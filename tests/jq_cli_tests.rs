@@ -108584,3 +108584,248 @@ fn test_fold_element_binds_and_def_walk_arms_3795() -> Result<()> {
     }
     Ok(())
 }
+
+/// #3639: a *consumer* of a body that reads path context and that the owned route
+/// can only resolve by prefetching -- `isempty`, `limit`, `skip`, `first`, `any`/
+/// `all` (which stop) and `reduce`, `last` (which consume the whole body) -- drives
+/// that body as jq does. The route used to run the body to completion first and
+/// hand the consumer its prefix: `isempty((.a, error("E2")) | key)` printed `false`
+/// and then `E2`, `[limit(1; ...)]` raised `E2` (the escape taken as the array's),
+/// `reduce` delivered the fold of the prefix and then the escape, `last` delivered
+/// the last of the prefix, and a `label` over such a body reported the `break` it
+/// caught. Now a stop reaches the body, so an escape past it is never reached; a
+/// whole-body consumer delivers nothing once the body raises (an error in `reduce`'s
+/// own update still wins, as jq raises it first); and a `label` owns its break.
+///
+/// Every row was checked three ways: the cursor route over the same document,
+/// jq 1.7.1's `path(...)` spelling (`key` is succinctly's; `skip` is not in 1.7.1,
+/// so those rows rest on the cursor route and `limit`), and the stream rows that
+/// must not change -- values produced before the escape are still delivered
+/// (`(.a | key), E` prints `"a"` first).
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_consumer_of_a_prefetched_path_context_body_follows_jq_3639() -> Result<()> {
+    for (filter, stdout, stderr, code) in [
+        (
+            r#"{"a":1} | isempty((.a, error("E2")) | key)"#,
+            "false\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1} | [limit(1; (.a, error("E2")) | key)]"#,
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1} | reduce ((.a, error("E2")) | key) as $x (0; 1)"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | first((.a, error("E2")) | key)"#,
+            "\"a\"\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1} | isempty([(error("E2") | key)])"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | [first([(error("E2") | key)])]"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | [limit(1; [(error("E2") | key)])]"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | isempty(error("E2") | key)"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (r#"{"a":1} | isempty(empty | key)"#, "true\n", "", 0),
+        (
+            r#"{"a":1} | isempty((error("E2"), .a) | key)"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | [limit(2; (.a, error("E2")) | key)]"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | [limit(2; (.a, .a, error("E2")) | key)]"#,
+            "[\"a\",\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1} | [skip(1; (.a, .a, error("E2")) | key)]"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | [limit(1; skip(1; (.a, .a, error("E2")) | key))]"#,
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1} | reduce ((.a, .a) | key) as $x (0; .+1)"#,
+            "2\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1} | reduce ((.a, error("E2")) | key) as $x (0; error("U"))"#,
+            "",
+            "jq: error (at <unknown>): U\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | reduce (error("E2") | key) as $x (0; 1)"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | first(foreach ((.a, error("E2")) | key) as $x (0; .+1))"#,
+            "1\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1} | [foreach ((.a, error("E2")) | key) as $x (0; .+1)]"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | any((.a, error("E2")) | key; .)"#,
+            "true\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1} | all((.a, error("E2")) | key; .)"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | any((.a, error("E2")) | key; not)"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | all((error("E2"), .a) | key; .)"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | [any((.a, error("E2")) | key; .)]"#,
+            "[true]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1} | [all((.a, error("E2")) | key; .)]"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (r#"{"a":1} | [all((.a, .a) | key; .)]"#, "[true]\n", "", 0),
+        (
+            r#"{"a":1} | [last((.a, error("E2")) | key)]"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | {"k": (last((error("E2"), .a) | key))}"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (r#"{"a":1} | last(.a, .a | key)"#, "\"a\"\n", "", 0),
+        (
+            r#"{"a":1} | [label $l | ((.a, break $l, .a) | key)]"#,
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1} | reduce (label $l | ((.a, break $l, .a) | key)) as $x (0; .+1)"#,
+            "1\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1} | {"k": first((.a, error("E2")) | key)}"#,
+            "{\"k\":\"a\"}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1} | [isempty((.a, error("E2")) | key)] | length"#,
+            "1\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1} | try isempty(error("E2") | key) catch "c""#,
+            "\"c\"\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1} | (.a | key), error("E")"#,
+            "\"a\"\n",
+            "jq: error (at <unknown>): E\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | (.a | key), isempty((.a, error("E2")) | key)"#,
+            "\"a\"\nfalse\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1} | (.a | key), reduce ((.a, error("E2")) | key) as $x (0; 1)"#,
+            "\"a\"\n",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | [(.a | key), error("E")]"#,
+            "",
+            "jq: error (at <unknown>): E\n",
+            5,
+        ),
+    ] {
+        let (out, err, got) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(
+            (out.as_str(), err.as_str(), got),
+            (stdout, stderr, code),
+            "{filter}"
+        );
+    }
+    Ok(())
+}

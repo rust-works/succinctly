@@ -6689,6 +6689,7 @@ pub(crate) fn resolve_path_context_at<S: EvalSemantics>(
             parent_of: Some(parent_of),
             prefetch: None,
             prefetch_escaped: None,
+            prefetch_catch_break: None,
         },
     )
 }
@@ -25588,6 +25589,37 @@ fn gen_hands_stage_input_on(gen: &Expr) -> bool {
     }
 }
 
+/// Whether a consumer's `body` is one the rewrite can resolve only by
+/// prefetching it -- a pipe that moves before it reads, a definition, a
+/// navigating `any(gen; cond)` -- and the owned identity pipe can run it
+/// natively (#3639). Exactly the bodies [`path_context_resolvable`] admits
+/// through `admits.prefetch` alone.
+///
+/// A consumer that stops (`limit`, `first`, `skip`, `isempty`) must drive such
+/// a body itself, so its stop reaches the body and an escape the body raised
+/// past that stop is never reported; prefetching only the body hands the
+/// consumer a finished prefix and leaves the escape to follow the consumer's
+/// own delivery. The rewriter and the native `isempty` stage arm both ask
+/// this, so the one that prefetches the consumer and the one that runs it
+/// cannot disagree (a prefetch whose stage the guard declined would arrive
+/// straight back at the rewriter).
+fn consumer_body_prefetches(body: &Expr) -> bool {
+    needs_path_context(body)
+        && !path_context_resolvable(body, ResolveAdmits::UPDATE_TARGET)
+        && owned_identity_pipe_supported(owned_identity_body_stages(body))
+}
+
+/// Whether `any(gen; cond)`/`all(gen; cond)` over a `gen` only a prefetch can
+/// resolve and a `cond` that reads no path context runs natively (#3639): the
+/// stage `eval_owned_identity_any_all` already runs for a `cond` that does
+/// read it. As for [`consumer_body_prefetches`], the decisive answer's stop
+/// must reach `gen`.
+fn any_all_gen_prefetches(gen: &Expr, cond: &Expr) -> bool {
+    !needs_path_context(cond)
+        && consumer_body_prefetches(gen)
+        && owned_identity_pipe_supported(owned_identity_body_stages(cond))
+}
+
 fn path_context_resolvable(expr: &Expr, admits: ResolveAdmits) -> bool {
     if !needs_path_context(expr) {
         // Nothing to resolve. Whatever this is, it evaluates against the
@@ -26049,6 +26081,7 @@ fn path_context_resolve_absent<S: EvalSemantics, V: DocumentValue>(
             parent_of: None,
             prefetch: None,
             prefetch_escaped: None,
+            prefetch_catch_break: None,
         },
     )
 }
@@ -26085,6 +26118,11 @@ struct PathContextAt<'a> {
     /// identity pipe supplies one, with its `escaped` cell; where there is no
     /// `prefetch` there is nothing to have escaped.
     prefetch_escaped: Option<&'a dyn Fn() -> bool>,
+    /// Drops the parked escape if it is `break $name` (#3639): a `label` that
+    /// resolved its own body by prefetching owns the break that body raised,
+    /// so the stage must not report it afterwards as an escape of the whole
+    /// stage. `None` wherever `prefetch_escaped` is.
+    prefetch_catch_break: Option<&'a dyn Fn(&str) -> bool>,
 }
 
 /// [`PathContextAt::prefetch`]'s hook: a sub-expression in, its outputs at
@@ -26192,9 +26230,56 @@ fn path_context_resolve_constants<S: EvalSemantics>(
                 Expr::Array(resolved)
             }
         }
+        // #3639: a consumer that stops over a body only a prefetch can
+        // resolve is prefetched whole, through the owned identity pipe's own
+        // native arm for it, so its stop reaches the body. Prefetching just
+        // the body hands the consumer a finished prefix: `isempty` decided
+        // from it and the escape after the stop was still reported, and a
+        // `limit`/`first` nested in an array was handed the escape as an
+        // array-level one. An escape the consumer's own run raises -- the
+        // stop never reached -- is parked exactly as any prefetch's is.
+        Expr::Limit { expr: body, .. }
+        | Expr::FirstExpr(body)
+        | Expr::Builtin(Builtin::Skip(_, body) | Builtin::IsEmpty(body))
+            if S::CONSUMERS_DRIVE_PREFETCHED_BODY
+                && at.prefetch.is_some()
+                && consumer_body_prefetches(body) =>
+        {
+            match at.prefetch {
+                Some(prefetch) => prefetched_literal(prefetch(expr)?),
+                None => unreachable!("the guard checked `at.prefetch`"), // omni-dev: coverage tolerate-line reason="unreachable: the arm's guard requires at.prefetch to be Some"
+            }
+        }
+        // #3639: the same for `any`/`all(gen; cond)` -- the decisive answer
+        // stops `gen` -- through `eval_owned_identity_any_all`.
+        Expr::Builtin(Builtin::AnyCond(gen, cond) | Builtin::AllCond(gen, cond))
+            if S::CONSUMERS_DRIVE_PREFETCHED_BODY
+                && at.prefetch.is_some()
+                && any_all_gen_prefetches(gen, cond) =>
+        {
+            match at.prefetch {
+                Some(prefetch) => prefetched_literal(prefetch(expr)?),
+                None => unreachable!("the guard checked `at.prefetch`"), // omni-dev: coverage tolerate-line reason="unreachable: the arm's guard requires at.prefetch to be Some"
+            }
+        }
         Expr::Optional(inner) => Expr::Optional(boxed(inner)?),
         Expr::FirstExpr(inner) => Expr::FirstExpr(boxed(inner)?),
-        Expr::LastExpr(inner) => Expr::LastExpr(boxed(inner)?),
+        // #3639: `last` consumes its whole body, like `reduce` and an array:
+        // an escape the body raised while it was prefetched means no `last`
+        // is delivered (and not the `null` of an empty one), where this route
+        // delivered the last of the prefix and then the escape.
+        Expr::LastExpr(inner) => {
+            let escaped_before = at.prefetch_escaped.is_some_and(|escaped| escaped());
+            let resolved = boxed(inner)?;
+            if S::CONSUMERS_DRIVE_PREFETCHED_BODY
+                && !escaped_before
+                && at.prefetch_escaped.is_some_and(|escaped| escaped())
+            {
+                Expr::Builtin(Builtin::Empty)
+            } else {
+                Expr::LastExpr(resolved)
+            }
+        }
         Expr::Negate(inner) => Expr::Negate(boxed(inner)?),
         Expr::Builtin(Builtin::FirstStream(inner)) => {
             Expr::Builtin(Builtin::FirstStream(boxed(inner)?))
@@ -26452,12 +26537,35 @@ fn path_context_resolve_constants<S: EvalSemantics>(
             patterns,
             init,
             update,
-        } => Expr::Reduce {
-            input: boxed(input)?,
-            patterns: patterns.clone(),
-            init: boxed(init)?,
-            update: update.clone(),
-        },
+        } => {
+            // #3639: `reduce` consumes its whole source, so an escape the
+            // *source* raised while it was prefetched means no result is
+            // delivered -- jq raises before the fold finishes, where this
+            // route delivered the fold of the prefix and then the escape.
+            // The fold is still run (an error in `update` is raised first,
+            // as jq raises it first) and its result dropped; the parked
+            // escape is reported after. `init` is resolved first because jq
+            // evaluates it first: an escape it raised is the stage's own,
+            // after the results its earlier outputs produced, and the
+            // source is then never run at all.
+            let init = boxed(init)?;
+            let escaped_before = at.prefetch_escaped.is_some_and(|escaped| escaped());
+            let input = boxed(input)?;
+            let reduce = Expr::Reduce {
+                input,
+                patterns: patterns.clone(),
+                init,
+                update: update.clone(),
+            };
+            if S::CONSUMERS_DRIVE_PREFETCHED_BODY
+                && !escaped_before
+                && at.prefetch_escaped.is_some_and(|escaped| escaped())
+            {
+                Expr::Pipe(vec![reduce, Expr::Builtin(Builtin::Empty)])
+            } else {
+                reduce
+            }
+        }
         Expr::Foreach {
             input,
             patterns,
@@ -26471,10 +26579,24 @@ fn path_context_resolve_constants<S: EvalSemantics>(
             update: update.clone(),
             extract: extract.clone(),
         },
-        Expr::Label { name, body } => Expr::Label {
-            name: name.clone(),
-            body: boxed(body)?,
-        },
+        // #3639: a body resolved by prefetching that raised `break $name`
+        // has been caught by this label -- the label ends there and delivers
+        // what came before -- so the break is not an escape of the stage. An
+        // escape parked by an earlier sub-expression is not this body's, and
+        // is left for the stage to report.
+        Expr::Label { name, body } => {
+            let escaped_before = at.prefetch_escaped.is_some_and(|escaped| escaped());
+            let resolved = boxed(body)?;
+            if S::CONSUMERS_DRIVE_PREFETCHED_BODY && !escaped_before {
+                if let Some(catch) = at.prefetch_catch_break {
+                    catch(name);
+                }
+            }
+            Expr::Label {
+                name: name.clone(),
+                body: resolved,
+            }
+        }
         Expr::As { expr, var, body } => Expr::As {
             expr: boxed(expr)?,
             var: var.clone(),
@@ -30178,6 +30300,7 @@ fn owned_identity_resolve_component<S: EvalSemantics, V: DocumentValue>(
             parent_of: None,
             prefetch: None,
             prefetch_escaped: None,
+            prefetch_catch_break: None,
         },
     )
 }
@@ -31896,6 +32019,14 @@ fn owned_identity_resolve_at<S: EvalSemantics, V: DocumentValue>(
         owned_identity_prefetch::<S, V>(sub, value, id, optional, escaped)
     };
     let prefetch_escaped = || escaped.borrow().is_some();
+    let prefetch_catch_break = |name: &str| {
+        let mut parked = escaped.borrow_mut();
+        let caught = matches!(&*parked, Some(Control::Break(label)) if label == name);
+        if caught {
+            *parked = None;
+        }
+        caught
+    };
     path_context_resolve_constants::<S>(
         stage,
         &PathContextAt {
@@ -31904,6 +32035,7 @@ fn owned_identity_resolve_at<S: EvalSemantics, V: DocumentValue>(
             parent_of: Some(&parent_of),
             prefetch: Some(&prefetch),
             prefetch_escaped: Some(&prefetch_escaped),
+            prefetch_catch_break: Some(&prefetch_catch_break),
         },
     )
 }
@@ -32352,6 +32484,29 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                 other => other,
             }
         }
+        // #3639: `isempty(f)` over a body only a prefetch can resolve, run
+        // natively like `first`. It is `first((f | false), true)` -- jq's own
+        // `label $go | (f | false, break $go), true` -- so the stop after
+        // `f`'s first output reaches `f`, and an escape `f` raises before any
+        // output is the stage's own, with no verdict delivered. A body the
+        // rewrite resolves by constants keeps the ruled arm below.
+        Expr::Builtin(Builtin::IsEmpty(f))
+            if S::CONSUMERS_DRIVE_PREFETCHED_BODY && consumer_body_prefetches(f) =>
+        {
+            let probe = Expr::Comma(vec![
+                Expr::Pipe(vec![(**f).clone(), Expr::Literal(Literal::Bool(false))]),
+                Expr::Literal(Literal::Bool(true)),
+            ]);
+            eval_owned_identity_bounded::<S, V>(
+                &probe,
+                OutputWindow::FIRST,
+                rest,
+                value,
+                id,
+                optional,
+                &mut tail,
+            )
+        }
         Expr::FirstExpr(inner) => eval_owned_identity_bounded::<S, V>(
             inner,
             OutputWindow::FIRST,
@@ -32368,10 +32523,16 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
         // refuses such a stage and the whole pipe used to fall to the
         // no-cursor evaluator. Here `gen` runs through this pipe and `cond`
         // is probed from each `(value, identity)` pair it produces.
-        Expr::Builtin(Builtin::AnyCond(gen, cond)) if needs_path_context(cond) => {
+        Expr::Builtin(Builtin::AnyCond(gen, cond))
+            if needs_path_context(cond)
+                || (S::CONSUMERS_DRIVE_PREFETCHED_BODY && any_all_gen_prefetches(gen, cond)) =>
+        {
             eval_owned_identity_any_all::<S, V>(gen, cond, true, rest, value, id, optional, tail)
         }
-        Expr::Builtin(Builtin::AllCond(gen, cond)) if needs_path_context(cond) => {
+        Expr::Builtin(Builtin::AllCond(gen, cond))
+            if needs_path_context(cond)
+                || (S::CONSUMERS_DRIVE_PREFETCHED_BODY && any_all_gen_prefetches(gen, cond)) =>
+        {
             eval_owned_identity_any_all::<S, V>(gen, cond, false, rest, value, id, optional, tail)
         }
         // #2658: `any(cond)`/`all(cond)` over a container are the same
