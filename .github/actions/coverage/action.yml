@@ -138,8 +138,9 @@ runs:
         # runtime CPU and unreachable-line variance (#2467).
         # It also ships prebuilt Linux x86_64 + ARM64 binaries (#3750), avoiding
         # cargo install on cache misses, and `patchcov merge` for future shards.
-        # Keep >= 0.1.1 for these capabilities. The migration is verified against
-        # omni-dev 0.46.0 with real main lcov artifacts and mutation checks;
+        # Keep >= 0.1.1 for these capabilities. The migration from omni-dev's
+        # coverage engine was verified against omni-dev 0.46.0 with real main
+        # lcov artifacts and mutation checks;
         # see docs/guides/developer.md "Patchcov migration verification".
         version: 0.1.1
         use-prebuilt-binary: ${{ inputs.use-prebuilt }}
