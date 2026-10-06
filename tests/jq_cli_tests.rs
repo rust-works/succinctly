@@ -64918,6 +64918,22 @@ fn test_map_f_in_path_position_raises_where_jq_does_3865() -> Result<()> {
             "Invalid path expression near attempt to access element 0 of [1]",
             5,
         ),
+        // An untracked input still raises from the iteration, with or without `getpath`
+        // in `f` (the by-value leaf keeps that check for the `getpath` case).
+        (
+            r"null",
+            r#"path(. as $x | {a:{b:1}} | map(getpath(["a"])) | $x)"#,
+            "",
+            r#"Invalid path expression near attempt to iterate through {"a":{"b":1}}"#,
+            5,
+        ),
+        (
+            r"null",
+            r"path(. as $x | {a:{b:1}} | map(.a) | $x)",
+            "",
+            r#"Invalid path expression near attempt to iterate through {"a":{"b":1}}"#,
+            5,
+        ),
         // Answers: `f` only navigates the elements it is given, or runs on none.
         (r#"[{"a":1}]"#, r"path(map(.a) | empty)", "", "", 0),
         (r#"[{"a":1}]"#, r"path(map(.a // .b) | empty)", "", "", 0),

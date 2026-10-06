@@ -37506,10 +37506,14 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // as the collect jq defines reuses every rule the `[E]` arm has -- the
         // pipe's register, the near-access wording, an untracked input's raise from
         // the `.[]` -- the way the bare `first` arm below reuses `Index`. An `f` that
-        // cannot move the register keeps the by-value leaf (nothing in it is
-        // path-checked), and so does one holding `getpath`, which the collect arm
-        // leaves to the eager fallback (#2759) -- there the leaf's own
-        // `builtin_navigation` check is all that is left. jq mode only (ADR-0018).
+        // cannot move the register keeps the by-value leaf: nothing in it is
+        // path-checked, so the answer is the same and the clone and the live walk are
+        // skipped (a sweep over `map(.)` and `map(tostring)` found no row that
+        // differs without the guard, so it is a cost guard, not a behaviour one). An
+        // `f` holding `getpath` keeps it too, because the collect arm leaves
+        // `getpath` to the eager fallback (#2759) and the leaf's own
+        // `builtin_navigation` check is all that is left of the untracked-input raise
+        // (`{a:{b:1}} | map(getpath(["a"]))`). jq mode only (ADR-0018).
         Expr::Builtin(Builtin::Map(f))
             if S::TAG == EvalTag::Jq
                 && !cannot_move_register(f)
