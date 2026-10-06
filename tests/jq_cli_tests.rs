@@ -64651,12 +64651,14 @@ fn test_and_or_negate_path_accepts_where_the_result_is_the_register_3289() -> Re
 }
 
 /// #3456: an `[E]` whose `E` is an `and`/`or`/unary minus carries the path
-/// register only while `register_movement_tracked` says the register's position
-/// is known after each operand. Since #3428 the `and`/`or` arms no longer ask
-/// it, so the array claim is its one reader, and each composite operand shape
-/// below is an arm of it that nothing else reaches: a postfix-`?` primitive, a
-/// nested `and`/`or`, unary minus, and an `as` source. Each answers `[]` in jq
-/// 1.7.1 and here; an arm that said `false` would refuse it ("with result").
+/// register while each operand is admitted by `register_movement_tracked` (the
+/// register's position is known after it) or, since #3724, by
+/// `array_contents_are_checked`. Since #3428 the `and`/`or` arms no longer ask
+/// either, so the array claim is their one reader. The composite operand shapes
+/// below (a postfix-`?` primitive, a nested `and`/`or`, unary minus) are admitted
+/// by both now; the `as` source is the one only `register_movement_tracked`
+/// reaches, which is why the claim is the union. Each answers `[]` in jq 1.7.1 and
+/// here; an arm that said `false` would refuse it ("with result").
 #[test]
 fn test_array_claim_over_composite_and_or_operands_carries_the_register_3456() -> Result<()> {
     assert_path_rows_3289(&[
@@ -64805,6 +64807,35 @@ fn test_collect_and_or_over_register_moving_builtins_3724() -> Result<()> {
             r"[true,2]",
             r"(. as $x | [first and true] | $x[0]) |= 9",
             "[9,2]\n",
+            "",
+            0,
+        ),
+        // The other shapes `array_contents_are_checked` admits are operands too.
+        (
+            r"[true]",
+            r"path(. as $x | [(try .a) and true] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[true]",
+            r"path(. as $x | [true or (if .a then first else .[0] end)] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[true]",
+            r"path(. as $x | [(recurse(.[]?)) and true] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[[1]]",
+            r"path(. as $x | [(flatten) and first] | $x)",
+            "[]\n",
             "",
             0,
         ),

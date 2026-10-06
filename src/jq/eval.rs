@@ -42018,7 +42018,10 @@ fn array_resolves_live<S: EvalSemantics>(inner: &Expr, trackable: bool) -> bool 
 /// slice's target (its keys are subexps); pipes, commas and parens of
 /// those; `last(f)`, whose claim is `f`'s own (#3767: it is `reduce f as $x
 /// (null; $x)`, so `f` is a source jq path-checks as the resolver's `last` arm
-/// does); and anything [`cannot_move_register`] admits, which neither moves
+/// does); `and`/`or`/unary minus over operands that satisfy
+/// [`and_or_operand_is_checked`] (this predicate or
+/// [`register_movement_tracked`], so the two are mutually recursive there,
+/// #3724); and anything [`cannot_move_register`] admits, which neither moves
 /// jq's register nor is path-checked inside. Everything else -- every other
 /// builtin call, an assignment, a `def`, a fold -- keeps the array
 /// refusing, the safe direction.
@@ -42173,6 +42176,18 @@ fn array_contents_are_checked(inner: &Expr) -> bool {
 /// `as` source) or everything jq path-checks inside it is checked here
 /// ([`array_contents_are_checked`], which admits a bare `first`/`add`, a
 /// `map(f)`, `try`, `if`). Each is sound alone, so the claim is their union.
+///
+/// The second predicate's own argument for a bare `first` ("jq's internal
+/// `.[0]` is path-intact because the input *is* the register") holds for the
+/// *left* operand and for an operand of unary minus; for the right operand of
+/// `and`/`or` the register has already moved to the left operand's output, so
+/// `first` navigates off it and does raise (`[last and first]`). What makes
+/// the union sound there is the resolver's `and`/`or` arm, not this predicate:
+/// it resolves the right operand live from the register the left one left
+/// ([`register_after`], [`resolve_from_restored_input`]), so a navigation off
+/// it is refused as jq refuses it, and the claim only has to say that nothing
+/// jq checks is left unchecked. A change to that arm needs the sweep's
+/// `[L and R]` operands (`scripts/jq-path-register-sweep.py`, #3724 item 2).
 fn and_or_operand_is_checked(operand: &Expr) -> bool {
     register_movement_tracked(operand) || array_contents_are_checked(operand)
 }

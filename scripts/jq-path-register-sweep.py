@@ -653,6 +653,16 @@ OPERANDS = [
     "[-first]",
     "[-(add)]",
     "[(first and true) or last]",
+    # ...and the other shapes `array_contents_are_checked` admits that an operand can now be
+    # (the review of #3724 item 2): `try`, `if`, `recurse`, `walk`, `flatten`.
+    "[(try .a) and true]",
+    "[true or (try .a)]",
+    "[(try (.a | tostring) catch .) and first]",
+    "[true or (if .a then first else .[0] end)]",
+    "[(recurse(.[]?)) and true]",
+    "[true or (walk(.))]",
+    "[(flatten) and first]",
+    "[-(try .a)]",
     "[last(.a) and first]",
     "[.a? and first]",
     "[(.a, .[0]) and last]",
