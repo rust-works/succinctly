@@ -38859,13 +38859,13 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
                 // equals the register in hand: then it may be that register's own
                 // node, which nothing here can certify and nothing refutes, and a
                 // refusal off it is the guess it is ([`guess_refusal`]). A value
-                // that differs from the register, or a register not in hand, cannot
-                // be it by pointer, so the mark is the ordinary non-certifying one
-                // and the refusal stays exact.
+                // that differs from the register cannot be it by pointer, nor can
+                // one with no register in hand unless a stage upstream lost it
+                // (#3795: [`may_be_register_in_hand`]), so the mark is then the
+                // ordinary non-certifying one and the refusal stays exact.
                 let demoted = Origin::Untracked;
                 let origin = if matches!(marker.origin, Origin::Unproven)
-                    && !register_in_hand(value, trackable, frame)
-                        .is_some_and(|reg| equals_register(&marker.value, reg))
+                    && !may_be_register_in_hand(&marker.value, value, trackable, frame)
                 {
                     &demoted
                 } else {
@@ -44144,7 +44144,19 @@ fn drive_fold_source_with<S: EvalSemantics>(
                 && (live_path_refusal(e).is_some() || is_fold_source_destructuring(e)))
     }) || (S::TAG == EvalTag::Jq
         && foreach_source
-        && foreach_source_destructures_register(source));
+        && foreach_source_destructures_register(source))
+        // #3795: a source that can hand the register back by pointer through
+        // control flow (`(., 1) | .`) is placed by the resolver too, so the
+        // output that *is* the register binds as the register-derived element
+        // it is in jq rather than by value. Not a source that binds a pattern or
+        // runs a fold of its own (#3489/#3744 leave those to the by-value drive:
+        // the resolver refuses `reduce (. as {a:$a} | .) as $k (.; .)`, which jq
+        // answers), and not inside another fold's UPDATE or EXTRACT, where `.` is
+        // the accumulator (#3790). Those keep the by-value drive and
+        // [`each_fold_bind`]'s `Unproven` marker.
+        || (fold_body::depth() == 0
+            && fold_source_may_alias_register::<S>(source)
+            && !binds_a_pattern_or_folds(source));
     // #3790: a fold whose source is the register itself (`.`) emits it as jq's
     // register-derived element at the root: `.` does not move the register and `$k`
     // is bound to that very node, so the element carries the root path (rebased
@@ -44430,13 +44442,15 @@ type BindSourceWitness = (Vec<(OwnedValue, Option<Origin>)>, Option<Control>);
 ///   $y | .a | $y)` prints `["a"]` before raising `x`, as jq does);
 /// - #3402: a source on the closed *transparent* grammar
 ///   ([`is_transparent_bind_source`]: `select`, `first`, `limit`, and `if`/
-///   `try`/`//`/`?`/pipes over them, none of which navigates) that
+///   `try`/`//`/`?`/`,`/pipes over them, plus -- #3795 -- a navigation of the
+///   register's own node as a leaf) that
 ///   [`is_identity_passthrough`] cannot prove is `.` -- typically because an
 ///   `if` condition may raise into a `catch` handler. Each output is either
 ///   the register itself, passed through, or a value computed beside it (a
 ///   handler's, an `if` arm's that is not `.`), and the resolver tells the two
 ///   apart on this input: the first is bound as a `.` bind would be
-///   ([`Origin::SnapshotAt`]), the second by value. A source with effects
+///   ([`Origin::SnapshotAt`]), a navigated output as the pure-navigation route
+///   binds it ([`Origin::At`]), the second by value. A source with effects
 ///   ([`walk_body_may_have_effects`]) keeps the by-value route, because the
 ///   witness may still decline -- a handler navigating its error value is a
 ///   resolver refusal -- and the by-value re-run would repeat the effect;
@@ -44496,17 +44510,18 @@ fn resolve_bind_source_witness<S: EvalSemantics>(
 /// The sources [`resolve_bind_source_witness`] resolves in path mode to learn
 /// whether each output *is* the register (#3402): `.`, and `select(c)`,
 /// `first(S)`, `limit(n; S)`, `if c then S else S end`, `try S catch h`,
-/// `S // S`, `S?` and `S | S` over them. Nothing here navigates, so every
-/// output the resolver keeps trackable is the frame's own node, passed
-/// through by pointer as jq passes it; an output it does not keep trackable
-/// (a `catch` handler's value) binds by value as before.
+/// `S // S`, `S?`, `S, S` and `S | S` over them. Every output the resolver keeps
+/// trackable is either the frame's own node, passed through by pointer as jq
+/// passes it, or -- #3795 -- the node a navigating leaf reached from it; an
+/// output it does not keep trackable (a `catch` handler's value) binds by value
+/// as before.
 ///
 /// The slots that are *not* sources -- a condition, a count, a handler --
 /// are arbitrary: the resolver evaluates conditions and counts by value, as
 /// jq's subexps do, and a handler's output is untracked. What keeps the
-/// grammar closed is that no other node may produce an output: a navigation,
-/// a call or a variable falls to the by-value route, so a value the resolver
-/// cannot place is never certified. The one exception is a literal or a
+/// grammar closed is that no other node may produce an output: a call, a
+/// variable or a navigation of anything but the register's own node falls to the
+/// by-value route, so a value the resolver cannot place is never certified. The one exception is a literal or a
 /// construction ([`is_fresh_leaf`], #3423): jq builds it fresh, so it is never
 /// the register, and the resolver places it as computed (an untracked branch,
 /// bound by value), which is what keeps `select(false) // {"a":1}` an exact
@@ -44518,29 +44533,103 @@ fn resolve_bind_source_witness<S: EvalSemantics>(
 /// Widening it to any source wrote where jq refuses
 /// (`(.a | tostring | .[0:1])? as $v`), which is why it is a grammar.
 fn is_transparent_bind_source(source: &Expr) -> bool {
+    transparent_outputs(source, true).is_some()
+}
+
+/// [`is_transparent_bind_source`]'s grammar walk, for a source whose input is
+/// register-tracked when `input_tracked` holds: `None` off the grammar, else
+/// whether every output it can produce is still tracked -- what a navigating leaf
+/// downstream of it needs (#3795).
+fn transparent_outputs(source: &Expr, input_tracked: bool) -> Option<bool> {
+    let all = |exprs: &mut dyn Iterator<Item = &Expr>| {
+        let mut tracked = true;
+        for e in exprs {
+            tracked &= transparent_outputs(e, input_tracked)?;
+        }
+        Some(tracked)
+    };
     match unwrap_bind_source(source) {
-        Expr::Identity | Expr::Builtin(Builtin::Select(_)) => true,
+        Expr::Identity | Expr::Builtin(Builtin::Select(_)) => Some(input_tracked),
         // #3423: a literal or construction is a value jq builds fresh, never the
         // register, and the resolver places it as computed (an untracked branch,
         // bound by value) -- the one thing the grammar needs of a leaf. It is what
         // keeps `select(false) // {"a":1}` an exact source rather than an
         // ambiguous one.
-        leaf if is_fresh_leaf(leaf) => true,
+        leaf if is_fresh_leaf(leaf) => Some(false),
+        // #3795: a navigation of the register's own node (`.a`, `.[0]`, `.a.b?`)
+        // is a leaf the resolver places exactly too -- at the node it reaches,
+        // which `resolve_bind_source_in` marks `Origin::At` as the pure-navigation
+        // route does. It is what lets `.a // .` and `first(.a, .)` bind `.a`'s own
+        // node rather than a value the register later moves onto. Only on a
+        // tracked input: a navigation of a computed value is the resolver's
+        // refusal, which a `try` or `//` here would swallow where jq navigates
+        // (`([1] | try .[0]) as $y` binds `1`).
+        leaf if is_navigating_leaf(leaf) => input_tracked.then_some(true),
+        Expr::Comma(exprs) => all(&mut exprs.iter()),
+        // A handler's output is untracked; one that may see the register as its
+        // error payload ([`try_body_may_raise_alias`]) is not placed at all, so the
+        // source stays on the by-value route, where its `Unproven` test applies.
+        Expr::Try {
+            expr,
+            catch: Some(_),
+        } => (!try_body_may_raise_alias(expr))
+            .then(|| transparent_outputs(expr, input_tracked))
+            .flatten()
+            .map(|_| false),
         Expr::Optional(inner)
         | Expr::FirstExpr(inner)
         | Expr::Limit { expr: inner, .. }
-        | Expr::Try { expr: inner, .. } => is_transparent_bind_source(inner),
+        | Expr::Try { expr: inner, .. } => transparent_outputs(inner, input_tracked),
         Expr::If {
             then_branch,
             else_branch,
             ..
-        } => is_transparent_bind_source(then_branch) && is_transparent_bind_source(else_branch),
-        Expr::Alternative(left, right) => {
-            is_transparent_bind_source(left) && is_transparent_bind_source(right)
+        } => all(&mut [&**then_branch, &**else_branch].into_iter()),
+        Expr::Alternative(left, right) => all(&mut [&**left, &**right].into_iter()),
+        Expr::Pipe(stages) if !stages.is_empty() => {
+            stages.iter().try_fold(input_tracked, |tracked, stage| {
+                transparent_outputs(stage, tracked)
+            })
         }
-        Expr::Pipe(stages) => !stages.is_empty() && stages.iter().all(is_transparent_bind_source),
-        _ => false,
+        _ => None,
     }
+}
+
+/// A pure navigation of the register's own node that navigates: a leaf of
+/// [`is_transparent_bind_source`]'s grammar the resolver places at the node it
+/// reaches (#3795).
+fn is_navigating_leaf(expr: &Expr) -> bool {
+    classify_navigation(expr) == (true, true)
+        // Every output a navigation of the register's node: nothing computed (a
+        // literal, a construction, a marker the frame may not certify), nothing
+        // raised, and no slice -- the one step the resolver refuses on a tracked
+        // value (a string's) that jq navigates, which a `try` would swallow.
+        && !any_subexpr(expr, &mut |e| {
+            matches!(
+                e,
+                Expr::Error(_)
+                    | Expr::Literal(_)
+                    | Expr::Array(_)
+                    | Expr::TrackedVar(_)
+                    | Expr::Slice { .. }
+                    | Expr::SliceExpr { .. }
+            )
+        })
+}
+
+/// Whether a `try` body can raise a value aliasing jq's register -- a bare
+/// `error` (which raises its input) or `error(x)` with `x` on
+/// [`may_alias_register`]'s grammar -- so that its `catch` handler's `.` may be
+/// the register by pointer (#3795: `try error(.) catch .`, `try select(error(.))
+/// catch .`). Conservative: any such raise anywhere in the body counts, even one
+/// an inner `try` would catch, and a wrong `true` only routes the source to the
+/// by-value bind, whose `Unproven` test still asks for equality with the register.
+fn try_body_may_raise_alias(body: &Expr) -> bool {
+    any_subexpr(body, &mut |e| match e {
+        Expr::Error(None) => true,
+        Expr::Error(Some(arg)) => may_alias_register(arg, None),
+        _ => false,
+    })
 }
 
 /// [`resolve_bind_source_witness`]'s path-mode resolution proper, against
@@ -44565,7 +44654,10 @@ fn resolve_bind_source_in<S: EvalSemantics>(
 ) -> Option<BindSourceWitness> {
     let bind = |b: PathBranch<'_>| {
         let origin = if b.trackable && slice_witnesses_node(&b.path, &b.value) {
-            if passthrough {
+            // #3795: the transparent grammar's navigating leaves reach a node below
+            // the frame's own, which is the `Origin::At` the pure-navigation route
+            // mints for it; only an output still at the frame's position is its `.`.
+            if passthrough && b.path.depth() == 0 {
                 frame.snapshot_origin_at(&b.path)
             } else {
                 frame.origin_at(&b.path)
@@ -44657,8 +44749,8 @@ fn resolve_as_source_sink<'a, S: EvalSemantics>(
             let ambiguous = !witnessed
                 && *may_alias
                     .get_or_init(|| source_may_alias_register::<S>(source, trackable, frame))
-                && register_in_hand(value, trackable, frame)
-                    .is_some_and(|reg| equals_register(&bound, reg));
+                // #3795: or, with the register lost upstream, could be the lost one.
+                && may_be_register_in_hand(&bound, value, trackable, frame);
             let substituted = substitute_bound_var_at(
                 source,
                 body,
@@ -46033,6 +46125,12 @@ impl FoldBind<'_> {
                 value,
                 origin: Some(origin),
             } => match origins {
+                // #3795: an `Unproven` marker is never the certifying position-less
+                // `Snapshot` below; it keeps its own origin on both folds.
+                _ if matches!(origin, Origin::Unproven) => {
+                    let marker = LazyMarker::new(value, Origin::Unproven, None);
+                    substitute_var_impl(expr, name, value, Some(&marker))
+                }
                 // `reduce` re-seeds no per-step register, so a position would
                 // admit nothing: it keeps the position-less marker it always
                 // had, whether or not `Frame::at` is on for another reason.
@@ -46097,6 +46195,7 @@ fn each_fold_bind<S: EvalSemantics>(
     reg: &FoldRegister,
     frame: &Frame,
     alternatives: Option<&[String]>,
+    source_may_alias: bool,
     sink: &mut dyn FnMut(Option<PatternRegister>, &FoldBind<'_>) -> Demand,
 ) -> Flow {
     match pattern {
@@ -46133,6 +46232,15 @@ fn each_fold_bind<S: EvalSemantics>(
                     .flatten()
                     .unwrap_or(Origin::Snapshot)
             });
+            // #3795: an element bound by value from a source that can hand the
+            // register back by pointer (`foreach ((., 1) | .) as $x`) is the
+            // `Unproven` marker `resolve_as_source_sink` gives the same source in an
+            // `as`: while it may be the register, a refusal off `$x` is a guess, not
+            // jq's verdict for a `try` to catch.
+            let origin = origin.or_else(|| {
+                (source_may_alias && fold_element_may_be_register(elem, reg))
+                    .then_some(Origin::Unproven)
+            });
             let bind = FoldBind {
                 binding: FoldBinding::Var {
                     name,
@@ -46146,6 +46254,49 @@ fn each_fold_bind<S: EvalSemantics>(
                 Demand::Stop => Flow::Stopped { pending: None },
             }
         }
+    }
+}
+
+/// Whether `source` binds a destructuring pattern or runs a fold anywhere, a
+/// called def's body included -- each distinct def looked into once, so a chain of
+/// defs that call the next many times stays linear (#3795).
+fn binds_a_pattern_or_folds(source: &Expr) -> bool {
+    let mut seen: Vec<*const FuncDefData> = Vec::new();
+    crate::jq::walk::search_subexpr(source, &mut |e| match e {
+        Expr::AsPattern { .. } | Expr::Reduce { .. } | Expr::Foreach { .. } => {
+            crate::jq::walk::Visit::Found
+        }
+        Expr::DefCall { def, args, .. } => {
+            let at = Rc::as_ptr(def);
+            // A call with arguments is walked again: its arguments differ per site.
+            if seen.contains(&at) && args.is_empty() {
+                crate::jq::walk::Visit::Skip
+            } else {
+                seen.push(at);
+                crate::jq::walk::Visit::Descend
+            }
+        }
+        _ => crate::jq::walk::Visit::Descend,
+    })
+}
+
+/// Whether a fold's source can hand jq's register back by pointer through control
+/// flow ([`may_alias_register`]), for [`each_fold_bind`]'s `Unproven` marker
+/// (#3795). Jq mode only, as at the `as` bind site ([`source_may_alias_register`]).
+fn fold_source_may_alias_register<S: EvalSemantics>(source: &Expr) -> bool {
+    S::TAG == EvalTag::Jq && may_alias_register(source, None)
+}
+
+/// Whether a by-value fold element may be the register's own node, by value
+/// (#3795): equal to the register where the element left it ([`FoldSourceValue::moved`]),
+/// or the register is lost.
+fn fold_element_may_be_register(elem: &FoldSourceValue, reg: &FoldRegister) -> bool {
+    match &elem.moved {
+        MovedRegister::Unmoved => {
+            may_be_register_in_hand(&elem.value, &reg.value, reg.trackable, &reg.frame)
+        }
+        MovedRegister::At { value, .. } => equals_register(&elem.value, value),
+        MovedRegister::Lost => true,
     }
 }
 
@@ -46309,61 +46460,136 @@ impl NavKind {
 /// the constructs that pass a sub-expression's output through unchanged: a comma,
 /// `if`, `//`, `try`/`?`, `first`/`last`/`limit`/`nth`, `label`, a rebind's body,
 /// `select` and the type filters (which hand their input back), and a pipe, whose
-/// last stage sees what the stages before it left. Everything else -- a builtin, a
-/// call, a navigation, a construction, a fold -- is taken to produce a different
-/// value, which is jq's own doctrine for a computed one
-/// ([`could_be_lost_register`]); a call or fold that forwards its input stays a
-/// residual (#3423). A `catch` handler's `.` is the error payload, not the
-/// register, so only a `$var` it names counts there (#3334 review). Only what the
+/// last stage sees what the stages before it left, and a zero-arity user def, which
+/// forwards what its body does (#3795, under a total work budget). Everything
+/// else -- a builtin, a call with arguments, a navigation, a construction, a fold --
+/// is taken to produce a different value, which is jq's own doctrine for a computed
+/// one ([`could_be_lost_register`]); such a call or fold that forwards its input
+/// stays a residual (#3423). A `catch` handler's `.` is the error payload, so it
+/// counts only when the body can raise an aliasing value ([`try_body_may_raise_alias`],
+/// #3795); otherwise only a `$var` it names counts there (#3334 review). Only what the
 /// parser builds is read: `first(f)`, `last(f)` and `limit` are `FirstExpr`,
 /// `LastExpr` and `Limit`, `nth(n; f)` is `Builtin::NthStream`; their hand-built
 /// twins (`Builtin::FirstStream`, `Builtin::LastStream`, `Expr::NthExpr`) never
 /// reach a bind source.
 fn may_alias_register(source: &Expr, register_frame: Option<&Frame>) -> bool {
-    fn alias(expr: &Expr, identity: bool, frame: Option<&Frame>) -> bool {
-        let any = |e: &Expr, identity: bool| alias(e, identity, frame);
-        match unwrap_bind_source(expr) {
-            Expr::Identity => identity,
-            // A marker bound at a position the register's own frame can compare and
-            // does not name is a different node, whatever it equals (`.a as $y | .c
-            // | try (first($y) as {b:$q} | $q)` on equal siblings: jq catches it).
-            Expr::TrackedVar(marker) => !matches!(
-                &marker.origin,
-                Origin::At { invocation, path }
-                    if frame.is_some_and(|f| f.at.is_some() && !f.names(*invocation, path))
-            ),
-            Expr::Var(_) => true,
-            Expr::Comma(exprs) => exprs.iter().any(|e| any(e, identity)),
-            Expr::If {
-                then_branch,
-                else_branch,
-                ..
-            } => any(then_branch, identity) || any(else_branch, identity),
-            Expr::Alternative(left, right) => any(left, identity) || any(right, identity),
-            Expr::Try { expr, catch } => {
-                any(expr, identity) || catch.as_deref().is_some_and(|c| any(c, false))
+    /// How many zero-arity def bodies the walk may look into, in total (#3795): a
+    /// work budget, not a depth cap, so a chain of defs that each call the next
+    /// many times stays linear. Past it a call counts as computing, the residual.
+    const CALL_BUDGET: u32 = 64;
+    /// A zero-arity `def` in lexical scope at the walk's position, for an
+    /// unresolved call inside the source that defines it (`(def f: .; f)`).
+    struct Scope<'a> {
+        name: &'a str,
+        body: &'a Expr,
+        parent: Option<&'a Self>,
+    }
+    struct Walk<'a> {
+        frame: Option<&'a Frame>,
+        budget: core::cell::Cell<u32>,
+    }
+    impl Walk<'_> {
+        /// One more def body looked into, if the budget allows it.
+        fn charge(&self) -> bool {
+            let left = self.budget.get();
+            self.budget.set(left.saturating_sub(1));
+            left > 0
+        }
+        fn alias(&self, expr: &Expr, identity: bool, scope: Option<&Scope<'_>>) -> bool {
+            let any = |e: &Expr, identity: bool| self.alias(e, identity, scope);
+            match unwrap_bind_source(expr) {
+                // #3795: a zero-arity user def forwards whatever its body forwards
+                // (`def f: .; f as $x`), installed (`DefCall`) or still a call to a
+                // `def` the source itself makes (`(def f: .; f) as $x`). A call with
+                // arguments stays a residual.
+                Expr::DefCall { def, args, .. } if args.is_empty() && def.params.is_empty() => {
+                    self.charge() && self.alias(&def.body, identity, None)
+                }
+                Expr::FuncDef {
+                    name,
+                    params,
+                    body,
+                    then,
+                    ..
+                } => {
+                    if params.is_empty() {
+                        let inner = Scope {
+                            name,
+                            body,
+                            parent: scope,
+                        };
+                        self.alias(then, identity, Some(&inner))
+                    } else {
+                        // A def with parameters shadows any outer one of the name
+                        // only at its own arity, so the outer scope still holds.
+                        any(then, identity)
+                    }
+                }
+                // A name the chain does not hold cannot reach here: resolution has
+                // already installed every call outside the source as a `DefCall`
+                // and substituted every parameter, so a miss would be a call to
+                // nothing, counted as computing.
+                Expr::FuncCall { name, args, .. } if args.is_empty() => {
+                    core::iter::successors(scope, |def| def.parent)
+                        .find(|def| def.name == name)
+                        // The body sees its own scope: itself, and what was in
+                        // scope where it was defined.
+                        .is_some_and(|def| {
+                            self.charge() && self.alias(def.body, identity, Some(def))
+                        })
+                }
+                Expr::Identity => identity,
+                // A marker bound at a position the register's own frame can compare
+                // and does not name is a different node, whatever it equals (`.a as
+                // $y | .c | try (first($y) as {b:$q} | $q)` on equal siblings: jq
+                // catches it).
+                Expr::TrackedVar(marker) => !matches!(
+                    &marker.origin,
+                    Origin::At { invocation, path }
+                        if self.frame.is_some_and(|f| f.at.is_some() && !f.names(*invocation, path))
+                ),
+                Expr::Var(_) => true,
+                Expr::Comma(exprs) => exprs.iter().any(|e| any(e, identity)),
+                Expr::If {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => any(then_branch, identity) || any(else_branch, identity),
+                Expr::Alternative(left, right) => any(left, identity) || any(right, identity),
+                // The handler's `.` is the error payload, which is the register by
+                // pointer when the body raises it (#3795: `try error(.) catch .`).
+                Expr::Try { expr, catch } => {
+                    any(expr, identity)
+                        || catch
+                            .as_deref()
+                            .is_some_and(|c| any(c, try_body_may_raise_alias(expr)))
+                }
+                Expr::Optional(inner)
+                | Expr::FirstExpr(inner)
+                | Expr::LastExpr(inner)
+                | Expr::Limit { expr: inner, .. }
+                | Expr::Label { body: inner, .. }
+                | Expr::As { body: inner, .. }
+                | Expr::AsPattern { body: inner, .. }
+                | Expr::Builtin(Builtin::NthStream(_, inner)) => any(inner, identity),
+                Expr::Builtin(builtin)
+                    if matches!(builtin, Builtin::Select(_)) || is_type_filter(builtin) =>
+                {
+                    identity
+                }
+                // Each stage's `.` is what the stages before it left.
+                Expr::Pipe(stages) => stages
+                    .iter()
+                    .fold(identity, |input_aliases, stage| any(stage, input_aliases)),
+                _ => false,
             }
-            Expr::Optional(inner)
-            | Expr::FirstExpr(inner)
-            | Expr::LastExpr(inner)
-            | Expr::Limit { expr: inner, .. }
-            | Expr::Label { body: inner, .. }
-            | Expr::As { body: inner, .. }
-            | Expr::AsPattern { body: inner, .. }
-            | Expr::Builtin(Builtin::NthStream(_, inner)) => any(inner, identity),
-            Expr::Builtin(builtin)
-                if matches!(builtin, Builtin::Select(_)) || is_type_filter(builtin) =>
-            {
-                identity
-            }
-            // Each stage's `.` is what the stages before it left.
-            Expr::Pipe(stages) => stages
-                .iter()
-                .fold(identity, |input_aliases, stage| any(stage, input_aliases)),
-            _ => false,
         }
     }
-    alias(source, true, register_frame)
+    Walk {
+        frame: register_frame,
+        budget: core::cell::Cell::new(CALL_BUDGET),
+    }
+    .alias(source, true, None)
 }
 
 /// Whether [`resolve_as_source_sink`] and the destructuring walk must treat `source`
@@ -46392,6 +46618,22 @@ fn register_in_hand<'a>(
         Some(value)
     } else {
         frame.register()
+    }
+}
+
+/// Whether `candidate` may be the register's own node at a stage, by value: equal
+/// to the register in hand, or -- with no register in hand because a stage upstream
+/// lost it -- a value that could be the lost one ([`could_be_lost_register`], as
+/// frozen). The test an `Unproven` marker is made and kept by (#3423, #3795).
+fn may_be_register_in_hand(
+    candidate: &OwnedValue,
+    value: &OwnedValue,
+    trackable: bool,
+    frame: &Frame,
+) -> bool {
+    match register_in_hand(value, trackable, frame) {
+        Some(register) => equals_register(candidate, register),
+        None => could_be_lost_register(&frame.register_loss, true, candidate),
     }
 }
 
@@ -47296,6 +47538,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         // the top of the step, and one that produces nothing or raises never
         // re-enters the step, so [`reclaim_fold_escape`] supersedes it against
         // the source drive's own verdict.
+        let source_may_alias = fold_source_may_alias_register::<S>(input);
         let source_flow = drive_fold_source::<S>(input, &ambient, relocate_base, &mut |elem| {
             aborted.begin();
             if let Some(control) = charge_budget(&mut budget, "reduce") {
@@ -47363,6 +47606,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                     &reg,
                     frame,
                     alternatives,
+                    source_may_alias,
                     &mut |walked, bind| {
                         let substituted = bind.apply(update, WalkOrigins::Drop);
                         // **#2632**: mirrors `resolve_foreach`'s own `None`-arm widening
@@ -47732,6 +47976,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
         // (#3293): a `?//` in the source that retries past that stop and then
         // produces nothing or raises supersedes it, as it does `aborted`.
         let mut downstream_stopped: Option<u64> = None;
+        let source_may_alias = fold_source_may_alias_register::<S>(input);
         let source_flow = drive_foreach_source::<S>(input, &ambient, relocate_base, &mut |elem| {
             downstream_stopped = None;
             aborted.begin();
@@ -47805,6 +48050,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                     &reg,
                     frame,
                     alternatives,
+                    source_may_alias,
                     &mut |walked, bind| {
                         let bound_update = bind.apply(update, WalkOrigins::Keep);
                         let bound_extract = extract.map(|ext| bind.apply(ext, WalkOrigins::Keep));
@@ -119222,6 +119468,28 @@ mod tests {
     fn test_path_bind_origin_matrix_accepts_2042() {
         // (input, filter, jq 1.7.1's `-c '[FILTER]'`)
         let rows: &[(&[u8], &str, &str)] = &[
+            // Refuse-only until #3795: the transparent witness grammar takes a
+            // navigation of the register's node as a leaf, so a source wrapping
+            // one in `select`/`//`/`if` is placed by the resolver, and `$y` is
+            // `.a`'s own node.
+            // select-wrapped-source
+            (
+                br#"{"a":{"b":1}}"#,
+                "path((.a | select(.b)) as $y | .a | $y)",
+                r#"[["a"]]"#,
+            ),
+            // alternative-source
+            (
+                br#"{"a":{"b":1}}"#,
+                "path((.a // 1) as $y | .a | $y)",
+                r#"[["a"]]"#,
+            ),
+            // if-source
+            (
+                br#"{"a":{"b":1}}"#,
+                "path((if .a then .a else .b end) as $y | .a | $y)",
+                r#"[["a"]]"#,
+            ),
             // #3049: `fromjson` does not move the register. The marker can
             // restore it after the reconstructed value, as jq does.
             (
@@ -119766,27 +120034,6 @@ mod tests {
                 br#"{"x":[1,2],"i":1}"#,
                 "path(.x[.i:]? as $y | .x[1:] | $y)",
                 r#"[["x",{"start":1,"end":null}]]"#,
-            ),
-            // The witness grammar is pure navigation (#2042 review), so a
-            // source wrapped in `select`/`//`/`if` binds by value. (A postfix
-            // `?` on a navigation step is navigation, #3519.)
-            // select-wrapped-source
-            (
-                br#"{"a":{"b":1}}"#,
-                "path((.a | select(.b)) as $y | .a | $y)",
-                r#"[["a"]]"#,
-            ),
-            // alternative-source
-            (
-                br#"{"a":{"b":1}}"#,
-                "path((.a // 1) as $y | .a | $y)",
-                r#"[["a"]]"#,
-            ),
-            // if-source
-            (
-                br#"{"a":{"b":1}}"#,
-                "path((if .a then .a else .b end) as $y | .a | $y)",
-                r#"[["a"]]"#,
             ),
             // full-slice-is-the-array (jq's `.a[0:3]` of a 3-array is `.a`)
             (
@@ -123470,6 +123717,68 @@ mod tests {
         }
     }
 
+    /// #3795 review: `may_alias_register` looks through a zero-arity def the source
+    /// itself defines (`(def f: .; f)`), lexically scoped, and under a total work
+    /// budget: a recursive def and a chain of defs that each call the next twelve
+    /// times both terminate at once instead of walking 12^8 bodies.
+    #[test]
+    fn test_may_alias_register_looks_through_inline_defs_under_a_budget_3795() {
+        for (filter, expected) in [
+            ("def f: .; f", true),
+            ("def f: (., 1); f", true),
+            ("def f: .; def g: f; g", true),
+            ("def f: .; first(f)", true),
+            // A def with parameters shadows only at its own arity.
+            ("def f: .; def f(g): 1; f", true),
+            ("def f: 1; f", false),
+            ("def f: .a; f", false),
+            ("def f: .; f | tostring", false),
+            // The body sees its own scope, not the call site's.
+            ("def g: 1; def f: g; def g: .; f", false),
+            // A recursive def is cut off by the budget.
+            ("def f: f; f", false),
+        ] {
+            let expr = parse(filter).unwrap_or_else(|e| panic!("{filter}: {e:?}"));
+            assert_eq!(may_alias_register(&expr, None), expected, "{filter}");
+        }
+        let mut chain = String::from("def d0: 1;");
+        for i in 1..=8 {
+            let calls = vec![format!("d{}", i - 1); 12].join(" // ");
+            chain.push_str(&format!(" def d{i}: {calls};"));
+        }
+        chain.push_str(" d8");
+        let expr = parse(&chain).unwrap();
+        // Every body computes, so an unbounded walk would visit all 12^8 calls.
+        assert!(!may_alias_register(&expr, None));
+    }
+
+    /// #3795: the transparent witness grammar takes a comma and a pure navigation
+    /// as leaves, so the resolver places `.a // .`'s output itself; a `catch`
+    /// handler that may see the register as its payload, an `error` leaf, a call
+    /// and a builtin stay out.
+    #[test]
+    fn test_transparent_bind_source_takes_comma_and_navigation_leaves_3795() {
+        for (filter, expected) in [
+            ("(.a // .)", true),
+            ("first(.a, .)", true),
+            ("limit(1; .a, .)", true),
+            ("((., 1) | .)", true),
+            ("(if .d then .a.b else . end)", true),
+            ("(.a?, .)", true),
+            ("try (.a, .) catch 1", true),
+            ("try (., 1) catch .", true),
+            ("try error(.) catch .", false),
+            ("try select(error(.)) catch .", false),
+            ("(error(.) // .)", false),
+            ("(.a | tostring)", false),
+            ("(.a // length)", false),
+            ("($x // .)", false),
+        ] {
+            let expr = parse(filter).unwrap_or_else(|e| panic!("{filter}: {e:?}"));
+            assert_eq!(is_transparent_bind_source(&expr), expected, "{filter}");
+        }
+    }
+
     /// #3423: `may_alias_register` reads the forwarders (`,`, `if`, `//`, `try`,
     /// `first`/`last`/`limit`/`nth`, `label`, a rebind, `select`, a pipe) over the
     /// aliasing leaves (`.` and a `$var`), and nothing else: a value the source
@@ -123501,6 +123810,14 @@ mod tests {
             ("(. | (., 1) | select(true))", true),
             // A handler's `.` is the payload; a `$var` there is still a leaf.
             ("try 1 catch .", false),
+            // #3795: ...which is the register when the body raises an aliasing value.
+            ("try error(.) catch .", true),
+            ("try error catch .", true),
+            ("try select(error(.)) catch .", true),
+            ("try (if error(.) then . else . end) catch .", true),
+            ("try error($y) catch .", true),
+            ("try error(\"x\") catch .", false),
+            ("try error({a: .}) catch .", false),
             // Values the source builds or derives are never the register.
             ("1", false),
             ("{a: .}", false),

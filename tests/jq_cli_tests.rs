@@ -98091,22 +98091,13 @@ fn test_comma_bind_source_is_classified_per_branch_3334() -> Result<()> {
 /// `{"a":{}}` / `{"a":9}`); the refusal is the documented price, in the safe
 /// direction. A value the source derives or builds is never the register, and the
 /// controls pin that those keep their catchable refusal. Both evaluators: the
-/// document on stdin and as a `-n` literal.
+/// document on stdin and as a `-n` literal. #3795 moved the comma-under-a-head
+/// rows to jq's answer: the transparent witness grammar now places them exactly.
 #[test]
 fn test_bind_source_that_may_be_the_register_refuses_loudly_3423() -> Result<()> {
     let doc = r#"{"a":{"b":1}}"#;
     let wide = r#"{"a":1,"c":1,"d":{"b":1},"x":{"a":1,"c":{"b":1}}}"#;
     let refused = [
-        // A plain bind, the source a comma under another head.
-        (
-            doc,
-            r"del((if true then (., 1) else . end) as $x | try $x.a)",
-        ),
-        (doc, r"del(((., 1) | .) as $x | try $x.a)"),
-        (doc, r"del((try (., 1) catch 2) as $x | try $x.a)"),
-        (doc, r"del(((., 1) // 2) as $x | try $x.a)"),
-        (doc, r"del(((., 1)?) as $x | try $x.a)"),
-        (doc, r"(((., 1) | .) as $x | try $x.a) = 9"),
         // A destructuring bind, the source a pass-through of a frozen `$orig`.
         (
             doc,
@@ -98128,24 +98119,18 @@ fn test_bind_source_that_may_be_the_register_refuses_loudly_3423() -> Result<()>
             doc,
             r#"del(. as $orig | has("k") | try (($orig as $p | $p) as {a:{b:$q}} | $q))"#,
         ),
-        // The other forwarder arms: `limit`, `last`, a rebind and a destructuring
-        // rebind's body, a type filter, and a pipe.
-        (doc, r"del(limit(1; ., 1) as $x | try $x.a)"),
+        // The other forwarder arms: `last`, a rebind and a destructuring rebind's
+        // body, a type filter, and a pipe.
         (doc, r"del(last(., .) as $x | try $x.a)"),
         (doc, r"del((. as {a:$q} | .) as $x | try $x.a)"),
         (doc, r"del((. as $z | (., 1) | .) as $x | try $x.a)"),
         (doc, r"del(((., 1) | objects) as $x | try $x.a)"),
-        // The forwarders the alias grammar reads through: `select` inside a comma,
-        // and a `catch` handler that names the frozen `$orig` (its `.` is the error
+        // A `catch` handler that names the frozen `$orig` (its `.` is the error
         // payload, so only the `$var` counts there).
-        (doc, r"del(((select(true), 1) | .) as $x | try $x.a)"),
         (
             doc,
             r#"del(. as $o | has("k") | try ((try error(1) catch $o) as {a:{b:$q}} | $q))"#,
         ),
-        // The source's output equal to the register by value, off the register:
-        // the stage the bind is read in is untracked and carries it.
-        (doc, r"del(((., 1) | .) as $x | 5 | try $x.a)"),
     ];
     for (input, filter) in refused {
         for (label, args, stdin) in [
@@ -98173,23 +98158,38 @@ fn test_bind_source_that_may_be_the_register_refuses_loudly_3423() -> Result<()>
             );
         }
     }
-    // The same refusal where the bind is read below an untracked stage and `?`
-    // would otherwise prune it: jq answers `[["b"]]`.
-    let (out, stderr, code) = run_jq_full(
-        &["-c", r#"[path(((., 1)?) as $v0 | "z" | try ($v0 | .b?))]"#],
-        Some(wide),
-    )?;
-    assert_eq!(code, 5, "{out:?}");
-    assert!(
-        stderr.contains("Invalid path expression near attempt to access element"),
-        "{stderr:?}"
-    );
-
     // Not ambiguous, so nothing moves. A fresh value (a construction) is never the
     // register, so its refusal is jq's own and a `try` still catches it; the
     // certified binds (`.`, `first(.)`, a top-level comma split per leaf) still
     // write, as jq does.
     for (input, filter, expected) in [
+        // #3795: a comma under another head is on the transparent witness grammar
+        // now, so the resolver places each output itself -- `.` as the register's
+        // node, `1` as computed -- and these write as jq does instead of refusing.
+        (
+            doc,
+            r"del((if true then (., 1) else . end) as $x | try $x.a)",
+            "{}\n",
+        ),
+        (doc, r"del(((., 1) | .) as $x | try $x.a)", "{}\n"),
+        (doc, r"del((try (., 1) catch 2) as $x | try $x.a)", "{}\n"),
+        (doc, r"del(((., 1) // 2) as $x | try $x.a)", "{}\n"),
+        (doc, r"del(((., 1)?) as $x | try $x.a)", "{}\n"),
+        (doc, r"(((., 1) | .) as $x | try $x.a) = 9", "{\"a\":9}\n"),
+        (doc, r"del(limit(1; ., 1) as $x | try $x.a)", "{}\n"),
+        (
+            doc,
+            r"del(((select(true), 1) | .) as $x | try $x.a)",
+            "{}\n",
+        ),
+        // Read off the register, after a literal that does not move it.
+        (doc, r"del(((., 1) | .) as $x | 5 | try $x.a)", "{}\n"),
+        // Read below an untracked stage, where `?` would otherwise prune it.
+        (
+            wide,
+            r#"[path(((., 1)?) as $v0 | "z" | try ($v0 | .b?))]"#,
+            "[[\"b\"]]\n",
+        ),
         (
             doc,
             r"del(({a:{b:1}}) as $x | try $x.a)",
@@ -107774,6 +107774,262 @@ fn test_undecodable_target_output_in_computed_index_and_slice_3807() -> Result<(
             err.contains("invalid unicode escape sequence"),
             "`{filter}`: {err:?}"
         );
+    }
+    Ok(())
+}
+
+/// Runs `filter` over `input` both on stdin and as a `-n` literal, the two
+/// evaluators, and hands each `(label, stdout, stderr, exit)` to `check` (#3795).
+fn for_both_evaluators_3795(
+    input: &str,
+    filter: &str,
+    mut check: impl FnMut(&str, &str, &str, i32),
+) -> Result<()> {
+    for (label, args, stdin) in [
+        (
+            "stdin",
+            vec!["-c".to_string(), filter.to_string()],
+            Some(input),
+        ),
+        (
+            "-n",
+            vec!["-nc".to_string(), format!("{input} | {filter}")],
+            None,
+        ),
+    ] {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (out, stderr, code) = run_jq_full(&args, stdin)?;
+        check(label, &out, &stderr, code);
+    }
+    Ok(())
+}
+
+/// #3795: bind sources the #3423 alias grammar did not reach bound unmarked, so a
+/// refusal off `$x` read as jq's own verdict and a `try` caught it: `del`, `=` and
+/// `|=` silently dropped the write jq makes (exit 0). Each now answers as jq does,
+/// where the resolver can place the output:
+///
+/// - a source mixing a navigation with `.` (`.a // .`, `first(.a, .)`), whose
+///   output is a node the register later moves onto -- the transparent witness
+///   grammar takes a navigation of the register's node as a leaf;
+/// - a `catch` handler whose body raises the register (`try error(.) catch .`):
+///   its payload is the register's own storage, which certifies (#3177);
+/// - a `reduce`/`foreach` over such a source, which the resolver now drives.
+///
+/// Every expected value captured live against jq 1.7.1. Both evaluators.
+#[test]
+fn test_bind_sources_beyond_the_alias_grammar_keep_the_write_3795() -> Result<()> {
+    let doc = r#"{"a":{"b":1}}"#;
+    let twins = r#"{"a":{"b":1},"c":{"b":1}}"#;
+    for (input, filter, expected) in [
+        // A navigation mixed with `.`: `$x` is `.a`'s own node.
+        (
+            doc,
+            r"((.a // .) as $x | .a | try $x.b) = 9",
+            r#"{"a":{"b":9}}"#,
+        ),
+        (
+            doc,
+            r"del(first(.a, .) as $x | .a | try $x.b)",
+            r#"{"a":{}}"#,
+        ),
+        (
+            doc,
+            r"del(limit(1; .a, .) as $x | .a | try $x.b)",
+            r#"{"a":{}}"#,
+        ),
+        (
+            doc,
+            r"((if .a then .a else . end) as $x | .a | try $x.b) |= 5",
+            r#"{"a":{"b":5}}"#,
+        ),
+        (doc, r"[path((.a // 1) as $y | .a | $y)]", r#"[["a"]]"#),
+        // ...and not an equal-valued sibling's: jq's own refusal is caught.
+        (
+            twins,
+            r"del((select(false) // .a) as $v | .c | try ($v | .b))",
+            twins,
+        ),
+        (twins, r"del((.a // .) as $x | .c | try $x.b)", twins),
+        // A navigation after a computed value is not the register's node: the
+        // source binds `1` by value, as jq does.
+        (
+            r#"{"1":true,"c":true}"#,
+            r"del(([1] | try .[0]) as $y | .[$y|tostring])",
+            r#"{"c":true}"#,
+        ),
+        // A `catch` handler whose payload is the register.
+        (doc, r"del((try error(.) catch .) as $x | try $x.a)", "{}"),
+        (doc, r"del((try error catch .) as $x | try $x.a)", "{}"),
+        (
+            doc,
+            r"del((try select(error(.)) catch .) as $x | try $x.a)",
+            "{}",
+        ),
+        (
+            doc,
+            r"del((try (if error(.) then . else . end) catch .) as $x | try $x.a)",
+            "{}",
+        ),
+        (
+            doc,
+            r"del((. as $y | try error($y) catch .) as $x | try $x.a)",
+            "{}",
+        ),
+        // ...and a fresh payload equal to the register is not it.
+        (
+            doc,
+            r#"del((try error({"a":{"b":1}}) catch .) as $x | try $x.a)"#,
+            doc,
+        ),
+        // A fold element bind over a source that forwards `.`.
+        (
+            doc,
+            r"(foreach ((., 1) | .) as $x (null; .; try $x.a)) = 9",
+            r#"{"a":9}"#,
+        ),
+        (doc, r"del(foreach ((., 1) | .) as $x (.; try $x.a))", "{}"),
+        (
+            doc,
+            r"[path(foreach ((., 1) | .) as $x (null; .; try $x.a))]",
+            r#"[["a"]]"#,
+        ),
+        (
+            doc,
+            r"del(foreach (label $l | (., 1)) as $x (.; try $x.a))",
+            "{}",
+        ),
+        (
+            doc,
+            r"del(foreach (def f: .; f) as $x (.; .; try $x.a))",
+            "{}",
+        ),
+        (
+            doc,
+            r"del(def f: (., 1); foreach f as $x (null; .; try $x.a))",
+            "{}",
+        ),
+    ] {
+        for_both_evaluators_3795(input, filter, |label, out, stderr, code| {
+            assert_eq!(code, 0, "{label} {filter}: {stderr:?}");
+            assert_eq!(out, format!("{expected}\n"), "{label} {filter}");
+        })?;
+    }
+    // jq's own refusals still agree, prefix and message: the reduce exit re-check,
+    // and a foreach that emits the register's path and then a non-register element.
+    for (filter, prefix, message) in [
+        (
+            r"del(reduce ((., 1) | .) as $x (.; try $x.a))",
+            "",
+            "Invalid path expression with result null",
+        ),
+        (
+            r"path(foreach ((., 1) | .) as $x (.; $x))",
+            "[]\n",
+            "Invalid path expression with result 1",
+        ),
+    ] {
+        for_both_evaluators_3795(doc, filter, |label, out, stderr, code| {
+            assert_eq!((out, code), (prefix, 5), "{label} {filter}");
+            assert!(stderr.contains(message), "{label} {filter}: {stderr:?}");
+        })?;
+    }
+    Ok(())
+}
+
+/// #3795: the shapes the resolver still cannot place -- a zero-arity `def` that
+/// forwards its input, and a source bound after a stage that lost the register --
+/// can be the register by pointer, so a refusal off `$x` is the resolver's guess:
+/// loud (exit 5), never caught, where it used to drop jq's write at exit 0. jq
+/// 1.7.1 writes `{}` in every row; the refusal is the documented price
+/// (`docs/compliance/jq/limitations.md`).
+#[test]
+fn test_bind_sources_the_resolver_cannot_place_refuse_loudly_3795() -> Result<()> {
+    let doc = r#"{"a":{"b":1}}"#;
+    for filter in [
+        r"del(def f: .; f as $x | try $x.a)",
+        r"del(def f: .; def g: f; g as $x | try $x.a)",
+        // The def inside the source itself (review): still a call to a zero-arity
+        // def that forwards `.`.
+        r"del((def f: .; f) as $x | try $x.a)",
+        r"((def f: .; f) as $x | try $x.a) = 9",
+        r"del(first(def f: .; f) as $x | try $x.a)",
+        r#"del(ltrimstr("x") | ((., 1) | .) as $x | try $x.a)"#,
+        r#"del(ltrimstr("x") | (if .z then 1 else . end) as $x | try $x.a)"#,
+        r#"del(ltrimstr("x") | foreach ((., 1) | .) as $x (null; .; try $x.a))"#,
+    ] {
+        for_both_evaluators_3795(doc, filter, |label, out, stderr, code| {
+            assert_eq!((out, code), ("", 5), "{label} {filter}: {stderr:?}");
+            assert!(
+                stderr.contains("Invalid path expression near attempt to access element"),
+                "{label} {filter}: {stderr:?}"
+            );
+        })?;
+    }
+    // A def that builds a value, and a lost register the source's output cannot
+    // be, keep jq's own catchable refusal.
+    for (filter, expected) in [
+        (r"del(def f: {a:{b:1}}; f as $x | try $x.a)", doc),
+        (
+            r#"del(ltrimstr("x") | ({"a":2} | (., 1)) as $x | try $x.a)"#,
+            doc,
+        ),
+    ] {
+        for_both_evaluators_3795(doc, filter, |label, out, stderr, code| {
+            assert_eq!(code, 0, "{label} {filter}: {stderr:?}");
+            assert_eq!(out, format!("{expected}\n"), "{label} {filter}");
+        })?;
+    }
+    Ok(())
+}
+
+/// #3795 (coverage): the fold-element and def-walk arms the other #3795 rows leave
+/// unreached. Every expected value captured live against jq 1.7.1; both evaluators.
+///
+/// - a source that calls one zero-arity def twice, which the by-value-drive check
+///   looks into once (`def f: .; foreach (f, f) ...`);
+/// - a fold source that binds a destructuring pattern, so its elements are driven
+///   by value and the one that is the register carries the register it moved onto
+///   (`. as {a:$q} | (., 1)`, below `.a` too);
+/// - the same, where the source navigates and then runs a stage the resolver cannot
+///   see inside (`.a | add?`), so the register is lost and `$x` is judged by value;
+/// - an output that is not the register, from a source that could hand it back,
+///   which keeps jq's catchable refusal (the one row here that fails without the
+///   demotion; the fold-element rows pin jq's answer and the arms' coverage, but
+///   no output tried changed when either `MovedRegister` arm was flipped).
+#[test]
+fn test_fold_element_binds_and_def_walk_arms_3795() -> Result<()> {
+    let doc = r#"{"a":{"b":1}}"#;
+    for (filter, expected) in [
+        (
+            r"del(def f: .; foreach (f, f) as $x (.; .; try $x.a))",
+            "{}",
+        ),
+        (
+            r"del(def f: .; foreach (f | f) as $x (.; .; try $x.a))",
+            "{}",
+        ),
+        (
+            r"del(foreach (. as {a:$q} | (., 1)) as $x (.; .; try $x.a))",
+            doc,
+        ),
+        (
+            r"del(.a | foreach (. as {b:$q} | (., 1)) as $x (.; .; try $x.a))",
+            doc,
+        ),
+        (
+            r"del(foreach ((.a | add?) // (. as {a:$q} | .)) as $x (.; .; try $x.a))",
+            doc,
+        ),
+        // The output that is not the register (`1`), bound below `.a` where the
+        // register has moved: marked `Unproven` it would be a loud refusal, and
+        // `try` would no longer catch it as jq's own.
+        (r"del((def f: .; (1, f)) as $x | .a | try $x.a)", doc),
+    ] {
+        for_both_evaluators_3795(doc, filter, |label, out, stderr, code| {
+            assert_eq!(code, 0, "{label} {filter}: {stderr:?}");
+            assert_eq!(out, format!("{expected}\n"), "{label} {filter}");
+        })?;
     }
     Ok(())
 }

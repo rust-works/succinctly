@@ -1561,8 +1561,23 @@ is the revert that established what the other one costs.
    a source that differs from the register by value cannot be it. A value the source derives or
    builds (`walk(.)`, `with_entries(.)`, `del(.zz)`, `tojson \| fromjson`, a construction) is
    never the register, so those keep their exact, catchable refusal. Pinned by
-   `test_bind_source_that_may_be_the_register_refuses_loudly_3423`. Residual shapes are
-   [#3795](https://github.com/rust-works/succinctly/issues/3795).
+   `test_bind_source_that_may_be_the_register_refuses_loudly_3423`.
+
+   [#3795](https://github.com/rust-works/succinctly/issues/3795) closed most of the shapes that
+   grammar did not reach. A navigation mixed with `.` (`.a // .`, `first(.a, .)`), a comma under
+   another head, and a `reduce`/`foreach` over such a source are now placed exactly by the
+   resolver and write as jq does, as does a `catch` handler whose body raises the register
+   (`try error(.) catch .`: the payload is the register's own storage). Two shapes the resolver
+   cannot place now refuse loudly where they used to drop jq's write at exit 0: a zero-arity
+   `def` that forwards its input (`del(def f: .; f as $x | try $x.a)`), and a bind made after a
+   stage that lost the register (`del(ltrimstr("x") | ((., 1) | .) as $x | try $x.a)`); jq writes
+   `{}` in both. One residual keeps the silent drop: a `?//` whose source forwards `.` through
+   control flow (`(((., 1) | .) as [$q] ?// $q | try $q.b) = 9` echoes the document where jq
+   writes `.b`). Marking it aborts an alternative jq retries
+   (`test_try_if_widening_does_not_leak_3279`), and binding its bare `$q` as a passthrough is
+   the shape the #3279 review rejected. Pinned by
+   `test_bind_sources_beyond_the_alias_grammar_keep_the_write_3795` and
+   `test_bind_sources_the_resolver_cannot_place_refuse_loudly_3795`.
 
    One residual keeps the silent drop. A *terminal* refusal (the pipe's last value is a `$var`,
    with no navigation after it) is still decided where the per-branch knowledge is gone, so a
@@ -2651,7 +2666,10 @@ is the revert that established what the other one costs.
    since [#3423](https://github.com/rust-works/succinctly/issues/3423) a plain bind whose
    source can hand the register back by pointer and whose output equals the register is bound
    with an `Unproven` marker, which keeps its mark while its value still equals the register at
-   the use site, so that refusal is the resolver's guess and loud (exit 5).
+   the use site, so that refusal is the resolver's guess and loud (exit 5). Since
+   [#3795](https://github.com/rust-works/succinctly/issues/3795) a comma under `if`/`try`/`//`
+   whose leaves are `.`, literals and navigations of the register's node is on the transparent
+   witness grammar, so this source is placed exactly and the `del` writes `{}` as jq does.
    Pinned by `test_comma_bind_source_is_classified_per_branch_3334` and
    `test_bind_source_that_may_be_the_register_refuses_loudly_3423`.
 3. **jq's pointer-identity artifacts on `*`/`+` with an empty operand** —
