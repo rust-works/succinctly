@@ -2,6 +2,21 @@
 
 Tracks updates to the knowledge wiki pages in `docs/`.
 
+## 2026-10-07 — Canonical-echo strings walk a specials mask (issue #3340)
+
+**Sources ingested:**
+- `src/util/simd/specials.rs` (new: `SpecialMask`, `classify_64`) and `scan_json_string_span` /
+  `canonical_escape_len` in `src/json/light.rs`
+- Interleaved wall-clock A/B with a never-calling holdout on terminus (7950X) and johns-mac-mini
+  (M4 Pro), cachegrind `Ir` and `time -l` instructions retired, over #3168's corpus, the #2608 corpus
+  and the generator patterns
+
+**Pages updated:**
+- [parsing/json.md](parsing/json.md) — new "Strings over one specials mask (#3340)" section with the
+  holdout table and the one residual; the #3168 "nothing ships" line now points to it
+- [optimizations/simd.md](optimizations/simd.md) — a block mask beats a per-call SIMD entry when
+  queries are dense
+
 ## 2026-09-27 — SIMD string skip re-measured and rejected again (issue #3168)
 
 **Sources ingested:**

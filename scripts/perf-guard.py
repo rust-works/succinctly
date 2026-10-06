@@ -429,6 +429,16 @@ QUERY_THRESHOLDS = {
     # the default threshold; ARM64-Linux stayed inside it). One-off: remove
     # this entry once the change is in `main` and the row reads ~0% again.
     "users_yq_del_select": 8.0,
+    # `users_compact_identity` (#3340): the canonical-echo gate's string arm
+    # walks one 64-byte specials mask per block instead of every byte of every
+    # string, so the compact identity row on a `users` document got cheaper
+    # (-7.0% x86_64 Ir against the PR's own merge-base, measured on a 7950X
+    # with this script; -5.1% instructions retired on an M4 Pro, whose
+    # ARM64-Linux twin could not be measured here and is expected to land near
+    # it, hence 10.0 and not 8.0). `users_compact_latefail` stays inside the
+    # default (-2.1%): its re-render dominates. One-off: remove this entry
+    # once the change is in `main` and the row reads ~0% again.
+    "users_compact_identity": 10.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
