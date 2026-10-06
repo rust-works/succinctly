@@ -45313,7 +45313,9 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
     let head_resolves_to_register =
         register.is_some_and(|reg| resolves_to_register::<S>(head, trackable, reg, frame));
     let bound_is_frozen = head_may_be_frozen(head, snapshot);
-    let fresh_head = S::TAG == EvalTag::Jq && yields_only_fresh_values(head);
+    // Only a retry reads it (`refusal_is_exact` below, `head_may_be_register`), and the
+    // last alternative never retries, so a single pattern skips the walk.
+    let fresh_head = patterns.len() > 1 && S::TAG == EvalTag::Jq && yields_only_fresh_values(head);
     // #3781: a head this arm cannot place -- not a bare `.`/marker it recognises, not
     // provably fresh (#3489) -- may still be jq's register itself (`select(true)`,
     // `first(.)`, `(.|.)`, `limit(1; .)` pass `.` through with its path). jq then
@@ -45333,7 +45335,7 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
         S::TAG == EvalTag::Jq
             && !head_resolves_to_register
             && !matches!(head, Expr::Identity | Expr::TrackedVar(_))
-            && !yields_only_fresh_values(head)
+            && !fresh_head
             // a head whose spine navigates is a navigated source, which
             // `identical`/the walk already model (`.a as {b:$v0} ?// $v0 | try .a`
             // matches jq); navigation inside a filter argument (`select(.a)`) is not

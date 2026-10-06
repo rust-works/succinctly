@@ -16,8 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[path(foreach ([[1]] as [$x] ?// $y | $y) as $w (.; if $w == null then .a else .b end))]` bound `$y` of the wrong alternative (`[["a"]]` for jq's
   `[["b"]]`). The issue read it as a source retry-after-stop model error; the retry model was right. Such a chain now goes through the resolver like a single
   pattern, and a provably fresh head's first-step refusal is treated as jq's own verdict even with no register in hand, so it holds after INIT navigated.
-  jq mode only. Seeded sweeps against a clean `main`: a 4,320-row source x chain x consumer grid went from 1,901 divergences from jq to 0, the fresh-source
-  sweep (8,202 rows) had 0 failures, and the path-register sweep (4,027 rows) 0 flips. Pinned by `fold_source_alt_chain_over_a_fresh_value_runs_the_next_alternative_3651`.
+  jq mode only. The refusal rule is in the shared `as`-pattern arm, so it also reaches a non-fold `?//` bind over a fresh head; a 13,440-row grid of those
+  (`path`/`del`/`=` x 7 heads x 5 chains x 8 bodies x 12 contexts x 4 documents) flipped no match against jq. Against a clean `main`, the 4,320-row source x chain x consumer
+  grid in `scripts/jq-fold-source-alt-chain-sweep.py` went from 1,901 divergences from jq to 0, `scripts/jq-fold-fresh-source-sweep.py` (8,202 rows) had 0 failures,
+  and `scripts/jq-path-register-sweep.py --sample 4000 --seed 3651` 0 flips. Pinned by `fold_source_alt_chain_over_a_fresh_value_runs_the_next_alternative_3651`.
 - **jq: a navigating `map(f)` in `path()`/`del()`/`=` is resolved as `[.[] | f]`, so jq's path error inside `f` is raised even when the result is discarded** (#3865).
   `path(map({k:1} | .k) | empty)` answered nothing and `del([map({k:1} | .k)] and (.a)?)` deleted nothing at exit 0, where jq raises
   `near attempt to access element "k"`: the by-value leaf evaluated `map(f)` as one opaque value and never path-checked `f`. A `map(f)` whose `f` can move
