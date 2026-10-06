@@ -422,6 +422,13 @@ DEFAULT_THRESHOLD = 5.0
 # already included it.
 QUERY_THRESHOLDS = {
     "wide_keys_unsorted": 10.0,
+    # `users_yq_del_select` (#2664): the shared walk reads a YAML object's
+    # members and scalar children without building a `DocumentField` each or
+    # entering the whole walk, so the yq-mode `del(.users[] | select(...))`
+    # row got cheaper (-5.2% x86_64 against the PR's own merge-base, -5.0% is
+    # the default threshold; ARM64-Linux stayed inside it). One-off: remove
+    # this entry once the change is in `main` and the row reads ~0% again.
+    "users_yq_del_select": 8.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant

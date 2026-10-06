@@ -115,65 +115,15 @@ impl ResolvedScalar {
     /// weren't folded in here — see the #907 follow-up issue.
     ///
     /// A tag-forced float (`!!float 2`) stays a bare
-    /// [`OwnedValue::Float`] here, keeping the value's *text* out of it.
-    /// Only the one caller whose round trip cannot carry float-ness any
-    /// other way needs the re-spelling — see
-    /// [`to_owned_value_for_json_bridge`](Self::to_owned_value_for_json_bridge),
-    /// and that function's doc comment for why giving it to every caller
-    /// is wrong.
+    /// [`OwnedValue::Float`] here, keeping the value's *text* out of it, so
+    /// string-producing builtins answer what real yq answers
+    /// (`!!float 2 | tostring` is `2`, #1090). A variant of this method that
+    /// re-spelled it as `2.0` to survive the `yq` runner's reindex round trip
+    /// (#1176) was removed by #2664: since #2902 a bare `Float` survives that
+    /// round trip as itself, and the literal it baked in leaked into
+    /// `tostring` on the `--eval-all`/`--slurp` routes.
     #[must_use]
     pub fn to_owned_value(self, text: Cow<'_, str>) -> OwnedValue {
-        self.to_owned_value_with_bridge_respelling(text, false)
-    }
-
-    /// [`to_owned_value`](Self::to_owned_value) for a value about to cross
-    /// `yq_runner.rs`'s `evaluate_input` reindex bridge, which re-spells a
-    /// tag-forced float so its type survives that round trip (#1176).
-    ///
-    /// A *finite* float whose text a plain reader would type as something
-    /// other than `!!float` — i.e. one that is only a float because an
-    /// explicit tag forced it (`!!float 2`, `!!float 0x2A`) — has nowhere
-    /// left to carry that float-ness: neither spelling gate in
-    /// [`to_owned_value`](Self::to_owned_value) accepts an integer-shaped
-    /// mantissa, so it arrives at that bridge as a bare
-    /// [`OwnedValue::Float`], serializes as `2`, and reparses as an `Int`.
-    /// Reproducible with no `-i` at all, via `--slurp '.[0]'` on
-    /// `a: !!float 2`. Re-spelling with a forced decimal point puts the
-    /// type back into the literal itself, where the round trip preserves
-    /// it.
-    ///
-    /// **Only that one caller.** `evaluate_input` is the sole bridge in
-    /// the codebase that hardcodes `to_json_for_reindex::<JqSemantics>`
-    /// (deliberately — `YqSemantics` there re-breaks #978's
-    /// JSON-sourced-`1e2`-renders-as-`100` rule), and jq's plain-`Float`
-    /// fallback is the one that drops the point. Every other bridge is
-    /// `S`-gated and spells a bare `Float` with `format_float_yq` under
-    /// `YqSemantics`, whose everyday-magnitude branch is
-    /// `format_float_with_fraction` (#2438) -- and a tag-forced float past
-    /// that magnitude threshold has already picked up its own spelling from
-    /// [`OwnedValue::from_document_float`] in the arm below -- so a
-    /// tag-forced float survives those untouched either way. Handing the re-spelling to
-    /// `eval_generic`'s cursor materialization and to `load()` as well
-    /// costs real oracle fidelity: their values reach string-producing
-    /// builtins, where real yq prints the scalar's own text, so
-    /// `!!float 2 | tostring` would answer `2.0` against yq's `2` (and
-    /// likewise `@yaml`, `@props`) — pinned by
-    /// `test_explicit_float_tag_respelling_stays_out_of_string_builtins_1090`
-    /// in `tests/yq_cli_tests.rs`.
-    ///
-    /// `.inf`/`.nan` stay on the bare-`Float` path: they have no decimal
-    /// spelling, and `resolve_plain` already types them `!!float`, so they
-    /// never need this anyway.
-    #[must_use]
-    pub fn to_owned_value_for_json_bridge(self, text: Cow<'_, str>) -> OwnedValue {
-        self.to_owned_value_with_bridge_respelling(text, true)
-    }
-
-    fn to_owned_value_with_bridge_respelling(
-        self,
-        text: Cow<'_, str>,
-        respell_tag_forced_float: bool,
-    ) -> OwnedValue {
         match self {
             Self::Null => OwnedValue::Null,
             Self::Bool(b) => OwnedValue::Bool(b),
@@ -183,18 +133,6 @@ impl ResolvedScalar {
             }
             Self::Float(f) => match preservable_float_literal_text(&text) {
                 Some(normalized) => OwnedValue::from_number_literal::<YqSemantics>(&normalized),
-                // The tag-forced-float re-spelling (#1176) -- gated to
-                // `to_owned_value_for_json_bridge`'s single caller, whose
-                // doc comment carries the full reasoning and the cost of
-                // applying it any wider.
-                None if respell_tag_forced_float
-                    && f.is_finite()
-                    && needs_explicit_float_tag(&text) =>
-                {
-                    OwnedValue::from_number_literal::<YqSemantics>(
-                        &super::format_float_with_fraction(f),
-                    )
-                }
                 // #2438: same document boundary as `to_owned_at_depth`'s own
                 // bare-float arm (`src/jq/eval_generic.rs`) -- an explicitly
                 // tagged `!!float 100000000000000000000` reaches `OwnedValue`
@@ -618,36 +556,19 @@ pub(super) fn preservable_float_literal_text(s: &str) -> Option<String> {
 }
 
 /// Whether emitting `text` as a plain YAML scalar would lose its
-/// float-ness, so a `!!float` tag (or a float-shaped respelling) is needed
-/// to keep the value's type stable across a round trip.
+/// float-ness, so a `!!float` tag is needed to keep the value's type stable
+/// across a round trip: `format_float_yq_yaml_nested` (`light.rs`) asks it to
+/// decide whether nested YAML output must precede a computed float with
+/// `!!float ` (#1090).
 ///
-/// Deliberately defined as "what [`resolve_plain`] — this crate's own
-/// reader — would say", rather than a hand-rolled scan for `.`/`e`. Two
-/// callers need the identical question answered and a second, independent
-/// spelling of YAML's float grammar would drift from the first (CLAUDE.md's
-/// #106 lesson: duplicated predicates diverge silently):
-/// - `format_float_yq_yaml_nested` (`light.rs`), deciding whether nested
-///   YAML output must precede a computed float with `!!float ` (#1090).
-/// - [`ResolvedScalar::to_owned_value`] below, deciding whether a
-///   tag-forced float needs a float-shaped literal to survive
-///   `to_json_for_reindex`'s JSON round trip (#1176).
-///
-/// Anchoring on `resolve_plain` also guarantees the emitter and the reader
-/// agree: whatever spelling this crate writes, this crate reads back at the
-/// same type. `resolve_plain` is the *JSON-sourced* reading, where `-0` is
-/// the integer zero, which is what the second caller (a JSON round trip)
-/// needs; the YAML emitter asks [`needs_explicit_float_tag_in_yaml`] instead,
-/// because a YAML document's `-0` is a float (#3445).
-#[must_use]
-pub(crate) fn needs_explicit_float_tag(text: &str) -> bool {
-    !matches!(resolve_plain(text), ResolvedScalar::Float(_))
-}
-
-/// [`needs_explicit_float_tag`] for text this crate is about to write into a
-/// YAML document (#3445): the question is what a YAML reader would make of
-/// it, and a YAML document's `-0` reads back as a float
-/// ([`resolve_plain_sourced`]), so a computed negative zero is emitted bare,
-/// as real yq does, rather than as `!!float -0`.
+/// Deliberately defined as "what this crate's own YAML reader
+/// ([`resolve_plain_sourced`]) would say", rather than a hand-rolled scan for
+/// `.`/`e`: a second, independent spelling of YAML's float grammar would drift
+/// from the first (CLAUDE.md's #106 lesson: duplicated predicates diverge
+/// silently), and the emitter and the reader must agree on whatever spelling
+/// this crate writes. A YAML document's `-0` reads back as a float, so a
+/// computed negative zero is emitted bare, as real yq does, rather than as
+/// `!!float -0` (#3445).
 #[must_use]
 pub(crate) fn needs_explicit_float_tag_in_yaml(text: &str) -> bool {
     !matches!(resolve_plain_sourced(text, false), ResolvedScalar::Float(_))

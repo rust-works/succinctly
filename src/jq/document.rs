@@ -454,6 +454,18 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// for YAML.
     const HAS_DELIMITER_CHECKS: bool = true;
 
+    /// Whether a cursor walk that already holds a member's value (a
+    /// [`DocumentField`] is built with one) hands it to the member's own walk
+    /// instead of resolving it again from the member's cursor (#2664).
+    ///
+    /// `false` by default, so JSON's walks are untouched: resolving a JSON
+    /// value is a token classification, and carrying the value into the
+    /// callee costs it an argument. `true` for YAML, where the resolve decodes
+    /// the node and the walk was doing it twice per member -- the difference
+    /// between the shared walk costing 26-40% and 2-5% more than the
+    /// hand-written one it replaced on a 10 MB `--slurp`.
+    const REUSE_FIELD_VALUE: bool = false;
+
     /// Whether a sequence's elements, and a mapping's members, are exactly the
     /// chain [`next_element`](Self::next_element) walks from the first, so that
     /// a scan for one can resume from one an earlier scan already reached
@@ -1727,6 +1739,32 @@ pub trait DocumentFields: Sized + Clone {
     fn uncons_key(&self) -> Option<(Self::Value, Self::Cursor, Self)> {
         let (field, rest) = self.uncons()?;
         Some((field.key, field.key_cursor, rest))
+    }
+
+    /// Visit every field as `(key, value, value cursor)`, stopping at the
+    /// first error, then check the list ended where it should (#2664).
+    ///
+    /// [`uncons`](Self::uncons) per member builds a whole [`DocumentField`]
+    /// (176 bytes for YAML), and returns it with the rest of the list through
+    /// memory; this hands the three things a walk that checks no member
+    /// delimiters ([`DocumentCursor::HAS_DELIMITER_CHECKS`] is `false`) reads
+    /// to a callback instead, with no key cursor and nothing to move.
+    ///
+    /// The default is the `uncons` loop, so a format pays nothing to ignore
+    /// it; YAML overrides it with its own iterator.
+    fn try_for_each_member(
+        &self,
+        mut each: impl FnMut(Self::Value, Self::Value, Self::Cursor) -> Result<(), EvalError>,
+    ) -> Result<(), EvalError> {
+        let mut f = self.clone();
+        while let Some((field, rest)) = f.uncons() {
+            each(field.key, field.value, field.value_cursor)?;
+            f = rest;
+        }
+        if f.ends_unpaired() {
+            return Err(f.malformed_member_error());
+        }
+        Ok(())
     }
 
     /// Walk every field, keeping every occurrence of a repeated key in
@@ -3831,9 +3869,7 @@ impl<V: DocumentValue, C: DocumentCursor> DocumentField<V, C> {
     where
         F: DocumentFields<Value = V, Cursor = C>,
     {
-        let Some(key) = resolve_display_key(&self.key, map, guard)? else {
-            return Err(fields.malformed_member_error());
-        };
+        let key = checked_member_key(&self.key, fields, map, guard)?;
         if !self.delimiters_ok::<F>(is_first) {
             return Err(fields.malformed_member_error());
         }
@@ -3868,6 +3904,25 @@ impl<V: DocumentValue, C: DocumentCursor> DocumentField<V, C> {
         }
         Ok(())
     }
+}
+
+/// The key half of [`DocumentField::checked_key`], with no delimiter check.
+///
+/// A member's display key under the #1642 collision rules, or the
+/// malformed-member error for a key that will not stringify at all (#1194).
+/// One definition for `checked_key` and for the walks that read a member as
+/// `(key, value, cursor)` ([`DocumentFields::try_for_each_member`]) because
+/// their format checks no delimiters (#2664).
+pub fn checked_member_key<F, T>(
+    key: &F::Value,
+    fields: &F,
+    map: &IndexMap<String, T>,
+    guard: &mut DisplayKeyGuard,
+) -> Result<String, EvalError>
+where
+    F: DocumentFields,
+{
+    resolve_display_key(key, map, guard)?.ok_or_else(|| fields.malformed_member_error())
 }
 
 /// The #1642 key-collision bookkeeping of an object walk that keeps none of

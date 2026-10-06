@@ -4688,6 +4688,102 @@ fn test_integer_valued_float_survives_slurp_eval_all_load_907() -> Result<()> {
     Ok(())
 }
 
+/// #2664: `load()`'s YAML path and `--slurp`/`--arg`/`-P`'s used to be two
+/// hand-written walks that spelled a *complex* mapping key differently --
+/// `load` as the key's compact JSON (`{"[1,2]":"value"}`), the runner as
+/// `""` (#222). They are one walk now, and `load` agrees with real yq
+/// (v4.53.3: `echo null | yq -o json -I0 'load("bk.yaml")'` prints
+/// `{"":"value"}`), as does the runner route.
+#[test]
+fn test_load_complex_mapping_key_spells_empty_like_the_runner_2664() -> Result<()> {
+    for doc in ["? - 1\n  - 2\n: value\n", "? [1, 2]\n: value\n"] {
+        let mut input_file = NamedTempFile::new()?;
+        write!(input_file, "{doc}")?;
+        let load_expr = format!("load({:?})", input_file.path().display().to_string());
+        let (out, code) = run_yq_stdin(&load_expr, "null", &["-o", "json", "-I", "0"])?;
+        assert_eq!(code, 0, "doc {doc:?}: out: {out:?}");
+        assert_eq!(out.trim(), r#"{"":"value"}"#, "doc {doc:?}");
+
+        let (out, code) = run_yq_stdin(".", doc, &["--arg", "x", "1", "-o", "json", "-I", "0"])?;
+        assert_eq!(code, 0, "doc {doc:?}: out: {out:?}");
+        assert_eq!(out.trim(), r#"{"":"value"}"#, "doc {doc:?}");
+    }
+    Ok(())
+}
+
+/// #2664: two complex keys both spell `""`, which `OwnedValue::Object` cannot
+/// hold twice, so `load()` raises through the shared `resolve_display_key`
+/// guard like every other materializing route (#2519, a recorded ADR-0018
+/// rule-4(b) divergence from yq, which keeps both). `load` used to keep both
+/// under two renderings of the key (`{"[1]":"a","[2]":"b"}`). A genuine `""`
+/// key colliding with a complex one raises too.
+#[test]
+fn test_load_colliding_complex_mapping_keys_raise_2664() -> Result<()> {
+    for doc in ["? - 1\n: a\n? - 2\n: b\n", "\"\": a\n? [x]\n: b\n"] {
+        let mut input_file = NamedTempFile::new()?;
+        write!(input_file, "{doc}")?;
+        let path = input_file.path().display().to_string();
+        let load_expr = format!("load({path:?})");
+        let (out, err, code) = run_yq_stdin_with_stderr(&load_expr, "null", &[])?;
+        assert_ne!(code, 0, "doc {doc:?}: out: {out:?}");
+        assert!(err.contains("is ambiguous"), "doc {doc:?}: err: {err}");
+    }
+    Ok(())
+}
+
+/// #2664: the runner's walk is the library's one walk, with no variant of its
+/// own. It used to materialize a tag-forced float through
+/// `to_owned_value_for_json_bridge`, which baked the literal `2.0` in to keep
+/// the float-ness across the reindex round trip (#1176) -- and so leaked it
+/// into string builtins on exactly the `--eval-all`/`--slurp` routes:
+/// `--eval-all '.a | tostring'` on `a: !!float 2` answered `"2.0"`, where real
+/// yq (v4.53.3, `yq ea -o json -I0 '.a | tostring'`) answers `"2"`, as every
+/// other route here already did (#1090). Since #2902 a bare `Float` survives
+/// that round trip as itself, so the type and the JSON spelling are pinned
+/// here to still hold without the re-spelling.
+#[test]
+fn test_runner_walk_keeps_tag_forced_float_type_without_respelling_2664() -> Result<()> {
+    let doc = "a: !!float 2\nb: 1.0\nc: !!str 1\nd: [!!float 3]\n";
+    let (out, code) = run_yq_stdin(".", doc, &["--arg", "x", "1", "-o", "json", "-I", "0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":2.0,"b":1.0,"c":"1","d":[3.0]}"#);
+
+    for route in ["--eval-all", "--slurp"] {
+        // `--slurp` wraps the documents in an array.
+        let (path, want_tostring) = if route == "--slurp" {
+            (".[0].a", r#""2""#)
+        } else {
+            (".a", r#""2""#)
+        };
+        let (out, code) = run_yq_stdin(
+            &format!("{path} | tostring"),
+            doc,
+            &[route, "-o", "json", "-I", "0"],
+        )?;
+        assert_eq!(code, 0, "{route}: out: {out:?}");
+        assert_eq!(out.trim(), want_tostring, "{route}");
+
+        // The re-spelled literal also made it compare unequal to the integer
+        // it equals (`false` here before #2664; yq answers `true`).
+        let (out, code) = run_yq_stdin(
+            &format!("{path} == 2"),
+            doc,
+            &[route, "-o", "json", "-I", "0"],
+        )?;
+        assert_eq!(code, 0, "{route}: out: {out:?}");
+        assert_eq!(out.trim(), "true", "{route}");
+
+        let (out, code) = run_yq_stdin(
+            &format!("{path} | tag"),
+            doc,
+            &[route, "-o", "json", "-I", "0"],
+        )?;
+        assert_eq!(code, 0, "{route}: out: {out:?}");
+        assert_eq!(out.trim(), r#""!!float""#, "{route}");
+    }
+    Ok(())
+}
+
 /// #907 companion, corrected by #978: `standard_json_to_owned`'s removal
 /// (see the test above) changed `--slurp`/`--eval-all --input-format
 /// json`'s number formatting, not just YAML input's -- `StandardJson::
@@ -14262,14 +14358,14 @@ fn test_tonumber_lenient_spellings_unaffected_in_yq_mode_3033() -> Result<()> {
     Ok(())
 }
 
-/// #1090 follow-on: #1176's tag-forced-float re-spelling is scoped to the
-/// one materialization that crosses `evaluate_input`'s reindex bridge, and
-/// must not reach the cursor materialization that string-producing
-/// builtins read.
+/// #1090 follow-on: #1176's tag-forced-float re-spelling must not reach the
+/// cursor materialization that string-producing builtins read. (It was scoped
+/// to the one materialization that crossed `evaluate_input`'s reindex bridge,
+/// and #2664 removed it altogether -- see
+/// `test_runner_walk_keeps_tag_forced_float_type_without_respelling_2664`.)
 ///
 /// Real yq prints the scalar's own text in all three of these, so an
-/// `!!float 2` node answers `2`, not `2.0`. Handing
-/// `to_owned_value_for_json_bridge`'s re-spelling to every
+/// `!!float 2` node answers `2`, not `2.0`. Handing the re-spelling to every
 /// `ResolvedScalar -> OwnedValue` caller (the shape this fix's first draft
 /// shipped) silently moved all three off the oracle -- including
 /// `tostring | length`, which went from `1` to `3`. Every expectation

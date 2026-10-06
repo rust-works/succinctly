@@ -43,11 +43,11 @@ use std::rc::Rc;
 use indexmap::IndexMap;
 
 use super::document::{
-    child_tail_gap_ok, collapsed_fields, collapsed_fields_if, container_tail_gap_ok,
-    effective_fields_checked, effective_fields_with_raw_last, effective_len_checked,
-    empty_elements_tail_gap_ok, empty_fields_tail_gap_ok, key_delimiter_ok, key_display_string,
-    key_display_string_kind, key_hash, key_is_malformed, resolve_display_key, tail_gap_ok,
-    trailing_element_gap_ok, value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors,
+    checked_member_key, child_tail_gap_ok, collapsed_fields, collapsed_fields_if,
+    container_tail_gap_ok, effective_fields_checked, effective_fields_with_raw_last,
+    effective_len_checked, empty_elements_tail_gap_ok, empty_fields_tail_gap_ok, key_delimiter_ok,
+    key_display_string, key_display_string_kind, key_hash, key_is_malformed, resolve_display_key,
+    tail_gap_ok, trailing_element_gap_ok, value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors,
     DocumentCursor, DocumentElements, DocumentFields, DocumentValue, IndentSpec, JsonConvention,
     LazyKeyLedger,
 };
@@ -834,9 +834,10 @@ pub fn to_owned_cursor<S: EvalSemantics, C: DocumentCursor>(
     }
     let result = to_owned_cursor_at_depth::<S, _, BuildOwned>(
         cursor,
+        None,
         0,
         &nesting_depth_check,
-        &|_| None,
+        &|_, _| None,
         &nested,
     );
     // #2334: see `debug_assert_materialization_error`'s own doc comment --
@@ -995,9 +996,87 @@ fn resolve_terminal_prefix_generic<C: DocumentCursor, S: EvalSemantics>(
 pub(super) fn to_owned_cursor_with<C: DocumentCursor, S: EvalSemantics>(
     cursor: &C,
     check_depth: impl Fn(usize) -> Result<(), EvalError>,
-    scalar_override: impl Fn(&C::Value) -> Option<OwnedValue>,
+    scalar_override: impl Fn(&C, &C::Value) -> Option<OwnedValue>,
 ) -> Result<OwnedValue, EvalError> {
-    to_owned_cursor_at_depth::<S, _, BuildOwned>(cursor, 0, &check_depth, &scalar_override, &[])
+    to_owned_cursor_at_depth::<S, _, BuildOwned>(
+        cursor,
+        None,
+        0,
+        &check_depth,
+        &scalar_override,
+        &[],
+    )
+}
+
+/// [`to_owned_cursor`] for a YAML document no `as` binding can name: what the
+/// `yq` CLI's input documents and `load()`'s file are (#2664).
+///
+/// The same walk, without the #2889 embed-table consultation, which is keyed
+/// by node and so could mistake a node of this document for a bound node of
+/// another. Its scalar override ([`yaml_scalar_in_one_resolve`]) is what the
+/// two hand-written walks this replaced did per scalar, and for the reason
+/// they did it: the accessor chain every other format shares re-resolves a
+/// YAML scalar's text once per accessor (`is_null`, `as_bool`,
+/// `number_literal`, `as_i64`, ...), which cost this route 16-51% on a
+/// 10 MB document against the walk it replaced (#2664).
+///
+/// `#[doc(hidden)]`: `pub` only because `src/bin/succinctly/*` is a separate
+/// crate, not library API.
+#[doc(hidden)]
+pub fn to_owned_yaml_cursor<S: EvalSemantics, W: AsRef<[u64]> + Clone>(
+    cursor: &crate::yaml::YamlCursor<'_, W>,
+) -> Result<OwnedValue, EvalError> {
+    let result = to_owned_cursor_at_depth::<S, _, BuildOwned>(
+        cursor,
+        None,
+        0,
+        &nesting_depth_check,
+        &yaml_scalar_in_one_resolve,
+        &[],
+    );
+    // #2334: the depth-0 entry point asserts, as `to_owned_cursor` does.
+    debug_assert_materialization_error(&result);
+    result
+}
+
+/// A YAML scalar materialized from one resolve of its text, or `None` to take
+/// the shared accessor chain.
+///
+/// Reproduces what that chain answers for the scalars it covers -- an explicit
+/// tag (#224), a quoted string kept as a string, a plain scalar typed by the
+/// core schema through [`ResolvedScalar::to_owned_value`] -- and declines
+/// everything else, so the chain still owns the error cases (an undecodable
+/// string, an `Error` node), aliases, and a JSON-sourced document's number
+/// canonicalization. It must keep agreeing with that chain, which
+/// `yaml_one_resolve_override_agrees_with_the_accessor_chain_2664` pins over a
+/// corpus of scalar spellings, and the #224/#835/#903/#1801 tests pin the
+/// tag, alias and error cases.
+fn yaml_scalar_in_one_resolve<W: AsRef<[u64]> + Clone>(
+    cursor: &crate::yaml::YamlCursor<'_, W>,
+    value: &crate::yaml::YamlValue<'_, W>,
+) -> Option<OwnedValue> {
+    use crate::yaml::YamlValue;
+    if cursor.canonicalize_numbers() {
+        return None;
+    }
+    match value {
+        YamlValue::Null => Some(OwnedValue::Null),
+        YamlValue::String(s) => {
+            let text = s.as_str().ok()?;
+            // #2621: `value` is a `String`, so `cursor` is not an `Alias` and
+            // `None` skips a second resolve.
+            if let Some(tag) = cursor.explicit_tag_at(None) {
+                if let Some(resolved) = crate::yaml::resolve_tagged(&text, tag) {
+                    return Some(resolved.to_owned_value(text));
+                }
+            }
+            if !s.is_unquoted() {
+                return Some(OwnedValue::String(text.into_owned().into()));
+            }
+            Some(s.resolve_plain_scalar(&text).to_owned_value(text))
+        }
+        _ => None,
+    }
 }
 
 /// [`to_owned_cursor`]'s and [`validate_cursor`]'s depth contract: a
@@ -1030,9 +1109,10 @@ fn nesting_depth_check(depth: usize) -> Result<(), EvalError> {
 pub fn validate_cursor<S: EvalSemantics, C: DocumentCursor>(cursor: &C) -> Result<(), EvalError> {
     let result = to_owned_cursor_at_depth::<S, _, CheckOnly>(
         cursor,
+        None,
         0,
         &nesting_depth_check,
-        &|_| None,
+        &|_, _| None,
         &[],
     );
     // The same depth-0 assertion `to_owned_cursor` makes (#2334).
@@ -1107,20 +1187,52 @@ impl CursorWalkOutput for CheckOnly {
     }
 }
 
+/// Walk one child of a container: a scalar the format's override answers is
+/// materialized here, without a call into the whole container-and-scalar walk
+/// below, whose entry cost is paid per node and is most of what separated the
+/// shared YAML walk from the hand-written one it replaced (#2664). Only a
+/// format that reuses member values ([`DocumentCursor::REUSE_FIELD_VALUE`])
+/// holds the child's value here, so for every other format `known` is `None`
+/// and this is the call it always was.
+#[inline(always)]
+fn walk_child<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOutput>(
+    cursor: &C,
+    known: Option<C::Value>,
+    depth: usize,
+    check_depth: &impl Fn(usize) -> Result<(), EvalError>,
+    scalar_override: &impl Fn(&C, &C::Value) -> Option<OwnedValue>,
+    nested: &[usize],
+) -> Result<B::Out, EvalError> {
+    if let Some(value) = &known {
+        // The callee's own first check, then its scalar-override arm.
+        check_depth(depth)?;
+        if let Some(owned) = scalar_override(cursor, value) {
+            return Ok(B::scalar(owned));
+        }
+    }
+    to_owned_cursor_at_depth::<S, _, B>(cursor, known, depth, check_depth, scalar_override, nested)
+}
+
 /// `nested` names the in-scope binding's nodes inside this walk's subtree:
 /// such a child comes back as that binding's own value
 /// ([`embed_shared_nested`], #3179). Only [`to_owned_cursor`] passes any,
 /// from [`embed_at_or_within`]: its depth contract is the one the height rule
 /// is stated against.
+///
+/// `known` is `cursor`'s own value when the caller already holds it and the
+/// format asks for it to be reused ([`DocumentCursor::REUSE_FIELD_VALUE`]): a
+/// member's `DocumentField` is built with its value, and resolving it again
+/// from the same cursor on entry doubled the cost of every YAML member (#2664).
 fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOutput>(
     cursor: &C,
+    known: Option<C::Value>,
     depth: usize,
     check_depth: &impl Fn(usize) -> Result<(), EvalError>,
-    scalar_override: &impl Fn(&C::Value) -> Option<OwnedValue>,
+    scalar_override: &impl Fn(&C, &C::Value) -> Option<OwnedValue>,
     nested: &[usize],
 ) -> Result<B::Out, EvalError> {
     check_depth(depth)?;
-    let value = cursor.value();
+    let value = known.unwrap_or_else(|| cursor.value());
     if let Some(fields) = value.as_object() {
         let mut map = IndexMap::new();
         let mut guard = DisplayKeyGuard::default();
@@ -1143,6 +1255,28 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
         // #3134: the members whose node an anchor is waiting on, with their
         // keys -- empty unless `nested` names one.
         let mut watched: Vec<(usize, OwnedValue)> = Vec::new();
+        if C::REUSE_FIELD_VALUE && !C::HAS_DELIMITER_CHECKS && B::KEEPS_MEMBERS && nested.is_empty()
+        {
+            // A format that holds each member's value and checks no member
+            // delimiters needs neither the key cursor nor the whole
+            // `DocumentField`: the same key rule (`resolve_display_key`, the
+            // half of `checked_key` that is not a delimiter check) on a
+            // slimmer member (#2664).
+            f.try_for_each_member(|key, member_value, value_cursor| {
+                let key = checked_member_key(&key, &f, &map, &mut guard)?;
+                let child = walk_child::<S, _, B>(
+                    &value_cursor,
+                    Some(member_value),
+                    depth + 1,
+                    check_depth,
+                    scalar_override,
+                    nested,
+                )?;
+                map.insert(key, child);
+                Ok(())
+            })?;
+            return Ok(B::object(map));
+        }
         while let Some((field, rest)) = f.uncons() {
             // Same key and delimiter handling as `to_owned_at_depth` above,
             // and since #1803 literally the same call -- these two
@@ -1157,8 +1291,9 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
             };
             let child = match embed_shared_nested::<_, B>(&field.value_cursor, depth + 1, nested) {
                 Some(child) => child,
-                None => to_owned_cursor_at_depth::<S, _, B>(
+                None => walk_child::<S, _, B>(
                     &field.value_cursor,
+                    C::REUSE_FIELD_VALUE.then_some(field.value),
                     depth + 1,
                     check_depth,
                     scalar_override,
@@ -1220,8 +1355,9 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
             items.push(
                 match embed_shared_nested::<_, B>(&elem_cursor, depth + 1, nested) {
                     Some(child) => child,
-                    None => to_owned_cursor_at_depth::<S, _, B>(
+                    None => walk_child::<S, _, B>(
                         &elem_cursor,
+                        C::REUSE_FIELD_VALUE.then(|| elem_cursor.value()),
                         depth + 1,
                         check_depth,
                         scalar_override,
@@ -1242,7 +1378,7 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
         }
         Ok(out)
     } else {
-        if let Some(owned) = scalar_override(&value) {
+        if let Some(owned) = scalar_override(cursor, &value) {
             return Ok(B::scalar(owned));
         }
         // An applicable explicit tag resolves from the raw text and so can
@@ -42816,6 +42952,170 @@ mod tests {
         }
     }
 
+    /// #2664: the YAML scalar override ([`yaml_scalar_in_one_resolve`]) is a
+    /// speed-up over the shared accessor chain, never a second opinion: the
+    /// value, its number spelling (compared through `Debug`, which `PartialEq`
+    /// can blur) and the error it raises are the chain's, on every spelling of
+    /// scalar, tag, alias and key the walks have had a bug over.
+    #[test]
+    fn yaml_one_resolve_override_agrees_with_the_accessor_chain_2664() {
+        use crate::yaml::YamlIndex;
+        let docs = [
+            "a: -0\nb: .inf\nc: -.inf\nd: .nan\ne: 0x1F\nf: 0o7\ng: 1_000\nh: 1e3\ni: .5\nj: 007\nk: 1.0\nl: 1.50\nm: +1\nn: 0b11\n",
+            "a: ~\nb: null\nc: true\nd: True\ne: yes\nf: 12345678901234567890\ng: 1e400\nh: -0.0\ni: 0.1e1\nj: 1.e5\nk: 0.30000000000000004\nl: 9223372036854775808\nm: 5e-324\n",
+            "a: \"1\"\nb: '2'\nc: \"true\"\nd: \"\"\ne: 'it''s'\nf: |\n  block\n  text\ng: >\n  folded\n  text\n",
+            "a: !!str 1\nb: !!int \"5\"\nc: !!float 2\nd: !!float \"3\"\ne: !!bool \"true\"\nf: !!null x\ng: !!int 0x10\nh: !!float 100000000000000000000\ni: !!float .inf\nj: !!int abc\nk: !!custom 7\n",
+            "- !!str 1\n- !!float 2\n- !!int \"7\"\n-\n  !!str 3\n- !!float\n  4\n",
+            "x: &a !!str 1\ny: *a\nz: &b !!float 2\nw: *b\nv: &c 5\nu: *c\n",
+            "a: &x hello\nb: *x\nc: [*x, *x]\n",
+            "base: &b {x: 1, y: 2}\nm:\n  <<: *b\n  z: 3\n",
+            "a:\n  b:\n    - 1\n    - {c: [2, 3], d: x}\n    - - 4\n      - 5\n",
+            "a: []\nb: {}\nc: [[]]\nd: [{}]\n",
+            "just a string\n",
+            "a: 9223372036854775807\nb: -9223372036854775808\nc: 1.7976931348623157e308\n",
+            "? - 1\n  - 2\n: value\n",
+            "? - 1\n: a\n? - 2\n: b\n",
+            "\"\\q\": bad\ngood: kept\n",
+            "a: \"\\q\"\n",
+        ];
+        fn agree<S: EvalSemantics>(doc: &str, cursor: &crate::yaml::YamlCursor<'_, Vec<u64>>) {
+            // The value (through `to_json` and through `Debug`, which keeps the
+            // number spelling `PartialEq` can blur) or the error message.
+            let observe = |r: Result<OwnedValue, EvalError>| {
+                r.map(|v| (v.to_json(), format!("{v:?}")))
+                    .map_err(|e| e.message)
+            };
+            assert_eq!(
+                observe(to_owned_yaml_cursor::<S, _>(cursor)),
+                observe(to_owned_cursor::<S, _>(cursor)),
+                "{doc:?}"
+            );
+        }
+        for doc in docs {
+            // A JSON-sourced index canonicalizes numbers, which the override
+            // declines and leaves to the chain: it must agree there too.
+            for json_sourced in [false, true] {
+                let mut index = YamlIndex::build(doc.as_bytes()).unwrap();
+                if json_sourced {
+                    index.mark_json_sourced();
+                }
+                let root = index.root(doc.as_bytes());
+                let cursor = root
+                    .first_child()
+                    .expect("YAML document should have content");
+                agree::<YqSemantics>(doc, &cursor);
+                // `load()` runs this entry under whichever mode it was called in.
+                agree::<JqSemantics>(doc, &cursor);
+            }
+        }
+    }
+
+    /// #2664: the trait-default `try_for_each_member` (which only a format
+    /// that overrides nothing runs -- JSON checks member delimiters, so the walk
+    /// never reaches for it there) visits the members `uncons` yields, in
+    /// order, stops at the first error the callback returns, and reports a
+    /// list that ended unpaired.
+    #[test]
+    fn default_try_for_each_member_visits_in_order_and_stops_on_error_2664() {
+        use crate::json::JsonIndex;
+
+        let json = br#"{"a": 1, "b": [2], "c": "x"}"#;
+        let index = JsonIndex::build(json);
+        let fields = index.root(json).value().as_object().expect("an object");
+        let mut seen = Vec::new();
+        fields
+            .try_for_each_member(|key, _value, cursor| {
+                seen.push((
+                    key.as_str().map(|k| k.to_string()),
+                    to_owned_cursor::<JqSemantics, _>(&cursor)
+                        .unwrap()
+                        .to_json(),
+                ));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            seen,
+            [
+                (Some("a".to_string()), "1".to_string()),
+                (Some("b".to_string()), "[2]".to_string()),
+                (Some("c".to_string()), "\"x\"".to_string()),
+            ]
+        );
+
+        let mut visited = 0;
+        let stopped = fields.try_for_each_member(|_, _, _| {
+            visited += 1;
+            Err(EvalError::new("stop"))
+        });
+        assert_eq!(stopped.unwrap_err().message, "stop");
+        assert_eq!(visited, 1, "the walk must stop at the first error");
+
+        // A trailing member with no value is the list ending unpaired.
+        let unpaired = br#"{"a": 1, invalid}"#;
+        let index = JsonIndex::build(unpaired);
+        let fields = index.root(unpaired).value().as_object().expect("an object");
+        let mut visited = 0;
+        let result = fields.try_for_each_member(|_, _, _| {
+            visited += 1;
+            Ok(())
+        });
+        assert_eq!(visited, 1);
+        assert!(result.is_err(), "an unpaired tail must raise");
+    }
+
+    /// #2664: `DocumentCursor::REUSE_FIELD_VALUE` lets the walk hand a child
+    /// the value its member was built with instead of resolving it again; that
+    /// is only sound while a YAML member's `value` *is* its cursor's value, on
+    /// every shape of member (a merge key's, an alias's, a tagged scalar's).
+    #[test]
+    fn yaml_field_value_is_its_cursors_value_2664() {
+        use crate::yaml::YamlIndex;
+        // The choice is per format and deliberate: YAML resolves a value by
+        // decoding the node, JSON's walks stay as they were.
+        const _: () = {
+            assert!(
+                <crate::yaml::YamlCursor<'static, Vec<u64>> as DocumentCursor>::REUSE_FIELD_VALUE
+            );
+            assert!(
+                !<crate::json::light::JsonCursor<'static, Vec<u64>> as DocumentCursor>::REUSE_FIELD_VALUE
+            );
+        };
+        let docs = [
+            "a: 1\nb: [2, {c: x}]\nd: !!float 3\ne: \"s\"\n",
+            "x: &a hello\ny: *a\nz: &m {k: v}\nw: *m\n",
+            "base: &b {x: 1, y: 2}\nm:\n  <<: *b\n  z: 3\n",
+        ];
+        for doc in docs {
+            let index = YamlIndex::build(doc.as_bytes()).unwrap();
+            let root = index.root(doc.as_bytes());
+            let cursor = root
+                .first_child()
+                .expect("YAML document should have content");
+            let mut stack = vec![cursor];
+            while let Some(node) = stack.pop() {
+                let value = node.value();
+                if let Some(fields) = value.as_object() {
+                    let mut f = fields;
+                    while let Some((field, rest)) = DocumentFields::uncons(&f) {
+                        let held = to_owned_cursor::<YqSemantics, _>(&field.value_cursor)
+                            .map(|v| v.to_json());
+                        let own = to_owned::<YqSemantics, _>(&field.value).map(|v| v.to_json());
+                        assert_eq!(own, held, "member value of {doc:?}");
+                        stack.push(field.value_cursor);
+                        f = rest;
+                    }
+                } else if let Some(elements) = value.as_array() {
+                    let mut e = elements;
+                    while let Some((elem, rest)) = e.uncons_cursor() {
+                        stack.push(elem);
+                        e = rest;
+                    }
+                }
+            }
+        }
+    }
+
     /// A scalar answers the nesting-depth failure itself when the caller's
     /// `check_depth` is laxer than [`MAX_NESTING_DEPTH`]: the guard at the
     /// walk's entry has already passed it, and the scalar arm re-checks
@@ -42831,7 +43131,7 @@ mod tests {
         // The strict contract refuses a level earlier, at the scalar's own
         // entry; the lax one lets the scalar arm see it.
         let strict = to_owned_cursor::<JqSemantics, _>(&cursor).expect_err("too deep");
-        let lax = to_owned_cursor_with::<_, JqSemantics>(&cursor, |_| Ok(()), |_| None)
+        let lax = to_owned_cursor_with::<_, JqSemantics>(&cursor, |_| Ok(()), |_, _| None)
             .expect_err("a scalar this deep must still be refused");
         let expected = crate::jq::value::nesting_depth_exceeded_message(MAX_NESTING_DEPTH);
         assert_eq!(strict.message, expected);
@@ -42843,7 +43143,7 @@ mod tests {
         let index = JsonIndex::build(doc.as_bytes());
         let cursor = index.root(doc.as_bytes());
         assert!(to_owned_cursor::<JqSemantics, _>(&cursor).is_ok());
-        assert!(to_owned_cursor_with::<_, JqSemantics>(&cursor, |_| Ok(()), |_| None).is_ok());
+        assert!(to_owned_cursor_with::<_, JqSemantics>(&cursor, |_| Ok(()), |_, _| None).is_ok());
     }
 
     /// Whether `query` over `json` in jq mode answers a prevalidated cursor

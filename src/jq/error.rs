@@ -1323,10 +1323,10 @@ impl EvalError {
     ///
     /// Called directly (not via a `document.rs`-local wrapper, #1813
     /// review): `document.rs`'s own `resolve_display_key` -- which
-    /// `succinctly-cli`'s `yq_runner.rs` (`yaml_to_owned_value`, #1749)
-    /// now also goes through (#2519) -- plus `eval.rs`'s
-    /// `yaml_value_to_owned_checked` (`load()`'s YAML path) and its
-    /// `StandardJson`-only `map_values`/`pick`/`omit` arms. `EvalError` is
+    /// the generic materializers (`yq_runner.rs`'s `yaml_to_owned_value`,
+    /// #1749, and `load()`'s YAML path both run on them since #2664) also go
+    /// through (#2519) -- plus `eval.rs`'s `StandardJson`-only
+    /// `map_values`/`pick`/`omit` arms. `EvalError` is
     /// already `pub` from `jq::mod`, so a re-exporting wrapper added an
     /// extra hop without adding any encapsulation.
     pub fn colliding_display_key(key: &str) -> Self {
@@ -1779,17 +1779,16 @@ impl EvalError {
 /// (#2025) and for the same reason: a hand-derived claim that nothing but
 /// review was keeping true.
 ///
-/// [`EvalError::colliding_display_key`] again, plus `eval.rs`'s
-/// `yaml_value_to_owned_checked` -- the `load` builtin's own YAML walk, whose
-/// name hides the `to_owned` in the middle and which #2334's review found
-/// outside both halves of the guard for exactly that reason. Its two error
-/// constructors are the same two.
+/// [`EvalError::colliding_display_key`] again. The `load` builtin's YAML path
+/// used to be a hand-written walk (`yaml_value_to_owned_checked`) with those
+/// same two constructors, which #2334's review found outside both halves of
+/// the guard because its name hid the `to_owned` in the middle; since #2664 it
+/// is `eval_generic::to_owned_yaml_cursor`, which asserts at its own depth-0
+/// entry, as does the CLI's input route that calls it.
 ///
 /// Called from the depth-0 entry points only, never the recursive
 /// `*_at_depth` inner calls -- one assert per materialization, not one per
-/// node. `yaml_value_to_owned_checked` recurses into itself rather than into a
-/// separate `_at_depth`, so it is asserted at its two `builtin_load` call
-/// sites instead, which is the same thing: once per materialization.
+/// node.
 #[inline]
 pub(crate) fn debug_assert_materialization_error<T>(result: &Result<T, EvalError>) {
     debug_assert!(

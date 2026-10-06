@@ -67176,8 +67176,9 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                                 // If single document, return it directly; otherwise return array
                                 let mut doc_values = Vec::new();
                                 while let Some((doc_cursor, rest)) = docs.uncons_cursor() {
-                                    let loaded = yaml_value_to_owned_checked(doc_cursor);
-                                    debug_assert_materialization_error(&loaded);
+                                    let loaded = super::eval_generic::to_owned_yaml_cursor::<S, _>(
+                                        &doc_cursor,
+                                    );
                                     match loaded {
                                         Ok(v) => doc_values.push(v),
                                         // #1620: a decode failure is never
@@ -67202,8 +67203,8 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                             // so this is defensive; `root` itself is this single
                             // document's cursor either way.
                             _ => {
-                                let loaded = yaml_value_to_owned_checked(root);
-                                debug_assert_materialization_error(&loaded);
+                                let loaded = // omni-dev: coverage tolerate-line reason="unreachable: YamlIndex::root always wraps the documents in a virtual root sequence, so the arm above takes every input (#2664)"
+                                    super::eval_generic::to_owned_yaml_cursor::<S, _>(&root); // omni-dev: coverage tolerate-line reason="unreachable: the same defensive arm as the line above (#2664)"
                                 match loaded {
                                     Ok(v) => QueryResult::Owned(v),
                                     // Same #1620 routing as the sequence arm
@@ -67222,119 +67223,6 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             result
         },
     )
-}
-
-/// Convert a YAML value to OwnedValue (helper for `load`).
-///
-/// Takes a cursor rather than a bare `YamlValue`: an explicit tag (`!!str`,
-/// `!!int`, …) lives on the cursor's `bp_pos` (`YamlCursor::explicit_tag`),
-/// not on the extracted value, and forces resolution regardless of quoting
-/// style — mirrors `yq_runner.rs`'s `yaml_to_owned_value` (#224).
-///
-/// #1801: raises `EvalError::decode_failure` on an undecodable string scalar
-/// instead of silently substituting `Null`, mirroring the `StandardJson`
-/// family's own `to_owned`/`owned_from_standard_json_at_depth`
-/// (#1746/#1755/#1620). A `Mapping` field whose *key* fails to decode now
-/// keeps both the key (via its `#1642` display fallback) and its value
-/// instead of dropping the whole field — the same pattern
-/// `yaml_to_owned_value` (`yq_runner.rs`) already uses for this identical
-/// YamlCursor-native shape, driving `DisplayKeyGuard` by hand since this
-/// function doesn't go through the `DocumentFields`/`resolve_display_key`
-/// path the `StandardJson` family uses (review: an earlier draft of this
-/// fix left the drop in place, incorrectly citing that family's own
-/// structural-#1194 carve-out as precedent for a case that is actually
-/// #1642's decode-failure-preservation territory instead).
-#[cfg(feature = "std")]
-fn yaml_value_to_owned_checked<W: Clone + AsRef<[u64]>>(
-    cursor: crate::yaml::YamlCursor<'_, W>,
-) -> Result<OwnedValue, EvalError> {
-    use crate::yaml::{resolve_tagged, YamlValue};
-
-    Ok(match cursor.value() {
-        YamlValue::Null => OwnedValue::Null,
-        YamlValue::String(s) => {
-            // Get the string value
-            let str_value = match s.as_str() {
-                Ok(cow) => cow,
-                Err(e) => return Err(EvalError::decode_failure(e.message())),
-            };
-
-            // #2621: `cursor.value()` above already proved `cursor` isn't
-            // `Alias` by matching `String`, so `None` skips a second
-            // resolve.
-            if let Some(explicit) = cursor.explicit_tag_at(None) {
-                if let Some(resolved) = resolve_tagged(&str_value, explicit) {
-                    return Ok(resolved.to_owned_value(str_value));
-                }
-            }
-
-            // Quoted strings are kept as strings
-            if !s.is_unquoted() {
-                return Ok(OwnedValue::String(str_value.into_owned().into()));
-            }
-
-            // Resolve plain scalars per the YAML 1.2 core schema
-            s.resolve_plain_scalar(&str_value).to_owned_value(str_value)
-        }
-        YamlValue::Sequence(mut elements) => {
-            let mut items = Vec::new();
-            // `uncons_resolved_cursor`, not `uncons_cursor`: the recursive
-            // call's own `cursor.explicit_tag_at(None)` above doesn't
-            // resolve a bare `-` sequence-item wrapper itself, so an
-            // unresolved cursor here would silently drop an explicit tag
-            // on a bare-dash-deferred scalar loaded via the `load()` builtin
-            // (#835).
-            while let Some((elem_cursor, rest)) = elements.uncons_resolved_cursor() {
-                items.push(yaml_value_to_owned_checked(elem_cursor)?);
-                elements = rest;
-            }
-            OwnedValue::array_from(items)
-        }
-        YamlValue::Mapping(fields) => {
-            let mut map = indexmap::IndexMap::new();
-            let mut guard = DisplayKeyGuard::default();
-            for field in fields {
-                let key = match field.key() {
-                    YamlValue::String(s) => {
-                        let (key, is_fallback) = match s.as_str() {
-                            Ok(cow) => (cow.into_owned(), false),
-                            // #1642's own fallback spelling, matching
-                            // `yaml_to_owned_value`'s identical handling:
-                            // the field is kept (key and value both),
-                            // guarded against colliding with another
-                            // key of the same display spelling rather
-                            // than silently overwriting one.
-                            Err(_) => (String::new(), true),
-                        };
-                        if !guard.check(&map, &key, is_fallback) {
-                            return Err(EvalError::colliding_display_key(&key));
-                        }
-                        key
-                    }
-                    _ => {
-                        // Non-string keys - convert to string representation
-                        let v = yaml_value_to_owned_checked(field.key_cursor())?;
-                        v.to_json()
-                    }
-                };
-                let value = yaml_value_to_owned_checked(field.value_cursor())?;
-                map.insert(key, value);
-            }
-            OwnedValue::Object(map.into())
-        }
-        YamlValue::Alias { target, .. } => {
-            // Resolve the *entire* alias chain first (#1193), not just this
-            // one hop: the resolved cursor's own `.value()` is guaranteed
-            // non-`Alias`, so this recursive call terminates in exactly one
-            // more step regardless of chain length.
-            match target.and_then(|t| t.resolve_alias_target_cursor()) {
-                Some(resolved) => yaml_value_to_owned_checked(resolved)?,
-                // Unresolved (dangling) target - treat as null
-                None => OwnedValue::Null,
-            }
-        }
-        YamlValue::Error(_) => OwnedValue::Null,
-    })
 }
 
 /// Builtin: load(file) - stub for no_std builds (returns error)
@@ -111069,7 +110957,7 @@ mod tests {
             });
         }
 
-        // ========== #224: explicit tag resolution in yaml_value_to_owned ==========
+        // ========== #224: explicit tag resolution in load()'s YAML walk ==========
 
         #[test]
         fn test_load_yaml_explicit_tag_resolution() {
@@ -111119,7 +111007,7 @@ mod tests {
 
         #[test]
         fn test_load_yaml_explicit_tag_on_bare_dash_deferred_sequence_item_835() {
-            // #835: `yaml_value_to_owned`'s `Sequence` arm used to walk
+            // #835: a sequence walk used to walk
             // elements via the raw `uncons_cursor` (rather than
             // `uncons_resolved_cursor`), and its own `explicit_tag()` check
             // doesn't resolve a bare `-` sequence-item wrapper itself (a
@@ -111173,43 +111061,70 @@ mod tests {
 
         #[test]
         fn test_load_yaml_non_string_mapping_key() {
-            // A non-scalar (sequence) explicit key falls through the
-            // `YamlValue::String` arm of the key match and is instead converted
-            // recursively via yaml_value_to_owned(...).to_json() - so the
-            // resulting object key is the compact JSON rendering of the key,
-            // `[1,2]` (no spaces; see OwnedValue::to_json's Array case).
+            // A non-scalar (sequence) explicit key is a *complex* key, which
+            // every YAML materializer spells `""` (#222) -- through the one
+            // shared walk since #2664, so `load` agrees with real yq
+            // (`load("bk.yaml")` => `{"":"value"}`, v4.53.3). It used to be
+            // the compact JSON rendering of the key (`[1,2]`), a spelling no
+            // other route produced.
             //
-            // Uses a block-sequence explicit key (`? - 1` / `  - 2`) rather
-            // than a flow-sequence key (`? [1, 2]`): `parse_explicit_key`'s `[`/`{`
-            // arms wrap `parse_flow_sequence`/`parse_flow_mapping` in an extra,
-            // untyped `write_bp_open`/`write_bp_close` pair even though those
-            // callees already open and close their own container node, so a
-            // flow-sequence explicit key currently decodes as a sequence
-            // wrapping the real sequence (`[[1,2]]`) instead of the key itself.
-            // That double-wrap predates this PR (`a7384db6`, explicit-key
-            // support) and is unrelated to tag resolution, so it's left alone
-            // here - reported separately rather than fixed as a drive-by.
-            with_temp_file(
-                "load_test_complex_key.yaml",
-                "? - 1\n  - 2\n: value\n",
-                |path| {
+            // The flow-sequence spelling (`? [1, 2]`) used to decode as a
+            // sequence wrapping the real one (`[[1,2]]`, `parse_explicit_key`'s
+            // extra bp open/close pair) and so spelled its key `[[1,2]]`; the
+            // key is never rendered now, so both spellings agree here. The
+            // wrapping itself is still in the parser.
+            for (name, doc) in [
+                ("load_test_complex_key.yaml", "? - 1\n  - 2\n: value\n"),
+                ("load_test_complex_flow_key.yaml", "? [1, 2]\n: value\n"),
+            ] {
+                with_temp_file(name, doc, |path| {
                     let json_bytes: &[u8] = b"null";
                     let index = JsonIndex::build(json_bytes);
                     let cursor = index.root(json_bytes);
                     let query = format!(r#"load("{path}")"#);
                     let expr = parse(&query).unwrap();
-                    match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
-                        QueryResult::Owned(OwnedValue::Object(obj)) => {
-                            assert_eq!(obj.len(), 1);
-                            assert_eq!(
-                                obj.get("[1,2]"),
-                                Some(&OwnedValue::String("value".to_string().into()))
-                            );
-                        }
-                        other => panic!("unexpected result: {other:?}"),
-                    }
-                },
-            );
+                    let result = eval_full::<Vec<u64>, JqSemantics>(&expr, cursor);
+                    let expected = OwnedValue::String("value".to_string().into());
+                    assert!(
+                        matches!(
+                            &result,
+                            QueryResult::Owned(OwnedValue::Object(obj))
+                                if obj.len() == 1 && obj.get("") == Some(&expected)
+                        ),
+                        "{doc:?}: unexpected result: {result:?}"
+                    );
+                });
+            }
+        }
+
+        #[test]
+        fn test_load_yaml_colliding_complex_keys_raise_2664() {
+            // Two complex keys both spell `""`; `OwnedValue::Object` cannot
+            // hold both, so the shared `resolve_display_key` guard raises as
+            // it does on every other materializing route (#2519) rather than
+            // `load` keeping both under two renderings of the key. A genuine
+            // `""` key colliding with a complex one raises too.
+            for (name, doc) in [
+                ("load_test_complex_collide.yaml", "? - 1\n: a\n? - 2\n: b\n"),
+                ("load_test_complex_vs_empty.yaml", "\"\": a\n? [x]\n: b\n"),
+            ] {
+                with_temp_file(name, doc, |path| {
+                    let json_bytes: &[u8] = b"null";
+                    let index = JsonIndex::build(json_bytes);
+                    let cursor = index.root(json_bytes);
+                    let query = format!(r#"load("{path}")"#);
+                    let expr = parse(&query).unwrap();
+                    let result = eval_full::<Vec<u64>, JqSemantics>(&expr, cursor);
+                    assert!(
+                        matches!(
+                            &result,
+                            QueryResult::Error(e)
+                                if e.is_decode_failure() && e.to_string().contains("is ambiguous")
+                        ),
+                        "{doc:?}: expected the collision error, got {result:?}"
+                    );
+                });
+            }
         }
 
         #[test]
@@ -111238,10 +111153,10 @@ mod tests {
 
         #[test]
         fn test_load_yaml_alias_preserves_tag_on_anchored_node() {
-            // yaml_value_to_owned's Alias arm recurses on the *target cursor*
-            // (`yaml_value_to_owned(target_cursor)`), not a bare value, so a tag
-            // sitting on the anchored node survives the alias hop - matching
-            // yq_runner.rs's yaml_to_owned_value and
+            // A tag sitting on the anchored node survives the alias hop
+            // (`DocumentCursor::explicit_tag` dereferences an alias to its
+            // anchor's tag), matching yq_runner.rs's yaml_to_owned_value --
+            // the same walk since #2664 -- and
             // tests/yq_cli_tests.rs::test_yaml_anchored_tag_in_seq_item_resolves.
             with_temp_file(
                 "load_test_alias_tag.yaml",

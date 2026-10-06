@@ -568,8 +568,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// #1314) -- the cursor-returning sibling of `resolve_alias_chain`
     /// above (a private method, not linkable from this public one), for
     /// callers that need to re-invoke a cursor method on the
-    /// resolved target (`stream_json_value`, `write_json_to`, `tag`, and
-    /// the CLI/evaluator's `yaml_to_owned_value`/`yaml_value_to_owned`)
+    /// resolved target (`stream_json_value`, `write_json_to`, `tag`)
     /// rather than just the resolved value. `self` need not itself be an
     /// alias -- returns `self` unchanged (zero hops) if it isn't.
     ///
@@ -595,9 +594,11 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// signatures -- accepted as a real but small (non-chain-scaling) cost,
     /// not benchmarked separately from the fix as a whole.
     ///
-    /// A `pub`, not `pub(crate)`, visibility (unlike its sibling):
-    /// `yaml_to_owned_value` (`src/bin/succinctly/yq_runner.rs`) is a
-    /// separate binary crate and needs to call this directly.
+    /// A `pub`, not `pub(crate)`, visibility (unlike its sibling): the CLI's
+    /// own materializing walk (`yaml_to_owned_value` in
+    /// `src/bin/succinctly/yq_runner.rs`, a separate binary crate) called
+    /// this directly until #2664 folded it onto the library's walk. Nothing
+    /// outside the library calls it now.
     ///
     /// Returns `None` only for a dangling (unresolvable) target. Panics
     /// past `MAX_ALIAS_CHAIN_DEPTH` (both private, not linkable from this
@@ -2929,13 +2930,8 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// whether this cursor is an alias, without paying for a fresh
     /// [`Self::value`] call just to make that same check again.
     ///
-    /// `#[doc(hidden)]`: `pub`, not `pub(crate)`, only because
-    /// `src/bin/succinctly/*` compiles as a separate crate from this
-    /// library and needs to reach this from `yaml_to_owned_value`
-    /// (`pub(crate)` cannot cross that boundary) -- not intended as public
-    /// library API (#2621), the same reason
-    /// [`crate::jq::eval_generic::path_context_pipe_streams_cursors`] is
-    /// `#[doc(hidden)]` too.
+    /// `pub(crate)`: the CLI's own materializing walk used to call this from
+    /// a separate crate (#2621), until #2664 folded it onto the library's.
     ///
     /// **Not a general-purpose default -- passing `None` is only safe when
     /// the caller can already prove this cursor isn't
@@ -2951,9 +2947,8 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     ///
     /// Pass `Some(&resolved)` when a prior [`Self::value`] call already
     /// produced it, or `None` only once that non-alias proof holds.
-    #[doc(hidden)]
     #[inline]
-    pub fn explicit_tag_at(&self, known_value: Option<&YamlValue<'a, W>>) -> Option<&str> {
+    pub(crate) fn explicit_tag_at(&self, known_value: Option<&YamlValue<'a, W>>) -> Option<&str> {
         if let Some(YamlValue::Alias { target, .. }) = known_value {
             // Not `target.and_then(|t| t.explicit_tag())`: `t` is a local
             // `YamlCursor` moved into the closure, so a call through `&t`
@@ -7278,7 +7273,8 @@ fn decode_failure(e: YamlStringError) -> StreamFailure {
 /// merely very long. #1193/PR #1314 fixes all 8 of those, routing each
 /// through this same `resolve_alias_chain`, alongside the YAML->JSON
 /// streaming writers (`stream_json_value`/`write_json_to`), `tag()`, and
-/// the CLI/evaluator's `yaml_to_owned_value`/`yaml_value_to_owned` -- five
+/// the CLI/evaluator's two hand-written materializing walks (since folded
+/// onto `eval_generic`'s, #2664) -- five
 /// more independently-self-recursive sites #1191's own review didn't
 /// cover, each needing the resolved *cursor* rather than just the value
 /// (see `YamlCursor::resolve_alias_target_cursor`, this method's
@@ -7330,6 +7326,12 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     /// would have read (#2640). `yaml_has_no_delimiter_checks_2640` pins the
     /// two staying in step.
     const HAS_DELIMITER_CHECKS: bool = false;
+
+    // Sound because `YamlField::value()` *is* `value_cursor().value()`: the
+    // walk hands the child the value it would resolve itself. Any `YamlFields`
+    // field built with a value that differs from its cursor's breaks this;
+    // `yaml_field_value_is_its_cursors_value_2664` pins it.
+    const REUSE_FIELD_VALUE: bool = true;
 
     #[inline]
     fn value(&self) -> Self::Value {
@@ -8106,6 +8108,19 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentFields for YamlFields<'a, W> {
     fn uncons_key(&self) -> Option<(Self::Value, Self::Cursor, Self)> {
         let (field, rest) = YamlFields::uncons(self)?;
         Some((field.key(), field.key_cursor(), rest))
+    }
+
+    #[inline]
+    fn try_for_each_member(
+        &self,
+        mut each: impl FnMut(Self::Value, Self::Value, Self::Cursor) -> Result<(), EvalError>,
+    ) -> Result<(), EvalError> {
+        // YAML's grammar never leaves a member unpaired (`ends_unpaired` is
+        // `false`), so there is no tail to check.
+        for field in self.clone() {
+            each(field.key(), field.value(), field.value_cursor())?;
+        }
+        Ok(())
     }
 
     // #1995: `Ok` unconditionally -- YAML's grammar has no equivalent

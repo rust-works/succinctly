@@ -927,7 +927,7 @@ fn cursor_to_owned<W: Clone + AsRef<[u64]>>(
             super::eval_generic::assert_nesting_depth(depth);
             Ok(())
         },
-        cursor_number_to_owned,
+        |_, value| cursor_number_to_owned(value),
     )
 }
 
@@ -939,7 +939,7 @@ fn try_cursor_to_owned<W: Clone + AsRef<[u64]>>(
     super::eval_generic::to_owned_cursor_with::<_, JqSemantics>(
         cursor,
         super::eval_generic::check_nesting_depth,
-        cursor_number_to_owned,
+        |_, value| cursor_number_to_owned(value),
     )
 }
 
