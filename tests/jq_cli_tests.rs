@@ -90400,6 +90400,57 @@ fn test_array_admits_self_checked_builtins_via_cli_3283() -> Result<()> {
     Ok(())
 }
 
+/// #3884, characterization of a message-only residual of #3271's by-value route: `map_values(first)`
+/// as a path or as a fold source evaluates the body by value, so on a scalar element jq's *type*
+/// error wins where jq raises its path error first, and where the path error is raised it names
+/// the container the construct produced rather than the element `first` indexed. Stdout and exit
+/// code match jq 1.7.1 on every row (nothing, exit 5). jq's own messages are in the comments;
+/// update the expectations if the resolver learns to name the element.
+#[test]
+fn test_map_values_first_path_error_message_residual_3884() -> Result<()> {
+    let object = r#"{"a":[1],"b":null}"#;
+    assert_path_rows_3289(&[
+        // jq: Invalid path expression near attempt to access element 0 of 1
+        (
+            "[1,2,3]",
+            r"path(foreach (map_values(first)) as $k (.; .))",
+            "",
+            "Cannot index number with number",
+            5,
+        ),
+        (
+            "[1,2,3]",
+            r"path(map_values(first))",
+            "",
+            "Cannot index number with number",
+            5,
+        ),
+        // jq: Invalid path expression near attempt to access element 0 of [1]
+        (
+            object,
+            r"path(foreach (map_values(first)) as $k (.; .))",
+            "",
+            r#"Invalid path expression near attempt to access element 0 of {"a":1,"b":null}"#,
+            5,
+        ),
+        (
+            object,
+            r"path(map_values(first))",
+            "",
+            r#"Invalid path expression near attempt to access element 0 of {"a":1,"b":null}"#,
+            5,
+        ),
+        // jq: Invalid path expression near attempt to access element 0 of [1]
+        (
+            "[[1],[2]]",
+            r"path(foreach (map_values(first)) as $k (.; .))",
+            "",
+            "Invalid path expression near attempt to access element 0 of [1,2]",
+            5,
+        ),
+    ])
+}
+
 /// #3284: a caught #3271 construct inside `[...]` keeps the register
 /// through the CLI route too. Confirmed live against jq 1.7.1.
 #[test]
