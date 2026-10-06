@@ -118007,6 +118007,9 @@ mod tests {
             r"del(. as $x | [map(.a, .b)] | $x[0])",
             r"del(. as $x | [map(if .a then .b else .a end)] | $x[0])",
             r"del(. as $x | [map(.b | length)] | $x[0])",
+            r"del(. as $x | [map((.a | length))] | $x[0])",
+            // Nothing in `f` navigates, so the chain rule is not what admits it.
+            r"del(. as $x | [map(tostring | length)] | $x[0])",
             // A fork is judged branch by branch, so a branch that navigates
             // nothing may sit beside one that stays on the register.
             r"del(. as $x | [map(.a, length)] | $x[0])",
