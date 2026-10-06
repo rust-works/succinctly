@@ -1295,6 +1295,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carries a `?//` now sees the consumer's stop and retries it from the stored state, where jq does not
   (already so un-nested), filed as #3651.
 
+- **jq: a consumer of a raising `key`/`parent`/`path` body follows jq on an owned input** (#3639,
+  the other half of #3512). `{"a":1} | isempty((.a, error("E2")) | key)` printed `false` and then
+  `E2`, `[limit(1; (.a, error("E2")) | key)]` raised `E2`, `reduce ((.a, error("E2")) | key) as $x
+  (0; 1)` printed `1` and then `E2`, and `last`, `any`/`all` and a `label` over such a body each
+  disagreed in the same way; jq and a document cursor answer `false`, `["a"]`, `E2` alone, `E2` alone,
+  `true`/`E2` and the label's own prefix. The owned route ran the body to completion ahead of its
+  consumer and handed it the prefix. A consumer that stops (`isempty`, `limit`, `skip`, `first`,
+  `any`/`all`) now drives the body, so its stop reaches it and an escape raised past the stop is never
+  reported; `reduce` and `last`, which consume the whole body, deliver nothing once it raises (an
+  error in `reduce`'s own update still wins); and a `label` owns the `break` its prefetched body
+  raised. jq mode only: yq's pipes collect their left side first, so the escape still surfaces ahead
+  of any consumer there, as it does on the cursor route and in yq v4.53.3.
+
 - **jq: an array collector over a raising `key`/`parent`/`path` body is atomic on an owned input**
   (#3512). `{"a":1} | [(error("E2")) | key]` printed `[]` after `E2`, `[(.a, error("E2")) | key]`
   printed `["a"]`, its `length` printed `0`, and `try ... catch` delivered `[]` and then the handler's
