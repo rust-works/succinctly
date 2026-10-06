@@ -128,9 +128,9 @@ runs:
             ;;
         esac
 
-    - uses: action-works/omni-dev-coverage-check@v2
+    - uses: action-works/patchcov-action@v1
       with:
-        # Pin patchcov, not omni-dev (#3873). 0.1.1 carries the extracted
+        # Pin patchcov itself (#3873, #3880). 0.1.1 carries the extracted
         # coverage engine: `.patchcov/config.yaml` discovery and the symmetric
         # ignore list mask popcount's CPU flap (#302); patience diff preserves
         # patch attribution on repetitive evaluator refactors (#1554); source

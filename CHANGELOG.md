@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **ci: the shared coverage action now uses `action-works/patchcov-action@v1`** (#3880). It replaces `action-works/omni-dev-coverage-check@v2` in `.github/actions/coverage/action.yml`
+  (the one definition behind both `ci.yml` and `coverage-baseline.yml`). `v1` resolves to the same commit and an identical `action.yml` as the old `v2`, so every input, the `version: 0.1.1`
+  patchcov pin and the baseline lookup are unchanged; only the repository an `omni-dev`-named workflow depended on is gone.
 - **jq: `indices` of a string no longer panics on a needle that starts with a multi-byte character** (#3903).
   `"éé" | indices("é")` (and `"日本日本" | indices("日")`, `"😀a😀" | indices("😀")`) panicked with `byte index 1 is not a char boundary`: the scan resumed one *byte* after each match and sliced the haystack
   there. It now resumes after the match's first character, which finds the same overlapping matches as jq 1.7.1's byte-wise scan (`"ééé" | indices("éé")` is `[0,2]`) and reports the same byte offsets.

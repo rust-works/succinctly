@@ -63,7 +63,7 @@ cargo bench                              # Run benchmarks
 
 ### Coverage
 
-CI runs coverage via the [`action-works/omni-dev-coverage-check`](https://github.com/action-works/omni-dev-coverage-check)
+CI runs coverage via the [`action-works/patchcov-action`](https://github.com/action-works/patchcov-action)
 action (x86_64 + ARM64 matrix), which wraps `cargo-llvm-cov` + `patchcov diff` and
 posts PR patch coverage as a sticky comment. To reproduce the CI line-coverage number locally,
 use the same feature set CI uses:

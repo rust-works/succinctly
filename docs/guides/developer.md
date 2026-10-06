@@ -198,7 +198,7 @@ comm -13 <(covered rest.info) <(covered two.info)   # lines only the two cover; 
 
 #### Patchcov migration verification
 
-The shared coverage action uses `omni-dev-coverage-check@v2` with **patchcov 0.1.1**
+The shared coverage action uses `patchcov-action@v1` with **patchcov 0.1.1**
 (#3873). The other omni-dev commands still use `.omni-dev/`; coverage alone reads
 `.patchcov/config.yaml`. Install the pinned tool with `cargo install patchcov --version 0.1.1`.
 CI runs `patchcov lint-markers --include 'src/**/*.rs'` before reporting, alongside the
