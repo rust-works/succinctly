@@ -7211,6 +7211,9 @@ mod slot_memo {
         /// A mapping's members, not a sequence's elements: `last` and `next`
         /// are the ids of member *values*, and `index` is unused.
         members: bool,
+        /// The parent's subtree end and depth, once something has asked
+        /// (#3846): kept while the scan is updated for the same parent.
+        extent: Option<(usize, usize)>,
     }
 
     struct State {
@@ -7245,6 +7248,29 @@ mod slot_memo {
     pub(crate) fn note_neighbour() {
         WORK.with(|w| w.set((w.get().0, w.get().1 + 1)));
     }
+
+    // How many positions `cursor_parent_and_slot` took the parent of from
+    // `document_parent`, although it was a parent a scan remembers (#3846).
+    #[cfg(test)]
+    thread_local! {
+        static MISSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn missed() -> usize {
+        MISSED.with(std::cell::Cell::get)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_missed(document: usize, parent: usize) {
+        if remembers(document, parent) {
+            MISSED.with(|m| m.set(m.get() + 1));
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) fn note_missed(_document: usize, _parent: usize) {}
 
     #[cfg(not(test))]
     #[inline(always)]
@@ -7328,6 +7354,59 @@ mod slot_memo {
         })
     }
 
+    /// A remembered parent a position at `id` may be a direct child of, and
+    /// its subtree end and depth if something has recorded them.
+    #[derive(Clone, Copy)]
+    pub(crate) struct Candidate {
+        pub(crate) parent: usize,
+        pub(crate) extent: Option<(usize, usize)>,
+    }
+
+    /// Every remembered parent that opens before `id` whose last found member
+    /// is also before it (a scan resumed from there is the point of asking),
+    /// without touching recency: most of them are rejected by the caller.
+    pub(crate) fn candidates(document: usize, id: usize) -> [Option<Candidate>; CAPACITY] {
+        MEMO.with(|m| {
+            let m = m.borrow();
+            let mut found = [None; CAPACITY];
+            if let Some(state) = m.as_ref().filter(|s| s.document == document) {
+                for (slot, scan) in found
+                    .iter_mut()
+                    .zip(state.scans.iter().filter(|s| s.parent < id && s.last < id))
+                {
+                    *slot = Some(Candidate {
+                        parent: scan.parent,
+                        extent: scan.extent,
+                    });
+                }
+            }
+            found
+        })
+    }
+
+    /// Whether a scan of `parent` is remembered (for the test counter).
+    #[cfg(test)]
+    pub(crate) fn remembers(document: usize, parent: usize) -> bool {
+        MEMO.with(|m| {
+            m.borrow()
+                .as_ref()
+                .filter(|s| s.document == document)
+                .is_some_and(|s| s.scans.iter().any(|s| s.parent == parent))
+        })
+    }
+
+    pub(crate) fn set_extent(document: usize, parent: usize, end: usize, depth: usize) {
+        MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            let Some(state) = m.as_mut().filter(|s| s.document == document) else {
+                return;
+            };
+            if let Some(scan) = state.scans.iter_mut().find(|s| s.parent == parent) {
+                scan.extent = Some((end, depth));
+            }
+        });
+    }
+
     pub(crate) fn remember(
         document: usize,
         parent: usize,
@@ -7341,8 +7420,9 @@ mod slot_memo {
             let Some(state) = m.as_mut().filter(|s| s.document == document) else {
                 return;
             };
+            let mut extent = None;
             if let Some(at) = state.scans.iter().position(|s| s.parent == parent) {
-                state.scans.remove(at);
+                extent = state.scans.remove(at).extent;
             } else if state.scans.len() == CAPACITY {
                 state.scans.remove(0);
             }
@@ -7352,6 +7432,7 @@ mod slot_memo {
                 index,
                 next,
                 members,
+                extent,
             });
         });
     }
@@ -7381,6 +7462,20 @@ mod slot_memo {
     ) -> Option<R> {
         None
     }
+
+    #[derive(Clone, Copy)]
+    pub(crate) struct Candidate {
+        pub(crate) parent: usize,
+        pub(crate) extent: Option<(usize, usize)>,
+    }
+
+    pub(crate) fn candidates(_document: usize, _id: usize) -> [Option<Candidate>; 0] {
+        []
+    }
+
+    pub(crate) fn set_extent(_document: usize, _parent: usize, _end: usize, _depth: usize) {}
+
+    pub(crate) fn note_missed(_document: usize, _parent: usize) {}
 
     pub(crate) fn remember(
         _document: usize,
@@ -24058,9 +24153,13 @@ fn cursor_parent_and_slot<C: DocumentCursor>(
             return Ok(Some((parent, slot)));
         }
     }
+    if let Some(parent) = remembered_direct_parent(c) {
+        return Ok(scan_for_slot(c, &parent)?.map(|slot| (parent, slot)));
+    }
     let Some(parent) = c.document_parent() else {
         return Ok(None);
     };
+    slot_memo::note_missed(c.document_token(), parent.node_id());
     Ok(scan_for_slot(c, &parent)?.map(|slot| (parent, slot)))
 }
 
@@ -24112,6 +24211,40 @@ fn scan_for_slot<C: DocumentCursor>(c: &C, parent: &C) -> Result<Option<CursorSl
 
 /// An array scan shorter than this is cheaper to redo than to remember.
 const SLOT_MEMO_MIN_SCAN: i64 = 32;
+
+/// The parent of `c`, when it is a direct child of a parent a scan remembers
+/// and comes after the member that scan last found (#3846): a fan-out that
+/// skips elements reads positions that are not the remembered one's
+/// neighbours, and asking such a node for its parent is `enclose`, a backward
+/// scan of the balanced parentheses, `O(distance to the parent's open)`. A
+/// direct child of a remembered parent lies strictly inside it, one level
+/// down: two `O(1)` facts (the parent's subtree end and depth, recorded the
+/// first time they are asked, and the node's depth) in place of the scan.
+fn remembered_direct_parent<C: DocumentCursor>(c: &C) -> Option<C> {
+    if !C::RESUMABLE_ELEMENT_SCAN {
+        return None;
+    }
+    let document = c.document_token();
+    let id = c.node_id();
+    let candidates = slot_memo::candidates(document, id);
+    let mut depth = None;
+    for candidate in candidates.into_iter().flatten() {
+        let (end, parent_depth) = match candidate.extent {
+            Some(extent) => extent,
+            None => {
+                let parent = c.at_node_id(candidate.parent)?;
+                let extent = (parent.subtree_end()?, parent.tree_depth()?);
+                slot_memo::set_extent(document, candidate.parent, extent.0, extent.1);
+                extent
+            }
+        };
+        // A node at the child depth beyond the parent's end is a cousin's.
+        if id < end && *depth.get_or_insert(c.tree_depth()?) == parent_depth + 1 {
+            return c.at_node_id(candidate.parent);
+        }
+    }
+    None
+}
 
 /// The parent's node id and the index of `c`, whether `c` is a new element
 /// rather than the remembered one itself, and whether the parent is a mapping
@@ -46148,6 +46281,8 @@ mod tests {
             .and_then(|sequence| sequence.first_child())
             .expect("the document's first item");
         assert!(first_item.next_element().is_none());
+        // ... and no depth to recognise a remembered parent's children by.
+        assert!(first_item.tree_depth().is_none());
         let expr = parse("[.[] | .[] | tostring | [key]]").unwrap();
         let before = slot_memo::work();
         let mut out = Vec::new();
@@ -46413,6 +46548,160 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #3846: a fan-out that skips elements reads positions that are not a
+    /// remembered one's neighbours, and a node's parent is `enclose`, a
+    /// backward scan, `O(i)` for the `i`th child of a wide parent. A direct
+    /// child of a parent a scan remembers is recognised by its depth and by
+    /// lying inside the parent's subtree instead, so no position of the
+    /// skipping fan-out takes its parent from `document_parent` -- array
+    /// elements and object members alike.
+    // The memo these pin is `std`-only: `no_std` has no `thread_local!`.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_skipping_fan_out_never_asks_a_remembered_parent_for_its_children_3846() {
+        let n = 1500usize;
+        let array = format!(
+            "[{}]",
+            (0..n)
+                .map(|i| format!("{{\"a\":{{\"b\":{i}}}}}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let object = format!(
+            "{{{}}}",
+            (0..n)
+                .map(|i| format!("\"k{i}\":{{\"a\":{{\"b\":{i}}}}}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        for (shape, doc) in [("array", array), ("object", object)] {
+            for stride in [2, 3, 7] {
+                let filter = format!(
+                    "[.[] | select(.a.b % {stride} == 0) | .a | tostring | [key]] | length"
+                );
+                let missed_before = slot_memo::missed();
+                let (out, control) = drive_each_sink::<JqSemantics>(doc.as_bytes(), &filter);
+                assert!(control.is_none(), "{shape} {filter}: {control:?}");
+                assert_eq!(out, [OwnedValue::Int(n.div_ceil(stride) as i64)]);
+                let missed = slot_memo::missed() - missed_before;
+                assert!(
+                    missed < n / 50,
+                    "{shape} {filter}: {missed} of {} positions took a remembered parent from `document_parent`",
+                    n / stride
+                );
+            }
+        }
+    }
+
+    /// #3846: a node at the remembered parent's child depth that lies *beyond*
+    /// the parent's subtree is a cousin's child, not the parent's: reading the
+    /// elements of a second wide array while the first one's scan is
+    /// remembered must answer the second array's own paths.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_a_second_wide_parent_is_not_taken_for_the_remembered_one_3846() {
+        let wide = |tag: &str| {
+            format!(
+                "[{}]",
+                (0..120)
+                    .map(|i| format!("{{\"{tag}\":{i}}}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        };
+        let doc = format!("{{\"x\":{},\"y\":{}}}", wide("p"), wide("q"));
+        for stride in [1, 2, 5] {
+            let filter = format!(
+                "[(.x, .y) | .[] | select(.[]? % {stride} == 0 or true) | tostring | path] | length"
+            );
+            let (out, control) = drive_each_sink::<JqSemantics>(doc.as_bytes(), &filter);
+            assert!(control.is_none(), "{filter}: {control:?}");
+            assert_eq!(out, [OwnedValue::Int(240)], "{filter}");
+        }
+        let (out, control) = drive_each_sink::<JqSemantics>(
+            doc.as_bytes(),
+            "[(.x, .y) | .[] | tostring | path | join(\"/\")] | .[0], .[119], .[120], .[125], .[239]",
+        );
+        assert!(control.is_none(), "{control:?}");
+        let got: Vec<String> = out.iter().map(OwnedValue::to_json).collect();
+        assert_eq!(
+            got,
+            [
+                r#""x/0""#,
+                r#""x/119""#,
+                r#""y/0""#,
+                r#""y/5""#,
+                r#""y/119""#
+            ]
+        );
+    }
+
+    /// #3846: with a wide array inside a wide array both remembered, the
+    /// scan that fits a position is the one whose parent is its own, not the
+    /// first one remembered: a skipping fan-out over the inner elements must
+    /// not take its parent from `document_parent` because the outer array's
+    /// scan was looked at first.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_nested_wide_parents_each_find_their_own_children_3846() {
+        let rows = 80usize;
+        let cols = 80usize;
+        let doc = format!(
+            "[{}]",
+            (0..rows)
+                .map(|r| format!(
+                    "{{\"items\":[{}]}}",
+                    (0..cols)
+                        .map(|c| format!("{{\"a\":{{\"b\":{}}}}}", r * cols + c))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        for stride in [1usize, 3] {
+            let filter = format!(
+                "[.[] | .items[] | select(.a.b % {stride} == 0) | .a | tostring | [key]] | length"
+            );
+            let (scanned_before, _) = slot_memo::work();
+            let missed_before = slot_memo::missed();
+            let (out, control) = drive_each_sink::<JqSemantics>(doc.as_bytes(), &filter);
+            assert!(control.is_none(), "{filter}: {control:?}");
+            let kept = (0..rows * cols).filter(|i| i % stride == 0).count();
+            assert_eq!(out, [OwnedValue::Int(kept as i64)], "{filter}");
+            let missed = slot_memo::missed() - missed_before;
+            let scanned = slot_memo::work().0 - scanned_before;
+            assert!(
+                missed < rows * cols / 50,
+                "{filter}: {missed} positions took a remembered parent from `document_parent`"
+            );
+            // A scan under 32 deep is not remembered, so up to 32 steps per
+            // position are the design's constant; quadratic would be millions.
+            assert!(
+                scanned < 40 * rows * cols,
+                "{filter}: visited {scanned} elements over {}",
+                rows * cols
+            );
+        }
+        // And the answers are each element's own path.
+        let (out, control) = drive_each_sink::<JqSemantics>(
+            doc.as_bytes(),
+            "[.[] | .items[] | tostring | path | join(\"/\")] | .[0], .[79], .[80], .[3239], .[6399]",
+        );
+        assert!(control.is_none(), "{control:?}");
+        let got: Vec<String> = out.iter().map(OwnedValue::to_json).collect();
+        assert_eq!(
+            got,
+            [
+                r#""0/items/0""#,
+                r#""0/items/79""#,
+                r#""1/items/0""#,
+                r#""40/items/39""#,
+                r#""79/items/79""#
+            ]
+        );
     }
 
     /// #2785: `effective_key_values` is `effective_keys` with typed keys --

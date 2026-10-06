@@ -475,6 +475,22 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// ids that follow document order.
     const RESUMABLE_ELEMENT_SCAN: bool = false;
 
+    /// This node's depth in the tree (the root is 1): a format that sets
+    /// [`RESUMABLE_ELEMENT_SCAN`] should answer it (and
+    /// [`subtree_end`](Self::subtree_end)), or skipping fan-outs fall back to
+    /// the parent lookup. A direct child of a node at depth `d`
+    /// is at depth `d + 1`, and lies strictly between that node's own id and
+    /// its [`subtree_end`](Self::subtree_end). Both are `O(1)` for the
+    /// balanced-parentheses formats, where finding a node's *parent* is a
+    /// backward scan, so the scan for an element's slot uses them to recognise
+    /// a direct child of a parent it remembers without asking for its parent
+    /// (#3846). `None` (the default) for a format that cannot say.
+    ///
+    /// [`RESUMABLE_ELEMENT_SCAN`]: Self::RESUMABLE_ELEMENT_SCAN
+    fn tree_depth(&self) -> Option<usize> {
+        None
+    }
+
     /// The element after this one, when [`RESUMABLE_ELEMENT_SCAN`] holds and
     /// this cursor is an element of a sequence or a key or value node of a
     /// mapping; `None` at the last element (and for every format that does not
