@@ -10509,6 +10509,12 @@ with result false` (the identity element), not `result true`. `path`, `del`, `|=
 and a `try`/`?` around them all name the last answer;
 `test_any_all_path_condition_retry_names_last_answer_3827` pins the matrix.
 
+The resolver drains the generator before it delivers the answers, so a retried
+alternative's side effects (`stderr`, `debug`) run before the first answer reaches the
+consumer: `path(.x | any(.; ...)) | ("H"|halt_error(3))` halts at the first answer in
+jq without running the retry, and here after it. The halt itself, its exit code and
+the output are the same (`test_any_all_path_answer_halt_is_not_retried_3827`).
+
 One shape in this family still diverges, and it is a *valid* answer rather than a
 refused one: an answer identical to jq's register (a `true` over a `true` node) that
 follows an alternative's error is a valid path in jq, and the resolver refuses it

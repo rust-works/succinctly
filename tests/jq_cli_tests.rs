@@ -15364,7 +15364,7 @@ fn test_add_reports_type_error_via_into_conversion() -> Result<()> {
 #[test]
 fn test_any_propagates_halt_from_condition() -> Result<()> {
     // `control_to_result`'s `Halt` arm (#791), reached via `any(cond)`:
-    // `any_all_probe_element` forks `cond` through `eval_owned_expr_fork`
+    // `any_all_probe_element_verdict` forks `cond` through `eval_owned_expr_fork`
     // and, when it halts with no truthy output for this element, returns
     // `Err(Control::Halt(code))`; `any_all_f`'s `Err(control) =>
     // control_to_result(control)` converts that back into a `QueryResult`

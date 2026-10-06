@@ -41026,12 +41026,16 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
                         // #3827: a `?//` in `cond` that swallows the decisive
                         // output's break decides again, one answer each.
                         let at = register_after(gen, branch, frame);
-                        answers.extend((0..verdicts).map(|_| at.clone()));
+                        for _ in 1..verdicts {
+                            answers.push(at.clone());
+                        }
+                        answers.push(at);
                         match after {
                             AfterVerdict::Stop => Demand::Stop,
                             // The retry ran dry: `gen` runs on.
                             AfterVerdict::Resume => Demand::Continue,
-                            // The answers are superseded by the retry's raise.
+                            // The retry's raise follows the answers: a refused one is
+                            // superseded by it, a valid path is printed first.
                             AfterVerdict::Raise(control) => {
                                 let mut slot = None;
                                 let demand = stop_with_escape(&mut slot, control);
@@ -41102,6 +41106,10 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
             let mut decide = |output: PathBranch<'a>| -> Demand {
                 if output.value.is_truthy() == target_truthy {
                     decided = true;
+                    debug_assert!(
+                        S::TAG == EvalTag::Jq,
+                        "only the jq-mode route resolves live"
+                    );
                     // #3827: a `?//` that swallows this stop decides again, and
                     // each decisive output is an answer jq's path tracker sees.
                     answers.push(register_after(cond, output, frame));
