@@ -43041,6 +43041,14 @@ fn recurse_seed_keeps_register<S: EvalSemantics>(element: &Expr, branch_trackabl
 /// predicate cannot see inside (a fold, a call) count, since the answer must be
 /// "maybe" for those.
 ///
+/// A comma or call *inside* a pipe does not count either (#3770): the walk stops
+/// at an `Expr::Pipe`, which takes the register from the frame and threads it
+/// through its own stages exactly as a body that *is* a pipe does -- and that
+/// body `resolve_sink` never asks this about. So `try ($w | .a, .b?)` sees the
+/// register on both outputs, as `$w | .a, .b?` already did; what still counts
+/// is a split above the pipe, where one sibling reaches a pipe and the other
+/// does not (#3145's `($v[0]?, $v)`).
+///
 /// A generator does not count by itself (#3770): `.[]` and `..` used to, which
 /// withheld the register from `try ($w | .a[])` and from `//`, `and`/`or`,
 /// `select`, `first(...)`, `limit` or a `catch` around one, so the body
@@ -43049,16 +43057,16 @@ fn recurse_seed_keeps_register<S: EvalSemantics>(element: &Expr, branch_trackabl
 /// such a body leaves through the same register view; the other generators
 /// (`recurse`, `range`, ...) were never listed here either.
 fn fans_out(expr: &Expr) -> bool {
-    any_subexpr(expr, &mut |e| {
-        matches!(
-            e,
-            Expr::Comma(_)
-                | Expr::AsPattern { .. }
-                | Expr::Reduce { .. }
-                | Expr::Foreach { .. }
-                | Expr::FuncCall { .. }
-                | Expr::NamespacedCall { .. }
-        )
+    use crate::jq::walk::{search_subexpr, Visit};
+    search_subexpr(expr, &mut |e| match e {
+        Expr::Pipe(_) => Visit::Skip,
+        Expr::Comma(_)
+        | Expr::AsPattern { .. }
+        | Expr::Reduce { .. }
+        | Expr::Foreach { .. }
+        | Expr::FuncCall { .. }
+        | Expr::NamespacedCall { .. } => Visit::Found,
+        _ => Visit::Descend,
     })
 }
 
@@ -43622,7 +43630,9 @@ impl FoldRegister {
         // `.a.c`, a key jq never names, because only the second output
         // refused and drove a `?//` retry jq does not perform. A body with
         // one output path cannot split that way, and neither can a generator's
-        // outputs, which all leave through the same stages (#3738, #3770).
+        // outputs, which all leave through the same stages (#3738, #3770), nor
+        // the outputs of a comma inside a nested pipe, which carries the
+        // register through its stages as a top-level one does (#3770).
         // Widening the other
         // direction (re-establishing in `resolve_node`'s own arms) is
         // #2046's documented scope limit, not this fix's.
@@ -43663,13 +43673,14 @@ impl FoldRegister {
                 &mut deliver,
             )
         } else {
-            let update_frame = update_frame.with_register(
-                if S::TAG == EvalTag::Jq && self.trackable && !tr && !fans_out(expr) {
-                    Some(&self.value)
-                } else {
-                    None
-                },
-            );
+            // #3770 tried marking a withheld register lost (#3267) so the
+            // body's `try` could not swallow the refusal into a skipped write.
+            // That also made loud a refusal that precedes an error jq's own
+            // `try` catches -- `(foreach .a as $w (0; try (($w | .c | .z),
+            // $w.b); .)) = 9` matched jq by writing nothing -- so a withheld
+            // register still resolves register-less here.
+            let carries = S::TAG == EvalTag::Jq && self.trackable && !tr && !fans_out(expr);
+            let update_frame = update_frame.with_register(carries.then_some(&self.value));
             resolve_node_sink::<S>(
                 expr,
                 &input,
