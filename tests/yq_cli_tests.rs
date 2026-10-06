@@ -165,7 +165,7 @@ fn test_yq_recurse_cap_raises_instead_of_ending_silently_3716() -> Result<()> {
 /// yields at most one value.
 ///
 /// No oracle exists (real yq's lexer rejects `recurse`, v4.53.3), so this is a
-/// succinctly extension behind `--jq-extensions` that follows jq's definition,
+/// succinctly extension that follows jq's definition,
 /// `def r: ., (f | select(cond) | r); r;`; the pinned reference for the counts
 /// is yq's own `..`, which a `cond` that keeps every node must equal. A `cond`
 /// that forks is not bounded by the tree and keeps the cap.

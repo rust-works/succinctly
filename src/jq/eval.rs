@@ -29464,6 +29464,14 @@ fn resolves_to_at_most_one_path(expr: &Expr) -> bool {
 /// Does evaluating `expr` yield at most one value? The key/bound half of
 /// [`resolves_to_at_most_one_path`].
 ///
+/// **Soundness is load-bearing for [`is_gated_structural_descent`] (#3737).**
+/// Elsewhere a wrong admission only costs a missed fast path; there it lifts
+/// `recurse`'s node cap, so an admitted `cond` that yielded two values would be
+/// visited once by [`walk_descendants_gated`] where jq visits a child per truthy
+/// output, and would leave the path walker's uncapped walk unbounded. Admit a
+/// shape here only when it yields at most one value *and* cannot emit a value
+/// and then raise.
+///
 /// Deliberately *not* [`is_owned_pure_expr`], despite the overlap: that
 /// predicate's job is the #2048 fast path's representation-neutrality (it
 /// admits `Not`/`Compare`/`type` because their results are freshly
@@ -41704,7 +41712,8 @@ fn recurse_family_root_seed<'a>(
 /// tree size — `[path(..)] | length` must equal jq's true count even past
 /// [`RECURSE_MAX_ITEMS`] nodes. `recurse(.[]?)` is that same bare walk spelled
 /// out (jq's `def recurse: recurse(.[]?);`), so [`resolve_recurse_sink`] lifts
-/// the cap for exactly that spelling ([`recurse_item_cap`], #3703).
+/// the cap for that spelling ([`recurse_item_cap`], #3703), and for the same
+/// `f` over a `cond` that cannot fork (#3737).
 ///
 /// **Lazy within a node's fan-out too** (#2895): a node's children are a
 /// [`RecursiveChildren`] cursor on a [`DescentFrame`], pulled one at a time,
@@ -48506,8 +48515,10 @@ pub(crate) struct RecurseWalkEnd {
 /// **So does `.[]?` with a `cond` that yields at most one value** (#3737):
 /// [`walk_descendants_gated`] asks `cond` of each node as it is reached and
 /// never runs `f`. Measured on a 74 MB `users` document, 4.9 M nodes, that is
-/// 4.3 times the speed (2.2 s against 9.3 s) and 0.43 times the peak memory
-/// (1.04 GB against 2.41 GB) of lifting the cap and keeping this walk.
+/// 3.5 times the speed (2.08 s against 7.28 s, an idle Ryzen 9 7950X) and 0.42
+/// times the peak memory (1.18 GB against 2.78 GB) of lifting the cap and
+/// keeping this walk; `docs/compliance/jq/limitations.md` has both machines and
+/// the cost against `..`.
 ///
 /// **`f` runs only if the sink still wants more.** That is the whole point
 /// of the sink: jq's `def r: ., (f | r); r;` emits `.` *before* `f` is
@@ -112725,7 +112736,6 @@ mod tests {
             r#"length == 2 or type == "object""#,
             // Outside it, the bridge answers them.
             "(.a // true)",
-            "tojson | length > 1",
         ];
         let consumers = [
             "[recurse(.[]?; COND)]",

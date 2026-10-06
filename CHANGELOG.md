@@ -22,11 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the walk is bounded by the tree, but the node cap meant for an unbounded `f` refused it: on a 12,001-node document `[recurse(.[]?; true)] | length`,
   `[recurse(.[]?; . != null)] | length`, `[path(recurse(.[]?; true))] | length` and the writes through them raised
   `recurse: maximum nodes exceeded` where jq answers 12001. The value walker now hands that shape to a direct walk that asks `cond` of
-  each node as it is reached, in jq's own order, and never runs `.[]?`; the path walker lifts its cap for it. A `cond` that can fork
-  (`(true, true)`) and any `f` but `.[]?` keep the cap. Measured against lifting only the cap (interleaved, an Apple M4 Pro under load, memory
-  capped): a 74 MB `users` document 2.2 s and 1.04 GB against 9.3 s and 2.41 GB, 63 MB of arrays 6.1 s and 3.97 GB against 29.7 s and 6.13 GB,
-  an 11.4 M-node alias expansion 2.04 GB against 7.83 GB. Below the cap it is faster too (a 7,001-node document, 2.39 s to 0.14 s over 300 walks).
-  Pinned by `test_recurse_of_each_optional_with_a_gating_cond_has_no_node_cap_3737`, `test_recurse_gated_cond_runs_in_jq_order_3737`,
+  each node as it is reached, in jq's own order, and never runs `.[]?`; the path walker lifts its cap for it. "Yields at most one value" is
+  `yields_at_most_one_value`'s grammar and nothing wider: a `cond` that can fork (`(true, true)`), one outside the grammar (`tonumber? // false`,
+  `try true`), and any `f` but `.[]?` keep the cap and still raise where jq answers (tracked in #3867). Measured against lifting only the
+  cap (interleaved, minimum of three, memory capped): a 74 MB `users` document 2.08 s and 1.18 GB against 7.28 s and 2.78 GB on a Ryzen 9
+  7950X, 2.2 s and 1.04 GB against 9.3 s and 2.41 GB on an Apple M5 Max (loaded, so its seconds are indicative); 63 MB of arrays 6.47 s and
+  4.77 GB against 21.7 s and 7.43 GB (x86_64), 6.1 s and 3.97 GB against 29.7 s and 6.13 GB (ARM64); an 11.4 M-node alias expansion 2.38 GB
+  against 9.35 GB (x86_64), 2.04 GB against 7.83 GB (ARM64). It costs 1.6 to 1.9 times `..`'s time and 1.5 to 2.6 times its memory. Below the cap it is
+  faster too (a 7,001-node document, 2.01 s to 0.14 s over 300 walks on the 7950X). Pinned by
+  `test_recurse_of_each_optional_with_a_gating_cond_has_no_node_cap_3737`, `test_recurse_gated_cond_runs_in_jq_order_3737`,
   `test_yq_recurse_gated_cond_has_no_node_cap_3737` and `walk_descendants_gated_agrees_with_the_evaluator_driven_walk_3737`; see
   `docs/compliance/jq/limitations.md`.
 - **jq: `paths`, `leaf_paths` and the cursor-native `path(f)` walkers answer on documents nested 256-383 levels deep** (#3429).
