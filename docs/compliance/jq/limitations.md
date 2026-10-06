@@ -1218,7 +1218,12 @@ is the revert that established what the other one costs.
      surfaces even where the result is discarded (`path(map({k:1} | .k) | empty)` raises near
      `"k"`, as in jq), also with a `getpath` in `f` and inside an `[E]` collect on an untracked entry
      (`getpath` is never the first stage of `.[] | f`, so the collect arm's #2759 gate does not
-     apply to it); the register verdict above is unchanged. jq mode only.
+     apply to it); the register verdict above is unchanged. jq mode only. One residual, refuse-only
+     and pinned: under a `?//` destructuring alternative the entry is untracked, so the live `.[]`
+     raises a loud refusal the retry does not catch, where jq's catchable error retries the second
+     alternative (`del(. as [$q] ?// $q | ([map(.a)] and (.a)?) | .c)` on `[{"a":1}]` is the document
+     unchanged in jq); the `.a` form refused the same way before #3865, the `getpath` form matched by
+     accident because the collect was never checked.
    - **The promoted builtins inside a compound stage** (`[sort]`, `limit(1; sort)`,
      `(sort, add)`, `(flatten(1), reverse)`, `[join(",")]`, `if`/`try` around them) are read as
      a loss: the stage is judged as a whole, and jq answers for each (the stage-level

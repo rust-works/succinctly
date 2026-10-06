@@ -37423,6 +37423,16 @@ fn fold_pattern_admitted<S: EvalSemantics>(patterns: &[Pattern]) -> bool {
     }
 }
 
+/// Whether a `map(f)` in path position is resolved as the collect jq defines
+/// (`[.[] | f]`, #3865) rather than evaluated by value: jq mode, and an `f`
+/// that can move the register -- one that cannot has nothing path-checked in it,
+/// so the by-value leaf answers the same without the clone and the live walk.
+/// The one definition the `map` arm and [`array_resolves_live`]'s `getpath`
+/// prune both read, so the prune can never cover a `map` the arm leaves by value.
+fn map_f_resolves_live<S: EvalSemantics>(f: &Expr) -> bool {
+    S::TAG == EvalTag::Jq && !cannot_move_register(f)
+}
+
 /// `[inner]` in path position, resolved live: `inner` runs against the register,
 /// every navigation in it is path-checked as jq checks it, and the collect
 /// backtracks to where it began. The body of the resolver's `[E]` arm
@@ -37558,7 +37568,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // over `map(.)` and `map(tostring)`, 20,027 rows, found no row that differs
         // without the guard, so it is a cost guard, not a behaviour one). jq mode
         // only (ADR-0018).
-        Expr::Builtin(Builtin::Map(f)) if S::TAG == EvalTag::Jq && !cannot_move_register(f) => {
+        Expr::Builtin(Builtin::Map(f)) if map_f_resolves_live::<S>(f) => {
             let inner = Expr::Pipe(vec![Expr::Iterate, (**f).clone()]);
             resolve_collect_live::<S>(&inner, value, trackable, snapshot, frame, sink)
         }
@@ -42029,7 +42039,10 @@ fn resolve_against_cow_sink<'a, S: EvalSemantics>(
 /// necessary for carrying the register but not sufficient; see
 /// [`array_contents_are_checked`]. The one shape excluded here (`GetPath`) is
 /// the one whose own untracked handling is still wrong (#2759 -- see the
-/// arm's own comment). A `TrackedVar` exclusion lived here too until #3290
+/// arm's own comment), except inside the `f` of a navigating `map(f)`
+/// ([`map_f_resolves_live`]): that is resolved as `.[] | f`, which never starts
+/// with a `getpath`, so the pruned subtree is not the case #2759 describes
+/// (#3865). A `TrackedVar` exclusion lived here too until #3290
 /// found it disqualified live resolution for a whole mixed array the moment
 /// a marker appeared anywhere inside it, not just at the marker itself.
 fn array_resolves_live<S: EvalSemantics>(inner: &Expr, trackable: bool) -> bool {
@@ -42040,7 +42053,7 @@ fn array_resolves_live<S: EvalSemantics>(inner: &Expr, trackable: bool) -> bool 
             // #3865: a navigating `map(f)` resolves as `[.[] | f]`, which never starts
             // with `getpath`, so a `getpath` inside its `f` meets the carried register
             // the first-stage case lacks and is not what this gate guards against.
-            Expr::Builtin(Builtin::Map(f)) if !cannot_move_register(f) => {
+            Expr::Builtin(Builtin::Map(f)) if map_f_resolves_live::<S>(f) => {
                 crate::jq::walk::Visit::Skip
             }
             _ => crate::jq::walk::Visit::Descend,

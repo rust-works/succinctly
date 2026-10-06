@@ -64965,6 +64965,17 @@ fn test_map_f_in_path_position_raises_where_jq_does_3865() -> Result<()> {
             "",
             0,
         ),
+        // Pinned refuse-only: under a `?//` destructuring alternative the entry is untracked,
+        // so the live `.[]` raises a refusal the retry does not catch, where jq's own
+        // catchable error retries the second alternative and writes nothing (the `.a` twin
+        // refused the same way before #3865).
+        (
+            r#"[{"a":1}]"#,
+            r"del(. as [$q] ?// $q | ([map(.a)] and (.a)?) | .c)",
+            "",
+            r#"Invalid path expression near attempt to iterate through [{"a":1}]"#,
+            5,
+        ),
         // Answers: `f` only navigates the elements it is given, or runs on none.
         (r#"[{"a":1}]"#, r"path(map(.a) | empty)", "", "", 0),
         (r#"[{"a":1}]"#, r"path(map(.a // .b) | empty)", "", "", 0),
