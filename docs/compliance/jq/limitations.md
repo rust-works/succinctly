@@ -1436,7 +1436,11 @@ is the revert that established what the other one costs.
    too when the resolver both resolves it live and checks everything jq checks inside it:
    navigation, `..`, `select` and (since #3767) the type filters and `last(f)`, an `if`'s branches, both of jq's `?`s and `try`/`catch`,
    `recurse(f)`/`recurse(f; cond)` (#2764), `and`/`or`/unary minus over checked operands
-   ([#3289](https://github.com/rust-works/succinctly/issues/3289)), and pipes, commas and
+   ([#3289](https://github.com/rust-works/succinctly/issues/3289); since
+   [#3724](https://github.com/rust-works/succinctly/issues/3724) an operand is checked when the register's position is known
+   after it or when everything jq path-checks inside it is checked here, so `[first and .[0]]` raises on `[true]` and answers
+   `[]` on `[false,1]`, as in jq; an operand outside both lists still refuses the collect, and so do a few shapes jq answers, for
+   example `[map(.a) and .a]` on `{"a":{"b":1}}` and `[true or .a]` in a `foreach` body: refuse-only), and pipes, commas and
    subexp shapes of those.
    [#3283](https://github.com/rust-works/succinctly/issues/3283)/[#3284](https://github.com/rust-works/succinctly/issues/3284)
    widened that list further: `builtin_navigation`'s value-independent members (bare

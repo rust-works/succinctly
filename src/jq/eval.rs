@@ -41351,12 +41351,14 @@ fn and_or_negate_resolves_live<S: EvalSemantics>(expr: &Expr) -> bool {
 /// (`first` is `.[0]`), a `def`, `try`, `if` (whose untaken branch drops the
 /// register statically) -- answers `false`.
 ///
-/// Read only by [`array_contents_are_checked`] since #3428: the `and`/`or`
-/// arms no longer decline an operand this rejects, because each operand's
-/// branch states its own register ([`register_after`]). An `[E]` still needs
-/// the allowlist, because its claim is that the resolver checks everything
-/// jq checks inside the brackets -- a stronger statement than "the register
-/// is known afterwards" -- and widening it is a separate promotion.
+/// Read only by [`and_or_operand_is_checked`] since #3428 (and, through it, by
+/// [`array_contents_are_checked`]'s `and`/`or`/minus arm): the `and`/`or` arms
+/// no longer decline an operand this rejects, because each operand's branch
+/// states its own register ([`register_after`]). An `[E]` still needs an
+/// allowlist, because its claim is that the resolver checks everything jq
+/// checks inside the brackets -- a stronger statement than "the register is
+/// known afterwards". Since #3724 that claim is this predicate *or*
+/// [`array_contents_are_checked`].
 ///
 /// Unlike [`array_contents_are_checked`], which admits a bare `first`
 /// because it cannot *fail* against a tracked input, this asks whether the
@@ -42016,7 +42018,10 @@ fn array_resolves_live<S: EvalSemantics>(inner: &Expr, trackable: bool) -> bool 
 /// slice's target (its keys are subexps); pipes, commas and parens of
 /// those; `last(f)`, whose claim is `f`'s own (#3767: it is `reduce f as $x
 /// (null; $x)`, so `f` is a source jq path-checks as the resolver's `last` arm
-/// does); and anything [`cannot_move_register`] admits, which neither moves
+/// does); `and`/`or`/unary minus over operands that satisfy
+/// [`and_or_operand_is_checked`] (this predicate or
+/// [`register_movement_tracked`], so the two are mutually recursive there,
+/// #3724); and anything [`cannot_move_register`] admits, which neither moves
 /// jq's register nor is path-checked inside. Everything else -- every other
 /// builtin call, an assignment, a `def`, a fold -- keeps the array
 /// refusing, the safe direction.
@@ -42047,20 +42052,21 @@ fn array_contents_are_checked(inner: &Expr) -> bool {
         Expr::LastExpr(f) | Expr::Builtin(Builtin::LastStream(f)) => array_contents_are_checked(f),
         // #3289: `resolve_node_sink` resolves `and`/`or`/unary minus live in
         // jq mode, checking each operand's navigation against the register
-        // as jq does. Since #3428 it does so for every operand; this claim
-        // keeps the narrower allowlist ([`register_movement_tracked`]) it was
-        // written against, which a bare `first` fails even though
-        // `array_contents_are_checked` admits it: `[first and .[0]]` on
-        // `[true]` is refused by jq near element 0. Widening an `[E]` claim
-        // is a promotion with oracle rows of its own (#3456, section 10 of
-        // the design note), not part of closing #3428.
-        // Confirmed live against jq 1.7.1: `path(. as $x | [.a and 5] | $x)`
-        // and `path(. as $x | [-.a] | $x)` on `{"a":1}` are `[]`, while
-        // `path([.a and .b] | empty)` still refuses near `"b"`.
+        // as jq does, and since #3428 it does so for every operand. The claim
+        // started on the narrower allowlist ([`register_movement_tracked`]),
+        // which a bare `first` fails; #3724 (item 2) widened it to the union
+        // with [`array_contents_are_checked`] ([`and_or_operand_is_checked`]),
+        // so `[first and .[0]]` is judged as jq judges it: on `[true]` the
+        // right operand navigates off the register `first` moved and both raise
+        // near element 0, on `[false,1]` the left operand short-circuits and
+        // both answer `[]`. Confirmed live against jq 1.7.1:
+        // `path(. as $x | [.a and 5] | $x)` and `path(. as $x | [-.a] | $x)` on
+        // `{"a":1}` are `[]`, while `path([.a and .b] | empty)` still refuses
+        // near `"b"`.
         Expr::And(l, r) | Expr::Or(l, r) => {
-            register_movement_tracked(l) && register_movement_tracked(r)
+            and_or_operand_is_checked(l) && and_or_operand_is_checked(r)
         }
-        Expr::Negate(e) => register_movement_tracked(e),
+        Expr::Negate(e) => and_or_operand_is_checked(e),
         // #2764: a primitive postfix `?` (`.a?`, `INDEX_OPT`) is not `try` at
         // all -- it is resolved natively by `resolve_optional_sink`'s own
         // primitive arm, so the claim still depends on whether the
@@ -42162,6 +42168,28 @@ fn array_contents_are_checked(inner: &Expr) -> bool {
         e if live_path_refusal(e).is_some() => true,
         other => cannot_move_register(other),
     }
+}
+
+/// Whether an `and`/`or`/unary minus operand inside `[E]` is one the resolver
+/// checks as jq does: either the register's position is known after it
+/// ([`register_movement_tracked`], the claim since #3289, which also covers an
+/// `as` source) or everything jq path-checks inside it is checked here
+/// ([`array_contents_are_checked`], which admits a bare `first`/`add`, a
+/// `map(f)`, `try`, `if`). Each is sound alone, so the claim is their union.
+///
+/// The second predicate's own argument for a bare `first` ("jq's internal
+/// `.[0]` is path-intact because the input *is* the register") holds for the
+/// *left* operand and for an operand of unary minus; for the right operand of
+/// `and`/`or` the register has already moved to the left operand's output, so
+/// `first` navigates off it and does raise (`[last and first]`). What makes
+/// the union sound there is the resolver's `and`/`or` arm, not this predicate:
+/// it resolves the right operand live from the register the left one left
+/// ([`register_after`], [`resolve_from_restored_input`]), so a navigation off
+/// it is refused as jq refuses it, and the claim only has to say that nothing
+/// jq checks is left unchecked. A change to that arm needs the sweep's
+/// `[L and R]` operands (`scripts/jq-path-register-sweep.py`, #3724 item 2).
+fn and_or_operand_is_checked(operand: &Expr) -> bool {
+    register_movement_tracked(operand) || array_contents_are_checked(operand)
 }
 
 /// Whether `f`, the argument of a `map`/`any`/`all` inside an `[E]` collect,

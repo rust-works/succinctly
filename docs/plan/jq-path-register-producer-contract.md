@@ -552,7 +552,13 @@ Each turns a refusal into an answer and needs its own oracle rows:
   (`navigates_only_the_register`: a chain of register navigations, optionally ending in one stage that navigates
   nothing, forked branch by branch). Still refused where jq answers: a `//`, `try` or `first(f)` inside `f`, and
   the `and`/`or` operands below.
-- Widening `array_contents_are_checked` past `register_movement_tracked`.
+- ~~Widening the `[E]` claim over `and`/`or`/unary minus past `register_movement_tracked`.~~ Done by #3724 (item 2):
+  an operand is claimed when `register_movement_tracked` *or* `array_contents_are_checked` says so
+  (`and_or_operand_is_checked`), so a bare `first`/`last`/`add`, a `map(f)` and `last(f)` no longer refuse the
+  collect: `[first and .[0]]` raises near element 0 on `[true]` and answers `[]` on `[false,1]`, as in jq. The union,
+  not the replacement, because `register_movement_tracked` also covers an `as` source, which
+  `array_contents_are_checked` does not. Swept over 300 `[L and R]`/`[L or R]`/`[-L]` operands built from twelve
+  pieces: 266,427 rows, 0 regressions and no `ACCEPT_WRONG`, 1,424 refuse-to-match flips, 285 rows still refused.
 - ~~Static `Unmoved` for the other builtins jq leaves in place (`sort`, `to_entries`, ...), one oracle
   row each.~~ Done for `sort`, `to_entries`, `flatten`, `add`, `map(f)` and `walk(f)` by #3361, at the
   leaf (`leaves_register_in_place`) and as a stage (`resolve_seq_stage`'s `stage_preserves_register`).

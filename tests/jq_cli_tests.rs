@@ -64651,12 +64651,14 @@ fn test_and_or_negate_path_accepts_where_the_result_is_the_register_3289() -> Re
 }
 
 /// #3456: an `[E]` whose `E` is an `and`/`or`/unary minus carries the path
-/// register only while `register_movement_tracked` says the register's position
-/// is known after each operand. Since #3428 the `and`/`or` arms no longer ask
-/// it, so the array claim is its one reader, and each composite operand shape
-/// below is an arm of it that nothing else reaches: a postfix-`?` primitive, a
-/// nested `and`/`or`, unary minus, and an `as` source. Each answers `[]` in jq
-/// 1.7.1 and here; an arm that said `false` would refuse it ("with result").
+/// register while each operand is admitted by `register_movement_tracked` (the
+/// register's position is known after it) or, since #3724, by
+/// `array_contents_are_checked`. Since #3428 the `and`/`or` arms no longer ask
+/// either, so the array claim is their one reader. The composite operand shapes
+/// below (a postfix-`?` primitive, a nested `and`/`or`, unary minus) are admitted
+/// by both now; the `as` source is the one only `register_movement_tracked`
+/// reaches, which is why the claim is the union. Each answers `[]` in jq 1.7.1 and
+/// here; an arm that said `false` would refuse it ("with result").
 #[test]
 fn test_array_claim_over_composite_and_or_operands_carries_the_register_3456() -> Result<()> {
     assert_path_rows_3289(&[
@@ -64708,6 +64710,159 @@ fn test_array_claim_over_composite_and_or_operands_carries_the_register_3456() -
             "[]\n",
             "",
             0,
+        ),
+    ])
+}
+
+/// #3724 (item 2): an `and`/`or`/unary minus inside an `[E]` collect whose operand
+/// jq leaves the register on but the resolver does not follow (a bare `first`,
+/// `last`, `add`, a `map(f)`) is judged as jq judges it. `and`/`or` are not subexps:
+/// `L` moves jq's register wherever it navigates, `R` runs on the original input
+/// against that register, and a short-circuit never runs `R`. So `[first and .[0]]`
+/// on `[true]` raises near element 0 where `[false,1]` answers `[]`, and a collect
+/// whose operands never navigate off the register (`[first and true]`) backtracks
+/// to the root. Every row captured from jq 1.7.1, on the stdin and `-n` routes.
+#[test]
+// The `{k:1}` rows are jq filter literals, not formatting strings.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_collect_and_or_over_register_moving_builtins_3724() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r"[true]",
+            r"path(. as $x | [first and true] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[true]",
+            r"path(. as $x | [first or .a] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (r"[1,2]", r"path(. as $x | [add and 1] | $x)", "[]\n", "", 0),
+        (
+            r"[true]",
+            r"path(. as $x | [map(.) and true] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (r"[0,2]", r"path(. as $x | [-first] | $x)", "[]\n", "", 0),
+        (
+            r"[true,2]",
+            r"path(. as $x | [(first and true) or last] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        // A short-circuit never runs the right operand, so it answers; the
+        // same program on a truthy `first` raises near element 0.
+        (
+            r"[false,1]",
+            r"path(. as $x | [first and .[0]] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[true]",
+            r"path(. as $x | [first and .[0]] | $x)",
+            "",
+            "Invalid path expression near attempt to access element 0 of [true]",
+            5,
+        ),
+        (
+            r"[[1],[2]]",
+            r"path(. as $x | [last and first] | $x)",
+            "",
+            "Invalid path expression near attempt to access element 0 of [[1],[2]]",
+            5,
+        ),
+        // The register survives, so a write through `$x` lands on it, and a
+        // write whose collect raises is refused rather than lost.
+        (
+            r"[true,2]",
+            r"del(. as $x | [first and true] | $x[0])",
+            "[2]\n",
+            "",
+            0,
+        ),
+        (
+            r"[false,2]",
+            r"del(. as $x | [first and .[0]] | $x[0])",
+            "[2]\n",
+            "",
+            0,
+        ),
+        (
+            r"[true,2]",
+            r"del(. as $x | [first and .[0]] | $x[0])",
+            "",
+            "Invalid path expression near attempt to access element 0 of [true,2]",
+            5,
+        ),
+        (
+            r"[true,2]",
+            r"(. as $x | [first and true] | $x[0]) |= 9",
+            "[9,2]\n",
+            "",
+            0,
+        ),
+        // The other shapes `array_contents_are_checked` admits are operands too.
+        (
+            r"[true]",
+            r"path(. as $x | [(try .a) and true] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[true]",
+            r"path(. as $x | [true or (if .a then first else .[0] end)] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[true]",
+            r"path(. as $x | [(recurse(.[]?)) and true] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[[1]]",
+            r"path(. as $x | [(flatten) and first] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        // An operand outside both allowlists keeps the collect refusing, on either
+        // side: a nested `[map(f)]` whose `f` navigates a computed value raises in
+        // jq, and the resolver evaluates it by value.
+        (
+            r"[true]",
+            r"path(. as $x | [[map({k:1} | .k)] and true] | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[true]",
+            r"path(. as $x | [true and [map({k:1} | .k)]] | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        // The collect's own output is computed, so navigating it still raises.
+        (
+            r"[true]",
+            r"path(. as $x | [first and first] | $x | .[0])",
+            "",
+            "Invalid path expression near attempt to access element 0 of [true]",
+            5,
         ),
     ])
 }
