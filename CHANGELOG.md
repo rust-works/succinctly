@@ -40,6 +40,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test_recurse_of_each_optional_with_a_gating_cond_has_no_node_cap_3737`, `test_recurse_gated_cond_runs_in_jq_order_3737`,
   `test_yq_recurse_gated_cond_has_no_node_cap_3737` and `walk_descendants_gated_agrees_with_the_evaluator_driven_walk_3737`; see
   `docs/compliance/jq/limitations.md`.
+- **jq: bind sources beyond the #3423 alias grammar keep the write jq makes under `try`** (#3795).
+  A source whose output is a node the register later moves onto (`((.a // .) as $x | .a | try $x.b) = 9`), a `catch` handler whose body
+  raises the register (`del((try error(.) catch .) as $x | try $x.a)`), a forwarding `def`, a bind made after a stage that lost the
+  register, and a `reduce`/`foreach` element bind over a source that forwards `.` (`(foreach ((., 1) | .) as $x (null; .; try $x.a)) = 9`)
+  were bound with no mark, so a refusal off `$x` was caught and `del`/`=`/`|=` echoed the document at exit 0. The #3402 transparent witness
+  grammar now takes a comma and a navigation of the register's node as leaves (only on a tracked input, and never a slice, whose refusal a
+  `try` would swallow), so the resolver places `.a // .`, `first(.a, .)` and `(., 1) | .` exactly; such a fold source is driven by the
+  resolver (outside another fold's body and without a pattern of its own); and `may_alias_register` counts a handler's `.` when the body
+  can raise an aliasing value, and looks through zero-arity defs. Those write as jq does. A forwarding `def` and a lost register still
+  cannot be placed, so they refuse loudly (exit 5) instead. Some #3423 rows that refused loudly now answer as jq does, and
+  `path((.a | select(.b)) as $y | .a | $y)`, `path((.a // 1) as $y | .a | $y)` and the `if` spelling move from refuse-only to answered.
+  Residual: a `?//` whose source forwards `.` through control flow still drops the write (`docs/compliance/jq/limitations.md`). Pinned by
+  `test_bind_sources_beyond_the_alias_grammar_keep_the_write_3795` and `test_bind_sources_the_resolver_cannot_place_refuse_loudly_3795`.
 - **jq: `paths`, `leaf_paths` and the cursor-native `path(f)` walkers answer on documents nested 256-383 levels deep** (#3429).
   They shared the whole-document materializers' 256 ceiling, so a well-formed document in that band answered `[..]` but raised
   `nesting depth exceeds limit of 256` for `[paths]`, `[leaf_paths]`, `[.. | path]` and a static `path(.a.a...)` chain. They now stop at
