@@ -29944,6 +29944,8 @@ fn stream_path_writes<S: EvalSemantics>(
         // A path arriving after a stop means a `?//` in `path_expr` retried
         // the next alternative (#2974 review): see [`RetryResumes`].
         if retry_resumes == RetryResumes::Yes {
+            // The stash holds only what `parked.stop` below put there, a write that
+            // raised, so a retry past it is a retry after a failed write.
             // #3859: a write that raised left jq's `reduce` state at the `null`
             // its `DUPN` hands back for a slot still retained for backtracking,
             // so the retried alternative's paths are written onto `null`, not

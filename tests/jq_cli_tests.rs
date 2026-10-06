@@ -110390,6 +110390,13 @@ fn test_destructuring_alt_bind_writes_and_a_retry_resumes_from_null_3859() -> Re
         ),
         (
             r#"{"x":[null],"k":3}"#,
+            r"(.x | .. | (. as [$q] ?// $z | $z)) = (9,8)",
+            "{\"x\":[9]}\n{\"x\":[8]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":[null],"k":3}"#,
             r"(.x | .. | (. as [$q] ?// {a:$q} ?// $z | null)) = 9",
             "{\"x\":[{\"a\":9}]}\n",
             "",
