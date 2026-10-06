@@ -125271,9 +125271,10 @@ mod tests {
     /// here regardless of the walk's own verdict.
     ///
     /// Reached via `FoldRegister::advance`'s third arm: the *outer*
-    /// `foreach`'s UPDATE (`def f: null; f`, a call -- `cannot_move_register`
-    /// is unconditionally `false` for a call, unlike a literal) produces an
-    /// untrackable branch, so the fold's own register frame becomes
+    /// `foreach`'s UPDATE (`def f: null; f | f`, a pipe of calls --
+    /// `cannot_move_register` is unconditionally `false` for a call, unlike a
+    /// literal) produces an untrackable branch, so the fold's own register
+    /// frame becomes
     /// `self.frame.unknown()` for the rest of that step. The *inner*
     /// `foreach`'s own destructuring pattern (`{a:$x}`, admitted by
     /// #2676's widened `may_bind_navigated` gate) then walks under that
@@ -125292,7 +125293,7 @@ mod tests {
         assert_eq!(
             outputs(
                 b"null",
-                "path(foreach (1) as $y (.; (def f: null; f); \
+                "path(foreach (1) as $y (.; (def f: null; f | f); \
                  foreach (null) as {a:$x} (.; .; $x)))"
             ),
             [r#"["a"]"#]
