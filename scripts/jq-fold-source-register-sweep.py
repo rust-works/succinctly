@@ -32,8 +32,8 @@ the alphabet. Run `--self-test` to print the pools.
 
 Two-sided staleness gate, as the other oracle sweeps have: the run fails on
 any divergence outside `KNOWN_RESIDUALS` -- the (source, category) pairs whose
-remaining divergences are tracked (#3459: an opaque builtin that indexes
-inside itself; #3460: pointer identity) -- and on any tracked pair that
+remaining divergences are recorded (#3460: pointer identity; a nested navigating
+`foreach`, recorded in docs/compliance/jq/limitations.md) -- and on any recorded pair that
 *stops* occurring, so the table cannot go stale. `--print-residuals` prints
 the observed table for regenerating it after a deliberate change.
 
@@ -66,6 +66,7 @@ SRCS += [
     '..|tostring', 'recurse|tostring', 'recurse(.[]?)|length', '..', 'recurse',
     'getpath(["a"])|tostring', 'getpath(["b","c"])|type', 'getpath(["a"])', 'walk(.)|tostring',
     'first|tostring', 'last|tostring', 'nth(0)|tostring', 'first', 'last', 'map(1)|length',
+    'nth(1)', 'nth(0,1)|tostring', 'flatten|length', 'add|length', 'map(.)|length', 'map(.a?)|length',
     '.[0:1]|tostring', '.[0:]|tostring', '.a[0:1]?|length', '.[1:]|type', '.[0:2]',
     'range(2)|tostring', 'paths|tostring', 'keys|.[0]', 'to_entries|length', 'tojson|fromjson',
 ]
@@ -89,12 +90,9 @@ FORMS = ['path({k} ({s}) as $k ({i}; {u}))', '({k} ({s}) as $k ({i}; {u})) = 9']
 # the run instead of hiding behind the source's name. A pair that stops
 # occurring fails too, so the table cannot go stale.
 #
-#   `first`/`last`/`nth`/`map`/`add`, *bare* -- builtins that index inside
-#   themselves, so the register's position is unknowable here (#3459). They
-#   leave the resolver's path at the root and read as a literal:
-#   `first|tostring` still FABRICATEs (jq refuses), as it did before #2159.
-#   After a navigation `first`/`last`/`nth` are navigated natively and no
-#   longer diverge.
+#   (#3459 closed the bare `first`/`last`/`nth`/`map`/`add`/`flatten` sources: they
+#   are routed through the resolver like any other navigation, so none of them is
+#   listed -- the sweep has no FABRICATE row left.)
 #   `.b|tostring`, `1, (.a|tostring)`, `..`, `recurse`, `.[0:]`, `.[0:2]`,
 #   `.[0:(1+1)]` -- jq's pointer identity: the accumulator carried across
 #   source elements, a `tostring` of a string, a full slice (#3460).
@@ -110,14 +108,7 @@ KNOWN_RESIDUALS = {
     '.[0:]|tostring': ['REJECT'],
     '.b|tostring': ['REJECT'],
     '1, (.a|tostring)': ['REJECT'],
-    'add?': ['REJECT', 'both-ok-differ'],
-    'first': ['FABRICATE', 'REJECT', 'both-ok-differ'],
-    'first|tostring': ['FABRICATE', 'both-ok-differ'],
     'foreach .[]? as $x (0; .+1)': ['REJECT'],
-    'last': ['FABRICATE', 'REJECT', 'both-ok-differ'],
-    'last|tostring': ['FABRICATE', 'both-ok-differ'],
-    'map(1)|length': ['FABRICATE'],
-    'nth(0)|tostring': ['FABRICATE', 'both-ok-differ'],
     'recurse': ['both-error-differ'],
     'recurse(.[]?)|length': ['both-error-differ'],
     'recurse|tostring': ['both-error-differ'],
