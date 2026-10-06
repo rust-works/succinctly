@@ -105319,7 +105319,7 @@ fn test_any_all_path_answer_precedes_retry_raise_3827() -> Result<()> {
 fn test_any_all_path_answer_halt_is_not_retried_3827() -> Result<()> {
     let input = r#"{"x":true}"#;
     for cond in [
-        r#"if $q then true else empty end"#,
+        r"if $q then true else empty end",
         r#"if $q then true else error("E2") end"#,
     ] {
         let filter =
