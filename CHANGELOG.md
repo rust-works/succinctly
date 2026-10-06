@@ -884,8 +884,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   other is `. as $d | 1 | foreach $d as $k`, a different source). **Not recognised inside another fold's UPDATE or EXTRACT**: there `.` is the accumulator,
   which the enclosing fold's source may have moved off the register while the ambient still reads as trackable, and a first cut answered a root where jq
   refuses (`path(reduce first as $k (.; foreach . as $k (0; ($k | .a?) // $k; .)))`, and `del(reduce .[]? as $k (.; ...))` deleted the document: 10
-  sampled `ACCEPT_WRONG` rows, found by the sweep, none left). Against a build of `main`, the path-register sweep (19 fold-over-the-register operands) is
-  reported in the pull request; the full-grid sample went from 24 `ACCEPT_WRONG` rows to 11. `scripts/jq-bind-origin-fuzz.py` (8,000 programs at
+  sampled `ACCEPT_WRONG` rows, found by the sweep, none left). Against a build of `main`, the path-register sweep (19 fold-over-the-register operands, 90,027 sampled rows)
+  went from 198 `ACCEPT_WRONG` rows to 8 (190 now matching jq, none new) and turned 1,570 refusals into matches; the full-grid sample (30,027 rows) went from 24
+  `ACCEPT_WRONG` rows to 11. 26 sampled rows that matched now refuse, all of them two operands (`reduce . as $k (0; $k.a?)` and `foreach . as $k (0; ($k | .a?) //
+  $k; .)`) under `and`/`or`/`try`, where `main` matched by luck. `scripts/jq-bind-origin-fuzz.py` (8,000 programs at
   `--fold-p 1.0`, and 8,000 mixed), the `jq-bind-origin-oracle-sweep.sh` matrix (identical row classes) and `jq-alt-retry-oracle-sweep.sh` (2,689 of 2,689)
   showed no fabricated or mismatching rows.
 - **jq: a `foreach` source that destructures the register itself (`. as PATTERN | ...`) moves it, so EXTRACT is checked where jq's register is** (#3744, a #3489 residual).
