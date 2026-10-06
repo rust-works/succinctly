@@ -26650,18 +26650,10 @@ fn path_context_resolve_constants<S: EvalSemantics>(
 /// this instead of rewriting the consumer's body, so the consumer itself drives
 /// the body. Their guards require a prefetch hook, so there is always one.
 fn prefetch_whole_consumer(at: &PathContextAt<'_>, expr: &Expr) -> Result<Expr, EvalError> {
-    match at.prefetch {
-        Some(prefetch) => Ok(prefetched_literal(prefetch(expr)?)),
-        None => {
-            // patchcov: coverage tolerate reason="unreachable by construction: both callers' guards require at.prefetch to be Some (#3639)"
-            debug_assert!(
-                false,
-                "a consumer was prefetched whole without a prefetch hook"
-            );
-            Ok(expr.clone())
-            // patchcov: coverage end
-        }
-    }
+    let prefetch = at
+        .prefetch
+        .expect("both callers' guards require a prefetch hook");
+    Ok(prefetched_literal(prefetch(expr)?))
 }
 
 /// The literal of a prefetched sub-expression's outputs: `empty` for none,
@@ -32989,33 +32981,36 @@ mod tests {
 
     /// #3639: a `label` met at a position with no prefetch hook (the absent-
     /// position and `|=` entries build none) has no break to catch, so it is
-    /// rewritten like any other wrapper and keeps its name and body.
+    /// rewritten like any other wrapper and keeps its name, in either mode --
+    /// the catch is `CONSUMERS_DRIVE_PREFETCHED_BODY`'s, which `yq` leaves off.
     #[test]
     fn label_without_a_prefetch_hook_keeps_its_body_3639() {
-        let expr = parse("label $out | key").unwrap();
-        let key = OwnedValue::String("a".into());
-        let path = vec![key.clone()];
-        let resolved = path_context_resolve_constants::<JqSemantics>(
-            &expr,
-            &PathContextAt {
-                key: Some(&key),
-                path: &|| Cow::Borrowed(path.as_slice()),
-                parent_of: None,
-                prefetch: None,
-                prefetch_escaped: None,
-                prefetch_catch_break: None,
-            },
-        )
-        .unwrap();
-        match resolved {
-            Expr::Label { name, body } => {
-                assert_eq!(name, "out");
-                assert!(
-                    !matches!(*body, Expr::Builtin(Builtin::Key)),
-                    "key unresolved"
-                );
-            }
-            other => panic!("expected a label, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message for the assertion above (#3639)"
+        fn resolved<S: EvalSemantics>() -> Expr {
+            let key = OwnedValue::String("a".into());
+            let path = vec![key.clone()];
+            let label = Expr::Label {
+                name: "out".into(),
+                body: Box::new(Expr::Builtin(Builtin::PathNoArg)),
+            };
+            path_context_resolve_constants::<S>(
+                &label,
+                &PathContextAt {
+                    key: Some(&key),
+                    path: &|| Cow::Borrowed(path.as_slice()),
+                    parent_of: None,
+                    prefetch: None,
+                    prefetch_escaped: None,
+                    prefetch_catch_break: None,
+                },
+            )
+            .unwrap()
+        }
+        for expr in [resolved::<JqSemantics>(), resolved::<YqSemantics>()] {
+            assert!(
+                matches!(&expr, Expr::Label { name, body }
+                    if name == "out" && !matches!(**body, Expr::Builtin(Builtin::PathNoArg))),
+                "label not kept with its path resolved: {expr:?}"
+            );
         }
     }
 
