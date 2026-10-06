@@ -6482,15 +6482,21 @@ its outputs (`first(path(reduce 1 as $x (.; .[("a"|stderr), ("b"|stderr)])))` wr
 `path_mode_foreach_update_and_extract_resolve_by_demand_3507` (`tests/jq_cli_tests.rs`); the `ix-foreach`
 family in `scripts/jq-alt-retry-oracle-sweep.sh` (stop variants included) is no longer a known divergence.
 
-*Residual, filed as [#3651](https://github.com/rust-works/succinctly/issues/3651).* The consumer's stop now
-also reaches a fold **nested** in UPDATE or EXTRACT, and a `?//` in that inner fold's *source* then retries
-after the stop from the stored state, where jq does not raise: `first(path(foreach 1 as $v (.; foreach
-([[1]] as [$x] ?// $y | $x) as $w (.; .b))))` on `{"b":[1,2,3]}` prints `["b"]` and then
-`Invalid path expression near attempt to access element "b" of [1,2,3]` here, and `["b"]` alone in jq. That
-retry-after-stop model is already wrong un-nested (`[first(path(foreach ([[1]] as [$x] ?// $y | $x) as $w
-(.; .b)))]` raises on `main` too); nesting only makes it reachable from a position the inner fold used to
-run to completion in. A nested fold whose EXTRACT also carries a `?//` retries both on the one stop and
-over-delivers (four paths where jq prints two).
+*Residual #3651, closed.* The consumer's stop also reaches a fold **nested** in UPDATE or EXTRACT, and
+a `?//` in that inner fold's *source* looked as if it retried after the stop from the stored state where jq
+does not (`first(path(foreach 1 as $v (.; foreach ([[1]] as [$x] ?// $y | $x) as $w (.; .b))))` on
+`{"b":[1,2,3]}` printed `["b"]` and then `Invalid path expression ...` here). The retry model was right; the
+*first alternative* was wrong. A pattern step in `path()` is a tracked index, and a freshly built value is
+never the register's node, so jq's `[[1]] as [$x]` raises and the `?//` runs `$y`: alternative one never
+runs in jq, and `[path(foreach ([[1]] as [$x] ?// $y | $y) as $w (.; if $w == null then .a else .b end))]`
+is `[["b"]]` there, `[["a"]]` here before the fix, with no stop and no nesting at all. A source with a `?//`
+chain was driven by value, where alternative one succeeds. A chain over a freshly built source now goes
+through the resolver like a single pattern does (`routes_fresh_destructuring`), and `resolve_as_pattern`
+treats a provably fresh head's first-step refusal as jq's own verdict (`fresh_head`) even with no register in
+hand, so the retry also holds once INIT has navigated. A fold's own `?//` pattern chain, and a chain over a
+source that may be the register, still run by value. Pinned in
+`fold_source_alt_chain_over_a_fresh_value_runs_the_next_alternative_3651` (`tests/jq_cli_tests.rs`),
+including the issue's rows and the `axax` stderr count.
 
 Value-mode `reduce`'s INIT (#2899 above) is untouched and still collects — it needs a native
 `Expr::Reduce` dispatch arm before a stop has anywhere to land, which is a different change.

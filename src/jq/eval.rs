@@ -44032,7 +44032,7 @@ fn foreach_source_destructures_register(source: &Expr) -> bool {
 fn is_fold_source_destructuring(e: &Expr) -> bool {
     match e {
         Expr::AsPattern { expr, patterns, .. } => {
-            routes_destructuring(patterns) && yields_only_fresh_values(expr)
+            routes_fresh_destructuring(patterns) && yields_only_fresh_values(expr)
         }
         Expr::Reduce {
             input, patterns, ..
@@ -44044,15 +44044,29 @@ fn is_fold_source_destructuring(e: &Expr) -> bool {
     }
 }
 
+/// [`routes_destructuring`] for a *freshly built* source ([`yields_only_fresh_values`], #3651):
+/// a `?//` chain routes too, as long as some alternative performs a pattern step at all.
+/// Every such step raises on a fresh value whatever the register is, so the resolver's
+/// refusal is jq's own verdict even when INIT has navigated (`resolve_as_pattern`'s
+/// `fresh_head`) and the chain runs the alternative jq runs. By value, alternative one
+/// *succeeded*: `first(path(foreach ([[1]] as [$x] ?// $y | $x) as $w (.; .b)))` then
+/// retried alternative two from a state alternative one had moved, where jq never ran
+/// alternative one. A chain of bare `$var`s performs no step and stays by value.
+fn routes_fresh_destructuring(patterns: &[Pattern]) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| !matches!(pattern, Pattern::Var(_)))
+}
+
 /// A single array or object pattern: the case the resolver answers like jq
 /// whatever INIT did to the register. A `?//` alternative is left to the
-/// by-value drive. jq retries onto the next alternative when the first one's
-/// pattern step raises, but once INIT has navigated (`(.[]; ...)`, `(.a; ...)`)
-/// the resolver cannot tell that refusal from a guess, so it does not retry and
-/// raises where jq answers: `reduce (([1],[2]) as [$a] ?// $a | empty) as $x
-/// (.[]; .)` is answered by jq and the by-value drive, and was refused. The
-/// price is that a fresh source under `?//` is still accepted where jq raises
-/// in every alternative.
+/// by-value drive, except over a freshly built `as` source
+/// ([`routes_fresh_destructuring`]). jq retries onto the next alternative when
+/// the first one's pattern step raises, but for a source that may be the
+/// register, or a fold's own pattern chain, the resolver cannot tell that refusal
+/// from a guess once INIT has navigated (`(.[]; ...)`, `(.a; ...)`), so it would
+/// not retry and would raise where jq answers. The price is that such a chain is
+/// still accepted by value where jq raises in every alternative.
 fn routes_destructuring(patterns: &[Pattern]) -> bool {
     matches!(patterns, [pattern] if !matches!(pattern, Pattern::Var(_)))
 }
@@ -45299,6 +45313,7 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
     let head_resolves_to_register =
         register.is_some_and(|reg| resolves_to_register::<S>(head, trackable, reg, frame));
     let bound_is_frozen = head_may_be_frozen(head, snapshot);
+    let fresh_head = S::TAG == EvalTag::Jq && yields_only_fresh_values(head);
     // #3781: a head this arm cannot place -- not a bare `.`/marker it recognises, not
     // provably fresh (#3489) -- may still be jq's register itself (`select(true)`,
     // `first(.)`, `(.|.)`, `limit(1; .)` pass `.` through with its path). jq then
@@ -45353,7 +45368,11 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
         // Whether a first-step refusal is jq's own verdict rather than this
         // arm's guess: the source is not even value-equal to the register,
         // so it cannot be the register's node whatever jq's pointer says.
-        let refusal_is_exact = register.is_some_and(|reg| bound != reg);
+        // #3651: or the head is provably fresh -- a literal or a built container is
+        // never jq's register node, so its first step refuses whatever the register
+        // is, and with none in hand (an INIT-navigated fold source) the next
+        // alternative is the one jq runs.
+        let refusal_is_exact = fresh_head || register.is_some_and(|reg| bound != reg);
         for (i, pattern) in patterns.iter().enumerate() {
             begin_pattern_alternative(i); // #3293
             let is_last = i == last_idx;
