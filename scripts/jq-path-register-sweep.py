@@ -666,6 +666,23 @@ OPERANDS = [
     "[last(.a) and first]",
     "[.a? and first]",
     "[(.a, .[0]) and last]",
+    # (#3865) a bare `map(f)` is `[.[] | f]` in jq, so an `f` that navigates a computed value
+    # raises there, whatever the stage does with the result. The by-value leaf never raised, so
+    # a stage that discarded the output accepted (`path(map({k:1} | .k) | empty)`). The
+    # contrasts keep an `f` jq answers: `//`, `try`-free chains, a trailing non-navigating stage.
+    "map({k:1} | .k)",
+    "map(.a | {k:1} | .k)",
+    "map(sort | .[0])",
+    "map(.a // .b)",
+    "map(.[0])",
+    "map(first)",
+    "map(.a | length)",
+    "map(.[]?)",
+    "map(select(.a))",
+    "map(.a, {k:1} | .k)",
+    "map(getpath([\"a\"]))",
+    "map(error(\"x\"))",
+    "map(empty)",
 ]
 
 # The other side of a two-operand shape. Chosen so that, against the inputs

@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jq: a navigating `map(f)` in `path()`/`del()`/`=` is resolved as `[.[] | f]`, so jq's path error inside `f` is raised even when the result is discarded** (#3865, shape 1).
+  `path(map({k:1} | .k) | empty)` answered nothing and `del([map({k:1} | .k)] and (.a)?)` deleted nothing at exit 0, where jq raises
+  `near attempt to access element "k"`: the by-value leaf evaluated `map(f)` as one opaque value and never path-checked `f`. A `map(f)` whose `f` can move
+  the register now re-dispatches as the collect jq defines, reusing every rule the `[E]` arm has; an `f` that cannot move it, and one holding `getpath`,
+  keep the by-value leaf. jq mode only; yq is pinned unchanged. Against a clean `main`, seeded sweeps over the new `map(f)` operands (40,027 rows), the
+  #3724 operands (60,027) and the whole grid (40,027) showed 0 regressions; `ACCEPT_WRONG` fell from 45 to 0, 25 to 12 and 27 to 21 (the rest are
+  `[map(...getpath...)]` on an untracked entry and unrelated fold shapes, unchanged). Still open on #3865: that `getpath` shape. Pinned by
+  `test_map_f_in_path_position_raises_where_jq_does_3865`.
 - **jq: an `and`/`or`/unary minus inside an `[E]` collect is judged as jq judges it when an operand is a bare `first`/`last`/`add` or a `map(f)`** (#3724, item 2).
   `path(. as $x | [first and .[0]] | $x)` raises near element 0 on `[true]` (`first` moved jq's register, so the right operand navigates off it) and is `[]`
   on `[false,1]` (the left operand short-circuits); `[first and true]`, `[add and 1]`, `[map(.) and true]` and `[-first]` are `[]`. The claim was

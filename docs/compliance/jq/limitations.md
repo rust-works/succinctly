@@ -1212,7 +1212,13 @@ is the revert that established what the other one costs.
      (`map(.)`, `map(tostring)`, `walk(.)`) leaves the register in place. That excludes an `f`
      that navigates and also an `f` that is itself one of the promoted builtins (`map(sort)`,
      `map(add)`): `add` iterates the element, which is the register for `map` but a computed
-     array for the trailing `| f` of `walk`, so one rule cannot cover both.
+     array for the trailing `| f` of `walk`, so one rule cannot cover both. Since
+     [#3865](https://github.com/rust-works/succinctly/issues/3865) a `map(f)` whose `f` can move the
+     register is *resolved* as the collect jq defines (`[.[] | f]`), so jq's path error inside `f`
+     surfaces even where the result is discarded (`path(map({k:1} | .k) | empty)` raises near
+     `"k"`, as in jq); the register verdict above is unchanged. A `map(f)` holding `getpath`
+     still evaluates by value (the collect arm leaves `getpath` to the eager fallback, #2759),
+     so `[map(getpath(["a"]))]` on an untracked entry accepts where jq raises; jq mode only.
    - **The promoted builtins inside a compound stage** (`[sort]`, `limit(1; sort)`,
      `(sort, add)`, `(flatten(1), reverse)`, `[join(",")]`, `if`/`try` around them) are read as
      a loss: the stage is judged as a whole, and jq answers for each (the stage-level
