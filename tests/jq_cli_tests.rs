@@ -82233,22 +82233,31 @@ fn test_fold_loop_variable_in_path_position_3329() -> Result<()> {
     }
     // Equal values at different nodes are different `jv`s; the same node is one.
     for (filter, want) in [
-        (
-            r".a as $y | reduce .a as $x (.a; ($x.b) = 9)",
-            Some(r#"{"b":9}"#),
-        ),
         (r"reduce .a as $x (.a; ($x.b) = 9)", Some(r#"{"b":9}"#)),
         (r"reduce .a as $x (.c; ($x.b) = 9)", None),
+        (r"reduce .c as $x (.a; ($x.b) = 9)", None),
     ] {
-        let (stdout, stderr, code) = run_jq_full(
-            &["-n", "-c", &format!("input | {filter}")],
-            Some(r#"{"a":{"b":1},"c":{"b":1}}"#),
-        )?;
-        match want {
-            Some(want) => assert_eq!((stdout.trim(), code), (want, 0), "{filter}: {stderr:?}"),
-            None => {
-                assert_eq!((stdout.trim(), code), ("", 5), "{filter}: {stderr:?}");
-                assert!(stderr.contains("Invalid path expression"), "{stderr:?}");
+        for (args, program) in [
+            (&["-c"][..], filter.to_string()),
+            (&["-n", "-c"][..], format!("input | {filter}")),
+        ] {
+            let mut argv: Vec<&str> = args.to_vec();
+            argv.push(&program);
+            let (stdout, stderr, code) = run_jq_full(&argv, Some(r#"{"a":{"b":1},"c":{"b":1}}"#))?;
+            match want {
+                Some(want) => assert_eq!(
+                    (stdout.trim(), code),
+                    (want, 0),
+                    "{program} ({args:?}): {stderr:?}"
+                ),
+                None => {
+                    assert_eq!(
+                        (stdout.trim(), code),
+                        ("", 5),
+                        "{program} ({args:?}): {stderr:?}"
+                    );
+                    assert!(stderr.contains("Invalid path expression"), "{stderr:?}");
+                }
             }
         }
     }
@@ -82256,15 +82265,6 @@ fn test_fold_loop_variable_in_path_position_3329() -> Result<()> {
     // source that navigates *below* it still refuses where jq answers (the
     // ancestor lookup #3179's nested reuse has no mirror for), never the
     // other way round.
-    let (stdout, stderr, code) = run_jq_full(
-        &["-c", r"reduce .a as $x (.a; ($x.b) = 9)"],
-        Some(r#"{"a":{"b":1},"c":{"b":1}}"#),
-    )?;
-    assert_eq!(
-        (stdout.trim(), code),
-        (r#"{"b":9}"#, 0),
-        "stderr={stderr:?}"
-    );
     let (stdout, _, code) = run_jq_full(
         &["-c", r"reduce .a as $x (.; del(.a | $x))"],
         Some(r#"{"a":{"b":1}}"#),

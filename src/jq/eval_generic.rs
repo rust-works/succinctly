@@ -11264,20 +11264,33 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             // itself, not `RootWitness::of(cursor)` (which would wrongly
             // compare against `.`'s own node instead of the accumulator's).
             let mut outputs: Vec<OwnedValue> = Vec::new();
-            let shared = fold_init_shares_identity::<S>(patterns, update, None);
+            let retry =
+                crate::jq::eval::FoldDirectRetry::of::<S>(init, input, patterns, update, None);
             let flow = reduce_forks::<S>(
                 patterns,
                 update,
                 &mut |per_init| {
-                    drive_foreach_init_generic::<S, V>(
-                        init, &value, optional, cursor, shared, per_init,
+                    drive_foreach_expr_generic::<S, V>(
+                        init,
+                        &value,
+                        optional,
+                        cursor,
+                        retry.marks_loop_vars(),
+                        per_init,
                     )
                 },
                 optional,
                 &mut |per_element| {
-                    drive_foreach_expr_generic::<S, V>(input, &value, optional, cursor, per_element)
+                    drive_foreach_expr_generic::<S, V>(
+                        input,
+                        &value,
+                        optional,
+                        cursor,
+                        false,
+                        per_element,
+                    )
                 },
-                crate::jq::eval::FoldDirectRetry::of(init, input),
+                retry,
                 &mut |v| {
                     outputs.push(v);
                     Demand::Continue
@@ -11324,21 +11337,39 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             // `foreach_forks` demotes them against `Owned` itself, same
             // reasoning as the `Expr::Reduce` arm just above.
             let mut outputs: Vec<OwnedValue> = Vec::new();
-            let shared = fold_init_shares_identity::<S>(patterns, update, extract.as_deref());
+            let retry = crate::jq::eval::FoldDirectRetry::of::<S>(
+                init,
+                input,
+                patterns,
+                update,
+                extract.as_deref(),
+            );
             let flow = foreach_forks::<S>(
                 patterns,
                 update,
                 extract.as_deref(),
                 &mut |per_init| {
-                    drive_foreach_init_generic::<S, V>(
-                        init, &value, optional, cursor, shared, per_init,
+                    drive_foreach_expr_generic::<S, V>(
+                        init,
+                        &value,
+                        optional,
+                        cursor,
+                        retry.marks_loop_vars(),
+                        per_init,
                     )
                 },
                 optional,
                 &mut |per_element| {
-                    drive_foreach_expr_generic::<S, V>(input, &value, optional, cursor, per_element)
+                    drive_foreach_expr_generic::<S, V>(
+                        input,
+                        &value,
+                        optional,
+                        cursor,
+                        false,
+                        per_element,
+                    )
                 },
-                crate::jq::eval::FoldDirectRetry::of(init, input),
+                retry,
                 &mut |v| {
                     outputs.push(v);
                     Demand::Continue
@@ -12817,85 +12848,57 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
 /// The source's own call site passes this once per INIT fork, driving the
 /// source afresh each time — see `eval::foreach_forks` for why that is not
 /// a recording-and-replay. INIT's own call site passes it exactly once.
+///
+/// `register_first` is INIT's alone, and only for a fold that marks its loop
+/// variables (#3329, `FoldDirectRetry::marks_loop_vars`). jq's `reduce (.) as $x
+/// (.; ($x.a) = 9)` binds `$x` and the accumulator to the *same* `jv`, because INIT
+/// and the source both read the input; this evaluator materializes the two
+/// separately, so `$x` would be a value-equal twin of the accumulator that the
+/// resolver's storage clause (#3177) cannot match. The first INIT output that
+/// names a document node is therefore registered in the embed table for the fork it
+/// starts, and the source's later materialization of that node returns its `Rc`
+/// ([`embed_table`]). The entry makes the accumulator's first in-place write copy
+/// once, and a live table reshapes owned navigation, neither of which a fold that
+/// cannot certify a marker should pay -- hence the gate. Only the *first* output:
+/// jq 1.7.1 evaluates SOURCE against `null` on every later fork
+/// (`[reduce (.) as $x ((.,.); $x)]` is `[{"a":1},null]`), so a loop variable there is
+/// never the accumulator's own node, and an entry would answer a write through it
+/// that jq refuses.
 fn drive_foreach_expr_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     value: &V,
     optional: bool,
     cursor: Option<V::Cursor>,
+    register_first: bool,
     per_item: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Flow {
     // Out-of-band, same as `stream_owned_outputs_generic`'s own
     // `decode_err`: the already-iterated prefix stands in front of an
     // undecodable element's error.
     let mut escape: Option<Control> = None;
+    // #3329: whether the next item is still the first one `register_first`
+    // may register.
+    let mut first = register_first;
     let flow = eval_each_generic::<S, V>(expr, value.clone(), optional, cursor, &mut |item| {
-        match generic_item_into_owned::<_, S>(item) {
-            Ok(v) => per_item(v),
+        if !core::mem::take(&mut first) {
+            return match generic_item_into_owned::<_, S>(item) {
+                Ok(v) => per_item(v),
+                Err(control) => stop_with_escape(&mut escape, control),
+            };
+        }
+        match generic_item_into_owned_with_origin::<_, S>(item) {
+            Ok((mut v, origin)) => {
+                // Held across the fork this output starts, so the source's own
+                // materialization of the same node returns this `Rc`.
+                let _entry = embed_table_push::<S>(origin.as_ref(), &mut v);
+                per_item(v)
+            }
             Err(control) => stop_with_escape(&mut escape, control),
         }
     });
     // Raw: `eval::foreach_forks` owns the `suppresses` decision -- see
     // `eval::eval_foreach`'s own drive for why suppressing here would be
     // wrong.
-    resume_from_escape(escape, flow)
-}
-
-/// Whether a fold's INIT outputs register themselves in the embed table for
-/// the fork they start (#3329).
-///
-/// jq's `reduce (.) as $x (.; ($x.a) = 9)` binds `$x` and the accumulator to
-/// the *same* `jv`, because INIT and the source both read the input. The
-/// generic evaluator materializes the two separately, so the loop variable is
-/// a value-equal twin of the accumulator that the resolver's storage clause
-/// (#3177) cannot match. An entry for INIT's node makes the source's
-/// materialization of that node return INIT's own `Rc` ([`embed_table`]).
-///
-/// Only a fold that marks its loop variables asks for it
-/// ([`fold_loop_variable_is_marked`]): the entry makes the accumulator's first
-/// in-place write copy, and the table being live reshapes owned navigation,
-/// neither of which a fold that cannot certify a marker should pay.
-fn fold_init_shares_identity<S: EvalSemantics>(
-    patterns: &[Pattern],
-    update: &Expr,
-    extract: Option<&Expr>,
-) -> bool {
-    crate::jq::eval::fold_loop_variable_is_marked::<S>(patterns, update, extract)
-}
-
-/// [`drive_foreach_expr_generic`] for a fold's INIT: with `shared`, the first
-/// output, if it names a document node, is registered in the embed table for as
-/// long as the fork it starts runs (#3329, see [`fold_init_shares_identity`]).
-fn drive_foreach_init_generic<S: EvalSemantics, V: DocumentValue>(
-    expr: &Expr,
-    value: &V,
-    optional: bool,
-    cursor: Option<V::Cursor>,
-    shared: bool,
-    per_item: &mut dyn FnMut(OwnedValue) -> Demand,
-) -> Flow {
-    if !shared {
-        return drive_foreach_expr_generic::<S, V>(expr, value, optional, cursor, per_item);
-    }
-    let mut escape: Option<Control> = None;
-    let mut first = true;
-    let flow = eval_each_generic::<S, V>(expr, value.clone(), optional, cursor, &mut |item| {
-        match generic_item_into_owned_with_origin::<_, S>(item) {
-            Ok((mut v, origin)) => {
-                // Only the first INIT output: jq 1.7.1 evaluates SOURCE against
-                // `null` on every later fork, so a loop variable there is never
-                // the accumulator's own node (`[reduce (.) as $x ((.,.); $x)]` is
-                // `[{"a":1},null]`), and an entry would make us answer a write
-                // through it that jq refuses.
-                let _entry = if core::mem::take(&mut first) {
-                    embed_table_push::<S>(origin.as_ref(), &mut v)
-                } else {
-                    None
-                };
-                per_item(v)
-            }
-            Err(control) => stop_with_escape(&mut escape, control),
-        }
-    });
     resume_from_escape(escape, flow)
 }
 
@@ -12915,18 +12918,25 @@ fn each_reduce_generic<S: EvalSemantics, V: DocumentValue>(
     // #2642/#3122: same reasoning as the eager `Expr::Reduce` arm -- `update`
     // reruns against the fold's own accumulator, never the ambient cursor,
     // and `reduce_forks` demotes it against `Owned` itself.
-    let shared = fold_init_shares_identity::<S>(patterns, update, None);
+    let retry = crate::jq::eval::FoldDirectRetry::of::<S>(init, input, patterns, update, None);
     reduce_forks::<S>(
         patterns,
         update,
         &mut |per_init| {
-            drive_foreach_init_generic::<S, V>(init, &value, optional, cursor, shared, per_init)
+            drive_foreach_expr_generic::<S, V>(
+                init,
+                &value,
+                optional,
+                cursor,
+                retry.marks_loop_vars(),
+                per_init,
+            )
         },
         optional,
         &mut |per_element| {
-            drive_foreach_expr_generic::<S, V>(input, &value, optional, cursor, per_element)
+            drive_foreach_expr_generic::<S, V>(input, &value, optional, cursor, false, per_element)
         },
-        crate::jq::eval::FoldDirectRetry::of(init, input),
+        retry,
         &mut |v| sink.push(GenericItem::Owned(v)),
     )
 }
@@ -12963,19 +12973,26 @@ fn each_foreach_generic<S: EvalSemantics, V: DocumentValue>(
     // #2642/#3122: same reasoning as the eager `Expr::Foreach` arm above --
     // `update`/`extract` rerun against the fold's own accumulator, never the
     // ambient cursor, and `foreach_forks` demotes them against `Owned` itself.
-    let shared = fold_init_shares_identity::<S>(patterns, update, extract);
+    let retry = crate::jq::eval::FoldDirectRetry::of::<S>(init, input, patterns, update, extract);
     foreach_forks::<S>(
         patterns,
         update,
         extract,
         &mut |per_init| {
-            drive_foreach_init_generic::<S, V>(init, &value, optional, cursor, shared, per_init)
+            drive_foreach_expr_generic::<S, V>(
+                init,
+                &value,
+                optional,
+                cursor,
+                retry.marks_loop_vars(),
+                per_init,
+            )
         },
         optional,
         &mut |per_element| {
-            drive_foreach_expr_generic::<S, V>(input, &value, optional, cursor, per_element)
+            drive_foreach_expr_generic::<S, V>(input, &value, optional, cursor, false, per_element)
         },
-        crate::jq::eval::FoldDirectRetry::of(init, input),
+        retry,
         &mut |v| sink.push(GenericItem::Owned(v)),
     )
 }

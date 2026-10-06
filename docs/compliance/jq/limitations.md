@@ -1966,9 +1966,9 @@ is the revert that established what the other one costs.
    changes, both gated on jq mode, on the program reading a variable in path position at all
    (`scalar_identity_readable`, decided once per program) and on the fold's own UPDATE or EXTRACT
    reading one of its loop variables *as a path step* (`fold_loop_variable_is_marked`): inside a
-   `path`/`del`/`pick`/assignment target at a position that carries the register, or anywhere
-   inside a call. The tight `reduce .[] as $x (0; . + $x)` shape and every fold that only reads
-   its variable by value are untouched. That last test is load-bearing: a marker anywhere in an
+   `path`/`del`/`pick`/assignment target at a position that carries the register, or as an
+   argument of a call outside an assignment's right-hand side. The tight `reduce .[] as $x (0; . +
+   $x)` shape and every fold that only reads its variable by value are untouched. That last test is load-bearing: a marker anywhere in an
    assignment makes `owned_assign_step` decline, so `reduce .[] as $r ({}; .[$r.name] =
    $r.score)` (`$r` is a key, read by value) would copy the accumulator on every step
    (`fold_assign_step_copies_nothing_3138`):
@@ -1999,6 +1999,8 @@ is the revert that established what the other one costs.
      ancestor lookup #3179's nested reuse has no mirror for);
    - a scalar loop variable (`reduce (.) as $x (.; path($x))` on a string or number): no storage
      identity until a bind promotes it (#3191);
+   - a loop variable that reaches the resolver only through a rebinding (`reduce (.) as $x (.; $x |
+     . as $y | ($y.a) = 9)`): the gate does not see it, so it is not marked;
    - `walk(.)`/`map_values(.)` as the source, and `[.][]` as the source on `-n`;
    - `no_std` builds (the embed table is a no-op there, so the stdin route stays refuse-only) and
      `succinctly yq` (ADR-0018: jq mode only).

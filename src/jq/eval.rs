@@ -48,7 +48,9 @@ use super::glob::yq_match_key;
 use super::local_zone::{self, LocalZone};
 use super::math;
 use super::slice::{self, SliceBounds};
-use super::walk::{any_subexpr, map_builtin_subexprs, map_pattern_subexprs, map_subexprs};
+use super::walk::{
+    any_subexpr, map_builtin_subexprs, map_pattern_subexprs, map_subexprs, search_subexpr, Visit,
+};
 
 /// Which `EvalSemantics` implementor a value carries, as a runtime tag.
 ///
@@ -54698,7 +54700,7 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         drive_init,
         optional,
         drive,
-        FoldDirectRetry::of(init, input),
+        FoldDirectRetry::of::<S>(init, input, patterns, update, None),
         &mut |v| {
             outputs.push(v);
             Demand::Continue
@@ -57213,7 +57215,7 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         drive_init,
         optional,
         drive,
-        FoldDirectRetry::of(init, input),
+        FoldDirectRetry::of::<S>(init, input, patterns, update, extract),
         &mut |v| {
             outputs.push(v);
             Demand::Continue
@@ -57257,22 +57259,31 @@ pub(crate) fn substitute_fold_step(
     marked: bool,
 ) -> Expr {
     let null_value = OwnedValue::Null;
-    let mut result: Option<Expr> = None;
     let vars = as_var_refs(bindings).chain(
         all_var_names
             .iter()
             .filter(|name| !bindings.iter().any(|(n, _)| n == *name))
             .map(|name| (name.as_str(), &null_value)),
     );
+    if !marked {
+        return substitute_vars(expr, vars);
+    }
+    // #3329: a container loop variable is spliced in as a marker holding the
+    // source element's own storage, not as a rebuilt literal, so the resolver
+    // can recognize it by storage identity (#3177). Everything else -- a scalar,
+    // and the `null` fill for a name only another `?//` alternative binds -- is
+    // substituted as before.
+    let mut result: Option<Expr> = None;
     for (name, value) in vars {
         let current = result.as_ref().unwrap_or(expr);
-        let next = if marked && matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
-            let marker = LazyMarker::new(value, Origin::Untracked, None);
-            substitute_var_impl(current, name, value, Some(&marker))
-        } else {
-            substitute_var(current, name, value)
-        };
-        result = Some(next);
+        result = Some(
+            if matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
+                let marker = LazyMarker::new(value, Origin::Untracked, None);
+                substitute_var_impl(current, name, value, Some(&marker))
+            } else {
+                substitute_var(current, name, value)
+            },
+        );
     }
     result.unwrap_or_else(|| expr.clone())
 }
@@ -57303,31 +57314,67 @@ pub(crate) fn fold_loop_variable_is_marked<S: EvalSemantics>(
 
 /// Whether `expr` can read one of `names` as a path step: inside the argument
 /// of a resolver (`path`, `del`, `pick`, an assignment's target) at a position
-/// that propagates the register, or anywhere inside a call, whose definition
-/// may hand it to a resolver this walk cannot see. A name used only by value
-/// (an index key, a comparison operand, a constructed element, an assignment's
-/// right-hand side) never reaches a resolver's certification, so it needs no
-/// marker. Over-approximates: an unfamiliar node holding the name counts.
+/// that propagates the register, or as an argument of a call outside an
+/// assignment's right-hand side, whose definition may hand it to a resolver this
+/// walk cannot see. A name used only by value (an index key, a comparison
+/// operand, a constructed element, an assignment's right-hand side) never reaches
+/// a resolver's certification, so it needs no marker. Over-approximates: an
+/// unfamiliar node holding the name counts. Under-approximates one way, safely:
+/// a name that reaches a resolver only through a rebinding (`$x | . as $y |
+/// ($y.a) = 9`) is not seen, and the write refuses as it did before.
 fn loop_var_is_path_source(expr: &Expr, names: &[String]) -> bool {
+    scan_for_path_source(expr, names, true)
+}
+
+/// [`loop_var_is_path_source`]'s traversal. `calls` says whether a call
+/// mentioning a name counts: it does not inside an assignment's right-hand side,
+/// which runs by value (`.[$r.name] = f($r)` is the fold shape marking would
+/// slow), though a resolver nested there still does.
+fn scan_for_path_source(expr: &Expr, names: &[String], calls: bool) -> bool {
     let mentions = |e: &Expr| {
         any_subexpr(
             e,
             &mut |n| matches!(n, Expr::Var(v) if names.iter().any(|name| name == v)),
         )
     };
-    any_subexpr(expr, &mut |e| match e {
-        Expr::Assign { path, .. }
-        | Expr::Update { path, .. }
-        | Expr::CompoundAssign { path, .. }
-        | Expr::AlternativeAssign { path, .. }
-        | Expr::Builtin(Builtin::Path(path) | Builtin::Del(path) | Builtin::Pick(path)) => {
-            path_source_position(path, &mentions)
+    search_subexpr(expr, &mut |e| match e {
+        Expr::Assign { path, value: rhs }
+        | Expr::CompoundAssign {
+            path, value: rhs, ..
+        }
+        | Expr::AlternativeAssign { path, value: rhs }
+        | Expr::Update {
+            path, filter: rhs, ..
+        } => {
+            if path_source_position(path, &mentions)
+                || scan_for_path_source(path, names, calls)
+                || scan_for_path_source(rhs, names, false)
+            {
+                Visit::Found
+            } else {
+                Visit::Skip
+            }
+        }
+        Expr::Builtin(Builtin::Path(path) | Builtin::Del(path) | Builtin::Pick(path)) => {
+            if path_source_position(path, &mentions) || scan_for_path_source(path, names, calls) {
+                Visit::Found
+            } else {
+                Visit::Skip
+            }
         }
         Expr::FuncCall { .. }
         | Expr::NamespacedCall { .. }
         | Expr::DefCall { .. }
-        | Expr::Shared(_) => mentions(e),
-        _ => false,
+        | Expr::Shared(_)
+            if calls =>
+        {
+            if mentions(e) {
+                Visit::Found
+            } else {
+                Visit::Skip
+            }
+        }
+        _ => Visit::Descend,
     })
 }
 
@@ -57389,18 +57436,36 @@ pub(crate) type ForeachInitDrive<'a> =
 /// `first`, `limit`, `//`, a pipe or a `def` is fixed on `std` (which reads
 /// the generation) and keeps the previous answer on `no_std`
 /// (`docs/compliance/jq/limitations.md`, "`reduce`/`foreach` and a `?//`").
+///
+/// Also carries the one other fact about a fold that depends on its text alone,
+/// so that no entry point works it out twice (#3329): whether it marks its loop
+/// variables ([`fold_loop_variable_is_marked`]).
 #[derive(Clone, Copy)]
 pub(crate) struct FoldDirectRetry {
     init: bool,
     source: bool,
+    marks: bool,
 }
 
 impl FoldDirectRetry {
-    pub(crate) fn of(init: &Expr, source: &Expr) -> Self {
+    pub(crate) fn of<S: EvalSemantics>(
+        init: &Expr,
+        source: &Expr,
+        patterns: &[Pattern],
+        update: &Expr,
+        extract: Option<&Expr>,
+    ) -> Self {
         Self {
             init: direct_pattern_retry(init),
             source: direct_pattern_retry(source),
+            marks: fold_loop_variable_is_marked::<S>(patterns, update, extract),
         }
+    }
+
+    /// Whether the fold marks its container loop variables (#3329); the generic
+    /// route's INIT drive reads it to register INIT's first output.
+    pub(crate) fn marks_loop_vars(self) -> bool {
+        self.marks
     }
 }
 
@@ -57480,7 +57545,7 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
     // 1.7.1 evaluates SOURCE against `null` on every later fork
     // (`[reduce (.) as $x ((.,.); $x)]` is `[{"a":1},null]`), so a write through
     // `$x` there refuses in jq where marking it would answer.
-    let mark_loop_vars = fold_loop_variable_is_marked::<S>(patterns, update, extract);
+    let mark_loop_vars = retry.marks;
     let hoisted_update = demote_for_reentry(update, &RootWitness::Owned);
     let update = FoldOperand::new::<S>(update, &hoisted_update);
     let hoisted_extract = extract.map(|e| (e, demote_for_reentry(e, &RootWitness::Owned)));
@@ -57616,7 +57681,7 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
     // #3181: a step whose accumulator still is one takes the as-written
     // UPDATE instead (see [`FoldOperand`]).
     // #3329: see `foreach_forks`.
-    let mark_loop_vars = fold_loop_variable_is_marked::<S>(patterns, update, None);
+    let mark_loop_vars = retry.marks;
     let hoisted_update = demote_for_reentry(update, &RootWitness::Owned);
     let update = FoldOperand::new::<S>(update, &hoisted_update);
     // Lazily computed on the first fork and reused, for the same reason
@@ -57820,7 +57885,7 @@ fn each_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         &mut drive_init,
         optional,
         &mut drive,
-        FoldDirectRetry::of(init, input),
+        FoldDirectRetry::of::<S>(init, input, patterns, update, None),
         &mut |v| sink(Item::Owned(v)),
     )
 }
@@ -57905,7 +57970,7 @@ fn each_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         &mut drive_init,
         optional,
         &mut drive,
-        FoldDirectRetry::of(init, input),
+        FoldDirectRetry::of::<S>(init, input, patterns, update, extract),
         &mut |v| sink(Item::Owned(v)),
     )
 }
@@ -74975,6 +75040,7 @@ mod tests {
             "reduce . as [$x] (.; path($x))",
             "reduce . as $x ?// [$x] (.; path($x))",
             "reduce . as $x (.; foo($x))",
+            "reduce . as $x (.; .a = (path($x) | length))",
             "reduce . as $x (.; path(($x.a)?))",
             "reduce . as $x (.; path($x[1:]))",
             "foreach . as $x (.; .; path($x))",
@@ -74991,6 +75057,11 @@ mod tests {
             "reduce . as $x (.; del(.[$x.i]))",
             "reduce . as $x (.; path(.a[$x]))",
             "reduce . as $x (.; path(.[$x.a:]))",
+            // A call on an assignment's right-hand side runs by value.
+            "reduce .[] as $r ({}; .[$r.name] = my_fn($r))",
+            "reduce . as $x (.; .a += foo($x))",
+            // Reaches a resolver only through a rebinding: not seen, so it refuses as before.
+            "reduce . as $x (.; $x | . as $y | ($y.a) = 9)",
             "reduce . as $x (.; path(.a?, .[0], ..))",
             "reduce . as $x (.; .a = $x)",
             "reduce . as $x (0; . + $x)",
