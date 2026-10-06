@@ -1394,7 +1394,7 @@ is the revert that established what the other one costs.
    register and `limit(1; .a)` still moves it; the count is a subexp), and lets an `[E]` collect
    hold a type filter (`[numbers]`, as `[select(.)]` already did), pinned by
    `test_register_limit_nth_wrappers_and_type_filter_collect_3767`. Still refused where jq
-   answers `[]`: a `catch` handler (it runs on a caught error's payload); either stage inside a
+   answers `[]`: a `catch` handler that navigates (Part 3 admits the rest); either stage inside a
    compound stage (a comma, a `//`, a pipe such as `select(.) \| select(.)`, a `def` call), which
    need the leaf-level verdict for a compound stage described above; a wrapper over an inner
    stage that merely navigates nothing (`first(.)`, `limit(1; .)`, `limit(1; 5)`), which jq leaves
@@ -1404,7 +1404,12 @@ is the revert that established what the other one costs.
    reads through to `f`, which the resolver's `last` arm resolves live, so `[last(1 \| .a)]` still raises
    as jq does and the output is demoted, so `[last(.a)] \| .k` still refuses), pinned by
    `test_collect_last_f_keeps_the_register_3767`; a `last` over `first(f)`, `//` or `limit` inside the
-   brackets stays refused. Under a `try` the refusal of such a
+   brackets stays refused. Part 3 reads a `try E catch H` whose `E` is such a stage and whose handler
+   cannot move the register (`try last(.a) catch .`, `5 | try select(.) catch 7`): jq runs the
+   handler after a backtrack that restores the register, so the inner stage decides, pinned by
+   `test_register_catch_handler_over_register_keeping_stage_3767`. A handler that navigates
+   (`try last(.a) catch .a`: it raises when it runs, as in jq, but when it never runs jq answers
+   `[]`) and a compound inner stage (`try (last(.a), error("e")) catch .`) are still refused. Under a `try` the refusal of such a
    shape inside a lost-register `and`/`or` operand is caught, so the write jq makes is
    **silently skipped** (`del(.a? as $y \| try ((.a)? and limit(1; 5)) \| try ($y \| .b))` on
    `{"a":{"b":1},"k":2}` leaves the document unchanged where jq gives `{"a":{},"k":2}`); the

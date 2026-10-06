@@ -41133,9 +41133,33 @@ fn leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
 /// through its own, different set of wrappers; the two answer different
 /// questions.)
 fn stage_leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
-    last_register_unmoved::<S>() && {
-        let stage = peel_register_transparent(expr);
-        is_last_stage(stage) || is_select_stage(stage)
+    last_register_unmoved::<S>() && stage_is_register_keeping(expr)
+}
+
+/// The shape half of [`stage_leaves_register_in_place`]: `expr` read through the
+/// wrappers [`peel_register_transparent`] passes the register through is a
+/// `last(f)` or a `select(f)`/type filter, or a `try E catch H` over one whose
+/// handler cannot move it (#3767).
+///
+/// jq runs a `try`'s handler after backtracking to the fork the `try` set, and a
+/// backtrack restores the path state saved there, so on the error path the
+/// register is back where the stage entered whatever `E` navigated before it
+/// raised, and on the success path it is wherever `E` left it: the inner stage
+/// decides, exactly as for a bare `E`. The handler then runs on the error's
+/// payload, a value with no position of its own; one that cannot move the
+/// register ([`cannot_move_register`]) leaves it alone, and one that navigates
+/// raises when it runs, in jq as here, so it is not admitted. Captured against
+/// jq 1.7.1, `path(. as $x | W | $x)` on `{"a":{"b":1},"k":2}`: `try last(.a)
+/// catch .` is `[]`, `try (last(.a), error("e")) catch .` is `[]` twice, and
+/// `try last(.a) catch .a` is `[]` too (the handler never ran) while `try
+/// (select(.), error({"a":1})) catch .a` raises (it ran, and navigated).
+fn stage_is_register_keeping(expr: &Expr) -> bool {
+    match peel_register_transparent(expr) {
+        Expr::Try {
+            expr: inner,
+            catch: Some(handler),
+        } => stage_is_register_keeping(inner) && cannot_move_register(handler),
+        stage => is_last_stage(stage) || is_select_stage(stage),
     }
 }
 
@@ -86005,19 +86029,46 @@ mod tests {
                 "{admitted}"
             );
         }
-        for refused in [
+        // #3767: `try E catch H` is `E`'s verdict when `H` cannot move the register.
+        for admitted in [
             "try select(.) catch .",
             "try last(.a) catch .",
+            "try last(.a) catch 7",
+            "try numbers catch $x",
+            "(try last(.a) catch .)?",
+            "first(try select(.) catch .)",
+            "limit(1; try last(.a) catch .)",
+            "try (try last(.a) catch 1) catch .",
+        ] {
+            let expr = stage(admitted);
+            assert!(
+                stage_leaves_register_in_place::<JqSemantics>(&expr),
+                "{admitted}"
+            );
+            assert!(
+                !stage_leaves_register_in_place::<YqSemantics>(&expr),
+                "{admitted}"
+            );
+        }
+        for refused in [
+            // a handler that navigates (it raises when it runs), and an `E` that moves
+            "try last(.a) catch .a",
+            "try select(.) catch (.a | .b)",
+            "try (try last(.a) catch .a) catch 2",
+            "try .a catch .",
+            "try first(.a) catch 7",
+            // a compound inner stage is still not read
+            "try (last(.a), select(.)) catch .",
+            "try (select(.) | last(.a)) catch .",
             "first(.a)",
             "first(.a)?",
             "(last(.a), select(.))",
             // #3767: a wrapper over a stage that navigates still moves the register
-            // (`limit(1; .a)` is a path error in jq), and a handler is not peeled.
+            // (`limit(1; .a)` is a path error in jq).
             "limit(1; .a)",
             "limit(2; first(.a))",
             "nth(0; .a)",
             "nth(0; try .a)",
-            "limit(1; try last(.a) catch .)",
             "limit(1; (last(.a), select(.)))",
         ] {
             let expr = stage(refused);

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jq: a `try ... catch` handler over `last(f)`, `select(f)` or a type filter keeps jq's path register, so `path(. as $x | try last(.a) catch . | $x)` is `[]`** (#3767, part 3).
+  jq runs a handler after backtracking to the fork the `try` set, which restores the path state, so on the error path the register is back where the
+  stage entered and on the success path it is wherever `E` left it: the inner stage decides, as for a bare `E`. The handler runs on the error's payload,
+  a value with no position, so one that cannot move the register (`.`, a constant, `$x`, `error(...)`) leaves it alone. `stage_leaves_register_in_place`
+  now reads `try E catch H` when `E` is itself such a stage (through the wrappers it already read, and nested) and `H` satisfies `cannot_move_register`;
+  `path`, `=`, `|=` and `del` through the frozen `$x` answer as jq does. A handler that navigates is not admitted (it raises when it runs, in jq as
+  here; where it never runs jq answers and this still refuses), and neither is a compound inner stage (`,` or a pipe). jq mode only (ADR-0018). Pinned by
+  `test_register_catch_handler_over_register_keeping_stage_3767` and the stage-rule unit test
+  `type_filters_are_defined_once_and_the_stage_rule_reads_them_3653`; two of #3653's refuse-only rows moved to jq's answer.
 - **ci: the shared coverage action now uses `action-works/patchcov-action@v1`** (#3880). It replaces `action-works/omni-dev-coverage-check@v2` in `.github/actions/coverage/action.yml`
   (the one definition behind both `ci.yml` and `coverage-baseline.yml`). `v1` resolves to the same commit and an identical `action.yml` as the old `v2`, so every input, the `version: 0.1.1`
   patchcov pin and the baseline lookup are unchanged; only the repository an `omni-dev`-named workflow depended on is gone.

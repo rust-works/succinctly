@@ -415,8 +415,8 @@ OPERANDS = [
     # movement of their own: `?`, `try` with no `catch`, and `first(...)`
     # (which emits from inside `last`, where the register is back where it
     # entered). The contrasts are the wrappers that are not admitted, and so stay
-    # refused where jq answers (`try ... catch`, a compound stage; `limit`/`nth`
-    # of a `last` were contrasts until #3767 admitted them), and the same
+    # refused where jq answers (a compound stage; `limit`/`nth` of a `last`
+    # and a `try ... catch` with a non-navigating handler were contrasts until #3767 admitted them), and the same
     # wrappers around a `f` that navigates, which move it and must stay refused.
     "last(.a)?",
     "(last(.a))?",
@@ -470,6 +470,30 @@ OPERANDS = [
     "first(limit(1; last(.a)))",
     "nth(0; limit(1; select(.)))",
     "limit(1; limit(1; last(.a)))",
+    # (#3767 Part 3) a `try E catch H` over a register-keeping `E`: the handler runs after a
+    # backtrack that restores the register, so the inner stage decides. A handler that
+    # navigates (`catch .a`, `catch (.a | $x)`), a `E` that navigates (`.a`, `first(.a)`),
+    # and a compound inner (`,` `|`) are the contrasts that stay refused.
+    "try last(.a) catch .",
+    "try last(.a) catch 7",
+    "try last(.a) catch $x",
+    "try last(.a) catch error(\"z\")",
+    "try last(.a) catch .a",
+    "try select(.) catch .",
+    "try select(.a) catch 7",
+    "try numbers catch .",
+    "try values catch $x",
+    "(try select(.) catch .)?",
+    "first(try select(.) catch .)",
+    "try (try last(.a) catch 1) catch .",
+    "try (try last(.a) catch .a) catch 2",
+    "try first(select(.)) catch .",
+    "limit(1; try select(.) catch .)",
+    "try .a catch .",
+    "try first(.a) catch 7",
+    "try (last(.a), error(\"e\")) catch .",
+    "try (select(.) | error(\"z\")) catch .",
+    "try error(\"z\") catch .",
     "limit(1; try last(.a) catch .)",
     "limit(1; (last(.a), select(.)))",
     "limit(1; (.a | select(.)))",
