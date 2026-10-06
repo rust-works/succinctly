@@ -118002,6 +118002,9 @@ mod tests {
     /// preserved register writes through to the array's first element, as jq does;
     /// every row confirmed live against jq 1.7.1.
     #[test]
+    // `"{k:1}"` is a jq filter literal, not a formatting string; clippy
+    // cannot tell the two apart from the brace shape alone.
+    #[allow(clippy::literal_string_with_formatting_args)]
     fn test_array_register_admits_navigating_tracked_f_3724() {
         let doc = r#"[{"a":1,"b":[2]},{"a":3}]"#;
         for filter in [
@@ -118055,14 +118058,14 @@ mod tests {
                 r#"[{"a":1}]"#,
                 r"path(. as $x | [all(.a | {k:1} | .k)] | $x)",
             ),
-            (r#"[[1]]"#, r"path(. as $x | [map(sort | .[0])] | $x)"),
+            (r"[[1]]", r"path(. as $x | [map(sort | .[0])] | $x)"),
             (
                 r#"[{"a":{"b":1}}]"#,
                 r"path(. as $x | [map((.a, length) | .b?)] | $x)",
             ),
             // `walk(f)` is not promoted: its trailing `f` runs on a computed array
             // (#3723), so jq raises on `.[0]?` here, a path error `?` does not catch.
-            (r#"[1]"#, r"path(. as $x | [walk(.[0]?)] | $x)"),
+            (r"[1]", r"path(. as $x | [walk(.[0]?)] | $x)"),
             (r#"[{"a":1}]"#, r"path(. as $x | [map(try .a)] | $x)"),
             (r#"[{"a":1}]"#, r"path(. as $x | [map(.a // .b)] | $x)"),
         ] {
@@ -120697,14 +120700,11 @@ mod tests {
         for src in [
             "map(.)",
             "map(. + 1)",
-            "map(.a)",
-            "map(first)",
             "map(empty)",
             "map(has(\"a\"))",
             "map(has(.a | tostring))",
             "map(range(2))",
             "map(paths)",
-            "map(.[] | .a)",
         ] {
             let expr = parse(src).unwrap();
             assert_eq!(
@@ -120712,6 +120712,23 @@ mod tests {
                 array_contents_are_checked(&expr),
                 "`[{src}]`: the register verdict and the `[E]` claim disagree"
             );
+        }
+        // ...and the one place they differ on purpose (#3724): an `f` that navigates
+        // only the register's own node is admitted inside `[E]`, where the collect
+        // backtracks the register, and still refused as a bare stage.
+        for src in [
+            "map(.a)",
+            "map(first)",
+            "map(.[] | .a)",
+            "any(.a)",
+            "all(.a | .b)",
+        ] {
+            let expr = parse(src).unwrap();
+            assert!(
+                !leaves_register_in_place::<JqSemantics>(&expr),
+                "`{src}` as a bare stage"
+            );
+            assert!(array_contents_are_checked(&expr), "`[{src}]`");
         }
     }
 

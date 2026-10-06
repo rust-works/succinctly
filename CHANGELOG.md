@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jq: an `[E]` collect holds a `map`/`any`/`all` whose `f` navigates only the register's own node, so `path(. as $x | [map(.a)] | $x)` is `[]`** (#3724, item 1).
+  `map(f)` is `[.[] | f]` and `any(f)`/`all(f)` run over `.[] | f`, so while the collect's input is jq's register the elements are tracked, `f`'s
+  navigation is path-intact, and the collect backtracks the register to where it began. #3283 admitted only an `f` that navigates nothing;
+  `navigates_only_the_register` adds a chain of register navigations (`.a`, `.[i]`, `.[]`, `..`, `first`, `last`, `select`/type filters, a computed key or
+  bound judged by its target, a primitive `?`), optionally ending in one stage that navigates nothing (`.b | length`), and judges a `,`/`if` branch by
+  branch. An `f` that first builds a value and then navigates it (`{k:1} | .k`, `.a | tostring | .b`, `sort | .[0]`) still raises, as in jq; `walk(f)` keeps
+  the old gate (its trailing `f` runs on a computed array, #3723), and `try`, `//` and `first(f)` inside `f` stay refused. jq mode only; yq rows pinned
+  unchanged. Against a clean build of `main`, the 43 new `[map]`/`[any]`/`[all]` sweep operands (bare stage, 37,443 rows; full shapes, 70,027 sampled rows)
+  showed 0 regressions and 536 refuse-to-match flips, and a full-grid sample (40,027 rows over all 363 operands) 0 regressions and 32 flips; `ACCEPT_WRONG` counts are identical to `main`'s (42 and 14) and none moved. Still open on #3724: item 2, the `and`/`or` arm of
+  `array_contents_are_checked`. Pinned by `test_collect_map_any_all_navigating_f_keeps_the_register_3724`,
+  `test_array_register_admits_navigating_tracked_f_3724` and `test_yq_collect_map_navigating_f_keeps_no_path_register_3724`.
 - **jq: `paths`, `leaf_paths` and the cursor-native `path(f)` walkers answer on documents nested 256-383 levels deep** (#3429).
   They shared the whole-document materializers' 256 ceiling, so a well-formed document in that band answered `[..]` but raised
   `nesting depth exceeds limit of 256` for `[paths]`, `[leaf_paths]`, `[.. | path]` and a static `path(.a.a...)` chain. They now stop at

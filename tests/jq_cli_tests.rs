@@ -65697,6 +65697,8 @@ fn test_path_register_last_f_does_not_move_it_3643() -> Result<()> {
 /// from jq 1.7.1, on the stdin and `-n` routes; where both refuse with different
 /// wording the row asserts the common prefix.
 #[test]
+// The `{k:1}` rows are jq filter literals, not formatting strings.
+#[allow(clippy::literal_string_with_formatting_args)]
 fn test_collect_map_any_all_navigating_f_keeps_the_register_3724() -> Result<()> {
     let doc = r#"[{"a":1,"b":[2]},{"a":3}]"#;
     assert_path_rows_both_routes_3749(&[
