@@ -370,6 +370,32 @@ OPERANDS = [
     "(foreach (foreach . as {a:$a} (0; .; .)) as $k (.; .; .))",
     "(foreach (reduce . as {a:$a} (0; .)) as $k (.; .; .))",
     "(foreach (foreach . as [$a] (.; .; .)) as $k (.; .; .))",
+    # (#3790) a fold whose SOURCE is the register itself: `.` does not move jq's register
+    # and `$k` is that very node, so a bare `$k` is a path (any value, not only null). The
+    # contrasts are a navigated source (`.a`, `.[]?`) and a computed one (`tostring`);
+    # `reduce` over `.` binds the same element.
+    "(foreach . as $k (0; $k; .))",
+    "(foreach . as $k (0; .; $k))",
+    "(foreach . as $k (0; $k.a?; .))",
+    "(foreach . as $k (.; $k | .a?; .))",
+    "(foreach . as $k (0; try $k; .))",
+    "(foreach . as $k (0; ($k | .a?) // $k; .))",
+    "(foreach (., .) as $k (0; $k; .))",
+    "(foreach (. | .) as $k (0; $k; .))",
+    "(foreach . as $k (0; first($k); .))",
+    "(foreach tostring as $k (0; $k; .))",
+    "(foreach .a? as $k (0; $k; .))",
+    "(foreach .[]? as $k (0; $k; .))",
+    "(reduce . as $k (0; $k))",
+    "(reduce . as $k (.; $k))",
+    "(reduce . as $k (0; $k.a?))",
+    "(foreach . as [$a] (0; $a; .))",
+    # ...a fold over `.` nested in another fold's UPDATE (not recognised there: the accumulator
+    # may have been moved off the register by the outer source), and one piped after a fold.
+    "(reduce .a? as $x (.; foreach . as $k (0; $k; .)))",
+    "(reduce first as $x (.; foreach . as $k (0; ($k | .a?) // $k; .)))",
+    "(foreach . as $x (.; .; .) | foreach . as $k (0; $k; .))",
+    "try (foreach . as $k (0; $k; .)) catch 7",
     "(reduce (foreach . as {a:$a} (.; .; .)) as $k (.; .))",
     "(reduce . as [[$a]] (0; .))",
     "try (reduce . as [[$a]] (0; .)) catch 7",

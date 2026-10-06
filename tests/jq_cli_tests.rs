@@ -62428,6 +62428,306 @@ fn test_foreach_source_destructuring_register_under_try_stays_refused_3744() -> 
     Ok(())
 }
 
+/// #3790: a `foreach` whose SOURCE is the register itself (`.`, or a comma or pipe of
+/// them) emits an element that is the register's own node, so a bare `$k` bound to
+/// it is a path: `path(foreach . as $k (0; $k; .))` is `[]` for any document, and a
+/// write through it lands on the root. The by-value drive gave the element no
+/// position, so `$k` re-established only for `null`/`true`/`false` and everything
+/// else refused ("Invalid path expression with result"). The element now carries the
+/// root path like a navigated source's does (`.a`, `.[]` already answered); `reduce`
+/// over `.` binds the same element and answers alike. Every row captured from jq 1.7.1, on the stdin and `-n` routes.
+#[test]
+fn test_foreach_over_the_register_binds_it_as_a_path_3790() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"a":1}"#,
+            r"path(foreach . as $k (0; $k; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (r"[]", r"path(foreach . as $k (0; $k; .))", "[]\n", "", 0),
+        (r"{}", r"path(foreach . as $k (0; $k; .))", "[]\n", "", 0),
+        (r"[1]", r"path(foreach . as $k (0; $k; .))", "[]\n", "", 0),
+        (r"null", r"path(foreach . as $k (0; $k; .))", "[]\n", "", 0),
+        (
+            r#"{"a":1}"#,
+            r"(foreach . as $k (0; $k; .)) = 9",
+            "9\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(foreach . as $k (0; try $k; .))",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(foreach . as $k (0; .; $k))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(foreach . as $k (0; $k.a?; .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(foreach . as $k (.; $k | .a; .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(foreach .a as $k (0; $k; .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(foreach .[] as $k (0; $k; .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(foreach (.) as $k (0; $k; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(foreach (., .) as $k (0; $k; .))",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(foreach (. | .) as $k (0; $k; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(foreach . as [$a] (0; $a; .))",
+            "",
+            r"Cannot index object with number",
+            5,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r"path(foreach . as {a:$a} (0; $a; .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $d | foreach . as $k (0; $d; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(.a | foreach . as $k (0; $k; .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(.a | foreach . as $k (.; .; $k))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"[path(foreach . as $k (0; $k, .; .))]",
+            "",
+            r"Invalid path expression with result 0",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(foreach . as $k (0; 5; $k))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(foreach . as $k (0; $k; $k))",
+            "[]\n",
+            "",
+            0,
+        ),
+        // `reduce` over the register: the same element, so the same answer.
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce . as $k (.a; $k))",
+            "",
+            r#"Invalid path expression with result {"a":{"b":1}}"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce . as $k (.; $k))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce . as $k (0; .a))",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of 0"#,
+            5,
+        ),
+        (r#"{"a":1}"#, r"path(reduce . as $k (.; $k))", "[]\n", "", 0),
+        (r#"{"a":1}"#, r"(reduce . as $k (.; $k)) = 9", "9\n", "", 0),
+        (r#"{"a":1}"#, r"path(reduce . as $k (0; $k))", "[]\n", "", 0),
+        (r"[1]", r"path(reduce . as $k (.; $k))", "[]\n", "", 0),
+        (
+            r#"{"a":1}"#,
+            r"path(reduce . as $k (0; .a))",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of 0"#,
+            5,
+        ),
+        (r#"{"a":1}"#, r"(reduce . as $k (0; $k)) = 9", "9\n", "", 0),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce . as $k (.; $k.a))",
+            "",
+            r#"Invalid path expression with result {"b":1}"#,
+            5,
+        ),
+        // The fold's INIT navigated first (the register is not at the root when the source runs).
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(foreach . as $k (.a; $k; .))",
+            "",
+            r#"Invalid path expression with result {"a":{"b":1}}"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(.a | foreach . as $k (.b?; $k; .))",
+            "",
+            r#"Invalid path expression with result {"b":1}"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(foreach . as $k (.a; $k; $k))",
+            "",
+            r#"Invalid path expression with result {"a":{"b":1}}"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(foreach (., .) as $k (.a; $k; .))",
+            "",
+            r#"Invalid path expression with result {"a":{"b":1}}"#,
+            5,
+        ),
+        // Nested in another fold's UPDATE the accumulator is not the register (the fold's source may have moved it): not recognised there.
+        (
+            r#"[{"key":"a","value":1}]"#,
+            r"path(reduce .[1+1] as $k (.; ((foreach . as $k (0; ($k | .a?) // $k; .)))))",
+            "",
+            r#"Invalid path expression near attempt to access element "a""#,
+            5,
+        ),
+        (
+            r#"[{"a":1}]"#,
+            r"path(reduce first as $k (.; ((foreach . as $k (0; ($k | .a?) // $k; .)))))",
+            "",
+            r#"Invalid path expression near attempt to access element "a""#,
+            5,
+        ),
+        (
+            r#"[{"key":"a","value":1}]"#,
+            r"del(reduce .[]? as $k (.; ((foreach . as $k (0; ($k | .a?) // $k; .)))))",
+            "",
+            r#"Invalid path expression near attempt to access element "a""#,
+            5,
+        ),
+        (
+            r"[true]",
+            r"path(reduce first as $k (.; ((foreach . as $k (0; ($k | .a?) // $k; .)))))",
+            "",
+            r#"Invalid path expression near attempt to access element "a""#,
+            5,
+        ),
+        (
+            r"[]",
+            r"path(reduce first as $k (.; ((foreach . as $k (0; ($k | .a?) // $k; .)))))",
+            "",
+            r#"Invalid path expression near attempt to access element "a""#,
+            5,
+        ),
+        (
+            r"[]",
+            r"path(reduce .[1+1] as $k (.; ((foreach . as $k (0; ($k | .a?) // $k; .)))))",
+            "",
+            r#"Invalid path expression near attempt to access element "a""#,
+            5,
+        ),
+        // Later INIT forks, and a bounded consumer stopping the source.
+        (
+            r#"{"a":1}"#,
+            r"[path(foreach . as $k ((0,1); $k; .))]",
+            "",
+            r"Invalid path expression with result null",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"[path(foreach . as $k ((0,1); .; $k))]",
+            "",
+            r"Invalid path expression with result null",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"[path(reduce . as $k ((0,1); $k))]",
+            "",
+            r"Invalid path expression with result null",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(first(foreach (., .) as $k (0; $k; .)))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"[path(limit(1; foreach (., .) as $k (0; $k; .)))]",
+            "[[]]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
 /// #3749/#3757, what is still refused where jq answers, in the safe direction. A
 /// verdict stage behind a `def` call or a `reduce` and one inside a compound stage
 /// (`(any, any)`, `any // 1`) are refused (#3644; the plain stage was lifted by #3758 and the
