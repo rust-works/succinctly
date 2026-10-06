@@ -20,6 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`path`/`del`/`=` x 7 heads x 5 chains x 8 bodies x 12 contexts x 4 documents) flipped no match against jq. Against a clean `main`, the 4,320-row source x chain x consumer
   grid in `scripts/jq-fold-source-alt-chain-sweep.py` went from 1,901 divergences from jq to 0, `scripts/jq-fold-fresh-source-sweep.py` (8,202 rows) had 0 failures,
   and `scripts/jq-path-register-sweep.py --sample 4000 --seed 3651` 0 flips. Pinned by `fold_source_alt_chain_over_a_fresh_value_runs_the_next_alternative_3651`.
+- **jq: a fold's own loop variable in path position answers as jq does instead of refusing with `Invalid path expression`** (#3329).
+  jq's `reduce (.) as $x (.; ($x.a) = 9)` is `{"a":9}` because `$x` is the very `jv` the source yielded and INIT `.` placed the same one; the fold spliced `$x` in as a
+  rebuilt literal with no storage identity, so `($x.a) = 9`, `path($x)` and `del(.[0] | $x)` all refused on both the stdin and the `-n 'input | ...'` routes. A container
+  loop variable is now an `Origin::Untracked` marker holding the source element's own storage, and on the generic route INIT's first output is registered on the embed
+  table so the source's materialization of the same node returns INIT's `Rc`. Only a fold whose UPDATE or EXTRACT reads one of its own loop variables as a path step pays for either (a variable used only as a key, as in `.[$r.name] = $r.score`, keeps its in-place assignment step), and
+  only the first INIT fork is marked (jq evaluates SOURCE against `null` on every later fork). jq mode only; yq is unchanged. Against `/usr/bin/jq` 1.7.1, a 21,600-row
+  sweep over 30 sources, 12 INITs, 3 tails, 5 inputs, both fold kinds and both routes had 0 wrong answers and refusals fell from 7,232 to 1,617. Still refused where jq
+  answers: a source that navigates below INIT's node on the stdin route (`reduce .[] as $x (.; del(.[0] | $x))`), a computed INIT with no cursor, and a scalar loop variable.
+  Pinned by `test_fold_loop_variable_in_path_position_3329` and the sweep's `fold-loop-var-*` rows.
 - **jq: a navigating `map(f)` in `path()`/`del()`/`=` is resolved as `[.[] | f]`, so jq's path error inside `f` is raised even when the result is discarded** (#3865).
   `path(map({k:1} | .k) | empty)` answered nothing and `del([map({k:1} | .k)] and (.a)?)` deleted nothing at exit 0, where jq raises
   `near attempt to access element "k"`: the by-value leaf evaluated `map(f)` as one opaque value and never path-checked `f`. A `map(f)` whose `f` can move
