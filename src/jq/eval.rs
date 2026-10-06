@@ -37496,6 +37496,28 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             });
             resolve_node_sink::<S>(&component, value, trackable, snapshot, frame, keep, sink)
         }
+        // #3865: jq defines `map(f)` as `[.[] | f]`, so in a path `f` runs on each
+        // element with the register on it and path-checks whatever it navigates.
+        // The by-value leaf evaluated `map(f)` as one opaque value and never
+        // raised for an `f` that navigates a computed value (`{k:1} | .k`,
+        // `sort | .[0]`), so a stage that discarded the result accepted where jq
+        // raises: `path(map({k:1} | .k) | empty)` answered nothing, and
+        // `del([map({k:1} | .k)] and (.a)?)` deleted nothing at exit 0. Re-dispatching
+        // as the collect jq defines reuses every rule the `[E]` arm has -- the
+        // pipe's register, the near-access wording, an untracked input's raise from
+        // the `.[]` -- the way the bare `first` arm below reuses `Index`. An `f` that
+        // cannot move the register keeps the by-value leaf (nothing in it is
+        // path-checked), and so does one holding `getpath`, which the collect arm
+        // leaves to the eager fallback (#2759) -- there the leaf's own
+        // `builtin_navigation` check is all that is left. jq mode only (ADR-0018).
+        Expr::Builtin(Builtin::Map(f))
+            if S::TAG == EvalTag::Jq
+                && !cannot_move_register(f)
+                && !any_subexpr(f, &mut |e| matches!(e, Expr::Builtin(Builtin::GetPath(_)))) =>
+        {
+            let collect = Expr::Array(Box::new(Expr::Pipe(vec![Expr::Iterate, (**f).clone()])));
+            resolve_node_sink::<S>(&collect, value, trackable, snapshot, frame, keep, sink)
+        }
         // #3551 (yq mode): real yq's bare `first` is a path step at the head of
         // an expression, so `first = 9`, `first |= 5`, `first += 1` and
         // `del(first)` act on what it names (yq v4.53.3, input `[1,2]`:
