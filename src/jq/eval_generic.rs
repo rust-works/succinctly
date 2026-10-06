@@ -26653,12 +26653,13 @@ fn prefetch_whole_consumer(at: &PathContextAt<'_>, expr: &Expr) -> Result<Expr, 
     match at.prefetch {
         Some(prefetch) => Ok(prefetched_literal(prefetch(expr)?)),
         None => {
-            // omni-dev: coverage tolerate-line reason="unreachable by construction: both callers' guards require at.prefetch to be Some (#3639)"
+            // patchcov: coverage tolerate reason="unreachable by construction: both callers' guards require at.prefetch to be Some (#3639)"
             debug_assert!(
                 false,
                 "a consumer was prefetched whole without a prefetch hook"
             );
-            Ok(expr.clone()) // omni-dev: coverage tolerate-line reason="unreachable by construction, see above"
+            Ok(expr.clone())
+            // patchcov: coverage end
         }
     }
 }
@@ -32983,6 +32984,38 @@ mod tests {
         match eval_using::<JqSemantics, _>(&expr, index.root(json).value()) {
             GenericResult::Owned(v) => v.to_json(),
             other => panic!("expected one owned output, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message for the assertion the tests below make (#2999)"
+        }
+    }
+
+    /// #3639: a `label` met at a position with no prefetch hook (the absent-
+    /// position and `|=` entries build none) has no break to catch, so it is
+    /// rewritten like any other wrapper and keeps its name and body.
+    #[test]
+    fn label_without_a_prefetch_hook_keeps_its_body_3639() {
+        let expr = parse("label $out | key").unwrap();
+        let key = OwnedValue::String("a".into());
+        let path = vec![key.clone()];
+        let resolved = path_context_resolve_constants::<JqSemantics>(
+            &expr,
+            &PathContextAt {
+                key: Some(&key),
+                path: &|| Cow::Borrowed(path.as_slice()),
+                parent_of: None,
+                prefetch: None,
+                prefetch_escaped: None,
+                prefetch_catch_break: None,
+            },
+        )
+        .unwrap();
+        match resolved {
+            Expr::Label { name, body } => {
+                assert_eq!(name, "out");
+                assert!(
+                    !matches!(*body, Expr::Builtin(Builtin::Key)),
+                    "key unresolved"
+                );
+            }
+            other => panic!("expected a label, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message for the assertion above (#3639)"
         }
     }
 
