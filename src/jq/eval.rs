@@ -43259,6 +43259,9 @@ impl FoldRegister {
         keep: Keep,
         sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
     ) -> ResolveFlow {
+        // #3790: whatever this resolves is a fold's UPDATE or EXTRACT, where `.` is the
+        // accumulator and jq's register may have been moved by the fold's own source.
+        let _in_fold_body = fold_body::enter();
         let tr = self.trackable && at_register;
         // #2042: the register's own position is what a navigated marker in
         // UPDATE/EXTRACT is certified against -- whether or not the
@@ -43922,7 +43925,15 @@ fn drive_fold_source_with<S: EvalSemantics>(
     // register-derived element at the root: `.` does not move the register and `$k`
     // is bound to that very node, so the element carries the root path (rebased
     // like a resolved branch's) instead of the by-value drive's none.
-    if S::TAG == EvalTag::Jq && ambient.trackable && yields_only_the_register(source) {
+    // Not inside another fold's UPDATE or EXTRACT: there `.` is the accumulator, which the
+    // enclosing fold's source may have moved off the register while the ambient still
+    // reads as trackable (`path(reduce first as $k (.; foreach . as $k (0; ($k | .a?) // $k; .)))`
+    // answered where jq refuses, and `del(reduce .[]? as $k (.; ...))` deleted the document).
+    if S::TAG == EvalTag::Jq
+        && ambient.trackable
+        && fold_body::depth() == 0
+        && yields_only_the_register(source)
+    {
         let path = match relocate_base {
             Some(base) => Rc::clone(base),
             None => PathPrefix::root(),
@@ -55231,6 +55242,50 @@ mod terminal_retry {
     /// Whether an attempt began since `generation` was read.
     pub(crate) fn began_since(generation: u64) -> bool {
         current() != generation
+    }
+}
+
+/// How many fold UPDATE/EXTRACT bodies are being resolved on this thread (#3790): a
+/// fold over the register is only recognised outside them. Without `std` there is no
+/// thread-local, so the depth reads as non-zero and the recognition is off there,
+/// which keeps the previous answer.
+#[cfg(feature = "std")]
+mod fold_body {
+    use std::cell::Cell;
+
+    thread_local! {
+        static DEPTH: Cell<u32> = const { Cell::new(0) };
+    }
+
+    pub(crate) struct Guard;
+
+    pub(crate) fn enter() -> Guard {
+        DEPTH.with(|d| d.set(d.get() + 1));
+        Guard
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            DEPTH.with(|d| d.set(d.get() - 1));
+        }
+    }
+
+    pub(crate) fn depth() -> u32 {
+        DEPTH.with(Cell::get)
+    }
+}
+
+/// See the `std` half.
+#[cfg(not(feature = "std"))]
+mod fold_body {
+    pub(crate) struct Guard;
+
+    pub(crate) fn enter() -> Guard {
+        Guard
+    }
+
+    pub(crate) fn depth() -> u32 {
+        1
     }
 }
 

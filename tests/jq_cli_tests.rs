@@ -62646,6 +62646,49 @@ fn test_foreach_over_the_register_binds_it_as_a_path_3790() -> Result<()> {
             r#"Invalid path expression with result {"a":{"b":1}}"#,
             5,
         ),
+        // Nested in another fold's UPDATE the accumulator is not the register (the fold's source may have moved it): not recognised there.
+        (
+            r#"[{"key":"a","value":1}]"#,
+            r"path(reduce .[1+1] as $k (.; ((foreach . as $k (0; ($k | .a?) // $k; .)))))",
+            "",
+            r#"Invalid path expression near attempt to access element "a""#,
+            5,
+        ),
+        (
+            r#"[{"a":1}]"#,
+            r"path(reduce first as $k (.; ((foreach . as $k (0; ($k | .a?) // $k; .)))))",
+            "",
+            r#"Invalid path expression near attempt to access element "a""#,
+            5,
+        ),
+        (
+            r#"[{"key":"a","value":1}]"#,
+            r"del(reduce .[]? as $k (.; ((foreach . as $k (0; ($k | .a?) // $k; .)))))",
+            "",
+            r#"Invalid path expression near attempt to access element "a""#,
+            5,
+        ),
+        (
+            r"[true]",
+            r"path(reduce first as $k (.; ((foreach . as $k (0; ($k | .a?) // $k; .)))))",
+            "",
+            r#"Invalid path expression near attempt to access element "a""#,
+            5,
+        ),
+        (
+            r"[]",
+            r"path(reduce first as $k (.; ((foreach . as $k (0; ($k | .a?) // $k; .)))))",
+            "",
+            r#"Invalid path expression near attempt to access element "a""#,
+            5,
+        ),
+        (
+            r"[]",
+            r"path(reduce .[1+1] as $k (.; ((foreach . as $k (0; ($k | .a?) // $k; .)))))",
+            "",
+            r#"Invalid path expression near attempt to access element "a""#,
+            5,
+        ),
     ])
 }
 
