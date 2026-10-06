@@ -107982,3 +107982,54 @@ fn test_bind_sources_the_resolver_cannot_place_refuse_loudly_3795() -> Result<()
     }
     Ok(())
 }
+
+/// #3795 (coverage): the fold-element and def-walk arms the other #3795 rows leave
+/// unreached. Every expected value captured live against jq 1.7.1; both evaluators.
+///
+/// - a source that calls one zero-arity def twice, which the by-value-drive check
+///   looks into once (`def f: .; foreach (f, f) ...`);
+/// - a fold source that binds a destructuring pattern, so its elements are driven
+///   by value and the one that is the register carries the register it moved onto
+///   (`. as {a:$q} | (., 1)`, below `.a` too);
+/// - the same, where the source navigates and then runs a stage the resolver cannot
+///   see inside (`.a | add?`), so the register is lost and `$x` is judged by value;
+/// - an output that is not the register, from a source that could hand it back,
+///   which keeps jq's catchable refusal (the one row here that fails without the
+///   demotion; the fold-element rows pin jq's answer and the arms' coverage, but
+///   no output tried changed when either `MovedRegister` arm was flipped).
+#[test]
+fn test_fold_element_binds_and_def_walk_arms_3795() -> Result<()> {
+    let doc = r#"{"a":{"b":1}}"#;
+    for (filter, expected) in [
+        (
+            r"del(def f: .; foreach (f, f) as $x (.; .; try $x.a))",
+            "{}",
+        ),
+        (
+            r"del(def f: .; foreach (f | f) as $x (.; .; try $x.a))",
+            "{}",
+        ),
+        (
+            r"del(foreach (. as {a:$q} | (., 1)) as $x (.; .; try $x.a))",
+            doc,
+        ),
+        (
+            r"del(.a | foreach (. as {b:$q} | (., 1)) as $x (.; .; try $x.a))",
+            doc,
+        ),
+        (
+            r"del(foreach ((.a | add?) // (. as {a:$q} | .)) as $x (.; .; try $x.a))",
+            doc,
+        ),
+        // The output that is not the register (`1`), bound below `.a` where the
+        // register has moved: marked `Unproven` it would be a loud refusal, and
+        // `try` would no longer catch it as jq's own.
+        (r"del((def f: .; (1, f)) as $x | .a | try $x.a)", doc),
+    ] {
+        for_both_evaluators_3795(doc, filter, |label, out, stderr, code| {
+            assert_eq!(code, 0, "{label} {filter}: {stderr:?}");
+            assert_eq!(out, format!("{expected}\n"), "{label} {filter}");
+        })?;
+    }
+    Ok(())
+}

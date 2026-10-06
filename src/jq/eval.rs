@@ -46525,17 +46525,18 @@ fn may_alias_register(source: &Expr, register_frame: Option<&Frame>) -> bool {
                         any(then, identity)
                     }
                 }
+                // A name the chain does not hold cannot reach here: resolution has
+                // already installed every call outside the source as a `DefCall`
+                // and substituted every parameter, so a miss would be a call to
+                // nothing, counted as computing.
                 Expr::FuncCall { name, args, .. } if args.is_empty() => {
-                    let mut at = scope;
-                    while let Some(def) = at {
-                        if def.name == name {
-                            // The body sees its own scope: itself, and what was in
-                            // scope where it was defined.
-                            return self.charge() && self.alias(def.body, identity, Some(def));
-                        }
-                        at = def.parent;
-                    }
-                    false
+                    core::iter::successors(scope, |def| def.parent)
+                        .find(|def| def.name == name)
+                        // The body sees its own scope: itself, and what was in
+                        // scope where it was defined.
+                        .is_some_and(|def| {
+                            self.charge() && self.alias(def.body, identity, Some(def))
+                        })
                 }
                 Expr::Identity => identity,
                 // A marker bound at a position the register's own frame can compare
