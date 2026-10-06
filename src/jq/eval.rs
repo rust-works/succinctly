@@ -40781,6 +40781,12 @@ fn leaf_register<'a, S: EvalSemantics>(
 /// `.[]` that [`iterates_untracked_input`] refuses on an input the register is
 /// not on, once the call has produced a value (not in [`builtin_navigation`],
 /// whose pre-evaluation check would pre-empt an argument's own error, #2646).
+///
+/// #3732 adds a `reduce` whose INIT cannot move the register
+/// ([`reduce_leaves_register_in_place`]): jq backtracks its source and every
+/// `UPDATE` to the post-INIT register, so what they navigate does not matter,
+/// provided the resolver checks it as jq does ([`register_movement_tracked`]).
+/// Like `add`, it is not in [`cannot_move_register`]: it navigates.
 fn leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
     cannot_move_register(expr)
         || (S::TAG == EvalTag::Jq
@@ -40801,6 +40807,13 @@ fn leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
                     | Builtin::ToEntries,
                 ) => true,
                 Expr::Builtin(Builtin::Map(f) | Builtin::Walk(f)) => cannot_move_register(f),
+                // #3732: the source and `UPDATE` are backtracked, INIT is not.
+                Expr::Reduce {
+                    patterns,
+                    input,
+                    init,
+                    update,
+                } => reduce_leaves_register_in_place(patterns, input, init, update),
                 _ => false,
             })
 }
@@ -42337,10 +42350,13 @@ fn patterns_all_bare(patterns: &[Pattern]) -> bool {
         .any(|p| matches!(p, Pattern::Object(_) | Pattern::Array(_)))
 }
 
-/// [`cannot_move_register`] for a `reduce`, shared with [`resolve_reduce`]'s
-/// final emission (#3710) so the two cannot disagree: a bare-variable pattern
-/// (a destructuring bind navigates, #2649) over a source, an `INIT` and an
-/// `UPDATE` none of which can move jq's register.
+/// [`cannot_move_register`] for a `reduce`: a bare-variable pattern (a
+/// destructuring bind navigates, #2649) over a source, an `INIT` and an
+/// `UPDATE` none of which can move jq's register. It was shared with
+/// [`resolve_reduce`]'s final emission (#3710); since #3732 that emission asks
+/// the weaker [`reduce_leaves_register_in_place`], which admits a navigating
+/// source and `UPDATE`, so this one now only answers [`cannot_move_register`]
+/// (and the `foreach` twin), where "navigates nothing" is the claim.
 fn reduce_cannot_move_register(
     patterns: &[Pattern],
     input: &Expr,
@@ -42351,6 +42367,36 @@ fn reduce_cannot_move_register(
         && cannot_move_register(input)
         && cannot_move_register(init)
         && cannot_move_register(update)
+}
+
+/// Whether a `reduce` leaves jq's register where it entered, *whatever its source
+/// and `UPDATE` navigate* (#3732). jq compiles `reduce` as `DUP; INIT; STOREV; FORK
+/// loop; SOURCE; ...UPDATE...; BACKTRACK`, with the `FORK` after INIT: the source and
+/// every `UPDATE` run in the looped branch, which ends in a `BACKTRACK` that restores
+/// the register to its post-INIT state, so only INIT's own navigation survives the
+/// fold (`path(.a as $x | reduce (1) as $i (.a; .b) | $x)` is `["a"]`; `path(. as $x |
+/// reduce (1) as $i (.; .a) | $x)` is `[]`). An INIT that cannot move the register
+/// therefore leaves it at the entry, which [`reduce_cannot_move_register`] only
+/// admits when the source and `UPDATE` are as inert.
+///
+/// The source and `UPDATE` still have to be ones the resolver checks as jq does
+/// ([`register_movement_tracked`]): a loss of the register used to hide a path
+/// error jq raises inside them that the fold does not model, and the first sweep
+/// found it for a source that destructures a computed value (`reduce (. as {a:$a}
+/// | .) as $k (.; .)` after `{a:{b:1}} | `: jq refuses at the destructuring `.a`,
+/// and accepting the stage answered `[]`). A destructuring pattern on the `reduce`
+/// itself stays out as in #3710: its own walk is resolved by the fold, and it is
+/// not claimed here.
+fn reduce_leaves_register_in_place(
+    patterns: &[Pattern],
+    input: &Expr,
+    init: &Expr,
+    update: &Expr,
+) -> bool {
+    patterns_all_bare(patterns)
+        && cannot_move_register(init)
+        && register_movement_tracked(input)
+        && register_movement_tracked(update)
 }
 
 /// [`reduce_cannot_move_register`]'s `foreach` twin: EXTRACT runs in the same
@@ -47446,7 +47492,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
     // #3710: a property of the `reduce`'s syntax, so answered once rather than per INIT fork.
     let register_unmoved = S::TAG == EvalTag::Jq
         && trackable
-        && reduce_cannot_move_register(patterns, input, init, update);
+        && reduce_leaves_register_in_place(patterns, input, init, update);
     let slice_ok = fold_slice_ok(patterns, input);
     // #3780: whether UPDATE navigates the accumulator on a path that always runs --
     // syntactic, so decided once, not per source element
@@ -47840,11 +47886,13 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         // accumulator still needs it).
         let mut emitted = reg.relocate_one::<S>(final_branch, true);
         // #3710: a computed accumulator is not the register, but when nothing in
-        // the fold can have moved it (`reduce_cannot_move_register`) jq's
-        // register is where the `reduce` entered, and the next pipe stage may
-        // still navigate from a variable frozen there (`path(. as $x | reduce
-        // (1) as $i (.; .a = $i) | $x.k)` is `["k"]`). The leaf states it, as
-        // every by-value leaf does ([`leaf_register`]); the stage then takes
+        // the fold can have moved it jq's register is where the `reduce`
+        // entered, and the next pipe stage may still navigate from a variable
+        // frozen there (`path(. as $x | reduce (1) as $i (.; .a = $i) | $x.k)`
+        // is `["k"]`). #3732: nothing *outside INIT* can have, since the source
+        // and UPDATE are backtracked ([`reduce_leaves_register_in_place`]), so
+        // a navigating source or UPDATE leaves it there too. The leaf states it,
+        // as every by-value leaf does ([`leaf_register`]); the stage then takes
         // the stricter of that and its own verdict. A trackable entry only: an
         // untracked one carries its register on the stage.
         if register_unmoved && !emitted.trackable {
@@ -121330,8 +121378,26 @@ mod tests {
                 "leaves_register_in_place({src})"
             );
         }
+        // #3732: a `reduce` whose INIT cannot move the register, whatever a source
+        // and `UPDATE` the resolver checks navigate; a navigating INIT, a
+        // destructuring pattern and a source or `UPDATE` it does not check stay out.
+        for (src, stays) in [
+            ("reduce (1) as $i (.; .a)", true),
+            ("reduce .a as $i (.; .b)", true),
+            ("reduce (1) as $i (.; 5)", true),
+            ("reduce (1) as $i (.a; .)", false),
+            ("reduce (1) as [$i] (.; 5)", false),
+            ("reduce (. as {a:$a} | .) as $k (.; .)", false),
+            ("reduce (1) as $i (.; try .a catch .)", false),
+        ] {
+            assert_eq!(
+                leaves_register_in_place::<JqSemantics>(&parse(src).unwrap()),
+                stays,
+                "leaves_register_in_place({src})"
+            );
+        }
         // The extras are jq-only: yq keeps the allowlist it had.
-        for src in ["add", "map(.)"] {
+        for src in ["add", "map(.)", "reduce (1) as $i (.; .a)"] {
             assert!(
                 !leaves_register_in_place::<YqSemantics>(&parse(src).unwrap()),
                 "leaves_register_in_place::<yq>({src})"
