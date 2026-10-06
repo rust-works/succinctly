@@ -10375,7 +10375,13 @@ fn eval_single_pipe<S: EvalSemantics, V: DocumentValue>(
     // `eval.rs:6441-6444`). Bridge the *whole* pipe there rather than
     // letting a later stage fall through `eval_builtin`'s per-builtin
     // fallback in isolation, which has no path to give it (#554).
-    if exprs.iter().any(needs_path_context) {
+    //
+    // Asked once and kept (#3822): the answer is a walk of every stage's
+    // unevaluated syntax, and this arm runs per dispatch, so a `try` body that
+    // fails at its first stage paid that walk -- twice -- per error for the
+    // rest of the body, which never runs.
+    let needs_path = exprs.iter().any(needs_path_context);
+    if needs_path {
         // #2061: `key`/`path`/`parent` answer from the path the walk
         // accumulates, so for a purely navigational pipe there is no
         // reason to build an `OwnedValue` tree for the document
@@ -10424,7 +10430,21 @@ fn eval_single_pipe<S: EvalSemantics, V: DocumentValue>(
     // #2416 step 3: the owned identity pipe lives in the sink route;
     // the staged fold below would hand its owned values to
     // `eval_on_owned` with no position.
-    if owned_identity_pipe_applies(exprs) {
+    //
+    // `needs_path` first: `owned_identity_pipe_applies` is `false` for every
+    // stage list in which no stage reads path context (its entry arm asks for
+    // one, and its loop returns `false` at the first stage that is neither
+    // navigational nor node-preserving unless a later stage does), so with it
+    // clear the call could only repeat the walk above to answer `false`.
+    //
+    // Debug builds still ask, so a later edit to `owned_identity_pipe_applies`
+    // that breaks the premise fails the whole test suite, not just the
+    // hand-picked corpus of `owned_identity_pipe_applies_is_false_without_path_context_3822`.
+    debug_assert!(
+        needs_path || !owned_identity_pipe_applies(exprs),
+        "owned_identity_pipe_applies is true for a pipe with no path-context stage (#3822)"
+    );
+    if needs_path && owned_identity_pipe_applies(exprs) {
         return collect_each_generic::<S, V>(whole.get(exprs), value, optional, cursor);
     }
 
@@ -48556,6 +48576,70 @@ mod tests {
         for f in no {
             assert!(!is_plain_navigation(&crate::jq::parse(f).unwrap()), "{f}");
         }
+    }
+
+    /// #3822: `eval_single_pipe` skips `owned_identity_pipe_applies` when no
+    /// stage reads path context, which is sound only because that function is
+    /// `false` for every such stage list. Pin the premise over the shapes its
+    /// own arms distinguish (navigational heads, computed and entry stages,
+    /// `as`, `//`, the map family, long never-evaluated tails), and that the
+    /// corpus does reach `true` once a stage reads path context -- so the
+    /// implication is not vacuous.
+    #[test]
+    fn owned_identity_pipe_applies_is_false_without_path_context_3822() {
+        let sum200 = vec!["1"; 200].join("+");
+        let long = format!(".foo | ({sum200})");
+        let without: Vec<&str> = vec![
+            ".a | .b",
+            ".foo | 1 + 1",
+            ".a | tostring | length",
+            ".a | . as $x | $x",
+            ".a | (null // .b) | length",
+            ".a | map(. + 1) | add",
+            ".a | to_entries | .[0]",
+            ".a | {b: .c} | .b",
+            ".a | select(. == 1) | . + 1",
+            ".a[] | .b | tostring",
+            ".a | [.[] | . * 2] | sort",
+            "1 | . + 1 | tostring",
+            "(.a // 1) | . + 2",
+            long.as_str(),
+        ];
+        for src in without {
+            let Expr::Pipe(stages) = parse(src).unwrap() else {
+                panic!("`{src}` is not a pipe");
+            };
+            assert!(
+                !stages.iter().any(needs_path_context),
+                "`{src}` reads path context, so it is not in the skipped class"
+            );
+            assert!(
+                !owned_identity_pipe_applies(&stages),
+                "`{src}` has no path-context stage but the owned identity pipe applies"
+            );
+        }
+        let with: Vec<&str> = vec![
+            ".a | key",
+            ".a | map(. + 1) | parent",
+            ".a[] | (. as $x | $x) | key",
+            ".a | (null // .b) | key",
+            ".a | tostring | path",
+        ];
+        let mut applies = 0;
+        for src in with {
+            let Expr::Pipe(stages) = parse(src).unwrap() else {
+                panic!("`{src}` is not a pipe");
+            };
+            assert!(
+                stages.iter().any(needs_path_context),
+                "`{src}` reads no path context"
+            );
+            applies += usize::from(owned_identity_pipe_applies(&stages));
+        }
+        assert!(
+            applies > 0,
+            "no corpus pipe takes the owned identity route, so the premise above is untested"
+        );
     }
 
     /// #3134: a scalar binding's anchor is pushed *pending* on its parent,
