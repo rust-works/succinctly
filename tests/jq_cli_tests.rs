@@ -70326,6 +70326,93 @@ fn test_path_register_by_value_operand_refusals_stay_refused_3456() -> Result<()
     ])
 }
 
+/// #3645: a `try` or `?` around an `and`/`or` whose left operand is a by-value
+/// builtin answers as jq does. The issue was filed while a lost operand's
+/// refusal was an uncatchable guess; `any`/`all`/`isempty(g)` since state the
+/// register they left (#3749, #3763) and `flatten`/`sort`/`to_entries` leave it
+/// where it entered (#3361), so the refusal of `R` is exact where jq raises and
+/// the step is not refused where it does not. The `any` row is pinned above;
+/// these are the rest of the issue's family, the `flatten` repro among them.
+/// Every row is captured from jq 1.7.1. The refused rows are the half that
+/// keeps the pin honest: a `try` that caught them would be a write at the wrong
+/// position (#3186, #3267), and jq leaves them uncaught too -- they fail at
+/// `PATH_END`, after the `try` has already returned.
+#[test]
+fn test_try_around_and_or_by_value_operand_answers_as_jq_3645() -> Result<()> {
+    let refused = "Invalid path expression";
+    assert_path_rows_3289(&[
+        // `flatten` leaves the register where it entered; `R` then runs on it.
+        (
+            r#"{"a":true}"#,
+            r"del(try (flatten and .a?))",
+            "{}\n",
+            "",
+            0,
+        ),
+        (
+            r#"[{"a":1}]"#,
+            r"del(try (flatten and .a?))",
+            "[{\"a\":1}]\n",
+            "",
+            0,
+        ),
+        (
+            r#"[{"a":1}]"#,
+            r"del((flatten and .a?)?)",
+            "[{\"a\":1}]\n",
+            "",
+            0,
+        ),
+        (
+            r#"[{"a":1}]"#,
+            r"(try (flatten and .a?)) |= 9",
+            "[{\"a\":1}]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"del(try (flatten and .a) catch .)",
+            "{}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"del(try (sort and .a?))",
+            "{\"a\":true}\n",
+            "",
+            0,
+        ),
+        // `all` and `isempty(g)` state the register they left.
+        (r#"{"a":true}"#, r"del(try (all and .a?))", "{}\n", "", 0),
+        (
+            r#"[{"a":1}]"#,
+            r"del(try (isempty(.[]) or .[0]?))",
+            "[{\"a\":1}]\n",
+            "",
+            0,
+        ),
+        // jq refuses these too, so they stay refused: the result is a `true`/
+        // `false` that is not the register, checked at `PATH_END`.
+        (r#"[{"a":1}]"#, r"del(try (sort or .a?))", "", refused, 5),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"del(try (to_entries and (.a)?))",
+            "",
+            refused,
+            5,
+        ),
+        (
+            r"[true]",
+            r"del(try (isempty(.[]) and .[0]))",
+            "",
+            refused,
+            5,
+        ),
+    ])
+}
+
 /// #3428 (closed by #3456's B3): an `and`/`or` operand jq navigates inside
 /// but the resolver evaluates by value -- `first`, `last`, `any`, `all`,
 /// `nth(n)`, `isempty(g)`, a `//`, an `if`, a `try`, a `def` -- used to keep
