@@ -27,6 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The evaluators' pipe routes (`eval_single`, the sink route, and the eager evaluator's `eval_pipe`/`eval_each_pipe`) all read it. Output is unchanged.
   **Breaking for library callers** that build or destructure `Expr::Pipe`: building one from a `Vec` adds `.into()` (or uses `Expr::pipe`), moving the stages out uses `into_vec()`,
   and an or-pattern binding `Expr::Pipe(x) | Expr::Comma(x)` splits in two, since the two payloads now differ in type.
+- **jq: a recursion behind `nth(n; ..)`, a bare-variable bind, or a `reduce` UPDATE of `recurse(f)` keeps jq's path register** (#3892).
+  `path(. as $x | 1 | nth(0; ..) | $x)`, `path(. as $x | 1 | (. as $q | ..) | $x)` and `path(. as $x | reduce (1,2) as $i (1; try recurse(.a)) | $x)` on
+  `{"a":{"b":{"b":null}},"c":2}` refused with exit 5 where jq 1.7.1 answers `[]` (the bind row then raises jq's own iterate error), and their `del`/`=`/`|=` forms refused where jq writes.
+  `entry_marker_shape` now forwards `nth(n; f)` (its resolver arm hands the kept branch on unchanged) and a bare-variable bind's body (the source is a subexp in jq), and
+  `register_movement_tracked` names every recurse spelling with a tracked `f`, as it already named `..`. A destructuring bind, a `def` call, a literal ahead of the recursion, a pipe
+  nested in a forwarder, a forking `foreach` UPDATE and a fold inside an `[E]` still refuse loudly (`test_recurse_seed_residuals_stay_loud_3580`). jq mode only. Pinned by
+  `test_recurse_seed_through_nth_bind_and_fold_recurse_f_3892`.
 - **ci: the shared coverage action now uses `action-works/patchcov-action@v1`** (#3880). It replaces `action-works/omni-dev-coverage-check@v2` in `.github/actions/coverage/action.yml`
   (the one definition behind both `ci.yml` and `coverage-baseline.yml`). `v1` resolves to the same commit and an identical `action.yml` as the old `v2`, so every input, the `version: 0.1.1`
   patchcov pin and the baseline lookup are unchanged; only the repository an `omni-dev`-named workflow depended on is gone.
