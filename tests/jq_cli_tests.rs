@@ -60769,7 +60769,7 @@ fn test_indices_family_raises_inside_path_on_the_evaluated_pattern_3347() -> Res
         (r#""abc" | indices([1])"#, r#"element [1] of "abc""#),
         (r#""abc" | index(null)"#, r#"element null of "abc""#),
         (r#"{"a":1} | indices("b")"#, r#"element "b" of {"a":1}"#),
-        (r#"null | rindex(1)"#, "element 1 of null"),
+        (r"null | rindex(1)", "element 1 of null"),
         (r#"5 | index("b")"#, r#"element "b" of 5"#),
         // A string searched for a string only reads, so `indices` answers; `index`
         // and `rindex` then apply `.[0]` / `.[-1:]` to the array of positions
@@ -60804,11 +60804,11 @@ fn test_indices_family_stays_silent_without_a_navigating_pattern_3347() -> Resul
     for filter in [
         r#"[path(("abc" | indices("b")) | empty)]"#,
         r#"[path(("abc" | indices("b", "c")) | empty)]"#,
-        r#"[path(([1] | indices(empty)) | empty)]"#,
-        r#"[path(([1] | index(empty)) | empty)]"#,
-        r#"[path(([1] | rindex(empty)) | empty)]"#,
+        r"[path(([1] | indices(empty)) | empty)]",
+        r"[path(([1] | index(empty)) | empty)]",
+        r"[path(([1] | rindex(empty)) | empty)]",
         // `?` catches the raise.
-        r#"[path(([1] | indices(1))?)]"#,
+        r"[path(([1] | indices(1))?)]",
         r#"[path(("abc" | index("b"))?)]"#,
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("{}"))?;
