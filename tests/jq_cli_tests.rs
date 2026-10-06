@@ -15364,7 +15364,7 @@ fn test_add_reports_type_error_via_into_conversion() -> Result<()> {
 #[test]
 fn test_any_propagates_halt_from_condition() -> Result<()> {
     // `control_to_result`'s `Halt` arm (#791), reached via `any(cond)`:
-    // `any_all_probe_element` forks `cond` through `eval_owned_expr_fork`
+    // `any_all_probe_element_verdict` forks `cond` through `eval_owned_expr_fork`
     // and, when it halts with no truthy output for this element, returns
     // `Err(Control::Halt(code))`; `any_all_f`'s `Err(control) =>
     // control_to_result(control)` converts that back into a `QueryResult`
@@ -105135,6 +105135,203 @@ fn test_any_all_condition_retry_extra_verdicts_3819() -> Result<()> {
         assert_retry_rows_3293(None, &format!("{input} | "), rows)?;
         // Document route (`eval_generic.rs`): the input stays on the cursor.
         assert_retry_rows_3293(Some(input), "", rows)?;
+    }
+    Ok(())
+}
+
+/// #3827 rows over `{"x":{"a":[1],"b":[2]}}`
+const RETRY_ROWS_ANY_ALL_PATH_3827: &[RetryRow3293] = &[
+    (
+        r#"path(.x | any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else empty end)))"#,
+        "",
+        "AA",
+        "Invalid path expression with result false",
+        5,
+    ),
+    (
+        r#"del(.x | any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else empty end)))"#,
+        "",
+        "AA",
+        "Invalid path expression with result false",
+        5,
+    ),
+    (
+        r#"(.x | any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else empty end))) |= 1"#,
+        "",
+        "AA",
+        "Invalid path expression with result false",
+        5,
+    ),
+    (
+        r#"try path(.x | any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else empty end))) catch ."#,
+        "\"Invalid path expression with result false\"\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(.x | any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else empty end)))?]"#,
+        "[]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(.x | all(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else empty end)))"#,
+        "",
+        "AA",
+        "Invalid path expression with result true",
+        5,
+    ),
+    (
+        r#"del(.x | all(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else empty end)))"#,
+        "",
+        "AA",
+        "Invalid path expression with result true",
+        5,
+    ),
+    (
+        r#"path(.x | any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else true end)))"#,
+        "",
+        "AA",
+        "Invalid path expression with result true",
+        5,
+    ),
+    (
+        r#"path(.x | all(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else false end)))"#,
+        "",
+        "AA",
+        "Invalid path expression with result false",
+        5,
+    ),
+    (
+        r#"path(.x | any((.a, .b); (. as [$q] ?// $z | ("A"|stderr) as $m | if $q != null then true else empty end)))"#,
+        "",
+        "AAAA",
+        "Invalid path expression with result false",
+        5,
+    ),
+    (
+        r#"path(.x | any(.[]; (. as [$q] ?// $z | ("A"|stderr) as $m | if $q != null then true else empty end)))"#,
+        "",
+        "AAAA",
+        "Invalid path expression with result false",
+        5,
+    ),
+    (
+        r#"path(.x | any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else error("E2") end)))"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"first(path(.x | any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else empty end))))"#,
+        "",
+        "AA",
+        "Invalid path expression with result false",
+        5,
+    ),
+    (
+        r#"[limit(1; path(.x | any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else empty end))))?]"#,
+        "[]\n",
+        "AA",
+        "",
+        0,
+    ),
+];
+
+/// #3827: in path position, `any`/`all` hand `path()` one answer per decisive
+/// output and then the identity element when a retry ran dry, as they do in
+/// value position (#3819). jq checks each answer against its register as it
+/// is emitted, and the `?//` that swallowed the decisive output's break also
+/// swallows the refusal, so only the last answer's refusal survives and names
+/// its value: `path(.x | any(.; (. as {a:$q} ?// {b:$z} | if $q != null then
+/// true else empty end)))` raises `with result false` (the identity element),
+/// not `with result true`. Rows cover `path`, `del`, `|=`, a `try`/`?` around
+/// them, `all`, two decisive alternatives, a generator the retry runs on past,
+/// and a retry that raises after the answer, on the owned route and the
+/// document route. Every value is captured from `/usr/bin/jq` 1.7.1 with `-nc`.
+#[test]
+fn test_any_all_path_condition_retry_names_last_answer_3827() -> Result<()> {
+    let input = r#"{"x":{"a":[1],"b":[2]}}"#;
+    // Owned route (`eval.rs`): the input is built under `-n`.
+    assert_retry_rows_3293(None, &format!("{input} | "), RETRY_ROWS_ANY_ALL_PATH_3827)?;
+    // Document route (`eval_generic.rs`): the input stays on the cursor.
+    assert_retry_rows_3293(Some(input), "", RETRY_ROWS_ANY_ALL_PATH_3827)?;
+    Ok(())
+}
+
+/// #3827 rows over `{"x":true}`, where an answer is a valid path (printed before
+/// a retry's raise)
+const RETRY_ROWS_ANY_ALL_PATH_RAISE_3827: &[RetryRow3293] = &[
+    (
+        r#"path(.x | any(.; (. as $q ?// $z | ("A"|stderr) as $m | if $q then true else error("E2") end)))"#,
+        "[\"x\"]\n",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[path(.x | any(.; (. as $q ?// $z | ("A"|stderr) as $m | if $q then true else error("E2") end)))?]"#,
+        "[[\"x\"]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(.x | all(.; (. as $q ?// $z | ("A"|stderr) as $m | if $q then false else error("E2") end)))"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"path(.x | any(.; (1 as $x ?// $y | ("A"|stderr) as $m | if $x then true else empty end)))"#,
+        "[\"x\"]\n",
+        "AA",
+        "Invalid path expression with result false",
+        5,
+    ),
+];
+
+/// #3827: an answer that is a valid path is printed before the raise of the
+/// `?//` retry that follows it, and an escape after the answers is raised
+/// after them. Every value is captured from `/usr/bin/jq` 1.7.1 with `-nc`.
+#[test]
+fn test_any_all_path_answer_precedes_retry_raise_3827() -> Result<()> {
+    let input = r#"{"x":true}"#;
+    assert_retry_rows_3293(
+        None,
+        &format!("{input} | "),
+        RETRY_ROWS_ANY_ALL_PATH_RAISE_3827,
+    )?;
+    assert_retry_rows_3293(Some(input), "", RETRY_ROWS_ANY_ALL_PATH_RAISE_3827)?;
+    Ok(())
+}
+
+/// #3827: a `halt` downstream of an answer is not the `break` the condition's
+/// `?//` swallows, so it halts rather than letting the next answer through. The
+/// condition's later alternative has already run by the time the answer is
+/// delivered, so its stderr trace is not pinned here (jq runs it once; this
+/// resolver runs it before the answer reaches the consumer).
+#[test]
+fn test_any_all_path_answer_halt_is_not_retried_3827() -> Result<()> {
+    let input = r#"{"x":true}"#;
+    for cond in [
+        r"if $q then true else empty end",
+        r#"if $q then true else error("E2") end"#,
+    ] {
+        let filter =
+            format!(r#"path(.x | any(.; (. as $q ?// $z | {cond}))) | ("H"|halt_error(3))"#);
+        let (out, err, code) = run_jq_full(&["-c", filter.as_str()], Some(input))?;
+        assert_eq!((out.as_str(), code), ("", 3), "`{filter}`: stderr {err:?}");
+        assert!(err.ends_with('H'), "`{filter}`: stderr {err:?}");
+        assert!(!err.contains("E2"), "`{filter}`: stderr {err:?}");
+        let owned = format!("{input} | {filter}");
+        let (out, err, code) = run_jq_full(&["-nc", owned.as_str()], None)?;
+        assert_eq!((out.as_str(), code), ("", 3), "`{owned}`: stderr {err:?}");
+        assert!(err.ends_with('H'), "`{owned}`: stderr {err:?}");
     }
     Ok(())
 }

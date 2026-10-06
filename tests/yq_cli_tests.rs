@@ -49626,7 +49626,7 @@ fn consumer_argument_positional_read_resolves_on_every_route_2968() -> Result<()
 /// "bbb")` is `true` on `{bbb: 1, c: 2}` because the first member's key is
 /// `bbb`, and `all(.[]; (key|length) == 3)` is `false` because `c`'s is not.
 /// The triage found `cond` was evaluated by value per element
-/// (`any_all_probe_element`), with no cursor at all.
+/// (`any_all_probe_element_verdict`), with no cursor at all.
 #[test]
 fn any_all_cond_reads_the_element_position_2968() -> Result<()> {
     let doc = "aa: {bbb: 1, c: 2}\n";

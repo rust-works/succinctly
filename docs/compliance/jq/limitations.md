@@ -10501,9 +10501,29 @@ Both routes and the unary forms follow this. `test_any_all_condition_retry_extra
 pins the matrix and `test_any_all_direct_condition_retry_extra_verdicts_3819` the
 direct-retry case that needs no std retry generation.
 
-One path still diverges: the path-position resolver, where `path(.x | any(.; ...))`
-raises `Invalid path expression with result true` on the first answer where jq
-raises with `result false` on the last. Both raise, so only the message differs. Tracked in #3827.
+The path-position resolver follows the same answers (#3827). jq checks each one
+against its register as it is emitted, and the `?//` that swallowed the decisive
+output's `break` also swallows the refusal that check raises, so only the last
+answer's refusal survives: `path(.x | any(.; ...))` raises `Invalid path expression
+with result false` (the identity element), not `result true`. `path`, `del`, `|=`
+and a `try`/`?` around them all name the last answer;
+`test_any_all_path_condition_retry_names_last_answer_3827` pins the matrix.
+
+The resolver drains the generator before it delivers the answers, so a retried
+alternative's side effects (`stderr`, `debug`) run before the first answer reaches the
+consumer: `path(.x | any(.; ...)) | ("H"|halt_error(3))` halts at the first answer in
+jq without running the retry, and here after it. The halt itself, its exit code and
+the output are the same (`test_any_all_path_answer_halt_is_not_retried_3827`).
+
+One shape in this family still diverges, and it is a *valid* answer rather than a
+refused one: an answer identical to jq's register (a `true` over a `true` node) that
+follows an alternative's error is a valid path in jq, and the resolver refuses it
+(`path(.x | any(.; (. as [$q] ?// $q | true)))` on `{"x":true}` is `["x"]` in jq). The same holds for the
+identity element after a swallowed answer: `path(.x | all(.; (1 as $x ?// $y | if $x then false else empty end)))`
+on `{"x":true}` is `["x"]` in jq, because the retry restores the register the answer is compared with,
+where the resolver states it lost and refuses.
+An answer that is a valid path is printed before the raise of the retry that follows
+it, as jq does (`test_any_all_path_answer_precedes_retry_raise_3827`).
 
 ## Provenance
 

@@ -15535,33 +15535,6 @@ fn builtin_all<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
-/// Probes a single element's `cond` for a match, stopping at the first
-/// *decisive* output -- jq's own `first(...)`-based definitions pull one
-/// output at a time and break on the first that decides, so a later output
-/// of the same `cond` application is never evaluated: `cond` yielding
-/// `(false, error(...))` resolves on the `false` alone, and `[any(1;
-/// (true, ("C"|stderr)))]` writes nothing (jq 1.7.1, captured live).
-/// #2968: used to collect every output first (`eval_owned_expr_fork`),
-/// which got the answer right but ran the side effects past the decision;
-/// now the same rule as `eval_generic.rs`'s `any_all_probe_item_generic`,
-/// so the two routes agree on that row too.
-///
-/// **Discards the control a `?//` retry raises after the decisive output**
-/// (#3810): it answers only "decided or not". Use
-/// [`any_all_probe_element_verdict`] wherever the answers and control a
-/// `?//` retry produces after the decisive output must follow it. The one
-/// remaining caller is the path-position resolver
-/// (`resolve_any_all_gen_cond_sink`), where `path(any(...))` itself still
-/// diverges before the retry is reached.
-fn any_all_probe_element<S: EvalSemantics>(
-    cond: &Expr,
-    elem: &OwnedValue,
-    target_truthy: bool,
-) -> Result<bool, Control> {
-    any_all_probe_element_verdict::<S>(cond, elem, target_truthy)
-        .map(|verdict| matches!(verdict, ElementProbe::Decided { .. }))
-}
-
 /// What probing one element's `cond` found (#3810, #3819).
 pub(crate) enum ElementProbe {
     /// `cond` ran dry without a decisive output.
@@ -15625,8 +15598,21 @@ pub(crate) fn element_probe_outcome(
     }
 }
 
-/// [`any_all_probe_element`] with the trailing verdicts and control kept
-/// (#3810, #3819).
+/// Probes a single element's `cond` for a match, stopping at the first
+/// *decisive* output -- jq's own `first(...)`-based definitions pull one
+/// output at a time and break on the first that decides, so a later output
+/// of the same `cond` application is never evaluated: `cond` yielding
+/// `(false, error(...))` resolves on the `false` alone, and `[any(1;
+/// (true, ("C"|stderr)))]` writes nothing (jq 1.7.1, captured live).
+/// #2968: used to collect every output first (`eval_owned_expr_fork`),
+/// which got the answer right but ran the side effects past the decision;
+/// now the same rule as `eval_generic.rs`'s `any_all_probe_item_generic`,
+/// so the two routes agree on that row too.
+///
+/// Keeps the verdicts and the control a `?//` retry raises after the decisive
+/// output (#3810, #3819): the answers and control that retry produces must
+/// follow it, in value position and in the path-position resolver alike
+/// (#3827).
 pub(crate) fn any_all_probe_element_verdict<S: EvalSemantics>(
     cond: &Expr,
     elem: &OwnedValue,
@@ -15785,7 +15771,7 @@ fn any_all_gen_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // duplicate-key and number-spelling fidelity.
     //
     // `target_truthy` decides which answer a single element can settle, and
-    // `any_all_probe_element` already folds that direction in -- so `all`
+    // `any_all_probe_element_verdict` already folds that direction in -- so `all`
     // still reaches a later side-effecting element whenever no element has
     // decided the answer yet. Confirmed against jq 1.7.1:
     // `all(2, (5|stderr); .==2)` writes `5` there too, and is pinned by
@@ -40949,7 +40935,7 @@ fn lost_at<'a, S: EvalSemantics>(value: &OwnedValue) -> BranchRegister<'a> {
 ///
 /// - A `cond` that provably navigates nothing (`cannot_move_register`, the
 ///   allowlist: `.`, a literal, a comparison, ...) can neither move the register
-///   nor raise, so evaluating it by value is exact ([`any_all_probe_element`]).
+///   nor raise, so evaluating it by value is exact ([`any_all_probe_element_verdict`]).
 /// - Anything else is resolved live, as a pipe stage on each branch `gen`
 ///   produced -- `gen | cond`, which is what jq runs -- so a path error on a
 ///   computed element raises as jq's does (catchable by `try`, as jq's is), and a
@@ -41009,7 +40995,9 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
     let mut stages: Vec<Expr> = Vec::new();
     let mut flattened = false;
     let mut decided = false;
-    let mut decided_at: Option<(Rc<PathPrefix>, BranchRegister<'a>)> = None;
+    // One entry per decisive output, in the order jq's path tracker sees them
+    // (#3827). Jq mode only: yq keeps its single by-value answer.
+    let mut answers: Vec<(Rc<PathPrefix>, BranchRegister<'a>)> = Vec::new();
     // A stop's stashed escape, with the retry generation it was stashed at: a
     // `?//` inside `gen` can retry after a failed alternative and resolve a later
     // one, which supersedes it (#3293, the `and`/`or`/negate arms' rule), so each
@@ -41027,16 +41015,37 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
             probe_escape = None;
             stage_escape = None;
             if !live {
-                return match any_all_probe_element::<S>(cond, &branch.value, target_truthy) {
-                    Ok(true) => {
+                return match any_all_probe_element_verdict::<S>(cond, &branch.value, target_truthy)
+                {
+                    Ok(ElementProbe::Decided { verdicts, after }) => {
                         decided = true;
-                        // `cond` is inert here, so jq mode states the register.
-                        if S::TAG == EvalTag::Jq {
-                            decided_at = Some(register_after(gen, branch, frame));
+                        if S::TAG != EvalTag::Jq {
+                            return Demand::Stop;
                         }
-                        Demand::Stop
+                        // `cond` is inert here, so jq mode states the register.
+                        // #3827: a `?//` in `cond` that swallows the decisive
+                        // output's break decides again, one answer each.
+                        let at = register_after(gen, branch, frame);
+                        for _ in 1..verdicts {
+                            answers.push(at.clone());
+                        }
+                        answers.push(at);
+                        match after {
+                            AfterVerdict::Stop => Demand::Stop,
+                            // The retry ran dry: `gen` runs on.
+                            AfterVerdict::Resume => Demand::Continue,
+                            // The retry's raise follows the answers: a refused one is
+                            // superseded by it, a valid path is printed first.
+                            AfterVerdict::Raise(control) => {
+                                let mut slot = None;
+                                let demand = stop_with_escape(&mut slot, control);
+                                probe_escape =
+                                    slot.map(|control| (control, pipe_retry_generation()));
+                                demand
+                            }
+                        }
                     }
-                    Ok(false) => Demand::Continue,
+                    Ok(ElementProbe::Undecided) => Demand::Continue,
                     Err(control) => {
                         let mut slot = None;
                         let demand = stop_with_escape(&mut slot, control);
@@ -41097,7 +41106,13 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
             let mut decide = |output: PathBranch<'a>| -> Demand {
                 if output.value.is_truthy() == target_truthy {
                     decided = true;
-                    decided_at = Some(register_after(cond, output, frame));
+                    debug_assert!(
+                        S::TAG == EvalTag::Jq,
+                        "only the jq-mode route resolves live"
+                    );
+                    // #3827: a `?//` that swallows this stop decides again, and
+                    // each decisive output is an answer jq's path tracker sees.
+                    answers.push(register_after(cond, output, frame));
                     Demand::Stop
                 } else {
                     Demand::Continue
@@ -41135,28 +41150,111 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
         },
     );
     let direct_retry = direct_pattern_retry(gen);
+    // The escape the drive still owes, unless a `?//` retry consumed it.
+    let mut owed: Option<EvalEscape> = None;
     if let Some((escape, at)) = stage_escape {
         if !resolve_retry_superseded(&flow, at, direct_retry) {
+            owed = Some(escape);
+        }
+    }
+    if owed.is_none() {
+        if let Some((control, at)) = probe_escape {
+            if !resolve_retry_superseded(&flow, at, direct_retry) {
+                owed = Some(EvalEscape::from(control));
+            }
+        }
+    }
+    if answers.is_empty() {
+        if let Some(escape) = owed {
             return ResolveFlow::Escaped(escape);
         }
-    }
-    if let Some((control, at)) = probe_escape {
-        if !resolve_retry_superseded(&flow, at, direct_retry) {
-            return ResolveFlow::Escaped(EvalEscape::from(control));
-        }
-    }
-    // `any` answers true when an element decided, `all` answers false.
-    let answer = OwnedValue::Bool(decided == target_truthy);
-    match decided_at {
-        Some((path, register)) => {
-            forward_drained_branch(flow, computed_at_register(answer, path, register), sink)
-        }
-        None => forward_drained_result(
+        // `any` answers true when an element decided, `all` answers false.
+        let answer = OwnedValue::Bool(decided == target_truthy);
+        return forward_drained_result(
             flow,
             answer,
             drained_register_after::<S>(trackable, value, decided),
             sink,
-        ),
+        );
+    }
+    deliver_any_all_answers::<S>(flow, owed, answers, target_truthy, trackable, value, sink)
+}
+
+/// Hand `any`/`all`'s answers to `sink` the way jq's path tracker sees them
+/// (#3827): one per decisive output, then the identity element when `gen` ran
+/// to its end (a retry that came up dry leaves `gen` running, #3819).
+///
+/// jq checks each answer against its register as it is emitted, and the
+/// `?//` that swallowed the decisive output's break also swallows the error
+/// that check raises, so only the last answer's refusal survives and names
+/// its value: `path(.x | any(.; (. as {a:$q} ?// {b:$z} | if $q != null then
+/// true else empty end)))` on `{"x":{"a":[1],"b":[2]}}` raises `with result
+/// false`, the identity element, not `true`. Every answer but the last is one
+/// a retry follows, so a stop on it is that swallowed break and the next is
+/// delivered all the same; the terminal sink re-enters after a stop for the
+/// same reason (`resolve_terminal_sink`, #3808).
+fn deliver_any_all_answers<'a, S: EvalSemantics>(
+    flow: ResolveFlow,
+    owed: Option<EvalEscape>,
+    answers: Vec<(Rc<PathPrefix>, BranchRegister<'a>)>,
+    target_truthy: bool,
+    trackable: bool,
+    value: &'a OwnedValue,
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
+    // An escape that follows the answers (a retry's raise, #3810, or a later
+    // `gen` output's) is raised after them, as jq does: an answer that is a
+    // valid path is printed first, and a refused one is the refusal the
+    // retry that raised supersedes.
+    let (escape, identity_follows) = match (owed, flow) {
+        (Some(escape), _) | (None, ResolveFlow::Escaped(escape)) => (Some(escape), false),
+        (None, ResolveFlow::Stopped) => (None, false),
+        (None, ResolveFlow::Exhausted) => (None, true),
+    };
+    let mut branches: Vec<PathBranch<'a>> = answers
+        .into_iter()
+        .map(|(path, register)| {
+            computed_at_register(OwnedValue::Bool(target_truthy), path, register)
+        })
+        .collect();
+    if identity_follows {
+        // The generator emitted, so the register is not known to be where this
+        // entered ([`drained_register_after`]).
+        branches.push(untracked_at_register(
+            Cow::Owned(OwnedValue::Bool(!target_truthy)),
+            drained_register::<S>(trackable, value),
+        ));
+    }
+    // Whether delivery runs on past `demand`. A stop is the break the `?//`
+    // swallowed, so it does -- but not a `halt` or a decode failure behind it,
+    // which no `?//` retries -- and the retry announces itself to the sinks that
+    // stashed a verdict on it (#3293).
+    let runs_on = |demand: Demand| {
+        if demand == Demand::Stop {
+            if !is_retryable_stop(false) {
+                return false;
+            }
+            clear_nonretryable_stop();
+        }
+        true
+    };
+    let mut demand = Demand::Continue;
+    for branch in branches {
+        if !runs_on(demand) {
+            return ResolveFlow::Stopped;
+        }
+        demand = sink(branch);
+    }
+    if let Some(escape) = escape {
+        return if runs_on(demand) {
+            ResolveFlow::Escaped(escape)
+        } else {
+            ResolveFlow::Stopped
+        };
+    }
+    match demand {
+        Demand::Continue => ResolveFlow::Exhausted,
+        Demand::Stop => ResolveFlow::Stopped,
     }
 }
 
