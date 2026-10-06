@@ -55703,6 +55703,149 @@ fn path_mode_foreach_update_and_extract_resolve_by_demand_3507() -> Result<()> {
     Ok(())
 }
 
+/// #3651: a `?//` chain in a fold **source** that destructures a freshly built value
+/// runs jq's *next* alternative, not the first, in path position.
+///
+/// jq's pattern step is a tracked index, and a fresh value is never the register's
+/// node, so `[[1]] as [$x]` raises `Invalid path expression` inside `path(...)` and
+/// the `?//` falls to `$y`. The issue read the divergence as "the source's `?//`
+/// retries after a consumer's stop from the stored state, where jq does not" -- but
+/// the retry model was right all along. The source was driven by value
+/// (`routes_destructuring` kept a `?//` chain off the resolver), where alternative
+/// one *succeeded*, so a stop retried onto alternative two on a state alternative
+/// one had already moved (`.b` on `[1,2,3]`), and with no stop the wrong alternative
+/// bound `$y` (`[["a"]]` for jq's `[["b"]]`). Un-nested, nested, in a write and
+/// under a stop that reaches it from an outer fold all read the same cause.
+///
+/// The first five rows are the issue's, whole from jq 1.7.1 -- stdout, stderr and
+/// exit code, so the `?//` body's side-effect count (`axax`) is pinned exactly.
+#[test]
+fn fold_source_alt_chain_over_a_fresh_value_runs_the_next_alternative_3651() -> Result<()> {
+    const D: &str = r#"{"a":{"a":1,"b":{"c":2}},"b":[1,2,3]}"#;
+    for (input, filter, want_out, want_err, want_code) in [
+        // Un-nested: the stop reaches a source whose first alternative jq never ran.
+        (
+            D,
+            r"[first(path(foreach ([[1]] as [$x] ?// $y | $x) as $w (.; .b)))]",
+            "[[\"b\"]]\n",
+            "",
+            0,
+        ),
+        // Nested in UPDATE (#3507 lets the outer stop reach it).
+        (
+            D,
+            r"first(path(foreach 1 as $v (.; foreach ([[1]] as [$x] ?// $y | $x) as $w (.; .b))))",
+            "[\"b\"]\n",
+            "",
+            0,
+        ),
+        // The same fold as a write target.
+        (
+            D,
+            r"first(foreach 1 as $v (.; foreach ([[1]] as [$x] ?// $y | $x) as $w (.; .b))) = 5",
+            "{\"a\":{\"a\":1,\"b\":{\"c\":2}},\"b\":5}\n",
+            "",
+            0,
+        ),
+        (
+            D,
+            r"first(foreach 1 as $v (.; foreach ([[1]] as [$x] ?// $y | $x) as $w (.; .b))) |= 5",
+            "{\"a\":{\"a\":1,\"b\":{\"c\":2}},\"b\":5}\n",
+            "",
+            0,
+        ),
+        (
+            D,
+            r"del(first(foreach 1 as $v (.; foreach ([[1]] as [$x] ?// $y | $x) as $w (.; .b))))",
+            "{\"a\":{\"a\":1,\"b\":{\"c\":2}}}\n",
+            "",
+            0,
+        ),
+        // Through an outer fold's INIT fan-out and an inner `.[]?`.
+        (
+            D,
+            r"isempty(path(foreach 1 as $v ((., .b); (. | .[]); foreach ([[1]] as [$x] ?// $y | $x) as $v (.; .[]?))))",
+            "false\n",
+            "",
+            0,
+        ),
+        // Both the source's chain and EXTRACT's own `?//` meet the one stop: EXTRACT
+        // retries (`axax`, two paths), the source does not run a second alternative.
+        (
+            r#"{"a":null,"b":[]}"#,
+            r#"first(path(foreach ([[1]] as [$x] ?// $y | $x) as $v (.a; (.b[0], empty); .[([null] as [[$q]] ?// $b | ("ax"|stderr) | if $q then "a" else "b" end)])))"#,
+            "[\"a\",\"b\",0,\"b\"]\n[\"a\",\"b\",0,\"b\"]\n",
+            "axax",
+            0,
+        ),
+        // No stop at all: alternative two binds, so `$y` is `[[1]]` and UPDATE takes `.b`.
+        (
+            D,
+            r"[path(foreach ([[1]] as [$x] ?// $y | $y) as $w (.; if $w == null then .a else .b end))]",
+            "[[\"b\"]]\n",
+            "",
+            0,
+        ),
+        // Alternative one's body never runs: `S` is written once, by the second.
+        (
+            D,
+            r#"[first(path(foreach ([[1]] as [$x] ?// $y | ("S"|stderr|empty), $x) as $w (.; .b)))]"#,
+            "[[\"b\"]]\n",
+            "S",
+            0,
+        ),
+        // A three-alternative chain lands on the first alternative that does not step.
+        (
+            D,
+            r"[path(foreach ([1] as [$x] ?// [$y] ?// $z | $z) as $w (.; if $w == null then .a else .b end))]",
+            "[[\"b\"]]\n",
+            "",
+            0,
+        ),
+        // Every alternative steps, so the last one's refusal is the answer.
+        (
+            D,
+            r"[path(foreach ([1] as [$x] ?// [$y] | $y) as $w (.; .))]",
+            "",
+            "jq: error (at <stdin>:0): Invalid path expression near attempt to access element 0 of [1]\n",
+            5,
+        ),
+        // `reduce` shares the source drive: it takes alternative two (`.b`), and the
+        // refusal is its own accumulator's, `[1,2,3]` rather than the document.
+        (
+            D,
+            r"[path(reduce ([[1]] as [$x] ?// $y | $y) as $w (.; if $w == null then .a else .b end))]",
+            "",
+            "jq: error (at <stdin>:0): Invalid path expression with result [1,2,3]\n",
+            5,
+        ),
+        // INIT has navigated, so the fold's source runs with no register in hand: a fresh
+        // value's refusal is still jq's own verdict and the next alternative binds.
+        (
+            r"[[1],[2]]",
+            r"path(reduce (([1],[2]) as [$a] ?// $a | empty) as $x (.[]; .))",
+            "[0]\n[1]\n",
+            "",
+            0,
+        ),
+        (
+            r"[[1],[2]]",
+            r"first(path(foreach (([1],[2]) as [$a] ?// $a | $a) as $x (.[]; .)))",
+            "[0]\n",
+            "",
+            0,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (want_out, want_err, want_code),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
 /// #2908: `path(f)` is a generator, so a consumer *outside* it can stop `f`.
 ///
 /// Both evaluators collected every path before their consumer saw one, so a
