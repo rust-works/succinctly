@@ -5,14 +5,14 @@ description: >-
   coverage-baseline.yml (pushes to main, which publish the baseline artifact
   that pull requests diff against). Run it after `actions/checkout` with
   `fetch-depth: 0`. One definition so the two workflows cannot drift apart on
-  the pinned omni-dev version, the test arguments or the coverage gate (#3649).
+  the pinned patchcov version, the test arguments or the coverage gate (#3649).
 
 inputs:
   name:
     description: 'Matrix leg name (x86_64 or ARM64); suffixes the artifact names and the comment header'
     required: true
   use-prebuilt:
-    description: "Whether to download a prebuilt omni-dev binary ('true') or build it from source ('false')"
+    description: "Whether to download a prebuilt patchcov binary ('true') or build it from source ('false')"
     required: true
   baseline-workflow:
     description: >-
@@ -128,45 +128,20 @@ runs:
             ;;
         esac
 
-    - uses: action-works/omni-dev-coverage-check@v1
+    - uses: action-works/omni-dev-coverage-check@v2
       with:
-        # Pin; we're a consumer. Must stay >= 0.38.0: that release added the
-        # declarative `.omni-dev/coverage.yaml` ignore-list (omni-dev#1398),
-        # which is how the CPU-conditional `src/bits/popcount.rs` flap (#302)
-        # is silenced. The action does not thread `--ignore-filename-regex`,
-        # so config-file discovery from the checkout is the only route.
-        # Bumped to 0.42.0 for #1554: that release carries omni-dev#1580's
-        # fix (PR rust-works/omni-dev#1586, switching `coverage diff`'s
-        # internal git diff to libgit2's patience algorithm), which resolves
-        # the patch-coverage misattribution this repo hit on refactor-shaped
-        # diffs with long runs of near-duplicate lines (src/jq/eval.rs on
-        # PR #1551) -- verified locally against that PR's exact base/head
-        # commits with the 0.42.0 binary: patch coverage now reports 7/7
-        # new lines for eval.rs, not the pre-fix "5161/6070 new lines"
-        # spanning nearly the whole file.
-        # Bumped to 0.43.0 for #2467: that release adds source-comment
-        # coverage markers (rust-works/omni-dev#1593) -- `tolerate`/`ignore`
-        # regions delimited by `// omni-dev: coverage tolerate reason="..."`
-        # ... `// omni-dev: coverage end`, scanned from each revision's own
-        # source. On an older binary a marker comment is inert and nothing
-        # is silenced, so this pin must stay >= 0.43.0. This is what lets
-        # `src/util/simd/x86.rs` mask its CPU-gated `detect_fast_bmi2` flap
-        # (10 lines, net 9 covered, #2449) via an in-source marker instead
-        # of a file-level exclusion.
-        # Bumped to 0.46.0 for #3750: it is the first release with an
-        # `omni-dev-linux-arm64.tar.gz` (0.43.0-0.45.0 ship none), so the ARM64
-        # leg can download the binary instead of a ~4.5 min `cargo install` on
-        # every omni-dev cache miss. It also adds `coverage merge`, which a
-        # sharded run would need with the repeatable `--report` and
-        # `--fail-under-lines` that 0.45.0 added. `coverage diff`
-        # is unchanged for this repo's single-report use: 0.43.0 and 0.46.0
-        # rendered byte-identical markdown and json from the same inputs, over
-        # two pairs of real `main` reports and a third whose patch lines had
-        # their hit counts zeroed by hand to get uncovered lines and a per-file
-        # delta (#3750), and 0.46.0's `coverage lint-markers` accepts every
-        # marker in the tree. Still must stay >= 0.43.0 for the source markers
-        # above.
-        version: 0.46.0
+        # Pin patchcov, not omni-dev (#3873). 0.1.1 carries the extracted
+        # coverage engine: `.patchcov/config.yaml` discovery and the symmetric
+        # ignore list mask popcount's CPU flap (#302); patience diff preserves
+        # patch attribution on repetitive evaluator refactors (#1554); source
+        # coverage `tolerate` / `tolerate-line` / `end` markers mask
+        # runtime CPU and unreachable-line variance (#2467).
+        # It also ships prebuilt Linux x86_64 + ARM64 binaries (#3750), avoiding
+        # cargo install on cache misses, and `patchcov merge` for future shards.
+        # Keep >= 0.1.1 for these capabilities. The migration is verified against
+        # omni-dev 0.46.0 with real main lcov artifacts and mutation checks;
+        # see docs/guides/developer.md "Patchcov migration verification".
+        version: 0.1.1
         use-prebuilt-binary: ${{ inputs.use-prebuilt }}
         test-args: --features cli,simd,regex,serde --workspace
         # #3750: logs how many raw profile files the run left and how big they
@@ -174,7 +149,11 @@ runs:
         # pooling (`pool-profile-files`) whose files are not pooled. While pooling
         # is on this is the only check that it took effect: delete this line and
         # profraw-stats.sh only together with that input.
-        extra-test-commands: bash "${{ github.action_path }}/profraw-stats.sh"
+        # Validate every Rust marker before reporting; documentation examples
+        # are outside this glob and are not executable coverage annotations.
+        extra-test-commands: |
+          patchcov lint-markers --include 'src/**/*.rs'
+          bash "${{ github.action_path }}/profraw-stats.sh"
         fail-under-lines: 55   # floor a few pts below local llvm-cov (ARM: 59.58% lines)
         # fail-under-patch left unset → report-only initially
         # Where the baseline is looked up: the newest *successful* run of this

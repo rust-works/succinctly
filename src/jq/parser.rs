@@ -243,7 +243,7 @@ fn join_expr(mut args: Vec<Expr>) -> Expr {
         (Some(stream), Some(idx_expr), Some(join)) => {
             Expr::Pipe(vec![stream, pair(idx_expr), join])
         }
-        _ => unreachable!("parse_join_expr passes two to four arguments"), // omni-dev: coverage tolerate-line reason="unreachable: parse_join_expr only calls join_expr with two to four arguments (#3046)"
+        _ => unreachable!("parse_join_expr passes two to four arguments"), // patchcov: coverage tolerate-line reason="unreachable: parse_join_expr only calls join_expr with two to four arguments (#3046)"
     };
     Expr::As {
         expr: Box::new(idx),
@@ -265,22 +265,22 @@ pub(crate) fn join_expr_into_args(expr: Expr) -> Result<Vec<Expr>, Expr> {
         Expr::Array(inner) => match *inner {
             Expr::Comma(mut items) => match items.pop() {
                 Some(Expr::IndexExpr { key, .. }) => *key,
-                _ => unreachable!("join_expr's pair is `[., $idx[idx_expr]]`"), // omni-dev: coverage tolerate-line reason="unreachable: join_expr builds only this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
+                _ => unreachable!("join_expr's pair is `[., $idx[idx_expr]]`"), // patchcov: coverage tolerate-line reason="unreachable: join_expr builds only this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
             },
-            _ => unreachable!("join_expr's pair is `[., $idx[idx_expr]]`"), // omni-dev: coverage tolerate-line reason="unreachable: join_expr builds only this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
+            _ => unreachable!("join_expr's pair is `[., $idx[idx_expr]]`"), // patchcov: coverage tolerate-line reason="unreachable: join_expr builds only this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
         },
-        _ => unreachable!("join_expr's pair is `[., $idx[idx_expr]]`"), // omni-dev: coverage tolerate-line reason="unreachable: join_expr builds only this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
+        _ => unreachable!("join_expr's pair is `[., $idx[idx_expr]]`"), // patchcov: coverage tolerate-line reason="unreachable: join_expr builds only this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
     };
     let mut args = alloc::vec![*idx];
     let stages = match *body {
         // JOIN/2: `[.[] | pair]` -- the `.[]` is not an argument.
         Expr::Array(inner) => match *inner {
             Expr::Pipe(stages) => stages.into_iter().skip(1).collect(),
-            _ => unreachable!("join_expr's JOIN/2 body is `[.[] | pair]`"), // omni-dev: coverage tolerate-line reason="unreachable: join_expr builds only this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
+            _ => unreachable!("join_expr's JOIN/2 body is `[.[] | pair]`"), // patchcov: coverage tolerate-line reason="unreachable: join_expr builds only this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
         },
         // JOIN/3: `stream | pair`; JOIN/4: `stream | pair | join_expr`
         Expr::Pipe(stages) => stages,
-        _ => unreachable!("join_expr builds an array or a pipe"), // omni-dev: coverage tolerate-line reason="unreachable: join_expr builds only this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
+        _ => unreachable!("join_expr builds an array or a pipe"), // patchcov: coverage tolerate-line reason="unreachable: join_expr builds only this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
     };
     // The pair stage carries `idx_expr`; every other stage is its own argument.
     for stage in stages {
@@ -310,11 +310,11 @@ pub(crate) fn join_expr_operands_mut<'a>(
         // JOIN/2: `[.[] | pair]` -- the `.[]` is not an argument.
         Expr::Array(inner) => match inner.as_mut() {
             Expr::Pipe(stages) => stages.iter_mut().skip(1).collect(),
-            _ => unreachable!("join_expr's JOIN/2 body is `[.[] | pair]`"), // omni-dev: coverage tolerate-line reason="unreachable: join_expr builds only this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
+            _ => unreachable!("join_expr's JOIN/2 body is `[.[] | pair]`"), // patchcov: coverage tolerate-line reason="unreachable: join_expr builds only this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
         },
         // JOIN/3: `stream | pair`; JOIN/4: `stream | pair | join_expr`
         Expr::Pipe(stages) => stages.iter_mut().collect(),
-        _ => unreachable!("join_expr builds an array or a pipe"), // omni-dev: coverage tolerate-line reason="unreachable: join_expr builds only this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
+        _ => unreachable!("join_expr builds an array or a pipe"), // patchcov: coverage tolerate-line reason="unreachable: join_expr builds only this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
     };
     let mut operands = alloc::vec![idx];
     for stage in stages {
@@ -323,11 +323,11 @@ pub(crate) fn join_expr_operands_mut<'a>(
                 Expr::Array(inner) => match inner.as_mut() {
                     Expr::Comma(items) => match items.last_mut() {
                         Some(Expr::IndexExpr { key, .. }) => key.as_mut(),
-                        _ => unreachable!("join_expr's pair is `[., $idx[idx_expr]]`"), // omni-dev: coverage tolerate-line reason="unreachable: is_join_pair just matched this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
+                        _ => unreachable!("join_expr's pair is `[., $idx[idx_expr]]`"), // patchcov: coverage tolerate-line reason="unreachable: is_join_pair just matched this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
                     },
-                    _ => unreachable!("join_expr's pair is `[., $idx[idx_expr]]`"), // omni-dev: coverage tolerate-line reason="unreachable: is_join_pair just matched this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
+                    _ => unreachable!("join_expr's pair is `[., $idx[idx_expr]]`"), // patchcov: coverage tolerate-line reason="unreachable: is_join_pair just matched this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
                 },
-                _ => unreachable!("join_expr's pair is `[., $idx[idx_expr]]`"), // omni-dev: coverage tolerate-line reason="unreachable: is_join_pair just matched this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
+                _ => unreachable!("join_expr's pair is `[., $idx[idx_expr]]`"), // patchcov: coverage tolerate-line reason="unreachable: is_join_pair just matched this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
             }
         } else {
             stage
@@ -342,7 +342,7 @@ pub(crate) fn join_expr_arity(expr: &Expr) -> Option<usize> {
         Expr::As { var, body, .. } if var == JOIN_IDX_VAR => Some(match body.as_ref() {
             Expr::Array(_) => 2,
             Expr::Pipe(stages) => stages.len() + 1,
-            _ => unreachable!("join_expr builds an array or a pipe"), // omni-dev: coverage tolerate-line reason="unreachable: join_expr builds only this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
+            _ => unreachable!("join_expr builds an array or a pipe"), // patchcov: coverage tolerate-line reason="unreachable: join_expr builds only this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
         }),
         _ => None,
     }
@@ -10221,7 +10221,7 @@ mod tests {
         // let-else/panic boilerplate to get there.
         fn split_literal(src: &str) -> Expr {
             let Expr::Arithmetic { left, right, .. } = parse(src).unwrap() else {
-                panic!("`{src}`: expected an Arithmetic node"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the #3044 pin itself, only formatted if the let-else pattern fails to match (#3044)"
+                panic!("`{src}`: expected an Arithmetic node"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the #3044 pin itself, only formatted if the let-else pattern fails to match (#3044)"
             };
             assert_eq!(*left, Expr::Literal(Literal::Int(-1)), "`{src}`");
             *right

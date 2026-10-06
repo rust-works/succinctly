@@ -1196,7 +1196,7 @@ pub mod alias_identity {
                             redirected.extend(components[i..].iter().cloned());
                             redirect_components(redirected, doc, table, opts, hops + 1, out);
                             return;
-                        } // omni-dev: coverage tolerate-line reason="unreachable: def is always a collect_alias_groups anchor path, which step_to_expr never fails on (#1351)"
+                        } // patchcov: coverage tolerate-line reason="unreachable: def is always a collect_alias_groups anchor path, which step_to_expr never fails on (#1351)"
                     }
                 }
             }
@@ -1217,7 +1217,7 @@ pub mod alias_identity {
         let mut paths = vec![rebuild(components)];
         redirect_paths(&mut paths, doc, Redirect::SINGLE);
         let Some(redirected) = paths.pop() else {
-            return; // omni-dev: coverage tolerate-line reason="unreachable: redirect_paths with Redirect::SINGLE always contributes exactly one output per input, so a 1-element paths always pops Some (#1351)"
+            return; // patchcov: coverage tolerate-line reason="unreachable: redirect_paths with Redirect::SINGLE always contributes exactly one output per input, so a 1-element paths always pops Some (#1351)"
         };
         let mut flat = Vec::new();
         push_path_components(&mut flat, &redirected);
@@ -1226,11 +1226,11 @@ pub mod alias_identity {
             .map(|c| match unwrap_path_component(c).0 {
                 Expr::Field(name) => Some(OwnedValue::String(name.clone().into())),
                 Expr::Index { idx, .. } => Some(OwnedValue::Int(*idx)),
-                _ => None, // omni-dev: coverage tolerate-line reason="unreachable: a concrete setpath/delpaths path's components are always Field/Index -- step_to_expr never produces another shape (#1351)"
+                _ => None, // patchcov: coverage tolerate-line reason="unreachable: a concrete setpath/delpaths path's components are always Field/Index -- step_to_expr never produces another shape (#1351)"
             })
             .collect::<Option<Vec<OwnedValue>>>()
         else {
-            return; // omni-dev: coverage tolerate-line reason="unreachable: the map above never yields None, since it only ever matches Field/Index (#1351)"
+            return; // patchcov: coverage tolerate-line reason="unreachable: the map above never yields None, since it only ever matches Field/Index (#1351)"
         };
         *path = concrete;
     }
@@ -1764,7 +1764,7 @@ fn key_or_parent_placeholder_values<S: EvalSemantics>(expr: &Expr) -> Vec<OwnedV
             .collect(),
         // Unreachable: every caller checks `key_or_parent_root_construct`
         // first, which this function's own match mirrors arm-for-arm.
-        _ => Vec::new(), // omni-dev: coverage tolerate-line reason="unreachable: key_or_parent_root_construct's identical structural match already refused any expr shape that would reach this arm"
+        _ => Vec::new(), // patchcov: coverage tolerate-line reason="unreachable: key_or_parent_root_construct's identical structural match already refused any expr shape that would reach this arm"
     }
 }
 
@@ -2336,11 +2336,11 @@ pub(crate) fn bridge_shared_for_value<S: EvalSemantics, W: Clone + AsRef<[u64]>>
     );
     if !same_kind {
         debug_assert!(
-            // omni-dev: coverage tolerate-line reason="unreachable: same invariant as the tolerated line below (#3069)"
-            same_kind, // omni-dev: coverage tolerate-line reason="unreachable: same invariant as the tolerated line below (#3069)"
+            // patchcov: coverage tolerate-line reason="unreachable: same invariant as the tolerated line below (#3069)"
+            same_kind, // patchcov: coverage tolerate-line reason="unreachable: same invariant as the tolerated line below (#3069)"
             "#3069: bridge provenance names a {shared:?} for another kind"
-        ); // omni-dev: coverage tolerate-line reason="unreachable: a bridge document is its source's serialization, so the node at each recorded position is the recorded kind (#3069)"
-        return None; // omni-dev: coverage tolerate-line reason="unreachable: see the debug_assert above (#3069)"
+        ); // patchcov: coverage tolerate-line reason="unreachable: a bridge document is its source's serialization, so the node at each recorded position is the recorded kind (#3069)"
+        return None; // patchcov: coverage tolerate-line reason="unreachable: see the debug_assert above (#3069)"
     }
     #[cfg(debug_assertions)]
     {
@@ -2386,7 +2386,7 @@ pub(crate) fn bridge_provenance_descend<W: Clone + AsRef<[u64]>>(
                 child = value.next_sibling();
                 (node <= value.subtree_end()?).then_some((field, value))
             })?,
-            _ => return None, // omni-dev: coverage tolerate-line reason="unreachable: a scalar has no children, and `node` lies inside the subtree the walk is in (#3069)"
+            _ => return None, // patchcov: coverage tolerate-line reason="unreachable: a scalar has no children, and `node` lies inside the subtree the walk is in (#3069)"
         };
         if node < cursor.bp_position() {
             return None; // an object key's own node, never a container
@@ -4934,8 +4934,8 @@ where
         if result.is_escape() {
             if let Some(control) = push_owned_values::<_, S>(result, &mut out) {
                 return stop_with_escape(&mut body_control, control);
-            } // omni-dev: coverage tolerate-line reason="unreachable: `is_escape()` is exactly `Error|Break|Halt|Partial`, and `push_owned_values` answers `Some(control)` for every one of those four, so the `None` continuation cannot be reached (#2180)"
-            return Demand::Stop; // omni-dev: coverage tolerate-line reason="unreachable: see the `if let` above -- `push_owned_values` never answers `None` for an `is_escape()` result (#2180)"
+            } // patchcov: coverage tolerate-line reason="unreachable: `is_escape()` is exactly `Error|Break|Halt|Partial`, and `push_owned_values` answers `Some(control)` for every one of those four, so the `None` continuation cannot be reached (#2180)"
+            return Demand::Stop; // patchcov: coverage tolerate-line reason="unreachable: see the `if let` above -- `push_owned_values` never answers `None` for an `is_escape()` result (#2180)"
         }
         if out.is_empty() && pending_first.is_none() {
             pending_first = Some(result);
@@ -6197,7 +6197,7 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // for those regardless of `optional`, so a `?` never swallows
                 // one. Kept so the two routes share one predicate rather than
                 // one of them hard-coding the current answer.
-                Err(e) if suppresses(&e, optional) => return Flow::Exhausted, // omni-dev: coverage tolerate-line reason="unreachable today: to_owned's only failures are is_decode_failure()-tagged, and suppresses() answers false for those whatever `optional` is -- the same defensive-but-dead arm eval_generic's own Builtin::Path materialization documents under #2280 (#2908)"
+                Err(e) if suppresses(&e, optional) => return Flow::Exhausted, // patchcov: coverage tolerate-line reason="unreachable today: to_owned's only failures are is_decode_failure()-tagged, and suppresses() answers false for those whatever `optional` is -- the same defensive-but-dead arm eval_generic's own Builtin::Path materialization documents under #2280 (#2908)"
                 Err(e) => return Flow::Escaped(Control::Error(e)),
             };
             each_path::<W, S>(path_expr, &owned, optional, sink)
@@ -7076,7 +7076,7 @@ fn each_pattern_alternatives<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // at all for a zero-output key, which still wins the chain.
             Flow::Exhausted => return Flow::Exhausted,
             Flow::Stopped { .. } => {
-                unreachable!("outcome recorded before the stop") // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
+                unreachable!("outcome recorded before the stop") // patchcov: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
             }
             // The matcher's own trailing control -- a pattern step's error
             // (a structural mismatch), or the key generator's own
@@ -8458,7 +8458,7 @@ fn each_object_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                                 // See this function's own doc comment: the
                                 // eager `ObjectEscape::None` rule (discard
                                 // everything) is deliberately not reproduced.
-                                return Demand::Continue; // omni-dev: coverage tolerate-line reason="unreachable: `optional` is never `true` here. `eval_each` is entered with a forced `true` at exactly one site (`Expr::Optional` over an `IndexExpr`/`SliceExpr`), and both of those evaluate their target (`eval_index_expr`) and their key (`eval_each(key, .., false)`) with a hardcoded `false`, so only the final index/slice step ever sees it -- nothing carries it down to an `Expr::Object` (#2180)"
+                                return Demand::Continue; // patchcov: coverage tolerate-line reason="unreachable: `optional` is never `true` here. `eval_each` is entered with a forced `true` at exactly one site (`Expr::Optional` over an `IndexExpr`/`SliceExpr`), and both of those evaluate their target (`eval_index_expr`) and their key (`eval_each(key, .., false)`) with a hardcoded `false`, so only the final index/slice step ever sees it -- nothing carries it down to an `Expr::Object` (#2180)"
                             }
                             return escape.stop(Control::Error(
                                 EvalError::cannot_use_as_object_key(&key_owned),
@@ -9667,7 +9667,7 @@ fn write_target_mut(head: &mut Expr) -> Option<&mut Box<Expr>> {
         | Expr::CompoundAssign { path, .. }
         | Expr::AlternativeAssign { path, .. }
         | Expr::Builtin(Builtin::Del(path)) => Some(path),
-        _ => None, // omni-dev: coverage tolerate-line reason="unreachable: owned_write_door calls this only on a clone of a head write_target already matched, and the two list the same five variants (#3188)"
+        _ => None, // patchcov: coverage tolerate-line reason="unreachable: owned_write_door calls this only on a clone of a head write_target already matched, and the two list the same five variants (#3188)"
     }
 }
 
@@ -9681,7 +9681,7 @@ fn write_target_mut(head: &mut Expr) -> Option<&mut Box<Expr>> {
 /// re-spelled.
 fn static_path_expr(path: &OwnedValue) -> Option<Expr> {
     let OwnedValue::Array(components) = path else {
-        return None; // omni-dev: coverage tolerate-line reason="unreachable: every value path_over_owned hands back is a path() output, which is always an array (#3188)"
+        return None; // patchcov: coverage tolerate-line reason="unreachable: every value path_over_owned hands back is a path() output, which is always an array (#3188)"
     };
     let mut steps = components
         .iter()
@@ -9960,7 +9960,7 @@ fn embed_peel_step<S: EvalSemantics>(
             match input {
                 OwnedValue::Array(items) => Ok(items.iter().cloned().collect()),
                 OwnedValue::Object(map) => Ok(map.values().cloned().collect()),
-                _ => return None, // omni-dev: coverage tolerate-line reason="unreachable: any_child_witnessed is false for every non-container, checked just above (#3178)"
+                _ => return None, // patchcov: coverage tolerate-line reason="unreachable: any_child_witnessed is false for every non-container, checked just above (#3178)"
             }
         }
         Expr::Iterate => match input {
@@ -10152,7 +10152,7 @@ impl RestCopy {
         }
         match self {
             Self::Owned(whole) => whole,
-            Self::Unasked | Self::Bare => unreachable!("the owned pipe was just built"), // omni-dev: coverage tolerate-line reason="unreachable: the `if` above replaces every other state with `Owned` before this match"
+            Self::Unasked | Self::Bare => unreachable!("the owned pipe was just built"), // patchcov: coverage tolerate-line reason="unreachable: the `if` above replaces every other state with `Owned` before this match"
         }
     }
 }
@@ -10658,7 +10658,7 @@ pub(crate) fn try_owned_assign_step<S: EvalSemantics>(
     }
     match owned_assign_step::<S>(expr, &mut state) {
         Some(Ok(())) => OwnedStep::Handled(Ok(state)),
-        Some(Err(error)) => OwnedStep::Handled(Err(error)), // omni-dev: coverage tolerate-line reason="reachable only on a genuine allocation failure: owned_assign_step's single-step arms map every non-allocation error to unreachable_owned_assign_write (provably impossible, see its own doc comment), and its Chain arm's set_path call walks exactly the steps owned_assign_step_child already validated as Field-into-Object/Null or Index-in-[0,len]-into-Array/Null with no mutation in between, so the only way set_path/set_field/set_index/pad_with_nulls can still fail is the same try_reserve-fails-under-OOM branch the codebase already tolerates elsewhere (#2267) (#3138)"
+        Some(Err(error)) => OwnedStep::Handled(Err(error)), // patchcov: coverage tolerate-line reason="reachable only on a genuine allocation failure: owned_assign_step's single-step arms map every non-allocation error to unreachable_owned_assign_write (provably impossible, see its own doc comment), and its Chain arm's set_path call walks exactly the steps owned_assign_step_child already validated as Field-into-Object/Null or Index-in-[0,len]-into-Array/Null with no mutation in between, so the only way set_path/set_field/set_index/pad_with_nulls can still fail is the same try_reserve-fails-under-OOM branch the codebase already tolerates elsewhere (#2267) (#3138)"
         None => OwnedStep::Declined(state),
     }
 }
@@ -10778,7 +10778,7 @@ fn owned_assign_shape(expr: &Expr) -> bool {
                     other => closed_expr_shape(other),
                 }
         }
-        _ => false, // omni-dev: coverage tolerate-line reason="unreachable: owned_assign_shape's only caller (owned_step_shape) gates the call on is_owned_assign(expr), which recognizes exactly Assign/Update/CompoundAssign/AlternativeAssign -- the same four variants this match already has explicit arms for, so `expr` can never be anything else here (#3138)"
+        _ => false, // patchcov: coverage tolerate-line reason="unreachable: owned_assign_shape's only caller (owned_step_shape) gates the call on is_owned_assign(expr), which recognizes exactly Assign/Update/CompoundAssign/AlternativeAssign -- the same four variants this match already has explicit arms for, so `expr` can never be anything else here (#3138)"
     }
 }
 
@@ -10978,7 +10978,7 @@ fn owned_assign_step<S: EvalSemantics>(
             path,
             OwnedAssignRhs::Alternative(closed_expr_to_owned::<S>(value)?),
         ),
-        _ => return None, // omni-dev: coverage tolerate-line reason="unreachable: both call sites (try_eval_owned_step, gated on is_owned_assign; eval_owned_reindex_free's own Assign|Update|CompoundAssign|AlternativeAssign arm) only ever hand this function one of the same four variants this match already covers explicitly (#3138)"
+        _ => return None, // patchcov: coverage tolerate-line reason="unreachable: both call sites (try_eval_owned_step, gated on is_owned_assign; eval_owned_reindex_free's own Assign|Update|CompoundAssign|AlternativeAssign arm) only ever hand this function one of the same four variants this match already covers explicitly (#3138)"
     };
 
     // The keys the write names, each settled against the container it lands
@@ -11052,11 +11052,11 @@ fn owned_assign_new_value<S: EvalSemantics>(
 #[cold]
 fn unreachable_owned_assign_write() -> EvalError {
     debug_assert!(
-        false, // omni-dev: coverage tolerate-line reason="unreachable: this function's own doc comment states why -- the borrow on `state` between owned_assign_step_child's check and the single write makes the container changing shape impossible, so debug_assert!(false, ..) can never fire (#3138)"
-        "owned_assign_step wrote into a container it did not check" // omni-dev: coverage tolerate-line reason="unreachable: same invariant as the `false` above -- this message is only ever formatted if that assert fires (#3138)"
+        false, // patchcov: coverage tolerate-line reason="unreachable: this function's own doc comment states why -- the borrow on `state` between owned_assign_step_child's check and the single write makes the container changing shape impossible, so debug_assert!(false, ..) can never fire (#3138)"
+        "owned_assign_step wrote into a container it did not check" // patchcov: coverage tolerate-line reason="unreachable: same invariant as the `false` above -- this message is only ever formatted if that assert fires (#3138)"
     );
-    EvalError::new("internal error: owned assignment target changed shape") // omni-dev: coverage tolerate-line reason="unreachable: this function is only called from owned_assign_step's single-step arms, both of which the invariant above already rules out ever calling it for real (#3138)"
-} // omni-dev: coverage tolerate-line reason="unreachable: the whole function body above is provably dead by the same borrow-checker invariant its doc comment states (#3138)"
+    EvalError::new("internal error: owned assignment target changed shape") // patchcov: coverage tolerate-line reason="unreachable: this function is only called from owned_assign_step's single-step arms, both of which the invariant above already rules out ever calling it for real (#3138)"
+} // patchcov: coverage tolerate-line reason="unreachable: the whole function body above is provably dead by the same borrow-checker invariant its doc comment states (#3138)"
 
 /// One step of an [`owned_assign_step`] path: an object key or an array
 /// index, the two components [`key_to_path_component`] produces for a
@@ -11093,7 +11093,7 @@ fn owned_assign_single_step<S: EvalSemantics>(path: &Expr) -> SingleStep<'_> {
     match path {
         Expr::Paren(inner) => owned_assign_single_step::<S>(inner),
         Expr::Pipe(stages) => match stages.as_slice() {
-            [only] => owned_assign_single_step::<S>(only), // omni-dev: coverage tolerate-line reason="unreachable: Expr::pipe() (the parser's sole Pipe constructor) collapses a one-element list to the bare inner expr instead of wrapping it, and substitute_vars's substitute_var walk preserves a Pipe's stage count rather than dropping stages -- no other site builds an Expr::Pipe for a parsed assignment path, so a path's top-level Pipe here is never single-element (#3138)"
+            [only] => owned_assign_single_step::<S>(only), // patchcov: coverage tolerate-line reason="unreachable: Expr::pipe() (the parser's sole Pipe constructor) collapses a one-element list to the bare inner expr instead of wrapping it, and substitute_vars's substitute_var walk preserves a Pipe's stage count rather than dropping stages -- no other site builds an Expr::Pipe for a parsed assignment path, so a path's top-level Pipe here is never single-element (#3138)"
             _ => SingleStep::Chain,
         },
         Expr::IndexExpr { target, key } if matches!(target.as_ref(), Expr::Identity) => {
@@ -14274,7 +14274,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::PathNoArg => {
             // PathNoArg requires path context which is handled in eval_pipe_with_context
             // When called without context, return empty path (root position)
-            QueryResult::Owned(OwnedValue::array()) // omni-dev: coverage tolerate-line reason="unreachable: every entry point supplies path context, so `path` never evaluates without one; pre-existing zero-hit line; #2999 changed only how its array payload is constructed"
+            QueryResult::Owned(OwnedValue::array()) // patchcov: coverage tolerate-line reason="unreachable: every entry point supplies path context, so `path` never evaluates without one; pre-existing zero-hit line; #2999 changed only how its array payload is constructed"
         }
         // `parent`/`parent(n)` with no path context at all is the root
         // position: there is no ancestor to return. Same #2460 rule, and the
@@ -14407,7 +14407,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::SortKeysOneLevel => {
             let owned = match to_owned::<S, _>(&value) {
                 Ok(v) => v,
-                Err(e) => return suppress_or_raise(e, optional), // omni-dev: coverage tolerate-line reason="unreachable: only ever constructed by builtin_sort_keys's own eval_update_no_vivify call, whose enclosing eval_update_impl already runs to_owned on the whole document up front (#2855) -- a decode failure anywhere raises there, before this filter ever sees a value to re-decode; confirmed live, `sort_keys(.a)`/`sort_keys(..)` on a document with a decode-failure subtree both raise from the outer to_owned"
+                Err(e) => return suppress_or_raise(e, optional), // patchcov: coverage tolerate-line reason="unreachable: only ever constructed by builtin_sort_keys's own eval_update_no_vivify call, whose enclosing eval_update_impl already runs to_owned on the whole document up front (#2855) -- a decode failure anywhere raises there, before this filter ever sees a value to re-decode; confirmed live, `sort_keys(.a)`/`sort_keys(..)` on a document with a decode-failure subtree both raise from the outer to_owned"
             };
             match owned {
                 OwnedValue::Object(obj) => {
@@ -14550,9 +14550,9 @@ fn builtin_length<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // A value the index could not read (`1.2.3`, #3222; `tru`, #3035)
         // raises as the document fault it is, ahead of `?` -- not as
         // `null (null) has no length`, which `try` would catch.
-        // omni-dev: coverage tolerate reason="unreachable: builtin_length's sole caller is eval_builtin's `Builtin::Length` dispatch, and `Length` is in `builtin_operand_is_input`, so eval_builtin's own top-of-function guard already returns the identical decode_failure for an Error value before this match ever runs; kept as this function's own contract in case a future caller reaches it directly (#3222)"
+        // patchcov: coverage tolerate reason="unreachable: builtin_length's sole caller is eval_builtin's `Builtin::Length` dispatch, and `Length` is in `builtin_operand_is_input`, so eval_builtin's own top-of-function guard already returns the identical decode_failure for an Error value before this match ever runs; kept as this function's own contract in case a future caller reaches it directly (#3222)"
         StandardJson::Error(reason) => QueryResult::Error(EvalError::decode_failure(*reason)),
-        // omni-dev: coverage end
+        // patchcov: coverage end
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::has_no_length(&to_owned_lossy::<S, _>(&value))),
     }
@@ -14773,9 +14773,9 @@ fn has_one_key<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // hold unchanged either way. jq keeps erroring here (`Cannot check
         // whether <container> has a <key> key`, which is correct and
         // unaffected).
-        // omni-dev: coverage tolerate reason="unreachable: has_one_key's sole caller is builtin_has (via eval_builtin's `Builtin::Has` dispatch), and `Has` is in `builtin_operand_is_input`, so eval_builtin's own top-of-function guard already returns the identical decode_failure for an Error value before builtin_has ever runs; kept as this function's own contract in case a future caller reaches it directly (#3222)"
+        // patchcov: coverage tolerate reason="unreachable: has_one_key's sole caller is builtin_has (via eval_builtin's `Builtin::Has` dispatch), and `Has` is in `builtin_operand_is_input`, so eval_builtin's own top-of-function guard already returns the identical decode_failure for an Error value before builtin_has ever runs; kept as this function's own contract in case a future caller reaches it directly (#3222)"
         (StandardJson::Error(reason), _) => QueryResult::Error(EvalError::decode_failure(*reason)),
-        // omni-dev: coverage end
+        // patchcov: coverage end
         _ if has_type_mismatch_is_permissive::<S>() => QueryResult::Owned(OwnedValue::Bool(false)),
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_check_has(
@@ -18060,7 +18060,7 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // rather than being silently substituted with JSON's `"null"` (#561).
         let entry_doc = match entry.reindexed::<S>() {
             Ok(doc) => doc,
-            Err(e) => return QueryResult::Error(e), // omni-dev: coverage tolerate-line reason="unreachable: entry is one of to_entries's already-materialized {key,value} pairs, so its depth here is provably no deeper than whatever earlier check let it exist -- a document-decoded entry is already <256 deep (MAX_NESTING_DEPTH, stricter than this 384 guard), and a filter-constructed one already survived becoming a cursor via its own whole-object reindex, which is strictly deeper than any single field extracted from it could be (unwrapping only reduces depth); confirmed live, {a: (reduce range(400) as $i (0; [.]))} | with_entries(.) fails one step earlier at the whole-object bridge, never here (#3261)"
+            Err(e) => return QueryResult::Error(e), // patchcov: coverage tolerate-line reason="unreachable: entry is one of to_entries's already-materialized {key,value} pairs, so its depth here is provably no deeper than whatever earlier check let it exist -- a document-decoded entry is already <256 deep (MAX_NESTING_DEPTH, stricter than this 384 guard), and a filter-constructed one already survived becoming a cursor via its own whole-object reindex, which is strictly deeper than any single field extracted from it could be (unwrapping only reduces depth); confirmed live, {a: (reduce range(400) as $i (0; [.]))} | with_entries(.) fails one step earlier at the whole-object bridge, never here (#3261)"
         };
         let cursor = entry_doc.root();
 
@@ -25922,7 +25922,7 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `terminal` before returning `Demand::Stop` -- so `terminal` would
         // already be `Some` and the check above would already have
         // returned.
-        Flow::Stopped { .. } => unreachable!("sink always sets `terminal` before Demand::Stop"), // omni-dev: coverage tolerate-line reason="unreachable: escape_with_prefix! sets `terminal` before Demand::Stop; already returned above (#2138)"
+        Flow::Stopped { .. } => unreachable!("sink always sets `terminal` before Demand::Stop"), // patchcov: coverage tolerate-line reason="unreachable: escape_with_prefix! sets `terminal` before Demand::Stop; already returned above (#2138)"
         // #2326: the key stream's own escape -- real jq's key-outer/
         // target-inner model indexes each already-produced key as it flows
         // out, so `key`'s own escaped generator's prefix is real jq output
@@ -26018,17 +26018,17 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut refused = false;
     let flow = each_slice_expr::<W, S>(target, start, end, value, optional, &mut |v| {
         if out.try_reserve(1).is_err() {
-            refused = true; // omni-dev: coverage tolerate-line reason="unreachable in a test: needs the allocator to refuse a one-element growth of the collector (#1634)"
-            return Demand::Stop; // omni-dev: coverage tolerate-line reason="unreachable in a test: see the line above (#1634)"
+            refused = true; // patchcov: coverage tolerate-line reason="unreachable in a test: needs the allocator to refuse a one-element growth of the collector (#1634)"
+            return Demand::Stop; // patchcov: coverage tolerate-line reason="unreachable in a test: see the line above (#1634)"
         }
         out.push(v);
         Demand::Continue
     });
     if refused {
-        // omni-dev: coverage tolerate reason="unreachable in a test: needs the allocator to refuse a one-element growth of the collector (#1634)"
+        // patchcov: coverage tolerate reason="unreachable in a test: needs the allocator to refuse a one-element growth of the collector (#1634)"
         let refusal = cannot_reserve_cross_product(&[out.len().saturating_add(1)]);
         return partial(out, Control::Error(refusal));
-        // omni-dev: coverage end
+        // patchcov: coverage end
     }
     match flow {
         // An empty `start` stream never evaluated `end` or the target at
@@ -26043,12 +26043,12 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // debug build, so a driver that regresses into a stale stop fails the
         // suite instead of truncating the slice unseen.
         Flow::Stopped { .. } => {
-            // omni-dev: coverage tolerate reason="unreachable: every consumer that records a wrapping stop resets it per invocation (#3293), so a stash-less Stopped needs one that regresses"
+            // patchcov: coverage tolerate reason="unreachable: every consumer that records a wrapping stop resets it per invocation (#3293), so a stash-less Stopped needs one that regresses"
             if cfg!(debug_assertions) {
                 unreachable!("a stash-less Stopped reached the slice collector (#3293)");
             }
             owned_vec_to_result(out)
-            // omni-dev: coverage end
+            // patchcov: coverage end
         }
         // #1528: `start`'s own trailing escape still has to reach the final
         // result -- a successful pull doesn't mean `start` itself didn't
@@ -28127,7 +28127,7 @@ pub fn eval_documents_together<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         .collect::<Result<Vec<_>, _>>()
     {
         Ok(docs) => docs,
-        Err(e) => return QueryResult::Error(e), // omni-dev: coverage tolerate-line reason="unreachable via --eval-all: every document here comes straight from parse_input, whose own MAX_NESTING_DEPTH (256) guard already rejects anything deep enough to reach MAX_VALUE_TREE_DEPTH (384) here -- confirmed live, a 300-level document fails parse_input's guard before ever reaching this reindex (#3261)"
+        Err(e) => return QueryResult::Error(e), // patchcov: coverage tolerate-line reason="unreachable via --eval-all: every document here comes straight from parse_input, whose own MAX_NESTING_DEPTH (256) guard already rejects anything deep enough to reach MAX_VALUE_TREE_DEPTH (384) here -- confirmed live, a 300-level document fails parse_input's guard before ever reaching this reindex (#3261)"
     };
     let inputs: Vec<YqDocument<_>> = documents
         .iter()
@@ -28458,7 +28458,7 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Some(YqAssignTargets { doc, paths, .. }) => (doc, paths),
         // jq mode never reaches here (#3448): `yq_prepare_assign_targets` is
         // `Some` in every yq call, and jq is `each_assign`.
-        None => unreachable!("jq mode's `=` is `each_assign` (#3448)"), // omni-dev: coverage tolerate-line reason="unreachable: eval_assign returns collect_assign for JqSemantics before this point, and yq_prepare_assign_targets is Some for every YqSemantics call (#3448)"
+        None => unreachable!("jq mode's `=` is `each_assign` (#3448)"), // patchcov: coverage tolerate-line reason="unreachable: eval_assign returns collect_assign for JqSemantics before this point, and yq_prepare_assign_targets is Some for every YqSemantics call (#3448)"
     };
 
     // `=` has no filter of its own: `write_one` writes `value` directly via
@@ -30051,7 +30051,7 @@ fn eval_update_multi<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // splices into.
         Some(YqAssignTargets { doc, paths, .. }) => (doc, paths),
         // jq mode never reaches here (#3448): see `eval_assign`.
-        None => unreachable!("jq mode's `op=`/`//=` is `each_assign` (#3448)"), // omni-dev: coverage tolerate-line reason="unreachable: eval_compound_assign/eval_alternative_assign return collect_assign for JqSemantics before this point, and yq_prepare_assign_targets is Some for every YqSemantics call (#3448)"
+        None => unreachable!("jq mode's `op=`/`//=` is `each_assign` (#3448)"), // patchcov: coverage tolerate-line reason="unreachable: eval_compound_assign/eval_alternative_assign return collect_assign for JqSemantics before this point, and yq_prepare_assign_targets is Some for every YqSemantics call (#3448)"
     };
     let scalar_noop = scalar_slice_noop && S::TAG == EvalTag::Yq;
     // #1351: a compound/alternative assign whose path *ends* at an alias
@@ -30378,10 +30378,10 @@ fn each_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         let value = match item.into_owned::<S>() {
             Ok(value) => value,
             Err(e) if suppresses(&e, optional) => {
-                // omni-dev: coverage tolerate reason="unreachable: a materialization only ever raises a decode failure, which `suppresses` never swallows -- `debug_assert_materialization_error` (#2334) asserts exactly that; kept so the one classification rule is applied here as at every sibling `to_owned` site (#1953, #3448)"
+                // patchcov: coverage tolerate reason="unreachable: a materialization only ever raises a decode failure, which `suppresses` never swallows -- `debug_assert_materialization_error` (#2334) asserts exactly that; kept so the one classification rule is applied here as at every sibling `to_owned` site (#1953, #3448)"
                 swallowed = true;
                 return Demand::Stop;
-                // omni-dev: coverage end
+                // patchcov: coverage end
             }
             Err(e) => return parked.stop(Control::Error(e)),
         };
@@ -30391,10 +30391,10 @@ fn each_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         let pristine = match pristine {
             Ok(pristine) => pristine,
             Err(e) if suppresses(&e, optional) => {
-                // omni-dev: coverage tolerate reason="unreachable: `assign_pristine` is `to_owned`, which only ever raises a decode failure (#2334's `debug_assert_materialization_error`), and `suppresses` never swallows one; kept so the one classification rule is applied here as at every sibling `to_owned` site (#1953, #3448)"
+                // patchcov: coverage tolerate reason="unreachable: `assign_pristine` is `to_owned`, which only ever raises a decode failure (#2334's `debug_assert_materialization_error`), and `suppresses` never swallows one; kept so the one classification rule is applied here as at every sibling `to_owned` site (#1953, #3448)"
                 swallowed = true;
                 return Demand::Stop;
-                // omni-dev: coverage end
+                // patchcov: coverage end
             }
             Err(e) => return parked.stop(Control::Error(e)),
         };
@@ -30529,7 +30529,7 @@ fn assign_one<S: EvalSemantics>(
                 let value = if i == last_path {
                     core::mem::replace(&mut value, OwnedValue::Null)
                 } else {
-                    value.clone() // omni-dev: coverage tolerate-line reason="unreachable: the eager route runs only when the path resolves to at most one path -- `needs_path_prepass` false is one verbatim path, and true with `resolves_to_at_most_one_path` is at most one resolved path (#2976) -- so no path is ever followed by another; kept as the loop's own contract (#3448)"
+                    value.clone() // patchcov: coverage tolerate-line reason="unreachable: the eager route runs only when the path resolves to at most one path -- `needs_path_prepass` false is one verbatim path, and true with `resolves_to_at_most_one_path` is at most one resolved path (#2976) -- so no path is ever followed by another; kept as the loop's own contract (#3448)"
                 };
                 set_path::<S>(&mut result, path, value, false, false)?;
             }
@@ -31610,7 +31610,7 @@ fn slice_has_non_integer_bound(
         // likewise only resolves over a `null` target.
         Some(SliceBoundKey::Verbatim(desc)) => match &**desc {
             OwnedValue::Object(desc) => SliceBounds::from_descriptor(desc).is_err(),
-            _ => false, // omni-dev: coverage tolerate-line reason="unreachable: descriptor_path_component builds a Verbatim key only from an object (#3300)"
+            _ => false, // patchcov: coverage tolerate-line reason="unreachable: descriptor_path_component builds a Verbatim key only from an object (#3300)"
         },
         Some(SliceBoundKey::Number(_)) | None => false,
     };
@@ -32179,7 +32179,7 @@ fn fresh_run_pos<'a>(pos: Option<&UpdatePos<'a>>, fresh: &[Expr]) -> Option<Upda
     let mut components = vec_with_capacity(fresh.len());
     for step in fresh {
         match unwrap_path_component(step).0 {
-            Expr::Field(name) => components.push(OwnedValue::String(name.clone().into())), // omni-dev: coverage tolerate-line reason="pre-existing zero-hit line; #3191 changed only how its string payload is constructed"
+            Expr::Field(name) => components.push(OwnedValue::String(name.clone().into())), // patchcov: coverage tolerate-line reason="pre-existing zero-hit line; #3191 changed only how its string payload is constructed"
             Expr::Index { idx, .. } if *idx >= 0 => components.push(OwnedValue::Int(*idx)),
             _ => return None,
         }
@@ -35524,7 +35524,7 @@ fn anchored_identical(marker: &Tracked, frame: &Frame) -> bool {
         return false;
     };
     if steps.is_empty() {
-        return false; // omni-dev: coverage tolerate-line reason="unreachable: an anchor is always a proper ancestor, so it records at least one step (#3134)"
+        return false; // patchcov: coverage tolerate-line reason="unreachable: an anchor is always a proper ancestor, so it records at least one step (#3134)"
     }
     let Some(root) = invocation_roots::get(frame.invocation) else {
         return false;
@@ -36775,14 +36775,14 @@ fn collect_resolved<'a>(
     let mut reserve_failed = false;
     let flow = resolve(&mut |branch| {
         if out.try_reserve(1).is_err() {
-            reserve_failed = true; // omni-dev: coverage tolerate-line reason="reachable only on a genuine allocation failure: `Vec::try_reserve(1)` on a vector that has spare capacity, or can grow, cannot fail -- this is the whole purpose of the branch, converting an OOM into a catchable error rather than an abort (ADR-0018's 'would take the host process down' exception). The pre-#2267 form of the same guard, `out.try_reserve(branches.len())` in `resolve_index_expr`/`resolve_slice_expr`, was 0-hit for the identical reason (#2267)"
-            return Demand::Stop; // omni-dev: coverage tolerate-line reason="see the line above -- the `Demand::Stop` half of the same allocation-failure-only branch (#2267)"
+            reserve_failed = true; // patchcov: coverage tolerate-line reason="reachable only on a genuine allocation failure: `Vec::try_reserve(1)` on a vector that has spare capacity, or can grow, cannot fail -- this is the whole purpose of the branch, converting an OOM into a catchable error rather than an abort (ADR-0018's 'would take the host process down' exception). The pre-#2267 form of the same guard, `out.try_reserve(branches.len())` in `resolve_index_expr`/`resolve_slice_expr`, was 0-hit for the identical reason (#2267)"
+            return Demand::Stop; // patchcov: coverage tolerate-line reason="see the line above -- the `Demand::Stop` half of the same allocation-failure-only branch (#2267)"
         }
         out.push(branch);
         Demand::Continue
     });
     if reserve_failed {
-        return Err((out, cannot_reserve_cross_product(&[1]).into())); // omni-dev: coverage tolerate-line reason="reachable only when the `try_reserve` above failed, i.e. only on a genuine allocation failure (#2267)"
+        return Err((out, cannot_reserve_cross_product(&[1]).into())); // patchcov: coverage tolerate-line reason="reachable only when the `try_reserve` above failed, i.e. only on a genuine allocation failure (#2267)"
     }
     match flow {
         ResolveFlow::Exhausted | ResolveFlow::Stopped => Ok(out),
@@ -39676,7 +39676,7 @@ fn builtin_navigation<S: EvalSemantics>(
             Ok(OwnedValue::Float(len)) => Ok(Some(BuiltinNavigation::Access(OwnedValue::Float(
                 len - 1.0,
             )))),
-            Ok(_) => unreachable!("owned_value_jq_length only ever returns Int or Float"), // omni-dev: coverage tolerate-line reason="unreachable: owned_value_jq_length's own match only ever constructs OwnedValue::Int or OwnedValue::Float, checked just above this arm (#2744)"
+            Ok(_) => unreachable!("owned_value_jq_length only ever returns Int or Float"), // patchcov: coverage tolerate-line reason="unreachable: owned_value_jq_length's own match only ever constructs OwnedValue::Int or OwnedValue::Float, checked just above this arm (#2744)"
             Err(e) => Err(EvalEscape::Error(e)),
         },
         _ => Ok(None),
@@ -40444,7 +40444,7 @@ fn resolve_leaf_bounded<'a, S: EvalSemantics>(
         // evaluation of `expr` already ran the candidate that halted, side
         // effects included, by the time control reaches here.
         if let Some(EvalEscape::Halt(code)) = &trailing {
-            return Some(Err((Vec::new(), EvalEscape::Halt(*code)))); // omni-dev: coverage tolerate-line reason="unreachable: `is_primitive` admits only Identity/Field/Index/Slice, and of those only a Slice's computed bounds can halt -- all four have their own arm in `resolve_node_sink`/`resolve_node_eager`, so none reaches this function. Pre-existing; #2694 only wrapped the return in `Some` (#2694)"
+            return Some(Err((Vec::new(), EvalEscape::Halt(*code)))); // patchcov: coverage tolerate-line reason="unreachable: `is_primitive` admits only Identity/Field/Index/Slice, and of those only a Slice's computed bounds can halt -- all four have their own arm in `resolve_node_sink`/`resolve_node_eager`, so none reaches this function. Pre-existing; #2694 only wrapped the return in `Some` (#2694)"
         }
         let mut components = Vec::new();
         push_path_components(&mut components, expr);
@@ -40478,7 +40478,7 @@ fn resolve_leaf_bounded<'a, S: EvalSemantics>(
             // that invariant ever changes, mirroring the resolver's existing
             // "no general bytecode path tracking" wording (#412).
             _ => Err((
-                // omni-dev: coverage tolerate-line reason="unreachable, as this arm's own comment above says: indexing or slicing a value yields zero or one result, so `is_primitive` never produces more than one -- kept as a named error rather than a panic. Pre-existing; #2694 only wrapped the enclosing return in `Some` (#2694)"
+                // patchcov: coverage tolerate-line reason="unreachable, as this arm's own comment above says: indexing or slicing a value yields zero or one result, so `is_primitive` never produces more than one -- kept as a named error rather than a panic. Pre-existing; #2694 only wrapped the enclosing return in `Some` (#2694)"
                 Vec::new(),
                 EvalError::new("Cannot use a computed index after a multi-output path component")
                     .into(),
@@ -41196,7 +41196,7 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
             }
             let Some(last) = stages.len().checked_sub(1) else {
                 // `cond` flattened to nothing: it is the branch itself.
-                return decide(branch); // omni-dev: coverage tolerate-line reason="unreachable: a cond that flattens to no stages is `.` or a pipe of `.`, which cannot_move_register admits, so it never takes the live route (#3757); the debug_assert where `stages` is built fails a test build that breaks that"
+                return decide(branch); // patchcov: coverage tolerate-line reason="unreachable: a cond that flattens to no stages is `.` or a pipe of `.`, which cannot_move_register admits, so it never takes the live route (#3757); the debug_assert where `stages` is built fails a test build that breaks that"
             };
             match resolve_seq_stage::<S>(
                 &stages,
@@ -45530,7 +45530,7 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                 // is `[]`, `$z` never tried).
                 Flow::Exhausted => break,
                 Flow::Stopped { .. } => {
-                    unreachable!("outcome recorded before the stop") // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
+                    unreachable!("outcome recorded before the stop") // patchcov: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
                 }
                 // The walk's own refusal (a pattern step), or the key
                 // generator's own trailing control -- given the same
@@ -47048,7 +47048,7 @@ fn settle_fold_alternative<S: EvalSemantics>(
     match walk {
         Flow::Exhausted => FoldStepOutcome::Return(Demand::Continue),
         Flow::Stopped { .. } => {
-            unreachable!("outcome recorded before the stop") // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, returned just above (#2872)"
+            unreachable!("outcome recorded before the stop") // patchcov: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, returned just above (#2872)"
         }
         Flow::Escaped(control) => {
             // Asked only of a refusal that could retry: the by-value walk inside
@@ -47839,7 +47839,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                     FoldStepOutcome::Return(demand) => return demand,
                 }
             }
-            unreachable!("the last alternative always returns") // omni-dev: coverage tolerate-line reason="unreachable: every arm of the loop's last iteration returns -- a walk refusal, an exhausted walk, and a step outcome that never retries on the last alternative (#2979, #2872)"
+            unreachable!("the last alternative always returns") // patchcov: coverage tolerate-line reason="unreachable: every arm of the loop's last iteration returns -- a walk refusal, an exhausted walk, and a step outcome that never retries on the last alternative (#2979, #2872)"
         });
         if let Some(control) =
             reclaim_fold_escape(aborted, source_flow, direct_pattern_retry(input))
@@ -48361,7 +48361,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                     FoldStepOutcome::Return(demand) => return demand,
                 }
             }
-            unreachable!("the last alternative always returns") // omni-dev: coverage tolerate-line reason="unreachable: every path through the loop's last iteration returns -- a walk refusal, an exhausted walk, and a step outcome that never retries on the last alternative (#2979, #2872)"
+            unreachable!("the last alternative always returns") // patchcov: coverage tolerate-line reason="unreachable: every path through the loop's last iteration returns -- a walk refusal, an exhausted walk, and a step outcome that never retries on the last alternative (#2979, #2872)"
         });
         // The source stream's own trailing control belongs to this fork
         // too, applied after its own inner drive — mirrors `eval_foreach`'s
@@ -51493,7 +51493,7 @@ fn eval_static_component_fallback<S: EvalSemantics>(
         values.len() <= 1,
         "eval_static_component_fallback: {component:?} produced {} outputs, but every \
          caller requires a single-valued tail (see needs_fanout_pass)",
-        values.len() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- a panic-message format argument for the #682 single-valued-tail pin, evaluated only if that assert's own condition is false (#2190)"
+        values.len() // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- a panic-message format argument for the #682 single-valued-tail pin, evaluated only if that assert's own condition is false (#2190)"
     );
     Ok(match values.len() {
         1 => Some(values.pop().expect("len checked")),
@@ -51570,7 +51570,7 @@ impl WalkNode<'_> {
     fn field(&self, name: &str) -> Self {
         self.pick(|value| match value {
             OwnedValue::Object(map) => map.get(name),
-            _ => None, // omni-dev: coverage tolerate-line reason="unreachable: the only caller reaches this after classify_static_component answered Field for this same value, which it does only for an object (#2190)"
+            _ => None, // patchcov: coverage tolerate-line reason="unreachable: the only caller reaches this after classify_static_component answered Field for this same value, which it does only for an object (#2190)"
         })
     }
 
@@ -51614,7 +51614,7 @@ fn slot_of(value: &OwnedValue, slot: usize) -> Option<&OwnedValue> {
     match value {
         OwnedValue::Object(map) => map.get_index(slot).map(|(_, child)| child),
         OwnedValue::Array(items) => items.get(slot),
-        _ => None, // omni-dev: coverage tolerate-line reason="unreachable: both callers establish the container first -- navigate_static_component_ref via classify_static_component's Index arm, and walk_path's Expr::Iterate arm by matching on the container itself (#2190)"
+        _ => None, // patchcov: coverage tolerate-line reason="unreachable: both callers establish the container first -- navigate_static_component_ref via classify_static_component's Index arm, and walk_path's Expr::Iterate arm by matching on the container itself (#2190)"
     }
 }
 
@@ -54563,7 +54563,7 @@ fn try_reduce_step_alternatives<S: EvalSemantics>(
             // is untouched, and the alternative still wins).
             Flow::Exhausted => return (state, None),
             Flow::Stopped { .. } => {
-                unreachable!("outcome recorded before the stop") // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
+                unreachable!("outcome recorded before the stop") // patchcov: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
             }
             // A pattern-match failure leaves `state` where the steps already
             // run left it (untouched when none ran, since UPDATE never ran)
@@ -56271,7 +56271,7 @@ pub(crate) fn stop_with_error(slot: &mut Option<EvalError>, error: EvalError) ->
     let demand = stop_with_escape(&mut control, Control::Error(error));
     match control {
         Some(Control::Error(error)) => *slot = Some(error),
-        _ => unreachable!("stop_with_escape stores exactly the control it was handed"), // omni-dev: coverage tolerate-line reason="unreachable: stop_with_escape's only write is `slot.set(Some(control))` with the control it was handed, which is always the `Control::Error` built one line above (#2180)"
+        _ => unreachable!("stop_with_escape stores exactly the control it was handed"), // patchcov: coverage tolerate-line reason="unreachable: stop_with_escape's only write is `slot.set(Some(control))` with the control it was handed, which is always the `Control::Error` built one line above (#2180)"
     }
     demand
 }
@@ -56952,7 +56952,7 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                         match update_flow {
                             Flow::Exhausted => Demand::Continue,
                             Flow::Stopped { .. } => {
-                                unreachable!("outcome recorded first") // omni-dev: coverage tolerate-line reason="unreachable: on_update records a `step_outcome` before every Demand::Stop it answers, and the fallback match runs only when it recorded none (#2872)"
+                                unreachable!("outcome recorded first") // patchcov: coverage tolerate-line reason="unreachable: on_update records a `step_outcome` before every Demand::Stop it answers, and the fallback match runs only when it recorded none (#2872)"
                             }
                             Flow::Escaped(control) if is_retryable_control(&control, is_last) => {
                                 outcome_at = pipe_retry_generation();
@@ -56992,7 +56992,7 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
             // Every step ran to completion (none, for a zero-output key).
             Flow::Exhausted => return (state, Flow::Exhausted),
             Flow::Stopped { .. } => {
-                unreachable!("outcome recorded before the stop") // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
+                unreachable!("outcome recorded before the stop") // patchcov: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
             }
             // A pattern-match failure (a step's error), or the key
             // generator's own trailing error/break/halt after the steps its
@@ -57560,7 +57560,7 @@ fn finish_fold_forks(
         Some(Flow::Escaped(control)) => finish_fork_flow(Some(control), optional),
         Some(Flow::Exhausted) => {
             unreachable!("a fork verdict is never Exhausted: the per-fork match routes only Stopped/Escaped into `terminal`")
-            // omni-dev: coverage tolerate-line reason="unreachable by construction: the per-fork match only ever hands stop_with_downstream a non-Exhausted flow, so `terminal` can never hold Exhausted (#2899)"
+            // patchcov: coverage tolerate-line reason="unreachable by construction: the per-fork match only ever hands stop_with_downstream a non-Exhausted flow, so `terminal` can never hold Exhausted (#2899)"
         }
         None => match init_flow {
             Flow::Exhausted | Flow::Stopped { .. } => finish_fork_flow(None, optional),
@@ -59889,7 +59889,7 @@ fn eval_path_context_pipe_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
             return QueryResult::ManyOwned(values);
         }
-    } // omni-dev: coverage tolerate-line reason="llvm-cov line-attribution artifact, not unreachable: the new gate test above (`Builtin::Length` as `first`) demonstrably takes `key_or_parent_root_construct(first) == false` and falls through to the reindex-bridge route below, passing -- but this closing brace, like the one at #56920 for the same reason, is never itself credited a hit"
+    } // patchcov: coverage tolerate-line reason="llvm-cov line-attribution artifact, not unreachable: the new gate test above (`Builtin::Length` as `first`) demonstrably takes `key_or_parent_root_construct(first) == false` and falls through to the reindex-bridge route below, passing -- but this closing brace, like the one at #56920 for the same reason, is never itself credited a hit"
 
     if !reindex_bridge_is_identity(owned) {
         if let Some(result) =
@@ -59903,7 +59903,7 @@ fn eval_path_context_pipe_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // same `to_json_for_reindex` (not `to_json`) for the same reason (#561).
     let doc = match owned.reindexed::<S>() {
         Ok(doc) => doc,
-        Err(e) => return QueryResult::Error(e), // omni-dev: coverage tolerate-line reason="unreachable in the current test suite: eval_path_context_pipe_owned itself has zero total call-site coverage today (not just this arm), confirmed by a full-suite eprintln probe across every test binary -- reaching its error arm needs first solving how to reach the function at all, out of scope for #3261's reindex-bridge fix"
+        Err(e) => return QueryResult::Error(e), // patchcov: coverage tolerate-line reason="unreachable in the current test suite: eval_path_context_pipe_owned itself has zero total call-site coverage today (not just this arm), confirmed by a full-suite eprintln probe across every test binary -- reaching its error arm needs first solving how to reach the function at all, out of scope for #3261's reindex-bridge fix"
     };
     let cursor = doc.root();
 
@@ -60977,13 +60977,13 @@ fn get_value_at_path(value: &OwnedValue, path: &[OwnedValue]) -> Option<OwnedVal
         // mode.
         (OwnedValue::Object(desc), OwnedValue::Array(arr)) => {
             let bounds = SliceBounds::from_descriptor(desc).ok()?;
-            let sliced = OwnedValue::Array(arr[bounds.resolve(arr.len())].to_vec().into()); // omni-dev: coverage tolerate-line reason="pre-existing zero-hit line; #2999 changed only how its array payload is constructed"
+            let sliced = OwnedValue::Array(arr[bounds.resolve(arr.len())].to_vec().into()); // patchcov: coverage tolerate-line reason="pre-existing zero-hit line; #2999 changed only how its array payload is constructed"
             get_value_at_path(&sliced, &path[1..])
         }
         (OwnedValue::Object(desc), OwnedValue::String(s)) => {
             let bounds = SliceBounds::from_descriptor(desc).ok()?;
             let range = bounds.resolve(s.chars().count());
-            let sliced = OwnedValue::String(slice::slice_str(s, range).into()); // omni-dev: coverage tolerate-line reason="pre-existing zero-hit line; #3191 changed only how its string payload is constructed"
+            let sliced = OwnedValue::String(slice::slice_str(s, range).into()); // patchcov: coverage tolerate-line reason="pre-existing zero-hit line; #3191 changed only how its string payload is constructed"
             get_value_at_path(&sliced, &path[1..])
         }
         (OwnedValue::Object(desc), OwnedValue::Object(map)) => {
@@ -63103,7 +63103,7 @@ fn peek_static_prefix<'a>(
     for component in prefix {
         current = match (component, current) {
             (Expr::Field(name), OwnedValue::Object(map)) => map.get(name).unwrap_or(NULL_VALUE),
-            (Expr::Field(_), OwnedValue::Null) => NULL_VALUE, // omni-dev: coverage tolerate-line reason="pre-existing zero-hit line; #2999 changed only which null constant it names"
+            (Expr::Field(_), OwnedValue::Null) => NULL_VALUE, // patchcov: coverage tolerate-line reason="pre-existing zero-hit line; #2999 changed only which null constant it names"
             (Expr::Index { idx, .. }, OwnedValue::Array(items)) => {
                 let resolved = if *idx < 0 {
                     items.len() as i64 + idx
@@ -65519,10 +65519,10 @@ fn builtin_mktime<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     let timestamp = match jq_timegm_secs(year, month, day, hour, minute, second) {
         Ok(Some(t)) => t,
-        Ok(None) if optional => return QueryResult::None, // omni-dev: coverage tolerate-line reason="`?` suppresses mktime's error outside builtin dispatch, so the optional flag is false even for an invalid date (#3083)"
+        Ok(None) if optional => return QueryResult::None, // patchcov: coverage tolerate-line reason="`?` suppresses mktime's error outside builtin dispatch, so the optional flag is false even for an invalid date (#3083)"
         Ok(None) => return QueryResult::Error(EvalError::new("invalid gmtime representation")),
         Err(_) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e), // omni-dev: coverage tolerate-line reason="unreachable for mktime's C-int-clamped fields: checked civil-date arithmetic stays within i64; the guard protects other callers of the shared helpers (#3083)"
+        Err(e) => return QueryResult::Error(e), // patchcov: coverage tolerate-line reason="unreachable for mktime's C-int-clamped fields: checked civil-date arithmetic stays within i64; the guard protects other callers of the shared helpers (#3083)"
     };
 
     QueryResult::Owned(OwnedValue::Float(timestamp as f64))
@@ -65711,10 +65711,10 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // `get_float_value_with` (pre-existing, not new to this
             // extraction, #3068).
             } else if optional {
-                return Err(QueryResult::None); // omni-dev: coverage tolerate-line reason="defensive, unreachable via ordinary JSON parsing (#3068)"
+                return Err(QueryResult::None); // patchcov: coverage tolerate-line reason="defensive, unreachable via ordinary JSON parsing (#3068)"
             } else {
                 let e = EvalError::new("invalid number");
-                return Err(QueryResult::Error(e)); // omni-dev: coverage tolerate-line reason="defensive, unreachable via ordinary JSON parsing (#3068)"
+                return Err(QueryResult::Error(e)); // patchcov: coverage tolerate-line reason="defensive, unreachable via ordinary JSON parsing (#3068)"
             };
 
             // Auto-converted the same way `gmtime` converts a raw
@@ -65759,7 +65759,7 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     // jq's error.
                     if arr.len() < 8 {
                         if optional {
-                            return Err(QueryResult::None); // omni-dev: coverage tolerate-line reason="`optional` is never true through either caller of this function -- confirmed live (`eprintln!` probe): `[1,2,3] | todate?` reaches `builtin_todate` with `optional=false`, same as bare `todate`. `?`'s suppression happens entirely outside builtin dispatch here, the same 'optional is never true here' shape eval.rs already documents elsewhere for a different function (#2180's Expr::Object tolerate-line note, ~line 7334) (#3068)"
+                            return Err(QueryResult::None); // patchcov: coverage tolerate-line reason="`optional` is never true through either caller of this function -- confirmed live (`eprintln!` probe): `[1,2,3] | todate?` reaches `builtin_todate` with `optional=false`, same as bare `todate`. `?`'s suppression happens entirely outside builtin dispatch here, the same 'optional is never true here' shape eval.rs already documents elsewhere for a different function (#2180's Expr::Object tolerate-line note, ~line 7334) (#3068)"
                         }
                         return Err(QueryResult::Error(
                             EvalError::requires_parsed_datetime_inputs(name),
@@ -65768,7 +65768,7 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
                     let get_int = |idx: usize| -> i64 {
                         match arr.get(idx) {
-                            Some(OwnedValue::Int(n)) => *n, // omni-dev: coverage tolerate-line reason="every array literal written in filter source, and every array-element JSON parses, decodes to NumberLiteral (#1035), not a bare Int -- Int is for internally-synthesized values spliced post-parse; probed a computed element ([1970,(0+0),..]) and it still decoded as NumberLiteral here, so this arm has no known real producer (#3068)"
+                            Some(OwnedValue::Int(n)) => *n, // patchcov: coverage tolerate-line reason="every array literal written in filter source, and every array-element JSON parses, decodes to NumberLiteral (#1035), not a bare Int -- Int is for internally-synthesized values spliced post-parse; probed a computed element ([1970,(0+0),..]) and it still decoded as NumberLiteral here, so this arm has no known real producer (#3068)"
                             Some(OwnedValue::Float(f)) => *f as i64,
                             Some(OwnedValue::NumberLiteral(NumberRepr::Int(n), _)) => *n,
                             Some(OwnedValue::NumberLiteral(NumberRepr::Float(f), _)) => *f as i64,
@@ -65804,7 +65804,7 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     });
                     Ok((t, zone))
                 }
-                _ if optional => Err(QueryResult::None), // omni-dev: coverage tolerate-line reason="`optional` is never true through either caller of this function, same as the array-length check above (#3068)"
+                _ if optional => Err(QueryResult::None), // patchcov: coverage tolerate-line reason="`optional` is never true through either caller of this function, same as the array-length check above (#3068)"
                 _ => Err(QueryResult::Error(
                     EvalError::requires_parsed_datetime_inputs(name),
                 )),
@@ -65868,7 +65868,7 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             ) {
                 Ok(s) => s,
                 Err(_) if optional => return QueryResult::None,
-                Err(e) => return QueryResult::Error(e), // omni-dev: coverage tolerate-line reason="unreachable for strftime's C-int-clamped fields and bounded zone offset; shared checked date helpers retain overflow guards for other callers (#3083)"
+                Err(e) => return QueryResult::Error(e), // patchcov: coverage tolerate-line reason="unreachable for strftime's C-int-clamped fields and bounded zone offset; shared checked date helpers retain overflow guards for other callers (#3083)"
             };
             QueryResult::Owned(OwnedValue::String(result.into()))
         },
@@ -66024,7 +66024,7 @@ fn format_strftime(
                             yearday,
                             zone_offset,
                             zone_name,
-                        )?; // omni-dev: coverage tolerate-line reason="llvm-cov line-attribution artifact, not unreachable: the call's own argument lines (immediately above) show 3 hits under the #3055 test's three E/O pass-through rows, but this closing-token line is never itself credited -- verified via the raw lcov DA: records"
+                        )?; // patchcov: coverage tolerate-line reason="llvm-cov line-attribution artifact, not unreachable: the call's own argument lines (immediately above) show 3 hits under the #3055 test's three E/O pass-through rows, but this closing-token line is never itself credited -- verified via the raw lcov DA: records"
                         result.push_str(&plain);
                     }
                     Some(_) => {}
@@ -67214,8 +67214,8 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                             // so this is defensive; `root` itself is this single
                             // document's cursor either way.
                             _ => {
-                                let loaded = // omni-dev: coverage tolerate-line reason="unreachable: YamlIndex::root always wraps the documents in a virtual root sequence, so the arm above takes every input (#2664)"
-                                    super::eval_generic::to_owned_yaml_cursor::<S, _>(&root); // omni-dev: coverage tolerate-line reason="unreachable: the same defensive arm as the line above (#2664)"
+                                let loaded = // patchcov: coverage tolerate-line reason="unreachable: YamlIndex::root always wraps the documents in a virtual root sequence, so the arm above takes every input (#2664)"
+                                    super::eval_generic::to_owned_yaml_cursor::<S, _>(&root); // patchcov: coverage tolerate-line reason="unreachable: the same defensive arm as the line above (#2664)"
                                 match loaded {
                                     Ok(v) => QueryResult::Owned(v),
                                     // Same #1620 routing as the sequence arm
@@ -67527,7 +67527,7 @@ fn mixed_radix_combinations(
 /// generator-controlled cross products (#1669).
 fn cartesian_product(arrays: &[Vec<OwnedValue>]) -> Result<Vec<OwnedValue>, EvalError> {
     if arrays.is_empty() {
-        return Ok(vec![OwnedValue::array()]); // omni-dev: coverage tolerate-line reason="unreachable from `combinations`, whose own empty-input return runs first; pre-existing zero-hit line; #2999 changed only how its array payload is constructed"
+        return Ok(vec![OwnedValue::array()]); // patchcov: coverage tolerate-line reason="unreachable from `combinations`, whose own empty-input return runs first; pre-existing zero-hit line; #2999 changed only how its array payload is constructed"
     }
 
     // Guard the row width (arrays.len()) against the heaviest type that
@@ -68631,7 +68631,7 @@ fn builtin_abs<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     if sorts_below_zero {
         match arith_negate::<S>(owned) {
             Ok(v) => QueryResult::Owned(v),
-            Err(_) if optional => QueryResult::None, // omni-dev: coverage tolerate-line reason="confirmed live (eprintln! probe): optional is always false in builtin_abs regardless of whether the filter writes abs?, since that suppression happens entirely outside builtin dispatch here -- the same 'optional is never true here' shape eval.rs already documents elsewhere (#2180) (#3041)"
+            Err(_) if optional => QueryResult::None, // patchcov: coverage tolerate-line reason="confirmed live (eprintln! probe): optional is always false in builtin_abs regardless of whether the filter writes abs?, since that suppression happens entirely outside builtin dispatch here -- the same 'optional is never true here' shape eval.rs already documents elsewhere (#2180) (#3041)"
             Err(e) => QueryResult::Error(e),
         }
     } else {
@@ -70689,7 +70689,7 @@ fn try_pattern_alternatives<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Flow::Exhausted => (carried, None),
         Flow::Escaped(control) => (carried, Some(control)),
         Flow::Stopped { .. } => {
-            unreachable!("a collector never stops") // omni-dev: coverage tolerate-line reason="unreachable: the sink is a plain collector that always answers Demand::Continue (#2872)"
+            unreachable!("a collector never stops") // patchcov: coverage tolerate-line reason="unreachable: the sink is a plain collector that always answers Demand::Continue (#2872)"
         }
     }
 }
@@ -70799,7 +70799,7 @@ impl PatternKey<'_> {
             )),
             (Self::Computed(key), _) => match index_one_owned::<S>(input, key, false) {
                 Ok(Some(v)) => Ok(v),
-                Ok(None) => unreachable!("index_one_owned(.., optional: false) never suppresses"), // omni-dev: coverage tolerate-line reason="unreachable: `optional: false` makes index_one_owned answer Ok(Some)/Err only (#2872)"
+                Ok(None) => unreachable!("index_one_owned(.., optional: false) never suppresses"), // patchcov: coverage tolerate-line reason="unreachable: `optional: false` makes index_one_owned answer Ok(Some)/Err only (#2872)"
                 Err(e) => Err(e),
             },
         }
@@ -71104,7 +71104,7 @@ fn walk_pattern_each<M: PatternMode, S: EvalSemantics>(
         return flow;
     }
     match pattern {
-        Pattern::Var(_) => unreachable!("a bare variable holds no computed key"), // omni-dev: coverage tolerate-line reason="unreachable: `pattern_has_computed_key` is false for `Pattern::Var`, so the loop walker above always takes it (#2872)"
+        Pattern::Var(_) => unreachable!("a bare variable holds no computed key"), // patchcov: coverage tolerate-line reason="unreachable: `pattern_has_computed_key` is false for `Pattern::Var`, so the loop walker above always takes it (#2872)"
         Pattern::Object(entries) => {
             walk_object_entries::<M, S>(mode, entries, true, input, reg, out, sink)
         }
@@ -71152,7 +71152,7 @@ fn walk_pattern_once<M: PatternMode, S: EvalSemantics>(
             let mut reg = reg;
             for (i, entry) in entries.iter().enumerate() {
                 let ObjectKey::Literal(key) = &entry.key else {
-                    unreachable!("the caller checked for computed keys") // omni-dev: coverage tolerate-line reason="unreachable: every caller gates on `pattern_has_computed_key` being false (#2872)"
+                    unreachable!("the caller checked for computed keys") // patchcov: coverage tolerate-line reason="unreachable: every caller gates on `pattern_has_computed_key` being false (#2872)"
                 };
                 let (child, moved) =
                     mode.step::<S>(&PatternKey::Field(key), input, &reg, i == 0)?;
@@ -72848,7 +72848,7 @@ fn substitute_params(body: &Expr, params: &[Param], shared: &[Rc<SharedArg>]) ->
         }
     }
     if subs.is_empty() {
-        return body.clone(); // omni-dev: coverage tolerate-line reason="unreachable: bind_def_call only calls this for a non-empty params, install_def_calls only builds a DefCall whose args.len() equals params.len(), and the last parameter is never shadowed, so at least one entry is always built (#2560)"
+        return body.clone(); // patchcov: coverage tolerate-line reason="unreachable: bind_def_call only calls this for a non-empty params, install_def_calls only builds a DefCall whose args.len() equals params.len(), and the last parameter is never shadowed, so at least one entry is always built (#2560)"
     }
     substitute_func_params_impl(body, &subs, ScopeMask::start(&subs))
 }
@@ -74262,7 +74262,7 @@ mod tests {
                 &expr, &input, false,
             ));
             let direct = eval_owned_reindex_free::<JqSemantics>(&expr, &input)
-                .unwrap_or_else(|| panic!("borrowed route declined {src} on {input:?}")); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if eval_owned_reindex_free declined a shape this loop's own `handled` table asserts is always answered (#3138)"
+                .unwrap_or_else(|| panic!("borrowed route declined {src} on {input:?}")); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if eval_owned_reindex_free declined a shape this loop's own `handled` table asserts is always answered (#3138)"
             let direct = match direct {
                 Ok(value) => (vec![value], "ok".to_string()),
                 Err(error) => (Vec::new(), format!("error:{}", error.message)),
@@ -74271,7 +74271,7 @@ mod tests {
             let OwnedStep::Handled(Ok(consumed)) =
                 try_eval_owned_step::<JqSemantics>(&expr, input.clone())
             else {
-                panic!("consuming route did not handle {src} on {input:?}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_eval_owned_step declined or errored on a shape this loop's own `handled` table asserts is always answered Ok (#3138)"
+                panic!("consuming route did not handle {src} on {input:?}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_eval_owned_step declined or errored on a shape this loop's own `handled` table asserts is always answered Ok (#3138)"
             };
             assert_eq!(
                 format!("{:?}", (vec![consumed], "ok")),
@@ -74310,7 +74310,7 @@ mod tests {
             let OwnedStep::Declined(returned) =
                 try_eval_owned_step::<JqSemantics>(&expr, input.clone())
             else {
-                panic!("consuming route must decline {src}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_eval_owned_step handled a shape this loop's own `declined` table asserts is always declined (#3138)"
+                panic!("consuming route must decline {src}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_eval_owned_step handled a shape this loop's own `declined` table asserts is always declined (#3138)"
             };
             assert_eq!(format!("{returned:?}"), format!("{input:?}"), "{src}");
         }
@@ -74331,7 +74331,7 @@ mod tests {
             let OwnedStep::Handled(Ok(consumed)) =
                 try_eval_owned_step::<YqSemantics>(&expr, object.clone())
             else {
-                panic!("yq: consuming route did not handle {src}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_eval_owned_step declined or errored on a yq shape this loop's own table asserts is always answered Ok (#3138)"
+                panic!("yq: consuming route did not handle {src}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_eval_owned_step declined or errored on a yq shape this loop's own table asserts is always answered Ok (#3138)"
             };
             assert_eq!(
                 format!("{:?}", (vec![consumed], "ok")),
@@ -74431,9 +74431,9 @@ mod tests {
         let text_ptr = |state: &OwnedValue| match state {
             OwnedValue::Object(fields) => match fields.get("keep") {
                 Some(OwnedValue::String(text)) => text.as_ptr(),
-                other => panic!("missing sibling: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if the tracked \"keep\" field stopped being a String, which nothing in this test ever touches (#3138)"
+                other => panic!("missing sibling: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if the tracked \"keep\" field stopped being a String, which nothing in this test ever touches (#3138)"
             },
-            other => panic!("expected object: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if `state` stopped being an Object, which every owned_assign_step write in the loop below preserves (#3138)"
+            other => panic!("expected object: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if `state` stopped being an Object, which every owned_assign_step write in the loop below preserves (#3138)"
         };
         let before = text_ptr(&state);
         for i in 0..64 {
@@ -74441,12 +74441,12 @@ mod tests {
             let expr = substitute_vars(&parse(".[$k] = $k").unwrap(), [("k", &key)]);
             state = match try_eval_owned_step::<JqSemantics>(&expr, state) {
                 OwnedStep::Handled(Ok(next)) => next,
-                _ => panic!("step {i} was not handled"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_eval_owned_step declined or errored on the single-step shape this loop drives every iteration (#3138)"
+                _ => panic!("step {i} was not handled"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_eval_owned_step declined or errored on the single-step shape this loop drives every iteration (#3138)"
             };
         }
         assert_eq!(text_ptr(&state), before, "the unchanged sibling was copied");
         let OwnedValue::Object(fields) = &state else {
-            unreachable!() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this arm only fires if `state` stopped being an Object, which every write in the loop above preserves (#3138)"
+            unreachable!() // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this arm only fires if `state` stopped being an Object, which every write in the loop above preserves (#3138)"
         };
         assert_eq!(fields.len(), 65);
     }
@@ -74484,9 +74484,9 @@ mod tests {
         let text_ptr = |state: &OwnedValue| match state {
             OwnedValue::Object(fields) => match fields.get("keep") {
                 Some(OwnedValue::String(text)) => text.as_ptr(),
-                other => panic!("missing sibling: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if the tracked \"keep\" field stopped being a String, which nothing in this test ever touches (#3241)"
+                other => panic!("missing sibling: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if the tracked \"keep\" field stopped being a String, which nothing in this test ever touches (#3241)"
             },
-            other => panic!("expected object: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if `state` stopped being an Object, which every owned_assign_step write in the loop below preserves (#3241)"
+            other => panic!("expected object: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if `state` stopped being an Object, which every owned_assign_step write in the loop below preserves (#3241)"
         };
         let before = text_ptr(&state);
         for i in 0..64 {
@@ -74504,7 +74504,7 @@ mod tests {
         }
         assert_eq!(text_ptr(&state), before, "the unchanged sibling was copied");
         let OwnedValue::Object(fields) = &state else {
-            unreachable!() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this arm only fires if `state` stopped being an Object, which every write in the loop above preserves (#3241)"
+            unreachable!() // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this arm only fires if `state` stopped being an Object, which every write in the loop above preserves (#3241)"
         };
         assert_eq!(fields.len(), 65);
 
@@ -74581,7 +74581,7 @@ mod tests {
         let OwnedStep::Handled(Ok(written)) =
             try_owned_assign_step::<JqSemantics>(&parse(".z = 1").unwrap(), state)
         else {
-            panic!("the assignment was not handled"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_owned_assign_step declined or errored on the single closed assignment this test drives (#3241)"
+            panic!("the assignment was not handled"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_owned_assign_step declined or errored on the single closed assignment this test drives (#3241)"
         };
 
         assert_eq!(bound, build(), "the bound value was written through");
@@ -74596,7 +74596,7 @@ mod tests {
             "the write copied off the registered storage"
         );
         let (OwnedValue::Object(before), OwnedValue::Object(after)) = (&bound, &written) else {
-            unreachable!() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- both values are built as objects above and an object assignment keeps its kind (#3241)"
+            unreachable!() // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- both values are built as objects above and an object assignment keeps its kind (#3241)"
         };
         assert!(
             after
@@ -74641,7 +74641,7 @@ mod tests {
             let guard = embed_table_push::<JqSemantics>(Some(&origin(7)), &mut bound.clone());
             // A second entry for the child, so its identity can be read back.
             let OwnedValue::Object(fields) = &bound else {
-                unreachable!() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- `doc` builds an object (#3241)"
+                unreachable!() // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- `doc` builds an object (#3241)"
             };
             let mut inner = fields.get("a").expect("child").clone();
             let inner_guard = embed_table_push::<JqSemantics>(Some(&origin(8)), &mut inner);
@@ -74649,7 +74649,7 @@ mod tests {
             let written =
                 match try_owned_assign_step::<JqSemantics>(&parse(".z = 1").unwrap(), bound) {
                     OwnedStep::Handled(Ok(written)) => written,
-                    _ => panic!("the assignment was not handled"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_owned_assign_step declined or errored on the single closed assignment this test drives (#3241)"
+                    _ => panic!("the assignment was not handled"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_owned_assign_step declined or errored on the single closed assignment this test drives (#3241)"
                 };
             assert_eq!(
                 RootWitness::of_owned::<JqSemantics>(&written),
@@ -74657,7 +74657,7 @@ mod tests {
                 "the write copied the registered root off the entry's storage"
             );
             let OwnedValue::Object(after) = &written else {
-                unreachable!() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- an object assignment keeps its kind (#3241)"
+                unreachable!() // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- an object assignment keeps its kind (#3241)"
             };
             assert_eq!(
                 RootWitness::of_owned::<JqSemantics>(after.get("a").expect("kept child")),
@@ -74690,10 +74690,10 @@ mod tests {
             let OwnedStep::Handled(Ok(written)) =
                 try_owned_assign_step::<JqSemantics>(&parse(src).unwrap(), state)
             else {
-                panic!("not handled: {src}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_owned_assign_step declined or errored on a closed assignment this table asserts is always answered (#3241)"
+                panic!("not handled: {src}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_owned_assign_step declined or errored on a closed assignment this table asserts is always answered (#3241)"
             };
             let OwnedValue::Object(fields) = &written else {
-                unreachable!() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- an object assignment keeps its kind (#3241)"
+                unreachable!() // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- an object assignment keeps its kind (#3241)"
             };
             let a = fields.get("a").expect("a");
             assert_eq!(a, &want, "{src}: value");
@@ -74737,7 +74737,7 @@ mod tests {
                     assert!(error.message.contains("as object key"), "{}", error.message);
                 }
                 (true, Flow::Exhausted) => {}
-                (_, _) => panic!("optional={optional}: unexpected flow"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if fold_step_each reported anything but an escape (not optional) or exhaustion (optional) for a failing owned step (#3241)"
+                (_, _) => panic!("optional={optional}: unexpected flow"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if fold_step_each reported anything but an escape (not optional) or exhaustion (optional) for a failing owned step (#3241)"
             }
         }
     }
@@ -74780,7 +74780,7 @@ mod tests {
             let OwnedStep::Declined(returned) =
                 try_owned_assign_step::<JqSemantics>(&expr, state.clone())
             else {
-                panic!("a marker-bearing UPDATE was handled: {src}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_owned_assign_step answered an UPDATE holding an Expr::TrackedVar, which closed_expr_to_owned rejects (#3241)"
+                panic!("a marker-bearing UPDATE was handled: {src}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_owned_assign_step answered an UPDATE holding an Expr::TrackedVar, which closed_expr_to_owned rejects (#3241)"
             };
             assert_eq!(returned, state, "{src}: the declined state is untouched");
         }
@@ -75057,7 +75057,7 @@ mod tests {
         ]);
         let substituted = substitute_var(&dollar_last, "a", &OwnedValue::Int(9));
         let Expr::FuncDef { body, .. } = &substituted else {
-            unreachable!("FuncDef arm always returns FuncDef"); // omni-dev: coverage tolerate-line reason="substitute_var_impl's FuncDef arm always returns FuncDef (#2283)"
+            unreachable!("FuncDef arm always returns FuncDef"); // patchcov: coverage tolerate-line reason="substitute_var_impl's FuncDef arm always returns FuncDef (#2283)"
         };
         assert_eq!(
             **body,
@@ -75079,7 +75079,7 @@ mod tests {
         ]);
         let substituted = substitute_var(&dollar_first, "a", &OwnedValue::Int(9));
         let Expr::FuncDef { body, .. } = &substituted else {
-            unreachable!("FuncDef arm always returns FuncDef"); // omni-dev: coverage tolerate-line reason="substitute_var_impl's FuncDef arm always returns FuncDef (#2283)"
+            unreachable!("FuncDef arm always returns FuncDef"); // patchcov: coverage tolerate-line reason="substitute_var_impl's FuncDef arm always returns FuncDef (#2283)"
         };
         assert_eq!(
             **body,
@@ -75097,7 +75097,7 @@ mod tests {
         ]);
         let substituted = substitute_var(&no_dollar, "a", &OwnedValue::Int(9));
         let Expr::FuncDef { body, .. } = &substituted else {
-            unreachable!("FuncDef arm always returns FuncDef"); // omni-dev: coverage tolerate-line reason="substitute_var_impl's FuncDef arm always returns FuncDef (#2283)"
+            unreachable!("FuncDef arm always returns FuncDef"); // patchcov: coverage tolerate-line reason="substitute_var_impl's FuncDef arm always returns FuncDef (#2283)"
         };
         assert_eq!(
             **body,
@@ -75167,7 +75167,7 @@ mod tests {
                 bound: FuncDefBound::default(),
             };
             let Expr::FuncDef { body, .. } = substitute_var(&def, "a", &OwnedValue::Int(9)) else {
-                unreachable!("FuncDef arm always returns FuncDef"); // omni-dev: coverage tolerate-line reason="substitute_var_impl's FuncDef arm always returns FuncDef (#2283)"
+                unreachable!("FuncDef arm always returns FuncDef"); // patchcov: coverage tolerate-line reason="substitute_var_impl's FuncDef arm always returns FuncDef (#2283)"
             };
             let var_site_reached = *body != Expr::Var("a".to_string());
             assert_eq!(
@@ -75185,7 +75185,7 @@ mod tests {
             };
             let substituted = substitute_func_param_impl(&def, "a", &arg, both);
             let Expr::FuncDef { body, .. } = substituted else {
-                unreachable!("FuncDef arm always returns FuncDef"); // omni-dev: coverage tolerate-line reason="substitute_func_param_impl's FuncDef arm always returns FuncDef (#2555)"
+                unreachable!("FuncDef arm always returns FuncDef"); // patchcov: coverage tolerate-line reason="substitute_func_param_impl's FuncDef arm always returns FuncDef (#2555)"
             };
             let param_site_reached = *body != Expr::Var("a".to_string());
             assert_eq!(
@@ -83220,7 +83220,7 @@ mod tests {
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "nesting depth exceeds limit of 384");
             }
-            other => panic!("expected a clean depth-limit error, got: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make (#3261)"
+            other => panic!("expected a clean depth-limit error, got: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make (#3261)"
         }
     }
 
@@ -83379,7 +83379,7 @@ mod tests {
 
         let from_doc = WalkNode::Doc(&doc).child_at(1);
         let WalkNode::Doc(child) = from_doc else {
-            panic!("a document node's child must stay borrowed, not be copied") // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion the test exists to make (#2190)"
+            panic!("a document node's child must stay borrowed, not be copied") // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion the test exists to make (#2190)"
         };
         assert!(
             core::ptr::eq(child, &doc.as_array().expect("array")[1]),
@@ -83759,7 +83759,7 @@ mod tests {
             })
             .chain(multi_stage.iter().map(|src| {
                 let Expr::Pipe(stages) = parse(src).unwrap() else {
-                    panic!("{src}: not a pipe"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3673)"
+                    panic!("{src}: not a pipe"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3673)"
                 };
                 (*src, stages)
             }));
@@ -84418,7 +84418,7 @@ mod tests {
                 let src = format!("{head} | {rest}");
                 let expr = parse(&src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
                 let Expr::Pipe(stages) = &expr else {
-                    panic!("{src}: not a pipe"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3682)"
+                    panic!("{src}: not a pipe"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3682)"
                 };
                 assert_eq!(stages.len(), 2, "{src}: head and one lone rest");
                 for input in &inputs {
@@ -84633,7 +84633,7 @@ mod tests {
             if cfg!(feature = "std") {
                 jq_true
             } else {
-                jq_false.clone() // omni-dev: coverage tolerate-line reason="the no-std arm: `cfg!(feature = \"std\")` is true in every coverage build, so only the other build takes this (#3069)"
+                jq_false.clone() // patchcov: coverage tolerate-line reason="the no-std arm: `cfg!(feature = \"std\")` is true in every coverage build, so only the other build takes this (#3069)"
             }
         );
         assert_eq!(
@@ -85464,7 +85464,7 @@ mod tests {
                 ..
             } = parse(&format!("def f(n): {body}; {use_site}")).unwrap()
             else {
-                panic!("expected a def") // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: every source this helper parses starts with `def f(n): ...;` (#3296)"
+                panic!("expected a def") // patchcov: coverage tolerate-line reason="unreachable in a passing suite: every source this helper parses starts with `def f(n): ...;` (#3296)"
             };
             let def = Rc::new(FuncDefData::new(name, params, *body));
             install_def_calls(&then, &def, 0, false)
@@ -85517,7 +85517,7 @@ mod tests {
         // flat -- a pipe of `.` stages -- so neither the walk nor the drop
         // nests deeper than a test thread's stack allows.
         let Expr::DefCall { def, .. } = &call else {
-            panic!("expected a DefCall") // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: `f(1)` under `def f(n)` always installs as a DefCall, which the assert above has just settled (#3296)"
+            panic!("expected a DefCall") // patchcov: coverage tolerate-line reason="unreachable in a passing suite: `f(1)` under `def f(n)` always installs as a DefCall, which the assert above has just settled (#3296)"
         };
         let with_arg = |stages: usize| Expr::DefCall {
             def: Rc::clone(def),
@@ -96989,7 +96989,7 @@ mod tests {
                 for v in &arr {
                     match v {
                         OwnedValue::Float(f) => assert!(f.is_nan()),
-                        other => panic!("expected a NaN float, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this test's own diagnostic (#3071)"
+                        other => panic!("expected a NaN float, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this test's own diagnostic (#3071)"
                     }
                 }
             }
@@ -97041,7 +97041,7 @@ mod tests {
                 for v in &arr {
                     match v {
                         OwnedValue::Float(f) => assert!(f.is_nan()),
-                        other => panic!("expected a NaN float, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this test's own diagnostic (#3102)"
+                        other => panic!("expected a NaN float, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this test's own diagnostic (#3102)"
                     }
                 }
             }
@@ -97955,7 +97955,7 @@ mod tests {
             right: Box::new(Expr::Literal(Literal::String("a".to_string()))),
         };
         let mut on_update_calls = 0;
-        // omni-dev: coverage tolerate reason="the closure is asserted never called below (on_update_calls stays 0) -- Err(_) with optional=true short-circuits fold_step_each before this sink runs (#3122)"
+        // patchcov: coverage tolerate reason="the closure is asserted never called below (on_update_calls stays 0) -- Err(_) with optional=true short-circuits fold_step_each before this sink runs (#3122)"
         let flow = fold_step_each::<JqSemantics>(
             &expr,
             OwnedValue::Int(1),
@@ -97966,7 +97966,7 @@ mod tests {
                 Demand::Continue
             },
         );
-        // omni-dev: coverage end
+        // patchcov: coverage end
         assert_eq!(on_update_calls, 0);
         assert!(matches!(flow, Flow::Exhausted));
     }
@@ -102745,7 +102745,7 @@ mod tests {
         let tag = match flow {
             Flow::Exhausted => "ok".to_string(),
             Flow::Escaped(Control::Error(e)) => format!("error:{}", e.message),
-            _ => panic!("{filter:?} on {input:?} neither finished nor raised"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the door's sink never stops and it never breaks or halts (#3439)"
+            _ => panic!("{filter:?} on {input:?} neither finished nor raised"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the door's sink never stops and it never breaks or halts (#3439)"
         };
         Some((out, tag))
     }
@@ -103330,7 +103330,7 @@ mod tests {
                 assert_eq!(arr[4], OwnedValue::Int(0));
                 match &arr[5] {
                     OwnedValue::Float(f) => assert!(f.is_nan()),
-                    other => panic!("expected a NaN float, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this test's own diagnostic (#3071)"
+                    other => panic!("expected a NaN float, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this test's own diagnostic (#3071)"
                 }
                 assert_eq!(arr[6], OwnedValue::Int(4));
                 assert_eq!(arr[7], OwnedValue::Int(0));
@@ -108340,7 +108340,7 @@ mod tests {
             false,
         ) {
             QueryResult::Owned(OwnedValue::Null) => {}
-            other => panic!("expected Owned(Null), got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make"
+            other => panic!("expected Owned(Null), got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make"
         }
         match eval_path_context_pipe_owned::<Vec<u64>, YqSemantics>(
             &[
@@ -108351,7 +108351,7 @@ mod tests {
             false,
         ) {
             QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make"
+            other => panic!("expected None, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make"
         }
         // #3362 review: a `Paren`-wrapped `key` as the pipe's own first
         // stage must be recognized too, not only the bare builtin -- the
@@ -108368,7 +108368,7 @@ mod tests {
         ) {
             QueryResult::ManyOwned(values)
                 if values == [OwnedValue::String("null".to_string().into())] => {}
-            other => panic!("expected ManyOwned([\"null\"]), got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make"
+            other => panic!("expected ManyOwned([\"null\"]), got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make"
         }
         // Two more of this same gate's arms the CLI-level tests above don't
         // reach: a `Comma` of two key/parent constructs with nothing else in
@@ -108388,7 +108388,7 @@ mod tests {
         ) {
             QueryResult::ManyOwned(values)
                 if values == [OwnedValue::Null, no_parent_placeholder()] => {}
-            other => panic!("expected ManyOwned([null, {{}}]), got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make"
+            other => panic!("expected ManyOwned([null, {{}}]), got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make"
         }
         match eval_path_context_pipe_owned::<Vec<u64>, JqSemantics>(
             &[Expr::Builtin(Builtin::Length)],
@@ -108396,7 +108396,7 @@ mod tests {
             false,
         ) {
             QueryResult::Owned(OwnedValue::Int(0)) => {}
-            other => panic!("expected Owned(Int(0)), got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make"
+            other => panic!("expected Owned(Int(0)), got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make"
         }
     }
 
@@ -109547,7 +109547,7 @@ mod tests {
                 assert_eq!(arr.len(), 2);
                 match &arr[0] {
                     OwnedValue::Float(f) => assert!(f.is_nan()),
-                    other => panic!("expected a NaN float, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this test's own diagnostic (#3071)"
+                    other => panic!("expected a NaN float, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this test's own diagnostic (#3071)"
                 }
                 assert_eq!(arr[1], OwnedValue::Int(1));
             }
@@ -111483,7 +111483,7 @@ mod tests {
             )
             .expect_err("depth guard should refuse at the limit");
             let EvalEscape::Error(e) = err else {
-                panic!("expected EvalEscape::Error, got {err:?}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- check_value_tree_depth's only Err variant is EvalError, and From<EvalError> for EvalEscape always produces EvalEscape::Error (#3275)"
+                panic!("expected EvalEscape::Error, got {err:?}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- check_value_tree_depth's only Err variant is EvalError, and From<EvalError> for EvalEscape always produces EvalEscape::Error (#3275)"
             };
             assert!(e.is_resource_limit(), "optional={optional}: {e:?}");
             assert!(e.is_uncatchable(), "optional={optional}: {e:?}");
@@ -112088,7 +112088,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let expr = parse(".[(0,1):(2,3)]").unwrap();
         let Expr::SliceExpr { target, start, end } = &expr else {
-            panic!("expected a computed slice, got {expr:?}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message for the shape assertion the test makes (#3471)"
+            panic!("expected a computed slice, got {expr:?}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message for the shape assertion the test makes (#3471)"
         };
         let mut pushed = Vec::new();
         let flow = each_slice_expr::<Vec<u64>, JqSemantics>(
@@ -115402,7 +115402,7 @@ mod tests {
         // What `?` never swallows still escapes the shortcut as the same failure.
         match settle::<JqSemantics, _>(&iterate, None, &undecodable) {
             Some(Err(e)) => assert!(e.is_decode_failure()),
-            other => panic!("expected a decode failure, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3689 pin, only reached when the pin is already failing"
+            other => panic!("expected a decode failure, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3689 pin, only reached when the pin is already failing"
         }
         // Not taken in yq mode, whatever the value.
         assert!(settle::<YqSemantics, _>(&iterate, None, &scalar).is_none());
@@ -115444,12 +115444,12 @@ mod tests {
         for body in [&iterate, &parenthesised] {
             match settle::<JqSemantics, _>(body, Some(&literal), &scalar) {
                 Some(Ok(v)) => assert_eq!(v.to_json(), r#""c""#),
-                other => panic!("expected the literal, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3704 pin, only reached when the pin is already failing"
+                other => panic!("expected the literal, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3704 pin, only reached when the pin is already failing"
             }
         }
         match settle::<JqSemantics, _>(&iterate, Some(&literal), &undecodable) {
             Some(Err(e)) => assert!(e.is_decode_failure()),
-            other => panic!("expected a decode failure, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3704 pin, only reached when the pin is already failing"
+            other => panic!("expected a decode failure, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3704 pin, only reached when the pin is already failing"
         }
         assert!(settle::<YqSemantics, _>(&iterate, Some(&literal), &scalar).is_none());
         // Not taken: no handler, a handler that is not a literal, a body that is
@@ -115484,7 +115484,7 @@ mod tests {
                 // A container is not caught: its members, not a handler's answer.
                 QueryResult::Many(vs) => format!("members {}", vs.len()),
                 QueryResult::Error(e) => format!("error decode={}", e.is_decode_failure()),
-                other => panic!("`{filter}` on {json:?}: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3704 pin, only reached when the pin is already failing"
+                other => panic!("`{filter}` on {json:?}: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3704 pin, only reached when the pin is already failing"
             }
         }
         fn pushed<S: EvalSemantics>(json: &[u8], filter: &str, stop_after: usize) -> String {
@@ -115505,7 +115505,7 @@ mod tests {
                 Flow::Escaped(Control::Error(e)) => {
                     format!("escaped decode={} {out:?}", e.is_decode_failure())
                 }
-                _ => panic!("`{filter}` on {json:?}: unexpected flow"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3704 pin, only reached when the pin is already failing"
+                _ => panic!("`{filter}` on {json:?}: unexpected flow"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3704 pin, only reached when the pin is already failing"
             }
         }
         let documents: [&[u8]; 9] = [
@@ -115608,7 +115608,7 @@ mod tests {
                 QueryResult::None => "none".to_owned(),
                 QueryResult::Owned(v) => v.to_json(),
                 QueryResult::Error(e) => format!("error decode={}", e.is_decode_failure()),
-                other => panic!("`{filter}` on {json:?}: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3689 pin, only reached when the pin is already failing"
+                other => panic!("`{filter}` on {json:?}: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3689 pin, only reached when the pin is already failing"
             }
         }
         fn pushed<S: EvalSemantics>(json: &[u8], filter: &str) -> String {
@@ -115624,7 +115624,7 @@ mod tests {
                 Flow::Escaped(Control::Error(e)) => {
                     format!("escaped decode={} {out:?}", e.is_decode_failure())
                 }
-                _ => panic!("`{filter}` on {json:?}: unexpected flow"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3689 pin, only reached when the pin is already failing"
+                _ => panic!("`{filter}` on {json:?}: unexpected flow"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3689 pin, only reached when the pin is already failing"
             }
         }
         // Dropped: nothing, and no handler to run.
@@ -119082,7 +119082,7 @@ mod tests {
         assert!(frame.at.is_some(), "{filter}: frame must be rooted");
         match &expr {
             Expr::AsPattern { patterns, .. } => (frame, patterns.clone()),
-            other => panic!("{filter}: expected AsPattern, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- every filter this helper is called with parses to an AsPattern (#2649)"
+            other => panic!("{filter}: expected AsPattern, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- every filter this helper is called with parses to an AsPattern (#2649)"
         }
     }
 
@@ -119126,7 +119126,7 @@ mod tests {
         let result = match flow {
             Flow::Exhausted => Ok(reached.expect("a literal-key pattern completes exactly once")),
             Flow::Escaped(Control::Error(e)) => Err(e),
-            Flow::Stopped { .. } | Flow::Escaped(_) => panic!("unexpected walk verdict"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- a literal-key pattern's walk either completes or refuses with an error (#2872)"
+            Flow::Stopped { .. } | Flow::Escaped(_) => panic!("unexpected walk verdict"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- a literal-key pattern's walk either completes or refuses with an error (#2872)"
         };
         (frame, result, out)
     }
@@ -119135,7 +119135,7 @@ mod tests {
     fn walk_pattern_origin_path_2649(origin: &Option<Origin>) -> Vec<Expr> {
         match origin {
             Some(Origin::At { path, .. }) => path.0.to_vec(),
-            other => panic!("expected Origin::At, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- every call site passes the origin of a binding this same test already proved carries a marker (#2649)"
+            other => panic!("expected Origin::At, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- every call site passes the origin of a binding this same test already proved carries a marker (#2649)"
         }
     }
 
@@ -119463,7 +119463,7 @@ mod tests {
         assert_eq!(sets.len(), 1);
         match flow {
             Flow::Escaped(Control::Error(e)) => assert_eq!(e.message, "E"),
-            _ => panic!("the key's trailing error escapes after the binding set"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the assertion above is the test (#2872)"
+            _ => panic!("the key's trailing error escapes after the binding set"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the assertion above is the test (#2872)"
         }
 
         // A later entry's key runs once per earlier binding: two outputs
@@ -120163,7 +120163,7 @@ mod tests {
                 Ok(got) => assert_eq!(got, *expected, "{filter}"),
                 Err(e) => panic!(
                     "{filter}: refused where jq answers {expected}: {}",
-                    e.message // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- every row here is a shape jq accepts, confirmed live (#2649)"
+                    e.message // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- every row here is a shape jq accepts, confirmed live (#2649)"
                 ),
             }
         }
@@ -120231,7 +120231,7 @@ mod tests {
                     assert!(e.is_untracked_navigation_error(), "{filter}: {}", e.message);
                 }
                 Err(e) => assert!(e.is_invalid_path_expression(), "{filter}: {}", e.message),
-                Ok(got) => panic!("{filter}: answered {got} where jq refuses"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- every row here is a shape jq refuses, confirmed live (#2649)"
+                Ok(got) => panic!("{filter}: answered {got} where jq refuses"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- every row here is a shape jq refuses, confirmed live (#2649)"
             }
         }
     }
@@ -120616,7 +120616,7 @@ mod tests {
             Some(node.clone()),
         );
         let Expr::TrackedVar(var) = &navigated else {
-            panic!("expected a TrackedVar, got {navigated:?}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the #2072 pin itself, only formatted if the let-else pattern fails to match (#2072)"
+            panic!("expected a TrackedVar, got {navigated:?}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the #2072 pin itself, only formatted if the let-else pattern fails to match (#2072)"
         };
         assert_eq!(var.origin, Origin::Untracked);
         assert_eq!(var.node, Some(node.clone()));
@@ -120632,7 +120632,7 @@ mod tests {
             Some(node.clone()),
         );
         let Expr::TrackedVar(var) = &passthrough else {
-            panic!("expected a TrackedVar, got {passthrough:?}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the #2072 pin itself, only formatted if the let-else pattern fails to match (#2072)"
+            panic!("expected a TrackedVar, got {passthrough:?}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the #2072 pin itself, only formatted if the let-else pattern fails to match (#2072)"
         };
         assert_eq!(var.origin, Origin::Snapshot);
         assert_eq!(var.node, Some(node));
@@ -120666,7 +120666,7 @@ mod tests {
             None,
         );
         let Expr::TrackedVar(var) = &constructed else {
-            panic!("expected a TrackedVar, got {constructed:?}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the #3069 pin itself, only formatted if the let-else pattern fails to match"
+            panic!("expected a TrackedVar, got {constructed:?}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the #3069 pin itself, only formatted if the let-else pattern fails to match"
         };
         assert_eq!(var.origin, Origin::Untracked);
         assert_eq!(var.node, None);
@@ -120683,7 +120683,7 @@ mod tests {
         // | $x)` is `[]` in jq 1.7.1.
         match path_of(passthrough) {
             QueryResult::Owned(OwnedValue::Array(path)) => assert!(path.is_empty()),
-            other => panic!("expected [], got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the #2072 pin itself, only formatted if the match doesn't hit the expected arm above (#2072)"
+            other => panic!("expected [], got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the #2072 pin itself, only formatted if the match doesn't hit the expected arm above (#2072)"
         }
         // The same value, untracked, is a literal to the resolver whatever
         // node it carries -- refused, not certified by value equality.
@@ -120699,7 +120699,7 @@ mod tests {
         );
         match path_of(untracked_root) {
             QueryResult::Error(e) => assert!(e.is_invalid_path_expression()),
-            other => panic!("expected a refusal, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the #2072 pin itself, only formatted if the match doesn't hit the expected arm above (#2072)"
+            other => panic!("expected a refusal, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the #2072 pin itself, only formatted if the match doesn't hit the expected arm above (#2072)"
         }
         // #3069: the constructed container's marker is a literal to the
         // resolver too -- equal to `.a`'s value, never `.a`'s node.
@@ -120713,7 +120713,7 @@ mod tests {
         };
         match at_a(constructed) {
             QueryResult::Error(e) => assert!(e.is_invalid_path_expression()),
-            other => panic!("expected a refusal, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the #3069 pin itself, only formatted if the match doesn't hit the expected arm above"
+            other => panic!("expected a refusal, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the #3069 pin itself, only formatted if the match doesn't hit the expected arm above"
         }
     }
 
@@ -120799,7 +120799,7 @@ mod tests {
         };
         let origin_of = |e: &Expr| match e {
             Expr::TrackedVar(m) => m.origin.clone(),
-            other => panic!("expected a marker, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- every expression this closure receives is built by `marker` above (#3037)"
+            other => panic!("expected a marker, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- every expression this closure receives is built by `marker` above (#3037)"
         };
         let root = RootWitness::Node {
             node: 3,
@@ -120877,7 +120877,7 @@ mod tests {
                 assert_eq!(origin_of(&parts[0]), Origin::Untracked);
                 assert_eq!(origin_of(&parts[1]), Origin::Snapshot);
             }
-            other => panic!("expected the comma back, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- `rewrite_markers` rebuilds the same node kind it was given (#3037)"
+            other => panic!("expected the comma back, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- `rewrite_markers` rebuilds the same node kind it was given (#3037)"
         }
     }
 
@@ -121653,7 +121653,7 @@ mod tests {
         };
         let origin_of = |e: &Expr| match e {
             Expr::TrackedVar(m) => m.origin.clone(),
-            other => panic!("expected a marker, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- every expression this closure receives is built by `marker` above (#3135)"
+            other => panic!("expected a marker, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- every expression this closure receives is built by `marker` above (#3135)"
         };
         let root = RootWitness::OwnedRoot(5);
 
@@ -121760,7 +121760,7 @@ mod tests {
         };
         let origin_of = |e: &Expr| match e {
             Expr::TrackedVar(m) => m.origin.clone(),
-            other => panic!("expected a marker, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- every expression this closure receives is built by `marker` above (#3122)"
+            other => panic!("expected a marker, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- every expression this closure receives is built by `marker` above (#3122)"
         };
         let root = RootWitness::Node {
             node: 3,
@@ -121778,7 +121778,7 @@ mod tests {
                 assert_eq!(origin_of(&parts[0]), Origin::Untracked);
                 assert_eq!(origin_of(&parts[1]), Origin::Snapshot);
             }
-            other => panic!("expected the comma back, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- `rewrite_markers` rebuilds the same node kind it was given (#3122)"
+            other => panic!("expected the comma back, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- `rewrite_markers` rebuilds the same node kind it was given (#3122)"
         }
     }
 
@@ -121846,11 +121846,11 @@ mod tests {
             let Cow::Owned(Expr::Builtin(Builtin::Path(inner))) =
                 demote_for_reentry(&resolving, root)
             else {
-                // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- fires only if demote_for_reentry's own let-else assertion condition is false (#3122)"
+                // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- fires only if demote_for_reentry's own let-else assertion condition is false (#3122)"
                 panic!("a mismatching root must rebuild the resolver-reaching expression");
             };
             let Expr::TrackedVar(demoted) = inner.as_ref() else {
-                panic!("the rebuilt expression keeps its shape"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- fires only if demote_for_reentry's own let-else assertion condition is false (#3122)"
+                panic!("the rebuilt expression keeps its shape"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- fires only if demote_for_reentry's own let-else assertion condition is false (#3122)"
             };
             assert_eq!(demoted.origin, Origin::Untracked);
         }
@@ -121890,11 +121890,11 @@ mod tests {
         let Cow::Owned(Expr::Builtin(Builtin::Path(inner))) =
             Reentry::Against(own).reroot::<JqSemantics>(&resolving)
         else {
-            // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- fires only if reroot's own let-else assertion condition is false (#3122)"
+            // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- fires only if reroot's own let-else assertion condition is false (#3122)"
             panic!("the root's own untracked marker must be promoted where a resolver reads it");
         };
         let Expr::TrackedVar(promoted) = inner.as_ref() else {
-            // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- fires only if reroot's own let-else assertion condition is false (#3122)"
+            // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- fires only if reroot's own let-else assertion condition is false (#3122)"
             panic!("the rebuilt expression keeps its shape");
         };
         assert_eq!(promoted.origin, Origin::Snapshot);
@@ -123639,7 +123639,7 @@ mod tests {
                 }
                 Err(want) => match got {
                     QueryResult::Error(e) => assert_eq!(e.message, *want, "{doc} | {filter}"),
-                    other => panic!("{doc} | {filter}: expected a refusal, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the assertion above, only formatted if the match doesn't hit the Error arm (#3119)"
+                    other => panic!("{doc} | {filter}: expected a refusal, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the assertion above, only formatted if the match doesn't hit the Error arm (#3119)"
                 },
             }
         }
@@ -123694,7 +123694,7 @@ mod tests {
                 }
                 Err(want) => match got {
                     QueryResult::Error(e) => assert_eq!(e.message, want, "{doc} | {filter}"),
-                    other => panic!("{doc} | {filter}: expected a refusal, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the assertion above, only formatted if the match doesn't hit the Error arm (#3127)"
+                    other => panic!("{doc} | {filter}: expected a refusal, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the assertion above, only formatted if the match doesn't hit the Error arm (#3127)"
                 },
             }
         }
@@ -126387,7 +126387,7 @@ mod tests {
         // the real "number required" error instead.
         match eval_single::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false) {
             QueryResult::Error(e) => assert!(e.message.contains("number required")),
-            other => panic!("expected number-required error, got: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make (#2937)"
+            other => panic!("expected number-required error, got: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make (#2937)"
         }
     }
 
@@ -126474,21 +126474,21 @@ mod tests {
                 let expr = parse(filter).expect("filter parses");
                 let concrete = match eval_full::<Vec<u64>, JqSemantics>(&expr, element) {
                     QueryResult::Error(e) => e.is_decode_failure(),
-                    _ => false, // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- every READERS filter raises a decode failure on every malformed json in this sweep, so this fallback never fires (#3222)"
+                    _ => false, // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- every READERS filter raises a decode failure on every malformed json in this sweep, so this fallback never fires (#3222)"
                 };
                 let generic = match crate::jq::eval_generic::eval_with_cursor_using::<JqSemantics, _>(
                     &expr, element,
                 ) {
                     crate::jq::eval_generic::GenericResult::Error(e) => e.is_decode_failure(),
-                    _ => false, // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- see the `concrete` match above, same sweep (#3222)"
+                    _ => false, // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- see the `concrete` match above, same sweep (#3222)"
                 };
                 for (evaluator, raised) in
                     [("eval_full", concrete), ("eval_with_cursor_using", generic)]
                 {
                     if !raised {
-                        // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- this is the failure-recording line for the assertion below, only reached if a READERS filter fails to raise (#3222)"
+                        // patchcov: coverage tolerate reason="unreachable in a passing suite by design -- this is the failure-recording line for the assertion below, only reached if a READERS filter fails to raise (#3222)"
                         escaped.push(format!("{evaluator} `{filter}` on {json}"));
-                        // omni-dev: coverage end
+                        // patchcov: coverage end
                     }
                 }
             }
@@ -126544,7 +126544,7 @@ mod tests {
                     _,
                 >(&expr, cursor)
                 {
-                    crate::jq::eval_generic::GenericResult::Error(e) => Err(e.message), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- none of NON_READERS ever raises through eval_with_cursor_using, on the malformed document or the well-formed one; kept so a filter that starts erroring is still comparable rather than panicking (#3222)"
+                    crate::jq::eval_generic::GenericResult::Error(e) => Err(e.message), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- none of NON_READERS ever raises through eval_with_cursor_using, on the malformed document or the well-formed one; kept so a filter that starts erroring is still comparable rather than panicking (#3222)"
                     other => other.into_owned::<JqSemantics>().map_err(|e| e.message),
                 };
                 let generic = run_generic(element);
@@ -126847,16 +126847,16 @@ mod share_audit_2999 {
             let QueryResult::Owned(OwnedValue::Array(items)) =
                 eval::<Vec<u64>, JqSemantics>(&expr, index.root(json))
             else {
-                unreachable!() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- every filter below builds an array (#3191)"
+                unreachable!() // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- every filter below builds an array (#3191)"
             };
             items
                 .iter()
                 .map(|item| match item {
                     OwnedValue::Object(map) => match map.get("k") {
                         Some(OwnedValue::String(s)) => s.is_shared(),
-                        _ => unreachable!(), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- each element is built as {k: <string>} (#3191)"
+                        _ => unreachable!(), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- each element is built as {k: <string>} (#3191)"
                     },
-                    _ => unreachable!(), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- each element is built as {k: <string>} (#3191)"
+                    _ => unreachable!(), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- each element is built as {k: <string>} (#3191)"
                 })
                 .collect()
         }
@@ -126958,8 +126958,8 @@ mod touched_edge_cases_2999 {
         let cursor = index.root(json);
         match eval_full::<Vec<u64>, S>(expr, cursor) {
             QueryResult::Owned(v) => v.to_json(),
-            QueryResult::One(v) => to_owned::<S, _>(&v).unwrap().to_json(), // omni-dev: coverage tolerate-line reason="every pinned filter below yields an owned value; kept so a cursor answer still renders rather than panics (#2999)"
-            other => panic!("unexpected result: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message for the assertions this helper serves (#2999)"
+            QueryResult::One(v) => to_owned::<S, _>(&v).unwrap().to_json(), // patchcov: coverage tolerate-line reason="every pinned filter below yields an owned value; kept so a cursor answer still renders rather than panics (#2999)"
+            other => panic!("unexpected result: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message for the assertions this helper serves (#2999)"
         }
     }
 
@@ -127293,7 +127293,7 @@ mod touched_edge_cases_2999 {
             ..
         } = parse(program).unwrap()
         else {
-            panic!("{program}: expected a def"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: every corpus program starts with a def (#3307)"
+            panic!("{program}: expected a def"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: every corpus program starts with a def (#3307)"
         };
         (Rc::new(FuncDefData::new(name, params, *body)), *then)
     }
@@ -127418,7 +127418,7 @@ mod touched_edge_cases_2999 {
                     ..
                 } = install_def_calls(&then, &outer, base, in_recursive_body)
                 else {
-                    panic!("{program}: expected the spine to stay a def"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: every corpus program's first node is a def (#3307)"
+                    panic!("{program}: expected the spine to stay a def"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: every corpus program's first node is a def (#3307)"
                 };
                 let first = Rc::new(FuncDefData::new(name, params, *body));
                 // The calls to `o` are real `DefCall`s already, so the walk
@@ -127455,7 +127455,7 @@ mod touched_edge_cases_2999 {
         // the ambient depth at the def's own `then`.
         match &installed {
             Expr::DefCall { frames, .. } => assert_eq!(*frames, 4, "`c`'s own then starts here"),
-            other => panic!("expected the call to `c` to be bound: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: the last def's call is bound (#3307)"
+            other => panic!("expected the call to `c` to be bound: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite: the last def's call is bound (#3307)"
         }
     }
 
@@ -127617,7 +127617,7 @@ mod touched_edge_cases_2999 {
             bound,
         } = head
         else {
-            panic!("expected a def"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: every caller passes a def head (#3307)"
+            panic!("expected a def"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: every caller passes a def head (#3307)"
         };
         let mut cur = bind_def(name, params, body, then, bound);
         loop {
@@ -127693,11 +127693,11 @@ mod touched_edge_cases_2999 {
         // Only the head caches the collapsed result; the parsed tree's inner
         // spine nodes were never reached.
         let Expr::FuncDef { bound, then, .. } = &head else {
-            panic!("expected a def"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: `chain` builds a def head (#3307)"
+            panic!("expected a def"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: `chain` builds a def head (#3307)"
         };
         assert!(bound.is_cached());
         let Expr::FuncDef { bound: inner, .. } = &**then else {
-            panic!("expected a second def"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: a 50-def chain has a second def (#3307)"
+            panic!("expected a second def"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: a 50-def chain has a second def (#3307)"
         };
         assert!(!inner.is_cached(), "inner spine nodes stay unbound");
     }
@@ -127793,7 +127793,7 @@ mod touched_edge_cases_2999 {
             bound,
         } = &head
         else {
-            panic!("expected a def"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: `spine_node` builds a def head (#3307)"
+            panic!("expected a def"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: `spine_node` builds a def head (#3307)"
         };
         let first = Rc::new(FuncDefData::new(
             name.clone(),
@@ -127854,7 +127854,7 @@ mod touched_edge_cases_2999 {
             ..
         } = then
         else {
-            panic!("expected a def"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: the loop above builds a def (#3307)"
+            panic!("expected a def"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: the loop above builds a def (#3307)"
         };
         let first = Rc::new(FuncDefData::new(name, params, *body));
         let installed = install_def_spine(&first, &then, 0);
@@ -127862,11 +127862,11 @@ mod touched_edge_cases_2999 {
         // The reference leaves the captured `a` alone, and so must this: the
         // two `Shared` nodes still hold a bare call, not a bound one.
         let Expr::Pipe(stages) = &installed else {
-            panic!("expected a pipe: {installed:?}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: the main filter is a pipe (#3307)"
+            panic!("expected a pipe: {installed:?}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: the main filter is a pipe (#3307)"
         };
         for stage in [&stages[0], &stages[2]] {
             let Expr::Shared(inner) = stage else {
-                panic!("expected a shared arg: {stage:?}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: stages 0 and 2 are the spliced arguments (#3307)"
+                panic!("expected a shared arg: {stage:?}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: stages 0 and 2 are the spliced arguments (#3307)"
             };
             assert!(
                 !format!("{inner:?}").contains("DefCall"),

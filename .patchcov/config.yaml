@@ -1,10 +1,10 @@
-# Coverage config for `omni-dev coverage diff` (the sticky PR comment posted by
+# Coverage config for `patchcov diff` (the sticky PR comment posted by
 # the `Coverage (x86_64)` / `Coverage (ARM64)` jobs in .github/workflows/ci.yml, via
 # the shared steps in .github/actions/coverage/action.yml).
 #
-# Requires omni-dev >= 0.38.0 (rust-works/omni-dev#1398). On older versions this
-# file is simply not read, so the pin in .github/actions/coverage/action.yml must
-# stay at or above 0.38.0 for the exclusions below to take effect.
+# Requires patchcov >= 0.1.1, pinned in .github/actions/coverage/action.yml.
+# Migrated from omni-dev coverage config (#3873); the diff ignore-list schema
+# and filtering semantics are unchanged.
 diff:
   # Repo-relative path regexes, unanchored (partial match), applied after
   # --strip-prefix normalisation — same semantics as the
@@ -42,8 +42,8 @@ diff:
   #     draws a host with avx512f (#2449; this paragraph previously
   #     understated the flap as "~1-2 lines"). Rather than excluding the whole
   #     ~230-line file, the flapping region is wrapped in a
-  #     `// omni-dev: coverage tolerate` marker directly in
-  #     src/util/simd/x86.rs (requires omni-dev >= 0.43.0, see the version pin
+  #     coverage `tolerate` marker directly in
+  #     src/util/simd/x86.rs (requires patchcov >= 0.1.1, see the version pin
   #     comment in .github/actions/coverage/action.yml; rust-works/omni-dev#1593, succinctly#2467): the file
   #     keeps contributing its real coverage to the total, and only the
   #     CPU-gated delta is masked.

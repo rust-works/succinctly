@@ -3369,7 +3369,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     // index (see `parse_alias_value`), so this arm is unreachable
                     // defense in depth; its hit status flips with instrumentation
                     // rather than with any test, hence the marker (#1374 follow-up).
-                    None => "!!null", // omni-dev: coverage tolerate-line reason="unreachable: an alias target is never None for a built index (#1374)"
+                    None => "!!null", // patchcov: coverage tolerate-line reason="unreachable: an alias target is never None for a built index (#1374)"
                 }
             }
             YamlValue::Error(_) => "!!null",
@@ -15476,7 +15476,7 @@ mod tests {
         let yaml = b"- 1\n- 2\n- 3\n";
         let index = YamlIndex::build(yaml).unwrap();
         let YamlValue::Sequence(elements) = first_doc(index.root(yaml)) else {
-            panic!("expected a sequence"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the fixture above is a block sequence (#2640)"
+            panic!("expected a sequence"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the fixture above is a block sequence (#2640)"
         };
         let (first, rest) = elements.uncons_cursor().expect("first");
         let (second, _) = rest.uncons_cursor().expect("second");
@@ -15503,7 +15503,7 @@ mod tests {
         let yaml = b"a: 1\nb: 2\nc: 3\n";
         let index = YamlIndex::build(yaml).unwrap();
         let YamlValue::Mapping(fields) = first_doc(index.root(yaml)) else {
-            panic!("expected a mapping"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the fixture above is a block mapping (#2640)"
+            panic!("expected a mapping"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the fixture above is a block mapping (#2640)"
         };
         let (a, rest) = DocumentFields::uncons(&fields).expect("a");
         let (b, _) = DocumentFields::uncons(&rest).expect("b");
@@ -16240,7 +16240,7 @@ plain: hello
         assert!(
             cursors.len() > 15,
             "the fixture must be big enough to be worth walking, got {}",
-            cursors.len() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is a panic-message format argument for the #2072 pin itself, only evaluated if the assert's own condition is false (#2072)"
+            cursors.len() // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is a panic-message format argument for the #2072 pin itself, only evaluated if the assert's own condition is false (#2072)"
         );
 
         for c in &cursors {
@@ -16251,7 +16251,7 @@ plain: hello
             assert!(
                 back.same_node(c),
                 "id {id} re-resolved to bp {}",
-                back.node_id() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is a panic-message format argument for the #2072 pin itself, only evaluated if the assert's own condition is false (#2072)"
+                back.node_id() // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is a panic-message format argument for the #2072 pin itself, only evaluated if the assert's own condition is false (#2072)"
             );
             let from_root = root
                 .at_node_id(id)
@@ -16408,7 +16408,7 @@ plain: hello
                 c.document_token(),
                 token,
                 "bp {} disagreed about its own document",
-                c.node_id() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is a panic-message format argument for the #2072 pin itself, only evaluated if the assert's own condition is false (#2072)"
+                c.node_id() // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is a panic-message format argument for the #2072 pin itself, only evaluated if the assert's own condition is false (#2072)"
             );
         }
 

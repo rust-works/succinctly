@@ -918,10 +918,10 @@ impl<T: Copy> FnScope<T> {
             // the stack have drifted, which a lookup would turn into a wrong
             // scope: stop here rather than carry on from a corrupt index.
             let Some(slots) = self.positions.get_mut(entry.name.as_str()) else {
-                unreachable!("a plain entry is listed under its name"); // omni-dev: coverage tolerate-line reason="unreachable by construction: every plain entry was listed under its name when it was pushed"
+                unreachable!("a plain entry is listed under its name"); // patchcov: coverage tolerate-line reason="unreachable by construction: every plain entry was listed under its name when it was pushed"
             };
             let Some(slot) = slots.iter().position(|(a, _)| *a == entry.arity) else {
-                unreachable!("a plain entry is listed under its arity"); // omni-dev: coverage tolerate-line reason="unreachable by construction: every plain entry was listed under its arity when it was pushed"
+                unreachable!("a plain entry is listed under its arity"); // patchcov: coverage tolerate-line reason="unreachable by construction: every plain entry was listed under its arity when it was pushed"
             };
             slots[slot].1.pop();
             if slots[slot].1.is_empty() {
@@ -971,7 +971,7 @@ impl RunEntry {
     /// The run this begin marker opens, as [`ScanResult::run`] reports it.
     fn open(&self) -> Option<(u32, Option<String>)> {
         let Self::Begin { id, alias } = self else {
-            return None; // omni-dev: coverage tolerate-line reason="unreachable by construction: `FnScope::floor` only ever names a begin marker"
+            return None; // patchcov: coverage tolerate-line reason="unreachable by construction: `FnScope::floor` only ever names a begin marker"
         };
         Some((*id, alias.clone()))
     }
@@ -2676,7 +2676,7 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
                 match &marker {
                     Some(RunMarker::Begin { .. }) => cx.occurrences.runs.push(RunFrame::default()),
                     Some(RunMarker::End { .. }) => closed_run = cx.occurrences.runs.pop(),
-                    None => {} // omni-dev: coverage tolerate-line reason="unreachable by construction: this match is only entered when is_marker (marker.is_some()) is true, and RunMarker has only Begin/End variants -- the None arm exists solely for exhaustiveness against Option<RunMarker>'s type"
+                    None => {} // patchcov: coverage tolerate-line reason="unreachable by construction: this match is only entered when is_marker (marker.is_some()) is true, and RunMarker has only Begin/End variants -- the None arm exists solely for exhaustiveness against Option<RunMarker>'s type"
                 }
             }
             check(then, cx, reachable);
@@ -2946,9 +2946,9 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
                 *expr = *fallback;
                 check(expr, cx, reachable);
             } else if is_jq_builtin(name, arity) {
-                next_call_occurrence(&mut cx.occurrences, name, arity); // omni-dev: coverage tolerate-line reason="unreachable in practice today: this arm needs builtin_fallback==None (the name was never a shadow candidate) yet is_jq_builtin==true (a real jq builtin at this arity) -- every implemented builtin's own dedicated parse already lowers that shape to Expr::Builtin before resolve.rs ever runs, and #3042/#3046 closed the once-real 'unimplemented builtin' gap this existed for (see JQ_BUILTIN_ROSTER's own doc comment)"
+                next_call_occurrence(&mut cx.occurrences, name, arity); // patchcov: coverage tolerate-line reason="unreachable in practice today: this arm needs builtin_fallback==None (the name was never a shadow candidate) yet is_jq_builtin==true (a real jq builtin at this arity) -- every implemented builtin's own dedicated parse already lowers that shape to Expr::Builtin before resolve.rs ever runs, and #3042/#3046 closed the once-real 'unimplemented builtin' gap this existed for (see JQ_BUILTIN_ROSTER's own doc comment)"
                 for a in args.iter_mut() {
-                    check(a, cx, reachable); // omni-dev: coverage tolerate-line reason="unreachable with the current roster: every `JQ_BUILTIN_ROSTER` entry of arity >= 1 already has a dedicated parser form (a `matches_keyword` special case or a `Libm1`/`Libm2`/`Libm3::ALL` entry -- confirmed by cross-referencing the full roster against both), so it is parsed straight to `Expr::Builtin` and never reaches here as a bare `FuncCall`. This arm exists for a roster name with no dedicated parse yet and a nonzero arity -- there is none today, so the loop body is reached with an empty `args` on every pinned-suite run (355 hits on the arm's own condition, 0 in the loop) and would only start executing if such a name were added (#2964)"
+                    check(a, cx, reachable); // patchcov: coverage tolerate-line reason="unreachable with the current roster: every `JQ_BUILTIN_ROSTER` entry of arity >= 1 already has a dedicated parser form (a `matches_keyword` special case or a `Libm1`/`Libm2`/`Libm3::ALL` entry -- confirmed by cross-referencing the full roster against both), so it is parsed straight to `Expr::Builtin` and never reaches here as a bare `FuncCall`. This arm exists for a roster name with no dedicated parse yet and a nonzero arity -- there is none today, so the loop body is reached with an empty `args` on every pinned-suite run (355 hits on the arm's own condition, 0 in the loop) and would only start executing if such a name were added (#2964)"
                 }
             } else {
                 let occurrence_index = next_call_occurrence(&mut cx.occurrences, name, arity);

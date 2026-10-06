@@ -1580,7 +1580,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             self.settle_float_if_sequence_closed(previous, None);
         }
         let Some(frame) = self.enclosing_seq_frame() else {
-            return; // omni-dev: coverage tolerate-line reason="unreachable: every block-sequence open registers a frame at its own depth before any item of it can be parsed (#1079)"
+            return; // patchcov: coverage tolerate-line reason="unreachable: every block-sequence open registers a frame at its own depth before any item of it can be parsed (#1079)"
         };
         let idx = self
             .pending_head_lines
@@ -1610,7 +1610,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// next.
     fn resolve_pending_block_backward(&mut self) {
         if self.pending_head_lines.is_empty() {
-            return; // omni-dev: coverage tolerate-line reason="unreachable: this function's sole caller (record_standalone_comment) only invokes it from inside a match on `pending_head_lines.last()`, so pending_head_lines is already known non-empty here (#798)"
+            return; // patchcov: coverage tolerate-line reason="unreachable: this function's sole caller (record_standalone_comment) only invokes it from inside a match on `pending_head_lines.last()`, so pending_head_lines is already known non-empty here (#798)"
         }
         if let Some(prev) = self.attached_prev() {
             self.drain_pending_into_foot(prev);
@@ -8010,7 +8010,7 @@ fn json_strict_plain_scalar_ok(bytes: &[u8]) -> bool {
     // (`-D unsafe-code`), so this stays a real (cheap, ASCII-fast-pathed)
     // check rather than a skippable one.
     let Ok(s) = core::str::from_utf8(bytes) else {
-        return false; // omni-dev: coverage tolerate-line reason="unreachable: every byte here already passed the `[0-9.eE+-]` charset check above, a strict subset of ASCII, so `str::from_utf8` can never fail (#2778)"
+        return false; // patchcov: coverage tolerate-line reason="unreachable: every byte here already passed the `[0-9.eE+-]` charset check above, a strict subset of ASCII, so `str::from_utf8` can never fail (#2778)"
     };
     // The finite-`f64`-parse primitive, not the core-schema dispatch around
     // it -- see `parse_float`'s doc comment for why only this much is
