@@ -51996,3 +51996,42 @@ fn test_yq_recurse_structural_descent_reads_position_like_recursive_descent_3773
     }
     Ok(())
 }
+
+/// #3639 changes how the owned identity route runs a *consumer* of a prefetched
+/// path-context body in jq mode only. yq's pipes collect their left side before the
+/// next stage runs, so the escape surfaces ahead of any consumer (yq v4.53.3 prints
+/// `Error: E2` alone for `[first((.a, error("E2")) | key)]`), and the route keeps
+/// answering that; the jq-only consumers behind `--jq-extensions` keep it too, as the
+/// cursor route does. `isempty`/`limit`/`reduce` are not yq builtins, so those rows
+/// rest on the cursor route rather than on yq.
+#[test]
+fn test_yq_consumer_of_a_prefetched_key_body_keeps_the_eager_pipe_3639() -> Result<()> {
+    for (filter, extra) in [
+        (r#"{"a":1} | [first((.a, error("E2")) | key)]"#, ""),
+        (r#"{"a":1} | [last((.a, error("E2")) | key)]"#, ""),
+        (
+            r#"{"a":1} | isempty((.a, error("E2")) | key)"#,
+            "--jq-extensions",
+        ),
+        (
+            r#"{"a":1} | [limit(1; (.a, error("E2")) | key)]"#,
+            "--jq-extensions",
+        ),
+        (
+            r#"{"a":1} | reduce ((.a, error("E2")) | key) as $x (0; 1)"#,
+            "--jq-extensions",
+        ),
+    ] {
+        let mut args = vec!["-n", "-o=json", "-I=0"];
+        if !extra.is_empty() {
+            args.push(extra);
+        }
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "", &args)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            ("", "Error: E2\n", 1),
+            "`{filter}`"
+        );
+    }
+    Ok(())
+}

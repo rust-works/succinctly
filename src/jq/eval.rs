@@ -336,6 +336,20 @@ pub trait EvalSemantics: Copy + Default {
     /// of `msg`, so an empty message raises nothing and the call yields
     /// nothing (`[error(empty), 1]` is `[1]`).
     const ERROR_OF_EMPTY_MESSAGE_ABORTS: bool;
+
+    /// If true (jq, #3639), the owned identity route lets a consumer of a
+    /// body it can only resolve by prefetching -- `isempty`, `limit`, `first`,
+    /// `skip`, `any`/`all` (which stop), `reduce` and `last` (which consume the
+    /// whole body) -- drive that body as jq does: a stop reaches the body, so an
+    /// escape raised past it is never reported, and a whole-body consumer
+    /// delivers nothing once the body raises. A `label` that resolved its own
+    /// body this way also owns the `break` the body raised. If false (yq),
+    /// none of that applies and the route keeps prefetching the body ahead of
+    /// its consumer: yq's pipes collect their left side before the next stage
+    /// runs, so the escape surfaces ahead of any consumer, which is what the
+    /// cursor route and real yq v4.53.3 answer (`first((.a, error("E2")) |
+    /// key)` raises `E2` alone) and the prefetch already reproduces.
+    const CONSUMERS_DRIVE_PREFETCHED_BODY: bool;
 }
 
 /// jq-compatible evaluation semantics (default).
@@ -371,6 +385,7 @@ impl EvalSemantics for JqSemantics {
     const BINARY_FANOUT_IS_LEFT_MAJOR: bool = false;
     const READ_ONLY_ABSENT_KEY_IS_EMPTY: bool = false;
     const ERROR_OF_EMPTY_MESSAGE_ABORTS: bool = false;
+    const CONSUMERS_DRIVE_PREFETCHED_BODY: bool = true;
 }
 
 /// yq-compatible evaluation semantics.
@@ -408,6 +423,7 @@ impl EvalSemantics for YqSemantics {
     const BINARY_FANOUT_IS_LEFT_MAJOR: bool = true;
     const READ_ONLY_ABSENT_KEY_IS_EMPTY: bool = true;
     const ERROR_OF_EMPTY_MESSAGE_ABORTS: bool = true;
+    const CONSUMERS_DRIVE_PREFETCHED_BODY: bool = false;
 }
 
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
