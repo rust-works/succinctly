@@ -26245,10 +26245,7 @@ fn path_context_resolve_constants<S: EvalSemantics>(
                 && at.prefetch.is_some()
                 && consumer_body_prefetches(body) =>
         {
-            match at.prefetch {
-                Some(prefetch) => prefetched_literal(prefetch(expr)?),
-                None => unreachable!("the guard checked `at.prefetch`"), // omni-dev: coverage tolerate-line reason="unreachable: the arm's guard requires at.prefetch to be Some"
-            }
+            prefetch_whole_consumer(at, expr)?
         }
         // #3639: the same for `any`/`all(gen; cond)` -- the decisive answer
         // stops `gen` -- through `eval_owned_identity_any_all`.
@@ -26257,10 +26254,7 @@ fn path_context_resolve_constants<S: EvalSemantics>(
                 && at.prefetch.is_some()
                 && any_all_gen_prefetches(gen, cond) =>
         {
-            match at.prefetch {
-                Some(prefetch) => prefetched_literal(prefetch(expr)?),
-                None => unreachable!("the guard checked `at.prefetch`"), // omni-dev: coverage tolerate-line reason="unreachable: the arm's guard requires at.prefetch to be Some"
-            }
+            prefetch_whole_consumer(at, expr)?
         }
         Expr::Optional(inner) => Expr::Optional(boxed(inner)?),
         Expr::FirstExpr(inner) => Expr::FirstExpr(boxed(inner)?),
@@ -26546,8 +26540,8 @@ fn path_context_resolve_constants<S: EvalSemantics>(
             // as jq raises it first) and its result dropped; the parked
             // escape is reported after. `init` is resolved first because jq
             // evaluates it first: an escape it raised is the stage's own,
-            // after the results its earlier outputs produced, and the
-            // source is then never run at all.
+            // after the results its earlier outputs produced, and a source
+            // prefetched after it runs nothing (`owned_identity_prefetch`).
             let init = boxed(init)?;
             let escaped_before = at.prefetch_escaped.is_some_and(|escaped| escaped());
             let input = boxed(input)?;
@@ -26649,6 +26643,24 @@ fn path_context_resolve_constants<S: EvalSemantics>(
             other.clone()
         }
     })
+}
+
+/// `expr` evaluated whole at the stage's position through the prefetch hook,
+/// as a literal of its outputs (#3639): the rewriter arms for a consumer take
+/// this instead of rewriting the consumer's body, so the consumer itself drives
+/// the body. Their guards require a prefetch hook, so there is always one.
+fn prefetch_whole_consumer(at: &PathContextAt<'_>, expr: &Expr) -> Result<Expr, EvalError> {
+    match at.prefetch {
+        Some(prefetch) => Ok(prefetched_literal(prefetch(expr)?)),
+        None => {
+            // omni-dev: coverage tolerate-line reason="unreachable by construction: both callers' guards require at.prefetch to be Some (#3639)"
+            debug_assert!(
+                false,
+                "a consumer was prefetched whole without a prefetch hook"
+            );
+            Ok(expr.clone()) // omni-dev: coverage tolerate-line reason="unreachable by construction, see above"
+        }
+    }
 }
 
 /// The literal of a prefetched sub-expression's outputs: `empty` for none,
