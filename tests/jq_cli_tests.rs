@@ -68639,11 +68639,11 @@ fn test_foreach_update_under_try_with_a_comma_inside_a_pipe_keeps_the_register_3
 /// (0; ($v[0]?, $v))) = 9` wrote `.a.c`), so the fold withholds the register.
 /// Marking it lost instead would make these loud, but it also makes loud a
 /// refusal that precedes an error jq's own `try` catches (the last row of
-/// `..._comma_inside_a_pipe_keeps_the_register_3770`). On `null`, `//` around a
-/// generator refuses loudly where jq answers: a bare `$k` alternate cannot
-/// relocate to the register once the body navigates anywhere (#3788), and an
-/// `and` body leaves the EXTRACT's `$k` with no register. jq 1.7.1's answers
-/// are in the comments; update the expectations when these are fixed.
+/// `..._comma_inside_a_pipe_keeps_the_register_3770`). On `null`, an `and` body
+/// leaves the EXTRACT's `$k` with no register and refuses loudly where jq
+/// answers. jq 1.7.1's answers are in the comments; update the expectations
+/// when these are fixed. (`//` around a generator was the other row until
+/// #3788, see `test_foreach_update_bare_var_alternate_keeps_the_register_3788`.)
 #[test]
 fn test_foreach_update_under_try_with_sibling_branches_characterize_preexisting_bug_3770(
 ) -> Result<()> {
@@ -68674,36 +68674,159 @@ fn test_foreach_update_under_try_with_sibling_branches_characterize_preexisting_
             "",
             0,
         ),
-        // #3788. jq: ["a"]
-        (
-            "null",
-            r"path(foreach .a? as $k (0; try (($k | .[]?) // $k); $k))",
-            "",
-            "Invalid path expression with result null",
-            5,
-        ),
-        // #3788. jq: {"a":9}
-        (
-            "null",
-            r"(foreach .a? as $k (0; try (($k | .[]?) // $k); .)) = 9",
-            "",
-            "Invalid path expression with result null",
-            5,
-        ),
-        // #3788. jq: null (a no-op write the old silent skip happened to match)
-        (
-            "null",
-            r"del(foreach .a? as $k (0; try (($k | .[]?) // $k); .))",
-            "",
-            "Invalid path expression with result null",
-            5,
-        ),
         // jq: ["a",0]
         (
             "null",
             r"path(foreach .a? as $k (0; try (($k | .[0]) and (.. | .a?)); $k))",
             "",
             "Invalid path expression with result null",
+            5,
+        ),
+    ])
+}
+
+/// #3788: a `foreach` UPDATE's `//` alternate runs after jq has backtracked out of whatever
+/// the left operand navigated, so a bare `$k` there is the register's own node again. The
+/// whole-body gate (`cannot_move_register` over `A // $k`) said the body navigates and
+/// refused the relocation, so the UPDATE refused loudly where jq answers. What decides it
+/// is the alternate's own operand: a left operand that is falsy or empty, navigating or not,
+/// leaves the alternate answered; a *truthy* navigating left still refuses a `$k` that sits
+/// after the navigation. Every row captured from jq 1.7.1 with `-c`.
+#[test]
+fn test_foreach_update_bare_var_alternate_keeps_the_register_3788() -> Result<()> {
+    let doc = r#"{"a":{"c":1}}"#;
+    assert_path_rows_3289(&[
+        // The four shapes the issue pins: path, write, `try`-wrapped delete, and EXTRACT `$k`.
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .b) // $k; .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $k (0; ($k | .b) // $k; .)) = 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $k (0; ($k | .b) // $k; .)) |= 7",
+            "{\"a\":7}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $k (0; try (($k|.b) // $k); .))",
+            "{}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .b) // $k; $k))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        // Every falsy-or-empty navigating left operand answers alike.
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .b?) // $k; .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .b | empty) // $k; .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | select(false)) // $k; .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k.b) // $k; .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        // The `null` document the #3770 characterization used to pin as a refusal.
+        (
+            "null",
+            r"path(foreach .a? as $k (0; try (($k | .[]?) // $k); $k))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            r"(foreach .a? as $k (0; try (($k | .[]?) // $k); .)) = 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            r"del(foreach .a? as $k (0; try (($k | .[]?) // $k); .))",
+            "null\n",
+            "",
+            0,
+        ),
+        // A truthy navigating left keeps its own answer, and the alternate is not consulted.
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .c) // $k; .))",
+            "[\"a\",\"c\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $k (0; ($k | .c) // $k; .)) = 9",
+            "{\"a\":{\"c\":9}}\n",
+            "",
+            0,
+        ),
+        // Must still refuse: a `$k` after navigation inside the alternate, a truthy left whose
+        // navigation ends on a value equal to the register, a constructed value, and an
+        // alternate that navigates the accumulator.
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .b) // ($k | .zz | $k); .))",
+            "",
+            "Invalid path expression with result {\"c\":1}",
+            5,
+        ),
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .c | $k) // $k; .))",
+            "",
+            "Invalid path expression with result {\"c\":1}",
+            5,
+        ),
+        (
+            doc,
+            r"path(foreach .a as $k (0; ([$k] | .[0]) // $k; .))",
+            "",
+            "Invalid path expression near attempt to access element 0 of [{\"c\":1}]",
+            5,
+        ),
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .b) // (.zz | $k); .))",
+            "",
+            "Invalid path expression near attempt to access element \"zz\" of 0",
             5,
         ),
     ])
