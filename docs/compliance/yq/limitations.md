@@ -4834,6 +4834,12 @@ and `del()` all follow the matching keys. Two gaps remain: an *unquoted* `*`
 (`.a*`) is still a parse error, and a *computed* string key (`.[ "x?" + "?" ]`)
 is still an exact lookup, because neither is a literal in the filter text.
 
+A wildcard key costs one pass over the mapping's keys plus one keyed lookup per match, and
+a keyed lookup into a document object is linear in its key count ([#3913](https://github.com/rust-works/succinctly/issues/3913)),
+so a pattern matching *m* keys of an *n*-key mapping is O(m·n): `.["k1*"]` over 8,000 keys
+matching 1,111 of them takes about 5.6 s in a debug build. A pattern matching a handful of
+keys, or a document of many small records, stays linear.
+
 ## Provenance
 
 | Artifact | Path |
