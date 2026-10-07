@@ -126839,12 +126839,16 @@ mod tests {
             ),
             // #3891: `error(.)` and bare `error` raise the register's own node,
             // which jq's `jv_identical` sees as the register for a container too;
-            // the resolver tells it by storage, so the handler navigates it.
+            // the resolver tells it by storage, so the handler navigates it. Only
+            // with `std`: without it this route does not hold the caller's own
+            // tree, so the refusal below stands (a library build, never the CLI).
+            #[cfg(feature = "std")]
             (
                 &br#"{"a":{"b":1}}"#[..],
                 r"path(.a | try error(.) catch .)",
                 r#"["a"]"#,
             ),
+            #[cfg(feature = "std")]
             (
                 &br#"{"a":{"b":1}}"#[..],
                 r"path(.a | try error(.) catch .b)",
@@ -126883,6 +126887,14 @@ mod tests {
                 &br#"{"a":{"b":1}}"#[..],
                 r"path(.a | (try error(null) catch .) | .b)",
                 r#"Invalid path expression near attempt to access element "b" of null"#,
+            ),
+            // Without `std` there is no storage identity to tell `error(.)` from a
+            // rebuilt copy, so it refuses where jq answers (the pre-#3891 row).
+            #[cfg(not(feature = "std"))]
+            (
+                &br#"{"a":{"b":1}}"#[..],
+                r"path(.a | try error(.) catch .)",
+                r#"Invalid path expression with result {"b":1}"#,
             ),
             // A payload that merely equals the register is a rebuilt copy, not its
             // node (`error(.)` is, #3891; this is not), and jq refuses it.
