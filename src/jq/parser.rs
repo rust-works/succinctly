@@ -6728,6 +6728,7 @@ impl<'a> Parser<'a> {
 
         // Phase 10: Array functions
         if self.matches_keyword("transpose") {
+            self.reject_unless_jq_extensions("transpose")?;
             self.consume_keyword("transpose");
             return Ok(Some(Builtin::Transpose));
         }
@@ -11556,6 +11557,7 @@ mod tests {
             ("gsub", r#"gsub("a";"b")"#),
             ("scan", r#"scan("a")"#),
             ("tostream", "tostream"),
+            ("transpose", "transpose"),
             ("fromstream", "fromstream(.)"),
             ("truncate_stream", "truncate_stream(.)"),
             ("getpath", "getpath([])"),

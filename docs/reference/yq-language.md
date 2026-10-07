@@ -535,6 +535,7 @@ surface (#1512):
 | `combinations`, `combinations(n)`                    | Cartesian product of an array of arrays       |
 | `pow(base; exp)`                                     | Exponentiation                                |
 | `bsearch(target)`                                    | Binary search index in a sorted array         |
+| `transpose`                                          | Transpose an array of arrays, `null`-padded (#3954) |
 | `strftime(fmt)`, `strptime(fmt)`                     | Broken-down-time formatting / parsing (#1650) |
 | `strflocaltime(fmt)`                                 | `strftime` in the local zone (#3046)          |
 | `format(name)`                                       | `@name` chosen at run time (#3046)            |
