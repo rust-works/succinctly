@@ -44902,7 +44902,8 @@ fn yields_only_the_register(e: &Expr) -> bool {
 /// where jq refuses inside an `or` under a `try`, 54 sampled rows; those were the
 /// resolver's uncatchable "with result" refusal of a `.` body after a moved register,
 /// which [`body_performs_no_step`] now keeps from firing early.) A `?//` chain is left
-/// to the by-value drive as for a fresh source ([`routes_destructuring`]).
+/// to the by-value drive as for a fresh source ([`routes_destructuring`]), except as a
+/// nested `foreach`'s own patterns over the register ([`routes_destructuring_chain`], #3948).
 fn foreach_source_destructures_register(source: &Expr) -> bool {
     match unwrap_paren(source) {
         Expr::AsPattern { expr, patterns, .. } => {
@@ -44917,9 +44918,19 @@ fn foreach_source_destructures_register(source: &Expr) -> bool {
             .is_some_and(foreach_source_destructures_register),
         Expr::Foreach {
             input, patterns, ..
-        } => routes_destructuring(patterns) && yields_only_the_register(input),
+        } => {
+            (routes_destructuring(patterns) || routes_destructuring_chain(patterns))
+                && yields_only_the_register(input)
+        }
         _ => false,
     }
+}
+
+/// A `?//` chain whose every alternative is an array or object pattern (#3948):
+/// jq's register follows the first alternative that matches, which the resolver's
+/// per-alternative walk states.
+fn routes_destructuring_chain(patterns: &[Pattern]) -> bool {
+    patterns.len() > 1 && routes_fresh_destructuring(patterns)
 }
 
 /// Whether `e` is a fold whose own SOURCE destructures the register (`. as [$q] | .`)
