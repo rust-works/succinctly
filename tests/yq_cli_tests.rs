@@ -166,9 +166,10 @@ fn test_yq_recurse_cap_raises_instead_of_ending_silently_3716() -> Result<()> {
 /// instead of silently skipping the write.
 ///
 /// Real yq's lexer rejects both names (v4.53.3), so they are succinctly
-/// extensions behind `--jq-extensions` that mean what jq defines and share the
-/// path-register table with jq mode; gating the arms to jq mode would have left
-/// the silent discard. Without the flag they are still the lexer error.
+/// extensions that mean what jq defines and share the path-register table with
+/// jq mode; gating the arms to jq mode would have left the silent discard.
+/// `INDEX` needs `--jq-extensions` to parse at all; `transpose` is not on the
+/// gate list yet, so only the path check is pinned for it here.
 #[test]
 fn test_yq_index_and_transpose_raise_inside_path_like_jq_3888() -> Result<()> {
     let args = ["--jq-extensions", "-o=json", "-I=0"];
@@ -189,14 +190,33 @@ fn test_yq_index_and_transpose_raise_inside_path_like_jq_3888() -> Result<()> {
     // Where jq's `transpose` does not reach its access, it answers.
     let (stdout, code) = run_yq_stdin("[path(([[]] | transpose) | empty)]", "{}", &args)?;
     assert_eq!((stdout.as_str(), code), ("[]\n", 0));
-    // No flag, no builtin: the lexer rejects the name before any path rule runs.
-    let (stdout, stderr, code) = run_yq_stdin_with_stderr(
-        "[path(([[1]] | transpose) | empty)]",
-        "{}",
-        &["-o=json", "-I=0"],
-    )?;
+    // No flag, no `INDEX`: the parser rejects the name before any path rule runs.
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr("[[1]] | INDEX(.)", "{}", &["-o=json", "-I=0"])?;
     assert_ne!(code, 0, "stdout: {stdout:?}");
-    assert!(!stderr.contains("Invalid path expression"), "{stderr:?}");
+    assert!(
+        stderr.contains("\"INDEX\" is not part of yq's syntax"),
+        "{stderr:?}"
+    );
+    Ok(())
+}
+
+/// #3950: `transpose` pads short rows with `null` in yq mode too.
+///
+/// Real yq's lexer rejects `transpose` (v4.53.3), so there is no yq answer to
+/// match; the builtin means what jq defines and shares one implementation with
+/// jq mode.
+#[test]
+fn test_yq_transpose_pads_short_rows_like_jq_3950() -> Result<()> {
+    let args = ["--jq-extensions", "-o=json", "-I=0"];
+    for (input, want) in [
+        ("[[1,2],[3]]", "[[1,3],[2,null]]\n"),
+        ("{a: [1,2], b: [3]}", "[[1,3],[2,null]]\n"),
+        ("[[1],null]", "[[1,null]]\n"),
+    ] {
+        let (stdout, code) = run_yq_stdin("transpose", input, &args)?;
+        assert_eq!((stdout.as_str(), code), (want, 0), "`{input}`");
+    }
     Ok(())
 }
 

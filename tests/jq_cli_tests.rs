@@ -61152,6 +61152,87 @@ fn test_transpose_stays_silent_or_raises_its_value_error_first_in_path_3888() ->
     Ok(())
 }
 
+/// #3950: by value, `transpose` is jq's `[range(0; map(length) | max) as $i |
+/// [.[] | .[$i]]]` -- short rows pad with `null`, a `null` row is all `null`,
+/// an object input iterates its values, and a row that cannot be indexed by a
+/// number raises. Every row captured live from jq 1.7.1 as `try transpose catch
+/// "ERR: \(.)"`.
+#[test]
+fn test_transpose_follows_jqs_definition_by_value_3950() -> Result<()> {
+    for (input, want) in [
+        ("[[1,2],[3]]", "[[1,3],[2,null]]"),
+        ("[[1],[2,3],[]]", "[[1,2,null],[null,3,null]]"),
+        ("[[1,2,3],[4],[5,6]]", "[[1,4,5],[2,null,6],[3,null,null]]"),
+        ("[[1],null]", "[[1,null]]"),
+        ("[null,[1,2]]", "[[null,1],[null,2]]"),
+        // Cells are not flattened: a row's element stays one cell.
+        ("[[[1,2]],[[3]]]", "[[[1,2],[3]]]"),
+        // `.[]` of an object is its values.
+        (r#"{"a":[1,2],"b":[3]}"#, "[[1,3],[2,null]]"),
+        // No row, or no row with a length: the range is empty.
+        ("[]", "[]"),
+        ("{}", "[]"),
+        ("[[]]", "[]"),
+        ("[null]", "[]"),
+        ("[{}]", "[]"),
+        (r#"[""]"#, "[]"),
+        (r#"{"a":[],"b":null}"#, "[]"),
+        // A row without a number index raises once the range yields, in row
+        // order and whatever the row's own length -- jq names the row's type.
+        ("[1,\"a\"]", r#""ERR: Cannot index number with number""#),
+        (r#"[[1],"ab"]"#, r#""ERR: Cannot index string with number""#),
+        (
+            r#"[[1,2],{"a":3}]"#,
+            r#""ERR: Cannot index object with number""#,
+        ),
+        // `map(length)` runs first, so its own errors win.
+        ("[[1],true]", r#""ERR: boolean (true) has no length""#),
+        (r#""a""#, r#""ERR: Cannot iterate over string (\"a\")""#),
+        ("5", r#""ERR: Cannot iterate over number (5)""#),
+        ("null", r#""ERR: Cannot iterate over null (null)""#),
+    ] {
+        let (stdout, code) = run_jq_stdin(r#"try transpose catch "ERR: \(.)""#, input, &["-c"])?;
+        assert_eq!(code, 0, "#3950: `{input}`: stdout {stdout:?}");
+        assert_eq!(stdout.trim(), want, "#3950: `{input}`");
+    }
+    // `?` suppresses the failure instead of raising it, for the input's own
+    // type and for a row that cannot be indexed alike.
+    for input in ["5", r#"[[1],"a"]"#, "[[1],true]"] {
+        let (stdout, code) = run_jq_stdin("[transpose?]", input, &["-c"])?;
+        assert_eq!((stdout.trim(), code), ("[]", 0), "#3950: `{input}`");
+    }
+    Ok(())
+}
+
+/// #3950: an output far larger than its input is refused instead of built. jq
+/// builds all `width x rows` cells (this input is ~4 million, and the same shape
+/// at 100k is ~10^10, which exhausts the host); a rectangular input of the same
+/// output size, and a ragged one within the factor, are untouched.
+#[test]
+fn test_transpose_refuses_an_output_far_larger_than_its_input_3950() -> Result<()> {
+    let zeros = vec!["0"; 2000].join(",");
+    let empties = vec!["[]"; 2000].join(",");
+    let ragged = format!("[[{zeros}],{empties}]");
+    let (stdout, stderr, code) = run_jq_full(&["-c", "transpose | length"], Some(&ragged))?;
+    assert_eq!(code, 5, "stdout {stdout:?}");
+    assert!(
+        stderr.contains("transpose: maximum output size exceeded"),
+        "{stderr:?}"
+    );
+    // A resource limit is not catchable, by `try` or `?`.
+    let (stdout, code) = run_jq_stdin("[try transpose catch 1]", &ragged, &["-c"])?;
+    assert_eq!(code, 5, "stdout {stdout:?}");
+    // Rectangular: 1500 x 1500 cells, as large as the output, is answered.
+    let row = vec!["1"; 1500].join(",");
+    let rect = format!("[{}]", vec![format!("[{row}]"); 1500].join(","));
+    let (stdout, code) = run_jq_stdin("transpose | map(length) | unique", &rect, &["-c"])?;
+    assert_eq!((stdout.trim(), code), ("[1500]", 0));
+    // Ragged but within 16x the cells it holds: answered, padded.
+    let (stdout, code) = run_jq_stdin("transpose | length", "[[1,2,3],[],[]]", &["-c"])?;
+    assert_eq!((stdout.trim(), code), ("3", 0));
+    Ok(())
+}
+
 /// #3347: `indices`, `index` and `rindex` on a value the resolver is not
 /// tracking raise jq's `Invalid path expression`, naming the access jq's own
 /// definition makes -- which depends on the *evaluated pattern*, the one thing

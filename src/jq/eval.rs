@@ -39959,46 +39959,36 @@ fn builtin_navigation<S: EvalSemantics>(
     }
 }
 
-/// The navigation `transpose` performs on an input the resolver is not
-/// tracking (#3888).
+/// The rows `transpose` iterates and whether its `range(0; map(length) | max)`
+/// yields a first index (#3888, #3950).
 ///
-/// `def transpose: if . == [] then [] else . as $in | (map(length) | max) as
-/// $max | [range(0; $max) as $j | [range(0; $in|length) as $i | $in[$i][$j]]]
-/// end;` -- every statement of that is captured from jq 1.7.1:
+/// jq 1.7.1 (`--debug-dump-disasm`): `def transpose: [range(0; map(length) |
+/// max) as $i | [.[] | .[$i]]];`. Every statement of that is captured live:
 ///
-/// - `[]` is the one input that navigates nothing at all.
-/// - `map(length)` is the source of an `as` binding, so it runs in a subexpression
-///   where jq does not path-check: its own failures are plain value errors, in
-///   element order (`5 | transpose` is `Cannot iterate over number (5)`, `[[],
-///   true]` is `boolean (true) has no length`), and win over everything below.
-/// - Past it, the body's path-checked access runs once `range(0; $max)` yields a
-///   `$j`, i.e. once some row has a length above zero (`[[1], null]` and `[1]`
-///   do, `[[], null]`, `[0.0]` and `{"a": []}` do not; an all-`NaN` maximum does
-///   too, as `range(0; nan)` is not empty). That access raises `near attempt to
-///   iterate through <input>` ahead of any value error of its own (`[1, "a"]`
-///   and `[[1,2], "ab"]` name the path, not `Cannot index number with number`).
-fn transpose_navigation<S: EvalSemantics>(
-    value: &OwnedValue,
-) -> Result<Option<BuiltinNavigation>, EvalEscape> {
-    let rows: Vec<&OwnedValue> = match value {
-        OwnedValue::Array(rows) if rows.is_empty() => return Ok(None),
+/// - `map(length) | max` is the `range` bound, which jq evaluates in a
+///   subexpression where it does not path-check: its own failures are plain
+///   value errors, in row order (`5 | transpose` is `Cannot iterate over number
+///   (5)`, `[[], true]` is `boolean (true) has no length`) and win over
+///   everything after.
+/// - `[]` and `{}` have no row, so `max` is `null` and the range is empty.
+/// - Otherwise the range yields a first `$i` once some row has a length above
+///   zero (`[[1], null]` and `[1]` do; `[[], null]`, `[0.0]` and `{"a": []}` do
+///   not), or when every length is `NaN` -- `max` sorts a `NaN` below every
+///   number, and `range(0; nan)` is not empty.
+fn transpose_rows<S: EvalSemantics>(
+    input: &OwnedValue,
+) -> Result<(Vec<&OwnedValue>, bool), EvalError> {
+    let rows: Vec<&OwnedValue> = match input {
         OwnedValue::Array(rows) => rows.iter().collect(),
         OwnedValue::Object(fields) => fields.values().collect(),
-        other => {
-            return Err(EvalEscape::Error(EvalError::cannot_iterate_with(
-                S::TAG,
-                other,
-            )))
-        }
+        other => return Err(EvalError::cannot_iterate_with(S::TAG, other)),
     };
     // Every row's length is taken before any is judged, since `map` stops at
-    // the first row that has none and that error beats a path error.
+    // the first row that has none and that error beats everything after it.
     let mut positive = false;
     let mut real = false;
-    let mut any_row = false;
-    for row in rows {
-        any_row = true;
-        match owned_value_jq_length::<S>(row).map_err(EvalEscape::Error)? {
+    for row in &rows {
+        match owned_value_jq_length::<S>(row)? {
             OwnedValue::Int(len) => {
                 real = true;
                 positive |= len > 0;
@@ -40010,11 +40000,20 @@ fn transpose_navigation<S: EvalSemantics>(
             _ => unreachable!("owned_value_jq_length only ever returns Int or Float"), // patchcov: coverage tolerate-line reason="unreachable: owned_value_jq_length's own match only ever constructs OwnedValue::Int or OwnedValue::Float, as in the Reverse arm of builtin_navigation (#3888)"
         }
     }
-    // `max` sorts a `NaN` below every number, so a `NaN` length only decides the
-    // maximum when every row has one -- and then `range(0; nan)` is not empty
-    // (jq 1.7.1: `[nan] | path(transpose | empty)` raises on the path).
-    let navigates = positive || (any_row && !real);
-    Ok(navigates.then_some(BuiltinNavigation::Iterate))
+    let iterates = positive || (!rows.is_empty() && !real);
+    Ok((rows, iterates))
+}
+
+/// The navigation `transpose` performs on an input the resolver is not
+/// tracking (#3888): the path-checked `.[]` of its body, reached once
+/// [`transpose_rows`] says the range yields an index, which raises `near attempt
+/// to iterate through <input>` ahead of any value error of its own (`[1, "a"]`
+/// and `[[1,2], "ab"]` name the path, not `Cannot index number with number`).
+fn transpose_navigation<S: EvalSemantics>(
+    value: &OwnedValue,
+) -> Result<Option<BuiltinNavigation>, EvalEscape> {
+    let (_, iterates) = transpose_rows::<S>(value).map_err(EvalEscape::Error)?;
+    Ok(iterates.then_some(BuiltinNavigation::Iterate))
 }
 
 /// The three builtins jq defines on top of one `$i`-parameter navigation, whose
@@ -71361,64 +71360,89 @@ fn builtin_rtrim<W: Clone + AsRef<[u64]>>(
 
 // Array functions
 
-/// Builtin: transpose - transpose array of arrays
+/// Builtin: transpose
+///
+/// jq 1.7.1 defines it as `[range(0; map(length) | max) as $i | [.[] |
+/// .[$i]]]` (`--debug-dump-disasm`), so the input is iterated with `.[]` (an
+/// object contributes its values), a row's width is its `length`, and each cell
+/// is `.[$i]` of the row: `null` past the end of a shorter array and for a
+/// `null` row, a `Cannot index <type> with number` for any other row (#3950).
 fn builtin_transpose<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    let elements = match value {
-        StandardJson::Array(a) => a,
-        _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::new("transpose requires array")),
-    };
-
-    // Collect all inner arrays
     // #1755: to_owned, not to_owned_lossy -- an undecodable element must
     // raise, not silently become "" and take part in the transpose.
     //
-    // #2327: suppress_or_raise, not a bare `QueryResult::Error(e)` -- the
-    // top-level non-array check above already consults `optional`, so
-    // ignoring it for these two element-level materializations was the same
-    // asymmetry #2280 fixed for Format/Path/GetPath.
-    let mut inner_arrays: Vec<Vec<OwnedValue>> = Vec::new();
-    for item in elements {
-        match item {
-            StandardJson::Array(inner) => match inner.map(|v| to_owned::<S, _>(&v)).collect() {
-                Ok(row) => inner_arrays.push(row),
-                Err(e) => return suppress_or_raise(e, optional),
-            },
-            // Non-array elements are treated as single-element arrays
-            _ => match to_owned::<S, _>(&item) {
-                Ok(owned) => inner_arrays.push(vec![owned]),
-                Err(e) => return suppress_or_raise(e, optional),
-            },
-        }
+    // #2327: the materialization and the transposition both go through
+    // `optional`, as every sibling does.
+    let owned = to_owned_or_suppress!(&value, optional);
+    match transpose_owned::<S>(&owned) {
+        Ok(transposed) => QueryResult::Owned(transposed),
+        Err(e) => suppress_or_raise(e, optional),
     }
+}
 
-    if inner_arrays.is_empty() {
-        return QueryResult::Owned(OwnedValue::array());
+/// Cells `transpose` may build for an input of any shape (#3950).
+const TRANSPOSE_FREE_CELLS: usize = 1 << 20;
+
+/// How many times the cells the input holds `transpose` may build before it
+/// refuses (#3950), see [`transpose_owned`].
+const TRANSPOSE_RAGGED_FACTOR: usize = 16;
+
+/// `transpose` of an already-materialized value (#3950), see
+/// [`builtin_transpose`]. Raises a resource limit rather than build an output
+/// of more than [`TRANSPOSE_FREE_CELLS`] cells that is also over
+/// [`TRANSPOSE_RAGGED_FACTOR`] times the input -- a divergence from jq (which
+/// would exhaust memory), recorded in `docs/compliance/jq/limitations.md`.
+fn transpose_owned<S: EvalSemantics>(input: &OwnedValue) -> Result<OwnedValue, EvalError> {
+    let (rows, iterates) = transpose_rows::<S>(input)?;
+    if !iterates {
+        return Ok(OwnedValue::array());
     }
-
-    // Find max length
-    let max_len = inner_arrays
-        .iter()
-        .map(alloc::vec::Vec::len)
-        .max()
-        .unwrap_or(0);
-
-    // Build transposed result
-    let mut result = vec_with_capacity(max_len);
-    for i in 0..max_len {
-        let mut row = Vec::new();
-        for inner in &inner_arrays {
-            if let Some(val) = inner.get(i) {
-                row.push(val.clone());
+    // The first `$i` runs `.[$i]` over every row in order, so the first row
+    // that cannot be indexed by a number raises -- before any column is built,
+    // and whatever its own length was.
+    let mut width = 0;
+    let mut held = 0usize;
+    for row in &rows {
+        match row {
+            OwnedValue::Array(cells) => {
+                width = width.max(cells.len());
+                held = held.saturating_add(cells.len());
+            }
+            OwnedValue::Null => {}
+            other => {
+                return Err(EvalError::cannot_index(
+                    other.type_name(),
+                    &OwnedValue::Int(0),
+                ))
             }
         }
-        result.push(OwnedValue::array_from(row));
     }
-
-    QueryResult::Owned(OwnedValue::array_from(result))
+    // jq builds `width x rows` cells, which a ragged input makes far larger than
+    // the input (one 100k-cell row among 100k empty ones is ~10^10 cells from a
+    // few hundred KB), and would exhaust the host. A rectangular input is exactly
+    // as big as its output and a modestly ragged one is allowed
+    // `TRANSPOSE_RAGGED_FACTOR` times that; a small input may take any shape.
+    let cells = width.saturating_mul(rows.len());
+    if cells > TRANSPOSE_FREE_CELLS.max(TRANSPOSE_RAGGED_FACTOR.saturating_mul(held + rows.len())) {
+        return Err(EvalError::resource_limit(
+            "transpose: maximum output size exceeded",
+        ));
+    }
+    let mut columns = vec_with_capacity(width);
+    for i in 0..width {
+        let column: Vec<OwnedValue> = rows
+            .iter()
+            .map(|row| match row {
+                OwnedValue::Array(cells) => cells.get(i).cloned().unwrap_or(OwnedValue::Null),
+                _ => OwnedValue::Null,
+            })
+            .collect();
+        columns.push(OwnedValue::array_from(column));
+    }
+    Ok(OwnedValue::array_from(columns))
 }
 
 /// Builtin: bsearch(x) - binary search for x in sorted array
