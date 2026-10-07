@@ -1930,7 +1930,7 @@ is the revert that established what the other one costs.
    | `. as $x \| ltrimstr("z") \| path($x)` (and a no-match `sub`/`rtrimstr`, `abs`, `walk(.)`, `setpath([]; .)`, `tostring \| tostring`, `reduce . as $y (null; $y)`) on a scalar | #3191 gives a bound string or number literal storage identity, but these builtins run through the owned re-index round trip, which hands `path()` a fresh copy -- the scalar twin of the bridged-builtin residual above. One more stays refused for a reason of its own: jq's constant pool (`def f: 5; f as $x \| f \| path($x)` is one `jv`) has no counterpart here, where each evaluation of a literal is a fresh value. The sweep's `scalar-*` rows pin each                                                                                                                       |
    | `. as $x \| .a as $y \| [.] \| path(.[0].a \| $y)`                                                                                                                            | `$x` is bound first, so `[.]` reuses `$x`'s own value, whose `.a` is `$x`'s materialization, not `$y`'s: sharing it needs an *ancestor* lookup when `$y` is bound, the mirror of #3179's nested reuse (jq `[0,"a"]`; the other bind order answers since #3179)                                                                                                                                                                                                                                                                                                                          |
    | `reduce (1) as $i (.; if true then . else 1 end) \| path($x)`                                                                                                                 | the UPDATE is not one of the owned fast paths (`eval_owned_navigation`/`eval_owned_relocating_fold`), so the fold's own hoisted per-step reroot rebuilds the accumulator before `path($x)` reads it                                                                                                                                                                                                                                                                                                                                                                                     |
-   | `reduce .[] as $x (.; del(.[0] \| $x))` (and a computed INIT such as `{k:.} \| .k`) on stdin                                                                                  | a fold's loop variable is marked, and INIT's own `Rc` registered for the source to reuse, only for a node INIT itself names ([#3329](https://github.com/rust-works/succinctly/issues/3329)): a source that navigates *below* INIT's node, or a computed INIT with no cursor, needs the ancestor lookup #3179's nested reuse has no mirror for. A scalar loop variable (`reduce (.) as $x (.; path($x))` on a string or number) has no storage identity until a bind promotes it (#3191)                                                                                                 |
+   | `{k:.} \| .k` (a computed INIT) on stdin                                                                                                                                      | a fold's loop variable is marked, and INIT's own `Rc` registered for the source to reuse, for a node INIT names and, since [#3897](https://github.com/rust-works/succinctly/issues/3897), any container below it: a computed INIT has no cursor to key an entry on. A scalar loop variable (`reduce (.) as $x (.; path($x))` on a string or number) has no storage identity until a bind promotes it (#3191)                                                                                                                                                                            |
    | `no_std` builds                                                                                                                                                               | `embed_table` is thread-local; without `std` it is a no-op, refuse-only like `file_index`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
    | `succinctly yq`                                                                                                                                                               | unchanged by design — `RootWitness::of_owned` is gated on `S::TAG == EvalTag::Jq`; yq's node model is #2643's business (ADR-0018)                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 
@@ -2006,7 +2006,11 @@ is the revert that established what the other one costs.
      so INIT's first output is registered on the embed table for the fork it starts
      (`drive_foreach_init_generic`), and the source's later materialization of the same node returns
      INIT's own `Rc`. The entry makes the accumulator's first in-place write copy once; only a fold
-     that marks its loop variables asks for it.
+     that marks its loop variables asks for it. Since #3897 the entry also answers a source that
+     navigates *below* INIT's node (`reduce .[] as $x (.; del(.[0] | $x))`): the materialization
+     of a descendant climbs to the entry's node and returns the matching child of INIT's value
+     (`embed_descendant_shared`, the mirror of #3179's nested reuse), declining for a shadowed
+     duplicate key. Only a fold's INIT entry descends; an ordinary `as` bind's entry does not.
 
    **Only the first INIT fork is marked.** jq 1.7.1 evaluates SOURCE against `null` on every later
    fork (`[reduce (.) as $x ((.,.); $x)]` is `[{"a":1},null]`), so a write through `$x` answers once
@@ -2018,10 +2022,14 @@ is the revert that established what the other one costs.
    Still refused where jq answers, none answering where jq refuses (pinned in
    `test_fold_loop_variable_in_path_position_3329` and the sweep's `fold-loop-var-*` rows):
 
-   - on the stdin route, a source that navigates *below* INIT's node (`reduce .[] as $x (.; del(.[0]
-     | $x))`, `reduce .a as $x (.; del(.a | $x))`), or a computed INIT with no cursor (`{k:.} | .k`,
-     `. + {}`): the embed table reuses a node's own `Rc`, never a descendant of one it holds (the
-     ancestor lookup #3179's nested reuse has no mirror for);
+   - on the stdin route, a computed INIT with no cursor (`{k:.} | .k`, `. + {}`): there is no node
+     to key an entry on;
+   - on the stdin route, a source whose path to INIT's node passes a member a later one shadows
+     (`reduce .[] as $x (.; del(.a | $x))` over `{"a":{"x":1},"a":{"x":2}}`, which jq answers `{}`):
+     the accumulator holds only the last member, so the descent declines rather than hand back
+     the wrong node;
+   - on the stdin route, a source that is an empty `{}`/`[]` or a scalar below INIT's node: only a
+     container with children is looked up (#3897);
    - a scalar loop variable (`reduce (.) as $x (.; path($x))` on a string or number): no storage
      identity until a bind promotes it (#3191);
    - a loop variable that reaches the resolver only through a rebinding (`reduce (.) as $x (.; $x |

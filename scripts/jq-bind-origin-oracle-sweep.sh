@@ -208,7 +208,11 @@
 # round-tripped source, an equal sibling, and every later INIT fork -- jq
 # evaluates SOURCE against `null` there): both binaries must exit 5. The
 # `-input-route` rows reach `eval.rs`'s owned fold the same way the
-# `owned-embed-*` rows do.
+# `owned-embed-*` rows do. The `fold-loop-var-below-init*` rows are #3897: a
+# source that navigates below INIT's node yields the matching child of INIT's
+# registered value, so `reduce .[] as $x (.; del(.[0] | $x))` answers on the
+# stdin route too; a source that is not below INIT (`-outside-init-refuses`), or
+# an element the path does not name, still refuses as jq does.
 #
 # Usage:
 #   cargo build --release --features cli
@@ -1159,6 +1163,17 @@ fold-loop-var-equal-sibling-refuses	{"a":{"b":1},"c":{"b":1}}	reduce .a as $x (.
 fold-loop-var-later-init-fork-refuses	{"a":1}	reduce (.) as $x ((.,.); ($x.a) = 9)
 fold-loop-var-later-init-fork-foreach-refuses	{"a":1}	[foreach (.) as $x ((.,.); ($x.a) = 9; .)]
 fold-loop-var-scalar-refuses	"s"	reduce (.) as $x (.; path($x))
+fold-loop-var-below-init	[{"a":1}]	reduce .[] as $x (.; del(.[0] | $x))
+fold-loop-var-below-init-object	{"a":{"b":1}}	reduce .a as $x (.; del(.a | $x))
+fold-loop-var-below-init-two-levels	{"a":{"c":{"b":1}}}	reduce .a.c as $x (.; del(.a.c | $x))
+fold-loop-var-below-init-navigated-init	[[{"a":1}]]	reduce .[0][] as $x (.[0]; del(.[0] | $x))
+fold-loop-var-below-init-foreach	[{"a":1}]	foreach .[] as $x (.; del(.[0] | $x); .)
+fold-loop-var-below-init-foreach-extract	[{"a":1}]	foreach .[] as $x (.; .; path(.[0] | $x))
+fold-loop-var-below-init-input-route	[{"a":1}] [{"a":1}]	input | reduce .[] as $x (.; del(.[0] | $x))
+fold-loop-var-below-init-other-element-refuses	[{"a":1},{"b":2}]	reduce .[] as $x (.; del(.[1] | $x))
+fold-loop-var-below-init-bare-path-refuses	[{"a":1}]	reduce .[] as $x (.; path($x))
+fold-loop-var-below-init-write-through-refuses	{"a":{"b":1}}	reduce .a as $x (.; ($x.b) = 9)
+fold-loop-var-outside-init-refuses	{"a":{"b":1},"c":{"b":1}}	reduce .a as $x (.c; del(.c | $x))
 CASES_EOF
 
 # Known refuse-only rows (jq answers, succinctly refuses), each with the

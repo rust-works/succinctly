@@ -6922,6 +6922,14 @@ mod embed_table {
         height: Cell<Option<usize>>,
         /// `Some` for an anchor entry (#3134), `None` for a binding's own.
         anchor: Option<Anchor>,
+        /// A fold's INIT entry (#3897): a materialization of a *descendant*
+        /// of `node` returns the matching child of `value` ([`descendant`]),
+        /// the mirror of #3179's reuse of a node nested inside the walk.
+        descends: bool,
+        /// The subtree end of a descending entry's node, asked once by the
+        /// first lookup that needs it (#3897); `0` where the format cannot
+        /// say, so such an entry covers nothing.
+        extent: Cell<Option<usize>>,
     }
 
     /// What an anchor entry adds (#3134): the bound node `child` inside
@@ -6942,6 +6950,18 @@ mod embed_table {
         /// Whether any entry is an anchor -- the resolver's gate for
         /// tracking positions on a marker it could certify by one (#3134).
         static ANCHORED: Cell<bool> = const { Cell::new(false) };
+        /// Whether any entry `descends` (#3897): the one extra load a
+        /// materialization pays while a table is live.
+        static DESCENDING: Cell<bool> = const { Cell::new(false) };
+        /// `(document, parent)` -> whether `parent`'s members spell distinct
+        /// keys (#3897), so a descent answers by key without a scan per
+        /// member. Cleared with the last descending entry.
+        static DISTINCT: RefCell<Vec<(usize, usize, bool)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Whether a fold's INIT entry is in scope (#3897).
+    pub(crate) fn descending() -> bool {
+        DESCENDING.with(Cell::get)
     }
 
     /// Whether any binding is in scope at all -- the cheap gate every read
@@ -6972,15 +6992,24 @@ mod embed_table {
             // disagree.
             TABLE.with(|t| {
                 let mut t = t.borrow_mut();
+                // A verdict is only trusted while the entry it was computed
+                // under lives: a document token is an address and can be
+                // reused once its index is gone (#3897).
+                if t.iter().skip(self.0).any(|e| e.descends) {
+                    DISTINCT.with(|d| d.borrow_mut().clear());
+                }
                 t.truncate(self.0);
                 ACTIVE.with(|a| a.set(!t.is_empty()));
                 ANCHORED.with(|a| a.set(t.iter().any(|e| e.anchor.is_some())));
+                let descending = t.iter().any(|e| e.descends);
+                DESCENDING.with(|a| a.set(descending));
             });
         }
     }
 
     fn push_entry(entry: Entry) -> Guard {
         let anchor = entry.anchor.is_some();
+        let descends = entry.descends;
         let previous = TABLE.with(|t| {
             let mut t = t.borrow_mut();
             let previous = t.len();
@@ -6990,6 +7019,9 @@ mod embed_table {
         ACTIVE.with(|a| a.set(true));
         if anchor {
             ANCHORED.with(|a| a.set(true));
+        }
+        if descends {
+            DESCENDING.with(|a| a.set(true));
         }
         Guard(previous)
     }
@@ -7003,6 +7035,21 @@ mod embed_table {
             value: Some(value),
             height: Cell::new(None),
             anchor: None,
+            descends: false,
+            extent: Cell::new(None),
+        })
+    }
+
+    /// [`push`] for a fold's INIT (#3897): see [`Entry::descends`].
+    pub(crate) fn push_descending(node: usize, document: usize, value: OwnedValue) -> Guard {
+        push_entry(Entry {
+            node,
+            document,
+            value: Some(value),
+            height: Cell::new(None),
+            anchor: None,
+            descends: true,
+            extent: Cell::new(None),
         })
     }
 
@@ -7024,6 +7071,8 @@ mod embed_table {
                 child,
                 steps: Some(steps),
             }),
+            descends: false,
+            extent: Cell::new(None),
         })
     }
 
@@ -7037,6 +7086,8 @@ mod embed_table {
             value: None,
             height: Cell::new(None),
             anchor: Some(Anchor { child, steps: None }),
+            descends: false,
+            extent: Cell::new(None),
         })
     }
 
@@ -7054,6 +7105,77 @@ mod embed_table {
                 .find(|e| e.node == node && e.document == document && e.value.is_some())
                 .and_then(|e| e.value.clone())
         })
+    }
+
+    /// Whether a descending entry of `document` has `node` strictly inside
+    /// its subtree (#3897). `end_of` names the subtree end of the entry's
+    /// node, asked at most once per entry and kept; it reads only the
+    /// document, never this table.
+    pub(crate) fn descending_covers(
+        node: usize,
+        document: usize,
+        end_of: impl Fn(usize) -> Option<usize>,
+    ) -> bool {
+        TABLE.with(|t| {
+            t.borrow().iter().any(|e| {
+                if !e.descends || e.document != document || e.node >= node {
+                    return false;
+                }
+                let end = match e.extent.get() {
+                    Some(end) => end,
+                    None => {
+                        let end = end_of(e.node).unwrap_or(0);
+                        e.extent.set(Some(end));
+                        end
+                    }
+                };
+                node < end
+            })
+        })
+    }
+
+    /// The value of the innermost descending entry at `(node, document)`.
+    pub(crate) fn descending_for(node: usize, document: usize) -> Option<OwnedValue> {
+        TABLE.with(|t| {
+            t.borrow()
+                .iter()
+                .rev()
+                .find(|e| e.descends && e.node == node && e.document == document)
+                .and_then(|e| e.value.clone())
+        })
+    }
+
+    /// Whether the members of `(parent, document)` spell distinct keys,
+    /// `compute`d once and remembered while a descending entry lives (#3897).
+    pub(crate) fn distinct_keys(
+        parent: usize,
+        document: usize,
+        compute: impl FnOnce() -> bool,
+    ) -> bool {
+        const CAPACITY: usize = 8;
+        // Least recently used last: a hit moves to the back, so the root
+        // object every element climbs through is never the one dropped.
+        let known = DISTINCT.with(|d| {
+            let mut d = d.borrow_mut();
+            let at = d
+                .iter()
+                .position(|(doc, p, _)| *doc == document && *p == parent)?;
+            let hit = d.remove(at);
+            d.push(hit);
+            Some(hit.2)
+        });
+        if let Some(ok) = known {
+            return ok;
+        }
+        let ok = compute();
+        DISTINCT.with(|d| {
+            let mut d = d.borrow_mut();
+            if d.len() == CAPACITY {
+                d.remove(0);
+            }
+            d.push((document, parent, ok));
+        });
+        ok
     }
 
     /// Whether some entry of `document` opens before `node` -- the only
@@ -7218,6 +7340,34 @@ mod embed_table {
         Guard
     }
 
+    pub(crate) fn push_descending(_node: usize, _document: usize, _value: OwnedValue) -> Guard {
+        Guard
+    }
+
+    pub(crate) fn descending() -> bool {
+        false
+    }
+
+    pub(crate) fn descending_covers(
+        _node: usize,
+        _document: usize,
+        _end_of: impl Fn(usize) -> Option<usize>,
+    ) -> bool {
+        false
+    }
+
+    pub(crate) fn descending_for(_node: usize, _document: usize) -> Option<OwnedValue> {
+        None
+    }
+
+    pub(crate) fn distinct_keys(
+        _parent: usize,
+        _document: usize,
+        compute: impl FnOnce() -> bool,
+    ) -> bool {
+        compute()
+    }
+
     pub(crate) fn push_anchor(
         _node: usize,
         _document: usize,
@@ -7331,6 +7481,26 @@ pub(crate) fn embed_table_push<S: EvalSemantics>(
     origin: Option<&BindOrigin>,
     value: &mut OwnedValue,
 ) -> Option<EmbedGuard> {
+    embed_table_push_as::<S>(origin, value, false)
+}
+
+/// [`embed_table_push`] for a fold's INIT (#3897): the entry also answers a
+/// materialization of any *descendant* of its node with the matching child of
+/// `value` ([`embed_descendant_shared`]), so a source that navigates below
+/// INIT (`reduce .[] as $x (.; del(.[0] | $x))`) yields the very `Rc` the
+/// accumulator holds, as jq's `$x` is the same `jv` as the accumulator's child.
+pub(crate) fn embed_table_push_descending<S: EvalSemantics>(
+    origin: Option<&BindOrigin>,
+    value: &mut OwnedValue,
+) -> Option<EmbedGuard> {
+    embed_table_push_as::<S>(origin, value, true)
+}
+
+fn embed_table_push_as<S: EvalSemantics>(
+    origin: Option<&BindOrigin>,
+    value: &mut OwnedValue,
+    descends: bool,
+) -> Option<EmbedGuard> {
     if S::TAG != EvalTag::Jq {
         return None;
     }
@@ -7350,7 +7520,13 @@ pub(crate) fn embed_table_push<S: EvalSemantics>(
         OwnedValue::NumberLiteral(_, spelling) if scalar_identity_readable => spelling.promote(),
         _ => return None,
     }
-    Some(embed_table::push(*node, *document, value.clone()))
+    Some(
+        if descends && matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
+            embed_table::push_descending(*node, *document, value.clone())
+        } else {
+            embed_table::push(*node, *document, value.clone())
+        },
+    )
 }
 
 /// Whether the program being evaluated can certify a navigated bind by its
@@ -8150,9 +8326,87 @@ fn embed_at_or_within<S: EvalSemantics, C: DocumentCursor>(
             Vec::new(),
         );
     }
-    embed_table::at_or_within(cursor.node_id(), cursor.document_token(), || {
-        cursor.subtree_end()
-    })
+    let (shared, nested) =
+        embed_table::at_or_within(cursor.node_id(), cursor.document_token(), || {
+            cursor.subtree_end()
+        });
+    // #3897: below a fold's INIT node. After the exact and nested lookups, and
+    // behind one more thread-local load that is false outside a fold that
+    // marks its loop variables.
+    // A bind inside the subtree (`nested`) keeps its own embedding, which the
+    // INIT child's `Rc` would replace.
+    if shared.is_none() && nested.is_empty() && embed_table::descending() {
+        if let Some(found) = embed_descendant_shared(cursor) {
+            return (Some(found), Vec::new());
+        }
+    }
+    (shared, nested)
+}
+
+/// The child of a fold's INIT value that `cursor`'s node is, when INIT's node
+/// is an ancestor of it (#3897).
+///
+/// The mirror of #3179's nested reuse: that one finds a bound node *inside*
+/// the subtree being materialized, this one a bound node *above* it. The
+/// climb names the steps from the entry's node down to `cursor`'s, and
+/// following them through the entry's value reaches the `Rc` the accumulator
+/// already holds for that node. Sound for the table's own reason: the entry
+/// holds a strong reference, so a write through either handle copies first.
+///
+/// Declines (the pre-#3897 fresh walk, a refusal where jq answers, never a
+/// wrong value) for a scalar or empty container, for a format that does not
+/// materialize one entry per child, and for a member whose key a later one
+/// shadows: `.[]` yields the shadowed node, the value keeps only the last.
+/// Reuse skips no depth check: the entry's own walk covered this subtree.
+fn embed_descendant_shared<C: DocumentCursor>(cursor: &C) -> Option<OwnedValue> {
+    let document = cursor.document_token();
+    if !cursor.materializes_members_one_to_one()
+        || !embed_table::descending_covers(cursor.node_id(), document, |entry| {
+            cursor.at_node_id(entry)?.subtree_end()
+        })
+    {
+        return None;
+    }
+    let mut steps: Vec<(C, OwnedValue)> = Vec::new();
+    let mut cur = *cursor;
+    let mut value = loop {
+        let (parent, slot) = cursor_parent_and_slot(&cur).ok()??;
+        let step = match slot {
+            CursorSlot::Element(index) => OwnedValue::Int(index),
+            CursorSlot::Value { key, .. } => key,
+            CursorSlot::Key(_) => return None, // patchcov: coverage tolerate-line reason="unreachable: the climb starts at a container (embed_at_or_within's `is_container` gate) and only ever moves to a parent, which is a container too, and a key is a leaf -- no node on the climb can be a key; kept as a refusal rather than a panic (#3897)"
+        };
+        let held = embed_table::descending_for(parent.node_id(), document);
+        steps.push((parent, step));
+        if let Some(held) = held {
+            break held;
+        }
+        cur = steps.last()?.0;
+    };
+    while let Some((parent, step)) = steps.pop() {
+        value = match (&value, &step) {
+            (OwnedValue::Array(items), OwnedValue::Int(index)) => {
+                items.get(usize::try_from(*index).ok()?)?.clone()
+            }
+            (OwnedValue::Object(map), OwnedValue::String(key)) => {
+                let distinct = embed_table::distinct_keys(parent.node_id(), document, || {
+                    let mut members = 0usize;
+                    let mut child = parent.first_child();
+                    while let Some(k) = child {
+                        members += 1;
+                        child = k.next_sibling().and_then(|v| v.next_sibling());
+                    }
+                    members == map.len()
+                });
+                if !distinct {
+                    return None;
+                }
+                map.get(&**key)?.clone()
+            }
+            _ => return None, // patchcov: coverage tolerate-line reason="unreachable: `materializes_members_one_to_one` holds, so the value held for a node is an array exactly when the node is a sequence and an object exactly when it is a mapping, and the step the climb recorded is an index for the first and a string key for the second; kept as a refusal rather than a panic (#3897)"
+        };
+    }
+    matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)).then_some(value)
 }
 
 /// The binding's own value for `child`, met at `depth` inside a walk whose
@@ -12924,7 +13178,7 @@ fn drive_foreach_expr_generic<S: EvalSemantics, V: DocumentValue>(
             Ok((mut v, origin)) => {
                 // Held across the fork this output starts, so the source's own
                 // materialization of the same node returns this `Rc`.
-                let _entry = embed_table_push::<S>(origin.as_ref(), &mut v);
+                let _entry = embed_table_push_descending::<S>(origin.as_ref(), &mut v);
                 per_item(v)
             }
             Err(control) => stop_with_escape(&mut escape, control),
