@@ -43862,7 +43862,13 @@ fn register_identical<S: EvalSemantics>(
 /// the snapshot half) shares one definition with `register_identical`
 /// instead of hand-inlining the same `matches!` + `==` a third time.
 fn null_bool_identical(a: &OwnedValue, b: &OwnedValue) -> bool {
-    matches!(a, OwnedValue::Null | OwnedValue::Bool(_)) && a == b
+    is_null_or_bool(a) && a == b
+}
+
+/// Whether `value` is `null`, `true` or `false`: the kinds jq's `jv_identical` treats as
+/// the same node whenever they are equal ([`null_bool_identical`]).
+fn is_null_or_bool(value: &OwnedValue) -> bool {
+    matches!(value, OwnedValue::Null | OwnedValue::Bool(_))
 }
 
 /// Whether `value` is an array jq's slice hands back as *the same node*: a
@@ -49262,11 +49268,34 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                             // output left, which is the entry's when it said so.
                             let update_unmoved = update_states_entry
                                 && matches!(update_branch.register, BranchRegister::AtEntry);
+                            // #3939: a computed emission that sits at the step's register
+                            // (a pattern walk or a navigating source moved it off the root)
+                            // on a `null`/`true`/`false` member states that value: the
+                            // extract's own `AtEntry` names none, and an outer fold reading
+                            // this `foreach` as its source would take the register as lost
+                            // instead of placing its own there (`jv_identical` admits the
+                            // kind, [`null_bool_identical`]). Only an `AtEntry` emission at
+                            // exactly the register's path: that statement is the extract
+                            // resolving against the step register itself, so an emission that
+                            // navigated further, or states anything else, keeps its own answer.
+                            let walked_at = (S::TAG == EvalTag::Jq
+                                && active_reg.trackable
+                                && active_reg.path.depth() > 0
+                                && is_null_or_bool(&active_reg.value))
+                            .then_some(&active_reg);
                             let mut emit = |branch: PathBranch<'a>| -> Demand {
                                 if update_unmoved && !branch.trackable {
                                     sink(branch.with_register(BranchRegister::Unmoved(
                                         Cow::Borrowed(value),
                                     )))
+                                } else if let Some(register) = walked_at.filter(|reg| {
+                                    !branch.trackable
+                                        && *branch.path == *reg.path
+                                        && matches!(branch.register, BranchRegister::AtEntry)
+                                }) {
+                                    sink(branch.with_register(BranchRegister::Unmoved(Cow::Owned(
+                                        register.value.clone(),
+                                    ))))
                                 } else {
                                     sink(branch)
                                 }

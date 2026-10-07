@@ -403,6 +403,20 @@ OPERANDS = [
     "(foreach (foreach . as [$a] (0; .; .)) as $x (.; .; .))",
     "(foreach (foreach . as [$a] (.; .; .)) as $k (.; .; .)) or .a",
     "try ((foreach (. as {a:$a} | .) as [$z] (.; .; .)) and true) catch 7",
+    # (#3939) a nested `foreach` that leaves the register on a `null`/boolean member: the outer
+    # EXTRACT is `jv_identical` to it by kind, so the path is that member's, not the root's.
+    # A navigating source, a deeper pattern, a comma source and an INIT that navigated first.
+    "(foreach (foreach .a as $a (0; .; .)) as $x (.; .; .))",
+    "(foreach (foreach . as {a:{b:$a}} (0; .; .)) as $x (.; .; .))",
+    "(foreach (foreach (., .) as {a:$a} (0; .; .)) as $x (.; .; .))",
+    "(foreach (foreach . as {a:$a} (0; .; .)) as $x (.a; .; .))",
+    "(foreach (foreach . as {a:$a} (0; .; .)) as $x (.; .; .a))",
+    # A literal INIT does not move the register, so a `true`/`false`/`null` member is the
+    # accumulator's node by kind. The `?//` chain is the recorded gap: it is left to the
+    # by-value drive (`routes_destructuring`), so it still answers the root where jq does not.
+    "(foreach (foreach . as {a:$a} (0; .; .)) as $x (true; .; .))",
+    "(foreach (foreach . as {a:$a} (0; .; .)) as $x (null; .; .))",
+    "(foreach (foreach . as {a:$a} ?// [$a] (0; .; .)) as $x (.; .; .))",
     # (#3790) a fold whose SOURCE is the register itself: `.` does not move jq's register
     # and `$k` is that very node, so a bare `$k` is a path (any value, not only null). The
     # contrasts are a navigated source (`.a`, `.[]?`) and a computed one (`tostring`);
