@@ -2504,11 +2504,13 @@ fn test_yq_default_rejects_jq_only_builtins_1512() -> Result<()> {
 #[test]
 fn test_yq_any_all_predicate_forms_gated_2005() -> Result<()> {
     for (filter, name, position) in [
-        ("5 | any(. > 3)", "any(cond)", 4),
-        ("{\"a\":1} | all(. > 0)", "all(cond)", 10),
-        ("[1,5] | any(.[]; . > 3)", "any(gen; cond)", 8),
-        ("[1,5] | all(.[]; . > 0)", "all(gen; cond)", 8),
-        ("[1,2] | map(any(. > 1))", "any(cond)", 12),
+        ("5 | any(. > 3)", "any(f)", 4),
+        ("{\"a\":1} | all(. > 0)", "all(f)", 10),
+        ("[1,5] | any(.[]; . > 3)", "any(f)", 8),
+        ("[1,5] | all(.[]; . > 0)", "all(f)", 8),
+        ("[1,2] | map(any(. > 1))", "any(f)", 12),
+        // the call is named, not whatever is nested in it
+        ("any(any(. > 1))", "any(f)", 0),
     ] {
         let (out, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[])?;
         assert_eq!(out, "", "{filter:?}: {stderr}");

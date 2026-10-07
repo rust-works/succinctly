@@ -5378,12 +5378,14 @@ impl<'a> Parser<'a> {
         }
         // any, any(cond), any(gen; cond). Bare `any` is real yq's own token; the predicate
         // forms are jq-only surface (yq's grammar takes no argument, `bad expression`), so in
-        // yq mode they are gated behind `--jq-extensions` like `min_by` (#2005).
+        // yq mode they are gated behind `--jq-extensions` like `min_by` (#2005), before the
+        // arguments are read so the rejection names this call, not something nested in it.
         if self.matches_keyword("any") {
             let keyword_start = self.pos;
             self.consume_keyword("any");
             self.skip_ws();
             if self.peek() == Some('(') {
+                self.reject_unless_jq_extensions_at("any(f)", keyword_start)?;
                 self.next();
                 self.skip_ws();
                 let f = self.parse_expr()?;
@@ -5401,14 +5403,12 @@ impl<'a> Parser<'a> {
                         );
                     }
                     self.next();
-                    self.reject_unless_jq_extensions_at("any(gen; cond)", keyword_start)?;
                     return Ok(Some(Builtin::AnyCond(Box::new(f), Box::new(cond))));
                 }
                 if self.peek() != Some(')') {
                     return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![f]);
                 }
                 self.next();
-                self.reject_unless_jq_extensions_at("any(cond)", keyword_start)?;
                 return Ok(Some(Builtin::AnyF(Box::new(f))));
             }
             return Ok(Some(Builtin::Any));
@@ -5419,6 +5419,7 @@ impl<'a> Parser<'a> {
             self.consume_keyword("all");
             self.skip_ws();
             if self.peek() == Some('(') {
+                self.reject_unless_jq_extensions_at("all(f)", keyword_start)?;
                 self.next();
                 self.skip_ws();
                 let f = self.parse_expr()?;
@@ -5436,14 +5437,12 @@ impl<'a> Parser<'a> {
                         );
                     }
                     self.next();
-                    self.reject_unless_jq_extensions_at("all(gen; cond)", keyword_start)?;
                     return Ok(Some(Builtin::AllCond(Box::new(f), Box::new(cond))));
                 }
                 if self.peek() != Some(')') {
                     return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![f]);
                 }
                 self.next();
-                self.reject_unless_jq_extensions_at("all(cond)", keyword_start)?;
                 return Ok(Some(Builtin::AllF(Box::new(f))));
             }
             return Ok(Some(Builtin::All));
@@ -11586,6 +11585,11 @@ mod tests {
             ("ldexp", "ldexp(3; 2)"),
             ("fmax", "fmax(1; 2)"),
             ("fma", "fma(2; 3; 4)"),
+            // #2005: `any`/`all` are real yq tokens; only the predicate forms are jq's.
+            ("any(f)", "any(. > 3)"),
+            ("all(f)", "all(. > 0)"),
+            ("any(f)", "any(.[]; . > 3)"),
+            ("all(f)", "all(.[]; . > 0)"),
         ];
 
         for (name, filter) in cases {
@@ -11608,6 +11612,38 @@ mod tests {
             assert!(
                 parse_program_with_mode(filter, ParserMode::Jq).is_ok(),
                 "`{name}` should parse in jq mode regardless of the yq-only gate"
+            );
+        }
+    }
+
+    /// #2005: the `any`/`all` gate is on the *call*, read before its arguments, so what the
+    /// rejection says and where it points do not depend on what is inside the parentheses.
+    /// Bare `any`/`all` are real yq tokens and parse in yq mode with no flag.
+    #[test]
+    fn test_yq_any_all_gate_names_the_call_not_its_arguments_2005() {
+        for (filter, position) in [
+            ("any(any(. > 1))", 0),
+            ("all(any(. > 1))", 0),
+            ("any(min_by(.a))", 0),
+            ("any(. > 3", 0),
+            ("[1] | all(.[]; any)", 6),
+        ] {
+            let err = parse_program_with_mode(filter, ParserMode::Yq).unwrap_err();
+            assert!(
+                err.message.contains("is not part of yq's syntax") && err.position == position,
+                "{filter:?}: {err:?}"
+            );
+            let name = if filter.contains("all(") && !filter.starts_with("any") {
+                "\"all(f)\""
+            } else {
+                "\"any(f)\""
+            };
+            assert!(err.message.contains(name), "{filter:?}: {err:?}");
+        }
+        for filter in ["any", "all", "[.[] | any]", "any | not"] {
+            assert!(
+                parse_program_with_mode(filter, ParserMode::Yq).is_ok(),
+                "bare form {filter:?} should parse in yq mode by default"
             );
         }
     }

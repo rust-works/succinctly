@@ -2629,7 +2629,7 @@ shapes:**
 
 Both filed together as [#1998](https://github.com/rust-works/succinctly/issues/1998).
 
-**Two more items found reviewing the fix itself, also not fixed here:**
+**Two more items found reviewing the fix itself, not fixed in that PR (the first was closed by #2005, below):**
 
 - **`any(cond)`/`all(cond)`/`any(gen; cond)`/`all(gen; cond)`** (the predicate-argument forms,
   dispatched from `Builtin::AnyF`/`AllF`/`AnyCond`/`AllCond`) leaked jq's own wording and let a
