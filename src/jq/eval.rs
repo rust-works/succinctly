@@ -39856,10 +39856,10 @@ enum BuiltinNavigation {
 ///   narrower approximation, not an extension of this table's own contract.
 ///   `fromstream` remains genuinely absent, along with
 ///   `ascii_downcase`/`ascii_upcase` (`explode | map(...)`), the
-///   `match`/`scan`/`capture`/`splits` family, and `transpose` (which
-///   additionally raises only when `map(length)|max` exceeds zero) — #2743.
-///   `INDEX(f)` is a clean `Iterate` on every input that simply has not
-///   been added yet.
+///   `match`/`scan`/`capture`/`splits` family — #2743. `transpose` raises
+///   only when `map(length)|max` exceeds zero, so it has an arm that reads
+///   the input ([`transpose_navigation`], #3888), and `INDEX(f)` is a
+///   constant `Iterate` (`INDEX(.[]; f)` runs its `.[]` first, on any input).
 ///   `nth(n)`, `reverse` and `indices(i)` are absent for a related reason:
 ///   their element depends on an argument or on `length` (and `reverse`
 ///   does not raise at all on an empty input), so they need a value this
@@ -39919,6 +39919,13 @@ fn builtin_navigation<S: EvalSemantics>(
         | Builtin::Flatten
         | Builtin::Map(_)
         | Builtin::FromEntries => Ok(Some(BuiltinNavigation::Iterate)),
+        // `def INDEX(idx_expr): INDEX(.[]; idx_expr);` -- the `.[]` source runs
+        // first, on any input at all (`5 | INDEX(.)` names `5`, not the
+        // `Cannot iterate` a by-value run raises), so its navigation is as
+        // constant as `add`'s. Only the one-argument form: `INDEX(stream; f)`
+        // iterates the *stream*, which this table cannot name (#3888).
+        Builtin::UpperIndex(_) => Ok(Some(BuiltinNavigation::Iterate)),
+        Builtin::Transpose => transpose_navigation::<S>(value),
         // The one entry whose answer depends on the *input*, because its
         // own definition branches on it: `def walk(f): def w: if type ==
         // "object" then map_values(w) elif type == "array" then map(w)
@@ -39950,6 +39957,64 @@ fn builtin_navigation<S: EvalSemantics>(
         },
         _ => Ok(None),
     }
+}
+
+/// The navigation `transpose` performs on an input the resolver is not
+/// tracking (#3888).
+///
+/// `def transpose: if . == [] then [] else . as $in | (map(length) | max) as
+/// $max | [range(0; $max) as $j | [range(0; $in|length) as $i | $in[$i][$j]]]
+/// end;` -- every statement of that is captured from jq 1.7.1:
+///
+/// - `[]` is the one input that navigates nothing at all.
+/// - `map(length)` is the source of an `as` binding, so it runs in a subexpression
+///   where jq does not path-check: its own failures are plain value errors, in
+///   element order (`5 | transpose` is `Cannot iterate over number (5)`, `[[],
+///   true]` is `boolean (true) has no length`), and win over everything below.
+/// - Past it, the body's path-checked access runs once `range(0; $max)` yields a
+///   `$j`, i.e. once some row has a length above zero (`[[1], null]` and `[1]`
+///   do, `[[], null]`, `[0.0]` and `{"a": []}` do not; an all-`NaN` maximum does
+///   too, as `range(0; nan)` is not empty). That access raises `near attempt to
+///   iterate through <input>` ahead of any value error of its own (`[1, "a"]`
+///   and `[[1,2], "ab"]` name the path, not `Cannot index number with number`).
+fn transpose_navigation<S: EvalSemantics>(
+    value: &OwnedValue,
+) -> Result<Option<BuiltinNavigation>, EvalEscape> {
+    let rows: Vec<&OwnedValue> = match value {
+        OwnedValue::Array(rows) if rows.is_empty() => return Ok(None),
+        OwnedValue::Array(rows) => rows.iter().collect(),
+        OwnedValue::Object(fields) => fields.values().collect(),
+        other => {
+            return Err(EvalEscape::Error(EvalError::cannot_iterate_with(
+                S::TAG,
+                other,
+            )))
+        }
+    };
+    // Every row's length is taken before any is judged, since `map` stops at
+    // the first row that has none and that error beats a path error.
+    let mut positive = false;
+    let mut real = false;
+    let mut any_row = false;
+    for row in rows {
+        any_row = true;
+        match owned_value_jq_length::<S>(row).map_err(EvalEscape::Error)? {
+            OwnedValue::Int(len) => {
+                real = true;
+                positive |= len > 0;
+            }
+            OwnedValue::Float(len) => {
+                real |= !len.is_nan();
+                positive |= len > 0.0;
+            }
+            _ => unreachable!("owned_value_jq_length only ever returns Int or Float"), // patchcov: coverage tolerate-line reason="unreachable: owned_value_jq_length's own match only ever constructs OwnedValue::Int or OwnedValue::Float, as in the Reverse arm of builtin_navigation (#3888)"
+        }
+    }
+    // `max` sorts a `NaN` below every number, so a `NaN` length only decides the
+    // maximum when every row has one -- and then `range(0; nan)` is not empty
+    // (jq 1.7.1: `[nan] | path(transpose | empty)` raises on the path).
+    let navigates = positive || (any_row && !real);
+    Ok(navigates.then_some(BuiltinNavigation::Iterate))
 }
 
 /// The three builtins jq defines on top of one `$i`-parameter navigation, whose
@@ -40776,7 +40841,19 @@ fn resolve_leaf_bounded<'a, S: EvalSemantics>(
         // leaves the document alone at exit 0, where this table's rule
         // would refuse. That rule is jq's, derived from how *jq* defines
         // these in `builtin.jq`; yq's implementation shares none of it.
-        if S::TAG == EvalTag::Jq {
+        //
+        // The exception is a name yq's lexer rejects outright -- `INDEX(f)` and
+        // `transpose` (`lexer: invalid input text` on v4.53.3): yq mode reaches
+        // them only through `--jq-extensions`, which means what jq defines, so
+        // there is no yq rule to protect, and gating them would leave the
+        // silently discarded `del`/`=` this table exists to refuse (#3888, as
+        // `nth(n)` in #3550).
+        if S::TAG == EvalTag::Jq
+            || matches!(
+                expr,
+                Expr::Builtin(Builtin::UpperIndex(_) | Builtin::Transpose)
+            )
+        {
             if let Expr::Builtin(builtin) = expr {
                 match builtin_navigation::<S>(builtin, value) {
                     Ok(Some(navigation)) => {
@@ -42711,7 +42788,10 @@ fn array_contents_are_checked(inner: &Expr) -> bool {
         // which by-value evaluation here raises identically. The output
         // then goes untracked, stricter than jq, so any navigation after it
         // inside the brackets still refuses (`[first] | .[0]` raises
-        // identically in both tools).
+        // identically in both tools). `INDEX(f)` and `transpose` (#3888) are
+        // `Iterate` entries too but are deliberately not in this list: on a
+        // tracked input they match jq already (`[INDEX(.)]`, `[transpose]`),
+        // and adding one needs that same tracked-input probe first.
         Expr::Builtin(
             Builtin::First
             | Builtin::Last

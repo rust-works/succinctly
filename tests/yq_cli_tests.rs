@@ -161,6 +161,45 @@ fn test_yq_recurse_cap_raises_instead_of_ending_silently_3716() -> Result<()> {
     Ok(())
 }
 
+/// #3888: `INDEX(f)` and `transpose` raise jq's `Invalid path expression` on an
+/// untracked value in yq mode too, so a `del`/`=` through them is refused
+/// instead of silently skipping the write.
+///
+/// Real yq's lexer rejects both names (v4.53.3), so they are succinctly
+/// extensions behind `--jq-extensions` that mean what jq defines and share the
+/// path-register table with jq mode; gating the arms to jq mode would have left
+/// the silent discard. Without the flag they are still the lexer error.
+#[test]
+fn test_yq_index_and_transpose_raise_inside_path_like_jq_3888() -> Result<()> {
+    let args = ["--jq-extensions", "-o=json", "-I=0"];
+    for filter in [
+        "[path(([[1]] | transpose) | empty)]",
+        "[path(([[1]] | INDEX(.)) | empty)]",
+        "del(([[1]] | transpose) | empty)",
+        "(([[1]] | INDEX(.)) | empty) = 1",
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "{}", &args)?;
+        assert_eq!(code, 1, "`{filter}` -- stdout: {stdout:?}");
+        assert_eq!(stdout, "", "`{filter}`");
+        assert!(
+            stderr.contains("Invalid path expression near attempt to iterate through [[1]]"),
+            "`{filter}` -- stderr: {stderr:?}"
+        );
+    }
+    // Where jq's `transpose` does not reach its access, it answers.
+    let (stdout, code) = run_yq_stdin("[path(([[]] | transpose) | empty)]", "{}", &args)?;
+    assert_eq!((stdout.as_str(), code), ("[]\n", 0));
+    // No flag, no builtin: the lexer rejects the name before any path rule runs.
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(
+        "[path(([[1]] | transpose) | empty)]",
+        "{}",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_ne!(code, 0, "stdout: {stdout:?}");
+    assert!(!stderr.contains("Invalid path expression"), "{stderr:?}");
+    Ok(())
+}
+
 /// #3737: `recurse(.[]?; cond)` has no node cap in yq mode either, when `cond`
 /// yields at most one value.
 ///
