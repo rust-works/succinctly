@@ -452,7 +452,10 @@ pub enum Expr {
 
     /// Chained expressions: `.foo.bar[0]`
     /// Each element is applied in sequence to the result of the previous.
-    Pipe(Vec<Self>),
+    ///
+    /// The stages are a [`PipeStages`], which reads as a `Vec<Expr>` and also
+    /// remembers whether any stage needs path context (#3886).
+    Pipe(PipeStages),
 
     /// Comma operator: `.foo, .bar` - outputs from both expressions
     Comma(Vec<Self>),
@@ -1710,6 +1713,117 @@ impl PartialEq for PathContextMemo {
     }
 }
 
+/// An [`Expr::Pipe`]'s stages, and whether any of them needs path context
+/// (#3886).
+///
+/// Reads as the `Vec<Expr>` it wraps (`Deref`), so a pipe's stages are matched
+/// and indexed as before. The remembered answer is `eval::needs_path_context`
+/// over every stage: a pipe asks it on each dispatch to choose its route, and
+/// the walk covers stages that may never run -- a `try` body failing at its
+/// first stage paid it for the whole remainder, per error.
+///
+/// Derived state, like [`FuncDefData`]'s memo: it takes no part in equality or
+/// `Debug`, a clone starts empty, and `DerefMut` forgets it, because any
+/// rewrite of a stage goes through `&mut Vec<Expr>` and may change the answer.
+#[derive(Default)]
+pub struct PipeStages {
+    stages: Vec<Expr>,
+    needs_path_context: core::cell::Cell<Option<bool>>,
+}
+
+impl PipeStages {
+    /// Whether any stage needs path context, computing it with `classify` on
+    /// the first call.
+    pub(crate) fn needs_path_context_or_init(
+        &self,
+        classify: impl FnOnce(&[Expr]) -> bool,
+    ) -> bool {
+        memo(&self.needs_path_context, || classify(&self.stages))
+    }
+
+    /// The stages, without the remembered answer.
+    pub fn into_vec(self) -> Vec<Expr> {
+        self.stages
+    }
+}
+
+impl From<Vec<Expr>> for PipeStages {
+    fn from(stages: Vec<Expr>) -> Self {
+        Self {
+            stages,
+            needs_path_context: core::cell::Cell::new(None),
+        }
+    }
+}
+
+impl FromIterator<Expr> for PipeStages {
+    fn from_iter<I: IntoIterator<Item = Expr>>(iter: I) -> Self {
+        Vec::from_iter(iter).into()
+    }
+}
+
+impl core::ops::Deref for PipeStages {
+    type Target = Vec<Expr>;
+
+    fn deref(&self) -> &Vec<Expr> {
+        &self.stages
+    }
+}
+
+impl core::ops::DerefMut for PipeStages {
+    fn deref_mut(&mut self) -> &mut Vec<Expr> {
+        self.needs_path_context.set(None);
+        &mut self.stages
+    }
+}
+
+impl IntoIterator for PipeStages {
+    type Item = Expr;
+    type IntoIter = <Vec<Expr> as IntoIterator>::IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.stages.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a PipeStages {
+    type Item = &'a Expr;
+    type IntoIter = core::slice::Iter<'a, Expr>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.stages.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut PipeStages {
+    type Item = &'a mut Expr;
+    type IntoIter = core::slice::IterMut<'a, Expr>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
+impl Clone for PipeStages {
+    fn clone(&self) -> Self {
+        self.stages.clone().into()
+    }
+}
+
+impl PartialEq for PipeStages {
+    fn eq(&self, other: &Self) -> bool {
+        self.stages == other.stages
+    }
+}
+
+/// Prints as the bare `Vec`, so an `Expr::Pipe` prints the same whether or not
+/// it has been asked.
+impl core::fmt::Debug for PipeStages {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.stages.fmt(f)
+    }
+}
+
 /// A complete jq program including module directives and the main expression.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
@@ -2962,7 +3076,7 @@ impl Expr {
         if exprs.len() == 1 {
             exprs.into_iter().next().unwrap()
         } else {
-            Self::Pipe(exprs)
+            Self::Pipe(exprs.into())
         }
     }
 
@@ -3284,6 +3398,51 @@ mod tests {
         let copy = asked.clone();
         assert!(!copy.needs_path_context_or_init(|_| false));
         assert!(asked.needs_path_context_or_init(|_| unreachable!("the original kept its own")));
+    }
+
+    /// #3886: `PipeStages`' remembered answer is derived state -- equality and
+    /// `Debug` ignore it, a clone starts empty, and a mutable borrow of the
+    /// stages forgets it, since a rewrite may change the answer.
+    #[test]
+    fn pipe_stages_memo_is_derived_state_3886() {
+        let stages = || vec![Expr::field("a"), Expr::Identity];
+        let fresh = Expr::Pipe(stages().into());
+        let asked = Expr::Pipe(stages().into());
+        let Expr::Pipe(asked_stages) = &asked else {
+            unreachable!(); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3673)"
+        };
+        assert!(asked_stages.needs_path_context_or_init(|_| true));
+        assert!(asked_stages.needs_path_context_or_init(|_| unreachable!("answered from the memo")));
+        assert_eq!(fresh, asked);
+        assert_eq!(format!("{fresh:?}"), format!("{asked:?}"));
+        assert_eq!(format!("{asked:?}"), r#"Pipe([Field("a"), Identity])"#);
+
+        let copy = asked_stages.clone();
+        assert!(!copy.needs_path_context_or_init(|_| false));
+        assert!(
+            asked_stages.needs_path_context_or_init(|_| unreachable!("the original kept its own"))
+        );
+
+        let mut rewritten = asked.clone();
+        let Expr::Pipe(rewritten_stages) = &mut rewritten else {
+            unreachable!(); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3673)"
+        };
+        assert!(rewritten_stages.needs_path_context_or_init(|_| true));
+        rewritten_stages.push(Expr::Identity);
+        assert!(
+            !rewritten_stages.needs_path_context_or_init(|_| false),
+            "a rewrite forgets"
+        );
+        assert_eq!(rewritten_stages.clone().into_vec().len(), 3);
+        let mut iterated = asked_stages.clone();
+        assert!(iterated.needs_path_context_or_init(|_| true));
+        for stage in &mut iterated {
+            *stage = Expr::Identity;
+        }
+        assert!(
+            !iterated.needs_path_context_or_init(|_| false),
+            "a rewrite by iteration forgets"
+        );
     }
 
     #[test]

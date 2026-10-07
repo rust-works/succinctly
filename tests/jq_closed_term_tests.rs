@@ -417,7 +417,7 @@ fn input_independent_builtins_are_closed_2173() {
 #[test]
 fn an_empty_pipe_is_conservatively_reading_2699() {
     assert!(
-        reads_ambient_value(&succinctly::jq::Expr::Pipe(vec![])),
+        reads_ambient_value(&succinctly::jq::Expr::Pipe(vec![].into())),
         "an empty pipe has no first stage to judge, so it must not be called closed"
     );
 }

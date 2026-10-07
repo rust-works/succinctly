@@ -1341,7 +1341,8 @@ pub(crate) fn search_subexpr<F: FnMut(&Expr) -> Visit + ?Sized>(
                     .any(|p| any_pattern_key(p, &mut |k| search_subexpr(k, visit)))
         }
 
-        Expr::Pipe(exprs) | Expr::Comma(exprs) => exprs.iter().any(|e| search_subexpr(e, visit)),
+        Expr::Pipe(exprs) => exprs.iter().any(|e| search_subexpr(e, visit)),
+        Expr::Comma(exprs) => exprs.iter().any(|e| search_subexpr(e, visit)),
 
         // Ignores `builtin_fallback` (unlike `map_subexprs`'s own `FuncCall`
         // arm, which recurses into it defensively) -- safe only because
