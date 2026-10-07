@@ -59240,6 +59240,19 @@ fn test_foreach_accumulator_identity_carries_across_source_elements_3460() -> Re
             "[\"a\"]\n[\"a\"]\n",
             0,
         ),
+        // a postfix `?` only prunes a failure to index: `.a?` reaches what `.a` does
+        (
+            r#"{"a":{"a":1}}"#,
+            r"path(foreach (1, .a) as $k (.; .a?))",
+            "[\"a\"]\n[\"a\",\"a\"]\n",
+            0,
+        ),
+        (
+            r#"{"a":{"a":1}}"#,
+            r"path(foreach (1, .a?) as $k (.; .a))",
+            "[\"a\"]\n[\"a\",\"a\"]\n",
+            0,
+        ),
         // an array element: step 2 reaches `.a[0]` again, then `"t"` refuses
         (
             r#"{"a":["s","t"]}"#,
@@ -59392,9 +59405,10 @@ fn test_foreach_full_slice_source_is_the_accumulator_3460() -> Result<()> {
 /// navigation, which on the write side is a write where yq no-ops, so it is jq
 /// mode only (ADR-0018: the mode decides). Under `--jq-extensions`, where
 /// `foreach` exists at all, `(foreach (1, .a) as $k (.; .a)) = 9` has to keep
-/// refusing its second step as before. This pins the row, not the gate:
-/// `accumulator_reached_register_at`'s `EvalTag::Jq` clause is belt and braces,
-/// and mutating it off leaves this row refusing (yq's route does not reach it).
+/// refusing its second step as before. This pins the row, not the gate: yq's
+/// route does not reach `accumulator_reached_register_at`, and mutating its
+/// `EvalTag::Jq` clause off leaves this row refusing. The gate itself is pinned by
+/// the `accumulator_reached_register_at_is_positional_and_jq_only_3460` unit test.
 #[test]
 fn test_yq_foreach_accumulator_identity_stays_refuse_only_3460() -> Result<()> {
     let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))

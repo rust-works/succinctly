@@ -47821,6 +47821,40 @@ fn settle_fold_alternative<S: EvalSemantics>(
     }
 }
 
+/// Whether two paths reach the same node, reading a component through a postfix
+/// `?` (`.a?` reaches what `.a` does -- the wrapper only prunes a failure to
+/// index). Shared nodes short-circuit, so the usual case, a path compared with
+/// itself or with its own extension's parent, is one pointer comparison.
+fn same_node_path(a: &Rc<PathPrefix>, b: &Rc<PathPrefix>) -> bool {
+    let (mut x, mut y) = (a, b);
+    loop {
+        if Rc::ptr_eq(x, y) {
+            return true;
+        }
+        match (&**x, &**y) {
+            (PathPrefix::Root, PathPrefix::Root) => return true,
+            (
+                PathPrefix::Node {
+                    parent: px,
+                    component: cx,
+                    depth: dx,
+                },
+                PathPrefix::Node {
+                    parent: py,
+                    component: cy,
+                    depth: dy,
+                },
+            ) => {
+                if dx != dy || strip_optional(cx) != strip_optional(cy) {
+                    return false;
+                }
+                (x, y) = (px, py);
+            }
+            _ => return false,
+        }
+    }
+}
+
 /// Whether the accumulator coming into a `foreach` step is the very node the
 /// step's register stands on, because the previous UPDATE *reached* it at that
 /// same absolute path (#3460): jq's `jv_identical(state, value_at_path)`, where
@@ -47853,7 +47887,7 @@ fn accumulator_reached_register_at<S: EvalSemantics>(
     S::TAG == EvalTag::Jq
         && step_reg.trackable
         && state_path.is_some_and(|path| {
-            (**path == *step_reg.path && slice_witnesses_node(&step_reg.path, state))
+            (same_node_path(path, &step_reg.path) && slice_witnesses_node(&step_reg.path, state))
                 || (slice_is_same_array(state) && is_slice_chain_over(&step_reg.path, path))
         })
         && *state == step_reg.value
@@ -48205,6 +48239,8 @@ fn reduce_update_at_register<S: EvalSemantics>(
     // where the persistent one is `false` (a `null`/`bool` accumulator is identical
     // to any `null`/`bool` register), and taking it would admit a write jq refuses
     // (`(reduce first(.a) as {a:$v0} (null; ($v0 | getpath([])))) = 9`).
+    // `None`: `reduce` carries no per-step accumulator path (#3460) -- the verdict may
+    // only narrow `persistent`, and the final accumulator is what jq checks.
     persistent
         && foreach_step_register::<S>(
             walked,
@@ -49027,6 +49063,10 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                         // wrote `ab` where jq writes `a`. `resolve_reduce`'s UPDATE stays
                         // collected: jq evaluates every one of its outputs.
                         let entry_state = core::mem::replace(&mut state, OwnedValue::Null);
+                        // `state_path` describes `state`, which is `Null` until an
+                        // UPDATE output replaces it (a step that delivers nothing, or
+                        // escapes first, must not leave the old node's path behind).
+                        state_path = None;
                         let entry_snapshot = state_snapshot.clone();
                         let mut delivered = false;
                         let update_stop_at = core::cell::Cell::new(None::<u64>);
@@ -49187,7 +49227,6 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                         if !delivered {
                             (state_at_register, state_snapshot) =
                                 reg.branch_provenance::<S>(None, frame);
-                            state_path = None;
                         }
                         if let ResolveFlow::Escaped(e) = flow {
                             outcome = Some(fold_escape_outcome(e, is_last, &aborted));
@@ -122843,6 +122882,116 @@ mod tests {
         ));
         assert!(register_identical::<YqSemantics>(
             &empty, &at_slice, &fresh, &mark
+        ));
+    }
+
+    /// #3460: the accumulator is the step register's node only when it was
+    /// *reached* at the same path (or a chain of slices over it that kept every
+    /// element), reading a postfix `?` as the same step; a different path with an
+    /// equal value, a stale/absent path, and yq mode never qualify.
+    #[test]
+    fn accumulator_reached_register_at_is_positional_and_jq_only_3460() {
+        let field = |n: &str| Expr::Field(n.to_string());
+        let at = |path: &Rc<PathPrefix>, value: &OwnedValue| FoldRegister {
+            path: Rc::clone(path),
+            value: value.clone(),
+            trackable: true,
+            frame: Frame::at(1, Rc::clone(path)),
+        };
+        let a = PathPrefix::extend(&PathPrefix::root(), field("a"));
+        let a_optional =
+            PathPrefix::extend(&PathPrefix::root(), Expr::Optional(Box::new(field("a"))));
+        let b = PathPrefix::extend(&PathPrefix::root(), field("b"));
+        let one = OwnedValue::array_from(vec![OwnedValue::Int(1)]);
+        let empty = OwnedValue::array();
+
+        // the same node, spelled with and without a postfix `?`, or shared
+        assert!(same_node_path(&a, &a));
+        assert!(same_node_path(&a, &a_optional));
+        assert!(same_node_path(&PathPrefix::root(), &PathPrefix::root()));
+        assert!(!same_node_path(&a, &b));
+        assert!(!same_node_path(&a, &PathPrefix::root()));
+        assert!(!same_node_path(&PathPrefix::root(), &a));
+
+        let reg = at(&a, &one);
+        assert!(accumulator_reached_register_at::<JqSemantics>(
+            Some(&a),
+            &one,
+            &reg
+        ));
+        assert!(accumulator_reached_register_at::<JqSemantics>(
+            Some(&a_optional),
+            &one,
+            &reg
+        ));
+        // jq mode only: it turns a refusal into navigation, a write where yq no-ops
+        assert!(!accumulator_reached_register_at::<YqSemantics>(
+            Some(&a),
+            &one,
+            &reg
+        ));
+        // computed (never reached), or reached somewhere else
+        assert!(!accumulator_reached_register_at::<JqSemantics>(
+            None, &one, &reg
+        ));
+        assert!(!accumulator_reached_register_at::<JqSemantics>(
+            Some(&b),
+            &one,
+            &reg
+        ));
+        // an untracked register admits nothing
+        let mut lost = at(&a, &one);
+        lost.trackable = false;
+        assert!(!accumulator_reached_register_at::<JqSemantics>(
+            Some(&a),
+            &one,
+            &lost
+        ));
+        // the value backstop: a stale path over a different accumulator
+        assert!(!accumulator_reached_register_at::<JqSemantics>(
+            Some(&a),
+            &empty,
+            &reg
+        ));
+
+        // a slice chain over the accumulator's non-empty array that kept it whole
+        let sliced = PathPrefix::extend(&a, Expr::slice(None, None));
+        let sliced_reg = at(&sliced, &one);
+        assert!(accumulator_reached_register_at::<JqSemantics>(
+            Some(&a),
+            &one,
+            &sliced_reg
+        ));
+        // ... but not over an empty one (a fresh `jv_array()`), nor one that dropped an element
+        let empty_reg = at(&sliced, &empty);
+        assert!(!accumulator_reached_register_at::<JqSemantics>(
+            Some(&a),
+            &empty,
+            &empty_reg
+        ));
+        let two = OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+        assert!(!accumulator_reached_register_at::<JqSemantics>(
+            Some(&a),
+            &two,
+            &sliced_reg
+        ));
+        // and the same path ending in a slice is the same node only for a non-empty array
+        assert!(accumulator_reached_register_at::<JqSemantics>(
+            Some(&sliced),
+            &one,
+            &sliced_reg
+        ));
+        assert!(!accumulator_reached_register_at::<JqSemantics>(
+            Some(&sliced),
+            &empty,
+            &empty_reg
+        ));
+        let string = OwnedValue::String("s".into());
+        let string_reg = at(&sliced, &string);
+        assert!(!accumulator_reached_register_at::<JqSemantics>(
+            Some(&sliced),
+            &string,
+            &string_reg
         ));
     }
 

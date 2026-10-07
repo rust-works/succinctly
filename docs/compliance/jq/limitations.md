@@ -3167,7 +3167,12 @@ answers `["b"]` — and classified the two residuals appended below):
     previous UPDATE *reached* the accumulator at the absolute path the next element moves the
     register to (`accumulator_reached_register_at`), or at the path that element slices without
     dropping an element. A different path holding an equal value, and a string or empty-array
-    slice (a fresh `jv`), still refuse. jq mode only.
+    slice (a fresh `jv`), still refuse. jq mode only. Still refusals where jq answers: a slice
+    chain *inside* UPDATE (`path(foreach (1, .[0:2]) as $k (.; .[0:2]|.[0:2]))` on `[1,2]`, where
+    the accumulator's path and the register's are two different slice chains over one array and
+    proving them the same node needs the base array's value), and `foreach (recurse(.[]?)|length)`
+    -- a parameterised `recurse` followed by a computing stage -- which raises one element before
+    jq does.
   - **A `foreach`'s bare `$k` over a navigated element names that element's position** (jq mode,
     `Origin::SnapshotAt`), which is what lets an empty array certify against the step register:
     `path(foreach .a as $k (0; $k; .))` on `{"a":[]}` is jq's `["a"]`

@@ -98,8 +98,9 @@ FORMS = ['path({k} ({s}) as $k ({i}; {u}))', '({k} ({s}) as $k ({i}; {u})) = 9']
 #   carried across source elements, `..`/`recurse` and a full slice of the accumulator
 #   are closed (#3460).
 #   `recurse(.[]?)|length` -- a `both-error-differ` row: `path(foreach (recurse(.[]?)|length) as $k
-#   (.; .a))` on `{"a":{"a":1},"b":{"c":2}}` raises at the second element in succinctly, one
-#   element after jq (a parameterised `recurse` followed by a computing stage; bare `..`/`recurse` match).
+#   (.; .a))` on `{"a":{"a":1},"b":{"c":2}}` raises at the second element in succinctly, one element
+#   *before* jq does (a parameterised `recurse` followed by a computing stage; bare `..`/`recurse`
+#   match since #3460).
 #   `foreach .[]? as $x (0; .+1)` -- a nested navigating `foreach`: its values
 #   come back off the resolver's root path, which `drive_fold_source` reads as
 #   a lost register, so it refuses where jq may answer (it used to read as a
