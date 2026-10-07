@@ -3603,7 +3603,7 @@ fn resolve_one_meta_assign(
     // a string outright (live-verified against pinned yq: `.a style = 5` =>
     // `unknown style 5`, `.a style = true` => `unknown style true`, `.a
     // style = {}` => `unknown style {}` -- always coerced, then checked).
-    let stringify = Expr::Pipe(vec![value.clone(), Expr::Builtin(Builtin::ToString)]);
+    let stringify = Expr::Pipe(vec![value.clone(), Expr::Builtin(Builtin::ToString)].into());
     let reports_before = sink.report_count();
     let mut texts = Vec::with_capacity(paths.len());
     if is_update {
@@ -8502,7 +8502,7 @@ mod tests {
 
         // The `Pipe` arm already requires every stage to qualify, so a
         // rejected `map` body disqualifies the whole chain it sits in.
-        let piped = Expr::Pipe(vec![Expr::Field("r".to_string()), computing]);
+        let piped = Expr::Pipe(vec![Expr::Field("r".to_string()), computing].into());
         assert!(!can_use_m2_streaming(&piped));
     }
 
@@ -8944,11 +8944,14 @@ mod tests {
     fn test_evaluate_yaml_pipe() {
         let yaml = b"users:\n  - name: Alice\n  - name: Bob";
         // .users | .[0] | .name
-        let expr = Expr::Pipe(vec![
-            Expr::Field("users".to_string()),
-            Expr::index(0),
-            Expr::Field("name".to_string()),
-        ]);
+        let expr = Expr::Pipe(
+            vec![
+                Expr::Field("users".to_string()),
+                Expr::index(0),
+                Expr::Field("name".to_string()),
+            ]
+            .into(),
+        );
         let results = eval_yaml(yaml, &expr);
 
         assert_eq!(results.len(), 1);
@@ -9637,10 +9640,9 @@ mod tests {
             Some(vec![(vec![], WriteKind::Set)])
         );
         assert_eq!(
-            targets_of(&assign(Expr::Pipe(vec![
-                Expr::Identity,
-                Expr::Field("a".into()),
-            ]))),
+            targets_of(&assign(Expr::Pipe(
+                vec![Expr::Identity, Expr::Field("a".into()),].into()
+            ))),
             Some(vec![(vec![PathStep::Key("a".into())], WriteKind::Set)])
         );
     }
@@ -9687,7 +9689,9 @@ mod tests {
             Expr::Builtin(Builtin::Select(Box::new(Expr::Identity))),
         ] {
             assert_eq!(
-                targets_of(&Expr::Pipe(vec![assign(Expr::Field("a".into())), stage])),
+                targets_of(&Expr::Pipe(
+                    vec![assign(Expr::Field("a".into())), stage].into()
+                )),
                 Some(vec![(vec![PathStep::Key("a".into())], WriteKind::Set)])
             );
         }
@@ -10051,10 +10055,7 @@ mod tests {
     fn collect_write_targets_declines_del_that_renumbers_another_write_870() {
         let del = |e: Expr| Expr::Builtin(Builtin::Del(Box::new(e)));
         let arr_idx = |i: i64| {
-            Expr::Pipe(vec![
-                Expr::Field("arr".into()),
-                Expr::Index { idx: i, key: None },
-            ])
+            Expr::Pipe(vec![Expr::Field("arr".into()), Expr::Index { idx: i, key: None }].into())
         };
         let set = |p: Expr| Expr::Assign {
             path: Box::new(p),
@@ -10063,19 +10064,20 @@ mod tests {
 
         // A write into the same array, after a del that renumbers it.
         assert!(
-            collect_write_targets(&Expr::Pipe(vec![set(arr_idx(1)), del(arr_idx(0))])).is_none()
+            collect_write_targets(&Expr::Pipe(vec![set(arr_idx(1)), del(arr_idx(0))].into()))
+                .is_none()
         );
         // Same two writes, other order — equally undecidable from this list.
         assert!(
-            collect_write_targets(&Expr::Pipe(vec![del(arr_idx(0)), set(arr_idx(1))])).is_none()
+            collect_write_targets(&Expr::Pipe(vec![del(arr_idx(0)), set(arr_idx(1))].into()))
+                .is_none()
         );
         // Two deletions from one array are handled together, not declined.
         assert!(collect_write_targets(&del(Expr::Comma(vec![arr_idx(0), arr_idx(2)]))).is_some());
         // A write elsewhere is unaffected by the renumbering.
-        assert!(collect_write_targets(&Expr::Pipe(vec![
-            del(arr_idx(0)),
-            set(Expr::Field("n".into()))
-        ]))
+        assert!(collect_write_targets(&Expr::Pipe(
+            vec![del(arr_idx(0)), set(Expr::Field("n".into()))].into()
+        ))
         .is_some());
     }
 
@@ -10092,10 +10094,9 @@ mod tests {
     #[test]
     fn collect_write_targets_follows_the_same_wrappers_2091() {
         let del_arr0 = || {
-            Expr::Builtin(Builtin::Del(Box::new(Expr::Pipe(vec![
-                Expr::Field("arr".into()),
-                Expr::Index { idx: 0, key: None },
-            ]))))
+            Expr::Builtin(Builtin::Del(Box::new(Expr::Pipe(
+                vec![Expr::Field("arr".into()), Expr::Index { idx: 0, key: None }].into(),
+            ))))
         };
         let expected = Some(vec![(
             vec![PathStep::Key("arr".into()), PathStep::Index(0)],

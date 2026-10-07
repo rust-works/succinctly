@@ -1365,7 +1365,12 @@ fn build_call_graph(
             }
         }
 
-        Expr::Pipe(exprs) | Expr::Comma(exprs) => {
+        Expr::Pipe(exprs) => {
+            for e in exprs {
+                build_call_graph(e, scope, enclosing, graph, roots);
+            }
+        }
+        Expr::Comma(exprs) => {
             for e in exprs {
                 build_call_graph(e, scope, enclosing, graph, roots);
             }
@@ -2814,7 +2819,12 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
             cx.reorder(&marks, Some(&[2, 0, 1, 3, 4]), Some(&[2, 0, 1, 3, 4]));
         }
 
-        Expr::Pipe(exprs) | Expr::Comma(exprs) => {
+        Expr::Pipe(exprs) => {
+            for e in exprs.iter_mut() {
+                check(e, cx, reachable);
+            }
+        }
+        Expr::Comma(exprs) => {
             for e in exprs.iter_mut() {
                 check(e, cx, reachable);
             }

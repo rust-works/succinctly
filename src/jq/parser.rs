@@ -236,12 +236,12 @@ fn join_expr(mut args: Vec<Expr>) -> Expr {
     };
     let mut args = args.into_iter();
     let body = match (args.next(), args.next(), args.next()) {
-        (Some(idx_expr), None, None) => {
-            Expr::Array(Box::new(Expr::Pipe(vec![Expr::Iterate, pair(idx_expr)])))
-        }
-        (Some(stream), Some(idx_expr), None) => Expr::Pipe(vec![stream, pair(idx_expr)]),
+        (Some(idx_expr), None, None) => Expr::Array(Box::new(Expr::Pipe(
+            vec![Expr::Iterate, pair(idx_expr)].into(),
+        ))),
+        (Some(stream), Some(idx_expr), None) => Expr::Pipe(vec![stream, pair(idx_expr)].into()),
         (Some(stream), Some(idx_expr), Some(join)) => {
-            Expr::Pipe(vec![stream, pair(idx_expr), join])
+            Expr::Pipe(vec![stream, pair(idx_expr), join].into())
         }
         _ => unreachable!("parse_join_expr passes two to four arguments"), // patchcov: coverage tolerate-line reason="unreachable: parse_join_expr only calls join_expr with two to four arguments (#3046)"
     };
@@ -3445,7 +3445,7 @@ impl<'a> Parser<'a> {
                 if !self.shadowable_defs.contains("error")
                     && contains_retrying_pattern_bind(&msg) =>
             {
-                Expr::Pipe(vec![*msg, Expr::Error(None)])
+                Expr::Pipe(vec![*msg, Expr::Error(None)].into())
             }
             msg => Expr::Error(msg),
         })
@@ -7284,7 +7284,7 @@ impl<'a> Parser<'a> {
                 stages.push(format.clone());
                 Expr::Pipe(stages)
             } else {
-                Expr::Pipe(vec![e.clone(), format.clone()])
+                Expr::Pipe(vec![e.clone(), format.clone()].into())
             }
         })
     }
@@ -7376,7 +7376,7 @@ impl<'a> Parser<'a> {
         if chain.len() == 1 {
             expr = chain.pop().unwrap();
         } else {
-            expr = Expr::Pipe(chain);
+            expr = Expr::Pipe(chain.into());
         }
 
         Ok(expr)
@@ -9105,31 +9105,37 @@ mod tests {
     fn test_chained() {
         assert_eq!(
             parse(".foo.bar").unwrap(),
-            Expr::Pipe(vec![Expr::Field("foo".into()), Expr::Field("bar".into()),])
+            Expr::Pipe(vec![Expr::Field("foo".into()), Expr::Field("bar".into()),].into())
         );
 
         assert_eq!(
             parse(".foo[0]").unwrap(),
-            Expr::Pipe(vec![Expr::Field("foo".into()), Expr::index(0),])
+            Expr::Pipe(vec![Expr::Field("foo".into()), Expr::index(0),].into())
         );
 
         assert_eq!(
             parse(".foo.bar[0].baz").unwrap(),
-            Expr::Pipe(vec![
-                Expr::Field("foo".into()),
-                Expr::Field("bar".into()),
-                Expr::index(0),
-                Expr::Field("baz".into()),
-            ])
+            Expr::Pipe(
+                vec![
+                    Expr::Field("foo".into()),
+                    Expr::Field("bar".into()),
+                    Expr::index(0),
+                    Expr::Field("baz".into()),
+                ]
+                .into()
+            )
         );
 
         assert_eq!(
             parse(".users[].name").unwrap(),
-            Expr::Pipe(vec![
-                Expr::Field("users".into()),
-                Expr::Iterate,
-                Expr::Field("name".into()),
-            ])
+            Expr::Pipe(
+                vec![
+                    Expr::Field("users".into()),
+                    Expr::Iterate,
+                    Expr::Field("name".into()),
+                ]
+                .into()
+            )
         );
     }
 
@@ -9163,36 +9169,45 @@ mod tests {
         // (1,2) | 3 — not 1, (2 | 3)
         assert_eq!(
             parse("1,2 | 3").unwrap(),
-            Expr::Pipe(vec![Expr::Comma(vec![int(1), int(2)]), int(3)])
+            Expr::Pipe(vec![Expr::Comma(vec![int(1), int(2)]), int(3)].into())
         );
 
         // Every stage is a comma list, so both sides group.
         assert_eq!(
             parse("1,2 | 3,4").unwrap(),
-            Expr::Pipe(vec![
-                Expr::Comma(vec![int(1), int(2)]),
-                Expr::Comma(vec![int(3), int(4)]),
-            ])
+            Expr::Pipe(
+                vec![
+                    Expr::Comma(vec![int(1), int(2)]),
+                    Expr::Comma(vec![int(3), int(4)]),
+                ]
+                .into()
+            )
         );
 
         // A pipe of three stages stays flat, with only the comma stage nested.
         assert_eq!(
             parse(".a | 1,2 | .b").unwrap(),
-            Expr::Pipe(vec![
-                Expr::Field("a".into()),
-                Expr::Comma(vec![int(1), int(2)]),
-                Expr::Field("b".into()),
-            ])
+            Expr::Pipe(
+                vec![
+                    Expr::Field("a".into()),
+                    Expr::Comma(vec![int(1), int(2)]),
+                    Expr::Field("b".into()),
+                ]
+                .into()
+            )
         );
 
         // Explicit parens were the old workaround; they must still mean the
         // same thing they always did.
         assert_eq!(
             parse("(1,2) | 3").unwrap(),
-            Expr::Pipe(vec![
-                Expr::Paren(Box::new(Expr::Comma(vec![int(1), int(2)]))),
-                int(3),
-            ])
+            Expr::Pipe(
+                vec![
+                    Expr::Paren(Box::new(Expr::Comma(vec![int(1), int(2)]))),
+                    int(3),
+                ]
+                .into()
+            )
         );
 
         // A comma with no pipe is still a bare comma — no spurious Pipe wrapper.
@@ -9244,7 +9259,7 @@ mod tests {
         );
         assert_eq!(
             yq(". | ., ."),
-            Expr::Comma(vec![Expr::Pipe(vec![id.clone(), id.clone()])])
+            Expr::Comma(vec![Expr::Pipe(vec![id.clone(), id.clone()].into())])
         );
 
         // A non-transparent operand on either side of the innermost pair
@@ -9372,11 +9387,11 @@ mod tests {
         // into the *left* operand. jq ranks `|` loosest, so the pipe wins.
         assert_eq!(
             yq(".a | 1 and .b"),
-            and(Expr::Pipe(vec![f("a"), int(1)]), f("b"))
+            and(Expr::Pipe(vec![f("a"), int(1)].into()), f("b"))
         );
         assert_eq!(
             parse(".a | 1 and .b").unwrap(),
-            Expr::Pipe(vec![f("a"), and(int(1), f("b"))])
+            Expr::Pipe(vec![f("a"), and(int(1), f("b"))].into())
         );
 
         // One precedence for both, popped only on strictly greater, so an
@@ -9418,7 +9433,7 @@ mod tests {
         // .y)`, `[...]` contents and object values parsing per operand.
         assert_eq!(
             yq(".a | (1 and .b)"),
-            Expr::Pipe(vec![f("a"), Expr::Paren(Box::new(and(int(1), f("b")))),])
+            Expr::Pipe(vec![f("a"), Expr::Paren(Box::new(and(int(1), f("b")))),].into())
         );
 
         // An object value carries the level too (yq's `:` is precedence 15,
@@ -9427,7 +9442,7 @@ mod tests {
             yq(r#"{"k": .a | .b and .c}"#),
             Expr::Object(vec![ObjectEntry {
                 key: ObjectKey::Literal("k".into()),
-                value: and(Expr::Pipe(vec![f("a"), f("b")]), f("c")),
+                value: and(Expr::Pipe(vec![f("a"), f("b")].into()), f("c")),
             }])
         );
     }
@@ -9440,26 +9455,30 @@ mod tests {
         // One text, two modes, two shapes.
         assert_eq!(
             parse("1,2 | 3").unwrap(),
-            Expr::Pipe(vec![Expr::Comma(vec![int(1), int(2)]), int(3)])
+            Expr::Pipe(vec![Expr::Comma(vec![int(1), int(2)]), int(3)].into())
         );
         assert_eq!(
             yq("1,2 | 3"),
-            Expr::Comma(vec![int(1), Expr::Pipe(vec![int(2), int(3)])])
+            Expr::Comma(vec![int(1), Expr::Pipe(vec![int(2), int(3)].into())])
         );
 
         // The comma stays n-ary at the top and every operand is a whole pipe
         // chain, so `1,2 | 3,4` is three operands, not two comma stages.
         assert_eq!(
             yq("1,2 | 3,4"),
-            Expr::Comma(vec![int(1), Expr::Pipe(vec![int(2), int(3)]), int(4)])
+            Expr::Comma(vec![
+                int(1),
+                Expr::Pipe(vec![int(2), int(3)].into()),
+                int(4)
+            ])
         );
 
         // `.a | 1,2 | .b` is `(.a | 1), (2 | .b)` — two independent chains.
         assert_eq!(
             yq(".a | 1,2 | .b"),
             Expr::Comma(vec![
-                Expr::Pipe(vec![Expr::Field("a".into()), int(1)]),
-                Expr::Pipe(vec![int(2), Expr::Field("b".into())]),
+                Expr::Pipe(vec![Expr::Field("a".into()), int(1)].into()),
+                Expr::Pipe(vec![int(2), Expr::Field("b".into())].into()),
             ])
         );
 
@@ -9467,10 +9486,13 @@ mod tests {
         // they restore jq's grouping in yq mode too.
         assert_eq!(
             yq("(1,2) | 3"),
-            Expr::Pipe(vec![
-                Expr::Paren(Box::new(Expr::Comma(vec![int(1), int(2)]))),
-                int(3),
-            ])
+            Expr::Pipe(
+                vec![
+                    Expr::Paren(Box::new(Expr::Comma(vec![int(1), int(2)]))),
+                    int(3),
+                ]
+                .into()
+            )
         );
 
         // Construction brackets are *not* such a boundary: they scope
@@ -9479,20 +9501,19 @@ mod tests {
             yq("[1,2 | 3]"),
             Expr::Array(Box::new(Expr::Comma(vec![
                 int(1),
-                Expr::Pipe(vec![int(2), int(3)]),
+                Expr::Pipe(vec![int(2), int(3)].into()),
             ])))
         );
         assert_eq!(
             parse("[1,2 | 3]").unwrap(),
-            Expr::Array(Box::new(Expr::Pipe(vec![
-                Expr::Comma(vec![int(1), int(2)]),
-                int(3),
-            ])))
+            Expr::Array(Box::new(Expr::Pipe(
+                vec![Expr::Comma(vec![int(1), int(2)]), int(3),].into()
+            )))
         );
 
         // Neither operator alone changes shape, in either mode.
         assert_eq!(yq("1,2"), Expr::Comma(vec![int(1), int(2)]));
-        assert_eq!(yq("1 | 2"), Expr::Pipe(vec![int(1), int(2)]));
+        assert_eq!(yq("1 | 2"), Expr::Pipe(vec![int(1), int(2)].into()));
     }
 
     /// `as` binds below the comma: its body swallows the rest of the
@@ -9871,7 +9892,7 @@ mod tests {
     fn test_pipe_operator() {
         assert_eq!(
             parse(". | .foo").unwrap(),
-            Expr::Pipe(vec![Expr::Identity, Expr::Field("foo".into()),])
+            Expr::Pipe(vec![Expr::Identity, Expr::Field("foo".into()),].into())
         );
     }
 
@@ -10708,26 +10729,26 @@ mod tests {
         // Quoted field in chained access
         assert_eq!(
             parse(".foo.\"bar-baz\"").unwrap(),
-            Expr::Pipe(vec![
-                Expr::Field("foo".into()),
-                Expr::Field("bar-baz".into()),
-            ])
+            Expr::Pipe(vec![Expr::Field("foo".into()), Expr::Field("bar-baz".into()),].into())
         );
 
         // Multiple quoted fields chained
         assert_eq!(
             parse(".\"a-b\".\"c-d\"").unwrap(),
-            Expr::Pipe(vec![Expr::Field("a-b".into()), Expr::Field("c-d".into()),])
+            Expr::Pipe(vec![Expr::Field("a-b".into()), Expr::Field("c-d".into()),].into())
         );
 
         // Mix of quoted and unquoted fields
         assert_eq!(
             parse(".foo.\"my-key\".bar").unwrap(),
-            Expr::Pipe(vec![
-                Expr::Field("foo".into()),
-                Expr::Field("my-key".into()),
-                Expr::Field("bar".into()),
-            ])
+            Expr::Pipe(
+                vec![
+                    Expr::Field("foo".into()),
+                    Expr::Field("my-key".into()),
+                    Expr::Field("bar".into()),
+                ]
+                .into()
+            )
         );
     }
 
@@ -11084,10 +11105,13 @@ mod tests {
         assert_eq!(
             parse(".a[.k].b[.j]").unwrap(),
             Expr::index_by(
-                Expr::Pipe(vec![
-                    Expr::index_by(Expr::Field("a".into()), Expr::Field("k".into())),
-                    Expr::Field("b".into()),
-                ]),
+                Expr::Pipe(
+                    vec![
+                        Expr::index_by(Expr::Field("a".into()), Expr::Field("k".into())),
+                        Expr::Field("b".into()),
+                    ]
+                    .into()
+                ),
                 Expr::Field("j".into())
             )
         );
@@ -11140,14 +11164,17 @@ mod tests {
         assert_eq!(
             parse(".a[.k1:.k2].b[.j1:.j2]").unwrap(),
             Expr::slice_by(
-                Expr::Pipe(vec![
-                    Expr::slice_by(
-                        Expr::Field("a".into()),
-                        Some(Expr::Field("k1".into())),
-                        Some(Expr::Field("k2".into())),
-                    ),
-                    Expr::Field("b".into()),
-                ]),
+                Expr::Pipe(
+                    vec![
+                        Expr::slice_by(
+                            Expr::Field("a".into()),
+                            Some(Expr::Field("k1".into())),
+                            Some(Expr::Field("k2".into())),
+                        ),
+                        Expr::Field("b".into()),
+                    ]
+                    .into()
+                ),
                 Some(Expr::Field("j1".into())),
                 Some(Expr::Field("j2".into())),
             )
@@ -11214,26 +11241,26 @@ mod tests {
         // Bracket string in chained access
         assert_eq!(
             parse(".foo[\"bar-baz\"]").unwrap(),
-            Expr::Pipe(vec![
-                Expr::Field("foo".into()),
-                Expr::Field("bar-baz".into()),
-            ])
+            Expr::Pipe(vec![Expr::Field("foo".into()), Expr::Field("bar-baz".into()),].into())
         );
 
         // Multiple bracket notations chained
         assert_eq!(
             parse(".[\"a-b\"][\"c-d\"]").unwrap(),
-            Expr::Pipe(vec![Expr::Field("a-b".into()), Expr::Field("c-d".into()),])
+            Expr::Pipe(vec![Expr::Field("a-b".into()), Expr::Field("c-d".into()),].into())
         );
 
         // Mix of bracket and dot notation
         assert_eq!(
             parse(".foo[\"my-key\"].bar").unwrap(),
-            Expr::Pipe(vec![
-                Expr::Field("foo".into()),
-                Expr::Field("my-key".into()),
-                Expr::Field("bar".into()),
-            ])
+            Expr::Pipe(
+                vec![
+                    Expr::Field("foo".into()),
+                    Expr::Field("my-key".into()),
+                    Expr::Field("bar".into()),
+                ]
+                .into()
+            )
         );
     }
 
@@ -11267,26 +11294,32 @@ mod tests {
         // Chained kebab-case
         assert_eq!(
             parse_with_mode(".my-key.other-key", ParserMode::Yq).unwrap(),
-            Expr::Pipe(vec![
-                Expr::Field("my-key".into()),
-                Expr::Field("other-key".into()),
-            ])
+            Expr::Pipe(
+                vec![
+                    Expr::Field("my-key".into()),
+                    Expr::Field("other-key".into()),
+                ]
+                .into()
+            )
         );
 
         // Mix of kebab-case and regular identifiers
         assert_eq!(
             parse_with_mode(".foo.my-key.bar", ParserMode::Yq).unwrap(),
-            Expr::Pipe(vec![
-                Expr::Field("foo".into()),
-                Expr::Field("my-key".into()),
-                Expr::Field("bar".into()),
-            ])
+            Expr::Pipe(
+                vec![
+                    Expr::Field("foo".into()),
+                    Expr::Field("my-key".into()),
+                    Expr::Field("bar".into()),
+                ]
+                .into()
+            )
         );
 
         // Kebab-case with array index
         assert_eq!(
             parse_with_mode(".my-key[0]", ParserMode::Yq).unwrap(),
-            Expr::Pipe(vec![Expr::Field("my-key".into()), Expr::index(0),])
+            Expr::Pipe(vec![Expr::Field("my-key".into()), Expr::index(0),].into())
         );
 
         // Kebab-case with optional
@@ -11655,7 +11688,7 @@ mod tests {
         // Comment between expressions
         assert_eq!(
             parse(".foo # get foo\n| .bar # then bar").unwrap(),
-            Expr::Pipe(vec![Expr::Field("foo".into()), Expr::Field("bar".into()),])
+            Expr::Pipe(vec![Expr::Field("foo".into()), Expr::Field("bar".into()),].into())
         );
 
         // Comment with special characters
@@ -11667,7 +11700,7 @@ mod tests {
         // Empty comment
         assert_eq!(
             parse(".foo #\n| .bar").unwrap(),
-            Expr::Pipe(vec![Expr::Field("foo".into()), Expr::Field("bar".into()),])
+            Expr::Pipe(vec![Expr::Field("foo".into()), Expr::Field("bar".into()),].into())
         );
 
         // Comment-only input should fail (no expression)
@@ -12129,10 +12162,9 @@ mod tests {
             parse(r#"@base64 "v=\(1)""#).unwrap(),
             Expr::StringInterpolation(vec![
                 StringPart::Literal("v=".into()),
-                StringPart::Expr(Box::new(Expr::Pipe(vec![
-                    one,
-                    Expr::Format(FormatType::Base64),
-                ]))),
+                StringPart::Expr(Box::new(Expr::Pipe(
+                    vec![one, Expr::Format(FormatType::Base64),].into()
+                ))),
             ])
         );
 
@@ -12147,15 +12179,13 @@ mod tests {
             parse(r#"@base64 "a\("x")b\("y")c""#).unwrap(),
             Expr::StringInterpolation(vec![
                 StringPart::Literal("a".into()),
-                StringPart::Expr(Box::new(Expr::Pipe(vec![
-                    x,
-                    Expr::Format(FormatType::Base64),
-                ]))),
+                StringPart::Expr(Box::new(Expr::Pipe(
+                    vec![x, Expr::Format(FormatType::Base64),].into()
+                ))),
                 StringPart::Literal("b".into()),
-                StringPart::Expr(Box::new(Expr::Pipe(vec![
-                    y,
-                    Expr::Format(FormatType::Base64),
-                ]))),
+                StringPart::Expr(Box::new(Expr::Pipe(
+                    vec![y, Expr::Format(FormatType::Base64),].into()
+                ))),
                 StringPart::Literal("c".into()),
             ])
         );
@@ -12191,31 +12221,36 @@ mod tests {
 
         assert_eq!(
             parse(r#"@base64 "\(key|tostring)""#).unwrap(),
-            Expr::StringInterpolation(vec![StringPart::Expr(Box::new(Expr::Pipe(vec![
-                key.clone(),
-                tostring.clone(),
-                Expr::Format(FormatType::Base64),
-            ])))])
+            Expr::StringInterpolation(vec![StringPart::Expr(Box::new(Expr::Pipe(
+                vec![
+                    key.clone(),
+                    tostring.clone(),
+                    Expr::Format(FormatType::Base64),
+                ]
+                .into()
+            )))])
         );
 
         // A non-`Pipe` slot still gets the pre-existing 2-element wrap.
         assert_eq!(
             parse(r#"@base64 "\(key)""#).unwrap(),
-            Expr::StringInterpolation(vec![StringPart::Expr(Box::new(Expr::Pipe(vec![
-                key,
-                Expr::Format(FormatType::Base64),
-            ])))])
+            Expr::StringInterpolation(vec![StringPart::Expr(Box::new(Expr::Pipe(
+                vec![key, Expr::Format(FormatType::Base64),].into()
+            )))])
         );
 
         // A longer chain flattens all the way, not just the first two.
         assert_eq!(
             parse(r#"@base64 "\(key|tostring|length)""#).unwrap(),
-            Expr::StringInterpolation(vec![StringPart::Expr(Box::new(Expr::Pipe(vec![
-                Expr::Builtin(Builtin::Key),
-                tostring,
-                Expr::Builtin(Builtin::Length),
-                Expr::Format(FormatType::Base64),
-            ])))])
+            Expr::StringInterpolation(vec![StringPart::Expr(Box::new(Expr::Pipe(
+                vec![
+                    Expr::Builtin(Builtin::Key),
+                    tostring,
+                    Expr::Builtin(Builtin::Length),
+                    Expr::Format(FormatType::Base64),
+                ]
+                .into()
+            )))])
         );
     }
 
@@ -12245,10 +12280,13 @@ mod tests {
             parse(r#"@foo "v=\(1)""#).unwrap(),
             Expr::StringInterpolation(vec![
                 StringPart::Literal("v=".into()),
-                StringPart::Expr(Box::new(Expr::Pipe(vec![
-                    parse("1").unwrap(),
-                    Expr::Format(FormatType::Unknown("foo".into())),
-                ]))),
+                StringPart::Expr(Box::new(Expr::Pipe(
+                    vec![
+                        parse("1").unwrap(),
+                        Expr::Format(FormatType::Unknown("foo".into())),
+                    ]
+                    .into()
+                ))),
             ])
         );
 
@@ -12396,7 +12434,7 @@ mod tests {
             if filter.starts_with(".a.") {
                 assert_eq!(
                     expr,
-                    Expr::Pipe(vec![Expr::Field("a".into()), expected]),
+                    Expr::Pipe(vec![Expr::Field("a".into()), expected].into()),
                     "{filter}"
                 );
             } else {
@@ -12482,7 +12520,7 @@ mod tests {
                 if filter.starts_with(".a.") {
                     assert_eq!(
                         expr,
-                        Expr::Pipe(vec![Expr::Field("a".into()), expected]),
+                        Expr::Pipe(vec![Expr::Field("a".into()), expected].into()),
                         "{filter:?}"
                     );
                 } else {

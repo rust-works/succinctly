@@ -852,10 +852,13 @@ fn test_optional_pipe_fallback_no_longer_raises_386() {
     // `reduce`/`foreach` a single value per step. So `full` yields `null` here
     // while `generic` yields nothing; both are correctly non-error, which is
     // all #386 is about, so only that is asserted.
-    let expr = Expr::Pipe(vec![
-        parse(r#"contains(["a"])"#).expect("parse failed"),
-        parse(r#"contains("x")"#).expect("parse failed"),
-    ])
+    let expr = Expr::Pipe(
+        vec![
+            parse(r#"contains(["a"])"#).expect("parse failed"),
+            parse(r#"contains("x")"#).expect("parse failed"),
+        ]
+        .into(),
+    )
     .optional();
     let json: &[u8] = br#"["ab"]"#;
     let index = JsonIndex::build(json);

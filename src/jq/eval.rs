@@ -1055,7 +1055,7 @@ pub mod alias_identity {
         match components.len() {
             0 => Expr::Identity,
             1 => components.pop().expect("len checked"),
-            _ => Expr::Pipe(components),
+            _ => Expr::Pipe(components.into()),
         }
     }
 
@@ -2884,7 +2884,11 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         Expr::CompoundAssign { value, .. } | Expr::AlternativeAssign { value, .. } => {
             needs_path_context(value)
         }
-        Expr::Pipe(exprs) => exprs.iter().any(needs_path_context),
+        // Remembered on the pipe (#3886): a pipe nested in another stage is
+        // walked once, not on every ask of the stage holding it.
+        Expr::Pipe(exprs) => {
+            exprs.needs_path_context_or_init(|stages| stages.iter().any(needs_path_context))
+        }
         Expr::Paren(inner) => needs_path_context(inner),
         Expr::Optional(inner) => needs_path_context(inner),
         // `first(expr)`/`last(expr)` (#2074): same reasoning as `Limit`
@@ -7177,10 +7181,13 @@ fn limit_raise_result<'a, W: Clone + AsRef<[u64]>>(
 /// an unsubtractable `$n`, since its `foreach` raises on `f`'s first output (#3486).
 /// Run wherever `f` would have been run unbounded.
 pub(crate) fn limit_raising(expr: &Expr, error: &EvalError) -> Expr {
-    Expr::Pipe(vec![
-        expr.clone(),
-        Expr::error(Some(Expr::literal(Literal::string(error.message.clone())))),
-    ])
+    Expr::Pipe(
+        vec![
+            expr.clone(),
+            Expr::error(Some(Expr::literal(Literal::string(error.message.clone())))),
+        ]
+        .into(),
+    )
 }
 
 /// jq's `limit($n; f)`/`nth($n; f)` both take `ceil($n)` outputs of `f` for
@@ -9816,7 +9823,7 @@ fn static_path_expr(path: &OwnedValue) -> Option<Expr> {
     Some(match steps.len() {
         0 => Expr::Identity,
         1 => steps.pop()?,
-        _ => Expr::Pipe(steps),
+        _ => Expr::Pipe(steps.into()),
     })
 }
 
@@ -10000,7 +10007,12 @@ fn embed_peel_step<S: EvalSemantics>(
             if rest.is_empty() {
                 return None;
             }
-            return embed_peel_step::<S>(&Expr::Pipe(rest.to_vec()), input, optional, reentry);
+            return embed_peel_step::<S>(
+                &Expr::Pipe(rest.to_vec().into()),
+                input,
+                optional,
+                reentry,
+            );
         }
         _ => {}
     }
@@ -10077,7 +10089,7 @@ fn embed_peel_step<S: EvalSemantics>(
     let rest = match rest {
         [] => Expr::Identity,
         [only] => only.clone(),
-        many => Expr::Pipe(many.to_vec()),
+        many => Expr::Pipe(many.to_vec().into()),
     };
     Some((stepped, rest))
 }
@@ -10238,7 +10250,7 @@ impl RestCopy {
     /// The owned pipe over `stages`, built on the first call.
     fn owned_pipe(&mut self, stages: &[Expr]) -> &Expr {
         if !matches!(self, Self::Owned(_)) {
-            *self = Self::Owned(Expr::Pipe(stages.to_vec()));
+            *self = Self::Owned(Expr::Pipe(stages.to_vec().into()));
         }
         match self {
             Self::Owned(whole) => whole,
@@ -24808,7 +24820,7 @@ fn eval_owned_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             copy = if exprs.len() == 1 {
                 exprs[0].clone()
             } else {
-                Expr::Pipe(exprs.to_vec())
+                Expr::Pipe(exprs.to_vec().into())
             };
             &copy
         }
@@ -37716,7 +37728,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // without the guard, so it is a cost guard, not a behaviour one). jq mode
         // only (ADR-0018).
         Expr::Builtin(Builtin::Map(f)) if map_f_resolves_live::<S>(f) => {
-            let inner = Expr::Pipe(vec![Expr::Iterate, (**f).clone()]);
+            let inner = Expr::Pipe(vec![Expr::Iterate, (**f).clone()].into());
             resolve_collect_live::<S>(&inner, value, trackable, snapshot, frame, sink)
         }
         // #3551 (yq mode): real yq's bare `first` is a path step at the head of
@@ -39577,7 +39589,7 @@ fn flatten_components(components: Vec<Expr>) -> Expr {
     match components.len() {
         0 => Expr::Identity,
         1 => components.into_iter().next().expect("len checked"),
-        _ => Expr::Pipe(components),
+        _ => Expr::Pipe(components.into()),
     }
 }
 
@@ -41869,7 +41881,8 @@ fn register_movement_tracked(expr: &Expr) -> bool {
         | Expr::Builtin(Builtin::Select(_) | Builtin::GetPath(_)) => true,
         Expr::Paren(e) => register_movement_tracked(e),
         Expr::Optional(e) if is_postfix_optional_primitive(e) => register_movement_tracked(e),
-        Expr::Pipe(parts) | Expr::Comma(parts) => parts.iter().all(register_movement_tracked),
+        Expr::Pipe(parts) => parts.iter().all(register_movement_tracked),
+        Expr::Comma(parts) => parts.iter().all(register_movement_tracked),
         Expr::And(l, r) | Expr::Or(l, r) => {
             register_movement_tracked(l) && register_movement_tracked(r)
         }
@@ -42617,7 +42630,8 @@ fn array_contents_are_checked(inner: &Expr) -> bool {
             expr,
             catch: Some(handler),
         } => array_contents_are_checked(expr) && array_contents_are_checked(handler),
-        Expr::Pipe(stages) | Expr::Comma(stages) => stages.iter().all(array_contents_are_checked),
+        Expr::Pipe(stages) => stages.iter().all(array_contents_are_checked),
+        Expr::Comma(stages) => stages.iter().all(array_contents_are_checked),
         Expr::If {
             then_branch,
             else_branch,
@@ -43033,7 +43047,8 @@ fn cannot_move_register(expr: &Expr) -> bool {
         Expr::Paren(inner) | Expr::Optional(inner) | Expr::Negate(inner) => {
             cannot_move_register(inner)
         }
-        Expr::Pipe(stages) | Expr::Comma(stages) => stages.iter().all(cannot_move_register),
+        Expr::Pipe(stages) => stages.iter().all(cannot_move_register),
+        Expr::Comma(stages) => stages.iter().all(cannot_move_register),
         // #3186: both operands of a binary operator are subexps in jq, like
         // an object's entries -- `path(. as $x | ({k:1}|.zz) + 1 | $x)` and
         // `path(. as $x | (.k == 1) | $x)` are both `[]`.
@@ -44608,7 +44623,8 @@ fn fold_source_moves_register(source: &Expr) -> bool {
 fn yields_only_the_register(e: &Expr) -> bool {
     match unwrap_paren(e) {
         Expr::Identity => true,
-        Expr::Comma(items) | Expr::Pipe(items) => items.iter().all(yields_only_the_register),
+        Expr::Pipe(items) => items.iter().all(yields_only_the_register),
+        Expr::Comma(items) => items.iter().all(yields_only_the_register),
         _ => false,
     }
 }
@@ -45269,7 +45285,7 @@ fn resolve_bind_source_witness<S: EvalSemantics>(
                     None,
                 ));
             }
-            let rest = Expr::Pipe(rest);
+            let rest = Expr::Pipe(rest.into());
             if !is_pure_navigation(&rest) {
                 return None;
             }
@@ -46590,7 +46606,10 @@ fn var_reaches_path_position(body: &Expr, var: &str) -> bool {
             var_reaches_path_position(then_branch, var)
                 || var_reaches_path_position(else_branch, var)
         }
-        Expr::Pipe(stages) | Expr::Comma(stages) => stages
+        Expr::Pipe(stages) => stages
+            .iter()
+            .any(|stage| var_reaches_path_position(stage, var)),
+        Expr::Comma(stages) => stages
             .iter()
             .any(|stage| var_reaches_path_position(stage, var)),
         Expr::Paren(inner) | Expr::Optional(inner) => var_reaches_path_position(inner, var),
@@ -54009,7 +54028,7 @@ fn resolve_dynamic_indexes_sink<S: EvalSemantics>(
     /// static path expression. Only ever called with a non-empty `trailing`.
     fn append_trailing(expr: Expr, trailing: &[Expr]) -> Expr {
         let mut components = match expr {
-            Expr::Pipe(exprs) => exprs,
+            Expr::Pipe(exprs) => exprs.into_vec(),
             Expr::Identity => Vec::new(),
             other => vec![other],
         };
@@ -54073,7 +54092,7 @@ fn resolve_dynamic_indexes_sink<S: EvalSemantics>(
 
     let reduced_expr = match flat.len() {
         1 => flat.into_iter().next().expect("len checked"),
-        _ => Expr::Pipe(flat),
+        _ => Expr::Pipe(flat.into()),
     };
     resolve_terminal_sink::<S>(&reduced_expr, input, true, untracked, &mut |b| {
         sink(append_trailing(assemble_one_branch(&b), &trailing))
@@ -58084,7 +58103,10 @@ fn scan_for_path_source(expr: &Expr, names: &[String], calls: bool) -> bool {
 fn path_source_position(expr: &Expr, mentions: &dyn Fn(&Expr) -> bool) -> bool {
     match expr {
         Expr::Var(_) => mentions(expr),
-        Expr::Pipe(stages) | Expr::Comma(stages) => stages
+        Expr::Pipe(stages) => stages
+            .iter()
+            .any(|stage| path_source_position(stage, mentions)),
+        Expr::Comma(stages) => stages
             .iter()
             .any(|stage| path_source_position(stage, mentions)),
         Expr::Paren(inner) | Expr::Optional(inner) => path_source_position(inner, mentions),
@@ -60800,7 +60822,7 @@ fn eval_path_context_pipe_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
             let mut values = Vec::new();
             for placeholder in &placeholders {
-                match eval_owned_multi::<S>(&Expr::Pipe(rest.to_vec()), placeholder) {
+                match eval_owned_multi::<S>(&Expr::Pipe(rest.to_vec().into()), placeholder) {
                     Ok(outputs) => values.extend(outputs),
                     Err(e) => return e.into(),
                 }
@@ -64231,7 +64253,7 @@ fn vivify_del_comma_iterate_targets(
         let branch_expr = if components.len() == 1 {
             components.into_iter().next().expect("len checked")
         } else {
-            Expr::Pipe(components)
+            Expr::Pipe(components.into())
         };
         delete_at_path(result, &branch_expr, trailing_optional, true, true)?;
     }
@@ -64268,7 +64290,8 @@ fn contains_length_dependent_index(expr: &Expr) -> bool {
             start.is_some_and(|s| s < 0) || end.is_some_and(|e| e < 0)
         }
         Expr::IndexExpr { .. } | Expr::SliceExpr { .. } => true,
-        Expr::Pipe(exprs) | Expr::Comma(exprs) => exprs.iter().any(contains_length_dependent_index),
+        Expr::Pipe(exprs) => exprs.iter().any(contains_length_dependent_index),
+        Expr::Comma(exprs) => exprs.iter().any(contains_length_dependent_index),
         Expr::Paren(inner) | Expr::Optional(inner) => contains_length_dependent_index(inner),
         _ => false,
     }
@@ -65243,7 +65266,7 @@ fn delete_path_steps(
                 // -- mirrors the original per-level code's identical
                 // one-time `rest` clone, just narrowed to where it's actually
                 // needed instead of built for every arm.
-                let rest_pipe = yq_mode.then(|| Expr::Pipe(rest.to_vec()));
+                let rest_pipe = yq_mode.then(|| Expr::Pipe(rest.to_vec().into()));
                 return match root {
                     OwnedValue::Array(arr) => {
                         // #1182: yq's chained-scalar-slice del() rule (#1116,
@@ -84642,7 +84665,7 @@ mod tests {
     fn test_single_stage_front_doors_agree_with_the_wrapped_pipe_3673() {
         /// Returns whether the front doors answered this stage on this input.
         fn check<S: EvalSemantics>(rest: &[Expr], input: &OwnedValue, src: &str) -> bool {
-            let wrapped = Expr::Pipe(rest.to_vec());
+            let wrapped = Expr::Pipe(rest.to_vec().into());
             let mut doors_answered = false;
             for optional in [false, true] {
                 for stop in [false, true] {
@@ -84759,7 +84782,7 @@ mod tests {
                 let Expr::Pipe(stages) = parse(src).unwrap() else {
                     panic!("{src}: not a pipe"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3673)"
                 };
-                (*src, stages)
+                (*src, stages.into_vec())
             }));
         for (src, rest) in rests {
             for input in &pure_value_matrix() {
@@ -84861,7 +84884,7 @@ mod tests {
         /// does and built the owned pipe only where it should have.
         fn check<S: EvalSemantics>(src: &str, admitted: bool, input: &OwnedValue) -> usize {
             let rest = [parse(src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"))];
-            let wrapped = Expr::Pipe(rest.to_vec());
+            let wrapped = Expr::Pipe(rest.to_vec().into());
             let only = lone_plain_stage(&rest).expect("every source is one plain stage");
             let mut fallbacks = 0;
             // `eval_single` asserts a path-context pipe is never evaluated
@@ -85038,7 +85061,7 @@ mod tests {
         let mut reindex_answered = 0;
         for src in admitted {
             let stage = parse(src).unwrap();
-            let wrapped = Expr::Pipe(vec![stage.clone()]);
+            let wrapped = Expr::Pipe(vec![stage.clone()].into());
             for input in &values {
                 let bare = eval_owned_reindex_free::<JqSemantics>(&stage, input);
                 let piped = eval_owned_reindex_free::<JqSemantics>(&wrapped, input);
@@ -85234,7 +85257,7 @@ mod tests {
             ] {
                 let parsed = parse(src).unwrap();
                 let rest: Vec<Expr> = match parsed.clone() {
-                    Expr::Pipe(stages) => stages,
+                    Expr::Pipe(stages) => stages.into_vec(),
                     other => vec![other],
                 };
                 let before = owned_pipe_copies::get();
@@ -85249,7 +85272,7 @@ mod tests {
                 let copied = if rest.len() == 1 {
                     rest[0].clone()
                 } else {
-                    Expr::Pipe(rest.clone())
+                    Expr::Pipe(rest.clone().into())
                 };
                 let want = show(eval_owned_input::<Vec<u64>, S>(
                     &copied,
@@ -85290,7 +85313,7 @@ mod tests {
 
         // The counter sees the old shape: a pipe of one handed to the entry.
         let before = lone_pipe_entries::get();
-        let lone = Expr::Pipe(vec![parse(". + 1").unwrap()]);
+        let lone = Expr::Pipe(vec![parse(". + 1").unwrap()].into());
         let mut out = Vec::new();
         eval_each_owned::<JqSemantics>(&lone, &one(), false, Reentry::REBUILT, &mut |v| {
             out.push(v.to_json());
@@ -86546,7 +86569,7 @@ mod tests {
         };
         let with_arg = |stages: usize| Expr::DefCall {
             def: Rc::clone(def),
-            args: vec![Expr::Pipe(vec![Expr::Identity; stages])],
+            args: vec![Expr::Pipe(vec![Expr::Identity; stages].into())],
             frames: 0,
             bound: BoundBody::default(),
         };
@@ -107012,6 +107035,32 @@ mod tests {
         ]);
     }
 
+    /// #3886: the `Pipe` arm answers from the pipe's memo, so a pipe nested in
+    /// another stage is walked once: a seeded answer is read back, and a first
+    /// ask fills the memo.
+    #[test]
+    fn needs_path_context_pipe_arm_reads_the_memo_3886() {
+        let seeded = parse(".a | .b").unwrap();
+        let Expr::Pipe(stages) = &seeded else {
+            panic!("not a pipe")
+        };
+        assert!(stages.needs_path_context_or_init(|_| true));
+        assert!(needs_path_context(&seeded), "answered from the seeded memo");
+
+        for (filter, needs) in [(".a | key", true), (".a | .b", false)] {
+            let pipe = parse(filter).unwrap();
+            assert_eq!(needs_path_context(&pipe), needs, "{filter}");
+            let Expr::Pipe(stages) = &pipe else {
+                panic!("{filter}: not a pipe")
+            };
+            assert_eq!(
+                stages.needs_path_context_or_init(|_| unreachable!("{filter}: filled by the ask")),
+                needs,
+                "{filter}"
+            );
+        }
+    }
+
     /// #499: `needs_path_context` mirrors `IndexExpr`'s target/key check
     /// (#360) for a computed slice's target and both bounds — a `path`/
     /// `parent`/`key` builtin (yq's no-arg path-context extensions) hiding in
@@ -112466,7 +112515,7 @@ mod tests {
         #[should_panic(expected = "unresolved computed index reached path tracking")]
         fn test_path_tracking_refuses_an_unresolved_key_mid_pipe() {
             let mut reached = Vec::new();
-            let pipe = Expr::Pipe(vec![unresolved(), Expr::Field("a".to_string())]);
+            let pipe = Expr::Pipe(vec![unresolved(), Expr::Field("a".to_string())].into());
             let _ = walk_path::<JqSemantics>(
                 &pipe,
                 WalkNode::Null,
@@ -112583,7 +112632,7 @@ mod tests {
         #[should_panic(expected = "unresolved computed slice reached path tracking")]
         fn test_path_tracking_refuses_an_unresolved_slice_mid_pipe() {
             let mut reached = Vec::new();
-            let pipe = Expr::Pipe(vec![unresolved(), Expr::Field("a".to_string())]);
+            let pipe = Expr::Pipe(vec![unresolved(), Expr::Field("a".to_string())].into());
             let _ = walk_path::<JqSemantics>(
                 &pipe,
                 WalkNode::Null,
@@ -117759,16 +117808,13 @@ mod tests {
         assert!(ends_in_array_key(&key()));
         assert!(ends_in_array_key(&Expr::Optional(Box::new(key()))));
         assert!(ends_in_array_key(&Expr::Paren(Box::new(key()))));
-        assert!(ends_in_array_key(&Expr::Pipe(vec![
-            Expr::Index { idx: 0, key: None },
-            key(),
-            Expr::Identity,
-        ])));
-        assert!(!ends_in_array_key(&Expr::Pipe(vec![
-            key(),
-            Expr::Index { idx: 0, key: None },
-        ])));
-        assert!(!ends_in_array_key(&Expr::Pipe(Vec::new())));
+        assert!(ends_in_array_key(&Expr::Pipe(
+            vec![Expr::Index { idx: 0, key: None }, key(), Expr::Identity,].into()
+        )));
+        assert!(!ends_in_array_key(&Expr::Pipe(
+            vec![key(), Expr::Index { idx: 0, key: None },].into()
+        )));
+        assert!(!ends_in_array_key(&Expr::Pipe(Vec::new().into())));
         assert!(!ends_in_array_key(&Expr::Index { idx: 0, key: None }));
         assert!(!ends_in_array_key(&Expr::Identity));
     }
@@ -121862,10 +121908,13 @@ mod tests {
         // resolver too -- equal to `.a`'s value, never `.a`'s node.
         let at_a = |var: Expr| {
             let cursor = index.root(doc);
-            let expr = Expr::Pipe(vec![
-                parse(".a").unwrap(),
-                Expr::Builtin(Builtin::Path(Box::new(var))),
-            ]);
+            let expr = Expr::Pipe(
+                vec![
+                    parse(".a").unwrap(),
+                    Expr::Builtin(Builtin::Path(Box::new(var))),
+                ]
+                .into(),
+            );
             eval_full::<Vec<u64>, JqSemantics>(&expr, cursor)
         };
         match at_a(constructed) {
@@ -122717,10 +122766,8 @@ mod tests {
         };
         let _guard = embed_table_push::<JqSemantics>(Some(&origin), &mut value.clone());
 
-        let expr = Expr::Pipe(vec![
-            Expr::Field("k".to_string()),
-            Expr::Field("a".to_string()),
-        ]);
+        let expr =
+            Expr::Pipe(vec![Expr::Field("k".to_string()), Expr::Field("a".to_string())].into());
         let input = OwnedValue::Int(5);
         let result = embed_peel_step::<JqSemantics>(&expr, &input, false, Reentry::REBUILT)
             .expect("a Field first-step with a peelable tail must not decline");
@@ -122988,7 +123035,7 @@ mod tests {
             document: 7,
         };
         // Read as a plain value: never rebuilt, whatever the root.
-        let plain = Expr::Pipe(vec![marker.clone(), Expr::Identity]);
+        let plain = Expr::Pipe(vec![marker.clone(), Expr::Identity].into());
         for root in [&own, &other, &RootWitness::Owned] {
             assert!(matches!(demote_for_reentry(&plain, root), Cow::Borrowed(_)));
         }
@@ -123038,7 +123085,7 @@ mod tests {
                 document: 7,
             }),
         }));
-        let plain = Expr::Pipe(vec![untracked.clone(), Expr::Identity]);
+        let plain = Expr::Pipe(vec![untracked.clone(), Expr::Identity].into());
         assert!(matches!(
             Reentry::Against(own).reroot::<JqSemantics>(&plain),
             Cow::Borrowed(_)
@@ -123099,10 +123146,9 @@ mod tests {
             named
         );
         assert_eq!(
-            try_payload_root(&Expr::Pipe(vec![
-                marker(Some(node.clone())),
-                Expr::Error(None)
-            ])),
+            try_payload_root(&Expr::Pipe(
+                vec![marker(Some(node.clone())), Expr::Error(None)].into()
+            )),
             named
         );
         assert_eq!(
@@ -123114,11 +123160,9 @@ mod tests {
             RootWitness::Owned
         );
         assert_eq!(
-            try_payload_root(&Expr::Pipe(vec![
-                marker(Some(node)),
-                Expr::Identity,
-                Expr::Error(None)
-            ])),
+            try_payload_root(&Expr::Pipe(
+                vec![marker(Some(node)), Expr::Identity, Expr::Error(None)].into()
+            )),
             RootWitness::Owned
         );
         assert_eq!(
@@ -123189,32 +123233,28 @@ mod tests {
         // `error($x) | error` is the head's one site; the trailing `error`
         // is not a second, unproven one.
         assert_eq!(
-            try_payload_root(&Expr::Pipe(vec![raise(3), Expr::Error(None)])),
+            try_payload_root(&Expr::Pipe(vec![raise(3), Expr::Error(None)].into())),
             at(3)
         );
         // A raise buried in an earlier stage of a pipe ending in `error` is
         // still seen: here node 4's, which disagrees with the tail's node 3.
         assert_eq!(
-            try_payload_root(&Expr::Pipe(vec![
-                Expr::Comma(vec![raise(4)]),
-                marker(3),
-                Expr::Error(None)
-            ])),
+            try_payload_root(&Expr::Pipe(
+                vec![Expr::Comma(vec![raise(4)]), marker(3), Expr::Error(None)].into()
+            )),
             RootWitness::Owned
         );
         assert_eq!(
-            try_payload_root(&Expr::Pipe(vec![
-                Expr::Comma(vec![raise(3)]),
-                marker(3),
-                Expr::Error(None)
-            ])),
+            try_payload_root(&Expr::Pipe(
+                vec![Expr::Comma(vec![raise(3)]), marker(3), Expr::Error(None)].into()
+            )),
             at(3)
         );
         // A bare `error` with no marker before it stays unproven.
         assert_eq!(
             try_payload_root(&Expr::Comma(vec![
                 raise(3),
-                Expr::Pipe(vec![Expr::Identity, Expr::Error(None)])
+                Expr::Pipe(vec![Expr::Identity, Expr::Error(None)].into())
             ])),
             RootWitness::Owned
         );
@@ -127273,7 +127313,7 @@ mod tests {
     #[test]
     fn fresh_run_stops_at_a_non_field_index_step_2549() {
         let steps = |f: &str| match parse(f).unwrap() {
-            Expr::Pipe(stages) => stages,
+            Expr::Pipe(stages) => stages.into_vec(),
             other => vec![other],
         };
         // A pure `Field`/`Index` run is measured whole ...
@@ -128989,10 +129029,10 @@ mod touched_edge_cases_2999 {
     fn def_spine_install_leaves_shared_opaque_3307() {
         let defs = [("a", "1"), ("b", "2")];
         let shared_a = || Expr::shared(parse("a").unwrap());
-        let mut then = Expr::Pipe(vec![shared_a(), parse("b").unwrap(), shared_a()]);
+        let mut then = Expr::Pipe(vec![shared_a(), parse("b").unwrap(), shared_a()].into());
         for (name, body) in defs.iter().rev() {
             let body = if *name == "b" {
-                Expr::Pipe(vec![shared_a(), parse("a").unwrap()])
+                Expr::Pipe(vec![shared_a(), parse("a").unwrap()].into())
             } else {
                 parse(body).unwrap()
             };

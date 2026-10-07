@@ -8281,7 +8281,7 @@ pub(crate) fn eval_path_context_pipe_with_cursor<S: EvalSemantics, C: DocumentCu
     optional: bool,
 ) -> GenericResult<C::Value> {
     eval_single::<S, C::Value>(
-        &Expr::Pipe(exprs.to_vec()),
+        &Expr::Pipe(exprs.to_vec().into()),
         cursor.value(),
         optional,
         Some(cursor),
@@ -9126,7 +9126,7 @@ fn fold_lazy_seq_stage<S: EvalSemantics, V: DocumentValue>(
                 let rest_expr = match rest {
                     [] => Expr::Identity,
                     [only] => only.clone(),
-                    many => Expr::Pipe(many.to_vec()),
+                    many => Expr::Pipe(many.to_vec().into()),
                 };
                 return match seq.materialize_atomic::<S>() {
                     Ok(owned) => eval_each_owned_collect::<S, V>(
@@ -10316,9 +10316,14 @@ fn try_single_generic<S: EvalSemantics, V: DocumentValue>(
 /// a sub-slice (`fold_pipe_stages`' `ManyCursor` arm) passes `rebuilt`, which
 /// copies the slice at most once, on the first fallback that asks, however
 /// many cursor elements the arm then runs it for.
+///
+/// It also answers whether any stage needs path context (#3886): from the
+/// given pipe's own memo, which outlives this dispatch, or for a sub-slice
+/// once per `PipeWhole`, however many cursor elements share it.
 struct PipeWhole<'a> {
     given: Option<&'a Expr>,
     rebuilt: core::cell::OnceCell<Expr>,
+    needs_path_context: core::cell::OnceCell<bool>,
 }
 
 impl<'a> PipeWhole<'a> {
@@ -10326,6 +10331,7 @@ impl<'a> PipeWhole<'a> {
         Self {
             given: Some(expr),
             rebuilt: core::cell::OnceCell::new(),
+            needs_path_context: core::cell::OnceCell::new(),
         }
     }
 
@@ -10333,13 +10339,32 @@ impl<'a> PipeWhole<'a> {
         Self {
             given: None,
             rebuilt: core::cell::OnceCell::new(),
+            needs_path_context: core::cell::OnceCell::new(),
+        }
+    }
+
+    /// Whether any of `exprs`, which must be the stages this was made for,
+    /// needs path context.
+    fn needs_path_context(&self, exprs: &[Expr]) -> bool {
+        let walk = |stages: &[Expr]| stages.iter().any(needs_path_context);
+        match self.given {
+            Some(Expr::Pipe(stages)) => {
+                debug_assert!(
+                    core::ptr::eq(stages.as_slice(), exprs),
+                    "PipeWhole::given names a pipe other than the stages asked about"
+                );
+                stages.needs_path_context_or_init(walk)
+            }
+            _ => *self.needs_path_context.get_or_init(|| walk(exprs)),
         }
     }
 
     /// The pipe over `exprs`, which must be the stages this was made for.
     fn get(&self, exprs: &[Expr]) -> &Expr {
-        self.given
-            .unwrap_or_else(|| self.rebuilt.get_or_init(|| Expr::Pipe(exprs.to_vec())))
+        self.given.unwrap_or_else(|| {
+            self.rebuilt
+                .get_or_init(|| Expr::Pipe(exprs.to_vec().into()))
+        })
     }
 }
 
@@ -10380,7 +10405,10 @@ fn eval_single_pipe<S: EvalSemantics, V: DocumentValue>(
     // unevaluated syntax, and this arm runs per dispatch, so a `try` body that
     // fails at its first stage paid that walk -- twice -- per error for the
     // rest of the body, which never runs.
-    let needs_path = exprs.iter().any(needs_path_context);
+    //
+    // And remembered on the pipe node (#3886), so the walk is paid once per
+    // pipe rather than once per dispatch.
+    let needs_path = whole.needs_path_context(exprs);
     if needs_path {
         // #2061: `key`/`path`/`parent` answer from the path the walk
         // accumulates, so for a purely navigational pipe there is no
@@ -15791,7 +15819,7 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
         // arm.
         if cursor.is_none() {
             return drain_result_generic(
-                eval_single::<S, _>(&Expr::Pipe(exprs.to_vec()), value, optional, cursor),
+                eval_single::<S, _>(&Expr::Pipe(exprs.to_vec().into()), value, optional, cursor),
                 sink,
             );
         }
@@ -20687,7 +20715,8 @@ fn path_expr_is_cursor_navigable(expr: &Expr) -> bool {
         // sign costs nothing here.
         Expr::Index { .. } => true,
         Expr::Paren(inner) | Expr::Optional(inner) => path_expr_is_cursor_navigable(inner),
-        Expr::Pipe(exprs) | Expr::Comma(exprs) => exprs.iter().all(path_expr_is_cursor_navigable),
+        Expr::Pipe(exprs) => exprs.iter().all(path_expr_is_cursor_navigable),
+        Expr::Comma(exprs) => exprs.iter().all(path_expr_is_cursor_navigable),
         _ => false,
     }
 }
@@ -20713,9 +20742,8 @@ fn array_route_stage_is_pure_navigation(expr: &Expr) -> bool {
     match expr {
         Expr::Identity | Expr::Iterate | Expr::Field(_) | Expr::Index { .. } => true,
         Expr::Paren(inner) | Expr::Optional(inner) => array_route_stage_is_pure_navigation(inner),
-        Expr::Pipe(exprs) | Expr::Comma(exprs) => {
-            exprs.iter().all(array_route_stage_is_pure_navigation)
-        }
+        Expr::Pipe(exprs) => exprs.iter().all(array_route_stage_is_pure_navigation),
+        Expr::Comma(exprs) => exprs.iter().all(array_route_stage_is_pure_navigation),
         _ => false,
     }
 }
@@ -22001,7 +22029,8 @@ fn path_context_is_navigational_at(expr: &Expr, unfolded: u8) -> bool {
                 && path_context_component_walkable(key)
         }
         Expr::Paren(inner) => nav(inner),
-        Expr::Pipe(exprs) | Expr::Comma(exprs) => exprs.iter().all(nav),
+        Expr::Pipe(exprs) => exprs.iter().all(nav),
+        Expr::Comma(exprs) => exprs.iter().all(nav),
         Expr::Builtin(Builtin::Parent) => true,
         // spine 2416 (walk residue): a computed `n` is evaluated at the
         // position, like a computed bracket's component.
@@ -25129,9 +25158,8 @@ fn path_context_stage_preserves_node(expr: &Expr) -> bool {
                     .as_ref()
                     .map_or(true, |c| path_context_stage_preserves_node(c))
         }
-        Expr::Pipe(exprs) | Expr::Comma(exprs) => {
-            exprs.iter().all(path_context_stage_preserves_node)
-        }
+        Expr::Pipe(exprs) => exprs.iter().all(path_context_stage_preserves_node),
+        Expr::Comma(exprs) => exprs.iter().all(path_context_stage_preserves_node),
         // spine 2416 (walk residue): the wrappers the walk steps preserve
         // the node when every body they can emit from does; the constructs
         // that emit nothing preserve it trivially.
@@ -25971,9 +25999,8 @@ fn path_context_absent_keeps_position(expr: &Expr) -> bool {
                     .as_deref()
                     .map_or(true, path_context_absent_keeps_position)
         }
-        Expr::Pipe(exprs) | Expr::Comma(exprs) => {
-            exprs.iter().all(path_context_absent_keeps_position)
-        }
+        Expr::Pipe(exprs) => exprs.iter().all(path_context_absent_keeps_position),
+        Expr::Comma(exprs) => exprs.iter().all(path_context_absent_keeps_position),
         // spine 2416 (identity pass): the wrappers whose output *is* one of
         // their body's outputs keep the position exactly when the body does.
         Expr::If {
@@ -26470,7 +26497,8 @@ fn path_context_resolve_constants<S: EvalSemantics>(
             exprs
                 .iter()
                 .map(|e| path_context_resolve_constants::<S>(e, at))
-                .collect::<Result<Vec<_>, _>>()?,
+                .collect::<Result<Vec<_>, _>>()?
+                .into(),
         ),
         Expr::Limit { n, expr } => Expr::Limit {
             n: boxed(n)?,
@@ -26659,7 +26687,7 @@ fn path_context_resolve_constants<S: EvalSemantics>(
                 && !escaped_before
                 && at.prefetch_escaped.is_some_and(|escaped| escaped())
             {
-                Expr::Pipe(vec![reduce, Expr::Builtin(Builtin::Empty)])
+                Expr::Pipe(vec![reduce, Expr::Builtin(Builtin::Empty)].into())
             } else {
                 reduce
             }
@@ -26912,7 +26940,7 @@ fn path_context_resolve_absent_stages<S: EvalSemantics, V: DocumentValue>(
     for stage in rest {
         stages.push(path_context_resolve_absent::<S, V>(stage, pos)?);
     }
-    let resolved = Expr::Pipe(stages);
+    let resolved = Expr::Pipe(stages.into());
     debug_assert!(
         !needs_path_context(&resolved),
         "path_context_absent_split admitted a stage the resolver leaves unresolved"
@@ -32603,7 +32631,7 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
             if S::CONSUMERS_DRIVE_PREFETCHED_BODY && consumer_body_prefetches(f) =>
         {
             let probe = Expr::Comma(vec![
-                Expr::Pipe(vec![(**f).clone(), Expr::Literal(Literal::Bool(false))]),
+                Expr::Pipe(vec![(**f).clone(), Expr::Literal(Literal::Bool(false))].into()),
                 Expr::Literal(Literal::Bool(true)),
             ]);
             eval_owned_identity_bounded::<S, V>(
@@ -34107,10 +34135,9 @@ mod tests {
 
         let result = eval(
             &Expr::Try {
-                expr: Box::new(Expr::Pipe(vec![
-                    Expr::Field("a".to_string()),
-                    Expr::Builtin(Builtin::Length),
-                ])),
+                expr: Box::new(Expr::Pipe(
+                    vec![Expr::Field("a".to_string()), Expr::Builtin(Builtin::Length)].into(),
+                )),
                 catch: Some(Box::new(Expr::Literal(Literal::String(
                     "caught".to_string(),
                 )))),
@@ -36266,11 +36293,14 @@ mod tests {
         let value = cursor.value();
 
         // .users | .[0] | .name
-        let expr = Expr::Pipe(vec![
-            Expr::Field("users".to_string()),
-            Expr::index(0),
-            Expr::Field("name".to_string()),
-        ]);
+        let expr = Expr::Pipe(
+            vec![
+                Expr::Field("users".to_string()),
+                Expr::index(0),
+                Expr::Field("name".to_string()),
+            ]
+            .into(),
+        );
 
         let result = eval(&expr, value);
         let owned = result.into_owned::<JqSemantics>().unwrap().unwrap();
@@ -37762,11 +37792,14 @@ mod tests {
         let value = mapping_cursor.value();
 
         // .users | .[0] | .name
-        let expr = Expr::Pipe(vec![
-            Expr::Field("users".to_string()),
-            Expr::index(0),
-            Expr::Field("name".to_string()),
-        ]);
+        let expr = Expr::Pipe(
+            vec![
+                Expr::Field("users".to_string()),
+                Expr::index(0),
+                Expr::Field("name".to_string()),
+            ]
+            .into(),
+        );
 
         let result = eval(&expr, value);
         let owned = result.into_owned::<JqSemantics>().unwrap().unwrap();
@@ -38760,11 +38793,14 @@ mod tests {
         // own early-return arm alongside `Error`.
         let json = br#"{"items": [1, 2]}"#;
         let index = JsonIndex::build(json);
-        let expr = Expr::Pipe(vec![
-            Expr::Field("items".to_string()),
-            Expr::Iterate,
-            Expr::Break("out".to_string()),
-        ]);
+        let expr = Expr::Pipe(
+            vec![
+                Expr::Field("items".to_string()),
+                Expr::Iterate,
+                Expr::Break("out".to_string()),
+            ]
+            .into(),
+        );
 
         let result = eval_with_cursor(&expr, index.root(json));
         assert!(matches!(result, GenericResult::Break(label) if label == "out"));
@@ -38787,14 +38823,17 @@ mod tests {
         // already took the all-`OneCursor` path before this fix).
         let json = br#"{"items": [{"a": 1}, {"a": 2}]}"#;
         let index = JsonIndex::build(json);
-        let expr = Expr::Pipe(vec![
-            Expr::Field("items".to_string()),
-            Expr::Iterate,
-            Expr::IndexExpr {
-                target: Box::new(Expr::Identity),
-                key: Box::new(Expr::Literal(Literal::String("a".to_string()))),
-            },
-        ]);
+        let expr = Expr::Pipe(
+            vec![
+                Expr::Field("items".to_string()),
+                Expr::Iterate,
+                Expr::IndexExpr {
+                    target: Box::new(Expr::Identity),
+                    key: Box::new(Expr::Literal(Literal::String("a".to_string()))),
+                },
+            ]
+            .into(),
+        );
 
         let result = eval_with_cursor(&expr, index.root(json));
         assert!(matches!(result, GenericResult::ManyCursor(_)));
@@ -43589,7 +43628,7 @@ mod tests {
             };
             for j in 1..stages.len() {
                 let tail = &stages[j..];
-                let rebuilt = Expr::Pipe(tail.to_vec());
+                let rebuilt = Expr::Pipe(tail.to_vec().into());
                 let cursor = index.root(json);
                 let want = show::<S, _>(eval_single::<S, _>(
                     &rebuilt,
@@ -43607,8 +43646,11 @@ mod tests {
                 ));
                 assert_eq!(got, want, "{filter}: tail from stage {j}");
                 let cursor = index.root(json);
+                let Expr::Pipe(rebuilt_stages) = &rebuilt else {
+                    unreachable!("built as a pipe above")
+                };
                 let with_whole = show::<S, _>(eval_single_pipe::<S, _>(
-                    tail,
+                    rebuilt_stages,
                     &PipeWhole::given(&rebuilt),
                     cursor.value(),
                     false,
@@ -43653,6 +43695,54 @@ mod tests {
         assert!(tails > 40, "the sweep must reach real tails, got {tails}");
     }
 
+    /// #3886: the dispatch asks the pipe node's memo, so after one dispatch
+    /// the answer is remembered there and the next dispatch walks nothing.
+    #[test]
+    fn eval_single_pipe_remembers_its_path_context_gate_3886() {
+        let json = br#"{"a":{"b":1}}"#;
+        let index = JsonIndex::build(json);
+        for (filter, needs) in [(".a | key", true), (".a | .b + 1", false)] {
+            let pipe = parse(filter).unwrap();
+            let Expr::Pipe(stages) = &pipe else {
+                panic!("{filter}: not a pipe");
+            };
+            let cursor = index.root(json);
+            let want = eval_single::<JqSemantics, _>(&pipe, cursor.value(), false, Some(cursor))
+                .collect_owned::<JqSemantics>()
+                .unwrap();
+            assert!(!want.is_empty(), "{filter}");
+            assert_eq!(
+                stages.needs_path_context_or_init(|_| unreachable!(
+                    "{filter}: answered by the dispatch"
+                )),
+                needs,
+                "{filter}"
+            );
+        }
+    }
+
+    /// #3886: `PipeWhole` answers from the given pipe's memo (a seeded answer
+    /// is read back, not recomputed), and for a sub-slice walks once however
+    /// many times it is asked.
+    #[test]
+    fn pipe_whole_path_context_answer_is_remembered_3886() {
+        let pipe = parse(".a | .b").unwrap();
+        let Expr::Pipe(stages) = &pipe else {
+            panic!("not a pipe");
+        };
+        assert!(stages.needs_path_context_or_init(|_| true), "seeded");
+        assert!(PipeWhole::given(&pipe).needs_path_context(stages));
+
+        let tail = [Expr::Identity, Expr::Builtin(Builtin::Key)];
+        let rebuilt = PipeWhole::rebuilt();
+        assert!(rebuilt.needs_path_context(&tail));
+        assert_eq!(rebuilt.needs_path_context.get(), Some(&true));
+        let plain = [Expr::Identity, Expr::Identity];
+        let rebuilt = PipeWhole::rebuilt();
+        assert!(!rebuilt.needs_path_context(&plain));
+        assert_eq!(rebuilt.needs_path_context.get(), Some(&false));
+    }
+
     /// #3502 review: a rebuilt pipe is copied once and then shared, so a
     /// fallback that fires for every cursor element does not clone per element.
     #[test]
@@ -43662,7 +43752,7 @@ mod tests {
         let first = rebuilt.get(&tail);
         assert!(matches!(first, Expr::Pipe(stages) if stages.len() == 2));
         assert!(core::ptr::eq(first, rebuilt.get(&tail)));
-        let whole = Expr::Pipe(tail.to_vec());
+        let whole = Expr::Pipe(tail.to_vec().into());
         assert!(core::ptr::eq(PipeWhole::given(&whole).get(&tail), &whole));
     }
 
@@ -43846,7 +43936,7 @@ mod tests {
         ] {
             let expr = parse(src).unwrap();
             let stages = match expr {
-                Expr::Pipe(stages) if src.starts_with(". + 1 |") => stages,
+                Expr::Pipe(stages) if src.starts_with(". + 1 |") => stages.into_vec(),
                 other => vec![other],
             };
             let mut rest = RestPipe::new(&stages);
@@ -45570,7 +45660,7 @@ mod tests {
             let Expr::Pipe(stages) = parse(f).unwrap() else {
                 panic!("not a pipe: {f}")
             };
-            stages
+            stages.into_vec()
         }
         // No path context at all: never the eager evaluator's business.
         assert!(!eager(".a | tostring"));
@@ -46218,7 +46308,7 @@ mod tests {
     fn path_context_absent_split_pins_its_four_conditions_2416() {
         let split = |f: &str| {
             let stages = match parse(f).unwrap() {
-                Expr::Pipe(stages) => stages,
+                Expr::Pipe(stages) => stages.into_vec(),
                 other => vec![other],
             };
             path_context_absent_split(&stages)
@@ -46348,7 +46438,7 @@ mod tests {
     fn head_can_yield_absent_tracks_the_last_navigation_2416() {
         let can = |f: &str| {
             let stages = match parse(f).unwrap() {
-                Expr::Pipe(stages) => stages,
+                Expr::Pipe(stages) => stages.into_vec(),
                 other => vec![other],
             };
             head_can_yield_absent(&stages)
@@ -46585,7 +46675,7 @@ mod tests {
         for stop in [false, true] {
             let mut values = Vec::new();
             let demand = path_context_step_each::<JqSemantics, Json>(
-                &Expr::Pipe(Vec::new()),
+                &Expr::Pipe(Vec::new().into()),
                 &pos,
                 &mut |reached| {
                     assert!(reached.at_key);
