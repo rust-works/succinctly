@@ -5470,8 +5470,9 @@ impl<'a> Parser<'a> {
         // jq-style `any(f)`, so these are not `--jq-extensions` surface -- they are native, and
         // yq mode only (jq 1.7.1 has no `any_c`; there they stay an undefined call). Captured
         // from yq v4.53.3: the predicate's *first* output decides an element and an element
-        // whose predicate yields nothing is skipped, hence `first(f)` (built at evaluation, so the
-        // call keeps `f` as written for a shadowing `def`); arguments after the first are never
+        // whose predicate yields nothing is skipped, after the whole predicate has run (see
+        // `eval::any_c_predicate`, built at evaluation so the call keeps `f` as written for a
+        // shadowing `def`); arguments after the first are never
         // evaluated and the form then behaves as a predicate that yields nothing (`any_c(.; .)`
         // is `false`, `all_c(.; .)` is `true`, over an array).
         if self.mode == ParserMode::Yq

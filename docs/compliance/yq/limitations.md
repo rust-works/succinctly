@@ -2647,7 +2647,9 @@ Both filed together as [#1998](https://github.com/rust-works/succinctly/issues/1
   generic parse error where yq says `'any_c' expects 1 arg but received none` (#2237's carve-out
   for every required-argument builtin), and the second and later arguments of `any_c(f; g; h)`
   are parsed and dropped, so only a user `def any_c(f; g)` of arity two shadows the builtin (a
-  `def` of arity three does not).
+  `def` of arity three does not). Not specific to these builtins and not fixed with them: an
+  undefined variable is *no output* in yq (`any_c($nope)` is `false`, `[.[] | $nope]` is `[]`)
+  and an error here, in every position ([#3976](https://github.com/rust-works/succinctly/issues/3976)).
 - **`with_entries(f)` rejects numeric keys** that real yq coerces to strings on reassembly
   (`[1,2] | with_entries(.)` succeeds on real yq, errors `Cannot use number (0) as object key`
   on succinctly) — a functional bug on well-formed input, unrelated to this section's

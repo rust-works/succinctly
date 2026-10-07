@@ -15887,17 +15887,28 @@ fn builtin_all_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// The per-element predicate yq's `any_c(f)` / `all_c(f)` runs (#3966), built where the
 /// call is evaluated so the builtin itself keeps `f` as written (a user `def any_c(f)`
-/// that shadows it must receive that, not this). Captured from yq v4.53.3: only the
-/// *first* output of `f` decides an element and an element whose `f` yields nothing is
-/// skipped, which is `first(f)`; and with a second argument (`any_c(f; g)`, parsed and
-/// never evaluated) the form behaves as a predicate that yields nothing -- `any_c(.; .)`
-/// is `false` and `all_c(.; .)` is `true` over an array.
+/// that shadows it must receive that, not this). Captured from yq v4.53.3: `f` is run to
+/// completion for an element and then only its *first* output decides it, so an error in
+/// a later output still raises (`[1,2] | any_c(true, error("x"))` is `Error: x`) -- not
+/// `first(f)`, which stops early -- and an element whose `f` yields nothing is skipped.
+/// That is `[f][0:1][]`. Across elements it still stops at the first deciding one. With a
+/// second argument (`any_c(f; g)`, parsed and never evaluated) the form behaves as a
+/// predicate that yields nothing -- `any_c(.; .)` is `false` and `all_c(.; .)` is `true`
+/// over an array.
 pub(crate) fn any_c_predicate(f: &Expr, has_extra_args: bool) -> Expr {
     if has_extra_args {
-        Expr::Builtin(Builtin::Empty)
-    } else {
-        Expr::Builtin(Builtin::FirstStream(Box::new(f.clone())))
+        return Expr::Builtin(Builtin::Empty);
     }
+    Expr::pipe(vec![
+        Expr::Array(Box::new(f.clone())),
+        Expr::Slice {
+            start: Some(0),
+            end: Some(1),
+            start_key: None,
+            end_key: None,
+        },
+        Expr::Iterate,
+    ])
 }
 
 /// Builtin: yq's `any_c(f)` / `all_c(f)` (#3966).

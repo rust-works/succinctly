@@ -29156,7 +29156,10 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             any_all_f_generic::<S, V>(cond, &value, optional, cursor.expect("guarded"), false)
         }
         // #3966: yq's `any_c(f)` / `all_c(f)` -- an array only (a mapping or a scalar is the bare
-        // form's rejection), then the `any(cond)` engine over [`any_c_predicate`].
+        // form's rejection), then the `any(cond)` engine over [`any_c_predicate`]. Not beside the
+        // `AnyF`/`AllF` arms of `each_generic`: those exist for jq's `?//` retries (extra verdicts)
+        // and `input` (the live queue), neither of which yq mode has, so this one answer is one
+        // boolean or one error and the default route delivers it.
         Builtin::AnyC(f, extra) | Builtin::AllC(f, extra) if cursor.is_some() => {
             let (name, target_truthy) = if matches!(builtin, Builtin::AnyC(..)) {
                 ("any", true)

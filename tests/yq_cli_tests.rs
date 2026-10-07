@@ -2597,6 +2597,10 @@ fn test_yq_any_c_all_c_3966() -> Result<()> {
         ("[1,5]", "any_c(true, false)", "true"),
         ("[1,5]", "all_c(true, false)", "true"),
         ("[1,5]", "all_c(false, true)", "false"),
+        // the predicate runs to completion, so a later output that does not error changes
+        // nothing: the first output still decides
+        ("[1,2]", "any_c(true, false)", "true"),
+        ("[1,2]", "all_c(false, true)", "false"),
         // a predicate that yields nothing skips its element
         ("[1,5]", "any_c(select(. > 3))", "true"),
         ("[1,5]", "all_c(select(. > 3))", "true"),
@@ -2611,8 +2615,10 @@ fn test_yq_any_c_all_c_3966() -> Result<()> {
         (r#"[{"b":1}]"#, "all_c(.a // false)", "false"),
         (r#"[{"b":1}]"#, "all_c(.a | not)", "true"),
         (r#"[{"b":1}]"#, "all_c(null)", "false"),
-        // stops at the first deciding element: later elements are not read
+        // stops at the first deciding element: later elements are not read, whatever their
+        // predicate would have raised
         ("[5,1]", r#"any_c((. > 3) or error("x"))"#, "true"),
+        ("[5,1]", r#"any_c(true, (. < 3) and error("x"))"#, "true"),
         ("[0,5]", r#"all_c((. > 3) and error("x"))"#, "false"),
         // an array of arrays, nesting, composition
         ("[[1],[5]]", "any_c(any_c(. > 3))", "true"),
@@ -2682,6 +2688,15 @@ fn test_yq_any_c_all_c_errors_and_context_3966() -> Result<()> {
         ("[1,5]", r#"any_c(error("x"))"#, "x"),
         ("[1,5]", r#"all_c(error("x"))"#, "x"),
         ("[1,5]", r#"any_c((. > 3) or error("x"))"#, "x"),
+        // an error in a LATER output of the predicate still raises: yq runs it to completion
+        // and only then takes the first output (so it is not `first(f)`)
+        ("[1,2]", r#"any_c(true, error("x"))"#, "x"),
+        ("[1,2]", r#"any_c(1, error("x"))"#, "x"),
+        ("[1,2]", r#"all_c(false, error("x"))"#, "x"),
+        ("[1,2]", r#"any_c(select(. > 0), error("x"))"#, "x"),
+        ("[1,2]", r#"any_c(false, true, error("y"))"#, "y"),
+        ("[1,2]", r#"all_c(select(. > 5), error("x"))"#, "x"),
+        ("[1,5]", r#"all_c(. > 3, ((. > 3) or error("x")))"#, "x"),
         ("[5,0]", r#"all_c((. > 3) and error("x"))"#, "x"),
         // bare, and with no argument: a parse error in succinctly's own wording (#2237), where
         // yq says `'any_c' expects 1 arg but received none`

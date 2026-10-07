@@ -498,8 +498,10 @@ in yq mode only. All behaviour below is captured from yq v4.53.3 (#3966):
 
 - the input must be an array; a mapping or a scalar is the bare form's error
   (`any only supports arrays, was !!map`), not an iteration;
-- only the **first** output of `f` decides an element (`[1,5] | any_c(false, true)` is `false`),
-  and an element whose `f` yields nothing is skipped (`[1,5] | all_c(select(. > 9))` is `true`);
+- `f` runs to completion for an element and only its **first** output decides it
+  (`[1,5] | any_c(false, true)` is `false`), so an error in a *later* output still raises
+  (`[1,2] | any_c(true, error("x"))` is `Error: x`); an element whose `f` yields nothing is
+  skipped (`[1,5] | all_c(select(. > 9))` is `true`);
 - `f` is evaluated read-only, so an *absent* key is no output and the element is skipped, while an
   explicit `null` is a falsy output: `[{"b":1}] | all_c(.a)` is `true`, `[{"a":null}] | all_c(.a)`
   is `false`;
