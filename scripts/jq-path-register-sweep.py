@@ -572,6 +572,19 @@ OPERANDS = [
     "try (last(.a), error(\"e\")) catch .",
     "try (select(.) | error(\"z\")) catch .",
     "try error(\"z\") catch .",
+    # (#3891) a catch handler that is a `?`-wrapped navigation. `INDEX_OPT` swallows a
+    # type error but not a path error, and the caught payload may or may not be the
+    # register's own node: `error` / `error(.)` raise it, `error("x")` / `error({..})`
+    # a different one, so each pairing is its own operand.
+    "try error catch (.a)?",
+    "try error catch .a?",
+    "try error catch (.a | .b)?",
+    "try error catch (.a // 1)?",
+    "try error catch first(.a)?",
+    "try error(.) catch (.a)?",
+    "try error(\"x\") catch (.a)?",
+    "try error({\"a\":1}) catch (.a)?",
+    "try error catch (try .a catch 0)",
     "try last(error) catch .",
     "try last(.a) catch input",
     "limit(1; try last(.a) catch .)",
