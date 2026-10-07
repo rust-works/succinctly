@@ -1737,6 +1737,15 @@ impl<'a> Parser<'a> {
             Some(']') => {
                 self.next();
                 Ok(match Self::fold_index_key(&key) {
+                    // #3374: a wildcard key is a generator over the matching keys.
+                    Some(Expr::Field(name))
+                        if self.mode == ParserMode::Yq && Expr::is_yq_key_pattern(&name) =>
+                    {
+                        Bracket::Dynamic {
+                            key: Expr::yq_wildcard_keys(&name),
+                            optional: false,
+                        }
+                    }
                     Some(folded) => Bracket::Static(folded),
                     None => Bracket::Dynamic {
                         key,
@@ -2938,11 +2947,11 @@ impl<'a> Parser<'a> {
                 // Check for quoted field access `."key"`
                 let mut expr = if self.peek() == Some('"') {
                     let name = self.parse_string_literal()?;
-                    Expr::Field(name)
+                    self.field_or_wildcard(name)
                 } else {
                     // Field access `.foo`
                     let name = self.parse_field_ident()?;
-                    Expr::Field(name)
+                    self.field_or_wildcard(name)
                 };
 
                 // yq lexes a `?` after a space or newline as an error, not a
@@ -7378,6 +7387,16 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse postfix operations (field access, indexing) after a primary expression.
+    /// `.name` as an [`Expr::Field`], or in yq mode a wildcard key (`*`/`?`) as
+    /// the generator over the keys it matches (#3374).
+    fn field_or_wildcard(&self, name: String) -> Expr {
+        if self.mode == ParserMode::Yq && Expr::is_yq_key_pattern(&name) {
+            Expr::index_by(Expr::Identity, Expr::yq_wildcard_keys(&name))
+        } else {
+            Expr::Field(name)
+        }
+    }
+
     fn parse_postfix(&mut self, mut expr: Expr) -> Result<Expr, ParseError> {
         let mut chain = vec![expr];
 
@@ -7411,7 +7430,7 @@ impl<'a> Parser<'a> {
                         } else {
                             self.parse_field_ident()?
                         };
-                        let mut field_expr = Expr::Field(name);
+                        let mut field_expr = self.field_or_wildcard(name);
 
                         let field_end = self.pos;
                         self.skip_ws();
@@ -9001,6 +9020,15 @@ pub fn parse_program_with_extra_shadowable_defs(
 
 #[cfg(test)]
 mod tests {
+    /// What yq mode parses `.name` to: a plain [`Expr::Field`], or for a `*`/`?`
+    /// pattern the index over its matching keys (#3374).
+    fn yq_field(name: &str) -> Expr {
+        if Expr::is_yq_key_pattern(name) {
+            Expr::index_by(Expr::Identity, Expr::yq_wildcard_keys(name))
+        } else {
+            Expr::Field(name.into())
+        }
+    }
     use super::*;
 
     #[test]
@@ -12580,7 +12608,7 @@ mod tests {
             (".a.x??", "x?"),
         ] {
             let expr = parse_with_mode(filter, ParserMode::Yq).unwrap();
-            let expected = Expr::Optional(Box::new(Expr::Field(name.into())));
+            let expected = Expr::Optional(Box::new(yq_field(name)));
             if filter.starts_with(".a.") {
                 assert_eq!(
                     expr,
@@ -12593,11 +12621,11 @@ mod tests {
         }
         assert_eq!(
             parse_with_mode(".x?y", ParserMode::Yq).unwrap(),
-            Expr::Field("x?y".into())
+            yq_field("x?y")
         );
         assert_eq!(
             parse_with_mode(".x?1", ParserMode::Yq).unwrap(),
-            Expr::Field("x?1".into())
+            yq_field("x?1")
         );
         assert_eq!(
             parse(".x??").unwrap(),
@@ -12615,13 +12643,13 @@ mod tests {
         ] {
             assert_eq!(
                 parse_with_mode(filter, ParserMode::Yq).unwrap(),
-                Expr::Field(name.into()),
+                yq_field(name),
                 "{filter}"
             );
         }
         assert_eq!(
             parse_with_mode(".x?//1?", ParserMode::Yq).unwrap(),
-            Expr::Optional(Box::new(Expr::Field("x?//1".into())))
+            Expr::Optional(Box::new(yq_field("x?//1")))
         );
         for filter in [
             ".x ?// 1",
@@ -12666,7 +12694,7 @@ mod tests {
         ] {
             let expr = parse_with_mode(filter, ParserMode::Yq).unwrap();
             if filter.ends_with('?') {
-                let expected = Expr::Optional(Box::new(Expr::Field(name.into())));
+                let expected = Expr::Optional(Box::new(yq_field(name)));
                 if filter.starts_with(".a.") {
                     assert_eq!(
                         expr,
@@ -12677,7 +12705,7 @@ mod tests {
                     assert_eq!(expr, expected, "{filter:?}");
                 }
             } else {
-                assert_eq!(expr, Expr::Field(name.into()), "{filter:?}");
+                assert_eq!(expr, yq_field(name), "{filter:?}");
             }
         }
         // Unchanged from #3370: a literal space or newline still separates
@@ -12717,7 +12745,7 @@ mod tests {
         );
         assert_eq!(
             parse_with_mode(".??", ParserMode::Yq).unwrap(),
-            Expr::Optional(Box::new(Expr::Field("?".into())))
+            Expr::Optional(Box::new(yq_field("?")))
         );
         for filter in [".x?", ".[0]?", ".\"x\"?", ".a.?"] {
             assert!(
