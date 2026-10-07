@@ -90166,6 +90166,14 @@ fn test_recurse_seed_through_nth_bind_and_fold_recurse_f_3892() -> Result<()> {
         (r"(. as $x | reduce (1,2) as $i (1; try recurse(.a)) | $x | .c) |= 9", "{\"a\":{\"b\":{\"b\":null}},\"c\":9}\n", "", 0),
         (r"(. as $x | reduce (1,2) as $i (1; recurse(.a)) | $x | .c) |= 9", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of 1\n", 5),
         (r"(. as $x | reduce (1,2) as $i (1; try recurse(.a)) | $x | .c) = 9", "{\"a\":{\"b\":{\"b\":null}},\"c\":9}\n", "", 0),
+        // #3892 review: the same forwarders on a trackable entry, nested in each other.
+        (r"del(.a | (. as $q | try ..) | .b)", "{\"a\":{},\"c\":2}\n", "", 0),
+        (r"del(.a | nth(0; (. as $q | try ..)) | .b)", "{\"a\":{},\"c\":2}\n", "", 0),
+        (r"del(.a | (. as $q | nth(0; try ..)) | .b)", "{\"a\":{},\"c\":2}\n", "", 0),
+        (r"path(.a | (. as $q | ..))", "[\"a\"]\n[\"a\",\"b\"]\n[\"a\",\"b\",\"b\"]\n", "", 0),
+        (r"path(.a | nth(1; ..))", "[\"a\",\"b\"]\n", "", 0),
+        (r"(.a | (. as $q | try ..) | .b) |= 7", "", "jq: error (at <stdin>:1): Cannot index number with string \"b\"\n", 5),
+        (r"(.a | nth(0; ..) | .b) = 7", "{\"a\":{\"b\":7},\"c\":2}\n", "", 0),
         // The `and`/`or` and `[E]` readers of the same predicate are unchanged.
         (r"path(recurse(.a; . != null) and true)", "", "jq: error (at <stdin>:1): Invalid path expression with result true\n", 5),
         (r"path([recurse(.a; . != null)])", "", "jq: error (at <stdin>:1): Invalid path expression with result [{\"a\":{\"b\":{\"b\":null}},\"c\"...\n", 5),

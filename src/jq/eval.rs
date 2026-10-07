@@ -41875,12 +41875,16 @@ fn and_or_negate_resolves_live<S: EvalSemantics>(expr: &Expr) -> bool {
 /// trackable where jq's register is), provably leaves the register alone
 /// ([`cannot_move_register`]), or composes steps that do. An allowlist, the
 /// safe direction: a wrong `true` lets an `and`/`or` accept where jq
-/// refuses, so everything else -- every builtin jq defines by navigating
+/// refuses, so everything else -- every other builtin jq defines by navigating
 /// (`first` is `.[0]`), a `def`, `try`, `if` (whose untaken branch drops the
-/// register statically) -- answers `false`.
+/// register statically) -- answers `false`. The recurse family is the one
+/// navigating builtin admitted, and only for an `f` this admits (#3892): jq's
+/// `def r: ., (f | r);` moves the register through `f` alone.
 ///
-/// Read only by [`and_or_operand_is_checked`] since #3428 (and, through it, by
-/// [`array_contents_are_checked`]'s `and`/`or`/minus arm): the `and`/`or` arms
+/// Read by [`and_or_operand_is_checked`] since #3428 (and, through it, by
+/// [`array_contents_are_checked`]'s `and`/`or`/minus arm), and by a fold's
+/// source and `UPDATE` ([`reduce_leaves_register_in_place`],
+/// [`fold_update_movement_tracked`], #3732/#3580): the `and`/`or` arms
 /// no longer decline an operand this rejects, because each operand's branch
 /// states its own register ([`register_after`]). An `[E]` still needs an
 /// allowlist, because its claim is that the resolver checks everything jq
@@ -41906,9 +41910,11 @@ fn register_movement_tracked(expr: &Expr) -> bool {
         // through at the register. `getpath` navigates natively (#2896).
         | Expr::Builtin(Builtin::Select(_) | Builtin::GetPath(_)) => true,
         // #3892: jq defines every recurse spelling as `def r: ., (f | r);`, so
-        // the register moves only through `f` (`recurse`/`recurse_down` are
-        // `recurse(.[]?)`), and `recurse(f; cond)`'s `cond` is `select`'s
-        // condition, a subexp -- the same reading `..` above already has.
+        // the register moves only through `f` (`recurse` is `recurse(.[]?)`),
+        // and `recurse(f; cond)`'s `cond` is `select`'s condition, a subexp --
+        // the same reading `..` above already has. `recurse_down`, which jq
+        // 1.7.1 does not define, resolves through the same walk as `..` here
+        // (`resolve_recursive_descent_sink`), so it is read the same way.
         Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => true,
         Expr::Builtin(Builtin::RecurseF(f) | Builtin::RecurseCond(f, _)) => {
             register_movement_tracked(f)
@@ -43618,8 +43624,10 @@ fn is_entry_marker_producer(expr: &Expr) -> bool {
 
 /// [`EntryMarkers`] for `expr`, peeling the wrappers [`entry_marker_stage`]
 /// lists. Each arm is the resolver's own forwarding arm in `resolve_node_sink`
-/// (or its sink helper): the closure parameters of `first`/`limit` and the
-/// condition of an `if` are subexps and never reach the sink.
+/// (or its sink helper): the count of `limit`/`nth`, the source of a
+/// bare-variable bind (#3892) and the condition of an `if` are subexps and
+/// never reach the sink, so a producer there states nothing this stage reads
+/// and is not looked at.
 fn entry_marker_shape(expr: &Expr) -> EntryMarkers {
     match expr {
         Expr::Identity
@@ -118898,6 +118906,7 @@ mod tests {
         }
         for filter in [
             "recurse(first(.a))",
+            "recurse(first(.a); . != null)",
             "recurse(.a; .b) | first",
             "try recurse(.a)",
         ] {
