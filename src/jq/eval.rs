@@ -433,7 +433,7 @@ use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
 use super::expr::{
     retention_scope, ArithOp, AssignOp, BindOrigin, BoundBody, Builtin, CompareOp, Expr,
     FormatType, FuncDefBound, FuncDefData, Libm1, Libm2, Libm3, Literal, MergeFlags, MetaSlot,
-    NumberKey, ObjectEntry, ObjectKey, Origin, Param, Pattern, PatternEntry, SharedArg,
+    NumberKey, ObjectEntry, ObjectKey, Origin, Param, Pattern, PatternEntry, PipeStages, SharedArg,
     SliceBoundKey, StringPart, Tracked,
 };
 use super::value::{
@@ -2886,9 +2886,7 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         }
         // Remembered on the pipe (#3886): a pipe nested in another stage is
         // walked once, not on every ask of the stage holding it.
-        Expr::Pipe(exprs) => {
-            exprs.needs_path_context_or_init(|stages| stages.iter().any(needs_path_context))
-        }
+        Expr::Pipe(exprs) => pipe_needs_path_context(exprs),
         Expr::Paren(inner) => needs_path_context(inner),
         Expr::Optional(inner) => needs_path_context(inner),
         // `first(expr)`/`last(expr)` (#2074): same reasoning as `Limit`
@@ -3095,6 +3093,18 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether any stage of a pipe needs path context, remembered on the pipe
+/// (#3886).
+///
+/// Every pipe route asks this on each dispatch to choose how to run the
+/// stages, and the walk covers stages that may never run: a `try` body that
+/// fails at its first stage paid it for the whole remainder, per error. The
+/// one definition behind [`needs_path_context`]'s `Pipe` arm and each route's
+/// own `Expr::Pipe` arm, so they cannot disagree.
+pub(crate) fn pipe_needs_path_context(stages: &PipeStages) -> bool {
+    stages.needs_path_context_or_init(|stages| stages.iter().any(needs_path_context))
 }
 
 /// Whether any `\(...)` slot in a string interpolation needs path context
@@ -3380,7 +3390,9 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // which then wrongly kept going instead of stopping (#693).
         Expr::Optional(inner) => eval_try::<W, S>(inner, None, value, optional),
 
-        Expr::Pipe(exprs) => eval_pipe::<W, S>(exprs, value, optional),
+        Expr::Pipe(exprs) => {
+            eval_pipe::<W, S>(exprs, Some(pipe_needs_path_context(exprs)), value, optional)
+        }
 
         Expr::Comma(exprs) => eval_comma::<W, S>(exprs, value, optional),
 
@@ -6187,7 +6199,13 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
             Flow::Exhausted
         }
-        Expr::Pipe(exprs) => eval_each_pipe::<W, S>(exprs, value, optional, sink),
+        Expr::Pipe(exprs) => eval_each_pipe::<W, S>(
+            exprs,
+            Some(pipe_needs_path_context(exprs)),
+            value,
+            optional,
+            sink,
+        ),
         Expr::Paren(inner) => eval_each::<W, S>(inner, value, optional, sink),
         // #2693: the `recurse` family streams its visited nodes, so a
         // bounded consumer stops the walk instead of truncating a finished
@@ -8811,8 +8829,12 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Slice-based twin of [`eval_each`]'s `Pipe` arm, so recursion walks `&rest`
 /// without rebuilding an `Expr::Pipe` per value (mirrors `eval_pipe`).
+///
+/// `needs_path` is the pipe's own remembered answer (#3886) when the caller
+/// holds the `Expr::Pipe`, or `None` for a sub-slice, which is walked.
 fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     exprs: &[Expr],
+    needs_path: Option<bool>,
     value: StandardJson<'a, W>,
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
@@ -8824,8 +8846,9 @@ fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // re-deriving it: getting this wrong silently stubs `key`/`parent`/
     // `file_index` to their zero defaults (the #715/#1302 failure class),
     // which produces wrong output rather than an error.
-    if exprs.iter().any(needs_path_context) {
-        return drain_result(eval_pipe::<W, S>(exprs, value, optional), sink);
+    let needs_path = needs_path.unwrap_or_else(|| exprs.iter().any(needs_path_context));
+    if needs_path {
+        return drain_result(eval_pipe::<W, S>(exprs, Some(true), value, optional), sink);
     }
 
     let Some((first, rest)) = exprs.split_first() else {
@@ -8862,7 +8885,7 @@ fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let upstream = {
         let mut driver = |item: Item<'a, W>| -> Demand {
             let flow = match item {
-                Item::Borrowed(v) => eval_each_pipe::<W, S>(rest, v, optional, &mut *sink),
+                Item::Borrowed(v) => eval_each_pipe::<W, S>(rest, None, v, optional, &mut *sink),
                 // Re-enters `eval_each`'s own `Expr::Pipe` arm on the
                 // reindexed owned value (same serialize-and-reindex bridge as
                 // `eval_owned_pipe`/`eval_owned_input`, same cost), so
@@ -24513,13 +24536,16 @@ fn promote_and_extend<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Evaluate a pipe (chain) of expressions.
+///
+/// `needs_path` is as for [`eval_each_pipe`].
 fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     exprs: &[Expr],
+    needs_path: Option<bool>,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Check if any expression in the pipe needs path context (PathNoArg, Parent)
-    if exprs.iter().any(needs_path_context) {
+    if needs_path.unwrap_or_else(|| exprs.iter().any(needs_path_context)) {
         // #1755: to_owned, not to_owned_lossy -- an undecodable input
         // must raise, not silently become "" for the path-context walk.
         let owned = match to_owned::<S, _>(&value) {
@@ -24541,7 +24567,7 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     {
         let mut outputs = Vec::new();
         let mut conversion_error = None;
-        let flow = eval_each_pipe::<W, S>(exprs, value, optional, &mut |item| match item
+        let flow = eval_each_pipe::<W, S>(exprs, None, value, optional, &mut |item| match item
             .into_owned::<S>()
         {
             Ok(item) => {
@@ -24568,7 +24594,7 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     // Apply remaining expressions to the result
     match result.materialize_cursor() {
-        QueryResult::One(v) => eval_pipe::<W, S>(rest, v, optional),
+        QueryResult::One(v) => eval_pipe::<W, S>(rest, None, v, optional),
         QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::Many(values) => {
             // Rest-of-pipe applied per element may yield borrowed (One/Many) OR
@@ -24579,7 +24605,7 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let mut borrowed: Vec<StandardJson<'a, W>> = Vec::new();
             let mut owned: Option<Vec<OwnedValue>> = None;
             for v in values {
-                match eval_pipe::<W, S>(rest, v, optional).materialize_cursor() {
+                match eval_pipe::<W, S>(rest, None, v, optional).materialize_cursor() {
                     QueryResult::One(r) => {
                         if let Err(e) =
                             push_promoted::<_, S>(core::iter::once(r), &mut borrowed, &mut owned)
@@ -107058,6 +107084,42 @@ mod tests {
                 needs,
                 "{filter}"
             );
+        }
+    }
+
+    /// #3886 review: this evaluator's own pipe routes (`eval_single` and
+    /// `eval_each`'s `Expr::Pipe` arms) ask the pipe node's memo too.
+    #[test]
+    fn eval_pipe_routes_remember_their_path_context_gate_3886() {
+        let json = br#"{"a":{"b":1}}"#;
+        let index = JsonIndex::build(json);
+        for each in [false, true] {
+            for (filter, needs) in [(".a | key", true), (".a | .b + 1", false)] {
+                let pipe = parse(filter).unwrap();
+                let Expr::Pipe(stages) = &pipe else {
+                    panic!("{filter}: not a pipe")
+                };
+                let value = index.root(json).value();
+                if each {
+                    let mut out = 0;
+                    let flow = eval_each::<Vec<u64>, JqSemantics>(&pipe, value, false, &mut |_| {
+                        out += 1;
+                        Demand::Continue
+                    });
+                    assert!(matches!(flow, Flow::Exhausted), "{filter}");
+                    assert_eq!(out, 1, "{filter}");
+                } else {
+                    let result = eval_single::<Vec<u64>, JqSemantics>(&pipe, value, false);
+                    assert!(!matches!(result, QueryResult::Error(_)), "{filter}");
+                }
+                assert_eq!(
+                    stages.needs_path_context_or_init(|_| unreachable!(
+                        "{filter}: answered by the dispatch"
+                    )),
+                    needs,
+                    "{filter}, each: {each}"
+                );
+            }
         }
     }
 

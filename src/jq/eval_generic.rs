@@ -66,9 +66,9 @@ use super::eval::{
     is_identity_passthrough, is_retryable_control, is_retryable_stop, key_arrays_eq, limit_raising,
     literal_to_owned, mark_nonretryable_escape, native_stack_exhausted, needs_path_context,
     numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned, owned_bound_to_i64,
-    owned_to_expr, owned_to_string, pattern_alternatives_var_names, prefer_pending_control,
-    probe_def_call, range_from_literal_override, range_max_exceeded_error, range_num,
-    range_values_f64, range_values_int, reads_parent, recurse_walk_flow, reduce_forks,
+    owned_to_expr, owned_to_string, pattern_alternatives_var_names, pipe_needs_path_context,
+    prefer_pending_control, probe_def_call, range_from_literal_override, range_max_exceeded_error,
+    range_num, range_values_f64, range_values_int, reads_parent, recurse_walk_flow, reduce_forks,
     reroot_for_reentry, reroot_markers, resolve_computed_slice_bounds, resume_from_escape,
     reverse_length_is_empty, select_emits, settle_then_replay, settles_before_consumer,
     shared_arg_depth_refusal, slice_component_value, slice_object_as_yq_children,
@@ -10017,11 +10017,12 @@ fn fold_pipe_stages_sink<S: EvalSemantics, V: DocumentValue>(
             // correct slice for every non-folding arm. Pinned by
             // `test_first_over_lazy_prefix_applies_every_stage_1565`.
             GenericResult::One(v) => {
-                return eval_each_pipe_generic::<S, V>(&stages[j..], v, optional, None, sink);
+                return eval_each_pipe_generic::<S, V>(&stages[j..], None, v, optional, None, sink);
             }
             GenericResult::OneCursor(c) => {
                 return eval_each_pipe_generic::<S, V>(
                     &stages[j..],
+                    None,
                     c.value(),
                     optional,
                     Some(c),
@@ -10343,19 +10344,18 @@ impl<'a> PipeWhole<'a> {
         }
     }
 
-    /// Whether any of `exprs`, which must be the stages this was made for,
-    /// needs path context.
+    /// Whether any of `exprs`, the stages this was made for, needs path
+    /// context. The given pipe's memo answers only for its own stages (the
+    /// same slice, not an equal one), so a mismatched pair walks instead of
+    /// reading another slice's answer.
     fn needs_path_context(&self, exprs: &[Expr]) -> bool {
-        let walk = |stages: &[Expr]| stages.iter().any(needs_path_context);
         match self.given {
-            Some(Expr::Pipe(stages)) => {
-                debug_assert!(
-                    core::ptr::eq(stages.as_slice(), exprs),
-                    "PipeWhole::given names a pipe other than the stages asked about"
-                );
-                stages.needs_path_context_or_init(walk)
+            Some(Expr::Pipe(stages)) if core::ptr::eq(stages.as_slice(), exprs) => {
+                pipe_needs_path_context(stages)
             }
-            _ => *self.needs_path_context.get_or_init(|| walk(exprs)),
+            _ => *self
+                .needs_path_context
+                .get_or_init(|| exprs.iter().any(needs_path_context)),
         }
     }
 
@@ -12270,7 +12270,14 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             }
             Flow::Exhausted
         }
-        Expr::Pipe(exprs) => eval_each_pipe_generic::<S, V>(exprs, value, optional, cursor, sink),
+        Expr::Pipe(exprs) => eval_each_pipe_generic::<S, V>(
+            exprs,
+            Some(pipe_needs_path_context(exprs)),
+            value,
+            optional,
+            cursor,
+            sink,
+        ),
         Expr::Paren(inner) => eval_each_generic::<S, V>(inner, value, optional, cursor, sink),
         // #1481: mirrors `eval.rs`'s own `eval_each` `Expr::Compare` arm
         // (#1459, Stage 4) -- `binary_fanout_each_generic` owns the loop
@@ -13233,16 +13240,16 @@ fn continue_pipe_element_generic<S: EvalSemantics, V: DocumentValue>(
 ) -> Flow {
     match item {
         GenericItem::One(v) => {
-            eval_each_pipe_generic::<S, V>(rest.stages(), v, optional, None, sink)
+            eval_each_pipe_generic::<S, V>(rest.stages(), None, v, optional, None, sink)
         }
         GenericItem::OneCursor(c) => {
-            eval_each_pipe_generic::<S, V>(rest.stages(), c.value(), optional, Some(c), sink)
+            eval_each_pipe_generic::<S, V>(rest.stages(), None, c.value(), optional, Some(c), sink)
         }
         // Same as the `OneCursor` arm above, minus the `c.value()` resolve
         // -- `v` was already decoded by whoever built this item (#1609), so
         // re-deriving it here would just repeat that work.
         GenericItem::OneCursorValue(c, v) => {
-            eval_each_pipe_generic::<S, V>(rest.stages(), v, optional, Some(c), sink)
+            eval_each_pipe_generic::<S, V>(rest.stages(), None, v, optional, Some(c), sink)
         }
         // #2543: this is the call site a plain top-level pipe
         // (`EXPR | tostring`/`EXPR | @json`/...) actually reaches --
@@ -15756,6 +15763,7 @@ fn each_object_value_generic<S: EvalSemantics, V: DocumentValue>(
 /// rather than duplicating them -- see its own doc comment.
 fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
     exprs: &[Expr],
+    needs_path: Option<bool>,
     value: V,
     optional: bool,
     cursor: Option<V::Cursor>,
@@ -15768,7 +15776,10 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
     if let Some(flow) = try_yq_context_pipe::<S, V>(exprs, value.clone(), optional, cursor, sink) {
         return flow;
     }
-    if exprs.iter().any(needs_path_context) {
+    // The pipe's remembered answer when the caller holds the `Expr::Pipe`
+    // (#3886); a sub-slice is walked.
+    let needs_path = needs_path.unwrap_or_else(|| exprs.iter().any(needs_path_context));
+    if needs_path {
         // #2416 phase 2: the cursor walk emits straight into `sink`, so a
         // path-context pipe is as lazy as any other stage here. Anything the
         // walk's static gate declines takes the absent route or the owned
@@ -15851,8 +15862,12 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
     // carries its identity into the rest of the pipe when a later stage
     // reads path context. Decided once, statically, so the per-item closure
     // pays nothing for the ordinary pipe.
+    //
+    // `needs_path` first: no stage of `rest` reads path context when no stage
+    // of the whole pipe does, so the walk of `rest` is skipped (#3886).
     let identity_from_first = cursor.filter(|_| {
-        rest.iter().any(needs_path_context)
+        needs_path
+            && rest.iter().any(needs_path_context)
             && !path_context_is_navigational(first)
             && !path_context_stage_preserves_node(first)
             && owned_identity_leaving_stage_supported(first)
@@ -26857,7 +26872,7 @@ fn try_path_context_absent_sink<S: EvalSemantics, V: DocumentValue>(
     let stepped = path_context_step_pipe_each::<S, V>(head, &root_pos, &mut |pos| {
         let flow = match &pos.node {
             PathNode::At(c) if rest_is_cursor_native => {
-                eval_each_pipe_generic::<S, V>(rest, c.value(), false, Some(*c), sink)
+                eval_each_pipe_generic::<S, V>(rest, None, c.value(), false, Some(*c), sink)
             }
             PathNode::At(c) => match to_owned_cursor::<S, _>(c) {
                 Ok(value) => eval_owned_identity_pipe::<S, V>(
@@ -31323,7 +31338,7 @@ fn continue_owned_identity_ancestor<S: EvalSemantics, V: DocumentValue>(
         }
         OwnedAncestor::Node(c) => match tail {
             OwnedIdentityTail::Sink(sink) => {
-                eval_each_pipe_generic::<S, V>(rest, c.value(), optional, Some(c), sink)
+                eval_each_pipe_generic::<S, V>(rest, None, c.value(), optional, Some(c), sink)
             }
             // An enclosing stage still needs the identity of every output
             // (spine 2416, identity pass): the node is materialized once and
@@ -32389,6 +32404,7 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                 if let OwnedIdentityTail::Sink(sink) = tail.reborrow() {
                     return eval_each_pipe_generic::<S, V>(
                         rest,
+                        None,
                         kc.value(),
                         optional,
                         Some(kc),
@@ -43718,6 +43734,43 @@ mod tests {
                 needs,
                 "{filter}"
             );
+        }
+    }
+
+    /// #3886 review: the sink route's `Expr::Pipe` arm asks the pipe node's
+    /// memo too, with and without a cursor.
+    #[test]
+    fn eval_each_pipe_generic_remembers_its_path_context_gate_3886() {
+        let json = br#"{"a":{"b":1}}"#;
+        let index = JsonIndex::build(json);
+        for with_cursor in [true, false] {
+            for (filter, needs) in [(".a | key", true), (".a | .b + 1", false)] {
+                let pipe = parse(filter).unwrap();
+                let Expr::Pipe(stages) = &pipe else {
+                    panic!("{filter}: not a pipe");
+                };
+                let cursor = index.root(json);
+                let mut out = 0;
+                let flow = eval_each_generic::<JqSemantics, _>(
+                    &pipe,
+                    cursor.value(),
+                    false,
+                    with_cursor.then_some(cursor),
+                    &mut |_item| {
+                        out += 1;
+                        Demand::Continue
+                    },
+                );
+                assert!(matches!(flow, Flow::Exhausted), "{filter}");
+                assert_eq!(out, 1, "{filter}");
+                assert_eq!(
+                    stages.needs_path_context_or_init(|_| unreachable!(
+                        "{filter}: answered by the dispatch"
+                    )),
+                    needs,
+                    "{filter}, cursor: {with_cursor}"
+                );
+            }
         }
     }
 

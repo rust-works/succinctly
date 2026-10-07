@@ -1734,7 +1734,10 @@ pub struct PipeStages {
 impl PipeStages {
     /// Whether any stage needs path context, computing it with `classify` on
     /// the first call.
-    pub fn needs_path_context_or_init(&self, classify: impl FnOnce(&[Expr]) -> bool) -> bool {
+    pub(crate) fn needs_path_context_or_init(
+        &self,
+        classify: impl FnOnce(&[Expr]) -> bool,
+    ) -> bool {
         memo(&self.needs_path_context, || classify(&self.stages))
     }
 

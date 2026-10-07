@@ -24,7 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The answer walks every stage's unevaluated syntax, so `map(try (.foo | (1+1+…200 terms)) catch "x")`, whose body fails at its first stage, paid that walk for the rest of the body on every
   element. It is now remembered on the pipe node, as #3455 does for a `def`'s body: `Expr::Pipe` holds a `PipeStages`, which reads as the `Vec<Expr>` it wraps and keeps the answer as derived
   state (ignored by equality and `Debug`, dropped by a clone or a mutable borrow). `needs_path_context`'s own `Pipe` arm reads the same memo, so a pipe nested in a stage is walked once too.
-  Output is unchanged. **API:** code that builds an `Expr::Pipe` from a `Vec` adds `.into()` (or uses `Expr::pipe`), and code that moves the stages out uses `into_vec()`.
+  The evaluators' pipe routes (`eval_single`, the sink route, and the eager evaluator's `eval_pipe`/`eval_each_pipe`) all read it. Output is unchanged.
+  **Breaking for library callers** that build or destructure `Expr::Pipe`: building one from a `Vec` adds `.into()` (or uses `Expr::pipe`), moving the stages out uses `into_vec()`,
+  and an or-pattern binding `Expr::Pipe(x) | Expr::Comma(x)` splits in two, since the two payloads now differ in type.
 - **ci: the shared coverage action now uses `action-works/patchcov-action@v1`** (#3880). It replaces `action-works/omni-dev-coverage-check@v2` in `.github/actions/coverage/action.yml`
   (the one definition behind both `ci.yml` and `coverage-baseline.yml`). `v1` resolves to the same commit and an identical `action.yml` as the old `v2`, so every input, the `version: 0.1.1`
   patchcov pin and the baseline lookup are unchanged; only the repository an `omni-dev`-named workflow depended on is gone.
