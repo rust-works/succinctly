@@ -21257,13 +21257,23 @@ fn string_slice_pattern<W>(
     }))
 }
 
-/// What `indices`, `index` and `rindex` answer for an input they cannot search.
+/// What `indices`, `index` and `rindex` answer for an input that is neither an array
+/// nor a string.
 ///
-/// jq routes a *string* pattern through `_strindices`, which answers `null`
-/// for an input holding no characters to search rather than raising: `null |
-/// index("a")` and `{} | index("a")` are both `null`. Anything else indexes the
-/// input with the pattern, so a scalar — or an object handed a non-string
-/// pattern, `{} | indices(1)` — reports that indexing error.
+/// jq defines `indices($i)` as `.[$i]` for every input but those two (`def indices($i):
+/// if type == "array" and ($i|type) == "array" then .[$i] elif type == "array" then
+/// .[[$i]] elif type == "string" and ($i|type) == "string" then _strindices($i) else
+/// .[$i] end;`), and `index`/`rindex` as `indices($i) | .[0]` / `.[-1:][0]`. So `null`
+/// and an object are *looked up*, not searched: `{"a":1} | indices("a")` is `1`, `null
+/// | indices(true)` is `Cannot index null with boolean`, and a scalar or an object
+/// handed a key it cannot take reports the indexing error, for all three alike.
+/// `index_one` is that lookup; `index`/`rindex` then apply their own access to what it
+/// answered (`{"a":[5,6]} | rindex("a")` is `6`, `{"a":1} | index("a")` is `Cannot
+/// index number with number`), through the same evaluator the pipe would use (#3890).
+///
+/// This was once written as "`_strindices` answers `null` for an input holding no
+/// characters", which held for the `null` and `{}` it was probed with and nothing else:
+/// the answer is `.[$i]`'s, and it is `null` there only because those two hold no key.
 ///
 /// One definition, because this is the outer half of the same refusal
 /// [`non_string_pattern`] covers, and the three searches had drifted here too.
@@ -21271,18 +21281,38 @@ fn unsearchable_input<'a, W: Clone + AsRef<[u64]>>(
     value: &StandardJson<'a, W>,
     pattern: &OwnedValue,
     optional: bool,
+    occurrence: SearchOccurrence,
 ) -> QueryResult<'a, W> {
-    match value {
-        // An *array* pattern reaches `.[$array]`, which `null` refuses
-        // (`null | indices([1])` is `Cannot index null with array`, #3453).
-        StandardJson::Null if !matches!(pattern, OwnedValue::Array(_)) => {
-            QueryResult::Owned(OwnedValue::Null)
-        }
-        StandardJson::Object(_) if matches!(pattern, OwnedValue::String(_)) => {
-            QueryResult::Owned(OwnedValue::Null)
-        }
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::cannot_index(type_name(value), pattern)),
+    if !matches!(value, StandardJson::Null | StandardJson::Object(_)) {
+        return suppress_or_raise(EvalError::cannot_index(type_name(value), pattern), optional);
+    }
+    // jq's rules, whichever mode asked: `indices` is jq surface even where yq reaches it
+    // (`--jq-extensions`, which follows jq, ADR-0018), and yq's lenient indexing would
+    // answer `null` for `a: [1,2]` | `indices(1)`, where jq says `Cannot index object with
+    // number`, and drop `.[0]` of a scalar rather than raise it.
+    let looked_up = index_one::<W, JqSemantics>(value.clone(), pattern, optional);
+    let tail = match occurrence {
+        SearchOccurrence::All => return looked_up,
+        SearchOccurrence::First => Expr::index(0),
+        SearchOccurrence::Last => Expr::pipe(vec![
+            Expr::Slice {
+                start: Some(-1),
+                end: None,
+                start_key: None,
+                end_key: None,
+            },
+            Expr::index(0),
+        ]),
+    };
+    // The tail runs on what the lookup answered, lazily, so a container is not read just
+    // to take one element of it. `index_one` on a `null` or an object *value* answers one
+    // document value (`One`) or an error: a cursor (`OneCursor`) and a computed result
+    // (`Owned`) only come from a slice or a subarray search of an array, which neither
+    // input is, and `index_one_on_null_or_object_answers_a_value_or_an_error_3890` pins
+    // that, so a lookup that did not answer a value has no element to take.
+    match looked_up {
+        QueryResult::One(v) => eval_single::<W, JqSemantics>(&tail, v, optional),
+        other => other,
     }
 }
 
@@ -21498,7 +21528,7 @@ fn search_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
             }
         },
-        _ => unsearchable_input(value, pattern, optional),
+        _ => unsearchable_input(value, pattern, optional, occurrence),
     }
 }
 
@@ -102220,14 +102250,15 @@ mod tests {
     }
 
     /// The other half of the same refusal: what the three searches do with an
-    /// input they cannot search. jq's `_strindices` answers `null` where there
-    /// are no characters to search rather than raising, so `null` and an object
-    /// handed a string pattern are values, not errors — and everything else
-    /// reports the indexing error, for all three alike.
+    /// input that is neither an array nor a string. jq's `indices($i)` is `.[$i]`
+    /// there, so `null` and an object are *looked up* -- `null` for a string key
+    /// they hold nothing under (these `null` rows are the lookup's answer, not a
+    /// `_strindices` one: #3890) -- and everything else reports the indexing
+    /// error, for all three alike.
     #[test]
     fn test_string_search_unsearchable_inputs() {
         assert_outcomes(&[
-            // jq answers with a value here, so no probe can pin these.
+            // jq answers with a value here (`null | .["a"]`, `{} | .["a"]`).
             (b"null", r#"indices("a")"#, Ok("null")),
             (b"null", r#"index("a")"#, Ok("null")),
             (b"null", r#"rindex("a")"#, Ok("null")),
@@ -102237,6 +102268,23 @@ mod tests {
             // A non-string pattern never reaches `_strindices`, so the object
             // is indexed with it and refused.
             (b"{}", "indices(1)", Err("Cannot index object with number")),
+            // #3890: a key the object holds is looked up, and `index`/`rindex`
+            // take `.[0]` / `.[-1:][0]` of it; `null` takes a boolean or `null`
+            // key to an error.
+            (br#"{"a":1}"#, r#"indices("a")"#, Ok("1")),
+            (br#"{"a":[5,6]}"#, r#"index("a")"#, Ok("5")),
+            (br#"{"a":[5,6]}"#, r#"rindex("a")"#, Ok("6")),
+            (
+                br#"{"a":1}"#,
+                r#"index("a")"#,
+                Err("Cannot index number with number"),
+            ),
+            (
+                b"null",
+                "indices(true)",
+                Err("Cannot index null with boolean"),
+            ),
+            (b"null", "rindex(null)", Err("Cannot index null with null")),
             // Scalars report the indexing error, which `index`/`rindex` used
             // to word as `expected string or array, got <t>`.
             (
@@ -102250,6 +102298,50 @@ mod tests {
                 Err(r#"Cannot index boolean with string "a""#),
             ),
         ]);
+    }
+
+    /// #3890: `unsearchable_input` takes `.[0]` / `.[-1:][0]` of what `index_one` answered for a
+    /// `null` or an object, and handles only a document value (`One`) -- a cursor or a computed
+    /// result would need its own arm, and cannot arise: those come from a slice or a subarray
+    /// search of an array. Pinned here over every key kind in both modes' jq rules, so a change
+    /// that makes `index_one` answer one of them fails this test instead of silently skipping
+    /// the tail.
+    #[test]
+    fn index_one_on_null_or_object_answers_a_value_or_an_error_3890() {
+        let object = br#"{"a":[5,6],"b":null,"c":{"d":1}}"#;
+        let keys = [
+            OwnedValue::String("a".into()),
+            OwnedValue::String("zz".into()),
+            OwnedValue::Int(0),
+            OwnedValue::Int(-1),
+            OwnedValue::Float(0.5),
+            OwnedValue::Bool(true),
+            OwnedValue::Null,
+            OwnedValue::array_from(vec![OwnedValue::Int(1)]),
+            OwnedValue::array_from(Vec::new()),
+            OwnedValue::object_from(Vec::new()),
+        ];
+        for json in [&b"null"[..], &object[..]] {
+            let index = crate::json::JsonIndex::build(json);
+            let cursor = index.root(json);
+            for key in &keys {
+                let result = index_one::<_, JqSemantics>(cursor.value(), key, false);
+                assert!(
+                    matches!(result, QueryResult::One(_) | QueryResult::Error(_)),
+                    "{} | .[{key:?}] is neither a value nor an error",
+                    String::from_utf8_lossy(json)
+                );
+            }
+        }
+        // The control that lets the classification above fail: an *array* target with an
+        // array key is the subarray search, which does answer a computed result.
+        let array = b"[1,2,1]";
+        let index = crate::json::JsonIndex::build(array);
+        let key = OwnedValue::array_from(vec![OwnedValue::Int(1)]);
+        assert!(matches!(
+            index_one::<_, JqSemantics>(index.root(array).value(), &key, false),
+            QueryResult::Owned(_)
+        ));
     }
 
     /// `ascii_upcase` and `ascii_downcase` are the same jq definition

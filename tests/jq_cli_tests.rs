@@ -61282,6 +61282,275 @@ fn test_indices_family_raises_inside_path_on_the_evaluated_pattern_3347() -> Res
     Ok(())
 }
 
+/// #3890: on an input that is neither an array nor a string, jq's `indices($i)` is
+/// `.[$i]` -- a lookup, not a search -- and `index`/`rindex` then take `.[0]` /
+/// `.[-1:][0]` of what it answered. `null` and an object were answered `null` whatever
+/// the pattern, on the strength of a comment that called it `_strindices`'s answer:
+/// that held for the `null` and `{}` it was probed with and for nothing else, so
+/// `null | indices(true)` answered where jq raises (and `[path(...)]` of it answered
+/// the root path `[[]]`, which `del` and `=` would then have written through), and
+/// `{"a":1} | indices("a")` answered `null` where jq answers `1`. Every row captured
+/// live from jq 1.7.1; `(input, filter, stdout or error text)`.
+#[test]
+fn test_indices_family_looks_up_a_null_or_object_input_3890() -> Result<()> {
+    for (input, filter, want) in [
+        // A key the input cannot take is the indexing error, not `null`.
+        (
+            "null",
+            "indices(true)",
+            Err("Cannot index null with boolean"),
+        ),
+        (
+            "null",
+            "indices(false)",
+            Err("Cannot index null with boolean"),
+        ),
+        ("null", "index(null)", Err("Cannot index null with null")),
+        (
+            "null",
+            "rindex(true)",
+            Err("Cannot index null with boolean"),
+        ),
+        ("null", "indices(null)", Err("Cannot index null with null")),
+        // ...and the same refusal reaches `path`, `del` and a write instead of the
+        // root path.
+        (
+            "null",
+            "[path(indices(true))]",
+            Err("Cannot index null with boolean"),
+        ),
+        (
+            "null",
+            "[path(index(false))]",
+            Err("Cannot index null with boolean"),
+        ),
+        (
+            "null",
+            "del(indices(true))",
+            Err("Cannot index null with boolean"),
+        ),
+        (
+            "null",
+            "(indices(true)) = 1",
+            Err("Cannot index null with boolean"),
+        ),
+        (
+            "null",
+            "[path(null | indices(null))]",
+            Err("Cannot index null with null"),
+        ),
+        // An object looks the key up.
+        (r#"{"a":1}"#, r#"indices("a")"#, Ok("1")),
+        (r#"{"a":[5,6]}"#, r#"indices("a")"#, Ok("[5,6]")),
+        ("{}", r#"indices("a")"#, Ok("null")),
+        (
+            r#"{"a":1}"#,
+            "indices(1)",
+            Err("Cannot index object with number"),
+        ),
+        // `index` / `rindex` apply their own access to the looked-up value.
+        (r#"{"a":[5,6]}"#, r#"index("a")"#, Ok("5")),
+        (r#"{"a":[5,6]}"#, r#"rindex("a")"#, Ok("6")),
+        (r#"{"a":[]}"#, r#"rindex("a")"#, Ok("null")),
+        (r#"{"a":null}"#, r#"index("a")"#, Ok("null")),
+        (
+            r#"{"a":1}"#,
+            r#"index("a")"#,
+            Err("Cannot index number with number"),
+        ),
+        (
+            r#"{"a":1}"#,
+            r#"rindex("a")"#,
+            Err("Cannot index number with object"),
+        ),
+        (
+            r#"{"a":"xyz"}"#,
+            r#"index("a")"#,
+            Err("Cannot index string with number"),
+        ),
+        (
+            r#"{"a":"xyz"}"#,
+            r#"rindex("a")"#,
+            Err("Cannot index string with number"),
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r#"index("a")"#,
+            Err("Cannot index object with number"),
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r#"rindex("a")"#,
+            Err("Cannot index object with object"),
+        ),
+        (
+            r#"{"a":true}"#,
+            r#"index("a")"#,
+            Err("Cannot index boolean with number"),
+        ),
+        (
+            r#"{"a":true}"#,
+            r#"rindex("a")"#,
+            Err("Cannot index boolean with object"),
+        ),
+        // An object pattern is jq's slice descriptor and an array pattern a subarray search:
+        // `null` takes the first (`null`), neither is a lookup an object can answer.
+        ("null", r#"indices({"start":0})"#, Ok("null")),
+        ("null", r#"index({"start":1})"#, Ok("null")),
+        (
+            r#"{"a":1}"#,
+            r#"indices({"start":0})"#,
+            Err("Cannot index object with object"),
+        ),
+        (
+            r#"{"a":1}"#,
+            "rindex({})",
+            Err("Cannot index object with object"),
+        ),
+        ("null", "indices([1])", Err("Cannot index null with array")),
+        (
+            r#"{"a":1}"#,
+            "indices([1])",
+            Err("Cannot index object with array"),
+        ),
+        // `?` swallows the lookup's own error and takes the looked-up value otherwise.
+        ("null", "indices(true)?", Ok("")),
+        (r#"{"a":1}"#, r#"index("a")?"#, Ok("")),
+        (r#"{"a":1}"#, r#"rindex("a")?"#, Ok("")),
+        (r#"{"a":"xyz"}"#, r#"rindex("a")?"#, Ok("")),
+        ("5", r#"indices("a")?"#, Ok("")),
+        (r#"{"a":1}"#, r#"indices("a")?"#, Ok("1")),
+        (r#"{"a":[5,6]}"#, r#"index("a")?"#, Ok("5")),
+        (r#"{"a":[5,6]}"#, r#"[.. | rindex("a")?]"#, Ok("[6,null]")),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        match want {
+            Ok(expected) => {
+                assert_eq!(code, 0, "#3890: `{input} | {filter}`: stderr {stderr:?}");
+                assert_eq!(stdout.trim(), expected, "#3890: `{input} | {filter}`");
+            }
+            Err(message) => {
+                assert_eq!(code, 5, "#3890: `{input} | {filter}`: stdout {stdout:?}");
+                assert!(stdout.is_empty(), "#3890: `{input} | {filter}`: {stdout:?}");
+                assert!(
+                    stderr.contains(message),
+                    "#3890: `{input} | {filter}`: wanted {message:?}, got {stderr:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// #3890: `indices`, `index` and `rindex` are jq surface even where yq reaches them
+/// (`--jq-extensions`), and an extension follows jq (ADR-0018), so the lookup uses jq's
+/// indexing rules and not yq's lenient ones. Run through `index_one::<YqSemantics>` the
+/// lookup answered `null` for `a: [1, 2]` | `indices(1)` (yq indexes a mapping by number
+/// into `null`) where jq raises, and the `.[0]` of a scalar produced no output at all
+/// where jq raises. Expected texts are jq 1.7.1's, for the same value as JSON.
+#[test]
+fn test_indices_family_looks_up_in_yq_extensions_3890() -> Result<()> {
+    for (input, filter, want) in [
+        ("a: [5, 6]\n", r#"indices("a")"#, Ok("[5,6]")),
+        ("a: [5, 6]\n", r#"index("a")"#, Ok("5")),
+        ("a: [5, 6]\n", r#"rindex("a")"#, Ok("6")),
+        ("a: 1\n", r#"indices("a")"#, Ok("1")),
+        (
+            "a: [1, 2]\n",
+            "indices(1)",
+            Err("Cannot index object with number"),
+        ),
+        (
+            "a: [1, 2]\n",
+            "index(1)",
+            Err("Cannot index object with number"),
+        ),
+        (
+            "a: 1\n",
+            r#"index("a")"#,
+            Err("Cannot index number with number"),
+        ),
+        (
+            "a: 1\n",
+            r#"rindex("a")"#,
+            Err("Cannot index number with object"),
+        ),
+        (
+            "n: null\n",
+            ".n | indices(true)",
+            Err("Cannot index null with boolean"),
+        ),
+        ("n: null\n", r#".n | index("a")"#, Ok("null")),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["yq", "--jq-extensions", "-o", "json", "-I", "0", filter])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child
+                    .stdin
+                    .take()
+                    .expect("piped")
+                    .write_all(input.as_bytes())?;
+                child.wait_with_output()
+            })?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        match want {
+            Ok(expected) => {
+                assert!(
+                    output.status.success(),
+                    "#3890 (yq): `{filter}`: {output:?}"
+                );
+                assert_eq!(stdout.trim(), expected, "#3890 (yq): `{filter}`");
+            }
+            Err(message) => {
+                assert!(
+                    !output.status.success(),
+                    "#3890 (yq): `{filter}`: {output:?}"
+                );
+                assert!(stdout.is_empty(), "#3890 (yq): `{filter}`: {stdout:?}");
+                assert!(
+                    stderr.contains(message),
+                    "#3890 (yq): `{filter}`: wanted {message:?}, got {stderr:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// #3890 residual, pinned so it cannot move unnoticed: `index`/`rindex` on a tracked
+/// object are `.[$i] | .[0]` in jq, a register that walks `["a",0]`, which this resolver
+/// does not model (a tracked key is still a by-value leaf). Until it does, an `and`
+/// whose left operand is `index("a")` is judged by jq's own value (`true` here) and its
+/// right operand runs against a register the resolver thinks is still at the root, so it
+/// refuses where jq's `(.a)?` swallows the path error and `//` falls through. The shape
+/// *matched* before #3890 only because the wrong `null` made `and` short-circuit. The
+/// same program spelled `.a[0]`, which the resolver does move, answers as jq does. Swept:
+/// 14 rows of this one shape, `scripts/jq-path-register-sweep.py` over the `index`/
+/// `rindex` operands. This test flips to jq's `{}` when the tracked step lands, and
+/// should then move to the `Ok` table of `test_indices_family_looks_up_a_null_or_object_input_3890`.
+#[test]
+fn test_index_on_a_tracked_object_register_residual_3890() -> Result<()> {
+    let input = r#"{"a":[true]}"#;
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"del((index("a") and (.a)?) // .a)"#], Some(input))?;
+    assert_eq!(code, 5, "#3890 residual: stdout {stdout:?}");
+    assert!(stdout.is_empty(), "#3890 residual: {stdout:?}");
+    assert!(
+        stderr.contains(r#"Invalid path expression near attempt to access element "a" of"#),
+        "#3890 residual: {stderr:?}"
+    );
+    // The contrast jq answers identically: a navigation the resolver does move.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "del((.a[0] and (.a)?) // .a)"], Some(input))?;
+    assert_eq!(code, 0, "#3890 contrast: stderr {stderr:?}");
+    assert_eq!(stdout.trim(), "{}", "#3890 contrast");
+    Ok(())
+}
+
 /// #3347: where `indices` does not navigate -- a string searched for a string --
 /// it answers, and a pattern that is empty or raises never reaches the access at
 /// all (jq's `$i` binding runs first). Captured live from jq 1.7.1.
