@@ -49858,7 +49858,17 @@ fn resolve_catch_sink<'a, S: EvalSemantics>(
     // exit 5.
     let frame = frame.with_register(entry_register);
     let seed = match frame.register() {
-        Some(register) if payload_may_be_node && null_bool_identical(&payload, register) => {
+        Some(register)
+            if payload_may_be_node
+                && (null_bool_identical(&payload, register)
+                    // #3891: `error` and `error(.)` raise the very node the `try`
+                    // stood on, so jq's `jv_identical` holds for a container too
+                    // (`try error catch .a` is `["a"]`), and storage identity is
+                    // that pointer test where the resolver holds the caller's own
+                    // tree. Where it does not (a reindex bridge) this is false and
+                    // the arm below decides.
+                    || (S::TAG == EvalTag::Jq && payload.shares_storage_with(register))) =>
+        {
             PathBranch::new(PathPrefix::root(), Cow::Owned(payload), true)
         }
         Some(register) => {
@@ -126775,6 +126785,19 @@ mod tests {
                 r"path(.a as $y | .a | label $out | try (break $out) catch $y)",
                 r#"["a"]"#,
             ),
+            // #3891: `error(.)` and bare `error` raise the register's own node,
+            // which jq's `jv_identical` sees as the register for a container too;
+            // the resolver tells it by storage, so the handler navigates it.
+            (
+                &br#"{"a":{"b":1}}"#[..],
+                r"path(.a | try error(.) catch .)",
+                r#"["a"]"#,
+            ),
+            (
+                &br#"{"a":{"b":1}}"#[..],
+                r"path(.a | try error(.) catch .b)",
+                r#"["a","b"]"#,
+            ),
         ] {
             assert_eq!(outputs(doc, filter), [want], "{filter}");
         }
@@ -126809,11 +126832,11 @@ mod tests {
                 r"path(.a | (try error(null) catch .) | .b)",
                 r#"Invalid path expression near attempt to access element "b" of null"#,
             ),
-            // Refuse-only: `error(.)` raises the register's own node, which
-            // a value-equal payload cannot be told apart from a rebuilt copy.
+            // A payload that merely equals the register is a rebuilt copy, not its
+            // node (`error(.)` is, #3891; this is not), and jq refuses it.
             (
                 &br#"{"a":{"b":1}}"#[..],
-                r"path(.a | try error(.) catch .)",
+                r#"path(.a | try error({"b":1}) catch .)"#,
                 r#"Invalid path expression with result {"b":1}"#,
             ),
             // Review: a caught `break`'s payload is jq's `{"__jq":0}` label

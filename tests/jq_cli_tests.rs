@@ -61042,6 +61042,53 @@ fn test_reverse_raises_unconditionally_2744() -> Result<()> {
     Ok(())
 }
 
+/// #3891: a `catch` handler that is a `?`-wrapped navigation off the node the
+/// `try` stood on. `INDEX_OPT` swallows a type error but never a path error, and
+/// `error` / `error(.)` raise the register's own node, so the handler navigates it
+/// (a path, a delete, a write); a payload that is merely equal (`error("x")`,
+/// `error({"a":1})`) is a fresh value, where the navigation prunes. Every row
+/// captured live from jq 1.7.1 over `{"a":{"b":null},"c":2}`.
+#[test]
+fn test_catch_handler_optional_navigation_reaches_the_register_node_3891() -> Result<()> {
+    let doc = r#"{"a":{"b":null},"c":2}"#;
+    for (program, want) in [
+        // The register's own node: the handler's navigation is a path.
+        ("path(try error catch (.a)?)", r#"["a"]"#),
+        ("path(try error catch .a?)", r#"["a"]"#),
+        ("path(try error(.) catch (.a | .b)?)", r#"["a","b"]"#),
+        ("path(try error catch (.a // 1)?)", r#"["a"]"#),
+        ("path(try error catch first(.a)?)", r#"["a"]"#),
+        ("path(try error catch .a)", r#"["a"]"#),
+        // ... so a write through it lands, instead of being silently skipped.
+        ("del(try error catch (.a)?)", r#"{"c":2}"#),
+        ("del(try error catch .a)", r#"{"c":2}"#),
+        ("(try error catch (.a)?) = 9", r#"{"a":9,"c":2}"#),
+        ("(try error catch (.a)?) |= 9", r#"{"a":9,"c":2}"#),
+        // An equal-but-fresh payload is not the register: the navigation prunes.
+        (r#"path(try error("x") catch (.a)?)"#, ""),
+        ("path(try error(.a) catch (.b)?)", ""),
+        (r#"del(try error({"a":1}) catch (.a)?)"#, doc),
+        (r#"(try error("x") catch (.a)?) = 9"#, doc),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(doc))?;
+        assert_eq!(code, 0, "#3891: `{program}`: stderr {stderr:?}");
+        assert_eq!(stdout.trim(), want, "#3891: `{program}`");
+    }
+    // Navigating off the handler's output is still not a path.
+    for program in [
+        "path(. as $x | try error catch (.a)? | 3)",
+        "path(. as $x | try error catch (.a)? | $x)",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(doc))?;
+        assert_eq!(code, 5, "#3891: `{program}`: stdout {stdout:?}");
+        assert!(
+            stderr.contains("Invalid path expression with result"),
+            "#3891: `{program}`: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3888: `INDEX(f)` iterates its input first (`INDEX(.[]; f)`), whatever it is,
 /// and `transpose` iterates once some row has a length above zero -- so on a
 /// value the resolver is not tracking both raise jq's `Invalid path expression
