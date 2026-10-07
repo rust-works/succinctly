@@ -43862,7 +43862,13 @@ fn register_identical<S: EvalSemantics>(
 /// the snapshot half) shares one definition with `register_identical`
 /// instead of hand-inlining the same `matches!` + `==` a third time.
 fn null_bool_identical(a: &OwnedValue, b: &OwnedValue) -> bool {
-    matches!(a, OwnedValue::Null | OwnedValue::Bool(_)) && a == b
+    is_null_or_bool(a) && a == b
+}
+
+/// Whether `value` is `null`, `true` or `false`: the kinds jq's `jv_identical` treats as
+/// the same node whenever they are equal ([`null_bool_identical`]).
+fn is_null_or_bool(value: &OwnedValue) -> bool {
+    matches!(value, OwnedValue::Null | OwnedValue::Bool(_))
 }
 
 /// Whether `value` is an array jq's slice hands back as *the same node*: a
@@ -49275,10 +49281,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                             let walked_at = (S::TAG == EvalTag::Jq
                                 && active_reg.trackable
                                 && active_reg.path.depth() > 0
-                                && matches!(
-                                    active_reg.value,
-                                    OwnedValue::Null | OwnedValue::Bool(_)
-                                ))
+                                && is_null_or_bool(&active_reg.value))
                             .then_some(&active_reg);
                             let mut emit = |branch: PathBranch<'a>| -> Demand {
                                 if update_unmoved && !branch.trackable {
