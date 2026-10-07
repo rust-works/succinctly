@@ -92412,6 +92412,21 @@ const SUBARRAY_SEARCH_KEY_IDENTITY_3943: &[(&str, &str)] = &[
     ("[nan] as $a | [$a] | .[[[nan]]]", "[]"),
     ("[[nan]] | .[[.[0]]]", "[0]"),
     ("[1,2,1,2] | .[[1,2]]", "[0,2]"),
+    // Path position keeps refusing as jq does: the spliced key is a plain
+    // value there, never a path marker.
+    ("[nan] as $a | [$a] | path(.[[$a]])", "[[[null]]]"),
+    (
+        "[nan] as $a | [$a] | try (.[[$a]] = 9) catch .",
+        "\"Cannot update field at array index of array\"",
+    ),
+    (
+        "[nan] as $a | [$a] | try (.[[$a]] |= 9) catch .",
+        "\"Cannot update field at array index of array\"",
+    ),
+    (
+        "[nan] as $a | [$a] | try del(.[[$a]]) catch .",
+        "\"Cannot delete array element of array\"",
+    ),
 ];
 
 #[cfg(not(feature = "unshared-containers"))]
