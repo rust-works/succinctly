@@ -79,6 +79,7 @@ jobs:
               - '!*.md'
               - '!docs/**'
               - '!.claude/skills/**'
+              - '!changelog.d/**'    # fragments are .md, but nested, so `!*.md` misses them (#3920)
 
       - id: decide
         run: |

@@ -41,19 +41,24 @@ Creates releases for the succinctly crate. Triggered by terms like "release", "p
    - Update `tests/snapshots/cli_golden_tests__version.snap`
    - This test WILL fail if you skip this step
 
-5. **Update CHANGELOG.md**
-   - Create new version section with date `YYYY-MM-DD`
-   - Group changes by user impact (not by commit type):
-     - **CLI Enhancements** - user-facing CLI features
-     - **Performance** - speed/memory improvements with metrics
-     - **SIMD Optimizations** - architecture-specific speedups
-     - **Memory Optimizations** - space efficiency improvements
-     - **Fixed** - bug fixes
-   - Update comparison links at bottom of file
+5. **Update CHANGELOG.md** - entries are per-PR fragments in `changelog.d/`; never hand-edit `[Unreleased]`
+   ```bash
+   python3 scripts/changelog.py check                              # all fragments well-formed
+   python3 scripts/changelog.py collect --version X.Y.Z --dry-run  # preview, writes nothing
+   python3 scripts/changelog.py collect --version X.Y.Z            # write the section
+   ```
+   - `collect` creates `## [X.Y.Z] - DATE` (fragments grouped Added, Changed, Deprecated,
+     Removed, Performance, Fixed, Security), carries any text still under `## [Unreleased]`
+     into it verbatim (the pre-fragment legacy text goes out with the first release), updates
+     the comparison links at the bottom, and deletes the consumed fragments
+   - Review `git diff CHANGELOG.md`; regroup or reword by user impact only if the release needs it
+   - Cross-check against `git log vPREV..HEAD`: a merged PR with no fragment (waived or forgotten) is
+     a missing entry
 
 6. **Commit the release**
    ```bash
    git add Cargo.toml Cargo.lock CHANGELOG.md tests/snapshots/
+   git add -A changelog.d   # the consumed fragments are deleted
    git commit -m "chore(release): prepare vX.Y.Z"
    ```
 
@@ -87,7 +92,7 @@ Creates releases for the succinctly crate. Triggered by terms like "release", "p
 
 - **Never run `cargo publish` manually** - CI handles this
 - **Never push a tag before the commit is pushed** - tag must reference pushed commit
-- **Never skip updating CHANGELOG.md** - it's part of the release
+- **Never skip updating CHANGELOG.md** - it's part of the release; run `collect`, don't hand-assemble it
 - **Never look at only recent commits** - always check ALL commits since last tag
 - **Never forget version snapshots** - grep for old version across codebase
 - **Never push directly to main without checking** - branch protection may require PR

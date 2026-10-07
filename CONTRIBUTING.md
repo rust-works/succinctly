@@ -110,6 +110,23 @@ For performance-critical changes:
 
 4. Test on multiple platforms if SIMD is involved
 
+### Changelog Fragments
+
+Do not edit `CHANGELOG.md` — every PR adding an entry to the same place made any two PRs
+in flight conflict. Add your own file instead:
+
+```
+changelog.d/<issue>.<type>.md      # e.g. changelog.d/3767.changed.md
+```
+
+`<type>` is `added`, `changed`, `deprecated`, `removed`, `performance`, `fixed` or
+`security`; use `+<slug>` for `<issue>` when there is no issue, and `.<n>` before `.md` for
+a second entry. The body is the entry as it would have been written in `CHANGELOG.md`
+(a `- ` bullet, bold lead-in, prose). A follow-up that refreshes an entry edits that same
+fragment. A PR with no user-visible effect (docs-only, CI-only, refactor) waives the CI
+check with the `no-changelog` label or a `[no changelog]` line in the PR body. See
+[changelog.d/README.md](changelog.d/README.md).
+
 ### Commit Messages
 
 We use [Conventional Commits](https://www.conventionalcommits.org/) format:
