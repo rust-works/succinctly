@@ -107068,7 +107068,7 @@ mod tests {
     fn needs_path_context_pipe_arm_reads_the_memo_3886() {
         let seeded = parse(".a | .b").unwrap();
         let Expr::Pipe(stages) = &seeded else {
-            panic!("not a pipe")
+            panic!("not a pipe"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3673)"
         };
         assert!(stages.needs_path_context_or_init(|_| true));
         assert!(needs_path_context(&seeded), "answered from the seeded memo");
@@ -107077,7 +107077,7 @@ mod tests {
             let pipe = parse(filter).unwrap();
             assert_eq!(needs_path_context(&pipe), needs, "{filter}");
             let Expr::Pipe(stages) = &pipe else {
-                panic!("{filter}: not a pipe")
+                panic!("{filter}: not a pipe"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3673)"
             };
             assert_eq!(
                 stages.needs_path_context_or_init(|_| unreachable!("{filter}: filled by the ask")),
@@ -107097,7 +107097,7 @@ mod tests {
             for (filter, needs) in [(".a | key", true), (".a | .b + 1", false)] {
                 let pipe = parse(filter).unwrap();
                 let Expr::Pipe(stages) = &pipe else {
-                    panic!("{filter}: not a pipe")
+                    panic!("{filter}: not a pipe"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3673)"
                 };
                 let value = index.root(json).value();
                 if each {

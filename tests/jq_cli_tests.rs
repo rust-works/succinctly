@@ -84896,6 +84896,9 @@ fn test_owned_embed_fold_ties_and_identity_stage_2889() -> Result<()> {
         r". as $x | [.,.] | (. | max) | path($x)",
         r". as $x | [.,.] | (max) | path($x)",
         r". as $x | [.,.] | (.) | max | path($x)",
+        // Two parenthesised identities: the second survives `skip_identity_stages`,
+        // so the peel recurses past it (#3886 moved this line onto `PipeStages`).
+        r". as $x | [.,.] | (.) | (.) | max | path($x)",
         r". as $x | {k:.} | (.k) | path($x)",
         r". as $x | {k:.} | (. | .k) | path($x)",
     ] {
@@ -111015,4 +111018,20 @@ fn test_register_catch_handler_over_register_keeping_stage_3767() -> Result<()> 
             5,
         ),
     ])
+}
+
+/// #3886: a `.`-headed parenthesised pipe of two or more stages over a lazy
+/// array rebuilds its tail as one `Pipe` (`fold_lazy_seq_stage`), which now
+/// goes through `PipeStages`. Output is jq 1.7.1's.
+#[test]
+fn test_lazy_seq_identity_headed_pipe_runs_every_stage_3886() -> Result<()> {
+    for (filter, want) in [
+        ("[.,.] | (. | .[0] | .a)", "1\n"),
+        ("[.,.] | (. | .[0] | .a | . + 1)", "2\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
+        assert_eq!(code, 0, "#3886: `{filter}`: stderr={stderr:?}");
+        assert_eq!(stdout, want, "#3886: `{filter}`");
+    }
+    Ok(())
 }

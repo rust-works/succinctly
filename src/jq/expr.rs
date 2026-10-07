@@ -1756,12 +1756,6 @@ impl From<Vec<Expr>> for PipeStages {
     }
 }
 
-impl From<PipeStages> for Vec<Expr> {
-    fn from(stages: PipeStages) -> Self {
-        stages.stages
-    }
-}
-
 impl FromIterator<Expr> for PipeStages {
     fn from_iter<I: IntoIterator<Item = Expr>>(iter: I) -> Self {
         Vec::from_iter(iter).into()
@@ -3415,7 +3409,7 @@ mod tests {
         let fresh = Expr::Pipe(stages().into());
         let asked = Expr::Pipe(stages().into());
         let Expr::Pipe(asked_stages) = &asked else {
-            unreachable!()
+            unreachable!(); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3673)"
         };
         assert!(asked_stages.needs_path_context_or_init(|_| true));
         assert!(asked_stages.needs_path_context_or_init(|_| unreachable!("answered from the memo")));
@@ -3431,7 +3425,7 @@ mod tests {
 
         let mut rewritten = asked.clone();
         let Expr::Pipe(rewritten_stages) = &mut rewritten else {
-            unreachable!()
+            unreachable!(); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3673)"
         };
         assert!(rewritten_stages.needs_path_context_or_init(|_| true));
         rewritten_stages.push(Expr::Identity);

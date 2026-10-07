@@ -10018,6 +10018,7 @@ fn fold_pipe_stages_sink<S: EvalSemantics, V: DocumentValue>(
             // `test_first_over_lazy_prefix_applies_every_stage_1565`.
             GenericResult::One(v) => {
                 return eval_each_pipe_generic::<S, V>(&stages[j..], None, v, optional, None, sink);
+                // patchcov: coverage tolerate-line reason="unreachable: this loop is entered only with a LazyKeys/LazyIndexRange/LazySeq head, and every fold_lazy_*_stage answers OneCursor, Owned, ManyOwned or a lazy marker (eval_on_owned never returns One); kept so a stage that did return One hands off by value instead of falling to the eager fold (#1565, #3886)"
             }
             GenericResult::OneCursor(c) => {
                 return eval_each_pipe_generic::<S, V>(
@@ -43663,7 +43664,7 @@ mod tests {
                 assert_eq!(got, want, "{filter}: tail from stage {j}");
                 let cursor = index.root(json);
                 let Expr::Pipe(rebuilt_stages) = &rebuilt else {
-                    unreachable!("built as a pipe above")
+                    unreachable!("built as a pipe above"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3673)"
                 };
                 let with_whole = show::<S, _>(eval_single_pipe::<S, _>(
                     rebuilt_stages,
@@ -43720,7 +43721,7 @@ mod tests {
         for (filter, needs) in [(".a | key", true), (".a | .b + 1", false)] {
             let pipe = parse(filter).unwrap();
             let Expr::Pipe(stages) = &pipe else {
-                panic!("{filter}: not a pipe");
+                panic!("{filter}: not a pipe"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3673)"
             };
             let cursor = index.root(json);
             let want = eval_single::<JqSemantics, _>(&pipe, cursor.value(), false, Some(cursor))
@@ -43747,7 +43748,7 @@ mod tests {
             for (filter, needs) in [(".a | key", true), (".a | .b + 1", false)] {
                 let pipe = parse(filter).unwrap();
                 let Expr::Pipe(stages) = &pipe else {
-                    panic!("{filter}: not a pipe");
+                    panic!("{filter}: not a pipe"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3673)"
                 };
                 let cursor = index.root(json);
                 let mut out = 0;
@@ -43781,7 +43782,7 @@ mod tests {
     fn pipe_whole_path_context_answer_is_remembered_3886() {
         let pipe = parse(".a | .b").unwrap();
         let Expr::Pipe(stages) = &pipe else {
-            panic!("not a pipe");
+            panic!("not a pipe"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3673)"
         };
         assert!(stages.needs_path_context_or_init(|_| true), "seeded");
         assert!(PipeWhole::given(&pipe).needs_path_context(stages));
