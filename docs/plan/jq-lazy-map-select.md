@@ -668,6 +668,17 @@ python3 scripts/ab-cli.py --before ./succ-before --after ./succ-after --tool jq 
     - Residual: an all-scalar body over many nodes holds its cursor list while the values
       are built, so `[.[0], .[]] | length` over 300k strings peaks at 74 MB instead of
       64 MB, with neutral time.
+    - **Mixed arrays, and no deferred walk** ([#3856](https://github.com/rust-works/succinctly/issues/3856),
+      Phase 1) — **landed**. #3478's deferred walk existed so a `,` array still failed whole on a
+      malformed node. #3856 drops that promise for the rule #2692 states, *a value is validated where
+      something reads it*, so `CursorCheck` and everything that settled it (`LazySeq::settle`,
+      `is_prevalidated`, `Sink::materializes_lazy_items`) are gone: `LazySource::Cursors` keeps one
+      `may_repeat` flag (#3477's shared build). A `,` body of any branches takes the route in jq mode
+      (the pure-navigation gate on the flat body is lifted); a computed branch (`[., 1]`) is held as an
+      owned element beside the node cursors in `LazySource::Mixed`, and an all-scalar array is built
+      owned with *decode-or-defer* (a scalar that fails to decode stays a node). The printer validates
+      every cursor element, so printing still raises and writes nothing; `[., 1] | length` answers.
+      `split_comma_head`'s pure-navigation gate is unchanged, so `[.[] | ., .]` still builds owned.
   - **A `,` head behind a pipe:**
     [#3476](https://github.com/rust-works/succinctly/issues/3476) — **landed**. `[(., .) | .data]`
     reached `Expr::Pipe`, whose `Expr::Comma` head answers one owned tree per item, then
