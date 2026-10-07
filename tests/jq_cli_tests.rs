@@ -63633,6 +63633,16 @@ fn test_routed_foreach_source_under_try_is_caught_3853() -> Result<()> {
             r#"Invalid path expression with result {"a":[true]}"#,
             5,
         ),
+        // Inside another fold's UPDATE `.` is the accumulator, which the enclosing source
+        // moved off the register: the body keeps refusing there (it deleted the document
+        // when the no-op body was handed on unconditionally).
+        (
+            doc,
+            r"del(reduce .[]? as $k (.; foreach (. as {a:$a} | .) as $k (.; .; .)))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
     ])
 }
 

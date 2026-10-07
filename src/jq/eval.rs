@@ -46273,7 +46273,14 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                         // refuses (catchably, as jq's own is) rather than this body,
                         // whose "with result" refusal is uncatchable (a routed `foreach`
                         // source under a `try`).
+                        // Not inside another fold's UPDATE or EXTRACT: there `.` is the
+                        // accumulator, which the enclosing source may have moved off the
+                        // register while the ambient still reads as trackable (#3790), so
+                        // the body's refusal is the only thing standing between
+                        // `del(reduce .[]? as $k (.; foreach (. as {a:$a} | .) as $k (.; .; .)))`
+                        // and deleting the document where jq raises.
                         if S::TAG == EvalTag::Jq
+                            && fold_body::depth() == 0
                             && !seed.trackable
                             && body_performs_no_step(&substituted)
                         {
