@@ -2971,6 +2971,156 @@ fn test_yq_alternative_in_path_position_2817() -> Result<()> {
     Ok(())
 }
 
+/// #2817: the error and early-stop paths of yq's per-left-output `//`, on every route that
+/// implements it. An error raised by the right side while it replaces a falsy output, or by the
+/// left side, or downstream of either, propagates; a left that yields nothing lets the right
+/// answer. Rows with yq's own syntax are captures from yq v4.53.3; the last block uses
+/// `--jq-extensions` (`limit`, `path(f)` are jq surface with no yq oracle), pinning the rule
+/// itself: a consumer that stops early stops the replacement too.
+#[test]
+fn test_yq_alternative_errors_and_early_stops_2817() -> Result<()> {
+    for (input, filter, message) in [
+        // the right side raises while replacing a falsy output: cursor, eager collecting
+        // (`map(f)` bodies), eager streaming (`(f) | g`), identity pipe (`| key`), path position
+        ("{}", r#"(null, 1) // error("y")"#, "y"),
+        ("{}", r#"[null,1] | map(. // error("y"))"#, "y"),
+        ("{}", r#"[null,1] | (.[] // error("y")) | tostring"#, "y"),
+        (r#"{"a":null}"#, r#"(.a // error("y")) | key"#, "y"),
+        (
+            r#"{"a":null,"b":1,"c":2}"#,
+            r#"((.a, .b) // error("y")) = 9"#,
+            "y",
+        ),
+        (
+            r#"{"a":null,"b":1,"c":2}"#,
+            r#"del((.a, .b) // error("y"))"#,
+            "y",
+        ),
+        // the left side raises
+        ("{}", r#"[1,2] | map(error("x") // 3)"#, "x"),
+        ("{}", r#"[null,1] | (error("x") // 3) | tostring"#, "x"),
+        (
+            r#"{"a":null,"b":1,"c":2}"#,
+            r#"((error("x"), .b) // .c) = 9"#,
+            "x",
+        ),
+        // downstream of a kept truthy output / of a replacement, in the identity pipe
+        (r#"{"a":1}"#, r#"(.a // .b) | (key | error("z"))"#, "z"),
+        (
+            r#"{"a":null,"b":2}"#,
+            r#"(.a // .b) | (key | error("z"))"#,
+            "z",
+        ),
+        // the same, on the identity pipe (a value computed upstream keeps its position)
+        (
+            r#"{"a":{"x":1,"y":2}}"#,
+            r#".a | (. + {}) | (.x // .y) | (key | error("z"))"#,
+            "z",
+        ),
+        (
+            r#"{"a":{"x":null,"y":2}}"#,
+            r#".a | (. + {}) | (.x // .y) | (key | error("z"))"#,
+            "z",
+        ),
+        (
+            r#"{"a":{"x":null,"y":2}}"#,
+            r#".a | (. + {}) | (.x // error("y")) | key"#,
+            "y",
+        ),
+        (
+            r#"{"a":{"x":null,"y":2}}"#,
+            r#".a | (. + {}) | (.x // select(false)) | (key | error("z"))"#,
+            "z",
+        ),
+    ] {
+        for route in [&[][..], &["--arg", "z", "1"][..]] {
+            let mut args = vec!["-o", "json", "-I", "0"];
+            args.extend_from_slice(route);
+            let (out, stderr, code) = run_yq_stdin_with_stderr(filter, input, &args)?;
+            assert_eq!(code, 1, "{input} | {filter} {route:?}: {out:?}");
+            assert!(
+                stderr.contains(message),
+                "{input} | {filter} {route:?}: {stderr}"
+            );
+        }
+    }
+    // a left that yields nothing lets the right answer, on the eager routes too
+    for (input, filter, want) in [
+        ("{}", "[1,2] | map(select(. > 5) // 7)", "[7,7]"),
+        ("{}", "[null,1] | (select(false) // 7) | tostring", "\"7\""),
+        (
+            r#"{"a":{"x":null,"y":2}}"#,
+            ".a | (. + {}) | (select(false) // .y) | key",
+            "\"y\"",
+        ),
+        // a falsy output the right side leaves alone stays, and the rest of the pipe may still raise
+        // (below); the lazy shapes `keys` and `map(f)` are truthy and pass through
+        (r#"{"a":1}"#, "keys // 9", "[\"a\"]"),
+        (r#"{"a":1}"#, "(keys, 5) // 9", "[\"a\"]\n5"),
+        (r#"{"a":[1,2]}"#, "(.a | map(.)) // 9", "[1,2]"),
+        (
+            r#"{"a":{"x":null,"y":2}}"#,
+            ".a | (. + {}) | (.x, .y) // select(false) | key",
+            "\"x\"\n\"y\"",
+        ),
+        (
+            r#"{"a":{"x":null,"y":2}}"#,
+            ".a | (. + {}) | (.x // (.y, .y)) | key",
+            "\"y\"\n\"y\"",
+        ),
+    ] {
+        let (out, stderr, code) =
+            run_yq_stdin_with_stderr(filter, input, &["-o", "json", "-I", "0"])?;
+        assert_eq!(code, 0, "{input} | {filter}: {stderr}");
+        assert_eq!(out.trim(), want, "{input} | {filter}");
+    }
+    // `halt` is not an error: it ends the run at once, in path position too (`--jq-extensions`)
+    for filter in [
+        "((halt, .b) // .c) = 9",
+        "del((halt, .b) // .c)",
+        "[path((halt, .b) // .c)]",
+    ] {
+        let (out, stderr, code) = run_yq_stdin_with_stderr(
+            filter,
+            r#"{"a":null,"b":1,"c":2}"#,
+            &["--jq-extensions", "-o", "json", "-I", "0"],
+        )?;
+        assert_eq!((code, out.as_str()), (0, ""), "{filter}: {stderr}");
+    }
+    // a consumer that stops early stops the replacement (`--jq-extensions`)
+    for (input, filter, want) in [
+        ("{}", "[limit(1; (null, 1) // (2, 3))]", "[2]"),
+        ("{}", "[null,1] | [limit(1; .[] // (2, 3))]", "[2]"),
+        (
+            r#"{"a":{"x":null,"y":2,"z":3}}"#,
+            "[limit(1; .a | (. + {}) | (.x // (.y, .z)) | key)]",
+            r#"["y"]"#,
+        ),
+        ("{}", "[limit(2; (null, 1) // (2, 3))]", "[2,3]"),
+        (
+            r#"{"a":null,"b":2,"c":3}"#,
+            "[limit(1; (.a // (.b, .c)) | key)]",
+            r#"["b"]"#,
+        ),
+        (
+            r#"{"a":null,"b":1,"c":2}"#,
+            "[limit(1; path((.a, .b) // .c))]",
+            r#"[["c"]]"#,
+        ),
+        (
+            r#"{"a":null,"b":1,"c":2}"#,
+            "[limit(2; path((.a, .b) // .c))]",
+            r#"[["c"],["b"]]"#,
+        ),
+    ] {
+        let (out, stderr, code) =
+            run_yq_stdin_with_stderr(filter, input, &["--jq-extensions", "-o", "json", "-I", "0"])?;
+        assert_eq!(code, 0, "{input} | {filter}: {stderr}");
+        assert_eq!(out.trim(), want, "{input} | {filter}");
+    }
+    Ok(())
+}
+
 /// #2817: a pipe headed by yq's `//` carries each output to the next stage with its own source
 /// position, so `line`/`column` read after the operator see the node a truthy output came from
 /// and 0 for a replacement computed by the right side -- including the mix of the two

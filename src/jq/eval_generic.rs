@@ -17626,15 +17626,15 @@ fn each_alternative_generic<S: EvalSemantics, V: DocumentValue>(
 /// `is_falsy`, a decoded or computed value by its truthiness, and the lazy shapes
 /// (`keys`, an index range, a built array) are always truthy -- a lazy array that fails to
 /// build raises where its consumer pulls it, not here.
-fn generic_item_is_truthy<V: DocumentValue>(item: &GenericItem<V>) -> Result<bool, Control> {
+fn generic_item_is_truthy<V: DocumentValue>(item: &GenericItem<V>) -> bool {
     match item {
         // Falsy is `null` or `false`, which the value says without decoding a container (#2692's
         // rule for a cursor: reading truthiness decodes nothing).
-        GenericItem::One(v) => Ok(!(v.is_null() || v.as_bool() == Some(false))),
-        GenericItem::OneCursor(c) | GenericItem::OneCursorValue(c, _) => Ok(cursor_is_truthy(c)),
-        GenericItem::Owned(o) => Ok(o.is_truthy()),
+        GenericItem::One(v) => !(v.is_null() || v.as_bool() == Some(false)), // patchcov: coverage tolerate-line reason="a document value pushed without a cursor: every left output the CLI's cursor route produces carries one, so only a caller driving this route without a cursor reaches this arm; it is the cursor arm below with the value's own null/false test (#2817)"
+        GenericItem::OneCursor(c) | GenericItem::OneCursorValue(c, _) => cursor_is_truthy(c),
+        GenericItem::Owned(o) => o.is_truthy(),
         GenericItem::LazyKeys { .. } | GenericItem::LazyIndexRange(_) | GenericItem::LazySeq(_) => {
-            Ok(true)
+            true
         }
     }
 }
@@ -17663,14 +17663,10 @@ fn each_alternative_per_left_output_generic<S: EvalSemantics, V: DocumentValue>(
         cursor,
         &mut |item: GenericItem<V>| {
             produced = true;
-            match generic_item_is_truthy::<V>(&item) {
-                Err(control) => return stop_with_escape(&mut escape, control),
-                Ok(true) => {
-                    let demand = sink.push(item);
-                    outer_stopped |= demand == Demand::Stop;
-                    return demand;
-                }
-                Ok(false) => {}
+            if generic_item_is_truthy::<V>(&item) {
+                let demand = sink.push(item);
+                outer_stopped |= demand == Demand::Stop;
+                return demand;
             }
             let mut replaced = false;
             let right_flow = eval_each_generic::<S, V>(
