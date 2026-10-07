@@ -59083,9 +59083,12 @@ fn loop_var_can_be_compared(expr: &Expr, names: &[String]) -> bool {
 /// walk cannot see. A name used only by value (an index key, a comparison
 /// operand, a constructed element, an assignment's right-hand side) never reaches
 /// a resolver's certification, so it needs no marker. Over-approximates: an
-/// unfamiliar node holding the name counts. Under-approximates one way, safely:
-/// a name that reaches a resolver only through a rebinding (`$x | . as $y |
-/// ($y.a) = 9`) is not seen, and the write refuses as it did before.
+/// unfamiliar node holding the name counts. A plain rebinding to the node itself
+/// (`$x as $y | ($y.a) = 9`, #3898) counts as a read of the variable, through
+/// [`is_loop_var_itself`]; `$x | . as $y | ($y.a) = 9` never needed it, since
+/// the pipe's `.` is the marker already. Under-approximates one way, safely: a
+/// name that reaches a resolver through a destructuring bind is not seen, and the
+/// write refuses as it did before.
 fn loop_var_is_path_source(expr: &Expr, names: &[String]) -> bool {
     scan_for_path_source(expr, names, true)
 }
@@ -59126,6 +59129,39 @@ fn scan_for_path_source(expr: &Expr, names: &[String], calls: bool) -> bool {
                 Visit::Skip
             }
         }
+        // #3898: `$x as $y | BODY` binds `$y` to the very node `$x` holds, so a
+        // resolver reading `$y` reads the loop variable. The alias joins the
+        // names the body is scanned for. Only a source that *is* the variable
+        // (`$x`, `($x | .)`): `$r.name as $n` binds a component, not the node,
+        // and counting it would mark `$r` in `reduce .[] as $r ({}; $r.name as
+        // $n | .[$n] = $r.score)` and make its in-place assignment step decline.
+        Expr::As {
+            expr: source,
+            var,
+            body,
+        } if is_loop_var_itself(source, names) => {
+            if scan_for_path_source(body, &with_alias(names, var), calls) {
+                Visit::Found
+            } else {
+                Visit::Skip
+            }
+        }
+        Expr::AsPattern {
+            expr: source,
+            patterns,
+            body,
+        } if matches!(patterns.as_slice(), [Pattern::Var(_)])
+            && is_loop_var_itself(source, names) =>
+        {
+            let [Pattern::Var(var)] = patterns.as_slice() else {
+                unreachable!("guarded by the match above"); // patchcov: coverage tolerate-line reason="unreachable: the arm's guard just matched exactly one Pattern::Var (#3898)"
+            };
+            if scan_for_path_source(body, &with_alias(names, var), calls) {
+                Visit::Found
+            } else {
+                Visit::Skip
+            }
+        }
         Expr::FuncCall { .. }
         | Expr::NamespacedCall { .. }
         | Expr::DefCall { .. }
@@ -59140,6 +59176,29 @@ fn scan_for_path_source(expr: &Expr, names: &[String], calls: bool) -> bool {
         }
         _ => Visit::Descend,
     })
+}
+
+/// `names` plus `alias`, for scanning the body of an `as` that renames a loop
+/// variable (#3898).
+fn with_alias(names: &[String], alias: &str) -> Vec<String> {
+    let mut extended = names.to_vec();
+    extended.push(alias.to_string());
+    extended
+}
+
+/// Whether `source` evaluates to the node one of `names` holds, unchanged: the
+/// bare variable, parenthesised, or piped through stages that pass `.` along
+/// (#3898). `$x.a`, `$x | length` and `[$x]` are not: they bind something else.
+fn is_loop_var_itself(source: &Expr, names: &[String]) -> bool {
+    match source {
+        Expr::Var(v) => names.iter().any(|name| name == v),
+        Expr::Paren(inner) => is_loop_var_itself(inner, names),
+        Expr::Pipe(stages) => stages.split_first().is_some_and(|(first, rest)| {
+            is_loop_var_itself(first, names)
+                && rest.iter().all(|stage| identity_passthrough(stage, false))
+        }),
+        _ => false,
+    }
 }
 
 /// [`loop_var_is_path_source`]'s walk of one resolver argument: descends only
@@ -76937,6 +76996,15 @@ mod tests {
             "reduce . as $x (.; path($x[1:]))",
             "foreach . as $x (.; .; path($x))",
             "foreach . as $x (.; ($x.a) = 1; .)",
+            // #3898: a rebinding of the node itself is a read of the variable.
+            "reduce . as $x (.; $x as $y | ($y.a) = 9)",
+            "reduce . as $x (.; $x as $y | path($y))",
+            "reduce . as $x (.; $x as $y | del($y.a))",
+            "reduce . as $x (.; $x as $y | $y as $z | ($z.a) = 9)",
+            "reduce . as $x (.; ($x | .) as $y | ($y.a) = 9)",
+            "reduce . as $x (.; $x as $y | foo($y))",
+            "foreach . as $x (.; $x as $y | ($y.a) = 1; .)",
+            "foreach . as $x (.; .; $x as $y | path($y))",
         ] {
             assert!(
                 gate::<JqSemantics>(src, AnchorScope::On),
@@ -76952,8 +77020,20 @@ mod tests {
             // A call on an assignment's right-hand side runs by value.
             "reduce .[] as $r ({}; .[$r.name] = my_fn($r))",
             "reduce . as $x (.; .a += foo($x))",
-            // Reaches a resolver only through a rebinding: not seen, so it refuses as before.
+            // The pipe's `.` is the marker already, so this answers without the gate (#3898).
             "reduce . as $x (.; $x | . as $y | ($y.a) = 9)",
+            // #3898: a rebinding that binds something other than the node itself, one
+            // that no resolver reads, and the hot shape the gate exists to keep in place
+            // (`$n` and `$s` are keys and scores, read by value).
+            "reduce .[] as $r ({}; $r.name as $n | .[$n] = $r.score)",
+            "reduce .[] as $r ({}; $r as $s | .[$s.name] = $s.score)",
+            "reduce .[] as $r ({}; $r as $s | .[$s.name] += ($s | f))",
+            "reduce . as $x (.; $x.a as $y | path($y))",
+            "reduce . as $x (.; $x | length as $y | path($y))",
+            "reduce . as $x (.; $x as [$y] | path($y))",
+            "reduce . as $x (.; $x as $y | .a = $y)",
+            "reduce . as $x (.; $x as $y | 1)",
+            "reduce . as $x (.; [$x] as $y | path($y))",
             "reduce . as $x (.; path(.a?, .[0], ..))",
             "reduce . as $x (.; .a = $x)",
             "reduce . as $x (0; . + $x)",

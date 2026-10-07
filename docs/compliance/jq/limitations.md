@@ -2030,8 +2030,15 @@ is the revert that established what the other one costs.
      container with children is looked up (#3897);
    - a scalar loop variable (`reduce (.) as $x (.; path($x))` on a string or number): no storage
      identity until a bind promotes it (#3191);
-   - a loop variable that reaches the resolver only through a rebinding (`reduce (.) as $x (.; $x |
-     . as $y | ($y.a) = 9)`): the gate does not see it, so it is not marked;
+   - a loop variable that reaches the resolver through a bind that is not a plain `as $y` of the
+     node itself -- a `?//` chain (`reduce (.) as $x (.; $x as [$y] ?// $y | ($y.a) = 9)`, which jq
+     answers `{"a":9}`): the gate does not see it, so it is not marked. A plain `$x as $y`
+     (`reduce (.) as $x (.; $x as $y | ($y.a) = 9)`, also through a chain of them or a passthrough
+     pipe `($x | .) as $y`) is read as a use of `$x` and answers since
+     [#3898](https://github.com/rust-works/succinctly/issues/3898), pinned in
+     `fold_loop_variable_marking_gate_3329` and `test_fold_loop_variable_rebound_by_as_3898`; a
+     bind of something else (`$x.a as $y`, `$x as [$y]`) is not the node and refuses as jq does.
+     (`$x | . as $y | ($y.a) = 9` never needed it: the pipe's `.` is the marker already);
    - `walk(.)`/`map_values(.)` as the source, and `[.][]` as the source on `-n`;
    - `no_std` builds (the embed table is a no-op there, so the stdin route stays refuse-only) and
      `succinctly yq` (ADR-0018: jq mode only).

@@ -85465,6 +85465,114 @@ fn test_fold_source_runs_against_null_after_first_init_fork_3895() -> Result<()>
     Ok(())
 }
 
+/// #3898: a fold's loop variable rebound with a plain `as` is still the same node.
+/// `$x as $y` binds `$y` to the very `jv` `$x` holds, so a resolver reading `$y`
+/// reads the loop variable (#3329 saw only `$x` itself). Only a bind of the node
+/// itself counts: a component (`$x.a as $y`), a constructed value (`[$x] as $y`),
+/// and a different node that merely looks equal all refuse, as does everything
+/// #3329 already refused (a literal INIT, a later fork). Both routes, every row
+/// captured live from jq 1.7.1 over `{"a":1}`.
+#[test]
+// jq filter literals like `{a:1}` are not formatting strings; clippy cannot
+// tell the two apart from the brace shape alone (as in the #3329 test below).
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_fold_loop_variable_rebound_by_as_3898() -> Result<()> {
+    let answering = [
+        (r"reduce (.) as $x (.; $x as $y | ($y.a) = 9)", r#"{"a":9}"#),
+        (r"reduce (.) as $x (.; $x as $y | path($y))", "[]"),
+        (r"reduce (.) as $x (.; $x as $y | del($y.a))", "{}"),
+        (
+            r"reduce (.) as $x (.; $x as $y | $y as $z | ($z.a) = 9)",
+            r#"{"a":9}"#,
+        ),
+        (
+            r"reduce (.) as $x (.; $x as $y | ($y | .a) = 9)",
+            r#"{"a":9}"#,
+        ),
+        (
+            r"reduce (.) as $x (.; ($x | .) as $y | ($y.a) = 9)",
+            r#"{"a":9}"#,
+        ),
+        (
+            r"foreach (.) as $x (.; $x as $y | ($y.a) = 9; .)",
+            r#"{"a":9}"#,
+        ),
+        (r"foreach (.) as $x (.; .; $x as $y | path($y))", "[]"),
+        // `$x | . as $y` never needed it: the pipe's `.` is the marker already.
+        (
+            r"reduce (.) as $x (.; $x | . as $y | ($y.a) = 9)",
+            r#"{"a":9}"#,
+        ),
+        // Rebound, then read by value: nothing to certify.
+        (
+            r"reduce (.) as $x (.; $x as $y | [$y] | .[0].a = 9)",
+            r#"[{"a":9}]"#,
+        ),
+    ];
+    let refusing = [
+        // A different node that merely looks like the accumulator.
+        r#"reduce ({"a":2}) as $x (.; $x as $y | ($y.a) = 9)"#,
+        // A component, and a constructed value, are not the node.
+        r"reduce (.) as $x (.; $x.a as $y | ($y) = 9)",
+        r"reduce (.) as $x (.; [$x] as $y | path($y))",
+        // What #3329 already refuses, rebound or not: a literal INIT, a later fork.
+        r"reduce (.) as $x ({a:1}; $x as $y | ($y.a) = 9)",
+        r"reduce (.,.) as $x (.; $x as $y | ($y.a) = 9)",
+    ];
+    for (args, wrap) in [(&["-c"][..], false), (&["-n", "-c"][..], true)] {
+        for (filter, want) in answering {
+            let program = if wrap {
+                format!("input | {filter}")
+            } else {
+                filter.to_string()
+            };
+            let mut argv: Vec<&str> = args.to_vec();
+            argv.push(&program);
+            let (stdout, stderr, code) = run_jq_full(&argv, Some(r#"{"a":1}"#))?;
+            assert_eq!(
+                (stdout.trim(), code),
+                (want, 0),
+                "#3898: `{program}` ({args:?}) must answer as jq 1.7.1 does; stderr={stderr:?}"
+            );
+        }
+        for filter in refusing {
+            let program = if wrap {
+                format!("input | {filter}")
+            } else {
+                filter.to_string()
+            };
+            let mut argv: Vec<&str> = args.to_vec();
+            argv.push(&program);
+            let (stdout, stderr, code) = run_jq_full(&argv, Some(r#"{"a":1}"#))?;
+            assert_eq!(
+                (stdout.trim(), code),
+                ("", 5),
+                "#3898: `{program}` ({args:?}) must refuse as jq 1.7.1 does; stderr={stderr:?}"
+            );
+            assert!(
+                stderr.contains("Invalid path expression"),
+                "#3898: `{program}` ({args:?}) refused for the wrong reason: {stderr:?}"
+            );
+        }
+        // Pinned, not endorsed: a `?//` chain of binds is not aliased, so this refuses
+        // where jq answers `{"a":9}`. Flip it if the alias learns `?//`.
+        let program = if wrap {
+            r"input | reduce (.) as $x (.; $x as [$y] ?// $y | ($y.a) = 9)".to_string()
+        } else {
+            r"reduce (.) as $x (.; $x as [$y] ?// $y | ($y.a) = 9)".to_string()
+        };
+        let mut argv: Vec<&str> = args.to_vec();
+        argv.push(&program);
+        let (stdout, _, code) = run_jq_full(&argv, Some(r#"{"a":1}"#))?;
+        assert_eq!(
+            (stdout.trim(), code),
+            ("", 5),
+            "#3898 residual: `{program}`"
+        );
+    }
+    Ok(())
+}
+
 /// #3329: a fold's own loop variable used in path position inside its
 /// UPDATE or EXTRACT. jq's `$x` is the very `jv` the source yielded, so a
 /// write or `path()` through it succeeds exactly while the accumulator still
