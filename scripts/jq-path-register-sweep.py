@@ -417,6 +417,16 @@ OPERANDS = [
     "(foreach (foreach . as {a:$a} (0; .; .)) as $x (true; .; .))",
     "(foreach (foreach . as {a:$a} (0; .; .)) as $x (null; .; .))",
     "(foreach (foreach . as {a:$a} ?// [$a] (0; .; .)) as $x (.; .; .))",
+    # (#3953) a `reduce` UPDATE that hands the accumulator's own node back after a register
+    # destructure: jq backtracks the whole UPDATE, so the final check reads INIT's register. The
+    # contrasts return a destructured `$var`, destructure with an array pattern, or follow the
+    # bind with a navigation. The dangerous direction is a `reduce` whose own source navigated
+    # (the `reduce-update-first-source`/`computed-key` contexts), where `.` is not the register.
+    "(. as {a:$a} | .)",
+    "(. as [$a] | .)",
+    "(. as {a:$a} | $a)",
+    "((. as {a:$a} | .) | .a)",
+    "(foreach (. as {a:$a} | .) as $x (.; .; .))",
     # (#3883) a nested `foreach` whose source navigates leaves the register on each element it
     # visits; an outer `null`/boolean accumulator is identical to a `null`/boolean member by kind.
     # Contrasts: an UPDATE that navigates, an EXTRACT that computes, a `reduce` that backtracks.

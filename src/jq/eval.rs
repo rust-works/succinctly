@@ -34098,6 +34098,49 @@ fn is_try_scoped_component(component: &Expr) -> bool {
     matches!(component, Expr::Optional(inner) if !is_postfix_optional_primitive(inner))
 }
 
+/// Whether every output of a `reduce` UPDATE is the accumulator's own node, whatever
+/// the UPDATE's register moves along the way (#3953).
+///
+/// jq backtracks a `reduce`'s source and UPDATE, so the register the final check reads
+/// is INIT's, however far UPDATE navigated: `path(reduce 1 as $k (.; (. as {a:$a} | .)))`
+/// is `[]` although the bind moved the register onto `.a` and `.` handed the root back.
+/// What decides the accumulator's standing is whether the node UPDATE emits is the one
+/// it was given. Syntactic and conservative, so a `false` only costs a refusal: `.`, a
+/// pipe of such, a single-pattern bind of `.` whose body is one (the pattern's own steps
+/// still run and raise as jq's do), and a `foreach` whose INIT, UPDATE and EXTRACT hand
+/// the state on (its state starts as the accumulator and only ever holds that node).
+/// A `?//` chain is out (a failed alternative leaves `null`), and so is any pattern
+/// whose `$var` could be returned: the body must itself hand its input on.
+fn update_returns_its_input(e: &Expr) -> bool {
+    match e {
+        Expr::Identity => true,
+        Expr::Paren(inner) => update_returns_its_input(inner),
+        Expr::Pipe(stages) => stages.iter().all(update_returns_its_input),
+        Expr::AsPattern {
+            expr,
+            patterns,
+            body,
+        } => {
+            patterns.len() == 1
+                && matches!(unwrap_paren(expr), Expr::Identity)
+                && update_returns_its_input(body)
+        }
+        Expr::Foreach {
+            patterns,
+            init,
+            update,
+            extract,
+            ..
+        } => {
+            patterns.len() == 1
+                && update_returns_its_input(init)
+                && update_returns_its_input(update)
+                && extract.as_deref().map_or(true, update_returns_its_input)
+        }
+        _ => false,
+    }
+}
+
 /// Whether `e` is a no-op in path position: `.`, or a pipe or parenthesised group of
 /// them. No `INDEX` runs, so jq's register is neither moved nor checked (#3853).
 /// Read-only and conservative (an `Optional` or anything else answers `false`), so the
@@ -46585,8 +46628,12 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                         // the body's refusal is the only thing standing between
                         // `del(reduce .[]? as $k (.; foreach (. as {a:$a} | .) as $k (.; .; .)))`
                         // and deleting the document where jq raises.
+                        // #3953: except where the enclosing body is a `reduce` UPDATE whose
+                        // accumulator is the register's node and whose source and INIT cannot
+                        // have moved it ([`fold_body::acc_is_register`]): `.` is the register
+                        // there, and jq backtracks the whole UPDATE.
                         if S::TAG == EvalTag::Jq
-                            && fold_body::depth() == 0
+                            && (fold_body::depth() == 0 || fold_body::acc_is_register_here())
                             && !seed.trackable
                             && body_performs_no_step(&substituted)
                         {
@@ -48773,6 +48820,15 @@ fn resolve_reduce<'a, S: EvalSemantics>(
     // syntactic, so decided once, not per source element
     // ([`reduce_update_at_register`]).
     let update_navigates = S::TAG == EvalTag::Jq && update_definitely_navigates(update);
+    // #3953: see [`update_returns_its_input`]. Jq mode only: yq has no `reduce` in path position.
+    let update_returns_input = S::TAG == EvalTag::Jq && update_returns_its_input(update);
+    // #3953: an outermost `reduce` whose source, INIT and loop pattern cannot move jq's
+    // register runs UPDATE with `.` on it for as long as the accumulator is its node.
+    let reduce_body_runs_on_register = S::TAG == EvalTag::Jq
+        && fold_body::depth() == 0
+        && patterns_all_bare(patterns)
+        && cannot_move_register(input)
+        && cannot_move_register(init);
     // INIT resolved first, before SOURCE (#2031, reordered from the
     // original #1467/#1872 shape): confirmed live against jq 1.7.1 (via
     // `debug`-instrumented INIT/SOURCE/UPDATE clauses) that real jq
@@ -49044,6 +49100,11 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                             outcome = Some(FoldStepOutcome::Return(aborted.stop(control)));
                             return Demand::Stop;
                         }
+                        let _acc_is_register = (update_returns_input
+                            && update_at_register
+                            && acc_at_register
+                            && reduce_body_runs_on_register)
+                            .then(fold_body::acc_is_register);
                         match reg.resolve::<S>(
                             &substituted,
                             acc_input,
@@ -49075,8 +49136,15 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                                 // starting point purely from this step's own output
                                 // branch, same as before #2632.
                                 let last = branches.into_iter().last();
+                                // #3953: UPDATE emitted the node it was given, so the
+                                // accumulator is at the register exactly when it was on the
+                                // way in, however far UPDATE moved jq's (backtracked) one.
+                                let input_at_register = acc_at_register;
                                 (acc_at_register, acc_snapshot) =
                                     reg.fold_branch_provenance::<S>(last.as_ref(), frame, slice_ok);
+                                if update_returns_input && last.is_some() {
+                                    acc_at_register = acc_at_register || input_at_register;
+                                }
                                 acc = last.map(|b| b.value.into_owned());
                                 Demand::Continue
                             }
@@ -57539,9 +57607,35 @@ mod fold_body {
 
     thread_local! {
         static DEPTH: Cell<u32> = const { Cell::new(0) };
+        /// The body depth at which `.` is known to be jq's register (#3953), 0 for none.
+        static ACC_DEPTH: Cell<u32> = const { Cell::new(0) };
     }
 
     pub(crate) struct Guard;
+
+    /// Restores the previous [`acc_is_register`] mark.
+    pub(crate) struct AccGuard(u32);
+
+    /// Marks the body about to be entered (one level deeper than now) as one where `.` is
+    /// jq's register: an outermost `reduce` whose source and INIT cannot move it, on a step
+    /// whose accumulator is the register's node (#3953). Nested fold bodies sit deeper, so
+    /// they never read it.
+    pub(crate) fn acc_is_register() -> AccGuard {
+        let previous = ACC_DEPTH.with(Cell::get);
+        ACC_DEPTH.with(|a| a.set(depth() + 1));
+        AccGuard(previous)
+    }
+
+    impl Drop for AccGuard {
+        fn drop(&mut self) {
+            ACC_DEPTH.with(|a| a.set(self.0));
+        }
+    }
+
+    /// Whether the body being resolved is the one [`acc_is_register`] marked.
+    pub(crate) fn acc_is_register_here() -> bool {
+        depth() > 0 && ACC_DEPTH.with(Cell::get) == depth()
+    }
 
     pub(crate) fn enter() -> Guard {
         DEPTH.with(|d| d.set(d.get() + 1));
@@ -57563,6 +57657,16 @@ mod fold_body {
 #[cfg(not(feature = "std"))]
 mod fold_body {
     pub(crate) struct Guard;
+
+    pub(crate) struct AccGuard;
+
+    pub(crate) fn acc_is_register() -> AccGuard {
+        AccGuard
+    }
+
+    pub(crate) fn acc_is_register_here() -> bool {
+        false
+    }
 
     pub(crate) fn enter() -> Guard {
         Guard
