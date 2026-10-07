@@ -63469,31 +63469,21 @@ fn test_foreach_source_destructuring_the_register_moves_it_3744() -> Result<()> 
     ])
 }
 
-/// #3744: what the routing costs, in the safe direction. A `foreach (. as PATTERN | ...)`
-/// source inside `and`/`or`/`-` under a `try` or `?` refuses (exit 5) where jq answers,
-/// because the resolver's terminal "Invalid path expression with result" refusal is
-/// uncatchable by design while jq's own `try` caught the equivalent error; `main`
-/// matched these only by the by-value drive's luck (it answered the root). Pinned so
-/// lifting it is a deliberate change; the jq answers are in each row.
+/// #3744, narrowed by #3853: what routing a `foreach (. as PATTERN | ...)` source costs, in
+/// the safe direction. Inside `and`/`or`/`-` under a `try` or `?`, the resolver's terminal
+/// "Invalid path expression with result" refusal is uncatchable by design while jq's own
+/// `try` catches the equivalent error. #3853 lifted the cases where that refusal came from
+/// the source's own `.` body (see [`test_routed_foreach_source_under_try_is_caught_3853`]); a
+/// later `?`-wrapped navigation off the moved register is still the resolver's guess, so it
+/// stays refused until the `and`/`or` left operand states the register the fold left.
+/// Pinned so lifting it is a deliberate change; the jq answer is in the row.
 #[test]
 fn test_foreach_source_destructuring_register_under_try_stays_refused_3744() -> Result<()> {
-    for (input, filter, jq_answer) in [
-        (
-            r#"{"a":[true]}"#,
-            r"del(try ((foreach (. as {a:$a} | .) as [$z] (.; .; .)) and true))",
-            "{\"a\":[true]}",
-        ),
-        (
-            r#"{"a":false,"b":null}"#,
-            r"del((-(try (foreach (. as {a:$a} | .) as $k (.; .; .)) catch 7))?)",
-            "{\"a\":false,\"b\":null}",
-        ),
-        (
-            r#"{"a":[true]}"#,
-            r"del(. as $x | ((foreach (. as {$a} | .) as $k (.; .; .)) and (.a | .b)?) | $x)",
-            "{\"a\":[true]}",
-        ),
-    ] {
+    for (input, filter, jq_answer) in [(
+        r#"{"a":[true]}"#,
+        r"del(. as $x | ((foreach (. as {$a} | .) as $k (.; .; .)) and (.a | .b)?) | $x)",
+        "{\"a\":[true]}",
+    )] {
         let routes = [
             ("stdin", run_jq_full(&["-c", filter], Some(input))?),
             (
@@ -63514,6 +63504,196 @@ fn test_foreach_source_destructuring_register_under_try_stays_refused_3744() -> 
         }
     }
     Ok(())
+}
+
+/// #3853: a routed `foreach` source (`. as PATTERN | .`) hands its element on with the
+/// register moved off it, and a `.` body performs no step, so jq raises nothing there: the
+/// refusal belongs to the NEXT step (the loop pattern's own, `.k`) or the end of the path.
+/// The resolver refused at the `.` body instead, with its uncatchable terminal "with
+/// result" error, so a `try` (or the `try` an `and`/`or`/`//` operand sits in) never saw
+/// it and `del` failed where jq's catches and leaves the document alone. Every row
+/// captured from jq 1.7.1, on the stdin and `-n` routes.
+#[test]
+fn test_routed_foreach_source_under_try_is_caught_3853() -> Result<()> {
+    let doc = r#"{"a":[true]}"#;
+    let unchanged = "{\"a\":[true]}\n";
+    assert_path_rows_both_routes_3749(&[
+        (
+            doc,
+            r"del(try (foreach (. as {a:$a} | .) as [$z] (.; .; .)))",
+            unchanged,
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(try ((foreach (. as {a:$a} | .) as [$z] (.; .; .)) and true))",
+            unchanged,
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(try ((foreach (. as {a:$a} | .) as [$z] (.; .; .)) or true))",
+            unchanged,
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(try ((foreach (. as {a:$a} | .) as [$z] (.; .; .)) // true))",
+            unchanged,
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(try (foreach (. as {a:$a} | .) as [$z] (.; .; .)))]",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false,"b":null}"#,
+            r"del((-(try (foreach (. as {a:$a} | .) as $k (.; .; .)) catch 7))?)",
+            "{\"a\":false,\"b\":null}\n",
+            "",
+            0,
+        ),
+        // Contrasts: without the `try` it still raises, and a source whose element the
+        // loop pattern does not step on raises only at the end of the path, as before.
+        (
+            doc,
+            r"path(foreach (. as {a:$a} | .) as [$z] (.; .; .))",
+            "",
+            r#"Invalid path expression near attempt to access element 0 of {"a":[true]}"#,
+            5,
+        ),
+        (
+            doc,
+            r"del(foreach (. as {a:$a} | .) as $z (.; .; .))",
+            "",
+            r#"Invalid path expression with result {"a":[true]}"#,
+            5,
+        ),
+    ])
+}
+
+/// #3853: a fold whose own SOURCE destructures the register (`. as [$q] | .`) leaves the
+/// register on the matched member while its element is still the old node, so the fold's
+/// loop pattern steps on a node the register is not at and jq raises, nested in a `reduce`
+/// as it does bare. The nested fold is no longer driven by value (`[]`). The contrasts
+/// stay answered: a bare `$a` loop pattern performs no step, and a `reduce` over `.`
+/// itself restores the register when it backtracks its source. Every row captured from
+/// jq 1.7.1, on the stdin and `-n` routes.
+#[test]
+fn test_nested_fold_with_a_destructured_register_source_raises_3853() -> Result<()> {
+    let near = "Invalid path expression near attempt to access element 0 of [1]";
+    assert_path_rows_both_routes_3749(&[
+        (
+            "[1]",
+            r"path(reduce (reduce (. as [$q] | .) as [$a] (0; .)) as $x (.; .))",
+            "",
+            near,
+            5,
+        ),
+        (
+            "[1]",
+            r"path(foreach (reduce (. as [$q] | .) as [$a] (0; .)) as $x (.; .; .))",
+            "",
+            near,
+            5,
+        ),
+        (
+            "[1]",
+            r"path(reduce (foreach (. as [$q] | .) as [$a] (0; .; .)) as $x (.; .))",
+            "",
+            near,
+            5,
+        ),
+        (
+            "[1]",
+            r"(reduce (reduce (. as [$q] | .) as [$a] (0; .)) as $x (.; .)) |= 5",
+            "",
+            near,
+            5,
+        ),
+        (
+            "[1]",
+            r"del(try (reduce (reduce (. as [$q] | .) as [$a] (0; .)) as $x (.; .)))",
+            "[1]\n",
+            "",
+            0,
+        ),
+        // Contrasts.
+        (
+            "[1]",
+            r"path(reduce (reduce (. as [$q] | .) as $a (0; .)) as $x (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            "[1]",
+            r"path(reduce (reduce . as [$a] (0; .)) as $x (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
+/// #3853: a nested `foreach` over `.` with a destructuring pattern moves jq's register for
+/// the OUTER fold (a `foreach` does not backtrack its source), so the outer EXTRACT is
+/// checked against a register it is no longer at: `path(foreach (foreach . as {a:$a} (0; .;
+/// .)) as $x (.; .; .))` raises where the by-value drive answered `[]`, and a write through
+/// it lands nowhere. A nested `reduce` backtracks and stays `[]`. The `or`-under-`try` rows
+/// are #3744's dangerous direction: the end-of-path refusal sits outside the `try`, so the
+/// operand's result is what jq names. Every row captured from jq 1.7.1, on the stdin and
+/// `-n` routes.
+#[test]
+fn test_nested_foreach_destructuring_the_register_moves_it_for_the_outer_fold_3853() -> Result<()> {
+    let with_result = r#"Invalid path expression with result {"a":1}"#;
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"a":1}"#,
+            r"path(foreach (foreach . as {a:$a} (0; .; .)) as $x (.; .; .))",
+            "",
+            with_result,
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"(foreach (foreach . as {a:$a} (0; .; .)) as $x (.; .; .)) |= 5",
+            "",
+            with_result,
+            5,
+        ),
+        // The nested fold's moved register is checked at the end of the path, outside the
+        // `try`, so these refuse in jq too, and the `or` operand (`true`) is what jq names.
+        (
+            r#"{"a":[true]}"#,
+            r"del(try (foreach (foreach . as {a:$a} (.; .; .)) as $k (.; .; .)))",
+            "",
+            r#"Invalid path expression with result {"a":[true]}"#,
+            5,
+        ),
+        (
+            r#"{"a":[true]}"#,
+            r"del(try ((foreach (foreach . as {a:$a} (.; .; .)) as $k (.; .; .)) or .a))",
+            "",
+            "Invalid path expression with result true",
+            5,
+        ),
+        // Contrast: a nested `reduce` restores the register.
+        (
+            r#"{"a":1}"#,
+            r"path(foreach (reduce . as {a:$a} (0; .)) as $x (.; .; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+    ])
 }
 
 /// #3790: a `foreach` whose SOURCE is the register itself (`.`, or a comma or pipe of

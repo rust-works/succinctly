@@ -33968,6 +33968,14 @@ fn is_try_scoped_component(component: &Expr) -> bool {
     matches!(component, Expr::Optional(inner) if !is_postfix_optional_primitive(inner))
 }
 
+/// Whether `e` is a no-op in path position: `.`, or a pipe or parenthesised group of
+/// them. No `INDEX` runs, so jq's register is neither moved nor checked (#3853).
+fn body_performs_no_step(e: &Expr) -> bool {
+    let mut flat = Vec::new();
+    push_path_components(&mut flat, e);
+    flat.is_empty()
+}
+
 /// Flatten an expression into the list of path components it denotes.
 ///
 /// `Pipe` and `Paren` are transparent and `Identity` contributes nothing, so
@@ -44702,11 +44710,13 @@ fn yields_only_the_register(e: &Expr) -> bool {
 /// $x (.; .; .)`).
 ///
 /// Only the source's own spine is read (the bind itself, a comma's branches, a
-/// pipe's head), never a builtin's argument or a `def` body, where `.`
-/// is another value, and so never a nested fold either: a nested `foreach . as [$q]
-/// (...)` over `.` moves the register for the outer fold in jq too, but routing it
-/// answered a root where jq refuses inside an `or` under a `try` (54 sampled rows,
-/// the dangerous direction), so it keeps the by-value drive. A `?//` chain is left
+/// pipe's head, a nested `foreach` over `.`), never a builtin's argument or a `def`
+/// body, where `.` is another value. A nested `foreach . as [$q] (...)` moves the
+/// register for the outer fold too (#3853): it does not backtrack its source, so what it
+/// destructures reaches the outer EXTRACT. (An earlier routing of it answered a root
+/// where jq refuses inside an `or` under a `try`, 54 sampled rows; those were the
+/// resolver's uncatchable "with result" refusal of a `.` body after a moved register,
+/// which [`body_performs_no_step`] now keeps from firing early.) A `?//` chain is left
 /// to the by-value drive as for a fresh source ([`routes_destructuring`]).
 fn foreach_source_destructures_register(source: &Expr) -> bool {
     match unwrap_paren(source) {
@@ -44717,6 +44727,30 @@ fn foreach_source_destructures_register(source: &Expr) -> bool {
         Expr::Pipe(stages) => stages
             .first()
             .is_some_and(foreach_source_destructures_register),
+        Expr::Foreach {
+            input, patterns, ..
+        } => routes_destructuring(patterns) && yields_only_the_register(input),
+        _ => false,
+    }
+}
+
+/// Whether `e` is a fold whose own SOURCE destructures the register (`. as [$q] | .`)
+/// and whose loop pattern then destructures what that source emitted (#3853):
+/// `reduce (. as [$q] | .) as [$a] (0; .)`. The source's step moved jq's register
+/// onto the matched member and its element is still the register's old node, so the
+/// loop pattern's own step runs against a register it is not at and raises, whether
+/// the fold is a `reduce` or a `foreach`. A nested `reduce` backtracks its source and
+/// restores the register afterwards, so the outer fold sees none of this movement; the
+/// raise is the inner pattern's own, which only the resolver models (a by-value drive
+/// answered `[]`). A bare `$a` loop pattern performs no step and stays by value.
+fn is_fold_with_destructured_register_source(e: &Expr) -> bool {
+    match e {
+        Expr::Reduce {
+            input, patterns, ..
+        }
+        | Expr::Foreach {
+            input, patterns, ..
+        } => routes_destructuring(patterns) && foreach_source_destructures_register(input),
         _ => false,
     }
 }
@@ -44993,6 +45027,7 @@ fn drive_fold_source_with<S: EvalSemantics>(
             || (S::TAG == EvalTag::Jq
                 && (live_path_refusal(e).is_some()
                     || is_fold_source_destructuring(e)
+                    || is_fold_with_destructured_register_source(e)
                     || matches!(
                         e,
                         Expr::Builtin(
@@ -46225,13 +46260,31 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                             )
                             .with_register(BranchRegister::Unmoved(Cow::Owned(reg.value)))
                         };
-                        resolve_seq_from_seed::<S>(
-                            core::slice::from_ref(&substituted),
-                            seed,
-                            frame,
-                            keep,
-                            sink,
-                        )
+                        // #3853: a body that is only `.` performs no step, so jq raises
+                        // nothing here: the pattern moved the register and `.` leaves it
+                        // there, and only the NEXT step (a loop pattern, `.k`) or the end
+                        // of the path checks it. Hand the seed on as the untracked,
+                        // register-carrying branch it is, so that step is the one that
+                        // refuses (catchably, as jq's own is) rather than this body,
+                        // whose "with result" refusal is uncatchable (a routed `foreach`
+                        // source under a `try`).
+                        if S::TAG == EvalTag::Jq
+                            && !seed.trackable
+                            && body_performs_no_step(&substituted)
+                        {
+                            match sink(seed) {
+                                Demand::Continue => ResolveFlow::Exhausted,
+                                Demand::Stop => ResolveFlow::Stopped,
+                            }
+                        } else {
+                            resolve_seq_from_seed::<S>(
+                                core::slice::from_ref(&substituted),
+                                seed,
+                                frame,
+                                keep,
+                                sink,
+                            )
+                        }
                     };
                     match flow {
                         ResolveFlow::Exhausted => Demand::Continue,
