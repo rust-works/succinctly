@@ -10,7 +10,7 @@ register. `drive_fold_source` used to inspect only each element's final
 touched the register (#2159); `MovedRegister` (`src/jq/eval.rs`) now carries
 where it went.
 
-Every case is `path(F)` and `(F) = 9`, over 7 documents (a `null`, `true`,
+Every case is `path(F)` and `(F) = 9`, over 9 documents (a `null`, `true`,
 nested and array-valued ones -- `null`/`bool` are `jv_identical` to a
 same-kind register wherever it sits, which is what makes the *positive* face
 of the bug reachable), for `foreach` and `reduce`, and is run through the
@@ -49,6 +49,7 @@ import argparse, collections, concurrent.futures as cf, itertools, re, subproces
 INPUTS = [
     '{"a":1,"b":{"c":2}}', '{"a":null,"b":null}', '{"a":[1,2],"b":"s"}', '[1,2]', 'null',
     '{"a":{"a":1},"b":{"c":2}}', '{"a":true,"b":true}',
+    '"s"', '""',  # a bare string document: its slice is a fresh `jv` (#3930)
 ]
 NAV = ['.a', '.b', '.a.c', '.[]', '.a?', '.[0]', '(.a,.b)', '.a[]?']
 TAIL = ['tostring', 'length', 'keys', 'type', 'tojson', '1', '[.]|.[0]', 'not', 'first', '(.,.)']
@@ -101,7 +102,17 @@ FORMS = ['path({k} ({s}) as $k ({i}; {u}))', '({k} ({s}) as $k ({i}; {u})) = 9']
 #   come back off the resolver's root path, which `drive_fold_source` reads as
 #   a lost register, so it refuses where jq may answer (it used to read as a
 #   literal and FABRICATE).
+#   `..|tostring`, `recurse|tostring`, `walk(.)|tostring`, `.[0:]|tostring`, `.[0:1]|tostring`,
+#   `.[0:(1+1)]|tostring` -- the same pointer identity, reached over a bare string document
+#   (`"s"`, `""`, added with #3930): `tostring` of a string is the same `jv`, so jq answers
+#   where a fold of the copy refuses. REJECT only; every FABRICATE row there is closed (#3930).
 KNOWN_RESIDUALS = {
+    '..|tostring': ['REJECT'],
+    '.[0:(1+1)]|tostring': ['REJECT'],
+    '.[0:1]|tostring': ['REJECT'],
+    '.[0:]|tostring': ['REJECT'],
+    'recurse|tostring': ['REJECT'],
+    'walk(.)|tostring': ['REJECT'],
     '.b|tostring': ['REJECT'],
     'foreach .[]? as $x (0; .+1)': ['REJECT'],
 }

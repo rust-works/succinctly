@@ -66569,6 +66569,61 @@ fn test_string_slice_is_not_the_register_3793() -> Result<()> {
     Ok(())
 }
 
+/// #3930: a `reduce` whose source is a string slice (`.[0:2]` of `"s"`) binds `$k` to a
+/// copy -- jq's string slice is a fresh `jv`, never `jv_identical` to the register -- so an
+/// accumulator that ends as `$k` is not at the register and `path()`/`=` refuse
+/// `with result "s"`. `each_fold_bind`'s position-less marker certifies a string by value,
+/// so the accumulator was taken for the register and `(reduce (.[0:2]) as $k (.; $k)) = 9`
+/// wrote `9`. An INIT of `1` or `null` reproduced it too. Controls: a non-empty array's
+/// slice *is* its node (and `foreach` answers on a string slice, which is a different
+/// shape), and `.` as UPDATE keeps the register. Every row captured from jq 1.7.1.
+#[test]
+fn test_reduce_string_slice_accumulator_is_not_the_register_3930() -> Result<()> {
+    for (input, filter) in [
+        (r#""s""#, r"(reduce (.[0:2]) as $k (.; $k)) = 9"),
+        (r#""s""#, r"path(reduce (.[0:2]) as $k (.; $k))"),
+        (r#""s""#, r"(reduce (.[0:1]) as $k (1; $k)) = 9"),
+        (r#""s""#, r"(reduce (.[0:1]) as $k (null; $k)) = 9"),
+        (r#""""#, r"path(reduce (.[0:2]) as $k (.; $k))"),
+        (r#""""#, r"(reduce (.[0:2]) as $k (.; $k)) = 9"),
+        (r#""abc""#, r"path(reduce (.[0:2]) as $k (.; $k))"),
+        (r#"{"a":"s"}"#, r"path(.a | reduce (.[0:2]) as $k (.; $k))"),
+        (r"[]", r"path(reduce (.[0:0]) as $k (.; $k))"),
+        // the optional slice is the same step (`strip_optional`)
+        (r#""s""#, r"path(reduce (.[0:2]?) as $k (.; $k))"),
+        (r#""s""#, r"(reduce (.[0:2]?) as $k (.; $k)) = 9"),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(&format!("{input}\n")))?;
+        assert_eq!(
+            (out.as_str(), code),
+            ("", 5),
+            "{filter} on {input}: stderr {err:?}"
+        );
+        assert!(
+            err.contains("Invalid path expression with result"),
+            "{filter} on {input}: stderr {err:?}"
+        );
+    }
+    for (input, filter, expected) in [
+        (r#"["a"]"#, r"(reduce (.[0:2]) as $k (.; $k)) = 9", r"9"),
+        (r#"["a"]"#, r"path(reduce (.[0:2]) as $k (.; $k))", r"[]"),
+        (r#""s""#, r"path(reduce (.[0:2]) as $k (.; .))", r"[]"),
+        (
+            r#""s""#,
+            r"path(foreach (.[0:2]) as $k (.; $k))",
+            r#"[{"start":0,"end":2}]"#,
+        ),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(&format!("{input}\n")))?;
+        assert_eq!(
+            (out.trim_end(), code),
+            (expected, 0),
+            "{filter} on {input}: stderr {err:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3494 (#3425 regression): an empty array is never identical to the
 /// register. jq's `.[0:]` of a non-empty array is the same array, but the
 /// slice of `[]` -- and any empty slice -- is a fresh `[]`, so `$x` is not

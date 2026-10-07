@@ -47053,10 +47053,16 @@ enum FoldBinding<'b> {
     /// A bare `$var` over the whole source element. `origin` is the marker's
     /// [`Origin`] when the element is register-derived (#2031) and `None` when
     /// it binds by value; [`Origin::Snapshot`] is the position-less marker.
+    ///
+    /// `fresh` (#3930): the element is the copy a slice returned -- a string, or an
+    /// empty array -- which is never `jv_identical` to the register it was sliced
+    /// from, so `reduce`'s position-less marker (which certifies a string by value)
+    /// must not stand for it.
     Var {
         name: &'b str,
         value: &'b OwnedValue,
         origin: Option<Origin>,
+        fresh: bool,
     },
 }
 
@@ -47087,6 +47093,7 @@ impl FoldBind<'_> {
                 name,
                 value,
                 origin: Some(origin),
+                fresh,
             } => match origins {
                 // #3795: an `Unproven` marker is never the certifying position-less
                 // `Snapshot` below; it keeps its own origin on both folds.
@@ -47096,7 +47103,11 @@ impl FoldBind<'_> {
                 }
                 // `reduce` re-seeds no per-step register, so a position would
                 // admit nothing: it keeps the position-less marker it always
-                // had, whether or not `Frame::at` is on for another reason.
+                // had, whether or not `Frame::at` is on for another reason. A
+                // `fresh` element gets no marker at all (#3930): that marker would
+                // certify a string slice by value against a register jq's
+                // `jv_identical` never finds it at.
+                WalkOrigins::Drop if *fresh => substitute_var(expr, name, value),
                 WalkOrigins::Drop => substitute_var_tracked(expr, name, value),
                 WalkOrigins::Keep => {
                     let marker = LazyMarker::new(value, origin.clone(), None);
@@ -47107,6 +47118,7 @@ impl FoldBind<'_> {
                 name,
                 value,
                 origin: None,
+                ..
             } => substitute_var(expr, name, value),
         };
         let null = OwnedValue::Null;
@@ -47204,11 +47216,17 @@ fn each_fold_bind<S: EvalSemantics>(
                 (source_may_alias && fold_element_may_be_register(elem, reg))
                     .then_some(Origin::Unproven)
             });
+            let fresh = S::TAG == EvalTag::Jq
+                && elem
+                    .register_path
+                    .as_ref()
+                    .is_some_and(|path| !slice_witnesses_node(path, &elem.value));
             let bind = FoldBind {
                 binding: FoldBinding::Var {
                     name,
                     value: &elem.value,
                     origin,
+                    fresh,
                 },
                 alternatives,
             };
