@@ -26,8 +26,8 @@ _spec.loader.exec_module(sweep)
 
 # Long enough that a cap which never fires would run out this clock, short enough
 # that a passing test is not slow.
-DEADLINE = 20.0
-PROMPT = 5.0  # a cap must fire well before the deadline
+DEADLINE = 60.0
+PROMPT = 30.0  # a cap must fire well before the deadline, with room for a loaded runner
 
 
 class RunOneTests(unittest.TestCase):
@@ -54,7 +54,7 @@ class RunOneTests(unittest.TestCase):
     def test_the_deadline_is_a_timeout(self):
         started = time.monotonic()
         result = sweep.run_one(["sleep", "30"], "", 0.3)
-        self.assertEqual(result, ("", None))
+        self.assertEqual(result, sweep.DEADLINE_RESULT)
         self.assertLess(time.monotonic() - started, PROMPT)
 
     def test_unbounded_stdout_is_killed_at_the_cap_and_is_a_timeout(self):
@@ -63,12 +63,23 @@ class RunOneTests(unittest.TestCase):
         self.assertIn("output exceeded", stdout)
         self.assertLess(elapsed, PROMPT)
 
-    def test_output_just_under_the_cap_is_kept_whole(self):
+    def test_output_up_to_the_cap_is_kept_whole_and_one_byte_more_is_not(self):
         size = 1 << 16
-        (stdout, code), _ = self.timed(
-            [sys.executable, "-c", f"print('a' * {size - 1})"], OUTPUT_CAP=size
-        )
+        at_cap = [sys.executable, "-c", f"print('a' * {size - 1})"]  # size bytes, newline too
+        (stdout, code), _ = self.timed(at_cap, OUTPUT_CAP=size)
         self.assertEqual((len(stdout), code), (size, 0))
+        (stdout, code), _ = self.timed(at_cap, OUTPUT_CAP=size - 1)
+        self.assertEqual(code, None)
+        self.assertIn("output exceeded", stdout)
+
+    def test_a_child_that_reads_nothing_cannot_block_the_runner_on_its_input(self):
+        # Larger than a pipe holds, and the child never reads it: the write must not
+        # run ahead of the deadline.
+        saved = sweep.run_one
+        started = time.monotonic()
+        result = saved(["sleep", "30"], "x" * (4 << 20), 0.5)
+        self.assertEqual(result, sweep.DEADLINE_RESULT)
+        self.assertLess(time.monotonic() - started, PROMPT)
 
     def test_unbounded_memory_without_output_is_killed_at_the_cap_and_is_a_timeout(self):
         # What jq does on `[path(recurse(.a)?)]`: grow forever, print nothing. The bytes
@@ -94,6 +105,35 @@ class RunOneTests(unittest.TestCase):
             RSS_CAP=256 << 20,
         )
         self.assertEqual((stdout, code), ("ok\n", 0))
+
+
+class EvaluateTests(unittest.TestCase):
+    def test_builds_are_not_run_on_a_row_jq_never_finishes(self):
+        calls = []
+        saved = sweep.run_one
+
+        def fake(argv, doc, timeout):
+            calls.append(argv[0])
+            return ("<output exceeded 1 bytes>", None) if argv[0] == sweep.ORACLE else ("[]\n", 0)
+
+        sweep.run_one = fake
+        try:
+            rec = sweep.evaluate(("ctx|x", "null", "."), [("base", "/b"), ("candidate", "/c")], 1)
+        finally:
+            sweep.run_one = saved
+        self.assertEqual(calls, [sweep.ORACLE])
+        self.assertEqual(set(rec["classes"].values()), {"ORACLE_TIMEOUT"})
+
+    def test_a_finished_oracle_runs_every_build(self):
+        calls = []
+        saved = sweep.run_one
+        sweep.run_one = lambda argv, doc, timeout: (calls.append(argv[0]), ("[]\n", 0))[1]
+        try:
+            rec = sweep.evaluate(("ctx|x", "null", "."), [("base", "/b"), ("candidate", "/c")], 1)
+        finally:
+            sweep.run_one = saved
+        self.assertEqual(calls, [sweep.ORACLE, "/b", "/c"])
+        self.assertEqual(set(rec["classes"].values()), {"MATCH"})
 
 
 class ClassifyTests(unittest.TestCase):

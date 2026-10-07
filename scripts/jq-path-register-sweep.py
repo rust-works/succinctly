@@ -33,12 +33,13 @@ candidate (main vs candidate).
   DIFF          both succeeded with different output, or both failed with
                 different exit codes
   TIMEOUT       the build exceeded --timeout (an O(N^3) gate shows up here), or
-                printed more than OUTPUT_CAP bytes (killed there, #3893);
-                re-run serially once before it is believed, since a loaded
-                box can time out a row a quiet one answers
-  ORACLE_TIMEOUT  jq itself timed out, or never stopped printing (an operand
-                that is infinite on some input, `recurse(.a)?` on `null`): the
-                row says nothing and is skipped
+                printed more than OUTPUT_CAP bytes or outgrew RSS_CAP (killed
+                there, #3893); a plain timeout is re-run serially once before it
+                is believed, since a loaded box can time out a row a quiet one
+                answers (a capped run is not: it ends the same way on any box)
+  ORACLE_TIMEOUT  jq itself timed out, or never stopped printing or outgrew RSS_CAP
+                (an operand that is infinite on some input, `recurse(.a)?` on
+                `null`): the row says nothing, so the builds are not run on it
 
 A row where the two sides both fail with the same exit code still needs the
 same stdout to be a MATCH: `path(...)` can print results before it errors.
@@ -1005,11 +1006,31 @@ def build_rows(operands=None, stage_only=False):
 # ---------------------------------------------------------------------------
 
 
+# What a run that outlived `--timeout` returns. A run killed at a cap returns a note in
+# the stdout slot instead, which is how the serial re-run tells load from the row.
+DEADLINE_RESULT = ("", None)
+# A build's result on a row whose oracle never finished: it was not run.
+SKIPPED_RESULT = ("<not run: jq did not finish>", None)
+
+
 def rss_bytes(pid):
-    """Resident size of `pid` in bytes, 0 once it is gone (`ps`: macOS has no /proc)."""
-    out = subprocess.run(
-        ["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True
-    ).stdout.strip()
+    """Resident size of `pid` in bytes; 0 once it is gone or cannot be read.
+
+    /proc where there is one (no process to spawn); `ps` on macOS. A failure to read
+    is 0, never an exception: this runs inside a worker, and one raised error would
+    abort a multi-hour sweep for the sake of a cap that only guards against a hog.
+    """
+    try:
+        with open(f"/proc/{pid}/statm") as fh:
+            return int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True
+        ).stdout.strip()
+    except OSError:
+        return 0
     return int(out) * 1024 if out.isdigit() else 0
 
 
@@ -1049,14 +1070,19 @@ def run_one(argv, doc, timeout):
                     return
                 chunks.append(chunk)
 
+        def feed():
+            try:
+                p.stdin.write(doc.encode())
+                p.stdin.close()
+            except (BrokenPipeError, ValueError):
+                pass  # the process answered (or refused) before it read its input
+
+        deadline = time.monotonic() + timeout
         reader = threading.Thread(target=drain, daemon=True)
         reader.start()
-        try:
-            p.stdin.write(doc.encode())
-            p.stdin.close()
-        except BrokenPipeError:
-            pass  # the process answered (or refused) before it read its input
-        deadline = time.monotonic() + timeout
+        # Not on this thread: a child that reads nothing, given more than a pipe holds,
+        # would block the write before the deadline or the memory poll began.
+        threading.Thread(target=feed, daemon=True).start()
         note = None
         while True:
             left = deadline - time.monotonic()
@@ -1073,7 +1099,7 @@ def run_one(argv, doc, timeout):
             p.kill()
             p.wait()
             reader.join()
-            return (note or "", None)
+            return (note, None) if note else DEADLINE_RESULT
         reader.join()
         if state["capped"]:
             return (f"<output exceeded {OUTPUT_CAP} bytes>", None)
@@ -1105,7 +1131,12 @@ def evaluate(row, builds, timeout):
     classes = {}
     outputs = {}
     for name, path in builds:
-        res = run_one([path, "jq", "-c", program], doc, timeout)
+        # A row jq never finishes says nothing about any build (ORACLE_TIMEOUT whatever it
+        # prints), and an infinite operand is exactly where a build can also run away.
+        if oracle[1] is None:
+            res = SKIPPED_RESULT
+        else:
+            res = run_one([path, "jq", "-c", program], doc, timeout)
         outputs[name] = res
         classes[name] = classify(oracle, res)
     return {
@@ -1236,11 +1267,8 @@ def main():
     # output or memory cap carries a note and is not retried: it ends the same
     # way on a quiet box, and re-running an infinite operand serially is minutes
     # of nothing (#3893).
-    def timed_out(res):
-        return res[1] is None and not res[0]
-
     retry = [i for i, rec in enumerate(records)
-             if any(timed_out(r) for r in [rec["oracle"], *rec["outputs"].values()])]
+             if DEADLINE_RESULT in [rec["oracle"], *rec["outputs"].values()]]
     if retry:
         print(f"re-running {len(retry)} timed-out row(s) serially", file=sys.stderr)
         for i in retry:
