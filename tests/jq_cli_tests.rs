@@ -5923,20 +5923,26 @@ fn test_paths_and_leaf_paths_raise_on_structurally_malformed_key_1829() -> Resul
 /// silently dropped assertion. Real jq 1.7.1 rejects this document at parse
 /// time (exit 5, `Invalid \uXXXX\uXXXX surrogate pair escape`) for `.`,
 /// `.,.` and `-S .` alike; succinctly's divergence on `.` predates #2103 and
-/// `.,.` has now joined it. `-S`/`-s` still raise, because rendering both
-/// keys into one map is what the collision is.
+/// `.,.` has now joined it. `-S` still raises, because rendering both
+/// keys into one map is what the collision is. `-s` left that list with
+/// #2847: the slurped array is indexed and `.` forwards the cursor, so it
+/// echoes the raw bytes like the default route -- asserted below.
 #[test]
 fn test_materializing_route_raises_on_colliding_decode_failure_keys_1642() -> Result<()> {
     let dup_doc = r#"{"\ud800":1,"\ud800":2}"#;
 
-    for args in [&["-Sc", "."][..], &["-c", "-s", "."][..]] {
-        let (out, err, code) = run_jq_full(args, Some(dup_doc))?;
-        assert_ne!(
-            code, 0,
-            "args {args:?} should raise rather than silently drop a value, out: {out:?}"
-        );
-        assert!(err.contains("ambiguous"), "args {args:?}, stderr: {err}");
-    }
+    let (out, err, code) = run_jq_full(&["-Sc", "."], Some(dup_doc))?;
+    assert_ne!(
+        code, 0,
+        "`-Sc .` should raise rather than silently drop a value, out: {out:?}"
+    );
+    assert!(err.contains("ambiguous"), "`-Sc .` stderr: {err}");
+
+    // #2847: `-s .` echoes the slurped document's own bytes, with nothing
+    // dropped and nothing raised, the same way the default route echoes `.`.
+    let (out, err, code) = run_jq_full(&["-c", "-s", "."], Some(dup_doc))?;
+    assert_eq!(code, 0, "`-s .` stderr: {err}");
+    assert_eq!(out, format!("[{dup_doc}]\n"));
 
     // #2103: `.,.` streams the root cursor straight to the printer, so it
     // echoes the document's own bytes twice at exit 0 -- no map, no
@@ -6320,24 +6326,24 @@ fn test_type_raises_on_malformed_keyword_instead_of_error_name_3035() -> Result<
     Ok(())
 }
 
-/// #2103 (code review) / #2662: the decision that a filter validates only
-/// what it reads is a property of the M2 route, and the M2 route was not
-/// the only one -- `-S`, `-a`, `-s`, `-C` and the `-n`/`input` bridge all
+/// #2103 (code review) / #2662 / #2847: the decision that a filter validates
+/// only what it reads is a property of the M2 route, and the M2 route was
+/// not the only one -- `-S`, `-a`, `-s`, `-C` and the `-n`/`input` bridge all
 /// went through `evaluate_input_streaming`, which materialized the whole
 /// input into an `OwnedValue` *before* evaluating, so `1+1` on a malformed
 /// document exited 5 on every one of them where the default route already
 /// answered `2`. #2662 closed that gap for `-S`/`-a`/`-C` (moved onto the
-/// same lazy route the default already used) but deliberately left `-s`
-/// and `-n`/`input` materializing -- `-s` needs a real offset-mapping
-/// redesign (tracked, not yet done) and `input` must hand the evaluator a
+/// same lazy route the default already used), and #2847 for `-s` (one
+/// synthesized `[v1,v2,...]` buffer indexed by that same route). `-n`/`input`
+/// stays materializing, and correctly: `input` must hand the evaluator a
 /// value it can return from a builtin, which requires materializing by
 /// construction (#2662's own triage, not an oversight). `-e` streams like
 /// the default but materializes each *output* to decide the exit status,
 /// so `-e '.,.'` on the colliding-key document still raises where `-c
 /// '.,.'` echoes -- unchanged by #2662, `-e` was never one of the flags
-/// moved. Every exit-5 row here matches jq 1.7.1's own parse-time
-/// rejection; the exit-0 rows for `-s`/`-n` are the recorded, still-open
-/// #2103 divergence for those two routes specifically now.
+/// moved. jq 1.7.1 rejects these documents at parse time on every route
+/// (exit 5); the exit-0 rows are the recorded #2103 divergence, still open
+/// for `-n`/`input` only.
 #[test]
 fn test_materializing_flag_routes_still_validate_2103() -> Result<()> {
     let structural = r#"{123:1,"b":2}"#;
@@ -6376,11 +6382,15 @@ fn test_materializing_flag_routes_still_validate_2103() -> Result<()> {
                 );
             }
 
-            // `-s` still materializes -- unmoved by #2662, see this test's
-            // own doc comment.
+            // #2847: `-s` moved onto the lazy route too -- the slurped array
+            // is indexed, not materialized, so `1+1` reads nothing of the
+            // malformed member and answers like the default route does.
             let (out, err, code) = run_jq_full(&["-sc", filter], Some(doc))?;
-            assert_eq!(code, 5, "-s {filter} on {doc}: out {out:?} stderr {err}");
-            assert!(out.is_empty(), "-s {filter} on {doc}: out {out:?}");
+            assert_eq!(
+                (out.as_str(), code),
+                ("2\n", 0),
+                "-s {filter} on {doc}: stderr {err}"
+            );
 
             // `-n`/`input` still materializes what it reads -- also
             // unmoved, and correctly so per #2662's own analysis (`input`
@@ -33383,13 +33393,24 @@ fn test_with_entries_entry_value_past_depth_limit_reports_cleanly_3261() -> Resu
 /// error instead of a panic.
 #[test]
 fn test_slurp_reports_clean_error_on_adversarial_nesting_1818() -> Result<()> {
+    // #2847: `--slurp` no longer reaches `validate_json_delimiters`' guard --
+    // it indexes the input like the default route. What this test exists to
+    // pin still holds: an over-deep document ends in a clean error, never a
+    // panic. The error is now the default route's own identity ceiling
+    // (#1819: `nesting depth exceeds limit of 384`, exit 1), the same answer
+    // `-c .` gives for the same document.
     let input = nested_arrays(500);
     let (stdout, stderr, code) = run_jq_full(&["-c", "--slurp", "."], Some(&input))?;
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(code, 1, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(stdout.is_empty(), "stdout: {stdout:?}");
     assert!(
-        stderr.contains("nesting depth exceeds limit of 256"),
+        stderr.contains("nesting depth exceeds limit of 384"),
         "stderr: {stderr:?}"
     );
+    assert!(!stderr.contains("panicked"), "stderr: {stderr:?}");
+    let (_, default_err, default_code) = run_jq_full(&["-c", "."], Some(&input))?;
+    assert_eq!(default_code, code, "the default route's own answer");
+    assert!(default_err.contains("nesting depth exceeds limit of 384"));
     Ok(())
 }
 
@@ -33480,13 +33501,27 @@ fn test_slurp_accepts_nesting_under_limit_1818() -> Result<()> {
 #[test]
 fn test_slurp_output_materialization_reports_clean_error_past_the_wrap_boundary_2299() -> Result<()>
 {
+    // #2847: the slurped array is indexed, not materialized, so the wrap
+    // level that used to land on `to_owned`'s ceiling is just one more level
+    // for the printer, whose own ceiling is 384 (#1819). 255 + 1 prints --
+    // jq itself accepts 256 -- and what this test exists to pin (no panic
+    // past the wrap boundary) holds trivially.
     let input = nested_arrays(255);
     let (stdout, stderr, code) = run_jq_full(&["-c", "--slurp", "."], Some(&input))?;
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), format!("[{input}]"));
+    // The wrap level still counts against the printer's ceiling: a document
+    // at 383 prints bare but raises once the array wraps it to 384.
+    let input = nested_arrays(383);
+    let (_, bare_err, bare_code) = run_jq_full(&["-c", "."], Some(&input))?;
+    assert_eq!(bare_code, 0, "stderr: {bare_err:?}");
+    let (stdout, stderr, code) = run_jq_full(&["-c", "--slurp", "."], Some(&input))?;
+    assert_eq!(code, 1, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(
-        stderr.contains("nesting depth exceeds limit of 256"),
+        stderr.contains("nesting depth exceeds limit of 384"),
         "stderr: {stderr:?}"
     );
+    assert!(!stderr.contains("panicked"), "stderr: {stderr:?}");
     Ok(())
 }
 
@@ -74983,13 +75018,17 @@ fn test_closed_terms_do_not_validate_2173() -> Result<()> {
         let (_out, err, code) = run_jq_full(&["-c", filter], Some(collision))?;
         assert_eq!(code, 0, "`{filter}` on the collision doc, stderr: {err}");
     }
-    // ... and the materializing routes on that same document still do raise
+    // ... and the materializing route on that same document still does raise
     // the collision, which is what keeps the pair above meaningful.
-    for args in [["-Sc", "."], ["-sc", "."]] {
-        let (_out, err, code) = run_jq_full(&args, Some(collision))?;
-        assert_eq!(code, 5, "`{args:?}` on the collision doc must still raise");
-        assert!(err.contains("ambiguous"), "`{args:?}` stderr: {err}");
-    }
+    let (_out, err, code) = run_jq_full(&["-Sc", "."], Some(collision))?;
+    assert_eq!(code, 5, "`-Sc .` on the collision doc must still raise");
+    assert!(err.contains("ambiguous"), "`-Sc .` stderr: {err}");
+    // `-s` left that list with #2847: the slurped array is indexed, and `.`
+    // forwards the cursor to the printer, so it echoes the document's own
+    // bytes inside the array exactly as the default route echoes them bare.
+    let (out, err, code) = run_jq_full(&["-sc", "."], Some(collision))?;
+    assert_eq!(code, 0, "`-sc .` on the collision doc, stderr: {err}");
+    assert_eq!(out, format!("[{collision}]\n"));
     Ok(())
 }
 
@@ -87955,11 +87994,12 @@ fn test_preserve_vs_reformat_axis_across_every_output_flag_2874() -> Result<()> 
 /// **This test pins a known gap, not the intended behaviour.** Writing it
 /// is what found the gap: `--preserve-input` keeps duplicates only on the
 /// cursor-streaming routes (`-c`, `-S -c`, pretty). The materializing ones
-/// (`-a`, `-s`/`--slurp`, `-C`) collapse them regardless -- the exact
+/// (`-a`, `-C`) collapse them regardless -- the exact
 /// counterpart, for the duplicate-key half of the bundle, of the
 /// number-spelling gap #2852 closed for those same routes. Verified
 /// pre-existing against the pre-refactor binary (identical on every row
-/// here), so #2874 neither caused nor fixed it; filed as #2986.
+/// here), so #2874 neither caused nor fixed it; filed as #2986. `-s`/`--slurp`
+/// left that list with #2847, which moved it onto the cursor-streaming route.
 #[test]
 fn test_duplicate_key_axis_follows_the_same_convention_2874() -> Result<()> {
     let input = r#"{"a":1,"a":2,"b":3}"#;
@@ -87978,7 +88018,8 @@ fn test_duplicate_key_axis_follows_the_same_convention_2874() -> Result<()> {
 
     // `--preserve-input` keeps both occurrences on the cursor-streaming
     // routes ...
-    for extra in [vec!["-c"], vec!["-c", "-S"], vec![]] {
+    // (`--slurp` among them since #2847) ...
+    for extra in [vec!["-c"], vec!["-c", "-S"], vec![], vec!["-c", "--slurp"]] {
         let mut args = extra.clone();
         args.push("--preserve-input");
         let (out, code) = run_jq_stdin(".", input, &args)?;
@@ -87990,16 +88031,13 @@ fn test_duplicate_key_axis_follows_the_same_convention_2874() -> Result<()> {
     }
 
     // ... and loses them on the materializing ones (#2986, pre-existing).
-    for extra in [vec!["-c", "-a"], vec!["-c", "--slurp"]] {
-        let mut args = extra.clone();
-        args.push("--preserve-input");
-        let (out, code) = run_jq_stdin(".", input, &args)?;
-        assert_eq!(code, 0, "args={args:?}");
-        assert!(
-            !out.contains(r#""a":1"#),
-            "args={args:?}: #2986 is fixed -- update this test's expectation, got {out:?}"
-        );
-    }
+    let args = ["-c", "-a", "--preserve-input"];
+    let (out, code) = run_jq_stdin(".", input, &args)?;
+    assert_eq!(code, 0, "args={args:?}");
+    assert!(
+        !out.contains(r#""a":1"#),
+        "args={args:?}: #2986 is fixed -- update this test's expectation, got {out:?}"
+    );
 
     Ok(())
 }
@@ -89646,7 +89684,9 @@ fn test_malformed_number_route_sweep_3222() -> Result<()> {
 /// that navigates past it or wraps it in a one-stream array (`[.]`, `[.b]`,
 /// `[.[] | .]`), but every other construction (a comma or nested array, an
 /// object, a bind) materializes it and raises, and so does any filter once an
-/// input builtin or `-s` makes the CLI materialize the whole input. The split
+/// input builtin makes the CLI materialize the whole input. (`-s` no longer
+/// does, since #2847: it reads the slurped array the way the default route
+/// reads a document, so its rows answer as the `-c` rows do.) The split
 /// is accepted (#3427), recorded in `docs/compliance/jq/limitations.md` ("An
 /// unreadable value is validated where something reads it, not where it is
 /// wrapped"); the library entry `succinctly::jq::eval` gives the same answers
@@ -89712,7 +89752,10 @@ fn test_unreadable_value_collection_split_3266() -> Result<()> {
         (&["-c"], OBJ, ".[0] | [.b // 1] | length", "1\n", 0),
         (&["-c"], OBJ, ".[0] | [try .b] | length", "1\n", 0),
         (&["-c"], OBJ, ".[0] | path(.a), input_line_number", "", 5),
-        (&["-c", "-s"], OBJ, ".[0][0] | path(.a)", "", 5),
+        // #2847: `-s` is the default route's own reads over one more array
+        // level, so the same split holds: `path(.a)` answers, a comma raises.
+        (&["-c", "-s"], OBJ, ".[0][0] | path(.a)", "[\"a\"]\n", 0),
+        (&["-c", "-s"], OBJ, ".[0][0] | [.a, .b] | length", "", 5),
     ];
     for &(flags, doc, filter, stdout, code) in rows {
         let args: Vec<&str> = flags.iter().copied().chain([filter]).collect();
@@ -110417,4 +110460,366 @@ fn test_destructuring_alt_bind_writes_and_a_retry_resumes_from_null_3859() -> Re
             0,
         ),
     ])
+}
+
+// #2847: `-s`/`--slurp` on ordinary JSON input indexes one synthesized
+// `[v1,v2,...]` buffer on the lazy route instead of materializing every
+// document into a `Vec<OwnedValue>` first. These pin what must *not* change
+// (output, the `(at ...)` marker, `input_filename`, the splitter's
+// all-or-nothing failures, `--validate`) and the one thing that must: a
+// malformed member nobody reads no longer fails the run.
+
+/// Output a user can see is unchanged by the route move. Every row is the
+/// pinned jq 1.7.1 binary's own answer for the same argv, so a regression
+/// here is a disagreement with jq, not with an earlier build.
+#[test]
+fn test_slurp_output_matches_jq_on_the_lazy_route_2847() -> Result<()> {
+    let rows: &[(&str, &[&str], &str)] = &[
+        (
+            r#"{"a":1} {"b":2}"#,
+            &["-sc", "."],
+            "[{\"a\":1},{\"b\":2}]\n",
+        ),
+        // Nothing to slurp is `[]`, not an error and not `null`.
+        ("", &["-sc", "."], "[]\n"),
+        ("", &["-s", "."], "[]\n"),
+        // Number spellings survive the join byte for byte, and jq's own
+        // leniencies (`007`, `.5`) are read the way a root-level one is.
+        ("1.10 4E+4 007 .5", &["-sc", "."], "[1.10,4E+4,7,0.5]\n"),
+        (
+            r#"{"a":[1,2]} 3"#,
+            &["-s", "."],
+            "[\n  {\n    \"a\": [\n      1,\n      2\n    ]\n  },\n  3\n]\n",
+        ),
+        ("[1,2] [3]", &["-sc", "map(length)"], "[2,1]\n"),
+        (r#""a" "b""#, &["-sr", ".[]"], "a\nb\n"),
+        (r#"{"b":1,"a":2}"#, &["-sSc", "."], "[{\"a\":2,\"b\":1}]\n"),
+        ("\"\u{e9}\"", &["-sac", "."], "[\"\\u00e9\"]\n"),
+        // Top-level values need no separator between them, so the join
+        // cannot reuse the source's own whitespace for its commas.
+        (
+            r#"{}{}[][]"a""b" 1 2"#,
+            &["-sc", "."],
+            "[{},{},[],[],\"a\",\"b\",1,2]\n",
+        ),
+        (
+            "{ \"a\" : 1 }\n\n[ 1 , 2 ]\n",
+            &["-sc", "."],
+            "[{\"a\":1},[1,2]]\n",
+        ),
+        ("1 2 3", &["-sc", "add"], "6\n"),
+        ("1 2 3", &["-sc", "length"], "3\n"),
+        ("{\"a\":1}\n{\"a\":2}\n", &["-sc", "map(.a)"], "[1,2]\n"),
+        (
+            r#"{"users":[{"n":"x"}]}"#,
+            &["-sc", ".[0].users[0].n"],
+            "\"x\"\n",
+        ),
+        (
+            "1 2",
+            &["-sc", "--arg", "v", "z", "[$v, .[0]]"],
+            "[\"z\",1]\n",
+        ),
+        (
+            r#""\u00e9" "\ud83d\ude00""#,
+            &["-sc", "."],
+            "[\"\u{e9}\",\"\u{1f600}\"]\n",
+        ),
+    ];
+    for (stdin, args, want) in rows {
+        let (out, err, code) = run_jq_full(args, Some(stdin))?;
+        assert_eq!(
+            (out.as_str(), code),
+            (*want, 0),
+            "{args:?} on {stdin:?}: stderr {err}"
+        );
+    }
+    Ok(())
+}
+
+/// The headline: the slurped array is indexed, so a filter that never reads
+/// a malformed member is not made to validate it (#2103's rule, now on `-s`
+/// too). `{123:1}`'s `.[0]` is the control: *reading* it still fails, in
+/// jq's diagnostic channel at exit 5, without printing anything.
+#[test]
+fn test_slurp_validates_only_what_the_filter_reads_2847() -> Result<()> {
+    // `concat!` keeps `{123:1}` from reading as a format argument to clippy.
+    let numeric_key = concat!("{", "123:1} 2");
+    for doc in [numeric_key, r#"2 {"a" 1}"#, r#"{"a":1,} [1,]"#] {
+        for filter in ["1+1", "length", "map(type) | length"] {
+            let (out, err, code) = run_jq_full(&["-sc", filter], Some(doc))?;
+            assert_eq!(
+                (out.as_str(), code),
+                ("2\n", 0),
+                "-sc {filter} on {doc}: stderr {err}"
+            );
+        }
+    }
+
+    // Reading the malformed member is still an error, on stdout nothing and
+    // in jq's channel -- not a panic and not `anyhow`'s `Error:` prefix.
+    let (out, err, code) = run_jq_full(&["-sc", ".[0]"], Some(numeric_key))?;
+    assert_eq!(code, 5, "out {out:?} stderr {err}");
+    assert!(out.is_empty(), "out {out:?}");
+    assert!(
+        err.starts_with("jq: error (at <stdin>:0): "),
+        "stderr: {err}"
+    );
+    assert!(!err.contains("panicked"), "stderr: {err}");
+
+    // A member the filter reads *after* a clean one prints the clean one
+    // first, as the default route does for a stream of documents.
+    let (out, err, code) = run_jq_full(&["-sc", ".[]"], Some(concat!("1 {", "123:1}")))?;
+    assert_eq!((out.as_str(), code), ("1\n", 5), "stderr {err}");
+    Ok(())
+}
+
+/// What the splitter cannot delimit is still all-or-nothing under `-s`: no
+/// stdout, exit 5, `Invalid JSON text` at line 0 of the *first* file -- the
+/// shape `get_inputs` has always reported, which a malformed *member* (above)
+/// no longer shares.
+#[test]
+fn test_slurp_splitter_failures_stay_all_or_nothing_2847() -> Result<()> {
+    for doc in ["1 2 }", "[1,2", "1\n2\n{", "\"abc", "1 xyz", "\"a\tb\" 1"] {
+        for filter in [".", "1+1", "length"] {
+            let (out, err, code) = run_jq_full(&["-sc", filter], Some(doc))?;
+            assert_eq!(code, 5, "-sc {filter} on {doc:?}: out {out:?} stderr {err}");
+            assert!(out.is_empty(), "-sc {filter} on {doc:?}: out {out:?}");
+            assert_eq!(
+                err, "jq: error (at <stdin>:0): Invalid JSON text\n",
+                "-sc {filter} on {doc:?}"
+            );
+        }
+    }
+
+    // A later file's failure still discards the earlier files' values, and
+    // names the first file, as before.
+    let (out, err, code, paths) = run_jq_over_files(&["-sc", "."], &["1\n", "[1,2\n"])?;
+    assert_eq!(code, 5, "out {out:?} stderr {err}");
+    assert!(out.is_empty(), "out {out:?}");
+    assert_eq!(
+        err,
+        format!("jq: error (at {}:0): Invalid JSON text\n", paths[0])
+    );
+    Ok(())
+}
+
+/// Files join in command-line order, and a diagnostic (and `input_filename`)
+/// answers for the *last* file at its own newline count -- the location jq
+/// gives a value slurped out of the whole stream (#1520). All of these are
+/// jq 1.7.1's own output.
+#[test]
+fn test_slurp_multiple_files_keep_order_and_last_file_location_2847() -> Result<()> {
+    let (out, err, code, _) = run_jq_over_files(&["-sc", "."], &["1\n", "2 3\n", "[4]\n"])?;
+    assert_eq!((out.as_str(), code), ("[1,2,3,[4]]\n", 0), "stderr {err}");
+
+    // Empty files in the middle and at the ends contribute nothing, and
+    // never a stray comma.
+    let (out, err, code, _) = run_jq_over_files(&["-sc", "."], &["", "1", "", "2\n", ""])?;
+    assert_eq!((out.as_str(), code), ("[1,2]\n", 0), "stderr {err}");
+
+    let (out, err, code, paths) =
+        run_jq_over_files(&["-sc", "input_filename"], &["1\n", "2 3\n", "[4]\n"])?;
+    assert_eq!(code, 0, "stderr {err}");
+    assert_eq!(out, format!("{:?}\n", paths[2]));
+
+    let (out, err, code, paths) =
+        run_jq_over_files(&["-sc", r#"error("x")"#], &["1\n", "2 3\n", "[4]\n"])?;
+    assert_eq!(code, 5, "out {out:?}");
+    assert_eq!(err, format!("jq: error (at {}:1): x\n", paths[2]));
+
+    // No trailing newline in the last file: line 0, not 1.
+    let (_, err, code, paths) = run_jq_over_files(&["-sc", r#"error("x")"#], &["1\n", "2"])?;
+    assert_eq!(code, 5);
+    assert_eq!(err, format!("jq: error (at {}:0): x\n", paths[1]));
+
+    // A malformed member read lazily is reported at the slurped value's
+    // location, which is the *last* file even when the member is in an
+    // earlier one (jq fails at parse time instead, with no file at all).
+    let (out, err, code, paths) =
+        run_jq_over_files(&["-sc", ".[0]"], &[concat!("{", "123:1}\n"), "2\n"])?;
+    assert_eq!(code, 5, "out {out:?}");
+    assert!(out.is_empty(), "out {out:?}");
+    assert!(
+        err.starts_with(&format!("jq: error (at {}:1): ", paths[1])),
+        "stderr: {err}"
+    );
+
+    // stdin: one newline per value here.
+    let (_, err, code) = run_jq_full(&["-sc", r#"error("x")"#], Some("1\n2\n"))?;
+    assert_eq!(code, 5);
+    assert_eq!(err, "jq: error (at <stdin>:2): x\n");
+    Ok(())
+}
+
+/// `--validate` still checks each file's own bytes, in order, before
+/// anything is slurped: a later bad file is exit 3 with nothing printed, and
+/// a clean run is unaffected.
+#[test]
+fn test_slurp_validate_checks_each_file_first_2847() -> Result<()> {
+    let (out, err, code, _) =
+        run_jq_over_files(&["--validate", "-sc", "."], &["1\n", "{\"a\":1,}\n"])?;
+    assert_eq!(code, 3, "out {out:?} stderr {err}");
+    assert!(out.is_empty(), "out {out:?}");
+    assert!(err.contains("validation error"), "stderr: {err}");
+
+    let (out, err, code, _) =
+        run_jq_over_files(&["--validate", "-sc", "."], &["1\n", "{\"a\":1}\n"])?;
+    assert_eq!((out.as_str(), code), ("[1,{\"a\":1}]\n", 0), "stderr {err}");
+    Ok(())
+}
+
+/// `-e` reads the slurped array's truthiness like any other output.
+#[test]
+fn test_slurp_exit_status_2847() -> Result<()> {
+    for (stdin, filter, want_out, want_code) in [
+        ("null", ".[0]", "null\n", 1),
+        ("", ".[0]", "null\n", 1),
+        ("1 2", ".[0]", "1\n", 0),
+        ("false", ".[0]", "false\n", 1),
+    ] {
+        let (out, err, code) = run_jq_full(&["-sec", filter], Some(stdin))?;
+        assert_eq!(
+            (out.as_str(), code),
+            (want_out, want_code),
+            "-sec {filter} on {stdin:?}: stderr {err}"
+        );
+    }
+    Ok(())
+}
+
+/// `--preserve-input` is the one flag whose output moves, and only because
+/// the lazy route is the one that honors it: it echoes each value's source
+/// spelling (whitespace, escapes, duplicate keys) the way the default route
+/// already does for `.`. There is no jq oracle for the flag; this pins the
+/// route-consistent behavior, and the second assertion pins that the default
+/// route echoes the same bytes, so the two cannot drift apart silently.
+#[test]
+fn test_slurp_preserve_input_echoes_source_spelling_like_the_default_route_2847() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &["--preserve-input", "-sc", "."],
+        Some(r#"{ "a" : 1.50 } [ 1 ]"#),
+    )?;
+    assert_eq!(
+        (out.as_str(), code),
+        ("[{ \"a\" : 1.50 },[ 1 ]]\n", 0),
+        "stderr {err}"
+    );
+    let (out, _, code) = run_jq_full(&["--preserve-input", "-c", "."], Some(r#"{ "a" : 1.50 }"#))?;
+    assert_eq!((out.as_str(), code), ("{ \"a\" : 1.50 }\n", 0));
+    Ok(())
+}
+
+/// The synthesized `[` adds one level around every document, so a document
+/// at jq's own parse limit (256) must still read, and one past it is accepted
+/// by the index the way the default route accepts it (jq rejects it at parse
+/// time; the lazy route's own, recorded depth guard only fires when a value
+/// is materialized, #1793).
+#[test]
+fn test_slurp_wrapper_level_does_not_reject_a_document_at_jq_depth_limit_2847() -> Result<()> {
+    for depth in [255usize, 256, 257, 300] {
+        let doc = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+        let (out, err, code) = run_jq_full(&["-sc", "length"], Some(&doc))?;
+        assert_eq!(
+            (out.as_str(), code),
+            ("1\n", 0),
+            "depth {depth}: stderr {err}"
+        );
+    }
+    // Printing the whole 256-deep document works: it is within jq's own limit.
+    let doc = format!("{}{}", "[".repeat(256), "]".repeat(256));
+    let (out, err, code) = run_jq_full(&["-sc", "."], Some(&doc))?;
+    assert_eq!(code, 0, "stderr {err}");
+    assert_eq!(out, format!("[{}{}]\n", "[".repeat(256), "]".repeat(256)));
+    Ok(())
+}
+
+/// `-s` combined with an input builtin, or with `--seq`, still materializes
+/// every document (#2847 moved plain `-s` off that route, so these rows are
+/// what keeps the route's own `-s` handling pinned): the stream's failures
+/// come out in jq's channel at exit 5, a file it cannot open at exit 2, and
+/// `--validate` at exit 3, all before anything is evaluated.
+#[test]
+fn test_slurp_with_an_input_builtin_still_reports_the_materializing_route_failures_2847(
+) -> Result<()> {
+    // A document the splitter or the delimiter walk rejects fails the whole
+    // slurped stream, `input?` or not. Every row is exit 5 in jq 1.7.1 too.
+    for (stdin, want) in [
+        ("1 [", "Invalid JSON text"),
+        ("[1 2]", "expected ',' or ']', found '2'"),
+        ("[1,]", "Invalid JSON text"),
+        ("{\"a\" 1}", "expected ':', found '1'"),
+        ("{\"a\":1 \"b\":2}", "Invalid JSON text"),
+    ] {
+        let (out, err, code) = run_jq_full(&["-s", "-c", "input?"], Some(stdin))?;
+        assert_eq!(code, 5, "{stdin:?}: out {out:?} stderr {err}");
+        assert!(out.is_empty(), "{stdin:?}: out {out:?}");
+        assert!(err.contains(want), "{stdin:?}: stderr {err}");
+    }
+
+    // A file that cannot be opened is jq's usage error, not a data error.
+    let missing = tempfile::tempdir()?.path().join("missing.json");
+    let missing = missing.to_string_lossy().into_owned();
+    let (out, err, code) = run_jq_full(&["-s", "-c", "input?", &missing], None)?;
+    assert_eq!(code, 2, "out {out:?} stderr {err}");
+    assert!(err.contains("Could not open file"), "stderr: {err}");
+
+    // `--validate` checks each file's own bytes first, including a file that
+    // is not UTF-8 at all, which plain `-s` would have substituted.
+    for body in [&b"{\"a\" 1}"[..], &b"\xff[1]"[..]] {
+        let (out, err, code, _) =
+            run_jq_over_byte_files(&["--validate", "-s", "-c", "input?"], &[body])?;
+        assert_eq!(code, 3, "{body:?}: out {out:?} stderr {err}");
+        assert!(err.contains("validation error"), "{body:?}: stderr {err}");
+    }
+
+    // Without `--validate` the same bytes are substituted, so a non-UTF-8
+    // document reaches the parser as U+FFFD text and fails there instead.
+    let (out, err, code, _) = run_jq_over_byte_files(&["-s", "-c", "input?"], &[b"\xff[1]"])?;
+    assert_eq!(code, 5, "out {out:?} stderr {err}");
+    assert!(!err.contains("validation error"), "stderr: {err}");
+    Ok(())
+}
+
+/// `--seq` keeps `-s` on the materializing route (its output is RS-prefixed), so the slurped array and
+/// an object root both reach the writer's lazy shapes (`keys`, `map`) through
+/// `materialize_stream_item`, and an array one level past the evaluator's
+/// ceiling is reported cleanly instead of panicking (#2299). The last row is
+/// a recorded divergence (jq 1.7.1 prints the 257-deep array): the ceiling is
+/// `MAX_NESTING_DEPTH`, which the lazy route's own printer limit does not share.
+#[test]
+fn test_seq_slurp_materializes_lazy_results_and_the_wrap_boundary_2847() -> Result<()> {
+    for (stdin, args, want) in [
+        (
+            "\x1e{\"b\":1,\"a\":2}\n",
+            &["--seq", "-c", "keys"][..],
+            "\x1e[\"a\",\"b\"]\n",
+        ),
+        (
+            "\x1e{\"b\":1,\"a\":2}\n",
+            &["--seq", "-s", "-c", ".[0] | keys"][..],
+            "\x1e[\"a\",\"b\"]\n",
+        ),
+        (
+            "\x1e1\n\x1e2\n",
+            &["--seq", "-s", "-c", "map(.+1)"][..],
+            "\x1e[2,3]\n",
+        ),
+    ] {
+        let (out, err, code) = run_jq_full(args, Some(stdin))?;
+        assert_eq!((out.as_str(), code), (want, 0), "{args:?}: stderr {err}");
+    }
+
+    // 256 empty arrays: the reader accepts it, and the slurp wrapper is the
+    // 257th level.
+    let doc = format!("\x1e{}{}\n", "[".repeat(256), "]".repeat(256));
+    let (out, err, code) = run_jq_full(&["--seq", "-s", "-c", "."], Some(&doc))?;
+    assert_eq!(code, 5, "out {out:?} stderr {err}");
+    assert!(out.is_empty(), "out {out:?}");
+    assert!(
+        err.contains("nesting depth exceeds limit of 256"),
+        "stderr: {err}"
+    );
+    assert!(!err.contains("panicked"), "stderr: {err}");
+    Ok(())
 }

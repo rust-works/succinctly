@@ -7131,9 +7131,10 @@ value sits on one line (`1\n2 }\n\n\n` → line 2); for a malformed value spanni
 jq names wherever its parser gave up inside it, and for one cut off at end of input
 `<unknown>`, where succinctly still names the end of its first line.
 
-**The materializing flag routes still validate whatever the filter — down to `-s` and
-`-n`/`input` now, closed by [#2662](https://github.com/rust-works/succinctly/issues/2662)
-for `-S`/`-a`/`-C`.** `-S` (sort keys), `-a` (ASCII output) and `-C` (color) used to force
+**The materializing flag routes still validate whatever the filter — down to `-n`/`input`
+now, closed by [#2662](https://github.com/rust-works/succinctly/issues/2662) for
+`-S`/`-a`/`-C` and by [#2847](https://github.com/rust-works/succinctly/issues/2847) for
+`-s`.** `-S` (sort keys), `-a` (ASCII output) and `-C` (color) used to force
 `evaluate_input_streaming`, which materializes the whole input into an `OwnedValue` *before*
 evaluating — so `1+1` on `{123:1,"b":2}` exited 5 under any of them where the default route
 already answered `2`, purely because those routes materialized the input for historical
@@ -7159,15 +7160,72 @@ document read via the `input`/`inputs` builtin itself was never affected, since 
 from an already-materialized queue that never reaches either `to_json` variant. A new
 `to_json_jq_preserve()` (the jq-mode sibling of the existing yq-mode `to_json_yq()`) closes
 that half.)
-`-s` (slurp) and the `-n`/`input` bridge stay materializing — `-s` needs a real
-offset-mapping redesign to slurp without building a DOM (tracked, not done), and `input`
-must hand the evaluator an owned value it can return from a builtin by construction, so
-validating what it materializes there is the rule working as intended, not an accident left
-to close. `-e` streams like the default but materializes each *output* to decide the exit
+The `-n`/`input` bridge stays materializing — `input` must hand the evaluator an owned
+value it can return from a builtin by construction, so validating what it materializes there
+is the rule working as intended, not an accident left to close. (`-s` was the other route
+left behind here; #2847's paragraph just below moves it.) `-e` streams like the default but materializes each *output* to decide the exit
 status, so `-e '.,.'` on `{"\ud800":1,"\ud800":2}` still raises the collision where `-c
 '.,.'` echoes — unaffected by this change, `-e` was never one of the routes being moved.
 Pinned by `test_materializing_flag_routes_still_validate_2103` (rewritten for the new
-`-S`/`-a`/`-C` behavior, `-s`/`-n` rows unchanged).
+`-S`/`-a`/`-C` behavior, then for `-s`; the `-n` rows are unchanged).
+
+**`-s`/`--slurp` indexes instead of materializing — closed by
+[#2847](https://github.com/rust-works/succinctly/issues/2847).** `-s` used to build the whole
+`Vec<OwnedValue>` before the filter ran, so `-sc '1+1'` on `{123:1} 2` exited 5 where the
+default route answers `2`, and paid a DOM for it (peak RSS on a 5.7 MB `users` document,
+release, M-series: 140 MB for `-sc '1+1'`, 185 MB for `-sc .`). It now splits each file with
+the same scanner the default route uses, joins the values as `[` + each value's own bytes
+joined by `,` + `]` into one buffer, and runs the ordinary lazy route over that one document
+(`slurp_documents`), so the filter reads from an index: **21 MB** for `-sc '1+1'` and for
+`-sc .` on the same file (the default route's own figure is 15.5 MB; the difference is the
+joined copy), and 5-16x less wall time, growing with the input (a 14 MB document: 341 → 40 MB,
+`-sc '1+1'` 459 → 28 ms). Only plain `-s` on JSON input moved: `-R -s`, `--seq -s`, DSV `-s`,
+`-n -s` and any filter using `input`/`inputs` keep the materializing route.
+
+What this changes, all of it the #2103 rule applied to `-s` (a filter validates what it
+reads) plus two consequences of the route:
+
+- A malformed *member* is reported only if the filter reads it. `-sc '1+1'`, `-sc length` and
+  `-sc 'map(type)'` on `{123:1} 2` answer at exit 0; `-sc '.[0]'` still exits 5 with nothing
+  printed, and `-sc '.[]'` on `1 {123:1}` prints `1` and then exits 5, as the default route
+  does for a stream of documents. The error is the lazy route's own diagnostic, at the
+  slurped value's location (the last file's EOF line, as every other `-s` error, **even when
+  the member lives in an earlier file**: `-sc '.[0]' bad.json ok.json` names `ok.json`), where
+  it used to be the document parser's at `<file>:0`. jq itself has no per-member position
+  here: it fails at parse time, with no file in its message.
+- What the splitter cannot delimit is **unchanged** and still all-or-nothing under `-s` — a
+  truncated container or string, a byte that starts no token, a raw control character in a
+  string — and `--validate` still checks each file in order first. `1 2 }` and `[1,2` exit 5
+  with no output and `Invalid JSON text` at line 0 of the first file, exactly as before.
+  jq's own text for these (`jq: parse error: Unfinished JSON term at EOF at line 3, column 0`)
+  was never reproduced on this route and still is not.
+- A value jq rejects as undecodable (`"\ud800"`, `"\x"`) is echoed raw, as on the default
+  route ([`docs/plan/decode-failure-routing.md`](../../plan/decode-failure-routing.md)), where
+  `-s` used to refuse the whole run. `{"\ud800":1}` under `-s` also stops printing the
+  garbled `"\\ud800"` key the old route produced.
+- Nesting depth now follows the default route. A document of 257 or more levels (jq rejects
+  it at parse time, exit 5) is accepted under `-s` and read by any filter that does not
+  materialize it. *Printing* it is bounded by the printer's own ceiling of 384 levels, and the
+  slurp array is one of them: a 383-level document prints bare but not under `-s`, where `.`
+  fails with `nesting depth exceeds limit of 384` at exit 1, the answer the default route
+  gives a 384-level document (#1819). A document at jq's own limit of 256 now reads and prints
+  under `-s`, where the old route's extra array level pushed it over its own ceiling.
+- `--preserve-input -s` echoes each value's source spelling (whitespace, escapes, duplicate
+  keys, `nan`) the way that flag already does on the default route, where it used to print the
+  normalized value. There is no jq oracle for the flag.
+
+Everything else a user can see was checked against the old route and against jq 1.7.1:
+output bytes, number spellings, the `(at <file>:<line>)` marker for one file, two files and
+stdin, `input_filename`, `-e`, `-S`/`-a`/`-r`/`-j`/`--tab`, `--arg`, and multiple files in
+command-line order (a differential sweep of 3,602 documents x 24 filters, 86,448 rows: no
+panic, no timeout, no row that succeeded before and fails now; every difference is one of the
+classes above). Pinned by `test_slurp_output_matches_jq_on_the_lazy_route_2847`,
+`test_slurp_validates_only_what_the_filter_reads_2847`,
+`test_slurp_splitter_failures_stay_all_or_nothing_2847`,
+`test_slurp_multiple_files_keep_order_and_last_file_location_2847`,
+`test_slurp_validate_checks_each_file_first_2847`, `test_slurp_exit_status_2847`,
+`test_slurp_preserve_input_echoes_source_spelling_like_the_default_route_2847` and
+`test_slurp_wrapper_level_does_not_reject_a_document_at_jq_depth_limit_2847`.
 
 **`-a` wins over `-r`/`-j` for a *string* value — a real jq quirk, reproduced exactly.**
 Confirmed live against jq 1.7.1: `-acr '"café"'` prints `"café"`, quoted and ASCII-escaped,
@@ -7347,9 +7405,11 @@ baseline for both is a filter that already had a native arm.
 
 **What did not change.** A filter that reads `.` still materializes and still validates
 everything it materializes — `. as $x | $x`, `if . then . else . end`, `[.]`, `{k: .}`,
-`. and true`, `range(length; 3)`, and `.` itself all keep their exit 5. So do the
-materializing flag routes (`-S`, `-a`, `-s`, `-C`, `-n`), which never reach these sites and
-are #2662's. And a document whose *root* the reader cannot delimit at all — `xyz123`,
+`. and true`, `range(length; 3)`, and `.` itself all keep their exit 5. So did the
+materializing flag routes (`-S`, `-a`, `-s`, `-C`, `-n`) when this was written: they never
+reached these sites. #2662 (`-S`/`-a`/`-C`) and #2847 (`-s`) have since moved onto the lazy
+route these entries describe, and only `-n`/`input` still validates whatever it materializes.
+And a document whose *root* the reader cannot delimit at all — `xyz123`,
 `[1,2`, `["a`, `[1] x` — still fails for every filter including `empty`, because there is
 no value to skip reading; that is the reader, not a filter, and it matches jq.
 
