@@ -55295,17 +55295,14 @@ fn reduce_is_demand_forwarding_2899() -> Result<()> {
             "h".to_string(),
             3,
         ),
-        // #2163's synthetic-`null` INIT-fork divergence, which the per-fork
-        // source drive exposes on more spellings than before: jq's second
-        // fork iterates a synthetic `null`, the `?` swallows that error
-        // before `stderr` runs, so jq writes once; succinctly's second fork
-        // iterates the real document and writes again. Stdout and exit code
-        // agree. Pinned as *our* answer so a future #2163 fix trips here.
+        // #2163's synthetic-`null` INIT-fork rule (closed by #3895): jq's
+        // second fork iterates `null`, the `?` swallows that error before
+        // `stderr` runs, so jq writes once -- and so do we.
         (
             r#"{"a":1}"#,
             r"reduce ((.[]|stderr)?) as $x ((0,1); .)".to_string(),
             "0\n1\n".to_string(),
-            "11".to_string(),
+            "1".to_string(),
             0,
         ),
         // A plain (non-`?//`) source still cannot be stopped early by either
@@ -83468,6 +83465,124 @@ fn test_tracked_var_in_evaluator_routes_keep_accepting_3036() -> Result<()> {
     Ok(())
 }
 
+/// #3895: jq 1.7.1 evaluates a fold's SOURCE against `null` on every INIT fork
+/// after the first (`DUPN` leaves `null` in the slot the next fork resumes
+/// from), so a source that reads `.` sees the real input once and `null` after.
+/// A source that does not read `.` is unaffected.
+///
+/// Every row runs on both routes -- stdin through the generic evaluator and
+/// `-n 'input | ...'` through `eval.rs`'s owned fold -- and every expected value
+/// is captured from `/usr/bin/jq` 1.7.1 on `{"a":1}`. The `first(repeat(.))`
+/// rows reach the eager (unbounded-stream) drive, the `limit`/`first`/`isempty`
+/// rows the demand-driven one.
+#[test]
+fn test_fold_source_runs_against_null_after_first_init_fork_3895() -> Result<()> {
+    let rows = [
+        (r"[reduce (.) as $x ((.,.); $x)]", r#"[{"a":1},null]"#),
+        (r"[foreach (.) as $x ((.,.); $x; .)]", r#"[{"a":1},null]"#),
+        // The third fork is `null` too, not just the second.
+        (
+            r"[reduce (.,.) as $x ((.,.,.); $x)]",
+            r#"[{"a":1},null,null]"#,
+        ),
+        (
+            r"[foreach (.,.) as $x ((.,.); $x)]",
+            r#"[{"a":1},{"a":1},null,null]"#,
+        ),
+        (r"[reduce (.a, .a) as $x ((0,0); . + $x)]", "[2,0]"),
+        (
+            r"[foreach (.a) as $x ((0,0); . + $x; ., 10)]",
+            "[1,10,0,10]",
+        ),
+        (
+            r"[reduce (.a) as $x ((.,.); . + {n:$x})]",
+            r#"[{"a":1,"n":1},{"a":1,"n":null}]"#,
+        ),
+        (
+            r"[foreach (.,.) as $x ((.,.); $x; [., $x])]",
+            r#"[[{"a":1},{"a":1}],[{"a":1},{"a":1}],[null,null],[null,null]]"#,
+        ),
+        // The source's own generator and bind forms read `.` the same way.
+        (
+            r"[reduce (. as $y | $y) as $x ((.,.); $x)]",
+            r#"[{"a":1},null]"#,
+        ),
+        (r"[reduce (.[]?, .a?) as $x ((.,.); [$x])]", "[[1],[null]]"),
+        (r"[reduce (.) as {a:$a} ((.,.); $a)]", "[1,null]"),
+        (
+            r"def f: reduce (.) as $x ((.,.); $x); [f]",
+            r#"[{"a":1},null]"#,
+        ),
+        (r"[.[]? | reduce (.) as $x ((.,.); $x)]", "[1,null]"),
+        // A source that never reads `.` is unaffected.
+        (r"[reduce range(3) as $x ((0,1); . + $x)]", "[3,4]"),
+        (r"[foreach (1,2) as $x ((0,1); . + $x)]", "[1,3,2,4]"),
+        // A single INIT output has no later fork.
+        (r"[foreach (.) as $x (.; $x)]", r#"[{"a":1}]"#),
+        // A consumer that stops after the first fork never reaches the second;
+        // one that does not stop reaches it.
+        (r"[first(reduce (.) as $x ((.,.); $x))]", r#"[{"a":1}]"#),
+        (
+            r"[limit(2; reduce (.) as $x ((.,.); $x))]",
+            r#"[{"a":1},null]"#,
+        ),
+        (
+            r"[limit(2; foreach (.) as $x ((.,.); $x; .))]",
+            r#"[{"a":1},null]"#,
+        ),
+        (r"[isempty(reduce (.) as $x ((.,.); $x))]", "[false]"),
+        // The unbounded-stream fallback drives the same way.
+        (
+            r"[reduce (first(repeat(.))) as $x ((.,.); $x)]",
+            r#"[{"a":1},null]"#,
+        ),
+        (
+            r"[foreach (first(repeat(.))) as $x ((.,.); $x)]",
+            r#"[{"a":1},null]"#,
+        ),
+        (
+            r"[reduce (.) as $x ((first(repeat(.)),.); $x)]",
+            r#"[{"a":1},null]"#,
+        ),
+    ];
+    for (filter, want) in rows {
+        for (args, program) in [
+            (&["-c"][..], filter.to_string()),
+            (&["-n", "-c"][..], format!("input | {filter}")),
+        ] {
+            let mut argv: Vec<&str> = args.to_vec();
+            argv.push(&program);
+            let (stdout, stderr, code) = run_jq_full(&argv, Some(r#"{"a":1}"#))?;
+            assert_eq!(
+                (stdout.trim(), code),
+                (want, 0),
+                "#3895: `{program}` ({args:?}) must answer as jq 1.7.1 does; stderr={stderr:?}"
+            );
+        }
+    }
+    // The later fork's source raises, because `.[]` on `null` does.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "[reduce (.[]) as $x ((1,2); . + $x)]"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!((stdout.trim(), code), ("", 5), "{stderr:?}");
+    assert!(stderr.contains("Cannot iterate over null"), "{stderr:?}");
+    // Side effects in the source run once per fork, against that fork's input.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "[reduce (debug) as $x ((.,.); $x)]"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(
+        (stdout.trim(), stderr.trim(), code),
+        (
+            r#"[{"a":1},null]"#,
+            "[\"DEBUG:\",{\"a\":1}]\n[\"DEBUG:\",null]",
+            0
+        )
+    );
+    Ok(())
+}
+
 /// #3329: a fold's own loop variable used in path position inside its
 /// UPDATE or EXTRACT. jq's `$x` is the very `jv` the source yielded, so a
 /// write or `path()` through it succeeds exactly while the accumulator still
@@ -98156,35 +98271,39 @@ fn test_error_message_is_not_evaluated_past_its_first_output_in_yq_mode_3636() -
 
 /// #3293 slice 4 and #2163: a `?//` retry that supersedes a consumer's stop
 /// lets the fold go on to its next INIT fork, and there the source runs
-/// against the real `.` where jq gives it a synthetic `null` -- #2163's open
-/// divergence, reached through more shapes now that the retry is honoured
-/// (`docs/compliance/jq/limitations.md`). These pin *our* answers; jq 1.7.1's
-/// are `[1,3]`, `[[1]]`, and an `E2` error.
+/// against `null`, as jq's does (#3895 closed #2163's divergence here). The
+/// answers are jq 1.7.1's: `[1,3]`, `[[1]]`, and an `E2` error.
 #[test]
-fn test_fold_second_fork_source_reads_real_input_after_retry_2163_3293() -> Result<()> {
-    for (input, filter, expected) in [
+fn test_fold_second_fork_source_reads_null_after_retry_2163_3293() -> Result<()> {
+    for (input, filter, expected, want_code) in [
         (
             r#"{"starts":[0,100],"items":[{"a":1},{"a":2}]}"#,
             r"[first(foreach (.items[]? as {a: $v} ?// $v | $v | numbers) as $x (.starts[]; . + $x))]",
-            "[1,3,101,103]\n",
+            "[1,3]\n",
+            0,
         ),
         (
             "[[1]]",
             r"[first(foreach (. as [$a] ?// [[$b]] | $a // empty) as $x ((0,100); $x; .))]",
-            "[[1],[1]]\n",
+            "[[1]]\n",
+            0,
         ),
         (
             "[[1]]",
             r#"[reduce (. as [$a] ?// [[$b]] | $a | if . == null then error("E2") end) as $x (([1] as $a ?// $b | $a); .+1)]"#,
-            "[1]\n",
+            "",
+            5,
         ),
     ] {
         let (out, err, code) = run_jq_full(&["-c", "--", filter], Some(input))?;
         assert_eq!(
             (out.as_str(), code),
-            (expected, 0),
+            (expected, want_code),
             "`{filter}`: stderr {err:?}"
         );
+        if want_code != 0 {
+            assert!(err.contains("E2"), "`{filter}`: stderr {err:?}");
+        }
     }
     Ok(())
 }

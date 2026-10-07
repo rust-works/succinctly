@@ -11617,13 +11617,13 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                     )
                 },
                 optional,
-                &mut |per_element| {
-                    drive_foreach_expr_generic::<S, V>(
+                &mut |source_input, per_element| {
+                    drive_fold_source_generic::<S, V>(
                         input,
+                        source_input,
                         &value,
                         optional,
                         cursor,
-                        false,
                         per_element,
                     )
                 },
@@ -11696,13 +11696,13 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                     )
                 },
                 optional,
-                &mut |per_element| {
-                    drive_foreach_expr_generic::<S, V>(
+                &mut |source_input, per_element| {
+                    drive_fold_source_generic::<S, V>(
                         input,
+                        source_input,
                         &value,
                         optional,
                         cursor,
-                        false,
                         per_element,
                     )
                 },
@@ -13190,6 +13190,30 @@ fn drive_foreach_expr_generic<S: EvalSemantics, V: DocumentValue>(
     resume_from_escape(escape, flow)
 }
 
+/// A fold's SOURCE drive on the generic evaluator (#3895): the first INIT fork
+/// reads the fold's own input through [`drive_foreach_expr_generic`], every
+/// later one reads `null`, as jq 1.7.1 does. This route has no `null` of its
+/// own value type to hand `eval_each_generic`, so a later fork runs the
+/// as-written source against an owned `null` instead
+/// ([`crate::jq::eval::drive_source_against_null`]).
+fn drive_fold_source_generic<S: EvalSemantics, V: DocumentValue>(
+    source: &Expr,
+    source_input: crate::jq::eval::SourceInput,
+    value: &V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    per_item: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Flow {
+    match source_input {
+        crate::jq::eval::SourceInput::Real => {
+            drive_foreach_expr_generic::<S, V>(source, value, optional, cursor, false, per_item)
+        }
+        crate::jq::eval::SourceInput::Null => {
+            crate::jq::eval::drive_source_against_null::<S>(source, optional, per_item)
+        }
+    }
+}
+
 /// [`eval_each_generic`]'s `reduce` arm (#2899) -- `each_foreach_generic`'s
 /// twin over [`reduce_forks`].
 #[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors `each_foreach_generic`'s parameter list
@@ -13221,8 +13245,15 @@ fn each_reduce_generic<S: EvalSemantics, V: DocumentValue>(
             )
         },
         optional,
-        &mut |per_element| {
-            drive_foreach_expr_generic::<S, V>(input, &value, optional, cursor, false, per_element)
+        &mut |source_input, per_element| {
+            drive_fold_source_generic::<S, V>(
+                input,
+                source_input,
+                &value,
+                optional,
+                cursor,
+                per_element,
+            )
         },
         retry,
         &mut |v| sink.push(GenericItem::Owned(v)),
@@ -13277,8 +13308,15 @@ fn each_foreach_generic<S: EvalSemantics, V: DocumentValue>(
             )
         },
         optional,
-        &mut |per_element| {
-            drive_foreach_expr_generic::<S, V>(input, &value, optional, cursor, false, per_element)
+        &mut |source_input, per_element| {
+            drive_fold_source_generic::<S, V>(
+                input,
+                source_input,
+                &value,
+                optional,
+                cursor,
+                per_element,
+            )
         },
         retry,
         &mut |v| sink.push(GenericItem::Owned(v)),
