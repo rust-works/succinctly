@@ -1775,8 +1775,10 @@ is the revert that established what the other one costs.
    answers `["c"]` on both
    ([#3136](https://github.com/rust-works/succinctly/issues/3136)).
 
-   Nine rows stay refuse-only, each pinned in `test_path_bind_origin_matrix_refuse_only_2042`
-   (`src/jq/eval.rs`) and `scripts/jq-bind-origin-oracle-sweep.sh`'s own `REFUSE_ONLY` list:
+   Six rows stay refuse-only, each pinned in `test_path_bind_origin_matrix_refuse_only_2042`
+   (`src/jq/eval.rs`) and `scripts/jq-bind-origin-oracle-sweep.sh`'s own `REFUSE_ONLY` list
+   (the `select`-, `//`- and `if`-wrapped source rows moved to the accepting matrix in
+   [#3795](https://github.com/rust-works/succinctly/issues/3795)):
 
    #3049 moved `path(.a as $y | .a | tojson | fromjson | $y)` to the accepting
    matrix: `fromjson` does not navigate, so it can preserve the register for `$y`.
@@ -1811,9 +1813,6 @@ is the revert that established what the other one costs.
    | -------------------------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
    | `.a as $y \| path(.a \| $y)`                             | `["a"]`                     | value-mode binding — `eval_as` never resolves its source in path position; the *positional* half of #3037 (its root-of-invocation half is closed)                                                                                                          |
    | `path(.a as $y \| ([$y] \| .[0]) as $z \| .a \| $z)`     | `["a"]`                     | the source navigates inside a construction, which the resolver refuses where jq's suspended tracking allows it, so it falls back to a plain value                                                                         |
-   | `path((.a \| select(.b)) as $y \| .a \| $y)`             | `["a"]`                     | the witness grammar is pure navigation; a `select`-wrapped source binds by value                                                                                                                                          |
-   | `path((.a // 1) as $y \| .a \| $y)`                      | `["a"]`                     | same: a `//` source binds by value                                                                                                                                                                                        |
-   | `path((if .a then .a else .b end) as $y \| .a \| $y)`    | `["a"]`                     | same: an `if` source binds by value                                                                                                                                                                                       |
    | `path(.a as $q \| ([$q] \| .[0]?) as $y \| .a \| $y)`    | `["a"]`                     | a `?` after a construction: the resolver refuses the navigation of the rebuilt value and the `?` lets that refusal through to the by-value fallback, which binds a plain value (#3519)                                    |
    | `path(.a[0:3] as $y \| .a \| $y)` on `{"a":[1,2,3]}`     | `["a"]`                     | jq's full slice *is* the array; the bind path ends in a slice component and `.a` does not                                                                                                                                 |
    | `path(.a as $y \| (.c \| $y \| .b) as $w \| .a.b \| $w)` | `["a","b"]`                 | a marker is re-rooted only at the head of a source (`$y.b as $w`, `(($y \| .b) \| .c) as $w`); elsewhere it is certified against the ambient position                                                                     |
