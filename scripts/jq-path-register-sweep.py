@@ -32,10 +32,13 @@ candidate (main vs candidate).
   REFUSE_WRONG  jq succeeded, the build refused (safe direction)
   DIFF          both succeeded with different output, or both failed with
                 different exit codes
-  TIMEOUT       the build exceeded --timeout (an O(N^3) gate shows up here);
+  TIMEOUT       the build exceeded --timeout (an O(N^3) gate shows up here), or
+                printed more than OUTPUT_CAP bytes (killed there, #3893);
                 re-run serially once before it is believed, since a loaded
                 box can time out a row a quiet one answers
-  ORACLE_TIMEOUT  jq itself timed out: the row says nothing and is skipped
+  ORACLE_TIMEOUT  jq itself timed out, or never stopped printing (an operand
+                that is infinite on some input, `recurse(.a)?` on `null`): the
+                row says nothing and is skipped
 
 A row where the two sides both fail with the same exit code still needs the
 same stdout to be a MATCH: `path(...)` can print results before it errors.
@@ -88,10 +91,23 @@ import pathlib
 import random
 import subprocess
 import sys
+import threading
 import time
 
 ORACLE = "/usr/bin/jq"
 ORACLE_VERSION = "jq-1.7.1"
+
+# The most stdout one run may produce before it is killed and classed a timeout. A
+# real row prints a few hundred bytes; 4 MiB is far past that and is reached by an
+# infinite jq output in well under a second, so nothing near it is ever buffered.
+OUTPUT_CAP = 4 * 1024 * 1024
+
+# The most resident memory one run may hold, and how often a run still going is
+# checked (the first check is after POLL_SECONDS, so a run that ends sooner is never
+# sampled). A real row stays under a few tens of MB; jq grows ~7 GB/s on the
+# infinite operands, so a coarser poll would let a run reach tens of GB first.
+RSS_CAP = 256 * 1024 * 1024
+POLL_SECONDS = 0.05
 
 # ---------------------------------------------------------------------------
 # Axes
@@ -989,18 +1005,79 @@ def build_rows(operands=None, stage_only=False):
 # ---------------------------------------------------------------------------
 
 
+def rss_bytes(pid):
+    """Resident size of `pid` in bytes, 0 once it is gone (`ps`: macOS has no /proc)."""
+    out = subprocess.run(
+        ["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True
+    ).stdout.strip()
+    return int(out) * 1024 if out.isdigit() else 0
+
+
 def run_one(argv, doc, timeout):
-    """(stdout, exit code); exit code is None on timeout."""
-    try:
-        p = subprocess.run(
-            argv,
-            input=doc.encode(),
-            capture_output=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        return ("", None)
-    return (p.stdout.decode("utf-8", "replace"), p.returncode)
+    """(stdout, exit code); exit code is None on timeout or a blown output/memory cap.
+
+    A run that never ends can cost the harness far more than its `--timeout` (#3893):
+
+    * stdout is read through a reader that stops at OUTPUT_CAP bytes and kills the
+      process. `subprocess.run(capture_output=True)` buffers without bound, so an
+      operand that is infinite on some input (`recurse(.a)?` on `null`, where jq
+      prints ever longer paths, ~135 MB in 3 s) grew the harness until `--timeout`,
+      and across `--jobs` workers that is gigabytes.
+    * the process's own resident size is polled while it runs and it is killed past
+      RSS_CAP. The same operand under `[path(...)]` or `del(...)` prints nothing and
+      grows *jq* instead (~30 GB in 4 s); macOS cannot set RLIMIT_AS, so this is the
+      only cap there. A row that finishes inside the first poll never pays for one.
+
+    A capped row is a timeout (jq's own is `ORACLE_TIMEOUT`, a build's is `TIMEOUT`),
+    with a note in the stdout slot.
+    """
+    with subprocess.Popen(
+        argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    ) as p:
+        chunks = []
+        state = {"size": 0, "capped": False}
+
+        def drain():
+            while True:
+                chunk = p.stdout.read1(65536)
+                if not chunk:
+                    return
+                state["size"] += len(chunk)
+                if state["size"] > OUTPUT_CAP:
+                    state["capped"] = True
+                    p.kill()
+                    return
+                chunks.append(chunk)
+
+        reader = threading.Thread(target=drain, daemon=True)
+        reader.start()
+        try:
+            p.stdin.write(doc.encode())
+            p.stdin.close()
+        except BrokenPipeError:
+            pass  # the process answered (or refused) before it read its input
+        deadline = time.monotonic() + timeout
+        note = None
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            try:
+                p.wait(timeout=min(left, POLL_SECONDS))
+                break
+            except subprocess.TimeoutExpired:
+                if rss_bytes(p.pid) > RSS_CAP:
+                    note = f"<resident size exceeded {RSS_CAP} bytes>"
+                    break
+        if p.poll() is None:
+            p.kill()
+            p.wait()
+            reader.join()
+            return (note or "", None)
+        reader.join()
+        if state["capped"]:
+            return (f"<output exceeded {OUTPUT_CAP} bytes>", None)
+        return (b"".join(chunks).decode("utf-8", "replace"), p.returncode)
 
 
 def classify(oracle, result):
@@ -1155,9 +1232,15 @@ def main():
                 print(f"  {i}/{len(rows)} ({time.time() - started:.0f}s)", file=sys.stderr)
 
     # A timeout under `--jobs` parallelism can be load, not the row. Re-run
-    # each such row alone, once, and believe that answer.
+    # each such row alone, once, and believe that answer. A run killed at the
+    # output or memory cap carries a note and is not retried: it ends the same
+    # way on a quiet box, and re-running an infinite operand serially is minutes
+    # of nothing (#3893).
+    def timed_out(res):
+        return res[1] is None and not res[0]
+
     retry = [i for i, rec in enumerate(records)
-             if "TIMEOUT" in rec["classes"].values() or rec["oracle"][1] is None]
+             if any(timed_out(r) for r in [rec["oracle"], *rec["outputs"].values()])]
     if retry:
         print(f"re-running {len(retry)} timed-out row(s) serially", file=sys.stderr)
         for i in retry:
