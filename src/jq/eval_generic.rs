@@ -29155,6 +29155,26 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         Builtin::AllF(cond) if cursor.is_some() => {
             any_all_f_generic::<S, V>(cond, &value, optional, cursor.expect("guarded"), false)
         }
+        // #3966: yq's `any_c(f)` / `all_c(f)` -- an array only (a mapping or a scalar is the bare
+        // form's rejection), then the `any(cond)` engine over [`any_c_predicate`].
+        Builtin::AnyC(f, extra) | Builtin::AllC(f, extra) if cursor.is_some() => {
+            let (name, target_truthy) = if matches!(builtin, Builtin::AnyC(..)) {
+                ("any", true)
+            } else {
+                ("all", false)
+            };
+            let cursor = cursor.expect("guarded");
+            if value.as_array().is_some() {
+                let cond = crate::jq::eval::any_c_predicate(f, extra.is_some());
+                // The predicate reads under yq's read-only context, as the eager arm's
+                // (`eval::builtin_any_all_c`): an absent key is no output, so skipped.
+                let _scope = S::READ_ONLY_ABSENT_KEY_IS_EMPTY
+                    .then(crate::jq::eval::yq_read_only_context::enter);
+                any_all_f_generic::<S, V>(&cond, &value, optional, cursor, target_truthy)
+            } else {
+                any_all_generic::<S, V>(&value, optional, cursor, name, target_truthy)
+            }
+        }
         Builtin::IsValid(f) => isvalid_generic::<S, V>(f, value, cursor),
 
         _ => {
@@ -29653,6 +29673,9 @@ fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
             // `trim`, `tonumber`, `to_unix`, `match`, `capture`, `sub`,
             // `unique_by`, `omit`, `pick`, `to_json`... every one keeps.
             Builtin::All
+            // #3966: native yq like `all`/`any`; `.s | any_c(.) | key` is `"s"` in v4.53.3.
+            | Builtin::AnyC(..)
+            | Builtin::AllC(..)
             | Builtin::Anchor
             | Builtin::DocumentIndex
             | Builtin::LineComment

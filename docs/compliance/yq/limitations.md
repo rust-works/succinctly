@@ -2640,7 +2640,14 @@ Both filed together as [#1998](https://github.com/rust-works/succinctly/issues/1
   parse time, with it they are jq's own surface, whose wording already matches jq 1.7.1 (`5 |
   any(. > 3)` is `Cannot iterate over number (5)`), so no yq-style wording is invented for a
   shape real yq never accepts. Bare `any`/`all` stay native. Real yq's own predicate spelling,
-  `any_c(cond)`/`all_c(cond)`, is a separate, unimplemented builtin.
+  `any_c(cond)`/`all_c(cond)`, was a separate, unimplemented builtin; it is implemented since
+  [#3966](https://github.com/rust-works/succinctly/issues/3966) (see
+  [`any_c(f)` / `all_c(f)`](../../reference/yq-language.md#any_cf--all_cf) in the yq language
+  reference), with two recorded residuals: a bare `any_c` or an empty `any_c()` is succinctly's
+  generic parse error where yq says `'any_c' expects 1 arg but received none` (#2237's carve-out
+  for every required-argument builtin), and the second and later arguments of `any_c(f; g; h)`
+  are parsed and dropped, so only a user `def any_c(f; g)` of arity two shadows the builtin (a
+  `def` of arity three does not).
 - **`with_entries(f)` rejects numeric keys** that real yq coerces to strings on reassembly
   (`[1,2] | with_entries(.)` succeeds on real yq, errors `Cannot use number (0) as object key`
   on succinctly) — a functional bug on well-formed input, unrelated to this section's

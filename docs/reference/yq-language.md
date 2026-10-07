@@ -490,6 +490,23 @@ than inventing a separate yq answer: `if A then B end` desugars to `if A then B 
 so a falsy condition passes the input through unchanged, not `null` (#3408) —
 `printf 'a: false\n' | succinctly yq '.a | if . then "x" end'` is `false`, not `null`.
 
+### `any_c(f)` / `all_c(f)`
+
+Real yq's predicate spelling of `any`/`all` (its `any(f)` does not parse; `succinctly yq` gates
+the jq spelling behind `--jq-extensions`, #2005). They are native, so they need no flag, and exist
+in yq mode only. All behaviour below is captured from yq v4.53.3 (#3966):
+
+- the input must be an array; a mapping or a scalar is the bare form's error
+  (`any only supports arrays, was !!map`), not an iteration;
+- only the **first** output of `f` decides an element (`[1,5] | any_c(false, true)` is `false`),
+  and an element whose `f` yields nothing is skipped (`[1,5] | all_c(select(. > 9))` is `true`);
+- `f` is evaluated read-only, so an *absent* key is no output and the element is skipped, while an
+  explicit `null` is a falsy output: `[{"b":1}] | all_c(.a)` is `true`, `[{"a":null}] | all_c(.a)`
+  is `false`;
+- `any_c` stops at the first truthy element and `all_c` at the first falsy one;
+- arguments after the first (`any_c(f; g)`) are parsed and never evaluated, and the form then
+  behaves as a predicate that yields nothing: `any_c(.; .)` is `false`, `all_c(.; .)` is `true`.
+
 ### Path context through jq-only constructs
 
 A `key`/`parent`/`path`/`file_index` read *after* a construct real yq's lexer rejects

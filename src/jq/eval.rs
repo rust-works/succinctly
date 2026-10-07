@@ -3085,9 +3085,13 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         // `f` at the stage's own input, and a loop's `cond`/`update` at the
         // input first and at each state after; a read in any of them needs
         // a position, and the native arms now supply one.
-        Expr::Builtin(Builtin::AnyF(f) | Builtin::AllF(f) | Builtin::IsValid(f)) => {
-            needs_path_context(f)
-        }
+        Expr::Builtin(
+            Builtin::AnyF(f)
+            | Builtin::AllF(f)
+            | Builtin::AnyC(f, _)
+            | Builtin::AllC(f, _)
+            | Builtin::IsValid(f),
+        ) => needs_path_context(f),
         Expr::Until { cond, update } | Expr::While { cond, update } => {
             needs_path_context(cond) || needs_path_context(update)
         }
@@ -6545,7 +6549,9 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Expr::Builtin(Builtin::IsEmpty(inner)) => {
             each_isempty::<W, S>(inner, value, optional, sink)
         }
-        Expr::Builtin(builtin @ (Builtin::AnyF(_) | Builtin::AllF(_))) => {
+        Expr::Builtin(
+            builtin @ (Builtin::AnyF(_) | Builtin::AllF(_) | Builtin::AnyC(..) | Builtin::AllC(..)),
+        ) => {
             let result = eval_builtin::<W, S>(builtin, value, optional);
             drain_any_all_probe(result, sink)
         }
@@ -14239,6 +14245,12 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::AnyCond(gen, cond) => builtin_any_cond::<W, S>(gen, cond, value, optional),
         Builtin::All => builtin_all::<W, S>(value, optional),
         Builtin::AllF(cond) => builtin_all_f::<W, S>(cond, value, optional),
+        Builtin::AnyC(f, extra) => {
+            builtin_any_all_c::<W, S>(f, extra.is_some(), value, optional, true)
+        }
+        Builtin::AllC(f, extra) => {
+            builtin_any_all_c::<W, S>(f, extra.is_some(), value, optional, false)
+        }
         Builtin::AllCond(gen, cond) => builtin_all_cond::<W, S>(gen, cond, value, optional),
         Builtin::Min => builtin_min::<W, S>(value, optional),
         Builtin::Max => builtin_max::<W, S>(value, optional),
@@ -15871,6 +15883,50 @@ fn builtin_all_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     any_all_f::<W, S>(cond, value, optional, false)
+}
+
+/// The per-element predicate yq's `any_c(f)` / `all_c(f)` runs (#3966), built where the
+/// call is evaluated so the builtin itself keeps `f` as written (a user `def any_c(f)`
+/// that shadows it must receive that, not this). Captured from yq v4.53.3: only the
+/// *first* output of `f` decides an element and an element whose `f` yields nothing is
+/// skipped, which is `first(f)`; and with a second argument (`any_c(f; g)`, parsed and
+/// never evaluated) the form behaves as a predicate that yields nothing -- `any_c(.; .)`
+/// is `false` and `all_c(.; .)` is `true` over an array.
+pub(crate) fn any_c_predicate(f: &Expr, has_extra_args: bool) -> Expr {
+    if has_extra_args {
+        Expr::Builtin(Builtin::Empty)
+    } else {
+        Expr::Builtin(Builtin::FirstStream(Box::new(f.clone())))
+    }
+}
+
+/// Builtin: yq's `any_c(f)` / `all_c(f)` (#3966).
+///
+/// Real yq takes an array only -- a mapping or a scalar is the bare form's
+/// `any only supports arrays, was !!map` (#1901), not `.[]`'s iteration -- and
+/// then runs the predicate per element ([`any_c_predicate`]). That is the
+/// `any(cond)` engine unchanged, so the verdict, the short-circuit and the errors
+/// are its own, run under yq's read-only context (an absent key is no output).
+fn builtin_any_all_c<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    f: &Expr,
+    has_extra_args: bool,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    target_truthy: bool,
+) -> QueryResult<'a, W> {
+    if matches!(value, StandardJson::Array(_)) {
+        let cond = any_c_predicate(f, has_extra_args);
+        // yq runs the predicate through `ReadOnlyClone`, as it does an assignment's right
+        // side (#2470): a key read that finds nothing is no node at all, so the element is
+        // skipped rather than read as `null` -- `[{"b":1}] | all_c(.a)` is `true`, where
+        // `[{"a":null}] | all_c(.a)` (a node that is there) is `false`.
+        let _scope = S::READ_ONLY_ABSENT_KEY_IS_EMPTY.then(yq_read_only_context::enter);
+        any_all_f::<W, S>(&cond, value, optional, target_truthy)
+    } else if target_truthy {
+        builtin_any::<W, S>(value, optional)
+    } else {
+        builtin_all::<W, S>(value, optional)
+    }
 }
 
 /// Shared engine for `any(gen; cond)`/`all(gen; cond)`, matching real jq's
@@ -29861,9 +29917,11 @@ fn builtin_yields_at_most_one_value(builtin: &Builtin) -> bool {
         | Builtin::Acosh
         | Builtin::All
         | Builtin::AllCond(_, _)
+        | Builtin::AllC(..)
         | Builtin::AllF(_)
         | Builtin::Anchor
         | Builtin::Any
+        | Builtin::AnyC(..)
         | Builtin::AnyCond(_, _)
         | Builtin::AnyF(_)
         | Builtin::Asin
