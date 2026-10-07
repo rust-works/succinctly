@@ -4622,7 +4622,7 @@ fn comma_array_generic<S: EvalSemantics, V: DocumentValue>(
                 .into_iter()
                 .filter_map(|e| match e {
                     LazyElem::Owned(o) => Some(o),
-                    LazyElem::Cursor(_) => None,
+                    LazyElem::Cursor(_) => None, // patchcov: coverage tolerate-line reason="unreachable: the decode above replaced every cursor with an owned value, or returned an error that skips this block (#3856)"
                 })
                 .collect();
             return GenericResult::Owned(OwnedValue::array_from(out));
@@ -44538,6 +44538,96 @@ mod tests {
         );
     }
 
+    /// #3856: a `,` array that computes a value *before* a node-producing
+    /// branch (`[1, .[]]`) folds that branch's whole cursor list into the
+    /// element list, in order, and the answer is the array the owned route
+    /// builds.
+    #[test]
+    fn test_mixed_sequence_takes_a_fan_out_branch_after_a_value_3856() {
+        let doc = r"[[1],[2],[3]]";
+        let index = JsonIndex::build(doc.as_bytes());
+        let expr = parse("[1, .[]]").unwrap();
+        let GenericResult::LazySeq(seq) =
+            eval_with_cursor_using::<JqSemantics, _>(&expr, index.root(doc.as_bytes()))
+        else {
+            panic!("a node beside a computed value is a sequence"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3856)"
+        };
+        assert!(matches!(seq.source, LazySource::Mixed(_)));
+        let built = seq.materialize_atomic::<JqSemantics>().unwrap();
+        let want = parse("[1, [1], [2], [3]]").unwrap();
+        let want = eval_with_cursor_using::<JqSemantics, _>(&want, index.root(doc.as_bytes()))
+            .collect_owned::<JqSemantics>()
+            .unwrap();
+        assert_eq!(vec![built], want);
+    }
+
+    /// #3856: a sequence with no stage and a source that is neither a cursor
+    /// list nor a mixed list (a `map` source whose `map` was never pushed)
+    /// still reads through the iterator, both when built and when a stage
+    /// folds over it -- the direct reads are only for the two sources that
+    /// hold their elements.
+    #[test]
+    fn test_stageless_map_source_still_reads_through_the_iterator_3856() {
+        let doc = r#"["x","y"]"#;
+        let index = JsonIndex::build(doc.as_bytes());
+        let expr = parse("keys_unsorted | map(.)").unwrap();
+        let stageless = || {
+            let GenericResult::LazySeq(mut seq) =
+                eval_with_cursor_using::<JqSemantics, _>(&expr, index.root(doc.as_bytes()))
+            else {
+                panic!("expected LazySeq"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3856)"
+            };
+            assert!(matches!(seq.source, LazySource::IndexRange { .. }));
+            seq.instructions = None;
+            seq
+        };
+        assert_eq!(
+            stageless().materialize_atomic::<JqSemantics>().unwrap(),
+            OwnedValue::array_from(vec![OwnedValue::Int(0), OwnedValue::Int(1)])
+        );
+        let counted =
+            fold_lazy_seq_stage::<JqSemantics, _>(stageless(), &parse("length").unwrap(), false);
+        assert_eq!(
+            counted.collect_owned::<JqSemantics>().unwrap(),
+            vec![OwnedValue::Int(2)]
+        );
+    }
+
+    /// #3856: the negative-index-out-of-range rule reaches an index into a
+    /// cursor-and-value sequence exactly as it reaches one into an all-node
+    /// sequence (#2254/#2264): yq errors, jq answers `null`. Only jq mode
+    /// builds such a sequence (`comma_array_generic`'s gate), so the stage is
+    /// folded over one directly under each mode's semantics.
+    #[test]
+    fn test_mixed_sequence_negative_index_out_of_range_follows_the_mode_3856() {
+        let doc = r#"{"a":{"x":1}}"#;
+        let index = JsonIndex::build(doc.as_bytes());
+        let expr = parse("[.a, 1]").unwrap();
+        let mixed = || {
+            let GenericResult::LazySeq(seq) =
+                eval_with_cursor_using::<JqSemantics, _>(&expr, index.root(doc.as_bytes()))
+            else {
+                panic!("a node beside a computed value is a sequence"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3856)"
+            };
+            assert!(matches!(seq.source, LazySource::Mixed(_)));
+            seq
+        };
+        let stage = parse(".[-5]").unwrap();
+        match fold_lazy_seq_stage::<YqSemantics, _>(mixed(), &stage, false) {
+            GenericResult::Error(e) => assert!(
+                e.message.contains("-5"),
+                "the message names the index as written: {}",
+                e.message
+            ),
+            other => panic!("expected a yq error, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3856)"
+        }
+        let answered = fold_lazy_seq_stage::<JqSemantics, _>(mixed(), &stage, false);
+        assert_eq!(
+            answered.collect_owned::<JqSemantics>().unwrap(),
+            vec![OwnedValue::Null]
+        );
+    }
+
     /// #3815: `[.. | parent?]` emits the root once per child, and the
     /// collection builds it once and shares it, by node and never by value.
     // Storage identity is what `unshared-containers` removes: a clone there
@@ -44978,7 +45068,7 @@ mod tests {
                                 LazyElem::Cursor(c) => {
                                     validate_cursor::<JqSemantics, _>(c).map_err(|e| e.message)
                                 }
-                                LazyElem::Owned(_) => Ok(()),
+                                LazyElem::Owned(_) => Ok(()), // patchcov: coverage tolerate-line reason="unreachable: `[., .]` holds only document nodes, so no pulled element is an owned value (#3856)"
                             })
                         });
                     let built_array = seq.materialize_atomic::<JqSemantics>().map_err(message);
