@@ -1292,7 +1292,7 @@ is the revert that established what the other one costs.
      producer vouches for the register: equal by kind it is re-established where the register stands, unequal it
      cannot be it and the stage raises as jq does; anything else -- an equal string or container, a producer that
      lost the register, an untracked entry that states none, a `gen` the allowlist cannot prove leaves the register
-     in place (`first(2, 3)`, where a literal `2` is exact) -- is ambiguous and refuses as an uncatchable guess, so
+     in place (a `def` call; a comma of literals such as `first(2, 3)` answers since #3862) -- is ambiguous and refuses as an uncatchable guess, so
      `del(try (.a and any(true; select(.))))`-shaped writes cannot go through on a swallowed error (jq answers
      `["a"]` for `path(.a and any(true; select(.)))` and this refuses). Pinned by
      `test_any_all_navigating_cond_states_the_register_it_left_3757`,
@@ -1321,8 +1321,10 @@ is the revert that established what the other one costs.
      `test_any_all_pipe_stage_verdict_residuals_stay_refused_3757`: inside a compound stage (`(any, any)`,
      `any // 1`, `any? // 1`), which is refused as a whole (#3644), behind a `def` call or a `reduce`
      (`def f: any; f | $x`), which state no register, and on an untracked entry over a generator the allowlist
-     cannot prove leaves the register in place (`1 | isempty(first(2,3))`, `1 | any(first(2,3); .)`: the step
-     states a loss, which the stage does not override). In yq mode `any`/`all` are real yq
+     cannot prove leaves the register in place (`1 | isempty(def f: 2; f)`: the step states a loss, which the stage
+     does not override; `1 | isempty(first(2,3))` and `1 | any(first(2,3); .)` answer since
+     [#3862](https://github.com/rust-works/succinctly/issues/3862), where each comma sibling states the register on
+     its own, pinned by `test_comma_siblings_state_the_register_on_their_own_3862`). In yq mode `any`/`all` are real yq
      builtins and keep yq's own scalar error (`all only supports arrays, was !!int`); real yq rejects the two-argument
      form outright, so `--jq-extensions` keeps its refusal.
 
@@ -2727,11 +2729,17 @@ is the revert that established what the other one costs.
    computed key and a `catch` handler around one keep the register too. `fans_out` then stopped
    at a nested pipe, which carries the register through its own stages as a top-level pipe body
    does, so a comma or call inside one keeps it as well (`path(foreach .x as $w (0; try ($w \|
-   .a, .b?); .))` is `["x","a"]`, `["x","b"]`, as in jq). It still counts a comma, a
-   destructuring bind, a fold and a call *above* every pipe, the split #3145 guards, and such a
-   body still differs from jq: `(foreach .x as $w (0; try (($w \| .a[]), $w); .)) = 9` is
-   `{"a":[{"b":1}],"x":9}` in jq and leaves the document unchanged here, a silently skipped
-   write ([#3862](https://github.com/rust-works/succinctly/issues/3862)). Marking the withheld register lost (#3267) would make it refuse loudly, but also
+   .a, .b?); .))` is `["x","a"]`, `["x","b"]`, as in jq). It still counts a
+   destructuring bind, a fold and a call *above* every pipe, and a comma above one unless each
+   of its siblings is a pipe or cannot move the register (the split #3145 guards; `$v[0]?` in
+   its `($v[0]?, $v)` is the pipe `$v \| .[0]?`). A comma forks, so jq runs every sibling
+   from the register the comma was entered with, and a bare sibling states that register on its
+   own, as a `//` alternate does: `(foreach .x as $w (0; try (($w \| .a[]), $w); .)) = 9` is
+   `{"a":[{"b":1}],"x":9}` in jq and here
+   ([#3862](https://github.com/rust-works/succinctly/issues/3862), pinned by
+   `test_foreach_update_under_try_with_a_comma_above_a_pipe_keeps_the_register_3862`). A sibling
+   that navigates without a pipe (`.a?`, `first(.a)`) still withholds the register, as before.
+   Marking a withheld register lost (#3267) would make it refuse loudly, but also
    turns rows that match jq today into refusals, where jq's own `try` catches a real error
    (`(foreach .a as $w (0; try (($w \| .c \| .z), $w.b); .)) = 9` writes nothing in either).
    A bare `$k` reached through a `//` alternate relocates to the register even when the left
@@ -2740,15 +2748,15 @@ is the revert that established what the other one costs.
    `cannot_move_register` answers is asked of the alternate alone
    ([#3788](https://github.com/rust-works/succinctly/issues/3788), pinned by
    `test_foreach_update_bare_var_alternate_keeps_the_register_3788`). Still refused loudly where
-   jq answers: a bare `$k` in a comma body (`path(foreach .a as $k (0; $k, ($k \| .c); .))`,
-   the register is withheld from a body that fans out), a by-value alternate followed by an
+   jq answers: a by-value alternate followed by an
    EXTRACT `$k` (`path(foreach .a as $k (0; ($k \| .b) // 5; $k))`), and an alternate that is
-   not a bare operand: a pipe after the `//` (`(($k \| .b) // $k) \| .c`, `... // $k \| $k`) or a
-   comma inside it (`($k \| .b) // ($k, $k)`), all pinned by
+   not a bare operand: a pipe after the `//` (`(($k \| .b) // $k) \| .c`, `... // $k \| $k`), all
+   pinned by
    `test_foreach_update_alternate_shapes_the_3788_carry_does_not_reach_characterize`. Pinned by
    `test_foreach_update_under_try_over_a_generator_keeps_the_register_3738`,
    `test_foreach_update_under_try_around_a_generator_keeps_the_register_3770`,
-   `test_foreach_update_under_try_with_a_comma_inside_a_pipe_keeps_the_register_3770` and, for what stays,
+   `test_foreach_update_under_try_with_a_comma_inside_a_pipe_keeps_the_register_3770`,
+   `test_foreach_update_under_try_with_a_comma_above_a_pipe_keeps_the_register_3862` and, for what stays,
    `test_foreach_update_under_try_with_sibling_branches_characterize_preexisting_bug_3770`.
 
    **`resolve_as_pattern`'s own first-step identity test recognizes every
@@ -3415,8 +3423,10 @@ answers `["b"]` — and classified the two residuals appended below):
   **What still refuses**, each loudly (an exit 5, never a write that is silently lost) and pinned by
   `test_recurse_seed_residuals_stay_loud_3580`:
   - an output that is not a recursion's seed or an untracked `.` and so states nothing: a literal
-    ahead of the recursion (`(1, ..)`, or the taken `else 1` of `if false then .. else 1 end`) is
-    `[]` in jq, and so is a variable ahead of it (`(. as $q | $q, (try ..))`);
+    ahead of the recursion (the taken `else 1` of `if false then .. else 1 end`) is `[]` in jq.
+    (A literal or variable *sibling* ahead of it in a comma answers since #3862: `(1, ..)` and
+    `(. as $q | $q, (try ..))` state the register per sibling, pinned by
+    `test_recurse_seed_after_a_comma_sibling_states_the_register_3862`);
   - a recursion behind a destructuring bind or a `def` call (`(. as [$q] | ..)`, `def f: ..; f`): the
     bind's pattern indexes before its body runs and a call's body is not named, so the stage is
     opaque. So is a pipe (or `select`) nested inside a forwarder, such as `if true then (.. | select(true))
