@@ -21277,7 +21277,7 @@ fn string_slice_pattern<W>(
 ///
 /// One definition, because this is the outer half of the same refusal
 /// [`non_string_pattern`] covers, and the three searches had drifted here too.
-fn unsearchable_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+fn unsearchable_input<'a, W: Clone + AsRef<[u64]>>(
     value: &StandardJson<'a, W>,
     pattern: &OwnedValue,
     optional: bool,
@@ -21290,7 +21290,11 @@ fn unsearchable_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Error(EvalError::cannot_index(type_name(value), pattern))
         };
     }
-    let looked_up = index_one::<W, S>(value.clone(), pattern, optional);
+    // jq's rules, whichever mode asked: `indices` is jq surface even where yq reaches it
+    // (`--jq-extensions`, which follows jq, ADR-0018), and yq's lenient indexing would
+    // answer `null` for `a: [1,2]` | `indices(1)`, where jq says `Cannot index object with
+    // number`, and drop `.[0]` of a scalar rather than raise it.
+    let looked_up = index_one::<W, JqSemantics>(value.clone(), pattern, optional);
     let tail = match occurrence {
         SearchOccurrence::All => return looked_up,
         SearchOccurrence::First => Expr::index(0),
@@ -21304,27 +21308,19 @@ fn unsearchable_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Expr::index(0),
         ]),
     };
-    let found = match looked_up {
-        QueryResult::None => return QueryResult::None,
-        QueryResult::Owned(v) => v,
-        QueryResult::One(v) => match to_owned::<S, _>(&v) {
-            Ok(v) => v,
-            Err(e) => return suppress_or_raise(e, optional),
+    // The tail runs on what the lookup answered, lazily where it is a document value so a
+    // container is not read just to take one element of it.
+    match looked_up {
+        QueryResult::One(v) => eval_single::<W, JqSemantics>(&tail, v, optional),
+        QueryResult::OneCursor(c) => eval_single::<W, JqSemantics>(&tail, c.value(), optional),
+        QueryResult::Owned(v) => match eval_owned_multi::<JqSemantics>(&tail, &v) {
+            Ok(outputs) => QueryResult::ManyOwned(outputs),
+            Err(_) if optional => QueryResult::None,
+            Err(e) => e.into(),
         },
-        // A container comes back as a cursor, which has to be read to take `.[0]` of it.
-        QueryResult::OneCursor(c) => match to_owned::<S, _>(&c.value()) {
-            Ok(v) => v,
-            Err(e) => return suppress_or_raise(e, optional),
-        },
-        // An error, `break` or `halt` from the lookup itself (`index_one` makes one
-        // answer for one key, so nothing else arises).
-        other => return other,
-    };
-    match eval_owned_multi::<S>(&tail, &found) {
-        Ok(mut outputs) if outputs.len() == 1 => QueryResult::Owned(outputs.remove(0)),
-        Ok(_) => QueryResult::None,
-        Err(_) if optional => QueryResult::None,
-        Err(e) => e.into(),
+        // Nothing to take the element of, or an error, `break` or `halt` from the lookup
+        // itself (`index_one` answers one key with one result, so nothing else arises).
+        other => other,
     }
 }
 
@@ -21540,7 +21536,7 @@ fn search_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
             }
         },
-        _ => unsearchable_input::<W, S>(value, pattern, optional, occurrence),
+        _ => unsearchable_input(value, pattern, optional, occurrence),
     }
 }
 

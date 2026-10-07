@@ -61312,6 +61312,26 @@ fn test_indices_family_looks_up_a_null_or_object_input_3890() -> Result<()> {
             r#"rindex("a")"#,
             Err("Cannot index boolean with object"),
         ),
+        // An object pattern is jq's slice descriptor and an array pattern a subarray search:
+        // `null` takes the first (`null`), neither is a lookup an object can answer.
+        ("null", r#"indices({"start":0})"#, Ok("null")),
+        ("null", r#"index({"start":1})"#, Ok("null")),
+        (
+            r#"{"a":1}"#,
+            r#"indices({"start":0})"#,
+            Err("Cannot index object with object"),
+        ),
+        (
+            r#"{"a":1}"#,
+            "rindex({})",
+            Err("Cannot index object with object"),
+        ),
+        ("null", "indices([1])", Err("Cannot index null with array")),
+        (
+            r#"{"a":1}"#,
+            "indices([1])",
+            Err("Cannot index object with array"),
+        ),
         // `?` swallows the lookup's own error and takes the looked-up value otherwise.
         ("null", "indices(true)?", Ok("")),
         (r#"{"a":1}"#, r#"index("a")?"#, Ok("")),
@@ -61338,6 +61358,115 @@ fn test_indices_family_looks_up_a_null_or_object_input_3890() -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// #3890: `indices`, `index` and `rindex` are jq surface even where yq reaches them
+/// (`--jq-extensions`), and an extension follows jq (ADR-0018), so the lookup uses jq's
+/// indexing rules and not yq's lenient ones. Run through `index_one::<YqSemantics>` the
+/// lookup answered `null` for `a: [1, 2]` | `indices(1)` (yq indexes a mapping by number
+/// into `null`) where jq raises, and the `.[0]` of a scalar produced no output at all
+/// where jq raises. Expected texts are jq 1.7.1's, for the same value as JSON.
+#[test]
+fn test_indices_family_looks_up_in_yq_extensions_3890() -> Result<()> {
+    for (input, filter, want) in [
+        ("a: [5, 6]\n", r#"indices("a")"#, Ok("[5,6]")),
+        ("a: [5, 6]\n", r#"index("a")"#, Ok("5")),
+        ("a: [5, 6]\n", r#"rindex("a")"#, Ok("6")),
+        ("a: 1\n", r#"indices("a")"#, Ok("1")),
+        (
+            "a: [1, 2]\n",
+            "indices(1)",
+            Err("Cannot index object with number"),
+        ),
+        (
+            "a: [1, 2]\n",
+            "index(1)",
+            Err("Cannot index object with number"),
+        ),
+        (
+            "a: 1\n",
+            r#"index("a")"#,
+            Err("Cannot index number with number"),
+        ),
+        (
+            "a: 1\n",
+            r#"rindex("a")"#,
+            Err("Cannot index number with object"),
+        ),
+        (
+            "n: null\n",
+            ".n | indices(true)",
+            Err("Cannot index null with boolean"),
+        ),
+        ("n: null\n", r#".n | index("a")"#, Ok("null")),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["yq", "--jq-extensions", "-o", "json", "-I", "0", filter])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child
+                    .stdin
+                    .take()
+                    .expect("piped")
+                    .write_all(input.as_bytes())?;
+                child.wait_with_output()
+            })?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        match want {
+            Ok(expected) => {
+                assert!(
+                    output.status.success(),
+                    "#3890 (yq): `{filter}`: {output:?}"
+                );
+                assert_eq!(stdout.trim(), expected, "#3890 (yq): `{filter}`");
+            }
+            Err(message) => {
+                assert!(
+                    !output.status.success(),
+                    "#3890 (yq): `{filter}`: {output:?}"
+                );
+                assert!(stdout.is_empty(), "#3890 (yq): `{filter}`: {stdout:?}");
+                assert!(
+                    stderr.contains(message),
+                    "#3890 (yq): `{filter}`: wanted {message:?}, got {stderr:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// #3890 residual, pinned so it cannot move unnoticed: `index`/`rindex` on a tracked
+/// object are `.[$i] | .[0]` in jq, a register that walks `["a",0]`, which this resolver
+/// does not model (a tracked key is still a by-value leaf). Until it does, an `and`
+/// whose left operand is `index("a")` is judged by jq's own value (`true` here) and its
+/// right operand runs against a register the resolver thinks is still at the root, so it
+/// refuses where jq's `(.a)?` swallows the path error and `//` falls through. The shape
+/// *matched* before #3890 only because the wrong `null` made `and` short-circuit. The
+/// same program spelled `.a[0]`, which the resolver does move, answers as jq does. Swept:
+/// 14 rows of this one shape, `scripts/jq-path-register-sweep.py` over the `index`/
+/// `rindex` operands. This test flips to jq's `{}` when the tracked step lands, and
+/// should then move to the `Ok` table of `test_indices_family_looks_up_a_null_or_object_input_3890`.
+#[test]
+fn test_index_on_a_tracked_object_register_residual_3890() -> Result<()> {
+    let input = r#"{"a":[true]}"#;
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"del((index("a") and (.a)?) // .a)"#], Some(input))?;
+    assert_eq!(code, 5, "#3890 residual: stdout {stdout:?}");
+    assert!(stdout.is_empty(), "#3890 residual: {stdout:?}");
+    assert!(
+        stderr.contains(r#"Invalid path expression near attempt to access element "a" of"#),
+        "#3890 residual: {stderr:?}"
+    );
+    // The contrast jq answers identically: a navigation the resolver does move.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "del((.a[0] and (.a)?) // .a)"], Some(input))?;
+    assert_eq!(code, 0, "#3890 contrast: stderr {stderr:?}");
+    assert_eq!(stdout.trim(), "{}", "#3890 contrast");
     Ok(())
 }
 
