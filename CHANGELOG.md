@@ -37,6 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   15,027-row sample of their bare stages went from 14,496 to 14,510 matches, and a 15,027-row sample of their full shapes from 14,612 to 14,615, with 0 regressions and
   `ACCEPT_WRONG` unchanged in both (43 and 8). `scripts/jq-bind-origin-fuzz.py` over three seeds (3,000 programs each, `--fold-p` 0, 0.3 and 0.7) found no fabricate,
   mismatch or new refuse-only row. Pinned by `test_recurse_seed_through_nth_bind_and_fold_recurse_f_3892`.
+- **jq: an array holds the nodes of a `,` body beside computed values without reading them, and validates a node where something reads it** (#3856, Phase 1).
+  `[., 1] | length`, `[., .] | length`, `[.a, .b] | length` and `[.b, empty] | length` over a value the index cannot read (`tru`, `1.2.3`) answered a decode failure; they answer. The array holds each
+  node as a cursor (`LazySource::Mixed` beside computed values, `Cursors` otherwise), so on a 36.6 MB document `[.users, 1] | length` no longer decodes the subtree. Printing the array, or any consumer that
+  reads a malformed node (`tojson`, `.[i]` of that node, `.[]` once it reaches it), still raises, and printing writes nothing; a consumer that reads only well-formed nodes (`first`, `.[0]`) answers, and a branch's own raise now comes first (`try [., error("x")] catch .` catches `x`). An all-scalar array is still built
+  owned, but a scalar that fails to decode stays a node and fails where it is read. This removes `CursorCheck::Pending` and the walk built around it (`LazySeq::settle`, `is_prevalidated`,
+  `Sink::materializes_lazy_items`). jq mode only; yq keeps its owned routes. Objects and `as` binds are the remaining phases of #3856. Pinned by
+  `test_mixed_array_matches_jq_3856`, `test_scalar_array_defers_an_undecodable_member_3856` and the rows moved in `test_unreadable_value_collection_split_3266`.
 - **ci: the shared coverage action now uses `action-works/patchcov-action@v1`** (#3880). It replaces `action-works/omni-dev-coverage-check@v2` in `.github/actions/coverage/action.yml`
   (the one definition behind both `ci.yml` and `coverage-baseline.yml`). `v1` resolves to the same commit and an identical `action.yml` as the old `v2`, so every input, the `version: 0.1.1`
   patchcov pin and the baseline lookup are unchanged; only the repository an `omni-dev`-named workflow depended on is gone.

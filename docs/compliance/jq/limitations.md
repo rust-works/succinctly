@@ -9473,7 +9473,7 @@ Pinned by `test_bridge_token_spellings_read_like_their_siblings_3034` and
 The library entry `succinctly::jq::eval` answers such a value as the CLI does since #3457. See the
 next entry.
 
-### An unreadable value is validated where something reads it, not where it is wrapped (#3266, #3427, #3457) — the collection split is accepted
+### An unreadable value is validated where something reads it, not where it is wrapped (#3266, #3427, #3457, #3856) — a narrower collection split is accepted
 
 jq 1.7.1 rejects every document below at parse time (exit 5), so no row has a reference answer.
 `succinctly jq` evaluates through the generic evaluator's cursor entries
@@ -9499,44 +9499,55 @@ others.
 | `[paths] \| length`, `[.[]] \| length` (same)           | `2`, `2`                        | `2`, `2`        |
 | `[leaf_paths]` (same)                                   | `[["a"],["b"]]`                 | `[["a"],["b"]]` |
 | `select(key == 0) \| path(.a)` (same)                   | `["a"]`                         | raises          |
-| `[., 1] \| length`, `{a: .} \| length` on `[1.2.3]`     | raises                          | raises          |
+| `[., 1] \| length`, `[., .] \| length` on `[1.2.3]`     | `2`                             | raises          |
+| `[., 1]` (printed) on `[1.2.3]`                         | raises                          | raises          |
+| `{a: .} \| length` on `[1.2.3]`                         | raises                          | raises          |
 | `[.b] \| length` on `[{"a":1,"b":tru}]`                 | `1`                             | `1`             |
-| `[.a, .b] \| length` (same)                             | raises                          | raises          |
+| `[.a, .b] \| length`, `[.[], 1] \| length` (same)       | `2`, `3`                        | `2`, `3`        |
+| `[.a, .b]` (printed, same)                              | raises                          | raises          |
 | `. as $x \| [$x] \| length` on `[1.2.3]`                | raises                          | raises          |
 
-**Accepted: the collection split inside the cursor evaluator (#3427).** An array stays a
-sequence of cursors, and so never decodes an element it does not read, only when its body is one
-chain of stages that each pass cursors through: navigation (`.`, `.b`, `.[]`, `.[] | .`),
-`limit`/`first`, `select`, `if`, `//` and `try`. `[.] | length` answers, and so do `[.b]`,
-`[limit(1; .)]`, `[first(.b)]`, `[.b | select(true)]`, `[if true then .b else 1 end]`,
-`[.b // 1]`, `[try .b]` and `[.[]]`. Every other construction builds an owned value and decodes
-what it holds, so each of these raises where those answer:
+**Accepted: what is left of the collection split inside the cursor evaluator (#3427, narrowed
+by #3856).** A jq-mode array whose body is a `,` (`[., 1]`, `[., .]`, `[.a, .b]`, `[.[], 1]`,
+`[.b, empty]`, and a `,` head behind a pipe of navigation) holds each document node it collects
+as a cursor, beside whatever the other branches compute, and reads none of them: `[., 1] |
+length` answers over an unreadable value. Printing the array reads every node, so `[., 1]` and
+`[.a, .b]` themselves raise and write nothing; so does a consumer that reads the malformed node
+(`.[i]` of it, `last`, `tojson`, a bind that materializes the array), while one that reads only
+well-formed nodes answers (`first`, `.[0]`, `.[:1]`), and `.[]` streams the elements before the
+malformed one and raises at it. Branches still run in order, so `[.,
+input]` and `[., debug]` keep jq's side-effect order, and a branch's own raise is the array's
+failure (`try [., error("x")] catch .` catches `x`, since no decode came first). An all-scalar
+array (`[.a, .b]`, the per-record `@csv` shape) is still built owned, but a scalar that fails to
+decode is kept as a node instead of raising there, so it fails where it is read.
 
-- a comma body, whatever its branches: `[., 1]`, `[., .]`, `[.a, .b]` (the unreadable value is
-  `.b`), `[.[], 1]`, `[.[] | ., .]`, and even `[.b, empty]`;
-- a collection built per element or inside another: `[[.]]`, `[.[] | [.]]`, since the inner
-  array is materialized to be an element;
+An array stays lazy too when its body is one chain of stages that each pass cursors through:
+navigation (`.`, `.b`, `.[]`, `.[] | .`), `limit`/`first`, `select`, `if`, `//` and `try`
+(`[.]`, `[.b]`, `[limit(1; .)]`, `[first(.b)]`, `[.b | select(true)]`, `[.[]]`). What still
+builds an owned value and decodes what it holds, so each of these raises where those answer:
+
+- a construction held inside another: `[[.]]`, `[.[] | [.]]`, since the inner array is
+  materialized to be an element;
+- a computed stream that is not a `,` body, `[.[] | ., .]`, whose pipe head is not a `,`;
 - an object: `{a: .}`, `{x: .b}`;
 - a variable bind, whether or not `$x` is ever read: `. as $x | 1`, `.b as $x | 1`,
-  `. as $x | [$x]`.
+  `. as $x | [$x]`;
+- yq mode, whose printer materializes a sequence anyway and so keeps its owned routes.
 
-`try` and `?` around the collection do not rescue it (`try ([., 1]) catch "c"`, `[.a, .b]?`),
+`try` and `?` around the remaining collections do not rescue them (`try ([[.]]) catch "c"`),
 because the failure is a decode failure.
 
-The rule a caller can apply is therefore "a single stream of cursors in, one array out":
-anything that has to hold the value beside another value, or under a name, decodes it. It is a
-recorded divergence from #2692's "validated when, and only when, something reads it", not a
-claim of conformance to it. It is accepted rather than fixed, by ADR-0018's decision order: jq
-1.7.1 rejects every such document at parse time, so there is no reference answer to match, and
-the two ways to remove the split both cost more than the split does. Decoding in every
-collection would validate every element of `[.[]]` over a large document, the whole-subtree
-cost semi-indexing exists to avoid, and would break the `LazySeq` streaming `map` and `sort`
-rely on. Keeping cursors in every collection needs an array that mixes cursors and owned
-values, an object and a binding that can hold a cursor, and the same change in both evaluators.
-Every affected input is one the index could not read, a document jq rejects outright, and every
-affected answer is a decode failure, never a wrong value. Revisit it if a caller needs `{a: .}`
-or a bind over an unreadable value to answer; the representation work above is what that would
-take.
+The rule a caller can apply is therefore "an array holds a value beside another value without
+reading it; an object, a bind or an array inside an array decodes it". It is a recorded
+divergence from #2692's "validated when, and only when, something reads it", not a claim of
+conformance to it, and it is accepted rather than fixed by ADR-0018's decision order: jq 1.7.1
+rejects every such document at parse time, so there is no reference answer to match. #3427
+accepted the whole split on implementation cost; #3856 measured it on well-formed input, where
+the eager shapes cost 4-6x the time and memory of their lazy twins (`. as $root | ...`, `[.users,
+1] | length`, `{a: .users}` over a 36 MB document), so the order then prefers the lazy one. The
+objects and binds are the remaining phases of #3856. Every affected input is one the index could
+not read, a document jq rejects outright, and every affected answer is a decode failure, never a
+wrong value.
 
 Every row above is pinned in both entries, so moving one is a decision made here and not a side
 effect: `eval_entry_agrees_with_the_cursor_entry_on_unreadable_values_3266` (`src/jq/eval.rs`)
