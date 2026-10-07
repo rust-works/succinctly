@@ -59129,39 +59129,6 @@ fn scan_for_path_source(expr: &Expr, names: &[String], calls: bool) -> bool {
                 Visit::Skip
             }
         }
-        // #3898: `$x as $y | BODY` binds `$y` to the very node `$x` holds, so a
-        // resolver reading `$y` reads the loop variable. The alias joins the
-        // names the body is scanned for. Only a source that *is* the variable
-        // (`$x`, `($x | .)`): `$r.name as $n` binds a component, not the node,
-        // and counting it would mark `$r` in `reduce .[] as $r ({}; $r.name as
-        // $n | .[$n] = $r.score)` and make its in-place assignment step decline.
-        Expr::As {
-            expr: source,
-            var,
-            body,
-        } if is_loop_var_itself(source, names) => {
-            if scan_for_path_source(body, &with_alias(names, var), calls) {
-                Visit::Found
-            } else {
-                Visit::Skip
-            }
-        }
-        Expr::AsPattern {
-            expr: source,
-            patterns,
-            body,
-        } if matches!(patterns.as_slice(), [Pattern::Var(_)])
-            && is_loop_var_itself(source, names) =>
-        {
-            let [Pattern::Var(var)] = patterns.as_slice() else {
-                unreachable!("guarded by the match above"); // patchcov: coverage tolerate-line reason="unreachable: the arm's guard just matched exactly one Pattern::Var (#3898)"
-            };
-            if scan_for_path_source(body, &with_alias(names, var), calls) {
-                Visit::Found
-            } else {
-                Visit::Skip
-            }
-        }
         Expr::FuncCall { .. }
         | Expr::NamespacedCall { .. }
         | Expr::DefCall { .. }
@@ -59174,8 +59141,43 @@ fn scan_for_path_source(expr: &Expr, names: &[String], calls: bool) -> bool {
                 Visit::Skip
             }
         }
-        _ => Visit::Descend,
+        // #3898: `$x as $y | BODY` binds `$y` to the very node `$x` holds, so a
+        // resolver reading `$y` reads the loop variable. The alias joins the names
+        // the body is scanned for. Only a source that *is* the variable (`$x`,
+        // `($x | .)`): `$r.name as $n` binds a component, not the node, and counting
+        // it would mark `$r` in `reduce .[] as $r ({}; $r.name as $n | .[$n] =
+        // $r.score)` and make its in-place assignment step decline. Nothing found
+        // that way is not "nothing here": the source may itself hold a read (a
+        // passthrough pipe's `if` condition), so the ordinary descent still runs.
+        _ => {
+            if let Some((source, var, body)) = plain_bind(e) {
+                if is_loop_var_itself(source, names)
+                    && scan_for_path_source(body, &with_alias(names, var), calls)
+                {
+                    return Visit::Found;
+                }
+            }
+            Visit::Descend
+        }
     })
+}
+
+/// `SRC as $v | BODY`, spelled as an `as` or as a destructuring bind of the one
+/// pattern `$v`: `(SRC, "v", BODY)` (#3898). Any other pattern binds a component,
+/// not the node.
+fn plain_bind(expr: &Expr) -> Option<(&Expr, &str, &Expr)> {
+    match expr {
+        Expr::As { expr, var, body } => Some((expr, var, body)),
+        Expr::AsPattern {
+            expr,
+            patterns,
+            body,
+        } => match patterns.as_slice() {
+            [Pattern::Var(var)] => Some((expr, var, body)),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// `names` plus `alias`, for scanning the body of an `as` that renames a loop
@@ -77005,6 +77007,9 @@ mod tests {
             "reduce . as $x (.; $x as $y | foo($y))",
             "foreach . as $x (.; $x as $y | ($y.a) = 1; .)",
             "foreach . as $x (.; .; $x as $y | path($y))",
+            // The bind source is scanned too: a passthrough pipe can hold a read.
+            "reduce . as $x (.; ($x | if (path($x) | true) then . else . end) as $y | 1)",
+            "reduce . as $x (.; $x as $x | path($x))",
         ] {
             assert!(
                 gate::<JqSemantics>(src, AnchorScope::On),
@@ -77034,6 +77039,9 @@ mod tests {
             "reduce . as $x (.; $x as $y | .a = $y)",
             "reduce . as $x (.; $x as $y | 1)",
             "reduce . as $x (.; [$x] as $y | path($y))",
+            // Only the fold's own loop variable is aliased, not any variable.
+            "reduce . as $x (.; $z as $y | path($y))",
+            "reduce . as $x (.; $x as $y | $z as $w | path($w))",
             "reduce . as $x (.; path(.a?, .[0], ..))",
             "reduce . as $x (.; .a = $x)",
             "reduce . as $x (0; . + $x)",
@@ -77052,6 +77060,10 @@ mod tests {
         ));
         assert!(!gate::<YqSemantics>(
             "reduce . as $x (.; path($x))",
+            AnchorScope::On
+        ));
+        assert!(!gate::<YqSemantics>(
+            "reduce . as $x (.; $x as $y | path($y))",
             AnchorScope::On
         ));
     }

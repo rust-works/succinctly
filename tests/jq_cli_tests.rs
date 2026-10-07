@@ -85503,6 +85503,8 @@ fn test_fold_loop_variable_rebound_by_as_3898() -> Result<()> {
             r"reduce (.) as $x (.; $x | . as $y | ($y.a) = 9)",
             r#"{"a":9}"#,
         ),
+        // A rebinding that shadows the loop variable's own name.
+        (r"reduce (.) as $x (.; $x as $x | ($x.a) = 9)", r#"{"a":9}"#),
         // Rebound, then read by value: nothing to certify.
         (
             r"reduce (.) as $x (.; $x as $y | [$y] | .[0].a = 9)",
@@ -85515,59 +85517,55 @@ fn test_fold_loop_variable_rebound_by_as_3898() -> Result<()> {
         // A component, and a constructed value, are not the node.
         r"reduce (.) as $x (.; $x.a as $y | ($y) = 9)",
         r"reduce (.) as $x (.; [$x] as $y | path($y))",
+        // A later bind of the same name replaces the alias.
+        r"reduce (.) as $x (.; $x as $y | 1 as $y | path($y))",
         // What #3329 already refuses, rebound or not: a literal INIT, a later fork.
         r"reduce (.) as $x ({a:1}; $x as $y | ($y.a) = 9)",
         r"reduce (.,.) as $x (.; $x as $y | ($y.a) = 9)",
     ];
-    for (args, wrap) in [(&["-c"][..], false), (&["-n", "-c"][..], true)] {
-        for (filter, want) in answering {
+    // Pinned, not endorsed: a `?//` chain of binds is not aliased, so this refuses
+    // where jq answers `{"a":9}`. Flip it if the alias learns `?//`.
+    let residual = r"reduce (.) as $x (.; $x as [$y] ?// $y | ($y.a) = 9)";
+    // Both routes: stdin through the generic evaluator, and `-n 'input | ...'`
+    // through `eval.rs`'s owned fold.
+    for wrap in [false, true] {
+        let run = |filter: &str| -> Result<(String, String, i32)> {
             let program = if wrap {
                 format!("input | {filter}")
             } else {
                 filter.to_string()
             };
-            let mut argv: Vec<&str> = args.to_vec();
+            let args: &[&str] = if wrap { &["-n", "-c"] } else { &["-c"] };
+            let mut argv = args.to_vec();
             argv.push(&program);
             let (stdout, stderr, code) = run_jq_full(&argv, Some(r#"{"a":1}"#))?;
+            Ok((stdout.trim().to_string(), stderr, code))
+        };
+        for (filter, want) in answering {
+            let (stdout, stderr, code) = run(filter)?;
             assert_eq!(
-                (stdout.trim(), code),
+                (stdout.as_str(), code),
                 (want, 0),
-                "#3898: `{program}` ({args:?}) must answer as jq 1.7.1 does; stderr={stderr:?}"
+                "#3898: `{filter}` (wrap={wrap}) must answer as jq 1.7.1 does; stderr={stderr:?}"
             );
         }
         for filter in refusing {
-            let program = if wrap {
-                format!("input | {filter}")
-            } else {
-                filter.to_string()
-            };
-            let mut argv: Vec<&str> = args.to_vec();
-            argv.push(&program);
-            let (stdout, stderr, code) = run_jq_full(&argv, Some(r#"{"a":1}"#))?;
+            let (stdout, stderr, code) = run(filter)?;
             assert_eq!(
-                (stdout.trim(), code),
+                (stdout.as_str(), code),
                 ("", 5),
-                "#3898: `{program}` ({args:?}) must refuse as jq 1.7.1 does; stderr={stderr:?}"
+                "#3898: `{filter}` (wrap={wrap}) must refuse as jq 1.7.1 does; stderr={stderr:?}"
             );
             assert!(
                 stderr.contains("Invalid path expression"),
-                "#3898: `{program}` ({args:?}) refused for the wrong reason: {stderr:?}"
+                "#3898: `{filter}` (wrap={wrap}) refused for the wrong reason: {stderr:?}"
             );
         }
-        // Pinned, not endorsed: a `?//` chain of binds is not aliased, so this refuses
-        // where jq answers `{"a":9}`. Flip it if the alias learns `?//`.
-        let program = if wrap {
-            r"input | reduce (.) as $x (.; $x as [$y] ?// $y | ($y.a) = 9)".to_string()
-        } else {
-            r"reduce (.) as $x (.; $x as [$y] ?// $y | ($y.a) = 9)".to_string()
-        };
-        let mut argv: Vec<&str> = args.to_vec();
-        argv.push(&program);
-        let (stdout, _, code) = run_jq_full(&argv, Some(r#"{"a":1}"#))?;
+        let (stdout, _, code) = run(residual)?;
         assert_eq!(
-            (stdout.trim(), code),
+            (stdout.as_str(), code),
             ("", 5),
-            "#3898 residual: `{program}`"
+            "#3898 residual (wrap={wrap}): `{residual}`"
         );
     }
     Ok(())
