@@ -61089,6 +61089,62 @@ fn test_catch_handler_optional_navigation_reaches_the_register_node_3891() -> Re
     Ok(())
 }
 
+/// #3965: a `try` body that always raises (`error(.a)`, `.a | error`) emits nothing, and
+/// the raise backtracks to the `try`'s fork point, so what its message or earlier stages
+/// navigated is undone and the register is where the `try` entered. `$x` after the handler
+/// therefore re-establishes (`[]`), where the resolver read the navigation as moving it
+/// and refused. A body that emits before it raises still moved it. Every row captured
+/// live from jq 1.7.1.
+#[test]
+fn test_always_raising_try_body_leaves_the_register_where_it_entered_3965() -> Result<()> {
+    for (doc, program, want) in [
+        (
+            r#"{"a":{"b":null},"c":2}"#,
+            "path(. as $x | try error(.a) catch . | $x)",
+            "[]",
+        ),
+        (
+            r#"{"a":{"b":null},"c":2}"#,
+            "path(. as $x | try error(.a) catch 5 | $x)",
+            "[]",
+        ),
+        (
+            r#"{"a":{"b":null},"c":2}"#,
+            "path(. as $x | try error(.c) catch . | $x)",
+            "[]",
+        ),
+        (
+            r#"{"a":{"b":null},"c":2}"#,
+            "path(. as $x | try (.a | error) catch . | $x)",
+            "[]",
+        ),
+        (
+            r#"{"a":{"b":null},"c":2}"#,
+            "path(. as $x | try (.a | error(.b)) catch . | $x)",
+            "[]",
+        ),
+        (
+            r#"[{"a":1},2]"#,
+            "path(. as $x | try error(.[0]) catch . | $x)",
+            "[]",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(doc))?;
+        assert_eq!(code, 0, "#3965: `{program}`: stderr {stderr:?}");
+        assert_eq!(stdout.trim(), want, "#3965: `{program}`");
+    }
+    // A body that emitted before it raised did move the register: still not a path.
+    let doc = r#"{"a":{"b":null},"c":2}"#;
+    let program = r#"path(. as $x | try (.a, error("x")) catch . | $x)"#;
+    let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(doc))?;
+    assert_eq!(code, 5, "#3965: `{program}`: stdout {stdout:?}");
+    assert!(
+        stderr.contains("Invalid path expression with result"),
+        "#3965: `{program}`: {stderr:?}"
+    );
+    Ok(())
+}
+
 /// #3891: the handler is seeded as the register's node only where jq keeps it
 /// tracked, and not just where the payload happens to share its storage. A payload
 /// built by value (`[.][0]`, `[.] | add`, `{"a":.} | .a`) keeps the register's `Rc`
@@ -114408,12 +114464,13 @@ fn test_register_catch_handler_over_register_keeping_stage_3767() -> Result<()> 
             with_root,
             5,
         ),
+        // (#3965 answers the next row: a body ending in `error` never emits, so it is jq's `[]`.)
         (
             doc,
             r#"path(. as $x | try (select(.) | error("z")) catch . | $x)"#,
+            "[]\n",
             "",
-            with_root,
-            5,
+            0,
         ),
         (
             doc,
