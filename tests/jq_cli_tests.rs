@@ -61195,9 +61195,41 @@ fn test_transpose_follows_jqs_definition_by_value_3950() -> Result<()> {
         assert_eq!(code, 0, "#3950: `{input}`: stdout {stdout:?}");
         assert_eq!(stdout.trim(), want, "#3950: `{input}`");
     }
-    // `?` suppresses the failure instead of raising it.
-    let (stdout, code) = run_jq_stdin("[transpose?]", "5", &["-c"])?;
-    assert_eq!((stdout.trim(), code), ("[]", 0));
+    // `?` suppresses the failure instead of raising it, for the input's own
+    // type and for a row that cannot be indexed alike.
+    for input in ["5", r#"[[1],"a"]"#, "[[1],true]"] {
+        let (stdout, code) = run_jq_stdin("[transpose?]", input, &["-c"])?;
+        assert_eq!((stdout.trim(), code), ("[]", 0), "#3950: `{input}`");
+    }
+    Ok(())
+}
+
+/// #3950: an output far larger than its input is refused instead of built. jq
+/// builds all `width x rows` cells (this input is ~4 million, and the same shape
+/// at 100k is ~10^10, which exhausts the host); a rectangular input of the same
+/// output size, and a ragged one within the factor, are untouched.
+#[test]
+fn test_transpose_refuses_an_output_far_larger_than_its_input_3950() -> Result<()> {
+    let zeros = vec!["0"; 2000].join(",");
+    let empties = vec!["[]"; 2000].join(",");
+    let ragged = format!("[[{zeros}],{empties}]");
+    let (stdout, stderr, code) = run_jq_full(&["-c", "transpose | length"], Some(&ragged))?;
+    assert_eq!(code, 5, "stdout {stdout:?}");
+    assert!(
+        stderr.contains("transpose: maximum output size exceeded"),
+        "{stderr:?}"
+    );
+    // A resource limit is not catchable, by `try` or `?`.
+    let (stdout, code) = run_jq_stdin("[try transpose catch 1]", &ragged, &["-c"])?;
+    assert_eq!(code, 5, "stdout {stdout:?}");
+    // Rectangular: 1500 x 1500 cells, as large as the output, is answered.
+    let row = vec!["1"; 1500].join(",");
+    let rect = format!("[{}]", vec![format!("[{row}]"); 1500].join(","));
+    let (stdout, code) = run_jq_stdin("transpose | map(length) | unique", &rect, &["-c"])?;
+    assert_eq!((stdout.trim(), code), ("[1500]", 0));
+    // Ragged but within 16x the cells it holds: answered, padded.
+    let (stdout, code) = run_jq_stdin("transpose | length", "[[1,2,3],[],[]]", &["-c"])?;
+    assert_eq!((stdout.trim(), code), ("3", 0));
     Ok(())
 }
 

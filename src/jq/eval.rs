@@ -71383,8 +71383,18 @@ fn builtin_transpose<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// Cells `transpose` may build for an input of any shape (#3950).
+const TRANSPOSE_FREE_CELLS: usize = 1 << 20;
+
+/// How many times the cells the input holds `transpose` may build before it
+/// refuses (#3950), see [`transpose_owned`].
+const TRANSPOSE_RAGGED_FACTOR: usize = 16;
+
 /// `transpose` of an already-materialized value (#3950), see
-/// [`builtin_transpose`].
+/// [`builtin_transpose`]. Raises a resource limit rather than build an output
+/// of more than [`TRANSPOSE_FREE_CELLS`] cells that is also over
+/// [`TRANSPOSE_RAGGED_FACTOR`] times the input -- a divergence from jq (which
+/// would exhaust memory), recorded in `docs/compliance/jq/limitations.md`.
 fn transpose_owned<S: EvalSemantics>(input: &OwnedValue) -> Result<OwnedValue, EvalError> {
     let (rows, iterates) = transpose_rows::<S>(input)?;
     if !iterates {
@@ -71394,9 +71404,13 @@ fn transpose_owned<S: EvalSemantics>(input: &OwnedValue) -> Result<OwnedValue, E
     // that cannot be indexed by a number raises -- before any column is built,
     // and whatever its own length was.
     let mut width = 0;
+    let mut held = 0usize;
     for row in &rows {
         match row {
-            OwnedValue::Array(cells) => width = width.max(cells.len()),
+            OwnedValue::Array(cells) => {
+                width = width.max(cells.len());
+                held = held.saturating_add(cells.len());
+            }
             OwnedValue::Null => {}
             other => {
                 return Err(EvalError::cannot_index(
@@ -71405,6 +71419,17 @@ fn transpose_owned<S: EvalSemantics>(input: &OwnedValue) -> Result<OwnedValue, E
                 ))
             }
         }
+    }
+    // jq builds `width x rows` cells, which a ragged input makes far larger than
+    // the input (one 100k-cell row among 100k empty ones is ~10^10 cells from a
+    // few hundred KB), and would exhaust the host. A rectangular input is exactly
+    // as big as its output and a modestly ragged one is allowed
+    // `TRANSPOSE_RAGGED_FACTOR` times that; a small input may take any shape.
+    let cells = width.saturating_mul(rows.len());
+    if cells > TRANSPOSE_FREE_CELLS.max(TRANSPOSE_RAGGED_FACTOR.saturating_mul(held + rows.len())) {
+        return Err(EvalError::resource_limit(
+            "transpose: maximum output size exceeded",
+        ));
     }
     let mut columns = vec_with_capacity(width);
     for i in 0..width {
