@@ -2915,6 +2915,62 @@ fn test_yq_alternative_decides_per_left_output_2817() -> Result<()> {
     Ok(())
 }
 
+/// #2817: `//` in path position -- the target of an assignment, `del` -- decides per left output
+/// too: a truthy branch is the target, a falsy one is replaced by `right`'s branches or, when
+/// `right` names none, is itself the target. Captured from yq v4.53.3 on
+/// `{"a":null,"b":1,"c":2}` (jq's collect-then-fallback would edit only the truthy `b`).
+#[test]
+fn test_yq_alternative_in_path_position_2817() -> Result<()> {
+    let input = r#"{"a":null,"b":1,"c":2}"#;
+    for (filter, want) in [
+        ("((.a, .b) // .c) = 9", r#"{"a":null,"b":9,"c":9}"#),
+        ("((.a, .b) // .c) |= 9", r#"{"a":null,"b":9,"c":9}"#),
+        ("del((.a, .b) // .c)", r#"{"a":null}"#),
+        ("((.a, .b) // select(false)) = 9", r#"{"a":9,"b":9,"c":2}"#),
+        ("(select(false) // .c) = 9", r#"{"a":null,"b":1,"c":9}"#),
+        ("(.a // .b) = 9", r#"{"a":null,"b":9,"c":2}"#),
+        ("(.a // .b) |= . + 1", r#"{"a":null,"b":2,"c":2}"#),
+        ("del(.a // .b // .c)", r#"{"a":null,"c":2}"#),
+    ] {
+        for route in [&[][..], &["--arg", "z", "1"][..]] {
+            let mut args = vec!["-o", "json", "-I", "0"];
+            args.extend_from_slice(route);
+            let (out, stderr, code) = run_yq_stdin_with_stderr(filter, input, &args)?;
+            assert_eq!(code, 0, "{filter} {route:?}: {stderr}");
+            assert_eq!(out.trim(), want, "{filter} {route:?}");
+        }
+    }
+    for (input, filter, want) in [
+        (
+            r#"{"a":null,"b":null,"c":2}"#,
+            "((.a, .b) // .c) = 9",
+            r#"{"a":null,"b":null,"c":9}"#,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "((.a, .b) // .c) = 9",
+            r#"{"a":9,"b":9}"#,
+        ),
+        (r#"{"a":[null,1]}"#, "(.a[] // 9) |= 5", r#"{"a":[null,5]}"#),
+        (
+            r#"{"a":[null,1,null]}"#,
+            "(.a[] // .a[0]) |= 5",
+            r#"{"a":[5,5,null]}"#,
+        ),
+        (
+            r#"{"a":[null,1,2]}"#,
+            "del(.a[] // select(false))",
+            r#"{"a":[]}"#,
+        ),
+    ] {
+        let (out, stderr, code) =
+            run_yq_stdin_with_stderr(filter, input, &["-o", "json", "-I", "0"])?;
+        assert_eq!(code, 0, "{input} | {filter}: {stderr}");
+        assert_eq!(out.trim(), want, "{input} | {filter}");
+    }
+    Ok(())
+}
+
 /// #2817: a pipe headed by yq's `//` carries each output to the next stage with its own source
 /// position, so `line`/`column` read after the operator see the node a truthy output came from
 /// and 0 for a replacement computed by the right side -- including the mix of the two
@@ -2929,6 +2985,10 @@ fn test_yq_alternative_keeps_source_positions_2817() -> Result<()> {
         (".a[] // select(false) | line", "2\n3\n4\n5"),
         (".a[] // .a[0] | line", "2\n3\n2\n5"),
         (".a[] | (. // 9) | line", "2\n3\n0\n5"),
+        // not only at the head of the pipe
+        (".a | .[] // 9 | line", "2\n3\n0\n5"),
+        (".a | (.[] // 9) | [., line]", "[1,2]\n[2,3]\n[9,0]\n[3,5]"),
+        (".a | .[] // 9 | line | . + 1", "3\n4\n1\n6"),
     ] {
         for route in [&[][..], &["--arg", "z", "1"][..]] {
             let mut args = vec!["-o", "json", "-I", "0"];

@@ -2822,11 +2822,15 @@ stage is such a `//` is driven by the streaming pipe so a document node and a co
 replacement can reach the next stage together (`.a[] // 9 | line`). Checked against yq on 2,590
 filter/input rows and 24 position rows, on the cursor and the DOM route.
 
+In path position (`((.a, .b) // .c) = 9`, `del((.a, .b) // .c)`) the rule is the same
+(`resolve_alternative_per_left_output_sink`): the truthy `b` and the replacement `c` are written, not `b` alone.
+
 One residual is *not* about `//`: yq's key lookup **auto-creates** a missing key in the tree it
 is reading, so `.zz // .[]?` on `{"a":1}` iterates a document that now holds `zz: null` and
 prints `1`, `null` (it prints `null`, `1`, `null` for `(.zz, .[]?)` with no `//` at all). The
 25 rows of that grid that still differ are all this (`.a.b // .a`, `(.a // .b) = 5` on a
-document with no `a`, ...) plus an unrelated `map` over a mapping.
+document with no `a`, ...) plus an unrelated `map` over a mapping; and `del((.a, .b) // .zz)`, where
+yq deletes the key it just created and loses `a` as well (`{"c":2}`; here `{"a":null,"c":2}`).
 
 ### An `and`/`or` operand's evaluation context — resolved for `and`/`or` (#2540); `=`'s right side remains open
 

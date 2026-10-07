@@ -10769,10 +10769,12 @@ fn eval_single_pipe<S: EvalSemantics, V: DocumentValue>(
     // document node with a value computed by the right operand (`.a[] // 9`). The collected
     // result below has no shape for that mix -- it would turn the nodes into plain values, and a
     // `line`/`column` read after the operator would lose its source position -- while the
-    // streaming driver carries each output with its own cursor.
+    // streaming driver carries each output with its own cursor. Any stage but the last: the
+    // last one's result is the pipe's, and nothing reads a position after it.
     if S::ALTERNATIVE_IS_PER_LEFT_OUTPUT
-        && exprs.len() > 1
-        && matches!(strip_parens(&exprs[0]), Expr::Alternative(..))
+        && exprs[..exprs.len().saturating_sub(1)]
+            .iter()
+            .any(|stage| matches!(strip_parens(stage), Expr::Alternative(..)))
     {
         return collect_each_generic::<S, V>(whole.get(exprs), value, optional, cursor);
     }
@@ -11547,8 +11549,9 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // `needs_path_context` has no `Expr::Alternative` arm, so a pipe whose
         // only path-context read sits inside a `//` is still never routed to
         // path-context evaluation, and this arm does not change that table.
-        // yq's `//` decides per left output (#2817): the streaming implementation, collected,
-        // so the two routes cannot disagree about which outputs it produces.
+        // yq mode (#2817): the arm below is jq's collect-then-fallback rule, which yq's `//` does
+        // not follow -- it decides per left output, so this route is the streaming implementation,
+        // collected, and the two cannot disagree about which outputs it produces.
         Expr::Alternative(..) if S::ALTERNATIVE_IS_PER_LEFT_OUTPUT => {
             collect_each_generic::<S, V>(expr, value, optional, cursor)
         }
@@ -17623,13 +17626,11 @@ fn each_alternative_generic<S: EvalSemantics, V: DocumentValue>(
 /// `is_falsy`, a decoded or computed value by its truthiness, and the lazy shapes
 /// (`keys`, an index range, a built array) are always truthy -- a lazy array that fails to
 /// build raises where its consumer pulls it, not here.
-fn generic_item_is_truthy<V: DocumentValue, S: EvalSemantics>(
-    item: &GenericItem<V>,
-) -> Result<bool, Control> {
+fn generic_item_is_truthy<V: DocumentValue>(item: &GenericItem<V>) -> Result<bool, Control> {
     match item {
-        GenericItem::One(v) => to_owned::<S, _>(v)
-            .map(|owned| owned.is_truthy())
-            .map_err(Control::Error),
+        // Falsy is `null` or `false`, which the value says without decoding a container (#2692's
+        // rule for a cursor: reading truthiness decodes nothing).
+        GenericItem::One(v) => Ok(!(v.is_null() || v.as_bool() == Some(false))),
         GenericItem::OneCursor(c) | GenericItem::OneCursorValue(c, _) => Ok(cursor_is_truthy(c)),
         GenericItem::Owned(o) => Ok(o.is_truthy()),
         GenericItem::LazyKeys { .. } | GenericItem::LazyIndexRange(_) | GenericItem::LazySeq(_) => {
@@ -17662,7 +17663,7 @@ fn each_alternative_per_left_output_generic<S: EvalSemantics, V: DocumentValue>(
         cursor,
         &mut |item: GenericItem<V>| {
             produced = true;
-            match generic_item_is_truthy::<V, S>(&item) {
+            match generic_item_is_truthy::<V>(&item) {
                 Err(control) => return stop_with_escape(&mut escape, control),
                 Ok(true) => {
                     let demand = sink.push(item);

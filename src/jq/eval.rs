@@ -39813,6 +39813,11 @@ fn resolve_alternative_sink<'a, S: EvalSemantics>(
     keep: Keep,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
+    if S::ALTERNATIVE_IS_PER_LEFT_OUTPUT {
+        return resolve_alternative_per_left_output_sink::<S>(
+            left, right, value, trackable, snapshot, frame, keep, sink,
+        );
+    }
     if let Expr::Literal(lit) = unwrap_paren(left) {
         if !literal_to_owned(lit).is_truthy() {
             return resolve_node_sink::<S>(
@@ -39855,6 +39860,100 @@ fn resolve_alternative_sink<'a, S: EvalSemantics>(
             &mut |branch| sink(carry_frame_register(right, branch, frame)),
         ),
         other => other,
+    }
+}
+
+/// Deliver one branch of [`resolve_alternative_per_left_output_sink`] to the consumer, recording a
+/// consumer stop as that resolution's verdict.
+fn deliver_alternative_branch<'a>(
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+    verdict: &mut Option<ResolveFlow>,
+    branch: PathBranch<'a>,
+) -> Demand {
+    match sink(branch) {
+        Demand::Continue => Demand::Continue,
+        Demand::Stop => {
+            *verdict = Some(ResolveFlow::Stopped);
+            Demand::Stop
+        }
+    }
+}
+
+/// yq's `//` in path position (`EvalSemantics::ALTERNATIVE_IS_PER_LEFT_OUTPUT`, #2817): what an
+/// assignment, `del` or `path` names. Each left branch is decided on its own -- a truthy one is
+/// delivered, a falsy one is replaced by `right`'s branches or, when `right` names none, delivered
+/// itself -- and `right` resolves on its own only when `left` named nothing at all. Captured from
+/// yq v4.53.3 on `{"a":null,"b":1,"c":2}`: `((.a, .b) // .c) = 9` writes `b` and `c`,
+/// `((.a, .b) // select(false)) = 9` writes `a` and `b`, `del((.a, .b) // .zz)` deletes `b` and
+/// the (created) `zz`.
+///
+/// `verdict` holds what a nested resolution answered from inside `left`'s sink, which can answer
+/// only [`Demand`]: a stop by the consumer, or an escape `right` raised. It outranks `left`'s own
+/// flow, but a halt does not (it is not catchable).
+#[allow(clippy::too_many_arguments)] // STYLE-0004: the resolver's own established argument set, as `resolve_alternative_sink`
+fn resolve_alternative_per_left_output_sink<'a, S: EvalSemantics>(
+    left: &Expr,
+    right: &Expr,
+    value: &'a OwnedValue,
+    trackable: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
+    keep: Keep,
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
+    let mut produced = false;
+    let mut verdict: Option<ResolveFlow> = None;
+    let flow = resolve_node_sink::<S>(
+        left,
+        value,
+        trackable,
+        snapshot,
+        frame,
+        keep,
+        &mut |branch| {
+            produced = true;
+            if branch.value.is_truthy() {
+                return deliver_alternative_branch(sink, &mut verdict, branch);
+            }
+            let mut replaced = false;
+            let right_flow = resolve_node_sink::<S>(
+                right,
+                value,
+                trackable,
+                snapshot,
+                frame,
+                keep,
+                &mut |replacement| {
+                    replaced = true;
+                    sink(carry_frame_register(right, replacement, frame))
+                },
+            );
+            match right_flow {
+                ResolveFlow::Exhausted if replaced => Demand::Continue,
+                // `right` names nothing: the falsy branch stays.
+                ResolveFlow::Exhausted => deliver_alternative_branch(sink, &mut verdict, branch),
+                other => {
+                    verdict = Some(other);
+                    Demand::Stop
+                }
+            }
+        },
+    );
+    if matches!(flow, ResolveFlow::Escaped(EvalEscape::Halt(_))) {
+        return flow;
+    }
+    match (verdict, flow) {
+        (Some(answer), _) => answer,
+        (None, ResolveFlow::Exhausted) if !produced => resolve_node_sink::<S>(
+            right,
+            value,
+            trackable,
+            snapshot,
+            frame,
+            keep,
+            &mut |branch| sink(carry_frame_register(right, branch, frame)),
+        ),
+        (None, other) => other,
     }
 }
 
