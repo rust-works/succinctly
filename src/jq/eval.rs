@@ -9157,7 +9157,7 @@ fn eval_each_owned_fast_path<S: EvalSemantics>(
 /// side) and the resolver's owned evaluation, and a new arm there would widen
 /// what both accept. Called from the two owned re-entries that reach the
 /// bridge, [`eval_each_owned`] and `eval_generic::eval_on_owned`, and (#3439)
-/// from [`eval_owned_pure_in`]'s opt-in `lengths` arm, which only
+/// from [`eval_owned_pure_in`]'s opt-in `door` arms, which only
 /// [`owned_select_door`] and [`owned_cond_verdict`] (an `until`/`while`
 /// condition, #3697) switch on: both read the count as a truth value, so its
 /// answer changes nothing about what a closed expression or the resolver
@@ -9176,6 +9176,78 @@ pub(crate) fn eval_owned_length(expr: &Expr, input: &OwnedValue) -> Option<Owned
         },
         _ => None,
     }
+}
+
+/// The [`eval_owned_pure_in`] `door` arms that answer one builtin over the
+/// owned input (#3707): `has(<literal>)`, `keys`, `startswith(<literal>)`,
+/// `endswith(<literal>)` and `tostring`.
+///
+/// Each answers only the shape whose result the reindex bridge hands back
+/// identically, and returns `None` for everything else, so a type mismatch, a
+/// `null` input, a non-literal or generator argument and every raised error
+/// stay the bridge's -- with its diagnostics and its per-mode rules (jq's
+/// `Cannot check whether ... has a ... key`, yq's permissive `false`). The
+/// argument is a literal so there is no generator to fan out and nothing to
+/// evaluate: a literal cannot raise, emit twice or touch the input.
+///
+/// The results are fresh values (a boolean, a new array, a new string), or for
+/// `tostring` of a string the input's own handle, as the bridge's
+/// [`tostring_owned`] hands it back.
+fn eval_owned_door_arm<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<Result<OwnedValue, EvalError>> {
+    let Expr::Builtin(builtin) = expr else {
+        return None;
+    };
+    let literal = |arg: &Expr| match unwrap_paren(arg) {
+        Expr::Literal(lit) => Some(literal_to_owned(lit)),
+        _ => None,
+    };
+    let answer = match builtin {
+        Builtin::Has(key) => match (input, literal(key)?) {
+            (OwnedValue::Object(fields), OwnedValue::String(key)) => {
+                OwnedValue::Bool(fields.contains_key(&*key))
+            }
+            (
+                OwnedValue::Array(items),
+                key @ (OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)),
+            ) => OwnedValue::Bool(match numeric_key_to_array_index::<S>(&key) {
+                None => false,
+                Some(idx) => index_in_array_bounds::<S>(idx, items.len() as i64),
+            }),
+            _ => return None,
+        },
+        Builtin::Keys => match input {
+            OwnedValue::Object(fields) => {
+                let mut keys: Vec<&str> = fields.keys().map(String::as_str).collect();
+                keys.sort_unstable();
+                OwnedValue::array_from(keys.into_iter().map(OwnedValue::string).collect())
+            }
+            OwnedValue::Array(items) => {
+                OwnedValue::array_from((0..items.len() as i64).map(OwnedValue::Int).collect())
+            }
+            _ => return None,
+        },
+        Builtin::Startswith(pattern) | Builtin::Endswith(pattern) => {
+            match (input, literal(pattern)?) {
+                (OwnedValue::String(s), OwnedValue::String(pattern)) => {
+                    OwnedValue::Bool(if matches!(builtin, Builtin::Startswith(_)) {
+                        s.starts_with(&*pattern)
+                    } else {
+                        s.ends_with(&*pattern)
+                    })
+                }
+                _ => return None,
+            }
+        }
+        Builtin::ToString => match input {
+            OwnedValue::String(_) => input.clone(),
+            _ => OwnedValue::String(owned_to_string::<S>(input).into()),
+        },
+        _ => return None,
+    };
+    Some(Ok(answer))
 }
 
 /// `add`/`min`/`max` over an owned container, computed here instead of
@@ -10470,7 +10542,7 @@ fn eval_each_owned_past_front_doors<S: EvalSemantics>(
 /// value), the bridge was.
 ///
 /// The condition is answered by [`owned_cond_verdict`] -- [`eval_owned_pure_in`]
-/// with `lengths` on, shared with `until`/`while` (#3697) -- the
+/// with `door` on, shared with `until`/`while` (#3697) -- the
 /// grammar [`eval_owned_pure`] already pins against the bridge (comparisons,
 /// `and`/`or`/`not`, `type`, navigation as an operand) plus `length` over a
 /// container. `select` yields its input unchanged, so a truthy answer emits
@@ -55926,9 +55998,11 @@ fn produces_fresh_value(expr: &Expr) -> bool {
 /// separation exists. #2397 moved that split from a pre-walk into the arms
 /// themselves; the rule is unchanged.
 ///
-/// One operand is opt-in rather than part of the grammar: `length` over an
-/// array or object, behind [`eval_owned_pure_in`]'s `lengths` flag (#3439).
-/// This function is the `lengths: false` entry point every caller but
+/// A handful of operands are opt-in rather than part of the grammar --
+/// `length` over an array or object (#3439), and `has`, `keys`,
+/// `startswith`/`endswith`, `tostring` and `[e]` (#3707) -- behind
+/// [`eval_owned_pure_in`]'s `door` flag. This function is the `door: false`
+/// entry point every caller but
 /// [`owned_select_door`] and [`owned_cond_verdict`] uses, so its grammar is
 /// unchanged.
 ///
@@ -55951,34 +56025,56 @@ fn eval_owned_pure<S: EvalSemantics>(
     eval_owned_pure_in::<S>(expr, input, position, false)
 }
 
-/// [`eval_owned_pure`]'s body, with `lengths` opting in one more operand:
+/// [`eval_owned_pure`]'s body, with `door` opting in more operands:
 /// `length` over an owned array or object, answered by [`eval_owned_length`]
-/// (#3439).
+/// (#3439), and the arms of [`eval_owned_door_arm`] (#3707) -- `has`, `keys`,
+/// `startswith`/`endswith`, `tostring` and `[e]`.
 ///
-/// `lengths` is a parameter and not an arm of [`eval_owned_pure`] because
+/// `door` is a parameter and not an arm of [`eval_owned_pure`] because
 /// that function also decides what [`closed_expr_to_owned`] and the
 /// resolver's owned evaluation accept, and #3477 kept `length` out of the
 /// shared evaluator for that reason. Only [`owned_select_door`] and
 /// [`owned_cond_verdict`], which read the answer as a truth value, ask for it,
-/// so a `length` in a `select` condition or an `until`/`while` condition
-/// (#3697) is settled from the tree instead of through the re-index bridge.
+/// so such an operand in a `select` condition or an `until`/`while`
+/// condition (#3697, #3707) is settled from the tree instead of through the
+/// re-index bridge. Because the answer is only ever read as a truth value,
+/// none of these arms is reachable in [`ResultPosition::Fresh`]: an arm that
+/// can carry a navigated subvalue (`[e]`) declines there.
 ///
-/// Every recursive call below passes `lengths` on, so a `length` nested in a
+/// Every recursive call below passes `door` on, so an operand nested in a
 /// comparison, a boolean or a pipe stage is reached under the same flag as
-/// the condition around it.
+/// the condition around it. A new door arm must pass it on the same way.
 fn eval_owned_pure_in<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
     position: ResultPosition,
-    lengths: bool,
+    door: bool,
 ) -> Option<Result<OwnedValue, EvalError>> {
     match expr {
-        Expr::Paren(inner) => eval_owned_pure_in::<S>(inner, input, position, lengths),
+        Expr::Paren(inner) => eval_owned_pure_in::<S>(inner, input, position, door),
         // A fresh integer, never a subvalue of `input`, so it is admitted in
         // either position (see `eval_owned_length`). Everything that is not
         // an array or an object declines, and the bridge keeps its
         // diagnostics and its per-mode rules.
-        Expr::Builtin(Builtin::Length) if lengths => eval_owned_length(expr, input).map(Ok),
+        Expr::Builtin(Builtin::Length) if door => eval_owned_length(expr, input).map(Ok),
+        Expr::Builtin(
+            Builtin::Has(_)
+            | Builtin::Keys
+            | Builtin::Startswith(_)
+            | Builtin::Endswith(_)
+            | Builtin::ToString,
+        ) if door => eval_owned_door_arm::<S>(expr, input),
+        // `[e]` for a single-output pure `e` is the one-element array of
+        // `e`'s answer: no generator to collect, so the evaluator's own
+        // array collection is this and an error from `e` is its error. An
+        // operand only (see the function's doc comment): the element may be
+        // a navigated subvalue.
+        Expr::Array(inner) if door && position == ResultPosition::Operand => {
+            match eval_owned_pure_in::<S>(inner, input, ResultPosition::Operand, door)? {
+                Ok(v) => Some(Ok(OwnedValue::array_from(vec![v]))),
+                Err(e) => Some(Err(e)),
+            }
+        }
         // `eval_single`'s own `Expr::Literal` arm, verbatim.
         Expr::Literal(lit) => Some(Ok(literal_to_owned(lit))),
         // `eval_single`'s own `Expr::TrackedVar` arm, verbatim (#2042). The
@@ -56051,11 +56147,11 @@ fn eval_owned_pure_in<S: EvalSemantics>(
         // `.a.b`'s message — pinned by
         // `compare_condition_reports_the_right_operands_error_first_2048`.
         Expr::Compare { op, left, right } => {
-            let r = match eval_owned_pure_in::<S>(right, input, ResultPosition::Operand, lengths)? {
+            let r = match eval_owned_pure_in::<S>(right, input, ResultPosition::Operand, door)? {
                 Ok(v) => v,
                 Err(e) => return Some(Err(e)),
             };
-            let l = match eval_owned_pure_in::<S>(left, input, ResultPosition::Operand, lengths)? {
+            let l = match eval_owned_pure_in::<S>(left, input, ResultPosition::Operand, door)? {
                 Ok(v) => v,
                 Err(e) => return Some(Err(e)),
             };
@@ -56066,8 +56162,8 @@ fn eval_owned_pure_in<S: EvalSemantics>(
         // *without evaluating the right operand at all* (which is what makes
         // `false and error("x")` answer `false` rather than raising), and
         // otherwise the answer is the right operand's own truthiness.
-        Expr::And(left, right) => eval_owned_pure_boolean::<S>(left, right, input, false, lengths),
-        Expr::Or(left, right) => eval_owned_pure_boolean::<S>(left, right, input, true, lengths),
+        Expr::And(left, right) => eval_owned_pure_boolean::<S>(left, right, input, false, door),
+        Expr::Or(left, right) => eval_owned_pure_boolean::<S>(left, right, input, true, door),
         // A pure pipe threads one value stage to stage — `eval_pipe`'s own
         // shape once every stage is single-output (and, per
         // [`is_owned_pure_expr`], once no stage needs path context, which is
@@ -56092,14 +56188,14 @@ fn eval_owned_pure_in<S: EvalSemantics>(
                         stage,
                         stage_input,
                         ResultPosition::Operand,
-                        lengths,
+                        door,
                     )? {
                         Ok(v) => v,
                         Err(e) => return Some(Err(e)),
                     },
                 );
             }
-            eval_owned_pure_in::<S>(last, current.as_ref().unwrap_or(input), position, lengths)
+            eval_owned_pure_in::<S>(last, current.as_ref().unwrap_or(input), position, door)
         }
         _ => None,
     }
@@ -56132,16 +56228,16 @@ fn eval_owned_pure_boolean<S: EvalSemantics>(
     right: &Expr,
     input: &OwnedValue,
     short_circuit: bool,
-    lengths: bool,
+    door: bool,
 ) -> Option<Result<OwnedValue, EvalError>> {
-    let l = match eval_owned_pure_in::<S>(left, input, ResultPosition::Operand, lengths)? {
+    let l = match eval_owned_pure_in::<S>(left, input, ResultPosition::Operand, door)? {
         Ok(v) => v,
         Err(e) => return Some(Err(e)),
     };
     if l.is_truthy() == short_circuit {
         return Some(Ok(OwnedValue::Bool(short_circuit)));
     }
-    let r = match eval_owned_pure_in::<S>(right, input, ResultPosition::Operand, lengths)? {
+    let r = match eval_owned_pure_in::<S>(right, input, ResultPosition::Operand, door)? {
         Ok(v) => v,
         Err(e) => return Some(Err(e)),
     };
@@ -59060,7 +59156,7 @@ impl<'e> LoopOperand<'e> {
 /// round and quadratic over the loop, where jq pays nothing (10000 rounds took
 /// 12.7 s on a debug binary, 20000 took 50.9 s).
 ///
-/// The condition is answered by [`eval_owned_pure_in`] with `lengths` on, the
+/// The condition is answered by [`eval_owned_pure_in`] with `door` on, the
 /// opt-in [`owned_select_door`] already takes for the same reason: the answer
 /// is read as a truth value and nothing else. Both routes use it -- the
 /// `until_step`/`while_step` pair here ([`LoopOperand::fork_cond`]) and
@@ -103750,6 +103846,18 @@ mod tests {
             "select(length > 0) | select(type != \"null\")",
             "select(length > 0) | length",
             "select(true) | select(false)",
+            // #3707: the builtins the door's condition now answers.
+            "select(has(\"a\"))",
+            "select(has(0))",
+            "select(has(1.5))",
+            "select(.a | has(\"b\"))",
+            "select((keys | length) == 2)",
+            "select(startswith(\"x\"))",
+            "select(endswith(\"\"))",
+            "select(tostring == \"1\")",
+            "select(tostring | startswith(\"[\"))",
+            "select(([.a] | length) == 1)",
+            "select(has(\"a\") and .a == 1) | length",
             // What follows a settled `select` keeps its own handling: a stage
             // that reads the node's place in the document, one that raises,
             // a later `select` the door cannot answer, and a longer chain.
@@ -103928,7 +104036,18 @@ mod tests {
     #[test]
     fn eval_owned_pure_still_declines_length_by_default_3439() {
         let array = OwnedValue::array_from(vec![OwnedValue::Int(1)]);
-        for src in ["length == 1", "length > 0 and type == \"array\"", "length"] {
+        // #3707's arms are the door's too, and so are not the default grammar's.
+        for src in [
+            "length == 1",
+            "length > 0 and type == \"array\"",
+            "length",
+            "has(0)",
+            "keys == keys",
+            "(keys | length) == 1",
+            "(tostring | startswith(\"[\"))",
+            "[.] == [.]",
+            "([.] | length) == 1",
+        ] {
             let expr = parse(src).unwrap();
             assert!(
                 eval_owned_pure::<JqSemantics>(&expr, &array, ResultPosition::Operand).is_none(),
@@ -103965,6 +104084,36 @@ mod tests {
             "(.a | length) == 1 and .a.b == 2",
             "length >= 1 and .a == 1",
             "length < 1 or .[0] == 1",
+            // #3707: the builtins and the array construction the door now takes.
+            "has(\"a\")",
+            "has(\"b\") and .a == 1",
+            "has(\"a\") or has(\"b\")",
+            "has(0)",
+            "has(1)",
+            "has(2)",
+            "has(1.5)",
+            "has(\"a\") | not",
+            "(.a | has(\"b\"))",
+            "(.a | has(0))",
+            "(keys | length) == 2",
+            "keys | length > 0",
+            "(.a | keys | length) == 1",
+            "startswith(\"x\")",
+            "endswith(\"r\")",
+            "startswith(\"\")",
+            "(.a | startswith(\"n\"))",
+            "tostring == \"1\"",
+            "tostring == \"1.0\"",
+            "(.a | tostring) == \"1\"",
+            "tostring | startswith(\"[\")",
+            "tostring | endswith(\"}\")",
+            "([.] | length) == 1",
+            "([.a] | length) == 1",
+            "[.a] == [1]",
+            "[.a] | tostring",
+            "[.] == [null]",
+            "[length] == [2]",
+            "([has(\"a\")] | length) == 1",
             // What a loop's condition already took before the `length` opt-in.
             "type == \"array\"",
             ".a == 1",
@@ -103976,6 +104125,7 @@ mod tests {
             "null",
         ];
         let (mut taken, mut declined) = (0, 0);
+        let mut taken_srcs = std::collections::BTreeSet::new();
         for src in conds {
             let expr = parse(src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
             for value in &values {
@@ -104003,6 +104153,7 @@ mod tests {
                         continue;
                     };
                     taken += 1;
+                    taken_srcs.insert(src);
                     match door {
                         Ok(verdict) => {
                             assert_eq!(bridge.1, "ok", "{mode}: {src:?} on {value:?}");
@@ -104027,6 +104178,11 @@ mod tests {
         }
         assert!(taken > 300, "the matrix must reach the verdict: {taken}");
         assert!(declined > 0, "the matrix must reach the declines too");
+        // Every condition must be answered by the door on some value, or a
+        // shape that never fires would pass this test vacuously.
+        for src in conds {
+            assert!(taken_srcs.contains(src), "{src:?} is never answered");
+        }
     }
 
     /// #3697: the verdict is only for shapes it can answer identically.
@@ -104053,16 +104209,38 @@ mod tests {
         ] {
             assert!(run("length >= 3", &scalar, false).is_none(), "{scalar:?}");
         }
+        // #3707: `has`, `keys`, `tostring` and `[e]` are answered now.
+        for src in [
+            "has(0)",
+            "(keys | length) == 2",
+            "tostring == \"[1,2]\"",
+            "[.] != 1",
+        ] {
+            assert!(run(src, &array, false).is_some(), "{src}");
+        }
         // Outside the pure grammar: a generator, a fan-out, builtins that compute.
         for src in [
             ".[] > 1",
             "length >= 1, length >= 2",
-            "has(0)",
-            "keys == [0, 1]",
             "any(.[]; . == 1)",
             "map(. + 1)",
+            // A non-literal or fanning argument, or a generator inside `[...]`.
+            "has(.[0])",
+            "has(0, 1)",
+            "[.[]] == .",
+            "keys == [0, 1]",
+            "startswith(\"a\", \"b\")",
+            // A mismatch keeps the bridge's error (jq) or `false` (yq).
+            "has(\"a\")",
+            "keys_unsorted == [0, 1]",
+            "startswith(\"a\")",
         ] {
             assert!(run(src, &array, false).is_none(), "{src}");
+        }
+        // `has`/`keys`/`startswith` on shapes the bridge answers differently.
+        let null = OwnedValue::Null;
+        for src in ["has(\"a\")", "keys == []", "startswith(\"a\")"] {
+            assert!(run(src, &null, false).is_none(), "{src} on null");
         }
         // Gated: `?`-suppression stays the bridge's.
         assert!(run("length >= 2", &array, true).is_none());

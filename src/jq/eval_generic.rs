@@ -43988,6 +43988,78 @@ mod tests {
         }
     }
 
+    /// #3707: an `until`/`while`/`select` condition built from `has`, `keys`,
+    /// `startswith`/`endswith`, `tostring` or an array construction reads the
+    /// owned state's tree instead of serializing and re-indexing it every
+    /// round -- the rows #3697 left at 52 reindexes over 50 rounds. The
+    /// reindex count is what pins it; the outputs are jq 1.7.1's (captured
+    /// live).
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)] // STYLE-0004: jq object literals, not format strings
+    fn test_until_while_select_builtin_condition_needs_no_reindex_per_round_3707() {
+        let doc = r#"{"a":[1,2,3],"o":{"p":1}}"#;
+        for (query, want) in [
+            (
+                r#"{i:0, d:.} | until(has("d") and .i >= 50; .i += 1) | .i"#,
+                vec!["50"],
+            ),
+            (
+                r#"{i:0, d:.} | until((.d | has("a")) and .i >= 50; .i += 1) | .i"#,
+                vec!["50"],
+            ),
+            (
+                "{i:0, d:.} | until((keys | length) == 2 and .i >= 50; .i += 1) | .i",
+                vec!["50"],
+            ),
+            (
+                "{i:0, d:.} | until(([.i] | length) == 1 and .i >= 50; .i += 1) | .i",
+                vec!["50"],
+            ),
+            (
+                r#"{i:0, d:.} | until((.i | tostring) == "50"; .i += 1) | .i"#,
+                vec!["50"],
+            ),
+            (
+                r#"{i:0, d:.} | until((.i | tostring | startswith("50")); .i += 1) | .i"#,
+                vec!["50"],
+            ),
+            (
+                r#"{i:0, d:.} | until((.i | tostring | endswith("0")) and .i >= 50; .i += 1) | .i"#,
+                vec!["50"],
+            ),
+            (
+                r#"{i:0, d:.} | [while(has("d") and .i < 50; .i += 1)] | length"#,
+                vec!["50"],
+            ),
+            // A growing array state, the issue's own repro shape.
+            ("[] | until(has(49); . + [1]) | length", vec!["50"]),
+            // Under an `as` binding the #2889 embed table is live.
+            (
+                r#". as $d | {i:0, d:$d} | until(has("d") and .i >= 50; .i += 1) | .i"#,
+                vec!["50"],
+            ),
+        ] {
+            let (got, reindexes) = outputs_and_reindexes(doc, query);
+            assert_eq!(got, want, "{query}");
+            assert!(
+                reindexes <= 3,
+                "{query}: {reindexes} reindexes over 50 rounds"
+            );
+        }
+        // Shapes the door declines keep the bridge and jq's answers.
+        for (query, want) in [
+            (r#"null | until(has("a"); {a: 1}) | .a"#, vec!["1"]),
+            (
+                r#"{i:0} | until(.i >= 3 and (.i | tostring | startswith("3")); .i += 1) | .i"#,
+                vec!["3"],
+            ),
+            ("[] | until(any(.[]; . == 1); . + [1]) | length", vec!["1"]),
+        ] {
+            let (got, _) = outputs_and_reindexes(doc, query);
+            assert_eq!(got, want, "{query}");
+        }
+    }
+
     /// #3697: an `until`/`while` whose state is a computed value reads a
     /// `length` condition off the owned tree instead of serializing the whole
     /// state and re-indexing it every round -- the cost #3674 left in the
