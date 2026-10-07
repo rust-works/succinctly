@@ -26719,7 +26719,7 @@ fn pull_slice_bound<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             },
             Item::Owned(v) => v,
         };
-        sink(owned_bound_to_i64(&raw, round))
+        sink(owned_bound_to_i64_for::<S>(&raw, round))
     };
     // STYLE-0012: the bound is evaluated with a hardcoded `optional: false`.
     // `.[s:e]?` suppresses only its own slice step, never an error raised
@@ -26765,6 +26765,37 @@ pub(crate) fn owned_bound_to_i64(
             rounded as i64
         }
     }))
+}
+
+/// [`owned_bound_to_i64`] under the mode's own bound grammar (#3415).
+///
+/// Real yq hands every bound's scalar text to `strconv.ParseInt`, so a bound
+/// that is not integer-shaped is refused -- whatever the target, and `?` does
+/// not suppress it (yq v4.53.3: `.[0:1.5]`, `.[(1.5):]`, `.[1.0:]`, `.[1e0:]`
+/// and `("1.0"|tonumber)` all raise `strconv.ParseInt: parsing "...": invalid
+/// syntax`). A float that is integral *by computation* renders as an integer
+/// (`.[(1.0+1):]` is `.[2:]`), so only a fractional or non-finite computed
+/// float and a float-*spelled* number (`NumberLiteral`) are refused. jq mode
+/// floors/ceils instead, and this is the same `Array/string slice indices must
+/// be integers` text the non-numeric refusal already uses in yq mode, which
+/// `docs/compliance/yq/limitations.md` records as differing from yq's own.
+pub(crate) fn owned_bound_to_i64_for<S: EvalSemantics>(
+    v: &OwnedValue,
+    round: fn(f64) -> f64,
+) -> Result<Option<i64>, EvalError> {
+    if S::TAG == EvalTag::Yq && yq_slice_bound_not_integral(v) {
+        return Err(EvalError::slice_indices_not_integers());
+    }
+    owned_bound_to_i64(v, round)
+}
+
+/// Whether yq's `ParseInt` would refuse this bound's scalar text (#3415).
+fn yq_slice_bound_not_integral(v: &OwnedValue) -> bool {
+    match v {
+        OwnedValue::Float(f) => !f.is_finite() || f.fract() != 0.0,
+        OwnedValue::NumberLiteral(NumberRepr::Float(_), _) => true,
+        _ => false,
+    }
 }
 
 /// The two bounds of a slice *descriptor* used as an index key,
@@ -52553,6 +52584,9 @@ fn drive_slice_bound<S: EvalSemantics>(
         }
         let mut resolved = vec_with_capacity(values.len());
         for raw in values {
+            if yq_slice_bound_not_integral(&raw) {
+                return Err(EvalError::slice_indices_not_integers().into());
+            }
             let bound = PathSliceBound::classify(raw, round);
             if let Err(e) = &bound.bound {
                 return Err(e.clone().into());

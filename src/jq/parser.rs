@@ -1720,7 +1720,11 @@ impl<'a> Parser<'a> {
             let end = self.parse_slice_bound()?;
             self.skip_ws();
             self.expect(']')?;
-            return Ok(Self::finish_slice(None, Some(end)));
+            return Ok(Self::finish_slice(
+                None,
+                Some(end),
+                self.mode == ParserMode::Yq,
+            ));
         }
 
         // Parse the bracket contents as a full expression. `:` can never be
@@ -1748,13 +1752,21 @@ impl<'a> Parser<'a> {
                 if self.peek() == Some(']') {
                     // `[n:]` - slice from n to end
                     self.next();
-                    Ok(Self::finish_slice(Some(key), None))
+                    Ok(Self::finish_slice(
+                        Some(key),
+                        None,
+                        self.mode == ParserMode::Yq,
+                    ))
                 } else {
                     // `[n:m]` - slice from n to m
                     let second = self.parse_slice_bound()?;
                     self.skip_ws();
                     self.expect(']')?;
-                    Ok(Self::finish_slice(Some(key), Some(second)))
+                    Ok(Self::finish_slice(
+                        Some(key),
+                        Some(second),
+                        self.mode == ParserMode::Yq,
+                    ))
                 }
             }
             Some(c) => Err(ParseError::new(
@@ -1779,9 +1791,16 @@ impl<'a> Parser<'a> {
     /// [`Expr::Slice`]'s own `start_key`/`end_key` -- each bound
     /// independently, the same rule [`Self::fold_index_key`] applies to an
     /// index's own `key` (#1088).
-    fn finish_slice(start: Option<Expr>, end: Option<Expr>) -> Bracket {
-        let start_folded = start.as_ref().and_then(Self::fold_slice_bound);
-        let end_folded = end.as_ref().and_then(Self::fold_slice_bound);
+    ///
+    /// #3415: in yq mode a float-*spelled* bound (`1.0`, `1e0`, `-1.0`) does
+    /// not fold: real yq hands its text to `strconv.ParseInt` at evaluation
+    /// time and refuses it, so it stays a runtime bound where the pull
+    /// helpers can raise (an unreached branch must not).
+    fn finish_slice(start: Option<Expr>, end: Option<Expr>, yq: bool) -> Bracket {
+        let fold =
+            |bound: &Expr| Self::fold_slice_bound(bound).filter(|(_, key)| !(yq && key.is_some()));
+        let start_folded = start.as_ref().and_then(fold);
+        let end_folded = end.as_ref().and_then(fold);
         let start_dynamic = start.is_some() && start_folded.is_none();
         let end_dynamic = end.is_some() && end_folded.is_none();
         if start_dynamic || end_dynamic {

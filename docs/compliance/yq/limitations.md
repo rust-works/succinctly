@@ -3648,6 +3648,14 @@ later `error(...)` still outranks an earlier non-numeric value
 `Error: x` — `end` is never reached) — only the message text differs from real yq's, as
 above.
 
+The same classification covers a *fractional* or float-*spelled* bound (#3415): real yq
+refuses `.[0:1.5]`, `.[(1.5):]`, `.[1.0:]`, `.[1e0:]` and `.[("1.0"|tonumber):]` with
+`strconv.ParseInt: parsing "1.5": invalid syntax` (any target, any read or write, `?`
+included), while a float that is integral *by computation* renders as an integer and is
+accepted (`.[(1.0+1):]` is `.[2:]`). `succinctly yq` raises its usual `Array/string slice
+indices must be integers` for the first group — again only the message text differs —
+and no longer floors/ceils as jq does (`succinctly jq` still does).
+
 ### An integer-shaped overflow float gains a trailing `.0` on the value route (#2419)
 
 This is the yq-mode counterpart to jq mode's
