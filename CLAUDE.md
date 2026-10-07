@@ -23,6 +23,10 @@ Detailed guidance is organized into skills in `.claude/skills/`. Claude will aut
 
 A structured knowledge base for this codebase lives in `docs/`. Start at [docs/index.md](docs/index.md) for a concept-oriented map of how the data structures, algorithms, SIMD implementations, and benchmarks relate to each other. The wiki pages cross-link to existing architecture docs, parsing docs, source files, and academic papers.
 
+## Changelog Fragments
+
+Never edit `CHANGELOG.md` in a PR: every PR touching the top of `[Unreleased]` made any two PRs in flight conflict (#3920). Add `changelog.d/<issue>.<type>.md` instead — `<type>` is `added`, `changed`, `deprecated`, `removed`, `performance`, `fixed` or `security`; `+<slug>` replaces the issue number when there is none; `.<n>` before `.md` is a second entry. The body is the entry exactly as it would have read in `CHANGELOG.md` (`- **bold lead-in** (#N).` plus prose and measured numbers); a follow-up that refreshes an entry edits that same file. `python3 scripts/changelog.py check` validates; a PR with no user-visible effect waives the CI check with a `[no changelog]` line in its body (or the `no-changelog` label). `scripts/changelog.py collect` assembles the release section — see [changelog.d/README.md](changelog.d/README.md) and [docs/guides/release.md](docs/guides/release.md).
+
 ## AI Scratch Directory
 
 Use `.ai/scratch/` for temporary files (git-ignored):

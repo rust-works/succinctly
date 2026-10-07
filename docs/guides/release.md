@@ -62,7 +62,35 @@ Follow [Semantic Versioning](https://semver.org/):
 
 ### 3. Update CHANGELOG.md
 
-Move items from `[Unreleased]` to a new version section:
+Changelog entries are per-PR **fragments** in `changelog.d/` (see
+[changelog.d/README.md](../../changelog.d/README.md)), not edits to `CHANGELOG.md`;
+`scripts/changelog.py` assembles them. Preview, then write the release section:
+
+```bash
+python3 scripts/changelog.py check                                # every fragment is well-formed
+python3 scripts/changelog.py collect --version X.Y.Z --dry-run    # preview; writes nothing
+python3 scripts/changelog.py collect --version X.Y.Z              # rewrite CHANGELOG.md
+```
+
+`collect` does the following, so there is nothing to move or reformat by hand:
+
+- renders `## [X.Y.Z] - YYYY-MM-DD` with the sections in Keep a Changelog order (Added,
+  Changed, Deprecated, Removed, Performance, Fixed, Security), entries by ascending issue
+  number, `+slug` entries last;
+- carries whatever is under `## [Unreleased]` into that section **verbatim, after the
+  fragment sections**, and leaves an empty `## [Unreleased]` above it. The text that
+  predates fragments is therefore released once, in the first release made after the switch;
+  after that `[Unreleased]` stays empty and the flow is purely fragments;
+- updates the comparison links at the bottom (`[Unreleased]` and the new `[X.Y.Z]`);
+- deletes the consumed fragments (everything in `changelog.d/` except `README.md`).
+
+It refuses, writing and deleting nothing, if a fragment is malformed, the version is not
+`X.Y.Z`, the version already has a section, or there is nothing to release. Read the result
+(`git diff CHANGELOG.md`) and group or reword entries by user impact if the release needs it.
+The release PR is titled `chore(release): ...`, which waives the "PR needs a fragment"
+check (it deletes fragments rather than adding one).
+
+The result has this shape:
 
 ```markdown
 ## [Unreleased]
@@ -99,6 +127,7 @@ Update the comparison links at the bottom:
 
 ```bash
 git add Cargo.toml Cargo.lock CHANGELOG.md
+git add -A changelog.d    # the consumed fragments are deleted
 git commit -m "chore(release): prepare vX.Y.Z"
 ```
 
@@ -170,7 +199,7 @@ Then fix the issue and restart from step 4.
 You cannot republish the same version to crates.io. If you need to fix a release:
 
 1. Increment the patch version (e.g., `0.1.0` -> `0.1.1`)
-2. Document the fix in CHANGELOG.md
+2. Document the fix in a changelog fragment (`changelog.d/<issue>.fixed.md`)
 3. Create a new release
 
 ## Pre-release Versions
@@ -199,5 +228,5 @@ rust-version = "1.73.0"
 
 When bumping MSRV:
 - This is a **minor** version bump (new feature: support for newer Rust features)
-- Document the change in CHANGELOG.md under "Changed"
+- Document the change in a `changelog.d/<issue>.changed.md` fragment
 - Update CI workflows if they test older versions

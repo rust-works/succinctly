@@ -48,6 +48,10 @@ The two `jq_cli_tests` named in `scripts/deep-recursion-tests.sh` are `#[ignore]
 
 Build the CLI with `cargo build --release --features cli`. The binary's `jq` and `yq` subcommands also have `sjq` and `syq` aliases. Use files under `.ai/scratch/` for manual CLI experiments; tracked examples are not scratch files.
 
+## Changelog
+
+Never edit `CHANGELOG.md` in a PR. Add `changelog.d/<issue>.<type>.md` (types: `added`, `changed`, `deprecated`, `removed`, `performance`, `fixed`, `security`; `+<slug>` instead of an issue number if there is none; `.<n>` for a second entry) holding the entry exactly as it would have read in the changelog, or waive it with a `[no changelog]` line in the PR body. `python3 scripts/changelog.py check` validates. See [changelog.d/README.md](changelog.d/README.md).
+
 ## Documentation and skills
 
 The knowledge wiki begins at [docs/index.md](docs/index.md). Coding conventions are in [docs/STYLE_GUIDE.md](docs/STYLE_GUIDE.md); architecture decisions are in [docs/adrs/README.md](docs/adrs/README.md). Update relevant docs when changing behavior or performance claims.

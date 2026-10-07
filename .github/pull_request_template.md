@@ -54,6 +54,7 @@ cargo fmt --check
 - [ ] I have added tests that prove my fix/feature works
 - [ ] New and existing tests pass locally
 - [ ] I have updated documentation as needed
+- [ ] I have added a `changelog.d/<issue>.<type>.md` fragment (or waived it; see changelog.d/README.md)
 - [ ] My changes generate no new warnings
 
 ## Additional Notes

@@ -450,7 +450,7 @@ See [release.md](release.md) for detailed release instructions.
 
 Quick summary:
 1. Update version in `Cargo.toml`
-2. Update `CHANGELOG.md`
+2. Run `python3 scripts/changelog.py collect --version X.Y.Z` to assemble `CHANGELOG.md` from the `changelog.d/` fragments
 3. Create annotated tag: `git tag -a v0.1.0 -m "Release v0.1.0"`
 4. Push: `git push origin v0.1.0`
 5. CI will build and publish
