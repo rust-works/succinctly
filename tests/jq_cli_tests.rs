@@ -68096,9 +68096,11 @@ fn test_path_register_drain_producers_lose_the_register_uncatchably_3456() -> Re
             access_a,
             5,
         ),
+        // `reverse` is jq-defined over `.[length - 1 - range(0; length)]`, so it navigates and
+        // is not register-neutral; `sort` was this row until #3960 listed the C-coded builtins.
         (
             doc,
-            r"del(. as $x | [.l | sort] | try ($x | .a))",
+            r"del(. as $x | [.l | reverse] | try ($x | .a))",
             "",
             access_a,
             5,
@@ -68109,7 +68111,7 @@ fn test_path_register_drain_producers_lose_the_register_uncatchably_3456() -> Re
         // give it, and is a promotion with rows of its own.
         (
             doc,
-            r"del(. as $x | .l | [. | sort] | try ($x | .k))",
+            r"del(. as $x | .l | [. | reverse] | try ($x | .k))",
             "",
             access_k,
             5,
@@ -70556,18 +70558,18 @@ fn test_foreach_extract_after_a_comma_update_ending_in_a_literal_3933() -> Resul
     ])
 }
 
-/// #3941, characterization of what its fix leaves. A comma sibling that is a pipe of
-/// non-navigating stages (#3959) is opaque to the register read, so the write is silently
-/// skipped; one that is a register-neutral builtin the allowlist lacks (#3960) refuses loudly.
-/// jq 1.7.1 writes in every row, `{"a":{"c":[1,2]},"z":0}` for `del`. Update the expectations
-/// when those are fixed. A bare sibling (`length`, `1+1`, `$v | length`) is fixed and not here.
+/// #3941, characterization of what its fix leaves (#3959). A comma sibling that is a pipe with a
+/// `.` in it (`(.|length)`, `(2|.+1)`) is opaque to the register read -- an `Identity` anywhere
+/// inside counts as an entry-marker producer -- so the write is silently skipped, where jq
+/// writes `{"a":{"c":[1,2]},"z":0}` for `del`. Update the expectations when it is fixed. A bare
+/// sibling (`length`, `1+1`, `$v | length`) is fixed and not here, and so are the register-neutral
+/// builtins of #3960 (`now`, `input_line_number`; see
+/// `test_foreach_update_comma_with_a_by_value_builtin_sibling_3960`).
 #[test]
-fn test_foreach_update_comma_sibling_residuals_characterize_3959_3960() -> Result<()> {
+fn test_foreach_update_comma_sibling_residuals_characterize_3959() -> Result<()> {
     let doc = r#"{"a":{"b":1,"c":[1,2]},"z":0}"#;
     let unchanged = "{\"a\":{\"b\":1,\"c\":[1,2]},\"z\":0}\n";
-    let refusal = "Invalid path expression near attempt to access element \"b\"";
     assert_path_rows_3289(&[
-        // #3959, silent: jq `{"a":{"c":[1,2]},"z":0}`.
         (
             doc,
             r"del(foreach .a as $v (.; (($v | .b?), (.|length)); try ($v | .b?)))",
@@ -70588,21 +70590,6 @@ fn test_foreach_update_comma_sibling_residuals_characterize_3959_3960() -> Resul
             unchanged,
             "",
             0,
-        ),
-        // #3960, loud: jq `{"a":{"c":[1,2]},"z":0}`.
-        (
-            doc,
-            r"del(foreach .a as $v (.; (($v | .b?), input_line_number); try ($v | .b?)))",
-            "",
-            refusal,
-            5,
-        ),
-        (
-            doc,
-            r"del(foreach .a as $v (.; (($v | .b?), now); try ($v | .b?)))",
-            "",
-            refusal,
-            5,
         ),
     ])
 }
@@ -70846,6 +70833,197 @@ fn test_foreach_comma_with_a_recursion_sibling_answers_3932() -> Result<()> {
             "[]\n[]\n[]\n[]\n",
             "",
             0,
+        ),
+    ])
+}
+
+/// #3960: a `foreach` UPDATE comma whose sibling is a builtin that navigates nothing (`now`,
+/// `input_line_number`, the C-coded math, string and sort families) leaves jq's register where
+/// the comma entered it, so the EXTRACT's `$v` re-establishes it after that sibling's output.
+/// `cannot_move_register` did not list them, so the sibling stated no register, the `try`
+/// swallowed the refusal and the write was lost (or the body refused loudly where jq answers).
+/// Each row is `(builtin, INIT)` run as `del(foreach .a as $v (INIT; (($v | .b?), BUILTIN); try
+/// ($v | .b?)))` on [`DOC_3960`]; jq 1.7.1 deletes `.a.b`. Chosen from a 148-builtin by 5-INIT
+/// differential, one INIT per builtin where this build used to differ from jq. `abs`,
+/// `ltrimstr` and `rtrimstr` are deliberately absent -- see
+/// `test_register_neutral_builtin_that_returns_its_input_stays_loud_3960`.
+const FOREACH_COMMA_BUILTIN_SIBLINGS_3960: &[(&str, &str)] = &[
+    ("min", "[3,1,2]"),
+    ("max", "[3,1,2]"),
+    ("sort", "[3,1,2]"),
+    ("explode", r#""abc""#),
+    ("implode", "[3,1,2]"),
+    ("floor", "3"),
+    ("ceil", "3"),
+    ("round", "3"),
+    ("sqrt", "3"),
+    ("fabs", "3"),
+    ("trunc", "3"),
+    ("infinite", r#""abc""#),
+    ("nan", r#""abc""#),
+    ("isinfinite", r#""abc""#),
+    ("isnan", r#""abc""#),
+    ("isnormal", r#""abc""#),
+    ("now", r#""abc""#),
+    ("input_line_number", r#""abc""#),
+    ("input_filename", r#""abc""#),
+    ("get_search_list", r#""abc""#),
+    ("env", r#""abc""#),
+    ("gmtime", "3"),
+    ("localtime", "3"),
+    ("todate", "3"),
+    ("todateiso8601", "3"),
+    (r#"startswith("a")"#, r#""abc""#),
+    (r#"endswith("a")"#, r#""abc""#),
+    (r#"split("a")"#, r#""abc""#),
+    (r#"contains("a")"#, r#""abc""#),
+    (r#"inside("a")"#, r#""abc""#),
+    ("inside({})", r#"{"k":1}"#),
+    ("builtins", r#""abc""#),
+    ("significand", "3"),
+    ("drem(1; 2)", r#""abc""#),
+    ("ldexp(1; 2)", r#""abc""#),
+    ("scalb(1; 2)", r#""abc""#),
+    ("nearbyint", "3"),
+    ("logb", "3"),
+    ("gamma", "3"),
+    ("lgamma", "3"),
+    ("tgamma", "3"),
+    ("lgamma_r", "3"),
+    ("frexp", "3"),
+    ("modf", "3"),
+    ("exp10", "3"),
+    ("pow(2; 3)", r#""abc""#),
+    ("log2", "3"),
+    ("atan2(1; 2)", r#""abc""#),
+];
+
+const DOC_3960: &str = r#"{"a":{"b":1,"c":[1,2]},"z":0}"#;
+
+#[test]
+fn test_foreach_update_comma_with_a_by_value_builtin_sibling_3960() -> Result<()> {
+    for (builtin, init) in FOREACH_COMMA_BUILTIN_SIBLINGS_3960 {
+        let filter =
+            format!("del(foreach .a as $v ({init}; (($v | .b?), {builtin}); try ($v | .b?)))");
+        let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some(DOC_3960))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            ("{\"a\":{\"c\":[1,2]},\"z\":0}\n", 0),
+            "`{filter}`: stderr {stderr:?}"
+        );
+    }
+    // The issue's own spellings, with the document as the accumulator.
+    assert_path_rows_3289(&[
+        (
+            DOC_3960,
+            r"del(foreach .a as $v (.; (($v | .b?), input_line_number); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            DOC_3960,
+            r"del(foreach .a as $v (.; (($v | .b?), now); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        // A pipe of non-navigating stages with no `.` in it reads too.
+        (
+            DOC_3960,
+            r"del(foreach .a as $v (.; (($v | .b?), (1 | floor)); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+    ])
+}
+
+/// #3960: `contains` is a C-coded boolean, so it leaves jq's register alone and a `$x` frozen
+/// at it re-establishes after it. These were the stand-in for "a stage the resolver cannot
+/// vouch for" in `test_guessed_path_refusal_is_not_caught_by_try_3267` and
+/// `test_frozen_source_through_a_composite_head_refuses_loudly_3334`, which now use
+/// `tojson | test(..)` for that. Captured from jq 1.7.1 with `-c`.
+#[test]
+fn test_contains_leaves_the_register_where_it_was_3960() -> Result<()> {
+    let doc = r#"{"a":{"b":1},"k":1,"l":[1,2]}"#;
+    assert_path_rows_3289(&[
+        (
+            doc,
+            r#"del(. as $x | contains({"a":{}}) | try ($x | .a))"#,
+            "{\"k\":1,\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r#"del(. as $orig | contains({"k":1}) | try ($orig as {a:{b:$q}} | $q))"#,
+            "{\"a\":{},\"k\":1,\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+        (
+            "[[3],[1]]",
+            r"path(. as $x | map(sort) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(. as $x | [.l | sort] | try ($x | .a))",
+            "{\"k\":1,\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(. as $x | .l | [. | sort] | try ($x | .k))",
+            "{\"a\":{\"b\":1},\"k\":1,\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+        // The price #3267 recorded for `contains`, paid back: jq prints the document unchanged.
+        (
+            r#"{"a":{"b":1},"k":1}"#,
+            r#"del(.a as $y | contains({"z":1}) | try ($y | .b))"#,
+            "{\"a\":{\"b\":1},\"k\":1}\n",
+            "",
+            0,
+        ),
+    ])
+}
+
+/// #3960, the hazard that keeps `abs`, `ltrimstr(s)` and `rtrimstr(s)` out of the
+/// register-neutral builtins. jq returns their input by pointer when it does not apply, so the
+/// register is the stage's *output* (`{"a":1} | ltrimstr("a")` is the register node), where this
+/// model produces a copy. Claiming the register unmoved let a `$x` frozen at it pass the
+/// foreach source's identity check as a copy, and a `try` swallowed that refusal into a skipped
+/// write. They stay loud, which is the safe direction. jq 1.7.1 deletes `.a` in every row.
+#[test]
+fn test_register_neutral_builtin_that_returns_its_input_stays_loud_3960() -> Result<()> {
+    let refusal = "Invalid path expression near attempt to access element";
+    assert_path_rows_3289(&[
+        (
+            r#"{"a":{"b":1}}"#,
+            r#"del(ltrimstr("x") | foreach ((., 1) | .) as $x (null; .; try $x.a))"#,
+            "",
+            refusal,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r#"del(rtrimstr("x") | foreach ((., 1) | .) as $x (null; .; try $x.a))"#,
+            "",
+            refusal,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"del(abs | foreach ((., 1) | .) as $x (null; .; try $x.a))",
+            "",
+            refusal,
+            5,
         ),
     ])
 }
@@ -71532,9 +71710,9 @@ fn test_path_register_by_value_builtin_stages_do_not_move_it_3361() -> Result<()
         (
             "[[3],[1]]",
             r"path(. as $x | map(sort) | $x)",
+            "[]\n",
             "",
-            "Invalid path expression",
-            5,
+            0,
         ),
         (
             "[[1],[2]]",
@@ -71555,13 +71733,7 @@ fn test_path_register_by_value_builtin_stages_do_not_move_it_3361() -> Result<()
             "Invalid path expression",
             5,
         ),
-        (
-            "[1,2]",
-            r"path(. as $x | [sort] | $x)",
-            "",
-            "Invalid path expression",
-            5,
-        ),
+        ("[1,2]", r"path(. as $x | [sort] | $x)", "[]\n", "", 0),
         (
             "[1,2]",
             r"path(. as $x | (sort, add) | $x)",
@@ -71572,17 +71744,11 @@ fn test_path_register_by_value_builtin_stages_do_not_move_it_3361() -> Result<()
         (
             "[1,2]",
             r"path(. as $x | if true then sort else . end | $x)",
+            "[]\n",
             "",
-            "Invalid path expression",
-            5,
+            0,
         ),
-        (
-            "[1,2]",
-            r"path(. as $x | try sort | $x)",
-            "",
-            "Invalid path expression",
-            5,
-        ),
+        ("[1,2]", r"path(. as $x | try sort | $x)", "[]\n", "", 0),
         // A multi-output or empty `f` and an empty input keep the register where
         // the stage entered it too, and so does a stage run once per element
         // of a fan-out.
@@ -92167,28 +92333,29 @@ fn test_write_through_root_snapshot_after_subexp_stage_under_try_3186() -> Resul
 /// uncatchable -- by the `try` beside it, by any `try` further out, and by a
 /// value-position `?` around the whole `del` -- so each is a loud exit 5
 /// instead (ADR-0018 rule 4). The lossy stage was `has(k)` until #3456, which
-/// proved `has` leaves the register alone (`cannot_move_register`); `contains`
-/// is the same kind of C-coded boolean this resolver still cannot vouch for.
+/// proved `has` leaves the register alone (`cannot_move_register`), and `contains` until #3960
+/// did the same for the C-coded builtins; `tojson | test(..)` is the kind of stage this
+/// resolver still cannot vouch for (the regex family is jq-defined over `match`).
 #[test]
 fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
     for filter in [
-        r#"del(. as $x | contains({"a":{}}) | try ($x | .a))"#,
+        r#"del(. as $x | tojson | test("a") | try ($x | .a))"#,
         r#"del(. as $x | ("a"|test("a")) | try ($x | .a))"#,
-        r#"del(. as $x | contains({"a":{}}) | ($x | .a)?)"#,
-        r#"del(. as $x | contains({"a":{}}) | ($x.a)?)"#,
-        r#"del(. as $x | contains({"a":{}}) | try $x["a"])"#,
-        r#"del(. as $x | contains({"a":{}}) | try ($x | .[]))"#,
-        r#"del(. as $x | contains({"a":{}}) | "a" as $k | try ($x | .[$k]))"#,
-        r#"del(. as $x | contains({"a":{}}) | 0 as $i | try ($x | .l[$i:1]))"#,
-        r#"del(. as $x | contains({"a":{}}) | try ($x as {a:$q} | $q))"#,
-        r#"del(. as $x | contains({"a":{}}) | try ($x | .a) catch empty)"#,
-        r#"del(. as $x | contains({"a":{}}) | $x | try .a)"#,
-        r#"del(. as $x | contains({"a":{}}) | label $out | try ($x | .a))"#,
+        r#"del(. as $x | tojson | test("a") | ($x | .a)?)"#,
+        r#"del(. as $x | tojson | test("a") | ($x.a)?)"#,
+        r#"del(. as $x | tojson | test("a") | try $x["a"])"#,
+        r#"del(. as $x | tojson | test("a") | try ($x | .[]))"#,
+        r#"del(. as $x | tojson | test("a") | "a" as $k | try ($x | .[$k]))"#,
+        r#"del(. as $x | tojson | test("a") | 0 as $i | try ($x | .l[$i:1]))"#,
+        r#"del(. as $x | tojson | test("a") | try ($x as {a:$q} | $q))"#,
+        r#"del(. as $x | tojson | test("a") | try ($x | .a) catch empty)"#,
+        r#"del(. as $x | tojson | test("a") | $x | try .a)"#,
+        r#"del(. as $x | tojson | test("a") | label $out | try ($x | .a))"#,
         // The loss happens *inside* the `try`: its own frame predates it.
-        r#"del(try (. as $x | contains({"a":{}}) | $x | .a))"#,
-        r#"del((. as $x | contains({"a":{}}) | $x | .a)?)"#,
+        r#"del(try (. as $x | tojson | test("a") | $x | .a))"#,
+        r#"del((. as $x | tojson | test("a") | $x | .a)?)"#,
         // And a value-position `?` around the whole write catches nothing.
-        r#"[del(. as $x | contains({"a":{}}) | try ($x | .a))?]"#,
+        r#"[del(. as $x | tojson | test("a") | try ($x | .a))?]"#,
         r"del(. as $x | (.zz // 5) | try ($x | .k))",
         r"del(. as $x | if .k then 5 else .a end | try ($x | .k))",
         r"del(. as $x | (def f: 5; f) | try ($x | .k))",
@@ -92210,23 +92377,23 @@ fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
     // register was lost; after `.a` the register provably moved.
     for (filter, expected) in [
         (
-            r#"del(. as $x | contains({"a":{}}) | try (5 | .a))"#,
+            r#"del(. as $x | tojson | test("a") | try (5 | .a))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
-            r#"del(. as $x | contains({"a":{}}) | try (.a))"#,
+            r#"del(. as $x | tojson | test("a") | try (.a))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
-            r#"del(. as $x | contains({"a":{}}) | $x | try (5 | .a))"#,
+            r#"del(. as $x | tojson | test("a") | $x | try (5 | .a))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
-            r#"del(. as $x | contains({"a":{}}) | $x | (5 | .a)?)"#,
+            r#"del(. as $x | tojson | test("a") | $x | (5 | .a)?)"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
-            r#"del(. as $x | contains({"a":{}}) | $x | try ("s" | .a))"#,
+            r#"del(. as $x | tojson | test("a") | $x | try ("s" | .a))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
@@ -92234,15 +92401,15 @@ fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
-            r#"del(. as $x | contains({"a":{}}) | try (5 | .[]))"#,
+            r#"del(. as $x | tojson | test("a") | try (5 | .[]))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
-            r#"del(. as $x | contains({"a":{}}) | try ($x | if true then 5 | .a else . end))"#,
+            r#"del(. as $x | tojson | test("a") | try ($x | if true then 5 | .a else . end))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
-            r#"del(. as $x | contains({"a":{}}) | try ($x | reduce (1) as $i (5; .a)))"#,
+            r#"del(. as $x | tojson | test("a") | try ($x | reduce (1) as $i (5; .a)))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
@@ -92261,7 +92428,7 @@ fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
-            r#"del(.a.zz as $x | contains({"a":{}}) | try ($x | .q))"#,
+            r#"del(.a.zz as $x | tojson | test("a") | try ($x | .q))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
@@ -92270,30 +92437,30 @@ fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
         ),
         (r"[path(.arr[0:1]? as $v0 | (abs?) | ($v0 | .b?)?)]", "[]"),
         (
-            r#"del(. as $x | contains({"a":{}}) | "a" as $k | try (5 | .[$k]))"#,
+            r#"del(. as $x | tojson | test("a") | "a" as $k | try (5 | .[$k]))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
-            r#"del(. as $x | contains({"a":{}}) | try ({"z":1} as {a:$q} | $q))"#,
+            r#"del(. as $x | tojson | test("a") | try ({"z":1} as {a:$q} | $q))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         // A step jq fails with a type error wherever its register is -- an
         // object indexed by a number, iterating `null`, an array pattern
         // over an object -- is refused exactly, so caught as in jq.
         (
-            r#"del(. as $x | contains({"a":{}}) | try ($x | .[0]))"#,
+            r#"del(. as $x | tojson | test("a") | try ($x | .[0]))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
-            r#"del(. as $x | contains({"a":{}}) | 0 as $i | try ($x | .[$i]))"#,
+            r#"del(. as $x | tojson | test("a") | 0 as $i | try ($x | .[$i]))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
-            r#"del(. as $x | contains({"a":{}}) | try (null | .[]))"#,
+            r#"del(. as $x | tojson | test("a") | try (null | .[]))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
-            r#"del(. as $x | contains({"a":{}}) | try ($x as [$q] | $q))"#,
+            r#"del(. as $x | tojson | test("a") | try ($x as [$q] | $q))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         // #3263: nor does an array resolved live -- jq's collect backtracks
@@ -92320,9 +92487,9 @@ fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
     // at or inside the lost register that jq's register did *not* land on --
     // its refusal is exact and caught in jq 1.7.1, which prints the document
     // unchanged -- but this resolver cannot tell the stage that left the
-    // register alone (`contains`) from one that moved it there (`first(.a)`), so
-    // it refuses loudly rather than risk the silent loss above.
-    let filter = r#"del(.a as $y | contains({"z":1}) | try ($y | .b))"#;
+    // register alone (`tojson | test(..)`, #3960 having listed `contains`) from one that moved it
+    // there (`first(.a)`), so it refuses loudly rather than risk the silent loss above.
+    let filter = r#"del(.a as $y | tojson | test("z") | try ($y | .b))"#;
     let (stdout, _stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1},"k":1}"#))?;
     assert_eq!(code, 5, "{filter}: stdout: {stdout:?}");
     Ok(())
@@ -102778,35 +102945,35 @@ fn test_frozen_source_through_a_composite_head_refuses_loudly_3334() -> Result<(
     for (doc, filter) in [
         (
             r#"{"a":{"b":1}}"#,
-            r#"del(. as $orig | contains({"k":1}) | try ($orig as {a:{b:$q}} | $q))"#,
+            r#"del(. as $orig | tojson | test("k") | try ($orig as {a:{b:$q}} | $q))"#,
         ),
         (
             r#"{"a":{"b":1}}"#,
-            r#"del(. as $orig | contains({"k":1}) | try (($orig,$orig) as {a:{b:$q}} | $q))"#,
+            r#"del(. as $orig | tojson | test("k") | try (($orig,$orig) as {a:{b:$q}} | $q))"#,
         ),
         (
             r#"{"a":{"b":1}}"#,
-            r#"del(. as $orig | contains({"k":1}) | try (($orig,1) as {a:{b:$q}} | $q))"#,
+            r#"del(. as $orig | tojson | test("k") | try (($orig,1) as {a:{b:$q}} | $q))"#,
         ),
         (
             r#"{"a":{"b":1}}"#,
-            r#"del(. as $orig | contains({"k":1}) | try (($orig,$orig) as $x | $x.a.b))"#,
+            r#"del(. as $orig | tojson | test("k") | try (($orig,$orig) as $x | $x.a.b))"#,
         ),
         (
             r#"{"a":{"b":1}}"#,
-            r#"del(. as $orig | contains({"k":1}) | try ((if true then $orig else $orig end) as {a:{b:$q}} | $q))"#,
+            r#"del(. as $orig | tojson | test("k") | try ((if true then $orig else $orig end) as {a:{b:$q}} | $q))"#,
         ),
         (
             r#"{"a":{"b":1}}"#,
-            r#"del(. as $orig | contains({"k":1}) | try (($orig // 1) as {a:{b:$q}} | $q))"#,
+            r#"del(. as $orig | tojson | test("k") | try (($orig // 1) as {a:{b:$q}} | $q))"#,
         ),
         (
             r#"{"a":5}"#,
-            r#"[path(. as $orig | contains({"k":1}) | try ($orig as {a:{b:$q}} | $q))]"#,
+            r#"[path(. as $orig | tojson | test("k") | try ($orig as {a:{b:$q}} | $q))]"#,
         ),
         (
             r#"{"a":5}"#,
-            r#"[path(. as $orig | contains({"k":1}) | try (($orig,$orig) as {a:{b:$q}} | $q))]"#,
+            r#"[path(. as $orig | tojson | test("k") | try (($orig,$orig) as {a:{b:$q}} | $q))]"#,
         ),
     ] {
         let (out, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
@@ -102825,7 +102992,7 @@ fn test_frozen_source_through_a_composite_head_refuses_loudly_3334() -> Result<(
     let (out, stderr, code) = run_jq_full(
         &[
             "-c",
-            r#"[path(. as $orig | contains({"k":1}) | $orig | try ((try error({"a":{"b":1}}) catch .) as {a:{b:$q}} | $q))]"#,
+            r#"[path(. as $orig | tojson | test("k") | $orig | try ((try error({"a":{"b":1}}) catch .) as {a:{b:$q}} | $q))]"#,
         ],
         Some(r#"{"a":{"b":1}}"#),
     )?;

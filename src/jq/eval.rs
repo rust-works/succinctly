@@ -43449,6 +43449,89 @@ fn cannot_move_register(expr: &Expr) -> bool {
             // recurse(empty) | $x)` and `path(. as $x | 1 | recurse(.+1;
             // .<3) | $x)` (`[]` twice).
             Builtin::RecurseF(f) | Builtin::RecurseCond(f, _) => cannot_move_register(f),
+            // #3960: builtins that navigate nothing at all -- C-coded, or jq-defined over C ones --
+            // so jq's register is where the stage entered it. Each was captured from jq 1.7.1 as
+            // a comma sibling in a `foreach` UPDATE (`del(foreach .a as $v (INIT; (($v | .b?),
+            // B); try ($v | .b?)))`) over five INIT shapes; the rows that pin them are
+            // `test_foreach_update_comma_with_a_by_value_builtin_sibling_3960`. `trim`, `ltrim`,
+            // `rtrim` and `toboolean` are not here: jq 1.7.1 does not define them. Nor are
+            // `ascii_downcase`/`ascii_upcase`: jq defines them as `explode | map(...) | implode`, so
+            // they iterate a derived array and raise a path error on an input the register is not
+            // on, which this predicate's "never raises" half forbids (#2743). Nor are `abs`,
+            // `ltrimstr(s)` and `rtrimstr(s)`: they hand their input back by pointer when it does
+            // not apply (`{"a":1} | ltrimstr("a")` is the register itself), which this model
+            // cannot represent -- a `$x` frozen at the register is then the stage's output in jq
+            // and a copy here, and a `try` swallowed that refusal into a skipped write
+            // (`del(ltrimstr("x") | foreach (., 1) as $x (null; .; try $x.a))`, #3423's residual).
+            Builtin::Floor
+            | Builtin::Ceil
+            | Builtin::Round
+            | Builtin::Sqrt
+            | Builtin::Fabs
+            | Builtin::Trunc
+            | Builtin::Log
+            | Builtin::Log10
+            | Builtin::Log2
+            | Builtin::Exp
+            | Builtin::Exp10
+            | Builtin::Exp2
+            | Builtin::Sin
+            | Builtin::Cos
+            | Builtin::Tan
+            | Builtin::Asin
+            | Builtin::Acos
+            | Builtin::Atan
+            | Builtin::Sinh
+            | Builtin::Cosh
+            | Builtin::Tanh
+            | Builtin::Asinh
+            | Builtin::Acosh
+            | Builtin::Atanh
+            | Builtin::Libm1(_)
+            | Builtin::Infinite
+            | Builtin::Nan
+            | Builtin::IsInfinite
+            | Builtin::IsNan
+            | Builtin::IsNormal
+            | Builtin::Now
+            | Builtin::InputLineNumber
+            | Builtin::InputFilename
+            | Builtin::GetSearchList
+            | Builtin::Env
+            | Builtin::Gmtime
+            | Builtin::Localtime
+            | Builtin::Mktime
+            | Builtin::Todate
+            | Builtin::Fromdate
+            | Builtin::Todateiso8601
+            | Builtin::Fromdateiso8601
+            | Builtin::Explode
+            | Builtin::Implode
+            | Builtin::Builtins
+            // #3711: `min`/`max`/`sort` are C-coded, and `min_by`/`max_by`/`group_by`/
+            // `sort_by(f)` are `_IMPL(map([f]))` -- a C function's argument is a subexp, so
+            // whatever `f` navigates moves nothing and path-checks nothing, and on an input the
+            // register is not on they raise nothing at all ([`leaves_register_in_place`]).
+            | Builtin::Min
+            | Builtin::Max
+            | Builtin::Sort
+            | Builtin::MinBy(_)
+            | Builtin::MaxBy(_)
+            | Builtin::GroupBy(_)
+            | Builtin::SortBy(_) => true,
+            // The same, with arguments: a C builtin's arguments are subexps, but a navigating
+            // one is refused here all the same -- the safe direction.
+            Builtin::Pow(a, b) | Builtin::Atan2(a, b) | Builtin::Libm2(_, a, b) => {
+                cannot_move_register(a) && cannot_move_register(b)
+            }
+            Builtin::Libm3(_, a, b, c) => {
+                cannot_move_register(a) && cannot_move_register(b) && cannot_move_register(c)
+            }
+            Builtin::Startswith(a)
+            | Builtin::Endswith(a)
+            | Builtin::Contains(a)
+            | Builtin::Inside(a)
+            | Builtin::Split(a) => cannot_move_register(a),
             _ => false,
         },
 
@@ -43916,8 +43999,8 @@ fn entry_marker_shape(expr: &Expr) -> EntryMarkers {
             //
             // Only a sibling `operand_leaves_register` recognises counts, and an opaque sibling
             // (a pipe with a `.` in it) keeps the whole comma opaque: `(.|length)` and
-            // `(2|.+1)` still skip the write (#3959), `now` and `input_line_number` still refuse
-            // (#3960).
+            // `(2|.+1)` still skip the write (#3959); a builtin `cannot_move_register` does not list
+            // (the regex family: `test("a")`) still refuses (#3960).
             if shape == EntryMarkers::None && items.iter().any(operand_leaves_register) {
                 EntryMarkers::Forwarded
             } else {
@@ -43985,8 +44068,8 @@ fn entry_marker_shape(expr: &Expr) -> EntryMarkers {
 /// accumulator and raises where jq raises, so a `try` around the comma catches it as
 /// jq's own does, and withholding the register for it only made the pipe sibling's `$w`
 /// refuse inside that `try` and the write vanish. The split that remains is a sibling the
-/// analysis cannot read at all (`now`, `input_line_number`, a computed key), where the
-/// register stays withheld and the body refuses loudly although jq answers (#3960);
+/// analysis cannot read at all (a regex builtin such as `test("a")`, a computed key), where
+/// the register stays withheld and the body refuses loudly although jq answers (#3960);
 /// #3145's `($v[0]?, $v)` is two pipe siblings, `$v[0]?` being `$v | .[0]?`.
 fn fans_out(expr: &Expr) -> bool {
     use crate::jq::walk::{search_subexpr, Visit};
@@ -44010,8 +44093,8 @@ fn fans_out(expr: &Expr) -> bool {
 /// navigation (`.b`, `.a?`, `.[]?`; [`is_navigation_node`], #3932). A navigation
 /// resolves against the accumulator, not the register, and raises where jq raises,
 /// so a `try` around the comma catches it as jq's own does. A builtin the register
-/// analysis does not list (`now`, `input_line_number`) and a computed key (`.a[.b]`)
-/// are neither, so they keep the register withheld (#3960).
+/// analysis does not list (`test("a")`) and a computed key (`.a[.b]`) are neither, so
+/// they keep the register withheld (#3960).
 ///
 /// The wrappers that add no movement of their own recurse into their operand, so
 /// the answer follows jq's fork through `first(.a, .b)`, `(.a, .b)`, `(.b // 3)`
@@ -131694,10 +131777,15 @@ mod touched_edge_cases_2999 {
             (".a?", true),
             ("first(.a)", true),
             ("(($w | .a) // .b)", true),
-            // A handler, a computed key and an unlisted builtin are not.
+            // A handler, a computed key and an unlisted builtin are not (#3960 lists the ones that
+            // navigate nothing; `ltrimstr` hands its input back by pointer and stays out).
             ("try (.a) catch 1", false),
             (".a[.b]", false),
-            ("now", false),
+            ("now", true),
+            ("floor", true),
+            ("sort", true),
+            ("test(\"a\")", false),
+            ("ltrimstr(\"a\")", false),
         ] {
             assert_eq!(
                 sibling_sees_register_uniformly(&parse(src).unwrap()),
@@ -131719,8 +131807,13 @@ mod touched_edge_cases_2999 {
             ("try (($w | .a), .[]?)", false),
             // A builtin the register analysis does not list is not one, nor is a call or a
             // navigation that wraps something else, so the register stays withheld (#3960).
-            ("try (($w | .a), now)", true),
-            ("try (($w | .a), input_line_number)", true),
+            ("try (($w | .a), test(\"a\"))", true),
+            ("try (($w | .a), match(\"a\"))", true),
+            // #3960: the builtins `cannot_move_register` lists navigate nothing, so they read.
+            ("try (($w | .a), now)", false),
+            ("try (($w | .a), input_line_number)", false),
+            ("try (($w | .a), floor)", false),
+            ("try (($w | .a), sort)", false),
             ("try (($w | .a), (.a | length))", false),
             ("try (($w | .a), .a[.b])", true),
             // The wrappers that add no movement recurse: a navigation one layer down counts.

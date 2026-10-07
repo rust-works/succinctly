@@ -1544,8 +1544,11 @@ is the revert that established what the other one costs.
    The price is the case this resolver can't tell apart: a value at or inside the lost register
    that jq's register did *not* land on. There jq's refusal is exact and caught, and this refuses
    loudly, because the stage in between is opaque and might have moved the register there:
-   - `del(.a as $y \| contains({z:1}) \| try ($y \| .b))` returns the document unchanged in jq, since
-     `contains` left the register at the root, but `first(.a)` would have moved it onto `$y`;
+   - `del(.a as $y \| tojson \| test("z") \| try ($y \| .b))` returns the document unchanged in jq, since
+     the stages left the register at the root, but `first(.a)` would have moved it onto `$y`. (The row was
+     `contains({z:1})` until [#3960](https://github.com/rust-works/succinctly/issues/3960) listed the
+     C-coded builtins that navigate nothing; `contains` now answers as jq does, and the regex family,
+     which jq defines over `match`, is the stage this resolver still cannot vouch for.)
    - after a `foreach` stage or a `reduce` that navigates, whose route hands back no register
      value, where the register was lost isn't known at all, so every `$var` or `null` refusal
      after one is loud (a `reduce` that cannot move the register states it since
@@ -2786,7 +2789,7 @@ is the revert that established what the other one costs.
    `{"a":[{"b":1}],"x":{"a":9,"b":2}}` in jq and here (the register used to be withheld, the pipe
    sibling's `$w` refused inside the `try` and the write was silently skipped; pinned by
    `test_foreach_update_try_comma_with_a_navigating_sibling_keeps_the_register_3932`). A sibling the
-   register analysis cannot read (`now`, `input_line_number`, a computed key `.a[.b]`) still withholds it, so the body
+   register analysis cannot read (a regex builtin such as `test("a")`, a computed key `.a[.b]`) still withholds it, so the body
    refuses loudly where jq answers ([#3960](https://github.com/rust-works/succinctly/issues/3960)), and a `select(f)` sibling,
    which has its own register rule, still skips the write silently
    ([#3974](https://github.com/rust-works/succinctly/issues/3974); `test_foreach_update_try_comma_select_sibling_characterizes_3974`).
@@ -2800,10 +2803,18 @@ is the revert that established what the other one costs.
    (pinned by `test_foreach_update_comma_with_a_navigating_pipe_and_a_literal_keeps_the_register_3941`).
    Only a sibling the register analysis recognises as leaving it alone counts. A sibling that is a pipe of
    non-navigating stages (`(.|length)`, `(2|.+1)`, `(. \| tostring)`) is opaque to it, so that mixed comma still
-   skips the write silently ([#3959](https://github.com/rust-works/succinctly/issues/3959)), and a register-neutral
-   builtin it does not list (`now`, `input_line_number`) refuses loudly
-   ([#3960](https://github.com/rust-works/succinctly/issues/3960)), where jq writes in both; characterized by
-   `test_foreach_update_comma_sibling_residuals_characterize_3959_3960`.
+   skips the write silently ([#3959](https://github.com/rust-works/succinctly/issues/3959); characterized by
+   `test_foreach_update_comma_sibling_residuals_characterize_3959`), where jq writes. The builtins that navigate
+   nothing (`now`, `input_line_number`, the C-coded math, string and `sort`/`min`/`max` families) are read
+   too ([#3960](https://github.com/rust-works/succinctly/issues/3960), pinned by
+   `test_foreach_update_comma_with_a_by_value_builtin_sibling_3960`); a builtin that navigates and backtracks
+   (`add`, `to_entries`, `reverse`), the regex family and the `select`-style type filters are not, and still refuse
+   where jq answers. Two groups stay out for a reason, not for want of an oracle row: `abs`, `ltrimstr(s)` and
+   `rtrimstr(s)` hand their input back by pointer when it does not apply, so the register is the stage's output in jq
+   and a copy here (listing them let a `try` swallow the resulting refusal into a skipped write, pinned loud by
+   `test_register_neutral_builtin_that_returns_its_input_stays_loud_3960`), and `ascii_downcase`/`ascii_upcase`
+   are `explode | map(..) | implode` in jq, so they iterate a derived array and raise a path error on an input the
+   register is not on (#2743). `trim`, `ltrim`, `rtrim` and `toboolean` are not defined in jq 1.7.1.
    Marking a withheld register lost (#3267) would make it refuse loudly, but also
    turns rows that match jq today into refusals, where jq's own `try` catches a real error
    (`(foreach .a as $w (0; try (($w \| .c \| .z), $w.b); .)) = 9` writes nothing in either).
