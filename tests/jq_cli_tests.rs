@@ -90259,7 +90259,6 @@ fn test_recurse_seed_through_nth_bind_and_fold_recurse_f_3892() -> Result<()> {
 #[test]
 fn test_recurse_seed_residuals_stay_loud_3580() -> Result<()> {
     assert_rows_2764(&[
-        (r"path(. as $x | 1 | (1, ..) | $x)", "[]\n[]\n", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n", 5),
         (r"path(. as $x | 1 | if false then .. else 1 end | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
         // #3892: a bind forwards only its body; a pipe or a variable ahead of the
         // recursion there is the nested-pipe and literal-ahead residual again.
@@ -90273,7 +90272,34 @@ fn test_recurse_seed_residuals_stay_loud_3580() -> Result<()> {
         (r"path(. as $x | foreach (1,2) as $i (1; (5, try ..); .) | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
         (r"path(. as $x | 1 | [foreach (1,2) as $i (1; try ..; .)] | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
         (r"del(. as $x | 1 | if false then .. else 1 end | $x | .c)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"c\" of {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
-        (r"del(. as $x | 1 | try (1, ..) | $x | .c)", "{\"a\":{\"b\":{\"b\":null}}}\n", "", 0),
+    ])
+}
+
+/// #3862: a comma sibling ahead of a recursion states the register on its own (a literal, or a
+/// variable), so `(1, ..)` keeps jq's answer where it was a loud refusal under #3580. The rows
+/// are on [`DOC_2764`], captured from jq 1.7.1: the path form prints both outputs before jq's own
+/// iterate error, and the `try` write forms succeed.
+#[test]
+fn test_recurse_seed_after_a_comma_sibling_states_the_register_3862() -> Result<()> {
+    assert_rows_2764(&[
+        (
+            r"path(. as $x | 1 | (1, ..) | $x)",
+            "[]\n[]\n",
+            "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n",
+            5,
+        ),
+        (
+            r"del(. as $x | 1 | try (1, ..) | $x | .c)",
+            "{\"a\":{\"b\":{\"b\":null}}}\n",
+            "",
+            0,
+        ),
+        (
+            r"del(. as $x | 1 | (. as $q | $q, (try ..)) | $x | .c)",
+            "{\"a\":{\"b\":{\"b\":null}}}\n",
+            "",
+            0,
+        ),
     ])
 }
 

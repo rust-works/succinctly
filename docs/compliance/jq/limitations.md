@@ -1292,7 +1292,7 @@ is the revert that established what the other one costs.
      producer vouches for the register: equal by kind it is re-established where the register stands, unequal it
      cannot be it and the stage raises as jq does; anything else -- an equal string or container, a producer that
      lost the register, an untracked entry that states none, a `gen` the allowlist cannot prove leaves the register
-     in place (`first(2, 3)`, where a literal `2` is exact) -- is ambiguous and refuses as an uncatchable guess, so
+     in place (a `def` call; a comma of literals such as `first(2, 3)` answers since #3862) -- is ambiguous and refuses as an uncatchable guess, so
      `del(try (.a and any(true; select(.))))`-shaped writes cannot go through on a swallowed error (jq answers
      `["a"]` for `path(.a and any(true; select(.)))` and this refuses). Pinned by
      `test_any_all_navigating_cond_states_the_register_it_left_3757`,
@@ -1321,8 +1321,10 @@ is the revert that established what the other one costs.
      `test_any_all_pipe_stage_verdict_residuals_stay_refused_3757`: inside a compound stage (`(any, any)`,
      `any // 1`, `any? // 1`), which is refused as a whole (#3644), behind a `def` call or a `reduce`
      (`def f: any; f | $x`), which state no register, and on an untracked entry over a generator the allowlist
-     cannot prove leaves the register in place (`1 | isempty(first(2,3))`, `1 | any(first(2,3); .)`: the step
-     states a loss, which the stage does not override). In yq mode `any`/`all` are real yq
+     cannot prove leaves the register in place (`1 | isempty(def f: 2; f)`: the step states a loss, which the stage
+     does not override; `1 | isempty(first(2,3))` and `1 | any(first(2,3); .)` answer since
+     [#3862](https://github.com/rust-works/succinctly/issues/3862), where each comma sibling states the register on
+     its own, pinned by `test_comma_siblings_state_the_register_on_their_own_3862`). In yq mode `any`/`all` are real yq
      builtins and keep yq's own scalar error (`all only supports arrays, was !!int`); real yq rejects the two-argument
      form outright, so `--jq-extensions` keeps its refusal.
 
@@ -3408,8 +3410,10 @@ answers `["b"]` — and classified the two residuals appended below):
   **What still refuses**, each loudly (an exit 5, never a write that is silently lost) and pinned by
   `test_recurse_seed_residuals_stay_loud_3580`:
   - an output that is not a recursion's seed or an untracked `.` and so states nothing: a literal
-    ahead of the recursion (`(1, ..)`, or the taken `else 1` of `if false then .. else 1 end`) is
-    `[]` in jq, and so is a variable ahead of it (`(. as $q | $q, (try ..))`);
+    ahead of the recursion (the taken `else 1` of `if false then .. else 1 end`) is `[]` in jq.
+    (A literal or variable *sibling* ahead of it in a comma answers since #3862: `(1, ..)` and
+    `(. as $q | $q, (try ..))` state the register per sibling, pinned by
+    `test_recurse_seed_after_a_comma_sibling_states_the_register_3862`);
   - a recursion behind a destructuring bind or a `def` call (`(. as [$q] | ..)`, `def f: ..; f`): the
     bind's pattern indexes before its body runs and a call's body is not named, so the stage is
     opaque. So is a pipe (or `select`) nested inside a forwarder, such as `if true then (.. | select(true))

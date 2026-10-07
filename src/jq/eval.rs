@@ -53390,7 +53390,7 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
         // nothing, and states a loss ([`register_after`]) for anything it
         // cannot vouch for. A leaf or wrapper that returned `None` for a
         // generator that moves the register would re-establish a stale `$x`
-        // here; the residual rows (`1 | isempty(first(2,3))`) pin the loss side.
+        // here; the residual rows (`1 | isempty(def f: 2; f)`) pin the loss side.
         let states_register = stages_per_result_register
             && !facts.navigated
             && !matches!(
@@ -130508,5 +130508,62 @@ mod touched_edge_cases_2999 {
             Vec::<String>::new()
         );
         assert_eq!(run("[1]", "empty"), Vec::<String>::new());
+    }
+
+    /// #3862: `fans_out` lets a comma through only when every sibling is a pipe or
+    /// cannot move the register. The second predicate must also accept everything
+    /// [`cannot_move_register`] accepts, or a body that cannot split would be
+    /// withheld, and must refuse a sibling that navigates without a pipe.
+    #[test]
+    fn test_sibling_sees_register_uniformly_agrees_with_cannot_move_register_3862() {
+        use crate::jq::parser::parse;
+        for src in [
+            "$w",
+            "1",
+            ".",
+            "{a: .a}",
+            "($w, 1)",
+            "(($w | .a) // $w)",
+            "($w | .a)?",
+            "try ($w | .a)",
+            "($w | .a[]), $w",
+            "\"x\"",
+        ] {
+            let expr = parse(src).unwrap();
+            if cannot_move_register(&expr) {
+                assert!(sibling_sees_register_uniformly(&expr), "{src}");
+            }
+        }
+        for (src, uniform) in [
+            ("$w | .a", true),
+            ("($w | .a)?", true),
+            ("try ($w | .a)", true),
+            ("(($w | .a) // $w)", true),
+            ("(($w | .a), $w)", true),
+            ("$w", true),
+            (".a", false),
+            (".a?", false),
+            ("first(.a)", false),
+            ("try (.a) catch 1", false),
+            ("(($w | .a) // .b)", false),
+        ] {
+            assert_eq!(
+                sibling_sees_register_uniformly(&parse(src).unwrap()),
+                uniform,
+                "sibling_sees_register_uniformly({src})"
+            );
+        }
+        // `fans_out` follows it: a comma of such siblings stays, one with a bare
+        // navigating sibling still counts (#3145), and a call above the pipes does too.
+        for (src, fans) in [
+            ("try (($w | .a[]), $w)", false),
+            ("($w | .a), ($w | .b)", false),
+            ("try ($w | .a, .b?)", false),
+            ("try (.a?, $w)", true),
+            ("try (($w | .a), first(.b))", true),
+            ("try (($w | .a), f)", true),
+        ] {
+            assert_eq!(fans_out(&parse(src).unwrap()), fans, "fans_out({src})");
+        }
     }
 }
