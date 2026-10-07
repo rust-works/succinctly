@@ -370,6 +370,22 @@ OPERANDS = [
     "(foreach (foreach . as {a:$a} (0; .; .)) as $k (.; .; .))",
     "(foreach (reduce . as {a:$a} (0; .)) as $k (.; .; .))",
     "(foreach (foreach . as [$a] (.; .; .)) as $k (.; .; .))",
+    # (#3853) the nested folds #3744 left by value. An inner fold whose own SOURCE
+    # destructures the register moves it, and the inner loop pattern's step then runs on
+    # an element the register is no longer at: jq raises there, inside a `reduce` too.
+    # Contrasts: a bare `$a` loop pattern performs no step, and `reduce . as [$a]` over the
+    # register itself is backtracked, so neither raises.
+    "(reduce (reduce (. as [$q] | .) as [$a] (0; .)) as $x (.; .))",
+    "(reduce (reduce (. as {a:$q} | .) as {a:$a} (0; .)) as $x (.; .))",
+    "(reduce (reduce (. as [$q] | .) as $a (0; .)) as $x (.; .))",
+    "(reduce (reduce . as [$a] (0; .)) as $x (.; .))",
+    "(foreach (reduce (. as [$q] | .) as [$a] (0; .)) as $x (.; .; .))",
+    "(foreach (foreach (. as [$q] | .) as [$a] (0; .; .)) as $x (.; .; .))",
+    "(foreach (foreach . as {a:$a} (0; .; .)) as $x (.; .; .))",
+    "(reduce (foreach . as {a:$a} (0; .; .)) as $x (.; .))",
+    "(foreach (foreach . as [$a] (0; .; .)) as $x (.; .; .))",
+    "(foreach (foreach . as [$a] (.; .; .)) as $k (.; .; .)) or .a",
+    "try ((foreach (. as {a:$a} | .) as [$z] (.; .; .)) and true) catch 7",
     # (#3790) a fold whose SOURCE is the register itself: `.` does not move jq's register
     # and `$k` is that very node, so a bare `$k` is a path (any value, not only null). The
     # contrasts are a navigated source (`.a`, `.[]?`) and a computed one (`tostring`);
