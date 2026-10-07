@@ -75,7 +75,8 @@ SRCS += [
 # move the register exactly as `.a`/`.[1]` do, but a key with no `.`/`.[]` of its own once
 # slipped past `drive_fold_source`'s navigation gate and was driven by value (#2159). And a
 # nested `foreach` emits its values off the resolver's root path whatever its own source
-# navigated, so it states the register its source left (#3883, closed).
+# navigated; it states the register its source left when that is a `null`/boolean member and
+# nothing after the source can move it (#3883, closed).
 SRCS += [
     '.[1+1]|tostring', '.["a"|ascii_downcase]|tostring', '.[0:(1+1)]|tostring',
     '.[[1]]|length', '.[1+1]', 'foreach .[]? as $x (0; .+1)', 'reduce .[]? as $x (0; .+1)',

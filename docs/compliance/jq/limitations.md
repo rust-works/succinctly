@@ -3214,9 +3214,12 @@ answers `["b"]` — and classified the two residuals appended below):
     literal that never touched the register (`(foreach (foreach .[]? as $x (0; .+1)) as $k (.; .; .)) = 9` on
     `{"a":{"a":1},"k":"a"}` replaced the document with `9`; jq raises), then as a lost register
     (a refusal where jq answered); an emission that sits at the register its source left on a
-    `null`/boolean member now states it (#3939, #3883), so
-    `path(foreach (foreach .[]? as $x (0; .+1)) as $k (null; .))` on `{"a":null,"b":null}` is jq's
-    `["a"]`, `["b"]`.
+    `null`/boolean member, with an UPDATE and EXTRACT that cannot navigate, now states it
+    (#3939, #3883), so `path(foreach (foreach .[]? as $x (0; .+1)) as $k (null; .))` on
+    `{"a":null,"b":null}` is jq's `["a"]`, `["b"]`. Still a refusal where jq may answer: a member
+    that is not `null`/a boolean (the outer accumulator is not that node, so jq refuses too
+    unless the accumulator is the member itself), and a nested `foreach` whose UPDATE or EXTRACT
+    navigates after the source; neither writes anything.
   - **jq's pointer identity**: `tostring` of a string is the same `jv`
     (`path(foreach (.b|tostring) as $k (.; $k))` on `{"b":"s"}` is `["b"]`) -- a general
     path-mode gap, not a `foreach` one (`path(.b|tostring)` refuses the same way), and still a

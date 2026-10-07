@@ -425,6 +425,9 @@ OPERANDS = [
     "(foreach (foreach .[] as $x (0; .+1; tostring)) as $k (true; .))",
     "(foreach (foreach .a as $x (0; .+1)) as $k (null; .))",
     "(foreach (foreach .[]? as $x (0; .a?)) as $k (null; .))",
+    "(foreach (foreach .[]? as $x (0; .+1; .a?)) as $k (null; .))",
+    "(foreach (foreach .[]? as $x (.a; .+1)) as $k (null; .))",
+    "(foreach (foreach .[]? as [$q] (0; .+1)) as $k (null; .))",
     "(foreach (reduce .[]? as $x (0; .+1)) as $k (null; .))",
     # (#3940) a leading stage that only hands the register on, ahead of a register destructure.
     # Contrasts: a bare loop variable, a nested `reduce`, a navigated leading stage.

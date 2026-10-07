@@ -64637,6 +64637,36 @@ fn test_nested_navigating_foreach_states_the_register_its_source_left_3883() -> 
             r#"Invalid path expression near attempt to access element "a" of 0"#,
             5,
         ),
+        // An EXTRACT that navigates, and an INIT that navigated before the source ran, keep
+        // their own refusals; a destructuring pattern states the member it matched.
+        (
+            both,
+            r"path(foreach (foreach .[]? as $x (0; .+1; .a?)) as $k (null; .))",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of 1"#,
+            5,
+        ),
+        (
+            both,
+            r"path(foreach (foreach .[]? as $x (.a; .+1)) as $k (null; .))",
+            "",
+            r#"Invalid path expression near attempt to iterate through {"a":null,"b":null}"#,
+            5,
+        ),
+        (
+            both,
+            r"path(foreach (foreach .[]? as [$q] (0; .+1)) as $k (null; .))",
+            "[\"a\",0]\n[\"b\",0]\n",
+            "",
+            0,
+        ),
+        (
+            both,
+            r"path(foreach (foreach .[]? as {a:$q} ?// $q (0; .+1)) as $k (null; .))",
+            "[\"a\",\"a\"]\n[\"b\",\"a\"]\n",
+            "",
+            0,
+        ),
     ])
 }
 
