@@ -9,6 +9,8 @@ use alloc::rc::Rc;
 #[cfg(not(test))]
 use alloc::string::String;
 #[cfg(not(test))]
+use alloc::vec;
+#[cfg(not(test))]
 use alloc::vec::Vec;
 #[cfg(test)]
 use std::collections::BTreeMap;
