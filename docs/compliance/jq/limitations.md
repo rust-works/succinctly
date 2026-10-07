@@ -2780,7 +2780,17 @@ is the revert that established what the other one costs.
    `{"a":[{"b":1}],"x":9}` in jq and here
    ([#3862](https://github.com/rust-works/succinctly/issues/3862), pinned by
    `test_foreach_update_under_try_with_a_comma_above_a_pipe_keeps_the_register_3862`). A sibling
-   that navigates without a pipe (`.a?`, `first(.a)`) still withholds the register, as before.
+   that navigates without a pipe (`.b`, `.a?`, `first(.a)`, `.[]?`) is read as well
+   ([#3932](https://github.com/rust-works/succinctly/issues/3932)): it resolves against the accumulator
+   and raises where jq raises, so `(foreach .x as $w (0; try (($w|.a), .b); .)) = 9` is
+   `{"a":[{"b":1}],"x":{"a":9,"b":2}}` in jq and here (the register used to be withheld, the pipe
+   sibling's `$w` refused inside the `try` and the write was silently skipped; pinned by
+   `test_foreach_update_try_comma_with_a_navigating_sibling_keeps_the_register_3932`). A sibling the
+   register analysis cannot read (`now`, `input_line_number`, a computed key `.a[.b]`) still withholds it, so the body
+   refuses loudly where jq answers ([#3960](https://github.com/rust-works/succinctly/issues/3960)), and a `select(f)` sibling,
+   which has its own register rule, still skips the write silently
+   ([#3974](https://github.com/rust-works/succinctly/issues/3974); `test_foreach_update_try_comma_select_sibling_characterizes_3974`).
+   The read follows `first`, `last`, `limit`, `nth`, a nested comma and a `//` down to the navigation.
    A comma that mixes a navigating pipe with a sibling that leaves the register alone is read
    too ([#3941](https://github.com/rust-works/succinctly/issues/3941)): in `del(foreach .a as $v
    (.; (($v \| .b?), 1); try ($v \| .b?)))` the pipe moves the register to `a.b` (its EXTRACT

@@ -70527,6 +70527,181 @@ fn test_destructure_comma_with_a_navigating_pipe_keeps_the_register_3941() -> Re
     ])
 }
 
+/// #3932: a comma sibling that navigates without a pipe (`.b`, `.a?`, `first(.a)`, `.[]?`) is
+/// resolved against the accumulator, not the register, and raises where jq raises, so a `try`
+/// around the comma catches it exactly as jq's own does. The fold used to withhold the register
+/// for such a comma, so the pipe sibling's `$w` could not re-establish it, `try` swallowed that
+/// refusal and a write through the UPDATE was silently skipped. A plain navigation no longer
+/// withholds it. Every row captured from jq 1.7.1 with `-c`.
+#[test]
+fn test_foreach_update_try_comma_with_a_navigating_sibling_keeps_the_register_3932() -> Result<()> {
+    let doc = r#"{"a":[{"b":1}],"x":{"a":[{"b":1}],"b":2}}"#;
+    assert_path_rows_3289(&[
+        // The issue's rows.
+        (
+            doc,
+            r"(foreach .x as $w (0; try (($w|.a), .b); .)) = 9",
+            "{\"a\":[{\"b\":1}],\"x\":{\"a\":9,\"b\":2}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .x as $w (0; try (($w|.a), .b); .))",
+            "{\"a\":[{\"b\":1}],\"x\":{\"b\":2}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .x as $w (0; try (($w|.a), .b); .))",
+            "[\"x\",\"a\"]\n",
+            "",
+            0,
+        ),
+        // The other bare navigations the issue names, and `.[]?`.
+        (
+            doc,
+            r"(foreach .x as $w (0; try (($w|.a), .a?); .)) = 9",
+            "{\"a\":[{\"b\":1}],\"x\":{\"a\":9,\"b\":2}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .x as $w (0; try (($w|.a), first(.a)); .)) = 9",
+            "{\"a\":[{\"b\":1}],\"x\":{\"a\":9,\"b\":2}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .x as $w (0; try (($w|.a), .[]?); .))",
+            "{\"a\":[{\"b\":1}],\"x\":{\"b\":2}}\n",
+            "",
+            0,
+        ),
+        // The navigating sibling first: jq raises on it before the pipe is reached, so
+        // nothing is written, and neither is anything here.
+        (
+            doc,
+            r"(foreach .x as $w (0; try (.b, ($w|.a)); .)) |= 7",
+            "{\"a\":[{\"b\":1}],\"x\":{\"a\":[{\"b\":1}],\"b\":2}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .x as $w (0; try ((.b, .a?), ($w|.a)); .))",
+            "",
+            "",
+            0,
+        ),
+    ])?;
+    // The same navigation one layer down: inside a comma, `first`, `last` and a `//`.
+    let doc = r#"{"a":[{"b":1}],"x":{"a":[{"b":1}],"b":2,"c":[5,6]}}"#;
+    assert_path_rows_3289(&[
+        (
+            doc,
+            r"path(foreach .x as $w (.; try ((($w|.c?),.a), 3); .))",
+            "[\"x\",\"c\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .x as $w (.; try (($w|.c), (.a, .b)); .))",
+            "[\"x\",\"c\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .x as $w (.; try (($w|.c), first(.a, .b)); .))",
+            "[\"x\",\"c\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .x as $w (.; try (($w|.c), last(.a)); .))",
+            "[\"x\",\"c\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .x as $w (0; try (($w|.a), (.b // 3)); .)) = 9",
+            "{\"a\":[{\"b\":1}],\"x\":{\"a\":9,\"b\":2,\"c\":[5,6]}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .x as $w (.; try (($w|.c), limit(1; .a)); .))",
+            "{\"a\":[{\"b\":1}],\"x\":{\"a\":[{\"b\":1}],\"b\":2}}\n",
+            "",
+            0,
+        ),
+    ])?;
+    // #3906's last residual row: a comma body of a pipe and `first($k)` (no `try`).
+    assert_path_rows_3289(&[(
+        r#"{"a":{"c":1}}"#,
+        r"path(foreach .a as $k (0; (($k | .b), first($k)); .))",
+        "[\"a\",\"b\"]\n[\"a\"]\n",
+        "",
+        0,
+    )])
+}
+
+/// #3932, characterization of what it leaves (#3974). A `select(f)` comma sibling has its own
+/// register rule (#3653) and still withholds the fold's register, so the pipe sibling's `$w`
+/// refuses inside the `try` and the path or write is silently dropped. jq prints `["x","c"]`
+/// and then raises `Invalid path expression` (exit 5) for `path`, and raises for `del`. Update the
+/// expectations when it is fixed.
+#[test]
+fn test_foreach_update_try_comma_select_sibling_characterizes_3974() -> Result<()> {
+    let doc = r#"{"a":[{"b":1}],"x":{"a":[{"b":1}],"b":2,"c":[5,6]}}"#;
+    assert_path_rows_3289(&[
+        (
+            doc,
+            r"path(foreach .x as $w (.; try (($w|.c), select(.a)); .))",
+            "",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .x as $w (.; try (($w|.c), select(.a)); .))",
+            "{\"a\":[{\"b\":1}],\"x\":{\"a\":[{\"b\":1}],\"b\":2,\"c\":[5,6]}}\n",
+            "",
+            0,
+        ),
+    ])
+}
+
+/// #3932: a `foreach` whose UPDATE is a comma of a recursion and a literal answers as jq does.
+/// Both rows were refusals in `test_recurse_seed_residuals_stay_loud_3580` until a comma
+/// sibling that navigates stopped withholding the register. Captured from jq 1.7.1 with `-c`
+/// against the #2764 document.
+#[test]
+fn test_foreach_comma_with_a_recursion_sibling_answers_3932() -> Result<()> {
+    assert_rows_2764(&[
+        (
+            r"path(. as $x | foreach (1,2) as $i (1; (try ..), 5; .) | $x)",
+            "[]\n[]\n[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r"path(. as $x | foreach (1,2) as $i (1; (5, try ..); .) | $x)",
+            "[]\n[]\n[]\n[]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
 /// #3862: a comma sibling states the register on its own, outside a fold's UPDATE too -- a
 /// pipe stage's `first(2, 3)` (a generator of literals) left the register in place for jq and
 /// was refused until each sibling was asked for itself. Every row captured from jq 1.7.1.
@@ -70944,7 +71119,8 @@ fn test_foreach_update_alternate_shapes_keep_the_register_3906() -> Result<()> {
 /// direction, and the same on `main` before it). jq's answers are in the comments; update the
 /// expectations when these are fixed. An output of the *left* operand states no register
 /// (`1 // first($k)` answers the `1`), so a stage after it cannot say the register is where it
-/// entered; a comma body whose sibling navigates without a pipe is the split #3145 guards.
+/// entered. (`(($k | .b), first($k))`, the comma-body row that used to be here, answers since
+/// #3932: see `test_foreach_update_try_comma_with_a_navigating_sibling_keeps_the_register_3932`.)
 #[test]
 fn test_foreach_update_alternate_residual_refusals_3906_characterize() -> Result<()> {
     let doc = r#"{"a":{"c":1}}"#;
@@ -70962,14 +71138,6 @@ fn test_foreach_update_alternate_residual_refusals_3906_characterize() -> Result
         (
             doc,
             r"path(foreach .a as $k (0; (first($k) // 5) | $k; .))",
-            "",
-            refusal,
-            5,
-        ),
-        // jq: ["a","b"] then ["a"]
-        (
-            doc,
-            r"path(foreach .a as $k (0; (($k | .b), first($k)); .))",
             "",
             refusal,
             5,
@@ -92634,8 +92802,6 @@ fn test_recurse_seed_residuals_stay_loud_3580() -> Result<()> {
         // a pipe nested inside a forwarder is opaque (the bare `(.. | select(true))` stage is answered by #3653's own rule)
         (r"path(. as $x | 1 | if true then (.. | select(true)) else . end | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
         (r"del(. as $x | 1 | if true then (.. | select(true)) else . end | $x | .c)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"c\" of {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
-        (r"path(. as $x | foreach (1,2) as $i (1; (try ..), 5; .) | $x)", "[]\n", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
-        (r"path(. as $x | foreach (1,2) as $i (1; (5, try ..); .) | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
         (r"path(. as $x | 1 | [foreach (1,2) as $i (1; try ..; .)] | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
         (r"del(. as $x | 1 | if false then .. else 1 end | $x | .c)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"c\" of {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
     ])
