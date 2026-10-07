@@ -530,7 +530,7 @@ Each turns a refusal into an answer and needs its own oracle rows:
   pass the inner register on. A `select` entered on the register already passed a trackable
   branch through; only the register *carried* by an untracked entry was dropped, so the sweep
   gained contexts that enter the stage on a literal (`untracked-*`). Still refused where jq
-  answers, tracked by #3767: `try ... catch H` and either stage inside a compound stage
+  answers, tracked by #3767: `try ... catch H` with a navigating `H` (the rest is #3767 Part 3, below) and either stage inside a compound stage
   (`limit`/`nth` and an `[E]` collect of a type filter were lifted by #3767 Part 1, below). Not a
   promotion but found on the way,
   #3766 (fixed): `last(f)` returned a copy, so a `last` whose output is the register itself
@@ -543,7 +543,9 @@ Each turns a refusal into an answer and needs its own oracle rows:
   spellings the parser builds) and the inner stage decides: `last(f)`, `select(f)` and the type filters
   leave the register where it entered, `.a` still moves it. The count is a subexp. And
   `array_contents_are_checked` asks `is_select_stage` (select or a type filter), where it named
-  only `select`. Still open under #3767: a `catch` handler, a compound inner stage (`,` `//`
+  only `select`. Done by #3767 Part 3: `try E catch H` is `E`'s verdict when `H` cannot move the register
+  (`stage_is_register_keeping`: jq runs the handler after a backtrack that restores the register, on the
+  error's payload, which has no position); a handler that navigates stays refused. Still open under #3767: a compound inner stage (`,` `//`
   `if`, a pipe, a `def` call), an `[E]` of a wrapper around a type filter
   (`[first(numbers)]`; `[last(f)]` is Done by #3767 Part 2: `array_contents_are_checked` reads through
   `last(f)` to `f`), and a wrapper over an inner stage that navigates nothing (`first(.)`,

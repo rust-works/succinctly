@@ -67940,27 +67940,25 @@ fn test_path_register_last_f_wrappers_and_select_keep_it_3653() -> Result<()> {
             with_root,
             5,
         ),
-        // Still refused where jq answers `[]`: a `catch` handler runs on a
-        // caught error's payload, a register of its own. Pinned as today's
-        // (refuse-only) behaviour so lifting it is a deliberate change with rows
-        // of its own. (`limit`/`nth` of a `last`, and of a `select`, and an `[E]`
-        // collect of a type filter, were pinned here too until #3767.)
+        // Lifted by #3767: a `catch` handler that cannot move the register runs after a
+        // backtrack that restores it, so `try E catch H` is `E`'s verdict
+        // (`test_register_catch_handler_over_register_keeping_stage_3767`); `limit`/`nth`
+        // emit from inside `E`, so they are read through like `first`, and the `[E]`
+        // allowlist names the type filters.
         (
             doc,
             r"path(. as $x | try last(.a) catch . | $x)",
+            "[]\n",
             "",
-            with_root,
-            5,
+            0,
         ),
         (
             doc,
             r"path(. as $x | 5 | try select(.) catch . | $x)",
+            "[]\n",
             "",
-            with_root,
-            5,
+            0,
         ),
-        // Lifted by #3767: `limit`/`nth` emit from inside `E`, so they are read
-        // through like `first`, and the `[E]` allowlist names the type filters.
         (
             doc,
             r"path(. as $x | limit(1; last(.a)) | $x)",
@@ -110822,4 +110820,199 @@ fn test_seq_slurp_materializes_lazy_results_and_the_wrap_boundary_2847() -> Resu
     );
     assert!(!err.contains("panicked"), "stderr: {err}");
     Ok(())
+}
+
+// ============================================================================
+// #3767 Part 3: a `try ... catch` handler over a register-keeping stage
+// ============================================================================
+
+/// jq runs a `try`'s handler after a backtrack to the fork the `try` set, and a
+/// backtrack restores the path state saved there, so `try E catch H` leaves
+/// jq's path register where `E` does: back at the entry for `last(f)`,
+/// `select(f)` and the type filters, moved for `.a`. The handler runs on the
+/// error's payload, a value with no position of its own, so one that cannot move
+/// the register (`.`, a constant, `$x`, an `error(...)`) leaves it alone. Before
+/// #3767 the handler was not read, and every row below refused where jq answers
+/// `[]`. A handler that *navigates* (`catch .a`) is not admitted: it raises when
+/// it runs, in jq as here, and where it never runs jq answers while this still
+/// refuses (the last group, pinned as today's refuse-only behaviour so lifting it
+/// is a deliberate change). Every answer row captured from jq 1.7.1 with `-c` on
+/// `{"a":{"b":1},"k":2}`, on both evaluators.
+#[test]
+fn test_register_catch_handler_over_register_keeping_stage_3767() -> Result<()> {
+    let doc = r#"{"a":{"b":1},"k":2}"#;
+    let with_root = "Invalid path expression with result";
+    assert_path_rows_both_routes_3749(&[
+        // `last(f)`, entered on the register
+        (
+            doc,
+            r"path(. as $x | try last(.a) catch . | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | try last(.a) catch 7 | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | try last(.a) catch $x | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r#"path(. as $x | try last(.a) catch error("z") | $x)"#,
+            "[]\n",
+            "",
+            0,
+        ),
+        // `select(f)` and the type filters, entered on an untracked value
+        (
+            doc,
+            r"path(. as $x | 5 | try select(.) catch . | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | 5 | try numbers catch 7 | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | 5 | try values catch $x | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | 5 | try strings catch . | $x)",
+            "",
+            "",
+            0,
+        ),
+        // under the wrappers that add no movement, and nested in each other
+        (
+            doc,
+            r"path(. as $x | (try last(.a) catch .)? | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | first(try last(.a) catch .) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | limit(1; try last(.a) catch .) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | try (try last(.a) catch 1) catch . | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        // `$x` is still the register: a navigation off it is a path, and below the root
+        // the register is still on `.a`
+        (
+            doc,
+            r"path(. as $x | try last(.a) catch . | $x | .k)",
+            "[\"k\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(.a | . as $x | 5 | try select(.) catch . | $x)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        // the write side lands on the register
+        (
+            doc,
+            r"(. as $x | 5 | try select(.) catch . | $x) = 9",
+            "9\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(. as $x | try last(.a) catch . | $x | .a) |= 7",
+            "{\"a\":7,\"k\":2}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(. as $x | try last(.a) catch . | $x | .k)",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        // An `E` that navigates moves the register, and the handler does not change that
+        (
+            doc,
+            r"path(. as $x | try first(.a) catch . | $x)",
+            "",
+            with_root,
+            5,
+        ),
+        (
+            doc,
+            r"path(. as $x | try .a catch . | $x)",
+            "",
+            with_root,
+            5,
+        ),
+        // A handler that runs and navigates raises, in jq as here
+        (
+            doc,
+            r#"path(. as $x | try (select(.) | error({"a":1})) catch .a | $x)"#,
+            "",
+            "Invalid path expression near attempt to access element \"a\"",
+            5,
+        ),
+        // Still refused where jq answers `[]`: a handler that navigates but never runs, and a
+        // compound inner stage (`|` `,`)
+        (
+            doc,
+            r"path(. as $x | try last(.a) catch .a | $x)",
+            "",
+            with_root,
+            5,
+        ),
+        (
+            doc,
+            r#"path(. as $x | try (select(.) | error("z")) catch . | $x)"#,
+            "",
+            with_root,
+            5,
+        ),
+        (
+            doc,
+            r#"path(. as $x | try (last(.a), error("e")) catch . | $x)"#,
+            "",
+            with_root,
+            5,
+        ),
+    ])
 }
