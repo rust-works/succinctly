@@ -423,6 +423,15 @@ OPERANDS = [
     "(foreach (.|.|foreach . as {a:$a} (0; .; .)) as $x (.; .; .))",
     "(foreach ((., .) | foreach . as {a:$a} (0; .; .)) as $x (.; .; .))",
     "(foreach ((.|.) | . as {a:$a} | .) as $x (.; .; .))",
+    # Known gap (#3956): a no-op bind head. Routing it through the resolver turned a refused
+    # `or`-under-`try` delete into a silent no-op (the resolver does not model `(.|.) as` as
+    # the register), so it stays by value until the resolver does.
+    "(foreach ((.|.) as {a:$a} | .) as $x (.; .; .))",
+    "(foreach ((., .) as {a:$a} | .) as $x (.; .; .))",
+    "(reduce ((.|.) | . as [$q] | .) as [$a] (0; .))",
+    # Known gap (#3955 review): other stages that hand the register on (`select(true)`,
+    # `first(.)`, `try`) hide the destructure the same way and are still read by value.
+    "(foreach ((.|select(true)) | foreach . as {a:$a} (0; .; .)) as $x (.; .; .))",
     "(foreach ((.|.) | foreach . as [$a] (0; .; .)) as $x (.; .; .))",
     "(foreach ((.|.) | foreach . as $a (0; .; .)) as $x (.; .; .))",
     "(foreach ((.|.) | reduce . as {a:$a} (0; .)) as $x (.; .; .))",

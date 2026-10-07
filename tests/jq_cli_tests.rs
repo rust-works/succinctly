@@ -64424,6 +64424,29 @@ fn test_foreach_source_destructure_after_a_no_op_leading_stage_raises_3940() -> 
             "Cannot index object with number",
             5,
         ),
+        // A `reduce` outer fold reads the same predicate (`is_fold_with_destructured_register_source`).
+        (
+            doc,
+            r"path(reduce ((.|.) | . as [$q] | .) as [$a] (0; .))",
+            "",
+            "Cannot index object with number",
+            5,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r"path(reduce ((.|.) | foreach . as {a:[$q]} (0;.;.)) as [$a] (0; .))",
+            "",
+            "Invalid path expression near attempt to access element 0 of 0",
+            5,
+        ),
+        // A nested `foreach` whose own source destructures keeps its loop pattern's refusal.
+        (
+            doc,
+            r"path(foreach ((.|.) | foreach (. as {a:$b} | .) as {c:$d} (0;.;.)) as $x (.;.;.))",
+            "",
+            r#"Invalid path expression near attempt to access element "c" of {"a":1,"b":2}"#,
+            5,
+        ),
         // On a `null` document the destructure moves the register onto `.a`, and `null` is
         // identical to it by kind (#3939), so the path is that member's.
         (

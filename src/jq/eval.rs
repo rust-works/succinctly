@@ -44863,7 +44863,8 @@ fn yields_only_the_register(e: &Expr) -> bool {
 /// $x (.; .; .)`).
 ///
 /// Only the source's own spine is read (the bind itself, a comma's branches, a
-/// pipe's first stage that does not just hand the register on (#3940), a nested `foreach` over `.`), never a builtin's argument or a `def`
+/// pipe's first stage that does not just hand the register on (#3940), a nested
+/// `foreach` over `.`), never a builtin's argument or a `def`
 /// body, where `.` is another value. A nested `foreach . as [$q] (...)` moves the
 /// register for the outer fold too (#3853): it does not backtrack its source, so what it
 /// destructures reaches the outer EXTRACT. (An earlier routing of it answered a root
