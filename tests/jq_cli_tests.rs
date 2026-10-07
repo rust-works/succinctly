@@ -92155,6 +92155,161 @@ fn test_container_identity_survives_the_bridge_and_literal_binds_3069() -> Resul
     Ok(())
 }
 
+/// #3896: a fold's container loop variable is one value in jq, read twice, so
+/// jq's `jv_equal` identity shortcut sees it (`reduce ([nan]) as $a (0; $a == $a)`
+/// is `true`; a rebuilt literal per `$a` was `false`). Marked wherever UPDATE or
+/// EXTRACT can compare the variable, on every INIT fork, through `foreach`'s two
+/// operands, destructuring, `?//`, a `def` and the equality-backed builtins. The
+/// last rows build a *different* handle (a copy, a fresh literal, a scalar, an
+/// element of a second parse) and must stay as jq answers them. Every value
+/// captured from `/usr/bin/jq` 1.7.1 with `-nc`.
+#[cfg(not(feature = "unshared-containers"))]
+const FOLD_LOOP_VARIABLE_IDENTITY_3896: &[(&str, &str)] = &[
+    ("reduce ([nan]) as $a (0; $a == $a)", "true"),
+    ("reduce ({a:nan}) as $a (0; $a == $a)", "true"),
+    ("reduce ([nan]) as $a (0; $a != $a)", "false"),
+    ("reduce ([nan]) as $a (0; $a | . == $a)", "true"),
+    (
+        "reduce ([nan],[nan]) as $a (0; . + ($a == $a | if . then 1 else 0 end))",
+        "2",
+    ),
+    ("[foreach ([nan]) as $a (0; $a == $a; .)]", "[true]"),
+    ("[foreach ([nan]) as $a (0; .; $a == $a)]", "[true]"),
+    ("reduce ([[nan]]) as [$a] (0; $a == $a)", "true"),
+    ("reduce ({a:[nan]}) as {a:$a} (0; $a == $a)", "true"),
+    ("reduce ([nan]) as $a ?// [$a] (0; $a == $a)", "true"),
+    ("reduce ([nan]) as $a (0; [$a] == [$a])", "true"),
+    ("reduce ([nan]) as $a (0; def f: $a == $a; f)", "true"),
+    ("reduce ([nan]) as $a (0; def f(x): x == x; f($a))", "true"),
+    ("reduce ([nan]) as $a (0; [$a, $a] | .[0] == .[1])", "true"),
+    ("reduce ([nan]) as $a (0; {x:$a,y:$a} | .x == .y)", "true"),
+    (
+        "reduce ([nan]) as $a (0; [$a] | index([$a]) | tojson)",
+        "\"0\"",
+    ),
+    ("reduce ([nan]) as $a (0; [$a] | IN([$a]))", "true"),
+    ("reduce ([nan]) as $a (0; [$a,$a] | unique | length)", "1"),
+    ("[reduce ([nan]) as $a ((0,1); $a == $a)]", "[true,true]"),
+    ("[foreach ([nan]) as $a ((0,1); $a == $a)]", "[true,true]"),
+    ("reduce ([nan]) as $a (.; .x = ($a == $a))", "{\"x\":true}"),
+    (
+        "[nan] as $n | reduce ($n, $n) as $a (null; if . == $a then \"same\" else $a end)",
+        "\"same\"",
+    ),
+    (
+        "[nan] as $n | reduce ($n, $n) as $a ([]; . + [$a == $n])",
+        "[true,true]",
+    ),
+    ("reduce ([nan]) as $a (0; [$a[]] == $a)", "false"),
+    ("reduce ([nan]) as $a (0; ($a | map(.)) == $a)", "false"),
+    ("reduce ([nan]) as $a (0; $a == [nan])", "false"),
+    ("reduce (nan) as $a (0; $a == $a)", "false"),
+    ("reduce ([1]) as $a (0; $a == $a)", "true"),
+    ("reduce ([nan]) as $a (0; $a < $a)", "true"),
+    (
+        "reduce ([nan]) as $a (0; [[$a]] | contains([[$a]]))",
+        "false",
+    ),
+    (
+        "reduce ([nan],[nan]) as $a (null; if . == $a then \"same\" else $a end)",
+        "[null]",
+    ),
+];
+
+#[cfg(not(feature = "unshared-containers"))]
+#[test]
+fn test_fold_container_loop_variable_keeps_identity_3896() -> Result<()> {
+    for (filter, expected) in FOLD_LOOP_VARIABLE_IDENTITY_3896 {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, "", &["-nc"])?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (*expected, 0),
+            "`{filter}`: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3896 through document input, where the fold's source is a cursor read
+/// rather than an `OwnedValue` literal: the answers do not move, and neither do
+/// the write/refusal answers of #3329 or the in-place assignment folds, when the
+/// UPDATE also compares the variable. Captured from `/usr/bin/jq` 1.7.1.
+#[cfg(not(feature = "unshared-containers"))]
+#[test]
+fn test_fold_container_loop_variable_identity_through_document_input_3896() -> Result<()> {
+    for (input, filter, expected, code) in [
+        ("[[1],[1]]", "reduce .[] as $a (0; $a == $a)", "true", 0),
+        (
+            "[[1],[2]]",
+            "reduce .[] as $a (null; if . == $a then 1 else $a end)",
+            "[2]",
+            0,
+        ),
+        (
+            "[[1],[1]]",
+            "reduce .[] as $a (null; if . == $a then \"eq\" else $a end)",
+            "\"eq\"",
+            0,
+        ),
+        (
+            "[[1],[1]]",
+            "map(nan) | reduce .[] as $a (0; $a == $a)",
+            "false",
+            0,
+        ),
+        (
+            "[{\"a\":1}]",
+            "reduce .[] as $a (.; ($a.a) = 9 | . == $a)",
+            "",
+            5,
+        ),
+        (
+            "{\"a\":[1]}",
+            "reduce (.a) as $x (.; ($x[0]) = 9 | $x == $x)",
+            "",
+            5,
+        ),
+        (
+            "{\"a\":[1]}",
+            "[path(reduce (.a) as $x (.; if $x == $x then $x else . end))]",
+            "",
+            5,
+        ),
+        (
+            "{\"a\":[1]}",
+            "[path(foreach (.a) as $x (.; $x; select($x == $x)))]",
+            "[[\"a\"]]",
+            0,
+        ),
+        (
+            "[{\"name\":\"a\",\"score\":1},{\"name\":\"b\",\"score\":2}]",
+            "reduce .[] as $r ({}; if $r == $r then .[$r.name] = $r.score else . end)",
+            "{\"a\":1,\"b\":2}",
+            0,
+        ),
+        (
+            "[{\"name\":\"a\",\"score\":1},{\"name\":\"b\",\"score\":2}]",
+            "reduce .[] as $r ({}; .[$r.name] += ($r.score | floor))",
+            "{\"a\":1,\"b\":2}",
+            0,
+        ),
+    ] {
+        let (stdout, stderr, status) = run_jq_stdin_streams(filter, input, &["-c"])?;
+        assert_eq!(
+            (stdout.trim_end(), status),
+            (expected, code),
+            "`{filter}`: stderr={stderr:?}"
+        );
+        if code != 0 {
+            assert!(
+                stderr.contains("Invalid path expression"),
+                "`{filter}`: stderr={stderr:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// #3069's bridge provenance, seen by `path()`: a container read back out of
 /// the reindex bridge is the storage that went in, so a bound `$x` embedded
 /// in something the bridge rebuilt is still `$x`'s own `Rc` where the

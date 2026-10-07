@@ -50733,6 +50733,24 @@ fn test_yq_container_nan_equality_stays_structural_3069() -> Result<()> {
     Ok(())
 }
 
+/// #3896: the fold's container loop variable keeps jq-mode identity (one value
+/// read twice) in jq mode only. `succinctly yq` accepts `reduce`/`foreach` where
+/// real yq's lexer rejects them, and answers a NaN-bearing container
+/// structurally there, as it does outside a fold (#3069).
+#[test]
+fn test_yq_fold_container_loop_variable_stays_structural_3896() -> Result<()> {
+    for (filter, expected) in [
+        ("reduce (.a) as $x (0; $x == $x)", "false"),
+        ("reduce (.a) as $x (0; $x != $x)", "true"),
+        ("reduce (.a) as $x (0; [$x] == [$x])", "false"),
+        ("[foreach (.a) as $x (0; $x == $x; .)] | .[0]", "false"),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, "a: [.nan]\n", &[])?;
+        assert_eq!((stdout.trim_end(), code), (expected, 0), "`{filter}`");
+    }
+    Ok(())
+}
+
 /// #3307: a spine of top-level defs is installed in one walk, in yq mode too
 /// (`succinctly yq` accepts `def`, which real yq's lexer rejects, and reaches
 /// the same `bind_def`). Every output below is what `succinctly yq` answered

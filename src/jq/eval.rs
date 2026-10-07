@@ -58421,6 +58421,82 @@ pub(crate) fn fold_loop_variable_is_marked<S: EvalSemantics>(
             || extract.is_some_and(|extract| loop_var_is_path_source(extract, &names)))
 }
 
+/// Whether a fold's container loop variables are substituted as storage-sharing
+/// markers so that jq's `jv_equal` identity check can see them (#3896): jq mode,
+/// and a fold whose UPDATE or EXTRACT both reads a loop variable and can compare
+/// it by value ([`loop_var_can_be_compared`]).
+///
+/// jq binds `$a` to one `jv` and reads it twice, so `reduce ([nan]) as $a (0;
+/// $a == $a)` is `true`; a rebuilt literal per `$a` is two allocations, and a
+/// NaN-bearing container is then unequal to itself. Independent of
+/// [`fold_loop_variable_is_marked`]: it needs no path read, no anchor scope, and
+/// holds on every INIT fork (a constant source is shared on each), and it never
+/// registers INIT's `Rc` -- the marker's storage is the element's own, which
+/// certifies nothing in `path()` that jq refuses.
+pub(crate) fn fold_loop_variable_shares_identity<S: EvalSemantics>(
+    patterns: &[Pattern],
+    update: &Expr,
+    extract: Option<&Expr>,
+) -> bool {
+    if !S::EQUALITY_SHORT_CIRCUITS_ON_IDENTITY {
+        return false;
+    }
+    let names = pattern_alternatives_var_names(patterns);
+    !names.is_empty()
+        && (loop_var_can_be_compared(update, &names)
+            || extract.is_some_and(|extract| loop_var_can_be_compared(extract, &names)))
+}
+
+/// Whether `expr` reads one of `names` *and* holds a node that can run jq's
+/// value equality: a `==`/`!=` anywhere, or a builtin or call (whose body may
+/// compare: `unique`, `index`, `IN`, a `def f: $a == $a`) outside an assignment.
+///
+/// An assignment's path and right-hand side are read by value and mostly keys
+/// and scores, and a marker anywhere in one makes `owned_assign_step` decline
+/// (`closed_expr_to_owned`), copying the accumulator on every step
+/// (`fold_assign_step_copies_nothing_3138`). Only an explicit `==`/`!=` there
+/// counts, so `.[$r.name] += ($r | f)` keeps its in-place step and a comparison
+/// hidden behind that call keeps the rebuilt operands (NaN-bearing containers
+/// only).
+fn loop_var_can_be_compared(expr: &Expr, names: &[String]) -> bool {
+    fn is_equality(e: &Expr) -> bool {
+        matches!(
+            e,
+            Expr::Compare {
+                op: CompareOp::Eq | CompareOp::Ne,
+                ..
+            }
+        )
+    }
+    let reads_name = any_subexpr(
+        expr,
+        &mut |n| matches!(n, Expr::Var(v) if names.iter().any(|name| name == v)),
+    );
+    reads_name
+        && search_subexpr(expr, &mut |e| {
+            if is_equality(e) {
+                Visit::Found
+            } else if is_assignment_expr(e) {
+                if any_subexpr(e, &mut |n| is_equality(n)) {
+                    Visit::Found
+                } else {
+                    Visit::Skip
+                }
+            } else if matches!(
+                e,
+                Expr::Builtin(_)
+                    | Expr::FuncCall { .. }
+                    | Expr::NamespacedCall { .. }
+                    | Expr::DefCall { .. }
+                    | Expr::Shared(_)
+            ) {
+                Visit::Found
+            } else {
+                Visit::Descend
+            }
+        })
+}
+
 /// Whether `expr` can read one of `names` as a path step: inside the argument
 /// of a resolver (`path`, `del`, `pick`, an assignment's target) at a position
 /// that propagates the register, or as an argument of a call outside an
@@ -58608,6 +58684,7 @@ pub(crate) struct FoldDirectRetry {
     init: bool,
     source: bool,
     marks: bool,
+    shares: bool,
 }
 
 impl FoldDirectRetry {
@@ -58622,6 +58699,7 @@ impl FoldDirectRetry {
             init: direct_pattern_retry(init),
             source: direct_pattern_retry(source),
             marks: fold_loop_variable_is_marked::<S>(patterns, update, extract),
+            shares: fold_loop_variable_shares_identity::<S>(patterns, update, extract),
         }
     }
 
@@ -58716,6 +58794,7 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
     // (`[reduce (.) as $x ((.,.); $x)]` is `[{"a":1},null]`), so a write through
     // `$x` there refuses in jq where marking it would answer.
     let mark_loop_vars = retry.marks;
+    let share_loop_vars = retry.shares;
     let hoisted_update = demote_for_reentry(update, &RootWitness::Owned);
     let update = FoldOperand::new::<S>(update, &hoisted_update);
     let hoisted_extract = extract.map(|e| (e, demote_for_reentry(e, &RootWitness::Owned)));
@@ -58744,7 +58823,8 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
     let init_flow = drive_init(&mut |init_val| {
         terminal.begin();
         let first = core::mem::take(&mut first_fork);
-        let mark = mark_loop_vars && first;
+        // #3896: identity sharing holds on every fork; only the path marking is first-fork-only.
+        let mark = (mark_loop_vars && first) || share_loop_vars;
         // #3895: jq runs every later fork's SOURCE against `null`.
         let source_input = if first {
             SourceInput::Real
@@ -58859,6 +58939,7 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
     // UPDATE instead (see [`FoldOperand`]).
     // #3329: see `foreach_forks`.
     let mark_loop_vars = retry.marks;
+    let share_loop_vars = retry.shares;
     let hoisted_update = demote_for_reentry(update, &RootWitness::Owned);
     let update = FoldOperand::new::<S>(update, &hoisted_update);
     // Lazily computed on the first fork and reused, for the same reason
@@ -58876,7 +58957,8 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
     let init_flow = drive_init(&mut |init_val| {
         terminal.begin();
         let first = core::mem::take(&mut first_fork);
-        let mark = mark_loop_vars && first;
+        // #3896: identity sharing holds on every fork; only the path marking is first-fork-only.
+        let mark = (mark_loop_vars && first) || share_loop_vars;
         // #3895: jq runs every later fork's SOURCE against `null`.
         let source_input = if first {
             SourceInput::Real
@@ -76278,6 +76360,72 @@ mod tests {
             "reduce . as $x (.; path($x))",
             AnchorScope::On
         ));
+    }
+
+    /// #3896: a fold shares its container loop variables' storage only where its
+    /// UPDATE or EXTRACT both reads one and can compare it by value, and never in
+    /// yq mode. An assignment's path and right-hand side keep the in-place step
+    /// (`fold_assign_step_copies_nothing_3138`) unless they hold a `==`/`!=`.
+    #[test]
+    fn fold_loop_variable_identity_gate_3896() {
+        fn gate<S: EvalSemantics>(src: &str) -> bool {
+            match &parse(src).unwrap() {
+                Expr::Reduce {
+                    patterns, update, ..
+                } => fold_loop_variable_shares_identity::<S>(patterns, update, None),
+                Expr::Foreach {
+                    patterns,
+                    update,
+                    extract,
+                    ..
+                } => fold_loop_variable_shares_identity::<S>(patterns, update, extract.as_deref()),
+                other => panic!("not a fold: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite: every row below is a reduce or a foreach (#3896)"
+            }
+        }
+
+        for src in [
+            "reduce . as $a (0; $a == $a)",
+            "reduce . as $a (0; $a != 1)",
+            "reduce . as [$a] (0; $a == $a)",
+            "reduce . as $a ?// [$a] (0; $a == $a)",
+            "reduce . as $a (0; [$a] | index([$a]))",
+            "reduce . as $a (0; f($a))",
+            "reduce . as $a (0; def f: $a == $a; f)",
+            "reduce . as $a (.; .x = ($a == $a))",
+            "reduce . as $a (.; .x |= ($a == 1))",
+            "foreach . as $a (0; 1; $a == $a)",
+            "foreach . as $a (0; $a == $a; .)",
+        ] {
+            assert!(
+                gate::<JqSemantics>(src),
+                "{src} can compare its loop variable"
+            );
+            assert!(
+                !gate::<YqSemantics>(src),
+                "{src}: yq mode never shares identity"
+            );
+        }
+        for src in [
+            // No comparison, builtin or call: nothing can observe the storage.
+            "reduce . as $a (0; . + 1)",
+            "reduce . as $a ([]; . + [$a])",
+            "reduce . as $a (.; .x = $a)",
+            // A comparison that never reads a loop variable.
+            "reduce . as $a (0; . == 1)",
+            "reduce . as $a (0; $b == $b)",
+            // An assignment's path and right-hand side run by value: a call or
+            // builtin there must not make `owned_assign_step` decline.
+            "reduce .[] as $r ({}; .[$r.name] = $r.score)",
+            "reduce .[] as $r ({}; .x[$r.name] += $r.score)",
+            "reduce .[] as $r ({}; .[$r.name] = my_fn($r))",
+            "reduce .[] as $r ({}; .[$r.name] += ($r.score | floor))",
+            "foreach . as $a (0; .; $a.b)",
+        ] {
+            assert!(
+                !gate::<JqSemantics>(src),
+                "{src} cannot compare its loop variable"
+            );
+        }
     }
 
     /// #3241: the fold loops' value output is the same with the embed table
