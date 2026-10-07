@@ -66,6 +66,9 @@ DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 
 WAIVER_LABEL = "no-changelog"
 WAIVER_MARKER_RE = re.compile(r"\[(?:no|skip) changelog\]", re.IGNORECASE)
+# A body line that CHANGELOG.md's own parsing would take for a heading or a link
+# definition (`collect` finds the Unreleased body's end and the footer by them).
+STRUCTURAL_LINE_RE = re.compile(r"^(?:#|\[[^\]]+\]: )")
 HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 RELEASE_TITLE_PREFIX = "chore(release):"
 
@@ -120,6 +123,12 @@ def read_body(path, name):
         raise ChangelogError(
             f"{name}: an entry must start with a bullet ('- '), as in CHANGELOG.md"
         )
+    for line in body.split("\n")[1:]:
+        if STRUCTURAL_LINE_RE.match(line):
+            raise ChangelogError(
+                f"{name}: a line starting at column 0 with '#' or a '[x]: ' link would "
+                f"corrupt CHANGELOG.md: {line[:40]!r}; indent it or reword"
+            )
     return body
 
 
@@ -243,10 +252,14 @@ def write_atomically(path, text):
         raise
 
 
-def waiver_reason(title, body, labels, author):
-    """Return why this PR needs no fragment, or None if it does."""
-    if title.strip().startswith(RELEASE_TITLE_PREFIX):
-        return f"release PR (title starts with '{RELEASE_TITLE_PREFIX}'; it consumes fragments)"
+def waiver_reason(title, body, labels, author, touches_changelog=False):
+    """Return why this PR needs no fragment, or None if it does.
+
+    The label and the body marker are an honour system by design. The release
+    title is not: it only waives a PR whose diff rewrites CHANGELOG.md, which
+    is what `collect` does, so a title alone cannot skip the gate."""
+    if title.strip().startswith(RELEASE_TITLE_PREFIX) and touches_changelog:
+        return f"release PR (title starts with '{RELEASE_TITLE_PREFIX}' and it rewrites CHANGELOG.md)"
     if author.endswith("[bot]"):
         return f"opened by a bot ({author})"
     if WAIVER_LABEL in labels:
@@ -257,15 +270,26 @@ def waiver_reason(title, body, labels, author):
     return None
 
 
-def changed_fragment_names(base, head, repo=ROOT, directory="changelog.d"):
-    """Names of fragments the PR adds, modifies or renames into place."""
+REPO = ROOT
+
+
+def _diff_names(base, head, diff_filter, path):
     out = subprocess.run(
-        ["git", "-C", str(repo), "diff", "--name-only", "--diff-filter=AMR",
-         f"{base}...{head}", "--", directory],
+        ["git", "-C", str(REPO), "diff", "--name-only", f"--diff-filter={diff_filter}",
+         f"{base}...{head}", "--", path],
         check=True, capture_output=True, text=True,
     ).stdout
-    names = [Path(p).name for p in out.splitlines()]
+    return out.splitlines()
+
+
+def changed_fragment_names(base, head, directory="changelog.d"):
+    """Names of fragments the PR adds, modifies or renames into place."""
+    names = [Path(p).name for p in _diff_names(base, head, "AMR", directory)]
     return [n for n in names if n not in NON_FRAGMENTS and FRAGMENT_RE.match(n)]
+
+
+def changelog_modified(base, head):
+    return bool(_diff_names(base, head, "M", "CHANGELOG.md"))
 
 
 def cmd_check(args):
@@ -285,7 +309,10 @@ def cmd_check_pr(args):
         return status
     labels = {l.strip() for l in args.labels.split(",") if l.strip()}
     body = Path(args.body_file).read_text(encoding="utf-8") if args.body_file else ""
-    reason = waiver_reason(args.title, body, labels, args.author)
+    reason = waiver_reason(
+        args.title, body, labels, args.author,
+        touches_changelog=changelog_modified(args.base, args.head),
+    )
     if reason:
         print(f"changelog fragment waived: {reason}")
         return 0
@@ -311,7 +338,9 @@ def cmd_collect(args):
             print(f"error: {e}", file=sys.stderr)
         raise ChangelogError(f"{len(errors)} invalid fragment(s); fix them before releasing")
     date = args.date or datetime.date.today().isoformat()
-    text = changelog.read_text(encoding="utf-8")
+    text = changelog.read_bytes().decode("utf-8")
+    if "\r" in text:
+        raise ChangelogError(f"{changelog.name}: has CRLF line endings; refusing to mix them")
     new_text = build_release(text, fragments, args.version, date)
 
     sections = render_sections(fragments)
@@ -320,15 +349,28 @@ def cmd_collect(args):
         print(f"## [{args.version}] - {date}\n")
         print("\n\n".join(sections))
         print(
-            f"\n-- dry run: would consume {len(fragments)} fragment(s) ({names}); "
-            "nothing written or deleted --",
+            f"\n-- dry run: would consume {len(fragments)} fragment(s) ({names}) and carry "
+            f"the text now under [Unreleased] into the section verbatim, after the sections "
+            f"above; nothing written or deleted --",
             file=sys.stderr,
         )
         return 0
 
+    fragment_dir = Path(args.fragments_dir)
+    if fragments and not os.access(fragment_dir, os.W_OK):
+        raise ChangelogError(f"{fragment_dir} is not writable; fragments could not be deleted")
     write_atomically(changelog, new_text)
+    stuck = []
     for f in fragments:
-        f.path.unlink()
+        try:
+            f.path.unlink()
+        except OSError as e:
+            stuck.append(f"{f.path.name}: {e}")
+    if stuck:
+        raise ChangelogError(
+            f"{changelog.name} was written, but these fragments could not be deleted; "
+            "delete them by hand (a re-run would refuse, the section exists): " + "; ".join(stuck)
+        )
     print(f"wrote {changelog.name}: [{args.version}] - {date}; consumed {len(fragments)} fragment(s)")
     return 0
 

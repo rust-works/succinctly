@@ -80,7 +80,9 @@ python3 scripts/changelog.py collect --version X.Y.Z              # rewrite CHAN
 - carries whatever is under `## [Unreleased]` into that section **verbatim, after the
   fragment sections**, and leaves an empty `## [Unreleased]` above it. The text that
   predates fragments is therefore released once, in the first release made after the switch;
-  after that `[Unreleased]` stays empty and the flow is purely fragments;
+  after that `[Unreleased]` stays empty and the flow is purely fragments. That first section
+  repeats headings (a `### Changed` from the fragments, then the legacy text's own `### Changed`
+  blocks): the legacy text is kept byte-for-byte on purpose and already repeats them;
 - updates the comparison links at the bottom (`[Unreleased]` and the new `[X.Y.Z]`);
 - deletes the consumed fragments (everything in `changelog.d/` except `README.md`).
 

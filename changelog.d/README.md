@@ -59,5 +59,6 @@ deletes the consumed fragments. See `docs/guides/release.md`.
 `CHANGELOG.md`'s `[Unreleased]` section predates fragments and is left untouched. At the
 first release, `collect` carries whatever is under `## [Unreleased]` into the new section
 verbatim, **after** the fragment sections, and leaves an empty `[Unreleased]` behind. From
-then on the changelog is purely fragments. Nobody should add new entries under
+then on the changelog is purely fragments. That first section therefore repeats `###`
+headings (the fragments' sections, then the legacy text's own); the legacy text already did. Nobody should add new entries under
 `[Unreleased]` by hand.

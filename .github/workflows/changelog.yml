@@ -20,6 +20,12 @@ on:
 permissions:
   contents: read
 
+# A label or body edit re-triggers the run; without this an older, failed run's
+# stale payload can finish after the newer passing one and leave the check red.
+concurrency:
+  group: changelog-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   fragments:
     name: Changelog fragments

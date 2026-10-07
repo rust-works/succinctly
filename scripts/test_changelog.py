@@ -189,6 +189,18 @@ class LoadFragmentsTests(Workspace):
         self.assertEqual([f.path.name for f in fragments], ["5.added.md"])
         self.assertEqual(len(errors), 5, errors)
 
+    def test_a_body_line_that_looks_like_structure_is_an_error(self):
+        for i, line in enumerate(["## [9.9.9] - x", "### Added", "[Unreleased]: http://x", "# top"]):
+            with self.subTest(line=line):
+                write_fragments(self.frag_dir, {f"{i + 1}.added.md": f"- entry\n{line}\n"})
+                _, errors = changelog.load_fragments(self.frag_dir)
+                self.assertTrue(any(f"{i + 1}.added.md" in e for e in errors), errors)
+
+    def test_indented_hash_and_bracket_text_in_a_body_is_fine(self):
+        write_fragments(self.frag_dir, {"1.added.md": "- entry\n  # a comment\n  ### not a heading\n  [x]: y\n- [link](u)\n"})
+        fragments, errors = changelog.load_fragments(self.frag_dir)
+        self.assertEqual((len(fragments), errors), (1, []))
+
     def test_non_utf8_body_is_an_error(self):
         self.frag_dir.mkdir()
         (self.frag_dir / "1.added.md").write_bytes(b"- \xff\xfe\n")
@@ -348,6 +360,23 @@ class CollectCommandTests(Workspace):
         self.collect()
         self.assertEqual(self.changelog.stat().st_mode & 0o777, 0o644)
 
+    def test_crlf_changelog_is_refused_not_normalised(self):
+        crlf = CHANGELOG.replace("\n", "\r\n").encode()
+        self.changelog.write_bytes(crlf)
+        status, _, err = self.collect()
+        self.assertEqual(status, 1)
+        self.assertIn("CRLF", err)
+        self.assertEqual(self.changelog.read_bytes(), crlf)
+
+    @unittest.skipIf(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0), "needs POSIX perms, non-root")
+    def test_unwritable_fragment_dir_is_refused_before_anything_is_written(self):
+        os.chmod(self.frag_dir, 0o555)
+        self.addCleanup(os.chmod, self.frag_dir, 0o755)
+        status, _, err = self.collect()
+        self.assertEqual(status, 1)
+        self.assertIn("not writable", err)
+        self.assertEqual(self.changelog.read_text(encoding="utf-8"), CHANGELOG)
+
     def test_a_refused_collect_deletes_nothing(self):
         status, _, err = self.run_cli(
             "collect", "--version", "0.7.0", "--changelog", str(self.changelog),
@@ -382,8 +411,8 @@ class CheckCommandTests(Workspace):
 
 
 class WaiverTests(unittest.TestCase):
-    def waiver(self, title="feat(jq): x", body="", labels=(), author="alice"):
-        return changelog.waiver_reason(title, body, set(labels), author)
+    def waiver(self, title="feat(jq): x", body="", labels=(), author="alice", touches_changelog=False):
+        return changelog.waiver_reason(title, body, set(labels), author, touches_changelog)
 
     def test_an_ordinary_pr_is_not_waived(self):
         self.assertIsNone(self.waiver())
@@ -399,8 +428,11 @@ class WaiverTests(unittest.TestCase):
         body = "## Description\n<!-- add [no changelog] to waive the fragment -->\nreal text\n"
         self.assertIsNone(self.waiver(body=body))
 
-    def test_release_pr_is_waived(self):
-        self.assertIn("release", self.waiver(title="chore(release): prepare v0.8.0"))
+    def test_release_pr_is_waived_only_if_it_rewrites_the_changelog(self):
+        title = "chore(release): prepare v0.8.0"
+        self.assertIn("release", self.waiver(title=title, touches_changelog=True))
+        # The title alone must not skip the gate for a feature PR.
+        self.assertIsNone(self.waiver(title=title))
 
     def test_bot_is_waived(self):
         self.assertIn("bot", self.waiver(author="dependabot[bot]"))
@@ -426,10 +458,9 @@ class CheckPrTests(Workspace):
         git(self.root, "add", "-A")
         git(self.root, "commit", "-q", "-m", "base")
         git(self.root, "checkout", "-q", "-b", "pr")
-        # `changed_fragment_names` defaults to the real repo; point it here.
-        self._orig = changelog.changed_fragment_names
-        changelog.changed_fragment_names = lambda base, head: self._orig(base, head, repo=self.root)
-        self.addCleanup(setattr, changelog, "changed_fragment_names", self._orig)
+        # The git helpers default to this repository; point them at the throwaway one.
+        self.addCleanup(setattr, changelog, "REPO", changelog.REPO)
+        changelog.REPO = self.root
 
     def check_pr(self, **kw):
         argv = ["check-pr", "--fragments-dir", str(self.frag_dir), "--base", "main",
@@ -476,6 +507,30 @@ class CheckPrTests(Workspace):
         git(self.root, "commit", "-q", "-m", "consume")
         status, _, _ = self.check_pr()
         self.assertEqual(status, 1)
+
+    def test_release_title_waives_only_with_a_changelog_rewrite(self):
+        self.commit({"src.rs": "x\n"})
+        status, _, _ = self.check_pr(title="chore(release): tweak jq")
+        self.assertEqual(status, 1)
+        self.commit({"CHANGELOG.md": "# Changelog\n"})  # new file: not a rewrite
+        status, _, _ = self.check_pr(title="chore(release): tweak jq")
+        self.assertEqual(status, 1)
+
+    def test_release_pr_that_consumes_fragments_passes(self):
+        (self.root / "CHANGELOG.md").write_text("# Changelog\n")
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "add changelog")
+        git(self.root, "checkout", "-q", "-B", "main")
+        git(self.root, "checkout", "-q", "-b", "release")
+        (self.root / "CHANGELOG.md").write_text("# Changelog\n\n## [0.8.0]\n")
+        git(self.root, "rm", "-q", "changelog.d/1.added.md")
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "release")
+        argv = ["check-pr", "--fragments-dir", str(self.frag_dir), "--base", "main",
+                "--head", "release", "--title", "chore(release): prepare v0.8.0"]
+        status, out, err = self.run_cli(*argv)
+        self.assertEqual(status, 0, err)
+        self.assertIn("release PR", out)
 
     def test_waived_pr_passes_without_a_fragment(self):
         self.commit({"docs.md": "x\n"})
