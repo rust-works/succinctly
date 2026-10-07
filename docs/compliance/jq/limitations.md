@@ -2598,13 +2598,14 @@ is the revert that established what the other one costs.
    \| $y as {c:$w} \| $w)` — answer since #3120 gave the arm the carried register. A fourth,
    `path(. as {a:$q} ?// {b:$r} \| if ([3,1]\|sort\|.[0]==1) then $q else $r end)`, answers
    `["a"]` since #3186 stopped `cannot_move_register` recursing into an `if` condition, which
-   jq compiles as a subexp.)
+   jq compiles as a subexp. A fifth, `path(. as {a:$q} \| $q[0], $q)`, answers `["a",0]`, `["a"]`
+   since #3941: a comma sibling that leaves the register alone states it, and the stage now reads that
+   statement whenever any sibling does, not only when every one does.)
 
    | Filter                                            | jq                 | Why succinctly still refuses                                                                                                                 |
    | ------------------------------------------------- | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
    | `path(. as {a:$q} \| .a as $z \| $z)`             | `["a"]`            | a bind whose source navigates needs a trackable stage, and the pattern's body stage is untracked by construction                             |
    | `path(. as {a:$q} ?// $z \| .a)`                  | `["a"]`            | jq's fork catches the body's own near-access error and tries the next alternative; here that error is indistinguishable from a resolver artefact, so the guard refuses instead (a `PATH_END` refusal, by contrast, reaches the loop as a sink stop and does retry)                                                             |
-   | `path(. as {a:$q} \| $q[0], $q)`                  | `["a",0]`, `["a"]` | pre-existing: a `$var` nested under `,`/`if` gets no register (the scope limit above) — `path(.a as $y \| .a \| 5 \| $y[0], $y)` refuses too |
    | `path(. as {a:$q} \| first(.) \| $q)`             | `["a"]`            | pre-existing: a `first(.)` passthrough on an untracked stage re-seeds the carried register from the ambient value -- `path(.a as $y \| .a \| 5 \| first(.) \| $y)` refuses too; `if`/`try`/`. as $q \| .`/`label`/`getpath([])` carry it, and so do `select` and the type filters since [#3653](https://github.com/rust-works/succinctly/issues/3653) |
    | `path((., .) as {a:$q} \| $q)`                    | `["a"]`, `["a"]`   | the identity premise is decided from the source's spelling (`.`, a certified marker, null/bool by value); an identity-*equivalent* source (`(., .)`, `getpath([])`, `first(recurse)`, a `def` parameter bound to `.`) binds by value and the first step refuses |
    | `path(. as {a:$q} \| $q[($q\|length)-1])`          | `["a",2]`          | a computed index on a marker head resolves the key off the ambient input, so the marker never re-establishes; `$q \| .[length-1]` answers                                                                                   |
@@ -2780,6 +2781,13 @@ is the revert that established what the other one costs.
    ([#3862](https://github.com/rust-works/succinctly/issues/3862), pinned by
    `test_foreach_update_under_try_with_a_comma_above_a_pipe_keeps_the_register_3862`). A sibling
    that navigates without a pipe (`.a?`, `first(.a)`) still withholds the register, as before.
+   A comma that mixes a navigating pipe with a sibling that leaves the register alone is read
+   too ([#3941](https://github.com/rust-works/succinctly/issues/3941)): in `del(foreach .a as $v
+   (.; (($v \| .b?), 1); try ($v \| .b?)))` the pipe moves the register to `a.b` (its EXTRACT
+   refuses) while the literal runs from `.a`, so `{"a":{"b":1}}` becomes `{"a":{}}` as in jq. The
+   literal's statement used to be read only when *every* sibling left the register alone, so its
+   EXTRACT ran register-less, the `try` caught the refusal and the write was silently skipped
+   (pinned by `test_foreach_update_comma_with_a_navigating_pipe_and_a_literal_keeps_the_register_3941`).
    Marking a withheld register lost (#3267) would make it refuse loudly, but also
    turns rows that match jq today into refusals, where jq's own `try` catches a real error
    (`(foreach .a as $w (0; try (($w \| .c \| .z), $w.b); .)) = 9` writes nothing in either).

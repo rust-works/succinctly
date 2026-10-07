@@ -70128,6 +70128,173 @@ fn test_foreach_update_under_try_with_a_comma_above_a_pipe_keeps_the_register_38
     ])
 }
 
+/// #3941: a comma that mixes a navigating pipe with a sibling that leaves the register alone.
+/// jq forks the comma, so the pipe sibling moves the register to `a.b` while the literal runs
+/// from `.a`; the EXTRACT's `$v | .b?` refuses after the first and answers after the second.
+/// Each sibling states the register on its own (#3862), but the fold only read that statement
+/// when *every* sibling left the register alone, so the literal's EXTRACT ran register-less, the
+/// `try` caught the refusal and a write through it was silently skipped. The rows after the
+/// first group keep their answers: an EXTRACT with no `try` raises on the pipe sibling's output,
+/// as in jq, and an UPDATE whose only output is the pipe never reaches the literal. Every row
+/// captured from jq 1.7.1 with `-c`.
+#[test]
+fn test_foreach_update_comma_with_a_navigating_pipe_and_a_literal_keeps_the_register_3941(
+) -> Result<()> {
+    let doc = r#"{"a":{"b":1}}"#;
+    assert_path_rows_3289(&[
+        // The issue's three writes and the path they name.
+        (
+            doc,
+            r"del(foreach .a as $v (.; (($v | .b?), 1); try ($v | .b?)))",
+            "{\"a\":{}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (.; (($v | .b?), 1); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (.; (($v | .b?), 1); try ($v | .b?))) |= 7",
+            "{\"a\":{\"b\":7}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .a as $v (.; (($v | .b?), 1); try ($v | .b?)))",
+            "[\"a\",\"b\"]\n",
+            "",
+            0,
+        ),
+        // The literal first, an unguarded pipe, a handler on the EXTRACT's `try`, and a
+        // bare `$v` sibling beside the literal.
+        (
+            doc,
+            r"del(foreach .a as $v (.; (1, ($v | .b?)); try ($v | .b?)))",
+            "{\"a\":{}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (.; (($v | .b), 1); try ($v | .b?)))",
+            "{\"a\":{}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (.; (($v | .b?), 1); try ($v | .b) catch empty))",
+            "{\"a\":{}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (.; (($v | .b?), 1, $v); try ($v | .b?)))",
+            "{\"a\":{}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .a as $v (.; (($v | .b?), $v); try ($v | .b?)))",
+            "[\"a\",\"b\"]\n",
+            "",
+            0,
+        ),
+        // No `try` on the EXTRACT: the pipe sibling's output raises, as in jq.
+        (
+            doc,
+            r"del(foreach .a as $v (.; (($v | .b?), 1); $v | .b?))",
+            "",
+            "Invalid path expression near attempt to access element \"b\" of {\"b\":1}",
+            5,
+        ),
+        // An EXTRACT that is the register itself: the literal is no path.
+        (
+            doc,
+            r"del(foreach .a as $v (.; (($v | .b?), 1); .))",
+            "",
+            "Invalid path expression with result 1",
+            5,
+        ),
+    ])
+}
+
+/// #3941: the same read, outside a fold. A destructuring bind's body is a comma whose
+/// siblings are a navigating pipe and a bare `$q`; `$q`'s statement used to be dropped, so the
+/// body refused where jq answers (`destructure-comma-marker-nav` in the bind-origin sweep).
+/// The last two rows keep refusing, as in jq: with a plain bind the first sibling's `$y[0]`
+/// is a path error of its own. Every row captured from jq 1.7.1 with `-c`.
+#[test]
+fn test_destructure_comma_with_a_navigating_pipe_keeps_the_register_3941() -> Result<()> {
+    let doc = r#"{"a":[1,2,3],"b":{"c":5}}"#;
+    assert_path_rows_3289(&[
+        (
+            doc,
+            r"path(. as {a:$q} | $q[0], $q)",
+            "[\"a\",0]\n[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as {a:$q} | $q, $q[0])",
+            "[\"a\"]\n[\"a\",0]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as {a:$q} | ($q[0], $q) | select(true))",
+            "[\"a\",0]\n[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(. as {a:$q} | $q[0], $q)",
+            "{\"b\":{\"c\":5}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(. as {a:$q} | $q[0], $q) = 9",
+            "{\"a\":9,\"b\":{\"c\":5}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(.a as $y | .a | 5 | $y[0], $y)",
+            "[\"a\",0]\n[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(.a as $y | $y[0], $y)",
+            "",
+            "Invalid path expression near attempt to access element 0 of [1,2,3]",
+            5,
+        ),
+        (
+            doc,
+            r"path(.a as $y | if true then $y[0], $y else 1 end)",
+            "",
+            "Invalid path expression near attempt to access element 0 of [1,2,3]",
+            5,
+        ),
+    ])
+}
+
 /// #3862: a comma sibling states the register on its own, outside a fold's UPDATE too -- a
 /// pipe stage's `first(2, 3)` (a generator of literals) left the register in place for jq and
 /// was refused until each sibling was asked for itself. Every row captured from jq 1.7.1.

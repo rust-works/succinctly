@@ -43828,9 +43828,21 @@ fn entry_marker_shape(expr: &Expr) -> EntryMarkers {
             expr: inner,
             catch: Some(_),
         } => entry_marker_shape(inner).join(EntryMarkers::Forwarded),
-        Expr::Comma(items) => items.iter().fold(EntryMarkers::None, |acc, item| {
-            acc.join(entry_marker_shape(item))
-        }),
+        Expr::Comma(items) => {
+            let shape = items.iter().fold(EntryMarkers::None, |acc, item| {
+                acc.join(entry_marker_shape(item))
+            });
+            // #3941: jq forks the comma, so each sibling starts from the register the comma
+            // was entered with, and a sibling that leaves it alone states it
+            // ([`carry_frame_register`], #3862) exactly as an alternate does. With every
+            // sibling of that kind the fold's own `identical()` fallback already read it; a
+            // comma that also holds a navigating sibling was the case left unread.
+            if shape == EntryMarkers::None && items.iter().any(operand_leaves_register) {
+                EntryMarkers::Forwarded
+            } else {
+                shape
+            }
+        }
         Expr::If {
             then_branch,
             else_branch,
