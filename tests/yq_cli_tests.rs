@@ -2567,6 +2567,195 @@ fn test_yq_any_all_predicate_forms_gated_2005() -> Result<()> {
     Ok(())
 }
 
+/// #3966: yq's own predicate spelling of `any`/`all`, `any_c(f)` / `all_c(f)` -- native, so
+/// no `--jq-extensions` -- run over an array, one element at a time. Every row is a capture from
+/// yq v4.53.3 (`input`, `filter`, stdout), and each runs on the cursor route and on the DOM route
+/// (`--arg z 1` forces the latter), which must agree.
+///
+/// What the rows pin, none of it obvious: only the *first* output of the predicate decides an
+/// element (`any_c(false, true)` is `false`), an element whose predicate yields nothing is
+/// skipped (`all_c(select(. > 9))` is `true`), an *absent* key read is such an element but an
+/// explicit `null` is a falsy one (`[{"b":1}] | all_c(.a)` is `true`, `[{"a":null}] | all_c(.a)`
+/// is `false`, because yq evaluates the predicate read-only), the walk stops at the first
+/// deciding element, and arguments after the first are never evaluated and leave a predicate
+/// that yields nothing.
+#[test]
+fn test_yq_any_c_all_c_3966() -> Result<()> {
+    for (input, filter, want) in [
+        // the verdicts
+        ("[1,5]", "any_c(. > 3)", "true"),
+        ("[1,5]", "all_c(. > 3)", "false"),
+        ("[1,5]", "all_c(. > 0)", "true"),
+        ("[1,5]", "any_c(. > 9)", "false"),
+        ("[]", "any_c(.)", "false"),
+        ("[]", "all_c(.)", "true"),
+        ("[null,false]", "any_c(.)", "false"),
+        ("[null,false]", "all_c(.)", "false"),
+        ("[1,5]", "[any_c(. > 3), all_c(. > 3)]", "[true,false]"),
+        // only the first output of the predicate counts
+        ("[1,5]", "any_c(false, true)", "false"),
+        ("[1,5]", "any_c(true, false)", "true"),
+        ("[1,5]", "all_c(true, false)", "true"),
+        ("[1,5]", "all_c(false, true)", "false"),
+        // the predicate runs to completion, so a later output that does not error changes
+        // nothing: the first output still decides
+        ("[1,2]", "any_c(true, false)", "true"),
+        ("[1,2]", "all_c(false, true)", "false"),
+        // a predicate that yields nothing skips its element
+        ("[1,5]", "any_c(select(. > 3))", "true"),
+        ("[1,5]", "all_c(select(. > 3))", "true"),
+        ("[1,5]", "any_c(select(. > 9))", "false"),
+        ("[1,5]", "all_c(select(. > 9))", "true"),
+        // an absent key read is no output; an explicit null is falsy
+        (r#"[{"b":1}]"#, "all_c(.a)", "true"),
+        (r#"[{"b":1}]"#, "any_c(.a)", "false"),
+        (r#"[{"a":null}]"#, "all_c(.a)", "false"),
+        ("[null]", "all_c(.a)", "true"),
+        (r#"[{"a":0}]"#, "all_c(.a)", "true"),
+        (r#"[{"b":1}]"#, "all_c(.a // false)", "false"),
+        (r#"[{"b":1}]"#, "all_c(.a | not)", "true"),
+        (r#"[{"b":1}]"#, "all_c(null)", "false"),
+        // stops at the first deciding element: later elements are not read, whatever their
+        // predicate would have raised
+        ("[5,1]", r#"any_c((. > 3) or error("x"))"#, "true"),
+        ("[5,1]", r#"any_c(true, (. < 3) and error("x"))"#, "true"),
+        ("[0,5]", r#"all_c((. > 3) and error("x"))"#, "false"),
+        // an array of arrays, nesting, composition
+        ("[[1],[5]]", "any_c(any_c(. > 3))", "true"),
+        ("[[1],[5]]", "all_c(any_c(. > 3))", "false"),
+        ("[[1],[5]]", "any_c(all_c(. > 3))", "true"),
+        ("[[1,5]]", ".[] | any_c(. > 3)", "true"),
+        ("[1,5]", "any_c (. > 3)", "true"),
+        ("[1,5]", "any_c( . > 3 )", "true"),
+        // arguments after the first are never evaluated; the predicate then yields nothing
+        ("[1]", r#"any_c(true; error("x"))"#, "false"),
+        ("[1]", r#"all_c(error("x"); true)"#, "true"),
+        ("[1,2]", "any_c(.;.;.)", "false"),
+        ("[1,2]", "all_c(.;.;.)", "true"),
+        ("[]", "all_c(.;.)", "true"),
+        // a constructed array is an owned value, which takes the eager evaluator rather than
+        // the cursor route the rows above run on: the same answers
+        (r#"{"b":1}"#, "[.] | all_c(.a)", "true"),
+        (r#"{"b":1}"#, "[.] | any_c(.a)", "false"),
+        (r#"{"a":null}"#, "[.] | all_c(.a)", "false"),
+        (r#"{"b":1}"#, "[., .] | any_c(false, true)", "false"),
+        (r#"{"b":1}"#, "[., .] | all_c(select(.a))", "true"),
+        (r#"{"a":5}"#, "[.a, 1] | any_c(. > 3)", "true"),
+        (r#"{"a":5}"#, "[.a, 1] | all_c(. > 3)", "false"),
+    ] {
+        for route in [&[][..], &["--arg", "z", "1"][..]] {
+            let mut args = vec!["-o", "json", "-I", "0"];
+            args.extend_from_slice(route);
+            let (out, stderr, code) = run_yq_stdin_with_stderr(filter, input, &args)?;
+            assert_eq!(code, 0, "{input} | {filter} {route:?}: {stderr}");
+            assert_eq!(out.trim(), want, "{input} | {filter} {route:?}");
+        }
+    }
+    Ok(())
+}
+
+/// #3966: what `any_c`/`all_c` refuse. A mapping or a scalar is the bare form's rejection
+/// (#1901) -- named `any`/`all`, not `any_c` -- rather than `.[]`'s iteration, an error in the
+/// predicate raises, and the keys/path of the input are kept (`.s | any_c(.) | key` is `"s"`).
+#[test]
+fn test_yq_any_c_all_c_errors_and_context_3966() -> Result<()> {
+    for (input, filter, message) in [
+        ("5", "any_c(.)", "any only supports arrays, was !!int"),
+        ("5", "all_c(.)", "all only supports arrays, was !!int"),
+        ("null", "any_c(.)", "any only supports arrays, was !!null"),
+        (
+            r#"{"a":1}"#,
+            "all_c(.)",
+            "all only supports arrays, was !!map",
+        ),
+        (
+            r#""abc""#,
+            "any_c(.a)",
+            "any only supports arrays, was !!str",
+        ),
+        ("5", "any_c(.;.)", "any only supports arrays, was !!int"),
+        // the same refusals for an owned (constructed) value, on the eager evaluator
+        (
+            r#"{"a":5}"#,
+            r#"{"x": .a} | any_c(.)"#,
+            "any only supports arrays, was !!map",
+        ),
+        (
+            r#"{"a":5}"#,
+            ".a + 1 | all_c(.)",
+            "all only supports arrays, was !!int",
+        ),
+        ("[1,5]", r#"any_c(error("x"))"#, "x"),
+        ("[1,5]", r#"all_c(error("x"))"#, "x"),
+        ("[1,5]", r#"any_c((. > 3) or error("x"))"#, "x"),
+        // an error in a LATER output of the predicate still raises: yq runs it to completion
+        // and only then takes the first output (so it is not `first(f)`)
+        ("[1,2]", r#"any_c(true, error("x"))"#, "x"),
+        ("[1,2]", r#"any_c(1, error("x"))"#, "x"),
+        ("[1,2]", r#"all_c(false, error("x"))"#, "x"),
+        ("[1,2]", r#"any_c(select(. > 0), error("x"))"#, "x"),
+        ("[1,2]", r#"any_c(false, true, error("y"))"#, "y"),
+        ("[1,2]", r#"all_c(select(. > 5), error("x"))"#, "x"),
+        ("[1,5]", r#"all_c(. > 3, ((. > 3) or error("x")))"#, "x"),
+        ("[5,0]", r#"all_c((. > 3) and error("x"))"#, "x"),
+        // bare, and with no argument: a parse error in succinctly's own wording (#2237), where
+        // yq says `'any_c' expects 1 arg but received none`
+        ("[1]", "any_c", "expected '(', found end of input"),
+    ] {
+        let (out, stderr, code) = run_yq_stdin_with_stderr(filter, input, &["-o", "json"])?;
+        assert_eq!(code, 1, "{input} | {filter}: {out:?}");
+        assert!(out.is_empty(), "{input} | {filter}: {out:?}");
+        assert!(stderr.contains(message), "{input} | {filter}: {stderr}");
+    }
+    for (filter, want) in [
+        (".s | any_c(.) | key", r#""s""#),
+        (".s | all_c(.) | path", r#"["s"]"#),
+        (".s | any_c(.) | tag", r#""!!bool""#),
+        (".y = (.s | any_c(. > 1))", r#"{"s":[1,2],"y":true}"#),
+        (".s |= all_c(. > 1)", r#"{"s":false}"#),
+    ] {
+        let (out, stderr, code) =
+            run_yq_stdin_with_stderr(filter, "s: [1, 2]\n", &["-o", "json", "-I", "0"])?;
+        assert_eq!(code, 0, "{filter}: {stderr}");
+        assert_eq!(out.trim(), want, "{filter}");
+    }
+    Ok(())
+}
+
+/// #3966: a user definition of the same name and arity is not the builtin and receives its
+/// arguments as written (`any_c(f)` must not hand it the `first(f)` the builtin runs); one of
+/// another arity leaves the builtin in place. jq 1.7.1 has no `any_c`/`all_c`, so in jq mode
+/// they stay undefined.
+#[test]
+fn test_yq_any_c_all_c_shadowing_and_jq_mode_3966() -> Result<()> {
+    for (filter, want) in [
+        (r#"def any_c(f): "mine"; any_c(.)"#, r#""mine""#),
+        ("def any_c(f): f; any_c(.[0])", "1"),
+        (r#"def all_c(f; g): "mine"; all_c(.; .)"#, r#""mine""#),
+        ("def all_c(f; g): [f, g]; all_c(1; 2)", "[1,2]"),
+        (r#"def any_c(f; g): "two"; any_c(. > 3)"#, "true"),
+        (r#"def any_c(f; g): "two"; any_c(. > 3; 1)"#, r#""two""#),
+        (
+            r#"def any_c: "zero"; [any_c, any_c(. > 3)]"#,
+            r#"["zero",true]"#,
+        ),
+    ] {
+        let (out, stderr, code) =
+            run_yq_stdin_with_stderr(filter, "[1,5]\n", &["-o", "json", "-I", "0"])?;
+        assert_eq!(code, 0, "{filter}: {stderr}");
+        assert_eq!(out.trim(), want, "{filter}");
+    }
+    for filter in ["any_c(. > 3)", "all_c(.)"] {
+        let (_out, stderr, code) = run_jq_stdin_with_stderr(filter, "[1,5]", &[])?;
+        assert_ne!(code, 0, "{filter}");
+        assert!(
+            stderr.contains("is not defined"),
+            "jq mode has no {filter:?}: {stderr}"
+        );
+    }
+    Ok(())
+}
+
 /// #2110's jq-mode fix (a zero-arity builtin/literal called with the wrong
 /// arity reports jq's own "X/N is not defined" instead of a raw parser
 /// rejection) must not leak into yq mode: real yq (v4.53.3) has no

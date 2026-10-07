@@ -2217,6 +2217,19 @@ pub enum Builtin {
     AllF(Box<Expr>),
     /// `all(gen; cond)` - true if cond is truthy for every output of gen
     AllCond(Box<Expr>, Box<Expr>),
+    /// yq's `any_c(f)` (#3966): the predicate form of `any`, over an array only.
+    ///
+    /// `f` is held as written, so a user `def any_c(f)` that shadows it receives what
+    /// the call passed; evaluation runs `f` to completion per element and lets only its
+    /// first output decide (real yq skips an element whose `f` yields nothing, and
+    /// still raises an error from a later output) through the `any(cond)` engine, after
+    /// yq's bare-`any` rejection of a mapping or a scalar. The second slot is the *first extra argument* of `any_c(f; g)`, which real
+    /// yq parses and never evaluates, after which the form behaves as a predicate that
+    /// yields nothing; later extras are parsed and dropped. Parsed in yq mode only; jq
+    /// has no `any_c`.
+    AnyC(Box<Expr>, Option<Box<Expr>>),
+    /// yq's `all_c(f)` (#3966): the `all` twin of [`Builtin::AnyC`].
+    AllC(Box<Expr>, Option<Box<Expr>>),
     /// `min` - minimum element
     Min,
     /// `max` - maximum element

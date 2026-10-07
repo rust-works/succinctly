@@ -5466,6 +5466,51 @@ impl<'a> Parser<'a> {
             }
             return Ok(Some(Builtin::All));
         }
+        // yq's own predicate forms of `any`/`all` (#3966): `any_c(f)` / `all_c(f)`. Real yq has no
+        // jq-style `any(f)`, so these are not `--jq-extensions` surface -- they are native, and
+        // yq mode only (jq 1.7.1 has no `any_c`; there they stay an undefined call). Captured
+        // from yq v4.53.3: the predicate's *first* output decides an element and an element
+        // whose predicate yields nothing is skipped, after the whole predicate has run (see
+        // `eval::any_c_predicate`, built at evaluation so the call keeps `f` as written for a
+        // shadowing `def`); arguments after the first are never
+        // evaluated and the form then behaves as a predicate that yields nothing (`any_c(.; .)`
+        // is `false`, `all_c(.; .)` is `true`, over an array).
+        if self.mode == ParserMode::Yq
+            && (self.matches_keyword("any_c") || self.matches_keyword("all_c"))
+        {
+            let is_any = self.matches_keyword("any_c");
+            let keyword = if is_any { "any_c" } else { "all_c" };
+            let keyword_start = self.pos;
+            self.consume_keyword(keyword);
+            self.skip_ws();
+            if let Err(early) = self.expect_or_none('(', keyword_start) {
+                return early;
+            }
+            self.next();
+            self.skip_ws();
+            let f = self.parse_expr()?;
+            self.skip_ws();
+            // The first extra argument is kept, so a shadowing `def any_c(f; g)` finds its
+            // arity and arguments; any later ones are parsed and dropped.
+            let mut extra: Option<Box<Expr>> = None;
+            while self.peek() == Some(';') {
+                self.next();
+                self.skip_ws();
+                let arg = self.parse_expr()?;
+                self.skip_ws();
+                extra.get_or_insert_with(|| Box::new(arg));
+            }
+            if self.peek() != Some(')') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![f]);
+            }
+            self.next();
+            let f = Box::new(f);
+            return Ok(Some(if is_any {
+                Builtin::AnyC(f, extra)
+            } else {
+                Builtin::AllC(f, extra)
+            }));
+        }
         if self.matches_keyword("min_by") {
             // Check min_by before min
             self.reject_unless_jq_extensions("min_by")?;
@@ -11635,6 +11680,48 @@ mod tests {
                 "`{name}` should parse in jq mode regardless of the yq-only gate"
             );
         }
+    }
+
+    /// #3966: `any_c(f)` / `all_c(f)` are yq's own predicate forms, so they parse in yq mode with
+    /// no `--jq-extensions` and keep their arguments as written (the second slot is the first
+    /// extra argument of `any_c(f; g)`), and jq mode, which has no such builtin, leaves them an
+    /// ordinary call. A name that merely starts with them is not them.
+    #[test]
+    fn test_yq_any_c_all_c_parse_in_yq_mode_only_3966() {
+        let yq = |s: &str| parse_with_mode(s, ParserMode::Yq);
+        for (filter, any, extra) in [
+            ("any_c(. > 3)", true, false),
+            ("all_c(. > 3)", false, false),
+            ("any_c(.; .)", true, true),
+            ("all_c(.; .; .)", false, true),
+            ("any_c (. > 3)", true, false),
+        ] {
+            let parsed = yq(filter);
+            assert!(
+                matches!(&parsed, Ok(Expr::Builtin(Builtin::AnyC(_, e))) if any && e.is_some() == extra)
+                    || matches!(&parsed, Ok(Expr::Builtin(Builtin::AllC(_, e))) if !any && e.is_some() == extra),
+                "{filter:?} should parse as the builtin with extra={extra}, got {parsed:?}"
+            );
+            assert!(
+                !matches!(
+                    parse_with_mode(filter, ParserMode::Jq),
+                    Ok(Expr::Builtin(Builtin::AnyC(..) | Builtin::AllC(..)))
+                ),
+                "{filter:?} is not a jq builtin"
+            );
+        }
+        assert!(yq("any_c").is_err(), "bare `any_c` needs its argument");
+        // ...and an argument list that never closes is an error, with or without extra ones
+        for open in ["any_c(. > 3", "all_c(. > 3; 1", "any_c(.; ."] {
+            assert!(yq(open).is_err(), "{open:?} has no closing parenthesis");
+        }
+        assert!(
+            !matches!(
+                yq("any_cat(. > 3)"),
+                Ok(Expr::Builtin(Builtin::AnyC(..) | Builtin::AllC(..)))
+            ),
+            "`any_cat` is a different name"
+        );
     }
 
     /// #2005: the `any`/`all` gate is on the *call*, read before its arguments, so what the

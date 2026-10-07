@@ -295,6 +295,10 @@ pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
         | Builtin::AtPosition(a, b)
         | Builtin::Libm2(_, a, b) => BuiltinKids::Two(a, b),
 
+        // --- One or two, by the call's written arity (4) -------------------
+        Builtin::AnyC(a, None) | Builtin::AllC(a, None) => BuiltinKids::One(a),
+        Builtin::AnyC(a, Some(b)) | Builtin::AllC(a, Some(b)) => BuiltinKids::Two(a, b),
+
         // --- Three sub-expressions (3) -------------------------------------
         Builtin::SubFlags(a, b, c) | Builtin::GsubFlags(a, b, c) | Builtin::Libm3(_, a, b, c) => {
             BuiltinKids::Three(a, b, c)
@@ -519,6 +523,12 @@ pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr)
         Builtin::MapValues(e) => Builtin::MapValues(Box::new(f(e))),
         Builtin::AnyF(e) => Builtin::AnyF(Box::new(f(e))),
         Builtin::AllF(e) => Builtin::AllF(Box::new(f(e))),
+        Builtin::AnyC(e, extra) => {
+            Builtin::AnyC(Box::new(f(e)), extra.as_deref().map(|x| Box::new(f(x))))
+        }
+        Builtin::AllC(e, extra) => {
+            Builtin::AllC(Box::new(f(e)), extra.as_deref().map(|x| Box::new(f(x))))
+        }
         Builtin::MinBy(e) => Builtin::MinBy(Box::new(f(e))),
         Builtin::MaxBy(e) => Builtin::MaxBy(Box::new(f(e))),
         Builtin::Ltrimstr(e) => Builtin::Ltrimstr(Box::new(f(e))),
@@ -1697,9 +1707,11 @@ fn stage_escapes_own_input(expr: &Expr) -> bool {
             | Builtin::Add
             | Builtin::Any
             | Builtin::AnyF(_)
+            | Builtin::AnyC(..)
             | Builtin::AnyCond(_, _)
             | Builtin::All
             | Builtin::AllF(_)
+            | Builtin::AllC(..)
             | Builtin::AllCond(_, _)
             | Builtin::Min
             | Builtin::Max
@@ -2045,8 +2057,10 @@ fn node_reads_ambient(node: &Expr) -> bool {
             | Builtin::Add
             | Builtin::Any
             | Builtin::AnyF(_)
+            | Builtin::AnyC(..)
             | Builtin::All
             | Builtin::AllF(_)
+            | Builtin::AllC(..)
             | Builtin::Min
             | Builtin::Max
             | Builtin::MinBy(_)
