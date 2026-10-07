@@ -21284,11 +21284,7 @@ fn unsearchable_input<'a, W: Clone + AsRef<[u64]>>(
     occurrence: SearchOccurrence,
 ) -> QueryResult<'a, W> {
     if !matches!(value, StandardJson::Null | StandardJson::Object(_)) {
-        return if optional {
-            QueryResult::None
-        } else {
-            QueryResult::Error(EvalError::cannot_index(type_name(value), pattern))
-        };
+        return suppress_or_raise(EvalError::cannot_index(type_name(value), pattern), optional);
     }
     // jq's rules, whichever mode asked: `indices` is jq surface even where yq reaches it
     // (`--jq-extensions`, which follows jq, ADR-0018), and yq's lenient indexing would
@@ -21308,18 +21304,14 @@ fn unsearchable_input<'a, W: Clone + AsRef<[u64]>>(
             Expr::index(0),
         ]),
     };
-    // The tail runs on what the lookup answered, lazily where it is a document value so a
-    // container is not read just to take one element of it.
+    // The tail runs on what the lookup answered, lazily, so a container is not read just
+    // to take one element of it. `index_one` on a `null` or an object *value* answers one
+    // document value (`One`) or an error: a cursor (`OneCursor`) and a computed result
+    // (`Owned`) only come from a slice or a subarray search of an array, which neither
+    // input is, and `index_one_on_null_or_object_answers_a_value_or_an_error_3890` pins
+    // that, so a lookup that did not answer a value has no element to take.
     match looked_up {
         QueryResult::One(v) => eval_single::<W, JqSemantics>(&tail, v, optional),
-        QueryResult::OneCursor(c) => eval_single::<W, JqSemantics>(&tail, c.value(), optional),
-        QueryResult::Owned(v) => match eval_owned_multi::<JqSemantics>(&tail, &v) {
-            Ok(outputs) => QueryResult::ManyOwned(outputs),
-            Err(_) if optional => QueryResult::None,
-            Err(e) => e.into(),
-        },
-        // Nothing to take the element of, or an error, `break` or `halt` from the lookup
-        // itself (`index_one` answers one key with one result, so nothing else arises).
         other => other,
     }
 }
@@ -102282,6 +102274,56 @@ mod tests {
                 Err(r#"Cannot index boolean with string "a""#),
             ),
         ]);
+    }
+
+    /// #3890: `unsearchable_input` takes `.[0]` / `.[-1:][0]` of what `index_one` answered for a
+    /// `null` or an object, and handles only a document value (`One`) -- a cursor or a computed
+    /// result would need its own arm, and cannot arise: those come from a slice or a subarray
+    /// search of an array. Pinned here over every key kind in both modes' jq rules, so a change
+    /// that makes `index_one` answer one of them fails this test instead of silently skipping
+    /// the tail.
+    #[test]
+    fn index_one_on_null_or_object_answers_a_value_or_an_error_3890() {
+        let object = br#"{"a":[5,6],"b":null,"c":{"d":1}}"#;
+        let keys = [
+            OwnedValue::String("a".into()),
+            OwnedValue::String("zz".into()),
+            OwnedValue::Int(0),
+            OwnedValue::Int(-1),
+            OwnedValue::Float(0.5),
+            OwnedValue::Bool(true),
+            OwnedValue::Null,
+            OwnedValue::array_from(vec![OwnedValue::Int(1)]),
+            OwnedValue::array_from(Vec::new()),
+            OwnedValue::object_from(Vec::new()),
+        ];
+        for json in [&b"null"[..], &object[..]] {
+            let index = crate::json::JsonIndex::build(json);
+            let cursor = index.root(json);
+            for key in &keys {
+                let result = index_one::<_, JqSemantics>(cursor.value(), key, false);
+                assert!(
+                    matches!(result, QueryResult::One(_) | QueryResult::Error(_)),
+                    "{} | .[{key:?}]: {}",
+                    String::from_utf8_lossy(json),
+                    match result {
+                        QueryResult::OneCursor(_) => "OneCursor",
+                        QueryResult::Owned(_) => "Owned",
+                        QueryResult::None => "None",
+                        _ => "another variant",
+                    }
+                );
+            }
+        }
+        // The control that lets the classification above fail: an *array* target with an
+        // array key is the subarray search, which does answer a computed result.
+        let array = b"[1,2,1]";
+        let index = crate::json::JsonIndex::build(array);
+        let key = OwnedValue::array_from(vec![OwnedValue::Int(1)]);
+        assert!(matches!(
+            index_one::<_, JqSemantics>(index.root(array).value(), &key, false),
+            QueryResult::Owned(_)
+        ));
     }
 
     /// `ascii_upcase` and `ascii_downcase` are the same jq definition
