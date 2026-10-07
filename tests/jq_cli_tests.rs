@@ -69534,46 +69534,197 @@ fn test_foreach_update_bare_var_alternate_keeps_the_register_3788() -> Result<()
     ])
 }
 
-/// #3788, characterization of what the fix leaves refusing loudly where jq 1.7.1 answers (the
-/// safe direction, and the same on `main`). jq's answers are in the comments; update the
-/// expectations when these are fixed. A comma body of bare siblings and pipes, and a comma inside the
-/// alternate, are answered since #3862; a `//` whose alternate is not a bare operand (a pipe
-/// after it, a by-value alternate with an EXTRACT `$k`) is answered by the stage's own gate, not by the branch the carry states.
+/// #3906: a `foreach` UPDATE whose `//` alternate is more than a bare `$k` keeps jq's
+/// path register too. #3788 relocated a bare `$k` alternate; a pipe after the `//`, a
+/// by-value alternate read by an EXTRACT `$k`, and a jq-defined wrapper (`first($k)`)
+/// were still decided by the stage's own whole-expression gate. The alternate runs after
+/// jq backtracked out of the left operand, so an alternate that leaves the register
+/// alone states the register the stage entered with ([`carry_frame_register`]), and the
+/// stage reads that statement per output. Every row captured from jq 1.7.1 with `-c`.
 #[test]
-fn test_foreach_update_alternate_shapes_the_3788_carry_does_not_reach_characterize() -> Result<()> {
+fn test_foreach_update_alternate_shapes_keep_the_register_3906() -> Result<()> {
     let doc = r#"{"a":{"c":1}}"#;
-    let refusal = "Invalid path expression";
     assert_path_rows_3289(&[
-        // jq: ["a"]
-        (
-            doc,
-            r"path(foreach .a as $k (0; ($k | .b) // 5; $k))",
-            "",
-            refusal,
-            5,
-        ),
-        // jq: ["a","c"]
+        // A pipe after the `//`.
         (
             doc,
             r"path(foreach .a as $k (0; (($k | .b) // $k) | .c; .))",
+            "[\"a\",\"c\"]\n",
             "",
-            refusal,
-            5,
+            0,
         ),
-        // jq: ["a"] (`first` is jq-defined, so the alternate may move the register)
         (
             doc,
-            r"path(foreach .a as $k (0; ($k | .b) // first($k); .))",
+            r"(foreach .a as $k (0; (($k | .b) // $k) | .c; .)) = 9",
+            "{\"a\":{\"c\":9}}\n",
             "",
-            refusal,
-            5,
+            0,
         ),
-        // jq: ["a"]
         (
             doc,
             r"path(foreach .a as $k (0; ($k | .b) // $k | $k; .))",
+            "[\"a\"]\n",
             "",
-            refusal,
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $k (0; ($k | .b) // $k | $k; .)) = 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .a as $k (0; (($k | .b) // $k) | .zz; .))",
+            "[\"a\",\"zz\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .a as $k (0; (try ($k | .b) // $k) | $k; .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        // A by-value alternate: the register is where the UPDATE entered, so an EXTRACT
+        // `$k` is on it, and an EXTRACT that navigates from it names the child.
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .b) // 5; $k))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $k (0; ($k | .b) // 5; $k)) = 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .b) // 5; ($k | .c)))",
+            "[\"a\",\"c\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .a as $k (0; (($k | .b) // 5) | $k; .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        // A jq-defined wrapper that adds no movement of its own around the alternate.
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .b) // first($k); .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $k (0; ($k | .b) // first($k); .)) = 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .b) // limit(1; $k); .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .b) // first($k) | .c; .))",
+            "[\"a\",\"c\"]\n",
+            "",
+            0,
+        ),
+        // A comma inside the alternate (answered since #3862) stays answered.
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .b) // ($k, $k); .))",
+            "[\"a\"]\n[\"a\"]\n",
+            "",
+            0,
+        ),
+        // Must still refuse: an EXTRACT that is not on the register, a by-value alternate
+        // read as a path, an alternate that navigates, and a constructed value.
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .b) // 5; .))",
+            "",
+            "Invalid path expression with result 5",
+            5,
+        ),
+        (
+            doc,
+            r"path(foreach .a as $k (0; (($k | .b) // 5) | .c; .))",
+            "",
+            "Invalid path expression near attempt to access element \"c\" of 5",
+            5,
+        ),
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .b) // first(.a); .))",
+            "",
+            "Invalid path expression near attempt to access element \"a\" of 0",
+            5,
+        ),
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .b) // first(.a) | $k; .))",
+            "",
+            "Invalid path expression near attempt to access element \"a\" of 0",
+            5,
+        ),
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .b) // (5 | .c); $k))",
+            "",
+            "Invalid path expression near attempt to access element \"c\" of 5",
+            5,
+        ),
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .b) // ($k | .c); $k))",
+            "",
+            "Invalid path expression with result {\"c\":1}",
+            5,
+        ),
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .c) // 5; $k))",
+            "",
+            "Invalid path expression with result {\"c\":1}",
+            5,
+        ),
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .c) // $k | $k; .))",
+            "",
+            "Invalid path expression with result {\"c\":1}",
+            5,
+        ),
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .b) // [$k] | .[0]; .))",
+            "",
+            "Invalid path expression near attempt to access element 0 of [{\"c\":1}]",
+            5,
+        ),
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .b) // {a: $k} | .a; .))",
+            "",
+            "Invalid path expression near attempt to access element \"a\" of {\"a\":{\"c\":1}}",
             5,
         ),
     ])

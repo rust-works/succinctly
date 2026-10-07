@@ -2758,12 +2758,18 @@ is the revert that established what the other one costs.
    here): the alternate runs after jq backtracked out of the left operand, so the question
    `cannot_move_register` answers is asked of the alternate alone
    ([#3788](https://github.com/rust-works/succinctly/issues/3788), pinned by
-   `test_foreach_update_bare_var_alternate_keeps_the_register_3788`). Still refused loudly where
-   jq answers: a by-value alternate followed by an
-   EXTRACT `$k` (`path(foreach .a as $k (0; ($k \| .b) // 5; $k))`), and an alternate that is
-   not a bare operand: a pipe after the `//` (`(($k \| .b) // $k) \| .c`, `... // $k \| $k`), all
-   pinned by
-   `test_foreach_update_alternate_shapes_the_3788_carry_does_not_reach_characterize`. Pinned by
+   `test_foreach_update_bare_var_alternate_keeps_the_register_3788`). That holds for an
+   alternate that is not a bare operand too
+   ([#3906](https://github.com/rust-works/succinctly/issues/3906), pinned by
+   `test_foreach_update_alternate_shapes_keep_the_register_3906`): a pipe after the `//`
+   (`path(foreach .a as $k (0; (($k \| .b) // $k) \| .c; .))` is `["a","c"]`, `... // $k \| $k`
+   is `["a"]`), a by-value alternate read by an EXTRACT `$k` (`... // 5; $k`), and an
+   alternate wrapped in `first(...)`/`limit(n; ...)`/`?` (`... // first($k)`) all answer as jq
+   does. An alternate that leaves the register alone (`operand_leaves_register`) states
+   the register the stage entered with, and the stage reads that statement per output
+   (`entry_marker_shape`) rather than asking the whole-expression question. An alternate
+   that navigates (`// first(.a)`, `// (5 \| .c)`, `// ($k \| .c)` before an EXTRACT `$k`) or
+   builds a value read as a path (`// [$k] \| .[0]`, `// 5; .`) still refuses where jq does. Pinned by
    `test_foreach_update_under_try_over_a_generator_keeps_the_register_3738`,
    `test_foreach_update_under_try_around_a_generator_keeps_the_register_3770`,
    `test_foreach_update_under_try_with_a_comma_inside_a_pipe_keeps_the_register_3770`,

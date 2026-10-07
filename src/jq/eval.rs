@@ -39626,11 +39626,23 @@ fn carry_frame_register<'a>(
     frame: &Frame,
 ) -> PathBranch<'a> {
     if !branch.trackable && matches!(branch.register, BranchRegister::None) {
-        if let Some(register) = frame.register().filter(|_| cannot_move_register(operand)) {
+        if let Some(register) = frame
+            .register()
+            .filter(|_| operand_leaves_register(operand))
+        {
             branch.register = BranchRegister::Unmoved(Cow::Owned(register.clone()));
         }
     }
     branch
+}
+
+/// Whether `operand`, run from jq's register, leaves it where it entered (#3906):
+/// [`cannot_move_register`] of what is under the wrappers that add no movement of
+/// their own ([`peel_register_transparent`]), so `first($k)`, `limit(1; $k)` and
+/// `$k?` say what a bare `$k` says. A wrapper over a navigating `f` is not
+/// admitted -- `first(.a)` moves the register, and the peeled `.a` says so.
+fn operand_leaves_register(operand: &Expr) -> bool {
+    cannot_move_register(peel_register_transparent(operand))
 }
 
 /// Flatten path components into one `Expr`, using `Expr::Pipe` only when
@@ -43680,7 +43692,19 @@ fn entry_marker_shape(expr: &Expr) -> EntryMarkers {
             else_branch,
             ..
         } => entry_marker_shape(then_branch).join(entry_marker_shape(else_branch)),
-        Expr::Alternative(left, right) => entry_marker_shape(left).join(entry_marker_shape(right)),
+        // #3906: the alternate runs after jq backtracked out of the left operand, so one
+        // that leaves the register alone states it as the stage entered it
+        // ([`carry_frame_register`]) -- a producer in its own right, like a `catch` handler.
+        Expr::Alternative(left, right) => {
+            let stated = if operand_leaves_register(right) {
+                EntryMarkers::Forwarded
+            } else {
+                EntryMarkers::None
+            };
+            entry_marker_shape(left)
+                .join(entry_marker_shape(right))
+                .join(stated)
+        }
         other if any_subexpr(other, &mut is_entry_marker_producer) => EntryMarkers::Opaque,
         _ => EntryMarkers::None,
     }
