@@ -44863,7 +44863,8 @@ fn yields_only_the_register(e: &Expr) -> bool {
 /// $x (.; .; .)`).
 ///
 /// Only the source's own spine is read (the bind itself, a comma's branches, a
-/// pipe's head, a nested `foreach` over `.`), never a builtin's argument or a `def`
+/// pipe's first stage that does not just hand the register on (#3940), a nested
+/// `foreach` over `.`), never a builtin's argument or a `def`
 /// body, where `.` is another value. A nested `foreach . as [$q] (...)` moves the
 /// register for the outer fold too (#3853): it does not backtrack its source, so what it
 /// destructures reaches the outer EXTRACT. (An earlier routing of it answered a root
@@ -44877,8 +44878,11 @@ fn foreach_source_destructures_register(source: &Expr) -> bool {
             routes_destructuring(patterns) && matches!(unwrap_paren(expr), Expr::Identity)
         }
         Expr::Comma(branches) => branches.iter().any(foreach_source_destructures_register),
+        // #3940: a leading stage that only hands the register on (`.`, `(.|.)`, `(., .)`)
+        // moves nothing, so the stage after it is the one that meets the register.
         Expr::Pipe(stages) => stages
-            .first()
+            .iter()
+            .find(|stage| !yields_only_the_register(stage))
             .is_some_and(foreach_source_destructures_register),
         Expr::Foreach {
             input, patterns, ..

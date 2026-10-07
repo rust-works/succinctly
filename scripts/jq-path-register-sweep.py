@@ -417,6 +417,25 @@ OPERANDS = [
     "(foreach (foreach . as {a:$a} (0; .; .)) as $x (true; .; .))",
     "(foreach (foreach . as {a:$a} (0; .; .)) as $x (null; .; .))",
     "(foreach (foreach . as {a:$a} ?// [$a] (0; .; .)) as $x (.; .; .))",
+    # (#3940) a leading stage that only hands the register on, ahead of a register destructure.
+    # Contrasts: a bare loop variable, a nested `reduce`, a navigated leading stage.
+    "(foreach ((.|.) | foreach . as {a:$a} (0; .; .)) as $x (.; .; .))",
+    "(foreach (.|.|foreach . as {a:$a} (0; .; .)) as $x (.; .; .))",
+    "(foreach ((., .) | foreach . as {a:$a} (0; .; .)) as $x (.; .; .))",
+    "(foreach ((.|.) | . as {a:$a} | .) as $x (.; .; .))",
+    # Known gap (#3956): a no-op bind head. Routing it through the resolver turned a refused
+    # `or`-under-`try` delete into a silent no-op (the resolver does not model `(.|.) as` as
+    # the register), so it stays by value until the resolver does.
+    "(foreach ((.|.) as {a:$a} | .) as $x (.; .; .))",
+    "(foreach ((., .) as {a:$a} | .) as $x (.; .; .))",
+    "(reduce ((.|.) | . as [$q] | .) as [$a] (0; .))",
+    # Known gap (#3955 review): other stages that hand the register on (`select(true)`,
+    # `first(.)`, `try`) hide the destructure the same way and are still read by value.
+    "(foreach ((.|select(true)) | foreach . as {a:$a} (0; .; .)) as $x (.; .; .))",
+    "(foreach ((.|.) | foreach . as [$a] (0; .; .)) as $x (.; .; .))",
+    "(foreach ((.|.) | foreach . as $a (0; .; .)) as $x (.; .; .))",
+    "(foreach ((.|.) | reduce . as {a:$a} (0; .)) as $x (.; .; .))",
+    "(foreach (.a | foreach . as {a:$a} (0; .; .)) as $x (.; .; .))",
     # (#3790) a fold whose SOURCE is the register itself: `.` does not move jq's register
     # and `$k` is that very node, so a bare `$k` is a path (any value, not only null). The
     # contrasts are a navigated source (`.a`, `.[]?`) and a computed one (`tostring`);
