@@ -2006,7 +2006,11 @@ is the revert that established what the other one costs.
      so INIT's first output is registered on the embed table for the fork it starts
      (`drive_foreach_init_generic`), and the source's later materialization of the same node returns
      INIT's own `Rc`. The entry makes the accumulator's first in-place write copy once; only a fold
-     that marks its loop variables asks for it.
+     that marks its loop variables asks for it. Since #3897 the entry also answers a source that
+     navigates *below* INIT's node (`reduce .[] as $x (.; del(.[0] | $x))`): the materialization
+     of a descendant climbs to the entry's node and returns the matching child of INIT's value
+     (`embed_descendant_shared`, the mirror of #3179's nested reuse), declining for a shadowed
+     duplicate key. Only a fold's INIT entry descends; an ordinary `as` bind's entry does not.
 
    **Only the first INIT fork is marked.** jq 1.7.1 evaluates SOURCE against `null` on every later
    fork (`[reduce (.) as $x ((.,.); $x)]` is `[{"a":1},null]`), so a write through `$x` answers once
@@ -2018,10 +2022,14 @@ is the revert that established what the other one costs.
    Still refused where jq answers, none answering where jq refuses (pinned in
    `test_fold_loop_variable_in_path_position_3329` and the sweep's `fold-loop-var-*` rows):
 
-   - on the stdin route, a source that navigates *below* INIT's node (`reduce .[] as $x (.; del(.[0]
-     | $x))`, `reduce .a as $x (.; del(.a | $x))`), or a computed INIT with no cursor (`{k:.} | .k`,
-     `. + {}`): the embed table reuses a node's own `Rc`, never a descendant of one it holds (the
-     ancestor lookup #3179's nested reuse has no mirror for);
+   - on the stdin route, a computed INIT with no cursor (`{k:.} | .k`, `. + {}`): there is no node
+     to key an entry on;
+   - on the stdin route, a source whose path to INIT's node passes a member a later one shadows
+     (`reduce .[] as $x (.; del(.a | $x))` over `{"a":{"x":1},"a":{"x":2}}`, which jq answers `{}`):
+     the accumulator holds only the last member, so the descent declines rather than hand back
+     the wrong node;
+   - on the stdin route, a source that is an empty `{}`/`[]` or a scalar below INIT's node: only a
+     container with children is looked up (#3897);
    - a scalar loop variable (`reduce (.) as $x (.; path($x))` on a string or number): no storage
      identity until a bind promotes it (#3191);
    - a loop variable that reaches the resolver only through a rebinding (`reduce (.) as $x (.; $x |

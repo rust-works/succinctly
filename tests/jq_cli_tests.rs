@@ -83317,15 +83317,125 @@ fn test_fold_loop_variable_in_path_position_3329() -> Result<()> {
             }
         }
     }
-    // The stdin route reuses INIT's `Rc` only for the node INIT itself is; a
-    // source that navigates *below* it still refuses where jq answers (the
-    // ancestor lookup #3179's nested reuse has no mirror for), never the
-    // other way round.
-    let (stdout, _, code) = run_jq_full(
-        &["-c", r"reduce .a as $x (.; del(.a | $x))"],
-        Some(r#"{"a":{"b":1}}"#),
+    // #3897: a source that navigates *below* INIT's node yields the child of
+    // INIT's own value, on the stdin route as on `-n 'input | ...'`. Every
+    // expected value is captured from `/usr/bin/jq` 1.7.1.
+    for (filter, input, want) in [
+        (
+            r"reduce .[] as $x (.; del(.[0] | $x))",
+            r#"[{"a":1}]"#,
+            "[]",
+        ),
+        (
+            r"reduce .a as $x (.; del(.a | $x))",
+            r#"{"a":{"b":1}}"#,
+            "{}",
+        ),
+        // Two levels below INIT, and a source below an INIT that is itself
+        // below the root.
+        (
+            r"reduce .a.c as $x (.; del(.a.c | $x))",
+            r#"{"a":{"c":{"b":1}}}"#,
+            r#"{"a":{}}"#,
+        ),
+        (
+            r"reduce .[0][] as $x (.[0]; del(.[0] | $x))",
+            r#"[[{"a":1}]]"#,
+            "[]",
+        ),
+        (
+            r"foreach .[] as $x (.; del(.[0] | $x); .)",
+            r#"[{"a":1}]"#,
+            "[]",
+        ),
+        (
+            r"foreach .[] as $x (.; .; path(.[0] | $x))",
+            r#"[{"a":1}]"#,
+            "[0]",
+        ),
+        // The first element is the accumulator's own node; the write moves
+        // nothing the second element names.
+        (
+            r"reduce .[] as $x (.; del(.[0] | $x))",
+            r#"[{"a":1},{"b":2}]"#,
+            "[]",
+        ),
+    ] {
+        for (args, program) in [
+            (&["-c"][..], filter.to_string()),
+            (&["-n", "-c"][..], format!("input | {filter}")),
+        ] {
+            let mut argv: Vec<&str> = args.to_vec();
+            argv.push(&program);
+            let (stdout, stderr, code) = run_jq_full(&argv, Some(input))?;
+            assert_eq!(
+                (stdout.trim(), code),
+                (want, 0),
+                "#3897: `{program}` ({args:?}) on {input} must answer as jq 1.7.1 does; stderr={stderr:?}"
+            );
+        }
+    }
+    // More parents than the descent remembers distinct-key verdicts for (8):
+    // each element's object is asked once, evicting the oldest, and the
+    // answers stay jq's -- only the element the path names is the node.
+    let wide = format!(
+        "[{}]",
+        (0..12)
+            .map(|i| format!(r#"{{"p":{{"q":{i}}}}}"#))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    for (at, want) in [
+        (
+            0,
+            r#"[[0,"p"],"no","no","no","no","no","no","no","no","no","no","no"]"#,
+        ),
+        (
+            3,
+            r#"["no","no","no",[3,"p"],"no","no","no","no","no","no","no","no"]"#,
+        ),
+    ] {
+        let filter =
+            format!(r#"[foreach (.[] | .p) as $x (.; .; try path(.[{at}].p | $x) catch "no")]"#);
+        let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some(&wide))?;
+        assert_eq!(
+            (stdout.trim(), code),
+            (want, 0),
+            "#3897: `{filter}`: {stderr:?}"
+        );
+    }
+    // jq refuses these too: the element is not the node the path stands on,
+    // or the loop variable is not below the accumulator at all.
+    for (filter, input) in [
+        (
+            r"reduce .[] as $x (.; del(.[1] | $x))",
+            r#"[{"a":1},{"b":2}]"#,
+        ),
+        (r"reduce .[] as $x (.; path($x))", r#"[{"a":1}]"#),
+        (r"reduce .a as $x (.; ($x.b) = 9)", r#"{"a":{"b":1}}"#),
+        // A source outside INIT's subtree is not a descendant of it.
+        (
+            r"reduce .a as $x (.c; del(.c | $x))",
+            r#"{"a":{"b":1},"c":{"b":1}}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.trim(), code),
+            ("", 5),
+            "#3897: `{filter}`: {stderr:?}"
+        );
+        assert!(stderr.contains("Invalid path expression"), "{stderr:?}");
+    }
+    // A member a later one shadows is in no value the accumulator holds:
+    // `.[]` yields it, but its child is the *last* member's. The descent
+    // declines (a refusal where jq answers `{}`), never answers with the
+    // wrong node.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r"reduce .[] as $x (.; del(.a | $x))"],
+        Some(r#"{"a":{"x":1},"a":{"x":2}}"#),
     )?;
-    assert_eq!((stdout.trim(), code), ("", 5));
+    assert_eq!((stdout.trim(), code), ("", 5), "#3897: {stderr:?}");
     Ok(())
 }
 
