@@ -774,7 +774,14 @@ catch-marker-reestablishes-del	{"a":{"b":1}}	del(.a as $y | .a | 5 | try error(1
 catch-marker-navigates	{"a":{"b":1}}	path(.a as $y | .a | try error(1) catch ($y | .b))
 catch-payload-handed-on	{"a":{"b":1}}	[path(.a | (try error(null) catch .) | empty)]
 catch-payload-handed-on-refuses	{"a":{"b":1}}	path(.a | (try error(null) catch .) | .b)
-catch-payload-own-node-refuse-only	{"a":{"b":1}}	path(.a | try error(.) catch .)
+catch-payload-own-node	{"a":{"b":1}}	path(.a | try error(.) catch .)
+catch-handler-optional-navigation-path	{"a":{"b":null},"c":2}	path(try error catch (.a)?)
+catch-handler-optional-navigation-del	{"a":{"b":null},"c":2}	del(try error catch (.a)?)
+catch-handler-optional-navigation-write	{"a":{"b":null},"c":2}	(try error catch (.a)?) = 9
+catch-handler-array-register	[[1],2]	del(try error catch .[0])
+catch-payload-constructed-extract-refuses	{"a":{"b":1},"z":[3,1,2]}	del(try error([.][0]) catch .a)
+catch-payload-built-by-value-refuses	{"a":{"b":1},"z":[3,1,2]}	(try error({"a":.}|.a) catch .a) = 9
+catch-payload-equal-but-rebuilt-refuses	{"a":{"b":1}}	path(.a | try error({"b":1}) catch .)
 computed-identity-bind-untracked	{"a":{"b":{"c":1}}}	path(.a | {b:{c:1}} | . as $x | $x)
 computed-identity-bind-untracked-del	{"a":{"b":{"c":1}}}	del(.a | {b:{c:1}} | . as $x | $x)
 computed-identity-bind-navigates	{"a":{"b":{"c":1}}}	path(.a | {b:{c:1}} | . as $x | $x | .b | .c)
@@ -1174,6 +1181,20 @@ fold-loop-var-below-init-other-element-refuses	[{"a":1},{"b":2}]	reduce .[] as $
 fold-loop-var-below-init-bare-path-refuses	[{"a":1}]	reduce .[] as $x (.; path($x))
 fold-loop-var-below-init-write-through-refuses	{"a":{"b":1}}	reduce .a as $x (.; ($x.b) = 9)
 fold-loop-var-outside-init-refuses	{"a":{"b":1},"c":{"b":1}}	reduce .a as $x (.c; del(.c | $x))
+fold-loop-var-rebound-write	{"a":1}	reduce (.) as $x (.; $x as $y | ($y.a) = 9)
+fold-loop-var-rebound-path	{"a":1}	reduce (.) as $x (.; $x as $y | path($y))
+fold-loop-var-rebound-del	{"a":1}	reduce (.) as $x (.; $x as $y | del($y.a))
+fold-loop-var-rebound-twice	{"a":1}	reduce (.) as $x (.; $x as $y | $y as $z | ($z.a) = 9)
+fold-loop-var-rebound-through-pipe	{"a":1}	reduce (.) as $x (.; ($x | .) as $y | ($y.a) = 9)
+fold-loop-var-rebound-foreach	{"a":1}	foreach (.) as $x (.; $x as $y | ($y.a) = 9; .)
+fold-loop-var-rebound-foreach-extract	{"a":1}	foreach (.) as $x (.; .; $x as $y | path($y))
+fold-loop-var-rebound-input-route	{"a":1} {"a":1}	input | reduce (.) as $x (.; $x as $y | ($y.a) = 9)
+fold-loop-var-rebound-different-node-refuses	{"a":1}	reduce ({"a":2}) as $x (.; $x as $y | ($y.a) = 9)
+fold-loop-var-rebound-component-refuses	{"a":1}	reduce (.) as $x (.; $x.a as $y | ($y) = 9)
+fold-loop-var-rebound-constructed-refuses	{"a":1}	reduce (.) as $x (.; [$x] as $y | path($y))
+fold-loop-var-rebound-literal-init-refuses	{"a":1}	reduce (.) as $x ({a:1}; $x as $y | ($y.a) = 9)
+fold-loop-var-rebound-later-fork-refuses	{"a":1}	reduce (.,.) as $x (.; $x as $y | ($y.a) = 9)
+fold-loop-var-rebound-alt-chain	{"a":1}	reduce (.) as $x (.; $x as [$y] ?// $y | ($y.a) = 9)
 CASES_EOF
 
 # Known refuse-only rows (jq answers, succinctly refuses), each with the
@@ -1196,7 +1217,6 @@ owned-embed-fold-update-rebuilt-by-nonwrite:#3181 review -- a witnessed step run
 owned-embed-fold-if-identity:#2889 -- an `if` UPDATE returning `.` is not one of eval_owned_navigation's recognized shapes, so embed_peel_step declines and the accumulator goes through the owned re-index bridge
 identity-if-arms-differ:#2978 -- identity_bind_position is static: an if whose arms sit at different positions ($p at [], . at ["a"]) proves neither, so the bind stays a bare Snapshot and getpath has no position to compose from; jq evaluates the condition
 untracked-later-step-refusal-no-retry:#3120 review -- refusal_is_exact is decided per source, and a marker that is the register is value-equal to it, so a later-step refusal after a certified first step is treated as a guess and does not retry; jq retries onto $w. The trackable twin retries and agrees
-catch-payload-own-node-refuse-only:#3133 -- error(.) raises the register node itself and jq answers ["a"]; the payload equals the register by value but is not null/bool and carries no marker, so it cannot be told from a rebuilt copy (catch-rebuilt-payload-refuses) and the handler stays untracked
 computed-identity-bind-mixed-if:#3133 -- an if source with one arm a computed `.` and the other a marker binds Untracked on an untracked stage (the condition is not evaluated); jq evaluates it and binds the marker
 scalar-string-keeps-tostring-twice:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
 scalar-string-keeps-ltrimstr-nomatch:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
@@ -1217,6 +1237,7 @@ scalar-constant-pool-number-def:#3191 -- jq's constant pool loads one `jv` for a
 scalar-constant-pool-string-def:same as scalar-constant-pool-number-def, for a string literal
 bound-comma-nested-node-refuse-only:#3477 -- a comma sequence shares a node only when it names that node twice; `.a` inside a `.` element is a descendant of another element, and the materialized copy of `.` has already built its own `.a`, so jq's shared jv is not shared here (the exact-node memo is deliberate: descendant sharing is the embed table's job and needs a bind to register)
 fold-loop-var-scalar-refuses:#3329 -- a fold's loop variable is marked for containers only; a scalar has no storage identity until a bind promotes it (#3191), so `reduce (.) as $x (.; path($x))` on a string or number refuses where jq answers
+fold-loop-var-rebound-alt-chain:#3898 -- the fold's loop variable is aliased only by a plain `$x as $y` (or a passthrough pipe of it); a `?//` chain of binds is not read as a rebinding, so the variable is not marked and jq's answer ({"a":9}) is refused
 REFUSE_EOF
 
 if [[ "${1:-}" == "--list-cases" ]]; then
