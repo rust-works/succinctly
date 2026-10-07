@@ -65,7 +65,7 @@ use super::eval::{
     index_one_owned as index_owned_by_key, is_assignment_expr, is_eager_arg,
     is_identity_passthrough, is_retryable_control, is_retryable_stop, key_arrays_eq, limit_raising,
     literal_to_owned, mark_nonretryable_escape, native_stack_exhausted, needs_path_context,
-    numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned, owned_bound_to_i64,
+    numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned, owned_bound_to_i64_for,
     owned_index_key_to_expr, owned_to_string, pattern_alternatives_var_names,
     pipe_needs_path_context, prefer_pending_control, probe_def_call, range_from_literal_override,
     range_max_exceeded_error, range_num, range_values_f64, range_values_int, reads_parent,
@@ -20270,7 +20270,7 @@ fn pull_slice_bound_generic<S: EvalSemantics, V: DocumentValue>(
             }
         };
         for v in &raw {
-            if sink(owned_bound_to_i64(v, round)) == Demand::Stop {
+            if sink(owned_bound_to_i64_for::<S>(v, round)) == Demand::Stop {
                 return Demand::Stop;
             }
         }

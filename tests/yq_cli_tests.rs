@@ -24692,19 +24692,64 @@ fn test_object_slice_computed_bounds_1102() -> Result<()> {
     Ok(())
 }
 
-/// #3404: a computed end bound in `(-1, 0)` is a *given* end that folds to
-/// the full child count `2N`, the same as `resolve_object_children` answers
-/// for any other given end past the last child -- never the entry count `N`
-/// an *omitted* end defaults to, which a "treat it as open" fix would have
-/// produced (`["a",1]`). Not a yq-parity row: real yq v4.53.3 rejects every
-/// fractional bound (`strconv.ParseInt: parsing "-0.5": invalid syntax`), a
-/// separate, pre-existing divergence. This pins internal consistency between
-/// the computed route and the given-end rule only.
+/// #3404 -> #3415: a computed end bound in `(-1, 0)` used to be a *given* end
+/// that folds to the full child count `2N` (never the entry count `N` an
+/// *omitted* end defaults to). Real yq v4.53.3 rejects every fractional bound
+/// (`strconv.ParseInt: parsing "-0.5": invalid syntax`), so yq mode now
+/// refuses it too and the given-end rule is only reachable through jq mode's
+/// `.[0:(-0.5)]` on arrays (pinned in `eval.rs`'s unit tests).
 #[test]
-fn test_object_slice_fractional_negative_end_is_a_given_end_3404() -> Result<()> {
-    let (out, code) = run_yq_stdin(".[0:(-0.5)]", r#"{"a":1,"b":2}"#, &["-o", "json", "-I0"])?;
-    assert_eq!(code, 0, "out: {out:?}");
-    assert_eq!(out.trim(), r#"["a",1,"b",2]"#);
+fn test_object_slice_fractional_negative_end_is_refused_3415() -> Result<()> {
+    let (out, stderr, code) =
+        run_yq_stdin_with_stderr(".[0:(-0.5)]", r#"{"a":1,"b":2}"#, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert!(
+        stderr.contains("Array/string slice indices must be integers"),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
+/// #3415: real yq hands every slice bound's scalar text to `strconv.ParseInt`
+/// (v4.53.3), so a fractional or float-*spelled* bound is refused on every
+/// target kind and under `?`, in a read and a write alike -- while a float that
+/// is integral *by computation* renders as an integer and is accepted
+/// (`.[(1.0+1):]` is `.[2:]`), and an unreached branch never raises.
+#[test]
+fn test_yq_slice_bound_must_be_integer_shaped_3415() -> Result<()> {
+    let args = ["-o=json", "-I=0"];
+    for filter in [
+        ".[0:1.5]",
+        ".[0.5:]",
+        ".[(1.5):]",
+        ".[0:(-0.5)]",
+        ".[1.0:]",
+        ".[-1.0:]",
+        ".[1e0:]",
+        r#".[("1.0"|tonumber):]"#,
+        ".[1.0:] = [9]",
+        "del(.[1.0:])",
+        ".[1:1.0]?",
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "[1,2,3,4]", &args)?;
+        assert_eq!(code, 1, "`{filter}` -- stdout: {stdout:?}");
+        assert!(
+            stderr.contains("Array/string slice indices must be integers"),
+            "`{filter}` -- stderr: {stderr:?}"
+        );
+    }
+    // A null target is not exempt, unlike jq.
+    let (_, stderr, code) = run_yq_stdin_with_stderr(".[0:1.5]", "null", &args)?;
+    assert_eq!(code, 1, "stderr: {stderr:?}");
+    for (filter, want) in [
+        ("[.[(1.0+1):]]", "[[3,4]]\n"),
+        ("[.[(4/2):]]", "[[3,4]]\n"),
+        ("[.[-2:]]", "[[3,4]]\n"),
+        ("if false then .[1.0:] else 1 end", "1\n"),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, "[1,2,3,4]", &args)?;
+        assert_eq!((stdout.as_str(), code), (want, 0), "`{filter}`");
+    }
     Ok(())
 }
 
