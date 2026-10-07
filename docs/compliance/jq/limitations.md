@@ -2788,6 +2788,12 @@ is the revert that established what the other one costs.
    literal's statement used to be read only when *every* sibling left the register alone, so its
    EXTRACT ran register-less, the `try` caught the refusal and the write was silently skipped
    (pinned by `test_foreach_update_comma_with_a_navigating_pipe_and_a_literal_keeps_the_register_3941`).
+   Only a sibling the register analysis recognises as leaving it alone counts. A sibling that is a pipe of
+   non-navigating stages (`(.|length)`, `(2|.+1)`, `(. \| tostring)`) is opaque to it, so that mixed comma still
+   skips the write silently ([#3959](https://github.com/rust-works/succinctly/issues/3959)), and a register-neutral
+   builtin it does not list (`now`, `input_line_number`) refuses loudly
+   ([#3960](https://github.com/rust-works/succinctly/issues/3960)), where jq writes in both; characterized by
+   `test_foreach_update_comma_sibling_residuals_characterize_3959_3960`.
    Marking a withheld register lost (#3267) would make it refuse loudly, but also
    turns rows that match jq today into refusals, where jq's own `try` catches a real error
    (`(foreach .a as $w (0; try (($w \| .c \| .z), $w.b); .)) = 9` writes nothing in either).

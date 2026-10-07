@@ -43834,9 +43834,16 @@ fn entry_marker_shape(expr: &Expr) -> EntryMarkers {
             });
             // #3941: jq forks the comma, so each sibling starts from the register the comma
             // was entered with, and a sibling that leaves it alone states it
-            // ([`carry_frame_register`], #3862) exactly as an alternate does. With every
-            // sibling of that kind the fold's own `identical()` fallback already read it; a
-            // comma that also holds a navigating sibling was the case left unread.
+            // ([`carry_frame_register`], #3862) exactly as an alternate does. A comma of such
+            // siblings alone (`(1, 2)`) was already answered, but one that also holds a
+            // navigating sibling had its statement left unread, so a fold's EXTRACT ran
+            // register-less and a `try` swallowed the refusal. This reads it for every stage that
+            // asks, so a comma after a destructuring bind outside a fold is read too.
+            //
+            // Only a sibling `operand_leaves_register` recognises counts, and an opaque sibling
+            // (a pipe with a `.` in it) keeps the whole comma opaque: `(.|length)` and
+            // `(2|.+1)` still skip the write (#3959), `now` and `input_line_number` still refuse
+            // (#3960).
             if shape == EntryMarkers::None && items.iter().any(operand_leaves_register) {
                 EntryMarkers::Forwarded
             } else {
@@ -119991,6 +119998,14 @@ mod tests {
             "(.a // 1)",
             "first(.a // 1)",
             ".a // .b // 1",
+            // #3941: a comma is a producer when any sibling leaves the register alone,
+            // however the others navigate -- each sibling states its own.
+            "(.a, 1)",
+            "(1, .a)",
+            "((.a | .b?), 1)",
+            "((.a | .b), $x)",
+            "(.a, first($x))",
+            "(1, 2)",
         ] {
             assert!(jq(filter), "{filter}");
         }
@@ -120022,6 +120037,12 @@ mod tests {
             ".a // (5 | .c)",
             ".a // ($x | .c)",
             ".a // limit(1; .b)",
+            // #3941: a comma none of whose siblings leaves the register alone states
+            // nothing, and an opaque host spoils one that does.
+            "(.a, .b)",
+            "(.a, first(.b))",
+            "((.a | .b), (.c | .d))",
+            "(1, [..])",
             // Nothing to read.
             "1",
             ".a",

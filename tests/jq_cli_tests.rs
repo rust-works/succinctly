@@ -70227,6 +70227,57 @@ fn test_foreach_update_comma_with_a_navigating_pipe_and_a_literal_keeps_the_regi
     ])
 }
 
+/// #3941, characterization of what its fix leaves. A comma sibling that is a pipe of
+/// non-navigating stages (#3959) is opaque to the register read, so the write is silently
+/// skipped; one that is a register-neutral builtin the allowlist lacks (#3960) refuses loudly.
+/// jq 1.7.1 writes in every row, `{"a":{"c":[1,2]},"z":0}` for `del`. Update the expectations
+/// when those are fixed. A bare sibling (`length`, `1+1`, `$v | length`) is fixed and not here.
+#[test]
+fn test_foreach_update_comma_sibling_residuals_characterize_3959_3960() -> Result<()> {
+    let doc = r#"{"a":{"b":1,"c":[1,2]},"z":0}"#;
+    let unchanged = "{\"a\":{\"b\":1,\"c\":[1,2]},\"z\":0}\n";
+    let refusal = "Invalid path expression near attempt to access element \"b\"";
+    assert_path_rows_3289(&[
+        // #3959, silent: jq `{"a":{"c":[1,2]},"z":0}`.
+        (
+            doc,
+            r"del(foreach .a as $v (.; (($v | .b?), (.|length)); try ($v | .b?)))",
+            unchanged,
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (.; (($v | .b?), (2|.+1)); try ($v | .b?)))",
+            unchanged,
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (.; (($v | .b?), (. | tostring)); try ($v | .b?)))",
+            unchanged,
+            "",
+            0,
+        ),
+        // #3960, loud: jq `{"a":{"c":[1,2]},"z":0}`.
+        (
+            doc,
+            r"del(foreach .a as $v (.; (($v | .b?), input_line_number); try ($v | .b?)))",
+            "",
+            refusal,
+            5,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (.; (($v | .b?), now); try ($v | .b?)))",
+            "",
+            refusal,
+            5,
+        ),
+    ])
+}
+
 /// #3941: the same read, outside a fold. A destructuring bind's body is a comma whose
 /// siblings are a navigating pipe and a bare `$q`; `$q`'s statement used to be dropped, so the
 /// body refused where jq answers (`destructure-comma-marker-nav` in the bind-origin sweep).
