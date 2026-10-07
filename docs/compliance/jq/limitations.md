@@ -3376,17 +3376,23 @@ answers `["b"]` — and classified the two residuals appended below):
   (`foreach_states_register_per_emission`). Pinned by
   `test_recurse_seed_behind_call_or_fork_keeps_register_3580`.
 
+  [#3892](https://github.com/rust-works/succinctly/issues/3892) added three shapes that answer as
+  jq does. `nth(n; f)` forwards the branch it keeps, as `first`/`limit` do (jq emits `f`'s output
+  through `LOADV $item`, which does not move the register). A bare-variable bind forwards its body
+  (`(. as $q | ..)`), because its source is a subexp. And `register_movement_tracked` names every
+  recurse spelling with a tracked `f`, not only `..`, so `reduce (1,2) as $i (1; try recurse(.a))` is
+  `[]`. Pinned by `test_recurse_seed_through_nth_bind_and_fold_recurse_f_3892`.
+
   **What still refuses**, each loudly (an exit 5, never a write that is silently lost) and pinned by
   `test_recurse_seed_residuals_stay_loud_3580`:
   - an output that is not a recursion's seed or an untracked `.` and so states nothing: a literal
     ahead of the recursion (`(1, ..)`, or the taken `else 1` of `if false then .. else 1 end`) is
-    `[]` in jq, and so is `nth(0; ..)`, which is not an audited forwarder;
-  - a recursion behind a destructuring bind or a `def` call (`(. as $q | ..)`, `def f: ..; f`): the
+    `[]` in jq, and so is a variable ahead of it (`(. as $q | $q, (try ..))`);
+  - a recursion behind a destructuring bind or a `def` call (`(. as [$q] | ..)`, `def f: ..; f`): the
     bind's pattern indexes before its body runs and a call's body is not named, so the stage is
-    opaque; and so is a pipe (or `select`) nested inside a forwarder, `if true then (.. | select(true))
-    else . end`, though the bare `(.. | select(true))` stage is answered by #3653's own rule;
-  - a `reduce` UPDATE whose recursion is `recurse(f)`: `register_movement_tracked` names `..`
-    and not `recurse(f)`.
+    opaque. So is a pipe (or `select`) nested inside a forwarder, such as `if true then (.. | select(true))
+    else . end` or a bare-variable bind's body `(. as $q | (try ..) | .)`, though the bare
+    `(.. | select(true))` stage is answered by #3653's own rule.
 - **A terminal `null`/`true`/`false` is the root path only while nothing navigated
   ([#3579](https://github.com/rust-works/succinctly/issues/3579)).** jq accepts a computed
   `null`, `true` or `false` as a path when it is `jv_identical` to the register, by value alone, so

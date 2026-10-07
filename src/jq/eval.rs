@@ -41875,12 +41875,16 @@ fn and_or_negate_resolves_live<S: EvalSemantics>(expr: &Expr) -> bool {
 /// trackable where jq's register is), provably leaves the register alone
 /// ([`cannot_move_register`]), or composes steps that do. An allowlist, the
 /// safe direction: a wrong `true` lets an `and`/`or` accept where jq
-/// refuses, so everything else -- every builtin jq defines by navigating
+/// refuses, so everything else -- every other builtin jq defines by navigating
 /// (`first` is `.[0]`), a `def`, `try`, `if` (whose untaken branch drops the
-/// register statically) -- answers `false`.
+/// register statically) -- answers `false`. The recurse family is the one
+/// navigating builtin admitted, and only for an `f` this admits (#3892): jq's
+/// `def r: ., (f | r);` moves the register through `f` alone.
 ///
-/// Read only by [`and_or_operand_is_checked`] since #3428 (and, through it, by
-/// [`array_contents_are_checked`]'s `and`/`or`/minus arm): the `and`/`or` arms
+/// Read by [`and_or_operand_is_checked`] since #3428 (and, through it, by
+/// [`array_contents_are_checked`]'s `and`/`or`/minus arm), and by a fold's
+/// source and `UPDATE` ([`reduce_leaves_register_in_place`],
+/// [`fold_update_movement_tracked`], #3732/#3580): the `and`/`or` arms
 /// no longer decline an operand this rejects, because each operand's branch
 /// states its own register ([`register_after`]). An `[E]` still needs an
 /// allowlist, because its claim is that the resolver checks everything jq
@@ -41905,6 +41909,16 @@ fn register_movement_tracked(expr: &Expr) -> bool {
         // `select`'s condition is a subexp in jq; it passes its input
         // through at the register. `getpath` navigates natively (#2896).
         | Expr::Builtin(Builtin::Select(_) | Builtin::GetPath(_)) => true,
+        // #3892: jq defines every recurse spelling as `def r: ., (f | r);`, so
+        // the register moves only through `f` (`recurse` is `recurse(.[]?)`),
+        // and `recurse(f; cond)`'s `cond` is `select`'s condition, a subexp --
+        // the same reading `..` above already has. `recurse_down`, which jq
+        // 1.7.1 does not define, resolves through the same walk as `..` here
+        // (`resolve_recursive_descent_sink`), so it is read the same way.
+        Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => true,
+        Expr::Builtin(Builtin::RecurseF(f) | Builtin::RecurseCond(f, _)) => {
+            register_movement_tracked(f)
+        }
         Expr::Paren(e) => register_movement_tracked(e),
         Expr::Optional(e) if is_postfix_optional_primitive(e) => register_movement_tracked(e),
         Expr::Pipe(parts) => parts.iter().all(register_movement_tracked),
@@ -43522,7 +43536,8 @@ fn getpath_preserves_register<S: EvalSemantics>(
 /// resolver arm forwards the branch it is given unchanged: `Paren`, `Shared`,
 /// `?`, `try` (and its handler), `,`, `if` (its condition is a subexp), `//`
 /// (the right side runs after the left was backtracked), `first(f)`,
-/// `limit(n; f)` and `label`. Anything else that hosts a producer -- a
+/// `limit(n; f)`, `nth(n; f)`, `label` and a bare-variable bind's body (its
+/// source is a subexp; both since #3892). Anything else that hosts a producer -- a
 /// destructuring bind, whose pattern indexes before its body runs, a fold, a
 /// `def` call -- is *opaque*: the stage reads nothing, and the refusal it had
 /// before stays. A stage that hosts no producer has nothing to read.
@@ -43609,8 +43624,10 @@ fn is_entry_marker_producer(expr: &Expr) -> bool {
 
 /// [`EntryMarkers`] for `expr`, peeling the wrappers [`entry_marker_stage`]
 /// lists. Each arm is the resolver's own forwarding arm in `resolve_node_sink`
-/// (or its sink helper): the closure parameters of `first`/`limit` and the
-/// condition of an `if` are subexps and never reach the sink.
+/// (or its sink helper): the count of `limit`/`nth`, the source of a
+/// bare-variable bind (#3892) and the condition of an `if` are subexps and
+/// never reach the sink, so a producer there states nothing this stage reads
+/// and is not looked at.
 fn entry_marker_shape(expr: &Expr) -> EntryMarkers {
     match expr {
         Expr::Identity
@@ -43624,9 +43641,18 @@ fn entry_marker_shape(expr: &Expr) -> EntryMarkers {
         Expr::Paren(inner)
         | Expr::Optional(inner)
         | Expr::FirstExpr(inner)
-        | Expr::Builtin(Builtin::FirstStream(inner))
+        // #3892: `nth`'s two spellings too: `resolve_nth_sink` hands the branch it
+        // keeps on unchanged and evaluates `n` by value, and jq's `nth` emits `f`'s
+        // output through `LOADV $item`, which leaves the register where `f` did.
+        | Expr::Builtin(Builtin::FirstStream(inner) | Builtin::NthStream(_, inner))
+        | Expr::NthExpr { expr: inner, .. }
         | Expr::Limit { expr: inner, .. }
         | Expr::Label { body: inner, .. }
+        // #3892: a bare-variable bind's source is a subexp in jq, and
+        // `resolve_as_source_sink` resolves the body against this arm's own
+        // input and sink. A destructuring `AsPattern` stays opaque: its pattern
+        // indexes before the body runs.
+        | Expr::As { body: inner, .. }
         | Expr::Try {
             expr: inner,
             catch: None,
@@ -118778,7 +118804,8 @@ mod tests {
     /// (a recursion, an untracked `.`, a `try` with a handler) reached only through
     /// the wrappers whose resolver arm forwards a branch unchanged. A stage that
     /// hosts a producer anywhere else -- a pipe, an array, a destructuring bind, a
-    /// `def` -- is opaque, and one that hosts none has nothing to read (#3580).
+    /// `def` -- is opaque, and one that hosts none has nothing to read (#3580;
+    /// `nth` and a bare-variable bind joined the forwarders in #3892).
     #[test]
     fn test_entry_marker_stage_predicate_3580() {
         let jq = |filter: &str| entry_marker_stage::<JqSemantics>(&parse(filter).unwrap(), false);
@@ -118807,6 +118834,14 @@ mod tests {
             "label $out | ..",
             "first(try ..)",
             "(first(..), limit(1; recurse(.a)))",
+            // #3892: `nth` forwards the branch it keeps, and a bare-variable
+            // bind resolves its body against the stage's own input and sink.
+            "nth(0; ..)",
+            "nth(1; try ..)",
+            ". as $v | ..",
+            "(. as $v | ..)",
+            ".a as $v | try recurse(.a) catch 7",
+            "(.., 1) as $v | ..",
         ] {
             assert!(jq(filter), "{filter}");
         }
@@ -118819,13 +118854,15 @@ mod tests {
             "[..]",
             "{a: ..}",
             ". as {a: $q} | ..",
-            ". as $v | ..",
+            ". as [$q] | ..",
             "def f: ..; f",
+            // #3892: a bind forwards only its body, and a pipe there re-seeds.
+            ". as $v | .. | .",
+            ". as $v | [..]",
             "reduce .. as $i (0; .)",
             "foreach .. as $i (0; .)",
-            // Skipped outputs and `nth` are not audited.
+            // Skipped outputs are not audited.
             "skip(1; ..)",
-            "nth(0; ..)",
             // One opaque host spoils a comma that is otherwise forwarded.
             "(.., [..])",
             "if true then .. else (.a | ..) end",
@@ -118848,6 +118885,40 @@ mod tests {
         // yq keeps its eager guard: no oracle, and a wrong acceptance there is
         // a silent write rather than a loud error.
         assert!(!entry_marker_stage::<YqSemantics>(&recursion, false));
+    }
+
+    /// Every recurse spelling is `def r: ., (f | r);` in jq, so its register moves
+    /// only through `f`, as `..`'s already did; `cond` is a `select` condition
+    /// (#3892). An `f` the predicate cannot follow keeps the recursion out.
+    #[test]
+    fn test_register_movement_tracked_recurse_family_3892() {
+        let tracked = |filter: &str| register_movement_tracked(&parse(filter).unwrap());
+        for filter in [
+            "..",
+            "recurse",
+            "recurse_down",
+            "recurse(.a)",
+            "recurse(.a[]?)",
+            "recurse(.a; . != null)",
+            "recurse(recurse(.b))",
+        ] {
+            assert!(tracked(filter), "{filter}");
+        }
+        for filter in [
+            "recurse(first(.a))",
+            "recurse(first(.a); . != null)",
+            "recurse(.a; .b) | first",
+            "try recurse(.a)",
+        ] {
+            assert!(!tracked(filter), "{filter}");
+        }
+        // A fold's UPDATE also sees through the `try` (#3580).
+        assert!(fold_update_movement_tracked(
+            &parse("try recurse(.a)").unwrap()
+        ));
+        assert!(!fold_update_movement_tracked(
+            &parse("try recurse(first(.a))").unwrap()
+        ));
     }
 
     /// The filed repro, read and write: the seed re-establishes the register,
