@@ -92385,6 +92385,49 @@ fn test_container_identity_survives_the_bridge_and_literal_binds_3069() -> Resul
     Ok(())
 }
 
+/// #3943: an array key on an array is jq's subarray search, which compares each
+/// element with `jv_equal`'s identity shortcut first, so a key built from the
+/// very handle the target holds is found even with a NaN inside. The key used
+/// to be re-spliced into the AST as literals, so `.[[$a]]` compared a fresh
+/// copy of `$a` against `$a` and answered `[]`, where `indices([$a])` (which
+/// keeps its pattern's storage) already answered `[0]`. The last rows build a
+/// *different* handle (a second parse, a fresh literal) and stay as jq answers
+/// them. Every value captured from `/usr/bin/jq` 1.7.1 with `-nc`.
+#[cfg(not(feature = "unshared-containers"))]
+const SUBARRAY_SEARCH_KEY_IDENTITY_3943: &[(&str, &str)] = &[
+    ("[nan] as $a | [$a] | .[[$a]]", "[0]"),
+    ("[nan] as $a | [[$a],[$a]] | .[[[$a]]]", "[0,1]"),
+    ("[nan] as $a | [$a,$a] | .[[$a]]", "[0,1]"),
+    ("[nan] as $a | [$a] as $h | $h | .[$h]", "[0]"),
+    ("[nan] as $a | [$a] | .[[$a]]?", "[0]"),
+    ("[nan] as $a | [$a] | .[[$a]] | length", "1"),
+    ("[nan] as $a | {a:$a} | [.a] | .[[$a]]", "[0]"),
+    ("{a:nan} as $a | [$a] | .[[$a]]", "[0]"),
+    ("[nan] as $a | [$a] | .[([$a])]", "[0]"),
+    ("[nan] as $a | [$a] | [.[[$a]], .[[$a]]]", "[[0],[0]]"),
+    ("[nan] as $a | [[$a]] | .[[[$a]]]", "[0]"),
+    ("[nan] as $a | ([$a],[$a,$a]) | .[[$a]]", "[0]\n[0,1]"),
+    ("[nan,nan] | .[[.[0]]]", "[]"),
+    ("[nan] as $a | [[nan]] | .[[$a]]", "[]"),
+    ("[nan] as $a | [$a] | .[[[nan]]]", "[]"),
+    ("[[nan]] | .[[.[0]]]", "[0]"),
+    ("[1,2,1,2] | .[[1,2]]", "[0,2]"),
+];
+
+#[cfg(not(feature = "unshared-containers"))]
+#[test]
+fn test_subarray_search_key_keeps_its_identity_3943() -> Result<()> {
+    for (filter, expected) in SUBARRAY_SEARCH_KEY_IDENTITY_3943 {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, "", &["-nc"])?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (*expected, 0),
+            "`{filter}`: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3896: a fold's container loop variable is one value in jq, read twice, so
 /// jq's `jv_equal` identity shortcut sees it (`reduce ([nan]) as $a (0; $a == $a)`
 /// is `true`; a rebuilt literal per `$a` was `false`). Marked wherever UPDATE or

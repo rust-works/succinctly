@@ -8354,7 +8354,7 @@ fn each_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 TargetEnd::Exhausted => Demand::Continue,
             };
         }
-        let literal_key = owned_to_expr(&k);
+        let literal_key = owned_index_key_to_expr::<S>(&k);
         let one_key_result = eval_index_expr::<W, S>(target, &literal_key, value.clone(), optional);
         match drain_result(one_key_result, sink) {
             Flow::Exhausted => Demand::Continue,
@@ -55354,6 +55354,27 @@ fn substitute_var_in_builtin(
 /// file's own `each_index_expr` does.
 pub(crate) fn owned_to_expr(value: &OwnedValue) -> Expr {
     owned_to_expr_at_depth(value, 0)
+}
+
+/// [`owned_to_expr`] for the one index key an `each_index_expr` splices back
+/// into [`eval_index_expr`] (and `eval_generic`'s twin). In jq mode an array
+/// key on an array is the subarray search, which compares each element with
+/// `jv_equal`'s instance check first (#3069), so the key has to reach the
+/// search holding the storage it was computed with: rebuilding it from
+/// literals gives every container and every parsed NaN a fresh identity, and
+/// `[nan] as $a | [$a] | .[[$a]]` stops finding `[$a]` (#3943). The value
+/// rides an [`Origin::Untracked`] marker, which evaluates as the plain value
+/// and refuses in path position. yq mode has no such search and keeps the
+/// rebuilt form.
+pub(crate) fn owned_index_key_to_expr<S: EvalSemantics>(key: &OwnedValue) -> Expr {
+    match key {
+        OwnedValue::Array(_) if S::TAG != EvalTag::Yq => Expr::TrackedVar(Rc::new(Tracked {
+            value: key.clone(),
+            origin: Origin::Untracked,
+            node: None,
+        })),
+        _ => owned_to_expr(key),
+    }
 }
 
 /// Panics past [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH)
