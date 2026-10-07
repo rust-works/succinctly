@@ -69647,6 +69647,48 @@ fn test_foreach_update_alternate_shapes_keep_the_register_3906() -> Result<()> {
             "",
             0,
         ),
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .b) // first(limit(1; $k)); .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .b) // nth(0; $k); .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $k (0; ($k | .b) // nth(0; $k); .)) = 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .b) // try $k; .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $k (0; ($k | .b) // try $k; .)) = 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .b) // $k?; .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
         // A comma inside the alternate (answered since #3862) stays answered.
         (
             doc,
@@ -69725,6 +69767,43 @@ fn test_foreach_update_alternate_shapes_keep_the_register_3906() -> Result<()> {
             r"path(foreach .a as $k (0; ($k | .b) // {a: $k} | .a; .))",
             "",
             "Invalid path expression near attempt to access element \"a\" of {\"a\":{\"c\":1}}",
+            5,
+        ),
+    ])
+}
+
+/// #3906, what the alternate fix leaves refusing loudly where jq 1.7.1 answers (the safe
+/// direction, and the same on `main` before it). jq's answers are in the comments; update the
+/// expectations when these are fixed. An output of the *left* operand states no register
+/// (`1 // first($k)` answers the `1`), so a stage after it cannot say the register is where it
+/// entered; a comma body whose sibling navigates without a pipe is the split #3145 guards.
+#[test]
+fn test_foreach_update_alternate_residual_refusals_3906_characterize() -> Result<()> {
+    let doc = r#"{"a":{"c":1}}"#;
+    let refusal = "Invalid path expression";
+    assert_path_rows_3289(&[
+        // jq: ["a"]
+        (
+            doc,
+            r"path(foreach .a as $k (0; (1 // first($k)) | $k; .))",
+            "",
+            refusal,
+            5,
+        ),
+        // jq: ["a"]
+        (
+            doc,
+            r"path(foreach .a as $k (0; (first($k) // 5) | $k; .))",
+            "",
+            refusal,
+            5,
+        ),
+        // jq: ["a","b"] then ["a"]
+        (
+            doc,
+            r"path(foreach .a as $k (0; (($k | .b), first($k)); .))",
+            "",
+            refusal,
             5,
         ),
     ])

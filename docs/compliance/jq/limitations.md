@@ -2769,7 +2769,12 @@ is the revert that established what the other one costs.
    the register the stage entered with, and the stage reads that statement per output
    (`entry_marker_shape`) rather than asking the whole-expression question. An alternate
    that navigates (`// first(.a)`, `// (5 \| .c)`, `// ($k \| .c)` before an EXTRACT `$k`) or
-   builds a value read as a path (`// [$k] \| .[0]`, `// 5; .`) still refuses where jq does. Pinned by
+   builds a value read as a path (`// [$k] \| .[0]`, `// 5; .`) still refuses where jq does.
+   Still refused loudly where jq answers, because an output of the *left* operand states no
+   register (`path(foreach .a as $k (0; (1 // first($k)) \| $k; .))` is `["a"]` in jq, as is
+   `(first($k) // 5) \| $k`), and because a comma sibling that navigates without a pipe
+   withholds the register (`(($k \| .b), first($k))` is `["a","b"]`, `["a"]`); pinned by
+   `test_foreach_update_alternate_residual_refusals_3906_characterize`. Pinned by
    `test_foreach_update_under_try_over_a_generator_keeps_the_register_3738`,
    `test_foreach_update_under_try_around_a_generator_keeps_the_register_3770`,
    `test_foreach_update_under_try_with_a_comma_inside_a_pipe_keeps_the_register_3770`,

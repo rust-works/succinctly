@@ -39605,7 +39605,9 @@ fn resolve_alternative_sink<'a, S: EvalSemantics>(
 }
 
 /// State the register `frame` carries on a by-value branch that `operand`
-/// produced, when `operand` provably cannot have moved it (#3788).
+/// produced, when `operand` provably cannot have moved it (#3788) -- itself, or
+/// through a wrapper that adds no movement of its own ([`operand_leaves_register`],
+/// #3906).
 ///
 /// A leaf computing by value says nothing about jq's register on an untracked
 /// entry, which the enclosing stage carries ([`leaf_register`]); a pipe stage
@@ -43556,7 +43558,9 @@ fn getpath_preserves_register<S: EvalSemantics>(
 /// `?`, `try` (and its handler), `,`, `if` (its condition is a subexp), `//`
 /// (the right side runs after the left was backtracked), `first(f)`,
 /// `limit(n; f)`, `nth(n; f)`, `label` and a bare-variable bind's body (its
-/// source is a subexp; both since #3892). Anything else that hosts a producer -- a
+/// source is a subexp; both since #3892). A `//` is also a producer when its right
+/// operand leaves the register alone ([`operand_leaves_register`], #3906): that alternate
+/// states the register the stage entered with ([`carry_frame_register`]). Anything else that hosts a producer -- a
 /// destructuring bind, whose pattern indexes before its body runs, a fold, a
 /// `def` call -- is *opaque*: the stage reads nothing, and the refusal it had
 /// before stays. A stage that hosts no producer has nothing to read.
@@ -43695,15 +43699,20 @@ fn entry_marker_shape(expr: &Expr) -> EntryMarkers {
         // #3906: the alternate runs after jq backtracked out of the left operand, so one
         // that leaves the register alone states it as the stage entered it
         // ([`carry_frame_register`]) -- a producer in its own right, like a `catch` handler.
+        //
+        // The shape says only that a statement *may* be read, never that one was made:
+        // `carry_frame_register` states a register only where the frame has one (a jq-mode
+        // fold or a pipe stage on an untracked entry), and the readers compare what a branch
+        // states to the register they hold ([`states_register_at_entry`]), so a stage with
+        // nothing to state reads nothing. The right operand is only asked when the arms did not already settle it, which keeps a
+        // right-nested chain (`a // b // c // ...`) linear.
         Expr::Alternative(left, right) => {
-            let stated = if operand_leaves_register(right) {
+            let shape = entry_marker_shape(left).join(entry_marker_shape(right));
+            if shape == EntryMarkers::None && operand_leaves_register(right) {
                 EntryMarkers::Forwarded
             } else {
-                EntryMarkers::None
-            };
-            entry_marker_shape(left)
-                .join(entry_marker_shape(right))
-                .join(stated)
+                shape
+            }
         }
         other if any_subexpr(other, &mut is_entry_marker_producer) => EntryMarkers::Opaque,
         _ => EntryMarkers::None,
@@ -119665,6 +119674,16 @@ mod tests {
             "(. as $v | ..)",
             ".a as $v | try recurse(.a) catch 7",
             "(.., 1) as $v | ..",
+            // #3906: a `//` whose right operand leaves the register alone is a
+            // producer: it states the register the stage entered with.
+            ".a // 1",
+            ".a // $x",
+            ".a // first($x)",
+            ".a // limit(1; $x)",
+            ".a // try $x",
+            "(.a // 1)",
+            "first(.a // 1)",
+            ".a // .b // 1",
         ] {
             assert!(jq(filter), "{filter}");
         }
@@ -119689,6 +119708,13 @@ mod tests {
             // One opaque host spoils a comma that is otherwise forwarded.
             "(.., [..])",
             "if true then .. else (.a | ..) end",
+            // #3906: an alternate that navigates states nothing, and neither does a
+            // wrapper over one.
+            ".a // .b",
+            ".a // first(.b)",
+            ".a // (5 | .c)",
+            ".a // ($x | .c)",
+            ".a // limit(1; .b)",
             // Nothing to read.
             "1",
             ".a",
