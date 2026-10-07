@@ -66,16 +66,16 @@ use super::eval::{
     is_identity_passthrough, is_retryable_control, is_retryable_stop, key_arrays_eq, limit_raising,
     literal_to_owned, mark_nonretryable_escape, native_stack_exhausted, needs_path_context,
     numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned, owned_bound_to_i64,
-    owned_to_expr, owned_to_string, pattern_alternatives_var_names, pipe_needs_path_context,
-    prefer_pending_control, probe_def_call, range_from_literal_override, range_max_exceeded_error,
-    range_num, range_values_f64, range_values_int, reads_parent, recurse_walk_flow, reduce_forks,
-    reroot_for_reentry, reroot_markers, resolve_computed_slice_bounds, resume_from_escape,
-    reverse_length_is_empty, select_emits, settle_then_replay, settles_before_consumer,
-    shared_arg_depth_refusal, slice_component_value, slice_object_as_yq_children,
-    slice_owned_value_read_computed, stop_with_downstream, stop_with_error, stop_with_escape,
-    streams_escaped_generator_prefix, streams_unbounded, substitute_bound_var_from,
-    substitute_vars, suppresses, tonumber_from_str, tostring_owned, try_handler_root,
-    vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
+    owned_index_key_to_expr, owned_to_string, pattern_alternatives_var_names,
+    pipe_needs_path_context, prefer_pending_control, probe_def_call, range_from_literal_override,
+    range_max_exceeded_error, range_num, range_values_f64, range_values_int, reads_parent,
+    recurse_walk_flow, reduce_forks, reroot_for_reentry, reroot_markers,
+    resolve_computed_slice_bounds, resume_from_escape, reverse_length_is_empty, select_emits,
+    settle_then_replay, settles_before_consumer, shared_arg_depth_refusal, slice_component_value,
+    slice_object_as_yq_children, slice_owned_value_read_computed, stop_with_downstream,
+    stop_with_error, stop_with_escape, streams_escaped_generator_prefix, streams_unbounded,
+    substitute_bound_var_from, substitute_vars, suppresses, tonumber_from_str, tostring_owned,
+    try_handler_root, vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
     yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_negative_index_check,
     yq_negative_index_error, yq_numeric_index_on_object_is_null, yq_object_key_stringify,
     yq_read_only_context, yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand,
@@ -15656,7 +15656,7 @@ fn each_select_generic<S: EvalSemantics, V: DocumentValue>(
 /// Demand-forwarding twin of `eval::each_index_expr` (#2180 WP2b), reusing
 /// this file's own [`eval_index_expr`] unchanged the identical way: each
 /// already-computed key is spliced back into the AST as a literal
-/// single-valued key expression ([`owned_to_expr`]) and handed to
+/// single-valued key expression ([`owned_index_key_to_expr`]) and handed to
 /// [`eval_index_expr`] for that one key alone, so `target`'s own
 /// re-evaluation-per-key (#2032), negative-index checks and `Partial`-fold
 /// machinery are untouched -- only the *key stream* itself is now driven
@@ -15821,7 +15821,7 @@ fn process_index_key<S: EvalSemantics, V: DocumentValue>(
             TargetEnd::Exhausted => true,
         };
     }
-    let literal_key = owned_to_expr(k);
+    let literal_key = owned_index_key_to_expr::<S>(k);
     let one_key_result = eval_index_expr::<S, V>(target, &literal_key, value, optional, cursor);
     match drain_result_generic(one_key_result, sink) {
         Flow::Exhausted => true,
