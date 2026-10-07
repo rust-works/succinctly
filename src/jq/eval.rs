@@ -40841,7 +40841,19 @@ fn resolve_leaf_bounded<'a, S: EvalSemantics>(
         // leaves the document alone at exit 0, where this table's rule
         // would refuse. That rule is jq's, derived from how *jq* defines
         // these in `builtin.jq`; yq's implementation shares none of it.
-        if S::TAG == EvalTag::Jq {
+        //
+        // The exception is a name yq's lexer rejects outright -- `INDEX(f)` and
+        // `transpose` (`lexer: invalid input text` on v4.53.3): yq mode reaches
+        // them only through `--jq-extensions`, which means what jq defines, so
+        // there is no yq rule to protect, and gating them would leave the
+        // silently discarded `del`/`=` this table exists to refuse (#3888, as
+        // `nth(n)` in #3550).
+        if S::TAG == EvalTag::Jq
+            || matches!(
+                expr,
+                Expr::Builtin(Builtin::UpperIndex(_) | Builtin::Transpose)
+            )
+        {
             if let Expr::Builtin(builtin) = expr {
                 match builtin_navigation::<S>(builtin, value) {
                     Ok(Some(navigation)) => {
@@ -42776,7 +42788,10 @@ fn array_contents_are_checked(inner: &Expr) -> bool {
         // which by-value evaluation here raises identically. The output
         // then goes untracked, stricter than jq, so any navigation after it
         // inside the brackets still refuses (`[first] | .[0]` raises
-        // identically in both tools).
+        // identically in both tools). `INDEX(f)` and `transpose` (#3888) are
+        // `Iterate` entries too but are deliberately not in this list: on a
+        // tracked input they match jq already (`[INDEX(.)]`, `[transpose]`),
+        // and adding one needs that same tracked-input probe first.
         Expr::Builtin(
             Builtin::First
             | Builtin::Last
