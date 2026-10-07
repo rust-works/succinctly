@@ -59179,6 +59179,255 @@ fn test_foreach_alt_chain_retries_after_navigation_then_scalar_builtin_2159() ->
     Ok(())
 }
 
+/// #3460: a `foreach` step's accumulator is the register's own node when the
+/// previous UPDATE *reached* it at the very path the next source element moves
+/// the register to -- jq's `jv_identical(state, value_at_path)`, a pointer
+/// comparison over an immutable document. `path(foreach (1, .a) as $k (.; .a))`
+/// raised on the second step. Every row is a live jq 1.7.1 capture, as `path()`
+/// and as the write that rides on it; each value kind is one `jv` kind
+/// `jv_identical` compares differently (string/container pointer, number bits,
+/// big-number literal pointer).
+#[test]
+fn test_foreach_accumulator_identity_carries_across_source_elements_3460() -> Result<()> {
+    // (document, filter, stdout, exit code)
+    const ROWS: &[(&str, &str, &str, i32)] = &[
+        (
+            r#"{"a":{"a":1},"b":{"c":2}}"#,
+            r"path(foreach (1, .a) as $k (.; .a))",
+            "[\"a\"]\n[\"a\",\"a\"]\n",
+            0,
+        ),
+        // the same, through `..` (a builtin source): jq raises one element later
+        (
+            r#"{"a":{"a":1},"b":{"c":2}}"#,
+            r"path(foreach (..) as $k (.; .a))",
+            "[\"a\"]\n[\"a\",\"a\"]\n",
+            5,
+        ),
+        (
+            r#"{"a":"s"}"#,
+            r"path(foreach (1, .a) as $k (.; if $k == 1 then .a else . end))",
+            "[\"a\"]\n[\"a\"]\n",
+            0,
+        ),
+        (
+            r#"{"a":"s"}"#,
+            r"(foreach (1, .a) as $k (.; if $k == 1 then .a else . end)) = 9",
+            "{\"a\":9}\n",
+            0,
+        ),
+        (
+            r#"{"a":1.5}"#,
+            r"path(foreach (1, .a) as $k (.; if $k == 1 then .a else . end))",
+            "[\"a\"]\n[\"a\"]\n",
+            0,
+        ),
+        (
+            r#"{"a":1000000000000000000000001}"#,
+            r"path(foreach (1, .a) as $k (.; if $k == 1 then .a else . end))",
+            "[\"a\"]\n[\"a\"]\n",
+            0,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r"(foreach (1, .a) as $k (.; if $k == 1 then .a else . end)) = 9",
+            "{\"a\":9}\n",
+            0,
+        ),
+        (
+            r#"{"a":{}}"#,
+            r"path(foreach (1, .a) as $k (.; if $k == 1 then .a else . end))",
+            "[\"a\"]\n[\"a\"]\n",
+            0,
+        ),
+        // an array element: step 2 reaches `.a[0]` again, then `"t"` refuses
+        (
+            r#"{"a":["s","t"]}"#,
+            r"path(foreach (1, .a[]) as $k (.; if $k == 1 then .a[0] else . end))",
+            "[\"a\",0]\n[\"a\",0]\n",
+            5,
+        ),
+        // a non-empty array slice at one path is one `jv` (shared buffer); a string
+        // slice and an empty array's are fresh ones
+        (
+            r#"{"a":[1,2]}"#,
+            r"path(foreach (1, .a[0:1]) as $k (.; if $k == 1 then .a[0:1] else . end))",
+            "[\"a\",{\"start\":0,\"end\":1}]\n[\"a\",{\"start\":0,\"end\":1}]\n",
+            0,
+        ),
+        (
+            r#"{"a":[1,2]}"#,
+            r"path(foreach (1, .a[0:1][0:1]) as $k (.; if $k == 1 then .a[0:1] else . end))",
+            "[\"a\",{\"start\":0,\"end\":1}]\n[\"a\",{\"start\":0,\"end\":1},{\"start\":0,\"end\":1}]\n",
+            0,
+        ),
+    ];
+    for (doc, filter, want_stdout, want_code) in ROWS {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(
+            stdout, *want_stdout,
+            "`{filter}` on {doc}: stderr: {stderr:?}"
+        );
+        assert_eq!(code, *want_code, "`{filter}` on {doc}: stderr: {stderr:?}");
+    }
+    Ok(())
+}
+
+/// #3460 must-not-change: the carried identity is *positional*. A different
+/// path holding an equal value is a different `jv` (`jv_identical` compares
+/// pointers, never structure), and a string or empty-array slice is a fresh
+/// `jv` even at the same path -- widening any of these writes where jq raises.
+/// Every row is a live jq 1.7.1 capture.
+#[test]
+fn test_foreach_accumulator_identity_is_positional_3460() -> Result<()> {
+    // (document, filter, stdout, exit code)
+    const ROWS: &[(&str, &str, &str, i32)] = &[
+        // equal object / string at a *different* path
+        (
+            r#"{"a":{"x":1},"b":{"x":1}}"#,
+            r"path(foreach (1, .b) as $k (.; if $k == 1 then .a else . end))",
+            "[\"a\"]\n",
+            5,
+        ),
+        (
+            r#"{"a":"s","b":"s"}"#,
+            r"path(foreach (1, .b) as $k (.; if $k == 1 then .a else . end))",
+            "[\"a\"]\n",
+            5,
+        ),
+        (
+            r#"{"a":"s","b":"s"}"#,
+            r"(foreach (1, .b) as $k (.; if $k == 1 then .a else . end)) = 9",
+            "",
+            5,
+        ),
+        // INIT navigated to `.b`, so a navigating source refuses
+        (
+            r#"{"a":{"x":1},"b":{"x":1}}"#,
+            r"path(foreach (.a) as $k (.b; .))",
+            "",
+            5,
+        ),
+        // a string slice is a copy even at the same path; an empty array's too
+        (
+            r#"{"a":"ab"}"#,
+            r"path(foreach (1, .a[0:2]) as $k (.; if $k == 1 then .a[0:2] else . end))",
+            "[\"a\",{\"start\":0,\"end\":2}]\n",
+            5,
+        ),
+        (
+            r#"{"a":[]}"#,
+            r"path(foreach (1, .a[0:1]) as $k (.; if $k == 1 then .a[0:1] else . end))",
+            "[\"a\",{\"start\":0,\"end\":1}]\n",
+            5,
+        ),
+        // a slice that dropped an element, or a slice of the *wrong* node
+        (r"[1,2]", r"(foreach (.[0:1]) as $k (.; .[0])) = 9", "", 5),
+        (
+            r#"{"a":[1,2]}"#,
+            r"path(foreach (.a[0:]) as $k (.a; .[0]))",
+            "",
+            5,
+        ),
+        (
+            r"[[1,2],3]",
+            r"(foreach (.[0], .[0][0:]) as $k (.; .[0])) = 9",
+            "",
+            5,
+        ),
+        (r"[]", r"path(foreach (.[0:]) as $k (.; .))", "", 5),
+        (r#""s""#, r"path(foreach (.[0:]) as $k (.; .))", "", 5),
+    ];
+    for (doc, filter, want_stdout, want_code) in ROWS {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(
+            stdout, *want_stdout,
+            "`{filter}` on {doc}: stderr: {stderr:?}"
+        );
+        assert_eq!(code, *want_code, "`{filter}` on {doc}: stderr: {stderr:?}");
+    }
+    Ok(())
+}
+
+/// #3460: a full slice is the same `jv` as its input (`jv_array_slice(a, 0, len)`
+/// keeps pointer, offset and size), so a fold source that slices the whole
+/// accumulator leaves the register on it -- `.[0:]|tostring` runs a real `INDEX`
+/// first and only the `tostring` declines to move it further. It was the one row
+/// #2159 moved from matching to refusing. Every row is a live jq 1.7.1 capture.
+#[test]
+fn test_foreach_full_slice_source_is_the_accumulator_3460() -> Result<()> {
+    // (document, filter, stdout, exit code)
+    const ROWS: &[(&str, &str, &str, i32)] = &[
+        (
+            r"[1,2]",
+            r"path(foreach (.[0:2]) as $k (.; .[0]))",
+            "[{\"start\":0,\"end\":2},0]\n",
+            0,
+        ),
+        (
+            r"[1,2]",
+            r"(foreach (.[0:]|tostring) as $k (.; .[0])) = 9",
+            "[9,2]\n",
+            0,
+        ),
+        (
+            r"[1,[2]]",
+            r"(foreach (.[0:(1+1)]|tostring) as $k (.; .[0])) = 9",
+            "[9,[2]]\n",
+            0,
+        ),
+    ];
+    for (doc, filter, want_stdout, want_code) in ROWS {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(
+            stdout, *want_stdout,
+            "`{filter}` on {doc}: stderr: {stderr:?}"
+        );
+        assert_eq!(code, *want_code, "`{filter}` on {doc}: stderr: {stderr:?}");
+    }
+    Ok(())
+}
+
+/// #3460, yq mode must-not-change: the carried identity turns a refusal into
+/// navigation, which on the write side is a write where yq no-ops, so it is jq
+/// mode only (ADR-0018: the mode decides). Under `--jq-extensions`, where
+/// `foreach` exists at all, `(foreach (1, .a) as $k (.; .a)) = 9` has to keep
+/// refusing its second step as before. This pins the row, not the gate:
+/// `accumulator_reached_register_at`'s `EvalTag::Jq` clause is belt and braces,
+/// and mutating it off leaves this row refusing (yq's route does not reach it).
+#[test]
+fn test_yq_foreach_accumulator_identity_stays_refuse_only_3460() -> Result<()> {
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .args([
+            "yq",
+            "--jq-extensions",
+            "-o",
+            "json",
+            "-I",
+            "0",
+            "(foreach (1, .a) as $k (.; .a)) = 9",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child
+                .stdin
+                .take()
+                .expect("piped")
+                .write_all(b"a:\n  a: 1\nb:\n  c: 2\n")?;
+            child.wait_with_output()
+        })?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "#3460 (yq): {output:?}");
+    assert!(
+        stderr.contains(r#"Invalid path expression near attempt to access element "a" of {"a":1}"#),
+        "#3460 (yq): {stderr:?}"
+    );
+    Ok(())
+}
+
 /// #2031 positive companion to the primary repro: a trackable source
 /// element's own per-element binding (`$k`, bound from `.a`'s own navigated
 /// value) *does* carry the register through when UPDATE references it

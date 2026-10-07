@@ -44133,29 +44133,10 @@ impl FoldRegister {
     /// `Optional(Slice)`, so each component is read through [`strip_optional`]
     /// (#3734), as [`slice_witnesses_node`] already does for the last one.
     fn whole_array_slice_of_register(&self, b: &PathBranch<'_>) -> bool {
-        if !slice_witnesses_node(&b.path, &b.value)
-            || !matches!(&self.value, OwnedValue::Array(items) if !items.is_empty())
-            || *b.value != self.value
-        {
-            return false;
-        }
-        let mut cur: &PathPrefix = &b.path;
-        while let PathPrefix::Node {
-            parent, component, ..
-        } = cur
-        {
-            if !matches!(
-                strip_optional(component),
-                Expr::Slice { .. } | Expr::SliceExpr { .. }
-            ) {
-                return false;
-            }
-            if Rc::ptr_eq(parent, &self.path) || **parent == *self.path {
-                return true;
-            }
-            cur = parent;
-        }
-        false
+        slice_witnesses_node(&b.path, &b.value)
+            && matches!(&self.value, OwnedValue::Array(items) if !items.is_empty())
+            && *b.value == self.value
+            && is_slice_chain_over(&b.path, &self.path)
     }
 
     /// Resolve `expr` (`UPDATE` or `EXTRACT`) against one fold step's own
@@ -46742,6 +46723,31 @@ fn slice_witnesses_node(path: &PathPrefix, value: &OwnedValue) -> bool {
     }
 }
 
+/// Whether `path` is `base` followed by one or more slice components, and nothing
+/// else (#3504). A slice under a postfix `?` (`.[0:]?`) is the same step: the
+/// wrapper only prunes a failure to slice, and a branch resolved under it carries
+/// `Optional(Slice)`, so each component is read through [`strip_optional`] (#3734),
+/// as [`slice_witnesses_node`] already does for the last one.
+fn is_slice_chain_over(path: &PathPrefix, base: &Rc<PathPrefix>) -> bool {
+    let mut cur = path;
+    while let PathPrefix::Node {
+        parent, component, ..
+    } = cur
+    {
+        if !matches!(
+            strip_optional(component),
+            Expr::Slice { .. } | Expr::SliceExpr { .. }
+        ) {
+            return false;
+        }
+        if Rc::ptr_eq(parent, base) || **parent == **base {
+            return true;
+        }
+        cur = parent;
+    }
+    false
+}
+
 /// The ambient `.` a fold's SOURCE runs against on **one** INIT fork, plus
 /// that ambient's own provenance relative to that fork's own
 /// [`FoldRegister`] -- exactly what [`drive_fold_source`] resolves the
@@ -47815,6 +47821,44 @@ fn settle_fold_alternative<S: EvalSemantics>(
     }
 }
 
+/// Whether the accumulator coming into a `foreach` step is the very node the
+/// step's register stands on, because the previous UPDATE *reached* it at that
+/// same absolute path (#3460): jq's `jv_identical(state, value_at_path)`, where
+/// `path()`'s document is immutable, so a node reached twice at one path is one
+/// `jv`.
+///
+/// `path(foreach (1, .a) as $k (.; .a))` on `{"a":{"a":1}}` is `["a"]` then
+/// `["a","a"]`: step 1's UPDATE leaves the accumulator on `.a`, which is where
+/// element 2's `.a` moves the register. [`register_identical`] cannot say so,
+/// because the accumulator's positional mark is only minted for a frame that
+/// tracks absolute positions ([`may_bind_navigated`]), and a fold's own program
+/// rarely asks for that.
+///
+/// Only a *reached* node qualifies -- `state_path` is `None` for a computed
+/// accumulator -- and a different path holding an equal value never does. A path
+/// ending in a slice is the same node only for a non-empty array
+/// ([`slice_witnesses_node`]): a string slice is a fresh string each time. The
+/// one different path that is the same node is a chain of slices over the
+/// accumulator's own non-empty array that kept every element, which shares its
+/// buffer (`path(foreach (.[0:2]) as $k (.; .[0]))` on `[1,2]`, the full-slice
+/// row of #3460).
+///
+/// jq mode only: this turns a refusal into navigation, which on the write side
+/// is a write where yq no-ops ([`foreach_step_register`]'s `Unmoved` arm).
+fn accumulator_reached_register_at<S: EvalSemantics>(
+    state_path: Option<&Rc<PathPrefix>>,
+    state: &OwnedValue,
+    step_reg: &FoldRegister,
+) -> bool {
+    S::TAG == EvalTag::Jq
+        && step_reg.trackable
+        && state_path.is_some_and(|path| {
+            (**path == *step_reg.path && slice_witnesses_node(&step_reg.path, state))
+                || (slice_is_same_array(state) && is_slice_chain_over(&step_reg.path, path))
+        })
+        && *state == step_reg.value
+}
+
 /// The register one `foreach` step's UPDATE and EXTRACT navigate against, and
 /// whether the accumulator coming into the step is at it -- jq's own
 /// `jv_identical(current_input, value_at_path)` (#2031, #2159, #2161).
@@ -47826,7 +47870,11 @@ fn settle_fold_alternative<S: EvalSemantics>(
 /// accumulator and its provenance coming into the step. Read-only: the sink
 /// keeps every `&mut` slot (`state`, `outcome`, `budget`, ...) to itself.
 ///
+/// `state_path` is the absolute path the accumulator was last *reached* at, when
+/// it was (#3460, [`accumulator_reached_register_at`]).
+///
 /// [`MovedRegister`] names the three sites that must agree on each variant.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: the accumulator's provenance is three facts (`state_at_register`, `state_snapshot`, `state_path`), and `reduce_update_at_register` mirrors the list
 fn foreach_step_register<S: EvalSemantics>(
     walked: Option<&PatternRegister>,
     elem: &FoldSourceValue,
@@ -47835,6 +47883,7 @@ fn foreach_step_register<S: EvalSemantics>(
     state: &OwnedValue,
     state_snapshot: &Snapshot,
     state_at_register: bool,
+    state_path: Option<&Rc<PathPrefix>>,
 ) -> (FoldRegister, bool) {
     // #2031: this step's own register -- where the pattern walk
     // left it, else the register-derived element's own position,
@@ -47848,7 +47897,8 @@ fn foreach_step_register<S: EvalSemantics>(
             frame: frame.extend(&walked_reg.path),
         };
         let at_register =
-            register_identical::<S>(&step_reg.value, &step_reg.frame, state, state_snapshot);
+            register_identical::<S>(&step_reg.value, &step_reg.frame, state, state_snapshot)
+                || accumulator_reached_register_at::<S>(state_path, state, &step_reg);
         return (step_reg, at_register);
     }
     match (&elem.register_path, &elem.moved) {
@@ -47866,7 +47916,8 @@ fn foreach_step_register<S: EvalSemantics>(
                 frame: frame.extend(path),
             };
             let at_register =
-                register_identical::<S>(&step_reg.value, &step_reg.frame, state, state_snapshot);
+                register_identical::<S>(&step_reg.value, &step_reg.frame, state, state_snapshot)
+                    || accumulator_reached_register_at::<S>(state_path, state, &step_reg);
             (step_reg, at_register)
         }
         // #2159: the element was computed *after* the source
@@ -47887,7 +47938,8 @@ fn foreach_step_register<S: EvalSemantics>(
                 frame: frame.extend(path),
             };
             let at_register =
-                register_identical::<S>(&step_reg.value, &step_reg.frame, state, state_snapshot);
+                register_identical::<S>(&step_reg.value, &step_reg.frame, state, state_snapshot)
+                    || accumulator_reached_register_at::<S>(state_path, state, &step_reg);
             (step_reg, at_register)
         }
         // #2159: the source navigated and then ran a stage the
@@ -48154,7 +48206,17 @@ fn reduce_update_at_register<S: EvalSemantics>(
     // to any `null`/`bool` register), and taking it would admit a write jq refuses
     // (`(reduce first(.a) as {a:$v0} (null; ($v0 | getpath([])))) = 9`).
     persistent
-        && foreach_step_register::<S>(walked, elem, reg, frame, acc, acc_snapshot, persistent).1
+        && foreach_step_register::<S>(
+            walked,
+            elem,
+            reg,
+            frame,
+            acc,
+            acc_snapshot,
+            persistent,
+            None,
+        )
+        .1
 }
 
 /// A `foreach` step's verdict on a `Demand::Stop` answered downstream of its
@@ -48821,6 +48883,10 @@ fn resolve_foreach<'a, S: EvalSemantics>(
         // document root, which is what the filed repro's `getpath(["a"])`
         // composes against inside UPDATE.
         let mut state_snapshot = accumulator_provenance::<S>(init_branch, frame);
+        // #3460: where the accumulator was last *reached*, absolute in the fold's
+        // frame like `reg.path` -- `None` for a computed one.
+        let mut state_path: Option<Rc<PathPrefix>> =
+            init_branch.trackable.then(|| Rc::clone(&init_branch.path));
         let aborted: StashedEscape = StashedVerdict::new();
         // The source is driven by demand (#2235): each element is folded
         // here, inside the drive, before the next one is pulled, so a step
@@ -48938,6 +49004,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                             &state,
                             &state_snapshot,
                             state_at_register,
+                            state_path.as_ref(),
                         );
                         if let Some(control) =
                             charge_alternative_update(&mut budget, &mut ran_update, "foreach")
@@ -49004,6 +49071,9 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                 slice_ok,
                             );
                             state = update_branch.value.clone().into_owned();
+                            state_path = update_branch
+                                .trackable
+                                .then(|| Rc::clone(&update_branch.path));
                             // #3580: this emission's register is the one UPDATE's
                             // output left, which is the entry's when it said so.
                             let update_unmoved = update_states_entry
@@ -49117,6 +49187,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                         if !delivered {
                             (state_at_register, state_snapshot) =
                                 reg.branch_provenance::<S>(None, frame);
+                            state_path = None;
                         }
                         if let ResolveFlow::Escaped(e) = flow {
                             outcome = Some(fold_escape_outcome(e, is_last, &aborted));
