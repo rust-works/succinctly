@@ -5376,7 +5376,9 @@ impl<'a> Parser<'a> {
             self.consume_keyword("add");
             return Ok(Some(Builtin::Add));
         }
-        // any, any(cond), any(gen; cond)
+        // any, any(cond), any(gen; cond). Bare `any` is real yq's own token; the predicate
+        // forms are jq-only surface (yq's grammar takes no argument, `bad expression`), so in
+        // yq mode they are gated behind `--jq-extensions` like `min_by` (#2005).
         if self.matches_keyword("any") {
             let keyword_start = self.pos;
             self.consume_keyword("any");
@@ -5399,17 +5401,19 @@ impl<'a> Parser<'a> {
                         );
                     }
                     self.next();
+                    self.reject_unless_jq_extensions_at("any(gen; cond)", keyword_start)?;
                     return Ok(Some(Builtin::AnyCond(Box::new(f), Box::new(cond))));
                 }
                 if self.peek() != Some(')') {
                     return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![f]);
                 }
                 self.next();
+                self.reject_unless_jq_extensions_at("any(cond)", keyword_start)?;
                 return Ok(Some(Builtin::AnyF(Box::new(f))));
             }
             return Ok(Some(Builtin::Any));
         }
-        // all, all(cond), all(gen; cond)
+        // all, all(cond), all(gen; cond): gated the same way as `any` above (#2005).
         if self.matches_keyword("all") {
             let keyword_start = self.pos;
             self.consume_keyword("all");
@@ -5432,12 +5436,14 @@ impl<'a> Parser<'a> {
                         );
                     }
                     self.next();
+                    self.reject_unless_jq_extensions_at("all(gen; cond)", keyword_start)?;
                     return Ok(Some(Builtin::AllCond(Box::new(f), Box::new(cond))));
                 }
                 if self.peek() != Some(')') {
                     return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![f]);
                 }
                 self.next();
+                self.reject_unless_jq_extensions_at("all(cond)", keyword_start)?;
                 return Ok(Some(Builtin::AllF(Box::new(f))));
             }
             return Ok(Some(Builtin::All));

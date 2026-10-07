@@ -2476,6 +2476,13 @@ fn test_yq_default_rejects_jq_only_builtins_1512() -> Result<()> {
         // `path` (not in this list) stays ungated -- see
         // test_yq_bare_path_ungated_2430.
         "path(.a)",
+        // #2005: real yq's `any`/`all` take no argument (its lexer: `bad expression`);
+        // the predicate forms are jq's. Bare `any`/`all` stay native -- see
+        // test_yq_any_all_predicate_forms_gated_2005.
+        "any(. > 3)",
+        "all(. > 0)",
+        "any(.[]; . > 3)",
+        "all(.[]; . > 0)",
     ] {
         let (_out, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[])?;
         assert_ne!(code, 0, "filter {filter:?} should be rejected by default");
@@ -2483,6 +2490,70 @@ fn test_yq_default_rejects_jq_only_builtins_1512() -> Result<()> {
             stderr.contains("--jq-extensions"),
             "filter {filter:?} stderr should mention --jq-extensions, got: {stderr}"
         );
+    }
+    Ok(())
+}
+
+/// #2005: real yq (v4.53.3) has `any` and `all` as argument-less tokens, so every predicate
+/// spelling -- `any(cond)`, `all(cond)`, `any(gen; cond)`, `all(gen; cond)` -- is `bad
+/// expression, please check expression syntax` there. They are jq surface, gated behind
+/// `--jq-extensions` like `min_by`; under the flag they are jq's own (`{"a":1} | all(. > 0)` is
+/// `true`, `5 | any(. > 3)` is jq's `Cannot iterate over number (5)`, which is already jq 1.7.1's
+/// text). The bare forms stay native with their #1901 wording, and a user-defined `any`/`all`
+/// still wins over the gate, as it does for `min_by`.
+#[test]
+fn test_yq_any_all_predicate_forms_gated_2005() -> Result<()> {
+    for (filter, name, position) in [
+        ("5 | any(. > 3)", "any(cond)", 4),
+        ("{\"a\":1} | all(. > 0)", "all(cond)", 10),
+        ("[1,5] | any(.[]; . > 3)", "any(gen; cond)", 8),
+        ("[1,5] | all(.[]; . > 0)", "all(gen; cond)", 8),
+        ("[1,2] | map(any(. > 1))", "any(cond)", 12),
+    ] {
+        let (out, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[])?;
+        assert_eq!(out, "", "{filter:?}: {stderr}");
+        assert_eq!(code, 1, "{filter:?}: {stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "parse error at position {position}: \"{name}\" is not part of yq's syntax; \
+                 pass --jq-extensions"
+            )),
+            "{filter:?}: {stderr}"
+        );
+    }
+    for (filter, want) in [
+        ("{\"a\":1} | all(. > 0)", "true"),
+        ("[1,5] | any(.[]; . > 3)", "true"),
+        ("[1,5] | all(.[]; . > 3)", "false"),
+        ("[1,5] | any(. > 3)", "true"),
+    ] {
+        let (out, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &["--jq-extensions"])?;
+        assert_eq!(code, 0, "{filter:?}: {stderr}");
+        assert_eq!(out.trim(), want, "{filter:?}");
+    }
+    // jq's own wording under the flag, unchanged: no yq oracle exists for the syntax.
+    let (_out, stderr, code) =
+        run_yq_stdin_with_stderr("5 | any(. > 3)", "a: 1\n", &["--jq-extensions"])?;
+    assert_eq!(code, 1, "{stderr}");
+    assert!(
+        stderr.contains("Cannot iterate over number (5)"),
+        "{stderr}"
+    );
+    // Bare forms: still native, #1901's wording.
+    let (_out, stderr, code) = run_yq_stdin_with_stderr("5 | any", "a: 1\n", &[])?;
+    assert_eq!(code, 1, "{stderr}");
+    assert!(
+        stderr.contains("any only supports arrays, was !!int"),
+        "{stderr}"
+    );
+    // A user definition of the same name and arity is not the builtin and is not gated.
+    for (filter, want) in [
+        ("def any(f): \"mine\"; any(.)", "\"mine\""),
+        ("def all(f; g): \"mine\"; all(.; .)", "\"mine\""),
+    ] {
+        let (out, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &["-o=json"])?;
+        assert_eq!(code, 0, "{filter:?}: {stderr}");
+        assert_eq!(out.trim(), want, "{filter:?}");
     }
     Ok(())
 }
@@ -2690,6 +2761,10 @@ fn test_yq_jq_extensions_flag_enables_jq_only_builtins_1512() -> Result<()> {
         "\"ABC\" | ascii_downcase",
         "\"abc\" | ascii_upcase",
         "path(.a)",
+        "[1,5] | any(. > 3)",
+        "[1,5] | all(. > 0)",
+        "[1,5] | any(.[]; . > 3)",
+        "[1,5] | all(.[]; . > 0)",
     ] {
         let (_out, stderr, code) =
             run_yq_stdin_with_stderr(filter, "a: 1\n", &["--jq-extensions"])?;
@@ -37576,18 +37651,25 @@ fn test_negative_index_out_of_range_survives_try_catch_2254() -> Result<()> {
 /// raising. Also pins `eval_owned_fast_path`'s own negative-index check
 /// (reached from `eval_each_owned`, `any`/`all`'s own generator-argument
 /// evaluator), which had the same now-removed `optional`-suppression gap.
+/// `any(gen; cond)` is jq surface, so it needs `--jq-extensions` (#2005).
 #[test]
 fn test_negative_index_out_of_range_survives_any_all_generator_2254() -> Result<()> {
-    let (out, stderr, code) =
-        run_yq_stdin_with_stderr("any(.a[-5]?; .)", "a: [1, 2]\n", &["-o", "json"])?;
+    let (out, stderr, code) = run_yq_stdin_with_stderr(
+        "any(.a[-5]?; .)",
+        "a: [1, 2]\n",
+        &["--jq-extensions", "-o", "json"],
+    )?;
     assert_eq!(code, 1, "out: {out:?}");
     assert_eq!(
         stderr.trim(),
         "Error: index [-5] out of range, array size is 2"
     );
 
-    let (out, stderr, code) =
-        run_yq_stdin_with_stderr("all(.a[-5]?; .)", "a: [1, 2]\n", &["-o", "json"])?;
+    let (out, stderr, code) = run_yq_stdin_with_stderr(
+        "all(.a[-5]?; .)",
+        "a: [1, 2]\n",
+        &["--jq-extensions", "-o", "json"],
+    )?;
     assert_eq!(code, 1, "out: {out:?}");
     assert_eq!(
         stderr.trim(),

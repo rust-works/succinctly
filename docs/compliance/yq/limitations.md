@@ -2632,12 +2632,15 @@ Both filed together as [#1998](https://github.com/rust-works/succinctly/issues/1
 **Two more items found reviewing the fix itself, also not fixed here:**
 
 - **`any(cond)`/`all(cond)`/`any(gen; cond)`/`all(gen; cond)`** (the predicate-argument forms,
-  dispatched from `Builtin::AnyF`/`AllF`/`AnyCond`/`AllCond`) still leak jq's own wording and
-  still allow full object iteration, unlike the now-fixed bare forms — and real yq's own lexer
-  rejects this syntax entirely regardless of arity (`bad expression, please check expression
-  syntax`), which `succinctly yq`'s parser doesn't gate behind `--jq-extensions` the way
-  neighboring jq-only builtins like `min_by` do. Filed as
-  [#2005](https://github.com/rust-works/succinctly/issues/2005).
+  dispatched from `Builtin::AnyF`/`AllF`/`AnyCond`/`AllCond`) leaked jq's own wording and let a
+  mapping through, and real yq's own lexer rejects this syntax entirely regardless of arity
+  (`bad expression, please check expression syntax`). *Closed* by gating the syntax behind
+  `--jq-extensions` like its neighbour `min_by` ([#2005](https://github.com/rust-works/succinctly/issues/2005),
+  `test_yq_any_all_predicate_forms_gated_2005`): without the flag the four spellings are refused at
+  parse time, with it they are jq's own surface, whose wording already matches jq 1.7.1 (`5 |
+  any(. > 3)` is `Cannot iterate over number (5)`), so no yq-style wording is invented for a
+  shape real yq never accepts. Bare `any`/`all` stay native. Real yq's own predicate spelling,
+  `any_c(cond)`/`all_c(cond)`, is a separate, unimplemented builtin.
 - **`with_entries(f)` rejects numeric keys** that real yq coerces to strings on reassembly
   (`[1,2] | with_entries(.)` succeeds on real yq, errors `Cannot use number (0) as object key`
   on succinctly) — a functional bug on well-formed input, unrelated to this section's

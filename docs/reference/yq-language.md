@@ -544,6 +544,7 @@ surface (#1512):
 | `todate`, `fromdate`                                 | ISO 8601 shortcuts (#1907)                    |
 | `todateiso8601`, `fromdateiso8601`                   | ISO 8601, fixed format (#1907)                |
 | `add`                                                | Sum of an array/stream (#1714)                |
+| `any(cond)`, `all(cond)`, `any(gen; cond)`, `all(gen; cond)` | Predicate forms of `any`/`all`; bare `any`/`all` are native (#2005) |
 | `min_by(f)`, `max_by(f)`                             | Extremum by a key function (#1714)            |
 | `implode`                                            | Codepoint array to string (#1714)             |
 | `INDEX(idx_expr)`, `INDEX(stream; idx_expr)`         | Build an object keyed by an index expr (#1714)|
