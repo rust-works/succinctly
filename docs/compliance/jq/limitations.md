@@ -7210,6 +7210,13 @@ reads) plus two consequences of the route:
   fails with `nesting depth exceeds limit of 384` at exit 1, the answer the default route
   gives a 384-level document (#1819). A document at jq's own limit of 256 now reads and prints
   under `-s`, where the old route's extra array level pushed it over its own ceiling.
+  **The routes that still materialize keep that ceiling, and it is a divergence from jq:** a
+  256-level document under `--seq -s`, or under `-s` with `input`/`inputs`, exits 5 with
+  `nesting depth exceeds limit of 256` (the slurp array is the 257th level), where jq 1.7.1
+  reads and prints it (a 255-level document is fine on both). It is the evaluator's own
+  materialization ceiling (`MAX_NESTING_DEPTH`) and fails cleanly, never as a panic (#2299);
+  it goes away for these routes only if they stop materializing. Pinned by
+  `test_seq_slurp_materializes_lazy_results_and_the_wrap_boundary_2847`.
 - `--preserve-input -s` echoes each value's source spelling (whitespace, escapes, duplicate
   keys, `nan`) the way that flag already does on the default route, where it used to print the
   normalized value. There is no jq oracle for the flag.
