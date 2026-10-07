@@ -63857,6 +63857,51 @@ fn test_nested_foreach_on_a_null_register_answers_the_member_it_moved_to_3939() 
             "",
             0,
         ),
+        // A `true`/`false`/`null` member is the outer accumulator's node by kind when INIT is
+        // that literal (a literal does not move the register), on a document that is not
+        // itself `null`; the write lands on the member.
+        (
+            r#"{"a":true}"#,
+            r"path(foreach (foreach . as {a:$a} (0; .; .)) as $x (true; .; .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"(foreach (foreach . as {a:$a} (0; .; .)) as $x (false; .; .)) = 5",
+            "{\"a\":5}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"path(foreach (foreach . as {a:$a} (0; .; .)) as $x (null; .; .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"path(foreach (foreach .a as $a (0; .; .)) as $x (true; .; .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[true]}"#,
+            r"(foreach (foreach . as {a:[$a]} (0; .; .)) as $x (true; .; .)) |= false",
+            "{\"a\":[false]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"path(foreach (foreach . as {a:$a} (0; .; .)) as $x (false; .; .))",
+            "",
+            "Invalid path expression with result false",
+            5,
+        ),
         // Contrasts: a register that is not `null`/a boolean is not the outer accumulator's
         // node, a navigated INIT leaves the outer register elsewhere, and a nested `reduce`
         // restores the register.

@@ -49268,8 +49268,10 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                             // extract's own `AtEntry` names none, and an outer fold reading
                             // this `foreach` as its source would take the register as lost
                             // instead of placing its own there (`jv_identical` admits the
-                            // kind, [`null_bool_identical`]). Only an emission at exactly the
-                            // register's path: one that navigated further keeps its own answer.
+                            // kind, [`null_bool_identical`]). Only an `AtEntry` emission at
+                            // exactly the register's path: that statement is the extract
+                            // resolving against the step register itself, so an emission that
+                            // navigated further, or states anything else, keeps its own answer.
                             let walked_at = (S::TAG == EvalTag::Jq
                                 && active_reg.trackable
                                 && active_reg.path.depth() > 0
@@ -49286,10 +49288,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                 } else if let Some(register) = walked_at.filter(|reg| {
                                     !branch.trackable
                                         && *branch.path == *reg.path
-                                        && matches!(
-                                            branch.register,
-                                            BranchRegister::None | BranchRegister::AtEntry
-                                        )
+                                        && matches!(branch.register, BranchRegister::AtEntry)
                                 }) {
                                     sink(branch.with_register(BranchRegister::Unmoved(Cow::Owned(
                                         register.value.clone(),
