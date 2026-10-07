@@ -64220,6 +64220,59 @@ fn test_nested_foreach_destructuring_the_register_moves_it_for_the_outer_fold_38
     ])
 }
 
+/// #3948: the `?//` chain form of #3939. jq's register follows the first alternative whose
+/// pattern matches, so on a `null` document `. as [$a] ?// {a:$a}` leaves it on `[0]` and
+/// `. as {a:$a} ?// [$a]` on `["a"]`; a chain read by value answered the root, so a write
+/// through it replaced the document. Every row captured from jq 1.7.1.
+#[test]
+fn test_nested_foreach_pattern_chain_on_a_null_register_answers_the_member_it_moved_to_3948(
+) -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r"null",
+            r"path(foreach (foreach . as [$a] ?// {a:$a} (0; .; .)) as $x (.; .; .))",
+            "[0]\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"path(foreach (foreach . as {a:$a} ?// [$a] (0; .; .)) as $x (.; .; .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"(foreach (foreach . as {a:$a} ?// [$a] (0; .; .)) as $x (.; .; .)) = 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"(foreach (foreach . as [$a] ?// {a:$a} (0; .; .)) as $x (.; .; .)) |= 9",
+            "[9]\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"(foreach (foreach . as {a:$a} ?// $a (0; .; .)) as $x (.; .; .)) = 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"path(foreach (foreach . as [$a] ?// [$a] (0; .; .)) as $x (.; .; .))",
+            "[0]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
 /// #3939: on a `null` (or boolean) register a nested `foreach` leaves jq's register on the
 /// member its pattern or source navigated to, and `jv_identical` admits the outer EXTRACT's
 /// `null` there by kind, so the outer fold's path is that member's, not the root's.
