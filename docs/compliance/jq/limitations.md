@@ -3170,7 +3170,10 @@ answers `["b"]` — and classified the two residuals appended below):
   - **jq's pointer identity**: `tostring` of a string is the same `jv`
     (`path(foreach (.b|tostring) as $k (.; $k))` on `{"b":"s"}` is `["b"]`) -- a general
     path-mode gap, not a `foreach` one (`path(.b|tostring)` refuses the same way), and still a
-    refusal; it predates #2159. Tracked as
+    refusal; it predates #2159.
+    The same gap shows on a bare string document once the sweep has one (#3930): `..|tostring`,
+    `recurse|tostring`, `walk(.)|tostring` and `.[0:]|tostring`/`.[0:1]|tostring`/`.[0:(1+1)]|tostring`
+    over `"s"` or `""` are refusals where jq answers, never a write. Tracked as
     [#3460](https://github.com/rust-works/succinctly/issues/3460). Closed by #3460's first
     half: the accumulator's node carried from one source element to the next
     (`path(foreach (1, .a) as $k (.; .a))` on `{"a":{"a":1}}` is `["a"]` then `["a","a"]`,

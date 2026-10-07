@@ -66342,6 +66342,9 @@ fn test_reduce_string_slice_accumulator_is_not_the_register_3930() -> Result<()>
         (r#""abc""#, r"path(reduce (.[0:2]) as $k (.; $k))"),
         (r#"{"a":"s"}"#, r"path(.a | reduce (.[0:2]) as $k (.; $k))"),
         (r"[]", r"path(reduce (.[0:0]) as $k (.; $k))"),
+        // the optional slice is the same step (`strip_optional`)
+        (r#""s""#, r"path(reduce (.[0:2]?) as $k (.; $k))"),
+        (r#""s""#, r"(reduce (.[0:2]?) as $k (.; $k)) = 9"),
     ] {
         let (out, err, code) = run_jq_full(&["-c", filter], Some(&format!("{input}\n")))?;
         assert_eq!(
