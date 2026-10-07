@@ -64529,6 +64529,117 @@ fn test_foreach_source_destructure_after_a_no_op_leading_stage_raises_3940() -> 
     ])
 }
 
+/// #3883: a nested `foreach` whose source navigates leaves jq's register on each element it
+/// visits, and the outer fold's `null`/boolean accumulator is identical to a `null`/boolean
+/// member by kind, so the outer path is that member's: `path(foreach (foreach .[]? as $x (0;
+/// .+1)) as $k (null; .))` on `{"a":null,"b":null}` is `["a"]` then `["b"]`, and a write lands
+/// on both. The nested emission was demoted to the root with no register and read as lost, so it
+/// refused. An UPDATE or EXTRACT that can navigate keeps its own answer, and a member that is
+/// not `null`/a boolean still refuses. Every row captured from jq 1.7.1, on the stdin and `-n`
+/// routes.
+#[test]
+fn test_nested_navigating_foreach_states_the_register_its_source_left_3883() -> Result<()> {
+    let both = r#"{"a":null,"b":null}"#;
+    assert_path_rows_both_routes_3749(&[
+        (
+            both,
+            r"path(foreach (foreach .[]? as $x (0; .+1)) as $k (null; .))",
+            "[\"a\"]\n[\"b\"]\n",
+            "",
+            0,
+        ),
+        (
+            both,
+            r"(foreach (foreach .[]? as $x (0; .+1)) as $k (null; .)) = 9",
+            "{\"a\":9,\"b\":9}\n",
+            "",
+            0,
+        ),
+        (
+            both,
+            r"path(foreach (foreach .[]? as $x (0; .+1)) as $k (null; .a))",
+            "[\"a\",\"a\"]\n[\"b\",\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            both,
+            r"path(foreach (foreach .[]? as $x (0; .+1; .+2)) as $k (null; .))",
+            "[\"a\"]\n[\"b\"]\n",
+            "",
+            0,
+        ),
+        (
+            both,
+            r"path(foreach (foreach .[]? as $x (0; .+1; tostring)) as $k (null; .))",
+            "[\"a\"]\n[\"b\"]\n",
+            "",
+            0,
+        ),
+        (
+            both,
+            r"path(foreach (foreach .[] as $x (0; .+1)) as $k (null; .))",
+            "[\"a\"]\n[\"b\"]\n",
+            "",
+            0,
+        ),
+        (
+            both,
+            r"path(foreach (foreach .a as $x (0; .+1)) as $k (null; .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            "[null,null]",
+            r"path(foreach (foreach .[] as $x (0; .+1)) as $k (null; .))",
+            "[0]\n[1]\n",
+            "",
+            0,
+        ),
+        (
+            "[null,null]",
+            r"del(foreach (foreach .[] as $x (0; .+1)) as $k (null; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        // A boolean member is the accumulator's node by kind as well; the first member
+        // (`true`) is, the second (`false`) is not.
+        (
+            r#"{"a":true,"b":false}"#,
+            r"path(foreach (foreach .[]? as $x (0; .+1)) as $k (true; .))",
+            "[\"a\"]\n",
+            "Invalid path expression with result true",
+            5,
+        ),
+        // Contrasts: a member that is not `null`/a boolean is not the accumulator's node, an
+        // accumulator that is the document is not a member, and an UPDATE that navigates
+        // keeps its own refusal.
+        (
+            r#"{"a":{"a":1},"k":"a"}"#,
+            r"path(foreach (foreach .[]? as $x (0; .+1)) as $k (null; .))",
+            "",
+            "Invalid path expression with result null",
+            5,
+        ),
+        (
+            r#"{"a":{"a":1},"k":"a"}"#,
+            r"(foreach (foreach .[]? as $x (0; .+1)) as $k (.; .; .)) = 9",
+            "",
+            r#"Invalid path expression with result {"a":{"a":1},"k":"a"}"#,
+            5,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"path(foreach (foreach .[]? as $x (0; .a?)) as $k (null; .))",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of 0"#,
+            5,
+        ),
+    ])
+}
+
 /// #3790: a `foreach` whose SOURCE is the register itself (`.`, or a comma or pipe of
 /// them) emits an element that is the register's own node, so a bare `$k` bound to
 /// it is a path: `path(foreach . as $k (0; $k; .))` is `[]` for any document, and a

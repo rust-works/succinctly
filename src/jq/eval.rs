@@ -49433,6 +49433,8 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                             // exactly the register's path: that statement is the extract
                             // resolving against the step register itself, so an emission that
                             // navigated further, or states anything else, keeps its own answer.
+                            let step_cannot_move = cannot_move_register(update)
+                                && extract.map_or(true, cannot_move_register);
                             let walked_at = (S::TAG == EvalTag::Jq
                                 && active_reg.trackable
                                 && active_reg.path.depth() > 0
@@ -49444,13 +49446,31 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                         Cow::Borrowed(value),
                                     )))
                                 } else if let Some(register) = walked_at.filter(|reg| {
+                                    // #3883: nothing after the source moved the register, so a
+                                    // computed emission leaves it where the source put it -- the
+                                    // step register's own path, which a branch demoted to the
+                                    // root does not carry. An `AtEntry` at exactly that path
+                                    // says the same on its own (#3939).
                                     !branch.trackable
-                                        && *branch.path == *reg.path
-                                        && matches!(branch.register, BranchRegister::AtEntry)
+                                        && match branch.register {
+                                            BranchRegister::AtEntry
+                                                if *branch.path == *reg.path =>
+                                            {
+                                                true
+                                            }
+                                            BranchRegister::None | BranchRegister::AtEntry => {
+                                                step_cannot_move
+                                                    && (branch.path.depth() == 0
+                                                        || *branch.path == *reg.path)
+                                            }
+                                            _ => false,
+                                        }
                                 }) {
-                                    sink(branch.with_register(BranchRegister::Unmoved(Cow::Owned(
-                                        register.value.clone(),
-                                    ))))
+                                    let mut moved = branch.with_register(BranchRegister::Unmoved(
+                                        Cow::Owned(register.value.clone()),
+                                    ));
+                                    moved.path = Rc::clone(&register.path);
+                                    sink(moved)
                                 } else {
                                     sink(branch)
                                 }
