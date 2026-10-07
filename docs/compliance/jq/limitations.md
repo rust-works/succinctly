@@ -2309,8 +2309,12 @@ is the revert that established what the other one costs.
    ([#3723](https://github.com/rust-works/succinctly/issues/3723)); #3713 closed those direct
    shapes (its entry is below), and [#3736](https://github.com/rust-works/succinctly/issues/3736)
    observes the trailing `f` inline, which also answers the `[walk(f)]` collect whose refusal a
-   later `try` used to swallow (`test_walk_over_an_array_observes_trailing_f_inline_3736`). Both
-   rules are jq mode only, like the rest of the table. (The always-raises group as a
+   later `try` used to swallow (`test_walk_over_an_array_observes_trailing_f_inline_3736`, and the
+   wider grid in `test_walk_over_an_array_that_produces_raises_where_jq_raises_3723`). One shape of
+   that collect still differs: a collect holding a `getpath` is evaluated by value (#2759), so
+   `{"a":[1]} | path(. as $x | [walk(getpath(["a"])?)] | try .[0])` exits 5 in jq and 0 here
+   (`test_walk_over_an_array_residual_getpath_collect_differs_from_jq_3723`, which a fix flips on
+   purpose). Both rules are jq mode only, like the rest of the table. (The always-raises group as a
    `reduce`/`foreach` *source* was the same gap until [#3726](https://github.com/rust-works/succinctly/issues/3726); it is
    closed, pinned by
    `test_reduce_foreach_source_that_always_raises_raises_in_path_position_3726`, and the yq side

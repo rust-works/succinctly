@@ -51967,6 +51967,25 @@ fn yq_walk_over_a_scalar_keeps_the_by_value_route_3713() -> Result<()> {
     Ok(())
 }
 
+/// #3723/#3736 observe `walk(f)`'s trailing `f` on a rebuilt array in jq
+/// mode only. Real yq's lexer rejects `walk` (v4.53.3), so under `--jq-extensions`
+/// it is a succinctly extension with no oracle to match (ADR-0018 rule 5), and yq
+/// mode keeps the answer it gave before: the collect and the `try` around the
+/// walk both stay silent where jq mode refuses the collect (exit 5).
+#[test]
+fn yq_walk_over_an_array_that_produces_keeps_the_by_value_route_3723() -> Result<()> {
+    let args = ["--jq-extensions", "-o=json", "-I=0"];
+    for filter in [
+        r#"[path(. as $x | [walk(if type == "array" then .[0] else . end)] | try .[0])]"#,
+        r#"[path(try walk(if type == "array" then .[0] else . end))]"#,
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, "[[1]]\n", &args)?;
+        assert_eq!(code, 0, "#3723 yq: `{filter}`");
+        assert_eq!(stdout, "[]\n", "#3723 yq: `{filter}`");
+    }
+    Ok(())
+}
+
 /// #3773: `recurse(.[]?)` reads the same position off each node over YAML as it
 /// does in jq mode: `key`, `parent` and `path` after it answer what they answer
 /// after `..`, instead of losing the node's position inside a collect.
