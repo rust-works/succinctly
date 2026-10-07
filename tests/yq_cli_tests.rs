@@ -2756,6 +2756,191 @@ fn test_yq_any_c_all_c_shadowing_and_jq_mode_3966() -> Result<()> {
     Ok(())
 }
 
+/// #2817: yq's `L // R` decides per left output -- a truthy one passes, a falsy one is replaced in
+/// place by `R`'s outputs, or stays itself when `R` yields nothing -- and `R` answers once on its
+/// own only when `L` yields nothing. Every row is a capture from yq v4.53.3, and each runs on the
+/// cursor route and on the DOM route (`--arg z 1` forces the latter), which must agree. jq's rule
+/// (collect the truthy outputs, fall back only when none) is unchanged in `succinctly jq`; its
+/// half is the last block.
+#[test]
+fn test_yq_alternative_decides_per_left_output_2817() -> Result<()> {
+    for (input, filter, want) in [
+        // per left output, in place
+        ("{}", "(1, null) // 2", "1\n2"),
+        ("{}", "(null, 1) // 2", "2\n1"),
+        ("{}", "(null, false) // 2", "2\n2"),
+        ("{}", "(null, 1, null) // 2", "2\n1\n2"),
+        ("{}", "(false, null) // (3, 4)", "3\n4\n3\n4"),
+        ("{}", "(null, 1) // (3, 4)", "3\n4\n1"),
+        ("{}", "(1, 2) // 3", "1\n2"),
+        ("{}", "(false, 0) // 9", "9\n0"),
+        ("{}", r#"(0, false, "") // 9"#, "0\n9\n\"\""),
+        // an empty right side keeps the falsy left value
+        ("{}", "(null // .[])", "null"),
+        ("{}", "(false // .[])", "false"),
+        ("{}", "(null, 2) // select(false)", "null\n2"),
+        ("{}", "(null, null) // select(false)", "null\nnull"),
+        (r#"{"a":1}"#, "(null // key)", "null"),
+        (r#"{"a":1}"#, "(null // .[])", "1"),
+        (
+            r#"{"a":1}"#,
+            "(false, 1, null) // (3, select(false))",
+            "3\n1\n3",
+        ),
+        // an empty left lets the right answer, once
+        ("{}", "select(false) // 7", "7"),
+        ("{}", "(.a, .b) // 7", "7\n7"),
+        (r#"{"a":1}"#, "(select(false), .a) // 7", "1"),
+        // the right side is not evaluated while every left output is truthy
+        ("{}", r#"1 // error("y")"#, "1"),
+        // chains
+        ("{}", "(null // null) // 3", "3"),
+        ("{}", "null // null // 3", "3"),
+        ("{}", "((null, 1) // 2) // 3", "2\n1"),
+        // documents
+        (r#"{"a":null,"b":2}"#, ".a // .b", "2"),
+        (r#"{"a":0,"b":2}"#, ".a // .b", "0"),
+        (r#"{"a":[null,1]}"#, ".a[] // 9", "9\n1"),
+        (r#"{"a":[null,1,false]}"#, "[.a[] // 9]", "[9,1,9]"),
+        (
+            r#"{"a":[null,1,false]}"#,
+            r#".a | map(. // "x")"#,
+            r#"["x",1,"x"]"#,
+        ),
+        // outputs stay where they stood
+        (
+            r#"{"a":null,"b":2,"c":3}"#,
+            "(.a, .b) // .c | key",
+            "\"c\"\n\"b\"",
+        ),
+        (
+            r#"{"a":null,"b":2,"c":3}"#,
+            "(.a, .b) // .c | path",
+            "[\"c\"]\n[\"b\"]",
+        ),
+        (
+            r#"{"a":null,"b":2,"c":3}"#,
+            "(.a, .b) // select(false) | key",
+            "\"a\"\n\"b\"",
+        ),
+        (
+            r#"{"a":null,"b":2,"c":3}"#,
+            ".a // select(false) | path",
+            "[\"a\"]",
+        ),
+        (
+            r#"{"a":null,"b":2,"c":3}"#,
+            "(.a, .b, .a) // (.c, .b) | key",
+            "\"c\"\n\"b\"\n\"b\"\n\"c\"\n\"b\"",
+        ),
+        (r#"{"a":[null,1]}"#, ".a[] // 9 | path", "[]\n[\"a\",1]"),
+        (r#"{"a":[null,1]}"#, ".a[] // select(false) | key", "0\n1"),
+        // a constructed value is an owned value, which takes the eager evaluator rather than the
+        // cursor route the rows above run on: the same answers
+        ("{}", "[null, 1, false] | (.[] // 9)", "9\n1\n9"),
+        ("{}", "[null, 1, false] | [.[] // 9]", "[9,1,9]"),
+        ("{}", "([null, 1] | .[]) // 9", "9\n1"),
+        ("{}", "[(null, 1) // 2]", "[2,1]"),
+        ("{}", "[(null, 1, null) // (3, 4)]", "[3,4,1,3,4]"),
+        ("{}", "[null, 1] | (.[] // select(false))", "null\n1"),
+        (
+            "{}",
+            "[null, 1] | .[] // select(false) | [.]",
+            "[null]\n[1]",
+        ),
+        ("{}", "[select(false) // 7]", "[7]"),
+        ("{}", "[(.a, .b) // 7]", "[7,7]"),
+        ("{}", "[(null, 2) // select(false)]", "[null,2]"),
+        ("{}", r#"{"x": (null, 1) // 2}"#, "{\"x\":2}\n{\"x\":1}"),
+        ("{}", "[1,2] | .[] // 9 | . + 1", "2\n3"),
+        ("{}", "[null, 1] | (.[] // 9) as $x | $x", "9\n1"),
+        ("{}", "[null, 1] | (.[] // 9) | select(. == 1)", "1"),
+        ("{}", "[null, 1] | [(.[] // 9) | select(. == 9)]", "[9]"),
+        ("{}", "[null, 1] | ((.[] // 9) == 9)", "true\nfalse"),
+        ("{}", "[null, 1] | ((.[] // 9) and true)", "true\ntrue"),
+        ("{}", "[null, 1] | (.[] // 9) + 1", "10\n2"),
+        (
+            "{}",
+            r#"[null, 1] | {"k": (.[] // 9)}"#,
+            "{\"k\":9}\n{\"k\":1}",
+        ),
+        ("{}", "[null, 1] | ((.[] // 9) | tostring)", "\"9\"\n\"1\""),
+        ("{}", r#"[null, 1] | "v\((.[] // 9))""#, "\"v9\""),
+        // writes and bindings read the same outputs
+        (
+            r#"{"a":null,"b":3}"#,
+            ".c = (.a // .b)",
+            r#"{"a":null,"b":3,"c":3}"#,
+        ),
+        (
+            r#"{"a":1,"b":3}"#,
+            ".c = (.a // .b)",
+            r#"{"a":1,"b":3,"c":1}"#,
+        ),
+        (r#"{"a":null,"b":3}"#, "(.a // .b) as $x | $x", "3"),
+    ] {
+        for route in [&[][..], &["--arg", "z", "1"][..]] {
+            let mut args = vec!["-o", "json", "-I", "0"];
+            args.extend_from_slice(route);
+            let (out, stderr, code) = run_yq_stdin_with_stderr(filter, input, &args)?;
+            assert_eq!(code, 0, "{input} | {filter} {route:?}: {stderr}");
+            assert_eq!(out.trim(), want, "{input} | {filter} {route:?}");
+        }
+    }
+    // a left error raises, and does not select the right side
+    for (filter, message) in [
+        (r#"error("x") // 3"#, "x"),
+        (r#"(1, error("x")) // 3"#, "x"),
+        (r#"(null, error("x")) // 3"#, "x"),
+        (r#"(error("x"), 1) // 3"#, "x"),
+        (r#"null // error("y")"#, "y"),
+        (r#"(1, null) // error("y")"#, "y"),
+    ] {
+        let (_out, stderr, code) = run_yq_stdin_with_stderr(filter, "{}", &["-o", "json"])?;
+        assert_eq!(code, 1, "{filter}");
+        assert!(stderr.contains(message), "{filter}: {stderr}");
+    }
+    // jq's own rule is unchanged
+    for (filter, want) in [
+        ("(1, null) // 2", "1"),
+        ("(null, 1) // 2", "1"),
+        ("(null, false) // 2", "2"),
+        ("(null // empty)", ""),
+        ("(false, null) // (3, 4)", "3\n4"),
+    ] {
+        let (out, stderr, code) = run_jq_stdin_with_stderr(filter, "{}", &["-c"])?;
+        assert_eq!(code, 0, "{filter}: {stderr}");
+        assert_eq!(out.trim(), want, "jq: {filter}");
+    }
+    Ok(())
+}
+
+/// #2817: a pipe headed by yq's `//` carries each output to the next stage with its own source
+/// position, so `line`/`column` read after the operator see the node a truthy output came from
+/// and 0 for a replacement computed by the right side -- including the mix of the two
+/// (`.a[] // 9 | line`), which a collected result has no shape for. Captured from yq v4.53.3.
+#[test]
+fn test_yq_alternative_keeps_source_positions_2817() -> Result<()> {
+    let input = "a:\n  - 1\n  - 2\n  - null\n  - 3\n";
+    for (filter, want) in [
+        (".a[] // 9 | line", "2\n3\n0\n5"),
+        (".a[] // 9 | column", "5\n5\n0\n5"),
+        (".a[] // 9 | [., line]", "[1,2]\n[2,3]\n[9,0]\n[3,5]"),
+        (".a[] // select(false) | line", "2\n3\n4\n5"),
+        (".a[] // .a[0] | line", "2\n3\n2\n5"),
+        (".a[] | (. // 9) | line", "2\n3\n0\n5"),
+    ] {
+        for route in [&[][..], &["--arg", "z", "1"][..]] {
+            let mut args = vec!["-o", "json", "-I", "0"];
+            args.extend_from_slice(route);
+            let (out, stderr, code) = run_yq_stdin_with_stderr(filter, input, &args)?;
+            assert_eq!(code, 0, "{filter} {route:?}: {stderr}");
+            assert_eq!(out.trim(), want, "{filter} {route:?}");
+        }
+    }
+    Ok(())
+}
+
 /// #2110's jq-mode fix (a zero-arity builtin/literal called with the wrong
 /// arity reports jq's own "X/N is not defined" instead of a raw parser
 /// rejection) must not leak into yq mode: real yq (v4.53.3) has no

@@ -10765,6 +10765,18 @@ fn eval_single_pipe<S: EvalSemantics, V: DocumentValue>(
         return collect_each_generic::<S, V>(whole.get(exprs), value, optional, cursor);
     }
 
+    // yq's `//` decides per left output (#2817), so what it hands the next stage can mix a
+    // document node with a value computed by the right operand (`.a[] // 9`). The collected
+    // result below has no shape for that mix -- it would turn the nodes into plain values, and a
+    // `line`/`column` read after the operator would lose its source position -- while the
+    // streaming driver carries each output with its own cursor.
+    if S::ALTERNATIVE_IS_PER_LEFT_OUTPUT
+        && exprs.len() > 1
+        && matches!(strip_parens(&exprs[0]), Expr::Alternative(..))
+    {
+        return collect_each_generic::<S, V>(whole.get(exprs), value, optional, cursor);
+    }
+
     let current = eval_single::<S, _>(&exprs[0], value, optional, cursor);
     fold_pipe_stages::<S, V>(current, &exprs[1..], optional)
 }
@@ -11535,6 +11547,11 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // `needs_path_context` has no `Expr::Alternative` arm, so a pipe whose
         // only path-context read sits inside a `//` is still never routed to
         // path-context evaluation, and this arm does not change that table.
+        // yq's `//` decides per left output (#2817): the streaming implementation, collected,
+        // so the two routes cannot disagree about which outputs it produces.
+        Expr::Alternative(..) if S::ALTERNATIVE_IS_PER_LEFT_OUTPUT => {
+            collect_each_generic::<S, V>(expr, value, optional, cursor)
+        }
         Expr::Alternative(left, right) => {
             match retain_truthy_generic::<_, S>(eval_single::<S, V>(
                 left,
@@ -17518,6 +17535,11 @@ fn each_alternative_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
+    if S::ALTERNATIVE_IS_PER_LEFT_OUTPUT {
+        return each_alternative_per_left_output_generic::<S, V>(
+            left, right, value, optional, cursor, sink,
+        );
+    }
     let mut forwarded = 0usize;
     let mut outer_stopped = false;
     let mut escape: Option<Control> = None;
@@ -17589,6 +17611,98 @@ fn each_alternative_generic<S: EvalSemantics, V: DocumentValue>(
         // At least one truthy output was forwarded, so `//` is answered.
         Flow::Exhausted | Flow::Stopped { .. } if forwarded > 0 => Flow::Exhausted,
         // No truthy output at all: the right side answers, unfiltered.
+        Flow::Exhausted | Flow::Stopped { .. } => {
+            eval_each_generic::<S, V>(right, value, optional, cursor, sink)
+        }
+    }
+}
+
+/// Whether one pushed item is truthy, without consuming it (a falsy one may have to be pushed
+/// itself afterwards, [`each_alternative_per_left_output_generic`]). Follows
+/// [`retain_truthy_generic`]'s rule shape by shape: a cursor answers from its own
+/// `is_falsy`, a decoded or computed value by its truthiness, and the lazy shapes
+/// (`keys`, an index range, a built array) are always truthy -- a lazy array that fails to
+/// build raises where its consumer pulls it, not here.
+fn generic_item_is_truthy<V: DocumentValue, S: EvalSemantics>(
+    item: &GenericItem<V>,
+) -> Result<bool, Control> {
+    match item {
+        GenericItem::One(v) => to_owned::<S, _>(v)
+            .map(|owned| owned.is_truthy())
+            .map_err(Control::Error),
+        GenericItem::OneCursor(c) | GenericItem::OneCursorValue(c, _) => Ok(cursor_is_truthy(c)),
+        GenericItem::Owned(o) => Ok(o.is_truthy()),
+        GenericItem::LazyKeys { .. } | GenericItem::LazyIndexRange(_) | GenericItem::LazySeq(_) => {
+            Ok(true)
+        }
+    }
+}
+
+/// yq's `//` as a pushed stream over the cursor route
+/// (`EvalSemantics::ALTERNATIVE_IS_PER_LEFT_OUTPUT`, #2817): the mirror of
+/// `eval::each_alternative_per_left_output`, whose doc comment carries the rule. A truthy left
+/// output is pushed; a falsy one is replaced by the right operand's outputs, or pushed itself
+/// when that yields none; the right operand answers once on its own only when the left
+/// yielded nothing. Both operands see the original input and its cursor.
+fn each_alternative_per_left_output_generic<S: EvalSemantics, V: DocumentValue>(
+    left: &Expr,
+    right: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    let mut produced = false;
+    let mut outer_stopped = false;
+    let mut escape: Option<Control> = None;
+    let left_flow = eval_each_generic::<S, V>(
+        left,
+        value.clone(),
+        optional,
+        cursor,
+        &mut |item: GenericItem<V>| {
+            produced = true;
+            match generic_item_is_truthy::<V, S>(&item) {
+                Err(control) => return stop_with_escape(&mut escape, control),
+                Ok(true) => {
+                    let demand = sink.push(item);
+                    outer_stopped |= demand == Demand::Stop;
+                    return demand;
+                }
+                Ok(false) => {}
+            }
+            let mut replaced = false;
+            let right_flow = eval_each_generic::<S, V>(
+                right,
+                value.clone(),
+                optional,
+                cursor,
+                &mut |out: GenericItem<V>| {
+                    replaced = true;
+                    sink.push(out)
+                },
+            );
+            match right_flow {
+                Flow::Exhausted if replaced => Demand::Continue,
+                Flow::Exhausted => {
+                    let demand = sink.push(item);
+                    outer_stopped |= demand == Demand::Stop;
+                    demand
+                }
+                Flow::Stopped { .. } => {
+                    outer_stopped = true;
+                    Demand::Stop
+                }
+                Flow::Escaped(control) => stop_with_escape(&mut escape, control),
+            }
+        },
+    );
+    if outer_stopped || escape.is_some() {
+        return resume_from_escape(escape, left_flow);
+    }
+    match left_flow {
+        Flow::Escaped(control) => Flow::Escaped(control),
+        Flow::Exhausted | Flow::Stopped { .. } if produced => Flow::Exhausted,
         Flow::Exhausted | Flow::Stopped { .. } => {
             eval_each_generic::<S, V>(right, value, optional, cursor, sink)
         }
@@ -31663,6 +31777,11 @@ fn eval_owned_identity_alternative<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     mut tail: OwnedIdentityTail<'_, V>,
 ) -> Flow {
+    if S::ALTERNATIVE_IS_PER_LEFT_OUTPUT {
+        return eval_owned_identity_alternative_per_left_output::<S, V>(
+            left, right, rest, value, id, optional, tail,
+        );
+    }
     let mut any_truthy = false;
     let rest_escape = StashedEscape::new();
     let left_flow = eval_owned_identity_stages::<S, V>(
@@ -31689,6 +31808,104 @@ fn eval_owned_identity_alternative<S: EvalSemantics, V: DocumentValue>(
     }
     match left_flow {
         Flow::Exhausted if !any_truthy => {
+            eval_owned_identity_spliced::<S, V>(right, rest, value, id, optional, tail)
+        }
+        other => other,
+    }
+}
+
+/// yq's `//` over an owned value with identity (`EvalSemantics::ALTERNATIVE_IS_PER_LEFT_OUTPUT`,
+/// #2817): [`eval_owned_identity_alternative`]'s per-output twin. Each left output is decided on
+/// its own and then continues into `rest` standing where *it* stood: a truthy one as it is; a
+/// falsy one replaced by each output of `right`, which continue at their own positions -- or, when
+/// `right` yields nothing, the falsy output itself at its own (`(.a, .b) // select(false) | key`
+/// is `"a"`, `"b"` in yq v4.53.3, `.a` being null); and `right` runs once on its own only when
+/// `left` yielded nothing at all. As in the jq form, an escape raised in `rest` (or by `right`)
+/// is kept apart from one raised by `left`, so a downstream failure is not read as "the left
+/// side failed".
+fn eval_owned_identity_alternative_per_left_output<S: EvalSemantics, V: DocumentValue>(
+    left: &Expr,
+    right: &Expr,
+    rest: &[Expr],
+    value: Cow<'_, OwnedValue>,
+    id: OwnedIdentity<V>,
+    optional: bool,
+    mut tail: OwnedIdentityTail<'_, V>,
+) -> Flow {
+    let mut produced = false;
+    let rest_escape = StashedEscape::new();
+    let left_flow = eval_owned_identity_stages::<S, V>(
+        owned_identity_body_stages(left),
+        Cow::Borrowed(&value),
+        id.clone(),
+        optional,
+        OwnedIdentityTail::Pairs(&mut |v, vid| {
+            rest_escape.begin();
+            produced = true;
+            if v.is_truthy() {
+                return match eval_owned_identity_stages::<S, V>(
+                    rest,
+                    v,
+                    vid,
+                    optional,
+                    tail.reborrow(),
+                ) {
+                    Flow::Escaped(control) => {
+                        stop_owned_identity_rest_escape(&rest_escape, control)
+                    }
+                    other => other,
+                };
+            }
+            let mut replaced = false;
+            let right_flow = eval_owned_identity_stages::<S, V>(
+                owned_identity_body_stages(right),
+                Cow::Borrowed(&value),
+                id.clone(),
+                optional,
+                OwnedIdentityTail::Pairs(&mut |rv, rvid| {
+                    replaced = true;
+                    match eval_owned_identity_stages::<S, V>(
+                        rest,
+                        rv,
+                        rvid,
+                        optional,
+                        tail.reborrow(),
+                    ) {
+                        Flow::Escaped(control) => {
+                            stop_owned_identity_rest_escape(&rest_escape, control)
+                        }
+                        other => other,
+                    }
+                }),
+            );
+            match right_flow {
+                Flow::Exhausted if replaced => Flow::Exhausted,
+                // `right` yielded nothing: the falsy output stays, where it stood.
+                Flow::Exhausted => {
+                    match eval_owned_identity_stages::<S, V>(
+                        rest,
+                        v,
+                        vid,
+                        optional,
+                        tail.reborrow(),
+                    ) {
+                        Flow::Escaped(control) => {
+                            stop_owned_identity_rest_escape(&rest_escape, control)
+                        }
+                        other => other,
+                    }
+                }
+                Flow::Escaped(control) => stop_owned_identity_rest_escape(&rest_escape, control),
+                other => other,
+            }
+        }),
+    );
+    if let Some(control) = rest_escape.take(&left_flow, crate::jq::eval::direct_pattern_retry(left))
+    {
+        return Flow::Escaped(control);
+    }
+    match left_flow {
+        Flow::Exhausted if !produced => {
             eval_owned_identity_spliced::<S, V>(right, rest, value, id, optional, tail)
         }
         other => other,

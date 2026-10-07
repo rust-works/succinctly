@@ -2792,29 +2792,41 @@ comment for the full call-site list and `tests/yq_cli_tests.rs`'s
 unaffected (it keeps its own separate, unconditional-null rule), and a real container
 target keeps its own structural error.
 
-### `//` maps per left output and keeps a falsy left value when the right side is empty — not chased ([#2817](https://github.com/rust-works/succinctly/issues/2817) discovered by #2782, not fixed)
+### `//` maps per left output and keeps a falsy left value when the right side is empty — resolved ([#2817](https://github.com/rust-works/succinctly/issues/2817)); yq's auto-creating key lookup remains
 
-succinctly evaluates `L // R` with jq's rule in both modes: collect `L`'s outputs, keep the
-truthy ones, run `R` only if none survived. Real yq v4.53.3 differs on two axes, captured
-live when [#2782](https://github.com/rust-works/succinctly/issues/2782) added `//` to
-`scripts/jq-path-context-oracle-sweep.sh`'s alphabet:
+Real yq v4.53.3's `L // R` is not jq's collect-then-fallback. Captured live when
+[#2782](https://github.com/rust-works/succinctly/issues/2782) added `//` to
+`scripts/jq-path-context-oracle-sweep.sh`'s alphabet, and implemented for yq mode by
+`EvalSemantics::ALTERNATIVE_IS_PER_LEFT_OUTPUT` (jq mode keeps its rule):
 
-| filter (`yq -n -o=json`)            | yq v4.53.3    | succinctly yq (= jq 1.7.1) |
+| filter (`yq -n -o=json`)            | yq v4.53.3    | jq 1.7.1 / `succinctly jq` |
 |-------------------------------------|---------------|----------------------------|
 | `(1, null) // 2`                    | `1` `2`       | `1`                        |
 | `(null, 1) // 2`                    | `2` `1`       | `1`                        |
 | `(null, 1, null) // 2`              | `2` `1` `2`   | `1`                        |
 | `(false, null) // (3, 4)`           | `3` `4` `3` `4` | `3` `4`                  |
+| `(null, 1) // (3, 4)`               | `3` `4` `1`   | `1`                        |
 | `{} \| (null // .[])`               | `null`        | *(nothing)*                |
 | `{"a":1} \| (null // key)` (root)   | `null`        | *(nothing)*                |
+| `select(false) // 7`                | `7`           | `7`                        |
 
-Each falsy output of `L` is replaced *in place* by `R`'s outputs, and where `R` yields
-nothing the falsy output itself is emitted. The twelve sweep rows this produces (`(null //
-key)`/`(null // parent)` at the document root, where both tools' `key`/`parent` are
-empty) are recorded in `tests/data/jq-path-context-sweep-known-divergences.txt` under
-#2817. Not a path-context question — it is *which* outputs `//` produces, an
-`EvalSemantics`-level rule for yq mode — and pre-existing: identical on `main` before
-#2782, whose change is *where* an output of `//` stands.
+Each left output is decided on its own: a truthy one passes, a falsy one is replaced *in place*
+by every output of `R` -- or stays itself when `R` yields nothing -- and `R` runs on its own only
+when `L` yielded nothing at all. `R` is not evaluated while every left output is truthy
+(`1 // error("y")` is `1`), a left error raises (`(null, error("x")) // 3`), and the outputs stay
+where they stood (`(.a, .b) // .c | key` is `"c"`, `"b"` for a null `.a`; `(.a, .b) //
+select(false) | key` is `"a"`, `"b"`). It is implemented on all four routes: the eager value
+route, its streaming twin, the cursor route (`each_alternative_per_left_output_generic`) and the
+owned identity pipe (`eval_owned_identity_alternative_per_left_output`), and a pipe whose first
+stage is such a `//` is driven by the streaming pipe so a document node and a computed
+replacement can reach the next stage together (`.a[] // 9 | line`). Checked against yq on 2,590
+filter/input rows and 24 position rows, on the cursor and the DOM route.
+
+One residual is *not* about `//`: yq's key lookup **auto-creates** a missing key in the tree it
+is reading, so `.zz // .[]?` on `{"a":1}` iterates a document that now holds `zz: null` and
+prints `1`, `null` (it prints `null`, `1`, `null` for `(.zz, .[]?)` with no `//` at all). The
+25 rows of that grid that still differ are all this (`.a.b // .a`, `(.a // .b) = 5` on a
+document with no `a`, ...) plus an unrelated `map` over a mapping.
 
 ### An `and`/`or` operand's evaluation context — resolved for `and`/`or` (#2540); `=`'s right side remains open
 
