@@ -61152,6 +61152,55 @@ fn test_transpose_stays_silent_or_raises_its_value_error_first_in_path_3888() ->
     Ok(())
 }
 
+/// #3950: by value, `transpose` is jq's `[range(0; map(length) | max) as $i |
+/// [.[] | .[$i]]]` -- short rows pad with `null`, a `null` row is all `null`,
+/// an object input iterates its values, and a row that cannot be indexed by a
+/// number raises. Every row captured live from jq 1.7.1 as `try transpose catch
+/// "ERR: \(.)"`.
+#[test]
+fn test_transpose_follows_jqs_definition_by_value_3950() -> Result<()> {
+    for (input, want) in [
+        ("[[1,2],[3]]", "[[1,3],[2,null]]"),
+        ("[[1],[2,3],[]]", "[[1,2,null],[null,3,null]]"),
+        ("[[1,2,3],[4],[5,6]]", "[[1,4,5],[2,null,6],[3,null,null]]"),
+        ("[[1],null]", "[[1,null]]"),
+        ("[null,[1,2]]", "[[null,1],[null,2]]"),
+        // Cells are not flattened: a row's element stays one cell.
+        ("[[[1,2]],[[3]]]", "[[[1,2],[3]]]"),
+        // `.[]` of an object is its values.
+        (r#"{"a":[1,2],"b":[3]}"#, "[[1,3],[2,null]]"),
+        // No row, or no row with a length: the range is empty.
+        ("[]", "[]"),
+        ("{}", "[]"),
+        ("[[]]", "[]"),
+        ("[null]", "[]"),
+        ("[{}]", "[]"),
+        (r#"[""]"#, "[]"),
+        (r#"{"a":[],"b":null}"#, "[]"),
+        // A row without a number index raises once the range yields, in row
+        // order and whatever the row's own length -- jq names the row's type.
+        ("[1,\"a\"]", r#""ERR: Cannot index number with number""#),
+        (r#"[[1],"ab"]"#, r#""ERR: Cannot index string with number""#),
+        (
+            r#"[[1,2],{"a":3}]"#,
+            r#""ERR: Cannot index object with number""#,
+        ),
+        // `map(length)` runs first, so its own errors win.
+        ("[[1],true]", r#""ERR: boolean (true) has no length""#),
+        (r#""a""#, r#""ERR: Cannot iterate over string (\"a\")""#),
+        ("5", r#""ERR: Cannot iterate over number (5)""#),
+        ("null", r#""ERR: Cannot iterate over null (null)""#),
+    ] {
+        let (stdout, code) = run_jq_stdin(r#"try transpose catch "ERR: \(.)""#, input, &["-c"])?;
+        assert_eq!(code, 0, "#3950: `{input}`: stdout {stdout:?}");
+        assert_eq!(stdout.trim(), want, "#3950: `{input}`");
+    }
+    // `?` suppresses the failure instead of raising it.
+    let (stdout, code) = run_jq_stdin("[transpose?]", "5", &["-c"])?;
+    assert_eq!((stdout.trim(), code), ("[]", 0));
+    Ok(())
+}
+
 /// #3347: `indices`, `index` and `rindex` on a value the resolver is not
 /// tracking raise jq's `Invalid path expression`, naming the access jq's own
 /// definition makes -- which depends on the *evaluated pattern*, the one thing
