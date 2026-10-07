@@ -93,25 +93,17 @@ FORMS = ['path({k} ({s}) as $k ({i}; {u}))', '({k} ({s}) as $k ({i}; {u})) = 9']
 #   (#3459 closed the bare `first`/`last`/`nth`/`map`/`add`/`flatten` sources: they
 #   are routed through the resolver like any other navigation, so none of them is
 #   listed -- the sweep has no FABRICATE row left.)
-#   `.b|tostring`, `1, (.a|tostring)`, `..`, `recurse`, `.[0:]`, `.[0:2]`,
-#   `.[0:(1+1)]` -- jq's pointer identity: the accumulator carried across
-#   source elements, a `tostring` of a string, a full slice (#3460).
+#   `.b|tostring` -- jq's pointer identity: `tostring` of a string is the same `jv`, a
+#   path-mode gap that is not specific to a fold (#3460's second half). The accumulator
+#   carried across source elements, `..`/`recurse` and a full slice of the accumulator
+#   are closed (#3460).
 #   `foreach .[]? as $x (0; .+1)` -- a nested navigating `foreach`: its values
 #   come back off the resolver's root path, which `drive_fold_source` reads as
 #   a lost register, so it refuses where jq may answer (it used to read as a
 #   literal and FABRICATE).
 KNOWN_RESIDUALS = {
-    '..': ['both-error-differ'],
-    '..|tostring': ['both-error-differ'],
-    '.[0:(1+1)]|tostring': ['REJECT'],
-    '.[0:2]': ['REJECT'],
-    '.[0:]|tostring': ['REJECT'],
     '.b|tostring': ['REJECT'],
-    '1, (.a|tostring)': ['REJECT'],
     'foreach .[]? as $x (0; .+1)': ['REJECT'],
-    'recurse': ['both-error-differ'],
-    'recurse(.[]?)|length': ['both-error-differ'],
-    'recurse|tostring': ['both-error-differ'],
 }
 
 

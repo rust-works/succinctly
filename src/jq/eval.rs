@@ -44114,29 +44114,10 @@ impl FoldRegister {
     /// `Optional(Slice)`, so each component is read through [`strip_optional`]
     /// (#3734), as [`slice_witnesses_node`] already does for the last one.
     fn whole_array_slice_of_register(&self, b: &PathBranch<'_>) -> bool {
-        if !slice_witnesses_node(&b.path, &b.value)
-            || !matches!(&self.value, OwnedValue::Array(items) if !items.is_empty())
-            || *b.value != self.value
-        {
-            return false;
-        }
-        let mut cur: &PathPrefix = &b.path;
-        while let PathPrefix::Node {
-            parent, component, ..
-        } = cur
-        {
-            if !matches!(
-                strip_optional(component),
-                Expr::Slice { .. } | Expr::SliceExpr { .. }
-            ) {
-                return false;
-            }
-            if Rc::ptr_eq(parent, &self.path) || **parent == *self.path {
-                return true;
-            }
-            cur = parent;
-        }
-        false
+        slice_witnesses_node(&b.path, &b.value)
+            && matches!(&self.value, OwnedValue::Array(items) if !items.is_empty())
+            && *b.value == self.value
+            && is_slice_chain_over(&b.path, &self.path)
     }
 
     /// Resolve `expr` (`UPDATE` or `EXTRACT`) against one fold step's own
@@ -46723,6 +46704,31 @@ fn slice_witnesses_node(path: &PathPrefix, value: &OwnedValue) -> bool {
     }
 }
 
+/// Whether `path` is `base` followed by one or more slice components, and nothing
+/// else (#3504). A slice under a postfix `?` (`.[0:]?`) is the same step: the
+/// wrapper only prunes a failure to slice, and a branch resolved under it carries
+/// `Optional(Slice)`, so each component is read through [`strip_optional`] (#3734),
+/// as [`slice_witnesses_node`] already does for the last one.
+fn is_slice_chain_over(path: &PathPrefix, base: &Rc<PathPrefix>) -> bool {
+    let mut cur = path;
+    while let PathPrefix::Node {
+        parent, component, ..
+    } = cur
+    {
+        if !matches!(
+            strip_optional(component),
+            Expr::Slice { .. } | Expr::SliceExpr { .. }
+        ) {
+            return false;
+        }
+        if Rc::ptr_eq(parent, base) || **parent == **base {
+            return true;
+        }
+        cur = parent;
+    }
+    false
+}
+
 /// The ambient `.` a fold's SOURCE runs against on **one** INIT fork, plus
 /// that ambient's own provenance relative to that fork's own
 /// [`FoldRegister`] -- exactly what [`drive_fold_source`] resolves the
@@ -47796,6 +47802,78 @@ fn settle_fold_alternative<S: EvalSemantics>(
     }
 }
 
+/// Whether two paths reach the same node, reading a component through a postfix
+/// `?` (`.a?` reaches what `.a` does -- the wrapper only prunes a failure to
+/// index). Shared nodes short-circuit, so the usual case, a path compared with
+/// itself or with its own extension's parent, is one pointer comparison.
+fn same_node_path(a: &Rc<PathPrefix>, b: &Rc<PathPrefix>) -> bool {
+    let (mut x, mut y) = (a, b);
+    loop {
+        if Rc::ptr_eq(x, y) {
+            return true;
+        }
+        match (&**x, &**y) {
+            (PathPrefix::Root, PathPrefix::Root) => return true,
+            (
+                PathPrefix::Node {
+                    parent: px,
+                    component: cx,
+                    depth: dx,
+                },
+                PathPrefix::Node {
+                    parent: py,
+                    component: cy,
+                    depth: dy,
+                },
+            ) => {
+                if dx != dy || strip_optional(cx) != strip_optional(cy) {
+                    return false;
+                }
+                (x, y) = (px, py);
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Whether the accumulator coming into a `foreach` step is the very node the
+/// step's register stands on, because the previous UPDATE *reached* it at that
+/// same absolute path (#3460): jq's `jv_identical(state, value_at_path)`, where
+/// `path()`'s document is immutable, so a node reached twice at one path is one
+/// `jv`.
+///
+/// `path(foreach (1, .a) as $k (.; .a))` on `{"a":{"a":1}}` is `["a"]` then
+/// `["a","a"]`: step 1's UPDATE leaves the accumulator on `.a`, which is where
+/// element 2's `.a` moves the register. [`register_identical`] cannot say so,
+/// because the accumulator's positional mark is only minted for a frame that
+/// tracks absolute positions ([`may_bind_navigated`]), and a fold's own program
+/// rarely asks for that.
+///
+/// Only a *reached* node qualifies -- `state_path` is `None` for a computed
+/// accumulator -- and a different path holding an equal value never does. A path
+/// ending in a slice is the same node only for a non-empty array
+/// ([`slice_witnesses_node`]): a string slice is a fresh string each time. The
+/// one different path that is the same node is a chain of slices over the
+/// accumulator's own non-empty array that kept every element, which shares its
+/// buffer (`path(foreach (.[0:2]) as $k (.; .[0]))` on `[1,2]`, the full-slice
+/// row of #3460).
+///
+/// jq mode only: this turns a refusal into navigation, which on the write side
+/// is a write where yq no-ops ([`foreach_step_register`]'s `Unmoved` arm).
+fn accumulator_reached_register_at<S: EvalSemantics>(
+    state_path: Option<&Rc<PathPrefix>>,
+    state: &OwnedValue,
+    step_reg: &FoldRegister,
+) -> bool {
+    S::TAG == EvalTag::Jq
+        && step_reg.trackable
+        && state_path.is_some_and(|path| {
+            (same_node_path(path, &step_reg.path) && slice_witnesses_node(&step_reg.path, state))
+                || (slice_is_same_array(state) && is_slice_chain_over(&step_reg.path, path))
+        })
+        && *state == step_reg.value
+}
+
 /// The register one `foreach` step's UPDATE and EXTRACT navigate against, and
 /// whether the accumulator coming into the step is at it -- jq's own
 /// `jv_identical(current_input, value_at_path)` (#2031, #2159, #2161).
@@ -47807,7 +47885,11 @@ fn settle_fold_alternative<S: EvalSemantics>(
 /// accumulator and its provenance coming into the step. Read-only: the sink
 /// keeps every `&mut` slot (`state`, `outcome`, `budget`, ...) to itself.
 ///
+/// `state_path` is the absolute path the accumulator was last *reached* at, when
+/// it was (#3460, [`accumulator_reached_register_at`]).
+///
 /// [`MovedRegister`] names the three sites that must agree on each variant.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: the accumulator's provenance is three facts (`state_at_register`, `state_snapshot`, `state_path`), and `reduce_update_at_register` mirrors the list
 fn foreach_step_register<S: EvalSemantics>(
     walked: Option<&PatternRegister>,
     elem: &FoldSourceValue,
@@ -47816,6 +47898,7 @@ fn foreach_step_register<S: EvalSemantics>(
     state: &OwnedValue,
     state_snapshot: &Snapshot,
     state_at_register: bool,
+    state_path: Option<&Rc<PathPrefix>>,
 ) -> (FoldRegister, bool) {
     // #2031: this step's own register -- where the pattern walk
     // left it, else the register-derived element's own position,
@@ -47829,7 +47912,8 @@ fn foreach_step_register<S: EvalSemantics>(
             frame: frame.extend(&walked_reg.path),
         };
         let at_register =
-            register_identical::<S>(&step_reg.value, &step_reg.frame, state, state_snapshot);
+            register_identical::<S>(&step_reg.value, &step_reg.frame, state, state_snapshot)
+                || accumulator_reached_register_at::<S>(state_path, state, &step_reg);
         return (step_reg, at_register);
     }
     match (&elem.register_path, &elem.moved) {
@@ -47847,7 +47931,8 @@ fn foreach_step_register<S: EvalSemantics>(
                 frame: frame.extend(path),
             };
             let at_register =
-                register_identical::<S>(&step_reg.value, &step_reg.frame, state, state_snapshot);
+                register_identical::<S>(&step_reg.value, &step_reg.frame, state, state_snapshot)
+                    || accumulator_reached_register_at::<S>(state_path, state, &step_reg);
             (step_reg, at_register)
         }
         // #2159: the element was computed *after* the source
@@ -47868,7 +47953,8 @@ fn foreach_step_register<S: EvalSemantics>(
                 frame: frame.extend(path),
             };
             let at_register =
-                register_identical::<S>(&step_reg.value, &step_reg.frame, state, state_snapshot);
+                register_identical::<S>(&step_reg.value, &step_reg.frame, state, state_snapshot)
+                    || accumulator_reached_register_at::<S>(state_path, state, &step_reg);
             (step_reg, at_register)
         }
         // #2159: the source navigated and then ran a stage the
@@ -48134,8 +48220,20 @@ fn reduce_update_at_register<S: EvalSemantics>(
     // where the persistent one is `false` (a `null`/`bool` accumulator is identical
     // to any `null`/`bool` register), and taking it would admit a write jq refuses
     // (`(reduce first(.a) as {a:$v0} (null; ($v0 | getpath([])))) = 9`).
+    // `None`: `reduce` carries no per-step accumulator path (#3460) -- the verdict may
+    // only narrow `persistent`, and the final accumulator is what jq checks.
     persistent
-        && foreach_step_register::<S>(walked, elem, reg, frame, acc, acc_snapshot, persistent).1
+        && foreach_step_register::<S>(
+            walked,
+            elem,
+            reg,
+            frame,
+            acc,
+            acc_snapshot,
+            persistent,
+            None,
+        )
+        .1
 }
 
 /// A `foreach` step's verdict on a `Demand::Stop` answered downstream of its
@@ -48802,6 +48900,10 @@ fn resolve_foreach<'a, S: EvalSemantics>(
         // document root, which is what the filed repro's `getpath(["a"])`
         // composes against inside UPDATE.
         let mut state_snapshot = accumulator_provenance::<S>(init_branch, frame);
+        // #3460: where the accumulator was last *reached*, absolute in the fold's
+        // frame like `reg.path` -- `None` for a computed one.
+        let mut state_path: Option<Rc<PathPrefix>> =
+            init_branch.trackable.then(|| Rc::clone(&init_branch.path));
         let aborted: StashedEscape = StashedVerdict::new();
         // The source is driven by demand (#2235): each element is folded
         // here, inside the drive, before the next one is pulled, so a step
@@ -48919,6 +49021,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                             &state,
                             &state_snapshot,
                             state_at_register,
+                            state_path.as_ref(),
                         );
                         if let Some(control) =
                             charge_alternative_update(&mut budget, &mut ran_update, "foreach")
@@ -48941,6 +49044,10 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                         // wrote `ab` where jq writes `a`. `resolve_reduce`'s UPDATE stays
                         // collected: jq evaluates every one of its outputs.
                         let entry_state = core::mem::replace(&mut state, OwnedValue::Null);
+                        // `state_path` describes `state`, which is `Null` until an
+                        // UPDATE output replaces it (a step that delivers nothing, or
+                        // escapes first, must not leave the old node's path behind).
+                        state_path = None;
                         let entry_snapshot = state_snapshot.clone();
                         let mut delivered = false;
                         let update_stop_at = core::cell::Cell::new(None::<u64>);
@@ -48985,6 +49092,9 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                 slice_ok,
                             );
                             state = update_branch.value.clone().into_owned();
+                            state_path = update_branch
+                                .trackable
+                                .then(|| Rc::clone(&update_branch.path));
                             // #3580: this emission's register is the one UPDATE's
                             // output left, which is the entry's when it said so.
                             let update_unmoved = update_states_entry
@@ -122753,6 +122863,116 @@ mod tests {
         ));
         assert!(register_identical::<YqSemantics>(
             &empty, &at_slice, &fresh, &mark
+        ));
+    }
+
+    /// #3460: the accumulator is the step register's node only when it was
+    /// *reached* at the same path (or a chain of slices over it that kept every
+    /// element), reading a postfix `?` as the same step; a different path with an
+    /// equal value, a stale/absent path, and yq mode never qualify.
+    #[test]
+    fn accumulator_reached_register_at_is_positional_and_jq_only_3460() {
+        let field = |n: &str| Expr::Field(n.to_string());
+        let at = |path: &Rc<PathPrefix>, value: &OwnedValue| FoldRegister {
+            path: Rc::clone(path),
+            value: value.clone(),
+            trackable: true,
+            frame: Frame::at(1, Rc::clone(path)),
+        };
+        let a = PathPrefix::extend(&PathPrefix::root(), field("a"));
+        let a_optional =
+            PathPrefix::extend(&PathPrefix::root(), Expr::Optional(Box::new(field("a"))));
+        let b = PathPrefix::extend(&PathPrefix::root(), field("b"));
+        let one = OwnedValue::array_from(vec![OwnedValue::Int(1)]);
+        let empty = OwnedValue::array();
+
+        // the same node, spelled with and without a postfix `?`, or shared
+        assert!(same_node_path(&a, &a));
+        assert!(same_node_path(&a, &a_optional));
+        assert!(same_node_path(&PathPrefix::root(), &PathPrefix::root()));
+        assert!(!same_node_path(&a, &b));
+        assert!(!same_node_path(&a, &PathPrefix::root()));
+        assert!(!same_node_path(&PathPrefix::root(), &a));
+
+        let reg = at(&a, &one);
+        assert!(accumulator_reached_register_at::<JqSemantics>(
+            Some(&a),
+            &one,
+            &reg
+        ));
+        assert!(accumulator_reached_register_at::<JqSemantics>(
+            Some(&a_optional),
+            &one,
+            &reg
+        ));
+        // jq mode only: it turns a refusal into navigation, a write where yq no-ops
+        assert!(!accumulator_reached_register_at::<YqSemantics>(
+            Some(&a),
+            &one,
+            &reg
+        ));
+        // computed (never reached), or reached somewhere else
+        assert!(!accumulator_reached_register_at::<JqSemantics>(
+            None, &one, &reg
+        ));
+        assert!(!accumulator_reached_register_at::<JqSemantics>(
+            Some(&b),
+            &one,
+            &reg
+        ));
+        // an untracked register admits nothing
+        let mut lost = at(&a, &one);
+        lost.trackable = false;
+        assert!(!accumulator_reached_register_at::<JqSemantics>(
+            Some(&a),
+            &one,
+            &lost
+        ));
+        // the value backstop: a stale path over a different accumulator
+        assert!(!accumulator_reached_register_at::<JqSemantics>(
+            Some(&a),
+            &empty,
+            &reg
+        ));
+
+        // a slice chain over the accumulator's non-empty array that kept it whole
+        let sliced = PathPrefix::extend(&a, Expr::slice(None, None));
+        let sliced_reg = at(&sliced, &one);
+        assert!(accumulator_reached_register_at::<JqSemantics>(
+            Some(&a),
+            &one,
+            &sliced_reg
+        ));
+        // ... but not over an empty one (a fresh `jv_array()`), nor one that dropped an element
+        let empty_reg = at(&sliced, &empty);
+        assert!(!accumulator_reached_register_at::<JqSemantics>(
+            Some(&a),
+            &empty,
+            &empty_reg
+        ));
+        let two = OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+        assert!(!accumulator_reached_register_at::<JqSemantics>(
+            Some(&a),
+            &two,
+            &sliced_reg
+        ));
+        // and the same path ending in a slice is the same node only for a non-empty array
+        assert!(accumulator_reached_register_at::<JqSemantics>(
+            Some(&sliced),
+            &one,
+            &sliced_reg
+        ));
+        assert!(!accumulator_reached_register_at::<JqSemantics>(
+            Some(&sliced),
+            &empty,
+            &empty_reg
+        ));
+        let string = OwnedValue::String("s".into());
+        let string_reg = at(&sliced, &string);
+        assert!(!accumulator_reached_register_at::<JqSemantics>(
+            Some(&sliced),
+            &string,
+            &string_reg
         ));
     }
 

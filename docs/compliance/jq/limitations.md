@@ -3129,7 +3129,7 @@ answers `["b"]` — and classified the two residuals appended below):
   273: "jq errors, succinctly succeeds" 1,527 to 88, "jq succeeds, succinctly errors" 540 to 56,
   "both succeed, differ" 1,293 to 124, "both error, differ" 174 to 5. A full slice
   (`(foreach (.[0:]|tostring) as $k (.; .[0])) = 9` on `[1,2]`, which is the same `jv` in jq)
-  went from matching to refusing -- the safe direction. What remains:
+  went from matching to refusing -- the safe direction, restored by #3460. What remains:
 
   - **A stage the resolver cannot see inside.** jq moves the register through a builtin that
     indexes inside itself, and the resolver cannot follow every one. The dangerous direction is
@@ -3155,11 +3155,23 @@ answers `["b"]` — and classified the two residuals appended below):
     never touched the register (`(foreach (foreach .[]? as $x (0; .+1)) as $k (.; .; .)) = 9` on
     `{"a":{"a":1},"k":"a"}` replaced the document with `9`; jq raises), and is now a lost
     register -- a refusal where jq may answer (recorded here; it has no issue of its own).
-  - **jq's pointer identity**: the accumulator's node is not carried from one source element to
-    the next (`path(foreach (1, .a) as $k (.; .a))`), `tostring` of a string is the same `jv`
-    (`path(foreach (.b|tostring) as $k (.; $k))` on `{"b":"s"}` is `["b"]`), and a full slice
-    is the same `jv` as its input. Refusals; each predates #2159. Tracked as
-    [#3460](https://github.com/rust-works/succinctly/issues/3460).
+  - **jq's pointer identity**: `tostring` of a string is the same `jv`
+    (`path(foreach (.b|tostring) as $k (.; $k))` on `{"b":"s"}` is `["b"]`) -- a general
+    path-mode gap, not a `foreach` one (`path(.b|tostring)` refuses the same way), and still a
+    refusal; it predates #2159. Tracked as
+    [#3460](https://github.com/rust-works/succinctly/issues/3460). Closed by #3460's first
+    half: the accumulator's node carried from one source element to the next
+    (`path(foreach (1, .a) as $k (.; .a))` on `{"a":{"a":1}}` is `["a"]` then `["a","a"]`,
+    including through `..`/`recurse`), and a full slice of the accumulator being the same `jv`
+    as its input (`(foreach (.[0:]|tostring) as $k (.; .[0])) = 9` on `[1,2]` is `[9,2]`). The
+    rule is jq's own `jv_identical(state, value_at_path)` over an immutable document: the
+    previous UPDATE *reached* the accumulator at the absolute path the next element moves the
+    register to (`accumulator_reached_register_at`), or at the path that element slices without
+    dropping an element. A different path holding an equal value, and a string or empty-array
+    slice (a fresh `jv`), still refuse. jq mode only. Still refusals where jq answers: a slice
+    chain *inside* UPDATE (`path(foreach (1, .[0:2]) as $k (.; .[0:2]|.[0:2]))` on `[1,2]`, where
+    the accumulator's path and the register's are two different slice chains over one array and
+    proving them the same node needs the base array's value).
   - **A `foreach`'s bare `$k` over a navigated element names that element's position** (jq mode,
     `Origin::SnapshotAt`), which is what lets an empty array certify against the step register:
     `path(foreach .a as $k (0; $k; .))` on `{"a":[]}` is jq's `["a"]`
