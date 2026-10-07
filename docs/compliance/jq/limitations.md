@@ -2726,11 +2726,17 @@ is the revert that established what the other one costs.
    computed key and a `catch` handler around one keep the register too. `fans_out` then stopped
    at a nested pipe, which carries the register through its own stages as a top-level pipe body
    does, so a comma or call inside one keeps it as well (`path(foreach .x as $w (0; try ($w \|
-   .a, .b?); .))` is `["x","a"]`, `["x","b"]`, as in jq). It still counts a comma, a
-   destructuring bind, a fold and a call *above* every pipe, the split #3145 guards, and such a
-   body still differs from jq: `(foreach .x as $w (0; try (($w \| .a[]), $w); .)) = 9` is
-   `{"a":[{"b":1}],"x":9}` in jq and leaves the document unchanged here, a silently skipped
-   write ([#3862](https://github.com/rust-works/succinctly/issues/3862)). Marking the withheld register lost (#3267) would make it refuse loudly, but also
+   .a, .b?); .))` is `["x","a"]`, `["x","b"]`, as in jq). It still counts a
+   destructuring bind, a fold and a call *above* every pipe, and a comma above one unless each
+   of its siblings is a pipe or cannot move the register (the split #3145 guards; `$v[0]?` in
+   its `($v[0]?, $v)` is the pipe `$v \| .[0]?`). A comma forks, so jq runs every sibling
+   from the register the comma was entered with, and a bare sibling states that register on its
+   own, as a `//` alternate does: `(foreach .x as $w (0; try (($w \| .a[]), $w); .)) = 9` is
+   `{"a":[{"b":1}],"x":9}` in jq and here
+   ([#3862](https://github.com/rust-works/succinctly/issues/3862), pinned by
+   `test_foreach_update_under_try_with_a_comma_above_a_pipe_keeps_the_register_3862`). A sibling
+   that navigates without a pipe (`.a?`, `first(.a)`) still withholds the register, as before.
+   Marking a withheld register lost (#3267) would make it refuse loudly, but also
    turns rows that match jq today into refusals, where jq's own `try` catches a real error
    (`(foreach .a as $w (0; try (($w \| .c \| .z), $w.b); .)) = 9` writes nothing in either).
    A bare `$k` reached through a `//` alternate relocates to the register even when the left
@@ -2739,15 +2745,15 @@ is the revert that established what the other one costs.
    `cannot_move_register` answers is asked of the alternate alone
    ([#3788](https://github.com/rust-works/succinctly/issues/3788), pinned by
    `test_foreach_update_bare_var_alternate_keeps_the_register_3788`). Still refused loudly where
-   jq answers: a bare `$k` in a comma body (`path(foreach .a as $k (0; $k, ($k \| .c); .))`,
-   the register is withheld from a body that fans out), a by-value alternate followed by an
+   jq answers: a by-value alternate followed by an
    EXTRACT `$k` (`path(foreach .a as $k (0; ($k \| .b) // 5; $k))`), and an alternate that is
-   not a bare operand: a pipe after the `//` (`(($k \| .b) // $k) \| .c`, `... // $k \| $k`) or a
-   comma inside it (`($k \| .b) // ($k, $k)`), all pinned by
+   not a bare operand: a pipe after the `//` (`(($k \| .b) // $k) \| .c`, `... // $k \| $k`), all
+   pinned by
    `test_foreach_update_alternate_shapes_the_3788_carry_does_not_reach_characterize`. Pinned by
    `test_foreach_update_under_try_over_a_generator_keeps_the_register_3738`,
    `test_foreach_update_under_try_around_a_generator_keeps_the_register_3770`,
-   `test_foreach_update_under_try_with_a_comma_inside_a_pipe_keeps_the_register_3770` and, for what stays,
+   `test_foreach_update_under_try_with_a_comma_inside_a_pipe_keeps_the_register_3770`,
+   `test_foreach_update_under_try_with_a_comma_above_a_pipe_keeps_the_register_3862` and, for what stays,
    `test_foreach_update_under_try_with_sibling_branches_characterize_preexisting_bug_3770`.
 
    **`resolve_as_pattern`'s own first-step identity test recognizes every
