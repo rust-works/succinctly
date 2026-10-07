@@ -9229,18 +9229,18 @@ fn eval_owned_door_arm<S: EvalSemantics>(
             }
             _ => return None,
         },
-        Builtin::Startswith(pattern) | Builtin::Endswith(pattern) => {
-            match (input, literal(pattern)?) {
-                (OwnedValue::String(s), OwnedValue::String(pattern)) => {
-                    OwnedValue::Bool(if matches!(builtin, Builtin::Startswith(_)) {
-                        s.starts_with(&*pattern)
-                    } else {
-                        s.ends_with(&*pattern)
-                    })
-                }
-                _ => return None,
+        Builtin::Startswith(pattern) => match (input, literal(pattern)?) {
+            (OwnedValue::String(s), OwnedValue::String(pattern)) => {
+                OwnedValue::Bool(s.starts_with(&*pattern))
             }
-        }
+            _ => return None,
+        },
+        Builtin::Endswith(pattern) => match (input, literal(pattern)?) {
+            (OwnedValue::String(s), OwnedValue::String(pattern)) => {
+                OwnedValue::Bool(s.ends_with(&*pattern))
+            }
+            _ => return None,
+        },
         Builtin::ToString => match input {
             OwnedValue::String(_) => input.clone(),
             _ => OwnedValue::String(owned_to_string::<S>(input).into()),
@@ -56063,7 +56063,7 @@ fn eval_owned_pure_in<S: EvalSemantics>(
             | Builtin::Startswith(_)
             | Builtin::Endswith(_)
             | Builtin::ToString,
-        ) if door => eval_owned_door_arm::<S>(expr, input),
+        ) if door && position == ResultPosition::Operand => eval_owned_door_arm::<S>(expr, input),
         // `[e]` for a single-output pure `e` is the one-element array of
         // `e`'s answer: no generator to collect, so the evaluator's own
         // array collection is this and an error from `e` is its error. An
@@ -104070,6 +104070,28 @@ mod tests {
         values.push(OwnedValue::array_from(
             (0..40).map(OwnedValue::Int).collect(),
         ));
+        // #3707: keys out of insertion order and non-ASCII, floats whose
+        // spelling a re-read could change.
+        let mut unsorted = indexmap::IndexMap::new();
+        unsorted.insert("\u{e9}".to_string(), OwnedValue::Int(1));
+        unsorted.insert("b".to_string(), OwnedValue::Int(2));
+        unsorted.insert("a".to_string(), OwnedValue::Int(3));
+        values.push(OwnedValue::Object(unsorted.into()));
+        values.push(OwnedValue::array_from(vec![
+            OwnedValue::Float(0.1),
+            OwnedValue::from_number_literal::<JqSemantics>("1e-7"),
+        ]));
+        for text in [
+            "1.0e100",
+            "1e-7",
+            "0.30000000000000004",
+            "100000000000000000000",
+        ] {
+            values.push(OwnedValue::from_number_literal::<JqSemantics>(text));
+        }
+        values.push(OwnedValue::Float(0.1 + 0.2));
+        values.push(OwnedValue::Float(1e-7));
+        values.push(OwnedValue::Float(1e100));
         let conds = [
             "length >= 2",
             "length == 0",
@@ -104097,6 +104119,15 @@ mod tests {
             "(.a | has(0))",
             "(keys | length) == 2",
             "keys | length > 0",
+            "keys | .[0] == \"a\"",
+            "keys | .[0] == \"b\"",
+            "keys | .[1] == \"\u{e9}\"",
+            "keys | .[0] == 0",
+            "tostring == \"1.0e100\"",
+            "tostring == \"0.30000000000000004\"",
+            "tostring == \"1e-7\"",
+            "tostring == \"[0.1,1e-7]\"",
+            "[.] | tostring | startswith(\"[[\")",
             "(.a | keys | length) == 1",
             "startswith(\"x\")",
             "endswith(\"r\")",

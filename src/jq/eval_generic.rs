@@ -44046,17 +44046,28 @@ mod tests {
                 "{query}: {reindexes} reindexes over 50 rounds"
             );
         }
-        // Shapes the door declines keep the bridge and jq's answers.
-        for (query, want) in [
-            (r#"null | until(has("a"); {a: 1}) | .a"#, vec!["1"]),
+        // Shapes the door declines keep the bridge and jq's answers: a `null`
+        // input under `has`, a generator-taking `any`, a computed `has` key.
+        // The reindex count shows the bridge answered the loop's condition.
+        for (query, want, bridged) in [
+            (r#"null | until(has("a"); {a: 1}) | .a"#, vec!["1"], false),
             (
-                r#"{i:0} | until(.i >= 3 and (.i | tostring | startswith("3")); .i += 1) | .i"#,
-                vec!["3"],
+                "{i:0, d:.} | until(any(.i; . >= 50); .i += 1) | .i",
+                vec!["50"],
+                true,
             ),
-            ("[] | until(any(.[]; . == 1); . + [1]) | length", vec!["1"]),
+            ("[] | until(has(1 - 1); . + [1]) | length", vec!["1"], false),
+            (
+                "[] | until(has(40 + 9); . + [1]) | length",
+                vec!["50"],
+                true,
+            ),
         ] {
-            let (got, _) = outputs_and_reindexes(doc, query);
+            let (got, reindexes) = outputs_and_reindexes(doc, query);
             assert_eq!(got, want, "{query}");
+            if bridged {
+                assert!(reindexes > 3, "{query}: {reindexes} reindexes");
+            }
         }
     }
 
