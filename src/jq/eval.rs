@@ -59149,35 +59149,24 @@ fn scan_for_path_source(expr: &Expr, names: &[String], calls: bool) -> bool {
         // $r.score)` and make its in-place assignment step decline. Nothing found
         // that way is not "nothing here": the source may itself hold a read (a
         // passthrough pipe's `if` condition), so the ordinary descent still runs.
-        _ => {
-            if let Some((source, var, body)) = plain_bind(e) {
-                if is_loop_var_itself(source, names)
-                    && scan_for_path_source(body, &with_alias(names, var), calls)
-                {
-                    return Visit::Found;
-                }
-            }
-            Visit::Descend
-        }
-    })
-}
-
-/// `SRC as $v | BODY`, spelled as an `as` or as a destructuring bind of the one
-/// pattern `$v`: `(SRC, "v", BODY)` (#3898). Any other pattern binds a component,
-/// not the node.
-fn plain_bind(expr: &Expr) -> Option<(&Expr, &str, &Expr)> {
-    match expr {
-        Expr::As { expr, var, body } => Some((expr, var, body)),
-        Expr::AsPattern {
-            expr,
-            patterns,
+        // A bare `$v` pattern is always an `Expr::As` (`parse_as_pattern`); an
+        // `AsPattern` is a destructuring or a `?//` chain, which binds a component
+        // or an alternative and is deliberately not an alias.
+        Expr::As {
+            expr: source,
+            var,
             body,
-        } => match patterns.as_slice() {
-            [Pattern::Var(var)] => Some((expr, var, body)),
-            _ => None,
-        },
-        _ => None,
-    }
+        } => {
+            if is_loop_var_itself(source, names)
+                && scan_for_path_source(body, &with_alias(names, var), calls)
+            {
+                Visit::Found
+            } else {
+                Visit::Descend
+            }
+        }
+        _ => Visit::Descend,
+    })
 }
 
 /// `names` plus `alias`, for scanning the body of an `as` that renames a loop
