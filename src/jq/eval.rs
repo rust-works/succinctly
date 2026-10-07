@@ -33970,10 +33970,15 @@ fn is_try_scoped_component(component: &Expr) -> bool {
 
 /// Whether `e` is a no-op in path position: `.`, or a pipe or parenthesised group of
 /// them. No `INDEX` runs, so jq's register is neither moved nor checked (#3853).
+/// Read-only and conservative (an `Optional` or anything else answers `false`), so the
+/// body is never cloned to ask.
 fn body_performs_no_step(e: &Expr) -> bool {
-    let mut flat = Vec::new();
-    push_path_components(&mut flat, e);
-    flat.is_empty()
+    match e {
+        Expr::Identity => true,
+        Expr::Paren(inner) => body_performs_no_step(inner),
+        Expr::Pipe(stages) => stages.iter().all(body_performs_no_step),
+        _ => false,
+    }
 }
 
 /// Flatten an expression into the list of path components it denotes.

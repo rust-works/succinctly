@@ -63470,20 +63470,28 @@ fn test_foreach_source_destructuring_the_register_moves_it_3744() -> Result<()> 
 }
 
 /// #3744, narrowed by #3853: what routing a `foreach (. as PATTERN | ...)` source costs, in
-/// the safe direction. Inside `and`/`or`/`-` under a `try` or `?`, the resolver's terminal
-/// "Invalid path expression with result" refusal is uncatchable by design while jq's own
-/// `try` catches the equivalent error. #3853 lifted the cases where that refusal came from
-/// the source's own `.` body (see [`test_routed_foreach_source_under_try_is_caught_3853`]); a
-/// later `?`-wrapped navigation off the moved register is still the resolver's guess, so it
-/// stays refused until the `and`/`or` left operand states the register the fold left.
-/// Pinned so lifting it is a deliberate change; the jq answer is in the row.
+/// the safe direction. A navigation off the register a routed `foreach` moved, as the right
+/// operand of an `and`/`or` (`(.a | .b)?`, jq's `try`), is refused where jq's own `try`
+/// catches the path error, because the `and`/`or` left operand does not state the register
+/// the fold left, so the resolver can only guess it (and a guess is uncatchable). #3853
+/// lifted the refusals that came from the source's own `.` body (see
+/// [`test_routed_foreach_source_under_try_is_caught_3853`]); these stay refused, for the
+/// routed source and the nested `foreach . as PAT` alike. Pinned so lifting it is a
+/// deliberate change; the jq answer is in each row.
 #[test]
 fn test_foreach_source_destructuring_register_under_try_stays_refused_3744() -> Result<()> {
-    for (input, filter, jq_answer) in [(
-        r#"{"a":[true]}"#,
-        r"del(. as $x | ((foreach (. as {$a} | .) as $k (.; .; .)) and (.a | .b)?) | $x)",
-        "{\"a\":[true]}",
-    )] {
+    for (input, filter, jq_answer) in [
+        (
+            r#"{"a":[true]}"#,
+            r"del(. as $x | ((foreach (. as {$a} | .) as $k (.; .; .)) and (.a | .b)?) | $x)",
+            "{\"a\":[true]}",
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            r"del(try ((foreach (foreach . as {a:$a} (0; .; .)) as $x (.; .; .)) and (.a | .b)?))",
+            "{\"a\":1,\"b\":2}",
+        ),
+    ] {
         let routes = [
             ("stdin", run_jq_full(&["-c", filter], Some(input))?),
             (
@@ -63504,6 +63512,55 @@ fn test_foreach_source_destructuring_register_under_try_stays_refused_3744() -> 
         }
     }
     Ok(())
+}
+
+/// #3853: a destructuring bind with a no-op body (`. as {a:$a} | .`) hands the register-
+/// carrying element on instead of refusing at the body, so wherever it sits the NEXT step or
+/// the end of the path is what refuses, as in jq: `path(. as {a:$a} | .)` raises at the end
+/// (with `first`, `limit`, `//`, `,`, `select(true)`, a frozen `$v` after it, and `|=`),
+/// `| .a` raises at the step, `?` and `try` catch it, and `| empty` never reaches either.
+/// The must-not-change rows of the new routing: the same refusals as before for every
+/// non-`try` shape, and `| empty` (which used to refuse) now answers. Every row captured
+/// from jq 1.7.1, on the stdin and `-n` routes.
+#[test]
+fn test_destructure_bind_with_a_no_op_body_defers_its_refusal_3853() -> Result<()> {
+    let doc = r#"{"a":[true]}"#;
+    let with_result = r#"Invalid path expression with result {"a":[true]}"#;
+    let near_a = r#"Invalid path expression near attempt to access element "a" of {"a":[true]}"#;
+    assert_path_rows_both_routes_3749(&[
+        (doc, r"path(. as {a:$a} | .)", "", with_result, 5),
+        (doc, r"[path(. as {a:$a} | .)?]", "[]\n", "", 0),
+        (doc, r"path(first(. as {a:$a} | .))", "", with_result, 5),
+        (doc, r"path(limit(1; . as {a:$a} | .))", "", with_result, 5),
+        (doc, r"path((. as {a:$a} | .) // .)", "", with_result, 5),
+        (doc, r"path((. as {a:$a} | .), .)", "", with_result, 5),
+        (
+            doc,
+            r"path((. as {a:$a} | .) | select(true))",
+            "",
+            with_result,
+            5,
+        ),
+        (
+            doc,
+            r"path(. as $v | (. as {a:$a} | .) | $v)",
+            "",
+            with_result,
+            5,
+        ),
+        (doc, r"path((. as {a:$a} | .) | .a)", "", near_a, 5),
+        (doc, r"del((. as {a:$a} | .) | .a?)", "", near_a, 5),
+        (doc, r"path((. as {a:$a} | .) | empty)", "", "", 0),
+        (
+            doc,
+            r"del(. as {a:$a} | . | empty)",
+            "{\"a\":[true]}\n",
+            "",
+            0,
+        ),
+        (doc, r"del(try (. as {a:$a} | .))", "", with_result, 5),
+        (doc, r"(. as {a:$a} | .) |= 3", "", with_result, 5),
+    ])
 }
 
 /// #3853: a routed `foreach` source (`. as PATTERN | .`) hands its element on with the
