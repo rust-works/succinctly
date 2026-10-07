@@ -92188,6 +92188,7 @@ const FOLD_LOOP_VARIABLE_IDENTITY_3896: &[(&str, &str)] = &[
         "\"0\"",
     ),
     ("reduce ([nan]) as $a (0; [$a] | IN([$a]))", "true"),
+    ("reduce ([nan]) as $a (0; [$a,$a] - [$a])", "[]"),
     ("reduce ([nan]) as $a (0; [$a,$a] | unique | length)", "1"),
     ("[reduce ([nan]) as $a ((0,1); $a == $a)]", "[true,true]"),
     ("[foreach ([nan]) as $a ((0,1); $a == $a)]", "[true,true]"),
@@ -92279,6 +92280,39 @@ fn test_fold_container_loop_variable_identity_through_document_input_3896() -> R
             "{\"a\":[1]}",
             "[path(foreach (.a) as $x (.; $x; select($x == $x)))]",
             "[[\"a\"]]",
+            0,
+        ),
+        // A later INIT fork shares too, and a write through the loop variable
+        // still refuses there (its SOURCE reads `null` in jq): the marker is
+        // the element's own storage, never the accumulator's.
+        (
+            "{\"a\":1}",
+            "[reduce (.) as $x ((.,.); ($x.a) = 9 | . == $x)]",
+            "",
+            5,
+        ),
+        (
+            "{\"a\":1}",
+            "[reduce (.) as $x ((.,.); if $x == $x then ($x.a) = 9 else . end)]",
+            "",
+            5,
+        ),
+        (
+            "{\"a\":1}",
+            "[foreach (.) as $x ((.,.); ($x.a) = 9; . == $x)]",
+            "",
+            5,
+        ),
+        (
+            "{\"a\":1}",
+            "[path(reduce (.) as $x ((.,.); if $x == $x then $x else . end))]",
+            "",
+            5,
+        ),
+        (
+            "{\"a\":[1]}",
+            "[reduce (.a) as $x ((.,.); $x == $x)]",
+            "[true,true]",
             0,
         ),
         (

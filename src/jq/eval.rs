@@ -58448,8 +58448,14 @@ pub(crate) fn fold_loop_variable_shares_identity<S: EvalSemantics>(
 }
 
 /// Whether `expr` reads one of `names` *and* holds a node that can run jq's
-/// value equality: a `==`/`!=` anywhere, or a builtin or call (whose body may
-/// compare: `unique`, `index`, `IN`, a `def f: $a == $a`) outside an assignment.
+/// value equality: a `==`/`!=` anywhere, or an array subtraction, a builtin or
+/// a call (whose body may compare: `unique`, `index`, `IN`, a `def f: $a == $a`)
+/// outside an assignment.
+///
+/// Deliberately not narrowed to a node that itself mentions the variable
+/// (`$a | .[0] == .[0]` compares the variable's own elements): a marker is the
+/// element's own storage, so over-approximating only skips a rebuild, and the
+/// one place a marker costs anything is an assignment (below).
 ///
 /// An assignment's path and right-hand side are read by value and mostly keys
 /// and scores, and a marker anywhere in one makes `owned_assign_step` decline
@@ -58484,7 +58490,11 @@ fn loop_var_can_be_compared(expr: &Expr, names: &[String]) -> bool {
                 }
             } else if matches!(
                 e,
-                Expr::Builtin(_)
+                // Array subtraction (`[$a, $a] - [$a]`) runs `jv_equal` too.
+                Expr::Arithmetic {
+                    op: ArithOp::Sub,
+                    ..
+                } | Expr::Builtin(_)
                     | Expr::FuncCall { .. }
                     | Expr::NamespacedCall { .. }
                     | Expr::DefCall { .. }
@@ -58823,7 +58833,12 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
     let init_flow = drive_init(&mut |init_val| {
         terminal.begin();
         let first = core::mem::take(&mut first_fork);
-        // #3896: identity sharing holds on every fork; only the path marking is first-fork-only.
+        // #3896: sharing holds on every fork -- a constant source is shared on each --
+        // while the path marking stays first-fork-only. A marker is the element's own
+        // storage (`Origin::Untracked`, nothing registered), which on a later fork is
+        // never the accumulator's, so it certifies no write jq refuses
+        // (`test_fold_container_loop_variable_identity_through_document_input_3896`'s
+        // multi-fork rows).
         let mark = (mark_loop_vars && first) || share_loop_vars;
         // #3895: jq runs every later fork's SOURCE against `null`.
         let source_input = if first {
@@ -58957,7 +58972,12 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
     let init_flow = drive_init(&mut |init_val| {
         terminal.begin();
         let first = core::mem::take(&mut first_fork);
-        // #3896: identity sharing holds on every fork; only the path marking is first-fork-only.
+        // #3896: sharing holds on every fork -- a constant source is shared on each --
+        // while the path marking stays first-fork-only. A marker is the element's own
+        // storage (`Origin::Untracked`, nothing registered), which on a later fork is
+        // never the accumulator's, so it certifies no write jq refuses
+        // (`test_fold_container_loop_variable_identity_through_document_input_3896`'s
+        // multi-fork rows).
         let mark = (mark_loop_vars && first) || share_loop_vars;
         // #3895: jq runs every later fork's SOURCE against `null`.
         let source_input = if first {
@@ -76389,6 +76409,7 @@ mod tests {
             "reduce . as [$a] (0; $a == $a)",
             "reduce . as $a ?// [$a] (0; $a == $a)",
             "reduce . as $a (0; [$a] | index([$a]))",
+            "reduce . as $a (0; [$a, $a] - [$a])",
             "reduce . as $a (0; f($a))",
             "reduce . as $a (0; def f: $a == $a; f)",
             "reduce . as $a (.; .x = ($a == $a))",
