@@ -33385,10 +33385,6 @@ mod tests {
         }
     }
 
-    /// #3639: a `label` met at a position with no prefetch hook (the absent-
-    /// position and `|=` entries build none) has no break to catch, so it is
-    /// rewritten like any other wrapper and keeps its name, in either mode --
-    /// the catch is `CONSUMERS_DRIVE_PREFETCHED_BODY`'s, which `yq` leaves off.
     /// #3278: the helper yq's write boundary narrows on matches both depth
     /// ceilings' exact message and nothing else.
     #[test]
@@ -33408,6 +33404,10 @@ mod tests {
         assert_eq!(depth_guard_panic_message(&*not_text), None);
     }
 
+    /// #3639: a `label` met at a position with no prefetch hook (the absent-
+    /// position and `|=` entries build none) has no break to catch, so it is
+    /// rewritten like any other wrapper and keeps its name, in either mode --
+    /// the catch is `CONSUMERS_DRIVE_PREFETCHED_BODY`'s, which `yq` leaves off.
     #[test]
     fn label_without_a_prefetch_hook_keeps_its_body_3639() {
         fn resolved<S: EvalSemantics>() -> Expr {

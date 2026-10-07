@@ -5888,38 +5888,21 @@ fn discard_yq_partial_prefix<V: DocumentValue>(result: GenericResult<V>) -> Gene
 }
 
 /// Main entry point for the yq command.
-/// `run_yq` behind the net for the depth guards yq's own write pipeline
-/// asserts (#3278).
 ///
-/// `owned_value_align_hash`, `reconcile_presentation_at_depth`,
-/// `scan_anchor_soundness`, `strip_presentation_style_at_depth` and
-/// `emit_yaml_value_at_depth` each `assert_value_tree_depth` on the *result*
-/// of an evaluation that already succeeded (`.a |= deep(400)` builds a value
-/// past `MAX_VALUE_TREE_DEPTH` with no adversarial document involved), so
-/// there is no `Result` to thread the signal through without re-signing the
-/// whole emission recursion. This boundary reports exactly that panic -- and
-/// only that one -- as the diagnostic `run_jq` already gives it, exiting with
-/// yq's own error status. The default panic hook is replaced for the call by
-/// one that stays silent for that message alone, so the raw `thread
-/// panicked` line does not precede the diagnostic; any other panic goes to
-/// the original hook and is re-raised unchanged.
-// `PanicInfo` is the hook's type on this crate's 1.73 MSRV; newer toolchains
-// renamed it `PanicHookInfo` and deprecate the old name.
-#[allow(deprecated)]
+/// Runs [`run_yq_inner`] behind the net for the depth guards yq's own write
+/// pipeline asserts (#3278): `owned_value_align_hash`,
+/// `reconcile_presentation_at_depth`, `scan_anchor_soundness`,
+/// `strip_presentation_style_at_depth` and `emit_yaml_value_at_depth` each
+/// `assert_value_tree_depth` on the *result* of an evaluation that already
+/// succeeded (`.a |= deep(400)` builds a value past `MAX_VALUE_TREE_DEPTH`
+/// with no adversarial document involved), so there is no `Result` to thread
+/// the signal through without re-signing the whole emission recursion. This
+/// boundary reports exactly that panic -- and only that one -- as the
+/// diagnostic `run_jq` already gives it, exiting with yq's own error status;
+/// any other panic is re-raised unchanged.
 pub fn run_yq(args: YqCommand) -> Result<i32> {
-    let previous: std::sync::Arc<dyn Fn(&std::panic::PanicInfo<'_>) + Sync + Send> =
-        std::sync::Arc::from(std::panic::take_hook());
-    let forward = previous.clone();
-    std::panic::set_hook(Box::new(move |info| {
-        if depth_guard_panic_message(info.payload()).is_none() {
-            forward(info);
-        }
-    }));
+    silence_depth_guard_panic_line();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_yq_inner(args)));
-    // Put the original hook back (library callers and the test harness share
-    // this process); `previous` is the only owner left once ours is dropped.
-    drop(std::panic::take_hook());
-    std::panic::set_hook(Box::new(move |info| previous(info)));
     match outcome {
         Ok(result) => result,
         Err(payload) => {
@@ -5930,6 +5913,28 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             Ok(exit_codes::YQ_FAILURE)
         }
     }
+}
+
+/// Install, once per process, a panic hook that stays silent for the depth
+/// guards' exact message so the raw `thread panicked` line does not precede
+/// [`run_yq`]'s diagnostic; every other panic goes to the hook that was
+/// there. Installed once rather than swapped per call: the hook is
+/// process-global, so a per-call take/restore would interleave across
+/// threads and nest one wrapper deeper per call.
+// `PanicInfo` is the hook's type on this crate's 1.73 MSRV; newer toolchains
+// renamed it `PanicHookInfo` and deprecate the old name.
+#[allow(deprecated)]
+fn silence_depth_guard_panic_line() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let previous: Box<dyn Fn(&std::panic::PanicInfo<'_>) + Sync + Send> =
+            std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if depth_guard_panic_message(info.payload()).is_none() {
+                previous(info);
+            }
+        }));
+    });
 }
 
 fn run_yq_inner(args: YqCommand) -> Result<i32> {
