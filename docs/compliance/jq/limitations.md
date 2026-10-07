@@ -639,7 +639,8 @@ $x (.; .[$x:]))` raises `E2`, was the slice error). What it leaves:
 ## A fold over the register itself (#3790)
 
 `path(foreach . as $k (0; $k; .))` is `[]` in jq for any document, and succinctly answers it: a fold
-whose SOURCE yields only the register (`.`, or a comma or pipe of them, `yields_only_the_register`)
+whose SOURCE yields only the register (`.`, or a comma or pipe of them, `select` with a literal
+condition, or `try`/`?`/`first`/`limit`/`nth` over one: `yields_only_the_register`, #3956)
 emits its elements at the root path, so a bare `$k` is a path and a write through it lands on the
 root (`foreach` and `reduce` alike). What it leaves, all refusals where jq answers (the safe
 direction), pinned or swept:

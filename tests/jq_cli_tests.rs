@@ -64653,6 +64653,147 @@ fn test_nested_foreach_on_a_null_register_answers_the_member_it_moved_to_3939() 
     ])
 }
 
+/// #3956: the stages that hand the register on without being a syntactic `.` -- `select(true)`,
+/// `first(.)`, `limit(1;.)`, `try (...)`, `label $f | ...` -- are read like #3940's `(.|.)`, so a
+/// register destructure behind them raises where the by-value drive answered `[]` (and a write
+/// through it replaced the document). On a `null` document the destructure moves the register
+/// onto `.a`, and `null` is identical to it by kind, so the path is that member's. Contrasts:
+/// a `select(false)` source emits nothing, and a source with no destructure behind the stage is
+/// still the register itself. A `select(f)` whose condition navigates is left to the by-value
+/// drive (its condition can raise). Every row captured from jq 1.7.1, on the stdin and `-n` routes.
+#[test]
+fn test_foreach_source_destructure_behind_a_register_forwarding_stage_raises_3956() -> Result<()> {
+    let doc = r#"{"a":1,"b":2}"#;
+    let with_result = r#"Invalid path expression with result {"a":1,"b":2}"#;
+    let refused = |filter: &'static str| (doc, filter, "", with_result, 5);
+    assert_path_rows_both_routes_3749(&[
+        refused(r"path(foreach ((.|select(true)) | foreach . as {a:$a} (0;.;.)) as $x (.;.;.))"),
+        refused(r"path(foreach (first(.) | foreach . as {a:$a} (0;.;.)) as $x (.;.;.))"),
+        refused(r"path(foreach (limit(1;.) | foreach . as {a:$a} (0;.;.)) as $x (.;.;.))"),
+        refused(r"path(foreach (try (foreach . as {a:$a} (0;.;.))) as $x (.;.;.))"),
+        refused(r"path(foreach (label $f | foreach . as {a:$a} (0;.;.)) as $x (.;.;.))"),
+        refused(
+            r"path(foreach (select(true) | select(true) | foreach . as {a:$a} (0;.;.)) as $x (.;.;.))",
+        ),
+        refused(r"(foreach ((.|select(true)) | foreach . as {a:$a} (0;.;.)) as $x (.;.;.)) = 9"),
+        refused(r"del(foreach ((.|select(true)) | foreach . as {a:$a} (0;.;.)) as $x (.;.;.))"),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(foreach (first(.) | foreach . as {a:{b:$b}} (0;.;.)) as $x (.;.;.))",
+            "",
+            r#"Invalid path expression with result {"a":{"b":1}}"#,
+            5,
+        ),
+        (
+            r#"{"a":[1,2]}"#,
+            r"path(foreach (select(true) | foreach . as {a:[$p]} (0;.;.)) as $x (.;.;.))",
+            "",
+            r#"Invalid path expression with result {"a":[1,2]}"#,
+            5,
+        ),
+        // On a `null` document the path is the member the destructure moved onto.
+        (
+            "null",
+            r"path(foreach ((.|select(true)) | foreach . as {a:$a} (0;.;.)) as $x (.;.;.))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            r"path(foreach (first(.) | foreach . as {a:$a} (0;.;.)) as $x (.;.;.))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            r"path(foreach (try (foreach . as {a:$a} (0;.;.))) as $x (.;.;.))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            r"(foreach ((.|select(true)) | foreach . as {a:$a} (0;.;.)) as $x (.;.;.)) = 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        // Contrasts: nothing is emitted for `select(false)`, and a forwarding stage with no
+        // destructure behind it is still the register itself.
+        (
+            doc,
+            r"path(foreach (select(false) | foreach . as {a:$a} (0;.;.)) as $x (.;.;.))",
+            "",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach (first(.) | .) as $x (.;.;.))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach (select(true)) as $x (.;.;.))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (doc, r"path(foreach (try .) as $x (.;.;.))", "[]\n", "", 0),
+        (
+            doc,
+            r"path(foreach (limit(1;.)) as $x (.;.;$x))",
+            "[]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
+/// #3956, characterization of what routing the source leaves (#3646). A `foreach` whose
+/// source destructures the register, as the left operand of an `and` inside a `try` or a `?`,
+/// refuses loudly where jq's own (catchable) error is caught and the document is answered
+/// unchanged: the operand states no path register, so the right operand's navigation cannot be
+/// placed (#3646). The syntactic `(.|.)` form routed by #3940 already did this on `main`; the
+/// `select(true)` form joined it with #3956 (its by-value drive answered the same document by
+/// luck). Update the expectations when #3646 is fixed. Captured from jq 1.7.1 with `-c`.
+#[test]
+fn test_routed_foreach_source_as_an_and_operand_under_try_refuses_3646_3956() -> Result<()> {
+    for forwarder in ["(.|.)", "(.|select(true))"] {
+        let rows: [(&str, String); 3] = [
+            (
+                r#"{"a":[true]}"#,
+                format!("del(.a? as $y | try ((foreach ({forwarder} | foreach . as {{a:$a}} (0; .; .)) as $x (.; .; .)) and (.. | .a?)) | try ($y | .b))"),
+            ),
+            (
+                r#"{"a":[true]}"#,
+                format!("(try ((foreach ({forwarder} | foreach . as {{a:$a}} (0; .; .)) as $x (.; .; .)) and (.a | .b)?) catch .) |= 9"),
+            ),
+            (
+                r#"{"a":1,"b":2}"#,
+                format!("del(((foreach ({forwarder} | foreach . as {{a:$a}} (0; .; .)) as $x (.; .; .)) and (.a | .b)?)?)"),
+            ),
+        ];
+        for (input, filter) in &rows {
+            let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+            assert_eq!(
+                (stdout.as_str(), code),
+                ("", 5),
+                "`{filter}` on {input}: stderr {stderr:?}"
+            );
+            assert!(
+                stderr.contains("Invalid path expression"),
+                "`{filter}` on {input}: stderr {stderr:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// #3940: a leading stage that only hands the register on (`.`, `(.|.)`, `(., .)`) moves
 /// nothing, so a register destructure after it is the destructure jq's outer fold meets:
 /// `path(foreach ((.|.) | foreach . as {a:$a} (0;.;.)) as $x (.;.;.))` raises where the
