@@ -70597,23 +70597,87 @@ fn test_foreach_update_try_comma_with_a_navigating_sibling_keeps_the_register_39
             "",
             0,
         ),
-    ])
+    ])?;
+    // The same navigation one layer down: inside a comma, `first`, `last` and a `//`.
+    let doc = r#"{"a":[{"b":1}],"x":{"a":[{"b":1}],"b":2,"c":[5,6]}}"#;
+    assert_path_rows_3289(&[
+        (
+            doc,
+            r"path(foreach .x as $w (.; try ((($w|.c?),.a), 3); .))",
+            "[\"x\",\"c\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .x as $w (.; try (($w|.c), (.a, .b)); .))",
+            "[\"x\",\"c\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .x as $w (.; try (($w|.c), first(.a, .b)); .))",
+            "[\"x\",\"c\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .x as $w (.; try (($w|.c), last(.a)); .))",
+            "[\"x\",\"c\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .x as $w (0; try (($w|.a), (.b // 3)); .)) = 9",
+            "{\"a\":[{\"b\":1}],\"x\":{\"a\":9,\"b\":2,\"c\":[5,6]}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .x as $w (.; try (($w|.c), limit(1; .a)); .))",
+            "{\"a\":[{\"b\":1}],\"x\":{\"a\":[{\"b\":1}],\"b\":2}}\n",
+            "",
+            0,
+        ),
+    ])?;
+    // #3906's last residual row: a comma body of a pipe and `first($k)` (no `try`).
+    assert_path_rows_3289(&[(
+        r#"{"a":{"c":1}}"#,
+        r"path(foreach .a as $k (0; (($k | .b), first($k)); .))",
+        "[\"a\",\"b\"]\n[\"a\"]\n",
+        "",
+        0,
+    )])
 }
 
-/// #3932: the comma read stops at what the resolver can path-check. A builtin the register
-/// analysis does not list (`now`, `input_line_number`) is not a navigation whose error `try`
-/// catches as jq does, so the register stays withheld and the body keeps refusing where
-/// jq refuses (#3960); a pipe of non-navigating stages keeps its #3959 behaviour.
+/// #3932, characterization of what it leaves (#3974). A `select(f)` comma sibling has its own
+/// register rule (#3653) and still withholds the fold's register, so the pipe sibling's `$w`
+/// refuses inside the `try` and the path or write is silently dropped. jq prints `["x","c"]`
+/// and then raises `Invalid path expression` (exit 5) for `path`, and raises for `del`. Update the
+/// expectations when it is fixed.
 #[test]
-fn test_foreach_update_comma_with_an_unlisted_builtin_sibling_stays_withheld_3932() -> Result<()> {
-    let doc = r#"{"a":{"b":1,"c":[1,2]},"z":0}"#;
-    assert_path_rows_3289(&[(
-        doc,
-        r"del(foreach .a as $v (.; (($v | .b?), input_line_number); try ($v | .b?)))",
-        "",
-        "Invalid path expression near attempt to access element \"b\"",
-        5,
-    )])
+fn test_foreach_update_try_comma_select_sibling_characterizes_3974() -> Result<()> {
+    let doc = r#"{"a":[{"b":1}],"x":{"a":[{"b":1}],"b":2,"c":[5,6]}}"#;
+    assert_path_rows_3289(&[
+        (
+            doc,
+            r"path(foreach .x as $w (.; try (($w|.c), select(.a)); .))",
+            "",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .x as $w (.; try (($w|.c), select(.a)); .))",
+            "{\"a\":[{\"b\":1}],\"x\":{\"a\":[{\"b\":1}],\"b\":2,\"c\":[5,6]}}\n",
+            "",
+            0,
+        ),
+    ])
 }
 
 /// #3932: a `foreach` whose UPDATE is a comma of a recursion and a literal answers as jq does.
@@ -71055,7 +71119,8 @@ fn test_foreach_update_alternate_shapes_keep_the_register_3906() -> Result<()> {
 /// direction, and the same on `main` before it). jq's answers are in the comments; update the
 /// expectations when these are fixed. An output of the *left* operand states no register
 /// (`1 // first($k)` answers the `1`), so a stage after it cannot say the register is where it
-/// entered; a comma body whose sibling navigates without a pipe is the split #3145 guards.
+/// entered. (`(($k | .b), first($k))`, the comma-body row that used to be here, answers since
+/// #3932: see `test_foreach_update_try_comma_with_a_navigating_sibling_keeps_the_register_3932`.)
 #[test]
 fn test_foreach_update_alternate_residual_refusals_3906_characterize() -> Result<()> {
     let doc = r#"{"a":{"c":1}}"#;
@@ -71073,14 +71138,6 @@ fn test_foreach_update_alternate_residual_refusals_3906_characterize() -> Result
         (
             doc,
             r"path(foreach .a as $k (0; (first($k) // 5) | $k; .))",
-            "",
-            refusal,
-            5,
-        ),
-        // jq: ["a","b"] then ["a"]
-        (
-            doc,
-            r"path(foreach .a as $k (0; (($k | .b), first($k)); .))",
             "",
             refusal,
             5,

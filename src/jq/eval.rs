@@ -43906,24 +43906,19 @@ fn entry_marker_shape(expr: &Expr) -> EntryMarkers {
 /// expression that cannot move it ([`cannot_move_register`]), whose by-value branch
 /// the comma states the register on ([`carry_frame_register`]). jq forks the
 /// comma, so every sibling starts from the register the comma was entered
-/// with; none of them can refuse where another answers. A sibling that is a plain
-/// navigation (`.b`, `.a?`, `first(.a)`, `.[]?`: [`sibling_navigates_resolvably`]) counts
-/// as one too (#3932): it resolves against the accumulator and raises where jq raises, so a
-/// `try` around the comma catches it as jq's own does, and withholding the register for it
-/// only made the pipe sibling's `$w` refuse inside that `try` and the write vanish. The split
-/// that remains is a sibling the analysis cannot read at all (`now`, `input_line_number`,
-/// a computed key): #3145's `($v[0]?, $v)` is two pipe siblings, `$v[0]?` being `$v | .[0]?`.
+/// with; none of them can refuse where another answers. A plain navigation
+/// (`.b`, `.a?`, `first(.a)`, `.[]?`) counts as one too (#3932): it resolves against the
+/// accumulator and raises where jq raises, so a `try` around the comma catches it as
+/// jq's own does, and withholding the register for it only made the pipe sibling's `$w`
+/// refuse inside that `try` and the write vanish. The split that remains is a sibling the
+/// analysis cannot read at all (`now`, `input_line_number`, a computed key), where the
+/// register stays withheld and the body refuses loudly although jq answers (#3960);
+/// #3145's `($v[0]?, $v)` is two pipe siblings, `$v[0]?` being `$v | .[0]?`.
 fn fans_out(expr: &Expr) -> bool {
     use crate::jq::walk::{search_subexpr, Visit};
     search_subexpr(expr, &mut |e| match e {
         Expr::Pipe(_) => Visit::Skip,
-        Expr::Comma(items)
-            if items.iter().all(|item| {
-                sibling_sees_register_uniformly(item) || sibling_navigates_resolvably(item)
-            }) =>
-        {
-            Visit::Descend
-        }
+        Expr::Comma(items) if items.iter().all(sibling_sees_register_uniformly) => Visit::Descend,
         Expr::Comma(_)
         | Expr::AsPattern { .. }
         | Expr::Reduce { .. }
@@ -43935,9 +43930,18 @@ fn fans_out(expr: &Expr) -> bool {
 }
 
 /// Whether one sibling of a comma resolves against the fold's register exactly
-/// as its siblings do: a pipe (every stage reads the register from the frame)
-/// or an expression that cannot move the register at all, so its by-value
-/// branch is at the register's own node ([`fans_out`], #3862).
+/// as its siblings do: a pipe (every stage reads the register from the frame),
+/// an expression that cannot move the register at all, so its by-value
+/// branch is at the register's own node ([`fans_out`], #3862), or a plain
+/// navigation (`.b`, `.a?`, `.[]?`; [`is_navigation_node`], #3932). A navigation
+/// resolves against the accumulator, not the register, and raises where jq raises,
+/// so a `try` around the comma catches it as jq's own does. A builtin the register
+/// analysis does not list (`now`, `input_line_number`) and a computed key (`.a[.b]`)
+/// are neither, so they keep the register withheld (#3960).
+///
+/// The wrappers that add no movement of their own recurse into their operand, so
+/// the answer follows jq's fork through `first(.a, .b)`, `(.a, .b)`, `(.b // 3)`
+/// and `last(.a)` as it does through a bare sibling.
 fn sibling_sees_register_uniformly(expr: &Expr) -> bool {
     match expr {
         Expr::Pipe(_) => true,
@@ -43946,27 +43950,21 @@ fn sibling_sees_register_uniformly(expr: &Expr) -> bool {
         | Expr::Try {
             expr: inner,
             catch: None,
-        } => sibling_sees_register_uniformly(inner),
+        }
+        | Expr::FirstExpr(inner)
+        | Expr::LastExpr(inner)
+        | Expr::Limit { expr: inner, .. }
+        | Expr::Builtin(
+            Builtin::FirstStream(inner) | Builtin::LastStream(inner) | Builtin::NthStream(_, inner),
+        ) => sibling_sees_register_uniformly(inner),
         Expr::Comma(items) => items.iter().all(sibling_sees_register_uniformly),
         // The alternate runs after jq backtracked out of the left operand, so each
         // side states its own register (#3788).
         Expr::Alternative(left, right) => {
             sibling_sees_register_uniformly(left) && sibling_sees_register_uniformly(right)
         }
-        other => cannot_move_register(other),
+        other => cannot_move_register(other) || is_navigation_node(other),
     }
-}
-
-/// Whether one sibling of a comma is a plain navigation the resolver path-checks as jq does
-/// (`.b`, `.a?`, `first(.a)`, `.[]`): the wrappers [`peel_register_transparent`] reads, over
-/// one navigation step ([`is_navigation_node`]). It resolves against the accumulator, not the
-/// register, and raises where jq raises, so a `try` around the comma catches it exactly as jq's
-/// own does (#3932). A builtin the register analysis does not list (`now`,
-/// `input_line_number`) is not one: its refusal is no jq error, so the register stays withheld
-/// and the body refuses loudly (#3960).
-fn sibling_navigates_resolvably(expr: &Expr) -> bool {
-    let peeled = peel_register_transparent(expr);
-    is_navigation_node(peeled)
 }
 
 /// jq's own `jv_identical(v, jq->value_at_path)`, modeled for a value type
@@ -131535,11 +131533,15 @@ mod touched_edge_cases_2999 {
             ("(($w | .a) // $w)", true),
             ("(($w | .a), $w)", true),
             ("$w", true),
-            (".a", false),
-            (".a?", false),
-            ("first(.a)", false),
+            // #3932: a plain navigation is read, alone or under a wrapper that adds no movement.
+            (".a", true),
+            (".a?", true),
+            ("first(.a)", true),
+            ("(($w | .a) // .b)", true),
+            // A handler, a computed key and an unlisted builtin are not.
             ("try (.a) catch 1", false),
-            ("(($w | .a) // .b)", false),
+            (".a[.b]", false),
+            ("now", false),
         ] {
             assert_eq!(
                 sibling_sees_register_uniformly(&parse(src).unwrap()),
@@ -131547,8 +131549,8 @@ mod touched_edge_cases_2999 {
                 "sibling_sees_register_uniformly({src})"
             );
         }
-        // `fans_out` follows it: a comma of such siblings stays, one with a bare
-        // navigating sibling still counts (#3145), and a call above the pipes does too.
+        // `fans_out` follows it: a comma of such siblings stays, one with a sibling it cannot
+        // read still counts (#3145), and a call above the pipes does too.
         for (src, fans) in [
             ("try (($w | .a[]), $w)", false),
             ("($w | .a), ($w | .b)", false),
@@ -131565,6 +131567,14 @@ mod touched_edge_cases_2999 {
             ("try (($w | .a), input_line_number)", true),
             ("try (($w | .a), (.a | length))", false),
             ("try (($w | .a), .a[.b])", true),
+            // The wrappers that add no movement recurse: a navigation one layer down counts.
+            ("try (($w | .a), (.a, .b))", false),
+            ("try (($w | .a), first(.a, .b))", false),
+            ("try (($w | .a), last(.a))", false),
+            ("try (($w | .a), (.b // 3))", false),
+            ("try (($w | .a), limit(1; .a))", false),
+            // `select(f)` has its own register rule and stays withheld (#3974).
+            ("try (($w | .a), select(.a))", true),
             ("try (($w | .a), f)", true),
         ] {
             assert_eq!(fans_out(&parse(src).unwrap()), fans, "fans_out({src})");

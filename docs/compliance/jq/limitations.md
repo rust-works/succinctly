@@ -2786,7 +2786,11 @@ is the revert that established what the other one costs.
    `{"a":[{"b":1}],"x":{"a":9,"b":2}}` in jq and here (the register used to be withheld, the pipe
    sibling's `$w` refused inside the `try` and the write was silently skipped; pinned by
    `test_foreach_update_try_comma_with_a_navigating_sibling_keeps_the_register_3932`). A sibling the
-   register analysis cannot read (`now`, `input_line_number`, a computed key `.a[.b]`) still withholds it.
+   register analysis cannot read (`now`, `input_line_number`, a computed key `.a[.b]`) still withholds it, so the body
+   refuses loudly where jq answers ([#3960](https://github.com/rust-works/succinctly/issues/3960)), and a `select(f)` sibling,
+   which has its own register rule, still skips the write silently
+   ([#3974](https://github.com/rust-works/succinctly/issues/3974); `test_foreach_update_try_comma_select_sibling_characterizes_3974`).
+   The read follows `first`, `last`, `limit`, `nth`, a nested comma and a `//` down to the navigation.
    A comma that mixes a navigating pipe with a sibling that leaves the register alone is read
    too ([#3941](https://github.com/rust-works/succinctly/issues/3941)): in `del(foreach .a as $v
    (.; (($v \| .b?), 1); try ($v \| .b?)))` the pipe moves the register to `a.b` (its EXTRACT
