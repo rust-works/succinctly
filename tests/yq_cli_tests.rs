@@ -23512,6 +23512,36 @@ fn test_isvalid_has_yq_type_mismatch_is_valid_917() -> Result<()> {
     Ok(())
 }
 
+/// #3278: a value a filter builds past `MAX_VALUE_TREE_DEPTH` and then hands to
+/// yq's own write/emission pipeline is reported as `nesting depth exceeds limit
+/// of 384` with yq's error status, not an uncaught panic (exit 101 plus a raw
+/// `thread panicked` line).
+#[test]
+fn test_yq_deep_filter_built_value_is_a_clean_error_3278() -> Result<()> {
+    let deep = "def deep(m): if m == 0 then . else [deep(m - 1)] end;";
+    for filter in [
+        format!("{deep} .a |= deep(400)"),
+        format!("{deep} .a = deep(400)"),
+        format!("{deep} deep(400)"),
+    ] {
+        let (stdout, stderr, code) =
+            run_yq_stdin_with_stderr(&filter, "a: 1\n", &["--jq-extensions"])?;
+        assert_eq!(
+            code, 1,
+            "`{filter}` -- stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert!(
+            stderr.contains("nesting depth exceeds limit of 384"),
+            "`{filter}` -- stderr: {stderr:?}"
+        );
+        assert!(
+            !stderr.contains("panicked"),
+            "`{filter}` -- stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #998: `yq --input-format json` on adversarially deep input must never
 /// raw stack-overflow (confirmed live before #998, `succinctly yq
 /// --input-format json '.'` on a 200,000-level-deep document aborted with
