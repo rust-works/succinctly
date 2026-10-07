@@ -1185,9 +1185,6 @@ CASES_EOF
 # comment inside the `$( )`, so the closing `)` vanished).
 read -r -d '' REFUSE_ONLY <<'REFUSE_EOF' || true
 source-rebuilt-container:the source navigates inside a construction, which jq's suspended tracking allows but the resolver refuses; falls back to a plain value
-select-wrapped-source:the witness grammar is pure navigation (is_pure_navigation); a select-wrapped source binds by value
-alternative-source:the witness grammar is pure navigation; a // source binds by value
-if-source:the witness grammar is pure navigation; an if source binds by value
 optional-source-over-construction:#3519 -- a ? after a construction (`([$q] | .[0]?) as $y`) is refused by the resolver where jq's suspended tracking allows it; the postfix ? lets that refusal through to the by-value fallback, which binds a plain value
 optional-source-computed-key:#3519 -- a computed key under ? is not on the witness grammar's literal-key gate (is_constant_key_navigation), so the source binds by value
 optional-source-computed-slice:#3519 -- same gate, for a computed slice bound
@@ -1196,16 +1193,12 @@ marker-not-at-head:a marker is re-rooted only at the head of a source; elsewhere
 destructure-bind-after-pattern:#2649 residue 1 -- a plain bind on the ambient input after a pattern moved the register: resolve_bind_source needs a trackable stage, and the pattern's body stage is not
 destructure-alt-navigation:#2649 residue 3 -- the body navigates the ambient input, which raises a near-access refusal the artefact guard cannot tell from an artefact, so the ?// does not retry
 destructure-comma-marker-nav:#2649 residue 4 -- pre-existing comma shape: a nested Pipe gets no register, so $q[0] inside a comma raises near-access (limitations.md, #2042)
-carried-register-passthrough:pre-existing (#2042): once the register is only *carried* (an untracked stage), a select/label/first/getpath passthrough re-seeds it from the ambient value and the marker no longer re-establishes; if/try/`. as $q | .`/literals keep it. Twin of literal-then-fold-untracked-init, found by the #2649 fuzz
-destructure-passthrough-stage:the destructuring door onto carried-register-passthrough -- a pattern body starts on an untracked stage, so the same select/label/first/getpath passthroughs drop the register; the baseline binary refuses the plain-bind twin identically, so this is not #2649's
 owned-embed-fold-update-rebuilt-by-nonwrite:#3181 review -- a witnessed step runs its UPDATE through the owned re-index bridge, so even an UPDATE returning `.` hands the next step a rebuilt copy (the owned-embed-fold-if-identity mechanism)
 owned-embed-fold-if-identity:#2889 -- an `if` UPDATE returning `.` is not one of eval_owned_navigation's recognized shapes, so embed_peel_step declines and the accumulator goes through the owned re-index bridge
 identity-if-arms-differ:#2978 -- identity_bind_position is static: an if whose arms sit at different positions ($p at [], . at ["a"]) proves neither, so the bind stays a bare Snapshot and getpath has no position to compose from; jq evaluates the condition
-untracked-opaque-stage-lost-register:#3120 review -- an opaque stage (reduce, a def call, first) drops the carried register, so the walk has none and refuses without retrying; jq refuses the step too and retries onto the bare alternative, whose empty body then writes nothing. main echoed the document by the ambient-null coincidence the fix removes
 untracked-later-step-refusal-no-retry:#3120 review -- refusal_is_exact is decided per source, and a marker that is the register is value-equal to it, so a later-step refusal after a certified first step is treated as a guess and does not retry; jq retries onto $w. The trackable twin retries and agrees
 catch-payload-own-node-refuse-only:#3133 -- error(.) raises the register node itself and jq answers ["a"]; the payload equals the register by value but is not null/bool and carries no marker, so it cannot be told from a rebuilt copy (catch-rebuilt-payload-refuses) and the handler stays untracked
 computed-identity-bind-mixed-if:#3133 -- an if source with one arm a computed `.` and the other a marker binds Untracked on an untracked stage (the condition is not evaluated); jq evaluates it and binds the marker
-fold-body-fanout-declines:#3145 review -- the register reaches a fold body only when that body cannot fan out: a nested pipe sees it while a sibling branch of the same multi-output body does not, so an UPDATE that refused wholesale could half-succeed and drive a ?// retry jq never performs, writing a key jq never names. Refusing the whole body is the safe side of that asymmetry
 fold-body-fanout-declines-del:#3145 review -- the del twin: jq writes {"a":{}}, the half-success wrote nothing at exit 0, and declining refuses loudly instead
 scalar-string-keeps-tostring-twice:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
 scalar-string-keeps-ltrimstr-nomatch:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
