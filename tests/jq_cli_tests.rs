@@ -64914,6 +64914,75 @@ fn test_reduce_update_handing_back_the_accumulator_after_a_destructure_3953() ->
             r#"Invalid path expression near attempt to access element "a" of false"#,
             5,
         ),
+        // Review of the first version (each deleted or overwrote the document where jq raises):
+        // a `foreach` under a `reduce` whose source navigated, a foreach after a bind, a bind
+        // INIT, a source hidden under `first`, and a nested foreach that yields nothing for one
+        // element and leaves its state `null`.
+        (
+            "[true]",
+            r"del(reduce .[]? as $k (.; foreach .[]? as $k (.; .; .)))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            "[true]",
+            r"(reduce .[]? as $k (.; foreach .[]? as $k (.; .; .))) |= 5",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":{"b":3},"b":2}"#,
+            r"del(reduce .[]? as $k (.; . as {b:$b} | foreach 1 as $e (.; .; .)))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":[1],"b":2}"#,
+            r"del(reduce .[]? as $k (.; reduce (1,2) as $j (.; foreach .a as $e (.; .; .))))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":[1],"b":2}"#,
+            r"del(reduce 1 as $k (.; foreach .[]? as $j ((. as {a:$a} | .); .; .)))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"del(reduce 1 as $k (.; (. as {a:$a} | foreach first(. as {a:$a} | .) as $j (.; .; .))))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(reduce 1 as $k (.; foreach (1,2) as $x (.; (foreach (select($x==2)) as $y (.; .; .)); .)))",
+            "",
+            "Invalid path expression with result null",
+            5,
+        ),
+        // A destructuring loop pattern steps on the element, off the accumulator's register.
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce . as {a:$q} (.; (. as {a:$a} | .)))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        // Under a `try` jq swallows the error and leaves the document.
+        (
+            "[true]",
+            r"del(try (reduce (.[]?, 1) as $k (.; foreach .[]? as $e (.; .; .))))",
+            "[true]\n",
+            "",
+            0,
+        ),
     ])
 }
 

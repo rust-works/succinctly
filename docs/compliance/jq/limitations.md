@@ -3430,8 +3430,16 @@ answers `["b"]` — and classified the two residuals appended below):
   `near attempt to access element "b"`), and `path(reduce .[]? as $k (.; .k |= 1))` on
   `{"a":true,"k":2}` (jq quotes `[{"a":true,"k":1},[]]`). A `?//` chain after a failed first
   alternative quotes the document where jq quotes `null` (`path(reduce .a as [$x] ?// $x (.;
-  (.k, .)))` on `{"a":[1],"k":2}`). What remains unmodelled is a dual provenance for an UPDATE
-  that navigates *and* hands back the accumulator it started from.
+  (.k, .)))` on `{"a":[1],"k":2}`). The dual provenance for an UPDATE that navigates *and* hands
+  back the accumulator it started from is modelled for a syntactic subset only
+  ([#3953](https://github.com/rust-works/succinctly/issues/3953)): `.`, a pipe of such, a
+  single-pattern bind of `.` whose body is one, and a `foreach` whose INIT, UPDATE and EXTRACT are
+  no-ops over a source the resolver path-checks, inside an outermost `reduce` whose source, INIT and
+  loop pattern cannot move the register (`path(reduce 1 as $k (.; (. as {a:$a} | .)))` is `[]`).
+  Still refused where jq answers, never a write: a navigated INIT (`path(reduce 1 as $k (.a; . as
+  [$a] | .))`), a bind or a destructuring loop pattern in a nested `foreach`'s UPDATE or EXTRACT, a
+  bare `. as $x` in the chain, an UPDATE that reaches the same node through `first(.)`/`limit`/`if`,
+  and a closure-parameter UPDATE.
 - **A `?//` retry that rests on a guessed first-step refusal refuses a tracked path ([#3781](https://github.com/rust-works/succinctly/issues/3781)).**
   jq takes a destructuring pattern's first step *on* the register when the bind source passes `.`
   through (`select(true)`, `select(.a)`, `(.|.)`, `first(.)`, `limit(1; .)`), so a body that

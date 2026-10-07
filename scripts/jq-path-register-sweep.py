@@ -422,6 +422,12 @@ OPERANDS = [
     # contrasts return a destructured `$var`, destructure with an array pattern, or follow the
     # bind with a navigation. The dangerous direction is a `reduce` whose own source navigated
     # (the `reduce-update-first-source`/`computed-key` contexts), where `.` is not the register.
+    # Review of the first version: shapes that deleted or overwrote the document where jq raises.
+    "(reduce 1 as $j (.; foreach .[]? as $e (.; .; .)))",
+    "(. as {b:$b} | foreach 1 as $e (.; .; .))",
+    "(foreach .[]? as $j ((. as {a:$a} | .); .; .))",
+    "(. as {a:$a} | foreach first(. as {a:$a} | .) as $j (.; .; .))",
+    "(foreach (1,2) as $x (.; (foreach (select($x == 2)) as $y (.; .; .)); .))",
     "(. as {a:$a} | .)",
     "(. as [$a] | .)",
     "(. as {a:$a} | $a)",
