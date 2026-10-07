@@ -2299,7 +2299,10 @@ is the revert that established what the other one costs.
    they answered `null` for any key, which in `path()` was the root's own `null` and so answered
    `[[]]` for `[path(indices(true))]` on `null` where jq raises
    (`test_indices_family_looks_up_a_null_or_object_input_3890`). Swept over the eight `indices`/
-   `index`/`rindex` operands (106,587 rows, base vs candidate, `scripts/jq-path-register-sweep.py`):
+   `index`/`rindex` operands (106,587 rows, base vs candidate; `scripts/jq-path-register-sweep.py
+   --base main=<build of the parent commit> --candidate <build> --operand 'indices(true)' --operand
+   'index(true)' --operand 'rindex(null)' --operand 'indices([true])' --operand 'index("a")' --operand
+   'rindex("a")' --operand 'indices(true, null)' --operand 'indices(empty)' --jobs 6`):
    `ACCEPT_WRONG` 210 → 0, `MATCH` 104,645 → 105,297, `REFUSE_WRONG` 1,712 → 1,280, `DIFF` 20 → 10.
    The one cost is 14 rows that matched jq by accident: `index("a")`/`rindex("a")` on
    `{"a":[true]}` was the wrong `null`, so `del((index("a") and (.a)?) // .a)` (and the
