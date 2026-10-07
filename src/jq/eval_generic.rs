@@ -4521,6 +4521,11 @@ fn fold_generic_owned_values<V: DocumentValue, S: EvalSemantics>(
 /// A `,` head behind a pipe of navigation comes here too (#3476): `exprs` are
 /// the head's branches and `tail` the stages each one is piped through
 /// ([`split_comma_head`]); a plain `,` body has an empty `tail`.
+/// The node count from which [`comma_array_generic`] returns the slack of its
+/// node list (#3923). Below it the list is a handful of cursors and the
+/// realloc costs more than the slack holds.
+const SHRINK_NODES_AT: usize = 64;
+
 fn comma_array_generic<S: EvalSemantics, V: DocumentValue>(
     exprs: &[Expr],
     tail: &[Expr],
@@ -4589,8 +4594,12 @@ fn comma_array_generic<S: EvalSemantics, V: DocumentValue>(
     let Some(mut elems) = elems else {
         // `push`/`extend` may have doubled the buffer: `[.[], .[0]]` over 300k
         // strings otherwise holds 600k slots while its values are built, or
-        // for as long as the sequence lives.
-        nodes.shrink_to_fit();
+        // for as long as the sequence lives. A short list wastes nothing worth
+        // a realloc, and the per-record `[., empty]`/`[.name, .age]` shapes
+        // paid one each (+4% Ir on x86_64, #3923).
+        if nodes.len() >= SHRINK_NODES_AT {
+            nodes.shrink_to_fit();
+        }
         if nodes.iter().any(DocumentCursor::is_container) {
             return GenericResult::LazySeq(Box::new(LazySeq::from_repeating_cursors(nodes)));
         }
@@ -44998,6 +45007,42 @@ mod tests {
             run(doc, "[., ., .]"),
             "a malformed document"
         );
+    }
+
+    /// #3923: a `,` array over a handful of nodes keeps the list it pushed
+    /// into (no per-record realloc), and one over many nodes still returns its
+    /// slack (`[.[], .[0]]` over 300k strings must not hold 600k slots).
+    #[test]
+    fn test_comma_array_shrinks_only_a_long_node_list_3923() {
+        let capacity = |query: &str, json: &str| {
+            let index = JsonIndex::build(json.as_bytes());
+            let expr = crate::jq::parse(query).unwrap();
+            let GenericResult::LazySeq(seq) =
+                eval_with_cursor_using::<JqSemantics, _>(&expr, index.root(json.as_bytes()))
+            else {
+                panic!("`{query}` is a cursor sequence"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3923)"
+            };
+            let LazySource::Cursors {
+                cursors,
+                may_repeat,
+                ..
+            } = &seq.source
+            else {
+                panic!("`{query}` is a cursors source"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3923)"
+            };
+            assert!(may_repeat);
+            (cursors.len(), cursors.capacity())
+        };
+        let (len, cap) = capacity("[., empty]", r#"{"a":[1]}"#);
+        assert_eq!(len, 1);
+        assert!(cap > len, "a short list is not shrunk (capacity {cap})");
+        let items: Vec<String> = (0..SHRINK_NODES_AT + 36)
+            .map(|i| format!("[{i}]"))
+            .collect();
+        let doc = format!("[{}]", items.join(","));
+        let (len, cap) = capacity("[.[], .[0]]", &doc);
+        assert_eq!(len, SHRINK_NODES_AT + 37);
+        assert_eq!(cap, len, "a long list returns its slack");
     }
 
     /// #3317: the `,` producer's sequence prints as its `Cursors` source,
