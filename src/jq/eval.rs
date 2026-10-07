@@ -49190,6 +49190,11 @@ fn resolve_foreach<'a, S: EvalSemantics>(
     // An INIT escape still surfaces only after every fork it preceded has
     // run, exactly as the collecting `flow_result(init_escape)` tail did:
     // `resolve_node_sink` reports it after delivering its prefix.
+    // #3883: nothing after the source can move the step register -- the same `UPDATE` and
+    // `EXTRACT` for every element, so judged once. (`INIT` and the source are already in the
+    // step register: `FoldRegister::enter` and `foreach_step_register` place it after them.)
+    let step_cannot_move =
+        cannot_move_register(update) && extract.map_or(true, cannot_move_register);
     let mut fork_index = 0usize;
     // Set by the sink when a fork ends the whole call; it outranks INIT's
     // own trailing escape, which jq never reaches once a consumer has
@@ -49463,13 +49468,27 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                         Cow::Borrowed(value),
                                     )))
                                 } else if let Some(register) = walked_at.filter(|reg| {
+                                    // #3883: nothing after the source moved the register, so a
+                                    // computed emission leaves it where the source put it -- the
+                                    // step register's own path, which a branch demoted to the
+                                    // root does not carry. An `AtEntry` at exactly that path
+                                    // says the same on its own (#3939).
                                     !branch.trackable
-                                        && *branch.path == *reg.path
-                                        && matches!(branch.register, BranchRegister::AtEntry)
+                                        && matches!(
+                                            branch.register,
+                                            BranchRegister::None | BranchRegister::AtEntry
+                                        )
+                                        && (*branch.path == *reg.path
+                                            && matches!(branch.register, BranchRegister::AtEntry)
+                                            || step_cannot_move
+                                                && (branch.path.depth() == 0
+                                                    || *branch.path == *reg.path))
                                 }) {
-                                    sink(branch.with_register(BranchRegister::Unmoved(Cow::Owned(
-                                        register.value.clone(),
-                                    ))))
+                                    let mut moved = branch.with_register(BranchRegister::Unmoved(
+                                        Cow::Owned(register.value.clone()),
+                                    ));
+                                    moved.path = Rc::clone(&register.path);
+                                    sink(moved)
                                 } else {
                                     sink(branch)
                                 }

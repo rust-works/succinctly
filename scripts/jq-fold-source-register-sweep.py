@@ -32,8 +32,8 @@ the alphabet. Run `--self-test` to print the pools.
 
 Two-sided staleness gate, as the other oracle sweeps have: the run fails on
 any divergence outside `KNOWN_RESIDUALS` -- the (source, category) pairs whose
-remaining divergences are recorded (#3460: pointer identity; a nested navigating
-`foreach`, recorded in docs/compliance/jq/limitations.md) -- and on any recorded pair that
+remaining divergences are recorded (#3460: pointer identity, recorded in
+docs/compliance/jq/limitations.md) -- and on any recorded pair that
 *stops* occurring, so the table cannot go stale. `--print-residuals` prints
 the observed table for regenerating it after a deliberate change.
 
@@ -75,7 +75,8 @@ SRCS += [
 # move the register exactly as `.a`/`.[1]` do, but a key with no `.`/`.[]` of its own once
 # slipped past `drive_fold_source`'s navigation gate and was driven by value (#2159). And a
 # nested `foreach` emits its values off the resolver's root path whatever its own source
-# navigated, so the fold reads them as literals (a tracked residual, see KNOWN_RESIDUALS).
+# navigated; it states the register its source left when that is a `null`/boolean member and
+# nothing after the source can move it (#3883, closed).
 SRCS += [
     '.[1+1]|tostring', '.["a"|ascii_downcase]|tostring', '.[0:(1+1)]|tostring',
     '.[[1]]|length', '.[1+1]', 'foreach .[]? as $x (0; .+1)', 'reduce .[]? as $x (0; .+1)',
@@ -98,10 +99,6 @@ FORMS = ['path({k} ({s}) as $k ({i}; {u}))', '({k} ({s}) as $k ({i}; {u})) = 9']
 #   path-mode gap that is not specific to a fold (#3460's second half). The accumulator
 #   carried across source elements, `..`/`recurse` and a full slice of the accumulator
 #   are closed (#3460).
-#   `foreach .[]? as $x (0; .+1)` -- a nested navigating `foreach`: its values
-#   come back off the resolver's root path, which `drive_fold_source` reads as
-#   a lost register, so it refuses where jq may answer (it used to read as a
-#   literal and FABRICATE).
 #   `..|tostring`, `recurse|tostring`, `walk(.)|tostring`, `.[0:]|tostring`, `.[0:1]|tostring`,
 #   `.[0:(1+1)]|tostring` -- the same pointer identity, reached over a bare string document
 #   (`"s"`, `""`, added with #3930): `tostring` of a string is the same `jv`, so jq answers
@@ -114,7 +111,6 @@ KNOWN_RESIDUALS = {
     'recurse|tostring': ['REJECT'],
     'walk(.)|tostring': ['REJECT'],
     '.b|tostring': ['REJECT'],
-    'foreach .[]? as $x (0; .+1)': ['REJECT'],
 }
 
 
