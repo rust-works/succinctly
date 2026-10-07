@@ -61042,6 +61042,116 @@ fn test_reverse_raises_unconditionally_2744() -> Result<()> {
     Ok(())
 }
 
+/// #3888: `INDEX(f)` iterates its input first (`INDEX(.[]; f)`), whatever it is,
+/// and `transpose` iterates once some row has a length above zero -- so on a
+/// value the resolver is not tracking both raise jq's `Invalid path expression
+/// near attempt to iterate through <input>` inside `path`/`del`/`=`. Every row
+/// captured live from jq 1.7.1 as `[path((INPUT | BUILTIN) | empty)]` over `{}`.
+#[test]
+fn test_index_and_transpose_raise_inside_path_on_an_untracked_value_3888() -> Result<()> {
+    for (filter, input) in [
+        // `INDEX(f)` navigates on every input, empty and scalar ones included.
+        ("[[1]] | INDEX(.)", "[[1]]"),
+        ("[1] | INDEX(.[0])", "[1]"),
+        ("[] | INDEX(.)", "[]"),
+        ("{} | INDEX(.)", "{}"),
+        (r#""abc" | INDEX(.)"#, r#""abc""#),
+        ("5 | INDEX(.)", "5"),
+        ("null | INDEX(.)", "null"),
+        // `transpose` navigates once the longest row is not empty, and the path
+        // error beats the value error the access would raise itself.
+        ("[[1,2],[3]] | transpose", "[[1,2],[3]]"),
+        ("[1] | transpose", "[1]"),
+        (r#"[1,"a"] | transpose"#, r#"[1,"a"]"#),
+        ("[-5] | transpose", "[-5]"),
+        ("[0.5] | transpose", "[0.5]"),
+        ("[[1],null] | transpose", "[[1],null]"),
+        (r#"{"a":[1]} | transpose"#, r#"{"a":[1]}"#),
+        // `max` sorts a `NaN` below every number, so an all-`NaN` row set still
+        // iterates (`range(0; nan)` is not empty) and a mixed one does not.
+        ("[nan] | transpose", "[null]"),
+        ("[nan,nan] | transpose", "[null,null]"),
+        ("[nan,1] | transpose", "[null,1]"),
+    ] {
+        for program in [
+            format!("[path(({filter}) | empty)]"),
+            format!("del(({filter}) | empty)"),
+            format!("({filter} | empty) = 1"),
+        ] {
+            let (stdout, stderr, code) = run_jq_full(&["-c", &program], Some("{}"))?;
+            assert_eq!(code, 5, "#3888: `{program}`: stdout {stdout:?}");
+            assert!(stdout.is_empty(), "#3888: `{program}`: {stdout:?}");
+            assert!(
+                stderr.contains(&format!(
+                    "Invalid path expression near attempt to iterate through {input}"
+                )),
+                "#3888: `{program}`: wanted {input:?}, got {stderr:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// #3888: where `transpose` does not reach its access it answers, a failure of its
+/// own `map(length)` comes first, and `?` catches the raise. Captured live from
+/// jq 1.7.1.
+#[test]
+fn test_transpose_stays_silent_or_raises_its_value_error_first_in_path_3888() -> Result<()> {
+    for filter in [
+        // `[]` is jq's own early exit; every other row set here has no length.
+        "[path(([] | transpose) | empty)]",
+        "[path(([[]] | transpose) | empty)]",
+        "[path(([[],[]] | transpose) | empty)]",
+        "[path(([null] | transpose) | empty)]",
+        r#"[path((["",{}] | transpose) | empty)]"#,
+        "[path(([0.0] | transpose) | empty)]",
+        "[path(([nan,0] | transpose) | empty)]",
+        // `?` catches the raise, for either builtin.
+        "[path(([[1]] | transpose)?)]",
+        "[path(([[1]] | INDEX(.))?)]",
+        // A tracked input is jq's register: its own iteration cannot raise.
+        r#"{"a":[[1]]} | [path(.a | INDEX(.) | empty)]"#,
+        r#"{"a":[[1]]} | [path(.a | transpose | empty)]"#,
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("{}"))?;
+        assert_eq!(code, 0, "#3888: `{filter}`: stderr {stderr:?}");
+        assert_eq!(stdout.trim(), "[]", "#3888: `{filter}`");
+    }
+    // `map(length)` runs in a subexpression: its failures are value errors, in
+    // row order, and win over the path error.
+    for (filter, message) in [
+        (
+            r#"[path(("a" | transpose) | empty)]"#,
+            r#"Cannot iterate over string ("a")"#,
+        ),
+        (
+            "[path((null | transpose) | empty)]",
+            "Cannot iterate over null (null)",
+        ),
+        (
+            "[path((5 | transpose) | empty)]",
+            "Cannot iterate over number (5)",
+        ),
+        (
+            "[path(([[1], true] | transpose) | empty)]",
+            "boolean (true) has no length",
+        ),
+        (
+            r#"[path(({"a": false} | transpose) | empty)]"#,
+            "boolean (false) has no length",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("{}"))?;
+        assert_eq!(code, 5, "#3888: `{filter}`: stdout {stdout:?}");
+        assert!(stderr.contains(message), "#3888: `{filter}`: {stderr:?}");
+        assert!(
+            !stderr.contains("Invalid path expression"),
+            "#3888: `{filter}`: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3347: `indices`, `index` and `rindex` on a value the resolver is not
 /// tracking raise jq's `Invalid path expression`, naming the access jq's own
 /// definition makes -- which depends on the *evaluated pattern*, the one thing
