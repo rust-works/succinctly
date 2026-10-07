@@ -61201,6 +61201,146 @@ fn test_indices_family_raises_inside_path_on_the_evaluated_pattern_3347() -> Res
     Ok(())
 }
 
+/// #3890: on an input that is neither an array nor a string, jq's `indices($i)` is
+/// `.[$i]` -- a lookup, not a search -- and `index`/`rindex` then take `.[0]` /
+/// `.[-1:][0]` of what it answered. `null` and an object were answered `null` whatever
+/// the pattern, on the strength of a comment that called it `_strindices`'s answer:
+/// that held for the `null` and `{}` it was probed with and for nothing else, so
+/// `null | indices(true)` answered where jq raises (and `[path(...)]` of it answered
+/// the root path `[[]]`, which `del` and `=` would then have written through), and
+/// `{"a":1} | indices("a")` answered `null` where jq answers `1`. Every row captured
+/// live from jq 1.7.1; `(input, filter, stdout or error text)`.
+#[test]
+fn test_indices_family_looks_up_a_null_or_object_input_3890() -> Result<()> {
+    for (input, filter, want) in [
+        // A key the input cannot take is the indexing error, not `null`.
+        (
+            "null",
+            "indices(true)",
+            Err("Cannot index null with boolean"),
+        ),
+        (
+            "null",
+            "indices(false)",
+            Err("Cannot index null with boolean"),
+        ),
+        ("null", "index(null)", Err("Cannot index null with null")),
+        (
+            "null",
+            "rindex(true)",
+            Err("Cannot index null with boolean"),
+        ),
+        ("null", "indices(null)", Err("Cannot index null with null")),
+        // ...and the same refusal reaches `path`, `del` and a write instead of the
+        // root path.
+        (
+            "null",
+            "[path(indices(true))]",
+            Err("Cannot index null with boolean"),
+        ),
+        (
+            "null",
+            "[path(index(false))]",
+            Err("Cannot index null with boolean"),
+        ),
+        (
+            "null",
+            "del(indices(true))",
+            Err("Cannot index null with boolean"),
+        ),
+        (
+            "null",
+            "(indices(true)) = 1",
+            Err("Cannot index null with boolean"),
+        ),
+        (
+            "null",
+            "[path(null | indices(null))]",
+            Err("Cannot index null with null"),
+        ),
+        // An object looks the key up.
+        (r#"{"a":1}"#, r#"indices("a")"#, Ok("1")),
+        (r#"{"a":[5,6]}"#, r#"indices("a")"#, Ok("[5,6]")),
+        ("{}", r#"indices("a")"#, Ok("null")),
+        (
+            r#"{"a":1}"#,
+            "indices(1)",
+            Err("Cannot index object with number"),
+        ),
+        // `index` / `rindex` apply their own access to the looked-up value.
+        (r#"{"a":[5,6]}"#, r#"index("a")"#, Ok("5")),
+        (r#"{"a":[5,6]}"#, r#"rindex("a")"#, Ok("6")),
+        (r#"{"a":[]}"#, r#"rindex("a")"#, Ok("null")),
+        (r#"{"a":null}"#, r#"index("a")"#, Ok("null")),
+        (
+            r#"{"a":1}"#,
+            r#"index("a")"#,
+            Err("Cannot index number with number"),
+        ),
+        (
+            r#"{"a":1}"#,
+            r#"rindex("a")"#,
+            Err("Cannot index number with object"),
+        ),
+        (
+            r#"{"a":"xyz"}"#,
+            r#"index("a")"#,
+            Err("Cannot index string with number"),
+        ),
+        (
+            r#"{"a":"xyz"}"#,
+            r#"rindex("a")"#,
+            Err("Cannot index string with number"),
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r#"index("a")"#,
+            Err("Cannot index object with number"),
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r#"rindex("a")"#,
+            Err("Cannot index object with object"),
+        ),
+        (
+            r#"{"a":true}"#,
+            r#"index("a")"#,
+            Err("Cannot index boolean with number"),
+        ),
+        (
+            r#"{"a":true}"#,
+            r#"rindex("a")"#,
+            Err("Cannot index boolean with object"),
+        ),
+        // `?` swallows the lookup's own error and takes the looked-up value otherwise.
+        ("null", "indices(true)?", Ok("")),
+        (r#"{"a":1}"#, r#"index("a")?"#, Ok("")),
+        (r#"{"a":1}"#, r#"rindex("a")?"#, Ok("")),
+        (r#"{"a":"xyz"}"#, r#"rindex("a")?"#, Ok("")),
+        ("5", r#"indices("a")?"#, Ok("")),
+        (r#"{"a":1}"#, r#"indices("a")?"#, Ok("1")),
+        (r#"{"a":[5,6]}"#, r#"index("a")?"#, Ok("5")),
+        (r#"{"a":[5,6]}"#, r#"[.. | rindex("a")?]"#, Ok("[6,null]")),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        match want {
+            Ok(expected) => {
+                assert_eq!(code, 0, "#3890: `{input} | {filter}`: stderr {stderr:?}");
+                assert_eq!(stdout.trim(), expected, "#3890: `{input} | {filter}`");
+            }
+            Err(message) => {
+                assert_eq!(code, 5, "#3890: `{input} | {filter}`: stdout {stdout:?}");
+                assert!(stdout.is_empty(), "#3890: `{input} | {filter}`: {stdout:?}");
+                assert!(
+                    stderr.contains(message),
+                    "#3890: `{input} | {filter}`: wanted {message:?}, got {stderr:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// #3347: where `indices` does not navigate -- a string searched for a string --
 /// it answers, and a pattern that is empty or raises never reaches the access at
 /// all (jq's `$i` binding runs first). Captured live from jq 1.7.1.

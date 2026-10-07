@@ -2291,8 +2291,22 @@ is the revert that established what the other one costs.
    rejects them), so it holds in both modes, reached in yq only through `--jq-extensions` (ADR-0018). Pinned in
    `test_indices_family_raises_inside_path_on_the_evaluated_pattern_3347` and its siblings. Still
    diverging, tracked: an array input on a *tracked* value, where jq answers a path through
-   an array key (`path(.a | indices(1))` is `["a",[1]]`), and a string `index`/`rindex` there
-   ([#3890](https://github.com/rust-works/succinctly/issues/3890)). A string searched for the empty
+   an array key (`path(.a | indices(1))` is `["a",[1]]`), a tracked object or `null` whose key is a
+   real path step (`path(.a | indices("x"))` is `["a","x"]`), and a string `index`/`rindex` there
+   ([#3890](https://github.com/rust-works/succinctly/issues/3890)); all three still refuse, in the
+   safe direction. What #3890 fixed is the *value*: `indices`/`index`/`rindex` on `null` or an object
+   are jq's `.[$i]` lookup (`{"a":1} | indices("a")` is `1`, `null | indices(true)` raises), where
+   they answered `null` for any key, which in `path()` was the root's own `null` and so answered
+   `[[]]` for `[path(indices(true))]` on `null` where jq raises
+   (`test_indices_family_looks_up_a_null_or_object_input_3890`). Swept over the eight `indices`/
+   `index`/`rindex` operands (106,587 rows, base vs candidate, `scripts/jq-path-register-sweep.py`):
+   `ACCEPT_WRONG` 210 → 0, `MATCH` 104,645 → 105,297, `REFUSE_WRONG` 1,712 → 1,280, `DIFF` 20 → 10.
+   The one cost is 14 rows that matched jq by accident: `index("a")`/`rindex("a")` on
+   `{"a":[true]}` was the wrong `null`, so `del((index("a") and (.a)?) // .a)` (and the
+   `.a? as $y | try (index("a") and .a) | ...` shape) short-circuited `and` and landed on jq's answer
+   by another road. With jq's own `true` the right operand runs against a register the resolver
+   does not yet move for `index`, so it refuses (exit 5, nothing written) where jq answers; the
+   same programs spelled `.a[0]` still match. They close with the tracked-navigation step above. A string searched for the empty
    string has no match, by value and in these errors alike (`"abc" | indices("")` is `[]`, `index`
    and `rindex` are `null`, as in jq 1.7.1; it was `[0,1,2]`, `0` and `3` until
    [#3889](https://github.com/rust-works/succinctly/issues/3889)).
