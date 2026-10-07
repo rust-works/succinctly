@@ -417,6 +417,16 @@ OPERANDS = [
     "(foreach (foreach . as {a:$a} (0; .; .)) as $x (true; .; .))",
     "(foreach (foreach . as {a:$a} (0; .; .)) as $x (null; .; .))",
     "(foreach (foreach . as {a:$a} ?// [$a] (0; .; .)) as $x (.; .; .))",
+    # (#3940) a leading stage that only hands the register on, ahead of a register destructure.
+    # Contrasts: a bare loop variable, a nested `reduce`, a navigated leading stage.
+    "(foreach ((.|.) | foreach . as {a:$a} (0; .; .)) as $x (.; .; .))",
+    "(foreach (.|.|foreach . as {a:$a} (0; .; .)) as $x (.; .; .))",
+    "(foreach ((., .) | foreach . as {a:$a} (0; .; .)) as $x (.; .; .))",
+    "(foreach ((.|.) | . as {a:$a} | .) as $x (.; .; .))",
+    "(foreach ((.|.) | foreach . as [$a] (0; .; .)) as $x (.; .; .))",
+    "(foreach ((.|.) | foreach . as $a (0; .; .)) as $x (.; .; .))",
+    "(foreach ((.|.) | reduce . as {a:$a} (0; .)) as $x (.; .; .))",
+    "(foreach (.a | foreach . as {a:$a} (0; .; .)) as $x (.; .; .))",
     # (#3790) a fold whose SOURCE is the register itself: `.` does not move jq's register
     # and `$k` is that very node, so a bare `$k` is a path (any value, not only null). The
     # contrasts are a navigated source (`.a`, `.[]?`) and a computed one (`tostring`);

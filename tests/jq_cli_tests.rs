@@ -64396,6 +64396,63 @@ fn test_nested_foreach_on_a_null_register_answers_the_member_it_moved_to_3939() 
     ])
 }
 
+/// #3940: a leading stage that only hands the register on (`.`, `(.|.)`, `(., .)`) moves
+/// nothing, so a register destructure after it is the destructure jq's outer fold meets:
+/// `path(foreach ((.|.) | foreach . as {a:$a} (0;.;.)) as $x (.;.;.))` raises where the
+/// by-value drive answered `[]`, and a write through it replaced the document. Only a pipe's
+/// first stage was read, so any no-op stage ahead of the destructure hid it. Contrasts: a
+/// bare loop variable performs no step, a nested `reduce` backtracks, and a navigating
+/// leading stage is the navigated source's own business. Every row captured from jq 1.7.1,
+/// on the stdin and `-n` routes.
+#[test]
+fn test_foreach_source_destructure_after_a_no_op_leading_stage_raises_3940() -> Result<()> {
+    let doc = r#"{"a":1,"b":2}"#;
+    let with_result = r#"Invalid path expression with result {"a":1,"b":2}"#;
+    let refused = |filter: &'static str| (doc, filter, "", with_result, 5);
+    assert_path_rows_both_routes_3749(&[
+        refused(r"path(foreach ((.|.) | foreach . as {a:$a} (0;.;.)) as $x (.;.;.))"),
+        refused(r"path(foreach (.|.|foreach . as {a:$a} (0;.;.)) as $x (.;.;.))"),
+        refused(r"path(foreach ((.,.) | foreach . as {a:$a} (0;.;.)) as $x (.;.;.))"),
+        refused(r"path(foreach ((.|.) | . as {a:$a} | .) as $x (.;.;.))"),
+        refused(r"path(foreach (.|(. as {a:$a} | .)) as $x (.;.;.))"),
+        refused(r"(foreach ((.|.) | foreach . as {a:$a} (0;.;.)) as $x (.;.;.)) = 9"),
+        refused(r"del(foreach ((.|.) | foreach . as {a:$a} (0;.;.)) as $x (.;.;.))"),
+        (
+            doc,
+            r"path(foreach ((.|.) | foreach . as [$a] (0;.;.)) as $x (.;.;.))",
+            "",
+            "Cannot index object with number",
+            5,
+        ),
+        // On a `null` document the destructure moves the register onto `.a`, and `null` is
+        // identical to it by kind (#3939), so the path is that member's.
+        (
+            "null",
+            r"path(foreach ((.|.) | foreach . as {a:$a} (0;.;.)) as $x (.;.;.))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        // Contrasts: a bare loop variable performs no step, a nested `reduce` backtracks, and
+        // a no-op chain with no destructure at all is the register itself.
+        (
+            doc,
+            r"path(foreach ((.|.) | foreach . as $a (0;.;.)) as $x (.;.;.))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach ((.|.) | reduce . as {a:$a} (0;.)) as $x (.;.;.))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (doc, r"path(foreach (.|.|.) as $x (.;.;.))", "[]\n", "", 0),
+    ])
+}
+
 /// #3790: a `foreach` whose SOURCE is the register itself (`.`, or a comma or pipe of
 /// them) emits an element that is the register's own node, so a bare `$k` bound to
 /// it is a path: `path(foreach . as $k (0; $k; .))` is `[]` for any document, and a
