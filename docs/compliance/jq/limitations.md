@@ -2011,9 +2011,8 @@ is the revert that established what the other one costs.
    **Only the first INIT fork is marked.** jq 1.7.1 evaluates SOURCE against `null` on every later
    fork (`[reduce (.) as $x ((.,.); $x)]` is `[{"a":1},null]`), so a write through `$x` answers once
    and then refuses (`reduce (.) as $x ((.,.); ($x.a) = 9)` prints `{"a":9}`, then errors); marking
-   the later forks would have answered them too. That jq quirk itself — `$x` is `null` there — is not
-   reproduced (a pre-existing divergence: this implementation hands every fork the real source), only
-   the path-position refusal that follows from it.
+   the later forks would have answered them too. A later fork's SOURCE is evaluated against `null`
+   (#3895), so `$x` is `null` there as in jq and the refusal follows from it rather than being added.
 
    Still refused where jq answers, none answering where jq refuses (pinned in
    `test_fold_loop_variable_in_path_position_3329` and the sweep's `fold-loop-var-*` rows):
@@ -9767,130 +9766,59 @@ Pinned per entry by `eval_entry_agrees_with_the_cursor_entry_on_unreadable_value
 reason), and in the CLI by `test_unreadable_value_collection_split_3266`
 (`tests/jq_cli_tests.rs`).
 
-### `foreach`/`reduce`'s INIT-fork re-entry: SOURCE reads real jq's synthetic `null`, not the ambient input — no carve-out; recorded as a still-open policy question (#534, #2163)
+### `foreach`/`reduce`'s INIT-fork re-entry: SOURCE reads `null` after the first fork — matched, no carve-out (#534, #2163, #3895)
 
-`foreach`/`reduce`'s parser accepted a top-level comma in the INIT slot from #534 onward
-(`foreach SOURCE as $x (INIT1, INIT2; ...)`), which forks the whole construct once per INIT
-output, each fork re-running over the same SOURCE stream. Real jq has an internal quirk here
-that this file never documented until now, even though the divergence itself has shipped
-since #534 and is already pinned by `test_reduce_comma_slots`/`test_foreach_comma_slots`
-(`src/jq/eval.rs`) — an ADR-0018 rule 6 gap this entry closes:
+`foreach`/`reduce` accept a top-level comma in the INIT slot (#534), which forks the whole
+construct once per INIT output, each fork re-running over SOURCE. Real jq has an internal quirk
+here: every fork after the first evaluates SOURCE against a synthetic `null`, not the real input —
+an artifact of how jq's VM threads the input register across a backtrack boundary (`DUPN` leaves
+`null` in the slot the next fork resumes from), not a designed feature. `.[]` on that `null`
+raises; a null-tolerant read answers `null` silently:
 
 ```console
-$ echo '[1,2,3]' | jq -c '[reduce .[] as $x (0,1; .+$x)]'
+$ echo '[1,2,3]' | jq -c 'reduce .[] as $x (0,1; .+$x)'
+6
 jq: error (at <stdin>:1): Cannot iterate over null (null)
-$ echo '[1,2,3]' | succinctly jq -c '[reduce .[] as $x (0,1; .+$x)]'
-[6,7]
-```
-
-(real jq's exit code is 5, and — because `[...]` fully buffers its generator before printing
-anything — stdout is completely empty here, not a partial `[6]`; the pre-existing
-`test_reduce_comma_slots`/`test_foreach_comma_slots` code comments in `src/jq/eval.rs`
-understated this the same way, corrected alongside this entry).
-
-Real jq's own bytecode compiler re-enters SOURCE's evaluation once per INIT fork, and for
-every fork after the first, the ambient input (`.`) SOURCE sees there is a synthetic `null`
-— not the real document — an artifact of how jq's VM threads the input register across a
-backtrack boundary, not a designed feature. `.[]` on that synthetic `null` raises "Cannot
-iterate over null"; a null-tolerant field read instead answers `null` silently
-([#2163](https://github.com/rust-works/succinctly/issues/2163) extended the original #534
-finding to this shape):
-
-```console
 $ echo '{"a":1,"c":2}' | jq -c '[foreach (.a) as $k ((0,.c); $k)]'
 [1,null]
-$ echo '{"a":1,"c":2}' | succinctly jq -c '[foreach (.a) as $k ((0,.c); $k)]'
-[1,1]
+$ echo '{"a":1}' | jq -c '[reduce (.) as $x ((.,.,.); $x)]'
+[{"a":1},null,null]
 ```
 
-Two of succinctly's three jq evaluators — `eval.rs`'s value evaluator and
-`eval_generic.rs`'s generic/CLI evaluator — share one core per construct (`reduce_forks`,
-`foreach_forks`), and neither ever substitutes a synthetic `null` for the ambient document.
-Both now re-drive SOURCE per INIT fork — `foreach` since #2180 WP3's review, `reduce` since
-#2899 — against the *real* ambient input every time, which is exactly the half jq does not
-do. (Before #2899 `reduce` differed again: it computed SOURCE's values once, upfront, and
-reused them across every fork, so `[reduce ("s"|stderr) as $x ((0,1); .)]` wrote `s` where
-jq writes `ss`. That half is closed; the synthetic-`null` half is what remains.)
+This was recorded here as an open policy question from #2163 until #3895, and `succinctly jq` now
+matches it: INIT's first output forks a fold whose SOURCE reads the real input, and every later
+output forks one whose SOURCE reads `null`. The decision followed ADR-0018's order — the output is
+readable, nothing is corrupted and nothing crashes, so no rule-4 condition lets us refuse the
+reference, and matching it costs nothing measurable (a single-INIT fold, which is nearly every
+fold, never builds the `null` form of its source).
 
-**#2899 widened this entry's reach**, and the trade is worth stating plainly. `reduce`'s old
-value-caching *accidentally* matched jq on shapes where the only visible difference was
-between "re-drive against the real document" and "re-drive against jq's synthetic `null`" —
-because caching re-drove against nothing at all. Driving per fork correctly is what the `?//`
-fix required, and it exposes the synthetic-`null` gap on those shapes:
+How it is built: the shared fork cores (`foreach_forks`/`reduce_forks`, `src/jq/eval.rs`) tell each
+fork's source drive whether it is the first (`SourceInput::Real`) or a later one
+(`SourceInput::Null`). `ForkSource` answers a later fork with `null | SOURCE`, built on the first
+such fork and reused, which both evaluators already run — neither needs a way to construct a null
+of its own value type. The path-context evaluator's `resolve_reduce`/`resolve_foreach` already did
+this for `path()` and assignment targets (#2388), so all three agree.
 
-```console
-$ echo '{"a":1}' | jq -c 'reduce ((.[]|stderr)?) as $x ((0,1); .)'
-1            # succinctly writes `11`; it wrote `1` before #2899
-```
+What it ties together, all captured from `/usr/bin/jq` 1.7.1 and pinned by
+`test_fold_source_runs_against_null_after_first_init_fork_3895` (`tests/jq_cli_tests.rs`, both the
+stdin and the `-n 'input | ...'` route, the demand-driven and the unbounded-stream drive):
 
-jq's second fork iterates its synthetic `null`, the `?` swallows that error before `stderr`
-runs, so jq writes once; succinctly's second fork iterates the real `{"a":1}` and writes
-again. Stdout and exit codes are unaffected in every such shape. This is the divergence this
-entry already records, reached by more spellings — not a new one, and not something `reduce`
-had ever deliberately matched.
+- **Side effects.** `reduce ((.[]|stderr)?) as $x ((0,1); .)` on `{"a":1}` writes `1` once: the
+  second fork's `.[]` raises on `null`, the `?` swallows it before `stderr` runs (#2899 had made
+  this write `11`).
+- **A `?//` retry that lets the next fork run** (#3293) — the second fork reads `null`:
+  `[first(foreach (. as [$a] ?// [[$b]] | $a // empty) as $x ((0,100); $x; .))]` on `[[1]]` is
+  `[[1]]`, and a `reduce` whose second fork's source raises is jq's `E2` error. Pinned by
+  `test_fold_second_fork_source_reads_null_after_retry_2163_3293`.
+- **Consumers.** `first(...)` stops after the first fork and never reaches the `null` one;
+  `limit(2; ...)` and `isempty(...)` reach it exactly as jq does.
+- **A loop variable in path position** (#3329): `$x` is `null` on a later fork, so
+  `reduce (.) as $x ((.,.); ($x.a) = 9)` answers once and then refuses, as it already did.
 
-**#3293's fold slice widened it again, and here stdout and exit codes can differ.** A fold's
-step error (or a consumer's stop) used to end the whole fold at the first INIT fork, even
-when a `?//` in SOURCE retried past it and produced nothing. jq's retry consumes that verdict
-and lets the next fork run; succinctly now does too, and that second fork reads the real
-input where jq reads its synthetic `null`. Shapes where the old early exit happened to match
-jq change:
-
-```console
-$ echo '[[1]]' | jq -c '[first(foreach (. as [$a] ?// [[$b]] | $a // empty) as $x ((0,100); $x; .))]'
-[[1]]        # succinctly: [[1],[1]]  (`[[1]] | ...` with a literal source gives jq [[1],[1]] too)
-$ echo '[[1]]' | jq -c '[reduce (. as [$a] ?// [[$b]] | $a | if . == null then error("E2") end) as $x (([1] as $a ?// $b | $a); .+1)]'
-jq: error: E2   # succinctly: [1]  (fork 2's source sees `[[1]]`, where jq's sees `null` and raises)
-```
-
-Pinned by `test_fold_second_fork_source_reads_real_input_after_retry_2163_3293`.
-
-That front-end-level agreement (not independent
-double-implementation of the fold itself, since both front ends call the same shared
-functions) is what `test_parity_foreach_reduce_init_fork_source_reads_ambient_input_2163`
-(`tests/jq_evaluator_parity_tests.rs`) pins.
-
-The **third** evaluator — the path-context evaluator's `resolve_reduce`/`resolve_foreach`
-(`src/jq/eval.rs`) — is not part of that shared core and is not consistent with it here: its
-own SOURCE resolution (`drive_fold_source`, added by #2031 for path-trackability, not for
-this divergence) already re-runs once per INIT fork, inside the per-branch loop, using the
-real document every time rather than a cached value — architecturally the closest thing in
-this codebase to what a jq-matching fix would need, but it does not inject a synthetic
-`null`, and in path/assignment position it does not reach the value evaluator's `[1,1]`
-answer at all:
-
-```console
-$ echo '{"a":1,"c":2}' | succinctly jq -c 'path(reduce (.a) as $k ((0,.c); $k))'
-jq: error (at <stdin>:1): Invalid path expression with result 1
-```
-
-This pre-existing three-way inconsistency (a #2031 restriction on navigating INIT forks,
-unrelated to #2163) is filed separately as
-[#2388](https://github.com/rust-works/succinctly/issues/2388) rather than folded into this
-entry, since it is a succinctly-internal-consistency gap, not a jq-fidelity question.
-
-This divergence does not fit any of ADR-0018 rule 4's four named conditions letter-for-letter
-(the output is readable, nothing is corrupted, and the process doesn't die either way), so
-per rule 4 it is recorded here as a still-open policy question — matching this file's own "A
-structurally malformed value doesn't abort the rest of a multi-value stream" entry, which is
-itself still open rather than a settled precedent to build on. Matching jq's quirk exactly
-would mean re-deriving jq's own undocumented VM register-threading rule (which expression
-shapes get a fresh backtrack point, and what `.` reads as across one) and reshaping the
-shared `reduce_forks`/`foreach_forks` core so it evaluates SOURCE per-fork against a
-synthetic `null` document — which is now only the synthetic-`null` half for *both* folds, the
-per-fork re-evaluation itself having landed with #2180 WP3's review for `foreach` and #2899
-for `reduce`. A prior attempt at a narrower version of this fix (nulling only the bound
-pattern variable, not re-deriving SOURCE itself) regressed a passing test
-(`test_eval_reduce_init_partial_prefix_still_forks_when_trailing_error_suppressed_1934`) —
-but that test's own SOURCE is a constant (`5`) that never reads `.` at all, so the regression
-shows only that *that particular* patch shape was wrong, not that a correctly-shaped
-per-fork-null fix is itself infeasible; no such fix has actually been attempted. Given `.[]`'s
-identical case has already shipped since #534 with no user-visible complaint, and
-succinctly's own value-evaluator behavior is arguably more useful than jq's here (one
-consistent value instead of a silent `null`/hard-error split depending on fork position) —
-this is recorded now, with regression coverage in place, as an open question for whoever
-next has reason to attempt the real per-fork re-evaluation, rather than as either a queued
-fix or a closed decision.
+A source that does not read `.` (`range(3)`, a literal, `$var`) cannot tell the forks apart and is
+unaffected. The fold's source expression is still the *as-written* one for `?//` retry detection
+(`FoldDirectRetry`); the `null | ` wrapper is a pipe stage, which that detection already treats as
+"fixed on `std`, previous answer on `no_std`" (see "`reduce`/`foreach` and a `?//`").
 
 ### Caller-supplied NaN literals still avoid the reindex bridge
 

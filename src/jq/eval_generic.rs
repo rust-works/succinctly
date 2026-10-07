@@ -11349,6 +11349,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             let mut outputs: Vec<OwnedValue> = Vec::new();
             let retry =
                 crate::jq::eval::FoldDirectRetry::of::<S>(init, input, patterns, update, None);
+            let mut source = crate::jq::eval::ForkSource::new(input);
             let flow = reduce_forks::<S>(
                 patterns,
                 update,
@@ -11363,9 +11364,9 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                     )
                 },
                 optional,
-                &mut |per_element| {
+                &mut |source_input, per_element| {
                     drive_foreach_expr_generic::<S, V>(
-                        input,
+                        source.expr(source_input),
                         &value,
                         optional,
                         cursor,
@@ -11427,6 +11428,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 update,
                 extract.as_deref(),
             );
+            let mut source = crate::jq::eval::ForkSource::new(input);
             let flow = foreach_forks::<S>(
                 patterns,
                 update,
@@ -11442,9 +11444,9 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                     )
                 },
                 optional,
-                &mut |per_element| {
+                &mut |source_input, per_element| {
                     drive_foreach_expr_generic::<S, V>(
-                        input,
+                        source.expr(source_input),
                         &value,
                         optional,
                         cursor,
@@ -12953,6 +12955,7 @@ fn each_reduce_generic<S: EvalSemantics, V: DocumentValue>(
     // reruns against the fold's own accumulator, never the ambient cursor,
     // and `reduce_forks` demotes it against `Owned` itself.
     let retry = crate::jq::eval::FoldDirectRetry::of::<S>(init, input, patterns, update, None);
+    let mut source = crate::jq::eval::ForkSource::new(input);
     reduce_forks::<S>(
         patterns,
         update,
@@ -12967,8 +12970,15 @@ fn each_reduce_generic<S: EvalSemantics, V: DocumentValue>(
             )
         },
         optional,
-        &mut |per_element| {
-            drive_foreach_expr_generic::<S, V>(input, &value, optional, cursor, false, per_element)
+        &mut |source_input, per_element| {
+            drive_foreach_expr_generic::<S, V>(
+                source.expr(source_input),
+                &value,
+                optional,
+                cursor,
+                false,
+                per_element,
+            )
         },
         retry,
         &mut |v| sink.push(GenericItem::Owned(v)),
@@ -13008,6 +13018,7 @@ fn each_foreach_generic<S: EvalSemantics, V: DocumentValue>(
     // `update`/`extract` rerun against the fold's own accumulator, never the
     // ambient cursor, and `foreach_forks` demotes them against `Owned` itself.
     let retry = crate::jq::eval::FoldDirectRetry::of::<S>(init, input, patterns, update, extract);
+    let mut source = crate::jq::eval::ForkSource::new(input);
     foreach_forks::<S>(
         patterns,
         update,
@@ -13023,8 +13034,15 @@ fn each_foreach_generic<S: EvalSemantics, V: DocumentValue>(
             )
         },
         optional,
-        &mut |per_element| {
-            drive_foreach_expr_generic::<S, V>(input, &value, optional, cursor, false, per_element)
+        &mut |source_input, per_element| {
+            drive_foreach_expr_generic::<S, V>(
+                source.expr(source_input),
+                &value,
+                optional,
+                cursor,
+                false,
+                per_element,
+            )
         },
         retry,
         &mut |v| sink.push(GenericItem::Owned(v)),

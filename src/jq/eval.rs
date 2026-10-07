@@ -55658,12 +55658,25 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     let mut outputs: Vec<OwnedValue> = Vec::new();
-    let mut lazy_drive = |per_element: ForeachElementSink<'_>| -> Flow {
-        drive_lazy::<W, S>(input, value.clone(), optional, per_element)
+    let mut lazy_source = ForkSource::new(input);
+    let mut lazy_drive = |source_input: SourceInput, per_element: ForeachElementSink<'_>| -> Flow {
+        drive_lazy::<W, S>(
+            lazy_source.expr(source_input),
+            value.clone(),
+            optional,
+            per_element,
+        )
     };
-    let mut eager_drive = |per_element: ForeachElementSink<'_>| -> Flow {
-        drive_eager::<W, S>(input, value.clone(), optional, per_element)
-    };
+    let mut eager_source = ForkSource::new(input);
+    let mut eager_drive =
+        |source_input: SourceInput, per_element: ForeachElementSink<'_>| -> Flow {
+            drive_eager::<W, S>(
+                eager_source.expr(source_input),
+                value.clone(),
+                optional,
+                per_element,
+            )
+        };
     let drive: ForeachSourceDrive<'_> = if streams_unbounded(input) {
         &mut eager_drive
     } else {
@@ -58200,13 +58213,26 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // The demand-driven strategy: one element at a time, so the fold's own
     // stop (and any `?//` in the source) is reached exactly as it is under a
     // wrapping `first`/`limit`.
-    let mut lazy_drive = |per_element: ForeachElementSink<'_>| -> Flow {
-        drive_lazy::<W, S>(input, value.clone(), optional, per_element)
+    let mut lazy_source = ForkSource::new(input);
+    let mut lazy_drive = |source_input: SourceInput, per_element: ForeachElementSink<'_>| -> Flow {
+        drive_lazy::<W, S>(
+            lazy_source.expr(source_input),
+            value.clone(),
+            optional,
+            per_element,
+        )
     };
     // The bounded fallback: see this function's own doc comment.
-    let mut eager_drive = |per_element: ForeachElementSink<'_>| -> Flow {
-        drive_eager::<W, S>(input, value.clone(), optional, per_element)
-    };
+    let mut eager_source = ForkSource::new(input);
+    let mut eager_drive =
+        |source_input: SourceInput, per_element: ForeachElementSink<'_>| -> Flow {
+            drive_eager::<W, S>(
+                eager_source.expr(source_input),
+                value.clone(),
+                optional,
+                per_element,
+            )
+        };
     let drive: ForeachSourceDrive<'_> = if streams_unbounded(input) {
         &mut eager_drive
     } else {
@@ -58422,10 +58448,59 @@ fn path_source_position(expr: &Expr, mentions: &dyn Fn(&Expr) -> bool) -> bool {
 /// higher-ranked enough to pass.
 pub(crate) type ForeachElementSink<'a> = &'a mut dyn FnMut(OwnedValue) -> Demand;
 
-/// How [`foreach_forks`] pulls the source: called once per INIT fork,
-/// handing each element to the callback in order and reporting how the
-/// source itself ended.
-pub(crate) type ForeachSourceDrive<'a> = &'a mut dyn FnMut(ForeachElementSink<'_>) -> Flow;
+/// What a fold's SOURCE is evaluated against for one INIT fork (#3895).
+///
+/// jq 1.7.1 hands the *first* fork the fold's real input and every later fork
+/// `null`: `reduce`/`foreach` duplicate the input with `DUPN`, which leaves
+/// `null` behind in the slot the next INIT output resumes from, so
+/// `[reduce (.) as $x ((.,.); $x)]` on `{"a":1}` is `[{"a":1},null]`. A source
+/// that does not read `.` (`range(3)`, a literal) cannot tell the two apart.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SourceInput {
+    /// The fold's own input: the first INIT fork.
+    Real,
+    /// `null`: every INIT fork after the first.
+    Null,
+}
+
+/// A fold's SOURCE expression, handing out the expression to drive for a given
+/// [`SourceInput`] (#3895).
+///
+/// Evaluating against `null` is spelled `null | SOURCE`, which every route --
+/// the `eval.rs` evaluator and the generic one alike -- already evaluates, so
+/// no route needs a way to construct a null of its own value type. The wrapped
+/// expression is built on the first later fork and only then: a fold with a
+/// single INIT output (almost all of them) never clones the source.
+pub(crate) struct ForkSource<'e> {
+    source: &'e Expr,
+    null_source: Option<Expr>,
+}
+
+impl<'e> ForkSource<'e> {
+    pub(crate) fn new(source: &'e Expr) -> Self {
+        Self {
+            source,
+            null_source: None,
+        }
+    }
+
+    /// The expression to drive for `input`; evaluate it against the fold's
+    /// own input either way.
+    pub(crate) fn expr(&mut self, input: SourceInput) -> &Expr {
+        match input {
+            SourceInput::Real => self.source,
+            SourceInput::Null => self.null_source.get_or_insert_with(|| {
+                Expr::pipe(vec![Expr::Literal(Literal::Null), self.source.clone()])
+            }),
+        }
+    }
+}
+
+/// How [`foreach_forks`] pulls the source: called once per INIT fork, told
+/// which input that fork's source runs against ([`SourceInput`]), handing each
+/// element to the callback in order and reporting how the source itself ended.
+pub(crate) type ForeachSourceDrive<'a> =
+    &'a mut dyn FnMut(SourceInput, ForeachElementSink<'_>) -> Flow;
 
 /// How [`foreach_forks`] pulls INIT: called exactly once, handing each INIT
 /// output to the callback in order and reporting how INIT's own generator
@@ -58505,6 +58580,12 @@ impl FoldDirectRetry {
 /// memory for the duration of a fold whose entire point is not to do that,
 /// even in the overwhelmingly common single-INIT case.
 ///
+/// **Every fork after the first drives it against `null`** (#3895): jq 1.7.1
+/// hands only INIT's first output the fold's real input
+/// (`[reduce (.) as $x ((.,.); $x)]` is `[{"a":1},null]`), so `drive_source` is
+/// told which input the fork reads ([`SourceInput`]) and the callers answer a
+/// later fork from [`ForkSource`].
+///
 /// The step's own verdict outranks the source's, and a *fork's* own verdict
 /// (which folds in the step's) outranks INIT's own: a step or fork that
 /// escaped, or that the consumer stopped, aborts the whole construct
@@ -58580,7 +58661,14 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
     let mut first_fork = true;
     let init_flow = drive_init(&mut |init_val| {
         terminal.begin();
-        let mark = mark_loop_vars && core::mem::take(&mut first_fork);
+        let first = core::mem::take(&mut first_fork);
+        let mark = mark_loop_vars && first;
+        // #3895: jq runs every later fork's SOURCE against `null`.
+        let source_input = if first {
+            SourceInput::Real
+        } else {
+            SourceInput::Null
+        };
         let all_var_names =
             all_var_names.get_or_insert_with(|| pattern_alternatives_var_names(patterns));
         let mut state = init_val;
@@ -58596,7 +58684,7 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
         // the retry generation (#3293).
         let ended = StashedVerdict::<Flow>::new();
 
-        let flow = drive_source(&mut |input_val| {
+        let flow = drive_source(source_input, &mut |input_val| {
             ended.begin();
             // Substituted per element as it arrives: the demand-driven path
             // sees one element at a time and can never hoist a whole matrix
@@ -58705,7 +58793,14 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
     let mut first_fork = true;
     let init_flow = drive_init(&mut |init_val| {
         terminal.begin();
-        let mark = mark_loop_vars && core::mem::take(&mut first_fork);
+        let first = core::mem::take(&mut first_fork);
+        let mark = mark_loop_vars && first;
+        // #3895: jq runs every later fork's SOURCE against `null`.
+        let source_input = if first {
+            SourceInput::Real
+        } else {
+            SourceInput::Null
+        };
         let all_var_names =
             all_var_names.get_or_insert_with(|| pattern_alternatives_var_names(patterns));
         let mut acc = init_val;
@@ -58716,7 +58811,7 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
         // recognised by `take` below (#3293).
         let ended = StashedVerdict::<Flow>::new();
 
-        let flow = drive_source(&mut |input_val| {
+        let flow = drive_source(source_input, &mut |input_val| {
             ended.begin();
             let step_acc = core::mem::replace(&mut acc, OwnedValue::Null);
             let (new_acc, step_control) = try_reduce_step_alternatives::<S>(
@@ -58883,8 +58978,14 @@ fn each_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut drive_init = |per_init: &mut dyn FnMut(OwnedValue) -> Demand| -> Flow {
         drive_lazy::<W, S>(init, value.clone(), optional, per_init)
     };
-    let mut drive = |per_element: ForeachElementSink<'_>| -> Flow {
-        drive_lazy::<W, S>(input, value.clone(), optional, per_element)
+    let mut source = ForkSource::new(input);
+    let mut drive = |source_input: SourceInput, per_element: ForeachElementSink<'_>| -> Flow {
+        drive_lazy::<W, S>(
+            source.expr(source_input),
+            value.clone(),
+            optional,
+            per_element,
+        )
     };
     reduce_forks::<S>(
         patterns,
@@ -58966,8 +59067,14 @@ fn each_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         drive_lazy::<W, S>(init, value.clone(), optional, per_init)
     };
 
-    let mut drive = |per_element: ForeachElementSink<'_>| -> Flow {
-        drive_lazy::<W, S>(input, value.clone(), optional, per_element)
+    let mut source = ForkSource::new(input);
+    let mut drive = |source_input: SourceInput, per_element: ForeachElementSink<'_>| -> Flow {
+        drive_lazy::<W, S>(
+            source.expr(source_input),
+            value.clone(),
+            optional,
+            per_element,
+        )
     };
 
     foreach_forks::<S>(
@@ -84075,6 +84182,29 @@ mod tests {
             .collect()
     }
 
+    /// [`outputs`], plus the error the stream ended with, if any: the values
+    /// produced before it stand in front of it, as jq prints them.
+    fn outputs_and_error(json: &[u8], filter: &str) -> (Vec<String>, Option<String>) {
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse(filter).unwrap();
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Partial(values, Control::Error(e)) => (
+                values.iter().map(OwnedValue::to_json).collect(),
+                Some(e.to_string()),
+            ),
+            QueryResult::Error(e) => (Vec::new(), Some(e.to_string())),
+            other => (
+                other
+                    .collect_owned::<YqSemantics>()
+                    .iter()
+                    .map(OwnedValue::to_json)
+                    .collect(),
+                None,
+            ),
+        }
+    }
+
     /// #3466: `cursor_child` names exactly the node `PatternKey::child`
     /// reads its owned value from, and nothing it cannot prove.
     #[test]
@@ -98171,22 +98301,20 @@ mod tests {
         assert_eq!(outputs(b"[1,2,3]", "reduce .[] as $x (0; .+$x, .)"), ["0"]);
 
         // INIT-comma: each INIT output independently forks the whole
-        // reduce, re-running over the *same* source stream. Real jq 1.7.1
-        // diverges here for a reason unrelated to this evaluator: its own
-        // bytecode re-enters `SOURCE` on the second INIT fork with `.`
-        // already clobbered by the first fork's own iteration (`echo
-        // '[1,2,3]' | jq -c 'reduce .[] as $x (0,1; .+$x)'` prints `6` then
-        // errors "Cannot iterate over null" — not `jq -n ...`, which
-        // supplies `null` as `.` from the very first fork and so errors
-        // immediately with nothing printed at all; see
-        // docs/compliance/jq/limitations.md's "INIT-fork re-entry" entry for
-        // the full writeup, including why `[reduce ...]`'s own buffered
-        // array form prints nothing before erroring either). This codebase's
-        // INIT-forking doesn't share that quirk — pinning succinctly's own
-        // consistent value here, not jq's, so a future refactor doesn't
-        // silently change it either way without a failing test to flag it.
+        // reduce, re-running SOURCE per fork -- and jq runs every fork after
+        // the first against a `null` input (#3895), so `.[]` raises there.
+        // `echo '[1,2,3]' | jq -c 'reduce .[] as $x (0,1; .+$x)'` prints `6`
+        // then errors "Cannot iterate over null" (`jq -n ...` supplies `null`
+        // as `.` from the very first fork and errors with nothing printed).
+        // A SOURCE that does not read `.` is unaffected.
+        let (values, error) = outputs_and_error(b"[1,2,3]", "reduce .[] as $x (0,1; .+$x)");
+        assert_eq!(values, ["6"]);
+        assert!(
+            error.is_some_and(|e| e.contains("Cannot iterate over null")),
+            "the second fork's `.[]` runs against null"
+        );
         assert_eq!(
-            outputs(b"[1,2,3]", "reduce .[] as $x (0,1; .+$x)"),
+            outputs(b"[1,2,3]", "reduce range(1;4) as $x (0,1; .+$x)"),
             ["6", "7"]
         );
     }
@@ -98210,20 +98338,25 @@ mod tests {
             ["1", "2", "3", "6", "6", "12"]
         );
 
-        // INIT-comma: same jq-engine-quirk divergence as `reduce` above
-        // (jq prints `1,3,6` then errors; pinning succinctly's own value).
+        // INIT-comma: same null-after-the-first-fork rule as `reduce` above
+        // (#3895): jq prints `1,3,6` then errors on the second fork's `.[]`.
+        let (values, error) = outputs_and_error(b"[1,2,3]", "foreach .[] as $x (0,1; .+$x)");
+        assert_eq!(values, ["1", "3", "6"]);
+        assert!(
+            error.is_some_and(|e| e.contains("Cannot iterate over null")),
+            "the second fork's `.[]` runs against null"
+        );
         assert_eq!(
-            outputs(b"[1,2,3]", "foreach .[] as $x (0,1; .+$x)"),
+            outputs(b"[1,2,3]", "foreach range(1;4) as $x (0,1; .+$x)"),
             ["1", "3", "6", "2", "4", "7"]
         );
     }
 
-    /// #2163: the `test_reduce_comma_slots`/`test_foreach_comma_slots` INIT-fork
-    /// divergence above isn't specific to a `.[]`-iterating SOURCE — real jq's
-    /// underlying quirk (a later INIT fork's own re-evaluation of SOURCE runs
-    /// against a synthetic `null` ambient document, not the real one) fires for
-    /// *any* SOURCE that reads `.`, including a bare field access with no
-    /// iteration at all. Verified live against jq 1.7.1:
+    /// #2163, closed by #3895: the INIT-fork rule above isn't specific to a
+    /// `.[]`-iterating SOURCE — a later INIT fork's SOURCE runs against `null`
+    /// for *any* SOURCE that reads `.`, including a bare field access with no
+    /// iteration at all, which answers `null` silently rather than raising.
+    /// Verified live against jq 1.7.1:
     ///
     /// ```console
     /// $ echo '{"a":1,"c":2}' | jq -c '[foreach (.a) as $k ((0,.c); $k)]'
@@ -98231,22 +98364,15 @@ mod tests {
     /// $ echo '{"a":1,"c":2}' | jq -c '[reduce (.a) as $k ((0,.c); $k)]'
     /// [1,null]
     /// ```
-    ///
-    /// succinctly re-evaluates SOURCE identically for every INIT fork instead
-    /// (each fork's own `.` is the real ambient input), so a null-tolerant
-    /// field read like `.a` answers the same value both times, `1` — pinning
-    /// that consistent value here per the same divergence already accepted for
-    /// the `.[]` case (see `docs/compliance/jq/limitations.md`'s "INIT-fork
-    /// re-entry" entry).
     #[test]
-    fn test_foreach_reduce_init_fork_source_reads_ambient_input_2163() {
+    fn test_foreach_reduce_init_fork_source_reads_null_after_first_fork_2163() {
         assert_eq!(
             outputs(br#"{"a":1,"c":2}"#, "[foreach (.a) as $k ((0,.c); $k)]"),
-            ["[1,1]"]
+            ["[1,null]"]
         );
         assert_eq!(
             outputs(br#"{"a":1,"c":2}"#, "[reduce (.a) as $k ((0,.c); $k)]"),
-            ["[1,1]"]
+            ["[1,null]"]
         );
     }
 

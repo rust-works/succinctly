@@ -2029,12 +2029,11 @@ fn test_parity_positive_index_trailing_comma_2312() {
     assert_error_parity(br"[1,2,3,]", ".[0]");
 }
 
-/// #2163: `foreach`/`reduce`'s INIT-fork re-entry divergence (real jq
-/// re-evaluates SOURCE against a synthetic `null` ambient document for every
-/// INIT fork after the first; succinctly re-evaluates SOURCE against the real
-/// document every time instead — see `docs/compliance/jq/limitations.md`'s
+/// #2163, closed by #3895: `foreach`/`reduce`'s INIT-fork re-entry (real jq
+/// re-evaluates SOURCE against `null` for every INIT fork after the first,
+/// and so does succinctly — see `docs/compliance/jq/limitations.md`'s
 /// "INIT-fork re-entry" entry and `eval.rs`'s
-/// `test_foreach_reduce_init_fork_source_reads_ambient_input_2163`). Both
+/// `test_foreach_reduce_init_fork_source_reads_null_after_first_fork_2163`). Both
 /// front ends here (`full_outputs`/`generic_outputs`) ultimately dispatch to
 /// the same shared `reduce_forks`/`foreach_forks` core,
 /// so this does not double-verify two independently-coded evaluators — it
@@ -2042,7 +2041,7 @@ fn test_parity_positive_index_trailing_comma_2312() {
 /// shared core the same way, so a future change to either front end's
 /// dispatch can't quietly stop reaching it.
 #[test]
-fn test_parity_foreach_reduce_init_fork_source_reads_ambient_input_2163() {
+fn test_parity_foreach_reduce_init_fork_source_reads_null_after_first_fork_2163() {
     for filter in [
         "[foreach (.a) as $k ((0,.c); $k)]",
         "[reduce (.a) as $k ((0,.c); $k)]",

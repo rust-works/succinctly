@@ -37020,13 +37020,28 @@ fn test_reduce_and_foreach_over_repeat_still_raise_1687() -> Result<()> {
     for filter in [
         "reduce repeat(1) as $x (0; .+1)",
         "foreach repeat(1) as $x (0; .+1)",
+        // A source that does not read `.`: every INIT fork runs it, so the
+        // cap on INIT's own stream is what ends the fold.
+        "reduce range(1;3) as $x (repeat(1); .+$x)",
+        "[foreach range(1;3) as $x (repeat(1); .+$x; .)]",
+    ] {
+        let (_, stderr, code) = run_jq_stdin_with_stderr(filter, "[1,2]", &[])?;
+        assert_eq!(code, 5, "{filter}: stderr {stderr}");
+        assert!(
+            stderr.contains("repeat: maximum iterations exceeded"),
+            "{filter}: stderr {stderr}"
+        );
+    }
+    // A source that reads `.` raises on the second fork, where jq 1.7.1 does
+    // (#3895: later forks read `null`), before INIT's cap is reached.
+    for filter in [
         "reduce .[] as $x (repeat(1); .+$x)",
         "[foreach .[] as $x (repeat(1); .+$x; .)]",
     ] {
         let (_, stderr, code) = run_jq_stdin_with_stderr(filter, "[1,2]", &[])?;
         assert_eq!(code, 5, "{filter}: stderr {stderr}");
         assert!(
-            stderr.contains("repeat: maximum iterations exceeded"),
+            stderr.contains("Cannot iterate over null"),
             "{filter}: stderr {stderr}"
         );
     }
