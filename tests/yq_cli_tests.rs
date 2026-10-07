@@ -168,8 +168,7 @@ fn test_yq_recurse_cap_raises_instead_of_ending_silently_3716() -> Result<()> {
 /// Real yq's lexer rejects both names (v4.53.3), so they are succinctly
 /// extensions that mean what jq defines and share the path-register table with
 /// jq mode; gating the arms to jq mode would have left the silent discard.
-/// `INDEX` needs `--jq-extensions` to parse at all; `transpose` is not on the
-/// gate list yet, so only the path check is pinned for it here.
+/// Both need `--jq-extensions` to parse at all (`transpose` since #3954).
 #[test]
 fn test_yq_index_and_transpose_raise_inside_path_like_jq_3888() -> Result<()> {
     let args = ["--jq-extensions", "-o=json", "-I=0"];
@@ -196,6 +195,14 @@ fn test_yq_index_and_transpose_raise_inside_path_like_jq_3888() -> Result<()> {
     assert_ne!(code, 0, "stdout: {stdout:?}");
     assert!(
         stderr.contains("\"INDEX\" is not part of yq's syntax"),
+        "{stderr:?}"
+    );
+    // #3954: likewise `transpose`, which yq's lexer rejects.
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr("[[1]] | transpose", "{}", &["-o=json", "-I=0"])?;
+    assert_ne!(code, 0, "stdout: {stdout:?}");
+    assert!(
+        stderr.contains("\"transpose\" is not part of yq's syntax"),
         "{stderr:?}"
     );
     Ok(())
