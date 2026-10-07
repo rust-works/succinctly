@@ -339,6 +339,16 @@ pub trait EvalSemantics: Copy + Default {
     /// nothing (`[error(empty), 1]` is `[1]`).
     const ERROR_OF_EMPTY_MESSAGE_ABORTS: bool;
 
+    /// If true (yq, #2817), `L // R` decides **per left output**: a truthy output
+    /// passes, a falsy one is replaced *in place* by `R`'s outputs -- or stays itself
+    /// when `R` yields nothing -- and `R` runs on its own only when `L` yields nothing
+    /// at all. Live-verified against yq v4.53.3: `(null, 1) // 2` is `2`, `1`;
+    /// `(null, false) // 2` is `2`, `2`; `(1, null) // (3, 4)` is `1`, `3`, `4`;
+    /// `{} | (null // .[])` is `null`; `select(false) // 7` is `7`. If false (jq), the
+    /// operator is collect-then-fallback: every truthy output passes, falsy ones are
+    /// dropped, and `R` answers only when none survived (`(null, 1) // 2` is `1`).
+    const ALTERNATIVE_IS_PER_LEFT_OUTPUT: bool;
+
     /// If true (jq, #3639), the owned identity route lets a consumer of a
     /// body it can only resolve by prefetching -- `isempty`, `limit`, `first`,
     /// `skip`, `any`/`all` (which stop), `reduce` and `last` (which consume the
@@ -387,6 +397,7 @@ impl EvalSemantics for JqSemantics {
     const BINARY_FANOUT_IS_LEFT_MAJOR: bool = false;
     const READ_ONLY_ABSENT_KEY_IS_EMPTY: bool = false;
     const ERROR_OF_EMPTY_MESSAGE_ABORTS: bool = false;
+    const ALTERNATIVE_IS_PER_LEFT_OUTPUT: bool = false;
     const CONSUMERS_DRIVE_PREFETCHED_BODY: bool = true;
 }
 
@@ -425,6 +436,7 @@ impl EvalSemantics for YqSemantics {
     const BINARY_FANOUT_IS_LEFT_MAJOR: bool = true;
     const READ_ONLY_ABSENT_KEY_IS_EMPTY: bool = true;
     const ERROR_OF_EMPTY_MESSAGE_ABORTS: bool = true;
+    const ALTERNATIVE_IS_PER_LEFT_OUTPUT: bool = true;
     const CONSUMERS_DRIVE_PREFETCHED_BODY: bool = false;
 }
 
@@ -8089,6 +8101,9 @@ fn each_alternative<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
+    if S::ALTERNATIVE_IS_PER_LEFT_OUTPUT {
+        return each_alternative_per_left_output::<W, S>(left, right, value, optional, sink);
+    }
     let mut forwarded = 0usize;
     let mut outer_stopped = false;
     let left_flow = eval_each::<W, S>(left, value.clone(), optional, &mut |item| {
@@ -8125,6 +8140,63 @@ fn each_alternative<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Flow::Exhausted | Flow::Stopped { .. } if forwarded > 0 => Flow::Exhausted,
         // No truthy output at all: the right side answers, and its outputs
         // go to `sink` unfiltered.
+        Flow::Exhausted | Flow::Stopped { .. } => eval_each::<W, S>(right, value, optional, sink),
+    }
+}
+
+/// yq's `//` as a pushed stream (`EvalSemantics::ALTERNATIVE_IS_PER_LEFT_OUTPUT`, #2817):
+/// the demand-forwarding twin of [`eval_alternative_per_left_output`], deciding each left
+/// output as it arrives -- a truthy one is pushed, a falsy one is replaced by `right`'s
+/// outputs (or pushed itself when `right` yields none), and `right` answers on its own only
+/// when `left` yielded nothing at all. Because nothing is collected first, a consumer's
+/// [`Demand::Stop`] reaches the left operand and the right one alike, and an error raised
+/// by `right` for one item stops the left operand there rather than being lost.
+///
+/// `escape` carries a control the right operand raised out of the left operand's sink,
+/// which can answer only [`Demand`]; `outer_stopped` records that the consumer, not the left
+/// operand, ended production, so its verdict is propagated untouched.
+fn each_alternative_per_left_output<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    left: &Expr,
+    right: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    let mut produced = false;
+    let mut outer_stopped = false;
+    let mut escape: Option<Control> = None;
+    let left_flow = eval_each::<W, S>(left, value.clone(), optional, &mut |item| {
+        produced = true;
+        if item.is_truthy() {
+            let demand = sink(item);
+            outer_stopped |= demand == Demand::Stop;
+            return demand;
+        }
+        let mut replaced = false;
+        let right_flow = eval_each::<W, S>(right, value.clone(), optional, &mut |out| {
+            replaced = true;
+            sink(out)
+        });
+        match right_flow {
+            Flow::Exhausted if replaced => Demand::Continue,
+            Flow::Exhausted => {
+                let demand = sink(item);
+                outer_stopped |= demand == Demand::Stop;
+                demand
+            }
+            Flow::Stopped { .. } => {
+                outer_stopped = true;
+                Demand::Stop
+            }
+            Flow::Escaped(control) => stop_with_escape(&mut escape, control),
+        }
+    });
+    if outer_stopped || escape.is_some() {
+        return resume_from_escape(escape, left_flow);
+    }
+    match left_flow {
+        Flow::Escaped(control) => Flow::Escaped(control),
+        Flow::Exhausted | Flow::Stopped { .. } if produced => Flow::Exhausted,
         Flow::Exhausted | Flow::Stopped { .. } => eval_each::<W, S>(right, value, optional, sink),
     }
 }
@@ -13616,6 +13688,9 @@ fn eval_alternative<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    if S::ALTERNATIVE_IS_PER_LEFT_OUTPUT {
+        return eval_alternative_per_left_output::<W, S>(left, right, value, optional);
+    }
     match retain_truthy(eval_single::<W, S>(left, value.clone(), optional)) {
         // A `break` escapes the operator rather than selecting a branch.
         QueryResult::Break(label) => QueryResult::Break(label),
@@ -13626,6 +13701,50 @@ fn eval_alternative<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `?` on the left (e.g. `.a? // 3`) to suppress the error instead.
         error @ QueryResult::Error(_) => error,
         kept => kept,
+    }
+}
+
+/// yq's `//` (`EvalSemantics::ALTERNATIVE_IS_PER_LEFT_OUTPUT`, #2817), collecting form: each
+/// left output is decided on its own. A truthy one passes; a falsy one is replaced, in
+/// place, by every output of `right` -- or stays itself when `right` yields nothing -- and
+/// `right` answers once on its own only when `left` yielded nothing at all. A left error
+/// propagates after the outputs decided before it and does not select `right`.
+fn eval_alternative_per_left_output<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    left: &Expr,
+    right: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let mut lefts: Vec<OwnedValue> = Vec::new();
+    let left_control = push_owned_values::<W, S>(
+        eval_single::<W, S>(left, value.clone(), optional),
+        &mut lefts,
+    );
+    let produced = !lefts.is_empty();
+    let mut out: Vec<OwnedValue> = Vec::new();
+    for item in lefts {
+        if item.is_truthy() {
+            out.push(item);
+            continue;
+        }
+        let mut replacement: Vec<OwnedValue> = Vec::new();
+        let right_control = push_owned_values::<W, S>(
+            eval_single::<W, S>(right, value.clone(), optional),
+            &mut replacement,
+        );
+        if replacement.is_empty() && right_control.is_none() {
+            out.push(item);
+        } else {
+            out.append(&mut replacement);
+        }
+        if let Some(control) = right_control {
+            return partial(out, control);
+        }
+    }
+    match left_control {
+        Some(control) => partial(out, control),
+        None if !produced => eval_single::<W, S>(right, value, optional),
+        None => owned_vec_to_result(out),
     }
 }
 
@@ -39767,6 +39886,11 @@ fn resolve_alternative_sink<'a, S: EvalSemantics>(
     keep: Keep,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
+    if S::ALTERNATIVE_IS_PER_LEFT_OUTPUT {
+        return resolve_alternative_per_left_output_sink::<S>(
+            left, right, value, trackable, snapshot, frame, keep, sink,
+        );
+    }
     if let Expr::Literal(lit) = unwrap_paren(left) {
         if !literal_to_owned(lit).is_truthy() {
             return resolve_node_sink::<S>(
@@ -39809,6 +39933,100 @@ fn resolve_alternative_sink<'a, S: EvalSemantics>(
             &mut |branch| sink(carry_frame_register(right, branch, frame)),
         ),
         other => other,
+    }
+}
+
+/// Deliver one branch of [`resolve_alternative_per_left_output_sink`] to the consumer, recording a
+/// consumer stop as that resolution's verdict.
+fn deliver_alternative_branch<'a>(
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+    verdict: &mut Option<ResolveFlow>,
+    branch: PathBranch<'a>,
+) -> Demand {
+    match sink(branch) {
+        Demand::Continue => Demand::Continue,
+        Demand::Stop => {
+            *verdict = Some(ResolveFlow::Stopped);
+            Demand::Stop
+        }
+    }
+}
+
+/// yq's `//` in path position (`EvalSemantics::ALTERNATIVE_IS_PER_LEFT_OUTPUT`, #2817): what an
+/// assignment, `del` or `path` names. Each left branch is decided on its own -- a truthy one is
+/// delivered, a falsy one is replaced by `right`'s branches or, when `right` names none, delivered
+/// itself -- and `right` resolves on its own only when `left` named nothing at all. Captured from
+/// yq v4.53.3 on `{"a":null,"b":1,"c":2}`: `((.a, .b) // .c) = 9` writes `b` and `c`,
+/// `((.a, .b) // select(false)) = 9` writes `a` and `b`, `del((.a, .b) // .zz)` deletes `b` and
+/// the (created) `zz`.
+///
+/// `verdict` holds what a nested resolution answered from inside `left`'s sink, which can answer
+/// only [`Demand`]: a stop by the consumer, or an escape `right` raised. It outranks `left`'s own
+/// flow, but a halt does not (it is not catchable).
+#[allow(clippy::too_many_arguments)] // STYLE-0004: the resolver's own established argument set, as `resolve_alternative_sink`
+fn resolve_alternative_per_left_output_sink<'a, S: EvalSemantics>(
+    left: &Expr,
+    right: &Expr,
+    value: &'a OwnedValue,
+    trackable: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
+    keep: Keep,
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
+    let mut produced = false;
+    let mut verdict: Option<ResolveFlow> = None;
+    let flow = resolve_node_sink::<S>(
+        left,
+        value,
+        trackable,
+        snapshot,
+        frame,
+        keep,
+        &mut |branch| {
+            produced = true;
+            if branch.value.is_truthy() {
+                return deliver_alternative_branch(sink, &mut verdict, branch);
+            }
+            let mut replaced = false;
+            let right_flow = resolve_node_sink::<S>(
+                right,
+                value,
+                trackable,
+                snapshot,
+                frame,
+                keep,
+                &mut |replacement| {
+                    replaced = true;
+                    sink(carry_frame_register(right, replacement, frame))
+                },
+            );
+            match right_flow {
+                ResolveFlow::Exhausted if replaced => Demand::Continue,
+                // `right` names nothing: the falsy branch stays.
+                ResolveFlow::Exhausted => deliver_alternative_branch(sink, &mut verdict, branch),
+                other => {
+                    verdict = Some(other);
+                    Demand::Stop
+                }
+            }
+        },
+    );
+    if matches!(flow, ResolveFlow::Escaped(EvalEscape::Halt(_))) {
+        return flow;
+    }
+    match (verdict, flow) {
+        (Some(answer), _) => answer,
+        (None, ResolveFlow::Exhausted) if !produced => resolve_node_sink::<S>(
+            right,
+            value,
+            trackable,
+            snapshot,
+            frame,
+            keep,
+            &mut |branch| sink(carry_frame_register(right, branch, frame)),
+        ),
+        (None, other) => other,
     }
 }
 
