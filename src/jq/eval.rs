@@ -43468,6 +43468,17 @@ fn foreach_cannot_move_register(
         && extract.map_or(true, cannot_move_register)
 }
 
+/// Whether `expr` can never emit an output: its last stage is `error(..)`, so it
+/// either raises or, upstream, produces nothing (#3965).
+fn body_always_raises(expr: &Expr) -> bool {
+    match expr {
+        Expr::Error(_) => true,
+        Expr::Paren(inner) => body_always_raises(inner),
+        Expr::Pipe(stages) => stages.last().is_some_and(body_always_raises),
+        _ => false,
+    }
+}
+
 /// Whether evaluating `expr` as one pipe stage provably leaves jq's path
 /// register (`value_at_path`) exactly where it was (#1573).
 ///
@@ -43634,7 +43645,11 @@ fn cannot_move_register(expr: &Expr) -> bool {
             ..
         } => cannot_move_register(then_branch) && cannot_move_register(else_branch),
         Expr::Try { expr, catch } => {
-            cannot_move_register(expr)
+            // #3965: a body that always raises emits nothing, and the raise
+            // backtracks to the `try`'s fork point, so whatever its message or
+            // earlier stages navigated is undone (`try error(.a) catch .`);
+            // only the handler's outputs are the stage's.
+            (body_always_raises(expr) || cannot_move_register(expr))
                 && match catch {
                     Some(handler) => cannot_move_register(handler),
                     None => true,
