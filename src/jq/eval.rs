@@ -42268,8 +42268,8 @@ fn recurse_family_root_seed<'a>(
 /// tree size — `[path(..)] | length` must equal jq's true count even past
 /// [`RECURSE_MAX_ITEMS`] nodes. `recurse(.[]?)` is that same bare walk spelled
 /// out (jq's `def recurse: recurse(.[]?);`), so [`resolve_recurse_sink`] lifts
-/// the cap for that spelling ([`recurse_item_cap`], #3703), and for the same
-/// `f` over a `cond` that cannot fork (#3737).
+/// the cap for that spelling ([`recurse_item_cap`], #3703), and for any `f`
+/// that only descends the tree until a `cond` forks (#3737, #3867).
 ///
 /// **Lazy within a node's fan-out too** (#2895): a node's children are a
 /// [`RecursiveChildren`] cursor on a [`DescentFrame`], pulled one at a time,
@@ -42284,7 +42284,7 @@ fn recurse_family_root_seed<'a>(
 /// `recurse(f)` evaluator) stay eager on purpose: their `f` can fan out and
 /// raise, so a node's children are the *output of running `f`*, not a slice
 /// already in hand, and they are capped by [`RECURSE_MAX_ITEMS`] (but for
-/// `.[]?`, see [`recurse_item_cap`]). Bare `..` has no `f`, so its children are
+/// a tree-descending `f`, see [`recurse_item_cap`]). Bare `..` has no `f`, so its children are
 /// exactly the container's own.
 ///
 /// Every value this function ever visits is a live sub-part of the original
@@ -49485,11 +49485,15 @@ fn is_tree_descending_f(f: &Expr) -> bool {
     match step(f) {
         Expr::Iterate => true,
         Expr::Pipe(stages) => {
-            let steps: Vec<&Expr> = stages.iter().map(step).collect();
-            matches!(steps.last(), Some(Expr::Iterate))
-                && steps
-                    .iter()
-                    .all(|s| matches!(s, Expr::Field(_) | Expr::Index { .. } | Expr::Iterate))
+            stages
+                .last()
+                .is_some_and(|last| matches!(step(last), Expr::Iterate))
+                && stages.iter().all(|stage| {
+                    matches!(
+                        step(stage),
+                        Expr::Field(_) | Expr::Index { .. } | Expr::Iterate
+                    )
+                })
         }
         _ => false,
     }
@@ -60544,7 +60548,8 @@ fn builtin_recurse_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // visited, `f` run at each, up to `RECURSE_MAX_ITEMS` -- except for
     // `.[]?` with no `cond` (bare `recurse`, which this function is for when
     // `builtin_recurse` calls it), which `each_recurse_walk` hands to
-    // `walk_descendants` and which has no cap (#3703).
+    // `walk_descendants` and which has no cap (#3703), and for another
+    // tree-descending `f`, whose cap starts lifted (#3867).
     let mut outputs: Vec<OwnedValue> = Vec::new();
     let end = each_recurse_walk::<S>(f, None, root, Reentry::Proven, &mut |v| {
         outputs.push(v);
@@ -114285,6 +114290,12 @@ mod tests {
             "recurse(.[]?, .[]?)",
             "recurse(.[1:][])",
             "recurse(.[]? | tostring)",
+            // A computed or multi-valued step can hand a node the same output
+            // twice (`.[(0,0)][]?`), which the cap-until-a-fork rule would
+            // not see: only the static `.field` / `.[n]` / `.[]` steps qualify.
+            "recurse(.[(0,0)][]?)",
+            r#"recurse(.["a","b"][]?)"#,
+            "recurse(.[.k][]?)",
             "recurse(.)",
             "recurse(if type == \"array\" then .[] else empty end)",
             "recurse(map(.))",
@@ -115221,6 +115232,34 @@ mod tests {
                         "`{walk}` ({levels}): {end}"
                     );
                 }
+            }
+        }
+        // `.[]` and `.children[]` over containers only (nothing for them to
+        // raise at) are stopped by the cap the same way, so the non-optional
+        // spellings pin `forked` too.
+        let empties = format!("[{}]", vec!["[]"; 6000].join(","));
+        let kids = format!(
+            r#"{{"children":[{}]}}"#,
+            vec![r#"{"children":[]}"#; 6000].join(",")
+        );
+        for (doc, walk) in [
+            (&empties, "[recurse(.[]; (true, true))] | length"),
+            (&empties, "[path(recurse(.[]; (true, true)))] | length"),
+            (&kids, "[recurse(.children[]; (true, true))] | length"),
+            (
+                &kids,
+                "[path(recurse(.children[]?; (true, true)))] | length",
+            ),
+        ] {
+            for levels in [0, u32::MAX] {
+                let (values, end) = recurse_native_levels_override::with(levels, || {
+                    outputs_and_end(doc.as_bytes(), walk)
+                });
+                assert!(values.is_empty(), "`{walk}` ({levels}): {values:?}");
+                assert!(
+                    end.contains("maximum nodes exceeded"),
+                    "`{walk}` ({levels}): {end}"
+                );
             }
         }
     }

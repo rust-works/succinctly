@@ -821,14 +821,14 @@ no `cond`) to a cursor walk when a document node is available (#3719), otherwise
 of the owned tree, so no cap applies; the path walker takes its cap from the caller's own `f` and
 lifts it for the same shape.
 
-**`.[]?` with a `cond` that yields at most one value is lifted too (#3737).** `recurse(.[]?; cond)` is
+**`.[]?` with a `cond` that yields at most one value takes a fast walk (#3737).** `recurse(.[]?; cond)` is
 `def r: ., (f | select(cond) | r); r;` over a tree, so a `cond` with one output keeps or drops each child
-once and the walk visits each node at most once. `yields_at_most_one_value` decides "cannot fork"; a
-`cond` it does not admit (`(true, true)` re-emits a child per truthy output, 2^depth visits) keeps the
-cap, as does every `f` but `.[]?`. The value walker hands the admitted shape to `walk_descendants_gated`,
-which asks `cond` of each node as it is reached (so jq's order of effects and of a raising `cond` holds in
-value position; `path(...)`, `|=` and `del` still run the queued order past the native stack budget, see the
-#2918 note below) and never runs `.[]?`; the path walker lifts its cap for it.
+once and the walk visits each node at most once. `yields_at_most_one_value` decides "cannot fork" for the
+fast path only: the value walker hands the admitted shape to `walk_descendants_gated`, which asks `cond` of
+each node as it is reached (so jq's order of effects and of a raising `cond` holds in value position;
+`path(...)`, `|=` and `del` still run the queued order past the native stack budget, see the #2918 note
+below) and never runs `.[]?`. What keeps every other walk bounded is the cap-until-a-fork rule (#3867,
+below), which does not depend on the shape of `cond`.
 
 Measured with `memcap.py` on `[recurse(.[]?; true)] | length`, interleaved, minimum of three runs, against a
 build that only lifts the cap and keeps the evaluator-driven walk (and against `..`, a cursor walk):
@@ -865,7 +865,9 @@ output (unrelated nodes have disjoint subtrees; an ancestor's outputs sit at a d
 descendant's), so such a walk visits a node more than once only after a `cond` gives one child a **second
 truthy verdict**, which `select` re-emits once per output. The walk starts with no cap and the cap comes
 back (10,000, counting the nodes already delivered) the moment a `cond` does that, so a forking walk is
-refused exactly where it was and everything else is answered. `.[]` without the `?` raises its own
+refused and everything else is answered. The fork is seen at a child's *second* truthy verdict, after the
+first verdict's subtree was walked, so a walk can deliver more than 10,000 nodes (a streamed consumer prints
+them, bounded by the document) before it raises at the next node. `.[]` without the `?` raises its own
 `Cannot iterate over ...` at a scalar, as before; only the cap changed. `yields_at_most_one_value` still
 decides which walks take the fast `walk_descendants_gated`; every other tree-descending walk runs
 `f` through the evaluator at each node, which is slower and holds more (the table above prices that route
