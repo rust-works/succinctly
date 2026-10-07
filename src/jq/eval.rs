@@ -102304,14 +102304,8 @@ mod tests {
                 let result = index_one::<_, JqSemantics>(cursor.value(), key, false);
                 assert!(
                     matches!(result, QueryResult::One(_) | QueryResult::Error(_)),
-                    "{} | .[{key:?}]: {}",
-                    String::from_utf8_lossy(json),
-                    match result {
-                        QueryResult::OneCursor(_) => "OneCursor",
-                        QueryResult::Owned(_) => "Owned",
-                        QueryResult::None => "None",
-                        _ => "another variant",
-                    }
+                    "{} | .[{key:?}] is neither a value nor an error",
+                    String::from_utf8_lossy(json)
                 );
             }
         }
