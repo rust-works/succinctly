@@ -6926,6 +6926,10 @@ mod embed_table {
         /// of `node` returns the matching child of `value` ([`descendant`]),
         /// the mirror of #3179's reuse of a node nested inside the walk.
         descends: bool,
+        /// The subtree end of a descending entry's node, asked once by the
+        /// first lookup that needs it (#3897); `0` where the format cannot
+        /// say, so such an entry covers nothing.
+        extent: Cell<Option<usize>>,
     }
 
     /// What an anchor entry adds (#3134): the bound node `child` inside
@@ -6988,14 +6992,17 @@ mod embed_table {
             // disagree.
             TABLE.with(|t| {
                 let mut t = t.borrow_mut();
+                // A verdict is only trusted while the entry it was computed
+                // under lives: a document token is an address and can be
+                // reused once its index is gone (#3897).
+                if t.iter().skip(self.0).any(|e| e.descends) {
+                    DISTINCT.with(|d| d.borrow_mut().clear());
+                }
                 t.truncate(self.0);
                 ACTIVE.with(|a| a.set(!t.is_empty()));
                 ANCHORED.with(|a| a.set(t.iter().any(|e| e.anchor.is_some())));
                 let descending = t.iter().any(|e| e.descends);
                 DESCENDING.with(|a| a.set(descending));
-                if !descending {
-                    DISTINCT.with(|d| d.borrow_mut().clear());
-                }
             });
         }
     }
@@ -7029,6 +7036,7 @@ mod embed_table {
             height: Cell::new(None),
             anchor: None,
             descends: false,
+            extent: Cell::new(None),
         })
     }
 
@@ -7041,6 +7049,7 @@ mod embed_table {
             height: Cell::new(None),
             anchor: None,
             descends: true,
+            extent: Cell::new(None),
         })
     }
 
@@ -7063,6 +7072,7 @@ mod embed_table {
                 steps: Some(steps),
             }),
             descends: false,
+            extent: Cell::new(None),
         })
     }
 
@@ -7077,6 +7087,7 @@ mod embed_table {
             height: Cell::new(None),
             anchor: Some(Anchor { child, steps: None }),
             descends: false,
+            extent: Cell::new(None),
         })
     }
 
@@ -7096,13 +7107,30 @@ mod embed_table {
         })
     }
 
-    /// Whether a descending entry of `document` opens before `node` -- the
-    /// only ones that can be one of its ancestors (#3897).
-    pub(crate) fn descending_before(node: usize, document: usize) -> bool {
+    /// Whether a descending entry of `document` has `node` strictly inside
+    /// its subtree (#3897). `end_of` names the subtree end of the entry's
+    /// node, asked at most once per entry and kept; it reads only the
+    /// document, never this table.
+    pub(crate) fn descending_covers(
+        node: usize,
+        document: usize,
+        end_of: impl Fn(usize) -> Option<usize>,
+    ) -> bool {
         TABLE.with(|t| {
-            t.borrow()
-                .iter()
-                .any(|e| e.descends && e.document == document && e.node < node)
+            t.borrow().iter().any(|e| {
+                if !e.descends || e.document != document || e.node >= node {
+                    return false;
+                }
+                let end = match e.extent.get() {
+                    Some(end) => end,
+                    None => {
+                        let end = end_of(e.node).unwrap_or(0);
+                        e.extent.set(Some(end));
+                        end
+                    }
+                };
+                node < end
+            })
         })
     }
 
@@ -7125,11 +7153,16 @@ mod embed_table {
         compute: impl FnOnce() -> bool,
     ) -> bool {
         const CAPACITY: usize = 8;
+        // Least recently used last: a hit moves to the back, so the root
+        // object every element climbs through is never the one dropped.
         let known = DISTINCT.with(|d| {
-            d.borrow()
+            let mut d = d.borrow_mut();
+            let at = d
                 .iter()
-                .find(|(doc, p, _)| *doc == document && *p == parent)
-                .map(|(_, _, ok)| *ok)
+                .position(|(doc, p, _)| *doc == document && *p == parent)?;
+            let hit = d.remove(at);
+            d.push(hit);
+            Some(hit.2)
         });
         if let Some(ok) = known {
             return ok;
@@ -7315,7 +7348,11 @@ mod embed_table {
         false
     }
 
-    pub(crate) fn descending_before(_node: usize, _document: usize) -> bool {
+    pub(crate) fn descending_covers(
+        _node: usize,
+        _document: usize,
+        _end_of: impl Fn(usize) -> Option<usize>,
+    ) -> bool {
         false
     }
 
@@ -8296,7 +8333,9 @@ fn embed_at_or_within<S: EvalSemantics, C: DocumentCursor>(
     // #3897: below a fold's INIT node. After the exact and nested lookups, and
     // behind one more thread-local load that is false outside a fold that
     // marks its loop variables.
-    if shared.is_none() && embed_table::descending() {
+    // A bind inside the subtree (`nested`) keeps its own embedding, which the
+    // INIT child's `Rc` would replace.
+    if shared.is_none() && nested.is_empty() && embed_table::descending() {
         if let Some(found) = embed_descendant_shared(cursor) {
             return (Some(found), Vec::new());
         }
@@ -8322,7 +8361,9 @@ fn embed_at_or_within<S: EvalSemantics, C: DocumentCursor>(
 fn embed_descendant_shared<C: DocumentCursor>(cursor: &C) -> Option<OwnedValue> {
     let document = cursor.document_token();
     if !cursor.materializes_members_one_to_one()
-        || !embed_table::descending_before(cursor.node_id(), document)
+        || !embed_table::descending_covers(cursor.node_id(), document, |entry| {
+            cursor.at_node_id(entry)?.subtree_end()
+        })
     {
         return None;
     }
