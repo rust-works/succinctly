@@ -5903,8 +5903,11 @@ fn discard_yq_partial_prefix<V: DocumentValue>(result: GenericResult<V>) -> Gene
 /// one that stays silent for that message alone, so the raw `thread
 /// panicked` line does not precede the diagnostic; any other panic goes to
 /// the original hook and is re-raised unchanged.
+// `PanicInfo` is the hook's type on this crate's 1.73 MSRV; newer toolchains
+// renamed it `PanicHookInfo` and deprecate the old name.
+#[allow(deprecated)]
 pub fn run_yq(args: YqCommand) -> Result<i32> {
-    let previous: std::sync::Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send> =
+    let previous: std::sync::Arc<dyn Fn(&std::panic::PanicInfo<'_>) + Sync + Send> =
         std::sync::Arc::from(std::panic::take_hook());
     let forward = previous.clone();
     std::panic::set_hook(Box::new(move |info| {

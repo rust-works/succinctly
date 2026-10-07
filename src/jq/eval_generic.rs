@@ -258,8 +258,10 @@ pub fn nesting_depth_panic_message(payload: &(dyn core::any::Any + Send)) -> Opt
         .then(|| text.to_string())
 }
 
-/// [`nesting_depth_panic_message`]'s wider twin for yq's own write pipeline
-/// (#3278): `Some` for either depth ceiling's exact message --
+/// The message of a caught depth-guard panic of either ceiling (#3278).
+///
+/// [`nesting_depth_panic_message`]'s wider twin for yq's own write pipeline:
+/// `Some` for either depth ceiling's exact message --
 /// [`MAX_NESTING_DEPTH`] (document nesting) *or*
 /// [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH) (a value a
 /// filter built past the tree ceiling, which `yq_runner.rs`'s emission and
