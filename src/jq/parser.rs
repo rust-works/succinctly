@@ -11696,15 +11696,12 @@ mod tests {
             ("all_c(.; .; .)", false, true),
             ("any_c (. > 3)", true, false),
         ] {
-            match yq(filter) {
-                Ok(Expr::Builtin(Builtin::AnyC(_, e))) if any => {
-                    assert_eq!(e.is_some(), extra, "{filter}");
-                }
-                Ok(Expr::Builtin(Builtin::AllC(_, e))) if !any => {
-                    assert_eq!(e.is_some(), extra, "{filter}");
-                }
-                other => panic!("{filter:?} should parse as the builtin, got {other:?}"),
-            }
+            let parsed = yq(filter);
+            assert!(
+                matches!(&parsed, Ok(Expr::Builtin(Builtin::AnyC(_, e))) if any && e.is_some() == extra)
+                    || matches!(&parsed, Ok(Expr::Builtin(Builtin::AllC(_, e))) if !any && e.is_some() == extra),
+                "{filter:?} should parse as the builtin with extra={extra}, got {parsed:?}"
+            );
             assert!(
                 !matches!(
                     parse_with_mode(filter, ParserMode::Jq),
@@ -11714,6 +11711,10 @@ mod tests {
             );
         }
         assert!(yq("any_c").is_err(), "bare `any_c` needs its argument");
+        // ...and an argument list that never closes is an error, with or without extra ones
+        for open in ["any_c(. > 3", "all_c(. > 3; 1", "any_c(.; ."] {
+            assert!(yq(open).is_err(), "{open:?} has no closing parenthesis");
+        }
         assert!(
             !matches!(
                 yq("any_cat(. > 3)"),
