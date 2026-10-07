@@ -49262,11 +49262,38 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                             // output left, which is the entry's when it said so.
                             let update_unmoved = update_states_entry
                                 && matches!(update_branch.register, BranchRegister::AtEntry);
+                            // #3939: a computed emission that sits at the step's register
+                            // (a pattern walk or a navigating source moved it off the root)
+                            // on a `null`/`true`/`false` member states that value: the
+                            // extract's own `AtEntry` names none, and an outer fold reading
+                            // this `foreach` as its source would take the register as lost
+                            // instead of placing its own there (`jv_identical` admits the
+                            // kind, [`null_bool_identical`]). Only an emission at exactly the
+                            // register's path: one that navigated further keeps its own answer.
+                            let walked_at = (S::TAG == EvalTag::Jq
+                                && active_reg.trackable
+                                && active_reg.path.depth() > 0
+                                && matches!(
+                                    active_reg.value,
+                                    OwnedValue::Null | OwnedValue::Bool(_)
+                                ))
+                            .then_some(&active_reg);
                             let mut emit = |branch: PathBranch<'a>| -> Demand {
                                 if update_unmoved && !branch.trackable {
                                     sink(branch.with_register(BranchRegister::Unmoved(
                                         Cow::Borrowed(value),
                                     )))
+                                } else if let Some(register) = walked_at.filter(|reg| {
+                                    !branch.trackable
+                                        && *branch.path == *reg.path
+                                        && matches!(
+                                            branch.register,
+                                            BranchRegister::None | BranchRegister::AtEntry
+                                        )
+                                }) {
+                                    sink(branch.with_register(BranchRegister::Unmoved(Cow::Owned(
+                                        register.value.clone(),
+                                    ))))
                                 } else {
                                     sink(branch)
                                 }

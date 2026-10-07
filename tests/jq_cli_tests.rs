@@ -63760,6 +63760,137 @@ fn test_nested_foreach_destructuring_the_register_moves_it_for_the_outer_fold_38
     ])
 }
 
+/// #3939: on a `null` (or boolean) register a nested `foreach` leaves jq's register on the
+/// member its pattern or source navigated to, and `jv_identical` admits the outer EXTRACT's
+/// `null` there by kind, so the outer fold's path is that member's, not the root's.
+/// `path(foreach (foreach . as {a:$a} (0; .; .)) as $x (.; .; .))` on `null` is `["a"]`, and a
+/// write through it lands on `.a`; the nested emission read as a lost register and answered the
+/// root, so `= 9` replaced the document. A source that navigates (`.a as $a`) or a deeper pattern
+/// moves it the same way. Contrasts: any register that is not `null`/a boolean still refuses
+/// (the outer accumulator is not that node), and a nested `reduce` backtracks. Every row
+/// captured from jq 1.7.1, on the stdin and `-n` routes.
+#[test]
+fn test_nested_foreach_on_a_null_register_answers_the_member_it_moved_to_3939() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r"null",
+            r"path(foreach (foreach . as {a:$a} (0; .; .)) as $x (.; .; .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"(foreach (foreach . as {a:$a} (0; .; .)) as $x (.; .; .)) = 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"(foreach (foreach . as {a:$a} (0; .; .)) as $x (.; .; .)) |= 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"path(foreach (foreach . as {a:$a} (0; .; .)) as $x (.; .; .)) | length",
+            "1\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"[path(foreach (foreach . as {a:$a} (0; .; .)) as $x (.; .; .))?]",
+            "[[\"a\"]]\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"path(foreach (foreach (., .) as {a:$a} (0; .; .)) as $x (.; .; .))",
+            "[\"a\"]\n[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"path(foreach (foreach . as {a:{b:$a}} (0; .; .)) as $x (.; .; .))",
+            "[\"a\",\"b\"]\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"path(foreach (foreach . as [$a] (0; .; .)) as $x (.; .; .))",
+            "[0]\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"path(foreach (foreach .a as $a (0; .; .)) as $x (.; .; .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"path(foreach (foreach .a.b as $a (0; .; .)) as $x (.; .; .))",
+            "[\"a\",\"b\"]\n",
+            "",
+            0,
+        ),
+        // The register the nested fold left is where the outer UPDATE/EXTRACT navigate from.
+        (
+            r"null",
+            r"path(foreach (foreach . as {a:$a} (0; .; .)) as $x (.; .; .a))",
+            "[\"a\",\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"path(foreach (foreach . as {a:$a} (0; .; .)) as $x (.; .a; .))",
+            "[\"a\",\"a\"]\n",
+            "",
+            0,
+        ),
+        // Contrasts: a register that is not `null`/a boolean is not the outer accumulator's
+        // node, a navigated INIT leaves the outer register elsewhere, and a nested `reduce`
+        // restores the register.
+        (
+            r#"{"a":null}"#,
+            r"path(foreach (foreach . as {a:$a} (0; .; .)) as $x (.; .; .))",
+            "",
+            r#"Invalid path expression with result {"a":null}"#,
+            5,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"path(foreach (foreach . as {a:$a} (0; .; .)) as $x (.a; .; .))",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of {"a":true}"#,
+            5,
+        ),
+        (
+            r"null",
+            r"path(foreach (reduce . as {a:$a} (0; .)) as $x (.; .; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"path(reduce (foreach . as {a:$a} (0; .; .)) as $x (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
 /// #3790: a `foreach` whose SOURCE is the register itself (`.`, or a comma or pipe of
 /// them) emits an element that is the register's own node, so a bare `$k` bound to
 /// it is a path: `path(foreach . as $k (0; $k; .))` is `[]` for any document, and a
