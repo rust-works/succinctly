@@ -786,7 +786,7 @@ retry's child is fine), was the abandoned alternative's `E`. The value and path 
   needed no change. No row here runs queued: it starts only in a walk deeper than the native
   budget.
 
-## `recurse(f)` raises at 10,000 nodes for every `f` but `.[]?` (#3703, #3716, #3737)
+## `recurse(f)` raises at 10,000 nodes unless `f` descends the tree (#3703, #3716, #3737, #3867)
 
 `recurse(f)` and `recurse(f; cond)` deliver at most `RECURSE_MAX_ITEMS` (10,000) nodes, in the value
 walker and in the path walker behind `path(recurse(f))`, `del`, `|=` and `pick` over it. A walk that
@@ -811,8 +811,8 @@ cap is the error the walk's size decided. Both evaluators and both modes share t
 select(length > 0)`, so it runs `f` on the root too and discards that output. A `recurse` as the filter
 argument over a document past the cap (`[paths(recurse(.[]? | .; true))] | length`, 18000 in jq) therefore
 raises here, where the silent truncation of the discarded root walk used to leave jq's count intact by
-luck. With `.[]?` bare and a `cond` that cannot fork (`[paths(recurse(.[]?; true))] | length`) it answers,
-since #3737 (below).
+luck. With a tree-descending `f` and a `cond` that does not fork (`[paths(recurse(.[]?; true))] | length`) it
+answers, since #3737 and #3867 (below).
 
 `.[]?` is the exception, and is lifted since #3703: jq defines `def recurse: recurse(.[]?);`
 (`jq --debug-dump-disasm` shows the lambda as `EACH_OPT`), so `recurse(.[]?)`, bare `recurse` and `..`
@@ -853,27 +853,41 @@ before and 0.14 s now on the 7950X (2.39 s and 0.14 s on the M5 Max). A `cond` t
 for a scalar (`length > 0` is asked of every number and string) takes the bridge there: 15.9 s against 6.44 s
 for `true` over the 31.5 M-node arrays document on the 7950X.
 
-**The admitted set is `yields_at_most_one_value`'s grammar, and nothing wider.** A `cond` outside it keeps
-the cap even when it cannot fork: `tonumber? // false`, `try true`, `first(.[]?, true)`, `limit(1; true)`,
-`def f: true; f`, and a `cond` that reads a variable substituted as an array or an object (admission
-then depends on how the variable was bound). Those raise where jq answers, as before this change; widening
-the set, `.[]` with a `cond`, `.children[]?`, and a tree-size cap that would not need the set at all are
-tracked in [#3867](https://github.com/rust-works/succinctly/issues/3867).
+**The cap is lifted until a `cond` forks, for every tree-descending `f` (#3867).** #3737 admitted a
+`cond` by shape (`yields_at_most_one_value`), which left non-forking conds the grammar does not know
+(`tonumber? // true`, `try true`, `first(.[]?, true)`, `limit(1; true)`, `def f: true; f`), and conds whose
+admission depended on how a variable was bound (`. as [$a] | recurse(.[]?; $a != null)`, a `def g($c)`
+argument), raising where jq answers. The walk is now judged by what it does, not by what `cond` looks like.
+`is_tree_descending_f` admits an `f` whose every output is a child of a real container, reached by a route
+that depends only on `f`: `.[]?`, `.[]`, or a chain of `.field`, `.[n]` and `.[]` steps (each optionally `?`)
+**ending in an iterate**, such as `.children[]?` and `.a.b[]?`. Two visited nodes are never given the same
+output (unrelated nodes have disjoint subtrees; an ancestor's outputs sit at a different depth from a
+descendant's), so such a walk visits a node more than once only after a `cond` gives one child a **second
+truthy verdict**, which `select` re-emits once per output. The walk starts with no cap and the cap comes
+back (10,000, counting the nodes already delivered) the moment a `cond` does that, so a forking walk is
+refused exactly where it was and everything else is answered. `.[]` without the `?` raises its own
+`Cannot iterate over ...` at a scalar, as before; only the cap changed. `yields_at_most_one_value` still
+decides which walks take the fast `walk_descendants_gated`; every other tree-descending walk runs
+`f` through the evaluator at each node, which is slower and holds more (the table above prices that route
+for `.[]?`: 3.4 to 4.9 times slower, 1.5 to 4 times the memory) in exchange for an answer.
 
 What still differs from jq, on a 12,001-node document (6,000 one-element arrays), captured from jq 1.7.1:
 
 | Filter                                                            | jq    | succinctly                                        |
 |-------------------------------------------------------------------|-------|---------------------------------------------------|
 | `[recurse(.[]?; (true, true))] \| length`                         | 36001 | raises `recurse: maximum nodes exceeded` (exit 5) |
-| `[recurse(.[]?; (.a? // true))] \| length`                        | 12001 | raises, as above (not admitted, see above)        |
 | `[recurse(.[]? \| .; true)] \| length`                            | 12001 | raises, as above                                  |
 | `[recurse(if type == "array" then .[] else empty end)] \| length` | 12001 | raises, as above                                  |
 
+A fork after the cap raises too: `[recurse(.[]?; if . == 7 then (true, true) else true end)] | length` on the
+same document with a last element `[7]` is 12004 in jq and raises here.
+
 A finite walk past the cap is still refused rather than answered where it is not provably bounded by the
-tree: a forking `cond`, a `cond` outside the admitted set, and any `f` but `.[]?` (`.[]` with a `cond`,
-`.children[]?`, `.[]? \| .`, an `if` that descends only through arrays), tracked in
-[#3867](https://github.com/rust-works/succinctly/issues/3867). A hang is not a divergence ADR-0018
-permits either, so the cap stays there. The path walker still runs `.[]?` at every node, so
+tree: a `cond` that forks, and an `f` that is not tree-descending (`.[]? | .`, a computed `f`, an `if` that
+descends only through arrays). A hang is not a divergence ADR-0018 permits either, so the cap stays there.
+There is still no cursor arm for `recurse(f; cond)` ([#3867](https://github.com/rust-works/succinctly/issues/3867)),
+so `first(recurse(.[]?; true))` pays for the whole document where `first(..)` does not. The path walker still
+runs `.[]?` at every node, so
 `path(recurse(.[]?))` takes about 1.8 times `path(..)`'s time (2.9 s against 1.6 s over 1.15 M nodes of
 a `users` document, [#3717](https://github.com/rust-works/succinctly/issues/3717)).
 
