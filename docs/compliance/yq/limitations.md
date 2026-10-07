@@ -4824,12 +4824,21 @@ parser and CLI tests pin these spellings while jq's pattern-alternative
 grammar remains unchanged. Bracket navigation similarly requires an adjacent
 optional suffix: `.[0]?` is valid, while `.[0] ?` is a yq lexer error.
 
-**Open gap ([#3374](https://github.com/rust-works/succinctly/issues/3374)):** yq
-also interprets `?` inside a field pattern as a one-byte wildcard and emits
-all matching values. Succinctly currently looks up the exact key, including
-for bracketed patterns such as `.["x??"]`. The parser fix does not change
-mapping lookup, so a mapping with both `x??` and `xyz` still returns only the
-exact `x??` value for `.x???`.
+**Resolved ([#3374](https://github.com/rust-works/succinctly/issues/3374)):** yq
+also interprets `*` and `?` inside a mapping key as wildcards and emits the value
+of every matching key in document order (`.["x??"]` on `{"x??":3,"x?y":4,"xyz":5}`
+is `3`, `4`, `5`). When no key matches, a read answers `null` and a write creates
+the pattern as a literal key. In yq mode the parser desugars a wildcard `.name` or
+`.["name"]` into an index over `Expr::yq_wildcard_keys`, so reads, `=`, `|=`, `+=`
+and `del()` all follow the matching keys. Two gaps remain: an *unquoted* `*`
+(`.a*`) is still a parse error, and a *computed* string key (`.[ "x?" + "?" ]`)
+is still an exact lookup, because neither is a literal in the filter text.
+
+A wildcard key costs one pass over the mapping's keys plus one keyed lookup per match, and
+a keyed lookup into a document object is linear in its key count ([#3913](https://github.com/rust-works/succinctly/issues/3913)),
+so a pattern matching *m* keys of an *n*-key mapping is O(m·n): `.["k1*"]` over 8,000 keys
+matching 1,111 of them takes about 5.6 s in a debug build. A pattern matching a handful of
+keys, or a document of many small records, stays linear.
 
 ## Provenance
 

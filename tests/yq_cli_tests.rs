@@ -51,6 +51,114 @@ fn test_question_marks_in_yq_field_names_3356() -> Result<()> {
     Ok(())
 }
 
+/// Pinned yq v4.53.3: `*` and `?` in a mapping key are wildcards, so a traversal
+/// emits the value of every matching key in document order (#3374). No match reads
+/// `null` and writes create the pattern as a literal key. Every row captured from
+/// the pinned binary.
+#[test]
+fn test_wildcard_mapping_key_lookups_3374() -> Result<()> {
+    let args = &["-p=json", "-o=json", "-I=0"];
+    for (input, filter, expected) in [
+        (
+            r#"{"x??":3,"x?y":4,"xyz":5,"abc":{"x":1},"abd":{"x":2}}"#,
+            r#".["x??"]"#,
+            "3\n4\n5\n",
+        ),
+        (
+            r#"{"x??":3,"x?y":4,"xyz":5,"abc":{"x":1},"abd":{"x":2}}"#,
+            r".x???",
+            "3\n4\n5\n",
+        ),
+        (
+            r#"{"x??":3,"x?y":4,"xyz":5,"abc":{"x":1},"abd":{"x":2}}"#,
+            r".x?y",
+            "4\n",
+        ),
+        (
+            r#"{"x??":3,"x?y":4,"xyz":5,"abc":{"x":1},"abd":{"x":2}}"#,
+            r#".["a*"]"#,
+            "{\"x\":1}\n{\"x\":2}\n",
+        ),
+        (
+            r#"{"x??":3,"x?y":4,"xyz":5,"abc":{"x":1},"abd":{"x":2}}"#,
+            r#".["a*"].x"#,
+            "1\n2\n",
+        ),
+        (
+            r#"{"x??":3,"x?y":4,"xyz":5,"abc":{"x":1},"abd":{"x":2}}"#,
+            r#".["zz*"]"#,
+            "null\n",
+        ),
+        (
+            r#"{"x??":3,"x?y":4,"xyz":5,"abc":{"x":1},"abd":{"x":2}}"#,
+            r#".["*"]"#,
+            "3\n4\n5\n{\"x\":1}\n{\"x\":2}\n",
+        ),
+        (
+            r#"{"x??":3,"x?y":4,"xyz":5,"abc":{"x":1},"abd":{"x":2}}"#,
+            r#".["a?c"].x"#,
+            "1\n",
+        ),
+        (
+            r#"{"x??":3,"x?y":4,"xyz":5,"abc":{"x":1},"abd":{"x":2}}"#,
+            r#"[.["x??"]]"#,
+            "[3,4,5]\n",
+        ),
+        (
+            r#"{"x??":3,"x?y":4,"xyz":5,"abc":{"x":1},"abd":{"x":2}}"#,
+            r#".["*b"], .["a*"]"#,
+            "null\n{\"x\":1}\n{\"x\":2}\n",
+        ),
+        (
+            r#"{"x??":3,"x?y":4,"xyz":5,"abc":{"x":1},"abd":{"x":2}}"#,
+            r#".["a*"]?"#,
+            "{\"x\":1}\n{\"x\":2}\n",
+        ),
+        (
+            r#"{"x??":3,"x?y":4,"xyz":5,"abc":{"x":1},"abd":{"x":2}}"#,
+            r#".["x??"] = 9"#,
+            "{\"x??\":9,\"x?y\":9,\"xyz\":9,\"abc\":{\"x\":1},\"abd\":{\"x\":2}}\n",
+        ),
+        (
+            r#"{"x??":3,"x?y":4,"xyz":5,"abc":{"x":1},"abd":{"x":2}}"#,
+            r#".["a*"].x = 7"#,
+            "{\"x??\":3,\"x?y\":4,\"xyz\":5,\"abc\":{\"x\":7},\"abd\":{\"x\":7}}\n",
+        ),
+        (
+            r#"{"x??":3,"x?y":4,"xyz":5,"abc":{"x":1},"abd":{"x":2}}"#,
+            r#"del(.["x??"])"#,
+            "{\"abc\":{\"x\":1},\"abd\":{\"x\":2}}\n",
+        ),
+        (
+            r#"{"x??":3,"x?y":4,"xyz":5,"abc":{"x":1},"abd":{"x":2}}"#,
+            r#".["x??"] |= . + 1"#,
+            "{\"x??\":4,\"x?y\":5,\"xyz\":6,\"abc\":{\"x\":1},\"abd\":{\"x\":2}}\n",
+        ),
+        (
+            r#"{"x??":3,"x?y":4,"xyz":5,"abc":{"x":1},"abd":{"x":2}}"#,
+            r#".["*"]["x"]"#,
+            "1\n2\n",
+        ),
+        (r#"{"a":1}"#, r#".["z*"] = 5"#, "{\"a\":1,\"z*\":5}\n"),
+        (
+            r#"{"a":1}"#,
+            r#".["z*"].k = 5"#,
+            "{\"a\":1,\"z*\":{\"k\":5}}\n",
+        ),
+        (r#"{"a":1}"#, r#"del(.["z*"])"#, "{\"a\":1}\n"),
+        (r#"{"a":1}"#, r#".["a*"] += 5"#, "{\"a\":6}\n"),
+        (r"null", r#".["a*"]"#, "null\n"),
+        (r"null", r#".["a*"] = 1"#, "{\"a*\":1}\n"),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, input, args)?,
+            (expected.into(), String::new(), 0),
+            "{input} | {filter}"
+        );
+    }
+    Ok(())
+}
+
 /// #3479: after a write (or `-R`, `--slurp`) `succinctly yq` evaluates a
 /// value it re-indexed into throwaway JSON text, so `line`/`column` answer the
 /// fixed default `0` there, never a position inside that text. Real yq 4.53.3

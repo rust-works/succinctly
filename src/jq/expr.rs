@@ -9,6 +9,8 @@ use alloc::rc::Rc;
 #[cfg(not(test))]
 use alloc::string::String;
 #[cfg(not(test))]
+use alloc::vec;
+#[cfg(not(test))]
 use alloc::vec::Vec;
 #[cfg(test)]
 use std::collections::BTreeMap;
@@ -3049,6 +3051,63 @@ impl Expr {
     /// Create an iterate expression.
     pub fn iterate() -> Self {
         Self::Iterate
+    }
+
+    /// Whether a yq mapping key names a *pattern*: real yq treats `*` and `?`
+    /// in a traversal key as wildcards (`pkg/yqlib` `matchKey`, #3374).
+    #[must_use]
+    pub fn is_yq_key_pattern(name: &str) -> bool {
+        name.bytes().any(|b| matches!(b, b'*' | b'?'))
+    }
+
+    /// The key generator behind a wildcard traversal `.["a*"]` (yq mode, #3374):
+    /// every string key of the input mapping that the pattern matches, in
+    /// document order, or the pattern itself as a literal key when none does
+    /// (so a read answers `null` and a write creates the key, as in yq). A
+    /// non-mapping input yields the pattern too, leaving the ordinary
+    /// `cannot index` error to the index step. It is
+    /// `[(try keys_unsorted[] catch empty) | select(type == "!!str" and . == PAT)]
+    /// | if length == 0 then PAT else .[] end`, where yq mode's `==` already
+    /// applies the same glob to its right operand.
+    #[must_use]
+    pub fn yq_wildcard_keys(pattern: &str) -> Self {
+        let pat = || Self::Literal(Literal::String(pattern.into()));
+        let keys = Self::Try {
+            expr: Box::new(Self::pipe(vec![
+                Self::Builtin(Builtin::KeysUnsorted),
+                Self::Iterate,
+            ])),
+            catch: Some(Box::new(Self::Builtin(Builtin::Empty))),
+        };
+        let is_matching_string = Self::And(
+            Box::new(Self::Compare {
+                op: CompareOp::Eq,
+                left: Box::new(Self::Builtin(Builtin::Type)),
+                right: Box::new(Self::Literal(Literal::String("!!str".into()))),
+            }),
+            Box::new(Self::Compare {
+                op: CompareOp::Eq,
+                left: Box::new(Self::Identity),
+                right: Box::new(pat()),
+            }),
+        );
+        let matches = Self::Array(Box::new(Self::pipe(vec![
+            keys,
+            Self::Builtin(Builtin::Select(Box::new(is_matching_string))),
+        ])));
+        let none_matched = Self::Compare {
+            op: CompareOp::Eq,
+            left: Box::new(Self::Builtin(Builtin::Length)),
+            right: Box::new(Self::Literal(Literal::Int(0))),
+        };
+        Self::pipe(vec![
+            matches,
+            Self::If {
+                cond: Box::new(none_matched),
+                then_branch: Box::new(pat()),
+                else_branch: Box::new(Self::Iterate),
+            },
+        ])
     }
 
     /// Create a computed-key index expression: `target[key]`.
