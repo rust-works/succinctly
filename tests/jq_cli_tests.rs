@@ -70171,39 +70171,47 @@ fn test_walk_over_a_scalar_is_f_in_path_position_3713() -> Result<()> {
     Ok(())
 }
 
-/// #3713 closed the direct shapes of #3723 (an `f` that navigates the array
-/// `walk` rebuilt, at any nesting level, in `path`, `del`, `=` and `|=`). One
-/// shape of it is still answered where jq raises, and one answer is wrong the
-/// other way; both are pinned as today's behaviour so a follow-up flips them on
-/// purpose (each row captured from jq 1.7.1):
-///
-/// - a `[walk(f)]` collect whose refusal a later `try` swallows. jq raises
-///   inside the collect (exit 5); the collect's contents are an allowlist
-///   (`array_contents_are_checked`) that admits only an `f` navigating nothing,
-///   so this resolver evaluates the collect by value and the `try` catches the
-///   refusal of the navigation after it (exit 0);
-/// - an effectful `f` that navigates only conditionally. The question runs `f`
-///   a second time, which a probe must not do to a body with side effects, so
-///   such a body that *can* navigate is refused whether or not it does here:
-///   jq answers (exit 0), this refuses (exit 5).
+/// #3713 closed the direct shapes of #3723 by *asking* the resolver, in a second
+/// pass, whether the trailing `f` navigates the array `walk` rebuilt, and two
+/// answers stayed wrong: a `[walk(f)]` collect whose refusal a later `try`
+/// swallowed (jq exits 5, this exited 0), and an effectful `f` that navigates only
+/// conditionally, which could not be asked (a probe must not re-run an effect,
+/// #2744) and was refused wherever it *can* navigate (jq answers, this exited 5).
+/// #3736 observes the trailing `f` inline instead, in the one evaluation, so both
+/// answer what jq 1.7.1 answers (each row captured from it), and so does the
+/// non-empty shape the probe never reached: a navigating `f` that yields output on
+/// the rebuilt array raised at the terminal check, so a later `| empty` or `try`
+/// hid it.
 #[test]
-fn test_walk_over_an_array_residuals_differ_from_jq_3723() -> Result<()> {
+fn test_walk_over_an_array_observes_trailing_f_inline_3736() -> Result<()> {
     for (input, filter, code) in [
         (
             "[[1]]",
             r#"path(. as $x | [walk(if type == "array" then .[0] else . end)] | try .[0])"#,
-            0,
+            5,
         ),
         (
             "[null]",
             r#"path(walk(debug | select(type == "object") | .a))"#,
-            5,
+            0,
         ),
+        (
+            "[null,null]",
+            r#"(..|walk(debug | select(type == "object") | .a)) |= 5"#,
+            0,
+        ),
+        // A navigating `f` that *yields* on the rebuilt array: jq raises there,
+        // whatever follows the `walk`.
+        ("[null]", "path(walk(.[0]) | empty)", 5),
+        ("[null]", "path(walk(.[0]))", 5),
+        ("[null]", "path(try walk(.[0]))", 0),
+        ("[null]", "[path(try walk(.[0]))]", 0),
     ] {
-        let (stdout, stderr, got) = run_jq_full(&["-c", filter], Some(input))?;
-        assert_eq!(got, code, "#3723: `{filter}` on {input}: stderr={stderr:?}");
-        assert_eq!(stdout, "", "#3723: `{filter}` on {input}");
+        let (_, stderr, got) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(got, code, "#3736: `{filter}` on {input}: stderr={stderr:?}");
     }
+    let (stdout, _, _) = run_jq_full(&["-c", "path(try walk(.[0]))"], Some("[null]"))?;
+    assert_eq!(stdout, "", "#3736: a caught refusal prints nothing");
     Ok(())
 }
 
@@ -70225,6 +70233,24 @@ fn test_walk_over_an_array_does_not_rerun_an_f_with_effects_3713() -> Result<()>
             "[\"DEBUG:\",\"m\"]\n[\"DEBUG:\",\"m\"]\n",
         ),
         ("path(walk(stderr | empty))", "null[]"),
+        // #3736: an effectful body whose navigation is guarded away answers, as in
+        // jq, instead of being refused for what it *could* do.
+        (
+            r#"path(walk(debug | select(type == "object") | .a))"#,
+            "[\"DEBUG:\",null]\n[\"DEBUG:\",[]]\n",
+        ),
+        (
+            r#"path(walk(debug("m") | select(type == "object") | .a))"#,
+            "[\"DEBUG:\",\"m\"]\n[\"DEBUG:\",\"m\"]\n",
+        ),
+        (
+            r#"path(walk(stderr | select(type == "object") | .a))"#,
+            "null[]",
+        ),
+        (
+            r#"path(walk(debug | getpath(["a"])?))"#,
+            "[\"DEBUG:\",null]\n[\"DEBUG:\",[null]]\n",
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("[null]"))?;
         assert_eq!(code, 0, "#3713: `{filter}`: stderr={stderr:?}");
@@ -70246,6 +70272,27 @@ fn test_walk_over_an_array_does_not_rerun_an_f_with_effects_3713() -> Result<()>
         2,
         "#3713: stderr={stderr:?}"
     );
+    // Nested levels run `f` once per node and once per rebuilt array, in jq's
+    // order, with no extra pass for the refusal or the answer (#3736): jq's bytes.
+    for (input, filter, want_stderr) in [
+        (
+            "[[1]]",
+            "path(walk(debug | .a?))",
+            "[\"DEBUG:\",1]\n[\"DEBUG:\",[]]\n",
+        ),
+        (
+            "[[null,null],[1]]",
+            r#"[path(walk(debug | getpath(["a"])?))]"#,
+            concat!(
+                "[\"DEBUG:\",null]\n[\"DEBUG:\",null]\n[\"DEBUG:\",[null,null]]\n",
+                "[\"DEBUG:\",1]\n[\"DEBUG:\",[]]\n[\"DEBUG:\",[]]\n",
+            ),
+        ),
+    ] {
+        let (_, stderr, _) = run_jq_full(&["-c", filter], Some(input))?;
+        let effects = stderr.split("jq: error").next().unwrap_or_default();
+        assert_eq!(effects, want_stderr, "#3736: `{filter}` on {input}");
+    }
     Ok(())
 }
 

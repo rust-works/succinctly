@@ -37703,12 +37703,13 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // the root, `walk(first)` is `[0]`, and `walk(1)` still refuses with its
         // result. An array or object does not qualify: `map(w)` rebuilds the
         // container, so the trailing `| f` runs on a computed value and the by-value
-        // route keeps judging it, both for what it produces
-        // (`always_refuses_as_live_path`) and for an `f` that yields nothing
-        // (`always_refuses_when_empty`), which jq refuses just the same: a
-        // stream like `..|walk(.a?)` reaches the scalar leaves only through
-        // those containers, so their silence would let it write. jq mode only
-        // (ADR-0018): yq has no oracle for it.
+        // route keeps judging it, for what it produces
+        // (`always_refuses_as_live_path`) and, for an array, by observing the
+        // trailing `f` inline (`walk_observed`, #3736), which jq refuses just the
+        // same whether or not `f` yields anything: a stream like `..|walk(.a?)`
+        // reaches the scalar leaves only through those containers, so their
+        // silence would let it write. jq mode only (ADR-0018): yq has no oracle
+        // for it.
         Expr::Builtin(Builtin::Walk(f))
             if S::TAG == EvalTag::Jq
                 && !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) =>
@@ -40065,14 +40066,24 @@ fn eval_leaf_each<S: EvalSemantics>(
     value: &OwnedValue,
     trackable: bool,
     snapshot: &Snapshot,
-    register_loss: &RegisterLoss,
+    frame: &Frame,
+    walk_input_reaches_object: bool,
     on_value: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> (Flow, Option<EvalError>) {
+    // #3736: `walk(f)` over an array that reaches no object observes its trailing
+    // `f` inline instead of probing it afterwards ([`walk_observed`]).
+    if S::TAG == EvalTag::Jq && !walk_input_reaches_object && matches!(value, OwnedValue::Array(_))
+    {
+        if let Expr::Builtin(Builtin::Walk(f)) = expr {
+            let (outputs, control) = walk_observed::<S>(f, value, snapshot, frame, 0);
+            return (drain_fork(outputs, control, on_value), None);
+        }
+    }
     let reentry = Reentry::at_register(trackable);
     match PatternSearch::of(expr).filter(|_| !trackable) {
         Some((search, pattern)) => {
             let refuse = |e: EvalError, step: Option<NavKind>| {
-                guess_refusal(e, register_loss, snapshot, value, step)
+                guess_refusal(e, &frame.register_loss, snapshot, value, step)
             };
             eval_each_pattern_search::<S>(search, pattern, value, reentry, &refuse, on_value)
         }
@@ -40378,23 +40389,13 @@ fn iterates_untracked_input<S: EvalSemantics>(
 /// where jq names the derived `[<input>,[]]` (the approximate-container tradeoff
 /// of #3271, recorded in `limitations.md`).
 ///
-/// #3713 (and #3723): `walk(f)` over an *array* that reaches no object is the
-/// third. jq's `def w: if type == "object" then map_values(w) elif type ==
-/// "array" then map(w) else . end | f; w` rebuilds the array with `map(w)`, which
-/// is never the register, and then runs the trailing `f` on it. That run raises
-/// iff it reaches a navigation, even under `?` (`path(walk(.a?))` and
-/// `path(walk(.[]?))` on `[null]` raise, where `walk(empty)`,
-/// `walk(select(false))`, `walk(try .a)` and `walk(select(type == "object") |
-/// .a)` yield nothing). That was harmless until a scalar `walk` became an answer
-/// of its own: in `(..|walk(.a?)) |= 5` over `[null,null]` the root array's
-/// silent nothing let the stream reach the scalar leaves, and the write jq
-/// refuses went through. The verdict is *asked*, not guessed from `f`'s shape:
-/// [`walk_trailing_f_raises`].
+/// #3713 (and #3723): `walk(f)` over an *array* that reaches no object is a third
+/// shape, but it is no longer answered here: the by-value leaf observes its
+/// trailing `f` inline ([`walk_observed`], #3736), so the verdict falls out of the
+/// one real evaluation and there is nothing left to ask once it delivered nothing.
 fn always_refuses_when_empty<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
-    snapshot: &Snapshot,
-    frame: &Frame,
 ) -> Option<EvalError> {
     if S::TAG != EvalTag::Jq {
         return None;
@@ -40415,117 +40416,89 @@ fn always_refuses_when_empty<S: EvalSemantics>(
         Expr::Builtin(Builtin::Walk(_)) if array_reaches_object(input) => Some(
             EvalError::invalid_path_expression_near_access(&OwnedValue::Int(0), input),
         ),
-        // Objects, and arrays reaching one, took the arm above; this one is for an
-        // array of scalars, and `walk_trailing_f_raises` answers `None` for anything
-        // else.
-        Expr::Builtin(Builtin::Walk(f)) => walk_trailing_f_raises::<S>(f, input, snapshot, frame),
         _ => None,
     }
 }
 
-/// Whether the trailing `f` of `walk(f)` raises when it runs on the arrays `walk`
-/// rebuilt (#3713), which jq path-checks because they are not the register.
+/// `walk(f)` over an array that reaches no object, evaluated for a path-position
+/// leaf with its trailing `f` observed **inline** (#3736, closing #3713's probe).
 ///
-/// Decided by running `f` in path position against each rebuilt array *as an
-/// untracked value*, the way any stage after a by-value one runs: the resolver
-/// already raises where jq does and stays silent where it does
-/// (`path([1,2] | .a?)` raises, `path([1,2] | select(type == "object") | .a)`,
-/// `path([1,2] | getpath(["a"])?)` and `path([1,2] | empty | .a)` do not), so this
-/// repeats none of that. A syntactic "does `f` navigate" scan was the first
-/// version and refused all four of those silent shapes.
+/// jq's `def w: if type == "object" then map_values(w) elif type == "array" then
+/// map(w) else . end | f; w` rebuilds each array with `map(w)` and runs the trailing
+/// `f` on it. That array is never the path register, so `f` raises iff it reaches a
+/// navigation (even under `?`: `path(walk(.a?))` over `[null]` raises, where
+/// `walk(empty)` and `walk(select(type == "object") | .a)` yield nothing). This is
+/// [`walk_impl_at_depth`] with that one run changed: a rebuilt array resolves `f`
+/// once in path position, as an untracked value (the way any stage after a by-value
+/// one runs, so the resolver's untracked-navigation rules decide the verdict), and
+/// the values it delivers are that level's outputs; a scalar still evaluates `f`
+/// by value, once. So `f` runs once per node, in jq's order, and an `f` with an
+/// effect fires exactly as often as in jq: the by-value pass and a second probe
+/// pass used to run it twice, which is why such a body could not be asked
+/// (#2744) and was refused when it could navigate.
 ///
-/// jq's `map(w)` -- `[.[] | w]` -- rebuilds an array at *every* nesting level and
-/// runs the trailing `f` on each, so every level is asked, innermost first, by one
-/// pass over the tree ([`walk_levels_ask`]) that also builds each level's array
-/// (each child's own outputs flattened in). Whatever a dry run delivers is
-/// dropped: the by-value route found no output, and the branches an untracked
-/// input yields are not paths in any case.
-///
-/// **The pass runs `f` a second time, so it is not made when `f` can have an
-/// effect** ([`walk_body_may_have_effects`]): `walk(debug | empty)` over `[null]`
-/// prints two lines in jq, and a probe on top of the by-value pass printed four
-/// (#2744's rule: a probe must not duplicate real evaluation's side effects, and a
-/// correct fix observes the value inline). Such a body cannot be asked, and
-/// answering silently would let `(..|walk(debug | .a?)) |= 5` over `[null,null]`
-/// write where jq errors, so one that can navigate ([`cannot_move_register`] is
-/// false) is refused, loudly and uncatchably like every guess (#3267); one that
-/// cannot navigate cannot raise, and stays silent. The pass costs a second walk of
-/// the tree, on this path only: a walk over an array that yielded nothing, in path
-/// position.
-fn walk_trailing_f_raises<S: EvalSemantics>(
-    f: &Expr,
-    value: &OwnedValue,
-    snapshot: &Snapshot,
-    frame: &Frame,
-) -> Option<EvalError> {
-    if !matches!(value, OwnedValue::Array(_)) {
-        return None;
-    }
-    if walk_body_may_have_effects(f) {
-        return (!cannot_move_register(f))
-            .then(|| EvalError::invalid_path_expression_guessed(value));
-    }
-    match walk_levels_ask::<S>(f, value, snapshot, frame, 0) {
-        Err(WalkLevel::Raised(e)) => Some(e),
-        Ok(_) | Err(WalkLevel::Aborted) => None,
-    }
-}
-
-/// Why [`walk_levels_ask`] stopped before the end of the tree.
-enum WalkLevel {
-    /// `f` raised on the array rebuilt at some level.
-    Raised(EvalError),
-    /// `f` ended in a control (an error, a `break`) the by-value route has already
-    /// delivered, so there is nothing left to ask.
-    Aborted,
-}
-
-/// One post-order pass of [`walk_trailing_f_raises`]: returns what `walk` itself
-/// produces for `value` (`f`'s outputs on it, by value), asking at every array
-/// whether `f` raises on the array rebuilt from its children. The outermost level
-/// (`depth == 0`) is asked but its outputs are not computed: the caller has them.
-///
-/// Mirrors [`walk_impl_at_depth`]'s array and scalar arms -- an object never gets
-/// here, [`array_reaches_object`] refuses it first -- and shares its depth bound.
-fn walk_levels_ask<S: EvalSemantics>(
+/// The `(outputs, control)` shape is [`walk_impl_at_depth`]'s, so the leaf
+/// ([`eval_leaf_each`]) delivers it through the same [`on_value`](drain_fork)
+/// callback and the register bookkeeping ([`leaf_register`]) is unchanged. An
+/// object never gets here ([`array_reaches_object`] routes it to the by-value
+/// walk, whose refusal arms are #3360's). Shares [`walk_impl_at_depth`]'s depth
+/// bound.
+fn walk_observed<S: EvalSemantics>(
     f: &Expr,
     value: &OwnedValue,
     snapshot: &Snapshot,
     frame: &Frame,
     depth: usize,
-) -> Result<Vec<OwnedValue>, WalkLevel> {
+) -> (Vec<OwnedValue>, Option<Control>) {
     assert_value_tree_depth(depth);
-    let rebuilt;
-    let seen = match value {
-        OwnedValue::Array(items) => {
-            let mut children = vec_with_capacity(items.len());
-            for item in items {
-                children.extend(walk_levels_ask::<S>(f, item, snapshot, frame, depth + 1)?);
-            }
-            rebuilt = OwnedValue::array_from(children);
-            if let ResolveFlow::Escaped(EvalEscape::Error(e)) = resolve_node_sink::<S>(
-                f,
-                &rebuilt,
-                false,
-                snapshot,
-                frame,
-                Keep::AtMost(usize::MAX),
-                &mut |_| Demand::Continue,
-            ) {
-                return Err(WalkLevel::Raised(e));
-            }
-            &rebuilt
-        }
-        other => other,
+    let OwnedValue::Array(items) = value else {
+        return eval_owned_expr_fork::<S>(f, value, false, Reentry::REBUILT);
     };
-    if depth == 0 {
-        return Ok(Vec::new());
+    let mut children = vec_with_capacity(items.len());
+    for item in items {
+        let (outputs, control) = walk_observed::<S>(f, item, snapshot, frame, depth + 1);
+        children.extend(outputs);
+        if let Some(control) = control {
+            return (Vec::new(), Some(control));
+        }
     }
-    let (outputs, control) = eval_owned_expr_fork::<S>(f, seen, false, Reentry::REBUILT);
-    if control.is_some() {
-        Err(WalkLevel::Aborted)
-    } else {
-        Ok(outputs)
+    let rebuilt = OwnedValue::array_from(children);
+    let mut outputs = Vec::new();
+    let flow = resolve_node_sink::<S>(
+        f,
+        &rebuilt,
+        false,
+        snapshot,
+        frame,
+        Keep::AtMost(usize::MAX),
+        &mut |branch| {
+            outputs.push(branch.value.into_owned());
+            Demand::Continue
+        },
+    );
+    let control = match flow {
+        ResolveFlow::Escaped(escape) => Some(Control::from(escape)),
+        ResolveFlow::Exhausted | ResolveFlow::Stopped => None,
+    };
+    (outputs, control)
+}
+
+/// Deliver a fork's `(outputs, control)` to a leaf's value callback, as
+/// [`drain_result`] delivers a `Partial`: the prefix first, then the control, and a
+/// stop part-way carries the control it never reached as `pending`.
+fn drain_fork(
+    outputs: Vec<OwnedValue>,
+    control: Option<Control>,
+    on_value: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Flow {
+    for v in outputs {
+        if on_value(v) == Demand::Stop {
+            return Flow::Stopped { pending: control };
+        }
+    }
+    match control {
+        Some(control) => Flow::Escaped(control),
+        None => Flow::Exhausted,
     }
 }
 
@@ -40669,7 +40642,8 @@ fn resolve_leaf_sink<'a, S: EvalSemantics>(
         value,
         trackable,
         snapshot,
-        register_loss,
+        frame,
+        walk_input_reaches_object,
         &mut on_value,
     );
     construct_refusal = construct_refusal.or(refusal);
@@ -40700,7 +40674,7 @@ fn resolve_leaf_sink<'a, S: EvalSemantics>(
     // argument's own type error/`error(...)` must still come first, same
     // ordering rule as `always_refuses_as_live_path`).
     if delivered == 0 && matches!(flow, Flow::Exhausted) {
-        if let Some(e) = always_refuses_when_empty::<S>(expr, value, snapshot, frame) {
+        if let Some(e) = always_refuses_when_empty::<S>(expr, value) {
             return ResolveFlow::Escaped(EvalEscape::Error(e));
         }
     }
@@ -41007,7 +40981,8 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         value,
         trackable,
         snapshot,
-        register_loss,
+        frame,
+        walk_input_reaches_object,
         &mut on_value,
     );
     construct_refusal = construct_refusal.or(refusal);
@@ -41054,7 +41029,7 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         // must still win first, which a bare-shape pre-check would not
         // respect).
         if matches!(flow, Flow::Exhausted) {
-            if let Some(e) = always_refuses_when_empty::<S>(expr, value, snapshot, frame) {
+            if let Some(e) = always_refuses_when_empty::<S>(expr, value) {
                 return Err((Vec::new(), EvalEscape::Error(e)));
             }
         }
