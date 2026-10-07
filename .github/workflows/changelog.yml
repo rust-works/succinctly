@@ -1,0 +1,54 @@
+name: Changelog fragments
+
+# Each PR adds its own changelog.d/<issue>.<type>.md instead of editing
+# CHANGELOG.md, so no two PRs conflict on the changelog (#3920). This workflow
+# validates every fragment and requires a PR to add one or be waived. See
+# changelog.d/README.md.
+on:
+  pull_request:
+    branches: [main]
+    # `edited` (PR body) and `labeled`/`unlabeled` are not default activity types;
+    # include them so the check re-runs the moment a waiver is added or removed.
+    types: [opened, reopened, synchronize, edited, labeled, unlabeled]
+  # Reports a status on the merge queue's `gh-readonly-queue/main/*` builds so the
+  # job could be made a required context without hanging queued PRs (see
+  # block-merge.yml, #310). The fragment *requirement* is a property of the PR, so
+  # it is skipped there; fragment validity is not, so a queue build still checks it.
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+
+jobs:
+  fragments:
+    name: Changelog fragments
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # `check-pr` diffs base...head, which needs the merge base
+
+      - name: Unit-test the changelog script
+        run: python3 scripts/test_changelog.py -v
+
+      - name: Validate fragments
+        run: python3 scripts/changelog.py check
+
+      # PR metadata goes through env, never interpolated into the script, so a
+      # title or body cannot inject shell.
+      - name: Require a fragment or a waiver
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          printf '%s' "$PR_BODY" > "$RUNNER_TEMP/pr-body.txt"
+          python3 scripts/changelog.py check-pr \
+            --base "$BASE_SHA" --head "$HEAD_SHA" \
+            --title "$PR_TITLE" --body-file "$RUNNER_TEMP/pr-body.txt" \
+            --labels "$PR_LABELS" --author "$PR_AUTHOR"
