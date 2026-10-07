@@ -64818,6 +64818,174 @@ fn test_nested_navigating_foreach_states_the_register_its_source_left_3883() -> 
     ])
 }
 
+/// #3953: jq backtracks a `reduce`'s source and UPDATE, so the register its final check reads
+/// is INIT's however far UPDATE navigated, and an UPDATE that hands the accumulator's own node
+/// back is at the register: `path(reduce 1 as $k (.; (. as {a:$a} | .)))` is `[]` although the
+/// bind moved the register onto `.a`, and `del()` of it is `null` and `= 5` writes the root.
+/// The same holds for a `foreach` in UPDATE whose source destructures the register or navigates
+/// (`foreach .[]? as $k (.; .; .)` on `[true]`). The resolver refused each. A destructured
+/// `$var` handed back, an array pattern on an object, a literal INIT that leaves the register
+/// off the accumulator, and a `reduce` whose own source navigated (where `.` is not the
+/// register) keep their refusals. Every row captured from jq 1.7.1, on the stdin and `-n` routes.
+#[test]
+fn test_reduce_update_handing_back_the_accumulator_after_a_destructure_3953() -> Result<()> {
+    let doc = r#"{"a":false,"b":null}"#;
+    let root = |filter: &'static str, out: &'static str| (doc, filter, out, "", 0);
+    assert_path_rows_both_routes_3749(&[
+        root(r"path(reduce 1 as $k (.; (. as {a:$a} | .)))", "[]\n"),
+        root(r"path(reduce (1,2) as $k (.; (. as {a:$a} | .)))", "[]\n"),
+        root(r"path(reduce 1 as $k (.; (. as {a:$a} | .) | .))", "[]\n"),
+        root(r"(reduce 1 as $k (.; (. as {a:$a} | .))) = 5", "5\n"),
+        root(r"del(reduce 1 as $k (.; (. as {a:$a} | .)))", "null\n"),
+        root(
+            r"path(reduce 1 as $k (.; (foreach (. as {a:$a} | .) as $x (.; .; .))))",
+            "[]\n",
+        ),
+        (
+            r#"{"a":{"x":1}}"#,
+            r"path(reduce 1 as $k (.; (. as {a:$a} | .)))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            "[true]",
+            r"path(reduce 1 as $k (.; (foreach .[]? as $k (.; .; .))))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            "[true]",
+            r"del(reduce 1 as $k (.; (foreach .[]? as $k (.; .; .))))",
+            "null\n",
+            "",
+            0,
+        ),
+        // Contrasts.
+        (
+            doc,
+            r"path(reduce 1 as $k (.; (. as {a:$a} | $a)))",
+            "",
+            "Invalid path expression with result false",
+            5,
+        ),
+        (
+            doc,
+            r"path(reduce 1 as $k (.; (. as [$a] | .)))",
+            "",
+            "Cannot index object with number",
+            5,
+        ),
+        (
+            doc,
+            r"path(reduce 1 as $k (0; (. as {a:$a} | .)))",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of 0"#,
+            5,
+        ),
+        (
+            doc,
+            r"path(reduce 1 as $k (.; (. as {a:$a} | .) | .a))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        // A `reduce` whose own source navigated runs UPDATE with `.` off the register: jq
+        // raises at the bind, and the document must not be deleted.
+        (
+            r#"{"a":[1],"b":2}"#,
+            r"del(reduce .[]? as $k (.; foreach (. as {a:$a} | .) as $k (.; .; .)))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":[1],"b":2}"#,
+            r"path(reduce .[]? as $k (.; . as {a:$a} | .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            doc,
+            r"path(reduce 1 as $k (.; (foreach (1,2) as $j (.; .a; .))))",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of false"#,
+            5,
+        ),
+        // Review of the first version (each deleted or overwrote the document where jq raises):
+        // a `foreach` under a `reduce` whose source navigated, a foreach after a bind, a bind
+        // INIT, a source hidden under `first`, and a nested foreach that yields nothing for one
+        // element and leaves its state `null`.
+        (
+            "[true]",
+            r"del(reduce .[]? as $k (.; foreach .[]? as $k (.; .; .)))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            "[true]",
+            r"(reduce .[]? as $k (.; foreach .[]? as $k (.; .; .))) |= 5",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":{"b":3},"b":2}"#,
+            r"del(reduce .[]? as $k (.; . as {b:$b} | foreach 1 as $e (.; .; .)))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":[1],"b":2}"#,
+            r"del(reduce .[]? as $k (.; reduce (1,2) as $j (.; foreach .a as $e (.; .; .))))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":[1],"b":2}"#,
+            r"del(reduce 1 as $k (.; foreach .[]? as $j ((. as {a:$a} | .); .; .)))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"del(reduce 1 as $k (.; (. as {a:$a} | foreach first(. as {a:$a} | .) as $j (.; .; .))))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(reduce 1 as $k (.; foreach (1,2) as $x (.; (foreach (select($x==2)) as $y (.; .; .)); .)))",
+            "",
+            "Invalid path expression with result null",
+            5,
+        ),
+        // A destructuring loop pattern steps on the element, off the accumulator's register.
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce . as {a:$q} (.; (. as {a:$a} | .)))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        // Under a `try` jq swallows the error and leaves the document.
+        (
+            "[true]",
+            r"del(try (reduce (.[]?, 1) as $k (.; foreach .[]? as $e (.; .; .))))",
+            "[true]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
 /// #3790: a `foreach` whose SOURCE is the register itself (`.`, or a comma or pipe of
 /// them) emits an element that is the register's own node, so a bare `$k` bound to
 /// it is a path: `path(foreach . as $k (0; $k; .))` is `[]` for any document, and a
