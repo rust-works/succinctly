@@ -9789,15 +9789,20 @@ This was recorded here as an open policy question from #2163 until #3895, and `s
 matches it: INIT's first output forks a fold whose SOURCE reads the real input, and every later
 output forks one whose SOURCE reads `null`. The decision followed ADR-0018's order — the output is
 readable, nothing is corrupted and nothing crashes, so no rule-4 condition lets us refuse the
-reference, and matching it costs nothing measurable (a single-INIT fold, which is nearly every
-fold, never builds the `null` form of its source).
+reference, and matching it costs nothing (a single-INIT fold, which is nearly every fold, never
+reaches the `null` branch).
 
 How it is built: the shared fork cores (`foreach_forks`/`reduce_forks`, `src/jq/eval.rs`) tell each
 fork's source drive whether it is the first (`SourceInput::Real`) or a later one
-(`SourceInput::Null`). `ForkSource` answers a later fork with `null | SOURCE`, built on the first
-such fork and reused, which both evaluators already run — neither needs a way to construct a null
-of its own value type. The path-context evaluator's `resolve_reduce`/`resolve_foreach` already did
-this for `path()` and assignment targets (#2388), so all three agree.
+(`SourceInput::Null`), and each caller runs a later fork's *as-written* source against `null`: the
+`eval.rs` evaluator hands it `StandardJson::Null` (`source_value`), the generic one an owned `null`
+(`drive_source_against_null`, the route's `eval_each_owned`, since it has no `null` of its own value
+type). Nothing is cloned or wrapped, so a single-INIT fold pays nothing and `FoldDirectRetry`'s `?//`
+detection reads the same source tree on every fork. The path-context evaluator's
+`resolve_reduce`/`resolve_foreach` already did this for `path()` and assignment targets (#2388), so
+all three agree. `succinctly yq` shares the cores and so reads `null` there too: real yq has no
+`reduce`/`foreach` (its lexer rejects both), so they are an extension there and follow jq (ADR-0018
+rule 5).
 
 What it ties together, all captured from `/usr/bin/jq` 1.7.1 and pinned by
 `test_fold_source_runs_against_null_after_first_init_fork_3895` (`tests/jq_cli_tests.rs`, both the
@@ -9816,9 +9821,7 @@ stdin and the `-n 'input | ...'` route, the demand-driven and the unbounded-stre
   `reduce (.) as $x ((.,.); ($x.a) = 9)` answers once and then refuses, as it already did.
 
 A source that does not read `.` (`range(3)`, a literal, `$var`) cannot tell the forks apart and is
-unaffected. The fold's source expression is still the *as-written* one for `?//` retry detection
-(`FoldDirectRetry`); the `null | ` wrapper is a pipe stage, which that detection already treats as
-"fixed on `std`, previous answer on `no_std`" (see "`reduce`/`foreach` and a `?//`").
+unaffected.
 
 ### Caller-supplied NaN literals still avoid the reindex bridge
 

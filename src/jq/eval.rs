@@ -55658,21 +55658,19 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     let mut outputs: Vec<OwnedValue> = Vec::new();
-    let mut lazy_source = ForkSource::new(input);
     let mut lazy_drive = |source_input: SourceInput, per_element: ForeachElementSink<'_>| -> Flow {
         drive_lazy::<W, S>(
-            lazy_source.expr(source_input),
-            value.clone(),
+            input,
+            source_value(&value, source_input),
             optional,
             per_element,
         )
     };
-    let mut eager_source = ForkSource::new(input);
     let mut eager_drive =
         |source_input: SourceInput, per_element: ForeachElementSink<'_>| -> Flow {
             drive_eager::<W, S>(
-                eager_source.expr(source_input),
-                value.clone(),
+                input,
+                source_value(&value, source_input),
                 optional,
                 per_element,
             )
@@ -58213,22 +58211,20 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // The demand-driven strategy: one element at a time, so the fold's own
     // stop (and any `?//` in the source) is reached exactly as it is under a
     // wrapping `first`/`limit`.
-    let mut lazy_source = ForkSource::new(input);
     let mut lazy_drive = |source_input: SourceInput, per_element: ForeachElementSink<'_>| -> Flow {
         drive_lazy::<W, S>(
-            lazy_source.expr(source_input),
-            value.clone(),
+            input,
+            source_value(&value, source_input),
             optional,
             per_element,
         )
     };
     // The bounded fallback: see this function's own doc comment.
-    let mut eager_source = ForkSource::new(input);
     let mut eager_drive =
         |source_input: SourceInput, per_element: ForeachElementSink<'_>| -> Flow {
             drive_eager::<W, S>(
-                eager_source.expr(source_input),
-                value.clone(),
+                input,
+                source_value(&value, source_input),
                 optional,
                 per_element,
             )
@@ -58463,36 +58459,38 @@ pub(crate) enum SourceInput {
     Null,
 }
 
-/// A fold's SOURCE expression, handing out the expression to drive for a given
-/// [`SourceInput`] (#3895).
+/// Drive `expr`, a fold's SOURCE, against `null` on the generic evaluator's
+/// behalf (#3895): [`SourceInput::Null`] for a route with no `null` of its own
+/// value type to hand `eval_each_generic`.
 ///
-/// Evaluating against `null` is spelled `null | SOURCE`, which every route --
-/// the `eval.rs` evaluator and the generic one alike -- already evaluates, so
-/// no route needs a way to construct a null of its own value type. The wrapped
-/// expression is built on the first later fork and only then: a fold with a
-/// single INIT output (almost all of them) never clones the source.
-pub(crate) struct ForkSource<'e> {
-    source: &'e Expr,
-    null_source: Option<Expr>,
+/// The expression is the as-written one, so a later fork sees the very same
+/// tree the first did -- no wrapper stage for the `?//` retry detection
+/// ([`FoldDirectRetry`]) to read differently, and nothing cloned. Escapes
+/// travel in the returned [`Flow`] itself: every item here is already owned,
+/// so there is no decode failure to stash the way [`drive_lazy`] does.
+pub(crate) fn drive_source_against_null<S: EvalSemantics>(
+    expr: &Expr,
+    optional: bool,
+    per_item: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Flow {
+    eval_each_owned::<S>(
+        expr,
+        &OwnedValue::Null,
+        optional,
+        Reentry::REBUILT,
+        per_item,
+    )
 }
 
-impl<'e> ForkSource<'e> {
-    pub(crate) fn new(source: &'e Expr) -> Self {
-        Self {
-            source,
-            null_source: None,
-        }
-    }
-
-    /// The expression to drive for `input`; evaluate it against the fold's
-    /// own input either way.
-    pub(crate) fn expr(&mut self, input: SourceInput) -> &Expr {
-        match input {
-            SourceInput::Real => self.source,
-            SourceInput::Null => self.null_source.get_or_insert_with(|| {
-                Expr::pipe(vec![Expr::Literal(Literal::Null), self.source.clone()])
-            }),
-        }
+/// The value a fold's SOURCE runs against on a fork reading `input`: the
+/// fold's own `value` for the first, `null` for every later one (#3895).
+fn source_value<'a, W: Clone>(
+    value: &StandardJson<'a, W>,
+    input: SourceInput,
+) -> StandardJson<'a, W> {
+    match input {
+        SourceInput::Real => value.clone(),
+        SourceInput::Null => StandardJson::Null,
     }
 }
 
@@ -58583,8 +58581,9 @@ impl FoldDirectRetry {
 /// **Every fork after the first drives it against `null`** (#3895): jq 1.7.1
 /// hands only INIT's first output the fold's real input
 /// (`[reduce (.) as $x ((.,.); $x)]` is `[{"a":1},null]`), so `drive_source` is
-/// told which input the fork reads ([`SourceInput`]) and the callers answer a
-/// later fork from [`ForkSource`].
+/// told which input the fork reads ([`SourceInput`]) and each caller runs a
+/// later fork's as-written source against `null` -- [`source_value`] on this
+/// evaluator, [`drive_source_against_null`] on the generic one.
 ///
 /// The step's own verdict outranks the source's, and a *fork's* own verdict
 /// (which folds in the step's) outranks INIT's own: a step or fork that
@@ -58978,11 +58977,10 @@ fn each_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut drive_init = |per_init: &mut dyn FnMut(OwnedValue) -> Demand| -> Flow {
         drive_lazy::<W, S>(init, value.clone(), optional, per_init)
     };
-    let mut source = ForkSource::new(input);
     let mut drive = |source_input: SourceInput, per_element: ForeachElementSink<'_>| -> Flow {
         drive_lazy::<W, S>(
-            source.expr(source_input),
-            value.clone(),
+            input,
+            source_value(&value, source_input),
             optional,
             per_element,
         )
@@ -59067,11 +59065,10 @@ fn each_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         drive_lazy::<W, S>(init, value.clone(), optional, per_init)
     };
 
-    let mut source = ForkSource::new(input);
     let mut drive = |source_input: SourceInput, per_element: ForeachElementSink<'_>| -> Flow {
         drive_lazy::<W, S>(
-            source.expr(source_input),
-            value.clone(),
+            input,
+            source_value(&value, source_input),
             optional,
             per_element,
         )
