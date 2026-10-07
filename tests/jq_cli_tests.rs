@@ -70171,6 +70171,91 @@ fn test_walk_over_a_scalar_is_f_in_path_position_3713() -> Result<()> {
     Ok(())
 }
 
+/// #3736 observes the trailing `f` inline, which closed the collect shape of #3723
+/// (item 4 of #3360): a `walk(f)` that *produced* a value because `f` navigated the
+/// array `walk` rebuilt. This pins the wider grid that fix was checked against, in
+/// every context that drives a leaf (a collect then a `try`, `try walk`, a `reduce`
+/// or `foreach` source, `del`, `|=`); every row is captured from jq 1.7.1
+/// (exit, stdout).
+#[test]
+fn test_walk_over_an_array_that_produces_raises_where_jq_raises_3723() -> Result<()> {
+    const NAV: &str = r#"if type == "array" then .[0] else . end"#;
+    let collect = format!("path(. as $x | [walk({NAV})] | try .[0])");
+    let try_walk = format!("path(try walk({NAV}))");
+    let catch_walk = format!("path(try walk({NAV}) catch 7)");
+    let del_try = format!("del(try walk({NAV}))");
+    let upd_try = format!("(try walk({NAV})) |= 5");
+    let reduce_src = format!("path(reduce walk({NAV}) as $v (.; .))");
+    let foreach_src = format!("path(foreach walk({NAV}) as $v (.; .))");
+    let collect_dots = r"path(. as $x | [walk(.a?)] | try .[0])";
+    let nested = r"path(. as $x | [walk(walk(empty))] | try .[0])";
+    let iter = r"path(. as $x | [walk(.[]?)] | try .[0])";
+    for (input, filter, code, want_stdout) in [
+        ("[[1]]", collect.as_str(), 5, ""),
+        ("[[1]]", collect_dots, 5, ""),
+        ("[1]", collect_dots, 5, ""),
+        ("[null]", collect_dots, 5, ""),
+        ("[]", iter, 5, ""),
+        ("[[1]]", nested, 5, ""),
+        ("[[1]]", reduce_src.as_str(), 5, ""),
+        ("[[1]]", foreach_src.as_str(), 5, ""),
+        // A `try` around the walk catches the raise: nothing is answered, and
+        // nothing is written.
+        ("[[1]]", try_walk.as_str(), 0, ""),
+        ("[[1]]", del_try.as_str(), 0, "[[1]]\n"),
+        ("[[1]]", upd_try.as_str(), 0, "[[1]]\n"),
+        // The handler's output is not the register's, so jq refuses it.
+        ("[[1]]", catch_walk.as_str(), 5, ""),
+    ] {
+        let (stdout, stderr, got) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(got, code, "#3723: `{filter}` on {input}: stderr={stderr:?}");
+        assert_eq!(stdout, want_stdout, "#3723: `{filter}` on {input}");
+        if code == 5 {
+            assert!(
+                stderr.contains("Invalid path expression"),
+                "#3723: `{filter}` on {input}: stderr={stderr:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The other half: a `walk(f)` body that jq answers must stay silent in the same
+/// collect, so the inline observation does not over-refuse a body that merely
+/// *mentions* navigation. Each row is captured from jq 1.7.1 (exit 0, nothing).
+#[test]
+fn test_walk_over_an_array_that_produces_stays_silent_for_a_body_jq_answers_3723() -> Result<()> {
+    for (input, body) in [
+        ("[1]", r#"if type == "number" then . + 1 else . end"#),
+        ("[[1]]", r#"select(type == "object") | .a"#),
+        ("[[1]]", r#"if type == "array" then sort else . end"#),
+        ("[[1]]", r#"if type == "array" then length else . end"#),
+        ("[[1]]", "."),
+        ("[[1]]", "try .a"),
+        ("[[1]]", "empty"),
+    ] {
+        let filter = format!("path(. as $x | [walk({body})] | try .[0])");
+        let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some(input))?;
+        assert_eq!(code, 0, "#3723: `{filter}` on {input}: stderr={stderr:?}");
+        assert_eq!(stdout, "", "#3723: `{filter}` on {input}");
+    }
+    Ok(())
+}
+
+/// The one #3723 shape still answered where jq raises, pinned as today's behaviour
+/// so a follow-up flips it on purpose: a collect that holds a `getpath` is
+/// evaluated by value (#2759), so nothing in it is path-checked.
+/// `{"a":[1]} | path(. as $x | [walk(getpath(["a"])?)] | try .[0])` exits 5 in jq
+/// 1.7.1 and 0 here.
+#[test]
+fn test_walk_over_an_array_residual_getpath_collect_differs_from_jq_3723() -> Result<()> {
+    let filter = r#"path(. as $x | [walk(getpath(["a"])?)] | try .[0])"#;
+    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":[1]}"#))?;
+    assert_eq!(code, 0, "#3723 residual: stderr={stderr:?}");
+    assert_eq!(stdout, "", "#3723 residual");
+    Ok(())
+}
+
 /// #3713 closed the direct shapes of #3723 by *asking* the resolver, in a second
 /// pass, whether the trailing `f` navigates the array `walk` rebuilt, and two
 /// answers stayed wrong: a `[walk(f)]` collect whose refusal a later `try`
