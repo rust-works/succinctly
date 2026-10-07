@@ -40054,13 +40054,19 @@ fn eval_each_pattern_search<S: EvalSemantics>(
     (flow, refusal)
 }
 
-/// [`eval_each_owned`] over a leaf's own `expr`, with the one leaf that must
-/// observe its argument routed through [`eval_each_pattern_search`] (#3347):
-/// `indices`/`index`/`rindex` name their pattern in the access they raise on an
-/// untracked input, which only the evaluation that produces the pattern can tell.
-/// Shared by [`resolve_leaf`] and [`resolve_leaf_sink`] so the two forms cannot
-/// disagree about it. The refusal it returns, if any, is read like the caller's
-/// own `construct_refusal`.
+/// [`eval_each_owned`] over a leaf's own `expr`, with the two leaves that must
+/// observe their own evaluation routed around it. `indices`/`index`/`rindex` go
+/// through [`eval_each_pattern_search`] (#3347): they name their pattern in the
+/// access they raise on an untracked input, which only the evaluation that produces
+/// the pattern can tell. A jq-mode `walk(f)` over an array that reaches no object
+/// goes through [`walk_observed`] (#3736), which resolves its trailing `f` on each
+/// rebuilt array as part of the one evaluation, and returns before the generic
+/// route's [`Reentry`] is computed, so a front door keyed on the `walk` expression
+/// would have to be added there too. `frame` carries the register loss both read, and
+/// `walk_input_reaches_object` is the caller's own [`array_reaches_object`] of
+/// `value`. Shared by [`resolve_leaf`] and [`resolve_leaf_sink`] so the two forms
+/// cannot disagree about either. The refusal it returns, if any, is read like the
+/// caller's own `construct_refusal`.
 fn eval_leaf_each<S: EvalSemantics>(
     expr: &Expr,
     value: &OwnedValue,

@@ -2308,8 +2308,8 @@ is the revert that established what the other one costs.
    shapes (its entry is below), and [#3736](https://github.com/rust-works/succinctly/issues/3736)
    observes the trailing `f` inline, which also answers the `[walk(f)]` collect whose refusal a
    later `try` used to swallow (`test_walk_over_an_array_observes_trailing_f_inline_3736`). Both
-   rules are jq mode only, like the rest of the table. (The always-raises group as a `reduce`/`foreach` *source*
-   was the same gap until [#3726](https://github.com/rust-works/succinctly/issues/3726); it is
+   rules are jq mode only, like the rest of the table. (The always-raises group as a
+   `reduce`/`foreach` *source* was the same gap until [#3726](https://github.com/rust-works/succinctly/issues/3726); it is
    closed, pinned by
    `test_reduce_foreach_source_that_always_raises_raises_in_path_position_3726`, and the yq side
    by `test_yq_reduce_source_that_jq_refuses_in_path_position_still_answers_3726`.)
@@ -3470,8 +3470,8 @@ answers `["b"]` — and classified the two residuals appended below):
   `walk(select(type == "object") | .a)` and `walk(getpath(["a"])?)` over it yield nothing in both.
   That was not optional: with a scalar `walk` answering, `(..|walk(.a?)) |= 5` over `[null,null]`
   reached the scalar leaves through the root array's silence and wrote where jq errors. The verdict is
-  asked, not guessed from `f`'s shape: `f` is resolved in path position against the array rebuilt at
-  every nesting level (jq's `map(w)` runs it on each), as an untracked value, as any stage after a
+  decided by the resolver, not guessed from `f`'s shape: `f` is resolved in path position against the
+  array rebuilt at every nesting level (jq's `map(w)` runs it on each), as an untracked value, as any stage after a
   by-value one is, so the resolver's own untracked-navigation rules decide it and the refusal is
   catchable like jq's (`try [path(walk(.a?))] catch "c"` is `"c"` in both). A syntactic "does `f`
   navigate" scan was the first version and refused `walk(select(type == "object") | .a)`,
@@ -3481,7 +3481,7 @@ answers `["b"]` — and classified the two residuals appended below):
   asked it with an inline observation. The by-value leaf for an array `walk` that reaches no object
   runs the same walk, except that each rebuilt array resolves `f` once, in path position, as an
   untracked value (a scalar still evaluates `f` by value, once), and the values it delivers are that
-  level's outputs. `f` therefore runs once per node, in jq's order: an effectful body (`debug`,
+  level's outputs. `f` therefore runs once per node, in jq's order (the one exception is below): an effectful body (`debug`,
   `debug(msg)`, `stderr`, `input`, `inputs`, `halt`, `halt_error`, or a call whose body the tree does
   not hold) fires exactly as often as in jq (`path(walk(debug | empty))` over `[null]` prints two lines
   in both, `test_walk_over_an_array_does_not_rerun_an_f_with_effects_3713`) and is no longer refused
@@ -3494,7 +3494,11 @@ answers `["b"]` — and classified the two residuals appended below):
   went from 464 accepted-wrongly, 2,110 refused-wrongly and 838 effect-count mismatches to none of the
   first and last, and 7 refused-wrongly rows that are `.[0] | walk(ltrimstr("a"))`, which fails
   identically before this change (the string-identity limit above). The probe's cost, a second walk of
-  the whole tree on the empty-result path, is gone. yq mode
+  the whole tree on the empty-result path, is gone. **Still differs:** the outputs of the *root*
+  level's trailing `f` are collected before any is delivered, so a consumer that stops early sees an
+  effectful `f` with several outputs run to completion where jq stops at the first
+  (`first(path(walk(debug, debug)))` over `[null,[null]]` prints 8 `DEBUG` lines here, 7 in jq; 9
+  before #3736), pinned by `test_walk_over_an_array_root_f_runs_to_completion_under_first_3736`. yq mode
   keeps the by-value route: real yq's lexer rejects `walk`, so under `--jq-extensions` it is a
   succinctly extension with no oracle to match (ADR-0018 rule 5), pinned by
   `yq_walk_over_a_scalar_keeps_the_by_value_route_3713`.

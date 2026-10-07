@@ -70184,34 +70184,58 @@ fn test_walk_over_a_scalar_is_f_in_path_position_3713() -> Result<()> {
 /// hid it.
 #[test]
 fn test_walk_over_an_array_observes_trailing_f_inline_3736() -> Result<()> {
-    for (input, filter, code) in [
+    for (input, filter, code, want_stdout) in [
         (
             "[[1]]",
             r#"path(. as $x | [walk(if type == "array" then .[0] else . end)] | try .[0])"#,
             5,
+            "",
         ),
         (
             "[null]",
             r#"path(walk(debug | select(type == "object") | .a))"#,
             0,
+            "",
         ),
+        // No write happens: jq prints the document unchanged.
         (
             "[null,null]",
             r#"(..|walk(debug | select(type == "object") | .a)) |= 5"#,
             0,
+            "[null,null]\n",
         ),
         // A navigating `f` that *yields* on the rebuilt array: jq raises there,
         // whatever follows the `walk`.
-        ("[null]", "path(walk(.[0]) | empty)", 5),
-        ("[null]", "path(walk(.[0]))", 5),
-        ("[null]", "path(try walk(.[0]))", 0),
-        ("[null]", "[path(try walk(.[0]))]", 0),
+        ("[null]", "path(walk(.[0]) | empty)", 5, ""),
+        ("[null]", "path(walk(.[0]))", 5, ""),
+        ("[null]", "path(try walk(.[0]))", 0, ""),
+        ("[null]", "[path(try walk(.[0]))]", 0, "[]\n"),
     ] {
-        let (_, stderr, got) = run_jq_full(&["-c", filter], Some(input))?;
+        let (stdout, stderr, got) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(got, code, "#3736: `{filter}` on {input}: stderr={stderr:?}");
+        assert_eq!(stdout, want_stdout, "#3736: `{filter}` on {input}");
     }
-    let (stdout, _, _) = run_jq_full(&["-c", "path(try walk(.[0]))"], Some("[null]"))?;
-    assert_eq!(stdout, "", "#3736: a caught refusal prints nothing");
+    Ok(())
+}
+
+/// #3736 collects the root level's trailing `f` before delivering any output, so a
+/// consumer that stops early still sees an effectful `f` with several outputs run
+/// to completion: `first(path(walk(debug, debug)))` over `[null,[null]]` prints 8
+/// `DEBUG` lines here where jq 1.7.1 prints 7 (9 before #3736, which ran the walk
+/// twice). Pinned as today's behaviour so a lazy root level flips it on purpose.
+#[test]
+fn test_walk_over_an_array_root_f_runs_to_completion_under_first_3736() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "first(path(walk(debug, debug)))"],
+        Some("[null,[null]]"),
+    )?;
+    assert_eq!(code, 5, "#3736: stderr={stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(
+        stderr.matches("DEBUG").count(),
+        8,
+        "#3736: stderr={stderr:?}"
+    );
     Ok(())
 }
 
