@@ -61089,6 +61089,107 @@ fn test_catch_handler_optional_navigation_reaches_the_register_node_3891() -> Re
     Ok(())
 }
 
+/// #3891: the handler is seeded as the register's node only where jq keeps it
+/// tracked, and not just where the payload happens to share its storage. A payload
+/// built by value (`[.][0]`, `[.] | add`, `{"a":.} | .a`) keeps the register's `Rc`
+/// here, but jq raises a path error inside `error(msg)`'s argument ahead of the
+/// handler, so a write through it must refuse (it silently landed in a first cut).
+/// The positive rows cover an array register, a non-root register and a register
+/// reached through a binding. Every row captured live from jq 1.7.1.
+#[test]
+fn test_catch_handler_seed_needs_a_payload_jq_keeps_tracked_3891() -> Result<()> {
+    for (program, doc, want) in [
+        // An array register, at the root and below it.
+        ("path(try error catch .[0])", "[[1],2]", "[0]"),
+        ("del(try error catch .[0])", "[[1],2]", "[2]"),
+        ("(try error catch .[0]) = 9", "[[1],2]", "[9,2]"),
+        (
+            "path(.z | try error catch .[0])",
+            r#"{"z":[5,6],"y":1}"#,
+            r#"["z",0]"#,
+        ),
+        (
+            "del(.z | try error catch .[0])",
+            r#"{"z":[5,6],"y":1}"#,
+            r#"{"z":[6],"y":1}"#,
+        ),
+        (
+            "(.z | try error catch (.[0])?) = 9",
+            r#"{"z":[5,6],"y":1}"#,
+            r#"{"z":[9,6],"y":1}"#,
+        ),
+        // A node reached through a binding, and one a pipe stage leaves alone.
+        (
+            "path(. as $x | try error($x) catch .a)",
+            r#"{"a":{"b":1}}"#,
+            r#"["a"]"#,
+        ),
+        (
+            "path(try (. | error) catch .a)",
+            r#"{"a":{"b":1}}"#,
+            r#"["a"]"#,
+        ),
+        (
+            "path(.a | try error catch .b)",
+            r#"{"a":{"b":1}}"#,
+            r#"["a","b"]"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(doc))?;
+        assert_eq!(code, 0, "#3891: `{program}` on {doc}: stderr {stderr:?}");
+        assert_eq!(stdout.trim(), want, "#3891: `{program}` on {doc}");
+    }
+    // A payload built by value is refused in every form, by path, delete and write.
+    let doc = r#"{"a":{"b":1},"z":[3,1,2]}"#;
+    for payload in ["[.][0]", "[.] | add", r#"{"a":.} | .a"#] {
+        for program in [
+            format!("path(try error({payload}) catch .a)"),
+            format!("del(try error({payload}) catch .a)"),
+            format!("(try error({payload}) catch .a) = 9"),
+        ] {
+            let (stdout, stderr, code) = run_jq_full(&["-c", &program], Some(doc))?;
+            assert_eq!(code, 5, "#3891: `{program}`: stdout {stdout:?}");
+            assert!(stdout.is_empty(), "#3891: `{program}`: {stdout:?}");
+            assert!(
+                stderr.contains(r#"Invalid path expression near attempt to access element "a" of"#),
+                "#3891: `{program}`: {stderr:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// #3967 (pinned, not endorsed): a compound handler next to an `and`/`or`/`-`
+/// navigation refuses where jq answers. `main` already refuses the `true` row
+/// (a `null`/`bool` payload has been seeded trackable since #3133); #3891 makes the
+/// array row refuse too, because a container sharing the register's storage is now
+/// seeded the same way. When #3967 lands both rows answer and this test flips.
+#[test]
+fn test_compound_catch_handler_beside_a_navigation_refuses_where_jq_answers_3967() -> Result<()> {
+    for (program, doc, element) in [
+        (
+            "path(try error catch (try .a catch 0) and .b?)",
+            "true",
+            r#""b" of true"#,
+        ),
+        (
+            "path(try error catch (try .a catch 0) and .[0])",
+            "[true]",
+            "0 of [true]",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(doc))?;
+        assert_eq!(code, 5, "#3967: `{program}` on {doc}: stdout {stdout:?}");
+        assert!(
+            stderr.contains(&format!(
+                "Invalid path expression near attempt to access element {element}"
+            )),
+            "#3967: `{program}` on {doc}: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3888: `INDEX(f)` iterates its input first (`INDEX(.[]; f)`), whatever it is,
 /// and `transpose` iterates once some row has a length above zero -- so on a
 /// value the resolver is not tracking both raise jq's `Invalid path expression

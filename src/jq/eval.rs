@@ -38272,12 +38272,17 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             };
             match resolve_node_sink::<S>(expr, value, trackable, snapshot, frame, keep, sink) {
                 ResolveFlow::Escaped(EvalEscape::Error(e)) if !e.is_uncatchable() => {
+                    let caught = if error_body_raises_its_input::<S>(expr) {
+                        CaughtPayload::OfInput
+                    } else {
+                        CaughtPayload::Value
+                    };
                     resolve_catch_sink::<S>(
                         catch.as_deref(),
                         e.payload(),
                         frame,
                         entry_register,
-                        true,
+                        caught,
                         keep,
                         sink,
                     )
@@ -38293,7 +38298,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                     OwnedValue::Null,
                     frame,
                     entry_register,
-                    false,
+                    CaughtPayload::Label,
                     keep,
                     sink,
                 ),
@@ -49746,6 +49751,44 @@ fn resolve_foreach<'a, S: EvalSemantics>(
     }
 }
 
+/// What a `try` caught, as far as jq's `jv_identical` against the register goes
+/// (#3133, #3891).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CaughtPayload {
+    /// A caught `break`: jq's `{"__jq":N}` label object, never the register's node.
+    Label,
+    /// An error value. A `null`/`bool` equal to the register is identical to it
+    /// whatever raised it (jq's `jv_identical` compares those by value).
+    Value,
+    /// The value `error` / `error(P)` raised with `P` a passthrough of `.`
+    /// ([`error_body_raises_its_input`]): the very node the body stood on, so a
+    /// container sharing the register's storage is the register's node too.
+    OfInput,
+}
+
+/// Whether a `try` body that raised raises *its own input*: `error`, or `error(P)`
+/// with `P` a passthrough of `.`, optionally after passthrough stages (#3891).
+///
+/// jq evaluates `error(msg)`'s argument in path mode, so only a path-preserving
+/// `P` keeps the register: `error(.)` raises the node and a handler navigates it
+/// (`path(try error(.) catch .a)` is `["a"]`), while `error([.][0])` or
+/// `error({"a":.}|.a)` fail with a path error inside the argument, ahead of the
+/// handler (captured live, jq 1.7.1). A payload built by value can still share
+/// the register's storage here -- the `Rc` survives the construction -- so storage
+/// alone is not enough: the expression has to be one jq keeps tracked. The
+/// grammar is [`is_identity_passthrough`]'s, so a path-preserving `P` it does not
+/// know (`first(.)`, `getpath([])`) refuses, as it did before.
+fn error_body_raises_its_input<S: EvalSemantics>(body: &Expr) -> bool {
+    match unwrap_bind_source(body) {
+        Expr::Error(None) => true,
+        Expr::Error(Some(msg)) => is_identity_passthrough::<S>(msg),
+        Expr::Pipe(stages) => stages.split_last().is_some_and(|(last, lead)| {
+            lead.iter().all(is_identity_passthrough::<S>) && error_body_raises_its_input::<S>(last)
+        }),
+        _ => false,
+    }
+}
+
 /// Apply `Expr::Try`'s `catch` clause (if any) after `expr` failed to
 /// resolve as a path, streaming its output straight to `sink` (#2235) —
 /// `expr`'s own already-resolved branches reached `sink` directly through
@@ -49823,7 +49866,7 @@ fn resolve_catch_sink<'a, S: EvalSemantics>(
     payload: OwnedValue,
     frame: &Frame,
     entry_register: Option<&OwnedValue>,
-    payload_may_be_node: bool,
+    caught: CaughtPayload,
     keep: Keep,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
@@ -49844,7 +49887,7 @@ fn resolve_catch_sink<'a, S: EvalSemantics>(
     // the old `frame.unknown()`), or trackable outright when the payload is
     // a `null`/`bool` identical to the register by jq's `jv_identical`
     // (`null | path(try (.a | error(null)) catch .b)` is `["b"]`) -- for an
-    // *error* payload only (`payload_may_be_node`): a caught `break`'s is a
+    // *error* payload only (anything but [`CaughtPayload::Label`]): a caught `break`'s is a
     // label object jq never finds identical. With no register in hand the
     // seed is a plain untracked branch, exactly as before.
     //
@@ -49859,15 +49902,24 @@ fn resolve_catch_sink<'a, S: EvalSemantics>(
     let frame = frame.with_register(entry_register);
     let seed = match frame.register() {
         Some(register)
-            if payload_may_be_node
+            if caught != CaughtPayload::Label
                 && (null_bool_identical(&payload, register)
                     // #3891: `error` and `error(.)` raise the very node the `try`
                     // stood on, so jq's `jv_identical` holds for a container too
                     // (`try error catch .a` is `["a"]`), and storage identity is
                     // that pointer test where the resolver holds the caller's own
-                    // tree. Where it does not (a reindex bridge) this is false and
-                    // the arm below decides.
-                    || (S::TAG == EvalTag::Jq && payload.shares_storage_with(register))) =>
+                    // tree. It answers for containers (and a scalar a bind has
+                    // promoted, [`OwnedValue::shares_storage_with`]); a string or a
+                    // computed number has no storage to compare, so a handler
+                    // navigating one still refuses, as it did (`"abc" | try error
+                    // catch .[1:]` is a path in jq). Where it does not hold at all (a
+                    // reindex bridge) this is false and the arm below decides. Only
+                    // for a body that raised its own input
+                    // ([`CaughtPayload::OfInput`]): a payload built by value can share
+                    // the storage too, which jq does not treat as the node.
+                    // `register` is only ever present in jq mode (`entry_register`).
+                    || (caught == CaughtPayload::OfInput
+                        && payload.shares_storage_with(register))) =>
         {
             PathBranch::new(PathPrefix::root(), Cow::Owned(payload), true)
         }
