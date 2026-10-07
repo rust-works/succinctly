@@ -70094,6 +70094,46 @@ fn test_foreach_update_comma_with_a_navigating_pipe_and_a_literal_keeps_the_regi
     ])
 }
 
+/// #3933: an EXTRACT after a comma UPDATE that ends in a literal. The literal's by-value
+/// output leaves jq's register where the comma entered it, so the EXTRACT's `$v0` is still the
+/// register's node; the fold used to refuse (`Invalid path expression with result 5`) because the
+/// comma was opaque to the register read, which #3941's per-sibling read now sees through.
+/// Every row captured from jq 1.7.1 with `-c`.
+#[test]
+fn test_foreach_extract_after_a_comma_update_ending_in_a_literal_3933() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r#"{"a":{"c":5}}"#,
+            r"path(foreach .a as {c:$v0} (0; (($v0 | .b?), 1); $v0))",
+            "[\"a\",\"c\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"c":5}}"#,
+            r"del(foreach .a as {c:$v0} (0; (($v0 | .b?), 1); $v0))",
+            "{\"a\":{}}\n",
+            "",
+            0,
+        ),
+        // The issue's second fuzz shape: a nested fold whose source is the loop variable.
+        (
+            r#"{"a":{"b":1},"c":{"b":1}}"#,
+            r"path(foreach .a as {c:$v0} (0; (($v0 | .b?), 1); foreach (1) as $i (0; $v0; .)))",
+            "[\"a\",\"c\",\"b\"]\n[\"a\",\"c\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"c":{"b":1}}"#,
+            r"path(foreach .a as {b:$v0} (0; (($v0 | .b?), 1); foreach (1) as $i (0; $v0; .)))",
+            "[\"a\",\"b\"]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
 /// #3941, characterization of what its fix leaves. A comma sibling that is a pipe of
 /// non-navigating stages (#3959) is opaque to the register read, so the write is silently
 /// skipped; one that is a register-neutral builtin the allowlist lacks (#3960) refuses loudly.
