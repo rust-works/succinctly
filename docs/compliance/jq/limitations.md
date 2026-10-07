@@ -8344,11 +8344,17 @@ is answered from the same tree since
 serialize and index the whole state each round to read one count, and
 `[] | until(length >= 8000; . + [1])` is now 6.0 ms on the M4 Pro and 6.3 ms on
 the 7950X against 701.6 ms and 737.1 ms. What the loops still bridge per
-round: a condition `eval_owned_pure` does not answer (`has`, `keys`, `any`/`all`,
-`tostring`, `startswith`, an array construction, tracked in
-[#3707](https://github.com/rust-works/succinctly/issues/3707); such a condition
-now pays one failed walk of the pure grammar first, 119 instructions per round,
-+0.82% on a tiny state), an update that
+round: a condition `eval_owned_pure` does not answer (a generator-taking
+`any`/`all`, `has`/`startswith`/`endswith` with a computed or fanning argument,
+`keys_unsorted`, ...; such a condition now pays one failed walk of the pure
+grammar first, 119 instructions per round, +0.82% on a tiny state). A literal-key
+`has`, `keys`, `startswith`/`endswith` with a literal string, `tostring` and an
+array construction `[e]` of a pure `e` are answered from the tree too since
+[#3707](https://github.com/rust-works/succinctly/issues/3707), behind the same
+`door` opt-in as `length`, so the shared grammar `closed_expr_to_owned` and the
+resolver use is unchanged; a `null` input or a type mismatch under `has`, and a
+non-container `keys`, still take the bridge so its diagnostics and yq's permissive
+`false` stay its own. An update that
 is not an owned step (a right side that reads the state, `.i = .i + 1`; a pipe
 with one such stage), and a `while`'s emitted copy makes its step copy the
 state's top-level container once per round.
