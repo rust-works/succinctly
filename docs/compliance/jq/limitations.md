@@ -5995,11 +5995,15 @@ Three differences remain, all in the direction of erroring rather than aborting:
   5 with the diagnostic instead of panicking, including through `try`/`catch`, `?` and
   `first(f)`) -- see
   `test_path_non_cursor_native_deep_static_chain_reports_clean_error_not_panic_2058_3275`.
-  One call site still panics uncaught rather than exiting 5: `succinctly yq`'s own
-  YAML-emission pipeline (`yq_runner.rs`'s `emit_yaml_value_at_depth` and four sibling
-  `assert_value_tree_depth` call sites, reached by a write (`=`/`|=`/`+=`) whose right-hand
-  side constructs a deep value directly rather than through the reindex bridge), tracked
-  separately as #3278.
+  `succinctly yq`'s own YAML-emission pipeline (`yq_runner.rs`'s `emit_yaml_value_at_depth`
+  and four sibling `assert_value_tree_depth` call sites, reached by a write (`=`/`|=`/`+=`)
+  whose right-hand side constructs a deep value directly rather than through the reindex
+  bridge) still asserts, but `run_yq` now catches exactly that panic (#3278) and reports the
+  same `nesting depth exceeds limit of 384` diagnostic with yq's own error status (exit 1,
+  where `succinctly jq` exits 5), not an uncaught exit 101. Unlike the checked guards above
+  this is a `catch_unwind` net rather than an `EvalError`, so the failure ends the run
+  instead of being an error a `try` could see; the emission recursion has no `Result` to
+  thread it through.
 - **A self-recursive comma generator streams for thousands of elements, not
   indefinitely.** `def naturals: 0, (naturals|.+1); [limit(100000; naturals)]` errors
   (`naturals/0 exceeded maximum recursion depth`) somewhere between 10,000 and 20,000

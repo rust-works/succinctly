@@ -258,6 +258,24 @@ pub fn nesting_depth_panic_message(payload: &(dyn core::any::Any + Send)) -> Opt
         .then(|| text.to_string())
 }
 
+/// [`nesting_depth_panic_message`]'s wider twin for yq's own write pipeline
+/// (#3278): `Some` for either depth ceiling's exact message --
+/// [`MAX_NESTING_DEPTH`] (document nesting) *or*
+/// [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH) (a value a
+/// filter built past the tree ceiling, which `yq_runner.rs`'s emission and
+/// presentation walks assert on after evaluation has already succeeded).
+/// `None` for any other panic, which a caller must still `resume_unwind`.
+pub fn depth_guard_panic_message(payload: &(dyn core::any::Any + Send)) -> Option<String> {
+    let text = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())?;
+    [MAX_NESTING_DEPTH, super::value::MAX_VALUE_TREE_DEPTH]
+        .into_iter()
+        .any(|max| text == super::value::nesting_depth_exceeded_message(max))
+        .then(|| text.to_string())
+}
+
 /// The materializers' depth guard (#3457): [`assert_nesting_depth`]'s
 /// ceiling, reported as a `decode_failure`-tagged `Err` instead of a panic.
 ///
@@ -33369,6 +33387,25 @@ mod tests {
     /// position and `|=` entries build none) has no break to catch, so it is
     /// rewritten like any other wrapper and keeps its name, in either mode --
     /// the catch is `CONSUMERS_DRIVE_PREFETCHED_BODY`'s, which `yq` leaves off.
+    /// #3278: the helper yq's write boundary narrows on matches both depth
+    /// ceilings' exact message and nothing else.
+    #[test]
+    fn depth_guard_panic_message_matches_both_ceilings_only_3278() {
+        use crate::jq::value::{nesting_depth_exceeded_message, MAX_VALUE_TREE_DEPTH};
+        for max in [MAX_NESTING_DEPTH, MAX_VALUE_TREE_DEPTH] {
+            let text = nesting_depth_exceeded_message(max);
+            assert_eq!(depth_guard_panic_message(&text), Some(text.clone()));
+            let owned: Box<dyn core::any::Any + Send> = Box::new(text.clone());
+            assert_eq!(depth_guard_panic_message(&*owned), Some(text));
+        }
+        let literal: Box<dyn core::any::Any + Send> = Box::new("index out of bounds");
+        assert_eq!(depth_guard_panic_message(&*literal), None);
+        let other = nesting_depth_exceeded_message(MAX_VALUE_TREE_DEPTH + 1);
+        assert_eq!(depth_guard_panic_message(&other), None);
+        let not_text: Box<dyn core::any::Any + Send> = Box::new(7_u32);
+        assert_eq!(depth_guard_panic_message(&*not_text), None);
+    }
+
     #[test]
     fn label_without_a_prefetch_hook_keeps_its_body_3639() {
         fn resolved<S: EvalSemantics>() -> Expr {

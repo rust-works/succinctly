@@ -18,9 +18,10 @@ use succinctly::jq::document::{
 };
 use succinctly::jq::escape::AsciiEscapeWriter;
 use succinctly::jq::eval_generic::{
-    check_nesting_depth, eval_with_cursor_using, to_owned as generic_to_owned,
-    to_owned_cursor as generic_to_owned_cursor, to_owned_with_comments, to_owned_yaml_cursor,
-    AnchorMark, CommentTree, GenericResult, NodeMeta, KEY_STYLE_STRING, VALUE_STYLE_STRING,
+    check_nesting_depth, depth_guard_panic_message, eval_with_cursor_using,
+    to_owned as generic_to_owned, to_owned_cursor as generic_to_owned_cursor,
+    to_owned_with_comments, to_owned_yaml_cursor, AnchorMark, CommentTree, GenericResult, NodeMeta,
+    KEY_STYLE_STRING, VALUE_STYLE_STRING,
 };
 use succinctly::jq::stream::StreamFailure;
 use succinctly::jq::{
@@ -5887,7 +5888,48 @@ fn discard_yq_partial_prefix<V: DocumentValue>(result: GenericResult<V>) -> Gene
 }
 
 /// Main entry point for the yq command.
+/// `run_yq` behind the net for the depth guards yq's own write pipeline
+/// asserts (#3278).
+///
+/// `owned_value_align_hash`, `reconcile_presentation_at_depth`,
+/// `scan_anchor_soundness`, `strip_presentation_style_at_depth` and
+/// `emit_yaml_value_at_depth` each `assert_value_tree_depth` on the *result*
+/// of an evaluation that already succeeded (`.a |= deep(400)` builds a value
+/// past `MAX_VALUE_TREE_DEPTH` with no adversarial document involved), so
+/// there is no `Result` to thread the signal through without re-signing the
+/// whole emission recursion. This boundary reports exactly that panic -- and
+/// only that one -- as the diagnostic `run_jq` already gives it, exiting with
+/// yq's own error status. The default panic hook is replaced for the call by
+/// one that stays silent for that message alone, so the raw `thread
+/// panicked` line does not precede the diagnostic; any other panic goes to
+/// the original hook and is re-raised unchanged.
 pub fn run_yq(args: YqCommand) -> Result<i32> {
+    let previous: std::sync::Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send> =
+        std::sync::Arc::from(std::panic::take_hook());
+    let forward = previous.clone();
+    std::panic::set_hook(Box::new(move |info| {
+        if depth_guard_panic_message(info.payload()).is_none() {
+            forward(info);
+        }
+    }));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_yq_inner(args)));
+    // Put the original hook back (library callers and the test harness share
+    // this process); `previous` is the only owner left once ours is dropped.
+    drop(std::panic::take_hook());
+    std::panic::set_hook(Box::new(move |info| previous(info)));
+    match outcome {
+        Ok(result) => result,
+        Err(payload) => {
+            let Some(message) = depth_guard_panic_message(&*payload) else {
+                std::panic::resume_unwind(payload);
+            };
+            eprintln!("Error: {message}");
+            Ok(exit_codes::YQ_FAILURE)
+        }
+    }
+}
+
+fn run_yq_inner(args: YqCommand) -> Result<i32> {
     // Handle --version
     if args.version {
         println!("succinctly-yq {}", env!("CARGO_PKG_VERSION"));
