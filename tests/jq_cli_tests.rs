@@ -83404,6 +83404,28 @@ fn test_fold_loop_variable_in_path_position_3329() -> Result<()> {
             "#3897: `{filter}`: {stderr:?}"
         );
     }
+    // The same parent asked twice: the second answer is the remembered
+    // distinct-keys verdict, not a recount of the object's members, and is
+    // still jq's (the second element is a node the path does not stand on).
+    for (filter, input, want) in [
+        (
+            r"[foreach (.a, .a) as $x (.; .; path(.a | $x))]",
+            r#"{"a":{"b":1},"c":{"b":2}}"#,
+            r#"[["a"],["a"]]"#,
+        ),
+        (
+            r#"[foreach (.a, .c) as $x (.; .; try path(.a | $x) catch "no")]"#,
+            r#"{"a":{"b":1},"c":{"b":2}}"#,
+            r#"[["a"],"no"]"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.trim(), code),
+            (want, 0),
+            "#3897: `{filter}`: {stderr:?}"
+        );
+    }
     // jq refuses these too: the element is not the node the path stands on,
     // or the loop variable is not below the accumulator at all.
     for (filter, input) in [

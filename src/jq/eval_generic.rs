@@ -8374,7 +8374,7 @@ fn embed_descendant_shared<C: DocumentCursor>(cursor: &C) -> Option<OwnedValue> 
         let step = match slot {
             CursorSlot::Element(index) => OwnedValue::Int(index),
             CursorSlot::Value { key, .. } => key,
-            CursorSlot::Key(_) => return None,
+            CursorSlot::Key(_) => return None, // patchcov: coverage tolerate-line reason="unreachable: the climb starts at a container (embed_at_or_within's `is_container` gate) and only ever moves to a parent, which is a container too, and a key is a leaf -- no node on the climb can be a key; kept as a refusal rather than a panic (#3897)"
         };
         let held = embed_table::descending_for(parent.node_id(), document);
         steps.push((parent, step));
@@ -8403,7 +8403,7 @@ fn embed_descendant_shared<C: DocumentCursor>(cursor: &C) -> Option<OwnedValue> 
                 }
                 map.get(&**key)?.clone()
             }
-            _ => return None,
+            _ => return None, // patchcov: coverage tolerate-line reason="unreachable: `materializes_members_one_to_one` holds, so the value held for a node is an array exactly when the node is a sequence and an object exactly when it is a mapping, and the step the climb recorded is an index for the first and a string key for the second; kept as a refusal rather than a panic (#3897)"
         };
     }
     matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)).then_some(value)
