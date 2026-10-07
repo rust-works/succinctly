@@ -7772,15 +7772,10 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
         // than by re-deriving its checks a second time -- which
         // `validate_cursor` keeps, since it is that same walk.
         //
-        // Skipped when `is_prevalidated()` (#3317, #3478): a jq-mode `[a, b,
-        // ...]` over document nodes runs this exact walk, under these same
-        // `JqSemantics`, on every cursor before it hands out the first one
-        // (`LazySource::advance`, which `drain_atomic` below pulls through) --
-        // which is what keeps a malformed node failing the whole array ahead
-        // of anything else -- so a second walk here would only repeat it (+50%
-        // time on `[., .]`).
+        // Every cursor is validated here, a jq-mode `[a, b, ...]`'s included
+        // (#3856): its nodes are not walked when it is built, so this is
+        // where they are read.
         GenericResult::LazySeq(seq) => {
-            let prevalidated = seq.is_prevalidated();
             match seq.drain_atomic() {
                 // All-or-nothing, matching `materialize_atomic`'s own atomicity
                 // contract ("real jq's array construction is all-or-nothing:
@@ -7794,7 +7789,6 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
                     let converted: Result<Vec<JqValue<'_, W>>, EvalError> = elems
                         .into_iter()
                         .map(|elem| match elem {
-                            LazyElem::Cursor(c) if prevalidated => Ok(JqValue::Cursor(c)),
                             LazyElem::Cursor(c) => {
                                 validate_cursor::<JqSemantics, _>(&c).map(|()| JqValue::Cursor(c))
                             }

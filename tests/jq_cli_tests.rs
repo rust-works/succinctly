@@ -89681,13 +89681,14 @@ fn test_malformed_number_route_sweep_3222() -> Result<()> {
     Ok(())
 }
 
-/// #3266/#3427: on a value the index cannot read, the CLI answers a filter
-/// that navigates past it or wraps it in a one-stream array (`[.]`, `[.b]`,
-/// `[.[] | .]`), but every other construction (a comma or nested array, an
-/// object, a bind) materializes it and raises, and so does any filter once an
-/// input builtin makes the CLI materialize the whole input. (`-s` no longer
-/// does, since #2847: it reads the slurped array the way the default route
-/// reads a document, so its rows answer as the `-c` rows do.) The split
+/// #3266/#3427/#3856: on a value the index cannot read, the CLI answers a
+/// filter that navigates past it or holds it in an array (`[.]`, `[.b]`,
+/// `[.[] | .]`, and since #3856 a `,` body such as `[., 1]` or `[.a, .b]`),
+/// but a construction held inside another, an object and a bind still
+/// materialize it and raise, and so does any filter once an input builtin
+/// makes the CLI materialize the whole input. (`-s` no longer does, since
+/// #2847: it reads the slurped array the way the default route reads a
+/// document, so its rows answer as the `-c` rows do.) What remains of the split
 /// is accepted (#3427), recorded in `docs/compliance/jq/limitations.md` ("An
 /// unreadable value is validated where something reads it, not where it is
 /// wrapped"); the library entry `succinctly::jq::eval` gives the same answers
@@ -89718,22 +89719,29 @@ fn test_unreadable_value_collection_split_3266() -> Result<()> {
             0,
         ),
         (&["-c"], OBJ, ".[0] | getpath([\"a\"])", "1\n", 0),
-        (&["-c"], "[1.2.3]", ".[0] | [., 1] | length", "", 5),
+        (&["-c"], "[1.2.3]", ".[0] | [., 1] | length", "2\n", 0),
+        // #3856: printing the array reads the node, so it raises and writes
+        // nothing.
+        (&["-c"], "[1.2.3]", ".[0] | [., 1]", "", 5),
         (&["-c"], "[1.2.3]", ".[0] | {a: .} | length", "", 5),
         (&["-c"], "[1.2.3]", ".[0] | . as $x | [$x] | length", "", 5),
-        (&["-c"], "[1.2.3]", ".[0] | [., .] | length", "", 5),
+        (&["-c"], "[1.2.3]", ".[0] | [., .] | length", "2\n", 0),
         (&["-c"], "[1.2.3]", ".[0] | [[.]] | length", "", 5),
         (&["-c"], OBJ, ".[0] | [.b] | length", "1\n", 0),
         (&["-c"], OBJ, ".[0] | [.[] | .] | length", "2\n", 0),
-        (&["-c"], OBJ, ".[0] | [.a, .b] | length", "", 5),
-        (&["-c"], OBJ, ".[0] | [.[], 1] | length", "", 5),
+        (&["-c"], OBJ, ".[0] | [.a, .b] | length", "2\n", 0),
+        // Decode-or-defer (#3856): `.a` decodes, `.b` is kept as a node, so
+        // the array answers until something reads `.b`.
+        (&["-c"], OBJ, ".[0] | [.a, .b]", "", 5),
+        (&["-c"], OBJ, ".[0] | [.[], 1] | length", "3\n", 0),
         (&["-c"], OBJ, ".[0] | {x: .b} | length", "", 5),
         (&["-c"], OBJ, ".[0] | .b as $x | 1", "", 5),
         (&["-c"], "[1.2.3]", ".[0] | . as $x | 1", "", 5),
-        (&["-c"], OBJ, ".[0] | [.b, empty] | length", "", 5),
+        (&["-c"], OBJ, ".[0] | [.b, empty] | length", "1\n", 0),
         (&["-c"], OBJ, ".[0] | [.[] | ., .] | length", "", 5),
         (&["-c"], OBJ, ".[0] | [.[] | [.]] | length", "", 5),
         (&["-c"], "[1.2.3]", ".[0] | try ([., 1]) catch \"c\"", "", 5),
+        // A `?` around the array sends it down the owned route, which decodes.
         (&["-c"], OBJ, ".[0] | [.a, .b]? | length", "", 5),
         (&["-c"], OBJ, ".[0] | [first(.b)] | length", "1\n", 0),
         (
@@ -89756,7 +89764,7 @@ fn test_unreadable_value_collection_split_3266() -> Result<()> {
         // #2847: `-s` is the default route's own reads over one more array
         // level, so the same split holds: `path(.a)` answers, a comma raises.
         (&["-c", "-s"], OBJ, ".[0][0] | path(.a)", "[\"a\"]\n", 0),
-        (&["-c", "-s"], OBJ, ".[0][0] | [.a, .b] | length", "", 5),
+        (&["-c", "-s"], OBJ, ".[0][0] | [.a, .b] | length", "2\n", 0),
     ];
     for &(flags, doc, filter, stdout, code) in rows {
         let args: Vec<&str> = flags.iter().copied().chain([filter]).collect();
@@ -101159,11 +101167,13 @@ fn test_comma_array_matches_jq_3317() -> Result<()> {
     Ok(())
 }
 
-/// #3317: a node is validated as the array collects it, so a malformed
-/// document still fails the whole construction before anything reaches
-/// stdout -- including `try [., error("x")] catch .`, where the decode
-/// failure comes first in branch order and is not catchable, and consumers
-/// the cursor sequence answers without materializing (`length`, `.[0]`).
+/// #3317, #3856: a node a `,` array holds is validated where something reads
+/// it, not where the array is built. Printing the array reads every node, so a
+/// malformed document fails the whole construction before anything reaches
+/// stdout, and so does a consumer that reads a node (`.[0]`, `first`, `.[]`).
+/// A consumer that reads none (`length`) answers, and a branch's own raise
+/// (`error("x")`) is the array's failure because no decode came first, so
+/// `try [., error("x")] catch .` catches it.
 #[test]
 fn test_comma_array_malformed_writes_nothing_3317() -> Result<()> {
     for (doc, message) in [
@@ -101176,11 +101186,9 @@ fn test_comma_array_malformed_writes_nothing_3317() -> Result<()> {
             "[.[], .]",
             "[., 1]",
             "[1, .]",
-            "[., .] | length",
             "[., .] | .[0]",
             "first([., .][])",
             "[., .][]",
-            r#"try [., error("x")] catch ."#,
             r#"[., (1, error("y"))]"#,
         ] {
             let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
@@ -101190,10 +101198,37 @@ fn test_comma_array_malformed_writes_nothing_3317() -> Result<()> {
                 "#3317 `{filter}` on {doc}: stdout={stdout:?}"
             );
             assert!(
-                stderr.contains(message),
+                stderr.contains("jq: error"),
                 "#3317 `{filter}` on {doc}: stderr={stderr:?}"
             );
+            // A node the array holds fails with its own decode message when
+            // the array is printed (a consumer that reads one element names
+            // the failure its own way); a branch's own raise (`y`) is not
+            // preceded by one (#3856).
+            let printed =
+                !filter.contains('|') && !filter.contains("first(") && !filter.ends_with("[]");
+            let want = if filter.contains("error(") {
+                Some("y")
+            } else {
+                printed.then_some(message)
+            };
+            if let Some(want) = want {
+                assert!(
+                    stderr.contains(want),
+                    "#3317 `{filter}` on {doc}: stderr={stderr:?}"
+                );
+            }
         }
+        // Holding a node reads nothing in it (#3856).
+        let (stdout, stderr, code) = run_jq_full(&["-c", "[., .] | length"], Some(doc))?;
+        assert_eq!((stdout.trim_end(), code), ("2", 0), "{doc}: {stderr:?}");
+        let (stdout, stderr, code) =
+            run_jq_full(&["-c", r#"try [., error("x")] catch ."#], Some(doc))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (r#""x""#, 0),
+            "{doc}: {stderr:?}"
+        );
     }
     Ok(())
 }
@@ -101228,8 +101263,9 @@ fn test_comma_array_preserve_input_echoes_duplicates_3317() -> Result<()> {
         ("[., .] | .[1:]", format!("[{input}]")),
         ("[.a, .b]", r#"[{"x":1,"x":2},{"y":1}]"#.to_string()),
         ("[., .] | .[0].a | length", "1".to_string()),
-        // A navigation miss is `null`, not a node, so this array is owned.
-        ("[.a, .missing]", r#"[{"x":2},null]"#.to_string()),
+        // A navigation miss is a computed `null` beside a node: the array
+        // still holds the node (#3856).
+        ("[.a, .missing]", r#"[{"x":1,"x":2},null]"#.to_string()),
     ] {
         let (stdout, _, code) = run_jq_full(&["-c", "--preserve-input", filter], Some(input))?;
         assert_eq!(code, 0, "#3317 `{filter}`");
@@ -101245,24 +101281,20 @@ fn test_comma_array_preserve_input_echoes_duplicates_3317() -> Result<()> {
     Ok(())
 }
 
-/// #3317: each node is walked once, when the array's shape is known, so the
-/// walk runs after later (pure-navigation) branches have. Every exit walks
-/// the pending nodes in branch order first, so the first failure is still the
-/// one the owned route raised: an earlier node's decode failure beats a later
-/// branch's type error, a navigation miss (`null`, not a node) builds the
-/// pending nodes before it, and a first branch's own error still comes first.
-/// Every row matches `main` before #3317 (jq itself rejects these documents
-/// at parse time, before any filter runs).
+/// #3317, #3856: the first failure is the first raise in branch order among
+/// what is read. A node the array holds is read when the array is printed (or
+/// a consumer reads it), so a later branch's own raise (`.missing` on an array)
+/// comes first and `try` catches it, where an array whose nodes are all
+/// undecodable fails with the first node's decode message.
 #[test]
 fn test_comma_array_first_failure_in_branch_order_3317() -> Result<()> {
     let bad_array = r#"[1, {"bad": xyz123}]"#;
     let bad_member = r#"{"a":{"k":tru},"b":2}"#;
     for (doc, filter, message) in [
-        (bad_array, "[., .missing]", "unexpected character"),
         (
             bad_array,
-            "try [., .missing] catch .",
-            "unexpected character",
+            "[., .missing]",
+            r#"Cannot index array with string "missing""#,
         ),
         (bad_array, "[.[1], .[5]]", "unexpected character"),
         (
@@ -101272,7 +101304,6 @@ fn test_comma_array_first_failure_in_branch_order_3317() -> Result<()> {
         ),
         (bad_member, "[.a, .missing]", "invalid boolean"),
         (bad_member, "[.b, .a]", "invalid boolean"),
-        (bad_member, "[.a, .b] | length", "invalid boolean"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
         assert_eq!(code, 5, "#3317 `{filter}` on {doc}: stderr={stderr:?}");
@@ -101285,35 +101316,34 @@ fn test_comma_array_first_failure_in_branch_order_3317() -> Result<()> {
             "#3317 `{filter}` on {doc}: stderr={stderr:?}"
         );
     }
+    for (doc, filter, want) in [
+        (
+            bad_array,
+            "try [., .missing] catch .",
+            r#""Cannot index array with string \"missing\"""#,
+        ),
+        (bad_member, "[.a, .b] | length", "2"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "#3856 `{filter}` on {doc}: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "#3856 `{filter}` on {doc}");
+    }
     Ok(())
 }
 
-/// #3478: a `,` array's nodes are walked by whoever consumes the array (the
-/// build itself, when the consumer materializes it), not when the array is
-/// constructed -- but never later than anything else can be observed. The
-/// first node here is well formed and the second is not, so a consumer that
-/// read the first without walking the rest (`.[0]`, `first`, an index, a
-/// slice) would answer where `main` failed, and a `debug` or `input` that ran
-/// between the construction and the walk would print before the error.
-///
-/// Every row is the array failing whole: exit 5, nothing on stdout, the one
-/// decode failure on stderr and no `DEBUG` line, in either node order.
+/// #3478, #3856: a `,` array's nodes are read by whoever reads the array, and
+/// by no one else. The first node here is well formed and the second is not.
+/// A consumer that reads the malformed node (printing, `.[1]`, `last`, `.[]`,
+/// `tojson`, a bind that materializes it) fails whole, with exit 5, nothing on
+/// stdout, one decode failure on stderr and no `DEBUG` line, in either node
+/// order; a consumer that reads only the well-formed node (`first`, `.[0]`,
+/// `.[:1]`) or none (`length`) answers.
 #[test]
 fn test_comma_array_deferred_walk_settles_before_anything_observable_3478() -> Result<()> {
     let doc = r#"{"a":{"k":1},"b":{"k":tru}}"#;
     for array in ["[.a, .b]", "[.b, .a]", "[.a, .a, .b]"] {
         for template in [
             "ARR",
-            "ARR | length",
-            "ARR | first",
-            "ARR | last",
-            "ARR | .[0]",
-            "ARR | .[1]",
-            "ARR | .[-1]",
-            "ARR | .[:1]",
-            "ARR | .[1:]",
-            "ARR | .[]",
-            "ARR | map(.k) | length",
             "ARR | tojson",
             "ARR | tostring",
             "ARR | debug | length",
@@ -101321,28 +101351,22 @@ fn test_comma_array_deferred_walk_settles_before_anything_observable_3478() -> R
             "ARR as $v | 1",
             "ARR as $v | debug | $v",
             "ARR as [$p, $q] | 1",
-            "(ARR, debug)",
             "[ARR, (1 | debug)]",
-            "first(ARR, debug)",
             "reduce ARR as $v (0; . + 1)",
             r#"try ARR catch "caught""#,
             "ARR | . == .",
             // Side effects in a later stage's own arguments must not run
-            // ahead of the array's walk either.
+            // ahead of the array's read either.
             "ARR | .[(1 | debug)]",
-            "ARR | map(., (1 | debug))",
-            "ARR | first(.[], (1 | debug))",
-            "ARR | limit((1 | debug); .[])",
-            "ARR | (1 | debug) as $x | length",
-            "ARR | if (1 | debug) then length else 0 end",
-            "ARR | has((0 | debug))",
+            "ARR | (1 | debug) as $x | tojson",
+            "ARR | if (1 | debug) then tojson else 0 end",
         ] {
             let filter = template.replace("ARR", array);
             let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some(doc))?;
             assert_eq!(code, 5, "#3478 `{filter}`: stderr={stderr:?}");
             assert!(stdout.is_empty(), "#3478 `{filter}`: stdout={stdout:?}");
             assert!(
-                stderr.contains("invalid boolean"),
+                stderr.contains("invalid boolean") || stderr.contains("invalid keyword"),
                 "#3478 `{filter}`: stderr={stderr:?}"
             );
             assert!(
@@ -101355,6 +101379,32 @@ fn test_comma_array_deferred_walk_settles_before_anything_observable_3478() -> R
                 "#3478 `{filter}`: stderr={stderr:?}"
             );
         }
+    }
+    for filter in ["[.a, .b] | last", "[.a, .b] | .[-1]"] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 5, "#3856 `{filter}`: stderr={stderr:?}");
+        assert!(stdout.is_empty(), "#3856 `{filter}`: stdout={stdout:?}");
+    }
+    // `.[]` prints each element as it goes, so the nodes before the malformed
+    // one are written and the raise comes at that node, as jq's streaming
+    // output would.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "[.a, .b] | .[]"], Some(doc))?;
+    assert_eq!((stdout.as_str(), code), ("{\"k\":1}\n", 5), "{stderr:?}");
+    // The nodes a consumer does not read are never decoded (#3856).
+    for (filter, want) in [
+        ("[.a, .b] | length", "2"),
+        ("[.a, .b] | first", r#"{"k":1}"#),
+        ("[.a, .b] | .[0]", r#"{"k":1}"#),
+        ("[.a, .b] | .[:1]", r#"[{"k":1}]"#),
+        ("[.b, .a] | length", "2"),
+        // `last` and `.[-1]` read only the last element.
+        ("[.b, .a] | last", r#"{"k":1}"#),
+        ("[.b, .a] | .[-1]", r#"{"k":1}"#),
+        ("[.a, .a, .b] | .[1]", r#"{"k":1}"#),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "#3856 `{filter}`: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "#3856 `{filter}`");
     }
     Ok(())
 }
@@ -101388,6 +101438,109 @@ fn test_comma_array_deferred_walk_answers_unchanged_3478() -> Result<()> {
         assert_eq!(code, 0, "#3478 `{filter}`: stderr={stderr:?}");
         assert_eq!(stdout.trim_end(), want, "#3478 `{filter}`");
     }
+    Ok(())
+}
+
+/// #3856: an array holding both document nodes and computed values keeps the
+/// nodes as cursors and prints exactly what jq 1.7.1 does (every row captured
+/// live from `/usr/bin/jq` 1.7.1), across the consumers that read an element
+/// (`tojson`, `.[i]`, a slice, a bind) and the one that reads none (`length`).
+#[test]
+fn test_mixed_array_matches_jq_3856() -> Result<()> {
+    let doc = r#"{"a":{"x":1},"b":[2,3],"n":"s","m":3}"#;
+    for (filter, want) in [
+        ("[., 1]", r#"[{"a":{"x":1},"b":[2,3],"n":"s","m":3},1]"#),
+        ("[.a, 1, .b]", r#"[{"x":1},1,[2,3]]"#),
+        ("[.[], \"x\"]", r#"[{"x":1},[2,3],"s",3,"x"]"#),
+        ("[.b, empty]", "[[2,3]]"),
+        ("[1, .a, .a]", r#"[1,{"x":1},{"x":1}]"#),
+        ("[., .] | length", "2"),
+        ("[.a, null] | .[0]", r#"{"x":1}"#),
+        ("[.a, 1] | tojson", r#""[{\"x\":1},1]""#),
+        ("[.a, 1] as $v | $v | length", "2"),
+        ("[., 1] | .[1:]", "[1]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "#3856 `{filter}`: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "#3856 `{filter}`");
+    }
+    Ok(())
+}
+
+/// #3856: the direct reads of a cursor-and-value array (`.[i]`, `last`, a
+/// slice) touch only the elements they name, as they do on an all-node array,
+/// so they answer over a malformed node they do not name. Without the arm the
+/// array is materialized whole and decodes it.
+#[test]
+fn test_mixed_array_direct_reads_skip_other_elements_3856() -> Result<()> {
+    let doc = r#"{"a":{"k":tru},"b":2}"#;
+    for (filter, want) in [
+        ("[.a, 1] | last", "1"),
+        ("[.a, 1] | .[1]", "1"),
+        ("[.a, 1] | .[-1]", "1"),
+        ("[.a, 1] | .[1:]", "[1]"),
+        ("[.a, 1] | .[5]", "null"),
+        ("[1, .a, 2] | .[2]", "2"),
+        ("[.a, 1] | length", "2"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "#3856 `{filter}`: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "#3856 `{filter}`");
+    }
+    // Naming the malformed node reads it.
+    for filter in [
+        "[.a, 1] | .[0] | tojson",
+        "[1, .a] | last",
+        "[1, .a] | .[1:]",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 5, "#3856 `{filter}`: stderr={stderr:?}");
+        assert!(stdout.is_empty(), "#3856 `{filter}`: stdout={stdout:?}");
+    }
+    // Well-formed input answers as jq 1.7.1 does.
+    let good = r#"{"a":{"k":1},"b":2}"#;
+    for (filter, want) in [
+        ("[.a, 1] | last", "1"),
+        ("[.a, 1] | .[0]", r#"{"k":1}"#),
+        ("[.a, 1, .b] | .[1:]", "[1,2]"),
+        ("[.a, 1, .b] | .[-3]", r#"{"k":1}"#),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(good))?;
+        assert_eq!(code, 0, "#3856 `{filter}`: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "#3856 `{filter}`");
+    }
+    Ok(())
+}
+
+/// #3856, decode-or-defer: an all-scalar array is built owned as before, but a
+/// scalar that fails to decode is kept as a node instead of raising, so it
+/// fails where it is read -- printing the array, or a consumer that reads it --
+/// and not where the array is built.
+#[test]
+fn test_scalar_array_defers_an_undecodable_member_3856() -> Result<()> {
+    let doc = r#"{"a":1,"b":tru}"#;
+    for (filter, want) in [
+        ("[.a, .b] | length", "2"),
+        ("[.a, .b] | .[0]", "1"),
+        ("[.a, .b, 1] | length", "3"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "#3856 `{filter}`: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "#3856 `{filter}`");
+    }
+    for filter in [
+        "[.a, .b]",
+        "[.a, .b, 1]",
+        "[.a, .b] | .[1]",
+        "[.a, .b] | tojson",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 5, "#3856 `{filter}`: stderr={stderr:?}");
+        assert!(stdout.is_empty(), "#3856 `{filter}`: stdout={stdout:?}");
+    }
+    // Well-formed input is unchanged.
+    let (stdout, _, code) = run_jq_full(&["-c", "[.a, .b]"], Some(r#"{"a":1,"b":true}"#))?;
+    assert_eq!((stdout.trim_end(), code), ("[1,true]", 0));
     Ok(())
 }
 
@@ -101437,9 +101590,10 @@ fn test_comma_head_pipe_array_matches_jq_3476() -> Result<()> {
     Ok(())
 }
 
-/// #3476: a node the array holds is still validated before anything is
-/// printed, so a malformed one fails the whole construction, in branch order
-/// -- and so is a failure in a branch's own stage ahead of a later branch.
+/// #3476, #3856: a node the array holds is validated where it is read, so
+/// printing a malformed one fails the whole construction, in branch order --
+/// and so is a failure in a branch's own stage ahead of a later branch.
+/// `| length` reads none of them and answers.
 #[test]
 fn test_comma_head_pipe_array_malformed_writes_nothing_3476() -> Result<()> {
     let bad_array = r#"[1, {"bad": xyz123}]"#;
@@ -101447,16 +101601,6 @@ fn test_comma_head_pipe_array_malformed_writes_nothing_3476() -> Result<()> {
     for (doc, filter, message) in [
         (bad_array, "[(., .) | .]", "unexpected character"),
         (bad_array, "[(., .) | .[1]?]", "unexpected character"),
-        (
-            bad_array,
-            "[(., .) | .[1]] | length",
-            "unexpected character",
-        ),
-        (
-            bad_array,
-            r#"try [(., .) | .[1]?, error("x")] catch ."#,
-            "unexpected character",
-        ),
         // A branch's own stage fails before the later branch is reached.
         (
             bad_array,
@@ -101479,6 +101623,8 @@ fn test_comma_head_pipe_array_malformed_writes_nothing_3476() -> Result<()> {
             "#3476 `{filter}` on {doc}: stderr={stderr:?}"
         );
     }
+    let (stdout, stderr, code) = run_jq_full(&["-c", "[(., .) | .[1]] | length"], Some(bad_array))?;
+    assert_eq!((stdout.trim_end(), code), ("2", 0), "{stderr:?}");
     Ok(())
 }
 

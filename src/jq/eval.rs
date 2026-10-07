@@ -127904,9 +127904,10 @@ mod tests {
     /// Each row pins `eval_using`'s and the cursor entry's answer, and the
     /// `eval` half is asserted equal to the cursor entry's for every row --
     /// including the collections that materialize in the cursor entry too
-    /// (`[., 1]`, `{a: .}`, `. as $x | [$x]`, #3427), which raise in both.
-    /// That split is accepted (see `docs/compliance/jq/limitations.md`), so
-    /// moving a row is a decision to record there, not a fix.
+    /// (`{a: .}`, `. as $x | [$x]`, #3427), which raise in both. That split
+    /// is accepted for what remains of it (see
+    /// `docs/compliance/jq/limitations.md`), so moving a row is a decision to
+    /// record there, not a fix.
     #[test]
     fn eval_entry_agrees_with_the_cursor_entry_on_unreadable_values_3266() {
         use crate::jq::eval_generic::{eval_using, eval_with_cursor_using, GenericResult};
@@ -127946,22 +127947,24 @@ mod tests {
                 Some("1"),
             ),
             (OBJ, "select(key == 0) | path(.a)", None, Some(r#"["a"]"#)),
-            // #3427, accepted: an array stays lazy only when its body is one
-            // cursor stream (`[.]`, `[.b]`, `[.[] | .]` above and below), so
-            // each of these builds an owned value in the cursor entry too.
-            ("[1.2.3]", "[., 1] | length", None, None),
-            ("[1.2.3]", "[., .] | length", None, None),
+            // #3427, narrowed by #3856: an array holds the nodes of a `,` body
+            // as cursors beside computed values (`[., 1]`, `[., .]`), so it
+            // reads none of them. What still builds an owned value in the
+            // cursor entry too is a construction held inside another
+            // (`[[.]]`), an object and a bind.
+            ("[1.2.3]", "[., 1] | length", None, Some("2")),
+            ("[1.2.3]", "[., .] | length", None, Some("2")),
             ("[1.2.3]", "[[.]] | length", None, None),
             ("[1.2.3]", "{a: .} | length", None, None),
             ("[1.2.3]", ". as $x | [$x] | length", None, None),
             (OBJ, "[.b] | length", Some("1"), Some("1")),
             (OBJ, "[.[] | .] | length", Some("2"), Some("2")),
-            (OBJ, "[.a, .b] | length", None, None),
-            (OBJ, "[.[], 1] | length", None, None),
+            (OBJ, "[.a, .b] | length", Some("2"), Some("2")),
+            (OBJ, "[.[], 1] | length", Some("3"), Some("3")),
             (OBJ, "{x: .b} | length", None, None),
             (OBJ, ".b as $x | 1", None, None),
             ("[1.2.3]", ". as $x | 1", None, None),
-            (OBJ, "[.b, empty] | length", None, None),
+            (OBJ, "[.b, empty] | length", Some("1"), Some("1")),
             (OBJ, "[.[] | ., .] | length", None, None),
             (OBJ, "[.[] | [.]] | length", None, None),
             ("[1.2.3]", r#"try ([., 1]) catch "c""#, None, None),

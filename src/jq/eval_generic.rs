@@ -885,14 +885,7 @@ fn to_owned_all_cursors_shared<S: EvalSemantics, C: DocumentCursor>(
 ) -> Result<Vec<OwnedValue>, EvalError> {
     let mut keys: Vec<(usize, usize)> = vec_with_capacity(cursors.len());
     keys.extend(cursors.iter().map(|c| (c.document_token(), c.node_id())));
-    let mut sorted = keys.clone();
-    sorted.sort_unstable();
-    let repeated: alloc::collections::BTreeSet<(usize, usize)> = sorted
-        .windows(2)
-        .filter(|pair| pair[0] == pair[1])
-        .map(|pair| pair[0])
-        .collect();
-    drop(sorted);
+    let repeated = repeated_node_keys(&keys);
     if repeated.is_empty() {
         return to_owned_all_cursors::<S, _>(cursors);
     }
@@ -900,18 +893,80 @@ fn to_owned_all_cursors_shared<S: EvalSemantics, C: DocumentCursor>(
         alloc::collections::BTreeMap::new();
     let mut out = vec_with_capacity(cursors.len());
     for (cursor, key) in cursors.iter().zip(keys) {
-        if let Some(shared) = built.get(&key) {
-            out.push(shared.clone());
-            continue;
-        }
-        let value = to_owned_cursor::<S, _>(cursor)?;
-        if repeated.contains(&key) && matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_))
-        {
-            built.insert(key, value.clone());
-        }
-        out.push(value);
+        out.push(to_owned_cursor_sharing::<S, _>(
+            cursor, key, &repeated, &mut built,
+        )?);
     }
     Ok(out)
+}
+
+/// [`to_owned_all_cursors_shared`] over a [`LazySource::Mixed`] list (#3856):
+/// each cursor is decoded as it comes, in order, and each owned value is kept
+/// as it is. Only cursors are keyed, so an owned value never stands in for a
+/// node.
+fn to_owned_all_elems_shared<S: EvalSemantics, V: DocumentValue>(
+    elems: &[LazyElem<V>],
+) -> Result<Vec<OwnedValue>, EvalError> {
+    let key_of = |c: &V::Cursor| (c.document_token(), c.node_id());
+    let mut keys: Vec<(usize, usize)> = Vec::new();
+    keys.extend(elems.iter().filter_map(|e| match e {
+        LazyElem::Cursor(c) => Some(key_of(c)),
+        LazyElem::Owned(_) => None,
+    }));
+    let repeated = repeated_node_keys(&keys);
+    drop(keys);
+    if repeated.is_empty() {
+        // Nothing to share: decode each node as it comes, with no map.
+        return elems
+            .iter()
+            .map(|e| match e {
+                LazyElem::Owned(o) => Ok(o.clone()),
+                LazyElem::Cursor(c) => to_owned_cursor::<S, _>(c),
+            })
+            .collect();
+    }
+    let mut built: alloc::collections::BTreeMap<(usize, usize), OwnedValue> =
+        alloc::collections::BTreeMap::new();
+    let mut out = vec_with_capacity(elems.len());
+    for elem in elems {
+        out.push(match elem {
+            LazyElem::Owned(o) => o.clone(),
+            LazyElem::Cursor(c) => {
+                to_owned_cursor_sharing::<S, _>(c, key_of(c), &repeated, &mut built)?
+            }
+        });
+    }
+    Ok(out)
+}
+
+/// The (document, node) keys named more than once in `keys`, found from the
+/// ids alone (#3477).
+fn repeated_node_keys(keys: &[(usize, usize)]) -> alloc::collections::BTreeSet<(usize, usize)> {
+    let mut sorted = keys.to_vec();
+    sorted.sort_unstable();
+    sorted
+        .windows(2)
+        .filter(|pair| pair[0] == pair[1])
+        .map(|pair| pair[0])
+        .collect()
+}
+
+/// Decode `cursor`, building a node in `repeated` once and handing its clone
+/// to every later occurrence. A scalar is cheaper to rebuild than to look up.
+fn to_owned_cursor_sharing<S: EvalSemantics, C: DocumentCursor>(
+    cursor: &C,
+    key: (usize, usize),
+    repeated: &alloc::collections::BTreeSet<(usize, usize)>,
+    built: &mut alloc::collections::BTreeMap<(usize, usize), OwnedValue>,
+) -> Result<OwnedValue, EvalError> {
+    if let Some(shared) = built.get(&key) {
+        return Ok(shared.clone());
+    }
+    let value = to_owned_cursor::<S, _>(cursor)?;
+    if repeated.contains(&key) && matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
+        built.insert(key, value.clone());
+    }
+    Ok(value)
 }
 
 /// [`to_owned_all_cursors`]'s prefix-preserving sibling (#2145): on a decode
@@ -3103,50 +3158,24 @@ enum LazySource<V: DocumentValue> {
     Cursors {
         cursors: Vec<V::Cursor>,
         next: usize,
-        /// Whether the cursors have passed [`validate_cursor`] under
-        /// `JqSemantics` (#3317's `,` producer) -- see [`CursorCheck`].
-        /// [`CursorCheck::Unchecked`] for every other producer.
-        /// It also marks the one source that may name a node twice
-        /// (`[., .]`), so materializing it shares a repeated container
-        /// (#3477).
+        /// Whether the sequence may name one node twice (`[., .]`, only the
+        /// jq-mode `,` producer builds one), so materializing it shares a
+        /// repeated container (#3477). `false` for every other producer:
+        /// `[.]` has one node and `[.[]]` distinct children, where a
+        /// per-element lookup would be pure cost.
         /// Kept on this variant rather than on `LazySeq` so the struct's
         /// pinned size (`test_lazyseq_size_is_pinned_1973`) does not grow.
-        check: CursorCheck,
+        may_repeat: bool,
     },
-}
-
-/// Where a [`LazySource::Cursors`] source stands on the validation
-/// [`comma_array_generic`] owes its consumer (#3317, #3478).
-///
-/// The array must fail whole, and first, on a malformed document, so every
-/// node is walked before anything the array's consumer does can be observed.
-/// That walk is `to_owned_cursor`'s own, so a consumer that materializes the
-/// array immediately does it for free while it builds: walking first only
-/// doubles the work. Hence `Pending`, a promise that some consumer will
-/// settle it, and a fail-closed way to settle it for everyone else:
-///
-/// - **Settled by the source itself**: [`LazySource::advance`] walks whatever
-///   is left the first time it is pulled, so every iterating consumer
-///   (`length`, `first`, `.[]`, a `map` stage, the printer) is covered
-///   without knowing the state exists.
-/// - **Settled by building**: [`LazySeq::materialize_atomic`]'s instruction-free
-///   path walks each node in order as it builds it, so the first failure is
-///   the same one the up-front walk would have raised.
-/// - **Settled at the boundary**: a `Pending` sequence handed to a sink is
-///   walked first ([`settle_lazy_item`]) unless the sink says it materializes
-///   what it is given before anything else runs
-///   ([`Sink::materializes_lazy_items`]); and `fold_lazy_seq_stage`'s arms
-///   that read the cursors directly settle it themselves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CursorCheck {
-    /// The consumer walks each cursor itself: every producer but the `,`
-    /// array's.
-    Unchecked,
-    /// The `,` array's cursors have not been walked; whoever consumes them
-    /// must, before anything else can be observed.
-    Pending,
-    /// Every remaining cursor passed [`validate_cursor::<JqSemantics, _>`](validate_cursor).
-    Done,
+    /// The jq-mode `,` array's answer when some element is a computed value
+    /// and another a container node, `[., 1]`/`[.users, null]` (#3856): the
+    /// elements in branch order, each a live cursor or an owned value.
+    ///
+    /// Only that one producer builds it, and it may name a node twice, so
+    /// materializing it shares a repeated container as [`Self::Cursors`]'s
+    /// `may_repeat` does. No cursor in it has been walked: whoever reads an
+    /// element validates it (#3856).
+    Mixed(alloc::vec::IntoIter<LazyElem<V>>),
 }
 
 // See `LazyElem`'s `Debug` impl above for why this is hand-written, not derived.
@@ -3165,6 +3194,10 @@ impl<V: DocumentValue> core::fmt::Debug for LazySource<V> {
                 .debug_struct("LazySource::Cursors")
                 .field("next", next)
                 .field("len", &cursors.len())
+                .finish(),
+            Self::Mixed(elems) => f
+                .debug_struct("LazySource::Mixed")
+                .field("len", &elems.len())
                 .finish(),
         }
     }
@@ -3185,7 +3218,7 @@ impl<V: DocumentValue> LazySource<V> {
         Self::Cursors {
             cursors,
             next: 0,
-            check: CursorCheck::Unchecked,
+            may_repeat: false,
         }
     }
     /// Pull one element forward, storing "the rest" back into `self`. Once a
@@ -3231,25 +3264,14 @@ impl<V: DocumentValue> LazySource<V> {
                 *next += 1;
                 Some(LazyElem::Owned(OwnedValue::Int(i as i64)))
             }
-            Self::Cursors {
-                cursors,
-                next,
-                check,
-            } => {
-                // #3478: the array fails whole before its first element is
-                // handed out, whichever consumer is pulling.
-                if *check == CursorCheck::Pending {
-                    cursors[*next..]
-                        .iter()
-                        .try_for_each(validate_cursor::<JqSemantics, _>)?;
-                    *check = CursorCheck::Done;
-                }
+            Self::Cursors { cursors, next, .. } => {
                 let Some(cursor) = cursors.get(*next).copied() else {
                     return Ok(None);
                 };
                 *next += 1;
                 Some(LazyElem::Cursor(cursor))
             }
+            Self::Mixed(elems) => elems.next(),
         })
     }
 }
@@ -3363,79 +3385,32 @@ impl<V: DocumentValue> LazySeq<V> {
         Self::new(LazySource::cursors(cursors))
     }
 
-    /// [`Self::from_cursors`] for the `,` array's cursors, which the
-    /// consumer must settle (#3317, #3478) -- see [`CursorCheck::Pending`].
-    /// Only the jq-mode `,` array producer calls this, so the walk it defers
-    /// is always `validate_cursor::<JqSemantics, _>`, the one the jq printer
-    /// uses.
-    fn from_pending_cursors(cursors: Vec<V::Cursor>) -> Self {
+    /// [`Self::from_cursors`] for the `,` array's cursors, which may name one
+    /// node twice (`[., .]`, #3477) -- see [`LazySource::Cursors`]'s
+    /// `may_repeat`. Nothing is walked here: whoever reads an element
+    /// validates it (#3856).
+    fn from_repeating_cursors(cursors: Vec<V::Cursor>) -> Self {
         Self::new(LazySource::Cursors {
             cursors,
             next: 0,
-            check: CursorCheck::Pending,
+            may_repeat: true,
         })
     }
 
-    /// [`Self::from_cursors`] for cursors already walked (#3317): a slice of
-    /// a settled `,` array.
-    fn from_validated_cursors(cursors: Vec<V::Cursor>) -> Self {
-        Self::new(LazySource::Cursors {
-            cursors,
-            next: 0,
-            check: CursorCheck::Done,
-        })
-    }
-
-    /// Whether every element this sequence will yield is a document cursor
-    /// that has passed, or is about to pass before it is handed out,
-    /// [`validate_cursor::<JqSemantics, _>`](validate_cursor) (#3317, #3478),
-    /// so a consumer about to run that same walk before rendering may skip
-    /// it. A `Pending` source qualifies because pulling it walks the rest
-    /// first (`LazySource::advance`); the printer always pulls.
-    ///
-    /// True only for an untouched `Cursors` source with a `,` array's check:
-    /// no `map` stage (which could compute a value no walk has seen) and
-    /// nothing buffered in `pending`. Any other shape answers `false`, which
-    /// is always safe -- the caller then validates as it did before this
-    /// flag existed.
-    pub fn is_prevalidated(&self) -> bool {
-        self.instructions.is_none()
-            && self.pending.is_empty()
-            && matches!(
-                self.source,
-                LazySource::Cursors {
-                    check: CursorCheck::Pending | CursorCheck::Done,
-                    ..
-                }
-            )
-    }
-
-    /// Walk a `Pending` source's remaining cursors now, so a consumer that
-    /// reads them without pulling (an index, a slice) fails as the array's
-    /// construction would have. A no-op for any other source.
-    fn settle(&mut self) -> Result<(), EvalError> {
-        if let LazySource::Cursors {
-            cursors,
-            next,
-            check,
-        } = &mut self.source
-        {
-            if *check == CursorCheck::Pending {
-                cursors[*next..]
-                    .iter()
-                    .try_for_each(validate_cursor::<JqSemantics, _>)?;
-                *check = CursorCheck::Done;
-            }
-        }
-        Ok(())
+    /// The `,` array's answer when it holds both computed values and nodes
+    /// (#3856) -- see [`LazySource::Mixed`].
+    fn from_mixed(elems: Vec<LazyElem<V>>) -> Self {
+        Self::new(LazySource::Mixed(elems.into_iter()))
     }
 
     /// Run one `Instruction` against one pending item, re-dispatching to
     /// whichever `EvalSemantics` the stage was pushed with. `LazyElem::Cursor`
     /// stays inside the generic cursor evaluator — the actual win;
-    /// `LazyElem::Owned` bridges through `eval_on_owned`, only ever asked to
-    /// reindex one already-small computed/synthetic scalar (a map-produced
-    /// value or an array-`keys_unsorted` index), never the whole document.
+    /// `LazyElem::Owned` bridges through `eval_on_owned`, which reindexes the
+    /// one computed/synthetic value (a map-produced value, an
+    /// array-`keys_unsorted` index, or an element a `,` array computed beside
+    /// its nodes, #3856) -- never the whole document, but as large as that
+    /// value is.
     fn eval_one(instr: &Instruction, elem: LazyElem<V>) -> GenericResult<V> {
         match (elem, instr.tag) {
             (LazyElem::Cursor(c), EvalTag::Jq) => {
@@ -3524,28 +3499,33 @@ impl<V: DocumentValue> LazySeq<V> {
         // each to `OwnedValue` -- is pure overhead here. Map cursors
         // straight to `OwnedValue` in one pass instead.
         //
-        // #3478: that build is also the walk a `Pending` `,` array owes, node
-        // by node in order, so its first failure is the one the up-front walk
-        // would have raised, and nothing else has run in between.
+        // This build is also the walk the array owes its consumer (#3856):
+        // each node is validated as it is decoded, in order.
         if self.instructions.is_none() && self.pending.is_empty() {
-            if let LazySource::Cursors {
-                cursors,
-                next,
-                check,
-            } = &self.source
-            {
-                let remaining = &cursors[*next..];
-                // #3477: only the `,` producer can name a node twice
-                // (`[., .]`); `[.]` has one node and `[.[]]` distinct
-                // children, where a per-element lookup would be pure cost.
-                if *check != CursorCheck::Unchecked {
-                    return to_owned_all_cursors_shared::<S, _>(remaining)
+            match &self.source {
+                LazySource::Cursors {
+                    cursors,
+                    next,
+                    may_repeat,
+                } => {
+                    let remaining = &cursors[*next..];
+                    // #3477: only the `,` producer can name a node twice
+                    // (`[., .]`).
+                    if *may_repeat {
+                        return to_owned_all_cursors_shared::<S, _>(remaining)
+                            .map(OwnedValue::array_from)
+                            .map_err(Control::Error);
+                    }
+                    return to_owned_all_cursors::<S, _>(remaining)
                         .map(OwnedValue::array_from)
                         .map_err(Control::Error);
                 }
-                return to_owned_all_cursors::<S, _>(remaining)
-                    .map(OwnedValue::array_from)
-                    .map_err(Control::Error);
+                LazySource::Mixed(elems) => {
+                    return to_owned_all_elems_shared::<S, V>(elems.as_slice())
+                        .map(OwnedValue::array_from)
+                        .map_err(Control::Error);
+                }
+                _ => {}
             }
         }
         let items = self.drain_atomic()?;
@@ -4511,43 +4491,33 @@ fn fold_generic_owned_values<V: DocumentValue, S: EvalSemantics>(
     None
 }
 
-/// A jq-mode array constructor over a `,` body of pure navigation,
-/// `[a, b, ...]` (#3317).
+/// A jq-mode array constructor over a `,` body, `[a, b, ...]` (#3317, #3856).
 ///
 /// The `Expr::Comma` arm hands its caller one `OwnedValue` per item, built
 /// with `to_owned_cursor` from the node each branch yields, so `[., .]` held
 /// two whole copies of the document. This evaluates the same branches, in the
 /// same order, with the same `optional`, and keeps each node as its cursor.
 ///
-/// **One walk per node, and the same first error.** On the `Comma` route a
-/// node was built as soon as its branch yielded it, so its decode failure
-/// came ahead of anything a later branch did. Only a body whose every branch
-/// is pure navigation (`array_route_stage_is_pure_navigation`) comes here, and
-/// navigation has no side effects -- no `input`, `debug` or `error` -- so a
-/// later branch running first is unobservable except through the one thing
-/// it can do, raise. Each node is therefore walked once, when the answer's
-/// shape is known, and every exit walks the pending nodes in branch order
-/// before anything that came after them -- the answer itself being the one
-/// exit whose walk belongs to its consumer ([`CursorCheck`], #3478):
+/// **A value is validated where something reads it** (#3856, #2692). A node
+/// is not walked here: the array holds it, and whatever reads the element --
+/// the printer, a `materialize_atomic`, any decode -- validates it then. So
+/// `[., 1] | length` over a malformed document answers (the array holds
+/// the node and reads nothing in it), and printing `[., 1]` raises and
+/// writes nothing, as jq's own array construction would. Branches still run
+/// in order, so `[., input]`/`[., debug]` keep jq's side-effect order, and a
+/// branch's own raise (`[., error("x")]`) is the array's failure.
 ///
-/// - Every item a node, one a container: answer
-///   [`LazySeq::from_pending_cursors`], whose nodes are walked
-///   ([`validate_cursor`], building nothing) before its first element is
-///   handed out, or by the build itself when the consumer materializes it
-///   (#3478, [`CursorCheck`]). The array still fails whole on a malformed
-///   document, and `[., .] | length` still raises there rather than counting
-///   what it never read; the jq printer renders the walked nodes without
-///   walking them a second time.
-/// - Every item a scalar node (`[.name, .age]`, the per-record `@csv`
-///   shape): build them. A small array costs less than a boxed sequence.
-/// - An item that is not a node -- the `null` a missing key reads as
-///   (`[.a, .missing]`): build the pending nodes then, and every later node as
-///   it arrives, so the array is owned exactly as the `Comma` route built it.
-/// - A branch escapes: validate the pending nodes first, so their decode
-///   failure still wins over the later branch's error.
+/// The answer's shape:
 ///
-/// A computed branch (`[., 1]`) never comes here: its array ends up owned
-/// whatever the others are, so `Expr::Array` keeps it on the `Comma` route.
+/// - Only nodes, a container among them: [`LazySeq::from_repeating_cursors`].
+/// - Nodes and computed values (`[., 1]`, `[.a, null]`), a container node among
+///   them: [`LazySeq::from_mixed`], each element a cursor or an owned value.
+/// - No container node at all (`[.name, .age]`, the per-record `@csv` shape):
+///   build the array, since a small owned array costs less than a boxed
+///   sequence. *Decode-or-defer*: a scalar that fails to decode is not raised
+///   here -- the array keeps its nodes lazy instead, and the failure surfaces
+///   where the element is read, like any other node.
+///
 /// A `,` head behind a pipe of navigation comes here too (#3476): `exprs` are
 /// the head's branches and `tail` the stages each one is piped through
 /// ([`split_comma_head`]); a plain `,` body has an empty `tail`.
@@ -4558,11 +4528,10 @@ fn comma_array_generic<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
-    // Nodes not walked yet, all of them document nodes.
+    // Every item so far, while all of them are document nodes.
     let mut nodes: Vec<V::Cursor> = Vec::new();
-    // `Some` once an item that is not a node arrived: `nodes` was built into
-    // it then, and the answer is this owned array.
-    let mut owned: Option<Vec<OwnedValue>> = None;
+    // `Some` once an item that is not a node arrived: `nodes` moved into it.
+    let mut elems: Option<Vec<LazyElem<V>>> = None;
     for expr in CommaBranches::new(exprs) {
         let mut result = eval_single::<S, _>(expr, value.clone(), optional, cursor);
         if !tail.is_empty() {
@@ -4570,7 +4539,7 @@ fn comma_array_generic<S: EvalSemantics, V: DocumentValue>(
             // pure navigation reaches there.
             result = fold_pipe_stages::<S, V>(result, tail, optional);
         }
-        let escape = match (owned.as_mut(), result) {
+        let escape = match (elems.as_mut(), result) {
             (None, GenericResult::OneCursor(c)) => {
                 nodes.push(c);
                 None
@@ -4584,50 +4553,92 @@ fn comma_array_generic<S: EvalSemantics, V: DocumentValue>(
                 nodes.extend(cs);
                 None
             }
-            (Some(out), result) => push_generic_owned_values::<_, S>(result, out),
+            (Some(out), GenericResult::OneCursor(c)) => {
+                out.push(LazyElem::Cursor(c));
+                None
+            }
+            (Some(out), GenericResult::ManyCursor(cs)) => {
+                out.extend(cs.into_iter().map(LazyElem::Cursor));
+                None
+            }
+            (Some(out), result) => push_generic_owned_elems::<_, S>(result, out),
             (None, result) => {
-                let mut values = Vec::new();
-                let escape = push_generic_owned_values::<_, S>(result, &mut values);
+                let mut values: Vec<LazyElem<V>> = Vec::new();
+                let escape = push_generic_owned_elems::<_, S>(result, &mut values);
+                // A branch that yields nothing (`empty`, a missing `.[]?`)
+                // leaves the array all nodes.
                 if !values.is_empty() {
-                    // STYLE-0012: atomic array construction raises
-                    // regardless of `optional`, as `Expr::Array`'s own arms
-                    // do -- `optional` was forwarded into each branch instead.
-                    let mut out = owned_or_err!(to_owned_all_cursors::<S, _>(&nodes));
+                    let mut out: Vec<LazyElem<V>> = vec_with_capacity(nodes.len() + values.len());
+                    out.extend(
+                        core::mem::take(&mut nodes)
+                            .into_iter()
+                            .map(LazyElem::Cursor),
+                    );
                     out.append(&mut values);
-                    nodes = Vec::new();
-                    owned = Some(out);
+                    elems = Some(out);
                 }
                 escape
             }
         };
         if let Some(control) = escape {
             // Atomic, like the rest of `Expr::Array`: whatever was collected
-            // is discarded, and the first failure in branch order is the
-            // whole answer.
-            if let Err(e) = validate_cursors::<S, V>(&nodes) {
-                return GenericResult::Error(e);
-            }
+            // is discarded, and the escape is the whole answer.
             return partial_generic(Vec::new(), control);
         }
     }
-    if let Some(out) = owned {
-        return GenericResult::Owned(OwnedValue::array_from(out));
+    let Some(mut elems) = elems else {
+        // `push`/`extend` may have doubled the buffer: `[.[], .[0]]` over 300k
+        // strings otherwise holds 600k slots while its values are built, or
+        // for as long as the sequence lives.
+        nodes.shrink_to_fit();
+        if nodes.iter().any(DocumentCursor::is_container) {
+            return GenericResult::LazySeq(Box::new(LazySeq::from_repeating_cursors(nodes)));
+        }
+        // STYLE-0012: atomic array construction regardless of `optional`, as
+        // `Expr::Array`'s own arms do -- `optional` was forwarded into each
+        // branch instead. Decode-or-defer: see above.
+        return match to_owned_all_cursors::<S, _>(&nodes) {
+            Ok(out) => GenericResult::Owned(OwnedValue::array_from(out)),
+            Err(_) => GenericResult::LazySeq(Box::new(LazySeq::from_repeating_cursors(nodes))),
+        };
+    };
+    let holds_container = elems
+        .iter()
+        .any(|e| matches!(e, LazyElem::Cursor(c) if c.is_container()));
+    if !holds_container {
+        // Every node is a scalar: build, decoding each one in place so a
+        // failure leaves the rest as nodes for `from_mixed` to hold.
+        let decoded = elems.iter_mut().try_for_each(|e| {
+            if let LazyElem::Cursor(c) = e {
+                // STYLE-0012: decode-or-defer -- a failure is kept as a node
+                // for the array to hold, never raised here, so `optional` has
+                // nothing to suppress (#3856).
+                *e = LazyElem::Owned(to_owned_cursor::<S, _>(c)?);
+            }
+            Ok::<(), EvalError>(())
+        });
+        if decoded.is_ok() {
+            let out = elems
+                .into_iter()
+                .filter_map(|e| match e {
+                    LazyElem::Owned(o) => Some(o),
+                    LazyElem::Cursor(_) => None,
+                })
+                .collect();
+            return GenericResult::Owned(OwnedValue::array_from(out));
+        }
     }
-    // `push`/`extend` may have doubled the buffer: `[.[], .[0]]` over 300k
-    // strings otherwise holds 600k slots while its values are built, or for
-    // as long as the sequence lives.
-    nodes.shrink_to_fit();
-    if nodes.iter().any(DocumentCursor::is_container) {
-        // #3478: not walked here. The walk is `to_owned_cursor`'s own, so a
-        // consumer that builds the array does it for free, and every other
-        // consumer settles it before anything can be observed -- see
-        // [`CursorCheck`].
-        return GenericResult::LazySeq(Box::new(LazySeq::from_pending_cursors(nodes)));
-    }
-    // STYLE-0012: atomic array construction -- see the arm above.
-    GenericResult::Owned(OwnedValue::array_from(owned_or_err!(
-        to_owned_all_cursors::<S, _>(&nodes)
-    )))
+    GenericResult::LazySeq(Box::new(LazySeq::from_mixed(elems)))
+}
+
+/// [`push_generic_owned_values`] for a [`comma_array_generic`] element list:
+/// every value `result` holds is kept as an owned element, and the first
+/// escape is handed back.
+fn push_generic_owned_elems<V: DocumentValue, S: EvalSemantics>(
+    result: GenericResult<V>,
+    out: &mut Vec<LazyElem<V>>,
+) -> Option<Control> {
+    fold_generic_owned_values::<_, S>(result, &mut |v, _| out.push(LazyElem::Owned(v)))
 }
 
 /// The branches of a `,` body in order, with a `,` nested inside it (through
@@ -4722,13 +4733,6 @@ fn split_comma_head(body: &Expr) -> Option<(&[Expr], &[Expr])> {
         return None;
     }
     Some((branches, rest))
-}
-
-/// [`validate_cursor`] over `nodes` in order, stopping at the first failure.
-fn validate_cursors<S: EvalSemantics, V: DocumentValue>(
-    nodes: &[V::Cursor],
-) -> Result<(), EvalError> {
-    nodes.iter().try_for_each(validate_cursor::<S, _>)
 }
 
 /// Whether `c`'s subtree, at any depth, contains a value that cannot be
@@ -9042,7 +9046,12 @@ fn fold_lazy_seq_stage<S: EvalSemantics, V: DocumentValue>(
     // every `seq` shape via the `Iterator` protocol, not just this one);
     // this covers every other integer index and `last`, checked ahead of
     // the main match so those two arms don't have to repeat the guard.
-    if seq.instructions.is_none() && matches!(seq.source, LazySource::Cursors { .. }) {
+    if seq.instructions.is_none()
+        && matches!(
+            seq.source,
+            LazySource::Cursors { .. } | LazySource::Mixed(_)
+        )
+    {
         // #3177: `. | X` is `X`, so an identity stage materializes the
         // sequence and hands the array on as it is -- *not* through the `_`
         // arm's `eval_on_owned`, whose JSON round trip rebuilt `[.] | . |
@@ -9095,20 +9104,6 @@ fn fold_lazy_seq_stage<S: EvalSemantics, V: DocumentValue>(
         // arm above (#3177): `(. | max)` and the parser-fused `. | . | max`
         // arrive as one `Pipe` whose head is `.`; that head is handled
         // first, below, by the same bridge-free materialization.
-        // #3478: the stages below that read the cursors without pulling
-        // them settle a `,` array's deferred walk first, so `[., .] | .[1]`
-        // still fails whole. Everything else either materializes (which
-        // walks as it builds) or pulls (which walks before the first
-        // element), and a pipe's head is settled by the recursion below.
-        if matches!(
-            unwrap_paren(expr),
-            Expr::Index { key: None, .. } | Expr::Builtin(Builtin::Last) | Expr::Slice { .. }
-        ) && !matches!(unwrap_paren(expr), Expr::Index { idx: 0, .. })
-        {
-            if let Err(e) = seq.settle() {
-                return GenericResult::Error(e);
-            }
-        }
         if let Expr::Pipe(stages) = unwrap_paren(expr) {
             // A `.` head (#3177): materialize, as the standalone arm above
             // does, and run the *rest of the pipe as one expression*
@@ -9155,7 +9150,7 @@ fn fold_lazy_seq_stage<S: EvalSemantics, V: DocumentValue>(
         } else if let LazySource::Cursors {
             cursors,
             next,
-            check,
+            may_repeat,
         } = &seq.source
         {
             let remaining = &cursors[*next..];
@@ -9192,15 +9187,45 @@ fn fold_lazy_seq_stage<S: EvalSemantics, V: DocumentValue>(
                 Expr::Slice { start, end, .. } => {
                     let range = SliceBounds::from_literals(*start, *end).resolve(remaining.len());
                     let slice = remaining[range].to_vec();
-                    // A sub-slice of validated cursors is still validated
-                    // (#3317): `[., .] | .[1:]` need not walk its element
-                    // again at print time. `settle` ran above, so a `,`
-                    // array's slice is `Done`, never `Pending`.
-                    return GenericResult::LazySeq(Box::new(if *check == CursorCheck::Done {
-                        LazySeq::from_validated_cursors(slice)
+                    // A slice of a `,` array may still name a node twice
+                    // (`[., .] | .[0:2]`), so it keeps the flag (#3477).
+                    return GenericResult::LazySeq(Box::new(if *may_repeat {
+                        LazySeq::from_repeating_cursors(slice)
                     } else {
                         LazySeq::from_cursors(slice)
                     }));
+                }
+                _ => {}
+            }
+        } else if let LazySource::Mixed(elems) = &seq.source {
+            // #3856: the same direct reads over a cursor-and-value sequence,
+            // so `[., 1] | last` reads one element rather than decoding the
+            // whole array.
+            let remaining = elems.as_slice();
+            let element = |e: Option<&LazyElem<V>>| match e {
+                Some(LazyElem::Cursor(c)) => GenericResult::OneCursor(*c),
+                Some(LazyElem::Owned(o)) => GenericResult::Owned(o.clone()),
+                None => GenericResult::Owned(OwnedValue::Null),
+            };
+            match unwrap_paren(expr) {
+                Expr::Index { idx, key: None } if *idx != 0 => {
+                    let len = remaining.len();
+                    let resolved = if *idx < 0 { len as i64 + idx } else { *idx };
+                    if let Some(e) = yq_negative_index_check::<S>(*idx, resolved, len) {
+                        return GenericResult::Error(e);
+                    }
+                    return element(
+                        usize::try_from(resolved)
+                            .ok()
+                            .and_then(|i| remaining.get(i)),
+                    );
+                }
+                Expr::Builtin(Builtin::Last) => return element(remaining.last()),
+                Expr::Slice { start, end, .. } => {
+                    let range = SliceBounds::from_literals(*start, *end).resolve(remaining.len());
+                    return GenericResult::LazySeq(Box::new(LazySeq::from_mixed(
+                        remaining[range].to_vec(),
+                    )));
                 }
                 _ => {}
             }
@@ -11459,17 +11484,14 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                     Flow::Stopped { .. } => GenericResult::Owned(OwnedValue::array_from(items)),
                 };
             }
-            // #3317: a `,` body of pure navigation keeps its document nodes
-            // as cursors in jq mode, where the printer renders a cursor
-            // sequence copy-free. yq's printer materializes a `LazySeq`
-            // anyway, so yq keeps the owned route below and skips the extra
-            // validation walk; so does a body with a computed branch
-            // (`[., 1]`), whose array ends up owned whatever the others are.
+            // #3317, #3856: a `,` body keeps its document nodes as cursors in
+            // jq mode, whatever its other branches compute, where the printer
+            // renders a cursor sequence copy-free and a node is validated
+            // only where something reads it. yq's printer materializes a
+            // `LazySeq` anyway, so yq keeps the owned route below.
             if S::TAG == EvalTag::Jq {
                 if let Expr::Comma(exprs) = unwrap_paren(inner) {
-                    if exprs.iter().all(array_route_stage_is_pure_navigation) {
-                        return comma_array_generic::<S, V>(exprs, &[], value, optional, cursor);
-                    }
+                    return comma_array_generic::<S, V>(exprs, &[], value, optional, cursor);
                 }
                 // #3476: the same body behind a pipe, `[(., .) | .data]`.
                 if let Some((branches, tail)) = split_comma_head(inner) {
@@ -11924,34 +11946,6 @@ trait Sink<V: DocumentValue> {
     fn budget(&self) -> Budget {
         Budget::Unbounded
     }
-
-    /// Whether this sink materializes a `GenericItem::LazySeq` the moment it
-    /// is handed one, before it runs anything else (#3478).
-    ///
-    /// A `,` array's nodes are walked by whoever consumes it
-    /// ([`CursorCheck`]), and a sink that builds the array does that walk as
-    /// it builds. Any other sink may run user code -- `debug`, `input`,
-    /// `error` -- before it looks at the array, so it must not see the array
-    /// unwalked: [`push_one_generic`] walks it first. `false`, the safe
-    /// answer, for every sink that does not say otherwise.
-    fn materializes_lazy_items(&self) -> bool {
-        false
-    }
-}
-
-/// A closure sink that materializes any `GenericItem::LazySeq` it receives
-/// before doing anything else -- see [`Sink::materializes_lazy_items`]. The
-/// closure must uphold that: its first act on a lazy item is
-/// `generic_item_into_owned` (or the `_with_origin` twin).
-struct MaterializesLazyItems<F>(F);
-
-impl<V: DocumentValue, F: FnMut(GenericItem<V>) -> Demand> Sink<V> for MaterializesLazyItems<F> {
-    fn push(&mut self, item: GenericItem<V>) -> Demand {
-        (self.0)(item)
-    }
-    fn materializes_lazy_items(&self) -> bool {
-        true
-    }
 }
 
 /// A sink with an explicit [`Budget`]: the only way a consumer opts *out*
@@ -11982,8 +11976,6 @@ impl<V: DocumentValue, F: FnMut(GenericItem<V>) -> Demand> Sink<V> for Materiali
 struct WithBudget<F> {
     budget: Budget,
     f: F,
-    /// [`Sink::materializes_lazy_items`] -- see [`forward_lazy`].
-    lazy_ok: bool,
 }
 
 impl<V: DocumentValue, F: FnMut(GenericItem<V>) -> Demand> Sink<V> for WithBudget<F> {
@@ -11992,9 +11984,6 @@ impl<V: DocumentValue, F: FnMut(GenericItem<V>) -> Demand> Sink<V> for WithBudge
     }
     fn budget(&self) -> Budget {
         self.budget
-    }
-    fn materializes_lazy_items(&self) -> bool {
-        self.lazy_ok
     }
 }
 
@@ -12009,7 +11998,6 @@ fn bounded<V: DocumentValue, F: FnMut(GenericItem<V>) -> Demand>(
     WithBudget {
         budget: Budget::AtMost(n).min(inner),
         f,
-        lazy_ok: false,
     }
 }
 
@@ -12025,21 +12013,12 @@ fn bounded<V: DocumentValue, F: FnMut(GenericItem<V>) -> Demand>(
 /// side. If they *filter* (a `select`), the window is "at least `n`
 /// validated" and the tail streams exactly as before.
 ///
-/// It also claims [`Sink::materializes_lazy_items`] (#3478), which is what
-/// makes it `forward_lazy` rather than a plain forwarder. The claim is
-/// [`eval_each_pipe_generic`]'s alone, the only caller: its closure hands a
-/// lazy item to [`continue_pipe_element_generic`], which folds it through
-/// [`fold_pipe_stages_sink`], and every stage there either pulls the sequence
-/// (which walks a `,` array first) or builds it -- nothing runs ahead of that.
-fn forward_lazy<V: DocumentValue, F: FnMut(GenericItem<V>) -> Demand>(
+/// [`eval_each_pipe_generic`] is its only caller.
+fn forward_budget<V: DocumentValue, F: FnMut(GenericItem<V>) -> Demand>(
     inner: Budget,
     f: F,
 ) -> WithBudget<F> {
-    WithBudget {
-        budget: inner,
-        f,
-        lazy_ok: true,
-    }
+    WithBudget { budget: inner, f }
 }
 
 /// Every existing `&mut |item| ..` closure is a `Sink` with the default
@@ -12052,17 +12031,7 @@ impl<V: DocumentValue, F: FnMut(GenericItem<V>) -> Demand> Sink<V> for F {
 }
 
 /// Push one item to `sink`, translating its `Demand` into a terminal `Flow`.
-fn push_one_generic<V: DocumentValue>(mut item: GenericItem<V>, sink: &mut dyn Sink<V>) -> Flow {
-    // #3478: the fail-closed half of `CursorCheck` -- see
-    // `Sink::materializes_lazy_items`. This is the one place a lazy item
-    // reaches a sink, so it is the one place that needs the check.
-    if let GenericItem::LazySeq(seq) = &mut item {
-        if !sink.materializes_lazy_items() {
-            if let Err(e) = seq.settle() {
-                return Flow::Escaped(Control::Error(e));
-            }
-        }
-    }
+fn push_one_generic<V: DocumentValue>(item: GenericItem<V>, sink: &mut dyn Sink<V>) -> Flow {
     match sink.push(item) {
         Demand::Continue => Flow::Exhausted,
         Demand::Stop => Flow::Stopped { pending: None },
@@ -15521,12 +15490,8 @@ fn process_index_key<S: EvalSemantics, V: DocumentValue>(
     // outputs before it, as in jq.
     if S::TAG == EvalTag::Jq && !crate::jq::eval::yields_at_most_one_value(target) {
         let drive = crate::jq::eval::TargetDrive::new();
-        let flow = eval_each_generic::<S, V>(
-            target,
-            value,
-            false,
-            cursor,
-            &mut MaterializesLazyItems(|item: GenericItem<V>| {
+        let flow =
+            eval_each_generic::<S, V>(target, value, false, cursor, &mut |item: GenericItem<V>| {
                 // A re-invocation after a stop is a `?//` retry inside the
                 // target (#3293): it supersedes the retried-past call.
                 drive.begin();
@@ -15544,8 +15509,7 @@ fn process_index_key<S: EvalSemantics, V: DocumentValue>(
                     Ok(None) => Demand::Continue,
                     Err(e) => drive.stop_with_escape(Control::Error(e)),
                 }
-            }),
-        );
+            });
         use crate::jq::eval::TargetEnd;
         return match drive.finish(flow, crate::jq::eval::direct_pattern_retry(target)) {
             TargetEnd::Stopped => false,
@@ -15913,7 +15877,7 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
     // the whole sequence, but only for a pipe whose source holds a `?//`.
     let force_lazy = crate::jq::eval::contains_retrying_pattern_bind(first);
     let upstream = {
-        let mut driver = forward_lazy(outer_budget, |item: GenericItem<V>| -> Demand {
+        let mut driver = forward_budget(outer_budget, |item: GenericItem<V>| -> Demand {
             let mut run = |item: GenericItem<V>, snk: &mut dyn Sink<V>| -> Flow {
                 match identity_from_first {
                     Some(_) if key_stage && matches!(item, GenericItem::OneCursor(_)) => {
@@ -15956,7 +15920,6 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
                             }
                             other => sink.push(other),
                         },
-                        lazy_ok: true,
                     };
                     run(item, &mut forcing)
                 };
@@ -18091,49 +18054,41 @@ where
     // frame guard did (`test_dollar_param_as_wrappers_are_charged_so_deep_recursion_refuses_3149`).
     let mut consumer_stopped_at: Option<u64> = None;
 
-    // #3478: the closure's first act on an item is to materialize it, so a
-    // `,` array bound here is walked by that build (`MaterializesLazyItems`).
-    let flow = settled_each_generic::<S, V>(
-        arg_expr,
-        value,
-        optional,
-        cursor,
-        &mut MaterializesLazyItems(|item| {
-            // #2952: reset before anything below can set a fresh `escape` for
-            // *this* call -- see `eval::fanout_arg_each_inner`'s identical
-            // top-of-closure reset (one reset per invocation rather than a
-            // per-arm duty every future arm has to remember) and its own
-            // doc comment for why a later, clean call can follow one that
-            // escaped (a `?//` inside `arg_expr` -- e.g. `skip($n; expr)`'s
-            // `expr` erroring while `$n` sits behind one -- retrying past it).
-            // Confirmed live against jq 1.7.1 (via the pinned-jq `skip`
-            // definition, `skip` being 1.8-only):
-            // `[limit(2;skip((1 as $x ?// $y | 0);10,error("BODY")))]` is
-            // `[10,10]` -- the first alternative's `error("BODY")` retries
-            // into the second, whose own `10` satisfies `limit(2)` before its
-            // own `error("BODY")` is ever reached.
-            escape.begin();
-            // #3293: a stale consumer stop would hide the error the retry's own
-            // call raises, the reverse of #2952.
-            consumer_stopped_at = None;
-            let owned = match generic_item_into_owned::<_, S>(item) {
-                Ok(owned) => owned,
-                Err(control) => return escape.stop(control),
-            };
-            match body(owned) {
-                // This `n`'s own walk finished; go on to the next one.
-                Flow::Exhausted => Demand::Continue,
-                // The downstream consumer said stop. Its verdict outranks the
-                // argument generator's, exactly as it does inside
-                // `each_limit_generic`'s own inner sink.
-                Flow::Stopped { .. } => {
-                    consumer_stopped_at = Some(crate::jq::eval::pipe_retry_generation());
-                    Demand::Stop
-                }
-                Flow::Escaped(control) => escape.stop(control),
+    let flow = settled_each_generic::<S, V>(arg_expr, value, optional, cursor, &mut |item| {
+        // #2952: reset before anything below can set a fresh `escape` for
+        // *this* call -- see `eval::fanout_arg_each_inner`'s identical
+        // top-of-closure reset (one reset per invocation rather than a
+        // per-arm duty every future arm has to remember) and its own
+        // doc comment for why a later, clean call can follow one that
+        // escaped (a `?//` inside `arg_expr` -- e.g. `skip($n; expr)`'s
+        // `expr` erroring while `$n` sits behind one -- retrying past it).
+        // Confirmed live against jq 1.7.1 (via the pinned-jq `skip`
+        // definition, `skip` being 1.8-only):
+        // `[limit(2;skip((1 as $x ?// $y | 0);10,error("BODY")))]` is
+        // `[10,10]` -- the first alternative's `error("BODY")` retries
+        // into the second, whose own `10` satisfies `limit(2)` before its
+        // own `error("BODY")` is ever reached.
+        escape.begin();
+        // #3293: a stale consumer stop would hide the error the retry's own
+        // call raises, the reverse of #2952.
+        consumer_stopped_at = None;
+        let owned = match generic_item_into_owned::<_, S>(item) {
+            Ok(owned) => owned,
+            Err(control) => return escape.stop(control),
+        };
+        match body(owned) {
+            // This `n`'s own walk finished; go on to the next one.
+            Flow::Exhausted => Demand::Continue,
+            // The downstream consumer said stop. Its verdict outranks the
+            // argument generator's, exactly as it does inside
+            // `each_limit_generic`'s own inner sink.
+            Flow::Stopped { .. } => {
+                consumer_stopped_at = Some(crate::jq::eval::pipe_retry_generation());
+                Demand::Stop
             }
-        }),
-    );
+            Flow::Escaped(control) => escape.stop(control),
+        }
+    });
 
     let direct_retry = crate::jq::eval::direct_pattern_retry(arg_expr);
     match escape.take(&flow, direct_retry) {
@@ -18180,40 +18135,33 @@ where
     // frame guard did (`test_dollar_param_as_wrappers_are_charged_so_deep_recursion_refuses_3149`).
     let mut consumer_stopped_at: Option<u64> = None;
 
-    // #3478: as `fanout_arg_each_generic` above.
-    let flow = settled_each_generic::<S, V>(
-        arg_expr,
-        value,
-        optional,
-        cursor,
-        &mut MaterializesLazyItems(|item| {
-            // #2952: reset before anything below can set a fresh `escape` for
-            // *this* call -- see `fanout_arg_each_generic`'s identical
-            // top-of-closure reset and `eval::fanout_arg_each_inner`'s doc
-            // comment for why a later, clean call can follow one that escaped
-            // (a `?//` inside `arg_expr` retrying past it).
-            escape.begin();
-            // #3293: a stale consumer stop would hide the error the retry's own
-            // call raises, the reverse of #2952.
-            consumer_stopped_at = None;
-            let (owned, origin) = match generic_item_into_owned_with_origin::<_, S>(item) {
-                Ok(pair) => pair,
-                Err(control) => return escape.stop(control),
-            };
-            match body(owned, origin) {
-                // This bound value's own walk finished; go on to the next one.
-                Flow::Exhausted => Demand::Continue,
-                // The downstream consumer said stop. Its verdict outranks the
-                // argument generator's, exactly as it does in
-                // `fanout_arg_each_generic` above.
-                Flow::Stopped { .. } => {
-                    consumer_stopped_at = Some(crate::jq::eval::pipe_retry_generation());
-                    Demand::Stop
-                }
-                Flow::Escaped(control) => escape.stop(control),
+    let flow = settled_each_generic::<S, V>(arg_expr, value, optional, cursor, &mut |item| {
+        // #2952: reset before anything below can set a fresh `escape` for
+        // *this* call -- see `fanout_arg_each_generic`'s identical
+        // top-of-closure reset and `eval::fanout_arg_each_inner`'s doc
+        // comment for why a later, clean call can follow one that escaped
+        // (a `?//` inside `arg_expr` retrying past it).
+        escape.begin();
+        // #3293: a stale consumer stop would hide the error the retry's own
+        // call raises, the reverse of #2952.
+        consumer_stopped_at = None;
+        let (owned, origin) = match generic_item_into_owned_with_origin::<_, S>(item) {
+            Ok(pair) => pair,
+            Err(control) => return escape.stop(control),
+        };
+        match body(owned, origin) {
+            // This bound value's own walk finished; go on to the next one.
+            Flow::Exhausted => Demand::Continue,
+            // The downstream consumer said stop. Its verdict outranks the
+            // argument generator's, exactly as it does in
+            // `fanout_arg_each_generic` above.
+            Flow::Stopped { .. } => {
+                consumer_stopped_at = Some(crate::jq::eval::pipe_retry_generation());
+                Demand::Stop
             }
-        }),
-    );
+            Flow::Escaped(control) => escape.stop(control),
+        }
+    });
 
     let direct_retry = crate::jq::eval::direct_pattern_retry(arg_expr);
     match escape.take(&flow, direct_retry) {
@@ -18247,41 +18195,34 @@ where
     // ahead of `flow` below since it is the reason the pull stopped.
     let mut decode_err: Option<Control> = None;
 
-    // #3478: as `fanout_arg_each_generic`.
-    let flow = eval_each_generic::<S, V>(
-        arg_expr,
-        value,
-        optional,
-        cursor,
-        &mut MaterializesLazyItems(|item| {
-            let owned = match generic_item_into_owned::<_, S>(item) {
-                Ok(owned) => owned,
-                Err(control) => return stop_with_escape(&mut decode_err, control),
-            };
-            if let Some(previous) = pending_first.take() {
-                if let Some(control) = push_generic_owned_values::<_, S>(previous, &mut out) {
-                    return stop_with_escape(&mut body_control, control);
-                }
-            }
-            let result = body(owned);
-            // A `body` failure stops the pull *here*, so the argument's
-            // remaining outputs are never evaluated -- `eval::fanout_arg`'s
-            // rules 2/4. Checked before buffering, or an escaping first result
-            // would be parked and the sink would ask for another value anyway.
-            if result.is_escape() {
-                if let Some(control) = push_generic_owned_values::<_, S>(result, &mut out) {
-                    return stop_with_escape(&mut body_control, control);
-                } // patchcov: coverage tolerate-line reason="unreachable: `is_escape()` is exactly `Error|Break|Halt|Partial`, and `push_generic_owned_values` answers `Some(control)` for every one of those four, so the `None` continuation cannot be reached (#2180)"
-                return Demand::Stop; // patchcov: coverage tolerate-line reason="unreachable: see the `if let` above -- `push_generic_owned_values` never answers `None` for an `is_escape()` result (#2180)"
-            }
-            if out.is_empty() && pending_first.is_none() {
-                pending_first = Some(result);
-            } else if let Some(control) = push_generic_owned_values::<_, S>(result, &mut out) {
+    let flow = eval_each_generic::<S, V>(arg_expr, value, optional, cursor, &mut |item| {
+        let owned = match generic_item_into_owned::<_, S>(item) {
+            Ok(owned) => owned,
+            Err(control) => return stop_with_escape(&mut decode_err, control),
+        };
+        if let Some(previous) = pending_first.take() {
+            if let Some(control) = push_generic_owned_values::<_, S>(previous, &mut out) {
                 return stop_with_escape(&mut body_control, control);
             }
-            Demand::Continue
-        }),
-    );
+        }
+        let result = body(owned);
+        // A `body` failure stops the pull *here*, so the argument's
+        // remaining outputs are never evaluated -- `eval::fanout_arg`'s
+        // rules 2/4. Checked before buffering, or an escaping first result
+        // would be parked and the sink would ask for another value anyway.
+        if result.is_escape() {
+            if let Some(control) = push_generic_owned_values::<_, S>(result, &mut out) {
+                return stop_with_escape(&mut body_control, control);
+            } // patchcov: coverage tolerate-line reason="unreachable: `is_escape()` is exactly `Error|Break|Halt|Partial`, and `push_generic_owned_values` answers `Some(control)` for every one of those four, so the `None` continuation cannot be reached (#2180)"
+            return Demand::Stop; // patchcov: coverage tolerate-line reason="unreachable: see the `if let` above -- `push_generic_owned_values` never answers `None` for an `is_escape()` result (#2180)"
+        }
+        if out.is_empty() && pending_first.is_none() {
+            pending_first = Some(result);
+        } else if let Some(control) = push_generic_owned_values::<_, S>(result, &mut out) {
+            return stop_with_escape(&mut body_control, control);
+        }
+        Demand::Continue
+    });
 
     // Whatever `body` already produced still stands in front of the control,
     // exactly as it does for the argument's own escape below.
@@ -19720,12 +19661,8 @@ fn slice_pair_streaming<S: EvalSemantics, V: DocumentValue>(
 ) -> (Option<Control>, bool) {
     use crate::jq::eval::{TargetDrive, TargetEnd};
     let drive = TargetDrive::new();
-    let flow = eval_each_generic::<S, V>(
-        target,
-        value,
-        false,
-        cursor,
-        &mut MaterializesLazyItems(|item: GenericItem<V>| {
+    let flow =
+        eval_each_generic::<S, V>(target, value, false, cursor, &mut |item: GenericItem<V>| {
             // A re-invocation after a stop is a `?//` retry inside the target
             // (#3293): it supersedes the retried-past call.
             drive.begin();
@@ -19743,8 +19680,7 @@ fn slice_pair_streaming<S: EvalSemantics, V: DocumentValue>(
                 Ok(None) => Demand::Continue,
                 Err(err) => drive.stop_with_escape(Control::Error(err)),
             }
-        }),
-    );
+        });
     match drive.finish(flow, crate::jq::eval::direct_pattern_retry(target)) {
         TargetEnd::Stopped => (None, true),
         TargetEnd::Escape(control) => (Some(control), false),
@@ -33395,7 +33331,6 @@ mod tests {
                         Demand::Continue
                     }
                 },
-                lazy_ok: false,
             };
             let flow = each_lazy_seq_iterate_sink::<JqSemantics, _>(*seq, &[], false, &mut sink);
             let err = match flow {
@@ -43507,22 +43442,34 @@ mod tests {
         assert!(to_owned_cursor_with::<_, JqSemantics>(&cursor, |_| Ok(()), |_, _| None).is_ok());
     }
 
-    /// Whether `query` over `json` in jq mode answers a prevalidated cursor
-    /// sequence (#3317), an owned array, or something else.
+    /// Whether `query` over `json` answers a `,` array's cursor sequence
+    /// (#3317, `"cursors"`), its mixed cursor-and-value sequence (#3856,
+    /// `"mixed"`), an owned array, or something else.
     fn comma_array_route<S: EvalSemantics>(query: &str, json: &str) -> &'static str {
         let index = JsonIndex::build(json.as_bytes());
         let expr = crate::jq::parse(query).unwrap();
         match eval_with_cursor_using::<S, _>(&expr, index.root(json.as_bytes())) {
-            GenericResult::LazySeq(seq) if seq.is_prevalidated() => "prevalidated",
+            GenericResult::LazySeq(seq)
+                if matches!(
+                    seq.source,
+                    LazySource::Cursors {
+                        may_repeat: true,
+                        ..
+                    }
+                ) =>
+            {
+                "cursors"
+            }
+            GenericResult::LazySeq(seq) if matches!(seq.source, LazySource::Mixed(_)) => "mixed",
             GenericResult::LazySeq(_) => "lazy",
             GenericResult::Owned(OwnedValue::Array(_)) => "owned",
             _ => "other",
         }
     }
 
-    /// #3317: a jq-mode `[a, b, ...]` whose items are all document nodes,
-    /// at least one a container, stays a validated cursor sequence; every
-    /// other body keeps the owned array it built before.
+    /// #3317, #3856: a jq-mode `[a, b, ...]` keeps every document node as a
+    /// cursor when one of them is a container -- alone, or beside computed
+    /// values (`[., 1]`) -- and builds an owned array only when none is.
     #[test]
     fn test_comma_array_route_3317() {
         let doc = r#"{"a":{"x":1},"b":[2],"n":"s","m":3}"#;
@@ -43534,25 +43481,36 @@ mod tests {
             "[.a, .b]",
             "[.a, .n]",
             "[.a, .b?]",
-            // A literal sub-slice of a validated sequence stays validated.
+            // A literal sub-slice of a `,` array still may name a node twice.
             "[., .] | .[1:]",
         ] {
             assert_eq!(
                 comma_array_route::<JqSemantics>(query, doc),
-                "prevalidated",
+                "cursors",
                 "{query}"
             );
         }
         for query in [
-            // All scalars: a small array is cheaper than a boxed sequence.
-            "[.n, .m]",
-            // A computed item makes the array owned, before or after a node.
+            // A computed item beside a node stays a sequence, before or after
+            // it (#3856).
             "[., 1]",
             "[1, .]",
             "[.a, (.m + 1)]",
             // Navigation that reaches no node yields a computed `null`.
             "[.a, .missing]",
             "[.missing, .a]",
+        ] {
+            assert_eq!(
+                comma_array_route::<JqSemantics>(query, doc),
+                "mixed",
+                "{query}"
+            );
+        }
+        for query in [
+            // All scalars: a small array is cheaper than a boxed sequence.
+            "[.n, .m]",
+            // Computed items only.
+            "[1, 2]",
             // #3410: a `?//` in the body keeps its sink route.
             "[., (.a as [$x] ?// $x | $x)]",
         ] {
@@ -43585,7 +43543,7 @@ mod tests {
         ] {
             assert_eq!(
                 comma_array_route::<JqSemantics>(query, doc),
-                "prevalidated",
+                "cursors",
                 "{query}"
             );
         }
@@ -43599,8 +43557,6 @@ mod tests {
             // A computed stage is not pure navigation.
             "[(., .) | .a | length]",
             "[(., .) | .a | select(.x)]",
-            // Parsed as `(.a, .b) | (.[]?, 1)`: a literal in the tail.
-            "[(.a, .b) | .[]?, 1]",
             // The head is not a `,`: nothing to distribute.
             "[.a | (., .)]",
             // The `,` sits under a `?`, which the head match does not see through.
@@ -43612,11 +43568,18 @@ mod tests {
                 "{query}"
             );
         }
+        // Parsed as `(.a, .b) | (.[]?, 1)`: a literal in the tail. The body is
+        // a `,` of two pipes, so it takes the comma route and holds `.a`'s and
+        // `.b`'s elements beside the literal (#3856).
+        assert_eq!(
+            comma_array_route::<JqSemantics>("[(.a, .b) | .[]?, 1]", doc),
+            "owned"
+        );
         // yq never enters: its own union pipe (#2451) is not this route, so
-        // what it answered before is unchanged (`prevalidated` is jq's alone).
+        // what it answered before is unchanged (`cursors` is jq's alone).
         assert_ne!(
             comma_array_route::<YqSemantics>("[(., .) | .a]", doc),
-            "prevalidated"
+            "cursors"
         );
     }
 
@@ -44498,6 +44461,83 @@ mod tests {
         assert!(!items[0].shares_storage_with(&items[1]));
     }
 
+    /// #3856: a sequence holding both nodes and computed values materializes
+    /// to exactly the values the owned route builds (`to_owned_cursor` per
+    /// node, each owned value as it is), shares a repeated container node as
+    /// the all-node sequence does (#3477), and prints as its own source.
+    #[test]
+    fn test_mixed_sequence_materializes_like_the_owned_route_3856() {
+        let doc = r#"{"a":{"x":1},"b":{"x":1},"c":[1,2],"n":"s"}"#;
+        let index = JsonIndex::build(doc.as_bytes());
+        let eval = |query: &str| {
+            let expr = parse(query).unwrap();
+            eval_with_cursor_using::<JqSemantics, _>(&expr, index.root(doc.as_bytes()))
+        };
+        let GenericResult::LazySeq(seq) = eval("[.a, 1, .a, .n, .c, null, .b]") else {
+            panic!("a node beside a computed value is a sequence"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3856)"
+        };
+        assert!(matches!(seq.source, LazySource::Mixed(_)));
+        let shown = format!("{seq:?}");
+        assert!(shown.contains("LazySource::Mixed"), "{shown}");
+        assert!(shown.contains("len: 7"), "{shown}");
+        let OwnedValue::Array(items) = seq.materialize_atomic::<JqSemantics>().unwrap() else {
+            panic!("a sequence materializes to an array"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3856)"
+        };
+        let items: Vec<OwnedValue> = items.iter().cloned().collect();
+        let want = eval("[.a, 1, .a, .n, .c, null, .b]")
+            .collect_owned::<JqSemantics>()
+            .unwrap();
+        // The same elements the pre-#3856 owned route (`.,`-expression
+        // evaluated one branch at a time) builds.
+        let expected: Vec<OwnedValue> = ["[.a]", "[1]", "[.a]", "[.n]", "[.c]", "[null]", "[.b]"]
+            .iter()
+            .map(
+                |q| match eval(q).collect_owned::<JqSemantics>().unwrap()[0].clone() {
+                    OwnedValue::Array(one) => one.iter().next().unwrap().clone(),
+                    other => other, // patchcov: coverage tolerate-line reason="unreachable in a passing suite: `[x]` always builds an array (#3856)"
+                },
+            )
+            .collect();
+        assert_eq!(items, expected);
+        assert_eq!(want, vec![OwnedValue::array_from(expected)]);
+        // A node named twice is built once and shared; equal values at two
+        // nodes are two builds.
+        #[cfg(not(feature = "unshared-containers"))]
+        {
+            assert!(items[0].shares_storage_with(&items[2]));
+            assert!(!items[0].shares_storage_with(&items[6]));
+        }
+    }
+
+    /// #3856: a failing node is decoded only when something reads it, and then
+    /// with the message the owned build gives, in element order.
+    #[test]
+    fn test_mixed_sequence_validates_where_read_3856() {
+        let doc = r#"{"a":{"k":1},"b":{"k":tru}}"#;
+        let index = JsonIndex::build(doc.as_bytes());
+        let expr = parse("[.a, 1, .b]").unwrap();
+        let GenericResult::LazySeq(seq) =
+            eval_with_cursor_using::<JqSemantics, _>(&expr, index.root(doc.as_bytes()))
+        else {
+            panic!("a node beside a computed value is a sequence"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3856)"
+        };
+        // Pulling reads nothing.
+        assert_eq!(seq.clone().drain_atomic().ok().map(|e| e.len()), Some(3));
+        // Building reads every node.
+        let built = seq.materialize_atomic::<JqSemantics>();
+        let Err(Control::Error(e)) = built else {
+            panic!("the malformed node must fail the build"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3856)"
+        };
+        // The document's only failure is `.b`'s, so decoding the root gives it.
+        let cursor = index.root(doc.as_bytes());
+        assert_eq!(
+            e.message,
+            to_owned_cursor::<JqSemantics, _>(&cursor)
+                .unwrap_err()
+                .message
+        );
+    }
+
     /// #3815: `[.. | parent?]` emits the root once per child, and the
     /// collection builds it once and shares it, by node and never by value.
     // Storage identity is what `unshared-containers` removes: a clone there
@@ -44757,8 +44797,9 @@ mod tests {
 
     /// #3500: a `,` nested inside an array's comma (through parentheses) is
     /// spliced into its branches, so the nodes stay cursors instead of one
-    /// owned tree each; a `?` over the group, a non-navigation branch and an
-    /// all-scalar body keep the routes they had. Outputs are jq 1.7.1's.
+    /// owned tree each; a `?` over the group is held as a computed value
+    /// beside them (#3856), and an all-scalar body stays owned. Outputs are
+    /// jq 1.7.1's.
     #[test]
     fn test_nested_comma_array_keeps_cursors_3500() {
         let doc = r#"{"a":{"x":1},"b":[2,3],"c":"s","d":null}"#;
@@ -44772,24 +44813,28 @@ mod tests {
         ] {
             assert_eq!(
                 comma_array_route::<JqSemantics>(query, doc),
-                "prevalidated",
+                "cursors",
                 "{query}"
             );
         }
         for query in [
-            // The `?` covers the whole group, which is not the same branches.
+            // The `?` covers the whole group, which is not the same branches:
+            // the group's answer is computed, so it is held beside the node.
             "[(., .)?, .]",
-            // A literal branch is computed, so the array ends up owned.
+            // A literal branch is computed, so it is held beside the nodes.
             "[(., 1), .]",
-            // Every item a scalar: a small array is cheaper than a sequence.
-            "[(.c, .c), .c]",
         ] {
             assert_eq!(
                 comma_array_route::<JqSemantics>(query, doc),
-                "owned",
+                "mixed",
                 "{query}"
             );
         }
+        // Every item a scalar: a small array is cheaper than a sequence.
+        assert_eq!(
+            comma_array_route::<JqSemantics>("[(.c, .c), .c]", doc),
+            "owned"
+        );
         for (query, want) in [
             ("[(., .), .] | length", "3"),
             ("[((., .), .) | .a]", r#"[{"x":1},{"x":1},{"x":1}]"#),
@@ -44813,14 +44858,15 @@ mod tests {
         // yq never enters this route: its answer is what it was.
         assert_ne!(
             comma_array_route::<YqSemantics>("[(., .), .]", doc),
-            "prevalidated"
+            "cursors"
         );
     }
 
     /// #3500: a spliced array fails exactly as the flat spelling of the same
     /// branches does -- the first failure in branch order, and nothing
-    /// printed -- whether the raise is a branch's own (`.c.x` on a string) or
-    /// an earlier pending node's undecodable string, and behind a piped tail.
+    /// printed -- whether the raise is a branch's own (`.c.x` on a string),
+    /// a branch's raise after an undecodable node (the node is not read, so
+    /// the branch's own error is the first, #3856), or behind a piped tail.
     #[test]
     fn test_nested_comma_array_fails_like_the_flat_spelling_3500() {
         let run = |doc: &str, query: &str| {
@@ -44834,8 +44880,8 @@ mod tests {
                 "[((.a, .c.x), .a), .c.y]",
                 "[.a, .c.x, .a, .c.y]",
             ),
-            // An undecodable string in an earlier node wins over a later
-            // nested branch's own error.
+            // An undecodable string in an earlier node is not read, so a later
+            // nested branch's own error is the first failure.
             (
                 r#"{"a":"\q","c":"s"}"#,
                 "[(.a, (.c.x, .a)), .a]",
@@ -44847,14 +44893,21 @@ mod tests {
                 "[((.a, .b), .a) | .x.y]",
                 "[(.a | .x.y), (.b | .x.y), (.a | .x.y)]",
             ),
-            // A malformed document.
-            (r#"{"a":1,"b":xyz}"#, "[(., .), .]", "[., ., .]"),
         ] {
             let (out, control) = run(doc, nested);
             assert!(out.is_empty(), "{nested}: {out:?}");
             assert!(control.contains("Error"), "{nested}: {control}");
             assert_eq!(run(doc, flat), (out, control), "{nested} vs {flat}");
         }
+        // A malformed document is not read by the array that holds it
+        // (#3856): the sink sees the sequence either way, and printing it
+        // fails (`tests/jq_cli_tests.rs`).
+        let doc = r#"{"a":1,"b":xyz}"#;
+        assert_eq!(
+            run(doc, "[(., .), .]"),
+            run(doc, "[., ., .]"),
+            "a malformed document"
+        );
     }
 
     /// #3317: the `,` producer's sequence prints as its `Cursors` source,
@@ -44910,17 +44963,29 @@ mod tests {
             // `collect_owned` swallows a plain `Error`, so read it first.
             let got = match eval_with_cursor_using::<JqSemantics, _>(&expr, cursor) {
                 GenericResult::Error(e) => Err(e.message), // patchcov: coverage tolerate-line reason="no document here answers a plain Error since #3478 (the walk is the consumer's); kept so a future eager walk reports its own message instead of falling to the arm below, which swallows it"
-                // #3478: the walk is the consumer's. Building the array
-                // (which walks as it builds) and pulling it (which walks
-                // before the first element) must each fail with the message
-                // the build gives, and only then.
+                // #3478, #3856: the walk is the consumer's. Pulling the array
+                // reads nothing, so it never fails; the walk a reader runs on
+                // each element (the printer's `validate_cursor`) and building
+                // the array (which walks as it builds) must each fail with
+                // the message the build gives, and only then.
                 GenericResult::LazySeq(seq) => {
-                    let pulled = seq.clone().drain_atomic().map(|_| ()).map_err(message);
+                    let pulled = seq
+                        .clone()
+                        .drain_atomic()
+                        .map_err(message)
+                        .and_then(|elems| {
+                            elems.iter().try_for_each(|elem| match elem {
+                                LazyElem::Cursor(c) => {
+                                    validate_cursor::<JqSemantics, _>(c).map_err(|e| e.message)
+                                }
+                                LazyElem::Owned(_) => Ok(()),
+                            })
+                        });
                     let built_array = seq.materialize_atomic::<JqSemantics>().map_err(message);
                     assert_eq!(
                         pulled,
                         built_array.clone().map(|_| ()),
-                        "pulling and building disagree on {doc}"
+                        "reading and building disagree on {doc}"
                     );
                     built_array.map(|array| vec![array])
                 }
