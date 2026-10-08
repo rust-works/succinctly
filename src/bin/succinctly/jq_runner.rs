@@ -11984,6 +11984,40 @@ mod tests {
         );
     }
 
+    /// #3909: the object arm of `print_json` echoes a cursor-valued field from
+    /// the document the way the array arm echoes an element, and re-renders a
+    /// field whose text is not the compact record. No CLI route puts an object
+    /// of cursors in front of the printer (`standard_json_to_jq_value` builds
+    /// one for a cursor's own object), so the arm is driven directly.
+    #[test]
+    fn print_json_object_echoes_canonical_cursor_fields_3909() {
+        let config = OutputConfig {
+            compact: true,
+            raw_output: false,
+            join_output: false,
+            raw_output0: false,
+            ascii_output: false,
+            color_output: false,
+            color_scheme: ColorScheme::default(),
+            sort_keys: false,
+            indent_string: String::new(),
+            unbuffered: false,
+            seq: false,
+            convention: JsonConvention::JqCompat,
+        };
+        // `a` is canonical and echoed; `b` holds `1e2`, which jq respells
+        // `1E+2`, so its field is rendered rather than echoed.
+        let json: &[u8] = br#"{"a":{"x":[1,2]},"b":{"n":1e2}}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = standard_json_to_jq_value(cursor.value(), &cursor).unwrap();
+        assert!(matches!(value, JqValue::Object(_)));
+        let mut out = Vec::new();
+        let mut scratch = Vec::new();
+        write_output_jq_value(&mut out, &value, &config, &mut scratch).unwrap();
+        assert_eq!(out, b"{\"a\":{\"x\":[1,2]},\"b\":{\"n\":1E+2}}\n");
+    }
+
     /// #1192: `generic_result_to_jq_values`'s own `One`/`Many` arms --
     /// direct construction, since no ordinary top-level jq/yq expression
     /// found during this fix's development routes a *document-sourced*

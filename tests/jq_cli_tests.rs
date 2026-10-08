@@ -114763,6 +114763,40 @@ fn test_cursor_printed_inside_a_lazy_array_echoes_or_rerenders_3909() -> Result<
     Ok(())
 }
 
+/// #3909: an element too wide for the pairwise duplicate-key scan (more than
+/// `PAIRWISE_SPAN_SCAN_LIMIT` = 16 keys) that the echo refuses (`1e2` is
+/// respelled) is rendered through the hashed scan, with or without a repeated
+/// key. A wide canonical element is echoed and never reaches that scan, so
+/// this is the only shape that holds it. Captured live from `/usr/bin/jq`
+/// 1.7.1: the repeated `k3` keeps its first position and its last value.
+#[test]
+fn test_wide_non_canonical_element_inside_a_lazy_array_rerenders_3909() -> Result<()> {
+    let keys = (0..20)
+        .map(|i| format!("\"k{i}\":{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let rendered = keys.clone();
+    let rendered_repeat = rendered.replace("\"k3\":3", "\"k3\":99");
+    for (doc, body) in [
+        (format!("{{\"a\":{{{keys},\"n\":1e2}}}}"), rendered),
+        (
+            format!("{{\"a\":{{{keys},\"k3\":99,\"n\":1e2}}}}"),
+            rendered_repeat,
+        ),
+    ] {
+        let want_one = format!("{{{body},\"n\":1E+2}}");
+        for (filter, want) in [
+            ("[.a]", format!("[{want_one}]\n")),
+            ("[.a] | .[0]", format!("{want_one}\n")),
+        ] {
+            let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&doc))?;
+            assert_eq!(code, 0, "#3909: `{filter}` on {doc}: stderr={stderr:?}");
+            assert_eq!(stdout, want, "#3909: `{filter}` on {doc}");
+        }
+    }
+    Ok(())
+}
+
 /// #3909: the echo is a validation the same as the walk it replaces, so a
 /// malformed element still prints nothing and exits 5, whichever element it
 /// is and however the array is spelled.
