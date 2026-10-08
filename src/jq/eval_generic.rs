@@ -23049,7 +23049,8 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
         }
         // #2968: `skip(n; body)` -- `limit`'s twin in the walk. The body is
         // stepped in full (there is no bound to stop it at; every dropped
-        // position still had to be produced) and the first `n` positions
+        // position still had to be produced -- unlike `limit`'s pipe body,
+        // which stops at its bound, #3514) and the first `n` positions
         // are dropped, once per count value, with the count's own escape
         // reported after the positions already produced exactly as `limit`
         // reports its count's.
@@ -23864,8 +23865,9 @@ fn path_context_step_try<S: EvalSemantics, V: DocumentValue>(
 /// pipe is streamed with a sink that stops at the bound (#3514), so the
 /// stages after its first never run at a position past it (`first(.[] | if
 /// ("A"|stderr) then . else . end)` prints one `A`, as jq does). Any other
-/// body is stepped whole and truncated; an escape it
-/// raised *after* the bound was met is dropped, which is what jq's own
+/// body is stepped whole and truncated, and so is a pipe's own first stage
+/// when it is not literal navigation (`..`, a `try`, a parenthesised pipe).
+/// An escape raised *after* the bound was met is dropped, which is what jq's own
 /// `first(f)` (`label $out | f | ., break $out`) does with an error the
 /// generator would only have raised past the output it stopped at
 /// (`path(first((.[], error("x"))))` is `["a"]` in jq 1.7.1, exit 0).
@@ -23903,17 +23905,18 @@ fn path_context_step_bounded<S: EvalSemantics, V: DocumentValue>(
         // the bound. The stopping sink is the same demand the unbounded
         // pipe arm of `path_context_step_generic` already passes, so each
         // stage keeps its own rollback and collecting rules.
-        Expr::Pipe(stages) if take.is_some() => {
-            path_context_step_pipe_each::<S, V>(stages, pos, &mut |head| {
+        Expr::Pipe(stages) => match take {
+            Some(n) => path_context_step_pipe_each::<S, V>(stages, pos, &mut |head| {
                 branch.push(head);
-                if take.is_some_and(|n| branch.len() >= n) {
+                if branch.len() >= n {
                     Demand::Stop
                 } else {
                     Demand::Continue
                 }
             })
-            .map(|_| ())
-        }
+            .map(|_| ()),
+            None => path_context_step_generic::<S, V>(body, pos, &mut branch),
+        },
         _ => path_context_step_generic::<S, V>(body, pos, &mut branch),
     };
     let satisfied = take.is_some_and(|n| branch.len() >= n);

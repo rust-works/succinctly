@@ -52862,6 +52862,57 @@ fn test_yq_jq_extensions_path_foreach_update_by_demand_3507() -> Result<()> {
     Ok(())
 }
 
+/// #3514: `first`/`limit` over a pipe stop at the bound on the `key` walk, which
+/// `succinctly yq` shares with jq mode behind `--jq-extensions`. An extension
+/// follows jq (ADR-0018), so the stage after `.[]` no longer runs at a position
+/// past the bound. yq's computed-component rollback is unchanged: a bracket whose
+/// component stream raises part-way still reports its error (`Error: x`, exit 1)
+/// and keeps none of the positions it had indexed, bounded or not.
+#[test]
+fn test_yq_jq_extensions_bounded_pipe_stops_at_the_bound_3514() -> Result<()> {
+    let flat = "a:\n  - 1\n  - 2\n  - 3\n";
+    let nested = "a:\n  - [1, 2]\n  - [3]\n";
+    for (yaml, filter, want_out, want_err, want_code) in [
+        (
+            flat,
+            r#".a | first(.[] | if ("A"|stderr) then . else . end) | key"#,
+            "0\n",
+            "A",
+            0,
+        ),
+        (
+            flat,
+            r#".a | limit(2; .[] | if ("A"|stderr) then . else . end) | key"#,
+            "0\n1\n",
+            "AA",
+            0,
+        ),
+        (
+            nested,
+            r#".a | first(.[] | .[(0, error("x"))]) | key"#,
+            "",
+            "Error: x\n",
+            1,
+        ),
+        (
+            nested,
+            r#".a | limit(2; .[] | .[(0, error("x"))]) | key"#,
+            "",
+            "Error: x\n",
+            1,
+        ),
+    ] {
+        let (stdout, stderr, code) =
+            run_yq_stdin_with_stderr(filter, yaml, &["--jq-extensions", "-o=json", "-I=0"])?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (want_out, want_err, want_code),
+            "`{filter}`"
+        );
+    }
+    Ok(())
+}
+
 /// #3643 promoted `last(f)` to leave jq's path register in place in jq mode
 /// only (ADR-0018: yq has no oracle for it). With the jq-only surface enabled,
 /// yq mode still refuses `del(. as $x | last(.a) | $x.k)` exactly as before.

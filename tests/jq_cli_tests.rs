@@ -55857,6 +55857,21 @@ fn limit_over_a_pipe_body_stops_the_stages_after_the_bound_3514() -> Result<()> 
             "A",
             0,
         ),
+        // A nested comma spends the same budget, and a branch after it is never reached.
+        (
+            flat,
+            r#".a | limit(2; (.[0], .[1]), error("x")) | key"#,
+            "0\n1\n",
+            "",
+            0,
+        ),
+        (
+            flat,
+            r#".a | limit(1; (.[0], error("x")), .[1]) | key"#,
+            "0\n",
+            "",
+            0,
+        ),
         // The budget is shared across branches: two from the first, one from the second.
         (
             nested,
