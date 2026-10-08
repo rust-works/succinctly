@@ -24220,9 +24220,21 @@ fn path_context_step_try<S: EvalSemantics, V: DocumentValue>(
     let Some(handler) = catch else {
         return Ok(());
     };
+    path_context_try_handler::<S, V>(handler, &payload, pos, out)
+}
+
+/// The catch handler of [`path_context_step_try`], run over the caught
+/// payload at the `try`'s own position: each output is an owned node standing
+/// where the `try` stood.
+fn path_context_try_handler<S: EvalSemantics, V: DocumentValue>(
+    handler: &Expr,
+    payload: &OwnedValue,
+    pos: &PathContextPos<V>,
+    out: &mut Vec<PathContextPos<V>>,
+) -> Result<(), Control> {
     let resolved = path_context_resolve_at_pos::<S, V>(handler, pos).map_err(Control::Error)?;
     let (values, control) =
-        owned_identity_values::<S>(&resolved, &payload, false, &RootWitness::Owned);
+        owned_identity_values::<S>(&resolved, payload, false, &RootWitness::Owned);
     for v in values {
         out.push(PathContextPos {
             node: PathNode::Owned(Rc::new(v)),
@@ -24231,6 +24243,43 @@ fn path_context_step_try<S: EvalSemantics, V: DocumentValue>(
         });
     }
     control.map_or(Ok(()), Err)
+}
+
+/// [`path_context_step_try`], delivering the body's positions as they are
+/// found (#4014), so a consumer's stop reaches the body: `first(try (.[] |
+/// C))` must not run `C` at the element after the one it returned. An error
+/// the *consumer* raises never reaches here -- the sink returns only a
+/// [`Demand`] -- so it is not this `try`'s to catch, exactly as in the
+/// collecting twin.
+fn path_context_step_try_each<S: EvalSemantics, V: DocumentValue>(
+    body: &Expr,
+    catch: Option<&Expr>,
+    pos: &PathContextPos<V>,
+    sink: &mut dyn FnMut(PathContextPos<V>) -> Demand,
+) -> Result<Demand, Control> {
+    if let Some(settled) = swallowed_path_leaf::<S, V>(body, catch, &pos.node) {
+        return settled.map(|()| Demand::Continue).map_err(Control::Error);
+    }
+    let payload = match path_context_step_each::<S, V>(body, pos, sink) {
+        Ok(demand) => return Ok(demand),
+        Err(Control::Error(e)) if e.is_uncatchable_at_value_position() => {
+            return Err(Control::Error(e))
+        }
+        Err(Control::Error(e)) => e.payload(),
+        Err(Control::Break(_)) => OwnedValue::Null,
+        Err(halt @ Control::Halt(_)) => return Err(halt),
+    };
+    let Some(handler) = catch else {
+        return Ok(Demand::Continue);
+    };
+    let mut handled = Vec::new();
+    let result = path_context_try_handler::<S, V>(handler, &payload, pos, &mut handled);
+    for head in handled {
+        if matches!(sink(head), Demand::Stop) {
+            return Ok(Demand::Stop);
+        }
+    }
+    result.map(|()| Demand::Continue)
 }
 
 /// `first(body)` / `limit(n; body)` as one walk step: at most `take`
@@ -24277,15 +24326,15 @@ fn path_context_step_bounded<S: EvalSemantics, V: DocumentValue>(
             }
             stepped
         }
-        // #3514: a pipe is streamed, so the stages after the first run only
-        // for the positions the bound lets through. Stepped whole, `.[] | if
-        // C then . else . end` ran `C` (and its `stderr`, `input` and `?//`
-        // retries) at every position `.[]` reached, including the ones past
-        // the bound. The stopping sink is the same demand the unbounded
-        // pipe arm of `path_context_step_generic` already passes, so each
-        // stage keeps its own rollback and collecting rules.
-        Expr::Pipe(stages) => match take {
-            Some(n) => path_context_step_pipe_each::<S, V>(stages, pos, &mut |head| {
+        // #3514/#4014: any other body is streamed, so the stages after the
+        // first run only for the positions the bound lets through. Stepped
+        // whole, `.[] | if C then . else . end` ran `C` (and its `stderr`,
+        // `input` and `?//` retries) at every position `.[]` reached,
+        // including the ones past the bound. The stopping sink is the same
+        // demand the unbounded pipe arm of `path_context_step_generic` already
+        // passes, so each stage keeps its own rollback and collecting rules.
+        _ => match take {
+            Some(n) => path_context_step_each::<S, V>(body, pos, &mut |head| {
                 branch.push(head);
                 if branch.len() >= n {
                     Demand::Stop
@@ -24296,7 +24345,6 @@ fn path_context_step_bounded<S: EvalSemantics, V: DocumentValue>(
             .map(|_| ()),
             None => path_context_step_generic::<S, V>(body, pos, &mut branch),
         },
-        _ => path_context_step_generic::<S, V>(body, pos, &mut branch),
     };
     let satisfied = take.is_some_and(|n| branch.len() >= n);
     if let Some(n) = take {
@@ -24741,21 +24789,26 @@ fn path_context_step_each<S: EvalSemantics, V: DocumentValue>(
     if matches!(expr, Expr::Builtin(Builtin::Parent)) {
         return Ok(path_context_hop(pos, 1).map_or(Demand::Continue, sink));
     }
-    // A nested chain of literal navigation is one stage to the outer pipe.
-    // Stream each position through the chain rather than materialising the
-    // chain's own final positions.
+    // A nested pipe is streamed too (#4014): each stage of it still decides
+    // for itself whether to collect (yq's component rollback), so streaming
+    // changes only when a position reaches the consumer, never which ones do.
+    // Collected whole, `(.[] | C)` ran `C` at every element before the first
+    // reached a `first`/`limit` that would stop there.
     if let Expr::Pipe(steps) = expr {
-        if steps.iter().all(|step| {
-            matches!(
-                step,
-                Expr::Identity
-                    | Expr::Field(_)
-                    | Expr::Index { .. }
-                    | Expr::Iterate
-                    | Expr::Builtin(Builtin::Parent)
-            )
-        }) {
-            return path_context_step_pipe_each::<S, V>(steps, pos, sink);
+        return path_context_step_pipe_each::<S, V>(steps, pos, sink);
+    }
+    // `try`/`?` around a body delivers as it goes for the same reason (`..`
+    // does not: it has no side effect of its own to over-run, so streaming it
+    // would only save building the descendant list). The slice and bracket `?`
+    // forms have their own arms in
+    // `path_context_step_generic` (the `?` covers only the indexing) and stay
+    // collecting.
+    if let Expr::Try { expr: body, catch } = expr {
+        return path_context_step_try_each::<S, V>(body, catch.as_deref(), pos, sink);
+    }
+    if let Expr::Optional(inner) = expr {
+        if !matches!(&**inner, Expr::IndexExpr { .. } | Expr::SliceExpr { .. }) {
+            return path_context_step_try_each::<S, V>(inner, None, pos, sink);
         }
     }
     // Literal navigation -- `.k`, `.[3]`, `.[]`. Every component is fixed by
