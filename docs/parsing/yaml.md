@@ -4835,7 +4835,8 @@ fn advance_cursor_to(&self, cursor: &mut SequentialCursor, target: usize) {
 > snippet below describe the pre-#125 layout and are kept as a historical record.
 >
 > **Update (#965):** the scan loop itself moved out of `write_json_string()` and
-> into `stream_json_string()`, which became the single implementation (buffered
+> into `stream_json_string()`, which became the single implementation (since #2663
+> a wrapper over `jq::escape::write_json_body_yq`; buffered
 > callers, including `write_json_string()`, are now thin wrappers over it). Every
 > `write_json_string()` reference below — "the problem", the inlining findings,
 > "Files Modified" — describes where this optimization originally landed, not
@@ -4949,11 +4950,56 @@ wrapper over it (#965) — so the streaming YAML→JSON path (P9's hot path) pic
 optimization too, having run a scalar byte-at-a-time loop until then. Measured effect of that
 alone: block-scalar workloads −4.7% to −8.6%, on both an M4 Pro and a 7950X.
 
-`jq::escape::write_json_body_yq` is the same convention over the same scan and looks like the
-obvious place to share this from, but the two callers want **opposite inlining**: the `#[inline]`
-this path needs costs jq's own `keys_unsorted` callers of that function up to 14% on x86_64
-(`arrays keys_unsorted`, 7950X, measured). They therefore keep separate copies on purpose — see
-#965.
+`jq::escape::write_json_body_yq` is the same convention over the same scan, and since #2663
+`stream_json_string` is a thin wrapper over it (quotes around the shared body). The two used to be
+separate copies on purpose: #1638 measured the `#[inline]` this path wanted costing jq's own
+`arrays keys_unsorted` up to 13.9% on a 7950X, concluded "opposite inlining", and left the fork
+(#965). That conclusion did not survive re-measurement under the pinned release profile
+(`codegen-units = 1`, fat LTO, #2603), which post-dates it.
+
+**The 13.9% was code layout, not inlining and not the `fn` pointer.** Five release binaries per
+machine from one base (`9b483a5ec`), each differing from it in one thing, on a 7950X and an M4 Pro:
+
+| Variant                                                            | jq rows, instructions | `yq` streaming rows, instructions |
+|--------------------------------------------------------------------|-----------------------|-----------------------------------|
+| A: `stream.rs`'s `escape: fn(..)` threaded as a generic closure    | -0.00% (both chips)   | -0.0% to -0.2%                    |
+| B2: `stream_json_string` delegates to the shared body              | -0.00% (7950X), <= +0.18% (M4 Pro) | +0.6% to +5.6%         |
+| B3: B2 plus `#[inline]` on the shared body                         | identical to B2       | identical to B2                   |
+| Holdout: B2's delegation behind `black_box(false)`                 | -0.00% (7950X), <= -0.26% (M4 Pro) | +0.0% to +0.3%         |
+
+Wall-clock on the same binaries (`scripts/ab-cli.py`, interleaved, 9 reps, 5 jq and 5 YAML corpus
+files of about 10 MB, output identity gated) moved the jq rows by up to +10.7% on the 7950X *at
+identical instruction counts*, and the holdout, whose delegation can never run, moved them by up to
++10.3%. That is the function-placement band `docs/guides/benchmarking.md` § 9 ("What the pinned profile does not pin") describes, and the reason an
+`Ir` table, not a stopwatch, decided this: removing the `fn` pointer changed no executed
+instruction, so it was never what blocked inlining, and `#[inline]` on the shared body changed
+none either.
+
+**What the collapse does cost is the U+2028/U+2029 check the fork never had.** The shared body
+escapes the line and paragraph separators (#1982), as real yq does; the fork echoed them raw (#2607),
+so it was faster because it skipped required work. The probe is one byte search for the `0xE2` lead
+byte both separators share, per string, plus a span-copying walk for the rare string that holds
+one. Final shipped build against the base, instructions retired:
+
+| `yq -o json -I0 .` on 10 MB of | 7950X   | M4 Pro  |
+|--------------------------------|---------|---------|
+| users                          | +1.0%   | +0.9%   |
+| strings (long ASCII)           | +2.8%   | +2.7%   |
+| unicode                        | +3.4%   | +3.0%   |
+| block scalars                  | +2.4%   | +1.8%   |
+| wide object, `keys_unsorted`   | +0.5%   | -0.5%   |
+
+Wall-clock, measured twice on each chip (the shipped build, then again after the review fix that
+also escapes the text the quoted-scalar transcoders copy; medians against a same-session control
+that read within -0.5% to +1.1%): strings `.` +2.7% and +4.4% on the 7950X, +4.7% and +4.3% on the
+M4 Pro; unicode `.` +2.7% and +4.6%, +4.3% and +3.3%; users `.` +0.2%, and +2.4% and +2.0%; block
+scalars -5.8% and -2.3%, and -4.9% and +1.9% (a row that moves by this much between two runs of one
+binary is not a result). The streaming path is memory-bound on the 7950X, so less of the `Ir`
+shows there. Two cheaper probes were tried and dropped: a `contains_cr`-style SIMD any-match
+kernel (no better, +1.7% to +3.9% more instructions on the 7950X, mixed on the M4 Pro), and
+probing per span rather than per string (block scalars +4.0% to +4.3% instead of +1.8% to +2.4%,
+since a string with an escape is many short spans).
+The `Ir` cost is the price of matching yq (ADR-0018 puts reference behaviour ahead of speed).
 
 ### Files Modified
 

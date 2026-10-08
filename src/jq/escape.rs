@@ -136,24 +136,33 @@ pub fn write_json_body_jq_ascii<W: Write>(out: &mut W, s: &str) -> core::fmt::Re
 /// single-byte scan (every one of `"`, `\`, `< 0x20` is a distinct byte
 /// value, and both separators' bytes are all `>= 0x80`) — a span the scan
 /// reports as escape-free is copied here byte for byte, so it still needs
-/// its own check. Gated on a cheap `contains(0xE2)` byte-existence probe
-/// first (mirroring this module's `contains_cr` precheck): only the lead
-/// byte both separators share with a broad swath of otherwise-ordinary
-/// non-ASCII text (curly quotes, em dash, bullets, ...), so almost every
-/// span skips the per-character walk entirely, and the two-hit case this
-/// exists for is rare enough in real documents that paying for it with a
-/// linear scan (rather than widening the shared SIMD scanner every caller
-/// of `find_json_escape` pays for) is the right trade.
+/// its own check. Gated on a cheap `contains(0xE2)` byte-existence probe,
+/// run once per string (#2663; per span it charged a string with many escapes
+/// -- a block scalar's every line -- one call per span): only the lead byte
+/// both separators share with a broad swath of otherwise-ordinary non-ASCII
+/// text (curly quotes, em dash, bullets, ...), so almost every string skips
+/// the separator walk entirely, and the two-hit case this exists for is rare
+/// enough in real documents that paying for it with a linear scan (rather
+/// than widening the shared SIMD scanner every caller of `find_json_escape`
+/// pays for) is the right trade.
 pub fn write_json_body_yq<W: Write>(out: &mut W, s: &str) -> core::fmt::Result {
     let bytes = s.as_bytes();
     let len = bytes.len();
     let mut i = 0;
+    // One probe per string, not per span: a string with escapes in it (a block
+    // scalar's every line) is many short spans, and a span-by-span probe
+    // charged each of them a call (#2663).
+    let may_hold_separator = bytes.contains(&0xE2);
 
     while i < len {
         let escape_pos = find_json_escape(bytes, i);
 
         if i < escape_pos {
-            write_yq_span_escaping_separators(out, &s[i..escape_pos])?;
+            if may_hold_separator {
+                write_yq_span_escaping_separators(out, &s[i..escape_pos])?;
+            } else {
+                out.write_str(&s[i..escape_pos])?;
+            }
         }
 
         i = escape_pos;
@@ -177,29 +186,52 @@ pub fn write_json_body_yq<W: Write>(out: &mut W, s: &str) -> core::fmt::Result {
     Ok(())
 }
 
-/// Write a span [`write_json_body_yq`] has already confirmed contains none
-/// of `"`, `\` or a `< 0x20` control -- so the only thing left to check is
-/// U+2028/U+2029 (see that function's own doc comment). The `contains`
-/// probe is byte-level (not `char`), which is sound here: UTF-8 guarantees
-/// no other code point's encoding contains the standalone byte `0xE2` in a
-/// position that would false-positive this into the slow path incorrectly
-/// escaping something -- the slow path re-walks by `char` and only ever
-/// matches the two exact code points, so a same-byte false trigger (e.g.
-/// U+2014 em dash, U+2022 bullet) just costs an extra linear pass, never a
-/// wrong escape.
+/// Write a span of a string [`write_json_body_yq`] has found to hold an `0xE2`
+/// byte, which already holds none of `"`, `\` or a `< 0x20` control -- so the
+/// only thing left to check is U+2028/U+2029 (see that function's own doc
+/// comment). The probe is byte-level (not `char`), which is sound: UTF-8
+/// guarantees no other code point's encoding contains the standalone byte
+/// `0xE2` in a position that would false-positive this into the slow path
+/// incorrectly escaping something -- the walk below only ever matches the two
+/// exact code points, so a same-byte false trigger (e.g. U+2014 em dash,
+/// U+2022 bullet) just costs an extra linear pass, never a wrong escape.
 #[inline]
 fn write_yq_span_escaping_separators<W: Write>(out: &mut W, span: &str) -> core::fmt::Result {
-    if !span.as_bytes().contains(&0xE2) {
-        return out.write_str(span);
-    }
-    for c in span.chars() {
-        match c {
-            '\u{2028}' => out.write_str("\\u2028")?,
-            '\u{2029}' => out.write_str("\\u2029")?,
-            c => out.write_char(c)?,
+    let bytes = span.as_bytes();
+    // Most strings holding an `0xE2` byte hold none of the two separators
+    // (curly quotes, arrows, CJK punctuation), so copy the text between hits
+    // as spans rather than writing it a `char` at a time (#2663). `0xE2` is a
+    // lead byte, never a continuation byte, so every `i` below is a char
+    // boundary.
+    let mut start = 0;
+    let mut i = 0;
+    while let Some(hit) = bytes[i..].iter().position(|&b| b == 0xE2) {
+        i += hit;
+        match bytes.get(i + 1..i + 3) {
+            Some([0x80, last @ (0xA8 | 0xA9)]) => {
+                out.write_str(&span[start..i])?;
+                out.write_str(if *last == 0xA8 { "\\u2028" } else { "\\u2029" })?;
+                i += 3;
+                start = i;
+            }
+            _ => i += 1,
         }
     }
-    Ok(())
+    out.write_str(&span[start..])
+}
+
+/// Write `span` -- text a caller has already split at every `"`, `\` and
+/// `< 0x20` byte -- with U+2028/U+2029 escaped, as [`write_json_body_yq`] does
+/// for the spans it finds itself. For the YAML quoted-scalar transcoders, which
+/// copy the stretches between YAML escapes and line folds verbatim and so never
+/// pass through that function's scan (#2663).
+#[inline]
+pub(crate) fn write_json_span_yq<W: Write>(out: &mut W, span: &str) -> core::fmt::Result {
+    if span.as_bytes().contains(&0xE2) {
+        write_yq_span_escaping_separators(out, span)
+    } else {
+        out.write_str(span)
+    }
 }
 
 /// [`write_json_body_yq`], plus `\uXXXX` for every non-ASCII character — yq's
@@ -532,6 +564,49 @@ mod tests {
                 s.push(needle);
                 s.push_str(&"b".repeat(pad));
                 assert_eq!(yq(&s), scalar_ref(&s), "pad={pad} needle={needle:?}");
+            }
+        }
+    }
+
+    /// The separator scan copies the text between U+2028/U+2029 as spans (#2663)
+    /// instead of walking it a `char` at a time, and must agree with that walk
+    /// for every arrangement of separators, near-miss code points sharing their
+    /// `0xE2` lead byte (`→`, `…`, U+2027, U+202A) and escapes, wherever they
+    /// land against a SIMD chunk.
+    #[test]
+    fn separator_scan_agrees_with_a_char_walk_2663() {
+        let char_walk = |s: &str| {
+            let mut out = String::new();
+            for c in s.chars() {
+                match c {
+                    '"' => out.push_str("\\\""),
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\u{2028}' => out.push_str("\\u2028"),
+                    '\u{2029}' => out.push_str("\\u2029"),
+                    c => out.push(c),
+                }
+            }
+            out
+        };
+        let pieces = [
+            "", "a", "→", "…", "\u{2028}", "\u{2029}", "\u{2027}", "\u{202A}", "é", "😁", "\"",
+            "\n", "\\",
+        ];
+        for a in pieces {
+            for b in pieces {
+                for c in pieces {
+                    for d in pieces {
+                        let s = format!("{a}{b}{c}{d}");
+                        assert_eq!(yq(&s), char_walk(&s), "{s:?}");
+                    }
+                }
+            }
+        }
+        for pad in 0..70usize {
+            for sep in ["\u{2028}", "\u{2029}", "→"] {
+                let s = format!("{}{sep}{}{sep}", "x".repeat(pad), "y".repeat(pad));
+                assert_eq!(yq(&s), char_walk(&s), "pad={pad} sep={sep:?}");
             }
         }
     }

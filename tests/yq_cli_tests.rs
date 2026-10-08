@@ -52913,6 +52913,123 @@ fn test_yq_jq_extensions_bounded_pipe_stops_at_the_bound_3514() -> Result<()> {
     Ok(())
 }
 
+/// #2607 / #2663: the streaming YAML->JSON writer kept its own copy of yq's
+/// string escaper, which never learned the U+2028/U+2029 escaping #1982 gave the
+/// shared one, so `-o json` wrote a separator that arrived as a raw UTF-8 byte
+/// unescaped wherever the cursor streamed (the default for `.`, `.a`, `.[]`) and
+/// escaped it wherever a write or `--arg` forced the DOM. It now delegates to
+/// that one definition, and the decoded `\u2028`/`\U00002029` escape forms agree
+/// with it. Every row is captured whole from yq v4.53.3; `…` (U+2026) and `→`
+/// (U+2192) share the separators' `0xE2` lead byte and must stay raw.
+#[test]
+fn test_yq_json_output_escapes_line_and_paragraph_separators_on_every_path_2607() -> Result<()> {
+    let ls = "\u{2028}";
+    let ps = "\u{2029}";
+    let mapping =
+        format!("a: \"x{ls}y\"\nb: [1]\nc: \"p{ps}q \u{2026} \u{2192} r\"\nd: \"v{ls}\"\n");
+    let flow = format!("{{\"a\": \"x{ls}y{ps}z\"}}\n");
+    let sequence = format!("- \"x{ls}y\"\n- 'p{ps}q'\n");
+    let escapes = "a: \"x\\u2028y\"\nb: \"x\\U00002029y\"\nc: \"\\L\\P \\u2026\"\n";
+    for (yaml, filter, extra, want) in [
+        (
+            mapping.as_str(),
+            ".",
+            &[][..],
+            "{\"a\":\"x\\u2028y\",\"b\":[1],\"c\":\"p\\u2029q \u{2026} \u{2192} r\",\"d\":\"v\\u2028\"}\n",
+        ),
+        (mapping.as_str(), ".a", &[][..], "\"x\\u2028y\"\n"),
+        (
+            mapping.as_str(),
+            ".c",
+            &[][..],
+            "\"p\\u2029q \u{2026} \u{2192} r\"\n",
+        ),
+        // A JSON-sourced flow mapping (#2607's own repro), a sequence, and a
+        // single-quoted scalar.
+        (flow.as_str(), ".", &[][..], "{\"a\":\"x\\u2028y\\u2029z\"}\n"),
+        (sequence.as_str(), ".", &[][..], "[\"x\\u2028y\",\"p\\u2029q\"]\n"),
+        (sequence.as_str(), ".[1]", &[][..], "\"p\\u2029q\"\n"),
+        // The escape forms decode to the same code points.
+        (
+            escapes,
+            ".",
+            &[][..],
+            "{\"a\":\"x\\u2028y\",\"b\":\"x\\u2029y\",\"c\":\"\\u2028\\u2029 \u{2026}\"}\n",
+        ),
+        // The DOM route (`--arg` forces it) already escaped them; the routes agree.
+        (
+            mapping.as_str(),
+            ".a",
+            &["--arg", "x", "1"][..],
+            "\"x\\u2028y\"\n",
+        ),
+        (
+            mapping.as_str(),
+            ".c",
+            &["--arg", "x", "1"][..],
+            "\"p\\u2029q \u{2026} \u{2192} r\"\n",
+        ),
+    ] {
+        let mut args = vec!["-o", "json", "-I0"];
+        args.extend_from_slice(extra);
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, yaml, &args)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (want, "", 0),
+            "`{filter}` {extra:?} on {yaml:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #2607 / #2663 review: a quoted scalar that holds an escape, a `''` pair or a
+/// line fold is transcoded rather than echoed, and the transcoders copy the text
+/// between those features verbatim -- a second place a raw U+2028/U+2029 byte
+/// could slip through unescaped. Each row is captured whole from yq v4.53.3,
+/// and each scalar mixes a separator with the feature that forces the transcode.
+#[test]
+fn test_yq_json_output_escapes_separators_in_transcoded_scalars_2607() -> Result<()> {
+    let ls = "\u{2028}";
+    let ps = "\u{2029}";
+    for (yaml, want) in [
+        (
+            format!("a: \"x{ls}y \\\" z\"\n"),
+            "{\"a\":\"x\\u2028y \\\" z\"}\n",
+        ),
+        (format!("b: 'p{ps}q '' r'\n"), "{\"b\":\"p\\u2029q ' r\"}\n"),
+        (
+            format!("a: \"x{ls}y\\n z\"\n"),
+            "{\"a\":\"x\\u2028y\\n z\"}\n",
+        ),
+        (format!("a: \"q\\t{ls}y\"\n"), "{\"a\":\"q\\t\\u2028y\"}\n"),
+        // A line fold in a double- and a single-quoted scalar.
+        (format!("a: \"x{ls}y\n  z\"\n"), "{\"a\":\"x\\u2028y z\"}\n"),
+        (format!("a: 'x{ls}y\n  z'\n"), "{\"a\":\"x\\u2028y z\"}\n"),
+        (format!("- \"x{ls}y \\\" z\"\n"), "[\"x\\u2028y \\\" z\"]\n"),
+        (
+            format!("{{a: \"x{ls}y \\\" z\"}}\n"),
+            "{\"a\":\"x\\u2028y \\\" z\"}\n",
+        ),
+    ] {
+        let args = ["-o", "json", "-I0"];
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(".", &yaml, &args)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (want, "", 0),
+            "{yaml:?}"
+        );
+        // The DOM route agrees with the streaming one.
+        let dom = ["-o", "json", "-I0", "--arg", "x", "1"];
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(".", &yaml, &dom)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (want, "", 0),
+            "--arg {yaml:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3643 promoted `last(f)` to leave jq's path register in place in jq mode
 /// only (ADR-0018: yq has no oracle for it). With the jq-only surface enabled,
 /// yq mode still refuses `del(. as $x | last(.a) | $x.k)` exactly as before.
