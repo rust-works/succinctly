@@ -55770,6 +55770,134 @@ fn path_mode_foreach_update_and_extract_resolve_by_demand_3507() -> Result<()> {
     Ok(())
 }
 
+/// #3514: the cursor route's `key` walk stepped a `limit`/`first` body that is a
+/// pipe whole, so the stages after the first ran at every position the first
+/// reached -- `limit(1; .[] | if ("A"|stderr) then . else . end) | key` wrote
+/// `AA` -- and a `?//` in that stage retried once more per dropped position.
+/// The pipe is now streamed with a sink that stops at the bound, and a comma
+/// branch gets only the budget the earlier branches left.
+///
+/// Every row is jq 1.7.1's `path(...) | last` (`key` is a succinctly extension,
+/// so `path()` is the oracle), captured whole, so the side-effect count is
+/// pinned on stderr as well as stdout. The bound-met-exactly, `limit(0; ..)`
+/// and error-before-the-bound rows are the ones that must not move.
+#[test]
+fn limit_over_a_pipe_body_stops_the_stages_after_the_bound_3514() -> Result<()> {
+    let flat = r#"{"a":[1,2,3]}"#;
+    let nested = r#"{"a":[[1,2],[3,4],[5]]}"#;
+    for (input, filter, want_out, want_err, want_code) in [
+        // The report: the second element's condition must not run.
+        (
+            flat,
+            r#".a | limit(1; .[] | if ("A"|stderr) then . else . end) | key"#,
+            "0\n",
+            "A",
+            0,
+        ),
+        (
+            flat,
+            r#".a | first(.[] | if ("A"|stderr) then . else . end) | key"#,
+            "0\n",
+            "A",
+            0,
+        ),
+        // The `?//` in the condition retries once for the one position that ran.
+        (
+            flat,
+            r#".a | limit(1; .[] | if ([1] as $q ?// $b | ("A"|stderr) as $_ | $q) then error("E") else . end) | key"#,
+            "0\n",
+            "AA",
+            0,
+        ),
+        // A bound that takes more than one output takes exactly that many.
+        (
+            flat,
+            r#".a | limit(2; .[] | if ("A"|stderr) then . else . end) | key"#,
+            "0\n1\n",
+            "AA",
+            0,
+        ),
+        // A filter that selects away positions keeps reading until the bound is met.
+        (
+            flat,
+            r#".a | first(.[] | select(. > 1) | if ("A"|stderr) then . else . end) | key"#,
+            "1\n",
+            "A",
+            0,
+        ),
+        // `limit(0; ..)` never evaluates the body.
+        (
+            flat,
+            r#".a | limit(0; .[] | if ("A"|stderr) then . else . end) | key"#,
+            "",
+            "",
+            0,
+        ),
+        // An error raised before the bound is met still raises; one raised
+        // at a position past it is dropped.
+        (
+            flat,
+            r#".a | limit(2; .[] | if . == 2 then error("E") else . end) | key"#,
+            "0\n",
+            "jq: error (at <stdin>:0): E\n",
+            5,
+        ),
+        (
+            flat,
+            r#".a | limit(2; .[] | if . == 3 then error("E") else . end) | key"#,
+            "0\n1\n",
+            "",
+            0,
+        ),
+        // A pipe inside a comma branch, and a branch after the bound.
+        (
+            flat,
+            r#".a | limit(1; (.[] | if ("A"|stderr) then . else . end), error("x")) | key"#,
+            "0\n",
+            "A",
+            0,
+        ),
+        // The budget is shared across branches: two from the first, one from the second.
+        (
+            nested,
+            r#".a | limit(3; (.[0] | .[] | if ("A"|stderr) then . else . end), (.[1] | .[] | if ("B"|stderr) then . else . end)) | key"#,
+            "0\n1\n0\n",
+            "AAB",
+            0,
+        ),
+        // A pipe nested in the pipe's tail stops as well.
+        (
+            nested,
+            r#".a | limit(2; .[] | .[] | if ("A"|stderr) then . else . end) | key"#,
+            "0\n1\n",
+            "AA",
+            0,
+        ),
+        (
+            nested,
+            r#".a | limit(3; .[] | (.[], .[0]) | if ("A"|stderr) then . else . end) | key"#,
+            "0\n1\n0\n",
+            "AAA",
+            0,
+        ),
+        (
+            nested,
+            r#".a | limit(2; .[] | limit(1; .[] | if ("A"|stderr) then . else . end)) | key"#,
+            "0\n0\n",
+            "AA",
+            0,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (want_out, want_err, want_code),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
 /// #3651: a `?//` chain in a fold **source** that destructures a freshly built value
 /// runs jq's *next* alternative, not the first, in path position.
 ///

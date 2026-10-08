@@ -23861,7 +23861,10 @@ fn path_context_step_try<S: EvalSemantics, V: DocumentValue>(
 /// where the body is a comma, and the branches past the bound are never
 /// stepped: `first((.[], halt_error))` stops after the first element, as jq
 /// does, rather than evaluating the `halt_error` it would never reach. A
-/// body that is not a comma is stepped whole and truncated; an escape it
+/// pipe is streamed with a sink that stops at the bound (#3514), so the
+/// stages after its first never run at a position past it (`first(.[] | if
+/// ("A"|stderr) then . else . end)` prints one `A`, as jq does). Any other
+/// body is stepped whole and truncated; an escape it
 /// raised *after* the bound was met is dropped, which is what jq's own
 /// `first(f)` (`label $out | f | ., break $out`) does with an error the
 /// generator would only have raised past the output it stopped at
@@ -23883,12 +23886,33 @@ fn path_context_step_bounded<S: EvalSemantics, V: DocumentValue>(
                 if take.is_some_and(|n| branch.len() >= n) {
                     break;
                 }
-                stepped = path_context_step_generic::<S, V>(b, pos, &mut branch);
+                // #3514: a branch gets only the budget the earlier ones left,
+                // so a pipe or comma inside it stops at the bound as well.
+                let remaining = take.map(|n| n - branch.len());
+                stepped = path_context_step_bounded::<S, V>(b, remaining, pos, &mut branch);
                 if stepped.is_err() {
                     break;
                 }
             }
             stepped
+        }
+        // #3514: a pipe is streamed, so the stages after the first run only
+        // for the positions the bound lets through. Stepped whole, `.[] | if
+        // C then . else . end` ran `C` (and its `stderr`, `input` and `?//`
+        // retries) at every position `.[]` reached, including the ones past
+        // the bound. The stopping sink is the same demand the unbounded
+        // pipe arm of `path_context_step_generic` already passes, so each
+        // stage keeps its own rollback and collecting rules.
+        Expr::Pipe(stages) if take.is_some() => {
+            path_context_step_pipe_each::<S, V>(stages, pos, &mut |head| {
+                branch.push(head);
+                if take.is_some_and(|n| branch.len() >= n) {
+                    Demand::Stop
+                } else {
+                    Demand::Continue
+                }
+            })
+            .map(|_| ())
         }
         _ => path_context_step_generic::<S, V>(body, pos, &mut branch),
     };
