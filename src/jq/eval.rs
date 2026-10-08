@@ -45118,12 +45118,20 @@ fn entry_marker_shape(expr: &Expr) -> EntryMarkers {
                 shape
             }
         }
-        // #4059: stages that cannot have moved the register ahead of the last one leave it where
-        // it entered, so the last stage's statements are read as they would be alone
-        // (`1 | (not, ($v|.b?))`, whose comma states the register per sibling). A head that may
-        // navigate keeps the pipe as opaque as it was.
+        // #4059: stages that cannot have moved the register ahead of a last stage that forks leave
+        // it where it entered, so the last stage's statements are read as they would be alone
+        // (`1 | (not, ($v|.b?))`, whose comma states the register per sibling). Only a forking
+        // last stage: a leaf producer there (`1 | .`) keeps the pipe as opaque as it was, and so
+        // does a head that may navigate.
         Expr::Pipe(stages)
             if stages.len() > 1
+                && matches!(
+                    unwrap_paren(&stages[stages.len() - 1]),
+                    Expr::Comma(_)
+                        | Expr::Alternative(..)
+                        | Expr::If { .. }
+                        | Expr::Try { .. }
+                )
                 && stages[..stages.len() - 1]
                     .iter()
                     .all(neutral_leaves_register) =>
@@ -134456,7 +134464,10 @@ mod neutral_leaves_register_tests_4028 {
             ("now | (now, floor)", true),
             ("1 | 2 | (now, floor)", true),
             ("1 | ((now, floor) // 5)", true),
-            // A head that may navigate, or a last stage with nothing to state.
+            ("1 | if . then (now, floor) else 1 end", true),
+            // A head that may navigate, or a last stage with nothing to state or that is a leaf
+            // producer (its pipe stays opaque, as before).
+            ("1 | .", false),
             (".a | (now, floor)", false),
             ("1 | .a | (now, floor)", false),
             ("1 | (.a, .b)", false),
