@@ -875,9 +875,10 @@ build that only lifts the cap and keeps the evaluator-driven walk (and against `
 
 The walk is 3.4 to 4.9 times faster than lifting only the cap, at 0.25 to 0.65 times its peak memory, and
 costs 1.6 to 1.9 times `..`'s time and 1.5 to 2.6 times its memory: one `cond` per node, and the owned tree
-a cursor walk avoids (there is no cursor arm for `recurse(f; cond)`, tracked in
-[#3867](https://github.com/rust-works/succinctly/issues/3867), so `first(recurse(.[]?; true))` also pays for
-the whole document where `first(..)` does not). The Apple M5 Max is a laptop on mains power with other
+a cursor walk avoids (in jq mode over a live document `recurse(.[]?; cond)` now takes that cursor walk, #3867, so
+`first(recurse(.[]?; true))` costs what `first(..)` does: 0.01 s and 18 MB against 0.09 s and 81 MB over a 7 MB
+`users` document on an Apple M4 Pro; the figures above are the owned walk's, which yq mode and a `cond` outside
+this grammar still take). The Apple M5 Max is a laptop on mains power with other
 sessions running (load average about 25), so its seconds are indicative and the ratios are the claim. Below
 the cap it is faster too: over a 7,001-node document, 300 repetitions of `[recurse(.[]?; true)]` took 2.01 s
 before and 0.14 s now on the 7950X (2.39 s and 0.14 s on the M5 Max). A `cond` the pure verdict cannot answer
@@ -918,8 +919,13 @@ same document with a last element `[7]` is 12004 in jq and raises here.
 A finite walk past the cap is still refused rather than answered where it is not provably bounded by the
 tree: a `cond` that forks, and an `f` that is not tree-descending (`.[]? | .`, a computed `f`, an `if` that
 descends only through arrays). A hang is not a divergence ADR-0018 permits either, so the cap stays there.
-There is still no cursor arm for `recurse(f; cond)` ([#3867](https://github.com/rust-works/succinctly/issues/3867)),
-so `first(recurse(.[]?; true))` pays for the whole document where `first(..)` does not. The path walker still
+`recurse(.[]?; cond)` has a cursor arm in jq mode only ([#3867](https://github.com/rust-works/succinctly/issues/3867)):
+`succinctly yq` keeps the owned walk, so there `first(recurse(.[]?; true))` still pays for the whole document where
+`first(..)` does not, and it counts a repeated mapping key's node once fewer than the cursor walk does when a
+position is read (`recurse(.[]?; true) | path` over `dup: {a: 1, a: 2}` is 3 nodes, the cursor walk's 4). Like `..`,
+the cursor walk decodes a node only where something reads it, so an undecodable string inside a subtree `cond`
+prunes is never raised (the owned walk raised it up front); jq 1.7.1 rejects such a document at parse time, so
+there is no reference answer (ADR-0018: performance decides). The path walker still
 runs `.[]?` at every node, so
 `path(recurse(.[]?))` takes about 1.8 times `path(..)`'s time (2.9 s against 1.6 s over 1.15 M nodes of
 a `users` document, [#3717](https://github.com/rust-works/succinctly/issues/3717)).

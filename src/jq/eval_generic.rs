@@ -13482,7 +13482,8 @@ fn each_foreach_generic<S: EvalSemantics, V: DocumentValue>(
     )
 }
 
-/// `..` from a cursor: the node, then every descendant in document order,
+/// `..` from a cursor (and, with a `cond`, `recurse(.[]?; cond)` for a `cond` yielding at
+/// most one value, #3867): the node, then every descendant in document order,
 /// each delivered as a live cursor (spine 2416, walk residue). `..` is
 /// `recurse(.[]?)`, so a node whose members cannot be listed ends its own
 /// branch silently -- except for the decode failure `?` never catches
@@ -13511,8 +13512,10 @@ fn each_recurse_cursor_generic<S: EvalSemantics, V: DocumentValue>(
         // walk's twin). The root is delivered without it, as `r` emits `.` first.
         // The caller admitted only a `cond` yielding at most one value, so one
         // truthy verdict keeps the child once.
-        if let Some(cond) = cond.filter(|_| !core::mem::take(&mut at_root)) {
+        let is_root = core::mem::take(&mut at_root);
+        if let Some(cond) = cond.filter(|_| !is_root) {
             let mut keep = false;
+            let mut verdicts = 0u32;
             let flow =
                 eval_each_generic::<S, V>(cond, cursor.value(), false, Some(cursor), &mut |item| {
                     keep |= generic_item_is_truthy(&item);
@@ -13526,7 +13529,6 @@ fn each_recurse_cursor_generic<S: EvalSemantics, V: DocumentValue>(
                 continue;
             }
         }
-        at_root = false;
         if matches!(sink.push(GenericItem::OneCursor(cursor)), Demand::Stop) {
             return Flow::Stopped { pending: None };
         }

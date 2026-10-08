@@ -59631,6 +59631,15 @@ fn test_recurse_cond_cursor_walk_keeps_the_owned_walks_order_3867() -> Result<()
             "[\"{\\\"a\\\":[1,{\\\"b\\\":2}],\\\"c\\\":null}\",\"[1,{\\\"b\\\":2}]\",\"1\",\"{\\\"b\\\":2}\",\"2\"]\n",
             0,
         ),
+        // A node is decoded where something reads it, as `..` does: a string that will
+        // not decode inside a subtree `cond` prunes is never raised (jq 1.7.1 rejects the
+        // document at parse time, so there is no reference answer).
+        (
+            r#"[1,["\ud800x",2],3]"#,
+            r#"recurse(.[]?; type != "array")"#,
+            "[1,[\"\\ud800x\",2],3]\n1\n3\n",
+            0,
+        ),
         // The root is delivered without `cond`, so a first output never runs it.
         (
             "[1,[2]]",
