@@ -25736,8 +25736,13 @@ fn index_array_by_position<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         },
         // jq returns null for index on null
         StandardJson::Null => QueryResult::One(StandardJson::Null),
-        StandardJson::Object(_) if yq_numeric_index_on_object_is_null::<S>() => {
-            QueryResult::One(StandardJson::Null)
+        // #4079: the member whose key text is the index (`.[1]` finds `1:`), `null` on a miss.
+        StandardJson::Object(fields) if yq_numeric_index_on_object_is_null::<S>() => {
+            match find_field::<W>(fields, &idx.to_string()) {
+                Ok(Some(v)) => QueryResult::One(v),
+                Ok(None) => QueryResult::One(StandardJson::Null),
+                Err(e) => QueryResult::Error(e),
+            }
         }
         // #2482 (yq mode): `.s[0]` on a scalar `s` -- same empty-not-error
         // rule as the field-name sibling in `index_object_by_name`, see
@@ -25873,6 +25878,26 @@ pub(crate) fn yq_numeric_index_on_object_is_null<S: EvalSemantics>() -> bool {
     S::TAG == EvalTag::Yq
 }
 
+/// The text real yq's `matchKey` compares a mapping's keys with when the index is a number, a
+/// boolean or `null` (#4079): `.[1]` finds the `1:` member, `.[true]` the `true:` one, `.[1.5]` the
+/// `1.5:` one, where jq has no such key. `None` outside yq mode, for a string (the ordinary
+/// lookup), for a container and for a NaN, which has no spelling. A miss still reads as
+/// [`yq_numeric_index_on_object_is_null`] says: the callers fall back to it.
+pub(crate) fn yq_mapping_index_text<S: EvalSemantics>(key: &OwnedValue) -> Option<String> {
+    if S::TAG != EvalTag::Yq {
+        return None;
+    }
+    match key {
+        OwnedValue::Float(f) if f.is_nan() => None,
+        OwnedValue::Int(_)
+        | OwnedValue::Float(_)
+        | OwnedValue::NumberLiteral(..)
+        | OwnedValue::Bool(_)
+        | OwnedValue::Null => yq_scalar_text::<S>(key).map(Cow::into_owned),
+        _ => None,
+    }
+}
+
 /// Whether indexing a *scalar* (string, number, or boolean -- **not** `null`,
 /// which already has its own unconditional-null rule) with any key -- a
 /// field name, a numeric index, or a computed key of either kind -- produces
@@ -25915,6 +25940,22 @@ fn index_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // may swallow.
     if let StandardJson::Error(reason) = target {
         return QueryResult::Error(EvalError::decode_failure(reason));
+    }
+    // #4079: yq finds a mapping's member by the *text* of a numeric, boolean or `null` index
+    // (`.[1]` is the `1:` member); a miss keeps the rules below (`null`).
+    if let (StandardJson::Object(fields), Some(text)) = (&target, yq_mapping_index_text::<S>(key)) {
+        match find_field::<W>(*fields, &text) {
+            Ok(Some(v)) => return QueryResult::One(v),
+            Ok(None) => {
+                if !matches!(
+                    key,
+                    OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)
+                ) {
+                    return QueryResult::One(StandardJson::Null);
+                }
+            }
+            Err(e) => return QueryResult::Error(e),
+        }
     }
     let indexable_by_string = matches!(target, StandardJson::Object(_) | StandardJson::Null);
     // #2459: yq mode also indexes a mapping by number (into `null`, via
@@ -26087,6 +26128,12 @@ pub(crate) fn index_one_owned<S: EvalSemantics>(
     if let (OwnedValue::Object(desc), false) = (key, S::TAG == EvalTag::Yq) {
         let (start, end) = descriptor_slice_bounds(desc);
         return slice_owned_value_read_computed::<S>(target, &start, &end, optional);
+    }
+    // #4079: a numeric, boolean or `null` index finds a mapping's member by its key text in yq.
+    if let (OwnedValue::Object(map), Some(text)) = (target, yq_mapping_index_text::<S>(key)) {
+        return Ok(Some(
+            map.get(text.as_str()).cloned().unwrap_or(OwnedValue::Null),
+        ));
     }
     match (key, target) {
         (OwnedValue::String(s), OwnedValue::Object(map)) => Ok(Some(
@@ -31641,6 +31688,62 @@ fn autovivify_object(root: &mut OwnedValue) {
     }
 }
 
+/// yq mode (#4079): `path_expr` with each `Index` step that lands on a *mapping* in `root` rewritten
+/// to the `Field` step of the same key text (`.[1] = "z"` writes the `1:` member, `.[2] = "z"`
+/// creates the key `2`), or `None` when no step needed it. yq finds a mapping's member by the text
+/// of a numeric index, where jq has no such key and the walkers below raise `Cannot index object
+/// with number`.
+///
+/// The walk follows `root` through plain `Field`/`Index` steps and stops at the first step it
+/// cannot classify from the document (a fan-out, a slice, a group, a component the document
+/// does not reach), leaving the rest as it is.
+fn yq_mapping_index_steps<S: EvalSemantics>(root: &OwnedValue, path_expr: &Expr) -> Option<Expr> {
+    if S::TAG != EvalTag::Yq {
+        return None;
+    }
+    let steps: &[Expr] = match path_expr {
+        Expr::Pipe(steps) => steps,
+        single => core::slice::from_ref(single),
+    };
+    if !steps.iter().any(|step| matches!(step, Expr::Index { .. })) {
+        return None;
+    }
+    let mut at = Some(root);
+    let mut rewritten: Option<Vec<Expr>> = None;
+    for (i, step) in steps.iter().enumerate() {
+        match step {
+            Expr::Field(name) => {
+                at = at.and_then(|v| match v {
+                    OwnedValue::Object(map) => map.get(name.as_str()),
+                    _ => None,
+                });
+            }
+            Expr::Index { idx, key } => match at {
+                Some(OwnedValue::Object(map)) => {
+                    let text = yq_scalar_text::<S>(&index_component_value(*idx, key.as_ref()))
+                        .map(Cow::into_owned)?;
+                    at = map.get(text.as_str());
+                    rewritten.get_or_insert_with(|| steps.to_vec())[i] = Expr::Field(text);
+                }
+                Some(OwnedValue::Array(items)) => {
+                    let resolved = if *idx < 0 {
+                        items.len() as i64 + idx
+                    } else {
+                        *idx
+                    };
+                    at = usize::try_from(resolved).ok().and_then(|i| items.get(i));
+                }
+                _ => at = None,
+            },
+            _ => break,
+        }
+    }
+    rewritten.map(|steps| match path_expr {
+        Expr::Pipe(_) => Expr::Pipe(steps.into()),
+        _ => steps.into_iter().next().unwrap_or(Expr::Identity),
+    })
+}
+
 /// [`set_path`]'s one-field write: vivify a `null` root into an object and
 /// insert `new_value` under `name`, handing `new_value` back when the root
 /// is not an object for the caller to diagnose. Shared with
@@ -31802,6 +31905,10 @@ fn set_path<S: EvalSemantics>(
     scalar_noop: bool,
     container_noop: bool,
 ) -> Result<(), EvalError> {
+    // #4079: an `Index` step on a mapping is the `Field` of its text in yq.
+    if let Some(rewritten) = yq_mapping_index_steps::<S>(root, path_expr) {
+        return set_path::<S>(root, &rewritten, new_value, scalar_noop, container_noop);
+    }
     match path_expr {
         Expr::Identity => {
             *root = new_value;
@@ -33431,6 +33538,18 @@ fn update_path_with_deletes<S: EvalSemantics>(
     pos: Option<&UpdatePos<'_>>,
     mut deletes: Option<&mut DeferredUpdateDeletes>,
 ) -> Result<bool, EvalEscape> {
+    // #4079: an `Index` step on a mapping is the `Field` of its text in yq.
+    if let Some(rewritten) = yq_mapping_index_steps::<S>(root, path_expr) {
+        return update_path_with_deletes::<S>(
+            root,
+            &rewritten,
+            filter_expr,
+            optional,
+            scalar_noop,
+            pos,
+            deletes,
+        );
+    }
     // yq's slice-write container no-op (#1142) is unconditional on the
     // operator, unlike `scalar_noop` (a caller-gated parameter, `false` for
     // `-=`/`*=`) -- so it only needs `S::TAG`, not threading through every
@@ -35160,6 +35279,14 @@ fn key_to_path_component<S: EvalSemantics>(
             if S::TAG != EvalTag::Yq && matches!(container, OwnedValue::Array(_)) =>
         {
             Ok(Expr::ArrayKey(Box::new(key.clone())))
+        }
+        // #4079: yq finds a mapping's member by the text of a numeric, boolean or `null` key.
+        _ if matches!(container, OwnedValue::Object(_))
+            && yq_mapping_index_text::<S>(key).is_some() =>
+        {
+            Ok(Expr::Field(
+                yq_mapping_index_text::<S>(key).unwrap_or_default(),
+            ))
         }
         // Truncation toward zero, as in the value path.
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
@@ -58301,8 +58428,13 @@ fn eval_owned_navigation<S: EvalSemantics>(
             OwnedValue::Null => Ok(Some(OwnedValue::Null)),
             // #2459: yq mode only -- same rule as `index_array_by_position`'s
             // own `Object` arm. See `yq_numeric_index_on_object_is_null`.
-            OwnedValue::Object(_) if yq_numeric_index_on_object_is_null::<S>() => {
-                Ok(Some(OwnedValue::Null))
+            OwnedValue::Object(map) if yq_numeric_index_on_object_is_null::<S>() => {
+                // #4079: the member whose key text is the index.
+                Ok(Some(
+                    map.get(idx.to_string().as_str())
+                        .cloned()
+                        .unwrap_or(OwnedValue::Null),
+                ))
             }
             // #2482 (yq mode): `.s[0]` on a scalar `s` -- same empty rule as
             // the sibling `Expr::Field` arm above.
@@ -104439,6 +104571,65 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(" ")),
         }
+    }
+
+    /// [`outcome`] under yq's semantics and parser: the eager evaluator over a JSON document,
+    /// the route the CLI's cursor evaluator does not take (#4079).
+    fn yq_outcome(json: &[u8], filter: &str) -> Result<String, String> {
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr =
+            crate::jq::parser::parse_with_mode(filter, crate::jq::parser::ParserMode::Yq).unwrap();
+        match eval_full::<Vec<u64>, YqSemantics>(&expr, cursor) {
+            QueryResult::Error(e) => Err(e.message),
+            other => Ok(other
+                .collect_owned::<YqSemantics>()
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>()
+                .join(" ")),
+        }
+    }
+
+    /// #4079: yq finds a mapping's member by the text of a numeric, boolean or `null` index, on
+    /// the eager evaluator too -- `index_one`, `index_array_by_position`, `index_one_owned`, the
+    /// owned `Expr::Index` arm and the write walkers -- and a miss is still `null` (#2459). jq
+    /// mode keeps raising.
+    #[test]
+    fn test_yq_index_finds_a_mapping_key_by_text_on_the_eager_route_4079() {
+        let doc: &[u8] = br#"{"abc":1,"1":"y","true":"t","null":"n","1.5":"w"}"#;
+        for (filter, expected) in [
+            (".[1]", r#""y""#),
+            (".[true]", r#""t""#),
+            (".[null]", r#""n""#),
+            (".[1.5]", r#""w""#),
+            (".[2]", "null"),
+            (".[false]", "null"),
+            ("1 as $k | .[$k]", r#""y""#),
+            ("true as $k | .[$k]", r#""t""#),
+            ("(. + {}) | .[1]", r#""y""#),
+            ("(. + {}) | .[null]", r#""n""#),
+            ("1 as $k | (. + {}) | .[$k]", r#""y""#),
+            ("(. + {}) | .[true]", r#""t""#),
+            ("(. + {}) | .[2]", "null"),
+            ("[.] | .[0] | .[1]", r#""y""#),
+            ("has(1)", "true"),
+            ("has(2)", "false"),
+            (".[1] = \"z\" | .[\"1\"]", r#""z""#),
+            (".[2] = \"z\" | .[\"2\"]", r#""z""#),
+            (".[1] |= . + \"!\" | .[1]", r#""y!""#),
+        ] {
+            assert_eq!(
+                yq_outcome(doc, filter),
+                Ok(expected.to_string()),
+                "{filter}"
+            );
+        }
+        // jq mode: no such lookup.
+        assert_eq!(
+            outcome(br#"{"1":"y"}"#, ".[1]"),
+            Err("Cannot index object with number".to_string())
+        );
     }
 
     /// Asserts `filter` over each `input` produces the paired outcome.

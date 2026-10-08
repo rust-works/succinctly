@@ -28755,36 +28755,24 @@ fn test_2353_del_comma_grouped_wrong_kind_key_still_errors_residual_gap() -> Res
 /// #2353 review found this second, independent residual gap (scope expanded
 /// on #2362): a *computed* index against an object -- `.[5+0]`, `5 as $i |
 /// .[$i]`, or a literal `null`/`true`/`false` key (only a bare integer
-/// literal gets the `Expr::Index` shorthand this issue's own fix touches;
-/// anything else, including those literals, is `Expr::IndexExpr`) --
-/// resolves through `resolve_index_expr`/`key_to_path_component`, generic
-/// path-resolution machinery shared by every path-consuming builtin
-/// (`path()`, every assignment operator, and `del()` alike), not through
-/// any of this issue's fixed `delete_*` functions. Real yq no-ops all of
+/// literal gets the `Expr::Index` shorthand) -- resolves through
+/// `resolve_index_expr`/`key_to_path_component`, generic path-resolution
+/// machinery shared by every path-consuming builtin. Real yq no-ops all of
 /// these against an object (confirmed live against v4.53.3); succinctly
-/// still raises. Pinning the current (unfixed) behavior rather than
-/// leaving it untested -- see #2362 for why a blanket fix there risks
-/// regressing assignment's own, different "stringify the key" divergence.
+/// raised until #4079, which finds a mapping's member by the text of a numeric,
+/// boolean or `null` key: the key is no longer the wrong kind, so `del()` removes the
+/// member if there is one and is a no-op otherwise, as in yq.
 #[test]
-fn test_2353_del_computed_index_wrong_kind_key_still_errors_residual_gap() -> Result<()> {
-    let (_out, code) = run_yq_stdin("del(.[5+0])", r#"{"a":1}"#, &["-o=json", "-I=0"])?;
-    assert_eq!(
-        code, 1,
-        "residual gap: computed-arithmetic index still errors"
-    );
-
-    let (_out, code) = run_yq_stdin("5 as $i | del(.[$i])", r#"{"a":1}"#, &["-o=json", "-I=0"])?;
-    assert_eq!(
-        code, 1,
-        "residual gap: computed-variable index still errors"
-    );
-
-    let (_out, code) = run_yq_stdin("del(.[null])", r#"{"a":1}"#, &["-o=json", "-I=0"])?;
-    assert_eq!(
-        code, 1,
-        "residual gap: literal null key (IndexExpr) still errors"
-    );
-
+fn test_2353_del_computed_index_on_a_mapping_is_a_noop_in_yq_4079() -> Result<()> {
+    for filter in [
+        "del(.[5+0])",
+        "5 as $i | del(.[$i])",
+        "del(.[null])",
+        "del(.[true])",
+    ] {
+        let (out, code) = run_yq_stdin(filter, r#"{"a":1}"#, &["-o=json", "-I=0"])?;
+        assert_eq!((out.trim(), code), (r#"{"a":1}"#, 0), "`{filter}`");
+    }
     Ok(())
 }
 
@@ -33183,18 +33171,20 @@ fn test_yq_assign_all_noop_mismatched_element_type_1432() -> Result<()> {
     assert_eq!(code, 0, "err={err}");
     assert_eq!(out.trim(), "{\n  \"a\": 5\n}");
 
-    // `Index` mid-prefix hits a real `Object` (wrong container type).
+    // `Index` mid-prefix hits a real `Object`: since #4079 yq's rule applies, the index is the
+    // key `0` (created, as `[]` is not iterable there), and the write has no targets. yq does not
+    // evaluate the right side then (`{"a":{"0":[]}}`); succinctly still does, so the `error` is
+    // raised (the recorded evaluate-the-RHS-with-no-targets difference).
     let (_out, err, code) =
         run_yq_stdin_with_stderr(".a[0][].b = error(\"boom\")", "a: {}\n", &["-o", "json"])?;
     assert_ne!(code, 0);
-    assert!(err.contains("Cannot index object with number"), "err={err}");
+    assert!(err.contains("boom"), "err={err}");
 
-    // Same shape, harmless RHS: the identical error, before and after
-    // #2481 -- the write-path gap is pre-existing, only its ordering
-    // relative to the RHS moved.
-    let (_out, err, code) = run_yq_stdin_with_stderr(".a[0][].b = 9", "a: {}\n", &["-o", "json"])?;
-    assert_ne!(code, 0);
-    assert!(err.contains("Cannot index object with number"), "err={err}");
+    // Same shape, harmless RHS: yq's answer.
+    let (out, err, code) =
+        run_yq_stdin_with_stderr(".a[0][].b = 9", "a: {}\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), r#"{"a":{"0":[]}}"#);
 
     Ok(())
 }
@@ -47071,13 +47061,10 @@ fn test_yq_numeric_index_on_mapping_is_null_2459() -> Result<()> {
         assert_eq!(code, 0, "`{filter}`: {output:?}");
         assert_eq!(output.trim(), expected, "`{filter}`");
     }
-    // The write side is unchanged -- still errors, not part of this fix.
-    let (_out, stderr, code) = run_yq_stdin_with_stderr(".a[5] = 1", doc, &[])?;
-    assert_ne!(code, 0, "write side is not part of #2459 -- see #1863");
-    assert!(
-        stderr.contains("Cannot index object with number"),
-        "got: {stderr}"
-    );
+    // The write side coerces the index to a string key and inserts it, as yq does (#4079; it
+    // raised `Cannot index object with number` before).
+    let (output, code) = run_yq_stdin(".a[5] = 1", doc, args)?;
+    assert_eq!((output.trim(), code), (r#"{"a":{"b":1,"5":1}}"#, 0));
     Ok(())
 }
 
@@ -57600,5 +57587,223 @@ fn test_yq_bare_wildcard_field_and_text_keys_2800() -> Result<()> {
         stderr.contains("Cannot index array with string \"*\""),
         "stderr: {stderr:?}"
     );
+    Ok(())
+}
+
+/// #4079: yq finds a mapping's member by the *text* of a numeric, boolean or `null` index -- `.[1]`
+/// is the `1:` member, `.[true]` the `true:` one, `.[1.5]` the `1.5:` one -- on every read route
+/// (literal, computed, `as`-bound, `?`, `has`) and every write (`=`, `|=`, `+=`, a computed key,
+/// creating the key when it is absent, `select(false)` leaving it alone), where it answered
+/// `null` or raised `Cannot index object with number`. A miss is still `null` (#2459), and an
+/// array keeps its positions. Every row captured from yq v4.53.3 with `-o=json -I=0`.
+#[test]
+fn test_yq_numeric_boolean_null_index_finds_a_mapping_key_by_text_4079() -> Result<()> {
+    let rows: &[(&str, &str, &str)] = &[
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            ".[1]",
+            "\"y\"\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            ".[true]",
+            "\"t\"\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            ".[null]",
+            "\"n\"\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            ".[1.5]",
+            "\"w\"\n",
+        ),
+        ("abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n", ".[2]", "null\n"),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            ".[1] | path",
+            "[1]\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            ".[1] | key",
+            "1\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            "[.[1], .[true]]",
+            "[\"y\",\"t\"]\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            ".[1]?",
+            "\"y\"\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            ".[0+1]",
+            "\"y\"\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            ". as $m | 1 as $i | $m[$i]",
+            "\"y\"\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            ".[1] as $v | $v",
+            "\"y\"\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            "has(1)",
+            "true\n",
+        ),
+        ("abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n", ".abc[1]", ""),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            ".[1] | tag",
+            "\"!!str\"\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            "[.[1]] | length",
+            "1\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            ".[1] = \"z\"",
+            "{\"abc\":1,\"1\":\"z\",\"true\":\"t\",\"null\":\"n\",\"1.5\":\"w\"}\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            ".[true] = \"z\"",
+            "{\"abc\":1,\"1\":\"y\",\"true\":\"z\",\"null\":\"n\",\"1.5\":\"w\"}\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            ".[2] = \"z\"",
+            "{\"abc\":1,\"1\":\"y\",\"true\":\"t\",\"null\":\"n\",\"1.5\":\"w\",\"2\":\"z\"}\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            ".[1] |= . + \"!\"",
+            "{\"abc\":1,\"1\":\"y!\",\"true\":\"t\",\"null\":\"n\",\"1.5\":\"w\"}\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            ".[1] += \"!\"",
+            "{\"abc\":1,\"1\":\"y!\",\"true\":\"t\",\"null\":\"n\",\"1.5\":\"w\"}\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            ".[1.5] = 0",
+            "{\"abc\":1,\"1\":\"y\",\"true\":\"t\",\"null\":\"n\",\"1.5\":0}\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            ".[null] = 0",
+            "{\"abc\":1,\"1\":\"y\",\"true\":\"t\",\"null\":0,\"1.5\":\"w\"}\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            "(.[1], .abc) = 9",
+            "{\"abc\":9,\"1\":9,\"true\":\"t\",\"null\":\"n\",\"1.5\":\"w\"}\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            ".[1] = \"z\" | .[1]",
+            "\"z\"\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            "1 as $k | .[$k] = \"z\"",
+            "{\"abc\":1,\"1\":\"z\",\"true\":\"t\",\"null\":\"n\",\"1.5\":\"w\"}\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            "true as $k | .[$k] = 7",
+            "{\"abc\":1,\"1\":\"y\",\"true\":7,\"null\":\"n\",\"1.5\":\"w\"}\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            ".[1] |= select(false)",
+            "{\"abc\":1,\"1\":\"y\",\"true\":\"t\",\"null\":\"n\",\"1.5\":\"w\"}\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            "del(.[1])",
+            "{\"abc\":1,\"1\":\"y\",\"true\":\"t\",\"null\":\"n\",\"1.5\":\"w\"}\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            "del(.[2])",
+            "{\"abc\":1,\"1\":\"y\",\"true\":\"t\",\"null\":\"n\",\"1.5\":\"w\"}\n",
+        ),
+        ("{}\n", ".[1] = \"z\"", "{\"1\":\"z\"}\n"),
+        (
+            "a: {x: 1}\n",
+            ".a[2] |= \"q\"",
+            "{\"a\":{\"x\":1,\"2\":\"q\"}}\n",
+        ),
+        (
+            "a: {x: 1}\n",
+            ".a[1] = \"z\"",
+            "{\"a\":{\"x\":1,\"1\":\"z\"}}\n",
+        ),
+        ("a: {x: 1}\n", ".a[1]", "null\n"),
+        ("a: {}\n", ".a[0][].b = 9", "{\"a\":{\"0\":[]}}\n"),
+        ("- a\n- b\n", ".[1]", "\"b\"\n"),
+        ("- a\n- b\n", ".[1] = \"z\"", "[\"a\",\"z\"]\n"),
+        ("- a\n- b\n", ".[2] = \"x\"", "[\"a\",\"b\",\"x\"]\n"),
+        ("- a\n- b\n", ".[-1]", "\"b\"\n"),
+        ("- a\n- b\n", "has(1)", "true\n"),
+        ("- a\n- b\n", ".[5]", "null\n"),
+        ("- a\n- b\n", ".[1] | key", "1\n"),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            "1 as $k | (. + {}) | .[$k]",
+            "\"y\"\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            "(. + {}) | .[1+0]",
+            "\"y\"\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            "(. + {}) | .[true]",
+            "\"t\"\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            "(. + {}) | .[2]",
+            "null\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            "[.] | .[0] | .[1]",
+            "\"y\"\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            "[.] | .[0] | .[1] | path",
+            "[0,1]\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            ". as $m | {\"k\": $m} | .k | .[1]",
+            "\"y\"\n",
+        ),
+    ];
+    for &(doc, filter, expected) in rows {
+        let (stdout, code) = run_yq_stdin(filter, doc, &["-o", "json", "-I", "0"])?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (expected, 0),
+            "`{filter}` on {doc:?}"
+        );
+    }
     Ok(())
 }

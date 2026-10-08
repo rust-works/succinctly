@@ -143,8 +143,9 @@ below uses, and `succinctly yq` follows:
 A space is what makes `*` an operator (`.a * 2`, `.a *2`); `.a*=2` is the assignment `.a* = 2`.
 A pattern finds a typed key by its text too (`*` matches `1: y`, `true: t` and `1.5: w`).
 `succinctly jq` keeps `*` an operator (`.a*2` is a product) and has no digit-leading field.
-Still open: `.[1]`, `.[true]` and `.[null]` as an *index* on a mapping, and names with other
-punctuation (`.a+1`); see [limitations.md](../compliance/yq/limitations.md).
+A numeric, boolean or `null` *index* finds a mapping's member by the same text (`.[1]` is the `1:`
+member, `.[true]` the `true:` one, `.[1] = "z"` updates it or creates the key `1`); a miss is `null`.
+Still open: names with other punctuation (`.a+1`); see [limitations.md](../compliance/yq/limitations.md).
 
 ### `==`/`!=` compare scalars by text, with a wildcard on the right
 
