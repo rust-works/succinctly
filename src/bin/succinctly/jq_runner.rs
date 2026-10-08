@@ -7270,13 +7270,11 @@ fn materialize_stream_item<V: succinctly::jq::document::DocumentValue>(
                 None
             }
         },
-        GenericResult::LazyObject(obj) => match obj.materialize_atomic::<JqSemantics>() {
-            Ok(v) => Some(v),
-            Err(e) => {
-                sink.report(DiagStyle::Jq, &e, &at.resolve());
-                None
-            }
-        },
+        GenericResult::LazyObject(obj) => sink.materialize(
+            DiagStyle::Jq,
+            obj.materialize_atomic::<JqSemantics>(),
+            &at.resolve(),
+        ),
         // The eight shapes a sink item provably never takes (see this
         // function's doc comment). `None` rather than `unreachable!()` so a
         // future regression cannot take the process down -- but it would drop

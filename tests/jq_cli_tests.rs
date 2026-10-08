@@ -97155,6 +97155,21 @@ fn test_object_holding_unreadable_node_is_validated_where_read_4044() -> Result<
         ("{a: .ok, b: .bad}", "", 5),
         ("{a: .bad} | .a", "", 5),
         ("{a: .bad} | tojson", "", 5),
+        // A member that raises before any node is held is the object's own
+        // error (jq 1.7.1 rejects the document, so these have no reference);
+        // an object read under a truthiness test, `//` or a collection raises
+        // on the node it holds.
+        ("{a: .n[0]}", "", 5),
+        ("{a: .ok, b: .n.x}", "", 5),
+        ("[{a: .n[0]}?]", "[]\n", 0),
+        ("[{(1): 2}?]", "[]\n", 0),
+        ("select({a: .bad})", "", 5),
+        ("{a: .bad} // 1", "", 5),
+        ("[{a: .bad}]", "", 5),
+        ("[{a: .bad}] | length", "", 5),
+        ("{a: .ok} // 1", "{\"a\":{\"x\":[1,2]}}\n", 0),
+        ("last({a: .ok})", "{\"a\":{\"x\":[1,2]}}\n", 0),
+        (".n | [{a: .}] | length", "1\n", 0),
         // The member comes back as the node it is: `length` of it counts its
         // members, a read of its contents raises.
         ("{a: .bad} | .a | length", "1\n", 0),

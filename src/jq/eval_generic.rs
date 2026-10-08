@@ -3698,11 +3698,6 @@ impl<V: DocumentValue> core::fmt::Debug for LazyObject<V> {
 }
 
 impl<V: DocumentValue> LazyObject<V> {
-    /// The members in construction order, each value a node or a computed one.
-    pub fn entries(&self) -> &[(String, LazyElem<V>)] {
-        &self.entries
-    }
-
     /// The members in construction order, by value.
     pub fn into_entries(self) -> Vec<(String, LazyElem<V>)> {
         self.entries
@@ -5604,7 +5599,7 @@ fn eval_on_many_owned<S: EvalSemantics, V: DocumentValue>(
                 unreachable!("eval_on_owned never returns LazyIndexRange")
             }
             GenericResult::LazySeq(_) => unreachable!("eval_on_owned never returns LazySeq"),
-            GenericResult::LazyObject(_) => unreachable!("eval_on_owned never returns LazyObject"),
+            GenericResult::LazyObject(_) => unreachable!("eval_on_owned never returns LazyObject"), // patchcov: coverage tolerate-line reason="unreachable: eval_on_owned evaluates an owned value with no cursor, and only a cursor builds a LazyObject (#4044)"
             GenericResult::None => {}
             // The outputs already produced no longer vanish (#400, #494).
             GenericResult::Error(e) => return partial_generic(results, Control::Error(e)),
@@ -5811,12 +5806,12 @@ impl<V: DocumentValue> GenericResult<V> {
             // A `Partial` prefix is not representable as a single value —
             // same "not representable" answer as `Break`/`Error` here.
             Self::Partial(..) => None,
-            Self::LazyKeys { .. }
-            | Self::LazyIndexRange(_)
-            | Self::LazySeq(_)
-            | Self::LazyObject(_) => {
+            Self::LazyKeys { .. } | Self::LazyIndexRange(_) | Self::LazySeq(_) => {
                 unreachable!("materialize_lazy() already normalized every lazy variant")
             }
+            Self::LazyObject(_) => {
+                unreachable!("materialize_lazy() already normalized a lazy object")
+            } // patchcov: coverage tolerate-line reason="unreachable: into_owned/collect_owned answer a LazyObject before materialize_lazy runs, and materialize_lazy turns it into Owned or Error (#4044)"
         })
     }
 
@@ -5844,12 +5839,12 @@ impl<V: DocumentValue> GenericResult<V> {
             Self::Break(_) => vec![],
             Self::Halt(_) => vec![],
             Self::Partial(vs, _control) => vs,
-            Self::LazyKeys { .. }
-            | Self::LazyIndexRange(_)
-            | Self::LazySeq(_)
-            | Self::LazyObject(_) => {
+            Self::LazyKeys { .. } | Self::LazyIndexRange(_) | Self::LazySeq(_) => {
                 unreachable!("materialize_lazy() already normalized every lazy variant")
             }
+            Self::LazyObject(_) => {
+                unreachable!("materialize_lazy() already normalized a lazy object")
+            } // patchcov: coverage tolerate-line reason="unreachable: into_owned/collect_owned answer a LazyObject before materialize_lazy runs, and materialize_lazy turns it into Owned or Error (#4044)"
         })
     }
 
@@ -9289,12 +9284,6 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
 ) -> GenericResult<V> {
     for (j, expr) in stages.iter().enumerate() {
-        // #4044: a lazy object is handed to a stage that does not read it
-        // natively as the owned value it stands for -- the arm below that has
-        // always taken one.
-        if matches!(current, GenericResult::LazyObject(_)) && !lazy_object_reads_natively(expr) {
-            current = current.materialize_lazy::<S>();
-        }
         current = match current {
             // The previous stage produced `vs` before terminating in
             // `outer_control` (#400, #494): pipe that prefix through
@@ -9916,9 +9905,12 @@ fn lazy_object_reads_natively(stage: &Expr) -> bool {
 }
 
 /// One step of folding a `GenericResult::LazyObject` through a further pipe
-/// stage that [`lazy_object_reads_natively`] (#4044): `.k` answers the member (a
-/// node stays a node), `length` the member count, `keys`/`keys_unsorted` the
-/// member names, and a chain headed by one of them continues from that answer.
+/// stage (#4044): `.k` answers the member (a node stays a node), `length` the
+/// member count, `keys`/`keys_unsorted` the member names, and a chain headed by
+/// one of them continues from that answer. Any other stage reads the object as
+/// the owned value it stands for, exactly as the eager fold's `Owned` arm does;
+/// the demand-driven fold (`continue_pipe_element_generic`) sends such a stage
+/// through its own `Owned` arm instead, which forwards demand.
 fn fold_lazy_object_stage<S: EvalSemantics, V: DocumentValue>(
     obj: Box<LazyObject<V>>,
     expr: &Expr,
@@ -9947,15 +9939,11 @@ fn fold_lazy_object_stage<S: EvalSemantics, V: DocumentValue>(
                     .collect(),
             ))
         }
-        Expr::Pipe(stages) => match stages.split_first() {
-            Some((head, tail)) => {
-                let answered = fold_lazy_object_stage::<S, V>(obj, head, optional);
-                fold_pipe_stages::<S, V>(answered, tail, optional)
-            }
-            None => GenericResult::LazyObject(obj),
-        },
-        // The callers send only what `lazy_object_reads_natively` admits; any
-        // other stage reads the object as the owned value it stands for.
+        Expr::Pipe(stages) if !stages.is_empty() => {
+            let answered = fold_lazy_object_stage::<S, V>(obj, &stages[0], optional);
+            fold_pipe_stages::<S, V>(answered, &stages[1..], optional)
+        }
+        // Any other stage reads the object as the owned value it stands for.
         _ => match obj.materialize_atomic::<S>() {
             Ok(owned) => eval_on_owned::<S, V>(expr, owned, optional, Reentry::REBUILT),
             Err(e) => GenericResult::Error(e),
@@ -10942,10 +10930,6 @@ fn fold_pipe_stages_sink<S: EvalSemantics, V: DocumentValue>(
         let expr = &stages[j];
         let rest = &stages[j + 1..];
         let is_iterate = matches!(unwrap_paren(expr), Expr::Iterate);
-        // #4044: see `fold_pipe_stages`.
-        if matches!(current, GenericResult::LazyObject(_)) && !lazy_object_reads_natively(expr) {
-            current = current.materialize_lazy::<S>();
-        }
         current = match current {
             GenericResult::LazyKeys {
                 fields,
@@ -26008,6 +25992,14 @@ fn object_construction_sink_generic<S: EvalSemantics, V: DocumentValue>(
     each_object_entries_generic::<S, V>(entries, value, optional, cursor, &mut acc, sink)
 }
 
+/// The member's key when it is a literal (`{a: ..}`, not `{(expr): ..}`).
+fn literal_object_key(entry: &ObjectEntry) -> Option<&str> {
+    match &entry.key {
+        ObjectKey::Literal(name) => Some(name),
+        ObjectKey::Expr(_) => None,
+    }
+}
+
 /// Whether an object member's value is pure navigation naming exactly one
 /// node: `.`, `.a`, `.[0]`, and pipes of them (#4044). No fan-out, no effect, so
 /// [`lazy_object_generic`] may evaluate it and still hand the object to the
@@ -26051,13 +26043,11 @@ fn lazy_object_generic<S: EvalSemantics, V: DocumentValue>(
     }
     // One pass, no allocation: literal keys over navigation values, no key twice.
     for (i, entry) in entries.iter().enumerate() {
-        let ObjectKey::Literal(name) = &entry.key else {
-            return None;
-        };
+        let name = literal_object_key(entry)?;
         if !object_value_names_one_node(&entry.value)
             || entries[..i]
                 .iter()
-                .any(|earlier| matches!(&earlier.key, ObjectKey::Literal(other) if other == name))
+                .any(|earlier| literal_object_key(earlier) == Some(name))
         {
             return None;
         }
@@ -26067,9 +26057,7 @@ fn lazy_object_generic<S: EvalSemantics, V: DocumentValue>(
     // not decode (decode-or-defer, as `comma_array_generic` does, #3856).
     let mut holds_node = false;
     for entry in entries {
-        let ObjectKey::Literal(name) = &entry.key else {
-            return None;
-        };
+        let name = literal_object_key(entry)?;
         let elem = match eval_single::<S, V>(&entry.value, value.clone(), optional, cursor) {
             GenericResult::OneCursor(c) if c.is_container() => {
                 holds_node = true;
@@ -26103,7 +26091,7 @@ fn lazy_object_generic<S: EvalSemantics, V: DocumentValue>(
             }
             _ => return None,
         };
-        members.push((name.clone(), elem));
+        members.push((name.to_string(), elem));
     }
     if holds_node {
         return Some(GenericResult::LazyObject(Box::new(LazyObject {
@@ -45788,6 +45776,12 @@ mod tests {
         let good = r#"{"a":{"x":[1,2]},"b":3}"#;
         let object = r#"{"o":{"x":[1,2]},"n":3}"#;
         with_object(good, |result| {
+            let GenericResult::LazyObject(obj) = result else {
+                panic!("the object holds a node");
+            };
+            assert_eq!(format!("{obj:?}"), "LazyObject { len: 2 }");
+        });
+        with_object(good, |result| {
             assert!(matches!(result, GenericResult::LazyObject(_)));
             assert!(result.produces_output() && !result.is_error());
             let mut json = String::new();
@@ -45887,6 +45881,8 @@ mod tests {
             r#"{("a"): .a}"#,
             "{a: .a | length}",
             "{a: .b[]}",
+            // Two objects, one per value of the member.
+            "{a: (.b[0], .m)}",
             "{a: .a?}",
             "{a: .missing.deeper.x}",
         ] {
