@@ -4482,11 +4482,18 @@ Three residuals, each captured live from v4.53.3:
   `IndexMap<String, _>` and their type is not recoverable. `entries_to_object`
   stringifies a typed key on reassembly in both tools (#2521), so `with_entries(.)` itself
   agrees.
-- **Traversal does not match a key by text** ([#2800](https://github.com/rust-works/succinctly/issues/2800)).
-  yq's `.[1]` and `has(1)` find the `1:` member (its `matchKey` compares texts), and
-  `.["ab*"]`/`.ab*` fan out over every key the pattern matches; succinctly's lookups are
-  exact and string-only. Not a key-node question, but the same `matchKey` -- listed here
-  because `.[] | select(key == 1)` now matches while `.[1]` still does not.
+- **Traversal matches a key by text for a string, a bare name and `has()`; a numeric, boolean or
+  null *index* still does not** ([#2800](https://github.com/rust-works/succinctly/issues/2800)).
+  yq's `matchKey` compares texts, so `.ab*`, `.*`, `.1` and `has(1)` find the `ab*`-matching
+  members and the `1:` member, and so do `.["ab*"]` and `.["1"]`; since #2800 all of them do
+  here too, a pattern also finding a typed key (`*` matches `1: y`, `true: t`, `1.5: w`).
+  What remains is `.[1]`, `.[true]`, `.[null]` (and `.[1] = "z"`) on a mapping, which still answer
+  `null` (yq finds the member), a mapping key whose spelling the owned value has lost (`~` and `null:`
+are `null`, `0x10` is the number 16, so a pattern cannot rebuild the text yq matches; such a key is
+left out of a `.*` rather than answered with a `null`), and yq's own
+  quirks, recorded rather than copied: `del(.["1"])` and `del(.[1])` on an int-spelled key are
+  no-ops in yq (succinctly deletes), and `pick(.["ab*"])` is `{}` there. Not a key-node question,
+  but the same `matchKey`.
 
 Pinned by `key_node_metadata_2763::a_typed_key_is_a_node_too_2785` and the
 `typed_key_node_2785` module (`tests/yq_cli_tests.rs`), plus the `typed_key_*_2785`
@@ -5004,9 +5011,18 @@ of every matching key in document order (`.["x??"]` on `{"x??":3,"x?y":4,"xyz":5
 is `3`, `4`, `5`). When no key matches, a read answers `null` and a write creates
 the pattern as a literal key. In yq mode the parser desugars a wildcard `.name` or
 `.["name"]` into an index over `Expr::yq_wildcard_keys`, so reads, `=`, `|=`, `+=`
-and `del()` all follow the matching keys. Two gaps remain: an *unquoted* `*`
-(`.a*`) is still a parse error, and a *computed* string key (`.[ "x?" + "?" ]`)
-is still an exact lookup, because neither is a literal in the filter text.
+and `del()` all follow the matching keys. **Resolved ([#2800](https://github.com/rust-works/succinctly/issues/2800)):** an
+*unquoted* `*` is part of the name too (`.ab*`, `.*`, `.*c`, `.a**`, `.a*b`), as is a leading digit
+(`.1`), because yq's unquoted field is any run of name bytes; so `.a*2` is the key `a*2`
+and not a product (`.a * 2` is one), and `.a*=2` is `.a* = 2`. A pattern matches a key by its text,
+so `*` also finds `1: y`, `true: t` and `1.5: w` (the generator spells a matching key with
+`tostring` and the ordinary string lookup finds it), and `has(k)` on a mapping compares the key
+text for any scalar `k` (`has(1)`, `has(true)`, `has(1.5)`); a leading-zero literal compares by
+its resolved text (`has(01)` is true here, false in yq, the recorded `01` residual). One gap
+remains: a *computed* string key (`.[ "x?" + "?" ]`) is still an exact lookup, because it is not
+a literal in the filter text. Once a name holds a `*` the rest of the run stays in it, as in yq (`.a*+=3` writes the key `a*+`);
+the operator bytes after a *plain* name still end it, so `.a+1`, `.a%1`, `.a<1`, `.a>1` and `.a@1`
+are operations here and the keys `a+1`, ... in yq ([#4079](https://github.com/rust-works/succinctly/issues/4079)).
 
 A wildcard key costs one pass over the mapping's keys plus one keyed lookup per match, and
 a keyed lookup into a document object is linear in its key count ([#3913](https://github.com/rust-works/succinctly/issues/3913)),

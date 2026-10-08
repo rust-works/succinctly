@@ -3076,17 +3076,27 @@ impl Expr {
         name.bytes().any(|b| matches!(b, b'*' | b'?'))
     }
 
-    /// The key generator behind a wildcard traversal `.["a*"]` (yq mode, #3374):
-    /// every string key of the input mapping that the pattern matches, in
-    /// document order, or the pattern itself as a literal key when none does
-    /// (so a read answers `null` and a write creates the key, as in yq). A
-    /// non-mapping input yields the pattern too, leaving the ordinary
+    /// The key generator behind a wildcard traversal `.["a*"]` (yq mode, #3374, #2800):
+    /// every key of the input mapping whose text the pattern matches, in document order,
+    /// spelled as the string `tostring` gives it (so a typed key -- `1: y`, `true: t` -- is found
+    /// by its text through the ordinary string lookup, as in yq's `matchKey`), or the pattern
+    /// itself as a literal key when none does (so a read answers `null` and a write creates the
+    /// key, as in yq). A non-mapping input yields the pattern too, leaving the ordinary
     /// `cannot index` error to the index step. It is
-    /// `[(try keys_unsorted[] catch empty) | select(type == "!!str" and . == PAT)]
-    /// | if length == 0 then PAT else .[] end`, where yq mode's `==` already
-    /// applies the same glob to its right operand.
+    /// `. as $m | [(try keys_unsorted[] catch empty) | select(. == PAT)
+    ///   | select(type == "!!str" or (tostring as $k | $m | has($k))) | tostring]
+    /// | if length == 0 then PAT else .[] end`, where yq mode's `==` already applies the same
+    /// glob to its right operand.
+    ///
+    /// The `has` guard keeps a typed key out of the matches unless its `tostring` spelling is
+    /// one the string lookup finds: `OwnedValue` has lost the spelling of `0x10` (the number
+    /// 16) and `~` (`null`), so their text cannot be rebuilt and they stay unmatched, as before
+    /// they were matched at all, rather than fabricating a `null` member; an array's indices fail
+    /// it too, which keeps `.*` on a sequence the `cannot index array with string "*"` error.
     #[must_use]
     pub fn yq_wildcard_keys(pattern: &str) -> Self {
+        const MAP: &str = "yq wildcard map";
+        const KEY: &str = "yq wildcard key";
         let pat = || Self::Literal(Literal::String(pattern.into()));
         let keys = Self::Try {
             expr: Box::new(Self::pipe(vec![
@@ -3095,35 +3105,50 @@ impl Expr {
             ])),
             catch: Some(Box::new(Self::Builtin(Builtin::Empty))),
         };
-        let is_matching_string = Self::And(
-            Box::new(Self::Compare {
-                op: CompareOp::Eq,
-                left: Box::new(Self::Builtin(Builtin::Type)),
-                right: Box::new(Self::Literal(Literal::String("!!str".into()))),
-            }),
-            Box::new(Self::Compare {
-                op: CompareOp::Eq,
-                left: Box::new(Self::Identity),
-                right: Box::new(pat()),
-            }),
-        );
+        let is_matching = Self::Compare {
+            op: CompareOp::Eq,
+            left: Box::new(Self::Identity),
+            right: Box::new(pat()),
+        };
+        let is_string = Self::Compare {
+            op: CompareOp::Eq,
+            left: Box::new(Self::Builtin(Builtin::Type)),
+            right: Box::new(Self::Literal(Literal::String("!!str".into()))),
+        };
+        let is_found = Self::As {
+            expr: Box::new(Self::Builtin(Builtin::ToString)),
+            var: KEY.into(),
+            body: Box::new(Self::pipe(vec![
+                Self::Var(MAP.into()),
+                Self::Builtin(Builtin::Has(Box::new(Self::Var(KEY.into())))),
+            ])),
+        };
         let matches = Self::Array(Box::new(Self::pipe(vec![
             keys,
-            Self::Builtin(Builtin::Select(Box::new(is_matching_string))),
+            Self::Builtin(Builtin::Select(Box::new(is_matching))),
+            Self::Builtin(Builtin::Select(Box::new(Self::Or(
+                Box::new(is_string),
+                Box::new(is_found),
+            )))),
+            Self::Builtin(Builtin::ToString),
         ])));
         let none_matched = Self::Compare {
             op: CompareOp::Eq,
             left: Box::new(Self::Builtin(Builtin::Length)),
             right: Box::new(Self::Literal(Literal::Int(0))),
         };
-        Self::pipe(vec![
-            matches,
-            Self::If {
-                cond: Box::new(none_matched),
-                then_branch: Box::new(pat()),
-                else_branch: Box::new(Self::Iterate),
-            },
-        ])
+        Self::As {
+            expr: Box::new(Self::Identity),
+            var: MAP.into(),
+            body: Box::new(Self::pipe(vec![
+                matches,
+                Self::If {
+                    cond: Box::new(none_matched),
+                    then_branch: Box::new(pat()),
+                    else_branch: Box::new(Self::Iterate),
+                },
+            ])),
+        }
     }
 
     /// Create a computed-key index expression: `target[key]`.

@@ -123,6 +123,29 @@ the level reappears inside one and the common `select(.x and .y)` idiom is
 unaffected: `.items[] | select(.name and .value)` filters per element in both
 modes, exactly as in jq.
 
+### Unquoted field names: `*`, `?` and a leading digit (#2800)
+
+Real yq reads an unquoted `.name` as any run of name bytes, so a mapping key is matched
+by its *text* with the same wildcard (`*` zero or more bytes, `?` exactly one) the `==` rule
+below uses, and `succinctly yq` follows:
+
+| Filter (on `abc: 1 / abd: 2 / x: 3 / 1: y`) | `succinctly yq` / `yq` |
+|---------------------------------------------|------------------------|
+| `.ab*`, `.["ab*"]`                          | `1`, `2`               |
+| `.*`                                        | `1`, `2`, `3`, `"y"`   |
+| `.a?c`, `.*c`                               | `1`                    |
+| `.1`, `.["1"]`                              | `"y"`                  |
+| `.a*2`                                      | `null` (the key `a*2`) |
+| `.a * 2`                                    | the product            |
+| `.ab* = 9`                                  | every match written    |
+| `has(1)`                                    | `true`                 |
+
+A space is what makes `*` an operator (`.a * 2`, `.a *2`); `.a*=2` is the assignment `.a* = 2`.
+A pattern finds a typed key by its text too (`*` matches `1: y`, `true: t` and `1.5: w`).
+`succinctly jq` keeps `*` an operator (`.a*2` is a product) and has no digit-leading field.
+Still open: `.[1]`, `.[true]` and `.[null]` as an *index* on a mapping, and names with other
+punctuation (`.a+1`); see [limitations.md](../compliance/yq/limitations.md).
+
 ### `==`/`!=` compare scalars by text, with a wildcard on the right
 
 Real yq's equality is not jq's typed equality (#2785). Between two scalars it

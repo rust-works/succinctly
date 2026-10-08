@@ -56798,3 +56798,169 @@ fn json_string_array(items: &[String]) -> String {
     let quoted: Vec<String> = items.iter().map(|k| format!("\"{k}\"")).collect();
     format!("[{}]", quoted.join(","))
 }
+
+/// #2800: yq's unquoted field is any run of name bytes, `*` and `?` among them, so `.ab*`, `.*`,
+/// `.*c`, `.a**` and `.a*b` are wildcard keys (`matchKey`) and `.1` is the key `1`, where `.a * 2`
+/// -- and only a spaced `*` -- is a product; `.a*=2` is the assignment `.a* = 2`. A pattern
+/// matches a key by its text, so `*` finds `1: y`, `true: t` and `1.5: w` as well as the string
+/// keys, and `has(k)` on a mapping compares the key text for any scalar argument. Every row
+/// captured from yq v4.53.3 with `-o=json -I=0`.
+#[test]
+fn test_yq_bare_wildcard_field_and_text_keys_2800() -> Result<()> {
+    let rows: &[(&str, &str, &str)] = &[
+        ("abc: 1\nabd: 2\nx: 3\n1: y\n", ".ab*", "1\n2\n"),
+        ("abc: 1\nabd: 2\nx: 3\n1: y\n", ".*", "1\n2\n3\n\"y\"\n"),
+        ("abc: 1\nabd: 2\nx: 3\n1: y\n", "[.*] | length", "4\n"),
+        ("abc: 1\nabd: 2\nx: 3\n1: y\n", ".*c", "1\n"),
+        ("abc: 1\nabd: 2\nx: 3\n1: y\n", ".a**", "1\n2\n"),
+        ("abc: 1\nabd: 2\nx: 3\n1: y\n", ".ab*?", "1\n2\n"),
+        ("abc: 1\nabd: 2\nx: 3\n1: y\n", ".ab?", "null\n"),
+        ("abc: 1\nabd: 2\nx: 3\n1: y\n", ".a*b", "null\n"),
+        ("abc: 1\nabd: 2\nx: 3\n1: y\n", ".1", "\"y\"\n"),
+        ("abc: 1\nabd: 2\nx: 3\n1: y\n", ".ab*|length", "1\n1\n"),
+        (
+            "abc: 1\nabd: 2\nx: 3\n1: y\n",
+            ".ab* = 9",
+            "{\"abc\":9,\"abd\":9,\"x\":3,\"1\":\"y\"}\n",
+        ),
+        (
+            "abc: 1\nabd: 2\nx: 3\n1: y\n",
+            ".*c = 0",
+            "{\"abc\":0,\"abd\":2,\"x\":3,\"1\":\"y\"}\n",
+        ),
+        (
+            "abc: 1\nabd: 2\nx: 3\n1: y\n",
+            ".ab* |= . + 10",
+            "{\"abc\":11,\"abd\":12,\"x\":3,\"1\":\"y\"}\n",
+        ),
+        (
+            "abc: 1\nabd: 2\nx: 3\n1: y\n",
+            "del(.ab*)",
+            "{\"x\":3,\"1\":\"y\"}\n",
+        ),
+        (
+            "abc: 1\nabd: 2\nx: 3\n1: y\n",
+            ".1 = \"z\"",
+            "{\"abc\":1,\"abd\":2,\"x\":3,\"1\":\"z\"}\n",
+        ),
+        ("abc: 1\nabd: 2\nx: 3\n1: y\n", ".a?c", "1\n"),
+        ("abc: 1\nabd: 2\nx: 3\n1: y\n", ". | .1", "\"y\"\n"),
+        (
+            "abc: 1\nabd: 2\nx: 3\n1: y\n",
+            ".ab* | key",
+            "\"abc\"\n\"abd\"\n",
+        ),
+        (
+            "abc: 1\nx: 3\n1: y\ntrue: t\n1.5: w\n",
+            ".*",
+            "1\n3\n\"y\"\n\"t\"\n\"w\"\n",
+        ),
+        (
+            "abc: 1\nx: 3\n1: y\ntrue: t\n1.5: w\n",
+            "[.*] | length",
+            "5\n",
+        ),
+        (
+            "abc: 1\nx: 3\n1: y\ntrue: t\n1.5: w\n",
+            ".[\"*\"]",
+            "1\n3\n\"y\"\n\"t\"\n\"w\"\n",
+        ),
+        (
+            "abc: 1\nx: 3\n1: y\ntrue: t\n1.5: w\n",
+            ".[\"1*\"]",
+            "\"y\"\n\"w\"\n",
+        ),
+        (
+            "abc: 1\nx: 3\n1: y\ntrue: t\n1.5: w\n",
+            ".[\"tr*\"]",
+            "\"t\"\n",
+        ),
+        (
+            "abc: 1\nx: 3\n1: y\ntrue: t\n1.5: w\n",
+            ".[\"1.*\"]",
+            "\"w\"\n",
+        ),
+        (
+            "abc: 1\nx: 3\n1: y\ntrue: t\n1.5: w\n",
+            ".* = 0",
+            "{\"abc\":0,\"x\":0,\"1\":0,\"true\":0,\"1.5\":0}\n",
+        ),
+        (
+            "abc: 1\nx: 3\n1: y\ntrue: t\n1.5: w\n",
+            ".[\"*\"] |= tostring",
+            "{\"abc\":\"1\",\"x\":\"3\",\"1\":\"y\",\"true\":\"t\",\"1.5\":\"w\"}\n",
+        ),
+        ("abc: 1\nx: 3\n1: y\ntrue: t\n1.5: w\n", "has(1)", "true\n"),
+        (
+            "abc: 1\nx: 3\n1: y\ntrue: t\n1.5: w\n",
+            "has(true)",
+            "true\n",
+        ),
+        (
+            "abc: 1\nx: 3\n1: y\ntrue: t\n1.5: w\n",
+            "has(1.5)",
+            "true\n",
+        ),
+        ("abc: 1\nx: 3\n1: y\ntrue: t\n1.5: w\n", "has(2)", "false\n"),
+        (
+            "abc: 1\nx: 3\n1: y\ntrue: t\n1.5: w\n",
+            "has(\"1\")",
+            "true\n",
+        ),
+        (
+            "abc: 1\nx: 3\n1: y\ntrue: t\n1.5: w\n",
+            "has(\"zz\")",
+            "false\n",
+        ),
+        (
+            "abc: 1\nx: 3\n1: y\ntrue: t\n1.5: w\n",
+            "[has(1), has(2)]",
+            "[true,false]\n",
+        ),
+        ("a: 3\nb: 4\n", ".a * 2", "6\n"),
+        ("a: 3\nb: 4\n", ".a *2", "6\n"),
+        ("a: 3\nb: 4\n", ".a*=2", "{\"a\":2,\"b\":4}\n"),
+        ("a: 3\nb: 4\n", ".a * .b", "12\n"),
+        (
+            "a: 3\nb: 4\n",
+            ". * {\"z\": 1}",
+            "{\"a\":3,\"b\":4,\"z\":1}\n",
+        ),
+        ("a: 3\nb: 4\n", ".[] * 2", "6\n8\n"),
+        ("a: 1\nab: 2\n", ".a*+=3", "{\"a\":1,\"ab\":2,\"a*+\":3}\n"),
+        ("a: 1\nab: 2\n", ".a*<1", "null\n"),
+        ("a: 1\nab: 2\n", ".a*%2", "null\n"),
+        ("a: 1\nab: 2\n", ".a*$x", "null\n"),
+        ("a: 1\nab: 2\n", ".a*2", "null\n"),
+        ("a: 1\nab: 2\n", ".a*=3", "{\"a\":3,\"ab\":3}\n"),
+        ("a: 1\nab: 2\n", ".a*?=3", "{\"a\":3,\"ab\":3}\n"),
+        ("a: 1\nab: 2\n", ".a*n=3", "{\"a\":1,\"ab\":2,\"a*n\":3}\n"),
+    ];
+    for &(doc, filter, expected) in rows {
+        let (stdout, code) = run_yq_stdin(filter, doc, &["-o", "json", "-I", "0"])?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (expected, 0),
+            "`{filter}` on {doc:?}"
+        );
+    }
+
+    // What stays different from yq: a key whose spelling the owned value has lost (`0x10` is the
+    // number 16, `null:` is `null`) is not matched by a pattern (yq matches its text `0x10`,
+    // `null`), and is left out rather than answered with a `null`; a pattern on a sequence is
+    // still the `cannot index` error, worded as for any string key.
+    let (stdout, code) = run_yq_stdin(
+        ".*",
+        "1.0: a\n0x10: h\nnull: n\nb: 2\n",
+        &["-o", "json", "-I", "0"],
+    )?;
+    assert_eq!((stdout.as_str(), code), ("\"a\"\n2\n", 0));
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr(".*", "- a\n- b\n", &["-o", "json", "-I", "0"])?;
+    assert_eq!((stdout.as_str(), code), ("", 1));
+    assert!(
+        stderr.contains("Cannot index array with string \"*\""),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}

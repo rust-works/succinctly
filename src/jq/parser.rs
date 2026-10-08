@@ -1340,19 +1340,35 @@ impl<'a> Parser<'a> {
     fn parse_field_ident(&mut self) -> Result<String, ParseError> {
         // Yq accepts an empty name before the optional marker (`.?`), and
         // a leading `?` can itself be part of a longer unquoted name (`.??`).
-        let mut name = if self.mode == ParserMode::Yq && self.peek() == Some('?') {
-            String::new()
-        } else {
-            self.parse_ident()?
-        };
+        // #2800: a leading `*` (`.*`, `.*c`, `.**`) and a leading digit (`.1`) start a name
+        // too: real yq's unquoted field is any run of the bytes below, so `.ab*` and `.a*b` are
+        // wildcard keys (`matchKey`) and `.1` is the key `1`, where `.a*2` is the key `a*2`
+        // and not a product (`.a * 2` is).
+        let mut name =
+            if self.mode == ParserMode::Yq && matches!(self.peek(), Some('?' | '*' | '0'..='9')) {
+                String::new()
+            } else {
+                self.parse_ident()?
+            };
         if self.mode != ParserMode::Yq {
             return Ok(name);
         }
 
         let suffix_start = self.pos;
+        // #2800: a name that holds a `*` is a wildcard pattern, and there yq keeps the rest of the
+        // run too (`.a*+=3` writes the key `a*+`), where the operator bytes after a plain name
+        // still end it (`.a+1` is a sum here; in yq it is the key `a+1`, #4079).
+        let mut wildcard = name.contains('*');
         while self.peek().is_some_and(|c| {
-            c.is_alphanumeric() || matches!(c, '_' | '-' | '/' | '?' | '\t' | '\r' | '\u{a0}')
+            c.is_alphanumeric()
+                || matches!(c, '_' | '-' | '/' | '?' | '*' | '\t' | '\r' | '\u{a0}')
+                || (wildcard
+                    && matches!(
+                        c,
+                        '+' | '%' | '<' | '>' | '@' | '#' | '~' | '^' | '&' | '$' | '\''
+                    ))
         }) {
+            wildcard |= self.peek() == Some('*');
             self.next();
         }
         if self.pos > suffix_start && self.input.as_bytes()[self.pos - 1] == b'?' {
@@ -2904,10 +2920,13 @@ impl<'a> Parser<'a> {
                 }
 
                 // Check for identity (just `.`)
+                //
+                // #2800: `.*` and `.*c` are a wildcard key in yq (no space after the dot, which is
+                // what tells them from `. * 2`), so the `*` is not a multiplication here.
                 if (self.is_eof() || self.is_expr_terminator())
                     && !(self.mode == ParserMode::Yq
                         && self.pos == dot_end
-                        && self.peek() == Some('?'))
+                        && matches!(self.peek(), Some('?' | '*')))
                 {
                     self.last_primary_is_term = true; // #3038: leaf Term
                     return Ok(Expr::Identity);
@@ -11425,6 +11444,45 @@ mod tests {
             parse_with_mode(".my-key?", ParserMode::Yq).unwrap(),
             Expr::Optional(Box::new(Expr::Field("my-key".into())))
         );
+    }
+
+    /// #2800: in yq mode `*` and a leading digit belong to an unquoted field name, so `.ab*`,
+    /// `.*`, `.*c`, `.a*2` and `.1` are keys (the pattern ones wildcard generators) where a spaced
+    /// `*` is a product; jq mode is unchanged.
+    #[test]
+    fn test_yq_bare_wildcard_and_digit_fields_2800() {
+        let yq = |s: &str| parse_with_mode(s, ParserMode::Yq).unwrap();
+        let wildcard = |p: &str| Expr::index_by(Expr::Identity, Expr::yq_wildcard_keys(p));
+        for (src, expected) in [
+            (".ab*", wildcard("ab*")),
+            (".*", wildcard("*")),
+            (".*c", wildcard("*c")),
+            (".a**", wildcard("a**")),
+            (".a*b", wildcard("a*b")),
+            (".a*2", wildcard("a*2")),
+            (".1", Expr::Field("1".into())),
+            (".12ab", Expr::Field("12ab".into())),
+        ] {
+            assert_eq!(yq(src), expected, "{src}");
+        }
+        // The optional marker still follows a wildcard name, and a gap still makes a product.
+        assert_eq!(yq(".ab*?"), Expr::Optional(Box::new(wildcard("ab*"))));
+        for src in [".a * 2", ".a *2", ". * 2", ".a *= 2"] {
+            let parsed = yq(src);
+            assert!(
+                matches!(
+                    parsed,
+                    Expr::Arithmetic { .. } | Expr::Assign { .. } | Expr::CompoundAssign { .. }
+                ),
+                "{src} parses as {parsed:?}"
+            );
+        }
+        // `.a*=2` is `.a* = 2`: the `=` ends the name.
+        assert!(matches!(yq(".a*=2"), Expr::Assign { .. }));
+        // jq mode keeps `*` an operator and has no digit-leading field.
+        let jq = |s: &str| parse_with_mode(s, ParserMode::Jq);
+        assert!(matches!(jq(".a*2").unwrap(), Expr::Arithmetic { .. }));
+        assert!(jq(".1").is_err());
     }
 
     #[test]
