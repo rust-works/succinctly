@@ -2146,7 +2146,9 @@ pub(crate) fn yq_dedup_key<S: EvalSemantics>(value: Option<&OwnedValue>, groupin
 /// yq mode only (#2799): keep the first element of each distinct key, in input order -- yq's
 /// `unique` family is an ordered map on [`yq_dedup_key`], not a sort followed by a dedup.
 pub(crate) fn yq_first_of_each_key<T>(keyed: Vec<(String, T)>) -> Vec<T> {
-    let mut seen: BTreeSet<String> = BTreeSet::new();
+    // A hashed set, not a `BTreeSet`: one probe per element instead of a tree walk of string
+    // compares, which is what made the first cut of this +94% on a million distinct integers.
+    let mut seen: indexmap::IndexSet<String> = indexmap::IndexSet::with_capacity(keyed.len());
     let mut out = Vec::with_capacity(keyed.len());
     for (key, item) in keyed {
         if seen.insert(key) {
@@ -2159,18 +2161,11 @@ pub(crate) fn yq_first_of_each_key<T>(keyed: Vec<(String, T)>) -> Vec<T> {
 /// yq mode only (#2799): group elements by [`yq_dedup_key`], groups in order of their first
 /// occurrence and members in input order (`[3,1,2,1] | group_by(.)` is `[[3],[1,1],[2]]`).
 pub(crate) fn yq_group_in_order<T>(keyed: Vec<(String, T)>) -> Vec<Vec<T>> {
-    let mut index: BTreeMap<String, usize> = BTreeMap::new();
-    let mut groups: Vec<Vec<T>> = Vec::new();
+    let mut groups: indexmap::IndexMap<String, Vec<T>> = indexmap::IndexMap::new();
     for (key, item) in keyed {
-        match index.get(&key) {
-            Some(&at) => groups[at].push(item),
-            None => {
-                index.insert(key, groups.len());
-                groups.push(vec![item]);
-            }
-        }
+        groups.entry(key).or_default().push(item);
     }
-    groups
+    groups.into_values().collect()
 }
 
 /// Order two `[f]` keys exactly as `compare_values` orders the
