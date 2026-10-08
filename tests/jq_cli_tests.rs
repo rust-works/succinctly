@@ -72928,9 +72928,10 @@ fn test_foreach_update_comma_with_a_bare_builtin_sibling_3960() -> Result<()> {
 }
 
 /// #3960, what the fix leaves. A sibling that can hand its input (or an element of it) back by
-/// pointer (`abs`, `ltrimstr`, `min`), one that is `explode | map(..) | implode` in jq so raises
-/// a path error on a derived input (`ascii_downcase?`, #2743), and a pipe of non-navigating stages
-/// (`(.|.)`) still refuse loudly, where jq writes. Update the expectations when those are fixed.
+/// pointer (`ltrimstr`, `min`; `abs` answers since #4041), one that is `explode | map(..) |
+/// implode` in jq so raises a path error on a derived input (`ascii_downcase?`, #2743), and a pipe
+/// of non-navigating stages (`(.|.)`) still refuse loudly, where jq writes. Update the
+/// expectations when those are fixed.
 /// Every row captured from jq 1.7.1 with `-c`: `del` writes `{"a":{"c":[1,2]},"z":0}` in all but
 /// `ascii_downcase?`, which leaves the document alone.
 #[test]
@@ -72938,13 +72939,6 @@ fn test_foreach_update_comma_bare_builtin_exclusions_characterize_3960() -> Resu
     let doc = r#"{"a":{"b":1,"c":[1,2]},"z":0}"#;
     let refusal = "Invalid path expression near attempt to access element \"b\"";
     assert_path_rows_3289(&[
-        (
-            doc,
-            r"del(foreach .a as $v (0; (($v | .b?), abs); try ($v | .b?)))",
-            "",
-            refusal,
-            5,
-        ),
         (
             doc,
             r#"del(foreach .a as $v ("abc"; (($v | .b?), ltrimstr("x")); try ($v | .b?)))"#,
@@ -73287,61 +73281,417 @@ fn test_foreach_update_register_neutral_shapes_leave_the_register_4028() -> Resu
     ])
 }
 
-/// #4028, what the fix leaves. A pipe stage after a comma that has a navigating sibling
-/// (`(($v|.b?), now) | floor`) and a bare builtin that can hand its input back by pointer (`abs`)
-/// still skip the write silently, where jq writes (the `// jq:` line on each row). Update the
-/// expectations when those are fixed.
+/// #4041, what #4028 left: a `foreach` UPDATE that is a pipe stage after a comma with a navigating
+/// sibling (`(($v|.b?), now) | floor`), a bare `abs`, and a neutral builtin inside an `if`, an
+/// array or a `catch` handler. Each leaves jq's register where the body entered it, so the EXTRACT
+/// (`try ($v | .b?)`) runs from `.a` and a write through it lands; the register analysis read only
+/// a comma, a pipe, `//` and the `?`/`try`/`first` wrappers over them, and the `try` swallowed the
+/// refusal into a skipped write with exit 0. The rows that still refuse are the controls: a
+/// sibling that navigated and then computed (`(.a|length)`) has moved the register, a pipe stage
+/// that navigates is a navigation, and jq refuses all of them too. Every row captured from jq
+/// 1.7.1 with `-c`, for `del`, `=` and `path`.
 #[test]
-fn test_foreach_update_register_neutral_shapes_exclusions_characterize_4028() -> Result<()> {
+fn test_foreach_update_register_neutral_shapes_after_a_navigating_comma_4041() -> Result<()> {
     let doc = r#"{"a":{"b":1,"c":[1,2]},"z":0}"#;
     assert_path_rows_3289(&[
-        // jq: {"a":{"c":[1,2]},"z":0}
         (
             doc,
             r"del(foreach .a as $v (0; (($v|.b?), now) | floor; try ($v | .b?)))",
-            "{\"a\":{\"b\":1,\"c\":[1,2]},\"z\":0}\n",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
             "",
             0,
         ),
-        // jq: {"a":{"b":9,"c":[1,2]},"z":0}
         (
             doc,
             r"(foreach .a as $v (0; (($v|.b?), now) | floor; try ($v | .b?))) = 9",
-            "{\"a\":{\"b\":1,\"c\":[1,2]},\"z\":0}\n",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
             "",
             0,
         ),
-        // jq: [["a","b"]]
         (
             doc,
             r"[path(foreach .a as $v (0; (($v|.b?), now) | floor; try ($v | .b?)))]",
-            "[]\n",
+            "[[\"a\",\"b\"]]\n",
             "",
             0,
         ),
-        // jq: {"a":{"c":[1,2]},"z":0}
+        (
+            doc,
+            r"del(foreach .a as $v (0; (($v|.b?), now) | floor | floor; try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; (($v|.b?), now) | floor | floor; try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; (($v|.b?), now) | floor | floor; try ($v | .b?)))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; (($v|.b?), now) | tostring | length; try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; (($v|.b?), now) | tostring | length; try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; (($v|.b?), now) | tostring | length; try ($v | .b?)))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; ((($v|.b?), now), floor) | floor; try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; ((($v|.b?), now), floor) | floor; try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; ((($v|.b?), now), floor) | floor; try ($v | .b?)))]",
+            "[[\"a\",\"b\"],[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; (($v|.b?), (.c?, now)) | floor; try ($v | .b?)))",
+            "",
+            "Invalid path expression near attempt to access element \"c\"",
+            5,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; (($v|.b?), (.c?, now)) | floor; try ($v | .b?))) = 9",
+            "",
+            "Invalid path expression near attempt to access element \"c\"",
+            5,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; (($v|.b?), (.c?, now)) | floor; try ($v | .b?)))]",
+            "",
+            "Invalid path expression near attempt to access element \"c\"",
+            5,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; (($v|.b?), now) | (floor, ceil); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; (($v|.b?), now) | (floor, ceil); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; (($v|.b?), now) | (floor, ceil); try ($v | .b?)))]",
+            "[[\"a\",\"b\"],[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
         (
             doc,
             r"del(foreach .a as $v (0; abs; try ($v | .b?)))",
-            "{\"a\":{\"b\":1,\"c\":[1,2]},\"z\":0}\n",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
             "",
             0,
         ),
-        // jq: {"a":{"b":9,"c":[1,2]},"z":0}
         (
             doc,
             r"(foreach .a as $v (0; abs; try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; abs; try ($v | .b?)))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; (($v|.b?), 1) | abs; try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; (($v|.b?), 1) | abs; try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; (($v|.b?), 1) | abs; try ($v | .b?)))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; if . then now else floor end; try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; if . then now else floor end; try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; if . then now else floor end; try ($v | .b?)))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; if (.a?, 1) then now else floor end; try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; if (.a?, 1) then now else floor end; try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; if (.a?, 1) then now else floor end; try ($v | .b?)))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; [now]; try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; [now]; try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; [now]; try ($v | .b?)))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; [now, floor]; try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; [now, floor]; try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; [now, floor]; try ($v | .b?)))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; try now catch 0; try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; try now catch 0; try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; try now catch 0; try ($v | .b?)))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r#"del(foreach .a as $v (0; try error("e") catch now; try ($v | .b?)))"#,
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r#"(foreach .a as $v (0; try error("e") catch now; try ($v | .b?))) = 9"#,
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r#"[path(foreach .a as $v (0; try error("e") catch now; try ($v | .b?)))]"#,
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (.; ((.a|length), now) | floor; try ($v | .b?)))",
+            "",
+            "Invalid path expression near attempt to access element \"a\"",
+            5,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (.; ((.a|length), now) | floor; try ($v | .b?))) = 9",
+            "",
+            "Invalid path expression near attempt to access element \"a\"",
+            5,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (.; ((.a|length), now) | floor; try ($v | .b?)))]",
+            "",
+            "Invalid path expression near attempt to access element \"a\"",
+            5,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (.; ((.z|tostring), now) | length; try ($v | .b?)))",
+            "",
+            "Invalid path expression near attempt to access element \"z\"",
+            5,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (.; ((.z|tostring), now) | length; try ($v | .b?))) = 9",
+            "",
+            "Invalid path expression near attempt to access element \"z\"",
+            5,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (.; ((.z|tostring), now) | length; try ($v | .b?)))]",
+            "",
+            "Invalid path expression near attempt to access element \"z\"",
+            5,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; (($v|.b?), now) | $v; try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; (($v|.b?), now) | $v; try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; (($v|.b?), now) | $v; try ($v | .b?)))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; if . then $v|.b else 1 end; try ($v | .b?)))",
             "{\"a\":{\"b\":1,\"c\":[1,2]},\"z\":0}\n",
             "",
             0,
         ),
-        // jq: [["a","b"]]
         (
             doc,
-            r"[path(foreach .a as $v (0; abs; try ($v | .b?)))]",
+            r"(foreach .a as $v (0; if . then $v|.b else 1 end; try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":1,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; if . then $v|.b else 1 end; try ($v | .b?)))]",
             "[]\n",
             "",
             0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; (($v|.b?), now) | floor; .))",
+            "",
+            "Invalid path expression with result 1",
+            5,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; (($v|.b?), now) | floor; .)) = 9",
+            "",
+            "Invalid path expression with result 1",
+            5,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; (($v|.b?), now) | floor; .))]",
+            "",
+            "Invalid path expression with result 1",
+            5,
         ),
     ])
 }

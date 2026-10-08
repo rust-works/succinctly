@@ -40468,8 +40468,10 @@ fn carry_register_when<'a>(
 ///   [`neutral_leaves_register`] reads. `first`, `limit`, `?`, `try` and `//` are read through
 ///   (#4028), each leaf held to this list.
 /// - Nothing that can hand its input or an element of it back by pointer, which the model cannot
-///   represent (a `try` then swallows the refusal into a skipped write): `abs`, `ltrimstr`,
-///   `rtrimstr`, `min`, `max`, `get_search_list`, `builtins`, `input_filename`.
+///   represent (a `try` then swallows the refusal into a skipped write): `ltrimstr`, `rtrimstr`,
+///   `min`, `max`, `get_search_list`, `builtins`, `input_filename`. (`abs` is `if . < 0 then - .
+///   else . end`: it hands its input back too, but only ever the input it was given, which a
+///   register-neutral stage cannot have moved, #4041.)
 /// - Nothing that raises a path error on a derived input: `ascii_downcase`, `ascii_upcase` are
 ///   `explode | map(..) | implode` in jq (#2743).
 /// - Nothing jq 1.7.1 does not define (`trim`, `ltrim`, `rtrim`, `toboolean`).
@@ -40523,6 +40525,7 @@ fn is_bare_register_neutral_builtin(expr: &Expr) -> bool {
             | Builtin::Fromdateiso8601
             | Builtin::Explode
             | Builtin::Implode
+            | Builtin::Abs
             | Builtin::Sort => true,
             Builtin::Pow(a, b) | Builtin::Atan2(a, b) | Builtin::Libm2(_, a, b) => {
                 literal(a) && literal(b)
@@ -40555,7 +40558,10 @@ fn operand_leaves_register(operand: &Expr) -> bool {
 /// [`peel_register_transparent`] passes the register through. jq's register is where the
 /// expression entered it exactly when every leaf of those shapes left it there, so the shape
 /// is neutral when each part is, and anything else is judged by [`cannot_move_register`]
-/// alone -- an `if`, an array, a `reduce` holding a neutral builtin is not read.
+/// alone, except for the three the register reads through themselves (#4041): an `if`, whose
+/// branches are held to this and whose condition is a subexp; an array, which jq's collect
+/// backtracks, so it is neutral when its contents are; and a `try ... catch`, whose handler runs
+/// after the fork restored the register. A `reduce` holding a neutral builtin is not read.
 ///
 /// Not a widening of [`cannot_move_register`]: that predicate is read by pipe stages and binds
 /// too, and a larger set routed programs into their holes (#3982, #3984). Asked only where a
@@ -40577,8 +40583,76 @@ fn neutral_leaves_register(expr: &Expr) -> bool {
         Expr::Alternative(left, right) => {
             neutral_leaves_register(left) && neutral_leaves_register(right)
         }
+        // #4041: only the condition of an `if` is a subexp, so each branch that runs is read
+        // the way a stage is; a collect backtracks to where it began, so `[E]` is as neutral
+        // as `E`; a handler runs after the fork restored the register, so a neutral body and
+        // a neutral handler leave it where the `try` entered.
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => neutral_leaves_register(then_branch) && neutral_leaves_register(else_branch),
+        Expr::Array(inner) => neutral_leaves_register(inner),
+        Expr::Try {
+            expr: body,
+            catch: Some(handler),
+        } => {
+            (body_always_raises(body) || neutral_leaves_register(body))
+                && neutral_leaves_register(handler)
+        }
         other => cannot_move_register(other),
     }
+}
+
+/// A fold's UPDATE `P | (A, B) | F` as `P | ((A | F), (B | F))` when `F` (every stage after the
+/// comma) is [`neutral_leaves_register`] and the comma is not (#4041).
+///
+/// The two read the same in jq -- `|` feeds each output of its left side through its right
+/// before backtracking into the left, which is the order the distributed form runs in -- but
+/// only the second states the register the way [`FoldRegister::advance`] reads it: a comma
+/// states its register per sibling ([`carry_comma_sibling_register`]), and a stage after the
+/// comma is resolved by the stage machinery, which drops the statement a neutral builtin
+/// leaves unread (`(($v|.b?), now) | floor` skipped the write where `(($v|.b?)|floor),
+/// (now|floor)` did not). Each distributed sibling is then judged on its own: the neutral ones
+/// leave the register, the navigating ones keep whatever they said before. Nested commas are
+/// distributed in turn. Jq mode only, like every register admission here (ADR-0018).
+fn distribute_neutral_tail(update: &Expr) -> Option<Expr> {
+    let Expr::Pipe(stages) = unwrap_paren(update) else {
+        return None;
+    };
+    let at = (0..stages.len().saturating_sub(1)).rev().find(|&k| {
+        matches!(unwrap_paren(&stages[k]), Expr::Comma(_))
+            && !neutral_leaves_register(&stages[k])
+            && stages[k + 1..].iter().all(neutral_leaves_register)
+    })?;
+    let Expr::Comma(items) = unwrap_paren(&stages[at]) else {
+        return None;
+    };
+    let tail = &stages[at + 1..];
+    let siblings = items
+        .iter()
+        .map(|item| {
+            let head = match item {
+                Expr::Paren(_) => item.clone(),
+                other => Expr::Paren(Box::new(other.clone())),
+            };
+            let piped = Expr::Pipe(
+                core::iter::once(head)
+                    .chain(tail.iter().cloned())
+                    .collect::<PipeStages>(),
+            );
+            let piped = distribute_neutral_tail(&piped).unwrap_or(piped);
+            Expr::Paren(Box::new(piped))
+        })
+        .collect();
+    let comma = Expr::Paren(Box::new(Expr::Comma(siblings)));
+    Some(if at == 0 {
+        comma
+    } else {
+        let mut head: Vec<Expr> = stages[..at].to_vec();
+        head.push(comma);
+        Expr::Pipe(head.into())
+    })
 }
 
 /// Flatten path components into one `Expr`, using `Expr::Pipe` only when
@@ -50401,6 +50475,11 @@ fn resolve_foreach<'a, S: EvalSemantics>(
     keep: Keep,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
+    // #4041: read UPDATE with a neutral tail pushed into the siblings of a comma it follows.
+    let distributed = (S::TAG == EvalTag::Jq)
+        .then(|| distribute_neutral_tail(update))
+        .flatten();
+    let update = distributed.as_ref().unwrap_or(update);
     // #4013: see `FoldRegister::enter`. Jq mode only, like every register admission here.
     let init_keeps_register = S::TAG != EvalTag::Jq || cannot_move_register(init);
     // #3761: `resolve_reduce`'s #3710 rule for `foreach`. A computed emission is
@@ -133792,14 +133871,15 @@ mod touched_edge_cases_2999 {
             ("try (($w | .a), first(.b))", false),
             ("try (($w | .a), .b)", false),
             ("try (($w | .a), .[]?)", false),
-            // A bare register-neutral builtin is read by the comma itself (#3960); one the
-            // register analysis does not list and that can hand its input back by pointer
-            // (`abs`) is not one, nor is a call or a navigation that wraps something else,
-            // so the register stays withheld.
+            // A bare register-neutral builtin is read by the comma itself (#3960, `abs` since
+            // #4041); one the register analysis does not list and that can hand its input back
+            // by pointer (`min`) is not one, nor is a call or a navigation that wraps something
+            // else, so the register stays withheld.
             ("try (($w | .a), now)", false),
             ("try (($w | .a), input_line_number)", false),
             ("try (($w | .a), floor)", false),
-            ("try (($w | .a), abs)", true),
+            ("try (($w | .a), abs)", false),
+            ("try (($w | .a), min)", true),
             ("try (($w | .a), pow(.; 2))", true),
             ("try (($w | .a), (.a | length))", false),
             ("try (($w | .a), .a[.b])", true),
@@ -133886,6 +133966,21 @@ mod neutral_leaves_register_tests_4028 {
             "try error(.a)",
             "(1, try error(.a))",
             "(1, (try error(.a))?)",
+            // #4041: `abs` is `if . < 0 then - . else . end`, which navigates nothing.
+            "abs",
+            "now, abs",
+            "(now | abs)",
+            // #4041: only an `if`'s condition is a subexp, a collect backtracks, and a handler runs
+            // after the fork restored the register; each is neutral when what runs is.
+            "if . then now else floor end",
+            "if .a then now else 1 end",
+            "if . then now end",
+            "[now]",
+            "[now, floor]",
+            "[]",
+            "try now catch 0",
+            "try error(.a) catch now",
+            "(try now catch (floor | floor))",
         ] {
             let expr = parse(src).unwrap();
             assert!(neutral_leaves_register(&expr), "`{src}` is neutral");
@@ -133900,20 +133995,107 @@ mod neutral_leaves_register_tests_4028 {
             "now | .a",
             "now, .a",
             "now // .a",
-            "abs",
-            "now, abs",
-            "(now | abs)",
             "pow(.; 2)",
-            "if . then now else floor end",
-            // Not read: an `if`, an array or a handler around neutral leaves is judged by
-            // `cannot_move_register` alone (a limit, not a jq-verified refusal).
-            "[now]",
+            // A branch, an element or a handler that navigates is a navigation.
+            "if . then .a else 1 end",
+            "if . then 1 else .a end",
+            "[.a]",
+            "[now, .a]",
             "try now catch .a",
+            "try .a catch now",
             "first(.a)",
             "ascii_downcase",
+            // Not read: the other builtins that can hand their input back by pointer (a limit,
+            // not a jq-verified refusal).
+            "min",
+            "ltrimstr(\"x\")",
         ] {
             let expr = parse(src).unwrap();
             assert!(!neutral_leaves_register(&expr), "`{src}` is not neutral");
+        }
+    }
+
+    /// `expr`'s debug text with every `Paren(..)` wrapper removed, so a rewrite is compared on
+    /// shape and not on the parentheses it happens to add.
+    fn without_parens(expr: &Expr) -> String {
+        let text = format!("{expr:?}");
+        let mut out = String::new();
+        let mut closers: Vec<bool> = Vec::new();
+        let mut rest = text.as_str();
+        while let Some(c) = rest.chars().next() {
+            if let Some(after) = rest.strip_prefix("Paren(") {
+                closers.push(true);
+                rest = after;
+                continue;
+            }
+            if c == '(' {
+                closers.push(false);
+            } else if c == ')' && closers.pop() == Some(true) {
+                rest = &rest[1..];
+                continue;
+            }
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
+        }
+        out
+    }
+
+    // #4041: `P | (A, B) | F` is `P | ((A | F), (B | F))` for a neutral `F` after a comma that is
+    // not neutral itself, and nothing else is rewritten. The rewrite is compared as the text the
+    // parser gives for the distributed program, so a change of shape shows up here.
+    #[test]
+    fn a_neutral_tail_is_pushed_into_the_siblings_of_the_comma_it_follows() {
+        for (src, distributed) in [
+            ("(.a, now) | floor", "((.a | floor), (now | floor))"),
+            (
+                "(.a, now) | floor | abs",
+                "((.a | floor | abs), (now | floor | abs))",
+            ),
+            (
+                "(.a, now) | (floor, ceil)",
+                "((.a | (floor, ceil)), (now | (floor, ceil)))",
+            ),
+            ("1 | (.a, now) | floor", "1 | ((.a | floor), (now | floor))"),
+            // The last comma with a neutral tail is the one distributed over.
+            (
+                "(.a, now) | (.b, now) | floor",
+                "(.a, now) | ((.b | floor), (now | floor))",
+            ),
+            // A nested comma is distributed in turn.
+            (
+                "(.a, (.b, now)) | floor",
+                "((.a | floor), ((.b | floor), (now | floor)))",
+            ),
+        ] {
+            let expr = parse(src).unwrap();
+            let want = parse(distributed).unwrap();
+            let got = distribute_neutral_tail(&expr).unwrap_or_else(|| panic!("`{src}` rewrites"));
+            assert_eq!(without_parens(&got), without_parens(&want), "`{src}`");
+        }
+    }
+
+    #[test]
+    fn nothing_else_is_pushed_anywhere() {
+        for src in [
+            // No comma, or the comma is the last stage.
+            ".a | floor",
+            "(.a, now)",
+            "floor | (.a, now)",
+            // The comma is neutral on its own: nothing to gain.
+            "(now, floor) | abs",
+            // A tail that navigates, or holds an unlisted builtin.
+            "(.a, now) | .b",
+            "(.a, now) | floor | .b",
+            "(.a, now) | min",
+            // Not a pipe.
+            "(.a, now)",
+            "now",
+        ] {
+            let expr = parse(src).unwrap();
+            assert!(
+                distribute_neutral_tail(&expr).is_none(),
+                "`{src}` is left alone"
+            );
         }
     }
 }
