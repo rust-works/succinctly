@@ -1,0 +1,16 @@
+a: 1
+b: "1"
+c: true
+d: "true"
+n: null
+s: "null"
+f: 1.0
+h: "1.0"
+l: [1]
+l2: [1]
+m: {x: 1}
+m2: {x: 1}
+z: [2]
+nn: .nan
+na: [.nan]
+nb: [.nan]

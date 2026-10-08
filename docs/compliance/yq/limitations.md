@@ -4201,7 +4201,7 @@ Two rendering divergences, both readable back and both pinned:
   tagged scalar whose cursor reports a quoted style (`a: !!int "5"`, #747) keeps its
   current (already divergent, pre-#798) rendering.
 
-### Scalar `==`/`!=` compare by text with a wildcard -- resolved ([#2785](https://github.com/rust-works/succinctly/issues/2785)); the dedup builtins and lost spellings remain
+### Scalar `==`/`!=` compare by text with a wildcard -- resolved ([#2785](https://github.com/rust-works/succinctly/issues/2785)); lost spellings remain
 
 Real yq's `==`/`!=` is not typed equality. `isEquals` (`pkg/yqlib/operator_equals.go`,
 v4.53.3) answers `rhs is !!null` for a `!!null` left operand and otherwise, for two scalar
@@ -4242,13 +4242,10 @@ its text (`numeric_display_string`, so `==` and `tostring` agree about a compute
 
 **Not reproduced**, each its own issue:
 
-- **The dedup builtins** ([#2799](https://github.com/rust-works/succinctly/issues/2799), the
-  slices after container `==`): yq's `unique`/`unique_by`/`group_by` key on the scalar text
-  *without* the wildcard, in first-occurrence order (`[1, "1"] | unique` is `[1]`,
-  `[3,1,2,1] | unique` is `[3,1,2]`), which is exactly why the text rule lives beside
-  `owned_value_eq` rather than inside it -- a glob is neither symmetric nor transitive and
-  cannot key a map -- so `unique`/`group_by`/`contains`/array `-` still use typed equality
-  here, and `sort`'s comparator still orders by type.
+- **`contains`, array `-` and `sort`** ([#2799](https://github.com/rust-works/succinctly/issues/2799),
+  the remaining slice): they still use typed equality / jq's type ordering, where yq's `sort`
+  comparator is typed only for null/bool/number pairs and falls back to `strings.Compare` on the
+  text (so `"1"` sorts before `1`).
 - **Spellings `OwnedValue` cannot keep** ([#2802](https://github.com/rust-works/succinctly/issues/2802)):
   `True == "true"` and `!!bool "yes" == true` are `true` here (yq `false`, its text is
   `True`/`yes`), `"~" == null` is `true` here (yq `false`), and a leading-zero, hex or
@@ -4263,6 +4260,74 @@ the bridge now writes a bare `Float` as a token the reparse hands back as a bare
 Pinned by the `yq_text_equality_2785` module (`tests/yq_cli_tests.rs`), the
 `scalar_text_equality_2785`/`scalar_wildcard_equality_2785`/`container_equality_2799` goldens, and the
 `glob` unit tests.
+
+### `unique`/`unique_by`/`group_by` key on text, in first-occurrence order -- resolved ([#2799](https://github.com/rust-works/succinctly/issues/2799)); a container's key encoding remains
+
+Real yq's `unique`, `unique_by` and `group_by` are not jq's sort-and-dedup. They are an ordered map
+keyed on a **text** (`getUniqueKeyValue`/`processIntoGroups`, `pkg/yqlib/operator_unique.go` and
+`operator_group_by.go`, v4.53.3), so the output is in first-occurrence order and two elements are
+one key whenever their texts match, whatever their type. succinctly sorted first and compared
+typed values. Captured live (`-o=json -I0`):
+
+| filter                                         | real yq               | why                                           |
+|------------------------------------------------|-----------------------|-----------------------------------------------|
+| `[3,1,2,1] \| unique`                          | `[3,1,2]`             | first occurrence, not sorted                  |
+| `[3,1,2,1] \| group_by(.)`                     | `[[3],[1,1],[2]]`     | groups in order of first occurrence           |
+| `[1, "1"] \| unique`                           | `[1]`                 | text `1` both sides                           |
+| `[0, false, "0", "false"] \| unique`           | `[0,false]`           | `"0"` is `0`'s text, `"false"` is `false`'s   |
+| `[1.5, "1.5", 1.50] \| unique`                 | `[1.5,1.50]`          | `1.50` keeps its spelling, so its own key     |
+| `["abc", "a*"] \| unique`                      | `["abc","a*"]`        | no wildcard in a map key (unlike `==`)        |
+| `[.nan, .nan] \| unique \| length`             | `1`                   | the same text                                 |
+| `[{"a":1,"b":2},{"b":2,"a":1}] \| unique \| length` | `2`             | a container's key is its encoding, order-sensitive |
+| `[[1],[2]] \| group_by(.) \| length`           | `1`                   | every container shares `group_by`'s empty key |
+| `[[1],[2]] \| unique \| length`                | `2`                   | but `unique` keys on the encoding             |
+| `unique_by(.a, .b)` / `group_by(.a, .b)`       | keyed on `.a` only    | yq reads the key filter's first output        |
+
+Fixed as `eval::yq_dedup_key` (the key), `yq_first_of_each_key` and `yq_group_in_order` (the
+ordered map), used by `builtin_unique`/`builtin_unique_by`/`builtin_group_by` and the owned
+`relocate` path in `eval.rs` and by the cursor route in `eval_generic.rs`. jq mode is
+untouched. The key is `tostring`'s text, so `==` and `unique` agree about a number.
+
+**Not reproduced**:
+
+- **A container's `unique` key is compact JSON here, the node's YAML in yq.** The equivalence
+  classes agree (equal contents dedup, different ones do not, field order matters) and the bytes
+  do not. yq's key is also style-sensitive (a flow `[1]` and a block `- 1` can be two keys), which
+  a value-level key cannot see.
+- **Alias nodes.** yq keys an alias element (`*x`) differently from the anchor's node, since its
+  container key is the YAML encoding and an alias encodes as itself: `anch: [&x {p: 1}, *x, {p: 1}]`
+  gives `.anch | unique | length` of `3` in yq and `1` here (`group_by(.) | length` is `2` there and
+  `1` here). Aliases are resolved before the key is built, so the identity is gone.
+- **Spellings `OwnedValue` cannot keep** ([#2802](https://github.com/rust-works/succinctly/issues/2802)):
+  the text a `01`, `0x1f` or `True` keys on is its resolved text here, in a document and as a
+  filter literal alike (`[01, 1] | unique` is `[1]` here and `[1,1]` in yq; a document
+  `[01, 1, 0x1f, 31, True, true] | unique` has 3 elements here and 6 in yq), the same residual
+  `==` has.
+- **Cost.** yq mode builds one `String` key per element and probes a hashed `IndexSet`/`IndexMap`
+  where it used to sort values in place. Interleaved A/B against `main`, release builds, minimum of
+  9 runs, 1M-element arrays (`yq '.a | unique | length'` and friends on 5-10 MB documents; the
+  `sort` row is the unchanged control; outputs identical):
+
+  | filter (1M elements)             | M4 Pro (Mac mini) | Ryzen 9 7950X (Zen 4) |
+  |----------------------------------|-------------------|-----------------------|
+  | `unique`, ints, 50k distinct     | 0.85x             | 1.11x                 |
+  | `unique`, ints, ~1M distinct     | 0.86x             | 1.11x                 |
+  | `unique`, strings, 289k distinct | 0.80x             | 0.69x                 |
+  | `group_by`, ints                 | 0.70x             | 0.76x                 |
+  | `group_by`, strings              | 0.58x             | 0.77x                 |
+  | `unique_by(.k)`, 250k records    | 0.90x             | 0.85x                 |
+  | `sort` (control)                 | 1.00x             | 1.01x                 |
+
+  Peak memory of `unique` over ~1M distinct integers rises by the key strings, about 90 MB on
+  the Mac (133 to 225 MB) and 80 MB on the Ryzen (118 to 196 MB); over strings it rises by
+  3-33 MB. A first cut with a `BTreeSet` was +94% on the distinct-integer row, which is why the
+  set is hashed, and building every key before probing any (rather than in one loop) is worth
+  10% on x86 for the same row. The only slower rows are `unique` over integers on x86 (+11%),
+  where the old in-place numeric sort is cheap; yq's own order and keys take precedence
+  (ADR-0018).
+
+Pinned by `dedup_builtins_key_on_text_in_first_occurrence_order_2799` (`tests/yq_cli_tests.rs`)
+and the `dedup_text_keys_2799`/`dedup_containers_2799` goldens.
 
 ### A typed mapping key is a node -- resolved ([#2785](https://github.com/rust-works/succinctly/issues/2785)); its spelling, the path register and an owned rebuild remain
 

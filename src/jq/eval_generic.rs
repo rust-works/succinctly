@@ -77,13 +77,13 @@ use super::eval::{
     stop_with_downstream, stop_with_error, stop_with_escape, streams_escaped_generator_prefix,
     streams_unbounded, substitute_bound_var_from, substitute_deferred_var, substitute_vars,
     suppresses, tonumber_from_str, tostring_owned, try_handler_root, vec_with_capacity,
-    yq_absent_key_read_is_empty, yq_assign_rhs_document, yq_empty_operand_output,
-    yq_field_index_on_scalar_is_empty, yq_negative_index_check, yq_negative_index_error,
-    yq_numeric_index_on_object_is_null, yq_object_key_stringify, yq_read_only_context,
-    yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand, EmptyOperandOp,
-    EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult, RangeNum,
-    Reentry, RestPipe, RootWitness, SliceTargetKind, StashedEscape, StashedVerdict, YqSemantics,
-    DEFERRED_BIND_UNRESOLVED, WHILE_UNTIL_MAX_STEPS,
+    yq_absent_key_read_is_empty, yq_assign_rhs_document, yq_dedup_key, yq_empty_operand_output,
+    yq_field_index_on_scalar_is_empty, yq_first_of_each_key, yq_negative_index_check,
+    yq_negative_index_error, yq_numeric_index_on_object_is_null, yq_object_key_stringify,
+    yq_read_only_context, yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand,
+    EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail,
+    QueryResult, RangeNum, Reentry, RestPipe, RootWitness, SliceTargetKind, StashedEscape,
+    StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED, WHILE_UNTIL_MAX_STEPS,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -21216,6 +21216,15 @@ impl SortKey {
         }
     }
 
+    /// The key real yq's `unique`/`unique_by` map this element on (#2799): the text of the
+    /// element itself, or of the key filter's first output. See [`yq_dedup_key`].
+    fn yq_dedup_key<S: EvalSemantics>(&self) -> String {
+        match self {
+            Self::Own(v) => yq_dedup_key::<S>(Some(v), false),
+            Self::By(parts) => yq_dedup_key::<S>(parts.first(), false),
+        }
+    }
+
     /// jq's `==`, under `S`'s number rules, as `owned_value_eq` would answer
     /// for the two keys.
     fn eq<S: EvalSemantics>(&self, other: &Self) -> bool {
@@ -29159,6 +29168,14 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // comment above for why).
             let cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
             sort_family_array_generic::<S, _>(cursors, key, optional, |mut keyed| {
+                // #2799: yq's `unique`/`unique_by` keep the first of each distinct text key in
+                // input order and never sort (`sort`/`sort_by` still do: part 3 of the issue).
+                if dedup && S::TAG == EvalTag::Yq {
+                    let keyed = keyed
+                        .into_iter()
+                        .map(|(key, cursor)| (key.yq_dedup_key::<S>(), cursor));
+                    return yq_first_of_each_key(keyed);
+                }
                 sort_keyed_elements::<S, V>(&mut keyed);
                 if dedup {
                     // `owned_value_eq::<S>`, not `compare_values(..) ==

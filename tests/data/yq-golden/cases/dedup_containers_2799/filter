@@ -1,0 +1,1 @@
+[([[2],[1],[2]]|unique), ([.l,.l2,.z]|unique), ([.l,.m]|group_by(.)|length), ([{"a":1,"b":2},{"b":2,"a":1}]|unique|length), ([.na,.nb]|unique|length), ([{"a":[1]},{"a":[2]}]|group_by(.a)|length), ([{"a":[1]},{"a":[1]},{"a":[2]}]|unique_by(.a)|length), ([1,[1],"1"]|unique)]

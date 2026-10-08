@@ -2114,6 +2114,81 @@ fn compare_slices_at_depth<S: EvalSemantics>(
     a.len().cmp(&b.len())
 }
 
+/// yq mode only (#2799): the key real yq's `unique`/`unique_by`/`group_by` map an element on
+/// (`getUniqueKeyValue`/`processIntoGroups`, `pkg/yqlib/operator_unique.go` and
+/// `operator_group_by.go`, v4.53.3), in place of jq's typed ordering.
+///
+/// A scalar keys on its **text** -- what `tostring` renders, so `1` and `"1"` share a key,
+/// `1.50` does not share one with `1.5`, and `.nan` keys the same as another `.nan` -- with no
+/// wildcard, which is why `==`'s glob rule cannot be reused (a glob is neither symmetric nor
+/// transitive and cannot key a map). `value` is the key filter's **first** output, or `None`
+/// for none (yq's own `null` node, so `"null"`): yq never reads a second output
+/// (`unique_by(.a, .b)` keys on `.a`).
+///
+/// A container keys on its encoding in `unique`/`unique_by` (order-sensitive:
+/// `{"a":1,"b":2}` and `{"b":2,"a":1}` are two keys) and on the **empty** key in `group_by`, where
+/// `grouping` is true and every container shares one group. The container encoding here is
+/// compact JSON, where yq's is the node's YAML; the equivalence classes agree and the bytes do
+/// not, and yq's key is style-sensitive (a flow `[1]` and a block `- 1` can differ) where this
+/// one is not -- recorded in `docs/compliance/yq/limitations.md`. A `\u{1}` prefix keeps a
+/// container's key from colliding with a string that spells the same text.
+pub(crate) fn yq_dedup_key<S: EvalSemantics>(value: Option<&OwnedValue>, grouping: bool) -> String {
+    match value {
+        None => "null".to_string(),
+        // `group_by`'s empty key is a plain string key, so it merges with the empty string `""`
+        // exactly as in yq (`["", [1]] | group_by(.)` is one group there). No escaping here:
+        // `group_by` has no container encoding to keep apart.
+        Some(OwnedValue::Array(_) | OwnedValue::Object(_)) if grouping => String::new(),
+        // A container's encoding starts with U+0001 ...
+        Some(v @ (OwnedValue::Array(_) | OwnedValue::Object(_))) => {
+            format!("\u{1}{}", owned_to_string::<S>(v))
+        }
+        Some(v) => {
+            let text = owned_to_string::<S>(v);
+            // ... and a scalar text that itself starts with U+0000 or U+0001 gets a U+0000 in
+            // front, so the two can never produce the same key (a plain `String`, which hashes
+            // faster than a flag-and-string pair: +12% on a million distinct integers on x86).
+            if !grouping && text.starts_with(['\u{0}', '\u{1}']) {
+                format!("\u{0}{text}")
+            } else {
+                text
+            }
+        }
+    }
+}
+
+/// yq mode only (#2799): keep the first element of each distinct key, in input order -- yq's
+/// `unique` family is an ordered map on [`yq_dedup_key`], not a sort followed by a dedup.
+pub(crate) fn yq_first_of_each_key<T>(keyed: impl ExactSizeIterator<Item = (String, T)>) -> Vec<T> {
+    // A hashed set, not a `BTreeSet`: one probe per element instead of a tree walk of string
+    // compares, which is what made the first cut of this +94% on a million distinct integers.
+    //
+    // Two passes on purpose: every key is built first and probed after. Building a key and
+    // probing it in the same loop measured 10% slower on a million distinct integers on x86
+    // (the allocator and the hash table fight over the cache): 1.19x against 1.08x of `main`.
+    let keyed: Vec<(String, T)> = keyed.collect();
+    let mut seen: indexmap::IndexSet<String> = indexmap::IndexSet::with_capacity(keyed.len());
+    let mut out = vec_with_capacity(keyed.len());
+    for (key, item) in keyed {
+        if seen.insert(key) {
+            out.push(item);
+        }
+    }
+    out
+}
+
+/// yq mode only (#2799): group elements by [`yq_dedup_key`], groups in order of their first
+/// occurrence and members in input order (`[3,1,2,1] | group_by(.)` is `[[3],[1,1],[2]]`).
+pub(crate) fn yq_group_in_order<T>(keyed: impl Iterator<Item = (String, T)>) -> Vec<Vec<T>> {
+    // Keys first, probes after, as `yq_first_of_each_key` does.
+    let keyed: Vec<(String, T)> = keyed.collect();
+    let mut groups: indexmap::IndexMap<String, Vec<T>> = indexmap::IndexMap::new();
+    for (key, item) in keyed {
+        groups.entry(key).or_default().push(item);
+    }
+    groups.into_values().collect()
+}
+
 /// Order two `[f]` keys exactly as `compare_values` orders the
 /// `OwnedValue::Array`s they would have been wrapped in.
 pub(crate) fn compare_key_arrays<S: EvalSemantics>(
@@ -9527,7 +9602,15 @@ fn relocate_elements<S: EvalSemantics>(
             let mut items: Vec<OwnedValue> = items.iter().cloned().collect();
             if matches!(builtin, Builtin::Reverse) {
                 items.reverse();
+            } else if S::TAG == EvalTag::Yq && matches!(builtin, Builtin::Unique) {
+                // #2799: yq's `unique` is first-occurrence order on the text key, not a sort.
+                let keyed = items
+                    .into_iter()
+                    .map(|item| (yq_dedup_key::<S>(Some(&item), false), item));
+                items = yq_first_of_each_key(keyed);
             } else {
+                // jq mode (and yq's `sort`, part 3 of #2799): sort, then drop adjacent equals.
+                // yq's `unique` took the arm above.
                 items.sort_by(compare_values::<S>);
                 if matches!(builtin, Builtin::Unique) {
                     items.dedup_by(|a, b| owned_value_eq::<S>(a, b));
@@ -17939,6 +18022,19 @@ fn builtin_group_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 keyed.push((key, owned_item));
             }
 
+            // #2799: yq's `group_by` is an ordered map on the first key output's text -- groups in
+            // order of first occurrence, no sort -- so it never reaches jq's sort-and-split below.
+            if S::TAG == EvalTag::Yq {
+                let keyed = keyed
+                    .into_iter()
+                    .map(|(key, item)| (yq_dedup_key::<S>(key.first(), true), item));
+                let groups = yq_group_in_order(keyed)
+                    .into_iter()
+                    .map(OwnedValue::array_from)
+                    .collect();
+                return QueryResult::Owned(OwnedValue::array_from(groups));
+            }
+
             // Sort by key
             keyed.sort_by(|(a, _), (b, _)| compare_key_arrays::<S>(a, b));
 
@@ -18020,6 +18116,15 @@ fn builtin_unique<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // #2327: to_owned_vec_or_suppress!, not a bare match -- see
             // `builtin_del`'s doc comment for the shared reasoning.
             let mut items = to_owned_vec_or_suppress!(elements, optional);
+
+            // #2799: yq's `unique` keeps the first of each distinct text key in input order; it
+            // does not sort. See `yq_dedup_key`.
+            if S::TAG == EvalTag::Yq {
+                let keyed = items
+                    .into_iter()
+                    .map(|item| (yq_dedup_key::<S>(Some(&item), false), item));
+                return QueryResult::Owned(OwnedValue::array_from(yq_first_of_each_key(keyed)));
+            }
 
             // Sort first (jq's unique returns sorted unique values)
             items.sort_by(compare_values::<S>);
@@ -18105,6 +18210,15 @@ fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Err(e) => return suppress_or_raise(e, optional),
                 };
                 keyed.push((key, owned_item));
+            }
+
+            // #2799: first of each distinct first-output text key, in input order (see
+            // `yq_dedup_key`); yq's `unique_by` does not sort.
+            if S::TAG == EvalTag::Yq {
+                let keyed = keyed
+                    .into_iter()
+                    .map(|(key, item)| (yq_dedup_key::<S>(key.first(), false), item));
+                return QueryResult::Owned(OwnedValue::array_from(yq_first_of_each_key(keyed)));
             }
 
             // Sort by key

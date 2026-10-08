@@ -1,0 +1,1 @@
+[([.a,.b]|unique), ([3,1,2,1]|unique), ([3,1,2,1]|group_by(.)), ([1,"1",1.0]|unique), (["abc","a*"]|unique), ([.c,.d]|unique), ([.n,.s]|group_by(.)), ([.f,.a]|unique), ([{"k":3},{"k":1},{"k":3}]|unique_by(.k)), ([{"a":1,"b":2},{"a":1,"b":3}]|unique_by(.a, .b)), ([2,10,1]|group_by(.))]
