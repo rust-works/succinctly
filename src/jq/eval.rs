@@ -50337,11 +50337,12 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                 && matches!(update_branch.register, BranchRegister::AtEntry);
                             // #3939: a computed emission that sits at the step's register
                             // (a pattern walk or a navigating source moved it off the root)
-                            // on a `null`/`true`/`false` member states that value: the
-                            // extract's own `AtEntry` names none, and an outer fold reading
-                            // this `foreach` as its source would take the register as lost
-                            // instead of placing its own there (`jv_identical` admits the
-                            // kind, [`null_bool_identical`]). Only an `AtEntry` emission at
+                            // states that register's value, of any kind (#3938; #3939 began
+                            // with `null`/`true`/`false`): the extract's own `AtEntry` names
+                            // none, and an outer fold reading this `foreach` as its source
+                            // would take the register as lost instead of placing its own
+                            // there, and an `and`/`or` operand after it would meet a guessed,
+                            // uncatchable refusal rather than jq's own. Only an `AtEntry` emission at
                             // exactly the register's path: that statement is the extract
                             // resolving against the step register itself, so an emission that
                             // navigated further, or states anything else, keeps its own answer.
