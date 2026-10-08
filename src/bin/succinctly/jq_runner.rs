@@ -7653,6 +7653,43 @@ fn to_jq_values<'a, W: Clone + AsRef<[u64]>>(
     }
 }
 
+/// How deep [`validate_cursor`] already counts a `LazySeq` element to be,
+/// restated against the canonical echo scan's ceiling (#3909).
+///
+/// The scan stops at [`MAX_VALUE_TREE_DEPTH`] (384) and `validate_cursor` at
+/// `eval_generic::MAX_NESTING_DEPTH` (256), counting each from the element's
+/// own root. Starting the scan at the difference makes it refuse exactly the
+/// documents `validate_cursor` refuses for depth, so it can stand in for the
+/// walk without a 256-to-383-level document slipping past the check.
+const LAZY_SEQ_ECHO_START_DEPTH: usize =
+    MAX_VALUE_TREE_DEPTH - succinctly::jq::eval_generic::MAX_NESTING_DEPTH;
+
+/// [`validate_cursor`] for one `LazySeq` element, with the canonical echo scan
+/// as a cheaper way to the same `Ok` (#3909).
+///
+/// A span the scan certifies is already well-formed, canonical JSON of bounded
+/// depth: it has no malformed member or delimiter, no scalar that fails to
+/// decode, and no repeated key. That is everything `validate_cursor` looks for,
+/// so `Ok` from the scan is `Ok` from the walk -- `canonical_span_implies_
+/// validate_cursor_ok_3909` in `eval_generic.rs` holds the two to it over
+/// random documents. The converse does not hold (`1.0` fails the scan and is
+/// perfectly valid), which is why a refusal falls back to the walk and never
+/// stands as an answer itself.
+///
+/// The scan is a single pass over the text and the walk builds a cursor per
+/// node, which is what made `[.users]` cost 3.6x `.users`.
+fn validate_lazy_seq_cursor<Wrd: Clone + AsRef<[u64]>>(
+    cursor: &JsonCursor<'_, Wrd>,
+) -> Result<(), EvalError> {
+    if cursor
+        .canonical_compact_span(LAZY_SEQ_ECHO_START_DEPTH)
+        .is_some()
+    {
+        return Ok(());
+    }
+    validate_cursor::<JqSemantics, _>(cursor)
+}
+
 fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
     result: GenericResult<StandardJson<'a, W>>,
     cursor: JsonCursor<'a, W>,
@@ -7790,7 +7827,7 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
                         .into_iter()
                         .map(|elem| match elem {
                             LazyElem::Cursor(c) => {
-                                validate_cursor::<JqSemantics, _>(&c).map(|()| JqValue::Cursor(c))
+                                validate_lazy_seq_cursor(&c).map(|()| JqValue::Cursor(c))
                             }
                             LazyElem::Owned(v) => JqValue::try_from_owned(v),
                         })
@@ -8105,6 +8142,19 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
         None
     };
 
+    // #3909: a cursor whose source text is already the compact record needs no
+    // render and so no buffer -- the scan that certified it is the validation
+    // the buffer exists to wait for (#3265), and nothing after it can fail.
+    // Without this a node the M2 path echoes straight out of the document
+    // (`.users`) cost 2.5x that and a second copy of itself in memory here.
+    if !is_raw_record(&as_str, config) {
+        if let Some(span) = echoable_span(value, config, 0) {
+            write_output_raw_prologue(out, as_str, config)?;
+            out.write_all(span.as_bytes())?;
+            return write_terminator(out, config);
+        }
+    }
+
     // #3265: a JSON body is rendered into `scratch` in full, and only copied
     // to `out` once it has rendered without error. `print_json` checks each
     // container's structure before writing its opening bracket, but a
@@ -8143,6 +8193,44 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
     written
 }
 
+/// Whether a record is written by the streaming writers (`print_json`,
+/// `print_owned_json`) rather than materialized and handed to `format_json`:
+/// `-S`, `-C` and `-a` each need the whole value (#2662). The one fork
+/// [`render_json_body`], [`write_output_owned_value`] and [`echoable_span`]
+/// all take, so a flag added to it reaches all three (#3909).
+fn writes_lazily(config: &OutputConfig) -> bool {
+    !config.sort_keys && !config.color_output && !config.ascii_output
+}
+
+/// The source text of a cursor-backed `value` when the compact jq-compat
+/// render would write exactly those bytes (#3909), or `None` when it would
+/// not, the config rules a verbatim span out, or `value` is not a cursor.
+///
+/// The decision `JsonCursor::stream_json` makes for the M2 fast path, made
+/// for the general path's printer. The config half mirrors
+/// [`render_json_body`]'s own fork ([`writes_lazily`]), narrowed to what a
+/// verbatim span can stand in for: a source-preserving convention is not this
+/// writer, and a non-compact layout needs whitespace the source does not
+/// have. `depth` is the level the value is
+/// printed at, so the scan refuses the same over-deep documents `print_json`
+/// does.
+fn echoable_span<'a, Wrd: Clone + AsRef<[u64]>>(
+    value: &JqValue<'a, Wrd>,
+    config: &OutputConfig,
+    depth: usize,
+) -> Option<&'a str> {
+    let JqValue::Cursor(cursor) = value else {
+        return None;
+    };
+    if !writes_lazily(config)
+        || config.convention.preserves_source_values()
+        || !(config.compact || config.indent_string.is_empty())
+    {
+        return None;
+    }
+    cursor.canonical_compact_span(depth)
+}
+
 /// The largest record buffer [`write_output_jq_value`] keeps between
 /// records. A larger one is dropped after its record is written, so peak
 /// RSS is one rendered record either way, but a stream's steady state isn't
@@ -8178,7 +8266,7 @@ fn render_json_body<Wrd: Clone + AsRef<[u64]>>(
     // mode, and still validates only the value being printed, not the rest
     // of the document -- the same "materializes what it reads" rule this
     // issue is generalizing to `-S`/`-C` above.
-    if !config.sort_keys && !config.color_output && !config.ascii_output {
+    if writes_lazily(config) {
         if config.convention.preserves_source_values() {
             print_json(
                 out,
@@ -8381,7 +8469,7 @@ fn write_output_owned_value<Out: Write>(
     // Same static `if` over two monomorphisations as the lazy sibling, and
     // for the same reason (#2874/#2603): this is the default `-c` route and
     // a vtable call in its per-scalar inner loop is not worth buying.
-    if !config.sort_keys && !config.color_output && !config.ascii_output {
+    if writes_lazily(config) {
         if config.convention.preserves_source_values() {
             print_owned_json(out, value, &PreserveFormatter, config, 0)?;
         } else {
@@ -9409,6 +9497,11 @@ where
                 (b'[', b']'),
                 &container_layout,
                 |out, v| {
+                    // #3909: an element that is a cursor (a `LazySeq`'s) is
+                    // echoed whole when it can be, not walked field by field.
+                    if let Some(span) = echoable_span(v, config, level + 1) {
+                        return Ok(out.write_all(span.as_bytes())?);
+                    }
                     print_json(
                         out,
                         v,
@@ -9439,6 +9532,10 @@ where
                     out.write_all(escaped.as_bytes())?;
                     out.write_all(b"\":")?;
                     out.write_all(space_after_colon.as_bytes())?;
+                    // #3909: as the array arm above.
+                    if let Some(span) = echoable_span(v, config, level + 1) {
+                        return Ok(out.write_all(span.as_bytes())?);
+                    }
                     print_json(
                         out,
                         v,
@@ -11784,6 +11881,10 @@ mod tests {
     /// #3265: a record bigger than `MAX_RETAINED_RECORD_SCRATCH` is written
     /// whole, and its buffer is released afterwards rather than kept for the
     /// rest of the stream. A small record keeps the buffer for reuse.
+    ///
+    /// The records carry a `1e2`, which jq respells `1E+2`: a canonical record
+    /// is echoed from the document without touching the buffer (#3909), and
+    /// this test is about the records that are rendered into it.
     #[test]
     fn write_output_jq_value_releases_an_oversized_scratch_3265() {
         let config = OutputConfig {
@@ -11800,7 +11901,9 @@ mod tests {
             seq: false,
             convention: JsonConvention::JqCompat,
         };
-        let big = format!("\"{}\"", "x".repeat(MAX_RETAINED_RECORD_SCRATCH));
+        let filler = "x".repeat(MAX_RETAINED_RECORD_SCRATCH);
+        let big = format!("[\"{filler}\",1e2]");
+        let want_big = format!("[\"{filler}\",1E+2]\n");
         let mut scratch = Vec::new();
         let mut out = Vec::new();
         let index = JsonIndex::build(big.as_bytes());
@@ -11810,12 +11913,11 @@ mod tests {
             &config,
             &mut scratch,
         )
-        .expect("a large string prints");
-        assert_eq!(out.len(), big.len() + 1);
-        assert_eq!(&out[..big.len()], big.as_bytes());
+        .expect("a large record prints");
+        assert_eq!(out, want_big.as_bytes());
         assert_eq!(scratch.capacity(), 0, "the oversized buffer is dropped");
 
-        let small: &[u8] = b"[1]";
+        let small: &[u8] = b"[1e2]";
         let index = JsonIndex::build(small);
         write_output_jq_value(
             &mut out,
@@ -11825,6 +11927,95 @@ mod tests {
         )
         .expect("a small record prints");
         assert!(scratch.capacity() > 0, "a small buffer is kept for reuse");
+    }
+
+    /// #3909: a cursor whose text is already the compact record is written
+    /// from the document, so no record is rendered and the buffer is never
+    /// grown -- at any size, which is what keeps a large echoed record from
+    /// costing a second copy of itself in memory.
+    #[test]
+    fn write_output_jq_value_echoes_a_canonical_cursor_without_the_buffer_3909() {
+        let config = OutputConfig {
+            compact: true,
+            raw_output: false,
+            join_output: false,
+            raw_output0: false,
+            ascii_output: false,
+            color_output: false,
+            color_scheme: ColorScheme::default(),
+            sort_keys: false,
+            indent_string: String::new(),
+            unbuffered: false,
+            seq: true,
+            convention: JsonConvention::JqCompat,
+        };
+        let big = format!(
+            "[\"{}\",{{\"a\":[1,2]}}]",
+            "x".repeat(MAX_RETAINED_RECORD_SCRATCH)
+        );
+        let mut scratch = Vec::new();
+        let mut out = Vec::new();
+        let index = JsonIndex::build(big.as_bytes());
+        write_output_jq_value(
+            &mut out,
+            &JqValue::Cursor(index.root(big.as_bytes())),
+            &config,
+            &mut scratch,
+        )
+        .expect("a canonical record prints");
+        assert_eq!(out, format!("\u{1e}{big}\n").as_bytes());
+        assert_eq!(scratch.capacity(), 0, "an echoed record is never buffered");
+
+        // The same text with one respelled number is rendered, so the buffer
+        // is what proves the test above could have failed.
+        let respelled = big.replace("[1,2]", "[1e2,2]");
+        let mut out = Vec::new();
+        let index = JsonIndex::build(respelled.as_bytes());
+        write_output_jq_value(
+            &mut out,
+            &JqValue::Cursor(index.root(respelled.as_bytes())),
+            &config,
+            &mut scratch,
+        )
+        .expect("a respelled record prints");
+        assert_eq!(
+            out,
+            format!("\u{1e}{}\n", big.replace("[1,2]", "[1E+2,2]")).as_bytes()
+        );
+    }
+
+    /// #3909: the object arm of `print_json` echoes a cursor-valued field from
+    /// the document the way the array arm echoes an element, and re-renders a
+    /// field whose text is not the compact record. No CLI route puts an object
+    /// of cursors in front of the printer (`standard_json_to_jq_value` builds
+    /// one for a cursor's own object), so the arm is driven directly.
+    #[test]
+    fn print_json_object_echoes_canonical_cursor_fields_3909() {
+        let config = OutputConfig {
+            compact: true,
+            raw_output: false,
+            join_output: false,
+            raw_output0: false,
+            ascii_output: false,
+            color_output: false,
+            color_scheme: ColorScheme::default(),
+            sort_keys: false,
+            indent_string: String::new(),
+            unbuffered: false,
+            seq: false,
+            convention: JsonConvention::JqCompat,
+        };
+        // `a` is canonical and echoed; `b` holds `1e2`, which jq respells
+        // `1E+2`, so its field is rendered rather than echoed.
+        let json: &[u8] = br#"{"a":{"x":[1,2]},"b":{"n":1e2}}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = standard_json_to_jq_value(cursor.value(), &cursor).unwrap();
+        assert!(matches!(value, JqValue::Object(_)));
+        let mut out = Vec::new();
+        let mut scratch = Vec::new();
+        write_output_jq_value(&mut out, &value, &config, &mut scratch).unwrap();
+        assert_eq!(out, b"{\"a\":{\"x\":[1,2]},\"b\":{\"n\":1E+2}}\n");
     }
 
     /// #1192: `generic_result_to_jq_values`'s own `One`/`Many` arms --
