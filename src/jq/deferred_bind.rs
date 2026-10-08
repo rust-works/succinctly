@@ -496,9 +496,17 @@ mod tests {
     fn reads(filter: &str) -> Option<DeferredReads> {
         // `. as $x | body`: split off the body the way the parser does.
         let Expr::As { var, body, .. } = parse(filter).expect("parses") else {
-            panic!("not an `as` bind") // patchcov: coverage tolerate-line reason="unreachable in a passing suite: every row is an `as` bind (#3856)"
+            panic!("not an `as` bind")
         };
         deferred_bind_reads(&body, &var)
+    }
+
+    #[test]
+    #[should_panic(expected = "not an `as` bind")]
+    fn reads_helper_rejects_a_filter_that_is_not_an_as_bind() {
+        // Pins the helper's own guard: a row that forgot its `as` must fail
+        // loudly, not read as "no reads" (#4036).
+        let _ = reads(". + 1");
     }
 
     fn sound(filter: &str) -> bool {
