@@ -7559,6 +7559,15 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     }
 
     #[inline]
+    fn explicit_tag_of_non_alias(&self) -> Option<&str> {
+        if self.index.has_explicit_tags() {
+            self.explicit_tag_at(None)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
     fn style(&self) -> &'static str {
         YamlCursor::style(self)
     }
