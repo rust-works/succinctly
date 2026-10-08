@@ -4588,12 +4588,14 @@ fn output_value<W: Write>(
                 .declared_anchor()
                 .filter(|_| matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)));
             let tag = block_container_tag(value, comments);
-            if anchor.is_none() && tag.is_none() {
-                rendered
-            } else if is_flow_safe(value, comments) {
-                format!("&{} {rendered}", anchor.unwrap_or_default())
-            } else {
-                format!("{}\n{rendered}", block_header(anchor, tag))
+            match (anchor, tag) {
+                (None, None) => rendered,
+                // A flow container keeps its anchor on its own line (a tag is only
+                // ever on a block container).
+                (Some(anchor), None) if is_flow_safe(value, comments) => {
+                    format!("&{anchor} {rendered}")
+                }
+                _ => format!("{}\n{rendered}", block_header(anchor, tag)),
             }
         };
         // A root's own standalone head comment (#798 PR2, #2795 PR B) has no
@@ -4985,7 +4987,7 @@ fn emit_yaml_value_at_depth(
         return format!("*{name}");
     }
     if comments.style() == "tagged" {
-        if let Some(tagged) = emit_tagged_scalar(value, config, indent, in_flow, depth) {
+        if let Some(tagged) = emit_tagged_scalar(value, config, indent, in_flow) {
             return tagged;
         }
     }
@@ -5474,7 +5476,7 @@ fn go_yaml_forces_double_quotes(s: &str) -> bool {
 /// The `!!seq`/`!!map` tag a container carries under `style = "tagged"` (#4066), or
 /// `None` for any other node. Only a non-empty block container reaches the callers
 /// that put it on the header line; an empty or flow one prints it inline
-/// ([`flow_container_tag`]).
+/// ([`with_container_tag`]).
 fn block_container_tag(value: &OwnedValue, comments: &CommentTree) -> Option<&'static str> {
     if comments.style() != "tagged" || !defers_to_own_block(value, comments) {
         return None;
@@ -5527,7 +5529,6 @@ fn emit_tagged_scalar(
     config: &OutputConfig,
     indent: &str,
     in_flow: bool,
-    depth: usize,
 ) -> Option<String> {
     let (tag, text) = match value {
         OwnedValue::Null => ("!!null", "null".to_string()),
@@ -5566,7 +5567,10 @@ fn emit_tagged_scalar(
             } else {
                 go_yaml_tagged_str_scalar(s, in_flow)?
             };
-            return Some(if text.is_empty() {
+            return Some(if text.is_empty() && in_flow {
+                // Inside `[...]`/`{...}` a tag alone would run into the delimiter.
+                "!!str ''".to_string()
+            } else if text.is_empty() {
                 "!!str".to_string()
             } else {
                 format!("!!str {text}")
@@ -5574,7 +5578,6 @@ fn emit_tagged_scalar(
         }
         OwnedValue::Array(_) | OwnedValue::Object(_) => return None,
     };
-    let _ = depth;
     Some(format!("{tag} {text}"))
 }
 

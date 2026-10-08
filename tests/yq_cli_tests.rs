@@ -43806,6 +43806,30 @@ fn test_yq_block_scalars_read_back_as_the_same_string_2707() -> Result<()> {
 fn test_yq_style_tagged_2707() -> Result<()> {
     let cases: &[(&str, &str, &[&str], &str)] = &[
         (
+            r#"a: {d: "", e: 1}
+"#,
+            r#".a style="flow" | .a.d style="tagged""#,
+            &[],
+            r#"a: {d: !!str '', e: 1}
+"#,
+        ),
+        (
+            r#"a: ["", "x"]
+"#,
+            r#".a[0] style="tagged""#,
+            &[],
+            r#"a: [!!str '', "x"]
+"#,
+        ),
+        (
+            r#"a: ["x"]
+"#,
+            r#".a style="flow" | .a[0] style = "tagged""#,
+            &[],
+            r#"a: [!!str x]
+"#,
+        ),
+        (
             r"a: 1
 ",
             r#".a style = "tagged""#,
