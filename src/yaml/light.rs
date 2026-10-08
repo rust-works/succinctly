@@ -7297,6 +7297,36 @@ thread_local! {
         const { core::cell::Cell::new(0) };
 }
 
+impl<W: AsRef<[u64]> + Clone> YamlCursor<'_, W> {
+    /// `element` as [`YamlElements::uncons_cursor`] hands out the sibling `self`: a block-sequence
+    /// item is unwrapped from its `-` node, anything else is the element itself.
+    fn unwrap_seq_entry(self) -> Self {
+        if self.is_container() {
+            self
+        } else if self
+            .text_position()
+            .is_some_and(|text_pos| starts_inline_seq_entry(self.text, text_pos))
+        {
+            self.first_child().unwrap_or(self)
+        } else {
+            self
+        }
+    }
+
+    /// Whether `self` is the `-` node whose unwrapped item `element` is: a childless-or-not
+    /// non-container node that starts a same-line sequence entry and whose first child is
+    /// `element`.
+    fn is_unwrapped_seq_entry_of(&self, element: &Self) -> bool {
+        !self.is_container()
+            && self
+                .text_position()
+                .is_some_and(|text_pos| starts_inline_seq_entry(self.text, text_pos))
+            && self
+                .first_child()
+                .is_some_and(|child| child.bp_pos == element.bp_pos)
+    }
+}
+
 impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     type Value = YamlValue<'a, W>;
 
@@ -7313,6 +7343,42 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     // field built with a value that differs from its cursor's breaks this;
     // `yaml_field_value_is_its_cursors_value_2664` pins it.
     const REUSE_FIELD_VALUE: bool = true;
+
+    /// `YamlElements::uncons_cursor` yields each block-sequence item unwrapped from its `-`
+    /// node and `YamlFields::uncons` a direct mapping's key and value as consecutive siblings:
+    /// [`next_element`](DocumentCursor::next_element) walks exactly those chains, so a scan for
+    /// an element's slot resumes instead of restarting from the first (#2784; JSON since #3702).
+    /// A merged mapping lists fewer members than it has children, which only means a resumed
+    /// scan misses a node the full scan finds, and the full scan then decides.
+    const RESUMABLE_ELEMENT_SCAN: bool = true;
+
+    /// The element after this one: the next sibling, as `uncons_cursor` unwraps it when this
+    /// element is a block-sequence item (the first child of its `-` wrapper, whose own
+    /// sibling is the next wrapper) or the wrapper itself (a bare `-`).
+    fn next_element(&self) -> Option<Self> {
+        let mut wrapper = *self;
+        if self.bp_pos > 0 {
+            if let Some(before) = self.at_node_id(self.bp_pos - 1) {
+                if before.is_unwrapped_seq_entry_of(self) {
+                    wrapper = before;
+                }
+            }
+        }
+        wrapper.next_sibling().map(YamlCursor::unwrap_seq_entry)
+    }
+
+    /// The balanced-parentheses excess at this node's open: a rank lookup.
+    #[inline]
+    fn tree_depth(&self) -> Option<usize> {
+        self.index.bp().depth(self.bp_pos)
+    }
+
+    /// The matching close parenthesis: every descendant's `bp_pos` lies strictly between it and
+    /// this node's own.
+    #[inline]
+    fn subtree_end(&self) -> Option<usize> {
+        self.index.bp().find_close(self.bp_pos)
+    }
 
     #[inline]
     fn value(&self) -> Self::Value {
@@ -16261,6 +16327,86 @@ mod tests {
             }
         }
         out
+    }
+
+    /// #2784: `next_element` walks the chain `uncons_cursor` hands out for a sequence (a
+    /// block item unwrapped from its `-` node, a bare `-` left as the node) and the key, value,
+    /// key, value, ... siblings of a direct mapping, from the first element to the last, for
+    /// every container of a document that holds each shape.
+    #[test]
+    fn next_element_walks_the_element_and_member_chains_2784() {
+        use crate::jq::document::{DocumentElements, DocumentFields, DocumentValue};
+        let yaml = "\
+seq:
+  - a
+  - b: 1
+    c: 2
+  -
+  - - x
+    - y
+  - [p, q]
+  - {r: 1, s: 2}
+  # a comment
+  - | 
+    text
+  - &anc z
+  - *anc
+  -   spaced
+map:
+  k1: v1
+  k2:
+  k3: [1, 2]
+  ? complex
+  : value
+  k4:
+    - n1
+    - n2
+flow: [a, [b, c], {d: e}]
+empty_seq: []
+empty_map: {}
+";
+        let index = YamlIndex::build(yaml.as_bytes()).unwrap();
+        let root = index.root(yaml.as_bytes());
+        let (mut sequences, mut mappings) = (0, 0);
+        for c in all_cursors_2072(root) {
+            let value = c.value();
+            if let Some(elements) = value.as_array() {
+                let mut expected = Vec::new();
+                let mut rest = elements;
+                while let Some((element, next)) = DocumentElements::uncons_cursor(&rest) {
+                    expected.push(element.node_id());
+                    rest = next;
+                }
+                let mut walked = Vec::new();
+                let mut at = DocumentElements::uncons_cursor(&elements).map(|(first, _)| first);
+                while let Some(element) = at {
+                    walked.push(element.node_id());
+                    at = element.next_element();
+                }
+                assert_eq!(walked, expected, "sequence at bp {}", c.node_id());
+                sequences += 1;
+            } else if let Some(fields) = value.as_object() {
+                let mut expected = Vec::new();
+                let mut rest = fields.clone();
+                while let Some((field, next)) = DocumentFields::uncons(&rest) {
+                    expected.push(field.key_cursor.node_id());
+                    expected.push(field.value_cursor.node_id());
+                    rest = next;
+                }
+                let mut walked = Vec::new();
+                let mut at = DocumentFields::uncons(&fields).map(|(field, _)| field.key_cursor);
+                while let Some(node) = at {
+                    walked.push(node.node_id());
+                    at = node.next_element();
+                }
+                assert_eq!(walked, expected, "mapping at bp {}", c.node_id());
+                mappings += 1;
+            }
+        }
+        assert!(
+            sequences >= 6 && mappings >= 5,
+            "{sequences} sequences, {mappings} mappings"
+        );
     }
 
     /// #2072 step 1: the round trip lands back on `same_node` for every node

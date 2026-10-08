@@ -55880,3 +55880,103 @@ fn test_path_of_recursive_descent_counts_a_repeated_mapping_key_once_3850() -> R
     );
     Ok(())
 }
+
+/// #2784: `key` and `path` read once per member of a wide YAML mapping or sequence resume from
+/// the member the last read found, as JSON's do (#3702, #3839), instead of scanning the parent from
+/// its first member. The scan only remembers past 32 members, so the documents are wider than
+/// that, and every answer is checked against the one the position gives: a resume that lost its
+/// place, or paired a key with the wrong value, shows here. Shapes that make the chain
+/// irregular -- bare `-` items, items that are sequences or mappings, comments between items,
+/// empty and flow values, explicit keys, a merged mapping -- are mixed in.
+#[test]
+fn test_yaml_key_and_path_per_member_resume_the_scan_2784() -> Result<()> {
+    let n = 90;
+
+    // A mapping whose members are as irregular as YAML allows.
+    let mut mapping = String::new();
+    let mut keys = Vec::new();
+    for i in 0..n {
+        keys.push(format!("k{i}"));
+        mapping.push_str(&match i % 9 {
+            0 => format!("k{i}: {i}\n"),
+            1 => format!("k{i}:\n"),
+            2 => format!("k{i}: [a, b]\n"),
+            3 => format!("k{i}: {{x: 1}}\n"),
+            4 => format!("k{i}:\n  - p\n  - q\n"),
+            5 => format!("# comment\nk{i}: &a{i} v\n"),
+            6 => format!("k{i}:\n  y: 1\n  z: 2\n"),
+            7 => format!("? k{i}\n: value\n"),
+            _ => format!("k{i}: |\n  text\n"),
+        });
+    }
+    let all_keys = serde_json_array(&keys);
+    let (stdout, code) = run_yq_stdin("[.[] | key]", &mapping, &["-o", "json", "-I", "0"])?;
+    assert_eq!((stdout.trim_end(), code), (all_keys.as_str(), 0));
+    let paths: Vec<String> = keys.iter().map(|k| format!("[\"{k}\"]")).collect();
+    let (stdout, code) = run_yq_stdin("[.[] | key | path]", &mapping, &["-o", "json", "-I", "0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), format!("[{}]", paths.join(",")));
+    let (stdout, code) = run_yq_stdin("[.[] | path]", &mapping, &["-o", "json", "-I", "0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), format!("[{}]", paths.join(",")));
+    // A read that skips members, and one that goes back, still answer from the position.
+    let (stdout, code) = run_yq_stdin(
+        "[.k70 | key, (.k20 | key), (.k85 | path), (.k3 | path), (.k71 | key)]",
+        &mapping,
+        &["-o", "json", "-I", "0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), r#"["k70","k20",["k85"],["k3"],"k71"]"#);
+
+    // A sequence with bare dashes, nested sequences and mappings, comments and flow items.
+    let mut sequence = String::new();
+    for i in 0..n {
+        sequence.push_str(&match i % 8 {
+            0 => format!("- {i}\n"),
+            1 => "-\n".to_string(),
+            2 => format!("- - x{i}\n  - y\n"),
+            3 => format!("- id: {i}\n  v: 1\n"),
+            4 => "# comment\n- [p, q]\n".to_string(),
+            5 => format!("- {{a: {i}}}\n"),
+            6 => format!("- |\n  text{i}\n"),
+            _ => format!("-   spaced{i}\n"),
+        });
+    }
+    let indexes: Vec<String> = (0..n).map(|i| format!("[{i}]")).collect();
+    let (stdout, code) = run_yq_stdin("[.[] | path]", &sequence, &["-o", "json", "-I", "0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), format!("[{}]", indexes.join(",")));
+    let (stdout, code) = run_yq_stdin("[.[] | key]", &sequence, &["-o", "json", "-I", "0"])?;
+    assert_eq!(code, 0);
+    let numbers: Vec<String> = (0..n).map(|i| i.to_string()).collect();
+    assert_eq!(stdout.trim_end(), format!("[{}]", numbers.join(",")));
+    let (stdout, code) = run_yq_stdin(
+        "[.[80] | path, (.[8] | key), (.[79] | key), (.[81] | path)]",
+        &sequence,
+        &["-o", "json", "-I", "0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "[[80],8,79,[81]]");
+
+    // A merged mapping lists fewer members than it has children: the resume misses what the
+    // scan finds, and the scan answers.
+    let mut merged = String::from("base: &b\n  x: 1\n  y: 2\n");
+    for i in 0..n {
+        merged.push_str(&format!("e{i}:\n  <<: *b\n  z: {i}\n"));
+    }
+    let (stdout, code) = run_yq_stdin("[.[] | key] | length", &merged, &["-o", "json", "-I", "0"])?;
+    assert_eq!((stdout.trim_end(), code), ("91", 0));
+    let (stdout, code) = run_yq_stdin(
+        "[.[] | .y | path] | length",
+        &merged,
+        &["-o", "json", "-I", "0"],
+    )?;
+    assert_eq!((stdout.trim_end(), code), ("91", 0));
+    Ok(())
+}
+
+/// `["a","b"]` as JSON text, for the expected side of the #2784 pin.
+fn serde_json_array(items: &[String]) -> String {
+    let quoted: Vec<String> = items.iter().map(|k| format!("\"{k}\"")).collect();
+    format!("[{}]", quoted.join(","))
+}
