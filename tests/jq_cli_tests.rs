@@ -64607,6 +64607,31 @@ fn test_foreach_source_destructuring_a_computed_null_is_refused_4007() -> Result
             near_a,
             5,
         ),
+        // `reduce` shares the seed: the same refusal, jq's own message.
+        (
+            doc,
+            r"del(null | reduce (null) as {a:$x} (.; .))",
+            "",
+            near_a,
+            5,
+        ),
+        // A `?//` chain on the same stage: `main` deleted `a` here; jq retries the last
+        // alternative and reports its step (`element 0`), where the walk reports the first
+        // alternative's refusal, so only the exit code and the prefix are pinned.
+        (
+            doc,
+            r"del(null | foreach (null) as {a:$x} ?// [$x] (.; .; .))",
+            "",
+            "Invalid path expression near attempt to access element",
+            5,
+        ),
+        (
+            doc,
+            r"del(null | reduce (null) as {a:$x} ?// [$x] (.; .))",
+            "",
+            "Invalid path expression near attempt to access element",
+            5,
+        ),
         // The register a fold's UPDATE left unknown (`def f: null; f | f`) holds a `null`
         // placeholder, not the document: the same wrong write on an object document.
         (

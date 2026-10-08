@@ -46608,7 +46608,8 @@ struct PatternRegister {
     is_input: bool,
     /// Whether `value` really is the register's value (#3120). `false` only
     /// for the seed of a walk on an untracked stage whose register the
-    /// caller could not hand in (a nested pipe, or a register already lost):
+    /// caller could not hand in (a nested pipe, a register already lost, or
+    /// a fold whose own register is untrackable, #4007):
     /// then `value` is a placeholder no step may compare against, and the
     /// walk's first step refuses unconditionally -- jq's verdict is
     /// unknowable there, and refusing is the direction that cannot write
@@ -46637,7 +46638,10 @@ struct PatternRegister {
 ///   `path(foreach (null) as {a:$x} (.; .; $x))` is `["a"]` on a `null`
 ///   document (the ambient register is `null` too), but `path(foreach (5) as
 ///   {a:$x} (.; .; .))` refuses on any document ("near attempt to access
-///   element \"a\" of 5") even though `$x` goes unused.
+///   element \"a\" of 5") even though `$x` goes unused. That register is
+///   *known* only while the fold's own is trackable (#4007): an untrackable
+///   one holds a placeholder (the ambient value of an untracked stage, or the
+///   `null` `FoldRegister::advance` leaves), which no step may compare against.
 fn fold_pattern_seed(elem: &FoldSourceValue, reg: &FoldRegister) -> PatternRegister {
     match (&elem.register_path, &elem.moved) {
         (Some(path), _) => PatternRegister {
