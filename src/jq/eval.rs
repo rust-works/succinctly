@@ -44947,9 +44947,14 @@ impl FoldRegister {
     /// (1; try .a; .)`). #3770 declined it for a fold whose register *is* tracked (a tracked
     /// register keeps the frame as it was), which is why that arm is not touched.
     fn withhold_untracked_register(&mut self) {
-        if !self.trackable {
+        // An already-recorded loss is kept: `LostAt` is the more precise statement, and
+        // widening it would make loud a refusal #3267 keeps exact. The live register is
+        // dropped, as `Frame::unknown` drops it, so the frame never records a loss while
+        // carrying a register (#3456 D2).
+        if !self.trackable && !self.frame.register_loss.is_lost() {
             self.frame = self
                 .frame
+                .with_register(None)
                 .with_register_loss(RegisterLoss::LostSomewhere)
                 .into_owned();
         }
@@ -49409,8 +49414,8 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         && reduce_leaves_register_in_place(patterns, input, init, update);
     // #3984: jq mode only, like every register admission here. A syntactic property of the
     // `reduce`, so answered once rather than per INIT fork.
-    let mentions_frozen_var = S::TAG == EvalTag::Jq
-        && (mentions_marker(input) || mentions_marker(init) || mentions_marker(update));
+    let mentions_frozen_var =
+        S::TAG == EvalTag::Jq && fold_mentions_frozen_var(patterns, &[input, init, update]);
     let slice_ok = fold_slice_ok(patterns, input);
     // #3780: whether UPDATE navigates the accumulator on a path that always runs --
     // syntactic, so decided once, not per source element
@@ -49930,10 +49935,13 @@ fn resolve_foreach<'a, S: EvalSemantics>(
         && foreach_cannot_move_register(patterns, input, init, update, extract);
     // #3984: see `resolve_reduce`'s identical flag; EXTRACT counts too.
     let mentions_frozen_var = S::TAG == EvalTag::Jq
-        && (mentions_marker(input)
-            || mentions_marker(init)
-            || mentions_marker(update)
-            || extract.is_some_and(mentions_marker));
+        && fold_mentions_frozen_var(
+            patterns,
+            &[input, init, update]
+                .into_iter()
+                .chain(extract)
+                .collect::<Vec<_>>(),
+        );
     // #3580: everything but UPDATE leaves the register where the fold entered, so
     // an emission is at the entry exactly when the UPDATE output it came from was
     // (an `AtEntry`, or a handler's `Unmoved` of the fold's register). jq emits from
@@ -55855,6 +55863,17 @@ fn raise_free_identity_passthrough(expr: &Expr, wide: bool) -> bool {
 /// source keeps the pre-#3279 grammar.
 fn mentions_marker(expr: &Expr) -> bool {
     crate::jq::walk::any_subexpr(expr, &mut |e| matches!(e, Expr::TrackedVar(_)))
+}
+
+/// Whether a `reduce`/`foreach` mentions a frozen `$var` marker anywhere it can navigate
+/// one: its SOURCE, INIT, UPDATE and EXTRACT (`parts`), or a computed key of a
+/// destructuring pattern (`{($x|.k):$q}`). One definition for both fold kinds, so the
+/// scan cannot drift between them (#3984).
+fn fold_mentions_frozen_var(patterns: &[Pattern], parts: &[&Expr]) -> bool {
+    parts.iter().any(|part| mentions_marker(part))
+        || patterns.iter().any(|pattern| {
+            crate::jq::walk::any_pattern_key(pattern, &mut |key| mentions_marker(key))
+        })
 }
 
 /// Whether `cond` provably yields at least one output and never raises, on

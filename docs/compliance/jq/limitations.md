@@ -2774,18 +2774,23 @@ is the revert that established what the other one costs.
    its register to `resolve_seq_sink` explicitly under a frame that carried none: `del(foreach .a as
    $v (.; try ($v \| .b); .))` on `{"a":{"b":1}}` echoed the document and now writes
    `{"a":{}}`, as jq does.
-   It does not reach a fold whose INIT is untracked *after a literal
-   stage* — that fold re-seeds its register from the ambient value, so the marker is not
-   recognised at all (the pre-existing `literal-then-fold-untracked-init` /
-   `carried-register-passthrough` class). With a generator source the enclosing `try` used to
-   swallow that refusal into a no-op write (`del(.a as $y \| .a \| 5 \| foreach range(1) as $i
-   (0; .; try ($y \| .b)))` is `{"a":{}}` in jq and echoed the document here); since
+   It does not make that fold *answer*: a fold whose INIT is untracked *after a literal
+   stage* re-seeds its register from the ambient value, so the marker is not recognised at all
+   (the pre-existing `literal-then-fold-untracked-init` / `carried-register-passthrough`
+   class). With a generator source the enclosing `try` used to swallow that refusal into a
+   no-op write (`del(.a as $y \| .a \| 5 \| foreach range(1) as $i (0; .; try ($y \| .b)))` is
+   `{"a":{}}` in jq and echoed the document here). Since
    [#3984](https://github.com/rust-works/succinctly/issues/3984) a fold that mentions a frozen
-   variable and whose register is untracked records the register as lost, so a refusal of a frozen value the step
-   could have navigated is the loud guess of #3267 and the program refuses. The cost, in the safe direction: over
-   `scripts/jq-nested-fold-frozen-var-sweep.py` (2,673 rows) `main` had 441 ACCEPT_WRONG and 252 DIFF rows and the build
-   has none, 399 more rows match jq, and 42 rows that matched jq by accident (a `del` of a key the document does not
-   have, behind a refused `try`) now refuse. Two refuse-only residuals,
+   variable (in its source, INIT, UPDATE, EXTRACT or a pattern's computed key) and whose
+   register is untracked records the register as lost, so a refusal of a frozen value the step
+   could have navigated is the loud guess of #3267 and the program refuses. The cost, in the
+   safe direction: over `scripts/jq-nested-fold-frozen-var-sweep.py` (2,673 rows) `main` had
+   441 ACCEPT_WRONG and 252 DIFF rows and the build has none, 399 more rows match jq, and 42
+   rows that matched jq by accident (a `del` of a key the document does not have, behind a
+   refused `try`, or a def called from the body) now refuse. Where jq raises too (`reduce`),
+   the exit code agrees and the message differs: jq reports the end-of-path check ("with
+   result {..}"), this build the navigation it refused ("near attempt to access element").
+   Two refuse-only residuals,
    both in the sweep: `path(.a \| try error(.) catch .)` —
    `error(.)` raises the register node itself and jq answers `["a"]`, but a payload equal to
    the register by value cannot be told from a rebuilt copy (`error({"a":1,"b":2})` refuses in
