@@ -14142,57 +14142,74 @@ fn yq_sort_text<S: EvalSemantics>(value: &OwnedValue) -> Cow<'_, str> {
     yq_scalar_text::<S>(value).unwrap_or(Cow::Borrowed(""))
 }
 
-/// The kind [`yq_compare_values`] sorts a value by, for [`yq_sort_by`]'s fast-path test.
-///
-/// Integers and floats share a kind when every integer is exactly an `f64` (|n| <= 2^53): then
-/// integer-against-integer (exact), integer-against-float and float-against-float (both as `f64`)
-/// are one consistent numeric order. A larger integer gets a kind of its own, because two such
-/// integers can differ as `i64` and tie as `f64`, which makes the relation intransitive against a
-/// float between them.
-fn yq_sort_kind(value: &OwnedValue) -> u8 {
-    const EXACT: i64 = 1 << 53;
+/// What a value is to [`yq_compare_values`], as a bit for [`yq_sort_by`]'s fast-path test.
+const YQ_NULL: u8 = 1;
+const YQ_BOOL: u8 = 2;
+/// An integer exactly representable as an `f64` (|n| <= 2^53).
+const YQ_INT_EXACT: u8 = 4;
+/// An integer too wide for an `f64` but narrow enough that `lhs - rhs` cannot wrap (|n| < 2^62).
+const YQ_INT_WIDE: u8 = 8;
+const YQ_FLOAT: u8 = 16;
+/// A string or a container: both compare by text (a container's is empty).
+const YQ_TEXT: u8 = 32;
+/// An integer whose difference with another can wrap `i64` (|n| >= 2^62): `int(lhs - rhs)`
+/// then flips sign, so no ordering of it is transitive.
+const YQ_INT_HUGE: u8 = 64;
+
+fn yq_sort_flag(value: &OwnedValue) -> u8 {
     match value {
-        OwnedValue::Null => 0,
-        OwnedValue::Bool(_) => 1,
+        OwnedValue::Null => YQ_NULL,
+        OwnedValue::Bool(_) => YQ_BOOL,
         OwnedValue::Int(n) | OwnedValue::NumberLiteral(NumberRepr::Int(n), _) => {
-            if n.unsigned_abs() <= EXACT as u64 {
-                2
+            let width = n.unsigned_abs();
+            if width <= 1 << 53 {
+                YQ_INT_EXACT
+            } else if width < 1 << 62 {
+                YQ_INT_WIDE
             } else {
-                6
+                YQ_INT_HUGE
             }
         }
-        OwnedValue::Float(_) | OwnedValue::NumberLiteral(NumberRepr::Float(..), _) => 2,
-        OwnedValue::String(_) => 4,
-        OwnedValue::Array(_) | OwnedValue::Object(_) => 5,
+        OwnedValue::Float(_) | OwnedValue::NumberLiteral(NumberRepr::Float(..), _) => YQ_FLOAT,
+        OwnedValue::String(_) | OwnedValue::Array(_) | OwnedValue::Object(_) => YQ_TEXT,
     }
+}
+
+/// Whether [`yq_compare_values`] is a total preorder over values carrying exactly these `flags`.
+///
+/// `null` and bools sort before everything else and among themselves consistently, so they never
+/// break it. Numbers compare numerically and text compares as text, so a position holding both a
+/// number and a text value is where "an integer against a string compares by text" makes the
+/// relation intransitive. Within the numbers, a float against an integer too wide for an `f64` is
+/// too (two such integers can differ as `i64` and tie as `f64`), and so is any integer whose
+/// difference can wrap.
+fn yq_sort_is_total(flags: u8) -> bool {
+    let numbers = YQ_INT_EXACT | YQ_INT_WIDE | YQ_FLOAT;
+    flags & YQ_INT_HUGE == 0
+        && !(flags & numbers != 0 && flags & YQ_TEXT != 0)
+        && !(flags & YQ_FLOAT != 0 && flags & YQ_INT_WIDE != 0)
 }
 
 /// yq mode only (#2799): sort `items` with [`yq_compare_values`] the way yq does.
 ///
 /// `keys` yields the `[f]` sort key of an item (for `sort`, the item itself as a one-element
-/// key). When every key position holds values of a single kind (all integers, all strings, ...)
-/// the comparator is a total preorder there, so every stable sort gives one and the same answer
-/// and the fast `slice::sort_by` is used. A mix of kinds is where the comparator is not a strict
-/// weak order and the answer depends on the algorithm, so that goes through
-/// [`go_sort::stable_sort_by`], Go's `sort.Stable`, which is what yq runs.
+/// key). When [`yq_sort_is_total`] holds at every key position the comparator is a total
+/// preorder, so every stable sort gives one and the same answer and the fast `slice::sort_by` is
+/// used. Otherwise the comparator is not a strict weak order and the answer depends on the
+/// algorithm, so that goes through [`go_sort::stable_sort_by`], Go's `sort.Stable`, which is what
+/// yq runs.
 pub(crate) fn yq_sort_by<T, S: EvalSemantics>(items: &mut [T], keys: impl Fn(&T) -> &[OwnedValue]) {
-    let mut kinds: Vec<u8> = Vec::new();
-    let mut total = true;
-    'scan: for item in items.iter() {
+    let mut flags: Vec<u8> = Vec::new();
+    for item in items.iter() {
         for (at, key) in keys(item).iter().enumerate() {
-            let kind = yq_sort_kind(key);
-            match kinds.get(at) {
-                Some(&seen) if seen != kind => {
-                    total = false;
-                    break 'scan;
-                }
-                Some(_) => {}
-                None => kinds.push(kind),
+            match flags.get_mut(at) {
+                Some(seen) => *seen |= yq_sort_flag(key),
+                None => flags.push(yq_sort_flag(key)),
             }
         }
     }
     let compare = |a: &T, b: &T| yq_compare_key_arrays::<S>(keys(a), keys(b));
-    if total {
+    if flags.iter().all(|&position| yq_sort_is_total(position)) {
         items.sort_by(compare);
     } else {
         super::go_sort::stable_sort_by(items, compare);
