@@ -42578,6 +42578,107 @@ b: *k
     Ok(())
 }
 
+/// #2598, the reshaping routes and non-string keys: `*`/`+` (`merge_tree`),
+/// `with_entries` and `to_entries | from_entries` carry a key's anchor through
+/// the entry's `key` string, and an alias to a non-string key's anchor
+/// (`&k 1: x` / `b: *k`) still matches the key's own scalar text. Captured
+/// live from yq v4.53.3.
+#[test]
+fn test_yq_key_anchor_survives_reshaping_and_non_string_keys_2598() -> Result<()> {
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            r"&k key: 1
+b: 2
+",
+            r#". * {"c":1}"#,
+            r"&k key: 1
+b: 2
+c: 1
+",
+        ),
+        (
+            r"&k key: 1
+b: 2
+",
+            r#". + {"c":1}"#,
+            r"&k key: 1
+b: 2
+c: 1
+",
+        ),
+        (
+            r"&k key: 1
+b: *k
+",
+            r"with_entries(.)",
+            r"&k key: 1
+b: *k
+",
+        ),
+        (
+            r"&k key: 1
+b: 2
+",
+            r"with_entries(.value |= . + 1)",
+            r"&k key: 2
+b: 3
+",
+        ),
+        (
+            r"&k key: 1
+b: 2
+",
+            r"to_entries | from_entries",
+            r"&k key: 1
+b: 2
+",
+        ),
+        (
+            r"x: {&k key: 1, b: *k}
+",
+            r#".x + {"z":1}"#,
+            r"{&k key: 1, b: *k, z: 1}
+",
+        ),
+        (
+            r"&k 1: x
+b: *k
+",
+            r".c = 2",
+            r"&k 1: x
+b: *k
+c: 2
+",
+        ),
+        (
+            r"&k true: x
+b: *k
+",
+            r".c = 2",
+            r"&k true: x
+b: *k
+c: 2
+",
+        ),
+        (
+            r"&k 1.5: x
+b: *k
+",
+            r".c = 2",
+            r"&k 1.5: x
+b: *k
+c: 2
+",
+        ),
+    ];
+    for (doc, filter, want) in cases {
+        let (out, _, code) = run_yq_stdin_with_stderr(filter, doc, &[])?;
+        assert_eq!(out, *want, "`{filter}` on {doc:?}");
+        assert_eq!(code, 0, "`{filter}` on {doc:?}");
+    }
+    Ok(())
+}
+
 /// #2598: where real yq prints a `*k` it cannot resolve, succinctly never
 /// emits YAML it cannot read back (the #763 soundness rule): deleting the
 /// anchored key, or sorting it below its alias, leaves the alias expanded to

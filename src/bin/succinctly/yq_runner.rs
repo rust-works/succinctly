@@ -2862,7 +2862,13 @@ impl Declared<'_> {
     fn identical(&self, value: &OwnedValue) -> bool {
         match self {
             Self::Node(node) => node.identical(value),
-            Self::Key(text) => matches!(value, OwnedValue::String(s) if s.as_ref() == *text),
+            // An alias to a key reads back as the key node's own scalar, so
+            // `&k 1: x` / `b: *k` is the integer `1`, not the string "1".
+            Self::Key(text) => match value {
+                OwnedValue::String(s) => s.as_ref() == *text,
+                OwnedValue::Array(_) | OwnedValue::Object(_) => false,
+                scalar => scalar.to_json() == *text,
+            },
         }
     }
 }
@@ -4781,14 +4787,15 @@ fn defers_to_own_block(value: &OwnedValue, comments: &CommentTree) -> bool {
             || matches!(value, OwnedValue::Array(a) if !a.is_empty()))
 }
 
-/// Mapping key `key`'s own `&name ` anchor declaration (trailing space, so it
-/// prefixes the key as written), or `""` if the key declares none (#2598).
-/// The key-side twin of [`anchor_decl_prefix`], matching `write_yaml_field_key`
-/// in `light.rs`: `&k key: &v 1`.
-fn key_anchor_prefix(comments: &CommentTree, key: &str) -> String {
-    comments
-        .key_anchor(key)
-        .map_or_else(String::new, |name| format!("&{name} "))
+/// `quoted_key` (a key as [`yaml_quote_key`] wrote it) behind mapping key
+/// `key`'s own `&name ` anchor declaration, if it declares one (#2598). The
+/// key-side twin of [`anchor_decl_prefix`], matching `write_yaml_field_key` in
+/// `light.rs`: `&k key: &v 1`. Allocates only for an anchored key.
+fn with_key_anchor(comments: &CommentTree, key: &str, quoted_key: String) -> String {
+    match comments.key_anchor(key) {
+        Some(name) => format!("&{name} {quoted_key}"),
+        None => quoted_key,
+    }
 }
 
 /// This node's `&name` anchor declaration as ` &name` (leading space), or
@@ -5190,15 +5197,15 @@ fn emit_yaml_value_at_depth(
                 let entries: Vec<_> = obj
                     .iter()
                     .map(|(k, v)| {
-                        let key = format!(
-                            "{}{}",
-                            key_anchor_prefix(comments, k),
+                        let key = with_key_anchor(
+                            comments,
+                            k,
                             yaml_quote_key(
                                 k,
                                 comments.key_style(k),
                                 true,
                                 config.json_sourced_floats,
-                            )
+                            ),
                         );
                         let field_comments = comments.field(k);
                         let val = emit_yaml_value_at_depth(
@@ -5229,15 +5236,15 @@ fn emit_yaml_value_at_depth(
                 let items: Vec<(String, bool)> = entries
                     .iter()
                     .map(|(k, v)| {
-                        let key = format!(
-                            "{}{}",
-                            key_anchor_prefix(comments, k),
+                        let key = with_key_anchor(
+                            comments,
+                            k,
                             yaml_quote_key(
                                 k,
                                 comments.key_style(k),
                                 false,
                                 config.json_sourced_floats,
-                            )
+                            ),
                         );
                         let field_comments = comments.field(k);
                         let comment_suffix = trailing_comment_suffix(field_comments, indent);

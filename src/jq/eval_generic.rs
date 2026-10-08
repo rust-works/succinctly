@@ -2293,7 +2293,7 @@ pub enum CommentTree {
 /// [`NodeMeta`], kept in [`CommentTree::Object`]'s per-key map (#3601).
 ///
 /// An entry exists only for a key that has something to say - a trailing
-/// comment (#765) or a quoted spelling - so the common plain, comment-free key
+/// comment (#765), a quoted spelling or a declared anchor (#2598) - so the common plain, comment-free key
 /// costs nothing, and the map is the same one that already carried the comment
 /// (`NodeMeta`'s own doc records a stack overflow from widening it, and a new
 /// `CommentTree::Object` field would widen every node the same way).

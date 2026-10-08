@@ -8,7 +8,7 @@ use super::{
     collect_write_targets, is_closed_literal, reconcile_presentation, CommentTree, Expr, IndexMap,
     NodeMeta, OwnedValue, ResultWithComments,
 };
-use succinctly::jq::eval_generic::KeyMeta;
+use succinctly::jq::eval_generic::{AnchorMark, KeyMeta};
 use succinctly::jq::{ArithOp, Builtin, MAX_VALUE_TREE_DEPTH};
 
 /// A deliberately small allowlist: no variables, environment reads, I/O,
@@ -133,13 +133,14 @@ fn trace_at_depth(
                         let OwnedValue::String(key) = key else {
                             return None;
                         };
-                        (
-                            CommentTree::Leaf(NodeMeta::from_comment_and_style(
-                                None,
-                                tree.key_style(key),
-                            )),
-                            tree.field(key).clone(),
-                        )
+                        // The key node is reused as the entry's `key` string, so
+                        // its `&anchor` rides along (`key: &k key`, #2598).
+                        let mut key_meta =
+                            NodeMeta::from_comment_and_style(None, tree.key_style(key));
+                        key_meta.anchor = tree
+                            .key_anchor(key)
+                            .map(|name| AnchorMark::Declares(name.to_string()));
+                        (CommentTree::Leaf(key_meta), tree.field(key).clone())
                     }
                     OwnedValue::Array(_) => (CommentTree::empty(), tree.at_index(i).clone()),
                     _ => return None,
@@ -185,7 +186,13 @@ fn trace_at_depth(
                 // Last occurrence wins, including an unstyled key. Never
                 // leave the earlier occurrence's style behind on collision.
                 keys.shift_remove(key.as_ref());
-                if let Some(meta) = KeyMeta::new(None, false, entry_tree.field(key_field).style()) {
+                let key_tree = entry_tree.field(key_field);
+                if let Some(meta) = KeyMeta::with_anchor(
+                    None,
+                    false,
+                    key_tree.style(),
+                    key_tree.declared_anchor().map(str::to_string),
+                ) {
                     keys.insert(key.to_string(), meta);
                 }
             }
@@ -277,7 +284,12 @@ fn merge_tree(
             };
             fields.insert(key.clone(), child);
             let key_tree = if lvalue.is_some() { lt } else { rt };
-            if let Some(meta) = KeyMeta::new(None, false, key_tree.key_style(key)) {
+            if let Some(meta) = KeyMeta::with_anchor(
+                None,
+                false,
+                key_tree.key_style(key),
+                key_tree.key_anchor(key).map(str::to_string),
+            ) {
                 keys.insert(key.clone(), meta);
             }
         }
