@@ -25827,6 +25827,59 @@ fn test_path_of_recursive_descent_answers_between_256_and_384_3850() -> Result<(
     Ok(())
 }
 
+/// #3850: the walker is its own implementation of `.[]?`'s descent, so its edges are pinned
+/// against jq 1.7.1: a scalar, `null`, `{}` and `[]` root is the one path `[]`, a repeated
+/// object key counts once, a `try` around it changes nothing, and `recurse` is the same walk.
+#[test]
+fn test_path_of_recursive_descent_edges_match_jq_3850() -> Result<()> {
+    assert_path_rows_3289(&[
+        ("5", "[path(..)]", "[[]]\n", "", 0),
+        ("null", "[path(..)]", "[[]]\n", "", 0),
+        ("{}", "[path(recurse)]", "[[]]\n", "", 0),
+        ("[]", r#"try ([path(..)]) catch "E""#, "[[]]\n", "", 0),
+        (r#"{"a":1,"a":2}"#, "[path(..)]", "[[],[\"a\"]]\n", "", 0),
+        (
+            r#"{"a":[{"b":1}],"c":{}}"#,
+            "[path(..)]",
+            "[[],[\"a\"],[\"a\",0],[\"a\",0,\"b\"],[\"c\"]]\n",
+            "",
+            0,
+        ),
+        // A decode failure is the one error `.[]?` never swallows, and `try` cannot catch it.
+        (
+            r#"{"a":"\ud800","d":5}"#,
+            "[path(..)]",
+            "",
+            "invalid unicode escape sequence",
+            5,
+        ),
+        (
+            r#"{"a":[{"b":1}],"c":{}}"#,
+            "[limit(2; path(..))]",
+            "[[],[\"a\"]]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
+/// #3850: a document nested between 256 and 384 levels reached through a *computed* value (no
+/// cursor to walk) still materializes and keeps the materializers' 256 ceiling, as before.
+#[test]
+fn test_path_of_recursive_descent_over_a_computed_value_keeps_256_3850() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "map(.) | [path(..)] | length"],
+        Some(&nested_arrays(300)),
+    )?;
+    assert_eq!(stdout.trim_end(), "");
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 256"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 /// #3850: past 384 the same forms refuse cleanly, with the ceiling they enforce (384).
 #[test]
 fn test_path_of_recursive_descent_past_384_refuses_cleanly_3850() -> Result<()> {

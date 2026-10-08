@@ -22503,7 +22503,8 @@ fn path_descent_children<S: EvalSemantics, V: DocumentValue>(
         return Ok(children);
     }
     match path_step_generic::<S, V, _>(&Expr::Iterate, here, at, true, &mut children) {
-        Err(e) if e.is_decode_failure() => Err(e),
+        // What `.[]?` never swallows: a decode failure, and the errors no `?` or `try` can catch.
+        Err(e) if e.is_decode_failure() || e.is_uncatchable_at_value_position() => Err(e),
         _ => Ok(children),
     }
 }
@@ -29371,6 +29372,19 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         // verbatim otherwise. See `reindex_bridge_is_identity`, and the
         // `Expr::Pipe` arm above for why `optional` isn't threaded in.
         Builtin::Path(path_expr) => {
+            // #3850: a bare `..`/`recurse` over a live node is walked by `path_descent_each`, so it
+            // takes the path walkers' 384 ceiling; over a computed value (no cursor) it still
+            // materializes below and keeps 256.
+            if let Some(root) = cursor.filter(|_| path_expr_is_bare_descent(path_expr)) {
+                let mut out = Vec::new();
+                return match path_descent_each::<S, V>(root, &mut |path| {
+                    out.push(path);
+                    Demand::Continue
+                }) {
+                    Ok(_) => owned_vec_to_generic_result(out),
+                    Err(e) => partial_generic(out, Control::Error(e)),
+                };
+            }
             // #2061: `path(...)` output is small and bounded, but this arm
             // materialized the whole document to produce it -- `path(.[0])`
             // on a 20 MB array cost 0.78s and 519 MiB against `.[0]`'s 0.09s
@@ -29393,17 +29407,6 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // whole document and therefore still raises on it -- that
             // boundary is recorded with the rest of the decision in
             // `docs/compliance/jq/limitations.md`.
-            // #3850: a bare `..`/`recurse` walks the same way, so it takes the deeper ceiling.
-            if let Some(root) = cursor.filter(|_| path_expr_is_bare_descent(path_expr)) {
-                let mut out = Vec::new();
-                return match path_descent_each::<S, V>(root, &mut |path| {
-                    out.push(path);
-                    Demand::Continue
-                }) {
-                    Ok(_) => owned_vec_to_generic_result(out),
-                    Err(e) => partial_generic(out, Control::Error(e)),
-                };
-            }
             if let Some(root) = cursor.filter(|_| path_expr_is_cursor_navigable(path_expr)) {
                 let mut out = Vec::new();
                 return match path_walk_generic::<S, V>(

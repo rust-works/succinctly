@@ -53384,3 +53384,20 @@ fn test_yq_consumer_of_a_prefetched_key_body_keeps_the_eager_pipe_3639() -> Resu
     }
     Ok(())
 }
+
+/// #3850: a bare `path(..)` is walked from the cursor, and a repeated mapping key counts once
+/// there as it does in `.. | path` and as it did on the owned route it replaced.
+#[test]
+fn test_path_of_recursive_descent_counts_a_repeated_mapping_key_once_3850() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(
+        "[path(..)]",
+        "a: 1\na: 2\nb:\n  c: [x]\n",
+        &["-o", "json", "-I", "0", "--jq-extensions"],
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(
+        stdout.trim_end(),
+        r#"[[],["a"],["b"],["b","c"],["b","c",0]]"#
+    );
+    Ok(())
+}

@@ -9897,7 +9897,8 @@ narrowing:
   them from 256), and so do a bare `path(..)`, `path(recurse)` and `path(recurse(.[]?))`
   ([#3850](https://github.com/rust-works/succinctly/issues/3850): they walk with cursors and an
   explicit stack instead of materializing the document); the forms that materialize the whole
-  document first (a descent inside a larger path expression such as `path(.. | .a?)`,
+  document first (a descent inside a larger path expression such as `path(.. | .a?)`, a bare
+  `path(..)` over a computed value rather than the input document (`map(.) | path(..)`, `{a: .} | .a | path(..)`),
   `path(recurse(f; c))`, `paths(f)`, `path(getpath(p))`, among others) stop at 256, the
   materializers' ceiling, chosen for native-stack safety. Past the ceiling they return
   `nesting depth exceeds limit of 384` (or `256`) as a `QueryResult::Error`, tagged as a decode
