@@ -14143,12 +14143,25 @@ fn yq_sort_text<S: EvalSemantics>(value: &OwnedValue) -> Cow<'_, str> {
 }
 
 /// The kind [`yq_compare_values`] sorts a value by, for [`yq_sort_by`]'s fast-path test.
+///
+/// Integers and floats share a kind when every integer is exactly an `f64` (|n| <= 2^53): then
+/// integer-against-integer (exact), integer-against-float and float-against-float (both as `f64`)
+/// are one consistent numeric order. A larger integer gets a kind of its own, because two such
+/// integers can differ as `i64` and tie as `f64`, which makes the relation intransitive against a
+/// float between them.
 fn yq_sort_kind(value: &OwnedValue) -> u8 {
+    const EXACT: i64 = 1 << 53;
     match value {
         OwnedValue::Null => 0,
         OwnedValue::Bool(_) => 1,
-        OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(..), _) => 2,
-        OwnedValue::Float(_) | OwnedValue::NumberLiteral(NumberRepr::Float(..), _) => 3,
+        OwnedValue::Int(n) | OwnedValue::NumberLiteral(NumberRepr::Int(n), _) => {
+            if n.unsigned_abs() <= EXACT as u64 {
+                2
+            } else {
+                6
+            }
+        }
+        OwnedValue::Float(_) | OwnedValue::NumberLiteral(NumberRepr::Float(..), _) => 2,
         OwnedValue::String(_) => 4,
         OwnedValue::Array(_) | OwnedValue::Object(_) => 5,
     }
