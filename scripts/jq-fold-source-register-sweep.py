@@ -95,23 +95,9 @@ FORMS = ['path({k} ({s}) as $k ({i}; {u}))', '({k} ({s}) as $k ({i}; {u})) = 9']
 #   (#3459 closed the bare `first`/`last`/`nth`/`map`/`add`/`flatten` sources: they
 #   are routed through the resolver like any other navigation, so none of them is
 #   listed -- the sweep has no FABRICATE row left.)
-#   `.b|tostring` -- jq's pointer identity: `tostring` of a string is the same `jv`, a
-#   path-mode gap that is not specific to a fold (#3460's second half). The accumulator
-#   carried across source elements, `..`/`recurse` and a full slice of the accumulator
-#   are closed (#3460).
-#   `..|tostring`, `recurse|tostring`, `walk(.)|tostring`, `.[0:]|tostring`, `.[0:1]|tostring`,
-#   `.[0:(1+1)]|tostring` -- the same pointer identity, reached over a bare string document
-#   (`"s"`, `""`, added with #3930): `tostring` of a string is the same `jv`, so jq answers
-#   where a fold of the copy refuses. REJECT only; every FABRICATE row there is closed (#3930).
-KNOWN_RESIDUALS = {
-    '..|tostring': ['REJECT'],
-    '.[0:(1+1)]|tostring': ['REJECT'],
-    '.[0:1]|tostring': ['REJECT'],
-    '.[0:]|tostring': ['REJECT'],
-    'recurse|tostring': ['REJECT'],
-    'walk(.)|tostring': ['REJECT'],
-    '.b|tostring': ['REJECT'],
-}
+#   (#3460 closed the accumulator carried across source elements, `..`/`recurse`, a full
+#   slice of the accumulator, and `tostring`/`@text` of a string / `tonumber` of a number.)
+KNOWN_RESIDUALS = {}
 
 
 def run(cmd, inp):

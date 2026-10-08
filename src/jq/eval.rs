@@ -38452,6 +38452,17 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                 ResolveFlow::Exhausted
             }
         }
+        // #3460: jq's `tostring`/`@text` of a string and `tonumber` of a number
+        // return their input as the very same `jv`, so `path()` accepts them
+        // (`path(.b|tostring)` is `["b"]`) and an update writes through them.
+        // Judged on the value's kind alone, from the 1.7.1 source: any other
+        // input builds a fresh value and stays a refusal. jq only: yq's
+        // `(.b|tostring) = 9` is a no-op.
+        Expr::Builtin(Builtin::ToString | Builtin::ToNumber) | Expr::Format(FormatType::Text)
+            if S::TAG == EvalTag::Jq && returns_input_as_is(expr, value) =>
+        {
+            emit_passthrough(value, trackable, snapshot, sink)
+        }
         // `if cond then a else b end`: only the branch the runtime actually
         // selects is checked for path-ness — the branch not taken is never
         // evaluated at all, so a non-path `else` that is never reached
@@ -52271,6 +52282,24 @@ fn type_filter_keeps(builtin: &Builtin, value: &OwnedValue) -> Option<bool> {
         Builtin::Scalars => !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)),
         _ => return None,
     })
+}
+
+/// Whether `expr` (`tostring`, `@text`, `tonumber`) hands `value` back as the
+/// same `jv` rather than a fresh one (#3460): a string through `tostring`/
+/// `@text`, a number through `tonumber`.
+fn returns_input_as_is(expr: &Expr, value: &OwnedValue) -> bool {
+    match expr {
+        Expr::Builtin(Builtin::ToString) | Expr::Format(FormatType::Text) => {
+            matches!(value, OwnedValue::String(_))
+        }
+        Expr::Builtin(Builtin::ToNumber) => {
+            matches!(
+                value,
+                OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)
+            )
+        }
+        _ => false,
+    }
 }
 
 /// Whether `builtin` is one of the nine type filters, as [`type_filter_keeps`]

@@ -59398,6 +59398,70 @@ fn test_foreach_full_slice_source_is_the_accumulator_3460() -> Result<()> {
     Ok(())
 }
 
+/// #3460 (second half): `tostring`/`@text` of a string and `tonumber` of a number
+/// return their input as the same `jv`, so `path()` and an update accept them where
+/// every other input builds a fresh value and is refused. Not specific to a fold.
+/// Every row is a live jq 1.7.1 capture.
+#[test]
+fn test_path_register_survives_input_returning_conversions_3460() -> Result<()> {
+    const DOC: &str = r#"{"a":[1,2],"b":"s","n":2,"t":"1"}"#;
+    // (filter, stdout, exit code)
+    const ROWS: &[(&str, &str, i32)] = &[
+        (r"path(.b|tostring)", "[\"b\"]\n", 0),
+        (r"path(.b|tostring|tostring)", "[\"b\"]\n", 0),
+        (r"path(.b|@text)", "[\"b\"]\n", 0),
+        (r"path(.n|tonumber)", "[\"n\"]\n", 0),
+        (
+            r"(.b|tostring) = 9",
+            "{\"a\":[1,2],\"b\":9,\"n\":2,\"t\":\"1\"}\n",
+            0,
+        ),
+        (
+            r"(.n|tonumber) |= 5",
+            "{\"a\":[1,2],\"b\":\"s\",\"n\":5,\"t\":\"1\"}\n",
+            0,
+        ),
+        // A fresh value in each: still refused.
+        (r"path(.n|tostring)", "", 5),
+        (r"path(.t|tonumber)", "", 5),
+        (r"path(.a|tostring)", "", 5),
+        (r"path(.b|tojson)", "", 5),
+        (r"path(.a|@json)", "", 5),
+    ];
+    for (filter, want_stdout, want_code) in ROWS {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(DOC))?;
+        assert_eq!(stdout, *want_stdout, "`{filter}`: stderr: {stderr:?}");
+        assert_eq!(code, *want_code, "`{filter}`: stderr: {stderr:?}");
+    }
+    Ok(())
+}
+
+/// #3460, yq mode must-not-change: `(.b|tostring) = "z"` is a no-op in yq v4.53.3
+/// and stays one here.
+#[test]
+fn test_yq_tostring_write_stays_a_noop_3460() -> Result<()> {
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .args(["yq", "(.b|tostring) = \"z\""])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child
+                .stdin
+                .take()
+                .expect("piped")
+                .write_all(b"a: 1\nb: s\n")?;
+            child.wait_with_output()
+        })?;
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "a: 1\nb: s\n",
+        "{output:?}"
+    );
+    Ok(())
+}
+
 /// #3460, yq mode must-not-change: the carried identity turns a refusal into
 /// navigation, which on the write side is a write where yq no-ops, so it is jq
 /// mode only (ADR-0018: the mode decides). Under `--jq-extensions`, where
