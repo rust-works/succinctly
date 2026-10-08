@@ -50347,9 +50347,8 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                             // navigated further, or states anything else, keeps its own answer.
                             let walked_at = (S::TAG == EvalTag::Jq
                                 && active_reg.trackable
-                                && active_reg.path.depth() > 0
-                                && is_null_or_bool(&active_reg.value))
-                            .then_some(&active_reg);
+                                && active_reg.path.depth() > 0)
+                                .then_some(&active_reg);
                             let mut emit = |branch: PathBranch<'a>| -> Demand {
                                 if update_unmoved && !branch.trackable {
                                     sink(branch.with_register(BranchRegister::Unmoved(

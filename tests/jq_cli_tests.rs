@@ -64848,27 +64848,24 @@ fn test_foreach_source_destructuring_the_register_moves_it_3744() -> Result<()> 
     ])
 }
 
-/// #3744, narrowed by #3853: what routing a `foreach (. as PATTERN | ...)` source costs, in
-/// the safe direction. A navigation off the register a routed `foreach` moved, as the right
-/// operand of an `and`/`or` (`(.a | .b)?`, jq's `try`), is refused where jq's own `try`
-/// catches the path error, because the `and`/`or` left operand does not state the register
-/// the fold left, so the resolver can only guess it (and a guess is uncatchable). #3853
-/// lifted the refusals that came from the source's own `.` body (see
-/// [`test_routed_foreach_source_under_try_is_caught_3853`]); these stay refused, for the
-/// routed source and the nested `foreach . as PAT` alike. Pinned so lifting it is a
-/// deliberate change; the jq answer is in each row.
+/// #3938 (after #3744, #3853): a navigation off the register a routed `foreach` moved, as the
+/// right operand of an `and`/`or` (`(.a | .b)?`, jq's `try`), is caught like jq's own `try`
+/// catches the path error. The `foreach` emission states the register its source's pattern
+/// walk left (a container as well as a `null`/`true`/`false`), so the refusal is jq's own
+/// "near attempt to access" -- catchable -- rather than an uncatchable guess. The routed
+/// source and the nested `foreach . as PAT` alike; every answer captured from jq 1.7.1.
 #[test]
-fn test_foreach_source_destructuring_register_under_try_stays_refused_3744() -> Result<()> {
+fn test_foreach_source_destructuring_register_under_try_is_caught_3938() -> Result<()> {
     for (input, filter, jq_answer) in [
         (
             r#"{"a":[true]}"#,
             r"del(. as $x | ((foreach (. as {$a} | .) as $k (.; .; .)) and (.a | .b)?) | $x)",
-            "{\"a\":[true]}",
+            "{\"a\":[true]}\n",
         ),
         (
             r#"{"a":1,"b":2}"#,
             r"del(try ((foreach (foreach . as {a:$a} (0; .; .)) as $x (.; .; .)) and (.a | .b)?))",
-            "{\"a\":1,\"b\":2}",
+            "{\"a\":1,\"b\":2}\n",
         ),
     ] {
         let routes = [
@@ -64881,12 +64878,8 @@ fn test_foreach_source_destructuring_register_under_try_stays_refused_3744() -> 
         for (route, (stdout, stderr, code)) in routes {
             assert_eq!(
                 (stdout.as_str(), code),
-                ("", 5),
-                "`{filter}` on {input} via {route} (jq answers {jq_answer}): stderr {stderr:?}"
-            );
-            assert!(
-                stderr.contains("Invalid path expression"),
-                "`{filter}` on {input} via {route}: {stderr:?}"
+                (jq_answer, 0),
+                "`{filter}` on {input} via {route}: stderr {stderr:?}"
             );
         }
     }
@@ -65590,15 +65583,14 @@ fn test_foreach_source_destructure_behind_a_register_forwarding_stage_raises_395
     ])
 }
 
-/// #3956, characterization of what routing the source leaves (#3646). A `foreach` whose
-/// source destructures the register, as the left operand of an `and` inside a `try` or a `?`,
-/// refuses loudly where jq's own (catchable) error is caught and the document is answered
-/// unchanged: the operand states no path register, so the right operand's navigation cannot be
-/// placed (#3646). The syntactic `(.|.)` form routed by #3940 already did this on `main`; the
-/// `select(true)` form joined it with #3956 (its by-value drive answered the same document by
-/// luck). Update the expectations when #3646 is fixed. Captured from jq 1.7.1 with `-c`.
+/// #3956 (answered since #3938): a `foreach` whose source destructures the register, as the
+/// left operand of an `and` inside a `try` or a `?`, answers the document unchanged as jq's own
+/// (catchable) error is caught. The operand's emission states the register the source's pattern
+/// walk left (#3938), so the right operand's navigation is refused the way jq refuses it, and
+/// the `try`/`?` catches it. The syntactic `(.|.)` form routed by #3940 and the `select(true)`
+/// form of #3956 alike. Captured from jq 1.7.1 with `-c`.
 #[test]
-fn test_routed_foreach_source_as_an_and_operand_under_try_refuses_3646_3956() -> Result<()> {
+fn test_routed_foreach_source_as_an_and_operand_under_try_is_caught_3956() -> Result<()> {
     for forwarder in ["(.|.)", "(.|select(true))"] {
         let rows: [(&str, String); 3] = [
             (
@@ -65618,11 +65610,7 @@ fn test_routed_foreach_source_as_an_and_operand_under_try_refuses_3646_3956() ->
             let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
             assert_eq!(
                 (stdout.as_str(), code),
-                ("", 5),
-                "`{filter}` on {input}: stderr {stderr:?}"
-            );
-            assert!(
-                stderr.contains("Invalid path expression"),
+                (format!("{input}\n").as_str(), 0),
                 "`{filter}` on {input}: stderr {stderr:?}"
             );
         }
