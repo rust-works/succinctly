@@ -168,8 +168,9 @@ follows yq, `succinctly jq` follows jq:
 
 Only `==`/`!=` take this rule (no wildcard in the dedup builtins: `unique`, `unique_by` and
 `group_by` key an ordered map on the same text and keep first-occurrence order, so `[1, "1"] |
-unique` is `[1]` and `[3,1,2,1] | unique` is `[3,1,2]`). `contains` and the ordering comparators
-keep their own semantics (see [limitations.md](../compliance/yq/limitations.md) for the
+unique` is `[1]` and `[3,1,2,1] | unique` is `[3,1,2]`). `sort` and `sort_by` follow yq's own comparator (null, then bools, integers numerically,
+otherwise the node text, containers tied) and Go's stable sort, so `[2, "10", 3] | sort` is
+`["10",2,3]`. `contains` and the ordering operators keep their own semantics (see [limitations.md](../compliance/yq/limitations.md) for the
 recorded gaps). A pairing
 that holds an array or object is never equal, as in yq: `[1] == [1]`, `{} == {}` and
 `. == .` are `false` and `!=` is `true`, so `select(. == .)` keeps only the scalars.

@@ -4402,10 +4402,10 @@ its text (`numeric_display_string`, so `==` and `tostring` agree about a compute
 
 **Not reproduced**, each its own issue:
 
-- **`contains`, array `-` and `sort`** ([#2799](https://github.com/rust-works/succinctly/issues/2799),
-  the remaining slice): they still use typed equality / jq's type ordering, where yq's `sort`
-  comparator is typed only for null/bool/number pairs and falls back to `strings.Compare` on the
-  text (so `"1"` sorts before `1`).
+- **`contains` and array `-`** keep typed equality where yq compares by text; `min`/`max`/`min_by`/
+  `max_by` keep jq's ordering where yq's comparator rejects a mixed array outright
+  (`[2, "10", 3] | min` is `!!str not yet supported for comparison` in yq;
+  [#4055](https://github.com/rust-works/succinctly/issues/4055)).
 - **A write keeps the blank lines between a head-comment block and the node below it**
   ([#4093](https://github.com/rust-works/succinctly/issues/4093)). For a node at column 0 the
   blank lines after the block are recorded as trailing empty entries of the head comment and
@@ -4528,6 +4528,64 @@ untouched. The key is `tostring`'s text, so `==` and `unique` agree about a numb
 
 Pinned by `dedup_builtins_key_on_text_in_first_occurrence_order_2799` (`tests/yq_cli_tests.rs`)
 and the `dedup_text_keys_2799`/`dedup_containers_2799` goldens.
+
+### `sort`/`sort_by` follow yq's comparator and Go's stable sort -- resolved ([#2799](https://github.com/rust-works/succinctly/issues/2799)); timestamps, absent keys, a literal `{}` and NaN remain
+
+Real yq's `sort` and `sort_by` are not jq's total order. `sortableNodeArray.compare`
+(`pkg/yqlib/operator_sort.go`, v4.53.3) decides in this order, and the first rule that applies
+wins: `null` sorts before everything; a bool before every non-bool (`false` before `true`); two
+integers numerically; two numbers (an integer and a float, or two floats) as `f64`; anything else
+by the node **texts**, byte-wise (`strings.Compare(lhs.Value, rhs.Value)`). A container's text is
+empty, so containers tie with each other and sort after the bools and before every non-empty text,
+whatever they hold. Captured live (`-o=json -I0`):
+
+| filter                                        | real yq                          | why                                       |
+|-----------------------------------------------|----------------------------------|-------------------------------------------|
+| `[2, "10", 3] \| sort`                        | `["10",2,3]`                     | an integer against a string compares by text |
+| `[.b, .a] \| sort` (`"1"`, `1`)               | `["1",1]`                        | equal texts tie, in input order           |
+| `[[2],[1]] \| sort`, `[{"a":2},{"a":1}] \| sort` | unchanged                    | containers tie                            |
+| `[1,[1],"1",{"a":1},null,true] \| sort`       | `[null,true,[1],{"a":1},1,"1"]`  | null, bool, containers, then texts        |
+| `[10,9,100,1] \| sort` / the strings          | numeric / `["1","10","100","9"]` | by kind                                   |
+
+**The comparator is not a strict weak order** (two integers compare numerically, an integer
+against a string by text, so `2 < 3`, `"10" < 2` and `3 < "10"` can all hold). The answer for a
+mixed-type array therefore depends on the sort algorithm, and yq runs Go's `sort.Stable`
+(insertion sort on blocks of 20, then `symMerge`). succinctly ports exactly that algorithm
+(`src/jq/go_sort.rs`) and uses it whenever the array mixes kinds, so a mixed array comes out in
+the order yq gives. When every element (every key position, for `sort_by`) is of one kind, the
+comparator is a total preorder and any stable sort returns the same answer, so Rust's faster
+`slice::sort_by` is used. Rust's sort is not a substitute on a mixed array: it orders it
+differently and, since Rust 1.81, may panic on the inconsistent comparison.
+
+Fixed as `eval::yq_compare_values` and `eval::yq_sort_by`, used by `builtin_sort`,
+`builtin_sort_by` and the owned `relocate` path in `eval.rs` and by `sort_keyed_elements` in
+`eval_generic.rs`. A `sort_by` key is the filter's full output list, compared position by
+position and then by length, as `sort_by(.a, .b)` is in yq. jq mode is untouched.
+
+**Not reproduced**:
+
+- **NaN and the infinities.** yq **panics** (`strconv.ParseFloat: parsing ".nan": invalid
+  syntax`, a Go runtime panic) when a number comparison reaches a `.nan` or `.inf`. This build
+  orders NaN before every other number and the infinities by value, rather than crash (the
+  ADR-0018 exception for output that would take the process down).
+- **A literal `{}` in the filter** sorts as the text `{}` in yq (its literal node carries that
+  text) and as the empty text of any other mapping here: `[.z, {}, .b] | sort` puts the literal
+  last in yq. An empty mapping read from a document sorts as empty text in both.
+- **Timestamps.** yq compares two `!!timestamp` nodes as times; `OwnedValue` has no timestamp
+  type, so they compare by text (equal for an ISO date, different for other layouts).
+- **An absent key in a `sort_by` key filter.** yq evaluates the key in a read-only context where
+  an absent key yields no output, so the element's key is `[]` and sorts before `[null]`; here
+  the absent key reads as `null` and ties with an explicit `null` (`[{k: null}, {n: 1}] |
+  sort_by(.k)` puts the absent one first in yq). `unique_by` and `group_by` read their keys the
+  same way. A separate difference, unchanged by this entry ([#4054](https://github.com/rust-works/succinctly/issues/4054)).
+- **Spellings `OwnedValue` cannot keep** ([#2802](https://github.com/rust-works/succinctly/issues/2802)):
+  a leading-zero, hex or underscored integer sorts by its resolved value here.
+
+Cost: see the measurements in the PR for #2799 part 3; the single-kind fast path keeps the common
+case on `slice::sort_by`.
+
+Pinned by `sort_follows_yqs_comparator_and_go_stable_sort_2799` (`tests/yq_cli_tests.rs`), the
+`sort_mixed_2799`/`sort_by_mixed_2799` goldens and the `go_sort` unit tests.
 
 ### A typed mapping key is a node -- resolved ([#2785](https://github.com/rust-works/succinctly/issues/2785)); its spelling, the path register and an owned rebuild remain
 
