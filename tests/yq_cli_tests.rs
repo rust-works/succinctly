@@ -59079,3 +59079,27 @@ fn test_yq_grouped_and_multi_target_writes_through_a_numeric_mapping_index_4085(
     }
     Ok(())
 }
+
+/// #4085 review: the delete trie's edge keeps an index's truncated value, not its spelling, so
+/// `.[1.0]` and `.[1]` share one and a mapping's `1.0:` member cannot be told from `1:`. A
+/// grouped `del()` carrying a spelled index therefore keeps raising rather than deleting from the
+/// wrong member (yq: `1: {b: 1}` and `1.0: {c: 3}`); a plain integer index walks into its member.
+#[test]
+fn test_yq_grouped_del_with_a_spelled_index_on_a_mapping_still_refuses_4085() -> Result<()> {
+    let doc = "a: {1: {b: 1, c: 1}, 1.0: {b: 3, c: 3}}\nl: [1, 2]\n";
+    let (out, code) = run_yq_stdin(
+        "del(.a[1.0].b, .a[1].c, .l[0])",
+        doc,
+        &["-o", "json", "-I", "0"],
+    )?;
+    assert_eq!((out.as_str(), code), ("", 1));
+    let (out, code) = run_yq_stdin("del(.a[1].b, .l[0])", doc, &["-o", "json", "-I", "0"])?;
+    assert_eq!(
+        (out.as_str(), code),
+        (
+            "{\"a\":{\"1\":{\"c\":1},\"1.0\":{\"b\":3,\"c\":3}},\"l\":[2]}\n",
+            0
+        )
+    );
+    Ok(())
+}

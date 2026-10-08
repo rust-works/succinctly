@@ -65985,6 +65985,11 @@ struct DeleteTrie {
     /// [`ArrayStep::Slice`]'s id -- what jq groups and orders slice
     /// continuations by (#3300).
     slice_components: Vec<OwnedValue>,
+    /// yq mode (#4085): some `Index` step carried a float spelling (`.[1.0]`, `.[1.5]`), which
+    /// the edge's truncated `idx` does not keep. [`delete_trie_array`] reads a mapping's member
+    /// by the index's text, so it cannot tell `.[1.0]` from `.[1]` once they share an edge and
+    /// leaves such a trie to the error it raised before.
+    spelled_index: bool,
 }
 
 impl DeleteTrie {
@@ -66051,6 +66056,7 @@ impl DeleteTrieBuilder {
             trie: DeleteTrie {
                 nodes: vec![DeleteTrieNode::new(DELETE_TRIE_ROOT, 0, true, false)],
                 slice_components: Vec::new(),
+                spelled_index: false,
             },
             memo: BTreeMap::new(),
             scratch: Vec::new(),
@@ -66131,6 +66137,7 @@ impl DeleteTrieBuilder {
             // the test that covers this site.
             Expr::Index { idx, key } => {
                 let step = array_index_step(*idx, key.as_ref(), self.yq_mode);
+                self.trie.spelled_index |= self.yq_mode && key.is_some();
                 self.array_child(parent, step, optional)
             }
             Expr::Slice {
@@ -66651,7 +66658,14 @@ fn delete_trie_array(
     // #4085: yq finds a mapping's member by the text of a numeric index, so a continuation
     // under one (`del(.a[1].b, .l[0])`) is walked into that member; a *terminal* index on a
     // mapping deletes nothing, as in the single-path form (#2353).
-    if yq_mode && matches!(value, OwnedValue::Object(_)) {
+    if yq_mode
+        && !trie.spelled_index
+        && matches!(value, OwnedValue::Object(_))
+        && node
+            .indices
+            .keys()
+            .all(|step| matches!(step, ArrayStep::Index { .. }))
+    {
         for &slot in &node.index_groups {
             let (step, &child) = node
                 .indices
