@@ -10965,9 +10965,20 @@ fn owned_select_door<S: EvalSemantics>(
     Some(RestPipe::new(stages).run_owned::<S>(input, optional, Reentry::REBUILT, sink))
 }
 
-/// Take a pipe's leading `.field`/`.[n]` natively, then re-enter with the
-/// rest on the value it lands on, instead of reindexing the whole input for
-/// the bridge (#3213).
+/// A first stage [`projection_peel`] navigates natively without asking the
+/// input: the one list both its nested-pipe pre-filter and its guard read.
+fn is_peelable_head(stage: &Expr) -> bool {
+    matches!(
+        stage,
+        Expr::Field(_) | Expr::Index { .. } | Expr::Slice { .. }
+    )
+}
+
+/// Take a pipe's leading `.field`/`.[n]`/`.[a:b]` (or `length`) natively, then
+/// re-enter with the rest on the value it lands on, instead of reindexing the
+/// whole input for the bridge (#3213). A slice is answered by
+/// [`slice_owned_value_read`], the one every other owned slice path shares
+/// (#3824), so a change to slice semantics there reaches this site too.
 ///
 /// A streaming stage hands each owned output to the rest of its pipe here --
 /// `while(...; .i += 1) | .i | select(. == 3199)` re-enters once per
@@ -11016,14 +11027,8 @@ fn projection_peel<S: EvalSemantics>(
         // The copy below is paid per re-entry, so a head that cannot peel
         // (`select(..)`, an empty pipe) is turned away before it.
         if !skip_identity_stages(inner).first().is_some_and(|head| {
-            matches!(
-                unwrap_paren(head),
-                Expr::Field(_)
-                    | Expr::Index { .. }
-                    | Expr::Slice { .. }
-                    | Expr::Pipe(_)
-                    | Expr::Builtin(Builtin::Length)
-            )
+            let head = unwrap_paren(head);
+            is_peelable_head(head) || matches!(head, Expr::Pipe(_) | Expr::Builtin(Builtin::Length))
         }) {
             return None;
         }
@@ -11036,12 +11041,7 @@ fn projection_peel<S: EvalSemantics>(
     }
     // #3477: a leading `length` steps to the count, then the rest runs on it.
     let counted = eval_owned_length(first, input);
-    if counted.is_none()
-        && !matches!(
-            first,
-            Expr::Field(_) | Expr::Index { .. } | Expr::Slice { .. }
-        )
-    {
+    if counted.is_none() && !is_peelable_head(first) {
         return None;
     }
     // `needs_path_context` of a pipe is "any stage does", so the slice is
@@ -107589,11 +107589,17 @@ mod tests {
         let slices = [
             ".[0:2]", ".[1:]", ".[:-1]", ".[-2:]", ".[2:1]", ".[:]", ".[5:100]", ".[1.5:3]",
         ];
+        fn itertools_product<'a>(
+            a: &'a [&'a str],
+            b: &'a [&'a str],
+        ) -> impl Iterator<Item = (&'a str, &'a str)> {
+            a.iter().flat_map(move |x| b.iter().map(move |y| (*x, *y)))
+        }
         let mut peeled_count = 0;
         for text in inputs {
             let input = parse_json(text);
-            for slice in slices {
-                let filter = format!("{slice} | length");
+            for (slice, tail) in itertools_product(&slices, &["length", "tojson", "."]) {
+                let filter = format!("{slice} | {tail}");
                 if let Some(jq) = peeled::<JqSemantics>(&filter, &input) {
                     peeled_count += 1;
                     assert_eq!(
@@ -107612,11 +107618,43 @@ mod tests {
             }
         }
         assert!(
-            peeled_count >= 24,
+            peeled_count >= 72,
             "arrays, strings and null must peel: {peeled_count}"
         );
         // A number is not sliceable: the bridge's error text stays the bridge's.
         assert!(peeled::<JqSemantics>(".[0:2] | length", &parse_json("5")).is_none());
+        // A number is not sliceable under `?` either: it is the bridge's to
+        // answer (empty), not the peel's.
+        let optional_slice = parse(".[0:2]? | length").unwrap();
+        assert!(projection_peel::<JqSemantics>(
+            &optional_slice,
+            &parse_json("5"),
+            true,
+            Reentry::REBUILT,
+            &mut |_| Demand::Continue
+        )
+        .is_none());
+        // Reached through the owned re-entry itself, not only the peel: a
+        // value nested to the depth limit makes the bridge raise (#3261), so an
+        // answer here shows the pipe never reached it.
+        let mut deep = OwnedValue::Null;
+        for _ in 0..crate::jq::value::MAX_VALUE_TREE_DEPTH {
+            deep = OwnedValue::array_from(vec![deep]);
+        }
+        let holder = OwnedValue::array_from(vec![deep, OwnedValue::Int(1), OwnedValue::Int(2)]);
+        let mut out = Vec::new();
+        let flow = eval_each_owned::<JqSemantics>(
+            &parse(".[1:3] | length").unwrap(),
+            &holder,
+            false,
+            Reentry::REBUILT,
+            &mut |v| {
+                out.push(v.to_json());
+                Demand::Continue
+            },
+        );
+        assert!(matches!(flow, Flow::Exhausted));
+        assert_eq!(out, ["2"]);
         // A bare slice has nothing behind it to peel for.
         assert!(peeled::<JqSemantics>(".[0:2]", &parse_json("[1,2,3]")).is_none());
     }
