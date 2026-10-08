@@ -4488,7 +4488,9 @@ Three residuals, each captured live from v4.53.3:
   members and the `1:` member, and so do `.["ab*"]` and `.["1"]`; since #2800 all of them do
   here too, a pattern also finding a typed key (`*` matches `1: y`, `true: t`, `1.5: w`).
   What remains is `.[1]`, `.[true]`, `.[null]` (and `.[1] = "z"`) on a mapping, which still answer
-  `null` (yq finds the member), a mapping key spelled `~` that no pattern matches, and yq's own
+  `null` (yq finds the member), a mapping key whose spelling the owned value has lost (`~` and `null:`
+are `null`, `0x10` is the number 16, so a pattern cannot rebuild the text yq matches; such a key is
+left out of a `.*` rather than answered with a `null`), and yq's own
   quirks, recorded rather than copied: `del(.["1"])` and `del(.[1])` on an int-spelled key are
   no-ops in yq (succinctly deletes), and `pick(.["ab*"])` is `{}` there. Not a key-node question,
   but the same `matchKey`.
@@ -5018,8 +5020,9 @@ so `*` also finds `1: y`, `true: t` and `1.5: w` (the generator spells a matchin
 text for any scalar `k` (`has(1)`, `has(true)`, `has(1.5)`); a leading-zero literal compares by
 its resolved text (`has(01)` is true here, false in yq, the recorded `01` residual). One gap
 remains: a *computed* string key (`.[ "x?" + "?" ]`) is still an exact lookup, because it is not
-a literal in the filter text. Other bytes yq keeps in an unquoted name are still operators here
-(`.a+1`, `.a%1`, `.a<1`, `.a>1` and `.a@1` are the keys `a+1`, ... in yq).
+a literal in the filter text. Once a name holds a `*` the rest of the run stays in it, as in yq (`.a*+=3` writes the key `a*+`);
+the operator bytes after a *plain* name still end it, so `.a+1`, `.a%1`, `.a<1`, `.a>1` and `.a@1`
+are operations here and the keys `a+1`, ... in yq ([#4079](https://github.com/rust-works/succinctly/issues/4079)).
 
 A wildcard key costs one pass over the mapping's keys plus one keyed lookup per match, and
 a keyed lookup into a document object is linear in its key count ([#3913](https://github.com/rust-works/succinctly/issues/3913)),

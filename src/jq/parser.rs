@@ -1355,9 +1355,20 @@ impl<'a> Parser<'a> {
         }
 
         let suffix_start = self.pos;
+        // #2800: a name that holds a `*` is a wildcard pattern, and there yq keeps the rest of the
+        // run too (`.a*+=3` writes the key `a*+`), where the operator bytes after a plain name
+        // still end it (`.a+1` is a sum here; in yq it is the key `a+1`, #4079).
+        let mut wildcard = name.contains('*');
         while self.peek().is_some_and(|c| {
-            c.is_alphanumeric() || matches!(c, '_' | '-' | '/' | '?' | '*' | '\t' | '\r' | '\u{a0}')
+            c.is_alphanumeric()
+                || matches!(c, '_' | '-' | '/' | '?' | '*' | '\t' | '\r' | '\u{a0}')
+                || (wildcard
+                    && matches!(
+                        c,
+                        '+' | '%' | '<' | '>' | '@' | '#' | '~' | '^' | '&' | '$' | '\''
+                    ))
         }) {
+            wildcard |= self.peek() == Some('*');
             self.next();
         }
         if self.pos > suffix_start && self.input.as_bytes()[self.pos - 1] == b'?' {

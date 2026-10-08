@@ -56927,6 +56927,14 @@ fn test_yq_bare_wildcard_field_and_text_keys_2800() -> Result<()> {
             "{\"a\":3,\"b\":4,\"z\":1}\n",
         ),
         ("a: 3\nb: 4\n", ".[] * 2", "6\n8\n"),
+        ("a: 1\nab: 2\n", ".a*+=3", "{\"a\":1,\"ab\":2,\"a*+\":3}\n"),
+        ("a: 1\nab: 2\n", ".a*<1", "null\n"),
+        ("a: 1\nab: 2\n", ".a*%2", "null\n"),
+        ("a: 1\nab: 2\n", ".a*$x", "null\n"),
+        ("a: 1\nab: 2\n", ".a*2", "null\n"),
+        ("a: 1\nab: 2\n", ".a*=3", "{\"a\":3,\"ab\":3}\n"),
+        ("a: 1\nab: 2\n", ".a*?=3", "{\"a\":3,\"ab\":3}\n"),
+        ("a: 1\nab: 2\n", ".a*n=3", "{\"a\":1,\"ab\":2,\"a*n\":3}\n"),
     ];
     for &(doc, filter, expected) in rows {
         let (stdout, code) = run_yq_stdin(filter, doc, &["-o", "json", "-I", "0"])?;
@@ -56936,5 +56944,23 @@ fn test_yq_bare_wildcard_field_and_text_keys_2800() -> Result<()> {
             "`{filter}` on {doc:?}"
         );
     }
+
+    // What stays different from yq: a key whose spelling the owned value has lost (`0x10` is the
+    // number 16, `null:` is `null`) is not matched by a pattern (yq matches its text `0x10`,
+    // `null`), and is left out rather than answered with a `null`; a pattern on a sequence is
+    // still the `cannot index` error, worded as for any string key.
+    let (stdout, code) = run_yq_stdin(
+        ".*",
+        "1.0: a\n0x10: h\nnull: n\nb: 2\n",
+        &["-o", "json", "-I", "0"],
+    )?;
+    assert_eq!((stdout.as_str(), code), ("\"a\"\n2\n", 0));
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr(".*", "- a\n- b\n", &["-o", "json", "-I", "0"])?;
+    assert_eq!((stdout.as_str(), code), ("", 1));
+    assert!(
+        stderr.contains("Cannot index array with string \"*\""),
+        "stderr: {stderr:?}"
+    );
     Ok(())
 }
