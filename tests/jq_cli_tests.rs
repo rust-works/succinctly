@@ -61145,6 +61145,92 @@ fn test_always_raising_try_body_leaves_the_register_where_it_entered_3965() -> R
     Ok(())
 }
 
+/// #3987: a `catch` handler that navigates under `//` leaves the register where the `try`
+/// entered it when the body raises a non-null scalar literal. `.a` on a string, number or
+/// boolean raises, the parenthesised `(.a)?` (or `try .a`) catches that, the operand emits
+/// nothing, and `// 5` takes `5`, so `$x` after the handler re-establishes (`[]`) where the
+/// resolver refused the navigating handler. A payload the program does not name (`error`
+/// raises its own input, which `.a` navigates on the register's node), a bare postfix
+/// `.a?` (it does not catch the path error), and a body that emitted before it raised are
+/// still refused, as in jq. Every row captured live from jq 1.7.1.
+#[test]
+fn test_catch_handler_navigating_under_alternative_on_a_scalar_payload_3987() -> Result<()> {
+    let doc = r#"{"a":{"b":null},"c":2}"#;
+    for (program, want) in [
+        (
+            r#"path(. as $x | try error("x") catch ((.a)? // 5) | $x)"#,
+            "[]",
+        ),
+        (
+            r"path(. as $x | try error(7) catch ((.a)? // 5) | $x)",
+            "[]",
+        ),
+        (
+            r"path(. as $x | try error(true) catch ((.[0])? // 5) | $x)",
+            "[]",
+        ),
+        (
+            r#"path(. as $x | try error("x") catch ((.[])? // 5) | $x)"#,
+            "[]",
+        ),
+        (
+            r#"path(. as $x | try error("x") catch ((.[0:1])? // 5) | $x)"#,
+            "[]",
+        ),
+        (
+            r#"path(. as $x | try error("x") catch (((.a | .b))? // 5) | $x)"#,
+            "[]",
+        ),
+        (
+            r#"path(. as $x | try error("x") catch ((.["a"])? // 5) | $x)"#,
+            "[]",
+        ),
+        (
+            r#"path(. as $x | try error("x") catch (((.a)?, 5)) | $x)"#,
+            "[]",
+        ),
+        (
+            r#"path(. as $x | try error("x") catch ((try .a) // 5) | $x)"#,
+            "[]",
+        ),
+        (
+            r#"path(. as $x | try (.a | error("x")) catch ((.a)? // 5) | $x)"#,
+            "[]",
+        ),
+        (
+            r#"del(. as $x | try error("x") catch ((.a)? // 5) | $x.a)"#,
+            r#"{"c":2}"#,
+        ),
+        (
+            r#"(. as $x | try error("x") catch ((.a)? // 5) | $x.a) = 9"#,
+            r#"{"a":9,"c":2}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(doc))?;
+        assert_eq!(code, 0, "#3987: `{program}`: stderr {stderr:?}");
+        assert_eq!(stdout.trim(), want, "#3987: `{program}`");
+    }
+    for (program, message) in [
+        (
+            r"path(. as $x | try error catch ((.a)? // 5) | $x)",
+            "Invalid path expression with result",
+        ),
+        (
+            r#"path(. as $x | try error("x") catch (.a? // 5) | $x)"#,
+            r#"Invalid path expression near attempt to access element "a" of "x""#,
+        ),
+        (
+            r#"path(. as $x | try (.a, error("x")) catch ((.a)? // 5) | $x)"#,
+            "Invalid path expression with result",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(doc))?;
+        assert_eq!(code, 5, "#3987: `{program}`: stdout {stdout:?}");
+        assert!(stderr.contains(message), "#3987: `{program}`: {stderr:?}");
+    }
+    Ok(())
+}
+
 /// #3891: the handler is seeded as the register's node only where jq keeps it
 /// tracked, and not just where the payload happens to share its storage. A payload
 /// built by value (`[.][0]`, `[.] | add`, `{"a":.} | .a`) keeps the register's `Rc`

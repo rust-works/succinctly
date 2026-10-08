@@ -43479,6 +43479,66 @@ fn body_always_raises(expr: &Expr) -> bool {
     }
 }
 
+/// Whether `expr` always raises `error(<literal>)` with a non-null scalar
+/// literal as the message (#3987): the payload its `catch` handler runs on is
+/// then a string, number or boolean the program text names, never a value the
+/// document holds.
+fn body_raises_scalar_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Error(Some(message)) => {
+            matches!(&**message, Expr::Literal(lit) if !matches!(lit, Literal::Null))
+        }
+        Expr::Paren(inner) => body_raises_scalar_literal(inner),
+        Expr::Pipe(stages) => stages.last().is_some_and(body_raises_scalar_literal),
+        _ => false,
+    }
+}
+
+/// Whether `expr` is a navigation that raises when its input is a non-null
+/// scalar: a field, index, slice or iteration step, or a pipe that starts with
+/// one (the rest of the pipe never runs).
+fn navigation_errors_on_scalar(expr: &Expr) -> bool {
+    match expr {
+        Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Slice { .. }
+        | Expr::ArrayKey(_)
+        | Expr::Iterate => true,
+        Expr::Paren(inner) => navigation_errors_on_scalar(inner),
+        Expr::Pipe(stages) => stages.first().is_some_and(navigation_errors_on_scalar),
+        _ => false,
+    }
+}
+
+/// Whether a `catch` handler provably leaves jq's path register where the `try`
+/// entered it, given that it runs on a non-null scalar literal (#3987).
+///
+/// [`cannot_move_register`] refuses a handler that navigates, because on a
+/// payload of unknown origin a navigation can succeed (the payload may be the
+/// register's own value). On a literal it cannot: `.a` on a string, number or
+/// boolean raises, and a parenthesised `(.a)?` (or `try .a`) catches that
+/// raise, so the operand emits nothing and `// R` takes `R`, the way jq answers
+/// `path(. as $x | try error("x") catch (.a)? // 5 | $x)` with `[]`. A bare
+/// postfix `.a?` does not catch the path error (#843), so it is not admitted:
+/// it raises, as in jq. `null` is excluded by the caller, since `null | .a`
+/// succeeds.
+fn handler_leaves_register_on_scalar_payload(handler: &Expr) -> bool {
+    cannot_move_register(handler)
+        || match handler {
+            Expr::Paren(inner) => handler_leaves_register_on_scalar_payload(inner),
+            Expr::Comma(stages) => stages.iter().all(handler_leaves_register_on_scalar_payload),
+            Expr::Alternative(left, right) => {
+                handler_leaves_register_on_scalar_payload(left)
+                    && handler_leaves_register_on_scalar_payload(right)
+            }
+            Expr::Optional(inner) => {
+                matches!(&**inner, Expr::Paren(nav) if navigation_errors_on_scalar(nav))
+            }
+            Expr::Try { expr, catch: None } => navigation_errors_on_scalar(expr),
+            _ => false,
+        }
+}
+
 /// Whether evaluating `expr` as one pipe stage provably leaves jq's path
 /// register (`value_at_path`) exactly where it was (#1573).
 ///
@@ -43651,7 +43711,11 @@ fn cannot_move_register(expr: &Expr) -> bool {
             // only the handler's outputs are the stage's.
             (body_always_raises(expr) || cannot_move_register(expr))
                 && match catch {
-                    Some(handler) => cannot_move_register(handler),
+                    Some(handler) => {
+                        cannot_move_register(handler)
+                            || (body_raises_scalar_literal(expr)
+                                && handler_leaves_register_on_scalar_payload(handler))
+                    }
                     None => true,
                 }
         }
