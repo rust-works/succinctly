@@ -19206,13 +19206,11 @@ fn test_dom_path_root_container_comment_gets_own_line_793b() -> Result<()> {
 /// A child's own comment and the container's own comment must both survive,
 /// as two distinct comments - not silently concatenated onto one line.
 ///
-/// The source is flow syntax (`[1, 2 ...]`), but a `#` comment runs to end
-/// of line and this one trails a non-final element, so there's nowhere for
-/// it to go on one line without breaking flow's grammar; `is_flow_safe`
-/// (#739) falls back to block rendering rather than lose the comment
-/// (real `yq` instead keeps flow with a synthetic trailing comma before
-/// the line break - a narrower fidelity gap this PR accepts, see
-/// `is_flow_safe`'s own doc comment).
+/// The source is flow syntax (`[1, 2 ...]`), and a `#` comment runs to end of
+/// line, so the DOM writer breaks the line the way go-yaml does (#2708): a
+/// synthetic trailing comma, the comment, then the closing bracket on its own
+/// line, with the container's own comment after it. Matches yq v4.53.3 for
+/// the same document.
 #[test]
 fn test_dom_path_container_and_child_comments_stay_distinct_793b() -> Result<()> {
     let (out, code) = run_yq_stdin(
@@ -19221,7 +19219,7 @@ fn test_dom_path_container_and_child_comments_stay_distinct_793b() -> Result<()>
         &["--arg", "x", "y"],
     )?;
     assert_eq!(code, 0);
-    assert_eq!(out, "items:\n  - 1\n  - 2 # child\n  # container\n");
+    assert_eq!(out, "items: [1, 2, # child\n] # container\n");
     Ok(())
 }
 
@@ -44386,6 +44384,823 @@ fn test_yq_style_tagged_loses_non_decimal_integer_spellings_2802() -> Result<()>
         let (out, err, code) = run_yq_stdin_with_stderr(".a style = \"tagged\"", doc, &[])?;
         assert_eq!(out, want, "{doc:?}: {err}");
         assert_eq!(code, 0, "{doc:?}: {err}");
+    }
+    Ok(())
+}
+
+/// #2708: a line comment on an element of a flow sequence or mapping keeps the
+/// collection in flow style, with the break placed the way go-yaml places it: after
+/// a scalar the comma comes first and the next element continues on the next line,
+/// the last one handing the closing bracket a line of its own (`[1, 2, # y` / `]`);
+/// after a nested collection the comment follows its closing bracket and the comma
+/// opens the next line (`[[1] # y` / `, 2]`); `]` closes at the enclosing indent and
+/// `}` at column 0; each flow level continues one indent width further in, rounded
+/// to a multiple of the width (`- [` under `-I3`). A comment written deeper than
+/// the container's direct children used to be dropped silently. Rows 1-18 are the
+/// triage matrix, the rest a seeded random sample over mappings, sequences, `-I`
+/// widths, multi-line comments and block parents, plus an alias (a scalar for this) and
+/// an empty collection (a collection); all captured live from yq v4.53.3.
+#[test]
+fn test_yq_line_comment_on_a_flow_element_keeps_flow_style_2708() -> Result<()> {
+    let cases: &[(&str, &str, &[&str], &str)] = &[
+        (
+            r"a: &x [1, 2]
+b: [*x, 3]
+",
+            r#".b[0] line_comment = "y""#,
+            &[],
+            r"a: &x [1, 2]
+b: [*x, # y
+  3]
+",
+        ),
+        (
+            r"a: &x [1, 2]
+b: [3, *x]
+",
+            r#".b[1] line_comment = "y""#,
+            &[],
+            r"a: &x [1, 2]
+b: [3, *x, # y
+]
+",
+        ),
+        (
+            r"a: &x [1, 2]
+b: {p: *x, q: 3}
+",
+            r#".b.p line_comment = "y""#,
+            &[],
+            r"a: &x [1, 2]
+b: {p: *x, # y
+  q: 3}
+",
+        ),
+        (
+            r"a: [[], 2]
+",
+            r#".a[0] line_comment = "x""#,
+            &[],
+            r"a: [[] # x
+, 2]
+",
+        ),
+        (
+            r"a: [{}, 2]
+",
+            r#".a[0] line_comment = "x""#,
+            &[],
+            r"a: [{} # x
+, 2]
+",
+        ),
+        (
+            r"a: [1, {}]
+",
+            r#".a[1] line_comment = "x""#,
+            &[],
+            r"a: [1, {} # x
+]
+",
+        ),
+        (
+            r"a: {b: [], c: 2}
+",
+            r#".a.b line_comment = "x""#,
+            &[],
+            r"a: {b: [] # x
+, c: 2}
+",
+        ),
+        (
+            r"a: [1, 2]
+",
+            r#".a[1] line_comment = "y""#,
+            &[],
+            r"a: [1, 2, # y
+]
+",
+        ),
+        (
+            r"a: [1, 2, 3]
+",
+            r#".a[1] line_comment = "y""#,
+            &[],
+            r"a: [1, 2, # y
+  3]
+",
+        ),
+        (
+            r"a: [1, 2]
+",
+            r#".a[0] line_comment = "y" | .a[1] line_comment = "z""#,
+            &[],
+            r"a: [1, # y
+  2, # z
+]
+",
+        ),
+        (
+            r"a: {b: 1, c: 2}
+",
+            r#".a.b line_comment = "y""#,
+            &[],
+            r"a: {b: 1, # y
+  c: 2}
+",
+        ),
+        (
+            r"a: {b: 1, c: 2}
+",
+            r#".a.c line_comment = "y""#,
+            &[],
+            r"a: {b: 1, c: 2, # y
+}
+",
+        ),
+        (
+            r"[1, 2]
+",
+            r#".[1] line_comment = "y""#,
+            &[],
+            r"[1, 2, # y
+]
+",
+        ),
+        (
+            r"a: [[1, 2, 3], 4]
+",
+            r#".a[0][1] line_comment = "y""#,
+            &[],
+            r"a: [[1, 2, # y
+    3], 4]
+",
+        ),
+        (
+            r"a: [[1, 2], 3]
+",
+            r#".a[0] line_comment = "y""#,
+            &[],
+            r"a: [[1, 2] # y
+, 3]
+",
+        ),
+        (
+            r"a: [1, 2] # c
+",
+            r#".a[1] line_comment = "y""#,
+            &[],
+            r"a: [1, 2, # y
+] # c
+",
+        ),
+        (
+            r"a: [1, 2]
+",
+            r#".a[1] line_comment = "m\nl""#,
+            &[],
+            r"a: [1, 2, # m
+  # l
+]
+",
+        ),
+        (
+            r"a: [1, 2]
+",
+            r#".a[0] anchor = "z" | .a[0] line_comment = "y""#,
+            &[],
+            r"a: [&z 1, # y
+  2]
+",
+        ),
+        (
+            r"a: {b: [1, 2]}
+",
+            r#".a.b[0] line_comment = "y""#,
+            &[],
+            r"a: {b: [1, # y
+    2]}
+",
+        ),
+        (
+            r"a: [{b: 1}, 2]
+",
+            r#".a[0].b line_comment = "y""#,
+            &[],
+            r"a: [{b: 1, # y
+}, 2]
+",
+        ),
+        (
+            r"a: [1, 2]
+",
+            r#".a[0] line_comment = "y""#,
+            &["-I4"],
+            r"a: [1, # y
+    2]
+",
+        ),
+        (
+            r"x:
+  a: [1, 2]
+",
+            r#".x.a[1] line_comment = "y""#,
+            &["-I4"],
+            r"x:
+    a: [1, 2, # y
+    ]
+",
+        ),
+        (
+            r"a: [[[1, 2]]]
+",
+            r#"(.. | select(. == 1)) line_comment = "c""#,
+            &["-I3"],
+            r"a: [[[1, # c
+         2]]]
+",
+        ),
+        (
+            r"- [[[1, 2]]]
+",
+            r#"(.. | select(. == 1)) line_comment = "c""#,
+            &["-I3"],
+            r"- [[[1, # c
+      2]]]
+",
+        ),
+        (
+            r"- a: [[[1, 2]]]
+",
+            r#"(.. | select(. == 1)) line_comment = "c""#,
+            &["-I4"],
+            r"- a: [[[1, # c
+            2]]]
+",
+        ),
+        (
+            r"- {a: null}
+",
+            r#".[0].a line_comment = "a b0""#,
+            &[],
+            r"- {a: null, # a b0
+}
+",
+        ),
+        (
+            r#"a: [{c: 3.5, d: "yy", b: "yy"}, [true, true], true]
+"#,
+            r#".a[1][0] line_comment = "a b0""#,
+            &[],
+            r#"a: [{c: 3.5, d: "yy", b: "yy"}, [true, # a b0
+    true], true]
+"#,
+        ),
+        (
+            r#"["x"]
+"#,
+            r#".[0] line_comment = "m\nl0""#,
+            &["-I3"],
+            r#"["x", # m
+   # l0
+]
+"#,
+        ),
+        (
+            r"x:
+  a: {d: [1, 3.5]}
+",
+            r#".x.a.d line_comment = "c0" | .x.a.d[0] line_comment = "c1" | .x.a.d[1] line_comment = "c2""#,
+            &[],
+            r"x:
+  a: {d: [1, # c1
+      3.5, # c2
+    ] # c0
+}
+",
+        ),
+        (
+            r#"a: ["x", [true, "yy"], ["yy", "x", 2]]
+"#,
+            r#".a[1] line_comment = "c0" | .a[2][0] line_comment = "a b1" | .a[2][1] line_comment = "a b2""#,
+            &["-I4"],
+            r#"a: ["x", [true, "yy"] # c0
+, ["yy", # a b1
+        "x", # a b2
+        2]]
+"#,
+        ),
+        (
+            r#"- [["x", 2, "yy"], "yy", {a: true}]
+"#,
+            r#".[0][1] line_comment = "c0""#,
+            &["-I3"],
+            r#"- [["x", 2, "yy"], "yy", # c0
+  {a: true}]
+"#,
+        ),
+        (
+            r#"[{d: "x", b: true, c: "yy"}]
+"#,
+            r#".[0] line_comment = "a b0" | .[0].d line_comment = "a b1""#,
+            &[],
+            r#"[{d: "x", # a b1
+    b: true, c: "yy"} # a b0
+]
+"#,
+        ),
+        (
+            r"x:
+  a: [null, 2, 1]
+",
+            r#".x.a[0] line_comment = "c0" | .x.a[1] line_comment = "m\nl1" | .x.a[2] line_comment = "a b2""#,
+            &[],
+            r"x:
+  a: [null, # c0
+    2, # m
+    # l1
+    1, # a b2
+  ]
+",
+        ),
+        (
+            r#"[[1, 1, null], {b: "x", d: "x"}]
+"#,
+            r#".[0][0] line_comment = "a b0" | .[0][2] line_comment = "c1" | .[0] line_comment = "c2""#,
+            &["-I4"],
+            r#"[[1, # a b0
+        1, null, # c1
+    ] # c2
+, {b: "x", d: "x"}]
+"#,
+        ),
+        (
+            r#"[[null, "yy", 3.5], [2, 1]]
+"#,
+            r#".[0][2] line_comment = "a b0" | .[0] line_comment = "m\nl1" | .[1] line_comment = "m\nl2""#,
+            &[],
+            r#"[[null, "yy", 3.5, # a b0
+  ] # m
+  # l1
+, [2, 1] # m
+  # l2
+]
+"#,
+        ),
+        (
+            r"x:
+  a: [[true, 2, null]]
+",
+            r#".x.a[0] line_comment = "a b0" | .x.a[0][1] line_comment = "a b1""#,
+            &["-I4"],
+            r"x:
+    a: [[true, 2, # a b1
+            null] # a b0
+    ]
+",
+        ),
+        (
+            r#"a: {d: null, a: [2, "yy", "x"]}
+"#,
+            r#".a.a line_comment = "c0""#,
+            &[],
+            r#"a: {d: null, a: [2, "yy", "x"] # c0
+}
+"#,
+        ),
+        (
+            r#"a: [[3.5, 3.5, 3.5], "yy", ["x", 1, "yy"]]
+"#,
+            r#".a[2] line_comment = "a b0" | .a[0][2] line_comment = "a b1" | .a[0][0] line_comment = "a b2""#,
+            &["-I3"],
+            r#"a: [[3.5, # a b2
+      3.5, 3.5, # a b1
+   ], "yy", ["x", 1, "yy"] # a b0
+]
+"#,
+        ),
+        (
+            r#"- [null, "yy", {c: 3.5}]
+"#,
+            r#".[0][0] line_comment = "m\nl0""#,
+            &["-I4"],
+            r#"- [null, # m
+  # l0
+  "yy", {c: 3.5}]
+"#,
+        ),
+        (
+            r#"- a: [true, "yy"]
+"#,
+            r#".[0].a[1] line_comment = "m\nl0" | .[0].a[0] line_comment = "c1""#,
+            &[],
+            r#"- a: [true, # c1
+    "yy", # m
+    # l0
+  ]
+"#,
+        ),
+        (
+            r#"- [null, {c: 2, a: "yy"}, null]
+"#,
+            r#".[0][2] line_comment = "a b0""#,
+            &["-I3"],
+            r#"- [null, {c: 2, a: "yy"}, null, # a b0
+]
+"#,
+        ),
+        (
+            r#"x:
+  a: {c: "yy", d: "x"}
+"#,
+            r#".x.a.c line_comment = "a b0" | .x.a.d line_comment = "c1""#,
+            &[],
+            r#"x:
+  a: {c: "yy", # a b0
+    d: "x", # c1
+}
+"#,
+        ),
+        (
+            r#"- [true, {b: "yy", c: null, d: 3.5}, [2]]
+"#,
+            r#".[0][0] line_comment = "c0""#,
+            &["-I3"],
+            r#"- [true, # c0
+  {b: "yy", c: null, d: 3.5}, [2]]
+"#,
+        ),
+        (
+            r#"- {d: ["x", true, 3.5], a: null}
+"#,
+            r#".[0].d[2] line_comment = "m\nl0" | .[0].a line_comment = "c1" | .[0].d[1] line_comment = "a b2""#,
+            &["-I4"],
+            r#"- {d: ["x", true, # a b2
+    3.5, # m
+    # l0
+  ], a: null, # c1
+}
+"#,
+        ),
+        (
+            r#"- a: {d: "yy"}
+"#,
+            r#".[0].a.d line_comment = "m\nl0""#,
+            &[],
+            r#"- a: {d: "yy", # m
+    # l0
+}
+"#,
+        ),
+        (
+            r#"a: {c: {b: null, c: "x"}}
+"#,
+            r#".a.c.b line_comment = "a b0""#,
+            &["-I4"],
+            r#"a: {c: {b: null, # a b0
+        c: "x"}}
+"#,
+        ),
+        (
+            r#"- a: [[1, "x"], ["x"]]
+"#,
+            r#".[0].a[0][1] line_comment = "a b0" | .[0].a[0] line_comment = "c1""#,
+            &[],
+            r#"- a: [[1, "x", # a b0
+    ] # c1
+, ["x"]]
+"#,
+        ),
+        (
+            r#"- a: [["x", "yy"], "x"]
+"#,
+            r#".[0].a[0][0] line_comment = "a b0" | .[0].a[0][1] line_comment = "c1""#,
+            &["-I3"],
+            r#"- a: [["x", # a b0
+      "yy", # c1
+   ], "x"]
+"#,
+        ),
+        (
+            r#"x:
+  a: [{b: "x", a: "x"}, ["x"]]
+"#,
+            r#".x.a[1][0] line_comment = "c0""#,
+            &[],
+            r#"x:
+  a: [{b: "x", a: "x"}, ["x", # c0
+    ]]
+"#,
+        ),
+        (
+            r#"x:
+  a: [["yy"], {d: true}, "yy"]
+"#,
+            r#".x.a[1] line_comment = "m\nl0" | .x.a[1].d line_comment = "c1" | .x.a[0] line_comment = "a b2""#,
+            &["-I3"],
+            r#"x:
+   a: [["yy"] # a b2
+, {d: true, # c1
+} # m
+      # l0
+, "yy"]
+"#,
+        ),
+        (
+            r#"- [[1], {c: "yy", d: true}]
+"#,
+            r#".[0][1].d line_comment = "a b0" | .[0][1].c line_comment = "m\nl1""#,
+            &["-I4"],
+            r#"- [[1], {c: "yy", # m
+    # l1
+    d: true, # a b0
+}]
+"#,
+        ),
+        (
+            r"a: {a: 3.5}
+",
+            r#".a.a line_comment = "m\nl0""#,
+            &[],
+            r"a: {a: 3.5, # m
+  # l0
+}
+",
+        ),
+        (
+            r"x:
+  a: [[3.5, 2, 1]]
+",
+            r#".x.a[0][1] line_comment = "c0""#,
+            &[],
+            r"x:
+  a: [[3.5, 2, # c0
+      1]]
+",
+        ),
+        (
+            r#"- [["yy", "x", 3.5]]
+"#,
+            r#".[0][0] line_comment = "a b0""#,
+            &["-I4"],
+            r#"- [["yy", "x", 3.5] # a b0
+]
+"#,
+        ),
+        (
+            r#"x:
+  a: {c: "yy"}
+"#,
+            r#".x.a.c line_comment = "c0""#,
+            &["-I4"],
+            r#"x:
+    a: {c: "yy", # c0
+}
+"#,
+        ),
+        (
+            r"- [2, [1]]
+",
+            r#".[0][1][0] line_comment = "c0" | .[0][0] line_comment = "c1" | .[0][1] line_comment = "m\nl2""#,
+            &["-I4"],
+            r"- [2, # c1
+  [1, # c0
+  ] # m
+  # l2
+]
+",
+        ),
+        (
+            r#"{a: [true, 3.5, "yy"]}
+"#,
+            r#".a line_comment = "c0""#,
+            &[],
+            r#"{a: [true, 3.5, "yy"] # c0
+}
+"#,
+        ),
+        (
+            r"a: [{c: true}]
+",
+            r#".a[0] line_comment = "m\nl0" | .a[0].c line_comment = "m\nl1""#,
+            &[],
+            r"a: [{c: true, # m
+    # l1
+} # m
+  # l0
+]
+",
+        ),
+        (
+            r"- [[true, 2]]
+",
+            r#".[0][0] line_comment = "a b0" | .[0][0][0] line_comment = "a b1" | .[0][0][1] line_comment = "c2""#,
+            &["-I3"],
+            r"- [[true, # a b1
+   2, # c2
+  ] # a b0
+]
+",
+        ),
+        (
+            r"a: [true]
+",
+            r#".a[0] line_comment = "m\nl0""#,
+            &[],
+            r"a: [true, # m
+  # l0
+]
+",
+        ),
+        (
+            r#"- ["yy", null, true]
+"#,
+            r#".[0][0] line_comment = "a b0""#,
+            &["-I4"],
+            r#"- ["yy", # a b0
+  null, true]
+"#,
+        ),
+        (
+            r"a: [null]
+",
+            r#".a[0] line_comment = "c0""#,
+            &[],
+            r"a: [null, # c0
+]
+",
+        ),
+        (
+            r"a: [null]
+",
+            r#".a[0] line_comment = "a b0""#,
+            &["-I4"],
+            r"a: [null, # a b0
+]
+",
+        ),
+        (
+            r"[[true, 2, 2], null]
+",
+            r#".[0][0] line_comment = "c0" | .[1] line_comment = "m\nl1" | .[0][1] line_comment = "a b2""#,
+            &["-I3"],
+            r"[[true, # c0
+      2, # a b2
+      2], null, # m
+   # l1
+]
+",
+        ),
+        (
+            r"a: [[3.5, true]]
+",
+            r#".a[0][0] line_comment = "c0" | .a[0] line_comment = "c1" | .a[0][1] line_comment = "m\nl2""#,
+            &["-I4"],
+            r"a: [[3.5, # c0
+        true, # m
+        # l2
+    ] # c1
+]
+",
+        ),
+        (
+            r#"[["x"], {c: true, a: null, d: 1}]
+"#,
+            r#".[1] line_comment = "a b0" | .[0] line_comment = "m\nl1""#,
+            &[],
+            r#"[["x"] # m
+  # l1
+, {c: true, a: null, d: 1} # a b0
+]
+"#,
+        ),
+        (
+            r#"- [[2, "yy"]]
+"#,
+            r#".[0][0][1] line_comment = "m\nl0""#,
+            &["-I4"],
+            r#"- [[2, "yy", # m
+    # l0
+  ]]
+"#,
+        ),
+        (
+            r#"- a: {d: "x", a: "x", b: [true, "x", true]}
+"#,
+            r#".[0].a.b[1] line_comment = "a b0""#,
+            &[],
+            r#"- a: {d: "x", a: "x", b: [true, "x", # a b0
+      true]}
+"#,
+        ),
+        (
+            r#"a: [["x", "yy"], 3.5, 3.5]
+"#,
+            r#".a[0][1] line_comment = "m\nl0" | .a[2] line_comment = "m\nl1""#,
+            &["-I4"],
+            r#"a: [["x", "yy", # m
+        # l0
+    ], 3.5, 3.5, # m
+    # l1
+]
+"#,
+        ),
+        (
+            r#"x:
+  a: {b: "x", d: [3.5, 2]}
+"#,
+            r#".x.a.d[0] line_comment = "c0" | .x.a.b line_comment = "c1" | .x.a.d[1] line_comment = "c2""#,
+            &[],
+            r#"x:
+  a: {b: "x", # c1
+    d: [3.5, # c0
+      2, # c2
+    ]}
+"#,
+        ),
+        (
+            r#"- [{b: 2, a: "yy", c: 3.5}, ["yy"], 1]
+"#,
+            r#".[0][1] line_comment = "a b0" | .[0][0].c line_comment = "m\nl1" | .[0][0].a line_comment = "c2""#,
+            &["-I4"],
+            r#"- [{b: 2, a: "yy", # c2
+    c: 3.5, # m
+    # l1
+}, ["yy"] # a b0
+, 1]
+"#,
+        ),
+        (
+            r#"- a: [[null, "yy", 3.5], 3.5]
+"#,
+            r#".[0].a[0] line_comment = "m\nl0" | .[0].a[0][1] line_comment = "c1""#,
+            &[],
+            r#"- a: [[null, "yy", # c1
+      3.5] # m
+    # l0
+, 3.5]
+"#,
+        ),
+        (
+            r#"- a: {a: {c: "x", b: "yy"}, d: 3.5}
+"#,
+            r#".[0].a.a.b line_comment = "a b0" | .[0].a.a line_comment = "m\nl1" | .[0].a.a.c line_comment = "a b2""#,
+            &[],
+            r#"- a: {a: {c: "x", # a b2
+      b: "yy", # a b0
+} # m
+    # l1
+, d: 3.5}
+"#,
+        ),
+        (
+            r#"[{c: "x", b: "yy"}, {a: 3.5}, null]
+"#,
+            r#".[1] line_comment = "c0" | .[0] line_comment = "a b1" | .[0].c line_comment = "m\nl2""#,
+            &["-I4"],
+            r#"[{c: "x", # m
+        # l2
+        b: "yy"} # a b1
+, {a: 3.5} # c0
+, null]
+"#,
+        ),
+        (
+            r#"- {d: "yy", a: {a: "x", c: 3.5, d: 3.5}}
+"#,
+            r#".[0].d line_comment = "a b0" | .[0].a.c line_comment = "m\nl1""#,
+            &["-I4"],
+            r#"- {d: "yy", # a b0
+  a: {a: "x", c: 3.5, # m
+    # l1
+    d: 3.5}}
+"#,
+        ),
+        (
+            r"[[3.5], 2, {a: null}]
+",
+            r#".[1] line_comment = "a b0""#,
+            &["-I3"],
+            r"[[3.5], 2, # a b0
+   {a: null}]
+",
+        ),
+        (
+            r#"- a: [[true, "x"]]
+"#,
+            r#".[0].a[0] line_comment = "c0" | .[0].a[0][0] line_comment = "m\nl1""#,
+            &["-I3"],
+            r#"- a: [[true, # m
+      # l1
+      "x"] # c0
+  ]
+"#,
+        ),
+    ];
+    for (doc, filter, extra, want) in cases {
+        let (out, err, code) = run_yq_stdin_with_stderr(filter, doc, extra)?;
+        assert_eq!(out, *want, "`{filter}` {extra:?} on {doc:?}: {err}");
+        assert_eq!(code, 0, "`{filter}` {extra:?} on {doc:?}: {err}");
     }
     Ok(())
 }
