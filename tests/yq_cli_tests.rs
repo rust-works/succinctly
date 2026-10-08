@@ -18763,11 +18763,14 @@ mod meta_assign_798 {
             // this pass runs at all from the body alone (a separate,
             // hand-rolled walk, not `any_subexpr`), so the body must already
             // look like a write for `count_meta_assigns` to ever see the key.
-            // A body that is *not* independently write-shaped (e.g. plain
-            // `.` or `$v`) still silently drops this same write today --
-            // `is_alias_sensitive_assign` has its own, separate computed-key
-            // blind spot, filed as #3203.
             ". as {((.a line_comment = \"x\") | .a): $v} | .b = 1",
+            // #3203: the same write with a body that is *not* independently
+            // write-shaped (`.`, `$v`). `is_alias_sensitive_assign` used to
+            // decide from the body alone, so the pass never ran and the write
+            // was dropped silently (exit 0, document unchanged).
+            ". as {((.a line_comment = \"x\") | .a): $v} | .",
+            ". as [{((.a style = \"double\") | .a): $v}] | .",
+            ". as {((.a anchor = \"z\") | .a): $v} | select(true)",
         ] {
             let (out, err, code) = run_yq_stdin_with_stderr(filter, "a: 1\nb: hi\n", &[]).unwrap();
             assert_eq!(code, 1, "[{filter}] stderr: {err}");
@@ -18777,6 +18780,23 @@ mod meta_assign_798 {
                 "[{filter}] stderr: {err}"
             );
         }
+    }
+
+    /// #3203: only a *metadata* write in a destructuring pattern's computed key
+    /// opens the metadata pass. A value-shaped write there (`=`) runs against the
+    /// bound value to build a key and never against the document the body returns,
+    /// so it is evaluated like any other key expression and the document passes
+    /// through untouched -- it neither refuses nor makes `.` a write.
+    #[test]
+    fn value_write_in_a_pattern_key_does_not_open_the_metadata_pass_3203() {
+        let filter = ". as {((.a = \"a\") | .a): $v} | .";
+        let (out, err, code) = run_yq_stdin_with_stderr(filter, "a: k\nk: 1\n", &[]).unwrap();
+        assert_eq!(code, 0, "[{filter}] stderr: {err}");
+        assert_eq!(out, "a: k\nk: 1\n", "[{filter}]");
+        assert!(
+            !err.contains("only supported as a top-level pipe stage"),
+            "[{filter}] stderr: {err}"
+        );
     }
 
     /// `--inplace` takes the same DOM write path (`is_alias_sensitive_assign`
