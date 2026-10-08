@@ -59605,6 +59605,35 @@ fn test_yq_tonumber_of_a_number_writes_3460() -> Result<()> {
     Ok(())
 }
 
+/// #4016: `ltrimstr`/`rtrimstr` return their input as the same `jv` unless a string
+/// argument matches the string input's edge. Every row is a live jq 1.7.1 capture.
+#[test]
+fn test_path_register_survives_non_matching_trim_4016() -> Result<()> {
+    const DOC: &str = r#"{"b":"s","t":"xs","n":2,"s":"st"}"#;
+    // (filter, stdout, exit code)
+    const ROWS: &[(&str, &str, i32)] = &[
+        (r#"path(.b|ltrimstr("x"))"#, "[\"b\"]\n", 0),
+        (r#"path(.s|rtrimstr("z"))"#, "[\"s\"]\n", 0),
+        (r#"path(.n|ltrimstr("x"))"#, "[\"n\"]\n", 0),
+        (r"path(.b|ltrimstr(1))", "[\"b\"]\n", 0),
+        (
+            r#"(.b|ltrimstr("x")) = 9"#,
+            "{\"b\":9,\"t\":\"xs\",\"n\":2,\"s\":\"st\"}\n",
+            0,
+        ),
+        // A match (an empty argument matches) builds a fresh string: refused.
+        (r#"path(.t|ltrimstr("x"))"#, "", 5),
+        (r#"path(.s|rtrimstr("t"))"#, "", 5),
+        (r#"path(.b|ltrimstr(""))"#, "", 5),
+    ];
+    for (filter, want_stdout, want_code) in ROWS {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(DOC))?;
+        assert_eq!(stdout, *want_stdout, "`{filter}`: stderr: {stderr:?}");
+        assert_eq!(code, *want_code, "`{filter}`: stderr: {stderr:?}");
+    }
+    Ok(())
+}
+
 /// #3460, yq mode must-not-change: `(.b|tostring) = "z"` is a no-op in yq v4.53.3
 /// and stays one here.
 #[test]
@@ -63261,7 +63290,7 @@ fn test_any_all_cond_on_a_computed_element_raises_as_jq_does_3757() -> Result<()
             r#"[{"a":true}]"#,
             r#"path(any(ltrimstr("x"); .a))"#,
             "",
-            "Invalid path expression",
+            "Cannot index array with string",
             5,
         ),
         (
@@ -76712,9 +76741,9 @@ fn test_terminal_null_after_a_navigation_refuses_loudly_3579() -> Result<()> {
         (
             r"null",
             r#"path(.a|ltrimstr("x")|null)"#,
+            "[\"a\"]\n",
             "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
-            5,
+            0,
         ),
         // (`walk(.)` was one of these until #3361, `reverse` until #3711 and a
         // `reduce` that computes its accumulator until #3710: each leaves the
@@ -76724,9 +76753,9 @@ fn test_terminal_null_after_a_navigation_refuses_loudly_3579() -> Result<()> {
         (
             r"null",
             r#"path(.a|rtrimstr("x")|null)"#,
+            "[\"a\"]\n",
             "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
-            5,
+            0,
         ),
     ])
 }
@@ -114007,9 +114036,6 @@ fn test_bind_sources_the_resolver_cannot_place_refuse_loudly_3795() -> Result<()
         r"del((def f: .; f) as $x | try $x.a)",
         r"((def f: .; f) as $x | try $x.a) = 9",
         r"del(first(def f: .; f) as $x | try $x.a)",
-        r#"del(ltrimstr("x") | ((., 1) | .) as $x | try $x.a)"#,
-        r#"del(ltrimstr("x") | (if .z then 1 else . end) as $x | try $x.a)"#,
-        r#"del(ltrimstr("x") | foreach ((., 1) | .) as $x (null; .; try $x.a))"#,
     ] {
         for_both_evaluators_3795(doc, filter, |label, out, stderr, code| {
             assert_eq!((out, code), ("", 5), "{label} {filter}: {stderr:?}");
@@ -114026,6 +114052,20 @@ fn test_bind_sources_the_resolver_cannot_place_refuse_loudly_3795() -> Result<()
         (
             r#"del(ltrimstr("x") | ({"a":2} | (., 1)) as $x | try $x.a)"#,
             doc,
+        ),
+        // A non-matching `ltrimstr` hands its input back as the same `jv` (#4016),
+        // so the register survives it and jq's `{}` is answered.
+        (
+            r#"del(ltrimstr("x") | ((., 1) | .) as $x | try $x.a)"#,
+            "{}",
+        ),
+        (
+            r#"del(ltrimstr("x") | (if .z then 1 else . end) as $x | try $x.a)"#,
+            "{}",
+        ),
+        (
+            r#"del(ltrimstr("x") | foreach ((., 1) | .) as $x (null; .; try $x.a))"#,
+            "{}",
         ),
     ] {
         for_both_evaluators_3795(doc, filter, |label, out, stderr, code| {

@@ -3288,8 +3288,8 @@ answers `["b"]` — and classified the two residuals appended below):
     `@text` are jq mode only (yq's `(.b|tostring) = "z"` is a no-op); `tonumber` of a number
     writes in both modes, as in yq v4.53.3. Still refused where jq answers (never a write): a
     *bound* result, `path(.b|tostring as $y|$y)` and `path(.n|tonumber as $x|$x)` (the bind-source
-    analyses do not know these stages return their input), and `ltrimstr`/`rtrimstr` with no match
-    ([#4016](https://github.com/rust-works/succinctly/issues/4016)). The sweep alphabet cannot spell
+    analyses do not know these stages return their input),. `ltrimstr`/`rtrimstr` with a literal argument that does not match return their input too (#4016);
+    a non-literal argument still refuses. The sweep alphabet cannot spell
     the bound shape. Tracked as
     [#3460](https://github.com/rust-works/succinctly/issues/3460). Closed by #3460's first
     half: the accumulator's node carried from one source element to the next
