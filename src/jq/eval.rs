@@ -44209,9 +44209,16 @@ fn entry_marker_shape(expr: &Expr) -> EntryMarkers {
             catch: Some(_),
         } => entry_marker_shape(inner).join(EntryMarkers::Forwarded),
         Expr::Comma(items) => {
-            let shape = items.iter().fold(EntryMarkers::None, |acc, item| {
-                acc.join(entry_marker_shape(item))
-            });
+            // #3959: a sibling that leaves the register alone is judged by that, not by what
+            // is inside it -- a pipe of non-navigating stages (`(.|length)`, `(2|.+1)`) holds an
+            // untracked `.` that would read as a producer, but it takes the register from the
+            // frame and hands it on where it entered, as a bare `length` does.
+            let shape = items
+                .iter()
+                .filter(|item| !operand_leaves_register(item))
+                .fold(EntryMarkers::None, |acc, item| {
+                    acc.join(entry_marker_shape(item))
+                });
             // #3941: jq forks the comma, so each sibling starts from the register the comma
             // was entered with, and a sibling that leaves it alone states it
             // ([`carry_frame_register`], #3862) exactly as an alternate does. A comma of such
@@ -44220,10 +44227,8 @@ fn entry_marker_shape(expr: &Expr) -> EntryMarkers {
             // register-less and a `try` swallowed the refusal. This reads it for every stage that
             // asks, so a comma after a destructuring bind outside a fold is read too.
             //
-            // Only a sibling `operand_leaves_register` recognises counts, and an opaque sibling
-            // (a pipe with a `.` in it) keeps the whole comma opaque: `(.|length)` and
-            // `(2|.+1)` still skip the write (#3959), `now` and `input_line_number` still refuse
-            // (#3960).
+            // Only a sibling `operand_leaves_register` recognises counts, and a sibling it does
+            // not (`now`, `input_line_number`) still refuses (#3960).
             if shape == EntryMarkers::None && items.iter().any(operand_leaves_register) {
                 EntryMarkers::Forwarded
             } else {
