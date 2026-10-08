@@ -81,12 +81,12 @@ use super::eval::{
     suppresses, tonumber_from_str, tostring_owned, try_handler_root, vec_with_capacity,
     yq_absent_key_read_is_empty, yq_assign_rhs_document, yq_dedup_key, yq_empty_context_reemit,
     yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_first_of_each_key,
-    yq_negative_index_check, yq_negative_index_error, yq_numeric_index_on_object_is_null,
-    yq_object_key_stringify, yq_read_only_context, yq_scalar_text, BinaryFanoutRules,
-    ComputedSliceBound, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
-    JqSemantics, LimitN, PathTrail, QueryResult, RangeNum, Reentry, RestPipe, RootWitness,
-    SliceTargetKind, StashedEscape, StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED,
-    WHILE_UNTIL_MAX_STEPS,
+    yq_index_key_is_numeric, yq_literal_index_text, yq_mapping_index_text, yq_negative_index_check,
+    yq_negative_index_error, yq_numeric_index_on_object_is_null, yq_object_key_stringify,
+    yq_read_only_context, yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand,
+    EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail,
+    QueryResult, RangeNum, Reentry, RestPipe, RootWitness, SliceTargetKind, StashedEscape,
+    StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED, WHILE_UNTIL_MAX_STEPS,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -11418,7 +11418,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             }
         }
 
-        Expr::Index { idx, .. } => {
+        Expr::Index { idx, key } => {
             if let Some(elements) = value.as_array() {
                 // #2594: `len_checked`'s walk holds only elements, so a
                 // zero-element `[,]` answered `null` here for every index.
@@ -11472,12 +11472,22 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 // errored while `null | .[$n]` — the same query, and the same
                 // rule in `index_one_generic` — returned null.
                 GenericResult::Owned(OwnedValue::Null)
-            } else if value.as_object().is_some() && yq_numeric_index_on_object_is_null::<S>() {
+            } else if let (Some(fields), true) =
+                (value.as_object(), yq_numeric_index_on_object_is_null::<S>())
+            {
                 // #2459: yq mode only -- `.a[5]` on a mapping is `null`, the
                 // same rule `index_one_generic`'s own numeric-key arm
                 // applies for the computed-key sibling `.a[$k]`. See
-                // `eval::yq_numeric_index_on_object_is_null`.
-                GenericResult::Owned(OwnedValue::Null)
+                // `eval::yq_numeric_index_on_object_is_null`. #4079: unless the mapping
+                // has a member whose key text is the index (`.[1]` finds `1:`).
+                match crate::jq::key_index::find_cursor_memoized(
+                    &fields,
+                    &yq_literal_index_text::<S>(*idx, key.as_ref()).unwrap_or_default(),
+                ) {
+                    Ok(Some(c)) => GenericResult::OneCursor(c),
+                    Ok(None) => GenericResult::Owned(OwnedValue::Null),
+                    Err(err) => GenericResult::Error(err),
+                }
             } else if yq_field_index_on_scalar_is_empty::<S>() {
                 // #2482 (yq mode): every yq-mode `Object` case was already
                 // absorbed by the branch above (the predicate there is
@@ -19791,6 +19801,19 @@ fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
             Err(e) => GenericResult::Error(e),
         };
     }
+    // #4079: yq finds a mapping's member by the *text* of a numeric, boolean or `null` index
+    // (`.[1]` is the `1:` member); a miss keeps the rules below (`null`).
+    if let (Some(fields), Some(text)) = (target.as_object(), yq_mapping_index_text::<S>(key)) {
+        match crate::jq::key_index::find_cursor_memoized(&fields, &text) {
+            Ok(Some(c)) => return GenericResult::OneCursor(c),
+            Ok(None) => {
+                if !yq_index_key_is_numeric(key) {
+                    return GenericResult::Owned(OwnedValue::Null);
+                }
+            }
+            Err(err) => return GenericResult::Error(err),
+        }
+    }
     match key {
         OwnedValue::String(s) => {
             // #2470: same rule as `Expr::Field`'s own arm -- a computed
@@ -22578,6 +22601,13 @@ fn path_field_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
     )))
 }
 
+/// The key text a literal numeric index `idx` (spelled `key`, a float's own digits) names in a
+/// yq mapping (#4079): the integer's decimal digits, or the float's text.
+fn component_text_for_index(idx: i64, key: Option<&NumberKey>) -> String {
+    yq_scalar_text::<YqSemantics>(&index_component_value(idx, key))
+        .map_or_else(|| idx.to_string(), Cow::into_owned)
+}
+
 /// A literal numeric index reaches at most one position. Share this step
 /// between the collecting path walk and the path-context callback walk.
 fn path_index_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
@@ -22614,8 +22644,20 @@ fn path_index_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
                         .and_then(|i| crate::jq::array_index::get_cursor_memoized(&elements, i))
                         .map_or(PathNode::Absent, PathNode::At)
                 }
-            } else if v.as_object().is_some() && yq_numeric_index_on_object_is_null::<S>() {
-                PathNode::Absent
+            } else if let (Some(fields), true) =
+                (v.as_object(), yq_numeric_index_on_object_is_null::<S>())
+            {
+                // #4079: the member whose key text is the index (`.[1]` finds `1:`); a miss
+                // stays the absent position of #2459. The component is the index itself, which
+                // is what yq's `path` answers for a typed key.
+                match crate::jq::key_index::find_cursor_memoized(
+                    &fields,
+                    &component_text_for_index(idx, key),
+                ) {
+                    Ok(Some(c)) => PathNode::At(c),
+                    Ok(None) => PathNode::Absent,
+                    Err(err) => return Err(err),
+                }
             } else if yq_field_index_on_scalar_is_empty::<S>() {
                 return Ok(None);
             } else {

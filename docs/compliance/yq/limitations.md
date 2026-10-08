@@ -2302,8 +2302,12 @@ RHS-discard predicate tweak like its siblings above):
   $ printf 'a:\n  - 1\n  - 2\n' | succinctly yq -o=json -I=0 '.a[5][].b = error("boom")'
   Error: boom
   ```
-- **An `Index` step mid-chain hits a real `Object`.** Real yq coerces the numeric index to a
-  string key and inserts it; succinctly has no such coercion and evaluates the RHS instead:
+- **An `Index` step mid-chain hits a real `Object`.** Resolved by
+  [#4079](https://github.com/rust-works/succinctly/issues/4079): yq finds a mapping's member by the
+  *text* of a numeric, boolean or `null` index (`.[1]` is the `1:` member, an absent one is created
+  as the key `1`), and the write walkers now do the same, so `.a[0][].b = 9` on `a: {}` is
+  `{"a":{"0":[]}}` as in yq. What is left of the example is the right side, which succinctly still
+  evaluates when the write has no targets:
   ```bash
   $ printf 'a: {}\n' | yq            -o=json -I=0 '.a[0][].b = error("boom")'
   {"a":{"0":[]}}
@@ -2316,14 +2320,26 @@ Pinned as known-divergent by `test_yq_assign_all_noop_mismatched_element_type_14
 match yq: an `Index` step hitting a genuine scalar mid-chain permanently no-ops the whole
 write (#1232), same as every other position.
 
-**The *read* side of the third bullet is resolved ([#2459](https://github.com/rust-works/succinctly/issues/2459)):**
-a terminal (not mid-chain) numeric index landing on a real `Object` -- `.a[5]` on
-`a: {b: 1}` -- now answers `null` in yq mode, matching real yq's own read (confirmed live:
-`.a[5]` is `null`, `.a[5] | key` is `5`, `.a[5] | path` is `["a",5]`), via
-`eval::yq_numeric_index_on_object_is_null`. The *write* side above is untouched by that
-fix and remains exactly the coercion gap this section describes -- `.a[5] = 1` still
-raises `Cannot index object with number` in succinctly where real yq inserts a string key
-(`{"a":{"b":1,"5":1}}`).
+**The *read* side of the third bullet is resolved ([#2459](https://github.com/rust-works/succinctly/issues/2459)),
+and so is the write side ([#4079](https://github.com/rust-works/succinctly/issues/4079)):**
+a numeric index landing on a real `Object` -- `.a[5]` on `a: {b: 1}` -- answers `null` in yq
+mode when no member has that key text, matching real yq's own read (confirmed live: `.a[5]` is `null`,
+`.a[5] | key` is `5`, `.a[5] | path` is `["a",5]`), via `eval::yq_numeric_index_on_object_is_null`;
+since #4079 it answers the member whose key text is the index when there is one (`.[1]` on
+`1: y` is `"y"`, `.[true]`, `.[null]` and `.[1.5]` likewise), and `.a[5] = 1` inserts the string
+key as yq does (`{"a":{"b":1,"5":1}}`) instead of raising `Cannot index object with number`.
+A float literal keeps its spelling (`.[1.0]` finds the `1.0:` member and `.[1.9]` the `1.9:` one, as
+yq does), but `.[01]` is parsed as the integer `1`, so it finds -- and a write updates -- the `1:`
+member where yq answers the `01:` one (the recorded lost-spelling residual).
+
+**Still raising: a write grouped with other targets.** The single-target forms above (`.a[1] = 7`,
+`|=`, `+=`, `style=`/`anchor=`/`line_comment=`, a computed key) work, but the eager path walker
+(`walk_path`, `step_into`, `classify_static_component`) and `setpath` read a numeric component on
+an object separately from `set_path`, so a write whose targets are enumerated first still raises
+`Cannot index object with number` where yq updates the member (and `del` leaves a mapping's
+member alone): `(.a[1], .a[2]) = 7`,
+`(.a[1], .a.x) = 7`, `(.a[1] // .z) = 3`, `(.a | select(.[1] == "y") | .[1]) = 1`,
+`(.a[1], .l[0]) = 3` and `del(.a[1], .l[0])`.
 
 ### `=`'s multi-output RHS: real yq takes only the last value, no fan-out
 
@@ -4498,18 +4514,17 @@ Three residuals, each captured live from v4.53.3:
   `IndexMap<String, _>` and their type is not recoverable. `entries_to_object`
   stringifies a typed key on reassembly in both tools (#2521), so `with_entries(.)` itself
   agrees.
-- **Traversal matches a key by text for a string, a bare name and `has()`; a numeric, boolean or
-  null *index* still does not** ([#2800](https://github.com/rust-works/succinctly/issues/2800)).
-  yq's `matchKey` compares texts, so `.ab*`, `.*`, `.1` and `has(1)` find the `ab*`-matching
-  members and the `1:` member, and so do `.["ab*"]` and `.["1"]`; since #2800 all of them do
-  here too, a pattern also finding a typed key (`*` matches `1: y`, `true: t`, `1.5: w`).
-  What remains is `.[1]`, `.[true]`, `.[null]` (and `.[1] = "z"`) on a mapping, which still answer
-  `null` (yq finds the member), a mapping key whose spelling the owned value has lost (`~` and `null:`
-are `null`, `0x10` is the number 16, so a pattern cannot rebuild the text yq matches; such a key is
-left out of a `.*` rather than answered with a `null`), and yq's own
-  quirks, recorded rather than copied: `del(.["1"])` and `del(.[1])` on an int-spelled key are
-  no-ops in yq (succinctly deletes), and `pick(.["ab*"])` is `{}` there. Not a key-node question,
-  but the same `matchKey`.
+- **Traversal matches a key by text** ([#2800](https://github.com/rust-works/succinctly/issues/2800),
+  [#4079](https://github.com/rust-works/succinctly/issues/4079)). yq's `matchKey` compares texts, so
+  `.ab*`, `.*`, `.1`, `has(1)`, `.[1]`, `.[true]` and `.[null]` find the `ab*`-matching members and
+  the `1:`, `true:` and `null:` members, and so do `.["ab*"]` and `.["1"]`; a pattern also finds a
+  typed key (`*` matches `1: y`, `true: t`, `1.5: w`), and `.[1] = "z"` updates or creates the member.
+  What remains: a mapping key whose spelling the owned value has lost (`~` and `null:` are `null`,
+  `0x10` is the number 16, so a pattern cannot rebuild the text yq matches; such a key is left out of
+  a `.*` rather than answered with a `null`), a literal index's own spelling (`.[01]`, above),
+  and yq's own quirks, recorded rather than copied: `del(.["1"])` and `del(.[1])` on an int-spelled
+  key are no-ops in yq (succinctly deletes), and `pick(.["ab*"])` is `{}` there. Not a key-node
+  question, but the same `matchKey`.
 
 Pinned by `key_node_metadata_2763::a_typed_key_is_a_node_too_2785` and the
 `typed_key_node_2785` module (`tests/yq_cli_tests.rs`), plus the `typed_key_*_2785`
