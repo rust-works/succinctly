@@ -2898,7 +2898,20 @@ is the revert that established what the other one costs.
    `neutral_leaves_register` (only an `if`'s condition is a subexp, a collect backtracks, and a
    handler runs after the fork restored the register). What still skips the write silently,
    where jq writes, is a navigating element inside an array (`[$v|.b?]`, which jq backtracks) and
-   the builtins of the exclusion list above as a bare UPDATE. A boolean register
+   the builtins of the exclusion list above as a bare UPDATE. A pipe whose last stage is a comma
+   with a navigating sibling, behind stages that cannot move the register (`1 | (not, ($v|.b?))`,
+   `length | (floor, ($v|.b?))`), is read like the comma alone
+   ([#4059](https://github.com/rust-works/succinctly/issues/4059), pinned by
+   `test_foreach_update_pipe_into_a_comma_with_a_navigating_sibling_keeps_the_register_4059`):
+   its first sibling's path was dropped and, over a `null` source, the surviving path was written
+   through where jq raises. A sibling that navigates and then computes (`$v|.b?|tostring`,
+   `$v|.b?|not`) leaves jq's register on what it navigated to, and EXTRACT runs from there
+   ([#4063](https://github.com/rust-works/succinctly/issues/4063), pinned by
+   `test_foreach_update_navigated_then_computed_sibling_moves_the_register_4063`): it used to be
+   read as the fold's own register whenever the two values were equal (`null`, `true`, `false`).
+   A navigating pipe on the accumulator (`. | .b?`) and a trailing `| .` after the comma still
+   skip a path over a `null` source (characterized by
+   `test_foreach_update_null_source_register_shapes_characterize_4063`). A boolean register
    still refuses for a bool-returning builtin next to a navigating comma sibling (`contains(true)`,
    `isnan`), because jq reads an equal boolean result as the register itself and the model does not
    carry that there; with no navigating sibling the carried register is compared with the result,
@@ -2932,8 +2945,9 @@ is the revert that established what the other one costs.
    `test_foreach_update_under_try_over_a_generator_keeps_the_register_3738`,
    `test_foreach_update_under_try_around_a_generator_keeps_the_register_3770`,
    `test_foreach_update_under_try_with_a_comma_inside_a_pipe_keeps_the_register_3770`,
-   `test_foreach_update_under_try_with_a_comma_above_a_pipe_keeps_the_register_3862` and, for what stays,
-   `test_foreach_update_under_try_with_sibling_branches_characterize_preexisting_bug_3770`.
+   `test_foreach_update_under_try_with_a_comma_above_a_pipe_keeps_the_register_3862` and, for an `and` body
+   on `null` (fixed by [#4063](https://github.com/rust-works/succinctly/issues/4063)),
+   `test_foreach_update_under_try_with_an_and_body_on_null_keeps_the_register_3770`.
 
    **`resolve_as_pattern`'s own first-step identity test recognizes every
    `is_identity_passthrough` spelling now** —
