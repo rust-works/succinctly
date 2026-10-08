@@ -3607,8 +3607,9 @@ fn write_json_string(output: &mut String, s: &str) {
 /// Write a JSON character escape sequence to output.
 /// Helper for direct transcoding functions.
 ///
-/// Everything >= 0x20 (including C1 controls 0x80-0x9F and higher
-/// codepoints) streams as raw UTF-8, matching `stream_json_escape`'s policy
+/// Everything >= 0x20 except U+2028/U+2029 (which yq always escapes, see
+/// `stream_json_escape`) -- including C1 controls 0x80-0x9F and higher
+/// codepoints -- streams as raw UTF-8, matching `stream_json_escape`'s policy
 /// and yq's own output: JSON only requires escaping `"`, `\`, and C0
 /// controls. An earlier version of this function additionally re-escaped
 /// non-ASCII characters as `\u00XX`/`\uXXXX`, which diverged from
@@ -3812,7 +3813,8 @@ fn transcode_double_quoted_to_json(
                 // Copy the safe span
                 let chunk = core::str::from_utf8(&bytes[start..end])
                     .map_err(|_| YamlStringError::InvalidUtf8)?;
-                output.push_str(chunk);
+                // `String`'s `fmt::Write` never fails (see `write_json_string`).
+                let _ = crate::jq::escape::write_json_span_yq(output, chunk);
             }
         }
     }
@@ -3898,7 +3900,8 @@ fn transcode_single_quoted_to_json(
                 }
                 let chunk = core::str::from_utf8(&bytes[start..end])
                     .map_err(|_| YamlStringError::InvalidUtf8)?;
-                output.push_str(chunk);
+                // `String`'s `fmt::Write` never fails (see `write_json_string`).
+                let _ = crate::jq::escape::write_json_span_yq(output, chunk);
             }
         }
     }
@@ -4455,7 +4458,7 @@ fn stream_json_escape<Out: core::fmt::Write>(out: &mut Out, ch: char) -> core::f
         // (#2663).
         '\u{2028}' => out.write_str("\\u2028"),
         '\u{2029}' => out.write_str("\\u2029"),
-        // Everything >= 0x20 (including C1 controls 0x80-0x9F and higher
+        // Everything else >= 0x20 (including C1 controls 0x80-0x9F and higher
         // codepoints) streams as raw UTF-8, matching `stream_json_string`'s
         // policy and yq's own output: JSON only requires escaping `"`, `\`,
         // and C0 controls. An earlier version of this function additionally
@@ -4649,7 +4652,7 @@ fn stream_transcode_double_quoted_to_json<Out: core::fmt::Write>(
                 }
                 let chunk = core::str::from_utf8(&bytes[start..end])
                     .map_err(|_| YamlStringError::InvalidUtf8)?;
-                out.write_str(chunk)
+                crate::jq::escape::write_json_span_yq(out, chunk)
                     .map_err(|_| YamlStringError::InvalidUtf8)?;
             }
         }
@@ -4733,7 +4736,7 @@ fn stream_transcode_single_quoted_to_json<Out: core::fmt::Write>(
                 }
                 let chunk = core::str::from_utf8(&bytes[start..end])
                     .map_err(|_| YamlStringError::InvalidUtf8)?;
-                out.write_str(chunk)
+                crate::jq::escape::write_json_span_yq(out, chunk)
                     .map_err(|_| YamlStringError::InvalidUtf8)?;
             }
         }
@@ -11750,6 +11753,70 @@ mod tests {
             let mut streamed = String::new();
             stream_transcode_double_quoted_to_json(&mut streamed, bytes, true).unwrap();
             assert_eq!(streamed, transcoded, "{text}");
+        }
+    }
+
+    /// The four quoted-scalar transcoders (buffered and streaming, double- and
+    /// single-quoted) copy the text between YAML escapes and folds verbatim, and
+    /// that copy has to escape U+2028/U+2029 like every other route (#2607,
+    /// #2663). A separator raw in the source, beside each feature that forces a
+    /// transcode, comes out as `\u2028`/`\u2029` from all four, and `…`/`→`
+    /// (which share the separators' lead byte) stay raw.
+    #[test]
+    fn test_quoted_transcoders_escape_separators_in_copied_text_2663() {
+        let ls = "\u{2028}";
+        let ps = "\u{2029}";
+        for dq in [
+            format!("a{ls}b\\n c{ps}d"),
+            format!("{ls}\\\" {ps}"),
+            format!("x{ls}y\n  z{ps}"),
+            format!("\u{2026} \u{2192} {ls}\\t{ps}\u{2026}"),
+        ] {
+            let bytes = dq.as_bytes();
+            let mut buffered = String::new();
+            transcode_double_quoted_to_json(&mut buffered, bytes, false).unwrap();
+            let mut streamed = String::new();
+            stream_transcode_double_quoted_to_json(&mut streamed, bytes, false).unwrap();
+            assert_eq!(buffered, streamed, "{dq:?}");
+            assert!(!buffered.contains(ls) && !buffered.contains(ps), "{dq:?}");
+            assert_eq!(
+                buffered.matches("\\u2028").count(),
+                dq.matches(ls).count(),
+                "{dq:?}"
+            );
+            assert_eq!(
+                buffered.matches("\\u2029").count(),
+                dq.matches(ps).count(),
+                "{dq:?}"
+            );
+            assert_eq!(
+                buffered.matches('\u{2026}').count(),
+                dq.matches('\u{2026}').count(),
+                "{dq:?}: near-miss code points stay raw"
+            );
+        }
+        for sq in [
+            format!("a{ls}b'' c{ps}d"),
+            format!("x{ls}y\n  z{ps}"),
+            format!("''{ls}\u{2026}{ps}''"),
+        ] {
+            let bytes = sq.as_bytes();
+            let mut buffered = String::new();
+            transcode_single_quoted_to_json(&mut buffered, bytes).unwrap();
+            let mut streamed = String::new();
+            stream_transcode_single_quoted_to_json(&mut streamed, bytes).unwrap();
+            assert_eq!(buffered, streamed, "{sq:?}");
+            assert!(!buffered.contains(ls) && !buffered.contains(ps), "{sq:?}");
+            assert_eq!(
+                buffered.matches("\\u2028").count(),
+                sq.matches(ls).count(),
+                "{sq:?}"
+            );
+            assert_eq!(
+                buffered.matches("\\u2029").count(),
+                sq.matches(ps).count(),
+                "{sq:?}"
+            );
         }
     }
 

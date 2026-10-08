@@ -52982,6 +52982,54 @@ fn test_yq_json_output_escapes_line_and_paragraph_separators_on_every_path_2607(
     Ok(())
 }
 
+/// #2607 / #2663 review: a quoted scalar that holds an escape, a `''` pair or a
+/// line fold is transcoded rather than echoed, and the transcoders copy the text
+/// between those features verbatim -- a second place a raw U+2028/U+2029 byte
+/// could slip through unescaped. Each row is captured whole from yq v4.53.3,
+/// and each scalar mixes a separator with the feature that forces the transcode.
+#[test]
+fn test_yq_json_output_escapes_separators_in_transcoded_scalars_2607() -> Result<()> {
+    let ls = "\u{2028}";
+    let ps = "\u{2029}";
+    for (yaml, want) in [
+        (
+            format!("a: \"x{ls}y \\\" z\"\n"),
+            "{\"a\":\"x\\u2028y \\\" z\"}\n",
+        ),
+        (format!("b: 'p{ps}q '' r'\n"), "{\"b\":\"p\\u2029q ' r\"}\n"),
+        (
+            format!("a: \"x{ls}y\\n z\"\n"),
+            "{\"a\":\"x\\u2028y\\n z\"}\n",
+        ),
+        (format!("a: \"q\\t{ls}y\"\n"), "{\"a\":\"q\\t\\u2028y\"}\n"),
+        // A line fold in a double- and a single-quoted scalar.
+        (format!("a: \"x{ls}y\n  z\"\n"), "{\"a\":\"x\\u2028y z\"}\n"),
+        (format!("a: 'x{ls}y\n  z'\n"), "{\"a\":\"x\\u2028y z\"}\n"),
+        (format!("- \"x{ls}y \\\" z\"\n"), "[\"x\\u2028y \\\" z\"]\n"),
+        (
+            format!("{{a: \"x{ls}y \\\" z\"}}\n"),
+            "{\"a\":\"x\\u2028y \\\" z\"}\n",
+        ),
+    ] {
+        let args = ["-o", "json", "-I0"];
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(".", &yaml, &args)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (want, "", 0),
+            "{yaml:?}"
+        );
+        // The DOM route agrees with the streaming one.
+        let dom = ["-o", "json", "-I0", "--arg", "x", "1"];
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(".", &yaml, &dom)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (want, "", 0),
+            "--arg {yaml:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3643 promoted `last(f)` to leave jq's path register in place in jq mode
 /// only (ADR-0018: yq has no oracle for it). With the jq-only surface enabled,
 /// yq mode still refuses `del(. as $x | last(.a) | $x.k)` exactly as before.

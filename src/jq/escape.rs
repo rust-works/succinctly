@@ -136,14 +136,15 @@ pub fn write_json_body_jq_ascii<W: Write>(out: &mut W, s: &str) -> core::fmt::Re
 /// single-byte scan (every one of `"`, `\`, `< 0x20` is a distinct byte
 /// value, and both separators' bytes are all `>= 0x80`) — a span the scan
 /// reports as escape-free is copied here byte for byte, so it still needs
-/// its own check. Gated on a cheap `contains(0xE2)` byte-existence probe
-/// first (mirroring this module's `contains_cr` precheck): only the lead
-/// byte both separators share with a broad swath of otherwise-ordinary
-/// non-ASCII text (curly quotes, em dash, bullets, ...), so almost every
-/// span skips the per-character walk entirely, and the two-hit case this
-/// exists for is rare enough in real documents that paying for it with a
-/// linear scan (rather than widening the shared SIMD scanner every caller
-/// of `find_json_escape` pays for) is the right trade.
+/// its own check. Gated on a cheap `contains(0xE2)` byte-existence probe,
+/// run once per string (#2663; per span it charged a string with many escapes
+/// -- a block scalar's every line -- one call per span): only the lead byte
+/// both separators share with a broad swath of otherwise-ordinary non-ASCII
+/// text (curly quotes, em dash, bullets, ...), so almost every string skips
+/// the separator walk entirely, and the two-hit case this exists for is rare
+/// enough in real documents that paying for it with a linear scan (rather
+/// than widening the shared SIMD scanner every caller of `find_json_escape`
+/// pays for) is the right trade.
 pub fn write_json_body_yq<W: Write>(out: &mut W, s: &str) -> core::fmt::Result {
     let bytes = s.as_bytes();
     let len = bytes.len();
@@ -217,6 +218,20 @@ fn write_yq_span_escaping_separators<W: Write>(out: &mut W, span: &str) -> core:
         }
     }
     out.write_str(&span[start..])
+}
+
+/// Write `span` -- text a caller has already split at every `"`, `\` and
+/// `< 0x20` byte -- with U+2028/U+2029 escaped, as [`write_json_body_yq`] does
+/// for the spans it finds itself. For the YAML quoted-scalar transcoders, which
+/// copy the stretches between YAML escapes and line folds verbatim and so never
+/// pass through that function's scan (#2663).
+#[inline]
+pub(crate) fn write_json_span_yq<W: Write>(out: &mut W, span: &str) -> core::fmt::Result {
+    if span.as_bytes().contains(&0xE2) {
+        write_yq_span_escaping_separators(out, span)
+    } else {
+        out.write_str(span)
+    }
 }
 
 /// [`write_json_body_yq`], plus `\uXXXX` for every non-ASCII character — yq's

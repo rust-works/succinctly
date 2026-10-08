@@ -4835,7 +4835,8 @@ fn advance_cursor_to(&self, cursor: &mut SequentialCursor, target: usize) {
 > snippet below describe the pre-#125 layout and are kept as a historical record.
 >
 > **Update (#965):** the scan loop itself moved out of `write_json_string()` and
-> into `stream_json_string()`, which became the single implementation (buffered
+> into `stream_json_string()`, which became the single implementation (since #2663
+> a wrapper over `jq::escape::write_json_body_yq`; buffered
 > callers, including `write_json_string()`, are now thin wrappers over it). Every
 > `write_json_string()` reference below — "the problem", the inlining findings,
 > "Files Modified" — describes where this optimization originally landed, not

@@ -6348,8 +6348,8 @@ fn run_yq_inner(args: YqCommand) -> Result<i32> {
     // only ASCII, so every non-ASCII character in the stream is string
     // content by construction. See `AsciiEscapeWriter` (`src/jq/escape.rs`)
     // for that argument in full, and for why it also leaves
-    // `stream_json_string`'s #965-sensitive SIMD scan compiled exactly as
-    // before.
+    // the streaming string writer's SIMD scan (`write_json_body_yq`'s,
+    // #2663) compiled exactly as before.
     //
     // Extracted into one local (rather than repeating the expression at
     // `can_json_fast_path`, `can_inplace_json_fast_path`, and
