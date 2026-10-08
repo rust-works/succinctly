@@ -51160,7 +51160,8 @@ fn walk_descendants(
 /// alive while its children run (see [`each_recurse_walk`]'s memory note). That
 /// is what lets it go uncapped: the walk is bounded by the tree, at the price
 /// of one `cond` per node and of the owned tree that [`walk_descendants`]'s
-/// cursor twin avoids (1.5 to 1.8 times `..`'s time and about twice its
+/// cursor twin avoids (jq mode over a live document takes `each_recurse_cursor_generic`'s
+/// gated cursor walk instead, #3867, which asks `cond` in this same order) (1.5 to 1.8 times `..`'s time and about twice its
 /// memory, measured in `docs/compliance/jq/limitations.md`).
 ///
 /// A container's children are pushed only once the sink has accepted it, so a

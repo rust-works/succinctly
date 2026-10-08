@@ -59597,6 +59597,68 @@ fn test_path_with_a_computed_key_repeats_to_the_same_answer_4001() -> Result<()>
     Ok(())
 }
 
+/// #3867: `recurse(.[]?; cond)` over a live document walks cursors, asking `cond` of
+/// each non-root node as it is popped. The order and the stopping rules are the
+/// owned walk's (and jq's): a child's whole subtree is delivered before the next
+/// sibling's `cond` runs, a `cond` that raises does so after the earlier subtrees
+/// and before any later sibling, and the root never meets `cond`. Every row is a
+/// live jq 1.7.1 capture.
+#[test]
+fn test_recurse_cond_cursor_walk_keeps_the_owned_walks_order_3867() -> Result<()> {
+    // (document, filter, stdout, exit code)
+    const ROWS: &[(&str, &str, &str, i32)] = &[
+        (
+            "[1,[2],3]",
+            r#"recurse(.[]?; if . == 2 then error("x") else true end)"#,
+            "[1,[2],3]\n1\n[2]\n",
+            5,
+        ),
+        (
+            "[[1,[2]],[3],4]",
+            r#"[recurse(.[]?; type == "array")]"#,
+            "[[[1,[2]],[3],4],[1,[2]],[2],[3]]\n",
+            0,
+        ),
+        (
+            "[[1,[2]],[3],4]",
+            r"[limit(2; recurse(.[]?; true))]",
+            "[[[1,[2]],[3],4],[1,[2]]]\n",
+            0,
+        ),
+        (
+            r#"{"a":[1,{"b":2}],"c":null}"#,
+            r"[recurse(.[]?; . != null) | tojson]",
+            "[\"{\\\"a\\\":[1,{\\\"b\\\":2}],\\\"c\\\":null}\",\"[1,{\\\"b\\\":2}]\",\"1\",\"{\\\"b\\\":2}\",\"2\"]\n",
+            0,
+        ),
+        // A node is decoded where something reads it, as `..` does: a string that will
+        // not decode inside a subtree `cond` prunes is never raised (jq 1.7.1 rejects the
+        // document at parse time, so there is no reference answer).
+        (
+            r#"[1,["\ud800x",2],3]"#,
+            r#"recurse(.[]?; type != "array")"#,
+            "[1,[\"\\ud800x\",2],3]\n1\n3\n",
+            0,
+        ),
+        // The root is delivered without `cond`, so a first output never runs it.
+        (
+            "[1,[2]]",
+            r#"first(recurse(.[]?; if . == 1 then error("y") else true end))"#,
+            "[1,[2]]\n",
+            0,
+        ),
+    ];
+    for (doc, filter, want_stdout, want_code) in ROWS {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(
+            stdout, *want_stdout,
+            "`{filter}` on {doc}: stderr {stderr:?}"
+        );
+        assert_eq!(code, *want_code, "`{filter}` on {doc}: stderr {stderr:?}");
+    }
+    Ok(())
+}
+
 /// #3460 (second half): `tostring`/`@text` of a string and `tonumber` of a number
 /// return their input as the same `jv`, so `path()` and an update accept them where
 /// every other input builds a fresh value and is refused. Not specific to a fold.

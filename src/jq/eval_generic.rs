@@ -13135,7 +13135,7 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown)
             if cursor.is_some() =>
         {
-            each_recurse_cursor_generic::<S, V>(cursor.expect("guarded"), sink)
+            each_recurse_cursor_generic::<S, V>(cursor.expect("guarded"), None, sink)
         }
         // #3719: jq defines bare `recurse` as `recurse(.[]?)`, so the spelled-out
         // form is the same walk and takes the same cursor route. Without this it
@@ -13144,7 +13144,21 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         Expr::Builtin(Builtin::RecurseF(f))
             if cursor.is_some() && crate::jq::eval::is_structural_descent(f, None) =>
         {
-            each_recurse_cursor_generic::<S, V>(cursor.expect("guarded"), sink)
+            each_recurse_cursor_generic::<S, V>(cursor.expect("guarded"), None, sink)
+        }
+        // #3867: and `recurse(.[]?; cond)` for a `cond` that yields at most one value
+        // -- the owned walk's `walk_descendants_gated`, without materializing the
+        // document (`first(recurse(.[]?; true))` over a 7 MB document was 5x `..`'s
+        // memory).
+        // Jq mode only: in yq mode a mapping with a duplicate key read through a position
+        // (`recurse(.[]?; true) | path`) counts the repeated key's node once more than the owned
+        // walk, a divergence left to its own issue.
+        Expr::Builtin(Builtin::RecurseCond(f, cond))
+            if S::TAG == EvalTag::Jq
+                && cursor.is_some()
+                && crate::jq::eval::is_gated_structural_descent(f, Some(cond)) =>
+        {
+            each_recurse_cursor_generic::<S, V>(cursor.expect("guarded"), Some(cond), sink)
         }
 
         // #2908: `path(f)` is a generator, so a consumer satisfied by the
@@ -13468,7 +13482,8 @@ fn each_foreach_generic<S: EvalSemantics, V: DocumentValue>(
     )
 }
 
-/// `..` from a cursor: the node, then every descendant in document order,
+/// `..` from a cursor (and, with a `cond`, `recurse(.[]?; cond)` for a `cond` yielding at
+/// most one value, #3867): the node, then every descendant in document order,
 /// each delivered as a live cursor (spine 2416, walk residue). `..` is
 /// `recurse(.[]?)`, so a node whose members cannot be listed ends its own
 /// branch silently -- except for the decode failure `?` never catches
@@ -13484,10 +13499,44 @@ fn each_foreach_generic<S: EvalSemantics, V: DocumentValue>(
 /// before, so the order of outputs and errors is unchanged.
 fn each_recurse_cursor_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: V::Cursor,
+    cond: Option<&Expr>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
     let mut pending: Vec<V::Cursor> = vec![cursor];
+    let mut at_root = true;
     while let Some(cursor) = pending.pop() {
+        // #3867: `recurse(.[]?; cond)` asks `cond` of a node when it is popped, not
+        // when its parent pushes it -- a child's whole subtree is done before the
+        // next sibling's `cond` runs, and one that raises does so after the earlier
+        // siblings' subtrees were delivered ([`recurse_gate_verdict`] is the owned
+        // walk's twin). The root is delivered without it, as `r` emits `.` first.
+        // The caller admitted only a `cond` yielding at most one value, so one
+        // truthy verdict keeps the child once.
+        let is_root = core::mem::take(&mut at_root);
+        if let Some(cond) = cond.filter(|_| !is_root) {
+            let mut keep = false;
+            let mut verdicts = 0u32;
+            let flow =
+                eval_each_generic::<S, V>(cond, cursor.value(), false, Some(cursor), &mut |item| {
+                    verdicts += 1;
+                    keep |= generic_item_is_truthy(&item);
+                    Demand::Continue
+                });
+            // The walk's bound rests on the admission rule: a second verdict would visit a
+            // child once per truthy output where this visits it once.
+            debug_assert!(
+                verdicts <= 1,
+                "an admitted `cond` yielded {verdicts} values"
+            );
+            match flow {
+                // `cond` is never stopped: the sink above always continues.
+                Flow::Exhausted | Flow::Stopped { .. } => {}
+                escaped @ Flow::Escaped(_) => return escaped,
+            }
+            if !keep {
+                continue;
+            }
+        }
         if matches!(sink.push(GenericItem::OneCursor(cursor)), Demand::Stop) {
             return Flow::Stopped { pending: None };
         }
@@ -49368,6 +49417,38 @@ mod tests {
         ] {
             let expr = parse(src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
             assert_eq!(path_expr_observes_no_identity(&expr), blind, "{src}");
+        }
+    }
+
+    /// #3867: `recurse(.[]?; cond)` over a live document delivers its nodes as cursors,
+    /// the way `..` does, and asks `cond` only of the non-root nodes. An owned walk
+    /// would deliver `GenericItem::Owned` values and materialize the document first.
+    #[test]
+    fn recurse_cond_over_a_live_node_delivers_cursors_3867() {
+        let json = br#"{"a":[1,{"b":2}],"c":null,"d":[3]}"#;
+        for (filter, delivered) in [
+            ("recurse(.[]?; true)", 8usize),
+            ("recurse(.[]?; . != null)", 7),
+            ("recurse(.[]?; type == \"array\")", 3),
+            ("recurse(.[]?; false)", 1),
+        ] {
+            let expr = parse(filter).expect("filter parses");
+            let index = JsonIndex::build(json);
+            let root = index.root(json);
+            let mut kinds = Vec::new();
+            let flow = eval_each_generic::<JqSemantics, _>(
+                &expr,
+                root.value(),
+                false,
+                Some(root),
+                &mut |item| {
+                    kinds.push(matches!(item, GenericItem::OneCursor(_)));
+                    Demand::Continue
+                },
+            );
+            assert!(matches!(flow, Flow::Exhausted), "{filter}");
+            assert_eq!(kinds.len(), delivered, "{filter}");
+            assert!(kinds.iter().all(|cursor| *cursor), "{filter}: {kinds:?}");
         }
     }
 
