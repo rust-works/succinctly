@@ -1995,7 +1995,7 @@ impl<W> From<EvalError> for QueryResult<'_, W> {
 
 /// The message of the internal error a deferred `as` binding raises when it is
 /// read with no cursor of its own document in hand (#3856). Reaching it means
-/// `eval_generic::deferred_bind_reads_are_sound` admitted a position it should
+/// `eval_generic::deferred_bind_reads` admitted a position it should
 /// not have; it is never a user error, and never a guessed value.
 pub(crate) const DEFERRED_BIND_UNRESOLVED: &str =
     "internal: a deferred variable binding was read without a cursor of its document (#3856)";

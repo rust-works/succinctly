@@ -37,28 +37,32 @@
 //! **Does the read share what the eager bind shared?** The eager bind decoded
 //! the node once and registered the result in the embed table (#2889), so every
 //! later materialization of *that node* -- `{r: $x}`, `$x == .`, `[$x]`, `$x |
-//! tojson` -- was handed the one `Rc` instead of decoding again. A deferred
-//! read has no entry to hit: it decodes the node each time it runs. That is
-//! free for a read that runs once per bind (it is the decode the eager bind
-//! paid, moved to where it is needed), and a loss that grows with the document
-//! for one that runs once per element of a collection:
-//! `. as $x | .users[] | select(.id < 300) | {r: $x}` decodes the whole document
-//! per element where the eager bind shared one copy (0.18 s against 6.7 s on a
-//! 1.4 MB document). So once a stage has *repeated* the ambient (`.[]`, or
-//! anything not known to yield one output), a read of `$x` is admitted only as
-//! the head of a chain of field reads that nothing consumes as a pipe stage
-//! (`$x.limit` as an operand, an object value, an array element). That reads a
-//! member of the node, never the node, and the eager bind did not share a
-//! member either: a descendant is materialized from its own cursor each time,
-//! before and after. A bare `$x`, `$x | length` and `$x | tojson` under a
-//! repeated ambient keep the eager decode.
+//! tojson` -- was handed the one `Rc` instead of decoding again. A deferred bind
+//! registers a *lazy* entry for its node (#4036, `eval_generic::embed_lazy_push`):
+//! the first materialization builds the value and fills the entry, and every
+//! later one shares it. So a bare read of `$x` costs the one decode the eager
+//! bind paid, moved to where it is needed, however many times it runs: once per
+//! element of a collection is no different from once. That is what lets
+//! `. as $x | .users[] | select(.id < 300) | {r: $x}` defer (it decoded the whole
+//! document per element before the entry, 0.18 s against 6.7 s on a 1.4 MB
+//! document, which is why a bare read under a repeated ambient was refused).
+//!
+//! What is still refused under a repeated ambient is a *member chain* something
+//! goes on to consume (`$x.users | length`, `$x.users[0]`, `$x.nodes[.from]`):
+//! that navigates a cursor per element where the eager bind walked an owned
+//! value, and a cursor walks an array to its index (#4035). A chain nothing
+//! consumes as a pipe stage (`$x.limit` as an operand, an object value, an array
+//! element) reads a member, never the node, and is admitted.
+//!
+//! The entry needs a thread-local table, so without `std` ([`LAZY_SHARES`]) a
+//! bare read under a repeated ambient is refused as before. A body that repeats
+//! such a read is [`DeferredReads::Sharing`]; every other sound body is
+//! [`DeferredReads::Navigating`].
 //!
 //! What is left is a constant factor, not a growth with the document: a body
-//! that names the node bare `k` times, each of which materializes it, decodes it
-//! up to `k` times where the eager bind decoded once, and `$x == .` over the same
-//! node loses the same-node shortcut the shared copy gave (`. as $x | $x == .`
-//! costs two decodes, measured +78%; `. as $x | {r: $x}` +17%). A read that only
-//! navigates (`$x.a`, `$x | keys`, `[$x]` counted) skips the decode altogether.
+//! that names the node bare `k` times decodes it once and shares it `k - 1`
+//! times, and a read that only navigates (`$x.a`, `$x | keys`, `[$x]` counted)
+//! skips the decode altogether.
 //!
 //! The body must be built from the forms listed in [`walk`]; a form outside the
 //! list is fine when it does not mention `$x` (it only degrades the ambient to
@@ -80,6 +84,25 @@ use alloc::rc::Rc;
 use super::document::DocumentCursor;
 use super::expr::{BindOrigin, Builtin, Expr, ObjectKey};
 use super::walk::any_subexpr;
+
+/// Whether a deferred bind's whole-node reads can share one decoded copy
+/// (#4036): the first materialization of the node fills a lazy embed-table
+/// entry and every later one is handed the same `Rc`, as the eager bind's entry
+/// did. That needs a thread-local table, so without `std` a repeated whole-node
+/// read is still refused and the bind stays eager.
+const LAZY_SHARES: bool = cfg!(feature = "std");
+
+/// How a sound body reads `$var` (#4036).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeferredReads {
+    /// Every read navigates the node, or runs once per bind: nothing is
+    /// decoded more than the eager bind decoded it, bare reads included.
+    Navigating,
+    /// Some whole-node read runs once per element of a collection. It decodes
+    /// the node once, in the first run, and every later one shares that copy
+    /// through the lazy embed entry.
+    Sharing,
+}
 
 /// What is known about the ambient input at a point in the body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -107,18 +130,23 @@ struct State {
     /// A generator upstream (`.[]`) hands this point one input per element, so
     /// a read here runs once per element, not once per bind.
     repeated: bool,
+    /// Whether a repeated whole-node read is admitted: the walk of a body that
+    /// has the shared copy to lean on ([`LAZY_SHARES`]).
+    shares: bool,
 }
 
 impl State {
     const START: Self = Self {
         at: Ambient::Cursor,
         repeated: false,
+        shares: false,
     };
 
     fn join(self, other: Self) -> Self {
         Self {
             at: self.at.join(other.at),
             repeated: self.repeated || other.repeated,
+            shares: self.shares,
         }
     }
 
@@ -140,13 +168,25 @@ impl State {
 pub(crate) fn deferred_bind_is_sound(body: &Expr, var: &str) -> bool {
     // A body that never names the variable is trivially sound (the cost
     // `. as $x | 1` used to pay).
-    !mentions_var(body, var) || deferred_bind_reads_are_sound(body, var)
+    !mentions_var(body, var) || deferred_bind_reads(body, var).is_some()
 }
 
-/// [`deferred_bind_is_sound`] for a body already known to name `$var`: the walk
+/// How `body`, already known to name `$var`, reads it through a deferred
+/// binding, or `None` when a read cannot be resolved or is not cheap: the walk
 /// alone, so the caller's one scan for the name is not repeated.
-pub(crate) fn deferred_bind_reads_are_sound(body: &Expr, var: &str) -> bool {
-    walk(body, var, State::START, false).is_some()
+///
+/// The strict walk comes first: a body it admits never repeats a whole-node
+/// read and needs no shared copy. Only one it refuses is walked again with
+/// repeated whole-node reads admitted, where they are the sharing's to pay for.
+pub(crate) fn deferred_bind_reads(body: &Expr, var: &str) -> Option<DeferredReads> {
+    if walk(body, var, State::START, false).is_some() {
+        return Some(DeferredReads::Navigating);
+    }
+    let sharing = State {
+        shares: LAZY_SHARES,
+        ..State::START
+    };
+    (LAZY_SHARES && walk(body, var, sharing, false).is_some()).then_some(DeferredReads::Sharing)
 }
 
 /// Whether `expr` reads `$var` anywhere. Over-approximate: a nested binder
@@ -212,14 +252,15 @@ fn walk(expr: &Expr, var: &str, st: State, piped: bool) -> Option<State> {
         (!mentions_var(e, var)).then_some(State {
             at: Ambient::Opaque,
             repeated: true,
+            ..st
         })
     };
     match expr {
-        // A repeated bare `$x` would materialize the whole node per run; the
+        // A repeated bare `$x` materializes the whole node per run, which is
+        // free once the first run's copy is shared (`State::shares`); the
         // field-chain read is `walk_pipe`'s.
-        Expr::Var(name) if name == var => {
-            (st.at == Ambient::Cursor && !st.repeated).then_some(st.with(Ambient::Cursor))
-        }
+        Expr::Var(name) if name == var => (st.at == Ambient::Cursor && (st.shares || !st.repeated))
+            .then_some(st.with(Ambient::Cursor)),
         Expr::Identity => Some(st),
         // A member that exists is a cursor; one that does not is an owned
         // `null` -- so the result is `Nav` whatever the input was, unless the
@@ -237,6 +278,7 @@ fn walk(expr: &Expr, var: &str, st: State, piped: bool) -> Option<State> {
                 _ => Ambient::Cursor,
             },
             repeated: true,
+            ..st
         }),
         Expr::Paren(inner) | Expr::Optional(inner) => walk(inner, var, st, piped),
         Expr::Pipe(stages) => walk_pipe(stages, var, st, piped),
@@ -338,6 +380,16 @@ fn walk_pipe(stages: &[Expr], var: &str, st: State, piped: bool) -> Option<State
                     .iter()
                     .take_while(|stage| is_field_read(stage))
                     .count();
+            // A bare `$var` stage reads the whole node, which shares one copy
+            // (`State::shares`); only the fields it navigates are refused.
+            if cur.shares && end == i + 1 {
+                if cur.at != Ambient::Cursor {
+                    return None;
+                }
+                cur = cur.with(Ambient::Cursor);
+                i += 1;
+                continue;
+            }
             if cur.at != Ambient::Cursor || end == i + 1 || end < stages.len() || piped {
                 return None;
             }
@@ -375,12 +427,27 @@ mod tests {
     use super::*;
     use crate::jq::parse;
 
+    fn reads(filter: &str) -> Option<DeferredReads> {
+        // `. as $x | body`: split off the body the way the parser does.
+        let Expr::As { var, body, .. } = parse(filter).expect("parses") else {
+            panic!("not an `as` bind") // patchcov: coverage tolerate-line reason="unreachable in a passing suite: every row is an `as` bind (#3856)"
+        };
+        deferred_bind_reads(&body, &var)
+    }
+
     fn sound(filter: &str) -> bool {
         // `. as $x | body`: split off the body the way the parser does.
         let Expr::As { var, body, .. } = parse(filter).expect("parses") else {
             panic!("not an `as` bind") // patchcov: coverage tolerate-line reason="unreachable in a passing suite: every row is an `as` bind (#3856)"
         };
         deferred_bind_is_sound(&body, &var)
+    }
+
+    /// What a repeated bare read of the node is: shared through the lazy embed
+    /// entry where there is one (#4036), refused where there is no table to
+    /// hold it.
+    fn sharing() -> Option<DeferredReads> {
+        LAZY_SHARES.then_some(DeferredReads::Sharing)
     }
 
     #[test]
@@ -423,30 +490,45 @@ mod tests {
     }
 
     #[test]
-    fn a_repeated_read_of_the_whole_node_is_refused() {
-        // The eager bind shared one decode of the node across these; a
-        // deferred read would decode it per element.
-        assert!(!sound(". as $x | .users[] | $x"));
-        assert!(!sound(". as $x | .users[] | {r: $x}"));
-        assert!(!sound(". as $x | .users[] | select($x == .)"));
-        assert!(!sound(". as $x | .users[] | [$x]"));
-        assert!(!sound(". as $x | .[] | .[] | $x"));
-        assert!(!sound(". as $x | .users[] | $x | length"));
-        assert!(!sound(". as $x | .users[] | $x | tojson"));
-        assert!(!sound(". as $x | .users[] | ($x, 1)"));
-        // A chain something goes on to consume, or that leaves the fields.
+    fn a_repeated_read_of_the_whole_node_shares_one_copy() {
+        // The eager bind decoded the node once and handed every later read the
+        // one `Rc`; a deferred read has the lazy entry to do the same (#4036).
+        for filter in [
+            ". as $x | .users[] | $x",
+            ". as $x | .users[] | {r: $x}",
+            ". as $x | .users[] | select($x == .)",
+            ". as $x | .users[] | [$x]",
+            ". as $x | .[] | .[] | $x",
+            ". as $x | .users[] | $x | length",
+            ". as $x | .users[] | $x | tojson",
+            ". as $x | .users[] | ($x, 1)",
+            // A generator beside the read repeats it too.
+            ". as $x | $x == (.[] | .b)",
+            ". as $x | ($x | length) == (.[] | .b)",
+            ". as $x | [.[] | $x]",
+        ] {
+            assert_eq!(reads(filter), sharing(), "{filter}");
+        }
+        // A comma beside it is a fixed number of branches, not a repetition.
+        assert_eq!(
+            reads(". as $x | ($x | length), (.[] | .b)"),
+            Some(DeferredReads::Navigating)
+        );
+    }
+
+    #[test]
+    fn a_repeated_member_read_that_something_consumes_is_refused() {
+        // Navigating the node on a cursor per element is not the whole-node
+        // read the shared copy covers: the eager bind walked an owned value
+        // here (#4035 is the array-index half of it).
         assert!(!sound(". as $x | .users[] | $x.users | length"));
         assert!(!sound(". as $x | .users[] | $x.users[0]"));
         assert!(!sound(". as $x | .users[] | $x.a | .b"));
         assert!(!sound(". as $x | .users[] | [$x.users[0]]"));
         assert!(!sound(". as $x | .edges[] | $x.nodes[.from]"));
         assert!(!sound(". as $x | .users[] | ($x.users | length)"));
-        // A generator beside the read repeats it too.
-        assert!(!sound(". as $x | $x == (.[] | .b)"));
-        assert!(!sound(". as $x | ($x | length) == (.[] | .b)"));
-        assert!(!sound(". as $x | [.[] | $x]"));
-        // A comma beside it is a fixed number of branches, not a repetition.
-        assert!(sound(". as $x | ($x | length), (.[] | .b)"));
+        // And a bare read beside one is refused with it.
+        assert!(!sound(". as $x | .users[] | ($x, $x.users[0])"));
     }
 
     #[test]
@@ -456,7 +538,7 @@ mod tests {
         assert!(sound(". as $x | {($x.k): 1}"));
         assert!(sound(". as $x | {a: 1, ($x.k): $x.v}"));
         // A computed key that yields many repeats the other entries.
-        assert!(!sound(". as $x | {(.[] | .k): $x}"));
+        assert_eq!(reads(". as $x | {(.[] | .k): $x}"), sharing());
         assert!(!sound(". as $x | {(.[] | .k): $x.a | length}"));
         // A negated value is computed, so there is no cursor to read from after it.
         assert!(!sound(". as $x | -(.[] | .a) | $x"));

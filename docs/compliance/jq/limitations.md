@@ -9828,8 +9828,9 @@ document cost 6.5x the memory and 4-5x the time of the same filter without the b
 - the node is a subtree (an object or array with children) of the document being read, and
   every read of `$x` happens where the ambient input is provably a node of that document
   (`deferred_bind_is_sound`, `src/jq/deferred_bind.rs`): at the bind's own input
-  (`$x.a`, `[$x, 1]`, `{k: $x}`, `$x == .`), or under an iteration when it reads a member
-  (`.users[] | $x.meta`, `.users[] | select(.id == $x.limit)`).
+  (`$x.a`, `[$x, 1]`, `{k: $x}`, `$x == .`), or under an iteration, as a member read
+  (`.users[] | $x.meta`, `.users[] | select(.id == $x.limit)`) or as the whole node
+  (`.users[] | {r: $x}`, `select($x == .)`, `$x | tojson`; see below).
 
 So `. as $x | 1` and `. as $x | $x.a` answer over an unreadable member the body does not reach
 (`[{"a":1,"b":tru}]`: `1` and `1`, where `eval_using` raises), and `. as $x | $x` echoes the node
@@ -9841,11 +9842,10 @@ unreadable `.b`). Every other bind keeps the eager decode and so raises at the b
 - a body that reads `$x` after a stage that may leave no cursor: a member that can be absent
   (`.missing | $x`, `.a.b | $x`, `.[0] | $x`) or a computed value (`1 | $x`, `length | $x`,
   `[.[]] | $x`, `(.a, 1) | $x`);
-- a body that reads the whole node under an iteration (`.users[] | {r: $x}`, `select($x == .)`,
-  `$x | length`): the eager bind decoded the node once and shared that copy across every
-  materialization of it, which a deferred read cannot (it would decode the node per element, 37x
-  slower on a 1.4 MB document), so only a member read (`$x.limit`, a field chain nothing consumes as
-  a pipe stage) is deferred there;
+- a body that reads a member chain under an iteration and goes on to consume it (`.users[] |
+  $x.users | length`, `$x.users[0]`, `$x.nodes[.from]`): the eager bind walked an owned value there,
+  and a cursor walks the array to its index per element (#4035), so only a chain nothing consumes as
+  a pipe stage (`$x.limit`) is deferred there;
 - a body that reads `$x` inside anything not on the predicate's list of cursor-preserving forms:
   `reduce`/`foreach`, `map`, `path(...)`, assignment and `del`, `def` bodies and calls, string
   interpolation, `input`, a catch handler, a destructuring bind;
@@ -9858,12 +9858,26 @@ The predicate is a whitelist, not a blacklist, because the evaluator hands some 
 owned evaluator, which has no cursor to resolve a deferred name against; such a read raises an
 internal error rather than a guessed value, and the differential sweep
 (`deferred_bind_agrees_with_the_decoding_bind_3856`, `src/jq/eval_generic.rs`) pins that no
-admitted body reaches it. What is left against the eager bind is a constant factor, not growth with
-the document: a body that names the node bare `k` times, each of which materializes it, decodes it up
-to `k` times where the eager bind decoded once (`. as $x | $x == .` is two decodes, +78% instructions
-on a 0.7 MB document; `. as $x | {r: $x}` +17%), and a read that only navigates skips the decode
-altogether. (`. as $r | .users[] | $r.users[0].id` walks the array's length per record, as it did
-before: the array index is what is linear, not the bind.)
+admitted body reaches it.
+
+**A whole-node read decodes the node once per bind (#4036).** The eager bind decoded the node once
+and registered the value in the embed table (#2889), so every later materialization of that node was
+handed the one `Rc`; a deferred read had no entry to hit and decoded the node each time it ran (37x
+slower for `. as $x | .users[] | select(.id < 300) | {r: $x}` on a 1.4 MB document), which is why
+#3856's first predicate refused a bare `$x` under an iteration. A deferred bind now registers a
+*lazy* entry for its node: the first materialization builds the value as always and fills the
+entry, and every later one is handed the same `Rc`, so `. as $x | $x == .` is one decode (-48%
+instructions on a 4.9 MB document) and `. as $x | .users[] | {r: $x}` is the eager bind's one decode
+moved to the first element (and no decode at all when no element reaches it: -60% and 58 -> 16 MB
+when `select` matches none). The entry lives in a stack of its own, not in the table `path()`
+reads identity from, so what a resolver accepts is unchanged, and a write through any other handle
+copies first because the filled entry holds a strong clone, as the eager entry does. It counts as a
+binding in scope (the `embed_table_active` gate that picks the navigation peel over a reindex of the
+shared value) from its fill when the body reads the node bare once per element, and from its second
+read otherwise. A node met *inside* a larger walk (`.a as $y | {k: .}` materializing the root with
+`$y`'s node one level in) is built fresh, as before. Without `std` there is no table to hold the
+entry (no thread-locals), so a bare whole-node read under an iteration keeps the eager decode there,
+as it did before.
 
 The rule a caller can apply is therefore "an array holds a value beside another value without
 reading it, and a bind names a subtree without reading it; an object or an array inside an array

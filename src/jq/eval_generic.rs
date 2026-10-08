@@ -42,7 +42,9 @@ use std::rc::Rc;
 
 use indexmap::IndexMap;
 
-use super::deferred_bind::{deferred_bind_cursor, deferred_bind_reads_are_sound, mentions_var};
+use super::deferred_bind::{
+    deferred_bind_cursor, deferred_bind_reads, mentions_var, DeferredReads,
+};
 use super::document::{
     checked_member_key, child_tail_gap_ok, collapsed_fields, collapsed_fields_if,
     container_tail_gap_ok, effective_fields_checked, effective_fields_with_raw_last,
@@ -850,9 +852,22 @@ pub fn to_owned_cursor<S: EvalSemantics, C: DocumentCursor>(
     // -- `.a as $y | {k:.} | .k.a`, where `{k:.}` materializes the root and
     // `$y`'s node sits one level inside it -- so a walk that cannot meet one
     // never consults the table per container.
-    let (shared, nested) = embed_at_or_within::<S, _>(cursor);
-    if let Some(shared) = shared {
-        return Ok(shared);
+    //
+    // #4036: `live()` is `active()` plus the lazy entries of deferred binds, so
+    // it is still the one load that gates everything below.
+    let mut nested = Vec::new();
+    let mut fill_lazy = false;
+    if embed_table::live() {
+        let (shared, inside) = embed_at_or_within::<S, _>(cursor);
+        if let Some(shared) = shared {
+            return Ok(shared);
+        }
+        nested = inside;
+        match embed_lazy::<S, _>(cursor) {
+            embed_table::LazyHit::Filled(shared) => return Ok(shared),
+            embed_table::LazyHit::Pending => fill_lazy = true,
+            embed_table::LazyHit::Absent => {}
+        }
     }
     let result = to_owned_cursor_at_depth::<S, _, BuildOwned>(
         cursor,
@@ -862,6 +877,12 @@ pub fn to_owned_cursor<S: EvalSemantics, C: DocumentCursor>(
         &|_, _| None,
         &nested,
     );
+    // #4036: the first build of a deferred bind's node is kept for the rest.
+    if fill_lazy {
+        if let Ok(built @ (OwnedValue::Array(_) | OwnedValue::Object(_))) = &result {
+            embed_table::lazy_fill(cursor.node_id(), cursor.document_token(), built);
+        }
+    }
     // #2334: see `debug_assert_materialization_error`'s own doc comment --
     // depth-0 entry point only.
     debug_assert_materialization_error(&result);
@@ -6979,6 +7000,153 @@ mod embed_table {
         /// keys (#3897), so a descent answers by key without a scan per
         /// member. Cleared with the last descending entry.
         static DISTINCT: RefCell<Vec<(usize, usize, bool)>> = const { RefCell::new(Vec::new()) };
+        /// The lazily filled entries of deferred binds (#4036), kept apart
+        /// from `TABLE` on purpose: `TABLE`'s readers (`witness_of`, the
+        /// anchors, `fill`'s pending-anchor match, the `active()` gates that
+        /// pick an evaluation route) must see exactly what they saw before, so
+        /// what `path()` accepts cannot change.
+        static LAZY: RefCell<Vec<LazyEntry>> = const { RefCell::new(Vec::new()) };
+        /// `ACTIVE || !LAZY.is_empty()`: the one load the hot materializer's
+        /// gate takes, so a program with no binding in scope pays what it
+        /// paid before the lazy stack existed.
+        static LIVE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// A deferred bind's entry (#4036): the node it names, and the value the
+    /// first materialization of that node built, once there is one. Filled it
+    /// holds a *strong* clone, like `TABLE`'s entries, so a write through any
+    /// other handle to the same storage copies first.
+    struct LazyEntry {
+        node: usize,
+        document: usize,
+        /// Always an `OwnedValue::Array`/`Object` once filled: the two
+        /// `Rc`-backed shapes, the ones [`push`]'s caller admits too.
+        value: Option<OwnedValue>,
+        /// Whether the body reads the node bare once per element of a
+        /// collection, so the entry pays for itself from its fill.
+        sharing: bool,
+        /// Whether the entry counts for [`active`]: once filled, for a
+        /// `sharing` entry, and once a second read has been handed `value`,
+        /// for any other.
+        reused: Cell<bool>,
+    }
+
+    /// What the lazy stack holds for a node (#4036).
+    pub(crate) enum LazyHit {
+        /// A deferred bind names the node and a materialization already built it.
+        Filled(OwnedValue),
+        /// A deferred bind names the node and nothing has built it yet: the
+        /// caller that does should [`lazy_fill`] it.
+        Pending,
+        /// No deferred bind names the node.
+        Absent,
+    }
+
+    /// Whether any binding, filled or not, is in scope: [`active`] plus the
+    /// lazy entries (#4036). The cheap gate of the materializer.
+    pub(crate) fn live() -> bool {
+        LIVE.with(Cell::get)
+    }
+
+    /// Recompute [`live`] and [`active`] from what the two stacks hold.
+    ///
+    /// A lazy entry whose value has been handed out a second time counts as a
+    /// binding in scope for [`active`], the way the eager bind's entry did: the
+    /// routes that gate on it (the navigation peel) are what keep
+    /// `.users[] | {r: $x} | .r.users[0].id` from writing the shared node out
+    /// and indexing it again per element. A bind read once never gets there, so
+    /// it keeps the routes a deferred bind took before the entry existed
+    /// (`{r: $x} | .r.users | length` is 21% cheaper on them than on the
+    /// peel's). The entry itself stays invisible to every reader of identity,
+    /// so an active table that certifies nothing is the state a binding of an
+    /// unrelated node already puts it in.
+    fn refresh_live() {
+        let table = TABLE.with(|t| !t.borrow().is_empty());
+        let (lazy, reused) = LAZY.with(|l| {
+            let l = l.borrow();
+            (!l.is_empty(), l.iter().any(|e| e.reused.get()))
+        });
+        LIVE.with(|a| a.set(table || lazy));
+        ACTIVE.with(|a| a.set(table || reused));
+    }
+
+    /// Pops the lazy entry (and any pushed under it) when dropped, however
+    /// the body leaves -- the same contract as [`Guard`]. A fill looks its
+    /// entry up when it runs, so one after the guard dropped finds nothing.
+    pub struct LazyGuard(usize);
+
+    impl Drop for LazyGuard {
+        fn drop(&mut self) {
+            LAZY.with(|l| l.borrow_mut().truncate(self.0));
+            refresh_live();
+        }
+    }
+
+    /// Register the deferred bind of `(node, document)`, to be filled by the
+    /// first materialization of that node (#4036).
+    pub(crate) fn lazy_push(node: usize, document: usize, sharing: bool) -> LazyGuard {
+        let previous = LAZY.with(|l| {
+            let mut l = l.borrow_mut();
+            let previous = l.len();
+            l.push(LazyEntry {
+                node,
+                document,
+                value: None,
+                sharing,
+                reused: Cell::new(false),
+            });
+            previous
+        });
+        LIVE.with(|a| a.set(true));
+        LazyGuard(previous)
+    }
+
+    /// The lazy entry for `(node, document)`: the innermost filled one, else
+    /// whether any is waiting (#4036).
+    pub(crate) fn lazy_lookup(node: usize, document: usize) -> LazyHit {
+        LAZY.with(|l| {
+            let l = l.borrow();
+            let mut waiting = false;
+            for e in l.iter().rev() {
+                if e.node == node && e.document == document {
+                    match &e.value {
+                        Some(v) => {
+                            if !e.reused.replace(true) {
+                                ACTIVE.with(|a| a.set(true));
+                            }
+                            return LazyHit::Filled(v.clone());
+                        }
+                        None => waiting = true,
+                    }
+                }
+            }
+            if waiting {
+                LazyHit::Pending
+            } else {
+                LazyHit::Absent
+            }
+        })
+    }
+
+    /// Hand `value`, the materialization of `(node, document)` just built, to
+    /// every entry still waiting for it (#4036). A no-op when none is in scope.
+    pub(crate) fn lazy_fill(node: usize, document: usize, value: &OwnedValue) {
+        let sharing = LAZY.with(|l| {
+            let mut sharing = false;
+            for e in l.borrow_mut().iter_mut() {
+                if e.node == node && e.document == document && e.value.is_none() {
+                    e.value = Some(value.clone());
+                    if e.sharing {
+                        e.reused.set(true);
+                        sharing = true;
+                    }
+                }
+            }
+            sharing
+        });
+        if sharing {
+            ACTIVE.with(|a| a.set(true));
+        }
     }
 
     /// Whether a fold's INIT entry is in scope (#3897).
@@ -7026,6 +7194,7 @@ mod embed_table {
                 let descending = t.iter().any(|e| e.descends);
                 DESCENDING.with(|a| a.set(descending));
             });
+            refresh_live();
         }
     }
 
@@ -7039,6 +7208,7 @@ mod embed_table {
             previous
         });
         ACTIVE.with(|a| a.set(true));
+        LIVE.with(|a| a.set(true));
         if anchor {
             ANCHORED.with(|a| a.set(true));
         }
@@ -7354,9 +7524,33 @@ mod embed_table {
         false
     }
 
+    pub(crate) fn live() -> bool {
+        false
+    }
+
     /// Same shape as the `std` guard, but there is nowhere to record a
     /// binding without a `thread_local!`, so it pops nothing.
     pub struct Guard;
+
+    /// [`Guard`]'s twin for a deferred bind's lazy entry (#4036).
+    pub struct LazyGuard;
+
+    #[allow(dead_code)] // never constructed without a thread-local table
+    pub(crate) enum LazyHit {
+        Filled(OwnedValue),
+        Pending,
+        Absent,
+    }
+
+    pub(crate) fn lazy_push(_node: usize, _document: usize, _sharing: bool) -> LazyGuard {
+        LazyGuard
+    }
+
+    pub(crate) fn lazy_lookup(_node: usize, _document: usize) -> LazyHit {
+        LazyHit::Absent
+    }
+
+    pub(crate) fn lazy_fill(_node: usize, _document: usize, _value: &OwnedValue) {}
 
     pub(crate) fn push(_node: usize, _document: usize, _value: OwnedValue) -> Guard {
         Guard
@@ -7451,6 +7645,24 @@ mod embed_table {
 
 /// The RAII guard [`embed_table_push`] returns (#2889).
 pub(crate) type EmbedGuard = embed_table::Guard;
+
+/// The RAII guard [`embed_lazy_push`] returns (#4036).
+pub(crate) type EmbedLazyGuard = embed_table::LazyGuard;
+
+/// Register the deferred bind of `node` (#4036), for as long as the returned
+/// guard lives: the first [`to_owned_cursor`] of that node builds its value as
+/// it always did and keeps it, and every later one is handed the same `Rc`,
+/// which is what the eager bind's [`embed_table_push`] entry gave it for the
+/// price of a decode at the bind. Nothing else reads the entry: it is not in
+/// the table the resolver certifies identity from, so what `path()` accepts is
+/// what it accepted with no entry.
+///
+/// `sharing` says the body reads the node bare once per element of a collection
+/// (`DeferredReads::Sharing`): the entry then counts as a binding in scope from
+/// its fill, the way the eager bind's did, rather than from its first reuse.
+pub(crate) fn embed_lazy_push<C: DocumentCursor>(node: &C, sharing: bool) -> EmbedLazyGuard {
+    embed_table::lazy_push(node.node_id(), node.document_token(), sharing)
+}
 
 /// The guards of one destructuring binding set's variables (#3466), released
 /// newest-first -- the LIFO order [`embed_table`]'s `Guard` documents -- where
@@ -8387,6 +8599,15 @@ pub(crate) fn embed_shared_for<S: EvalSemantics, C: DocumentCursor>(
         return None;
     }
     embed_table::shared_for(cursor.node_id(), cursor.document_token())
+}
+
+/// What a deferred bind holds for the node `cursor` stands at (#4036). jq mode
+/// only, like every read of the table.
+fn embed_lazy<S: EvalSemantics, C: DocumentCursor>(cursor: &C) -> embed_table::LazyHit {
+    if S::TAG != EvalTag::Jq {
+        return embed_table::LazyHit::Absent;
+    }
+    embed_table::lazy_lookup(cursor.node_id(), cursor.document_token())
 }
 
 /// The height [`to_owned_cursor_at_depth`] walks below `cursor`'s node:
@@ -14317,7 +14538,8 @@ fn each_as_generic<S: EvalSemantics, V: DocumentValue>(
     //   prove every read happens where one is in hand.
     let mentions = core::cell::OnceCell::new();
     let names_var = || *mentions.get_or_init(|| mentions_var(body, var));
-    let body_defers = core::cell::OnceCell::new();
+    let reads = core::cell::OnceCell::new();
+    let body_reads = || *reads.get_or_init(|| deferred_bind_reads(body, var));
     let defer = |bound: &V::Cursor, decode_failed: bool| {
         S::TAG == EvalTag::Jq
             && defer_binds_enabled()
@@ -14327,7 +14549,7 @@ fn each_as_generic<S: EvalSemantics, V: DocumentValue>(
                 decode_failed,
                 || !names_var(),
                 // Asked only once `names_var` has answered yes.
-                || *body_defers.get_or_init(|| deferred_bind_reads_are_sound(body, var)),
+                || body_reads().is_some(),
             )
     };
     fanout_arg_each_generic_deferring::<S, V, _>(
@@ -14365,6 +14587,10 @@ fn each_as_generic<S: EvalSemantics, V: DocumentValue>(
                 #[cfg(test)]
                 DEFERRED_TAKEN.with(|n| n.set(n.get() + 1));
                 if names_var() {
+                    // #4036: the first whole-node read builds the value and the
+                    // rest share it, as the eager bind's entry made them.
+                    let _lazy =
+                        embed_lazy_push(&node, body_reads() == Some(DeferredReads::Sharing));
                     let deferred = substitute_deferred_var(body, var, bind_origin_of_cursor(&node));
                     eval_each_generic::<S, V>(&deferred, value.clone(), optional, cursor, sink)
                 } else {
@@ -51540,11 +51766,14 @@ mod deferred_bind_tests_3856 {
         tally.finish(1000, 3000);
     }
 
-    /// The reads that kept the eager decode are the ones that would otherwise
-    /// decode the node once per element, where the eager bind shared one copy
-    /// through the embed table (#2889). Pinned by whether a bind was deferred.
+    /// Which reads defer (#3856, #4036). A whole-node read under an iteration
+    /// used to keep the eager decode, because the eager bind's embed-table entry
+    /// shared one copy and a deferred read had no entry to hit; the lazy entry
+    /// is that copy now. What still keeps it is a member read something goes on
+    /// to consume, which navigates a cursor per element where the eager bind
+    /// walked an owned value. Pinned by whether a bind was deferred.
     #[test]
-    fn repeated_reads_that_materialize_the_node_keep_the_eager_bind_3856() {
+    fn reads_that_keep_the_eager_bind_are_the_consumed_member_chains_4036() {
         let doc = r#"{"users":[{"id":1},{"id":2}],"meta":{"n":3}}"#;
         let deferred = |filter: &str| {
             let before = DEFERRED_TAKEN.with(core::cell::Cell::get);
@@ -51558,11 +51787,167 @@ mod deferred_bind_tests_3856 {
         assert_eq!(deferred(". as $x | .users[] | $x.meta.n"), 1);
         assert_eq!(deferred(". as $x | .users[] | select(.id < $x.meta.n)"), 1);
         assert_eq!(deferred(". as $x | .users[] | .id"), 1);
-        // The whole node under an iteration keeps the one shared decode.
-        assert_eq!(deferred(". as $x | .users[] | {r: $x}"), 0);
-        assert_eq!(deferred(". as $x | .users[] | select($x == .)"), 0);
-        assert_eq!(deferred(". as $x | .users[] | $x | tojson"), 0);
+        // The whole node under an iteration shares the lazy entry's copy, where
+        // there is a table to hold it.
+        let whole = u64::from(cfg!(feature = "std"));
+        assert_eq!(deferred(". as $x | .users[] | {r: $x}"), whole);
+        assert_eq!(deferred(". as $x | .users[] | select($x == .)"), whole);
+        assert_eq!(deferred(". as $x | .users[] | $x | tojson"), whole);
+        assert_eq!(deferred(". as $x | .users[] | [$x]"), whole);
+        // A member chain something consumes keeps the eager walk.
         assert_eq!(deferred(". as $x | .users[] | $x.users | length"), 0);
-        assert_eq!(deferred(". as $x | .users[] | [$x]"), 0);
+        assert_eq!(deferred(". as $x | .users[] | $x.users[0]"), 0);
+    }
+
+    /// The lazy entry (#4036): the first materialization of the bound node
+    /// builds it, every later one is handed the same `Rc`, and nothing but the
+    /// materializer sees the entry.
+    // `std` for the thread-local table; the holdout never shares storage.
+    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    #[test]
+    fn lazy_entry_fills_once_and_shares_the_copy_4036() {
+        let doc = br#"{"a":[1,2],"b":{"c":3}}"#;
+        let index = JsonIndex::build(doc);
+        let root = index.root(doc);
+
+        // No entry: every materialization builds its own copy.
+        let first = to_owned_cursor::<JqSemantics, _>(&root).unwrap();
+        let second = to_owned_cursor::<JqSemantics, _>(&root).unwrap();
+        assert!(!first.shares_storage_with(&second), "premise: no entry");
+
+        let guard = embed_lazy_push(&root, false);
+        assert!(!embed_table_active(), "an unfilled entry is not a binding");
+        let built = to_owned_cursor::<JqSemantics, _>(&root).unwrap();
+        assert!(!embed_table_active(), "one read does not make it one");
+        let shared = to_owned_cursor::<JqSemantics, _>(&root).unwrap();
+        assert!(built.shares_storage_with(&shared), "the second read shares");
+        assert_eq!(built, first, "sharing never changes the value");
+        assert!(embed_table_active(), "a reused entry counts as a binding");
+        // It certifies nothing: the identity readers see no binding.
+        assert_eq!(embed_witness_of(&built), None);
+        assert!(embed_anchor_for(root.node_id(), root.document_token()).is_none());
+        // Another node of the document is not the entry's.
+        let a = root.first_child().unwrap().next_sibling().unwrap();
+        let other = to_owned_cursor::<JqSemantics, _>(&a).unwrap();
+        assert!(!other.shares_storage_with(&built));
+
+        // Gone with the guard: nothing is shared, nothing is live, and a fill
+        // that comes late finds no entry.
+        drop(guard);
+        assert!(!embed_table_active());
+        assert!(!embed_table::live());
+        let after = to_owned_cursor::<JqSemantics, _>(&root).unwrap();
+        assert!(!after.shares_storage_with(&built));
+        embed_table::lazy_fill(root.node_id(), root.document_token(), &built);
+        let again = to_owned_cursor::<JqSemantics, _>(&root).unwrap();
+        assert!(!again.shares_storage_with(&built), "a late fill is a no-op");
+    }
+
+    /// An entry for a body that reads the node once per element counts as a
+    /// binding from its fill, not its first reuse; a yq evaluation never reads
+    /// one (#4036).
+    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    #[test]
+    fn sharing_entry_is_active_from_its_fill_and_jq_only_4036() {
+        let doc = br#"{"a":[1,2]}"#;
+        let index = JsonIndex::build(doc);
+        let root = index.root(doc);
+        let guard = embed_lazy_push(&root, true);
+        assert!(!embed_table_active(), "nothing built yet");
+        let built = to_owned_cursor::<JqSemantics, _>(&root).unwrap();
+        assert!(embed_table_active(), "filled by the first build");
+        drop(guard);
+        assert!(!embed_table_active(), "the guard's drop empties it");
+
+        // A mode that is not jq neither fills nor reads the entry.
+        let _guard = embed_lazy_push(&root, true);
+        let one = to_owned_cursor::<YqSemantics, _>(&root).unwrap();
+        let two = to_owned_cursor::<YqSemantics, _>(&root).unwrap();
+        assert!(!one.shares_storage_with(&two));
+        assert!(!embed_table_active());
+        assert_eq!(one, built);
+    }
+
+    /// Nested and shadowing entries for one node: the first build fills every
+    /// entry waiting on it, and each guard pops its own (#4036).
+    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    #[test]
+    fn lazy_entries_nest_and_pop_in_order_4036() {
+        let doc = br#"{"a":[1,2]}"#;
+        let index = JsonIndex::build(doc);
+        let root = index.root(doc);
+        let outer = embed_lazy_push(&root, false);
+        let inner = embed_lazy_push(&root, false);
+        let built = to_owned_cursor::<JqSemantics, _>(&root).unwrap();
+        drop(inner);
+        assert!(embed_table::live(), "the outer entry is still in scope");
+        let shared = to_owned_cursor::<JqSemantics, _>(&root).unwrap();
+        assert!(
+            shared.shares_storage_with(&built),
+            "the outer was filled too"
+        );
+        drop(outer);
+        assert!(!embed_table::live());
+    }
+
+    /// A node whose materialization fails fills nothing: each read raises the
+    /// same error again, and the entry never holds a half-built value (#4036).
+    #[cfg(feature = "std")]
+    #[test]
+    fn lazy_entry_stays_empty_when_the_build_fails_4036() {
+        let doc = br#"{"a":[1.2.3]}"#;
+        let index = JsonIndex::build(doc);
+        let root = index.root(doc);
+        let _guard = embed_lazy_push(&root, true);
+        let first = to_owned_cursor::<JqSemantics, _>(&root);
+        let second = to_owned_cursor::<JqSemantics, _>(&root);
+        assert!(first.is_err());
+        assert_eq!(
+            first.unwrap_err().message,
+            second.unwrap_err().message,
+            "the same error each time"
+        );
+        assert!(!embed_table_active(), "nothing was filled");
+    }
+
+    /// The repeated whole-node reads defer and answer what the eager bind
+    /// answers, including while a path expression that does not name `$x` runs
+    /// beside them (#4036).
+    #[cfg(feature = "std")]
+    #[test]
+    fn repeated_whole_node_reads_match_the_decoding_bind_4036() {
+        let docs = [
+            r#"{"users":[{"id":1},{"id":2}],"meta":{"n":3}}"#,
+            r#"{"users":[],"meta":null}"#,
+            r#"[{"id":1},[2,3],"x",null]"#,
+        ];
+        // Whether the bind defers: a read after a construction has no cursor
+        // to resolve from, so `{a: $x} | .a == $x` keeps the eager decode.
+        let filters = [
+            (". as $x | .users[]? | {r: $x}", true),
+            (". as $x | .users[]? | select($x == .)", true),
+            (". as $x | .[]? | [$x, .]", true),
+            (". as $x | .users[]? | $x | tojson", true),
+            (". as $x | .users[]? | $x | length", true),
+            (". as $x | .[]? | ($x == $x, $x)", true),
+            (". as $x | [.[]? | $x] | length", true),
+            (". as $x | .users[]? | ({r: $x}, path(.id?))", true),
+            (". as $x | .users[]? | {r: $x} | .r.users[0]?", true),
+            (". as $x | $x == .", true),
+            (". as $x | [$x, $x] | .[0] == .[1]", true),
+            (". as $x | .[]? | {a: $x} | .a == $x", false),
+        ];
+        for doc in docs {
+            for (filter, defers) in filters {
+                let deferred = run(doc, filter);
+                let eager = with_eager_binds(|| run(doc, filter));
+                assert_eq!(deferred, eager, "{filter} over {doc}");
+                assert_eq!(run_streaming(doc, filter), eager, "{filter} (streaming)");
+                let taken = DEFERRED_TAKEN.with(core::cell::Cell::get);
+                let _ = run(doc, filter);
+                let took = DEFERRED_TAKEN.with(core::cell::Cell::get) - taken;
+                assert_eq!(took, u64::from(defers), "{filter} over {doc}");
+            }
+        }
     }
 }
