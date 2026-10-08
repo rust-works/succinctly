@@ -2720,7 +2720,8 @@ fn reconcile_presentation_at_depth(
                 mark @ Some(AnchorMark::Aliases(_)) if !is_write_target => mark.clone(),
                 _ => None,
             };
-            CommentTree::Leaf(NodeMeta::empty_with_anchor(anchor))
+            let tag = pristine_tree.meta().tag().filter(|tag| is_custom_tag(tag));
+            CommentTree::Leaf(NodeMeta::empty_with_anchor(anchor).with_tag(tag.map(str::to_string)))
         }
         // Both scalars, any variant/value: same node, only its value
         // changed - its own comment, style and anchor mark survive. Real
@@ -2729,8 +2730,48 @@ fn reconcile_presentation_at_depth(
         // (#763). Whether a surviving `*x` mark is still *emittable* is a
         // separate question, settled afterwards by
         // [`enforce_anchor_soundness`] once the whole result is known.
-        _ => CommentTree::Leaf(pristine_tree.meta().clone()),
+        //
+        // #4078: a written node keeps a custom tag (`!Ref`, `!Foo`) but not a core
+        // one, which follows the new value's type (`!!str "dq"` written `5` is `5`).
+        _ => CommentTree::Leaf(written_scalar_meta(
+            pristine_tree.meta(),
+            pristine_value != result_value,
+            result_value,
+        )),
     }
+}
+
+/// The metadata a scalar keeps once a write has run over it. Untouched, all of it. Written,
+/// it loses a core tag unless the new value has that type (a core tag follows the value's
+/// type: `!!str 1` written `"x"` stays `!!str`, written `5` is `5`) and a quoted spelling the
+/// new value cannot carry (a number is not written quoted), but keeps a custom tag (#4078).
+fn written_scalar_meta(meta: &NodeMeta, changed: bool, now: &OwnedValue) -> NodeMeta {
+    if !changed {
+        return meta.clone();
+    }
+    let now_core = match now {
+        OwnedValue::Null => "!!null",
+        OwnedValue::Bool(_) => "!!bool",
+        OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _) => "!!int",
+        OwnedValue::Float(_) | OwnedValue::NumberLiteral(NumberRepr::Float(_), _) => "!!float",
+        OwnedValue::String(_) => "!!str",
+        OwnedValue::Array(_) | OwnedValue::Object(_) => "",
+    };
+    // The quoting stays while the node's type stays: a string, or a value of the type
+    // its core tag already names (`!!int "5"` written `6` is `!!int "6"`).
+    let keeps_style = now_core == "!!str" || meta.tag() == Some(now_core);
+    let meta_now = meta.with_style(if keeps_style { meta.style } else { "" });
+    match meta.tag() {
+        Some(tag) if !is_custom_tag(tag) && tag != now_core => meta_now.with_tag(None),
+        _ => meta_now,
+    }
+}
+
+/// A tag that is not one of YAML's own (`!!str`, `!!map`, ...): an application tag
+/// (`!Ref`, `!Foo`, `!<tag:example.com,2000:x>`), which yq keeps on a node whose value
+/// a write replaces.
+fn is_custom_tag(tag: &str) -> bool {
+    !tag.starts_with("!!")
 }
 
 /// Evaluate `split_expr` against `result` with `$index` bound to
@@ -4245,6 +4286,21 @@ fn is_yaml_11_bool_word(text: &str) -> bool {
 /// Walks `value` alongside `tree` (#3614): a node's quoting is kept when its string is a YAML 1.1
 /// bool spelling ([`is_yaml_11_bool_word`]), which the tree alone cannot say. A `value` that does
 /// not match the tree's shape contributes `null`, so the node's style is stripped as before.
+/// `-P` re-resolves a node's type instead of echoing a core tag that only restates it
+/// (`!!str 1` is `"1"`, `!!int 5` is `5`, `!!map` is dropped), and keeps every other tag
+/// (`!Ref`, `!!binary`, ...), as yq does (#4078). `!!float` goes the same way: a whole
+/// float prints its own `!!float` when it needs one.
+fn strip_core_tag(meta: NodeMeta) -> NodeMeta {
+    if matches!(
+        meta.tag(),
+        Some("!!str" | "!!int" | "!!float" | "!!bool" | "!!map" | "!!seq" | "!!null")
+    ) {
+        meta.with_tag(None)
+    } else {
+        meta
+    }
+}
+
 fn strip_presentation_style_at_depth(
     value: &OwnedValue,
     tree: &CommentTree,
@@ -4265,7 +4321,7 @@ fn strip_presentation_style_at_depth(
                 OwnedValue::String(text) => kept_quote(text, tree.style()),
                 _ => "",
             };
-            CommentTree::Leaf(meta.with_style(style))
+            CommentTree::Leaf(strip_core_tag(meta.with_style(style)))
         }
         CommentTree::Array(meta, items) => {
             let elements = match value {
@@ -4273,7 +4329,7 @@ fn strip_presentation_style_at_depth(
                 _ => None,
             };
             CommentTree::Array(
-                meta.with_style(""),
+                strip_core_tag(meta.with_style("")),
                 items
                     .iter()
                     .enumerate()
@@ -4290,7 +4346,7 @@ fn strip_presentation_style_at_depth(
                 _ => None,
             };
             CommentTree::Object(
-                meta.with_style(""),
+                strip_core_tag(meta.with_style("")),
                 fields
                     .iter()
                     .map(|(k, v)| {
@@ -4588,14 +4644,14 @@ fn output_value<W: Write>(
                 .declared_anchor()
                 .filter(|_| matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)));
             let tag = block_container_tag(value, comments);
-            match (anchor, tag) {
+            match (anchor, tag.as_deref()) {
                 (None, None) => rendered,
                 // A flow container keeps its anchor on its own line (a tag is only
                 // ever on a block container).
                 (Some(anchor), None) if is_flow_safe(value, comments) => {
                     format!("&{anchor} {rendered}")
                 }
-                _ => format!("{}\n{rendered}", block_header(anchor, tag)),
+                _ => format!("{}\n{rendered}", block_header(anchor, tag.as_deref())),
             }
         };
         // A root's own standalone head comment (#798 PR2, #2795 PR B) has no
@@ -4972,8 +5028,8 @@ fn emit_yaml_value_at_depth(
     if let Some(name) = comments.alias_name() {
         return format!("*{name}");
     }
-    if comments.style() == "tagged" {
-        if let Some(tagged) = emit_tagged_scalar(value, config, indent, in_flow) {
+    if comments.style() == "tagged" || comments.meta().tag().is_some() {
+        if let Some(tagged) = emit_tagged_scalar(value, comments, config, indent, in_flow, depth) {
             return tagged;
         }
     }
@@ -5064,7 +5120,8 @@ fn emit_yaml_value_at_depth(
                             // (#763).
                             let tag = block_container_tag(v, elem_comments);
                             if elem_comments.declared_anchor().is_some() || tag.is_some() {
-                                let header = block_header(elem_comments.declared_anchor(), tag);
+                                let header =
+                                    block_header(elem_comments.declared_anchor(), tag.as_deref());
                                 // Same "compact" rule as the plain block-sequence
                                 // element below: the value's own content aligns
                                 // under the `- ` prefix's 2-column width, not a
@@ -5602,33 +5659,41 @@ fn render_flow(
     out
 }
 
-/// The `!!seq`/`!!map` tag a container carries under `style = "tagged"` (#4066), or
-/// `None` for any other node. Only a non-empty block container reaches the callers
-/// that put it on the header line; an empty or flow one prints it inline
-/// ([`with_container_tag`]).
-fn block_container_tag(value: &OwnedValue, comments: &CommentTree) -> Option<&'static str> {
-    if comments.style() != "tagged" || !defers_to_own_block(value, comments) {
+/// The tag a non-empty block container carries on its header line: the explicit tag
+/// it was written with (`!Foo`, #4078), or the `!!seq`/`!!map` of `style = "tagged"`
+/// (#4066). `None` for any other node. An empty or flow container prints its tag
+/// inline instead ([`with_container_tag`]).
+fn block_container_tag(value: &OwnedValue, comments: &CommentTree) -> Option<String> {
+    if !defers_to_own_block(value, comments) {
+        return None;
+    }
+    container_tag(value, comments)
+}
+
+/// The tag a container carries: its explicit one, else the derived one under
+/// `style = "tagged"`.
+fn container_tag(value: &OwnedValue, comments: &CommentTree) -> Option<String> {
+    if let Some(tag) = comments.meta().tag() {
+        return Some(tag.to_string());
+    }
+    if comments.style() != "tagged" {
         return None;
     }
     match value {
-        OwnedValue::Array(_) => Some("!!seq"),
-        OwnedValue::Object(_) => Some("!!map"),
+        OwnedValue::Array(_) => Some("!!seq".to_string()),
+        OwnedValue::Object(_) => Some("!!map".to_string()),
         _ => None,
     }
 }
 
-/// `rendered` (a flow or empty container) behind its `!!seq `/`!!map ` tag under
-/// `style = "tagged"` (#4066); unchanged for an untagged node. Out of line so the
-/// recursive emitter's frame stays small.
+/// `rendered` (a flow or empty container) behind its tag (see [`container_tag`]);
+/// unchanged for an untagged node. Out of line so the recursive emitter's frame
+/// stays small.
 #[inline(never)]
 fn with_container_tag(value: &OwnedValue, comments: &CommentTree, rendered: String) -> String {
-    if comments.style() != "tagged" {
-        return rendered;
-    }
-    match value {
-        OwnedValue::Array(_) => format!("!!seq {rendered}"),
-        OwnedValue::Object(_) => format!("!!map {rendered}"),
-        _ => rendered,
+    match container_tag(value, comments) {
+        Some(tag) => format!("{tag} {rendered}"),
+        None => rendered,
     }
 }
 
@@ -5644,21 +5709,59 @@ fn block_header(anchor: Option<&str>, tag: Option<&str>) -> String {
     }
 }
 
-/// A scalar under `style = "tagged"` (#4066): its type tag, derived from the value as
-/// it is now (not stored), then the value as it is ordinarily written -- except that a
-/// string is no longer quoted for reading back as another type, since the tag already
-/// says it is a string (`!!str 1`). `None` for a container.
+/// A scalar behind its tag (#4066, #4078): the explicit tag it was written with
+/// (`!Ref`, `!!str`), verbatim, or under `style = "tagged"` the tag of its current
+/// value type. `None` for a container (its tag goes on the header line, see
+/// [`block_container_tag`]) and for a scalar with neither.
 ///
-/// A string with a line break is a block scalar under the tag (`!!str |-`); the empty
-/// string is the tag alone. A whole computed float already carries its own `!!float`
-/// ([`format_float_yq_yaml_nested`]), which must not be doubled.
+/// An explicit tag keeps the value's own style and spelling (`!!str 1`,
+/// `!Sub "x-${A}"`, `!Ref Param`); a *derived* one is not quoted for reading back as
+/// another type (`!!str 1`, `!!str null`), only for what the syntax needs
+/// (`!!str 'x: y'`), a multi-line string is a block scalar (`!!str |-`), and the
+/// empty string is the tag alone. A whole computed float already carries its own
+/// `!!float` ([`format_float_yq_yaml_nested`]), which must not be doubled.
 #[inline(never)]
 fn emit_tagged_scalar(
     value: &OwnedValue,
+    comments: &CommentTree,
     config: &OutputConfig,
     indent: &str,
     in_flow: bool,
+    depth: usize,
 ) -> Option<String> {
+    if matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
+        return None;
+    }
+    if let Some(tag) = comments.meta().tag() {
+        let quoted = |q: fn(&str) -> String| plain_scalar_text(value).map(|text| q(&text));
+        let text = if let (OwnedValue::String(s), "") = (value, comments.style()) {
+            tagged_string_text(s, config, indent, in_flow)?
+        } else if let Some(text) = match comments.style() {
+            // A non-string behind a tag that was quoted in the source
+            // (`!!int "2"`, `!!bool "true"`) stays quoted, as yq keeps it.
+            "double" => quoted(yaml_double_quote_escaped),
+            "single" => quoted(yaml_single_quote_escaped),
+            _ => None,
+        } {
+            text
+        } else {
+            // Without the tag (and without a derived one), or it would print twice.
+            let style = if comments.style() == "tagged" {
+                ""
+            } else {
+                comments.style()
+            };
+            let bare = CommentTree::Leaf(comments.meta().with_tag(None).with_style(style));
+            let text =
+                emit_yaml_value_at_depth(value, &bare, config, indent, in_flow, depth, indent);
+            // The explicit tag replaces the `!!float` a nested whole float adds itself.
+            match text.strip_prefix("!!float ") {
+                Some(spelling) => spelling.to_string(),
+                None => text,
+            }
+        };
+        return Some(join_tag(tag, text));
+    }
     let (tag, text) = match value {
         OwnedValue::Null => ("!!null", "null".to_string()),
         OwnedValue::Bool(b) => ("!!bool", b.to_string()),
@@ -5686,28 +5789,50 @@ fn emit_tagged_scalar(
             NumberRepr::Int(_) => ("!!int", literal.to_string()),
         },
         OwnedValue::String(s) => {
-            let text = if s.contains(['\n', '\r', '\u{85}', '\u{2028}', '\u{2029}']) {
-                if in_flow {
-                    go_yaml_double_quoted_scalar(s)
-                } else {
-                    emit_block_scalar(s, false, indent, config.indent_str.len())
-                        .unwrap_or_else(|| go_yaml_double_quoted_scalar(s))
-                }
-            } else {
-                go_yaml_tagged_str_scalar(s, in_flow)?
-            };
-            return Some(if text.is_empty() && in_flow {
-                // Inside `[...]`/`{...}` a tag alone would run into the delimiter.
-                "!!str ''".to_string()
-            } else if text.is_empty() {
-                "!!str".to_string()
-            } else {
-                format!("!!str {text}")
-            });
+            return Some(join_tag(
+                "!!str",
+                tagged_string_text(s, config, indent, in_flow)?,
+            ));
         }
         OwnedValue::Array(_) | OwnedValue::Object(_) => return None,
     };
     Some(format!("{tag} {text}"))
+}
+
+/// `tag` then `text`, or the tag alone when there is no text.
+fn join_tag(tag: &str, text: String) -> String {
+    if text.is_empty() {
+        tag.to_string()
+    } else {
+        format!("{tag} {text}")
+    }
+}
+
+/// A string as it is written behind a tag that already says it is a string: not
+/// quoted for reading back as another type, a block scalar when it has a line break,
+/// and `''` rather than nothing for the empty string inside a flow collection, where
+/// a tag alone would run into the delimiter.
+fn tagged_string_text(
+    s: &str,
+    config: &OutputConfig,
+    indent: &str,
+    in_flow: bool,
+) -> Option<String> {
+    let text = if s.contains(['\n', '\r', '\u{85}', '\u{2028}', '\u{2029}']) {
+        if in_flow {
+            go_yaml_double_quoted_scalar(s)
+        } else {
+            emit_block_scalar(s, false, indent, config.indent_str.len())
+                .unwrap_or_else(|| go_yaml_double_quoted_scalar(s))
+        }
+    } else {
+        go_yaml_tagged_str_scalar(s, in_flow)?
+    };
+    Some(if text.is_empty() && in_flow {
+        "''".to_string()
+    } else {
+        text
+    })
 }
 
 /// A string scalar as the DOM writer prints it: a block scalar when its style is

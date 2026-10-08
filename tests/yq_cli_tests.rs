@@ -45205,6 +45205,534 @@ b: {p: *x, # y
     Ok(())
 }
 
+/// #4078: a DOM write keeps the explicit tags of the document -- `!Ref`, `!GetAtt`,
+/// `!Sub` (CloudFormation), an application tag on a mapping or sequence, `!!str 1`,
+/// `!!float 1`, `!!int "2"` -- on a scalar, on the header line of a block container
+/// behind any anchor, and before a flow or empty one. A written node keeps a custom
+/// tag and loses a core tag that its new value no longer has (`!!str 1` written `5` is
+/// `5`, written `"x"` stays `!!str x`); `-P` drops the core tags that only restate a type
+/// and keeps the rest. Every row captured live from yq v4.53.3.
+#[test]
+fn test_yq_dom_write_keeps_explicit_tags_4078() -> Result<()> {
+    let cases: &[(&str, &str, &[&str], &str)] = &[
+        (
+            r#"a: !!str 1
+b: !!int "2"
+"#,
+            r".z = 1",
+            &[],
+            r#"a: !!str 1
+b: !!int "2"
+z: 1
+"#,
+        ),
+        (
+            r"a: !!float 1
+",
+            r".z = 1",
+            &[],
+            r"a: !!float 1
+z: 1
+",
+        ),
+        (
+            r"a: !!str yes
+",
+            r".z = 1",
+            &[],
+            r"a: !!str yes
+z: 1
+",
+        ),
+        (
+            r"a: !Ref Param
+",
+            r".z = 1",
+            &[],
+            r"a: !Ref Param
+z: 1
+",
+        ),
+        (
+            r#"a: !Sub "x-${A}"
+"#,
+            r".z = 1",
+            &[],
+            r#"a: !Sub "x-${A}"
+z: 1
+"#,
+        ),
+        (
+            r"a: !Sub 'x'
+",
+            r".z = 1",
+            &[],
+            r"a: !Sub 'x'
+z: 1
+",
+        ),
+        (
+            r"a: !GetAtt [Q, Arn]
+",
+            r".z = 1",
+            &[],
+            r"a: !GetAtt [Q, Arn]
+z: 1
+",
+        ),
+        (
+            r"a: !GetAtt
+  - Q
+  - Arn
+",
+            r".z = 1",
+            &[],
+            r"a: !GetAtt
+  - Q
+  - Arn
+z: 1
+",
+        ),
+        (
+            r"a: !Foo
+  k: v
+",
+            r".z = 1",
+            &[],
+            r"a: !Foo
+  k: v
+z: 1
+",
+        ),
+        (
+            r"a: !Foo {k: v}
+",
+            r".z = 1",
+            &[],
+            r"a: !Foo {k: v}
+z: 1
+",
+        ),
+        (
+            r"a: !Foo []
+",
+            r".z = 1",
+            &[],
+            r"a: !Foo []
+z: 1
+",
+        ),
+        (
+            r"a: !Foo {}
+",
+            r".z = 1",
+            &[],
+            r"a: !Foo {}
+z: 1
+",
+        ),
+        (
+            r"- !Ref a
+- !Foo
+  k: v
+- !Bar
+  - 1
+",
+            r".[0] = .[0]",
+            &[],
+            r"- !Ref a
+- !Foo
+  k: v
+- !Bar
+  - 1
+",
+        ),
+        (
+            r"- !Ref a
+- 2
+",
+            r".[1] = 3",
+            &[],
+            r"- !Ref a
+- 3
+",
+        ),
+        (
+            r"a: &x !Foo
+  k: v
+b: *x
+",
+            r".z = 1",
+            &[],
+            r"a: &x !Foo
+  k: v
+b: *x
+z: 1
+",
+        ),
+        (
+            r"a: &x !Ref v
+b: *x
+",
+            r".z = 1",
+            &[],
+            r"a: &x !Ref v
+b: *x
+z: 1
+",
+        ),
+        (
+            r"a: !!null null
+",
+            r".z = 1",
+            &[],
+            r"a: !!null null
+z: 1
+",
+        ),
+        (
+            r#"a: !!bool "true"
+"#,
+            r".z = 1",
+            &[],
+            r#"a: !!bool "true"
+z: 1
+"#,
+        ),
+        (
+            r"a: !!binary aGVsbG8=
+",
+            r".z = 1",
+            &[],
+            r"a: !!binary aGVsbG8=
+z: 1
+",
+        ),
+        (
+            r"a: !!str
+",
+            r".z = 1",
+            &[],
+            r"a: !!str
+z: 1
+",
+        ),
+        (
+            r"a: !Ref x # c
+",
+            r".z = 1",
+            &[],
+            r"a: !Ref x # c
+z: 1
+",
+        ),
+        (
+            r"a: !Foo # c
+  k: v
+",
+            r".z = 1",
+            &[],
+            r"a: !Foo
+  k: v # c
+z: 1
+",
+        ),
+        (
+            r"!Foo
+a: 1
+",
+            r".z = 1",
+            &[],
+            r"!Foo
+a: 1
+z: 1
+",
+        ),
+        (
+            r"!Foo
+- 1
+- 2
+",
+            r".[0] = 5",
+            &[],
+            r"!Foo
+- 5
+- 2
+",
+        ),
+        (
+            r"a:
+  b: !!map
+    c: !!str d
+",
+            r".z = 1",
+            &[],
+            r"a:
+  b: !!map
+    c: !!str d
+z: 1
+",
+        ),
+        (
+            r"a: !Foo
+  k: !Ref v
+  l: [!Ref a, b]
+",
+            r".z = 1",
+            &[],
+            r"a: !Foo
+  k: !Ref v
+  l: [!Ref a, b]
+z: 1
+",
+        ),
+        (
+            r"a: !Foo
+  k: v
+",
+            r".z = 1",
+            &["-I4"],
+            r"a: !Foo
+    k: v
+z: 1
+",
+        ),
+        (
+            r"a: !Foo
+  - 1
+",
+            r".z = 1",
+            &["-I4"],
+            r"a: !Foo
+    - 1
+z: 1
+",
+        ),
+        (
+            r"- !Foo
+  k: v
+- 2
+",
+            r".[1] = 3",
+            &["-I4"],
+            r"- !Foo
+  k: v
+- 3
+",
+        ),
+        (
+            r"a: !!str 1
+",
+            r#".a = "x""#,
+            &[],
+            r"a: !!str x
+",
+        ),
+        (
+            r"a: !!str 1
+",
+            r#".a |= "x""#,
+            &[],
+            r"a: !!str x
+",
+        ),
+        (
+            r"a: !Ref v
+",
+            r"del(.b)",
+            &[],
+            r"a: !Ref v
+",
+        ),
+        (
+            r"a: !Ref v
+",
+            r".",
+            &["-P"],
+            r"a: !Ref v
+",
+        ),
+        (
+            r"a: !Foo
+  k: v
+",
+            r#".a.k = "w""#,
+            &[],
+            r"a: !Foo
+  k: w
+",
+        ),
+        (
+            r"a: !Foo
+  k: v
+  l: !Bar
+    m: 1
+",
+            r".a.l.m = 2",
+            &[],
+            r"a: !Foo
+  k: v
+  l: !Bar
+    m: 2
+",
+        ),
+        (
+            r#"Resources:
+  B:
+    Type: X
+    Properties:
+      Name: !Ref Param
+      Arn: !GetAtt [Q, Arn]
+      Sub: !Sub "x-${A}"
+      Map: !Foo
+        k: v
+"#,
+            r".Resources.B.Properties.Other = 1",
+            &[],
+            r#"Resources:
+  B:
+    Type: X
+    Properties:
+      Name: !Ref Param
+      Arn: !GetAtt [Q, Arn]
+      Sub: !Sub "x-${A}"
+      Map: !Foo
+        k: v
+      Other: 1
+"#,
+        ),
+        (
+            r#"Resources:
+  B:
+    Type: X
+    Properties:
+      Name: !Ref Param
+      Arn: !GetAtt [Q, Arn]
+      Sub: !Sub "x-${A}"
+      Map: !Foo
+        k: v
+"#,
+            r#".Resources.B.Type = "Y" | del(.Resources.B.Properties.Arn)"#,
+            &[],
+            r#"Resources:
+  B:
+    Type: Y
+    Properties:
+      Name: !Ref Param
+      Sub: !Sub "x-${A}"
+      Map: !Foo
+        k: v
+"#,
+        ),
+        (
+            r"a: !!str 1
+",
+            r".a = 5",
+            &[],
+            r"a: 5
+",
+        ),
+        (
+            r"a: !Ref v
+",
+            r".a = 5",
+            &[],
+            r"a: !Ref 5
+",
+        ),
+        (
+            r"a: !Foo
+  k: v
+",
+            r".a = 5",
+            &[],
+            r"a: !Foo 5
+",
+        ),
+        (
+            r"a: !Foo
+  k: v
+",
+            r".a = [1]",
+            &[],
+            r"a: !Foo
+  - 1
+",
+        ),
+        (
+            r#"a: !!int "5"
+"#,
+            r".a = 6",
+            &[],
+            r#"a: !!int "6"
+"#,
+        ),
+        (
+            r"a: !!float 1
+",
+            r".a = 2",
+            &[],
+            r"a: 2
+",
+        ),
+        (
+            r"a: !!str 1
+",
+            r#". style = """#,
+            &[],
+            r"a: !!str 1
+",
+        ),
+        (
+            r#"a: !!str 1
+b: !!int "7"
+c: !!map {d: 1}
+"#,
+            r".",
+            &["-P"],
+            r#"a: "1"
+b: 7
+c:
+  d: 1
+"#,
+        ),
+    ];
+    for (doc, filter, extra, want) in cases {
+        let (out, err, code) = run_yq_stdin_with_stderr(filter, doc, extra)?;
+        assert_eq!(out, *want, "`{filter}` {extra:?} on {doc:?}: {err}");
+        assert_eq!(code, 0, "`{filter}` {extra:?} on {doc:?}: {err}");
+    }
+    Ok(())
+}
+
+/// `-i` takes the same DOM path, so the tags of a CloudFormation template survive an
+/// in-place edit.
+#[test]
+fn test_yq_inplace_keeps_explicit_tags_4078() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    write!(
+        file,
+        "Resources:\n  B:\n    Properties:\n      Name: !Ref Param\n      Arn: !GetAtt [Q, Arn]\n"
+    )?;
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg(".Resources.B.Properties.Other = 1")
+        .arg(file.path())
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(file.path())?,
+        "Resources:\n  B:\n    Properties:\n      Name: !Ref Param\n      Arn: !GetAtt [Q, Arn]\n      Other: 1\n"
+    );
+    Ok(())
+}
+
 // =============================================================================
 // #2470: yq's read-only evaluation context (`Context.DontAutoCreate`)
 // =============================================================================

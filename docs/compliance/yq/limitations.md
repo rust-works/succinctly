@@ -636,7 +636,7 @@ and a quoted string spelled like a timestamp, `1_000` or `0b11` was written bare
 as another type) where yq writes it double-quoted. The strip pass now walks the value beside the
 tree: a quoted bool spelling, key or value, keeps its style, and every other quoted string is
 remembered as a string (`VALUE_STYLE_STRING`, `KEY_STYLE_STRING`), written as go-yaml writes any
-string. Plain scalars are untouched (`off: 8` stays plain). A node a write *copies* from elsewhere (`.c = .a`, `.l[1] = .l[0]`) has no tree entry of its own, so it loses its quoting with or without `-P`, and an explicit `!!str` tag is dropped on this route (`a: !!str "yes"` becomes `a: "yes"`). Pinned by the
+string. Plain scalars are untouched (`off: 8` stays plain). A node a write *copies* from elsewhere (`.c = .a`, `.l[1] = .l[0]`) has no tree entry of its own, so it loses its quoting with or without `-P`, and `-P` drops a core tag that only restates a type (`a: !!str "yes"` becomes `a: "yes"`, as in yq). Pinned by the
 `yaml_pretty_old_bool_*_3614` and `yaml_pretty_quoted_typed_strings_3614` goldens; a randomized
 sweep of 720 documents over the spellings, block and flow, matches yq.
 
@@ -4247,6 +4247,20 @@ ruled out), even though real yq supports every one of them:
   `~` prints `null`; and a style is applied to the node's *final* value (the known
   no-read-after-write gap), so `.a style = "tagged" | .a = 3.5` prints `!!float 3.5` where yq
   drops the tag when the new value's type differs.
+- **Explicit tags survive a write** ([#4078](https://github.com/rust-works/succinctly/issues/4078)).
+  A DOM write (`=`, `|=`, `del()`, `-P`, `-i`, `--arg`) re-emits every explicit tag of the
+  document it read: `!Ref`/`!GetAtt`/`!Sub` and application tags on scalars, mappings and
+  sequences, and `!!str 1`, `!!float 1`, `!!int "2"`, before a scalar, on the header line of a
+  block container behind any anchor, and before a flow or empty one. They used to be dropped,
+  which turned a CloudFormation template into a different document on any edit. A written node
+  keeps a custom tag and loses a core tag its new value no longer has (`!!str 1` written `5` is
+  `5`, written `"x"` stays `!!str x`; `!!int "5"` written `6` is `!!int "6"`); `-P` drops the
+  core tags that only restate a type and keeps the rest. Checked against yq v4.53.3 on ~1,900
+  random tagged documents. Not matched: a node a write *copies* from elsewhere (`.b = .a`)
+  carries no tree entry, so it loses its tag where yq copies it (the existing copy gap); a
+  computed value has no tag (#1416); `!!set` members print `null` where yq prints `''`; `!!null`
+  keeps no `~` spelling (#2802); and a tagged `null` that a path write walks through
+  (`a: !Foo null` + `.a.b = 5`) becomes a mapping where yq leaves the document alone.
 - **`anchor = "<name>"` with a name go-yaml's emitter refuses** raises real yq's exact
   `yaml: yaml: anchor value must contain valid characters only`. The accepted set is the
   measured one, not YAML 1.2's: printable ASCII except `,`/`[`/`]`/`{`/`}`/`:` and

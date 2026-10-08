@@ -2123,18 +2123,27 @@ struct HeadFootComment {
     head: Vec<String>,
     /// Standalone `#` lines directly below the node.
     foot: Vec<String>,
+    /// The explicit tag the node was written with (`!Ref`, `!!str`), verbatim
+    /// (#4078). Kept in this box rather than as a field of its own for the same
+    /// reason the head/foot lines are: `NodeMeta` is on the stack of every
+    /// recursive walk, and an untagged node should cost nothing.
+    tag: Option<String>,
 }
 
 impl HeadFootComment {
-    /// `None` when both `head` and `foot` are empty, else boxed -- the one
-    /// place this "only allocate when there's something to say" rule is
-    /// defined, shared by every [`NodeMeta`] construction site that can
-    /// produce head/foot data (#2795 PR B).
-    fn boxed_if_any(head: Vec<String>, foot: Vec<String>) -> Option<Box<Self>> {
-        if head.is_empty() && foot.is_empty() {
+    /// `None` when there is no head, foot or tag, else boxed -- the one place this
+    /// "only allocate when there's something to say" rule is defined, shared by
+    /// every [`NodeMeta`] construction site that can produce head/foot/tag data
+    /// (#2795 PR B, #4078).
+    fn boxed_if_any_with_tag(
+        head: Vec<String>,
+        foot: Vec<String>,
+        tag: Option<String>,
+    ) -> Option<Box<Self>> {
+        if head.is_empty() && foot.is_empty() && tag.is_none() {
             None
         } else {
-            Some(Box::new(Self { head, foot }))
+            Some(Box::new(Self { head, foot, tag }))
         }
     }
 }
@@ -2217,7 +2226,33 @@ impl NodeMeta {
     /// already gets — see the field's own doc comment for why that matters.
     pub fn with_head_foot(&self, head: Vec<String>, foot: Vec<String>) -> Self {
         Self {
-            head_foot_comment: HeadFootComment::boxed_if_any(head, foot),
+            head_foot_comment: HeadFootComment::boxed_if_any_with_tag(head, foot, self.tag_owned()),
+            ..self.clone()
+        }
+    }
+
+    /// The explicit tag this node was written with (`!Ref`, `!!str`), verbatim,
+    /// or `None` (#4078).
+    pub fn tag(&self) -> Option<&str> {
+        self.head_foot_comment
+            .as_deref()
+            .and_then(|hf| hf.tag.as_deref())
+    }
+
+    fn tag_owned(&self) -> Option<String> {
+        self.tag().map(str::to_string)
+    }
+
+    /// This node's own metadata with its explicit tag replaced, everything else
+    /// kept (#4078).
+    #[must_use]
+    pub fn with_tag(&self, tag: Option<String>) -> Self {
+        let (head, foot) = self.head_foot_comment.as_deref().map_or_else(
+            || (Vec::new(), Vec::new()),
+            |hf| (hf.head.clone(), hf.foot.clone()),
+        );
+        Self {
+            head_foot_comment: HeadFootComment::boxed_if_any_with_tag(head, foot, tag),
             ..self.clone()
         }
     }
@@ -2682,7 +2717,20 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
         comment: own_comment,
         style: own_style,
         anchor: own_anchor,
-        head_foot_comment: HeadFootComment::boxed_if_any(own_head, own_foot),
+        head_foot_comment: HeadFootComment::boxed_if_any_with_tag(
+            own_head,
+            own_foot,
+            // #4078: the explicit tag, verbatim. Not on an alias node (its tag, if
+            // any, lives on the anchor it points to, which is written there) nor
+            // anywhere under one (never written at all).
+            if child_under_alias {
+                None
+            } else {
+                cursor
+                    .and_then(DocumentCursor::explicit_tag)
+                    .map(str::to_string)
+            },
+        ),
     };
     if let Some(fields) = value.as_object() {
         let mut map = IndexMap::new();
@@ -43697,6 +43745,47 @@ mod tests {
         // The alias-expanded copy is the target's own mark, not a declaration.
         assert_eq!(comments.field("n").key_anchor("inner"), None);
         assert_eq!(CommentTree::empty().key_anchor("key"), None);
+    }
+
+    /// #4078: a node's explicit tag is recorded verbatim, on scalars and containers, not
+    /// on an alias nor under one, and a head/foot rewrite keeps it.
+    #[test]
+    fn test_to_owned_with_comments_records_explicit_tags_4078() {
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"a: !Ref Param\nb: !!str 1\nc: !Foo\n  k: !GetAtt [Q, Arn]\nd: &x !Bar v\ne: *x\nf: plain\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let cursor = index.root(yaml);
+        let mapping_cursor = cursor
+            .first_child()
+            .expect("YAML document should have content");
+        let value = mapping_cursor.value();
+        let (_, comments) = to_owned_with_comments::<_, YqSemantics>(&value, Some(&mapping_cursor))
+            .expect("conversion succeeds");
+
+        let tag = |key: &str| comments.field(key).meta().tag().map(str::to_string);
+        assert_eq!(tag("a").as_deref(), Some("!Ref"));
+        assert_eq!(tag("b").as_deref(), Some("!!str"));
+        assert_eq!(tag("c").as_deref(), Some("!Foo"));
+        assert_eq!(comments.field("c").field("k").meta().tag(), Some("!GetAtt"));
+        assert_eq!(tag("d").as_deref(), Some("!Bar"));
+        assert_eq!(
+            tag("e"),
+            None,
+            "an alias is written `*x`, never behind a tag"
+        );
+        assert_eq!(tag("f"), None);
+
+        let meta = comments
+            .field("a")
+            .meta()
+            .with_head_foot(vec!["# h".to_string()], Vec::new());
+        assert_eq!(
+            meta.tag(),
+            Some("!Ref"),
+            "a head/foot rewrite keeps the tag"
+        );
+        assert_eq!(meta.with_tag(None).head_comment(), ["# h".to_string()]);
     }
 
     /// #2598: an anchor alone earns a `KeyMeta` entry, and survives a write.
