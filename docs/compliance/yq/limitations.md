@@ -2832,45 +2832,93 @@ prints `1`, `null` (it prints `null`, `1`, `null` for `(.zz, .[]?)` with no `//`
 document with no `a`, ...) plus an unrelated `map` over a mapping; and `del((.a, .b) // .zz)`, where
 yq deletes the key it just created and loses `a` as well (`{"c":2}`; here `{"a":null,"c":2}`).
 
-### An `and`/`or` operand's evaluation context — resolved for `and`/`or` (#2540); `=`'s right side remains open
+### An operand's evaluation context — a context-free stage re-emits against an empty context (#2540, #2588)
 
 A literal or constructor is not really "empty" against a read-only, zero-node context in
 real yq the way `.`/`length`/a plain navigational read are: `valueOperator`
 (`pkg/yqlib/operator_value.go`) special-cases an empty `context.MatchingNodes` by
 re-emitting a copy of the literal node instead of looping zero times, and `[...]`/`{...}`
 (`operator_collect.go`/`operator_create_map.go`) carry the identical special case in their
-own operators — but not identically to each other. Captured live against yq v4.53.3 on
-`a: {b: 1}` (`.a.zz` genuinely absent, not `null`):
+own operators — but not identically to each other. The rule is **per operator, not per
+pipe**: the *first* context-free operator restarts the stream from a node of its own, and
+every later stage then runs normally on it. Captured live against yq v4.53.3 on
+`a: {b: 1}` / `x: 5` (`.a.zz` genuinely absent, not `null`), as `.x = (.a.zz | EXPR)`:
 
-| `EXPR` in `(.a.zz \| EXPR) and true` | produces (not "empty" for #2460's rule) |
+| `EXPR` | produces (not "empty" for #2460's rule) |
 |---|---|
-| `true` / `5` / `"s"` | itself, unconditionally |
-| `[.]` / `[.a]` / `[1,2]` | `[]`, **regardless of the array's own body** — it loops zero times over the empty context, but the collected array is still emitted once |
+| `true` / `5` / `"s"` / `null` / `-1` | itself, unconditionally |
+| `[.]` / `[.a]` / `[1,2]` / `[]` | `[]`, **regardless of the array's own body** — it loops zero times over the empty context, but the collected array is still emitted once |
 | `{"k": 1}` | `{"k": 1}` — every field's value also independently qualifies |
+| `{"k": [1]}` | `{"k": []}` — each field value is itself re-emitted |
 | `{"k": .}` | nothing — `.` does not have this special case (`operator_self.go` returns its input context unchanged), so the *whole* object construction aborts, not just that field |
 | `{"k": 1, "j": .}` | nothing — one disqualifying field is enough; this is not a per-field union |
-| `.` / `length` / any other filter | nothing (propagates, matching the pre-existing #2460 oracle rows for `key`/`parent`) |
+| `1 + 1` / `"s" + "t"` / `1 == 1` / `1 // 3` | the operator applied to the re-emitted operands (`2`, `"st"`, `true`, `1`) |
+| `(true, false)` / `(1, .b)` / `(.b, 1)` | the re-emitting branches only: `=` keeps the last (`false`, `1`, `1`), `and`/`or` see every one |
+| `true \| not` / `1 \| tostring` / `[1] \| length` / `{"q": 1} \| .q` | `false` / `"1"` / `0` / `1` — the first stage re-emits and the tail runs on it |
+| `.` / `.b` / `length` / `tostring` / `select(true)` / `. // 3` | nothing (propagates, matching the pre-existing #2460 oracle rows for `key`/`parent`) |
 
 Before [#2540](https://github.com/rust-works/succinctly/issues/2540), succinctly propagated
 the zero-node emptiness straight through the pipe for every `EXPR` shape, so `and`'s left
 operand registered as empty and #2460's own empty-operand rule short-circuited to `false`
 without ever consulting the literal/constructor's real value: `(.a.zz | true) and true` was
-`false` instead of `true`. Fixed as `jq::eval::yq_empty_context_literal_or_constructor`, a
-pure `Expr` classifier (recursing into a pipe's own last stage, and into an object's field
-values) shared by both evaluators through `jq::eval::boolean_fanout_bools` — the one
-definition `and`/`or` in both evaluators already share for #2460's own rule. Gated on
-`rules.read_only`, so jq mode and comparison operands are untouched. See
-`tests/yq_cli_tests.rs`'s `test_yq_empty_context_literal_or_constructor_and_operand_2540`
-and `test_yq_empty_context_constructor_value_shapes_2540` for the full captured matrix.
+`false` instead of `true`. #2540 modelled the rule as "the pipe's *last* stage re-emits a
+static value", which was too narrow in both directions (`(.a.zz | 1 + 1) and true`,
+`(.a.zz | true | not) and true` and `(.a.zz | (true, false)) and true` were still wrong), and
+it only reached `and`/`or`: `=`'s right side evaluates through a different mechanism
+(`jq::eval::collect_rhs_outputs`), so `.x = (.a.zz | true)` stayed `x: 5` where yq has
+`x: true`.
 
-**Residual, not yet fixed:** the issue's own prose also names `=`'s right side as reachable
-through the identical `DontAutoCreate` mechanism (#2470), and it is — `.x = (.a.zz | true)`
-is `x: true` in real yq, `x: 5` (i.e. unchanged) in succinctly (confirmed live against
-v4.53.3) — but `=`'s right side evaluates through a completely different code path
-(`jq::eval::yq_prepare_assign_targets`/`resolve_dynamic_indexes`, not
-`boolean_fanout_bools`) that #2540 did not touch. Tracked as a follow-up rather than folded
-in here, since fixing it needs its own trace through that separate mechanism, not a second
-call to the same classifier.
+[#2588](https://github.com/rust-works/succinctly/issues/2588) replaces the classifier with
+`jq::eval::yq_empty_context_reemit`, which returns the *expression* yq would emit
+(a pure `Expr` rewrite: a pipe is classified by its first re-emitting stage and keeps the
+tail, an array becomes `[]`, a comma keeps only its re-emitting branches, an operator needs
+every operand to re-emit). The rewrite reads nothing from its input, so it is evaluated
+wherever the original produced nothing, inside the read-only scope that produced the
+emptiness:
+
+- `collect_rhs_outputs` — the shared prologue of `=`, `+=`, `-=`, `*=` and the other
+  compound forms, in both evaluators (the generic one prefetches through it);
+- the `and`/`or` fanout (`boolean_fanout_each`), both operands, driving **every** bit the
+  rewrite yields;
+- the arithmetic and comparison fanout, both evaluators
+  (`binary_fanout_each_with` and `binary_fanout_each_generic_with`), for an operand of an
+  arithmetic expression or any operand under an enclosing read-only scope
+  (`.x = ((.a.zz | 1) == 1)`). A bare top-level comparison is not read-only in yq
+  (`compareOperator` does not clone its context read-only), so it is left alone.
+
+Gated on yq mode and a read-only scope, so jq mode (where `.a.zz` is a `null`, not zero
+nodes) never enters the path. The admitted set is closed (literals, `-`, arithmetic,
+comparison, `and`/`or`, `//` (left operand only, the right becomes `empty` when it does not
+re-emit), `[...]`, `{...}` with literal keys, `,`, `|`); `Expr::Shared`
+is deliberately not unwrapped, and a dynamic object key declines unless it is itself a
+literal (anything else would have to be evaluated to be stringified, and raising where yq
+emits nothing is worse than staying empty). See `tests/yq_cli_tests.rs`'s
+`test_yq_assign_rhs_reemits_from_a_context_free_stage_2588`,
+`test_yq_assign_rhs_non_reemitting_stages_stay_empty_2588` and
+`test_yq_empty_context_reemit_in_boolean_and_arithmetic_operands_2588` for the captured
+matrix, and the #2540 tests for the original `and`/`or` rows.
+
+**Residual, not fixed by #2588** (each reaches the same yq rule through a route that is not
+an operand of the shapes above; all checked live against v4.53.3):
+
+- an operand *nested inside a collect*: `.x = ([.a.zz | true])` is `x: [true]` in yq,
+  `x: []` here. The re-emission has to happen at the pipe inside `[...]`, which is the
+  ordinary pipe evaluator rather than a fanout;
+- `|=`: `.x |= (.zz | true)` is `x: true` in yq (its filter runs per matched node through
+  `SingleChildContext`, see the end of this section), `x: 5` here;
+- `//` with a parenthesised re-emitting left operand: `.x = ((.a.zz | 1) // 3)` is `x: 1`
+  in yq and `x: 3` here (`.x = (.a.zz | 1 // 3)` agrees). `//` has its own evaluation
+  routes (`eval_alternative_per_left_output` and its cursor, lazy and path twins) that
+  do not share the fanout loop;
+- a **second restart** after the stream empties again: `.x = (.a.zz | true | select(false) |
+  1)` is `x: 1` and `.x = (.a.zz | 1 | .zz | 2)` is `x: 2` in yq (every context-free
+  operator restarts an empty stream, not only the first), `x: 5` here. The rewrite keeps
+  the tail after the first re-emitting stage verbatim, because whether a later stage's
+  input is empty is only known while evaluating;
+- an operator with **one** re-emitting operand and one that reads its input, which yq
+  answers asymmetrically: `.x = (.a.zz | 1 == .b)` (and `!=`, `<`, `>`, `<=`, `>=`) is
+  `false`/`true` in yq while `.b == 2` and `1 + .b` are nothing. The operator declines
+  (both operands must re-emit), so these keep their pre-#2588 answer (`x: 5`).
 
 Real yq's `assignUpdateOperator` (`pkg/yqlib/operator_assign.go`, v4.53.3) resolves and
 auto-creates the **left** side first, then evaluates the right side — through

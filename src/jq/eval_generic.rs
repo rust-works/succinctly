@@ -79,13 +79,14 @@ use super::eval::{
     stop_with_downstream, stop_with_error, stop_with_escape, streams_escaped_generator_prefix,
     streams_unbounded, substitute_bound_var_from, substitute_deferred_var, substitute_vars,
     suppresses, tonumber_from_str, tostring_owned, try_handler_root, vec_with_capacity,
-    yq_absent_key_read_is_empty, yq_assign_rhs_document, yq_dedup_key, yq_empty_operand_output,
-    yq_field_index_on_scalar_is_empty, yq_first_of_each_key, yq_negative_index_check,
-    yq_negative_index_error, yq_numeric_index_on_object_is_null, yq_object_key_stringify,
-    yq_read_only_context, yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand,
-    EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail,
-    QueryResult, RangeNum, Reentry, RestPipe, RootWitness, SliceTargetKind, StashedEscape,
-    StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED, WHILE_UNTIL_MAX_STEPS,
+    yq_absent_key_read_is_empty, yq_assign_rhs_document, yq_dedup_key, yq_empty_context_reemit,
+    yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_first_of_each_key,
+    yq_negative_index_check, yq_negative_index_error, yq_numeric_index_on_object_is_null,
+    yq_object_key_stringify, yq_read_only_context, yq_scalar_text, BinaryFanoutRules,
+    ComputedSliceBound, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
+    JqSemantics, LimitN, PathTrail, QueryResult, RangeNum, Reentry, RestPipe, RootWitness,
+    SliceTargetKind, StashedEscape, StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED,
+    WHILE_UNTIL_MAX_STEPS,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -17758,7 +17759,7 @@ fn binary_fanout_each_generic_with<V: DocumentValue, S: EvalSemantics>(
     // pairings -- the same rule, from the same definition, that
     // `eval::binary_fanout_each` consults on the eager route. `None` in jq
     // mode, where `1 + empty` really is nothing.
-    let mut outer_seen = 0usize;
+    let outer_seen = core::cell::Cell::new(0usize);
     // #2451: jq loops the right operand outermost, yq the left -- the same
     // `BinaryFanoutRules::left_major` the eager loop reads, so the two routes
     // cannot pick different orders.
@@ -17768,18 +17769,21 @@ fn binary_fanout_each_generic_with<V: DocumentValue, S: EvalSemantics>(
         (right, left)
     };
 
-    let outer = each_operand(outer_expr, &mut |outer_item: GenericItem<V>| {
+    // The rewrite depends only on `inner_expr`, so it is computed at most
+    // once however many outer values find the inner operand empty (#2588).
+    let inner_reemit: core::cell::OnceCell<Option<Expr>> = core::cell::OnceCell::new();
+    let mut on_outer = |outer_item: GenericItem<V>| {
         abort.begin();
-        outer_seen += 1;
+        outer_seen.set(outer_seen.get() + 1);
         let outer_val = match generic_item_into_owned::<_, S>(outer_item) {
             Ok(v) => v,
             Err(control) => return abort.stop_with_downstream(Flow::Escaped(control)),
         };
 
-        let mut inner_seen = 0usize;
-        let inner = each_operand(inner_expr, &mut |inner_item: GenericItem<V>| {
+        let inner_seen = core::cell::Cell::new(0usize);
+        let mut on_inner = |inner_item: GenericItem<V>| {
             abort.begin();
-            inner_seen += 1;
+            inner_seen.set(inner_seen.get() + 1);
             let inner_val = match generic_item_into_owned::<_, S>(inner_item) {
                 Ok(v) => v,
                 Err(control) => return abort.stop_with_downstream(Flow::Escaped(control)),
@@ -17806,7 +17810,8 @@ fn binary_fanout_each_generic_with<V: DocumentValue, S: EvalSemantics>(
                     Flow::Escaped(Control::Error(e))
                 }),
             }
-        });
+        };
+        let mut inner = each_operand(inner_expr, &mut on_inner);
 
         // #3293: a retry inside `inner_expr` that produced nothing never
         // re-invoked the closure above to reset `abort`.
@@ -17814,6 +17819,23 @@ fn binary_fanout_each_generic_with<V: DocumentValue, S: EvalSemantics>(
         if abort.is_set() {
             return Demand::Stop;
         }
+
+        // #2588 (yq mode only): the inner operand produced nothing, but a
+        // context-free stage of it re-emits a node of its own -- pair the
+        // rewritten operand instead. Mirrors `eval::binary_fanout_each_with`.
+        if inner_seen.get() == 0
+            && matches!(inner, Flow::Exhausted)
+            && rules.reemits_empty_operand()
+        {
+            if let Some(reemit) = inner_reemit.get_or_init(|| yq_empty_context_reemit(inner_expr)) {
+                inner = each_operand(reemit, &mut on_inner);
+                abort.settle(&inner, crate::jq::eval::direct_pattern_retry(reemit));
+                if abort.is_set() {
+                    return Demand::Stop;
+                }
+            }
+        }
+        let inner_seen = inner_seen.get();
 
         // #2460 (yq mode only): the *inner* operand produced nothing for this
         // outer value, so this pairing is answered from the empty-operand
@@ -17833,10 +17855,26 @@ fn binary_fanout_each_generic_with<V: DocumentValue, S: EvalSemantics>(
             Flow::Exhausted => Demand::Continue,
             other => abort.stop_with_downstream(other),
         }
-    });
+    };
+    let mut outer = each_operand(outer_expr, &mut on_outer);
 
-    let abort = abort.take(&outer, crate::jq::eval::direct_pattern_retry(outer_expr));
-    if let (Some(op), 0, None, Flow::Exhausted) = (rules.empty, outer_seen, &abort, &outer) {
+    abort.settle(&outer, crate::jq::eval::direct_pattern_retry(outer_expr));
+    // #2588 (yq mode only): the outer operand produced nothing, but a
+    // context-free stage of it re-emits a node of its own; pair the
+    // rewritten operand with the inner one through the same loop body.
+    let mut outer_driven = outer_expr;
+    let reemit = (outer_seen.get() == 0
+        && rules.reemits_empty_operand()
+        && !abort.is_set()
+        && matches!(outer, Flow::Exhausted))
+    .then(|| yq_empty_context_reemit(outer_expr))
+    .flatten();
+    if let Some(reemit) = &reemit {
+        outer = each_operand(reemit, &mut on_outer);
+        outer_driven = reemit;
+    }
+    let abort = abort.take(&outer, crate::jq::eval::direct_pattern_retry(outer_driven));
+    if let (Some(op), 0, None, Flow::Exhausted) = (rules.empty, outer_seen.get(), &abort, &outer) {
         // #2460 (yq mode only): the *outer* operand produced nothing, so the
         // loop never ran and the inner one was never evaluated at all --
         // drive it once here so `1 + key` and `key + 1` stay symmetric the

@@ -42056,6 +42056,184 @@ fn test_yq_empty_context_literal_or_constructor_right_operand_and_dynamic_key_25
     Ok(())
 }
 
+/// #2588: `=`'s right side (and its `+=`/`*=`-style siblings, which share the
+/// prologue) is not empty when a context-free stage of it re-emits a node of
+/// its own, exactly as #2540 established for `and`/`or`. Real yq models this
+/// per operator -- the *first* context-free stage restarts the stream from a
+/// node of its own and every later stage runs normally on it -- where #2540's
+/// classifier only looked at the pipe's *last* stage.
+///
+/// Every row is a live capture from Homebrew `yq` v4.53.3 (`-o=json -I0`) on
+/// `a: {b: 1}` / `x: 5`, where `.a.zz` is genuinely absent. The `{"q": .b}`
+/// style rows in the sibling test are the negative controls.
+#[test]
+fn test_yq_assign_rhs_reemits_from_a_context_free_stage_2588() -> Result<()> {
+    const DOC: &str = "a:\n  b: 1\nx: 5\n";
+    for (filter, want) in [
+        (r".x = (.a.zz | true)", r#"{"a":{"b":1},"x":true}"#),
+        (r".x = (.a.zz | 7)", r#"{"a":{"b":1},"x":7}"#),
+        (r#".x = (.a.zz | "s")"#, r#"{"a":{"b":1},"x":"s"}"#),
+        (r".x = (.a.zz | null)", r#"{"a":{"b":1},"x":null}"#),
+        (r".x = (.a.zz | -1)", r#"{"a":{"b":1},"x":-1}"#),
+        (r".x = (.a.zz | [1,2])", r#"{"a":{"b":1},"x":[]}"#),
+        (r".x = (.a.zz | [.b])", r#"{"a":{"b":1},"x":[]}"#),
+        (r".x = (.a.zz | [true])", r#"{"a":{"b":1},"x":[]}"#),
+        (r".x = (.a.zz | [])", r#"{"a":{"b":1},"x":[]}"#),
+        (r#".x = (.a.zz | {"q": 1})"#, r#"{"a":{"b":1},"x":{"q":1}}"#),
+        (
+            r#".x = (.a.zz | {"q": [1]})"#,
+            r#"{"a":{"b":1},"x":{"q":[]}}"#,
+        ),
+        (r".x = (.a.zz | 1 + 1)", r#"{"a":{"b":1},"x":2}"#),
+        (r#".x = (.a.zz | "s" + "t")"#, r#"{"a":{"b":1},"x":"st"}"#),
+        (r".x = (.a.zz | 1 == 1)", r#"{"a":{"b":1},"x":true}"#),
+        (r".x = (.a.zz | 1 // 3)", r#"{"a":{"b":1},"x":1}"#),
+        (r".x = (.a.zz | true | not)", r#"{"a":{"b":1},"x":false}"#),
+        (r".x = (.a.zz | 1 | tostring)", r#"{"a":{"b":1},"x":"1"}"#),
+        (r".x = (.a.zz | [1] | length)", r#"{"a":{"b":1},"x":0}"#),
+        (r#".x = (.a.zz | {"q": 1} | .q)"#, r#"{"a":{"b":1},"x":1}"#),
+        (
+            r#".x = (.a.zz | "a" | test("a"))"#,
+            r#"{"a":{"b":1},"x":true}"#,
+        ),
+        (r".x = (.a.zz | 1 | . + 1)", r#"{"a":{"b":1},"x":2}"#),
+        (
+            r".x = (.a.zz | (true, false))",
+            r#"{"a":{"b":1},"x":false}"#,
+        ),
+        (r".x = (.a.zz | (1, .b))", r#"{"a":{"b":1},"x":1}"#),
+        (r".x = (.a.zz | (.b, 1))", r#"{"a":{"b":1},"x":1}"#),
+        (r".x += (.a.zz | 1)", r#"{"a":{"b":1},"x":6}"#),
+        (r".zz = (.a.zz | true)", r#"{"a":{"b":1},"x":5,"zz":true}"#),
+        (
+            r"(.x, .a.b) = (.a.zz | true)",
+            r#"{"a":{"b":true},"x":true}"#,
+        ),
+        (r".x = (.a.zz | 1) + 1", r#"{"a":{"b":1},"x":2}"#),
+        (r".x = ((.a.zz | 1) == 1)", r#"{"a":{"b":1},"x":true}"#),
+        (r".x = (.a[5] | true)", r#"{"a":{"b":1},"x":true}"#),
+        (
+            r".x = (.a.zz | true | . and false)",
+            r#"{"a":{"b":1},"x":false}"#,
+        ),
+        (
+            r".x = (.a.zz | true and false)",
+            r#"{"a":{"b":1},"x":false}"#,
+        ),
+        (r".x = (1,2)", r#"{"a":{"b":1},"x":2}"#),
+        (r".x = (.a.zz | 1) + (.a.yy | 2)", r#"{"a":{"b":1},"x":3}"#),
+        (r".x = (.a.zz | {(1): 2})", r#"{"a":{"b":1},"x":{"1":2}}"#),
+        (
+            r#".x = (.a.zz | {("k"): [1]})"#,
+            r#"{"a":{"b":1},"x":{"k":[]}}"#,
+        ),
+        (
+            r#".x = (.a.zz | {"q": (1 | tostring)})"#,
+            r#"{"a":{"b":1},"x":{"q":"1"}}"#,
+        ),
+        (r".x = ((.a.zz | 1) != 1)", r#"{"a":{"b":1},"x":false}"#),
+        (r".x = (.a.zz | (1, 2) + 1)", r#"{"a":{"b":1},"x":3}"#),
+        (r".x = (.a.zz | 1 | (. , 2))", r#"{"a":{"b":1},"x":2}"#),
+        (r".x = (.a.zz | [1] | .[0])", r#"{"a":{"b":1},"x":null}"#),
+    ] {
+        let (out, _, code) = run_yq_stdin_with_stderr(filter, DOC, &["-o", "json", "-I", "0"])?;
+        assert_eq!(out.trim(), want, "`{filter}`");
+        assert_eq!(code, 0, "`{filter}`");
+    }
+    Ok(())
+}
+
+/// #2588 negative controls: a stage that reads its input (`.b`, `length`,
+/// `select(true)`, ...) propagates the empty context, so the assignment
+/// performs zero writes and `x` keeps its value -- as does an object with one
+/// such field. Captured live against yq v4.53.3.
+#[test]
+fn test_yq_assign_rhs_non_reemitting_stages_stay_empty_2588() -> Result<()> {
+    const DOC: &str = "a:\n  b: 1\nx: 5\n";
+    for (filter, want) in [
+        (r#".x = (.a.zz | {"q": .b})"#, r#"{"a":{"b":1},"x":5}"#),
+        (r".x = (.a.zz | .b)", r#"{"a":{"b":1},"x":5}"#),
+        (r".x = (.a.zz | length)", r#"{"a":{"b":1},"x":5}"#),
+        (r".x = (.a.zz | tostring)", r#"{"a":{"b":1},"x":5}"#),
+        (r".x = (.a.zz | . // 3)", r#"{"a":{"b":1},"x":5}"#),
+        (r".x = (.a.zz | select(true))", r#"{"a":{"b":1},"x":5}"#),
+        (r".x = (.a.zz | {(.b): 1})", r#"{"a":{"b":1},"x":5}"#),
+    ] {
+        let (out, _, code) = run_yq_stdin_with_stderr(filter, DOC, &["-o", "json", "-I", "0"])?;
+        assert_eq!(out.trim(), want, "`{filter}`");
+        assert_eq!(code, 0, "`{filter}`");
+    }
+    Ok(())
+}
+
+/// #2588: the same generalised rule for `and`/`or` (both operands, and a
+/// comma that re-emits two bits) and for an arithmetic/comparison operand
+/// whose pipe produced zero nodes. Captured live against yq v4.53.3.
+#[test]
+fn test_yq_empty_context_reemit_in_boolean_and_arithmetic_operands_2588() -> Result<()> {
+    const DOC: &str = "a:\n  b: 1\nx: 5\n";
+    for (filter, want) in [
+        (r"(.a.zz | 1 + 1) and true", r"true"),
+        (r"(.a.zz | false | not) and true", r"true"),
+        (r"(.a.zz | [1] | length) and true", r"true"),
+        (r"(.a.zz | (true, false)) and true", "true\nfalse"),
+        (r"true and (.a.zz | (true, false))", "true\nfalse"),
+        (r"false or (.a.zz | 1 + 1)", r"true"),
+        (r"(.a.zz | 1) + 1", r"2"),
+        (r"(.a.zz | 1) - (.a.yy | 2)", r"-1"),
+        (r"1 + (.a.zz | 2)", r"3"),
+    ] {
+        let (out, _, code) = run_yq_stdin_with_stderr(filter, DOC, &["-o", "json", "-I", "0"])?;
+        assert_eq!(out.trim(), want, "`{filter}`");
+        assert_eq!(code, 0, "`{filter}`");
+    }
+    Ok(())
+}
+
+/// #2588 review shapes, captured live against yq v4.53.3 on `a: {b: 1}` /
+/// `x: 5`: a re-emitting operand whose rewrite then comes back empty
+/// (`1 | select(false)`) is an empty operand like any other and the #2460
+/// table answers it, and `//` needs only its *left* operand to re-emit -- the
+/// right side is never reached for a truthy left, and a falsy left stays
+/// itself when the right side reads its input.
+#[test]
+fn test_yq_empty_context_reemit_review_shapes_2588() -> Result<()> {
+    const DOC: &str = "a:\n  b: 1\nx: 5\n";
+    for (filter, want) in [
+        ("true and (.a.zz | 1 | select(false))", "false"),
+        ("(.a.zz | 1 | select(false)) and true", "false"),
+        ("(.a.zz | 1 | select(false)) or true", "true"),
+        (".x = (.a.zz | 1 // .b)", r#"{"a":{"b":1},"x":1}"#),
+        (".x = (.a.zz | null // .b)", r#"{"a":{"b":1},"x":null}"#),
+        (".x = (.a.zz | false // 7)", r#"{"a":{"b":1},"x":7}"#),
+        ("(.a.zz | 1 // .b) and true", "true"),
+    ] {
+        let (out, _, code) = run_yq_stdin_with_stderr(filter, DOC, &["-o", "json", "-I", "0"])?;
+        assert_eq!(out.trim(), want, "`{filter}`");
+        assert_eq!(code, 0, "`{filter}`");
+    }
+    Ok(())
+}
+
+/// #2588 jq-mode guard: the re-emission is yq's read-only-context rule and
+/// must never run under `succinctly jq`, where `.a.zz` is a `null`, not zero
+/// nodes, so these answer through the ordinary evaluator. Pinned jq 1.7.1.
+#[test]
+fn test_jq_mode_never_takes_the_yq_reemit_path_2588() -> Result<()> {
+    const DOC: &str = r#"{"a": {"b": 1}, "x": 5}"#;
+    for (filter, want) in [
+        (".x = (.a.zz | true)", r#"{"a":{"b":1},"x":true}"#),
+        (".x = (.a.zz | [1,2])", r#"{"a":{"b":1},"x":[1,2]}"#),
+        (".x = (.a.zz | 1) + 1", r#"{"a":{"b":1},"x":2}"#),
+        ("(.a.zz | 1 + 1) and true", "true"),
+    ] {
+        let (out, code) = run_jq_stdin(filter, DOC, &["-c"])?;
+        assert_eq!(out.trim(), want, "`{filter}`");
+        assert_eq!(code, 0, "`{filter}`");
+    }
+    Ok(())
+}
+
 // =============================================================================
 // #2470: yq's read-only evaluation context (`Context.DontAutoCreate`)
 // =============================================================================
