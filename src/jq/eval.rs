@@ -49,7 +49,8 @@ use super::local_zone::{self, LocalZone};
 use super::math;
 use super::slice::{self, SliceBounds};
 use super::walk::{
-    any_subexpr, map_builtin_subexprs, map_pattern_subexprs, map_subexprs, search_subexpr, Visit,
+    any_pattern_key, any_subexpr, map_builtin_subexprs, map_pattern_subexprs, map_subexprs,
+    search_subexpr, Visit,
 };
 
 /// Which `EvalSemantics` implementor a value carries, as a runtime tag.
@@ -1544,7 +1545,22 @@ fn contains_assign_scoped<'e>(expr: &'e Expr, scope: &mut DefScope<'e>) -> bool 
             .iter()
             .any(|stage| contains_assign_scoped(stage, scope)),
         // Only the body reaches the output; the bound expression never does.
-        Expr::As { body, .. } | Expr::AsPattern { body, .. } => contains_assign_scoped(body, scope),
+        Expr::As { body, .. } => contains_assign_scoped(body, scope),
+        // #3203: neither does a destructuring pattern's computed key, but a
+        // metadata write (`line_comment =`, `style =`, `anchor =`) buried in
+        // one is still a write the CLI's metadata pass must see, to refuse it
+        // as it refuses every buried write (#798) rather than drop it. A
+        // *value*-shaped write in a key (`=`, `|=`, `del(..)`) is deliberately
+        // not counted: it runs against the bound value to produce a key, never
+        // against the document the body then returns, so it makes no path of
+        // that document's output mean something else.
+        Expr::AsPattern { patterns, body, .. } => {
+            patterns.iter().any(|pattern| {
+                any_pattern_key(pattern, &mut |key| {
+                    any_subexpr(key, &mut |e| matches!(e, Expr::MetaAssign { .. }))
+                })
+            }) || contains_assign_scoped(body, scope)
+        }
         Expr::FuncDef {
             name,
             params,
@@ -131360,6 +131376,37 @@ mod tests {
     }
 
     /// Both halves must follow the *same* wrappers, since
+    /// #3203: a *metadata* write buried in a destructuring pattern's computed
+    /// key makes the filter a write for the CLI's metadata pass (which then
+    /// refuses it), whatever the body is; a value-shaped write there, or no
+    /// write at all, does not. Mirrors #3017's `any_subexpr` descent.
+    #[test]
+    fn pattern_key_metadata_write_is_seen_by_the_gate_3203() {
+        let yq = |src: &str| parse_with_mode_and_extensions(src, ParserMode::Yq, true).unwrap();
+        for src in [
+            ". as {((.a line_comment = \"x\") | .a): $v} | .",
+            ". as [{((.a style = \"double\") | .a): $v}] | .",
+            ". as {((.a anchor = \"z\") | .a): $v} | select(true)",
+            ". as {x: {((.a line_comment = \"x\") | .a): $v}} | .",
+        ] {
+            let expr = yq(src);
+            assert!(contains_assign(&expr), "{src}");
+            assert!(is_alias_sensitive_assign(&expr), "{src}");
+        }
+        for src in [
+            ". as {((.a = 1) | .a): $v} | .",
+            ". as {((.a) | .a): $v} | .",
+            ". as {a: $v} | .",
+            // A reshaping body is outside the gate whatever the key holds (the
+            // gate is `is_shape_preserving && contains_assign`).
+            ". as {((.a line_comment = \"x\") | .a): $v} | $v",
+            ". as {((.a line_comment = \"x\") | .a): $v} | map(.)",
+        ] {
+            let expr = yq(src);
+            assert!(!is_alias_sensitive_assign(&expr), "{src}");
+        }
+    }
+
     /// `is_alias_sensitive_assign` is `is_shape_preserving && contains_assign`
     /// -- a wrapper only one of them follows would make the pair answer
     /// correctly for the wrong reason, and stop doing so the moment the other
