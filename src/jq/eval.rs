@@ -38734,7 +38734,14 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                     snapshot,
                     frame,
                     keep,
-                    &mut |branch| sink(carry_comma_sibling_register(e, branch, frame)),
+                    &mut |branch| {
+                        sink(carry_comma_sibling_register(
+                            e,
+                            branch,
+                            frame,
+                            (S::TAG == EvalTag::Jq && trackable).then_some(value),
+                        ))
+                    },
                 ) {
                     ResolveFlow::Exhausted => {}
                     other => return other,
@@ -40606,9 +40613,22 @@ fn carry_frame_register<'a>(
 /// their own that a larger set would route programs into.
 fn carry_comma_sibling_register<'a>(
     operand: &Expr,
-    branch: PathBranch<'a>,
+    mut branch: PathBranch<'a>,
     frame: &Frame,
+    entry: Option<&OwnedValue>,
 ) -> PathBranch<'a> {
+    // #4063: on a trackable entry the register is the comma's input itself and the frame holds
+    // none, so a sibling that leaves it alone (`now | .`, whose stage rule drops the statement)
+    // states the entry value. Jq mode only, like every register admission here.
+    if let Some(register) = entry {
+        if !branch.trackable
+            && matches!(branch.register, BranchRegister::None)
+            && neutral_leaves_register(operand)
+        {
+            branch.register = BranchRegister::Unmoved(Cow::Owned(register.clone()));
+        }
+        return branch;
+    }
     carry_register_when(branch, frame, || neutral_leaves_register(operand))
 }
 
@@ -134570,57 +134590,44 @@ mod neutral_leaves_register_tests_4028 {
         }
     }
 
-    // #4059: a pipe reads its last stage's register statements when every stage ahead of it
-    // is neutral, and stays as opaque as it was behind one that may navigate.
-    #[test]
-    fn a_pipe_reads_its_last_stage_behind_neutral_heads() {
-        for (src, forwarded) in [
-            ("1 | (now, floor)", true),
-            ("now | (now, floor)", true),
-            ("1 | 2 | (now, floor)", true),
-            ("1 | ((now, floor) // 5)", true),
-            ("1 | if . then (now, floor) else 1 end", true),
-            // #4063: a leaf last stage is read as it would be alone, and a trailing `.` forwards
-            // the statement of the stage before it (`1` states none).
-            ("1 | .", false),
-            ("(1, 2) | .", true),
-            // A head that may navigate keeps the pipe opaque.
-            (".a | (now, floor)", false),
-            (".a | .", false),
-            ("1 | .a | (now, floor)", false),
-            ("1 | (.a, .b)", false),
-            ("1 | .a", false),
-        ] {
-            let expr = parse(src).unwrap();
-            assert_eq!(
-                matches!(entry_marker_shape(&expr), EntryMarkers::Forwarded),
-                forwarded,
-                "entry_marker_shape({src})"
-            );
+    /// [`entry_marker_shape`] of `src` by name, so a test tells `none` from `opaque`.
+    fn marker_shape(src: &str) -> &'static str {
+        match entry_marker_shape(&parse(src).unwrap()) {
+            EntryMarkers::None => "none",
+            EntryMarkers::Forwarded => "forwarded",
+            EntryMarkers::Opaque => "opaque",
         }
     }
 
-    // #4063: a trailing `.` forwards the statement of the stage before it, so a pipe is read
-    // through what is left; a navigating head still keeps it opaque.
+    // #4059, #4063: a pipe reads its last stage's register statements when every stage ahead
+    // of it is neutral, after dropping the trailing `.` stages that only forward the statement of
+    // the one before them; behind a head that may navigate it is classified as it always was.
     #[test]
-    fn a_trailing_identity_forwards_the_statement_of_the_stage_before_it() {
-        for (src, forwarded) in [
-            ("(1, 2) | .", true),
-            ("(now, .a) | .", true),
-            ("(now, .a) | . | .", true),
-            ("1 | (now, .a) | .", true),
-            (". | (now, .a)", true),
-            (". | .b?", false),
-            // A head that may navigate, ahead of anything but a trailing `.`.
-            (".a | (now, floor)", false),
-            ("(.a, .b) | .", false),
+    fn a_pipe_reads_its_last_stage_behind_neutral_heads() {
+        for (src, shape) in [
+            ("1 | (now, floor)", "forwarded"),
+            ("now | (now, floor)", "forwarded"),
+            ("1 | 2 | (now, floor)", "forwarded"),
+            ("1 | ((now, floor) // 5)", "forwarded"),
+            ("1 | if . then (now, floor) else 1 end", "forwarded"),
+            (". | (now, .a)", "forwarded"),
+            ("1 | .a", "none"),
+            ("1 | (.a, .b)", "none"),
+            (". | .b?", "none"),
+            // A trailing `.` forwards the statement before it (`1` states none).
+            ("1 | .", "none"),
+            ("(1, 2) | .", "forwarded"),
+            ("(now, .a) | .", "forwarded"),
+            ("(now, .a) | . | .", "forwarded"),
+            // A head that may navigate: only the last stage's own producers count, as before.
+            (".a | (now, floor)", "none"),
+            (".a | .", "none"),
+            ("(.a, .b) | .", "none"),
+            (". | .b? | tostring", "opaque"),
+            // A seed producer ahead of a trailing `.` re-seeds and stays opaque.
+            (".. | .", "opaque"),
         ] {
-            let expr = parse(src).unwrap();
-            assert_eq!(
-                matches!(entry_marker_shape(&expr), EntryMarkers::Forwarded),
-                forwarded,
-                "entry_marker_shape({src})"
-            );
+            assert_eq!(marker_shape(src), shape, "entry_marker_shape({src})");
         }
     }
 

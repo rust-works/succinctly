@@ -2909,10 +2909,14 @@ is the revert that established what the other one costs.
    ([#4063](https://github.com/rust-works/succinctly/issues/4063), pinned by
    `test_foreach_update_navigated_then_computed_sibling_moves_the_register_4063`): it used to be
    read as the fold's own register whenever the two values were equal (`null`, `true`, `false`).
-   A pipe on the accumulator (`. | .b?`) beside a neutral builtin, and a trailing `| .` after the
-   comma, are read too (pinned by `test_foreach_update_null_source_register_shapes_keep_the_register_4063`):
-   over a `null` source the accumulator is identical to the register, so such a sibling navigates
-   and the builtin is a by-value leaf on a trackable entry. A boolean register
+   A pipe on the accumulator (`. | .b?`) beside a neutral builtin, a sibling that is a pipe ending in a neutral
+   builtin (`now | .`), and a trailing `| .` after the comma are read too (pinned by
+   `test_foreach_update_null_source_register_shapes_keep_the_register_4063`): over a `null` source
+   the accumulator is identical to the register, so such a sibling navigates, the builtin is a
+   by-value leaf on a *trackable* entry, and the comma states the entry value for a sibling that leaves
+   it alone. What still drops a path there is a sibling that navigates through the accumulator and
+   then computes (`. | .b? | tostring`), the same shape through `$v` being read since #4063's first half;
+   a loud refusal that becomes an empty answer on a deep `//` shape is #4071. A boolean register
    is compared with the result, so an equal one answers and a different one refuses, as in jq
    (jq reads an equal boolean result as the register itself): that holds for a bool-returning
    builtin (`contains(true)`) next to a navigating comma sibling too since #4063.
