@@ -627,14 +627,25 @@ $x (.; .[$x:]))` raises `E2`, was the slice error). What it leaves:
   over `[1]`) raises in jq whatever the register is, so its refusal is exact: it retries, and a
   `try` around it behaves as jq's does (`path(foreach (try ((reduce . as [$a] ?// $a (0; .)),
   .b[0]) catch 1) as $x (.; .; .))` is two paths, was one, with the reduce's `0` lost at exit 0),
-  pinned by `test_fold_pattern_that_fails_by_value_retries_3743`. **Left as it was**: a refusal
-  that remains a guess (`reduce . as {a:$a} ?// [$a] (0; .)` over a document that has `a`, where
-  jq finds the step intact) is not retried, and is still *catchable*, so a `try` around it runs
-  its handler where jq delivers the alternative's own output, silently (the other guess sites make
-  theirs uncatchable, ADR-0018 rule 4; making this one loud is a policy change with a large
-  refusal class, filed separately). A pattern with a computed key is not judged by value
-  (running its generator again would repeat its effects,
-  `test_fold_pattern_computed_key_is_not_run_twice_3743`), so it keeps the same behaviour.
+  pinned by `test_fold_pattern_that_fails_by_value_retries_3743`. **A refusal that remains a
+  guess is loud** ([#3840](https://github.com/rust-works/succinctly/issues/3840)): `reduce . as
+  {a:$a} ?// $a (0; .)` over a document that has `a`, where jq finds the step intact, is not
+  retried, and since #3840 a `try` or `?` around it can no longer catch it (the other guess sites
+  make theirs uncatchable, ADR-0018 rule 4). It used to run the handler where jq delivers the
+  alternative's own output, silently: `del(try (.a and (reduce . as {a:$a} ?// $a (0; .))))` on
+  `{"a":true}` is `{}` in jq and echoed the document here, losing the write. It now refuses
+  (exit 5), as the un-wrapped fold already did. **A recorded divergence, in the safe direction**:
+  the walk cannot tell whether a *later* alternative would also have failed, so a try-wrapped fold
+  whose catch happened to agree with jq (`del(try (.a and (reduce . as {a:$a,b:$b} ?// [$a] (0;
+  .))))` on `{"a":1,"b":2}`, jq `{"a":1,"b":2}`) refuses too. Only a refusal of a step that could
+  have succeeded on the element is converted (`NavKind::would_succeed_on`); one jq raises
+  whatever its register is (a string key off an array) stays catchable. Over the nine fold-pattern
+  operands of `scripts/jq-path-register-sweep.py` (119,907 rows) wrong answers fell from 126
+  ACCEPT_WRONG and 32 DIFF to 14 and 10, at 118 more refusals. **Still left as it was**: a
+  computed key whose value is `null`, a boolean or an array has no `NavKind`, so its guessed
+  refusal stays catchable; and a guess on the *last* alternative is not asked at all. A pattern
+  with a computed key is not judged by value (running its generator again would repeat its
+  effects, `test_fold_pattern_computed_key_is_not_run_twice_3743`), so it is not retried.
 
 ## A fold over the register itself (#3790)
 

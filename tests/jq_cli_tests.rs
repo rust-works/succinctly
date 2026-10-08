@@ -63945,6 +63945,25 @@ fn test_fold_guessed_pattern_refusal_is_not_catchable_3840() -> Result<()> {
             r#"Invalid path expression near attempt to access element "a" of {"a":true}"#,
             5,
         ),
+        // The recorded cost: the walk cannot tell that a later alternative would also
+        // have failed, so this row, which the catch used to answer as jq does
+        // (`{"a":1,"b":2}`), refuses too.
+        (
+            r#"{"a":1,"b":2}"#,
+            r"del(try (.a and (reduce . as {a:$a,b:$b} ?// [$a] (0; .))))",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of {"a":1,"b":2}"#,
+            5,
+        ),
+        // Unchanged: a guess on the last (here only) alternative is not asked, and the
+        // catch answers as jq does.
+        (
+            r#"{"a":true}"#,
+            r"del(try (.a and (reduce . as {a:$a} (0; .))))",
+            "{\"a\":true}\n",
+            "",
+            0,
+        ),
         // Contrast: the refused step could never succeed, so the catch is jq's too
         // (jq retries the first alternative's error into the second, which raises the
         // same way, and the `try` catches that).
