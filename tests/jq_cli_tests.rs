@@ -64509,6 +64509,107 @@ fn test_nested_fold_over_frozen_var_with_untracked_register_stays_loud_3984() ->
     ])
 }
 
+/// #4013: a fold whose INIT navigates and then computes (`.a | tostring`) leaves jq's register
+/// on the navigated node, but the untracked INIT branch seeded the fold's register from the
+/// ambient value with the ambient `trackable`, so a destructuring pattern walked from the
+/// root and `=`/`|=` wrote through the wrong node: `(foreach (null) as {a:$x} (.a|tostring;
+/// .; $x)) = 5` is `{"a":{"a":5}}` in jq and was `{"a":5}` here, `path(...)` of it
+/// `["a","a"]` and `["a"]`. An INIT that can have moved the register
+/// ([`cannot_move_register`] is false) now seeds an untrackable one, so the walk refuses
+/// (exit 5) where jq answers -- the safe direction -- for `foreach` and `reduce` alike. The
+/// controls are unchanged: an INIT that computes without navigating (`tostring`) keeps the
+/// ambient register, and one that navigates without computing is tracked outright. Every jq
+/// side captured from jq 1.7.1. The shape needs a `null` source: `null` is the one value jq's
+/// `path_intact` accepts by value, so a non-null source refuses in both tools and every such
+/// variant already agrees. A compound INIT is judged as a whole, as `resolve_seq_stage` judges a
+/// compound stage ([`cannot_move_register`] is deliberately stricter than a per-branch verdict):
+/// `path(foreach (null) as {a:$x} (.a // "s"; .; $x))` is `["a"]` in jq and refuses here, the
+/// recorded cost.
+#[test]
+fn test_fold_init_that_navigates_then_computes_does_not_keep_the_ambient_register_4013(
+) -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            "null",
+            r"(foreach (null) as {a:$x} (.a|tostring; .; $x)) = 5",
+            "",
+            r#"Invalid path expression near attempt to access element "a""#,
+            5,
+        ),
+        (
+            "null",
+            r"path(foreach (null) as {a:$x} (.a|tostring; .; $x))",
+            "",
+            r#"Invalid path expression near attempt to access element "a""#,
+            5,
+        ),
+        (
+            "null",
+            r"(foreach (null) as {a:$x} (.a|tostring; .; $x)) |= 5",
+            "",
+            r#"Invalid path expression near attempt to access element "a""#,
+            5,
+        ),
+        (
+            "null",
+            r"(reduce (null) as {a:$x} (.a|tostring; $x)) = 5",
+            "",
+            r#"Invalid path expression near attempt to access element "a""#,
+            5,
+        ),
+        (
+            "null",
+            r"path(reduce (null) as {a:$x} (.a|tostring; $x))",
+            "",
+            r#"Invalid path expression near attempt to access element "a""#,
+            5,
+        ),
+        (
+            "null",
+            r"path(foreach (null) as {a:$x} (.a|.b|tostring; .; $x))",
+            "",
+            r#"Invalid path expression near attempt to access element "a""#,
+            5,
+        ),
+        (
+            "null",
+            r"(foreach (null) as [$x] (.a|length; .; $x)) = 5",
+            "",
+            r"Invalid path expression near attempt to access element 0",
+            5,
+        ),
+        (
+            "null",
+            r"(reduce (null) as {a:$x} (.a|tostring; $x)) |= 5",
+            "",
+            r#"Invalid path expression near attempt to access element "a""#,
+            5,
+        ),
+        (
+            "null",
+            r#"path(foreach (null) as {a:$x} (.a // "s"; .; $x))"#,
+            "",
+            r#"Invalid path expression near attempt to access element "a""#,
+            5,
+        ),
+        // Controls.
+        (
+            "null",
+            r"path(foreach (null) as {a:$x} (tostring; .; $x))",
+            "[\"a\"]\n",
+            r"",
+            0,
+        ),
+        (
+            "null",
+            r"path(foreach (null) as {a:$x} (.a; .; $x))",
+            "[\"a\",\"a\"]\n",
+            r"",
+            0,
+        ),
+    ])
+}
+
 /// #3744: a destructuring of the register itself (`.`) as a `foreach` SOURCE moves
 /// jq's path register through the pattern's tracked index steps, so the body's
 /// EXTRACT is checked against a register it is no longer at: `path(foreach (. as
