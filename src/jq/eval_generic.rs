@@ -3906,6 +3906,11 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
         return GenericResult::Owned(length);
     }
 
+    // #4053: a stage that never reads `.` needs no index over it either.
+    if let Some(value) = crate::jq::eval::eval_owned_closed::<S>(expr) {
+        return GenericResult::Owned(value);
+    }
+
     // #2889: `add`/`min`/`max` relocate one of their inputs rather than
     // computing a new value, and the round trip below would rebuild that
     // input as a copy -- costing the node identity jq keeps
@@ -35140,6 +35145,40 @@ mod tests {
             }
             other => panic!("expected a clean depth-limit error, got: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make (#3261)"
         }
+    }
+
+    /// #4053: a stage that never reads `.` is answered without the reindex
+    /// bridge. The same value that makes the bridge raise its depth error for
+    /// an identity stage (#3261, above) is never written out for a literal, so
+    /// the literal answers -- the observable proof the bridge was skipped,
+    /// where the saving itself is an instruction count.
+    #[test]
+    fn eval_on_owned_answers_a_closed_stage_without_the_bridge_4053() {
+        let mut deep = OwnedValue::Null;
+        for _ in 0..crate::jq::value::MAX_VALUE_TREE_DEPTH {
+            deep = OwnedValue::array_from(vec![deep]);
+        }
+        for (src, expected) in [("1", "1"), ("[1,\"a\"]", "[1,\"a\"]"), ("1 + 2", "3")] {
+            let expr = crate::jq::parse(src).unwrap();
+            let result = eval_on_owned::<JqSemantics, crate::json::light::StandardJson<'_, Vec<u64>>>(
+                &expr,
+                deep.clone(),
+                false,
+                Reentry::REBUILT,
+            );
+            match result {
+                GenericResult::Owned(v) => assert_eq!(v.to_json(), expected, "{src}"),
+                other => panic!("{src}: expected the closed stage's value, got: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make (#4053)"
+            }
+        }
+        // A stage that reads `.` still goes through the bridge and its error.
+        let result = eval_on_owned::<JqSemantics, crate::json::light::StandardJson<'_, Vec<u64>>>(
+            &crate::jq::parse("type").unwrap(),
+            deep,
+            false,
+            Reentry::REBUILT,
+        );
+        assert!(matches!(result, GenericResult::Error(_)));
     }
 
     fn round_trips_unchanged<S: EvalSemantics>(value: &OwnedValue) -> bool {

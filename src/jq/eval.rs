@@ -9472,6 +9472,28 @@ pub(crate) fn eval_owned_length(expr: &Expr, input: &OwnedValue) -> Option<Owned
     }
 }
 
+/// A stage that never reads `.`, answered without the owned input (#4053).
+///
+/// `[$x] | 1` handed the stage `1` an owned array holding the whole of `$x`, and
+/// the re-index bridge wrote that array out and indexed it again to evaluate a
+/// literal: 3.4 M instructions per element over a 63 KB document, against
+/// 0.06 M for the same stage after `{r: $x}`. A literal, an array or object
+/// built from closed parts, and the other shapes [`closed_expr_shape`] admits
+/// have one output whatever `.` is, so the input is never touched.
+///
+/// Deliberately [`closed_expr_to_owned`] and nothing wider: it is the same
+/// grammar an owned-assign right side is answered from (#3138), so a change to
+/// what it accepts changes both, and it declines (`None`) whatever errors, fans
+/// out, or hands a bound container's own node on (`escaped`, #3241), leaving the
+/// bridge its diagnostics and its identity rules.
+pub(crate) fn eval_owned_closed<S: EvalSemantics>(expr: &Expr) -> Option<OwnedValue> {
+    if closed_expr_shape(expr) {
+        closed_expr_to_owned::<S>(expr)
+    } else {
+        None
+    }
+}
+
 /// The [`eval_owned_pure_in`] `door` arms that answer one builtin over the
 /// owned input (#3707): `has(<literal>)`, `keys`, `startswith(<literal>)`,
 /// `endswith(<literal>)` and `tostring`.
@@ -87915,6 +87937,133 @@ mod tests {
                 eval_owned_length(&expr, &OwnedValue::array_from(vec![])).is_none(),
                 "{src}"
             );
+        }
+    }
+
+    /// #4053: `eval_owned_closed` answers a stage that never reads `.` the way
+    /// the reindex bridge does, whatever the input holds, in both modes -- and
+    /// declines every stage that does read it, or can raise or fan out.
+    #[test]
+    fn eval_owned_closed_agrees_with_the_reindex_bridge_4053() {
+        let mut values = pure_value_matrix();
+        values.push(OwnedValue::array_from(vec![]));
+        values.push(OwnedValue::array_from(vec![
+            OwnedValue::Int(1),
+            OwnedValue::Null,
+            OwnedValue::String("x".into()),
+        ]));
+        let closed = [
+            "1",
+            "1.0",
+            "1.50",
+            "-1",
+            "100000000000000000000",
+            "0.1",
+            "\"s\"",
+            "\"a\\u00e9\\n\"",
+            "null",
+            "true",
+            "[]",
+            "{}",
+            "[1,2]",
+            "[1,[2,{\"a\":3}]]",
+            "{\"a\":1}",
+            "{a:1,a:2}",
+            "{\"a b\":[1]}",
+            "(1)",
+            "1 + 2",
+            "1.5 + 1",
+            "\"a\" + \"b\"",
+            "[1] + [2]",
+            "{\"a\":1} + {\"b\":2}",
+            "1 == 1",
+            "[1] == [1]",
+            "1 < 2",
+            "null // 3",
+            "false // [1]",
+            "1 and 2",
+            "false or null",
+            "{\"a\":1} | .a",
+            "[1,2] | length",
+            "[1,2] | first",
+        ];
+        // Which sources each mode answers. jq answers all but `first`; yq's
+        // owned grammar has no operators and no `length`/`first` stage, so a
+        // regression that stops an arm answering fails here, not silently.
+        let jq_declines = ["[1,2] | first"];
+        let yq_declines = [
+            "1 + 2",
+            "1.5 + 1",
+            "\"a\" + \"b\"",
+            "[1] + [2]",
+            "{\"a\":1} + {\"b\":2}",
+            "1 == 1",
+            "[1] == [1]",
+            "1 < 2",
+            "null // 3",
+            "false // [1]",
+            "1 and 2",
+            "false or null",
+            "[1,2] | length",
+            "[1,2] | first",
+        ];
+        for src in closed {
+            let expr = parse(src).unwrap();
+            assert_eq!(
+                eval_owned_closed::<JqSemantics>(&expr).is_none(),
+                jq_declines.contains(&src),
+                "jq mode: {src:?}"
+            );
+            assert_eq!(
+                eval_owned_closed::<YqSemantics>(&expr).is_none(),
+                yq_declines.contains(&src),
+                "yq mode: {src:?}"
+            );
+        }
+        for value in &values {
+            for src in closed {
+                let expr = parse(src).unwrap();
+                let jq_fast = eval_owned_closed::<JqSemantics>(&expr);
+                let yq_fast = eval_owned_closed::<YqSemantics>(&expr);
+                for (mode, fast) in [("jq", jq_fast), ("yq", yq_fast)] {
+                    let Some(fast) = fast else { continue };
+                    let bridge = if mode == "jq" {
+                        debug_normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                            &expr, value, false,
+                        ))
+                    } else {
+                        debug_normalize(eval_owned_input_bridge::<Vec<u64>, YqSemantics>(
+                            &expr, value, false,
+                        ))
+                    };
+                    let fast = debug_normalize(QueryResult::<Vec<u64>>::Owned(fast));
+                    assert_eq!(fast, bridge, "{mode} mode: {src:?} on {value:?}");
+                }
+            }
+        }
+        // A stage that reads `.`, raises, fans out or computes from the input
+        // is not this helper's to answer.
+        for src in [
+            ".",
+            ".a",
+            ".[0]",
+            "length",
+            "keys",
+            "type",
+            "not",
+            "empty",
+            "(1, 2)",
+            "1 / 0",
+            "\"a\" + 1",
+            "[.[]]",
+            "{a: .}",
+            "1 | .a",
+            "input",
+            "$ENV",
+        ] {
+            let expr = parse(src).unwrap();
+            assert!(eval_owned_closed::<JqSemantics>(&expr).is_none(), "{src}");
+            assert!(eval_owned_closed::<YqSemantics>(&expr).is_none(), "{src}");
         }
     }
 
