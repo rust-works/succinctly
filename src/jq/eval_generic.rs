@@ -71,17 +71,17 @@ use super::eval::{
     range_max_exceeded_error, range_num, range_values_f64, range_values_int, reads_parent,
     recurse_walk_flow, reduce_forks, reroot_for_reentry, reroot_markers,
     resolve_computed_slice_bounds, resume_from_escape, reverse_length_is_empty, select_emits,
-    settle_then_replay, settles_before_consumer, shared_arg_depth_refusal, slice_component_value,
-    slice_object_as_yq_children, slice_owned_value_read_computed, stop_with_downstream,
-    stop_with_error, stop_with_escape, streams_escaped_generator_prefix, streams_unbounded,
-    substitute_bound_var_from, substitute_vars, suppresses, tonumber_from_str, tostring_owned,
-    try_handler_root, vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
-    yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_negative_index_check,
-    yq_negative_index_error, yq_numeric_index_on_object_is_null, yq_object_key_stringify,
-    yq_read_only_context, yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand,
-    EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail,
-    QueryResult, RangeNum, Reentry, RestPipe, RootWitness, SliceTargetKind, StashedEscape,
-    StashedVerdict, YqSemantics, WHILE_UNTIL_MAX_STEPS,
+    settle_then_replay, settles_before_consumer, settles_both, shared_arg_depth_refusal,
+    slice_component_value, slice_object_as_yq_children, slice_owned_value_read_computed,
+    stop_with_downstream, stop_with_error, stop_with_escape, streams_escaped_generator_prefix,
+    streams_unbounded, substitute_bound_var_from, substitute_vars, suppresses, tonumber_from_str,
+    tostring_owned, try_handler_root, vec_with_capacity, yq_absent_key_read_is_empty,
+    yq_assign_rhs_document, yq_empty_operand_output, yq_field_index_on_scalar_is_empty,
+    yq_negative_index_check, yq_negative_index_error, yq_numeric_index_on_object_is_null,
+    yq_object_key_stringify, yq_read_only_context, yq_scalar_text, BinaryFanoutRules,
+    ComputedSliceBound, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
+    JqSemantics, LimitN, PathTrail, QueryResult, RangeNum, Reentry, RestPipe, RootWitness,
+    SliceTargetKind, StashedEscape, StashedVerdict, YqSemantics, WHILE_UNTIL_MAX_STEPS,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -17144,7 +17144,7 @@ fn binary_fanout_each_generic<V: DocumentValue, S: EvalSemantics>(
     sink: &mut dyn Sink<V>,
 ) -> Flow {
     // #3296: decided once per operator, as in `eval::binary_fanout_each`.
-    if settles_before_consumer(left) && settles_before_consumer(right) {
+    if settles_both(left, right) {
         binary_fanout_each_generic_with::<V, S>(
             settled_operand_strategy_generic(each_operand),
             left,

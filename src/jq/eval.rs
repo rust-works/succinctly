@@ -11671,7 +11671,7 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // only add a buffered frame to every level; with none -- every link of a
     // lazy argument chain, the `n == 0` each level runs through -- there is
     // nothing to settle.
-    if settles_before_consumer(left) && settles_before_consumer(right) {
+    if settles_both(left, right) {
         binary_fanout_each_with::<W, S>(
             settled_operand_strategy(each_operand),
             left,
@@ -12198,7 +12198,7 @@ pub(crate) fn boolean_fanout_each(
     sink: &mut dyn FnMut(bool) -> Demand,
 ) -> Flow {
     // #3296: decided once per operator, as in `binary_fanout_each`.
-    if settles_before_consumer(left) && settles_before_consumer(right) {
+    if settles_both(left, right) {
         boolean_fanout_each_with(
             settled_operand_strategy(each_operand),
             left,
@@ -74702,7 +74702,10 @@ pub(crate) fn shared_arg_depth_refusal() -> EvalError {
 /// settles only when both its operands pass (see [`binary_fanout_each`]).
 ///
 /// The check runs on every operand a fan-out evaluates, so it must cost O(1)
-/// however deep the recursion is. A bare argument read (a `Shared` operand) is
+/// however deep the recursion is. (Refusing an operand that calls no `def`
+/// still takes a walk of all of it, so an operator asks through
+/// [`settles_both`], which refuses on a cheap operand without walking the
+/// other -- a left-nested `1 + 1 + ... + 1` was N^2 before that, #3885.) A bare argument read (a `Shared` operand) is
 /// never settled without looking inside: that is every link of a lazy argument
 /// chain (`n - 1` over the previous level's `n`), which evaluates one binary
 /// operator per link and would otherwise walk the whole chain below it on
@@ -74716,6 +74719,35 @@ pub(crate) fn settles_before_consumer(expr: &Expr) -> bool {
     }
     let mut walk = PureWalk::new(false);
     single_valued_pure(expr, None, &mut walk) == Some(true)
+}
+
+/// Whether both operands of an operator [`settles_before_consumer`] (#3885),
+/// which is the question every binary fan-out asks once per evaluation.
+///
+/// Answered cheapest-side first. Proving an operand does *not* settle means
+/// walking all of it, and in a left-nested chain (`1 + 1 + ... + 1`) the left
+/// operand is the whole rest of the chain while the right one is a literal that
+/// is refused in one step: asking left first made each of N operators re-walk
+/// everything below it, N^2 node visits. The two checks are pure and
+/// independent, so the order changes only the cost, never the answer.
+pub(crate) fn settles_both(left: &Expr, right: &Expr) -> bool {
+    settles_both_with(left, right, settles_before_consumer)
+}
+
+/// [`settles_both`] over an injected predicate, so the order it asks in can be
+/// pinned without timing anything.
+fn settles_both_with(left: &Expr, right: &Expr, mut settles: impl FnMut(&Expr) -> bool) -> bool {
+    // A leaf never calls a `def`, so it never settles -- and says so without a walk.
+    let is_leaf = |e: &Expr| {
+        matches!(
+            e,
+            Expr::Identity | Expr::Literal(_) | Expr::Field(_) | Expr::Var(_) | Expr::TrackedVar(_)
+        )
+    };
+    if is_leaf(left) || is_leaf(right) {
+        return false;
+    }
+    settles(right) && settles(left)
 }
 
 /// Whether reading the argument `arg` may take `eval_single`'s eager path in
@@ -88160,6 +88192,61 @@ mod tests {
         assert!(!settles_before_consumer(&with_arg(
             SETTLE_ANALYSIS_BUDGET as usize
         )));
+    }
+
+    /// #3885: [`settles_both`] gives exactly `settles(left) && settles(right)`,
+    /// and asks the cheap side first -- a literal operand is refused without
+    /// the other operand being asked at all, which is what kept a left-nested
+    /// chain from re-walking everything below each of its operators.
+    #[test]
+    fn settles_both_asks_the_cheap_side_first_3885() {
+        let call = {
+            let Expr::FuncDef {
+                name,
+                params,
+                body,
+                then,
+                ..
+            } = parse("def f(n): n; f(1)").unwrap()
+            else {
+                panic!("expected a def") // patchcov: coverage tolerate-line reason="unreachable in a passing suite: the source above always parses to a FuncDef (#3885)"
+            };
+            let def = Rc::new(FuncDefData::new(name, params, *body));
+            install_def_calls(&then, &def, 0, false)
+        };
+        let chain = parse("1 + 1 + 1 + 1").unwrap();
+        let leaf = parse("1").unwrap();
+
+        // The answer is `left && right` over every pairing of shapes.
+        let shapes = [&call, &chain, &leaf, &Expr::Identity];
+        for l in shapes {
+            for r in shapes {
+                assert_eq!(
+                    settles_both(l, r),
+                    settles_before_consumer(l) && settles_before_consumer(r)
+                );
+            }
+        }
+        assert!(settles_both(&call, &call));
+
+        // Left-nested chain over a literal: the chain is never asked.
+        let mut asked = Vec::new();
+        assert!(!settles_both_with(&chain, &leaf, |e| {
+            asked.push(e.clone());
+            true
+        }));
+        assert!(asked.is_empty(), "a leaf operand must refuse unasked");
+        // Leaf on the left is refused the same way.
+        assert!(!settles_both_with(&leaf, &chain, |_| panic!("asked"))); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: the leaf short-circuits before any predicate call (#3885)"
+
+        // Two compound operands: the right is asked first, and a refusal
+        // there spares the left.
+        let mut asked = Vec::new();
+        assert!(!settles_both_with(&chain, &call, |e| {
+            asked.push(e == &chain);
+            false
+        }));
+        assert_eq!(asked, [false], "right first, and only it when it refuses");
     }
 
     /// #2397: the navigation shapes the representation gate exists for must
