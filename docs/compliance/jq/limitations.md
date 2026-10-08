@@ -9743,22 +9743,63 @@ builds an owned value and decodes what it holds, so each of these raises where t
   materialized to be an element;
 - a computed stream that is not a `,` body, `[.[] | ., .]`, whose pipe head is not a `,`;
 - an object: `{a: .}`, `{x: .b}`;
-- a variable bind, whether or not `$x` is ever read: `. as $x | 1`, `.b as $x | 1`,
-  `. as $x | [$x]`;
+- a variable bind that decodes at the bind, below;
 - yq mode, whose printer materializes a sequence anyway and so keeps its owned routes.
 
 `try` and `?` around the remaining collections do not rescue them (`try ([[.]]) catch "c"`),
 because the failure is a decode failure.
 
+**A bind decodes what its body reads, and nothing else (#3856, jq mode).** `EXPR as $x | body`
+used to decode the bound node whether or not `$x` was read, which on a well-formed 36 MB
+document cost 6.5x the memory and 4-5x the time of the same filter without the bind
+(`. as $root | .users[] | .name`). It now leaves the node undecoded, and `$x` is a name for it
+(`Expr::DeferredVar`) that each read re-resolves to a cursor, in two cases:
+
+- the body never names `$x`: `. as $x | 1`, `.users[] | . as $u | .name`, for a subtree; a
+  scalar is decoded as before and kept undecoded only when that decode failed, so `.b as $x | 1`
+  answers over `tru` and a well-formed scalar costs nothing extra;
+- the node is a subtree (an object or array with children) of the document being read, and
+  every read of `$x` happens where the ambient input is provably a node of that document
+  (`deferred_bind_is_sound`, `src/jq/deferred_bind.rs`): at the bind's own input
+  (`$x.a`, `[$x, 1]`, `{k: $x}`, `$x == .`), or under an iteration (`.users[] | $x.meta`,
+  `.users[] | select(.id == $x.limit)`).
+
+So `. as $x | 1` and `. as $x | $x.a` answer over an unreadable member the body does not reach
+(`[{"a":1,"b":tru}]`: `1` and `1`, where `eval_using` raises), and `. as $x | $x` echoes the node
+as `.` does, with the printer reading it. Anything that
+decodes the node still raises where it does (`$x | tojson`, `$x + {}`, `$x.b` for the
+unreadable `.b`). Every other bind keeps the eager decode and so raises at the bind, as before:
+
+- a scalar or an empty container whose body names the variable (`.b as $x | [$x]`);
+- a body that reads `$x` after a stage that may leave no cursor: a member that can be absent
+  (`.missing | $x`, `.a.b | $x`, `.[0] | $x`) or a computed value (`1 | $x`, `length | $x`,
+  `[.[]] | $x`, `(.a, 1) | $x`);
+- a body that reads `$x` inside anything not on the predicate's list of cursor-preserving forms:
+  `reduce`/`foreach`, `map`, `path(...)`, assignment and `del`, `def` bodies and calls, string
+  interpolation, `input`, a catch handler, a destructuring bind;
+- a bind whose source is not a node of the ambient document (`input as $x`);
+- yq mode, which follows yq.
+
+The predicate is a whitelist, not a blacklist, because the evaluator hands some forms to the
+owned evaluator, which has no cursor to resolve a deferred name against; such a read raises an
+internal error rather than a guessed value, and the differential sweep
+(`deferred_bind_agrees_with_the_decoding_bind_3856`, `src/jq/eval_generic.rs`) pins that no
+admitted body reaches it. A read the predicate admits costs what it cost before: the eager bind
+already resolved `$x` back to its document node wherever the use site held a cursor of the same
+document (#2072), so only the decode at the bind is gone. (`. as $r | .users[] |
+$r.users[0].id` walks the array's length per record, as it did before; the array index is what
+is linear, not the bind.)
+
 The rule a caller can apply is therefore "an array holds a value beside another value without
-reading it; an object, a bind or an array inside an array decodes it". It is a recorded
+reading it, and a bind names a subtree without reading it; an object or an array inside an array
+decodes it". It is a recorded
 divergence from #2692's "validated when, and only when, something reads it", not a claim of
 conformance to it, and it is accepted rather than fixed by ADR-0018's decision order: jq 1.7.1
 rejects every such document at parse time, so there is no reference answer to match. #3427
 accepted the whole split on implementation cost; #3856 measured it on well-formed input, where
 the eager shapes cost 4-6x the time and memory of their lazy twins (`. as $root | ...`, `[.users,
 1] | length`, `{a: .users}` over a 36 MB document), so the order then prefers the lazy one. The
-objects and binds are the remaining phases of #3856. Every affected input is one the index could
+objects are the remaining phase of #3856. Every affected input is one the index could
 not read, a document jq rejects outright, and every affected answer is a decode failure, never a
 wrong value.
 

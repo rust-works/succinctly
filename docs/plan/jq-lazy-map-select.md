@@ -679,6 +679,20 @@ python3 scripts/ab-cli.py --before ./succ-before --after ./succ-after --tool jq 
       owned with *decode-or-defer* (a scalar that fails to decode stays a node). The printer validates
       every cursor element, so printing still raises and writes nothing; `[., 1] | length` answers.
       `split_comma_head`'s pure-navigation gate is unchanged, so `[.[] | ., .]` still builds owned.
+    - **Deferred `as $x` binds** ([#3856](https://github.com/rust-works/succinctly/issues/3856),
+      Phase 3) — **landed**. A bind decoded its source whether or not `$x` was read
+      (`. as $root | .users[] | .name` decoded the document: 262 MB on a 26 MB `users` file against
+      42 MB without the bind). The node is now substituted as an `Expr::DeferredVar` that each read
+      re-resolves against the ambient cursor, when the body never names `$x`, or when
+      `deferred_bind_is_sound` (`src/jq/deferred_bind.rs`) proves every read has a cursor of the
+      document in hand. That is a three-state walk over a whitelist of forms, and the whitelist is the
+      point: a form the evaluator hands to the owned evaluator has no cursor to resolve against, so
+      `map`, `reduce`, `path(...)`, a `def` or a string interpolation that reads `$x` keeps the eager
+      decode (the differential sweep found the interpolation hole at once). Reads cost what they did
+      before, because the eager bind already resolved `$x` to its document node wherever the use site
+      held a cursor (#2072); what is gone is the decode at the bind. -57% to -87% instructions and
+      262 MB -> 42 MB on the motivating rows, scalar binds / `reduce` / `yq` within noise (M5 Max;
+      the x86_64 half of the A/B was not run).
   - **A `,` head behind a pipe:**
     [#3476](https://github.com/rust-works/succinctly/issues/3476) — **landed**. `[(., .) | .data]`
     reached `Expr::Pipe`, whose `Expr::Comma` head answers one owned tree per item, then
