@@ -4201,7 +4201,7 @@ Two rendering divergences, both readable back and both pinned:
   tagged scalar whose cursor reports a quoted style (`a: !!int "5"`, #747) keeps its
   current (already divergent, pre-#798) rendering.
 
-### Scalar `==`/`!=` compare by text with a wildcard -- resolved ([#2785](https://github.com/rust-works/succinctly/issues/2785)); containers, the dedup builtins and lost spellings remain
+### Scalar `==`/`!=` compare by text with a wildcard -- resolved ([#2785](https://github.com/rust-works/succinctly/issues/2785)); the dedup builtins and lost spellings remain
 
 Real yq's `==`/`!=` is not typed equality. `isEquals` (`pkg/yqlib/operator_equals.go`,
 v4.53.3) answers `rhs is !!null` for a `!!null` left operand and otherwise, for two scalar
@@ -4223,6 +4223,16 @@ Captured live (`-o=json -I0`):
 | `"null" == null`                  | `true`  | a `!!null` *right* operand is the text `null` |
 | `"~" == null`, `0 == null`        | `false` | that text is its spelling                  |
 | `.[] \| select(key == "ab*")`     | matches `abc`, `abd` | the everyday use              |
+| `[1] == [1]`, `{} == {}`, `. == .` | `false` | a container pairing is never equal (#2799) |
+| `[1] != [1]`                      | `true`  | the same, negated                          |
+| `[1] == null`, `[1] == 1`, `[1] == "*"` | `false` | no container is `!!null`, a scalar or a pattern match |
+
+**Containers** ([#2799](https://github.com/rust-works/succinctly/issues/2799)): `isEquals`
+answers `false` for any pairing that holds an array or object, so `==` is `false` and `!=` is
+`true` there. succinctly answered structural equality before, so `select(. == .)` kept every
+node and now keeps only the scalars; any script that compared whole arrays or objects with
+`==` now sees yq's answer (use `tojson`/`@json` on both sides to compare structurally, which
+works in both tools).
 
 Fixed as `eval::yq_scalar_text_eq`, consulted from `eval::apply_compare_op` beside
 #2483's `yq_null_ordering_is_false`, so all three evaluators take it; the matcher is
@@ -4232,14 +4242,13 @@ its text (`numeric_display_string`, so `==` and `tostring` agree about a compute
 
 **Not reproduced**, each its own issue:
 
-- **A container pairing is never equal in yq** ([#2799](https://github.com/rust-works/succinctly/issues/2799)):
-  `[1] == [1]`, `{} == {}` and even `. == .` are `false` there; succinctly keeps
-  structural equality (`true`). The dedup builtins are the other half of the same issue:
-  yq's `unique`/`unique_by`/`group_by` key on the scalar text *without* the wildcard
-  (`[1, "1"] | unique` is `[1]`), which is exactly why the text rule lives beside
-  `owned_value_eq` rather than inside it -- a glob is neither symmetric nor transitive
-  and cannot key a map -- so `unique`/`group_by`/`contains`/array `-` still use typed
-  equality here.
+- **The dedup builtins** ([#2799](https://github.com/rust-works/succinctly/issues/2799), the
+  slices after container `==`): yq's `unique`/`unique_by`/`group_by` key on the scalar text
+  *without* the wildcard, in first-occurrence order (`[1, "1"] | unique` is `[1]`,
+  `[3,1,2,1] | unique` is `[3,1,2]`), which is exactly why the text rule lives beside
+  `owned_value_eq` rather than inside it -- a glob is neither symmetric nor transitive and
+  cannot key a map -- so `unique`/`group_by`/`contains`/array `-` still use typed equality
+  here, and `sort`'s comparator still orders by type.
 - **Spellings `OwnedValue` cannot keep** ([#2802](https://github.com/rust-works/succinctly/issues/2802)):
   `True == "true"` and `!!bool "yes" == true` are `true` here (yq `false`, its text is
   `True`/`yes`), `"~" == null` is `true` here (yq `false`), and a leading-zero, hex or
@@ -4252,7 +4261,7 @@ printed `1.0` (yq `1`). Fixed by [#2902](https://github.com/rust-works/succinctl
 the bridge now writes a bare `Float` as a token the reparse hands back as a bare `Float`.
 
 Pinned by the `yq_text_equality_2785` module (`tests/yq_cli_tests.rs`), the
-`scalar_text_equality_2785`/`scalar_wildcard_equality_2785` goldens, and the
+`scalar_text_equality_2785`/`scalar_wildcard_equality_2785`/`container_equality_2799` goldens, and the
 `glob` unit tests.
 
 ### A typed mapping key is a node -- resolved ([#2785](https://github.com/rust-works/succinctly/issues/2785)); its spelling, the path register and an owned rebuild remain
