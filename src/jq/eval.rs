@@ -10986,11 +10986,14 @@ fn owned_select_door<S: EvalSemantics>(
 fn is_peelable_head(stage: &Expr) -> bool {
     matches!(
         stage,
-        Expr::Field(_) | Expr::Index { .. } | Expr::Slice { .. }
+        Expr::Field(_)
+            | Expr::Index { .. }
+            | Expr::Slice { .. }
+            | Expr::Builtin(Builtin::First | Builtin::Last)
     )
 }
 
-/// Take a pipe's leading `.field`/`.[n]`/`.[a:b]` (or `length`) natively, then
+/// Take a pipe's leading `.field`/`.[n]`/`.[a:b]`/`first`/`last` (or `length`) natively, then
 /// re-enter with the rest on the value it lands on, instead of reindexing the
 /// whole input for the bridge (#3213). A slice is answered by
 /// [`slice_owned_value_read`], the one every other owned slice path shares
@@ -11077,6 +11080,24 @@ fn projection_peel<S: EvalSemantics>(
                 return None;
             };
             child
+        }
+        // #4068: jq defines `first`/`last` as `.[0]`/`.[-1]`, and on an array or
+        // `null` that is all `builtin_first`/`builtin_last` do. yq has its own
+        // `first` arm, and every other target raises, so those go to the bridge.
+        (None, Expr::Builtin(builtin @ (Builtin::First | Builtin::Last))) => {
+            if S::TAG != EvalTag::Jq {
+                return None;
+            }
+            match input {
+                OwnedValue::Array(items) => match builtin {
+                    Builtin::First => items.first(),
+                    _ => items.last(),
+                }
+                .cloned()
+                .unwrap_or(OwnedValue::Null),
+                OwnedValue::Null => OwnedValue::Null,
+                _ => return None,
+            }
         }
         (None, _) => {
             let Ok(Some(child)) = eval_owned_navigation::<S>(first, input, optional)? else {
@@ -107718,6 +107739,76 @@ mod tests {
         assert_eq!(out, ["2"]);
         // A bare slice has nothing behind it to peel for.
         assert!(peeled::<JqSemantics>(".[0:2]", &parse_json("[1,2,3]")).is_none());
+    }
+
+    /// #4068: [`projection_peel`] takes a leading `first`/`last` in jq mode --
+    /// `.[0]`/`.[-1]` of an array, `null` of `null` -- and answers what the
+    /// reindex bridge answers (compared against the real bridge). yq has its
+    /// own `first`, and every other target raises in the bridge's own words, so
+    /// those decline.
+    #[test]
+    fn projection_peel_takes_a_leading_first_and_last_4068() {
+        fn peeled<S: EvalSemantics>(filter: &str, input: &OwnedValue) -> Option<Vec<String>> {
+            let expr = parse(filter).unwrap();
+            let mut out = Vec::new();
+            projection_peel::<S>(&expr, input, false, Reentry::REBUILT, &mut |v| {
+                out.push(v.to_json());
+                Demand::Continue
+            })
+            .map(|_| out)
+        }
+        fn bridged<S: EvalSemantics>(filter: &str, input: &OwnedValue) -> Vec<String> {
+            let expr = parse(filter).unwrap();
+            let doc = input.reindexed::<S>().unwrap();
+            let mut out = Vec::new();
+            let _ = eval_each::<Vec<u64>, S>(&expr, doc.root().value(), false, &mut |item| {
+                out.push(item.into_owned_lossy::<S>().to_json());
+                Demand::Continue
+            });
+            out
+        }
+        let parse_json = |text: &str| {
+            let bytes = text.as_bytes();
+            let index = JsonIndex::build(bytes);
+            to_owned::<JqSemantics, _>(&index.root(bytes).value()).unwrap()
+        };
+        let mut peeled_count = 0;
+        for text in [
+            "[1,2,3]",
+            "[[1,[2]],{\"x\":[3]},\"s\",null]",
+            "[]",
+            "[null]",
+            "[1.50,100000000000000000000]",
+            "null",
+        ] {
+            let input = parse_json(text);
+            for head in ["first", "last", "(first)"] {
+                for tail in ["length", "tojson", "."] {
+                    let filter = format!("{head} | {tail}");
+                    let jq = peeled::<JqSemantics>(&filter, &input)
+                        .unwrap_or_else(|| panic!("{filter} on {text}: declined"));
+                    peeled_count += 1;
+                    assert_eq!(
+                        jq,
+                        bridged::<JqSemantics>(&filter, &input),
+                        "{filter} on {text}"
+                    );
+                    // yq's `first` is its own arm: not the peel's to answer.
+                    assert!(
+                        peeled::<YqSemantics>(&filter, &input).is_none(),
+                        "yq {filter}"
+                    );
+                }
+            }
+        }
+        assert_eq!(peeled_count, 54);
+        // An object or a scalar raises in the bridge: declined, text intact.
+        for text in ["{\"a\":1}", "5", "\"s\"", "true"] {
+            assert!(
+                peeled::<JqSemantics>("first | length", &parse_json(text)).is_none(),
+                "{text}"
+            );
+        }
     }
 
     /// The door's answer for `filter` over `input`, in the shape
