@@ -44338,6 +44338,11 @@ fn sibling_sees_register_uniformly(expr: &Expr) -> bool {
             Builtin::FirstStream(inner) | Builtin::LastStream(inner) | Builtin::NthStream(_, inner),
         ) => sibling_sees_register_uniformly(inner),
         Expr::Comma(items) => items.iter().all(sibling_sees_register_uniformly),
+        // #3974: `select(f)` is `if f then . else empty end` -- `f` runs as a subexp, so
+        // whatever it navigates cannot move the register, and the branch it keeps is the one
+        // the comma entered on. Its condition raises exactly where jq's does, so a `try`
+        // around the comma catches it as jq's own does.
+        Expr::Builtin(Builtin::Select(_)) => true,
         // The alternate runs after jq backtracked out of the left operand, so each
         // side states its own register (#3788).
         Expr::Alternative(left, right) => {
@@ -132148,6 +132153,10 @@ mod touched_edge_cases_2999 {
             (".a?", true),
             ("first(.a)", true),
             ("(($w | .a) // .b)", true),
+            // #3974: `select(f)` forwards the branch it keeps, whatever its condition reads.
+            ("select(.a)", true),
+            ("select(true)", true),
+            ("select(.a[.b])", true),
             // A handler, a computed key and an unlisted builtin are not.
             ("try (.a) catch 1", false),
             (".a[.b]", false),
@@ -132183,8 +132192,9 @@ mod touched_edge_cases_2999 {
             ("try (($w | .a), last(.a))", false),
             ("try (($w | .a), (.b // 3))", false),
             ("try (($w | .a), limit(1; .a))", false),
-            // `select(f)` has its own register rule and stays withheld (#3974).
-            ("try (($w | .a), select(.a))", true),
+            // `select(f)` forwards the branch it keeps and runs `f` as a subexp (#3974).
+            ("try (($w | .a), select(.a))", false),
+            ("try (($w | .a), select(.a[.b]))", false),
             ("try (($w | .a), f)", true),
         ] {
             assert_eq!(fans_out(&parse(src).unwrap()), fans, "fans_out({src})");

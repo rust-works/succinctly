@@ -71026,26 +71026,66 @@ fn test_foreach_update_try_comma_with_a_navigating_sibling_keeps_the_register_39
     )])
 }
 
-/// #3932, characterization of what it leaves (#3974). A `select(f)` comma sibling has its own
-/// register rule (#3653) and still withholds the fold's register, so the pipe sibling's `$w`
-/// refuses inside the `try` and the path or write is silently dropped. jq prints `["x","c"]`
-/// and then raises `Invalid path expression` (exit 5) for `path`, and raises for `del`. Update the
-/// expectations when it is fixed.
+/// #3974: a `select(f)` comma sibling hands `.` through at the register the comma entered on and
+/// runs `f` as a subexp, so it cannot move the register and no longer withholds it. The pipe
+/// sibling's `$w` used to refuse inside the `try`, which swallowed the refusal and silently
+/// dropped the path or write; jq prints `["x","c"]` and then raises `Invalid path expression`
+/// (exit 5) for `path`, raises for `del`, and writes through the rows where the condition itself
+/// raises on the accumulator. Every row captured from jq 1.7.1 with `-c`.
 #[test]
-fn test_foreach_update_try_comma_select_sibling_characterizes_3974() -> Result<()> {
+fn test_foreach_update_try_comma_select_sibling_keeps_the_register_3974() -> Result<()> {
     let doc = r#"{"a":[{"b":1}],"x":{"a":[{"b":1}],"b":2,"c":[5,6]}}"#;
+    let invalid = "Invalid path expression with result";
     assert_path_rows_3289(&[
         (
             doc,
             r"path(foreach .x as $w (.; try (($w|.c), select(.a)); .))",
+            "[\"x\",\"c\"]\n",
+            invalid,
+            5,
+        ),
+        (
+            doc,
+            r"del(foreach .x as $w (.; try (($w|.c), select(.a)); .))",
             "",
+            invalid,
+            5,
+        ),
+        (
+            doc,
+            r"path(foreach .x as $w (.; try (($w|.c), select(true)); .))",
+            "[\"x\",\"c\"]\n",
+            invalid,
+            5,
+        ),
+        // A computed key inside the condition is still the condition's own subexp: it raises on
+        // the accumulator, the `try` catches it, and the pipe sibling's write lands.
+        (
+            doc,
+            r"del(foreach .x as $w (.; try (($w|.c), select(.a[.b])); .))",
+            "{\"a\":[{\"b\":1}],\"x\":{\"a\":[{\"b\":1}],\"b\":2}}\n",
+            "",
+            0,
+        ),
+        // The condition raising on the accumulator is caught by the `try`, and the write lands.
+        (
+            doc,
+            r"(foreach .x as $w (0; try (($w|.a), select(.b)); .)) = 9",
+            "{\"a\":[{\"b\":1}],\"x\":{\"a\":9,\"b\":2,\"c\":[5,6]}}\n",
             "",
             0,
         ),
         (
             doc,
-            r"del(foreach .x as $w (.; try (($w|.c), select(.a)); .))",
-            "{\"a\":[{\"b\":1}],\"x\":{\"a\":[{\"b\":1}],\"b\":2,\"c\":[5,6]}}\n",
+            r"del(foreach .x as $w (0; try (($w|.a), select(.b)); .))",
+            "{\"a\":[{\"b\":1}],\"x\":{\"b\":2,\"c\":[5,6]}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .x as $w (0; try (($w|.a), select(.a[.b])); .))",
+            "[\"x\",\"a\"]\n",
             "",
             0,
         ),
