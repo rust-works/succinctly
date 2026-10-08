@@ -72129,26 +72129,20 @@ fn test_foreach_update_under_try_with_a_comma_inside_a_pipe_keeps_the_register_3
     ])
 }
 
-/// #3770, characterization of what remains of a pre-existing bug. The comma-above-a-pipe
-/// rows that used to be here are fixed (#3862,
-/// [`test_foreach_update_under_try_with_a_comma_above_a_pipe_keeps_the_register_3862`]).
-/// What is left: on `null`, an `and` body leaves the EXTRACT's `$k` with no register and
-/// refuses loudly where jq answers. jq 1.7.1's answer is in the comment; update the
-/// expectation when this is fixed. (`//` around a generator was the other row until
-/// #3788, see `test_foreach_update_bare_var_alternate_keeps_the_register_3788`.)
+/// #3770: on `null`, an `and` body in a `foreach` UPDATE under `try` left the EXTRACT's `$k` with no
+/// register and refused loudly where jq answers `["a",0]`. It answers since #4063: the `$k | .[0]`
+/// operand navigated and then `and` computed, so the register is on what it reached and the
+/// EXTRACT runs from there. (`//` around a generator was the other row until #3788, see
+/// `test_foreach_update_bare_var_alternate_keeps_the_register_3788`.) Captured from jq 1.7.1.
 #[test]
-fn test_foreach_update_under_try_with_sibling_branches_characterize_preexisting_bug_3770(
-) -> Result<()> {
-    assert_path_rows_3289(&[
-        // jq: ["a",0]
-        (
-            "null",
-            r"path(foreach .a? as $k (0; try (($k | .[0]) and (.. | .a?)); $k))",
-            "",
-            "Invalid path expression with result null",
-            5,
-        ),
-    ])
+fn test_foreach_update_under_try_with_an_and_body_on_null_keeps_the_register_3770() -> Result<()> {
+    assert_path_rows_3289(&[(
+        "null",
+        r"path(foreach .a? as $k (0; try (($k | .[0]) and (.. | .a?)); $k))",
+        "[\"a\",0]\n",
+        "",
+        0,
+    )])
 }
 
 /// #3862: a comma's siblings are forks, so jq runs each from the register the comma was
@@ -74175,46 +74169,186 @@ fn test_foreach_update_pipe_into_a_comma_with_a_navigating_sibling_keeps_the_reg
     ])
 }
 
-/// #4059, what it leaves. A sibling that navigates and then computes (`$v|.b?|tostring`) leaves
-/// jq's register on what it navigated to, `null` there as at the fold's own register. The branch
-/// used to be read as being at the fold's register by that value alone and EXTRACT resolved
-/// against the wrong node (`["a","b"]` twice); it no longer is, but the register it did move to is
-/// not modelled, so the path jq names second is dropped and the write that follows lands where jq
-/// raises. The same with or without a stage ahead of the comma. Update the expectations when the
-/// moved register is modelled.
+/// #4063: a sibling that navigates and then computes (`$v|.b?|tostring`, `$v|.b?|not`) leaves jq's
+/// register on what it navigated to, `null` there as at the fold's own register. EXTRACT runs
+/// from that node, so jq names `["a","b","b"]` after `["a","b"]` and the second `setpath` meets the
+/// number the first one wrote. The fold used to read the branch as being at its own register by
+/// the equal `null` alone, and then (since #4059) not at all, so a path was dropped and the write
+/// that remained landed where jq raises. Every row captured from jq 1.7.1 with `-c`.
 #[test]
-fn test_foreach_update_navigated_then_computed_sibling_characterize_4059() -> Result<()> {
+fn test_foreach_update_navigated_then_computed_sibling_moves_the_register_4063() -> Result<()> {
+    let null_doc = r#"{"a":null,"z":{"b":1}}"#;
+    assert_path_rows_3289(&[
+        (
+            null_doc,
+            r"del(foreach .a as $v (0; 1 | (not, ($v|.b?|tostring)); try ($v | .b?)))",
+            "{\"a\":null,\"z\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            null_doc,
+            r"(foreach .a as $v (0; 1 | (not, ($v|.b?|tostring)); try ($v | .b?))) = 9",
+            "",
+            "Cannot index number with string \"b\"",
+            5,
+        ),
+        (
+            null_doc,
+            r"[path(foreach .a as $v (0; 1 | (not, ($v|.b?|tostring)); try ($v | .b?)))]",
+            "[[\"a\",\"b\"],[\"a\",\"b\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            null_doc,
+            r"del(foreach .a as $v (0; (not, ($v|.b?|tostring)); try ($v | .b?)))",
+            "{\"a\":null,\"z\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            null_doc,
+            r"(foreach .a as $v (0; (not, ($v|.b?|tostring)); try ($v | .b?))) = 9",
+            "",
+            "Cannot index number with string \"b\"",
+            5,
+        ),
+        (
+            null_doc,
+            r"[path(foreach .a as $v (0; (not, ($v|.b?|tostring)); try ($v | .b?)))]",
+            "[[\"a\",\"b\"],[\"a\",\"b\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            null_doc,
+            r"del(foreach .a as $v (0; try ($v|.b?|not) catch .; try ($v | .b?)))",
+            "{\"a\":null,\"z\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            null_doc,
+            r"(foreach .a as $v (0; try ($v|.b?|not) catch .; try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":{\"b\":9}},\"z\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            null_doc,
+            r"[path(foreach .a as $v (0; try ($v|.b?|not) catch .; try ($v | .b?)))]",
+            "[[\"a\",\"b\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            null_doc,
+            r"del(foreach .a as $v (0; ($v|.b?|not) // 3; try ($v | .b?)))",
+            "{\"a\":null,\"z\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            null_doc,
+            r"(foreach .a as $v (0; ($v|.b?|not) // 3; try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":{\"b\":9}},\"z\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            null_doc,
+            r"[path(foreach .a as $v (0; ($v|.b?|not) // 3; try ($v | .b?)))]",
+            "[[\"a\",\"b\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            null_doc,
+            r"del(foreach .a as $v (null; (true, (.b?)) | 1; try ($v | .b?)))",
+            "{\"a\":null,\"z\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            null_doc,
+            r"(foreach .a as $v (null; (true, (.b?)) | 1; try ($v | .b?))) = 9",
+            "",
+            "Cannot index number with string \"b\"",
+            5,
+        ),
+        (
+            null_doc,
+            r"[path(foreach .a as $v (null; (true, (.b?)) | 1; try ($v | .b?)))]",
+            "[[\"a\",\"b\"],[\"a\",\"b\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            null_doc,
+            r"del(foreach .a as $v (0; (not, ($v|.b?|tostring), now); try ($v | .b?)))",
+            "{\"a\":null,\"z\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            null_doc,
+            r"(foreach .a as $v (0; (not, ($v|.b?|tostring), now); try ($v | .b?))) = 9",
+            "",
+            "Cannot index number with string \"b\"",
+            5,
+        ),
+        (
+            null_doc,
+            r"[path(foreach .a as $v (0; (not, ($v|.b?|tostring), now); try ($v | .b?)))]",
+            "[[\"a\",\"b\"],[\"a\",\"b\",\"b\"],[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            null_doc,
+            r"del(foreach .a as $v (0; 1 | (($v|.b?|tostring), not); try ($v | .b?)))",
+            "{\"a\":null,\"z\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            null_doc,
+            r"(foreach .a as $v (0; 1 | (($v|.b?|tostring), not); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9},\"z\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            null_doc,
+            r"[path(foreach .a as $v (0; 1 | (($v|.b?|tostring), not); try ($v | .b?)))]",
+            "[[\"a\",\"b\",\"b\"],[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
+/// #4063, what it leaves. A navigating pipe on the accumulator (`. | .b?`) and a trailing `| .`
+/// after the comma still skip a path jq names, so the write lands where jq raises. jq's answer is
+/// in the comment; update the expectations when those are fixed.
+#[test]
+fn test_foreach_update_null_source_register_shapes_characterize_4063() -> Result<()> {
     let null_doc = r#"{"a":null,"z":{"b":1}}"#;
     assert_path_rows_3289(&[
         // jq: exit 5, error (at <stdin>:0): Cannot index number with string "b"
         (
             null_doc,
-            r"(foreach .a as $v (0; 1 | (not, ($v|.b?|tostring)); try ($v | .b?))) = 9",
-            "{\"a\":{\"b\":9},\"z\":{\"b\":1}}\n",
-            "",
-            0,
-        ),
-        // jq: [["a","b"],["a","b","b"]]
-        (
-            null_doc,
-            r"[path(foreach .a as $v (0; 1 | (not, ($v|.b?|tostring)); try ($v | .b?)))]",
-            "[[\"a\",\"b\"]]\n",
+            r"(foreach .a as $v (null; (now, (. | (.b?))); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":{\"b\":9}},\"z\":{\"b\":1}}\n",
             "",
             0,
         ),
         // jq: exit 5, error (at <stdin>:0): Cannot index number with string "b"
         (
             null_doc,
-            r"(foreach .a as $v (0; (not, ($v|.b?|tostring)); try ($v | .b?))) = 9",
-            "{\"a\":{\"b\":9},\"z\":{\"b\":1}}\n",
-            "",
-            0,
-        ),
-        // jq: [["a","b"],["a","b","b"]]
-        (
-            null_doc,
-            r"[path(foreach .a as $v (0; (not, ($v|.b?|tostring)); try ($v | .b?)))]",
-            "[[\"a\",\"b\"]]\n",
+            r"(foreach .a as $v (.; (((1,2), ($v | .b?)) | .); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":{\"b\":9}},\"z\":{\"b\":1}}\n",
             "",
             0,
         ),

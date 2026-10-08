@@ -46084,6 +46084,13 @@ impl FoldRegister {
             // declines the way the same pipe does outside a fold.
             let mut demoted = PathBranch::demoted(b.snapshot, b.value);
             demoted.path = PathPrefix::extend_many(&self.path, b.path.to_vec());
+            // #4063: a branch that navigated and then computed states where jq's register
+            // moved to; [`FoldRegister::advance`] reads it.
+            if b.path.depth() > 0 {
+                if let BranchRegister::Unmoved(register) = b.register {
+                    demoted.register = BranchRegister::Unmoved(register);
+                }
+            }
             demoted
         }
     }
@@ -46146,6 +46153,21 @@ impl FoldRegister {
             Self {
                 path: Rc::clone(&branch.path),
                 value: branch.value.clone().into_owned(),
+                trackable: true,
+                frame: fold_frame.extend(&branch.path),
+                live_register_known: false,
+            }
+        } else if let Some(register) = branch
+            .register
+            .unmoved_value()
+            .filter(|_| branch.path.depth() > self.path.depth())
+        {
+            // #4063: UPDATE navigated and then computed, so jq's register is on what it
+            // navigated to -- `branch.path`, holding the value the branch states -- and EXTRACT
+            // runs from there, as the computed value is not the register.
+            Self {
+                path: Rc::clone(&branch.path),
+                value: register.clone(),
                 trackable: true,
                 frame: fold_frame.extend(&branch.path),
                 live_register_known: false,
