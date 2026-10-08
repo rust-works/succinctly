@@ -3461,6 +3461,16 @@ fn meta_path_from_value(path: &OwnedValue, current: &OwnedValue) -> Option<Vec<M
     };
     let mut out = Vec::with_capacity(steps.len());
     for step in steps {
+        // #4079: a numeric, boolean or `null` component that lands on a mapping is the member
+        // whose key has that text (`.a[1] style = "double"` on `a: {1: y}`), as yq reads it.
+        if !matches!(step, OwnedValue::String(_)) {
+            if let (Some(OwnedValue::Object(_)), Some(text)) =
+                (owned_value_at(current, &out), plain_scalar_text(step))
+            {
+                out.push(MetaPathStep::Key(text));
+                continue;
+            }
+        }
         let step = match step {
             OwnedValue::String(k) => MetaPathStep::Key(k.to_string()),
             OwnedValue::Int(i) if *i >= 0 => MetaPathStep::Index(*i as usize),

@@ -2328,8 +2328,18 @@ mode when no member has that key text, matching real yq's own read (confirmed li
 since #4079 it answers the member whose key text is the index when there is one (`.[1]` on
 `1: y` is `"y"`, `.[true]`, `.[null]` and `.[1.5]` likewise), and `.a[5] = 1` inserts the string
 key as yq does (`{"a":{"b":1,"5":1}}`) instead of raising `Cannot index object with number`.
-The literal's spelling is its resolved text, so `.[1.0]` and `.[01]` find the `1:` member where yq,
-which compares the spelling, answers `null` (the recorded lost-spelling residual).
+A float literal keeps its spelling (`.[1.0]` finds the `1.0:` member and `.[1.9]` the `1.9:` one, as
+yq does), but `.[01]` is parsed as the integer `1`, so it finds -- and a write updates -- the `1:`
+member where yq answers the `01:` one (the recorded lost-spelling residual).
+
+**Still raising: a write grouped with other targets.** The single-target forms above (`.a[1] = 7`,
+`|=`, `+=`, `style=`/`anchor=`/`line_comment=`, a computed key) work, but the eager path walker
+(`walk_path`, `step_into`, `classify_static_component`) and `setpath` read a numeric component on
+an object separately from `set_path`, so a write whose targets are enumerated first still raises
+`Cannot index object with number` where yq updates the member (and `del` leaves a mapping's
+member alone): `(.a[1], .a[2]) = 7`,
+`(.a[1], .a.x) = 7`, `(.a[1] // .z) = 3`, `(.a | select(.[1] == "y") | .[1]) = 1`,
+`(.a[1], .l[0]) = 3` and `del(.a[1], .l[0])`.
 
 ### `=`'s multi-output RHS: real yq takes only the last value, no fan-out
 
@@ -4511,7 +4521,7 @@ Three residuals, each captured live from v4.53.3:
   typed key (`*` matches `1: y`, `true: t`, `1.5: w`), and `.[1] = "z"` updates or creates the member.
   What remains: a mapping key whose spelling the owned value has lost (`~` and `null:` are `null`,
   `0x10` is the number 16, so a pattern cannot rebuild the text yq matches; such a key is left out of
-  a `.*` rather than answered with a `null`), a literal index's own spelling (`.[1.0]`, `.[01]`, above),
+  a `.*` rather than answered with a `null`), a literal index's own spelling (`.[01]`, above),
   and yq's own quirks, recorded rather than copied: `del(.["1"])` and `del(.[1])` on an int-spelled
   key are no-ops in yq (succinctly deletes), and `pick(.["ab*"])` is `{}` there. Not a key-node
   question, but the same `matchKey`.

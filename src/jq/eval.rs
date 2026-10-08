@@ -3269,7 +3269,19 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         Expr::Field(name) => index_object_by_name::<W, S>(value, name, optional),
 
-        Expr::Index { idx, .. } => index_array_by_position::<W, S>(value, *idx, optional),
+        Expr::Index { idx, key } => {
+            // #4079: a mapping's member whose key text is the literal (`.[1]` finds `1:`).
+            if let (StandardJson::Object(fields), Some(text)) =
+                (&value, yq_literal_index_text::<S>(*idx, key.as_ref()))
+            {
+                match find_field::<W>(*fields, &text) {
+                    Ok(Some(v)) => return QueryResult::One(v),
+                    Ok(None) => {}
+                    Err(e) => return QueryResult::Error(e),
+                }
+            }
+            index_array_by_position::<W, S>(value, *idx, optional)
+        }
 
         // #3506: a resolved array key replayed as a component reads as the
         // subarray search it named, and refuses any other target as the key
@@ -25736,13 +25748,9 @@ fn index_array_by_position<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         },
         // jq returns null for index on null
         StandardJson::Null => QueryResult::One(StandardJson::Null),
-        // #4079: the member whose key text is the index (`.[1]` finds `1:`), `null` on a miss.
-        StandardJson::Object(fields) if yq_numeric_index_on_object_is_null::<S>() => {
-            match find_field::<W>(fields, &idx.to_string()) {
-                Ok(Some(v)) => QueryResult::One(v),
-                Ok(None) => QueryResult::One(StandardJson::Null),
-                Err(e) => QueryResult::Error(e),
-            }
+        // (#4079: the callers that know the literal's spelling look the member up first.)
+        StandardJson::Object(_) if yq_numeric_index_on_object_is_null::<S>() => {
+            QueryResult::One(StandardJson::Null)
         }
         // #2482 (yq mode): `.s[0]` on a scalar `s` -- same empty-not-error
         // rule as the field-name sibling in `index_object_by_name`, see
@@ -25878,6 +25886,24 @@ pub(crate) fn yq_numeric_index_on_object_is_null<S: EvalSemantics>() -> bool {
     S::TAG == EvalTag::Yq
 }
 
+/// [`yq_mapping_index_text`] of a literal `.[N]`: the number's own spelling when it has one
+/// (`.[1.9]` is the key `1.9`, not the integer `1`), the integer's digits otherwise (#4079).
+pub(crate) fn yq_literal_index_text<S: EvalSemantics>(
+    idx: i64,
+    key: Option<&NumberKey>,
+) -> Option<String> {
+    yq_mapping_index_text::<S>(&index_component_value(idx, key))
+}
+
+/// Whether an index key is a number: a numeric miss on a mapping falls through to the array
+/// rules (#4079), while a boolean or `null` key that finds no member is `null`.
+pub(crate) fn yq_index_key_is_numeric(key: &OwnedValue) -> bool {
+    matches!(
+        key,
+        OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)
+    )
+}
+
 /// The text real yq's `matchKey` compares a mapping's keys with when the index is a number, a
 /// boolean or `null` (#4079): `.[1]` finds the `1:` member, `.[true]` the `true:` one, `.[1.5]` the
 /// `1.5:` one, where jq has no such key. `None` outside yq mode, for a string (the ordinary
@@ -25947,10 +25973,7 @@ fn index_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         match find_field::<W>(*fields, &text) {
             Ok(Some(v)) => return QueryResult::One(v),
             Ok(None) => {
-                if !matches!(
-                    key,
-                    OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)
-                ) {
+                if !yq_index_key_is_numeric(key) {
                     return QueryResult::One(StandardJson::Null);
                 }
             }
@@ -35265,6 +35288,12 @@ fn key_to_path_component<S: EvalSemantics>(
     container: &OwnedValue,
     scalar_noop: bool,
 ) -> Result<Expr, EvalError> {
+    // #4079: yq finds a mapping's member by the text of a numeric, boolean or `null` key. The
+    // helper answers `None` for every other key and outside yq mode, so this is ahead of the
+    // dispatch below without reordering any of its arms.
+    if let (OwnedValue::Object(_), Some(text)) = (container, yq_mapping_index_text::<S>(key)) {
+        return Ok(Expr::Field(text));
+    }
     match key {
         OwnedValue::String(s) => Ok(Expr::Field(s.to_string())),
         // #3300: jq's slice descriptor, in path position.
@@ -35279,14 +35308,6 @@ fn key_to_path_component<S: EvalSemantics>(
             if S::TAG != EvalTag::Yq && matches!(container, OwnedValue::Array(_)) =>
         {
             Ok(Expr::ArrayKey(Box::new(key.clone())))
-        }
-        // #4079: yq finds a mapping's member by the text of a numeric, boolean or `null` key.
-        _ if matches!(container, OwnedValue::Object(_))
-            && yq_mapping_index_text::<S>(key).is_some() =>
-        {
-            Ok(Expr::Field(
-                yq_mapping_index_text::<S>(key).unwrap_or_default(),
-            ))
         }
         // Truncation toward zero, as in the value path.
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
@@ -58397,7 +58418,7 @@ fn eval_owned_navigation<S: EvalSemantics>(
                 name,
             )),
         }),
-        Expr::Index { idx, .. } => Some(match input {
+        Expr::Index { idx, key } => Some(match input {
             OwnedValue::Array(items) => {
                 // yq mode only (#2254): same rule as `index_array_by_position`
                 // and every other call site this fix touches -- a negative
@@ -58429,10 +58450,10 @@ fn eval_owned_navigation<S: EvalSemantics>(
             // #2459: yq mode only -- same rule as `index_array_by_position`'s
             // own `Object` arm. See `yq_numeric_index_on_object_is_null`.
             OwnedValue::Object(map) if yq_numeric_index_on_object_is_null::<S>() => {
-                // #4079: the member whose key text is the index.
+                // #4079: the member whose key text is the literal.
                 Ok(Some(
-                    map.get(idx.to_string().as_str())
-                        .cloned()
+                    yq_literal_index_text::<S>(*idx, key.as_ref())
+                        .and_then(|text| map.get(text.as_str()).cloned())
                         .unwrap_or(OwnedValue::Null),
                 ))
             }
@@ -104597,12 +104618,16 @@ mod tests {
     /// mode keeps raising.
     #[test]
     fn test_yq_index_finds_a_mapping_key_by_text_on_the_eager_route_4079() {
-        let doc: &[u8] = br#"{"abc":1,"1":"y","true":"t","null":"n","1.5":"w"}"#;
+        let doc: &[u8] = br#"{"abc":1,"1":"y","1.0":"w1","true":"t","null":"n","1.5":"w"}"#;
         for (filter, expected) in [
             (".[1]", r#""y""#),
             (".[true]", r#""t""#),
             (".[null]", r#""n""#),
             (".[1.5]", r#""w""#),
+            (".[1.9]", "null"),
+            (".[1.0]", r#""w1""#),
+            ("(. + {}) | .[1.0]", r#""w1""#),
+            ("(. + {}) | .[1.9]", "null"),
             (".[2]", "null"),
             (".[false]", "null"),
             ("1 as $k | .[$k]", r#""y""#),

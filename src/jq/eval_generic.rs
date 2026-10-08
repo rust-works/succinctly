@@ -81,12 +81,12 @@ use super::eval::{
     suppresses, tonumber_from_str, tostring_owned, try_handler_root, vec_with_capacity,
     yq_absent_key_read_is_empty, yq_assign_rhs_document, yq_dedup_key, yq_empty_context_reemit,
     yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_first_of_each_key,
-    yq_mapping_index_text, yq_negative_index_check, yq_negative_index_error,
-    yq_numeric_index_on_object_is_null, yq_object_key_stringify, yq_read_only_context,
-    yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand, EmptyOperandOp,
-    EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult, RangeNum,
-    Reentry, RestPipe, RootWitness, SliceTargetKind, StashedEscape, StashedVerdict, YqSemantics,
-    DEFERRED_BIND_UNRESOLVED, WHILE_UNTIL_MAX_STEPS,
+    yq_index_key_is_numeric, yq_literal_index_text, yq_mapping_index_text, yq_negative_index_check,
+    yq_negative_index_error, yq_numeric_index_on_object_is_null, yq_object_key_stringify,
+    yq_read_only_context, yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand,
+    EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail,
+    QueryResult, RangeNum, Reentry, RestPipe, RootWitness, SliceTargetKind, StashedEscape,
+    StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED, WHILE_UNTIL_MAX_STEPS,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -11418,7 +11418,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             }
         }
 
-        Expr::Index { idx, .. } => {
+        Expr::Index { idx, key } => {
             if let Some(elements) = value.as_array() {
                 // #2594: `len_checked`'s walk holds only elements, so a
                 // zero-element `[,]` answered `null` here for every index.
@@ -11480,7 +11480,10 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 // applies for the computed-key sibling `.a[$k]`. See
                 // `eval::yq_numeric_index_on_object_is_null`. #4079: unless the mapping
                 // has a member whose key text is the index (`.[1]` finds `1:`).
-                match crate::jq::key_index::find_cursor_memoized(&fields, &idx.to_string()) {
+                match crate::jq::key_index::find_cursor_memoized(
+                    &fields,
+                    &yq_literal_index_text::<S>(*idx, key.as_ref()).unwrap_or_default(),
+                ) {
                     Ok(Some(c)) => GenericResult::OneCursor(c),
                     Ok(None) => GenericResult::Owned(OwnedValue::Null),
                     Err(err) => GenericResult::Error(err),
@@ -19804,10 +19807,7 @@ fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
         match crate::jq::key_index::find_cursor_memoized(&fields, &text) {
             Ok(Some(c)) => return GenericResult::OneCursor(c),
             Ok(None) => {
-                if !matches!(
-                    key,
-                    OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)
-                ) {
+                if !yq_index_key_is_numeric(key) {
                     return GenericResult::Owned(OwnedValue::Null);
                 }
             }

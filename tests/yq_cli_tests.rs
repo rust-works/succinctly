@@ -57796,6 +57796,26 @@ fn test_yq_numeric_boolean_null_index_finds_a_mapping_key_by_text_4079() -> Resu
             ". as $m | {\"k\": $m} | .k | .[1]",
             "\"y\"\n",
         ),
+        // The index's own spelling is the key, not its truncation: `.[1.9]` is `1.9`, never `1`,
+        // and an integral float literal keeps its spelling (`.[1.0]` is the `1.0:` member).
+        ("1: y\n1.0: v\n2: z\n", ".[1.0]", "\"v\"\n"),
+        ("1: y\n1.0: v\n2: z\n", ".[2.0]", "null\n"),
+        ("1: y\n1.0: v\n2: z\n", "(. + {}) | .[1.0]", "\"v\"\n"),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            ".[1.9]",
+            "null\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            "(. + {}) | .[1.9]",
+            "null\n",
+        ),
+        (
+            "abc: 1\n1: y\ntrue: t\nnull: n\n1.5: w\n",
+            ".[1.9] = \"z\"",
+            "{\"abc\":1,\"1\":\"y\",\"true\":\"t\",\"null\":\"n\",\"1.5\":\"w\",\"1.9\":\"z\"}\n",
+        ),
     ];
     for &(doc, filter, expected) in rows {
         let (stdout, code) = run_yq_stdin(filter, doc, &["-o", "json", "-I", "0"])?;
@@ -57804,6 +57824,45 @@ fn test_yq_numeric_boolean_null_index_finds_a_mapping_key_by_text_4079() -> Resu
             (expected, 0),
             "`{filter}` on {doc:?}"
         );
+    }
+    Ok(())
+}
+
+/// #4079: a metadata write (`style=`, `anchor=`, `line_comment=`) addressed by a numeric or boolean
+/// index on a mapping lands on the member whose key has that text, in the YAML output, where it
+/// was silently dropped. Rows captured from yq v4.53.3.
+#[test]
+fn test_yq_metadata_write_through_a_numeric_index_on_a_mapping_4079() -> Result<()> {
+    let doc = "a: {1: y, 1.5: w, true: t, x: [1, 2]}\n";
+    let rows: &[(&str, &str)] = &[
+        (
+            ".a[1] style=\"double\"",
+            "a: {1: \"y\", 1.5: w, true: t, x: [1, 2]}\n",
+        ),
+        (
+            ".a[1] style=\"single\"",
+            "a: {1: 'y', 1.5: w, true: t, x: [1, 2]}\n",
+        ),
+        (
+            ".a[1] anchor=\"foo\"",
+            "a: {1: &foo y, 1.5: w, true: t, x: [1, 2]}\n",
+        ),
+        (
+            ".a[1] line_comment=\"c\"",
+            "a: {1: y, # c\n  1.5: w, true: t, x: [1, 2]}\n",
+        ),
+        (
+            ".a[1.5] style=\"single\"",
+            "a: {1: y, 1.5: 'w', true: t, x: [1, 2]}\n",
+        ),
+        (
+            ".a[true] anchor=\"b\"",
+            "a: {1: y, 1.5: w, true: &b t, x: [1, 2]}\n",
+        ),
+    ];
+    for &(filter, expected) in rows {
+        let (stdout, code) = run_yq_stdin(filter, doc, &[])?;
+        assert_eq!((stdout.as_str(), code), (expected, 0), "`{filter}`");
     }
     Ok(())
 }
