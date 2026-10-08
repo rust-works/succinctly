@@ -132339,7 +132339,7 @@ mod tests {
     /// Each row pins `eval_using`'s and the cursor entry's answer, and the
     /// `eval` half is asserted equal to the cursor entry's for every row --
     /// including the collections that materialize in the cursor entry too
-    /// (`{a: .}`, `. as $x | [$x]`, #3427), which raise in both. That split
+    /// (`. as $x | [$x]`, `[[.]]`, #3427), which raise in both. That split
     /// is accepted for what remains of it (see
     /// `docs/compliance/jq/limitations.md`), so moving a row is a decision to
     /// record there, not a fix.
@@ -132384,9 +132384,9 @@ mod tests {
             (OBJ, "select(key == 0) | path(.a)", None, Some(r#"["a"]"#)),
             // #3427, narrowed by #3856: an array holds the nodes of a `,` body
             // as cursors beside computed values (`[., 1]`, `[., .]`), so it
-            // reads none of them. What still builds an owned value in the
-            // cursor entry too is a construction held inside another
-            // (`[[.]]`), an object and a bind.
+            // reads none of them, and an object holds its nodes the same way
+            // (#4044). What still builds an owned value in the cursor entry
+            // too is a construction held inside another (`[[.]]`) and a bind.
             ("[1.2.3]", "[., 1] | length", None, Some("2")),
             ("[1.2.3]", "[., .] | length", None, Some("2")),
             ("[1.2.3]", "[[.]] | length", None, None),

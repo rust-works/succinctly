@@ -4120,7 +4120,7 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
                 sink.report(DiagStyle::Yq, &e, &no_location());
                 Ok(vec![])
             }
-        },
+        }, // patchcov: coverage tolerate-line reason="unreachable: only jq mode builds a LazyObject; this arm is the exhaustiveness answer for the shared enum (#4044)"
         GenericResult::None => Ok(vec![]),
         // Real yq streams nothing before a top-level error/break — a
         // `Partial`'s already-produced prefix is discarded the same way an
