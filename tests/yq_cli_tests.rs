@@ -43810,8 +43810,8 @@ fn test_yq_style_tagged_2707() -> Result<()> {
 "#,
             r#".a style="flow" | .a.d style="tagged""#,
             &[],
-            r#"a: {d: !!str '', e: 1}
-"#,
+            r"a: {d: !!str '', e: 1}
+",
         ),
         (
             r#"a: ["", "x"]
@@ -43826,8 +43826,8 @@ fn test_yq_style_tagged_2707() -> Result<()> {
 "#,
             r#".a style="flow" | .a[0] style = "tagged""#,
             &[],
-            r#"a: [!!str x]
-"#,
+            r"a: [!!str x]
+",
         ),
         (
             r"a: 1
