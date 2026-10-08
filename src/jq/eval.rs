@@ -41992,6 +41992,36 @@ fn stage_states_register_per_result<S: EvalSemantics>(expr: &Expr) -> bool {
         }
 }
 
+/// Whether `expr` is a compound stage (`,`, `//`, `if`, `try`) whose branches each
+/// state jq's register themselves (#3644). jq backtracks to the fork, so a branch
+/// that navigates nothing leaves the register where the stage entered whatever its
+/// sibling navigates; [`cannot_move_register`] answers for the node as a whole and
+/// so refuses the by-value branch too. Only the stage's *own* fork is read per
+/// branch: the branches themselves are held to nothing here, because
+/// [`resolve_seq_stage`] reads the statement only on a result that navigated
+/// nothing, and a by-value leaf states `Unmoved` only when it provably left the
+/// register ([`leaf_register`]) and a loss otherwise. Trackable entries only: on
+/// an untracked one no leaf sees the register. Jq mode only (ADR-0018).
+fn compound_states_register_per_result<S: EvalSemantics>(expr: &Expr) -> bool {
+    last_register_unmoved::<S>()
+        && matches!(
+            peel_register_transparent(expr),
+            Expr::Comma(_) | Expr::Alternative(..) | Expr::If { .. }
+        )
+        || matches!(
+            peel_register_transparent(expr),
+            // A handler that runs navigates the error payload, not the register,
+            // and the handler's by-value output would then be read as the entry
+            // register (`try (error(.) | error("x")) catch ((.a)? // 5)` is a
+            // path error in jq). So a navigating handler is admitted only behind
+            // a body that cannot raise; the handler machinery (#3133, #3987)
+            // answers the rest.
+            Expr::Try { expr: body, catch }
+                if catch.as_deref().map_or(true, cannot_move_register)
+                    || matches!(unwrap_paren(body), Expr::Literal(_))
+        )
+}
+
 /// Whether `expr` is a `foreach` whose emissions state jq's register per emission
 /// (#3580), read through the wrappers [`peel_register_transparent`] passes the
 /// register through: one that [`foreach_outside_update_cannot_move`] and whose
@@ -54619,7 +54649,8 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
     // an untracked entry reads an absent statement as the carried copy standing
     // (#3826), which is wrong for an emission whose UPDATE navigated.
     let stages_per_result_register = stage_states_register_per_result::<S>(element)
-        || (branch_trackable && foreach_states_register_per_emission::<S>(element));
+        || (branch_trackable && foreach_states_register_per_emission::<S>(element))
+        || (branch_trackable && compound_states_register_per_result::<S>(element));
     let mut place_step = |step: PathBranch<'a>| -> Demand {
         // #3293: only a `?//` retry re-invokes this after a stop.
         downstream.begin();
