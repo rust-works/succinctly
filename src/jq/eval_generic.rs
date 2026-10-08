@@ -7747,6 +7747,22 @@ mod slot_memo {
         })
     }
 
+    // Owned copies `path(f)` built, for the test that pins one copy per loop.
+    #[cfg(test)]
+    thread_local! {
+        static ROOT_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn root_built() -> usize {
+        ROOT_BUILT.with(std::cell::Cell::get)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_root_built() {
+        ROOT_BUILT.with(|b| b.set(b.get() + 1));
+    }
+
     /// What the memo holds for the owned copy of node `id` (#4001).
     pub(crate) enum RootLookup {
         /// Kept by an earlier call: use it.
@@ -7960,16 +7976,6 @@ mod slot_memo {
     pub(crate) fn note_scanned() {}
 
     pub(crate) fn note_neighbour() {}
-
-    pub(crate) enum RootLookup {
-        First,
-    }
-
-    pub(crate) fn root_lookup(_document: usize, _id: usize) -> RootLookup {
-        RootLookup::First
-    }
-
-    pub(crate) fn keep_root(_document: usize, _id: usize, _copy: alloc::rc::Rc<super::RootCopy>) {}
 }
 
 #[cfg(feature = "std")]
@@ -13150,7 +13156,11 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             // precheck looks for is the `path` builtin *around* it (#3122).
             let demoted = reroot_markers::<S>(path_expr, &root);
             // #2280: `optional` suppresses a decode failure into no output.
-            let copy = match root_copy_for_path::<V, S>(&value, cursor) {
+            let copy = match root_copy_for_path::<V, S>(
+                &value,
+                cursor,
+                path_expr_observes_no_identity(path_expr),
+            ) {
                 Ok(v) => v,
                 Err(e) if suppresses(&e, optional) => return Flow::Exhausted,
                 Err(e) => return Flow::Escaped(Control::Error(e)),
@@ -21169,33 +21179,68 @@ fn sort_keyed_elements<S: EvalSemantics, V: DocumentValue>(keyed: &mut [(SortKey
 /// A `path(.big[$k])` per key of a wide object otherwise copies the whole
 /// document and re-walks it for the bridge test on every key: the cost of one
 /// lookup became the size of the document. The first call keeps nothing, so a
-/// query that asks once holds no copy past it; one copy is kept at a time, so
-/// the retained size is the transient one it replaces.
+/// query that asks once holds no copy past it; one copy is kept at a time. That
+/// copy lives to the end of the evaluation, not the end of the call that built
+/// it, so a query that goes on to allocate a lot after a looped `path(f)` holds
+/// it on top of that.
+///
+/// Not while an `as` binding is in scope ([`embed_table_active`]), unless
+/// `identity_free` says `f` cannot observe which nodes the copy shares:
+/// `to_owned_cursor` shares a bound node's `Rc` into the copy it builds there,
+/// so the copy depends on which bindings are live, which the memo's key (the
+/// node) does not name. Such a call builds its own, as before.
 fn root_copy_for_path<V: DocumentValue, S: EvalSemantics>(
     value: &V,
     cursor: Option<V::Cursor>,
+    #[cfg_attr(not(feature = "std"), allow(unused_variables))] identity_free: bool,
 ) -> Result<Rc<RootCopy>, EvalError> {
     let build = |value: &V, cursor: Option<V::Cursor>| -> Result<Rc<RootCopy>, EvalError> {
         let owned = to_owned_with_cursor::<_, S>(value, cursor)?;
+        #[cfg(all(test, feature = "std"))]
+        slot_memo::note_root_built();
         Ok(Rc::new(RootCopy {
             bridge_is_identity: reindex_bridge_is_identity(&owned),
             owned,
         }))
     };
-    let Some(c) = cursor else {
-        return build(value, None);
-    };
-    let (document, id) = (c.document_token(), c.node_id());
-    match slot_memo::root_lookup(document, id) {
-        #[cfg(feature = "std")]
-        slot_memo::RootLookup::Kept(copy) => Ok(copy),
-        #[cfg(feature = "std")]
-        slot_memo::RootLookup::Repeat => {
-            let copy = build(value, Some(c))?;
-            slot_memo::keep_root(document, id, Rc::clone(&copy));
-            Ok(copy)
+    #[cfg(feature = "std")]
+    if let Some(c) = cursor
+        .as_ref()
+        .filter(|_| identity_free || !embed_table_active())
+    {
+        let (document, id) = (c.document_token(), c.node_id());
+        match slot_memo::root_lookup(document, id) {
+            slot_memo::RootLookup::Kept(copy) => return Ok(copy),
+            slot_memo::RootLookup::Repeat => {
+                let copy = build(value, cursor)?;
+                slot_memo::keep_root(document, id, Rc::clone(&copy));
+                return Ok(copy);
+            }
+            slot_memo::RootLookup::First => {}
         }
-        slot_memo::RootLookup::First => build(value, Some(c)),
+    }
+    build(value, cursor)
+}
+
+/// Whether `path(expr)` can tell which document nodes its owned copy shares
+/// with a live `as` binding (#4001): false for anything but navigation whose
+/// computed keys are read by value (`.big[$k]`, `.a.b[$i]`, the key a frozen
+/// `TrackedVar` holds included). A variable used any other way (`path($y)`,
+/// `$y | .a`) compares nodes, which is what the sharing is for.
+fn path_expr_observes_no_identity(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identity | Expr::Iterate | Expr::Field(_) | Expr::Index { .. } => true,
+        Expr::Paren(inner) | Expr::Optional(inner) => path_expr_observes_no_identity(inner),
+        Expr::Pipe(exprs) => exprs.iter().all(path_expr_observes_no_identity),
+        Expr::Comma(exprs) => exprs.iter().all(path_expr_observes_no_identity),
+        Expr::IndexExpr { target, key } => {
+            path_expr_observes_no_identity(target)
+                && matches!(
+                    &**key,
+                    Expr::Var(_) | Expr::TrackedVar(_) | Expr::Literal(_)
+                )
+        }
+        _ => false,
     }
 }
 
@@ -49123,6 +49168,47 @@ mod tests {
             crate::jq::key_index::memo::work().1 > before.1,
             "the index answered"
         );
+    }
+
+    /// #4001: only navigation whose computed keys are read by value is blind to
+    /// which nodes a copy shares with a binding.
+    #[test]
+    fn path_expr_observes_no_identity_admits_only_by_value_keys_4001() {
+        for (src, blind) in [
+            (".big[$k]", true),
+            (".a.b[$k]", true),
+            (".a[$k]?", true),
+            (".a, .b[$k]", true),
+            (".[]", true),
+            ("$y", false),
+            ("$y | .a", false),
+            (".a | $y", false),
+            (".big[$k | tostring]", false),
+            (".big[$k][$j]", true),
+            (".big[.a]", false),
+            (".[1:$k]", false),
+            ("first(.big[$k])", false),
+        ] {
+            let expr = parse(src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
+            assert_eq!(path_expr_observes_no_identity(&expr), blind, "{src}");
+        }
+    }
+
+    /// #4001: a loop of `path(.big[$k])` builds the owned copy twice (the first call
+    /// keeps nothing, the second keeps it) and every later call reuses it.
+    #[cfg(feature = "std")]
+    #[test]
+    fn path_with_a_computed_key_builds_one_kept_copy_4001() {
+        let members: Vec<String> = (0..20).map(|i| format!("\"k{i}\":{i}")).collect();
+        let doc = format!("{{\"big\":{{{}}}}}", members.join(","));
+        let before = slot_memo::root_built();
+        let (out, control) = drive_each_sink::<JqSemantics>(
+            doc.as_bytes(),
+            "[range(6) as $i | \"k\\($i)\" as $k | path(.big[$k])] | length",
+        );
+        assert!(control.is_none(), "{control:?}");
+        assert_eq!(out, [OwnedValue::Int(6)]);
+        assert_eq!(slot_memo::root_built() - before, 2);
     }
 
     /// #4001: the owned copy `path(f)` makes of a node is kept from the second
