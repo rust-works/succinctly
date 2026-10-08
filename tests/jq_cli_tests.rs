@@ -104649,6 +104649,121 @@ fn test_nth_key_and_path_name_the_delivered_element_on_both_routes_3610() -> Res
     Ok(())
 }
 
+/// #3621: a `?//` inside `first`/`nth`/`limit` retries past the consumer's
+/// stop and delivers a second output (the pinned jq 1.7.1's value mode answers
+/// `[1,1]` for each, and `nth(1; ...)` `[2,1]`), and that retried output keeps
+/// the identity of the element it is: `key` and `path` named the root
+/// placeholder (`null`, `[]`) for it, where `limit` already named the element.
+/// `skip` has no stop to retry past, so its second output is the body's own
+/// literal `5`, which stands at no node. Each row runs on both routes, as the
+/// #3610 rows do. jq's path mode delivers one output for a `first`/`nth`
+/// (`path(first(...))` is `[["b",0]]`), which the last rows keep.
+#[test]
+fn test_retried_bounded_output_keeps_its_identity_on_both_routes_3621() -> Result<()> {
+    let doc = r#"{"a":{"b":[1,2]}}"#;
+    let body = r"[1] as [$q] ?// $b | (.b[], 5)";
+    for (filter, values, keys, paths) in [
+        (
+            format!(".a | first({body})"),
+            "[1,1]",
+            "[0,0]",
+            r#"[["a","b",0],["a","b",0]]"#,
+        ),
+        (
+            format!(".a | nth(0; {body})"),
+            "[1,1]",
+            "[0,0]",
+            r#"[["a","b",0],["a","b",0]]"#,
+        ),
+        (
+            format!(".a | limit(1; {body})"),
+            "[1,1]",
+            "[0,0]",
+            r#"[["a","b",0],["a","b",0]]"#,
+        ),
+        // The count survives the retry (`seen` keeps rising), so the retried
+        // alternative's element at index 0 is the second one delivered.
+        (
+            format!(".a | nth(1; {body})"),
+            "[2,1]",
+            "[1,0]",
+            r#"[["a","b",1],["a","b",0]]"#,
+        ),
+        (
+            format!(".a | first(first({body}))"),
+            "[1,1]",
+            "[0,0]",
+            r#"[["a","b",0],["a","b",0]]"#,
+        ),
+    ] {
+        let ran = |collected: &str| -> Result<(String, String, i32)> {
+            let (stdout, stderr, code) = run_jq_full(&["-c", collected], Some(doc))?;
+            Ok((stdout.trim_end().to_string(), stderr, code))
+        };
+        let ran_owned = |collected: &str| -> Result<(String, String, i32)> {
+            let owned = format!("{doc} | {collected}");
+            let (stdout, stderr, code) = run_jq_full(&["-nc", &owned], None)?;
+            Ok((stdout.trim_end().to_string(), stderr, code))
+        };
+        for (tail, expected) in [("", values), (" | key", keys), (" | path", paths)] {
+            let collected = format!("[{filter}{tail}]");
+            for (route, (stdout, stderr, code)) in [
+                ("cursor", ran(&collected)?),
+                ("owned", ran_owned(&collected)?),
+            ] {
+                assert_eq!(
+                    (stdout.as_str(), code),
+                    (expected, 0),
+                    "`{collected}` ({route} route): stderr {stderr:?}"
+                );
+            }
+        }
+    }
+    // `skip(1; ...)` delivers `.b[1]` and the literal `5`; only the first has a node.
+    for (tail, expected) in [
+        ("", "[2,5]"),
+        (" | key", "[1,null]"),
+        (" | path", r#"[["a","b",1],[]]"#),
+    ] {
+        let collected = format!("[.a | skip(1; {body}){tail}]");
+        let (stdout, stderr, code) = run_jq_full(&["-c", &collected], Some(doc))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "`{collected}`: stderr {stderr:?}"
+        );
+    }
+    // The retried element's decode is still checked before it is handed on: a
+    // lone surrogate in it raises, after the first alternative's `1` was kept.
+    let bad = r#"{"a":"\ud800","p":1}"#;
+    for filter in [
+        r#"first([.p] as [$y] ?// $y | if ($y|type)=="number" then .p else .a end)"#,
+        r#"nth(0; [.p] as [$y] ?// $y | if ($y|type)=="number" then .p else .a end)"#,
+    ] {
+        let collected = format!("[{filter} | key]");
+        let (stdout, stderr, code) = run_jq_full(&["-c", &collected], Some(bad))?;
+        assert_ne!(code, 0, "`{collected}`: stdout {stdout:?}");
+        assert!(
+            stderr.contains("invalid unicode escape"),
+            "`{collected}`: stderr {stderr:?}"
+        );
+    }
+    // jq's path mode: one output for `first` and `nth`, as it was.
+    for filter in [
+        format!(".a | path(first({body}))"),
+        format!(".a | path(nth(0; {body}))"),
+    ] {
+        let collected = format!("[{filter}]");
+        let (stdout, stderr, code) = run_jq_full(&["-c", &collected], Some(doc))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (r#"[["b",0]]"#, 0),
+            "`{collected}`: stderr {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3610: `nth(n; f)` pulls its body no further than index `n`, an error the
 /// body raises at a dropped position surfaces before anything is delivered,
 /// and one raised downstream of the delivered element still propagates -- on

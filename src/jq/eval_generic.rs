@@ -15036,7 +15036,8 @@ fn each_limit_with_n_generic<S: EvalSemantics, V: DocumentValue>(
 /// A *second* (or later) kept item at this same index -- reachable only
 /// through a `?//` retry (#1519), since the sink answers `Demand::Stop` on
 /// the first one and a generator with no such retry is never asked again --
-/// is force-decoded the same way before it reaches `sink`, mirroring
+/// has its decode forced the same way before it reaches `sink` (the cursor is
+/// kept, #3621), mirroring
 /// [`items_to_generic_result`]'s own multi-item rule (`take_at_index_generic`
 /// is the streaming twin of [`nth_with_n_generic`]/`each_take_first_generic`,
 /// both of which route a multi-item `wanted` batch through that function via
@@ -15054,6 +15055,10 @@ fn each_limit_with_n_generic<S: EvalSemantics, V: DocumentValue>(
 /// `test_generic_first_nth_retry_batch_still_raises_decode_failure_1519`
 /// exists to pin for the eager, `Vec`-collecting siblings this lazy skeleton
 /// was missing it relative to.
+///
+/// The decode is checked, not substituted for the node
+/// ([`generic_item_forced_keeping_cursor`]), so `first(G) | key` names the
+/// retried element as `limit(1; G) | key` does.
 fn take_at_index_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     value: V,
@@ -15084,8 +15089,8 @@ fn take_at_index_generic<S: EvalSemantics, V: DocumentValue>(
             seen += 1;
             if at_or_past {
                 let item = if kept_any {
-                    match generic_item_into_owned::<_, S>(item) {
-                        Ok(v) => GenericItem::Owned(v),
+                    match generic_item_forced_keeping_cursor::<_, S>(item) {
+                        Ok(item) => item,
                         Err(control) => return stop_with_escape(&mut skipped_err, control),
                     }
                 } else {
@@ -17633,6 +17638,27 @@ fn generic_item_into_owned<V: DocumentValue, S: EvalSemantics>(
         _ => {
             unreachable!("a single GenericItem never materializes to a multi-output or lazy shape")
         }
+    }
+}
+
+/// `item` with whatever decode it still owes forced, so its failure is raised
+/// here, keeping the document node of a cursor item (#3621).
+///
+/// [`generic_item_into_owned`] answers an `OwnedValue`, which stands at no
+/// position: a `key`/`path` read downstream of it takes the root placeholder.
+/// A cursor item's decode is only *checked* here -- the cursor is handed on,
+/// so the stage after still places the value where the node stands, as it does
+/// for the first item the consumer kept. Every other item has no node to keep.
+fn generic_item_forced_keeping_cursor<V: DocumentValue, S: EvalSemantics>(
+    item: GenericItem<V>,
+) -> Result<GenericItem<V>, Control> {
+    match item {
+        // `generic_item_to_result` reads a `OneCursorValue` as its cursor too.
+        GenericItem::OneCursor(c) | GenericItem::OneCursorValue(c, _) => {
+            to_owned_cursor::<S, _>(&c).map_err(Control::Error)?;
+            Ok(GenericItem::OneCursor(c))
+        }
+        other => generic_item_into_owned::<_, S>(other).map(GenericItem::Owned),
     }
 }
 
