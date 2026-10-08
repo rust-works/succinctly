@@ -100,8 +100,17 @@ fn test_public_eval_accepts_depth_under_limit_2627() {
 /// that edge on any platform's frame sizes: they pin the ceiling, not the
 /// margin.
 fn run_on_big_stack(json: String, filter: String) -> Result<Vec<String>, (bool, String)> {
+    run_on_stack(8 * 1024 * 1024, json, filter)
+}
+
+/// [`run_on_big_stack`] with the thread's stack size chosen by the caller.
+fn run_on_stack(
+    stack_size: usize,
+    json: String,
+    filter: String,
+) -> Result<Vec<String>, (bool, String)> {
     std::thread::Builder::new()
-        .stack_size(8 * 1024 * 1024)
+        .stack_size(stack_size)
         .spawn(move || {
             let bytes = json.as_bytes();
             let index = JsonIndex::build(bytes);
@@ -130,9 +139,9 @@ fn run_on_big_stack(json: String, filter: String) -> Result<Vec<String>, (bool, 
 /// (a plain error would let `try ... catch` turn a stack-safety guard into an
 /// ordinary answer).
 ///
-/// The native walkers (`paths`, `leaf_paths`, `.. | path`) stop at
-/// `MAX_PATH_WALK_DEPTH` (384); `path(..)` materializes the document first and
-/// stops at `MAX_NESTING_DEPTH` (256).
+/// The native walkers (`paths`, `leaf_paths`, `.. | path`, and `path(..)` since #3850) stop at
+/// `MAX_PATH_WALK_DEPTH` (384); `paths(f)` materializes the document first and stops at
+/// `MAX_NESTING_DEPTH` (256).
 #[test]
 fn test_public_eval_path_family_over_depth_is_a_clean_error_3457() {
     for (filter, depths, limit) in [
@@ -144,7 +153,13 @@ fn test_public_eval_path_family_over_depth_is_a_clean_error_3457() {
             &[384, 1000][..],
             384,
         ),
-        ("[path(..)] | length", &[256, 300, 384, 1000][..], 256),
+        ("[path(..)] | length", &[384, 1000][..], 384),
+        ("[path(recurse)] | length", &[384, 1000][..], 384),
+        (
+            r#"[paths(type == "number")] | length"#,
+            &[256, 300, 384, 1000][..],
+            256,
+        ),
     ] {
         for &depth in depths {
             let outcome = run_on_big_stack(nested_arrays(depth), filter.to_string());
@@ -170,6 +185,8 @@ fn test_public_eval_path_family_under_depth_answers_3457() {
             ("[paths] | length", depth),
             ("[leaf_paths] | length", 1),
             ("[.. | path] | length", depth + 1),
+            ("[path(..)] | length", depth + 1),
+            ("[path(recurse)] | length", depth + 1),
         ] {
             assert_eq!(
                 run_on_big_stack(nested_arrays(depth), filter.to_string()),
@@ -180,8 +197,11 @@ fn test_public_eval_path_family_under_depth_answers_3457() {
     }
     // The materializing form is still bounded by the lower ceiling.
     assert_eq!(
-        run_on_big_stack(nested_arrays(255), "[path(..)] | length".to_string()),
-        Ok(vec!["256".to_string()])
+        run_on_big_stack(
+            nested_arrays(255),
+            r#"[paths(type == "number")] | length"#.to_string()
+        ),
+        Ok(vec!["1".to_string()])
     );
 }
 
@@ -264,4 +284,19 @@ fn test_public_eval_result_variant_contract_3457() {
         QueryResult::Owned(OwnedValue::Null)
     ));
     assert!(matches!(run(".[] | select(. > 5)"), QueryResult::None));
+}
+
+/// #3850: `path(..)` and `path(recurse)` walk with an explicit stack, so the deepest document
+/// they accept (383 levels) fits the smallest stack a library caller or a `cargo test` thread
+/// gives the evaluator (2 MiB) on a debug build -- the margin the materializing route
+/// (`to_owned_cursor_at_depth`, ~360 levels on aarch64) did not have.
+#[test]
+fn test_public_eval_path_of_recursive_descent_fits_a_default_test_thread_3850() {
+    for filter in ["[path(..)] | length", "[path(recurse)] | length"] {
+        assert_eq!(
+            run_on_stack(2 * 1024 * 1024, nested_arrays(383), filter.to_string()),
+            Ok(vec!["384".to_string()]),
+            "{filter}"
+        );
+    }
 }

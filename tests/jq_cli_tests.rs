@@ -25769,30 +25769,135 @@ fn test_paths_and_leaf_paths_past_384_refuse_cleanly_3429() -> Result<()> {
     Ok(())
 }
 
-/// #3429 residual: `path(..)` and `paths(f)` materialize the whole document
-/// first (`to_owned_with_cursor`, a native recursion that overflows a 2 MiB
-/// debug thread at ~360 levels on aarch64, ~385 on x86_64), so they keep the materializers' 256 ceiling
-/// even though `paths` and `.. | path` over the same document answer. Pinned
-/// so that lifting it is a deliberate change that also re-measures the
-/// materializer's stack (see `MAX_PATH_WALK_DEPTH`).
+/// #3429 residual: `paths(f)` materializes the whole document first (`to_owned_with_cursor`, a
+/// native recursion that overflows a 2 MiB debug thread at ~360 levels on aarch64, ~385 on
+/// x86_64), so it keeps the materializers' 256 ceiling even though `paths` and `.. | path` over
+/// the same document answer. Pinned so that lifting it is a deliberate change that also
+/// re-measures the materializer's stack (see `MAX_PATH_WALK_DEPTH`). `path(..)` and
+/// `path(recurse)` left this list with #3850.
 #[test]
 fn test_materializing_path_forms_still_stop_at_the_materializer_ceiling_3429() -> Result<()> {
     let doc = nested_arrays(300);
-    for filter in [
-        "[path(..)] | length",
-        "[paths(type == \"number\")] | length",
-    ] {
-        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&doc))?;
-        assert_eq!(stdout.trim_end(), "", "{filter}");
-        assert_eq!(code, 5, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
-        assert!(
-            stderr.contains("nesting depth exceeds limit of 256"),
-            "{filter}: stderr: {stderr:?}"
-        );
-    }
+    let filter = "[paths(type == \"number\")] | length";
+    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&doc))?;
+    assert_eq!(stdout.trim_end(), "", "{filter}");
+    assert_eq!(code, 5, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 256"),
+        "{filter}: stderr: {stderr:?}"
+    );
     let (stdout, stderr, code) = run_jq_full(&["-c", "[.. | path] | length"], Some(&doc))?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout.trim_end(), "301");
+    Ok(())
+}
+
+/// #3850: `path(..)`, `path(recurse)` and `path(recurse(.[]?))` walk the document with cursors
+/// instead of materializing it, so they answer up to `MAX_PATH_WALK_DEPTH` (384) -- where
+/// `.. | path` does -- instead of stopping at the materializers' 256. 383 is the deepest
+/// document: a path as long as the document is deep must stay under the ceiling.
+#[test]
+fn test_path_of_recursive_descent_answers_between_256_and_384_3850() -> Result<()> {
+    for depth in [255, 256, 300, 383] {
+        let doc = nested_arrays(depth);
+        for filter in [
+            "[path(..)] | length",
+            "[path(recurse)] | length",
+            "[path(recurse(.[]?))] | length",
+            "[path((..))] | length",
+            "first(path(..) | select(length == 5)) | length",
+            "[limit(3; path(..))] | length",
+        ] {
+            let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&doc))?;
+            assert_eq!(
+                code, 0,
+                "{filter} @ {depth}: stdout: {stdout:?} stderr: {stderr:?}"
+            );
+            // `first(..)` stops at the fifth-deep path, `limit(3; ..)` at the third.
+            let expected = if filter.starts_with("first") {
+                "5".to_string()
+            } else if filter.starts_with("[limit") {
+                "3".to_string()
+            } else {
+                (depth + 1).to_string()
+            };
+            assert_eq!(stdout.trim_end(), expected, "{filter} @ {depth}");
+        }
+    }
+    Ok(())
+}
+
+/// #3850: the walker is its own implementation of `.[]?`'s descent, so its edges are pinned
+/// against jq 1.7.1: a scalar, `null`, `{}` and `[]` root is the one path `[]`, a repeated
+/// object key counts once, a `try` around it changes nothing, and `recurse` is the same walk.
+#[test]
+fn test_path_of_recursive_descent_edges_match_jq_3850() -> Result<()> {
+    assert_path_rows_3289(&[
+        ("5", "[path(..)]", "[[]]\n", "", 0),
+        ("null", "[path(..)]", "[[]]\n", "", 0),
+        ("{}", "[path(recurse)]", "[[]]\n", "", 0),
+        ("[]", r#"try ([path(..)]) catch "E""#, "[[]]\n", "", 0),
+        (r#"{"a":1,"a":2}"#, "[path(..)]", "[[],[\"a\"]]\n", "", 0),
+        (
+            r#"{"a":[{"b":1}],"c":{}}"#,
+            "[path(..)]",
+            "[[],[\"a\"],[\"a\",0],[\"a\",0,\"b\"],[\"c\"]]\n",
+            "",
+            0,
+        ),
+        // A decode failure is the one error `.[]?` never swallows, and `try` cannot catch it.
+        (
+            r#"{"a":"\ud800","d":5}"#,
+            "[path(..)]",
+            "",
+            "invalid unicode escape sequence",
+            5,
+        ),
+        (
+            r#"{"a":[{"b":1}],"c":{}}"#,
+            "[limit(2; path(..))]",
+            "[[],[\"a\"]]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
+/// #3850: a document nested between 256 and 384 levels reached through a *computed* value (no
+/// cursor to walk) still materializes and keeps the materializers' 256 ceiling, as before.
+#[test]
+fn test_path_of_recursive_descent_over_a_computed_value_keeps_256_3850() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "map(.) | [path(..)] | length"],
+        Some(&nested_arrays(300)),
+    )?;
+    assert_eq!(stdout.trim_end(), "");
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 256"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #3850: past 384 the same forms refuse cleanly, with the ceiling they enforce (384).
+#[test]
+fn test_path_of_recursive_descent_past_384_refuses_cleanly_3850() -> Result<()> {
+    for depth in [384, 500] {
+        let doc = nested_arrays(depth);
+        for filter in ["[path(..)] | length", "[path(recurse)] | length"] {
+            let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&doc))?;
+            assert_eq!(stdout.trim_end(), "", "{filter} @ {depth}");
+            assert_eq!(
+                code, 5,
+                "{filter} @ {depth}: stdout: {stdout:?} stderr: {stderr:?}"
+            );
+            assert!(
+                stderr.contains("nesting depth exceeds limit of 384"),
+                "{filter} @ {depth}: stderr: {stderr:?}"
+            );
+        }
+    }
     Ok(())
 }
 

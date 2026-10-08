@@ -9910,9 +9910,13 @@ narrowing:
 - **Nesting depth.** The path builtins stop at a nesting depth the previous evaluator, which
   answered up to 384, did not have. `paths`, `leaf_paths` and the cursor-native `path(f)`
   walkers stop at 384 ([#3429](https://github.com/rust-works/succinctly/issues/3429) raised
-  them from 256); the forms that materialize the whole document first (`path(..)`,
-  `path(recurse(f; c))`, `paths(f)`, `path(getpath(p))`, among others) stop at 256, the materializers'
-  ceiling, chosen for native-stack safety. Past the ceiling they return
+  them from 256), and so do a bare `path(..)`, `path(recurse)` and `path(recurse(.[]?))`
+  ([#3850](https://github.com/rust-works/succinctly/issues/3850): they walk with cursors and an
+  explicit stack instead of materializing the document); the forms that materialize the whole
+  document first (a descent inside a larger path expression such as `path(.. | .a?)`, a bare
+  `path(..)` over a computed value rather than the input document (`map(.) | path(..)`, `{a: .} | .a | path(..)`),
+  `path(recurse(f; c))`, `paths(f)`, `path(getpath(p))`, among others) stop at 256, the
+  materializers' ceiling, chosen for native-stack safety. Past the ceiling they return
   `nesting depth exceeds limit of 384` (or `256`) as a `QueryResult::Error`, tagged as a decode
   failure so a `try` in the filter does not swallow it, and never as an unwinding panic: the
   walkers report it as an error, as do the comment-preserving and standard-JSON materializers
@@ -10212,7 +10216,8 @@ an order of magnitude cheaper than the walk this removes.
 | `path(.d)`, `.d \| key`, `.d \| parent`, `getpath(["d"])` | answer | never read `.a` |
 | `path(.a)`, `getpath(["a"])` | answer, echoing raw bytes like `.a` | naming a position is not reading it |
 | `getpath(["a"]) \| length`, `path(.a[])`, `.a[] \| key` | raise | the value is read |
-| `path(if . then .d else null end)`, `path(.d \| select(true))`, `path(..)` | raise | not cursor-navigable; the fallback materializes, and validates all of it |
+| `path(if . then .d else null end)`, `path(.d \| select(true))`, `path(.. \| .a?)` | raise | not cursor-navigable; the fallback materializes, and validates all of it |
+| `path(..)`, `path(recurse)` | raise | the walk reads every node, as `.. \| path` does (#3850) |
 | `select(f)`, `sort_by(f)`, `unique_by(f)`, `min_by(f)`, `max_by(f)` | raise | the subtree walked *is* the value tested or emitted |
 | `to_entries`, `map_values(f)`, `. as $x`, `.a \|= 1`, `[.[]]` | raise | materialize |
 

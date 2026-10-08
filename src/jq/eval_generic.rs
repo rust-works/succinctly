@@ -330,12 +330,13 @@ pub(crate) fn guard_nesting_depth(depth: usize) -> Result<(), EvalError> {
 /// would abort a 2 MiB debug thread before reaching its own guard on aarch64,
 /// and leave no margin at all on x86_64 -- so it keeps
 /// [`MAX_NESTING_DEPTH`], and a route that materializes the document first
-/// (`path(..)`, `path(recurse(f; c))`, `paths(f)`, `path(getpath(p))`, among
-/// others) still refuses past 256; see `docs/compliance/jq/limitations.md`.
+/// (`path(recurse(f; c))`, `paths(f)`, `path(getpath(p))`, a descent inside a larger path
+/// expression, among others) still refuses past 256; a bare `path(..)` and `path(recurse)` walk
+/// with an explicit stack and take 384 (#3850); see `docs/compliance/jq/limitations.md`.
 ///
 /// The guard is `depth < ceiling` and the walkers count differently, so state
 /// the boundary in what a caller can observe: `paths`/`leaf_paths` and
-/// `.. | path` take a *document* nested up to 383 levels (a path as long as the
+/// `.. | path` and `path(..)` take a *document* nested up to 383 levels (a path as long as the
 /// document is deep must stay under the ceiling), and a static chain
 /// (`path(.a.a...)`) takes up to 384 *components*, because the guard runs
 /// before each stage's step.
@@ -8848,8 +8849,9 @@ pub fn eval_with_cursor<C: DocumentCursor>(expr: &Expr, cursor: C) -> GenericRes
 /// deep for a path walker returns a decode-failure-tagged error instead: past
 /// [`MAX_PATH_WALK_DEPTH`] (384) levels for `paths`/`leaf_paths` and the
 /// cursor-native `path(f)` walkers, past [`MAX_NESTING_DEPTH`] (256) for the
-/// forms that materialize the document first (`path(..)`,
-/// `path(recurse(f; c))`, `paths(f)` and `path(getpath(p))`) (#3429).
+/// forms that materialize the document first (`path(recurse(f; c))`,
+/// `paths(f)` and `path(getpath(p))`) (#3429; a bare `path(..)` and `path(recurse)` joined the
+/// 384 group with #3850).
 ///
 /// Same `takes_input_queue_bridge` condition as [`eval_using`] (#1504),
 /// cursor-metadata carve-out included; see its doc comment for why the
@@ -13412,6 +13414,14 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
                 && crate::jq::eval::is_gated_structural_descent(f, Some(cond)) =>
         {
             each_recurse_cursor_generic::<S, V>(cursor.expect("guarded"), Some(cond), sink)
+        }
+
+        // #3850: `path(..)`, `path(recurse)` and `path(recurse(.[]?))` stream their paths from
+        // the cursor, past the 256 levels the materializing route below stops at.
+        Expr::Builtin(Builtin::Path(path_expr))
+            if cursor.is_some() && path_expr_is_bare_descent(path_expr) =>
+        {
+            each_path_descent_generic::<S, V>(cursor.expect("guarded"), sink)
         }
 
         // #2908: `path(f)` is a generator, so a consumer satisfied by the
@@ -21769,6 +21779,20 @@ fn path_expr_is_cursor_navigable(expr: &Expr) -> bool {
     }
 }
 
+/// `expr` is exactly `..`, `recurse` or `recurse(.[]?)`, parentheses aside (#3850). `path()` of
+/// one is walked by [`each_path_descent_generic`] with cursors, not by materializing the
+/// document, which is what capped it at 256 levels where `.. | path` reached 384. Deliberately
+/// not part of [`path_expr_is_cursor_navigable`]: that predicate gates the collecting walker,
+/// which would hold every position of a descent at once; a bare descent streams.
+fn path_expr_is_bare_descent(expr: &Expr) -> bool {
+    match expr {
+        Expr::Paren(inner) => path_expr_is_bare_descent(inner),
+        Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => true,
+        Expr::Builtin(Builtin::RecurseF(f)) => crate::jq::eval::is_structural_descent(f, None),
+        _ => false,
+    }
+}
+
 /// Whether an array constructor may keep `expr`'s branches as cursors and
 /// regroup or reorder them (#3317's `[a, b]`, #3473, #3476's
 /// `[(a, b) | c]`) -- the array routes' own admission test (#3501).
@@ -22727,6 +22751,62 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
         // `path_expr_is_cursor_navigable` gates every caller, so nothing else
         // can arrive here.
         other => unreachable!("non-navigable path expression reached the cursor walk: {other:?}"),
+    }
+}
+
+/// The positions [`path_descent_children`] reaches: each member's path and node.
+type PathDescentChildren<V> = Vec<(Rc<PathTrail>, PathNode<V>)>;
+
+/// The members of `here` as `..` descends into them (#3850): `.[]?`, so a node that cannot be
+/// iterated ends its own branch silently and a decode failure is the one error it never swallows.
+/// A repeated mapping key counts once whatever the mode: `..` is `recurse(.[]?)` and `.[]`
+/// collapses them, as `.. | path` ([`path_context_step_recurse`]) and the owned `path(..)` this
+/// replaces both do. `path(.[])` keeps the mode's own rule (`S::COLLAPSE_DUPLICATE_KEYS`).
+fn path_descent_children<S: EvalSemantics, V: DocumentValue>(
+    here: &PathNode<V>,
+    at: &Rc<PathTrail>,
+) -> Result<PathDescentChildren<V>, EvalError> {
+    let mut children = Vec::new();
+    if let Some(settled) = swallowed_path_leaf::<S, V>(&Expr::Iterate, None, here) {
+        settled?;
+        return Ok(children);
+    }
+    match path_step_generic::<S, V, _>(&Expr::Iterate, here, at, true, &mut children) {
+        // What `.[]?` never swallows: a decode failure, and the errors no `?` or `try` can catch.
+        Err(e) if e.is_decode_failure() || e.is_uncatchable_at_value_position() => Err(e),
+        _ => Ok(children),
+    }
+}
+
+/// `path(..)` over a live node, one path at a time to `emit` (#3850): the node itself, then every
+/// descendant in document order. An explicit stack keeps the native frame count flat in the
+/// document's depth (the guard still caps it at `MAX_PATH_WALK_DEPTH`), and `emit` answering
+/// `Demand::Stop` ends the walk there, so `first(path(..))` pays for one path. `Ok(Stop)` is that
+/// stop; whatever was emitted before an `Err` stands.
+fn path_descent_each<S: EvalSemantics, V: DocumentValue>(
+    root: V::Cursor,
+    emit: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Result<Demand, EvalError> {
+    let mut pending = vec![(PathTrail::root(), PathNode::At(root))];
+    while let Some((at, here)) = pending.pop() {
+        guard_path_walk_depth(at.depth())?;
+        if matches!(emit(OwnedValue::Array(at.to_vec().into())), Demand::Stop) {
+            return Ok(Demand::Stop);
+        }
+        pending.extend(path_descent_children::<S, V>(&here, &at)?.into_iter().rev());
+    }
+    Ok(Demand::Continue)
+}
+
+/// [`path_descent_each`] as a `Flow` into a generic sink.
+fn each_path_descent_generic<S: EvalSemantics, V: DocumentValue>(
+    root: V::Cursor,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    match path_descent_each::<S, V>(root, &mut |path| sink.push(GenericItem::Owned(path))) {
+        Ok(Demand::Stop) => Flow::Stopped { pending: None },
+        Ok(Demand::Continue) => Flow::Exhausted,
+        Err(e) => Flow::Escaped(Control::Error(e)),
     }
 }
 
@@ -29574,6 +29654,19 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         // verbatim otherwise. See `reindex_bridge_is_identity`, and the
         // `Expr::Pipe` arm above for why `optional` isn't threaded in.
         Builtin::Path(path_expr) => {
+            // #3850: a bare `..`/`recurse` over a live node is walked by `path_descent_each`, so it
+            // takes the path walkers' 384 ceiling; over a computed value (no cursor) it still
+            // materializes below and keeps 256.
+            if let Some(root) = cursor.filter(|_| path_expr_is_bare_descent(path_expr)) {
+                let mut out = Vec::new();
+                return match path_descent_each::<S, V>(root, &mut |path| {
+                    out.push(path);
+                    Demand::Continue
+                }) {
+                    Ok(_) => owned_vec_to_generic_result(out),
+                    Err(e) => partial_generic(out, Control::Error(e)),
+                };
+            }
             // #2061: `path(...)` output is small and bounded, but this arm
             // materialized the whole document to produce it -- `path(.[0])`
             // on a 20 MB array cost 0.78s and 519 MiB against `.[0]`'s 0.09s
@@ -46367,6 +46460,36 @@ mod tests {
                     || path_expr_is_cursor_navigable(&expr),
                 "{query}"
             );
+        }
+    }
+
+    /// #3850: exactly `..`, `recurse` and `recurse(.[]?)` (parentheses aside) are walked by
+    /// `path_descent_each`; a descent inside a larger expression, or a `recurse` over any other
+    /// `f`, stays on the routes it had, and neither predicate of `path()`'s collecting walker
+    /// or the array routes admits a descent.
+    #[test]
+    fn test_bare_descent_predicate_3850() {
+        let stage = |query: &str| crate::jq::parse(query).unwrap();
+        for bare in ["..", "(..)", "recurse", "recurse(.[]?)", "((recurse))"] {
+            let expr = stage(bare);
+            assert!(path_expr_is_bare_descent(&expr), "{bare}");
+            assert!(!path_expr_is_cursor_navigable(&expr), "{bare}");
+            assert!(!array_route_stage_is_pure_navigation(&expr), "{bare}");
+        }
+        for other in [
+            ".a | ..",
+            ".. | .a?",
+            "(..)?",
+            "(.a, ..)",
+            "recurse(.a)",
+            "recurse(.[]; . != 1)",
+            "recurse(.[]?; true)",
+            ".. | length",
+            "walk(.)",
+            ".",
+            ".[]",
+        ] {
+            assert!(!path_expr_is_bare_descent(&stage(other)), "{other}");
         }
     }
 

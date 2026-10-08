@@ -28438,9 +28438,10 @@ fn count_elements<W: Clone + AsRef<[u64]>>(
 /// A document nested too deep for the queries that walk it returns
 /// `nesting depth exceeds limit of N` as a [`QueryResult::Error`]: `paths`,
 /// `leaf_paths` and the cursor-native `path(f)` walkers answer up to 383
-/// levels (N is 384), while the forms that materialize the document first
-/// (`path(..)`, `path(recurse(f; c))`, `paths(f)`, `path(getpath(p))`, among
-/// others) stop at 255 (N is 256). The error is tagged as a decode failure, so a `try` in the
+/// levels (N is 384), as do a bare `path(..)`, `path(recurse)` and `path(recurse(.[]?))` over
+/// the input document (#3850), while the forms that materialize the document first
+/// (`path(recurse(f; c))`, `paths(f)`, `path(getpath(p))`, a descent inside a larger path
+/// expression, or a bare `path(..)` over a computed value, among others) stop at 255 (N is 256). The error is tagged as a decode failure, so a `try` in the
 /// filter does not swallow it, and it is a return value, not an unwinding
 /// panic. The evaluator this entry used before #3457 answered all of these up
 /// to 384 levels; the materializing forms stay at 256 because the
