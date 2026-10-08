@@ -190,6 +190,46 @@ fn test_bare_scalar_document_trailing_comment_is_its_foot_2821() -> Result<()> {
     Ok(())
 }
 
+/// Pinned yq v4.53.3: a mapping entry whose key is non-scalar is addressed by the `""` yq
+/// collapses that key to, so `.[""]` reads its value (#2822). A real `""` key and a second
+/// non-scalar key are matched the same way, last one winning. Rows captured from the pinned
+/// binary; `.[""] | key` (the key node itself) is a recorded residual, not asserted here.
+#[test]
+fn test_non_scalar_mapping_key_is_addressed_by_the_empty_string_2822() -> Result<()> {
+    let args = &["-o=json", "-I=0"];
+    for (input, filter, expected) in [
+        ("? - a\n  - b\n: v\nb: 2\n", r#".[""]"#, "\"v\"\n"),
+        ("? - a\n  - b\n: v\nb: 2\n", r#".[""]?"#, "\"v\"\n"),
+        ("? - a\n  - b\n: v\nb: 2\n", r#"[.[""]]"#, "[\"v\"]\n"),
+        ("? - a\n  - b\n: v\nb: 2\n", r#".[("","b")]"#, "\"v\"\n2\n"),
+        (
+            "? - a\n  - b\n: v\nb: 2\n",
+            r#".[""] | type"#,
+            "\"!!str\"\n",
+        ),
+        (
+            "? - a\n  - b\n: v\nb: 2\n",
+            r#".[""] = 9"#,
+            "{\"\":9,\"b\":2}\n",
+        ),
+        ("? - a\n  - b\n: v\nb: 2\n", r#"del(.[""])"#, "{\"b\":2}\n"),
+        (
+            "? - a\n  - b\n: v\n? {x: 1}\n: w\nb: 2\n",
+            r#".[""]"#,
+            "\"w\"\n",
+        ),
+        ("\"\": real\n? [1]\n: cx\n", r#".[""]"#, "\"cx\"\n"),
+        ("? - a\n: v\n", ".x", "null\n"),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, input, args)?,
+            (expected.into(), String::new(), 0),
+            "{input:?} | {filter}"
+        );
+    }
+    Ok(())
+}
+
 /// #3479: after a write (or `-R`, `--slurp`) `succinctly yq` evaluates a
 /// value it re-indexed into throwaway JSON text, so `line`/`column` answer the
 /// fixed default `0` there, never a position inside that text. Real yq 4.53.3
