@@ -55932,6 +55932,163 @@ fn limit_over_a_pipe_body_stops_the_stages_after_the_bound_3514() -> Result<()> 
     Ok(())
 }
 
+/// #4014: #3514 stopped a `first`/`limit` *pipe* body at its bound, but two
+/// stages of the `key` walk still collected before delivering: a parenthesised
+/// pipe that is itself a stage, and a `try`/`?` wrapper. So `first(try (.[] |
+/// C))` ran `C` at every element, as did `limit(1; .[] | (.[]? | C))` and
+/// `first(.. | (.[]? | C))`. Each now streams, with a stop reaching the stage
+/// (`try` still catches only its own body's errors). `..` itself has no side
+/// effect to over-run, so it needed nothing.
+///
+/// Every row is jq 1.7.1's `path(...) | last` (`key` is a succinctly extension),
+/// captured whole, so the side-effect count is pinned on stderr as well as stdout.
+#[test]
+fn bounded_walk_stops_nested_pipe_try_and_recursion_stages_at_the_bound_4014() -> Result<()> {
+    let flat = r#"{"a":[1,2,3]}"#;
+    let nested = r#"{"a":[[1,2],[3]]}"#;
+    let tree = r#"{"a":{"x":1,"y":[2]}}"#;
+    for (input, filter, want_out, want_err, want_code) in [
+        // A parenthesised pipe as a stage.
+        (
+            nested,
+            r#".a | limit(1; .[] | (.[]? | if ("B"|stderr) then . else . end)) | key"#,
+            "0\n",
+            "B",
+            0,
+        ),
+        (
+            nested,
+            r#".a | first(.[] | (.[]? | if ("B"|stderr) then . else . end)) | key"#,
+            "0\n",
+            "B",
+            0,
+        ),
+        // `try` and `?` wrappers.
+        (
+            flat,
+            r#".a | first(try (.[] | if ("A"|stderr) then . else . end)) | key"#,
+            "0\n",
+            "A",
+            0,
+        ),
+        (
+            flat,
+            r#".a | first((.[] | if ("A"|stderr) then . else . end)?) | key"#,
+            "0\n",
+            "A",
+            0,
+        ),
+        (
+            flat,
+            r#".a | limit(2; try (.[] | if ("A"|stderr) then . else . end)) | key"#,
+            "0\n1\n",
+            "AA",
+            0,
+        ),
+        // `..`.
+        (
+            tree,
+            r#".a | first(.. | (.[]? | if ("B"|stderr) then . else . end)) | key"#,
+            "\"x\"\n",
+            "B",
+            0,
+        ),
+        (
+            tree,
+            r#".a | first(.. | if ("B"|stderr) then . else . end) | key"#,
+            "\"a\"\n",
+            "B",
+            0,
+        ),
+        // A `try` whose body fails part-way, under an outer pipe with a side
+        // effect: the positions before the error reach the later stages first.
+        (
+            flat,
+            r#".a | try (.[] | if . == 2 then error("E") else . end) | if ("D"|stderr) then . else . end | key"#,
+            "0\n",
+            "D",
+            0,
+        ),
+        // Must not move: a bound met exactly reads every position it asked for,
+        // `limit(0; ..)` never evaluates the body, and a `try` still swallows
+        // its own body's error after the positions before it.
+        (
+            flat,
+            r#".a | limit(3; try (.[] | if ("A"|stderr) then . else . end)) | key"#,
+            "0\n1\n2\n",
+            "AAA",
+            0,
+        ),
+        (
+            flat,
+            r#".a | limit(0; try (.[] | if ("A"|stderr) then . else . end)) | key"#,
+            "",
+            "",
+            0,
+        ),
+        (
+            flat,
+            r#".a | limit(5; try (.[] | if . == 2 then error("E") else . end)) | key"#,
+            "0\n",
+            "",
+            0,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (want_out, want_err, want_code),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
+/// #4014 review: a `try ... catch` under a `first`/`limit` bound. jq rejects a
+/// path through a catch handler's output (`Invalid path expression`), so there
+/// is no oracle; these rows pin succinctly's own answer, which the streaming
+/// `try` has to leave exactly as the collecting one gave it -- the handler's
+/// outputs stand at the `try`'s own position, a stop in the middle of them
+/// drops the handler's later error, and an unbounded read raises it.
+#[test]
+fn bounded_walk_keeps_the_try_catch_handler_answers_4014() -> Result<()> {
+    let flat = r#"{"a":[1,2,3]}"#;
+    for (filter, want_out, want_err, want_code) in [
+        (
+            r#".a | first(try (.[] | error("x")) catch .) | key"#,
+            "\"a\"\n",
+            "",
+            0,
+        ),
+        (
+            r#".a | first(try error("x") catch (1, error("y"))) | key"#,
+            "\"a\"\n",
+            "",
+            0,
+        ),
+        (
+            r#".a | limit(5; try error("x") catch (1, error("y"))) | key"#,
+            "\"a\"\n",
+            "jq: error (at <stdin>:0): y\n",
+            5,
+        ),
+        (
+            r#".a | first(try (.[] | if ("A"|stderr) then error("x") else . end) catch (.|stderr)) | key"#,
+            "\"a\"\n",
+            "Ax",
+            0,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(flat))?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (want_out, want_err, want_code),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
 /// #3651: a `?//` chain in a fold **source** that destructures a freshly built value
 /// runs jq's *next* alternative, not the first, in path position.
 ///

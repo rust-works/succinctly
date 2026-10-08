@@ -53004,6 +53004,56 @@ fn test_yq_jq_extensions_bounded_pipe_stops_at_the_bound_3514() -> Result<()> {
     Ok(())
 }
 
+/// #4014: the `key` walk's nested pipe, `try` and `..` stages stream into a
+/// `first`/`limit`, behind `--jq-extensions` in yq mode (an extension follows
+/// jq, ADR-0018). The computed-bracket rollback is untouched: a bracket whose
+/// component stream raises part-way inside a `try` still reports through the
+/// `try`, with none of the positions it had indexed.
+#[test]
+fn test_yq_jq_extensions_bounded_walk_streams_try_and_nested_pipes_4014() -> Result<()> {
+    let flat = "a:\n  - 1\n  - 2\n  - 3\n";
+    let nested = "a:\n  - [1, 2]\n  - [3]\n";
+    for (yaml, filter, want_out, want_err, want_code) in [
+        (
+            flat,
+            r#".a | first(try (.[] | if ("A"|stderr) then . else . end)) | key"#,
+            "0\n",
+            "A",
+            0,
+        ),
+        (
+            nested,
+            r#".a | limit(1; .[] | (.[]? | if ("B"|stderr) then . else . end)) | key"#,
+            "0\n",
+            "B",
+            0,
+        ),
+        (
+            nested,
+            r#".a | first(.. | if ("C"|stderr) then . else . end) | key"#,
+            "\"a\"\n",
+            "C",
+            0,
+        ),
+        (
+            nested,
+            r#".a | first(try .[(0, error("x"))] catch "caught") | key"#,
+            "\"a\"\n",
+            "",
+            0,
+        ),
+    ] {
+        let (stdout, stderr, code) =
+            run_yq_stdin_with_stderr(filter, yaml, &["--jq-extensions", "-o=json", "-I0"])?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (want_out, want_err, want_code),
+            "`{filter}`"
+        );
+    }
+    Ok(())
+}
+
 /// #2607 / #2663: the streaming YAML->JSON writer kept its own copy of yq's
 /// string escaper, which never learned the U+2028/U+2029 escaping #1982 gave the
 /// shared one, so `-o json` wrote a separator that arrived as a raw UTF-8 byte
