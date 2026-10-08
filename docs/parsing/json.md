@@ -508,7 +508,7 @@ Reading an element of a document array (`.users[0]`, `.[5]`, `$root.nodes[.from]
 
 `src/jq/array_index.rs` adds a per-array `ElementIndex`: the node id of every element, built by the same walk `len_checked` makes with the same checks, so the length is the number of ids and element `k` is the node `ids[k]` names. **Every anomaly refuses the build** and the caller runs the walk, which raises what it always raised (and an array whose walk raises is never registered at all: only a walk that succeeded registers one). A walk of 64 or more elements registers the array, the second length lookup walks again and counts, and the **third** builds; an element read uses an existing index but never builds one. Building on the second made an array read exactly twice slower than the two walks it replaced (+4.7% / +8.7% on `.[] | [.[3], .[4]]` over 20,000 hundred-element arrays), because an index costs one walk plus the ids. The memo lives inside the same evaluation scope as `key_index`'s (a `document_token` is not a security boundary), keeps at most four indexes and 2^21 elements, remembers a refusal and an eviction, and does not exist under `no_std`. `length`, `last`, `keys`, `has`, `.[N]`, `.[$k]` and `getpath` read through it; the slice and the `path()` walks keep the walk.
 
-Release, `ab-cli.py` interleaved, output identity gated on every row, a control run per box in the same session (floor within -0.7%..+0.9% of 0), base `36f8582c0` vs the shipped commit:
+Release, `ab-cli.py` interleaved, output identity gated on every row, a control run per box in the same session (every control row within -1.7%..+0.9%), base `36f8582c0` vs the shipped commit:
 
 | row                                                       | 7950X (min)       | M4 Pro (min)      |
 |-----------------------------------------------------------|-------------------|-------------------|
@@ -517,12 +517,12 @@ Release, `ab-cli.py` interleaved, output identity gated on every row, a control 
 | `[.[range(0;300)]] \| length`, one 1M-element array       | 4.28 s -> 71 ms   | 3.23 s -> 52 ms   |
 | `.[] \| [.[3], .[4], .[5], .[6]]`, 20,000 arrays of 100   | -13.4%            | -15.6%            |
 | `.[] \| [.[3], .[4]]` (read twice: the worst case)        | +3.3%             | -0.7%             |
-| `.users[100]`, `.users \| length`, `.users[-1]`, `last` (10 and 26 MB, read once) | +0.2%..+2.3% | -3.0%..-0.6% |
+| `.users[100]`, `.users \| length`, `.users[-1]`, `last` (10 and 26 MB, read once) | -0.7%..+2.3%  | -3.0%..+0.8%  |
 | `.[100]`, `length`, `last`, `.[-1]` on one 1M-element array | +0.4%..+2.2%    | -5.0%..-2.5%      |
 
 Growth: 0.7 MB to 2.8 MB (4x the records) multiplies the base by 16x and the change by 3.7x. Instructions (7950X cachegrind `Ir`, M4 Pro `time -l` instructions retired, min of 3), base vs shipped: every single-read row is +0.00% to +0.29%, the twice-read row +1.45% / +1.68% (registering 20,000 arrays), `[.[] | length] | add` +0.74% / +0.98%, the four-read row -16.9% / -15.4%. Cache misses and branch mispredicts (cachegrind with `--cache-sim=yes --branch-sim=yes`, `.users | length`, 7 MB): identical to 0.01%.
 
-**The 7950X wall-clock on the single-read rows is placement, not cost, and moves with the build.** Three builds of near-identical source read +2.1%, +2.4% and +0.8% (median) on `.users | length`-shaped rows at the same `Ir`, while the M4 Pro reads -1.5% (median -1.4% to -1.6% on both builds); a holdout build of the same tree whose memo is behind `black_box(false)` read +0.15% beside a `new` at +2.4% in the same session. This is the function-placement band `docs/guides/benchmarking.md` § 9 describes; it is recorded rather than chased.
+**The 7950X wall-clock on the single-read rows is placement, not cost, and moves with the build.** Four builds of near-identical source read +1.0%, +2.1%, +2.4% and +0.8% (median of the 14 single-read rows) at the same `Ir`, while the M4 Pro reads -1.4%, -1.4% and -1.5% on the three it was given; a holdout build of the same tree whose memo is behind `black_box(false)` read +0.15% beside a `new` at +2.4% in the same session. This is the function-placement band `docs/guides/benchmarking.md` § 9 describes; it is recorded rather than chased.
 
 Pinned by `array_index::tests` (the index agrees with the walk at every index and past the end, refuses what the walk raises on, builds on the third length lookup and never on an element read, never registers a small or malformed array, never answers a partly consumed list from the whole array's index) and `wide_document_array_reads_agree_with_jq_across_repeated_reads_4035`, whose rows are jq 1.7.1's.
 
