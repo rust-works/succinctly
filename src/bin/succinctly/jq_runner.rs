@@ -8142,6 +8142,19 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
         None
     };
 
+    // #3909: a cursor whose source text is already the compact record needs no
+    // render and so no buffer -- the scan that certified it is the validation
+    // the buffer exists to wait for (#3265), and nothing after it can fail.
+    // Without this a node the M2 path echoes straight out of the document
+    // (`.users`) cost 2.5x that and a second copy of itself in memory here.
+    if !is_raw_record(&as_str, config) {
+        if let Some(span) = echoable_span(value, config, 0) {
+            write_output_raw_prologue(out, as_str, config)?;
+            out.write_all(span.as_bytes())?;
+            return write_terminator(out, config);
+        }
+    }
+
     // #3265: a JSON body is rendered into `scratch` in full, and only copied
     // to `out` once it has rendered without error. `print_json` checks each
     // container's structure before writing its opening bracket, but a
@@ -8161,19 +8174,6 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
     // already decoded, so nothing after the NUL check can fail.
     // `write_terminator` stays on `out`, so `--unbuffered` still flushes
     // once per record.
-    // #3909: a cursor whose source text is already the compact record needs no
-    // render and so no buffer -- the scan that certified it is the validation
-    // the buffer exists to wait for (#3265), and nothing after it can fail.
-    // Without this a node the M2 path echoes straight out of the document
-    // (`.users`) cost 2.5x that and a second copy of itself in memory here.
-    if !is_raw_record(&as_str, config) {
-        if let Some(span) = echoable_span(value, config, 0) {
-            write_output_raw_prologue(out, as_str, config)?;
-            out.write_all(span.as_bytes())?;
-            return write_terminator(out, config);
-        }
-    }
-
     scratch.clear();
     let written = (|| {
         if !is_raw_record(&as_str, config) {
@@ -8193,15 +8193,25 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
     written
 }
 
+/// Whether a record is written by the streaming writers (`print_json`,
+/// `print_owned_json`) rather than materialized and handed to `format_json`:
+/// `-S`, `-C` and `-a` each need the whole value (#2662). The one fork
+/// [`render_json_body`], [`write_output_owned_value`] and [`echoable_span`]
+/// all take, so a flag added to it reaches all three (#3909).
+fn writes_lazily(config: &OutputConfig) -> bool {
+    !config.sort_keys && !config.color_output && !config.ascii_output
+}
+
 /// The source text of a cursor-backed `value` when the compact jq-compat
 /// render would write exactly those bytes (#3909), or `None` when it would
 /// not, the config rules a verbatim span out, or `value` is not a cursor.
 ///
 /// The decision `JsonCursor::stream_json` makes for the M2 fast path, made
 /// for the general path's printer. The config half mirrors
-/// [`render_json_body`]'s own fork: `-S`/`-C`/`-a` and a source-preserving
-/// convention each leave `print_json`, and a non-compact layout needs
-/// whitespace the source does not have. `depth` is the level the value is
+/// [`render_json_body`]'s own fork ([`writes_lazily`]), narrowed to what a
+/// verbatim span can stand in for: a source-preserving convention is not this
+/// writer, and a non-compact layout needs whitespace the source does not
+/// have. `depth` is the level the value is
 /// printed at, so the scan refuses the same over-deep documents `print_json`
 /// does.
 fn echoable_span<'a, Wrd: Clone + AsRef<[u64]>>(
@@ -8212,9 +8222,7 @@ fn echoable_span<'a, Wrd: Clone + AsRef<[u64]>>(
     let JqValue::Cursor(cursor) = value else {
         return None;
     };
-    if config.sort_keys
-        || config.color_output
-        || config.ascii_output
+    if !writes_lazily(config)
         || config.convention.preserves_source_values()
         || !(config.compact || config.indent_string.is_empty())
     {
@@ -8258,7 +8266,7 @@ fn render_json_body<Wrd: Clone + AsRef<[u64]>>(
     // mode, and still validates only the value being printed, not the rest
     // of the document -- the same "materializes what it reads" rule this
     // issue is generalizing to `-S`/`-C` above.
-    if !config.sort_keys && !config.color_output && !config.ascii_output {
+    if writes_lazily(config) {
         if config.convention.preserves_source_values() {
             print_json(
                 out,
@@ -8461,7 +8469,7 @@ fn write_output_owned_value<Out: Write>(
     // Same static `if` over two monomorphisations as the lazy sibling, and
     // for the same reason (#2874/#2603): this is the default `-c` route and
     // a vtable call in its per-scalar inner loop is not worth buying.
-    if !config.sort_keys && !config.color_output && !config.ascii_output {
+    if writes_lazily(config) {
         if config.convention.preserves_source_values() {
             print_owned_json(out, value, &PreserveFormatter, config, 0)?;
         } else {

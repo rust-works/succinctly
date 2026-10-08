@@ -114706,7 +114706,7 @@ fn test_cursor_printed_inside_a_lazy_array_echoes_or_rerenders_3909() -> Result<
             "{\"k\":{\"x\":[1,2,{\"y\":\"z\"}]}}\n",
         ),
         // A number jq respells (`1e2` -> `1E+2`), a duplicate key (collapsed
-        // to the last value) and an escape jq writes raw (`A` -> `A`):
+        // to the last value) and an escape jq writes raw (`\u0041` -> `A`):
         // each refuses the echo and is re-rendered.
         ("[.b]", &["-c"][..], "[{\"n\":1.0,\"m\":1E+2}]\n"),
         ("[.b] | .[0]", &["-c"][..], "{\"n\":1.0,\"m\":1E+2}\n"),
