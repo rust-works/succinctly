@@ -11004,16 +11004,18 @@ fn projection_peel<S: EvalSemantics>(
     let [first, rest @ ..] = skip_identity_stages(stages) else {
         return None;
     };
-    if rest.is_empty() {
-        return None;
-    }
     let first = unwrap_paren(first);
     // A chained head (`.a.b | ...`) parses as one nested pipe: flatten it one
-    // level, as `embed_peel_step` does, so its first step is visible.
+    // level, as `embed_peel_step` does, so its first step is visible. Before the
+    // `rest` check on purpose (#4052): a lone `.r.users[0].id` is the pipe's one
+    // stage, with nothing behind it, and its own stages are what navigate.
     if let Expr::Pipe(inner) = first {
         let mut flat = inner.clone();
         flat.extend_from_slice(rest);
         return projection_peel::<S>(&Expr::Pipe(flat), input, optional, reentry, sink);
+    }
+    if rest.is_empty() {
+        return None;
     }
     // #3477: a leading `length` steps to the count, then the rest runs on it.
     let counted = eval_owned_length(first, input);
@@ -107391,6 +107393,56 @@ mod tests {
         assert!(run(".i | select(true)", &array, Reentry::REBUILT).is_none());
         assert!(run(".i", &input, Reentry::REBUILT).is_none());
         assert!(run(".i | select(true)", &input, Reentry::Proven).is_none());
+    }
+
+    /// #4052: a pipe whose one stage is a nested pipe -- the rest `{r: $x} |
+    /// .r.users[0].id` hands back, `.r.users[0].id` being a pipe of its own --
+    /// is flattened before the "nothing behind the first stage" check, so its
+    /// own stages navigate. The check ran first and declined it, which sent
+    /// the whole owned object (a 63 KB bound value, per element) through the
+    /// reindex bridge to read one field.
+    #[test]
+    fn projection_peel_flattens_a_lone_nested_pipe_4052() {
+        let json: &[u8] = br#"{"r":{"users":[{"id":7,"n":"x"},{"id":8}]},"z":1}"#;
+        let index = JsonIndex::build(json);
+        let input = to_owned::<JqSemantics, _>(&index.root(json).value()).unwrap();
+        let lone = |filter: &str| {
+            let inner = parse(filter).unwrap();
+            Expr::Pipe(vec![inner].into())
+        };
+        let run = |expr: &Expr| {
+            let mut out = Vec::new();
+            let flow =
+                projection_peel::<JqSemantics>(expr, &input, false, Reentry::REBUILT, &mut |v| {
+                    out.push(v);
+                    Demand::Continue
+                });
+            flow.map(|flow| (flow, out))
+        };
+        for (filter, expected) in [
+            (".r.users[0].id", "7"),
+            (".r.users[1].id", "8"),
+            (".r.users[0]", "{\"id\":7,\"n\":\"x\"}"),
+            (".r.users | length", "2"),
+        ] {
+            let expr = lone(filter);
+            let (flow, out) = run(&expr).unwrap_or_else(|| panic!("{filter}: declined"));
+            assert!(matches!(flow, Flow::Exhausted), "{filter}");
+            assert_eq!(out.len(), 1, "{filter}");
+            assert_eq!(out[0].to_json(), expected, "{filter}");
+            // The value the whole re-entry (the bridge) answers.
+            let mut bridged = Vec::new();
+            let _ =
+                eval_each_owned::<JqSemantics>(&expr, &input, false, Reentry::REBUILT, &mut |v| {
+                    bridged.push(v);
+                    Demand::Continue
+                });
+            assert_eq!(out[0].to_json(), bridged[0].to_json(), "{filter}");
+        }
+        // Still declined: a single navigation has nothing to peel, and a path
+        // reader stays the bridge's.
+        assert!(run(&lone(".r")).is_none());
+        assert!(run(&lone(".r.users[0] | key")).is_none());
     }
 
     /// The door's answer for `filter` over `input`, in the shape
