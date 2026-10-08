@@ -804,6 +804,7 @@ nested-fold-frozen-foreach-in-foreach-extract-del	{"a":{"b":1,"c":[1,2]},"z":0}	
 nested-fold-frozen-foreach-in-foreach-extract-assign	{"a":{"b":1,"c":[1,2]},"z":0}	(foreach .a as $v ([3,1,2]; (($v | .b?), 1); try (foreach 1 as $i ($v; .; .b)))) = 9
 nested-fold-frozen-foreach-in-foreach-extract-path	{"a":{"b":1,"c":[1,2]},"z":0}	[path(foreach .a as $v ([3,1,2]; (($v | .b?), 1); try (foreach 1 as $i ($v; .; .b))))]
 nested-fold-frozen-reduce-in-foreach-extract-del	{"a":{"b":1,"c":[1,2]},"z":0}	del(foreach .a as $v ([3,1,2]; (($v | .b?), 1); try (reduce 1 as $i ($v; .b))))
+nested-fold-frozen-source-loop-var-navigated-del	{"a":{"b":1,"c":[1,2]},"z":0}	del(foreach .a as $v ([3,1,2]; (($v | .b?), 1); try (reduce $v as $i (0; $i.b))))
 owned-embed-agree-array-element	{"a":1}	. as $x | [.] | .[0] | path($x)
 owned-embed-refuse-path-nested-embed	{"a":1}	. as $x | [.] | path(.[0] | $x)
 owned-embed-path-nested-multi-first	{"a":1}	. as $x | [.,.] | path(.[0] | $x)

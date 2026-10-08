@@ -2782,7 +2782,10 @@ is the revert that established what the other one costs.
    (0; .; try ($y \| .b)))` is `{"a":{}}` in jq and echoed the document here); since
    [#3984](https://github.com/rust-works/succinctly/issues/3984) a fold that mentions a frozen
    variable and whose register is untracked records the register as lost, so a refusal of a frozen value the step
-   could have navigated is the loud guess of #3267 and the program refuses. Two refuse-only residuals,
+   could have navigated is the loud guess of #3267 and the program refuses. The cost, in the safe direction: over
+   `scripts/jq-nested-fold-frozen-var-sweep.py` (2,673 rows) `main` had 441 ACCEPT_WRONG and 252 DIFF rows and the build
+   has none, 399 more rows match jq, and 42 rows that matched jq by accident (a `del` of a key the document does not
+   have, behind a refused `try`) now refuse. Two refuse-only residuals,
    both in the sweep: `path(.a \| try error(.) catch .)` —
    `error(.)` raises the register node itself and jq answers `["a"]`, but a payload equal to
    the register by value cannot be told from a rebuilt copy (`error({"a":1,"b":2})` refuses in

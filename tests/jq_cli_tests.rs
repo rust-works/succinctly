@@ -64161,8 +64161,8 @@ fn test_fold_pattern_step_that_never_succeeds_retries_3998() -> Result<()> {
 /// the program refuses (exit 5) where jq writes -- the recorded safe direction -- and where jq
 /// refuses too (`reduce`) the exit codes agree. Controls: a fold at the register, and one
 /// sitting off it, which jq refuses inside the `try`, are unchanged. Every jq side captured
-/// from jq 1.7.1. **Not covered**: `reduce $v as $i (0; $i.b)` as the nested fold, a different
-/// route (a bound pattern variable navigated by a static tail), which still echoes.
+/// from jq 1.7.1. `reduce $v as $i (0; $i.b)` (#4008, which navigates the loop variable through a
+/// static tail) takes the same route: the `$v` SOURCE is the mention.
 #[test]
 fn test_nested_fold_over_frozen_var_with_untracked_register_stays_loud_3984() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -64204,6 +64204,27 @@ fn test_nested_fold_over_frozen_var_with_untracked_register_stays_loud_3984() ->
         (
             r#"{"a":{"b":1,"c":[1,2]},"z":0}"#,
             r"del(foreach .a as $v ([3,1,2]; (($v | .b?), 1); try (reduce 1 as $i ($v; .b))))",
+            "",
+            r#"Invalid path expression near attempt to access element "b""#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1,"c":[1,2]},"z":0}"#,
+            r#"del(foreach .a as $v ([3,1,2]; (($v | .b?), 1); try (reduce $v as $i (0; $i.b))))"#,
+            "",
+            r#"Invalid path expression near attempt to access element "b""#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1,"c":[1,2]},"z":0}"#,
+            r#"(foreach .a as $v ([3,1,2]; (($v | .b?), 1); try (reduce $v as $i (0; $i.b)))) = 9"#,
+            "",
+            r#"Invalid path expression near attempt to access element "b""#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1,"c":[1,2]},"z":0}"#,
+            r#"[path(foreach .a as $v ([3,1,2]; (($v | .b?), 1); try (reduce $v as $i (0; $i.b))))]"#,
             "",
             r#"Invalid path expression near attempt to access element "b""#,
             5,
