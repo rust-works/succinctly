@@ -5412,6 +5412,87 @@ run peaked at 317 MB.
 
 ---
 
+## O9: Resume the Slot Scan for YAML — Accepted ✅
+
+**Issue**: #2784 (`key`/`path`/`parent` read once per member of a wide mapping or sequence
+were quadratic).
+
+### What was slow
+
+`cursor_slot` answers "where does this node sit in its parent" by scanning the parent's
+members from the first until one matches. A query that reads `key` or `path` at every member
+of an `n`-member parent therefore visits `n(n-1)/2` of them. JSON stopped doing this in
+#3702/#3839: a format that sets `DocumentCursor::RESUMABLE_ELEMENT_SCAN` and answers
+`next_element` lets the scan resume from the member the last one found. YAML opted out because
+its block-sequence items are unwrapped from their `-` nodes and are not siblings of each other.
+
+### The change
+
+`YamlCursor` sets `RESUMABLE_ELEMENT_SCAN` and answers `next_element`, `tree_depth` and
+`subtree_end`. `next_element` is the sibling, unwrapped exactly as `YamlElements::uncons_cursor`
+unwraps it: from a block-sequence item (the first child of its `-` node) or from the `-` node
+itself (a bare `-`) it hops to the next `-` node and unwraps that; for a mapping's key and value
+nodes it is the plain next sibling, which is the chain `YamlFields::uncons` walks for a mapping
+without merge keys. A merged mapping lists fewer members than it has children; the resume then
+misses a node the full scan finds, and the full scan decides (`member_slot_resumable` and
+`element_slot_resumable` both fall back to it), so the answer is the full scan's either way.
+
+### Measured (release, `[.[] | key | path] | length`, `kN: N` mapping / `- N` sequence)
+
+M5 Max, one run each:
+
+| input      | 5k keys | 10k keys | 20k keys | 40k keys |
+|------------|---------|----------|----------|----------|
+| mapping, before | 2.84 s | 11.89 s | 47.72 s | 200.02 s |
+| mapping, after  | 0.02 s | 0.04 s  | 0.07 s  | 0.16 s   |
+| sequence, before | 0.59 s | 2.31 s | 9.86 s  | 36.27 s  |
+| sequence, after  | 0.01 s | 0.01 s | 0.01 s  | 0.02 s   |
+
+Interleaved A/B (`scripts/ab-cli.py`, 5 repetitions, output identity 12/12 on both),
+medians, `before` -> `after`:
+
+| input (query)                              | Apple M4 Pro              | AMD Ryzen 9 7950X         |
+|--------------------------------------------|---------------------------|---------------------------|
+| map 2000 (`key \| path`)                   | 492.5 ms -> 9.7 ms (-98.0%) | 756.6 ms -> 11.8 ms (-98.4%) |
+| map 4000                                   | 1944 ms -> 16.6 ms (-99.1%) | 3020 ms -> 21.2 ms (-99.3%)  |
+| map 8000                                   | 7803 ms -> 30.3 ms (-99.6%) | 12071 ms -> 40.4 ms (-99.7%) |
+| seq 2000                                   | 109.2 ms -> 4.3 ms (-96.1%) | 158.0 ms -> 3.3 ms (-97.9%)  |
+| seq 4000                                   | 412.9 ms -> 5.8 ms (-98.6%) | 623.8 ms -> 4.8 ms (-99.2%)  |
+| seq 8000                                   | 1607 ms -> 7.3 ms (-99.5%)  | 2481 ms -> 7.5 ms (-99.7%)   |
+
+Doubling the input now costs about 2x (9.7 -> 16.6 -> 30.3 ms and 11.8 -> 21.2 -> 40.4 ms for
+the mapping), where it cost 4x. `select(key == "k5" or key == 5)` over the same files moves the
+same way (-97.9% to -99.7%).
+
+**Holdouts** (inputs of 100,000 members, >= 1 MB; the walk route does not call the scan, so
+these should not move): `[.[] | key | line]`, `.` and `[.[]] | length` on a mapping and a
+sequence, median of medians +0.16% on the M4 Pro and +0.72% on the 7950X against a control of
+-0.2% and -1.2%; the largest single row is +1.9% (ARM) and +1.4% (x86_64) with signs that
+change from row to row.
+
+`[.[] | parent | length] | length` stays quadratic: that is #2574's materialization of the
+parent, not this scan.
+
+### Tests
+
+`next_element_walks_the_element_and_member_chains_2784` (`src/yaml/light.rs`) compares the
+`next_element` chain with `uncons_cursor`'s and `YamlFields::uncons`'s for every container of
+a document holding bare `-` items, nested sequences, comments, flow items, explicit keys and
+empty values. `test_yaml_sequence_slots_resume_the_scan_2784` and
+`test_yaml_member_slots_resume_the_scan_2784` (`src/jq/eval_generic.rs`) pin the work: about
+`n` visits over `n` members, with the answers checked per position (the first replaces #3702's
+"a YAML sequence takes the scan from the start" pin). `test_yaml_key_and_path_per_member_resume_the_scan_2784`
+(`tests/yq_cli_tests.rs`) checks `key`/`path` over 90-member mappings and sequences of irregular
+shape and a merged mapping, in order and skipping.
+
+### Files Modified
+
+- `src/yaml/light.rs` — `YamlCursor`: `RESUMABLE_ELEMENT_SCAN`, `next_element`, `tree_depth`,
+  `subtree_end`
+- `src/jq/eval_generic.rs`, `tests/yq_cli_tests.rs` — tests
+
+---
+
 ## See Also
 
 - [YamlIndex wiki page](yaml-index.md) — concept overview, dependencies, and academic references
