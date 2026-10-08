@@ -44975,10 +44975,19 @@ impl FoldRegister {
     /// never moved off the document root, despite INIT computing `0`),
     /// but `path(. as $x | reduce (1,2) as $i (.a; $x))` raises (INIT's
     /// own navigation moved the register off `$x`'s frozen position).
+    ///
+    /// **#4013: INIT that navigated and then computed.** `.a | tostring` leaves jq's
+    /// register on `.a` (a computed value moves nothing, the navigation before it did), and
+    /// the branch it hands back is untracked, so the ambient `trackable` describes a
+    /// register that is no longer where the fold entered. `init_keeps_register` is whether
+    /// INIT *cannot* have moved it ([`cannot_move_register`]); when it can, the untracked
+    /// arm seeds an untrackable register, so a pattern walking from it refuses instead of
+    /// walking from the root and writing through the wrong node.
     fn enter(
         init_branch: &PathBranch<'_>,
         value: &OwnedValue,
         trackable: bool,
+        init_keeps_register: bool,
         frame: &Frame,
     ) -> (Self, OwnedValue) {
         let acc = init_branch.value.clone().into_owned();
@@ -44993,7 +45002,7 @@ impl FoldRegister {
             Self {
                 path: PathPrefix::root(),
                 value: value.clone(),
-                trackable,
+                trackable: trackable && init_keeps_register,
                 frame: frame.clone(),
             }
         };
@@ -49493,6 +49502,8 @@ fn resolve_reduce<'a, S: EvalSemantics>(
     let mentions_frozen_var =
         S::TAG == EvalTag::Jq && fold_mentions_frozen_var(patterns, &[input, init, update]);
     let slice_ok = fold_slice_ok(patterns, input);
+    // #4013: see `FoldRegister::enter`. Jq mode only, like every register admission here.
+    let init_keeps_register = S::TAG != EvalTag::Jq || cannot_move_register(init);
     // #3780: whether UPDATE navigates the accumulator on a path that always runs --
     // syntactic, so decided once, not per source element
     // ([`reduce_update_at_register`]).
@@ -49564,7 +49575,8 @@ fn resolve_reduce<'a, S: EvalSemantics>(
             fork_index += 1;
             i
         };
-        let (mut reg, acc) = FoldRegister::enter(init_branch, value, trackable, frame);
+        let (mut reg, acc) =
+            FoldRegister::enter(init_branch, value, trackable, init_keeps_register, frame);
         if mentions_frozen_var {
             reg.withhold_untracked_register(); // #3984
         }
@@ -50006,6 +50018,8 @@ fn resolve_foreach<'a, S: EvalSemantics>(
     // The leaf states it on every untracked emission; the stage then takes the
     // stricter of that and its own verdict. A trackable entry only: an untracked
     // one carries its register on the stage.
+    // #4013: see `FoldRegister::enter`. Jq mode only, like every register admission here.
+    let init_keeps_register = S::TAG != EvalTag::Jq || cannot_move_register(init);
     let register_unmoved = S::TAG == EvalTag::Jq
         && trackable
         && foreach_cannot_move_register(patterns, input, init, update, extract);
@@ -50083,7 +50097,8 @@ fn resolve_foreach<'a, S: EvalSemantics>(
             fork_index += 1;
             i
         };
-        let (mut reg, mut state) = FoldRegister::enter(init_branch, value, trackable, frame);
+        let (mut reg, mut state) =
+            FoldRegister::enter(init_branch, value, trackable, init_keeps_register, frame);
         if mentions_frozen_var {
             reg.withhold_untracked_register(); // #3984
         }

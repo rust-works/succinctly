@@ -362,6 +362,14 @@ OPERANDS = [
     # refusal is jq's own verdict, for `foreach` as for `reduce`.
     "(foreach . as {(\"a\"):$a} ?// $a (0; .; .))",
     "(reduce . as {(\"a\"):$a} ?// {(\"b\"):$a} ?// $a (0; .))",
+    # (#4013) a fold INIT that navigates and then computes leaves jq's register on the
+    # navigated node, off the root the untracked INIT's ambient describes: a pattern
+    # walking from there and a `=`/`|=` through it wrote through the wrong node.
+    "(foreach (null) as {a:$x} (.a|tostring; .; $x))",
+    "(reduce (null) as {a:$x} (.a|tostring; $x))",
+    "(foreach (null) as [$x] (.a|length; .; $x))",
+    "(reduce .[]? as {a:$x} (.b|tostring; $x))",
+    "(foreach (null) as {a:$x} (tostring; .; $x))",
     "(reduce . as [$a] (0; .))",
     # (#3744) a destructuring of the register itself as a `foreach` SOURCE: the pattern's
     # tracked index steps move jq's register onto the matched member, so an EXTRACT that
