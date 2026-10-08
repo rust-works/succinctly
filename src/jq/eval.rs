@@ -11125,7 +11125,7 @@ fn owned_assign_shape(expr: &Expr) -> bool {
 /// pins a chain at that limit.
 fn closed_expr_shape(expr: &Expr) -> bool {
     match expr {
-        Expr::Literal(_) => true,
+        Expr::Literal(_) | Expr::TrackedVar(_) => true,
         Expr::Paren(inner) => closed_expr_shape(inner),
         Expr::Array(inner) => match inner.as_ref() {
             Expr::Builtin(Builtin::Empty) => true,
@@ -11173,22 +11173,60 @@ fn closed_expr_to_owned<S: EvalSemantics>(expr: &Expr) -> Option<OwnedValue> {
     if let Expr::Literal(lit) = expr {
         return Some(literal_to_owned(lit));
     }
-    closed_expr_to_owned_at_depth::<S>(expr, 0)
+    let mut escaped = false;
+    let value = closed_expr_to_owned_at_depth::<S>(expr, 0, &mut escaped)?;
+    // #4005: a marker is read by value, so an answer that is a scalar carries nothing of
+    // the binding's identity. `escaped` says the answer is a container that is a marker's
+    // own node, or a node of it, which a step that does not know the embed table must not
+    // hand on (#3241).
+    if escaped {
+        return None;
+    }
+    Some(value)
 }
 
 /// [`closed_expr_to_owned`], with a depth guard over the array/object
 /// shapes `owned_to_expr_at_depth` builds.
+///
+/// `escaped` is set when the value returned is a container that a marker
+/// ([`Expr::TrackedVar`], #4005) handed on: the marker itself, a node of it, or a
+/// container built from either. A node whose own answer is a scalar leaves it as it
+/// found it -- a comparison, a field read, a `length` carry no identity out of their
+/// operands -- and a container built only from scalars is fresh, so it does too.
 fn closed_expr_to_owned_at_depth<S: EvalSemantics>(
     expr: &Expr,
     depth: usize,
+    escaped: &mut bool,
+) -> Option<OwnedValue> {
+    let before = *escaped;
+    let value = closed_expr_to_owned_node::<S>(expr, depth, escaped)?;
+    if !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
+        *escaped = before;
+    }
+    Some(value)
+}
+
+fn closed_expr_to_owned_node<S: EvalSemantics>(
+    expr: &Expr,
+    depth: usize,
+    escaped: &mut bool,
 ) -> Option<OwnedValue> {
     assert_value_tree_depth(depth);
     match expr {
         Expr::Literal(lit) => Some(literal_to_owned(lit)),
-        Expr::Paren(inner) => closed_expr_to_owned_at_depth::<S>(inner, depth + 1),
+        // #4005: a loop variable a fold marked so that `==`/`!=` sees jq's identity
+        // short-circuit (#3896), read for its value: the clone shares the marker's
+        // storage, which is all `apply_compare_op` needs. A marker is always a
+        // container, so reading one sets `escaped`, and [`closed_expr_to_owned`]
+        // declines the answer unless an enclosing node reduced it to a scalar.
+        Expr::TrackedVar(marker) if S::TAG == EvalTag::Jq => {
+            *escaped = true;
+            Some(marker.value.clone())
+        }
+        Expr::Paren(inner) => closed_expr_to_owned_at_depth::<S>(inner, depth + 1, escaped),
         Expr::Pipe(stages) => {
             let (head, rest) = stages.split_first()?;
-            let mut value = closed_expr_to_owned_at_depth::<S>(head, depth + 1)?;
+            let mut value = closed_expr_to_owned_at_depth::<S>(head, depth + 1, escaped)?;
             for stage in rest {
                 value = match eval_owned_fast_path::<S>(stage, &value, false) {
                     Some(Ok(Some(next))) => next,
@@ -11206,34 +11244,34 @@ fn closed_expr_to_owned_at_depth<S: EvalSemantics>(
         // only: yq's comparison, arithmetic and `//` rules differ, and its
         // only owned step is #3025's `.field op= <number>`.
         Expr::Compare { op, left, right } if S::TAG == EvalTag::Jq => {
-            let r = closed_expr_to_owned_at_depth::<S>(right, depth + 1)?;
-            let l = closed_expr_to_owned_at_depth::<S>(left, depth + 1)?;
+            let r = closed_expr_to_owned_at_depth::<S>(right, depth + 1, escaped)?;
+            let l = closed_expr_to_owned_at_depth::<S>(left, depth + 1, escaped)?;
             Some(OwnedValue::Bool(apply_compare_op::<S>(*op, &l, &r)))
         }
         Expr::Arithmetic { op, left, right } if S::TAG == EvalTag::Jq => {
-            let r = closed_expr_to_owned_at_depth::<S>(right, depth + 1)?;
-            let l = closed_expr_to_owned_at_depth::<S>(left, depth + 1)?;
+            let r = closed_expr_to_owned_at_depth::<S>(right, depth + 1, escaped)?;
+            let l = closed_expr_to_owned_at_depth::<S>(left, depth + 1, escaped)?;
             arith_combine::<S>(*op, l, r).ok()
         }
         // The right operand is read only when the left does not settle the
         // answer, as `boolean_fanout_core` does.
         Expr::And(left, right) | Expr::Or(left, right) if S::TAG == EvalTag::Jq => {
             let short_circuit = matches!(expr, Expr::Or(..));
-            let l = closed_expr_to_owned_at_depth::<S>(left, depth + 1)?;
+            let l = closed_expr_to_owned_at_depth::<S>(left, depth + 1, escaped)?;
             if l.is_truthy() == short_circuit {
                 return Some(OwnedValue::Bool(short_circuit));
             }
-            let r = closed_expr_to_owned_at_depth::<S>(right, depth + 1)?;
+            let r = closed_expr_to_owned_at_depth::<S>(right, depth + 1, escaped)?;
             Some(OwnedValue::Bool(r.is_truthy()))
         }
         // `l // r` with a closed `l`: its one value if truthy, else `r`. An
         // `l` that raises declines rather than being swallowed here.
         Expr::Alternative(left, right) if S::TAG == EvalTag::Jq => {
-            let l = closed_expr_to_owned_at_depth::<S>(left, depth + 1)?;
+            let l = closed_expr_to_owned_at_depth::<S>(left, depth + 1, escaped)?;
             if l.is_truthy() {
                 Some(l)
             } else {
-                closed_expr_to_owned_at_depth::<S>(right, depth + 1)
+                closed_expr_to_owned_at_depth::<S>(right, depth + 1, escaped)
             }
         }
         // `[$x]` is a *bare* element inside `Expr::Array`: the parser only
@@ -11243,12 +11281,16 @@ fn closed_expr_to_owned_at_depth<S: EvalSemantics>(
             Expr::Comma(items) => {
                 let mut out = vec_with_capacity(items.len());
                 for item in items {
-                    out.push(closed_expr_to_owned_at_depth::<S>(item, depth + 1)?);
+                    out.push(closed_expr_to_owned_at_depth::<S>(
+                        item,
+                        depth + 1,
+                        escaped,
+                    )?);
                 }
                 Some(OwnedValue::array_from(out))
             }
             single => Some(OwnedValue::array_from(vec![
-                closed_expr_to_owned_at_depth::<S>(single, depth + 1)?,
+                closed_expr_to_owned_at_depth::<S>(single, depth + 1, escaped)?,
             ])),
         },
         // Duplicate keys fold through `IndexMap`'s own `FromIterator`, as
@@ -11258,15 +11300,17 @@ fn closed_expr_to_owned_at_depth<S: EvalSemantics>(
             for entry in entries {
                 let key = match &entry.key {
                     ObjectKey::Literal(s) => s.clone(),
-                    ObjectKey::Expr(e) => match closed_expr_to_owned_at_depth::<S>(e, depth + 1)? {
-                        OwnedValue::String(s) => s,
-                        _ => return None,
+                    ObjectKey::Expr(e) => {
+                        match closed_expr_to_owned_at_depth::<S>(e, depth + 1, escaped)? {
+                            OwnedValue::String(s) => s,
+                            _ => return None,
+                        }
+                        .into_string()
                     }
-                    .into_string(),
                 };
                 out.push((
                     key,
-                    closed_expr_to_owned_at_depth::<S>(&entry.value, depth + 1)?,
+                    closed_expr_to_owned_at_depth::<S>(&entry.value, depth + 1, escaped)?,
                 ));
             }
             Some(OwnedValue::Object(out.into_iter().collect()))
@@ -57719,10 +57763,13 @@ fn fold_step_each<S: EvalSemantics>(
 /// that holds a document node) only the assignment half of the step runs;
 /// `to_entries`/`from_entries` stay on the bridge, where
 /// [`eval_owned_relocating_fold`] owns them. The assignment step is sound
-/// under the table because it reads neither the table nor a marker (its right
-/// side and keys must be [`closed_expr_to_owned`], and an `Expr::TrackedVar`
-/// is never closed -- so #3181's witnessed UPDATE, which always carries one,
-/// declines to the route above), and it never writes a container the table
+/// under the table because it reads no table entry and no marker's identity (its
+/// right side and keys must be [`closed_expr_to_owned`], which reads an
+/// `Expr::TrackedVar` by value only and declines an answer that is a container
+/// carrying one, #4005 -- so a marker's node never reaches the accumulator, and
+/// #3181's witnessed UPDATE, which differs from the hoisted copy only in a
+/// marker's origin, answers the same value either way), and it never writes a
+/// container the table
 /// registered in place: a registered container has at least two strong
 /// references (the table's own and the binding's), so `Rc::make_mut` copies it
 /// first and the entry keeps witnessing the unmodified original. The copy
@@ -60069,9 +60116,10 @@ pub(crate) fn substitute_fold_step(
 /// of its *own* loop variables as a path step ([`loop_var_is_path_source`]).
 ///
 /// The last test is what keeps `reduce .[] as $r ({}; .[$r.name] = $r.score)`
-/// -- `$r` is only a key, read by value -- on its in-place assignment step: a
-/// marker anywhere in an assignment makes `owned_assign_step` decline
-/// (`closed_expr_to_owned`), and the accumulator is then copied on every step.
+/// -- `$r` is only a key, read by value -- on its in-place assignment step. A
+/// marker read for a scalar no longer makes `owned_assign_step` decline (#4005), but
+/// one whose answer is a container still does (`closed_expr_to_owned`), and the
+/// accumulator is then copied on every step.
 pub(crate) fn fold_loop_variable_is_marked<S: EvalSemantics>(
     patterns: &[Pattern],
     update: &Expr,
@@ -60123,7 +60171,9 @@ pub(crate) fn fold_loop_variable_shares_identity<S: EvalSemantics>(
 /// one place a marker costs anything is an assignment (below).
 ///
 /// An assignment's path and right-hand side are read by value and mostly keys
-/// and scores, and a marker anywhere in one makes `owned_assign_step` decline
+/// and scores. A marker there is read by value (#4005), so one whose answer is a
+/// scalar -- a key, a field, a comparison -- keeps the in-place step, and one
+/// whose answer is a container makes `owned_assign_step` decline
 /// (`closed_expr_to_owned`), copying the accumulator on every step
 /// (`fold_assign_step_copies_nothing_3138`). Only an explicit `==`/`!=` there
 /// counts, so `.[$r.name] += ($r | f)` keeps its in-place step and a comparison
@@ -78478,15 +78528,23 @@ mod tests {
         }
     }
 
-    /// #3241: an UPDATE holding a marker is never closed, so the owned
-    /// assignment declines it and the step takes the evaluator route with the
-    /// witness #3181 gives it. A marker is how a binding's node reaches the
-    /// UPDATE, so a step that answered one here could not keep the identity
-    /// it names. Every position a marker can sit in -- the right side, a
-    /// computed key, a parenthesised target -- and both origins.
+    /// #3241: an UPDATE whose answer would be a marker's container is never
+    /// closed, so the owned assignment declines it and the step takes the
+    /// evaluator route with the witness #3181 gives it. A marker is how a
+    /// binding's node reaches the UPDATE, so a step that answered one here could
+    /// not keep the identity it names. The positions a marker's node can reach
+    /// the accumulator from -- the right side, an operand, a parenthesised
+    /// target -- and both origins. A marker read for a *scalar* is a different
+    /// matter (#4005): see `owned_assign_step_reads_markers_by_value_for_scalars_4005`.
     #[test]
     fn owned_assign_step_declines_markers_3241() {
-        let value = OwnedValue::object_from([("k".to_string(), OwnedValue::Int(1))]);
+        let value = OwnedValue::object_from([
+            ("k".to_string(), OwnedValue::Int(1)),
+            (
+                "row".to_string(),
+                OwnedValue::array_from(vec![OwnedValue::Int(7)]),
+            ),
+        ]);
         let state = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(0))]);
         let untracked = Expr::TrackedVar(Rc::new(Tracked {
             value: value.clone(),
@@ -78496,9 +78554,13 @@ mod tests {
         let mut exprs = Vec::new();
         for src in [
             ".a = $m",
-            ".[$m.k | tostring] = 1",
             "($m.k) = 9",
             ".a += $m",
+            // #4005: so does a container that holds one, or a node of one.
+            ".a = [$m]",
+            ".a = {k: $m}",
+            ".a = $m.row",
+            ".a = ($m.row // 0)",
         ] {
             exprs.push((
                 src,
@@ -78522,8 +78584,61 @@ mod tests {
         }
     }
 
+    /// #4005: a marker read for a scalar -- a key, a field, a comparison of two
+    /// of them -- carries none of the binding's identity into the accumulator, so
+    /// the owned step answers it. `$m == $m` over a NaN-bearing container is `true`
+    /// because the two operands are one shared node (jq's instance check, #3896),
+    /// which only holds if the step reads the marker rather than a rebuilt copy.
+    #[test]
+    fn owned_assign_step_reads_markers_by_value_for_scalars_4005() {
+        let nan_row = OwnedValue::array_from(vec![
+            OwnedValue::Float(f64::NAN),
+            OwnedValue::String("x".into()),
+        ]);
+        let value = OwnedValue::object_from([
+            ("k".to_string(), OwnedValue::String("key".into())),
+            ("a".to_string(), OwnedValue::Int(2)),
+            ("b".to_string(), OwnedValue::Int(2)),
+            ("row".to_string(), nan_row),
+        ]);
+        let state = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(0))]);
+        for (src, key, expected) in [
+            (".[$m.k] = ($m.a == $m.b)", "key", OwnedValue::Bool(true)),
+            (".[$m.k] = ($m.a != $m.b)", "key", OwnedValue::Bool(false)),
+            (".[$m.k] = ($m == $m)", "key", OwnedValue::Bool(true)),
+            (
+                ".[$m.k] = ($m.row == $m.row)",
+                "key",
+                OwnedValue::Bool(true),
+            ),
+            (".[$m.k] = $m.a", "key", OwnedValue::Int(2)),
+            // A container built only from scalar reads is fresh.
+            (
+                ".[$m.k] = [$m.a, $m.a == $m.b]",
+                "key",
+                OwnedValue::array_from(vec![OwnedValue::Int(2), OwnedValue::Bool(true)]),
+            ),
+            (
+                ".[$m.k] = {x: ($m.row == $m.row)}",
+                "key",
+                OwnedValue::object_from([("x".to_string(), OwnedValue::Bool(true))]),
+            ),
+        ] {
+            let expr = substitute_var_tracked(&parse(src).unwrap(), "m", &value);
+            let OwnedStep::Handled(Ok(written)) =
+                try_owned_assign_step::<JqSemantics>(&expr, state.clone())
+            else {
+                panic!("a scalar read of a marker was declined: {src}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if the owned step declined a marker read for a scalar, which #4005 admits"
+            };
+            let OwnedValue::Object(fields) = written else {
+                panic!("expected an object: {src}"); // patchcov: coverage tolerate-line reason="unreachable: an owned assignment into an object state leaves an object"
+            };
+            assert_eq!(fields.get(key), Some(&expected), "{src}");
+        }
+    }
+
     /// #3329: a fold marks its loop variables only where its UPDATE or EXTRACT can
-    /// read one as a path step. A marker anywhere in an assignment makes
+    /// read one as a path step. A marker whose answer is a container makes
     /// `owned_assign_step` decline, so `.[$r.name] = $r.score` -- `$r` read by value, as
     /// a key -- must keep its in-place step (`fold_assign_step_copies_nothing_3138`
     /// pins the copies; this pins the decision).
@@ -131521,6 +131636,14 @@ mod share_audit_2999 {
         assert_forced(
             &json,
             "reduce .[] as $r ({}; $r as $s | .[$s.name] = $s.score)",
+            &[],
+        );
+        // #4005: an explicit `==`/`!=` on the loop variable marks it (#3896), and the
+        // marker is read by value, so the accumulator is still written in place.
+        assert_forced(&json, "reduce .[] as $r ({}; .[$r.name] = ($r == $r))", &[]);
+        assert_forced(
+            &json,
+            "reduce .[] as $r ({}; .[$r.name] = ($r.name != $r.score))",
             &[],
         );
     }

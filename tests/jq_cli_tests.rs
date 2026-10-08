@@ -97049,6 +97049,48 @@ fn test_fold_container_loop_variable_identity_through_document_input_3896() -> R
     Ok(())
 }
 
+/// #4005: an assignment whose right side compares a container loop variable reads it by
+/// value in the in-place step, and that must not lose jq's instance check (#3896): a
+/// NaN-bearing container is equal to itself because both operands are one shared node, and
+/// unequal to a distinct node with the same contents. Every row captured from jq 1.7.1.
+#[test]
+fn test_fold_assignment_compares_a_loop_variable_by_identity_4005() -> Result<()> {
+    for (filter, expected) in [
+        (
+            "reduce ([nan]) as $a ({}; .x = ($a == $a))",
+            "{\"x\":true}\n",
+        ),
+        (
+            "reduce ([nan]) as $a ({}; .x = ($a != $a))",
+            "{\"x\":false}\n",
+        ),
+        (
+            r#"reduce ({"k":[nan]}) as $a ({}; .x = ($a.k == $a.k))"#,
+            "{\"x\":true}\n",
+        ),
+        (
+            "reduce ([nan],[nan]) as $a ({}; .x += [($a == $a)])",
+            "{\"x\":[true,true]}\n",
+        ),
+        (
+            r#"reduce ({"a":[nan],"b":[nan]}) as $r ({}; .x = ($r.a == $r.b))"#,
+            "{\"x\":false}\n",
+        ),
+        (
+            r#"reduce ({"k":[1],"n":"a"}) as $a ({}; .[$a.n] = $a.k | .y = ($a == $a))"#,
+            "{\"a\":[1],\"y\":true}\n",
+        ),
+        (
+            r#"foreach ({"k":[nan]},{"k":[nan]}) as $a ({}; .x = ($a.k == $a.k); .x)"#,
+            "true\ntrue\n",
+        ),
+    ] {
+        let (output, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!((output.as_str(), code), (expected, 0), "{filter}: {stderr}");
+    }
+    Ok(())
+}
+
 /// #3069's bridge provenance, seen by `path()`: a container read back out of
 /// the reindex bridge is the storage that went in, so a bound `$x` embedded
 /// in something the bridge rebuilt is still `$x`'s own `Rc` where the
