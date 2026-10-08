@@ -13518,10 +13518,18 @@ fn each_recurse_cursor_generic<S: EvalSemantics, V: DocumentValue>(
             let mut verdicts = 0u32;
             let flow =
                 eval_each_generic::<S, V>(cond, cursor.value(), false, Some(cursor), &mut |item| {
+                    verdicts += 1;
                     keep |= generic_item_is_truthy(&item);
                     Demand::Continue
                 });
+            // The walk's bound rests on the admission rule: a second verdict would visit a
+            // child once per truthy output where this visits it once.
+            debug_assert!(
+                verdicts <= 1,
+                "an admitted `cond` yielded {verdicts} values"
+            );
             match flow {
+                // `cond` is never stopped: the sink above always continues.
                 Flow::Exhausted | Flow::Stopped { .. } => {}
                 escaped @ Flow::Escaped(_) => return escaped,
             }
