@@ -30,7 +30,6 @@ use super::scalar::{
     resolve_plain, resolve_plain_sourced, resolve_tagged, whole_float_as_int, ResolvedScalar,
 };
 use super::{starts_inline_seq_entry, starts_seq_entry};
-use crate::util::simd::escape::find_json_escape;
 
 // ============================================================================
 // YamlCursor: Position in the YAML structure
@@ -4416,56 +4415,20 @@ fn write_resolved_scalar_as_json(
 /// (P9's hot path) never got the optimization and a change to the escape
 /// convention could only ever reach one of them (#965).
 ///
-/// Deliberately *not* delegating to `jq::escape::write_json_body_yq`, which
-/// is the same convention and the same scan: measured on pinned hardware,
-/// the `#[inline]` this path needs to stay competitive costs the jq callers
-/// of that function up to 14% on x86_64 (`arrays keys_unsorted`, 7950X).
-/// The two callers want opposite inlining, so they keep separate copies --
-/// see #965 for the numbers.
-///
-/// `#[inline]` is load-bearing here, matching O3's own finding that this path
-/// is sensitive to call overhead on short strings: without it the streaming
-/// path reads ~+1% across the yq corpus instead of neutral-to-faster.
+/// The body is `jq::escape::write_json_body_yq`, the one definition of yq's
+/// convention, SIMD scan and U+2028/U+2029 escaping included. This function
+/// was a separate copy of it until #2663 (#1638 had kept the fork because
+/// `#[inline]` on the shared body cost jq's `arrays keys_unsorted` 13.9% on a
+/// 7950X). Re-measured under the pinned release profile (one codegen unit,
+/// fat LTO), on a 7950X and an M4 Pro, the executed instructions of every jq
+/// row are identical with or without the fork, with or without `#[inline]` on
+/// the shared body: the 13.9% was code layout, not inlining (see
+/// `docs/parsing/yaml.md`, O3). The fork had also drifted -- it never learned
+/// the separator escaping #1982 added to the shared body (#2607).
 #[inline]
 fn stream_json_string<Out: core::fmt::Write>(out: &mut Out, s: &str) -> core::fmt::Result {
     out.write_char('"')?;
-
-    let bytes = s.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-
-    while i < len {
-        // The SIMD scan handles short strings internally with a scalar
-        // fallback; `find_json_escape` is `#[inline(always)]` for that reason.
-        let escape_pos = find_json_escape(bytes, i);
-
-        if i < escape_pos {
-            out.write_str(&s[i..escape_pos])?;
-        }
-
-        i = escape_pos;
-
-        if i < len {
-            let b = bytes[i];
-            match b {
-                b'"' => out.write_str("\\\"")?,
-                b'\\' => out.write_str("\\\\")?,
-                b'\n' => out.write_str("\\n")?,
-                b'\r' => out.write_str("\\r")?,
-                b'\t' => out.write_str("\\t")?,
-                // `find_json_escape` only stops on the four cases above and
-                // on `< 0x20`, so nothing else can reach here.
-                b => {
-                    out.write_str("\\u00")?;
-                    const HEX: &[u8; 16] = b"0123456789abcdef";
-                    out.write_char(HEX[(b >> 4) as usize] as char)?;
-                    out.write_char(HEX[(b & 0xf) as usize] as char)?;
-                }
-            }
-            i += 1;
-        }
-    }
-
+    crate::jq::escape::write_json_body_yq(out, s)?;
     out.write_char('"')
 }
 
@@ -10599,9 +10562,8 @@ mod tests {
         (ResolvedScalar::Float(f64::NEG_INFINITY), "-.inf"),
         (ResolvedScalar::Float(f64::NAN), ".nan"),
         // Every escape class `stream_json_string`'s convention has to handle
-        // (the same convention as `write_json_body_yq`, kept as a separate
-        // copy -- see #965), plus lengths on both sides of the SIMD chunk
-        // thresholds.
+        // (`write_json_body_yq`, which it delegates to, #2663), plus lengths on
+        // both sides of the SIMD chunk thresholds.
         (ResolvedScalar::Str, ""),
         (ResolvedScalar::Str, "plain"),
         (ResolvedScalar::Str, "quote \" backslash \\"),

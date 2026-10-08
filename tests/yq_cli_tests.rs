@@ -52913,6 +52913,42 @@ fn test_yq_jq_extensions_bounded_pipe_stops_at_the_bound_3514() -> Result<()> {
     Ok(())
 }
 
+/// #2607 / #2663: the streaming YAML->JSON writer kept its own copy of yq's
+/// string escaper, which never learned the U+2028/U+2029 escaping #1982 gave the
+/// shared one, so `-o json` wrote the two separators raw wherever the cursor
+/// streamed (the default for `.`, `.a`, `.[]`) and escaped them wherever a write
+/// or `--arg` forced the DOM. It now delegates to that one definition. Every row
+/// is captured whole from yq v4.53.3; `…` (U+2026) and `→` (U+2192) share the
+/// separators' `0xE2` lead byte and must stay raw.
+#[test]
+fn test_yq_json_output_escapes_line_and_paragraph_separators_on_every_path_2607() -> Result<()> {
+    let yaml =
+        "a: \"x\u{2028}y\"\nb: [1]\nc: \"p\u{2029}q \u{2026} \u{2192} r\"\nd: \"v\u{2028}\"\n";
+    for (filter, extra, want) in [
+        (
+            ".",
+            &[][..],
+            "{\"a\":\"x\\u2028y\",\"b\":[1],\"c\":\"p\\u2029q \u{2026} \u{2192} r\",\"d\":\"v\\u2028\"}\n",
+        ),
+        (".a", &[][..], "\"x\\u2028y\"\n"),
+        (".c", &[][..], "\"p\\u2029q \u{2026} \u{2192} r\"\n"),
+        (".d", &[][..], "\"v\\u2028\"\n"),
+        // The DOM route (`--arg` forces it) already escaped them; the two routes agree.
+        (".a", &["--arg", "x", "1"][..], "\"x\\u2028y\"\n"),
+        (".c", &["--arg", "x", "1"][..], "\"p\\u2029q \u{2026} \u{2192} r\"\n"),
+    ] {
+        let mut args = vec!["-o", "json", "-I0"];
+        args.extend_from_slice(extra);
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, yaml, &args)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (want, "", 0),
+            "`{filter}` {extra:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3643 promoted `last(f)` to leave jq's path register in place in jq mode
 /// only (ADR-0018: yq has no oracle for it). With the jq-only surface enabled,
 /// yq mode still refuses `del(. as $x | last(.a) | $x.k)` exactly as before.
