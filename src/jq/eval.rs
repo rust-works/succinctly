@@ -10454,8 +10454,9 @@ pub(crate) fn eval_each_owned_front_doors<S: EvalSemantics>(
 /// because the doors unwrap exactly one level, so `Pipe([Pipe([max])])` and
 /// `Pipe([max])` are not the same question to them. The bare route past the
 /// doors ([`lone_stage_can_go_bare`], #3692) depends on it too:
-/// [`projection_peel`] declines a bare stage because it is not a pipe, and
-/// would peel a bare `(.a | floor)` that it declines inside `Pipe([..])`.
+/// [`projection_peel`] declines a bare stage because it is not a pipe. A
+/// stage that is a pipe is never bare, and [`projection_peel`] flattens it
+/// inside `Pipe([..])` (#4052), where it declined it before.
 fn lone_plain_stage(rest: &[Expr]) -> Option<&Expr> {
     match rest {
         [only] if !matches!(unwrap_paren(only), Expr::Pipe(_)) => Some(only),
@@ -10693,8 +10694,10 @@ impl<'a> RestPipe<'a> {
 /// [`owned_write_door`], [`owned_select_door`] and the #3135 identity-bind
 /// door take a non-pipe as `core::slice::from_ref(stage)`;
 /// [`projection_peel`] declines both spellings (a bare stage is not a pipe,
-/// which [`lone_plain_stage`] guarantees, and a one-stage pipe has no stage
-/// after its first); [`reroot_for_reentry`] walks the tree without regard to
+/// which [`lone_plain_stage`] guarantees, and a one-stage pipe of a plain
+/// stage has no stage after its first; a one-stage pipe of a nested pipe is
+/// flattened, #4052, but that stage is not plain, so it is never bare);
+/// [`reroot_for_reentry`] walks the tree without regard to
 /// what wraps it. [`eval_owned_reindex_free`] answers a one-stage pipe only
 /// when [`owned_step_shape`] holds, which for an assignment is
 /// [`owned_assign_shape`], and a bare unshaped assignment goes to
@@ -11010,6 +11013,19 @@ fn projection_peel<S: EvalSemantics>(
     // `rest` check on purpose (#4052): a lone `.r.users[0].id` is the pipe's one
     // stage, with nothing behind it, and its own stages are what navigate.
     if let Expr::Pipe(inner) = first {
+        // The copy below is paid per re-entry, so a head that cannot peel
+        // (`select(..)`, an empty pipe) is turned away before it.
+        if !skip_identity_stages(inner).first().is_some_and(|head| {
+            matches!(
+                unwrap_paren(head),
+                Expr::Field(_)
+                    | Expr::Index { .. }
+                    | Expr::Pipe(_)
+                    | Expr::Builtin(Builtin::Length)
+            )
+        }) {
+            return None;
+        }
         let mut flat = inner.clone();
         flat.extend_from_slice(rest);
         return projection_peel::<S>(&Expr::Pipe(flat), input, optional, reentry, sink);
@@ -107410,39 +107426,61 @@ mod tests {
             let inner = parse(filter).unwrap();
             Expr::Pipe(vec![inner].into())
         };
-        let run = |expr: &Expr| {
+        fn peeled<S: EvalSemantics>(
+            expr: &Expr,
+            input: &OwnedValue,
+        ) -> Option<(Flow, Vec<String>)> {
             let mut out = Vec::new();
-            let flow =
-                projection_peel::<JqSemantics>(expr, &input, false, Reentry::REBUILT, &mut |v| {
-                    out.push(v);
-                    Demand::Continue
-                });
+            let flow = projection_peel::<S>(expr, input, false, Reentry::REBUILT, &mut |v| {
+                out.push(v.to_json());
+                Demand::Continue
+            });
             flow.map(|flow| (flow, out))
-        };
-        for (filter, expected) in [
-            (".r.users[0].id", "7"),
-            (".r.users[1].id", "8"),
-            (".r.users[0]", "{\"id\":7,\"n\":\"x\"}"),
-            (".r.users | length", "2"),
+        }
+        // The reindex bridge itself, not `eval_each_owned` (which would run
+        // the peel under test first).
+        fn bridged<S: EvalSemantics>(expr: &Expr, input: &OwnedValue) -> Vec<String> {
+            let doc = input.reindexed::<S>().unwrap();
+            let mut out = Vec::new();
+            let _ = eval_each::<Vec<u64>, S>(expr, doc.root().value(), false, &mut |item| {
+                out.push(item.into_owned_lossy::<S>().to_json());
+                Demand::Continue
+            });
+            out
+        }
+        for filter in [
+            ".r.users[0].id",
+            ".r.users[1].id",
+            ".r.users[0]",
+            ".r.users | length",
+            ".r.users[5].id",
+            ".r.nope.x",
+            ".r.users[-1].id",
+            "(.r.users[0].id)",
+            ". | .r.users[0].id",
         ] {
             let expr = lone(filter);
-            let (flow, out) = run(&expr).unwrap_or_else(|| panic!("{filter}: declined"));
+            let (flow, jq) = peeled::<JqSemantics>(&expr, &input)
+                .unwrap_or_else(|| panic!("{filter}: declined"));
             assert!(matches!(flow, Flow::Exhausted), "{filter}");
-            assert_eq!(out.len(), 1, "{filter}");
-            assert_eq!(out[0].to_json(), expected, "{filter}");
-            // The value the whole re-entry (the bridge) answers.
-            let mut bridged = Vec::new();
-            let _ =
-                eval_each_owned::<JqSemantics>(&expr, &input, false, Reentry::REBUILT, &mut |v| {
-                    bridged.push(v);
-                    Demand::Continue
-                });
-            assert_eq!(out[0].to_json(), bridged[0].to_json(), "{filter}");
+            assert_eq!(jq, bridged::<JqSemantics>(&expr, &input), "jq: {filter}");
+            // yq declines an absent key (its empty result is observable); where
+            // it does peel, it agrees with its own bridge.
+            if let Some((_, yq)) = peeled::<YqSemantics>(&expr, &input) {
+                assert_eq!(yq, bridged::<YqSemantics>(&expr, &input), "yq: {filter}");
+            }
         }
-        // Still declined: a single navigation has nothing to peel, and a path
-        // reader stays the bridge's.
-        assert!(run(&lone(".r")).is_none());
-        assert!(run(&lone(".r.users[0] | key")).is_none());
+        // Still declined: a single navigation has nothing to peel, a path
+        // reader stays the bridge's, and a head that cannot peel is turned
+        // away before the stages are copied.
+        for filter in [".r", ".r.users[0] | key", "select(.z == 1) | .r", ""] {
+            let expr = if filter.is_empty() {
+                Expr::Pipe(vec![Expr::Pipe(Vec::new().into())].into())
+            } else {
+                lone(filter)
+            };
+            assert!(peeled::<JqSemantics>(&expr, &input).is_none(), "{filter:?}");
+        }
     }
 
     /// The door's answer for `filter` over `input`, in the shape
