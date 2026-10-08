@@ -16,7 +16,9 @@
 //!   ([`DocumentFields::uncons_key`]); no value is decoded, so validation
 //!   stays "where something reads it" (#2692).
 //! - **Every anomaly refuses the build** (a non-string key, an unpaired tail,
-//!   a trailing stray comma, an object past [`MAX_INDEXED_MEMBERS`]) and the
+//!   a trailing stray comma, an object past [`MAX_INDEXED_MEMBERS`], or keys
+//!   so repeated that their runs of slots outgrow the build's probe budget)
+//!   and the
 //!   caller runs the walk it always ran, which raises exactly what it always
 //!   raised. So an index exists only for an object the walk would not have
 //!   raised on for *any* name, and what is left to check per lookup is the
@@ -34,7 +36,10 @@
 //! visited; only a walk of [`WIDE_MEMBERS`] or more registers the object, and
 //! the *next* lookup of it builds the index. An object that is small, or
 //! looked up once, never costs more than the walk it always cost, and a
-//! refused build is remembered so it is not retried.
+//! refused build is remembered so it is not retried. So is an eviction: only
+//! four indexes are kept, and an object whose index was dropped goes back to
+//! the walk for good rather than being rebuilt each time a pipeline cycles
+//! past it.
 //!
 //! # Scope
 //!
@@ -99,16 +104,17 @@ impl KeyIndex {
         let mut last_key_cursor = None;
         let mut rest = fields.clone();
         while let Some((key, key_cursor, next)) = rest.uncons_key() {
-            if key_is_malformed(&key) {
-                return None;
-            }
             members += 1;
             if members > MAX_INDEXED_MEMBERS {
                 return None;
             }
+            // A hash exists only for a key that decoded, so asking for it first
+            // decodes each key once; the malformed test is for a key without one.
             if let Some(hash) = key_hash_of(&key) {
                 keys.push(key_cursor.node_id());
                 hashes.push(hash);
+            } else if key_is_malformed(&key) {
+                return None;
             }
             last_key_cursor = Some(key_cursor);
             rest = next;
@@ -119,9 +125,16 @@ impl KeyIndex {
         let size = (keys.len() * 2).next_power_of_two().max(8);
         let mask = size - 1;
         let mut table = alloc_table(size);
+        // Equal keys share a hash and so a run of slots, and inserting into a
+        // run of m costs m probes: a million repeats of one key would be
+        // quadratic to build, and every lookup of it a scan of the run. The
+        // walk is linear, so an object that clusters this badly keeps it: the
+        // budget lets a run grow to about 4 * sqrt(members).
+        let mut budget = 8 * keys.len() + 64;
         for (entry, hash) in hashes.iter().enumerate() {
             let mut at = (*hash as usize) & mask;
             while table[at].entry != 0 {
+                budget = budget.checked_sub(1)?;
                 at = (at + 1) & mask;
             }
             table[at] = Slot {
@@ -218,7 +231,8 @@ pub(crate) mod memo {
 
     /// Objects remembered at once, indexed or not. Least recently used first.
     const ENTRIES: usize = 16;
-    /// Indexes kept at once.
+    /// Indexes kept at once. A build in progress holds the fourth's place, and
+    /// its transient hash vector comes on top of the retained size.
     const INDEXES: usize = 4;
     /// Members indexed across all the indexes kept.
     const MEMBER_BUDGET: usize = MAX_INDEXED_MEMBERS;
@@ -226,7 +240,11 @@ pub(crate) mod memo {
     enum Kind {
         /// A wide walk has been seen: the next lookup builds.
         Seen,
-        /// The build was refused (malformed, or too wide): always walk.
+        /// Always walk: the build was refused (malformed, clustered, too
+        /// wide), or the index was evicted. An evicted object is not given a
+        /// second chance: a pipeline cycling over more wide objects than
+        /// there are indexes would otherwise rebuild one on nearly every
+        /// lookup, and a build costs more than the walk it replaces.
         Refused,
         Indexed(KeyIndex),
     }
@@ -344,11 +362,14 @@ pub(crate) mod memo {
             let at = state.entries.iter().position(|e| e.head == id)?;
             let mut entry = state.entries.remove(at);
             if matches!(entry.kind, Kind::Seen) {
-                // The second lookup of a wide object: build.
+                // The second lookup of a wide object: build. Room by count
+                // first, so the indexes held while this one is built are
+                // INDEXES - 1 at most; by members once its size is known.
+                make_room(&mut state.entries, 1, 0);
                 entry.kind = match KeyIndex::build(fields) {
                     Some(index) => {
                         note_build();
-                        make_room(&mut state.entries, index.len());
+                        make_room(&mut state.entries, 1, index.len());
                         Kind::Indexed(index)
                     }
                     None => Kind::Refused,
@@ -369,24 +390,23 @@ pub(crate) mod memo {
         })
     }
 
-    /// Drop the least recently used indexes until one of `incoming` members
-    /// fits both the count and the member budget.
-    fn make_room(entries: &mut Vec<Entry>, incoming: usize) {
+    /// Retire the least recently used indexes (to [`Kind::Refused`]) until
+    /// `incoming` more indexes of `members` members fit both the count and the
+    /// member budget.
+    fn make_room(entries: &mut [Entry], incoming: usize, members: usize) {
         loop {
-            let (count, members) = entries.iter().fold((0, 0), |(c, n), e| match &e.kind {
+            let (count, held) = entries.iter().fold((0, 0), |(c, n), e| match &e.kind {
                 Kind::Indexed(ix) => (c + 1, n + ix.len()),
                 _ => (c, n),
             });
-            if count < INDEXES && members + incoming <= MEMBER_BUDGET {
+            if count + incoming <= INDEXES && held + members <= MEMBER_BUDGET {
                 return;
             }
             match entries
                 .iter()
                 .position(|e| matches!(e.kind, Kind::Indexed(_)))
             {
-                Some(at) => {
-                    entries.remove(at);
-                }
+                Some(at) => entries[at].kind = Kind::Refused,
                 None => return,
             }
         }
@@ -567,6 +587,25 @@ mod tests {
     }
 
     #[test]
+    fn build_refuses_an_object_whose_keys_all_cluster_3913() {
+        // Equal keys share a hash, so a run of them is a run of slots: the
+        // build is quadratic in the run and a lookup scans all of it.
+        let repeated = format!("{{{}}}", vec!["\"a\":1"; 3000].join(","));
+        with_root_object(&repeated, |fields| {
+            assert!(KeyIndex::build(fields).is_none());
+        });
+        // A few repeats of many keys is ordinary, and indexes.
+        let few: Vec<String> = (0..200)
+            .flat_map(|i| (0..3).map(move |j| format!("\"k{i}\":{j}")))
+            .collect();
+        let few = format!("{{{}}}", few.join(","));
+        with_root_object(&few, |fields| {
+            assert!(KeyIndex::build(fields).is_some());
+        });
+        assert_agrees(&few, &["k0", "k100", "k199", "absent"]);
+    }
+
+    #[test]
     fn build_refuses_nothing_else_3913() {
         for doc in [r#"{"a":1}"#, r#"{"a":{"b":[1,2,{"c":3}]},"d":null}"#] {
             with_root_object(doc, |fields| {
@@ -661,6 +700,64 @@ mod tests {
                     );
                 }
             }
+        }
+
+        #[test]
+        fn a_refused_clustered_object_is_walked_not_built_3913() {
+            let doc = format!("{{{}}}", vec!["\"a\":1"; 3000].join(","));
+            let before = memo::work();
+            let answers = lookups(&doc, "a", 5);
+            assert_eq!(memo::work(), before, "refused: neither a build nor a hit");
+            assert!(answers.iter().all(|a| *a == answers[0]));
+            assert!(matches!(answers[0], Ok(Some(_))));
+        }
+
+        #[test]
+        fn more_wide_objects_than_indexes_do_not_rebuild_on_every_round_3913() {
+            // Six wide objects read in a cycle, with room for four indexes:
+            // an evicted object goes back to the walk and is not rebuilt each
+            // time round (a build costs more than the walk), so the builds
+            // are bounded by the objects, not by the lookups.
+            let objects = 6;
+            let members = WIDE_MEMBERS * 2;
+            let doc = format!(
+                "{{{}}}",
+                (0..objects)
+                    .map(|o| {
+                        let inner: Vec<String> =
+                            (0..members).map(|i| format!("\"k{i}\":{o}")).collect();
+                        format!("\"o{o}\":{{{}}}", inner.join(","))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            let _scope = memo::enter(root.document_token());
+            let top = root.value().as_object().expect("an object document");
+            let inner: Vec<_> = (0..objects)
+                .map(|o| {
+                    let c = top.find_cursor(&format!("o{o}")).unwrap().expect("member");
+                    c.value().as_object().expect("an object")
+                })
+                .collect();
+            let before = memo::work();
+            for round in 0..8 {
+                for (o, fields) in inner.iter().enumerate() {
+                    let want = shown(fields.find_cursor("k7"));
+                    assert_eq!(
+                        shown(find_cursor_memoized(fields, "k7")),
+                        want,
+                        "object {o} round {round}"
+                    );
+                }
+            }
+            let builds = memo::work().0 - before.0;
+            // Each object is built once at most, however many rounds.
+            assert!(
+                builds <= objects,
+                "{builds} builds over {objects} objects x 8 rounds"
+            );
         }
 
         #[test]

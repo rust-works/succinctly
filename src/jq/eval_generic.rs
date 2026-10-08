@@ -7687,14 +7687,16 @@ mod slot_memo {
 
     /// Restores what the scope it opened replaced, if it opened one -- and
     /// closes the key-index scope opened beside it (#3913).
-    pub(crate) struct Guard(
-        Restore,
-        #[allow(dead_code)] crate::jq::key_index::memo::Guard,
-    );
+    pub(crate) struct Guard {
+        restore: Restore,
+        _keys: crate::jq::key_index::memo::Guard,
+    }
 
     impl Drop for Guard {
         fn drop(&mut self) {
-            if let Restore::Previous(previous) = std::mem::replace(&mut self.0, Restore::Nothing) {
+            if let Restore::Previous(previous) =
+                std::mem::replace(&mut self.restore, Restore::Nothing)
+            {
                 MEMO.with(|m| *m.borrow_mut() = previous);
             }
         }
@@ -7707,15 +7709,18 @@ mod slot_memo {
         MEMO.with(|m| {
             let mut m = m.borrow_mut();
             if m.as_ref().is_some_and(|s| s.document == document) {
-                return Guard(Restore::Nothing, keys);
+                return Guard {
+                    restore: Restore::Nothing,
+                    _keys: keys,
+                };
             }
-            Guard(
-                Restore::Previous(m.replace(State {
+            Guard {
+                restore: Restore::Previous(m.replace(State {
                     document,
                     scans: Vec::new(),
                 })),
-                keys,
-            )
+                _keys: keys,
+            }
         })
     }
 
