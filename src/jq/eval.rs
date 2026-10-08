@@ -15468,6 +15468,18 @@ fn has_one_key<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     key_owned: OwnedValue,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // #2800: yq's `has(k)` on a mapping compares the key's *text* for any scalar argument
+    // (`has(1)` is true on a `1:` member, `has(true)` on `true:`, `has(null)` on `null:`), where
+    // jq's `has(1)` on an object is an error. A string argument keeps the ordinary arm below.
+    if S::TAG == EvalTag::Yq && !matches!(key_owned, OwnedValue::String(_)) {
+        if let (StandardJson::Object(fields), Some(text)) = (value, yq_scalar_text::<S>(&key_owned))
+        {
+            return match fields.contains_checked(&text) {
+                Ok(found) => QueryResult::Owned(OwnedValue::Bool(found)),
+                Err(e) => QueryResult::Error(e),
+            };
+        }
+    }
     match (value, &key_owned) {
         // jq: null | has("key") => false
         (StandardJson::Null, _) => QueryResult::Owned(OwnedValue::Bool(false)),

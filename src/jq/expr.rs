@@ -3076,14 +3076,15 @@ impl Expr {
         name.bytes().any(|b| matches!(b, b'*' | b'?'))
     }
 
-    /// The key generator behind a wildcard traversal `.["a*"]` (yq mode, #3374):
-    /// every string key of the input mapping that the pattern matches, in
-    /// document order, or the pattern itself as a literal key when none does
-    /// (so a read answers `null` and a write creates the key, as in yq). A
-    /// non-mapping input yields the pattern too, leaving the ordinary
+    /// The key generator behind a wildcard traversal `.["a*"]` (yq mode, #3374, #2800):
+    /// every key of the input mapping whose text the pattern matches, in document order,
+    /// spelled as the string `tostring` gives it (so a typed key -- `1: y`, `true: t` -- is found
+    /// by its text through the ordinary string lookup, as in yq's `matchKey`), or the pattern
+    /// itself as a literal key when none does (so a read answers `null` and a write creates the
+    /// key, as in yq). A non-mapping input yields the pattern too, leaving the ordinary
     /// `cannot index` error to the index step. It is
-    /// `[(try keys_unsorted[] catch empty) | select(type == "!!str" and . == PAT)]
-    /// | if length == 0 then PAT else .[] end`, where yq mode's `==` already
+    /// `[(try keys_unsorted[] catch empty) | select(. == PAT)]
+    /// | if length == 0 then PAT else (.[] | tostring) end`, where yq mode's `==` already
     /// applies the same glob to its right operand.
     #[must_use]
     pub fn yq_wildcard_keys(pattern: &str) -> Self {
@@ -3095,21 +3096,14 @@ impl Expr {
             ])),
             catch: Some(Box::new(Self::Builtin(Builtin::Empty))),
         };
-        let is_matching_string = Self::And(
-            Box::new(Self::Compare {
-                op: CompareOp::Eq,
-                left: Box::new(Self::Builtin(Builtin::Type)),
-                right: Box::new(Self::Literal(Literal::String("!!str".into()))),
-            }),
-            Box::new(Self::Compare {
-                op: CompareOp::Eq,
-                left: Box::new(Self::Identity),
-                right: Box::new(pat()),
-            }),
-        );
+        let is_matching = Self::Compare {
+            op: CompareOp::Eq,
+            left: Box::new(Self::Identity),
+            right: Box::new(pat()),
+        };
         let matches = Self::Array(Box::new(Self::pipe(vec![
             keys,
-            Self::Builtin(Builtin::Select(Box::new(is_matching_string))),
+            Self::Builtin(Builtin::Select(Box::new(is_matching))),
         ])));
         let none_matched = Self::Compare {
             op: CompareOp::Eq,
@@ -3121,7 +3115,10 @@ impl Expr {
             Self::If {
                 cond: Box::new(none_matched),
                 then_branch: Box::new(pat()),
-                else_branch: Box::new(Self::Iterate),
+                else_branch: Box::new(Self::pipe(vec![
+                    Self::Iterate,
+                    Self::Builtin(Builtin::ToString),
+                ])),
             },
         ])
     }

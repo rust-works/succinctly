@@ -21481,6 +21481,19 @@ fn eval_has_one_key<S: EvalSemantics, V: DocumentValue>(
     if cursor_is_null(value, cursor.as_ref()) {
         return GenericResult::Owned(OwnedValue::Bool(false));
     }
+    // #2800: yq's `has(k)` on a mapping compares the key's *text* for any scalar argument
+    // (`has(1)` is true on a `1:` member); see `eval::has_one_key`'s twin of this arm.
+    if S::TAG == EvalTag::Yq && !matches!(key_owned, OwnedValue::String(_)) {
+        if let (Some(fields), Some(text)) = (value.as_object(), yq_scalar_text::<S>(&key_owned)) {
+            if let Err(err) = empty_fields_tail_gap_ok(&fields, cursor.as_ref()) {
+                return GenericResult::Error(err);
+            }
+            return match crate::jq::key_index::contains_memoized(&fields, &text) {
+                Ok(found) => GenericResult::Owned(OwnedValue::Bool(found)),
+                Err(err) => GenericResult::Error(err),
+            };
+        }
+    }
     match (&key_owned, value.as_object(), value.as_array()) {
         // #2261: `contains_checked`, not the bare `contains` -- catches a
         // trailing stray comma (`{"a":1,} | has("a")`), a #1194 unpaired
