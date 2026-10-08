@@ -83,7 +83,7 @@ use super::eval::{
     yq_empty_context_reemit, yq_empty_operand_output, yq_field_index_on_scalar_is_empty,
     yq_first_of_each_key, yq_index_key_is_numeric, yq_literal_index_text, yq_mapping_index_text,
     yq_negative_index_check, yq_negative_index_error, yq_numeric_index_on_object_is_null,
-    yq_object_key_stringify, yq_read_only_context, yq_scalar_text, BinaryFanoutRules,
+    yq_object_key_stringify, yq_read_only_context, yq_scalar_text, yq_sort_by, BinaryFanoutRules,
     ComputedSliceBound, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
     JqSemantics, LimitN, PathTrail, QueryResult, RangeNum, Reentry, RestPipe, RootWitness,
     SliceTargetKind, StashedEscape, StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED,
@@ -22202,6 +22202,14 @@ impl SortKey {
         }
     }
 
+    /// This key as the `[f]` slice [`yq_sort_by`] compares: a bare element is a one-element key.
+    fn as_key_slice(&self) -> &[OwnedValue] {
+        match self {
+            Self::Own(value) => core::slice::from_ref(value),
+            Self::By(parts) => parts.as_slice(),
+        }
+    }
+
     /// The key real yq's `unique`/`unique_by` map this element on (#2799): the text of the
     /// element itself, or of the key filter's first output. See [`yq_dedup_key`].
     fn yq_dedup_key<S: EvalSemantics>(&self) -> String {
@@ -22392,6 +22400,11 @@ fn sort_family_array_generic<S: EvalSemantics, V: DocumentValue>(
 /// still point at distinct document positions that can print differently
 /// (two mappings with the same collapsed form but different duplicate keys).
 fn sort_keyed_elements<S: EvalSemantics, V: DocumentValue>(keyed: &mut [(SortKey, V::Cursor)]) {
+    if S::TAG == EvalTag::Yq {
+        // #2799: yq's comparator and sort -- see `eval::yq_sort_by`.
+        yq_sort_by::<_, S>(keyed, |(key, _)| key.as_key_slice());
+        return;
+    }
     keyed.sort_by(|(a, _), (b, _)| a.cmp::<S>(b));
 }
 
