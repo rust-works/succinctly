@@ -1720,6 +1720,20 @@ pub(crate) struct BinaryFanoutRules {
     pub(crate) read_only: bool,
 }
 
+impl BinaryFanoutRules {
+    /// Whether an operand that produced nothing may still be re-emitted by a
+    /// context-free stage of it (#2588, see [`yq_empty_context_reemit`]).
+    ///
+    /// yq mode only, and only where absent keys are read as empty to begin
+    /// with: an arithmetic or `and`/`or` operand (`read_only`), or any
+    /// operand -- a comparison's included -- of an expression already inside
+    /// an enclosing read-only scope, which is what an assignment's right side
+    /// is (`.x = ((.a.zz | 1) == 1)` is `true` there, `.a.zz` being empty).
+    pub(crate) fn reemits_empty_operand(&self) -> bool {
+        self.empty.is_some() && (self.read_only || yq_read_only_context::active())
+    }
+}
+
 /// The one place any binary-fanout rule is read off `S` (#2460/#2451/#2470).
 pub(crate) fn binary_fanout_rules<S: EvalSemantics>(op: EmptyOperandOp) -> BinaryFanoutRules {
     BinaryFanoutRules {
@@ -3711,14 +3725,15 @@ pub(crate) fn literal_to_owned(lit: &Literal) -> OwnedValue {
     OwnedValue::from(lit.clone())
 }
 
-/// **yq's "a literal or constructor against an empty context still yields
-/// one node" rule** (#2540), consulted only inside a
-/// [read-only context](yq_read_only_context) (#2470) when the operand
+/// **yq's "a context-free stage against an empty context still emits"
+/// rule** (#2540, generalised by #2588), consulted only inside a
+/// [read-only context](yq_read_only_context) (#2470) when an operand
 /// expression produced zero outputs, right before that emptiness would
 /// otherwise reach [`yq_empty_operand_output`]'s (#2460) table. Shared
 /// between both evaluators (`eval.rs`'s [`read_only_operand_strategy`] and
-/// `eval_generic.rs`'s `read_only_operand_strategy_generic`) since it is
-/// pure `Expr` classification with no cursor/document dependency at all.
+/// `eval_generic.rs`'s `read_only_operand_strategy_generic`) and the
+/// assignment prologue ([`collect_rhs_outputs`]) since it is pure `Expr`
+/// classification with no cursor/document dependency at all.
 ///
 /// Real yq's `valueOperator` special-cases an empty `context.MatchingNodes`
 /// by re-emitting a copy of the literal node itself rather than looping zero
@@ -3730,32 +3745,39 @@ pub(crate) fn literal_to_owned(lit: &Literal) -> OwnedValue {
 ///
 /// | `EXPR`            | produces (not "empty" for #2460's purposes) |
 /// |-------------------|----------------------------------------------|
-/// | `true`/`5`/`"s"`  | itself, unconditionally                       |
+/// | `true`/`5`/`"s"`/`-1` | itself, unconditionally                   |
 /// | `[.]`/`[.a]`/`[1,2]` | `[]`, **regardless of the array's own body** -- it loops zero times over the (empty) context, but the collected array is still emitted once |
 /// | `{"k": 1}`        | `{"k": 1}` -- every field's value also independently qualifies |
+/// | `{"k": [1]}`      | `{"k": []}` -- each field value is itself re-emitted |
 /// | `{"k": .}`        | nothing -- `.` does not have this special case (it propagates the emptiness, matching `operator_self.go`'s "return input context unchanged"), so the *whole* object construction aborts, not just that one field |
 /// | `{"k": 1, "j": .}` | nothing -- one disqualifying field is enough; this is not a per-field union |
+/// | `1 + 1`/`1 == 1`/`1 // 3` | the operator applied to the re-emitted operands -- both operands must qualify |
+/// | `(1, .b)`         | `1` -- a comma re-emits only its qualifying branches |
+/// | `true \| not`/`[1] \| length`/`{"q": 1} \| .q` | the first stage re-emits and **every later stage then runs normally** on what it emitted |
 /// | `.`/`length`/any other filter | nothing (propagates, matching the pre-existing #2460 oracle rows for `key`/`parent`) |
 ///
-/// A `Pipe` recurses into its own *last* stage only: a pipe's overall
-/// "what does the tail produce given an empty upstream" is governed
-/// entirely by the tail's own rule once every earlier stage has already
-/// contributed nothing, mirroring how yq's own pipe operator hands the
-/// (empty) context straight to the next operator without accumulating
-/// anything from a stage that produced zero nodes.
+/// A `Pipe` is therefore classified by its *first* qualifying stage, not its
+/// last (#2540 modelled the last): every stage before it hands the empty
+/// context straight on, mirroring how yq's own pipe operator passes zero
+/// nodes along without accumulating anything, and the first context-free
+/// operator then restarts the stream from a node of its own.
 ///
-/// Deliberately does not special-case `Expr::Shared` (native since #2416
-/// phase 3, transparent to evaluation): unwrapping it here would be correct
-/// but is not exercised by any known query shape yet, so it is left for
-/// whoever hits it live rather than guessed at.
-pub(crate) fn yq_empty_context_literal_or_constructor(expr: &Expr) -> Option<OwnedValue> {
+/// Returns the expression that, evaluated against **any** input, reproduces
+/// what yq emits: each admitted stage is context-free by construction, so
+/// the rewritten expression never reads the input it is evaluated against.
+/// The admitted set is closed and enumerated below; in particular
+/// `Expr::Shared` is deliberately not unwrapped (native since #2416 phase 3,
+/// transparent to evaluation): unwrapping it would be correct but is not
+/// exercised by any known query shape yet, so it is left for whoever hits it
+/// live rather than guessed at.
+pub(crate) fn yq_empty_context_reemit(expr: &Expr) -> Option<Expr> {
     match super::eval_generic::strip_parens(expr) {
-        Expr::Literal(lit) => Some(literal_to_owned(lit)),
+        lit @ Expr::Literal(_) => Some(lit.clone()),
         // Regardless of `body`: the collected array is emitted once even
         // when its own body loops zero times over the empty context.
-        Expr::Array(_) => Some(OwnedValue::array()),
+        Expr::Array(_) => Some(Expr::Array(Box::new(Expr::Comma(Vec::new())))),
         Expr::Object(entries) => {
-            let mut map = IndexMap::new();
+            let mut rewritten = Vec::new();
             for entry in entries {
                 let key = match &entry.key {
                     ObjectKey::Literal(s) => s.clone(),
@@ -3766,25 +3788,70 @@ pub(crate) fn yq_empty_context_literal_or_constructor(expr: &Expr) -> Option<Own
                     // disqualifying the object; only a genuinely
                     // non-stringifiable key (`Array`/`Object`, which
                     // `yq_object_key_stringify` already refuses) does that.
+                    // Only a literal key can be stringified here without
+                    // evaluating anything, so any other re-emitting key
+                    // (#2588) declines the whole object rather than risk
+                    // raising where yq emits nothing.
                     // `YqSemantics` unconditionally, not a generic `S`: this
                     // whole function only ever runs under `rules.read_only`,
                     // which is yq-only by construction (see this function's
                     // own doc comment), so there is no jq-mode call to get
                     // this wrong for.
-                    ObjectKey::Expr(k) => {
-                        let v = yq_empty_context_literal_or_constructor(k)?;
-                        match &v {
-                            OwnedValue::String(s) => String::clone(s),
-                            _ => yq_object_key_stringify::<YqSemantics>(&v)?,
-                        }
-                    }
+                    ObjectKey::Expr(k) => match yq_empty_context_reemit(k)? {
+                        Expr::Literal(lit) => match literal_to_owned(&lit) {
+                            OwnedValue::String(s) => String::clone(&s),
+                            v => yq_object_key_stringify::<YqSemantics>(&v)?,
+                        },
+                        _ => return None,
+                    },
                 };
-                let value = yq_empty_context_literal_or_constructor(&entry.value)?;
-                map.insert(key, value);
+                rewritten.push(ObjectEntry {
+                    key: ObjectKey::Literal(key),
+                    value: yq_empty_context_reemit(&entry.value)?,
+                });
             }
-            Some(OwnedValue::Object(map.into()))
+            Some(Expr::Object(rewritten))
         }
-        Expr::Pipe(stages) => yq_empty_context_literal_or_constructor(stages.last()?),
+        Expr::Comma(branches) => {
+            let kept: Vec<Expr> = branches
+                .iter()
+                .filter_map(yq_empty_context_reemit)
+                .collect();
+            (!kept.is_empty()).then(|| Expr::comma(kept))
+        }
+        Expr::Negate(operand) => Some(Expr::Negate(Box::new(yq_empty_context_reemit(operand)?))),
+        Expr::Arithmetic { op, left, right } => Some(Expr::Arithmetic {
+            op: *op,
+            left: Box::new(yq_empty_context_reemit(left)?),
+            right: Box::new(yq_empty_context_reemit(right)?),
+        }),
+        Expr::Compare { op, left, right } => Some(Expr::Compare {
+            op: *op,
+            left: Box::new(yq_empty_context_reemit(left)?),
+            right: Box::new(yq_empty_context_reemit(right)?),
+        }),
+        Expr::And(left, right) => Some(Expr::And(
+            Box::new(yq_empty_context_reemit(left)?),
+            Box::new(yq_empty_context_reemit(right)?),
+        )),
+        Expr::Or(left, right) => Some(Expr::Or(
+            Box::new(yq_empty_context_reemit(left)?),
+            Box::new(yq_empty_context_reemit(right)?),
+        )),
+        Expr::Alternative(left, right) => Some(Expr::Alternative(
+            Box::new(yq_empty_context_reemit(left)?),
+            Box::new(yq_empty_context_reemit(right)?),
+        )),
+        Expr::Pipe(stages) => {
+            let (at, head) = stages
+                .iter()
+                .enumerate()
+                .find_map(|(i, stage)| Some((i, yq_empty_context_reemit(stage)?)))?;
+            let mut rewritten = Vec::new();
+            rewritten.push(head);
+            rewritten.extend(stages[at + 1..].iter().cloned());
+            Some(Expr::pipe(rewritten))
+        }
         _ => None,
     }
 }
@@ -12005,7 +12072,7 @@ fn binary_fanout_each_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // count can be answered from `yq_empty_operand_output` instead of
     // silently contributing no pairings. `None` in jq mode, where `1 + empty`
     // really is nothing.
-    let mut outer_seen = 0usize;
+    let outer_seen = core::cell::Cell::new(0usize);
     // #2451: which operand drives the outer loop. jq re-evaluates the *left*
     // operand per right output; yq re-evaluates the *right* one per left
     // output (`doCrossFunc`, `pkg/yqlib/operators.go:113-138`). Only the
@@ -12018,18 +12085,18 @@ fn binary_fanout_each_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         (right, left)
     };
 
-    let outer = each_operand(outer_expr, &mut |outer_item: Item<'a, W>| {
+    let mut on_outer = |outer_item: Item<'a, W>| {
         abort.begin();
-        outer_seen += 1;
+        outer_seen.set(outer_seen.get() + 1);
         let outer_val = match checked_fanout_operand::<_, S>(outer_item, &abort) {
             Ok(v) => v,
             Err(demand) => return demand,
         };
 
-        let mut inner_seen = 0usize;
-        let inner = each_operand(inner_expr, &mut |inner_item: Item<'a, W>| {
+        let inner_seen = core::cell::Cell::new(0usize);
+        let mut on_inner = |inner_item: Item<'a, W>| {
             abort.begin();
-            inner_seen += 1;
+            inner_seen.set(inner_seen.get() + 1);
             let inner_val = match checked_fanout_operand::<_, S>(inner_item, &abort) {
                 Ok(v) => v,
                 Err(demand) => return demand,
@@ -12073,7 +12140,8 @@ fn binary_fanout_each_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     })
                 }
             }
-        });
+        };
+        let mut inner = each_operand(inner_expr, &mut on_inner);
 
         // A `combine` failure has already decided; the `Stopped` it induces
         // in the inner loop must not overwrite that verdict.
@@ -12083,6 +12151,25 @@ fn binary_fanout_each_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         if abort.is_set() {
             return Demand::Stop;
         }
+
+        // #2588 (yq mode only): the inner operand produced nothing, but a
+        // context-free stage of it re-emits a node of its own (see
+        // [`yq_empty_context_reemit`]), so the rewritten operand is paired
+        // with this outer value through the same body instead of falling to
+        // the empty-operand table below.
+        if inner_seen.get() == 0
+            && matches!(inner, Flow::Exhausted)
+            && rules.reemits_empty_operand()
+        {
+            if let Some(reemit) = yq_empty_context_reemit(inner_expr) {
+                inner = each_operand(&reemit, &mut on_inner);
+                abort.settle(&inner, direct_pattern_retry(&reemit));
+                if abort.is_set() {
+                    return Demand::Stop;
+                }
+            }
+        }
+        let inner_seen = inner_seen.get();
 
         // #2460 (yq mode only): the *inner* operand produced nothing for this
         // outer value, so this pairing is answered from the empty-operand
@@ -12109,7 +12196,8 @@ fn binary_fanout_each_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // reason `eval_each_pipe`'s downstream stop ends stage 1.
             other => abort.stop_with_downstream(other),
         }
-    });
+    };
+    let mut outer = each_operand(outer_expr, &mut on_outer);
 
     // The inner verdict wins over the outer loop's `Stopped`, which is only
     // the echo of our own driver returning `Stop`.
@@ -12148,8 +12236,24 @@ fn binary_fanout_each_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // #2693 gave the family its own arm. `while` has no lazy arm, so it is
     // what the current pair uses -- see
     // `test_short_circuit_side_effect_leaks_820_932_987`.
-    let abort = abort.take(&outer, direct_pattern_retry(outer_expr));
-    if let (Some(op), 0, None, Flow::Exhausted) = (rules.empty, outer_seen, &abort, &outer) {
+    abort.settle(&outer, direct_pattern_retry(outer_expr));
+    // #2588 (yq mode only): the outer operand produced nothing, but a
+    // context-free stage of it re-emits a node of its own (see
+    // [`yq_empty_context_reemit`]); pair the rewritten operand with the inner
+    // one through the same loop body.
+    let mut outer_driven = outer_expr;
+    let reemit = (outer_seen.get() == 0
+        && rules.reemits_empty_operand()
+        && !abort.is_set()
+        && matches!(outer, Flow::Exhausted))
+    .then(|| yq_empty_context_reemit(outer_expr))
+    .flatten();
+    if let Some(reemit) = &reemit {
+        outer = each_operand(reemit, &mut on_outer);
+        outer_driven = reemit;
+    }
+    let abort = abort.take(&outer, direct_pattern_retry(outer_driven));
+    if let (Some(op), 0, None, Flow::Exhausted) = (rules.empty, outer_seen.get(), &abort, &outer) {
         // #2460 (yq mode only): the *outer* operand produced nothing, so the
         // loop above never ran and the inner one was never evaluated at all.
         // Drive it once here and answer each of its outputs from the same
@@ -12525,18 +12629,22 @@ fn boolean_fanout_each_with(
     // can only answer `Demand` -- the same shape `binary_fanout_each`'s own
     // `abort` uses.
     let abort = StashedEscape::new();
-    let mut outer_stopped = false;
-    let mut left_seen = 0usize;
+    let outer_stopped = core::cell::Cell::new(false);
+    let left_seen = core::cell::Cell::new(0usize);
 
-    let mut flow = each_operand(left, &mut |left_bit| {
+    // One left-operand bit, paired against the right operand. A closure
+    // rather than an inline literal because the #2588 re-emission below
+    // drives it a second time, with the rewritten operand.
+    let mut on_left_bit = |left_bit: bool| {
         // #3293: a re-invocation after a stop is a `?//` retry inside
         // `left`; it supersedes whatever the retried-past bit decided,
         // including a consumer's stop that would otherwise hide the error
         // the retry's own pairing raises.
         abort.begin();
-        outer_stopped = false;
-        left_seen += 1;
-        boolean_pair_left_bit(
+        outer_stopped.set(false);
+        left_seen.set(left_seen.get() + 1);
+        let mut stopped = false;
+        let demand = boolean_pair_left_bit(
             left_bit,
             right,
             short_circuit,
@@ -12544,35 +12652,40 @@ fn boolean_fanout_each_with(
             &each_operand,
             sink,
             &abort,
-            &mut outer_stopped,
-        )
-    });
-    // #3293: a retry inside `left` that produced nothing never re-invoked
-    // the closure above.
-    abort.settle(&flow, direct_pattern_retry(left));
+            &mut stopped,
+        );
+        outer_stopped.set(stopped);
+        demand
+    };
+    let mut drive_left = |operand: &Expr| {
+        let flow = each_operand(operand, &mut on_left_bit);
+        // #3293: a retry inside `operand` that produced nothing never
+        // re-invoked the closure above.
+        abort.settle(&flow, direct_pattern_retry(operand));
+        flow
+    };
+    let mut flow = drive_left(left);
 
-    // #2460/#2540 (yq mode only): the left operand produced *zero* outputs,
-    // so it contributes one synthesized truthiness bit, which then runs
-    // through the identical pairing body above rather than a second
-    // spelling of it. See [`empty_boolean_operand_bit`] for which bit, and
-    // why a literal/constructor operand is not "empty" at all.
-    if left_seen == 0 && !abort.is_set() && matches!(flow, Flow::Exhausted) {
-        if let Some(bit) = empty_boolean_operand_bit(left, rules) {
-            let demand = boolean_pair_left_bit(
-                bit,
-                right,
-                short_circuit,
-                rules,
-                &each_operand,
-                sink,
-                &abort,
-                &mut outer_stopped,
-            );
+    // #2460/#2540/#2588 (yq mode only): the left operand produced *zero*
+    // outputs. If a context-free stage of it re-emits (see
+    // [`yq_empty_context_reemit`]) the rewritten operand is driven through
+    // the identical pairing body; otherwise it contributes one synthesized
+    // truthiness bit, see [`empty_boolean_operand`].
+    if left_seen.get() == 0 && !abort.is_set() && matches!(flow, Flow::Exhausted) {
+        if let Some(reemit) = rules
+            .read_only
+            .then(|| yq_empty_context_reemit(left))
+            .flatten()
+        {
+            flow = drive_left(&reemit);
+        } else if let Some(bit) = empty_boolean_operand(rules.empty) {
+            let demand = on_left_bit(bit);
             if demand == Demand::Stop && !abort.is_set() {
                 flow = Flow::Stopped { pending: None };
             }
         }
     }
+    let outer_stopped = outer_stopped.get();
 
     if abort.is_set() {
         return abort.resume(flow, false);
@@ -12613,18 +12726,26 @@ fn boolean_pair_left_bit(
     }
 
     let mut right_seen = 0usize;
-    let right_flow = each_operand(right, &mut |right_bit| {
+    let mut right_flow = each_operand(right, &mut |right_bit| {
         right_seen += 1;
         sink(right_bit)
     });
 
-    // #2460/#2540 (yq mode only), the right-operand half -- same rule and
-    // same gate as the left one, only reachable once the right operand ran
-    // to exhaustion (an operand that escaped or was stopped part-way is not
-    // "empty"), exactly as `binary_fanout_each`'s own `inner_seen == 0`
-    // check requires.
+    // #2460/#2540/#2588 (yq mode only), the right-operand half -- same rule
+    // and same gate as the left one, only reachable once the right operand
+    // ran to exhaustion (an operand that escaped or was stopped part-way is
+    // not "empty"), exactly as `binary_fanout_each`'s own `inner_seen == 0`
+    // check requires. A re-emitting stage (see [`yq_empty_context_reemit`])
+    // supplies every bit its rewritten operand produces; failing that the
+    // operand contributes the empty-operand table's one bit.
     if right_seen == 0 && matches!(right_flow, Flow::Exhausted) {
-        if let Some(bit) = empty_boolean_operand_bit(right, rules) {
+        if let Some(reemit) = rules
+            .read_only
+            .then(|| yq_empty_context_reemit(right))
+            .flatten()
+        {
+            right_flow = each_operand(&reemit, sink);
+        } else if let Some(bit) = empty_boolean_operand(rules.empty) {
             if sink(bit) == Demand::Stop {
                 *outer_stopped = true;
                 return Demand::Stop;
@@ -12647,38 +12768,6 @@ fn boolean_pair_left_bit(
         // sink-world spelling of the pre-WP2a `return (out, Some(control))`
         // (#400/#494).
         Flow::Escaped(control) => abort.stop(control),
-    }
-}
-
-/// The truthiness bit a *zero-output* `and`/`or` operand contributes, or
-/// `None` for "contribute nothing" (jq mode, always).
-///
-/// Two rules, in the order [`boolean_fanout_bools`] applied them before
-/// #2180 WP2a lifted them out of its loop:
-///
-/// * #2540 -- a literal/constructor operand was never really "empty" in real
-///   yq's own model to begin with; its operator special-cases a zero-node
-///   context and re-emits one node anyway (see
-///   [`yq_empty_context_literal_or_constructor`]). Checked only when
-///   `rules.read_only` is set: this "empty" only exists because `and`/`or`'s
-///   own read-only context turned `.a.zz` into zero nodes in the first place
-///   (#2470), so the same gate that created the emptiness decides whether
-///   this rule can override it.
-/// * #2460 -- otherwise the operand contributes one `false`, which is the
-///   whole of yq's captured `and`/`or` behaviour: `and` then short-circuits
-///   to `false` without consulting the other side (yq's inconsistency 4),
-///   and `or` falls through to the other operand's own truthiness. The rule
-///   itself lives in [`yq_empty_operand_output`], so `and`/`or` and the
-///   arithmetic/comparison fanout share one definition of "this operand was
-///   empty".
-fn empty_boolean_operand_bit(operand: &Expr, rules: BinaryFanoutRules) -> Option<bool> {
-    match rules
-        .read_only
-        .then(|| yq_empty_context_literal_or_constructor(operand))
-        .flatten()
-    {
-        Some(v) => Some(v.is_truthy()),
-        None => empty_boolean_operand(rules.empty),
     }
 }
 
@@ -29823,7 +29912,20 @@ fn collect_rhs_outputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Some(doc) => eval_owned_input::<W, S>(value_expr, doc, optional, Reentry::REBUILT),
         None => eval_single::<W, S>(value_expr, input.clone(), optional),
     };
-    match evaluated.materialize_cursor() {
+    let mut evaluated = evaluated.materialize_cursor();
+    // #2588: a right side that produced nothing under the read-only scope is
+    // still not empty when a context-free stage of it re-emits a node of its
+    // own (`.x = (.a.zz | true)` is `x: true` in real yq, see
+    // `yq_empty_context_reemit`). The rewrite reads nothing from the input,
+    // so it is evaluated against `null` inside this same still-open scope.
+    if S::READ_ONLY_ABSENT_KEY_IS_EMPTY && matches!(evaluated, QueryResult::None) {
+        if let Some(reemit) = yq_empty_context_reemit(value_expr) {
+            evaluated =
+                eval_owned_input::<W, S>(&reemit, &OwnedValue::Null, optional, Reentry::REBUILT)
+                    .materialize_cursor();
+        }
+    }
+    match evaluated {
         QueryResult::One(v) => match to_owned::<S, _>(&v) {
             Ok(owned) => Ok((vec![owned], None)),
             Err(e) => Err(suppress_or_raise(e, optional)),
@@ -85835,6 +85937,50 @@ mod tests {
             ".[0:1]",
             QueryResult::Owned(_) => {}
         );
+    }
+
+    /// #2588: `yq_empty_context_reemit`'s rewrite for each shape the classifier
+    /// admits, and `None` for each it must decline. The rewrite is rendered
+    /// back to source so the assertion reads as the rule: the first
+    /// context-free stage restarts the stream, every later stage is kept, a
+    /// comma keeps only its re-emitting branches, an array collapses to `[]`.
+    #[test]
+    fn test_yq_empty_context_reemit_rewrites_2588() {
+        // Compared as parsed expressions: the expected side is the source the
+        // rewrite should be equivalent to.
+        let reemit = |src: &str| yq_empty_context_reemit(&parse(src).unwrap());
+        let is = |got: Option<Expr>, want: &str| {
+            assert_eq!(got, Some(parse(want).unwrap()), "want `{want}`");
+        };
+        is(reemit("true"), "true");
+        is(reemit("-1"), "-1");
+        is(reemit("[1, 2]"), "[]");
+        is(reemit("{\"q\": [1]}"), "{\"q\": []}");
+        // Pipe: the first re-emitting stage wins; the tail is kept verbatim.
+        is(reemit(".a | true | not"), "true | not");
+        is(reemit("[1] | length"), "[] | length");
+        // A re-emitting stage after a propagating one still restarts.
+        is(reemit(".a | length | 7"), "7");
+        // Comma: only the branches that re-emit survive.
+        is(reemit("(1, .b)"), "1");
+        assert_eq!(reemit("(.b, .c)"), None);
+        // Operators need every operand to re-emit.
+        is(reemit("1 + 1"), "1 + 1");
+        assert_eq!(reemit("1 + .b"), None);
+        is(reemit("1 == 1"), "1 == 1");
+        is(reemit("1 // 3"), "1 // 3");
+        assert_eq!(reemit(". // 3"), None);
+        // An object is all-or-nothing, a dynamic key only when it is a literal.
+        is(reemit("{\"q\": 1}"), "{\"q\": 1}");
+        assert_eq!(reemit("{\"q\": .b}"), None);
+        assert_eq!(reemit("{\"k\": 1, \"j\": .}"), None);
+        is(reemit("{(5): 1}"), "{\"5\": 1}");
+        assert_eq!(reemit("{(.b): 1}"), None);
+        assert_eq!(reemit("{([1]): 1}"), None);
+        // Anything that reads its input propagates the emptiness.
+        for src in [".", ".b", "length", "select(true)", "tostring", "keys"] {
+            assert_eq!(reemit(src), None, "`{src}`");
+        }
     }
 
     /// #1755 (now against `collect_rhs_outputs`, #1778's replacement for
