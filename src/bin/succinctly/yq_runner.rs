@@ -5159,7 +5159,14 @@ fn emit_yaml_value_at_depth(
                                 format!("{indent}- {first_line}")
                             }
                         } else {
-                            let val_indent = format!("{indent}{}", config.indent_str);
+                            // A block scalar's content sits two columns in from its
+                            // `- `, whatever the indent width (#2707); every other
+                            // scalar ignores the indent it is handed.
+                            let val_indent = if matches!(v, OwnedValue::String(_)) {
+                                format!("{indent}  ")
+                            } else {
+                                format!("{indent}{}", config.indent_str)
+                            };
                             let item = emit_yaml_value_at_depth(
                                 v,
                                 elem_comments,
@@ -5442,16 +5449,16 @@ fn can_single_quote(s: &str) -> bool {
     !s.chars().any(|c| c.is_ascii_control())
 }
 
-/// Whether go-yaml writes a string with a line break double-quoted whatever the
-/// requested style: a character its emitter will not write raw (a control, `\r`,
-/// a character outside the BMP) or a space before a line break (libyaml's
-/// `special_characters` and `space_break`).
 /// A character go-yaml's emitter treats as a line break, other than `\r`, which it
 /// will not write raw.
 fn is_yaml_line_break(c: char) -> bool {
     matches!(c, '\n' | '\u{85}' | '\u{2028}' | '\u{2029}')
 }
 
+/// Whether go-yaml writes a string with a line break double-quoted whatever the
+/// requested style: a character its emitter will not write raw (a control, `\r`,
+/// a character outside the BMP) or a space before a line break (libyaml's
+/// `special_characters` and `space_break`).
 fn go_yaml_forces_double_quotes(s: &str) -> bool {
     let printable = |c: char| {
         matches!(
@@ -5486,7 +5493,7 @@ fn emit_string_scalar(
         let folded = match style {
             "literal" => Some(false),
             "folded" => Some(true),
-            "" | VALUE_STYLE_STRING if s.contains('\n') => Some(false),
+            "" | "flow" | VALUE_STYLE_STRING if s.contains('\n') => Some(false),
             _ => None,
         };
         if let Some(folded) = folded {
@@ -5496,7 +5503,7 @@ fn emit_string_scalar(
         }
     }
     if matches!(style, "literal" | "folded")
-        || (matches!(style, "" | VALUE_STYLE_STRING)
+        || (matches!(style, "" | "flow" | VALUE_STYLE_STRING)
             && s.contains(['\n', '\r', '\u{85}', '\u{2028}', '\u{2029}'])
             && go_yaml_forces_double_quotes(s))
     {
@@ -5542,24 +5549,24 @@ fn emit_block_scalar(s: &str, folded: bool, indent: &str, step: usize) -> Option
     if s.is_empty() || step == 0 || step > 9 {
         return None;
     }
-    let chars: Vec<char> = s.chars().collect();
-    if go_yaml_forces_double_quotes(s) || chars.last() == Some(&' ') {
+    let last = s.chars().next_back()?;
+    if go_yaml_forces_double_quotes(s) || last == ' ' || (last != '\n' && is_yaml_line_break(last))
+    {
         return None;
     }
-    let first = chars[0];
-    let hint = if first == ' ' {
+    let hint = if s.starts_with(' ') {
         char::from_digit(step as u32, 10)?.to_string()
     } else {
         String::new()
     };
-    let breaks_at_end = chars
-        .iter()
+    let breaks_at_end = s
+        .chars()
         .rev()
-        .take_while(|&&c| is_yaml_line_break(c))
+        .take_while(|&c| is_yaml_line_break(c))
         .count();
     let chomp = match breaks_at_end {
         0 => "-",
-        1 if chars.len() > 1 => "",
+        1 if s.len() > 1 => "",
         _ => "+",
     };
     let mut out = format!("{}{hint}{chomp}\n", if folded { '>' } else { '|' });
@@ -5567,10 +5574,10 @@ fn emit_block_scalar(s: &str, folded: bool, indent: &str, step: usize) -> Option
     let text: &str = s.strip_suffix(is_yaml_line_break).unwrap_or(s);
     if folded {
         // go-yaml's quirk, see the doc comment: the test reads the string's start.
-        let extra_break = chars
-            .iter()
-            .find(|&&c| !is_yaml_line_break(c))
-            .is_some_and(|&c| !matches!(c, ' ' | '\t'));
+        let extra_break = s
+            .chars()
+            .find(|&c| !is_yaml_line_break(c))
+            .is_some_and(|c| !matches!(c, ' ' | '\t'));
         let mut breaks = true;
         let mut leading_spaces = true;
         for c in text.chars() {

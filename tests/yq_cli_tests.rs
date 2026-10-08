@@ -43591,6 +43591,169 @@ b: 1
     Ok(())
 }
 
+/// #2707: a block scalar in a sequence item has its content two columns in from the
+/// `- `, whatever the `-I` width (the indentation indicator still carries the width),
+/// and a requested `flow` style keeps a multi-line string a block scalar. Captured
+/// live from yq v4.53.3.
+#[test]
+fn test_yq_block_scalar_in_a_sequence_and_under_flow_style_2707() -> Result<()> {
+    let cases: &[(&str, &str, &[&str], &str)] = &[
+        (
+            r"a:
+  - 1
+",
+            r#".a[0] = "x\ny""#,
+            &["-I4"],
+            r"a:
+    - |-
+      x
+      y
+",
+        ),
+        (
+            r"a:
+  - 1
+",
+            r#".a[0] = "x\ny""#,
+            &["-I3"],
+            r"a:
+   - |-
+     x
+     y
+",
+        ),
+        (
+            r"a:
+  - 1
+",
+            r#".a[0] = "x\ny""#,
+            &["-I8"],
+            r"a:
+        - |-
+          x
+          y
+",
+        ),
+        (
+            r"a:
+  - 1
+",
+            r#".a[0] = " x\ny""#,
+            &["-I4"],
+            r"a:
+    - |4-
+       x
+      y
+",
+        ),
+        (
+            r"- 1
+",
+            r#".[0] = "x\ny""#,
+            &["-I4"],
+            r"- |-
+  x
+  y
+",
+        ),
+        (
+            r"- 1
+",
+            r#".[0] = " x\ny""#,
+            &["-I4"],
+            r"- |4-
+   x
+  y
+",
+        ),
+        (
+            r"a:
+  - 1
+",
+            r#".a[0] style="folded""#,
+            &["-I4"],
+            r"a:
+    - >-
+      1
+",
+        ),
+        (
+            r"a:
+  - 1
+",
+            r#".a[0] = "x\ny""#,
+            &["-I1"],
+            r"a:
+  - |-
+    x
+    y
+",
+        ),
+        (
+            r"a:
+  b:
+    - 1
+",
+            r#".a.b[0] = "x\ny""#,
+            &["-I4"],
+            r"a:
+    b:
+        - |-
+          x
+          y
+",
+        ),
+        (
+            r"- - 1
+",
+            r#".[0][0] = "x\ny""#,
+            &["-I4"],
+            r"- - |-
+    x
+    y
+",
+        ),
+        (
+            r"a:
+  - k: 1
+",
+            r#".a[0].k = "x\ny""#,
+            &["-I4"],
+            r"a:
+    - k: |-
+        x
+        y
+",
+        ),
+        (
+            r"a: |
+  x
+",
+            r#".a style="flow""#,
+            &[],
+            r"a: |
+  x
+",
+        ),
+        (
+            r"a: x
+",
+            r#".a = "p\nq" | .a style="flow""#,
+            &[],
+            r"a: |-
+  p
+  q
+",
+        ),
+    ];
+    for (doc, filter, extra, want) in cases {
+        let (out, err, code) = run_yq_stdin_with_stderr(filter, doc, extra)?;
+        assert_eq!(out, *want, "`{filter}` {extra:?} on {doc:?}: {err}");
+        assert_eq!(code, 0, "`{filter}` {extra:?} on {doc:?}: {err}");
+    }
+    Ok(())
+}
+
 /// #2707: whatever block scalar is written reads back as the same string -- a
 /// wrong chomping or indentation indicator changes the value silently, so this
 /// round-trips a grid of leading spaces, tabs, `#`, `- `, `: ` and 0-3 trailing

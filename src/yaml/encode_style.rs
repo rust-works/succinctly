@@ -183,9 +183,10 @@ pub fn go_yaml_dom_scalar(s: &str, flow: bool, json_sourced: bool, is_key: bool)
     go_yaml_string_scalar(s, flow)
 }
 
-/// `s` as go-yaml's emitter writes a double-quoted scalar, as a string, for the yq command line's DOM
-/// writer (#2707): the fallback for a string it was asked to write as a block
-/// scalar (`style = "literal"`) that go-yaml cannot.
+/// `s` as go-yaml's emitter writes a double-quoted scalar, as a string.
+///
+/// For the yq command line's DOM writer (#2707): the fallback for a string it was
+/// asked to write as a block scalar (`style = "literal"`) that go-yaml cannot.
 #[must_use]
 pub fn go_yaml_double_quoted_scalar(s: &str) -> String {
     let mut out = String::new();
