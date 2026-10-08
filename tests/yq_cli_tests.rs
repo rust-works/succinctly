@@ -159,6 +159,37 @@ fn test_wildcard_mapping_key_lookups_3374() -> Result<()> {
     Ok(())
 }
 
+/// #2821: a standalone comment trailing a document whose content is a bare scalar is that
+/// document's own `foot_comment`, alone and after an earlier document. Rows captured from
+/// pinned yq v4.53.3.
+#[test]
+fn test_bare_scalar_document_trailing_comment_is_its_foot_2821() -> Result<()> {
+    for (input, filter, expected) in [
+        ("hello\n# trail\n", "foot_comment", "trail\n"),
+        ("\"hello\"\n# trail\n", "foot_comment", "trail\n"),
+        ("# head\nhello # line\n# trail\n", "foot_comment", "trail\n"),
+        ("# head\nhello # line\n# trail\n", "head_comment", "head\n"),
+        ("# head\nhello # line\n# trail\n", "line_comment", "line\n"),
+        (
+            "- 1\n- 2\n---\nhello\n# trail\n",
+            "select(document_index==1) | foot_comment",
+            "trail\n",
+        ),
+        (
+            "- 1\n- 2\n---\nhello\n# trail\n",
+            "select(document_index==0) | foot_comment",
+            "\n",
+        ),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, input, &[])?,
+            (expected.into(), String::new(), 0),
+            "{input:?} | {filter}"
+        );
+    }
+    Ok(())
+}
+
 /// #3479: after a write (or `-R`, `--slurp`) `succinctly yq` evaluates a
 /// value it re-indexed into throwaway JSON text, so `line`/`column` answer the
 /// fixed default `0` there, never a position inside that text. Real yq 4.53.3

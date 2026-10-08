@@ -1,0 +1,1 @@
+- **`succinctly yq` reads a bare-scalar document's trailing comment as its `foot_comment`** (#2821). `printf 'hello\n# trail\n' | yq 'foot_comment'` is `trail`, alone and after an earlier document; this already held on `main`, and is now pinned by `test_bare_scalar_document_trailing_comment_is_its_foot_2821`.
