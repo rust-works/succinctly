@@ -26284,8 +26284,12 @@ fn test_complex_output_flags_over_depth_document_report_cleanly_not_panic_2850()
 ///   `is_falsy` -- O(1), no recursion -- so `. and true` answers `true` at
 ///   exit 0 on this same 300-deep input. That is pinned as its own claim by
 ///   `test_truthiness_probes_do_not_trip_the_depth_guard_2692`.
-/// - `. as $x | $x` is the current probe: a binding still materializes the
-///   ambient value through the bridge, so it still reaches the guard.
+/// - `. as $x | $x` was the probe after that: a binding materialized the
+///   ambient value through the bridge, so it reached the guard. #3856 ended
+///   that too: a bind that only hands its node on (`$x` is read where the
+///   ambient is a cursor) decodes nothing, so it echoes the document like `.`
+///   does. `. as $x | $x | tojson` is the current probe: `tojson` reads the
+///   node, so it still reaches the guard.
 ///
 /// Already shielded at the CLI boundary by `catch_unwind` (#1793) before the
 /// fix -- confirmed via `!stderr.contains("panicked")` below, so this pins
@@ -26295,7 +26299,8 @@ fn test_complex_output_flags_over_depth_document_report_cleanly_not_panic_2850()
 /// which had no such net.
 #[test]
 fn test_boolean_wildcard_bridge_over_depth_document_reports_cleanly_not_panic_2627() -> Result<()> {
-    let (stdout, stderr, code) = run_jq_full(&["-c", ". as $x | $x"], Some(&nested_arrays(300)))?;
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", ". as $x | $x | tojson"], Some(&nested_arrays(300)))?;
     assert_eq!(stdout.trim_end(), "");
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(!stderr.contains("panicked"), "stderr: {stderr:?}");
@@ -26303,6 +26308,12 @@ fn test_boolean_wildcard_bridge_over_depth_document_reports_cleanly_not_panic_26
         stderr.contains("nesting depth exceeds limit of 256"),
         "stderr: {stderr:?}"
     );
+    // #3856: and a bind that only hands the node on reads nothing, so the guard
+    // has nothing to trip on -- it echoes the document, as `.` does.
+    let deep = nested_arrays(300);
+    let (stdout, stderr, code) = run_jq_full(&["-c", ". as $x | $x"], Some(&deep))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), deep.trim_end());
     Ok(())
 }
 
@@ -54579,6 +54590,12 @@ fn test_lazy_validation_boundary_2168() -> Result<()> {
         ("isvalid(.d)", "true"),
         ("until(true; .) | .d", "5"),
         ("[while(false; .)] | length", "0"),
+        // #3856: a bind hands its node on undecoded, so `$x` is `.`: the
+        // printer reads it, and it echoes the source text as `.` does.
+        (". as $x | $x | .d", "5"),
+        (". as $x | 1", "1"),
+        (". as $x | $x.d", "5"),
+        (".a as $x | 1", "1"),
     ] {
         let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
         assert_eq!(code, 0, "{filter}: stdout {stdout:?} stderr {stderr:?}");
@@ -54587,14 +54604,16 @@ fn test_lazy_validation_boundary_2168() -> Result<()> {
 
     // Raises: reads `.a`, or emits/tests a subtree containing it.
     for filter in [
-        ".a | length",    // reads the value
-        ".a | tostring",  // reads the value
-        "path(.a[])",     // iterating the scalar reads it
-        "to_entries",     // materializes every member
-        ". as $x | $x",   // materializes the binding
-        ".a |= 1",        // the write path materializes
-        "sort_by(.d)",    // the sort family keeps its gate
-        "[.[]] | tojson", // #2575: still materializes every element (unlike `length`)
+        ".a | length",             // reads the value
+        ".a | tostring",           // reads the value
+        "path(.a[])",              // iterating the scalar reads it
+        "to_entries",              // materializes every member
+        ". as $x | $x | tojson",   // #3856: reads the binding (`. as $x | $x` echoes, as `.` does)
+        ". as $x | $x.a | length", // reads the unreadable member
+        ".a as $x | $x",           // a scalar the body reads is decoded at the bind
+        ".a |= 1",                 // the write path materializes
+        "sort_by(.d)",             // the sort family keeps its gate
+        "[.[]] | tojson",          // #2575: still materializes every element (unlike `length`)
     ] {
         let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
         assert_eq!(code, 5, "{filter}: stdout {stdout:?} stderr {stderr:?}");
@@ -54611,8 +54630,8 @@ fn test_lazy_validation_boundary_2168() -> Result<()> {
     // whole of the surviving rule.
     for filter in [
         "select(.) | to_entries",
-        "select(.) | . as $x | $x",
-        "select(.) | [.[]] | tojson", // #2575: `length` no longer materializes -- see above
+        "select(.) | . as $x | $x | tojson", // #3856: a bind alone no longer materializes
+        "select(.) | [.[]] | tojson",        // #2575: `length` no longer materializes -- see above
     ] {
         let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
         assert_eq!(code, 5, "{filter}: stdout {stdout:?} stderr {stderr:?}");
@@ -93732,8 +93751,44 @@ fn test_unreadable_value_collection_split_3266() -> Result<()> {
         (&["-c"], OBJ, ".[0] | [.a, .b]", "", 5),
         (&["-c"], OBJ, ".[0] | [.[], 1] | length", "3\n", 0),
         (&["-c"], OBJ, ".[0] | {x: .b} | length", "", 5),
-        (&["-c"], OBJ, ".[0] | .b as $x | 1", "", 5),
-        (&["-c"], "[1.2.3]", ".[0] | . as $x | 1", "", 5),
+        // #3856: a bind decodes only what its body reads. A body that never
+        // names the variable reads nothing, a scalar included; a subtree is
+        // handed on as the node it is, and read where the body reads it.
+        (&["-c"], OBJ, ".[0] | .b as $x | 1", "1\n", 0),
+        (&["-c"], "[1.2.3]", ".[0] | . as $x | 1", "1\n", 0),
+        (&["-c"], OBJ, ".[0] | . as $x | 1", "1\n", 0),
+        (&["-c"], OBJ, ".[0] | . as $x | $x.a", "1\n", 0),
+        (
+            &["-c"],
+            OBJ,
+            ".[0] | . as $x | [$x.a, 2] | length",
+            "2\n",
+            0,
+        ),
+        (&["-c"], OBJ, ".[0] | . as $x | [$x.a, 2]", "[1,2]\n", 0),
+        (&["-c"], OBJ, ".[0] | . as $x | .a + $x.a", "2\n", 0),
+        (&["-c"], OBJ, ".[0] | . as $x | $x | length", "2\n", 0),
+        (&["-c"], OBJ, ".[0] | . as $r | [.[]] | length", "2\n", 0),
+        // Reading the unreadable member raises where it is read, and a
+        // printed node is read by the printer.
+        (&["-c"], OBJ, ".[0] | . as $x | $x", "", 5),
+        (&["-c"], OBJ, ".[0] | . as $x | $x.b", "", 5),
+        (&["-c"], OBJ, ".[0] | . as $x | $x | tojson", "", 5),
+        (&["-c"], OBJ, ".[0] | . as $x | $x + {}", "", 5),
+        (&["-c"], OBJ, ".[0] | .b as $x | $x", "", 5),
+        // A scalar the body reads is decoded at the bind: only a subtree has
+        // a decode worth skipping.
+        (&["-c"], OBJ, ".[0] | .b as $x | [$x] | length", "", 5),
+        // A body that loses the cursor before it reads the variable decodes
+        // at the bind, so it raises as the sibling that never defers does.
+        (&["-c"], OBJ, ".[0] | . as $x | 1 | $x | length", "", 5),
+        (
+            &["-c"],
+            OBJ,
+            ".[0] | . as $x | .missing | $x | length",
+            "",
+            5,
+        ),
         (&["-c"], OBJ, ".[0] | [.b, empty] | length", "1\n", 0),
         (&["-c"], OBJ, ".[0] | [.[] | ., .] | length", "", 5),
         (&["-c"], OBJ, ".[0] | [.[] | [.]] | length", "", 5),
@@ -93771,6 +93826,48 @@ fn test_unreadable_value_collection_split_3266() -> Result<()> {
             (stdout, code),
             "{flags:?} {filter} on {doc}: {err:?}"
         );
+    }
+    Ok(())
+}
+
+/// #3856: a bind that leaves its node undecoded answers what jq does. Every
+/// expectation was captured from `/usr/bin/jq` 1.7.1 on this document; the
+/// rows are the shapes a deferred bind reads from (the root, a record under an
+/// iteration, past a cursor-losing stage, inside a nested bind) and the ones
+/// that decode at the bind (`reduce`, `map`, a value-producing stage first).
+#[test]
+fn test_deferred_bind_matches_jq_3856() -> Result<()> {
+    let doc = r#"{"meta":{"n":3,"lim":2},"users":[{"id":1,"name":"a","tags":["x","y"]},{"id":2,"name":"b","tags":[]},{"id":3,"name":"c","tags":["z"]}],"k":null}"#;
+    let rows: &[(&str, &str)] = &[
+        (". as $x | 1", "1\n"),
+        (". as $r | .users[] | .name", "\"a\"\n\"b\"\n\"c\"\n"),
+        (". as $r | .users[] | select(.id == $r.meta.lim) | .name", "\"b\"\n"),
+        (".users[] | . as $u | $u.name", "\"a\"\n\"b\"\n\"c\"\n"),
+        (".users[] | . as $u | [$u.id, $u.tags[]]", "[1,\"x\",\"y\"]\n[2]\n[3,\"z\"]\n"),
+        (". as $x | $x | keys", "[\"k\",\"meta\",\"users\"]\n"),
+        (". as $x | [$x.meta, 1]", "[{\"n\":3,\"lim\":2},1]\n"),
+        (". as $x | {a: $x.meta, b: .k}", "{\"a\":{\"n\":3,\"lim\":2},\"b\":null}\n"),
+        (". as $x | .missing | $x", "{\"meta\":{\"n\":3,\"lim\":2},\"users\":[{\"id\":1,\"name\":\"a\",\"tags\":[\"x\",\"y\"]},{\"id\":2,\"name\":\"b\",\"tags\":[]},{\"id\":3,\"name\":\"c\",\"tags\":[\"z\"]}],\"k\":null}\n"),
+        (". as $x | .users[] | $x.users | length", "3\n3\n3\n"),
+        (". as $r | .users[] | {n: .name, c: ($r.users | length)}", "{\"n\":\"a\",\"c\":3}\n{\"n\":\"b\",\"c\":3}\n{\"n\":\"c\",\"c\":3}\n"),
+        (". as $x | $x == .", "true\n"),
+        (". as $x | $x + {z: 1} | keys", "[\"k\",\"meta\",\"users\",\"z\"]\n"),
+        (". as $x | .users[0] as $y | [$x.meta.n, $y.id]", "[3,1]\n"),
+        (". as $x | try ($x | error) catch .meta", "{\"n\":3,\"lim\":2}\n"),
+        (".users as $u | [$u[] | .id] | add", "6\n"),
+        (". as $x | .users | map($x.meta.n + .id)", "[4,5,6]\n"),
+        (". as $x | [.users[] | select(.id > $x.meta.n - 2) | .name]", "[\"b\",\"c\"]\n"),
+        (". as $x | .meta | $x.users | length", "3\n"),
+        (". as $x | (.meta, .k) | [., $x.meta.n]", "[{\"n\":3,\"lim\":2},3]\n[null,3]\n"),
+        (". as $x | $x | tojson | length", "143\n"),
+        (". as $a | . as $b | $a == $b", "true\n"),
+        ("[.users[] as $u | $u.id]", "[1,2,3]\n"),
+        (". as $x | reduce .users[] as $u (0; . + $u.id + $x.meta.n)", "15\n"),
+        (". as $x | [paths] | length", "20\n"),
+    ];
+    for &(filter, want) in rows {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
+        assert_eq!((stdout.as_str(), code), (want, 0), "{filter}: {stderr:?}");
     }
     Ok(())
 }

@@ -2491,6 +2491,7 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
         | Expr::Literal(_)
         | Expr::Var(_)
         | Expr::TrackedVar(_)
+        | Expr::DeferredVar(_)
         | Expr::Loc { .. }
         | Expr::Env
         | Expr::Not

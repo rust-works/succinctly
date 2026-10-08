@@ -596,6 +596,22 @@ pub enum Expr {
     /// of whether `origin` certifies against `path()`'s register.
     TrackedVar(Rc<Tracked>),
 
+    /// A bound variable whose value was never decoded (#3856, phase 3):
+    /// `EXPR as $x | body` where `EXPR` named a node of the ambient
+    /// document, and `body` reads `$x` only where the ambient input is
+    /// provably a cursor of that same document
+    /// (`eval_generic::deferred_bind_is_sound`). The use site resolves the
+    /// node through `DocumentCursor::at_node_id` and answers it as a
+    /// cursor, so the value is validated and decoded only where something
+    /// reads it -- and not at all when `$x` is never read.
+    ///
+    /// Synthesized only by `each_as_generic`, in jq mode, never by the
+    /// parser. There is deliberately no fallback value: a read with no
+    /// same-document cursor is a soundness bug in that predicate and raises
+    /// an internal error rather than guessing one. `Rc` keeps this one
+    /// pointer wide, so `size_of::<Expr>()` does not move.
+    DeferredVar(Rc<BindOrigin>),
+
     /// Location reference: `$__loc__`
     /// Returns `{"file": F, "line": N}`, where `N` is the 1-based line number
     /// in the jq source where `$__loc__` appears, and `F` is `"<top-level>"`

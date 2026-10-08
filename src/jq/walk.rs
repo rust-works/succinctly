@@ -823,6 +823,8 @@ pub fn map_subexprs(expr: &Expr, mut f: &mut dyn FnMut(&Expr) -> Expr) -> Expr {
         // of the frozen snapshot, so re-inlining a `def` that closes over a
         // large passthrough-bound value on every call stays cheap (#844).
         Expr::TrackedVar(v) => Expr::TrackedVar(v.clone()),
+        // #3856: a leaf like `TrackedVar`; the `Rc` clone is a refcount bump.
+        Expr::DeferredVar(v) => Expr::DeferredVar(v.clone()),
         Expr::Loc { line, file } => Expr::Loc {
             line: *line,
             file: file.clone(),
@@ -1201,6 +1203,7 @@ pub(crate) fn search_subexpr<F: FnMut(&Expr) -> Visit + ?Sized>(
         | Expr::Format(_)
         | Expr::Var(_)
         | Expr::TrackedVar(_)
+        | Expr::DeferredVar(_)
         | Expr::Loc { .. }
         | Expr::Env
         | Expr::Break(_) => false,
@@ -1636,6 +1639,9 @@ fn stage_escapes_own_input(expr: &Expr) -> bool {
         // An unresolved call carries no body to inspect. Resolved DefCall
         // bodies are visited by the shared traversal instead.
         Expr::FuncCall { .. } | Expr::NamespacedCall { .. } => true,
+        // #3856: a deferred binding reads the document by node id, not through
+        // the rebound value, so a bridge must keep the real document for it.
+        Expr::DeferredVar(..) => true,
         Expr::Builtin(b) => match b {
             // Input-stream state, cursor metadata and path context can
             // bypass the rebound value. Preserve the conservative path
@@ -1947,7 +1953,10 @@ fn node_reads_ambient(node: &Expr) -> bool {
         | Expr::RecursiveDescent
         // `not` and `@base64` and friends all apply to `.`.
         | Expr::Not
-        | Expr::Format(_) => true,
+        | Expr::Format(_)
+        // #3856: resolves its node against the ambient *cursor*, so an
+        // ambient replaced by `null` would leave it nothing to resolve from.
+        | Expr::DeferredVar(_) => true,
 
         // Both emit `.` itself and test `cond` against it, and neither
         // emission is a child this walk would otherwise see.
@@ -2976,5 +2985,45 @@ mod tests {
             }
             false
         });
+    }
+
+    /// #3856: a deferred binding resolves its node against the ambient
+    /// *cursor*, so a bridge may neither replace the ambient with `null` for it
+    /// (`reads_ambient_value`) nor treat its stage as closed over its own input
+    /// (`stage_escapes_own_input`). Both are what keep `bridge_ambient_input`
+    /// from handing it a document it cannot resolve from.
+    #[test]
+    fn deferred_variable_reads_the_ambient_cursor_3856() {
+        use crate::jq::expr::BindOrigin;
+        let deferred = Expr::DeferredVar(Rc::new(BindOrigin::Node {
+            node: 0,
+            document: 0,
+        }));
+        assert!(reads_ambient_value(&deferred));
+        // Wrapped in a construction that otherwise reads nothing.
+        assert!(reads_ambient_value(&Expr::Array(Box::new(
+            deferred.clone()
+        ))));
+        assert!(stage_escapes_own_input(&deferred));
+        assert!(stage_escapes_own_input(&Expr::Pipe(
+            vec![
+                Expr::Literal(crate::jq::expr::Literal::Null),
+                deferred.clone()
+            ]
+            .into()
+        )));
+        // The snapshot it replaces holds its value, so it is neither.
+        let tracked = Expr::TrackedVar(crate::jq::expr::Tracked::snapshot(
+            crate::jq::value::OwnedValue::Null,
+        ));
+        assert!(!reads_ambient_value(&tracked));
+        assert!(!stage_escapes_own_input(&tracked));
+        // And the traversals treat it as a leaf: nothing to descend into, and a
+        // rebuild keeps the same shared node.
+        assert!(!any_subexpr(&deferred, &mut |e| matches!(
+            e,
+            Expr::Var(_) | Expr::TrackedVar(_)
+        )));
+        assert_eq!(map_subexprs(&deferred, &mut |e| e.clone()), deferred);
     }
 }
