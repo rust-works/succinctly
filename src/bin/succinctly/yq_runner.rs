@@ -5311,15 +5311,7 @@ fn emit_yaml_value_at_depth(
                             );
                             let comment_suffix = trailing_comment_suffix(elem_comments, indent);
                             let anchor = anchor_decl_prefix(elem_comments);
-                            if item.is_empty() {
-                                // An empty value (#3028): nothing after the dash.
-                                format!("{indent}-{anchor}{comment_suffix}")
-                            } else {
-                                format!(
-                                    "{indent}-{anchor} {}",
-                                    with_trailing_comment(item, &comment_suffix)
-                                )
-                            }
+                            entry_line(indent, "-", &anchor, item, &comment_suffix)
                         };
                         let rendered = prepend_head_comment_lines(
                             rendered,
@@ -5477,15 +5469,7 @@ fn emit_yaml_value_at_depth(
                             } else {
                                 comment_suffix
                             };
-                            if val.is_empty() {
-                                // An empty value (`push:`, #3028): nothing after the colon.
-                                format!("{indent}{key}:{anchor}{comment_suffix}")
-                            } else {
-                                format!(
-                                    "{indent}{key}:{anchor} {}",
-                                    with_trailing_comment(val, &comment_suffix)
-                                )
-                            }
+                            entry_line(indent, &format!("{key}:"), &anchor, val, &comment_suffix)
                         };
                         let rendered = prepend_head_comment_lines(
                             rendered,
@@ -5999,6 +5983,28 @@ fn emit_string_scalar(
         return go_yaml_double_quoted_scalar(s);
     }
     yaml_quote_string_with_style(s, style, in_flow, config.json_sourced_floats)
+}
+
+/// One `key:` or `-` entry line: `{indent}{lead}{anchor} {value}{comment}`, with nothing after
+/// the lead for an empty value (`push:`, #3028). Out of line so the recursive emitter's frame
+/// stays small (see `emit_yaml_value_panics_past_nesting_depth_limit_1017`, which overflows
+/// under coverage instrumentation otherwise).
+#[inline(never)]
+fn entry_line(
+    indent: &str,
+    lead: &str,
+    anchor: &str,
+    value: String,
+    comment_suffix: &str,
+) -> String {
+    if value.is_empty() {
+        format!("{indent}{lead}{anchor}{comment_suffix}")
+    } else {
+        format!(
+            "{indent}{lead}{anchor} {}",
+            with_trailing_comment(value, comment_suffix)
+        )
+    }
 }
 
 /// `rendered` followed by a trailing comment. A block scalar's header is its first
