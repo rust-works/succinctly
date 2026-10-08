@@ -636,8 +636,19 @@ $x (.; .[$x:]))` raises `E2`, was the slice error). What it leaves:
   `{"a":true}` is `{}` in jq and echoed the document here, losing the write. It now refuses
   (exit 5), as the un-wrapped fold already did. **A recorded divergence, in the safe direction**:
   the walk cannot tell whether a *later* alternative would also have failed, so a try-wrapped fold
-  whose catch happened to agree with jq (`del(try (.a and (reduce . as {a:$a,b:$b} ?// [$a] (0;
-  .))))` on `{"a":1,"b":2}`, jq `{"a":1,"b":2}`) refuses too. Only a refusal of a step that could
+  whose catch happened to agree with jq refuses too. Since
+  [#3999](https://github.com/rust-works/succinctly/issues/3999) that holds only where the fold's
+  register is genuinely unknown: a fold entered on an untracked stage whose register value the
+  stage still carries (the right operand of an `and`/`or` whose left operand navigated, jq's
+  register on `.a` while the fold's `.` is the root) compares the element with that value, and an
+  element that is not equal to it is provably not the register's node, so the refusal is jq's own
+  verdict and `?//` retries (`del(try (.a and (reduce . as {a:$a,b:$b} ?// [$a] (0; .))))` on
+  `{"a":1,"b":2}` is jq's `{"a":1,"b":2}`, was exit 5; `reduce` and `foreach`, any number of
+  alternatives; pinned by `test_fold_pattern_against_known_untracked_register_retries_3999`). An
+  element equal to it, or a register the stage has lost, stays the loud guess. The position of
+  that register is not known, so the walk still cannot *step* from it: a row jq answers by
+  stepping from the register's own node (`{"a":true}` with `?// $a`, jq `{}`) refuses at the
+  result instead. Only a refusal of a step that could
   have succeeded on the element is converted (`NavKind::would_succeed_on`); one jq raises
   whatever its register is (a string key off an array) stays catchable, and since
   [#3998](https://github.com/rust-works/succinctly/issues/3998) it also *retries* the next
