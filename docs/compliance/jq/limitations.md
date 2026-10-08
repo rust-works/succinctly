@@ -3275,13 +3275,16 @@ answers `["b"]` — and classified the two residuals appended below):
     that is not `null`/a boolean (the outer accumulator is not that node, so jq refuses too
     unless the accumulator is the member itself), and a nested `foreach` whose UPDATE or EXTRACT
     navigates after the source; neither writes anything.
-  - **jq's pointer identity**: `tostring` of a string is the same `jv`
-    (`path(foreach (.b|tostring) as $k (.; $k))` on `{"b":"s"}` is `["b"]`) -- a general
-    path-mode gap, not a `foreach` one (`path(.b|tostring)` refuses the same way), and still a
-    refusal; it predates #2159.
-    The same gap shows on a bare string document once the sweep has one (#3930): `..|tostring`,
-    `recurse|tostring`, `walk(.)|tostring` and `.[0:]|tostring`/`.[0:1]|tostring`/`.[0:(1+1)]|tostring`
-    over `"s"` or `""` are refusals where jq answers, never a write. Tracked as
+  - **jq's pointer identity**: `tostring`/`@text` of a string and `tonumber` of a number are
+    the same `jv`, a general path-mode rule rather than a `foreach` one. Closed by #3460's second
+    half: `path(.b|tostring)` is `["b"]`, `(.b|tostring) = 9` writes, `..|tostring`/`.[0:]|tostring`
+    over a bare string document answer, and the sweep's residual table is empty. `tostring` and
+    `@text` are jq mode only (yq's `(.b|tostring) = "z"` is a no-op); `tonumber` of a number
+    writes in both modes, as in yq v4.53.3. Still refused where jq answers (never a write): a
+    *bound* result, `path(.b|tostring as $y|$y)` and `path(.n|tonumber as $x|$x)` (the bind-source
+    analyses do not know these stages return their input), and `ltrimstr`/`rtrimstr` with no match
+    ([#4016](https://github.com/rust-works/succinctly/issues/4016)). The sweep alphabet cannot spell
+    the bound shape. Tracked as
     [#3460](https://github.com/rust-works/succinctly/issues/3460). Closed by #3460's first
     half: the accumulator's node carried from one source element to the next
     (`path(foreach (1, .a) as $k (.; .a))` on `{"a":{"a":1}}` is `["a"]` then `["a","a"]`,

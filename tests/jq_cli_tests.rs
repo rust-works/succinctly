@@ -59436,6 +59436,32 @@ fn test_path_register_survives_input_returning_conversions_3460() -> Result<()> 
     Ok(())
 }
 
+/// #3460: yq writes through `tonumber` of a number (v4.53.3), so that arm is not
+/// jq-gated.
+#[test]
+fn test_yq_tonumber_of_a_number_writes_3460() -> Result<()> {
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .args(["yq", "(.n|tonumber) = 5"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child
+                .stdin
+                .take()
+                .expect("piped")
+                .write_all(b"b: s\nn: 2\n")?;
+            child.wait_with_output()
+        })?;
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "b: s\nn: 5\n",
+        "{output:?}"
+    );
+    Ok(())
+}
+
 /// #3460, yq mode must-not-change: `(.b|tostring) = "z"` is a no-op in yq v4.53.3
 /// and stays one here.
 #[test]
