@@ -492,6 +492,16 @@ The per-element shape, `-c '.[]'` over the array files (each output element runs
 
 `string_scan_agrees_with_the_bytewise_reference_across_block_boundaries_3340` and `..._on_random_strings_3340` pin the new scan against the old byte loop (kept in the test module as an independent oracle) with the opening quote at every offset of a 64-byte block and a special of every kind planted at every offset across two boundaries; `src/util/simd/specials.rs` pins the kernel against a scalar reference for every byte value in every lane.
 
+### Keyed Lookup into a Wide Object (#3913)
+
+`DocumentFields::find_cursor` answers "the last member whose key is `name`" by walking every member: a later duplicate can always supersede the match, and a malformed sibling must raise whether or not it is the one asked for. A pipeline that reads one wide object many times (`.big[$k]`, or `$b[.]` for a `$b` bound to a node of the document, #2072) therefore cost time linear in the key count per lookup (3.5 s for 10,000 lookups into 10,000 keys, 350x the owned-map read).
+
+`src/jq/key_index.rs` adds a per-object `KeyIndex`: the key node ids in document order and an open-addressed table of 32-bit hashes, built in one pass over the keys alone (no member value is decoded). The walk reports how many members it visited (`find_cursor_counted`, free: the loop already counts); a walk of 64 or more registers the object, and the *next* lookup builds the index, so a small object, or a wide one read once, costs what it always did. A probe keeps the last entry whose decoded key equals the name, then checks only the winner's own `,`/`:` delimiters through `DocumentCursor::preceding_delimiter_ok`, as the walk does.
+
+**Every anomaly refuses the build** (a non-string key, an unpaired tail, a stray trailing comma, more than 2^21 members) and the caller runs the walk, which raises what it always raised; a refusal is remembered so it is not retried. The memo lives inside `slot_memo`'s evaluation scope (a `document_token` is not a security boundary), keeps at most four indexes and 2^21 members, and does not exist under `no_std`. YAML keeps the walk (`head_key_cursor` defaults to `None`): merge keys, alias keys and yq's duplicate rule need their own design.
+
+Apple M4 Pro, release, 10,000 lookups, min of 3, base `main` (`ce32db7ab`) vs this change: `$b[.]` 0.61 s -> 0.11 s (1,000 keys) and 3.46 s -> 0.09 s (10,000); `.big[$k]` 0.62 s -> 0.10 s and 3.60 s -> 0.09 s; 100,000 keys: 74.8 s -> 0.09 s. Instructions retired (min of 3, same box): `.big.k5000.v` -0.1%, `keys_unsorted` -0.1%, `to_entries` 0.0%, `.users[0].name` 0.0%, three lookups of one wide object -9.1%; the two rows that do nothing but look up fields of small records, `.users[].name` and `[.users[] | select(.age > 20) | .email]`, read +0.5% to +1.4% across five builds of this source, and two builds that differ only in an `#[inline]` hint read +1.5% / +0.2% against +0.9% / +1.2% -- the layout band, not a cost that tracks the change. Wall-clock on those rows (interleaved, 41 runs, load average 16) read +1.2% / -3.5% (min) and +0.3% / +1.7% (median). The index costs about 32 bytes per key (3 MB at 100,000 keys). Not measured: x86_64.
+
 ---
 
 ## Optimisation Techniques Used

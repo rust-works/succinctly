@@ -77,6 +77,7 @@ mod eval;
 pub mod eval_generic;
 mod expr;
 mod glob;
+mod key_index;
 mod lazy;
 mod local_zone;
 mod math;
