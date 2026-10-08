@@ -64519,7 +64519,12 @@ fn test_nested_fold_over_frozen_var_with_untracked_register_stays_loud_3984() ->
 /// (exit 5) where jq answers -- the safe direction -- for `foreach` and `reduce` alike. The
 /// controls are unchanged: an INIT that computes without navigating (`tostring`) keeps the
 /// ambient register, and one that navigates without computing is tracked outright. Every jq
-/// side captured from jq 1.7.1 (`null` input).
+/// side captured from jq 1.7.1. The shape needs a `null` source: `null` is the one value jq's
+/// `path_intact` accepts by value, so a non-null source refuses in both tools and every such
+/// variant already agrees. A compound INIT is judged as a whole, as `resolve_seq_stage` judges a
+/// compound stage ([`cannot_move_register`] is deliberately stricter than a per-branch verdict):
+/// `path(foreach (null) as {a:$x} (.a // "s"; .; $x))` is `["a"]` in jq and refuses here, the
+/// recorded cost.
 #[test]
 fn test_fold_init_that_navigates_then_computes_does_not_keep_the_ambient_register_4013(
 ) -> Result<()> {
@@ -64571,6 +64576,20 @@ fn test_fold_init_that_navigates_then_computes_does_not_keep_the_ambient_registe
             r"(foreach (null) as [$x] (.a|length; .; $x)) = 5",
             "",
             r"Invalid path expression near attempt to access element 0",
+            5,
+        ),
+        (
+            "null",
+            r"(reduce (null) as {a:$x} (.a|tostring; $x)) |= 5",
+            "",
+            r#"Invalid path expression near attempt to access element "a""#,
+            5,
+        ),
+        (
+            "null",
+            r#"path(foreach (null) as {a:$x} (.a // "s"; .; $x))"#,
+            "",
+            r#"Invalid path expression near attempt to access element "a""#,
             5,
         ),
         // Controls.

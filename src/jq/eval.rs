@@ -45003,7 +45003,13 @@ impl FoldRegister {
                 path: PathPrefix::root(),
                 value: value.clone(),
                 trackable: trackable && init_keeps_register,
-                frame: frame.clone(),
+                // A register INIT may have moved is not at the fold's entry position, so
+                // the frame stops claiming one (no live register, no provable position).
+                frame: if trackable && !init_keeps_register {
+                    frame.unknown()
+                } else {
+                    frame.clone()
+                },
             }
         };
         (reg, acc)
@@ -50009,6 +50015,8 @@ fn resolve_foreach<'a, S: EvalSemantics>(
     keep: Keep,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
+    // #4013: see `FoldRegister::enter`. Jq mode only, like every register admission here.
+    let init_keeps_register = S::TAG != EvalTag::Jq || cannot_move_register(init);
     // #3761: `resolve_reduce`'s #3710 rule for `foreach`. A computed emission is
     // not the register, but when nothing in the fold can have moved it jq's
     // register is where the `foreach` entered, and the next pipe stage may still
@@ -50018,8 +50026,6 @@ fn resolve_foreach<'a, S: EvalSemantics>(
     // The leaf states it on every untracked emission; the stage then takes the
     // stricter of that and its own verdict. A trackable entry only: an untracked
     // one carries its register on the stage.
-    // #4013: see `FoldRegister::enter`. Jq mode only, like every register admission here.
-    let init_keeps_register = S::TAG != EvalTag::Jq || cannot_move_register(init);
     let register_unmoved = S::TAG == EvalTag::Jq
         && trackable
         && foreach_cannot_move_register(patterns, input, init, update, extract);

@@ -687,8 +687,9 @@ an untrackable one, so the walk refuses (exit 5) where jq answers, for `foreach`
 that only computes (`tostring`) or only navigates is unchanged. The cost, in the safe direction: the
 five INIT operands this added to `scripts/jq-path-register-sweep.py` (8,967 rows) lose 66 rows that matched
 jq by accident (all on a `null` document, where the old walk's wrong node and jq's coincide), and nothing else
-in the 40,000-row sample or the other sweeps moves. A walk that tracks where INIT's navigation left the
-register would recover them.
+in the 40,000-row sample or the other sweeps moves. A compound INIT is judged as a whole, as
+`resolve_seq_stage` judges a compound stage, so `path(foreach (null) as {a:$x} (.a // "s"; .; $x))`
+(`["a"]` in jq) refuses too. A walk that tracks where INIT's navigation left the register would recover them.
 
 ## Path-mode slice bounds and a `?//` retry (#3293)
 
