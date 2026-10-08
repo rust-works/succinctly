@@ -3820,40 +3820,62 @@ pub(crate) fn yq_empty_context_reemit(expr: &Expr) -> Option<Expr> {
             (!kept.is_empty()).then(|| Expr::comma(kept))
         }
         Expr::Negate(operand) => Some(Expr::Negate(Box::new(yq_empty_context_reemit(operand)?))),
-        Expr::Arithmetic { op, left, right } => Some(Expr::Arithmetic {
-            op: *op,
-            left: Box::new(yq_empty_context_reemit(left)?),
-            right: Box::new(yq_empty_context_reemit(right)?),
-        }),
-        Expr::Compare { op, left, right } => Some(Expr::Compare {
-            op: *op,
-            left: Box::new(yq_empty_context_reemit(left)?),
-            right: Box::new(yq_empty_context_reemit(right)?),
-        }),
-        Expr::And(left, right) => Some(Expr::And(
-            Box::new(yq_empty_context_reemit(left)?),
-            Box::new(yq_empty_context_reemit(right)?),
-        )),
-        Expr::Or(left, right) => Some(Expr::Or(
-            Box::new(yq_empty_context_reemit(left)?),
-            Box::new(yq_empty_context_reemit(right)?),
-        )),
+        // An operator needs every operand to re-emit, see `reemit_operands`.
+        Expr::Arithmetic { op, left, right } => {
+            let (left, right) = reemit_operands(left, right)?;
+            Some(Expr::Arithmetic {
+                op: *op,
+                left: Box::new(left),
+                right: Box::new(right),
+            })
+        }
+        Expr::Compare { op, left, right } => {
+            let (left, right) = reemit_operands(left, right)?;
+            Some(Expr::Compare {
+                op: *op,
+                left: Box::new(left),
+                right: Box::new(right),
+            })
+        }
+        Expr::And(left, right) => {
+            let (left, right) = reemit_operands(left, right)?;
+            Some(Expr::And(Box::new(left), Box::new(right)))
+        }
+        Expr::Or(left, right) => {
+            let (left, right) = reemit_operands(left, right)?;
+            Some(Expr::Or(Box::new(left), Box::new(right)))
+        }
+        // Only the left operand has to re-emit: `1 // .b` is `1` (the right
+        // side is never reached), and `null // .b` is `null` -- a falsy left
+        // output stays itself when the right side yields nothing -- which is
+        // what the `empty` stands in for.
         Expr::Alternative(left, right) => Some(Expr::Alternative(
             Box::new(yq_empty_context_reemit(left)?),
-            Box::new(yq_empty_context_reemit(right)?),
+            Box::new(yq_empty_context_reemit(right).unwrap_or(Expr::Builtin(Builtin::Empty))),
         )),
         Expr::Pipe(stages) => {
             let (at, head) = stages
                 .iter()
                 .enumerate()
                 .find_map(|(i, stage)| Some((i, yq_empty_context_reemit(stage)?)))?;
-            let mut rewritten = Vec::new();
-            rewritten.push(head);
+            let mut rewritten = vec![head];
             rewritten.extend(stages[at + 1..].iter().cloned());
             Some(Expr::pipe(rewritten))
         }
         _ => None,
     }
+}
+
+/// The operands of a binary operator under [`yq_empty_context_reemit`]: both
+/// must re-emit. An operand that reads its input is empty against an empty
+/// context, but what yq then does is not one rule -- `1 == .b` is `false`
+/// while `.b == 2` and `1 + .b` are nothing -- so the operator declines and
+/// the ordinary evaluator answers it (the empty-operand table, #2460).
+fn reemit_operands(left: &Expr, right: &Expr) -> Option<(Expr, Expr)> {
+    Some((
+        yq_empty_context_reemit(left)?,
+        yq_empty_context_reemit(right)?,
+    ))
 }
 
 /// Evaluate a comma expression (multiple outputs).
@@ -12085,6 +12107,9 @@ fn binary_fanout_each_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         (right, left)
     };
 
+    // The rewrite depends only on `inner_expr`, so it is computed at most
+    // once however many outer values find the inner operand empty (#2588).
+    let inner_reemit: core::cell::OnceCell<Option<Expr>> = core::cell::OnceCell::new();
     let mut on_outer = |outer_item: Item<'a, W>| {
         abort.begin();
         outer_seen.set(outer_seen.get() + 1);
@@ -12161,9 +12186,9 @@ fn binary_fanout_each_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             && matches!(inner, Flow::Exhausted)
             && rules.reemits_empty_operand()
         {
-            if let Some(reemit) = yq_empty_context_reemit(inner_expr) {
-                inner = each_operand(&reemit, &mut on_inner);
-                abort.settle(&inner, direct_pattern_retry(&reemit));
+            if let Some(reemit) = inner_reemit.get_or_init(|| yq_empty_context_reemit(inner_expr)) {
+                inner = each_operand(reemit, &mut on_inner);
+                abort.settle(&inner, direct_pattern_retry(reemit));
                 if abort.is_set() {
                     return Demand::Stop;
                 }
@@ -12678,10 +12703,15 @@ fn boolean_fanout_each_with(
             .flatten()
         {
             flow = drive_left(&reemit);
-        } else if let Some(bit) = empty_boolean_operand(rules.empty) {
-            let demand = on_left_bit(bit);
-            if demand == Demand::Stop && !abort.is_set() {
-                flow = Flow::Stopped { pending: None };
+        }
+        // The rewrite itself can come back empty (`1 | select(false)`): that
+        // is an empty operand like any other, and the table answers it.
+        if left_seen.get() == 0 && !abort.is_set() && matches!(flow, Flow::Exhausted) {
+            if let Some(bit) = empty_boolean_operand(rules.empty) {
+                let demand = on_left_bit(bit);
+                if demand == Demand::Stop && !abort.is_set() {
+                    flow = Flow::Stopped { pending: None };
+                }
             }
         }
     }
@@ -12744,11 +12774,19 @@ fn boolean_pair_left_bit(
             .then(|| yq_empty_context_reemit(right))
             .flatten()
         {
-            right_flow = each_operand(&reemit, sink);
-        } else if let Some(bit) = empty_boolean_operand(rules.empty) {
-            if sink(bit) == Demand::Stop {
-                *outer_stopped = true;
-                return Demand::Stop;
+            right_flow = each_operand(&reemit, &mut |right_bit| {
+                right_seen += 1;
+                sink(right_bit)
+            });
+        }
+        // The rewrite itself can come back empty (`1 | select(false)`): that
+        // is an empty operand like any other, and the table answers it.
+        if right_seen == 0 && matches!(right_flow, Flow::Exhausted) {
+            if let Some(bit) = empty_boolean_operand(rules.empty) {
+                if sink(bit) == Demand::Stop {
+                    *outer_stopped = true;
+                    return Demand::Stop;
+                }
             }
         }
     }
@@ -85970,6 +86008,8 @@ mod tests {
         is(reemit("1 == 1"), "1 == 1");
         is(reemit("1 // 3"), "1 // 3");
         assert_eq!(reemit(". // 3"), None);
+        // `//` needs only its left operand: the right side becomes `empty`.
+        is(reemit("1 // .b"), "1 // empty");
         // An object is all-or-nothing, a dynamic key only when it is a literal.
         is(reemit("{\"q\": 1}"), "{\"q\": 1}");
         assert_eq!(reemit("{\"q\": .b}"), None);

@@ -17743,6 +17743,9 @@ fn binary_fanout_each_generic_with<V: DocumentValue, S: EvalSemantics>(
         (right, left)
     };
 
+    // The rewrite depends only on `inner_expr`, so it is computed at most
+    // once however many outer values find the inner operand empty (#2588).
+    let inner_reemit: core::cell::OnceCell<Option<Expr>> = core::cell::OnceCell::new();
     let mut on_outer = |outer_item: GenericItem<V>| {
         abort.begin();
         outer_seen.set(outer_seen.get() + 1);
@@ -17798,9 +17801,9 @@ fn binary_fanout_each_generic_with<V: DocumentValue, S: EvalSemantics>(
             && matches!(inner, Flow::Exhausted)
             && rules.reemits_empty_operand()
         {
-            if let Some(reemit) = yq_empty_context_reemit(inner_expr) {
-                inner = each_operand(&reemit, &mut on_inner);
-                abort.settle(&inner, crate::jq::eval::direct_pattern_retry(&reemit));
+            if let Some(reemit) = inner_reemit.get_or_init(|| yq_empty_context_reemit(inner_expr)) {
+                inner = each_operand(reemit, &mut on_inner);
+                abort.settle(&inner, crate::jq::eval::direct_pattern_retry(reemit));
                 if abort.is_set() {
                     return Demand::Stop;
                 }

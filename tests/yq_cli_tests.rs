@@ -42190,6 +42190,31 @@ fn test_yq_empty_context_reemit_in_boolean_and_arithmetic_operands_2588() -> Res
     Ok(())
 }
 
+/// #2588 review shapes, captured live against yq v4.53.3 on `a: {b: 1}` /
+/// `x: 5`: a re-emitting operand whose rewrite then comes back empty
+/// (`1 | select(false)`) is an empty operand like any other and the #2460
+/// table answers it, and `//` needs only its *left* operand to re-emit -- the
+/// right side is never reached for a truthy left, and a falsy left stays
+/// itself when the right side reads its input.
+#[test]
+fn test_yq_empty_context_reemit_review_shapes_2588() -> Result<()> {
+    const DOC: &str = "a:\n  b: 1\nx: 5\n";
+    for (filter, want) in [
+        ("true and (.a.zz | 1 | select(false))", "false"),
+        ("(.a.zz | 1 | select(false)) and true", "false"),
+        ("(.a.zz | 1 | select(false)) or true", "true"),
+        (".x = (.a.zz | 1 // .b)", r#"{"a":{"b":1},"x":1}"#),
+        (".x = (.a.zz | null // .b)", r#"{"a":{"b":1},"x":null}"#),
+        (".x = (.a.zz | false // 7)", r#"{"a":{"b":1},"x":7}"#),
+        ("(.a.zz | 1 // .b) and true", "true"),
+    ] {
+        let (out, _, code) = run_yq_stdin_with_stderr(filter, DOC, &["-o", "json", "-I", "0"])?;
+        assert_eq!(out.trim(), want, "`{filter}`");
+        assert_eq!(code, 0, "`{filter}`");
+    }
+    Ok(())
+}
+
 /// #2588 jq-mode guard: the re-emission is yq's read-only-context rule and
 /// must never run under `succinctly jq`, where `.a.zz` is a `null`, not zero
 /// nodes, so these answer through the ordinary evaluator. Pinned jq 1.7.1.

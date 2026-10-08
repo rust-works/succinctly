@@ -2888,7 +2888,8 @@ emptiness:
 
 Gated on yq mode and a read-only scope, so jq mode (where `.a.zz` is a `null`, not zero
 nodes) never enters the path. The admitted set is closed (literals, `-`, arithmetic,
-comparison, `and`/`or`/`//`, `[...]`, `{...}` with literal keys, `,`, `|`); `Expr::Shared`
+comparison, `and`/`or`, `//` (left operand only, the right becomes `empty` when it does not
+re-emit), `[...]`, `{...}` with literal keys, `,`, `|`); `Expr::Shared`
 is deliberately not unwrapped, and a dynamic object key declines unless it is itself a
 literal (anything else would have to be evaluated to be stringified, and raising where yq
 emits nothing is worse than staying empty). See `tests/yq_cli_tests.rs`'s
@@ -2908,7 +2909,16 @@ an operand of the shapes above; all checked live against v4.53.3):
 - `//` with a parenthesised re-emitting left operand: `.x = ((.a.zz | 1) // 3)` is `x: 1`
   in yq and `x: 3` here (`.x = (.a.zz | 1 // 3)` agrees). `//` has its own evaluation
   routes (`eval_alternative_per_left_output` and its cursor, lazy and path twins) that
-  do not share the fanout loop.
+  do not share the fanout loop;
+- a **second restart** after the stream empties again: `.x = (.a.zz | true | select(false) |
+  1)` is `x: 1` and `.x = (.a.zz | 1 | .zz | 2)` is `x: 2` in yq (every context-free
+  operator restarts an empty stream, not only the first), `x: 5` here. The rewrite keeps
+  the tail after the first re-emitting stage verbatim, because whether a later stage's
+  input is empty is only known while evaluating;
+- an operator with **one** re-emitting operand and one that reads its input, which yq
+  answers asymmetrically: `.x = (.a.zz | 1 == .b)` (and `!=`, `<`, `>`, `<=`, `>=`) is
+  `false`/`true` in yq while `.b == 2` and `1 + .b` are nothing. The operator declines
+  (both operands must re-emit), so these keep their pre-#2588 answer (`x: 5`).
 
 Real yq's `assignUpdateOperator` (`pkg/yqlib/operator_assign.go`, v4.53.3) resolves and
 auto-creates the **left** side first, then evaluates the right side — through
