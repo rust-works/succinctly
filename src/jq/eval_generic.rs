@@ -2310,6 +2310,9 @@ pub struct KeyMeta {
     /// source, [`KEY_STYLE_STRING`] once `-P` has stripped the quoting but the
     /// key is still known to be a string, or `""` for a plain key.
     style: &'static str,
+    /// The anchor the key declares (`&k key: 1`, #2598), without the `&`.
+    /// A key can only declare one: an alias used as a key is a separate gap.
+    anchor: Option<String>,
 }
 
 /// The key style (see [`CommentTree::key_style`]) for a key whose quoting `-P` stripped.
@@ -2331,17 +2334,29 @@ impl KeyMeta {
     /// key with neither - the one place that decides whether a key earns an
     /// entry in the per-key map.
     pub fn new(comment: Option<String>, value_absent: bool, style: &'static str) -> Option<Self> {
+        Self::with_anchor(comment, value_absent, style, None)
+    }
+
+    /// [`Self::new`] for a key that may also declare an anchor (`&k key: 1`,
+    /// #2598), which earns the key an entry on its own.
+    pub fn with_anchor(
+        comment: Option<String>,
+        value_absent: bool,
+        style: &'static str,
+        anchor: Option<String>,
+    ) -> Option<Self> {
         let style = match style {
             "single" | "double" | KEY_STYLE_STRING => style,
             _ => "",
         };
-        if comment.is_none() && style.is_empty() {
+        if comment.is_none() && style.is_empty() && anchor.is_none() {
             return None;
         }
         Some(Self {
             comment,
             value_absent,
             style,
+            anchor,
         })
     }
 
@@ -2350,10 +2365,11 @@ impl KeyMeta {
     /// `None` once nothing is left to say.
     #[must_use]
     pub fn carried_over(&self, value_absent: bool, keep_style: bool) -> Option<Self> {
-        Self::new(
+        Self::with_anchor(
             self.comment.clone(),
             value_absent,
             if keep_style { self.style } else { "" },
+            self.anchor.clone(),
         )
     }
 
@@ -2475,6 +2491,17 @@ impl CommentTree {
         match self {
             Self::Object(_, _, keys) => keys.get(key).map_or("", |k| k.style),
             _ => "",
+        }
+    }
+
+    /// The anchor object field `key`'s *key* declares (`&k key: 1`, #2598),
+    /// without the `&`, or `None` if this isn't an `Object`, has no such
+    /// key, or the key declares none. Distinct from
+    /// `field(key).declared_anchor()`, which is the *value's* anchor.
+    pub fn key_anchor(&self, key: &str) -> Option<&str> {
+        match self {
+            Self::Object(_, _, keys) => keys.get(key).and_then(|k| k.anchor.as_deref()),
+            _ => None,
         }
     }
 
@@ -2722,7 +2749,20 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
             let value_absent = key_comment.is_some()
                 && field.value.is_null()
                 && field.value.as_str().map_or(true, |s| s.is_empty());
-            if let Some(meta) = KeyMeta::new(key_comment, value_absent, field.key_cursor.style()) {
+            // #2598: a key's own `&anchor`, unless this subtree is an alias
+            // expansion, where it is the anchor target's own mark copied onto
+            // this position (#2500's rule for a value's `Declares`).
+            let key_anchor = if child_under_alias {
+                None
+            } else {
+                DocumentCursor::anchor(&field.key_cursor).map(str::to_string)
+            };
+            if let Some(meta) = KeyMeta::with_anchor(
+                key_comment,
+                value_absent,
+                field.key_cursor.style(),
+                key_anchor,
+            ) {
                 key_comment_map.insert(key, meta);
             }
             last_field = Some(field.value_cursor);
@@ -43589,6 +43629,52 @@ mod tests {
         assert_eq!(comments.field("a").style(), "");
         // Only an `Object` has keys.
         assert_eq!(CommentTree::empty().key_style("a"), "");
+    }
+
+    /// #2598: a key's own `&anchor` is recorded in the per-key map (and earns
+    /// a key an entry by itself), is not recorded under an alias expansion,
+    /// and rides alongside a comment and a style on the same entry.
+    #[test]
+    fn test_to_owned_with_comments_records_key_anchor_2598() {
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"&k key: 1\n&q \"quoted\": 2\nplain: 3\nm: &m\n  &j inner: 4\nn: *m\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let cursor = index.root(yaml);
+        let mapping_cursor = cursor
+            .first_child()
+            .expect("YAML document should have content");
+        let value = mapping_cursor.value();
+        let (_, comments) = to_owned_with_comments::<_, YqSemantics>(&value, Some(&mapping_cursor))
+            .expect("conversion succeeds");
+
+        assert_eq!(comments.key_anchor("key"), Some("k"));
+        assert_eq!(comments.key_anchor("quoted"), Some("q"));
+        assert_eq!(comments.key_style("quoted"), "double");
+        assert_eq!(comments.key_anchor("plain"), None);
+        assert_eq!(comments.key_anchor("missing"), None);
+        // A nested key's anchor is on the nested object's own map.
+        assert_eq!(comments.field("m").key_anchor("inner"), Some("j"));
+        // The alias-expanded copy is the target's own mark, not a declaration.
+        assert_eq!(comments.field("n").key_anchor("inner"), None);
+        assert_eq!(CommentTree::empty().key_anchor("key"), None);
+    }
+
+    /// #2598: an anchor alone earns a `KeyMeta` entry, and survives a write.
+    #[test]
+    fn test_key_meta_with_anchor_2598() {
+        assert!(KeyMeta::with_anchor(None, false, "", None).is_none());
+        let anchored = KeyMeta::with_anchor(None, false, "", Some("k".to_string()))
+            .expect("an anchor earns an entry");
+        let carried = anchored
+            .carried_over(true, false)
+            .expect("a carried-over key keeps its anchor");
+        assert_eq!(carried.anchor.as_deref(), Some("k"));
+        assert_eq!(
+            anchored.with_style_stripped().anchor.as_deref(),
+            Some("k"),
+            "-P strips quoting, never the anchor"
+        );
     }
 
     /// #3601: `KeyMeta` holds an entry only for a key with something to say,

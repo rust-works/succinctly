@@ -42215,6 +42215,388 @@ fn test_yq_empty_context_reemit_review_shapes_2588() -> Result<()> {
     Ok(())
 }
 
+/// #2598: a mapping key's own `&anchor` survives the DOM write path (`=`,
+/// `|=`, `del()`, `-P`), as it already did on the cursor-streaming identity
+/// path (#1352). Each row is `(document, filter, extra args, want)`, captured
+/// live from Homebrew `yq` v4.53.3: a plain `&k key: 1`, a value alias
+/// targeting the key's anchor (`b: *k`, which used to expand to `b: key`
+/// because the anchor-soundness gate never saw a declaration), a nested key,
+/// a flow mapping, a key with a deferred value and comment, an explicit
+/// `? &k key` key, an integer key, a key and value that both declare, an
+/// anchored key under an alias-expanded mapping, and `-P`.
+#[test]
+fn test_yq_dom_write_keeps_a_mapping_keys_anchor_2598() -> Result<()> {
+    let cases: &[(&str, &str, &[&str], &str)] = &[
+        (
+            r"&k key: 1
+b: 2
+",
+            r".b = 5",
+            &[],
+            r"&k key: 1
+b: 5
+",
+        ),
+        (
+            r"&k key: 1
+b: 2
+",
+            r".key |= . + 1",
+            &[],
+            r"&k key: 2
+b: 2
+",
+        ),
+        (
+            r"&k key: 1
+b: 2
+",
+            r"del(.b)",
+            &[],
+            r"&k key: 1
+",
+        ),
+        (
+            r"&k key: 1
+b: 2
+",
+            r".a.b = 7",
+            &[],
+            r"&k key: 1
+b: 2
+a:
+  b: 7
+",
+        ),
+        (
+            r"&k key: 1
+b: 2
+",
+            r".key = 9",
+            &[],
+            r"&k key: 9
+b: 2
+",
+        ),
+        (
+            r"&k key: 1
+b: 2
+",
+            r".",
+            &["-P"],
+            r"&k key: 1
+b: 2
+",
+        ),
+        (
+            r"&k key: 1
+b: *k
+",
+            r".b = 5",
+            &[],
+            r"&k key: 1
+b: 5
+",
+        ),
+        (
+            r"&k key: 1
+b: *k
+",
+            r".key |= . + 1",
+            &[],
+            r"&k key: 2
+b: *k
+",
+        ),
+        (
+            r"&k key: 1
+b: *k
+",
+            r".a.b = 7",
+            &[],
+            r"&k key: 1
+b: *k
+a:
+  b: 7
+",
+        ),
+        (
+            r"&k key: 1
+b: *k
+",
+            r".key = 9",
+            &[],
+            r"&k key: 9
+b: *k
+",
+        ),
+        (
+            r"a:
+  &k key: 1
+  b: 2
+c: *k
+",
+            r".b = 5",
+            &[],
+            r"a:
+  &k key: 1
+  b: 2
+c: *k
+b: 5
+",
+        ),
+        (
+            r"a:
+  &k key: 1
+  b: 2
+c: *k
+",
+            r"del(.a.b)",
+            &[],
+            r"a:
+  &k key: 1
+c: *k
+",
+        ),
+        (
+            r"a:
+  &k key: 1
+  b: 2
+c: *k
+",
+            r".a.b = 7",
+            &[],
+            r"a:
+  &k key: 1
+  b: 7
+c: *k
+",
+        ),
+        (
+            r"{&k key: 1, b: 2}
+",
+            r".b = 5",
+            &[],
+            r"{&k key: 1, b: 5}
+",
+        ),
+        (
+            r"&k key: # kc
+  x: 1
+b: 2
+",
+            r".b = 5",
+            &[],
+            r"&k key: # kc
+  x: 1
+b: 5
+",
+        ),
+        (
+            r"? &k key
+: 1
+b: 2
+",
+            r".b = 5",
+            &[],
+            r"&k key: 1
+b: 5
+",
+        ),
+        (
+            r"&k 1: x
+b: 2
+",
+            r".b = 5",
+            &[],
+            r"&k 1: x
+b: 5
+",
+        ),
+        (
+            r"&k key: &v 1
+b: 2
+",
+            r".b = 5",
+            &[],
+            r"&k key: &v 1
+b: 5
+",
+        ),
+        (
+            r"&k key: &v 1
+b: 2
+",
+            r".key = 2",
+            &[],
+            r"&k key: &v 2
+b: 2
+",
+        ),
+        (
+            r"m: &m
+  &k key: 1
+n: *m
+z: 1
+",
+            r".z = 2",
+            &[],
+            r"m: &m
+  &k key: 1
+n: *m
+z: 2
+",
+        ),
+        (
+            r"m: &m
+  &k key: 1
+n: *m
+z: 1
+",
+            r".m.key = 5",
+            &[],
+            r"m: &m
+  &k key: 5
+n: *m
+z: 1
+",
+        ),
+        (
+            r"m: &m
+  &k key: 1
+n: *m
+z: 1
+",
+            r".n.key = 5",
+            &[],
+            r"m: &m
+  &k key: 5
+n: *m
+z: 1
+",
+        ),
+        (
+            r"&k key: 1
+b: 2
+c: *k
+",
+            r".b = 5",
+            &[],
+            r"&k key: 1
+b: 5
+c: *k
+",
+        ),
+        (
+            r"x:
+  &k a: 1
+  b:
+    &j c: 2
+",
+            r".x.b.c = 9",
+            &[],
+            r"x:
+  &k a: 1
+  b:
+    &j c: 9
+",
+        ),
+        (
+            r"x:
+  &k a: 1
+  b:
+    &j c: 2
+",
+            r".x.a = 9",
+            &[],
+            r"x:
+  &k a: 9
+  b:
+    &j c: 2
+",
+        ),
+        (
+            r"x:
+  &k a: 1
+  b:
+    &j c: 2
+",
+            r"del(.x.a)",
+            &[],
+            r"x:
+  b:
+    &j c: 2
+",
+        ),
+        (
+            r"x:
+  &k a: 1
+  b:
+    &j c: 2
+",
+            r".y = 1",
+            &[],
+            r"x:
+  &k a: 1
+  b:
+    &j c: 2
+y: 1
+",
+        ),
+        (
+            r"x:
+  &k a: 1
+  b:
+    &j c: 2
+",
+            r".",
+            &["-P"],
+            r"x:
+  &k a: 1
+  b:
+    &j c: 2
+",
+        ),
+        (
+            r"&k key: 1
+b: *k
+",
+            r".b = 5",
+            &["-o=json"],
+            r#"{
+  "key": 1,
+  "b": 5
+}
+"#,
+        ),
+    ];
+    for (doc, filter, extra, want) in cases {
+        let (out, _, code) = run_yq_stdin_with_stderr(filter, doc, extra)?;
+        assert_eq!(out, *want, "`{filter}` {extra:?} on {doc:?}");
+        assert_eq!(code, 0, "`{filter}` {extra:?} on {doc:?}");
+    }
+    Ok(())
+}
+
+/// #2598: where real yq prints a `*k` it cannot resolve, succinctly never
+/// emits YAML it cannot read back (the #763 soundness rule): deleting the
+/// anchored key, or sorting it below its alias, leaves the alias expanded to
+/// the key's text. Declared divergences from yq v4.53.3, which prints
+/// `c: *k` in both.
+#[test]
+fn test_yq_key_anchor_alias_stays_sound_when_the_key_moves_or_goes_2598() -> Result<()> {
+    const DOC: &str = "&k key: 1\nb: 2\nc: *k\n";
+    for (filter, want) in [
+        ("del(.key)", "b: 2\nc: key\n"),
+        ("sort_keys(.)", "b: 2\nc: key\n&k key: 1\n"),
+    ] {
+        let (out, _, code) = run_yq_stdin_with_stderr(filter, DOC, &[])?;
+        assert_eq!(out, want, "`{filter}`");
+        assert_eq!(code, 0, "`{filter}`");
+    }
+    Ok(())
+}
+
 /// #2588 jq-mode guard: the re-emission is yq's read-only-context rule and
 /// must never run under `succinctly jq`, where `.a.zz` is a `null`, not zero
 /// nodes, so these answer through the ordinary evaluator. Pinned jq 1.7.1.

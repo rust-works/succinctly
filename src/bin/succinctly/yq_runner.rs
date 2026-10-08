@@ -2849,6 +2849,24 @@ enum TreeStep<'a> {
     Index(usize),
 }
 
+/// What an anchor name stands for in [`scan_anchor_soundness`]: a value node,
+/// or (#2598) a mapping key, whose value is the key's own text.
+#[derive(Clone, Copy)]
+enum Declared<'v> {
+    Node(&'v OwnedValue),
+    Key(&'v str),
+}
+
+impl Declared<'_> {
+    /// Whether an alias at `value` would read back as this declaration.
+    fn identical(&self, value: &OwnedValue) -> bool {
+        match self {
+            Self::Node(node) => node.identical(value),
+            Self::Key(text) => matches!(value, OwnedValue::String(s) if s.as_ref() == *text),
+        }
+    }
+}
+
 /// Drop every `*alias` mark this document cannot actually resolve, so the
 /// YAML written out always re-reads as the same values succinctly would
 /// have printed without any anchor syntax at all (#763).
@@ -2884,7 +2902,7 @@ fn enforce_anchor_soundness(value: &OwnedValue, comments: &mut CommentTree, sort
     // before the second pass takes a mutable one. The flagged paths borrow
     // only from `value`, which the second pass never touches.
     let unresolvable: Vec<Vec<TreeStep<'_>>> = {
-        let mut declared: IndexMap<&str, &OwnedValue> = IndexMap::new();
+        let mut declared: IndexMap<&str, Declared<'_>> = IndexMap::new();
         let mut unresolvable = Vec::new();
         let mut path = Vec::new();
         scan_anchor_soundness(
@@ -2916,7 +2934,7 @@ fn scan_anchor_soundness<'v, 'c>(
     value: &'v OwnedValue,
     comments: &'c CommentTree,
     sort_keys: bool,
-    declared: &mut IndexMap<&'c str, &'v OwnedValue>,
+    declared: &mut IndexMap<&'c str, Declared<'v>>,
     unresolvable: &mut Vec<Vec<TreeStep<'v>>>,
     path: &mut Vec<TreeStep<'v>>,
     depth: usize,
@@ -2926,7 +2944,7 @@ fn scan_anchor_soundness<'v, 'c>(
         // A repeated name shadows the earlier one for every *later* alias,
         // matching YAML's own "most recent preceding anchor wins".
         Some(AnchorMark::Declares(name)) => {
-            declared.insert(name.as_str(), value);
+            declared.insert(name.as_str(), Declared::Node(value));
         }
         // No such declaration yet (missing entirely, or emitted later than
         // this alias), or one whose value has since diverged from this one.
@@ -2960,6 +2978,11 @@ fn scan_anchor_soundness<'v, 'c>(
             }
             for k in keys {
                 let Some(v) = fields.get(k) else { continue };
+                // #2598: a key's `&name` is declared before its value is
+                // reached, and stands for the key's own text.
+                if let Some(name) = comments.key_anchor(k) {
+                    declared.insert(name, Declared::Key(k.as_str()));
+                }
                 path.push(TreeStep::Key(k.as_str()));
                 scan_anchor_soundness(
                     v,
@@ -4758,6 +4781,16 @@ fn defers_to_own_block(value: &OwnedValue, comments: &CommentTree) -> bool {
             || matches!(value, OwnedValue::Array(a) if !a.is_empty()))
 }
 
+/// Mapping key `key`'s own `&name ` anchor declaration (trailing space, so it
+/// prefixes the key as written), or `""` if the key declares none (#2598).
+/// The key-side twin of [`anchor_decl_prefix`], matching `write_yaml_field_key`
+/// in `light.rs`: `&k key: &v 1`.
+fn key_anchor_prefix(comments: &CommentTree, key: &str) -> String {
+    comments
+        .key_anchor(key)
+        .map_or_else(String::new, |name| format!("&{name} "))
+}
+
 /// This node's `&name` anchor declaration as ` &name` (leading space), or
 /// `""` if it declares none (#763).
 ///
@@ -5157,11 +5190,15 @@ fn emit_yaml_value_at_depth(
                 let entries: Vec<_> = obj
                     .iter()
                     .map(|(k, v)| {
-                        let key = yaml_quote_key(
-                            k,
-                            comments.key_style(k),
-                            true,
-                            config.json_sourced_floats,
+                        let key = format!(
+                            "{}{}",
+                            key_anchor_prefix(comments, k),
+                            yaml_quote_key(
+                                k,
+                                comments.key_style(k),
+                                true,
+                                config.json_sourced_floats,
+                            )
                         );
                         let field_comments = comments.field(k);
                         let val = emit_yaml_value_at_depth(
@@ -5192,11 +5229,15 @@ fn emit_yaml_value_at_depth(
                 let items: Vec<(String, bool)> = entries
                     .iter()
                     .map(|(k, v)| {
-                        let key = yaml_quote_key(
-                            k,
-                            comments.key_style(k),
-                            false,
-                            config.json_sourced_floats,
+                        let key = format!(
+                            "{}{}",
+                            key_anchor_prefix(comments, k),
+                            yaml_quote_key(
+                                k,
+                                comments.key_style(k),
+                                false,
+                                config.json_sourced_floats,
+                            )
                         );
                         let field_comments = comments.field(k);
                         let comment_suffix = trailing_comment_suffix(field_comments, indent);
