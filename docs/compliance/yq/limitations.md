@@ -337,6 +337,18 @@ a: 1
 b: &x 1
 ```
 
+**A mapping key's anchor rides the same machinery
+([#2598](https://github.com/rust-works/succinctly/issues/2598)).** A key's `&k` is recorded
+in the per-key side map next to its comment and quoting, re-emitted before the key
+(`&k key: &v 1`), and declared to the soundness gate with the key's own text as its value, so a
+value alias that targets it (`b: *k`) survives a write while the key is still emitted before it.
+The same licensed divergence applies when it is not: deleting the key, or `sort_keys` moving it
+below its alias, expands the alias to the key's text (`c: key`) where yq prints an
+unresolvable `*k`. An alias used *as* a key (`*k : 2`) is a separate, pre-existing gap, and so
+are two routes that still print a key bare: `keys` (`- &k key` in yq) and `pick`, and a `<<` merge
+expands the merged mapping's keys, anchors included, where yq keeps `<<: *m` (a value anchor under
+a merge is expanded the same way, so `&j` is then declared twice, which YAML allows).
+
 Related open items in the same family, still unresolved:
 [#1359](https://github.com/rust-works/succinctly/issues/1359) (a write that changes a node's
 kind drops its `&anchor`, where real yq keeps it),
