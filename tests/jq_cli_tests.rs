@@ -64732,6 +64732,21 @@ fn test_fold_pattern_against_known_untracked_register_retries_3999() -> Result<(
             "",
             0,
         ),
+        // Not only `and`/`or`: any untracked stage that leaves the register in place.
+        (
+            r#"{"a":[1]}"#,
+            r#"del(try (.a | {"x":1} | reduce . as {x:$q} ?// [$q] (0; .)))"#,
+            "{\"a\":[1]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":2}"#,
+            r"del(try (.a and (tojson | fromjson | reduce . as {a:$a} ?// [$a] (0; .))))",
+            "{\"a\":[1],\"b\":2}\n",
+            "",
+            0,
+        ),
         // Un-wrapped: the retry reaches the last alternative's own refusal, as jq's.
         (
             r#"{"a":1,"b":2}"#,

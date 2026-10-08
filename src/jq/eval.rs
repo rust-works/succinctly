@@ -48538,18 +48538,22 @@ fn fold_walk_refusal_is_guess<S: EvalSemantics>(
     ) {
         return false;
     }
+    // #3999: an untrackable register whose value the frame still carries (an `and`/`or`
+    // right operand after a left operand that navigated, or any stage that left the
+    // register in place). The walk cannot step from it (its position is unknown), so an
+    // element equal to it, `null` and booleans included, might be its node and the
+    // walk's refusal is a guess; any other element is provably not the register's node,
+    // and jq's `path_intact` refuses it too, so the refusal is jq's own verdict (a `?//`
+    // retries it). `equals_register`, not `==`: a shared node is the register by
+    // pointer even where `==` is false (a `nan` inside it).
+    if S::TAG == EvalTag::Jq && matches!(elem.moved, MovedRegister::Unmoved) {
+        if let Some(live) = reg.live_register() {
+            return equals_register(&elem.value, live);
+        }
+    }
     // #2159: the register the walk compared against is the moved one when
     // the source navigated before computing this element.
     let (trackable, register) = match &elem.moved {
-        // #3999: an untrackable register whose value the frame still carries (an
-        // `and`/`or` right operand after a left operand that navigated). The walk cannot
-        // step from it (its position is unknown), so an element equal to it, `null` and
-        // booleans included, might be its node and the walk's refusal is a guess; any
-        // other element is provably not the register's node, and jq's `path_intact`
-        // refuses it too, so the refusal is jq's own verdict (a `?//` retries it).
-        MovedRegister::Unmoved if S::TAG == EvalTag::Jq && reg.live_register().is_some() => {
-            return reg.live_register() == Some(&elem.value);
-        }
         MovedRegister::Unmoved => (reg.trackable, &reg.value),
         MovedRegister::At { value, .. } => (true, value),
         MovedRegister::Lost => (false, &reg.value),
