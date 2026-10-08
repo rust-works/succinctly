@@ -1641,7 +1641,7 @@ pub trait DocumentFields: Sized + Clone {
     /// existing shape `contains` itself already has), so every sibling key
     /// is checked there, match-position dependence and all.
     fn contains_checked(&self, name: &str) -> Result<bool, EvalError> {
-        self.contains_checked_walk(name, &mut 0)
+        self.contains_checked_counted(name).0
     }
 
     /// [`contains_checked`](Self::contains_checked), plus how many members the
@@ -1650,80 +1650,74 @@ pub trait DocumentFields: Sized + Clone {
     /// [`find_cursor_counted`](Self::find_cursor_counted). Meaningful only
     /// alongside an `Ok`.
     fn contains_checked_counted(&self, name: &str) -> (Result<bool, EvalError>, usize) {
-        let mut visited = 0;
-        let found = self.contains_checked_walk(name, &mut visited);
-        (found, visited)
-    }
-
-    /// The walk behind [`contains_checked`](Self::contains_checked) and
-    /// [`contains_checked_counted`](Self::contains_checked_counted); counts
-    /// each member it visits into `visited`.
-    #[doc(hidden)]
-    fn contains_checked_walk(&self, name: &str, visited: &mut usize) -> Result<bool, EvalError> {
-        let mut fields = self.clone();
-        let mut is_first = true;
-        // The last key cursor seen, for the *non-match* exhaustion path
-        // below -- that walk always reaches the true end regardless (the
-        // same shape `contains` itself already has), so its own trailing
-        // check is free, unlike the early-exit match path above.
-        let mut last_key_cursor: Option<Self::Cursor> = None;
-        while let Some((key, key_cursor, rest)) = fields.uncons_key() {
-            *visited += 1;
-            // #1677/#2288: cheap per-key checks, riding the walk `contains`
-            // already makes regardless of early exit -- no extra cost,
-            // early-exit or not. `display` being `None` (#1194/#1995) means
-            // a key the format's grammar never allowed at all (a non-string
-            // JSON key); the delimiter checks catch a missing/doubled
-            // `,`/`:` around a key that *is* well-shaped. Both only cover
-            // keys actually visited before a match -- see this method's own
-            // doc comment for why a malformed key strictly *after* the
-            // match is a documented, accepted gap, not something this walk
-            // closes.
-            //
-            // `key_display_string_kind` once, not `key_is_malformed` (#1194
-            // check) plus a separate `key_display_string` (match check) --
-            // `key_is_malformed(k) == key_display_string_kind(k).is_none()`
-            // by construction (code review on this fix caught the
-            // redundant second decode pass a naive two-call version would
-            // pay for every key, every `has()` call).
-            let display = key_display_string_kind(&key);
-            if display.is_none()
-                || !key_delimiter_ok::<Self>(&key, &key_cursor, is_first)
-                || !key_only_value_delimiter_ok::<Self>(&key, &key_cursor)
-            {
+        let mut visited = 0usize;
+        let found = (|| -> Result<bool, EvalError> {
+            let mut fields = self.clone();
+            let mut is_first = true;
+            // The last key cursor seen, for the *non-match* exhaustion path
+            // below -- that walk always reaches the true end regardless (the
+            // same shape `contains` itself already has), so its own trailing
+            // check is free, unlike the early-exit match path above.
+            let mut last_key_cursor: Option<Self::Cursor> = None;
+            while let Some((key, key_cursor, rest)) = fields.uncons_key() {
+                visited += 1;
+                // #1677/#2288: cheap per-key checks, riding the walk `contains`
+                // already makes regardless of early exit -- no extra cost,
+                // early-exit or not. `display` being `None` (#1194/#1995) means
+                // a key the format's grammar never allowed at all (a non-string
+                // JSON key); the delimiter checks catch a missing/doubled
+                // `,`/`:` around a key that *is* well-shaped. Both only cover
+                // keys actually visited before a match -- see this method's own
+                // doc comment for why a malformed key strictly *after* the
+                // match is a documented, accepted gap, not something this walk
+                // closes.
+                //
+                // `key_display_string_kind` once, not `key_is_malformed` (#1194
+                // check) plus a separate `key_display_string` (match check) --
+                // `key_is_malformed(k) == key_display_string_kind(k).is_none()`
+                // by construction (code review on this fix caught the
+                // redundant second decode pass a naive two-call version would
+                // pay for every key, every `has()` call).
+                let display = key_display_string_kind(&key);
+                if display.is_none()
+                    || !key_delimiter_ok::<Self>(&key, &key_cursor, is_first)
+                    || !key_only_value_delimiter_ok::<Self>(&key, &key_cursor)
+                {
+                    return Err(self.malformed_member_error());
+                }
+                if display.is_some_and(|(k, _is_fallback)| k.as_ref() == name) {
+                    // #2261: free exactly when the match is also the last
+                    // field -- see this method's own doc comment for why a
+                    // match elsewhere accepts the documented early-exit trade
+                    // instead of paying for a walk to confirm one way or
+                    // the other.
+                    if let Some(value_cursor) = key_cursor.next_sibling() {
+                        if value_cursor.next_sibling().is_none()
+                            && !trailing_element_gap_ok(&value_cursor, b'}')
+                        {
+                            return Err(self.malformed_member_error());
+                        }
+                    }
+                    return Ok(true);
+                }
+                last_key_cursor = Some(key_cursor);
+                fields = rest;
+                is_first = false;
+            }
+            if fields.ends_unpaired() {
                 return Err(self.malformed_member_error());
             }
-            if display.is_some_and(|(k, _is_fallback)| k.as_ref() == name) {
-                // #2261: free exactly when the match is also the last
-                // field -- see this method's own doc comment for why a
-                // match elsewhere accepts the documented early-exit trade
-                // instead of paying for a walk to confirm one way or
-                // the other.
-                if let Some(value_cursor) = key_cursor.next_sibling() {
-                    if value_cursor.next_sibling().is_none()
-                        && !trailing_element_gap_ok(&value_cursor, b'}')
-                    {
-                        return Err(self.malformed_member_error());
-                    }
-                }
-                return Ok(true);
+            // #2261: no match found anywhere, so this walk already reached the
+            // object's true end -- the trailing-gap check is free here, same
+            // as every other #2261 fix, via `last_field_trailing_gap_ok`
+            // (#2307), consolidating what used to be a fourth inline copy of
+            // this same hop-then-check shape.
+            if !last_field_trailing_gap_ok(last_key_cursor, b'}') {
+                return Err(self.malformed_member_error());
             }
-            last_key_cursor = Some(key_cursor);
-            fields = rest;
-            is_first = false;
-        }
-        if fields.ends_unpaired() {
-            return Err(self.malformed_member_error());
-        }
-        // #2261: no match found anywhere, so this walk already reached the
-        // object's true end -- the trailing-gap check is free here, same
-        // as every other #2261 fix, via `last_field_trailing_gap_ok`
-        // (#2307), consolidating what used to be a fourth inline copy of
-        // this same hop-then-check shape.
-        if !last_field_trailing_gap_ok(last_key_cursor, b'}') {
-            return Err(self.malformed_member_error());
-        }
-        Ok(false)
+            Ok(false)
+        })();
+        (found, visited)
     }
 
     /// Check if there are no fields.

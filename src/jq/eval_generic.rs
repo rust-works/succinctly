@@ -49072,6 +49072,36 @@ mod tests {
     /// A member with a missing `,` that `has` reaches (a lookup that matches
     /// after it, or none at all) raises; one a match precedes does not. The
     /// index must not smooth that over, so the object keeps the walk.
+    /// An index a keyed read (`.big[$k]`) built serves `has` on the same object, and
+    /// the reverse, with the walk's answers.
+    #[cfg(feature = "std")]
+    #[test]
+    fn has_and_keyed_reads_share_one_index_4002() {
+        let members: Vec<String> = (0..150).map(|i| format!("\"k{i}\":{i}")).collect();
+        let doc = format!("{{\"big\":{{{}}}}}", members.join(","));
+        for (program, builds, hits) in [
+            ("[range(4) as $i | .big[\"k7\"]] | length", 1, 3),
+            ("[range(4) as $i | .big | has(\"nope\")] | length", 1, 3),
+            (
+                "[range(4) as $i | .big[\"k7\"]] + [range(4) as $i | .big | has(\"nope\")] | length",
+                1,
+                7,
+            ),
+            (
+                "[range(4) as $i | .big | has(\"nope\")] + [range(4) as $i | .big[\"k7\"]] | length",
+                1,
+                7,
+            ),
+        ] {
+            let before = crate::jq::key_index::memo::work();
+            let (out, control) = drive_each_sink::<JqSemantics>(doc.as_bytes(), program);
+            assert!(control.is_none(), "{control:?}");
+            assert_eq!(out.len(), 1, "{program}");
+            let (b, h) = crate::jq::key_index::memo::work();
+            assert_eq!((b - before.0, h - before.1), (builds, hits), "{program}");
+        }
+    }
+
     #[cfg(feature = "std")]
     #[test]
     fn has_through_the_index_keeps_the_walk_for_a_bad_delimiter_4002() {

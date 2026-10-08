@@ -30,10 +30,20 @@
 //!   decoded key equals the name, in both evaluation modes (the walk does not
 //!   look at the mode).
 //!
+//! # `has` (#4002)
+//!
+//! `has($k)` is answered from the same index, with one more condition: its
+//! walk (`contains_checked`) also raises, depending on where the match sits, for
+//! a key that will not decode and for a missing or doubled `,`/`:` on any member
+//! it visits, which the build above deliberately tolerates. So [`KeyIndex::contains`]
+//! answers only an object that [`KeyIndex::walk_is_clean`] (one extra key-only
+//! pass, run on the first `has`); any other object keeps the walk. A consumer
+//! added later must keep that condition.
+//!
 //! # When one is built
 //!
-//! Not on first sight. `find_cursor_counted` reports how many members a walk
-//! visited; only a walk of [`WIDE_MEMBERS`] or more registers the object, and
+//! Not on first sight. `find_cursor_counted` (and `contains_checked_counted`, for
+//! `has`) reports how many members a walk visited; only a walk of [`WIDE_MEMBERS`] or more registers the object, and
 //! the *next* lookup of it builds the index. An object that is small, or
 //! looked up once, never costs more than the walk it always cost, and a
 //! refused build is remembered so it is not retried. So is an eviction: only
