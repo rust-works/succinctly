@@ -5786,6 +5786,11 @@ impl<'a, W: AsRef<[u64]>> YamlElements<'a, W> {
         //
         // A childless wrapper is returned as-is: `value()` decides whether it is an empty
         // sequence item (null) or a plain scalar that merely begins `- ` (#332).
+        //
+        // `YamlCursor::unwrap_seq_entry` is the same rule for `next_element` to step with (#2784);
+        // it is a copy and not a call because a call here cost 21 instructions per element of every
+        // sequence walk even with `#[inline]`. `next_element_walks_the_element_and_member_chains_2784`
+        // pins the two to the same chain.
         if element_cursor.is_container() {
             Some((element_cursor, rest))
         } else if element_cursor
@@ -7297,9 +7302,12 @@ thread_local! {
         const { core::cell::Cell::new(0) };
 }
 
-impl<W: AsRef<[u64]> + Clone> YamlCursor<'_, W> {
-    /// `element` as [`YamlElements::uncons_cursor`] hands out the sibling `self`: a block-sequence
-    /// item is unwrapped from its `-` node, anything else is the element itself.
+impl<W: AsRef<[u64]>> YamlCursor<'_, W> {
+    /// A `-` node unwrapped the way [`YamlElements::uncons_cursor`] unwraps it: a block-sequence
+    /// item with its content on the `-` line is its first child, anything else is the node
+    /// itself.
+    /// (A copy of the rule `YamlElements::uncons_cursor` applies inline; see the note there.)
+    #[inline]
     fn unwrap_seq_entry(self) -> Self {
         if self.is_container() {
             self
@@ -7313,14 +7321,23 @@ impl<W: AsRef<[u64]> + Clone> YamlCursor<'_, W> {
         }
     }
 
-    /// Whether `self` is the `-` node whose unwrapped item `element` is: a childless-or-not
-    /// non-container node that starts a same-line sequence entry and whose first child is
+    /// The element `DocumentElements::uncons_cursor` hands out for the sibling `self`: unwrapped
+    /// from its `-` node, and resolved through a bare `-` whose value is on the next line
+    /// ([`YamlElements::uncons_resolved_cursor`]).
+    #[inline]
+    fn seq_item(self) -> Self {
+        self.unwrap_seq_entry().resolve_bare_seq_item()
+    }
+
+    /// Whether `self` is the `-` node whose item is `element`: a non-container node that
+    /// starts a sequence entry (content on the same line or the next) and whose first child is
     /// `element`.
-    fn is_unwrapped_seq_entry_of(&self, element: &Self) -> bool {
+    #[inline]
+    fn is_seq_entry_of(&self, element: &Self) -> bool {
         !self.is_container()
             && self
                 .text_position()
-                .is_some_and(|text_pos| starts_inline_seq_entry(self.text, text_pos))
+                .is_some_and(|text_pos| starts_seq_entry(self.text, text_pos))
             && self
                 .first_child()
                 .is_some_and(|child| child.bp_pos == element.bp_pos)
@@ -7352,22 +7369,27 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     /// scan misses a node the full scan finds, and the full scan then decides.
     const RESUMABLE_ELEMENT_SCAN: bool = true;
 
-    /// The element after this one: the next sibling, as `uncons_cursor` unwraps it when this
-    /// element is a block-sequence item (the first child of its `-` wrapper, whose own
-    /// sibling is the next wrapper) or the wrapper itself (a bare `-`).
+    /// The element after this one, as `DocumentElements::uncons_cursor` hands it out: the next
+    /// sibling, unwrapped from its `-` node and resolved through a deferred bare `-` (a value on
+    /// the next line). From a block-sequence item -- the first child of its `-` node, whose
+    /// own sibling is the next `-` node -- or from the `-` node itself (a bare `-`), the step is
+    /// from that `-` node; anywhere else the element is its own sibling.
     fn next_element(&self) -> Option<Self> {
         let mut wrapper = *self;
         if self.bp_pos > 0 {
             if let Some(before) = self.at_node_id(self.bp_pos - 1) {
-                if before.is_unwrapped_seq_entry_of(self) {
+                if before.is_seq_entry_of(self) {
                     wrapper = before;
                 }
             }
         }
-        wrapper.next_sibling().map(YamlCursor::unwrap_seq_entry)
+        wrapper.next_sibling().map(YamlCursor::seq_item)
     }
 
-    /// The balanced-parentheses excess at this node's open: a rank lookup.
+    /// The balanced-parentheses excess at this node's open: a rank lookup. A block-sequence item
+    /// sits under its `-` node, so it is two levels below its sequence, not one: the scan's
+    /// "direct child of a remembered parent" test does not recognise it and takes the parent
+    /// from `document_parent`, as it did before.
     #[inline]
     fn tree_depth(&self) -> Option<usize> {
         self.index.bp().depth(self.bp_pos)
@@ -16352,6 +16374,15 @@ seq:
   - &anc z
   - *anc
   -   spaced
+  -
+    d1: deferred
+    d2: mapping
+  -
+    - deferred
+    - sequence
+  -
+    deferred scalar
+  - last
 map:
   k1: v1
   k2:

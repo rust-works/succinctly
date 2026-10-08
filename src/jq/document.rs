@@ -403,7 +403,7 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// where the format cannot say cheaply; a caller then treats the subtree
     /// as containing nothing.
     fn subtree_end(&self) -> Option<usize> {
-        None // patchcov: coverage tolerate-line reason="unreachable: the only caller, eval_generic::embed_at_or_within, is gated on jq semantics, and the YAML cursor (the one implementor without an override) is only ever evaluated under yq semantics (#3179)"
+        None // patchcov: coverage tolerate-line reason="unreachable: every implementor overrides this (JSON since #3179, YAML since #2784), so the default is only what a future format without one would answer"
     }
 
     /// Check if this cursor points to a container (array or object) **with
@@ -478,9 +478,13 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// the length of that array before it could resume.
     ///
     /// The default is `false`: a format whose element cursor is not the plain
-    /// sibling of the previous one (YAML's block-sequence items are wrapper
-    /// nodes that `uncons_cursor` unwraps) keeps the scan from the start. A
-    /// format that sets it must also have [`at_node_id`](Self::at_node_id) of
+    /// sibling of the previous one keeps the scan from the start. YAML's
+    /// block-sequence items are wrapper nodes that `uncons_cursor` unwraps (and
+    /// resolves through a bare `-`), so its [`next_element`](Self::next_element)
+    /// steps from the item's `-` node and applies the same unwrapping (#2784);
+    /// it must yield exactly the elements `uncons_cursor` does, which
+    /// `yaml::light`'s `next_element_walks_the_element_and_member_chains_2784`
+    /// pins. A format that sets it must also have [`at_node_id`](Self::at_node_id) of
     /// a parent's [`node_id`](Self::node_id) answer that parent's
     /// [`document_parent`](Self::document_parent) -- the scan answers an
     /// element's parent from a remembered id rather than climbing -- and node

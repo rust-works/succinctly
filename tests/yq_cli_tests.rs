@@ -55909,7 +55909,7 @@ fn test_yaml_key_and_path_per_member_resume_the_scan_2784() -> Result<()> {
             _ => format!("k{i}: |\n  text\n"),
         });
     }
-    let all_keys = serde_json_array(&keys);
+    let all_keys = json_string_array(&keys);
     let (stdout, code) = run_yq_stdin("[.[] | key]", &mapping, &["-o", "json", "-I", "0"])?;
     assert_eq!((stdout.trim_end(), code), (all_keys.as_str(), 0));
     let paths: Vec<String> = keys.iter().map(|k| format!("[\"{k}\"]")).collect();
@@ -55931,7 +55931,10 @@ fn test_yaml_key_and_path_per_member_resume_the_scan_2784() -> Result<()> {
     // A sequence with bare dashes, nested sequences and mappings, comments and flow items.
     let mut sequence = String::new();
     for i in 0..n {
-        sequence.push_str(&match i % 8 {
+        sequence.push_str(&match i % 11 {
+            8 => format!("-\n  id: {i}\n  v: 1\n"),
+            9 => "-\n  - p\n  - q\n".to_string(),
+            10 => format!("-\n  deferred{i}\n"),
             0 => format!("- {i}\n"),
             1 => "-\n".to_string(),
             2 => format!("- - x{i}\n  - y\n"),
@@ -55976,7 +55979,7 @@ fn test_yaml_key_and_path_per_member_resume_the_scan_2784() -> Result<()> {
 }
 
 /// `["a","b"]` as JSON text, for the expected side of the #2784 pin.
-fn serde_json_array(items: &[String]) -> String {
+fn json_string_array(items: &[String]) -> String {
     let quoted: Vec<String> = items.iter().map(|k| format!("\"{k}\"")).collect();
     format!("[{}]", quoted.join(","))
 }

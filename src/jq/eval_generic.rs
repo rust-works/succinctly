@@ -49150,7 +49150,14 @@ mod tests {
     fn test_yaml_sequence_slots_resume_the_scan_2784() {
         let n = 1200usize;
         let yaml: String = (0..n)
-            .map(|i| format!("- a:\n    b: {i}\n"))
+            .map(|i| {
+                // Items with the content on the `-` line and on the next line (a deferred bare `-`).
+                if i % 2 == 0 {
+                    format!("- a:\n    b: {i}\n")
+                } else {
+                    format!("-\n  a:\n    b: {i}\n")
+                }
+            })
             .collect::<String>();
         let index = crate::yaml::YamlIndex::build(yaml.as_bytes()).unwrap();
         let first_item = index

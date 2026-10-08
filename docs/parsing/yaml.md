@@ -5429,9 +5429,11 @@ its block-sequence items are unwrapped from their `-` nodes and are not siblings
 ### The change
 
 `YamlCursor` sets `RESUMABLE_ELEMENT_SCAN` and answers `next_element`, `tree_depth` and
-`subtree_end`. `next_element` is the sibling, unwrapped exactly as `YamlElements::uncons_cursor`
-unwraps it: from a block-sequence item (the first child of its `-` node) or from the `-` node
-itself (a bare `-`) it hops to the next `-` node and unwraps that; for a mapping's key and value
+`subtree_end`. `next_element` is the sibling, unwrapped and resolved exactly as
+`DocumentElements::uncons_cursor` hands it out (the inline unwrap of `YamlElements::uncons_cursor`,
+then `resolve_bare_seq_item` for a `-` whose value is on the next line): from a block-sequence
+item (the first child of its `-` node) or from the `-` node itself (a bare `-`) it hops to the
+next `-` node and unwraps and resolves that; for a mapping's key and value
 nodes it is the plain next sibling, which is the chain `YamlFields::uncons` walks for a mapping
 without merge keys. A merged mapping lists fewer members than it has children; the resume then
 misses a node the full scan finds, and the full scan decides (`member_slot_resumable` and
@@ -5448,27 +5450,38 @@ M5 Max, one run each:
 | sequence, before | 0.59 s | 2.31 s | 9.86 s  | 36.27 s  |
 | sequence, after  | 0.01 s | 0.01 s | 0.01 s  | 0.02 s   |
 
-Interleaved A/B (`scripts/ab-cli.py`, 5 repetitions, output identity 12/12 on both),
-medians, `before` -> `after`:
+Interleaved A/B (`scripts/ab-cli.py`, 5 repetitions, output identity 12/12 on both boxes, binaries
+built from the base commit and from this change), medians, `before` -> `after`. `seq` is `- N` items,
+`seqd` is `-` with the item on the next line, `seqm` alternates the two:
 
-| input (query)                              | Apple M4 Pro              | AMD Ryzen 9 7950X         |
-|--------------------------------------------|---------------------------|---------------------------|
-| map 2000 (`key \| path`)                   | 492.5 ms -> 9.7 ms (-98.0%) | 756.6 ms -> 11.8 ms (-98.4%) |
-| map 4000                                   | 1944 ms -> 16.6 ms (-99.1%) | 3020 ms -> 21.2 ms (-99.3%)  |
-| map 8000                                   | 7803 ms -> 30.3 ms (-99.6%) | 12071 ms -> 40.4 ms (-99.7%) |
-| seq 2000                                   | 109.2 ms -> 4.3 ms (-96.1%) | 158.0 ms -> 3.3 ms (-97.9%)  |
-| seq 4000                                   | 412.9 ms -> 5.8 ms (-98.6%) | 623.8 ms -> 4.8 ms (-99.2%)  |
-| seq 8000                                   | 1607 ms -> 7.3 ms (-99.5%)  | 2481 ms -> 7.5 ms (-99.7%)   |
+| input (`[.[] \| key \| path] \| length`) | Apple M4 Pro                | AMD Ryzen 9 7950X            |
+|-------------------------------------------|-----------------------------|------------------------------|
+| mapping 2,000 keys                        | 495.0 ms -> 10.4 ms (-97.9%) | 751.9 ms -> 11.5 ms (-98.5%) |
+| mapping 4,000                             | 1948 ms -> 16.9 ms (-99.1%)  | 3011 ms -> 21.4 ms (-99.3%)  |
+| mapping 8,000                             | 7786 ms -> 30.5 ms (-99.6%)  | 12047 ms -> 41.2 ms (-99.7%) |
+| seq 2,000                                 | 108.9 ms -> 4.4 ms (-96.0%)  | 157.8 ms -> 3.3 ms (-97.9%)  |
+| seq 8,000                                 | 1602 ms -> 7.8 ms (-99.5%)   | 2482 ms -> 7.5 ms (-99.7%)   |
+| seqd 2,000                                | 144.5 ms -> 4.6 ms (-96.8%)  | 232.2 ms -> 3.5 ms (-98.5%)  |
+| seqd 8,000                                | 2173 ms -> 8.1 ms (-99.6%)   | 3704 ms -> 8.6 ms (-99.8%)   |
+| seqm 2,000                                | 128.1 ms -> 4.6 ms (-96.4%)  | 187.2 ms -> 3.4 ms (-98.2%)  |
+| seqm 8,000                                | 1839 ms -> 8.2 ms (-99.6%)   | 2958 ms -> 8.6 ms (-99.7%)   |
 
-Doubling the input now costs about 2x (9.7 -> 16.6 -> 30.3 ms and 11.8 -> 21.2 -> 40.4 ms for
-the mapping), where it cost 4x. `select(key == "k5" or key == 5)` over the same files moves the
-same way (-97.9% to -99.7%).
+Doubling the input now costs about 2x (mapping 10.4 -> 16.9 -> 30.5 ms and 11.5 -> 21.4 -> 41.2 ms),
+where it cost 4x; all 12 configurations are faster on both boxes (range -96.0% to -99.8%). The
+control (the base binary against itself) reads -0.04% and -0.46%. `select(key == "k5" or key == 5)`
+over the same files moved the same way in the first measurement (-97.9% to -99.7%).
 
 **Holdouts** (inputs of 100,000 members, >= 1 MB; the walk route does not call the scan, so
 these should not move): `[.[] | key | line]`, `.` and `[.[]] | length` on a mapping and a
-sequence, median of medians +0.16% on the M4 Pro and +0.72% on the 7950X against a control of
--0.2% and -1.2%; the largest single row is +1.9% (ARM) and +1.4% (x86_64) with signs that
-change from row to row.
+sequence, median of medians -0.33% on the M4 Pro and +0.73% on the 7950X. Retired instructions
+say the code those rows run did not change: cachegrind on the 7950X reads +70 to +340
+instructions out of 207M-748M on the sequence rows and +90 on the mapping rows, and `time -l` on
+the M4 Pro reads +0.11% (`key | line`) and +0.02% (`.`) on the mapping, so the largest wall-clock
+row (+2.0% on `map100000 key | line` on the M4 Pro) is code placement, not work. (A first version
+of the change routed `YamlElements::uncons_cursor` through the shared unwrap helper; that added 21
+instructions per element to every sequence walk even with `#[inline]`, 5 with `#[inline(always)]`,
+and is why `uncons_cursor` keeps its own copy of the rule and the chain-equivalence test pins the
+two together.)
 
 `[.[] | parent | length] | length` stays quadratic: that is #2574's materialization of the
 parent, not this scan.
