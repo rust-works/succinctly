@@ -5563,7 +5563,16 @@ be specified as an array`, having fired the target three times
 (`(. as $x ?// $y | (.|stderr)[(0,1)]) += "x"` on `[1,2]`). That is jq's VM stack, not a
 rule, and it fires on *any* retry through `_modify`, even one whose writes all succeed.
 succinctly keeps the first failed write's own error instead (`number (1) and string ("x")
-cannot be added`, here after firing the target twice), which keeps jq's exit code. `=` is
+cannot be added`, here after firing the target twice), which keeps jq's exit code. The same
+holds when the chain is longer than the write needs and an earlier retry already raised: on a
+`null` document `(limit(1; foreach (foreach . as [$a] ?// {a:$a} ?// $a (0; .; .)) as $x (.; .; .))) |= 9`
+(and the `+= 1` form) fails in jq with `Paths must be specified as an array`, because the
+third alternative is a second retry through `_modify`, where the two-alternative chain
+raises its own `Cannot index array with string "a"`. succinctly reports the second
+alternative's error in both cases, exit 5 either way
+([#3963](https://github.com/rust-works/succinctly/issues/3963); the nested `foreach` is
+incidental: `(limit(1; . as [$a] ?// {a:$a} ?// $a | .)) |= 9` shows the same message).
+`=` is
 different in jq, and succinctly follows it: `_assign`'s `reduce` carries on with the retried
 alternative, so `(. as $x ?// $y | .[if $x == null then 0 else -5 end]) = 1` on `[1]` is `[1]`
 (it raised `Out of bounds negative array index` here before #2974's review). It carries on
