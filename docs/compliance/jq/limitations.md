@@ -639,13 +639,19 @@ $x (.; .[$x:]))` raises `E2`, was the slice error). What it leaves:
   whose catch happened to agree with jq (`del(try (.a and (reduce . as {a:$a,b:$b} ?// [$a] (0;
   .))))` on `{"a":1,"b":2}`, jq `{"a":1,"b":2}`) refuses too. Only a refusal of a step that could
   have succeeded on the element is converted (`NavKind::would_succeed_on`); one jq raises
-  whatever its register is (a string key off an array) stays catchable. Over the nine fold-pattern
+  whatever its register is (a string key off an array) stays catchable, and since
+  [#3998](https://github.com/rust-works/succinctly/issues/3998) it also *retries* the next
+  alternative, computed key or not: it is jq's own verdict, not a guess (`del(try (.[0] and (reduce
+  . as {("a"):$a} ?// $a (0; .))))` on `[1]` is jq's error, was a silent `[1]`; on `[true]` jq
+  answers `[]` and the retried alternative refuses here, as the un-wrapped fold already did,
+  pinned by `test_fold_pattern_step_that_never_succeeds_retries_3998`). Over the nine fold-pattern
   operands of `scripts/jq-path-register-sweep.py` (119,907 rows) wrong answers fell from 126
   ACCEPT_WRONG and 32 DIFF to 14 and 10, at 118 more refusals. **Still left as it was**: a
   computed key whose value is `null`, a boolean or an array has no `NavKind`, so its guessed
   refusal stays catchable; and a guess on the *last* alternative is not asked at all. A pattern
   with a computed key is not judged by value (running its generator again would repeat its
-  effects, `test_fold_pattern_computed_key_is_not_run_twice_3743`), so it is not retried.
+  effects, `test_fold_pattern_computed_key_is_not_run_twice_3743`), so a refusal that could still
+  succeed is not retried; one that never could (#3998) is, without running the key again.
 
 ## A fold over the register itself (#3790)
 
