@@ -4294,6 +4294,10 @@ untouched. The key is `tostring`'s text, so `==` and `unique` agree about a numb
   classes agree (equal contents dedup, different ones do not, field order matters) and the bytes
   do not. yq's key is also style-sensitive (a flow `[1]` and a block `- 1` can be two keys), which
   a value-level key cannot see.
+- **Alias nodes.** yq keys an alias element (`*x`) differently from the anchor's node, since its
+  container key is the YAML encoding and an alias encodes as itself: `anch: [&x {p: 1}, *x, {p: 1}]`
+  gives `.anch | unique | length` of `3` in yq and `1` here (`group_by(.) | length` is `2` there and
+  `1` here). Aliases are resolved before the key is built, so the identity is gone.
 - **Spellings `OwnedValue` cannot keep** ([#2802](https://github.com/rust-works/succinctly/issues/2802)):
   the text a `01`, `0x1f` or `True` keys on is its resolved text here, in a document and as a
   filter literal alike (`[01, 1] | unique` is `[1]` here and `[1,1]` in yq; a document

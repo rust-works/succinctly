@@ -49953,6 +49953,11 @@ mod yq_text_equality_2785 {
             (r#"["a","A","a"] | unique"#, r#"["a","A"]"#),
             (r"[1,2,3,4] | group_by(. % 2)", r"[[1,3],[2,4]]"),
             (r"[1,2,3,4] | unique_by(. % 2)", r"[1,2]"),
+            // The empty `group_by` key merges a container with `""`, as in yq; `unique`'s
+            // container key cannot collide with a string spelling the same text.
+            (r#"["", [1]] | group_by(.) | length"#, "1"),
+            (r#"["", [1]] | unique | length"#, "2"),
+            (r#"["\u0001[1]", [1]] | unique | length"#, "2"),
         ] {
             let (out, code) = run_yq_stdin(filter, scalars, &["-o=json", "-I=0"])?;
             assert_eq!((out.trim(), code), (want, 0), "`{filter}`");
