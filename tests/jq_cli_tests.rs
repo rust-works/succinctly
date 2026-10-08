@@ -59560,6 +59560,43 @@ fn test_foreach_full_slice_source_is_the_accumulator_3460() -> Result<()> {
     Ok(())
 }
 
+/// #4001: `path(.big[$k])` per key of a wide object reuses one owned copy of the
+/// document (the cursor walk does not take a computed key), so a repeated call must
+/// answer what a lone call answers -- including over a document whose copy the
+/// reindex bridge would not round-trip (`nan`, an over-range literal). Every row is
+/// a live jq 1.7.1 capture.
+#[test]
+fn test_path_with_a_computed_key_repeats_to_the_same_answer_4001() -> Result<()> {
+    const ROWS: &[(&str, &str, &str)] = &[
+        (
+            r#"{"big":{"a":1,"b":2},"ks":["a","b","c","a"],"n":nan}"#,
+            r"[.ks[] as $k | path(.big[$k])]",
+            "[[\"big\",\"a\"],[\"big\",\"b\"],[\"big\",\"c\"],[\"big\",\"a\"]]\n",
+        ),
+        (
+            r#"{"big":{"a":1,"b":2},"ks":["a","b","c","a"],"n":1e1000}"#,
+            r"[.ks[] as $k | path(.big[$k])]",
+            "[[\"big\",\"a\"],[\"big\",\"b\"],[\"big\",\"c\"],[\"big\",\"a\"]]\n",
+        ),
+        (
+            r#"{"big":{"a":{"x":[1,2]},"b":2},"ks":["a","b","c","a"]}"#,
+            r#"[.ks[] as $k | try path(.big[$k][0]) catch "E"]"#,
+            "[\"E\",\"E\",[\"big\",\"c\",0],\"E\"]\n",
+        ),
+        (
+            r#"{"big":{"a":{"x":[1,2]},"b":2},"ks":["a","b","c","a"]}"#,
+            r"[.ks[] as $k | path(.big[$k] | select(. != null))]",
+            "[[\"big\",\"a\"],[\"big\",\"b\"],[\"big\",\"a\"]]\n",
+        ),
+    ];
+    for (doc, filter, want) in ROWS {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(stdout, *want, "`{filter}` on {doc}: stderr: {stderr:?}");
+        assert_eq!(code, 0, "`{filter}` on {doc}: stderr: {stderr:?}");
+    }
+    Ok(())
+}
+
 /// #3460 (second half): `tostring`/`@text` of a string and `tonumber` of a number
 /// return their input as the same `jv`, so `path()` and an update accept them where
 /// every other input builds a fresh value and is refused. Not specific to a fold.
