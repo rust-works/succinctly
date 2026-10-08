@@ -4070,6 +4070,20 @@ pub trait DocumentElements: Sized + Copy + Clone {
     /// Check if there are no elements.
     fn is_empty(&self) -> bool;
 
+    /// A cheap identity of this list: the node id of the element it stands at
+    /// and the document's token, read without resolving the element or
+    /// finding its next sibling (which [`uncons_cursor`](Self::uncons_cursor)
+    /// does). Two lists with the same identity are the same list, because the
+    /// rest of an array is determined by where it starts (#4035). `None` for
+    /// an exhausted list or a format that does not support the element index.
+    ///
+    /// The id need not be the node `uncons_cursor` hands back (a YAML list may
+    /// stand at a `-` wrapper that `uncons_cursor` resolves past); it need
+    /// only be the same every time for the same list.
+    fn head_id(&self) -> Option<(usize, usize)> {
+        None // patchcov: coverage tolerate-line reason="the default for a format without the element index; both shipped formats override it"
+    }
+
     /// Count the number of elements.
     fn len(&self) -> usize {
         let mut count = 0;

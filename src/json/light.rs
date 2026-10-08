@@ -4506,6 +4506,10 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentElements for JsonElements<'a, W> {
         JsonElements::is_empty(self)
     }
 
+    fn head_id(&self) -> Option<(usize, usize)> {
+        self.current().map(|c| (c.node_id(), c.document_token()))
+    }
+
     /// Re-runs the strict validator, mirroring
     /// [`JsonFields::malformed_member_error`]'s own reasoning (#1194) for
     /// the array delimiter class (#1677).
