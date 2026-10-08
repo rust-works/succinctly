@@ -38467,9 +38467,14 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // unless a string argument actually matches the string input's edge
         // (an empty argument matches), in which case the result is fresh. Only
         // a literal argument is judged; anything else keeps the refusal. jq
-        // only: yq has no `ltrimstr`.
-        Expr::Builtin(Builtin::Ltrimstr(arg) | Builtin::Rtrimstr(arg))
-            if S::TAG == EvalTag::Jq && trim_returns_input(expr, arg, value) =>
+        // only: yq's `--jq-extensions` `ltrimstr` keeps its no-op write.
+        Expr::Builtin(Builtin::Ltrimstr(arg))
+            if S::TAG == EvalTag::Jq && trim_returns_input(true, arg, value) =>
+        {
+            emit_passthrough(value, trackable, snapshot, sink)
+        }
+        Expr::Builtin(Builtin::Rtrimstr(arg))
+            if S::TAG == EvalTag::Jq && trim_returns_input(false, arg, value) =>
         {
             emit_passthrough(value, trackable, snapshot, sink)
         }
@@ -52391,16 +52396,17 @@ fn type_filter_keeps(builtin: &Builtin, value: &OwnedValue) -> Option<bool> {
 
 /// Whether `ltrimstr`/`rtrimstr` with the literal `arg` returns `value` itself
 /// (#4016): `value` or `arg` is not a string, or the edge does not match.
-fn trim_returns_input(expr: &Expr, arg: &Expr, value: &OwnedValue) -> bool {
+fn trim_returns_input(is_left: bool, arg: &Expr, value: &OwnedValue) -> bool {
     let Expr::Literal(lit) = arg else {
         return false;
     };
     let (Literal::String(edge), OwnedValue::String(text)) = (lit, value) else {
         return true;
     };
-    match expr {
-        Expr::Builtin(Builtin::Ltrimstr(_)) => !text.as_str().starts_with(edge.as_str()),
-        _ => !text.as_str().ends_with(edge.as_str()),
+    if is_left {
+        !text.as_str().starts_with(edge.as_str())
+    } else {
+        !text.as_str().ends_with(edge.as_str())
     }
 }
 

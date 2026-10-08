@@ -1624,8 +1624,8 @@ is the revert that established what the other one costs.
    (`try error(.) catch .`: the payload is the register's own storage). Two shapes the resolver
    cannot place now refuse loudly where they used to drop jq's write at exit 0: a zero-arity
    `def` that forwards its input (`del(def f: .; f as $x | try $x.a)`), and a bind made after a
-   stage that lost the register (`del(ltrimstr("x") | ((., 1) | .) as $x | try $x.a)`); jq writes
-   `{}` in both. One residual keeps the silent drop: a `?//` whose source forwards `.` through
+   stage that lost the register (`del(ltrimstr("x") | ((., 1) | .) as $x | try $x.a)` was one until
+   #4016, which answers it); jq writes `{}` in both. One residual keeps the silent drop: a `?//` whose source forwards `.` through
    control flow (`(((., 1) | .) as [$q] ?// $q | try $q.b) = 9` echoes the document where jq
    writes `.b`). Marking it aborts an alternative jq retries
    (`test_try_if_widening_does_not_leak_3279`), and binding its bare `$q` as a passthrough is
@@ -3288,9 +3288,10 @@ answers `["b"]` — and classified the two residuals appended below):
     `@text` are jq mode only (yq's `(.b|tostring) = "z"` is a no-op); `tonumber` of a number
     writes in both modes, as in yq v4.53.3. Still refused where jq answers (never a write): a
     *bound* result, `path(.b|tostring as $y|$y)` and `path(.n|tonumber as $x|$x)` (the bind-source
-    analyses do not know these stages return their input),. `ltrimstr`/`rtrimstr` with a literal argument that does not match return their input too (#4016);
-    a non-literal argument still refuses. The sweep alphabet cannot spell
-    the bound shape. Tracked as
+    analyses do not know these stages return their input; the sweep alphabet cannot spell the bound
+    shape, #4017). `ltrimstr`/`rtrimstr` with a literal argument that does not match return their
+    input too (#4016); a matching edge builds a fresh string, and a non-literal argument still refuses.
+    Tracked as
     [#3460](https://github.com/rust-works/succinctly/issues/3460). Closed by #3460's first
     half: the accumulator's node carried from one source element to the next
     (`path(foreach (1, .a) as $k (.; .a))` on `{"a":{"a":1}}` is `["a"]` then `["a","a"]`,
