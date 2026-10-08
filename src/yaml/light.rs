@@ -7558,6 +7558,27 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         YamlCursor::explicit_tag(self)
     }
 
+    fn plain_scalar_source<'v>(&'v self, value: &'v YamlValue<'a, W>) -> Option<Cow<'v, str>> {
+        match value {
+            // An empty entry (`push:`).
+            YamlValue::Null => Some(Cow::Borrowed("")),
+            YamlValue::String(YamlString::Unquoted {
+                text,
+                start,
+                end,
+                json_sourced: false,
+                ..
+            }) => {
+                let bytes = text.get(*start..*end)?;
+                if bytes.contains(&b'\n') {
+                    return None;
+                }
+                core::str::from_utf8(bytes).ok().map(Cow::Borrowed)
+            }
+            _ => None,
+        }
+    }
+
     #[inline]
     fn explicit_tag_of_non_alias(&self) -> Option<&str> {
         if self.index.has_explicit_tags() {

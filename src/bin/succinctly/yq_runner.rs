@@ -35,8 +35,8 @@ use succinctly::json::validate;
 use succinctly::json::JsonIndex;
 use succinctly::yaml::{
     format_float_yq_yaml, format_float_yq_yaml_nested, go_yaml_dom_scalar,
-    go_yaml_double_quoted_scalar, go_yaml_tagged_str_scalar, stream_json_sequence,
-    stream_yaml_sequence, YamlCursor, YamlIndex, YamlValue,
+    go_yaml_double_quoted_scalar, go_yaml_tagged_str_scalar, resolve_plain_sourced,
+    stream_json_sequence, stream_yaml_sequence, ResolvedScalar, YamlCursor, YamlIndex, YamlValue,
 };
 
 use super::m2_gate::can_use_m2_streaming;
@@ -2735,7 +2735,12 @@ fn reconcile_presentation_at_depth(
         // one, which follows the new value's type (`!!str "dq"` written `5` is `5`).
         _ => CommentTree::Leaf(written_scalar_meta(
             pristine_tree.meta(),
-            !pristine_value.identical(result_value),
+            !same_scalar(pristine_value, result_value),
+            // A closed literal written right here (`.a = true`) brings its own text,
+            // even when the value is the one the node already had (#3028).
+            targets
+                .iter()
+                .any(|(steps, kind, fresh)| steps.is_empty() && *kind == WriteKind::Set && *fresh),
             pristine_value,
             result_value,
         )),
@@ -2749,11 +2754,16 @@ fn reconcile_presentation_at_depth(
 fn written_scalar_meta(
     meta: &NodeMeta,
     changed: bool,
+    rewritten_by_literal: bool,
     before: &OwnedValue,
     now: &OwnedValue,
 ) -> NodeMeta {
     if !changed {
-        return meta.clone();
+        return if rewritten_by_literal {
+            meta.with_spelling(None)
+        } else {
+            meta.clone()
+        };
     }
     let now_core = core_tag_of(now);
     // The quoting stays while the node's type stays: a string; a value of the type its
@@ -2768,11 +2778,34 @@ fn written_scalar_meta(
             Some(tag) => tag == now_core,
             None => false,
         };
-    let meta_now = meta.with_style(if keeps_style { meta.style } else { "" });
+    let meta_now = meta
+        .with_style(if keeps_style { meta.style } else { "" })
+        .with_spelling(None);
     match meta.tag() {
         Some(tag) if !is_custom_tag(tag) && tag != now_core => meta_now.with_tag(None),
         _ => meta_now,
     }
+}
+
+/// Whether a write left a scalar as it was: the same type and the same value, however
+/// each side carries it (`Int(31)` and the literal `0x1F` are one value; `1` and `1.0`
+/// are not, they are an `!!int` and a `!!float`).
+fn same_scalar(a: &OwnedValue, b: &OwnedValue) -> bool {
+    core_tag_of(a) == core_tag_of(b)
+        && match (a, b) {
+            (OwnedValue::Null, OwnedValue::Null) => true,
+            (OwnedValue::Bool(x), OwnedValue::Bool(y)) => x == y,
+            (OwnedValue::String(x), OwnedValue::String(y)) => x == y,
+            (
+                OwnedValue::Int(x) | OwnedValue::NumberLiteral(NumberRepr::Int(x), _),
+                OwnedValue::Int(y) | OwnedValue::NumberLiteral(NumberRepr::Int(y), _),
+            ) => x == y,
+            (
+                OwnedValue::Float(x) | OwnedValue::NumberLiteral(NumberRepr::Float(x), _),
+                OwnedValue::Float(y) | OwnedValue::NumberLiteral(NumberRepr::Float(y), _),
+            ) => x == y || (x.is_nan() && y.is_nan()),
+            _ => false,
+        }
 }
 
 /// The core tag YAML's type resolution gives a value.
@@ -3853,7 +3886,14 @@ fn apply_meta_assign_writes(
             }
             MetaEffect::Style(style) => {
                 if matches!(*style, "double" | "single" | "literal" | "folded") {
-                    if let Some(plain) = plain_scalar_text(node_value) {
+                    // The text the node was written with (`~`, `0x1F`, `True`, #3028), else
+                    // the value's own spelling.
+                    let spelled = node
+                        .meta()
+                        .spelling()
+                        .filter(|spelling| spelling_names_value(spelling, node_value))
+                        .map(str::to_string);
+                    if let Some(plain) = spelled.or_else(|| plain_scalar_text(node_value)) {
                         *node_value = OwnedValue::String(plain.into());
                     }
                 }
@@ -5080,7 +5120,10 @@ fn emit_yaml_value_at_depth(
     if let Some(name) = comments.alias_name() {
         return format!("*{name}");
     }
-    if comments.style() == "tagged" || comments.meta().tag().is_some() {
+    if comments.style() == "tagged"
+        || comments.meta().tag().is_some()
+        || comments.meta().spelling().is_some()
+    {
         if let Some(tagged) = emit_tagged_scalar(value, comments, config, indent, in_flow, depth) {
             return tagged;
         }
@@ -5278,10 +5321,7 @@ fn emit_yaml_value_at_depth(
                             );
                             let comment_suffix = trailing_comment_suffix(elem_comments, indent);
                             let anchor = anchor_decl_prefix(elem_comments);
-                            format!(
-                                "{indent}-{anchor} {}",
-                                with_trailing_comment(item, &comment_suffix)
-                            )
+                            entry_line(indent, "-", &anchor, item, &comment_suffix)
                         };
                         let rendered = prepend_head_comment_lines(
                             rendered,
@@ -5439,10 +5479,7 @@ fn emit_yaml_value_at_depth(
                             } else {
                                 comment_suffix
                             };
-                            format!(
-                                "{indent}{key}:{anchor} {}",
-                                with_trailing_comment(val, &comment_suffix)
-                            )
+                            entry_line(indent, &format!("{key}:"), &anchor, val, &comment_suffix)
                         };
                         let rendered = prepend_head_comment_lines(
                             rendered,
@@ -5814,6 +5851,22 @@ fn emit_tagged_scalar(
         };
         return Some(join_tag(tag, text));
     }
+    // How the node was spelled in the source (`~`, `True`, `.5`), when that still names
+    // its value (#3028). Empty for an empty value, written as nothing in block context.
+    let spelled = comments
+        .meta()
+        .spelling()
+        .filter(|spelling| spelling_names_value(spelling, value))
+        .map(|spelling| {
+            if spelling.is_empty() && in_flow {
+                "null"
+            } else {
+                spelling
+            }
+        });
+    if comments.style() != "tagged" {
+        return spelled.map(str::to_string);
+    }
     let (tag, text) = match value {
         OwnedValue::Null => ("!!null", "null".to_string()),
         OwnedValue::Bool(b) => ("!!bool", b.to_string()),
@@ -5848,7 +5901,26 @@ fn emit_tagged_scalar(
         }
         OwnedValue::Array(_) | OwnedValue::Object(_) => return None,
     };
-    Some(format!("{tag} {text}"))
+    Some(join_tag(tag, spelled.map_or(text, str::to_string)))
+}
+
+/// Whether a plain scalar written `spelling` in the source still names `value`: the
+/// DOM writer prints the spelling back only for a node whose value it did not change
+/// (`True` for `true`, `0x1F` for 31), never for one a write replaced (#3028).
+fn spelling_names_value(spelling: &str, value: &OwnedValue) -> bool {
+    match (resolve_plain_sourced(spelling, false), value) {
+        (ResolvedScalar::Null, OwnedValue::Null) => true,
+        (ResolvedScalar::Bool(a), OwnedValue::Bool(b)) => a == *b,
+        (
+            ResolvedScalar::Int(a),
+            OwnedValue::Int(b) | OwnedValue::NumberLiteral(NumberRepr::Int(b), _),
+        ) => a == *b,
+        (
+            ResolvedScalar::Float(a),
+            OwnedValue::Float(b) | OwnedValue::NumberLiteral(NumberRepr::Float(b), _),
+        ) => a == *b || (a.is_nan() && b.is_nan()),
+        _ => false,
+    }
 }
 
 /// `tag` then `text`, or the tag alone when there is no text.
@@ -5921,6 +5993,28 @@ fn emit_string_scalar(
         return go_yaml_double_quoted_scalar(s);
     }
     yaml_quote_string_with_style(s, style, in_flow, config.json_sourced_floats)
+}
+
+/// One `key:` or `-` entry line: `{indent}{lead}{anchor} {value}{comment}`, with nothing after
+/// the lead for an empty value (`push:`, #3028). Out of line so the recursive emitter's frame
+/// stays small (see `emit_yaml_value_panics_past_nesting_depth_limit_1017`, which overflows
+/// under coverage instrumentation otherwise).
+#[inline(never)]
+fn entry_line(
+    indent: &str,
+    lead: &str,
+    anchor: &str,
+    value: String,
+    comment_suffix: &str,
+) -> String {
+    if value.is_empty() {
+        format!("{indent}{lead}{anchor}{comment_suffix}")
+    } else {
+        format!(
+            "{indent}{lead}{anchor} {}",
+            with_trailing_comment(value, comment_suffix)
+        )
+    }
 }
 
 /// `rendered` followed by a trailing comment. A block scalar's header is its first

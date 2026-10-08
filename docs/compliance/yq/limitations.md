@@ -4256,8 +4256,7 @@ ruled out), even though real yq supports every one of them:
   Two go-yaml folded-writer quirks are reproduced rather than fixed, so a folded value does
   not always read back identically in yq either: a kept (`>+`) trailing run gains one empty
   line, and a more-indented line (`x\n y`) gets an empty line before it. Divergences that
-  remain for `tagged`: a non-decimal integer loses its spelling before the emitter runs
-  (`!!int 31` for `0x1F`, [#2802](https://github.com/rust-works/succinctly/issues/2802));
+  remain for `tagged`: `1_000` is a string here where yq types it `!!int`;
   `2024-01-01` is `!!str` where yq has `!!timestamp` (no timestamp type); an explicit source
   tag is not kept (`a: !!float 1` prints `!!int 1`, [#1416](https://github.com/rust-works/succinctly/issues/1416));
   `~` prints `null`; and a style is applied to the node's *final* value (the known
@@ -4274,8 +4273,7 @@ ruled out), even though real yq supports every one of them:
   core tags that only restate a type and keeps the rest. Checked against yq v4.53.3 on ~1,900
   random tagged documents. Not matched: a node a write *copies* from elsewhere (`.b = .a`)
   carries no tree entry, so it loses its tag where yq copies it (the existing copy gap); a
-  computed value has no tag (#1416); `!!set` members print `null` where yq prints `''`; `!!null`
-  keeps no `~` spelling (#2802); and a tagged `null` that a path write walks through
+  computed value has no tag (#1416); `!!set` members print `null` where yq prints `''`; and a tagged `null` that a path write walks through
   (`a: !Foo null` + `.a.b = 5`) becomes a mapping where yq leaves the document alone. A tag on a
   mapping *key* (`? !K key`) is not captured and is still dropped, and a tagged empty value
   (`a: !Foo` with nothing after it) is written `!Foo null`.
@@ -4362,6 +4360,25 @@ its text (`numeric_display_string`, so `==` and `tostring` agree about a compute
   the remaining slice): they still use typed equality / jq's type ordering, where yq's `sort`
   comparator is typed only for null/bool/number pairs and falls back to `strings.Compare` on the
   text (so `"1"` sorts before `1`).
+- **A write keeps the source spelling of an untouched plain scalar**
+  ([#3028](https://github.com/rust-works/succinctly/issues/3028)). On the DOM route (`=`, `|=`,
+  `del()`, `-P`, `-i`) a null, bool or number that was not spelled the canonical way is
+  printed back as it was written: `push:` (an empty value, the GitHub Actions idiom, which
+  used to become `push: null`), `~`, `Null`, `True`, `0x1F`, `017`, `+1`, `.5`, `2.`, `.inf`.
+  The spelling rides the node's metadata beside its comment, style, anchor and tag (the
+  ADR-0017 side-tree, not `OwnedValue`), is recorded only when it differs from the way the
+  value prints, and is printed only while it still resolves to the node's value, so a node a
+  write replaces takes the new value's text (`b: 0xff` written `5` is `5`). Checked against
+  yq v4.53.3 on ~3,000 random documents plus a sweep of 2,178 real YAML files. It does not
+  touch #2802's *read* side (`tostring`, `==`, keys), listed below. A closed literal written
+  over a node (`.a = true` over `True`) brings its own text, as in yq; `style = "double"` and
+  `"single"` quote the spelling (`"~"`, `"0x1F"`). Not matched:
+  - arithmetic on a hex or octal integer keeps its base in yq (`0xff + 1` is `0x100`, #3027);
+  - the spelling belongs to the *position*, not the node, so equal-valued scalars that a write
+    moves (`[~, Null] | reverse`) swap spellings, where yq carries each node's own;
+  - a node a write copies from elsewhere (`.b = .a`) carries none, and a bare document scalar
+    (`--- 0x1F`) loses its spelling;
+  - an empty value inside a flow collection (`{x: , y: 1}`) prints `null` where yq prints `''`.
 - **Spellings `OwnedValue` cannot keep** ([#2802](https://github.com/rust-works/succinctly/issues/2802)):
   `True == "true"` and `!!bool "yes" == true` are `true` here (yq `false`, its text is
   `True`/`yes`), `"~" == null` is `true` here (yq `false`), and a leading-zero, hex or

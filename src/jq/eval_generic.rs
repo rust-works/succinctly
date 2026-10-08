@@ -2128,6 +2128,10 @@ struct HeadFootComment {
     /// reason the head/foot lines are: `NodeMeta` is on the stack of every
     /// recursive walk, and an untagged node should cost nothing.
     tag: Option<String>,
+    /// How the node's plain scalar was spelled in the source when that is not the
+    /// spelling its value prints with (`~`, `True`, `0x1F`, `.5`, or nothing at all for
+    /// an empty value), verbatim (#3028). Same box, same reason as `tag`.
+    spelling: Option<String>,
 }
 
 impl HeadFootComment {
@@ -2139,11 +2143,17 @@ impl HeadFootComment {
         head: Vec<String>,
         foot: Vec<String>,
         tag: Option<String>,
+        spelling: Option<String>,
     ) -> Option<Box<Self>> {
-        if head.is_empty() && foot.is_empty() && tag.is_none() {
+        if head.is_empty() && foot.is_empty() && tag.is_none() && spelling.is_none() {
             None
         } else {
-            Some(Box::new(Self { head, foot, tag }))
+            Some(Box::new(Self {
+                head,
+                foot,
+                tag,
+                spelling,
+            }))
         }
     }
 }
@@ -2226,7 +2236,12 @@ impl NodeMeta {
     /// already gets — see the field's own doc comment for why that matters.
     pub fn with_head_foot(&self, head: Vec<String>, foot: Vec<String>) -> Self {
         Self {
-            head_foot_comment: HeadFootComment::boxed_if_any_with_tag(head, foot, self.tag_owned()),
+            head_foot_comment: HeadFootComment::boxed_if_any_with_tag(
+                head,
+                foot,
+                self.tag_owned(),
+                self.spelling_owned(),
+            ),
             ..self.clone()
         }
     }
@@ -2243,6 +2258,38 @@ impl NodeMeta {
         self.tag().map(str::to_string)
     }
 
+    fn spelling_owned(&self) -> Option<String> {
+        self.spelling().map(str::to_string)
+    }
+
+    /// How this node's plain scalar was spelled in the source when that differs from the
+    /// way its value prints (`~`, `True`, `0x1F`), or `""` for an empty value; `None` if
+    /// it was spelled the canonical way (#3028).
+    pub fn spelling(&self) -> Option<&str> {
+        self.head_foot_comment
+            .as_deref()
+            .and_then(|hf| hf.spelling.as_deref())
+    }
+
+    /// This node's own metadata with its source spelling replaced, everything else kept
+    /// (#3028).
+    #[must_use]
+    pub fn with_spelling(&self, spelling: Option<String>) -> Self {
+        let (head, foot) = self.head_foot_comment.as_deref().map_or_else(
+            || (Vec::new(), Vec::new()),
+            |hf| (hf.head.clone(), hf.foot.clone()),
+        );
+        Self {
+            head_foot_comment: HeadFootComment::boxed_if_any_with_tag(
+                head,
+                foot,
+                self.tag_owned(),
+                spelling,
+            ),
+            ..self.clone()
+        }
+    }
+
     /// This node's own metadata with its explicit tag replaced, everything else
     /// kept (#4078).
     #[must_use]
@@ -2252,7 +2299,12 @@ impl NodeMeta {
             |hf| (hf.head.clone(), hf.foot.clone()),
         );
         Self {
-            head_foot_comment: HeadFootComment::boxed_if_any_with_tag(head, foot, tag),
+            head_foot_comment: HeadFootComment::boxed_if_any_with_tag(
+                head,
+                foot,
+                tag,
+                self.spelling_owned(),
+            ),
             ..self.clone()
         }
     }
@@ -2730,6 +2782,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
                     .and_then(DocumentCursor::explicit_tag_of_non_alias)
                     .map(str::to_string)
             },
+            None,
         ),
     };
     if let Some(fields) = value.as_object() {
@@ -2883,8 +2936,68 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
             Some(owned) => owned,
             None => to_owned_at_depth::<S, _>(value, cursor, depth)?,
         };
+        let own_meta = match cursor {
+            Some(cursor) if !child_under_alias => {
+                let spelling = source_spelling(cursor, value, &owned);
+                if spelling.is_some() {
+                    own_meta.with_spelling(spelling)
+                } else {
+                    own_meta
+                }
+            }
+            _ => own_meta,
+        };
         Ok((owned, CommentTree::Leaf(own_meta)))
     }
+}
+
+/// How a non-string plain scalar was spelled in the source (#3028), or `None` when that is
+/// the way its value prints anyway: the empty value (`push:`), `~`, `True`, `0x1F`, `.5`,
+/// `+1`. The DOM writer prints the spelling back for a node it did not write, where it
+/// used to print the canonical form (`push: null`, `y: true`, `w: 31`) and change lines
+/// the user never addressed.
+///
+/// Only a plain scalar has one worth keeping (a quoted one is a string, which already
+/// travels verbatim), and only a value that resolved to null, a bool or a number.
+fn source_spelling<C: DocumentCursor>(
+    cursor: &C,
+    raw: &C::Value,
+    value: &OwnedValue,
+) -> Option<String> {
+    // The cheap, allocation-free answers first: the overwhelmingly common scalar is
+    // spelled the canonical way, and most of them are decided by one comparison.
+    if !matches!(
+        value,
+        OwnedValue::Null
+            | OwnedValue::Bool(_)
+            | OwnedValue::Int(_)
+            | OwnedValue::NumberLiteral(..)
+            | OwnedValue::Float(_)
+    ) {
+        return None;
+    }
+    let source = cursor.plain_scalar_source(raw)?;
+    let canonical = match value {
+        OwnedValue::Null => source == "null",
+        OwnedValue::Bool(b) => source == if *b { "true" } else { "false" },
+        OwnedValue::Int(n) => {
+            // A plain decimal with no sign or leading zero reads back as itself.
+            let digits = source.strip_prefix('-').unwrap_or(&source);
+            !digits.is_empty()
+                && digits.bytes().all(|b| b.is_ascii_digit())
+                && (digits.len() == 1 || !digits.starts_with('0'))
+                && source != "-0"
+                && source.parse::<i64>() == Ok(*n)
+        }
+        OwnedValue::NumberLiteral(_, literal) => source == **literal,
+        OwnedValue::Float(f) if f.is_nan() => source == ".nan",
+        OwnedValue::Float(f) if f.is_infinite() => {
+            source == if *f > 0.0 { ".inf" } else { "-.inf" }
+        }
+        OwnedValue::Float(f) => source == crate::yaml::format_float_yq_yaml(*f),
+        _ => true,
+    };
+    (!canonical).then(|| source.into_owned())
 }
 
 /// Materialize a key/slice-bound candidate just enough to classify it.
@@ -44247,6 +44360,58 @@ mod tests {
             "a head/foot rewrite keeps the tag"
         );
         assert_eq!(meta.with_tag(None).head_comment(), ["# h".to_string()]);
+    }
+
+    /// #3028: the source spelling of a plain null, bool or number is recorded when it is not
+    /// the way the value prints, and only then: not for a canonical one, a quoted string, a
+    /// string, a container, nor under an alias.
+    #[test]
+    fn test_to_owned_with_comments_records_source_spellings_3028() {
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"a: ~\nb:\nc: True\nd: 0x1F\ne: .5\nf: null\ng: true\nh: 5\ni: \"~\"\nj: x\nk: &n 0x2\nl: *n\nm: [Null, 1]\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let cursor = index.root(yaml);
+        let mapping_cursor = cursor
+            .first_child()
+            .expect("YAML document should have content");
+        let value = mapping_cursor.value();
+        let (_, comments) = to_owned_with_comments::<_, YqSemantics>(&value, Some(&mapping_cursor))
+            .expect("conversion succeeds");
+
+        let spelling = |key: &str| comments.field(key).meta().spelling().map(str::to_string);
+        assert_eq!(spelling("a").as_deref(), Some("~"));
+        assert_eq!(
+            spelling("b").as_deref(),
+            Some(""),
+            "an empty value is spelled as nothing"
+        );
+        assert_eq!(spelling("c").as_deref(), Some("True"));
+        assert_eq!(spelling("d").as_deref(), Some("0x1F"));
+        assert_eq!(spelling("e").as_deref(), Some(".5"));
+        for canonical in ["f", "g", "h", "i", "j"] {
+            assert_eq!(spelling(canonical), None, "{canonical}");
+        }
+        assert_eq!(spelling("k").as_deref(), Some("0x2"));
+        assert_eq!(spelling("l"), None, "an alias is written `*n`");
+        assert_eq!(
+            comments.field("m").at_index(0).meta().spelling(),
+            Some("Null")
+        );
+        assert_eq!(comments.field("m").at_index(1).meta().spelling(), None);
+        assert_eq!(comments.field("m").meta().spelling(), None);
+
+        // A head/foot or tag rewrite keeps it.
+        let meta = comments
+            .field("a")
+            .meta()
+            .with_head_foot(vec!["# h".to_string()], Vec::new());
+        assert_eq!(meta.spelling(), Some("~"));
+        assert_eq!(
+            meta.with_tag(Some("!!null".to_string())).spelling(),
+            Some("~")
+        );
+        assert_eq!(meta.with_spelling(None).head_comment(), ["# h".to_string()]);
     }
 
     /// #2598: an anchor alone earns a `KeyMeta` entry, and survives a write.

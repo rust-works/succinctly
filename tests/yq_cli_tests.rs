@@ -44360,15 +44360,16 @@ z: !!str '''q'''
     Ok(())
 }
 
-/// `style = "tagged"` on an integer spelled `0x1F`, `0o17` or `1_000`: yq keeps the
-/// spelling (`!!int 0x1F`), succinctly's value has lost it before the emitter runs
-/// (#2802: `OwnedValue` keeps no spelling for a non-decimal integer), so it prints the
-/// decimal value, and `1_000` (a string here) as `!!str`.
+/// `style = "tagged"` keeps the spelling of a non-decimal integer, `~` and `True` (#3028,
+/// which closed the gap this test used to pin as #2802's). What stays divergent is
+/// `1_000`: yq types it `!!int`, here it is a string, so it prints `!!str`.
 #[test]
-fn test_yq_style_tagged_loses_non_decimal_integer_spellings_2802() -> Result<()> {
+fn test_yq_style_tagged_keeps_spellings_but_not_underscore_integers_2802() -> Result<()> {
     for (doc, want) in [
-        ("a: 0x1F\n", "a: !!int 31\n"),
-        ("a: 0o17\n", "a: !!int 15\n"),
+        ("a: 0x1F\n", "a: !!int 0x1F\n"),
+        ("a: 0o17\n", "a: !!int 0o17\n"),
+        ("a: ~\n", "a: !!null ~\n"),
+        ("a: True\n", "a: !!bool True\n"),
         ("a: 1_000\n", "a: !!str 1_000\n"),
     ] {
         let (out, err, code) = run_yq_stdin_with_stderr(".a style = \"tagged\"", doc, &[])?;
@@ -45830,6 +45831,1095 @@ fn test_yq_inplace_keeps_explicit_tags_4078() -> Result<()> {
         std::fs::read_to_string(file.path())?,
         "Resources:\n  B:\n    Properties:\n      Name: !Ref Param\n      Arn: !GetAtt [Q, Arn]\n      Other: 1\n"
     );
+    Ok(())
+}
+
+/// #3028: a DOM write leaves an untouched plain scalar spelled the way the source had it
+/// -- `push:` (an empty value, the GitHub Actions idiom), `~`, `Null`, `True`, `0x1F`,
+/// `017`, `+1`, `.5`, `2.` -- where it re-printed the canonical form (`push: null`,
+/// `true`, `31`) and changed lines the user never addressed. A node a write replaces
+/// takes the new value's text. The spelling rides the node's metadata and is printed
+/// only while it still names the node's value. Every row captured live from yq v4.53.3.
+#[test]
+fn test_yq_dom_write_keeps_scalar_spellings_3028() -> Result<()> {
+    let cases: &[(&str, &str, &[&str], &str)] = &[
+        (
+            r"a: NULL
+",
+            r".a = null",
+            &[],
+            r"a: null
+",
+        ),
+        (
+            r"a: ~
+",
+            r".a = null",
+            &[],
+            r"a: null
+",
+        ),
+        (
+            r"a: True
+",
+            r".a = true",
+            &[],
+            r"a: true
+",
+        ),
+        (
+            r"a: +1
+b: 2
+",
+            r".a = 1",
+            &[],
+            r"a: 1
+b: 2
+",
+        ),
+        (
+            r"a: .NaN
+b: .Inf
+c: +.inf
+d: -.INF
+",
+            r".z = 1",
+            &[],
+            r"a: .NaN
+b: .Inf
+c: +.inf
+d: -.INF
+z: 1
+",
+        ),
+        (
+            r"a: ~
+",
+            r#".a style = "double""#,
+            &[],
+            r#"a: "~"
+"#,
+        ),
+        (
+            r"a: 0x1F
+",
+            r#".a style = "double""#,
+            &[],
+            r#"a: "0x1F"
+"#,
+        ),
+        (
+            r"a: True
+",
+            r#".a style = "literal""#,
+            &[],
+            r"a: |-
+  True
+",
+        ),
+        (
+            r"a:
+b: 1
+",
+            r#".a style = "double""#,
+            &[],
+            r#"a: ""
+b: 1
+"#,
+        ),
+        (
+            r"a:
+b: 1
+",
+            r#".a style = "single""#,
+            &[],
+            r"a: ''
+b: 1
+",
+        ),
+        (
+            r"a: True
+",
+            r".a = .a",
+            &[],
+            r"a: True
+",
+        ),
+        (
+            r"a: 1
+b: 0xff
+c: 017
+d: ~
+e: True
+f: .5
+g: +1
+h: 0.50
+i: 1e3
+j: NULL
+k: 0o17
+l: 2.
+m: FALSE
+n: [0x1, ~]
+",
+            r".a = 2",
+            &[],
+            r"a: 2
+b: 0xff
+c: 017
+d: ~
+e: True
+f: .5
+g: +1
+h: 0.50
+i: 1e3
+j: NULL
+k: 0o17
+l: 2.
+m: FALSE
+n: [0x1, ~]
+",
+        ),
+        (
+            r"a: 1
+b: 0xff
+c: 017
+d: ~
+e: True
+f: .5
+g: +1
+h: 0.50
+i: 1e3
+j: NULL
+k: 0o17
+l: 2.
+m: FALSE
+n: [0x1, ~]
+",
+            r"del(.a)",
+            &[],
+            r"b: 0xff
+c: 017
+d: ~
+e: True
+f: .5
+g: +1
+h: 0.50
+i: 1e3
+j: NULL
+k: 0o17
+l: 2.
+m: FALSE
+n: [0x1, ~]
+",
+        ),
+        (
+            r"a: 1
+b: 0xff
+d: ~
+n: [0x1, ~]
+",
+            r".n[0] = 5",
+            &[],
+            r"a: 1
+b: 0xff
+d: ~
+n: [5, ~]
+",
+        ),
+        (
+            r"on:
+  push:
+  pull_request:
+    branches: [main]
+jobs:
+  b:
+    runs-on: x
+    steps:
+      -
+      - uses: a
+",
+            r#".jobs.b.name = "n""#,
+            &[],
+            r"on:
+  push:
+  pull_request:
+    branches: [main]
+jobs:
+  b:
+    runs-on: x
+    steps:
+      -
+      - uses: a
+    name: n
+",
+        ),
+        (
+            r"on:
+  push:
+  pull_request:
+    branches: [main]
+",
+            r".",
+            &["-P"],
+            r"on:
+  push:
+  pull_request:
+    branches:
+      - main
+",
+        ),
+        (
+            r"a: # note
+b: ~ # tilde
+c:
+  - 
+  - ~
+",
+            r".z = 1",
+            &[],
+            r"a: # note
+b: ~ # tilde
+c:
+  -
+  - ~
+z: 1
+",
+        ),
+        (
+            r"a: !!null ~
+b: !!bool True
+c: !!int 0x1F
+",
+            r".z = 1",
+            &[],
+            r"a: !!null ~
+b: !!bool True
+c: !!int 0x1F
+z: 1
+",
+        ),
+        (
+            r"a: ~
+",
+            r".a = 5",
+            &[],
+            r"a: 5
+",
+        ),
+        (
+            r"a: True
+",
+            r".a = false",
+            &[],
+            r"a: false
+",
+        ),
+        (
+            r"a: 0x1F
+",
+            r".a = 32",
+            &[],
+            r"a: 32
+",
+        ),
+        (
+            r"a: NULL
+",
+            r".a = 1",
+            &[],
+            r"a: 1
+",
+        ),
+        (
+            r"a: 0x1F
+b: 1
+",
+            r".b = 2",
+            &["-I4"],
+            r"a: 0x1F
+b: 2
+",
+        ),
+        (
+            r"{a: ~, b: [True, 0x1F, ], c: .5}
+",
+            r".z = 1",
+            &[],
+            r"{a: ~, b: [True, 0x1F], c: .5, z: 1}
+",
+        ),
+        (
+            r"d:
+  - .5
+  - 42
+  - on
+h: .5
+g:
+  p: ~
+  r: on
+",
+            r".a = 5",
+            &[],
+            r"d:
+  - .5
+  - 42
+  - on
+h: .5
+g:
+  p: ~
+  r: on
+a: 5
+",
+        ),
+        (
+            r"e: +.5
+h:
+  - 01
+  - +1
+f: FALSE
+a:
+  q: FALSE
+  r: 00
+",
+            r".zz = 1",
+            &[],
+            r"e: +.5
+h:
+  - 01
+  - +1
+f: FALSE
+a:
+  q: FALSE
+  r: 00
+zz: 1
+",
+        ),
+        (
+            r"e:
+  q: NULL
+g: 017
+",
+            r#".a = "s""#,
+            &[],
+            r"e:
+  q: NULL
+g: 017
+a: s
+",
+        ),
+        (
+            r"f: [False, 0x1F]
+c: [0.50, NULL]
+g: 0.50
+",
+            r"del(.zzz)",
+            &[],
+            r"f: [False, 0x1F]
+c: [0.50, NULL]
+g: 0.50
+",
+        ),
+        (
+            r"g: [true]
+f:
+  p: -.inf
+e: 0b11
+c: 1
+d: No
+",
+            r".a = 5",
+            &[],
+            r"g: [true]
+f:
+  p: -.inf
+e: 0b11
+c: 1
+d: No
+a: 5
+",
+        ),
+        (
+            r"g: null
+e: FALSE
+f: [0o17, 1E3, 1_000]
+b: [1_000]
+",
+            r".a = 5",
+            &[],
+            r"g: null
+e: FALSE
+f: [0o17, 1E3, 1_000]
+b: [1_000]
+a: 5
+",
+        ),
+        (
+            r"f: [null, on, ~]
+e: [-0, NULL, 01]
+a:
+  - 017
+",
+            r"del(.zzz)",
+            &[],
+            r"f: [null, on, ~]
+e: [-0, NULL, 01]
+a:
+  - 017
+",
+        ),
+        (
+            r"d: 0b11
+a:
+  - ~
+  - 1_000
+f:
+  q: 1e3
+  r: -.inf
+b:
+  - 2.
+",
+            r"del(.zzz)",
+            &[],
+            r"d: 0b11
+a:
+  - ~
+  - 1_000
+f:
+  q: 1e3
+  r: -.inf
+b:
+  - 2.
+",
+        ),
+        (
+            r"g: Null
+e: null
+b: [null, on, 0x1F]
+a: .nan
+",
+            r#".a = "s""#,
+            &[],
+            r"g: Null
+e: null
+b: [null, on, 0x1F]
+a: s
+",
+        ),
+        (
+            r"f: .inf
+d:
+  - .inf
+  - 1e3
+  - +.5
+g: +1
+a: [FALSE]
+b: [~, -.inf]
+",
+            r".a = 5",
+            &[],
+            r"f: .inf
+d:
+  - .inf
+  - 1e3
+  - +.5
+g: +1
+a: 5
+b: [~, -.inf]
+",
+        ),
+        (
+            r"c:
+  - x
+  - -.inf
+f: -1
+",
+            r".a = 5",
+            &[],
+            r"c:
+  - x
+  - -.inf
+f: -1
+a: 5
+",
+        ),
+        (
+            r"b: 0x1F
+a:
+  - on
+  - yes
+  - false
+f: -0
+g: [+1, .nan]
+",
+            r#".a = "s""#,
+            &[],
+            r"b: 0x1F
+a: s
+f: -0
+g: [+1, .nan]
+",
+        ),
+        (
+            r"g: [1.0, +1]
+d: Null
+e: [0x, 01, yes]
+a:
+  - False
+  - 0x1F
+",
+            r#".a = "s""#,
+            &[],
+            r"g: [1.0, +1]
+d: Null
+e: [0x, 01, yes]
+a: s
+",
+        ),
+        (
+            r"g:
+h: 1e3
+c:
+  - FALSE
+  - -.inf
+  - +.5
+",
+            r#".a = "s""#,
+            &[],
+            r"g:
+h: 1e3
+c:
+  - FALSE
+  - -.inf
+  - +.5
+a: s
+",
+        ),
+        (
+            r"c:
+  p: FALSE
+b: True
+",
+            r".zz = 1",
+            &[],
+            r"c:
+  p: FALSE
+b: True
+zz: 1
+",
+        ),
+        (
+            r"f: No
+e: 1.0
+",
+            r#".a = "s""#,
+            &[],
+            r"f: No
+e: 1.0
+a: s
+",
+        ),
+        (
+            r"b: ~
+f:
+  p: 0x
+  q: -.inf
+a: -0
+e: 00
+",
+            r".zz = 1",
+            &[],
+            r"b: ~
+f:
+  p: 0x
+  q: -.inf
+a: -0
+e: 00
+zz: 1
+",
+        ),
+        (
+            r"g: +0x1
+f: [-1, -0]
+",
+            r".zz = 1",
+            &[],
+            r"g: +0x1
+f: [-1, -0]
+zz: 1
+",
+        ),
+        (
+            r"b: false
+h:
+  p: 1_000
+g: 0b11
+f:
+  - 1E3
+  -
+d: 1
+",
+            r"del(.zzz)",
+            &[],
+            r"b: false
+h:
+  p: 1_000
+g: 0b11
+f:
+  - 1E3
+  -
+d: 1
+",
+        ),
+        (
+            r"g:
+  r: null
+  p: 1E3
+b: [42]
+",
+            r".a = 5",
+            &[],
+            r"g:
+  r: null
+  p: 1E3
+b: [42]
+a: 5
+",
+        ),
+        (
+            r"g:
+  - False
+  - 0x1F
+h:
+  - 017
+  - +1
+  - null
+d: 0x1F
+",
+            r#".a = "s""#,
+            &[],
+            r"g:
+  - False
+  - 0x1F
+h:
+  - 017
+  - +1
+  - null
+d: 0x1F
+a: s
+",
+        ),
+        (
+            r"f: [1E3, Null, -1]
+a: 1
+c: [.5, 1e3, false]
+",
+            r#".a = "s""#,
+            &[],
+            r"f: [1E3, Null, -1]
+a: s
+c: [.5, 1e3, false]
+",
+        ),
+        (
+            r"a:
+  - -1
+  - 0x1F
+d: 1_000
+g: 0.50
+f:
+  -
+  -
+  - +.5
+c:
+  - TRUE
+",
+            r".zz = 1",
+            &[],
+            r"a:
+  - -1
+  - 0x1F
+d: 1_000
+g: 0.50
+f:
+  -
+  -
+  - +.5
+c:
+  - TRUE
+zz: 1
+",
+        ),
+        (
+            r"a: [1e3, .nan, 1e3]
+b: [1e3, 0xff]
+",
+            r#".a = "s""#,
+            &[],
+            r"a: s
+b: [1e3, 0xff]
+",
+        ),
+        (
+            r"b: x
+f: [0.50]
+c: .inf
+h:
+  - 1_000
+  - False
+a: [-0]
+",
+            r#".a = "s""#,
+            &[],
+            r"b: x
+f: [0.50]
+c: .inf
+h:
+  - 1_000
+  - False
+a: s
+",
+        ),
+        (
+            r"f: 0o17
+d: 0.50
+e:
+  - on
+  - 0xff
+c:
+  - .nan
+  - 0o17
+  - 5e
+",
+            r"del(.zzz)",
+            &[],
+            r"f: 0o17
+d: 0.50
+e:
+  - on
+  - 0xff
+c:
+  - .nan
+  - 0o17
+  - 5e
+",
+        ),
+        (
+            r"b: yes
+h: Null
+g: 01
+e: [1.0, 5e, .inf]
+c:
+  - false
+",
+            r#".a = "s""#,
+            &[],
+            r"b: yes
+h: Null
+g: 01
+e: [1.0, 5e, .inf]
+c:
+  - false
+a: s
+",
+        ),
+        (
+            r"b: 2.
+c: [+.5, 0b11, 1.0]
+f:
+  -
+  - .nan
+  - x
+g:
+  - 1
+  - .nan
+  - True
+h: FALSE
+",
+            r".a = 5",
+            &[],
+            r"b: 2.
+c: [+.5, 0b11, 1.0]
+f:
+  -
+  - .nan
+  - x
+g:
+  - 1
+  - .nan
+  - True
+h: FALSE
+a: 5
+",
+        ),
+        (
+            r"h:
+  q: -1
+  r: 0b11
+c: 017
+b: True
+g:
+  - 2.
+  - -1
+a: 0xff
+",
+            r"del(.zzz)",
+            &[],
+            r"h:
+  q: -1
+  r: 0b11
+c: 017
+b: True
+g:
+  - 2.
+  - -1
+a: 0xff
+",
+        ),
+        (
+            r"e: 0xff
+a: ~
+g: 5e
+d: 1
+",
+            r#".a = "s""#,
+            &[],
+            r"e: 0xff
+a: s
+g: 5e
+d: 1
+",
+        ),
+        (
+            r"d:
+  p: .inf
+c:
+  r: 1E3
+f: +1
+e: [1.0, .inf]
+",
+            r".zz = 1",
+            &[],
+            r"d:
+  p: .inf
+c:
+  r: 1E3
+f: +1
+e: [1.0, .inf]
+zz: 1
+",
+        ),
+        (
+            r"b: x
+a:
+  - false
+  - -.inf
+  - 1e3
+",
+            r"del(.zzz)",
+            &[],
+            r"b: x
+a:
+  - false
+  - -.inf
+  - 1e3
+",
+        ),
+        (
+            r"g: 0x
+d: .inf
+",
+            r"del(.zzz)",
+            &[],
+            r"g: 0x
+d: .inf
+",
+        ),
+        (
+            r"c: [5e]
+a: 1e3
+e: [False, ~]
+b: +0x1
+",
+            r"del(.zzz)",
+            &[],
+            r"c: [5e]
+a: 1e3
+e: [False, ~]
+b: +0x1
+",
+        ),
+        (
+            r"f: [yes, true, 5e]
+g: 0x1F
+",
+            r#".a = "s""#,
+            &[],
+            r"f: [yes, true, 5e]
+g: 0x1F
+a: s
+",
+        ),
+        (
+            r"h: yes
+b: No
+",
+            r".zz = 1",
+            &[],
+            r"h: yes
+b: No
+zz: 1
+",
+        ),
+        (
+            r"c: false
+f: [+1]
+a: null
+d: on
+",
+            r".a = 5",
+            &[],
+            r"c: false
+f: [+1]
+a: 5
+d: on
+",
+        ),
+        (
+            r"b:
+  - 0x
+  - ~
+  - .inf
+e: Null
+a: 0xff
+g: +.5
+",
+            r#".a = "s""#,
+            &[],
+            r"b:
+  - 0x
+  - ~
+  - .inf
+e: Null
+a: s
+g: +.5
+",
+        ),
+        (
+            r"c: True
+h: [-1]
+e:
+  q: yes
+f: TRUE
+",
+            r#".a = "s""#,
+            &[],
+            r"c: True
+h: [-1]
+e:
+  q: yes
+f: TRUE
+a: s
+",
+        ),
+        (
+            r"g: x
+f: +1
+c:
+  r: ~
+a:
+  - -0
+  - FALSE
+  - yes
+",
+            r#".a = "s""#,
+            &[],
+            r"g: x
+f: +1
+c:
+  r: ~
+a: s
+",
+        ),
+        (
+            r"h: ~
+d: [+.5]
+",
+            r#".a = "s""#,
+            &[],
+            r"h: ~
+d: [+.5]
+a: s
+",
+        ),
+        (
+            r"c:
+  p: 1E3
+e: False
+",
+            r"del(.zzz)",
+            &[],
+            r"c:
+  p: 1E3
+e: False
+",
+        ),
+        (
+            r"h: 0b11
+g: 1_000
+d: +1
+e: false
+b:
+  - 42
+",
+            r"del(.zzz)",
+            &[],
+            r"h: 0b11
+g: 1_000
+d: +1
+e: false
+b:
+  - 42
+",
+        ),
+        (
+            r"g: 42
+f: [false, null, +0x1]
+",
+            r#".a = "s""#,
+            &[],
+            r"g: 42
+f: [false, null, +0x1]
+a: s
+",
+        ),
+        (
+            r"a: .nan
+f:
+  - ~
+  - .inf
+  - .inf
+e: [-0, 00]
+b: x
+g: [42]
+",
+            r#".a = "s""#,
+            &[],
+            r"a: s
+f:
+  - ~
+  - .inf
+  - .inf
+e: [-0, 00]
+b: x
+g: [42]
+",
+        ),
+    ];
+    for (doc, filter, extra, want) in cases {
+        let (out, err, code) = run_yq_stdin_with_stderr(filter, doc, extra)?;
+        assert_eq!(out, *want, "`{filter}` {extra:?} on {doc:?}: {err}");
+        assert_eq!(code, 0, "`{filter}` {extra:?} on {doc:?}: {err}");
+    }
     Ok(())
 }
 
