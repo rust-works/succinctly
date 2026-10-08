@@ -87987,7 +87987,39 @@ mod tests {
             "[1,2] | length",
             "[1,2] | first",
         ];
-        let mut answered = 0;
+        // Which sources each mode answers. jq answers all but `first`; yq's
+        // owned grammar has no operators and no `length`/`first` stage, so a
+        // regression that stops an arm answering fails here, not silently.
+        let jq_declines = ["[1,2] | first"];
+        let yq_declines = [
+            "1 + 2",
+            "1.5 + 1",
+            "\"a\" + \"b\"",
+            "[1] + [2]",
+            "{\"a\":1} + {\"b\":2}",
+            "1 == 1",
+            "[1] == [1]",
+            "1 < 2",
+            "null // 3",
+            "false // [1]",
+            "1 and 2",
+            "false or null",
+            "[1,2] | length",
+            "[1,2] | first",
+        ];
+        for src in closed {
+            let expr = parse(src).unwrap();
+            assert_eq!(
+                eval_owned_closed::<JqSemantics>(&expr).is_none(),
+                jq_declines.contains(&src),
+                "jq mode: {src:?}"
+            );
+            assert_eq!(
+                eval_owned_closed::<YqSemantics>(&expr).is_none(),
+                yq_declines.contains(&src),
+                "yq mode: {src:?}"
+            );
+        }
         for value in &values {
             for src in closed {
                 let expr = parse(src).unwrap();
@@ -87995,7 +88027,6 @@ mod tests {
                 let yq_fast = eval_owned_closed::<YqSemantics>(&expr);
                 for (mode, fast) in [("jq", jq_fast), ("yq", yq_fast)] {
                     let Some(fast) = fast else { continue };
-                    answered += 1;
                     let bridge = if mode == "jq" {
                         debug_normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
                             &expr, value, false,
@@ -88010,7 +88041,6 @@ mod tests {
                 }
             }
         }
-        assert!(answered > 400, "the matrix must reach the closed arms");
         // A stage that reads `.`, raises, fans out or computes from the input
         // is not this helper's to answer.
         for src in [
