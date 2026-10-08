@@ -131375,7 +131375,6 @@ mod tests {
         assert!(!is_alias_sensitive_assign(&reshape));
     }
 
-    /// Both halves must follow the *same* wrappers, since
     /// #3203: a *metadata* write buried in a destructuring pattern's computed
     /// key makes the filter a write for the CLI's metadata pass (which then
     /// refuses it), whatever the body is; a value-shaped write there, or no
@@ -131407,6 +131406,7 @@ mod tests {
         }
     }
 
+    /// Both halves must follow the *same* wrappers, since
     /// `is_alias_sensitive_assign` is `is_shape_preserving && contains_assign`
     /// -- a wrapper only one of them follows would make the pair answer
     /// correctly for the wrong reason, and stop doing so the moment the other
