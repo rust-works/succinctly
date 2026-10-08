@@ -4270,7 +4270,10 @@ against yq v4.53.3 on ~1,000 random flow collections (mappings and sequences, th
 under a root, a mapping, a nested mapping and a sequence item, `-I1`/`3`/`4`/`6`, multi-line
 comments). One related gap stays: the cursor-streaming identity route (`yq .` with no write)
 still prints `2 # child` / `  ]` for the `[1, 2 # child\n]` source where yq prints
-`[1, 2, # child` / `]`; the DOM route (any write, `-P`, `--arg`) matches.
+`[1, 2, # child` / `]`; the DOM route (any write, `-P`, `--arg`) matches. And a comment on a flow element does not survive
+extracting the container (`.a[0] line_comment = "y" | .a`, `.b = .a`): the reshaped value carries no
+flow style or comment tree (#3615), where yq keeps both. `-C` does not colour a flow collection
+the way yq does (it never did), so the closing-bracket line of a commented one is coloured as a key.
 
 One rendering divergence, readable back and pinned:
 

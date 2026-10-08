@@ -5484,15 +5484,15 @@ struct FlowItem {
     text: String,
     /// The element's own trailing comment, `#` and all, possibly several lines.
     comment: Option<String>,
-    /// Whether the element is itself a non-empty collection, which takes its comment
-    /// differently from a scalar.
+    /// Whether the element is itself a collection (empty or not), which takes its
+    /// comment differently from a scalar. An alias to one is not: it is written `*x`.
     container: bool,
 }
 
 impl FlowItem {
     fn new(text: String, value: &OwnedValue, comments: &CommentTree) -> Self {
-        let container = matches!(value, OwnedValue::Array(a) if !a.is_empty())
-            || matches!(value, OwnedValue::Object(o) if !o.is_empty());
+        let container = comments.alias_name().is_none()
+            && matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_));
         Self {
             text,
             comment: comments.own().map(str::to_string),
@@ -5523,18 +5523,21 @@ fn flow_child_indent(continuation: &str, step: &str) -> String {
 
 /// A flow collection's text, `[a, b]` or `{k: v}`, with any element line comments
 /// placed the way go-yaml places them (#2708). `continuation` is the indent the
-/// elements continue at and `owner` the indent of the container the collection sits
-/// in, where a closing `]` goes.
+/// elements continue at after a line break and `owner` the indent of the container
+/// the collection sits in, where a closing `]` goes.
 ///
 /// A `#` comment runs to the end of the line, so a commented element breaks the
-/// line. After a scalar the comma comes first (`[1, # c`), the next element
-/// continuing on the next line at `continuation` and, when it was the last, the closing
-/// bracket on a line of its own (go-yaml writes a trailing comma for it); after a
-/// collection the comment follows the closing bracket with no comma
-/// (`[[1] # c`), and the comma opens the next line at column 0 (`, 2]`). A further
-/// line of a multi-line comment sits at `continuation`. A `]` is at `owner` but a `}` is
-/// always at column 0, which go-yaml does not do consistently. Without a comment this is just the
-/// elements joined by `, `.
+/// line. After a scalar (an alias too) the comma comes first (`[1, # c`) and the
+/// next element continues on the next line at `continuation`; when it was the last,
+/// go-yaml has written a trailing comma and the closing bracket gets a line of its
+/// own. After a collection (an empty one too) the comment follows the closing
+/// bracket with no comma (`[[1] # c`) and the comma opens the next line at column 0
+/// (`, 2]`). A further line of a multi-line comment sits at `continuation`. A `]`
+/// closes at `owner`, but a `}` always at column 0, which go-yaml does not do
+/// consistently. Without a comment this is the elements joined by `, `.
+///
+/// Out of line to keep the recursive emitter's frame small (see
+/// `emit_yaml_value_panics_past_nesting_depth_limit_1017`).
 #[inline(never)]
 fn render_flow(
     open: char,

@@ -44398,10 +44398,80 @@ fn test_yq_style_tagged_loses_non_decimal_integer_spellings_2802() -> Result<()>
 /// to a multiple of the width (`- [` under `-I3`). A comment written deeper than
 /// the container's direct children used to be dropped silently. Rows 1-18 are the
 /// triage matrix, the rest a seeded random sample over mappings, sequences, `-I`
-/// widths, multi-line comments and block parents; all captured live from yq v4.53.3.
+/// widths, multi-line comments and block parents, plus an alias (a scalar for this) and
+/// an empty collection (a collection); all captured live from yq v4.53.3.
 #[test]
 fn test_yq_line_comment_on_a_flow_element_keeps_flow_style_2708() -> Result<()> {
     let cases: &[(&str, &str, &[&str], &str)] = &[
+        (
+            r"a: &x [1, 2]
+b: [*x, 3]
+",
+            r#".b[0] line_comment = "y""#,
+            &[],
+            r"a: &x [1, 2]
+b: [*x, # y
+  3]
+",
+        ),
+        (
+            r"a: &x [1, 2]
+b: [3, *x]
+",
+            r#".b[1] line_comment = "y""#,
+            &[],
+            r"a: &x [1, 2]
+b: [3, *x, # y
+]
+",
+        ),
+        (
+            r"a: &x [1, 2]
+b: {p: *x, q: 3}
+",
+            r#".b.p line_comment = "y""#,
+            &[],
+            r"a: &x [1, 2]
+b: {p: *x, # y
+  q: 3}
+",
+        ),
+        (
+            r"a: [[], 2]
+",
+            r#".a[0] line_comment = "x""#,
+            &[],
+            r"a: [[] # x
+, 2]
+",
+        ),
+        (
+            r"a: [{}, 2]
+",
+            r#".a[0] line_comment = "x""#,
+            &[],
+            r"a: [{} # x
+, 2]
+",
+        ),
+        (
+            r"a: [1, {}]
+",
+            r#".a[1] line_comment = "x""#,
+            &[],
+            r"a: [1, {} # x
+]
+",
+        ),
+        (
+            r"a: {b: [], c: 2}
+",
+            r#".a.b line_comment = "x""#,
+            &[],
+            r"a: {b: [] # x
+, c: 2}
+",
+        ),
         (
             r"a: [1, 2]
 ",
