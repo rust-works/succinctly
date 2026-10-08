@@ -64564,6 +64564,99 @@ fn test_routed_foreach_source_under_try_is_caught_3853() -> Result<()> {
     ])
 }
 
+/// #4007: a `foreach` source that destructures `.` is routed to the resolver (#3940), and
+/// when `.` is a COMPUTED `null` (a `null |` stage, `null as $n | $n`, or a fold's null
+/// accumulator) the register is not that null: it sits wherever the stage left it, so jq
+/// refuses at the first step of the loop pattern and `del`/`=`/`|=` write nothing. The
+/// resolver seeded the ambient null as the register and let it through the `null`/`bool`
+/// identity clause, deleting `a`. Must-not-change rows: on a `null` DOCUMENT the register
+/// really is `null`, so the same walk answers (`["a"]`), and a bare `. as {a:$a} | .`
+/// source and a literal `null` element were already right. Every row captured from jq
+/// 1.7.1, on the stdin and `-n` routes.
+#[test]
+fn test_foreach_source_destructuring_a_computed_null_is_refused_4007() -> Result<()> {
+    let doc = r#"{"a":null,"b":2}"#;
+    let near_a = r#"Invalid path expression near attempt to access element "a" of null"#;
+    macro_rules! src {
+        () => {
+            "foreach ((.|.) | foreach . as {a:$a} (0;.;.)) as $x (.;.;.)"
+        };
+    }
+    assert_path_rows_both_routes_3749(&[
+        (doc, concat!("del(null | ", src!(), ")"), "", near_a, 5),
+        (doc, concat!("(null | ", src!(), ") |= 9"), "", near_a, 5),
+        (doc, concat!("(null | ", src!(), ") = 9"), "", near_a, 5),
+        (
+            doc,
+            concat!("del(null as $n | $n | ", src!(), ")"),
+            "",
+            near_a,
+            5,
+        ),
+        (
+            doc,
+            concat!("del(. as $n | null | ", src!(), ")"),
+            "",
+            near_a,
+            5,
+        ),
+        (
+            r#"{"a":2}"#,
+            concat!("del(foreach 1 as $k (null; ", src!(), "; .))"),
+            "",
+            near_a,
+            5,
+        ),
+        // The register a fold's UPDATE left unknown (`def f: null; f | f`) holds a `null`
+        // placeholder, not the document: the same wrong write on an object document.
+        (
+            r#"{"a":1,"b":2}"#,
+            r"del(foreach (1) as $y (.; (def f: null; f | f); foreach (null) as {a:$x} (.; .; $x)))",
+            "",
+            near_a,
+            5,
+        ),
+        // Contrasts: the bare source and a literal `null` element refused already.
+        (
+            doc,
+            r"del(null | foreach (. as {a:$a} | .) as $x (.;.;.))",
+            "",
+            near_a,
+            5,
+        ),
+        (
+            doc,
+            r"del(foreach (null) as {a:$x} (.; .; $x))",
+            "",
+            near_a,
+            5,
+        ),
+        // On a `null` document the register IS `null`: the walk steps, as in jq.
+        (
+            "null",
+            concat!("path(null | ", src!(), ")"),
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            concat!("path(foreach 1 as $k (null; ", src!(), "; .))"),
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            r"path(null | foreach (null) as {a:$x} (.; .; $x))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        ("null", concat!("del(null | ", src!(), ")"), "null\n", "", 0),
+    ])
+}
+
 /// #3853: a fold whose own SOURCE destructures the register (`. as [$q] | .`) leaves the
 /// register on the matched member while its element is still the old node, so the fold's
 /// loop pattern steps on a node the register is not at and jq raises, nested in a `reduce`

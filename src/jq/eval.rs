@@ -46660,11 +46660,17 @@ fn fold_pattern_seed(elem: &FoldSourceValue, reg: &FoldRegister) -> PatternRegis
             is_input: false,
             known: false,
         },
+        // #4007: a fold on an untracked stage (a `null |` stage, `null as $n | $n`,
+        // a fold's null accumulator) holds the *ambient* value in `reg.value`, not
+        // the register's own, so it is a placeholder no step may compare against --
+        // as `resolve_as_pattern` seeds the same case (#3120). Reading it as known
+        // admitted a computed `null` through `PathPatternMode::step`'s `null`/`bool`
+        // identity clause, where jq refuses at the first step.
         (None, MovedRegister::Unmoved) => PatternRegister {
             path: Rc::clone(&reg.path),
             value: reg.value.clone(),
             is_input: false,
-            known: true,
+            known: reg.trackable,
         },
     }
 }
@@ -128598,26 +128604,38 @@ mod tests {
     /// `self.frame.unknown()` for the rest of that step. The *inner*
     /// `foreach`'s own destructuring pattern (`{a:$x}`, admitted by
     /// #2676's widened `may_bind_navigated` gate) then walks under that
-    /// unknown frame: `fold_pattern_seed`'s `null_bool_identical` exception
-    /// still lets the step through (both the source element and the
-    /// inherited register are `null`), but the resulting binding's
-    /// `frame.origin_at` has nothing to answer with.
+    /// unknown frame, where a binding's `frame.origin_at` has nothing to answer
+    /// with.
     ///
-    /// The inner fold's own *structural* register (`walked_reg.path`, used
-    /// for `EXTRACT`'s emitted position) tracks independently of the
-    /// `$x` marker, so the output still matches jq exactly -- confirmed
-    /// live, `["a"]` -- even though `$x` itself now carries no marker to
-    /// re-establish from.
+    /// #4007: the register the third arm leaves holds a `null` *placeholder*
+    /// (its value is unknown), not the document, so `fold_pattern_seed` no
+    /// longer lets the walk compare against it. This test pinned `["a"]` on
+    /// a `null` document, which the placeholder matched by luck; on any other
+    /// document the same placeholder wrote through a register jq does not
+    /// have (`del(...)` deleted `a` from `{"a":1,"b":2}`, where jq's
+    /// register sits on the object and refuses at the first step). Both now
+    /// refuse; the `null` document is a lost answer, not a wrong write
+    /// (ADR-0018's refuse-only direction).
     #[test]
     fn test_fold_pattern_none_origin_under_unknown_frame() {
-        assert_eq!(
-            outputs(
-                b"null",
+        let refusal = r#"Invalid path expression near attempt to access element "a" of null"#;
+        for (doc, filter) in [
+            (
+                &b"null"[..],
                 "path(foreach (1) as $y (.; (def f: null; f | f); \
-                 foreach (null) as {a:$x} (.; .; $x)))"
+                 foreach (null) as {a:$x} (.; .; $x)))",
             ),
-            [r#"["a"]"#]
-        );
+            (
+                &b"{\"a\":1,\"b\":2}"[..],
+                "del(foreach (1) as $y (.; (def f: null; f | f); \
+                 foreach (null) as {a:$x} (.; .; $x)))",
+            ),
+        ] {
+            let (values, error) = outputs_and_error(doc, filter);
+            assert!(values.is_empty(), "{filter}: {values:?}");
+            let error = error.unwrap_or_else(|| panic!("{filter}: expected a refusal"));
+            assert!(error.contains(refusal), "{filter}: {error}");
+        }
     }
 
     /// #2676 step 1: `may_bind_navigated`'s syntactic gate widens to admit a
