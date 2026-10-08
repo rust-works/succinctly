@@ -15173,7 +15173,9 @@ fn each_upper_in_generic<S: EvalSemantics, V: DocumentValue>(
             Ok(v) => v,
             Err(control) => return stop_with_escape(&mut escape, control),
         };
-        if owned_value_eq::<S>(&candidate, &current) {
+        // #2799: `IN(s)` is `any(s == .; .)`, so it takes `==`'s one definition (yq mode: the
+        // text-and-container rule), the same as `IN(src; s)`.
+        if apply_compare_op::<S>(CompareOp::Eq, &candidate, &current) {
             if sink.push(GenericItem::Owned(OwnedValue::Bool(true))) == Demand::Stop {
                 outer_stopped = true;
             }

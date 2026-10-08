@@ -23016,18 +23016,21 @@ fn test_split_doc_hides_in_has_argument() -> Result<()> {
 #[test]
 fn test_split_doc_hides_in_the_builtins_the_wildcard_skipped_1309() -> Result<()> {
     let yaml = "a: 1\nb: 2\n";
-    for filter in [
-        ".[], any(split_doc; .)",
-        ".[], all(split_doc; .)",
-        ".[], any(split_doc)",
-        ".[], all(split_doc)",
-        ".[], IN(split_doc)",
-        ".[], IN(split_doc; .)",
+    // The last line is the builtin's own answer. `IN(split_doc)` and `IN(split_doc; .)` compare
+    // the document with itself, a container pairing, which is never equal in yq mode (#2799).
+    for (filter, last) in [
+        (".[], any(split_doc; .)", "true"),
+        (".[], all(split_doc; .)", "true"),
+        (".[], any(split_doc)", "true"),
+        (".[], all(split_doc)", "true"),
+        (".[], IN(split_doc)", "false"),
+        (".[], IN(split_doc; .)", "false"),
     ] {
         let (output, code) = run_yq_stdin(filter, yaml, &["--jq-extensions"])?;
         assert_eq!(code, 0, "{filter}");
         assert_eq!(
-            output, "1\n---\n2\n---\ntrue\n",
+            output,
+            format!("1\n---\n2\n---\n{last}\n"),
             "{filter} should separate every top-level result"
         );
     }
@@ -49780,20 +49783,18 @@ mod yq_text_equality_2785 {
     }
 
     /// Only `==`/`!=` take the text rule; the rest of the equality family
-    /// keeps its typed answer, and containers keep structural equality.
-    /// The first five rows differ from real yq (`[1]`, `[[1,"1"]]`, `1`,
-    /// `false`, `false`) and are recorded divergences in
-    /// `docs/compliance/yq/limitations.md`, pinned here so a change to any
-    /// of them is a deliberate one; the rest already agree with yq and
-    /// guard that the text rule stops at the scalar boundary.
+    /// keeps its typed answer. The first three rows differ from real yq
+    /// (`[1]`, `[[1,"1"]]`, `1`) and are recorded divergences in
+    /// `docs/compliance/yq/limitations.md` (#2799's dedup slice), pinned here
+    /// so a change to any of them is a deliberate one; the rest already
+    /// agree with yq and guard that the text rule stops at the scalar
+    /// boundary. Container `==` is the next test's (#2799).
     #[test]
     fn the_rest_of_the_equality_family_is_unchanged_2785() -> Result<()> {
         check(&[
             ("[.a, .b] | unique", "[1,\"1\"]"),
             ("[.a, .b] | group_by(.)", "[[1],[\"1\"]]"),
             ("[.a, .b] | group_by(.) | length", "2"),
-            ("[1] == [1]", "true"),
-            (". == .", "true"),
             // Agree with yq already.
             ("{\"x\": .a} == {\"x\": .b}", "false"),
             ("[.a] == [.b]", "false"),
@@ -49802,6 +49803,75 @@ mod yq_text_equality_2785 {
             ("[1] == null", "false"),
             ("null == [1]", "false"),
         ])
+    }
+
+    /// #2799: real yq's `isEquals` answers `false` for every pairing that holds an array
+    /// or object, so `==` is `false` and `!=` is `true` there (`[1] == [1]`, `{} == {}` and
+    /// `. == .` included), and `select(. == .)` keeps only the scalars. Every expectation was
+    /// captured live from yq v4.53.3 (`-o=json -I0`) on the document below.
+    #[test]
+    fn container_pairings_are_never_equal_2799() -> Result<()> {
+        let doc = "l: [1]\nm: {x: 1}\na: 1\nb: \"1\"\nn: null\ne: []\no: {}\n";
+        for (filter, want) in [
+            ("[1] == [1]", "false"),
+            ("[1] != [1]", "true"),
+            (".l == .l", "false"),
+            (".l != .l", "true"),
+            (". == .", "false"),
+            (". != .", "true"),
+            ("{} == {}", "false"),
+            (".m == {\"x\": 1}", "false"),
+            (".o == {}", "false"),
+            (".e == []", "false"),
+            (".l == null", "false"),
+            ("null == .l", "false"),
+            (".n == .l", "false"),
+            (".l == .n", "false"),
+            (".e == null", "false"),
+            (".l == 1", "false"),
+            ("1 == .l", "false"),
+            (".l == \"[1]\"", "false"),
+            (".l == \"*\"", "false"),
+            ("\"*\" == .l", "false"),
+            ("[.a == .a, .l == .l]", "[true,false]"),
+            ("[.l, .m] | map(. == .)", "[false,false]"),
+            ("(.l | . == .)", "false"),
+            ("(.l == .l) // \"alt\"", "\"alt\""),
+            ("[.[] | select(. != .)] | length", "4"),
+            (
+                "[.[] | select(. == .) | tag]",
+                "[\"!!int\",\"!!str\",\"!!null\"]",
+            ),
+            // A scalar inside a container still compares by text.
+            (".l[0] == .a", "true"),
+        ] {
+            let (out, code) = run_yq_stdin(filter, doc, &["-o=json", "-I=0"])?;
+            assert_eq!((out.trim(), code), (want, 0), "`{filter}`");
+        }
+        Ok(())
+    }
+
+    /// #2799: `IN(s)` is `any(s == .; .)` and `IN(src; s)` is `any(src == s; .)`, so both take
+    /// `==`'s one definition in yq mode -- text equality for scalars, never equal for a
+    /// container pairing. (`IN` is a jq-only builtin, reachable through `--jq-extensions`.)
+    #[test]
+    fn in_follows_the_same_equality_2799() -> Result<()> {
+        let doc = "a: 1\nl: [1]\n";
+        for (filter, want) in [
+            (".a | IN(1, 2)", "true"),
+            (".a | IN(\"1\")", "true"),
+            (".a | IN(2, 3)", "false"),
+            (".l | IN([1])", "false"),
+            (".l | IN(.)", "false"),
+            ("IN(.a; 1, 2)", "true"),
+            ("IN(.a; \"1\")", "true"),
+            ("IN(.l; [1])", "false"),
+            ("IN(.l; .l)", "false"),
+        ] {
+            let (out, code) = run_yq_stdin(filter, doc, &["-o=json", "-I=0", "--jq-extensions"])?;
+            assert_eq!((out.trim(), code), (want, 0), "`{filter}`");
+        }
+        Ok(())
     }
 
     /// jq mode is untouched: `1 == "1"` is `false` there, as in jq 1.7.1.
@@ -50799,8 +50869,12 @@ fn any_all_cond_reads_the_element_position_2968() -> Result<()> {
         // read the other way round.
         (r#".aa | [.[] | any(.; key == "c")]"#, "[false,true]"),
         (r#".aa | [.[] | any(1; key == "c")]"#, "[false,false]"),
-        // `parent` from inside `cond` climbs from the element
-        (r#".aa | any(.[]; (parent | keys) == ["bbb","c"])"#, "true"),
+        // `parent` from inside `cond` climbs from the element (scalar compare: a container
+        // pairing is never equal in yq mode since #2799)
+        (
+            r#".aa | any(.[]; ((parent | keys) | tojson) == "[\"bbb\",\"c\"]")"#,
+            "true",
+        ),
     ] {
         let (out, code) = run_yq_stdin(filter, doc, &args)?;
         assert_eq!((out.trim(), code), (want, 0), "`{filter}`");
@@ -50946,7 +51020,7 @@ fn any_all_cond_read_resolves_on_rewritten_routes_3079() -> Result<()> {
             r#"{"bbb":"bbb","c":"c"}"#,
         ),
         (
-            r#".aa | map_values(any(.[]; (parent|keys) == ["y"]))"#,
+            r#".aa | map_values(any(.[]; ((parent|keys) | tojson) == "[\"y\"]"))"#,
             r#"{"bbb":false,"c":true}"#,
         ),
         (

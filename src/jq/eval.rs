@@ -707,18 +707,18 @@ pub(crate) fn yq_null_ordering_is_false<S: EvalSemantics>(
     }
 }
 
-/// yq mode only (#2785): `==`/`!=` between two **scalars** compares their
-/// *text*, with yq's wildcard matcher ([`yq_match_key`]) applied to the
+/// yq mode only (#2785, #2799): `==`/`!=` between two **scalars** compares
+/// their *text*, with yq's wildcard matcher ([`yq_match_key`]) applied to the
 /// right-hand operand -- never jq's typed equality. This is real yq's
 /// `isEquals` (`pkg/yqlib/operator_equals.go`, v4.53.3) verbatim: a `!!null`
 /// left operand is equal only to a `!!null` right one; otherwise two scalar
 /// nodes are equal iff `matchKey(lhs.Value, rhs.Value)`, the same
 /// byte-level glob the `.["a*"]` traversal uses; anything else is `false`.
-/// `None` means "the ordinary rule decides" -- every non-equality op, jq
-/// mode, and any operand that is an array or object (real yq answers
-/// `false` for *every* container pairing, `[1] == [1]` and `. == .`
-/// included; that half is not reproduced here and is recorded in
-/// `docs/compliance/yq/limitations.md`).
+/// "Anything else" includes every pairing with an array or object: real yq
+/// answers `false` for `==` and `true` for `!=` there, `[1] == [1]`,
+/// `{} == {}` and `. == .` included (#2799), so `select(. == .)` keeps only
+/// the scalars. `None` means "the ordinary rule decides" -- every
+/// non-equality op and jq mode.
 ///
 /// Captured live against yq v4.53.3 (`-o=json -I0`), each row also
 /// pinned in `tests/yq_cli_tests.rs`:
@@ -736,6 +736,10 @@ pub(crate) fn yq_null_ordering_is_false<S: EvalSemantics>(
 /// | `"null" == null`               | `true`  | a `!!null` *rhs* is just text `null`  |
 /// | `"~" == null`                  | `false` | that text is the rhs's own spelling   |
 /// | `0 == null`                    | `false` | text `0` vs `null`                    |
+/// | `[1] == [1]`, `{} == {}`, `. == .` | `false` | a container pairing is never equal |
+/// | `[1] != [1]`                   | `true`  | the same, negated                     |
+/// | `[1] == null`, `null == [1]`   | `false` | no container is `!!null`              |
+/// | `[1] == 1`, `1 == [1]`, `[1] == "*"` | `false` | scalar against container       |
 ///
 /// The text of an owned scalar is what `tostring` renders (`owned_to_string`),
 /// so `==` and `tostring` cannot disagree about a number; a document
@@ -762,13 +766,17 @@ pub(crate) fn yq_scalar_text_eq<S: EvalSemantics>(
     if S::TAG != EvalTag::Yq || !matches!(op, CompareOp::Eq | CompareOp::Ne) {
         return None;
     }
-    let (Some(l), Some(r)) = (yq_scalar_text::<S>(left), yq_scalar_text::<S>(right)) else {
-        return None;
-    };
-    let equal = if left.is_null() {
-        right.is_null()
-    } else {
-        yq_match_key(&l, &r)
+    // `isEquals` is `false` unless both nodes are scalars (or the left is `!!null` and so is
+    // the right): a container has no `.Value` text to match, so no pairing with one is equal.
+    let equal = match (yq_scalar_text::<S>(left), yq_scalar_text::<S>(right)) {
+        (Some(l), Some(r)) => {
+            if left.is_null() {
+                right.is_null()
+            } else {
+                yq_match_key(&l, &r)
+            }
+        }
+        _ => false,
     };
     Some(if op == CompareOp::Eq { equal } else { !equal })
 }
@@ -777,8 +785,8 @@ pub(crate) fn yq_scalar_text_eq<S: EvalSemantics>(
 /// node): a string's own contents, borrowed; a number or bool as
 /// [`owned_to_string`] renders it; `null` as the four bytes `null`. Only the
 /// numeric arm allocates, so a string-against-string `==` stays free.
-/// `None` for a container, which has no `.Value` and is the caller's cue to
-/// leave the pairing to the structural rule.
+/// `None` for a container, which has no `.Value`: [`yq_scalar_text_eq`] reads it as "no
+/// container pairing is equal" (#2799), `eval_generic.rs`'s key gate as "not a scalar spelling".
 ///
 /// `pub(crate)`, not private: `eval_generic.rs`'s key materialization
 /// (`key_owned_value`, `path_context_item_to_owned`'s `OneCursorValue` arm)
@@ -8038,7 +8046,9 @@ fn each_upper_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let flow = eval_each_owned::<S>(s, &current, optional, Reentry::Proven, &mut |candidate| {
         // #3293: reset per invocation -- see `each_limit`.
         outer_stopped = false;
-        if owned_value_eq::<S>(&candidate, &current) {
+        // #2799: `IN(s)` is `any(s == .; .)`, so it takes `==`'s one definition (yq mode: the
+        // text-and-container rule), the same as `IN(src; s)`.
+        if apply_compare_op::<S>(CompareOp::Eq, &candidate, &current) {
             if sink(Item::Owned(OwnedValue::Bool(true))) == Demand::Stop {
                 outer_stopped = true;
             }
@@ -15401,7 +15411,9 @@ fn builtin_upper_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `optional` into its own `gen` evaluation for exactly this reason.
     // #3036: `current` is this arm's own input, unrebuilt -- bridged.
     let flow = eval_each_owned::<S>(s, &current, optional, Reentry::Proven, &mut |candidate| {
-        if owned_value_eq::<S>(&candidate, &current) {
+        // #2799: `IN(s)` is `any(s == .; .)`, so it takes `==`'s one definition (yq mode: the
+        // text-and-container rule), the same as `IN(src; s)`.
+        if apply_compare_op::<S>(CompareOp::Eq, &candidate, &current) {
             found += 1;
             Demand::Stop
         } else {
