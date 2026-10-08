@@ -63892,6 +63892,98 @@ fn test_fold_pattern_computed_key_is_not_run_twice_3743() -> Result<()> {
     Ok(())
 }
 
+/// #3840: a fold's pattern-walk refusal that is only the walk's *guess* at jq's
+/// `path_intact` (the element equals the register by value, so jq may have carried
+/// on with this alternative) is loud, like every other guess site (ADR-0018 rule 4):
+/// a `try` or `?` around the fold must not run its handler for it. `del(try (.a and
+/// (reduce . as {a:$a} ?// $a (0; .))))` on `{"a":true}` is `{}` in jq, which
+/// finds the first alternative intact and deletes `.a`; the guess refused, the `try`
+/// caught it, and the write was lost silently at exit 0 (`{"a":true}`). It is now
+/// the refusal the un-wrapped fold already was, exit 5 -- a refusal where jq
+/// answers, never an answer jq would not give. A computed key, which #3743's
+/// by-value rule does not judge, and `foreach` take the same route. The contrast is a
+/// refusal of a step that could never succeed on the element (the string key `"a"`
+/// off the array `[true]`): jq raises that whatever its register is, so the `try`
+/// catching it is what jq does too, and it stays catchable.
+/// Every jq side captured from jq 1.7.1; succinctly's exit-5 rows are the recorded
+/// safe-direction divergence.
+#[test]
+fn test_fold_guessed_pattern_refusal_is_not_catchable_3840() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"a":true}"#,
+            r"del(try (.a and (reduce . as {a:$a} ?// $a (0; .))))",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of {"a":true}"#,
+            5,
+        ),
+        (
+            r#"{"a":true}"#,
+            r#"del(try (.a and (reduce . as {("a"):$a} ?// $a (0; .))))"#,
+            "",
+            r#"Invalid path expression near attempt to access element "a" of {"a":true}"#,
+            5,
+        ),
+        (
+            r"[true]",
+            r"del(try (.[0] and (reduce . as [$a] ?// $a (0; .))))",
+            "",
+            r"Invalid path expression near attempt to access element 0 of [true]",
+            5,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"del(try (.a and (foreach . as {a:$a} ?// $a (0; .; .))))",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of {"a":true}"#,
+            5,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"del((.a and (reduce . as {a:$a} ?// $a (0; .)))?)",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of {"a":true}"#,
+            5,
+        ),
+        // The recorded cost: the walk cannot tell that a later alternative would also
+        // have failed, so this row, which the catch used to answer as jq does
+        // (`{"a":1,"b":2}`), refuses too.
+        (
+            r#"{"a":1,"b":2}"#,
+            r"del(try (.a and (reduce . as {a:$a,b:$b} ?// [$a] (0; .))))",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of {"a":1,"b":2}"#,
+            5,
+        ),
+        // Unchanged: a guess on the last (here only) alternative is not asked, and the
+        // catch answers as jq does.
+        (
+            r#"{"a":true}"#,
+            r"del(try (.a and (reduce . as {a:$a} (0; .))))",
+            "{\"a\":true}\n",
+            "",
+            0,
+        ),
+        // Contrast: the refused step could never succeed, so the catch is jq's too
+        // (jq retries the first alternative's error into the second, which raises the
+        // same way, and the `try` catches that).
+        (
+            r"[true]",
+            r#"del(try (.[0] and (reduce . as {("a"):$a} ?// {("b"):$a} (0; .))))"#,
+            "[true]\n",
+            "",
+            0,
+        ),
+        (
+            r"[true]",
+            r#"del(try (.[0] and (foreach . as {("a"):$a} ?// {("b"):$a} (0; .; .))))"#,
+            "[true]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
 /// #3744: a destructuring of the register itself (`.`) as a `foreach` SOURCE moves
 /// jq's path register through the pattern's tracked index steps, so the body's
 /// EXTRACT is checked against a register it is no longer at: `path(foreach (. as
