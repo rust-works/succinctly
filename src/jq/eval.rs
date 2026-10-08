@@ -42164,22 +42164,20 @@ fn stage_states_register_per_result<S: EvalSemantics>(expr: &Expr) -> bool {
 /// an untracked one no leaf sees the register. Jq mode only (ADR-0018).
 fn compound_states_register_per_result<S: EvalSemantics>(expr: &Expr) -> bool {
     last_register_unmoved::<S>()
-        && matches!(
-            peel_register_transparent(expr),
-            Expr::Comma(_) | Expr::Alternative(..) | Expr::If { .. }
-        )
-        || matches!(
-            peel_register_transparent(expr),
+        && match peel_register_transparent(expr) {
+            Expr::Comma(_) | Expr::Alternative(..) | Expr::If { .. } => true,
             // A handler that runs navigates the error payload, not the register,
             // and the handler's by-value output would then be read as the entry
             // register (`try (error(.) | error("x")) catch ((.a)? // 5)` is a
             // path error in jq). So a navigating handler is admitted only behind
             // a body that cannot raise; the handler machinery (#3133, #3987)
             // answers the rest.
-            Expr::Try { expr: body, catch }
-                if catch.as_deref().map_or(true, cannot_move_register)
+            Expr::Try { expr: body, catch } => {
+                catch.as_deref().map_or(true, cannot_move_register)
                     || matches!(unwrap_paren(body), Expr::Literal(_))
-        )
+            }
+            _ => false,
+        }
 }
 
 /// Whether `expr` is a `foreach` whose emissions state jq's register per emission
@@ -133488,5 +133486,44 @@ mod touched_edge_cases_2999 {
         ] {
             assert_eq!(fans_out(&parse(src).unwrap()), fans, "fans_out({src})");
         }
+    }
+}
+
+#[cfg(test)]
+mod compound_states_register_mode_gate_tests {
+    use super::*;
+    use crate::jq::parse;
+
+    // #4023: the predicate is documented "jq mode only (ADR-0018)", and every arm
+    // has to sit behind that gate -- `&&` binds tighter than `||`, so a `Try` arm
+    // written after an `||` read the gate for the other arms only.
+    #[test]
+    fn every_arm_is_jq_mode_only() {
+        for src in [
+            "1, 2",
+            ". // 1",
+            "if . then 1 else 2 end",
+            "try error(\"x\") catch 2",
+            "try (.a) catch 2",
+        ] {
+            let expr = parse(src).unwrap();
+            assert!(
+                compound_states_register_per_result::<JqSemantics>(&expr),
+                "jq mode must admit `{src}`"
+            );
+            assert!(
+                !compound_states_register_per_result::<YqSemantics>(&expr),
+                "yq mode must not admit `{src}`"
+            );
+        }
+    }
+
+    // The gate must not turn the predicate into a constant: a body that is not
+    // a compound stage is refused in jq mode too.
+    #[test]
+    fn a_plain_navigation_is_refused_in_both_modes() {
+        let expr = parse(".a").unwrap();
+        assert!(!compound_states_register_per_result::<JqSemantics>(&expr));
+        assert!(!compound_states_register_per_result::<YqSemantics>(&expr));
     }
 }
