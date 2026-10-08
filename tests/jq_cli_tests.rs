@@ -72329,6 +72329,16 @@ fn test_foreach_update_comma_bare_builtin_exclusions_characterize_3960() -> Resu
             "Invalid path expression with result 0",
             5,
         ),
+        // A boolean register: jq reads a result equal to it as the register itself
+        // (`jv_identical`), so it answers `[["a"],["a"],["a"],["a"]]`; the model does not carry
+        // that, so the bool-returning builtins stay refused.
+        (
+            r#"{"a":true,"z":false}"#,
+            r"[path(foreach (1,2) as $v (.a; (contains(true), contains(true)); .))]",
+            "",
+            "Invalid path expression with result true",
+            5,
+        ),
     ])
 }
 

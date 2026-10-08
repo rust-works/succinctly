@@ -40268,7 +40268,11 @@ fn carry_register_when<'a>(
 }
 
 /// A bare builtin that navigates nothing and returns a value it computed, so a comma sibling
-/// holding it leaves jq's register where the comma entered it (#3960): the C-coded math and
+/// holding it leaves jq's register where the comma entered it (#3960). Read for an immediate
+/// comma sibling only: the same builtin as a bare UPDATE, in a nested comma or under a wrapper
+/// still skips the write silently (#4028). A boolean register is a limit of the model, not of
+/// this list: jq reads a `contains(true)`/`isnan` result equal to a `true`/`false` register as
+/// that register (`jv_identical`), which the model does not carry, so those inputs stay refused: the C-coded math and
 /// date builtins, `now`, `input_line_number`, `explode`/`implode`, `sort`, and the string
 /// predicates with literal arguments. Captured from jq 1.7.1 in the shape `del(foreach .a as $v
 /// (INIT; (($v | .b?), B); try ($v | .b?)))` over five INITs

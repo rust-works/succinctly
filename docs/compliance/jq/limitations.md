@@ -2860,7 +2860,11 @@ is the revert that established what the other one costs.
    back by pointer (`abs`, `ltrimstr`, `rtrimstr`, `min`, `max`), the `ascii_downcase`/`ascii_upcase`
    pair (`explode | map(..) | implode` in jq, so a path error on a derived input, #2743) and a
    builtin with a non-literal argument still refuse loudly, where jq writes; characterized by
-   `test_foreach_update_comma_bare_builtin_exclusions_characterize_3960`.
+   `test_foreach_update_comma_bare_builtin_exclusions_characterize_3960`. The same builtins outside
+   a flat comma sibling (a bare UPDATE, a nested comma, under `first`/`//`/`?`) are not read at all
+   and skip the write silently ([#4028](https://github.com/rust-works/succinctly/issues/4028)), and
+   a boolean register stays refused for the bool-returning ones (`contains(true)`, `isnan`), because
+   jq reads an equal boolean result as the register itself and the model does not carry that.
    Marking a withheld register lost (#3267) would make it refuse loudly, but also
    turns rows that match jq today into refusals, where jq's own `try` catches a real error
    (`(foreach .a as $w (0; try (($w \| .c \| .z), $w.b); .)) = 9` writes nothing in either).
