@@ -678,6 +678,18 @@ direction), pinned or swept:
   drive and its refusal.
 - **`no_std`** has no thread-local, so the recognition is off there and the previous answer stands.
 
+**A fold INIT that navigates and then computes ([#4013](https://github.com/rust-works/succinctly/issues/4013)).**
+`(foreach (null) as {a:$x} (.a|tostring; .; $x)) = 5` is `{"a":{"a":5}}` in jq: INIT's navigation moved
+the register to `.a` and the computed value left it there. The fold used to seed its register from the
+ambient value, so the loop pattern walked from the root and `=`/`|=`/`path()` wrote or reported through
+`.a` instead of `.a.a`. An INIT that can have moved the register (`cannot_move_register` is false) now seeds
+an untrackable one, so the walk refuses (exit 5) where jq answers, for `foreach` and `reduce` alike; an INIT
+that only computes (`tostring`) or only navigates is unchanged. The cost, in the safe direction: the
+five INIT operands this added to `scripts/jq-path-register-sweep.py` (8,967 rows) lose 66 rows that matched
+jq by accident (all on a `null` document, where the old walk's wrong node and jq's coincide), and nothing else
+in the 40,000-row sample or the other sweeps moves. A walk that tracks where INIT's navigation left the
+register would recover them.
+
 ## Path-mode slice bounds and a `?//` retry (#3293)
 
 A `?//` in a computed slice bound under `path`/`del`/`=`/`|=`/`+=`/`//=`/`pick` retries past
