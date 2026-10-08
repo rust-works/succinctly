@@ -49141,27 +49141,34 @@ mod tests {
         );
     }
 
-    /// #3702: a YAML sequence is not on the resumable path (its item cursor is
-    /// a wrapper `uncons_cursor` unwraps, not the previous item's sibling), so
-    /// it answers by the scan from the first item, and answers the same.
+    /// #2784: a YAML sequence is on the resumable path since its `next_element` walks the items
+    /// `uncons_cursor` unwraps from their `-` nodes, so `key`/`path` read at every item of a wide
+    /// sequence visit about `n` of them where the scan from the first item visited `n(n-1)/2`
+    /// (it was #3702's "not on the resumable path" pin), and answer the same.
     #[cfg(feature = "std")]
     #[test]
-    fn test_yaml_sequence_slots_take_the_scan_from_the_start_3702() {
-        let yaml: String = (0..120)
-            .map(|i| format!("- a:\n    b: {i}\n"))
+    fn test_yaml_sequence_slots_resume_the_scan_2784() {
+        let n = 1200usize;
+        let yaml: String = (0..n)
+            .map(|i| {
+                // Items with the content on the `-` line and on the next line (a deferred bare `-`).
+                if i % 2 == 0 {
+                    format!("- a:\n    b: {i}\n")
+                } else {
+                    format!("-\n  a:\n    b: {i}\n")
+                }
+            })
             .collect::<String>();
         let index = crate::yaml::YamlIndex::build(yaml.as_bytes()).unwrap();
-        // The default: a format that does not resume has no element chain.
         let first_item = index
             .root(yaml.as_bytes())
             .first_child()
             .and_then(|sequence| sequence.first_child())
             .expect("the document's first item");
-        assert!(first_item.next_element().is_none());
-        // ... and no depth to recognise a remembered parent's children by.
-        assert!(first_item.tree_depth().is_none());
+        assert!(first_item.next_element().is_some());
+        assert!(first_item.tree_depth().is_some());
         let expr = parse("[.[] | .[] | tostring | [key]]").unwrap();
-        let before = slot_memo::work();
+        let (scanned_before, neighbours_before) = slot_memo::work();
         let mut out = Vec::new();
         let control = eval_each_with_cursor_using::<YqSemantics, _>(
             &expr,
@@ -49175,16 +49182,59 @@ mod tests {
         );
         assert!(control.is_none(), "{control:?}");
         let OwnedValue::Array(keys) = &out[0] else {
-            panic!("expected one array, got {out:?}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3702 pin, only reached when the pin is already failing"
+            panic!("expected one array, got {out:?}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #2784 pin, only reached when the pin is already failing"
         };
-        assert_eq!(keys.len(), 120);
+        assert_eq!(keys.len(), n);
         for (i, key) in keys.iter().enumerate() {
             assert_eq!(key.to_json(), format!("[{i}]"), "item {i}");
         }
-        assert_eq!(
-            slot_memo::work(),
-            before,
-            "a YAML sequence went through the resumable scan"
+        let (scanned, neighbours) = slot_memo::work();
+        let (scanned, neighbours) = (scanned - scanned_before, neighbours - neighbours_before);
+        assert!(
+            scanned < 4 * n,
+            "visited {scanned} items over {n}; quadratic would be ~{}",
+            n * n / 2
+        );
+        assert!(
+            neighbours >= n / 2,
+            "only {neighbours} of {n} positions were answered as a remembered item's neighbour"
+        );
+    }
+
+    /// #2784: the same for a wide YAML mapping, whose members are the key, value, key, value, ...
+    /// siblings: `key`/`path` read at every member visit about `n` of them.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_yaml_member_slots_resume_the_scan_2784() {
+        let n = 1200usize;
+        let yaml: String = (0..n).map(|i| format!("k{i}: {i}\n")).collect();
+        let index = crate::yaml::YamlIndex::build(yaml.as_bytes()).unwrap();
+        let expr = parse("[.[] | .[] | key | path]").unwrap();
+        let (scanned_before, _) = slot_memo::work();
+        let mut out = Vec::new();
+        let control = eval_each_with_cursor_using::<YqSemantics, _>(
+            &expr,
+            index.root(yaml.as_bytes()),
+            &mut |result| {
+                if let Ok(Some(v)) = result.into_owned::<YqSemantics>() {
+                    out.push(v);
+                }
+                true
+            },
+        );
+        assert!(control.is_none(), "{control:?}");
+        let OwnedValue::Array(paths) = &out[0] else {
+            panic!("expected one array, got {out:?}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #2784 pin, only reached when the pin is already failing"
+        };
+        assert_eq!(paths.len(), n);
+        for (i, path) in paths.iter().enumerate() {
+            assert_eq!(path.to_json(), format!("[\"k{i}\"]"), "member {i}");
+        }
+        let scanned = slot_memo::work().0 - scanned_before;
+        assert!(
+            scanned < 4 * n,
+            "visited {scanned} members over {n}; quadratic would be ~{}",
+            n * n / 2
         );
     }
 
