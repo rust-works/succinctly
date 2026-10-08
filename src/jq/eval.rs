@@ -40270,9 +40270,7 @@ fn carry_comma_sibling_register<'a>(
     branch: PathBranch<'a>,
     frame: &Frame,
 ) -> PathBranch<'a> {
-    carry_register_when(branch, frame, || {
-        operand_leaves_register(operand) || neutral_leaves_register(operand)
-    })
+    carry_register_when(branch, frame, || neutral_leaves_register(operand))
 }
 
 /// The shared body of the two: state `frame`'s register on a by-value `branch` that says
@@ -40307,8 +40305,9 @@ fn carry_register_when<'a>(
 /// - Arguments must be literals. A `.` in an argument makes the sibling opaque to
 ///   [`entry_marker_shape`] (the #3959 route), a generator makes the builtin yield several
 ///   outputs the fold's `Keep::First` truncates, and a navigating one is a navigation.
-/// - Bare only, never under `first`/`last`/`//`: those wrappers state the register on a different
-///   path than [`carry_comma_sibling_register`] reads.
+/// - Not under `last(f)`, which states the register on a different path than
+///   [`neutral_leaves_register`] reads. `first`, `limit`, `?`, `try` and `//` are read through
+///   (#4028), each leaf held to this list.
 /// - Nothing that can hand its input or an element of it back by pointer, which the model cannot
 ///   represent (a `try` then swallows the refusal into a skipped write): `abs`, `ltrimstr`,
 ///   `rtrimstr`, `min`, `max`, `get_search_list`, `builtins`, `input_filename`.
@@ -40390,7 +40389,8 @@ fn operand_leaves_register(operand: &Expr) -> bool {
     cannot_move_register(peel_register_transparent(operand))
 }
 
-/// [`operand_leaves_register`], plus the bare builtins that navigate nothing
+/// [`cannot_move_register`] of `expr` as written or of what is under the wrappers that add no
+/// movement ([`operand_leaves_register`]), plus the bare builtins that navigate nothing
 /// ([`is_bare_register_neutral_builtin`], #3960) read through the shapes that only fork or
 /// sequence their operands (#4028): a comma, a pipe, a `//`, and the wrappers
 /// [`peel_register_transparent`] passes the register through. jq's register is where the
@@ -40403,6 +40403,11 @@ fn operand_leaves_register(operand: &Expr) -> bool {
 /// fold's UPDATE body is judged ([`FoldRegister::advance`]) and where a comma sibling is
 /// (#3960's three readers), the two places the register statement reaches EXTRACT.
 fn neutral_leaves_register(expr: &Expr) -> bool {
+    // First as written: peeling a `try` drops the rule that a body which always raises
+    // undoes whatever it navigated (`try error(.a)`, #3965), which only the whole node states.
+    if cannot_move_register(expr) {
+        return true;
+    }
     let peeled = peel_register_transparent(expr);
     if is_bare_register_neutral_builtin(peeled) {
         return true;
@@ -44688,9 +44693,7 @@ fn entry_marker_shape(expr: &Expr) -> EntryMarkers {
             // with a `.` in it) keeps the whole comma opaque: `(.|length)` and `(2|.+1)` still
             // skip the write (#3959).
             if shape == EntryMarkers::None
-                && items.iter().any(|item| {
-                    operand_leaves_register(item) || neutral_leaves_register(item)
-                })
+                && items.iter().any(neutral_leaves_register)
             {
                 EntryMarkers::Forwarded
             } else {
@@ -133596,6 +133599,11 @@ mod neutral_leaves_register_tests_4028 {
             "limit(1; now, 1)",
             "(now, (floor | floor))",
             "1",
+            // A body that always raises undoes what it navigated (#3965); only the whole node says
+            // so, so a `try` is not peeled before it is asked.
+            "try error(.a)",
+            "(1, try error(.a))",
+            "(1, (try error(.a))?)",
         ] {
             let expr = parse(src).unwrap();
             assert!(neutral_leaves_register(&expr), "`{src}` is neutral");
@@ -133615,6 +133623,8 @@ mod neutral_leaves_register_tests_4028 {
             "(now | abs)",
             "pow(.; 2)",
             "if . then now else floor end",
+            // Not read: an `if`, an array or a handler around neutral leaves is judged by
+            // `cannot_move_register` alone (a limit, not a jq-verified refusal).
             "[now]",
             "try now catch .a",
             "first(.a)",

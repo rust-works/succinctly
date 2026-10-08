@@ -72984,6 +72984,22 @@ fn test_foreach_update_register_neutral_shapes_leave_the_register_4028() -> Resu
             "Invalid path expression with result true",
             5,
         ),
+        // A body that always raises undoes what it navigated, so it leaves the register (#3965):
+        // reading UPDATE through `try` must not forget that.
+        (
+            doc,
+            r"del(foreach .a as $v (0; (1, try error(.a)); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; (1, (try error(.a))?); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
     ])
 }
 
