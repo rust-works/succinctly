@@ -24210,17 +24210,26 @@ fn path_context_step_try<S: EvalSemantics, V: DocumentValue>(
     out.append(&mut branch);
     let payload = match stepped {
         Ok(()) => return Ok(()),
-        Err(Control::Error(e)) if e.is_uncatchable_at_value_position() => {
-            return Err(Control::Error(e))
-        }
-        Err(Control::Error(e)) => e.payload(),
-        Err(Control::Break(_)) => OwnedValue::Null,
-        Err(halt @ Control::Halt(_)) => return Err(halt),
+        Err(escape) => path_context_caught_payload(escape)?,
     };
     let Some(handler) = catch else {
         return Ok(());
     };
     path_context_try_handler::<S, V>(handler, &payload, pos, out)
+}
+
+/// What a `try` catches: the payload its handler runs over, or the escape
+/// that is not its to catch -- a halt, and the errors
+/// `EvalError::is_uncatchable_at_value_position` names. A `break` runs the
+/// handler over `null`, as `each_try_generic` does. The one definition both
+/// [`path_context_step_try`] and [`path_context_step_try_each`] use (#4014).
+fn path_context_caught_payload(escape: Control) -> Result<OwnedValue, Control> {
+    match escape {
+        Control::Error(e) if e.is_uncatchable_at_value_position() => Err(Control::Error(e)),
+        Control::Error(e) => Ok(e.payload()),
+        Control::Break(_) => Ok(OwnedValue::Null),
+        halt @ Control::Halt(_) => Err(halt),
+    }
 }
 
 /// The catch handler of [`path_context_step_try`], run over the caught
@@ -24262,12 +24271,7 @@ fn path_context_step_try_each<S: EvalSemantics, V: DocumentValue>(
     }
     let payload = match path_context_step_each::<S, V>(body, pos, sink) {
         Ok(demand) => return Ok(demand),
-        Err(Control::Error(e)) if e.is_uncatchable_at_value_position() => {
-            return Err(Control::Error(e))
-        }
-        Err(Control::Error(e)) => e.payload(),
-        Err(Control::Break(_)) => OwnedValue::Null,
-        Err(halt @ Control::Halt(_)) => return Err(halt),
+        Err(escape) => path_context_caught_payload(escape)?,
     };
     let Some(handler) = catch else {
         return Ok(Demand::Continue);
@@ -24285,17 +24289,18 @@ fn path_context_step_try_each<S: EvalSemantics, V: DocumentValue>(
 /// `first(body)` / `limit(n; body)` as one walk step: at most `take`
 /// positions of the body (all of them for `None`).
 ///
-/// The walk's step is eager -- it collects every position a stage reaches
-/// before the next stage runs -- so a bound is applied branch by branch
-/// where the body is a comma, and the branches past the bound are never
-/// stepped: `first((.[], halt_error))` stops after the first element, as jq
-/// does, rather than evaluating the `halt_error` it would never reach. A
-/// pipe is streamed with a sink that stops at the bound (#3514), so the
-/// stages after its first never run at a position past it (`first(.[] | if
-/// ("A"|stderr) then . else . end)` prints one `A`, as jq does). Any other
-/// body is stepped whole and truncated, and so is a pipe's own first stage
-/// when it is not literal navigation (`..`, a `try`, a parenthesised pipe).
-/// An escape raised *after* the bound was met is dropped, which is what jq's own
+/// A stage of the walk collects every position it reaches before the next
+/// stage runs unless [`path_context_step_each`] streams it, so a bound is
+/// applied branch by branch where the body is a comma, and the branches past
+/// the bound are never stepped: `first((.[], halt_error))` stops after the
+/// first element, as jq does, rather than evaluating the `halt_error` it would
+/// never reach. Any other body is driven through [`path_context_step_each`]
+/// with a sink that stops at the bound (#3514, #4014), so the stages after the
+/// first never run at a position past it (`first(.[] | if ("A"|stderr) then .
+/// else . end)` prints one `A`, as jq does), and neither do those behind a
+/// `try`/`?` or a parenthesised pipe. A stage `path_context_step_each` still
+/// collects (a computed bracket, an owned navigation) runs to completion
+/// before its first position is delivered. An escape raised *after* the bound was met is dropped, which is what jq's own
 /// `first(f)` (`label $out | f | ., break $out`) does with an error the
 /// generator would only have raised past the output it stopped at
 /// (`path(first((.[], error("x"))))` is `["a"]` in jq 1.7.1, exit 0).
@@ -24756,10 +24761,10 @@ fn path_context_emitting_value<V: DocumentValue>(
 
 /// Deliver each position from one stage to a callback. Parentheses, commas,
 /// identity, `parent`, literal fields and indices on live or absent nodes,
-/// and nested pipes of these zero-or-one steps bypass the intermediate
-/// buffer. Owned navigation and more complex expressions retain their
-/// collecting semantics. The callback only returns demand, so its downstream
-/// error cannot be caught by this stage.
+/// and nested pipes bypass the intermediate buffer, and so does `try`/`?`
+/// around a body (#4014). Owned navigation and more complex expressions retain
+/// their collecting semantics. The callback only returns demand, so its
+/// downstream error cannot be caught by this stage.
 fn path_context_step_each<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     pos: &PathContextPos<V>,

@@ -56000,6 +56000,15 @@ fn bounded_walk_stops_nested_pipe_try_and_recursion_stages_at_the_bound_4014() -
             "B",
             0,
         ),
+        // A `try` whose body fails part-way, under an outer pipe with a side
+        // effect: the positions before the error reach the later stages first.
+        (
+            flat,
+            r#".a | try (.[] | if . == 2 then error("E") else . end) | if ("D"|stderr) then . else . end | key"#,
+            "0\n",
+            "D",
+            0,
+        ),
         // Must not move: a bound met exactly reads every position it asked for,
         // `limit(0; ..)` never evaluates the body, and a `try` still swallows
         // its own body's error after the positions before it.
@@ -56026,6 +56035,51 @@ fn bounded_walk_stops_nested_pipe_try_and_recursion_stages_at_the_bound_4014() -
         ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (want_out, want_err, want_code),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
+/// #4014 review: a `try ... catch` under a `first`/`limit` bound. jq rejects a
+/// path through a catch handler's output (`Invalid path expression`), so there
+/// is no oracle; these rows pin succinctly's own answer, which the streaming
+/// `try` has to leave exactly as the collecting one gave it -- the handler's
+/// outputs stand at the `try`'s own position, a stop in the middle of them
+/// drops the handler's later error, and an unbounded read raises it.
+#[test]
+fn bounded_walk_keeps_the_try_catch_handler_answers_4014() -> Result<()> {
+    let flat = r#"{"a":[1,2,3]}"#;
+    for (filter, want_out, want_err, want_code) in [
+        (
+            r#".a | first(try (.[] | error("x")) catch .) | key"#,
+            "\"a\"\n",
+            "",
+            0,
+        ),
+        (
+            r#".a | first(try error("x") catch (1, error("y"))) | key"#,
+            "\"a\"\n",
+            "",
+            0,
+        ),
+        (
+            r#".a | limit(5; try error("x") catch (1, error("y"))) | key"#,
+            "\"a\"\n",
+            "jq: error (at <stdin>:0): y\n",
+            5,
+        ),
+        (
+            r#".a | first(try (.[] | if ("A"|stderr) then error("x") else . end) catch (.|stderr)) | key"#,
+            "\"a\"\n",
+            "Ax",
+            0,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(flat))?;
         assert_eq!(
             (stdout.as_str(), stderr.as_str(), code),
             (want_out, want_err, want_code),
