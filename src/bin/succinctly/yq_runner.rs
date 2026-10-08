@@ -4712,27 +4712,13 @@ fn output_value<W: Write>(
 }
 
 /// Whether `value`/`comments` should render in YAML flow style (`[...]`/
-/// `{...}`, issue #739) — `comments.style() == "flow"`, unless a child
-/// (array element or object field) has its own trailing comment.
+/// `{...}`, issue #739) -- `comments.style() == "flow"`.
 ///
-/// A `#` comment runs to end of line, so a flow collection has nowhere to
-/// put one before its last item without breaking onto another line anyway
-/// (real `yq` does this with a synthetic trailing comma:
-/// `[1, 2, # child\n]`). Falling back to block style — already
-/// comment-safe, since every comment gets its own line there — is simpler
-/// and more general than replicating that exact placement, at the cost of
-/// not matching real `yq`'s output byte-for-byte in this one narrow case
-/// (a comment on a non-final flow element); losing the comment entirely
-/// would be worse.
-fn is_flow_safe(value: &OwnedValue, comments: &CommentTree) -> bool {
-    if comments.style() != "flow" {
-        return false;
-    }
-    match value {
-        OwnedValue::Array(items) => !(0..items.len()).any(|i| comments.at_index(i).own().is_some()),
-        OwnedValue::Object(fields) => !fields.keys().any(|k| comments.field(k).own().is_some()),
-        _ => true,
-    }
+/// An element's own line comment no longer demotes the collection to block
+/// style: a `#` comment runs to the end of the line, so [`render_flow`] breaks
+/// the line after it the way go-yaml does (#2708).
+fn is_flow_safe(_value: &OwnedValue, comments: &CommentTree) -> bool {
+    comments.style() == "flow"
 }
 
 /// Whether this node's content is deferred to its own indented block below
@@ -5024,6 +5010,8 @@ fn emit_yaml_value_at_depth(
                 with_container_tag(value, comments, "[]".to_string())
             } else if in_flow || is_flow_safe(value, comments) {
                 // Flow style for nested in flow context
+                let ci = flow_continuation(indent, &config.indent_str);
+                let child_indent = flow_child_indent(&ci, &config.indent_str);
                 let items: Vec<_> = arr
                     .iter()
                     .enumerate()
@@ -5033,21 +5021,23 @@ fn emit_yaml_value_at_depth(
                             v,
                             elem_comments,
                             config,
-                            indent,
+                            &child_indent,
                             true,
                             depth + 1,
-                            indent,
+                            &ci,
                         );
                         // `[&x 1, *x]` — a flow item's own anchor sits
                         // immediately before it (#763), the DOM twin of
                         // `write_yaml_child_inline` in `light.rs`.
-                        match elem_comments.declared_anchor() {
+                        let item = match elem_comments.declared_anchor() {
                             Some(anchor) => format!("&{anchor} {item}"),
                             None => item,
-                        }
+                        };
+                        FlowItem::new(item, v, elem_comments)
                     })
                     .collect();
-                with_container_tag(value, comments, format!("[{}]", items.join(", ")))
+                let rendered = render_flow('[', ']', items, &ci, recursion_base);
+                with_container_tag(value, comments, rendered)
             } else {
                 // Block style sequence
                 let items: Vec<(String, bool)> = arr
@@ -5157,11 +5147,17 @@ fn emit_yaml_value_at_depth(
                             // A block scalar's content sits two columns in from its
                             // `- `, whatever the indent width (#2707); every other
                             // scalar ignores the indent it is handed.
-                            let val_indent = if matches!(v, OwnedValue::String(_)) {
-                                format!("{indent}  ")
-                            } else {
-                                format!("{indent}{}", config.indent_str)
-                            };
+                            let flow_collection = elem_comments.style() == "flow"
+                                && matches!(v, OwnedValue::Array(_) | OwnedValue::Object(_));
+                            let val_indent =
+                                if flow_collection || matches!(v, OwnedValue::String(_)) {
+                                    format!("{indent}  ")
+                                } else {
+                                    format!("{indent}{}", config.indent_str)
+                                };
+                            // A flow collection in a sequence item continues two
+                            // columns in and closes at the sequence's own indent
+                            // (#2708); everything else steps from its own indent.
                             let item = emit_yaml_value_at_depth(
                                 v,
                                 elem_comments,
@@ -5169,7 +5165,7 @@ fn emit_yaml_value_at_depth(
                                 &val_indent,
                                 false,
                                 depth + 1,
-                                &val_indent,
+                                if flow_collection { indent } else { &val_indent },
                             );
                             let comment_suffix = trailing_comment_suffix(elem_comments, indent);
                             let anchor = anchor_decl_prefix(elem_comments);
@@ -5198,6 +5194,8 @@ fn emit_yaml_value_at_depth(
                 with_container_tag(value, comments, "{}".to_string())
             } else if in_flow || is_flow_safe(value, comments) {
                 // Flow style for nested in flow context
+                let ci = flow_continuation(indent, &config.indent_str);
+                let child_indent = flow_child_indent(&ci, &config.indent_str);
                 let entries: Vec<_> = obj
                     .iter()
                     .map(|(k, v)| {
@@ -5216,17 +5214,18 @@ fn emit_yaml_value_at_depth(
                             v,
                             field_comments,
                             config,
-                            indent,
+                            &child_indent,
                             true,
                             depth + 1,
-                            indent,
+                            &ci,
                         );
                         // `{x: &y 1, z: *y}` (#763).
                         let anchor = anchor_decl_prefix(field_comments);
-                        format!("{key}:{anchor} {val}")
+                        FlowItem::new(format!("{key}:{anchor} {val}"), v, field_comments)
                     })
                     .collect();
-                with_container_tag(value, comments, format!("{{{}}}", entries.join(", ")))
+                let rendered = render_flow('{', '}', entries, &ci, recursion_base);
+                with_container_tag(value, comments, rendered)
             } else {
                 // Block style mapping
                 let entries: Vec<_> = if config.sort_keys {
@@ -5301,6 +5300,8 @@ fn emit_yaml_value_at_depth(
                             // (#1077/#1113).
                             format!("{indent}{key}:{anchor} {kc}")
                         } else {
+                            // A flow collection closes at its mapping's own indent
+                            // (#2708); everything else steps from its own.
                             let val = emit_yaml_value_at_depth(
                                 v,
                                 field_comments,
@@ -5308,7 +5309,11 @@ fn emit_yaml_value_at_depth(
                                 &val_indent,
                                 false,
                                 depth + 1,
-                                &val_indent,
+                                if field_comments.style() == "flow" {
+                                    indent
+                                } else {
+                                    &val_indent
+                                },
                             );
                             // The value's own comment takes priority; fall
                             // back to the key's own comment when the value
@@ -5471,6 +5476,127 @@ fn go_yaml_forces_double_quotes(s: &str) -> bool {
         previous = c;
     }
     false
+}
+
+/// One element of a flow collection being rendered: its text, and the line comment
+/// it carries (#2708).
+struct FlowItem {
+    text: String,
+    /// The element's own trailing comment, `#` and all, possibly several lines.
+    comment: Option<String>,
+    /// Whether the element is itself a non-empty collection, which takes its comment
+    /// differently from a scalar.
+    container: bool,
+}
+
+impl FlowItem {
+    fn new(text: String, value: &OwnedValue, comments: &CommentTree) -> Self {
+        let container = matches!(value, OwnedValue::Array(a) if !a.is_empty())
+            || matches!(value, OwnedValue::Object(o) if !o.is_empty());
+        Self {
+            text,
+            comment: comments.own().map(str::to_string),
+            container,
+        }
+    }
+}
+
+/// The indent a flow collection's elements continue at after a line break (#2708):
+/// go-yaml's `emitter.indent` once it has entered the collection. The collection's
+/// caller computed that as `indent`, except at the document root, where it is empty
+/// and the first flow level is one step in.
+fn flow_continuation(indent: &str, step: &str) -> String {
+    if indent.is_empty() { step } else { indent }.to_string()
+}
+
+/// A flow collection nested in the one continuing at `continuation` continues at the
+/// next multiple of the indent width above it -- go-yaml's
+/// `indent = width * ((indent + width) / width)`, which only differs from adding a
+/// step when `continuation` is not itself a multiple (a `- ` offset under `-I3`).
+fn flow_child_indent(continuation: &str, step: &str) -> String {
+    let width = step.len();
+    if width == 0 {
+        return continuation.to_string();
+    }
+    " ".repeat(width * ((continuation.len() + width) / width))
+}
+
+/// A flow collection's text, `[a, b]` or `{k: v}`, with any element line comments
+/// placed the way go-yaml places them (#2708). `continuation` is the indent the
+/// elements continue at and `owner` the indent of the container the collection sits
+/// in, where a closing `]` goes.
+///
+/// A `#` comment runs to the end of the line, so a commented element breaks the
+/// line. After a scalar the comma comes first (`[1, # c`), the next element
+/// continuing on the next line at `continuation` and, when it was the last, the closing
+/// bracket on a line of its own (go-yaml writes a trailing comma for it); after a
+/// collection the comment follows the closing bracket with no comma
+/// (`[[1] # c`), and the comma opens the next line at column 0 (`, 2]`). A further
+/// line of a multi-line comment sits at `continuation`. A `]` is at `owner` but a `}` is
+/// always at column 0, which go-yaml does not do consistently. Without a comment this is just the
+/// elements joined by `, `.
+#[inline(never)]
+fn render_flow(
+    open: char,
+    close: char,
+    items: Vec<FlowItem>,
+    continuation: &str,
+    owner: &str,
+) -> String {
+    if items.iter().all(|item| item.comment.is_none()) {
+        let joined = items
+            .into_iter()
+            .map(|item| item.text)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!("{open}{joined}{close}");
+    }
+    #[derive(PartialEq)]
+    enum Pending {
+        Nothing,
+        AfterScalar,
+        AfterCollection,
+    }
+    let mut out = String::from(open);
+    let mut pending = Pending::Nothing;
+    for (i, item) in items.into_iter().enumerate() {
+        match pending {
+            Pending::Nothing if i > 0 => out.push_str(", "),
+            Pending::Nothing => {}
+            Pending::AfterScalar => {
+                out.push('\n');
+                out.push_str(continuation);
+            }
+            Pending::AfterCollection => out.push_str("\n, "),
+        }
+        out.push_str(&item.text);
+        pending = Pending::Nothing;
+        if let Some(comment) = item.comment {
+            let mut lines = comment.split('\n');
+            out.push_str(if item.container { " " } else { ", " });
+            out.push_str(lines.next().unwrap_or_default());
+            for line in lines {
+                out.push('\n');
+                if !line.is_empty() {
+                    out.push_str(continuation);
+                    out.push_str(line);
+                }
+            }
+            pending = if item.container {
+                Pending::AfterCollection
+            } else {
+                Pending::AfterScalar
+            };
+        }
+    }
+    if pending != Pending::Nothing {
+        out.push('\n');
+        if close == ']' {
+            out.push_str(owner);
+        }
+    }
+    out.push(close);
+    out
 }
 
 /// The `!!seq`/`!!map` tag a container carries under `style = "tagged"` (#4066), or
@@ -9008,17 +9134,15 @@ mod tests {
         );
     }
 
-    /// `in_flow: true` is never reached through any CLI-observable path
-    /// today (`output_value`'s only call site always starts at `false`, and
-    /// nothing downstream re-enters flow style) - `can_use_m2_streaming`'s
-    /// doc comment notes there's no `--flow`-style output flag yet. Call the
-    /// private helper directly, mirroring the NaN/Infinity test above, to
-    /// pin the flow-style Array/Object arms' comment threading (#710):
-    /// `comments.at_index`/`comments.field` must recurse correctly even
-    /// though flow style never appends a trailing comment of its own (see
-    /// `emit_yaml_value`'s own doc comment for why).
+    /// Pins the flow-style Array/Object arms' comment threading (#710):
+    /// `comments.at_index`/`comments.field` must recurse correctly. Since #2708
+    /// a flow collection places an element's line comment the way go-yaml
+    /// does -- after a comma for a scalar, after the closing bracket for a
+    /// collection -- instead of dropping it; the expectation below is what
+    /// yq v4.53.3 prints for the same write (`[{k: 1}]` with `.[0].k` and
+    /// `.[0]` commented).
     #[test]
-    fn test_emit_yaml_value_flow_style_threads_comments_without_appending_them() {
+    fn test_emit_yaml_value_flow_style_places_element_comments() {
         let config = OutputConfig {
             output_format: OutputFormat::Yaml,
             compact: true,
@@ -9028,7 +9152,7 @@ mod tests {
             ascii_output: false,
             sort_keys: false,
             no_doc: false,
-            indent_str: String::new(),
+            indent_str: "  ".to_string(),
             use_color: false,
             json_sourced_floats: false,
         };
@@ -9054,11 +9178,9 @@ mod tests {
             )],
         );
 
-        // Flow style renders compactly and drops every trailing comment,
-        // whether on the nested object or its field - unlike block style.
         assert_eq!(
             emit_yaml_value(&value, &comments, &config, "", true),
-            "[{k: 1}]"
+            "[{k: 1, # k trailing\n} # obj trailing\n]"
         );
     }
 

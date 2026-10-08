@@ -4258,13 +4258,22 @@ ruled out), even though real yq supports every one of them:
   write pass resolves stages against the document each one sees and can't see the input
   such a nested write would run against; real yq handles all of them.
 
-Two rendering divergences, both readable back and both pinned:
+A line comment on an element of a flow sequence or mapping (`.a[-1] line_comment = "y"` on
+`a: [1, 2]`) is written the way go-yaml writes it, since
+[#2708](https://github.com/rust-works/succinctly/issues/2708): `a: [1, 2, # y` / `]`, a comma
+first for a scalar, the comment after the closing bracket for a nested collection, `]` at the
+enclosing indent and `}` at column 0, each flow level continuing at go-yaml's
+`indent = width * ((indent + width) / width)` (one more step in, rounded to a multiple of the
+width, so `- [` under `-I3` continues at 3, not 5). Before it the collection fell back to block
+form, and a comment below the container's direct children was dropped without a word. Checked
+against yq v4.53.3 on ~1,000 random flow collections (mappings and sequences, three levels deep,
+under a root, a mapping, a nested mapping and a sequence item, `-I1`/`3`/`4`/`6`, multi-line
+comments). One related gap stays: the cursor-streaming identity route (`yq .` with no write)
+still prints `2 # child` / `  ]` for the `[1, 2 # child\n]` source where yq prints
+`[1, 2, # child` / `]`; the DOM route (any write, `-P`, `--arg`) matches.
 
-- **`.a[-1] line_comment = "y"` on a flow sequence** `a: [1, 2]` prints the block form
-  `a:\n  - 1\n  - 2 # y`; real yq keeps the flow sequence and emits `a: [1, 2, # y\n]`
-  (a comment after a trailing comma inside the brackets). succinctly's flow emitter has
-  no position for an element's own comment, so the sequence falls back to block form
-  exactly as an *existing* element comment already does (`is_flow_safe`).
+One rendering divergence, readable back and pinned:
+
 - **`style = "double"`/`"single"` on a non-string scalar** rewrites the value into the
   quoted string (`a: 1` becomes `a: "1"`, `a: null` becomes `a: 'null'`), which is what
   real yq's output amounts to — the result reads back as a string in both tools, and a
