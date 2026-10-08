@@ -10900,7 +10900,7 @@ pub(crate) fn eval_owned_reindex_free<S: EvalSemantics>(
             let mut result = input.clone();
             owned_assign_step::<S>(expr, &mut result).map(|written| written.map(|()| result))
         }
-        Expr::Alternative(..) if is_owned_assign(expr) => {
+        Expr::Alternative(..) | Expr::As { .. } if is_owned_assign(expr) => {
             let mut result = input.clone();
             owned_assign_step::<S>(expr, &mut result).map(|written| written.map(|()| result))
         }
@@ -10945,13 +10945,15 @@ fn owned_step_shape(expr: &Expr) -> bool {
 
 /// Whether `expr` is one of the four value-position assignment operators
 /// [`owned_assign_step`] may answer (#3138), or such an assignment under an
-/// outer `//` (#3944).
+/// outer `//` (#3944) or an `as` bind (#3978), at any nesting.
 fn is_owned_assign(expr: &Expr) -> bool {
     match expr {
         // #3944: `=` binds tighter than `//`, so `.[$k] = $v // 0` is
         // `(.[$k] = $v) // 0` -- an assignment whose result is a container,
         // never `null`/`false`, so the right side is never read.
-        Expr::Alternative(left, _) => is_plain_owned_assign(unwrap_paren(left)),
+        Expr::Alternative(left, _) => is_owned_assign(unwrap_paren(left)),
+        // #3978: `$r.name as $n | .[$n] = $r.score`.
+        Expr::As { body, .. } => is_owned_assign(unwrap_paren(body)),
         _ => is_plain_owned_assign(expr),
     }
 }
@@ -10983,6 +10985,13 @@ fn owned_assign_shape(expr: &Expr) -> bool {
     }
     match expr {
         Expr::Alternative(left, _) => owned_assign_shape(unwrap_paren(left)),
+        // The body still holds the bound `$n` as a free variable here, which
+        // `closed_expr_shape` rejects, so only the necessary conditions of
+        // [`owned_assign_step`]'s `As` arm are asked: a closed source and a
+        // body that is itself an assignment.
+        Expr::As { expr, body, .. } => {
+            closed_expr_shape(expr) && is_owned_assign(unwrap_paren(body))
+        }
         Expr::Assign { path, value }
         | Expr::CompoundAssign { path, value, .. }
         | Expr::AlternativeAssign { path, value } => path_shape(path) && closed_expr_shape(value),
@@ -10997,7 +11006,7 @@ fn owned_assign_shape(expr: &Expr) -> bool {
                     other => closed_expr_shape(other),
                 }
         }
-        _ => false, // patchcov: coverage tolerate-line reason="unreachable: owned_assign_shape's only caller (owned_step_shape) gates the call on is_owned_assign(expr), which recognizes exactly Assign/Update/CompoundAssign/AlternativeAssign and an `Alternative` around one -- the same variants this match already has explicit arms for, so `expr` can never be anything else here (#3138, #3944)"
+        _ => false, // patchcov: coverage tolerate-line reason="unreachable: owned_assign_shape's only caller (owned_step_shape) gates the call on is_owned_assign(expr), which recognizes exactly Assign/Update/CompoundAssign/AlternativeAssign and an `Alternative` or `As` around one -- the same variants this match already has explicit arms for, so `expr` can never be anything else here (#3138, #3944, #3978)"
     }
 }
 
@@ -11263,11 +11272,28 @@ fn owned_assign_step<S: EvalSemantics>(
         // not swallow either.
         Expr::Alternative(left, _) => {
             let left = unwrap_paren(left);
-            return if S::TAG == EvalTag::Jq && is_plain_owned_assign(left) {
+            return if S::TAG == EvalTag::Jq && is_owned_assign(left) {
                 owned_assign_step::<S>(left, state)
             } else {
                 None
             };
+        }
+        // #3978: `SOURCE as $n | ASSIGN` with a closed SOURCE is one value bound
+        // once, read by value, so substituting it into the body is the bind --
+        // the way `substitute_fold_step` binds the loop variable. A source that
+        // reads `.`, raises, or yields other than once is not closed, and the
+        // evaluator keeps it. jq mode only, like the rest of the step.
+        Expr::As {
+            expr: source,
+            var,
+            body,
+        } => {
+            let body = unwrap_paren(body);
+            if S::TAG != EvalTag::Jq || !is_owned_assign(body) {
+                return None;
+            }
+            let bound = closed_expr_to_owned::<S>(source)?;
+            return owned_assign_step::<S>(&substitute_var(body, var, &bound), state);
         }
         Expr::Assign { path, value } => (
             path,
@@ -11299,7 +11325,7 @@ fn owned_assign_step<S: EvalSemantics>(
             path,
             OwnedAssignRhs::Alternative(closed_expr_to_owned::<S>(value)?),
         ),
-        _ => return None, // patchcov: coverage tolerate-line reason="unreachable: both call sites (try_eval_owned_step, gated on is_owned_assign; eval_owned_reindex_free's own Assign|Update|CompoundAssign|AlternativeAssign arm) only ever hand this function one of the same four variants, or an `Alternative` around one, all of which this match already covers explicitly (#3138, #3944)"
+        _ => return None, // patchcov: coverage tolerate-line reason="unreachable: both call sites (try_eval_owned_step, gated on is_owned_assign; eval_owned_reindex_free's own Assign|Update|CompoundAssign|AlternativeAssign arm) only ever hand this function one of the same four variants, or an `Alternative` or `As` around one, all of which this match already covers explicitly (#3138, #3944, #3978)"
     };
 
     // The keys the write names, each settled against the container it lands
@@ -77463,6 +77489,165 @@ mod tests {
         }
     }
 
+    /// #3978: an assignment under `SOURCE as $n | ...` whose SOURCE is closed
+    /// is answered in place, with `$n` substituted. Each row equals what the
+    /// reindex bridge answers; a SOURCE that reads `.`, yields twice or raises
+    /// stays on the evaluator's route, untouched.
+    #[test]
+    fn owned_assign_under_an_as_bind_3978() {
+        let record = OwnedValue::object_from([
+            ("name".to_string(), OwnedValue::string("User7")),
+            (
+                "score".to_string(),
+                OwnedValue::from_number_literal::<JqSemantics>("70.5"),
+            ),
+            ("tag".to_string(), OwnedValue::Null),
+        ]);
+        let subst = |src: &str| substitute_vars(&parse(src).unwrap(), [("r", &record)]);
+        let object = OwnedValue::object_from([
+            ("x".to_string(), OwnedValue::string("k")),
+            (
+                "User7".to_string(),
+                OwnedValue::from_number_literal::<JqSemantics>("1"),
+            ),
+        ]);
+        let handled = [
+            "$r.name as $n | .[$n] = $r.score",
+            "$r as $s | .[$s.name] = $s.score",
+            "$r.name as $n | $r.score as $v | .[$n] = $v",
+            // The inner bind shadows the outer.
+            "$r.name as $n | \"z\" as $n | .[$n] = 1",
+            "$r.name as $n | (.[$n] = $r.score) // 0",
+            "$r.name as $n | .[$n] += ($r.score | floor)",
+            "$r.tag as $n | .[$n // \"d\"] = $r.score",
+            "$r.name as $n | .a[$n] |= $r.score",
+            "($r.name) as $n | (.[$n] //= 5)",
+        ];
+        for src in handled {
+            for input in [object.clone(), OwnedValue::Null] {
+                let expr = subst(src);
+                let bridge = normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                    &expr, &input, false,
+                ));
+                let direct = eval_owned_reindex_free::<JqSemantics>(&expr, &input)
+                    .unwrap_or_else(|| panic!("declined: {src}")); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if eval_owned_reindex_free declined a shape this loop's own `handled` table asserts is always answered (#3978)"
+                let direct = match direct {
+                    Ok(value) => (vec![value], "ok".to_string()),
+                    Err(error) => (Vec::new(), format!("error:{}", error.message)),
+                };
+                assert_eq!(format!("{direct:?}"), format!("{bridge:?}"), "{src}");
+                let OwnedStep::Handled(Ok(consumed)) =
+                    try_eval_owned_step::<JqSemantics>(&expr, input.clone())
+                else {
+                    panic!("not handled: {src}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_eval_owned_step declined or errored on a shape this loop's own `handled` table asserts is always answered Ok (#3978)"
+                };
+                assert_eq!(
+                    format!("{:?}", (vec![consumed], "ok")),
+                    format!("{bridge:?}"),
+                    "{src}"
+                );
+            }
+        }
+
+        let declined = [
+            ".x as $n | .[$n] = $r.score",        // SOURCE reads `.`
+            "($r.name, \"w\") as $n | .[$n] = 1", // two outputs
+            "$r.name.x as $n | .[$n] = 1",        // SOURCE raises
+            "$r.name as $n | .[$n] = .x",         // body reads `.`
+            "$r.name as $n | .[$n] = (1, 2)",     // two outputs
+            "$r.name as $n | .[$n] | length",     // body is no assignment
+            "$r.name as $n | .[$n + 1] = 1",      // key raises
+        ];
+        for src in declined {
+            let expr = subst(src);
+            assert!(
+                eval_owned_reindex_free::<JqSemantics>(&expr, &object).is_none(),
+                "{src}"
+            );
+            let OwnedStep::Declined(returned) =
+                try_eval_owned_step::<JqSemantics>(&expr, object.clone())
+            else {
+                panic!("must decline: {src}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_eval_owned_step handled a shape this loop's own `declined` table asserts is always declined (#3978)"
+            };
+            assert_eq!(format!("{returned:?}"), format!("{object:?}"), "{src}");
+        }
+
+        // yq mode takes none of it.
+        assert!(matches!(
+            try_eval_owned_step::<YqSemantics>(&subst("$r.name as $n | .[$n] = 1"), object),
+            OwnedStep::Declined(_)
+        ));
+    }
+
+    /// #3978: the fold loops end to end over an `as`-bound key, every
+    /// expected output captured from jq 1.7.1.
+    #[test]
+    fn owned_assign_as_bind_fold_rows_match_jq_3978() {
+        let records =
+            br#"[{"name":"a","score":1.10},{"name":"b","score":2},{"name":"a","score":3.7}]"#;
+        for (update, expected) in [
+            (
+                r"$r.name as $n | .[$n] = $r.score",
+                r#"{"x":"k","a":3.7,"b":2}"#,
+            ),
+            (
+                r"$r as $s | .[$s.name] = $s.score",
+                r#"{"x":"k","a":3.7,"b":2}"#,
+            ),
+            (
+                r"$r.name as $n | $r.score as $v | .[$n] = $v",
+                r#"{"x":"k","a":3.7,"b":2}"#,
+            ),
+            (
+                r#"$r.name as $n | "z" as $n | .[$n] = 1"#,
+                r#"{"x":"k","z":1}"#,
+            ),
+            (
+                r"$r.name as $n | (.[$n] = $r.score) // 0",
+                r#"{"x":"k","a":3.7,"b":2}"#,
+            ),
+            (
+                r"$r.name as $n | .[$n] += ($r.score | floor)",
+                r#"{"x":"k","a":4,"b":2}"#,
+            ),
+            (r".x as $n | .[$n] = $r.score", r#"{"x":"k","k":3.7}"#),
+            (r#"($r.name, "w") as $n | .[$n] = 1"#, r#"{"x":"k","w":1}"#),
+            (
+                r#"$r.nope as $n | .[$n // "d"] = $r.score"#,
+                r#"{"x":"k","d":3.7}"#,
+            ),
+        ] {
+            let filter = format!(r#"reduce .[] as $r ({{"x":"k"}}; {update})"#);
+            assert_eq!(outputs(records, &filter), [expected], "{filter}");
+        }
+        // The other routes a step takes: under an `as` binding (the #2889 embed
+        // table is live), `?`, `foreach`, `until` and `while`.
+        for (filter, expected) in [
+            (
+                r"[.[] | {name, score}] as $d | reduce $d[] as $r ({}; $r.name as $n | .[$n] = $r.score)",
+                r#"{"a":3.7,"b":2}"#,
+            ),
+            (
+                r"reduce .[] as $r ({}; ($r.name as $n | .[$n] = $r.score)?)",
+                r#"{"a":3.7,"b":2}"#,
+            ),
+            (
+                r"[foreach .[] as $r ({}; $r.name as $n | .[$n] = $r.score; length)]",
+                "[1,2,2]",
+            ),
+            (
+                r#"{"a":0} | until(.a >= 3; 1 as $k | .a += $k)"#,
+                r#"{"a":3}"#,
+            ),
+            (
+                r#"{"a":0} | [while(.a < 3; 1 as $k | .a += $k)] | length"#,
+                "3",
+            ),
+        ] {
+            assert_eq!(outputs(records, filter), [expected], "{filter}");
+        }
+    }
+
     /// #3241: a fold step takes the owned assignment while the #2889 embed
     /// table is live -- a fold running inside `. as $d | ...` -- where it used
     /// to take the reindex bridge on every step and stay O(n²).
@@ -87195,6 +87380,15 @@ mod tests {
             ".[0] = 1",
             "(.a = 1)",
             "((.a |= . + 1))",
+            // #3978: under an `as` bind, with a closed and an unclosed source.
+            r#""a" as $n | .[$n] = 1"#,
+            "1 as $n | .a = $n",
+            "(1 as $n | .a = $n)",
+            "1 as $n | 2 as $m | .a = $n + $m",
+            r#""a" as $n | (.[$n] = 1) // 0"#,
+            ".b as $n | .a = $n",
+            "(1, 2) as $n | .a = $n",
+            "1 as $n | .a = .b",
             // And the ones it declines: a bare stage tries `owned_assign_step`
             // where `Pipe([stage])` is stopped by `owned_step_shape`.
             ".a = .b",
@@ -130752,6 +130946,17 @@ mod share_audit_2999 {
         let json = format!("[{}]", body.join(",")).into_bytes();
         assert_forced(&json, "reduce .[] as $r ({}; .[$r.name] = $r.score)", &[]);
         assert_forced(&json, "reduce .[] as $r ({}; .x[$r.name] += $r.score)", &[]);
+        // #3978: the same assignment under an `as` bind copies nothing either.
+        assert_forced(
+            &json,
+            "reduce .[] as $r ({}; $r.name as $n | .[$n] = $r.score)",
+            &[],
+        );
+        assert_forced(
+            &json,
+            "reduce .[] as $r ({}; $r as $s | .[$s.name] = $s.score)",
+            &[],
+        );
     }
 
     /// #3439: `range/3`'s generic loop appends to its accumulator in place
