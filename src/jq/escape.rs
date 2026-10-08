@@ -591,7 +591,7 @@ mod tests {
         };
         let pieces = [
             "", "a", "→", "…", "\u{2028}", "\u{2029}", "\u{2027}", "\u{202A}", "é", "😁", "\"",
-            "\n",
+            "\n", "\\",
         ];
         for a in pieces {
             for b in pieces {
