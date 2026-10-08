@@ -10945,7 +10945,7 @@ fn owned_step_shape(expr: &Expr) -> bool {
 
 /// Whether `expr` is one of the four value-position assignment operators
 /// [`owned_assign_step`] may answer (#3138), or such an assignment under an
-/// outer `//` (#3944).
+/// outer `//` (#3944) or an `as` bind (#3978), at any nesting.
 fn is_owned_assign(expr: &Expr) -> bool {
     match expr {
         // #3944: `=` binds tighter than `//`, so `.[$k] = $v // 0` is
@@ -10985,8 +10985,12 @@ fn owned_assign_shape(expr: &Expr) -> bool {
     }
     match expr {
         Expr::Alternative(left, _) => owned_assign_shape(unwrap_paren(left)),
+        // The body still holds the bound `$n` as a free variable here, which
+        // `closed_expr_shape` rejects, so only the necessary conditions of
+        // [`owned_assign_step`]'s `As` arm are asked: a closed source and a
+        // body that is itself an assignment.
         Expr::As { expr, body, .. } => {
-            closed_expr_shape(expr) && owned_assign_shape(unwrap_paren(body))
+            closed_expr_shape(expr) && is_owned_assign(unwrap_paren(body))
         }
         Expr::Assign { path, value }
         | Expr::CompoundAssign { path, value, .. }
@@ -11002,7 +11006,7 @@ fn owned_assign_shape(expr: &Expr) -> bool {
                     other => closed_expr_shape(other),
                 }
         }
-        _ => false, // patchcov: coverage tolerate-line reason="unreachable: owned_assign_shape's only caller (owned_step_shape) gates the call on is_owned_assign(expr), which recognizes exactly Assign/Update/CompoundAssign/AlternativeAssign and an `Alternative` around one -- the same variants this match already has explicit arms for, so `expr` can never be anything else here (#3138, #3944)"
+        _ => false, // patchcov: coverage tolerate-line reason="unreachable: owned_assign_shape's only caller (owned_step_shape) gates the call on is_owned_assign(expr), which recognizes exactly Assign/Update/CompoundAssign/AlternativeAssign and an `Alternative` or `As` around one -- the same variants this match already has explicit arms for, so `expr` can never be anything else here (#3138, #3944, #3978)"
     }
 }
 
@@ -11321,7 +11325,7 @@ fn owned_assign_step<S: EvalSemantics>(
             path,
             OwnedAssignRhs::Alternative(closed_expr_to_owned::<S>(value)?),
         ),
-        _ => return None, // patchcov: coverage tolerate-line reason="unreachable: both call sites (try_eval_owned_step, gated on is_owned_assign; eval_owned_reindex_free's own Assign|Update|CompoundAssign|AlternativeAssign arm) only ever hand this function one of the same four variants, or an `Alternative` around one, all of which this match already covers explicitly (#3138, #3944)"
+        _ => return None, // patchcov: coverage tolerate-line reason="unreachable: both call sites (try_eval_owned_step, gated on is_owned_assign; eval_owned_reindex_free's own Assign|Update|CompoundAssign|AlternativeAssign arm) only ever hand this function one of the same four variants, or an `Alternative` or `As` around one, all of which this match already covers explicitly (#3138, #3944, #3978)"
     };
 
     // The keys the write names, each settled against the container it lands
@@ -77616,6 +77620,26 @@ mod tests {
             let filter = format!(r#"reduce .[] as $r ({{"x":"k"}}; {update})"#);
             assert_eq!(outputs(records, &filter), [expected], "{filter}");
         }
+        // The other routes a step takes: under an `as` binding (the #2889 embed
+        // table is live), `?`, `foreach`, `until` and `while`.
+        for (filter, expected) in [
+            (
+                r"[.[] | {name, score}] as $d | reduce $d[] as $r ({}; $r.name as $n | .[$n] = $r.score)",
+                r#"{"a":3.7,"b":2}"#,
+            ),
+            (
+                r"reduce .[] as $r ({}; ($r.name as $n | .[$n] = $r.score)?)",
+                r#"{"a":3.7,"b":2}"#,
+            ),
+            (
+                r"[foreach .[] as $r ({}; $r.name as $n | .[$n] = $r.score; length)]",
+                "[1,2,2]",
+            ),
+            (r"{a:0} | until(.a >= 3; 1 as $k | .a += $k)", r#"{"a":3}"#),
+            (r"{a:0} | [while(.a < 3; 1 as $k | .a += $k)] | length", "3"),
+        ] {
+            assert_eq!(outputs(records, filter), [expected], "{filter}");
+        }
     }
 
     /// #3241: a fold step takes the owned assignment while the #2889 embed
@@ -87350,6 +87374,15 @@ mod tests {
             ".[0] = 1",
             "(.a = 1)",
             "((.a |= . + 1))",
+            // #3978: under an `as` bind, with a closed and an unclosed source.
+            r#""a" as $n | .[$n] = 1"#,
+            "1 as $n | .a = $n",
+            "(1 as $n | .a = $n)",
+            "1 as $n | 2 as $m | .a = $n + $m",
+            r#""a" as $n | (.[$n] = 1) // 0"#,
+            ".b as $n | .a = $n",
+            "(1, 2) as $n | .a = $n",
+            "1 as $n | .a = .b",
             // And the ones it declines: a bare stage tries `owned_assign_step`
             // where `Pipe([stage])` is stopped by `owned_step_shape`.
             ".a = .b",
