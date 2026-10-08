@@ -46493,11 +46493,15 @@ struct PatternBinding {
 ///   register the branch moved.
 struct PathPatternMode<'f> {
     frame: &'f Frame,
-    /// Set when a step's `path_intact` refusal is of a step that could have
-    /// *succeeded* on the value it refused ([`NavKind::would_succeed_on`]) -- a
-    /// fold's [`settle_fold_alternative`] reads it to tell a refusal that is the
-    /// walk's guess from one jq raises whatever its register is (#3840).
-    refused_step_could_succeed: Option<&'f core::cell::Cell<bool>>,
+    /// Set when a step's `path_intact` refusal is of a step with a [`NavKind`]:
+    /// `Some(true)` if it could have *succeeded* on the value it refused
+    /// ([`NavKind::would_succeed_on`]), `Some(false)` if it never could. `None`
+    /// for a key with no kind, or before any refusal. A walk ends at its first
+    /// refusal (`step(..)?`) and a fold makes the cell afresh for each alternative,
+    /// so a value read after a refusal is that refusal's. A fold's
+    /// [`settle_fold_alternative`] reads it to tell a refusal that is the walk's
+    /// guess from one jq raises whatever its register is (#3840, #3998).
+    refused_step_could_succeed: Option<&'f core::cell::Cell<Option<bool>>>,
 }
 
 impl PatternMode for PathPatternMode<'_> {
@@ -46528,7 +46532,7 @@ impl PatternMode for PathPatternMode<'_> {
                 PatternKey::Computed(value) => (*value).clone(),
             };
             if let Some(probe) = self.refused_step_could_succeed {
-                probe.set(NavKind::of(&element).is_some_and(|kind| kind.would_succeed_on(input)));
+                probe.set(NavKind::of(&element).map(|kind| kind.would_succeed_on(input)));
             }
             return Err(EvalError::invalid_path_expression_near_access(
                 &element, input,
@@ -46596,14 +46600,15 @@ fn each_pattern_walk<S: EvalSemantics>(
 }
 
 /// [`each_pattern_walk`], noting in `refused_step_could_succeed` whether a
-/// refusal is of a step that could have succeeded on the value it refused (#3840).
+/// refusal is of a step that could have succeeded on the value it refused (#3840,
+/// #3998).
 fn each_pattern_walk_probed<S: EvalSemantics>(
     pattern: &Pattern,
     input: &OwnedValue,
     seed: PatternRegister,
     frame: &Frame,
     invert: bool,
-    refused_step_could_succeed: Option<&core::cell::Cell<bool>>,
+    refused_step_could_succeed: Option<&core::cell::Cell<Option<bool>>>,
     sink: &mut dyn FnMut(PatternRegister, &[PatternBinding]) -> Demand,
 ) -> Flow {
     let mode = PathPatternMode {
@@ -47839,7 +47844,7 @@ fn each_fold_bind<S: EvalSemantics>(
     frame: &Frame,
     alternatives: Option<&[String]>,
     source_may_alias: bool,
-    refused_step_could_succeed: &core::cell::Cell<bool>,
+    refused_step_could_succeed: &core::cell::Cell<Option<bool>>,
     sink: &mut dyn FnMut(Option<PatternRegister>, &FoldBind<'_>) -> Demand,
 ) -> Flow {
     match pattern {
@@ -48577,7 +48582,7 @@ fn settle_fold_alternative<S: EvalSemantics>(
     pattern: &Pattern,
     elem: &FoldSourceValue,
     reg: &FoldRegister,
-    refused_step_could_succeed: bool,
+    refused_step_could_succeed: Option<bool>,
     aborted: &StashedEscape,
 ) -> FoldStepOutcome {
     if let Some(outcome) = outcome {
@@ -48591,9 +48596,15 @@ fn settle_fold_alternative<S: EvalSemantics>(
         Flow::Escaped(control) => {
             // Asked only of a refusal that could retry: the by-value walk inside
             // [`fold_walk_refusal_is_guess`] is not free (#3743), and
-            // [`walk_escape_retries`] reads `guessed` for nothing else.
+            // [`walk_escape_retries`] reads `guessed` for nothing else. #3998: a
+            // refused step that could never succeed on its input is a value error
+            // jq raises whatever its register is, and `?//` retries it, so the
+            // refusal is jq's own verdict -- exact, whether or not the key is
+            // computed (which [`pattern_walk_fails_by_value`] does not judge, as
+            // running it again would repeat its effects).
             let guessed = !is_last
                 && matches!(&control, Control::Error(e) if is_resolver_refusal(e))
+                && refused_step_could_succeed != Some(false)
                 && fold_walk_refusal_is_guess::<S>(pattern, elem, reg);
             if walk_escape_retries(&control, is_last, guessed) {
                 FoldStepOutcome::Retry
@@ -48603,9 +48614,10 @@ fn settle_fold_alternative<S: EvalSemantics>(
                 // (ADR-0018 rule 4): jq may have carried on with this alternative, so a
                 // `try` around the fold must not run its handler for it. A step that
                 // could never succeed is a value error jq raises wherever its register
-                // is, and stays catchable.
+                // is, and stays catchable (on the last alternative; before it, #3998,
+                // it retries).
                 let control = match control {
-                    Control::Error(e) if guessed && refused_step_could_succeed => {
+                    Control::Error(e) if guessed && refused_step_could_succeed == Some(true) => {
                         Control::Error(e.into_guessed_path_refusal())
                     }
                     other => other,
@@ -49372,7 +49384,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                 // step's own verdict, richer than the `Demand` a sink can
                 // answer, is recorded out-of-band in `outcome`.
                 let mut outcome: Option<FoldStepOutcome> = None;
-                let refused_step_could_succeed = core::cell::Cell::new(false);
+                let refused_step_could_succeed = core::cell::Cell::new(None);
                 let walk = each_fold_bind::<S>(
                     pattern,
                     &elem,
@@ -49854,7 +49866,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                 // `["b","c"]`, `["b","d"]`. The step's verdict is recorded in
                 // `outcome`, as `resolve_reduce`'s is ([`FoldStepOutcome`]).
                 let mut outcome: Option<FoldStepOutcome> = None;
-                let refused_step_could_succeed = core::cell::Cell::new(false);
+                let refused_step_could_succeed = core::cell::Cell::new(None);
                 let walk = each_fold_bind::<S>(
                     pattern,
                     &elem,

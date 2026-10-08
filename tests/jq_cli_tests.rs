@@ -63984,6 +63984,80 @@ fn test_fold_guessed_pattern_refusal_is_not_catchable_3840() -> Result<()> {
     ])
 }
 
+/// #3998: a fold's `?//` pattern step that can never succeed on the element (a computed
+/// string key off an array) is a value error jq raises whatever its register is, and
+/// `?//` retries it, so the walk's refusal is jq's own verdict, not a guess. It used to
+/// be treated as one anyway: the key is computed, which #3743's by-value rule does not
+/// judge, so the refusal never retried and stayed catchable, and a `try` around the
+/// fold ran its handler where jq runs the next alternative. `del(try (.[0] and (reduce
+/// . as {("a"):$a} ?// $a (0; .))))` on `[1]` is jq's error at exit 5 (the `and`'s
+/// `true` is not the register's `1`); the silent `[1]` at exit 0 lost the write's
+/// refusal. `foreach` and a third alternative take the same route. The contrast rows
+/// are unchanged: a chain whose every alternative fails still reaches the catch, and a
+/// step that could succeed (`.a`, `[$a]`) stays the loud guess of #3840. A recorded
+/// divergence in the safe direction: on `[true]` jq answers `[]` (its `and` result
+/// `true` is the register's own boolean), and the retried alternative refuses here, as
+/// the un-wrapped fold already did. Every jq side captured from jq 1.7.1.
+#[test]
+fn test_fold_pattern_step_that_never_succeeds_retries_3998() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r"[1]",
+            r#"del(try (.[0] and (reduce . as {("a"):$a} ?// $a (0; .))))"#,
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+        (
+            r"[[]]",
+            r#"del(try (.[0] and (reduce . as {("a"):$a} ?// $a (0; .))))"#,
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+        (
+            r"[1]",
+            r#"del(try (.[0] and (foreach . as {("a"):$a} ?// $a (0; .; .))))"#,
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+        // The retry goes past the second alternative to the third.
+        (
+            r"[1]",
+            r#"del(try (.[0] and (reduce . as {("a"):$a} ?// {("b"):$a} ?// $a (0; .))))"#,
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+        // Un-wrapped, the retry now reaches the same refusal jq's own `and` raises.
+        (
+            r"[1]",
+            r#"path(.[0] and (reduce . as {("a"):$a} ?// $a (0; .)))"#,
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+        // Contrast: every alternative fails, so the catch is jq's too.
+        (
+            r"[1]",
+            r#"del(try (.[0] and (reduce . as {("a"):$a} ?// {("b"):$a} (0; .))))"#,
+            "[1]\n",
+            "",
+            0,
+        ),
+        // Recorded divergence: jq finds `true` identical to the register's boolean and
+        // answers `[]`; the retried alternative refuses, as the un-wrapped fold did.
+        (
+            r"[true]",
+            r#"del(try (.[0] and (reduce . as {("a"):$a} ?// $a (0; .))))"#,
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+    ])
+}
+
 /// #3744: a destructuring of the register itself (`.`) as a `foreach` SOURCE moves
 /// jq's path register through the pattern's tracked index steps, so the body's
 /// EXTRACT is checked against a register it is no longer at: `path(foreach (. as

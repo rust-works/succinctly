@@ -357,6 +357,11 @@ OPERANDS = [
     "(reduce .a as [$a] ?// $a (0; .))",
     "(reduce .[]? as [$a] ?// $a (0; .))",
     "(reduce . as {(\"a\"):$a} ?// $a (0; .))",
+    # (#3998) a computed key whose step can never succeed on the element (a string off an
+    # array): jq raises it whatever its register is and `?//` retries, so the walk's
+    # refusal is jq's own verdict, for `foreach` as for `reduce`.
+    "(foreach . as {(\"a\"):$a} ?// $a (0; .; .))",
+    "(reduce . as {(\"a\"):$a} ?// {(\"b\"):$a} ?// $a (0; .))",
     "(reduce . as [$a] (0; .))",
     # (#3744) a destructuring of the register itself as a `foreach` SOURCE: the pattern's
     # tracked index steps move jq's register onto the matched member, so an EXTRACT that
