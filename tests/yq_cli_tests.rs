@@ -49782,19 +49782,17 @@ mod yq_text_equality_2785 {
         ])
     }
 
-    /// Only `==`/`!=` take the text rule; the rest of the equality family
-    /// keeps its typed answer. The first three rows differ from real yq
-    /// (`[1]`, `[[1,"1"]]`, `1`) and are recorded divergences in
-    /// `docs/compliance/yq/limitations.md` (#2799's dedup slice), pinned here
-    /// so a change to any of them is a deliberate one; the rest already
-    /// agree with yq and guard that the text rule stops at the scalar
-    /// boundary. Container `==` is the next test's (#2799).
+    /// `==`/`!=` take the text rule and the dedup builtins key on the same text (#2799); the
+    /// rest of the equality family keeps its typed answer. Every row agrees with yq: the first
+    /// three are the dedup builtins' text key, the rest guard that the text rule stops at the
+    /// scalar boundary. Container `==` and the full dedup tables are the next tests' (#2799).
     #[test]
     fn the_rest_of_the_equality_family_is_unchanged_2785() -> Result<()> {
         check(&[
-            ("[.a, .b] | unique", "[1,\"1\"]"),
-            ("[.a, .b] | group_by(.)", "[[1],[\"1\"]]"),
-            ("[.a, .b] | group_by(.) | length", "2"),
+            // `unique`/`group_by` key on the text since #2799 (part 2): `1` and `"1"` collapse.
+            ("[.a, .b] | unique", "[1]"),
+            ("[.a, .b] | group_by(.)", "[[1,\"1\"]]"),
+            ("[.a, .b] | group_by(.) | length", "1"),
             // Agree with yq already.
             ("{\"x\": .a} == {\"x\": .b}", "false"),
             ("[.a] == [.b]", "false"),
@@ -49846,6 +49844,147 @@ mod yq_text_equality_2785 {
             (".l[0] == .a", "true"),
         ] {
             let (out, code) = run_yq_stdin(filter, doc, &["-o=json", "-I=0"])?;
+            assert_eq!((out.trim(), code), (want, 0), "`{filter}`");
+        }
+        Ok(())
+    }
+
+    /// #2799 (part 2): real yq's `unique`/`unique_by`/`group_by` are an ordered map keyed on the
+    /// element's (or the key filter's first output's) **text**, not a sort followed by a dedup:
+    /// first-occurrence order, `1` and `"1"` one key, `1.50` and `1.5` two, every container one
+    /// `group_by` group, a container's encoding as the `unique` key. Every expectation was
+    /// captured live from yq v4.53.3 (`-o=json -I0`). The first table runs on literals and a
+    /// scalar document (the bridged route), the second on arrays that stay on the cursor route.
+    #[test]
+    fn dedup_builtins_key_on_text_in_first_occurrence_order_2799() -> Result<()> {
+        let scalars = "a: 1\nb: \"1\"\nc: true\nd: \"true\"\nn: null\ns: \"null\"\nf: 1.0\nh: \"1.0\"\nl: [1]\nl2: [1]\nm: {x: 1}\nm2: {x: 1}\nz: [2]\nnn: .nan\nna: [.nan]\nnb: [.nan]\n";
+        for (filter, want) in [
+            (r"[.a, .b] | unique", r"[1]"),
+            (r"[.a, .b] | unique_by(.)", r"[1]"),
+            (r"[.a, .b] | group_by(.)", r#"[[1,"1"]]"#),
+            (r"[.a, .b] | group_by(.) | length", r"1"),
+            (r"[3,1,2,1] | unique", r"[3,1,2]"),
+            (r"[3,1,2,1] | group_by(.)", r"[[3],[1,1],[2]]"),
+            (r"[3,1,2,1] | unique_by(.)", r"[3,1,2]"),
+            (r#"[1, "1", 1.0] | unique"#, r"[1,1.0]"),
+            (r#"["1.0", 1.0] | unique"#, r#"["1.0"]"#),
+            (
+                r#"[1, true, "true", null, "null", 1.0, "1.0"] | unique"#,
+                r"[1,true,null,1.0]",
+            ),
+            (r#"["abc", "a*"] | unique"#, r#"["abc","a*"]"#),
+            (r#"["a*", "abc"] | unique"#, r#"["a*","abc"]"#),
+            (r#"[1, [1], "1"] | unique"#, r"[1,[1]]"),
+            (r"[[1],[2]] | unique", r"[[1],[2]]"),
+            (r"[[1],[2]] | group_by(.) | length", r"1"),
+            (r"[[2],[1],[2]] | unique", r"[[2],[1]]"),
+            (
+                r#"[{"x":1},{"x":1},{"x":2}] | unique"#,
+                r#"[{"x":1},{"x":2}]"#,
+            ),
+            (r#"[{"x":1},{"x":2}] | group_by(.) | length"#, r"1"),
+            (r"[.l, .l2, .z] | unique", r"[[1],[2]]"),
+            (r"[.l, .l2, .z] | unique | length", r"2"),
+            (r"[.m, .m2] | unique | length", r"1"),
+            (r"[.l, .m] | unique | length", r"2"),
+            (r"[.l, .m] | group_by(.) | length", r"1"),
+            (r"[.n, .s] | unique", r"[null]"),
+            (r"[.n, .s] | group_by(.)", r#"[[null,"null"]]"#),
+            (r"[.c, .d] | unique", r"[true]"),
+            (r"[.f, .a] | unique", r"[1.0,1]"),
+            (r"[.h, .f] | unique", r#"["1.0"]"#),
+            (
+                r#"[{"k":1,"v":"a"},{"k":"1","v":"b"},{"k":2,"v":"c"}] | unique_by(.k)"#,
+                r#"[{"k":1,"v":"a"},{"k":2,"v":"c"}]"#,
+            ),
+            (
+                r#"[{"k":1,"v":"a"},{"k":"1","v":"b"},{"k":2,"v":"c"}] | group_by(.k)"#,
+                r#"[[{"k":1,"v":"a"},{"k":"1","v":"b"}],[{"k":2,"v":"c"}]]"#,
+            ),
+            (
+                r#"[{"k":3},{"k":1},{"k":3}] | unique_by(.k)"#,
+                r#"[{"k":3},{"k":1}]"#,
+            ),
+            (
+                r#"[{"k":3},{"k":1},{"k":3}] | group_by(.k)"#,
+                r#"[[{"k":3},{"k":3}],[{"k":1}]]"#,
+            ),
+            (
+                r#"[{"k":3},{"v":1},{"k":3}] | unique_by(.k)"#,
+                r#"[{"k":3},{"v":1}]"#,
+            ),
+            (
+                r#"[{"k":3},{"v":1},{"k":3}] | group_by(.k)"#,
+                r#"[[{"k":3},{"k":3}],[{"v":1}]]"#,
+            ),
+            (r"[] | unique", r"[]"),
+            (r"[] | group_by(.)", r"[]"),
+            (r"[5] | unique", r"[5]"),
+            (r"[null, null] | unique", r"[null]"),
+            (r"[.nn, .nn] | unique | length", r"1"),
+            (r"[.na, .na] | unique | length", r"1"),
+            (r"[.na, .nb] | unique | length", r"1"),
+            (r"[.na, .l] | unique | length", r"2"),
+            (r"[.nn, .nn] | group_by(.) | length", r"1"),
+            (r#"["b","a","b"] | unique"#, r#"["b","a"]"#),
+            (r#"["b","a","b"] | group_by(.)"#, r#"[["b","b"],["a"]]"#),
+            (r"[true,false,true] | unique", r"[true,false]"),
+            (r"[2,10,1] | unique", r"[2,10,1]"),
+            (r"[2,10,1] | group_by(.)", r"[[2],[10],[1]]"),
+            (r#"[{"a":1,"b":2},{"b":2,"a":1}] | unique | length"#, r"2"),
+            (
+                r#"[{"a":1,"b":2},{"b":2,"a":1}] | group_by(.) | length"#,
+                r"1",
+            ),
+            (
+                r#"[{"a":1,"b":2},{"a":1,"b":3},{"a":1,"b":2}] | unique_by(.a, .b)"#,
+                r#"[{"a":1,"b":2}]"#,
+            ),
+            (
+                r#"[{"a":1,"b":2},{"a":1,"b":3},{"a":1,"b":2}] | group_by(.a, .b)"#,
+                r#"[[{"a":1,"b":2},{"a":1,"b":3},{"a":1,"b":2}]]"#,
+            ),
+            (r#"[{"a":[1]},{"a":[2]}] | group_by(.a) | length"#, r"1"),
+            (r#"["", null, "null", "~"] | unique"#, r#"["",null,"~"]"#),
+            (r#"["", null] | group_by(.)"#, r#"[[""],[null]]"#),
+            (r#"[0, false, "0", "false"] | unique"#, r"[0,false]"),
+            (r#"[1.5, "1.5", 1.50] | unique"#, r"[1.5,1.50]"),
+            (r#"[1e3, 1000, "1e3"] | unique"#, r"[1e3,1000]"),
+            (r#"["a","A","a"] | unique"#, r#"["a","A"]"#),
+            (r"[1,2,3,4] | group_by(. % 2)", r"[[1,3],[2,4]]"),
+            (r"[1,2,3,4] | unique_by(. % 2)", r"[1,2]"),
+        ] {
+            let (out, code) = run_yq_stdin(filter, scalars, &["-o=json", "-I=0"])?;
+            assert_eq!((out.trim(), code), (want, 0), "`{filter}`");
+        }
+        let arrays = "arr: [3, 1, 2, 1, \"1\", 1.0, \"x\", x]\nrecs:\n  - {k: 3, v: a}\n  - {k: \"3\", v: b}\n  - {k: 1, v: c}\n  - {k: 3, v: d}\nnest:\n  - [1, 2]\n  - [1, 2]\n  - [2, 1]\nbools: [true, false, true, \"true\"]\n";
+        for (filter, want) in [
+            (r".arr | unique", r#"[3,1,2,1.0,"x"]"#),
+            (
+                r".arr | group_by(.)",
+                r#"[[3],[1,1,"1"],[2],[1.0],["x","x"]]"#,
+            ),
+            (r".arr | unique_by(.)", r#"[3,1,2,1.0,"x"]"#),
+            (
+                r".recs | unique_by(.k)",
+                r#"[{"k":3,"v":"a"},{"k":1,"v":"c"}]"#,
+            ),
+            (
+                r".recs | group_by(.k)",
+                r#"[[{"k":3,"v":"a"},{"k":"3","v":"b"},{"k":3,"v":"d"}],[{"k":1,"v":"c"}]]"#,
+            ),
+            (r".nest | unique", r"[[1,2],[2,1]]"),
+            (r".nest | group_by(.[0])", r"[[[1,2],[1,2]],[[2,1]]]"),
+            (r".nest | group_by(.)", r"[[[1,2],[1,2],[2,1]]]"),
+            (r".bools | unique", r"[true,false]"),
+            (r".recs | map(.k) | unique", r"[3,1]"),
+            (r".recs | [.[] | .k] | group_by(.)", r#"[[3,"3",3],[1]]"#),
+            (
+                r".recs | unique_by(.v, .k)",
+                r#"[{"k":3,"v":"a"},{"k":"3","v":"b"},{"k":1,"v":"c"},{"k":3,"v":"d"}]"#,
+            ),
+        ] {
+            let (out, code) = run_yq_stdin(filter, arrays, &["-o=json", "-I=0"])?;
             assert_eq!((out.trim(), code), (want, 0), "`{filter}`");
         }
         Ok(())
