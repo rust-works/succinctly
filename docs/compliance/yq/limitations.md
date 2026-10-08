@@ -4228,18 +4228,25 @@ ruled out), even though real yq supports every one of them:
   which this issue didn't add. See the identity-round-trip entry below.
   Remaining: the write forms (`comments =`/`comments |=`) and `...` recursive descent in yq
   mode; cross-link #1079/#1080/#1085 above.
-- **`style = "tagged"`** raises `style = "tagged" is not yet supported` (an unknown name
-  still raises real yq's own `unknown style <name>`). Real yq renders the tag of the node's
-  current value type (`a: !!int 1`, `!!str x`, `!!seq`/`!!map` with the container forced to
-  block form, the source spelling kept: `!!int 0x1F`). The DOM emitter has no arm for it, so
-  accepting the style would set a value it then ignores. `literal` and `folded` render since
+- **`style = "tagged"`** renders the tag of the node's current value type
+  ([#4066](https://github.com/rust-works/succinctly/issues/4066), the last piece of #2707):
+  `!!int`/`!!float`/`!!bool`/`!!null`/`!!str` before a scalar, `!!seq`/`!!map` on the header
+  line of a block container (before a flow or empty one), after any anchor. An unknown name
+  still raises real yq's own `unknown style <name>`. `literal` and `folded` render since
   [#2707](https://github.com/rust-works/succinctly/issues/2707): a string with a line break
   and no style of its own is also written as a block scalar, and an existing one survives a
   DOM write (`a: |\n  x` + `.b = 1` keeps `a: |`), all ported from libyaml's emitter and
-  checked against yq v4.53.3 on ~5,000 random strings. Two go-yaml folded-writer quirks are
-  reproduced rather than fixed, so a folded value does not always read back identically in
-  yq either: a kept (`>+`) trailing run gains one empty line, and a more-indented line
-  (`x\n y`) gets an empty line before it.
+  checked against yq v4.53.3 on ~5,000 random strings (tagged strings on another ~2,000).
+  Two go-yaml folded-writer quirks are reproduced rather than fixed, so a folded value does
+  not always read back identically in yq either: a kept (`>+`) trailing run gains one empty
+  line, and a more-indented line (`x\n y`) gets an empty line before it. Divergences that
+  remain for `tagged`: a non-decimal integer loses its spelling before the emitter runs
+  (`!!int 31` for `0x1F`, [#2802](https://github.com/rust-works/succinctly/issues/2802));
+  `2024-01-01` is `!!str` where yq has `!!timestamp` (no timestamp type); an explicit source
+  tag is not kept (`a: !!float 1` prints `!!int 1`, [#1416](https://github.com/rust-works/succinctly/issues/1416));
+  `~` prints `null`; and a style is applied to the node's *final* value (the known
+  no-read-after-write gap), so `.a style = "tagged" | .a = 3.5` prints `!!float 3.5` where yq
+  drops the tag when the new value's type differs.
 - **`anchor = "<name>"` with a name go-yaml's emitter refuses** raises real yq's exact
   `yaml: yaml: anchor value must contain valid characters only`. The accepted set is the
   measured one, not YAML 1.2's: printable ASCII except `,`/`[`/`]`/`{`/`}`/`:` and
