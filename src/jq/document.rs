@@ -1510,6 +1510,34 @@ pub trait DocumentFields: Sized + Clone {
     /// this lookup would otherwise have returned).
     fn find_cursor(&self, name: &str) -> Result<Option<Self::Cursor>, EvalError>;
 
+    /// [`find_cursor`](Self::find_cursor), plus how many members the lookup
+    /// walked (#3913).
+    ///
+    /// The count is what lets `eval_generic` tell a wide object from a small
+    /// one without a walk of its own: a lookup that had to visit many members
+    /// is the one a `KeyIndex` would have
+    /// answered in one probe. It is only meaningful alongside an `Ok`.
+    ///
+    /// The default answers `0`, "not wide", so a format that does not support
+    /// the index (YAML) is never asked to build one.
+    fn find_cursor_counted(&self, name: &str) -> (Result<Option<Self::Cursor>, EvalError>, usize) {
+        (self.find_cursor(name), 0)
+    }
+
+    /// The key node of the first member this list still holds, or `None` for
+    /// an exhausted list or a format that does not support the key index
+    /// (#3913).
+    ///
+    /// Its [`node_id`](DocumentCursor::node_id) names the list: two lists
+    /// that start at the same key node are the same list, because the rest
+    /// of an object is determined by where it starts. That is the identity a
+    /// `KeyIndex` is filed under, so a
+    /// partly consumed list (whose head is a later key node) can never be
+    /// answered from the index of the whole object.
+    fn head_key_cursor(&self) -> Option<Self::Cursor> {
+        None
+    }
+
     /// Whether any field has this key -- existence only, no particular
     /// occurrence's value.
     ///
@@ -1932,7 +1960,7 @@ fn ascii_key_hash(key: &[u8]) -> Option<u64> {
 /// override, so every YAML key hash lands here and used to pay two full
 /// `YamlString` decodes (#965 item 10, the same redundancy
 /// [`key_display_string_kind`] shed).
-fn key_hash_of<V: DocumentValue>(key: &V) -> Option<u64> {
+pub(crate) fn key_hash_of<V: DocumentValue>(key: &V) -> Option<u64> {
     if let Some(raw) = key.key_raw_unescaped() {
         if let Some(hash) = ascii_key_hash(raw) {
             return Some(hash);

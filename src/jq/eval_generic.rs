@@ -7685,12 +7685,18 @@ mod slot_memo {
         Previous(Option<State>),
     }
 
-    /// Restores what the scope it opened replaced, if it opened one.
-    pub(crate) struct Guard(Restore);
+    /// Restores what the scope it opened replaced, if it opened one -- and
+    /// closes the key-index scope opened beside it (#3913).
+    pub(crate) struct Guard {
+        restore: Restore,
+        _keys: crate::jq::key_index::memo::Guard,
+    }
 
     impl Drop for Guard {
         fn drop(&mut self) {
-            if let Restore::Previous(previous) = std::mem::replace(&mut self.0, Restore::Nothing) {
+            if let Restore::Previous(previous) =
+                std::mem::replace(&mut self.restore, Restore::Nothing)
+            {
                 MEMO.with(|m| *m.borrow_mut() = previous);
             }
         }
@@ -7699,15 +7705,22 @@ mod slot_memo {
     /// Open the scope for evaluations over `document`: a no-op while one is
     /// already open for it, a nested scope (restored on drop) otherwise.
     pub(crate) fn enter(document: usize) -> Guard {
+        let keys = crate::jq::key_index::memo::enter(document);
         MEMO.with(|m| {
             let mut m = m.borrow_mut();
             if m.as_ref().is_some_and(|s| s.document == document) {
-                return Guard(Restore::Nothing);
+                return Guard {
+                    restore: Restore::Nothing,
+                    _keys: keys,
+                };
             }
-            Guard(Restore::Previous(m.replace(State {
-                document,
-                scans: Vec::new(),
-            })))
+            Guard {
+                restore: Restore::Previous(m.replace(State {
+                    document,
+                    scans: Vec::new(),
+                })),
+                _keys: keys,
+            }
         })
     }
 
@@ -10945,7 +10958,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 if let Err(err) = empty_fields_tail_gap_ok(&fields, cursor.as_ref()) {
                     return GenericResult::Error(err);
                 }
-                match fields.find_cursor(name) {
+                match crate::jq::key_index::find_cursor_memoized(&fields, name) {
                     Ok(Some(c)) => GenericResult::OneCursor(c),
                     // jq returns null for missing fields on objects (not an error)
                     Ok(None) if absent_is_empty => GenericResult::None,
@@ -19048,7 +19061,7 @@ fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
             // `"zzz" as $k | .[$k] * 2` are both empty in real yq).
             let absent_is_empty = yq_absent_key_read_is_empty::<S>();
             if let Some(fields) = target.as_object() {
-                match fields.find_cursor(s) {
+                match crate::jq::key_index::find_cursor_memoized(&fields, s) {
                     Ok(Some(c)) => GenericResult::OneCursor(c),
                     Ok(None) if absent_is_empty => GenericResult::None,
                     Ok(None) => GenericResult::Owned(OwnedValue::Null),
@@ -21693,7 +21706,7 @@ fn path_field_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
                 // #2594: a zero-field malformed tail is invisible to
                 // `find_cursor`, so it needs its own check.
                 empty_fields_tail_gap_ok(&fields, Some(c))?;
-                match fields.find_cursor(name)? {
+                match crate::jq::key_index::find_cursor_memoized(&fields, name)? {
                     Some(fc) => PathNode::At(fc),
                     None => PathNode::Absent,
                 }
@@ -23441,7 +23454,7 @@ fn getpath_walk_cursor<S: EvalSemantics, V: DocumentValue>(
                     // checks for the field it returns, so a corrupted
                     // member on the read path still raises here
                     // (STYLE-0013's routed form).
-                    return match fields.find_cursor(key) {
+                    return match crate::jq::key_index::find_cursor_memoized(&fields, key) {
                         Ok(Some(field)) => {
                             c = field;
                             continue;
@@ -48839,6 +48852,142 @@ mod tests {
             Demand::Continue
         });
         (out, flow)
+    }
+
+    /// A document whose `big` object is wide enough to be indexed, and whose
+    /// `ks` names keys of it in an order that revisits them (#3913).
+    #[cfg(feature = "std")]
+    fn keyed_lookup_document_3913(members: usize) -> String {
+        let big: Vec<String> = (0..members)
+            .map(|i| format!("\"k{i}\":{{\"v\":{i}}}"))
+            .collect();
+        let ks: Vec<String> = (0..members * 3)
+            .map(|i| format!("\"k{}\"", (i * 7) % members))
+            .collect();
+        format!(
+            "{{\"big\":{{{}}},\"ks\":[{}]}}",
+            big.join(","),
+            ks.join(",")
+        )
+    }
+
+    /// #3913: a keyed read of a wide document object answers the same from
+    /// the key index as from the walk, on every route that reaches one: a
+    /// direct `.big[$k]`, a bound `$b[.]` whose use site reads the same
+    /// document (#2072), `path()` and `getpath`. The reference is the same
+    /// read with the key turned into an owned value by `tostring`, which
+    /// makes `$b` the decoded map.
+    #[cfg(feature = "std")]
+    #[test]
+    fn keyed_lookup_through_the_index_answers_what_the_owned_map_does_3913() {
+        let doc = keyed_lookup_document_3913(150);
+        for (indexed, reference) in [
+            (
+                "[.ks[] as $k | .big[$k]]",
+                ".big as $m | [.ks[] | tostring | $m[.]]",
+            ),
+            (
+                ".big as $b | [.ks[] | $b[.]]",
+                ".big as $m | [.ks[] | tostring | $m[.]]",
+            ),
+            (
+                ".big as $b | [.ks[] | $b[.].v]",
+                ".big as $m | [.ks[] | tostring | $m[.].v]",
+            ),
+            (
+                "[range(450) as $i | path(.big.k7)]",
+                "[range(450) | [\"big\", \"k7\"]]",
+            ),
+            (
+                "[.ks[] as $k | getpath([\"big\", $k])]",
+                ".big as $m | [.ks[] | tostring | $m[.]]",
+            ),
+            (
+                "[.ks[] as $k | .big[$k, \"absent\"]]",
+                ".big as $m | [.ks[] | tostring | $m[., \"absent\"]]",
+            ),
+        ] {
+            {
+                let before = crate::jq::key_index::memo::work();
+                let (got, control) = drive_each_sink::<JqSemantics>(doc.as_bytes(), indexed);
+                assert!(control.is_none(), "{indexed}: {control:?}");
+                let (want, control) = drive_each_sink::<JqSemantics>(doc.as_bytes(), reference);
+                assert!(control.is_none(), "{reference}: {control:?}");
+                assert_eq!(got, want, "{indexed}");
+                let (builds, hits) = crate::jq::key_index::memo::work();
+                assert!(builds > before.0, "{indexed}: no index was built");
+                let gained = hits - before.1;
+                assert!(gained > 300, "{indexed}: only {gained} hits");
+            }
+        }
+    }
+
+    /// #3913: the same under yq's semantics -- a JSON document read by `yq`
+    /// takes the same lookup, and the duplicate rule for it is the walk's.
+    #[cfg(feature = "std")]
+    #[test]
+    fn keyed_lookup_through_the_index_is_the_same_under_yq_semantics_3913() {
+        let doc = keyed_lookup_document_3913(150);
+        let filter = ".big as $b | [.ks[] | $b[.].v] | length";
+        let (jq, c1) = drive_each_sink::<JqSemantics>(doc.as_bytes(), filter);
+        let (yq, c2) = drive_each_sink::<YqSemantics>(doc.as_bytes(), filter);
+        assert!(c1.is_none() && c2.is_none());
+        assert_eq!(jq, yq);
+        assert_eq!(jq, [OwnedValue::Int(450)]);
+    }
+
+    /// #3913: the last of a repeated key wins, whether the lookup walked or
+    /// was answered by the index.
+    #[cfg(feature = "std")]
+    #[test]
+    fn keyed_lookup_through_the_index_keeps_the_last_duplicate_3913() {
+        let mut members: Vec<String> = (0..100).map(|i| format!("\"k{i}\":{i}")).collect();
+        members.push("\"k5\":\"later\"".to_owned());
+        members.push("\"k5\":\"latest\"".to_owned());
+        let doc = format!("{{{}}}", members.join(","));
+        let (out, control) =
+            drive_each_sink::<JqSemantics>(doc.as_bytes(), "[range(6) as $i | .[\"k5\"]] | unique");
+        assert!(control.is_none(), "{control:?}");
+        assert_eq!(
+            out,
+            [OwnedValue::Array(
+                vec![OwnedValue::String("latest".into())].into()
+            )]
+        );
+    }
+
+    /// #3913: an error raised for a lookup the index answers is the error the
+    /// walk raises for it -- here a winner with a missing `,` -- and the
+    /// lookups before it still emit.
+    #[cfg(feature = "std")]
+    #[test]
+    fn keyed_lookup_through_the_index_raises_what_the_walk_raises_3913() {
+        let mut members: Vec<String> = (0..100).map(|i| format!("\"k{i}\":{i}")).collect();
+        members.push("\"bad\":1 \"worse\":2".to_owned());
+        let doc = format!("{{{}}}", members.join(","));
+        let (walked, walked_control) = drive_each_sink::<JqSemantics>(doc.as_bytes(), ".worse");
+        assert_eq!(walked, []);
+        let walked_control = format!("{walked_control:?}");
+        assert!(walked_control.contains("Error"), "{walked_control}");
+        let before = crate::jq::key_index::memo::work();
+        let (out, control) = drive_each_sink::<JqSemantics>(
+            doc.as_bytes(),
+            "(\"k1\", \"k2\", \"k3\", \"bad\", \"worse\") as $k | .[$k]",
+        );
+        assert_eq!(
+            out,
+            [
+                OwnedValue::Int(1),
+                OwnedValue::Int(2),
+                OwnedValue::Int(3),
+                OwnedValue::Int(1)
+            ]
+        );
+        assert_eq!(format!("{control:?}"), walked_control);
+        assert!(
+            crate::jq::key_index::memo::work().1 > before.1,
+            "the index answered"
+        );
     }
 
     #[test]

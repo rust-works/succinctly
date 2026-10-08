@@ -1675,6 +1675,21 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
     where
         W: Clone,
     {
+        self.find_cursor_counted(name).0
+    }
+
+    /// [`find_cursor`](Self::find_cursor), plus the number of members the
+    /// walk visited (#3913) -- the loop already counts them for the
+    /// first-member test, so the count is free. Meaningful only for an `Ok`;
+    /// an `Err` reports `0`.
+    #[inline]
+    pub fn find_cursor_counted(
+        &self,
+        name: &str,
+    ) -> (Result<Option<JsonCursor<'a, W>>, EvalError>, usize)
+    where
+        W: Clone,
+    {
         // STYLE-0013-TAIL: `find`'s cursor-returning twin, exempt for the same
         // reason -- routing to `child_tail_gap_ok` is behaviour-preserving but
         // pointless, and the `container_tail_gap_ok` that would actually close
@@ -1693,7 +1708,7 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
         while let Some((field, rest)) = fields.uncons() {
             let key = field.key();
             if key_is_malformed(&key) {
-                return Err(fields.malformed_member_error());
+                return (Err(fields.malformed_member_error()), 0);
             }
             // Same undecodable-key skip as `find` above (#1247).
             if let StandardJson::String(key) = key {
@@ -1711,11 +1726,11 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
         if let Some((key_start, value_cursor, is_first)) = winner {
             let comma_expected = if is_first { None } else { Some(b',') };
             if !preceding_gap_ok(value_cursor.text(), key_start, comma_expected) {
-                return Err(EvalError::malformed_json_text(value_cursor.text()));
+                return (Err(EvalError::malformed_json_text(value_cursor.text())), 0);
             }
             if let Some(value_start) = value_cursor.text_position() {
                 if !preceding_gap_ok(value_cursor.text(), value_start, Some(b':')) {
-                    return Err(EvalError::malformed_json_text(value_cursor.text()));
+                    return (Err(EvalError::malformed_json_text(value_cursor.text())), 0);
                 }
             }
         }
@@ -1724,10 +1739,10 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
         // anything -- see this function's own doc comment above.
         if let Some(last) = last_value_cursor {
             if !trailing_element_gap_ok(&last, b'}') {
-                return Err(EvalError::malformed_json_text(last.text()));
+                return (Err(EvalError::malformed_json_text(last.text())), 0);
             }
         }
-        Ok(winner.map(|(_, value_cursor, _)| value_cursor))
+        (Ok(winner.map(|(_, value_cursor, _)| value_cursor)), index)
     }
 }
 
@@ -4422,6 +4437,18 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentFields for JsonFields<'a, W> {
 
     fn find_cursor(&self, name: &str) -> Result<Option<Self::Cursor>, EvalError> {
         JsonFields::find_cursor(self, name)
+    }
+
+    #[inline]
+    fn find_cursor_counted(&self, name: &str) -> (Result<Option<Self::Cursor>, EvalError>, usize) {
+        JsonFields::find_cursor_counted(self, name)
+    }
+
+    /// The retained child cursor *is* the next key node (#3913); an exhausted
+    /// list, and an empty container's tagged slot (#3180), hold none.
+    #[inline]
+    fn head_key_cursor(&self) -> Option<Self::Cursor> {
+        self.current()
     }
 
     fn is_empty(&self) -> bool {
