@@ -45216,6 +45216,116 @@ b: {p: *x, # y
 fn test_yq_dom_write_keeps_explicit_tags_4078() -> Result<()> {
     let cases: &[(&str, &str, &[&str], &str)] = &[
         (
+            r"a: !!str 1
+b: 1
+",
+            r#".a style = "tagged""#,
+            &[],
+            r"a: !!str 1
+b: 1
+",
+        ),
+        (
+            r"a: !!float 1
+z: 1
+",
+            r".a = 1",
+            &[],
+            r"a: 1
+z: 1
+",
+        ),
+        (
+            r"a: !!float 1
+z: 1
+",
+            r".a = 2",
+            &[],
+            r"a: 2
+z: 1
+",
+        ),
+        (
+            r#"a: !Foo "5"
+z: 1
+"#,
+            r".a = 6",
+            &[],
+            r#"a: !Foo "6"
+z: 1
+"#,
+        ),
+        (
+            r#"a: !Foo "5x"
+z: 1
+"#,
+            r".a = 6",
+            &[],
+            r"a: !Foo 6
+z: 1
+",
+        ),
+        (
+            r"a: !Foo '5'
+z: 1
+",
+            r".a = 6",
+            &[],
+            r"a: !Foo '6'
+z: 1
+",
+        ),
+        (
+            r#"a: !Foo "dq"
+z: 1
+"#,
+            r".a = 5",
+            &[],
+            r"a: !Foo 5
+z: 1
+",
+        ),
+        (
+            r#"a: !Foo "dq"
+z: 1
+"#,
+            r".a = true",
+            &[],
+            r"a: !Foo true
+z: 1
+",
+        ),
+        (
+            r#"a: !!int "5"
+z: 1
+"#,
+            r".a = 6",
+            &[],
+            r#"a: !!int "6"
+z: 1
+"#,
+        ),
+        (
+            r#"a: !!str "5"
+z: 1
+"#,
+            r".a = 5",
+            &[],
+            r"a: 5
+z: 1
+",
+        ),
+        (
+            r"a: !Foo 5
+z: 1
+",
+            r#".a = "x""#,
+            &[],
+            r"a: !Foo x
+z: 1
+",
+        ),
+        (
             r#"a: !!str 1
 b: !!int "2"
 "#,

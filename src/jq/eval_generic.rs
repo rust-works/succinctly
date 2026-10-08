@@ -2727,7 +2727,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
                 None
             } else {
                 cursor
-                    .and_then(DocumentCursor::explicit_tag)
+                    .and_then(DocumentCursor::explicit_tag_of_non_alias)
                     .map(str::to_string)
             },
         ),

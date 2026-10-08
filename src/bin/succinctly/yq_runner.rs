@@ -2735,7 +2735,8 @@ fn reconcile_presentation_at_depth(
         // one, which follows the new value's type (`!!str "dq"` written `5` is `5`).
         _ => CommentTree::Leaf(written_scalar_meta(
             pristine_tree.meta(),
-            pristine_value != result_value,
+            !pristine_value.identical(result_value),
+            pristine_value,
             result_value,
         )),
     }
@@ -2745,25 +2746,56 @@ fn reconcile_presentation_at_depth(
 /// it loses a core tag unless the new value has that type (a core tag follows the value's
 /// type: `!!str 1` written `"x"` stays `!!str`, written `5` is `5`) and a quoted spelling the
 /// new value cannot carry (a number is not written quoted), but keeps a custom tag (#4078).
-fn written_scalar_meta(meta: &NodeMeta, changed: bool, now: &OwnedValue) -> NodeMeta {
+fn written_scalar_meta(
+    meta: &NodeMeta,
+    changed: bool,
+    before: &OwnedValue,
+    now: &OwnedValue,
+) -> NodeMeta {
     if !changed {
         return meta.clone();
     }
-    let now_core = match now {
+    let now_core = core_tag_of(now);
+    // The quoting stays while the node's type stays: a string; a value of the type its
+    // core tag already names (`!!int "5"` written `6` is `!!int "6"`); or, behind a
+    // custom tag, a value of the type the quoted text itself reads as (`!Foo "5"` written
+    // `6` is `!Foo "6"`, `!Foo "5x"` written `6` is `!Foo 6`).
+    let keeps_style = now_core == "!!str"
+        || match meta.tag() {
+            Some(tag) if is_custom_tag(tag) => {
+                matches!(before, OwnedValue::String(text) if implicit_core_tag(text) == now_core)
+            }
+            Some(tag) => tag == now_core,
+            None => false,
+        };
+    let meta_now = meta.with_style(if keeps_style { meta.style } else { "" });
+    match meta.tag() {
+        Some(tag) if !is_custom_tag(tag) && tag != now_core => meta_now.with_tag(None),
+        _ => meta_now,
+    }
+}
+
+/// The core tag YAML's type resolution gives a value.
+fn core_tag_of(value: &OwnedValue) -> &'static str {
+    match value {
         OwnedValue::Null => "!!null",
         OwnedValue::Bool(_) => "!!bool",
         OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _) => "!!int",
         OwnedValue::Float(_) | OwnedValue::NumberLiteral(NumberRepr::Float(_), _) => "!!float",
         OwnedValue::String(_) => "!!str",
-        OwnedValue::Array(_) | OwnedValue::Object(_) => "",
-    };
-    // The quoting stays while the node's type stays: a string, or a value of the type
-    // its core tag already names (`!!int "5"` written `6` is `!!int "6"`).
-    let keeps_style = now_core == "!!str" || meta.tag() == Some(now_core);
-    let meta_now = meta.with_style(if keeps_style { meta.style } else { "" });
-    match meta.tag() {
-        Some(tag) if !is_custom_tag(tag) && tag != now_core => meta_now.with_tag(None),
-        _ => meta_now,
+        OwnedValue::Array(_) => "!!seq",
+        OwnedValue::Object(_) => "!!map",
+    }
+}
+
+/// The core tag a plain scalar with this text would resolve to.
+fn implicit_core_tag(text: &str) -> &'static str {
+    match text {
+        "null" | "Null" | "NULL" | "~" | "" => "!!null",
+        "true" | "True" | "TRUE" | "false" | "False" | "FALSE" => "!!bool",
+        _ if text.parse::<i64>().is_ok() => "!!int",
+        _ if text.parse::<f64>().is_ok() => "!!float",
+        _ => "!!str",
     }
 }
 
@@ -4276,16 +4308,6 @@ fn is_yaml_11_bool_word(text: &str) -> bool {
         .any(|word| text.eq_ignore_ascii_case(word))
 }
 
-/// Panics past `succinctly::jq::MAX_VALUE_TREE_DEPTH` levels of nesting
-/// (#1017) -- unlike its sibling [`reconcile_presentation`], which #1015
-/// already guards, this walker over the same `CommentTree` shape had no
-/// guard at all. Currently only fed an already-reconciled/bounded tree,
-/// so this is defense-in-depth against that call chain changing, not a
-/// currently-live independent crash path.
-///
-/// Walks `value` alongside `tree` (#3614): a node's quoting is kept when its string is a YAML 1.1
-/// bool spelling ([`is_yaml_11_bool_word`]), which the tree alone cannot say. A `value` that does
-/// not match the tree's shape contributes `null`, so the node's style is stripped as before.
 /// `-P` re-resolves a node's type instead of echoing a core tag that only restates it
 /// (`!!str 1` is `"1"`, `!!int 5` is `5`, `!!map` is dropped), and keeps every other tag
 /// (`!Ref`, `!!binary`, ...), as yq does (#4078). `!!float` goes the same way: a whole
@@ -4301,6 +4323,16 @@ fn strip_core_tag(meta: NodeMeta) -> NodeMeta {
     }
 }
 
+/// Panics past `succinctly::jq::MAX_VALUE_TREE_DEPTH` levels of nesting
+/// (#1017) -- unlike its sibling [`reconcile_presentation`], which #1015
+/// already guards, this walker over the same `CommentTree` shape had no
+/// guard at all. Currently only fed an already-reconciled/bounded tree,
+/// so this is defense-in-depth against that call chain changing, not a
+/// currently-live independent crash path.
+///
+/// Walks `value` alongside `tree` (#3614): a node's quoting is kept when its string is a YAML 1.1
+/// bool spelling ([`is_yaml_11_bool_word`]), which the tree alone cannot say. A `value` that does
+/// not match the tree's shape contributes `null`, so the node's style is stripped as before.
 fn strip_presentation_style_at_depth(
     value: &OwnedValue,
     tree: &CommentTree,
@@ -5734,7 +5766,7 @@ fn emit_tagged_scalar(
     }
     if let Some(tag) = comments.meta().tag() {
         let quoted = |q: fn(&str) -> String| plain_scalar_text(value).map(|text| q(&text));
-        let text = if let (OwnedValue::String(s), "") = (value, comments.style()) {
+        let text = if let (OwnedValue::String(s), "" | "tagged") = (value, comments.style()) {
             tagged_string_text(s, config, indent, in_flow)?
         } else if let Some(text) = match comments.style() {
             // A non-string behind a tag that was quoted in the source

@@ -4260,7 +4260,9 @@ ruled out), even though real yq supports every one of them:
   carries no tree entry, so it loses its tag where yq copies it (the existing copy gap); a
   computed value has no tag (#1416); `!!set` members print `null` where yq prints `''`; `!!null`
   keeps no `~` spelling (#2802); and a tagged `null` that a path write walks through
-  (`a: !Foo null` + `.a.b = 5`) becomes a mapping where yq leaves the document alone.
+  (`a: !Foo null` + `.a.b = 5`) becomes a mapping where yq leaves the document alone. A tag on a
+  mapping *key* (`? !K key`) is not captured and is still dropped, and a tagged empty value
+  (`a: !Foo` with nothing after it) is written `!Foo null`.
 - **`anchor = "<name>"` with a name go-yaml's emitter refuses** raises real yq's exact
   `yaml: yaml: anchor value must contain valid characters only`. The accepted set is the
   measured one, not YAML 1.2's: printable ASCII except `,`/`[`/`]`/`{`/`}`/`:` and

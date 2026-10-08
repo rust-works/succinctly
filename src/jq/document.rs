@@ -842,6 +842,13 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         None
     }
 
+    /// [`Self::explicit_tag`] for a caller that already knows this node is not an
+    /// alias, which spares a YAML cursor the value decode it otherwise pays to find
+    /// that out (#4078: the DOM walk asks every node of a document that has a tag).
+    fn explicit_tag_of_non_alias(&self) -> Option<&str> {
+        self.explicit_tag()
+    }
+
     /// Get the YAML style indicator for this node (e.g. `"flow"`, `"double"`).
     ///
     /// Returns `""` (no explicit style) by default; only YAML cursors
