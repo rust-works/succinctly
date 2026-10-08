@@ -614,8 +614,8 @@ mod tests {
             assert_eq!(sorted, again, "deterministic, len {len}");
             let mut from_sorted = sorted.clone();
             let mut from_input = input;
-            from_sorted.sort();
-            from_input.sort();
+            from_sorted.sort_unstable();
+            from_input.sort_unstable();
             assert_eq!(
                 from_sorted, from_input,
                 "a permutation of the input, len {len}"
