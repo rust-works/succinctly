@@ -842,6 +842,14 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         None
     }
 
+    /// The source text of this node when it is a plain (unquoted, single-line) scalar --
+    /// `""` for an empty value -- so the DOM writer can print back the spelling a value
+    /// resolved from (`~`, `True`, `0x1F`, #3028). `None` for anything else, and for
+    /// formats without plain scalars (JSON).
+    fn plain_scalar_source(&self) -> Option<Cow<'_, str>> {
+        None
+    }
+
     /// [`Self::explicit_tag`] for a caller that already knows this node is not an
     /// alias, which spares a YAML cursor the value decode it otherwise pays to find
     /// that out (#4078: the DOM walk asks every node of a document that has a tag).
