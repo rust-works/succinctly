@@ -11096,6 +11096,12 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 // yq's own out-of-range error), so the trailing/leading gap
                 // checks ride along for free on every call, not just the
                 // negative-index ones.
+                //
+                // #4035: free for one read, but a program that uses a document
+                // array as a lookup table pays it once per read. The length
+                // and the element come from `array_index`, which answers from
+                // an index of the array's node ids once it has proved wide and
+                // is read again, and otherwise runs exactly this walk.
                 let len = match crate::jq::array_index::len_checked_memoized(&elements) {
                     Ok(len) => len,
                     Err(err) => return GenericResult::Error(err),

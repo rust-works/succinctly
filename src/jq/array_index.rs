@@ -26,12 +26,16 @@
 //!
 //! # When one is built
 //!
-//! Not on first sight. A walk of [`WIDE_ELEMENTS`] or more registers the array,
-//! and the next *length* lookup builds the index (an element lookup never
-//! does, so a single read costs what it always cost). An array that is small,
-//! or read once, never costs more than the walk it always cost; a refused
-//! build is remembered so it is not retried, and so is an eviction, as in
-//! [`super::key_index`].
+//! Not on first sight, and not on second. A walk of [`WIDE_ELEMENTS`] or more
+//! registers the array, the next *length* lookup walks again and counts, and
+//! the third builds the index (an element lookup never does). An index costs
+//! one walk and the ids it keeps, so building it on the second lookup made an
+//! array read exactly twice slower than the two walks it replaced (+5% to +9%
+//! on `.[] | [.[3], .[4]]` over 20,000 hundred-element arrays); on the third
+//! it replaces a walk with its price and every later read is O(1). An array
+//! that is small, or read twice, never costs more than the walks it always
+//! cost; a refused build is remembered so it is not retried, and so is an
+//! eviction, as in [`super::key_index`].
 //!
 //! # Scope
 //!
@@ -67,12 +71,14 @@ impl ElementIndex {
     /// anything but plainly well-formed (see the module doc: a refusal sends
     /// the caller to the walk, which says what is wrong). The checks are
     /// [`DocumentElements::len_checked`]'s, in the same order.
-    pub(crate) fn build<E: DocumentElements>(elements: &E) -> Option<Self> {
-        Self::build_within(elements, MAX_INDEXED_ELEMENTS)
+    pub(crate) fn build<E: DocumentElements>(elements: &E, len: usize) -> Option<Self> {
+        Self::build_within(elements, len, MAX_INDEXED_ELEMENTS)
     }
 
-    fn build_within<E: DocumentElements>(elements: &E, max: usize) -> Option<Self> {
-        let mut ids = Vec::new();
+    /// `len` is the length a walk of this list found, to size the ids: a wrong
+    /// guess costs only a reallocation.
+    fn build_within<E: DocumentElements>(elements: &E, len: usize, max: usize) -> Option<Self> {
+        let mut ids = Vec::with_capacity(len.min(max));
         let mut elems = *elements;
         let mut is_first = true;
         let mut last = None;
@@ -116,7 +122,7 @@ pub(crate) fn len_checked_memoized<E: DocumentElements>(elements: &E) -> Result<
     }
     let len = elements.len_checked()?;
     if len >= WIDE_ELEMENTS {
-        memo::note_wide(elements);
+        memo::note_wide(elements, len);
     }
     Ok(len)
 }
@@ -144,12 +150,20 @@ pub(crate) mod memo {
     const ENTRIES: usize = 16;
     /// Indexes kept at once.
     const INDEXES: usize = 4;
+    /// The length lookup that builds is the one after this many walks of the
+    /// array (the registering one included): the third lookup.
+    const BUILD_AT: u8 = 2;
     /// Elements indexed across all the indexes kept.
     const ELEMENT_BUDGET: usize = MAX_INDEXED_ELEMENTS;
 
     enum Kind {
-        /// A wide walk has been seen: the next length lookup builds.
-        Seen,
+        /// Wide walks have been seen, this many length lookups of them so far
+        /// (counting the one that registered it), for an array of this many
+        /// elements: the third lookup builds, sized from the length.
+        Seen {
+            lookups: u8,
+            len: usize,
+        },
         /// Always walk: the build was refused (malformed, too wide), or the
         /// index was evicted (an evicted array is not given a second chance,
         /// for the reason `key_index` gives).
@@ -268,16 +282,26 @@ pub(crate) mod memo {
             let state = m.as_mut().filter(|s| s.document == document)?;
             let at = state.entries.iter().position(|e| e.head == id)?;
             let mut entry = state.entries.remove(at);
-            if may_build && matches!(entry.kind, Kind::Seen) {
-                make_room(&mut state.entries, 1, 0);
-                entry.kind = match ElementIndex::build(elements) {
-                    Some(index) => {
-                        note_build();
-                        make_room(&mut state.entries, 1, index.len());
-                        Kind::Indexed(index)
+            if may_build {
+                if let Kind::Seen { lookups, len } = entry.kind {
+                    if lookups < BUILD_AT {
+                        entry.kind = Kind::Seen {
+                            lookups: lookups + 1,
+                            len,
+                        };
+                        state.entries.push(entry);
+                        return None;
                     }
-                    None => Kind::Refused,
-                };
+                    make_room(&mut state.entries, 1, 0);
+                    entry.kind = match ElementIndex::build(elements, len) {
+                        Some(index) => {
+                            note_build();
+                            make_room(&mut state.entries, 1, index.len());
+                            Kind::Indexed(index)
+                        }
+                        None => Kind::Refused,
+                    };
+                }
             }
             let found = match &entry.kind {
                 Kind::Indexed(index) => {
@@ -287,7 +311,7 @@ pub(crate) mod memo {
                     }
                     found
                 }
-                Kind::Seen | Kind::Refused => None,
+                Kind::Seen { .. } | Kind::Refused => None,
             };
             state.entries.push(entry);
             found
@@ -318,7 +342,7 @@ pub(crate) mod memo {
 
     /// Remember that a walk of `elements` was wide, so the next length lookup
     /// of the same list builds an index.
-    pub(crate) fn note_wide<E: DocumentElements>(elements: &E) {
+    pub(crate) fn note_wide<E: DocumentElements>(elements: &E, len: usize) {
         let Some((head, _)) = elements.uncons_cursor() else {
             return;
         };
@@ -337,7 +361,7 @@ pub(crate) mod memo {
             }
             state.entries.push(Entry {
                 head: id,
-                kind: Kind::Seen,
+                kind: Kind::Seen { lookups: 1, len },
             });
             ARMED.with(|a| a.set(true));
         });
@@ -366,7 +390,7 @@ pub(crate) mod memo {
         None
     }
 
-    pub(crate) fn note_wide<E: DocumentElements>(_elements: &E) {}
+    pub(crate) fn note_wide<E: DocumentElements>(_elements: &E, _len: usize) {}
 }
 
 #[cfg(test)]
@@ -398,7 +422,7 @@ mod tests {
     fn index_agrees_with_the_walk_on_every_index_and_past_the_end_4035() {
         let doc = wide_array(130);
         with_root_array(&doc, |elements| {
-            let index = ElementIndex::build(elements).expect("a well-formed array indexes");
+            let index = ElementIndex::build(elements, 0).expect("a well-formed array indexes");
             let head = elements.uncons_cursor().expect("a non-empty array").0;
             assert_eq!(Ok(index.len()), elements.len_checked());
             for k in 0..135 {
@@ -416,7 +440,7 @@ mod tests {
         for doc in ["[1,2,]", "[1,,2]", "[,1,2]", "[1,2,3,tru]", "[,]"] {
             with_root_array(doc, |elements| {
                 if elements.len_checked().is_err() {
-                    assert!(ElementIndex::build(elements).is_none(), "{doc}");
+                    assert!(ElementIndex::build(elements, 0).is_none(), "{doc}");
                 }
             });
         }
@@ -424,7 +448,7 @@ mod tests {
         // above is not vacuous.
         with_root_array("[1,2,]", |elements| {
             assert!(elements.len_checked().is_err());
-            assert!(ElementIndex::build(elements).is_none());
+            assert!(ElementIndex::build(elements, 0).is_none());
         });
     }
 
@@ -432,9 +456,9 @@ mod tests {
     fn build_refuses_an_array_longer_than_the_cap_4035() {
         let doc = wide_array(5);
         with_root_array(&doc, |elements| {
-            assert!(ElementIndex::build_within(elements, 4).is_none());
+            assert!(ElementIndex::build_within(elements, 5, 4).is_none());
             assert_eq!(
-                ElementIndex::build_within(elements, 5).map(|ix| ix.len()),
+                ElementIndex::build_within(elements, 5, 5).map(|ix| ix.len()),
                 Some(5)
             );
         });
@@ -455,13 +479,13 @@ mod tests {
         }
 
         #[test]
-        fn a_wide_array_builds_on_its_second_length_lookup_4035() {
+        fn a_wide_array_builds_on_its_third_length_lookup_4035() {
             let doc = wide_array(WIDE_ELEMENTS * 2);
             let before = memo::work();
             let answers = lens(&doc, 6);
             let (builds, hits) = memo::work();
             assert_eq!(builds - before.0, 1, "one build, not one per lookup");
-            assert_eq!(hits - before.1, 5, "every lookup after the first");
+            assert_eq!(hits - before.1, 4, "every lookup after the building one");
             assert!(answers.iter().all(|a| *a == Ok(WIDE_ELEMENTS * 2)));
         }
 
@@ -478,7 +502,11 @@ mod tests {
             let walked = shown(elements.get_cursor(7));
             assert_eq!(shown(get_cursor_memoized(&elements, 7)), walked);
             assert_eq!(memo::work(), before, "a single read builds nothing");
-            // The second read builds (length), and the element read after it hits.
+            // The second read still walks: an array read twice must not pay
+            // for an index it would use once.
+            assert!(len_checked_memoized(&elements).is_ok());
+            assert_eq!(memo::work(), before, "two reads build nothing");
+            // The third builds (length), and the element read after it hits.
             assert!(len_checked_memoized(&elements).is_ok());
             let (builds, hits) = memo::work();
             assert_eq!(builds - before.0, 1);
