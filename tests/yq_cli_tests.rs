@@ -49958,6 +49958,7 @@ mod yq_text_equality_2785 {
             (r#"["", [1]] | group_by(.) | length"#, "1"),
             (r#"["", [1]] | unique | length"#, "2"),
             (r#"["\u0001[1]", [1]] | unique | length"#, "2"),
+            (r#"["\u0000x", "x", "\u0001x"] | unique | length"#, "3"),
         ] {
             let (out, code) = run_yq_stdin(filter, scalars, &["-o=json", "-I=0"])?;
             assert_eq!((out.trim(), code), (want, 0), "`{filter}`");

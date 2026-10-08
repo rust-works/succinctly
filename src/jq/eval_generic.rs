@@ -21218,7 +21218,7 @@ impl SortKey {
 
     /// The key real yq's `unique`/`unique_by` map this element on (#2799): the text of the
     /// element itself, or of the key filter's first output. See [`yq_dedup_key`].
-    fn yq_dedup_key<S: EvalSemantics>(&self) -> (bool, String) {
+    fn yq_dedup_key<S: EvalSemantics>(&self) -> String {
         match self {
             Self::Own(v) => yq_dedup_key::<S>(Some(v), false),
             Self::By(parts) => yq_dedup_key::<S>(parts.first(), false),

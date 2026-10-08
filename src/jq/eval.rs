@@ -2132,31 +2132,37 @@ fn compare_slices_at_depth<S: EvalSemantics>(
 /// not, and yq's key is style-sensitive (a flow `[1]` and a block `- 1` can differ) where this
 /// one is not -- recorded in `docs/compliance/yq/limitations.md`. A `\u{1}` prefix keeps a
 /// container's key from colliding with a string that spells the same text.
-pub(crate) fn yq_dedup_key<S: EvalSemantics>(
-    value: Option<&OwnedValue>,
-    grouping: bool,
-) -> (bool, String) {
+pub(crate) fn yq_dedup_key<S: EvalSemantics>(value: Option<&OwnedValue>, grouping: bool) -> String {
     match value {
-        None => (false, "null".to_string()),
+        None => "null".to_string(),
         // `group_by`'s empty key is a plain string key, so it merges with the empty string `""`
-        // exactly as in yq (`["", [1]] | group_by(.)` is one group there).
-        Some(OwnedValue::Array(_) | OwnedValue::Object(_)) if grouping => (false, String::new()),
-        // The flag keeps a container's encoding from colliding with a string that spells the
-        // same text, a collision yq cannot have (its container key is YAML).
-        Some(v @ (OwnedValue::Array(_) | OwnedValue::Object(_))) => (true, owned_to_string::<S>(v)),
-        Some(v) => (false, owned_to_string::<S>(v)),
+        // exactly as in yq (`["", [1]] | group_by(.)` is one group there). No escaping here:
+        // `group_by` has no container encoding to keep apart.
+        Some(OwnedValue::Array(_) | OwnedValue::Object(_)) if grouping => String::new(),
+        // A container's encoding starts with U+0001 ...
+        Some(v @ (OwnedValue::Array(_) | OwnedValue::Object(_))) => {
+            format!("\u{1}{}", owned_to_string::<S>(v))
+        }
+        Some(v) => {
+            let text = owned_to_string::<S>(v);
+            // ... and a scalar text that itself starts with U+0000 or U+0001 gets a U+0000 in
+            // front, so the two can never produce the same key (a plain `String`, which hashes
+            // faster than a flag-and-string pair: +12% on a million distinct integers on x86).
+            if !grouping && text.starts_with(['\u{0}', '\u{1}']) {
+                format!("\u{0}{text}")
+            } else {
+                text
+            }
+        }
     }
 }
 
 /// yq mode only (#2799): keep the first element of each distinct key, in input order -- yq's
 /// `unique` family is an ordered map on [`yq_dedup_key`], not a sort followed by a dedup.
-pub(crate) fn yq_first_of_each_key<T>(
-    keyed: impl ExactSizeIterator<Item = ((bool, String), T)>,
-) -> Vec<T> {
+pub(crate) fn yq_first_of_each_key<T>(keyed: impl ExactSizeIterator<Item = (String, T)>) -> Vec<T> {
     // A hashed set, not a `BTreeSet`: one probe per element instead of a tree walk of string
     // compares, which is what made the first cut of this +94% on a million distinct integers.
-    let mut seen: indexmap::IndexSet<(bool, String)> =
-        indexmap::IndexSet::with_capacity(keyed.len());
+    let mut seen: indexmap::IndexSet<String> = indexmap::IndexSet::with_capacity(keyed.len());
     let mut out = vec_with_capacity(keyed.len());
     for (key, item) in keyed {
         if seen.insert(key) {
@@ -2168,10 +2174,8 @@ pub(crate) fn yq_first_of_each_key<T>(
 
 /// yq mode only (#2799): group elements by [`yq_dedup_key`], groups in order of their first
 /// occurrence and members in input order (`[3,1,2,1] | group_by(.)` is `[[3],[1,1],[2]]`).
-pub(crate) fn yq_group_in_order<T>(
-    keyed: impl Iterator<Item = ((bool, String), T)>,
-) -> Vec<Vec<T>> {
-    let mut groups: indexmap::IndexMap<(bool, String), Vec<T>> = indexmap::IndexMap::new();
+pub(crate) fn yq_group_in_order<T>(keyed: impl Iterator<Item = (String, T)>) -> Vec<Vec<T>> {
+    let mut groups: indexmap::IndexMap<String, Vec<T>> = indexmap::IndexMap::new();
     for (key, item) in keyed {
         groups.entry(key).or_default().push(item);
     }
