@@ -77635,8 +77635,14 @@ mod tests {
                 r"[foreach .[] as $r ({}; $r.name as $n | .[$n] = $r.score; length)]",
                 "[1,2,2]",
             ),
-            (r"{a:0} | until(.a >= 3; 1 as $k | .a += $k)", r#"{"a":3}"#),
-            (r"{a:0} | [while(.a < 3; 1 as $k | .a += $k)] | length", "3"),
+            (
+                r#"{"a":0} | until(.a >= 3; 1 as $k | .a += $k)"#,
+                r#"{"a":3}"#,
+            ),
+            (
+                r#"{"a":0} | [while(.a < 3; 1 as $k | .a += $k)] | length"#,
+                "3",
+            ),
         ] {
             assert_eq!(outputs(records, filter), [expected], "{filter}");
         }
