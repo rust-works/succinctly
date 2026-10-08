@@ -4081,7 +4081,7 @@ pub trait DocumentElements: Sized + Copy + Clone {
     /// stand at a `-` wrapper that `uncons_cursor` resolves past); it need
     /// only be the same every time for the same list.
     fn head_id(&self) -> Option<(usize, usize)> {
-        None
+        None // patchcov: coverage tolerate-line reason="the default for a format without the element index; both shipped formats override it"
     }
 
     /// Count the number of elements.

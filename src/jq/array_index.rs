@@ -331,7 +331,7 @@ pub(crate) mod memo {
                             make_room(&mut state.entries, 1, index.len());
                             Kind::Indexed(index)
                         }
-                        None => Kind::Refused,
+                        None => Kind::Refused, // patchcov: coverage tolerate-line reason="defensive: an array registers only after a walk that succeeded, and the build makes that walk's checks, so it refuses only past MAX_INDEXED_ELEMENTS, which a unit test pins on build_within directly"
                     };
                 }
             }
@@ -368,7 +368,7 @@ pub(crate) mod memo {
                 .position(|e| matches!(e.kind, Kind::Indexed(_)))
             {
                 Some(at) => entries[at].kind = Kind::Refused,
-                None => return,
+                None => return, // patchcov: coverage tolerate-line reason="defensive: the loop ends here only when nothing is left to retire yet the budget is still exceeded, i.e. a single index larger than the whole element budget, which MAX_INDEXED_ELEMENTS (equal to the budget) rules out"
             }
         }
     }
@@ -377,7 +377,7 @@ pub(crate) mod memo {
     /// of the same list builds an index.
     pub(crate) fn note_wide<E: DocumentElements>(elements: &E, len: usize) {
         let Some((id, document)) = elements.head_id() else {
-            return;
+            return; // patchcov: coverage tolerate-line reason="unreachable: a list that just walked to a length of WIDE_ELEMENTS or more has a head"
         };
         MEMO.with(|m| {
             let mut m = m.borrow_mut();
@@ -506,9 +506,7 @@ mod tests {
                             let doc = format!("[{lead}{}{trail}]", els.join(joiner));
                             let index = JsonIndex::build(doc.as_bytes());
                             let root = index.root(doc.as_bytes());
-                            let Some(elements) = root.value().as_array() else {
-                                continue;
-                            };
+                            let elements = root.value().as_array().expect("an array document");
                             let walked = elements.len_checked();
                             let built = ElementIndex::build(&elements, 0);
                             assert_eq!(
@@ -655,6 +653,61 @@ mod tests {
                 );
                 assert!(answers.iter().all(Result::is_err), "{answers:?}");
             }
+        }
+
+        #[test]
+        fn more_wide_arrays_than_slots_stay_correct_and_bounded_4035() {
+            // Twenty wide arrays in one scope: more than the four indexes and the
+            // sixteen entries the memo keeps, so retirements and the oldest
+            // entries falling out both happen. Every answer is the walk's,
+            // whichever arrays happen to hold an index.
+            let inner = wide_array(WIDE_ELEMENTS + 3);
+            let doc = format!("[{}]", vec![inner; 20].join(","));
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            let _scope = memo::enter(root.document_token());
+            let outer = root.value().as_array().expect("an array document");
+            let arrays: Vec<_> = outer
+                .collect_values()
+                .iter()
+                .map(|v| v.as_array().expect("an inner array"))
+                .collect();
+            assert_eq!(arrays.len(), 20);
+            let check = |n: usize, round: usize| {
+                let elements = &arrays[n];
+                assert_eq!(
+                    len_checked_memoized(elements).map_err(|e| format!("{e:?}")),
+                    Ok(WIDE_ELEMENTS + 3),
+                    "array {n} round {round}"
+                );
+                assert_eq!(
+                    shown(get_cursor_memoized(elements, 5)),
+                    shown(elements.get_cursor(5)),
+                    "array {n} round {round}"
+                );
+            };
+            let before = memo::work();
+            // Six arrays read in turn, five times each: six builds against four
+            // slots, so the oldest indexes are retired as the newer are built.
+            for n in 0..6 {
+                for round in 0..5 {
+                    check(n, round);
+                }
+            }
+            let (builds, _) = memo::work();
+            assert_eq!(builds - before.0, 6, "each array built once");
+            // The retired ones are walked for good, and still right.
+            for round in 5..8 {
+                check(0, round);
+                check(1, round);
+            }
+            assert_eq!(memo::work().0, builds, "a retired array is not rebuilt");
+            // Twenty registrations overflow the sixteen entries the memo keeps.
+            for n in 6..20 {
+                check(n, 0);
+            }
+            check(0, 9);
+            check(19, 9);
         }
 
         #[test]
