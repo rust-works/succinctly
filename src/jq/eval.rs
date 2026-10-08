@@ -11042,7 +11042,7 @@ fn owned_assign_shape(expr: &Expr) -> bool {
 /// pins a chain at that limit.
 fn closed_expr_shape(expr: &Expr) -> bool {
     match expr {
-        Expr::Literal(_) => true,
+        Expr::Literal(_) | Expr::TrackedVar(_) => true,
         Expr::Paren(inner) => closed_expr_shape(inner),
         Expr::Array(inner) => match inner.as_ref() {
             Expr::Builtin(Builtin::Empty) => true,
@@ -11090,7 +11090,18 @@ fn closed_expr_to_owned<S: EvalSemantics>(expr: &Expr) -> Option<OwnedValue> {
     if let Expr::Literal(lit) = expr {
         return Some(literal_to_owned(lit));
     }
-    closed_expr_to_owned_at_depth::<S>(expr, 0)
+    let value = closed_expr_to_owned_at_depth::<S>(expr, 0)?;
+    // #4005: a marker is read by value, so a scalar answer carries nothing of the
+    // binding's identity; a container could be the marker's own node (or a node
+    // of it), which a step that does not know the embed table must not hand on
+    // (#3241). Only checked once the answer is a container, so the per-step cost
+    // of a scalar right side is the match below.
+    if matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_))
+        && any_subexpr(expr, &mut |e| matches!(e, Expr::TrackedVar(_)))
+    {
+        return None;
+    }
+    Some(value)
 }
 
 /// [`closed_expr_to_owned`], with a depth guard over the array/object
@@ -11102,6 +11113,12 @@ fn closed_expr_to_owned_at_depth<S: EvalSemantics>(
     assert_value_tree_depth(depth);
     match expr {
         Expr::Literal(lit) => Some(literal_to_owned(lit)),
+        // #4005: a loop variable a fold marked so that `==`/`!=` sees jq's identity
+        // short-circuit (#3896), read for its value: the clone shares the marker's
+        // storage, which is all `apply_compare_op` needs. [`closed_expr_to_owned`]
+        // declines an answer that is a container, so none of the binding's identity
+        // can reach the accumulator.
+        Expr::TrackedVar(marker) if S::TAG == EvalTag::Jq => Some(marker.value.clone()),
         Expr::Paren(inner) => closed_expr_to_owned_at_depth::<S>(inner, depth + 1),
         Expr::Pipe(stages) => {
             let (head, rest) = stages.split_first()?;
@@ -78364,12 +78381,14 @@ mod tests {
         }
     }
 
-    /// #3241: an UPDATE holding a marker is never closed, so the owned
-    /// assignment declines it and the step takes the evaluator route with the
-    /// witness #3181 gives it. A marker is how a binding's node reaches the
-    /// UPDATE, so a step that answered one here could not keep the identity
-    /// it names. Every position a marker can sit in -- the right side, a
-    /// computed key, a parenthesised target -- and both origins.
+    /// #3241: an UPDATE whose answer would be a marker's container is never
+    /// closed, so the owned assignment declines it and the step takes the
+    /// evaluator route with the witness #3181 gives it. A marker is how a
+    /// binding's node reaches the UPDATE, so a step that answered one here could
+    /// not keep the identity it names. The positions a marker's node can reach
+    /// the accumulator from -- the right side, an operand, a parenthesised
+    /// target -- and both origins. A marker read for a *scalar* is a different
+    /// matter (#4005): see `owned_assign_step_reads_markers_by_value_for_scalars_4005`.
     #[test]
     fn owned_assign_step_declines_markers_3241() {
         let value = OwnedValue::object_from([("k".to_string(), OwnedValue::Int(1))]);
@@ -78382,9 +78401,11 @@ mod tests {
         let mut exprs = Vec::new();
         for src in [
             ".a = $m",
-            ".[$m.k | tostring] = 1",
             "($m.k) = 9",
             ".a += $m",
+            // #4005: a container answer built from a marker declines too.
+            ".a = [$m.k]",
+            ".a = {k: $m.k}",
         ] {
             exprs.push((
                 src,
@@ -78405,6 +78426,48 @@ mod tests {
                 panic!("a marker-bearing UPDATE was handled: {src}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_owned_assign_step answered an UPDATE holding an Expr::TrackedVar, which closed_expr_to_owned rejects (#3241)"
             };
             assert_eq!(returned, state, "{src}: the declined state is untouched");
+        }
+    }
+
+    /// #4005: a marker read for a scalar -- a key, a field, a comparison of two
+    /// of them -- carries none of the binding's identity into the accumulator, so
+    /// the owned step answers it. `$m == $m` over a NaN-bearing container is `true`
+    /// because the two operands are one shared node (jq's instance check, #3896),
+    /// which only holds if the step reads the marker rather than a rebuilt copy.
+    #[test]
+    fn owned_assign_step_reads_markers_by_value_for_scalars_4005() {
+        let nan_row = OwnedValue::array_from(vec![
+            OwnedValue::Float(f64::NAN),
+            OwnedValue::String("x".into()),
+        ]);
+        let value = OwnedValue::object_from([
+            ("k".to_string(), OwnedValue::String("key".into())),
+            ("a".to_string(), OwnedValue::Int(2)),
+            ("b".to_string(), OwnedValue::Int(2)),
+            ("row".to_string(), nan_row),
+        ]);
+        let state = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(0))]);
+        for (src, key, expected) in [
+            (".[$m.k] = ($m.a == $m.b)", "key", OwnedValue::Bool(true)),
+            (".[$m.k] = ($m.a != $m.b)", "key", OwnedValue::Bool(false)),
+            (".[$m.k] = ($m == $m)", "key", OwnedValue::Bool(true)),
+            (
+                ".[$m.k] = ($m.row == $m.row)",
+                "key",
+                OwnedValue::Bool(true),
+            ),
+            (".[$m.k] = $m.a", "key", OwnedValue::Int(2)),
+        ] {
+            let expr = substitute_var_tracked(&parse(src).unwrap(), "m", &value);
+            let OwnedStep::Handled(Ok(written)) =
+                try_owned_assign_step::<JqSemantics>(&expr, state.clone())
+            else {
+                panic!("a scalar read of a marker was declined: {src}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if the owned step declined a marker read for a scalar, which #4005 admits"
+            };
+            let OwnedValue::Object(fields) = written else {
+                panic!("expected an object: {src}"); // patchcov: coverage tolerate-line reason="unreachable: an owned assignment into an object state leaves an object"
+            };
+            assert_eq!(fields.get(key), Some(&expected), "{src}");
         }
     }
 
@@ -131407,6 +131470,14 @@ mod share_audit_2999 {
         assert_forced(
             &json,
             "reduce .[] as $r ({}; $r as $s | .[$s.name] = $s.score)",
+            &[],
+        );
+        // #4005: an explicit `==`/`!=` on the loop variable marks it (#3896), and the
+        // marker is read by value, so the accumulator is still written in place.
+        assert_forced(&json, "reduce .[] as $r ({}; .[$r.name] = ($r == $r))", &[]);
+        assert_forced(
+            &json,
+            "reduce .[] as $r ({}; .[$r.name] = ($r.name != $r.score))",
             &[],
         );
     }
