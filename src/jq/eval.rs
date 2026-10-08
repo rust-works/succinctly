@@ -2149,7 +2149,7 @@ pub(crate) fn yq_first_of_each_key<T>(keyed: Vec<(String, T)>) -> Vec<T> {
     // A hashed set, not a `BTreeSet`: one probe per element instead of a tree walk of string
     // compares, which is what made the first cut of this +94% on a million distinct integers.
     let mut seen: indexmap::IndexSet<String> = indexmap::IndexSet::with_capacity(keyed.len());
-    let mut out = Vec::with_capacity(keyed.len());
+    let mut out = vec_with_capacity(keyed.len());
     for (key, item) in keyed {
         if seen.insert(key) {
             out.push(item);

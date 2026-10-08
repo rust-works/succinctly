@@ -4299,8 +4299,26 @@ untouched. The key is `tostring`'s text, so `==` and `unique` agree about a numb
   filter literal alike (`[01, 1] | unique` is `[1]` here and `[1,1]` in yq; a document
   `[01, 1, 0x1f, 31, True, true] | unique` has 3 elements here and 6 in yq), the same residual
   `==` has.
-- **Cost.** yq mode builds one `String` per element and a `BTreeMap`/`BTreeSet` of them where it
-  sorted values in place; see the measurements in the PR for #2799 part 2.
+- **Cost.** yq mode builds one `String` key per element and probes a hashed `IndexSet`/`IndexMap`
+  where it used to sort values in place. Interleaved A/B against `main`, release builds, minimum of
+  9 runs, 1M-element arrays (`yq '.a | unique | length'` and friends on 5-10 MB documents; the
+  `sort` row is the unchanged control; outputs identical):
+
+  | filter (1M elements)             | M4 Pro (Mac mini) | Ryzen 9 7950X (Zen 4) |
+  |----------------------------------|-------------------|-----------------------|
+  | `unique`, ints, 50k distinct     | 0.86x             | 1.05x                 |
+  | `unique`, ints, ~1M distinct     | 0.85x             | 1.07x                 |
+  | `unique`, strings, 289k distinct | 0.80x             | 0.67x                 |
+  | `group_by`, ints                 | 0.71x             | 0.77x                 |
+  | `group_by`, strings              | 0.57x             | 0.76x                 |
+  | `unique_by(.k)`, 250k records    | 0.90x             | 0.85x                 |
+  | `sort` (control)                 | 1.00x             | 0.99x                 |
+
+  Peak memory of `unique` over ~1M distinct integers rises by the key strings, about 90 MB on
+  the Mac (133 to 225 MB) and 80 MB on the Ryzen (118 to 196 MB); over strings it rises by
+  3-33 MB. A first cut with a `BTreeSet` was +94% on the distinct-integer row, which is why the
+  set is hashed. The only slower row is `unique` over integers on x86 (+5% to +7%), where the
+  old in-place numeric sort is cheap; yq's own order and keys take precedence (ADR-0018).
 
 Pinned by `dedup_builtins_key_on_text_in_first_occurrence_order_2799` (`tests/yq_cli_tests.rs`)
 and the `dedup_text_keys_2799`/`dedup_containers_2799` goldens.
