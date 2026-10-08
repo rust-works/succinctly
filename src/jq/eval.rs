@@ -46479,6 +46479,11 @@ struct PatternBinding {
 ///   register the branch moved.
 struct PathPatternMode<'f> {
     frame: &'f Frame,
+    /// Set when a step's `path_intact` refusal is of a step that could have
+    /// *succeeded* on the value it refused ([`NavKind::would_succeed_on`]) -- a
+    /// fold's [`settle_fold_alternative`] reads it to tell a refusal that is the
+    /// walk's guess from one jq raises whatever its register is (#3840).
+    refused_step_could_succeed: Option<&'f core::cell::Cell<bool>>,
 }
 
 impl PatternMode for PathPatternMode<'_> {
@@ -46508,6 +46513,9 @@ impl PatternMode for PathPatternMode<'_> {
                 PatternKey::Position(i) => OwnedValue::Int(*i),
                 PatternKey::Computed(value) => (*value).clone(),
             };
+            if let Some(probe) = self.refused_step_could_succeed {
+                probe.set(NavKind::of(&element).is_some_and(|kind| kind.would_succeed_on(input)));
+            }
             return Err(EvalError::invalid_path_expression_near_access(
                 &element, input,
             ));
@@ -46570,7 +46578,24 @@ fn each_pattern_walk<S: EvalSemantics>(
     invert: bool,
     sink: &mut dyn FnMut(PatternRegister, &[PatternBinding]) -> Demand,
 ) -> Flow {
-    let mode = PathPatternMode { frame };
+    each_pattern_walk_probed::<S>(pattern, input, seed, frame, invert, None, sink)
+}
+
+/// [`each_pattern_walk`], noting in `refused_step_could_succeed` whether a
+/// refusal is of a step that could have succeeded on the value it refused (#3840).
+fn each_pattern_walk_probed<S: EvalSemantics>(
+    pattern: &Pattern,
+    input: &OwnedValue,
+    seed: PatternRegister,
+    frame: &Frame,
+    invert: bool,
+    refused_step_could_succeed: Option<&core::cell::Cell<bool>>,
+    sink: &mut dyn FnMut(PatternRegister, &[PatternBinding]) -> Demand,
+) -> Flow {
+    let mode = PathPatternMode {
+        frame,
+        refused_step_could_succeed,
+    };
     let mut out: Vec<PatternBinding> = Vec::new();
     walk_pattern_each::<PathPatternMode<'_>, S>(
         &mode,
@@ -47792,6 +47817,7 @@ impl FoldBind<'_> {
 /// that completed before it. Whether a refusal may retry the next
 /// alternative is [`walk_escape_retries`]'s question, with
 /// [`fold_walk_refusal_is_guess`] supplying its `guessed`.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: the fold's threaded ambients plus #3840's refusal probe, as `resolve_reduce`/`resolve_foreach`
 fn each_fold_bind<S: EvalSemantics>(
     pattern: &Pattern,
     elem: &FoldSourceValue,
@@ -47799,17 +47825,19 @@ fn each_fold_bind<S: EvalSemantics>(
     frame: &Frame,
     alternatives: Option<&[String]>,
     source_may_alias: bool,
+    refused_step_could_succeed: &core::cell::Cell<bool>,
     sink: &mut dyn FnMut(Option<PatternRegister>, &FoldBind<'_>) -> Demand,
 ) -> Flow {
     match pattern {
         Pattern::Object(_) | Pattern::Array(_) => {
             let seed = fold_pattern_seed(elem, reg);
-            each_pattern_walk::<S>(
+            each_pattern_walk_probed::<S>(
                 pattern,
                 &elem.value,
                 seed,
                 frame,
                 alternatives.is_some(),
+                Some(refused_step_could_succeed),
                 &mut |walked, bindings| {
                     let bind = FoldBind {
                         binding: FoldBinding::Pattern(bindings),
@@ -48527,6 +48555,7 @@ enum FoldStepOutcome {
 /// retries only when it is jq's own verdict ([`walk_escape_retries`],
 /// guided by [`fold_walk_refusal_is_guess`]); a key generator's `break`
 /// retries like any other, `halt` never.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: the fold's threaded ambients plus #3840's refusal probe, as `each_fold_bind`
 fn settle_fold_alternative<S: EvalSemantics>(
     outcome: Option<FoldStepOutcome>,
     walk: Flow,
@@ -48534,6 +48563,7 @@ fn settle_fold_alternative<S: EvalSemantics>(
     pattern: &Pattern,
     elem: &FoldSourceValue,
     reg: &FoldRegister,
+    refused_step_could_succeed: bool,
     aborted: &StashedEscape,
 ) -> FoldStepOutcome {
     if let Some(outcome) = outcome {
@@ -48554,6 +48584,18 @@ fn settle_fold_alternative<S: EvalSemantics>(
             if walk_escape_retries(&control, is_last, guessed) {
                 FoldStepOutcome::Retry
             } else {
+                // #3840: a refusal that is only the walk's guess at `path_intact`, of a
+                // step that could have succeeded, is loud like every other guess site
+                // (ADR-0018 rule 4): jq may have carried on with this alternative, so a
+                // `try` around the fold must not run its handler for it. A step that
+                // could never succeed is a value error jq raises wherever its register
+                // is, and stays catchable.
+                let control = match control {
+                    Control::Error(e) if guessed && refused_step_could_succeed => {
+                        Control::Error(e.into_guessed_path_refusal())
+                    }
+                    other => other,
+                };
                 FoldStepOutcome::Return(aborted.stop(control))
             }
         }
@@ -49316,6 +49358,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                 // step's own verdict, richer than the `Demand` a sink can
                 // answer, is recorded out-of-band in `outcome`.
                 let mut outcome: Option<FoldStepOutcome> = None;
+                let refused_step_could_succeed = core::cell::Cell::new(false);
                 let walk = each_fold_bind::<S>(
                     pattern,
                     &elem,
@@ -49323,6 +49366,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                     frame,
                     alternatives,
                     source_may_alias,
+                    &refused_step_could_succeed,
                     &mut |walked, bind| {
                         let substituted = bind.apply(update, WalkOrigins::Drop);
                         // **#2632**: mirrors `resolve_foreach`'s own `None`-arm widening
@@ -49443,7 +49487,14 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                     },
                 );
                 match settle_fold_alternative::<S>(
-                    outcome, walk, is_last, pattern, &elem, &reg, &aborted,
+                    outcome,
+                    walk,
+                    is_last,
+                    pattern,
+                    &elem,
+                    &reg,
+                    refused_step_could_succeed.get(),
+                    &aborted,
                 ) {
                     FoldStepOutcome::Retry => continue,
                     FoldStepOutcome::Return(demand) => return demand,
@@ -49789,6 +49840,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                 // `["b","c"]`, `["b","d"]`. The step's verdict is recorded in
                 // `outcome`, as `resolve_reduce`'s is ([`FoldStepOutcome`]).
                 let mut outcome: Option<FoldStepOutcome> = None;
+                let refused_step_could_succeed = core::cell::Cell::new(false);
                 let walk = each_fold_bind::<S>(
                     pattern,
                     &elem,
@@ -49796,6 +49848,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                     frame,
                     alternatives,
                     source_may_alias,
+                    &refused_step_could_succeed,
                     &mut |walked, bind| {
                         let bound_update = bind.apply(update, WalkOrigins::Keep);
                         let bound_extract = extract.map(|ext| bind.apply(ext, WalkOrigins::Keep));
@@ -50041,7 +50094,14 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                     },
                 );
                 match settle_fold_alternative::<S>(
-                    outcome, walk, is_last, pattern, &elem, &reg, &aborted,
+                    outcome,
+                    walk,
+                    is_last,
+                    pattern,
+                    &elem,
+                    &reg,
+                    refused_step_could_succeed.get(),
+                    &aborted,
                 ) {
                     FoldStepOutcome::Retry => continue,
                     FoldStepOutcome::Return(demand) => return demand,
