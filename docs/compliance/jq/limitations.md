@@ -9843,9 +9843,11 @@ unreadable `.b`). Every other bind keeps the eager decode and so raises at the b
   (`.missing | $x`, `.a.b | $x`, `.[0] | $x`) or a computed value (`1 | $x`, `length | $x`,
   `[.[]] | $x`, `(.a, 1) | $x`);
 - a body that reads a member chain under an iteration and goes on to consume it (`.users[] |
-  $x.users | length`, `$x.users[0]`, `$x.nodes[.from]`): the eager bind walked an owned value there,
-  and a cursor walks the array to its index per element (#4035), so only a chain nothing consumes as
-  a pipe stage (`$x.limit`) is deferred there;
+  $x.users | length`, `$x.users[0]`, `$x.nodes[.from]`), or that navigates the node after a bare
+  read (`.users[] | $x | .users[$i]`, `($x) | .users[0]`): the eager bind walked an owned value
+  there, and a cursor walks the array to its index per element (#4035), so only a chain nothing
+  consumes as a pipe stage (`$x.limit`) and a bare read a non-navigating stage follows
+  (`$x | length`, `$x | tojson`) are deferred there;
 - a body that reads `$x` inside anything not on the predicate's list of cursor-preserving forms:
   `reduce`/`foreach`, `map`, `path(...)`, assignment and `del`, `def` bodies and calls, string
   interpolation, `input`, a catch handler, a destructuring bind;
@@ -9874,7 +9876,7 @@ reads identity from, so what a resolver accepts is unchanged, and a write throug
 copies first because the filled entry holds a strong clone, as the eager entry does. It counts as a
 binding in scope (the `embed_table_active` gate that picks the navigation peel over a reindex of the
 shared value) from its fill when the body reads the node bare once per element, and from its second
-read otherwise. A node met *inside* a larger walk (`.a as $y | {k: .}` materializing the root with
+read otherwise. A body that only reads members (`$x.meta.n`) never builds the node, so it registers no entry. A node met *inside* a larger walk (`.a as $y | {k: .}` materializing the root with
 `$y`'s node one level in) is built fresh, as before. Without `std` there is no table to hold the
 entry (no thread-locals), so a bare whole-node read under an iteration keeps the eager decode there,
 as it did before.

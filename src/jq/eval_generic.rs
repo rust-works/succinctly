@@ -7105,27 +7105,48 @@ mod embed_table {
     /// whether any is waiting (#4036).
     pub(crate) fn lazy_lookup(node: usize, document: usize) -> LazyHit {
         LAZY.with(|l| {
-            let l = l.borrow();
+            let mut l = l.borrow_mut();
             let mut waiting = false;
-            for e in l.iter().rev() {
+            let mut found = None;
+            for (at, e) in l.iter().enumerate().rev() {
                 if e.node == node && e.document == document {
                     match &e.value {
                         Some(v) => {
-                            if !e.reused.replace(true) {
-                                ACTIVE.with(|a| a.set(true));
-                            }
-                            return LazyHit::Filled(v.clone());
+                            found = Some((at, v.clone()));
+                            break;
                         }
                         None => waiting = true,
                     }
                 }
             }
-            if waiting {
-                LazyHit::Pending
-            } else {
-                LazyHit::Absent
+            let Some((at, value)) = found else {
+                return if waiting {
+                    LazyHit::Pending
+                } else {
+                    LazyHit::Absent
+                };
+            };
+            if !l[at].reused.replace(true) {
+                ACTIVE.with(|a| a.set(true));
             }
+            if waiting {
+                // A bind of the same node pushed after the fill (`. as $x |
+                // ... | . as $y | ...`) takes the copy its outer one holds.
+                for e in l.iter_mut() {
+                    if e.node == node && e.document == document && e.value.is_none() {
+                        e.value = Some(value.clone());
+                        e.reused.set(true);
+                    }
+                }
+            }
+            LazyHit::Filled(value)
         })
+    }
+
+    /// How many lazy entries hold a value.
+    #[cfg(test)]
+    pub(crate) fn lazy_filled() -> usize {
+        LAZY.with(|l| l.borrow().iter().filter(|e| e.value.is_some()).count())
     }
 
     /// Hand `value`, the materialization of `(node, document)` just built, to
@@ -14588,9 +14609,12 @@ fn each_as_generic<S: EvalSemantics, V: DocumentValue>(
                 DEFERRED_TAKEN.with(|n| n.set(n.get() + 1));
                 if names_var() {
                     // #4036: the first whole-node read builds the value and the
-                    // rest share it, as the eager bind's entry made them.
-                    let _lazy =
-                        embed_lazy_push(&node, body_reads() == Some(DeferredReads::Sharing));
+                    // rest share it, as the eager bind's entry made them. A body
+                    // that only reads members never builds one, so it gets no
+                    // entry to be looked up in.
+                    let reads = body_reads();
+                    let _lazy = (reads != Some(DeferredReads::Members))
+                        .then(|| embed_lazy_push(&node, reads == Some(DeferredReads::Sharing)));
                     let deferred = substitute_deferred_var(body, var, bind_origin_of_cursor(&node));
                     eval_each_generic::<S, V>(&deferred, value.clone(), optional, cursor, sink)
                 } else {
@@ -51888,6 +51912,41 @@ mod deferred_bind_tests_3856 {
         );
         drop(outer);
         assert!(!embed_table::live());
+
+        // A bind of the node pushed after the first one was filled takes that
+        // copy at its first read.
+        let outer = embed_lazy_push(&root, false);
+        let built = to_owned_cursor::<JqSemantics, _>(&root).unwrap();
+        let inner = embed_lazy_push(&root, false);
+        assert_eq!(embed_table::lazy_filled(), 1, "only the outer is filled");
+        let shared = to_owned_cursor::<JqSemantics, _>(&root).unwrap();
+        assert!(shared.shares_storage_with(&built));
+        assert_eq!(embed_table::lazy_filled(), 2, "the inner took the copy");
+        drop(inner);
+        assert!(embed_table::live());
+        drop(outer);
+        assert!(!embed_table::live());
+    }
+
+    /// A binding's entry coming and going does not take the lazy entry's claim
+    /// on `active()` with it (#4036).
+    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    #[test]
+    fn lazy_entry_keeps_the_table_active_across_other_bindings_4036() {
+        let doc = br#"{"a":{"b":[1]},"c":2}"#;
+        let index = JsonIndex::build(doc);
+        let root = index.root(doc);
+        let a = root.first_child().unwrap().next_sibling().unwrap();
+        let _lazy = embed_lazy_push(&root, true);
+        let _ = to_owned_cursor::<JqSemantics, _>(&root).unwrap();
+        assert!(embed_table_active());
+        let mut bound = to_owned_cursor::<JqSemantics, _>(&a).unwrap();
+        let origin = bind_origin_of_cursor(&a);
+        drop(embed_table_push::<JqSemantics>(Some(&origin), &mut bound));
+        assert!(
+            embed_table_active(),
+            "a binding's pop is not the lazy one's"
+        );
     }
 
     /// A node whose materialization fails fills nothing: each read raises the

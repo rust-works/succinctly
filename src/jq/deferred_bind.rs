@@ -95,12 +95,15 @@ const LAZY_SHARES: bool = cfg!(feature = "std");
 /// How a sound body reads `$var` (#4036).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeferredReads {
-    /// Every read navigates the node, or runs once per bind: nothing is
-    /// decoded more than the eager bind decoded it, bare reads included.
-    Navigating,
-    /// Some whole-node read runs once per element of a collection. It decodes
-    /// the node once, in the first run, and every later one shares that copy
-    /// through the lazy embed entry.
+    /// Every read navigates a member of the node (`$x.a`, `$x.meta.n`): none
+    /// materializes it, so there is no copy to share.
+    Members,
+    /// Some read materializes the node, and none runs once per element of a
+    /// collection. It shares one copy with the body's other reads of that node
+    /// (`$x == .`, `[$x, $x]`), where the eager bind decoded it once.
+    Whole,
+    /// Some whole-node read runs once per element. It decodes the node once, in
+    /// the first run, and every later one shares that copy.
     Sharing,
 }
 
@@ -133,6 +136,11 @@ struct State {
     /// Whether a repeated whole-node read is admitted: the walk of a body that
     /// has the shared copy to lean on ([`LAZY_SHARES`]).
     shares: bool,
+    /// The ambient input is the bound node itself, read bare under a repeated
+    /// ambient. Navigating it (`$x | .users[$i]`) walks a cursor per element
+    /// where the eager bind walked an owned value (#4035), so a navigating
+    /// stage after one is refused like `$x.users[$i]` is.
+    whole: bool,
 }
 
 impl State {
@@ -140,6 +148,7 @@ impl State {
         at: Ambient::Cursor,
         repeated: false,
         shares: false,
+        whole: false,
     };
 
     fn join(self, other: Self) -> Self {
@@ -147,11 +156,17 @@ impl State {
             at: self.at.join(other.at),
             repeated: self.repeated || other.repeated,
             shares: self.shares,
+            whole: self.whole || other.whole,
         }
     }
 
     fn with(self, at: Ambient) -> Self {
-        Self { at, ..self }
+        Self {
+            at,
+            // Only a cursor can still be the bound node.
+            whole: self.whole && at == Ambient::Cursor,
+            ..self
+        }
     }
 
     fn repeating(self, many: bool) -> Self {
@@ -180,13 +195,40 @@ pub(crate) fn deferred_bind_is_sound(body: &Expr, var: &str) -> bool {
 /// repeated whole-node reads admitted, where they are the sharing's to pay for.
 pub(crate) fn deferred_bind_reads(body: &Expr, var: &str) -> Option<DeferredReads> {
     if walk(body, var, State::START, false).is_some() {
-        return Some(DeferredReads::Navigating);
+        return Some(if reads_whole_node(body, var) {
+            DeferredReads::Whole
+        } else {
+            DeferredReads::Members
+        });
     }
     let sharing = State {
         shares: LAZY_SHARES,
         ..State::START
     };
     (LAZY_SHARES && walk(body, var, sharing, false).is_some()).then_some(DeferredReads::Sharing)
+}
+
+/// Whether `body` reads `$var` anywhere but as the head of a field chain
+/// (`$x.a`), which is the only read that never materializes the node.
+/// Over-approximate, like [`mentions_var`]: a read it cannot place counts.
+fn reads_whole_node(body: &Expr, var: &str) -> bool {
+    let (mut reads, mut heads) = (0usize, 0usize);
+    any_subexpr(body, &mut |e| {
+        match e {
+            Expr::Var(name) if name == var => reads += 1,
+            Expr::Pipe(stages) => {
+                heads += stages
+                    .windows(2)
+                    .filter(|w| {
+                        matches!(&w[0], Expr::Var(name) if name == var) && is_field_read(&w[1])
+                    })
+                    .count();
+            }
+            _ => {}
+        }
+        false
+    });
+    reads > heads
 }
 
 /// Whether `expr` reads `$var` anywhere. Over-approximate: a nested binder
@@ -241,6 +283,23 @@ fn is_field_read(stage: &Expr) -> bool {
     }
 }
 
+/// A stage that navigates into what it is handed: `.k`, `.[3]`, `.[]`,
+/// `.[a:b]`, `.[expr]`, alone or wrapped, or a pipe that starts with one.
+fn navigates(stage: &Expr) -> bool {
+    match stage {
+        Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Slice { .. }
+        | Expr::IndexExpr { .. }
+        | Expr::SliceExpr { .. }
+        | Expr::ArrayKey(_)
+        | Expr::Iterate => true,
+        Expr::Paren(inner) | Expr::Optional(inner) => navigates(inner),
+        Expr::Pipe(stages) => stages.first().is_some_and(navigates),
+        _ => false,
+    }
+}
+
 /// The state after `expr` runs against `st`, or `None` when `expr` reads
 /// `$var` somewhere a deferred binding cannot be resolved or is not cheap.
 /// `piped` is whether a pipe stage consumes `expr`'s output.
@@ -252,15 +311,22 @@ fn walk(expr: &Expr, var: &str, st: State, piped: bool) -> Option<State> {
         (!mentions_var(e, var)).then_some(State {
             at: Ambient::Opaque,
             repeated: true,
+            whole: false,
             ..st
         })
     };
+    if st.whole && navigates(expr) {
+        return None;
+    }
     match expr {
         // A repeated bare `$x` materializes the whole node per run, which is
         // free once the first run's copy is shared (`State::shares`); the
         // field-chain read is `walk_pipe`'s.
         Expr::Var(name) if name == var => (st.at == Ambient::Cursor && (st.shares || !st.repeated))
-            .then_some(st.with(Ambient::Cursor)),
+            .then_some(State {
+                whole: st.repeated,
+                ..st.with(Ambient::Cursor)
+            }),
         Expr::Identity => Some(st),
         // A member that exists is a cursor; one that does not is an owned
         // `null` -- so the result is `Nav` whatever the input was, unless the
@@ -278,6 +344,7 @@ fn walk(expr: &Expr, var: &str, st: State, piped: bool) -> Option<State> {
                 _ => Ambient::Cursor,
             },
             repeated: true,
+            whole: false,
             ..st
         }),
         Expr::Paren(inner) | Expr::Optional(inner) => walk(inner, var, st, piped),
@@ -381,12 +448,11 @@ fn walk_pipe(stages: &[Expr], var: &str, st: State, piped: bool) -> Option<State
                     .take_while(|stage| is_field_read(stage))
                     .count();
             // A bare `$var` stage reads the whole node, which shares one copy
-            // (`State::shares`); only the fields it navigates are refused.
+            // (`State::shares`): `walk` takes it, and refuses a navigating stage
+            // after it. Only the fields it navigates are refused here.
             if cur.shares && end == i + 1 {
-                if cur.at != Ambient::Cursor {
-                    return None;
-                }
-                cur = cur.with(Ambient::Cursor);
+                let consumed = i + 1 < stages.len() || piped;
+                cur = walk(&stages[i], var, cur, consumed)?;
                 i += 1;
                 continue;
             }
@@ -512,7 +578,60 @@ mod tests {
         // A comma beside it is a fixed number of branches, not a repetition.
         assert_eq!(
             reads(". as $x | ($x | length), (.[] | .b)"),
-            Some(DeferredReads::Navigating)
+            Some(DeferredReads::Whole)
+        );
+    }
+
+    #[test]
+    fn a_bare_read_followed_by_navigation_under_a_repeated_ambient_is_refused() {
+        // The same walk of a cursor per element as `$x.users[0]`, however the
+        // node reaches the navigating stage.
+        assert!(!sound(". as $x | .users[] | $x | .users[0]"));
+        assert!(!sound(
+            ". as $x | .users[] | .id as $i | $x | .users[$i - 1].name"
+        ));
+        assert!(!sound(". as $x | .users[] | ($x) | .users[0]"));
+        assert!(!sound(". as $x | .users[] | $x | .[]"));
+        assert!(!sound(". as $x | .users[] | $x | .users[1:]"));
+        assert!(!sound(
+            ". as $x | .users[] | (if .id == 1 then $x else . end) | .users[0]"
+        ));
+        assert!(!sound(". as $x | .users[] | $x | (.users | length)"));
+        // Not navigating it: a function of the node, or a read that is not
+        // repeated.
+        assert_eq!(reads(". as $x | .users[] | $x | length"), sharing());
+        assert_eq!(reads(". as $x | .users[] | $x | tojson"), sharing());
+        assert_eq!(
+            reads(". as $x | $x | .users[0]"),
+            Some(DeferredReads::Whole)
+        );
+        assert_eq!(reads(". as $x | $x | .users[]"), Some(DeferredReads::Whole));
+        // A stage after a computed value navigates that, not the node.
+        assert_eq!(
+            reads(". as $x | .users[] | [$x] | .[0].users[0]"),
+            sharing()
+        );
+    }
+
+    #[test]
+    fn only_a_body_that_materializes_the_node_has_a_copy_to_share() {
+        assert_eq!(reads(". as $x | $x.a"), Some(DeferredReads::Members));
+        assert_eq!(
+            reads(". as $x | .users[] | $x.meta.n"),
+            Some(DeferredReads::Members)
+        );
+        assert_eq!(
+            reads(". as $x | .[] | $x.b.c"),
+            Some(DeferredReads::Members)
+        );
+        assert_eq!(reads(". as $x | $x"), Some(DeferredReads::Whole));
+        assert_eq!(
+            reads(". as $x | {a: $x.a, b: $x}"),
+            Some(DeferredReads::Whole)
+        );
+        assert_eq!(
+            reads(". as $x | $x.a == $x.b"),
+            Some(DeferredReads::Members)
         );
     }
 
