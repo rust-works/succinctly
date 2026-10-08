@@ -7567,6 +7567,15 @@ pub(crate) enum AnchorScope {
     On,
 }
 
+/// The owned copy of a document node `path(f)` evaluates an `f` the cursor
+/// walk does not take against, with the verdict of the reindex bridge's
+/// identity test on it (#4001). Both cost a walk of the whole node, so a
+/// `path(.big[$k])` repeated per key paid it per key.
+pub(crate) struct RootCopy {
+    owned: OwnedValue,
+    bridge_is_identity: bool,
+}
+
 /// The element scans [`cursor_slot`] may resume, for the duration of one
 /// evaluation (#3702).
 ///
@@ -7591,6 +7600,9 @@ pub(crate) enum AnchorScope {
 #[cfg(feature = "std")]
 mod slot_memo {
     use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use super::RootCopy;
 
     /// How many wide parents are remembered at once: a document has a handful
     /// of wide levels, and each position's climb touches each of them. The
@@ -7617,6 +7629,16 @@ mod slot_memo {
         document: usize,
         /// Least recently used first.
         scans: Vec<Scan>,
+        /// The node `path(f)` last materialized the owned copy of, for an `f`
+        /// the cursor walk does not take (#4001): seen once, then kept.
+        root: Option<RootMemo>,
+    }
+
+    enum RootMemo {
+        /// Seen by one `path(f)`; nothing kept, so a single call pays what it
+        /// always paid and holds no copy past it.
+        Seen(usize),
+        Kept(usize, Rc<RootCopy>),
     }
 
     thread_local! {
@@ -7718,10 +7740,48 @@ mod slot_memo {
                 restore: Restore::Previous(m.replace(State {
                     document,
                     scans: Vec::new(),
+                    root: None,
                 })),
                 _keys: keys,
             }
         })
+    }
+
+    /// What the memo holds for the owned copy of node `id` (#4001).
+    pub(crate) enum RootLookup {
+        /// Kept by an earlier call: use it.
+        Kept(Rc<RootCopy>),
+        /// A second call for the node: build the copy and [`keep_root`] it.
+        Repeat,
+        /// The first call, or no scope for `document`: build it and drop it.
+        First,
+    }
+
+    pub(crate) fn root_lookup(document: usize, id: usize) -> RootLookup {
+        MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            let Some(state) = m.as_mut().filter(|s| s.document == document) else {
+                return RootLookup::First;
+            };
+            match &state.root {
+                Some(RootMemo::Kept(kept, copy)) if *kept == id => {
+                    RootLookup::Kept(Rc::clone(copy))
+                }
+                Some(RootMemo::Seen(seen)) if *seen == id => RootLookup::Repeat,
+                _ => {
+                    state.root = Some(RootMemo::Seen(id));
+                    RootLookup::First
+                }
+            }
+        })
+    }
+
+    pub(crate) fn keep_root(document: usize, id: usize, copy: Rc<RootCopy>) {
+        MEMO.with(|m| {
+            if let Some(state) = m.borrow_mut().as_mut().filter(|s| s.document == document) {
+                state.root = Some(RootMemo::Kept(id, copy));
+            }
+        });
     }
 
     /// The element of `parent` the last scan found -- its node id and index --
@@ -7900,6 +7960,16 @@ mod slot_memo {
     pub(crate) fn note_scanned() {}
 
     pub(crate) fn note_neighbour() {}
+
+    pub(crate) enum RootLookup {
+        First,
+    }
+
+    pub(crate) fn root_lookup(_document: usize, _id: usize) -> RootLookup {
+        RootLookup::First
+    }
+
+    pub(crate) fn keep_root(_document: usize, _id: usize, _copy: alloc::rc::Rc<super::RootCopy>) {}
 }
 
 #[cfg(feature = "std")]
@@ -13080,12 +13150,13 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             // precheck looks for is the `path` builtin *around* it (#3122).
             let demoted = reroot_markers::<S>(path_expr, &root);
             // #2280: `optional` suppresses a decode failure into no output.
-            let owned = match to_owned_with_cursor::<_, S>(&value, cursor) {
+            let copy = match root_copy_for_path::<V, S>(&value, cursor) {
                 Ok(v) => v,
                 Err(e) if suppresses(&e, optional) => return Flow::Exhausted,
                 Err(e) => return Flow::Escaped(Control::Error(e)),
             };
-            if !reindex_bridge_is_identity(&owned) {
+            let owned = &copy.owned;
+            if !copy.bridge_is_identity {
                 // #2925: demand-forwarding, not `eval_on_owned`'s eager
                 // collect -- a consumer wrapping this arm (`limit`, `first`,
                 // `label`/`break`) can now stop the walk early on a document
@@ -13107,13 +13178,13 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
                 // reroots `path_expr` directly instead, per its own comment.
                 return eval_each_owned::<S>(
                     expr,
-                    &owned,
+                    owned,
                     optional,
                     Reentry::Against(root),
                     &mut |v| sink.push(GenericItem::Owned(v)),
                 );
             }
-            each_path_on_owned::<S>(&demoted, &owned, false, &mut |v| {
+            each_path_on_owned::<S>(&demoted, owned, false, &mut |v| {
                 sink.push(GenericItem::Owned(v))
             })
         }
@@ -21089,6 +21160,43 @@ fn sort_family_array_generic<S: EvalSemantics, V: DocumentValue>(
 /// (two mappings with the same collapsed form but different duplicate keys).
 fn sort_keyed_elements<S: EvalSemantics, V: DocumentValue>(keyed: &mut [(SortKey, V::Cursor)]) {
     keyed.sort_by(|(a, _), (b, _)| a.cmp::<S>(b));
+}
+
+/// [`to_owned_with_cursor`] for `path(f)`'s materializing arm, remembering the
+/// copy (and the bridge's identity verdict on it) once a second `path(f)` asks
+/// for the same node (#4001).
+///
+/// A `path(.big[$k])` per key of a wide object otherwise copies the whole
+/// document and re-walks it for the bridge test on every key: the cost of one
+/// lookup became the size of the document. The first call keeps nothing, so a
+/// query that asks once holds no copy past it; one copy is kept at a time, so
+/// the retained size is the transient one it replaces.
+fn root_copy_for_path<V: DocumentValue, S: EvalSemantics>(
+    value: &V,
+    cursor: Option<V::Cursor>,
+) -> Result<Rc<RootCopy>, EvalError> {
+    let build = |value: &V, cursor: Option<V::Cursor>| -> Result<Rc<RootCopy>, EvalError> {
+        let owned = to_owned_with_cursor::<_, S>(value, cursor)?;
+        Ok(Rc::new(RootCopy {
+            bridge_is_identity: reindex_bridge_is_identity(&owned),
+            owned,
+        }))
+    };
+    let Some(c) = cursor else {
+        return build(value, None);
+    };
+    let (document, id) = (c.document_token(), c.node_id());
+    match slot_memo::root_lookup(document, id) {
+        #[cfg(feature = "std")]
+        slot_memo::RootLookup::Kept(copy) => Ok(copy),
+        #[cfg(feature = "std")]
+        slot_memo::RootLookup::Repeat => {
+            let copy = build(value, Some(c))?;
+            slot_memo::keep_root(document, id, Rc::clone(&copy));
+            Ok(copy)
+        }
+        slot_memo::RootLookup::First => build(value, Some(c)),
+    }
 }
 
 /// Whether `path(expr)` can be resolved by walking cursors instead of
@@ -49015,6 +49123,50 @@ mod tests {
             crate::jq::key_index::memo::work().1 > before.1,
             "the index answered"
         );
+    }
+
+    /// #4001: the owned copy `path(f)` makes of a node is kept from the second
+    /// call for that node on, so one `path(f)` holds nothing past itself and a
+    /// loop of them pays for one copy; another node starts over.
+    #[cfg(feature = "std")]
+    #[test]
+    fn path_root_copy_is_kept_from_the_second_call_for_a_node_4001() {
+        let json = br#"{"big":{"a":1}}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let (document, id) = (root.document_token(), root.node_id());
+        let _scope = slot_memo::enter(document);
+        assert!(matches!(
+            slot_memo::root_lookup(document, id),
+            slot_memo::RootLookup::First
+        ));
+        assert!(matches!(
+            slot_memo::root_lookup(document, id),
+            slot_memo::RootLookup::Repeat
+        ));
+        let copy = Rc::new(RootCopy {
+            owned: OwnedValue::Null,
+            bridge_is_identity: true,
+        });
+        slot_memo::keep_root(document, id, copy);
+        assert!(matches!(
+            slot_memo::root_lookup(document, id),
+            slot_memo::RootLookup::Kept(_)
+        ));
+        // Another node replaces it; the first starts over rather than reviving it.
+        assert!(matches!(
+            slot_memo::root_lookup(document, id + 2),
+            slot_memo::RootLookup::First
+        ));
+        assert!(matches!(
+            slot_memo::root_lookup(document, id),
+            slot_memo::RootLookup::First
+        ));
+        // No scope open for another document: nothing is kept for it.
+        assert!(matches!(
+            slot_memo::root_lookup(document + 1, id),
+            slot_memo::RootLookup::First
+        ));
     }
 
     /// #4002: `has($k)` over a wide object is answered by the key index once
