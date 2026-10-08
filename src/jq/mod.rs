@@ -70,6 +70,7 @@
 //! }
 //! ```
 
+mod deferred_bind;
 pub mod document;
 mod error;
 pub mod escape;

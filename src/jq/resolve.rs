@@ -1172,6 +1172,7 @@ fn build_call_graph(
         | Expr::Format(_)
         | Expr::Var(_)
         | Expr::TrackedVar(_)
+        | Expr::DeferredVar(_)
         | Expr::Loc { .. }
         | Expr::Env
         | Expr::Break(_) => {}
@@ -2303,6 +2304,7 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
         | Expr::Not
         | Expr::Format(_)
         | Expr::TrackedVar(_)
+        | Expr::DeferredVar(_)
         | Expr::Loc { .. } => {}
 
         // #3029: `$ENV` is an ordinary, shadowable binding in jq (and in

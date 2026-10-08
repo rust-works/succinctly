@@ -1985,6 +1985,13 @@ impl<W> From<EvalError> for QueryResult<'_, W> {
     }
 }
 
+/// The message of the internal error a deferred `as` binding raises when it is
+/// read with no cursor of its own document in hand (#3856). Reaching it means
+/// `eval_generic::deferred_bind_reads_are_sound` admitted a position it should
+/// not have; it is never a user error, and never a guessed value.
+pub(crate) const DEFERRED_BIND_UNRESOLVED: &str =
+    "internal: a deferred variable binding was read without a cursor of its document (#3856)";
+
 // jq's `jv_kind` discriminants, verbatim from `jv.h`, so the two enums can be
 // read side by side. `JV_KIND_INVALID` (0) has no `OwnedValue` counterpart — an
 // `OwnedValue` is always a valid value — so the numbering starts at 1.
@@ -3470,6 +3477,11 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // ordinary bound value -- `resolve_node`'s own `Expr::TrackedVar`
         // arm is what actually decides path-trackability.
         Expr::TrackedVar(v) => QueryResult::Owned(v.value.clone()),
+        // #3856: this evaluator reads a reindexed copy of the value, which has
+        // no node of the original document to resolve a deferred binding
+        // against. `deferred_bind_is_sound` keeps a deferred binding out of
+        // every body that can reach here, so this is the loud backstop.
+        Expr::DeferredVar(_) => QueryResult::Error(EvalError::new(DEFERRED_BIND_UNRESOLVED)),
         Expr::Loc { line, file } => {
             // #2688: `$__loc__` names the *program text*, not the input --
             // jq's own `locfile` uses the literal string `<top-level>` for
@@ -56187,6 +56199,9 @@ struct LazyMarker<'a> {
     origin: Origin,
     node: Option<BindOrigin>,
     built: core::cell::OnceCell<Rc<Tracked>>,
+    /// A deferred binding (#3856): every `$var` becomes this
+    /// [`Expr::DeferredVar`] and `value`/`origin` are never read.
+    deferred: Option<Rc<BindOrigin>>,
 }
 
 impl<'a> LazyMarker<'a> {
@@ -56196,6 +56211,16 @@ impl<'a> LazyMarker<'a> {
             origin,
             node,
             built: core::cell::OnceCell::new(),
+            deferred: None,
+        }
+    }
+
+    /// What a `$var` becomes: the shared deferred marker, or the lazily built
+    /// tracked snapshot.
+    fn expr(&self) -> Expr {
+        match &self.deferred {
+            Some(node) => Expr::DeferredVar(Rc::clone(node)),
+            None => Expr::TrackedVar(self.get()),
         }
     }
 
@@ -56208,6 +56233,20 @@ impl<'a> LazyMarker<'a> {
             })
         }))
     }
+}
+
+/// Substitute a deferred binding (#3856) for `$var_name` in `body`: every
+/// occurrence becomes one shared [`Expr::DeferredVar`] naming `node`, with
+/// the same shadowing, `Shared` opacity and pattern rules as
+/// [`substitute_bound_var_from`] -- it is the same traversal, with a marker
+/// that builds a different leaf, so the two cannot drift (#2873).
+pub(crate) fn substitute_deferred_var(body: &Expr, var_name: &str, node: BindOrigin) -> Expr {
+    // Never read: `LazyMarker::expr` answers the deferred leaf, and the
+    // builtin arms that take a replacement value only see it through a mark.
+    let unread = OwnedValue::Null;
+    let mut marker = LazyMarker::new(&unread, Origin::Untracked, None);
+    marker.deferred = Some(Rc::new(node));
+    substitute_var_impl(body, var_name, &unread, Some(&marker))
 }
 
 /// Substitute `bound` for `$var_name` in `body`, choosing between
@@ -56482,7 +56521,7 @@ fn substitute_var_impl(
         // binding, which is the O(depth^2) traversal this design removes.
         Expr::Shared(inner) => Expr::Shared(Rc::clone(inner)),
         Expr::Var(name) if name == var_name => match mark {
-            Some(marker) => Expr::TrackedVar(marker.get()),
+            Some(marker) => marker.expr(),
             None => owned_to_expr(replacement),
         },
         // #2727: `Expr::Error` used to stop here with `msg.clone()`,
@@ -131123,8 +131162,21 @@ mod tests {
             (OBJ, "[.a, .b] | length", Some("2"), Some("2")),
             (OBJ, "[.[], 1] | length", Some("3"), Some("3")),
             (OBJ, "{x: .b} | length", None, None),
-            (OBJ, ".b as $x | 1", None, None),
-            ("[1.2.3]", ". as $x | 1", None, None),
+            // #3856: a bind decodes what a body reads from it, and nothing
+            // when the body never names the variable (a scalar included) or
+            // reads only well-formed members of a subtree.
+            //
+            // `eval_using` is handed the element already decoded, which raises
+            // for the whole of it, so it never reaches the bind.
+            (OBJ, ".b as $x | 1", Some("1"), Some("1")),
+            ("[1.2.3]", ". as $x | 1", None, Some("1")),
+            (OBJ, ". as $x | 1", None, Some("1")),
+            (OBJ, ". as $x | $x.a", None, Some("1")),
+            (OBJ, ". as $x | [$x.a, 2] | length", None, Some("2")),
+            (OBJ, ". as $x | .a + $x.a", None, Some("2")),
+            // Handing the node on (`$x`, `$x.b`) is `.` and `.b`: the printer
+            // reads it, which `test_unreadable_value_collection_split_3266`
+            // pins from the CLI.
             (OBJ, "[.b, empty] | length", Some("1"), Some("1")),
             (OBJ, "[.[] | ., .] | length", None, None),
             (OBJ, "[.[] | [.]] | length", None, None),
