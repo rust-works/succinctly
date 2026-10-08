@@ -65678,6 +65678,54 @@ fn test_nested_foreach_pattern_chain_on_a_null_register_answers_the_member_it_mo
     ])
 }
 
+/// #3963: a three-alternative `?//` chain under an `|=`/`op=` write fails in jq 1.7.1 with
+/// `Paths must be specified as an array` -- the second retry through `_modify` corrupts its
+/// `reduce` accumulator, a VM-stack quirk the project deliberately does not reproduce
+/// (`limitations.md`, #2974). succinctly reports the earlier alternative's own error instead, so
+/// the exit code (5) and the empty stdout match jq and only the message differs. The rows pin
+/// that recorded divergence, and that `=` (which carries on with the retried alternative) and
+/// the two-alternative chain (whose retry raises its own error) still answer as jq does.
+#[test]
+fn test_three_alternative_chain_under_limit_update_keeps_the_earlier_error_3963() -> Result<()> {
+    let nested = r"foreach (foreach . as [$a] ?// {a:$a} ?// $a (0; .; .)) as $x (.; .; .)";
+    let flat = r". as [$a] ?// {a:$a} ?// $a | .";
+    for (filter, message) in [
+        (
+            format!("(limit(1; {nested})) |= 9"),
+            r#"Cannot index array with string "a""#,
+        ),
+        (
+            format!("(limit(1; {flat})) |= 9"),
+            r#"Cannot index array with string "a""#,
+        ),
+        (
+            format!("(limit(1; {nested})) += 1"),
+            "array ([1]) and number (1) cannot be added",
+        ),
+    ] {
+        let (output, stderr, code) = run_jq_full(&["-c", &filter], Some("null"))?;
+        assert_eq!(code, 5, "{filter}: {stderr}");
+        assert_eq!(output, "", "{filter}");
+        assert!(stderr.contains(message), "{filter}: {stderr}");
+    }
+    // `=` carries on with the retried alternative, as jq does.
+    let (output, stderr, code) =
+        run_jq_full(&["-c", &format!("(limit(1; {flat})) = 9")], Some("null"))?;
+    assert_eq!((output.as_str(), code), ("9\n", 0), "{stderr}");
+    // The two-alternative chain's retry raises its own error in jq too.
+    let (output, stderr, code) = run_jq_full(
+        &["-c", "(limit(1; . as [$a] ?// {a:$a} | .)) |= 9"],
+        Some("null"),
+    )?;
+    assert_eq!(code, 5, "{stderr}");
+    assert_eq!(output, "");
+    assert!(
+        stderr.contains(r#"Cannot index array with string "a""#),
+        "{stderr}"
+    );
+    Ok(())
+}
+
 /// #3939: on a `null` (or boolean) register a nested `foreach` leaves jq's register on the
 /// member its pattern or source navigated to, and `jv_identical` admits the outer EXTRACT's
 /// `null` there by kind, so the outer fold's path is that member's, not the root's.
