@@ -4448,6 +4448,13 @@ fn stream_json_escape<Out: core::fmt::Write>(out: &mut Out, ch: char) -> core::f
             out.write_char(HEX[(b >> 4) as usize] as char)?;
             out.write_char(HEX[(b & 0xf) as usize] as char)
         }
+        // U+2028/U+2029 are the one pair of code points >= 0x20 yq always
+        // escapes, whatever spelling the source used (`write_json_body_yq`,
+        // #1982): a `\u2028` or `\U00002028` escape decodes to one and
+        // reaches this function, so it has to agree with the raw-byte route
+        // (#2663).
+        '\u{2028}' => out.write_str("\\u2028"),
+        '\u{2029}' => out.write_str("\\u2029"),
         // Everything >= 0x20 (including C1 controls 0x80-0x9F and higher
         // codepoints) streams as raw UTF-8, matching `stream_json_string`'s
         // policy and yq's own output: JSON only requires escaping `"`, `\`,

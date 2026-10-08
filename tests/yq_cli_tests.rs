@@ -52915,27 +52915,60 @@ fn test_yq_jq_extensions_bounded_pipe_stops_at_the_bound_3514() -> Result<()> {
 
 /// #2607 / #2663: the streaming YAML->JSON writer kept its own copy of yq's
 /// string escaper, which never learned the U+2028/U+2029 escaping #1982 gave the
-/// shared one, so `-o json` wrote the two separators raw wherever the cursor
-/// streamed (the default for `.`, `.a`, `.[]`) and escaped them wherever a write
-/// or `--arg` forced the DOM. It now delegates to that one definition. Every row
-/// is captured whole from yq v4.53.3; `…` (U+2026) and `→` (U+2192) share the
-/// separators' `0xE2` lead byte and must stay raw.
+/// shared one, so `-o json` wrote a separator that arrived as a raw UTF-8 byte
+/// unescaped wherever the cursor streamed (the default for `.`, `.a`, `.[]`) and
+/// escaped it wherever a write or `--arg` forced the DOM. It now delegates to
+/// that one definition, and the decoded `\u2028`/`\U00002029` escape forms agree
+/// with it. Every row is captured whole from yq v4.53.3; `…` (U+2026) and `→`
+/// (U+2192) share the separators' `0xE2` lead byte and must stay raw.
 #[test]
 fn test_yq_json_output_escapes_line_and_paragraph_separators_on_every_path_2607() -> Result<()> {
-    let yaml =
-        "a: \"x\u{2028}y\"\nb: [1]\nc: \"p\u{2029}q \u{2026} \u{2192} r\"\nd: \"v\u{2028}\"\n";
-    for (filter, extra, want) in [
+    let ls = "\u{2028}";
+    let ps = "\u{2029}";
+    let mapping =
+        format!("a: \"x{ls}y\"\nb: [1]\nc: \"p{ps}q \u{2026} \u{2192} r\"\nd: \"v{ls}\"\n");
+    let flow = format!("{{\"a\": \"x{ls}y{ps}z\"}}\n");
+    let sequence = format!("- \"x{ls}y\"\n- 'p{ps}q'\n");
+    let escapes = "a: \"x\\u2028y\"\nb: \"x\\U00002029y\"\nc: \"\\L\\P \\u2026\"\n";
+    for (yaml, filter, extra, want) in [
         (
+            mapping.as_str(),
             ".",
             &[][..],
             "{\"a\":\"x\\u2028y\",\"b\":[1],\"c\":\"p\\u2029q \u{2026} \u{2192} r\",\"d\":\"v\\u2028\"}\n",
         ),
-        (".a", &[][..], "\"x\\u2028y\"\n"),
-        (".c", &[][..], "\"p\\u2029q \u{2026} \u{2192} r\"\n"),
-        (".d", &[][..], "\"v\\u2028\"\n"),
-        // The DOM route (`--arg` forces it) already escaped them; the two routes agree.
-        (".a", &["--arg", "x", "1"][..], "\"x\\u2028y\"\n"),
-        (".c", &["--arg", "x", "1"][..], "\"p\\u2029q \u{2026} \u{2192} r\"\n"),
+        (mapping.as_str(), ".a", &[][..], "\"x\\u2028y\"\n"),
+        (
+            mapping.as_str(),
+            ".c",
+            &[][..],
+            "\"p\\u2029q \u{2026} \u{2192} r\"\n",
+        ),
+        // A JSON-sourced flow mapping (#2607's own repro), a sequence, and a
+        // single-quoted scalar.
+        (flow.as_str(), ".", &[][..], "{\"a\":\"x\\u2028y\\u2029z\"}\n"),
+        (sequence.as_str(), ".", &[][..], "[\"x\\u2028y\",\"p\\u2029q\"]\n"),
+        (sequence.as_str(), ".[1]", &[][..], "\"p\\u2029q\"\n"),
+        // The escape forms decode to the same code points.
+        (
+            escapes,
+            ".",
+            &[][..],
+            "{\"a\":\"x\\u2028y\",\"b\":\"x\\u2029y\",\"c\":\"\\u2028\\u2029 \u{2026}\"}\n",
+        ),
+        // The DOM route (`--arg` forces it) already escaped them; the routes agree.
+        (
+            mapping.as_str(),
+            ".a",
+            &["--arg", "x", "1"][..],
+            "\"x\\u2028y\"\n",
+        ),
+        (
+            mapping.as_str(),
+            ".c",
+            &["--arg", "x", "1"][..],
+            "\"p\\u2029q \u{2026} \u{2192} r\"\n",
+        ),
     ] {
         let mut args = vec!["-o", "json", "-I0"];
         args.extend_from_slice(extra);
@@ -52943,7 +52976,7 @@ fn test_yq_json_output_escapes_line_and_paragraph_separators_on_every_path_2607(
         assert_eq!(
             (stdout.as_str(), stderr.as_str(), code),
             (want, "", 0),
-            "`{filter}` {extra:?}"
+            "`{filter}` {extra:?} on {yaml:?}"
         );
     }
     Ok(())
