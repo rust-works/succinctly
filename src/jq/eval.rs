@@ -45306,7 +45306,14 @@ fn yields_only_the_register(e: &Expr) -> bool {
         Expr::Identity => true,
         Expr::Pipe(items) => items.iter().all(yields_only_the_register),
         Expr::Comma(items) => items.iter().all(yields_only_the_register),
-        _ => false,
+        // #3956: a stage that hands the register on without being a syntactic `.`. `select`
+        // with a literal condition cannot raise and emits the register or nothing; the
+        // other wrappers emit what their operand does ([`peel_register_transparent`]).
+        Expr::Builtin(Builtin::Select(cond)) => matches!(unwrap_paren(cond), Expr::Literal(_)),
+        other => {
+            let peeled = peel_register_transparent(other);
+            !core::ptr::eq(peeled, other) && yields_only_the_register(peeled)
+        }
     }
 }
 
@@ -45350,7 +45357,14 @@ fn foreach_source_destructures_register(source: &Expr) -> bool {
             (routes_destructuring(patterns) || routes_destructuring_chain(patterns))
                 && yields_only_the_register(input)
         }
-        _ => false,
+        // #3956: a wrapper that emits what its operand does (`try E`, `E?`, `first(E)`,
+        // `limit(n; E)`) meets the register where `E` does, and a `label` runs its body in
+        // the same scope, so the destructure behind it is the source's own.
+        Expr::Label { body, .. } => foreach_source_destructures_register(body),
+        other => {
+            let peeled = peel_register_transparent(other);
+            !core::ptr::eq(peeled, other) && foreach_source_destructures_register(peeled)
+        }
     }
 }
 
