@@ -18704,20 +18704,19 @@ mod meta_assign_798 {
         Ok(())
     }
 
-    /// `literal`/`folded`/`tagged` are in real yq's vocabulary (so they
-    /// never raise `unknown style`) but succinctly's emitter can't render
-    /// them -- refused explicitly rather than accepted and ignored.
+    /// `tagged` is in real yq's vocabulary (so it never raises `unknown style`)
+    /// but succinctly's emitter can't render it yet -- refused explicitly
+    /// rather than accepted and ignored. (`literal` and `folded` render since
+    /// #2707.)
     #[test]
-    fn style_literal_folded_tagged_raise_not_yet_supported() {
-        for style in ["literal", "folded", "tagged"] {
-            let filter = format!(".a style = \"{style}\"");
-            let (_out, err, code) = run_yq_stdin_with_stderr(&filter, "a: hello\n", &[]).unwrap();
-            assert_eq!(code, 1, "[{filter}] stderr: {err}");
-            assert!(
-                err.contains(&format!("style = \"{style}\" is not yet supported")),
-                "[{filter}] stderr: {err}"
-            );
-        }
+    fn style_tagged_raises_not_yet_supported() {
+        let filter = ".a style = \"tagged\"";
+        let (_out, err, code) = run_yq_stdin_with_stderr(filter, "a: hello\n", &[]).unwrap();
+        assert_eq!(code, 1, "[{filter}] stderr: {err}");
+        assert!(
+            err.contains("style = \"tagged\" is not yet supported"),
+            "[{filter}] stderr: {err}"
+        );
     }
 
     /// An anchor name go-yaml's emitter refuses raises real yq's exact
@@ -42713,6 +42712,917 @@ fn test_jq_mode_never_takes_the_yq_reemit_path_2588() -> Result<()> {
         let (out, code) = run_jq_stdin(filter, DOC, &["-c"])?;
         assert_eq!(out.trim(), want, "`{filter}`");
         assert_eq!(code, 0, "`{filter}`");
+    }
+    Ok(())
+}
+
+/// #2707: a DOM write (`.z = 1`, `-P`, `-I4`, ...) leaves a block scalar in the
+/// document as a block scalar, with its chomping and indentation indicators, its
+/// trailing comment on the header line and its anchor before it, instead of
+/// re-rendering it as `"x\ny\n"`. Every row is captured live from yq v4.53.3.
+#[test]
+fn test_yq_dom_write_keeps_block_scalars_2707() -> Result<()> {
+    let cases: &[(&str, &str, &[&str], &str)] = &[
+        (
+            r"a: |
+  x
+  y
+",
+            r".b = 1",
+            &[],
+            r"a: |
+  x
+  y
+b: 1
+",
+        ),
+        (
+            r"a: |-
+  x
+  y
+",
+            r".b = 1",
+            &[],
+            r"a: |-
+  x
+  y
+b: 1
+",
+        ),
+        (
+            r"a: |+
+  x
+  y
+
+
+b: 2
+",
+            r".z = 1",
+            &[],
+            r"a: |+
+  x
+  y
+
+
+b: 2
+z: 1
+",
+        ),
+        (
+            r"a: |2
+    x
+  y
+",
+            r".z = 1",
+            &[],
+            r"a: |2
+    x
+  y
+z: 1
+",
+        ),
+        (
+            r"a: >
+  x
+  y
+
+  z
+",
+            r".z = 1",
+            &[],
+            r"a: >
+  x y
+
+  z
+
+z: 1
+",
+        ),
+        (
+            r"a: >-
+  x
+  y
+",
+            r".z = 1",
+            &[],
+            r"a: >-
+  x y
+z: 1
+",
+        ),
+        (
+            r"a: >+
+  x
+  y
+
+b: 2
+",
+            r".z = 1",
+            &[],
+            r"a: >+
+  x y
+
+
+b: 2
+z: 1
+",
+        ),
+        (
+            r"a: >
+  x
+    y
+  z
+",
+            r".z = 1",
+            &[],
+            r"a: >
+  x
+
+    y
+  z
+
+z: 1
+",
+        ),
+        (
+            r"a:
+  b: |
+    p
+    q
+  c:
+    - |-
+      r
+      s
+    - >
+      t
+      u
+",
+            r".z = 1",
+            &[],
+            r"a:
+  b: |
+    p
+    q
+  c:
+    - |-
+      r
+      s
+    - >
+      t u
+
+z: 1
+",
+        ),
+        (
+            r"a: |
+  x
+  y
+",
+            r".z = 1",
+            &["-I4"],
+            r"a: |
+    x
+    y
+z: 1
+",
+        ),
+        (
+            r"a:
+  b: |
+    p
+    q
+",
+            r".z = 1",
+            &["-I4"],
+            r"a:
+    b: |
+        p
+        q
+z: 1
+",
+        ),
+        (
+            r"a: |
+  x
+  y
+",
+            r".z = 1",
+            &["-P"],
+            r"a: |
+  x
+  y
+z: 1
+",
+        ),
+        (
+            r"a: &an |
+  x
+  y
+",
+            r".z = 1",
+            &[],
+            r"a: &an |
+  x
+  y
+z: 1
+",
+        ),
+        (
+            r"a: | # cm
+  x
+  y
+",
+            r".z = 1",
+            &[],
+            r"a: | # cm
+  x
+  y
+z: 1
+",
+        ),
+        (
+            r"a: |
+  x
+  y
+b: 2
+",
+            r#".a style="double""#,
+            &[],
+            r#"a: "x\ny\n"
+b: 2
+"#,
+        ),
+        (
+            r"a: |
+  x
+  y
+b: 2
+",
+            r#".a style="""#,
+            &[],
+            r"a: |
+  x
+  y
+b: 2
+",
+        ),
+        (
+            r#"a: "x\ny"
+b: 2
+"#,
+            r".z = 1",
+            &[],
+            r#"a: "x\ny"
+b: 2
+z: 1
+"#,
+        ),
+        (
+            r"a: 'x'
+b: 2
+",
+            r#".a = "p\\nq""#,
+            &[],
+            r"a: 'p\nq'
+b: 2
+",
+        ),
+        (
+            r"a: |
+  x
+  y
+",
+            r#".a = "z""#,
+            &[],
+            r"a: |-
+  z
+",
+        ),
+        (
+            r"a: |
+  x
+  y
+",
+            r#".a |= . + "w""#,
+            &[],
+            r"a: |-
+  x
+  y
+  w
+",
+        ),
+        (
+            r"a: |
+  x
+  y
+",
+            r#".a = "z\\nw""#,
+            &[],
+            r"a: |-
+  z\nw
+",
+        ),
+        (
+            r"- |
+  x
+  y
+- 2
+",
+            r".[1] = 3",
+            &[],
+            r"- |
+  x
+  y
+- 3
+",
+        ),
+    ];
+    for (doc, filter, extra, want) in cases {
+        let (out, err, code) = run_yq_stdin_with_stderr(filter, doc, extra)?;
+        assert_eq!(out, *want, "`{filter}` {extra:?} on {doc:?}: {err}");
+        assert_eq!(code, 0, "`{filter}` {extra:?} on {doc:?}: {err}");
+    }
+    Ok(())
+}
+
+/// #2707: `style = "literal"` and `style = "folded"` write a block scalar (they
+/// used to be refused with "not yet supported"): a non-string scalar becomes a
+/// string, a container is rendered in block form, a style inside a flow
+/// collection falls back to double quotes, a string go-yaml cannot write as a
+/// block (empty, trailing space, space before a break) is double-quoted, and the
+/// trailing comment and anchor sit on the header line. Captured live from yq v4.53.3.
+#[test]
+fn test_yq_style_literal_and_folded_2707() -> Result<()> {
+    let cases: &[(&str, &str, &[&str], &str)] = &[
+        (
+            r"a: hello
+",
+            r#".a style = "literal""#,
+            &[],
+            r"a: |-
+  hello
+",
+        ),
+        (
+            r"a: hello
+",
+            r#".a style = "folded""#,
+            &[],
+            r"a: >-
+  hello
+",
+        ),
+        (
+            r"a: 1
+",
+            r#".a style = "literal""#,
+            &[],
+            r"a: |-
+  1
+",
+        ),
+        (
+            r"a: 1
+",
+            r#".a style = "folded""#,
+            &[],
+            r"a: >-
+  1
+",
+        ),
+        (
+            r"a: true
+",
+            r#".a style = "literal""#,
+            &[],
+            r"a: |-
+  true
+",
+        ),
+        (
+            r"a: null
+",
+            r#".a style = "literal""#,
+            &[],
+            r"a: |-
+  null
+",
+        ),
+        (
+            r"a: x # c
+",
+            r#".a style = "literal""#,
+            &[],
+            r"a: |- # c
+  x
+",
+        ),
+        (
+            r"a: x # c
+",
+            r#".a style = "folded""#,
+            &[],
+            r"a: >- # c
+  x
+",
+        ),
+        (
+            r"a: &an hello
+",
+            r#".a style = "literal""#,
+            &[],
+            r"a: &an |-
+  hello
+",
+        ),
+        (
+            r"a: [1, 2]
+",
+            r#".a style = "literal""#,
+            &[],
+            r"a:
+  - 1
+  - 2
+",
+        ),
+        (
+            r"a: {b: 1}
+",
+            r#".a style = "folded""#,
+            &[],
+            r"a:
+  b: 1
+",
+        ),
+        (
+            r"a: [x, y]
+",
+            r#".a[0] style = "literal""#,
+            &[],
+            r#"a: ["x", y]
+"#,
+        ),
+        (
+            r"a:
+  - x
+  - y
+",
+            r#".a[0] style = "literal""#,
+            &[],
+            r"a:
+  - |-
+    x
+  - y
+",
+        ),
+        (
+            r"a:
+  b: hello
+",
+            r#".a.b style = "literal""#,
+            &[],
+            r"a:
+  b: |-
+    hello
+",
+        ),
+        (
+            r"a:
+  b: hello
+",
+            r#".a.b style = "literal""#,
+            &["-I4"],
+            r"a:
+    b: |-
+        hello
+",
+        ),
+        (
+            r"a: hello world
+",
+            r#".a style = "folded""#,
+            &[],
+            r"a: >-
+  hello world
+",
+        ),
+        (
+            r"a: |
+  x
+  y
+",
+            r#".a style = "folded""#,
+            &[],
+            r"a: >
+  x
+
+  y
+
+",
+        ),
+        (
+            r"a: >
+  x
+  y
+",
+            r#".a style = "literal""#,
+            &[],
+            r"a: |
+  x y
+",
+        ),
+        (
+            r"a: hello
+",
+            r#".a style = "literal" | .a style = "double""#,
+            &[],
+            r#"a: "hello"
+"#,
+        ),
+        (
+            r"a: hello
+",
+            r#".a style = "literal" | .a line_comment = "c""#,
+            &[],
+            r"a: |- # c
+  hello
+",
+        ),
+        (
+            r"a: hello
+",
+            r#".a style = "literal" | .a anchor = "z""#,
+            &[],
+            r"a: &z |-
+  hello
+",
+        ),
+        (
+            r#"a: ""
+"#,
+            r#".a style = "literal""#,
+            &[],
+            r#"a: ""
+"#,
+        ),
+        (
+            r"a: ' lead'
+",
+            r#".a style = "literal""#,
+            &[],
+            r"a: |2-
+   lead
+",
+        ),
+        (
+            r"a: 'x '
+",
+            r#".a style = "literal""#,
+            &[],
+            r#"a: "x "
+"#,
+        ),
+        (
+            r"a: 'x 
+y'
+",
+            r#".a style = "literal""#,
+            &[],
+            r"a: |-
+  x y
+",
+        ),
+        (
+            r"a: x
+b: y
+",
+            r#".[] style = "literal""#,
+            &[],
+            r"a: |-
+  x
+b: |-
+  y
+",
+        ),
+    ];
+    for (doc, filter, extra, want) in cases {
+        let (out, err, code) = run_yq_stdin_with_stderr(filter, doc, extra)?;
+        assert_eq!(out, *want, "`{filter}` {extra:?} on {doc:?}: {err}");
+        assert_eq!(code, 0, "`{filter}` {extra:?} on {doc:?}: {err}");
+    }
+    Ok(())
+}
+
+/// #2707: a string with a line break and no style of its own (a fresh write, a
+/// JSON-sourced or computed value) is written the way go-yaml writes it: a literal
+/// block scalar, unless it holds a character go-yaml will not write raw or a
+/// space before a break, which keep their double quotes. A string the source
+/// *quoted* keeps its quoting. Captured live from yq v4.53.3.
+#[test]
+fn test_yq_fresh_multiline_string_is_a_block_scalar_2707() -> Result<()> {
+    let cases: &[(&str, &str, &[&str], &str)] = &[
+        (
+            r"a: 1
+",
+            r#".z = "x\ny""#,
+            &[],
+            r"a: 1
+z: |-
+  x
+  y
+",
+        ),
+        (
+            r"a: 1
+",
+            r#".z = "x\ny\n""#,
+            &[],
+            r"a: 1
+z: |
+  x
+  y
+",
+        ),
+        (
+            r"a: 1
+",
+            r#".z = "x\ny\n\n""#,
+            &[],
+            r"a: 1
+z: |+
+  x
+  y
+
+",
+        ),
+        (
+            r"a: 1
+",
+            r#".z = "\n""#,
+            &[],
+            r"a: 1
+z: |+
+
+",
+        ),
+        (
+            r"a: 1
+",
+            r#".z = " x\ny""#,
+            &[],
+            r"a: 1
+z: |2-
+   x
+  y
+",
+        ),
+        (
+            r"a: 1
+",
+            r#".z = "\nx""#,
+            &[],
+            r"a: 1
+z: |-
+
+  x
+",
+        ),
+        (
+            r"a: 1
+",
+            r#".z = "x\n\ny""#,
+            &[],
+            r"a: 1
+z: |-
+  x
+
+  y
+",
+        ),
+        (
+            r"a: 1
+",
+            r#".z = "x\ty\nz""#,
+            &[],
+            r"a: 1
+z: |-
+  x	y
+  z
+",
+        ),
+        (
+            r"a: 1
+",
+            r##".z = "#x\ny""##,
+            &[],
+            r"a: 1
+z: |-
+  #x
+  y
+",
+        ),
+        (
+            r"a: 1
+",
+            r#".z = "- x\ny""#,
+            &[],
+            r"a: 1
+z: |-
+  - x
+  y
+",
+        ),
+        (
+            r"a: 1
+",
+            r#".z = "x: y\nz""#,
+            &[],
+            r"a: 1
+z: |-
+  x: y
+  z
+",
+        ),
+        (
+            r"a: 1
+",
+            r#".z = "é\nz""#,
+            &[],
+            r"a: 1
+z: |-
+  é
+  z
+",
+        ),
+        (
+            r"a: 1
+",
+            r#".z = "x \ny""#,
+            &[],
+            r#"a: 1
+z: "x \ny"
+"#,
+        ),
+        (
+            r"a: 1
+",
+            r#".z = "x\r\ny""#,
+            &[],
+            r#"a: 1
+z: "x\r\ny"
+"#,
+        ),
+        (
+            r"a: 1
+",
+            r#".z = "x\ny ""#,
+            &[],
+            r#"a: 1
+z: "x\ny "
+"#,
+        ),
+        (
+            r"a: 1
+",
+            r#".z = "a\n b""#,
+            &[],
+            r"a: 1
+z: |-
+  a
+   b
+",
+        ),
+        (
+            r"a: 1
+",
+            r#".z = "x\n\n\ny\n""#,
+            &[],
+            r"a: 1
+z: |
+  x
+
+
+  y
+",
+        ),
+        (
+            r"a: 1
+",
+            r#".z = "'q'\n\"r\"""#,
+            &[],
+            r#"a: 1
+z: |-
+  'q'
+  "r"
+"#,
+        ),
+        (
+            r"a: 1
+",
+            r#".z = ["x\ny", 1]"#,
+            &[],
+            r"a: 1
+z:
+  - |-
+    x
+    y
+  - 1
+",
+        ),
+        (
+            r"a: 1
+",
+            r#".z = {"k": "x\ny"}"#,
+            &[],
+            r"a: 1
+z:
+  k: |-
+    x
+    y
+",
+        ),
+        (
+            r"a: 1
+",
+            r#".z = "x\ny""#,
+            &["-I4"],
+            r"a: 1
+z: |-
+    x
+    y
+",
+        ),
+        (
+            r"a: 1
+",
+            r#".z = {"k": "x\ny"}"#,
+            &["-I4"],
+            r"a: 1
+z:
+    k: |-
+        x
+        y
+",
+        ),
+        (
+            r#"a: "x\ny"
+"#,
+            r".b = 1",
+            &[],
+            r#"a: "x\ny"
+b: 1
+"#,
+        ),
+        (
+            r"a: 'x\ny'
+",
+            r".b = 1",
+            &[],
+            r"a: 'x\ny'
+b: 1
+",
+        ),
+    ];
+    for (doc, filter, extra, want) in cases {
+        let (out, err, code) = run_yq_stdin_with_stderr(filter, doc, extra)?;
+        assert_eq!(out, *want, "`{filter}` {extra:?} on {doc:?}: {err}");
+        assert_eq!(code, 0, "`{filter}` {extra:?} on {doc:?}: {err}");
+    }
+    Ok(())
+}
+
+/// #2707: whatever block scalar is written reads back as the same string -- a
+/// wrong chomping or indentation indicator changes the value silently, so this
+/// round-trips a grid of leading spaces, tabs, `#`, `- `, `: ` and 0-3 trailing
+/// breaks through the writer and the reader, in a literal and a folded block.
+#[test]
+fn test_yq_block_scalars_read_back_as_the_same_string_2707() -> Result<()> {
+    let bodies = [
+        "x\ny", " x\ny", "x\n y", "x\n\ny", "\nx", "#x\ny", "- x\ny", "x: y\nz", "x\ty\nz",
+    ];
+    for body in bodies {
+        for trailing in ["", "\n", "\n\n", "\n\n\n"] {
+            let value = format!("{body}{trailing}");
+            let literal = serde_json::to_string(&value)?;
+            for style in ["", "literal", "folded"] {
+                // go-yaml's folded writer adds a line to a kept (`>+`) trailing
+                // run, so yq itself reads such a value back with one more `\n`.
+                // Likewise a more-indented line (`x\n y`) gets an empty line before it.
+                if style == "folded" && (trailing.len() > 1 || body.contains("\n ")) {
+                    continue;
+                }
+                let filter = if style.is_empty() {
+                    format!(".z = {literal}")
+                } else {
+                    format!(".z = {literal} | .z style = \"{style}\"")
+                };
+                let (yaml, err, code) = run_yq_stdin_with_stderr(&filter, "a: 1\n", &[])?;
+                assert_eq!(code, 0, "{filter}: {err}");
+                let (json, code) = run_yq_stdin(".z", &yaml, &["-o", "json", "-I", "0"])?;
+                assert_eq!(code, 0, "{filter} wrote {yaml:?}");
+                assert_eq!(json.trim(), literal, "{filter} wrote {yaml:?}");
+            }
+        }
     }
     Ok(())
 }

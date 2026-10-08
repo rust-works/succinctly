@@ -34,8 +34,9 @@ use succinctly::json::light::JsonCursor;
 use succinctly::json::validate;
 use succinctly::json::JsonIndex;
 use succinctly::yaml::{
-    format_float_yq_yaml, format_float_yq_yaml_nested, go_yaml_dom_scalar, stream_json_sequence,
-    stream_yaml_sequence, YamlCursor, YamlIndex, YamlValue,
+    format_float_yq_yaml, format_float_yq_yaml_nested, go_yaml_dom_scalar,
+    go_yaml_double_quoted_scalar, stream_json_sequence, stream_yaml_sequence, YamlCursor,
+    YamlIndex, YamlValue,
 };
 
 use super::m2_gate::can_use_m2_streaming;
@@ -3269,12 +3270,12 @@ impl WritableSlot {
 }
 
 /// Real yq's accepted `style =` vocabulary, live-verified against pinned
-/// v4.53.3 (`unknown style bogus` for anything else). `literal`/`folded`/
-/// `tagged` are in the vocabulary but not in [`RENDERABLE_STYLES`]: real yq
-/// renders all three (`a: |-\n  1` / `a: >-\n  1` / `a: !!int 1`),
-/// succinctly's emitter can't yet, so they are refused explicitly rather
-/// than accepted and silently ignored -- see this issue's entry in
-/// `docs/compliance/yq/limitations.md`.
+/// v4.53.3 (`unknown style bogus` for anything else). `tagged` is in the
+/// vocabulary but not in [`RENDERABLE_STYLES`]: real yq renders it
+/// (`a: !!int 1`), succinctly's emitter can't yet, so it is refused explicitly
+/// rather than accepted and silently ignored -- see this issue's entry in
+/// `docs/compliance/yq/limitations.md`. (`literal` and `folded` render since
+/// #2707.)
 fn validate_style(s: &str) -> Option<&'static str> {
     match s {
         "" => Some(""),
@@ -3291,7 +3292,7 @@ fn validate_style(s: &str) -> Option<&'static str> {
 /// The subset of [`validate_style`]'s vocabulary the DOM emitter
 /// (`emit_yaml_value_at_depth`/`yaml_quote_string_with_style`) has a real
 /// rendering arm for.
-const RENDERABLE_STYLES: &[&str] = &["", "flow", "double", "single"];
+const RENDERABLE_STYLES: &[&str] = &["", "flow", "double", "single", "literal", "folded"];
 
 /// The text a `line_comment = s` write stores in `NodeMeta.comment`, or
 /// `None` for a clearing write.
@@ -3785,7 +3786,7 @@ fn apply_meta_assign_writes(
                 node.meta_mut().comment.clone_from(text);
             }
             MetaEffect::Style(style) => {
-                if matches!(*style, "double" | "single") {
+                if matches!(*style, "double" | "single" | "literal" | "folded") {
                     if let Some(plain) = plain_scalar_text(node_value) {
                         *node_value = OwnedValue::String(plain.into());
                     }
@@ -5024,9 +5025,7 @@ fn emit_yaml_value_at_depth(
             // and yq preserves a document literal's exact text.
             literal.to_string()
         }
-        OwnedValue::String(s) => {
-            yaml_quote_string_with_style(s, comments.style(), in_flow, config.json_sourced_floats)
-        }
+        OwnedValue::String(s) => emit_string_scalar(s, comments.style(), in_flow, config, indent),
         OwnedValue::Array(arr) => {
             if arr.is_empty() {
                 "[]".to_string()
@@ -5172,7 +5171,10 @@ fn emit_yaml_value_at_depth(
                             );
                             let comment_suffix = trailing_comment_suffix(elem_comments, indent);
                             let anchor = anchor_decl_prefix(elem_comments);
-                            format!("{indent}-{anchor} {item}{comment_suffix}")
+                            format!(
+                                "{indent}-{anchor} {}",
+                                with_trailing_comment(item, &comment_suffix)
+                            )
                         };
                         let rendered = prepend_head_comment_lines(
                             rendered,
@@ -5319,7 +5321,10 @@ fn emit_yaml_value_at_depth(
                             } else {
                                 comment_suffix
                             };
-                            format!("{indent}{key}:{anchor} {val}{comment_suffix}")
+                            format!(
+                                "{indent}{key}:{anchor} {}",
+                                with_trailing_comment(val, &comment_suffix)
+                            )
                         };
                         let rendered = prepend_head_comment_lines(
                             rendered,
@@ -5437,6 +5442,176 @@ fn can_single_quote(s: &str) -> bool {
     !s.chars().any(|c| c.is_ascii_control())
 }
 
+/// Whether go-yaml writes a string with a line break double-quoted whatever the
+/// requested style: a character its emitter will not write raw (a control, `\r`,
+/// a character outside the BMP) or a space before a line break (libyaml's
+/// `special_characters` and `space_break`).
+/// A character go-yaml's emitter treats as a line break, other than `\r`, which it
+/// will not write raw.
+fn is_yaml_line_break(c: char) -> bool {
+    matches!(c, '\n' | '\u{85}' | '\u{2028}' | '\u{2029}')
+}
+
+fn go_yaml_forces_double_quotes(s: &str) -> bool {
+    let printable = |c: char| {
+        matches!(
+            c,
+            '\n' | '\t' | '\u{20}'..='\u{7E}' | '\u{A0}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}'
+        ) && c != '\u{FEFF}'
+    };
+    let mut previous = '\0';
+    for c in s.chars() {
+        if !printable(c) || (previous == ' ' && is_yaml_line_break(c)) {
+            return true;
+        }
+        previous = c;
+    }
+    false
+}
+
+/// A string scalar as the DOM writer prints it: a block scalar when its style is
+/// `literal`/`folded` (#2707), or when it has no style of its own and holds a line
+/// break, which is what go-yaml does with it (`.b = "x\ny"` is `b: |-`). Inside a flow
+/// collection, or for a string go-yaml cannot write as a block, a requested block
+/// style falls back to double quotes (yq: `["1"]`) and anything else keeps
+/// [`yaml_quote_string_with_style`]'s answer.
+fn emit_string_scalar(
+    s: &str,
+    style: &str,
+    in_flow: bool,
+    config: &OutputConfig,
+    indent: &str,
+) -> String {
+    if !in_flow {
+        let folded = match style {
+            "literal" => Some(false),
+            "folded" => Some(true),
+            "" | VALUE_STYLE_STRING if s.contains('\n') => Some(false),
+            _ => None,
+        };
+        if let Some(folded) = folded {
+            if let Some(block) = emit_block_scalar(s, folded, indent, config.indent_str.len()) {
+                return block;
+            }
+        }
+    }
+    if matches!(style, "literal" | "folded")
+        || (matches!(style, "" | VALUE_STYLE_STRING)
+            && s.contains(['\n', '\r', '\u{85}', '\u{2028}', '\u{2029}'])
+            && go_yaml_forces_double_quotes(s))
+    {
+        return go_yaml_double_quoted_scalar(s);
+    }
+    yaml_quote_string_with_style(s, style, in_flow, config.json_sourced_floats)
+}
+
+/// `rendered` followed by a trailing comment. A block scalar's header is its first
+/// line, and that is where its comment goes (`a: | # c`); anywhere else it is the end.
+fn with_trailing_comment(rendered: String, comment_suffix: &str) -> String {
+    if comment_suffix.is_empty() {
+        return rendered;
+    }
+    if rendered.starts_with(['|', '>']) {
+        if let Some((header, body)) = rendered.split_once('\n') {
+            return format!("{header}{comment_suffix}\n{body}");
+        }
+    }
+    format!("{rendered}{comment_suffix}")
+}
+
+/// The block scalar (`|` literal or `>` folded) go-yaml writes for `s`, header
+/// line included and without the final line break (the entry separator
+/// supplies it), or `None` when go-yaml would not write one (#2707).
+///
+/// `indent` is the indent of the content lines and `step` the width of one
+/// indent unit, which is the indentation indicator go-yaml writes when the first
+/// line starts with a space (`|2-`). Ported from libyaml's
+/// `yaml_emitter_analyze_scalar` (what disqualifies a block) and
+/// `yaml_emitter_write_{literal,folded}_scalar` (how it is written), then
+/// checked against yq v4.53.3 on random strings:
+///
+/// - the chomping indicator comes from the trailing breaks: none is `-`, one
+///   is clip (no indicator), two or more (or a lone break) is `+`;
+/// - a string go-yaml cannot write as a block (empty, a character it will not
+///   write raw, a space before a break, a trailing space, any break other
+///   than `\n`) is `None`, and its caller falls back to quoting;
+/// - folded writes an empty line for every `\n` -- except that go-yaml tests the
+///   first character of the *string*, not the one after the break, so a string
+///   starting with a space, tab or break gets none.
+fn emit_block_scalar(s: &str, folded: bool, indent: &str, step: usize) -> Option<String> {
+    if s.is_empty() || step == 0 || step > 9 {
+        return None;
+    }
+    let chars: Vec<char> = s.chars().collect();
+    if go_yaml_forces_double_quotes(s) || chars.last() == Some(&' ') {
+        return None;
+    }
+    let first = chars[0];
+    let hint = if first == ' ' {
+        char::from_digit(step as u32, 10)?.to_string()
+    } else {
+        String::new()
+    };
+    let breaks_at_end = chars
+        .iter()
+        .rev()
+        .take_while(|&&c| is_yaml_line_break(c))
+        .count();
+    let chomp = match breaks_at_end {
+        0 => "-",
+        1 if chars.len() > 1 => "",
+        _ => "+",
+    };
+    let mut out = format!("{}{hint}{chomp}\n", if folded { '>' } else { '|' });
+    // The final break is the entry separator, not content.
+    let text: &str = s.strip_suffix(is_yaml_line_break).unwrap_or(s);
+    if folded {
+        // go-yaml's quirk, see the doc comment: the test reads the string's start.
+        let extra_break = chars
+            .iter()
+            .find(|&&c| !is_yaml_line_break(c))
+            .is_some_and(|&c| !matches!(c, ' ' | '\t'));
+        let mut breaks = true;
+        let mut leading_spaces = true;
+        for c in text.chars() {
+            if is_yaml_line_break(c) {
+                if !breaks && !leading_spaces && c == '\n' && extra_break {
+                    out.push('\n');
+                }
+                out.push(c);
+                breaks = true;
+            } else {
+                if breaks {
+                    out.push_str(indent);
+                    leading_spaces = matches!(c, ' ' | '\t');
+                }
+                out.push(c);
+                breaks = false;
+            }
+        }
+        // The final break, when the string ended in one, still goes through the
+        // loop above in go-yaml and earns its extra empty line.
+        if s.ends_with('\n') && !breaks && !leading_spaces && extra_break {
+            out.push('\n');
+        }
+    } else {
+        let mut breaks = true;
+        for c in text.chars() {
+            if is_yaml_line_break(c) {
+                out.push(c);
+                breaks = true;
+            } else {
+                if breaks {
+                    out.push_str(indent);
+                }
+                out.push(c);
+                breaks = false;
+            }
+        }
+    }
+    Some(out)
+}
+
 /// Quote a YAML string the way [`yaml_quote_string`] does, except honoring
 /// a known original style (`"single"`/`"double"`, from [`CommentTree`]'s
 /// per-node style — see [`CommentTree::style`]) when there is one and it's
@@ -5447,10 +5622,9 @@ fn can_single_quote(s: &str) -> bool {
 /// *required*, which is not the same as matching what the source actually
 /// wrote (#739's `'single'` repro needs quotes at all, not just safe ones).
 ///
-/// Any other style (`""`, `"flow"`, `"literal"`, `"folded"` — the last two
-/// are block-scalar styles this DOM writer doesn't reproduce; see
-/// `CommentTree`'s own doc comment) falls back to the plain heuristic
-/// unchanged; so does [`VALUE_STYLE_STRING`] (`-P`'s "a quoted string, quoting stripped", #3614),
+/// Any other style (`""`, `"flow"`; `"literal"`/`"folded"` are block scalars,
+/// written by [`emit_string_scalar`] before this is reached, #2707) falls back
+/// to the plain heuristic unchanged; so does [`VALUE_STYLE_STRING`] (`-P`'s "a quoted string, quoting stripped", #3614),
 /// as a string known not to be a plain scalar of another type.
 fn yaml_quote_string_with_style(s: &str, style: &str, in_flow: bool, json_sourced: bool) -> String {
     // No empty-string special case needed here (unlike `yaml_quote_string`
