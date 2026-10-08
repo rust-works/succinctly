@@ -5571,8 +5571,8 @@ third alternative is a second retry through `_modify`, where the two-alternative
 raises its own `Cannot index array with string "a"`. succinctly reports the second
 alternative's error in both cases, exit 5 either way
 ([#3963](https://github.com/rust-works/succinctly/issues/3963); the nested `foreach` is
-incidental, `(limit(1; . as [$a] ?// {a:$a} ?// $a | .)) |= 9` shows the same message, and
-`=` is unaffected). `=` is
+incidental: `(limit(1; . as [$a] ?// {a:$a} ?// $a | .)) |= 9` shows the same message).
+`=` is
 different in jq, and succinctly follows it: `_assign`'s `reduce` carries on with the retried
 alternative, so `(. as $x ?// $y | .[if $x == null then 0 else -5 end]) = 1` on `[1]` is `[1]`
 (it raised `Out of bounds negative array index` here before #2974's review). It carries on
