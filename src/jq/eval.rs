@@ -54894,6 +54894,13 @@ fn navigate_static_component_ref<'v, S: EvalSemantics>(
     component: &Expr,
     current: &WalkNode<'v>,
 ) -> Result<Option<WalkNode<'v>>, EvalEscape> {
+    // #4085: yq finds a mapping's member by the text of a numeric index (`.[1]` is the `1:`
+    // member), here as well as at `set_path`'s entry (#4079); an absent one reads as `null`.
+    if let (Expr::Index { idx, key }, OwnedValue::Object(_)) = (component, current.value()) {
+        if let Some(text) = yq_literal_index_text::<S>(*idx, key.as_ref()) {
+            return Ok(Some(current.field(&text)));
+        }
+    }
     Ok(Some(
         match classify_static_component(component, current.value())? {
             StaticAccess::Field(name) => current.field(name),
@@ -66641,6 +66648,34 @@ fn delete_trie_array(
         return Ok(value);
     }
 
+    // #4085: yq finds a mapping's member by the text of a numeric index, so a continuation
+    // under one (`del(.a[1].b, .l[0])`) is walked into that member; a *terminal* index on a
+    // mapping deletes nothing, as in the single-path form (#2353).
+    if yq_mode && matches!(value, OwnedValue::Object(_)) {
+        for &slot in &node.index_groups {
+            let (step, &child) = node
+                .indices
+                .get_index(slot)
+                .expect("index_groups holds live indices indices");
+            let ArrayStep::Index { idx, frac } = *step else {
+                continue;
+            };
+            let Some(text) = yq_scalar_text::<YqSemantics>(&array_index_step_key(idx, frac))
+                .map(Cow::into_owned)
+            else {
+                continue;
+            };
+            match value.as_object_mut().and_then(|m| m.get_mut(text.as_str())) {
+                Some(target) => {
+                    let old = core::mem::replace(target, OwnedValue::Null);
+                    *target = delete_trie_apply(old, trie, child, yq_mode)?;
+                }
+                None => delete_trie_through_absent(trie, child)?,
+            }
+        }
+        return Ok(value);
+    }
+
     if !matches!(value, OwnedValue::Array(_)) {
         // Not dead code: `resolve_node` validates a `Slice` component by
         // evaluating it as a *read*, and slicing a string is a legal read
@@ -68045,7 +68080,28 @@ fn delete_path_steps(
                     ))
                 }
             },
-            Expr::Index { idx, .. } => match root {
+            Expr::Index { idx, key } => match root {
+                // #4085: yq finds a mapping's member by the text of a numeric index mid-chain
+                // (`del(.a[1].b)` deletes `b` from the `1:` member); only a *terminal* step on
+                // one is the no-op of #2353. A member the mapping lacks reads as `null`.
+                OwnedValue::Object(_) if yq_mode => {
+                    let Some(text) = yq_literal_index_text::<YqSemantics>(*idx, key.as_ref())
+                    else {
+                        return Ok(());
+                    };
+                    // Re-borrowed here rather than bound in the pattern: a guarded arm that
+                    // binds `map` keeps `*root` borrowed across the loop's next iteration.
+                    if let Some(current) = root
+                        .as_object_mut()
+                        .and_then(|map| map.get_mut(text.as_str()))
+                    {
+                        root = current;
+                        steps = rest;
+                        real_slot = true;
+                        continue;
+                    }
+                    return delete_at_path_through_absent(rest, optional, yq_mode);
+                }
                 OwnedValue::Array(arr) => {
                     let key = OwnedValue::Int(*idx);
                     // #2268: real yq raises here too, mid-chain -- confirmed

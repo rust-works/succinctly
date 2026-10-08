@@ -28726,29 +28726,14 @@ fn test_2353_del_wrong_kind_index_key_noop_mid_chain() -> Result<()> {
     Ok(())
 }
 
-/// #2353: **residual gap, not fixed here** -- unlike the single-path shape
-/// above, a comma-grouped `del(.[5], .a)` still raises instead of no-oping
-/// `.[5]` and deleting only `.a`. A single static path (`del(.[5])` alone)
-/// never needs "path prepass" and reaches `delete_at_path` directly (the
-/// site this issue's own fix touches); a `Comma` always does, routing
-/// through `resolve_node`'s shared leaf resolver (`resolve_leaf`), which
-/// evaluates the branch via the *ordinary value evaluator* to get its
-/// output rather than delegating to any of this issue's fixed `delete_*`
-/// functions. That evaluator was found (during this issue's own
-/// investigation, live-verified) to already raise for a **plain read**
-/// of `.[5]` against a bare object (`{"a":1} | .[5]` raises "Cannot index
-/// object with number" in succinctly, where real yq returns `null`) --
-/// this is a materially larger, read-level divergence, not a del()-specific
-/// one, and out of scope for this fix. Filed as a follow-up, #2362. Pinning
-/// the current (unfixed) behavior here rather than silently leaving it
-/// untested.
+/// #2353 / #4085: a comma-grouped `del(.[5], .a)` no-ops `.[5]` and deletes only `.a`, as the
+/// single-path form does and as yq does. It raised `Cannot index object with number` until #4085:
+/// a `Comma` goes through `resolve_node`'s path prepass, whose leaf resolver evaluated the index
+/// against the mapping, and the delete trie then had no rule for a numeric step on one (#2362).
 #[test]
-fn test_2353_del_comma_grouped_wrong_kind_key_still_errors_residual_gap() -> Result<()> {
-    let (_out, code) = run_yq_stdin("del(.[5], .a)", r#"{"a":1,"b":2}"#, &["-o=json", "-I=0"])?;
-    assert_eq!(
-        code, 1,
-        "residual gap: comma-grouped form still errors, unlike the single-path fix above"
-    );
+fn test_2353_del_comma_grouped_wrong_kind_key_noops_4085() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.[5], .a)", r#"{"a":1,"b":2}"#, &["-o=json", "-I=0"])?;
+    assert_eq!((out.trim(), code), (r#"{"b":2}"#, 0));
     Ok(())
 }
 
@@ -58953,6 +58938,144 @@ fn test_yq_metadata_write_through_a_numeric_index_on_a_mapping_4079() -> Result<
     for &(filter, expected) in rows {
         let (stdout, code) = run_yq_stdin(filter, doc, &[])?;
         assert_eq!((stdout.as_str(), code), (expected, 0), "`{filter}`");
+    }
+    Ok(())
+}
+
+/// #4085: the 'Cannot index object with number' a grouped or multi-target write still raised after
+/// #4079 -- `(.a[1], .a[2]) = 7`, `(.a[1] // .z) = 3`, `del(.a[1], .l[0])`, `del(.a[1].b)`,
+/// `del(.a[1].b, .l[0])` -- on a mapping whose members are keyed `1:`, `2:`. The path walker reads
+/// a numeric index on a mapping by its key text, and `del()` walks *into* the member for a
+/// continuation (`b` is deleted from `1:`) while a terminal index on a mapping deletes nothing, as
+/// yq does. Every row captured from yq v4.53.3 with `-o=json -I=0`.
+#[test]
+fn test_yq_grouped_and_multi_target_writes_through_a_numeric_mapping_index_4085() -> Result<()> {
+    let m = "a: {1: y, 2: z, x: 1}\nl: [1, 2]\n";
+    let n = "a: {1: {b: 1, c: 2}, x: 3}\nl: [1, 2]\n";
+    let rows: &[(&str, &str, &str)] = &[
+        (
+            m,
+            "(.a[1], .a[2]) = 7",
+            "{\"a\":{\"1\":7,\"2\":7,\"x\":1},\"l\":[1,2]}\n",
+        ),
+        (
+            m,
+            "(.a[1], .a[2]) |= \"q\"",
+            "{\"a\":{\"1\":\"q\",\"2\":\"q\",\"x\":1},\"l\":[1,2]}\n",
+        ),
+        (
+            m,
+            "(.a[1], .a.x) = 7",
+            "{\"a\":{\"1\":7,\"2\":\"z\",\"x\":7},\"l\":[1,2]}\n",
+        ),
+        (
+            m,
+            "(.a[1] // .z) = 3",
+            "{\"a\":{\"1\":3,\"2\":\"z\",\"x\":1},\"l\":[1,2]}\n",
+        ),
+        (
+            m,
+            "(.a[1], .l[0]) = 3",
+            "{\"a\":{\"1\":3,\"2\":\"z\",\"x\":1},\"l\":[3,2]}\n",
+        ),
+        (
+            m,
+            "(.a | select(.[1] == \"y\") | .[1]) = 1",
+            "{\"a\":{\"1\":1,\"2\":\"z\",\"x\":1},\"l\":[1,2]}\n",
+        ),
+        (
+            m,
+            "(.a[1], .a[9]) = 5",
+            "{\"a\":{\"1\":5,\"2\":\"z\",\"x\":1,\"9\":5},\"l\":[1,2]}\n",
+        ),
+        (
+            m,
+            "(.a[true], .a[1]) = 5",
+            "{\"a\":{\"1\":5,\"2\":\"z\",\"x\":1,\"true\":5},\"l\":[1,2]}\n",
+        ),
+        (
+            m,
+            "del(.a[1], .l[0])",
+            "{\"a\":{\"1\":\"y\",\"2\":\"z\",\"x\":1},\"l\":[2]}\n",
+        ),
+        (
+            m,
+            "del(.l[0], .a[1])",
+            "{\"a\":{\"1\":\"y\",\"2\":\"z\",\"x\":1},\"l\":[2]}\n",
+        ),
+        (
+            m,
+            "del(.a[1], .a.x)",
+            "{\"a\":{\"1\":\"y\",\"2\":\"z\"},\"l\":[1,2]}\n",
+        ),
+        (
+            m,
+            "del(.a[1], .a[2])",
+            "{\"a\":{\"1\":\"y\",\"2\":\"z\",\"x\":1},\"l\":[1,2]}\n",
+        ),
+        (
+            m,
+            "del(.a[1], .a[7])",
+            "{\"a\":{\"1\":\"y\",\"2\":\"z\",\"x\":1},\"l\":[1,2]}\n",
+        ),
+        (
+            n,
+            "del(.a[1].b)",
+            "{\"a\":{\"1\":{\"c\":2},\"x\":3},\"l\":[1,2]}\n",
+        ),
+        (
+            n,
+            "del(.a[1].b, .l[0])",
+            "{\"a\":{\"1\":{\"c\":2},\"x\":3},\"l\":[2]}\n",
+        ),
+        (
+            n,
+            "del(.a[1].b, .a[1].c)",
+            "{\"a\":{\"1\":{},\"x\":3},\"l\":[1,2]}\n",
+        ),
+        (
+            n,
+            "del(.a[1], .a[1].b)",
+            "{\"a\":{\"1\":{\"c\":2},\"x\":3},\"l\":[1,2]}\n",
+        ),
+        (
+            n,
+            "del(.a[1].b, .a.x)",
+            "{\"a\":{\"1\":{\"c\":2}},\"l\":[1,2]}\n",
+        ),
+        (
+            n,
+            "del(.a[9].b, .l[0])",
+            "{\"a\":{\"1\":{\"b\":1,\"c\":2},\"x\":3},\"l\":[2]}\n",
+        ),
+        (
+            n,
+            "del(.a[1].b, .a[2].q)",
+            "{\"a\":{\"1\":{\"c\":2},\"x\":3},\"l\":[1,2]}\n",
+        ),
+        (
+            n,
+            "del(.a[1]?.b)",
+            "{\"a\":{\"1\":{\"c\":2},\"x\":3},\"l\":[1,2]}\n",
+        ),
+        (
+            n,
+            "(.a[1].b, .a[1].c) = 0",
+            "{\"a\":{\"1\":{\"b\":0,\"c\":0},\"x\":3},\"l\":[1,2]}\n",
+        ),
+        (
+            n,
+            "(.a[1].b, .l[0]) |= 5",
+            "{\"a\":{\"1\":{\"b\":5,\"c\":2},\"x\":3},\"l\":[5,2]}\n",
+        ),
+    ];
+    for &(doc, filter, expected) in rows {
+        let (stdout, code) = run_yq_stdin(filter, doc, &["-o", "json", "-I", "0"])?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (expected, 0),
+            "`{filter}` on {doc:?}"
+        );
     }
     Ok(())
 }
