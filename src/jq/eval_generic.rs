@@ -48772,11 +48772,8 @@ mod tests {
                 assert_eq!(got, want, "{indexed}");
                 let (builds, hits) = crate::jq::key_index::memo::work();
                 assert!(builds > before.0, "{indexed}: no index was built");
-                assert!(
-                    hits - before.1 > 300,
-                    "{indexed}: only {} hits",
-                    hits - before.1
-                );
+                let gained = hits - before.1;
+                assert!(gained > 300, "{indexed}: only {gained} hits");
             }
         }
     }

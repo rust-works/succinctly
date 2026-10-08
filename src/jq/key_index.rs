@@ -98,6 +98,11 @@ impl KeyIndex {
     /// anything but plainly well-formed (see the module doc: a refusal sends
     /// the caller to the walk, which says what is wrong).
     pub(crate) fn build<F: DocumentFields>(fields: &F) -> Option<Self> {
+        Self::build_within(fields, MAX_INDEXED_MEMBERS)
+    }
+
+    /// [`build`](Self::build) for an object of at most `max_members` members.
+    fn build_within<F: DocumentFields>(fields: &F, max_members: usize) -> Option<Self> {
         let mut keys = Vec::new();
         let mut hashes: Vec<u64> = Vec::new();
         let mut members = 0usize;
@@ -105,7 +110,7 @@ impl KeyIndex {
         let mut rest = fields.clone();
         while let Some((key, key_cursor, next)) = rest.uncons_key() {
             members += 1;
-            if members > MAX_INDEXED_MEMBERS {
+            if members > max_members {
                 return None;
             }
             // A hash exists only for a key that decoded, so asking for it first
@@ -185,16 +190,18 @@ impl KeyIndex {
         };
         let value_cursor = key_cursor.next_sibling()?;
         let is_first = self.keys[entry] == head.node_id();
-        if let Some(key_start) = key_cursor.text_position() {
-            let expected = if is_first { None } else { Some(b',') };
-            if !key_cursor.preceding_delimiter_ok(key_start, expected) {
-                return Some(Err(key_cursor.malformed_delimiter_error()));
-            }
+        let expected = if is_first { None } else { Some(b',') };
+        let key_ok = key_cursor
+            .text_position()
+            .map_or(true, |at| key_cursor.preceding_delimiter_ok(at, expected));
+        if !key_ok {
+            return Some(Err(key_cursor.malformed_delimiter_error()));
         }
-        if let Some(value_start) = value_cursor.text_position() {
-            if !value_cursor.preceding_delimiter_ok(value_start, Some(b':')) {
-                return Some(Err(value_cursor.malformed_delimiter_error()));
-            }
+        let value_ok = value_cursor.text_position().map_or(true, |at| {
+            value_cursor.preceding_delimiter_ok(at, Some(b':'))
+        });
+        if !value_ok {
+            return Some(Err(value_cursor.malformed_delimiter_error()));
         }
         Some(Ok(Some(value_cursor)))
     }
@@ -282,23 +289,17 @@ pub(crate) mod memo {
         WORK.with(std::cell::Cell::get)
     }
 
-    #[cfg(test)]
+    #[inline(always)]
     fn note_build() {
+        #[cfg(test)]
         WORK.with(|w| w.set((w.get().0 + 1, w.get().1)));
     }
 
-    #[cfg(test)]
+    #[inline(always)]
     fn note_hit() {
+        #[cfg(test)]
         WORK.with(|w| w.set((w.get().0, w.get().1 + 1)));
     }
-
-    #[cfg(not(test))]
-    #[inline(always)]
-    fn note_build() {}
-
-    #[cfg(not(test))]
-    #[inline(always)]
-    fn note_hit() {}
 
     /// What a [`Guard`] puts back when it drops.
     enum Restore {
@@ -437,6 +438,20 @@ pub(crate) mod memo {
             });
             ARMED.with(|a| a.set(true));
         });
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn make_room_gives_up_when_no_index_is_left_to_retire_3913() {
+            // An object wider than the whole budget cannot be made room for by
+            // retiring anything: there is nothing held, and the loop must end.
+            let mut entries: Vec<Entry> = Vec::new();
+            make_room(&mut entries, 1, MEMBER_BUDGET + 1);
+            assert!(entries.is_empty());
+        }
     }
 }
 
@@ -614,6 +629,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn build_refuses_an_object_wider_than_the_cap_3913() {
+        let doc = wide_object(5);
+        with_root_object(&doc, |fields| {
+            assert!(KeyIndex::build_within(fields, 4).is_none());
+            assert_eq!(
+                KeyIndex::build_within(fields, 5).map(|ix| ix.len()),
+                Some(5)
+            );
+        });
+    }
+
     #[cfg(feature = "std")]
     mod memo_flow {
         use super::*;
@@ -758,6 +785,65 @@ mod tests {
                 builds <= objects,
                 "{builds} builds over {objects} objects x 8 rounds"
             );
+        }
+
+        #[test]
+        fn more_wide_objects_than_the_memo_remembers_still_answer_alike_3913() {
+            // One more wide object than the memo has entries for: the oldest
+            // entry is forgotten to make room, and every object still answers
+            // as its walk does.
+            let objects = 17;
+            let members = WIDE_MEMBERS * 2;
+            let doc = format!(
+                "{{{}}}",
+                (0..objects)
+                    .map(|o| {
+                        let inner: Vec<String> =
+                            (0..members).map(|i| format!("\"k{i}\":{o}")).collect();
+                        format!("\"o{o}\":{{{}}}", inner.join(","))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            let _scope = memo::enter(root.document_token());
+            let top = root.value().as_object().expect("an object document");
+            for o in 0..objects {
+                let c = top.find_cursor(&format!("o{o}")).unwrap().expect("member");
+                let fields = c.value().as_object().expect("an object");
+                let want = shown(fields.find_cursor("k7"));
+                for _ in 0..3 {
+                    assert_eq!(shown(find_cursor_memoized(&fields, "k7")), want, "{o}");
+                }
+            }
+        }
+
+        #[test]
+        fn a_yaml_mapping_is_never_registered_3913() {
+            use crate::yaml::{YamlIndex, YamlValue};
+
+            let yaml: String = (0..WIDE_MEMBERS * 2)
+                .map(|i| format!("k{i}: {i}\n"))
+                .collect();
+            let index = YamlIndex::build(yaml.as_bytes()).unwrap();
+            let root = index.root(yaml.as_bytes());
+            let YamlValue::Sequence(docs) = root.value() else {
+                panic!("a YAML root is a sequence of documents"); // patchcov: coverage tolerate-line reason="unreachable: YamlIndex::build always wraps parsed documents in a virtual root Sequence (#798)"
+            };
+            let Some(YamlValue::Mapping(fields)) = docs.into_iter().next() else {
+                panic!("expected a mapping document"); // patchcov: coverage tolerate-line reason="unreachable: the document built above is a block mapping (#3913)"
+            };
+            assert!(fields.head_key_cursor().is_none());
+            let _scope = memo::enter(root.document_token());
+            let before = memo::work();
+            // A format without the key index is told "not wide" by its own
+            // walk; asking the memo to remember it anyway is a no-op.
+            memo::note_wide(&fields);
+            for _ in 0..4 {
+                assert!(matches!(find_cursor_memoized(&fields, "k9"), Ok(Some(_))));
+            }
+            assert_eq!(memo::work(), before);
         }
 
         #[test]
