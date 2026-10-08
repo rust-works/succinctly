@@ -4231,8 +4231,8 @@ Captured live (`-o=json -I0`):
 answers `false` for any pairing that holds an array or object, so `==` is `false` and `!=` is
 `true` there. succinctly answered structural equality before, so `select(. == .)` kept every
 node and now keeps only the scalars; any script that compared whole arrays or objects with
-`==` now sees yq's answer (use `tojson`/`@json` on both sides to compare structurally, which
-works in both tools).
+`==` now sees yq's answer (comparing `tojson` of both sides gives a structural comparison in both tools,
+except that the right-hand text is still a glob: a `*` or `?` in a string value matches there).
 
 Fixed as `eval::yq_scalar_text_eq`, consulted from `eval::apply_compare_op` beside
 #2483's `yq_null_ordering_is_false`, so all three evaluators take it; the matcher is

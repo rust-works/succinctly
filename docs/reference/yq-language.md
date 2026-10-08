@@ -143,9 +143,10 @@ follows yq, `succinctly jq` follows jq:
 | `.[] \| select(key == "ab*")`     | every `ab…` member     | *(no match)*           |
 
 Only `==`/`!=` take this rule. `unique`, `group_by`, `contains` and the
-ordering comparators keep their own semantics, and a container pairing is
-compared structurally here where real yq answers `false` for every one — see
-[limitations.md](../compliance/yq/limitations.md) for the recorded gaps.
+ordering comparators keep their own semantics (see
+[limitations.md](../compliance/yq/limitations.md) for the recorded gaps). A pairing
+that holds an array or object is never equal, as in yq: `[1] == [1]`, `{} == {}` and
+`. == .` are `false` and `!=` is `true`, so `select(. == .)` keeps only the scalars.
 
 Because a mapping key is resolved with the same scalar rules as a value, a
 typed key (`1: x`, `true: y`, `null: z`) is an `!!int`/`!!bool`/`!!null` node

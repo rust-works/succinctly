@@ -785,8 +785,8 @@ pub(crate) fn yq_scalar_text_eq<S: EvalSemantics>(
 /// node): a string's own contents, borrowed; a number or bool as
 /// [`owned_to_string`] renders it; `null` as the four bytes `null`. Only the
 /// numeric arm allocates, so a string-against-string `==` stays free.
-/// `None` for a container, which has no `.Value` and is the caller's cue to
-/// leave the pairing to the structural rule.
+/// `None` for a container, which has no `.Value`: [`yq_scalar_text_eq`] reads it as "no
+/// container pairing is equal" (#2799), `eval_generic.rs`'s key gate as "not a scalar spelling".
 ///
 /// `pub(crate)`, not private: `eval_generic.rs`'s key materialization
 /// (`key_owned_value`, `path_context_item_to_owned`'s `OneCursorValue` arm)
@@ -8046,7 +8046,9 @@ fn each_upper_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let flow = eval_each_owned::<S>(s, &current, optional, Reentry::Proven, &mut |candidate| {
         // #3293: reset per invocation -- see `each_limit`.
         outer_stopped = false;
-        if owned_value_eq::<S>(&candidate, &current) {
+        // #2799: `IN(s)` is `any(s == .; .)`, so it takes `==`'s one definition (yq mode: the
+        // text-and-container rule), the same as `IN(src; s)`.
+        if apply_compare_op::<S>(CompareOp::Eq, &candidate, &current) {
             if sink(Item::Owned(OwnedValue::Bool(true))) == Demand::Stop {
                 outer_stopped = true;
             }
@@ -15409,7 +15411,9 @@ fn builtin_upper_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `optional` into its own `gen` evaluation for exactly this reason.
     // #3036: `current` is this arm's own input, unrebuilt -- bridged.
     let flow = eval_each_owned::<S>(s, &current, optional, Reentry::Proven, &mut |candidate| {
-        if owned_value_eq::<S>(&candidate, &current) {
+        // #2799: `IN(s)` is `any(s == .; .)`, so it takes `==`'s one definition (yq mode: the
+        // text-and-container rule), the same as `IN(src; s)`.
+        if apply_compare_op::<S>(CompareOp::Eq, &candidate, &current) {
             found += 1;
             Demand::Stop
         } else {
