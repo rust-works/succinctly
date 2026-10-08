@@ -10844,7 +10844,7 @@ pub(crate) fn try_eval_owned_step<S: EvalSemantics>(expr: &Expr, state: OwnedVal
 
 /// The assignment half of [`try_eval_owned_step`]: [`owned_assign_step`] over
 /// a consumed state, declining (the untouched state handed back) for anything
-/// that is not one of [`is_owned_assign`]'s four operators.
+/// that is not one of [`is_owned_assign`]'s shapes.
 ///
 /// Split out so a caller that must stay off [`eval_owned_reindex_free`]'s
 /// other arms -- `to_entries`/`from_entries` and the pipes of them, which
@@ -10944,7 +10944,8 @@ fn owned_step_shape(expr: &Expr) -> bool {
 }
 
 /// Whether `expr` is one of the four value-position assignment operators
-/// [`owned_assign_step`] may answer (#3138).
+/// [`owned_assign_step`] may answer (#3138), or such an assignment under an
+/// outer `//` (#3944).
 fn is_owned_assign(expr: &Expr) -> bool {
     match expr {
         // #3944: `=` binds tighter than `//`, so `.[$k] = $v // 0` is
@@ -10996,11 +10997,18 @@ fn owned_assign_shape(expr: &Expr) -> bool {
                     other => closed_expr_shape(other),
                 }
         }
-        _ => false, // patchcov: coverage tolerate-line reason="unreachable: owned_assign_shape's only caller (owned_step_shape) gates the call on is_owned_assign(expr), which recognizes exactly Assign/Update/CompoundAssign/AlternativeAssign -- the same four variants this match already has explicit arms for, so `expr` can never be anything else here (#3138)"
+        _ => false, // patchcov: coverage tolerate-line reason="unreachable: owned_assign_shape's only caller (owned_step_shape) gates the call on is_owned_assign(expr), which recognizes exactly Assign/Update/CompoundAssign/AlternativeAssign and an `Alternative` around one -- the same variants this match already has explicit arms for, so `expr` can never be anything else here (#3138, #3944)"
     }
 }
 
 /// [`closed_expr_to_owned`]'s grammar, checked without evaluating anything.
+///
+/// Mode-agnostic, like the rest of the shape gate: under yq the operators of
+/// #3944 pass here and [`closed_expr_to_owned_at_depth`] declines them, as it
+/// already declines every assignment but #3025's. The recursion down an
+/// operator chain is bounded by the parser's expression-nesting limit (256), so
+/// it needs no depth guard of its own; `owned_assign_closed_rhs_chain_3944`
+/// pins a chain at that limit.
 fn closed_expr_shape(expr: &Expr) -> bool {
     match expr {
         Expr::Literal(_) => true,
@@ -11249,10 +11257,13 @@ fn owned_assign_step<S: EvalSemantics>(
         // #3944: a successful write leaves the state a container (the path
         // has at least one step), which is truthy, so `(A) // B` is `A`'s
         // result and `B` is never read. Anything `A` declines is the
-        // evaluator's. jq mode only: yq's `//` and its writes differ.
-        Expr::Alternative(left, _) if S::TAG == EvalTag::Jq => {
+        // evaluator's. jq mode only: yq's `//` and its writes differ. An
+        // error here could only be the allocation failure the write's own doc
+        // names (the target was settled before the write), which `//` would
+        // not swallow either.
+        Expr::Alternative(left, _) => {
             let left = unwrap_paren(left);
-            return if is_plain_owned_assign(left) {
+            return if S::TAG == EvalTag::Jq && is_plain_owned_assign(left) {
                 owned_assign_step::<S>(left, state)
             } else {
                 None
@@ -11288,7 +11299,7 @@ fn owned_assign_step<S: EvalSemantics>(
             path,
             OwnedAssignRhs::Alternative(closed_expr_to_owned::<S>(value)?),
         ),
-        _ => return None, // patchcov: coverage tolerate-line reason="unreachable: both call sites (try_eval_owned_step, gated on is_owned_assign; eval_owned_reindex_free's own Assign|Update|CompoundAssign|AlternativeAssign arm) only ever hand this function one of the same four variants this match already covers explicitly (#3138)"
+        _ => return None, // patchcov: coverage tolerate-line reason="unreachable: both call sites (try_eval_owned_step, gated on is_owned_assign; eval_owned_reindex_free's own Assign|Update|CompoundAssign|AlternativeAssign arm) only ever hand this function one of the same four variants, or an `Alternative` around one, all of which this match already covers explicitly (#3138, #3944)"
     };
 
     // The keys the write names, each settled against the container it lands
@@ -76921,7 +76932,7 @@ mod tests {
                 &expr, &input, false,
             ));
             let direct = eval_owned_reindex_free::<JqSemantics>(&expr, &input)
-                .unwrap_or_else(|| panic!("declined: {src}")); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if eval_owned_reindex_free declined a shape this loop's own `handled` table asserts is always answered (#3138)"
+                .unwrap_or_else(|| panic!("borrowed route declined {src} on {input:?}")); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if eval_owned_reindex_free declined a shape this loop's own `handled` table asserts is always answered (#3138)"
             let direct = match direct {
                 Ok(value) => (vec![value], "ok".to_string()),
                 Err(error) => (Vec::new(), format!("error:{}", error.message)),
@@ -77276,6 +77287,36 @@ mod tests {
             };
         }
         assert_eq!(text_ptr(&state), before, "the unchanged sibling was copied");
+    }
+
+    /// #3944: `closed_expr_shape` and `closed_expr_to_owned_at_depth` recurse down
+    /// an operator chain with no guard of their own; the parser's nesting limit
+    /// (256) is what bounds them. A chain at that limit still answers, and one
+    /// past it is refused at parse time rather than panicking in the value-tree
+    /// depth assert (384).
+    #[test]
+    #[cfg(feature = "std")]
+    fn owned_assign_closed_rhs_chain_3944() {
+        // The sink evaluator's debug-build frames overflow a test thread's
+        // default stack at this depth, with or without #3944.
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(|| {
+                let chain = |op: &str, n: usize| vec!["$r"; n].join(op);
+                for op in [" + ", " // ", " or ", " and "] {
+                    let filter = alloc::format!(
+                        "reduce .[] as $r ({{}}; .[$r|tostring] = ({}))",
+                        chain(op, 250)
+                    );
+                    assert_eq!(outputs(b"[1,2]", &filter).len(), 1, "{op}");
+                }
+                let too_deep =
+                    alloc::format!("reduce .[] as $r ({{}}; .a = ({}))", chain(" + ", 500));
+                assert!(crate::jq::parse(&too_deep).is_err());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     /// #3944: the fold loops end to end over the new right-hand sides, every
