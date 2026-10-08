@@ -35,8 +35,8 @@ use succinctly::json::validate;
 use succinctly::json::JsonIndex;
 use succinctly::yaml::{
     format_float_yq_yaml, format_float_yq_yaml_nested, go_yaml_dom_scalar,
-    go_yaml_double_quoted_scalar, stream_json_sequence, stream_yaml_sequence, YamlCursor,
-    YamlIndex, YamlValue,
+    go_yaml_double_quoted_scalar, go_yaml_tagged_str_scalar, stream_json_sequence,
+    stream_yaml_sequence, YamlCursor, YamlIndex, YamlValue,
 };
 
 use super::m2_gate::can_use_m2_streaming;
@@ -3270,12 +3270,8 @@ impl WritableSlot {
 }
 
 /// Real yq's accepted `style =` vocabulary, live-verified against pinned
-/// v4.53.3 (`unknown style bogus` for anything else). `tagged` is in the
-/// vocabulary but not in [`RENDERABLE_STYLES`]: real yq renders it
-/// (`a: !!int 1`), succinctly's emitter can't yet, so it is refused explicitly
-/// rather than accepted and silently ignored -- see this issue's entry in
-/// `docs/compliance/yq/limitations.md`. (`literal` and `folded` render since
-/// #2707.)
+/// v4.53.3 (`unknown style bogus` for anything else). Every name in it renders
+/// in the DOM emitter: `literal`/`folded` since #2707, `tagged` since #4066.
 fn validate_style(s: &str) -> Option<&'static str> {
     match s {
         "" => Some(""),
@@ -3288,11 +3284,6 @@ fn validate_style(s: &str) -> Option<&'static str> {
         _ => None,
     }
 }
-
-/// The subset of [`validate_style`]'s vocabulary the DOM emitter
-/// (`emit_yaml_value_at_depth`/`yaml_quote_string_with_style`) has a real
-/// rendering arm for.
-const RENDERABLE_STYLES: &[&str] = &["", "flow", "double", "single", "literal", "folded"];
 
 /// The text a `line_comment = s` write stores in `NodeMeta.comment`, or
 /// `None` for a clearing write.
@@ -3671,15 +3662,7 @@ fn resolve_one_meta_assign(
     for (path, s) in texts {
         let effect = match slot {
             WritableSlot::Style => match validate_style(&s) {
-                Some(style) if RENDERABLE_STYLES.contains(&style) => MetaEffect::Style(style),
-                Some(style) => {
-                    sink.report(
-                        DiagStyle::Yq,
-                        &EvalError::new(format!("style = \"{style}\" is not yet supported")),
-                        &no_location(),
-                    );
-                    return false;
-                }
+                Some(style) => MetaEffect::Style(style),
                 None => {
                     sink.report(
                         DiagStyle::Yq,
@@ -4599,15 +4582,18 @@ fn output_value<W: Write>(
             // and `evaluate_yaml_cursor`'s root-scalar pass has already
             // cleared the mark for that case anyway.
             let rendered = emit_yaml_value(value, comments, config, "", false);
-            match comments.declared_anchor() {
-                Some(anchor) if matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) => {
-                    if is_flow_safe(value, comments) {
-                        format!("&{anchor} {rendered}")
-                    } else {
-                        format!("&{anchor}\n{rendered}")
-                    }
-                }
-                _ => rendered,
+            // `style = "tagged"` (#4066) puts its `!!map`/`!!seq` on the header line
+            // too, after any anchor (`&x !!map`).
+            let anchor = comments
+                .declared_anchor()
+                .filter(|_| matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)));
+            let tag = block_container_tag(value, comments);
+            if anchor.is_none() && tag.is_none() {
+                rendered
+            } else if is_flow_safe(value, comments) {
+                format!("&{} {rendered}", anchor.unwrap_or_default())
+            } else {
+                format!("{}\n{rendered}", block_header(anchor, tag))
             }
         };
         // A root's own standalone head comment (#798 PR2, #2795 PR B) has no
@@ -4998,6 +4984,11 @@ fn emit_yaml_value_at_depth(
     if let Some(name) = comments.alias_name() {
         return format!("*{name}");
     }
+    if comments.style() == "tagged" {
+        if let Some(tagged) = emit_tagged_scalar(value, config, indent, in_flow, depth) {
+            return tagged;
+        }
+    }
     match value {
         OwnedValue::Null => "null".to_string(),
         OwnedValue::Bool(b) => b.to_string(),
@@ -5028,7 +5019,7 @@ fn emit_yaml_value_at_depth(
         OwnedValue::String(s) => emit_string_scalar(s, comments.style(), in_flow, config, indent),
         OwnedValue::Array(arr) => {
             if arr.is_empty() {
-                "[]".to_string()
+                with_container_tag(value, comments, "[]".to_string())
             } else if in_flow || is_flow_safe(value, comments) {
                 // Flow style for nested in flow context
                 let items: Vec<_> = arr
@@ -5054,7 +5045,7 @@ fn emit_yaml_value_at_depth(
                         }
                     })
                     .collect();
-                format!("[{}]", items.join(", "))
+                with_container_tag(value, comments, format!("[{}]", items.join(", ")))
             } else {
                 // Block style sequence
                 let items: Vec<(String, bool)> = arr
@@ -5079,7 +5070,9 @@ fn emit_yaml_value_at_depth(
                             // `stream_yaml_value`'s sequence arm in
                             // `light.rs`, which real yq is pinned against
                             // (#763).
-                            if let Some(anchor) = elem_comments.declared_anchor() {
+                            let tag = block_container_tag(v, elem_comments);
+                            if elem_comments.declared_anchor().is_some() || tag.is_some() {
+                                let header = block_header(elem_comments.declared_anchor(), tag);
                                 // Same "compact" rule as the plain block-sequence
                                 // element below: the value's own content aligns
                                 // under the `- ` prefix's 2-column width, not a
@@ -5109,7 +5102,7 @@ fn emit_yaml_value_at_depth(
                                 );
                                 let val =
                                     append_own_comment_line(val, elem_comments.own(), &val_indent);
-                                format!("{indent}- &{anchor}\n{val}")
+                                format!("{indent}- {header}\n{val}")
                             } else {
                                 // A non-empty mapping/sequence element renders
                                 // in real yq's "compact" form: `- ` shares its
@@ -5200,7 +5193,7 @@ fn emit_yaml_value_at_depth(
         }
         OwnedValue::Object(obj) => {
             if obj.is_empty() {
-                "{}".to_string()
+                with_container_tag(value, comments, "{}".to_string())
             } else if in_flow || is_flow_safe(value, comments) {
                 // Flow style for nested in flow context
                 let entries: Vec<_> = obj
@@ -5231,7 +5224,7 @@ fn emit_yaml_value_at_depth(
                         format!("{key}:{anchor} {val}")
                     })
                     .collect();
-                format!("{{{}}}", entries.join(", "))
+                with_container_tag(value, comments, format!("{{{}}}", entries.join(", ")))
             } else {
                 // Block style mapping
                 let entries: Vec<_> = if config.sort_keys {
@@ -5293,7 +5286,9 @@ fn emit_yaml_value_at_depth(
                             // after it: a `#` runs to end of line, so the
                             // reverse order would bury the anchor inside the
                             // comment text (#763).
-                            format!("{indent}{key}:{anchor}{key_comment_suffix}\n{val}")
+                            let tag = block_container_tag(v, field_comments)
+                                .map_or_else(String::new, |tag| format!(" {tag}"));
+                            format!("{indent}{key}:{anchor}{tag}{key_comment_suffix}\n{val}")
                         } else if let Some(kc) = comments.key_comment_if_value_absent(k) {
                             // The deferred value materialized as nothing at
                             // all - the key's own comment stands alone with
@@ -5476,6 +5471,113 @@ fn go_yaml_forces_double_quotes(s: &str) -> bool {
     false
 }
 
+/// The `!!seq`/`!!map` tag a container carries under `style = "tagged"` (#4066), or
+/// `None` for any other node. Only a non-empty block container reaches the callers
+/// that put it on the header line; an empty or flow one prints it inline
+/// ([`flow_container_tag`]).
+fn block_container_tag(value: &OwnedValue, comments: &CommentTree) -> Option<&'static str> {
+    if comments.style() != "tagged" || !defers_to_own_block(value, comments) {
+        return None;
+    }
+    match value {
+        OwnedValue::Array(_) => Some("!!seq"),
+        OwnedValue::Object(_) => Some("!!map"),
+        _ => None,
+    }
+}
+
+/// `rendered` (a flow or empty container) behind its `!!seq `/`!!map ` tag under
+/// `style = "tagged"` (#4066); unchanged for an untagged node. Out of line so the
+/// recursive emitter's frame stays small.
+#[inline(never)]
+fn with_container_tag(value: &OwnedValue, comments: &CommentTree, rendered: String) -> String {
+    if comments.style() != "tagged" {
+        return rendered;
+    }
+    match value {
+        OwnedValue::Array(_) => format!("!!seq {rendered}"),
+        OwnedValue::Object(_) => format!("!!map {rendered}"),
+        _ => rendered,
+    }
+}
+
+/// The header line of a block container that has an anchor, a tag or both:
+/// `&x`, `!!map` or `&x !!map`.
+#[inline(never)]
+fn block_header(anchor: Option<&str>, tag: Option<&str>) -> String {
+    match (anchor, tag) {
+        (Some(anchor), Some(tag)) => format!("&{anchor} {tag}"),
+        (Some(anchor), None) => format!("&{anchor}"),
+        (None, Some(tag)) => tag.to_string(),
+        (None, None) => String::new(),
+    }
+}
+
+/// A scalar under `style = "tagged"` (#4066): its type tag, derived from the value as
+/// it is now (not stored), then the value as it is ordinarily written -- except that a
+/// string is no longer quoted for reading back as another type, since the tag already
+/// says it is a string (`!!str 1`). `None` for a container.
+///
+/// A string with a line break is a block scalar under the tag (`!!str |-`); the empty
+/// string is the tag alone. A whole computed float already carries its own `!!float`
+/// ([`format_float_yq_yaml_nested`]), which must not be doubled.
+#[inline(never)]
+fn emit_tagged_scalar(
+    value: &OwnedValue,
+    config: &OutputConfig,
+    indent: &str,
+    in_flow: bool,
+    depth: usize,
+) -> Option<String> {
+    let (tag, text) = match value {
+        OwnedValue::Null => ("!!null", "null".to_string()),
+        OwnedValue::Bool(b) => ("!!bool", b.to_string()),
+        OwnedValue::Int(n) => ("!!int", n.to_string()),
+        OwnedValue::Float(f) if f.is_nan() || f.is_infinite() => (
+            "!!float",
+            nonfinite_display_string::<YqSemantics>(*f).to_string(),
+        ),
+        OwnedValue::Float(f) => {
+            let spelling = format_float_yq_yaml_nested(*f);
+            (
+                "!!float",
+                spelling
+                    .strip_prefix("!!float ")
+                    .unwrap_or(&spelling)
+                    .to_string(),
+            )
+        }
+        OwnedValue::NumberLiteral(repr, literal) => match repr {
+            NumberRepr::Float(f) if f.is_nan() || f.is_infinite() => (
+                "!!float",
+                nonfinite_display_string::<YqSemantics>(*f).to_string(),
+            ),
+            NumberRepr::Float(_) => ("!!float", literal.to_string()),
+            NumberRepr::Int(_) => ("!!int", literal.to_string()),
+        },
+        OwnedValue::String(s) => {
+            let text = if s.contains(['\n', '\r', '\u{85}', '\u{2028}', '\u{2029}']) {
+                if in_flow {
+                    go_yaml_double_quoted_scalar(s)
+                } else {
+                    emit_block_scalar(s, false, indent, config.indent_str.len())
+                        .unwrap_or_else(|| go_yaml_double_quoted_scalar(s))
+                }
+            } else {
+                go_yaml_tagged_str_scalar(s, in_flow)?
+            };
+            return Some(if text.is_empty() {
+                "!!str".to_string()
+            } else {
+                format!("!!str {text}")
+            });
+        }
+        OwnedValue::Array(_) | OwnedValue::Object(_) => return None,
+    };
+    let _ = depth;
+    Some(format!("{tag} {text}"))
+}
+
 /// A string scalar as the DOM writer prints it: a block scalar when its style is
 /// `literal`/`folded` (#2707), or when it has no style of its own and holds a line
 /// break, which is what go-yaml does with it (`.b = "x\ny"` is `b: |-`). Inside a flow
@@ -5518,7 +5620,12 @@ fn with_trailing_comment(rendered: String, comment_suffix: &str) -> String {
     if comment_suffix.is_empty() {
         return rendered;
     }
-    if rendered.starts_with(['|', '>']) {
+    // `!!str |-` under `style = "tagged"` (#4066) has its header behind the tag.
+    if rendered
+        .strip_prefix("!!str ")
+        .unwrap_or(&rendered)
+        .starts_with(['|', '>'])
+    {
         if let Some((header, body)) = rendered.split_once('\n') {
             return format!("{header}{comment_suffix}\n{body}");
         }

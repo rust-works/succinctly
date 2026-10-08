@@ -56,12 +56,19 @@ pub(crate) enum EncodedStringStyle {
 /// collection (`{v: ['a:b', 'x,y']}`), where block context leaves them bare.
 #[must_use]
 pub(crate) fn go_yaml_string_style(s: &str, flow: bool) -> Option<EncodedStringStyle> {
+    go_yaml_string_style_typed(s, flow, true)
+}
+
+/// [`go_yaml_string_style`], optionally without the type check: with an explicit `!!str`
+/// tag in front (yq's `style = "tagged"`, #4066) a string that would read back as
+/// another type is written plain, since the tag already says what it is (`!!str 1`).
+fn go_yaml_string_style_typed(s: &str, flow: bool, typed: bool) -> Option<EncodedStringStyle> {
     if has_break(s) {
         return None;
     }
     // yaml.v3 `stringv`: a string that would resolve to another tag when
     // written plain is double-quoted. The empty string resolves to null.
-    if resolves_to_non_str(s) {
+    if typed && resolves_to_non_str(s) {
         return Some(EncodedStringStyle::DoubleQuoted);
     }
     // The emitter's `yaml_emitter_analyze_scalar`, for block context and a
@@ -181,6 +188,22 @@ pub fn go_yaml_dom_scalar(s: &str, flow: bool, json_sourced: bool, is_key: bool)
         }
     }
     go_yaml_string_scalar(s, flow)
+}
+
+/// The scalar go-yaml writes after an explicit `!!str` tag, or `None` for a line break.
+///
+/// For yq's `style = "tagged"` (#4066): the usual choice of style without the rule that
+/// quotes a string reading back as another type. Empty for the empty string, which is
+/// the tag alone (`a: !!str`).
+#[must_use]
+pub fn go_yaml_tagged_str_scalar(s: &str, flow: bool) -> Option<String> {
+    let mut out = String::new();
+    match go_yaml_string_style_typed(s, flow, false)? {
+        EncodedStringStyle::Plain => out.push_str(s),
+        EncodedStringStyle::SingleQuoted => write_go_yaml_single_quoted(&mut out, s).ok()?,
+        EncodedStringStyle::DoubleQuoted => write_go_yaml_double_quoted(&mut out, s).ok()?,
+    }
+    Some(out)
 }
 
 /// `s` as go-yaml's emitter writes a double-quoted scalar, as a string.

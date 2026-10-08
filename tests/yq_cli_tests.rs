@@ -18704,21 +18704,6 @@ mod meta_assign_798 {
         Ok(())
     }
 
-    /// `tagged` is in real yq's vocabulary (so it never raises `unknown style`)
-    /// but succinctly's emitter can't render it yet -- refused explicitly
-    /// rather than accepted and ignored. (`literal` and `folded` render since
-    /// #2707.)
-    #[test]
-    fn style_tagged_raises_not_yet_supported() {
-        let filter = ".a style = \"tagged\"";
-        let (_out, err, code) = run_yq_stdin_with_stderr(filter, "a: hello\n", &[]).unwrap();
-        assert_eq!(code, 1, "[{filter}] stderr: {err}");
-        assert!(
-            err.contains("style = \"tagged\" is not yet supported"),
-            "[{filter}] stderr: {err}"
-        );
-    }
-
     /// An anchor name go-yaml's emitter refuses raises real yq's exact
     /// error (and no document is printed); the accepted set is the measured
     /// one -- printable ASCII except `,[]{}:` and whitespace. Before the
@@ -43806,6 +43791,577 @@ fn test_yq_block_scalars_read_back_as_the_same_string_2707() -> Result<()> {
                 assert_eq!(json.trim(), literal, "{filter} wrote {yaml:?}");
             }
         }
+    }
+    Ok(())
+}
+
+/// #2707 follow-up: `style = "tagged"` writes the tag of the node's current value
+/// type (it used to be refused with "not yet supported"): `!!int`/`!!float`/`!!bool`/
+/// `!!null`/`!!str` before a scalar, `!!seq`/`!!map` on the header line of a block
+/// container (and before a flow or empty one), after any anchor. A string is not
+/// quoted for reading back as another type (`!!str 1`, `!!str null`), only for what
+/// the syntax needs (`!!str 'x: y'`); a multi-line one is a block scalar
+/// (`!!str |-`), and the empty string is the tag alone. Captured live from yq v4.53.3.
+#[test]
+fn test_yq_style_tagged_2707() -> Result<()> {
+    let cases: &[(&str, &str, &[&str], &str)] = &[
+        (
+            r"a: 1
+",
+            r#".a style = "tagged""#,
+            &[],
+            r"a: !!int 1
+",
+        ),
+        (
+            r"a: x
+",
+            r#".a style = "tagged""#,
+            &[],
+            r"a: !!str x
+",
+        ),
+        (
+            r#"a: "1"
+"#,
+            r#".a style = "tagged""#,
+            &[],
+            r"a: !!str 1
+",
+        ),
+        (
+            r#"a: ""
+"#,
+            r#".a style = "tagged""#,
+            &[],
+            r"a: !!str
+",
+        ),
+        (
+            r"a: [1, 2]
+b: 1
+",
+            r#".a style = "tagged""#,
+            &[],
+            r"a: !!seq
+  - 1
+  - 2
+b: 1
+",
+        ),
+        (
+            r"a: {b: 1}
+b: 1
+",
+            r#".a style = "tagged""#,
+            &[],
+            r"a: !!map
+  b: 1
+b: 1
+",
+        ),
+        (
+            r"a: 1.5
+",
+            r#".a style = "tagged""#,
+            &[],
+            r"a: !!float 1.5
+",
+        ),
+        (
+            r"a: null
+",
+            r#".a style = "tagged""#,
+            &[],
+            r"a: !!null null
+",
+        ),
+        (
+            r"a: true
+",
+            r#".a style = "tagged""#,
+            &[],
+            r"a: !!bool true
+",
+        ),
+        (
+            r"a: &an 1
+",
+            r#".a style = "tagged""#,
+            &[],
+            r"a: &an !!int 1
+",
+        ),
+        (
+            r"a: 1
+",
+            r#".a style = "tagged" | .a line_comment = "c""#,
+            &[],
+            r"a: !!int 1 # c
+",
+        ),
+        (
+            r#"a: "x: y"
+"#,
+            r#".a style = "tagged""#,
+            &[],
+            r"a: !!str 'x: y'
+",
+        ),
+        (
+            r"a: [1, 2]
+",
+            r#".a[0] style = "tagged""#,
+            &[],
+            r"a: [!!int 1, 2]
+",
+        ),
+        (
+            r"a: []
+",
+            r#".a style = "tagged""#,
+            &[],
+            r"a: !!seq []
+",
+        ),
+        (
+            r"a: {}
+",
+            r#".a style = "tagged""#,
+            &[],
+            r"a: !!map {}
+",
+        ),
+        (
+            r"a: 1
+",
+            r#". style = "tagged""#,
+            &[],
+            r"!!map
+a: 1
+",
+        ),
+        (
+            r"- 1
+- 2
+",
+            r#".[0] style = "tagged""#,
+            &[],
+            r"- !!int 1
+- 2
+",
+        ),
+        (
+            r"a:
+  - [1, 2]
+  - 3
+",
+            r#".a[0] style = "tagged""#,
+            &[],
+            r"a:
+  - !!seq
+    - 1
+    - 2
+  - 3
+",
+        ),
+        (
+            r"a:
+  - {b: 1}
+  - 3
+",
+            r#".a[0] style = "tagged""#,
+            &[],
+            r"a:
+  - !!map
+    b: 1
+  - 3
+",
+        ),
+        (
+            r"a:
+  - b: 1
+    c: 2
+  - 3
+",
+            r#".a[0] style = "tagged""#,
+            &[],
+            r"a:
+  - !!map
+    b: 1
+    c: 2
+  - 3
+",
+        ),
+        (
+            r"a:
+  b: 1
+  c: [1, 2]
+",
+            r#".a style = "tagged""#,
+            &[],
+            r"a: !!map
+  b: 1
+  c: [1, 2]
+",
+        ),
+        (
+            r"a:
+  b: 1
+  c: [1, 2]
+",
+            r#".a style = "tagged" | .a.c style = "tagged""#,
+            &[],
+            r"a: !!map
+  b: 1
+  c: !!seq
+    - 1
+    - 2
+",
+        ),
+        (
+            r"a:
+  b: 1
+  c: [x, 2]
+",
+            r#".. style = "tagged""#,
+            &[],
+            r"!!map
+a: !!map
+  b: !!int 1
+  c: !!seq
+    - !!str x
+    - !!int 2
+",
+        ),
+        (
+            r"a: &x
+  b: 1
+",
+            r#".a style = "tagged""#,
+            &[],
+            r"a: &x !!map
+  b: 1
+",
+        ),
+        (
+            r"a:
+  b: 1
+",
+            r#".a style = "tagged""#,
+            &["-I4"],
+            r"a: !!map
+    b: 1
+",
+        ),
+        (
+            r"- a
+- b
+",
+            r#". style = "tagged""#,
+            &[],
+            r"!!seq
+- a
+- b
+",
+        ),
+        (
+            r#"a: "x y"
+"#,
+            r#".a style = "tagged""#,
+            &[],
+            r"a: !!str x y
+",
+        ),
+        (
+            r##"a: "# c"
+"##,
+            r#".a style = "tagged""#,
+            &[],
+            r"a: !!str '# c'
+",
+        ),
+        (
+            r#"a: "- x"
+"#,
+            r#".a style = "tagged""#,
+            &[],
+            r"a: !!str '- x'
+",
+        ),
+        (
+            r#"a: "null"
+"#,
+            r#".a style = "tagged""#,
+            &[],
+            r"a: !!str null
+",
+        ),
+        (
+            r#"a: " lead"
+"#,
+            r#".a style = "tagged""#,
+            &[],
+            r"a: !!str ' lead'
+",
+        ),
+        (
+            r#"a: "tab\t"
+"#,
+            r#".a style = "tagged""#,
+            &[],
+            r#"a: !!str "tab\t"
+"#,
+        ),
+        (
+            r"a: 1e3
+",
+            r#".a style = "tagged""#,
+            &[],
+            r"a: !!float 1e3
+",
+        ),
+        (
+            r"a: .inf
+",
+            r#".a style = "tagged""#,
+            &[],
+            r"a: !!float .inf
+",
+        ),
+        (
+            r"a: 12:30:45
+",
+            r#".a style = "tagged""#,
+            &[],
+            r"a: !!str 12:30:45
+",
+        ),
+        (
+            r"a: yes
+",
+            r#".a style = "tagged""#,
+            &[],
+            r"a: !!str yes
+",
+        ),
+        (
+            r"a: [[1], [2]]
+",
+            r#".a[0] style = "tagged""#,
+            &[],
+            r"a: [!!seq [1], [2]]
+",
+        ),
+        (
+            r"a: [[1], [2]]
+",
+            r#".a[0][0] style = "tagged""#,
+            &[],
+            r"a: [[!!int 1], [2]]
+",
+        ),
+        (
+            r"a: {b: [1, 2], c: 1}
+",
+            r#".a.b style = "tagged""#,
+            &[],
+            r"a: {b: !!seq [1, 2], c: 1}
+",
+        ),
+        (
+            r"a: {b: [1, 2], c: 1}
+",
+            r#".a style = "tagged""#,
+            &[],
+            r"a: !!map
+  b: [1, 2]
+  c: 1
+",
+        ),
+        (
+            r"a: 2.50
+",
+            r#".a style = "tagged""#,
+            &[],
+            r"a: !!float 2.50
+",
+        ),
+        (
+            r#"a: ["x, y", "q"]
+"#,
+            r#".a[1] style = "tagged""#,
+            &[],
+            r#"a: ["x, y", !!str q]
+"#,
+        ),
+        (
+            r"a: 1
+b: 2
+",
+            r#".a style = "tagged" | .b = 3"#,
+            &[],
+            r"a: !!int 1
+b: 3
+",
+        ),
+        (
+            r"a: 1
+",
+            r#".a style = "tagged" | .a anchor = "z""#,
+            &[],
+            r"a: &z !!int 1
+",
+        ),
+        (
+            r"a: 3 # cm
+",
+            r#".a style = "tagged""#,
+            &[],
+            r"a: !!int 3 # cm
+",
+        ),
+        (
+            r"# head
+a: 3
+",
+            r#".a style = "tagged""#,
+            &[],
+            r"# head
+a: !!int 3
+",
+        ),
+        (
+            r"a:
+  b: 3
+",
+            r#".a.b style = "tagged""#,
+            &["-I4"],
+            r"a:
+    b: !!int 3
+",
+        ),
+        (
+            r"a: |
+  x
+  y
+",
+            r#".a style = "tagged""#,
+            &[],
+            r"a: !!str |
+  x
+  y
+",
+        ),
+        (
+            r"a: >
+  x
+",
+            r#".a style = "tagged""#,
+            &[],
+            r"a: !!str |
+  x
+",
+        ),
+        (
+            r"a: 2
+",
+            r#".a style = "tagged" | .a |= . + 1"#,
+            &[],
+            r"a: !!int 3
+",
+        ),
+        (
+            r"a: 1
+",
+            r#".a style = "tagged" | .a style = "double""#,
+            &[],
+            r#"a: "1"
+"#,
+        ),
+        (
+            r"a: 1
+",
+            r#".z = "x\ny" | .z style = "tagged""#,
+            &[],
+            r"a: 1
+z: !!str |-
+  x
+  y
+",
+        ),
+        (
+            r"a: 1
+",
+            r#".z = "x\ny\n" | .z style = "tagged""#,
+            &[],
+            r"a: 1
+z: !!str |
+  x
+  y
+",
+        ),
+        (
+            r"a: 1
+",
+            r#".z = " x\ny" | .z style = "tagged""#,
+            &[],
+            r"a: 1
+z: !!str |2-
+   x
+  y
+",
+        ),
+        (
+            r"a: 1
+",
+            r#".z = "a, b" | .z style = "tagged""#,
+            &[],
+            r"a: 1
+z: !!str a, b
+",
+        ),
+        (
+            r"a: 1
+",
+            r#".z = "é" | .z style = "tagged""#,
+            &[],
+            r"a: 1
+z: !!str é
+",
+        ),
+        (
+            r"a: 1
+",
+            r#".z = "'q'" | .z style = "tagged""#,
+            &[],
+            r"a: 1
+z: !!str '''q'''
+",
+        ),
+    ];
+    for (doc, filter, extra, want) in cases {
+        let (out, err, code) = run_yq_stdin_with_stderr(filter, doc, extra)?;
+        assert_eq!(out, *want, "`{filter}` {extra:?} on {doc:?}: {err}");
+        assert_eq!(code, 0, "`{filter}` {extra:?} on {doc:?}: {err}");
+    }
+    Ok(())
+}
+
+/// `style = "tagged"` on an integer spelled `0x1F`, `0o17` or `1_000`: yq keeps the
+/// spelling (`!!int 0x1F`), succinctly's value has lost it before the emitter runs
+/// (#2802: `OwnedValue` keeps no spelling for a non-decimal integer), so it prints the
+/// decimal value, and `1_000` (a string here) as `!!str`.
+#[test]
+fn test_yq_style_tagged_loses_non_decimal_integer_spellings_2802() -> Result<()> {
+    for (doc, want) in [
+        ("a: 0x1F\n", "a: !!int 31\n"),
+        ("a: 0o17\n", "a: !!int 15\n"),
+        ("a: 1_000\n", "a: !!str 1_000\n"),
+    ] {
+        let (out, err, code) = run_yq_stdin_with_stderr(".a style = \"tagged\"", doc, &[])?;
+        assert_eq!(out, want, "{doc:?}: {err}");
+        assert_eq!(code, 0, "{doc:?}: {err}");
     }
     Ok(())
 }
