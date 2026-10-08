@@ -11020,6 +11020,7 @@ fn projection_peel<S: EvalSemantics>(
                 unwrap_paren(head),
                 Expr::Field(_)
                     | Expr::Index { .. }
+                    | Expr::Slice { .. }
                     | Expr::Pipe(_)
                     | Expr::Builtin(Builtin::Length)
             )
@@ -11035,7 +11036,12 @@ fn projection_peel<S: EvalSemantics>(
     }
     // #3477: a leading `length` steps to the count, then the rest runs on it.
     let counted = eval_owned_length(first, input);
-    if counted.is_none() && !matches!(first, Expr::Field(_) | Expr::Index { .. }) {
+    if counted.is_none()
+        && !matches!(
+            first,
+            Expr::Field(_) | Expr::Index { .. } | Expr::Slice { .. }
+        )
+    {
         return None;
     }
     // `needs_path_context` of a pipe is "any stage does", so the slice is
@@ -11043,9 +11049,20 @@ fn projection_peel<S: EvalSemantics>(
     if rest.iter().any(needs_path_context) {
         return None;
     }
-    let child = match counted {
-        Some(count) => count,
-        None => {
+    let child = match (counted, first) {
+        (Some(count), _) => count,
+        // #3824: a slice is a plain `Vec`/`&str` operation once the bounds are
+        // known, and the sub-array it answers shares its elements. Through the
+        // bridge it wrote out and indexed the whole array first, which for
+        // `[.. | parent?] | .[0:2]` -- an array of n shared copies of the
+        // document -- is quadratic in its size.
+        (None, Expr::Slice { start, end, .. }) => {
+            let Ok(Some(child)) = slice_owned_value_read::<S>(input, *start, *end, optional) else {
+                return None;
+            };
+            child
+        }
+        (None, _) => {
             let Ok(Some(child)) = eval_owned_navigation::<S>(first, input, optional)? else {
                 return None;
             };
@@ -107527,6 +107544,81 @@ mod tests {
             };
             assert!(peeled::<JqSemantics>(&expr, &input).is_none(), "{filter:?}");
         }
+    }
+
+    /// #3824: [`projection_peel`] takes a leading slice natively, answering what
+    /// the reindex bridge answers -- for an array, a string, `null`, and (yq) an
+    /// object -- and declines a target the bridge raises on, so the bridge keeps
+    /// its diagnostics. Compared against the real bridge (`reindexed` +
+    /// `eval_each`), in both modes.
+    #[test]
+    fn projection_peel_takes_a_leading_slice_3824() {
+        fn peeled<S: EvalSemantics>(filter: &str, input: &OwnedValue) -> Option<Vec<String>> {
+            let expr = parse(filter).unwrap();
+            let mut out = Vec::new();
+            projection_peel::<S>(&expr, input, false, Reentry::REBUILT, &mut |v| {
+                out.push(v.to_json());
+                Demand::Continue
+            })
+            .map(|_| out)
+        }
+        fn bridged<S: EvalSemantics>(filter: &str, input: &OwnedValue) -> Vec<String> {
+            let expr = parse(filter).unwrap();
+            let doc = input.reindexed::<S>().unwrap();
+            let mut out = Vec::new();
+            let _ = eval_each::<Vec<u64>, S>(&expr, doc.root().value(), false, &mut |item| {
+                out.push(item.into_owned_lossy::<S>().to_json());
+                Demand::Continue
+            });
+            out
+        }
+        let parse_json = |text: &str| {
+            let bytes = text.as_bytes();
+            let index = JsonIndex::build(bytes);
+            to_owned::<JqSemantics, _>(&index.root(bytes).value()).unwrap()
+        };
+        let inputs = [
+            "[1,2,3,4,5]",
+            "[[1,[2]],{\"x\":[3]},\"s\",null]",
+            "[]",
+            "\"héllo wörld\"",
+            "null",
+            "{\"a\":1,\"b\":2,\"c\":3}",
+            "5",
+        ];
+        let slices = [
+            ".[0:2]", ".[1:]", ".[:-1]", ".[-2:]", ".[2:1]", ".[:]", ".[5:100]", ".[1.5:3]",
+        ];
+        let mut peeled_count = 0;
+        for text in inputs {
+            let input = parse_json(text);
+            for slice in slices {
+                let filter = format!("{slice} | length");
+                if let Some(jq) = peeled::<JqSemantics>(&filter, &input) {
+                    peeled_count += 1;
+                    assert_eq!(
+                        jq,
+                        bridged::<JqSemantics>(&filter, &input),
+                        "jq {filter} on {text}"
+                    );
+                }
+                if let Some(yq) = peeled::<YqSemantics>(&filter, &input) {
+                    assert_eq!(
+                        yq,
+                        bridged::<YqSemantics>(&filter, &input),
+                        "yq {filter} on {text}"
+                    );
+                }
+            }
+        }
+        assert!(
+            peeled_count >= 24,
+            "arrays, strings and null must peel: {peeled_count}"
+        );
+        // A number is not sliceable: the bridge's error text stays the bridge's.
+        assert!(peeled::<JqSemantics>(".[0:2] | length", &parse_json("5")).is_none());
+        // A bare slice has nothing behind it to peel for.
+        assert!(peeled::<JqSemantics>(".[0:2]", &parse_json("[1,2,3]")).is_none());
     }
 
     /// The door's answer for `filter` over `input`, in the shape
