@@ -1641,6 +1641,25 @@ pub trait DocumentFields: Sized + Clone {
     /// existing shape `contains` itself already has), so every sibling key
     /// is checked there, match-position dependence and all.
     fn contains_checked(&self, name: &str) -> Result<bool, EvalError> {
+        self.contains_checked_walk(name, &mut 0)
+    }
+
+    /// [`contains_checked`](Self::contains_checked), plus how many members the
+    /// walk visited (#4002): the count is what lets a caller tell a wide
+    /// object from a small one without a walk of its own, as for
+    /// [`find_cursor_counted`](Self::find_cursor_counted). Meaningful only
+    /// alongside an `Ok`.
+    fn contains_checked_counted(&self, name: &str) -> (Result<bool, EvalError>, usize) {
+        let mut visited = 0;
+        let found = self.contains_checked_walk(name, &mut visited);
+        (found, visited)
+    }
+
+    /// The walk behind [`contains_checked`](Self::contains_checked) and
+    /// [`contains_checked_counted`](Self::contains_checked_counted); counts
+    /// each member it visits into `visited`.
+    #[doc(hidden)]
+    fn contains_checked_walk(&self, name: &str, visited: &mut usize) -> Result<bool, EvalError> {
         let mut fields = self.clone();
         let mut is_first = true;
         // The last key cursor seen, for the *non-match* exhaustion path
@@ -1649,6 +1668,7 @@ pub trait DocumentFields: Sized + Clone {
         // check is free, unlike the early-exit match path above.
         let mut last_key_cursor: Option<Self::Cursor> = None;
         while let Some((key, key_cursor, rest)) = fields.uncons_key() {
+            *visited += 1;
             // #1677/#2288: cheap per-key checks, riding the walk `contains`
             // already makes regardless of early exit -- no extra cost,
             // early-exit or not. `display` being `None` (#1194/#1995) means

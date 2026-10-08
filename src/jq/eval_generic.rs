@@ -20806,7 +20806,7 @@ fn eval_has_one_key<S: EvalSemantics, V: DocumentValue>(
             if let Err(err) = empty_fields_tail_gap_ok(&fields, cursor.as_ref()) {
                 return GenericResult::Error(err);
             }
-            match fields.contains_checked(key) {
+            match crate::jq::key_index::contains_memoized(&fields, key) {
                 Ok(found) => GenericResult::Owned(OwnedValue::Bool(found)),
                 Err(err) => GenericResult::Error(err),
             }
@@ -49015,6 +49015,90 @@ mod tests {
             crate::jq::key_index::memo::work().1 > before.1,
             "the index answered"
         );
+    }
+
+    /// #4002: `has($k)` over a wide object is answered by the key index once
+    /// the object has proved wide, with the answer (and the error) the walk
+    /// gives for the same name. Every name is also run alone, in a scope of its
+    /// own, where no index exists: that run is the walk's answer.
+    #[cfg(feature = "std")]
+    fn has_through_the_index_matches_the_walk_4002(members: &[String], names: &[&str]) -> usize {
+        let doc = format!("{{{}}}", members.join(","));
+        let list = names
+            .iter()
+            .map(|n| format!("{n:?}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let before = crate::jq::key_index::memo::work();
+        let (indexed, indexed_control) = drive_each_sink::<JqSemantics>(
+            doc.as_bytes(),
+            &format!("({list}) as $k | range(3) as $r | (try has($k) catch \"E\")"),
+        );
+        // The walk's answers, name by name. A decode failure ends the stream
+        // (nothing catches it), for the walk and the index alike.
+        let mut want = Vec::new();
+        let mut want_control = String::from("None");
+        for name in names {
+            let (one, control) = drive_each_sink::<JqSemantics>(
+                doc.as_bytes(),
+                &format!("try has({name:?}) catch \"E\""),
+            );
+            if control.is_some() {
+                want_control = format!("{control:?}");
+                break;
+            }
+            for _ in 0..3 {
+                want.extend(one.iter().cloned());
+            }
+        }
+        assert_eq!(indexed, want, "{doc}");
+        assert_eq!(format!("{indexed_control:?}"), want_control, "{doc}");
+        crate::jq::key_index::memo::work().1 - before.1
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn has_through_the_index_answers_present_absent_and_repeated_keys_4002() {
+        let mut members: Vec<String> = (0..200).map(|i| format!("\"k{i}\":{i}")).collect();
+        members.push("\"k5\":\"again\"".to_owned());
+        members.push("\"\":0".to_owned());
+        let hits = has_through_the_index_matches_the_walk_4002(
+            &members,
+            &["k0", "k5", "k199", "k200", "absent", "", "K5", "k"],
+        );
+        assert!(hits > 10, "the index answered {hits} lookups");
+    }
+
+    /// A member with a missing `,` that `has` reaches (a lookup that matches
+    /// after it, or none at all) raises; one a match precedes does not. The
+    /// index must not smooth that over, so the object keeps the walk.
+    #[cfg(feature = "std")]
+    #[test]
+    fn has_through_the_index_keeps_the_walk_for_a_bad_delimiter_4002() {
+        let mut members: Vec<String> = (0..100).map(|i| format!("\"k{i}\":{i}")).collect();
+        members.push("\"bad\":1 \"worse\":2".to_owned());
+        members.push("\"tail\":3".to_owned());
+        let hits = has_through_the_index_matches_the_walk_4002(
+            &members,
+            &["k1", "k99", "bad", "worse", "tail", "absent"],
+        );
+        assert_eq!(hits, 0, "an unclean object is never answered by the index");
+    }
+
+    /// A key that will not decode (a lone surrogate) is substituted by its
+    /// lossy spelling for `has` but skipped by the index, so the object keeps
+    /// the walk.
+    #[cfg(feature = "std")]
+    #[test]
+    fn has_through_the_index_keeps_the_walk_for_an_undecodable_key_4002() {
+        let mut members: Vec<String> = (0..100).map(|i| format!("\"k{i}\":{i}")).collect();
+        members.push("\"\\ud800\":1".to_owned());
+        members.push("\"z\":2".to_owned());
+        let hits = has_through_the_index_matches_the_walk_4002(
+            &members,
+            &["k1", "z", "absent", "\u{fffd}", "\\ud800"],
+        );
+        assert_eq!(hits, 0, "an unclean object is never answered by the index");
     }
 
     #[test]
