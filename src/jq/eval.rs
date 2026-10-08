@@ -43489,7 +43489,28 @@ fn body_raises_scalar_literal(expr: &Expr) -> bool {
             matches!(&**message, Expr::Literal(lit) if !matches!(lit, Literal::Null))
         }
         Expr::Paren(inner) => body_raises_scalar_literal(inner),
-        Expr::Pipe(stages) => stages.last().is_some_and(body_raises_scalar_literal),
+        // An earlier stage that raises first decides the payload, so each one
+        // must be a step whose own failures carry a fresh message string:
+        // `error(.) | error("x")` hands its handler the document.
+        Expr::Pipe(stages) => stages.split_last().is_some_and(|(last, earlier)| {
+            earlier.iter().all(raises_only_fresh_messages) && body_raises_scalar_literal(last)
+        }),
+        _ => false,
+    }
+}
+
+/// Whether `expr` is a navigation step, `.` or a literal, none of which can
+/// raise a value the document holds: a type error carries a fresh message string.
+fn raises_only_fresh_messages(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identity
+        | Expr::Literal(_)
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Slice { .. }
+        | Expr::ArrayKey(_)
+        | Expr::Iterate => true,
+        Expr::Paren(inner) => raises_only_fresh_messages(inner),
         _ => false,
     }
 }
@@ -43510,8 +43531,9 @@ fn navigation_errors_on_scalar(expr: &Expr) -> bool {
     }
 }
 
-/// Whether a `catch` handler provably leaves jq's path register where the `try`
-/// entered it, given that it runs on a non-null scalar literal (#3987).
+/// Whether a `catch` handler that [`cannot_move_register`] refuses provably leaves
+/// jq's path register where the `try` entered it, given that it runs on a non-null
+/// scalar literal (#3987).
 ///
 /// [`cannot_move_register`] refuses a handler that navigates, because on a
 /// payload of unknown origin a navigation can succeed (the payload may be the
@@ -43523,20 +43545,18 @@ fn navigation_errors_on_scalar(expr: &Expr) -> bool {
 /// it raises, as in jq. `null` is excluded by the caller, since `null | .a`
 /// succeeds.
 fn handler_leaves_register_on_scalar_payload(handler: &Expr) -> bool {
-    cannot_move_register(handler)
-        || match handler {
-            Expr::Paren(inner) => handler_leaves_register_on_scalar_payload(inner),
-            Expr::Comma(stages) => stages.iter().all(handler_leaves_register_on_scalar_payload),
-            Expr::Alternative(left, right) => {
-                handler_leaves_register_on_scalar_payload(left)
-                    && handler_leaves_register_on_scalar_payload(right)
-            }
-            Expr::Optional(inner) => {
-                matches!(&**inner, Expr::Paren(nav) if navigation_errors_on_scalar(nav))
-            }
-            Expr::Try { expr, catch: None } => navigation_errors_on_scalar(expr),
-            _ => false,
+    // Only the cases `cannot_move_register` refuses; the caller has asked it.
+    let leaves = |e: &Expr| cannot_move_register(e) || handler_leaves_register_on_scalar_payload(e);
+    match handler {
+        Expr::Paren(inner) => leaves(inner),
+        Expr::Comma(stages) => stages.iter().all(leaves),
+        Expr::Alternative(left, right) => leaves(left) && leaves(right),
+        Expr::Optional(inner) => {
+            matches!(&**inner, Expr::Paren(nav) if navigation_errors_on_scalar(nav))
         }
+        Expr::Try { expr, catch: None } => navigation_errors_on_scalar(expr),
+        _ => false,
+    }
 }
 
 /// Whether evaluating `expr` as one pipe stage provably leaves jq's path

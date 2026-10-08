@@ -61223,6 +61223,11 @@ fn test_catch_handler_navigating_under_alternative_on_a_scalar_payload_3987() ->
             r#"path(. as $x | try (.a, error("x")) catch ((.a)? // 5) | $x)"#,
             "Invalid path expression with result",
         ),
+        // An earlier stage that raises first decides the payload: here the document.
+        (
+            r#"path(. as $x | try (error(.) | error("x")) catch ((.a)? // 5) | $x)"#,
+            "Invalid path expression with result",
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(doc))?;
         assert_eq!(code, 5, "#3987: `{program}`: stdout {stdout:?}");
