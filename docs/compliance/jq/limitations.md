@@ -9761,8 +9761,8 @@ document cost 6.5x the memory and 4-5x the time of the same filter without the b
 - the node is a subtree (an object or array with children) of the document being read, and
   every read of `$x` happens where the ambient input is provably a node of that document
   (`deferred_bind_is_sound`, `src/jq/deferred_bind.rs`): at the bind's own input
-  (`$x.a`, `[$x, 1]`, `{k: $x}`, `$x == .`), or under an iteration (`.users[] | $x.meta`,
-  `.users[] | select(.id == $x.limit)`).
+  (`$x.a`, `[$x, 1]`, `{k: $x}`, `$x == .`), or under an iteration when it reads a member
+  (`.users[] | $x.meta`, `.users[] | select(.id == $x.limit)`).
 
 So `. as $x | 1` and `. as $x | $x.a` answer over an unreadable member the body does not reach
 (`[{"a":1,"b":tru}]`: `1` and `1`, where `eval_using` raises), and `. as $x | $x` echoes the node
@@ -9774,21 +9774,29 @@ unreadable `.b`). Every other bind keeps the eager decode and so raises at the b
 - a body that reads `$x` after a stage that may leave no cursor: a member that can be absent
   (`.missing | $x`, `.a.b | $x`, `.[0] | $x`) or a computed value (`1 | $x`, `length | $x`,
   `[.[]] | $x`, `(.a, 1) | $x`);
+- a body that reads the whole node under an iteration (`.users[] | {r: $x}`, `select($x == .)`,
+  `$x | length`): the eager bind decoded the node once and shared that copy across every
+  materialization of it, which a deferred read cannot (it would decode the node per element, 37x
+  slower on a 1.4 MB document), so only a member read (`$x.limit`, a field chain nothing consumes as
+  a pipe stage) is deferred there;
 - a body that reads `$x` inside anything not on the predicate's list of cursor-preserving forms:
   `reduce`/`foreach`, `map`, `path(...)`, assignment and `del`, `def` bodies and calls, string
   interpolation, `input`, a catch handler, a destructuring bind;
-- a bind whose source is not a node of the ambient document (`input as $x`);
+- a bind whose source is not a node of the ambient document (`input as $x | $x`), when the body
+  reads the variable (a body that never names it defers whatever the source is, so `input as $x |
+  1` no longer validates the document it consumes);
 - yq mode, which follows yq.
 
 The predicate is a whitelist, not a blacklist, because the evaluator hands some forms to the
 owned evaluator, which has no cursor to resolve a deferred name against; such a read raises an
 internal error rather than a guessed value, and the differential sweep
 (`deferred_bind_agrees_with_the_decoding_bind_3856`, `src/jq/eval_generic.rs`) pins that no
-admitted body reaches it. A read the predicate admits costs what it cost before: the eager bind
-already resolved `$x` back to its document node wherever the use site held a cursor of the same
-document (#2072), so only the decode at the bind is gone. (`. as $r | .users[] |
-$r.users[0].id` walks the array's length per record, as it did before; the array index is what
-is linear, not the bind.)
+admitted body reaches it. What is left against the eager bind is a constant factor, not growth with
+the document: a body that names the node bare `k` times, each of which materializes it, decodes it up
+to `k` times where the eager bind decoded once (`. as $x | $x == .` is two decodes, +78% instructions
+on a 0.7 MB document; `. as $x | {r: $x}` +17%), and a read that only navigates skips the decode
+altogether. (`. as $r | .users[] | $r.users[0].id` walks the array's length per record, as it did
+before: the array index is what is linear, not the bind.)
 
 The rule a caller can apply is therefore "an array holds a value beside another value without
 reading it, and a bind names a subtree without reading it; an object or an array inside an array

@@ -42,7 +42,7 @@ use std::rc::Rc;
 
 use indexmap::IndexMap;
 
-use super::deferred_bind::{deferred_bind_cursor, deferred_bind_is_sound, mentions_var};
+use super::deferred_bind::{deferred_bind_cursor, deferred_bind_reads_are_sound, mentions_var};
 use super::document::{
     checked_member_key, child_tail_gap_ok, collapsed_fields, collapsed_fields_if,
     container_tail_gap_ok, effective_fields_checked, effective_fields_with_raw_last,
@@ -14185,7 +14185,8 @@ fn each_as_generic<S: EvalSemantics, V: DocumentValue>(
     //   be one of the ambient cursor's own document, because the use site
     //   resolves it against that cursor, and `deferred_bind_is_sound` has to
     //   prove every read happens where one is in hand.
-    let unused = core::cell::OnceCell::new();
+    let mentions = core::cell::OnceCell::new();
+    let names_var = || *mentions.get_or_init(|| mentions_var(body, var));
     let body_defers = core::cell::OnceCell::new();
     let defer = |bound: &V::Cursor, decode_failed: bool| {
         S::TAG == EvalTag::Jq
@@ -14194,8 +14195,9 @@ fn each_as_generic<S: EvalSemantics, V: DocumentValue>(
                 bound,
                 cursor.as_ref(),
                 decode_failed,
-                || *unused.get_or_init(|| !mentions_var(body, var)),
-                || *body_defers.get_or_init(|| deferred_bind_is_sound(body, var)),
+                || !names_var(),
+                // Asked only once `names_var` has answered yes.
+                || *body_defers.get_or_init(|| deferred_bind_reads_are_sound(body, var)),
             )
     };
     fanout_arg_each_generic_deferring::<S, V, _>(
@@ -14232,7 +14234,7 @@ fn each_as_generic<S: EvalSemantics, V: DocumentValue>(
             Bound::Deferred(node) => {
                 #[cfg(test)]
                 DEFERRED_TAKEN.with(|n| n.set(n.get() + 1));
-                if mentions_var(body, var) {
+                if names_var() {
                     let deferred = substitute_deferred_var(body, var, bind_origin_of_cursor(&node));
                     eval_each_generic::<S, V>(&deferred, value.clone(), optional, cursor, sink)
                 } else {
@@ -18695,8 +18697,7 @@ where
         |bound| match bound {
             Bound::Value(owned, origin) => body(owned, origin),
             Bound::Deferred(_) => {
-                unreachable!("a defer test that always answers false hands out no node")
-                // patchcov: coverage tolerate-line reason="unreachable: the defer test passed above is `|_| false`, and `Bound::Deferred` is only built when it answers true (#3856)"
+                unreachable!("never defers") // patchcov: coverage tolerate-line reason="unreachable: the defer test passed above is `|_| false`, and `Bound::Deferred` is only built when it answers true (#3856)"
             }
         },
     )
@@ -50548,46 +50549,116 @@ mod deferred_bind_tests_3856 {
     use crate::jq::parse;
     use crate::json::JsonIndex;
 
-    /// Every output of `filter` over `json` (as compact JSON), and how the
+    /// Every output of a filter over a document (as compact JSON), and how the
     /// stream ended.
-    fn run(json: &str, filter: &str) -> (Vec<String>, Option<String>) {
+    type Outcome = (Vec<String>, Option<String>);
+
+    /// A way of running a filter over a document.
+    type Runner = fn(&str, &str) -> Outcome;
+
+    /// How a stream ended, as text.
+    fn ended(control: Control) -> String {
+        match control {
+            Control::Error(e) => format!("error: {}", e.message),
+            Control::Break(label) => format!("break {label}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite: no generated body breaks (#3856)"
+            Control::Halt(code) => format!("halt {code}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite: no generated body halts (#3856)"
+        }
+    }
+
+    /// [`Outcome`] of `filter` over `json`, through the collecting entry.
+    fn run(json: &str, filter: &str) -> Outcome {
         let index = JsonIndex::build(json.as_bytes());
         let cursor = index.root(json.as_bytes());
         let expr = parse(filter).expect("filter parses");
         let result = eval_with_cursor_using::<JqSemantics, _>(&expr, cursor);
         let mut out = Vec::new();
         let control = push_generic_owned_values::<_, JqSemantics>(result, &mut out);
-        let ended = control.map(|c| match c {
-            Control::Error(e) => format!("error: {}", e.message),
-            Control::Break(label) => format!("break {label}"),
-            Control::Halt(code) => format!("halt {code}"),
-        });
-        (out.iter().map(OwnedValue::to_json).collect(), ended)
+        (
+            out.iter().map(OwnedValue::to_json).collect(),
+            control.map(ended),
+        )
     }
 
     /// [`run`] through the streaming entry the CLI drives, whose sink-based
     /// stages differ from the collecting entry's.
-    fn run_streaming(json: &str, filter: &str) -> (Vec<String>, Option<String>) {
+    fn run_streaming(json: &str, filter: &str) -> Outcome {
         let index = JsonIndex::build(json.as_bytes());
         let cursor = index.root(json.as_bytes());
         let expr = parse(filter).expect("filter parses");
         let mut out = Vec::new();
-        let mut ended = None;
+        let mut stopped = None;
         let control = eval_each_with_cursor_using::<JqSemantics, _>(&expr, cursor, &mut |item| {
-            match push_generic_owned_values::<_, JqSemantics>(item, &mut out) {
-                None => true,
-                Some(c) => {
-                    ended = Some(c);
-                    false
-                }
+            stopped = push_generic_owned_values::<_, JqSemantics>(item, &mut out);
+            stopped.is_none()
+        });
+        (
+            out.iter().map(OwnedValue::to_json).collect(),
+            stopped.or(control).map(ended),
+        )
+    }
+
+    /// What a sweep over filters and documents tallies: both binds are run
+    /// through both entries, and a disagreement or an escape of the internal
+    /// error is recorded rather than asserted, so one run names them all.
+    #[derive(Default)]
+    struct Tally {
+        mismatches: Vec<String>,
+        backstop: Vec<String>,
+        answers: usize,
+        deferred_before: u64,
+    }
+
+    impl Tally {
+        fn start() -> Self {
+            Self {
+                deferred_before: DEFERRED_TAKEN.with(core::cell::Cell::get),
+                ..Self::default()
             }
-        });
-        let ended = ended.or(control).map(|c| match c {
-            Control::Error(e) => format!("error: {}", e.message),
-            Control::Break(label) => format!("break {label}"),
-            Control::Halt(code) => format!("halt {code}"),
-        });
-        (out.iter().map(OwnedValue::to_json).collect(), ended)
+        }
+
+        /// Runs `filter` over `doc` with the node left undecoded and decoded.
+        fn check(&mut self, doc: &str, filter: &str) {
+            let routes: [(&str, Runner); 2] = [("collecting", run), ("streaming", run_streaming)];
+            for (route, run) in routes {
+                let deferred = run(doc, filter);
+                let eager = with_eager_binds(|| run(doc, filter));
+                // Built every time and kept only on a failure, so the recording
+                // path is one executed line.
+                let report = format!(
+                    "{filter} on {doc} ({route})\n  deferred: {deferred:?}\n  eager:    {eager:?}"
+                );
+                let fired = deferred
+                    .1
+                    .as_deref()
+                    .is_some_and(|e| e.contains("deferred variable"));
+                self.mismatches
+                    .extend((deferred != eager).then(|| report.clone()));
+                self.backstop.extend(fired.then_some(report));
+                self.answers += deferred.0.len();
+            }
+        }
+
+        /// Asserts nothing disagreed, the internal error never fired, and the
+        /// sweep was not vacuous: it answered, and it really deferred binds.
+        fn finish(self, min_answers: usize, min_deferred: u64) {
+            let first =
+                |list: &[String]| list.iter().take(5).cloned().collect::<Vec<_>>().join("\n");
+            let backstop = format!(
+                "the internal error fired {} times, first 5:\n{}",
+                self.backstop.len(),
+                first(&self.backstop)
+            );
+            let mismatches = format!(
+                "{} disagreements, first 5:\n{}",
+                self.mismatches.len(),
+                first(&self.mismatches)
+            );
+            let deferred = DEFERRED_TAKEN.with(core::cell::Cell::get) - self.deferred_before;
+            assert!(self.backstop.is_empty(), "{backstop}");
+            assert!(self.mismatches.is_empty(), "{mismatches}");
+            assert!(self.answers > min_answers, "only {} outputs", self.answers);
+            assert!(deferred > min_deferred, "only {deferred} binds deferred");
+        }
     }
 
     /// A small deterministic generator, so a failure names its seed.
@@ -50709,10 +50780,7 @@ mod deferred_bind_tests_3856 {
         let mut rng = Lcg(3856);
         docs.extend((0..12).map(|_| random_json(&mut rng, 3)));
 
-        let taken_before = DEFERRED_TAKEN.with(core::cell::Cell::get);
-        let mut mismatches = Vec::new();
-        let mut deferred_answers = 0usize;
-        let mut backstop = std::collections::BTreeSet::new();
+        let mut tally = Tally::start();
         for body in bodies() {
             // Bound at the root, and bound per element of an iteration.
             for filter in [
@@ -50723,62 +50791,11 @@ mod deferred_bind_tests_3856 {
                 format!(".users[]? as $x | {body}"),
             ] {
                 for doc in &docs {
-                    let deferred = run(doc, &filter);
-                    let eager = with_eager_binds(|| run(doc, &filter));
-                    if deferred != eager {
-                        mismatches.push(format!(
-                            "{filter} on {doc}\n  deferred: {deferred:?}\n  eager:    {eager:?}"
-                        ));
-                    }
-                    let streamed = run_streaming(doc, &filter);
-                    let streamed_eager = with_eager_binds(|| run_streaming(doc, &filter));
-                    if streamed != streamed_eager {
-                        mismatches.push(format!(
-                            "{filter} on {doc} (streaming)\n  deferred: {streamed:?}\n  eager:    {streamed_eager:?}"
-                        ));
-                    }
-                    if streamed
-                        .1
-                        .as_deref()
-                        .is_some_and(|e| e.contains("deferred variable"))
-                    {
-                        backstop.insert(format!("{filter} (streaming)"));
-                    }
-                    if deferred
-                        .1
-                        .as_deref()
-                        .is_some_and(|e| e.contains("deferred variable"))
-                    {
-                        backstop.insert(filter.clone());
-                    }
-                    deferred_answers += deferred.0.len();
+                    tally.check(doc, &filter);
                 }
             }
         }
-        assert!(
-            backstop.is_empty(),
-            "the internal error fired for {} filters, first 10: {:#?}",
-            backstop.len(),
-            backstop.iter().take(10).collect::<Vec<_>>()
-        );
-        assert!(
-            deferred_answers > 1000,
-            "the sweep barely answered anything"
-        );
-        // Not vacuous: the deferred arm really left nodes undecoded.
-        let taken = DEFERRED_TAKEN.with(core::cell::Cell::get) - taken_before;
-        assert!(taken > 5000, "only {taken} binds were deferred");
-        assert!(
-            mismatches.is_empty(),
-            "{} disagreements, first 5:\n{}",
-            mismatches.len(),
-            mismatches
-                .iter()
-                .take(5)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
+        tally.finish(1000, 5000);
     }
 
     /// The gate defers a subtree of the ambient cursor's own document and
@@ -50862,28 +50879,18 @@ mod deferred_bind_tests_3856 {
             true
         ));
         // The body walk is not paid for when an earlier test already decided.
-        assert!(may_defer_bind(
-            &a_root,
-            None,
-            false,
-            always,
-            || unreachable!("not asked")
-        ));
-        assert!(!may_defer_bind(
-            &member(a_root, "s"),
-            Some(&a_root),
-            false,
-            never,
-            || { unreachable!("not asked") }
-        ));
-        assert!(may_defer_bind(
-            &member(a_root, "s"),
-            None,
-            true,
-            always,
-            || { unreachable!("not asked") }
-        ));
+        let (s_node, other) = (member(a_root, "s"), Some(&a_root));
+        assert!(may_defer_bind(&a_root, None, false, always, not_asked));
+        assert!(!may_defer_bind(&s_node, other, false, never, not_asked));
+        assert!(may_defer_bind(&s_node, None, true, always, not_asked));
     }
+
+    /// The body walk, which a gate that already decided must not ask for.
+    // patchcov: coverage tolerate reason="unreachable in a passing suite: being asked is the failure this stands in for (#3856)"
+    fn not_asked() -> bool {
+        unreachable!("not asked")
+    }
+    // patchcov: coverage end
 
     /// A deferred variable with nothing to resolve it from raises the internal
     /// error, in every evaluator that can meet one, and never answers a value.
@@ -50900,26 +50907,35 @@ mod deferred_bind_tests_3856 {
         };
         let message = |r: GenericResult<_>| match r {
             GenericResult::Error(e) => e.message,
-            other => panic!(
-                "expected the internal error, got {:?}",
-                other.into_owned::<JqSemantics>()
-            ),
+            _ => panic!("not an error"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite: every probe answers the internal error (#3856)"
         };
 
         // Resolved against its own document: the node itself.
-        match eval_with_cursor_using::<JqSemantics, _>(&node(&cursor), cursor) {
-            GenericResult::OneCursor(c) => assert!(c.same_node(&cursor)),
-            other => panic!(
-                "expected the node, got {:?}",
-                other.into_owned::<JqSemantics>()
-            ),
-        }
+        let resolved = eval_with_cursor_using::<JqSemantics, _>(&node(&cursor), cursor);
+        assert!(matches!(&resolved, GenericResult::OneCursor(c) if c.same_node(&cursor)));
         // Resolved from a cursor of another document: the token is checked
         // before the id is trusted.
         assert_eq!(
             message(eval_with_cursor_using::<JqSemantics, _>(
                 &node(&cursor),
                 foreign
+            )),
+            crate::jq::eval::DEFERRED_BIND_UNRESOLVED
+        );
+        // A handle that names no node of a document at all (a marker built by
+        // hand: the bind only ever makes the node form).
+        let owned_origin = Expr::DeferredVar(Rc::new(BindOrigin::Owned {
+            base: None,
+            chain: Vec::new(),
+            key_node: false,
+            exact: false,
+            root: 0,
+            navigated: false,
+        }));
+        assert_eq!(
+            message(eval_with_cursor_using::<JqSemantics, _>(
+                &owned_origin,
+                cursor
             )),
             crate::jq::eval::DEFERRED_BIND_UNRESOLVED
         );
@@ -50934,11 +50950,126 @@ mod deferred_bind_tests_3856 {
             crate::jq::eval::DEFERRED_BIND_UNRESOLVED
         );
         // The owned evaluator has no node of the original document to resolve.
-        match crate::jq::eval::eval_full::<Vec<u64>, JqSemantics>(&node(&cursor), cursor) {
-            QueryResult::Error(e) => {
-                assert_eq!(e.message, crate::jq::eval::DEFERRED_BIND_UNRESOLVED);
-            }
-            other => panic!("expected the internal error, got {other:?}"),
+        let QueryResult::Error(owned) =
+            crate::jq::eval::eval_full::<Vec<u64>, JqSemantics>(&node(&cursor), cursor)
+        else {
+            panic!("not an error") // patchcov: coverage tolerate-line reason="unreachable in a passing suite: the owned evaluator answers the internal error (#3856)"
+        };
+        assert_eq!(owned.message, crate::jq::eval::DEFERRED_BIND_UNRESOLVED);
+    }
+
+    /// A random expression over `$x`, from the forms the predicate admits and
+    /// the ones it refuses, nested to `depth`.
+    fn random_body(rng: &mut Lcg, depth: u32) -> String {
+        const LEAVES: [&str; 20] = [
+            "$x",
+            "$x.a",
+            "$x.users",
+            "$x.users[0]",
+            ".",
+            ".a",
+            ".b",
+            ".users",
+            ".[0]",
+            ".[]?",
+            "1",
+            "\"s\"",
+            "null",
+            "empty",
+            "length",
+            "keys?",
+            "type",
+            "tojson",
+            "not",
+            "..",
+        ];
+        if depth == 0 || rng.next(10) < 2 {
+            return LEAVES[rng.next(LEAVES.len() as u64) as usize].to_string();
         }
+        let choice = rng.next(20);
+        let mut sub = || random_body(rng, depth - 1);
+        match choice {
+            0 | 1 => format!("{} | {}", sub(), sub()),
+            2 => format!("({}, {})", sub(), sub()),
+            3 => format!("[{}]", sub()),
+            4 => format!("{{k: {}, j: {}}}", sub(), sub()),
+            5 => format!("({}) == ({})", sub(), sub()),
+            6 => format!("({}) + ({})", sub(), sub()),
+            7 => format!("if {} then {} else {} end", sub(), sub(), sub()),
+            8 => format!("({}) // ({})", sub(), sub()),
+            9 => format!("try ({}) catch ({})", sub(), sub()),
+            10 => format!("select({})", sub()),
+            11 => format!("({}) as $y | ({}), $y", sub(), sub()),
+            12 => format!("map({})", sub()),
+            13 => format!("first({})", sub()),
+            14 => format!("limit(2; {})", sub()),
+            15 => format!("reduce ({}) as $i (0; . + ({} | length?))", sub(), sub()),
+            16 => format!("path({})?", sub()),
+            17 => format!("\"v=\\({})\"", sub()),
+            // A nested binder of the same name shadows `$x` in its body only.
+            18 => format!("({}) as $x | ({}), $x", sub(), sub()),
+            _ => format!("({}) and ({})", sub(), sub()),
+        }
+    }
+
+    /// The same, over random bodies: the sweep above is templates, which cover
+    /// the shapes someone thought of. Whatever the generator builds that parses
+    /// must answer the same with the node left undecoded as with it decoded,
+    /// and never reach the internal error.
+    #[test]
+    fn deferred_bind_agrees_on_random_bodies_3856() {
+        let mut rng = Lcg(0x3856);
+        let docs: Vec<String> = [
+            r#"{"a":{"b":1},"b":2,"users":[{"a":1},{"a":2,"users":[3]}],"k":null}"#,
+            r#"{"users":[],"a":[1,[2,3]],"b":"s"}"#,
+            r#"[{"a":1},{"b":[1,2]},3,null,"x"]"#,
+        ]
+        .into_iter()
+        .map(String::from)
+        .chain((0..3).map(|_| random_json(&mut rng, 3)))
+        .collect();
+
+        let mut tally = Tally::start();
+        let mut parsed = 0usize;
+        for _ in 0..6000 {
+            let body = random_body(&mut rng, 4);
+            for prefix in [". as $x | ", ".[]? | . as $x | ", ".users as $x | "] {
+                let filter = format!("{prefix}{body}");
+                // A combination that does not parse (a stray `..` operand) is
+                // not a filter.
+                parsed += usize::from(parse(&filter).is_ok());
+                for doc in docs.iter().filter(|_| parse(&filter).is_ok()) {
+                    tally.check(doc, &filter);
+                }
+            }
+        }
+        assert!(parsed > 3000, "only {parsed} filters parsed");
+        tally.finish(1000, 3000);
+    }
+
+    /// The reads that kept the eager decode are the ones that would otherwise
+    /// decode the node once per element, where the eager bind shared one copy
+    /// through the embed table (#2889). Pinned by whether a bind was deferred.
+    #[test]
+    fn repeated_reads_that_materialize_the_node_keep_the_eager_bind_3856() {
+        let doc = r#"{"users":[{"id":1},{"id":2}],"meta":{"n":3}}"#;
+        let deferred = |filter: &str| {
+            let before = DEFERRED_TAKEN.with(core::cell::Cell::get);
+            let _ = run(doc, filter);
+            DEFERRED_TAKEN.with(core::cell::Cell::get) - before
+        };
+        // One read per bind, however it is consumed, and member reads under
+        // an iteration, defer.
+        assert_eq!(deferred(". as $x | {r: $x}"), 1);
+        assert_eq!(deferred(". as $x | $x | tojson"), 1);
+        assert_eq!(deferred(". as $x | .users[] | $x.meta.n"), 1);
+        assert_eq!(deferred(". as $x | .users[] | select(.id < $x.meta.n)"), 1);
+        assert_eq!(deferred(". as $x | .users[] | .id"), 1);
+        // The whole node under an iteration keeps the one shared decode.
+        assert_eq!(deferred(". as $x | .users[] | {r: $x}"), 0);
+        assert_eq!(deferred(". as $x | .users[] | select($x == .)"), 0);
+        assert_eq!(deferred(". as $x | .users[] | $x | tojson"), 0);
+        assert_eq!(deferred(". as $x | .users[] | $x.users | length"), 0);
+        assert_eq!(deferred(". as $x | .users[] | [$x]"), 0);
     }
 }

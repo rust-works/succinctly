@@ -1985,16 +1985,16 @@ impl<W> From<EvalError> for QueryResult<'_, W> {
     }
 }
 
-// jq's `jv_kind` discriminants, verbatim from `jv.h`, so the two enums can be
-// read side by side. `JV_KIND_INVALID` (0) has no `OwnedValue` counterpart — an
-// `OwnedValue` is always a valid value — so the numbering starts at 1.
 /// The message of the internal error a deferred `as` binding raises when it is
 /// read with no cursor of its own document in hand (#3856). Reaching it means
-/// `eval_generic::deferred_bind_is_sound` admitted a position it should not
-/// have; it is never a user error, and never a guessed value.
+/// `eval_generic::deferred_bind_reads_are_sound` admitted a position it should
+/// not have; it is never a user error, and never a guessed value.
 pub(crate) const DEFERRED_BIND_UNRESOLVED: &str =
     "internal: a deferred variable binding was read without a cursor of its document (#3856)";
 
+// jq's `jv_kind` discriminants, verbatim from `jv.h`, so the two enums can be
+// read side by side. `JV_KIND_INVALID` (0) has no `OwnedValue` counterpart — an
+// `OwnedValue` is always a valid value — so the numbering starts at 1.
 const JQ_KIND_NULL: u8 = 1;
 const JQ_KIND_FALSE: u8 = 2;
 const JQ_KIND_TRUE: u8 = 3;

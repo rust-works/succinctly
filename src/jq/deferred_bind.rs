@@ -16,9 +16,10 @@
 //!
 //! # The predicate
 //!
-//! It answers: is every `$x` in `body` read where the ambient input is
-//! *definitely* a cursor of the document `$x` was bound from? It tracks the
-//! ambient input through the body as an [`Ambient`]:
+//! It answers two questions about every `$x` in `body`.
+//!
+//! **Is there a cursor to resolve it from?** It tracks the ambient input
+//! through the body as an [`Ambient`]:
 //!
 //! - [`Ambient::Cursor`]: a node of the document. The bind's own input starts
 //!   here (the caller checks that the bound node belongs to the ambient
@@ -31,26 +32,43 @@
 //! - [`Ambient::Opaque`]: anything else -- a literal, a construction, a
 //!   computed value.
 //!
-//! `$x` is admitted only under `Cursor`. The body must be built from the forms
-//! listed in [`walk`]; a form outside the list is fine when it does not mention
-//! `$x` (it only degrades the ambient to `Opaque` for what follows) and makes
-//! the bind eager when it does. That is a whitelist on purpose: the evaluator
-//! hands some forms to the owned evaluator, which has no cursor to resolve a
-//! deferred variable against, and a form not known to stay native must not
-//! carry one. It is kept separate from `array_route_stage_is_pure_navigation`
-//! and `path_expr_is_cursor_navigable` (#3501): three predicates that look
-//! alike and answer different questions must not widen together.
+//! `$x` is admitted only under `Cursor`.
 //!
-//! # What a read costs
+//! **Does the read share what the eager bind shared?** The eager bind decoded
+//! the node once and registered the result in the embed table (#2889), so every
+//! later materialization of *that node* -- `{r: $x}`, `$x == .`, `[$x]`, `$x |
+//! tojson` -- was handed the one `Rc` instead of decoding again. A deferred
+//! read has no entry to hit: it decodes the node each time it runs. That is
+//! free for a read that runs once per bind (it is the decode the eager bind
+//! paid, moved to where it is needed), and a loss that grows with the document
+//! for one that runs once per element of a collection:
+//! `. as $x | .users[] | select(.id < 300) | {r: $x}` decodes the whole document
+//! per element where the eager bind shared one copy (0.18 s against 6.7 s on a
+//! 1.4 MB document). So once a stage has *repeated* the ambient (`.[]`, or
+//! anything not known to yield one output), a read of `$x` is admitted only as
+//! the head of a chain of field reads that nothing consumes as a pipe stage
+//! (`$x.limit` as an operand, an object value, an array element). That reads a
+//! member of the node, never the node, and the eager bind did not share a
+//! member either: a descendant is materialized from its own cursor each time,
+//! before and after. A bare `$x`, `$x | length` and `$x | tojson` under a
+//! repeated ambient keep the eager decode.
 //!
-//! Nothing more than before. The eager bind already resolved `$x` back to its
-//! document node wherever the use site held a cursor of the same document
-//! (#2072), and only fell back to its decoded value where there was none --
-//! which is exactly the position this predicate refuses. So a read it admits
-//! navigates the document as it always did, and deferring removes only the
-//! decode at the bind. (A read that walks a large container per element, such
-//! as `$root.nodes[.from]` over a big array, was O(n) per read before and still
-//! is: that is the array index walking its length, not this change.)
+//! What is left is a constant factor, not a growth with the document: a body
+//! that names the node bare `k` times, each of which materializes it, decodes it
+//! up to `k` times where the eager bind decoded once, and `$x == .` over the same
+//! node loses the same-node shortcut the shared copy gave (`. as $x | $x == .`
+//! costs two decodes, measured +78%; `. as $x | {r: $x}` +17%). A read that only
+//! navigates (`$x.a`, `$x | keys`, `[$x]` counted) skips the decode altogether.
+//!
+//! The body must be built from the forms listed in [`walk`]; a form outside the
+//! list is fine when it does not mention `$x` (it only degrades the ambient to
+//! `Opaque` for what follows) and makes the bind eager when it does. That is a
+//! whitelist on purpose: the evaluator hands some forms to the owned evaluator,
+//! which has no cursor to resolve a deferred variable against, and a form not
+//! known to stay native must not carry one. It is kept separate from
+//! `array_route_stage_is_pure_navigation` and `path_expr_is_cursor_navigable`
+//! (#3501): three predicates that look alike and answer different questions must
+//! not widen together.
 //!
 //! No `path(...)`, assignment, `del`, `reduce`, `foreach`, `def` or call is on
 //! the list, so a deferred variable never reaches the path resolver and its
@@ -81,12 +99,54 @@ impl Ambient {
     }
 }
 
+/// The ambient input at a point in the body, and whether the stages that
+/// produced it may have run it more than once per bind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct State {
+    at: Ambient,
+    /// A generator upstream (`.[]`) hands this point one input per element, so
+    /// a read here runs once per element, not once per bind.
+    repeated: bool,
+}
+
+impl State {
+    const START: Self = Self {
+        at: Ambient::Cursor,
+        repeated: false,
+    };
+
+    fn join(self, other: Self) -> Self {
+        Self {
+            at: self.at.join(other.at),
+            repeated: self.repeated || other.repeated,
+        }
+    }
+
+    fn with(self, at: Ambient) -> Self {
+        Self { at, ..self }
+    }
+
+    fn repeating(self, many: bool) -> Self {
+        Self {
+            repeated: self.repeated || many,
+            ..self
+        }
+    }
+}
+
 /// Whether `body` may read `$var` through a deferred binding -- see the
 /// module documentation. `false` keeps the bind eager, exactly as before.
+#[cfg(test)]
 pub(crate) fn deferred_bind_is_sound(body: &Expr, var: &str) -> bool {
     // A body that never names the variable is trivially sound (the cost
-    // `. as $x | 1` used to pay), and the common case -- one scan, no walk.
-    !mentions_var(body, var) || walk(body, var, Ambient::Cursor).is_some()
+    // `. as $x | 1` used to pay).
+    !mentions_var(body, var) || deferred_bind_reads_are_sound(body, var)
+}
+
+/// [`deferred_bind_is_sound`] for a body already known to name `$var`: the walk
+/// alone, so the caller's one scan for the name is not repeated.
+pub(crate) fn deferred_bind_reads_are_sound(body: &Expr, var: &str) -> bool {
+    walk(body, var, State::START, false).is_some()
 }
 
 /// Whether `expr` reads `$var` anywhere. Over-approximate: a nested binder
@@ -95,100 +155,203 @@ pub(crate) fn mentions_var(expr: &Expr, var: &str) -> bool {
     any_subexpr(expr, &mut |e| matches!(e, Expr::Var(name) if name == var))
 }
 
-/// The ambient after `expr` runs against `at`, or `None` when `expr` reads
-/// `$var` somewhere a deferred binding cannot be resolved.
-fn walk(expr: &Expr, var: &str, at: Ambient) -> Option<Ambient> {
-    // Everything outside the whitelist: harmless without the variable, which
-    // then leaves the ambient unknown for any later stage.
-    let opaque = |e: &Expr| (!mentions_var(e, var)).then_some(Ambient::Opaque);
+/// Whether `expr` may yield more than one output (or, for a form this does not
+/// know, whether it might). A generator makes whatever is evaluated alongside
+/// or after it run once per output.
+fn may_yield_many(expr: &Expr) -> bool {
     match expr {
-        Expr::Var(name) if name == var => (at == Ambient::Cursor).then_some(Ambient::Cursor),
-        Expr::Identity => Some(at),
+        Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Literal(_)
+        | Expr::Var(_)
+        | Expr::Not
+        // Collects whatever its body yields into one array.
+        | Expr::Array(_) => false,
+        Expr::Paren(inner) | Expr::Optional(inner) | Expr::Negate(inner) => may_yield_many(inner),
+        Expr::Pipe(stages) => stages.iter().any(may_yield_many),
+        Expr::Compare { left, right, .. }
+        | Expr::Arithmetic { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::Alternative(left, right) => may_yield_many(left) || may_yield_many(right),
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => may_yield_many(cond) || may_yield_many(then_branch) || may_yield_many(else_branch),
+        Expr::Try { expr, catch } => {
+            may_yield_many(expr) || catch.as_deref().is_some_and(may_yield_many)
+        }
+        Expr::Object(entries) => entries.iter().any(|entry| {
+            may_yield_many(&entry.value)
+                || matches!(&entry.key, ObjectKey::Expr(key) if may_yield_many(key))
+        }),
+        Expr::As { expr, body, .. } => may_yield_many(expr) || may_yield_many(body),
+        _ => true,
+    }
+}
+
+/// A stage that reads one member of an object: `.k`, `.k?`.
+fn is_field_read(stage: &Expr) -> bool {
+    match stage {
+        Expr::Field(_) => true,
+        Expr::Optional(inner) => matches!(inner.as_ref(), Expr::Field(_)),
+        _ => false,
+    }
+}
+
+/// The state after `expr` runs against `st`, or `None` when `expr` reads
+/// `$var` somewhere a deferred binding cannot be resolved or is not cheap.
+/// `piped` is whether a pipe stage consumes `expr`'s output.
+fn walk(expr: &Expr, var: &str, st: State, piped: bool) -> Option<State> {
+    // Everything outside the whitelist: harmless without the variable, which
+    // then leaves the ambient unknown for any later stage, and (since it may
+    // be a generator) repeated.
+    let opaque = |e: &Expr| {
+        (!mentions_var(e, var)).then_some(State {
+            at: Ambient::Opaque,
+            repeated: true,
+        })
+    };
+    match expr {
+        // A repeated bare `$x` would materialize the whole node per run; the
+        // field-chain read is `walk_pipe`'s.
+        Expr::Var(name) if name == var => {
+            (st.at == Ambient::Cursor && !st.repeated).then_some(st.with(Ambient::Cursor))
+        }
+        Expr::Identity => Some(st),
         // A member that exists is a cursor; one that does not is an owned
         // `null` -- so the result is `Nav` whatever the input was, unless the
         // input is already opaque.
-        Expr::Field(_) | Expr::Index { .. } => Some(match at {
+        Expr::Field(_) | Expr::Index { .. } => Some(st.with(match st.at {
             Ambient::Opaque => Ambient::Opaque,
             _ => Ambient::Nav,
-        }),
+        })),
         // Only an actual container has elements to yield, and a container
-        // reached from a node is a node: `.[]` always yields cursors.
-        Expr::Iterate => Some(match at {
-            Ambient::Opaque => Ambient::Opaque,
-            _ => Ambient::Cursor,
+        // reached from a node is a node: `.[]` always yields cursors. One per
+        // element, so everything after it is repeated.
+        Expr::Iterate => Some(State {
+            at: match st.at {
+                Ambient::Opaque => Ambient::Opaque,
+                _ => Ambient::Cursor,
+            },
+            repeated: true,
         }),
-        Expr::Paren(inner) | Expr::Optional(inner) => walk(inner, var, at),
-        Expr::Pipe(stages) => stages
+        Expr::Paren(inner) | Expr::Optional(inner) => walk(inner, var, st, piped),
+        Expr::Pipe(stages) => walk_pipe(stages, var, st, piped),
+        Expr::Comma(branches) => branches
             .iter()
-            .try_fold(at, |ambient, stage| walk(stage, var, ambient)),
-        Expr::Comma(branches) => branches.iter().try_fold(Ambient::Cursor, |joined, branch| {
-            Some(joined.join(walk(branch, var, at)?))
-        }),
-        Expr::Compare { left, right, .. } | Expr::Arithmetic { left, right, .. } => {
-            walk(left, var, at)?;
-            walk(right, var, at)?;
-            Some(Ambient::Opaque)
-        }
-        Expr::And(left, right) | Expr::Or(left, right) => {
-            walk(left, var, at)?;
-            walk(right, var, at)?;
-            Some(Ambient::Opaque)
+            .try_fold(None::<State>, |joined, branch| {
+                let out = walk(branch, var, st, piped)?;
+                Some(Some(joined.map_or(out, |j| j.join(out))))
+            })?
+            .or(Some(st)),
+        Expr::Compare { left, right, .. }
+        | Expr::Arithmetic { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right) => {
+            // The right operand is the outer loop (#768), so each operand runs
+            // once per output of the other.
+            walk(left, var, st.repeating(may_yield_many(right)), false)?;
+            walk(right, var, st.repeating(may_yield_many(left)), false)?;
+            Some(st.with(Ambient::Opaque).repeating(may_yield_many(expr)))
         }
         Expr::Negate(inner) => {
-            walk(inner, var, at)?;
-            Some(Ambient::Opaque)
+            walk(inner, var, st, false)?;
+            Some(st.with(Ambient::Opaque).repeating(may_yield_many(inner)))
         }
-        Expr::Alternative(left, right) => Some(walk(left, var, at)?.join(walk(right, var, at)?)),
+        Expr::Alternative(left, right) => {
+            Some(walk(left, var, st, piped)?.join(walk(right, var, st, piped)?))
+        }
         Expr::If {
             cond,
             then_branch,
             else_branch,
         } => {
-            walk(cond, var, at)?;
-            Some(walk(then_branch, var, at)?.join(walk(else_branch, var, at)?))
+            walk(cond, var, st, false)?;
+            // A branch runs once per output of the condition.
+            let st = st.repeating(may_yield_many(cond));
+            Some(walk(then_branch, var, st, piped)?.join(walk(else_branch, var, st, piped)?))
         }
         // The handler runs on the error value, not on the ambient.
         Expr::Try { expr, catch } => {
-            let body = walk(expr, var, at)?;
+            let body = walk(expr, var, st, piped)?;
             match catch {
-                Some(handler) => walk(handler, var, Ambient::Opaque).map(|_| Ambient::Opaque),
+                Some(handler) => walk(handler, var, st.with(Ambient::Opaque), piped)
+                    .map(|handled| handled.join(body.with(Ambient::Opaque))),
                 None => Some(body),
             }
         }
         Expr::Array(inner) => {
-            walk(inner, var, at)?;
-            Some(Ambient::Opaque)
+            walk(inner, var, st, false)?;
+            Some(st.with(Ambient::Opaque))
         }
         Expr::Object(entries) => {
+            // Entries combine as a cartesian product, so one entry's generator
+            // repeats the others.
+            let st = st.repeating(may_yield_many(expr));
             for entry in entries {
                 if let ObjectKey::Expr(key) = &entry.key {
-                    walk(key, var, at)?;
+                    walk(key, var, st, false)?;
                 }
-                walk(&entry.value, var, at)?;
+                walk(&entry.value, var, st, false)?;
             }
-            Some(Ambient::Opaque)
+            Some(st.with(Ambient::Opaque))
         }
-        // `select` hands its input on unchanged.
+        // `select` hands its input on unchanged, once per truthy output.
         Expr::Builtin(Builtin::Select(cond)) => {
-            walk(cond, var, at)?;
-            Some(at)
+            walk(cond, var, st, false)?;
+            Some(st.repeating(may_yield_many(cond)))
         }
-        // A nested bind runs its body on the same ambient the bind sees, and
-        // its source is read there too. The same name shadows ours.
+        // A nested bind runs its body on the same ambient the bind sees, once
+        // per output of its source; the source is read there too. The same
+        // name shadows ours.
         Expr::As {
             expr,
             var: inner,
             body,
         } => {
-            walk(expr, var, at)?;
+            walk(expr, var, st, false)?;
             if inner == var {
-                Some(Ambient::Opaque)
+                Some(st.with(Ambient::Opaque))
             } else {
-                walk(body, var, at)
+                walk(body, var, st.repeating(may_yield_many(expr)), piped)
             }
         }
         other => opaque(other),
     }
+}
+
+/// [`walk`] over the stages of a pipe. A read of `$var` followed only by field
+/// reads is one read of that field chain (`$x.a.b`), which is what a repeated
+/// ambient admits; a bare `$var`, or any other stage after it, consumes the
+/// whole node.
+fn walk_pipe(stages: &[Expr], var: &str, st: State, piped: bool) -> Option<State> {
+    let mut cur = st;
+    let mut i = 0;
+    while i < stages.len() {
+        if matches!(&stages[i], Expr::Var(name) if name == var) && cur.repeated {
+            let end = i
+                + 1
+                + stages[i + 1..]
+                    .iter()
+                    .take_while(|stage| is_field_read(stage))
+                    .count();
+            if cur.at != Ambient::Cursor || end == i + 1 || end < stages.len() || piped {
+                return None;
+            }
+            // At least one field read follows (a bare `$var` returned above), so
+            // the result is a member, which may be absent.
+            cur = cur.with(Ambient::Nav);
+            i = end;
+            continue;
+        }
+        let consumed = i + 1 < stages.len() || piped;
+        cur = walk(&stages[i], var, cur, consumed)?;
+        i += 1;
+    }
+    Some(cur)
 }
 
 /// [`DocumentCursor::at_node_id`] for a deferred binding's node, against any
@@ -214,10 +377,10 @@ mod tests {
 
     fn sound(filter: &str) -> bool {
         // `. as $x | body`: split off the body the way the parser does.
-        match parse(filter).expect("parses") {
-            Expr::As { var, body, .. } => deferred_bind_is_sound(&body, &var),
-            other => panic!("expected an `as` bind, got {other:?}"),
-        }
+        let Expr::As { var, body, .. } = parse(filter).expect("parses") else {
+            panic!("not an `as` bind") // patchcov: coverage tolerate-line reason="unreachable in a passing suite: every row is an `as` bind (#3856)"
+        };
+        deferred_bind_is_sound(&body, &var)
     }
 
     #[test]
@@ -239,11 +402,65 @@ mod tests {
     }
 
     #[test]
-    fn reads_under_an_iteration_are_sound() {
+    fn a_single_read_is_sound_however_it_is_consumed() {
+        assert!(sound(". as $x | $x.users | length"));
+        assert!(sound(". as $x | $x.users[0]"));
+        assert!(sound(". as $x | $x | tojson"));
+        assert!(sound(". as $x | ($x.a, $x.b) | length"));
+    }
+
+    #[test]
+    fn a_repeated_read_is_sound_only_as_a_field_chain() {
+        // The head of a field chain nothing consumes as a pipe stage.
         assert!(sound(". as $x | .users[] | $x.meta"));
+        assert!(sound(". as $x | .users[] | $x.meta.n"));
         assert!(sound(". as $x | .users[] | select(.id == $x.limit)"));
-        assert!(sound(". as $x | .users[] | {a: $x.a}"));
-        assert!(sound(". as $x | .[] | .[] | $x"));
+        assert!(sound(". as $x | .users[] | {a: $x.a, b: [$x.b]}"));
+        assert!(sound(
+            ". as $x | .users[] | if .id > $x.min then 1 else 2 end"
+        ));
+        assert!(sound(". as $x | .users[] | $x.a?"));
+    }
+
+    #[test]
+    fn a_repeated_read_of_the_whole_node_is_refused() {
+        // The eager bind shared one decode of the node across these; a
+        // deferred read would decode it per element.
+        assert!(!sound(". as $x | .users[] | $x"));
+        assert!(!sound(". as $x | .users[] | {r: $x}"));
+        assert!(!sound(". as $x | .users[] | select($x == .)"));
+        assert!(!sound(". as $x | .users[] | [$x]"));
+        assert!(!sound(". as $x | .[] | .[] | $x"));
+        assert!(!sound(". as $x | .users[] | $x | length"));
+        assert!(!sound(". as $x | .users[] | $x | tojson"));
+        assert!(!sound(". as $x | .users[] | ($x, 1)"));
+        // A chain something goes on to consume, or that leaves the fields.
+        assert!(!sound(". as $x | .users[] | $x.users | length"));
+        assert!(!sound(". as $x | .users[] | $x.users[0]"));
+        assert!(!sound(". as $x | .users[] | $x.a | .b"));
+        assert!(!sound(". as $x | .users[] | [$x.users[0]]"));
+        assert!(!sound(". as $x | .edges[] | $x.nodes[.from]"));
+        assert!(!sound(". as $x | .users[] | ($x.users | length)"));
+        // A generator beside the read repeats it too.
+        assert!(!sound(". as $x | $x == (.[] | .b)"));
+        assert!(!sound(". as $x | ($x | length) == (.[] | .b)"));
+        assert!(!sound(". as $x | [.[] | $x]"));
+        // A comma beside it is a fixed number of branches, not a repetition.
+        assert!(sound(". as $x | ($x | length), (.[] | .b)"));
+    }
+
+    #[test]
+    fn operators_negation_and_computed_keys_are_walked() {
+        assert!(sound(". as $x | -($x.a)"));
+        assert!(sound(". as $x | try $x.a"));
+        assert!(sound(". as $x | {($x.k): 1}"));
+        assert!(sound(". as $x | {a: 1, ($x.k): $x.v}"));
+        // A computed key that yields many repeats the other entries.
+        assert!(!sound(". as $x | {(.[] | .k): $x}"));
+        assert!(!sound(". as $x | {(.[] | .k): $x.a | length}"));
+        // A negated value is computed, so there is no cursor to read from after it.
+        assert!(!sound(". as $x | -(.[] | .a) | $x"));
+        assert!(!sound(". as $x | try (.[] | .a) catch $x"));
     }
 
     #[test]

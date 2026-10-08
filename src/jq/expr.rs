@@ -600,7 +600,7 @@ pub enum Expr {
     /// `EXPR as $x | body` where `EXPR` named a node of the ambient
     /// document, and `body` reads `$x` only where the ambient input is
     /// provably a cursor of that same document
-    /// (`eval_generic::deferred_bind_is_sound`). The use site resolves the
+    /// (`deferred_bind::deferred_bind_is_sound`). The use site resolves the
     /// node through `DocumentCursor::at_node_id` and answers it as a
     /// cursor, so the value is validated and decoded only where something
     /// reads it -- and not at all when `$x` is never read.
