@@ -4989,12 +4989,16 @@ one. Final shipped build against the base, instructions retired:
 | block scalars                  | +2.4%   | +1.8%   |
 | wide object, `keys_unsorted`   | +0.5%   | -0.5%   |
 
-Wall-clock follows on the M4 Pro (strings `.` +4.7%, unicode `.` +4.3%, users +2.4%, block scalars
--4.9% median) and is mostly inside the noise on the 7950X (strings +2.7%, unicode +2.7%, block
-scalars -5.8%), where the streaming path is memory-bound. Two cheaper probes were tried and
-dropped: a `contains_cr`-style SIMD any-match kernel (no better, +1.7% to +3.9% more instructions
-on the 7950X, mixed on the M4 Pro), and probing per span rather than per string (block scalars
-+4.0% to +4.3% instead of +1.8% to +2.4%, since a string with an escape is many short spans).
+Wall-clock, measured twice on each chip (the shipped build, then again after the review fix that
+also escapes the text the quoted-scalar transcoders copy; medians against a same-session control
+that read within -0.5% to +1.1%): strings `.` +2.7% and +4.4% on the 7950X, +4.7% and +4.3% on the
+M4 Pro; unicode `.` +2.7% and +4.6%, +4.3% and +3.3%; users `.` +0.2%, and +2.4% and +2.0%; block
+scalars -5.8% and -2.3%, and -4.9% and +1.9% (a row that moves by this much between two runs of one
+binary is not a result). The streaming path is memory-bound on the 7950X, so less of the `Ir`
+shows there. Two cheaper probes were tried and dropped: a `contains_cr`-style SIMD any-match
+kernel (no better, +1.7% to +3.9% more instructions on the 7950X, mixed on the M4 Pro), and
+probing per span rather than per string (block scalars +4.0% to +4.3% instead of +1.8% to +2.4%,
+since a string with an escape is many short spans).
 The `Ir` cost is the price of matching yq (ADR-0018 puts reference behaviour ahead of speed).
 
 ### Files Modified
