@@ -7270,6 +7270,13 @@ fn materialize_stream_item<V: succinctly::jq::document::DocumentValue>(
                 None
             }
         },
+        GenericResult::LazyObject(obj) => match obj.materialize_atomic::<JqSemantics>() {
+            Ok(v) => Some(v),
+            Err(e) => {
+                sink.report(DiagStyle::Jq, &e, &at.resolve());
+                None
+            }
+        },
         // The eight shapes a sink item provably never takes (see this
         // function's doc comment). `None` rather than `unreachable!()` so a
         // future regression cannot take the process down -- but it would drop
@@ -7854,6 +7861,31 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
                     vec![]
                 }
             }
+        }
+        // #4044: an object holding document nodes prints each one from the
+        // source, validated up front like a `LazySeq` element, so a node that
+        // fails to decode keeps stdout empty (all-or-nothing, as `jq` builds
+        // the object before printing any of it).
+        GenericResult::LazyObject(obj) => {
+            let mut map: IndexMap<String, JqValue<'_, W>> = IndexMap::new();
+            for (key, elem) in obj.entries() {
+                let value = match elem {
+                    LazyElem::Cursor(c) => {
+                        validate_lazy_seq_cursor(c).map(|()| JqValue::Cursor(*c))
+                    }
+                    LazyElem::Owned(v) => JqValue::try_from_owned(v.clone()),
+                };
+                match value {
+                    Ok(value) => {
+                        map.insert(key.clone(), value);
+                    }
+                    Err(e) => {
+                        sink.report(DiagStyle::Jq, &e, at);
+                        return vec![];
+                    }
+                }
+            }
+            vec![OutputItem::Lazy(JqValue::Object(map.into()))]
         }
         GenericResult::None => vec![],
         GenericResult::Error(e) => {

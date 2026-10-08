@@ -28892,7 +28892,8 @@ fn generic_to_query_result<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         GenericResult::Partial(prefix, control) => QueryResult::Partial(prefix, control),
         GenericResult::LazyKeys { .. }
         | GenericResult::LazyIndexRange(_)
-        | GenericResult::LazySeq(_) => {
+        | GenericResult::LazySeq(_)
+        | GenericResult::LazyObject(_) => {
             unreachable!("materialize_lazy() already normalized every lazy variant")
         }
     }
@@ -132389,13 +132390,13 @@ mod tests {
             ("[1.2.3]", "[., 1] | length", None, Some("2")),
             ("[1.2.3]", "[., .] | length", None, Some("2")),
             ("[1.2.3]", "[[.]] | length", None, None),
-            ("[1.2.3]", "{a: .} | length", None, None),
+            ("[1.2.3]", "{a: .} | length", None, Some("1")),
             ("[1.2.3]", ". as $x | [$x] | length", None, None),
             (OBJ, "[.b] | length", Some("1"), Some("1")),
             (OBJ, "[.[] | .] | length", Some("2"), Some("2")),
             (OBJ, "[.a, .b] | length", Some("2"), Some("2")),
             (OBJ, "[.[], 1] | length", Some("3"), Some("3")),
-            (OBJ, "{x: .b} | length", None, None),
+            (OBJ, "{x: .b} | length", None, Some("1")),
             // #3856: a bind decodes what a body reads from it, and nothing
             // when the body never names the variable (a scalar included) or
             // reads only well-formed members of a subtree.

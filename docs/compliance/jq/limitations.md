@@ -9805,7 +9805,8 @@ others.
 | `select(key == 0) \| path(.a)` (same)                   | `["a"]`                         | raises          |
 | `[., 1] \| length`, `[., .] \| length` on `[1.2.3]`     | `2`                             | raises          |
 | `[., 1]` (printed) on `[1.2.3]`                         | raises                          | raises          |
-| `{a: .} \| length` on `[1.2.3]`                         | raises                          | raises          |
+| `{a: .} \| length` on `[1.2.3]`                         | `1`                             | raises          |
+| `{a: .}` (printed) on `[1.2.3]`                         | raises                          | raises          |
 | `[.b] \| length` on `[{"a":1,"b":tru}]`                 | `1`                             | `1`             |
 | `[.a, .b] \| length`, `[.[], 1] \| length` (same)       | `2`, `3`                        | `2`, `3`        |
 | `[.a, .b]` (printed, same)                              | raises                          | raises          |
@@ -9830,15 +9831,34 @@ navigation (`.`, `.b`, `.[]`, `.[] | .`), `limit`/`first`, `select`, `if`, `//` 
 (`[.]`, `[.b]`, `[limit(1; .)]`, `[first(.b)]`, `[.b | select(true)]`, `[.[]]`). What still
 builds an owned value and decodes what it holds, so each of these raises where those answer:
 
-- a construction held inside another: `[[.]]`, `[.[] | [.]]`, since the inner array is
-  materialized to be an element;
+- a construction held inside another: `[[.]]`, `[.[] | [.]]`, `{a: {b: .}}`, since the inner
+  construction is materialized to be an element;
 - a computed stream that is not a `,` body, `[.[] | ., .]`, whose pipe head is not a `,`;
-- an object: `{a: .}`, `{x: .b}`;
 - a variable bind that decodes at the bind, below;
 - yq mode, whose printer materializes a sequence anyway and so keeps its owned routes.
 
 `try` and `?` around the remaining collections do not rescue them (`try ([[.]]) catch "c"`),
 because the failure is a decode failure.
+
+**An object holds its nodes too (#4044, jq mode).** `{a: .users}`, `{meta: .meta, data: .users}`,
+`{x: .b}` and `{a: .}` hold each document node a member names as a cursor and read none of them,
+where the object used to decode every member at construction (`{a: .users}` over a 7 MB `users`
+document: 2,485 M instructions and 81 MB printed, 489 M and 25 MB now, the cost of
+`[.users]`). It applies to literal, distinct keys over values that each name one node (`.`,
+`.a`, `.[0]`, a pipe of those); a repeated key, a computed key or value, a fan-out (`.[]`), an
+absent value and a construction held inside another keep the ordinary route. A scalar that does
+not decode is kept as a node like an array's (`{x: .b} | length` over `tru` answers `1`). An
+object with no node to keep (`{name, age}`, the per-record shape) is built owned. Reading it
+behaves as an array's does: `.k`, `length`, `keys` and `keys_unsorted` answer without reading a
+member's contents; printing, `tojson`, `to_entries`, `has` and every other consumer read the
+whole object and raise on a node that fails to decode, writing nothing; a member that is a node
+comes back as the node (`{a: .bad} | .a | length` counts its members, `| tojson` raises). Two
+visible consequences, both the array's: `--preserve-input` keeps a repeated key inside a node the
+object holds (`{a: .dup}` prints `{"a":{"k":1,"k":2}}`, as `[.dup]` does), and `{a: .} | .a |
+first(map(f) | .[])` yields the first element like the document's own `first(map(f) | .[])`
+(the #725 trade, pinned in `test_map_iterate_atomicity_outside_truncators_2666`) rather than
+raising on a later one, because `.a` is a node, not an owned copy. yq mode keeps its owned
+routes.
 
 **A bind decodes what its body reads, and nothing else (#3856, jq mode).** `EXPR as $x | body`
 used to decode the bound node whether or not `$x` was read, which on a well-formed 36 MB
