@@ -2938,7 +2938,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
         };
         let own_meta = match cursor {
             Some(cursor) if !child_under_alias => {
-                let spelling = source_spelling(cursor, &owned);
+                let spelling = source_spelling(cursor, value, &owned);
                 if spelling.is_some() {
                     own_meta.with_spelling(spelling)
                 } else {
@@ -2959,7 +2959,11 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
 ///
 /// Only a plain scalar has one worth keeping (a quoted one is a string, which already
 /// travels verbatim), and only a value that resolved to null, a bool or a number.
-fn source_spelling<C: DocumentCursor>(cursor: &C, value: &OwnedValue) -> Option<String> {
+fn source_spelling<C: DocumentCursor>(
+    cursor: &C,
+    raw: &C::Value,
+    value: &OwnedValue,
+) -> Option<String> {
     // The cheap, allocation-free answers first: the overwhelmingly common scalar is
     // spelled the canonical way, and most of them are decided by one comparison.
     if !matches!(
@@ -2972,7 +2976,7 @@ fn source_spelling<C: DocumentCursor>(cursor: &C, value: &OwnedValue) -> Option<
     ) {
         return None;
     }
-    let source = cursor.plain_scalar_source()?;
+    let source = cursor.plain_scalar_source(raw)?;
     let canonical = match value {
         OwnedValue::Null => source == "null",
         OwnedValue::Bool(b) => source == if *b { "true" } else { "false" },

@@ -7558,8 +7558,8 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         YamlCursor::explicit_tag(self)
     }
 
-    fn plain_scalar_source(&self) -> Option<Cow<'_, str>> {
-        match self.value() {
+    fn plain_scalar_source<'v>(&'v self, value: &'v YamlValue<'a, W>) -> Option<Cow<'v, str>> {
+        match value {
             // An empty entry (`push:`).
             YamlValue::Null => Some(Cow::Borrowed("")),
             YamlValue::String(YamlString::Unquoted {
@@ -7569,7 +7569,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
                 json_sourced: false,
                 ..
             }) => {
-                let bytes = text.get(start..end)?;
+                let bytes = text.get(*start..*end)?;
                 if bytes.contains(&b'\n') {
                     return None;
                 }

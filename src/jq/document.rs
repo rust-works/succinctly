@@ -846,7 +846,10 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// `""` for an empty value -- so the DOM writer can print back the spelling a value
     /// resolved from (`~`, `True`, `0x1F`, #3028). `None` for anything else, and for
     /// formats without plain scalars (JSON).
-    fn plain_scalar_source(&self) -> Option<Cow<'_, str>> {
+    ///
+    /// `value` is this cursor's own decoded value, which the caller already holds, so
+    /// the YAML cursor need not decode it again (the DOM walk asks every scalar leaf).
+    fn plain_scalar_source<'v>(&'v self, _value: &'v Self::Value) -> Option<Cow<'v, str>> {
         None
     }
 
