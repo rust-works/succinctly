@@ -46496,7 +46496,9 @@ struct PathPatternMode<'f> {
     /// Set when a step's `path_intact` refusal is of a step with a [`NavKind`]:
     /// `Some(true)` if it could have *succeeded* on the value it refused
     /// ([`NavKind::would_succeed_on`]), `Some(false)` if it never could. `None`
-    /// for a key with no kind, or before any refusal. A fold's
+    /// for a key with no kind, or before any refusal. A walk ends at its first
+    /// refusal (`step(..)?`) and a fold makes the cell afresh for each alternative,
+    /// so a value read after a refusal is that refusal's. A fold's
     /// [`settle_fold_alternative`] reads it to tell a refusal that is the walk's
     /// guess from one jq raises whatever its register is (#3840, #3998).
     refused_step_could_succeed: Option<&'f core::cell::Cell<Option<bool>>>,

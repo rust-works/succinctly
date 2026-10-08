@@ -644,7 +644,9 @@ $x (.; .[$x:]))` raises `E2`, was the slice error). What it leaves:
   alternative, computed key or not: it is jq's own verdict, not a guess (`del(try (.[0] and (reduce
   . as {("a"):$a} ?// $a (0; .))))` on `[1]` is jq's error, was a silent `[1]`; on `[true]` jq
   answers `[]` and the retried alternative refuses here, as the un-wrapped fold already did,
-  pinned by `test_fold_pattern_step_that_never_succeeds_retries_3998`). Over the nine fold-pattern
+  pinned by `test_fold_pattern_step_that_never_succeeds_retries_3998`; over the three sweep operands
+  that reach the shape, 39,987 rows, 28 ACCEPT_WRONG and 7 DIFF became 0 and 3, no row worse). The
+  figures below are #3840's, before that. Over the nine fold-pattern
   operands of `scripts/jq-path-register-sweep.py` (119,907 rows) wrong answers fell from 126
   ACCEPT_WRONG and 32 DIFF to 14 and 10, at 118 more refusals. **Still left as it was**: a
   computed key whose value is `null`, a boolean or an array has no `NavKind`, so its guessed
