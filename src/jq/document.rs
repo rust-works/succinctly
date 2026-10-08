@@ -842,6 +842,15 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         None
     }
 
+    /// The text before this node's document content when it holds an explicit `---`
+    /// marker on a line of its own -- the comments, blank lines and the marker itself,
+    /// verbatim, ending in a line break -- else `None` (#4086). Only meaningful for a
+    /// document's own content node; yq re-prints it before the first document of a
+    /// file on any write, where the DOM writer used to drop the marker.
+    fn document_preamble(&self) -> Option<&str> {
+        None
+    }
+
     /// The source text of this node when it is a plain (unquoted, single-line) scalar --
     /// `""` for an empty value -- so the DOM writer can print back the spelling a value
     /// resolved from (`~`, `True`, `0x1F`, #3028). `None` for anything else, and for

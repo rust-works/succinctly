@@ -2721,7 +2721,11 @@ fn reconcile_presentation_at_depth(
                 _ => None,
             };
             let tag = pristine_tree.meta().tag().filter(|tag| is_custom_tag(tag));
-            CommentTree::Leaf(NodeMeta::empty_with_anchor(anchor).with_tag(tag.map(str::to_string)))
+            CommentTree::Leaf(
+                NodeMeta::empty_with_anchor(anchor)
+                    .with_tag(tag.map(str::to_string))
+                    .with_preamble(pristine_tree.meta().preamble().map(str::to_string)),
+            )
         }
         // Both scalars, any variant/value: same node, only its value
         // changed - its own comment, style and anchor mark survive. Real
@@ -4300,9 +4304,12 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
         for (value, comments) in docs.iter_mut() {
             if !matches!(value, OwnedValue::Object(_) | OwnedValue::Array(_)) {
                 let head = comments.meta().head_comment().to_vec();
+                // The first document's `---` marker survives too (#4086).
+                let preamble = comments.meta().preamble().map(str::to_string);
                 *comments = CommentTree::Leaf(
                     NodeMeta::from_comment_and_style(comments.own().map(str::to_string), "")
-                        .with_head_foot(head, Vec::new()),
+                        .with_head_foot(head, Vec::new())
+                        .with_preamble(preamble),
                 );
             }
         }
@@ -4754,6 +4761,22 @@ fn output_value<W: Write>(
         // streaming and DOM routes (the streaming route's own `foot` root
         // exclusion just below is scalar-only).
         let body = prepend_head_comment_lines(body, comments.meta().head_comment(), "");
+        // The first document's `---` marker, with the comments and blank lines before it,
+        // verbatim (#4086). `-N` keeps the comments and drops the marker lines.
+        let body = match comments.meta().preamble() {
+            Some(preamble) => {
+                let preamble: String = if config.no_doc {
+                    preamble
+                        .split_inclusive('\n')
+                        .filter(|line| line.trim_end_matches(['\n', '\r', ' ', '\t']) != "---")
+                        .collect()
+                } else {
+                    preamble.to_string()
+                };
+                format!("{preamble}{body}")
+            }
+            None => body,
+        };
         // Every non-root node's own trailing comment is appended by its
         // *parent* during `emit_yaml_value`'s recursion (see its Array/Object
         // arms), but the root has no parent call site to do that for it —

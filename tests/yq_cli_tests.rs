@@ -17937,14 +17937,14 @@ mod dom_standalone_comments_2795 {
     /// Known, recorded residual: real yq's `--header-preprocess` slurps a
     /// leading blank line / `%YAML`/`---` marker verbatim ahead of the first
     /// document (the streaming route's own `write_yq_header`, #2795 PR A).
-    /// The DOM route now reproduces the blank line before the first node
-    /// (#4093); a `%YAML` directive and the `---` marker (#4086) are the
-    /// remaining parts of the header it does not carry as structured lines.
-    /// Pinned here so the header-unification fix has a failing test to flip.
+    /// The DOM route now reproduces both the blank line before the first node
+    /// (#4093) and the `---` marker (#4086); a `%YAML` directive is the one
+    /// part of the header it still does not carry. Kept as a pin so the
+    /// remaining header fix has a test to flip.
     #[test]
     fn header_verbatim_reproduction_is_streaming_only_2795() -> Result<()> {
         assert_eq!(yq_p(".", "# lead\n\na: 1\n", &[])?, "# lead\n\na: 1\n");
-        assert_eq!(yq_p(".", "---\na: 1\n", &[])?, "a: 1\n");
+        assert_eq!(yq_p(".", "---\na: 1\n", &[])?, "---\na: 1\n");
         Ok(())
     }
 
@@ -47124,6 +47124,317 @@ k: 2
             r"# a
 
 6
+/// #4086: a write keeps the first document's `---` marker, with the comments and blank
+/// lines before it, verbatim -- they used to be dropped, so editing any Kubernetes
+/// manifest, Ansible playbook or generated file that opens with `---` changed its first
+/// line. The marker line loses trailing blanks, `-N` drops the marker lines and keeps the
+/// comments, only the first document of a file gets it (the later ones keep the ordinary
+/// separator), and a root that a write replaces keeps it too. Every row captured live from
+/// yq v4.53.3.
+#[test]
+fn test_yq_dom_write_keeps_the_document_start_marker_4086() -> Result<()> {
+    let cases: &[(&str, &str, &[&str], &str)] = &[
+        (
+            r"---
+a: 1
+",
+            r".b = 2",
+            &[],
+            r"---
+a: 1
+b: 2
+",
+        ),
+        (
+            r"---
+# c
+a: 1
+",
+            r".b = 2",
+            &[],
+            r"---
+# c
+a: 1
+b: 2
+",
+        ),
+        (
+            r"---
+a: 1
+---
+b: 2
+",
+            r".c = 2",
+            &[],
+            r"---
+a: 1
+c: 2
+---
+b: 2
+c: 2
+",
+        ),
+        (
+            r"---
+
+
+a: 1
+",
+            r".b = 2",
+            &[],
+            r"---
+
+
+a: 1
+b: 2
+",
+        ),
+        (
+            r"
+
+---
+a: 1
+",
+            r".b = 2",
+            &[],
+            r"
+
+---
+a: 1
+b: 2
+",
+        ),
+        (
+            r"---   
+a: 1
+",
+            r".b = 2",
+            &[],
+            r"---
+a: 1
+b: 2
+",
+        ),
+        (
+            r"---
+# c
+- 1
+",
+            r".[0] = 2",
+            &[],
+            r"---
+# c
+- 2
+",
+        ),
+        (
+            r"---
+a: 1
+...
+---
+c: 3
+",
+            r".b = 2",
+            &[],
+            r"---
+a: 1
+b: 2
+---
+c: 3
+b: 2
+",
+        ),
+        (
+            r"---
+5
+",
+            r".a = 5",
+            &[],
+            r"---
+5
+",
+        ),
+        (
+            r"---
+a: 1
+",
+            r". = 5",
+            &[],
+            r"---
+5
+",
+        ),
+        (
+            r"---
+a: 1
+",
+            r".b = 2",
+            &["-I4"],
+            r"---
+a: 1
+b: 2
+",
+        ),
+        (
+            r"---
+a: 1
+b: 2
+",
+            r"del(.a)",
+            &[],
+            r"---
+b: 2
+",
+        ),
+        (
+            r"---
+a: 1
+",
+            r".",
+            &["-P"],
+            r"---
+a: 1
+",
+        ),
+        (
+            r"---
+a: 1
+---
+b: 2
+",
+            r"..",
+            &[],
+            r"---
+a: 1
+1
+---
+b: 2
+2
+",
+        ),
+        (
+            r"---
+a: 1
+",
+            r".a",
+            &[],
+            r"1
+",
+        ),
+        (
+            r"---
+a: 1
+",
+            r"select(.zz)",
+            &[],
+            r"",
+        ),
+        (
+            r"# only
+a: 1
+",
+            r".a = 2",
+            &[],
+            r"# only
+a: 2
+",
+        ),
+        (
+            r"a: 1
+",
+            r".b = 2",
+            &[],
+            r"a: 1
+b: 2
+",
+        ),
+        (
+            r"---
+- 1
+",
+            r".[0] = 5",
+            &[],
+            r"---
+- 5
+",
+        ),
+        (
+            r"---
+a: 1
+---
+b: 2
+",
+            r".b = 2",
+            &["-N"],
+            r"a: 1
+b: 2
+b: 2
+",
+        ),
+        (
+            r"# h
+---
+a: 1
+",
+            r".b = 2",
+            &["-N"],
+            r"# h
+a: 1
+b: 2
+",
+        ),
+        (
+            r"---
+# c
+a: 1
+",
+            r".b = 2",
+            &["-N"],
+            r"# c
+a: 1
+b: 2
+",
+        ),
+        (
+            r"---
+
+# c
+a: 1
+",
+            r".b = 2",
+            &[],
+            r"---
+
+# c
+a: 1
+b: 2
+",
+        ),
+        (
+            r"---
+a: &x 1
+b: *x
+",
+            r".c = 2",
+            &[],
+            r"---
+a: &x 1
+b: *x
+c: 2
+",
+        ),
+        (
+            r"---
+l:
+  - a
+  - b
+",
+            r#".l[0] = "z""#,
+            &[],
+            r"---
+l:
+  - z
+  - b
 ",
         ),
     ];

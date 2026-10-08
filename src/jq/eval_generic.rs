@@ -2132,6 +2132,9 @@ struct HeadFootComment {
     /// spelling its value prints with (`~`, `True`, `0x1F`, `.5`, or nothing at all for
     /// an empty value), verbatim (#3028). Same box, same reason as `tag`.
     spelling: Option<String>,
+    /// The text before the first document's content, when it holds an explicit `---`
+    /// marker (#4086); only ever set on a document's root node.
+    preamble: Option<String>,
 }
 
 impl HeadFootComment {
@@ -2145,7 +2148,23 @@ impl HeadFootComment {
         tag: Option<String>,
         spelling: Option<String>,
     ) -> Option<Box<Self>> {
-        if head.is_empty() && foot.is_empty() && tag.is_none() && spelling.is_none() {
+        Self::boxed_if_any_full(head, foot, tag, spelling, None)
+    }
+
+    /// [`Self::boxed_if_any_with_tag`] plus the document preamble (#4086).
+    fn boxed_if_any_full(
+        head: Vec<String>,
+        foot: Vec<String>,
+        tag: Option<String>,
+        spelling: Option<String>,
+        preamble: Option<String>,
+    ) -> Option<Box<Self>> {
+        if head.is_empty()
+            && foot.is_empty()
+            && tag.is_none()
+            && spelling.is_none()
+            && preamble.is_none()
+        {
             None
         } else {
             Some(Box::new(Self {
@@ -2153,6 +2172,7 @@ impl HeadFootComment {
                 foot,
                 tag,
                 spelling,
+                preamble,
             }))
         }
     }
@@ -2236,11 +2256,12 @@ impl NodeMeta {
     /// already gets — see the field's own doc comment for why that matters.
     pub fn with_head_foot(&self, head: Vec<String>, foot: Vec<String>) -> Self {
         Self {
-            head_foot_comment: HeadFootComment::boxed_if_any_with_tag(
+            head_foot_comment: HeadFootComment::boxed_if_any_full(
                 head,
                 foot,
                 self.tag_owned(),
                 self.spelling_owned(),
+                self.preamble_owned(),
             ),
             ..self.clone()
         }
@@ -2256,6 +2277,39 @@ impl NodeMeta {
 
     fn tag_owned(&self) -> Option<String> {
         self.tag().map(str::to_string)
+    }
+
+    fn preamble_owned(&self) -> Option<String> {
+        self.preamble().map(str::to_string)
+    }
+
+    /// The text before the first document's content, when it holds an explicit `---`
+    /// marker (#4086): the comments, blank lines and the marker, verbatim. Set only on
+    /// a document's root node.
+    pub fn preamble(&self) -> Option<&str> {
+        self.head_foot_comment
+            .as_deref()
+            .and_then(|hf| hf.preamble.as_deref())
+    }
+
+    /// This node's own metadata with its document preamble replaced, everything else
+    /// kept (#4086).
+    #[must_use]
+    pub fn with_preamble(&self, preamble: Option<String>) -> Self {
+        let (head, foot) = self.head_foot_comment.as_deref().map_or_else(
+            || (Vec::new(), Vec::new()),
+            |hf| (hf.head.clone(), hf.foot.clone()),
+        );
+        Self {
+            head_foot_comment: HeadFootComment::boxed_if_any_full(
+                head,
+                foot,
+                self.tag_owned(),
+                self.spelling_owned(),
+                preamble,
+            ),
+            ..self.clone()
+        }
     }
 
     fn spelling_owned(&self) -> Option<String> {
@@ -2280,11 +2334,12 @@ impl NodeMeta {
             |hf| (hf.head.clone(), hf.foot.clone()),
         );
         Self {
-            head_foot_comment: HeadFootComment::boxed_if_any_with_tag(
+            head_foot_comment: HeadFootComment::boxed_if_any_full(
                 head,
                 foot,
                 self.tag_owned(),
                 spelling,
+                self.preamble_owned(),
             ),
             ..self.clone()
         }
@@ -2299,11 +2354,12 @@ impl NodeMeta {
             |hf| (hf.head.clone(), hf.foot.clone()),
         );
         Self {
-            head_foot_comment: HeadFootComment::boxed_if_any_with_tag(
+            head_foot_comment: HeadFootComment::boxed_if_any_full(
                 head,
                 foot,
                 tag,
                 self.spelling_owned(),
+                self.preamble_owned(),
             ),
             ..self.clone()
         }
@@ -2650,15 +2706,41 @@ pub fn to_owned_with_comments<V: DocumentValue, S: EvalSemantics>(
         to_owned_with_comments_at_depth::<_, S>(value, cursor, 0, false, HeadFootRead::Own)?;
     if let Some(c) = cursor {
         let is_collection = matches!(v, OwnedValue::Object(_) | OwnedValue::Array(_));
-        if !is_collection {
-            let is_document_root = DocumentCursor::is_document_content(c);
-            let is_first_document = DocumentCursor::document_index(c) == Some(0);
-            if !is_document_root || !is_first_document {
-                *comments.meta_mut() = comments.meta().with_head_foot(Vec::new(), Vec::new());
+        let is_document_root = DocumentCursor::is_document_content(c);
+        let is_first_document = DocumentCursor::document_index(c) == Some(0);
+        if !is_collection && (!is_document_root || !is_first_document) {
+            *comments.meta_mut() = comments.meta().with_head_foot(Vec::new(), Vec::new());
+        }
+        // #4086: the first document's `---` marker (and the comments and blank lines
+        // before it) is printed back verbatim before the document on any write, and
+        // stands in for the head comments it already contains.
+        if is_document_root && is_first_document {
+            if let Some(preamble) = DocumentCursor::document_preamble(c) {
+                let meta = comments.meta();
+                let foot = meta.foot_comment().to_vec();
+                *comments.meta_mut() = meta
+                    .with_head_foot(Vec::new(), foot)
+                    .with_preamble(Some(normalized_preamble(preamble)));
             }
         }
     }
     Ok((v, comments))
+}
+
+/// The document preamble as yq prints it (#4086): verbatim, except that the `---` marker
+/// line loses any trailing blanks.
+fn normalized_preamble(preamble: &str) -> String {
+    preamble
+        .split_inclusive('\n')
+        .map(|line| {
+            let bare = line.trim_end_matches(['\n', '\r']);
+            if bare.trim_end_matches([' ', '\t']) == "---" {
+                alloc::borrow::Cow::Owned(format!("---{}", &line[bare.len()..]))
+            } else {
+                alloc::borrow::Cow::Borrowed(line)
+            }
+        })
+        .collect()
 }
 
 /// Whether [`to_owned_with_comments_at_depth`] should read this node's own
@@ -44412,6 +44494,59 @@ mod tests {
             Some("~")
         );
         assert_eq!(meta.with_spelling(None).head_comment(), ["# h".to_string()]);
+    }
+
+    /// #4086: the first document's `---` marker is recorded as a preamble on its root,
+    /// with the comments and blank lines before it, and nowhere else.
+    #[test]
+    fn test_to_owned_with_comments_records_the_document_preamble_4086() {
+        use crate::yaml::YamlIndex;
+
+        let preamble_of = |yaml: &[u8]| {
+            let index = YamlIndex::build(yaml).unwrap();
+            let cursor = index.root(yaml);
+            let doc = cursor.first_child().expect("a document");
+            let value = doc.value();
+            let (_, comments) =
+                to_owned_with_comments::<_, YqSemantics>(&value, Some(&doc)).expect("converts");
+            comments.meta().preamble().map(str::to_string)
+        };
+        assert_eq!(preamble_of(b"---\na: 1\n").as_deref(), Some("---\n"));
+        assert_eq!(
+            preamble_of(b"# a\n\n# b\n---\n\n\na: 1\n").as_deref(),
+            Some("# a\n\n# b\n---\n\n\n")
+        );
+        assert_eq!(
+            preamble_of(b"---   \n- 1\n").as_deref(),
+            Some("---\n"),
+            "trailing blanks go"
+        );
+        assert_eq!(
+            preamble_of(b"---\n# c\na: 1\n").as_deref(),
+            Some("---\n"),
+            "a comment after is the key's"
+        );
+        assert_eq!(preamble_of(b"a: 1\n"), None);
+        assert_eq!(preamble_of(b"# only\na: 1\n"), None);
+        assert_eq!(
+            preamble_of(b"--- 5\n"),
+            None,
+            "content on the marker's line"
+        );
+        assert_eq!(preamble_of(b"%YAML 1.2\n---\na: 1\n"), None, "a directive");
+        // Only the first document's.
+        let yaml = b"a: 1\n---\nb: 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let second = index
+            .root(yaml)
+            .first_child()
+            .unwrap()
+            .next_sibling()
+            .unwrap();
+        let value = second.value();
+        let (_, comments) =
+            to_owned_with_comments::<_, YqSemantics>(&value, Some(&second)).expect("converts");
+        assert_eq!(comments.meta().preamble(), None);
     }
 
     /// #2598: an anchor alone earns a `KeyMeta` entry, and survives a write.
