@@ -5181,15 +5181,13 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
         let mut fields = self.clone();
         let mut result = None;
         while let Some((field, rest)) = fields.uncons() {
-            if let YamlValue::String(key) = field.key() {
-                // Same undecodable-key skip as `JsonFields::find` in
-                // `src/json/light.rs` -- see that function for the full
-                // rationale (#1247). A mapping key that fails to decode is
-                // skipped rather than ending the search, so it can no longer
-                // hide valid later fields from lookup.
-                if key.as_str().is_ok_and(|k| k == name) {
-                    result = Some(field.value());
-                }
+            // Same undecodable-key skip as `JsonFields::find` in
+            // `src/json/light.rs` -- see that function for the full
+            // rationale (#1247). A mapping key that fails to decode is
+            // skipped rather than ending the search, so it can no longer
+            // hide valid later fields from lookup.
+            if field_key_is_named(&field.key(), name) {
+                result = Some(field.value());
             }
             fields = rest;
         }
@@ -5212,12 +5210,10 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
         let mut fields = self.clone();
         let mut result = None;
         while let Some((field, rest)) = fields.uncons() {
-            if let YamlValue::String(key) = field.key() {
-                // Same undecodable-key skip as `find` above (#1247); see
-                // `JsonFields::find` in `src/json/light.rs` for the rationale.
-                if key.as_str().is_ok_and(|k| k == name) {
-                    result = Some(field.value_cursor());
-                }
+            // Same undecodable-key skip as `find` above (#1247); see
+            // `JsonFields::find` in `src/json/light.rs` for the rationale.
+            if field_key_is_named(&field.key(), name) {
+                result = Some(field.value_cursor());
             }
             fields = rest;
         }
@@ -5719,6 +5715,18 @@ impl<W> Clone for YamlField<'_, W> {
 }
 
 impl<W> Copy for YamlField<'_, W> {}
+
+/// Whether a mapping field's key is the one `name` addresses. A decoded string key
+/// matches its text. A non-scalar key (a sequence or mapping) is spelled `""` -- the
+/// string yq collapses it to when it renders JSON -- so `.[""]` reaches its entry
+/// (#2822); a scalar that is not a string never matches.
+fn field_key_is_named<W: AsRef<[u64]>>(key: &YamlValue<'_, W>, name: &str) -> bool {
+    match key {
+        YamlValue::String(key) => key.as_str().is_ok_and(|k| k == name),
+        YamlValue::Mapping(_) | YamlValue::Sequence(_) => name.is_empty(),
+        _ => false,
+    }
+}
 
 impl<'a, W: AsRef<[u64]>> YamlField<'a, W> {
     /// Get the field key.
