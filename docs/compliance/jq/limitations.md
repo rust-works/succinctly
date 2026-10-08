@@ -8421,6 +8421,25 @@ side too, not only a literal one. Controls are unchanged: `.users[] | .name`,
 `. + "x"` (#2086), `. + [$x]` (#2152), `.i += 1` (#3025, 99,999 steps),
 identity and `map` all read 1.0x.
 
+**The right side may compute from the loop variable
+([#3944](https://github.com/rust-works/succinctly/issues/3944)).** A
+comparison, `and`/`or`, arithmetic, `//`, or one of the argument-free builtins
+`floor`, `ceil`, `round`, `sqrt`, `fabs`, `length`, `ascii_downcase` and
+`ascii_upcase` on a spliced `$r` (`.[$r.name] += ($r.score | floor)`,
+`.[$r.name] = ($r.n // 0)`, `.[$r.name] = $r.a + $r.b`) used to leave the closed
+grammar, so the step copied its accumulator every time: 5,000 → 15,000 records
+read 1.3 s → 10 s. Each operand is itself closed, so it has one value; a
+failing operand or stage declines to the evaluator's route and text. `=` binds
+tighter than `//`, so `.[$k] = $v // 0` is `(.[$k] = $v) // 0`: a successful
+write leaves a container, which is truthy, so the `//` never reads its right
+side and the assignment is answered in place. jq mode only.
+
+An *explicit* `==`/`!=` on a container loop variable (`.[$r.name] = ($r ==
+$r)`, `($r.a == $r.b)`) is still not answered: #3896 substitutes such a
+variable as a storage-sharing marker so jq's identity short-circuit holds
+(`[nan] == [nan]`), and a marker is never closed (#3241). The ordering
+comparisons and equality on a scalar loop variable are unaffected.
+
 What it does not change:
 
 - **`foreach`** and **`while`** still hand the state to a second reader

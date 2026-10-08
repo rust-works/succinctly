@@ -10844,7 +10844,7 @@ pub(crate) fn try_eval_owned_step<S: EvalSemantics>(expr: &Expr, state: OwnedVal
 
 /// The assignment half of [`try_eval_owned_step`]: [`owned_assign_step`] over
 /// a consumed state, declining (the untouched state handed back) for anything
-/// that is not one of [`is_owned_assign`]'s four operators.
+/// that is not one of [`is_owned_assign`]'s shapes.
 ///
 /// Split out so a caller that must stay off [`eval_owned_reindex_free`]'s
 /// other arms -- `to_entries`/`from_entries` and the pipes of them, which
@@ -10900,6 +10900,10 @@ pub(crate) fn eval_owned_reindex_free<S: EvalSemantics>(
             let mut result = input.clone();
             owned_assign_step::<S>(expr, &mut result).map(|written| written.map(|()| result))
         }
+        Expr::Alternative(..) if is_owned_assign(expr) => {
+            let mut result = input.clone();
+            owned_assign_step::<S>(expr, &mut result).map(|written| written.map(|()| result))
+        }
         _ => None,
     }
 }
@@ -10940,8 +10944,19 @@ fn owned_step_shape(expr: &Expr) -> bool {
 }
 
 /// Whether `expr` is one of the four value-position assignment operators
-/// [`owned_assign_step`] may answer (#3138).
+/// [`owned_assign_step`] may answer (#3138), or such an assignment under an
+/// outer `//` (#3944).
 fn is_owned_assign(expr: &Expr) -> bool {
+    match expr {
+        // #3944: `=` binds tighter than `//`, so `.[$k] = $v // 0` is
+        // `(.[$k] = $v) // 0` -- an assignment whose result is a container,
+        // never `null`/`false`, so the right side is never read.
+        Expr::Alternative(left, _) => is_plain_owned_assign(unwrap_paren(left)),
+        _ => is_plain_owned_assign(expr),
+    }
+}
+
+fn is_plain_owned_assign(expr: &Expr) -> bool {
     matches!(
         expr,
         Expr::Assign { .. }
@@ -10967,6 +10982,7 @@ fn owned_assign_shape(expr: &Expr) -> bool {
         }
     }
     match expr {
+        Expr::Alternative(left, _) => owned_assign_shape(unwrap_paren(left)),
         Expr::Assign { path, value }
         | Expr::CompoundAssign { path, value, .. }
         | Expr::AlternativeAssign { path, value } => path_shape(path) && closed_expr_shape(value),
@@ -10981,11 +10997,18 @@ fn owned_assign_shape(expr: &Expr) -> bool {
                     other => closed_expr_shape(other),
                 }
         }
-        _ => false, // patchcov: coverage tolerate-line reason="unreachable: owned_assign_shape's only caller (owned_step_shape) gates the call on is_owned_assign(expr), which recognizes exactly Assign/Update/CompoundAssign/AlternativeAssign -- the same four variants this match already has explicit arms for, so `expr` can never be anything else here (#3138)"
+        _ => false, // patchcov: coverage tolerate-line reason="unreachable: owned_assign_shape's only caller (owned_step_shape) gates the call on is_owned_assign(expr), which recognizes exactly Assign/Update/CompoundAssign/AlternativeAssign and an `Alternative` around one -- the same variants this match already has explicit arms for, so `expr` can never be anything else here (#3138, #3944)"
     }
 }
 
 /// [`closed_expr_to_owned`]'s grammar, checked without evaluating anything.
+///
+/// Mode-agnostic, like the rest of the shape gate: under yq the operators of
+/// #3944 pass here and [`closed_expr_to_owned_at_depth`] declines them, as it
+/// already declines every assignment but #3025's. The recursion down an
+/// operator chain is bounded by the parser's expression-nesting limit (256), so
+/// it needs no depth guard of its own; `owned_assign_closed_rhs_chain_3944`
+/// pins a chain at that limit.
 fn closed_expr_shape(expr: &Expr) -> bool {
     match expr {
         Expr::Literal(_) => true,
@@ -11003,6 +11026,12 @@ fn closed_expr_shape(expr: &Expr) -> bool {
                 }
         }),
         Expr::Pipe(stages) => stages.first().is_some_and(closed_expr_shape),
+        // #3944: the operators [`closed_expr_to_owned_at_depth`] answers for jq.
+        Expr::Compare { left, right, .. }
+        | Expr::Arithmetic { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::Alternative(left, right) => closed_expr_shape(left) && closed_expr_shape(right),
         _ => false,
     }
 }
@@ -11047,12 +11076,51 @@ fn closed_expr_to_owned_at_depth<S: EvalSemantics>(
             let (head, rest) = stages.split_first()?;
             let mut value = closed_expr_to_owned_at_depth::<S>(head, depth + 1)?;
             for stage in rest {
-                value = match eval_owned_fast_path::<S>(stage, &value, false)? {
-                    Ok(Some(next)) => next,
-                    Ok(None) | Err(_) => return None,
+                value = match eval_owned_fast_path::<S>(stage, &value, false) {
+                    Some(Ok(Some(next))) => next,
+                    Some(_) => return None,
+                    None => closed_unary_builtin::<S>(stage, &value)?,
                 };
             }
             Some(value)
+        }
+        // #3944: the operators of a right side that reads only the loop
+        // variable -- `$r == $r`, `$r.a + $r.b`, `$r.n // 0`, `$r.a and $r.b`.
+        // Every operand is itself closed, so each has exactly one value and
+        // the product is one value; one that raises, or yields nothing, makes
+        // the whole expression decline, as a failing pipe stage does. jq mode
+        // only: yq's comparison, arithmetic and `//` rules differ, and its
+        // only owned step is #3025's `.field op= <number>`.
+        Expr::Compare { op, left, right } if S::TAG == EvalTag::Jq => {
+            let r = closed_expr_to_owned_at_depth::<S>(right, depth + 1)?;
+            let l = closed_expr_to_owned_at_depth::<S>(left, depth + 1)?;
+            Some(OwnedValue::Bool(apply_compare_op::<S>(*op, &l, &r)))
+        }
+        Expr::Arithmetic { op, left, right } if S::TAG == EvalTag::Jq => {
+            let r = closed_expr_to_owned_at_depth::<S>(right, depth + 1)?;
+            let l = closed_expr_to_owned_at_depth::<S>(left, depth + 1)?;
+            arith_combine::<S>(*op, l, r).ok()
+        }
+        // The right operand is read only when the left does not settle the
+        // answer, as `boolean_fanout_core` does.
+        Expr::And(left, right) | Expr::Or(left, right) if S::TAG == EvalTag::Jq => {
+            let short_circuit = matches!(expr, Expr::Or(..));
+            let l = closed_expr_to_owned_at_depth::<S>(left, depth + 1)?;
+            if l.is_truthy() == short_circuit {
+                return Some(OwnedValue::Bool(short_circuit));
+            }
+            let r = closed_expr_to_owned_at_depth::<S>(right, depth + 1)?;
+            Some(OwnedValue::Bool(r.is_truthy()))
+        }
+        // `l // r` with a closed `l`: its one value if truthy, else `r`. An
+        // `l` that raises declines rather than being swallowed here.
+        Expr::Alternative(left, right) if S::TAG == EvalTag::Jq => {
+            let l = closed_expr_to_owned_at_depth::<S>(left, depth + 1)?;
+            if l.is_truthy() {
+                Some(l)
+            } else {
+                closed_expr_to_owned_at_depth::<S>(right, depth + 1)
+            }
         }
         // `[$x]` is a *bare* element inside `Expr::Array`: the parser only
         // adds `Expr::Comma` when a `,` is present (#2152).
@@ -11089,6 +11157,41 @@ fn closed_expr_to_owned_at_depth<S: EvalSemantics>(
             }
             Some(OwnedValue::Object(out.into_iter().collect()))
         }
+        _ => None,
+    }
+}
+
+/// Whether `stage` is one of the argument-free builtins [`closed_unary_builtin`]
+/// answers: each maps its input to at most one value and has no effect.
+fn is_closed_unary_builtin(stage: &Expr) -> bool {
+    matches!(
+        unwrap_paren(stage),
+        Expr::Builtin(
+            Builtin::Floor
+                | Builtin::Ceil
+                | Builtin::Round
+                | Builtin::Sqrt
+                | Builtin::Fabs
+                | Builtin::Length
+                | Builtin::AsciiDowncase
+                | Builtin::AsciiUpcase
+        )
+    )
+}
+
+/// A pipe stage of a closed expression that [`eval_owned_fast_path`] does not
+/// answer (#3944): `$r.score | floor`. The input is the closed head's value,
+/// never the accumulator, so the evaluator runs on a value the size of one
+/// record field. The stage is a whitelisted builtin with no argument, so it
+/// cannot fan out or run an effect; one that raises or yields nothing is
+/// `None`, and the caller declines to the evaluator's own route and text.
+/// jq mode only, like the operators in [`closed_expr_to_owned_at_depth`].
+fn closed_unary_builtin<S: EvalSemantics>(stage: &Expr, input: &OwnedValue) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq || !is_closed_unary_builtin(stage) {
+        return None;
+    }
+    match eval_owned_expr_full::<S>(unwrap_paren(stage), input, false) {
+        Ok(Some((value, None))) => Some(value),
         _ => None,
     }
 }
@@ -11151,6 +11254,21 @@ fn owned_assign_step<S: EvalSemantics>(
     state: &mut OwnedValue,
 ) -> Option<Result<(), EvalError>> {
     let (path, rhs) = match expr {
+        // #3944: a successful write leaves the state a container (the path
+        // has at least one step), which is truthy, so `(A) // B` is `A`'s
+        // result and `B` is never read. Anything `A` declines is the
+        // evaluator's. jq mode only: yq's `//` and its writes differ. An
+        // error here could only be the allocation failure the write's own doc
+        // names (the target was settled before the write), which `//` would
+        // not swallow either.
+        Expr::Alternative(left, _) => {
+            let left = unwrap_paren(left);
+            return if S::TAG == EvalTag::Jq && is_plain_owned_assign(left) {
+                owned_assign_step::<S>(left, state)
+            } else {
+                None
+            };
+        }
         Expr::Assign { path, value } => (
             path,
             OwnedAssignRhs::Value(closed_expr_to_owned::<S>(value)?),
@@ -11181,7 +11299,7 @@ fn owned_assign_step<S: EvalSemantics>(
             path,
             OwnedAssignRhs::Alternative(closed_expr_to_owned::<S>(value)?),
         ),
-        _ => return None, // patchcov: coverage tolerate-line reason="unreachable: both call sites (try_eval_owned_step, gated on is_owned_assign; eval_owned_reindex_free's own Assign|Update|CompoundAssign|AlternativeAssign arm) only ever hand this function one of the same four variants this match already covers explicitly (#3138)"
+        _ => return None, // patchcov: coverage tolerate-line reason="unreachable: both call sites (try_eval_owned_step, gated on is_owned_assign; eval_owned_reindex_free's own Assign|Update|CompoundAssign|AlternativeAssign arm) only ever hand this function one of the same four variants, or an `Alternative` around one, all of which this match already covers explicitly (#3138, #3944)"
     };
 
     // The keys the write names, each settled against the container it lands
@@ -77013,6 +77131,252 @@ mod tests {
             unreachable!() // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this arm only fires if `state` stopped being an Object, which every write in the loop above preserves (#3138)"
         };
         assert_eq!(fields.len(), 65);
+    }
+
+    /// #3944: a right side built from the loop variable with a comparison, an
+    /// arithmetic operator, `and`/`or`, `//` or a unary builtin is closed too,
+    /// so the assignment writes in place instead of copying its accumulator
+    /// every step. Each row is exactly what the reindex bridge answers, the
+    /// sibling's text is the same allocation after the write, and every shape
+    /// that must stay on the evaluator's route (a raise, a fan-out, a read of
+    /// `.`) comes back untouched.
+    #[test]
+    fn owned_assign_closed_rhs_operators_3944() {
+        let record = OwnedValue::object_from([
+            ("name".to_string(), OwnedValue::string("User7")),
+            (
+                "id".to_string(),
+                OwnedValue::from_number_literal::<JqSemantics>("2"),
+            ),
+            (
+                "score".to_string(),
+                OwnedValue::from_number_literal::<JqSemantics>("70.5"),
+            ),
+            ("tag".to_string(), OwnedValue::Null),
+        ]);
+        let subst = |src: &str| substitute_vars(&parse(src).unwrap(), [("r", &record)]);
+        let object = OwnedValue::object_from([
+            (
+                "User7".to_string(),
+                OwnedValue::from_number_literal::<JqSemantics>("1"),
+            ),
+            ("keep".to_string(), OwnedValue::string("x".repeat(1000))),
+        ]);
+        let handled = [
+            ".[$r.name] = ($r.score >= $r.id)",
+            ".[$r.name] = ($r.id != 2)",
+            ".[$r.name] = ($r.score > 50 and $r.id < 5)",
+            ".[$r.name] = ($r.tag or $r.name)",
+            ".[$r.name] = ($r.tag and error(\"never\"))",
+            ".[$r.name] = ($r.score // 0)",
+            ".[$r.name] = ($r.tag // 0)",
+            ".[$r.name] = ($r.tag // $r.tag // \"d\")",
+            ".[$r.name] = ($r.score + 1)",
+            ".[$r.name] = ($r.score * $r.id - 3)",
+            ".[$r.name] = ($r.name + \"!\")",
+            ".[$r.name] += ($r.score | floor)",
+            ".[$r.name] += ($r.score | ceil)",
+            ".[$r.name] = ($r.score | round)",
+            ".[$r.name] = ($r.score | sqrt)",
+            ".[$r.name] = ($r.score | fabs)",
+            ".[$r.name] = ($r.name | length)",
+            ".[$r.name] = ($r.name | ascii_upcase)",
+            ".[$r.name] = ($r.name | ascii_downcase)",
+            ".[$r.name] |= ($r.score | floor)",
+            ".[$r.name] //= ($r.tag // 5)",
+            // `=` binds tighter than `//`: the assignment, then its `//`.
+            "(.[$r.name] = $r.score) // 0",
+            ".[$r.name] = $r.score // 0",
+            ".[$r.name] += 1 // error(\"unread\")",
+            // The right side is never read, so it may read `.` or raise.
+            "(.[$r.name] = 1) // .keep",
+        ];
+        for src in handled {
+            for input in [object.clone(), OwnedValue::Null] {
+                let expr = subst(src);
+                let bridge = normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                    &expr, &input, false,
+                ));
+                let direct = eval_owned_reindex_free::<JqSemantics>(&expr, &input)
+                    .unwrap_or_else(|| panic!("declined: {src}")); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if eval_owned_reindex_free declined a shape this loop's own `handled` table asserts is always answered (#3944)"
+                let direct = match direct {
+                    Ok(value) => (vec![value], "ok".to_string()),
+                    Err(error) => (Vec::new(), format!("error:{}", error.message)),
+                };
+                assert_eq!(format!("{direct:?}"), format!("{bridge:?}"), "{src}");
+                let OwnedStep::Handled(Ok(consumed)) =
+                    try_eval_owned_step::<JqSemantics>(&expr, input.clone())
+                else {
+                    panic!("not handled: {src}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_eval_owned_step declined or errored on a shape this loop's own `handled` table asserts is always answered Ok (#3944)"
+                };
+                assert_eq!(
+                    format!("{:?}", (vec![consumed], "ok")),
+                    format!("{bridge:?}"),
+                    "{src}"
+                );
+            }
+        }
+
+        // Each stays on the evaluator's route: it raises, yields nothing or
+        // twice, reads `.`, or is a builtin the closed grammar does not take.
+        let declined = [
+            ".[$r.name] = ($r.name | floor)",          // the stage raises
+            ".[$r.name] = ($r.score / 0)",             // the operator raises
+            ".[$r.name] = ($r.name - 1)",              // the operator raises
+            ".[$r.name] = ($r.tag // error(\"x\"))",   // not closed
+            ".[$r.name] = (1, 2) // 0",                // two outputs
+            ".[$r.name] = (.keep // 0)",               // reads `.`
+            ".[$r.name] = (.keep == 1)",               // reads `.`
+            ".[$r.name] = ($r.score | keys)",          // not a whitelisted stage
+            ".[$r.name] = ($r.score | (floor, ceil))", // fans out
+            ".[$r.name] = ($r.nope | floor)",          // null | floor raises
+            ".keep // 0",                              // not an assignment at all
+        ];
+        for src in declined {
+            let expr = subst(src);
+            assert!(
+                eval_owned_reindex_free::<JqSemantics>(&expr, &object).is_none(),
+                "{src}"
+            );
+            let OwnedStep::Declined(returned) =
+                try_eval_owned_step::<JqSemantics>(&expr, object.clone())
+            else {
+                panic!("consuming route must decline {src}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_eval_owned_step handled a shape this loop's own `declined` table asserts is always declined (#3944)"
+            };
+            assert_eq!(format!("{returned:?}"), format!("{object:?}"), "{src}");
+        }
+
+        // A write through an array with a string key raises, which the outer
+        // `//` swallows into its right side: the evaluator's call, not ours.
+        let array = OwnedValue::array_from(vec![OwnedValue::Null]);
+        let expr = subst("(.[$r.name] = 1) // 0");
+        assert!(matches!(
+            try_eval_owned_step::<JqSemantics>(&expr, array),
+            OwnedStep::Declined(_)
+        ));
+
+        // yq mode takes none of it: its `=`, `//` and comparisons differ.
+        for src in [
+            ".[$r.name] = ($r.score > 1)",
+            ".[$r.name] = ($r.tag // 0)",
+            "(.[$r.name] = 1) // 0",
+        ] {
+            assert!(
+                matches!(
+                    try_eval_owned_step::<YqSemantics>(&subst(src), object.clone()),
+                    OwnedStep::Declined(_)
+                ),
+                "yq: {src}"
+            );
+        }
+
+        // Written in place: the unchanged sibling keeps its allocation.
+        let text_ptr = |state: &OwnedValue| match state {
+            OwnedValue::Object(fields) => match fields.get("keep") {
+                Some(OwnedValue::String(text)) => text.as_ptr(),
+                other => panic!("missing sibling: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if the tracked \"keep\" field stopped being a String, which nothing in this test touches (#3944)"
+            },
+            other => panic!("expected object: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if `state` stopped being an Object, which every write below preserves (#3944)"
+        };
+        let before = text_ptr(&object);
+        let mut state = object;
+        for (i, src) in [
+            ".[$k] = ($r.score < 1)",
+            ".[$k] = ($r.tag // 0)",
+            ".[$k] += ($r.score | floor)",
+            "(.[$k] = $r.id) // 0",
+        ]
+        .into_iter()
+        .cycle()
+        .take(64)
+        .enumerate()
+        {
+            let key = OwnedValue::string(alloc::format!("k{i}"));
+            let expr = substitute_vars(&parse(src).unwrap(), [("r", &record), ("k", &key)]);
+            state = match try_eval_owned_step::<JqSemantics>(&expr, state) {
+                OwnedStep::Handled(Ok(next)) => next,
+                _ => panic!("step {i} ({src}) was not handled"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_eval_owned_step declined or errored on a shape this loop drives every iteration (#3944)"
+            };
+        }
+        assert_eq!(text_ptr(&state), before, "the unchanged sibling was copied");
+    }
+
+    /// #3944: `closed_expr_shape` and `closed_expr_to_owned_at_depth` recurse down
+    /// an operator chain with no guard of their own; the parser's nesting limit
+    /// (256) is what bounds them. A chain at that limit still answers, and one
+    /// past it is refused at parse time rather than panicking in the value-tree
+    /// depth assert (384).
+    #[test]
+    #[cfg(feature = "std")]
+    fn owned_assign_closed_rhs_chain_3944() {
+        // The sink evaluator's debug-build frames overflow a test thread's
+        // default stack at this depth, with or without #3944.
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(|| {
+                let chain = |op: &str, n: usize| vec!["$r"; n].join(op);
+                for op in [" + ", " // ", " or ", " and "] {
+                    let filter = alloc::format!(
+                        "reduce .[] as $r ({{}}; .[$r|tostring] = ({}))",
+                        chain(op, 250)
+                    );
+                    assert_eq!(outputs(b"[1,2]", &filter).len(), 1, "{op}");
+                }
+                let too_deep =
+                    alloc::format!("reduce .[] as $r ({{}}; .a = ({}))", chain(" + ", 500));
+                assert!(crate::jq::parse(&too_deep).is_err());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// #3944: the fold loops end to end over the new right-hand sides, every
+    /// expected output captured from jq 1.7.1.
+    #[test]
+    fn owned_assign_closed_rhs_fold_rows_match_jq_3944() {
+        let records =
+            br#"[{"name":"a","score":1.10},{"name":"b","score":2},{"name":"a","score":3.7}]"#;
+        for (filter, expected) in [
+            (
+                r"reduce .[] as $r ({}; .[$r.name] += ($r.score | floor))",
+                r#"{"a":4,"b":2}"#,
+            ),
+            (
+                r"reduce .[] as $r ({}; .[$r.name] = ($r.score > 2))",
+                r#"{"a":true,"b":false}"#,
+            ),
+            (
+                r"reduce .[] as $r ({}; .[$r.name] = ($r.score // 0))",
+                r#"{"a":3.7,"b":2}"#,
+            ),
+            (
+                r"reduce .[] as $r ({}; (.[$r.name] = $r.score) // 0)",
+                r#"{"a":3.7,"b":2}"#,
+            ),
+            (
+                r"reduce .[] as $r ({}; .[$r.name] = $r.score // 0)",
+                r#"{"a":3.7,"b":2}"#,
+            ),
+            (
+                r"reduce .[] as $r ({}; .[$r.name] = ($r.score + 1))",
+                r#"{"a":4.7,"b":3}"#,
+            ),
+            (
+                r#"reduce .[] as $r ({}; .[$r.name] = ($r.score > 2 and $r.name == "a"))"#,
+                r#"{"a":true,"b":false}"#,
+            ),
+            (
+                r"reduce .[] as $r ({}; .[$r.name] = ($r.name | ascii_upcase))",
+                r#"{"a":"A","b":"B"}"#,
+            ),
+            (
+                r#"reduce .[] as $r ({}; .[$r.name] = ($r.nope // "d"))"#,
+                r#"{"a":"d","b":"d"}"#,
+            ),
+        ] {
+            assert_eq!(outputs(records, filter), [expected], "{filter}");
+        }
     }
 
     /// #3241: a fold step takes the owned assignment while the #2889 embed
