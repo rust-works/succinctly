@@ -8440,6 +8440,16 @@ variable as a storage-sharing marker so jq's identity short-circuit holds
 (`[nan] == [nan]`), and a marker is never closed (#3241). The ordering
 comparisons and equality on a scalar loop variable are unaffected.
 
+**An `as` bind around the assignment
+([#3978](https://github.com/rust-works/succinctly/issues/3978)).**
+`$r.name as $n | .[$n] = $r.score` and `$r as $s | .[$s.name] = $s.score`
+copied the accumulator every step (`Expr::As` was not an assignment, so the
+step declined). When the bind's source is closed -- one value, no read of `.`
+-- it is bound once and read by value, so `owned_assign_step` substitutes it
+into the body (as `substitute_fold_step` binds the loop variable) and writes in
+place; nested binds and a shadowing rebind recurse. A source that reads `.`,
+raises, or yields other than once stays on the evaluator's route. jq mode only.
+
 What it does not change:
 
 - **`foreach`** and **`while`** still hand the state to a second reader
