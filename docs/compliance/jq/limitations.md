@@ -2866,11 +2866,19 @@ is the revert that established what the other one costs.
    back by pointer (`abs`, `ltrimstr`, `rtrimstr`, `min`, `max`), the `ascii_downcase`/`ascii_upcase`
    pair (`explode | map(..) | implode` in jq, so a path error on a derived input, #2743) and a
    builtin with a non-literal argument still refuse loudly, where jq writes; characterized by
-   `test_foreach_update_comma_bare_builtin_exclusions_characterize_3960`. The same builtins outside
-   a flat comma sibling (a bare UPDATE, a nested comma, under `first`/`//`/`?`) are not read at all
-   and skip the write silently ([#4028](https://github.com/rust-works/succinctly/issues/4028)), and
-   a boolean register stays refused for the bool-returning ones (`contains(true)`, `isnan`), because
-   jq reads an equal boolean result as the register itself and the model does not carry that.
+   `test_foreach_update_comma_bare_builtin_exclusions_characterize_3960`. The same builtins as a bare
+   UPDATE, in a nested comma, in a pipe of them, or under `first`/`//`/`?`/`try` are read through the
+   shapes that only fork or sequence them ([#4028](https://github.com/rust-works/succinctly/issues/4028),
+   pinned by `test_foreach_update_register_neutral_shapes_leave_the_register_4028`). What still skips
+   the write silently, where jq writes, is a pipe stage after a comma that has a navigating sibling
+   (`(($v|.b?), now) | floor`), a bare `abs`/`min`-class UPDATE (as a comma sibling it refuses
+   loudly, above), and a neutral builtin inside an `if`, an array or a `try ... catch` handler,
+   which are judged by the shared register analysis alone; characterized by
+   `test_foreach_update_register_neutral_shapes_exclusions_characterize_4028`. A boolean register
+   still refuses for a bool-returning builtin next to a navigating comma sibling (`contains(true)`,
+   `isnan`), because jq reads an equal boolean result as the register itself and the model does not
+   carry that there; with no navigating sibling the carried register is compared with the result,
+   so an equal one answers and a different one refuses, as in jq.
    Marking a withheld register lost (#3267) would make it refuse loudly, but also
    turns rows that match jq today into refusals, where jq's own `try` catches a real error
    (`(foreach .a as $w (0; try (($w \| .c \| .z), $w.b); .)) = 9` writes nothing in either).
@@ -2891,11 +2899,12 @@ is the revert that established what the other one costs.
    (`entry_marker_shape`) rather than asking the whole-expression question. An alternate
    that navigates (`// first(.a)`, `// (5 \| .c)`, `// ($k \| .c)` before an EXTRACT `$k`) or
    builds a value read as a path (`// [$k] \| .[0]`, `// 5; .`) still refuses where jq does.
-   Still refused loudly where jq answers, because an output of the *left* operand states no
-   register (`path(foreach .a as $k (0; (1 // first($k)) \| $k; .))` is `["a"]` in jq, as is
-   `(first($k) // 5) \| $k`), and because a comma sibling that navigates without a pipe
-   withholds the register (`(($k \| .b), first($k))` is `["a","b"]`, `["a"]`); pinned by
-   `test_foreach_update_alternate_residual_refusals_3906_characterize`. Pinned by
+   An UPDATE that is a pipe or `//` of operands that cannot move the register, read through
+   `first`/`limit`/`?`/`try` (`(1 // first($k)) \| $k`, `(first($k) // 5) \| $k`), answers as jq does
+   since [#4028](https://github.com/rust-works/succinctly/issues/4028) (pinned by
+   `test_foreach_update_alternate_first_wrapper_keeps_the_register_4028`). Still refused loudly where
+   jq answers: a comma sibling that navigates without a pipe withholds the register
+   (`(($k \| .b), first($k))` is `["a","b"]`, `["a"]`). Pinned by
    `test_foreach_update_under_try_over_a_generator_keeps_the_register_3738`,
    `test_foreach_update_under_try_around_a_generator_keeps_the_register_3770`,
    `test_foreach_update_under_try_with_a_comma_inside_a_pipe_keeps_the_register_3770`,

@@ -72738,14 +72738,374 @@ fn test_foreach_update_comma_bare_builtin_exclusions_characterize_3960() -> Resu
             5,
         ),
         // A boolean register: jq reads a result equal to it as the register itself
-        // (`jv_identical`), so it answers `[["a"],["a"],["a"],["a"]]`; the model does not carry
-        // that, so the bool-returning builtins stay refused.
+        // (`jv_identical`), so it answers `[["a"],["a"]]`; the model does not carry that, so a
+        // bool-returning builtin next to a navigating sibling stays refused. A comma of only such
+        // builtins answers since #4028 (the carried register is compared with the result, so a
+        // result that differs from it still refuses, as in jq).
         (
             r#"{"a":true,"z":false}"#,
-            r"[path(foreach (1,2) as $v (.a; (contains(true), contains(true)); .))]",
+            r"[path(foreach (1,2) as $v (.a; (.a?, contains(true)); .))]",
             "",
             "Invalid path expression with result true",
             5,
+        ),
+    ])
+}
+
+/// #4028: a `foreach` UPDATE that is a bare register-neutral builtin (`now`, `floor`,
+/// `input_line_number`), or a shape that only forks or sequences them (a nested comma, a pipe of
+/// them, `//`, `?`, `try` without a handler, `first`), leaves jq's register where the body
+/// entered it, so the EXTRACT (`try ($v | .b?)`) runs from `.a` and a write through it lands.
+/// The register analysis did not list the builtins, only a flat comma sibling was read as
+/// leaving it (#3960), and the `try` swallowed the refusal into a skipped write with exit 0:
+/// `del(...)` echoed the document and `path(...)` printed nothing. Every row captured from jq
+/// 1.7.1 with `-c`, for `del`, `=` and `path`.
+#[test]
+fn test_foreach_update_register_neutral_shapes_leave_the_register_4028() -> Result<()> {
+    let doc = r#"{"a":{"b":1,"c":[1,2]},"z":0}"#;
+    assert_path_rows_3289(&[
+        (
+            doc,
+            r"del(foreach .a as $v (0; now; try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; now; try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; now; try ($v | .b?)))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; floor; try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; floor; try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; floor; try ($v | .b?)))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; input_line_number; try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; input_line_number; try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; input_line_number; try ($v | .b?)))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; ((now,now),(now,now)); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; ((now,now),(now,now)); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; ((now,now),(now,now)); try ($v | .b?)))]",
+            "[[\"a\",\"b\"],[\"a\",\"b\"],[\"a\",\"b\"],[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; (now, now|tostring); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; (now, now|tostring); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; (now, now|tostring); try ($v | .b?)))]",
+            "[[\"a\",\"b\"],[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; (now, first(floor)); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; (now, first(floor)); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; (now, first(floor)); try ($v | .b?)))]",
+            "[[\"a\",\"b\"],[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; (now, floor // 1); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; (now, floor // 1); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; (now, floor // 1); try ($v | .b?)))]",
+            "[[\"a\",\"b\"],[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; (($v|.b?), (now|floor)); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; (($v|.b?), (now|floor)); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; (($v|.b?), (now|floor)); try ($v | .b?)))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; (now, floor?); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; (now, floor?); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; (now, floor?); try ($v | .b?)))]",
+            "[[\"a\",\"b\"],[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; (now)?; try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; (now)?; try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; (now)?; try ($v | .b?)))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; (sqrt, (floor|floor)); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; (sqrt, (floor|floor)); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; (sqrt, (floor|floor)); try ($v | .b?)))]",
+            "[[\"a\",\"b\"],[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; first(now); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; first(now); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; first(now); try ($v | .b?)))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        // A boolean register: the carried register is compared with the result as jq does
+        // (`jv_identical`), so an equal result answers and a different one refuses.
+        (
+            r#"{"a":true,"z":false}"#,
+            r"[path(foreach (1,2) as $v (.a; (contains(true), contains(true)); .))]",
+            "[[\"a\"],[\"a\"],[\"a\"],[\"a\"]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false,"z":true}"#,
+            r"[path(foreach (1,2) as $v (.a; contains(false); .))]",
+            "",
+            "Invalid path expression with result true",
+            5,
+        ),
+        // A body that always raises undoes what it navigated, so it leaves the register (#3965):
+        // reading UPDATE through `try` must not forget that.
+        (
+            doc,
+            r"del(foreach .a as $v (0; (1, try error(.a)); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; (1, (try error(.a))?); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+    ])
+}
+
+/// #4028, what the fix leaves. A pipe stage after a comma that has a navigating sibling
+/// (`(($v|.b?), now) | floor`) and a bare builtin that can hand its input back by pointer (`abs`)
+/// still skip the write silently, where jq writes (the `// jq:` line on each row). Update the
+/// expectations when those are fixed.
+#[test]
+fn test_foreach_update_register_neutral_shapes_exclusions_characterize_4028() -> Result<()> {
+    let doc = r#"{"a":{"b":1,"c":[1,2]},"z":0}"#;
+    assert_path_rows_3289(&[
+        // jq: {"a":{"c":[1,2]},"z":0}
+        (
+            doc,
+            r"del(foreach .a as $v (0; (($v|.b?), now) | floor; try ($v | .b?)))",
+            "{\"a\":{\"b\":1,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        // jq: {"a":{"b":9,"c":[1,2]},"z":0}
+        (
+            doc,
+            r"(foreach .a as $v (0; (($v|.b?), now) | floor; try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":1,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        // jq: [["a","b"]]
+        (
+            doc,
+            r"[path(foreach .a as $v (0; (($v|.b?), now) | floor; try ($v | .b?)))]",
+            "[]\n",
+            "",
+            0,
+        ),
+        // jq: {"a":{"c":[1,2]},"z":0}
+        (
+            doc,
+            r"del(foreach .a as $v (0; abs; try ($v | .b?)))",
+            "{\"a\":{\"b\":1,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        // jq: {"a":{"b":9,"c":[1,2]},"z":0}
+        (
+            doc,
+            r"(foreach .a as $v (0; abs; try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":1,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        // jq: [["a","b"]]
+        (
+            doc,
+            r"[path(foreach .a as $v (0; abs; try ($v | .b?)))]",
+            "[]\n",
+            "",
+            0,
         ),
     ])
 }
@@ -73446,32 +73806,30 @@ fn test_foreach_update_alternate_shapes_keep_the_register_3906() -> Result<()> {
     ])
 }
 
-/// #3906, what the alternate fix leaves refusing loudly where jq 1.7.1 answers (the safe
-/// direction, and the same on `main` before it). jq's answers are in the comments; update the
-/// expectations when these are fixed. An output of the *left* operand states no register
-/// (`1 // first($k)` answers the `1`), so a stage after it cannot say the register is where it
-/// entered. (`(($k | .b), first($k))`, the comma-body row that used to be here, answers since
-/// #3932: see `test_foreach_update_try_comma_with_a_navigating_sibling_keeps_the_register_3932`.)
+/// #3906 left these refusing loudly where jq 1.7.1 answers: an output of the *left* operand of a
+/// `//` states no register (`1 // first($k)` answers the `1`), so a stage after it could not say
+/// the register is where it entered. #4028 reads a fold's UPDATE through `//`, a pipe and the
+/// wrappers that add no movement (`first`, `limit`, `?`, `try`) when every leaf cannot move the
+/// register, so both now answer `["a"]`, as in jq.
+/// (`(($k | .b), first($k))`, a comma with a navigating sibling, answers since #3932: see
+/// `test_foreach_update_try_comma_with_a_navigating_sibling_keeps_the_register_3932`.)
 #[test]
-fn test_foreach_update_alternate_residual_refusals_3906_characterize() -> Result<()> {
+fn test_foreach_update_alternate_first_wrapper_keeps_the_register_4028() -> Result<()> {
     let doc = r#"{"a":{"c":1}}"#;
-    let refusal = "Invalid path expression";
     assert_path_rows_3289(&[
-        // jq: ["a"]
         (
             doc,
             r"path(foreach .a as $k (0; (1 // first($k)) | $k; .))",
+            "[\"a\"]\n",
             "",
-            refusal,
-            5,
+            0,
         ),
-        // jq: ["a"]
         (
             doc,
             r"path(foreach .a as $k (0; (first($k) // 5) | $k; .))",
+            "[\"a\"]\n",
             "",
-            refusal,
-            5,
+            0,
         ),
     ])
 }
