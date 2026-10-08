@@ -4581,8 +4581,23 @@ position and then by length, as `sort_by(.a, .b)` is in yq. jq mode is untouched
 - **Spellings `OwnedValue` cannot keep** ([#2802](https://github.com/rust-works/succinctly/issues/2802)):
   a leading-zero, hex or underscored integer sorts by its resolved value here.
 
-Cost: see the measurements in the PR for #2799 part 3; the single-kind fast path keeps the common
-case on `slice::sort_by`.
+Cost. Interleaved A/B against `main`, release builds, minimum of 9 runs, 1M-element arrays on
+5-10 MB documents (outputs identical; `sort_by` on 250k records):
+
+| filter                                | M4 Pro (Mac mini) | Ryzen 9 7950X (Zen 4) |
+|---------------------------------------|-------------------|-----------------------|
+| `sort`, ints, 50k distinct            | 1.04x             | 1.01x                 |
+| `sort`, ints, ~1M distinct            | 1.03x             | 1.01x                 |
+| `sort`, strings                       | 1.08x             | 0.98x                 |
+| `sort`, ints and floats               | 1.05x             | 1.00x                 |
+| `sort`, ints and strings (mixed)      | 2.19x             | 1.89x                 |
+| `sort_by(.k)`                         | 1.02x             | 0.99x                 |
+
+A single-kind array (and integers with floats, while every integer is exactly an `f64`) is a
+total preorder, so it keeps `slice::sort_by`. Only an array that mixes kinds in the
+non-transitive way (integers or floats with strings, bools or containers) takes the port of Go's
+stable sort, which is the price of yq's order: `symMerge` does O(n log^2 n) swaps where Rust's
+merge sort does O(n log n).
 
 Pinned by `sort_follows_yqs_comparator_and_go_stable_sort_2799` (`tests/yq_cli_tests.rs`), the
 `sort_mixed_2799`/`sort_by_mixed_2799` goldens and the `go_sort` unit tests.
