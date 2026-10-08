@@ -15036,7 +15036,8 @@ fn each_limit_with_n_generic<S: EvalSemantics, V: DocumentValue>(
 /// A *second* (or later) kept item at this same index -- reachable only
 /// through a `?//` retry (#1519), since the sink answers `Demand::Stop` on
 /// the first one and a generator with no such retry is never asked again --
-/// is force-decoded the same way before it reaches `sink`, mirroring
+/// has its decode forced the same way before it reaches `sink` (the cursor is
+/// kept, #3621), mirroring
 /// [`items_to_generic_result`]'s own multi-item rule (`take_at_index_generic`
 /// is the streaming twin of [`nth_with_n_generic`]/`each_take_first_generic`,
 /// both of which route a multi-item `wanted` batch through that function via
@@ -15055,9 +15056,9 @@ fn each_limit_with_n_generic<S: EvalSemantics, V: DocumentValue>(
 /// exists to pin for the eager, `Vec`-collecting siblings this lazy skeleton
 /// was missing it relative to.
 ///
-/// The forced item keeps its cursor ([`generic_item_forced_keeping_cursor`],
-/// #3621): the decode is checked, not substituted for the node, so `first(G) |
-/// key` names the retried element as `limit(1; G) | key` does.
+/// The decode is checked, not substituted for the node
+/// ([`generic_item_forced_keeping_cursor`]), so `first(G) | key` names the
+/// retried element as `limit(1; G) | key` does.
 fn take_at_index_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     value: V,

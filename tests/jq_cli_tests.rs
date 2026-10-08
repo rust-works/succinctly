@@ -104733,6 +104733,21 @@ fn test_retried_bounded_output_keeps_its_identity_on_both_routes_3621() -> Resul
             "`{collected}`: stderr {stderr:?}"
         );
     }
+    // The retried element's decode is still checked before it is handed on: a
+    // lone surrogate in it raises, after the first alternative's `1` was kept.
+    let bad = r#"{"a":"\ud800","p":1}"#;
+    for filter in [
+        r#"first([.p] as [$y] ?// $y | if ($y|type)=="number" then .p else .a end)"#,
+        r#"nth(0; [.p] as [$y] ?// $y | if ($y|type)=="number" then .p else .a end)"#,
+    ] {
+        let collected = format!("[{filter} | key]");
+        let (stdout, stderr, code) = run_jq_full(&["-c", &collected], Some(bad))?;
+        assert_ne!(code, 0, "`{collected}`: stdout {stdout:?}");
+        assert!(
+            stderr.contains("invalid unicode escape"),
+            "`{collected}`: stderr {stderr:?}"
+        );
+    }
     // jq's path mode: one output for `first` and `nth`, as it was.
     for filter in [
         format!(".a | path(first({body}))"),
