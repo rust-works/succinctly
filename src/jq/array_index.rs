@@ -61,6 +61,14 @@ pub(crate) const WIDE_ELEMENTS: usize = 64;
 /// bytes per element.
 pub(crate) const MAX_INDEXED_ELEMENTS: usize = 1 << 21;
 
+/// What an element read found in an index.
+pub(crate) enum Element<C> {
+    /// The element's cursor.
+    Found(C),
+    /// An index past the end.
+    Past,
+}
+
 /// The node id of every element of one array, in document order.
 pub(crate) struct ElementIndex {
     ids: Vec<usize>,
@@ -103,12 +111,12 @@ impl ElementIndex {
         self.ids.len()
     }
 
-    /// The cursor of element `index`, or `Some(None)` past the end; `None`
-    /// when the id does not resolve (the caller then walks).
-    fn get<C: DocumentCursor>(&self, head: &C, index: usize) -> Option<Option<C>> {
+    /// The cursor of element `index`, or [`Element::Past`] past the end;
+    /// `None` when the id does not resolve (the caller then walks).
+    fn get<C: DocumentCursor>(&self, head: &C, index: usize) -> Option<Element<C>> {
         match self.ids.get(index) {
-            Some(id) => head.at_node_id(*id).map(Some),
-            None => Some(None),
+            Some(id) => head.at_node_id(*id).map(Element::Found),
+            None => Some(Element::Past),
         }
     }
 }
@@ -134,10 +142,11 @@ pub(crate) fn get_cursor_memoized<E: DocumentElements>(
     elements: &E,
     index: usize,
 ) -> Option<E::Cursor> {
-    if let Some(found) = memo::get(elements, index) {
-        return found;
+    match memo::get(elements, index) {
+        Some(Element::Found(cursor)) => Some(cursor),
+        Some(Element::Past) => None,
+        None => elements.get_cursor(index),
     }
-    elements.get_cursor(index)
 }
 
 #[cfg(feature = "std")]
@@ -255,13 +264,13 @@ pub(crate) mod memo {
         answer(elements, true, |index, _head| Some(index.len()))
     }
 
-    /// Element `index` of the list `elements`: `Some(found)` when an existing
-    /// index can say, `None` to walk. Never builds.
+    /// Element `index` of the list `elements`, when an existing index can say,
+    /// else `None` to walk. Never builds.
     #[inline]
     pub(crate) fn get<E: DocumentElements>(
         elements: &E,
         index: usize,
-    ) -> Option<Option<E::Cursor>> {
+    ) -> Option<super::Element<E::Cursor>> {
         if !ARMED.with(Cell::get) {
             return None;
         }
@@ -386,7 +395,7 @@ pub(crate) mod memo {
     pub(crate) fn get<E: DocumentElements>(
         _elements: &E,
         _index: usize,
-    ) -> Option<Option<E::Cursor>> {
+    ) -> Option<super::Element<E::Cursor>> {
         None
     }
 
@@ -427,7 +436,10 @@ mod tests {
             assert_eq!(Ok(index.len()), elements.len_checked());
             for k in 0..135 {
                 assert_eq!(
-                    index.get(&head, k).map(shown),
+                    index.get(&head, k).map(|e| match e {
+                        Element::Found(c) => Some(c.node_id()),
+                        Element::Past => None,
+                    }),
                     Some(shown(elements.get_cursor(k))),
                     "element {k}"
                 );
