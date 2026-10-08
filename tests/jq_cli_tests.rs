@@ -56089,6 +56089,48 @@ fn bounded_walk_keeps_the_try_catch_handler_answers_4014() -> Result<()> {
     Ok(())
 }
 
+/// #4035: reading a wide document array repeatedly is answered from a per-array
+/// element index once the array has proved wide (`src/jq/array_index.rs`), where
+/// every read used to walk the whole array again. The index may never change an
+/// answer, so a program that reads the same 200-element array many times --
+/// enough for the second length lookup to build the index and every later read
+/// to use it -- must give jq 1.7.1's answers at every index, in range, past the
+/// end and negative, through `.[N]`, `.[$k]`, `length`, `last`, `has` and `keys`.
+/// A wide array that is malformed still raises on its first read, and on every
+/// read after it.
+#[test]
+fn wide_document_array_reads_agree_with_jq_across_repeated_reads_4035() -> Result<()> {
+    let body: Vec<String> = (0..200).map(|i| i.to_string()).collect();
+    let clean = format!(r#"{{"a":[{}]}}"#, body.join(","));
+    for (filter, want) in [
+        (
+            "[.a[0], .a[-1], .a[199], .a[200], .a[-200], .a[-201], .a[5], (.a|length), .a[5], (.a|last), (.a|has(199)), (.a|has(200)), (.a|keys|length), .a[5]]",
+            "[0,199,199,null,0,null,5,200,5,199,true,false,200,5]",
+        ),
+        (
+            ". as $r | [range(0;4)] | map($r.a[. * 60])",
+            "[0,60,120,180]",
+        ),
+        (
+            "[.a[range(0;6)] , (.a|length), .a[6]]",
+            "[0,1,2,3,4,5,200,6]",
+        ),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(&clean))?;
+        assert_eq!((out.trim(), err.as_str(), code), (want, "", 0), "{filter}");
+    }
+    let trailing = format!(r#"{{"a":[{},]}}"#, body.join(","));
+    for filter in [
+        "[.a[0], .a[1], .a[2]]",
+        ". as $r | [range(0;4)] | map($r.a[.])",
+        "[(.a|length), (.a|length), (.a|length)]",
+    ] {
+        let (out, _err, code) = run_jq_full(&["-c", filter], Some(&trailing))?;
+        assert_eq!((out.as_str(), code), ("", 5), "{filter}");
+    }
+    Ok(())
+}
+
 /// #3651: a `?//` chain in a fold **source** that destructures a freshly built value
 /// runs jq's *next* alternative, not the first, in path position.
 ///

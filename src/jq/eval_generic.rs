@@ -7714,6 +7714,7 @@ mod slot_memo {
     pub(crate) struct Guard {
         restore: Restore,
         _keys: crate::jq::key_index::memo::Guard,
+        _elements: crate::jq::array_index::memo::Guard,
     }
 
     impl Drop for Guard {
@@ -7730,12 +7731,14 @@ mod slot_memo {
     /// already open for it, a nested scope (restored on drop) otherwise.
     pub(crate) fn enter(document: usize) -> Guard {
         let keys = crate::jq::key_index::memo::enter(document);
+        let elements = crate::jq::array_index::memo::enter(document);
         MEMO.with(|m| {
             let mut m = m.borrow_mut();
             if m.as_ref().is_some_and(|s| s.document == document) {
                 return Guard {
                     restore: Restore::Nothing,
                     _keys: keys,
+                    _elements: elements,
                 };
             }
             Guard {
@@ -7745,6 +7748,7 @@ mod slot_memo {
                     root: None,
                 })),
                 _keys: keys,
+                _elements: elements,
             }
         })
     }
@@ -11092,7 +11096,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 // yq's own out-of-range error), so the trailing/leading gap
                 // checks ride along for free on every call, not just the
                 // negative-index ones.
-                let len = match elements.len_checked() {
+                let len = match crate::jq::array_index::len_checked_memoized(&elements) {
                     Ok(len) => len,
                     Err(err) => return GenericResult::Error(err),
                 };
@@ -11110,7 +11114,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 if let Some(e) = yq_negative_index_check::<S>(*idx, resolved, len) {
                     return GenericResult::Error(e);
                 }
-                match elements.get_cursor(resolved as usize) {
+                match crate::jq::array_index::get_cursor_memoized(&elements, resolved as usize) {
                     Some(c) => GenericResult::OneCursor(c),
                     // jq returns null for out-of-bounds array indices (positive
                     // or negative), not an error. `.[n]` and `.[n]?` both yield
@@ -19410,7 +19414,7 @@ fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
                 // out-of-range error below) already happens unconditionally
                 // on every call, same reasoning as the literal-index
                 // sibling arm in `eval_single`'s own `Expr::Index`.
-                let len = match elements.len_checked() {
+                let len = match crate::jq::array_index::len_checked_memoized(&elements) {
                     Ok(len) => len,
                     Err(err) => return GenericResult::Error(err),
                 };
@@ -19435,7 +19439,7 @@ fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
                 }
                 match resolved
                     .and_then(|r| usize::try_from(r).ok())
-                    .and_then(|i| elements.get_cursor(i))
+                    .and_then(|i| crate::jq::array_index::get_cursor_memoized(&elements, i))
                 {
                     Some(c) => GenericResult::OneCursor(c),
                     // Out-of-bounds is null, not an error (#307).
@@ -21136,7 +21140,7 @@ fn eval_has_one_key<S: EvalSemantics, V: DocumentValue>(
             if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
                 return GenericResult::Error(err);
             }
-            let len = match elements.len_checked() {
+            let len = match crate::jq::array_index::len_checked_memoized(&elements) {
                 Ok(len) => len,
                 Err(err) => return GenericResult::Error(err),
             };
@@ -23865,7 +23869,7 @@ fn getpath_walk_cursor<S: EvalSemantics, V: DocumentValue>(
             }
             OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
                 if let Some(elements) = v.as_array() {
-                    let len = match elements.len_checked() {
+                    let len = match crate::jq::array_index::len_checked_memoized(&elements) {
                         Ok(len) => len,
                         Err(e) if suppresses(&e, optional) => return GenericResult::None,
                         Err(e) => return GenericResult::Error(e),
@@ -23876,7 +23880,7 @@ fn getpath_walk_cursor<S: EvalSemantics, V: DocumentValue>(
                     // anything landing outside either end -- NaN included
                     // -- reads as `null`.
                     return match crate::jq::eval::resolve_read_index(segment, len)
-                        .and_then(|idx| elements.get_cursor(idx))
+                        .and_then(|idx| crate::jq::array_index::get_cursor_memoized(&elements, idx))
                     {
                         Some(element) => {
                             c = element;
@@ -28438,7 +28442,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
                     return GenericResult::Error(err);
                 }
-                match elements.len_checked() {
+                match crate::jq::array_index::len_checked_memoized(&elements) {
                     Ok(len) => GenericResult::Owned(OwnedValue::Int(len as i64)),
                     Err(err) => GenericResult::Error(err),
                 }
@@ -28525,7 +28529,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
                     return GenericResult::Error(err);
                 }
-                match elements.len_checked() {
+                match crate::jq::array_index::len_checked_memoized(&elements) {
                     Ok(len) => GenericResult::LazyIndexRange(len),
                     Err(err) => GenericResult::Error(err),
                 }
@@ -28562,7 +28566,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
                     return GenericResult::Error(err);
                 }
-                match elements.len_checked() {
+                match crate::jq::array_index::len_checked_memoized(&elements) {
                     Ok(len) => GenericResult::LazyIndexRange(len),
                     Err(err) => GenericResult::Error(err),
                 }
@@ -28956,11 +28960,14 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 // `last` already has to walk the whole array to find its
                 // own length, so the #1677/#2261 gap checks ride along for
                 // free on that same mandatory walk.
-                let len = match elements.len_checked() {
+                let len = match crate::jq::array_index::len_checked_memoized(&elements) {
                     Ok(len) => len,
                     Err(err) => return GenericResult::Error(err),
                 };
-                match len.checked_sub(1).and_then(|i| elements.get_cursor(i)) {
+                match len
+                    .checked_sub(1)
+                    .and_then(|i| crate::jq::array_index::get_cursor_memoized(&elements, i))
+                {
                     Some(c) => GenericResult::OneCursor(c),
                     None => GenericResult::Owned(OwnedValue::Null),
                 }
