@@ -68,100 +68,107 @@ fn insertion_sort<T>(
     }
 }
 
-/// `sort.symMerge`: merge the sorted runs `data[a..m]` and `data[m..b]` in place.
+/// `sort.symMerge`: merge the sorted runs `data[lo..split]` and `data[split..hi]` in place.
+///
+/// Go's names are `a`, `m`, `b` (and `i`, `j`, `h`, `n`, `r`, `p`, `c`); they are spelled out
+/// here only to satisfy `clippy::many_single_char_names`, the steps are Go's one for one.
 fn sym_merge<T>(
     data: &mut [T],
-    a: usize,
-    m: usize,
-    b: usize,
+    lo: usize,
+    split: usize,
+    hi: usize,
     less: &mut impl FnMut(&[T], usize, usize) -> bool,
 ) {
     // A one-element left run: binary search for its position and rotate it there.
-    if m - a == 1 {
-        let (mut i, mut j) = (m, b);
-        while i < j {
-            let h = (i + j) >> 1;
-            if less(data, h, a) {
-                i = h + 1;
+    if split - lo == 1 {
+        let (mut from, mut to) = (split, hi);
+        while from < to {
+            let half = (from + to) >> 1;
+            if less(data, half, lo) {
+                from = half + 1;
             } else {
-                j = h;
+                to = half;
             }
         }
-        // Swap values until data[a] reaches the position before i.
-        let mut k = a;
-        while k + 1 < i {
+        // Swap values until data[lo] reaches the position before `from`.
+        let mut k = lo;
+        while k + 1 < from {
             data.swap(k, k + 1);
             k += 1;
         }
         return;
     }
     // A one-element right run.
-    if b - m == 1 {
-        let (mut i, mut j) = (a, m);
-        while i < j {
-            let h = (i + j) >> 1;
-            if !less(data, m, h) {
-                i = h + 1;
+    if hi - split == 1 {
+        let (mut from, mut to) = (lo, split);
+        while from < to {
+            let half = (from + to) >> 1;
+            if !less(data, split, half) {
+                from = half + 1;
             } else {
-                j = h;
+                to = half;
             }
         }
-        // Swap values until data[m] reaches the position i.
-        let mut k = m;
-        while k > i {
+        // Swap values until data[split] reaches the position `from`.
+        let mut k = split;
+        while k > from {
             data.swap(k, k - 1);
             k -= 1;
         }
         return;
     }
 
-    let mid = (a + b) >> 1;
-    let n = mid + m;
-    let (mut start, mut r) = if m > mid { (n - b, mid) } else { (a, m) };
-    let p = n - 1;
+    let mid = (lo + hi) >> 1;
+    let total = mid + split;
+    let (mut start, mut bound) = if split > mid {
+        (total - hi, mid)
+    } else {
+        (lo, split)
+    };
+    let last = total - 1;
 
-    while start < r {
-        let c = (start + r) >> 1;
-        if !less(data, p - c, c) {
-            start = c + 1;
+    while start < bound {
+        let probe = (start + bound) >> 1;
+        if !less(data, last - probe, probe) {
+            start = probe + 1;
         } else {
-            r = c;
+            bound = probe;
         }
     }
 
-    let end = n - start;
-    if start < m && m < end {
-        rotate(data, start, m, end);
+    let end = total - start;
+    if start < split && split < end {
+        rotate(data, start, split, end);
     }
-    if a < start && start < mid {
-        sym_merge(data, a, start, mid, less);
+    if lo < start && start < mid {
+        sym_merge(data, lo, start, mid, less);
     }
-    if mid < end && end < b {
-        sym_merge(data, mid, end, b, less);
+    if mid < end && end < hi {
+        sym_merge(data, mid, end, hi, less);
     }
 }
 
-/// `sort.rotate`: rotate `data[a..b]` so that `data[m..b]` comes first, by block swaps.
-fn rotate<T>(data: &mut [T], a: usize, m: usize, b: usize) {
-    let mut i = m - a;
-    let mut j = b - m;
-    while i != j {
-        if i > j {
-            swap_range(data, m - i, m, j);
-            i -= j;
+/// `sort.rotate`: rotate `data[lo..hi]` so that `data[split..hi]` comes first, by block swaps.
+fn rotate<T>(data: &mut [T], lo: usize, split: usize, hi: usize) {
+    let mut left = split - lo;
+    let mut right = hi - split;
+    while left != right {
+        if left > right {
+            swap_range(data, split - left, split, right);
+            left -= right;
         } else {
-            swap_range(data, m - i, m + j - i, i);
-            j -= i;
+            swap_range(data, split - left, split + right - left, left);
+            right -= left;
         }
     }
-    // i == j
-    swap_range(data, m - i, m, i);
+    // left == right
+    swap_range(data, split - left, split, left);
 }
 
 /// `sort.swapRange`.
-fn swap_range<T>(data: &mut [T], a: usize, b: usize, n: usize) {
-    for i in 0..n {
-        data.swap(a + i, b + i);
+fn swap_range<T>(data: &mut [T], first: usize, second: usize, count: usize) {
+    for offset in 0..count {
+        data.swap(first + offset, second + offset);
     }
 }
 
