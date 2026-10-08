@@ -70780,39 +70780,82 @@ fn test_foreach_extract_after_a_comma_update_ending_in_a_literal_3933() -> Resul
     ])
 }
 
-/// #3941, characterization of what its fix leaves. A comma sibling that is a pipe of
-/// non-navigating stages (#3959) is opaque to the register read, so the write is silently
-/// skipped; one that is a register-neutral builtin the allowlist lacks (#3960) refuses loudly.
-/// jq 1.7.1 writes in every row, `{"a":{"c":[1,2]},"z":0}` for `del`. Update the expectations
-/// when those are fixed. A bare sibling (`length`, `1+1`, `$v | length`) is fixed and not here.
+/// #3959: a comma sibling that is a pipe of non-navigating stages (`(.|length)`, `(2|.+1)`,
+/// `(. | tostring)`) leaves the register where the pipe entered, as a bare `length` does, so
+/// the fold reads its statement beside the navigating pipe's. It used to be judged by the
+/// untracked `.` inside it, which read as a producer and kept the whole comma opaque: the
+/// literal's EXTRACT ran register-less, the `try` swallowed the refusal and the write was
+/// silently skipped. An EXTRACT with no `try` still raises on the pipe sibling's output, as in
+/// jq. Every row captured from jq 1.7.1 with `-c`.
 #[test]
-fn test_foreach_update_comma_sibling_residuals_characterize_3959_3960() -> Result<()> {
+fn test_foreach_update_comma_with_a_non_navigating_pipe_sibling_keeps_the_register_3959(
+) -> Result<()> {
     let doc = r#"{"a":{"b":1,"c":[1,2]},"z":0}"#;
-    let unchanged = "{\"a\":{\"b\":1,\"c\":[1,2]},\"z\":0}\n";
-    let refusal = "Invalid path expression near attempt to access element \"b\"";
+    let deleted = "{\"a\":{\"c\":[1,2]},\"z\":0}\n";
     assert_path_rows_3289(&[
-        // #3959, silent: jq `{"a":{"c":[1,2]},"z":0}`.
         (
             doc,
             r"del(foreach .a as $v (.; (($v | .b?), (.|length)); try ($v | .b?)))",
-            unchanged,
+            deleted,
             "",
             0,
         ),
         (
             doc,
             r"del(foreach .a as $v (.; (($v | .b?), (2|.+1)); try ($v | .b?)))",
-            unchanged,
+            deleted,
             "",
             0,
         ),
         (
             doc,
             r"del(foreach .a as $v (.; (($v | .b?), (. | tostring)); try ($v | .b?)))",
-            unchanged,
+            deleted,
             "",
             0,
         ),
+        (
+            doc,
+            r"(foreach .a as $v (.; (($v | .b?), (2|.+1)); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (.; (($v | .b?), (.|length)); try ($v | .b?))) |= 7",
+            "{\"a\":{\"b\":7,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .a as $v (.; (($v | .b?), (. | tostring)); try ($v | .b?)))",
+            "[\"a\",\"b\"]\n",
+            "",
+            0,
+        ),
+        // No `try` on the EXTRACT: it raises on the pipe sibling's output, as in jq.
+        (
+            doc,
+            r"del(foreach .a as $v (.; (($v | .b?), (.|length)); ($v | .b?)))",
+            "",
+            "Invalid path expression near attempt to access element \"b\"",
+            5,
+        ),
+    ])
+}
+
+/// #3941, characterization of what its fix leaves. A comma sibling that is a register-neutral
+/// builtin the allowlist lacks (#3960) refuses loudly. jq 1.7.1 writes in every row,
+/// `{"a":{"c":[1,2]},"z":0}` for `del`. Update the expectations when that is fixed. A bare
+/// sibling (`length`, `1+1`, `$v | length`) and a pipe of non-navigating stages (#3959) are
+/// fixed and not here.
+#[test]
+fn test_foreach_update_comma_sibling_residuals_characterize_3960() -> Result<()> {
+    let doc = r#"{"a":{"b":1,"c":[1,2]},"z":0}"#;
+    let refusal = "Invalid path expression near attempt to access element \"b\"";
+    assert_path_rows_3289(&[
         // #3960, loud: jq `{"a":{"c":[1,2]},"z":0}`.
         (
             doc,
