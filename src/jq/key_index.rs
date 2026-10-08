@@ -30,10 +30,20 @@
 //!   decoded key equals the name, in both evaluation modes (the walk does not
 //!   look at the mode).
 //!
+//! # `has` (#4002)
+//!
+//! `has($k)` is answered from the same index, with one more condition: its
+//! walk (`contains_checked`) also raises, depending on where the match sits, for
+//! a key that will not decode and for a missing or doubled `,`/`:` on any member
+//! it visits, which the build above deliberately tolerates. So [`KeyIndex::contains`]
+//! answers only an object that [`KeyIndex::walk_is_clean`] (one extra key-only
+//! pass, run on the first `has`); any other object keeps the walk. A consumer
+//! added later must keep that condition.
+//!
 //! # When one is built
 //!
-//! Not on first sight. `find_cursor_counted` reports how many members a walk
-//! visited; only a walk of [`WIDE_MEMBERS`] or more registers the object, and
+//! Not on first sight. `find_cursor_counted` (and `contains_checked_counted`, for
+//! `has`) reports how many members a walk visited; only a walk of [`WIDE_MEMBERS`] or more registers the object, and
 //! the *next* lookup of it builds the index. An object that is small, or
 //! looked up once, never costs more than the walk it always cost, and a
 //! refused build is remembered so it is not retried. So is an eviction: only
@@ -59,8 +69,8 @@
 use alloc::vec::Vec;
 
 use super::document::{
-    key_hash, key_hash_of, key_is_malformed, last_field_trailing_gap_ok, DocumentCursor,
-    DocumentFields, DocumentValue,
+    key_delimiter_ok, key_hash, key_hash_of, key_is_malformed, key_only_value_delimiter_ok,
+    last_field_trailing_gap_ok, DocumentCursor, DocumentFields, DocumentValue,
 };
 use super::error::EvalError;
 
@@ -91,6 +101,10 @@ pub(crate) struct KeyIndex {
     keys: Vec<usize>,
     table: Vec<Slot>,
     mask: usize,
+    /// Whether a `has` walk of this object would find nothing to raise on
+    /// (#4002), decided by [`Self::walk_is_clean`] the first time a `has`
+    /// asks, so a `find`-only object never pays for it.
+    clean: core::cell::Cell<Option<bool>>,
 }
 
 impl KeyIndex {
@@ -147,7 +161,63 @@ impl KeyIndex {
                 entry: entry as u32 + 1,
             };
         }
-        Some(Self { keys, table, mask })
+        Some(Self {
+            keys,
+            table,
+            mask,
+            clean: core::cell::Cell::new(None),
+        })
+    }
+
+    /// What `contains_checked(name)` answers for the list `fields` is, or
+    /// `None` when the index cannot say (the caller then walks) (#4002).
+    ///
+    /// The walk's early exit makes its errors depend on where the match sits
+    /// (#1739, #2261, #2288): a malformed sibling raises only if visited
+    /// before it. The build already refused every anomaly that does not depend
+    /// on the name (a non-string key, an unpaired tail, a trailing comma), so
+    /// what is left is a member whose key will not decode, or whose `,`/`:` is
+    /// missing or doubled. An object holding either keeps the walk, which
+    /// raises exactly where it always did; for every other object the answer
+    /// is "some entry's decoded key equals the name".
+    pub(crate) fn contains<F: DocumentFields>(
+        &self,
+        fields: &F,
+        head: &F::Cursor,
+        name: &str,
+    ) -> Option<bool> {
+        if !self.walk_is_clean(fields) {
+            return None;
+        }
+        match self.lookup(head, name)? {
+            Ok(found) => Some(found.is_some()),
+            Err(_) => None,
+        }
+    }
+
+    /// Whether `fields`, the list this index was built from, has no member a
+    /// `contains_checked` walk could raise on: every key decodes and every
+    /// key's `,` and `:` are in place. One key-only pass, run once.
+    fn walk_is_clean<F: DocumentFields>(&self, fields: &F) -> bool {
+        if let Some(clean) = self.clean.get() {
+            return clean;
+        }
+        let mut is_first = true;
+        let mut rest = fields.clone();
+        let mut clean = true;
+        while let Some((key, key_cursor, next)) = rest.uncons_key() {
+            if !matches!(key.decoded_key_str(), Ok(Some(_)))
+                || !key_delimiter_ok::<F>(&key, &key_cursor, is_first)
+                || !key_only_value_delimiter_ok::<F>(&key, &key_cursor)
+            {
+                clean = false;
+                break;
+            }
+            is_first = false;
+            rest = next;
+        }
+        self.clean.set(Some(clean));
+        clean
     }
 
     /// How many members the index holds.
@@ -224,6 +294,23 @@ pub(crate) fn find_cursor_memoized<F: DocumentFields>(
         return answer;
     }
     let (found, walked) = fields.find_cursor_counted(name);
+    if walked >= WIDE_MEMBERS && found.is_ok() {
+        memo::note_wide(fields);
+    }
+    found
+}
+
+/// [`DocumentFields::contains_checked`] for a caller inside an evaluation: the
+/// same answer, from a [`KeyIndex`] once the object has proved wide (#4002).
+#[inline]
+pub(crate) fn contains_memoized<F: DocumentFields>(
+    fields: &F,
+    name: &str,
+) -> Result<bool, EvalError> {
+    if let Some(answer) = memo::answer_has(fields, name) {
+        return Ok(answer);
+    }
+    let (found, walked) = fields.contains_checked_counted(name);
     if walked >= WIDE_MEMBERS && found.is_ok() {
         memo::note_wide(fields);
     }
@@ -346,14 +433,24 @@ pub(crate) mod memo {
         if !ARMED.with(Cell::get) {
             return None;
         }
-        answer_armed(fields, name)
+        answer_armed(fields, |index, head| index.lookup(head, name))
+    }
+
+    /// [`answer`] for `has(name)` (#4002): whether the object holds the key,
+    /// or `None` to walk.
+    #[inline]
+    pub(crate) fn answer_has<F: DocumentFields>(fields: &F, name: &str) -> Option<bool> {
+        if !ARMED.with(Cell::get) {
+            return None;
+        }
+        answer_armed(fields, |index, head| index.contains(fields, head, name))
     }
 
     #[inline(never)]
-    fn answer_armed<F: DocumentFields>(
+    fn answer_armed<F: DocumentFields, R>(
         fields: &F,
-        name: &str,
-    ) -> Option<Result<Option<F::Cursor>, EvalError>> {
+        probe: impl FnOnce(&KeyIndex, &F::Cursor) -> Option<R>,
+    ) -> Option<R> {
         let head = fields.head_key_cursor()?;
         let id = head.node_id();
         let document = head.document_token();
@@ -378,7 +475,7 @@ pub(crate) mod memo {
             }
             let found = match &entry.kind {
                 Kind::Indexed(index) => {
-                    let found = index.lookup(&head, name);
+                    let found = probe(index, &head);
                     if found.is_some() {
                         note_hit();
                     }
@@ -470,6 +567,10 @@ pub(crate) mod memo {
         _fields: &F,
         _name: &str,
     ) -> Option<Result<Option<F::Cursor>, EvalError>> {
+        None
+    }
+
+    pub(crate) fn answer_has<F: DocumentFields>(_fields: &F, _name: &str) -> Option<bool> {
         None
     }
 
