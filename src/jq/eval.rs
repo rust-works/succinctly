@@ -11671,7 +11671,7 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // only add a buffered frame to every level; with none -- every link of a
     // lazy argument chain, the `n == 0` each level runs through -- there is
     // nothing to settle.
-    if settles_before_consumer(left) && settles_before_consumer(right) {
+    if settles_both(left, right) {
         binary_fanout_each_with::<W, S>(
             settled_operand_strategy(each_operand),
             left,
@@ -12198,7 +12198,7 @@ pub(crate) fn boolean_fanout_each(
     sink: &mut dyn FnMut(bool) -> Demand,
 ) -> Flow {
     // #3296: decided once per operator, as in `binary_fanout_each`.
-    if settles_before_consumer(left) && settles_before_consumer(right) {
+    if settles_both(left, right) {
         boolean_fanout_each_with(
             settled_operand_strategy(each_operand),
             left,
@@ -74701,8 +74701,10 @@ pub(crate) fn shared_arg_depth_refusal() -> EvalError {
 /// any depth that matters, and keeps the path it always took. An operator
 /// settles only when both its operands pass (see [`binary_fanout_each`]).
 ///
-/// The check runs on every operand a fan-out evaluates, so it must cost O(1)
-/// however deep the recursion is. A bare argument read (a `Shared` operand) is
+/// The check runs on every operand a fan-out evaluates, so it must stay cheap
+/// however deep the recursion is (an operator asks through [`settles_both`],
+/// whose probe refuses a small operand without walking the other, #3885). A
+/// bare argument read (a `Shared` operand) is
 /// never settled without looking inside: that is every link of a lazy argument
 /// chain (`n - 1` over the previous level's `n`), which evaluates one binary
 /// operator per link and would otherwise walk the whole chain below it on
@@ -74716,6 +74718,79 @@ pub(crate) fn settles_before_consumer(expr: &Expr) -> bool {
     }
     let mut walk = PureWalk::new(false);
     single_valued_pure(expr, None, &mut walk) == Some(true)
+}
+
+/// Whether both operands of an operator [`settles_before_consumer`] (#3885),
+/// which is the question every binary fan-out asks once per evaluation.
+///
+/// Refusing an operand that calls no `def` means walking all of it, so asking
+/// the left operand first and then the right made a left-nested chain
+/// (`1 + 1 + ... + 1`) re-walk everything below each of its N operators, N^2
+/// node visits, to refuse a right operand that is one literal. Asking the right
+/// first would only move that to a right-nested chain. So the right operand
+/// is probed ([`SETTLE_PROBE_BUDGET`] nodes) first, and only if the probe
+/// cannot decide it is the left one: an operand the probe refuses ends the
+/// question whichever side it is on, and only an operand too big to decide is
+/// walked in full. One the probe finds settling needs no probe of the other
+/// side -- it is walked in full, as it always was -- so the common
+/// left-nested chain costs one node here, and a chain of `def` calls nothing
+/// extra. The checks are pure and independent, so this changes what the
+/// question costs, never its answer.
+pub(crate) fn settles_both(left: &Expr, right: &Expr) -> bool {
+    settles_both_with(left, right, settle_probe, settles_before_consumer)
+}
+
+/// How many nodes the probe in [`settles_both`] spends on an operand before
+/// leaving it to the full [`SETTLE_ANALYSIS_BUDGET`] walk.
+const SETTLE_PROBE_BUDGET: u32 = 8;
+
+/// What a probe of [`SETTLE_PROBE_BUDGET`] nodes could tell about one operand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettleProbe {
+    /// The whole operand fit the budget and [`settles_before_consumer`] holds.
+    Settles,
+    /// It does not settle: a `Shared` read, or a walk that ended on a node the
+    /// analysis does not recognise with budget to spare.
+    Refuses,
+    /// The budget ran out first; only the full walk can say.
+    Undecided,
+}
+
+/// [`settles_before_consumer`] for at most [`SETTLE_PROBE_BUDGET`] nodes. A
+/// walk that finishes inside that budget does so identically inside the full
+/// one, so `Settles` and `Refuses` are the full answer; a walk that fails with
+/// the budget spent may have failed for lack of it, so it is `Undecided`.
+fn settle_probe(expr: &Expr) -> SettleProbe {
+    if matches!(expr, Expr::Shared(_)) {
+        return SettleProbe::Refuses;
+    }
+    let mut walk = PureWalk::new(false);
+    walk.budget = SETTLE_PROBE_BUDGET;
+    match single_valued_pure(expr, None, &mut walk) {
+        Some(true) => SettleProbe::Settles,
+        Some(false) => SettleProbe::Refuses,
+        None if walk.budget == 0 => SettleProbe::Undecided,
+        None => SettleProbe::Refuses,
+    }
+}
+
+/// [`settles_both`] over an injected probe and full check, so what it asks,
+/// and in what order, can be pinned without timing anything.
+fn settles_both_with(
+    left: &Expr,
+    right: &Expr,
+    mut probe: impl FnMut(&Expr) -> SettleProbe,
+    mut full: impl FnMut(&Expr) -> bool,
+) -> bool {
+    match probe(right) {
+        SettleProbe::Refuses => false,
+        SettleProbe::Settles => full(left),
+        SettleProbe::Undecided => match probe(left) {
+            SettleProbe::Refuses => false,
+            SettleProbe::Settles => full(right),
+            SettleProbe::Undecided => full(left) && full(right),
+        },
+    }
 }
 
 /// Whether reading the argument `arg` may take `eval_single`'s eager path in
@@ -88160,6 +88235,109 @@ mod tests {
         assert!(!settles_before_consumer(&with_arg(
             SETTLE_ANALYSIS_BUDGET as usize
         )));
+    }
+
+    /// #3885: [`settles_both`] gives exactly `settles(left) && settles(right)`,
+    /// and a small operand that does not settle ends the question without the
+    /// other operand being walked in full, on either side -- which is what kept
+    /// a left-nested chain from re-walking everything below each of its
+    /// operators, without moving that cost to a right-nested one.
+    #[test]
+    fn settles_both_refuses_on_a_small_operand_without_the_big_walk_3885() {
+        let call = {
+            let Expr::FuncDef {
+                name,
+                params,
+                body,
+                then,
+                ..
+            } = parse("def f(n): n; f(1)").unwrap()
+            else {
+                panic!("expected a def") // patchcov: coverage tolerate-line reason="unreachable in a passing suite: the source above always parses to a FuncDef (#3885)"
+            };
+            let def = Rc::new(FuncDefData::new(name, params, *body));
+            install_def_calls(&then, &def, 0, false)
+        };
+        let Expr::DefCall { def, .. } = &call else {
+            panic!("expected a DefCall") // patchcov: coverage tolerate-line reason="unreachable in a passing suite: `f(1)` under `def f(n)` always installs as a DefCall (#3885)"
+        };
+        // Past the probe, within the full budget: settles, but only the full walk can say.
+        let big_call = Expr::DefCall {
+            def: Rc::clone(def),
+            args: vec![Expr::Pipe(
+                vec![Expr::Identity; SETTLE_PROBE_BUDGET as usize * 2].into(),
+            )],
+            frames: 0,
+            bound: BoundBody::default(),
+        };
+        // Past the probe, and not settling: a flat pipe of `.`.
+        let big_plain = Expr::Pipe(vec![Expr::Identity; SETTLE_PROBE_BUDGET as usize * 2].into());
+        let chain = parse("1 + 1 + 1 + 1").unwrap();
+        let leaf = parse("1").unwrap();
+        let shared = Expr::shared(call.clone());
+
+        assert_eq!(settle_probe(&leaf), SettleProbe::Refuses);
+        assert_eq!(settle_probe(&chain), SettleProbe::Refuses);
+        assert_eq!(settle_probe(&shared), SettleProbe::Refuses);
+        assert_eq!(settle_probe(&call), SettleProbe::Settles);
+        assert_eq!(settle_probe(&big_call), SettleProbe::Undecided);
+        assert_eq!(settle_probe(&big_plain), SettleProbe::Undecided);
+
+        // The answer is `left && right` over every pairing of shapes.
+        let shapes = [
+            &call,
+            &big_call,
+            &big_plain,
+            &chain,
+            &leaf,
+            &shared,
+            &Expr::Identity,
+        ];
+        for l in shapes {
+            for r in shapes {
+                assert_eq!(
+                    settles_both(l, r),
+                    settles_before_consumer(l) && settles_before_consumer(r),
+                );
+            }
+        }
+        assert!(settles_both(&call, &call));
+        assert!(settles_both(&big_call, &call));
+        assert!(!settles_both(&big_call, &big_plain));
+
+        // A big operand beside a small one that refuses is never walked in
+        // full -- on either side, so neither nesting direction re-walks.
+        for (l, r) in [(&big_call, &leaf), (&leaf, &big_call), (&big_plain, &chain)] {
+            let mut full_walks = 0;
+            assert!(!settles_both_with(l, r, settle_probe, |_| {
+                full_walks += 1;
+                true
+            }));
+            assert_eq!(
+                full_walks, 0,
+                "a refusing small operand must end the question"
+            );
+        }
+        // A settling right operand is not probed against: the left is walked
+        // in full, once, as it always was.
+        let mut full_walks = 0;
+        assert!(settles_both_with(&big_plain, &call, settle_probe, |_| {
+            full_walks += 1;
+            true
+        }));
+        assert_eq!(full_walks, 1);
+        // Two operands too big to probe are walked in full, each at most once.
+        let mut full_walks = 0;
+        assert!(settles_both_with(
+            &big_call,
+            &big_call,
+            settle_probe,
+            |_| {
+                full_walks += 1;
+                true
+            }
+        ));
+        assert_eq!(full_walks, 2);
     }
 
     /// #2397: the navigation shapes the representation gate exists for must
