@@ -38452,6 +38452,27 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                 ResolveFlow::Exhausted
             }
         }
+        // #3460: jq's `tostring`/`@text` of a string and `tonumber` of a number
+        // return their input as the very same `jv`, so `path()` accepts them
+        // (`path(.b|tostring)` is `["b"]`) and an update writes through them.
+        // Judged on the value's kind alone, from the 1.7.1 source: any other
+        // input builds a fresh value and stays a refusal. `tostring`/`@text`
+        // are jq only: yq's `(.b|tostring) = 9` is a no-op.
+        Expr::Builtin(Builtin::ToString) | Expr::Format(FormatType::Text)
+            if S::TAG == EvalTag::Jq && matches!(value, OwnedValue::String(_)) =>
+        {
+            emit_passthrough(value, trackable, snapshot, sink)
+        }
+        // yq's `(.n|tonumber) = 5` writes through a number as well (v4.53.3), so
+        // this arm is not mode-gated.
+        Expr::Builtin(Builtin::ToNumber)
+            if matches!(
+                value,
+                OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)
+            ) =>
+        {
+            emit_passthrough(value, trackable, snapshot, sink)
+        }
         // `if cond then a else b end`: only the branch the runtime actually
         // selects is checked for path-ness — the branch not taken is never
         // evaluated at all, so a non-path `else` that is never reached
