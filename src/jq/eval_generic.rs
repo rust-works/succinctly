@@ -22144,7 +22144,7 @@ fn path_index_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
             } else if let Some(elements) = v.as_array() {
                 empty_elements_tail_gap_ok(&elements, Some(c))?;
                 if idx < 0 {
-                    let len = elements.len_checked()?;
+                    let len = crate::jq::array_index::len_checked_memoized(&elements)?;
                     let resolved = len as i64 + idx;
                     if let Some(e) = yq_negative_index_check::<S>(idx, resolved, len) {
                         return Err(e);
@@ -22152,13 +22152,12 @@ fn path_index_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
                     if S::TAG == EvalTag::Yq && resolved >= 0 {
                         component = OwnedValue::Int(resolved);
                     }
-                    elements
-                        .get_cursor(resolved as usize)
+                    crate::jq::array_index::get_cursor_memoized(&elements, resolved as usize)
                         .map_or(PathNode::Absent, PathNode::At)
                 } else {
                     usize::try_from(idx)
                         .ok()
-                        .and_then(|i| elements.get_cursor(i))
+                        .and_then(|i| crate::jq::array_index::get_cursor_memoized(&elements, i))
                         .map_or(PathNode::Absent, PathNode::At)
                 }
             } else if v.as_object().is_some() && yq_numeric_index_on_object_is_null::<S>() {
@@ -23927,7 +23926,7 @@ fn getpath_walk_cursor<S: EvalSemantics, V: DocumentValue>(
                 // #1804/#2476/#2173 history block for the measured cost and
                 // why every other value-producing route pays the same price.
                 if let Some(elements) = v.as_array() {
-                    let len = match elements.len_checked() {
+                    let len = match crate::jq::array_index::len_checked_memoized(&elements) {
                         Ok(len) => len,
                         Err(e) if suppresses(&e, optional) => return GenericResult::None,
                         Err(e) => return GenericResult::Error(e),
@@ -23942,7 +23941,9 @@ fn getpath_walk_cursor<S: EvalSemantics, V: DocumentValue>(
                         // `len_checked`/`resolve` already bound every index
                         // in `range` to `[0, len)`, so `get_cursor` cannot
                         // miss here.
-                        let Some(elem) = elements.get_cursor(idx) else {
+                        let Some(elem) =
+                            crate::jq::array_index::get_cursor_memoized(&elements, idx)
+                        else {
                             break; // patchcov: coverage tolerate-line reason="unreachable: `len_checked` and `SliceBounds::resolve` already bound every index in `range` to `[0, len)`, so `get_cursor` cannot miss (#2168)"
                         };
                         match to_owned_cursor::<S, _>(&elem) {

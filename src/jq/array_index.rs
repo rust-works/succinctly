@@ -123,6 +123,12 @@ impl ElementIndex {
 
 /// [`DocumentElements::len_checked`] for a caller inside an evaluation: the
 /// same answer, from an [`ElementIndex`] once the array has proved wide.
+///
+/// A drop-in for `len_checked` and nothing more: it does **not** make the
+/// zero-element `[,]` check (`empty_elements_tail_gap_ok`), which `len_checked`
+/// cannot make either and which every caller makes first. (An index is only
+/// ever built for an array of [`WIDE_ELEMENTS`] or more, so the two never meet,
+/// but a caller must not rely on that.)
 #[inline]
 pub(crate) fn len_checked_memoized<E: DocumentElements>(elements: &E) -> Result<usize, EvalError> {
     if let Some(len) = memo::len(elements) {
@@ -153,7 +159,7 @@ pub(crate) fn get_cursor_memoized<E: DocumentElements>(
 pub(crate) mod memo {
     use std::cell::{Cell, RefCell};
 
-    use super::{DocumentCursor, DocumentElements, ElementIndex, MAX_INDEXED_ELEMENTS};
+    use super::{DocumentElements, ElementIndex, MAX_INDEXED_ELEMENTS};
 
     /// Arrays remembered at once, indexed or not. Least recently used first.
     const ENTRIES: usize = 16;
@@ -193,9 +199,22 @@ pub(crate) mod memo {
 
     thread_local! {
         static MEMO: RefCell<Option<State>> = const { RefCell::new(None) };
-        /// Whether the open scope holds any entry: the one load every lookup
-        /// of an evaluation that has seen no wide array makes.
-        static ARMED: Cell<bool> = const { Cell::new(false) };
+        /// A Bloom filter over the heads of the open scope's entries (one bit
+        /// per head, from [`bit`]): zero while the scope holds none, which is
+        /// the one load every lookup of an evaluation that has seen no wide
+        /// array makes, and a cheap reject for the small arrays read after one
+        /// has. A stale bit (an evicted entry) only costs a probe.
+        static BLOOM: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// The filter bit of the list whose first element has node id `id`.
+    #[inline(always)]
+    fn bit(id: usize) -> u64 {
+        1 << ((id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58)
+    }
+
+    fn bloom_of(entries: &[Entry]) -> u64 {
+        entries.iter().fold(0, |b, e| b | bit(e.head))
     }
 
     #[cfg(test)]
@@ -232,7 +251,7 @@ pub(crate) mod memo {
     impl Drop for Guard {
         fn drop(&mut self) {
             if let Restore::Previous(previous) = std::mem::replace(&mut self.0, Restore::Nothing) {
-                ARMED.with(|a| a.set(previous.as_ref().is_some_and(|s| !s.entries.is_empty())));
+                BLOOM.with(|b| b.set(previous.as_ref().map_or(0, |s| bloom_of(&s.entries))));
                 MEMO.with(|m| *m.borrow_mut() = previous);
             }
         }
@@ -246,7 +265,7 @@ pub(crate) mod memo {
             if m.as_ref().is_some_and(|s| s.document == document) {
                 return Guard(Restore::Nothing);
             }
-            ARMED.with(|a| a.set(false));
+            BLOOM.with(|b| b.set(0));
             Guard(Restore::Previous(m.replace(State {
                 document,
                 entries: Vec::new(),
@@ -258,10 +277,11 @@ pub(crate) mod memo {
     /// second length lookup of a wide array) can say; `None` means "walk".
     #[inline]
     pub(crate) fn len<E: DocumentElements>(elements: &E) -> Option<usize> {
-        if !ARMED.with(Cell::get) {
+        let bloom = BLOOM.with(Cell::get);
+        if bloom == 0 {
             return None;
         }
-        answer(elements, true, |index, _head| Some(index.len()))
+        answer(elements, bloom, true, |index, _head| Some(index.len()))
     }
 
     /// Element `index` of the list `elements`, when an existing index can say,
@@ -271,21 +291,24 @@ pub(crate) mod memo {
         elements: &E,
         index: usize,
     ) -> Option<super::Element<E::Cursor>> {
-        if !ARMED.with(Cell::get) {
+        let bloom = BLOOM.with(Cell::get);
+        if bloom == 0 {
             return None;
         }
-        answer(elements, false, |ix, head| ix.get(head, index))
+        answer(elements, bloom, false, |ix, head| ix.get(head, index))
     }
 
     #[inline(never)]
     fn answer<E: DocumentElements, R>(
         elements: &E,
+        bloom: u64,
         may_build: bool,
         probe: impl FnOnce(&ElementIndex, &E::Cursor) -> Option<R>,
     ) -> Option<R> {
-        let (head, _) = elements.uncons_cursor()?;
-        let id = head.node_id();
-        let document = head.document_token();
+        let (id, document) = elements.head_id()?;
+        if bloom & bit(id) == 0 {
+            return None;
+        }
         MEMO.with(|m| {
             let mut m = m.borrow_mut();
             let state = m.as_mut().filter(|s| s.document == document)?;
@@ -314,6 +337,7 @@ pub(crate) mod memo {
             }
             let found = match &entry.kind {
                 Kind::Indexed(index) => {
+                    let (head, _) = elements.uncons_cursor()?;
                     let found = probe(index, &head);
                     if found.is_some() {
                         note_hit();
@@ -352,11 +376,9 @@ pub(crate) mod memo {
     /// Remember that a walk of `elements` was wide, so the next length lookup
     /// of the same list builds an index.
     pub(crate) fn note_wide<E: DocumentElements>(elements: &E, len: usize) {
-        let Some((head, _)) = elements.uncons_cursor() else {
+        let Some((id, document)) = elements.head_id() else {
             return;
         };
-        let id = head.node_id();
-        let document = head.document_token();
         MEMO.with(|m| {
             let mut m = m.borrow_mut();
             let Some(state) = m.as_mut().filter(|s| s.document == document) else {
@@ -372,7 +394,7 @@ pub(crate) mod memo {
                 head: id,
                 kind: Kind::Seen { lookups: 1, len },
             });
-            ARMED.with(|a| a.set(true));
+            BLOOM.with(|b| b.set(b.get() | bit(id)));
         });
     }
 }
@@ -462,6 +484,65 @@ mod tests {
             assert!(elements.len_checked().is_err());
             assert!(ElementIndex::build(elements, 0).is_none());
         });
+    }
+
+    /// The build is a copy of `len_checked`'s loop, so the module's "cannot
+    /// change an answer" argument rests on the two agreeing. Pin it over every
+    /// arrangement of up to four elements (scalar, malformed scalar, empty and
+    /// string members) with every separator, leading and trailing delimiter
+    /// the semi-index will accept: an index exists exactly when the walk
+    /// succeeds, with the walk's length.
+    #[test]
+    fn build_succeeds_exactly_when_len_checked_does_4035() {
+        let members = ["1", "tru", "[]", "\"a\"", "{\"k\":1}"];
+        let mut checked = 0;
+        for count in 0..=4usize {
+            let mut picks = vec![0usize; count];
+            loop {
+                let els: Vec<&str> = picks.iter().map(|i| members[*i]).collect();
+                for joiner in [",", ",,", " ", ""] {
+                    for lead in ["", ","] {
+                        for trail in ["", ",", ",,", " ,"] {
+                            let doc = format!("[{lead}{}{trail}]", els.join(joiner));
+                            let index = JsonIndex::build(doc.as_bytes());
+                            let root = index.root(doc.as_bytes());
+                            let Some(elements) = root.value().as_array() else {
+                                continue;
+                            };
+                            let walked = elements.len_checked();
+                            let built = ElementIndex::build(&elements, 0);
+                            assert_eq!(
+                                built.as_ref().map(ElementIndex::len),
+                                walked.as_ref().ok().copied(),
+                                "{doc}"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+                // Advance the odometer.
+                let mut at = count;
+                loop {
+                    if at == 0 {
+                        break;
+                    }
+                    at -= 1;
+                    picks[at] += 1;
+                    if picks[at] < members.len() {
+                        break;
+                    }
+                    picks[at] = 0;
+                    if at == 0 {
+                        at = usize::MAX;
+                        break;
+                    }
+                }
+                if count == 0 || at == usize::MAX {
+                    break;
+                }
+            }
+        }
+        assert!(checked > 1000, "the sweep covered {checked} documents");
     }
 
     #[test]

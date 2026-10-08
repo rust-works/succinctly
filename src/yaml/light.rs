@@ -8152,6 +8152,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentElements for YamlElements<'a, W> {
     fn is_empty(&self) -> bool {
         YamlElements::is_empty(self)
     }
+
+    fn head_id(&self) -> Option<(usize, usize)> {
+        self.element_cursor
+            .map(|c| (c.node_id(), c.document_token()))
+    }
 }
 
 // ============================================================================

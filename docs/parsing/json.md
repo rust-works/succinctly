@@ -510,15 +510,15 @@ Reading an element of a document array (`.users[0]`, `.[5]`, `$root.nodes[.from]
 
 Release, `ab-cli.py` interleaved, output identity gated on every row, a control run per box in the same session (every control row within -1.7%..+0.9%), base `36f8582c0` vs the shipped commit:
 
-| row                                                       | 7950X (min)       | M4 Pro (min)      |
-|-----------------------------------------------------------|-------------------|-------------------|
-| `. as $r \| .users[] \| $r.users[0].id`, 0.7 MB          | 1,115 ms -> 22 ms | 852 ms -> 17 ms   |
-| the same, 2.8 MB                                          | 17.7 s -> 83 ms   | 13.5 s -> 57 ms   |
-| `[.[range(0;300)]] \| length`, one 1M-element array       | 4.28 s -> 71 ms   | 3.23 s -> 52 ms   |
-| `.[] \| [.[3], .[4], .[5], .[6]]`, 20,000 arrays of 100   | -13.4%            | -15.6%            |
-| `.[] \| [.[3], .[4]]` (read twice: the worst case)        | +3.3%             | -0.7%             |
-| `.users[100]`, `.users \| length`, `.users[-1]`, `last` (10 and 26 MB, read once) | -0.7%..+2.3%  | -3.0%..+0.8%  |
-| `.[100]`, `length`, `last`, `.[-1]` on one 1M-element array | +0.4%..+2.2%    | -5.0%..-2.5%      |
+| row                                                                               | 7950X (min)       | M4 Pro (min)    |
+|-----------------------------------------------------------------------------------|-------------------|-----------------|
+| `. as $r \| .users[] \| $r.users[0].id`, 0.7 MB                                   | 1,115 ms -> 22 ms | 852 ms -> 17 ms |
+| the same, 2.8 MB                                                                  | 17.7 s -> 83 ms   | 13.5 s -> 57 ms |
+| `[.[range(0;300)]] \| length`, one 1M-element array                               | 4.28 s -> 71 ms   | 3.23 s -> 52 ms |
+| `.[] \| [.[3], .[4], .[5], .[6]]`, 20,000 arrays of 100                           | -13.4%            | -15.6%          |
+| `.[] \| [.[3], .[4]]` (read twice: the worst case)                                | +3.3%             | -0.7%           |
+| `.users[100]`, `.users \| length`, `.users[-1]`, `last` (10 and 26 MB, read once) | -0.7%..+2.3%      | -3.0%..+0.8%    |
+| `.[100]`, `length`, `last`, `.[-1]` on one 1M-element array                       | +0.4%..+2.2%      | -5.0%..-2.5%    |
 
 Growth: 0.7 MB to 2.8 MB (4x the records) multiplies the base by 16x and the change by 3.7x. Instructions (7950X cachegrind `Ir`, M4 Pro `time -l` instructions retired, min of 3), base vs shipped: every single-read row is +0.00% to +0.29%, the twice-read row +1.45% / +1.68% (registering 20,000 arrays), `[.[] | length] | add` +0.74% / +0.98%, the four-read row -16.9% / -15.4%. Cache misses and branch mispredicts (cachegrind with `--cache-sim=yes --branch-sim=yes`, `.users | length`, 7 MB): identical to 0.01%.
 
