@@ -85681,7 +85681,9 @@ fn test_map_iterate_atomicity_outside_truncators_2666() -> Result<()> {
         ("first(map(.+1) | .[] | select(.>2))", "", 5),
         ("first(map(.+1) | .[] , 9)", "", 5),
         ("{a: .} | .a | map(.+1) | .[]", "", 5),
-        ("{a: .} | .a | first(map(.+1) | .[])", "", 5),
+        // A literal member makes the object ineligible for holding nodes, so
+        // it is built owned and `.a` is an owned copy: atomic, as jq is.
+        ("{a: ., b: 1} | .a | first(map(.+1) | .[])", "", 5),
     ];
     for (filter, want_out, want_code) in match_jq {
         let (out, err, code) = run_jq_full(&["-c", filter], Some(input))?;
@@ -85700,6 +85702,16 @@ fn test_map_iterate_atomicity_outside_truncators_2666() -> Result<()> {
         ("limit(1; map(.+1) | .[])", "2"),
         ("map(.+1) | .[0]", "2"),
         ("nth(0; map(.+1)|.[])", "2"),
+        // #4044: `{a: .}` holds the node it names, as `[.]` and an `as` bind
+        // always did, so `.a` is a document node and its `map` is lazy like
+        // the document's own. Before, the object decoded `.` and the owned
+        // value's `map` was atomic.
+        ("{a: .} | .a | first(map(.+1) | .[])", "2"),
+        ("{a: .} | .a | limit(1; map(.+1) | .[])", "2"),
+        ("{a: .} | .a | map(.+1) | .[0]", "2"),
+        ("{a: .} | .a | map(.+1) | first", "2"),
+        ("{a: .} | .a | nth(0; map(.+1)|.[])", "2"),
+        (r#"try ({a: .} | .a | first(map(.+1)|.[])) catch "c""#, "2"),
     ];
     for (filter, want_out) in preserved {
         let (out, err, code) = run_jq_full(&["-c", filter], Some(input))?;
@@ -91285,7 +91297,18 @@ fn test_embed_nested_reuse_keeps_the_depth_limit_3179() -> Result<()> {
         ("[]", 0),
         "n=255: stderr={stderr:?}"
     );
+    // #4044: `{k:.}` holds the root as a node and never walks it, so nothing
+    // checks its depth and the filter answers (as jq, with no such limit, does).
+    // A literal member makes the object ineligible: it is built owned and the
+    // walk raises the depth error.
     let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&nested(256)))?;
+    assert_eq!(
+        (stdout.trim_end(), code),
+        ("[]", 0),
+        "n=256 (held node): stderr={stderr:?}"
+    );
+    let owned_filter = r".a as $y | {k:., j:1} | .k.a | path($y)";
+    let (stdout, stderr, code) = run_jq_full(&["-c", owned_filter], Some(&nested(256)))?;
     assert_eq!((stdout.as_str(), code), ("", 5), "n=256: stdout={stdout:?}");
     assert!(stderr.contains("nesting depth"), "n=256: stderr={stderr:?}");
     // The height is the document's, not the bound value's: a duplicate key
@@ -91297,7 +91320,7 @@ fn test_embed_nested_reuse_keeps_the_depth_limit_3179() -> Result<()> {
         "[".repeat(254),
         "]".repeat(254)
     );
-    for filter in [r"{k:.} | .k.a", r".a as $y | {k:.} | .k.a"] {
+    for filter in [r"{k:., j:1} | .k.a", r".a as $y | {k:., j:1} | .k.a"] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&dup))?;
         assert_eq!(
             (stdout.as_str(), code),
@@ -96904,10 +96927,311 @@ fn test_malformed_number_route_sweep_3222() -> Result<()> {
     Ok(())
 }
 
+/// #4044: an object holding document nodes (`{a: .u}`) keeps them as nodes
+/// instead of decoding them, and prints, navigates and compares exactly as the
+/// decoded object did. Every expectation is the pinned jq 1.7.1's output for
+/// the same filter and document, on both routes: the document on stdin keeps
+/// the cursor (the lazy object), `-n` with the document as a prefix builds an
+/// owned value (the ordinary object).
+#[test]
+fn test_object_holding_nodes_matches_jq_on_both_routes_4044() -> Result<()> {
+    let doc = r#"{"u":[1,{"k":"v"}],"n":null,"s":"x","o":{"p":{"q":[2,3]}}}"#;
+    let rows: &[(&str, &str)] = &[
+        (r"{a: .u}", "{\"a\":[1,{\"k\":\"v\"}]}\n"),
+        (r"{a: .}", "{\"a\":{\"u\":[1,{\"k\":\"v\"}],\"n\":null,\"s\":\"x\",\"o\":{\"p\":{\"q\":[2,3]}}}}\n"),
+        (r"{a: ., b: .u}", "{\"a\":{\"u\":[1,{\"k\":\"v\"}],\"n\":null,\"s\":\"x\",\"o\":{\"p\":{\"q\":[2,3]}}},\"b\":[1,{\"k\":\"v\"}]}\n"),
+        (r"{n: .n, u: .u}", "{\"n\":null,\"u\":[1,{\"k\":\"v\"}]}\n"),
+        (r"{a: .u, b: .u}", "{\"a\":[1,{\"k\":\"v\"}],\"b\":[1,{\"k\":\"v\"}]}\n"),
+        (r"{a: .u[1], c: .s}", "{\"a\":{\"k\":\"v\"},\"c\":\"x\"}\n"),
+        (r"{a: .o.p}", "{\"a\":{\"q\":[2,3]}}\n"),
+        (r"{a: .u} | .a", "[1,{\"k\":\"v\"}]\n"),
+        (r"{a: .u} | .a | length", "2\n"),
+        (r"{a: .u} | .b", "null\n"),
+        (r"{a: .u} | length", "1\n"),
+        (r"{a: .u, b: .o} | keys", "[\"a\",\"b\"]\n"),
+        (r"{a: .u, b: .o} | to_entries | length", "2\n"),
+        (r#"{a: .u} | has("a")"#, "true\n"),
+        (r"{a: .u, b: .s} | .[]", "[1,{\"k\":\"v\"}]\n\"x\"\n"),
+        (r"{a: .u} | tojson", "\"{\\\"a\\\":[1,{\\\"k\\\":\\\"v\\\"}]}\"\n"),
+        (r"{a: .u} + {z: 1}", "{\"a\":[1,{\"k\":\"v\"}],\"z\":1}\n"),
+        (r"{a: .o} | .a.p.q[1]", "3\n"),
+        (r"{a: .u} | del(.a)", "{}\n"),
+        (r"{a: .u} | .a[0]", "1\n"),
+        (r"{a: .u} | map_values(length)", "{\"a\":2}\n"),
+        (r"{a: .u} == {a: .u}", "true\n"),
+        (r"{a: .u} | with_entries(.)", "{\"a\":[1,{\"k\":\"v\"}]}\n"),
+        (r"[{a: .u}] | length", "1\n"),
+        (r"{a: .u} | select(.a)", "{\"a\":[1,{\"k\":\"v\"}]}\n"),
+        (r#"{("k"): .u}"#, "{\"k\":[1,{\"k\":\"v\"}]}\n"),
+        (r"{a: .u} | @json", "\"{\\\"a\\\":[1,{\\\"k\\\":\\\"v\\\"}]}\"\n"),
+        (r"{a: .u} | tostring", "\"{\\\"a\\\":[1,{\\\"k\\\":\\\"v\\\"}]}\"\n"),
+        (r"{a: .u, a: .s}", "{\"a\":\"x\"}\n"),
+        (r"{a: .u} | [.[]] | length", "1\n"),
+        (r"{a: {b: .u}}", "{\"a\":{\"b\":[1,{\"k\":\"v\"}]}}\n"),
+        (r"{a: .u?}", "{\"a\":[1,{\"k\":\"v\"}]}\n"),
+        (r"{a: .u[]}", "{\"a\":1}\n{\"a\":{\"k\":\"v\"}}\n"),
+        (r"{a: .u} | .a as $x | $x", "[1,{\"k\":\"v\"}]\n"),
+        (r"{a: .u} | path(.a)", "[\"a\"]\n"),
+        (r"{a: .u} | [paths]", "[[\"a\"],[\"a\",0],[\"a\",1],[\"a\",1,\"k\"]]\n"),
+        (r"{a: .u} | tostream", "[[\"a\",0],1]\n[[\"a\",1,\"k\"],\"v\"]\n[[\"a\",1,\"k\"]]\n[[\"a\",1]]\n[[\"a\"]]\n"),
+    ];
+    for (filter, expected) in rows {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (*expected, 0),
+            "`{filter}` (cursor route): stderr {stderr:?}"
+        );
+        let owned = format!("{doc} | {filter}");
+        let (stdout, stderr, code) = run_jq_full(&["-nc", &owned], None)?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (*expected, 0),
+            "`{owned}` (owned route): stderr {stderr:?}"
+        );
+    }
+    // Output flags: the nodes it holds are written at the object's depth.
+    let flag_rows: &[(&[&str], &str)] = &[
+        (&["-S"], "{\n  \"a\": {\n    \"p\": {\n      \"q\": [\n        2,\n        3\n      ]\n    }\n  },\n  \"b\": [\n    1,\n    {\n      \"k\": \"v\"\n    }\n  ]\n}\n"),
+        (&[], "{\n  \"b\": [\n    1,\n    {\n      \"k\": \"v\"\n    }\n  ],\n  \"a\": {\n    \"p\": {\n      \"q\": [\n        2,\n        3\n      ]\n    }\n  }\n}\n"),
+        (&["--tab"], "{\n\t\"b\": [\n\t\t1,\n\t\t{\n\t\t\t\"k\": \"v\"\n\t\t}\n\t],\n\t\"a\": {\n\t\t\"p\": {\n\t\t\t\"q\": [\n\t\t\t\t2,\n\t\t\t\t3\n\t\t\t]\n\t\t}\n\t}\n}\n"),
+        (&["--indent", "1"], "{\n \"b\": [\n  1,\n  {\n   \"k\": \"v\"\n  }\n ],\n \"a\": {\n  \"p\": {\n   \"q\": [\n    2,\n    3\n   ]\n  }\n }\n}\n"),
+    ];
+    for (flags, expected) in flag_rows {
+        let mut args = flags.to_vec();
+        args.push("{b: .u, a: .o}");
+        let (stdout, stderr, code) = run_jq_full(&args, Some(doc))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (*expected, 0),
+            "{flags:?}: stderr {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #4044: what a lazy object is piped into answers as it did when the object
+/// was decoded: a `?//` retry past it still retries, a bounded consumer stops a
+/// generator after it, a postfix chain starting at a member reads the member as
+/// a node, and an ordinary stage sees the owned object. Every expectation is
+/// the pinned jq 1.7.1's output. The unbounded generators finish only because
+/// the consumer stops them; a regression here is a hang.
+#[test]
+fn test_stages_after_an_object_holding_nodes_match_jq_4044() -> Result<()> {
+    let doc = r#"{"u":[1,{"k":"v"}],"n":null,"s":"x","o":{"p":{"q":[2,3]}}}"#;
+    let rows: &[(&str, &str)] = &[
+        (
+            r"{a: .u} | (. as {a: $x} ?// $x | $x) | .a",
+            "[1,{\"k\":\"v\"}]\n",
+        ),
+        (
+            r#"try ({a: .u} | (. as {a: $x} ?// $x | $x) | .a) catch "c""#,
+            "[1,{\"k\":\"v\"}]\n",
+        ),
+        (
+            r"[({a: .u} | (. as {a: $x} ?// $x | $x) | .a)?]",
+            "[[1,{\"k\":\"v\"}]]\n",
+        ),
+        (
+            r"def f: . as {a: $x} ?// $x | $x; {a: .u} | f | .a",
+            "[1,{\"k\":\"v\"}]\n",
+        ),
+        (r"first({a: .u} | def f(x): x, f(x+1); f(0))", "0\n"),
+        (
+            r"[limit(3; {a: .u} | def f(x): x, f(x+1); f(0))]",
+            "[0,1,2]\n",
+        ),
+        (r"isempty({a: .u} | range(1e9))", "false\n"),
+        (
+            r"first({a: .u} | range(1e9) | [range(100)] | length)",
+            "100\n",
+        ),
+        (r"{a: .u} | .a[0]", "1\n"),
+        (r"{a: .u} | .a[1].k", "\"v\"\n"),
+        (r"{a: .o} | .a.p.q[0]", "2\n"),
+        (r"{a: .u} | .a | .[1]", "{\"k\":\"v\"}\n"),
+        (r"{a: .u} | (.a | .[1])", "{\"k\":\"v\"}\n"),
+        (r"{a: .u} | .a[]", "1\n{\"k\":\"v\"}\n"),
+        (r"{a: .u, n: .n} | .n", "null\n"),
+        (r#"{a: .u, s: .s} | select(.s == "x") | .a | length"#, "2\n"),
+        (r"{u: .u} | .u.x?", ""),
+        (r"{u: .u} | .u | length", "2\n"),
+        (r"[.o | {p} | .p | keys[]]", "[\"q\"]\n"),
+        (r"{a: .o} | [.a | paths] | length", "4\n"),
+        (r"{a: .u} | to_entries[] | .key", "\"a\"\n"),
+        (r"{a: .u} | [.[] | length]", "[2]\n"),
+        (r"{a: .u} | map(length)", "[2]\n"),
+        (r"{a: .o} | tostream | select(length==2) | .[1]", "2\n3\n"),
+        (r"[{a: .u}[]]", "[[1,{\"k\":\"v\"}]]\n"),
+        (r"{a: .u} | .[]?", "[1,{\"k\":\"v\"}]\n"),
+        (r#"{a: .u} | try error("x") catch ."#, "\"x\"\n"),
+        (r"{a: .u} | if .a then 1 else 2 end", "1\n"),
+        (r"{a: .u} | .a as $y | $y[0]", "1\n"),
+        (r"{a: .u} | [.a, .a] | length", "2\n"),
+        (r"{a: .u} | reduce .a[] as $i (0; . + 1)", "2\n"),
+        (r"{a: .u} | first(.a[])", "1\n"),
+        (r"{a: .u} | limit(1; .a[])", "1\n"),
+        (r"{a: .u} | .. | numbers", "1\n"),
+        (r".u | map({x: .})", "[{\"x\":1},{\"x\":{\"k\":\"v\"}}]\n"),
+        (r"select({a: .u}) | .a | length", "0\n"),
+        (r"{a: .o} // 1", "{\"a\":{\"p\":{\"q\":[2,3]}}}\n"),
+        (r"[{a: .u}]", "[{\"a\":[1,{\"k\":\"v\"}]}]\n"),
+        (r"last({a: .u})", "{\"a\":[1,{\"k\":\"v\"}]}\n"),
+        (r"first({a: .u})", "{\"a\":[1,{\"k\":\"v\"}]}\n"),
+        (r"[{a: .u}, {b: .o}] | length", "2\n"),
+        (
+            r"{a: .u} | ., .",
+            "{\"a\":[1,{\"k\":\"v\"}]}\n{\"a\":[1,{\"k\":\"v\"}]}\n",
+        ),
+        (r"[{a: .u}[]]", "[[1,{\"k\":\"v\"}]]\n"),
+        (r"{a: .u} as $o | $o | .a | length", "2\n"),
+        (r"{a: .u} | not", "false\n"),
+        (r"{a: .u} | type", "\"object\"\n"),
+        (r"{a: .u} | tojson | fromjson | .a | length", "2\n"),
+        (r"[.u[] | {v: .}] | length", "2\n"),
+        (r".u | map({x: .}) | length", "2\n"),
+    ];
+    for (filter, expected) in rows {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (*expected, 0),
+            "`{filter}` (cursor route): stderr {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #4044: the output flags that make the writer take the object whole (`-e`,
+/// `-a`, `-r`, `-j`) write what jq 1.7.1 writes for an object holding
+/// nodes. (`-S`, `--tab` and `--indent` are in the matches-jq test above; `-C`
+/// differs from jq's escape bytes for every object, held nodes or not.)
+#[test]
+fn test_output_flags_with_an_object_holding_nodes_match_jq_4044() -> Result<()> {
+    let doc = r#"{"u":[1,{"k":"v"}],"n":null,"s":"x"}"#;
+    let rows: &[(&[&str], &str)] = &[
+        (&["-e", "-c"], "{\"a\":[1,{\"k\":\"v\"}],\"b\":\"x\"}\n"),
+        (&["-a", "-c"], "{\"a\":[1,{\"k\":\"v\"}],\"b\":\"x\"}\n"),
+        (&["-r", "-c"], "{\"a\":[1,{\"k\":\"v\"}],\"b\":\"x\"}\n"),
+        (
+            &["-j"],
+            "{\n  \"a\": [\n    1,\n    {\n      \"k\": \"v\"\n    }\n  ],\n  \"b\": \"x\"\n}",
+        ),
+    ];
+    for (flags, expected) in rows {
+        let mut args = flags.to_vec();
+        args.push("{a: .u, b: .s}");
+        let (stdout, stderr, code) = run_jq_full(&args, Some(doc))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (*expected, 0),
+            "{flags:?}: stderr {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #4044: an object holding a node it cannot read validates it where it is
+/// read, as `[.b]` does (#3856): the object answers `length`, `keys` and a
+/// member that is well-formed, and raises, writing nothing, when it is printed
+/// or a filter reads the bad node. jq 1.7.1 rejects every document here at
+/// parse time (exit 5), so no row has a reference answer; the rows pin
+/// `docs/compliance/jq/limitations.md` ("An unreadable value is validated where
+/// something reads it").
+#[test]
+fn test_object_holding_unreadable_node_is_validated_where_read_4044() -> Result<()> {
+    let doc = r#"{"ok":{"x":[1,2]},"bad":{"y":[1,,2]},"n":3}"#;
+    let rows: &[(&str, &str, i32)] = &[
+        ("{a: .bad} | length", "1\n", 0),
+        ("{a: .ok, b: .bad} | keys", "[\"a\",\"b\"]\n", 0),
+        ("{b: .ok, a: .bad} | keys", "[\"a\",\"b\"]\n", 0),
+        ("{b: .ok, a: .bad} | keys_unsorted", "[\"b\",\"a\"]\n", 0),
+        ("{a: .ok, b: .bad} | .a", "{\"x\":[1,2]}\n", 0),
+        ("{a: .bad, b: .n} | .b", "3\n", 0),
+        // Everything else a lazy object is asked reads it whole.
+        ("{a: .bad} | has(\"a\")", "", 5),
+        // Printing, and any filter that reads the bad node, raises.
+        ("{a: .bad}", "", 5),
+        ("{a: .ok, b: .bad}", "", 5),
+        ("{a: .bad} | .a", "", 5),
+        ("{a: .bad} | tojson", "", 5),
+        // A member that raises before any node is held is the object's own
+        // error (jq 1.7.1 rejects the document, so these have no reference);
+        // an object read under a truthiness test, `//` or a collection raises
+        // on the node it holds.
+        ("{a: .n[0]}", "", 5),
+        ("{a: .ok, b: .n.x}", "", 5),
+        ("[{a: .n[0]}?]", "[]\n", 0),
+        ("[{(1): 2}?]", "[]\n", 0),
+        ("select({a: .bad})", "", 5),
+        ("{a: .bad} // 1", "", 5),
+        ("[{a: .bad}]", "", 5),
+        ("[{a: .bad}] | length", "", 5),
+        ("{a: .ok} // 1", "{\"a\":{\"x\":[1,2]}}\n", 0),
+        ("last({a: .ok})", "{\"a\":{\"x\":[1,2]}}\n", 0),
+        (".n | [{a: .}] | length", "1\n", 0),
+        // The member comes back as the node it is: `length` of it counts its
+        // members, a read of its contents raises.
+        ("{a: .bad} | .a | length", "1\n", 0),
+        ("{a: .bad} | .a | tojson", "", 5),
+        // An object as an index key, index target or slice bound is read in
+        // full, and its decode failure is the answer rather than an empty one.
+        (r"[{a: .bad}[.k]]", "", 5),
+        (r".[{a: .bad}]", "", 5),
+        (r".n[{a: .bad}:]", "", 5),
+        (r#"try .n[{a: .bad}] catch "c""#, "", 5),
+        ("{a: .bad, b: .n} | to_entries", "", 5),
+        // `[.bad]` answers the same shapes (the precedent).
+        ("[.bad] | length", "1\n", 0),
+        ("[.bad]", "", 5),
+    ];
+    for (filter, expected, want) in rows {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (*expected, *want),
+            "`{filter}`: stderr {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #4044: `--preserve-input` keeps a repeated key inside a node the object
+/// holds, as it does inside an array's (`[.dup]`, #2066), and the default
+/// route collapses it as jq does. yq mode never holds nodes.
+#[test]
+fn test_object_holding_node_with_repeated_key_4044() -> Result<()> {
+    let doc = r#"{"dup":{"k":1,"k":2},"n":3}"#;
+    for (flags, filter, expected) in [
+        (&["-c"][..], "{a: .dup}", "{\"a\":{\"k\":2}}\n"),
+        (
+            &["-c", "--preserve-input"][..],
+            "[.dup]",
+            "[{\"k\":1,\"k\":2}]\n",
+        ),
+        (
+            &["-c", "--preserve-input"][..],
+            "{a: .dup, b: .n}",
+            "{\"a\":{\"k\":1,\"k\":2},\"b\":3}\n",
+        ),
+    ] {
+        let mut args = flags.to_vec();
+        args.push(filter);
+        let (stdout, stderr, code) = run_jq_full(&args, Some(doc))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (expected, 0),
+            "{flags:?} `{filter}`: stderr {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3266/#3427/#3856: on a value the index cannot read, the CLI answers a
 /// filter that navigates past it or holds it in an array (`[.]`, `[.b]`,
 /// `[.[] | .]`, and since #3856 a `,` body such as `[., 1]` or `[.a, .b]`),
-/// but a construction held inside another, an object and a bind still
+/// and, since #4044, an object `{a: .}`, `{x: .b}`; but a construction held
+/// inside another and a bind still
 /// materialize it and raise, and so does any filter once an input builtin
 /// makes the CLI materialize the whole input. (`-s` no longer does, since
 /// #2847: it reads the slurped array the way the default route reads a
@@ -96946,7 +97270,8 @@ fn test_unreadable_value_collection_split_3266() -> Result<()> {
         // #3856: printing the array reads the node, so it raises and writes
         // nothing.
         (&["-c"], "[1.2.3]", ".[0] | [., 1]", "", 5),
-        (&["-c"], "[1.2.3]", ".[0] | {a: .} | length", "", 5),
+        (&["-c"], "[1.2.3]", ".[0] | {a: .} | length", "1\n", 0),
+        (&["-c"], "[1.2.3]", ".[0] | {a: .}", "", 5),
         (&["-c"], "[1.2.3]", ".[0] | . as $x | [$x] | length", "", 5),
         (&["-c"], "[1.2.3]", ".[0] | [., .] | length", "2\n", 0),
         (&["-c"], "[1.2.3]", ".[0] | [[.]] | length", "", 5),
@@ -96957,7 +97282,10 @@ fn test_unreadable_value_collection_split_3266() -> Result<()> {
         // the array answers until something reads `.b`.
         (&["-c"], OBJ, ".[0] | [.a, .b]", "", 5),
         (&["-c"], OBJ, ".[0] | [.[], 1] | length", "3\n", 0),
-        (&["-c"], OBJ, ".[0] | {x: .b} | length", "", 5),
+        (&["-c"], OBJ, ".[0] | {x: .b} | length", "1\n", 0),
+        (&["-c"], OBJ, ".[0] | {x: .b}", "", 5),
+        (&["-c"], OBJ, ".[0] | {x: .a, y: .b} | .x", "1\n", 0),
+        (&["-c"], OBJ, ".[0] | {x: .a, y: .b} | .y", "", 5),
         // #3856: a bind decodes only what its body reads. A body that never
         // names the variable reads nothing, a scalar included; a subtree is
         // handed on as the node it is, and read where the body reads it.

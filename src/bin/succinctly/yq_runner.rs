@@ -4122,6 +4122,16 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
                 Ok(vec![])
             }
         },
+        // jq mode builds this; yq never does, but the DOM boundary answers it
+        // as the owned object it stands for (#4044).
+        GenericResult::LazyObject(obj) => {
+            let object = sink.materialize(
+                DiagStyle::Yq,
+                obj.materialize_atomic::<YqSemantics>(),
+                &no_location(),
+            );
+            Ok(object.map(no_comments).into_iter().collect()) // patchcov: coverage tolerate-line reason="unreachable: only jq mode builds a LazyObject; this arm is the exhaustiveness answer for the shared enum (#4044)"
+        }
         GenericResult::None => Ok(vec![]),
         // Real yq streams nothing before a top-level error/break — a
         // `Partial`'s already-produced prefix is discarded the same way an

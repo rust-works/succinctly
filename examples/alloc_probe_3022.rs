@@ -78,7 +78,8 @@ macro_rules! settle {
             GenericResult::Error(e) => panic!("query failed: {e:?}"),
             GenericResult::LazyKeys { .. }
             | GenericResult::LazyIndexRange(_)
-            | GenericResult::LazySeq(_) => {
+            | GenericResult::LazySeq(_)
+            | GenericResult::LazyObject(_) => {
                 panic!("query left a lazy result; this probe expects a settled one")
             }
             GenericResult::Break(l) => panic!("query broke out to label {l:?}"),

@@ -9805,7 +9805,8 @@ others.
 | `select(key == 0) \| path(.a)` (same)                   | `["a"]`                         | raises          |
 | `[., 1] \| length`, `[., .] \| length` on `[1.2.3]`     | `2`                             | raises          |
 | `[., 1]` (printed) on `[1.2.3]`                         | raises                          | raises          |
-| `{a: .} \| length` on `[1.2.3]`                         | raises                          | raises          |
+| `{a: .} \| length` on `[1.2.3]`                         | `1`                             | raises          |
+| `{a: .}` (printed) on `[1.2.3]`                         | raises                          | raises          |
 | `[.b] \| length` on `[{"a":1,"b":tru}]`                 | `1`                             | `1`             |
 | `[.a, .b] \| length`, `[.[], 1] \| length` (same)       | `2`, `3`                        | `2`, `3`        |
 | `[.a, .b]` (printed, same)                              | raises                          | raises          |
@@ -9830,15 +9831,52 @@ navigation (`.`, `.b`, `.[]`, `.[] | .`), `limit`/`first`, `select`, `if`, `//` 
 (`[.]`, `[.b]`, `[limit(1; .)]`, `[first(.b)]`, `[.b | select(true)]`, `[.[]]`). What still
 builds an owned value and decodes what it holds, so each of these raises where those answer:
 
-- a construction held inside another: `[[.]]`, `[.[] | [.]]`, since the inner array is
-  materialized to be an element;
+- a construction held inside another: `[[.]]`, `[.[] | [.]]`, `{a: {b: .}}`, since the inner
+  construction is materialized to be an element;
 - a computed stream that is not a `,` body, `[.[] | ., .]`, whose pipe head is not a `,`;
-- an object: `{a: .}`, `{x: .b}`;
 - a variable bind that decodes at the bind, below;
 - yq mode, whose printer materializes a sequence anyway and so keeps its owned routes.
 
 `try` and `?` around the remaining collections do not rescue them (`try ([[.]]) catch "c"`),
 because the failure is a decode failure.
+
+**An object holds its nodes too (#4044, jq mode).** `{a: .users}`, `{meta: .meta, data: .users}`,
+`{x: .b}` and `{a: .}` hold each document node a member names as a cursor and read none of them,
+where the object used to decode every member at construction (`{a: .users}` over a 7 MB `users`
+document: 2,460 M instructions and 81 MB printed, 490 M and 25 MB now, the cost of `[.users]`). It
+applies to literal, distinct keys over values that each name one node (`.`, `.a`, `.[0]`, a pipe of
+those), when a member is a container or a scalar that fails to decode. A repeated key, a computed
+key or value, a fan-out (`.[]`) and a construction held inside another keep the ordinary route, as
+does a member that errors or yields nothing before a node is held; a missing key is `null`, kept
+as a value beside the nodes. An object with no node to keep (`{name, age}`, the per-record shape)
+is built owned. A scalar that does not decode is kept as a node like an array's (`{x: .b} |
+length` over `tru` answers `1`).
+
+Reading it behaves as an array's does, with these specifics. `.k`, a chain that starts at one
+(`.a.x`, `.a[0]`), `length`, `keys` and `keys_unsorted` answer without reading a member's
+contents, and a member that is a node comes back as the node (`{a: .bad} | .a | length` counts its
+members, `| tojson` raises). Printing, `tojson`, `to_entries`, `has`, an index key or slice bound
+(`.u[{a: .bad}:]`) and every other consumer read the whole object and raise on a node that fails
+to decode, writing nothing; `-e`, `-S`, `-a` and `-C` materialize it first, as they do an
+array. Any stage after the object that is not one of those reads takes the object as the owned
+value it stands for, through the arm that has always handled one, so a `?//` retry, a bounded
+consumer and a generator after it behave as they did. `try`/`?`, `isempty`, `skip` and `isvalid`
+do not read the object (they do not read an array's nodes either, but they force a `LazySeq`), so
+a decode failure surfaces where it is later printed or read. On a `Result`-returning library
+entry (`eval_with_cursor*`, `eval_each_with_cursor*`) the answer is `GenericResult::LazyObject`
+where it was `Owned(Object)`; `into_owned` and `collect_owned` report a node's decode failure as
+`Err`.
+
+Three visible consequences, all the array's. `--preserve-input` keeps a repeated key inside a node
+the object holds (`{a: .dup}` prints `{"a":{"k":1,"k":2}}`, as `[.dup]` does). The lazy `map`
+trade (#725, `test_map_iterate_atomicity_outside_truncators_2666`) now reaches `.a` of an object
+that holds the document: `{a: .} | .a | first(map(f) | .[])`, `| limit(1; map(f) | .[])`, `|
+map(f) | .[0]`, `| map(f) | first` and `| nth(0; map(f) | .[])` yield the first element like the
+document's own spellings instead of raising on a later element, and `try (...) catch` around them
+no longer catches, because `.a` is a node, not an owned copy. (`{a: ., b: 1} | .a | ...` still
+raises: only an object that holds a node keeps `.a` one.) A `succinctly` extension that reads
+the node's position (`line`, `at_offset`) answers for the node, so `{a: .o} | .a | line` is the
+node's line where the owned copy had none. The nesting-depth ceiling is checked where a node is read, so `{k: .}` over a document nested past it answers where the owned object raised the depth error (jq, with no such limit, answers). yq mode keeps its owned routes.
 
 **A bind decodes what its body reads, and nothing else (#3856, jq mode).** `EXPR as $x | body`
 used to decode the bound node whether or not `$x` was read, which on a well-formed 36 MB
@@ -9906,15 +9944,15 @@ entry (no thread-locals), so a bare whole-node read under an iteration keeps the
 as it did before.
 
 The rule a caller can apply is therefore "an array holds a value beside another value without
-reading it, and a bind names a subtree without reading it; an object or an array inside an array
-decodes it". It is a recorded
+reading it, an object holds its nodes without reading them, and a bind names a subtree without
+reading it; a construction held inside another decodes it". It is a recorded
 divergence from #2692's "validated when, and only when, something reads it", not a claim of
 conformance to it, and it is accepted rather than fixed by ADR-0018's decision order: jq 1.7.1
 rejects every such document at parse time, so there is no reference answer to match. #3427
 accepted the whole split on implementation cost; #3856 measured it on well-formed input, where
 the eager shapes cost 4-6x the time and memory of their lazy twins (`. as $root | ...`, `[.users,
-1] | length`, `{a: .users}` over a 36 MB document), so the order then prefers the lazy one. The
-objects are the remaining phase of #3856. Every affected input is one the index could
+1] | length`, `{a: .users}` over a 36 MB document), so the order then prefers the lazy one
+(objects: #4044). Every affected input is one the index could
 not read, a document jq rejects outright, and every affected answer is a decode failure, never a
 wrong value.
 
@@ -9938,7 +9976,7 @@ narrowing:
   ([#3850](https://github.com/rust-works/succinctly/issues/3850): they walk with cursors and an
   explicit stack instead of materializing the document); the forms that materialize the whole
   document first (a descent inside a larger path expression such as `path(.. | .a?)`, a bare
-  `path(..)` over a computed value rather than the input document (`map(.) | path(..)`, `{a: .} | .a | path(..)`),
+  `path(..)` over a computed value rather than the input document (`map(.) | path(..)`, `{a: 1} | path(..)`),
   `path(recurse(f; c))`, `paths(f)`, `path(getpath(p))`, among others) stop at 256, the
   materializers' ceiling, chosen for native-stack safety. Past the ceiling they return
   `nesting depth exceeds limit of 384` (or `256`) as a `QueryResult::Error`, tagged as a decode

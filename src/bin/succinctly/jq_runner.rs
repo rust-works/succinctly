@@ -7192,9 +7192,9 @@ fn evaluate_input_streaming(
 /// the variants a *single* sink item can be.
 ///
 /// That is a strictly smaller set than `GenericResult`'s: a sink item is
-/// always a `GenericItem`, and `generic_item_to_result` maps its six variants
-/// onto `One`/`OneCursor`/`Owned`/`LazyKeys`/`LazyIndexRange`/`LazySeq` and
-/// nothing else. The remaining eight -- `None`, `Error`, `Break`, `Halt`, and
+/// always a `GenericItem`, and `generic_item_to_result` maps its variants
+/// onto `One`/`OneCursor`/`Owned`/`LazyKeys`/`LazyIndexRange`/`LazySeq`/
+/// `LazyObject` and nothing else. The remaining eight -- `None`, `Error`, `Break`, `Halt`, and
 /// the four multi-value shapes -- are therefore unreachable *by
 /// construction*, not merely unlikely, so they share one arm rather than
 /// eight speculative ones that could never run (an earlier draft spelled all
@@ -7270,6 +7270,11 @@ fn materialize_stream_item<V: succinctly::jq::document::DocumentValue>(
                 None
             }
         },
+        GenericResult::LazyObject(obj) => sink.materialize(
+            DiagStyle::Jq,
+            obj.materialize_atomic::<JqSemantics>(),
+            &at.resolve(),
+        ),
         // The eight shapes a sink item provably never takes (see this
         // function's doc comment). `None` rather than `unreachable!()` so a
         // future regression cannot take the process down -- but it would drop
@@ -7854,6 +7859,32 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
                     vec![]
                 }
             }
+        }
+        // #4044: an object holding document nodes prints each one from the
+        // source, validated up front like a `LazySeq` element, so a node that
+        // fails to decode keeps stdout empty (all-or-nothing, as `jq` builds
+        // the object before printing any of it).
+        GenericResult::LazyObject(obj) => {
+            let entries = obj.into_entries();
+            let mut map: IndexMap<String, JqValue<'_, W>> = IndexMap::with_capacity(entries.len());
+            for (key, elem) in entries {
+                let value = match elem {
+                    LazyElem::Cursor(c) => {
+                        validate_lazy_seq_cursor(&c).map(|()| JqValue::Cursor(c))
+                    }
+                    LazyElem::Owned(v) => JqValue::try_from_owned(v),
+                };
+                match value {
+                    Ok(value) => {
+                        map.insert(key, value);
+                    }
+                    Err(e) => {
+                        sink.report(DiagStyle::Jq, &e, at);
+                        return vec![];
+                    }
+                }
+            }
+            vec![OutputItem::Lazy(JqValue::Object(map.into()))]
         }
         GenericResult::None => vec![],
         GenericResult::Error(e) => {
