@@ -4256,7 +4256,8 @@ ruled out), even though real yq supports every one of them:
   Two go-yaml folded-writer quirks are reproduced rather than fixed, so a folded value does
   not always read back identically in yq either: a kept (`>+`) trailing run gains one empty
   line, and a more-indented line (`x\n y`) gets an empty line before it. Divergences that
-  remain for `tagged`: `1_000` is a string here where yq types it `!!int`; `2024-01-01` is `!!str` where yq has `!!timestamp` (no timestamp type); an explicit source
+  remain for `tagged`: `1_000` is a string here where yq types it `!!int`;
+  `2024-01-01` is `!!str` where yq has `!!timestamp` (no timestamp type); an explicit source
   tag is not kept (`a: !!float 1` prints `!!int 1`, [#1416](https://github.com/rust-works/succinctly/issues/1416));
   `~` prints `null`; and a style is applied to the node's *final* value (the known
   no-read-after-write gap), so `.a style = "tagged" | .a = 3.5` prints `!!float 3.5` where yq
@@ -4369,10 +4370,15 @@ its text (`numeric_display_string`, so `==` and `tostring` agree about a compute
   value prints, and is printed only while it still resolves to the node's value, so a node a
   write replaces takes the new value's text (`b: 0xff` written `5` is `5`). Checked against
   yq v4.53.3 on ~3,000 random documents plus a sweep of 2,178 real YAML files. It does not
-  touch #2802's *read* side (`tostring`, `==`, keys), listed below. Not matched: arithmetic
-  on a hex or octal integer keeps its base in yq (`0xff + 1` is `0x100`, #3027); writing a
-  value identical to the node's own over its spelling (`.a = null` over `NULL`) keeps the
-  spelling where yq writes the new text; a node a write copies from elsewhere carries none.
+  touch #2802's *read* side (`tostring`, `==`, keys), listed below. A closed literal written
+  over a node (`.a = true` over `True`) brings its own text, as in yq; `style = "double"` and
+  `"single"` quote the spelling (`"~"`, `"0x1F"`). Not matched:
+  - arithmetic on a hex or octal integer keeps its base in yq (`0xff + 1` is `0x100`, #3027);
+  - the spelling belongs to the *position*, not the node, so equal-valued scalars that a write
+    moves (`[~, Null] | reverse`) swap spellings, where yq carries each node's own;
+  - a node a write copies from elsewhere (`.b = .a`) carries none, and a bare document scalar
+    (`--- 0x1F`) loses its spelling;
+  - an empty value inside a flow collection (`{x: , y: 1}`) prints `null` where yq prints `''`.
 - **Spellings `OwnedValue` cannot keep** ([#2802](https://github.com/rust-works/succinctly/issues/2802)):
   `True == "true"` and `!!bool "yes" == true` are `true` here (yq `false`, its text is
   `True`/`yes`), `"~" == null` is `true` here (yq `false`), and a leading-zero, hex or

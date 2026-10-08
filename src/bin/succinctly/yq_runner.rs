@@ -2736,6 +2736,11 @@ fn reconcile_presentation_at_depth(
         _ => CommentTree::Leaf(written_scalar_meta(
             pristine_tree.meta(),
             !same_scalar(pristine_value, result_value),
+            // A closed literal written right here (`.a = true`) brings its own text,
+            // even when the value is the one the node already had (#3028).
+            targets
+                .iter()
+                .any(|(steps, kind, fresh)| steps.is_empty() && *kind == WriteKind::Set && *fresh),
             pristine_value,
             result_value,
         )),
@@ -2749,11 +2754,16 @@ fn reconcile_presentation_at_depth(
 fn written_scalar_meta(
     meta: &NodeMeta,
     changed: bool,
+    rewritten_by_literal: bool,
     before: &OwnedValue,
     now: &OwnedValue,
 ) -> NodeMeta {
     if !changed {
-        return meta.clone();
+        return if rewritten_by_literal {
+            meta.with_spelling(None)
+        } else {
+            meta.clone()
+        };
     }
     let now_core = core_tag_of(now);
     // The quoting stays while the node's type stays: a string; a value of the type its
@@ -3876,7 +3886,14 @@ fn apply_meta_assign_writes(
             }
             MetaEffect::Style(style) => {
                 if matches!(*style, "double" | "single" | "literal" | "folded") {
-                    if let Some(plain) = plain_scalar_text(node_value) {
+                    // The text the node was written with (`~`, `0x1F`, `True`, #3028), else
+                    // the value's own spelling.
+                    let spelled = node
+                        .meta()
+                        .spelling()
+                        .filter(|spelling| spelling_names_value(spelling, node_value))
+                        .map(str::to_string);
+                    if let Some(plain) = spelled.or_else(|| plain_scalar_text(node_value)) {
                         *node_value = OwnedValue::String(plain.into());
                     }
                 }

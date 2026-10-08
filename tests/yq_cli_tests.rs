@@ -45844,6 +45844,108 @@ fn test_yq_inplace_keeps_explicit_tags_4078() -> Result<()> {
 fn test_yq_dom_write_keeps_scalar_spellings_3028() -> Result<()> {
     let cases: &[(&str, &str, &[&str], &str)] = &[
         (
+            r"a: NULL
+",
+            r".a = null",
+            &[],
+            r"a: null
+",
+        ),
+        (
+            r"a: ~
+",
+            r".a = null",
+            &[],
+            r"a: null
+",
+        ),
+        (
+            r"a: True
+",
+            r".a = true",
+            &[],
+            r"a: true
+",
+        ),
+        (
+            r"a: +1
+b: 2
+",
+            r".a = 1",
+            &[],
+            r"a: 1
+b: 2
+",
+        ),
+        (
+            r"a: .NaN
+b: .Inf
+c: +.inf
+d: -.INF
+",
+            r".z = 1",
+            &[],
+            r"a: .NaN
+b: .Inf
+c: +.inf
+d: -.INF
+z: 1
+",
+        ),
+        (
+            r"a: ~
+",
+            r#".a style = "double""#,
+            &[],
+            r#"a: "~"
+"#,
+        ),
+        (
+            r"a: 0x1F
+",
+            r#".a style = "double""#,
+            &[],
+            r#"a: "0x1F"
+"#,
+        ),
+        (
+            r"a: True
+",
+            r#".a style = "literal""#,
+            &[],
+            r"a: |-
+  True
+",
+        ),
+        (
+            r"a:
+b: 1
+",
+            r#".a style = "double""#,
+            &[],
+            r#"a: ""
+b: 1
+"#,
+        ),
+        (
+            r"a:
+b: 1
+",
+            r#".a style = "single""#,
+            &[],
+            r"a: ''
+b: 1
+",
+        ),
+        (
+            r"a: True
+",
+            r".a = .a",
+            &[],
+            r"a: True
+",
+        ),
+        (
             r"a: 1
 b: 0xff
 c: 017

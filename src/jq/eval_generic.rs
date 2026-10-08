@@ -2960,17 +2960,40 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
 /// Only a plain scalar has one worth keeping (a quoted one is a string, which already
 /// travels verbatim), and only a value that resolved to null, a bool or a number.
 fn source_spelling<C: DocumentCursor>(cursor: &C, value: &OwnedValue) -> Option<String> {
-    let canonical: alloc::borrow::Cow<'_, str> = match value {
-        OwnedValue::Null => "null".into(),
-        OwnedValue::Bool(true) => "true".into(),
-        OwnedValue::Bool(false) => "false".into(),
-        OwnedValue::Int(n) => n.to_string().into(),
-        OwnedValue::NumberLiteral(_, literal) => alloc::borrow::Cow::Borrowed(&**literal),
-        OwnedValue::Float(f) if f.is_finite() => crate::yaml::format_float_yq_yaml(*f).into(),
-        _ => return None,
-    };
+    // The cheap, allocation-free answers first: the overwhelmingly common scalar is
+    // spelled the canonical way, and most of them are decided by one comparison.
+    if !matches!(
+        value,
+        OwnedValue::Null
+            | OwnedValue::Bool(_)
+            | OwnedValue::Int(_)
+            | OwnedValue::NumberLiteral(..)
+            | OwnedValue::Float(_)
+    ) {
+        return None;
+    }
     let source = cursor.plain_scalar_source()?;
-    (source != canonical).then(|| source.into_owned())
+    let canonical = match value {
+        OwnedValue::Null => source == "null",
+        OwnedValue::Bool(b) => source == if *b { "true" } else { "false" },
+        OwnedValue::Int(n) => {
+            // A plain decimal with no sign or leading zero reads back as itself.
+            let digits = source.strip_prefix('-').unwrap_or(&source);
+            !digits.is_empty()
+                && digits.bytes().all(|b| b.is_ascii_digit())
+                && (digits.len() == 1 || !digits.starts_with('0'))
+                && source != "-0"
+                && source.parse::<i64>() == Ok(*n)
+        }
+        OwnedValue::NumberLiteral(_, literal) => source == **literal,
+        OwnedValue::Float(f) if f.is_nan() => source == ".nan",
+        OwnedValue::Float(f) if f.is_infinite() => {
+            source == if *f > 0.0 { ".inf" } else { "-.inf" }
+        }
+        OwnedValue::Float(f) => source == crate::yaml::format_float_yq_yaml(*f),
+        _ => true,
+    };
+    (!canonical).then(|| source.into_owned())
 }
 
 /// Materialize a key/slice-bound candidate just enough to classify it.
