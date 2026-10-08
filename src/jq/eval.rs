@@ -45118,6 +45118,18 @@ fn entry_marker_shape(expr: &Expr) -> EntryMarkers {
                 shape
             }
         }
+        // #4059: stages that cannot have moved the register ahead of the last one leave it where
+        // it entered, so the last stage's statements are read as they would be alone
+        // (`1 | (not, ($v|.b?))`, whose comma states the register per sibling). A head that may
+        // navigate keeps the pipe as opaque as it was.
+        Expr::Pipe(stages)
+            if stages.len() > 1
+                && stages[..stages.len() - 1]
+                    .iter()
+                    .all(neutral_leaves_register) =>
+        {
+            entry_marker_shape(&stages[stages.len() - 1])
+        }
         other if any_subexpr(other, &mut is_entry_marker_producer) => EntryMarkers::Opaque,
         _ => EntryMarkers::None,
     }
@@ -45875,6 +45887,10 @@ impl FoldRegister {
             // corruption, and `advance` is not generic over the mode.
             let at_entry = S::TAG == EvalTag::Jq
                 && !branch.trackable
+                // #4059: a branch that navigated before it computed (`$v|.b?|tostring`) states the
+                // register where it moved to, and a `null`/`true`/`false` there equals the fold's
+                // own by value: only a branch that navigated nowhere can be at the entry.
+                && branch.path.depth() == 0
                 && matches!(
                     branch.register,
                     BranchRegister::AtEntry | BranchRegister::Unmoved(_)
@@ -134406,6 +134422,30 @@ mod neutral_leaves_register_tests_4028 {
             let want = parse(distributed).unwrap();
             let got = distribute_neutral_tail(&expr).unwrap_or_else(|| panic!("`{src}` rewrites"));
             assert_eq!(without_parens(&got), without_parens(&want), "`{src}`");
+        }
+    }
+
+    // #4059: a pipe reads its last stage's register statements when every stage ahead of it
+    // is neutral, and stays as opaque as it was behind one that may navigate.
+    #[test]
+    fn a_pipe_reads_its_last_stage_behind_neutral_heads() {
+        for (src, forwarded) in [
+            ("1 | (now, floor)", true),
+            ("now | (now, floor)", true),
+            ("1 | 2 | (now, floor)", true),
+            ("1 | ((now, floor) // 5)", true),
+            // A head that may navigate, or a last stage with nothing to state.
+            (".a | (now, floor)", false),
+            ("1 | .a | (now, floor)", false),
+            ("1 | (.a, .b)", false),
+            ("1 | .a", false),
+        ] {
+            let expr = parse(src).unwrap();
+            assert_eq!(
+                matches!(entry_marker_shape(&expr), EntryMarkers::Forwarded),
+                forwarded,
+                "entry_marker_shape({src})"
+            );
         }
     }
 

@@ -2898,7 +2898,17 @@ is the revert that established what the other one costs.
    `neutral_leaves_register` (only an `if`'s condition is a subexp, a collect backtracks, and a
    handler runs after the fork restored the register). What still skips the write silently,
    where jq writes, is a navigating element inside an array (`[$v|.b?]`, which jq backtracks) and
-   the builtins of the exclusion list above as a bare UPDATE. A boolean register
+   the builtins of the exclusion list above as a bare UPDATE. A pipe whose last stage is a comma
+   with a navigating sibling, behind stages that cannot move the register (`1 | (not, ($v|.b?))`,
+   `length | (floor, ($v|.b?))`), is read like the comma alone
+   ([#4059](https://github.com/rust-works/succinctly/issues/4059), pinned by
+   `test_foreach_update_pipe_into_a_comma_with_a_navigating_sibling_keeps_the_register_4059`):
+   its first sibling's path was dropped and, over a `null` source, the surviving path was written
+   through where jq raises. A sibling that navigates and then computes (`$v|.b?|tostring`)
+   leaves jq's register on what it navigated to; that is no longer read as the fold's own register
+   when the two values are equal (`null`, `true`, `false`), but the register it did move to is not
+   modelled, so the path jq names for it is dropped (characterized by
+   `test_foreach_update_navigated_then_computed_sibling_characterize_4059`). A boolean register
    still refuses for a bool-returning builtin next to a navigating comma sibling (`contains(true)`,
    `isnan`), because jq reads an equal boolean result as the register itself and the model does not
    carry that there; with no navigating sibling the carried register is compared with the result,
