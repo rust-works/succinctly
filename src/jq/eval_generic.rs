@@ -7144,7 +7144,8 @@ mod embed_table {
     }
 
     /// How many lazy entries hold a value.
-    #[cfg(test)]
+    // The test that reads it is off in the `unshared-containers` holdout.
+    #[cfg(all(test, not(feature = "unshared-containers")))]
     pub(crate) fn lazy_filled() -> usize {
         LAZY.with(|l| l.borrow().iter().filter(|e| e.value.is_some()).count())
     }
