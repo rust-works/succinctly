@@ -2832,8 +2832,8 @@ is the revert that established what the other one costs.
    `{"a":[{"b":1}],"x":{"a":9,"b":2}}` in jq and here (the register used to be withheld, the pipe
    sibling's `$w` refused inside the `try` and the write was silently skipped; pinned by
    `test_foreach_update_try_comma_with_a_navigating_sibling_keeps_the_register_3932`). A sibling the
-   register analysis cannot read (`now`, `input_line_number`, a computed key `.a[.b]`) still withholds it, so the body
-   refuses loudly where jq answers ([#3960](https://github.com/rust-works/succinctly/issues/3960)). A `select(f)`
+   register analysis cannot read (a computed key `.a[.b]`) still withholds it, so the body
+   refuses loudly where jq answers. A `select(f)`
    sibling is read whatever its condition navigates ([#3974](https://github.com/rust-works/succinctly/issues/3974)):
    it hands `.` through at the register the comma entered on and runs `f` as a subexp, so
    `del(foreach .x as $w (.; try (($w|.c), select(.a)); .))` raises `Invalid path expression` as jq does instead of
@@ -2851,9 +2851,16 @@ is the revert that established what the other one costs.
    ([#3959](https://github.com/rust-works/succinctly/issues/3959)): it is judged by leaving the register where it
    entered, not by the untracked `.` inside it, so `del(foreach .a as $v (.; (($v | .b?), (.|length)); try ($v | .b?)))`
    deletes as in jq (pinned by `test_foreach_update_comma_with_a_non_navigating_pipe_sibling_keeps_the_register_3959`).
-   A register-neutral builtin it does not list (`now`, `input_line_number`) still refuses loudly
-   ([#3960](https://github.com/rust-works/succinctly/issues/3960)), where jq writes; characterized by
-   `test_foreach_update_comma_sibling_residuals_characterize_3960`.
+   A bare builtin that navigates nothing and returns a value it computed (`now`, `input_line_number`,
+   the math and date builtins, `explode`, `implode`, `sort`, and the string predicates with literal
+   arguments) is one too ([#3960](https://github.com/rust-works/succinctly/issues/3960)): the comma reads
+   it as a sibling of its own, not through the shared register analysis, whose wider readers (pipe
+   stages, binds) have holes a larger set would route programs into (pinned by
+   `test_foreach_update_comma_with_a_bare_builtin_sibling_3960`). A builtin that can hand its input
+   back by pointer (`abs`, `ltrimstr`, `rtrimstr`, `min`, `max`), the `ascii_downcase`/`ascii_upcase`
+   pair (`explode | map(..) | implode` in jq, so a path error on a derived input, #2743) and a
+   builtin with a non-literal argument still refuse loudly, where jq writes; characterized by
+   `test_foreach_update_comma_bare_builtin_exclusions_characterize_3960`.
    Marking a withheld register lost (#3267) would make it refuse loudly, but also
    turns rows that match jq today into refusals, where jq's own `try` catches a real error
    (`(foreach .a as $w (0; try (($w \| .c \| .z), $w.b); .)) = 9` writes nothing in either).

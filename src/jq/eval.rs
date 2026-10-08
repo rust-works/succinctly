@@ -38371,7 +38371,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                     snapshot,
                     frame,
                     keep,
-                    &mut |branch| sink(carry_frame_register(e, branch, frame)),
+                    &mut |branch| sink(carry_comma_sibling_register(e, branch, frame)),
                 ) {
                     ResolveFlow::Exhausted => {}
                     other => return other,
@@ -40230,18 +40230,126 @@ fn resolve_alternative_per_left_output_sink<'a, S: EvalSemantics>(
 /// fold, so `operand` is walked only for a branch that could use the answer.
 fn carry_frame_register<'a>(
     operand: &Expr,
-    mut branch: PathBranch<'a>,
+    branch: PathBranch<'a>,
     frame: &Frame,
 ) -> PathBranch<'a> {
+    carry_register_when(branch, frame, || operand_leaves_register(operand))
+}
+
+/// [`carry_frame_register`] for one sibling of a comma (#3960): also a bare builtin that
+/// navigates nothing ([`is_bare_register_neutral_builtin`]). Only a comma sibling is asked
+/// this, never an alternate's operand or a pipe stage, because the register statement it makes
+/// is read by the fold's EXTRACT and the wider readers of `cannot_move_register` have holes of
+/// their own that a larger set would route programs into.
+fn carry_comma_sibling_register<'a>(
+    operand: &Expr,
+    branch: PathBranch<'a>,
+    frame: &Frame,
+) -> PathBranch<'a> {
+    carry_register_when(branch, frame, || {
+        operand_leaves_register(operand) || is_bare_register_neutral_builtin(operand)
+    })
+}
+
+/// The shared body of the two: state `frame`'s register on a by-value `branch` that says
+/// nothing, when `leaves` (asked last, so the walk is paid only for a branch that could use it)
+/// holds.
+fn carry_register_when<'a>(
+    mut branch: PathBranch<'a>,
+    frame: &Frame,
+    leaves: impl FnOnce() -> bool,
+) -> PathBranch<'a> {
     if !branch.trackable && matches!(branch.register, BranchRegister::None) {
-        if let Some(register) = frame
-            .register()
-            .filter(|_| operand_leaves_register(operand))
-        {
+        if let Some(register) = frame.register().filter(|_| leaves()) {
             branch.register = BranchRegister::Unmoved(Cow::Owned(register.clone()));
         }
     }
     branch
+}
+
+/// A bare builtin that navigates nothing and returns a value it computed, so a comma sibling
+/// holding it leaves jq's register where the comma entered it (#3960): the C-coded math and
+/// date builtins, `now`, `input_line_number`, `explode`/`implode`, `sort`, and the string
+/// predicates with literal arguments. Captured from jq 1.7.1 in the shape `del(foreach .a as $v
+/// (INIT; (($v | .b?), B); try ($v | .b?)))` over five INITs
+/// (`test_foreach_update_comma_with_a_bare_builtin_sibling_3960`).
+///
+/// Deliberately narrower than "navigates nothing", each exclusion measured:
+/// - Arguments must be literals. A `.` in an argument makes the sibling opaque to
+///   [`entry_marker_shape`] (the #3959 route), a generator makes the builtin yield several
+///   outputs the fold's `Keep::First` truncates, and a navigating one is a navigation.
+/// - Bare only, never under `first`/`last`/`//`: those wrappers state the register on a different
+///   path than [`carry_comma_sibling_register`] reads.
+/// - Nothing that can hand its input or an element of it back by pointer, which the model cannot
+///   represent (a `try` then swallows the refusal into a skipped write): `abs`, `ltrimstr`,
+///   `rtrimstr`, `min`, `max`, `get_search_list`, `builtins`, `input_filename`.
+/// - Nothing that raises a path error on a derived input: `ascii_downcase`, `ascii_upcase` are
+///   `explode | map(..) | implode` in jq (#2743).
+/// - Nothing jq 1.7.1 does not define (`trim`, `ltrim`, `rtrim`, `toboolean`).
+///
+/// This is not part of [`cannot_move_register`]: that predicate is read by pipe stages and binds
+/// too, and widening it let a `reduce`/`foreach` that mentions a frozen `$x` accept what jq
+/// refuses, after any of these stages.
+fn is_bare_register_neutral_builtin(expr: &Expr) -> bool {
+    let literal = |e: &Expr| matches!(e, Expr::Literal(_));
+    // `(now)` is `now`: a comma written `(A), (B)` holds parenthesised siblings.
+    match unwrap_paren(expr) {
+        Expr::Builtin(builtin) => match builtin {
+            Builtin::Floor
+            | Builtin::Ceil
+            | Builtin::Round
+            | Builtin::Sqrt
+            | Builtin::Fabs
+            | Builtin::Trunc
+            | Builtin::Log
+            | Builtin::Log10
+            | Builtin::Log2
+            | Builtin::Exp
+            | Builtin::Exp10
+            | Builtin::Exp2
+            | Builtin::Sin
+            | Builtin::Cos
+            | Builtin::Tan
+            | Builtin::Asin
+            | Builtin::Acos
+            | Builtin::Atan
+            | Builtin::Sinh
+            | Builtin::Cosh
+            | Builtin::Tanh
+            | Builtin::Asinh
+            | Builtin::Acosh
+            | Builtin::Atanh
+            | Builtin::Libm1(_)
+            | Builtin::Infinite
+            | Builtin::Nan
+            | Builtin::IsInfinite
+            | Builtin::IsNan
+            | Builtin::IsNormal
+            | Builtin::Now
+            | Builtin::InputLineNumber
+            | Builtin::Gmtime
+            | Builtin::Localtime
+            | Builtin::Mktime
+            | Builtin::Todate
+            | Builtin::Fromdate
+            | Builtin::Todateiso8601
+            | Builtin::Fromdateiso8601
+            | Builtin::Explode
+            | Builtin::Implode
+            | Builtin::Sort => true,
+            Builtin::Pow(a, b) | Builtin::Atan2(a, b) | Builtin::Libm2(_, a, b) => {
+                literal(a) && literal(b)
+            }
+            Builtin::Libm3(_, a, b, c) => literal(a) && literal(b) && literal(c),
+            Builtin::Startswith(a)
+            | Builtin::Endswith(a)
+            | Builtin::Contains(a)
+            | Builtin::Inside(a)
+            | Builtin::Split(a) => literal(a),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// Whether `operand`, run from jq's register, leaves it where it entered (#3906):
@@ -44521,9 +44629,15 @@ fn entry_marker_shape(expr: &Expr) -> EntryMarkers {
             // register-less and a `try` swallowed the refusal. This reads it for every stage that
             // asks, so a comma after a destructuring bind outside a fold is read too.
             //
-            // Only a sibling `operand_leaves_register` recognises counts, and a sibling it does
-            // not (`now`, `input_line_number`) still refuses (#3960).
-            if shape == EntryMarkers::None && items.iter().any(operand_leaves_register) {
+            // Only a sibling `operand_leaves_register` recognises (or a bare register-neutral
+            // builtin, #3960: `now`, `input_line_number`) counts, and an opaque sibling (a pipe
+            // with a `.` in it) keeps the whole comma opaque: `(.|length)` and `(2|.+1)` still
+            // skip the write (#3959).
+            if shape == EntryMarkers::None
+                && items.iter().any(|item| {
+                    operand_leaves_register(item) || is_bare_register_neutral_builtin(item)
+                })
+            {
                 EntryMarkers::Forwarded
             } else {
                 shape
@@ -44589,15 +44703,22 @@ fn entry_marker_shape(expr: &Expr) -> EntryMarkers {
 /// (`.b`, `.a?`, `first(.a)`, `.[]?`) counts as one too (#3932): it resolves against the
 /// accumulator and raises where jq raises, so a `try` around the comma catches it as
 /// jq's own does, and withholding the register for it only made the pipe sibling's `$w`
-/// refuse inside that `try` and the write vanish. The split that remains is a sibling the
-/// analysis cannot read at all (`now`, `input_line_number`, a computed key), where the
-/// register stays withheld and the body refuses loudly although jq answers (#3960);
+/// refuse inside that `try` and the write vanish. A bare builtin that navigates nothing
+/// (`now`, `input_line_number`, `floor`; [`is_bare_register_neutral_builtin`], #3960) counts
+/// too. The split that remains is a sibling the analysis cannot read at all (a computed key,
+/// `abs`), where the register stays withheld and the body refuses loudly although jq answers;
 /// #3145's `($v[0]?, $v)` is two pipe siblings, `$v[0]?` being `$v | .[0]?`.
 fn fans_out(expr: &Expr) -> bool {
     use crate::jq::walk::{search_subexpr, Visit};
     search_subexpr(expr, &mut |e| match e {
         Expr::Pipe(_) => Visit::Skip,
-        Expr::Comma(items) if items.iter().all(sibling_sees_register_uniformly) => Visit::Descend,
+        Expr::Comma(items)
+            if items.iter().all(|item| {
+                sibling_sees_register_uniformly(item) || is_bare_register_neutral_builtin(item)
+            }) =>
+        {
+            Visit::Descend
+        }
         Expr::Comma(_)
         | Expr::AsPattern { .. }
         | Expr::Reduce { .. }
@@ -44615,8 +44736,10 @@ fn fans_out(expr: &Expr) -> bool {
 /// navigation (`.b`, `.a?`, `.[]?`; [`is_navigation_node`], #3932). A navigation
 /// resolves against the accumulator, not the register, and raises where jq raises,
 /// so a `try` around the comma catches it as jq's own does. A builtin the register
-/// analysis does not list (`now`, `input_line_number`) and a computed key (`.a[.b]`)
-/// are neither, so they keep the register withheld (#3960).
+/// analysis does not list (`abs`) and a computed key (`.a[.b]`) are neither, so they keep the
+/// register withheld. A bare register-neutral builtin (`now`, `input_line_number`) is read by
+/// [`is_bare_register_neutral_builtin`] where a comma asks (#3960), not here: this predicate's
+/// other readers have holes of their own that a larger set would route programs into.
 ///
 /// The wrappers that add no movement of their own recurse into their operand, so
 /// the answer follows jq's fork through `first(.a, .b)`, `(.a, .b)`, `(.b // 3)`
@@ -133285,10 +133408,15 @@ mod touched_edge_cases_2999 {
             ("try (($w | .a), first(.b))", false),
             ("try (($w | .a), .b)", false),
             ("try (($w | .a), .[]?)", false),
-            // A builtin the register analysis does not list is not one, nor is a call or a
-            // navigation that wraps something else, so the register stays withheld (#3960).
-            ("try (($w | .a), now)", true),
-            ("try (($w | .a), input_line_number)", true),
+            // A bare register-neutral builtin is read by the comma itself (#3960); one the
+            // register analysis does not list and that can hand its input back by pointer
+            // (`abs`) is not one, nor is a call or a navigation that wraps something else,
+            // so the register stays withheld.
+            ("try (($w | .a), now)", false),
+            ("try (($w | .a), input_line_number)", false),
+            ("try (($w | .a), floor)", false),
+            ("try (($w | .a), abs)", true),
+            ("try (($w | .a), pow(.; 2))", true),
             ("try (($w | .a), (.a | length))", false),
             ("try (($w | .a), .a[.b])", true),
             // The wrappers that add no movement recurse: a navigation one layer down counts.

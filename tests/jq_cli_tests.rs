@@ -71804,29 +71804,529 @@ fn test_foreach_update_comma_with_a_non_navigating_pipe_sibling_keeps_the_regist
     ])
 }
 
-/// #3941, characterization of what its fix leaves. A comma sibling that is a register-neutral
-/// builtin the allowlist lacks (#3960) refuses loudly. jq 1.7.1 writes in every row,
-/// `{"a":{"c":[1,2]},"z":0}` for `del`. Update the expectations when that is fixed. A bare
-/// sibling (`length`, `1+1`, `$v | length`) and a pipe of non-navigating stages (#3959) are
-/// fixed and not here.
+/// #3960: a comma sibling that is a bare builtin which navigates nothing and returns a value it
+/// computed leaves jq's register where the comma entered it, so the fold's EXTRACT (`try ($v |
+/// .b?)`) runs from `.a` after that sibling and a write through it lands. The register analysis
+/// did not list these builtins, the comma's statement was dropped, and the body refused loudly
+/// (`Invalid path expression near attempt to access element "b"`) where jq writes. The rows
+/// cover the C-coded math builtins, `now`, `input_line_number`, the date builtins, `explode`/
+/// `implode`/`sort` and the string predicates with literal arguments, each over an INIT that
+/// is a valid input for it and over `.`, for `del`, `=` and `path`. Every row captured from
+/// jq 1.7.1 with `-c`. A comma written `(A), (B)` holds parenthesised siblings, and `(now)` is
+/// `now`: the last rows spell it that way.
 #[test]
-fn test_foreach_update_comma_sibling_residuals_characterize_3960() -> Result<()> {
+fn test_foreach_update_comma_with_a_bare_builtin_sibling_3960() -> Result<()> {
     let doc = r#"{"a":{"b":1,"c":[1,2]},"z":0}"#;
-    let refusal = "Invalid path expression near attempt to access element \"b\"";
     assert_path_rows_3289(&[
-        // #3960, loud: jq `{"a":{"c":[1,2]},"z":0}`.
+        (
+            doc,
+            r"del(foreach .a as $v (0; (($v | .b?), input_line_number); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; (($v | .b?), input_line_number); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; (($v | .b?), input_line_number); try ($v | .b?)))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; (($v | .b?), now); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; (($v | .b?), now); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; (($v | .b?), now); try ($v | .b?)))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; (($v | .b?), floor); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; (($v | .b?), floor); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; (($v | .b?), floor); try ($v | .b?)))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; (($v | .b?), sqrt); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; (($v | .b?), sqrt); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; (($v | .b?), sqrt); try ($v | .b?)))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; (($v | .b?), infinite); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; (($v | .b?), infinite); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; (($v | .b?), infinite); try ($v | .b?)))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; (($v | .b?), pow(2;3)); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; (($v | .b?), pow(2;3)); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; (($v | .b?), pow(2;3)); try ($v | .b?)))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; (($v | .b?), gmtime); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; (($v | .b?), gmtime); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; (($v | .b?), gmtime); try ($v | .b?)))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (.; (($v | .b?), now); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (.; (($v | .b?), now); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (.; (($v | .b?), now); try ($v | .b?)))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
         (
             doc,
             r"del(foreach .a as $v (.; (($v | .b?), input_line_number); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (.; (($v | .b?), input_line_number); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (.; (($v | .b?), input_line_number); try ($v | .b?)))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v ([2000,0,1,0,0,0,0,0]; (($v | .b?), mktime); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v ([2000,0,1,0,0,0,0,0]; (($v | .b?), mktime); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v ([2000,0,1,0,0,0,0,0]; (($v | .b?), mktime); try ($v | .b?)))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r#"del(foreach .a as $v ("2000-01-01T00:00:00Z"; (($v | .b?), fromdate); try ($v | .b?)))"#,
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r#"(foreach .a as $v ("2000-01-01T00:00:00Z"; (($v | .b?), fromdate); try ($v | .b?))) = 9"#,
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r#"[path(foreach .a as $v ("2000-01-01T00:00:00Z"; (($v | .b?), fromdate); try ($v | .b?)))]"#,
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r#"del(foreach .a as $v ("abc"; (($v | .b?), explode); try ($v | .b?)))"#,
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r#"(foreach .a as $v ("abc"; (($v | .b?), explode); try ($v | .b?))) = 9"#,
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r#"[path(foreach .a as $v ("abc"; (($v | .b?), explode); try ($v | .b?)))]"#,
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v ([97,98]; (($v | .b?), implode); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v ([97,98]; (($v | .b?), implode); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v ([97,98]; (($v | .b?), implode); try ($v | .b?)))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v ([3,1,2]; (($v | .b?), sort); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v ([3,1,2]; (($v | .b?), sort); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v ([3,1,2]; (($v | .b?), sort); try ($v | .b?)))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r#"del(foreach .a as $v ("abc"; (($v | .b?), startswith("a")); try ($v | .b?)))"#,
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r#"(foreach .a as $v ("abc"; (($v | .b?), startswith("a")); try ($v | .b?))) = 9"#,
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r#"[path(foreach .a as $v ("abc"; (($v | .b?), startswith("a")); try ($v | .b?)))]"#,
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r#"del(foreach .a as $v ("a,b"; (($v | .b?), split(",")); try ($v | .b?)))"#,
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r#"(foreach .a as $v ("a,b"; (($v | .b?), split(",")); try ($v | .b?))) = 9"#,
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r#"[path(foreach .a as $v ("a,b"; (($v | .b?), split(",")); try ($v | .b?)))]"#,
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; (($v | .b?)), (now); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; (($v | .b?)), (now); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; (($v | .b?)), now; try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; (($v | .b?)), now; try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; now, (($v | .b?)); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; now, (($v | .b?)); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; (($v | .b?)), (input_line_number); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; (($v | .b?)), (input_line_number); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; (($v | .b?)), input_line_number; try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; (($v | .b?)), input_line_number; try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; input_line_number, (($v | .b?)); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; input_line_number, (($v | .b?)); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; (($v | .b?)), (floor); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; (($v | .b?)), (floor); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; (($v | .b?)), floor; try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; (($v | .b?)), floor; try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; floor, (($v | .b?)); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; floor, (($v | .b?)); try ($v | .b?))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+    ])
+}
+
+/// #3960, what the fix leaves. A sibling that can hand its input (or an element of it) back by
+/// pointer (`abs`, `ltrimstr`, `min`), one that is `explode | map(..) | implode` in jq so raises
+/// a path error on a derived input (`ascii_downcase?`, #2743), and a pipe of non-navigating stages
+/// (`(.|.)`) still refuse loudly, where jq writes. Update the expectations when those are fixed.
+/// Every row captured from jq 1.7.1 with `-c`: `del` writes `{"a":{"c":[1,2]},"z":0}` in all but
+/// `ascii_downcase?`, which leaves the document alone.
+#[test]
+fn test_foreach_update_comma_bare_builtin_exclusions_characterize_3960() -> Result<()> {
+    let doc = r#"{"a":{"b":1,"c":[1,2]},"z":0}"#;
+    let refusal = "Invalid path expression near attempt to access element \"b\"";
+    assert_path_rows_3289(&[
+        (
+            doc,
+            r"del(foreach .a as $v (0; (($v | .b?), abs); try ($v | .b?)))",
             "",
             refusal,
             5,
         ),
         (
             doc,
-            r"del(foreach .a as $v (.; (($v | .b?), now); try ($v | .b?)))",
+            r#"del(foreach .a as $v ("abc"; (($v | .b?), ltrimstr("x")); try ($v | .b?)))"#,
             "",
             refusal,
+            5,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v ([3,1]; (($v | .b?), min); try ($v | .b?)))",
+            "",
+            refusal,
+            5,
+        ),
+        (
+            doc,
+            r#"del(foreach .a as $v ("abc"; (($v | .b?), ascii_downcase?); try ($v | .b?)))"#,
+            "",
+            refusal,
+            5,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; (($v | .b?), (.|.)); try ($v | .b?)))",
+            "",
+            "Invalid path expression with result 0",
             5,
         ),
     ])
