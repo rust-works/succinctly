@@ -44934,6 +44934,27 @@ impl FoldRegister {
         (reg, acc)
     }
 
+    /// #3984: records that an *untracked* register is not jq's register, which is still
+    /// where the enclosing stage left it (`length` and a literal do not move it), for a fold
+    /// that mentions a frozen `$var`. That `$var` may be the register by pointer, so the
+    /// refusal of the first navigation of it in UPDATE/EXTRACT is the resolver's guess, not
+    /// jq's verdict; left `Kept`, it read as exact and a `try` around the fold swallowed it,
+    /// dropping the write jq makes. Recording the register lost makes it the loud guess of
+    /// #3267 (a refused value that is neither frozen nor `null`, or a step that could never
+    /// succeed, stays exact). Gated on the fold *mentioning* a marker, not on every untracked
+    /// register: a `null` accumulator is a register candidate once the register is lost, and
+    /// 31 of 39,210 sampled path-register rows lost a jq match that way (`foreach (1,2) as $i
+    /// (1; try .a; .)`). #3770 declined it for a fold whose register *is* tracked (a tracked
+    /// register keeps the frame as it was), which is why that arm is not touched.
+    fn withhold_untracked_register(&mut self) {
+        if !self.trackable {
+            self.frame = self
+                .frame
+                .with_register_loss(RegisterLoss::LostSomewhere)
+                .into_owned();
+        }
+    }
+
     /// A branch's provenance *relative to this register* — `(at_register,
     /// snapshot)`, exactly the pair [`FoldRegister::resolve`] needs for its
     /// own `at_register`/`snapshot` parameters (#1590).
@@ -49386,6 +49407,10 @@ fn resolve_reduce<'a, S: EvalSemantics>(
     let register_unmoved = S::TAG == EvalTag::Jq
         && trackable
         && reduce_leaves_register_in_place(patterns, input, init, update);
+    // #3984: jq mode only, like every register admission here. A syntactic property of the
+    // `reduce`, so answered once rather than per INIT fork.
+    let mentions_frozen_var = S::TAG == EvalTag::Jq
+        && (mentions_marker(input) || mentions_marker(init) || mentions_marker(update));
     let slice_ok = fold_slice_ok(patterns, input);
     // #3780: whether UPDATE navigates the accumulator on a path that always runs --
     // syntactic, so decided once, not per source element
@@ -49458,7 +49483,10 @@ fn resolve_reduce<'a, S: EvalSemantics>(
             fork_index += 1;
             i
         };
-        let (reg, acc) = FoldRegister::enter(init_branch, value, trackable, frame);
+        let (mut reg, acc) = FoldRegister::enter(init_branch, value, trackable, frame);
+        if mentions_frozen_var {
+            reg.withhold_untracked_register(); // #3984
+        }
 
         // #2031: SOURCE runs immediately after INIT against the same
         // shared register real jq threads through the whole construct.
@@ -49900,6 +49928,12 @@ fn resolve_foreach<'a, S: EvalSemantics>(
     let register_unmoved = S::TAG == EvalTag::Jq
         && trackable
         && foreach_cannot_move_register(patterns, input, init, update, extract);
+    // #3984: see `resolve_reduce`'s identical flag; EXTRACT counts too.
+    let mentions_frozen_var = S::TAG == EvalTag::Jq
+        && (mentions_marker(input)
+            || mentions_marker(init)
+            || mentions_marker(update)
+            || extract.is_some_and(mentions_marker));
     // #3580: everything but UPDATE leaves the register where the fold entered, so
     // an emission is at the entry exactly when the UPDATE output it came from was
     // (an `AtEntry`, or a handler's `Unmoved` of the fold's register). jq emits from
@@ -49965,7 +49999,10 @@ fn resolve_foreach<'a, S: EvalSemantics>(
             fork_index += 1;
             i
         };
-        let (reg, mut state) = FoldRegister::enter(init_branch, value, trackable, frame);
+        let (mut reg, mut state) = FoldRegister::enter(init_branch, value, trackable, frame);
+        if mentions_frozen_var {
+            reg.withhold_untracked_register(); // #3984
+        }
 
         // #2031/#2388: see `resolve_reduce`'s identical derivation —
         // SOURCE's own ambient value, trackability and snapshot mark are
@@ -128424,17 +128461,18 @@ mod tests {
                 assert!(is_resolver_refusal(&e), "{}", e.message);
             }
         );
-        // Unchanged: a fold whose INIT is untracked *after a literal stage*
-        // re-seeds its register from the ambient, so the marker is not
-        // recognised at all -- pre-existing (`literal-then-fold-untracked-
-        // init`, `carried-register-passthrough`), and with a generator
-        // source the `try` then swallows that refusal into a no-op write.
-        assert_eq!(
-            outputs(
-                br#"{"a":{"b":1}}"#,
-                r"del(.a as $y | .a | 5 | foreach range(1) as $i (0; .; try ($y | .b)))"
-            ),
-            [r#"{"a":{"b":1}}"#]
+        // A fold whose INIT is untracked *after a literal stage* re-seeds its
+        // register from the ambient, so the marker is not recognised at all --
+        // pre-existing (`literal-then-fold-untracked-init`,
+        // `carried-register-passthrough`). With a generator source the `try`
+        // used to swallow that refusal into a no-op write (`{"a":{"b":1}}`
+        // where jq writes `{"a":{}}`); #3984 makes the refusal loud instead,
+        // since a fold that mentions a frozen `$var` and has an untracked register records it lost.
+        query!(br#"{"a":{"b":1}}"#,
+            r"del(.a as $y | .a | 5 | foreach range(1) as $i (0; .; try ($y | .b)))",
+            QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                assert!(is_resolver_refusal(&e), "{}", e.message);
+            }
         );
     }
 
