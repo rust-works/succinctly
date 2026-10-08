@@ -2881,18 +2881,24 @@ is the revert that established what the other one costs.
    it as a sibling of its own, not through the shared register analysis, whose wider readers (pipe
    stages, binds) have holes a larger set would route programs into (pinned by
    `test_foreach_update_comma_with_a_bare_builtin_sibling_3960`). A builtin that can hand its input
-   back by pointer (`abs`, `ltrimstr`, `rtrimstr`, `min`, `max`), the `ascii_downcase`/`ascii_upcase`
+   back by pointer (`ltrimstr`, `rtrimstr`, `min`, `max`), the `ascii_downcase`/`ascii_upcase`
    pair (`explode | map(..) | implode` in jq, so a path error on a derived input, #2743) and a
    builtin with a non-literal argument still refuse loudly, where jq writes; characterized by
    `test_foreach_update_comma_bare_builtin_exclusions_characterize_3960`. The same builtins as a bare
    UPDATE, in a nested comma, in a pipe of them, or under `first`/`//`/`?`/`try` are read through the
    shapes that only fork or sequence them ([#4028](https://github.com/rust-works/succinctly/issues/4028),
-   pinned by `test_foreach_update_register_neutral_shapes_leave_the_register_4028`). What still skips
-   the write silently, where jq writes, is a pipe stage after a comma that has a navigating sibling
-   (`(($v|.b?), now) | floor`), a bare `abs`/`min`-class UPDATE (as a comma sibling it refuses
-   loudly, above), and a neutral builtin inside an `if`, an array or a `try ... catch` handler,
-   which are judged by the shared register analysis alone; characterized by
-   `test_foreach_update_register_neutral_shapes_exclusions_characterize_4028`. A boolean register
+   pinned by `test_foreach_update_register_neutral_shapes_leave_the_register_4028`). So are a pipe
+   stage after a comma that has a navigating sibling (`(($v|.b?), now) | floor`), a bare or
+   comma-sibling `abs`, and a neutral builtin inside an `if`, an array or a `try ... catch`
+   handler ([#4041](https://github.com/rust-works/succinctly/issues/4041), pinned by
+   `test_foreach_update_register_neutral_shapes_after_a_navigating_comma_4041`): the first by
+   pushing the neutral tail into the comma's siblings before UPDATE is resolved
+   (`distribute_neutral_tail`; `(A, B) | F` and `(A | F), (B | F)` run in the same order in jq,
+   and only the second states its register per sibling), the others as arms of
+   `neutral_leaves_register` (only an `if`'s condition is a subexp, a collect backtracks, and a
+   handler runs after the fork restored the register). What still skips the write silently,
+   where jq writes, is a navigating element inside an array (`[$v|.b?]`, which jq backtracks) and
+   the builtins of the exclusion list above as a bare UPDATE. A boolean register
    still refuses for a bool-returning builtin next to a navigating comma sibling (`contains(true)`,
    `isnan`), because jq reads an equal boolean result as the register itself and the model does not
    carry that there; with no navigating sibling the carried register is compared with the result,
