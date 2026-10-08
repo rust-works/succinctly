@@ -42420,7 +42420,12 @@ fn leaf_register<'a, S: EvalSemantics>(
 ) -> BranchRegister<'a> {
     if !trackable {
         BranchRegister::None
-    } else if leaves_register_in_place::<S>(expr) {
+    } else if leaves_register_in_place::<S>(expr)
+        // #4063: a bare builtin that navigates nothing leaves the register where it entered,
+        // as it does on an untracked entry ([`carry_comma_sibling_register`], #3960). The
+        // stage still takes the stricter of this and its own verdict.
+        || (S::TAG == EvalTag::Jq && is_bare_register_neutral_builtin(expr))
+    {
         BranchRegister::Unmoved(Cow::Borrowed(value))
     } else {
         lost_at::<S>(value)
@@ -45136,29 +45141,49 @@ fn entry_marker_shape(expr: &Expr) -> EntryMarkers {
                 shape
             }
         }
-        // #4059: stages that cannot have moved the register ahead of a last stage that forks leave
-        // it where it entered, so the last stage's statements are read as they would be alone
-        // (`1 | (not, ($v|.b?))`, whose comma states the register per sibling). Only a forking
-        // last stage: a leaf producer there (`1 | .`) keeps the pipe as opaque as it was, and so
-        // does a head that may navigate.
-        Expr::Pipe(stages)
-            if stages.len() > 1
-                && matches!(
-                    unwrap_paren(&stages[stages.len() - 1]),
-                    Expr::Comma(_)
-                        | Expr::Alternative(..)
-                        | Expr::If { .. }
-                        | Expr::Try { .. }
-                )
-                && stages[..stages.len() - 1]
-                    .iter()
-                    .all(neutral_leaves_register) =>
-        {
-            entry_marker_shape(&stages[stages.len() - 1])
+        // #4059: stages that cannot have moved the register ahead of the last one leave it where
+        // it entered, so the last stage's statements are read as they would be alone
+        // (`1 | (not, ($v|.b?))`, whose comma states the register per sibling; #4063:
+        // `. | .b?`, `(1, 2) | .`, whose last stage is a leaf). A head that may navigate keeps
+        // the pipe as opaque as it was.
+        Expr::Pipe(stages) if stages.len() > 1 && pipe_forwards_last_statement(stages) => {
+            entry_marker_pipe_shape(stages)
         }
         other if any_subexpr(other, &mut is_entry_marker_producer) => EntryMarkers::Opaque,
         _ => EntryMarkers::None,
     }
+}
+
+/// Whether a pipe's register statements are those of its last stage alone ([`entry_marker_shape`],
+/// #4059, #4063): the stages ahead of it cannot have moved the register, after dropping the
+/// trailing `.` stages that only forward the statement of the one before them.
+fn pipe_forwards_last_statement(stages: &[Expr]) -> bool {
+    let stages = pipe_without_trailing_identity(stages);
+    stages.len() == 1
+        || stages[..stages.len() - 1]
+            .iter()
+            .all(neutral_leaves_register)
+}
+
+/// [`entry_marker_shape`] of a pipe that [`pipe_forwards_last_statement`] holds for.
+fn entry_marker_pipe_shape(stages: &[Expr]) -> EntryMarkers {
+    let stages = pipe_without_trailing_identity(stages);
+    entry_marker_shape(&stages[stages.len() - 1])
+}
+
+/// `stages` without the `.` stages at its end (never emptying it): a stage that cannot move the
+/// register leaves the statement it received as it was (`(X) | .` states what `X` states). Not
+/// after a stage that is itself a seed producer (`.. | .`, `. | .`): a pipe re-seeds, and its
+/// inner stage reads that statement, not the one outside it.
+fn pipe_without_trailing_identity(stages: &[Expr]) -> &[Expr] {
+    let mut end = stages.len();
+    while end > 1 && matches!(unwrap_paren(&stages[end - 1]), Expr::Identity) {
+        end -= 1;
+    }
+    if end < stages.len() && is_entry_marker_producer(unwrap_paren(&stages[end - 1])) {
+        return stages;
+    }
+    &stages[..end]
 }
 
 /// Whether `expr` can split into sibling branches that would see the fold's
@@ -134555,13 +134580,40 @@ mod neutral_leaves_register_tests_4028 {
             ("1 | 2 | (now, floor)", true),
             ("1 | ((now, floor) // 5)", true),
             ("1 | if . then (now, floor) else 1 end", true),
-            // A head that may navigate, or a last stage with nothing to state or that is a leaf
-            // producer (its pipe stays opaque, as before).
+            // #4063: a leaf last stage is read as it would be alone, and a trailing `.` forwards
+            // the statement of the stage before it (`1` states none).
             ("1 | .", false),
+            ("(1, 2) | .", true),
+            // A head that may navigate keeps the pipe opaque.
             (".a | (now, floor)", false),
+            (".a | .", false),
             ("1 | .a | (now, floor)", false),
             ("1 | (.a, .b)", false),
             ("1 | .a", false),
+        ] {
+            let expr = parse(src).unwrap();
+            assert_eq!(
+                matches!(entry_marker_shape(&expr), EntryMarkers::Forwarded),
+                forwarded,
+                "entry_marker_shape({src})"
+            );
+        }
+    }
+
+    // #4063: a trailing `.` forwards the statement of the stage before it, so a pipe is read
+    // through what is left; a navigating head still keeps it opaque.
+    #[test]
+    fn a_trailing_identity_forwards_the_statement_of_the_stage_before_it() {
+        for (src, forwarded) in [
+            ("(1, 2) | .", true),
+            ("(now, .a) | .", true),
+            ("(now, .a) | . | .", true),
+            ("1 | (now, .a) | .", true),
+            (". | (now, .a)", true),
+            (". | .b?", false),
+            // A head that may navigate, ahead of anything but a trailing `.`.
+            (".a | (now, floor)", false),
+            ("(.a, .b) | .", false),
         ] {
             let expr = parse(src).unwrap();
             assert_eq!(
