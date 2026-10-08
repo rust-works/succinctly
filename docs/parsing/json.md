@@ -502,6 +502,30 @@ The per-element shape, `-c '.[]'` over the array files (each output element runs
 
 Apple M4 Pro, release, 10,000 lookups, min of 3, base `main` (`ce32db7ab`) vs this change: `$b[.]` 0.61 s -> 0.11 s (1,000 keys) and 3.46 s -> 0.09 s (10,000); `.big[$k]` 0.62 s -> 0.10 s and 3.60 s -> 0.09 s; 100,000 keys: 74.8 s -> 0.09 s. Instructions retired (min of 3, same box): `.big.k5000.v` -0.1%, `keys_unsorted` -0.1%, `to_entries` 0.0%, `.users[0].name` 0.0%, two lookups of one wide object -1.5%, three -11.1%; the two rows that do nothing but look up fields of small records, `.users[].name` and `[.users[] | select(.age > 20) | .email]`, read +0.3% to +1.4% across six builds of this source, and two builds that differ only in an `#[inline]` hint read +1.5% / +0.2% against +0.9% / +1.2% -- the layout band, not a cost that tracks the change. Wall-clock on those rows (interleaved, 41 runs, load average 16) read +1.2% / -3.5% (min) and +0.3% / +1.7% (median). The index costs about 32 bytes per key (3 MB at 100,000 keys). Not measured: x86_64.
 
+### Indexed Reads of a Wide Array (#4035)
+
+Reading an element of a document array (`.users[0]`, `.[5]`, `$root.nodes[.from]`) resolved the index through `DocumentElements::len_checked` first: the walk normalizes a negative index, raises yq's own out-of-range error, and is where the malformed-delimiter checks live (a missing or doubled `,`, a trailing stray one, #1677, #2261, #2594). That is free for one read and quadratic for a program that uses a document array as a lookup table, because every read walks the whole array again and then walks siblings to the element. `. as $r | .users[] | $r.users[0].id` took 73 s on the 7 MB `users` document.
+
+`src/jq/array_index.rs` adds a per-array `ElementIndex`: the node id of every element, built by the same walk `len_checked` makes with the same checks, so the length is the number of ids and element `k` is the node `ids[k]` names. **Every anomaly refuses the build** and the caller runs the walk, which raises what it always raised (and an array whose walk raises is never registered at all: only a walk that succeeded registers one). A walk of 64 or more elements registers the array, the second length lookup walks again and counts, and the **third** builds; an element read uses an existing index but never builds one. Building on the second made an array read exactly twice slower than the two walks it replaced (+4.7% / +8.7% on `.[] | [.[3], .[4]]` over 20,000 hundred-element arrays), because an index costs one walk plus the ids. The memo lives inside the same evaluation scope as `key_index`'s (a `document_token` is not a security boundary), keeps at most four indexes and 2^21 elements, remembers a refusal and an eviction, and does not exist under `no_std`. `length`, `last`, `keys`, `has`, `.[N]`, `.[$k]` and `getpath` read through it; the slice and the `path()` walks keep the walk.
+
+Release, `ab-cli.py` interleaved, output identity gated on every row, a control run per box in the same session (floor within -0.7%..+0.9% of 0), base `36f8582c0` vs the shipped commit:
+
+| row                                                       | 7950X (min)       | M4 Pro (min)      |
+|-----------------------------------------------------------|-------------------|-------------------|
+| `. as $r \| .users[] \| $r.users[0].id`, 0.7 MB          | 1,115 ms -> 22 ms | 852 ms -> 17 ms   |
+| the same, 2.8 MB                                          | 17.7 s -> 83 ms   | 13.5 s -> 57 ms   |
+| `[.[range(0;300)]] \| length`, one 1M-element array       | 4.28 s -> 71 ms   | 3.23 s -> 52 ms   |
+| `.[] \| [.[3], .[4], .[5], .[6]]`, 20,000 arrays of 100   | -13.4%            | -15.6%            |
+| `.[] \| [.[3], .[4]]` (read twice: the worst case)        | +3.3%             | -0.7%             |
+| `.users[100]`, `.users \| length`, `.users[-1]`, `last` (10 and 26 MB, read once) | +0.2%..+2.3% | -3.0%..-0.6% |
+| `.[100]`, `length`, `last`, `.[-1]` on one 1M-element array | +0.4%..+2.2%    | -5.0%..-2.5%      |
+
+Growth: 0.7 MB to 2.8 MB (4x the records) multiplies the base by 16x and the change by 3.7x. Instructions (7950X cachegrind `Ir`, M4 Pro `time -l` instructions retired, min of 3), base vs shipped: every single-read row is +0.00% to +0.29%, the twice-read row +1.45% / +1.68% (registering 20,000 arrays), `[.[] | length] | add` +0.74% / +0.98%, the four-read row -16.9% / -15.4%. Cache misses and branch mispredicts (cachegrind with `--cache-sim=yes --branch-sim=yes`, `.users | length`, 7 MB): identical to 0.01%.
+
+**The 7950X wall-clock on the single-read rows is placement, not cost, and moves with the build.** Three builds of near-identical source read +2.1%, +2.4% and +0.8% (median) on `.users | length`-shaped rows at the same `Ir`, while the M4 Pro reads -1.5% (median -1.4% to -1.6% on both builds); a holdout build of the same tree whose memo is behind `black_box(false)` read +0.15% beside a `new` at +2.4% in the same session. This is the function-placement band `docs/guides/benchmarking.md` § 9 describes; it is recorded rather than chased.
+
+Pinned by `array_index::tests` (the index agrees with the walk at every index and past the end, refuses what the walk raises on, builds on the third length lookup and never on an element read, never registers a small or malformed array, never answers a partly consumed list from the whole array's index) and `wide_document_array_reads_agree_with_jq_across_repeated_reads_4035`, whose rows are jq 1.7.1's.
+
 ---
 
 ## Optimisation Techniques Used
