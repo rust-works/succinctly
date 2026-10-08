@@ -1260,12 +1260,11 @@ is the revert that established what the other one costs.
      alternative (`del(. as [$q] ?// $q | ([map(.a)] and (.a)?) | .c)` on `[{"a":1}]` is the document
      unchanged in jq); the `.a` form refused the same way before #3865, the `getpath` form matched by
      accident because the collect was never checked.
-   - **The promoted builtins inside a compound stage** (`[sort]`, `limit(1; sort)`,
-     `(sort, add)`, `(flatten(1), reverse)`, `[join(",")]`, `if`/`try` around them) are read as
-     a loss: the stage is judged as a whole, and jq answers for each (the stage-level
-     downgrade and `array_contents_are_checked` promotions in
-     `docs/plan/jq-path-register-producer-contract.md`, section 10). Refuse-only, identical
-     before #3361 and #3711. Both rows are pinned
+   - **The promoted builtins inside a collect or a bounded consumer** (`[sort]`, `limit(1; sort)`,
+     `[join(",")]`) are read as a loss, and jq answers for each (the `array_contents_are_checked`
+     promotions in `docs/plan/jq-path-register-producer-contract.md`, section 10). Refuse-only,
+     identical before #3361 and #3711. A `,`/`//`/`if`/`try` of them (`(sort, add)`,
+     `(flatten(1), reverse)`) answers since #3644. The rows are pinned
      (`test_path_register_by_value_builtin_stages_do_not_move_it_3361`).
    - **A refusal inside a `?//` body is not retried** (`path_alternative_retries`), so
      `del(. as $x ?// $y \| if $x then (.a and .b) else .c end)` on `{"a":1,"c":2}` refuses
@@ -1396,14 +1395,12 @@ is the revert that established what the other one costs.
    [#3710](https://github.com/rust-works/succinctly/issues/3710) has it state its register, so
    `path(. as $x \| reduce (1) as $i (.; .a = $i) \| $x.k)` is `["k"]` in both tools.) Before #3186 these refused, and under `try` the refusal was caught as if it
    were jq's own: `del(. as $v \| {k: .a} \| try ($v \| .[]?))` echoed the document where jq
-   deletes every key. The register is also dropped **per stage, not per leaf**: a compound stage
-   that mixes a leaf that navigates with one that does not (`(.a // 1)`, an `if` or a
-   `try`/`catch` of that shape) loses it as a whole, so `path(. as $x \| (.a // 1) \| $x)` on
-   `{"a":null}` and `path(. as $x \| if true then 1 else first(.a) end \| $x)` on `{"a":1}`
-   refuse where jq answers `[]` (backtracking to the fork puts the register back for the
-   by-value leaf). Refuse-only, and pinned
-   (`test_path_register_compound_stage_is_refused_as_a_whole_3456`) so lifting the verdict to
-   the leaf is a deliberate change with rows of its own. The drain builtins are the same kind of
+   deletes every key. A compound stage that mixes a leaf that
+   navigates with one that does not (`(.a // 1)`, an `if` or a `try`/`catch` of that shape)
+   states the register **per branch** on a trackable entry since #3644, as jq does
+   (backtracking to the fork puts the register back for the by-value leaf), so
+   `path(. as $x \| (.a // 1) \| $x)` on `{"a":null}` is `[]`. Pinned
+   (`test_path_register_compound_stage_states_its_register_per_branch_3644`). The drain builtins are the same kind of
    case: jq backtracks `INDEX(s; f)`'s source, so `path(. as $x \| INDEX(.l[]; .) \| $x)` on
    `{"l":[1,2]}` is `[]` in jq, while here the register is lost at the drain and the later `$x`
    is refused -- and, since #3267, uncatchably.

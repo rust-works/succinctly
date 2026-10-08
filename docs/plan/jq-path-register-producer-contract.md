@@ -166,7 +166,7 @@ P7/P8 follow the same shape: `register_after`'s four-way decision becomes "read 
   promotion that needs its own rows, not part of making the producers truthful. So `place_step`
   applies `cannot_move_register(element)` to the register entering the step, in exactly one
   place, and takes the stricter of the producer's and the stage's answer
-  (`test_path_register_compound_stage_is_refused_as_a_whole_3456` pins the rows).
+  (`test_path_register_compound_stage_states_its_register_per_branch_3644` pins the rows; #3644 lifted the verdict to the leaf for `,`/`//`/`if`/`try` on a trackable entry).
   `StepRegisterFacts::stage_preserves_register` and `carry_register` are gone: `reestablishes_register`
   reads a register the stage has already vouched for.
 - *A carried register has no leaf producer.* `getpath_preserves_register` is `false` whenever the
@@ -571,9 +571,9 @@ Each turns a refusal into an answer and needs its own oracle rows:
   since #3892.) A design note for whoever extends it: **do not convert the handler's `Unmoved` to
   `AtEntry`** -- the first cut did, and 44 `-(try (.a | error) catch 7)` rows lost a match, because `register_after`, an `any`/`all`
   generator and a fold source all read the value out of an `Unmoved`.
-- The stage-level downgrade in `place_step`: a leaf-local verdict for `,`/`//`/`if`/`try`, which
-  turns the three rows pinned by `test_path_register_compound_stage_is_refused_as_a_whole_3456`
-  into jq's `[]`. Cheap now, because the producers already say it.
+- ~~The stage-level downgrade in `place_step`: a leaf-local verdict for `,`/`//`/`if`/`try`, which
+  turns the three rows into jq's `[]`.~~ Done by #3644 for a trackable entry (`compound_states_register_per_result`);
+  an untracked entry still takes the stage-level answer.
 - `LostAt(entry)` for an unchecked `[E]`, and passing `LostAt`'s position through `register_after`
   instead of `LostSomewhere`.
 - ~~An `[E]` collect of `map(f)`/`any(f)`/`all(f)` whose `f` navigates but stays on the register.~~ Done by #3724

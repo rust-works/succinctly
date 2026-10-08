@@ -61539,31 +61539,24 @@ fn test_catch_handler_seed_needs_a_payload_jq_keeps_tracked_3891() -> Result<()>
     Ok(())
 }
 
-/// #3967 (pinned, not endorsed): a compound handler next to an `and`/`or`/`-`
-/// navigation refuses where jq answers. `main` already refuses the `true` row
-/// (a `null`/`bool` payload has been seeded trackable since #3133); #3891 makes the
-/// array row refuse too, because a container sharing the register's storage is now
-/// seeded the same way. When #3967 lands both rows answer and this test flips.
+/// #3967, flipped by #3644: a compound handler next to an `and`/`or`/`-`
+/// navigation answers as jq does (the `true` row emits nothing, the
+/// array row `[0]`). Both refused before the compound stage stated its register
+/// per branch.
 #[test]
-fn test_compound_catch_handler_beside_a_navigation_refuses_where_jq_answers_3967() -> Result<()> {
-    for (program, doc, element) in [
-        (
-            "path(try error catch (try .a catch 0) and .b?)",
-            "true",
-            r#""b" of true"#,
-        ),
+fn test_compound_catch_handler_beside_a_navigation_answers_like_jq_3967() -> Result<()> {
+    for (program, doc, expected) in [
+        ("path(try error catch (try .a catch 0) and .b?)", "true", ""),
         (
             "path(try error catch (try .a catch 0) and .[0])",
             "[true]",
-            "0 of [true]",
+            "[0]\n",
         ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(doc))?;
-        assert_eq!(code, 5, "#3967: `{program}` on {doc}: stdout {stdout:?}");
-        assert!(
-            stderr.contains(&format!(
-                "Invalid path expression near attempt to access element {element}"
-            )),
+        assert_eq!(
+            (stdout.as_str(), code),
+            (expected, 0),
             "#3967: `{program}` on {doc}: {stderr:?}"
         );
     }
@@ -66197,8 +66190,8 @@ fn test_foreach_over_the_register_binds_it_as_a_path_3790() -> Result<()> {
 }
 
 /// #3749/#3757, what is still refused where jq answers, in the safe direction. A
-/// verdict stage behind a `def` call or a `reduce` and one inside a compound stage
-/// (`(any, any)`, `any // 1`) are refused (#3644; the plain stage was lifted by #3758 and the
+/// verdict stage behind a `def` call or a `reduce` is refused (a compound stage of them,
+/// `(any, any)` and `any // 1`, answers since #3644; the plain stage was lifted by #3758 and the
 /// untracked entry by #3826, see
 /// [`test_pipe_stage_reads_the_backtracked_register_verdict_3758`] and
 /// [`test_verdict_stage_on_an_untracked_entry_3826`]). And a
@@ -66233,20 +66226,6 @@ fn test_any_all_pipe_stage_verdict_residuals_stay_refused_3757() -> Result<()> {
         (
             r#"{"a":false}"#,
             r"path(. as $x | reduce 1 as $i (.; any) | $x)",
-            "[]",
-            r#"Invalid path expression with result {"a":false}"#,
-        ),
-        // #3758: the same stage gap for a compound stage that mixes the verdict
-        // stage with another branch (#3644's whole-stage refusal).
-        (
-            r#"{"a":false}"#,
-            r"path(. as $x | (any, any) | $x)",
-            "[] []",
-            r#"Invalid path expression with result {"a":false}"#,
-        ),
-        (
-            r#"{"a":false}"#,
-            r"path(. as $x | (any // 1) | $x)",
             "[]",
             r#"Invalid path expression with result {"a":false}"#,
         ),
@@ -69331,18 +69310,11 @@ fn test_path_register_last_f_does_not_move_it_3643() -> Result<()> {
             r#"near attempt to access element "a""#,
             5,
         ),
-        // Still refused where jq answers `[]`: a compound stage mixing `last`
-        // with a navigating leaf is judged as a whole (the `[E]` collect around
-        // `last(f)` was lifted by #3767, see
-        // `test_collect_last_f_keeps_the_register_3767`). Pinned as today's
-        // (refuse-only) behaviour so lifting it is a deliberate change.
-        (
-            doc,
-            r"path(. as $x | (last(.a) // .k) | $x)",
-            "",
-            with_root,
-            5,
-        ),
+        // A compound stage mixing `last` with a navigating leaf states its
+        // register per branch (#3644), so it answers jq's `[]` (the `[E]`
+        // collect around `last(f)` was lifted by #3767, see
+        // `test_collect_last_f_keeps_the_register_3767`).
+        (doc, r"path(. as $x | (last(.a) // .k) | $x)", "[]\n", "", 0),
         // #3767: inside the collect, the generators the `[E]` allowlist does not
         // read stay refused where jq answers `[]` (jq's own `first(f)`, `//` and
         // `limit` emit from inside the fork and move the register).
@@ -70708,11 +70680,13 @@ fn test_foreach_extract_ending_on_untracked_null_after_navigation_refuses_3769()
             refusal,
             5,
         ),
+        // #3644: the `//` stage states its register per branch, so this answers
+        // jq's `["a"]` (the `.b` branch navigated, `null` is by value).
         (
             "path(foreach (1) as $i (.; .; .a | (.b // null)))".to_string(),
+            "[\"a\"]\n",
             "",
-            refusal,
-            5,
+            0,
         ),
         // a register that never left the root, and a fold after a navigation
         (
@@ -72706,7 +72680,7 @@ fn test_path_register_by_value_builtin_stages_do_not_move_it_3361() -> Result<()
         ),
         // The same builtins inside a compound stage (a collect, a generator
         // consumer, a comma, an `if`, a `try`) are read as a loss: the stage is
-        // judged as a whole (`test_path_register_compound_stage_is_refused_as_a_whole_3456`),
+        // judged as a whole (`test_path_register_compound_stage_states_its_register_per_branch_3644`),
         // and jq answers `[]` for each. Refuse-only, and the open promotions in
         // `docs/plan/jq-path-register-producer-contract.md` section 10.
         (
@@ -72726,16 +72700,16 @@ fn test_path_register_by_value_builtin_stages_do_not_move_it_3361() -> Result<()
         (
             "[1,2]",
             r"path(. as $x | (sort, add) | $x)",
+            "[]\n[]\n",
             "",
-            "Invalid path expression",
-            5,
+            0,
         ),
         (
             "[1,2]",
             r"path(. as $x | if true then sort else . end | $x)",
+            "[]\n",
             "",
-            "Invalid path expression",
-            5,
+            0,
         ),
         (
             "[1,2]",
@@ -72977,17 +72951,18 @@ fn test_path_register_more_by_value_builtins_do_not_move_it_3711() -> Result<()>
             bad,
             5,
         ),
-        // The new group inside a compound stage is read as a loss, like the
-        // #3361 group (`test_path_register_by_value_builtin_stages_do_not_move_it_3361`):
-        // jq answers each of these, so they are pinned as today's refuse-only
-        // behaviour. A `try` or `?` around an untracked iteration does not catch
-        // the refusal either, as for `add` and `flatten`.
+        // The new group inside a compound stage states its register per branch
+        // (#3644), like the #3361 group
+        // (`test_path_register_by_value_builtin_stages_do_not_move_it_3361`), so
+        // a comma of them answers jq's `["a",0]` twice. The rows below stay
+        // refused where jq answers: a `try` or `?` around an untracked iteration
+        // does not catch the refusal either, as for `add` and `flatten`.
         (
             r#"{"a":["x"]}"#,
             r"path(.a | . as $x | (flatten(1), reverse) | $x[0])",
+            "[\"a\",0]\n[\"a\",0]\n",
             "",
-            bad,
-            5,
+            0,
         ),
         (
             r#"{"a":["x"]}"#,
@@ -74781,36 +74756,36 @@ fn test_fold_source_destructuring_does_not_drain_inputs_3489() -> Result<()> {
     Ok(())
 }
 
-/// #3456 (B2): the survival rule is decided per *stage*, not per leaf. A
-/// compound stage that mixes a leaf that navigates with one that does not
-/// loses the register as a whole, so these refuse where jq 1.7.1 answers `[]`
-/// (backtracking to the fork puts its register back for the by-value leaf).
-/// Pinned as today's behaviour: lifting the verdict to the leaf would turn
-/// each into jq's answer, which is a promotion with its own rows, and the
-/// producer migration must flip nothing. The `(empty, 1)` control matches jq.
+/// #3456 (B2), promoted by #3644: a compound stage (`//`, `if`, `try`) that mixes
+/// a leaf that navigates with one that does not states its register per branch,
+/// not per stage -- jq backtracks to the fork, so the by-value leaf's register is
+/// the one it entered with, and each of these is jq 1.7.1's `[]`. Before #3644
+/// the stage was judged as a whole and each refused. The `(empty, 1)` control
+/// matched jq throughout; the `(.a, 1)` row is the other side of the rule (the
+/// `.a` branch moved the register, so jq refuses and so does this build).
 #[test]
-fn test_path_register_compound_stage_is_refused_as_a_whole_3456() -> Result<()> {
+fn test_path_register_compound_stage_states_its_register_per_branch_3644() -> Result<()> {
     assert_path_rows_3289(&[
         (
             r#"{"a":null}"#,
             r"path(. as $x | (.a // 1) | $x)",
+            "[]\n",
             "",
-            r#"Invalid path expression with result {"a":null}"#,
-            5,
+            0,
         ),
         (
             r#"{"a":1}"#,
             r"path(. as $x | if true then 1 else first(.a) end | $x)",
+            "[]\n",
             "",
-            r#"Invalid path expression with result {"a":1}"#,
-            5,
+            0,
         ),
         (
             r#"{"a":1}"#,
             r"path(. as $x | try 1 catch first(.a) | $x)",
+            "[]\n",
             "",
-            r#"Invalid path expression with result {"a":1}"#,
-            5,
+            0,
         ),
         (
             r#"{"a":null}"#,
@@ -74818,6 +74793,27 @@ fn test_path_register_compound_stage_is_refused_as_a_whole_3456() -> Result<()> 
             "[]\n",
             "",
             0,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"path(. as $x | (any, any) | $x)",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"path(. as $x | (any // 1) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"path(. as $x | (.a, 1) | $x)",
+            "",
+            r#"Invalid path expression with result {"a":null}"#,
+            5,
         ),
     ])
 }
@@ -93456,8 +93452,6 @@ fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
         r#"del((. as $x | contains({"a":{}}) | $x | .a)?)"#,
         // And a value-position `?` around the whole write catches nothing.
         r#"[del(. as $x | contains({"a":{}}) | try ($x | .a))?]"#,
-        r"del(. as $x | (.zz // 5) | try ($x | .k))",
-        r"del(. as $x | if .k then 5 else .a end | try ($x | .k))",
         r"del(. as $x | (def f: 5; f) | try ($x | .k))",
     ] {
         let (stdout, stderr, code) =
@@ -115518,9 +115512,9 @@ fn test_register_catch_handler_over_register_keeping_stage_3767() -> Result<()> 
         (
             doc,
             r#"path(. as $x | try (last(.a), error("e")) catch . | $x)"#,
+            "[]\n[]\n",
             "",
-            with_root,
-            5,
+            0,
         ),
     ])
 }
