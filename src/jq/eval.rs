@@ -45838,8 +45838,12 @@ fn foreach_source_destructures_register(source: &Expr) -> bool {
         Expr::Foreach {
             input, patterns, ..
         } => {
-            (routes_destructuring(patterns) || routes_destructuring_chain(patterns))
-                && yields_only_the_register(input)
+            ((routes_destructuring(patterns) || routes_destructuring_chain(patterns))
+                && yields_only_the_register(input))
+                // #4031: the nested fold does not backtrack its source either, so what
+                // that source destructures reaches the outer EXTRACT whatever the
+                // nested loop pattern is (`foreach (foreach (. as [$a] | .) as $k (.; .; .))`).
+                || foreach_source_destructures_register(input)
         }
         // #3956: a wrapper that emits what its operand does (`try E`, `E?`, `first(E)`,
         // `limit(n; E)`) meets the register where `E` does, and a `label` runs its body in

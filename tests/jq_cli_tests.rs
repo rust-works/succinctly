@@ -65528,6 +65528,103 @@ fn test_nested_foreach_destructuring_the_register_moves_it_for_the_outer_fold_38
     ])
 }
 
+/// #4031 (after #3853): a nested `foreach` whose own SOURCE destructures the register
+/// (`foreach (. as [$a] | .) as $k (...)`) moves it for the OUTER fold whatever the nested
+/// loop pattern is, because a `foreach` does not backtrack its source. The outer EXTRACT is
+/// then checked against a register it is no longer at and raises, where the by-value drive
+/// answered `[]` and a write through it landed nowhere. A nested `reduce` backtracks and a
+/// source that destructures nothing leave the root. Every row captured from jq 1.7.1.
+#[test]
+fn test_nested_foreach_whose_source_destructures_the_register_moves_it_for_the_outer_fold_4031(
+) -> Result<()> {
+    let with_result = r"Invalid path expression with result [[1]]";
+    assert_path_rows_both_routes_3749(&[
+        (
+            r"[[1]]",
+            r"path(foreach (foreach (. as [$a] | .) as $k (.; .; .)) as $q (.; .; .))",
+            "",
+            with_result,
+            5,
+        ),
+        // EXTRACT `$k`, a two-output UPDATE, and a first() wrapper change nothing.
+        (
+            r"[[1]]",
+            r"path(foreach (foreach (. as [$a] | .) as $k (.; .; $k)) as $q (.; .; .))",
+            "",
+            with_result,
+            5,
+        ),
+        (
+            r"[[1]]",
+            r"path(foreach (foreach (. as [$a] | .) as $k (.; (.,.); .)) as $q (.; .; .))",
+            "",
+            with_result,
+            5,
+        ),
+        (
+            r"[[1]]",
+            r"path(first(foreach (foreach (. as [$a] | .) as $k (.; .; .)) as $q (.; .; .)))",
+            "",
+            with_result,
+            5,
+        ),
+        // An object pattern, and an array pattern that steps past the member.
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(foreach (foreach (. as {a:$a} | .) as $k (.; .; .)) as $q (.; .; .))",
+            "",
+            r#"Invalid path expression with result {"a":{"b":1}}"#,
+            5,
+        ),
+        (
+            r"[[1]]",
+            r"path(foreach (foreach (. as [$a,$b] | .) as $k (.; .; .)) as $q (.; .; .))",
+            "",
+            "Invalid path expression near attempt to access element 0 of [[1]]",
+            5,
+        ),
+        // A write through it is refused the same way.
+        (
+            r"[[1]]",
+            r"(foreach (foreach (. as [$a] | .) as $k (.; .; .)) as $q (.; .; .)) |= 5",
+            "",
+            with_result,
+            5,
+        ),
+        (
+            r"[[1]]",
+            r"del(foreach (foreach (. as [$a] | .) as $k (.; .; .)) as $q (.; .; .))",
+            "",
+            with_result,
+            5,
+        ),
+        // On a `null` register the destructure's step succeeds and the path follows it.
+        (
+            r"null",
+            r"path(foreach (foreach (. as [$a] | .) as $k (.; .; .)) as $q (.; .; .))",
+            "[0]\n",
+            "",
+            0,
+        ),
+        // Contrast: a nested `reduce` backtracks its source, and a source that
+        // destructures nothing leaves the register at the root.
+        (
+            r"[[1]]",
+            r"path(foreach (reduce (. as [$a] | .) as $k (.; .)) as $q (.; .; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[[1]]",
+            r"path(foreach (foreach (5) as $k (.; .; .)) as $q (.; .; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
 /// #3948: the `?//` chain form of #3939. jq's register follows the first alternative whose
 /// pattern matches, so on a `null` document `. as [$a] ?// {a:$a}` leaves it on `[0]` and
 /// `. as {a:$a} ?// [$a]` on `["a"]`; a chain read by value answered the root, so a write
