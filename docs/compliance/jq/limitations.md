@@ -637,8 +637,8 @@ $x (.; .[$x:]))` raises `E2`, was the slice error). What it leaves:
   (exit 5), as the un-wrapped fold already did. **A recorded divergence, in the safe direction**:
   the walk cannot tell whether a *later* alternative would also have failed, so a try-wrapped fold
   whose catch happened to agree with jq (`del(try (.a and (reduce . as {a:$a,b:$b} ?// [$a] (0;
-  .))))` on `{"a":1,"b":2}`, jq `{"a":1,"b":2}`) refuses too. Only a refusal of a step that could
-  have succeeded on the element is converted (`NavKind::would_succeed_on`); one jq raises
+  .))))` on `{"a":1,"b":2}`, jq `{"a":1,"b":2}`) refuses too (no longer where the register is known,
+  #3999, below). Only a refusal of a step that could have succeeded on the element is converted (`NavKind::would_succeed_on`); one jq raises
   whatever its register is (a string key off an array) stays catchable, and since
   [#3998](https://github.com/rust-works/succinctly/issues/3998) it also *retries* the next
   alternative, computed key or not: it is jq's own verdict, not a guess (`del(try (.[0] and (reduce
@@ -654,6 +654,24 @@ $x (.; .[$x:]))` raises `E2`, was the slice error). What it leaves:
   with a computed key is not judged by value (running its generator again would repeat its
   effects, `test_fold_pattern_computed_key_is_not_run_twice_3743`), so a refusal that could still
   succeed is not retried; one that never could (#3998) is, without running the key again.
+  **A fold on an untracked stage that still carries jq's register value** (the right operand of
+  an `and`/`or` whose left operand navigated, so jq's register is on `.a` while the fold's `.` is
+  the root; any stage that leaves the register in place, an object construction or `tojson | fromjson`)
+  compares the element with that value ([#3999](https://github.com/rust-works/succinctly/issues/3999)):
+  an element that is not equal to it is provably not the register's node, so the refusal is
+  jq's own verdict and `?//` retries, as above. `del(try (.a and (reduce . as {a:$a,b:$b} ?//
+  [$a] (0; .))))` on `{"a":1,"b":2}` is jq's `{"a":1,"b":2}` (it was exit 5), for `reduce` and
+  `foreach`, any number of alternatives, pinned by
+  `test_fold_pattern_against_known_untracked_register_retries_3999`. An element equal to the
+  register by value (a `map(.)` copy of the array the register sits on) stays the loud guess,
+  and so does a fold whose stage lost the register or whose INIT may have moved it. The
+  register's *position* is still unknown there, so the walk cannot step from it: a row jq
+  answers by stepping from the register's own node (`{"a":true}` with `?// $a`, jq `{}`) still
+  refuses, now at the result ("with result true") rather than at the first step. The first
+  alternative's refusal on the untracked contexts where no register is carried (`var-rebind`,
+  `untracked-*`) is unchanged. Over a seeded sample of 30,027 rows of the 20 `?//` fold operands
+  (`--sample 30000 --seed 11`, `/usr/bin/jq` 1.7.1): REFUSE_WRONG 1,883 to 1,793, MATCH 28,138
+  to 28,228, no ACCEPT_WRONG before or after, none of the 6 DIFF rows moved.
 
 ## A fold over the register itself (#3790)
 

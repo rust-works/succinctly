@@ -45138,9 +45138,27 @@ struct FoldRegister {
     /// The register's absolute position (#2042): the fold's own frame
     /// extended by `path`, or unknown once the register has been lost.
     frame: Frame,
+    /// Whether `frame` carries jq's live register value for an *untrackable* register
+    /// (#3999): the fold was entered on an untracked stage whose register is where that
+    /// stage left it -- an `and`/`or` right operand after a left operand that navigated --
+    /// and INIT cannot have moved it. Read through [`FoldRegister::live_register`].
+    live_register_known: bool,
 }
 
 impl FoldRegister {
+    /// jq's register *value* when it is known but sits somewhere this fold cannot name
+    /// (#3999): an untrackable register whose enclosing stage still holds it. Its
+    /// position is unknown, so a pattern walk cannot step from it
+    /// ([`PatternRegister::known`] stays `false`), but a source element that is not equal
+    /// to it is provably not its node, which is all [`fold_walk_refusal_is_guess`] asks.
+    fn live_register(&self) -> Option<&OwnedValue> {
+        if self.live_register_known && !self.trackable && !self.frame.register_loss.is_lost() {
+            self.frame.register()
+        } else {
+            None
+        }
+    }
+
     /// Seed the register from one INIT branch (one INIT fork) and the
     /// accumulator's own starting value (always INIT's own computed
     /// value, regardless of whether it was itself trackable).
@@ -45177,6 +45195,7 @@ impl FoldRegister {
                 value: acc.clone(),
                 trackable: true,
                 frame: frame.extend(&init_branch.path),
+                live_register_known: false,
             }
         } else {
             Self {
@@ -45190,6 +45209,9 @@ impl FoldRegister {
                 } else {
                     frame.clone()
                 },
+                // #3999: INIT that cannot move the register leaves it where the stage
+                // holding this fold left it, and the frame carries its value.
+                live_register_known: init_keeps_register,
             }
         };
         (reg, acc)
@@ -45715,6 +45737,7 @@ impl FoldRegister {
                 value: branch.value.clone().into_owned(),
                 trackable: true,
                 frame: fold_frame.extend(&branch.path),
+                live_register_known: false,
             }
         } else if neutral_leaves_register(update_expr)
             // #3580: UPDATE could navigate, but this output is one it emitted
@@ -45727,6 +45750,7 @@ impl FoldRegister {
                 value: self.value.clone(),
                 trackable: self.trackable,
                 frame: self.frame.clone(),
+                live_register_known: self.live_register_known,
             }
         } else {
             // #3775: keep where the register stood entering UPDATE. jq's
@@ -45744,6 +45768,7 @@ impl FoldRegister {
                 value: OwnedValue::Null,
                 trackable: false,
                 frame: self.frame.unknown(),
+                live_register_known: false,
             }
         }
     }
@@ -48544,6 +48569,19 @@ fn fold_walk_refusal_is_guess<S: EvalSemantics>(
     ) {
         return false;
     }
+    // #3999: an untrackable register whose value the frame still carries (an `and`/`or`
+    // right operand after a left operand that navigated, or any stage that left the
+    // register in place). The walk cannot step from it (its position is unknown), so an
+    // element equal to it, `null` and booleans included, might be its node and the
+    // walk's refusal is a guess; any other element is provably not the register's node,
+    // and jq's `path_intact` refuses it too, so the refusal is jq's own verdict (a `?//`
+    // retries it). `equals_register`, not `==`: a shared node is the register by
+    // pointer even where `==` is false (a `nan` inside it).
+    if S::TAG == EvalTag::Jq && matches!(elem.moved, MovedRegister::Unmoved) {
+        if let Some(live) = reg.live_register() {
+            return equals_register(&elem.value, live);
+        }
+    }
     // #2159: the register the walk compared against is the moved one when
     // the source navigated before computing this element.
     let (trackable, register) = match &elem.moved {
@@ -49265,6 +49303,7 @@ fn foreach_step_register<S: EvalSemantics>(
             value: walked_reg.value.clone(),
             trackable: walked_reg.is_input,
             frame: frame.extend(&walked_reg.path),
+            live_register_known: false,
         };
         let at_register =
             register_identical::<S>(&step_reg.value, &step_reg.frame, state, state_snapshot)
@@ -49284,6 +49323,7 @@ fn foreach_step_register<S: EvalSemantics>(
                 value: elem.value.clone(),
                 trackable: true,
                 frame: frame.extend(path),
+                live_register_known: false,
             };
             let at_register =
                 register_identical::<S>(&step_reg.value, &step_reg.frame, state, state_snapshot)
@@ -49306,6 +49346,7 @@ fn foreach_step_register<S: EvalSemantics>(
                 value: value.clone(),
                 trackable: true,
                 frame: frame.extend(path),
+                live_register_known: false,
             };
             let at_register =
                 register_identical::<S>(&step_reg.value, &step_reg.frame, state, state_snapshot)
@@ -49323,6 +49364,7 @@ fn foreach_step_register<S: EvalSemantics>(
                 value: reg.value.clone(),
                 trackable: false,
                 frame: reg.frame.unknown(),
+                live_register_known: false,
             },
             false,
         ),
@@ -49394,6 +49436,7 @@ fn foreach_step_register<S: EvalSemantics>(
                 value: reg.value.clone(),
                 trackable: reg.trackable,
                 frame: reg.frame.clone(),
+                live_register_known: reg.live_register_known,
             },
             state_at_register || reg.identical::<S>(state, state_snapshot, S::TAG == EvalTag::Jq),
         ),
@@ -125599,6 +125642,7 @@ mod tests {
             value: value.clone(),
             trackable: true,
             frame: Frame::at(1, Rc::clone(path)),
+            live_register_known: false,
         };
         let a = PathPrefix::extend(&PathPrefix::root(), field("a"));
         let a_optional =

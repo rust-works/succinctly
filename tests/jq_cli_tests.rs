@@ -64527,7 +64527,10 @@ fn test_fold_pattern_computed_key_is_not_run_twice_3743() -> Result<()> {
 /// off the array `[true]`): jq raises that whatever its register is, so the `try`
 /// catching it is what jq does too, and it stays catchable.
 /// Every jq side captured from jq 1.7.1; succinctly's exit-5 rows are the recorded
-/// safe-direction divergence.
+/// safe-direction divergence. Since #3999 the `and` rows below no longer reach the walk's guess
+/// (the root is provably not the register `true`), so the chain retries and refuses at the
+/// result instead; `test_fold_pattern_against_known_untracked_register_retries_3999` pins the
+/// guess that remains.
 #[test]
 fn test_fold_guessed_pattern_refusal_is_not_catchable_3840() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -64535,45 +64538,35 @@ fn test_fold_guessed_pattern_refusal_is_not_catchable_3840() -> Result<()> {
             r#"{"a":true}"#,
             r"del(try (.a and (reduce . as {a:$a} ?// $a (0; .))))",
             "",
-            r#"Invalid path expression near attempt to access element "a" of {"a":true}"#,
+            r"Invalid path expression with result true",
             5,
         ),
         (
             r#"{"a":true}"#,
             r#"del(try (.a and (reduce . as {("a"):$a} ?// $a (0; .))))"#,
             "",
-            r#"Invalid path expression near attempt to access element "a" of {"a":true}"#,
+            r"Invalid path expression with result true",
             5,
         ),
         (
             r"[true]",
             r"del(try (.[0] and (reduce . as [$a] ?// $a (0; .))))",
             "",
-            r"Invalid path expression near attempt to access element 0 of [true]",
+            r"Invalid path expression with result true",
             5,
         ),
         (
             r#"{"a":true}"#,
             r"del(try (.a and (foreach . as {a:$a} ?// $a (0; .; .))))",
             "",
-            r#"Invalid path expression near attempt to access element "a" of {"a":true}"#,
+            r"Invalid path expression with result true",
             5,
         ),
         (
             r#"{"a":true}"#,
             r"del((.a and (reduce . as {a:$a} ?// $a (0; .)))?)",
             "",
-            r#"Invalid path expression near attempt to access element "a" of {"a":true}"#,
-            5,
-        ),
-        // The recorded cost: the walk cannot tell that a later alternative would also
-        // have failed, so this row, which the catch used to answer as jq does
-        // (`{"a":1,"b":2}`), refuses too.
-        (
-            r#"{"a":1,"b":2}"#,
-            r"del(try (.a and (reduce . as {a:$a,b:$b} ?// [$a] (0; .))))",
-            "",
-            r#"Invalid path expression near attempt to access element "a" of {"a":1,"b":2}"#,
+            r"Invalid path expression with result true",
             5,
         ),
         // Unchanged: a guess on the last (here only) alternative is not asked, and the
@@ -64674,6 +64667,102 @@ fn test_fold_pattern_step_that_never_succeeds_retries_3998() -> Result<()> {
             r#"del(try (.[0] and (reduce . as {("a"):$a} ?// $a (0; .))))"#,
             "",
             r"Invalid path expression with result true",
+            5,
+        ),
+    ])
+}
+
+/// #3999: a fold entered on an untracked stage whose register is still known -- the right
+/// operand of an `and`/`or` whose left operand navigated, so jq's register sits on `.a` while
+/// the fold's `.` is the root -- judges its `?//` walk against that register's value. The
+/// element (the root) is not equal to it, so it is provably not the register's node: jq's
+/// `path_intact` refuses the first alternative too, and `?//` retries, instead of the walk's
+/// refusal being called a guess and stopping the chain (exit 5 where jq answers). `del(try (.a
+/// and (reduce . as {a:$a,b:$b} ?// [$a] (0; .))))` on `{"a":1,"b":2}` is jq's
+/// `{"a":1,"b":2}` (both alternatives fail and the `try` catches the last); it was exit 5, for
+/// `reduce` and `foreach`, any number of alternatives, an object, array or boolean register,
+/// and `or`. The un-wrapped fold now reaches the second alternative's own refusal, the one jq
+/// raises ("element 0"). Contrast: an element that *is* equal to the register by value (a
+/// `map(.)` copy of the array the register sits on) may be its node, so the walk's refusal is
+/// still the loud guess of #3840; jq retries and fails at the result ("with result 0"), this
+/// refuses at the step, both exit 5. Every jq side captured from jq 1.7.1.
+#[test]
+fn test_fold_pattern_against_known_untracked_register_retries_3999() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"a":1,"b":2}"#,
+            r"del(try (.a and (reduce . as {a:$a,b:$b} ?// [$a] (0; .))))",
+            "{\"a\":1,\"b\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            r"del(try (.a and (foreach . as {a:$a,b:$b} ?// [$a] (0; .; .))))",
+            "{\"a\":1,\"b\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            r"del(try (.a and (reduce . as {a:$a,b:$b} ?// [$a] ?// {b:$a} (0; .))))",
+            "{\"a\":1,\"b\":2}\n",
+            "",
+            0,
+        ),
+        // A container register, and `or` after a false left operand.
+        (
+            r#"{"a":{"a":1},"b":2}"#,
+            r"del(try (.a and (reduce . as {a:$a,b:$b} ?// [$a] (0; .))))",
+            "{\"a\":{\"a\":1},\"b\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":2}"#,
+            r"del(try (.a and (reduce . as {a:$a,b:$b} ?// [$a] (0; .))))",
+            "{\"a\":[1],\"b\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false,"b":2}"#,
+            r"del(try (.a or (reduce . as {a:$a,b:$b} ?// [$a] (0; .))))",
+            "{\"a\":false,\"b\":2}\n",
+            "",
+            0,
+        ),
+        // Not only `and`/`or`: any untracked stage that leaves the register in place.
+        (
+            r#"{"a":[1]}"#,
+            r#"del(try (.a | {"x":1} | reduce . as {x:$q} ?// [$q] (0; .)))"#,
+            "{\"a\":[1]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":2}"#,
+            r"del(try (.a and (tojson | fromjson | reduce . as {a:$a} ?// [$a] (0; .))))",
+            "{\"a\":[1],\"b\":2}\n",
+            "",
+            0,
+        ),
+        // Un-wrapped: the retry reaches the last alternative's own refusal, as jq's.
+        (
+            r#"{"a":1,"b":2}"#,
+            r"path(.a and (reduce . as {a:$a,b:$b} ?// [$a] (0; .)))",
+            "",
+            r#"Invalid path expression near attempt to access element 0 of {"a":1,"b":2}"#,
+            5,
+        ),
+        // Contrast: the element equals the register by value, so it may be the register's
+        // node and the refusal stays the walk's loud guess, not a retry (a retry would
+        // reach the second alternative and refuse "with result 0", as jq does).
+        (
+            r#"{"a":[1]}"#,
+            r"del(try (.a | map(.) | reduce . as [$x] ?// $x (0; .)))",
+            "",
+            r"Invalid path expression near attempt to access element 0 of [1]",
             5,
         ),
     ])
