@@ -40271,7 +40271,7 @@ fn carry_comma_sibling_register<'a>(
     frame: &Frame,
 ) -> PathBranch<'a> {
     carry_register_when(branch, frame, || {
-        operand_leaves_register(operand) || is_bare_register_neutral_builtin(operand)
+        operand_leaves_register(operand) || neutral_leaves_register(operand)
     })
 }
 
@@ -40292,9 +40292,10 @@ fn carry_register_when<'a>(
 }
 
 /// A bare builtin that navigates nothing and returns a value it computed, so a comma sibling
-/// holding it leaves jq's register where the comma entered it (#3960). Read for an immediate
-/// comma sibling only: the same builtin as a bare UPDATE, in a nested comma or under a wrapper
-/// still skips the write silently (#4028). A boolean register is a limit of the model, not of
+/// holding it leaves jq's register where the comma entered it (#3960). Read through the shapes
+/// that only fork or sequence their operands by [`neutral_leaves_register`] (#4028): a bare
+/// UPDATE, a nested comma, a pipe of them, `//`, and the wrappers
+/// [`peel_register_transparent`] passes the register through. A boolean register is a limit of the model, not of
 /// this list: jq reads a `contains(true)`/`isnan` result equal to a `true`/`false` register as
 /// that register (`jv_identical`), which the model does not carry, so those inputs stay refused: the C-coded math and
 /// date builtins, `now`, `input_line_number`, `explode`/`implode`, `sort`, and the string
@@ -40387,6 +40388,33 @@ fn is_bare_register_neutral_builtin(expr: &Expr) -> bool {
 /// admitted -- `first(.a)` moves the register, and the peeled `.a` says so.
 fn operand_leaves_register(operand: &Expr) -> bool {
     cannot_move_register(peel_register_transparent(operand))
+}
+
+/// [`operand_leaves_register`], plus the bare builtins that navigate nothing
+/// ([`is_bare_register_neutral_builtin`], #3960) read through the shapes that only fork or
+/// sequence their operands (#4028): a comma, a pipe, a `//`, and the wrappers
+/// [`peel_register_transparent`] passes the register through. jq's register is where the
+/// expression entered it exactly when every leaf of those shapes left it there, so the shape
+/// is neutral when each part is, and anything else is judged by [`cannot_move_register`]
+/// alone -- an `if`, an array, a `reduce` holding a neutral builtin is not read.
+///
+/// Not a widening of [`cannot_move_register`]: that predicate is read by pipe stages and binds
+/// too, and a larger set routed programs into their holes (#3982, #3984). Asked only where a
+/// fold's UPDATE body is judged ([`FoldRegister::advance`]) and where a comma sibling is
+/// (#3960's three readers), the two places the register statement reaches EXTRACT.
+fn neutral_leaves_register(expr: &Expr) -> bool {
+    let peeled = peel_register_transparent(expr);
+    if is_bare_register_neutral_builtin(peeled) {
+        return true;
+    }
+    match peeled {
+        Expr::Comma(items) => items.iter().all(neutral_leaves_register),
+        Expr::Pipe(stages) => stages.iter().all(neutral_leaves_register),
+        Expr::Alternative(left, right) => {
+            neutral_leaves_register(left) && neutral_leaves_register(right)
+        }
+        other => cannot_move_register(other),
+    }
 }
 
 /// Flatten path components into one `Expr`, using `Expr::Pipe` only when
@@ -44661,7 +44689,7 @@ fn entry_marker_shape(expr: &Expr) -> EntryMarkers {
             // skip the write (#3959).
             if shape == EntryMarkers::None
                 && items.iter().any(|item| {
-                    operand_leaves_register(item) || is_bare_register_neutral_builtin(item)
+                    operand_leaves_register(item) || neutral_leaves_register(item)
                 })
             {
                 EntryMarkers::Forwarded
@@ -44740,7 +44768,7 @@ fn fans_out(expr: &Expr) -> bool {
         Expr::Pipe(_) => Visit::Skip,
         Expr::Comma(items)
             if items.iter().all(|item| {
-                sibling_sees_register_uniformly(item) || is_bare_register_neutral_builtin(item)
+                sibling_sees_register_uniformly(item) || neutral_leaves_register(item)
             }) =>
         {
             Visit::Descend
@@ -45685,7 +45713,7 @@ impl FoldRegister {
                 trackable: true,
                 frame: fold_frame.extend(&branch.path),
             }
-        } else if cannot_move_register(update_expr)
+        } else if neutral_leaves_register(update_expr)
             // #3580: UPDATE could navigate, but this output is one it emitted
             // before it did (a recursion's seed, a caught body's handler): the
             // register is where UPDATE entered, which is `self`.
@@ -133542,5 +133570,58 @@ mod compound_states_register_mode_gate_tests {
         let expr = parse(".a").unwrap();
         assert!(!compound_states_register_per_result::<JqSemantics>(&expr));
         assert!(!compound_states_register_per_result::<YqSemantics>(&expr));
+    }
+}
+
+#[cfg(test)]
+mod neutral_leaves_register_tests_4028 {
+    use super::*;
+    use crate::jq::parse;
+
+    // #4028: a shape that only forks or sequences register-neutral builtins is neutral when each
+    // part is, and anything else is `cannot_move_register`'s call alone.
+    #[test]
+    fn forks_and_sequences_of_neutral_builtins_are_neutral() {
+        for src in [
+            "now",
+            "(now)",
+            "now, floor",
+            "((now, now), (now, now))",
+            "now | floor",
+            "now | tostring",
+            "floor // 1",
+            "now?",
+            "try floor",
+            "first(floor)",
+            "limit(1; now, 1)",
+            "(now, (floor | floor))",
+            "1",
+        ] {
+            let expr = parse(src).unwrap();
+            assert!(neutral_leaves_register(&expr), "`{src}` is neutral");
+        }
+    }
+
+    #[test]
+    fn a_navigation_or_an_unlisted_builtin_anywhere_is_not() {
+        for src in [
+            ".a",
+            ".a | now",
+            "now | .a",
+            "now, .a",
+            "now // .a",
+            "abs",
+            "now, abs",
+            "(now | abs)",
+            "pow(.; 2)",
+            "if . then now else floor end",
+            "[now]",
+            "try now catch .a",
+            "first(.a)",
+            "ascii_downcase",
+        ] {
+            let expr = parse(src).unwrap();
+            assert!(!neutral_leaves_register(&expr), "`{src}` is not neutral");
+        }
     }
 }
