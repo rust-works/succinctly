@@ -796,6 +796,15 @@ fold-extract-nested-try	{"a":{"b":1}}	path(.a as $y | .a | foreach range(1) as $
 fold-body-nested-try-sibling-control	{"a":{"b":1},"c":{"b":1}}	del(.a as $y | foreach .c as $v (.; try ($y | .b); .))
 fold-body-fanout-declines	{"a":{"b":1}}	(foreach .a as {a:$v} ?// {c:$v} (0; ($v[0]?, $v))) = 9
 fold-body-fanout-declines-del	{"a":{"b":1}}	del(foreach .a as $v (.; (($v | .b?), 1); try ($v | .b?)))
+nested-fold-frozen-init-reduce-after-length	{"a":{"b":1,"c":[1,2]},"z":0}	del(. as $x | length | try (reduce 1 as $i ($x; .a)))
+nested-fold-frozen-init-foreach-after-length	{"a":{"b":1,"c":[1,2]},"z":0}	del(. as $x | length | try (foreach 1 as $i ($x; .; .a)))
+nested-fold-frozen-init-reduce-at-register-control	{"a":{"b":1,"c":[1,2]},"z":0}	del(. as $x | try (reduce 1 as $i ($x; .a)))
+nested-fold-frozen-init-reduce-off-register-control	{"a":{"b":1,"c":[1,2]},"z":0}	del(. as $x | .a | try (reduce 1 as $i ($x; .a)))
+nested-fold-frozen-foreach-in-foreach-extract-del	{"a":{"b":1,"c":[1,2]},"z":0}	del(foreach .a as $v ([3,1,2]; (($v | .b?), 1); try (foreach 1 as $i ($v; .; .b))))
+nested-fold-frozen-foreach-in-foreach-extract-assign	{"a":{"b":1,"c":[1,2]},"z":0}	(foreach .a as $v ([3,1,2]; (($v | .b?), 1); try (foreach 1 as $i ($v; .; .b)))) = 9
+nested-fold-frozen-foreach-in-foreach-extract-path	{"a":{"b":1,"c":[1,2]},"z":0}	[path(foreach .a as $v ([3,1,2]; (($v | .b?), 1); try (foreach 1 as $i ($v; .; .b))))]
+nested-fold-frozen-reduce-in-foreach-extract-del	{"a":{"b":1,"c":[1,2]},"z":0}	del(foreach .a as $v ([3,1,2]; (($v | .b?), 1); try (reduce 1 as $i ($v; .b))))
+nested-fold-frozen-source-loop-var-navigated-del	{"a":{"b":1,"c":[1,2]},"z":0}	del(foreach .a as $v ([3,1,2]; (($v | .b?), 1); try (reduce $v as $i (0; $i.b))))
 owned-embed-agree-array-element	{"a":1}	. as $x | [.] | .[0] | path($x)
 owned-embed-refuse-path-nested-embed	{"a":1}	. as $x | [.] | path(.[0] | $x)
 owned-embed-path-nested-multi-first	{"a":1}	. as $x | [.,.] | path(.[0] | $x)
@@ -1238,6 +1247,10 @@ scalar-constant-pool-string-def:same as scalar-constant-pool-number-def, for a s
 bound-comma-nested-node-refuse-only:#3477 -- a comma sequence shares a node only when it names that node twice; `.a` inside a `.` element is a descendant of another element, and the materialized copy of `.` has already built its own `.a`, so jq's shared jv is not shared here (the exact-node memo is deliberate: descendant sharing is the embed table's job and needs a bind to register)
 fold-loop-var-scalar-refuses:#3329 -- a fold's loop variable is marked for containers only; a scalar has no storage identity until a bind promotes it (#3191), so `reduce (.) as $x (.; path($x))` on a string or number refuses where jq answers
 fold-loop-var-rebound-alt-chain:#3898 -- the fold's loop variable is aliased only by a plain `$x as $y` (or a passthrough pipe of it); a `?//` chain of binds is not read as a rebinding, so the variable is not marked and jq's answer ({"a":9}) is refused
+nested-fold-frozen-init-foreach-after-length:#3984 -- the fold's register is untracked, so a refusal of a frozen value the step could have navigated is the resolver's guess and stays loud (#3267); jq finds the step intact and answers
+nested-fold-frozen-foreach-in-foreach-extract-del:#3984 -- the fold's register is untracked, so a refusal of a frozen value the step could have navigated is the resolver's guess and stays loud (#3267); jq finds the step intact and answers
+nested-fold-frozen-foreach-in-foreach-extract-assign:#3984 -- the fold's register is untracked, so a refusal of a frozen value the step could have navigated is the resolver's guess and stays loud (#3267); jq finds the step intact and answers
+nested-fold-frozen-foreach-in-foreach-extract-path:#3984 -- the fold's register is untracked, so a refusal of a frozen value the step could have navigated is the resolver's guess and stays loud (#3267); jq finds the step intact and answers
 REFUSE_EOF
 
 if [[ "${1:-}" == "--list-cases" ]]; then

@@ -64292,6 +64292,111 @@ fn test_fold_pattern_step_that_never_succeeds_retries_3998() -> Result<()> {
     ])
 }
 
+/// #3984: a `reduce`/`foreach` that mentions a frozen `$v` inside a `try`, in a fold body or
+/// after a stage that leaves jq's register where it was (`length`, a literal), is judged
+/// against a register this resolver does not have: the fold's own register is untracked, so
+/// the accumulator it starts from (`$v`, which jq still holds by the very pointer the
+/// register is) cannot be certified, and the refusal of its first navigation is the resolver's
+/// guess, not jq's verdict. jq finds that step intact (its error, where it raises, comes later,
+/// at the fold's exit and outside the `try`), so the catching `try` dropped the write or path
+/// jq makes, or echoed the document where jq refuses. A fold that mentions a frozen `$v` and whose register is
+/// untracked now records it lost (#3267), so such a refusal is loud like every other guess:
+/// the program refuses (exit 5) where jq writes -- the recorded safe direction -- and where jq
+/// refuses too (`reduce`) the exit codes agree. Controls: a fold at the register, and one
+/// sitting off it, which jq refuses inside the `try`, are unchanged. Every jq side captured
+/// from jq 1.7.1. `reduce $v as $i (0; $i.b)` (#4008, which navigates the loop variable through a
+/// static tail) takes the same route: the `$v` SOURCE is the mention.
+#[test]
+fn test_nested_fold_over_frozen_var_with_untracked_register_stays_loud_3984() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"a":{"b":1,"c":[1,2]},"z":0}"#,
+            r"del(. as $x | length | try (reduce 1 as $i ($x; .a)))",
+            "",
+            r#"Invalid path expression near attempt to access element "a""#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1,"c":[1,2]},"z":0}"#,
+            r"del(. as $x | length | try (foreach 1 as $i ($x; .; .a)))",
+            "",
+            r#"Invalid path expression near attempt to access element "a""#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1,"c":[1,2]},"z":0}"#,
+            r"del(foreach .a as $v ([3,1,2]; (($v | .b?), 1); try (foreach 1 as $i ($v; .; .b))))",
+            "",
+            r#"Invalid path expression near attempt to access element "b""#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1,"c":[1,2]},"z":0}"#,
+            r"(foreach .a as $v ([3,1,2]; (($v | .b?), 1); try (foreach 1 as $i ($v; .; .b)))) = 9",
+            "",
+            r#"Invalid path expression near attempt to access element "b""#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1,"c":[1,2]},"z":0}"#,
+            r"[path(foreach .a as $v ([3,1,2]; (($v | .b?), 1); try (foreach 1 as $i ($v; .; .b))))]",
+            "",
+            r#"Invalid path expression near attempt to access element "b""#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1,"c":[1,2]},"z":0}"#,
+            r"del(foreach .a as $v ([3,1,2]; (($v | .b?), 1); try (reduce 1 as $i ($v; .b))))",
+            "",
+            r#"Invalid path expression near attempt to access element "b""#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1,"c":[1,2]},"z":0}"#,
+            r"del(foreach .a as $v ([3,1,2]; (($v | .b?), 1); try (reduce $v as $i (0; $i.b))))",
+            "",
+            r#"Invalid path expression near attempt to access element "b""#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1,"c":[1,2]},"z":0}"#,
+            r"(foreach .a as $v ([3,1,2]; (($v | .b?), 1); try (reduce $v as $i (0; $i.b)))) = 9",
+            "",
+            r#"Invalid path expression near attempt to access element "b""#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1,"c":[1,2]},"z":0}"#,
+            r"[path(foreach .a as $v ([3,1,2]; (($v | .b?), 1); try (reduce $v as $i (0; $i.b))))]",
+            "",
+            r#"Invalid path expression near attempt to access element "b""#,
+            5,
+        ),
+        // Controls.
+        (
+            r#"{"a":{"b":1,"c":[1,2]},"z":0}"#,
+            r"del(. as $x | try (reduce 1 as $i ($x; .a)))",
+            "",
+            r#"Invalid path expression with result {"b":1,"c":[1,2]}"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1,"c":[1,2]},"z":0}"#,
+            r"del(. as $x | .a | try (reduce 1 as $i ($x; .a)))",
+            "{\"a\":{\"b\":1,\"c\":[1,2]},\"z\":0}\n",
+            r"",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":[1,2]},"z":0}"#,
+            r"del(foreach .a as $v ([3,1,2]; (($v | .b?), 1); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
+            r"",
+            0,
+        ),
+    ])
+}
+
 /// #3744: a destructuring of the register itself (`.`) as a `foreach` SOURCE moves
 /// jq's path register through the pattern's tracked index steps, so the body's
 /// EXTRACT is checked against a register it is no longer at: `path(foreach (. as
