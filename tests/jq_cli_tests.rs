@@ -114686,3 +114686,102 @@ fn test_lazy_seq_identity_headed_pipe_runs_every_stage_3886() -> Result<()> {
     }
     Ok(())
 }
+
+/// #3909: a cursor printed by the general path (not the M2 echo) is written
+/// from its source text when that text is already the compact record, and
+/// re-rendered when it is not. Both routes must print the same bytes, and a
+/// malformed element must still leave nothing on stdout. Every expectation
+/// below was captured live from `/usr/bin/jq` 1.7.1 and agrees with the
+/// pre-change binary.
+#[test]
+fn test_cursor_printed_inside_a_lazy_array_echoes_or_rerenders_3909() -> Result<()> {
+    let doc = r#"{"a":{"x":[1,2,{"y":"z"}]},"b":{"n":1.0,"m":1e2},"c":{"k":1,"k":2},"d":{"e":"\u0041"},"s":"q","u":{"z":1,"a":2},"v":{"é":1}}"#;
+    for (filter, args, want) in [
+        // Canonical element: echoed.
+        ("[.a]", &["-c"][..], "[{\"x\":[1,2,{\"y\":\"z\"}]}]\n"),
+        ("[.a] | .[0]", &["-c"][..], "{\"x\":[1,2,{\"y\":\"z\"}]}\n"),
+        (
+            r#"{"k":.a}"#,
+            &["-c"][..],
+            "{\"k\":{\"x\":[1,2,{\"y\":\"z\"}]}}\n",
+        ),
+        // A number jq respells (`1e2` -> `1E+2`), a duplicate key (collapsed
+        // to the last value) and an escape jq writes raw (`A` -> `A`):
+        // each refuses the echo and is re-rendered.
+        ("[.b]", &["-c"][..], "[{\"n\":1.0,\"m\":1E+2}]\n"),
+        ("[.b] | .[0]", &["-c"][..], "{\"n\":1.0,\"m\":1E+2}\n"),
+        ("[.c]", &["-c"][..], "[{\"k\":2}]\n"),
+        ("[.c] | .[0]", &["-c"][..], "{\"k\":2}\n"),
+        ("[.d] | .[0]", &["-c"][..], "{\"e\":\"A\"}\n"),
+        // One echoed element beside one re-rendered one.
+        (
+            "[.a,.b]",
+            &["-c"][..],
+            "[{\"x\":[1,2,{\"y\":\"z\"}]},{\"n\":1.0,\"m\":1E+2}]\n",
+        ),
+        // A layout with whitespace in it is never the source text.
+        (
+            "[.a,.s]",
+            &["--indent", "1"][..],
+            "[\n {\n  \"x\": [\n   1,\n   2,\n   {\n    \"y\": \"z\"\n   }\n  ]\n },\n \"q\"\n]\n",
+        ),
+        // A raw string is not a JSON record at all.
+        ("[.s] | .[0]", &["-r"][..], "q\n"),
+        (
+            "[.a] | .[0]",
+            &["-j"][..],
+            "{\n  \"x\": [\n    1,\n    2,\n    {\n      \"y\": \"z\"\n    }\n  ]\n}",
+        ),
+        // The flags that leave the compact writer: an echo would print the
+        // source's key order and its raw non-ASCII.
+        ("[.u]", &["-S", "-c"][..], "[{\"a\":2,\"z\":1}]\n"),
+        ("[.u] | .[0]", &["-S", "-c"][..], "{\"a\":2,\"z\":1}\n"),
+        ("[.v]", &["-a", "-c"][..], "[{\"\\u00e9\":1}]\n"),
+        ("[.v] | .[0]", &["-a", "-c"][..], "{\"\\u00e9\":1}\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&[args, &[filter]].concat(), Some(doc))?;
+        assert_eq!(code, 0, "#3909: `{filter}` {args:?}: stderr={stderr:?}");
+        assert_eq!(stdout, want, "#3909: `{filter}` {args:?}");
+    }
+
+    // `--preserve-input` keeps the source's own spelling instead (succinctly's
+    // extension, so there is no jq to capture it from).
+    let (stdout, _, code) = run_jq_full(&["-c", "--preserve-input", "[.b]"], Some(doc))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[{\"n\":1.0,\"m\":1e2}]\n");
+    // `-C` colours, which a source span cannot.
+    let (stdout, _, code) = run_jq_full(&["-c", "-C", "[.u] | .[0]"], Some(doc))?;
+    assert_eq!(code, 0);
+    assert!(stdout.contains('\u{1b}'), "#3909: -C output {stdout:?}");
+
+    // `--seq` writes its record separator before the echoed record, as it does
+    // before a rendered one.
+    let seq_doc = format!("\u{1e}{doc}\n");
+    let (stdout, _, code) = run_jq_full(&["-c", "--seq", "[.a] | .[0]"], Some(&seq_doc))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "\u{1e}{\"x\":[1,2,{\"y\":\"z\"}]}\n");
+    Ok(())
+}
+
+/// #3909: the echo is a validation the same as the walk it replaces, so a
+/// malformed element still prints nothing and exits 5, whichever element it
+/// is and however the array is spelled.
+#[test]
+fn test_malformed_element_inside_a_lazy_array_prints_nothing_3909() -> Result<()> {
+    for (filter, input) in [
+        ("[.a]", r#"{"a":[1,,2]}"#),
+        ("[.a,.b]", r#"{"a":[1],"b":[1,,2]}"#),
+        ("[.a,.b]", r#"{"a":[1,,2],"b":[1]}"#),
+        ("[.a] | .[0]", r#"{"a":{"k":tru}}"#),
+        ("[.a]", r#"{"a":{"k":[1,2,]}}"#),
+        (r#"{"k":.a}"#, r#"{"a":[1 2]}"#),
+        ("[.a]", r#"{"a":{"k" 1}}"#),
+    ] {
+        for extra in [&["-c"][..], &[][..]] {
+            let (stdout, code) = run_jq_stdin(filter, input, extra)?;
+            assert_eq!(stdout, "", "#3909: `{filter}` on {input} {extra:?}");
+            assert_eq!(code, 5, "#3909: `{filter}` on {input} {extra:?}");
+        }
+    }
+    Ok(())
+}

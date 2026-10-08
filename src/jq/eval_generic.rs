@@ -43764,6 +43764,150 @@ mod tests {
         assert!(collisions > 20, "too few collisions: {collisions}");
     }
 
+    /// #3909: the CLI's `LazySeq` printer takes the canonical echo scan's `Some`
+    /// as `validate_cursor`'s `Ok` (`validate_lazy_seq_cursor`). That is only
+    /// sound if no document the scan accepts is one the walk refuses, so this
+    /// holds them to it: random documents over canonical and non-canonical
+    /// spellings, damaged at random, plus the depth ceiling's edge -- the scan
+    /// counts to 384 and the walk to 256, and the caller restates one as the
+    /// other by starting the scan at the difference.
+    #[test]
+    fn canonical_span_implies_validate_cursor_ok_3909() {
+        use crate::json::light::JsonCursor;
+        const START: usize = crate::jq::MAX_VALUE_TREE_DEPTH - MAX_NESTING_DEPTH;
+
+        fn scan_accepts(cursor: &JsonCursor<'_>) -> bool {
+            cursor.canonical_compact_span(START).is_some()
+        }
+
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self, n: usize) -> usize {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                (self.0 % n as u64) as usize
+            }
+        }
+        const KEYS: &[&str] = &[
+            r#""a""#,
+            r#""b""#,
+            r#""a""#,
+            r#""\ud800""#,
+            r#""\u0061""#,
+            r#""\ud800""#,
+            r#""k""#,
+            r#""é""#,
+        ];
+        const SCALARS: &[&str] = &[
+            "1",
+            "2.5",
+            "-0",
+            "1.0",
+            "1e999",
+            "1E+2",
+            "123456789012345678901234567890",
+            "null",
+            "true",
+            "false",
+            r#""s""#,
+            r#""\q""#,
+            r#""\ud800""#,
+            r#""\u0041""#,
+            r#""é""#,
+            r#""\n\t""#,
+        ];
+        fn gen(rng: &mut Rng, depth: usize, out: &mut String) {
+            match if depth > 4 { 0 } else { rng.next(3) } {
+                0 => out.push_str(SCALARS[rng.next(SCALARS.len())]),
+                1 => {
+                    out.push('{');
+                    for i in 0..rng.next(5) {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        out.push_str(KEYS[rng.next(KEYS.len())]);
+                        out.push(':');
+                        gen(rng, depth + 1, out);
+                    }
+                    out.push('}');
+                }
+                _ => {
+                    out.push('[');
+                    for i in 0..rng.next(4) {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        gen(rng, depth + 1, out);
+                    }
+                    out.push(']');
+                }
+            }
+        }
+        const DAMAGE: &[&str] = &[",", ":", "x", "{", "}", "[", "]", "\"", "\\", " "];
+        let mut docs: Vec<String> = Vec::new();
+        for depth in [250, 254, 255, 256, 257, 300, 383, 384] {
+            docs.push(linear_nest(depth));
+            docs.push(format!("{}1{}", "[".repeat(depth), "]".repeat(depth)));
+        }
+        let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+        for _ in 0..4000 {
+            let mut doc = String::new();
+            gen(&mut rng, 0, &mut doc);
+            if rng.next(3) == 0 {
+                let at = (0..=doc.len())
+                    .filter(|i| doc.is_char_boundary(*i))
+                    .nth(rng.next(doc.chars().count() + 1))
+                    .unwrap_or(0);
+                doc.insert_str(at, DAMAGE[rng.next(DAMAGE.len())]);
+            }
+            // Wrapped, so damage never lands before the node: text ahead of a
+            // value is its parent's to check (the CLI also balances brackets
+            // before it indexes anything), which neither walk looks at.
+            docs.push(format!("[{doc}]"));
+        }
+        let (mut accepted, mut refused_but_valid) = (0usize, 0usize);
+        for doc in &docs {
+            let index = JsonIndex::build(doc.as_bytes());
+            let cursor = index.root(doc.as_bytes());
+            // An unterminated string panics in the accessor whichever walk
+            // reaches it (the CLI catches that), and the scan reads bytes, so
+            // it is the walk that has to be shielded.
+            let accepts = scan_accepts(&cursor);
+            let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                validate_cursor::<JqSemantics, _>(&cursor).map_err(|e| e.message)
+            }));
+            if accepts {
+                accepted += 1;
+                assert_eq!(
+                    checked.as_ref().ok(),
+                    Some(&Ok(())),
+                    "the scan accepts a document validate_cursor refuses: {doc}"
+                );
+            } else if matches!(checked, Ok(Ok(()))) {
+                refused_but_valid += 1;
+            }
+        }
+        // Vacuity guards: the scan must have accepted plenty, refused plenty
+        // of valid ones, and the depth edge must have been on both sides.
+        assert!(accepted > 300, "too few accepted documents: {accepted}");
+        assert!(
+            refused_but_valid > 300,
+            "too few refused-but-valid: {refused_but_valid}"
+        );
+        let index = JsonIndex::build(linear_nest(255).as_bytes());
+        let nest_255 = linear_nest(255);
+        let cursor = index.root(nest_255.as_bytes());
+        assert!(
+            scan_accepts(&cursor),
+            "255 levels is inside the walk's ceiling"
+        );
+        let nest_256 = linear_nest(256);
+        let index = JsonIndex::build(nest_256.as_bytes());
+        let cursor = index.root(nest_256.as_bytes());
+        assert!(!scan_accepts(&cursor), "256 levels is the walk's ceiling");
+    }
+
     /// #3478: the same, over YAML, whose complex keys are flagged as
     /// fallbacks too (#2519) and so meet the ledger's seeding path.
     #[test]

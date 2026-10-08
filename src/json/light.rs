@@ -1077,6 +1077,47 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
         Some((start, end))
     }
 
+    /// This node's source span when it is already exactly what a compact,
+    /// default-convention (`JsonConvention::JqCompat`) render would write for
+    /// it, or `None` when it is not or cannot be told (#2608, #3909).
+    ///
+    /// The echo decision `stream_json` makes, lifted out so the CLI's
+    /// general-path printer can make it too: that printer (`print_json`)
+    /// walks the node field by field where this reads it once. `Some` is
+    /// both the output and its validation -- the scan is the structural check
+    /// a re-render would otherwise supply, see
+    /// `canonical_compact_jq_span_end` -- so a caller that gets one has
+    /// nothing left to check about the node's text. It does not say the node
+    /// is cheap to *evaluate*: only that its text is well formed and
+    /// canonical.
+    ///
+    /// `depth` is how many levels down the node is counted to be, against
+    /// [`MAX_VALUE_TREE_DEPTH`]: the printer's own `level`, or a larger number
+    /// for a caller that owes a tighter ceiling than the printer's.
+    ///
+    /// Only the node's *start* is taken from the cursor. The end comes out of
+    /// the scan itself -- see `canonical_compact_jq_span_end`'s own doc
+    /// comment for why that span is exactly this node's, and for the
+    /// 28%-of-the-gate `text_range` rescan this avoids (`raw_bytes` walks the
+    /// whole container a second time just to find the closing bracket the
+    /// scan is about to reach anyway).
+    pub fn canonical_compact_span(&self, depth: usize) -> Option<&'a str> {
+        let rest = self.text.get(self.text_position()?..)?;
+        let end = canonical_compact_jq_span_end_at_depth(rest, depth)?;
+        debug_assert_eq!(
+            self.text_range().map(|(start, stop)| stop - start),
+            Some(end),
+            "the canonical scan and `text_range` must agree on an accepted span"
+        );
+        // The scan certifies "canonical *given* valid UTF-8" and no longer
+        // decodes the sequences itself, so this is the half of the decision
+        // that rules on UTF-8 -- one vectorised pass instead of the scan's
+        // old byte-at-a-time decode. A failure is *not* an error of this
+        // method's: callers fall through to the re-render, which is what
+        // raises the real decode diagnostic.
+        core::str::from_utf8(&rest[..end]).ok()
+    }
+
     /// Get the raw bytes for this JSON value.
     ///
     /// Returns the original bytes from the JSON text, preserving formatting.
@@ -3321,12 +3362,23 @@ fn scalar_end_pos<W: AsRef<[u64]> + Clone>(
 ///   two agree, which the `debug_assert_eq!` in `stream_json`'s echo branch
 ///   checks against [`JsonCursor::text_range`] on every accepted span in
 ///   every debug build and test run.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn canonical_compact_jq_span_end(bytes: &[u8]) -> Option<usize> {
-    scan_canonical_value(bytes, 0, 0, &mut SpecialMask::new())
+    canonical_compact_jq_span_end_at_depth(bytes, 0)
 }
 
-/// The whole-buffer form of [`canonical_compact_jq_span_end`]: true iff
+/// `canonical_compact_jq_span_end` for a value that sits `depth` levels down
+/// already (#3909): the scan's nesting ceiling is [`MAX_VALUE_TREE_DEPTH`]
+/// counted from the document root, so a caller printing a nested value, or one
+/// that owes a tighter ceiling than the printer's, says where it starts. A
+/// larger `depth` only narrows what is accepted.
+#[must_use]
+pub(crate) fn canonical_compact_jq_span_end_at_depth(bytes: &[u8], depth: usize) -> Option<usize> {
+    scan_canonical_value(bytes, 0, depth, &mut SpecialMask::new())
+}
+
+/// The whole-buffer form of `canonical_compact_jq_span_end`: true iff
 /// that scan both accepts and consumes *all* of `bytes`. The accept
 /// language the differential tests in this module's own `mod tests` are
 /// written against, and the spelling the rest of this file's comments
@@ -3938,35 +3990,8 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
         // every caller that wants ascii-escaped output routes around this
         // method entirely rather than calling it with `JqCompat`.
         if indent.is_compact() && !sort_keys && numbers == JsonConvention::JqCompat {
-            // Only the node's *start* is taken from the cursor. The end
-            // comes out of the scan itself -- see
-            // `canonical_compact_jq_span_end`'s own doc comment for why that
-            // span is exactly this node's, and for the 28%-of-the-gate
-            // `text_range` rescan this avoids (`raw_bytes`, which the first
-            // draft called here, walks the whole container a second time
-            // just to find the closing bracket the scan is about to reach
-            // anyway).
-            if let Some(rest) = self
-                .text_position()
-                .and_then(|start| self.text.get(start..))
-            {
-                if let Some(end) = canonical_compact_jq_span_end(rest) {
-                    debug_assert_eq!(
-                        self.text_range().map(|(start, stop)| stop - start),
-                        Some(end),
-                        "the canonical scan and `text_range` must agree on an accepted span"
-                    );
-                    // The scan certifies "canonical *given* valid UTF-8"
-                    // and no longer decodes the sequences itself, so this
-                    // is the half of the decision that rules on UTF-8 --
-                    // one vectorised pass instead of the scan's old
-                    // byte-at-a-time decode. A failure is *not* an error
-                    // of this branch's: it falls through to the re-render,
-                    // which is what raises the real decode diagnostic.
-                    if let Ok(s) = core::str::from_utf8(&rest[..end]) {
-                        return Ok(out.write_str(s)?);
-                    }
-                }
+            if let Some(span) = self.canonical_compact_span(0) {
+                return Ok(out.write_str(span)?);
             }
             // Falls through to the general re-render path below -- no text
             // position was available, the span wasn't certified canonical,
