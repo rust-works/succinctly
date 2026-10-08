@@ -95348,6 +95348,65 @@ fn test_deferred_bind_matches_jq_3856() -> Result<()> {
     Ok(())
 }
 
+/// #4036: a deferred bind's whole-node reads share one copy of the node
+/// instead of decoding it per read, and answer what jq answers. Rows run at
+/// the bind's own input and under an iteration, beside a `path(...)` that does
+/// not name `$x`, and where `$x` is compared with the node it was bound from.
+/// Every expectation was captured from `/usr/bin/jq` 1.7.1.
+#[test]
+fn test_deferred_bind_whole_node_reads_match_jq_4036() -> Result<()> {
+    let doc = r#"{"meta":{"n":3,"lim":2},"users":[{"id":1,"name":"a","tags":["x","y"]},{"id":2,"name":"b","tags":[]},{"id":3,"name":"c","tags":["z"]}],"k":null}"#;
+    let rows: &[(&str, &str)] = &[
+        (". as $x | .users[] | {r: $x} | .r.meta.n", "3\n3\n3\n"),
+        (". as $x | .users[] | select($x == .) | .id", ""),
+        (". as $x | .users[] | select($x != .) | .id", "1\n2\n3\n"),
+        (
+            ". as $x | .users[] | $x | tojson | length",
+            "143\n143\n143\n",
+        ),
+        (". as $x | .users[] | [$x, .id] | .[1]", "1\n2\n3\n"),
+        (
+            ". as $x | .users[] | if .id == 2 then $x.meta else $x | length end",
+            "3\n{\"n\":3,\"lim\":2}\n3\n",
+        ),
+        (
+            ". as $x | .users[] | ({r: $x} | .r.k), (path(.id) | length)",
+            "null\n1\nnull\n1\nnull\n1\n",
+        ),
+        (
+            ". as $x | [.users[] | {r: $x} | .r.users[0].id]",
+            "[1,1,1]\n",
+        ),
+        (
+            ". as $x | .users[] | select(.id > 1) | $x | .k",
+            "null\nnull\n",
+        ),
+        (". as $x | .users[] | $x | length", "3\n3\n3\n"),
+        (
+            ". as $x | .users[] | [$x, $x] | .[0] == .[1]",
+            "true\ntrue\ntrue\n",
+        ),
+        (
+            ". as $x | .users[] | {a: $x, b: $x} | .a == .b",
+            "true\ntrue\ntrue\n",
+        ),
+        (". as $x | .users[] | $x == .", "false\nfalse\nfalse\n"),
+        (
+            ". as $x | .users[] | .id as $i | $x | .users[$i - 1].name",
+            "\"a\"\n\"b\"\n\"c\"\n",
+        ),
+        (
+            ". as $x | .users[] | .name + ($x | .meta.n | tostring)",
+            "\"a3\"\n\"b3\"\n\"c3\"\n",
+        ),
+    ];
+    for &(filter, want) in rows {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
+        assert_eq!((stdout.as_str(), code), (want, 0), "{filter}: {stderr:?}");
+    }
+    Ok(())
+}
+
 // ---- #2764: untracked-input `path()` arms refuse only where jq does ----
 
 /// The document every #2764 row below runs against. `.a.b.b` is `null`, so
