@@ -44812,6 +44812,41 @@ fn handler_leaves_register_on_scalar_payload(handler: &Expr) -> bool {
     }
 }
 
+/// [`cannot_move_register`] of a zero-arity `def` body (#4124). One budget of
+/// [`DEF_CALL_SHAPE_BUDGET`] bodies is shared by the whole outermost question, a count and not a
+/// depth: nested calls multiply (a pipe of `k` calls to a body that is a pipe of `k` calls ...), so a
+/// depth cap alone leaves the walk `k^depth` long. Past it the answer is `false`, so a recursive or
+/// fanned-out `def` reads as it did before the arm existed (a call that moves the register). Without
+/// `std` there is no thread-local to count with and the answer stays `false`, like every other
+/// recognition gated on one (#3790).
+#[cfg(feature = "std")]
+fn def_call_body_cannot_move_register(body: &Expr) -> bool {
+    use std::cell::Cell;
+    thread_local! {
+        /// Bodies looked into by the outermost question still being answered.
+        static USED: Cell<u32> = const { Cell::new(0) };
+        /// How many of these questions are nested on this thread; 0 outside any.
+        static NESTED: Cell<u32> = const { Cell::new(0) };
+    }
+    if NESTED.with(Cell::get) == 0 {
+        USED.with(|u| u.set(0));
+    }
+    if USED.with(Cell::get) >= DEF_CALL_SHAPE_BUDGET {
+        return false;
+    }
+    USED.with(|u| u.set(u.get() + 1));
+    NESTED.with(|n| n.set(n.get() + 1));
+    let leaves = cannot_move_register(body);
+    NESTED.with(|n| n.set(n.get() - 1));
+    leaves
+}
+
+/// See the `std` half.
+#[cfg(not(feature = "std"))]
+fn def_call_body_cannot_move_register(_body: &Expr) -> bool {
+    false
+}
+
 /// Whether evaluating `expr` as one pipe stage provably leaves jq's path
 /// register (`value_at_path`) exactly where it was (#1573).
 ///
@@ -44972,11 +45007,20 @@ fn cannot_move_register(expr: &Expr) -> bool {
         // #3186: only the condition is a subexp (`path(. as $x | if
         // ({j:1}|.zz) then 5 else 6 end | $x)` is `[]`); the branch that
         // runs is not (`if .k then .a else 6 end` moves it onto `.a`).
+        //
+        // #4124: a literal condition runs one branch only, so the other is not read
+        // (`def f: if false then .. else 1 end; f | $x` is `[]` in jq 1.7.1).
         Expr::If {
+            cond,
             then_branch,
             else_branch,
-            ..
-        } => cannot_move_register(then_branch) && cannot_move_register(else_branch),
+        } => match &**cond {
+            Expr::Literal(Literal::Bool(true)) => cannot_move_register(then_branch),
+            Expr::Literal(Literal::Bool(false) | Literal::Null) => {
+                cannot_move_register(else_branch)
+            }
+            _ => cannot_move_register(then_branch) && cannot_move_register(else_branch),
+        },
         Expr::Try { expr, catch } => {
             // #3965: a body that always raises emits nothing, and the raise
             // backtracks to the `try`'s fork point, so whatever its message or
@@ -45028,6 +45072,14 @@ fn cannot_move_register(expr: &Expr) -> bool {
         // `label` installs a scope and evaluates its body in it; only the
         // body can move the register.
         Expr::Label { body, .. } => cannot_move_register(body),
+
+        // #4124: `resolve_node_sink`'s `DefCall` arm resolves the bound body against the call's
+        // own input and frame, so a call with no arguments leaves the register where its body does
+        // (`def f: 1; f | $x`, which jq answers `[]` as it does `1 | $x`). A call with arguments
+        // binds code this cannot see. See [`def_call_body_cannot_move_register`].
+        Expr::DefCall { def, args, .. } if args.is_empty() && def.params.is_empty() => {
+            def_call_body_cannot_move_register(&def.body)
+        }
 
         // `fromjson` parses its input without indexing it. Its result can
         // re-establish a null register by jq's null identity rule; otherwise
@@ -131228,9 +131280,10 @@ mod tests {
     /// here regardless of the walk's own verdict.
     ///
     /// Reached via `FoldRegister::advance`'s third arm: the *outer*
-    /// `foreach`'s UPDATE (`def f: null; f | f`, a pipe of calls --
-    /// `cannot_move_register` is unconditionally `false` for a call, unlike a
-    /// literal) produces an untrackable branch, so the fold's own register
+    /// `foreach`'s UPDATE (`def f(g): null; f(1) | f(1)`, a pipe of calls that take
+    /// an argument -- `cannot_move_register` is `false` for those, unlike a literal;
+    /// a zero-argument call over a literal body reads as one since #4124)
+    /// produces an untrackable branch, so the fold's own register
     /// frame becomes
     /// `self.frame.unknown()` for the rest of that step. The *inner*
     /// `foreach`'s own destructuring pattern (`{a:$x}`, admitted by
@@ -131253,12 +131306,12 @@ mod tests {
         for (doc, filter) in [
             (
                 &b"null"[..],
-                "path(foreach (1) as $y (.; (def f: null; f | f); \
+                "path(foreach (1) as $y (.; (def f(g): null; f(1) | f(1)); \
                  foreach (null) as {a:$x} (.; .; $x)))",
             ),
             (
                 &b"{\"a\":1,\"b\":2}"[..],
-                "del(foreach (1) as $y (.; (def f: null; f | f); \
+                "del(foreach (1) as $y (.; (def f(g): null; f(1) | f(1)); \
                  foreach (null) as {a:$x} (.; .; $x)))",
             ),
         ] {

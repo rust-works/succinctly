@@ -98580,11 +98580,13 @@ fn test_recurse_seed_residuals_stay_loud_3580() -> Result<()> {
         (r"del(. as $x | 1 | [foreach (1,2) as $i (1; try ..; .)] | $x | .c)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"c\" of {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
         // #3914: an `if` whose branches hold no producer at all states nothing to read, and a `def` call
         // that takes an argument binds code the shape cannot see
-        (r"path(. as $x | 1 | if false then .a else 1 end | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+        // (`if false then .a else 1 end` is answered since #4124: a literal condition reads only the
+        // branch it runs)
+        (r"path(. as $x | 1 | if false then .a else 1 end | $x)", "[]\n", "", 0),
         (r"path(. as $x | 1 | def f(a): ..; f(1) | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
         // #3914: a `reduce` UPDATE whose `if` has a by-value branch is the same shape on the fold's own
-        // register and still refuses (jq: `[]`).
-        (r"path(. as $x | reduce (1,2) as $i (1; if false then .. else 1 end) | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+        // register; #4124's literal-condition rule answers it (jq: `[]`).
+        (r"path(. as $x | reduce (1,2) as $i (1; if false then .. else 1 end) | $x)", "[]\n", "", 0),
     ])
 }
 
@@ -121135,5 +121137,60 @@ fn test_reduce_try_update_handler_moves_the_register_4126() -> Result<()> {
         Some(r#"{"a":false}"#),
     )?;
     assert_eq!((out.as_str(), code), ("[]\n", 0), "stderr {err:?}");
+    Ok(())
+}
+
+/// #4124: a zero-arity `def` whose body is a by-value literal leaves jq's register where the call
+/// entered it, so `f | $x` answers `[]` as `1 | $x` does. The call used to read as a stage that
+/// may have moved the register: a bare `path` refused, and a `try` around it swallowed the refusal
+/// and printed nothing at exit 0. A body that navigates (`.a`) still refuses, as jq's does.
+#[test]
+fn test_def_call_with_a_literal_body_keeps_the_register_4124() -> Result<()> {
+    let doc = r#"{"a":{"b":{"b":null}},"c":2}"#;
+    for filter in [
+        "try path(. as $x | def f: 1; f | $x)",
+        "path(. as $x | def f: 1; f | $x)",
+        "try path(. as $x | 1 | def f: 1; f | $x)",
+        "try path(. as $x | def f: if false then .. else 1 end; f | $x)",
+        "try path(. as $x | def f: if null then .. else 1 end; f | $x)",
+        "path(. as $x | def f: 1; def g: f; g | $x)",
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", "--", filter], Some(doc))?;
+        assert_eq!(
+            (out.as_str(), code),
+            ("[]\n", 0),
+            "`{filter}`: stderr {err:?}"
+        );
+    }
+    for filter in [
+        "path(. as $x | def f: .a; f | $x)",
+        "path(. as $x | def f: if true then .. else 1 end; f | $x)",
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", "--", filter], Some(doc))?;
+        assert_eq!(code, 5, "`{filter}`: stdout {out:?} stderr {err:?}");
+        assert!(
+            err.contains("Invalid path expression with result"),
+            "`{filter}`: {err:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #4124 review: the zero-arity `def` call arm shares one budget across the whole question, so a
+/// chain whose every def calls the one below it several times in a pipe ends at once, as it did
+/// before the arm (a depth cap alone made the analysis fanout^16 long: minutes at a fanout of 5).
+#[test]
+fn test_def_call_chain_fanout_is_bounded_4124() -> Result<()> {
+    let mut filter = String::from("path(. as $x | def f0: 1; ");
+    for i in 1..=20 {
+        filter.push_str(&format!(
+            "def f{i}: {}; ",
+            vec![format!("f{}", i - 1); 6].join(" | ")
+        ));
+    }
+    filter.push_str("f20 | $x | .c)");
+    let (_, err, code) = run_jq_full(&["-c", "--", &filter], Some(r#"{"a":1,"c":3}"#))?;
+    assert_eq!(code, 5, "stderr {err:?}");
+    assert!(err.contains("exceeded maximum recursion depth"), "{err:?}");
     Ok(())
 }
