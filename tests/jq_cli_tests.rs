@@ -121783,6 +121783,40 @@ fn test_error_message_navigation_is_path_checked_4146() -> Result<()> {
         assert_eq!(code, 5, "#4146: `{program}`: stderr {err:?}");
         assert!(err.contains(message), "#4146: `{program}`: {err:?}");
     }
+    // The leading step decides, whatever wraps it: a pipe through `.`, a comma or `//` whose
+    // first output navigates, `.[]`, a `?`, parentheses.
+    for message in [
+        ".c, .c",
+        ".c, 5",
+        ".c // 1",
+        ". | .c",
+        ".[]",
+        "(.c)",
+        ".c?",
+        "(.c | tostring) | tostring",
+    ] {
+        let program = format!("path({{\"c\":false}} | try error({message}) catch .)");
+        let (_, err, code) = run_jq_full(&["-c", "--", &program], Some(r#"{"c":null}"#))?;
+        assert_eq!(code, 5, "#4146: `{program}`: stderr {err:?}");
+        assert!(
+            err.contains("Invalid path expression with result \"Invalid path expression"),
+            "#4146: `{program}`: {err:?}"
+        );
+    }
+    // A message that starts with a value, not a navigation, is the by-value route's.
+    let (_, err, code) = run_jq_full(
+        &[
+            "-c",
+            "--",
+            r#"path({"c":false} | try error(5, .c) catch .)"#,
+        ],
+        Some(r#"{"c":null}"#),
+    )?;
+    assert_eq!(code, 5, "#4146: {err:?}");
+    assert!(
+        err.contains("Invalid path expression with result 5"),
+        "{err:?}"
+    );
     // A tracked entry navigates the message natively, and a message that does not
     // navigate is unchanged.
     for (program, doc, want) in [

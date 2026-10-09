@@ -1300,6 +1300,12 @@ is the revert that established what the other one costs.
      refusals. The refusal's wording differs from jq's for `-(...)` (`boolean (false) cannot be
      negated`) and `and .[0]` (`near attempt to access element 0`). Not applied inside a fold
      body that has moved the register, where the entry register is not known.
+   - **`error(msg)` whose message starts with a value, not a navigation** (#4146). jq defines
+     `error(msg)` as `msg | error`, so a message that navigates raises jq's path error ahead of
+     the `error`; that is modelled for a message whose first step navigates (`error(.c)`,
+     `error(. | .c)`, `error(.c, 5)`, `error(.[])`). A message that first builds a value and then
+     navigates it (`error(1 | .c)`) is still evaluated by value: both refuse, but a `try` hands its
+     handler `Cannot index number with "c"` where jq hands it the path-error text.
    - **`map(f)` and `walk(f)` with an `f` outside `cannot_move_register`'s allowlist** are
      refused as a stage and as an operand where jq answers (`path(. as $x | map(.a) | $x)` on
      `[{"a":1}]` is `[]` in jq, and so is `map(sort)` on `[[3],[1]]`): jq path-checks `f` against
