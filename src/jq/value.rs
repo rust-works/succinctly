@@ -4518,6 +4518,14 @@ impl ReindexedDoc {
         // #4154: a one-token document's index follows from its length alone,
         // so it skips the scanner and the directory build the general
         // constructor pays for.
+        debug_assert!(
+            !scalar_root
+                || text
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|b| !matches!(b, b'[' | b'{' | b' ' | b'\n' | b'\t' | b'\r')),
+            "a scalar root's bridge text is one token at offset 0, got {text:?}"
+        );
         let index = if scalar_root {
             crate::json::JsonIndex::build_reindex_scalar(text.len())
         } else {
@@ -9831,6 +9839,13 @@ mod tests {
             OwnedValue::String("{}[],:\"[{".into()),
             OwnedValue::String("  padded  ".into()),
         ];
+        // Escapes the writer emits (quote, backslash, newline, `\u00XX`) in
+        // runs that straddle each word boundary.
+        for n in [30, 31, 32, 33, 62, 63, 64, 65] {
+            scalars.push(OwnedValue::String("\"".repeat(n).into()));
+            scalars.push(OwnedValue::String("\\".repeat(n).into()));
+            scalars.push(OwnedValue::String("\n\u{1}".repeat(n).into()));
+        }
         for n in [60, 61, 62, 63, 64, 65, 126, 127, 128, 129, 1000] {
             scalars.push(OwnedValue::String("x".repeat(n).into()));
             scalars.push(OwnedValue::String(format!("{{{}", "[,]".repeat(n)).into()));
@@ -9840,6 +9855,10 @@ mod tests {
             let general = JsonIndex::build_reindex(doc.text().as_bytes());
             assert_eq!(doc.index.ib(), general.ib(), "IB for {:?}", doc.text());
             assert_eq!(doc.index.ib_len(), general.ib_len());
+            for p in 0..=doc.index.ib_len() + 1 {
+                assert_eq!(doc.index.ib_rank1(p), general.ib_rank1(p), "ib_rank1({p})");
+            }
+            assert!(format!("{:?}", doc.index).contains("bridge_tokens: true"));
             assert_eq!(doc.index.bp().words(), general.bp().words());
             assert_eq!(doc.index.bp().len(), general.bp().len());
             let general_root = general.root(doc.text().as_bytes());

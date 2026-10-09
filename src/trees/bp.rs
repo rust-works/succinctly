@@ -2066,9 +2066,7 @@ impl BalancedParens<Vec<u64>, NoSelect> {
             select: NoSelect,
         }
     }
-}
 
-impl BalancedParens<Vec<u64>, NoSelect> {
     /// The balanced parentheses of a single leaf, `()`: one word, two bits,
     /// and no excess or rank directories (#4154).
     ///
@@ -2083,6 +2081,7 @@ impl BalancedParens<Vec<u64>, NoSelect> {
     ///
     /// For callers that build one per scalar (the jq reindex bridge), where
     /// the eight directory `Vec`s are most of the allocations.
+    #[doc(hidden)]
     pub fn leaf() -> Self {
         Self {
             words: alloc::vec![0b01],

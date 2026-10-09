@@ -117,9 +117,9 @@ fn allocations_collecting(query: &str, json: &str) -> (usize, i64) {
 
 const N: usize = 2_000;
 
-/// Allocator calls per member the rows may make. Measured at 8-12 (strings
-/// cost more: the owned string is its own allocation); before the change
-/// integers alone made 16-18, so every row is above the bound without it.
+/// Allocator calls per member the rows may make. Measured at 8-10 on integers
+/// and up to 12 on strings (the owned string is its own allocation); before the change
+/// integers made 16-18, which the bound rejects.
 const BOUND: usize = 14;
 
 fn fixtures() -> Vec<(&'static str, String)> {
