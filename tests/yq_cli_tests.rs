@@ -58720,6 +58720,73 @@ fn test_yaml_key_and_path_per_member_resume_the_scan_2784() -> Result<()> {
     Ok(())
 }
 
+/// #3846: `key` and `path` read at the members a fan-out *keeps* -- not at every member, so each
+/// read is not the previous one's neighbour -- over the irregular shapes #2784's pin mixes
+/// (bare `-` items, nested sequences and mappings, comments, flow and block-scalar values,
+/// explicit keys, anchors). A mapping's value is not rebuilt per read and a block-sequence
+/// item's parent is not found by climbing; the answers must still be each member's own.
+#[test]
+fn test_yaml_key_and_path_of_the_members_a_fan_out_keeps_3846() -> Result<()> {
+    let n = 300;
+
+    let mut mapping = String::new();
+    for i in 0..n {
+        mapping.push_str(&match i % 9 {
+            0 => format!("k{i}: {i}\n"),
+            1 => format!("k{i}:\n"),
+            2 => format!("k{i}: [a, b]\n"),
+            3 => format!("k{i}: {{x: 1}}\n"),
+            4 => format!("k{i}:\n  - p\n  - q\n"),
+            5 => format!("# comment\nk{i}: &a{i} v\n"),
+            6 => format!("k{i}:\n  y: 1\n  z: 2\n"),
+            7 => format!("? k{i}\n: value\n"),
+            _ => format!("k{i}: |\n  text\n"),
+        });
+    }
+    let kept: Vec<usize> = (0..n).filter(|i| matches!(i % 9, 0 | 2 | 4)).collect();
+    let keys: Vec<String> = kept.iter().map(|i| format!("k{i}")).collect();
+    let filter = "[.[] | select(tag == \"!!int\" or tag == \"!!seq\") | key]";
+    let (stdout, code) = run_yq_stdin(filter, &mapping, &["-o", "json", "-I", "0"])?;
+    assert_eq!(
+        (stdout.trim_end(), code),
+        (json_string_array(&keys).as_str(), 0)
+    );
+    let paths: Vec<String> = keys.iter().map(|k| format!("[\"{k}\"]")).collect();
+    let filter = "[.[] | select(tag == \"!!int\" or tag == \"!!seq\") | path]";
+    let (stdout, code) = run_yq_stdin(filter, &mapping, &["-o", "json", "-I", "0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), format!("[{}]", paths.join(",")));
+
+    let mut sequence = String::new();
+    for i in 0..n {
+        sequence.push_str(&match i % 11 {
+            8 => format!("-\n  id: {i}\n  v: 1\n"),
+            9 => "-\n  - p\n  - q\n".to_string(),
+            10 => format!("-\n  deferred{i}\n"),
+            0 => format!("- {i}\n"),
+            1 => "-\n".to_string(),
+            2 => format!("- - x{i}\n  - y\n"),
+            3 => format!("- id: {i}\n  v: 1\n"),
+            4 => "# comment\n- [p, q]\n".to_string(),
+            5 => format!("- {{a: {i}}}\n"),
+            6 => format!("- |\n  text{i}\n"),
+            _ => format!("-   spaced{i}\n"),
+        });
+    }
+    let kept: Vec<usize> = (0..n).filter(|i| matches!(i % 11, 0 | 2 | 4 | 9)).collect();
+    let indexes: Vec<String> = kept.iter().map(usize::to_string).collect();
+    let filter = "[.[] | select(tag == \"!!int\" or tag == \"!!seq\") | key]";
+    let (stdout, code) = run_yq_stdin(filter, &sequence, &["-o", "json", "-I", "0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), format!("[{}]", indexes.join(",")));
+    let paths: Vec<String> = kept.iter().map(|i| format!("[{i}]")).collect();
+    let filter = "[.[] | select(tag == \"!!int\" or tag == \"!!seq\") | path]";
+    let (stdout, code) = run_yq_stdin(filter, &sequence, &["-o", "json", "-I", "0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), format!("[{}]", paths.join(",")));
+    Ok(())
+}
+
 /// `["a","b"]` as JSON text, for the expected side of the #2784 pin.
 fn json_string_array(items: &[String]) -> String {
     let quoted: Vec<String> = items.iter().map(|k| format!("\"{k}\"")).collect();
