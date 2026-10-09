@@ -366,7 +366,7 @@ DEFAULT_THRESHOLD = 5.0
 # merge-base that already included it.
 #
 # `wide_identity` / `users_identity` / `users_compact_latefail` (#3344, then
-# again #3343) carried overrides of the same one-off kind: `find_close`
+# #4167, which closed #3343) carried overrides of the same one-off kind: `find_close`
 # scanning the starting word directly (#3344, -6.7% / -6.7% / -6.4% x86_64) and
 # `census` sorting only the hashes that land on an already-set bit instead of
 # all of them (#4167, `wide_identity` -6.5% x86_64). Both are now in `main`;
