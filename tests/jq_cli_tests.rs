@@ -105441,13 +105441,14 @@ fn test_halt_after_a_retried_lazy_fault_in_a_fold_source_writes_once_3518() -> R
 
 /// #3518, yq mode: the `try` and `?//` drivers are shared with `succinctly yq`,
 /// which has no `?//` (yq v4.53.3's lexer rejects it), so the double write cannot
-/// arise there. Real yq has neither `reduce` nor `halt_error` either, so this has no
+/// arise there. Real yq has neither `reduce` nor `halt_error` either (hence `--jq-extensions`, #2065), so this has no
 /// oracle; it pins that the shared drivers still write the halt once and stop.
 #[test]
 fn test_halt_in_a_fold_source_try_writes_once_in_yq_mode_3518() -> Result<()> {
     let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
         .args([
             "yq",
+            "--jq-extensions",
             "-o",
             "json",
             "-I",

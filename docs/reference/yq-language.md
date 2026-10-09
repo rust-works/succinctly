@@ -56,7 +56,7 @@ All features from the [jq Language Reference](jq-language.md) work with yq, incl
 - Operators (arithmetic, comparison, boolean, pipe, comma)
 - Array/object operations (`keys`, `values`, `sort`, `group_by`, etc.)
 - String functions (`split`, `join`, `test`, `match`, etc.)
-- Control flow (`if-then-else`, `try-catch`, `reduce`, `foreach`)
+- Control flow (`if-then-else`, `try-catch`; `reduce` and `foreach` need `--jq-extensions`)
 - User-defined functions (`def name: body;`)
 - Variable binding (`as $var`)
 - Assignment operators (`=`, `|=`, `+=`, etc.)
@@ -277,7 +277,7 @@ succinctly yq --eval-all 'select(file_index == 0) * select(file_index == 1)' f1.
 # General merge across any number of files: collect the documents into one
 # array first, then fold it (`reduce` is a succinctly extension here -- real
 # yq's lexer rejects it)
-succinctly yq --eval-all '[.] | reduce .[] as $item ({}; . * $item)' f1.yaml f2.yaml f3.yaml
+succinctly yq --jq-extensions --eval-all '[.] | reduce .[] as $item ({}; . * $item)' f1.yaml f2.yaml f3.yaml
 ```
 
 **Changed in this release**: the `.[] |` prefix the previous version of this section used (`--eval-all '.[] | select(file_index == 0)'`) is no longer the idiom — `.[]` now iterates each *document's* own members, exactly as real yq's does. `file_index`/`key`/`document_index`/`path`/`parent` resolve relative to their own document through `.`/`.[]`/`.field` navigation, comparisons, `select(...)`, `map(...)`, `if/then/else`, `try/catch`, comma, `label`, array literals (`[...]`), and user-defined functions — but not inside object literals (`{...}`) or `any`/`all`, where they fall back to `0` (see [Known Limitations](#known-limitations)). `--eval-all` is incompatible with `--slurp`, `--inplace`, `--raw-input`, `--split-exp`, and `--front-matter`.
@@ -597,6 +597,7 @@ surface (#1512):
 | `INDEX(idx_expr)`, `INDEX(stream; idx_expr)`         | Build an object keyed by an index expr (#1714)|
 | `JOIN(idx; idx_expr)` and its 3/4-argument forms     | Join a stream against an `INDEX` (#3046)      |
 | `walk(f)`                                            | Recursively transform every node (#1714)      |
+| `reduce SRC as $x (init; update)`, `foreach SRC as $x (init; update[; extract])` | Fold keywords (#2065, #2447, #2605) |
 | `floor`, `ceil`, `round`, `sqrt`, `fabs`             | Basic math functions (#1714; past `i64` range now a `Float`, not saturated, #2937) |
 | `abs`, `trunc`                                       | Absolute value / truncate to integer (#1885)  |
 | `log`, `log2`, `log10`                               | Logarithms (#1714)                            |

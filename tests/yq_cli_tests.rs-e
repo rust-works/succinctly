@@ -60112,6 +60112,7 @@ fn test_tags_on_flow_collections_and_mapping_keys_are_kept_4088() -> Result<()> 
     Ok(())
 }
 
+<<<<<<< HEAD
 /// #3039: a comma-grouped `del()`/write whose branch navigates into a scalar prunes that
 /// branch (yq's `traverse` yields no candidate) instead of raising and losing its siblings.
 #[test]
@@ -60180,9 +60181,7 @@ fn test_jq_comma_branch_crossing_a_scalar_still_raises_3039() -> Result<()> {
     let (_out, err, code) = run_jq_stdin_with_stderr("del(.a, .a[0])", r#"{"a":"ab"}"#, &["-c"])?;
     assert_ne!(code, 0);
     assert!(err.contains("Cannot index string with number"), "err={err}");
-    Ok(())
-}
-
+=======
 /// #2065/#2447/#2605: real yq v4.53.3's lexer rejects `reduce` and `foreach`
 /// (`invalid input text "reduce .a[] as $..."`), so yq mode gates both behind
 /// `--jq-extensions` like the rest of the jq-only surface (#1512).
@@ -60214,5 +60213,6 @@ fn test_yq_reduce_foreach_are_gated_behind_jq_extensions_2065() -> Result<()> {
     // A mapping key spelled like the keyword is a field name, not the fold.
     let (out, code) = run_yq_stdin(".reduce", "reduce: 7\n", &[])?;
     assert_eq!((out.trim(), code), ("7", 0));
+>>>>>>> 05a0112f (fix(yq): gate reduce and foreach behind --jq-extensions)
     Ok(())
 }

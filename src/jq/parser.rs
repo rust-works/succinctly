@@ -3091,10 +3091,12 @@ impl<'a> Parser<'a> {
                         Self::parse_error_expr,
                     )
                 } else if self.matches_keyword("reduce") {
+                    self.reject_unless_jq_extensions("reduce")?;
                     let e = self.parse_reduce_expr()?;
                     self.last_primary_is_term = false;
                     return Ok(e);
                 } else if self.matches_keyword("foreach") {
+                    self.reject_unless_jq_extensions("foreach")?;
                     let e = self.parse_foreach_expr()?;
                     self.last_primary_is_term = false;
                     return Ok(e);
