@@ -78,6 +78,8 @@ This directory documents optimization techniques used in the succinctly library,
 | jq `memchr::memmem` substring | **Deferred**  | Green micro (5.9×/52×) but scan is a minority of allocation-bound ops; no end-to-end workload (#301) | [jq-string-search.md](jq-string-search.md) |
 | jq `@csv`/`@tsv`/`@dsv`/`@sh` byte-scan rewrite | **No effect** (in noise) | Already at 10-14 GiB/s pre-rewrite; allocation/pass count wasn't the bottleneck | [jq-format-allocation.md](jq-format-allocation.md) |
 | jq settled vs sink-fed operands (#4132) | **No change** (sink-fed 0.91-1.29x of settled) | Sink-fed runs 8-15% fewer instructions but takes 1.6-1.7x the D1 misses at 25-200 terms; widening the settle rule is 3-24% slower | [jq-settled-operands.md](jq-settled-operands.md) |
+| jq census: exactly sized hash table or radix partition instead of the sort (#3343) | **+3.8% to +38%** on a 7950X (table: -2.9% on an M4 Pro) | A table that fits one box's cache is a random-access loss on the other; the radix permute is a dependent chain | [parsing/json.md](../parsing/json.md#key-census-of-a-wide-object-3343) |
+| jq canonical-gap fast path in `preceding_gap_ok` / `following_gap_ok` (#3343) | **+3.2% to +3.9%** wall on the identity print (instructions -1.2%) | Fewer instructions, slower code in the shared gap check; nothing on `length` | [parsing/json.md](../parsing/json.md#key-census-of-a-wide-object-3343) |
 
 ---
 
