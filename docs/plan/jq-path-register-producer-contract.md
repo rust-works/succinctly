@@ -545,11 +545,13 @@ Each turns a refusal into an answer and needs its own oracle rows:
   `array_contents_are_checked` asks `is_select_stage` (select or a type filter), where it named
   only `select`. Done by #3767 Part 3: `try E catch H` is `E`'s verdict when `H` cannot move the register
   (`stage_is_register_keeping`: jq runs the handler after a backtrack that restores the register, on the
-  error's payload, which has no position); a handler that navigates stays refused. Still open under #3767: a compound inner stage (`,` `//`
-  `if`, a pipe, a `def` call), an `[E]` of a wrapper around a type filter
-  (`[first(numbers)]`; `[last(f)]` is Done by #3767 Part 2: `array_contents_are_checked` reads through
-  `last(f)` to `f`), and a wrapper over an inner stage that navigates nothing (`first(.)`,
-  `limit(1; .)`, `limit(1; 5)`), which jq leaves in place and the allowlist does not read through.
+  error's payload, which has no position); a handler that navigates stays refused. Done by #3767 Part 2: `[last(f)]`
+  (`array_contents_are_checked` reads through `last(f)` to `f`). Done by #3767 Part 4: a wrapper over an inner stage that
+  navigates nothing (`first(5)`, `limit(1; 5)`, `nth(0; 5)`: `stage_is_register_keeping` also admits
+  `cannot_move_register(stage)` after the peel, and deliberately not by widening `cannot_move_register` itself, whose
+  other consumers would all move), and an `[E]` collect of `first(f)`/`limit(n; f)`/`nth(n; f)`
+  (`array_contents_are_checked` reads them through to `f`, as the resolver's arms forward `f`'s live branches).
+  Still open under #3767: a compound inner stage (`,` `//` `if` on an untracked entry, a pipe, a `def` call).
 - ~~A `reduce` whose source or `UPDATE` navigates.~~ Done by #3732 (`reduce_leaves_register_in_place`, read by
   `resolve_reduce`'s emission and by `leaves_register_in_place`): jq's `reduce` is `INIT; FORK loop; SOURCE; UPDATE;
   BACKTRACK`, so the register is where INIT left it, and an INIT that cannot move it leaves it at the entry whatever

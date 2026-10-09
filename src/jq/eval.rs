@@ -42771,7 +42771,9 @@ fn stage_leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
 
 /// The shape half of [`stage_leaves_register_in_place`]: `expr` read through the
 /// wrappers [`peel_register_transparent`] passes the register through is a
-/// `last(f)` or a `select(f)`/type filter, or a `try E catch H` over one whose
+/// `last(f)` or a `select(f)`/type filter, a stage that navigates nothing
+/// ([`cannot_move_register`]: `first(5)`, `limit(1; 5)`, `nth(0; 5)` are as
+/// unmoving as the `5` under them), or a `try E catch H` over one whose
 /// handler cannot move it (#3767).
 ///
 /// jq runs a `try`'s handler after backtracking to the fork the `try` set, and a
@@ -42792,7 +42794,10 @@ fn stage_is_register_keeping(expr: &Expr) -> bool {
             expr: inner,
             catch: Some(handler),
         } => stage_is_register_keeping(inner) && cannot_move_register(handler),
-        stage => is_last_stage(stage) || is_select_stage(stage),
+        // #3767: a stage that navigates nothing leaves it where it was, and the
+        // wrappers peeled above add no movement, so `first(5)`, `limit(1; 5)` and
+        // `nth(0; 5)` are as unmoving as the `5` under them.
+        stage => is_last_stage(stage) || is_select_stage(stage) || cannot_move_register(stage),
     }
 }
 
@@ -44135,7 +44140,8 @@ fn array_resolves_live<S: EvalSemantics>(inner: &Expr, trackable: bool) -> bool 
 /// slice's target (its keys are subexps); pipes, commas and parens of
 /// those; `last(f)`, whose claim is `f`'s own (#3767: it is `reduce f as $x
 /// (null; $x)`, so `f` is a source jq path-checks as the resolver's `last` arm
-/// does); `and`/`or`/unary minus over operands that satisfy
+/// does), and so are `first(f)`, `limit(n; f)` and `nth(n; f)`, which forward
+/// `f`'s own live branches; `and`/`or`/unary minus over operands that satisfy
 /// [`and_or_operand_is_checked`] (this predicate or
 /// [`register_movement_tracked`], so the two are mutually recursive there,
 /// #3724); and anything [`cannot_move_register`] admits, which neither moves
@@ -44167,6 +44173,15 @@ fn array_contents_are_checked(inner: &Expr) -> bool {
         // whatever it is for `f` itself; the output is demoted, so a navigation
         // after it inside the brackets still refuses.
         Expr::LastExpr(f) | Expr::Builtin(Builtin::LastStream(f)) => array_contents_are_checked(f),
+        // #3767: `first(f)`, `limit(n; f)` and `nth(n; f)` forward `f`'s own live
+        // branches (`resolve_bounded_sink`, `resolve_limit_sink`, `resolve_nth_sink`),
+        // so what `f` navigates is path-checked exactly as in a pipe, and the count
+        // is a subexp jq checks nothing in. The claim is `f`'s own.
+        Expr::FirstExpr(f)
+        | Expr::Limit { expr: f, .. }
+        | Expr::Builtin(Builtin::FirstStream(f) | Builtin::NthStream(_, f)) => {
+            array_contents_are_checked(f)
+        }
         // #3289: `resolve_node_sink` resolves `and`/`or`/unary minus live in
         // jq mode, checking each operand's navigation against the register
         // as jq does, and since #3428 it does so for every operand. The claim
@@ -89936,9 +89951,11 @@ mod tests {
         ] {
             assert!(!is_type_filter(&other), "{other:?}");
             assert_eq!(type_filter_keeps(&other, &OwnedValue::Null), None);
-            assert!(!stage_leaves_register_in_place::<JqSemantics>(
-                &Expr::Builtin(other)
-            ));
+            // Not a `select`/`last` stage. (`length` and the rest navigate nothing, so
+            // since #3767 part 4 the shape half admits them through
+            // `cannot_move_register`, as `resolve_seq_stage` already did bare.)
+            let expr = Expr::Builtin(other);
+            assert!(!is_select_stage(&expr) && !is_last_stage(&expr));
         }
 
         let stage = |filter: &str| parse(filter).expect("filter parses");
@@ -90000,6 +90017,64 @@ mod tests {
                 !stage_leaves_register_in_place::<YqSemantics>(&expr),
                 "{admitted}"
             );
+        }
+        // #3767 (part 4): a wrapper over a stage that navigates nothing leaves the
+        // register where it was, as the stage under it does.
+        for admitted in [
+            "first(5)",
+            "limit(1; 5)",
+            "limit(0; 5)",
+            "nth(0; 5)",
+            "first(\"s\")?",
+            "try first(5)",
+            "first(limit(1; 5))",
+            "limit(1; first(null))",
+        ] {
+            let expr = stage(admitted);
+            assert!(
+                stage_leaves_register_in_place::<JqSemantics>(&expr),
+                "{admitted}"
+            );
+            assert!(
+                !stage_leaves_register_in_place::<YqSemantics>(&expr),
+                "{admitted}"
+            );
+        }
+        // ... and one over a stage that navigates, or whose later outputs may, still moves it.
+        for refused in [
+            "first(.a)",
+            "limit(2; (5, .a))",
+            "nth(1; (5, .a))",
+            "first(5 | .a)",
+        ] {
+            let expr = stage(refused);
+            assert!(
+                !stage_leaves_register_in_place::<JqSemantics>(&expr),
+                "{refused}"
+            );
+        }
+        // ... and the collect reads `first`/`limit`/`nth` through to `f`.
+        for (filter, checked) in [
+            ("[first(numbers)]", true),
+            ("[limit(1; select(.))]", true),
+            ("[nth(0; values)]", true),
+            ("[first(last(.a))]", true),
+            ("[first(.a)]", true),
+            ("[nth(0; def f: .a; f)]", false),
+            ("[first(def f: .a; f)]", false),
+        ] {
+            let Expr::Array(inner) = stage(filter) else {
+                panic!("{filter} is a collect");
+            };
+            assert_eq!(array_contents_are_checked(&inner), checked, "{filter}");
+            // The wrapper adds no claim of its own: it is `f`'s.
+            let (Expr::FirstExpr(f)
+            | Expr::Limit { expr: f, .. }
+            | Expr::Builtin(Builtin::NthStream(_, f))) = unwrap_paren(&inner)
+            else {
+                panic!("{filter} holds a first/limit/nth");
+            };
+            assert_eq!(array_contents_are_checked(f), checked, "{filter}");
         }
         // #3767: `try E catch H` is `E`'s verdict when `H` cannot move the register.
         for admitted in [
