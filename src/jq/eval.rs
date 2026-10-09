@@ -42786,11 +42786,11 @@ fn leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
                 Expr::Builtin(Builtin::Map(f) | Builtin::Walk(f)) => cannot_move_register(f),
                 // #3732: the source and `UPDATE` are backtracked, INIT is not.
                 Expr::Reduce {
-                    patterns,
                     input,
                     init,
                     update,
-                } => reduce_leaves_register_in_place(patterns, input, init, update),
+                    ..
+                } => reduce_leaves_register_in_place(input, init, update),
                 _ => false,
             })
 }
@@ -44583,17 +44583,18 @@ fn reduce_cannot_move_register(
 /// error jq raises inside them that the fold does not model, and the first sweep
 /// found it for a source that destructures a computed value (`reduce (. as {a:$a}
 /// | .) as $k (.; .)` after `{a:{b:1}} | `: jq refuses at the destructuring `.a`,
-/// and accepting the stage answered `[]`). A destructuring pattern on the `reduce`
-/// itself stays out as in #3710: its own walk is resolved by the fold, and it is
-/// not claimed here.
-fn reduce_leaves_register_in_place(
-    patterns: &[Pattern],
-    input: &Expr,
-    init: &Expr,
-    update: &Expr,
-) -> bool {
-    patterns_all_bare(patterns)
-        && cannot_move_register(init)
+/// and accepting the stage answered `[]`).
+///
+/// **#4048: the loop pattern is not asked about.** A destructuring pattern
+/// (`as {a:$a}`, `as [$a] ?// $a`) runs its `INDEX` steps after the `FORK`, inside
+/// the same backtracked loop as the source, so what it navigates does not survive
+/// the fold either. [`resolve_reduce`]'s own walk is what models the pattern's
+/// `path_intact` check, and it still runs for every element; this predicate only
+/// says where the register is once the fold has answered. (Not so for
+/// [`reduce_cannot_move_register`], which also stands for "navigates nothing", and
+/// not for `foreach`, which emits from inside the loop.)
+fn reduce_leaves_register_in_place(input: &Expr, init: &Expr, update: &Expr) -> bool {
+    cannot_move_register(init)
         && register_movement_tracked(input)
         && fold_update_movement_tracked(update)
 }
@@ -50593,9 +50594,12 @@ fn resolve_reduce<'a, S: EvalSemantics>(
     // narrower one, which misses a computed key (`.[1+1]`) and so let the
     // slice rule accept `path(reduce .[1+1] as $a (.; .[0:]))` where jq refuses.
     // #3710: a property of the `reduce`'s syntax, so answered once rather than per INIT fork.
-    let register_unmoved = S::TAG == EvalTag::Jq
-        && trackable
-        && reduce_leaves_register_in_place(patterns, input, init, update);
+    let leaves_in_place =
+        S::TAG == EvalTag::Jq && reduce_leaves_register_in_place(input, init, update);
+    let register_unmoved = leaves_in_place && trackable;
+    let carried_register = (leaves_in_place && !trackable && !frame.register_loss.is_lost())
+        .then(|| frame.register().cloned())
+        .flatten();
     // #3984: jq mode only, like every register admission here. A syntactic property of the
     // `reduce`, so answered once rather than per INIT fork.
     let mentions_frozen_var =
@@ -51039,10 +51043,16 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         // and UPDATE are backtracked ([`reduce_leaves_register_in_place`]), so
         // a navigating source or UPDATE leaves it there too. The leaf states it,
         // as every by-value leaf does ([`leaf_register`]); the stage then takes
-        // the stricter of that and its own verdict. A trackable entry only: an
-        // untracked one carries its register on the stage.
+        // the stricter of that and its own verdict. #4048: an untracked entry
+        // carries its register on the stage's frame, and a pipe stage reads it
+        // from there; an `and`/`or`/unary-minus operand is resolved live and its
+        // result's register is the branch's own statement ([`register_after`]),
+        // so the fold states the frame's register too -- when the frame still
+        // holds one ([`Frame::register`]), not a lost one.
         if register_unmoved && !emitted.trackable {
             emitted = emitted.with_register(BranchRegister::Unmoved(Cow::Borrowed(value)));
+        } else if let Some(register) = carried_register.as_ref().filter(|_| !emitted.trackable) {
+            emitted = emitted.with_register(BranchRegister::Unmoved(Cow::Owned(register.clone())));
         }
         if sink(emitted) == Demand::Stop {
             fork_outcome.stash(ResolveFlow::Stopped);
@@ -127556,14 +127566,21 @@ mod tests {
             );
         }
         // #3732: a `reduce` whose INIT cannot move the register, whatever a source
-        // and `UPDATE` the resolver checks navigate; a navigating INIT, a
-        // destructuring pattern and a source or `UPDATE` it does not check stay out.
+        // and `UPDATE` the resolver checks navigate; a navigating INIT and a source or
+        // `UPDATE` it does not check stay out. #4048: the loop pattern is not asked
+        // about -- a destructuring one runs inside the backtracked loop too -- but an
+        // INIT, source or `UPDATE` that fails the rules above keeps a destructuring
+        // `reduce` out as it does a bare one.
         for (src, stays) in [
             ("reduce (1) as $i (.; .a)", true),
             ("reduce .a as $i (.; .b)", true),
             ("reduce (1) as $i (.; 5)", true),
             ("reduce (1) as $i (.a; .)", false),
-            ("reduce (1) as [$i] (.; 5)", false),
+            ("reduce (1) as [$i] (.; 5)", true),
+            ("reduce . as {a:$a} ?// $a (0; .)", true),
+            ("reduce .a as {b:$b} (.; $b)", true),
+            ("reduce (1) as [$i] (.a; .)", false),
+            ("reduce . as {a:$a} (.; try .a catch .)", false),
             ("reduce (. as {a:$a} | .) as $k (.; .)", false),
             ("reduce (1) as $i (.; try .a catch .)", false),
         ] {
