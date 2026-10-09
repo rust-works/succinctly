@@ -122506,3 +122506,36 @@ fn test_jq_slice_bound_with_no_output_is_no_slice_4197() -> Result<()> {
     }
     Ok(())
 }
+
+/// #4139's control: yq reads an operand with no output as "no operator" (an `as`
+/// body that still runs, an index that stands for every child, a `has` that is
+/// `false`), and jq does none of it. Every row was captured from `/usr/bin/jq`
+/// 1.7.1 and must keep its answer.
+#[test]
+fn test_jq_empty_operand_keeps_the_generator_model_4139() -> Result<()> {
+    for (input, filter, expected) in [
+        ("[1,2]", "select(false) as $y | 3", ""),
+        ("[1,2,3]", "[.[] | select(false) as $z | .]", "[]\n"),
+        ("[1,2]", "[1] | .[select(false)]", ""),
+        ("{\"a\":1,\"b\":[1,2,3]}", "[.b[select(false)]]", "[]\n"),
+        (
+            "{\"a\":1,\"b\":2}",
+            ".[select(false)] = 9",
+            "{\"a\":1,\"b\":2}\n",
+        ),
+        (
+            "{\"a\":1,\"b\":[1,2,3]}",
+            ".b[select(false)] += 1",
+            "{\"a\":1,\"b\":[1,2,3]}\n",
+        ),
+        ("[1,2,3]", "del(.[select(false)])", "[1,2,3]\n"),
+        ("[1,2]", "[has(select(false))]", "[]\n"),
+    ] {
+        assert_eq!(
+            run_jq_stdin(filter, input, &["-c"])?,
+            (expected.into(), 0),
+            "{filter} on {input}"
+        );
+    }
+    Ok(())
+}

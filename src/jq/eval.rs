@@ -7315,11 +7315,13 @@ fn each_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
-    fanout_arg_each_with_origin::<W, S, _>(
+    let mut bound_any = false;
+    let flow = fanout_arg_each_with_origin::<W, S, _>(
         expr,
         value.clone(),
         optional,
         |mut bound_val, origin| {
+            bound_any = true;
             // #2889 Stage B: the mirror of `each_as_generic`'s own push --
             // the binding holds this node's `OwnedValue` for the body's
             // whole dynamic extent, so registering it makes a later
@@ -7333,7 +7335,34 @@ fn each_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 substitute_bound_var_from::<S>(expr, body, var, &bound_val, origin);
             eval_each::<W, S>(&substituted_body, value.clone(), optional, sink)
         },
-    )
+    );
+    // yq's `as` runs its body once, with the variable unbound, when the source
+    // has no output (#4139).
+    if yq_runs_as_body_without_source::<S>(bound_any, &flow) {
+        return eval_each::<W, S>(body, value, optional, sink);
+    }
+    flow
+}
+
+/// Whether an `as` whose source produced nothing still runs its body (#4139).
+///
+/// yq's `A as $v | B` is the assign-variable operator followed by `|`: the
+/// operator hands its *context* on whether or not `A` matched anything, and
+/// leaves the variable unset, so `B` runs once against the unchanged input and
+/// reads `$v` as no output (#2981). jq runs `B` once per output of `A`, so
+/// nothing at all for an empty `A`. Captured live against yq v4.53.3
+/// (`select(false) as $z | .a` is `.a`, `[.[] | select(false) as $z | .]` is the
+/// input array again).
+///
+/// `bound_any` is whether the body ran for any bound value, and `flow` how the
+/// source's fan-out ended: only a clean end counts, never an escape (the source
+/// raised, so there is nothing to continue from) or a stop (the consumer has
+/// what it wanted).
+pub(crate) fn yq_runs_as_body_without_source<S: EvalSemantics>(
+    bound_any: bool,
+    flow: &Flow,
+) -> bool {
+    S::TAG == EvalTag::Yq && !bound_any && matches!(flow, Flow::Exhausted)
 }
 
 /// Lazy twin of [`eval_as_pattern`] (#2180 WP2b widens #1462 the same way
@@ -15835,7 +15864,8 @@ fn builtin_has<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    fanout_arg::<W, S, _>(
+    let mut keyed = false;
+    let result = fanout_arg::<W, S, _>(
         key_expr,
         value.clone(),
         optional,
@@ -15844,8 +15874,17 @@ fn builtin_has<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // jq gives `[true,false]`. Bug-for-bug per ADR-0018, so yq mode keeps
         // using only the first key.
         ArgFanout::yq_native::<S>(),
-        |key_owned| has_one_key::<W, S>(&value, key_owned, optional),
-    )
+        |key_owned| {
+            keyed = true;
+            has_one_key::<W, S>(&value, key_owned, optional)
+        },
+    );
+    // yq's `has(E)` is `false` when `E` has no output, on any operand (#4139):
+    // `has(select(false))` and an unbound `has($typo)`. jq has no output.
+    if S::TAG == EvalTag::Yq && !keyed && matches!(result, QueryResult::None) {
+        return QueryResult::Owned(OwnedValue::Bool(false));
+    }
+    result
 }
 
 /// `has(key)`'s check for one already-resolved key — the body of
@@ -27338,7 +27377,9 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `Owned`/`ManyOwned` arms exactly (no `to_owned_key_shape`
     // normalization for these -- pre-existing, unchanged behavior): an
     // already-owned key keeps its full content.
+    let mut keys_seen = false;
     let mut sink = |item: Item<'a, W>| -> Demand {
+        keys_seen = true;
         match item {
             Item::Borrowed(v) => {
                 // STYLE-0012: this materializes the *key* generator's
@@ -27385,7 +27426,14 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `borrowed_vec_to_result` fallback below already collapses to
         // `None`, the same as the old `if keys.is_empty() { return
         // QueryResult::None }` early check did.
-        Flow::Exhausted => {}
+        //
+        // yq reads an index with no output as no index at all, so `.[E]` is
+        // every child of the operand (#4139); see `yq_empty_index_children`.
+        Flow::Exhausted => {
+            if !keys_seen && S::TAG == EvalTag::Yq {
+                return eval_single::<W, S>(&yq_empty_index_children(target), value, optional);
+            }
+        }
         // Our sink is the only thing that can ask the pull to stop, and it
         // only ever does so through `escape_with_prefix!`, which sets
         // `terminal` before returning `Demand::Stop` -- so `terminal` would
@@ -27428,6 +27476,23 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Some(vs) => owned_vec_to_result(vs),
         None => borrowed_vec_to_result(borrowed),
     }
+}
+
+/// What yq's `E[K]` is when `K` has no output (#4139): `E[]`, every child of
+/// the operand, not nothing.
+///
+/// Captured live against yq v4.53.3 on `[1,2,3]` and `{"a":1,"b":[1,2,3]}`:
+/// `.[select(false)]` (or an unbound `.[$typo]`) prints each child, `del(...)`
+/// of it deletes them all, `.[select(false)] = 9` assigns every member, and
+/// `has(select(false))` is `false`. jq mode keeps its generator model, where
+/// no key means no result.
+///
+/// The children of a scalar or `null` are none, not an error (`.b[]` on `b: 3`
+/// is silent in yq), hence the `?`: path-position iteration over a scalar
+/// raises (see `resolve_iterate_sink`), which would turn a no-op write into a
+/// failure.
+pub(crate) fn yq_empty_index_children(target: &Expr) -> Expr {
+    Expr::Pipe(vec![target.clone(), Expr::Optional(Box::new(Expr::Iterate))].into())
 }
 
 /// Evaluate `E[S:T]` — slicing by computed bounds.
@@ -55292,7 +55357,21 @@ fn resolve_index_expr_sink<'a, S: EvalSemantics>(
     if let Some(control) = stash.take(&key_flow, key_direct_retry) {
         return ResolveFlow::Escaped(EvalEscape::from(control));
     }
-    flow_result(index_key_trailing(key_flow))
+    let trailing = index_key_trailing(key_flow);
+    // yq reads an index with no output as every child of the operand, in path
+    // position too, so `.[E] = v` and `del(.[E])` reach all of them (#4139).
+    if first_key && trailing.is_none() && S::TAG == EvalTag::Yq {
+        return resolve_node_sink::<S>(
+            &yq_empty_index_children(target),
+            value,
+            trackable,
+            snapshot,
+            frame,
+            keep,
+            sink,
+        );
+    }
+    flow_result(trailing)
 }
 
 /// Resolve `E[S:T]` in path context, with or without a trailing `?`.
@@ -59123,6 +59202,12 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // ever runs, restores the "earlier undecodable value preempts a later
     // competing signal" ordering #1832 already established elsewhere.
     let mut all_results: Vec<OwnedValue> = Vec::new();
+
+    // yq's `as` runs its body once, with the variable unbound, when the source
+    // has no output (#4139); see `yq_runs_as_body_without_source`.
+    if S::TAG == EvalTag::Yq && bound_values.is_empty() && bound_control.is_none() {
+        return eval_single::<W, S>(body, value, optional);
+    }
 
     for (i, mut bound_val) in bound_values.into_iter().enumerate() {
         let origin = bound_origins.get(i).cloned().flatten();
@@ -136580,6 +136665,60 @@ mod touched_edge_cases_2999 {
             closed(r#"{"a":{"x":1},"b":{"y":2}}"#, ParserMode::Yq).as_deref(),
             Some(r#"{"a":{"x":1},"b":{"y":2}}"#)
         );
+    }
+
+    /// #4139: yq's `as` runs its body once, with the variable unset, when the
+    /// source has no output. The CLI is served by the generic evaluator, so the
+    /// owned evaluator's two `as` implementations (`eval_as` through `eval_full`,
+    /// `each_as` through `eval_each`) are pinned here; every row was captured from
+    /// yq v4.53.3 and the jq half keeps its generator model.
+    #[test]
+    fn yq_empty_as_source_runs_the_body_once_in_the_owned_evaluators_4139() {
+        let json = br"[1,2,3]";
+        let index = JsonIndex::build(json);
+        let join = |values: Vec<OwnedValue>| {
+            values
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let streamed = |expr: &Expr| {
+            let mut items = Vec::new();
+            let flow = eval_each::<Vec<u64>, YqSemantics>(
+                expr,
+                index.root(json).value(),
+                false,
+                &mut |item| {
+                    items.push(item);
+                    Demand::Continue
+                },
+            );
+            assert!(matches!(flow, Flow::Exhausted), "{expr:?}");
+            join(items_to_result_checked::<_, YqSemantics>(items).collect_owned::<YqSemantics>())
+        };
+        for (filter, expected) in [
+            ("select(false) as $y | 3", "3"),
+            (".[] as $y | select(false) as $z | $y", "1 2 3"),
+            ("[.[] | select(false) as $z | .]", "[1,2,3]"),
+            ("select(false) as $y | $y", ""),
+            (r#"(.[] | select(. > 5)) as $y | "ran""#, r#""ran""#),
+            (".[] as $x | $x * 2", "2 4 6"),
+        ] {
+            let expr = parse_with_mode_and_extensions(filter, ParserMode::Yq, false)
+                .expect("filter parses");
+            let full = eval_full::<Vec<u64>, YqSemantics>(&expr, index.root(json));
+            assert_eq!(
+                join(full.collect_owned::<YqSemantics>()),
+                expected,
+                "eval_full: {filter}"
+            );
+            assert_eq!(streamed(&expr), expected, "eval_each: {filter}");
+        }
+        // jq: the body runs per output of the source, so none.
+        let expr = parse("select(false) as $y | 3").expect("filter parses");
+        let jq = eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(json));
+        assert_eq!(jq.collect_owned::<JqSemantics>().len(), 0);
     }
 
     /// #4182: `object_from_pairs` is where a construction's pairs become an

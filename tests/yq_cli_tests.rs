@@ -60924,6 +60924,87 @@ fn test_object_construction_repeated_key_deep_merges_4182() -> Result<()> {
     Ok(())
 }
 
+/// Pinned yq v4.53.3: an operand with no output is not the same as no operator
+/// (#4139). `A as $v | B` runs `B` once, with `$v` unset, when `A` has no output;
+/// an empty index operand in `.[E]` stands for every child of the operand, which
+/// is what a typo'd variable becomes (`.b[$typo] = 1` sets every element,
+/// `del(.[$typo])` empties the document); `has(E)` is `false`. The children of a
+/// scalar or `null` are none, so those writes stay no-ops. Every row was captured
+/// from the pinned binary, `-p=json -o=json -I=0`.
+#[test]
+fn test_yq_empty_operand_as_index_del_and_has_4139() -> Result<()> {
+    let args = &["-p=json", "-o=json", "-I=0"];
+    for (input, filter, expected) in [
+        ("[1,2]", "select(false) as $y | 3", "3\n"),
+        ("[1,2]", ".[] as $y | select(false) as $z | $y", "1\n2\n"),
+        ("{\"a\":1,\"b\":2}", "select(false) as $z | .a", "1\n"),
+        ("[1,2,3]", "[.[] | select(false) as $z | .]", "[1,2,3]\n"),
+        (
+            "[1,2,3]",
+            "(.[] | select(. > 5)) as $y | \"ran\"",
+            "\"ran\"\n",
+        ),
+        ("[1,2,3]", "select(false) as $y | $y", ""),
+        ("[1,2,3]", ".[] as $x | $x * 2", "2\n4\n6\n"),
+        ("[1,2]", "[1] | .[select(false)]", "1\n"),
+        ("{\"a\":1,\"b\":[1,2,3]}", ".b[$typo]", "1\n2\n3\n"),
+        ("[1,2,3]", "[.[select(false)]]", "[1,2,3]\n"),
+        ("[1,2,3]", ".[select(false)] | length", "1\n1\n1\n"),
+        ("[[1,2],[3]]", ".[select(false)][0]", "1\n3\n"),
+        ("[[1,2],[3]]", ".[0][select(false)]", "1\n2\n"),
+        (
+            "{\"a\":1,\"b\":2}",
+            ".[select(false)] = 9",
+            "{\"a\":9,\"b\":9}\n",
+        ),
+        (
+            "{\"a\":1,\"b\":[1,2,3]}",
+            ".b[$typo] = 1",
+            "{\"a\":1,\"b\":[1,1,1]}\n",
+        ),
+        (
+            "{\"a\":1,\"b\":[1,2,3]}",
+            ".b[$typo] += 1",
+            "{\"a\":1,\"b\":[2,3,4]}\n",
+        ),
+        ("[1,2,3]", ".[select(false)] |= . + 1", "[2,3,4]\n"),
+        ("[1,2,3]", "del(.[select(false)])", "[]\n"),
+        ("{\"a\":1,\"b\":[1,2,3]}", "del(.[$typo])", "{}\n"),
+        (
+            "{\"a\":1,\"b\":[1,2,3]}",
+            "del(.b[$typo])",
+            "{\"a\":1,\"b\":[]}\n",
+        ),
+        (
+            "{\"a\":{\"b\":1}}",
+            "del(.a[select(false)])",
+            "{\"a\":{}}\n",
+        ),
+        (
+            "{\"a\":[1,2],\"b\":3}",
+            ".b[$typo] = 1",
+            "{\"a\":[1,2],\"b\":3}\n",
+        ),
+        (
+            "{\"a\":[1,2],\"b\":3}",
+            "del(.nokey[$typo])",
+            "{\"a\":[1,2],\"b\":3}\n",
+        ),
+        ("{\"a\":[1,2],\"b\":3}", ".b[$typo]", ""),
+        ("{\"a\":1,\"b\":[1,2,3]}", "has($typo)", "false\n"),
+        ("[1,2]", "has(select(false))", "false\n"),
+        ("{\"a\":1,\"k\":\"a\"}", "has(.k)", "true\n"),
+        ("[10,20]", ".[(1,select(false))]", "20\n"),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, input, args)?,
+            (expected.into(), String::new(), 0),
+            "{filter} on {input}"
+        );
+    }
+    Ok(())
+}
+
 /// Pinned yq v4.53.3: a later entry with fewer children than the first fails the
 /// whole construction, and a bare entry that splats to a value `*` cannot merge
 /// into a map fails with yq's multiply error (#2783).
