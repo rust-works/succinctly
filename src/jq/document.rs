@@ -1382,6 +1382,22 @@ pub trait DocumentValue: Sized + Clone {
         None
     }
 
+    /// [`key_raw_unescaped`](Self::key_raw_unescaped) plus the byte position
+    /// immediately past the key's closing quote, from the same single scan
+    /// (#3343).
+    ///
+    /// A caller that hashes a key *and* checks the `:` after it
+    /// (`key_hash_and_end_of`) would otherwise scan the key twice -- once to
+    /// find the closing quote for the span, again for
+    /// [`text_end`](Self::text_end). Defaults to `None`; JSON overrides it. It
+    /// answers `None` wherever `key_raw_unescaped` does (an escape, a span
+    /// shorter than its two quotes) and also for an unterminated span, so a
+    /// caller that falls back to `key_hash_of`/`text_end` on `None` sees
+    /// exactly what the two separate calls would have said.
+    fn key_raw_unescaped_with_end(&self) -> Option<(&[u8], usize)> {
+        None
+    }
+
     /// This key's raw source-text span (quotes stripped), regardless of
     /// whether the bytes inside it actually decode.
     ///
@@ -2040,6 +2056,24 @@ pub(crate) fn key_hash_of<V: DocumentValue>(key: &V) -> Option<u64> {
         .map(|key| key_hash(key.as_bytes()))
 }
 
+/// [`key_hash_of`] and [`DocumentValue::text_end`] together, for a key-only
+/// walk that checks the `:` after each key (#3343).
+///
+/// On the escape-free ASCII key the hash's raw span already ends at the
+/// closing quote, so the key's end is known without the second quote scan
+/// `text_end` would make. Anything off that path -- an escape, non-ASCII
+/// bytes, no raw span, an unterminated string -- answers exactly what the two
+/// separate calls would have.
+#[inline]
+pub(crate) fn key_hash_and_end_of<V: DocumentValue>(key: &V) -> (Option<u64>, Option<usize>) {
+    if let Some((raw, end)) = key.key_raw_unescaped_with_end() {
+        if let Some(hash) = ascii_key_hash(raw) {
+            return (Some(hash), Some(end));
+        }
+    }
+    (key_hash_of(key), key.text_end())
+}
+
 /// [`key_hash_of`] for a caller holding a whole field.
 fn field_key_hash<V: DocumentValue, C: DocumentCursor>(field: &DocumentField<V, C>) -> Option<u64> {
     key_hash_of(&field.key)
@@ -2524,6 +2558,20 @@ pub(crate) fn key_only_value_delimiter_ok<F: DocumentFields>(
     }
 }
 
+/// [`key_only_value_delimiter_ok`] for a caller that already knows where the
+/// key ends (`key_end`, as [`key_hash_and_end_of`] answers it) and so need
+/// not scan for it again (#3343).
+#[inline]
+pub(crate) fn colon_after_key_end_ok<F: DocumentFields>(
+    key_end: Option<usize>,
+    key_cursor: &F::Cursor,
+) -> bool {
+    match key_end {
+        Some(key_end) => key_cursor.following_colon_ok(key_end),
+        None => true,
+    }
+}
+
 /// Above this many keys, a per-object duplicate-key check stops comparing
 /// every pair of key spans.
 ///
@@ -2594,8 +2642,9 @@ pub fn key_span_fingerprint(quoted: &[u8]) -> u64 {
 /// as a walk goes, without holding the keys.
 ///
 /// **Only for a caller that cannot sort.** Every batch site here hashes
-/// into a `Vec<u64>` and sorts instead, because a sort streams and a table
-/// does not: at 7.1M keys the table is 134 MB, and on a 7950X -- 32 MB of
+/// into a `Vec<u64>` and sorts (or, for `census`, sorts only what a
+/// bitset prefilter could not clear -- `repeated_hashes`) instead, because
+/// a sort streams and a table does not: at 7.1M keys the table is 134 MB, and on a 7950X -- 32 MB of
 /// L3 per CCD -- that cost 24% on the identity path where the sort cost
 /// nothing. An M4 Pro absorbed it and preferred the table, which is the
 /// architecture split CLAUDE.md warns memory-bound results carry. The one
@@ -3007,17 +3056,96 @@ impl KeyCensus {
     }
 }
 
+/// Fewest hashes [`repeated_hashes`] runs the bitset prefilter on; below this
+/// the plain sort is already cheap and the two bitsets are not worth
+/// allocating. Measured on `map(length)` over many equal objects: 8 keys per
+/// object is 1-2% slower with the prefilter, 32 is a wash, 128 is 2% faster.
+const PREFILTER_MIN: usize = 128;
+
+/// Most hashes [`repeated_hashes`] runs the bitset prefilter on. Above this
+/// the bitsets (two of `8 * n` bits, rounded up to a power of two) outgrow the
+/// cache the prefilter relies on and the sort streams better.
+const PREFILTER_MAX: usize = 1 << 21;
+
+/// Bits of bitset per hash. The prefilter hands the sort only the hashes
+/// that landed on a bit another hash had already set, about `n / (2 *
+/// BITS_PER_HASH)` of them, so this trades memory against how much is left to
+/// sort.
+const PREFILTER_BITS_PER_HASH: usize = 8;
+
+/// The hashes that occur more than once in `hashes`, sorted ascending and
+/// deduplicated, plus how many distinct values `hashes` holds in total
+/// (#3343) -- what `sort_unstable` followed by [`shared_hashes`] answers,
+/// without sorting every hash when almost none repeat.
+///
+/// A real object almost never repeats a key, so the sort of all `n` hashes
+/// (25 M instructions for the 159 K keys of perf-guard's `wide` fixture) is
+/// spent proving that nothing matched. Instead one pass sets a bit per hash
+/// in a bitset and, in a second bitset, remembers every bit that was already
+/// set. A hash whose bit was never set twice cannot equal any other hash, so
+/// only the hashes on a doubly-set bit -- a few percent, almost all of them
+/// accidental collisions of the *bitset*, not of the hashes -- go on to the
+/// sort. The answer is exact: every occurrence of a repeated hash sits on a
+/// doubly-set bit, and every other hash is distinct.
+///
+/// Measured against the sort on a 7950X and an M4 Pro: faster at every
+/// width from 159 K to 1.2 M keys on both. The alternatives lost on at least
+/// one of them (an exactly-sized table by 4-10% on the 7950X, an in-place
+/// radix partition by 3-37% on both); see `docs/parsing/json.md`.
+fn repeated_hashes(mut hashes: Vec<u64>) -> (Vec<u64>, usize) {
+    let n = hashes.len();
+    if !(PREFILTER_MIN..=PREFILTER_MAX).contains(&n) {
+        hashes.sort_unstable();
+        return shared_hashes(&hashes);
+    }
+    // Hashes are well mixed (`key_hash_checked` ends in a splitmix64
+    // finalizer), so the low bits index uniformly. A constructed set of
+    // colliding low bits only costs the sort it would have cost anyway.
+    let bits = (n * PREFILTER_BITS_PER_HASH).next_power_of_two().max(64);
+    let mask = bits - 1;
+    let mut seen = vec![0u64; bits / 64];
+    let mut twice = vec![0u64; bits / 64];
+    let mut any = false;
+    for &hash in &hashes {
+        let at = hash as usize & mask;
+        let bit = 1u64 << (at & 63);
+        let already = seen[at >> 6] & bit;
+        seen[at >> 6] |= bit;
+        twice[at >> 6] |= already;
+        any |= already != 0;
+    }
+    if !any {
+        return (Vec::new(), n);
+    }
+    drop(seen);
+    let mut candidates: Vec<u64> = hashes
+        .iter()
+        .copied()
+        .filter(|&hash| {
+            let at = hash as usize & mask;
+            twice[at >> 6] & (1u64 << (at & 63)) != 0
+        })
+        .collect();
+    // Every hash left out sat alone on its bit, so each is its own value.
+    let alone = n - candidates.len();
+    candidates.sort_unstable();
+    let (shared, distinct) = shared_hashes(&candidates);
+    (shared, alone + distinct)
+}
+
 /// Take the census of `fields` (see [`KeyCensus`]).
 ///
-/// The walk collects hashes into a `Vec` and the table is built afterwards,
-/// rather than probing as the walk goes, purely so the table can be sized
-/// exactly. A [`KeyHashes`] left to grow into a wide object rehashes
-/// everything it holds at every doubling -- roughly as many extra
-/// random-access inserts as there are keys, plus zeroing each intermediate
-/// table -- and measured *slower* than the sort it replaces: `keys_unsorted`
-/// on `wide/10mb` went +110% to +146% against the pre-#1385 baseline instead
-/// of improving. The `Vec` was already here before this change, so sizing
-/// the table off it costs nothing new.
+/// One key-only walk collects a hash per field, [`repeated_hashes`] says
+/// which of them occur more than once, and only if some do is the object
+/// walked a second time to separate real repeats from 64-bit collisions. The
+/// hashes go into a plain `Vec` rather than a [`KeyHashes`] probed as the walk
+/// goes: a `KeyHashes` left to grow into a wide object rehashes everything it
+/// holds at every doubling and measured *slower* than a sort
+/// (`keys_unsorted` on `wide/10mb` went +110% to +146% against the
+/// pre-#1385 baseline), and one sized exactly from the `Vec` afterwards is a
+/// random-access table that lost to the sort by 4-10% on a 7950X even at
+/// 159 K keys (#3343) while winning on an M4 Pro -- the architecture split
+/// [`KeyHashes`] records for #1514.
 fn census<F: DocumentFields>(fields: &F) -> KeyCensus {
     let mut hashes: Vec<u64> = Vec::new();
     let mut unkeyed = 0usize;
@@ -3030,12 +3158,13 @@ fn census<F: DocumentFields>(fields: &F) -> KeyCensus {
         // `key`'s own decode, and colon-before-value scans forward from
         // it (`key_only_value_delimiter_ok`) rather than resolving the
         // value's own position.
+        let (hash, key_end) = key_hash_and_end_of(&key);
         if !key_delimiter_ok::<F>(&key, &cursor, is_first)
-            || !key_only_value_delimiter_ok::<F>(&key, &cursor)
+            || !colon_after_key_end_ok::<F>(key_end, &cursor)
         {
             malformed = true;
         }
-        match key_hash_of(&key) {
+        match hash {
             Some(hash) => hashes.push(hash),
             // `key_hash_of` answers `None` for exactly the keys that do not
             // stringify, so this is the only branch [`key_is_malformed`] can
@@ -3059,8 +3188,7 @@ fn census<F: DocumentFields>(fields: &F) -> KeyCensus {
     // comment for the O(1) hop and the container-typed-last-child residual
     // gap (#2243) this inherits.
     malformed |= !last_field_trailing_gap_ok(last_key_cursor, b'}');
-    hashes.sort_unstable();
-    let (shared, distinct_hashes) = shared_hashes(&hashes);
+    let (shared, distinct_hashes) = repeated_hashes(hashes);
     if shared.is_empty() {
         return KeyCensus {
             distinct: distinct_hashes,
@@ -3584,8 +3712,17 @@ impl<F: DocumentFields> Iterator for DistinctKeyCursors<F> {
         // even for a field a later duplicate ends up collapsing away.
         let is_first = self.walked == 0;
         self.walked += 1;
+        // The probe below hashes this same key, so when there is a probe the
+        // one scan that finds the key's closing quote answers both that and
+        // the `:` check (#3343); without one (`collapse` is off, or the
+        // probe has retired) there is no hash to share a scan with.
+        let (hash, key_end) = if self.seen.is_some() {
+            key_hash_and_end_of(&key)
+        } else {
+            (None, key.text_end())
+        };
         if !key_delimiter_ok::<F>(&key, &key_cursor, is_first)
-            || !key_only_value_delimiter_ok::<F>(&key, &key_cursor)
+            || !colon_after_key_end_ok::<F>(key_end, &key_cursor)
         {
             self.delimiter_fault = true;
         }
@@ -3621,7 +3758,7 @@ impl<F: DocumentFields> Iterator for DistinctKeyCursors<F> {
         } else {
             self.seen
                 .as_mut()
-                .is_some_and(|seen| key_hash_of(&key).is_some_and(|hash| seen.insert(hash)))
+                .is_some_and(|seen| hash.is_some_and(|hash| seen.insert(hash)))
         };
         if repeat {
             let confirmed = collapse_confirmed_repeat(&self.all);
@@ -4781,6 +4918,174 @@ mod raw_key_hash_tests {
         // The high byte in the *tail* word, past the 8-byte stride, is the
         // case a chunk-only check would miss.
         assert_eq!(ascii_key_hash("aaaaaaaaé".as_bytes()), None);
+    }
+}
+
+#[cfg(test)]
+mod key_hash_and_end_tests {
+    use super::{key_hash_and_end_of, key_hash_of, DocumentFields, DocumentValue};
+    use crate::json::JsonIndex;
+
+    /// `key_hash_and_end_of` is `key_hash_of` plus `text_end` from one scan
+    /// (#3343), so it must answer exactly what the two calls do -- for the
+    /// escape-free ASCII key it shortcuts and for every shape it must hand
+    /// back to the two-call path: an escape, non-ASCII bytes, a raw DEL, an
+    /// unterminated span, a non-string key.
+    #[test]
+    fn matches_the_two_separate_calls_3343() {
+        let documents: &[&[u8]] = &[
+            br#"{"k":1}"#,
+            br#"{"":1}"#,
+            br#"{"a":1}"#,
+            br#"{"exactly8":1}"#,
+            br#"{"a rather longer key than one word":1}"#,
+            br#"{"a\"b":1}"#,
+            br#"{"a\u0041":1}"#,
+            br#"{"a\\":1}"#,
+            "{\"caf\u{e9}\":1}".as_bytes(),
+            b"{\"a\x7fb\":1}",
+            br#"{"k""#,
+            br#"{"k"#,
+            br#"{""#,
+            br"{",
+            br"{12:1}",
+            br"{null:1}",
+            br#"{ "spaced" : 1 }"#,
+        ];
+        let mut compared = 0;
+        for json in documents {
+            let index = JsonIndex::build(json);
+            let root = index.root(json);
+            let Some(fields) = root.value().as_object() else {
+                continue;
+            };
+            let Some((key, _cursor, _rest)) = fields.uncons_key() else {
+                continue;
+            };
+            compared += 1;
+            assert_eq!(
+                key_hash_and_end_of(&key),
+                (key_hash_of(&key), key.text_end()),
+                "{}",
+                String::from_utf8_lossy(json)
+            );
+            if let Some((raw, end)) = key.key_raw_unescaped_with_end() {
+                assert_eq!(Some(raw), key.key_raw_unescaped());
+                assert_eq!(Some(end), key.text_end());
+            }
+        }
+        // A shape that yields no key is skipped above; this keeps the loop
+        // from passing with nothing compared.
+        assert!(compared >= 10, "only {compared} documents yielded a key");
+    }
+
+    /// The shortcut must actually fire on the shape it exists for, or the
+    /// test above could pass with the second scan never removed.
+    #[test]
+    fn escape_free_ascii_key_takes_the_single_scan_3343() {
+        let json = br#"{"k12345":1}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let fields = root.value().as_object().expect("an object");
+        let (key, _, _) = fields.uncons_key().expect("a key");
+        let (raw, end) = key.key_raw_unescaped_with_end().expect("the single scan");
+        assert_eq!(raw, b"k12345");
+        assert_eq!(end, 9, "one past the closing quote");
+        // An escaped key and an unterminated one both decline it.
+        let json = br#"{"a\nb":1}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let fields = root.value().as_object().expect("an object");
+        let (key, _, _) = fields.uncons_key().expect("a key");
+        assert!(
+            key.key_raw_unescaped_with_end().is_none(),
+            "an escape declines the single scan"
+        );
+    }
+}
+
+#[cfg(test)]
+mod repeated_hashes_tests {
+    use super::{repeated_hashes, shared_hashes, PREFILTER_MAX};
+
+    /// The reference the prefilter must equal: sort everything.
+    fn by_sorting(hashes: &[u64]) -> (Vec<u64>, usize) {
+        let mut sorted = hashes.to_vec();
+        sorted.sort_unstable();
+        shared_hashes(&sorted)
+    }
+
+    /// xorshift64*, so the inputs are the same on every platform.
+    fn stream(seed: u64) -> impl Iterator<Item = u64> {
+        let mut state = seed | 1;
+        core::iter::repeat_with(move || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        })
+    }
+
+    /// The prefilter answers what the sort does -- the shared list *and* the
+    /// distinct count, which `census` subtracts from -- for inputs with no
+    /// repeat, a few, many, and every hash equal.
+    #[test]
+    fn matches_the_sort_on_every_repeat_shape_3343() {
+        for n in [0usize, 1, 2, 3, 63, 64, 65, 1000, 4096, 50_000] {
+            let unique: Vec<u64> = stream(n as u64 + 1).take(n).collect();
+            let mut cases: Vec<(&str, Vec<u64>)> = vec![("unique", unique.clone())];
+            if n >= 4 {
+                let mut few = unique.clone();
+                few[n - 1] = few[0];
+                few[n / 2] = few[1];
+                cases.push(("two repeats", few));
+                let mut thrice = unique.clone();
+                thrice[n - 1] = thrice[0];
+                thrice[n - 2] = thrice[0];
+                cases.push(("one value three times", thrice));
+                let mut half = unique.clone();
+                for i in 0..n / 2 {
+                    half[n - 1 - i] = half[i];
+                }
+                cases.push(("every value twice", half));
+            }
+            cases.push(("all equal", vec![0x9e37_79b9_7f4a_7c15; n]));
+            cases.push(("zero", vec![0; n]));
+            for (name, hashes) in cases {
+                assert_eq!(
+                    repeated_hashes(hashes.clone()),
+                    by_sorting(&hashes),
+                    "{name}, n = {n}"
+                );
+            }
+        }
+    }
+
+    /// Distinct hashes that share every low bit all land on one bitset bit.
+    /// None repeats, so the answer is "no repeat" however many fall on it --
+    /// the case that sends the whole input through the fallback sort.
+    #[test]
+    fn distinct_hashes_on_one_bit_are_not_a_repeat_3343() {
+        let hashes: Vec<u64> = (0..5000u64).map(|i| (i + 1) << 40).collect();
+        let (shared, distinct) = repeated_hashes(hashes.clone());
+        assert_eq!(shared, Vec::<u64>::new());
+        assert_eq!(distinct, 5000);
+        // ...and a real repeat among them is still found.
+        let mut with_repeat = hashes;
+        with_repeat[4999] = with_repeat[7];
+        assert_eq!(
+            repeated_hashes(with_repeat.clone()),
+            by_sorting(&with_repeat)
+        );
+    }
+
+    /// Past the ceiling the plain sort runs; the answer does not change.
+    #[test]
+    fn above_the_ceiling_still_matches_the_sort_3343() {
+        let mut hashes: Vec<u64> = stream(7).take(PREFILTER_MAX + 3).collect();
+        let last = hashes.len() - 1;
+        hashes[last] = hashes[100];
+        assert_eq!(repeated_hashes(hashes.clone()), by_sorting(&hashes));
     }
 }
 

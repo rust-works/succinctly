@@ -4325,6 +4325,27 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
         }
     }
 
+    /// [`key_raw_unescaped`](DocumentValue::key_raw_unescaped) and the span's
+    /// end from the one `raw_and_escaped` scan (#3343). An unterminated span
+    /// (`raw` not ending in its closing quote) answers `None`: `find_end`
+    /// reports one past the text there, which `start + raw.len()` would not,
+    /// so that rare shape takes the two-call path instead of an answer that
+    /// merely happens to agree.
+    #[inline]
+    fn key_raw_unescaped_with_end(&self) -> Option<(&[u8], usize)> {
+        match self {
+            StandardJson::String(s) => {
+                let (raw, escaped, _has_del) = s.raw_and_escaped();
+                if escaped || raw.len() < 2 || raw[raw.len() - 1] != b'"' {
+                    None
+                } else {
+                    Some((&raw[1..raw.len() - 1], s.start() + raw.len()))
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn string_decode_error(&self) -> Option<&'static str> {
         match self {
             StandardJson::String(s) => s.as_str().err().map(JsonError::message),
