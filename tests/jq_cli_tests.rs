@@ -98112,6 +98112,13 @@ fn test_comma_stage_array_matches_jq_3922() -> Result<()> {
         ("[.users[1].t[] | ., .]", "[]\n", 0),
         ("[.k[]? | ., .]", "[]\n", 0),
         ("[.k[] | ., .]", "", 5),
+        // A value carried without its node (`to_entries` builds new objects)
+        // has no cursors to keep.
+        (
+            ".users | to_entries | [.[] | .value | ., .] | length",
+            "6\n",
+            0,
+        ),
         // A prefix that is not a document node declines to the owned route.
         ("[.users[9] | ., .]", "[null,null]\n", 0),
         ("[.nope | .a, .b]", "[null,null]\n", 0),

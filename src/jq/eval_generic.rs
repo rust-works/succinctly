@@ -5287,16 +5287,18 @@ fn split_comma_stage(body: &Expr) -> Option<(&[Expr], &[Expr], &[Expr])> {
     let Expr::Pipe(stages) = unwrap_paren(body) else {
         return None;
     };
-    if !stages.iter().all(array_route_stage_is_pure_navigation) {
-        return None;
-    }
+    // The structural test first: most pipes have no `,` stage, and the
+    // predicate walks every stage.
     let at = stages
         .iter()
         .position(|stage| matches!(unwrap_paren(stage), Expr::Comma(_)))?;
+    if at == 0 || !stages.iter().all(array_route_stage_is_pure_navigation) {
+        return None;
+    }
     let Expr::Comma(branches) = unwrap_paren(&stages[at]) else {
         return None; // patchcov: coverage tolerate-line reason="unreachable: `position` just found a `Comma` at this index (#3922)"
     };
-    (at > 0).then(|| (&stages[..at], branches.as_slice(), &stages[at + 1..]))
+    Some((&stages[..at], branches.as_slice(), &stages[at + 1..]))
 }
 
 /// A jq-mode array over `prefix | (branches) | tail` that keeps its document
@@ -5308,8 +5310,9 @@ fn split_comma_stage(body: &Expr) -> Option<(&[Expr], &[Expr], &[Expr])> {
 /// items interleave per cursor exactly as the pipe's outputs do, into the same
 /// [`CommaArray`] the plain `,` body fills.
 ///
-/// `None` when the prefix does not answer cursors alone (an owned value, a
-/// raise, a lazy result): the caller then runs the body down the owned route,
+/// `None` when the prefix does not answer cursors alone (an owned value, which
+/// is all a value carried without its node can answer; a raise; a lazy result):
+/// the caller then runs the body down the owned route,
 /// which also settles the order of a raise against the items before it. The
 /// prefix is pure navigation, so running it again there costs time, never an
 /// effect.
@@ -5321,16 +5324,9 @@ fn comma_stage_array_generic<S: EvalSemantics, V: DocumentValue>(
 ) -> Option<GenericResult<V>> {
     let head = eval_single::<S, _>(&prefix[0], value, optional, cursor);
     let head = fold_pipe_stages::<S, V>(head, &prefix[1..], optional);
-    let nodes = match head {
-        GenericResult::OneCursor(c) => vec![c],
-        GenericResult::ManyCursor(cs) => cs,
-        GenericResult::None => Vec::new(),
-        _ => return None,
-    };
-    let branches: Vec<&Expr> = CommaBranches::new(branches).collect();
     let mut array = CommaArray::new();
-    for node in nodes {
-        for &expr in &branches {
+    let mut run = |node: V::Cursor| -> Option<GenericResult<V>> {
+        for expr in CommaBranches::new(branches) {
             let mut result = eval_single::<S, _>(expr, node.value(), optional, Some(node));
             if !tail.is_empty() {
                 result = fold_pipe_stages::<S, V>(result, tail, optional);
@@ -5339,6 +5335,23 @@ fn comma_stage_array_generic<S: EvalSemantics, V: DocumentValue>(
                 return Some(partial_generic(Vec::new(), control));
             }
         }
+        None
+    };
+    match head {
+        GenericResult::OneCursor(node) => {
+            if let Some(escape) = run(node) {
+                return Some(escape);
+            }
+        }
+        GenericResult::ManyCursor(nodes) => {
+            for node in nodes {
+                if let Some(escape) = run(node) {
+                    return Some(escape);
+                }
+            }
+        }
+        GenericResult::None => {}
+        _ => return None,
     }
     Some(array.finish::<S>())
 }
@@ -46634,6 +46647,52 @@ mod tests {
         );
     }
 
+    /// #3922: the `?`/`try` boundary hands on a node-only sequence unforced
+    /// because materializing one can only raise a decode failure, which no
+    /// `try` catches. This fails if a walk over a node ever raises anything
+    /// catchable: it reads each kind of unreadable subtree the way the
+    /// boundary would have.
+    #[test]
+    fn test_node_sequence_materializes_only_uncatchable_errors_3922() {
+        let deep = alloc::format!("[{}1{}]", "[".repeat(300), "]".repeat(300));
+        for doc in [
+            "[tru]",
+            "[1.2.3]",
+            r#"["\q"]"#,
+            r#"[{"a" 1}]"#,
+            r#"[{"a":1 "b":2}]"#,
+            r#"[{"a":tru}]"#,
+            r#"[{"a":1,}]"#,
+            "[[1,]]",
+            "[[1 2]]",
+            "[[tru]]",
+            deep.as_str(),
+        ] {
+            let index = JsonIndex::build(doc.as_bytes());
+            let node = index
+                .root(doc.as_bytes())
+                .first_child()
+                .expect("one element");
+            for seq in [
+                LazySeq::<crate::json::light::StandardJson<'_, Vec<u64>>>::from_repeating_cursors(
+                    alloc::vec![node, node],
+                ),
+                LazySeq::from_mixed(alloc::vec![
+                    LazyElem::Cursor(node),
+                    LazyElem::Owned(OwnedValue::Int(1)),
+                ]),
+            ] {
+                assert!(seq.holds_only_nodes(), "{doc}");
+                match seq.materialize_atomic::<JqSemantics>() {
+                    Err(Control::Error(e)) => {
+                        assert!(e.is_uncatchable_at_value_position(), "{doc}: {e:?}");
+                    }
+                    other => panic!("{doc}: expected a decode failure, got {other:?}"),
+                }
+            }
+        }
+    }
+
     /// #3922: a `,` stage after a pipe of pure navigation takes the comma
     /// route, per output of the stages before it, and a `?`/`try` around an
     /// array that holds only nodes and values hands it on instead of
@@ -46654,6 +46713,8 @@ mod tests {
             // A computed stage is not pure navigation.
             ("[.[] | ., length]", "owned"),
             ("[.[] | length, .]", "owned"),
+            // The `?` covers the group, so it is not the branches of a `,`.
+            ("[.a | (., .)?]", "owned"),
             // The boundary no longer forces an array of nodes and values.
             ("[.a, .b]?", "cursors"),
             ("[.[] | ., .]?", "cursors"),
@@ -47941,6 +48002,8 @@ mod tests {
         assert_eq!(split("[.[] | length | (., .)]"), None);
         assert_eq!(split("[.[] | (., .) | length]"), None);
         assert_eq!(split("[.[] | ((., .))?]"), None);
+        // `(a, b)?` is not the same branches as `a, b`: the `?` covers the group.
+        assert_eq!(split("[.[] | (., .)?]"), None);
     }
 
     /// #3501: the array routes' own predicate admits exactly the

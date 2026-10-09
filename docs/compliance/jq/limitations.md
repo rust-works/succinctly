@@ -9919,8 +9919,10 @@ well-formed 7 MB `users` document paid 8-17x the time and 3-5x the memory of the
 (`[.users, 1]? | length` 0.08 s and 82 MB, `[.users[] | ., .] | length` 0.17 s and 156 MB, against
 0.01 s and 18-30 MB). Nothing is lost by it: the only failure such an array can raise is a decode
 failure, which `?`/`try` let through anyway, so it surfaces where an element is read (printing
-`[.a, .b]?` still raises and writes nothing). A branch that raises (`[.users[0].n.x, 1]?`) is
-still caught.
+`[.a, .b]?` still raises and writes nothing, and so do `tojson`, `//` and `isempty` over it). A
+consumer that reads only well-formed nodes answers where it used to raise (`first([.a, .b]?)`,
+`[.a, .b]? | length`), and `.[]` streams the elements before the malformed one. A branch that
+raises (`[.users[0].n.x, 1]?`) is still caught.
 
 **An object holds its nodes too (#4044, jq mode).** `{a: .users}`, `{meta: .meta, data: .users}`,
 `{x: .b}` and `{a: .}` hold each document node a member names as a cursor and read none of them,
