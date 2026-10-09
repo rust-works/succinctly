@@ -27044,7 +27044,7 @@ fn resumed_slot_back<C: DocumentCursor>(c: &C, parent: &C) -> Option<CursorSlot<
         let elem = from.prev_element()?;
         at -= 1;
         if elem.node_id() < target {
-            return None;
+            return None; // patchcov: coverage tolerate-line reason="unreachable: `c` is an element of `parent`, so the walk back meets it before any node id below its own; kept so a cursor whose element chain skips it falls back to the scan instead of walking to the start (#4101)"
         }
         if elem.same_node(c) {
             if at >= SLOT_MEMO_MIN_SCAN {
@@ -50719,10 +50719,10 @@ mod tests {
             assert!(control.is_none(), "{filter}: {control:?}");
             assert_eq!(out, [OwnedValue::Int(n as i64)], "{filter}");
             let scanned = slot_memo::work().0 - scanned_before;
+            let quadratic = n * n / 2;
             assert!(
                 scanned < 4 * n,
-                "{filter}: visited {scanned} elements over {n}; quadratic would be ~{}",
-                n * n / 2
+                "{filter}: visited {scanned} elements over {n}; quadratic would be ~{quadratic}"
             );
             assert_eq!(
                 slot_memo::missed() - missed_before,
@@ -50767,11 +50767,10 @@ mod tests {
         // A stride inside the cap: each read after the first walks about the stride.
         let near: Vec<usize> = (0..14).map(|k| n - 1 - k * (cap - 56)).collect();
         let walked = visited(&near);
+        let (reads, stride) = (near.len(), cap - 56);
         assert!(
-            walked < n + near.len() * cap,
-            "visited {walked} over {} reads of stride {}",
-            near.len(),
-            cap - 56
+            walked < n + reads * cap,
+            "visited {walked} over {reads} reads of stride {stride}"
         );
         // A stride past the cap: no walk is started, so every read is the full
         // scan to its own index, nothing more.

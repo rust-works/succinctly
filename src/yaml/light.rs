@@ -16610,6 +16610,23 @@ empty_map: {}
         );
     }
 
+    /// #4101: YAML keeps the forward-only slot scan, so it neither claims `STEPS_BACK` nor steps
+    /// back from any node of a document that holds every sequence and mapping shape.
+    #[test]
+    fn prev_element_is_not_offered_for_yaml_4101() {
+        use crate::jq::document::DocumentCursor;
+        let yaml = ELEMENT_CHAIN_DOC_2784;
+        let index = YamlIndex::build(yaml.as_bytes()).unwrap();
+        let root = index.root(yaml.as_bytes());
+        const { assert!(!<YamlCursor<'_, Vec<u64>> as DocumentCursor>::STEPS_BACK) };
+        let mut probed = 0;
+        for c in all_cursors_2072(root) {
+            assert!(c.prev_element().is_none(), "bp {}", c.node_id());
+            probed += 1;
+        }
+        assert!(probed > 10, "{probed} cursors");
+    }
+
     /// #3846: `element_depth` is what the scan for an element's slot uses to recognise a direct
     /// child of a parent it remembers, so it must be sound -- every node strictly inside a
     /// container whose `element_depth` is the container's `tree_depth` plus one has that
