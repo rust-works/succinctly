@@ -1100,8 +1100,8 @@ fn build_l2_index_scalar(
 
 /// Excess change (opens minus closes) over bits `bit_idx..valid_bits` of `word`.
 ///
-/// Shared by `find_close_from`'s `ScanWord` step and `find_close`'s start-word
-/// scan, which must agree on what a word that holds no match leaves behind.
+/// The excess `find_close_in_start_word` carries into `find_close_from` when
+/// the close is not in the open's own word.
 #[inline]
 fn word_tail_excess(word: u64, bit_idx: usize, valid_bits: usize) -> i32 {
     let remaining_bits = valid_bits - bit_idx;
@@ -2628,20 +2628,18 @@ impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
                         self.len - word_idx * 64
                     };
 
-                    // Use fast byte-level scan
-                    if let Some(match_bit) =
-                        find_close_in_word_fast(word, bit_idx, excess, valid_bits)
-                    {
-                        return Some(word_idx * 64 + match_bit);
-                    }
-
-                    // No match in this word - compute excess change and move to next word
-                    // We need to compute excess change from bit_idx to end of valid bits
-                    excess += word_tail_excess(word, bit_idx, valid_bits);
-
-                    // Move to start of next word
-                    pos = (word_idx + 1) * 64;
-                    state = State::FromL0;
+                    // `CheckL0` sent us here because the word's minimum excess
+                    // reaches the target, and the index masks the final partial
+                    // word (#188), so the scan always finds the match. Entries
+                    // are word-aligned (see `State::FromL0`), so there is no
+                    // partial first word whose leftover excess a miss would
+                    // have to carry forward.
+                    let found = find_close_in_word_fast(word, bit_idx, excess, valid_bits);
+                    debug_assert!(
+                        found.is_some(),
+                        "l0 index promised a close in word {word_idx}"
+                    );
+                    return found.map(|match_bit| word_idx * 64 + match_bit);
                 }
 
                 State::CheckL0 => {
@@ -2712,13 +2710,12 @@ impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
                 }
 
                 State::FromL0 => {
-                    if pos % 64 == 0 {
-                        state = State::FromL1;
-                    } else if pos < self.len {
-                        state = State::ScanWord;
-                    } else {
-                        return None;
-                    }
+                    // Both callers enter at a word boundary: `find_close` scans
+                    // the word holding the open's successor itself (#3344), and
+                    // a successor in a word `words` lacks is the boundary
+                    // after the last stored word.
+                    debug_assert_eq!(pos % 64, 0);
+                    state = State::FromL1;
                 }
 
                 State::FromL1 => {
