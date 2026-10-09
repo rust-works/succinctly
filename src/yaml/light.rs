@@ -7397,8 +7397,8 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     }
 
     /// [`tree_depth`](DocumentCursor::tree_depth), except for a block-sequence item that is the
-    /// first child of its `-` node: the `-` node is the sequence's direct child, so its depth
-    /// is the item's (#3846). A node that is not a first child fails on one bit test (the
+    /// first child of its `-` node (which has no other child): the `-` node is the sequence's
+    /// direct child, so its depth is the item's (#3846). A node that is not a first child fails on one bit test (the
     /// position before it is not an open); `is_seq_entry_of` is the rule `next_element`
     /// unwraps with.
     #[inline]
@@ -16555,8 +16555,54 @@ empty_map: {}
     /// every element and member `next_element` walks passes the test.
     #[test]
     fn element_depth_recognises_exactly_the_direct_children_3846() {
+        let (containers, block_items) = element_depth_checked_3846(ELEMENT_CHAIN_DOC_2784);
+        assert!(
+            containers >= 10 && block_items >= 8,
+            "{containers} containers, {block_items} block items"
+        );
+        // Shapes whose `-` node is awkward to tell from a node that merely follows a `-`:
+        // chains of `-`, explicit keys, block scalars and comments right after the indicator,
+        // flow collections and anchors as items, an item that is a mapping with a sequence.
+        let (containers, block_items) = element_depth_checked_3846(
+            "\
+- - - x
+    - y
+  - z
+- ? a
+  : b
+  ? [c, d]
+  : e
+- |
+  text
+- # comment after the indicator
+  k: v
+- &anc [p, {q: r}]
+- *anc
+-
+  # comment on its own line
+  - nested
+- {a: [1, 2], b: {c: d}}
+- k: - not a sequence
+- key:
+  - item
+  - - deep
+    - deeper
+- !!str tagged
+- >-
+  folded
+  text
+",
+        );
+        assert!(
+            containers >= 8 && block_items >= 10,
+            "{containers} containers, {block_items} block items"
+        );
+    }
+
+    /// [`element_depth_recognises_exactly_the_direct_children_3846`]'s checks over one document:
+    /// returns how many containers and how many block items were checked.
+    fn element_depth_checked_3846(yaml: &str) -> (usize, usize) {
         use crate::jq::document::{DocumentElements, DocumentFields, DocumentValue};
-        let yaml = ELEMENT_CHAIN_DOC_2784;
         let index = YamlIndex::build(yaml.as_bytes()).unwrap();
         let root = index.root(yaml.as_bytes());
         let cursors = all_cursors_2072(root);
@@ -16614,10 +16660,7 @@ empty_map: {}
                 }
             }
         }
-        assert!(
-            containers >= 10 && block_items >= 8,
-            "{containers} containers, {block_items} block items"
-        );
+        (containers, block_items)
     }
 
     /// #2072 step 1: the round trip lands back on `same_node` for every node

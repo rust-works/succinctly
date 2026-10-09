@@ -517,9 +517,12 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// whose elements are the parent's direct children in the tree. A format
     /// that wraps an element in a node of its own (YAML's block-sequence
     /// `- ` entry) answers the wrapper's depth, since the wrapper is the
-    /// parent's direct child; answering a smaller depth than `tree_depth`
-    /// is always safe, a larger one is not. Only the depth of the parent is
-    /// `tree_depth`.
+    /// parent's direct child. An implementor must never answer a depth
+    /// *smaller* than the node's true one except to step over such a wrapper
+    /// (a smaller depth lets a deeper descendant pass for a child and returns
+    /// the wrong parent, with no fallback); a larger one only makes the test
+    /// miss, and the caller then asks for the parent. Only the parent's depth
+    /// is `tree_depth`.
     fn element_depth(&self) -> Option<usize> {
         self.tree_depth()
     }
