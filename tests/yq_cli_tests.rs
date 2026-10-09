@@ -60967,3 +60967,66 @@ fn test_del_of_a_root_variable_keeps_the_document_3244() -> Result<()> {
     assert_eq!((out.trim(), code), ("null", 0));
     Ok(())
 }
+
+/// Pinned yq v4.53.3: `match` is Go's `regexp`, so its object has the keys `string, offset,
+/// length, captures`, offsets and lengths count **bytes**, and a capture has a `name` key only
+/// when the group is named (#4205). A group that did not take part is `string: null, offset: -1,
+/// length: 0` whatever the overall match is. Every row was captured from the pinned binary,
+/// `-n -o=json -I=0`.
+#[test]
+fn test_match_object_follows_gos_regexp_4205() -> Result<()> {
+    let args = &["-n", "-o=json", "-I=0"];
+    for (filter, expected) in [
+        (
+            r#""hello world" | match("o")"#,
+            r#"{"string":"o","offset":4,"length":1,"captures":[]}"#,
+        ),
+        (
+            r#""hello world" | match("(?P<first>o) (?P<second>w)")"#,
+            r#"{"string":"o w","offset":4,"length":3,"captures":[{"string":"o","offset":4,"length":1,"name":"first"},{"string":"w","offset":6,"length":1,"name":"second"}]}"#,
+        ),
+        (
+            r#""hello" | match("(x)?hello")"#,
+            r#"{"string":"hello","offset":0,"length":5,"captures":[{"string":null,"offset":-1,"length":0}]}"#,
+        ),
+        (
+            r#""abc" | match("(x)?(?P<n>b)")"#,
+            r#"{"string":"b","offset":1,"length":1,"captures":[{"string":null,"offset":-1,"length":0},{"string":"b","offset":1,"length":1,"name":"n"}]}"#,
+        ),
+        // A group that matched the empty string keeps its own offset.
+        (
+            r#""ab" | match("(a)(x*)")"#,
+            r#"{"string":"a","offset":0,"length":1,"captures":[{"string":"a","offset":0,"length":1},{"string":"","offset":1,"length":0}]}"#,
+        ),
+        // A group that did not take part is unset even when the whole match is empty.
+        (
+            r#""b" | match("(a)*")"#,
+            r#"{"string":"","offset":0,"length":0,"captures":[{"string":null,"offset":-1,"length":0}]}"#,
+        ),
+        // Offsets and lengths are bytes, not code points.
+        (
+            r#""héllo" | match("l")"#,
+            r#"{"string":"l","offset":3,"length":1,"captures":[]}"#,
+        ),
+        (r#""日本語" | match("本") | .length"#, "3"),
+        (r#""a😀b" | match("b") | .offset"#, "5"),
+        (
+            r#""abc" | match("b") | keys"#,
+            r#"["string","offset","length","captures"]"#,
+        ),
+        (r#""abab" | [match("ab"; "g")] | map(.offset)"#, "[0,2]"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, "", args)?;
+        assert_eq!((out.trim(), code), (expected, 0), "{filter}");
+    }
+    // jq mode keeps oniguruma's shape: code points, `offset, length, string`, `name: null`.
+    let (out, code) = run_jq_stdin(r#"match("(l)")"#, r#""héllo""#, &["-c"])?;
+    assert_eq!(
+        (out.trim(), code),
+        (
+            r#"{"offset":2,"length":1,"string":"l","captures":[{"offset":2,"length":1,"string":"l","name":null}]}"#,
+            0
+        )
+    );
+    Ok(())
+}
