@@ -7579,6 +7579,47 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         }
     }
 
+    fn document_preamble(&self, through_content: bool) -> Option<&str> {
+        if !self.is_document_content() {
+            return None;
+        }
+        let start = self.text_position()?;
+        // Back up to the start of the line the content begins on: content that shares a
+        // line with the marker (`--- 5`, `--- |`) is not a preamble.
+        let before = self.text.get(..start)?;
+        let line_start = before
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |i| i + 1);
+        if !before[line_start..].iter().all(|&b| b == b' ') {
+            return None;
+        }
+        let preamble = core::str::from_utf8(&before[..line_start]).ok()?;
+        // Through the last `---` line and the blank lines straight after it; comments
+        // after the marker belong to the first node, which prints its own head.
+        let mut end = 0;
+        let mut offset = 0;
+        let mut marker_seen = false;
+        for line in preamble.split_inclusive('\n') {
+            let bare = line.trim_end_matches(['\n', '\r']);
+            let trimmed = bare.trim_end_matches([' ', '\t']);
+            offset += line.len();
+            if trimmed == "---" {
+                marker_seen = true;
+                end = offset;
+            } else if bare.starts_with('%') || (bare.starts_with("---") && !marker_seen) {
+                // A directive, or a marker with something after it: yq's handling of
+                // those is its own (an upstream quirk), not reproduced here.
+                return None;
+            } else if marker_seen && trimmed.is_empty() {
+                end = offset;
+            } else if marker_seen {
+                break;
+            }
+        }
+        marker_seen.then(|| &preamble[..if through_content { preamble.len() } else { end }])
+    }
+
     #[inline]
     fn explicit_tag_of_non_alias(&self) -> Option<&str> {
         if self.index.has_explicit_tags() {

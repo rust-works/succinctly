@@ -4374,6 +4374,20 @@ its text (`numeric_display_string`, so `==` and `tostring` agree about a compute
   in yq. A head comment with a blank line after it on a *nested* key
   (`m:\n  # a\n\n  k: 1`) is still mangled on a write: the comment moves to the next top-level
   key (pre-existing; yq prints `m:\n  # a\n  k: 1`).
+- **A write keeps the first document's `---` marker**
+  ([#4086](https://github.com/rust-works/succinctly/issues/4086)). A DOM write (`=`, `|=`,
+  `del()`, `-P`, `-i`) prints back the text before the first document's content when it holds a
+  `---` marker on a line of its own: the comments and blank lines above it, verbatim, the
+  marker (trailing blanks dropped), and the blank lines straight after. It used to be dropped,
+  so editing a manifest or playbook that opens with `---` changed its first line. Only the first
+  document of a file gets it (later ones keep the ordinary separator), `-N` drops the marker
+  lines and keeps the comments, and a root a write replaces keeps it. Not matched: content on
+  the marker's own line (`--- 5`, `--- |`; yq prints `---` then the content), a comment on
+  the marker's line (`--- # x`, where yq glues the comment onto the first key: an upstream quirk
+  not reproduced), and a `%YAML` directive (yq drops it; here the document is rejected). The preamble is
+  attached to the first document's root as read, so a result built from it (`to_entries`, a
+  reshaped value) carries none where yq still prints it; and a null first document
+  (`---\n---\na: 1`) keeps its pre-existing divergence.
 - **A write keeps the source spelling of an untouched plain scalar**
   ([#3028](https://github.com/rust-works/succinctly/issues/3028)). On the DOM route (`=`, `|=`,
   `del()`, `-P`, `-i`) a null, bool or number that was not spelled the canonical way is

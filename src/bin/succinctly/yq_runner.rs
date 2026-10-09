@@ -2714,14 +2714,7 @@ fn reconcile_presentation_at_depth(
         // equal `.a`'s by coincidence, wrongly keeping `*x`.
         (OwnedValue::Object(_) | OwnedValue::Array(_), _)
         | (_, OwnedValue::Object(_) | OwnedValue::Array(_)) => {
-            let is_write_target = targets.iter().any(|(steps, ..)| steps.is_empty());
-            let anchor = match &pristine_tree.meta().anchor {
-                mark @ Some(AnchorMark::Declares(_)) => mark.clone(),
-                mark @ Some(AnchorMark::Aliases(_)) if !is_write_target => mark.clone(),
-                _ => None,
-            };
-            let tag = pristine_tree.meta().tag().filter(|tag| is_custom_tag(tag));
-            CommentTree::Leaf(NodeMeta::empty_with_anchor(anchor).with_tag(tag.map(str::to_string)))
+            kind_changed_leaf(pristine_tree, targets)
         }
         // Both scalars, any variant/value: same node, only its value
         // changed - its own comment, style and anchor mark survive. Real
@@ -2733,18 +2726,50 @@ fn reconcile_presentation_at_depth(
         //
         // #4078: a written node keeps a custom tag (`!Ref`, `!Foo`) but not a core
         // one, which follows the new value's type (`!!str "dq"` written `5` is `5`).
-        _ => CommentTree::Leaf(written_scalar_meta(
-            pristine_tree.meta(),
-            !same_scalar(pristine_value, result_value),
-            // A closed literal written right here (`.a = true`) brings its own text,
-            // even when the value is the one the node already had (#3028).
-            targets
-                .iter()
-                .any(|(steps, kind, fresh)| steps.is_empty() && *kind == WriteKind::Set && *fresh),
-            pristine_value,
-            result_value,
-        )),
+        _ => written_scalar_leaf(pristine_tree, targets, pristine_value, result_value),
     }
+}
+
+/// The tree for a node whose kind changed (container <-> scalar): it keeps an anchor
+/// declaration, a custom tag and, at the document root, the preamble, never the rest.
+/// Out of line so `reconcile_presentation_at_depth`'s recursive frame stays small (its
+/// #1005 depth-guard test overflows under coverage instrumentation otherwise).
+#[inline(never)]
+fn kind_changed_leaf(pristine_tree: &CommentTree, targets: &[RelTarget<'_>]) -> CommentTree {
+    let is_write_target = targets.iter().any(|(steps, ..)| steps.is_empty());
+    let anchor = match &pristine_tree.meta().anchor {
+        mark @ Some(AnchorMark::Declares(_)) => mark.clone(),
+        mark @ Some(AnchorMark::Aliases(_)) if !is_write_target => mark.clone(),
+        _ => None,
+    };
+    let tag = pristine_tree.meta().tag().filter(|tag| is_custom_tag(tag));
+    CommentTree::Leaf(
+        NodeMeta::empty_with_anchor(anchor)
+            .with_tag(tag.map(str::to_string))
+            .with_preamble(pristine_tree.meta().preamble().map(str::to_string)),
+    )
+}
+
+/// The tree for a scalar a write may have changed (see [`written_scalar_meta`]); out of
+/// line for the same reason as [`kind_changed_leaf`].
+#[inline(never)]
+fn written_scalar_leaf(
+    pristine_tree: &CommentTree,
+    targets: &[RelTarget<'_>],
+    pristine_value: &OwnedValue,
+    result_value: &OwnedValue,
+) -> CommentTree {
+    CommentTree::Leaf(written_scalar_meta(
+        pristine_tree.meta(),
+        !same_scalar(pristine_value, result_value),
+        // A closed literal written right here (`.a = true`) brings its own text, even
+        // when the value is the one the node already had (#3028).
+        targets
+            .iter()
+            .any(|(steps, kind, fresh)| steps.is_empty() && *kind == WriteKind::Set && *fresh),
+        pristine_value,
+        result_value,
+    ))
 }
 
 /// The metadata a scalar keeps once a write has run over it. Untouched, all of it. Written,
@@ -4300,9 +4325,12 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
         for (value, comments) in docs.iter_mut() {
             if !matches!(value, OwnedValue::Object(_) | OwnedValue::Array(_)) {
                 let head = comments.meta().head_comment().to_vec();
+                // The first document's `---` marker survives too (#4086).
+                let preamble = comments.meta().preamble().map(str::to_string);
                 *comments = CommentTree::Leaf(
                     NodeMeta::from_comment_and_style(comments.own().map(str::to_string), "")
-                        .with_head_foot(head, Vec::new()),
+                        .with_head_foot(head, Vec::new())
+                        .with_preamble(preamble),
                 );
             }
         }
@@ -4754,6 +4782,22 @@ fn output_value<W: Write>(
         // streaming and DOM routes (the streaming route's own `foot` root
         // exclusion just below is scalar-only).
         let body = prepend_head_comment_lines(body, comments.meta().head_comment(), "");
+        // The first document's `---` marker, with the comments and blank lines before it,
+        // verbatim (#4086). `-N` keeps the comments and drops the marker lines.
+        let body = match comments.meta().preamble() {
+            Some(preamble) => {
+                let preamble: String = if config.no_doc {
+                    preamble
+                        .split_inclusive('\n')
+                        .filter(|line| line.trim_end_matches(['\n', '\r', ' ', '\t']) != "---")
+                        .collect()
+                } else {
+                    preamble.to_string()
+                };
+                format!("{preamble}{body}")
+            }
+            None => body,
+        };
         // Every non-root node's own trailing comment is appended by its
         // *parent* during `emit_yaml_value`'s recursion (see its Array/Object
         // arms), but the root has no parent call site to do that for it —
@@ -9147,7 +9191,19 @@ fn run_yq_inner(args: YqCommand) -> Result<i32> {
                 // would flip `any_yaml_doc_output` true in time for result
                 // 2's own (unwanted) separator check to fire on it too.
                 let mut first_result_in_doc = true;
-                for (result, comments) in results {
+                for (result, mut comments) in results {
+                    // A later file's `---` preamble marker is the separator written above
+                    // (#4086): yq prints it once.
+                    if wants_doc_separator && !defer_to_nul_check {
+                        if let Some(rest) = comments
+                            .meta()
+                            .preamble()
+                            .and_then(|pre| pre.strip_prefix("---\n"))
+                        {
+                            let rest = (!rest.is_empty()).then(|| rest.to_string());
+                            *comments.meta_mut() = comments.meta().with_preamble(rest);
+                        }
+                    }
                     // `split_doc` (#1709 code review) takes priority over
                     // the inter-document separator above when both apply --
                     // matches every other call site's own has_split_doc-
