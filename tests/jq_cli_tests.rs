@@ -120894,3 +120894,44 @@ fn test_register_wrapper_over_by_value_leaf_stage_4108() -> Result<()> {
         ),
     ])
 }
+
+/// #4126: a `reduce` whose UPDATE is `try (., error) catch (.a)?` over a source and INIT that
+/// cannot move jq's register runs the handler with `.` on the register, so `.a` moves it off the
+/// accumulator and the path check refuses (jq: `Invalid path expression with result ...`, exit 5).
+/// It was accepted, and `del` wrote `null` over the whole document. A source that navigates
+/// (`.[]?`) leaves jq's register on the element, where the same UPDATE answers `[]`.
+#[test]
+fn test_reduce_try_update_handler_moves_the_register_4126() -> Result<()> {
+    for (filter, doc) in [
+        (
+            "del(reduce 1 as $k (.; try (., error) catch (.a)?))",
+            r#"{"a":1,"b":2}"#,
+        ),
+        (
+            "path(reduce (1,2) as $k (.; try (., error) catch (.a)?))",
+            r#"{"a":false}"#,
+        ),
+        (
+            "(reduce 1 as $k (.; try (., error) catch (.a)?)) = 5",
+            r#"{"a":1,"b":2}"#,
+        ),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", "--", filter], Some(doc))?;
+        assert_eq!(code, 5, "`{filter}`: stdout {out:?} stderr {err:?}");
+        assert!(out.is_empty(), "`{filter}` wrote: {out:?}");
+        assert!(
+            err.contains("Invalid path expression with result"),
+            "`{filter}`: {err:?}"
+        );
+    }
+    let (out, err, code) = run_jq_full(
+        &[
+            "-c",
+            "--",
+            "path(reduce .[]? as $k (.; try (., error) catch (.a)?))",
+        ],
+        Some(r#"{"a":false}"#),
+    )?;
+    assert_eq!((out.as_str(), code), ("[]\n", 0), "stderr {err:?}");
+    Ok(())
+}
