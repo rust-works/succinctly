@@ -59330,3 +59330,128 @@ fn test_yq_grouped_del_with_a_spelled_index_on_a_mapping_still_refuses_4085() ->
     );
     Ok(())
 }
+
+/// #4081: a node tag (alone, or with an anchor in either order, or verbatim) in
+/// front of a flow collection inside a flow sequence parses. The lookahead that
+/// decides whether a flow-sequence entry is an implicit single-pair mapping
+/// (`[k: v]`) skipped an anchor but not a tag, so it scanned `!Foo {a` up to
+/// the `: ` inside the braces and took `!Foo {a: 1}` for a pair; the real parse
+/// then rejected the `]`. Every expectation is yq v4.53.3's output.
+#[test]
+fn test_tag_before_a_flow_collection_inside_a_flow_sequence_4081() -> Result<()> {
+    let rows: &[(&str, &str, &[&str], &str)] = &[
+        // A flow-collection key followed by spaces before its `:` (the lookahead
+        // required the colon to touch the closing bracket): `!Foo {a: 1} : v`
+        // parsed before this change only by accident, through the `: ` inside
+        // the braces.
+        (
+            "a: [{a: 1} : v]",
+            ".",
+            &["-o=json", "-I0"],
+            "{\"a\":[{\"\":\"v\"}]}\n",
+        ),
+        (
+            "a: [!Foo {a: 1} : v]",
+            ".",
+            &["-o=json", "-I0"],
+            "{\"a\":[{\"\":\"v\"}]}\n",
+        ),
+        (
+            "a: [[1] : v]",
+            ".",
+            &["-o=json", "-I0"],
+            "{\"a\":[{\"\":\"v\"}]}\n",
+        ),
+        (
+            "a: [!Foo [1] : v, z]",
+            ".",
+            &["-o=json", "-I0"],
+            "{\"a\":[{\"\":\"v\"},\"z\"]}\n",
+        ),
+        (
+            "a: [{a: 1}\t: v]",
+            ".",
+            &["-o=json", "-I0"],
+            "{\"a\":[{\"\":\"v\"}]}\n",
+        ),
+        (
+            "a: [{a: 1} :v]",
+            ".",
+            &["-o=json", "-I0"],
+            "{\"a\":[{\"\":\"v\"}]}\n",
+        ),
+        // A tag whose name ends in `:` is still a tag: the element is `1`.
+        ("x: [!a: 1]", ".", &["-o=json", "-I0"], "{\"x\":[1]}\n"),
+        ("x: [!a: 1, 2]", ".", &["-o=json", "-I0"], "{\"x\":[1,2]}\n"),
+        (
+            "x: [!a: {b: 1}]",
+            ".",
+            &["-o=json", "-I0"],
+            "{\"x\":[{\"b\":1}]}\n",
+        ),
+        ("a: [!Foo {a: 1}]", ".", &[], "a: [!Foo {a: 1}]\n"),
+        ("a: [x, !Foo {a: 1}]", ".", &[], "a: [x, !Foo {a: 1}]\n"),
+        (
+            "a: [!!str null, !Foo {a: 1}]",
+            ".",
+            &[],
+            "a: [!!str null, !Foo {a: 1}]\n",
+        ),
+        (
+            "a: !!seq [!!str null, !Foo {a: !x.y 1, c: 2.5}]",
+            ".",
+            &["-o=json", "-I0"],
+            "{\"a\":[\"null\",{\"a\":1,\"c\":2.5}]}\n",
+        ),
+        ("a: [!Foo [1], 2]", ".", &[], "a: [!Foo [1], 2]\n"),
+        (
+            "a: [&x !Foo {a: 1}, *x]",
+            ".",
+            &[],
+            "a: [&x !Foo {a: 1}, *x]\n",
+        ),
+        (
+            "a: [!Foo &x {a: 1}, *x]",
+            ".",
+            &[],
+            "a: [&x !Foo {a: 1}, *x]\n",
+        ),
+        (
+            "a: [!<tag:x,y> {a: 1}]",
+            ".",
+            &[],
+            "a: [!<tag:x,y> {a: 1}]\n",
+        ),
+        ("a: [!Foo {a: 1}, !Bar {b: [2]}]", ".a[1].b[0]", &[], "2\n"),
+        ("- [!Foo {a: 1}]\n- b", ".[0][0].a", &[], "1\n"),
+        ("a: {k: [!Foo {a: 1}, z]}", ".a.k | length", &[], "2\n"),
+        (
+            "a: [!Foo k: v, !Bar {b: 2}]",
+            ".",
+            &["-o=json", "-I0"],
+            "{\"a\":[{\"k\":\"v\"},{\"b\":2}]}\n",
+        ),
+        (
+            "a: [!Foo \"k\": v]",
+            ".",
+            &["-o=json", "-I0"],
+            "{\"a\":[{\"k\":\"v\"}]}\n",
+        ),
+        (
+            "a: [!Foo {a: 1}: v]",
+            ".",
+            &["-o=json", "-I0"],
+            "{\"a\":[{\"\":\"v\"}]}\n",
+        ),
+        ("a: [!Foo a]", ".", &["-o=json", "-I0"], "{\"a\":[\"a\"]}\n"),
+    ];
+    for &(doc, filter, args, expected) in rows {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, args)?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (expected, 0),
+            "`{filter}` on {doc:?}: stderr {stderr:?}"
+        );
+    }
+    Ok(())
+}

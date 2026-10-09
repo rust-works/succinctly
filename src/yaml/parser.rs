@@ -5398,32 +5398,44 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     fn looks_like_flow_mapping_entry(&self) -> bool {
         let mut i = self.pos;
 
-        // Skip a leading anchor or alias: an aliased key IS the key (`*x: v`,
-        // #409) and an anchored key just prefixes it (`&x k: v`, corpus case
-        // CN3R) - what determines whether this item is a pair is what
-        // follows the name, not the indicator. Uses the same scanner the
-        // real anchor/alias parse uses, so this can't drift from what will
-        // actually be consumed (#106).
-        if i < self.input.len() && (self.input[i] == b'&' || self.input[i] == b'*') {
-            let is_alias = self.input[i] == b'*';
-            let name_start = i + 1;
-            let name_end = simd::parse_anchor_name(self.input, name_start);
-            if name_end == name_start {
-                // Empty name - not a valid anchor/alias; let the real parse
-                // report it.
-                return false;
+        // Skip leading node properties: an aliased key IS the key (`*x: v`,
+        // #409), while an anchored key (`&x k: v`, corpus case CN3R) and a
+        // tagged one (`!Foo {a: 1}`, #4081) just prefix it - what determines
+        // whether this item is a pair is what follows the properties, not
+        // the indicators. Uses the same scanners the real parse uses, so this
+        // can't drift from what will actually be consumed (#106).
+        while i < self.input.len() && matches!(self.input[i], b'&' | b'*' | b'!') {
+            if self.input[i] == b'!' {
+                let (end, ok) = scan_tag_extent(self.input, i);
+                if !ok {
+                    // An unterminated verbatim tag: let the real parse report it.
+                    return false;
+                }
+                i = end;
+            } else {
+                let is_alias = self.input[i] == b'*';
+                let name_start = i + 1;
+                let name_end = simd::parse_anchor_name(self.input, name_start);
+                if name_end == name_start {
+                    // Empty name - not a valid anchor/alias; let the real parse
+                    // report it.
+                    return false;
+                }
+                i = name_end;
+                if is_alias {
+                    while i < self.input.len() && matches!(self.input[i], b' ' | b'\t') {
+                        i += 1;
+                    }
+                    // The alias name is the whole key; nothing else to scan.
+                    return i < self.input.len() && self.input[i] == b':';
+                }
             }
-            i = name_end;
             while i < self.input.len() && matches!(self.input[i], b' ' | b'\t') {
                 i += 1;
             }
-            if is_alias {
-                // The alias name is the whole key; nothing else to scan.
-                return i < self.input.len() && self.input[i] == b':';
-            }
-            // An anchor prefixes the actual key, which still needs to be
+            // A property prefixes the actual key, which still needs to be
             // scanned below - it may be quoted, a container, or a plain
-            // scalar.
+            // scalar (or another property).
         }
 
         // Skip quoted string if present
@@ -5497,7 +5509,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     _ => i += 1,
                 }
             }
-            // After the flow, check for colon - can be adjacent (no space required)
+            // After the flow, check for colon - can be adjacent (no space required),
+            // or follow spaces on the same line, as after a quoted key (`[{a: 1} : v]`,
+            // #4081: it parsed with a tag before it only because the scan below took
+            // the `: ` inside the braces for the pair's colon).
+            while i < self.input.len() && matches!(self.input[i], b' ' | b'\t') {
+                i += 1;
+            }
             if i < self.input.len() && self.input[i] == b':' {
                 return true;
             }
@@ -9486,6 +9504,57 @@ mod tests {
                      lookahead disagree (CRLF)"
                 );
             }
+        }
+    }
+
+    /// #4081: the flow-sequence lookahead that decides whether an entry is an
+    /// implicit single-pair mapping skips node properties -- an anchor, an alias,
+    /// and a tag in either order -- and decides on what follows them. A tag
+    /// before a flow collection is a tagged element (`!Foo {a: 1}`), not a pair
+    /// whose key is `!Foo {a`.
+    #[test]
+    fn flow_pair_lookahead_skips_node_properties_4081() {
+        // (entry text starting at the element, is it an implicit pair?)
+        for (entry, is_pair) in [
+            ("!Foo {a: 1}]", false),
+            ("!Foo [a: 1]]", false),
+            ("&x !Foo {a: 1}]", false),
+            ("!Foo &x {a: 1}]", false),
+            ("!<tag:x,y> {a: 1}]", false),
+            ("!!str {a: 1}]", false),
+            ("!Foo a]", false),
+            ("{a: 1}]", false),
+            ("!Foo k: v]", true),
+            ("!Foo \"k\": v]", true),
+            ("&x !Foo k: v]", true),
+            ("!Foo &x k: v]", true),
+            ("!Foo {a: 1}: v]", true),
+            ("!Foo {a: 1} : v]", true),
+            ("{a: 1} : v]", true),
+            ("[a]\t: v]", true),
+            ("{a: 1} x]", false),
+            ("!Foo [a]: v]", true),
+            ("&x k: v]", true),
+            ("*x: v]", true),
+            ("k: v]", true),
+        ] {
+            let parser = Parser::<false>::new(entry.as_bytes());
+            assert_eq!(parser.looks_like_flow_mapping_entry(), is_pair, "{entry:?}");
+        }
+        // An unterminated verbatim tag is the real parse's to report.
+        let parser = Parser::<false>::new(b"!<tag:x {a: 1}]");
+        assert!(!parser.looks_like_flow_mapping_entry());
+        // And the documents parse end to end.
+        for doc in [
+            "a: [!Foo {a: 1}]\n",
+            "[x, !Foo {a: 1}]\n",
+            "a: [!!str null, !Foo {a: 1}]\n",
+            "[&x !Foo {a: 1}, *x]\n",
+        ] {
+            assert!(
+                crate::yaml::YamlIndex::build(doc.as_bytes()).is_ok(),
+                "{doc:?}"
+            );
         }
     }
 }
