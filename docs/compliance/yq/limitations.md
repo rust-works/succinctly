@@ -4289,7 +4289,9 @@ What is refused explicitly (an error, never a silent no-op — the outcome #798'
 ruled out), even though real yq supports every one of them:
 
 - **`tag =`, and `head_comment =`/`foot_comment =`/`comments =` with a non-empty text on
-  anything but the document root** raise `<slot> = ... is not yet supported`. Real yq's `.a tag = "!!str"` coerces the
+  anything but the document root, a scalar mapping value / sequence item in a block
+  collection, or a mapping key (`(.a | key) head_comment = "x"`)** raise `<slot> = ... is
+  not yet supported`. Real yq's `.a tag = "!!str"` coerces the
   value's type, `.a head_comment = "hi"`/`.a foot_comment = "bye"` insert standalone comment
   lines, and `.a comments = "x"` sets head, line and foot together. Setting a text has no
   write mechanism here yet: `NodeMeta` (`src/jq/eval_generic.rs`) keeps a node's tag only as
@@ -4313,6 +4315,35 @@ ruled out), even though real yq supports every one of them:
   every node and still raises. Checked by 11 `meta_assign_root_*_2796` goldens, the
   document-shape sweep (flow, empty, scalar and multi-document roots) and a differential fuzz
   of ~2,800 root writes over random commented documents, none differing.
+- **A scalar mapping value or sequence item takes a text** ([#2796](https://github.com/rust-works/succinctly/issues/2796),
+  part 3): `.a.b head_comment = "x"`, `foot_comment` and `comments`, where yq prints it is
+  where go-yaml's emitter flushes it, not above or below the node (all measured against
+  v4.53.3). A mapping value's head waits for the next key and prints just above it at its
+  indent (after the last value it trails the entry), and a head the next key already owns
+  replaces it, so the write is lost; its foot follows the entry with a blank line unless it
+  is the last; a sequence item's head is above the item and its foot below with the same
+  rule; `comments` is the line comment, then the foot, then the head (`a: 1 # x`, `# x`, a
+  blank, `# x`, `b:`), and after a last entry head, a blank line and foot. In this tree the
+  lines are the member's own head and foot (what `# mid` above `b:` is): the next member's
+  head for a value head, this member's foot for the rest. A node, or its successor, that
+  already owns head or foot lines is refused rather than merged (the order yq flushes them
+  in is not modelled), as is anything under a flow collection, a container target, a text of
+  newlines alone, and a write to more than one target (`.[] head_comment = "x"`). Checked by
+  13 `meta_assign_entry_*_2796` goldens and a differential fuzz of ~5,300 accepted writes
+  over random documents with and without comments (none differed; ~4,300 more were refused).
+- **A mapping key takes a text** ([#2796](https://github.com/rust-works/succinctly/issues/2796),
+  part 4): `(.a | key) head_comment = "x"`, `foot_comment`, `line_comment` and `comments`, the
+  natural way to put a comment above a key. yq keeps the comments above and below an entry on
+  its key, which is what this tree stores as the member's own head and foot lines, so the head
+  goes above the key (replacing what was there: `# mid` above `b:` is `b`'s head), the foot
+  below the entry (blank line after a non-last one, none after the last) and the line comment
+  on the key's line, which for a scalar value is the value's own; `comments` is all three,
+  head first (`# x`, `a: 1 # x`, `# x`, a blank, `b:`). A foot or a line comment already
+  there (go-yaml prints a key's line comment on a later line when the value has one), a line
+  comment on a container value (a different slot), anything under a flow collection,
+  `style`/`anchor`, a newline-only text and several targets are refused. Checked by 11
+  `meta_assign_key_*_2796` goldens and a differential fuzz of ~7,200 accepted writes over
+  random documents with and without comments (none differed; ~2,000 more were refused).
 - **The clearing forms are written** ([#2796](https://github.com/rust-works/succinctly/issues/2796),
   part 1): `head_comment = ""`, `foot_comment = ""`, `comments = ""` and `line_comment = ""`,
   `=` or `|=`, on any target, and `...` (yq's recursive descent that also visits mapping

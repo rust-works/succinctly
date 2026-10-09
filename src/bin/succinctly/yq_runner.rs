@@ -3386,6 +3386,21 @@ enum MetaEffect {
         foot: Option<Vec<String>>,
         line: Option<String>,
     },
+    /// `.a.b head_comment = "x"` and friends on a scalar mapping value or sequence item in a
+    /// block collection (#2796). yq prints what is set on such a node where go-yaml's emitter
+    /// flushes it, not above or below the node: see [`apply_set_entry`].
+    SetEntry {
+        head: Option<Vec<String>>,
+        foot: Option<Vec<String>>,
+        line: Option<String>,
+    },
+    /// `(.a | key) head_comment = "x"` and friends: the mapping key's own head, foot and line
+    /// comment (#2796), which is what yq keeps above and below an entry. See [`apply_set_key`].
+    SetKey {
+        head: Option<Vec<String>>,
+        foot: Option<Vec<String>>,
+        line: Option<String>,
+    },
 }
 
 /// One resolved metadata write: which node, and what to do to it.
@@ -3821,18 +3836,26 @@ fn resolve_one_meta_assign(
     // mapping member: those are the candidates a clearing write needs for the comments above
     // and below an entry (`# mid\nb: 2`), which yq keeps on the key.
     let with_keys = matches!(target, Expr::RecursiveDescentWithKeys);
-    if with_keys && matches!(slot, WritableSlot::Style | WritableSlot::Anchor) {
+    // `(PATH | key)` addresses the key node of the member `PATH` names (#2796).
+    let key_prefix = target.key_node_prefix();
+    if (with_keys || key_prefix.is_some())
+        && matches!(slot, WritableSlot::Style | WritableSlot::Anchor)
+    {
         // Their key-node counterparts (a quoted key, an `&anchor` on a key) are not modelled for
         // a write, and applying them to the value node would be wrong rather than missing.
         sink.report(
             DiagStyle::Yq,
-            &EvalError::new("`...` is only supported with the comment slots (#2796)"),
+            &EvalError::new(
+                "`...` and `(PATH | key)` are only supported with the comment slots (#2796)",
+            ),
             &no_location(),
         );
         return false;
     }
     let path_target = if with_keys {
         Expr::RecursiveDescent
+    } else if let Some(prefix) = &key_prefix {
+        prefix.clone()
     } else {
         target.clone()
     };
@@ -3847,8 +3870,16 @@ fn resolve_one_meta_assign(
     if paths.is_empty() {
         return true;
     }
-    let mut paths: Vec<(Vec<MetaPathStep>, bool)> =
-        paths.into_iter().map(|path| (path, false)).collect();
+    // A key target keeps the members only: the key of a sequence item is its index, not a node.
+    let key_target = key_prefix.is_some();
+    let mut paths: Vec<(Vec<MetaPathStep>, bool)> = paths
+        .into_iter()
+        .filter(|path| !key_target || matches!(path.last(), Some(MetaPathStep::Key(_))))
+        .map(|path| (path, key_target))
+        .collect();
+    if paths.is_empty() {
+        return true;
+    }
     if with_keys {
         let mut keys = Vec::new();
         for (path, _) in &paths {
@@ -3909,6 +3940,9 @@ fn resolve_one_meta_assign(
         );
     }
 
+    // Writes to neighbouring entries interact (a value's head is the next key's), which is not
+    // modelled: a text goes to a single target.
+    let single_target = texts.len() == 1;
     for (path, on_key, s) in texts {
         // A key node's trailing comment is the key line's own, not the value's: only the
         // clearing form reaches it (#2796), through the same effect the other slots clear with.
@@ -3922,11 +3956,52 @@ fn resolve_one_meta_assign(
             | WritableSlot::FootComment
             | WritableSlot::Comments
             | WritableSlot::KeyLineComment => {
+                // A key node takes a text (#2796): its head above the key, its line comment on the
+                // key's line and its foot below the entry, which is what the entry's own lines are.
+                if key_target && single_target && on_key && !s.is_empty() {
+                    let keyword = match slot {
+                        WritableSlot::HeadComment => "head_comment",
+                        WritableSlot::FootComment => "foot_comment",
+                        WritableSlot::LineComment | WritableSlot::KeyLineComment => "line_comment",
+                        _ => "comments",
+                    };
+                    let Some(text) = meta_comment_text(&s) else {
+                        sink.report(
+                            DiagStyle::Yq,
+                            &EvalError::new(format!(
+                                "{keyword} = ... is not yet supported for a text made of newlines \
+                                 alone on a key node (#2796)"
+                            )),
+                            &no_location(),
+                        );
+                        return false;
+                    };
+                    let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+                    let head = matches!(slot, WritableSlot::HeadComment | WritableSlot::Comments);
+                    let foot = matches!(slot, WritableSlot::FootComment | WritableSlot::Comments);
+                    let line = matches!(
+                        slot,
+                        WritableSlot::Comments
+                            | WritableSlot::LineComment
+                            | WritableSlot::KeyLineComment
+                    );
+                    out.push(ResolvedMetaWrite {
+                        path,
+                        on_key,
+                        effect: MetaEffect::SetKey {
+                            head: head.then(|| lines.clone()),
+                            foot: foot.then_some(lines),
+                            line: line.then_some(text),
+                        },
+                    });
+                    continue;
+                }
                 // The document root takes a text (#2796): yq prints its head above the document
                 // and its foot below, wherever the document's own entries put theirs. Any other
                 // node's depends on go-yaml's emitter state.
                 let text = meta_comment_text(&s);
                 let sets_root = text.is_some()
+                    && single_target
                     && !on_key
                     && path.is_empty()
                     && !matches!(slot, WritableSlot::KeyLineComment);
@@ -3938,6 +4013,32 @@ fn resolve_one_meta_assign(
                         path,
                         on_key,
                         effect: MetaEffect::SetRoot {
+                            head: head.then(|| lines.clone()),
+                            foot: foot.then_some(lines),
+                            line: matches!(slot, WritableSlot::Comments).then_some(text),
+                        },
+                    });
+                    continue;
+                }
+                // A scalar mapping value or sequence item takes a text too (#2796); where it
+                // lands, and whether the surrounding comments allow it, is decided against the
+                // result's comment tree when the write is applied.
+                let sets_entry = !s.is_empty()
+                    && single_target
+                    && !on_key
+                    && !path.is_empty()
+                    && !matches!(slot, WritableSlot::KeyLineComment)
+                    && meta_comment_text(&s).is_some()
+                    && scalar_entry_in_collection(current, &path);
+                if sets_entry {
+                    let text = meta_comment_text(&s).unwrap_or_default();
+                    let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+                    let head = matches!(slot, WritableSlot::HeadComment | WritableSlot::Comments);
+                    let foot = matches!(slot, WritableSlot::FootComment | WritableSlot::Comments);
+                    out.push(ResolvedMetaWrite {
+                        path,
+                        on_key,
+                        effect: MetaEffect::SetEntry {
                             head: head.then(|| lines.clone()),
                             foot: foot.then_some(lines),
                             line: matches!(slot, WritableSlot::Comments).then_some(text),
@@ -4070,7 +4171,7 @@ fn apply_meta_assign_writes(
     writes: &[ResolvedMetaWrite],
     value: &mut OwnedValue,
     tree: &mut CommentTree,
-) {
+) -> Result<(), EvalError> {
     for write in writes {
         let steps: Vec<TreeStep<'_>> = write
             .path
@@ -4085,6 +4186,29 @@ fn apply_meta_assign_writes(
         };
         if let MetaEffect::Clear { head, line, foot } = write.effect {
             apply_clear(write, &steps, tree, head, line, foot);
+            continue;
+        }
+        if let MetaEffect::SetEntry { head, foot, line } = &write.effect {
+            // A later stage can have replaced the scalar this was resolved against with a
+            // container, which yq places differently.
+            if matches!(node_value, OwnedValue::Object(_) | OwnedValue::Array(_)) {
+                return Err(set_entry_unsupported(
+                    "a later stage replaced the scalar with a mapping or sequence",
+                ));
+            }
+            apply_set_entry(&steps, tree, head.as_ref(), foot.as_ref(), line.as_ref())?;
+            continue;
+        }
+        if let MetaEffect::SetKey { head, foot, line } = &write.effect {
+            let scalar = !matches!(node_value, OwnedValue::Object(_) | OwnedValue::Array(_));
+            apply_set_key(
+                &steps,
+                tree,
+                scalar,
+                head.as_ref(),
+                foot.as_ref(),
+                line.as_ref(),
+            )?;
             continue;
         }
         let Some(node) = comment_tree_at_path_or_create_mut(tree, &steps) else {
@@ -4129,9 +4253,245 @@ fn apply_meta_assign_writes(
                 node.meta_mut().anchor = name.clone().map(AnchorMark::Declares);
             }
             // Handled above, before the node is borrowed.
-            MetaEffect::Clear { .. } | MetaEffect::SetRoot { .. } => {} // patchcov: coverage tolerate-line reason="unreachable: apply_meta_assign_writes sends every Clear to apply_clear and continues before reaching this match (#2796)"
+            MetaEffect::Clear { .. }
+            | MetaEffect::SetRoot { .. }
+            | MetaEffect::SetEntry { .. }
+            | MetaEffect::SetKey { .. } => {} // patchcov: coverage tolerate-line reason="unreachable: apply_meta_assign_writes handles every Clear, SetRoot, SetEntry and SetKey before reaching this match (#2796)"
         }
     }
+    Ok(())
+}
+
+/// Whether `path` addresses a scalar that is a value of a mapping or an item of a sequence in
+/// `root` (#2796): the only inner nodes a text write is modelled for.
+fn scalar_entry_in_collection(root: &OwnedValue, path: &[MetaPathStep]) -> bool {
+    let Some((last, parent_path)) = path.split_last() else {
+        return false;
+    };
+    let target_is_scalar = matches!(
+        owned_value_at(root, path),
+        Some(v) if !matches!(v, OwnedValue::Object(_) | OwnedValue::Array(_))
+    );
+    target_is_scalar
+        && matches!(
+            (owned_value_at(root, parent_path), last),
+            (Some(OwnedValue::Object(_)), MetaPathStep::Key(_))
+                | (Some(OwnedValue::Array(_)), MetaPathStep::Index(_))
+        )
+}
+
+/// The refusal for a text write the comment tree cannot place exactly.
+fn set_entry_unsupported(why: &str) -> EvalError {
+    EvalError::new(format!(
+        "head_comment/foot_comment/comments = ... is not yet supported here: {why} (#2796)"
+    ))
+}
+
+/// Whether every collection from the root down to `parent_steps` is block style, `Err` if one is
+/// flow (#2796: a flow collection prints its comments differently), `Ok(false)` if the path is not
+/// in the tree at all.
+fn block_ancestors(tree: &CommentTree, parent_steps: &[TreeStep<'_>]) -> Result<bool, EvalError> {
+    let flow = || set_entry_unsupported("the collection is written in flow style");
+    let mut ancestor = tree;
+    if ancestor.style() == "flow" {
+        return Err(flow());
+    }
+    for step in parent_steps {
+        let next = match (ancestor, step) {
+            (CommentTree::Object(_, fields, _), TreeStep::Key(k)) => fields.get(*k),
+            (CommentTree::Array(_, items), TreeStep::Index(i)) => items.get(*i),
+            _ => None,
+        };
+        let Some(next) = next else {
+            return Ok(false);
+        };
+        if next.style() == "flow" {
+            return Err(flow());
+        }
+        ancestor = next;
+    }
+    Ok(true)
+}
+
+/// Apply a text write to a scalar mapping value or sequence item (`.a.b head_comment = "x"`,
+/// #2796), or refuse it.
+///
+/// yq does not print such a comment above or below the node. go-yaml's emitter keeps one
+/// pending slot per kind and flushes it at the next event that processes it, so, in a block
+/// collection (all measured against pinned v4.53.3, every rule below):
+///
+/// - a **mapping value's head** waits for the next key: it prints just above it, at its indent,
+///   unless that key has a head of its own, which replaces it (the write is then lost); after
+///   the *last* value it prints below the entry, at the entry's indent;
+/// - a **mapping value's foot** prints below the entry followed by a blank line, except after
+///   the last entry, where there is none;
+/// - a **sequence item's head** prints above the item; its foot below, with the same blank
+///   line rule;
+/// - `comments` is all three: the line comment, then the foot, then the head (so `a: 1 # x`,
+///   `# x`, a blank, `# x`, `b:`), and after a last entry head, a blank and foot.
+///
+/// Where those lines belong in this tree is the entry-level head and foot of the member (what
+/// `# mid` above `b:` is): the next member's head for a value head, this member's foot for the
+/// rest. Any head or foot already on the members involved is refused instead of merged: the
+/// order yq flushes them in is not modelled. So is anything under a flow collection.
+fn apply_set_entry(
+    steps: &[TreeStep<'_>],
+    tree: &mut CommentTree,
+    head: Option<&Vec<String>>,
+    foot: Option<&Vec<String>>,
+    line: Option<&String>,
+) -> Result<(), EvalError> {
+    let Some((last, parent_steps)) = steps.split_last() else {
+        return Ok(());
+    };
+    if !block_ancestors(tree, parent_steps)? {
+        return Ok(());
+    }
+    let Some(parent) = comment_tree_at_path_or_create_mut(tree, parent_steps) else {
+        return Ok(());
+    };
+    let owns_lines = |node: &CommentTree| {
+        !node.meta().head_comment().is_empty() || !node.meta().foot_comment().is_empty()
+    };
+    let lines_of = |head: Option<&Vec<String>>, foot: Option<&Vec<String>>, last_entry: bool| {
+        // After the last member a head and a foot are separated by a blank line.
+        let mut out = Vec::new();
+        if last_entry {
+            if let Some(head) = head {
+                out.extend(head.iter().cloned());
+            }
+            if head.is_some() && foot.is_some() {
+                out.push(String::new());
+            }
+            if let Some(foot) = foot {
+                out.extend(foot.iter().cloned());
+            }
+        } else if let Some(foot) = foot {
+            // The blank line after a non-last foot is `join_block_entries`'s.
+            out.extend(foot.iter().cloned());
+        }
+        out
+    };
+    // Either kind of collection reduces to "the members, in order" and which one is the target.
+    let (members, index): (Vec<&mut CommentTree>, usize) = match (parent, last) {
+        (CommentTree::Object(_, fields, _), TreeStep::Key(k)) => {
+            let Some(index) = fields.get_index_of(*k) else {
+                return Ok(());
+            };
+            (fields.values_mut().collect(), index)
+        }
+        (CommentTree::Array(_, items), TreeStep::Index(i)) => (items.iter_mut().collect(), *i),
+        _ => return Ok(()),
+    };
+    let is_map = matches!(last, TreeStep::Key(_));
+    let count = members.len();
+    if index >= count {
+        return Ok(());
+    }
+    let last_entry = index + 1 == count;
+    let mut members = members;
+    if owns_lines(members[index]) {
+        return Err(set_entry_unsupported(
+            "the node already has head or foot comment lines (in the document or from an earlier write)",
+        ));
+    }
+    if !last_entry && owns_lines(members[index + 1]) {
+        return Err(set_entry_unsupported(
+            "the next entry already has head or foot comment lines (in the document or from an earlier write)",
+        ));
+    }
+    if let Some(line) = line {
+        members[index].meta_mut().comment = Some(line.clone());
+    }
+    let (set_head, set_foot) = (head, foot);
+    if is_map {
+        // A mapping value's head is the next key's, or trails the last entry.
+        let own_foot = if last_entry {
+            lines_of(set_head, set_foot, true)
+        } else {
+            if let Some(head) = set_head {
+                let next = members[index + 1].meta();
+                *members[index + 1].meta_mut() = next.with_head_foot(head.clone(), Vec::new());
+            }
+            lines_of(None, set_foot, false)
+        };
+        if !own_foot.is_empty() {
+            let meta = members[index].meta();
+            *members[index].meta_mut() = meta.with_head_foot(Vec::new(), own_foot);
+        }
+    } else {
+        // A sequence item's head is its own, above it.
+        let own_head = set_head.cloned().unwrap_or_default();
+        let own_foot = lines_of(None, set_foot, last_entry);
+        let meta = members[index].meta();
+        *members[index].meta_mut() = meta.with_head_foot(own_head, own_foot);
+    }
+    Ok(())
+}
+
+/// Apply a text write to a mapping key node (`(.a | key) head_comment = "x"`, #2796), or refuse
+/// it.
+///
+/// yq keeps the comments above and below an entry on its key, so this is the natural place for
+/// them, and the tree stores them as the member's own head and foot lines: the head goes above
+/// the key (replacing what was there: `# mid` above `b:` is `b`'s head), the foot below the entry
+/// (the blank line after a non-last foot is the joiner's), and a line comment on the key's line,
+/// which for a scalar value is the value's own. Measured against pinned v4.53.3 on the same
+/// shapes as [`apply_set_entry`]. Refused rather than merged: a foot or a line comment already
+/// there (go-yaml prints a key's line comment on a later line when the value has one), a line
+/// comment on a container value (a different slot), and anything under a flow collection.
+fn apply_set_key(
+    steps: &[TreeStep<'_>],
+    tree: &mut CommentTree,
+    scalar_value: bool,
+    head: Option<&Vec<String>>,
+    foot: Option<&Vec<String>>,
+    line: Option<&String>,
+) -> Result<(), EvalError> {
+    let Some((TreeStep::Key(key), parent_steps)) = steps.split_last() else {
+        return Ok(());
+    };
+    if !block_ancestors(tree, parent_steps)? {
+        return Ok(());
+    }
+    // The write may name a member the value tree only gained from the real evaluation (`(.z.y |
+    // key) ...` on a document without `z`): grow the comment tree to it.
+    comment_tree_at_path_or_create_mut(tree, steps);
+    let Some(CommentTree::Object(_, fields, _)) =
+        comment_tree_at_path_or_create_mut(tree, parent_steps)
+    else {
+        return Ok(());
+    };
+    let Some(member) = fields.get_mut(*key) else {
+        return Ok(()); // patchcov: coverage tolerate-line reason="unreachable: the member was grown just above, so the parent object has it (#2796)"
+    };
+    if foot.is_some() && !member.meta().foot_comment().is_empty() {
+        return Err(set_entry_unsupported(
+            "the key already has foot comment lines",
+        ));
+    }
+    if line.is_some() {
+        if !scalar_value {
+            return Err(set_entry_unsupported(
+                "a line comment on the key of a mapping or sequence value",
+            ));
+        }
+        if member.meta().comment.is_some() {
+            return Err(set_entry_unsupported(
+                "the entry already has a line comment",
+            ));
+        }
+        member.meta_mut().comment = line.cloned();
+    }
+    let meta = member.meta();
+    let new_head = head
+        .cloned()
+        .unwrap_or_else(|| meta.head_comment().to_vec());
+    let new_foot = foot
+        .cloned()
+        .unwrap_or_else(|| meta.foot_comment().to_vec());
+    *member.meta_mut() = meta.with_head_foot(new_head, new_foot);
+    Ok(())
 }
 
 /// Apply a clearing write (`head_comment = ""`, `foot_comment = ""`, `comments = ""`, #2796).
@@ -4575,7 +4935,14 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     if !resolved_meta_writes.is_empty() {
         if let Ok(docs) = &mut docs {
             for (value, comments) in docs.iter_mut() {
-                apply_meta_assign_writes(&resolved_meta_writes, value, comments);
+                if let Err(refusal) =
+                    apply_meta_assign_writes(&resolved_meta_writes, value, comments)
+                {
+                    // A write the comment tree cannot place exactly (#2796): no document is
+                    // printed, as for any other metadata write that fails.
+                    sink.report(DiagStyle::Yq, &refusal, &no_location());
+                    return Ok(Vec::new());
+                }
             }
         } // patchcov: coverage tolerate-line reason="unreachable: every arm of the `match result { .. }` above that assigns `docs` (L3492-3622) constructs `Ok(..)` -- none ever produces `Err`, so this `if let`'s implicit else can't be taken; symmetric to L1625's `?` (#798)"
     }
@@ -11552,5 +11919,180 @@ mod tests {
             resolve_meta_assign_writes(&expr, &OwnedValue::Null, &mut ErrorSink::default())
                 .is_some()
         );
+    }
+
+    /// #2796: a text written to a scalar mapping value or sequence item lands where go-yaml's
+    /// emitter flushes it: a value's head waits for the next key (or trails the last entry), a
+    /// foot follows the entry with a blank line unless it is the last, `comments` is both plus
+    /// the line comment, and a sequence item's head is above it.
+    #[test]
+    fn scalar_entry_text_lands_where_the_emitter_flushes_it_2796() {
+        let map = "a: 1\nb: 2\nc: 3\n";
+        for (filter, want) in [
+            (".a head_comment = \"x\"", "a: 1\n# x\nb: 2\nc: 3"),
+            (".c head_comment = \"x\"", "a: 1\nb: 2\nc: 3\n# x"),
+            (".a foot_comment = \"x\"", "a: 1\n# x\n\nb: 2\nc: 3"),
+            (".c foot_comment = \"x\"", "a: 1\nb: 2\nc: 3\n# x"),
+            (".a comments = \"x\"", "a: 1 # x\n# x\n\n# x\nb: 2\nc: 3"),
+            (".c comments = \"x\"", "a: 1\nb: 2\nc: 3 # x\n# x\n\n# x"),
+            (
+                ".b foot_comment = \"m\\nn\"",
+                "a: 1\nb: 2\n# m\n# n\n\nc: 3",
+            ),
+        ] {
+            assert_eq!(
+                render_with_comments(map, filter).trim_end(),
+                want,
+                "{filter}"
+            );
+        }
+        let nested = "a:\n  b: 1\n  c: 2\ns:\n  - x\n  - y\n";
+        for (filter, want) in [
+            (
+                ".a.c head_comment = \"x\"",
+                "a:\n  b: 1\n  c: 2\n  # x\ns:\n  - x\n  - y",
+            ),
+            (
+                ".s[0] head_comment = \"x\"",
+                "a:\n  b: 1\n  c: 2\ns:\n  # x\n  - x\n  - y",
+            ),
+            (
+                ".s[0] foot_comment = \"x\"",
+                "a:\n  b: 1\n  c: 2\ns:\n  - x\n  # x\n\n  - y",
+            ),
+            (
+                ".s[1] foot_comment = \"x\"",
+                "a:\n  b: 1\n  c: 2\ns:\n  - x\n  - y\n  # x",
+            ),
+        ] {
+            assert_eq!(
+                render_with_comments(nested, filter).trim_end(),
+                want,
+                "{filter}"
+            );
+        }
+    }
+
+    /// #2796: what the comment tree cannot place exactly is refused, never merged or dropped:
+    /// a node or its successor that already owns head or foot lines, a flow collection, a
+    /// container target, and a newline-only text.
+    #[test]
+    fn scalar_entry_text_refuses_what_it_cannot_place_2796() {
+        for (yaml, filter) in [
+            ("a: 1\n# own\nb: 2\nc: 3\n", ".a head_comment = \"x\""),
+            ("a: 1\n# own\nb: 2\nc: 3\n", ".b foot_comment = \"x\""),
+            ("a: 1\n# own\nb: 2\n", ".b head_comment = \"x\""),
+            ("a: {b: 1, c: 2}\n", ".a.b head_comment = \"x\""),
+            ("a: [1, 2]\n", ".a[0] foot_comment = \"x\""),
+            ("a: {b: 1}\nc: 2\n", ".a head_comment = \"x\""),
+            ("a: 1\n", ".a head_comment = \"\\n\""),
+            // A later stage replaced the scalar with a container, which yq places differently.
+            ("a: 1\n", ".a head_comment = \"y\" | .a = {\"x\": 1}"),
+        ] {
+            let expr = jq::parse_with_mode(filter, jq::ParserMode::Yq).unwrap();
+            let mut sink = ErrorSink::default();
+            let (groups, _) = evaluate_yaml_direct_filtered(
+                yaml.as_bytes(),
+                &expr,
+                None,
+                &mut sink,
+                DirectEvalOptions {
+                    need_comments: true,
+                    strip_style: false,
+                    sort_keys: false,
+                    mark_json_sourced: false,
+                },
+            )
+            .unwrap();
+            assert!(
+                groups.into_iter().flatten().next().is_none(),
+                "{filter} on {yaml:?}"
+            );
+            assert_eq!(sink.report_count(), 1, "{filter} on {yaml:?}");
+        }
+    }
+
+    /// #2796: `(PATH | key)` addresses the mapping key's own comments: the head above the key
+    /// (replacing what was there), the foot below the entry, the line comment on its line.
+    #[test]
+    fn key_node_text_lands_on_the_keys_own_lines_2796() {
+        let map = "a: 1\nb: 2\nc: 3\n";
+        for (filter, want) in [
+            ("(.b | key) head_comment = \"x\"", "a: 1\n# x\nb: 2\nc: 3"),
+            ("(.a | key) foot_comment = \"x\"", "a: 1\n# x\n\nb: 2\nc: 3"),
+            ("(.c | key) foot_comment = \"x\"", "a: 1\nb: 2\nc: 3\n# x"),
+            ("(.a | key) line_comment = \"x\"", "a: 1 # x\nb: 2\nc: 3"),
+            (
+                "(.a | key) comments = \"x\"",
+                "# x\na: 1 # x\n# x\n\nb: 2\nc: 3",
+            ),
+            (
+                "(.b | key) head_comment = \"m\\nn\"",
+                "a: 1\n# m\n# n\nb: 2\nc: 3",
+            ),
+        ] {
+            assert_eq!(
+                render_with_comments(map, filter).trim_end(),
+                want,
+                "{filter}"
+            );
+        }
+        assert_eq!(
+            render_with_comments("a: 1\n# mid\nb: 2\n", "(.b | key) head_comment = \"x\"")
+                .trim_end(),
+            "a: 1\n# x\nb: 2"
+        );
+        // A key under a sequence item, and clearing through the same target.
+        assert_eq!(
+            render_with_comments("- a: 1\n  b: 2\n", "(.[0].b | key) head_comment = \"x\"")
+                .trim_end(),
+            "- a: 1\n  # x\n  b: 2"
+        );
+        assert_eq!(
+            render_with_comments(
+                "# top\na: 1 # l\n# mid\nb: 2\n",
+                "(.b | key) comments = \"\""
+            )
+            .trim_end(),
+            "# top\na: 1 # l\nb: 2"
+        );
+    }
+
+    /// #2796: what the key node cannot take exactly is refused: a foot or a line comment already
+    /// there, a line comment on a container value, a flow collection, a style or anchor, a
+    /// newline-only text, and several targets.
+    #[test]
+    fn key_node_text_refuses_what_it_cannot_place_2796() {
+        for (yaml, filter) in [
+            ("a: 1\n# own\n\nb: 2\n", "(.a | key) foot_comment = \"x\""),
+            ("a: 1 # l\nb: 2\n", "(.a | key) line_comment = \"x\""),
+            ("a:\n  b: 1\nc: 2\n", "(.a | key) line_comment = \"x\""),
+            ("a: {b: 1}\n", "(.a.b | key) head_comment = \"x\""),
+            ("a: 1\n", "(.a | key) style = \"double\""),
+            ("a: 1\n", "(.a | key) anchor = \"z\""),
+            ("a: 1\n", "(.a | key) head_comment = \"\\n\""),
+            ("a: 1\nb: 2\n", "(.[] | key) head_comment = \"x\""),
+        ] {
+            let expr = jq::parse_with_mode(filter, jq::ParserMode::Yq).unwrap();
+            let mut sink = ErrorSink::default();
+            let (groups, _) = evaluate_yaml_direct_filtered(
+                yaml.as_bytes(),
+                &expr,
+                None,
+                &mut sink,
+                DirectEvalOptions {
+                    need_comments: true,
+                    strip_style: false,
+                    sort_keys: false,
+                    mark_json_sourced: false,
+                },
+            )
+            .unwrap();
+            assert!(
+                groups.into_iter().flatten().next().is_none(),
+                "{filter} on {yaml:?}"
+            );
+            assert_eq!(sink.report_count(), 1, "{filter} on {yaml:?}");
+        }
     }
 }
