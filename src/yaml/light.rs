@@ -7387,12 +7387,31 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     }
 
     /// The balanced-parentheses excess at this node's open: a rank lookup. A block-sequence item
-    /// sits under its `-` node, so it is two levels below its sequence, not one: the scan's
-    /// "direct child of a remembered parent" test does not recognise it and takes the parent
-    /// from `document_parent`, as it did before.
+    /// sits under its `-` node, so it is two levels below its sequence, not one; the scan's
+    /// "direct child of a remembered parent" test asks [`element_depth`] about the child instead.
+    ///
+    /// [`element_depth`]: DocumentCursor::element_depth
     #[inline]
     fn tree_depth(&self) -> Option<usize> {
         self.index.bp().depth(self.bp_pos)
+    }
+
+    /// [`tree_depth`](DocumentCursor::tree_depth), except for a block-sequence item that is the
+    /// first child of its `-` node: the `-` node is the sequence's direct child, so its depth
+    /// is the item's (#3846). A node that is not a first child fails on one bit test (the
+    /// position before it is not an open); `is_seq_entry_of` is the rule `next_element`
+    /// unwraps with.
+    #[inline]
+    fn element_depth(&self) -> Option<usize> {
+        let depth = self.tree_depth()?;
+        if self.bp_pos > 0 {
+            if let Some(before) = self.at_node_id(self.bp_pos - 1) {
+                if before.is_seq_entry_of(self) {
+                    return Some(depth - 1);
+                }
+            }
+        }
+        Some(depth)
     }
 
     /// The matching close parenthesis: every descendant's `bp_pos` lies strictly between it and
@@ -16437,14 +16456,8 @@ mod tests {
         out
     }
 
-    /// #2784: `next_element` walks the chain `uncons_cursor` hands out for a sequence (a
-    /// block item unwrapped from its `-` node, a bare `-` left as the node) and the key, value,
-    /// key, value, ... siblings of a direct mapping, from the first element to the last, for
-    /// every container of a document that holds each shape.
-    #[test]
-    fn next_element_walks_the_element_and_member_chains_2784() {
-        use crate::jq::document::{DocumentElements, DocumentFields, DocumentValue};
-        let yaml = "\
+    /// A document holding every shape of sequence item and mapping member (#2784, #3846).
+    const ELEMENT_CHAIN_DOC_2784: &str = "\
 seq:
   - a
   - b: 1
@@ -16482,6 +16495,15 @@ flow: [a, [b, c], {d: e}]
 empty_seq: []
 empty_map: {}
 ";
+
+    /// #2784: `next_element` walks the chain `uncons_cursor` hands out for a sequence (a
+    /// block item unwrapped from its `-` node, a bare `-` left as the node) and the key, value,
+    /// key, value, ... siblings of a direct mapping, from the first element to the last, for
+    /// every container of a document that holds each shape.
+    #[test]
+    fn next_element_walks_the_element_and_member_chains_2784() {
+        use crate::jq::document::{DocumentElements, DocumentFields, DocumentValue};
+        let yaml = ELEMENT_CHAIN_DOC_2784;
         let index = YamlIndex::build(yaml.as_bytes()).unwrap();
         let root = index.root(yaml.as_bytes());
         let (mut sequences, mut mappings) = (0, 0);
@@ -16523,6 +16545,78 @@ empty_map: {}
         assert!(
             sequences >= 6 && mappings >= 5,
             "{sequences} sequences, {mappings} mappings"
+        );
+    }
+
+    /// #3846: `element_depth` is what the scan for an element's slot uses to recognise a direct
+    /// child of a parent it remembers, so it must be sound -- every node strictly inside a
+    /// container whose `element_depth` is the container's `tree_depth` plus one has that
+    /// container for its `document_parent`, whatever the `-` nodes around it -- and complete:
+    /// every element and member `next_element` walks passes the test.
+    #[test]
+    fn element_depth_recognises_exactly_the_direct_children_3846() {
+        use crate::jq::document::{DocumentElements, DocumentFields, DocumentValue};
+        let yaml = ELEMENT_CHAIN_DOC_2784;
+        let index = YamlIndex::build(yaml.as_bytes()).unwrap();
+        let root = index.root(yaml.as_bytes());
+        let cursors = all_cursors_2072(root);
+        let (mut containers, mut block_items) = (0, 0);
+        for parent in &cursors {
+            // Neither the stream root nor a `-` node is anyone's `document_parent`, so no scan
+            // remembers one (a `-` node's `value()` is its item's, which is why it is skipped).
+            if parent.node_id() == 0 || !parent.is_container() {
+                continue;
+            }
+            let value = parent.value();
+            let mut children = Vec::new();
+            if let Some(elements) = value.as_array() {
+                let mut rest = elements;
+                while let Some((element, next)) = DocumentElements::uncons_cursor(&rest) {
+                    children.push(element);
+                    rest = next;
+                }
+            } else if let Some(fields) = value.as_object() {
+                let mut rest = fields;
+                while let Some((field, next)) = DocumentFields::uncons(&rest) {
+                    children.push(field.key_cursor);
+                    children.push(field.value_cursor);
+                    rest = next;
+                }
+            } else {
+                continue;
+            }
+            let (Some(end), Some(depth)) = (parent.subtree_end(), parent.tree_depth()) else {
+                continue;
+            };
+            containers += 1;
+            for child in &children {
+                assert_eq!(
+                    child.element_depth(),
+                    Some(depth + 1),
+                    "child at bp {} of the container at bp {}",
+                    child.node_id(),
+                    parent.node_id()
+                );
+                block_items += usize::from(child.element_depth() != child.tree_depth());
+            }
+            for c in &cursors {
+                if c.node_id() > parent.node_id()
+                    && c.node_id() < end
+                    && c.element_depth() == Some(depth + 1)
+                {
+                    assert_eq!(
+                        c.document_parent().map(|p| p.node_id()),
+                        Some(parent.node_id()),
+                        "bp {} passes for a child of the container at bp {}",
+                        c.node_id(),
+                        parent.node_id()
+                    );
+                }
+            }
+        }
+        assert!(
+            containers >= 10 && block_items >= 8,
+            "{containers} containers, {block_items} block items"
         );
     }
 

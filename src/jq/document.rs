@@ -495,8 +495,9 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// [`RESUMABLE_ELEMENT_SCAN`] should answer it (and
     /// [`subtree_end`](Self::subtree_end)), or skipping fan-outs fall back to
     /// the parent lookup. A direct child of a node at depth `d`
-    /// is at depth `d + 1`, and lies strictly between that node's own id and
-    /// its [`subtree_end`](Self::subtree_end). Both are `O(1)` for the
+    /// is at depth `d + 1` (its [`element_depth`](Self::element_depth)), and
+    /// lies strictly between that node's own id and its
+    /// [`subtree_end`](Self::subtree_end). Both are `O(1)` for the
     /// balanced-parentheses formats, where finding a node's *parent* is a
     /// backward scan, so the scan for an element's slot uses them to recognise
     /// a direct child of a parent it remembers without asking for its parent
@@ -505,6 +506,22 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// [`RESUMABLE_ELEMENT_SCAN`]: Self::RESUMABLE_ELEMENT_SCAN
     fn tree_depth(&self) -> Option<usize> {
         None
+    }
+
+    /// The depth at which this node counts as an *element* of its parent, for
+    /// the test "is this a direct child of a node at depth `d`" (#3846): a
+    /// node is one exactly when its `element_depth` is `d + 1` and it lies
+    /// strictly inside that node's [`subtree_end`](Self::subtree_end).
+    ///
+    /// The default is [`tree_depth`](Self::tree_depth), right for a format
+    /// whose elements are the parent's direct children in the tree. A format
+    /// that wraps an element in a node of its own (YAML's block-sequence
+    /// `- ` entry) answers the wrapper's depth, since the wrapper is the
+    /// parent's direct child; answering a smaller depth than `tree_depth`
+    /// is always safe, a larger one is not. Only the depth of the parent is
+    /// `tree_depth`.
+    fn element_depth(&self) -> Option<usize> {
+        self.tree_depth()
     }
 
     /// The element after this one, when [`RESUMABLE_ELEMENT_SCAN`] holds and

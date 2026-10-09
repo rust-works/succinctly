@@ -8277,6 +8277,27 @@ mod slot_memo {
     #[inline(always)]
     pub(crate) fn note_missed(_document: usize, _parent: usize) {}
 
+    // How many times `scan_for_slot` built the parent's value, which for a YAML
+    // mapping walks every member (#3846): a resume must not.
+    #[cfg(test)]
+    thread_local! {
+        static VALUED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn valued() -> usize {
+        VALUED.with(std::cell::Cell::get)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_parent_valued() {
+        VALUED.with(|v| v.set(v.get() + 1));
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) fn note_parent_valued() {}
+
     #[cfg(not(test))]
     #[inline(always)]
     pub(crate) fn note_scanned() {}
@@ -8552,6 +8573,8 @@ mod slot_memo {
     pub(crate) fn set_extent(_document: usize, _parent: usize, _end: usize, _depth: usize) {}
 
     pub(crate) fn note_missed(_document: usize, _parent: usize) {}
+
+    pub(crate) fn note_parent_valued() {}
 
     pub(crate) fn remember(
         _document: usize,
@@ -26436,6 +26459,12 @@ fn cursor_parent_and_slot<C: DocumentCursor>(
 
 /// Where `c` sits among `parent`'s members, by scanning them.
 fn scan_for_slot<C: DocumentCursor>(c: &C, parent: &C) -> Result<Option<CursorSlot<C>>, EvalError> {
+    if C::RESUMABLE_ELEMENT_SCAN {
+        if let Some(slot) = resumed_slot(c, parent) {
+            return Ok(Some(slot));
+        }
+    }
+    slot_memo::note_parent_valued();
     let parent_value = parent.value();
     if let Some(fields) = parent_value.as_object() {
         if C::RESUMABLE_ELEMENT_SCAN {
@@ -26490,7 +26519,10 @@ const SLOT_MEMO_MIN_SCAN: i64 = 32;
 /// scan of the balanced parentheses, `O(distance to the parent's open)`. A
 /// direct child of a remembered parent lies strictly inside it, one level
 /// down: two `O(1)` facts (the parent's subtree end and depth, recorded the
-/// first time they are asked, and the node's depth) in place of the scan.
+/// first time they are asked, and the node's [`element_depth`]) in place of
+/// the scan.
+///
+/// [`element_depth`]: DocumentCursor::element_depth
 fn remembered_direct_parent<C: DocumentCursor>(c: &C) -> Option<C> {
     if !C::RESUMABLE_ELEMENT_SCAN {
         return None;
@@ -26510,7 +26542,7 @@ fn remembered_direct_parent<C: DocumentCursor>(c: &C) -> Option<C> {
             }
         };
         // A node at the child depth beyond the parent's end is a cousin's.
-        if id < end && *depth.get_or_insert(c.tree_depth()?) == parent_depth + 1 {
+        if id < end && *depth.get_or_insert(c.element_depth()?) == parent_depth + 1 {
             return c.at_node_id(candidate.parent);
         }
     }
@@ -26548,31 +26580,46 @@ fn remembered_neighbour<C: DocumentCursor>(c: &C) -> Option<(usize, i64, bool, b
     found
 }
 
-/// [`scan_for_slot`]'s array arm for a format whose elements are the
-/// [`next_element`](DocumentCursor::next_element) chain: the element `c` of
-/// `parent`, resuming from the element the last scan of `parent` found when
-/// [`slot_memo`] holds one before `c`, and remembering where this scan ends
-/// for the next (#3702). A resume that finds nothing falls back to the scan
-/// from the first element, so the answer is the full scan's either way.
+/// The slot of `c` in `parent`, resuming after the member or element the last
+/// scan of `parent` found when [`slot_memo`] holds one before `c` (#3702,
+/// #3839), or `None` when nothing is remembered, `c` is not further on, or an
+/// undecodable key is reached: the scan from the first one then decides, so the
+/// answer is the full scan's either way.
 ///
-/// A scan back to an element before the remembered one replaces it: a pipe
-/// that alternates a read near the start with a read near the end gets no
-/// help, as it got none before.
-fn element_slot_resumable<C: DocumentCursor>(
-    c: &C,
-    parent: &C,
-    elements: <C::Value as DocumentValue>::Elements,
-) -> Option<CursorSlot<C>> {
+/// It reads only cursors, never `parent.value()`: a YAML mapping's value
+/// resolves its merge keys by walking every member, `O(members)`, which a
+/// fan-out that skips members (so is not a remembered one's neighbour) paid at
+/// every position (#3846). The remembered scan says whether the parent is a
+/// mapping, so the value is not needed to tell either.
+fn resumed_slot<C: DocumentCursor>(c: &C, parent: &C) -> Option<CursorSlot<C>> {
     let document = c.document_token();
     let parent_id = parent.node_id();
-    if let Some((last, index, false)) = slot_memo::resume(document, parent_id, c.node_id()) {
-        let mut cursor = c.at_node_id(last).and_then(|l| l.next_element());
+    let target = c.node_id();
+    let (last, index, members) = slot_memo::resume(document, parent_id, target)?;
+    let mut cursor = c.at_node_id(last).and_then(|l| l.next_element());
+    if members {
+        while let Some(kc) = cursor {
+            slot_memo::note_scanned();
+            // Node ids follow document order: past `c`, it is not here, and
+            // the scan from the first member decides whether it is anywhere.
+            if kc.node_id() > target {
+                break;
+            }
+            // A key with no value after it ends the list, as in the full scan.
+            let vc = kc.next_element()?;
+            let is_value = vc.same_node(c);
+            if is_value || kc.same_node(c) {
+                let slot = member_slot(kc, is_value)?;
+                remember_member(document, parent_id, &vc);
+                return Some(slot);
+            }
+            cursor = vc.next_element();
+        }
+    } else {
         let mut at = index + 1;
         while let Some(elem) = cursor {
             slot_memo::note_scanned();
-            // Node ids follow document order: past `c`, it is not here, and
-            // the scan from the first element decides whether it is anywhere.
-            if elem.node_id() > c.node_id() {
+            if elem.node_id() > target {
                 break;
             }
             let next = elem.next_element();
@@ -26591,6 +26638,25 @@ fn element_slot_resumable<C: DocumentCursor>(
             at += 1;
         }
     }
+    None
+}
+
+/// [`scan_for_slot`]'s array arm for a format whose elements are the
+/// [`next_element`](DocumentCursor::next_element) chain: the element `c` of
+/// `parent`, scanned from the first element (after [`resumed_slot`] found
+/// nothing to resume from), remembering where the scan ends for the next
+/// (#3702).
+///
+/// A scan back to an element before the remembered one replaces it: a pipe
+/// that alternates a read near the start with a read near the end gets no
+/// help, as it got none before.
+fn element_slot_resumable<C: DocumentCursor>(
+    c: &C,
+    parent: &C,
+    elements: <C::Value as DocumentValue>::Elements,
+) -> Option<CursorSlot<C>> {
+    let document = c.document_token();
+    let parent_id = parent.node_id();
     let mut index = 0i64;
     let mut e = elements;
     while let Some((elem, rest)) = e.uncons_cursor() {
@@ -26666,12 +26732,10 @@ fn remembered_member_key<C: DocumentCursor>(c: &C) -> Option<usize> {
 
 /// [`scan_for_slot`]'s object arm for a format whose members are the
 /// [`next_element`](DocumentCursor::next_element) chain of key, value, key,
-/// value: where `c` -- a member's value or its key node -- sits, resuming
-/// after the member the last scan of `parent` found when [`slot_memo`] holds
-/// one before `c`, and remembering where this scan ends (#3839). `all` is the
-/// parent's whole field list, which names the malformed member an undecodable
-/// key reports. A resume that finds nothing falls back to the scan from the
-/// first member, so the answer is the full scan's either way.
+/// value: where `c` -- a member's value or its key node -- sits, scanned from
+/// the first member (after [`resumed_slot`] found nothing to resume from), and
+/// remembering where this scan ends (#3839). `all` is the parent's whole field
+/// list, which names the malformed member an undecodable key reports.
 fn member_slot_resumable<C: DocumentCursor>(
     c: &C,
     parent: &C,
@@ -26679,30 +26743,9 @@ fn member_slot_resumable<C: DocumentCursor>(
 ) -> Result<Option<CursorSlot<C>>, EvalError> {
     let document = c.document_token();
     let parent_id = parent.node_id();
-    let target = c.node_id();
     let slot_of = |key_cursor: C, is_value: bool| -> Result<CursorSlot<C>, EvalError> {
         member_slot(key_cursor, is_value).ok_or_else(|| all.malformed_member_error())
     };
-    if let Some((last, _, true)) = slot_memo::resume(document, parent_id, target) {
-        let mut key_cursor = c.at_node_id(last).and_then(|v| v.next_element());
-        while let Some(kc) = key_cursor {
-            slot_memo::note_scanned();
-            // Node ids follow document order: past `c`, it is not here, and
-            // the scan from the first member decides whether it is anywhere.
-            if kc.node_id() > target {
-                break;
-            }
-            // A key with no value after it ends the list, as in the full scan.
-            let Some(vc) = kc.next_element() else { break };
-            let is_value = vc.same_node(c);
-            if is_value || kc.same_node(c) {
-                let slot = slot_of(kc, is_value)?;
-                remember_member(document, parent_id, &vc);
-                return Ok(Some(slot));
-            }
-            key_cursor = vc.next_element();
-        }
-    }
     let mut scanned = 0i64;
     let mut f = all.clone();
     while let Some((field, rest)) = f.uncons() {
@@ -50389,6 +50432,150 @@ mod tests {
                     n / stride
                 );
             }
+        }
+    }
+
+    /// [`drive_each_sink`] over a YAML document with yq's semantics.
+    fn drive_yaml_sink(yaml: &str, filter: &str) -> (Vec<OwnedValue>, Option<Control>) {
+        let expr = parse(filter).expect("filter parses");
+        let index = crate::yaml::YamlIndex::build(yaml.as_bytes()).unwrap();
+        let mut out = Vec::new();
+        let mut on_value = |result: GenericResult<_>| {
+            let _ = push_generic_owned_values::<_, YqSemantics>(result, &mut out);
+            true
+        };
+        let control = eval_each_with_cursor_using::<YqSemantics, _>(
+            &expr,
+            index.root(yaml.as_bytes()),
+            &mut on_value,
+        );
+        (out, control)
+    }
+
+    /// #3846: the skipping fan-out of #3702's table over YAML. A block-sequence item sits
+    /// under its `-` node, two levels below its sequence, and a mapping's `value()` resolves
+    /// its merge keys by walking every member: so a position that is not a remembered one's
+    /// neighbour climbed with `enclose` (sequences, `O(i)`) or rebuilt the parent's field list
+    /// (mappings, `O(members)`), and the fan-out was quadratic in both. Neither is asked for
+    /// now: no position takes its remembered parent from `document_parent`, a scan visits
+    /// about one member per member, and the answers are the keys and indexes of the full scan.
+    // The memo these pin is `std`-only: `no_std` has no `thread_local!`.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_yaml_skipping_fan_out_never_asks_a_remembered_parent_for_its_children_3846() {
+        let n = 1500usize;
+        // Items with the content on the `-` line and on the next line (a deferred bare `-`).
+        let block: String = (0..n)
+            .map(|i| {
+                if i % 2 == 0 {
+                    format!("- a:\n    b: {i}\n")
+                } else {
+                    format!("-\n  a:\n    b: {i}\n")
+                }
+            })
+            .collect();
+        let flow = format!(
+            "[{}]\n",
+            (0..n)
+                .map(|i| format!("{{a: {{b: {i}}}}}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let mapping: String = (0..n)
+            .map(|i| format!("k{i}:\n  a:\n    b: {i}\n"))
+            .collect();
+        for (shape, yaml, is_mapping) in [
+            ("block sequence", block, false),
+            ("flow sequence", flow, false),
+            ("mapping", mapping, true),
+        ] {
+            for stride in [2usize, 3, 7] {
+                // The stream root lists the documents; the first `.[]` enters the only one.
+                let filter = format!("[.[] | .[] | select(.a.b % {stride} == 0) | key]");
+                let (scanned_before, _) = slot_memo::work();
+                let missed_before = slot_memo::missed();
+                let valued_before = slot_memo::valued();
+                let (out, control) = drive_yaml_sink(&yaml, &filter);
+                assert!(control.is_none(), "{shape} {filter}: {control:?}");
+                let expected: Vec<String> = (0..n)
+                    .filter(|i| i % stride == 0)
+                    .map(|i| {
+                        if is_mapping {
+                            format!("\"k{i}\"")
+                        } else {
+                            i.to_string()
+                        }
+                    })
+                    .collect();
+                let OwnedValue::Array(keys) = &out[0] else {
+                    panic!("{shape} {filter}: expected one array, got {out:?}");
+                    // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3846 pin, only reached when the pin is already failing"
+                };
+                let keys: Vec<String> = keys.iter().map(OwnedValue::to_json).collect();
+                assert_eq!(keys, expected, "{shape} {filter}");
+                let missed = slot_memo::missed() - missed_before;
+                assert!(
+                    missed < n / 50,
+                    "{shape} {filter}: {missed} of {} positions took a remembered parent from `document_parent`",
+                    n / stride
+                );
+                // A scan under 32 deep is not remembered, so up to 32 steps per
+                // position are the design's constant; quadratic would be ~n^2/2/stride.
+                let scanned = slot_memo::work().0 - scanned_before;
+                // Only the positions before a scan is remembered build the parent's value.
+                let valued = slot_memo::valued() - valued_before;
+                assert!(
+                    valued < n / 20,
+                    "{shape} {filter}: the parent's value was built {valued} times over {n} members"
+                );
+                assert!(
+                    scanned < 8 * n,
+                    "{shape} {filter}: visited {scanned} members over {n}"
+                );
+            }
+        }
+    }
+
+    /// #3846: the resume before the parent's value is built must answer what the scan from
+    /// the first member does where a YAML mapping's members and children differ -- a merge key
+    /// (`<<`) adds members no field spells, and an own key overrides a merged one -- checked
+    /// against `to_entries`, which reads the same members without asking for any slot (a merged
+    /// member's `path` names the node it lives at, so only its last step is compared).
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_resumed_yaml_scan_answers_what_the_full_scan_does_with_merge_keys_3846() {
+        let mut yaml =
+            String::from("base: &base\n  shared: {a: 99}\n  k7: {a: 98}\nwide:\n  <<: *base\n");
+        for i in 0..200 {
+            yaml.push_str(&format!("  k{i}:\n    a: {i}\n"));
+        }
+        for (slot, entries) in [
+            (
+                "[.[] | .wide | .[] | select(.a % 3 == 0) | key]",
+                "[.[] | .wide | to_entries[] | select(.value.a % 3 == 0) | .key]",
+            ),
+            (
+                "[.[] | .wide | .[] | select(.a % 7 == 1) | path | .[-1]]",
+                "[.[] | .wide | to_entries[] | select(.value.a % 7 == 1) | .key]",
+            ),
+            (
+                "[.[] | .wide | .[] | select(.a % 2 == 0) | (key, (path | .[-1]))]",
+                "[.[] | .wide | to_entries[] | select(.value.a % 2 == 0) | (.key, .key)]",
+            ),
+        ] {
+            let (by_slot, control) = drive_yaml_sink(&yaml, slot);
+            assert!(control.is_none(), "{slot}: {control:?}");
+            let (by_entries, control) = drive_yaml_sink(&yaml, entries);
+            assert!(control.is_none(), "{entries}: {control:?}");
+            assert_eq!(by_slot, by_entries, "{slot}");
+            let OwnedValue::Array(found) = &by_slot[0] else {
+                panic!("{slot}: expected one array, got {by_slot:?}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3846 pin, only reached when the pin is already failing"
+            };
+            assert!(
+                found.len() >= 25,
+                "{slot}: only {} members selected",
+                found.len()
+            );
         }
     }
 
