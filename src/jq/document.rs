@@ -2867,10 +2867,17 @@ impl KeyHashes {
     /// 64-bit hash count as a repeat), and folds each hash the same way, so
     /// it agrees with a loop of `insert`s over the same list.
     ///
-    /// `hashes` must be shorter than [`SATURATING_KEYS`](Self::SATURATING_KEYS);
-    /// the table sized for more would be wider than `MAX_SLOTS`.
+    /// A list of [`SATURATING_KEYS`](Self::SATURATING_KEYS) hashes or more
+    /// answers `true` without building anything, as a saturated table's
+    /// `insert` does: the table sized for it would be wider than
+    /// `MAX_SLOTS`.
     pub fn has_repeat(hashes: &[u64]) -> bool {
-        debug_assert!(hashes.len() < Self::SATURATING_KEYS);
+        // Past the ceiling the answer is the conservative one, as a
+        // saturated table's `insert` gives it, rather than a table wider
+        // than `MAX_SLOTS`.
+        if hashes.len() >= Self::SATURATING_KEYS {
+            return true;
+        }
         let table = Self::with_capacity(hashes.len());
         let (mut slots, mask) = (table.slots, table.mask);
         for &hash in hashes {
@@ -4472,6 +4479,10 @@ mod key_hash_tests {
             x.wrapping_mul(0xbf58_476d_1ce4_e5b9) ^ (x >> 32)
         }
 
+        // Two distinct keys sharing a 64-bit hash are the same hash here:
+        // the verdict is "may repeat", which the gate treats as a decline.
+        // The list holds hashes only, so there is nothing to disambiguate
+        // with.
         assert!(!KeyHashes::has_repeat(&[]));
         assert!(!KeyHashes::has_repeat(&[7]));
         assert!(KeyHashes::has_repeat(&[7, 7]));
@@ -4505,6 +4516,52 @@ mod key_hash_tests {
                 assert!(KeyHashes::has_repeat(&tail), "{n}: repeat at the tail");
             }
         }
+    }
+
+    /// The batch form stops where the growing table does (#3333):
+    /// `SATURATING_KEYS` is the count at which `saturated()` first answers
+    /// `true`, one fewer distinct hash settles in a table within the
+    /// ceiling, a repeat in the very last slot of that widest list is
+    /// found, and a list at the ceiling answers conservatively instead of
+    /// building a wider table.
+    #[test]
+    fn key_hashes_has_repeat_stops_at_the_saturating_width_3333() {
+        fn mix(i: u64) -> u64 {
+            let mut x = i.wrapping_add(1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            x ^= x >> 29;
+            x.wrapping_mul(0xbf58_476d_1ce4_e5b9) ^ (x >> 32)
+        }
+
+        let mut seen = KeyHashes::new();
+        for i in 0..KeyHashes::SATURATING_KEYS as u64 - 1 {
+            assert!(!seen.insert(mix(i)));
+        }
+        assert!(!seen.saturated(), "one key short of the width");
+        assert!(!seen.insert(mix(u64::MAX)));
+        assert!(
+            seen.saturated(),
+            "SATURATING_KEYS is where saturated() turns true"
+        );
+
+        let mut widest: Vec<u64> = (0..KeyHashes::SATURATING_KEYS as u64 - 1)
+            .map(mix)
+            .collect();
+        assert!(
+            !KeyHashes::has_repeat(&widest),
+            "the widest list that settles"
+        );
+        let last = widest.len() - 1;
+        widest[last] = widest[0];
+        assert!(
+            KeyHashes::has_repeat(&widest),
+            "a repeat in the very last slot"
+        );
+
+        let over: Vec<u64> = (0..KeyHashes::SATURATING_KEYS as u64).map(mix).collect();
+        assert!(
+            KeyHashes::has_repeat(&over),
+            "at the ceiling the answer is conservative"
+        );
     }
 
     /// The table stops doubling at [`KeyHashes::MAX_SLOTS`] and says so

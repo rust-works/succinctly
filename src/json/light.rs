@@ -6987,8 +6987,9 @@ mod tests {
     /// `scan_canonical_object`'s duplicate-key check has *two* tiers
     /// (#2608 review): the first `PAIRWISE_SPAN_SCAN_LIMIT` keys are
     /// compared pairwise with no allocation, and the key that overflows
-    /// that limit seeds a real [`KeyHashes`] table every later key goes
-    /// through. Nothing else in this module's tests reaches the second
+    /// that limit hands the rest of the object to
+    /// `scan_canonical_object_wide`, which collects every later key's hash
+    /// for one exactly sized table (#3333). Nothing else in this module's tests reaches the second
     /// tier -- the corpus above tops out at six keys and the fuzz
     /// generator's objects are narrow -- so the seeding, the table tier
     /// and the *cross-tier* duplicate detection went unexercised.
@@ -7070,10 +7071,10 @@ mod tests {
 
     /// The table tier's third exit, after "seen this key" and "the span
     /// ended": [`KeyHashes`] stops growing at its own ceiling, and
-    /// `scan_canonical_object` checks `saturated()` after every `insert`
-    /// so it bails there instead of certifying the rest of a very wide
-    /// object against a table that can no longer record anything (#2608
-    /// review).
+    /// `scan_canonical_object_wide` stops collecting at
+    /// `KeyHashes::SATURATING_KEYS` keys so it bails there instead of
+    /// certifying the rest of a very wide object against a table that
+    /// could no longer record anything (#2608 review, #3333).
     ///
     /// The width is not negotiable -- `KeyHashes::MAX_SLOTS * 3 / 4`
     /// exactly, the point `src/jq/document.rs`'s own
@@ -7087,9 +7088,11 @@ mod tests {
     fn canonical_echo_bails_when_the_key_table_saturates_2608() {
         // `KeyHashes::MAX_SLOTS` (`1 << 20`) * 3/4: the key count at which
         // `insert` would next have doubled a table already at its ceiling,
-        // so `saturated()` first answers `true`. Private to `document.rs`,
-        // hence spelled out here rather than imported.
+        // so `saturated()` first answers `true`. Spelled out here as an
+        // oracle independent of the constant the scan uses, and checked
+        // against it on the next line.
         const SATURATES_AT: usize = 786_432;
+        assert_eq!(KeyHashes::SATURATING_KEYS, SATURATES_AT);
 
         let mut doc = String::with_capacity(SATURATES_AT * 13);
         doc.push('{');
