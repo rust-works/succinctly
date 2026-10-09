@@ -43046,8 +43046,13 @@ fn stage_leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
 /// wrappers [`peel_register_transparent`] passes the register through is a
 /// `last(f)` or a `select(f)`/type filter, a stage that navigates nothing
 /// ([`cannot_move_register`]: `first(5)`, `limit(1; 5)`, `nth(0; 5)` are as
-/// unmoving as the `5` under them), or a `try E catch H` over one whose
-/// handler cannot move it (#3767).
+/// unmoving as the `5` under them), a `try E catch H` over one whose
+/// handler cannot move it, or a compound stage (`,` `//` `if`, a pipe) of
+/// stages that each leave it alone ([`stage_keeps_register_statically`], #3767).
+///
+/// A compound stage keeps the register only if *every* branch does: `(select(.) | .a)` is
+/// a path error in jq, so the last stage of a pipe is not enough, and neither is one side of
+/// a `//`. An `if`'s condition is the exception, a subexp that moves nothing.
 ///
 /// jq runs a `try`'s handler after backtracking to the fork the `try` set, and a
 /// backtrack restores the path state saved there, so on the error path the
@@ -43067,6 +43072,26 @@ fn stage_is_register_keeping<S: EvalSemantics>(expr: &Expr) -> bool {
             expr: inner,
             catch: Some(handler),
         } => stage_is_register_keeping::<S>(inner) && cannot_move_register(handler),
+        // #3767: a compound stage whose every branch leaves the register alone. jq
+        // backtracks to the fork each alternative of a `,`, `//` or `if` starts from, so
+        // each begins at the entry register; a pipe threads the register from one stage
+        // to the next, so each stage must leave it where it found it. A branch that moves
+        // it (`.a`) keeps the whole refused, as does one this predicate cannot judge (a
+        // `def` call, never admitted: `cannot_move_register`'s doc).
+        Expr::Comma(branches) => branches.iter().all(stage_keeps_register_statically::<S>),
+        Expr::Pipe(stages) => stages.iter().all(stage_keeps_register_statically::<S>),
+        Expr::Alternative(left, right) => {
+            stage_keeps_register_statically::<S>(left)
+                && stage_keeps_register_statically::<S>(right)
+        }
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            stage_keeps_register_statically::<S>(then_branch)
+                && stage_keeps_register_statically::<S>(else_branch)
+        }
         // #3767: a stage that navigates nothing leaves it where it was, and the
         // wrappers peeled above add no movement, so `first(5)`, `limit(1; 5)` and
         // `nth(0; 5)` are as unmoving as the `5` under them.
@@ -43086,6 +43111,28 @@ fn stage_is_register_keeping<S: EvalSemantics>(expr: &Expr) -> bool {
                     && leaves_register_in_place::<S>(stage))
         }
     }
+}
+
+/// The static half of "this stage leaves jq's register where it entered", the one
+/// definition `resolve_seq_stage` reads of a stage and [`stage_is_register_keeping`]
+/// reads of each branch of a compound stage (#3767 part 5), so the two cannot drift:
+///
+/// - [`cannot_move_register`]: it navigates nothing at all;
+/// - [`stage_leaves_register_in_place`]: `last(f)` (#3643), `select(f)` and the type
+///   filters (#3653), `first`/`limit`/`nth` around them, `try ... catch` over them
+///   and, recursively, a compound stage of them (#3767);
+/// - [`leaves_register_in_place`]: a by-value stage jq defines over a backtracked
+///   source (`add`, `flatten`, `map(f)`, `walk(f)`) or never lets touch the register
+///   (`sort`, `to_entries`), the leaf's own verdict (#3361).
+///
+/// The shapes that need the run's state instead (an `[E]` collect resolved live,
+/// `getpath`) are answered at the call site only, so they are not read as a branch
+/// of a compound stage: `(select(.), [numbers])` stays refused where `[numbers]`
+/// alone is admitted (the safe direction).
+fn stage_keeps_register_statically<S: EvalSemantics>(expr: &Expr) -> bool {
+    cannot_move_register(expr)
+        || stage_leaves_register_in_place::<S>(expr)
+        || leaves_register_in_place::<S>(expr)
 }
 
 /// Whether a pipe stage `expr` is one whose by-value leaf states jq's path
@@ -56313,18 +56360,11 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
     // had moved it (#3289 review: `del(.a | [true] | (nth(0) and true))`
     // re-established on `.a`'s `true` and deleted where jq refuses).
     let stage_reports_register = and_or_negate_resolves_live::<S>(element);
-    let stage_preserves_register = cannot_move_register(element)
-        // #3643: `last(f)` backtracks its source, so the register is where the
-        // stage entered even though `f` navigates. #3653: `select(f)` and the
-        // type filters pass their input through at the register and `f` is a
-        // subexp; both read through `?`, `try` and `first`.
-        || stage_leaves_register_in_place::<S>(element)
-        // #3361: a by-value stage jq defines over a backtracked source (`add`,
-        // `flatten`, `map(f)`, `walk(f)`) or never lets touch the register
-        // (`sort`, `to_entries`). The leaf states the same verdict
-        // ([`leaves_register_in_place`]), and what such a stage navigates on an
-        // input the register is not on is refused by [`builtin_navigation`].
-        || leaves_register_in_place::<S>(element)
+    // [`stage_keeps_register_statically`] holds the static admissions (#3643 `last(f)`, #3653
+    // `select(f)` and the type filters, #3361 the by-value stages jq defines over a
+    // backtracked source; what such a stage navigates on an input the register is not
+    // on is refused by [`builtin_navigation`]); the two below need the run's state.
+    let stage_preserves_register = stage_keeps_register_statically::<S>(element)
         // #3263: an array resolved live whose contents the resolver checks as
         // jq does, and jq's collect backtracks the register to where it began.
         || matches!(element, Expr::Array(inner)
@@ -90848,19 +90888,64 @@ mod tests {
             "try (try last(.a) catch .a) catch 2",
             "try .a catch .",
             "try first(.a) catch 7",
-            // a compound inner stage is still not read
-            "try (last(.a), select(.)) catch .",
-            "try (select(.) | last(.a)) catch .",
             "first(.a)",
             "first(.a)?",
-            "(last(.a), select(.))",
             // #3767: a wrapper over a stage that navigates still moves the register
             // (`limit(1; .a)` is a path error in jq).
             "limit(1; .a)",
             "limit(2; first(.a))",
             "nth(0; .a)",
             "nth(0; try .a)",
+        ] {
+            let expr = stage(refused);
+            assert!(
+                !stage_leaves_register_in_place::<JqSemantics>(&expr),
+                "{refused}"
+            );
+        }
+        // #3767 part 5: a compound stage is as register-keeping as its least branch.
+        for admitted in [
+            "(select(.), select(.))",
+            "(select(.), 7)",
+            "(empty, last(.a))",
+            "(select(.) // 7)",
+            "(last(.a) // select(.))",
+            "if . then select(.) else last(.a) end",
+            "if .a then select(.) else . end",
+            "(select(.) | select(.))",
+            "(select(.) | (select(.), last(.a)))",
+            "first(select(.), 3)",
             "limit(1; (last(.a), select(.)))",
+            "try (last(.a), select(.)) catch .",
+            "try (select(.) | last(.a)) catch .",
+            "(select(.), select(.))?",
+        ] {
+            let expr = stage(admitted);
+            assert!(
+                stage_leaves_register_in_place::<JqSemantics>(&expr),
+                "{admitted}"
+            );
+            assert!(
+                !stage_leaves_register_in_place::<YqSemantics>(&expr),
+                "{admitted}"
+            );
+        }
+        // ... and one branch that moves it, or that this predicate cannot judge (a `def`
+        // call), keeps the whole refused.
+        for refused in [
+            "(select(.), .a)",
+            "(.a, select(.))",
+            "(select(.) // .a)",
+            "(.a // select(.))",
+            "if .k then select(.) else .a end",
+            "if .k then .a else select(.) end",
+            "(select(.) | .a)",
+            "(select(.), first(.a))",
+            "(select(.), (.a)?)",
+            "(select(.), getpath([\"a\"]))",
+            "(select(.), (def g: select(.); g))",
+            "try (select(.), .a) catch .",
+            "first(select(.), .a)",
         ] {
             let expr = stage(refused);
             assert!(

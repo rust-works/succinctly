@@ -1485,10 +1485,9 @@ is the revert that established what the other one costs.
    from inside `E` like `first(E)`, so `limit(1; last(.a))` and `5 | nth(0; select(.))` keep the
    register and `limit(1; .a)` still moves it; the count is a subexp), and lets an `[E]` collect
    hold a type filter (`[numbers]`, as `[select(.)]` already did), pinned by
-   `test_register_limit_nth_wrappers_and_type_filter_collect_3767`. Still refused where jq
-   answers `[]`: a `catch` handler that navigates (Part 3 admits the rest); either stage inside a
-   compound stage (a comma, a `//`, a pipe such as `select(.) \| select(.)`, a `def` call), which
-   need the leaf-level verdict for a compound stage described above. Two more shapes were refused
+   `test_register_limit_nth_wrappers_and_type_filter_collect_3767`. Part 1 left a `catch`
+   handler and a compound stage (a comma, a `//`, an `if`, a pipe, a `def` call) refused where
+   jq answers `[]`; Part 3 and Part 5 below lift most of both. Two more shapes were refused
    after Part 3 and are lifted by Part 4: a wrapper over an inner stage that merely navigates
    nothing (`first(5)`, `limit(1; 5)`, `nth(0; 5)`, which jq leaves in place), and an `[E]` collect
    of `first`/`limit`/`nth` (`[first(numbers)]`), whose claim reads through to `f` as `last(f)`'s
@@ -1513,8 +1512,19 @@ is the revert that established what the other one costs.
    `test_register_catch_handler_over_register_keeping_stage_3767`. A handler that navigates
    (`try last(.a) catch .a`: it raises when it runs, as in jq, but when it never runs jq answers
    `[]`), a handler whose payload is the register's own value (`try last(error) catch .`, where
-   the error payload is the root itself) or that reads `input` (`catch input`), and a compound
-   inner stage (`try (last(.a), error("e")) catch .`) are still refused where jq answers `[]`.
+   the error payload is the root itself) or that reads `input` (`catch input`), are still refused where jq answers `[]`. (A compound inner stage under the `try`
+   was refused here until Part 5.)
+   Part 5 lifts the compound stage (`,` `//` `if`, a parenthesised pipe) whose every branch leaves
+   the register alone: jq backtracks to the fork each branch starts from, so `5 \| (select(.), 7)`,
+   `5 \| (select(.) // 7)`, `5 \| if . then select(.) else last(.a) end` and `5 \| (select(.) \|
+   (select(.), select(.)))` all leave `$x` at the root (`[]` per output), pinned by
+   `test_register_compound_stage_of_register_keeping_branches_3767`. A branch that navigates
+   (`(select(.), .a)`) or a navigating tail (`(select(.) \| .a)`) keeps the whole refused, as in jq. Still
+   refused where jq answers: a `def` call (`def g: last(.a); g \| $x`, which `cannot_move_register`
+   never admits: a name is not a body), a branch that is an `[E]` collect or `getpath` (admitted as a
+   bare stage by the run's state, which a branch is not asked: `(select(.), [numbers])`), and a
+   compound `catch` handler (`try (select(.), error("e")) catch (select(.), 7)`: only a handler
+   that navigates nothing is read).
    Under a `try` the refusal of a `limit`/`first` wrapper shape inside a lost-register `and`/`or` operand used to be caught, so the write jq makes was
    **silently skipped** (`del(.a? as $y \| try ((.a)? and limit(1; 5)) \| try ($y \| .b))` on
    `{"a":{"b":1},"k":2}` left the document unchanged where jq gives `{"a":{},"k":2}`); Part 4 closes
