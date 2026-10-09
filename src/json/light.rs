@@ -250,7 +250,7 @@ impl JsonIndex<Vec<u64>> {
             u32::try_from(len).is_ok(),
             "JsonIndex supports inputs up to u32::MAX (4294967295) bytes; got {len} bytes (#188)"
         );
-        let mut ib = vec![0u64; len.div_ceil(64)];
+        let mut ib = alloc::vec![0u64; len.div_ceil(64)];
         if let Some(first) = ib.first_mut() {
             *first = 1;
         }

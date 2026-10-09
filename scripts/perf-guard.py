@@ -461,6 +461,18 @@ QUERY_THRESHOLDS = {
     # and the rows read ~0% again.
     "users_keys_unsorted": 12.0,
     "arrays_first_map_iterate": 10.0,
+    # `arrays_map_iterate`, `users_yq_raw_slice`, `users_yq_raw_test` (#4154):
+    # a scalar root crossing the reindex bridge is indexed directly instead of
+    # through the general build and its eight balanced-parentheses directory
+    # `Vec`s, so every row that re-indexes a scalar per element or per `-R`
+    # line got cheaper (x86_64 -19.0% / -24.1% / -11.3%, ARM64-Linux -22.2% /
+    # -20.8% / -9.3% Ir against the PR's own merge-base, outputs
+    # byte-identical). 30.0 / 30.0 / 15.0 leave headroom over the measured
+    # drift without hiding a real regression. One-off: remove these entries
+    # once the change is in `main` and the rows read ~0% again.
+    "arrays_map_iterate": 30.0,
+    "users_yq_raw_slice": 30.0,
+    "users_yq_raw_test": 15.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
