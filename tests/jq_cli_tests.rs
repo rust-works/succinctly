@@ -121491,3 +121491,159 @@ fn test_try_catch_operand_neighbours_keep_their_answers_4125() -> Result<()> {
     }
     Ok(())
 }
+
+/// #3728: the path resolver and the owned evaluator settle a swallowed `.[]`
+/// over a scalar, and a `catch empty` handler, without building what they drop,
+/// and still answer what they did.
+///
+/// Four sites changed: `resolve_catch_sink` no longer runs a bare `empty`
+/// handler, the resolver's `Expr::Try` and `Expr::Optional` arms answer a
+/// trackable scalar's `.[]` without stepping it, and `eval_each_owned` does the
+/// same for an owned scalar before the re-index bridge (`paths(f)`, `any`).
+/// The valid-JSON rows are jq 1.7.1's own. The rows jq cannot read were
+/// captured from the binary built from the parent commit and are identical on
+/// this one. An untracked scalar (`1 | .[]?`) is not a trackable one, so the
+/// path error `?` keeps still raises; a handler that is not `empty` still runs.
+#[test]
+fn test_swallowed_iteration_in_path_consumers_answers_what_it_did_3728() -> Result<()> {
+    const MIXED: &str = r#"[1,"a",null,true,[2],{"k":3}]"#;
+    const NESTED: &str = r#"{"a":[1,{"b":2}],"c":"x"}"#;
+    assert_path_rows_3289(&[
+        (
+            MIXED,
+            "[.[] | path(try .[] catch empty)]",
+            "[[0],[\"k\"]]\n",
+            "",
+            0,
+        ),
+        (MIXED, "[.[] | path(try .[])]", "[[0],[\"k\"]]\n", "", 0),
+        (
+            MIXED,
+            "[.[] | path(.[]? // .)]",
+            "[[],[],[],[],[0],[\"k\"]]\n",
+            "",
+            0,
+        ),
+        (MIXED, "[.[] | path(first(.[]?))]", "[[0],[\"k\"]]\n", "", 0),
+        (
+            MIXED,
+            "[path(try .[] catch empty)]",
+            "[[0],[1],[2],[3],[4],[5]]\n",
+            "",
+            0,
+        ),
+        (
+            MIXED,
+            "[path(.. | try .[] catch empty)]",
+            "[[0],[1],[2],[3],[4],[5],[4,0],[5,\"k\"]]\n",
+            "",
+            0,
+        ),
+        (MIXED, "[paths(.[]?)]", "[[4],[5]]\n", "", 0),
+        (MIXED, "[paths(try .[] catch empty)]", "[[4],[5]]\n", "", 0),
+        (MIXED, "[.[] | paths(.[]?)]", "[]\n", "", 0),
+        (
+            MIXED,
+            "[.[] | del(.[]?)]",
+            "[1,\"a\",null,true,[],{}]\n",
+            "",
+            0,
+        ),
+        (MIXED, "[any(.[]?; . == 2)]", "[false]\n", "", 0),
+        (MIXED, "[limit(2; paths(.[]?))]", "[[4],[5]]\n", "", 0),
+        (r#""abc""#, "[path(try .[] catch empty)]", "[]\n", "", 0),
+        ("null", "[path(.[]? // .)]", "[[]]\n", "", 0),
+        (
+            NESTED,
+            "[paths(.[]?)]",
+            "[[\"a\"],[\"a\"],[\"a\",1]]\n",
+            "",
+            0,
+        ),
+        (
+            NESTED,
+            "[.. | path(try .[] catch empty)]",
+            "[[\"a\"],[\"c\"],[0],[1],[\"b\"]]\n",
+            "",
+            0,
+        ),
+        // An untracked scalar is not a trackable one: the path error `?` keeps
+        // still raises, and a `try` with a handler that is not `empty` still
+        // hands the handler the error.
+        (
+            "1",
+            "[path(1 | .[]?)]",
+            "",
+            "Invalid path expression near attempt to iterate through 1",
+            5,
+        ),
+        ("1", "[path(1 | try .[] catch empty)]", "[]\n", "", 0),
+        (
+            "1",
+            "path(try .[] catch .)",
+            "",
+            "Invalid path expression with result",
+            5,
+        ),
+        // `catch empty` over a caught error that is not a swallowed `.[]`.
+        (
+            r#"{"a":1}"#,
+            r#"[path(try error("x") catch empty)]"#,
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r#"[path(try error("x") catch .a)]"#,
+            "",
+            "Invalid path expression near attempt to access element \"a\"",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            "[path(try error catch empty | .a)]",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null}"#,
+            "[path(.a | try error(null) catch .b)]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        // Documents jq cannot read: what `?` never swallows still escapes,
+        // from the member whose leaf check raises it.
+        (
+            r#"["\ud800"]"#,
+            "[paths(.[]?)]",
+            "",
+            "invalid unicode escape sequence",
+            5,
+        ),
+        (
+            r#"["\ud800"]"#,
+            "[.[] | path(try .[] catch empty)]",
+            "",
+            "invalid unicode escape sequence",
+            5,
+        ),
+        (
+            "[1.2.3,[4]]",
+            "[.[] | path(.[]? // .)]",
+            "",
+            "invalid numeric literal",
+            5,
+        ),
+        (
+            r#"[1,"\ud800",[2]]"#,
+            "[paths(try .[] catch empty)]",
+            "",
+            "invalid unicode escape sequence",
+            5,
+        ),
+        ("[tru]", "[.[] | paths(.[]?)]", "", "invalid boolean", 5),
+    ])
+}

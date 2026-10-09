@@ -5638,10 +5638,19 @@ pub(crate) fn suppresses(e: &EvalError, optional: bool) -> bool {
 ///
 /// Not `Option::is_none_or`: the crate's MSRV is 1.73 and that is 1.82.
 pub(crate) fn try_swallows_scalar_iteration(expr: &Expr, catch: Option<&Expr>) -> bool {
-    matches!(unwrap_bind_source(expr), Expr::Iterate)
-        && catch.map_or(true, |c| {
-            matches!(unwrap_bind_source(c), Expr::Builtin(Builtin::Empty))
-        })
+    matches!(unwrap_bind_source(expr), Expr::Iterate) && catch.map_or(true, is_empty_handler)
+}
+
+/// Whether a `catch` handler is the bare builtin `empty`, which delivers nothing
+/// for any payload (a `break` runs it over `null`, which is the same nothing), so
+/// the boundary is the same as one with no handler. One definition for
+/// [`try_swallows_scalar_iteration`] (the value boundaries and the path walks) and
+/// [`resolve_catch_sink`] (the resolver), so the two cannot disagree about which
+/// handlers run (#3728). Peeled by [`unwrap_bind_source`], as the shape tests
+/// above are: a `def empty:` in scope is a `DefCall`, a closure argument arrives as
+/// `Expr::Shared`, and nothing is evaluated here either way.
+fn is_empty_handler(catch: &Expr) -> bool {
+    matches!(unwrap_bind_source(catch), Expr::Builtin(Builtin::Empty))
 }
 
 /// The constant a `try .[] catch LITERAL` boundary answers with for a scalar
@@ -5667,6 +5676,47 @@ pub(crate) fn try_catches_scalar_iteration_with_literal<'e>(
     match unwrap_bind_source(catch?) {
         Expr::Literal(lit) => Some(lit),
         _ => None,
+    }
+}
+
+/// Whether the `?`/`try` boundary over `body` with this handler has nothing to
+/// do for the **owned** `value` (#3728): [`swallowing_boundary`](crate::jq::eval_generic::swallowing_boundary)
+/// (a bare `.[]` with no handler or `empty`, not in yq mode) over a scalar.
+///
+/// The owned twin of `eval_generic::swallowed_scalar_iteration`, for the walks
+/// that hold an [`OwnedValue`] and not a document cursor: the path resolver and
+/// the re-index bridge ([`eval_each_owned`]). An owned scalar was decoded when it
+/// was built, so unlike a cursor's it has no decode failure left to raise, and
+/// the swallowed `Cannot iterate over ...` is the only outcome -- nothing. The
+/// bridge answered it only after re-indexing `value` into a throwaway document,
+/// and the resolver after formatting the message `?` drops.
+///
+/// The shape test runs first: it is an O(1) match on the AST, so a boundary of
+/// any other shape pays nothing.
+fn owned_scalar_iteration_swallowed<S: EvalSemantics>(
+    body: &Expr,
+    catch: Option<&Expr>,
+    value: &OwnedValue,
+) -> bool {
+    crate::jq::eval_generic::swallowing_boundary::<S>(body, catch)
+        && !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_))
+}
+
+/// [`owned_scalar_iteration_swallowed`] for a whole boundary expression: `expr`
+/// is `body?` or `try body catch handler`, optionally parenthesised (#3728).
+fn owned_swallowing_boundary<S: EvalSemantics>(expr: &Expr, value: &OwnedValue) -> bool {
+    match unwrap_paren(expr) {
+        Expr::Optional(inner) => owned_scalar_iteration_swallowed::<S>(inner, None, value),
+        Expr::Try { expr, catch } => {
+            owned_scalar_iteration_swallowed::<S>(expr, catch.as_deref(), value)
+        }
+        // A door answers the bare stage and the one-stage pipe around it alike
+        // (#3673): `. | .[]?` is `.[]?`, as `eval_owned_length` reads it.
+        Expr::Pipe(stages) => match skip_identity_stages(stages) {
+            [only] => owned_swallowing_boundary::<S>(only, value),
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -10498,6 +10548,12 @@ pub(crate) fn eval_each_owned_front_doors<S: EvalSemantics>(
             Demand::Continue => Flow::Exhausted,
             Demand::Stop => Flow::Stopped { pending: None },
         });
+    }
+    // #3728: a `.[]?` over an owned scalar reaches nothing, and re-indexing the
+    // scalar to find that out (`paths(.[]?)` does it twice per node) was the
+    // whole cost.
+    if owned_swallowing_boundary::<S>(expr, input) {
+        return Some(Flow::Exhausted);
     }
     None
 }
@@ -39470,6 +39526,11 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // trackable, otherwise whatever this stage's frame carries; the
         // handler is resolved with it in hand (`resolve_catch_sink`).
         Expr::Try { expr, catch } => {
+            // #3728: a bare `.[]` over a trackable scalar raises the `Cannot
+            // iterate` error this boundary drops (see `resolve_optional_sink`).
+            if trackable && owned_scalar_iteration_swallowed::<S>(expr, catch.as_deref(), value) {
+                return ResolveFlow::Exhausted;
+            }
             // jq mode only, like every other register admission in this
             // file: real yq's lexer rejects `try`, so there is no oracle,
             // and yq's scalar-write no-op convention would turn a wrong
@@ -40802,6 +40863,14 @@ fn resolve_optional_sink<'a, S: EvalSemantics>(
             target, start, end, value, true, trackable, snapshot, frame, keep, sink,
         ),
         _ => {
+            // #3728: `.[]?` over a trackable scalar is the `Cannot iterate over
+            // ...` this arm prunes, whose message `resolve_iterate_sink` would
+            // format first (a preview string and an owned copy of the scalar).
+            // An untracked one raises a path error instead, which `?` keeps, so
+            // it still evaluates. Nothing is delivered either way.
+            if trackable && owned_scalar_iteration_swallowed::<S>(inner, None, value) {
+                return ResolveFlow::Exhausted;
+            }
             let bare_navigation_primitive = matches!(
                 inner,
                 Expr::Field(_) | Expr::Index { .. } | Expr::Iterate | Expr::Slice { .. }
@@ -52356,6 +52425,12 @@ fn resolve_catch_sink<'a, S: EvalSemantics>(
     let Some(catch_expr) = catch else {
         return ResolveFlow::Exhausted;
     };
+    // #3728: `catch empty` is the same boundary as no handler -- it delivers
+    // nothing for any payload -- so the payload is not seeded, the handler is
+    // not flattened, and it is not run over a re-indexed copy of the payload.
+    if is_empty_handler(catch_expr) {
+        return ResolveFlow::Exhausted;
+    }
     // A caught error/break payload is never a snapshot (#1591): jq's own
     // handler binding is unrelated to any `$x` frozen elsewhere in scope.
     //
@@ -89393,6 +89468,13 @@ mod tests {
             "reverse",
             "to_entries",
             r#"getpath(["a"])"#,
+            // A swallowed `.[]` over a scalar (#3728), however it is spelled.
+            ".[]?",
+            "(.[])?",
+            "try .[]",
+            "try .[] catch empty",
+            r#"try .[] catch "c""#,
+            "(.[] | empty)?",
             // Left to the bridge.
             "floor",
             "keys",
@@ -122365,6 +122447,61 @@ mod tests {
         assert!(settle::<JqSemantics, _>(&iterate, Some(&handler), &scalar).is_none());
         assert!(settle::<JqSemantics, _>(&field, None, &scalar).is_none());
         assert!(settle::<JqSemantics, _>(&iterate, None, &container).is_none());
+    }
+
+    /// #3728: the owned-side boundary's gate, which no output can show. Taken for
+    /// a `?` or `try` over a bare `.[]` (under a `Paren` too) with no handler or
+    /// `catch empty`, over an owned scalar, in jq mode -- not in yq mode, not over a
+    /// container, and not for a handler that runs or a body that is not `.[]`.
+    #[test]
+    fn owned_swallowing_boundary_gate_3728() {
+        let boundary = |source: &str, value: &OwnedValue| {
+            let expr = parse(source).unwrap();
+            (
+                owned_swallowing_boundary::<JqSemantics>(&expr, value),
+                owned_swallowing_boundary::<YqSemantics>(&expr, value),
+            )
+        };
+        let scalars = [
+            OwnedValue::Null,
+            OwnedValue::Bool(true),
+            OwnedValue::Int(5),
+            OwnedValue::String("abc".into()),
+        ];
+        for scalar in &scalars {
+            // Taken in jq mode only, however the boundary is spelled.
+            for source in [
+                ".[]?",
+                "(.[])?",
+                "try .[]",
+                "try .[] catch empty",
+                "(try .[] catch empty)",
+                // The one-stage pipe around it, as the front doors read both alike.
+                ". | .[]?",
+            ] {
+                assert_eq!(boundary(source, scalar), (true, false), "{source}");
+            }
+            // A handler that runs, a body that is not a bare `.[]`, and a bare
+            // `.[]` with no boundary around it are all evaluated.
+            for source in [
+                r#"try .[] catch "c""#,
+                "try .[] catch .",
+                "try .[] catch (empty | empty)",
+                ".a?",
+                "(.[] | empty)?",
+                ".[0]?",
+                ".[]",
+                // Two stages are a pipe the door does not read.
+                ".[]? | .[]?",
+            ] {
+                assert_eq!(boundary(source, scalar), (false, false), "{source}");
+            }
+        }
+        // A container has members to list.
+        let array = parse("[1]").unwrap();
+        let container = eval_owned_closed::<JqSemantics>(&array).unwrap();
+        assert_eq!(boundary(".[]?", &container), (false, false));
+        assert_eq!(boundary("try .[] catch empty", &container), (false, false));
     }
 
     /// #3704: the constant-handler shortcut's gate, which no output can show.
