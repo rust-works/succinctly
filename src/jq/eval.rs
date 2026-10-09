@@ -133875,10 +133875,23 @@ mod tests {
             // reads it, which `test_unreadable_value_collection_split_3266`
             // pins from the CLI.
             (OBJ, "[.b, empty] | length", Some("1"), Some("1")),
-            (OBJ, "[.[] | ., .] | length", None, None),
+            // #3922: a `,` behind a pipe whose head is not the `,` keeps its
+            // nodes as cursors too, and a `?` around the array no longer
+            // decodes what it holds.
+            (OBJ, "[.[] | ., .] | length", Some("4"), Some("4")),
             (OBJ, "[.[] | [.]] | length", None, None),
             ("[1.2.3]", r#"try ([., 1]) catch "c""#, None, None),
-            (OBJ, "[.a, .b]? | length", None, None),
+            (OBJ, "[.a, .b]? | length", Some("2"), Some("2")),
+            (
+                OBJ,
+                "try ([.a, .b]) catch \"c\" | length",
+                Some("2"),
+                Some("2"),
+            ),
+            // Reading the array reads the node, and a decode failure is never
+            // caught: the `?`/`try` boundary only stops forcing it early.
+            (OBJ, "[.a, .b]?", None, None),
+            (OBJ, "try ([.[] | ., .]) catch \"c\"", None, None),
             (OBJ, "[first(.b)] | length", Some("1"), Some("1")),
             (OBJ, "[.b | select(true)] | length", Some("1"), Some("1")),
             (
@@ -133896,6 +133909,13 @@ mod tests {
                 // Anything but one value is reported as its `Debug` rather than
                 // panicking, so a row that moved shows up in the assertion below.
                 other => {
+                    // A deferred array (`[., 1]`, `try ([., 1])`) fails when it is
+                    // read, which `into_owned` reports as a missing value: read it
+                    // first, so the failure is the decode failure it is.
+                    let other = other.materialize_lazy::<JqSemantics>();
+                    if matches!(&other, GenericResult::Error(e) if e.is_decode_failure()) {
+                        return None;
+                    }
                     let owned = other.into_owned::<JqSemantics>();
                     let answer = owned
                         .as_ref()
