@@ -56228,6 +56228,13 @@ fn test_slice_bound_with_no_output_is_an_error_4197() -> Result<()> {
         ".b[select(false):] += [1]",
         "del(.b[select(false):])",
         "del(.b[:select(false)])",
+        // A consumer that reads the path (`key`, `path`, `parent`, `file_index`) walks the slice
+        // in path position, a separate bound driver; it raises the same error.
+        ".b[select(false):] | key",
+        ".b[1:select(false)] | path",
+        ".b[$typo:] | parent",
+        ".n[select(false):]? | file_index",
+        ".b[0:2][select(false):] | key",
     ] {
         let (stdout, stderr, code) = run_yq_stdin_with_stderr(program, doc, &[])?;
         assert_eq!(
@@ -56253,6 +56260,9 @@ fn test_slice_bound_with_no_output_is_an_error_on_the_owned_route_4197() -> Resu
         "{\"b\":[1,2,3]} | .b[select(false):1] = [9]",
         "{\"b\":[1,2,3]} | del(.b[select(false):])",
         "[1,2,3] | .[$typo:]",
+        "{\"b\":[1,2,3]} | .b[select(false):] | key",
+        "{\"b\":[1,2,3]} | .b[1:select(false)] | path",
+        "[1,2,3] | .[$typo:] | parent",
     ] {
         let (stdout, stderr, code) = run_yq_stdin_with_stderr(program, "", &["-n"])?;
         assert_eq!(

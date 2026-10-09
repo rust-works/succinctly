@@ -21860,7 +21860,8 @@ fn slice_pair_generic<S: EvalSemantics, V: DocumentValue>(
 /// `Error: x`, not `y`), and a failed classification is raised before any
 /// value reaches the slice step -- outranked only by the generator's own
 /// escape (`.[(0,"x",error("y")):3]` is `Error: y`). A `ComputedSliceBound`
-/// therefore only ever reaches `sink` as `Ok` in yq mode.
+/// therefore only ever reaches `sink` as `Ok` in yq mode. A bound that produces no
+/// value at all is an error there, not an empty pairing (#4197).
 fn each_slice_bound_generic<S: EvalSemantics, V: DocumentValue>(
     bound: &Option<Box<Expr>>,
     value: V,
@@ -21893,7 +21894,7 @@ fn each_slice_bound_generic<S: EvalSemantics, V: DocumentValue>(
         // #4197: yq wants exactly one number from a bound, and a stream that
         // ended without producing one is an error, not "no slice".
         if collected.is_empty() {
-            return Flow::Escaped(Control::Error(EvalError::slice_bound_count(0)));
+            return Flow::Escaped(Control::Error(EvalError::slice_bound_empty()));
         }
         for b in collected {
             if sink(b) == Demand::Stop {
@@ -24982,6 +24983,22 @@ fn path_context_push_owned_children<V: DocumentValue>(
     }
 }
 
+/// #4197: yq wants exactly one number from a slice bound, so a bound stream that ended
+/// without producing a value is an error (`expected to find 1 number, got 0 instead`), not
+/// "this pairing produces nothing" -- jq's generator model, which jq mode keeps. The
+/// path-position walks that pull a bound lazily (`path_context_component_each_bound`,
+/// `owned_identity_computed_step`) end it with this; the eager collections
+/// (`each_slice_bound`, `each_slice_bound_generic`, `drive_slice_bound`) check the empty
+/// collection themselves. A stream that escaped or was stopped keeps its own verdict.
+fn yq_bound_needs_a_value<S: EvalSemantics>(produced: bool, flow: Flow) -> Flow {
+    match flow {
+        Flow::Exhausted if S::TAG == EvalTag::Yq && !produced => {
+            Flow::Escaped(Control::Error(EvalError::slice_bound_empty()))
+        }
+        other => other,
+    }
+}
+
 /// `E[S:T]` (or `E[S:T]?` with `bracket_optional`) as one walk step, from
 /// `pos`. jq compiles it as `S as $s | T as $t | E | .[$s:$t]`: the bounds
 /// are evaluated against this stage's own input, outer, and the target is
@@ -25002,7 +25019,14 @@ fn path_context_component_each_bound<S: EvalSemantics, V: DocumentValue>(
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Flow {
     match expr {
-        Some(e) => path_context_component_flow::<S, V>(e, pos, sink),
+        Some(e) => {
+            let mut produced = false;
+            let flow = path_context_component_flow::<S, V>(e, pos, &mut |v| {
+                produced = true;
+                sink(v)
+            });
+            yq_bound_needs_a_value::<S>(produced, flow)
+        }
         // No `?//` to retry, so the sink's stop is reported as one.
         None => match sink(OwnedValue::Null) {
             Demand::Continue => Flow::Exhausted,
@@ -33392,13 +33416,20 @@ fn owned_identity_computed_step<S: EvalSemantics, V: DocumentValue>(
             let drive_bound =
                 |bound: &Option<Expr>, sink: &mut dyn FnMut(OwnedValue) -> Demand| -> Flow {
                     match bound {
-                        Some(e) => eval_each_owned::<S>(
-                            e,
-                            value,
-                            optional,
-                            Reentry::Against(id.root_witness()),
-                            sink,
-                        ),
+                        Some(e) => {
+                            let mut produced = false;
+                            let flow = eval_each_owned::<S>(
+                                e,
+                                value,
+                                optional,
+                                Reentry::Against(id.root_witness()),
+                                &mut |v| {
+                                    produced = true;
+                                    sink(v)
+                                },
+                            );
+                            yq_bound_needs_a_value::<S>(produced, flow)
+                        }
                         None => match sink(OwnedValue::Null) {
                             Demand::Continue => Flow::Exhausted,
                             Demand::Stop => Flow::Stopped { pending: None },
