@@ -62353,6 +62353,30 @@ fn test_try_body_raising_a_marker_elsewhere_keeps_refusing_the_handler_4127() ->
             r#"{"s":[1]}"#,
             "near attempt to access element 0 of 1",
         ),
+        // A body that stepped off the node and failed raises jq's own message, a string, not
+        // the marker: the handler's payload is that text, which is not the register's node.
+        (
+            "path(.s | try (. as $y | .x | error($y)) catch .)",
+            r#"{"s":5}"#,
+            r#"with result "Cannot index number"#,
+        ),
+        // Every branch, stage and operand has to raise the marker or a message: one that can
+        // raise anything else (`{"a":1}`) is that value, not the register's node.
+        (
+            r#"path(.s | try (. as $y | if .[0] == 2 then error($y) else error({"a":1}) end) catch .[0])"#,
+            r#"{"s":[1]}"#,
+            r#"near attempt to access element 0 of {"a":1}"#,
+        ),
+        (
+            r#"path(.s | try (. as $y | .[0] | error({"a":1})) catch .[0])"#,
+            r#"{"s":[1]}"#,
+            r#"near attempt to access element 0 of {"a":1}"#,
+        ),
+        (
+            r#"path(.s | try (. as $y | (.[0] == 1) and error({"a":1})) catch .[0])"#,
+            r#"{"s":[1]}"#,
+            r#"near attempt to access element 0 of {"a":1}"#,
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(doc))?;
         assert_eq!(code, 5, "#4127: `{program}` on {doc}: stdout {stdout:?}");
