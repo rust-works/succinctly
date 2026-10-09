@@ -192,10 +192,10 @@ mod tests {
     #[test]
     fn a_scalar_splats_to_nothing_and_a_mapping_to_its_values() {
         // A scalar first node has no children, so `N` is 0 and nothing is collected.
-        assert!(
+        assert_eq!(
             collect_object::<YqSemantics>(alloc::vec![UnionEntry::Bare(alloc::vec![int(1)])])
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            Vec::<OwnedValue>::new()
         );
         // A mapping's children are `[key, value]`: the key splats to nothing, the value
         // (a mapping) to its own values.

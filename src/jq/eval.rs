@@ -135926,7 +135926,7 @@ mod touched_edge_cases_2999 {
             let expr = parse_with_mode_and_extensions(filter, ParserMode::Yq, extensions)
                 .expect("filter parses");
             match eval::<Vec<u64>, YqSemantics>(&expr, index.root(json)) {
-                QueryResult::Error(e) => format!("error: {}", e.to_string()),
+                QueryResult::Error(e) => format!("error: {e}"),
                 result => result
                     .collect_owned::<YqSemantics>()
                     .iter()
