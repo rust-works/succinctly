@@ -62048,7 +62048,22 @@ fn test_try_body_raising_its_input_seeds_the_handler_as_the_register_4019() -> R
             r#"{"s":[1]}"#,
             "[\"s\",0]\n",
         ),
-        // The write side reaches the same node.
+        // The write side reaches the same node, a scalar one included.
+        (
+            "del(.s | try error catch .)",
+            r#"{"s":5,"t":1}"#,
+            "{\"t\":1}\n",
+        ),
+        (
+            "(.s | try error catch .) = 9",
+            r#"{"s":5,"t":1}"#,
+            "{\"s\":9,\"t\":1}\n",
+        ),
+        (
+            r#"(.s | try error(.) catch .) |= . + "d""#,
+            r#"{"s":"abc","t":1}"#,
+            "{\"s\":\"abcd\",\"t\":1}\n",
+        ),
         (
             r#"del(.s | try (error(.) | error("x")) catch .[0])"#,
             r#"{"s":[5,6],"y":1}"#,
@@ -62160,6 +62175,46 @@ fn test_try_body_raising_something_else_keeps_refusing_the_handler_4019() -> Res
         ),
         "#4019: `{program}`: {stderr:?}"
     );
+    Ok(())
+}
+
+/// #4019 review: `. // X` is not `.` -- on a `null` or `false` register it is `X`, so a body
+/// that raises `X` does not hand its handler the register's node, and seeding it as that
+/// node turned jq's path error into a `del` and an assignment that landed. Every row
+/// captured live from jq 1.7.1; the stage after the body and the message position are both
+/// covered, bare and under an `if`.
+#[test]
+fn test_try_body_raising_an_alternative_is_not_the_register_4019() -> Result<()> {
+    for (program, doc, message) in [
+        (
+            r#"del(.x | try error(. // {"a":1}) catch .a)"#,
+            r#"{"x":null,"y":1}"#,
+            r#"near attempt to access element "a" of {"a":1}"#,
+        ),
+        (
+            "del(.x | try ((. // 1) | error) catch .)",
+            r#"{"x":null,"y":1}"#,
+            "with result 1",
+        ),
+        (
+            "(.x | try error(. // 1) catch .) = 5",
+            r#"{"x":null,"y":1}"#,
+            "with result 1",
+        ),
+        (
+            "path(.x | try (if true then error(. // 5) else . end) catch .)",
+            r#"{"x":false}"#,
+            "with result 5",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(doc))?;
+        assert_eq!(code, 5, "#4019: `{program}` on {doc}: stdout {stdout:?}");
+        assert!(stdout.is_empty(), "#4019: `{program}`: {stdout:?}");
+        assert!(
+            stderr.contains(&format!("Invalid path expression {message}")),
+            "#4019: `{program}`: {stderr:?}"
+        );
+    }
     Ok(())
 }
 

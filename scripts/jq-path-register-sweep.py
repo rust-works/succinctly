@@ -636,6 +636,13 @@ OPERANDS = [
     "try (.a | error) catch .",
     "try (.[0]?, error) catch (.[0])?",
     "try error([.][0]) catch (.a)?",
+    # (#4019 review) `. // X` is `X` on a null/false register, so a body raising it does not
+    # raise the register's own node.
+    "try error(. // {\"a\":1}) catch .a",
+    "try ((. // 1) | error) catch .",
+    "try (if true then error(. // 5) else . end) catch (.a)?",
+    "try ((. // 1), error) catch .",
+    "try (select(. // 1) | error) catch (.a)?",
     "try last(error) catch .",
     "try last(.a) catch input",
     # (#3767 Part 4) a `first`/`limit`/`nth` over a stage that navigates nothing leaves the

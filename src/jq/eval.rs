@@ -51711,8 +51711,8 @@ fn error_body_raises_its_input<S: EvalSemantics>(body: &Expr) -> bool {
 /// The shapes, all captured against jq 1.7.1 with `path(try B catch .a)` on
 /// `{"a":{"b":1}}` (each `["a"]`):
 ///
-/// - `error`, `error(.)`;
-/// - a pipe of raise-free passthroughs (`select(c)` over a total condition
+/// - `error`, `error(.)` (`. // X` is not `.`: it is `X` on a `null` or `false` register);
+/// - a pipe of exact passthroughs (`select(c)` over a total condition
 ///   included) up to its first `error` of the input; whatever follows is dead
 ///   (`error | error`, `error(.) | error("x")`, `select(true) | error`);
 /// - `if C then A else B end` with a total, raise-free `C` and `A`, `B` each
@@ -51728,24 +51728,26 @@ fn error_body_raises_its_input<S: EvalSemantics>(body: &Expr) -> bool {
 /// unless `.` is known to be the register there ([`fold_body::acc_is_register_here`]): a
 /// fold's source may have moved jq's register off the accumulator the body is
 /// "trackable" on (`path(reduce .[]? as $k (.; try (., error) catch (.a)?))` is `[]` in
-/// jq, where seeding the handler as the register's node refuses).
+/// jq, where seeding the handler as the register's node refuses). Without `std` there is no
+/// thread-local to ask, the depth reads as non-zero, and the recognition is off, like every
+/// other one gated on it (#3790).
 fn trackable_body_raises_its_input<S: EvalSemantics>(body: &Expr) -> bool {
     S::TAG == EvalTag::Jq
         && (fold_body::depth() == 0 || fold_body::acc_is_register_here())
         && !mentions_marker(body)
-        && body_raises_only_its_input(body, true)
+        && body_raises_only_its_input(body)
 }
 
-/// [`trackable_body_raises_its_input`]'s grammar; `wide` as in [`identity_passthrough`].
-fn body_raises_only_its_input(body: &Expr, wide: bool) -> bool {
+/// [`trackable_body_raises_its_input`]'s grammar.
+fn body_raises_only_its_input(body: &Expr) -> bool {
     match unwrap_bind_source(body) {
-        Expr::Error(_) => stage_raises_its_input(body, wide),
+        Expr::Error(_) => stage_raises_its_input(body),
         Expr::Pipe(stages) => {
             for stage in stages {
-                if stage_raises_its_input(stage, wide) {
+                if stage_raises_its_input(stage) {
                     return true;
                 }
-                if !raise_free_passthrough_stage(stage, wide) {
+                if !exact_passthrough_stage(stage) {
                     return false;
                 }
             }
@@ -51755,45 +51757,57 @@ fn body_raises_only_its_input(body: &Expr, wide: bool) -> bool {
             cond,
             then_branch,
             else_branch,
-        } if wide => {
+        } => {
             cond_is_total_and_raise_free(cond)
-                && branch_raises_only_its_input(then_branch, wide)
-                && branch_raises_only_its_input(else_branch, wide)
+                && branch_raises_only_its_input(then_branch)
+                && branch_raises_only_its_input(else_branch)
         }
-        Expr::Comma(items) if wide => {
-            !items.is_empty()
-                && items
-                    .iter()
-                    .all(|item| branch_raises_only_its_input(item, wide))
-        }
+        Expr::Comma(items) => !items.is_empty() && items.iter().all(branch_raises_only_its_input),
         _ => false,
     }
 }
 
-/// `expr` is `error` or `error(P)` with `P` a raise-free passthrough of `.`:
-/// it always raises, and what it raises is its input.
-fn stage_raises_its_input(expr: &Expr, wide: bool) -> bool {
+/// `expr` is `error` or `error(P)` with `P` an [exact passthrough](exact_passthrough_stage)
+/// of `.`: it always raises, and what it raises is its input.
+fn stage_raises_its_input(expr: &Expr) -> bool {
     match unwrap_bind_source(expr) {
         Expr::Error(None) => true,
-        Expr::Error(Some(msg)) => raise_free_identity_passthrough(msg, wide),
+        Expr::Error(Some(msg)) => exact_passthrough_stage(msg),
         _ => false,
     }
 }
 
 /// A branch of a compound body: it cannot raise anything but its input.
-fn branch_raises_only_its_input(expr: &Expr, wide: bool) -> bool {
-    raise_free_passthrough_stage(expr, wide) || body_raises_only_its_input(expr, wide)
+fn branch_raises_only_its_input(expr: &Expr) -> bool {
+    exact_passthrough_stage(expr) || body_raises_only_its_input(expr)
 }
 
-/// A pipe stage that hands `.` on unchanged and never raises: a raise-free
-/// passthrough, or a `select(c)` whose condition is total and raise-free (it is a
-/// subexp in jq, so it cannot move the register either).
-fn raise_free_passthrough_stage(expr: &Expr, wide: bool) -> bool {
-    raise_free_identity_passthrough(expr, wide)
-        || matches!(
-            unwrap_bind_source(expr),
-            Expr::Builtin(Builtin::Select(cond)) if wide && cond_is_total_and_raise_free(cond)
-        )
+/// A pipe stage that emits `.` itself (or nothing) and never raises: `.`, a pipe,
+/// comma or `if` over total conditions of such stages, or a `select(c)` whose
+/// condition is total and raise-free (a subexp in jq, so it cannot move the
+/// register either).
+///
+/// Narrower than [`raise_free_identity_passthrough`] on purpose: its `A // B` arm
+/// reads only `A`, because every caller of that one backs it with a value-equality
+/// or storage check, and this grammar has neither. `error(. // 1)` raises `1` when
+/// `.` is `null`, which is not the register's node (#4019 review).
+fn exact_passthrough_stage(expr: &Expr) -> bool {
+    match unwrap_bind_source(expr) {
+        Expr::Identity => true,
+        Expr::Builtin(Builtin::Select(cond)) => cond_is_total_and_raise_free(cond),
+        Expr::Pipe(stages) => stages.iter().all(exact_passthrough_stage),
+        Expr::Comma(items) => !items.is_empty() && items.iter().all(exact_passthrough_stage),
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            cond_is_total_and_raise_free(cond)
+                && exact_passthrough_stage(then_branch)
+                && exact_passthrough_stage(else_branch)
+        }
+        _ => false,
+    }
 }
 
 /// Apply `Expr::Try`'s `catch` clause (if any) after `expr` failed to
