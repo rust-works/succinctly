@@ -576,6 +576,13 @@ Each turns a refusal into an answer and needs its own oracle rows:
 - ~~The stage-level downgrade in `place_step`: a leaf-local verdict for `,`/`//`/`if`/`try`, which
   turns the three rows into jq's `[]`.~~ Done by #3644 for a trackable entry (`compound_states_register_per_result`);
   an untracked entry still takes the stage-level answer.
+- ~~A `try` whose body raises a path-tracked value and whose handler navigates, read per result.~~ Done by #4019:
+  a body every one of whose raises is its own input (`error_body_raises_its_input`: `error`, `error(.)`, a pipe of
+  raise-free passthroughs up to an `error`, an `if` over a total condition, a comma) seeds the handler as the
+  register's node on a trackable entry, scalar registers included, so `compound_states_register_per_result` reads the
+  handler's outputs the way it reads a `,`/`//`/`if`. A body outside that grammar (`(.a, error)`, a condition that can
+  raise, a `$x` marker beyond the #3891 shapes) keeps today's exclusion; `path(.s | try (. as $y | .[0] | error($y))
+  catch .[0])` is the known residual (refuse-only).
 - `LostAt(entry)` for an unchecked `[E]`, and passing `LostAt`'s position through `register_after`
   instead of `LostSomewhere`.
 - ~~An `[E]` collect of `map(f)`/`any(f)`/`all(f)` whose `f` navigates but stays on the register.~~ Done by #3724

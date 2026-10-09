@@ -614,6 +614,28 @@ OPERANDS = [
     "try error(\"x\") catch (.a)?",
     "try error({\"a\":1}) catch (.a)?",
     "try error catch (try .a catch 0)",
+    # (#4019) a body that raises its own input through more than a bare `error`, so the
+    # handler's payload is the register's node (a scalar one included), and the same
+    # shapes whose condition can raise or whose stage navigates first, which are not.
+    "try error catch .",
+    "try error(.) catch .",
+    "try (error | error) catch (.a)?",
+    "try (error(.) | error(\"x\")) catch ((.a)? // 5)",
+    "try (error(.) | error(\"x\")) catch .a",
+    "try (error(.) | error(\"x\")) catch .",
+    "try (if . == 1 then error(.) else . end) catch .",
+    "try (if . == 1 then error(.) else . end) catch ((.a)? // 5)",
+    "try (if true then error else . end) catch .a?",
+    "try (if . == null then . else error end) catch (.a)?",
+    "try (if .a then error(.) else . end) catch ((.a)? // 5)",
+    "try (., error) catch (.a)?",
+    "try (error, .) catch .[0]?",
+    "try (select(true) | error) catch (.a)?",
+    "try (select(. == 1) | error) catch .",
+    "try (select(.a) | error) catch .a",
+    "try (.a | error) catch .",
+    "try (.[0]?, error) catch (.[0])?",
+    "try error([.][0]) catch (.a)?",
     "try last(error) catch .",
     "try last(.a) catch input",
     # (#3767 Part 4) a `first`/`limit`/`nth` over a stage that navigates nothing leaves the

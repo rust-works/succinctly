@@ -39272,7 +39272,11 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             match resolve_node_sink::<S>(expr, value, trackable, snapshot, frame, keep, sink) {
                 ResolveFlow::Escaped(EvalEscape::Error(e)) if !e.is_uncatchable() => {
                     let caught = if error_body_raises_its_input::<S>(expr) {
-                        CaughtPayload::OfInput
+                        if trackable && !mentions_marker(expr) {
+                            CaughtPayload::OfRegister
+                        } else {
+                            CaughtPayload::OfInput
+                        }
                     } else {
                         CaughtPayload::Value
                     };
@@ -42933,12 +42937,17 @@ fn compound_states_register_per_result<S: EvalSemantics>(expr: &Expr) -> bool {
             // A handler that runs navigates the error payload, not the register,
             // and the handler's by-value output would then be read as the entry
             // register (`try (error(.) | error("x")) catch ((.a)? // 5)` is a
-            // path error in jq). So a navigating handler is admitted only behind
-            // a body that cannot raise; the handler machinery (#3133, #3987)
-            // answers the rest.
+            // path error in jq) if the payload were the register's node and the
+            // seed said it was not. So a navigating handler is admitted only
+            // where the seed is exact: behind a body that cannot raise, or one
+            // whose every raise is its own input ([`error_body_raises_its_input`],
+            // #4019), which [`resolve_catch_sink`] seeds as the register's node
+            // so the handler's navigations are tracked and each output states its
+            // own register. The handler machinery (#3133, #3987) answers the rest.
             Expr::Try { expr: body, catch } => {
                 catch.as_deref().map_or(true, cannot_move_register)
                     || matches!(unwrap_paren(body), Expr::Literal(_))
+                    || (!mentions_marker(body) && error_body_raises_its_input::<S>(body))
             }
             _ => false,
         }
@@ -51664,10 +51673,15 @@ enum CaughtPayload {
     /// ([`error_body_raises_its_input`]): the very node the body stood on, so a
     /// container sharing the register's storage is the register's node too.
     OfInput,
+    /// [`OfInput`](Self::OfInput) from a `try` entered on a trackable branch (#4019):
+    /// the node the body stood on *is* jq's register there, so the payload is the
+    /// register's node for a scalar too, which has no storage to compare.
+    OfRegister,
 }
 
-/// Whether a `try` body that raised raises *its own input*: `error`, or `error(P)`
-/// with `P` a passthrough of `.`, optionally after passthrough stages (#3891).
+/// Whether every error a `try` body can raise is *its own input*: `error`, or
+/// `error(P)` with `P` a passthrough of `.`, reached through stages that neither
+/// raise nor move off `.` (#3891, widened by #4019).
 ///
 /// jq evaluates `error(msg)`'s argument in path mode, so only a path-preserving
 /// `P` keeps the register: `error(.)` raises the node and a handler navigates it
@@ -51676,17 +51690,107 @@ enum CaughtPayload {
 /// handler (captured live, jq 1.7.1). A payload built by value can still share
 /// the register's storage here -- the `Rc` survives the construction -- so storage
 /// alone is not enough: the expression has to be one jq keeps tracked. The
-/// grammar is [`is_identity_passthrough`]'s, so a path-preserving `P` it does not
-/// know (`first(.)`, `getpath([])`) refuses, as it did before.
+/// grammar is [`raise_free_identity_passthrough`]'s, so a path-preserving `P` it
+/// does not know (`first(.)`, `getpath([])`) refuses, as it did before.
+///
+/// The shapes, all captured against jq 1.7.1 with `path(try B catch .a)` on
+/// `{"a":{"b":1}}` (each `["a"]`):
+///
+/// - `error`, `error(.)`;
+/// - a pipe of raise-free passthroughs (`select(c)` over a total condition
+///   included) up to its first `error` of the input; whatever follows is dead
+///   (`error | error`, `error(.) | error("x")`, `select(true) | error`);
+/// - `if C then A else B end` with a total, raise-free `C` and `A`, `B` each
+///   qualifying (`if true then error(.) else . end`); a condition that can
+///   raise (`if .a.b.c then ..`) raises *its own* value first;
+/// - `A, B` with both qualifying (`(., error)`, `(error, .)`). An item that
+///   navigates (`.a, error`) still qualifies only if it cannot raise, which no
+///   navigation can promise, so it does not.
+///
+/// A body that qualifies without being able to raise at all is vacuously true;
+/// the answer is only asked of a body that did raise. Marker-free, like the wide
+/// arms of [`raise_free_identity_passthrough`]; a body holding one keeps the narrow
+/// grammar it had.
 fn error_body_raises_its_input<S: EvalSemantics>(body: &Expr) -> bool {
+    if mentions_marker(body) {
+        // A frozen `$x` is `.` only by the marker's origin, which the storage test in
+        // [`resolve_catch_sink`] backs up; the widened grammar stays off it (#4019).
+        return marker_body_raises_its_input::<S>(body);
+    }
+    body_raises_only_its_input(body, S::TAG == EvalTag::Jq)
+}
+
+/// [`error_body_raises_its_input`] for a body holding a frozen `$x` marker: `error`,
+/// `error(P)`, or a pipe of passthroughs ending in one (#3891).
+fn marker_body_raises_its_input<S: EvalSemantics>(body: &Expr) -> bool {
     match unwrap_bind_source(body) {
         Expr::Error(None) => true,
         Expr::Error(Some(msg)) => is_identity_passthrough::<S>(msg),
         Expr::Pipe(stages) => stages.split_last().is_some_and(|(last, lead)| {
-            lead.iter().all(is_identity_passthrough::<S>) && error_body_raises_its_input::<S>(last)
+            lead.iter().all(is_identity_passthrough::<S>) && marker_body_raises_its_input::<S>(last)
         }),
         _ => false,
     }
+}
+
+/// [`error_body_raises_its_input`]'s grammar; `wide` as in [`identity_passthrough`].
+fn body_raises_only_its_input(body: &Expr, wide: bool) -> bool {
+    match unwrap_bind_source(body) {
+        Expr::Error(_) => stage_raises_its_input(body, wide),
+        Expr::Pipe(stages) => {
+            for stage in stages.iter() {
+                if stage_raises_its_input(stage, wide) {
+                    return true;
+                }
+                if !raise_free_passthrough_stage(stage, wide) {
+                    return false;
+                }
+            }
+            false
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } if wide => {
+            cond_is_total_and_raise_free(cond)
+                && branch_raises_only_its_input(then_branch, wide)
+                && branch_raises_only_its_input(else_branch, wide)
+        }
+        Expr::Comma(items) if wide => {
+            !items.is_empty()
+                && items
+                    .iter()
+                    .all(|item| branch_raises_only_its_input(item, wide))
+        }
+        _ => false,
+    }
+}
+
+/// `expr` is `error` or `error(P)` with `P` a raise-free passthrough of `.`:
+/// it always raises, and what it raises is its input.
+fn stage_raises_its_input(expr: &Expr, wide: bool) -> bool {
+    match unwrap_bind_source(expr) {
+        Expr::Error(None) => true,
+        Expr::Error(Some(msg)) => raise_free_identity_passthrough(msg, wide),
+        _ => false,
+    }
+}
+
+/// A branch of a compound body: it cannot raise anything but its input.
+fn branch_raises_only_its_input(expr: &Expr, wide: bool) -> bool {
+    raise_free_passthrough_stage(expr, wide) || body_raises_only_its_input(expr, wide)
+}
+
+/// A pipe stage that hands `.` on unchanged and never raises: a raise-free
+/// passthrough, or a `select(c)` whose condition is total and raise-free (it is a
+/// subexp in jq, so it cannot move the register either).
+fn raise_free_passthrough_stage(expr: &Expr, wide: bool) -> bool {
+    raise_free_identity_passthrough(expr, wide)
+        || matches!(
+            unwrap_bind_source(expr),
+            Expr::Builtin(Builtin::Select(cond)) if wide && cond_is_total_and_raise_free(cond)
+        )
 }
 
 /// Apply `Expr::Try`'s `catch` clause (if any) after `expr` failed to
@@ -51818,6 +51922,7 @@ fn resolve_catch_sink<'a, S: EvalSemantics>(
                     // ([`CaughtPayload::OfInput`]): a payload built by value can share
                     // the storage too, which jq does not treat as the node.
                     // `register` is only ever present in jq mode (`entry_register`).
+                    || caught == CaughtPayload::OfRegister
                     || (caught == CaughtPayload::OfInput
                         && payload.shares_storage_with(register))) =>
         {

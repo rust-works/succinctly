@@ -61990,6 +61990,167 @@ fn test_catch_handler_seed_needs_a_payload_jq_keeps_tracked_3891() -> Result<()>
     Ok(())
 }
 
+/// #4019: a `try` whose body raises the node it stood on, by more than a bare `error`,
+/// hands its handler the register's own node, so the handler navigates it as a path:
+/// a scalar register (it has no storage to compare), an `if`/`,`/`select` body, a body
+/// that raises twice (`error | error`), at the root and below it, through `path`, `del`,
+/// `=` and `|=`. Every row captured live from jq 1.7.1.
+#[test]
+fn test_try_body_raising_its_input_seeds_the_handler_as_the_register_4019() -> Result<()> {
+    for (program, doc, want) in [
+        // The issue's repro: a scalar register, a body that raises it under an `if`.
+        (
+            "path(.d | .[] | try (if . == 3 then error(.) else . end) catch .)",
+            r#"{"d":[3,4]}"#,
+            "[\"d\",0]\n[\"d\",1]\n",
+        ),
+        // A scalar register, whatever its kind and whatever the handler does with it.
+        ("path(.s | try error catch .)", r#"{"s":5}"#, "[\"s\"]\n"),
+        (
+            "path(.s | try error(.) catch .)",
+            r#"{"s":"abc"}"#,
+            "[\"s\"]\n",
+        ),
+        (
+            "path(.s | try error catch .[1:])",
+            r#"{"s":"abc"}"#,
+            "[\"s\",{\"start\":1,\"end\":null}]\n",
+        ),
+        // A body that raises its input first and something else after it.
+        (
+            r#"path(try (error(.)|error("x")) catch ((.a)? // 5))"#,
+            r#"{"a":{"b":1}}"#,
+            "[\"a\"]\n",
+        ),
+        (
+            "path(.s | try (error | error) catch .[0])",
+            r#"{"s":[1]}"#,
+            "[\"s\",0]\n",
+        ),
+        // Compound bodies: an `if` over a total condition, a comma, a `select`.
+        (
+            "path(.s | try (if . == null then . else error end) catch .[0])",
+            r#"{"s":[1]}"#,
+            "[\"s\",0]\n",
+        ),
+        (
+            "path(.s | try (select(. != null) | error) catch .[0])",
+            r#"{"s":[1]}"#,
+            "[\"s\",0]\n",
+        ),
+        (
+            "path(.s | try (., error) catch .[0])",
+            r#"{"s":[1]}"#,
+            "[\"s\"]\n[\"s\",0]\n",
+        ),
+        (
+            "path(.s | try (error, .) catch .[0])",
+            r#"{"s":[1]}"#,
+            "[\"s\",0]\n",
+        ),
+        // The write side reaches the same node.
+        (
+            r#"del(.s | try (error(.) | error("x")) catch .[0])"#,
+            r#"{"s":[5,6],"y":1}"#,
+            "{\"s\":[6],\"y\":1}\n",
+        ),
+        (
+            "(.d | .[] | try (if . == 3 then error(.) else . end) catch .) = 9",
+            r#"{"d":[3,4]}"#,
+            "{\"d\":[9,9]}\n",
+        ),
+        (
+            "(.d | .[] | try (if . == 3 then error(.) else . end) catch .) |= . + 1",
+            r#"{"d":[3,4]}"#,
+            "{\"d\":[4,5]}\n",
+        ),
+        (
+            "del(.d | .[] | try (if . == 3 then error(.) else . end) catch .)",
+            r#"{"d":[3,4,3]}"#,
+            "{\"d\":[]}\n",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(doc))?;
+        assert_eq!(code, 0, "#4019: `{program}` on {doc}: stderr {stderr:?}");
+        assert_eq!(stdout, want, "#4019: `{program}` on {doc}");
+    }
+    Ok(())
+}
+
+/// #4019: the stage after such a `try` reads each handler output's own register. A
+/// navigating handler that took a path moved the register (the `$x` after it is a path
+/// error); one whose `//` fell to a by-value `5` did not (`$x` re-establishes `[]`). The
+/// first cut that admitted the `try` accepted the first row too, and jq refuses it.
+/// Every row captured live from jq 1.7.1.
+#[test]
+fn test_try_raising_its_input_states_the_handler_register_per_result_4019() -> Result<()> {
+    let program = r#"path(. as $x | try (error(.)|error("x")) catch ((.a)? // 5) | $x)"#;
+    let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(r#"{"d":[3,4]}"#))?;
+    assert_eq!((stdout.as_str(), code), ("[]\n", 0), "#4019: {stderr:?}");
+    let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(r#"{"a":{"b":1}}"#))?;
+    assert_eq!(code, 5, "#4019: stdout {stdout:?}");
+    assert!(
+        stderr.contains(r#"Invalid path expression with result {"a":{"b":1}}"#),
+        "#4019: {stderr:?}"
+    );
+    let program =
+        r#"path(. as $x | try (if . == 3 then error(.) else . end) catch ((.a)? // 5) | $x)"#;
+    let (stdout, stderr, code) = run_jq_full(&["-c", program], Some("3"))?;
+    assert_eq!((stdout.as_str(), code), ("[]\n", 0), "#4019: {stderr:?}");
+    Ok(())
+}
+
+/// #4019: the payload is the register's node only for a body every one of whose raises
+/// is its own input. A body that navigates before it raises, builds the payload by value,
+/// raises something else (a condition that can fail, a fresh message) or emits a
+/// navigation first hands its handler a different value, and the handler's navigation
+/// still raises, as in jq. Every row captured live from jq 1.7.1.
+#[test]
+fn test_try_body_raising_something_else_keeps_refusing_the_handler_4019() -> Result<()> {
+    for (program, doc, message) in [
+        (
+            "path(.s | try (.[0] | error) catch .[0])",
+            "near attempt to access element 0 of 1",
+        ),
+        (
+            "path(.s | try error([.][0]) catch .[0])",
+            // (the payload's text differs from jq's, a wording residual)
+            "near attempt to access element 0 of",
+        ),
+        (
+            "path(.s | try (if .[0].x then error(.) else . end) catch .[0])",
+            "near attempt to access element 0 of \"Cannot index number",
+        ),
+        (
+            r#"path(.s | try (if . == null then . else error("z") end) catch .[0])"#,
+            "near attempt to access element 0 of \"z\"",
+        ),
+        (
+            "path(.s | try (select(.[0].x) | error) catch .[0])",
+            "near attempt to access element 0 of \"Cannot index number",
+        ),
+        (
+            "path(.s | try (.a, error) catch .[0])",
+            "near attempt to access element 0 of \"Cannot index array",
+        ),
+        (
+            "del(.s | try (.[0] | error) catch .[0])",
+            "near attempt to access element 0 of 1",
+        ),
+    ]
+    .map(|(program, message)| (program, r#"{"s":[1]}"#, message))
+    {
+        let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(doc))?;
+        assert_eq!(code, 5, "#4019: `{program}`: stdout {stdout:?}");
+        assert!(stdout.is_empty(), "#4019: `{program}`: {stdout:?}");
+        assert!(
+            stderr.contains(&format!("Invalid path expression {message}")),
+            "#4019: `{program}`: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3967, flipped by #3644: a compound handler next to an `and`/`or`/`-`
 /// navigation answers as jq does (the `true` row emits nothing, the
 /// array row `[0]`). Both refused before the compound stage stated its register
