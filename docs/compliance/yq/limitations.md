@@ -4967,10 +4967,13 @@ Residual divergences remain, all in cases yq itself reaches through its node mod
   has different lengths is the `CollectObject: mismatching node sizes` error in yq and no output
   here, and `[.l[] | {.nope}]` is `[{}]` in yq and `[{},{}]` here (#4184). Pair-only
   constructions are unaffected (one object per node either way).
-- **`,` over one stored list.** yq's `UNION` skips its right operand when both sides evaluate to
-  the very same node list, which `$z, $z`, `($z), $z` and `., .` do (`[1] as $z | $z, $z` prints
-  once). It is a property of the comma operator everywhere, not of `{...}`, so a bare entry
-  shows it too: `[[1,2],[3,4]] as $z | {$z, $z}` is `1 2 3 4` in yq and `1 2 2 4` here.
+- **`,` over two variable references.** yq's `UNION` drops its right operand when both operands are
+  variable references, whatever they hold: `1 as $z | 2 as $y | $z, $y` prints only `1`, and so does
+  `$z, $y, $w`; `., .` collapses too (`succinctly yq` already does that one). Array collection is
+  unaffected (`[$z, $y]` is `[1,2]`). It is a property of the comma operator everywhere, not of
+  `{...}`, so a bare entry shows it: `[[1,2],[3,4]] as $z | {$z, $z}` is `1 2 3 4` in yq and `1 2 2 4`
+  here. The mechanism is not the pointer comparison in `operator_union.go` that it first looks like
+  (#4183).
 - **A parenthesized pair.** `{"x": 1, ("a": 2)}` parses in yq (`:` is an ordinary binary
   operator); `succinctly yq` accepts a pair only directly inside the braces.
 - **The `*` error text.** The error a failed multiply raises is succinctly's usual
