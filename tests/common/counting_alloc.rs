@@ -20,7 +20,9 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use succinctly::jq::eval_generic::{eval_each_with_cursor_using, GenericResult};
+use succinctly::jq::eval_generic::{
+    eval_each_with_cursor_using, eval_with_cursor_using, GenericResult,
+};
 use succinctly::jq::{eval_full, parse, JqSemantics, OwnedValue, QueryResult};
 use succinctly::json::JsonIndex;
 
@@ -75,18 +77,54 @@ unsafe impl GlobalAlloc for Counting {
     }
 }
 
+/// Closes the counting window when dropped, so a `run` that panics (these
+/// helpers' answer closures do, on a query that did not settle) cannot leave
+/// the thread counting through the unwind and any `catch_unwind` after it.
+struct Window;
+
+impl Window {
+    fn open() -> Self {
+        ALLOCATIONS.with(|count| count.set(Some(0)));
+        Self
+    }
+
+    fn close(self) -> usize {
+        let counted = ALLOCATIONS
+            .with(|count| count.replace(None))
+            .expect("the window was opened above");
+        // `Drop` then finds the window already closed.
+        drop(self);
+        counted
+    }
+}
+
+impl Drop for Window {
+    fn drop(&mut self) {
+        let _ = ALLOCATIONS.try_with(|count| count.set(None));
+    }
+}
+
 /// Allocator calls `run` makes on this thread, and what it returned.
 ///
 /// A realloc counts as one call; `dealloc` is not counted, since a term that
 /// allocates per node frees per node too. Not re-entrant: a window opened
 /// inside another resets it.
 pub fn count_allocations<R>(run: impl FnOnce() -> R) -> (usize, R) {
-    ALLOCATIONS.with(|count| count.set(Some(0)));
+    let window = Window::open();
     let result = run();
-    let counted = ALLOCATIONS
-        .with(|count| count.replace(None))
-        .expect("the window was opened above");
-    (counted, result)
+    (window.close(), result)
+}
+
+/// Panics unless [`Counting`] is this binary's `#[global_allocator]` and counting. A test
+/// file that includes this module and forgets the static compiles, and every
+/// "no more than its twin" bound it asserts then passes as `0 <= 0`.
+fn assert_installed() {
+    let (counted, _) = count_allocations(|| std::hint::black_box(Box::new(0u64)));
+    assert!(
+        counted > 0,
+        "the counting allocator counted nothing: is `#[global_allocator] static ALLOCATOR: \
+         Counting = Counting;` declared in this test file?"
+    );
 }
 
 /// Allocator calls one run of `run` makes, after one warm-up run outside the
@@ -101,11 +139,31 @@ pub fn measure<R, T: PartialEq + std::fmt::Debug>(
     run: impl Fn() -> R,
     answer: impl Fn(R) -> T,
 ) -> (usize, T) {
+    assert_installed();
     let expected = answer(run());
     let (counted, result) = count_allocations(&run);
     let answered = answer(result);
     assert_eq!(answered, expected, "a repeat evaluation must agree");
     (counted, expected)
+}
+
+/// Allocator calls one evaluation of `query` makes over `json` through the
+/// collecting entry (`eval_with_cursor_using`), after one warm-up evaluation
+/// outside the window, and the number it answered (`query` must settle to one
+/// integer).
+pub fn allocations_collecting(query: &str, json: &str) -> (usize, i64) {
+    let bytes = json.as_bytes();
+    let index = JsonIndex::build(bytes);
+    let root = index.root(bytes);
+    let expr = parse(query).expect("parse");
+
+    measure(
+        || eval_with_cursor_using::<JqSemantics, _>(&expr, root),
+        |result| match result {
+            GenericResult::Owned(OwnedValue::Int(n)) => n,
+            _ => panic!("`{query}` did not settle to one number"),
+        },
+    )
 }
 
 /// Allocator calls one evaluation of `query` makes over `json` through the

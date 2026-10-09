@@ -32,39 +32,14 @@
 //! Counting is gated to the calling thread, so the harness's other threads, and
 //! other tests in this file, cannot add to the window.
 
-use succinctly::jq::eval_generic::{eval_with_cursor_using, GenericResult};
-use succinctly::jq::{parse, JqSemantics, OwnedValue};
-use succinctly::json::JsonIndex;
-
 #[path = "common/counting_alloc.rs"]
 mod counting_alloc;
-use counting_alloc::{allocations_streaming, allocations_value_route, measure, Counting};
+use counting_alloc::{
+    allocations_collecting, allocations_streaming, allocations_value_route, Counting,
+};
 
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
-
-/// Allocator calls one evaluation of `query` makes over `json` through the
-/// collecting entry, after one warm-up evaluation outside the window, and the
-/// number it answered.
-///
-/// A realloc counts as one call; `dealloc` is not counted, since a term that
-/// allocates per node frees per node too.
-fn allocations_collecting(query: &str, json: &str) -> (usize, i64) {
-    let bytes = json.as_bytes();
-    let index = JsonIndex::build(bytes);
-    let root = index.root(bytes);
-    let expr = parse(query).expect("parse");
-
-    // `measure` infers the result's element type (the
-    // crate-private `DocumentValue`) from the call, so it is never named here.
-    measure(
-        || eval_with_cursor_using::<JqSemantics, _>(&expr, root),
-        |result| match result {
-            GenericResult::Owned(OwnedValue::Int(n)) => n,
-            _ => panic!("`{query}` did not settle to one number"),
-        },
-    )
-}
 
 const N: usize = 2_000;
 
