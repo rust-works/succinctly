@@ -8719,7 +8719,7 @@ mod slot_memo {
 
     /// The element of `parent` the last scan found -- its node id and index --
     /// when `target` comes *before* it and the scan was of a sequence's
-    /// elements (#4101): the point to step back from.
+    /// elements (#4101): the point to step back from. Read-only.
     pub(crate) fn resume_back(
         document: usize,
         parent: usize,
@@ -8728,14 +8728,14 @@ mod slot_memo {
         MEMO.with(|m| {
             let mut m = m.borrow_mut();
             let state = m.as_mut().filter(|s| s.document == document)?;
-            let at = state
+            // Recency is not touched: a walk that finds nothing must not keep
+            // this parent alive past one a fan-out is still reading, and
+            // `remember` refreshes it when the walk succeeds.
+            let scan = state
                 .scans
                 .iter()
-                .position(|s| s.parent == parent && !s.members && s.last > target)?;
-            let scan = state.scans.remove(at);
-            let found = (scan.last, scan.index);
-            state.scans.push(scan);
-            Some(found)
+                .find(|s| s.parent == parent && !s.members && s.last > target)?;
+            Some((scan.last, scan.index))
         })
     }
 
@@ -27012,22 +27012,34 @@ fn resumed_slot<C: DocumentCursor>(c: &C, parent: &C) -> Option<CursorSlot<C>> {
 /// scan from the first element is `O(index of c)`. Elements only: a mapping's
 /// scan keeps no member index to bound the walk with.
 ///
-/// The walk gives up after half the remembered index, past which the scan
-/// from the first element is the shorter one, and after
-/// [`SLOT_MEMO_MAX_BACK`] elements, so a read that is not close behind the
-/// remembered one (a pipe that alternates a read near the start with one near
-/// the end) wastes a bounded walk, not a long one, before the scan it always
-/// paid. `None` (the scan from the first element then decides) also when
-/// the format has no `prev_element`, or the chain passes `c` without meeting
-/// it.
+/// Whether the walk is worth starting is estimated from the node ids, which
+/// follow document order: `c` is about `index * (last - c) / (last - parent)`
+/// elements behind the remembered one. Past [`SLOT_MEMO_MAX_BACK`] of them (or
+/// past half the index, where the scan from the first element is the shorter
+/// one) the walk is not started, so a read that is not close behind the
+/// remembered one -- one near the start, or a stride longer than the cap --
+/// costs exactly what it cost before. The estimate is only a gate: the walk
+/// itself stops after the same bound, so a document whose elements differ
+/// wildly in size wastes at most that many steps, and `None` (the scan from
+/// the first element then decides) also when the chain passes `c` without
+/// meeting it.
 fn resumed_slot_back<C: DocumentCursor>(c: &C, parent: &C) -> Option<CursorSlot<C>> {
+    if !C::STEPS_BACK {
+        return None;
+    }
     let document = c.document_token();
     let parent_id = parent.node_id();
     let target = c.node_id();
     let (last, index) = slot_memo::resume_back(document, parent_id, target)?;
+    let bound = (index / 2).min(SLOT_MEMO_MAX_BACK);
+    let span = last.checked_sub(parent_id).filter(|s| *s > 0)?;
+    let estimate = u128::try_from(index).ok()? * u128::try_from(last - target).ok()? / span as u128;
+    if estimate > bound as u128 {
+        return None;
+    }
     let mut from = c.at_node_id(last)?;
     let mut at = index;
-    for _ in 0..(index / 2).min(SLOT_MEMO_MAX_BACK) {
+    for _ in 0..bound {
         slot_memo::note_scanned();
         let elem = from.prev_element()?;
         at -= 1;
@@ -27035,14 +27047,16 @@ fn resumed_slot_back<C: DocumentCursor>(c: &C, parent: &C) -> Option<CursorSlot<
             return None;
         }
         if elem.same_node(c) {
-            slot_memo::remember(
-                document,
-                parent_id,
-                elem.node_id(),
-                at,
-                Some(from.node_id()),
-                false,
-            );
+            if at >= SLOT_MEMO_MIN_SCAN {
+                slot_memo::remember(
+                    document,
+                    parent_id,
+                    elem.node_id(),
+                    at,
+                    Some(from.node_id()),
+                    false,
+                );
+            }
             return Some(CursorSlot::Element(at));
         }
         from = elem;
@@ -50716,6 +50730,151 @@ mod tests {
                 "{filter}: a position took its parent from `document_parent` although its parent is remembered"
             );
         }
+    }
+
+    /// #4101: the walk back is bounded, not just the answer. A read within
+    /// [`SLOT_MEMO_MAX_BACK`] elements of the remembered one costs about the
+    /// distance; one beyond it, or near the start of the array, is not
+    /// attempted and costs exactly the scan from the first element it always
+    /// cost.
+    // The memo these pin is `std`-only: `no_std` has no `thread_local!`.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_slot_walk_back_is_bounded_by_the_step_cap_4101() {
+        let n = 3000usize;
+        let doc = format!("[{}]", vec!["{\"a\":1}"; n].join(","));
+        let index = JsonIndex::build(doc.as_bytes());
+        let root = index.root(doc.as_bytes());
+        let mut elements = Vec::new();
+        let mut next = root.first_child();
+        while let Some(c) = next {
+            next = c.next_sibling();
+            elements.push(c);
+        }
+        let read = |i: usize| match cursor_slot(&elements[i]) {
+            Ok(Some(CursorSlot::Element(at))) => assert_eq!(at, i as i64, "element {i}"),
+            other => panic!("not an element slot: {:?}", other.map(|_| ())), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #4101 pin, only reached when the pin is already failing"
+        };
+        let cap = usize::try_from(SLOT_MEMO_MAX_BACK).unwrap();
+        let visited = |reads: &[usize]| {
+            let _scope = slot_memo::enter(root.document_token());
+            let (before, _) = slot_memo::work();
+            for &i in reads {
+                read(i);
+            }
+            slot_memo::work().0 - before
+        };
+        // A stride inside the cap: each read after the first walks about the stride.
+        let near: Vec<usize> = (0..14).map(|k| n - 1 - k * (cap - 56)).collect();
+        let walked = visited(&near);
+        assert!(
+            walked < n + near.len() * cap,
+            "visited {walked} over {} reads of stride {}",
+            near.len(),
+            cap - 56
+        );
+        // A stride past the cap: no walk is started, so every read is the full
+        // scan to its own index, nothing more.
+        let far: Vec<usize> = (0..9).map(|k| n - 1 - k * (cap + 44)).collect();
+        assert_eq!(
+            visited(&far),
+            far.iter().map(|i| i + 1).sum::<usize>(),
+            "a stride past the cap must cost the scan from the first element"
+        );
+        // A read near the start while the memo sits far on: the scan from the
+        // first element, not a walk back over the elements in between.
+        assert_eq!(visited(&[2000, 5]), 2001 + 6);
+    }
+
+    /// #4101: reading in descending order answers what ascending order does,
+    /// for the shapes the walk back does not take (a mapping's members, a YAML
+    /// sequence and mapping, whose cursors have no `prev_element`) and the one
+    /// it does with scalar elements.
+    // The memo these pin is `std`-only: `no_std` has no `thread_local!`.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_descending_slot_reads_answer_what_ascending_reads_do_4101() {
+        fn describe<C: DocumentCursor>(c: &C) -> String {
+            match cursor_slot(c) {
+                Ok(Some(CursorSlot::Element(i))) => format!("element {i}"),
+                Ok(Some(CursorSlot::Value { key, .. })) => format!("value {}", key.to_json()),
+                Ok(Some(CursorSlot::Key(key))) => format!("key {}", key.to_json()),
+                Ok(None) => "none".to_string(),
+                Err(_) => "error".to_string(), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- no fixture here has a malformed member"
+            }
+        }
+        fn chain<C: DocumentCursor>(first: Option<C>) -> Vec<C> {
+            let mut out = Vec::new();
+            let mut next = first;
+            while let Some(c) = next {
+                next = c.next_element();
+                out.push(c);
+            }
+            out
+        }
+        fn check<C: DocumentCursor>(nodes: &[C], document: usize, what: &str) {
+            let ascending = {
+                let _scope = slot_memo::enter(document);
+                nodes.iter().map(describe).collect::<Vec<_>>()
+            };
+            let _scope = slot_memo::enter(document);
+            for i in (0..nodes.len()).rev() {
+                assert_eq!(describe(&nodes[i]), ascending[i], "{what}: node {i}");
+            }
+            // And again out of order: ends, then a zig-zag.
+            for i in (0..nodes.len() / 2).flat_map(|i| [i, nodes.len() - 1 - i]) {
+                assert_eq!(
+                    describe(&nodes[i]),
+                    ascending[i],
+                    "{what}: zig-zag node {i}"
+                );
+            }
+        }
+        let n = 400usize;
+        let scalars = format!(
+            "[{}]",
+            (0..n).map(|i| i.to_string()).collect::<Vec<_>>().join(",")
+        );
+        let json = JsonIndex::build(scalars.as_bytes());
+        let root = json.root(scalars.as_bytes());
+        check(
+            &chain(root.first_child()),
+            root.document_token(),
+            "scalar array",
+        );
+
+        let object = format!(
+            "{{{}}}",
+            (0..n)
+                .map(|i| format!("\"k{i}\":{{\"v\":{i}}}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let json = JsonIndex::build(object.as_bytes());
+        let root = json.root(object.as_bytes());
+        check(&chain(root.first_child()), root.document_token(), "object");
+
+        let sequence: String = (0..n)
+            .map(|i| {
+                if i % 2 == 0 {
+                    format!("- a:\n    b: {i}\n")
+                } else {
+                    format!("-\n  a:\n    b: {i}\n")
+                }
+            })
+            .collect();
+        let yaml = crate::yaml::YamlIndex::build(sequence.as_bytes()).unwrap();
+        let root = yaml.root(sequence.as_bytes());
+        let items = chain(root.first_child().and_then(|s| s.first_child()));
+        assert_eq!(items.len(), n);
+        check(&items, root.document_token(), "yaml sequence");
+
+        let mapping: String = (0..n).map(|i| format!("k{i}:\n  v: {i}\n")).collect();
+        let yaml = crate::yaml::YamlIndex::build(mapping.as_bytes()).unwrap();
+        let root = yaml.root(mapping.as_bytes());
+        let members = chain(root.first_child().and_then(|m| m.first_child()));
+        assert_eq!(members.len(), 2 * n);
+        check(&members, root.document_token(), "yaml mapping");
     }
 
     /// #3702: the memo keeps the parents a pipe is still reading. Least
