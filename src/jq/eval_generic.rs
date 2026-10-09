@@ -6182,16 +6182,16 @@ impl<V: DocumentValue> GenericResult<V> {
     /// yields `Error`, which `into_owned`/`collect_owned` would otherwise
     /// report as the same `None`/empty they give a jq error.
     ///
-    /// Only a result that was lazy is promoted -- a result that arrives as
-    /// `Error` keeps the answer it has always had, and so does a non-decode
-    /// error a lazy stage raises.
+    /// Only an `Error` that forcing created is promoted: a result that arrives
+    /// as `Error` keeps the answer it has always had (its caller was handed
+    /// the `Error` and can read it; it never sees the one made in here), and
+    /// so does a non-decode error a lazy stage raises.
     fn materialize_lazy_checked<S: EvalSemantics>(self) -> Result<Self, EvalError> {
-        let was_lazy = matches!(
-            self,
-            Self::LazyKeys { .. } | Self::LazyIndexRange(_) | Self::LazySeq(_)
-        );
+        // `materialize_lazy` leaves every non-lazy variant as it is, so an
+        // `Error` out of a result that was not one can only be forcing's.
+        let arrived_as_error = matches!(self, Self::Error(_));
         match self.materialize_lazy::<S>() {
-            Self::Error(e) if was_lazy && e.is_decode_failure() => Err(e),
+            Self::Error(e) if !arrived_as_error && e.is_decode_failure() => Err(e),
             other => Ok(other),
         }
     }
@@ -6202,7 +6202,7 @@ impl<V: DocumentValue> GenericResult<V> {
     /// `Error`, `Halt`, `Partial` -- unchanged); `Err` means a value *was*
     /// there but a scalar in it could not be decoded (#1247), which is a
     /// different answer and must not collapse into the same `None`. That
-    /// includes a lazy array, key list or object whose forcing hits one
+    /// includes a lazy array or object whose forcing hits one
     /// (#4044, #4165).
     pub fn into_owned<S: EvalSemantics>(self) -> Result<Option<OwnedValue>, EvalError> {
         // A lazy object's decode failure is the answer, not a missing value
@@ -46608,14 +46608,15 @@ mod tests {
     fn test_lazy_seq_into_owned_reports_a_decode_failure_4165() {
         fn run<R>(
             query: &str,
-            json: &str,
+            json: impl AsRef<[u8]>,
             f: impl FnOnce(GenericResult<crate::json::light::StandardJson<'_, Vec<u64>>>) -> R,
         ) -> R {
-            let index = JsonIndex::build(json.as_bytes());
+            let json = json.as_ref();
+            let index = JsonIndex::build(json);
             let expr = crate::jq::parse(query).unwrap();
             f(eval_with_cursor_using::<JqSemantics, _>(
                 &expr,
-                index.root(json.as_bytes()).first_child().unwrap(),
+                index.root(json).first_child().unwrap(),
             ))
         }
         // `[., 1]` keeps the element as a node beside a computed value.
@@ -46638,10 +46639,12 @@ mod tests {
             });
         }
         // Any other failure while forcing the array is still no single value.
-        run("[., 1] | map(. + {})", "[7]", |result| {
+        run("map(1/0)", "[[7]]", |result| {
+            assert!(matches!(result, GenericResult::LazySeq(_)));
             assert_eq!(result.into_owned::<JqSemantics>(), Ok(None));
         });
-        run("[., 1] | map(. + {})", "[7]", |result| {
+        run("map(1/0)", "[[7]]", |result| {
+            assert!(matches!(result, GenericResult::LazySeq(_)));
             assert_eq!(result.collect_owned::<JqSemantics>(), Ok(vec![]));
         });
     }

@@ -134093,8 +134093,17 @@ mod tests {
                     // A deferred array (`[., 1]`, `try ([., 1])`) fails when it is
                     // read, and `into_owned` reports that as the decode failure it
                     // is (#4165), as it does for a deferred object (#4044).
+                    // Only a deferred result counts: a value that arrives
+                    // decoded-or-not and fails in `into_owned` is a different
+                    // answer, which should still show as a moved row.
+                    let deferred = matches!(
+                        other,
+                        GenericResult::LazySeq(_)
+                            | GenericResult::LazyKeys { .. }
+                            | GenericResult::LazyObject(_)
+                    );
                     let owned = other.into_owned::<JqSemantics>();
-                    if matches!(&owned, Err(e) if e.is_decode_failure()) {
+                    if deferred && matches!(&owned, Err(e) if e.is_decode_failure()) {
                         return None;
                     }
                     let answer = owned
