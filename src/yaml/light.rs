@@ -7643,7 +7643,26 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         // about an interior blank line the block also had -- see
         // `head_comment_lines_with_blanks`'s own doc comment for the bug
         // this closes.
-        head_comment_lines_with_blanks(self.text, self.index.get_head_comments(self.bp_pos))
+        let ranges = self.index.get_head_comments(self.bp_pos);
+        let mut lines = head_comment_lines_with_blanks(self.text, ranges);
+        // #4093: the blank lines between the block and a node at column 0 are kept by
+        // yq (an indented node drops them, and so does a block that itself follows a
+        // blank line: yq then reads it as the previous node's foot), and are the block's
+        // last entries here.
+        if let (Some(&(first_start, _)), Some(&(_, last_end)), Some(pos)) =
+            (ranges.first(), ranges.last(), self.text_position())
+        {
+            let at_column_zero = pos == 0 || self.text.get(pos - 1) == Some(&b'\n');
+            if at_column_zero
+                && !lines.is_empty()
+                && !blank_line_before(self.text, first_start as usize)
+            {
+                for _ in 0..blank_lines_between(self.text, last_end as usize, pos) {
+                    lines.push(String::new());
+                }
+            }
+        }
+        lines
     }
 
     #[inline]
@@ -8784,6 +8803,36 @@ fn blank_line_between(text: &[u8], from: usize, to: usize) -> bool {
         }
     }
     false
+}
+
+/// How many wholly blank lines lie in `text[from..to)` (#4093): the line breaks there,
+/// less the one that ends the line `from` is on.
+fn blank_lines_between(text: &[u8], from: usize, to: usize) -> usize {
+    let mut breaks = 0usize;
+    let mut p = from;
+    let end = to.min(text.len());
+    while p < end {
+        if is_line_break(text[p]) {
+            breaks += 1;
+            p += line_break_len(text, p);
+        } else {
+            p += 1;
+        }
+    }
+    breaks.saturating_sub(1)
+}
+
+/// Whether the line just above the one `at` is on is blank (#4093).
+fn blank_line_before(text: &[u8], at: usize) -> bool {
+    let line_start = text[..at.min(text.len())]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |i| i + 1);
+    let Some(before) = text[..line_start].strip_suffix(b"\n") else {
+        return false;
+    };
+    let before = before.strip_suffix(b"\r").unwrap_or(before);
+    before.is_empty() && line_start > 1 || before.last() == Some(&b'\n')
 }
 
 /// Build a node's standalone head comment lines as owned strings, inserting
