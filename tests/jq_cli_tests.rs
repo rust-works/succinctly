@@ -60463,35 +60463,21 @@ fn test_foreach_extract_wellformed_shapes_unaffected_by_2860() -> Result<()> {
     Ok(())
 }
 
-/// #2860 (review, known residual): `cannot_move_register`'s gate is
-/// *syntactic* -- it requires every branch of an `if`/`try` to be
-/// navigation-free, not only the one actually taken. Gating `identical()`
-/// on it (this issue's own fix) therefore costs a refusal whenever a
-/// navigating branch sits *unreached* alongside a safe one, even though the
-/// register genuinely never moved on the path actually executed: jq
-/// accepts `path(. as $x | foreach (1,2) as $i (0; (if false then .a else
-/// $x end); .))` (`[]` twice), and so does succinctly's own pre-#2860
-/// `identical()` (which had no gate to consult `expr`'s shape at all) --
-/// but post-#2860, the untaken `.a` arm alone is enough to disable
-/// `identical()` here, so this now refuses. Same shape #2046's own
-/// "Scope limit, deliberately not closed" already accepts for a `$var`
-/// reference nested *directly* inside `if`/`try` with no register threaded
-/// at all (`docs/compliance/jq/limitations.md`); this is that scope limit
-/// reasserting itself through `identical()`'s new gate rather than a fresh
-/// defect. Refuse-only, the established safe direction throughout this
-/// subsystem's history -- a write through the identical filter fails
-/// rather than corrupting anything (jq's own `99`; succinctly raises).
-/// Pinned as a known residual rather than silently left uncovered.
+/// #2860 (review) pinned this as a known residual refusal: `cannot_move_register`'s gate is
+/// *syntactic* -- it requires every branch of an `if`/`try` to be navigation-free, not only the
+/// one actually taken -- so an untaken navigating `.a` arm beside a safe `$x` arm disabled
+/// `identical()` and `path(. as $x | foreach (1,2) as $i (0; (if false then .a else $x end);
+/// .))` refused where jq answers `[]` twice. #3914 closed it by another route: the `if` arm of
+/// the resolver now states the register the taken branch starts from, so the `$x` branch is read
+/// as what it is. Captured from jq 1.7.1; the write form is not affected.
 #[test]
-fn test_foreach_extract_untaken_branch_navigation_is_a_known_residual_2860() -> Result<()> {
+fn test_foreach_extract_untaken_branch_navigation_answers_as_jq_2860_3914() -> Result<()> {
     let filter = "path(. as $x | foreach (1,2) as $i (0; (if false then .a else $x end); .))";
     let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1}}"#))?;
-    assert_eq!(stdout, "", "known residual: stderr: {stderr:?}");
-    assert!(
-        stderr.contains(r#"Invalid path expression with result {"a":{"b":1}}"#),
-        "stderr: {stderr:?}"
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("[]\n[]\n", "", 0)
     );
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     Ok(())
 }
 

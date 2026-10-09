@@ -1746,7 +1746,11 @@ is the revert that established what the other one costs.
    from the fold's accumulator, not from a `resolve()` call over one expression) keeps
    `identical()` unconditionally available, unaffected by this gate.
 
-   **Known residual of #2860's own fix, refuse-only**: `cannot_move_register` is a *syntactic*
+   **Known residual of #2860's own fix, refuse-only** (the read and write forms for an `if` whose untaken arm navigates
+   answers as jq since [#3914](https://github.com/rust-works/succinctly/issues/3914) -- the `if` arm states the
+   register its taken branch starts from -- pinned by
+   `test_foreach_extract_untaken_branch_navigation_answers_as_jq_2860_3914`; the rest of this paragraph is the
+   general rule): `cannot_move_register` is a *syntactic*
    allowlist — for `if`/`try` it requires every branch to be navigation-free, not only the one
    actually taken (deliberately conservative for its two pre-existing callers, `resolve_seq_sink`'s
    own carrying and `advance`'s above, where a wrong `false` only ever costs a refusal there
