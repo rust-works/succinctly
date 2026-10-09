@@ -21254,7 +21254,7 @@ fn tonumber_from_str_yq(s: &str) -> Result<OwnedValue, EvalError> {
 /// decimal otherwise. `i64::from_str_radix`/`str::parse::<i64>` both accept
 /// a sign *after* where the prefix (if any) was stripped, matching Go's
 /// `strconv.ParseInt`.
-fn yq_parse_int64(s: &str) -> Option<i64> {
+pub(crate) fn yq_parse_int64(s: &str) -> Option<i64> {
     if s.is_empty() {
         return None;
     }
@@ -23077,6 +23077,14 @@ pub(crate) fn getpath_walk_owned_segments<'a, W: Clone + AsRef<[u64]>, S: EvalSe
             }
             (OwnedValue::Object(obj), OwnedValue::String(key)) => {
                 current = Cow::Owned(obj.get(key.as_str()).cloned().unwrap_or(OwnedValue::Null));
+            }
+            // #2801: `path` reports an integer-spelled mapping key as an integer in yq mode,
+            // so `getpath` of it reads the member by its text.
+            (OwnedValue::Object(obj), _)
+                if S::TAG == EvalTag::Yq && yq_integer_component_text(segment).is_some() =>
+            {
+                let text = yq_integer_component_text(segment).unwrap_or_default();
+                current = Cow::Owned(obj.get(text.as_str()).cloned().unwrap_or(OwnedValue::Null));
             }
             (
                 OwnedValue::Array(arr),
@@ -66053,6 +66061,17 @@ fn extend_array_with_nulls_for_delete(
     pad_with_nulls(arr, target_len - 1)
 }
 
+/// The text an integer path component names a mapping member by in yq mode (#2801): `path`
+/// reports an integer-spelled key as an integer, and a literal `[1]` in a filter is a
+/// `NumberLiteral`, so both spellings of a whole number read as their decimal digits.
+pub(crate) fn yq_integer_component_text(component: &OwnedValue) -> Option<String> {
+    match component {
+        OwnedValue::Int(n) => Some(n.to_string()),
+        OwnedValue::NumberLiteral(..) => component.as_i64().map(|n| n.to_string()),
+        _ => None,
+    }
+}
+
 /// Helper to set a value at a path
 ///
 /// Follows jq: `null` is the only value auto-vivified into whatever container
@@ -66069,6 +66088,17 @@ fn set_value_at_path<S: EvalSemantics>(
         return Ok(new_val);
     };
     let rest = &path[1..];
+
+    // #2801: `path` reports an integer-spelled mapping key as an integer, so in yq mode an
+    // integer component on a mapping names the member by its text, as `.[1] = v` does.
+    if let (EvalTag::Yq, Some(text), OwnedValue::Object(_)) =
+        (S::TAG, yq_integer_component_text(key), &value)
+    {
+        let mut text_path = vec_with_capacity(path.len());
+        text_path.push(OwnedValue::String(text.into()));
+        text_path.extend_from_slice(rest);
+        return set_value_at_path::<S>(value, &text_path, new_val);
+    }
 
     match key {
         OwnedValue::String(name) => match value {

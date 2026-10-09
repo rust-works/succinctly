@@ -22142,7 +22142,11 @@ fn collect_paths_generic<S: EvalSemantics, V: DocumentValue>(
             let Some(key) = key_display_string(&field.key) else {
                 return Err(fields.malformed_member_error());
             };
-            current_path.push(OwnedValue::String(key.into_owned().into()));
+            current_path.push(if S::TAG == EvalTag::Yq {
+                yq_path_component(key, &field.key_cursor)
+            } else {
+                OwnedValue::String(key.into_owned().into())
+            });
             if !leaves_only {
                 paths.push(OwnedValue::Array(current_path.clone().into()));
             }
@@ -22850,6 +22854,16 @@ trait StepTrail<V: DocumentValue>: Clone {
     fn extend_with(&self, component: impl FnOnce() -> OwnedValue, from: &PathNode<V>) -> Self {
         self.extend_from(component(), from)
     }
+
+    /// [`extend_with`](Self::extend_with) for a component naming a mapping member (#2801).
+    #[inline]
+    fn extend_member_with(
+        &self,
+        component: impl FnOnce() -> OwnedValue,
+        from: &PathNode<V>,
+    ) -> Self {
+        self.extend_with(component, from)
+    }
 }
 
 impl<V: DocumentValue> StepTrail<V> for Rc<PathTrail> {
@@ -22919,6 +22933,10 @@ struct PathContextStep<V: DocumentValue> {
     component: OwnedValue,
     /// The node at `parent`'s position, which `component` was taken from.
     from: PathNode<V>,
+    /// Whether `component` names a mapping member, as opposed to an array index (#2801).
+    /// An integer-spelled key is an integer component in yq, so `key` needs this to tell
+    /// `1: x` from the element at index 1 without asking the parent what it is.
+    member: bool,
 }
 
 struct PathContextLink<V: DocumentValue> {
@@ -23007,27 +23025,41 @@ impl<V: DocumentValue> PathContextTrail<V> {
 
     /// A trail from the flat shape [`cursor_path_and_ancestors`] climbs:
     /// `ancestors[i]` is the node `path[i]` was taken from.
+    #[cfg(test)]
     fn from_climb(path: Vec<OwnedValue>, ancestors: Vec<V::Cursor>) -> Self {
+        let members = vec![false; path.len()];
+        Self::from_climb_members(path, ancestors, &members)
+    }
+
+    /// [`from_climb`](Self::from_climb) with which levels are mapping members (#2801).
+    fn from_climb_members(
+        path: Vec<OwnedValue>,
+        ancestors: Vec<V::Cursor>,
+        members: &[bool],
+    ) -> Self {
         debug_assert_eq!(path.len(), ancestors.len());
+        debug_assert_eq!(path.len(), members.len());
         // A shared seed needs a backing Vec and an Rc. At one or two levels
         // that cannot save allocations over one link per level, so keep the
         // old representation for shallow nested roots. `seeded_link`, not
         // `extend_from`: these links *are* the seed (#3020), unlike a real
         // navigation step reached through the trait method during evaluation.
         if path.len() < PATH_CONTEXT_SEED_MIN_LEVELS {
-            return path
-                .into_iter()
-                .zip(ancestors)
-                .fold(Self::Root, |trail, (component, from)| {
-                    trail.seeded_link(component, &PathNode::At(from))
-                });
+            return path.into_iter().zip(ancestors).zip(members).fold(
+                Self::Root,
+                |trail, ((component, from), member)| {
+                    trail.seeded_link(component, &PathNode::At(from), *member)
+                },
+            );
         }
         let steps = path
             .into_iter()
             .zip(ancestors)
-            .map(|(component, from)| PathContextStep {
+            .zip(members)
+            .map(|((component, from), member)| PathContextStep {
                 component,
                 from: PathNode::At(from),
+                member: *member,
             })
             .collect::<Vec<_>>();
         let visible_len = steps.len();
@@ -23042,12 +23074,13 @@ impl<V: DocumentValue> PathContextTrail<V> {
     /// [`extend_from`](StepTrail::extend_from), which differ only in what
     /// they pass here (#3020 review: keeps the two `PathContextLink`
     /// constructions from drifting out of sync on a future field).
-    fn link(&self, component: OwnedValue, from: &PathNode<V>, seed: usize) -> Self {
+    fn link(&self, component: OwnedValue, from: &PathNode<V>, seed: usize, member: bool) -> Self {
         Self::Link(Rc::new(PathContextLink {
             parent: self.clone(),
             step: PathContextStep {
                 component,
                 from: from.clone(),
+                member,
             },
             depth: self.depth() + 1,
             seed,
@@ -23057,8 +23090,8 @@ impl<V: DocumentValue> PathContextTrail<V> {
     /// One link of the initial seed itself -- see `PathContextLink`'s own
     /// `seed` field doc comment for why this passes a different `seed` than
     /// [`extend_from`](StepTrail::extend_from) does.
-    fn seeded_link(&self, component: OwnedValue, from: &PathNode<V>) -> Self {
-        self.link(component, from, self.depth() + 1)
+    fn seeded_link(&self, component: OwnedValue, from: &PathNode<V>, member: bool) -> Self {
+        self.link(component, from, self.depth() + 1, member)
     }
 
     /// `depth` at the point this trail was seeded from a nested input's real
@@ -23153,7 +23186,15 @@ impl<V: DocumentValue> StepTrail<V> for PathContextTrail<V> {
     }
 
     fn extend_from(&self, component: OwnedValue, from: &PathNode<V>) -> Self {
-        self.link(component, from, self.seed_depth())
+        self.link(component, from, self.seed_depth(), false)
+    }
+
+    fn extend_member_with(
+        &self,
+        component: impl FnOnce() -> OwnedValue,
+        from: &PathNode<V>,
+    ) -> Self {
+        self.link(component(), from, self.seed_depth(), true)
     }
 }
 
@@ -23479,7 +23520,16 @@ fn path_iterate_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>
                         emit(
                             // #3023: the owned key is only built for a trail
                             // that keeps it.
-                            path.extend_with(|| OwnedValue::String(key.into_owned().into()), node),
+                            path.extend_member_with(
+                                || {
+                                    if S::TAG == EvalTag::Yq {
+                                        yq_path_component(key, &field.key_cursor)
+                                    } else {
+                                        OwnedValue::String(key.into_owned().into())
+                                    }
+                                },
+                                node,
+                            ),
                             PathNode::At(field.value_cursor),
                         ),
                         Demand::Stop
@@ -24468,7 +24518,7 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             let anchor =
                 live(&pos.node).or_else(|| pos.trail.links().find_map(|link| live(&link.from)));
             match anchor.and_then(|a| bind_origin_cursor(&var.node, &a)) {
-                Some(c) => out.push(path_context_root::<V>(c)?),
+                Some(c) => out.push(path_context_root_for::<S, V>(c)?),
                 None => out.push(PathContextPos {
                     node: PathNode::Owned(Rc::new(var.value.clone())),
                     trail: PathContextTrail::root(),
@@ -25148,6 +25198,21 @@ fn getpath_walk_cursor<S: EvalSemantics, V: DocumentValue>(
         // possibly use just to throw its result away paid for that walk
         // for nothing (up to 3x per segment on an aliased node, once here
         // and again in whichever accessor did apply).
+        // #2801: in yq mode `path` reports an integer-spelled mapping key as an integer, so an
+        // integer segment over a mapping names the member by its text.
+        let text_segment;
+        let integer_text = if S::TAG == EvalTag::Yq {
+            crate::jq::eval::yq_integer_component_text(segment)
+        } else {
+            None
+        };
+        let segment = match integer_text {
+            Some(text) if v.as_object().is_some() => {
+                text_segment = OwnedValue::String(text.into());
+                &text_segment
+            }
+            _ => segment,
+        };
         match segment {
             OwnedValue::String(key) => {
                 if let Some(fields) = v.as_object() {
@@ -26043,7 +26108,7 @@ fn path_component_step_expr(component: &OwnedValue) -> Option<Expr> {
 /// hop that keeps `[.[] | key | line]` linear; a mismatch there, an index
 /// component and an absent or owned node keep the trail's spelling, as
 /// before.
-fn path_context_emitting_value<V: DocumentValue>(
+fn path_context_emitting_value<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     pos: &PathContextPos<V>,
 ) -> Result<Option<GenericItem<V>>, EvalError> {
@@ -26054,6 +26119,34 @@ fn path_context_emitting_value<V: DocumentValue>(
         }
         Expr::Builtin(Builtin::Key) if pos.at_key => Ok(None),
         Expr::Builtin(Builtin::Key) => match pos.trail.last_component() {
+            // #2801: in yq mode an integer-spelled mapping key (`-3:` included) is an integer
+            // component, so an integer here is either an array index or such a key. The
+            // position's parent says which, and a key keeps the node route the string arm
+            // below takes: the key node is the value's previous sibling.
+            Some(OwnedValue::Int(i)) if S::TAG == EvalTag::Yq => match &pos.node {
+                PathNode::At(c) => {
+                    let in_mapping = pos.trail.links().next().is_some_and(|step| step.member);
+                    let member_key = if in_mapping {
+                        c.prev_sibling().and_then(|kc| {
+                            let v = kc.value();
+                            let display = key_display_string(&v)?.into_owned();
+                            Some(if key_node_spells(&kc, &v, &display) {
+                                GenericItem::OneCursorValue(kc, v)
+                            } else {
+                                GenericItem::Owned(OwnedValue::String(display.into()))
+                            })
+                        })
+                    } else {
+                        None
+                    };
+                    match member_key {
+                        Some(item) => Ok(Some(item)),
+                        None if *i < 0 => Ok(cursor_key(c)?.and_then(owned)),
+                        None => Ok(owned(OwnedValue::Int(*i))),
+                    }
+                }
+                PathNode::Absent | PathNode::Owned(_) => Ok(owned(OwnedValue::Int(*i))),
+            },
             Some(OwnedValue::Int(i)) if *i < 0 => match &pos.node {
                 PathNode::At(c) => Ok(cursor_key(c)?.and_then(owned)),
                 _ => Ok(owned(OwnedValue::Int(*i))),
@@ -26289,7 +26382,7 @@ fn path_context_walk_generic<S: EvalSemantics, V: DocumentValue>(
         // sibling hop, still constant) so the metadata builtins after it
         // answer from the key -- see `path_context_emitting_value`.
         Expr::Builtin(Builtin::PathNoArg | Builtin::Key) => {
-            match path_context_emitting_value(expr, pos) {
+            match path_context_emitting_value::<S, V>(expr, pos) {
                 Ok(Some(item)) => Ok(sink.push(item)),
                 Ok(None) => Ok(Demand::Continue),
                 // `cursor_key`'s malformed-member-key error path, pre-existing
@@ -27334,6 +27427,35 @@ fn key_spelling_may_retype(key: &str) -> bool {
     )
 }
 
+/// The path component yq reports for a mapping key (#2801): an integer when the key is
+/// not a string node and its text reads as one, else the text.
+///
+/// yq's `GetPath` renders a key through `CandidateNode.getParsedKey`: a `!!str` key is a
+/// string, and any other key is `parseInt64(text)` when that parses and the raw text when it
+/// does not. So `1:`, `01:`, `0x1f:`, `0o17:`, `+4:`, `1_0:` and `!!float 1:` are all integer
+/// components (`[1]`, `[1]`, `[31]`, `[15]`, `[4]`, `[10]`, `[1]`), while `true:`, `~:`,
+/// `1.5:`, `1.0:`, `0b11:` and an `i64`-overflowing digit string stay strings, and a quoted or
+/// `!!str`-tagged key is always a string. The component is the *parsed* value, not the
+/// spelling, which is what yq reports.
+///
+/// "Not a string node" is "a plain scalar without a `!!str` tag": a quoted key and every key of
+/// a JSON-sourced document have no plain source text, so they keep the string route without
+/// asking the grammar. [`key_spelling_may_retype`]'s first byte would admit more than this
+/// needs, so the prefilter is narrower: only a digit or sign can begin a `parseInt64` number.
+fn yq_path_component<C: DocumentCursor>(display: Cow<'_, str>, key_cursor: &C) -> OwnedValue {
+    if matches!(display.as_bytes().first(), Some(b'0'..=b'9' | b'-' | b'+'))
+        && key_cursor.explicit_tag() != Some("!!str")
+        && key_cursor
+            .plain_scalar_source(&key_cursor.value())
+            .is_some()
+    {
+        if let Some(n) = crate::jq::eval::yq_parse_int64(&display) {
+            return OwnedValue::Int(n);
+        }
+    }
+    OwnedValue::String(display.into_owned().into())
+}
+
 /// Whether the key node `kc` is an untagged scalar whose raw spelling is
 /// exactly `expected` -- a plain string, or a typed key whose text
 /// [`to_owned_at_depth`]'s ladder will retype downstream (#2785).
@@ -27367,17 +27489,39 @@ fn key_node_spells<C: DocumentCursor>(kc: &C, v: &C::Value, expected: &str) -> b
 fn cursor_path_and_ancestors<C: DocumentCursor>(
     c: &C,
 ) -> Result<(Vec<OwnedValue>, Vec<C>, bool), EvalError> {
+    cursor_path_and_ancestors_for::<JqSemantics, C>(c)
+}
+
+/// [`cursor_path_and_ancestors`] under the semantics `S`: in yq mode a mapping key whose text
+/// reads as an integer is an integer component (#2801, [`yq_path_component`]).
+fn cursor_path_and_ancestors_for<S: EvalSemantics, C: DocumentCursor>(
+    c: &C,
+) -> Result<(Vec<OwnedValue>, Vec<C>, bool), EvalError> {
+    let (path, ancestors, at_key, _) = cursor_path_ancestors_members_for::<S, C>(c)?;
+    Ok((path, ancestors, at_key))
+}
+
+/// [`cursor_path_and_ancestors_for`] plus, per level, whether the component names a mapping member
+/// (a value or key slot) rather than an array index (#2801).
+#[allow(clippy::type_complexity)] // the four parallel climb results, named at the one caller
+fn cursor_path_ancestors_members_for<S: EvalSemantics, C: DocumentCursor>(
+    c: &C,
+) -> Result<(Vec<OwnedValue>, Vec<C>, bool, Vec<bool>), EvalError> {
+    let retype = S::TAG == EvalTag::Yq;
+    let mut members = Vec::new();
     let mut path = Vec::new();
     let mut ancestors = Vec::new();
     let mut at_key = false;
     let mut cur = *c;
     let mut first = true;
     while let Some((parent, slot)) = cursor_parent_and_slot(&cur)? {
+        members.push(!matches!(slot, CursorSlot::Element(_)));
         let key = match slot {
-            CursorSlot::Value { key, .. } => key,
+            CursorSlot::Value { key, key_cursor } => retype_member_key(retype, key, &key_cursor),
+            // The climb stands on the key node itself, so `cur` is its cursor.
             CursorSlot::Key(key) => {
                 at_key |= first;
-                key
+                retype_member_key(retype, key, &cur)
             }
             CursorSlot::Element(index) => OwnedValue::Int(index),
         };
@@ -27388,7 +27532,20 @@ fn cursor_path_and_ancestors<C: DocumentCursor>(
     }
     path.reverse();
     ancestors.reverse();
-    Ok((path, ancestors, at_key))
+    members.reverse();
+    Ok((path, ancestors, at_key, members))
+}
+
+/// `key` as the path component its member's key node `key_cursor` reports, when `retype` (yq).
+fn retype_member_key<C: DocumentCursor>(
+    retype: bool,
+    key: OwnedValue,
+    key_cursor: &C,
+) -> OwnedValue {
+    match key {
+        OwnedValue::String(s) if retype => yq_path_component(Cow::Borrowed(&**s), key_cursor),
+        other => other,
+    }
 }
 
 /// `n` levels up from `c`, or `None` at or above the document root.
@@ -27975,19 +28132,28 @@ fn path_context_single_native(expr: &Expr) -> bool {
 /// #2692 is the only caller that does: it materializes a comparison key,
 /// while `select` merely tests truthiness and so joined this side of the
 /// line.
+#[cfg(test)]
 fn path_context_root<V: DocumentValue>(root: V::Cursor) -> Result<PathContextPos<V>, Control> {
+    path_context_root_for::<JqSemantics, V>(root)
+}
+
+/// [`path_context_root`] under the semantics `S` (#2801).
+fn path_context_root_for<S: EvalSemantics, V: DocumentValue>(
+    root: V::Cursor,
+) -> Result<PathContextPos<V>, Control> {
     // The walk's input is not always the document root: a nested pipe
     // (`first(.a | parent | parent)`) is walked from the node the outer
     // stage handed it (#2416 phase 3). `path`/`parent` are absolute, so the
     // position starts from the input's real path and ancestors, climbed
     // from the cursor itself.
-    let (path, ancestors, at_key) = match cursor_path_and_ancestors(&root) {
+    let (path, ancestors, at_key, members) = match cursor_path_ancestors_members_for::<S, _>(&root)
+    {
         Ok(found) => found,
         Err(e) => return Err(Control::Error(e)),
     };
     Ok(PathContextPos {
         node: PathNode::At(root),
-        trail: PathContextTrail::from_climb(path, ancestors),
+        trail: PathContextTrail::from_climb_members(path, ancestors, &members),
         at_key,
     })
 }
@@ -28009,7 +28175,7 @@ fn try_path_context_walk_sink<S: EvalSemantics, V: DocumentValue>(
     sink: &mut dyn Sink<V>,
 ) -> Option<Flow> {
     let (walked, rest) = path_context_walk_split(exprs)?;
-    let root_pos = match path_context_root::<V>(root) {
+    let root_pos = match path_context_root_for::<S, V>(root) {
         Ok(pos) => pos,
         Err(control) => return Some(Flow::Escaped(control)),
     };
@@ -28066,7 +28232,7 @@ fn try_path_context_cursor_walk<S: EvalSemantics, V: DocumentValue>(
         })?;
         return Some(collected_items_result::<_, S>(items, flow));
     }
-    let root_pos = match path_context_root::<V>(root) {
+    let root_pos = match path_context_root_for::<S, V>(root) {
         Ok(pos) => pos,
         Err(control) => {
             return Some(match control {
@@ -29340,7 +29506,7 @@ fn try_path_context_absent_sink<S: EvalSemantics, V: DocumentValue>(
     sink: &mut dyn Sink<V>,
 ) -> Option<Flow> {
     let (head, rest, route) = path_context_absent_split(exprs)?;
-    let root_pos = match path_context_root::<V>(root) {
+    let root_pos = match path_context_root_for::<S, V>(root) {
         Ok(pos) => pos,
         Err(control) => return Some(Flow::Escaped(control)),
     };
@@ -31316,7 +31482,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             Err(e) => GenericResult::Error(e),
         },
         Builtin::PathNoArg if cursor.is_some() => {
-            match cursor_path_and_ancestors(&cursor.expect("guarded")) {
+            match cursor_path_and_ancestors_for::<S, _>(&cursor.expect("guarded")) {
                 Ok((path, _, _)) => GenericResult::Owned(OwnedValue::array_from(path)),
                 Err(e) => GenericResult::Error(e),
             }
@@ -50501,7 +50667,8 @@ mod tests {
             ]
         );
         assert!(matches!(
-            path_context_emitting_value(&Expr::Builtin(Builtin::Key), &seeded).unwrap(),
+            path_context_emitting_value::<JqSemantics, _>(&Expr::Builtin(Builtin::Key), &seeded)
+                .unwrap(),
             Some(GenericItem::Owned(OwnedValue::Int(1)))
         ));
 
@@ -50560,11 +50727,12 @@ mod tests {
             path_context_root::<crate::json::StandardJson<'_, Vec<u64>>>(key_cursor).unwrap();
         assert!(key_pos.at_key);
         assert_eq!(key_pos.trail.to_vec(), [OwnedValue::String("a".into())]);
-        assert!(
-            path_context_emitting_value(&Expr::Builtin(Builtin::Key), &key_pos)
-                .unwrap()
-                .is_none()
-        );
+        assert!(path_context_emitting_value::<JqSemantics, _>(
+            &Expr::Builtin(Builtin::Key),
+            &key_pos
+        )
+        .unwrap()
+        .is_none());
         assert!(path_context_hop(&key_pos, 0).unwrap().at_key);
         let parent = path_context_hop(&key_pos, 1).unwrap();
         assert!(!parent.at_key);
