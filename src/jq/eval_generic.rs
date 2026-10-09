@@ -12215,6 +12215,15 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             eval_index_expr::<S, V>(target, key, value, optional, cursor)
         }
 
+        // #4163: jq defines `nth(n)` as `n as $n | .[$n]`, and the owned evaluator already
+        // answers it through `index_one`, the `.[$k]` operator itself. Without this arm the
+        // call reached the bridge, which serialises and re-indexes the whole input per
+        // evaluation -- 113 s against `.[$i]`'s 0.8 s for 16,000 reads of a 16,000-element array.
+        // By reference, as the resolver's own `Builtin::Nth` arm does: no rebuilt `IndexExpr`.
+        Expr::Builtin(Builtin::Nth(n)) => {
+            eval_index_expr::<S, V>(&Expr::Identity, n, value, optional, cursor)
+        }
+
         // Handled natively for the same two reasons as `Expr::IndexExpr`
         // above: the fallback re-enters `full_eval`, which restarts with
         // `optional = false` and so loses the `?` in `.[.a:.b]?`; and it
@@ -24196,6 +24205,8 @@ fn path_context_is_navigational_at(expr: &Expr, unfolded: u8) -> bool {
             (nav(target) || path_context_component_walkable(target))
                 && path_context_component_walkable(key)
         }
+        // #4163: jq's `nth(n)` is `.[n]`, stepped by the same computed-index arm.
+        Expr::Builtin(Builtin::Nth(n)) => path_context_component_walkable(n),
         Expr::Paren(inner) => nav(inner),
         Expr::Pipe(exprs) => exprs.iter().all(nav),
         Expr::Comma(exprs) => exprs.iter().all(nav),
@@ -24637,6 +24648,10 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
         }
         Expr::IndexExpr { target, key } => {
             path_context_step_computed_index::<S, V>(target, key, false, pos, out)
+        }
+        // #4163: jq's `nth(n)` is `n as $n | .[$n]`; the target is the position itself.
+        Expr::Builtin(Builtin::Nth(n)) => {
+            path_context_step_computed_index::<S, V>(&Expr::Identity, n, false, pos, out)
         }
         // spine 2416 (walk residue): `E[S:T]?`, ahead of the generic
         // `Expr::Optional` arm for the same reason as `E[K]?` above.
@@ -51084,6 +51099,10 @@ mod tests {
         for filter in [
             "[range(length-1;-1;-1) as $i | getpath([$i]) | tostring | [key]] | length",
             "[range(length-1;-1;-1) as $i | getpath([$i]) | tostring | path] | length",
+            // #4163: `nth(n)` is `.[n]`; it used to leave the walk for the owned identity route,
+            // which materializes the whole array per read.
+            "[range(length-1;-1;-1) as $i | nth($i) | tostring | [key]] | length",
+            "[range(length-1;-1;-1) as $i | nth($i) | tostring | path] | length",
         ] {
             let (scanned_before, _) = slot_memo::work();
             let missed_before = slot_memo::missed();

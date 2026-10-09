@@ -122202,3 +122202,54 @@ fn test_path_f_stage_leaves_register_4118() -> Result<()> {
         ),
     ])
 }
+
+/// #4163: `nth(n)` is jq's `.[n]` (`def nth($n): .[$n];`), so a position read through it names the
+/// same node, key and path as the bracket, including a negative index -- where `nth(-1) | key` used
+/// to answer `-1` and `.[-1] | key` answers the resolved index. Rows 1-3 are jq 1.7.1's own
+/// values; `key` is a succinctly builtin, so those rows pin the equality with `.[n]`.
+#[test]
+fn test_nth_reads_the_same_position_as_the_bracket_4163() -> Result<()> {
+    for doc in [
+        "[10,20,30]",
+        r#"[{"a":1},{"a":2},{"a":3}]"#,
+        r#"{"a":[10,20,30],"b":2}"#,
+    ] {
+        for (nth, bracket) in [
+            ("nth(1)", ".[1]"),
+            ("nth(-1)", ".[-1]"),
+            ("nth(5)", ".[5]"),
+            ("nth(1.5)", ".[1.5]"),
+            ("nth(0,2)", ".[0,2]"),
+            (r#"nth("a")"#, r#".["a"]"#),
+            ("nth(null)", ".[null]"),
+        ] {
+            for tail in [
+                "",
+                " | key",
+                " | tostring | key",
+                " | path",
+                " | tostring | path",
+                " | [key]",
+                " | .. | key",
+            ] {
+                let by_nth = run_jq_stdin(&format!("[{nth}{tail}]"), doc, &["-c"])?;
+                let by_bracket = run_jq_stdin(&format!("[{bracket}{tail}]"), doc, &["-c"])?;
+                assert_eq!(by_nth, by_bracket, "{doc}: {nth}{tail}");
+            }
+            let by_nth = run_jq_stdin(&format!("[path({nth})]"), doc, &["-c"])?;
+            let by_bracket = run_jq_stdin(&format!("[path({bracket})]"), doc, &["-c"])?;
+            assert_eq!(by_nth, by_bracket, "{doc}: path({nth})");
+        }
+    }
+    // The values themselves, from jq 1.7.1.
+    assert_eq!(
+        run_jq_stdin("[nth(-1), nth(1), nth(0,2)]", "[10,20,30]", &["-c"])?,
+        ("[30,20,10,30]\n".to_string(), 0)
+    );
+    // And the position: the last element's key is its resolved index.
+    assert_eq!(
+        run_jq_stdin("nth(-1) | key", "[10,20,30]", &["-c"])?,
+        ("2\n".to_string(), 0)
+    );
+    Ok(())
+}
