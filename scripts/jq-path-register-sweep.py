@@ -922,6 +922,37 @@ OPERANDS = [
     "(foreach (1,2) as $i (.a; try ..; .))",
     "(foreach .[]? as $i (1; try ..; .))",
     "(foreach (1,2) as $i (1; try ..; .) | .a?)",
+    # (#3899) a destructuring `?//` bind whose body mixes a navigating and a
+    # by-value part. A failed destructure is restored by the fork, so the bare
+    # `$var` alternative that runs leaves jq's register where the stage entered
+    # and each branch of the body states it itself; a destructure that succeeds
+    # moves it. The by-value `true`/`false`/`null` body is #3859's.
+    "(. as [$q] ?// $z | (.a?, true))",
+    "(. as [$q] ?// $z | (true, .a?))",
+    "(. as [$q] ?// $z | (.a?, false))",
+    "(. as [$q] ?// $z | (.a?, null))",
+    "(. as [$q] ?// $z | (.a?, 1))",
+    "(. as [$q] ?// $z | (.[0]?, true))",
+    "(. as [$q] ?// $z | (., true))",
+    "(. as [$q] ?// $z | (.a, true))",
+    "(. as {a:$q} ?// $z | (.a?, true))",
+    "(. as {a:$q} ?// $z | (.a, null))",
+    "(. as [$q] ?// $z | (.a? // true))",
+    "(. as [$q] ?// $z | (.a // true))",
+    "(. as [$q] ?// $z | if .a? then .a else true end)",
+    "(. as [$q] ?// $z | if true then true else .a end)",
+    "(. as [$q] ?// $z | try (.a, true) catch 1)",
+    "(. as [$q] ?// $z | try (.a?, true) catch .a)",
+    "(. as [$q] ?// $z | ((.a?, true), false))",
+    "(. as [$q] ?// $z | (.a? | true))",
+    "(. as [$q] ?// $z | ((.a?, true) | .b?))",
+    "(. as [$q] ?// {a:$z} ?// $y | (.a?, true))",
+    "(. as [$q] ?// $z | (. as [$r] ?// $w | (.a?, true)))",
+    "(. as [$q] ?// $z | (.a?, $z))",
+    "(. as [$q] ?// $z | (.a?, $q))",
+    "(. as [$q] ?// $z | (empty, true))",
+    "(. as [$q] ?// $z | (.[]?, true))",
+    "(. as [$q] ?// $z | ({a:1}, true))",
 ]
 
 # The other side of a two-operand shape. Chosen so that, against the inputs

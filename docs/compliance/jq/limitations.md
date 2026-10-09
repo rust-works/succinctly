@@ -11158,11 +11158,15 @@ with result false` (the identity element), not `result true`. `path`, `del`, `|=
 and a `try`/`?` around them all name the last answer;
 `test_any_all_path_condition_retry_names_last_answer_3827` pins the matrix.
 
-The resolver drains the generator before it delivers the answers, so a retried
-alternative's side effects (`stderr`, `debug`) run before the first answer reaches the
-consumer: `path(.x | any(.; ...)) | ("H"|halt_error(3))` halts at the first answer in
-jq without running the retry, and here after it. The halt itself, its exit code and
-the output are the same (`test_any_all_path_answer_halt_is_not_retried_3827`); the ordering is tracked in #3899.
+The resolver hands each answer to the consumer from inside the drain (#3899), so a
+retried alternative's side effects (`stderr`, `debug`, `halt`) run after the answer,
+as jq's lazy `first(...)` runs them: `path(.x | any(.; ...)) | ("H"|halt_error(3))`
+halts at the first answer without running the retry, and a `stderr` trace in the retry
+comes after the consumer's own (`test_any_all_path_answer_precedes_the_retrys_side_effects_3899`,
+`test_any_all_path_answer_halt_is_not_retried_3827`). `isempty(g)` has no such retry
+to reorder, because jq's `first((g | false), true)` is not modelled past `g`'s first
+output here at all (`path(.x | isempty(. as $q ?// $z | if $q then true else empty end))`
+on `{"x":true}` is `["x"]` in jq, a refusal here).
 
 The identity element `any`/`all` answer once `gen` is exhausted after a swallowed answer
 is compared with the register where the call entered, since backtracking through every fork
@@ -11179,8 +11183,10 @@ reads that statement per result for a destructuring bind whose body cannot move 
 (`stage_states_register_per_result`, #3859), while a destructure that *succeeds* moves the
 register and keeps answering the moved position
 (`test_destructuring_alt_bind_with_a_failed_first_alternative_states_its_register_3859`).
-A body that mixes a navigating and a by-value part (`(.a?, true)`) is not admitted and still
-refuses where jq answers (#3899). An answer that is a valid path is printed before the raise of the
+A compound body (`,`, `//`, `if`, `try`) states it per branch, trackable entries only
+(`compound_states_register_per_result`, #3899): `(.a?, true)` over a `true` register is `["x"]`, while
+a branch that lands off the register (`false`, `1`) or after a navigating branch still refuses
+(`test_destructuring_alt_bind_with_a_compound_body_states_its_register_per_branch_3899`). An answer that is a valid path is printed before the raise of the
 retry that follows it, as jq does (`test_any_all_path_answer_precedes_retry_raise_3827`).
 
 ## Provenance

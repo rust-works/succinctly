@@ -115696,9 +115696,9 @@ fn test_any_all_path_answer_precedes_retry_raise_3827() -> Result<()> {
 
 /// #3827: a `halt` downstream of an answer is not the `break` the condition's
 /// `?//` swallows, so it halts rather than letting the next answer through. The
-/// condition's later alternative has already run by the time the answer is
-/// delivered, so its stderr trace is not pinned here (jq runs it once; this
-/// resolver runs it before the answer reaches the consumer).
+/// answer reaches the consumer before the retry runs (#3899), so the condition's
+/// later alternative leaves no trace on stderr: `RH` for the by-value route's
+/// `"R"|stderr`, not `RRH`.
 #[test]
 fn test_any_all_path_answer_halt_is_not_retried_3827() -> Result<()> {
     let input = r#"{"x":true}"#;
@@ -115716,6 +115716,65 @@ fn test_any_all_path_answer_halt_is_not_retried_3827() -> Result<()> {
         let (out, err, code) = run_jq_full(&["-nc", owned.as_str()], None)?;
         assert_eq!((out.as_str(), code), ("", 3), "`{owned}`: stderr {err:?}");
         assert!(err.ends_with('H'), "`{owned}`: stderr {err:?}");
+    }
+    Ok(())
+}
+
+/// #3899: the consumer has `any`/`all`'s answer before the `?//` retry that
+/// follows it runs, so what the retry does (`stderr`, `halt`) comes after
+/// whatever the consumer did with the answer. Every row captured from jq 1.7.1
+/// with `-c`, stderr interleaved as written; the resolver used to drain the
+/// retry first (`RRH`, `RHjq: error ...`).
+#[test]
+fn test_any_all_path_answer_precedes_the_retrys_side_effects_3899() -> Result<()> {
+    let input = r#"{"x":true}"#;
+    for (filter, stdout, stderr_starts, code) in [
+        // the by-value route: `cond` navigates nothing
+        (
+            r#"path(.x | any(.; (. as $q ?// $z | ("R"|stderr) as $m | if $q then true else empty end))) | ("H"|halt_error(3))"#,
+            "",
+            "RH",
+            3,
+        ),
+        (
+            r#"path(.x | all(.; (. as $q ?// $z | ("R"|stderr) as $m | if $q then false else empty end))) | ("H"|halt_error(3))"#,
+            "",
+            "RRH",
+            3,
+        ),
+        // the live route: `cond`'s retry is a real `?//` the resolver drives
+        (
+            r#"path(.x | any(.; (. as $q ?// $z | if $q then true else (("R"|stderr)|empty) end))) | ("H"|stderr)"#,
+            "\"H\"\n",
+            "HRjq: error (at ",
+            5,
+        ),
+        (
+            r#"path(.x | all(.; (. as $q ?// $z | if $q then false else (("R"|stderr)|empty) end))) | ("H"|stderr)"#,
+            "\"H\"\n",
+            "RH",
+            0,
+        ),
+    ] {
+        let owned = format!("{input} | {filter}");
+        for (args, stdin) in [
+            (vec!["-c", filter], Some(input)),
+            (vec!["-nc", owned.as_str()], None),
+        ] {
+            let (out, err, status) = run_jq_full(&args, stdin)?;
+            assert_eq!(
+                (out.as_str(), status),
+                (stdout, code),
+                "`{filter}`: {err:?}"
+            );
+            assert!(err.starts_with(stderr_starts), "`{filter}`: {err:?}");
+            // Exactly the trace and nothing after it, bar the error line.
+            if stderr_starts.ends_with("(at ") {
+                assert!(err.ends_with("with result false\n"), "`{filter}`: {err:?}");
+            } else {
+                assert_eq!(err, stderr_starts, "`{filter}`");
+            }
+        }
     }
     Ok(())
 }
@@ -118749,6 +118808,97 @@ fn test_destructuring_alt_bind_with_a_failed_first_alternative_states_its_regist
             "",
             "Invalid path expression with result true",
             5,
+        ),
+    ])
+}
+
+/// #3899: a destructuring `?//` bind whose body mixes a navigating and a by-value
+/// part. The failed destructure is restored by the fork, so the bare `$var`
+/// alternative that runs starts at the register the stage entered, and each
+/// branch of the body states it for itself: `(.a?, true)` over a `true` register
+/// answers `["x"]`, while a branch that lands off the register still refuses
+/// (`false`, `1`), and a branch that navigated keeps its position. Every row
+/// captured from jq 1.7.1, on the stdin and `-n` routes.
+#[test]
+fn test_destructuring_alt_bind_with_a_compound_body_states_its_register_per_branch_3899(
+) -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"x":true}"#,
+            r"path(.x | (. as [$q] ?// $z | (.a?, true)))",
+            "[\"x\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":true}"#,
+            r"path(.x | (. as [$q] ?// $z | (true, .a?)))",
+            "[\"x\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":true}"#,
+            r"path(.x | (. as [$q] ?// $z | (.a? // true)))",
+            "[\"x\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":true}"#,
+            r"path(.x | (. as [$q] ?// $z | try (.a?, true) catch 1))",
+            "[\"x\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":true}"#,
+            r"path(.x | (. as [$q] ?// $z | if .a? then 1 else true end))",
+            "",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":true}"#,
+            r"del(.x | (. as [$q] ?// $z | (.a?, true)))",
+            "{}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":true}"#,
+            r"path(.x | (. as [$q] ?// $z | (.a?, false)))",
+            "",
+            "Invalid path expression with result false",
+            5,
+        ),
+        (
+            r#"{"x":true}"#,
+            r"path(.x | (. as [$q] ?// $z | (.a?, 1)))",
+            "",
+            "Invalid path expression with result 1",
+            5,
+        ),
+        (
+            r#"{"x":{"a":true}}"#,
+            r"path(.x | (. as [$q] ?// $z | (.a, true)))",
+            "[\"x\",\"a\"]\n",
+            "Invalid path expression with result true",
+            5,
+        ),
+        (
+            r#"{"x":{"a":true}}"#,
+            r"del(.x | (. as [$q] ?// $z | (.a, true)))",
+            "",
+            "Invalid path expression with result true",
+            5,
+        ),
+        (
+            r#"{"x":null}"#,
+            r"path(.x | (. as [$q] ?// $z | (.a?, null)))",
+            "[\"x\",0,\"a\"]\n[\"x\",0]\n",
+            "",
+            0,
         ),
     ])
 }
