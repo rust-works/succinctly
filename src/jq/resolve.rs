@@ -2433,14 +2433,17 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
         // the units are reversed: an error of the block itself stays in
         // source order (`ua + ub` is `ua`, `ub`), and `and`, `or` and `//`
         // are not such calls.
-        Expr::Arithmetic { left, right, .. } | Expr::Compare { left, right, .. } => {
-            let start = cx.mark();
-            check(left, cx, reachable);
-            let middle = cx.mark();
-            check(right, cx, reachable);
-            let end = cx.mark();
-            cx.reorder(&[start, middle, end], Some(&[1, 0]), None);
+        Expr::Arithmetic {
+            left,
+            right,
+            settle,
+            ..
+        } => {
+            // The pass below can rewrite an operand in place (#3997).
+            settle.forget();
+            check_operator_operands(left, right, cx, reachable);
         }
+        Expr::Compare { left, right, .. } => check_operator_operands(left, right, cx, reachable),
 
         Expr::And(left, right) | Expr::Or(left, right) | Expr::Alternative(left, right) => {
             check(left, cx, reachable);
@@ -3199,6 +3202,22 @@ fn collect_def_body_addrs(expr: &Expr, addrs: &mut Vec<usize>) {
 }
 
 /// [`check`] over an optional sub-expression.
+/// The operands of an arithmetic or comparison operator, checked in order
+/// and reported in jq's reversed one (#3583).
+fn check_operator_operands(
+    left: &mut Expr,
+    right: &mut Expr,
+    cx: &mut CheckCtx,
+    reachable: &BTreeSet<usize>,
+) {
+    let start = cx.mark();
+    check(left, cx, reachable);
+    let middle = cx.mark();
+    check(right, cx, reachable);
+    let end = cx.mark();
+    cx.reorder(&[start, middle, end], Some(&[1, 0]), None);
+}
+
 fn check_opt(expr: Option<&mut Expr>, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
     if let Some(e) = expr {
         check(e, cx, reachable);
@@ -3822,6 +3841,25 @@ mod tests {
             resolve("def error: \"S\"; label $out | (1, break $out, 3)"),
             Ok(())
         );
+    }
+
+    /// #3997: a node whose operands the resolve pass rewrites in place does
+    /// not keep what a settle walk remembered about the old ones.
+    #[test]
+    fn resolving_an_arithmetic_node_forgets_its_settle_memo_3997() {
+        let mut expr = parse("def f: 1; f + f").unwrap();
+        #[rustfmt::skip]
+        let Expr::FuncDef { then, .. } = &mut expr else { panic!("expected a def") };
+        #[rustfmt::skip]
+        let Expr::Arithmetic { settle, .. } = &**then else { panic!("expected arithmetic") };
+        settle.set(Some(true), 5);
+        assert!(settle.get().is_some());
+        resolve_func_calls(&mut expr).unwrap();
+        #[rustfmt::skip]
+        let Expr::FuncDef { then, .. } = &expr else { unreachable!() };
+        #[rustfmt::skip]
+        let Expr::Arithmetic { settle, .. } = &**then else { unreachable!() };
+        assert!(settle.get().is_none());
     }
 
     /// #2687: an arity-1 `def error(m):` does not shadow a bare `break $x`

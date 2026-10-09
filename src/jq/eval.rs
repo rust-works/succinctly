@@ -444,10 +444,10 @@ impl EvalSemantics for YqSemantics {
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
 
 use super::expr::{
-    retention_scope, ArithOp, AssignOp, BindOrigin, BoundBody, Builtin, CompareOp, Expr,
-    FormatType, FuncDefBound, FuncDefData, Libm1, Libm2, Libm3, Literal, MergeFlags, MetaSlot,
-    NumberKey, ObjectEntry, ObjectKey, Origin, Param, Pattern, PatternEntry, PipeStages, SharedArg,
-    SliceBoundKey, StringPart, Tracked,
+    retention_scope, ArithOp, ArithSettleMemo, AssignOp, BindOrigin, BoundBody, Builtin, CompareOp,
+    Expr, FormatType, FuncDefBound, FuncDefData, Libm1, Libm2, Libm3, Literal, MergeFlags,
+    MetaSlot, NumberKey, ObjectEntry, ObjectKey, Origin, Param, Pattern, PatternEntry, PipeStages,
+    SharedArg, SliceBoundKey, StringPart, Tracked,
 };
 use super::value::{
     assert_value_tree_depth, check_value_tree_depth, cmp_f64, document_number_f64,
@@ -3554,9 +3554,9 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         Expr::Paren(inner) => eval_single::<W, S>(inner, value, optional),
 
-        Expr::Arithmetic { op, left, right } => {
-            eval_arithmetic::<W, S>(*op, left, right, value, optional)
-        }
+        Expr::Arithmetic {
+            op, left, right, ..
+        } => eval_arithmetic::<W, S>(*op, left, right, value, optional),
 
         Expr::Negate(operand) => eval_negate::<W, S>(operand, value, optional),
 
@@ -3849,12 +3849,15 @@ pub(crate) fn yq_empty_context_reemit(expr: &Expr) -> Option<Expr> {
         }
         Expr::Negate(operand) => Some(Expr::Negate(Box::new(yq_empty_context_reemit(operand)?))),
         // An operator needs every operand to re-emit, see `reemit_operands`.
-        Expr::Arithmetic { op, left, right } => {
+        Expr::Arithmetic {
+            op, left, right, ..
+        } => {
             let (left, right) = reemit_operands(left, right)?;
             Some(Expr::Arithmetic {
                 op: *op,
                 left: Box::new(left),
                 right: Box::new(right),
+                settle: ArithSettleMemo::default(),
             })
         }
         Expr::Compare { op, left, right } => {
@@ -6521,7 +6524,9 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `eval_binary_fanout` alone, but this arm is what keeps that fix
         // working when arithmetic sits inside `first(...)`/`IN(...)`/another
         // `Compare`/etc.
-        Expr::Arithmetic { op, left, right } => binary_fanout_each::<_, S>(
+        Expr::Arithmetic {
+            op, left, right, ..
+        } => binary_fanout_each::<_, S>(
             |operand, operand_sink| {
                 eval_each::<W, S>(operand, value.clone(), optional, operand_sink)
             },
@@ -11441,7 +11446,9 @@ fn closed_expr_to_owned_node<S: EvalSemantics>(
             let l = closed_expr_to_owned_at_depth::<S>(left, depth + 1, escaped)?;
             Some(OwnedValue::Bool(apply_compare_op::<S>(*op, &l, &r)))
         }
-        Expr::Arithmetic { op, left, right } if S::TAG == EvalTag::Jq => {
+        Expr::Arithmetic {
+            op, left, right, ..
+        } if S::TAG == EvalTag::Jq => {
             let r = closed_expr_to_owned_at_depth::<S>(right, depth + 1, escaped)?;
             let l = closed_expr_to_owned_at_depth::<S>(left, depth + 1, escaped)?;
             arith_combine::<S>(*op, l, r).ok()
@@ -11644,7 +11651,9 @@ fn owned_assign_step<S: EvalSemantics>(
         Expr::Update { path, filter } => (
             path,
             match filter.as_ref() {
-                Expr::Arithmetic { op, left, right } if matches!(left.as_ref(), Expr::Identity) => {
+                Expr::Arithmetic {
+                    op, left, right, ..
+                } if matches!(left.as_ref(), Expr::Identity) => {
                     OwnedAssignRhs::Combine(*op, closed_expr_to_owned::<S>(right)?)
                 }
                 other => OwnedAssignRhs::Value(closed_expr_to_owned::<S>(other)?),
@@ -31260,6 +31269,7 @@ fn eval_compound_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             op: arith_op,
             left: Box::new(Expr::Identity),
             right: Box::new(owned_to_expr(&rhs_value)),
+            settle: ArithSettleMemo::default(),
         },
     )
 }
@@ -31552,6 +31562,7 @@ fn assign_one<S: EvalSemantics>(
             op,
             left: Box::new(Expr::Identity),
             right: Box::new(owned_to_expr(&value)),
+            settle: ArithSettleMemo::default(),
         }),
         AssignKind::Alt => Some(Expr::Alternative(
             Box::new(Expr::Identity),
@@ -58482,7 +58493,10 @@ pub(crate) fn eval_owned_fast_path<S: EvalSemantics>(
 /// starts from, so the borrowed [`eval_owned_fast_path`] arm that shares
 /// this recognizer answers nothing its general evaluator would not.
 fn owned_arith_accumulator_shape<S: EvalSemantics>(expr: &Expr) -> Option<(ArithOp, OwnedValue)> {
-    let Expr::Arithmetic { op, left, right } = expr else {
+    let Expr::Arithmetic {
+        op, left, right, ..
+    } = expr
+    else {
         return None;
     };
     if !matches!(left.as_ref(), Expr::Identity) {
@@ -76697,6 +76711,13 @@ pub(crate) fn is_eager_arg(arg: &SharedArg) -> bool {
 /// [`is_eager_arg`] walks one link at a time and shares the bound.
 const SETTLE_ANALYSIS_BUDGET: u32 = 1024;
 
+// How many nodes `single_valued_pure` has visited on this thread, so a test
+// can pin that a remembered answer is read rather than walked again (#3997).
+#[cfg(test)]
+thread_local! {
+    static SETTLE_WALK_VISITS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
 /// The state [`single_valued_pure`] threads through its walk: the node budget
 /// left, and whether it is classifying an argument for [`is_eager_arg`] --
 /// where a nested `Shared` counts by its own remembered answer and a `,` of
@@ -76726,12 +76747,55 @@ fn single_valued_pure(
     walk: &mut PureWalk,
 ) -> Option<bool> {
     walk.budget = walk.budget.checked_sub(1)?;
+    #[cfg(test)]
+    SETTLE_WALK_VISITS.with(|v| v.set(v.get() + 1));
+    // The one walk whose answer is a function of the subtree alone (#3997).
+    let memoised = within.is_none() && !walk.for_eager_arg;
     let mut sv = |e: &Expr| single_valued_pure(e, within, walk);
     match expr {
         Expr::Identity | Expr::Literal(_) | Expr::Field(_) | Expr::Var(_) | Expr::TrackedVar(_) => {
             Some(false)
         }
         Expr::Paren(inner) | Expr::Negate(inner) => sv(inner),
+        // Outside a definition body, in the settle analysis, what a walk finds
+        // below an arithmetic node is remembered on it with its cost, so the
+        // operator above a chain's next link reads it back instead of walking
+        // the whole chain again (#3997). The cost is charged either way, which
+        // is what keeps the answer -- and the budget left -- what walking
+        // would have given.
+        Expr::Arithmetic {
+            left,
+            right,
+            settle,
+            ..
+        } if memoised => {
+            // The budget this node's own visit was charged from.
+            let entry = walk.budget + 1;
+            if let Some((result, cost)) = settle.get() {
+                return match entry.checked_sub(cost) {
+                    Some(left_over) => {
+                        walk.budget = left_over;
+                        result
+                    }
+                    // A walk short of the budget runs dry on the way, exactly
+                    // here.
+                    None => {
+                        walk.budget = 0;
+                        None
+                    }
+                };
+            }
+            let result = single_valued_pure(left, within, walk).and_then(|l| {
+                let r = single_valued_pure(right, within, walk)?;
+                Some(l | r)
+            });
+            // An unrecognised node that spent the last of the budget is
+            // indistinguishable from running dry, whose cost is the budget's.
+            if result.is_some() || walk.budget > 0 {
+                settle.set(result, entry - walk.budget);
+            }
+            result
+        }
         Expr::Arithmetic { left, right, .. } | Expr::Compare { left, right, .. } => {
             Some(sv(left)? | sv(right)?)
         }
@@ -90699,6 +90763,7 @@ mod tests {
                 op: ArithOp::Sub,
                 left: Box::new(Expr::Shared(prev)),
                 right: Box::new(one.clone()),
+                settle: ArithSettleMemo::default(),
             }))
         };
         let base = |expr: Expr| Rc::new(SharedArg::new(expr));
@@ -90927,6 +90992,216 @@ mod tests {
             }
         ));
         assert_eq!(full_walks, 2);
+    }
+
+    /// `def f: BODY; <use_site>` with `f` installed as a real `DefCall`, so a
+    /// use site such as `f + f + f` is a chain whose operands all call a `def`.
+    fn installed_use_site_3997(def_source: &str, use_site: &str) -> Expr {
+        #[rustfmt::skip]
+        let Expr::FuncDef { name, params, body, then, .. } = parse(&format!("{def_source}; {use_site}")).unwrap() else { panic!("expected a def") };
+        let def = Rc::new(FuncDefData::new(name, params, *body));
+        install_def_calls(&then, &def, 0, false)
+    }
+
+    /// Run `body` on a stack a 200-deep chain fits in debug: a test thread's
+    /// default overflows on the walk's own recursion, as the evaluator's does
+    /// there (the CLI runs on 256 MB).
+    #[cfg(feature = "std")]
+    fn on_big_stack_3997(body: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(body)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// `f + f + ... + f`, `terms` of them, over `def f: .+1`.
+    fn def_call_chain_3997(terms: usize) -> Expr {
+        installed_use_site_3997("def f: .+1", &vec!["f"; terms].join(" + "))
+    }
+
+    /// The result and the budget left of one settle-analysis walk of `expr`
+    /// from `budget` nodes -- the two things a remembered answer must keep.
+    fn settle_walk_3997(expr: &Expr, budget: u32) -> (Option<bool>, u32) {
+        let mut walk = PureWalk::new(false);
+        walk.budget = budget;
+        let result = single_valued_pure(expr, None, &mut walk);
+        (result, walk.budget)
+    }
+
+    /// Every arithmetic node down `expr`'s left spine, outermost first.
+    fn left_spine_3997(expr: &Expr) -> Vec<&Expr> {
+        let mut spine = Vec::new();
+        let mut at = expr;
+        while let Expr::Arithmetic { left, .. } = at {
+            spine.push(at);
+            at = left;
+        }
+        spine
+    }
+
+    /// #3997: reading a remembered answer is the walk it replaces, down to the
+    /// budget it leaves -- so which operands settle (#3296's reach) cannot have
+    /// moved. Compared on a fresh clone (which remembers nothing, so is the
+    /// walk as it was before) at every budget that matters: the chain's cost
+    /// and either side of it, and the point where it runs dry.
+    #[test]
+    #[cfg(feature = "std")]
+    fn remembered_settle_walk_equals_the_cold_walk_3997() {
+        on_big_stack_3997(|| {
+            let mut chains = vec![
+                // `5N - 1` nodes: 205 terms is 1024, exactly the budget.
+                def_call_chain_3997(1),
+                def_call_chain_3997(2),
+                def_call_chain_3997(7),
+                def_call_chain_3997(204),
+                def_call_chain_3997(205),
+                def_call_chain_3997(206),
+                def_call_chain_3997(230),
+            ];
+            // A walk that ends on an unrecognised node, with budget to spare,
+            // at the bottom of the spine and near its top.
+            chains.push(installed_use_site_3997(
+                "def f: .+1",
+                "length + f + f + f + f",
+            ));
+            chains.push(installed_use_site_3997(
+                "def f: .+1",
+                "f + f + f + f + length + f",
+            ));
+            // Past the budget, and a `Compare` / non-arithmetic link in the spine.
+            chains.push(installed_use_site_3997(
+                "def f: .+1",
+                "(f + f + f) == f + f",
+            ));
+            chains.push(installed_use_site_3997(
+                "def f: .+1",
+                "(f | . + f) + f + (f - f)",
+            ));
+            for chain in &chains {
+                let pristine = chain.clone();
+                let (full_result, full_left) =
+                    settle_walk_3997(&pristine.clone(), SETTLE_ANALYSIS_BUDGET);
+                let cost = SETTLE_ANALYSIS_BUDGET - full_left;
+                // Remember everything the full walk can.
+                assert_eq!(
+                    settle_walk_3997(chain, SETTLE_ANALYSIS_BUDGET),
+                    (full_result, full_left)
+                );
+                let mut budgets = vec![1, 2, 3, 8, 100, SETTLE_ANALYSIS_BUDGET];
+                budgets.extend(
+                    [cost.saturating_sub(1), cost, cost + 1]
+                        .into_iter()
+                        .filter(|b| *b > 0),
+                );
+                // Never walked itself: only ever cloned, and a clone is cold.
+                let never_walked = pristine.clone();
+                for budget in budgets {
+                    for (warm, cold) in left_spine_3997(chain)
+                        .into_iter()
+                        .zip(left_spine_3997(&never_walked))
+                    {
+                        assert_eq!(
+                            settle_walk_3997(warm, budget),
+                            settle_walk_3997(&cold.clone(), budget),
+                            "budget {budget} over a spine node of a {cost}-node chain"
+                        );
+                    }
+                    assert_eq!(
+                        settle_walk_3997(chain, budget),
+                        settle_walk_3997(&pristine.clone(), budget),
+                        "budget {budget} over a {cost}-node chain"
+                    );
+                }
+                // And the questions the evaluator asks, whole.
+                assert_eq!(settles_before_consumer(chain), full_result == Some(true));
+                assert_eq!(
+                    settle_probe(chain),
+                    settle_probe(&pristine.clone()),
+                    "the probe reads the same answer"
+                );
+            }
+            // The budget boundary itself is where #3296 left it.
+            assert!(settles_before_consumer(&def_call_chain_3997(205)));
+            assert!(!settles_before_consumer(&def_call_chain_3997(206)));
+        });
+    }
+
+    /// #3997: the operators of a chain of `def` calls asked in the order the
+    /// evaluator asks them, outermost first, walk the chain about once between
+    /// them -- not once each. Counts the nodes visited, so a regression is a
+    /// number, not a stopwatch.
+    #[test]
+    #[cfg(feature = "std")]
+    fn a_def_call_chain_is_walked_once_not_per_operator_3997() {
+        on_big_stack_3997(|| {
+            const TERMS: u64 = 100;
+            let chain = def_call_chain_3997(TERMS as usize);
+            let spine = left_spine_3997(&chain);
+            assert_eq!(spine.len() as u64, TERMS - 1);
+            let visits = || SETTLE_WALK_VISITS.with(core::cell::Cell::get);
+            let before = visits();
+            for node in &spine {
+                #[rustfmt::skip]
+                let Expr::Arithmetic { left, right, .. } = node else { unreachable!() };
+                assert!(settles_both(left, right));
+            }
+            let spent = visits() - before;
+            // One walk of the chain (`5 * TERMS - 1` nodes), a probe of each right
+            // operand and one read per operator. Walking each left operand afresh
+            // is `TERMS * (5 * TERMS) / 2`, 24,000 and more.
+            assert!(
+                spent < 12 * TERMS,
+                "{spent} nodes visited for {TERMS} operators"
+            );
+            // Asked of the top, once to remember it, then again: one visit.
+            assert!(settles_before_consumer(&chain));
+            let before = visits();
+            assert!(settles_before_consumer(&chain));
+            assert_eq!(visits() - before, 1, "a remembered chain is not re-walked");
+        });
+    }
+
+    /// #3997: what is remembered about a node is not part of what the node is,
+    /// and not shared with a copy that might be rewritten.
+    #[test]
+    fn the_settle_memo_is_not_part_of_the_expr_3997() {
+        let chain = def_call_chain_3997(3);
+        let cold = chain.clone();
+        let printed = format!("{chain:?}");
+        assert!(settles_before_consumer(&chain));
+        #[rustfmt::skip]
+        let Expr::Arithmetic { settle, .. } = &chain else { unreachable!() };
+        assert!(settle.get().is_some(), "the walk remembered the node");
+        assert_eq!(chain, cold, "equality ignores the memo");
+        assert_eq!(format!("{chain:?}"), printed, "so does Debug");
+        let copy = chain.clone();
+        #[rustfmt::skip]
+        let Expr::Arithmetic { settle, .. } = &copy else { unreachable!() };
+        assert!(settle.get().is_none(), "a clone starts with nothing");
+    }
+
+    /// #3997: only the settle analysis outside a `def` body remembers. An
+    /// arithmetic node in a body is walked with that definition's parameters
+    /// in scope, and one in an argument by `is_eager_arg`'s different rules --
+    /// each a different question, which must not be answered by a memo of
+    /// another.
+    #[test]
+    fn only_the_top_level_settle_walk_remembers_3997() {
+        let call = installed_use_site_3997("def f: .+1", "f");
+        #[rustfmt::skip]
+        let Expr::DefCall { def, .. } = &call else { panic!("expected a DefCall") };
+        assert!(settles_before_consumer(&call));
+        #[rustfmt::skip]
+        let Expr::Arithmetic { settle, .. } = &def.body else { panic!("expected an arithmetic body") };
+        assert!(settle.get().is_none(), "a body is walked within its def");
+
+        let arg = SharedArg::new(parse("1 + 1").unwrap());
+        assert!(is_eager_arg(&arg));
+        #[rustfmt::skip]
+        let Expr::Arithmetic { settle, .. } = arg.expr() else { panic!("expected arithmetic") };
+        assert!(settle.get().is_none(), "an eager-arg walk is not memoised");
     }
 
     /// #2397: the navigation shapes the representation gate exists for must
@@ -103282,6 +103557,7 @@ mod tests {
                 op: ArithOp::Add,
                 left: Box::new(Expr::Identity),
                 right: Box::new(Expr::Literal(Literal::Int(1))),
+                settle: ArithSettleMemo::default(),
             }),
             Some((ArithOp::Add, OwnedValue::Int(1)))
         );
@@ -103292,6 +103568,7 @@ mod tests {
                 op: ArithOp::Add,
                 left: Box::new(Expr::Field("foo".to_string())),
                 right: Box::new(Expr::Literal(Literal::Int(1))),
+                settle: ArithSettleMemo::default(),
             }),
             None
         );
@@ -103301,6 +103578,7 @@ mod tests {
                 op: ArithOp::Add,
                 left: Box::new(Expr::Identity),
                 right: Box::new(Expr::Field("foo".to_string())),
+                settle: ArithSettleMemo::default(),
             }),
             None
         );
@@ -103347,6 +103625,7 @@ mod tests {
             op: ArithOp::Add,
             left: Box::new(Expr::Identity),
             right: Box::new(Expr::Literal(Literal::String("a".to_string()))),
+            settle: ArithSettleMemo::default(),
         };
         let mut on_update_calls = 0;
         // patchcov: coverage tolerate reason="the closure is asserted never called below (on_update_calls stays 0) -- Err(_) with optional=true short-circuits fold_step_each before this sink runs (#3122)"

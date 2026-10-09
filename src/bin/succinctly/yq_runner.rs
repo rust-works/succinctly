@@ -9330,6 +9330,7 @@ mod tests {
             op: succinctly::jq::ArithOp::Add,
             left: Box::new(Expr::Identity),
             right: Box::new(Expr::Literal(succinctly::jq::Literal::Float(1e100))),
+            settle: succinctly::jq::ArithSettleMemo::default(),
         })));
         assert!(!can_use_m2_streaming(&arithmetic));
     }
@@ -9356,6 +9357,7 @@ mod tests {
             op: succinctly::jq::ArithOp::Add,
             left: Box::new(Expr::Identity),
             right: Box::new(Expr::Literal(succinctly::jq::Literal::Float(1e100))),
+            settle: succinctly::jq::ArithSettleMemo::default(),
         })));
         assert!(!can_use_m2_streaming(&computing));
 
