@@ -60928,3 +60928,41 @@ fn test_integer_path_components_name_the_member_by_text_2801() -> Result<()> {
     );
     Ok(())
 }
+
+/// Pinned yq v4.53.3: a `del()` target that is a bound variable holding the root keeps the
+/// document, where the bare `del(.)` empties it (#3244). A variable holds a node and the root
+/// node has no parent to be removed from. Every row was captured from the pinned binary,
+/// `-o=json -I=0`.
+#[test]
+fn test_del_of_a_root_variable_keeps_the_document_3244() -> Result<()> {
+    let args = &["-o=json", "-I=0"];
+    for (doc, filter, expected) in [
+        ("a: 1", "del(. as $y | $y)", r#"{"a":1}"#),
+        ("a: 1", ". as $y | del($y)", r#"{"a":1}"#),
+        ("a: 1", ". as $y | del(($y))", r#"{"a":1}"#),
+        ("a: 1", ". as $y | del($y | .)", r#"{"a":1}"#),
+        ("a: 1", "del(. as $y | $y | .)", r#"{"a":1}"#),
+        ("a: 1", "del(. as $y | ($y, $y))", r#"{"a":1}"#),
+        ("a: 1", ". as $y | del(. | $y)", r#"{"a":1}"#),
+        ("a: 1", ". as $y | del(. | $y | .)", r#"{"a":1}"#),
+        ("a: 1", ". as $y | del($y | (.))", r#"{"a":1}"#),
+        ("true", ". as $y | del($y)", "true"),
+        ("null", ". as $y | del($y)", "null"),
+        ("a: {b: 1}", ". as $y | del($y)", r#"{"a":{"b":1}}"#),
+        // A null or boolean child reached by value identity is the root of its own context.
+        ("a: true", ".a as $y | .a | del($y)", "true"),
+        ("a: null", ".a as $y | .a | del($y)", "null"),
+        // Controls: the shapes yq does empty stay empty.
+        ("a: 1", "del(.)", ""),
+        ("a: 1", "del(select(true))", ""),
+        ("a: 1", ". as $y | $y | del(.)", ""),
+        ("a: 1", ". as $y | del(select($y))", ""),
+    ] {
+        let (out, code) = run_yq_stdin(filter, &format!("{doc}\n"), args)?;
+        assert_eq!((out.trim(), code), (expected, 0), "{doc} | {filter}");
+    }
+    // jq mode is unchanged: jq empties the document to null.
+    let (out, code) = run_jq_stdin("del(. as $y | $y)", r#"{"a":1}"#, &["-c"])?;
+    assert_eq!((out.trim(), code), ("null", 0));
+    Ok(())
+}

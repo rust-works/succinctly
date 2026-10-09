@@ -2109,6 +2109,21 @@ When every target is one of those, the result matches real yq: `null | del(null)
 path used to reach yq's bare-`del(.)` rule, which printed nothing. A mix with a tracked
 target (`null | del(null, .a)`) still refuses.
 
+A `del()` target that is a bound variable holding the root keeps the document
+([#3244](https://github.com/rust-works/succinctly/issues/3244)): `. as $y | del($y)`,
+`del(. as $y | $y)`, `del(($y))`, `del($y | .)` and `del(. as $y | ($y, $y))` print the input
+unchanged, as yq does (`{"a":1}` on `a: 1`; `true` and `null` on those scalars), where the
+bare `del(.)` prints nothing. The check is syntactic -- the target is a variable and nothing
+else -- because the resolved branch does not remember how it reached the root. So a spelling
+that reaches the root variable through anything but identities still empties the document:
+`. as $y | del($y // .)` and `. as $y | del($y | select(true))` print nothing where yq prints it.
+What stays
+different, all of it yq's node identity ([#2643](https://github.com/rust-works/succinctly/issues/2643)):
+a variable bound below the root (`.a as $y | del($y)` deletes `.a` in yq, refuses here),
+`. as $y | del($y.a)` (yq keeps the document, succinctly deletes `.a`), and the mixed orders
+`del(., $y)` / `del(.a, $y)` (yq keeps the document, succinctly empties it), which are
+#1865's reverse-order quirk.
+
 The test is value identity with the input, not whether the target has a path, so a literal
 that doesn't equal its input still refuses where real yq deletes nothing:
 `true | del(null)`, `true | del(. == false)`, `{a: {b: 1}} | .a.b |= del(null)`, and
