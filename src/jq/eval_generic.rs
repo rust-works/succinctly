@@ -3788,6 +3788,28 @@ impl<V: DocumentValue> LazySeq<V> {
         Self::new(LazySource::Mixed(elems.into_iter()))
     }
 
+    /// Whether this is an array of document nodes and owned values with no
+    /// `map` stage on top (#3922): the shape array construction builds
+    /// ([`Self::from_cursors`], [`Self::from_repeating_cursors`],
+    /// [`Self::from_mixed`]).
+    ///
+    /// Such a sequence has nothing left to *compute*, so the only way to
+    /// materialize it can fail is by reading a node, and every error that walk
+    /// raises is a decode failure (`malformed_member_error`,
+    /// `malformed_delimiter_error`, the depth guard, a string that does not
+    /// decode), which `?`/`try` never catch (#1247). A `try` boundary that
+    /// forces such a sequence therefore neither catches nor changes anything:
+    /// it only decodes early. [`try_single_generic`] and
+    /// [`check_lazy_item_for_try`] use this to hand it on unforced.
+    fn holds_only_nodes(&self) -> bool {
+        self.instructions.is_none()
+            && self.pending.is_empty()
+            && matches!(
+                self.source,
+                LazySource::Cursors { .. } | LazySource::Mixed(_)
+            )
+    }
+
     /// Run one `Instruction` against one pending item, re-dispatching to
     /// whichever `EvalSemantics` the stage was pushed with. `LazyElem::Cursor`
     /// stays inside the generic cursor evaluator — the actual win;
@@ -5001,10 +5023,7 @@ fn comma_array_generic<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
-    // Every item so far, while all of them are document nodes.
-    let mut nodes: Vec<V::Cursor> = Vec::new();
-    // `Some` once an item that is not a node arrived: `nodes` moved into it.
-    let mut elems: Option<Vec<LazyElem<V>>> = None;
+    let mut array = CommaArray::new();
     for expr in CommaBranches::new(exprs) {
         let mut result = eval_single::<S, _>(expr, value.clone(), optional, cursor);
         if !tail.is_empty() {
@@ -5012,18 +5031,50 @@ fn comma_array_generic<S: EvalSemantics, V: DocumentValue>(
             // pure navigation reaches there.
             result = fold_pipe_stages::<S, V>(result, tail, optional);
         }
-        let escape = match (elems.as_mut(), result) {
+        if let Some(control) = array.push::<S>(result) {
+            // Atomic, like the rest of `Expr::Array`: whatever was collected
+            // is discarded, and the escape is the whole answer.
+            return partial_generic(Vec::new(), control);
+        }
+    }
+    array.finish::<S>()
+}
+
+/// What [`comma_array_generic`] has collected: its items so far, in order,
+/// shared with [`comma_stage_array_generic`] so the two routes cannot drift on
+/// what an item or an array is (#3922).
+struct CommaArray<V: DocumentValue> {
+    /// Every item so far, while all of them are document nodes.
+    nodes: Vec<V::Cursor>,
+    /// `Some` once an item that is not a node arrived: `nodes` moved into it.
+    elems: Option<Vec<LazyElem<V>>>,
+}
+
+impl<V: DocumentValue> CommaArray<V> {
+    fn new() -> Self {
+        Self {
+            nodes: Vec::new(),
+            elems: None,
+        }
+    }
+
+    /// Adds every item `result` holds, in order. The first escape (a raise, a
+    /// break, a halt) is handed back for the caller to make the array's
+    /// failure.
+    #[inline]
+    fn push<S: EvalSemantics>(&mut self, result: GenericResult<V>) -> Option<Control> {
+        match (self.elems.as_mut(), result) {
             (None, GenericResult::OneCursor(c)) => {
-                nodes.push(c);
+                self.nodes.push(c);
                 None
             }
             // The branch's own `Vec` when it is the first, rather than a copy.
-            (None, GenericResult::ManyCursor(cs)) if nodes.is_empty() => {
-                nodes = cs;
+            (None, GenericResult::ManyCursor(cs)) if self.nodes.is_empty() => {
+                self.nodes = cs;
                 None
             }
             (None, GenericResult::ManyCursor(cs)) => {
-                nodes.extend(cs);
+                self.nodes.extend(cs);
                 None
             }
             (Some(out), GenericResult::OneCursor(c)) => {
@@ -5041,71 +5092,72 @@ fn comma_array_generic<S: EvalSemantics, V: DocumentValue>(
                 // A branch that yields nothing (`empty`, a missing `.[]?`)
                 // leaves the array all nodes.
                 if !values.is_empty() {
-                    let mut out: Vec<LazyElem<V>> = vec_with_capacity(nodes.len() + values.len());
+                    let mut out: Vec<LazyElem<V>> =
+                        vec_with_capacity(self.nodes.len() + values.len());
                     out.extend(
-                        core::mem::take(&mut nodes)
+                        core::mem::take(&mut self.nodes)
                             .into_iter()
                             .map(LazyElem::Cursor),
                     );
                     out.append(&mut values);
-                    elems = Some(out);
+                    self.elems = Some(out);
                 }
                 escape
             }
-        };
-        if let Some(control) = escape {
-            // Atomic, like the rest of `Expr::Array`: whatever was collected
-            // is discarded, and the escape is the whole answer.
-            return partial_generic(Vec::new(), control);
         }
     }
-    let Some(mut elems) = elems else {
-        // `push`/`extend` may have doubled the buffer: `[.[], .[0]]` over 300k
-        // strings otherwise holds 600k slots while its values are built, or
-        // for as long as the sequence lives. A short list wastes nothing worth
-        // a realloc, and the per-record `[., empty]`/`[.name, .age]` shapes
-        // paid one each (+4% Ir on x86_64, #3923).
-        if nodes.len() >= SHRINK_NODES_AT {
-            nodes.shrink_to_fit();
-        }
-        if nodes.iter().any(DocumentCursor::is_container) {
-            return GenericResult::LazySeq(Box::new(LazySeq::from_repeating_cursors(nodes)));
-        }
-        // STYLE-0012: atomic array construction regardless of `optional`, as
-        // `Expr::Array`'s own arms do -- `optional` was forwarded into each
-        // branch instead. Decode-or-defer: see above.
-        return match to_owned_all_cursors::<S, _>(&nodes) {
-            Ok(out) => GenericResult::Owned(OwnedValue::array_from(out)),
-            Err(_) => GenericResult::LazySeq(Box::new(LazySeq::from_repeating_cursors(nodes))),
-        };
-    };
-    let holds_container = elems
-        .iter()
-        .any(|e| matches!(e, LazyElem::Cursor(c) if c.is_container()));
-    if !holds_container {
-        // Every node is a scalar: build, decoding each one in place so a
-        // failure leaves the rest as nodes for `from_mixed` to hold.
-        let decoded = elems.iter_mut().try_for_each(|e| {
-            if let LazyElem::Cursor(c) = e {
-                // STYLE-0012: decode-or-defer -- a failure is kept as a node
-                // for the array to hold, never raised here, so `optional` has
-                // nothing to suppress (#3856).
-                *e = LazyElem::Owned(to_owned_cursor::<S, _>(c)?);
+
+    /// The array the items make. See [`comma_array_generic`] for its shape.
+    fn finish<S: EvalSemantics>(self) -> GenericResult<V> {
+        let Self { mut nodes, elems } = self;
+        let Some(mut elems) = elems else {
+            // `push`/`extend` may have doubled the buffer: `[.[], .[0]]` over 300k
+            // strings otherwise holds 600k slots while its values are built, or
+            // for as long as the sequence lives. A short list wastes nothing worth
+            // a realloc, and the per-record `[., empty]`/`[.name, .age]` shapes
+            // paid one each (+4% Ir on x86_64, #3923).
+            if nodes.len() >= SHRINK_NODES_AT {
+                nodes.shrink_to_fit();
             }
-            Ok::<(), EvalError>(())
-        });
-        if decoded.is_ok() {
-            let out = elems
-                .into_iter()
-                .filter_map(|e| match e {
-                    LazyElem::Owned(o) => Some(o),
-                    LazyElem::Cursor(_) => None, // patchcov: coverage tolerate-line reason="unreachable: the decode above replaced every cursor with an owned value, or returned an error that skips this block (#3856)"
-                })
-                .collect();
-            return GenericResult::Owned(OwnedValue::array_from(out));
+            if nodes.iter().any(DocumentCursor::is_container) {
+                return GenericResult::LazySeq(Box::new(LazySeq::from_repeating_cursors(nodes)));
+            }
+            // STYLE-0012: atomic array construction regardless of `optional`, as
+            // `Expr::Array`'s own arms do -- `optional` was forwarded into each
+            // branch instead. Decode-or-defer: see above.
+            return match to_owned_all_cursors::<S, _>(&nodes) {
+                Ok(out) => GenericResult::Owned(OwnedValue::array_from(out)),
+                Err(_) => GenericResult::LazySeq(Box::new(LazySeq::from_repeating_cursors(nodes))),
+            };
+        };
+        let holds_container = elems
+            .iter()
+            .any(|e| matches!(e, LazyElem::Cursor(c) if c.is_container()));
+        if !holds_container {
+            // Every node is a scalar: build, decoding each one in place so a
+            // failure leaves the rest as nodes for `from_mixed` to hold.
+            let decoded = elems.iter_mut().try_for_each(|e| {
+                if let LazyElem::Cursor(c) = e {
+                    // STYLE-0012: decode-or-defer -- a failure is kept as a node
+                    // for the array to hold, never raised here, so `optional` has
+                    // nothing to suppress (#3856).
+                    *e = LazyElem::Owned(to_owned_cursor::<S, _>(c)?);
+                }
+                Ok::<(), EvalError>(())
+            });
+            if decoded.is_ok() {
+                let out = elems
+                    .into_iter()
+                    .filter_map(|e| match e {
+                        LazyElem::Owned(o) => Some(o),
+                        LazyElem::Cursor(_) => None, // patchcov: coverage tolerate-line reason="unreachable: the decode above replaced every cursor with an owned value, or returned an error that skips this block (#3856)"
+                    })
+                    .collect();
+                return GenericResult::Owned(OwnedValue::array_from(out));
+            }
         }
+        GenericResult::LazySeq(Box::new(LazySeq::from_mixed(elems)))
     }
-    GenericResult::LazySeq(Box::new(LazySeq::from_mixed(elems)))
 }
 
 /// [`push_generic_owned_values`] for a [`comma_array_generic`] element list:
@@ -5210,6 +5262,100 @@ fn split_comma_head(body: &Expr) -> Option<(&[Expr], &[Expr])> {
         return None;
     }
     Some((branches, rest))
+}
+
+/// `P | (a, b, ...) | rest`, split into the stages before the `,`, its
+/// branches and the stages after it, when the whole pipe is pure navigation
+/// (#3922); `None` for any other body, and for a `,` that heads the pipe
+/// ([`split_comma_head`]'s).
+///
+/// `[.[] | ., .]` is a pipe whose head is not a `,`, so [`split_comma_head`]
+/// declined it and the whole pipe ran down the owned route: its `,` stage
+/// answered one owned tree per item, `[.users[] | ., .] | length` taking 0.17 s
+/// and 156 MB where `[.users[], .users[]] | length` took 0.01 s and 30 MB
+/// (release, Apple M4 Pro, a 7 MB document), and decoding an unreadable value
+/// the array merely holds.
+///
+/// Only the first `,` stage is split: a pipe applies each stage to every output
+/// of the one before, so the outputs are those of `prefix`, and for each of them
+/// those of `branches` in order, then `tail` ([`comma_stage_array_generic`]).
+/// The regrouping is sound for the reason [`split_comma_head`]'s is: every
+/// stage is [`array_route_stage_is_pure_navigation`], so there is no side effect
+/// for the interleaving to reorder, and no stage the `Expr::Pipe` arm routes
+/// differently. That predicate is this route's own, not `path()`'s (#3501).
+fn split_comma_stage(body: &Expr) -> Option<(&[Expr], &[Expr], &[Expr])> {
+    let Expr::Pipe(stages) = unwrap_paren(body) else {
+        return None;
+    };
+    // The structural test first: most pipes have no `,` stage, and the
+    // predicate walks every stage.
+    let (at, branches) =
+        stages
+            .iter()
+            .enumerate()
+            .find_map(|(at, stage)| match unwrap_paren(stage) {
+                Expr::Comma(branches) => Some((at, branches)),
+                _ => None,
+            })?;
+    if at == 0 || !stages.iter().all(array_route_stage_is_pure_navigation) {
+        return None;
+    }
+    Some((&stages[..at], branches.as_slice(), &stages[at + 1..]))
+}
+
+/// A jq-mode array over `prefix | (branches) | tail` that keeps its document
+/// nodes as cursors (#3922): [`comma_array_generic`] for a `,` stage that does
+/// not head the pipe ([`split_comma_stage`]).
+///
+/// The prefix is run once, as the `Expr::Pipe` arm runs it; each cursor it
+/// answers then has every branch run against it (and `tail` after), so the
+/// items interleave per cursor exactly as the pipe's outputs do, into the same
+/// [`CommaArray`] the plain `,` body fills.
+///
+/// `None` when the prefix does not answer cursors alone (an owned value, which
+/// is all a value carried without its node can answer; a raise; a lazy result):
+/// the caller then runs the body down the owned route,
+/// which also settles the order of a raise against the items before it. The
+/// prefix is pure navigation, so running it again there costs time, never an
+/// effect.
+fn comma_stage_array_generic<S: EvalSemantics, V: DocumentValue>(
+    (prefix, branches, tail): (&[Expr], &[Expr], &[Expr]),
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+) -> Option<GenericResult<V>> {
+    let head = eval_single::<S, _>(&prefix[0], value, optional, cursor);
+    let head = fold_pipe_stages::<S, V>(head, &prefix[1..], optional);
+    let mut array = CommaArray::new();
+    let mut run = |node: V::Cursor| -> Option<GenericResult<V>> {
+        for expr in CommaBranches::new(branches) {
+            let mut result = eval_single::<S, _>(expr, node.value(), optional, Some(node));
+            if !tail.is_empty() {
+                result = fold_pipe_stages::<S, V>(result, tail, optional);
+            }
+            if let Some(control) = array.push::<S>(result) {
+                return Some(partial_generic(Vec::new(), control));
+            }
+        }
+        None
+    };
+    match head {
+        GenericResult::OneCursor(node) => {
+            if let Some(escape) = run(node) {
+                return Some(escape);
+            }
+        }
+        GenericResult::ManyCursor(nodes) => {
+            for node in nodes {
+                if let Some(escape) = run(node) {
+                    return Some(escape);
+                }
+            }
+        }
+        GenericResult::None => {}
+        _ => return None,
+    }
+    Some(array.finish::<S>())
 }
 
 /// Whether `c`'s subtree, at any depth, contains a value that cannot be
@@ -11508,6 +11654,12 @@ fn try_single_generic<S: EvalSemantics, V: DocumentValue>(
         GenericResult::Partial(prefix, Control::Break(_)) => {
             prepend_generic(prefix, run_catch(&OwnedValue::Null))
         }
+        // #3922: a jq-mode array of nodes has nothing to compute, so forcing it
+        // could only raise a decode failure this boundary lets through anyway;
+        // it is handed on, and whoever reads an element validates it (#3856).
+        GenericResult::LazySeq(seq) if S::TAG == EvalTag::Jq && seq.holds_only_nodes() => {
+            GenericResult::LazySeq(seq)
+        }
         GenericResult::LazySeq(seq) => match seq.materialize_atomic::<S>() {
             Ok(owned) => GenericResult::Owned(owned),
             Err(Control::Error(e)) if e.is_uncatchable_at_value_position() => {
@@ -12745,6 +12897,15 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 // #3476: the same body behind a pipe, `[(., .) | .data]`.
                 if let Some((branches, tail)) = split_comma_head(inner) {
                     return comma_array_generic::<S, V>(branches, tail, value, optional, cursor);
+                }
+                // #3922: and behind a pipe whose head is not the `,`,
+                // `[.[] | ., .]`.
+                if let Some(split) = split_comma_stage(inner) {
+                    if let Some(result) =
+                        comma_stage_array_generic::<S, V>(split, value.clone(), optional, cursor)
+                    {
+                        return result;
+                    }
                 }
             }
             let inner_result = eval_single::<S, _>(inner, value, optional, cursor);
@@ -14862,6 +15023,10 @@ fn check_lazy_item_for_try<V: DocumentValue, S: EvalSemantics>(
                 collapse,
             })
             .map_err(Control::Error),
+        // #3922: see `try_single_generic`'s identical arm.
+        GenericItem::LazySeq(seq) if S::TAG == EvalTag::Jq && seq.holds_only_nodes() => {
+            Ok(GenericItem::LazySeq(seq))
+        }
         GenericItem::LazySeq(seq) => seq.materialize_atomic::<S>().map(GenericItem::Owned),
         other => Ok(other),
     }
@@ -46444,6 +46609,12 @@ mod tests {
                 "{query}"
             );
         }
+        // The head is not a `,`: nothing to distribute, but the `,` stage after
+        // it is the stage route's (#3922, `test_comma_stage_array_route_3922`).
+        assert_eq!(
+            comma_array_route::<JqSemantics>("[.a | (., .)]", doc),
+            "cursors"
+        );
         for query in [
             // Every item a scalar: a small array is cheaper than a sequence.
             "[(., .) | .m]",
@@ -46454,8 +46625,6 @@ mod tests {
             // A computed stage is not pure navigation.
             "[(., .) | .a | length]",
             "[(., .) | .a | select(.x)]",
-            // The head is not a `,`: nothing to distribute.
-            "[.a | (., .)]",
             // The `,` sits under a `?`, which the head match does not see through.
             "[((., .))? | .a]",
         ] {
@@ -46478,6 +46647,97 @@ mod tests {
             comma_array_route::<YqSemantics>("[(., .) | .a]", doc),
             "cursors"
         );
+    }
+
+    /// #3922: the `?`/`try` boundary hands on a node-only sequence unforced
+    /// because materializing one can only raise a decode failure, which no
+    /// `try` catches. This fails if a walk over a node ever raises anything
+    /// catchable: it reads each kind of unreadable subtree the way the
+    /// boundary would have.
+    #[test]
+    fn test_node_sequence_materializes_only_uncatchable_errors_3922() {
+        let deep = alloc::format!("[{}1{}]", "[".repeat(300), "]".repeat(300));
+        for doc in [
+            "[tru]",
+            "[1.2.3]",
+            r#"["\q"]"#,
+            r#"[{"a" 1}]"#,
+            r#"[{"a":1 "b":2}]"#,
+            r#"[{"a":tru}]"#,
+            r#"[{"a":1,}]"#,
+            "[[1,]]",
+            "[[1 2]]",
+            "[[tru]]",
+            deep.as_str(),
+        ] {
+            let index = JsonIndex::build(doc.as_bytes());
+            let node = index
+                .root(doc.as_bytes())
+                .first_child()
+                .expect("one element");
+            for seq in [
+                LazySeq::<crate::json::light::StandardJson<'_, Vec<u64>>>::from_repeating_cursors(
+                    alloc::vec![node, node],
+                ),
+                LazySeq::from_mixed(alloc::vec![
+                    LazyElem::Cursor(node),
+                    LazyElem::Owned(OwnedValue::Int(1)),
+                ]),
+            ] {
+                assert!(seq.holds_only_nodes(), "{doc}");
+                let result = seq.materialize_atomic::<JqSemantics>();
+                assert!(
+                    matches!(&result, Err(Control::Error(e)) if e.is_uncatchable_at_value_position()),
+                    "{doc}: expected an uncatchable decode failure, got {result:?}"
+                );
+            }
+        }
+    }
+
+    /// #3922: a `,` stage after a pipe of pure navigation takes the comma
+    /// route, per output of the stages before it, and a `?`/`try` around an
+    /// array that holds only nodes and values hands it on instead of
+    /// forcing it. What neither takes stays as it was, and yq never enters.
+    #[test]
+    fn test_comma_stage_array_route_3922() {
+        let doc = r#"{"a":{"x":1},"b":[2],"n":"s","m":3}"#;
+        for (query, route) in [
+            ("[.[] | ., .]", "cursors"),
+            ("[.a | (., .)]", "cursors"),
+            ("[.[] | (., .) | .]", "cursors"),
+            ("[.a | ., .missing]", "mixed"),
+            // Every item a scalar: a small array is cheaper than a sequence.
+            ("[.a | .x, .x]", "owned"),
+            // A prefix that is not a document node declines to the owned route.
+            ("[.missing | .a, .b]", "owned"),
+            ("[.a.x | ., .]", "owned"),
+            // A computed stage is not pure navigation.
+            ("[.[] | ., length]", "owned"),
+            ("[.[] | length, .]", "owned"),
+            // The `?` covers the group, so it is not the branches of a `,`.
+            ("[.a | (., .)?]", "owned"),
+            // The boundary no longer forces an array of nodes and values.
+            ("[.a, .b]?", "cursors"),
+            ("[.[] | ., .]?", "cursors"),
+            ("try [.a, .b] catch \"c\"", "cursors"),
+            ("[., 1]?", "mixed"),
+            // Nothing to hand on: the array is built.
+            ("[.m, .n]?", "owned"),
+        ] {
+            assert_eq!(
+                comma_array_route::<JqSemantics>(query, doc),
+                route,
+                "{query}"
+            );
+        }
+        // yq keeps its owned routes, with or without the boundary.
+        for query in ["[.[] | ., .]", "[.a, .b]?"] {
+            assert_ne!(
+                comma_array_route::<YqSemantics>(query, doc),
+                "cursors",
+                "{query}"
+            );
+        }
     }
 
     /// #3502: `fold_pipe_stages`' `ManyCursor` arm borrows the rest of the
@@ -47711,6 +47971,70 @@ mod tests {
         assert_eq!(split("[(., .) | length]"), None);
         assert_eq!(split("[(., .) | . + 1]"), None);
         assert_eq!(split("[((., .))? | .a]"), None);
+    }
+
+    /// #3922: only a sequence of nodes with nothing left to compute is handed
+    /// on unforced; any other source, or a pending `map`, is forced as before.
+    #[test]
+    fn test_holds_only_nodes_declines_other_sequences_3922() {
+        type Seq<'a> = LazySeq<crate::json::light::StandardJson<'a, Vec<u64>>>;
+        let doc = b"[1,2]";
+        let index = JsonIndex::build(doc);
+        assert!(!Seq::new(LazySource::IndexRange { next: 0, len: 2 }).holds_only_nodes());
+        let node = index.root(doc).first_child().expect("one element");
+        assert!(Seq::from_cursors(alloc::vec![node]).holds_only_nodes());
+    }
+
+    /// #3922: a raise out of a branch (or the `tail`) of a `,` stage becomes
+    /// the array's failure, whether the prefix answered one node or many.
+    #[test]
+    fn test_comma_stage_array_raise_3922() {
+        let doc = r#"{"a":"s","b":"t"}"#;
+        for query in ["[.a | ., .x]", "[.[] | ., .x]"] {
+            let index = JsonIndex::build(doc.as_bytes());
+            let expr = crate::jq::parse(query).unwrap();
+            let result =
+                eval_with_cursor_using::<JqSemantics, _>(&expr, index.root(doc.as_bytes()));
+            assert!(
+                matches!(result, GenericResult::Error(_)),
+                "{query}: not an error"
+            );
+        }
+    }
+
+    /// #3922: which bodies [`split_comma_stage`] takes. A `,` that heads the
+    /// pipe is [`split_comma_head`]'s, so the two never both answer.
+    #[test]
+    fn test_split_comma_stage_3922() {
+        let body = |query: &str| match crate::jq::parse(query).unwrap() {
+            Expr::Array(inner) => *inner,
+            other => other,
+        };
+        let split = |query: &str| {
+            split_comma_stage(&body(query))
+                .map(|(prefix, branches, tail)| (prefix.len(), branches.len(), tail.len()))
+        };
+        assert_eq!(split("[.[] | ., .]"), Some((1, 2, 0)));
+        assert_eq!(
+            split("[.a | .[] | (.b, .c, .d) | .e | .f]"),
+            Some((2, 3, 2))
+        );
+        assert_eq!(split("[.[] | ((., .))]"), Some((1, 2, 0)));
+        // Only the first `,` stage splits; a later one stays in the tail.
+        assert_eq!(split("[.[] | (., .) | (.a, .b)]"), Some((1, 2, 1)));
+        // A `,` heading the pipe is `split_comma_head`'s, never this one's.
+        assert_eq!(split("[(., .) | .a]"), None);
+        assert!(split_comma_head(&body("[(., .) | .a]")).is_some());
+        // No pipe, no `,` stage, a computed stage anywhere, or a `,` under a `?`.
+        assert_eq!(split("1, 2"), None);
+        assert_eq!(split("[., .]"), None);
+        assert_eq!(split("[.[] | .a]"), None);
+        assert_eq!(split("[.[] | (., 1)]"), None);
+        assert_eq!(split("[.[] | length | (., .)]"), None);
+        assert_eq!(split("[.[] | (., .) | length]"), None);
+        assert_eq!(split("[.[] | ((., .))?]"), None);
+        // `(a, b)?` is not the same branches as `a, b`: the `?` covers the group.
+        assert_eq!(split("[.[] | (., .)?]"), None);
     }
 
     /// #3501: the array routes' own predicate admits exactly the

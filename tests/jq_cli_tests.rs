@@ -98005,11 +98005,34 @@ fn test_unreadable_value_collection_split_3266() -> Result<()> {
             5,
         ),
         (&["-c"], OBJ, ".[0] | [.b, empty] | length", "1\n", 0),
-        (&["-c"], OBJ, ".[0] | [.[] | ., .] | length", "", 5),
+        // #3922: a `,` behind a pipe whose head is not the `,` holds its nodes
+        // too, and printing the array still reads the unreadable one.
+        (&["-c"], OBJ, ".[0] | [.[] | ., .] | length", "4\n", 0),
+        (&["-c"], OBJ, ".[0] | [.[] | ., .]", "", 5),
+        (&["-c"], OBJ, ".[0] | [.[] | ., .] | .[0]", "1\n", 0),
+        (&["-c"], OBJ, ".[0] | [.[] | ., .] | .[3]", "", 5),
         (&["-c"], OBJ, ".[0] | [.[] | [.]] | length", "", 5),
         (&["-c"], "[1.2.3]", ".[0] | try ([., 1]) catch \"c\"", "", 5),
-        // A `?` around the array sends it down the owned route, which decodes.
-        (&["-c"], OBJ, ".[0] | [.a, .b]? | length", "", 5),
+        // #3922: a `?` around the array no longer decodes what it holds: a
+        // decode failure is never caught, so the boundary has nothing to check
+        // for, and whatever reads an element validates it.
+        (&["-c"], OBJ, ".[0] | [.a, .b]? | length", "2\n", 0),
+        (&["-c"], OBJ, ".[0] | [.a, .b]?", "", 5),
+        (&["-c"], OBJ, ".[0] | [.a, .b]? | .[1]", "", 5),
+        (
+            &["-c"],
+            OBJ,
+            ".[0] | try ([.a, .b]) catch \"c\" | length",
+            "2\n",
+            0,
+        ),
+        (
+            &["-c"],
+            OBJ,
+            ".[0] | try ([.a, .b] | .[1]) catch \"c\"",
+            "",
+            5,
+        ),
         (&["-c"], OBJ, ".[0] | [first(.b)] | length", "1\n", 0),
         (
             &["-c"],
@@ -98040,6 +98063,89 @@ fn test_unreadable_value_collection_split_3266() -> Result<()> {
             (out.as_str(), got),
             (stdout, code),
             "{flags:?} {filter} on {doc}: {err:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3922: an array over a `,` stage that does not head its pipe
+/// (`[.[] | ., .]`), and one wrapped in `?`/`try`, answer what jq answers on a
+/// readable document: the items interleave per output of the stages before the
+/// `,`, an empty or failing prefix and a raise inside a branch behave as in the
+/// pipe, and a prefix that is not a document node (`.users[9]`, `null`) declines
+/// to the owned route with the same answer. Every expectation was captured from
+/// `/usr/bin/jq` 1.7.1 on this document (stdout, exit code).
+#[test]
+fn test_comma_stage_array_matches_jq_3922() -> Result<()> {
+    let doc = r#"{"users":[{"id":1,"n":"a","t":[1,2]},{"id":2,"n":"b","t":[]},{"id":3,"n":"c","t":[3]}],"k":null}"#;
+    let rows: &[(&str, &str, i32)] = &[
+        (
+            "[.users[] | ., .]",
+            "[{\"id\":1,\"n\":\"a\",\"t\":[1,2]},{\"id\":1,\"n\":\"a\",\"t\":[1,2]},{\"id\":2,\"n\":\"b\",\"t\":[]},{\"id\":2,\"n\":\"b\",\"t\":[]},{\"id\":3,\"n\":\"c\",\"t\":[3]},{\"id\":3,\"n\":\"c\",\"t\":[3]}]\n",
+            0,
+        ),
+        ("[.users[] | .id, .n]", "[1,\"a\",2,\"b\",3,\"c\"]\n", 0),
+        (
+            "[.users[] | (.id, .n), .t]",
+            "[1,\"a\",[1,2],2,\"b\",[],3,\"c\",[3]]\n",
+            0,
+        ),
+        ("[.users[] | .t[] | ., .]", "[1,1,2,2,3,3]\n", 0),
+        ("[.users[] | (.t, .t) | .[0]]", "[1,1,null,null,3,3]\n", 0),
+        ("[.users[] | .nope, .id]", "[null,1,null,2,null,3]\n", 0),
+        ("[.users[] | .t[0], .t[1]]", "[1,2,null,null,3,null]\n", 0),
+        ("[.users[] | .id, .id | .]", "[1,1,2,2,3,3]\n", 0),
+        ("[.users[] | (.id, .n) | .]", "[1,\"a\",2,\"b\",3,\"c\"]\n", 0),
+        ("[.users | .[] | .id, .n] | length", "6\n", 0),
+        ("[.users[]? | ., .] | length", "6\n", 0),
+        ("[.users[] | .t[]? | ., .] | length", "6\n", 0),
+        ("[.users[] | ., .] | map(.id)", "[1,1,2,2,3,3]\n", 0),
+        ("[.users[] | ., .] | .[3].id", "2\n", 0),
+        ("[.users[] | ., .] | add | length", "3\n", 0),
+        (
+            "[.users[] | ., .] | first",
+            "{\"id\":1,\"n\":\"a\",\"t\":[1,2]}\n",
+            0,
+        ),
+        // A prefix with no output is an empty array; one that raises is the
+        // array's failure.
+        ("[.users[1].t[] | ., .]", "[]\n", 0),
+        ("[.k[]? | ., .]", "[]\n", 0),
+        ("[.k[] | ., .]", "", 5),
+        // A value carried without its node (`to_entries` builds new objects)
+        // has no cursors to keep.
+        (
+            ".users | to_entries | [.[] | .value | ., .] | length",
+            "6\n",
+            0,
+        ),
+        // A prefix that is not a document node declines to the owned route.
+        ("[.users[9] | ., .]", "[null,null]\n", 0),
+        ("[.nope | .a, .b]", "[null,null]\n", 0),
+        // A computed branch is not this route's.
+        (
+            "[.users[] | ., 1]",
+            "[{\"id\":1,\"n\":\"a\",\"t\":[1,2]},1,{\"id\":2,\"n\":\"b\",\"t\":[]},1,{\"id\":3,\"n\":\"c\",\"t\":[3]},1]\n",
+            0,
+        ),
+        // `?` and `try` around the array: a branch's raise is still caught, the
+        // array itself is unchanged.
+        ("[.users[] | .id, .n]?", "[1,\"a\",2,\"b\",3,\"c\"]\n", 0),
+        ("[.users[0].n.x, .id]?", "", 0),
+        ("try [.users[0].n.x, 1] catch \"c\"", "\"c\"\n", 0),
+        ("[.users, 1]? | length", "2\n", 0),
+        (
+            "[.users, 1]?",
+            "[[{\"id\":1,\"n\":\"a\",\"t\":[1,2]},{\"id\":2,\"n\":\"b\",\"t\":[]},{\"id\":3,\"n\":\"c\",\"t\":[3]}],1]\n",
+            0,
+        ),
+    ];
+    for &(filter, want, want_code) in rows {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (want, want_code),
+            "{filter}: {stderr:?}"
         );
     }
     Ok(())

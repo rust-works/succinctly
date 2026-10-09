@@ -9880,11 +9880,14 @@ others.
 | `[.b] \| length` on `[{"a":1,"b":tru}]`                 | `1`                             | `1`             |
 | `[.a, .b] \| length`, `[.[], 1] \| length` (same)       | `2`, `3`                        | `2`, `3`        |
 | `[.a, .b]` (printed, same)                              | raises                          | raises          |
+| `[.[] \| ., .] \| length`, `[.a, .b]? \| length` (same) | `4`, `2`                        | `4`, `2`        |
 | `. as $x \| [$x] \| length` on `[1.2.3]`                | raises                          | raises          |
 
 **Accepted: what is left of the collection split inside the cursor evaluator (#3427, narrowed
 by #3856).** A jq-mode array whose body is a `,` (`[., 1]`, `[., .]`, `[.a, .b]`, `[.[], 1]`,
-`[.b, empty]`, and a `,` head behind a pipe of navigation) holds each document node it collects
+`[.b, empty]`, a `,` head behind a pipe of navigation, and since #3922 a `,` stage after a pipe of
+navigation, `[.[] | ., .]`, where each output of the stages before it gets every branch in turn)
+holds each document node it collects
 as a cursor, beside whatever the other branches compute, and reads none of them: `[., 1] |
 length` answers over an unreadable value. Printing the array reads every node, so `[., 1]` and
 `[.a, .b]` themselves raise and write nothing; so does a consumer that reads the malformed node
@@ -9903,12 +9906,23 @@ builds an owned value and decodes what it holds, so each of these raises where t
 
 - a construction held inside another: `[[.]]`, `[.[] | [.]]`, `{a: {b: .}}`, since the inner
   construction is materialized to be an element;
-- a computed stream that is not a `,` body, `[.[] | ., .]`, whose pipe head is not a `,`;
+- a computed stream that is not a `,` body, or a pipe with a computed stage (`[.[] | ., 1]`,
+  `[.[] | length, .]`), which is not the pure navigation the regrouping is sound for;
 - a variable bind that decodes at the bind, below;
 - yq mode, whose printer materializes a sequence anyway and so keeps its owned routes.
 
-`try` and `?` around the remaining collections do not rescue them (`try ([[.]]) catch "c"`),
-because the failure is a decode failure.
+`try` and `?` do not rescue them (`try ([[.]]) catch "c"`), because the failure is a decode
+failure. Since #3922 they do not force an array that holds only nodes and computed values either:
+`[.a, .b]? | length` and `try ([.[] | ., .]) catch "c" | length` answer over an unreadable value
+(`2`, `4`), where the boundary used to decode the array to learn whether it fails, and a
+well-formed 7 MB `users` document paid 8-17x the time and 3-5x the memory of the bare array for it
+(`[.users, 1]? | length` 0.08 s and 82 MB, `[.users[] | ., .] | length` 0.17 s and 156 MB, against
+0.01 s and 18-30 MB). Nothing is lost by it: the only failure such an array can raise is a decode
+failure, which `?`/`try` let through anyway, so it surfaces where an element is read (printing
+`[.a, .b]?` still raises and writes nothing, and so do `tojson`, `//` and `isempty` over it). A
+consumer that reads only well-formed nodes answers where it used to raise (`first([.a, .b]?)`,
+`[.a, .b]? | length`), and `.[]` streams the elements before the malformed one. A branch that
+raises (`[.users[0].n.x, 1]?`) is still caught.
 
 **An object holds its nodes too (#4044, jq mode).** `{a: .users}`, `{meta: .meta, data: .users}`,
 `{x: .b}` and `{a: .}` hold each document node a member names as a cursor and read none of them,
