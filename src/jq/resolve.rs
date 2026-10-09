@@ -2433,14 +2433,17 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
         // the units are reversed: an error of the block itself stays in
         // source order (`ua + ub` is `ua`, `ub`), and `and`, `or` and `//`
         // are not such calls.
-        Expr::Arithmetic { left, right, .. } | Expr::Compare { left, right, .. } => {
-            let start = cx.mark();
-            check(left, cx, reachable);
-            let middle = cx.mark();
-            check(right, cx, reachable);
-            let end = cx.mark();
-            cx.reorder(&[start, middle, end], Some(&[1, 0]), None);
+        Expr::Arithmetic {
+            left,
+            right,
+            settle,
+            ..
+        } => {
+            // The pass below can rewrite an operand in place (#3997).
+            settle.forget();
+            check_operator_operands(left, right, cx, reachable);
         }
+        Expr::Compare { left, right, .. } => check_operator_operands(left, right, cx, reachable),
 
         Expr::And(left, right) | Expr::Or(left, right) | Expr::Alternative(left, right) => {
             check(left, cx, reachable);
@@ -3199,6 +3202,22 @@ fn collect_def_body_addrs(expr: &Expr, addrs: &mut Vec<usize>) {
 }
 
 /// [`check`] over an optional sub-expression.
+/// The operands of an arithmetic or comparison operator, checked in order
+/// and reported in jq's reversed one (#3583).
+fn check_operator_operands(
+    left: &mut Expr,
+    right: &mut Expr,
+    cx: &mut CheckCtx,
+    reachable: &BTreeSet<usize>,
+) {
+    let start = cx.mark();
+    check(left, cx, reachable);
+    let middle = cx.mark();
+    check(right, cx, reachable);
+    let end = cx.mark();
+    cx.reorder(&[start, middle, end], Some(&[1, 0]), None);
+}
+
 fn check_opt(expr: Option<&mut Expr>, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
     if let Some(e) = expr {
         check(e, cx, reachable);
@@ -3829,6 +3848,29 @@ mod tests {
     /// applies here exactly as it does to a plain `error` call. Confirmed
     /// live: `def error(m): "S1"; label $out | 1, break $out` still answers
     /// `1` in jq 1.7.1.
+    /// #3997: a node whose operands the resolve pass rewrites in place does
+    /// not keep what a settle walk remembered about the old ones.
+    #[test]
+    fn resolving_an_arithmetic_node_forgets_its_settle_memo_3997() {
+        let mut expr = parse("def f: 1; f + f").unwrap();
+        let Expr::FuncDef { then, .. } = &mut expr else {
+            panic!("expected a def") // patchcov: coverage tolerate-line reason="unreachable in a passing suite: the source above starts with a `def` (#3997)"
+        };
+        let Expr::Arithmetic { settle, .. } = &**then else {
+            panic!("expected arithmetic") // patchcov: coverage tolerate-line reason="unreachable in a passing suite: `f + f` is arithmetic (#3997)"
+        };
+        settle.set(Some(true), 5);
+        assert!(settle.get().is_some());
+        resolve_func_calls(&mut expr).unwrap();
+        let Expr::FuncDef { then, .. } = &expr else {
+            unreachable!(); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: resolving keeps the def (#3997)"
+        };
+        let Expr::Arithmetic { settle, .. } = &**then else {
+            unreachable!(); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: resolving keeps the operator (#3997)"
+        };
+        assert!(settle.get().is_none());
+    }
+
     #[test]
     fn break_is_not_shadowed_by_a_different_arity_def_error() {
         assert_eq!(

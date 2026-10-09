@@ -91062,8 +91062,9 @@ mod tests {
                 "(f | . + f) + f + (f - f)",
             ));
             for chain in &chains {
-                let cold = chain.clone();
-                let (full_result, full_left) = settle_walk_3997(&cold, SETTLE_ANALYSIS_BUDGET);
+                let pristine = chain.clone();
+                let (full_result, full_left) =
+                    settle_walk_3997(&pristine.clone(), SETTLE_ANALYSIS_BUDGET);
                 let cost = SETTLE_ANALYSIS_BUDGET - full_left;
                 // Remember everything the full walk can.
                 assert_eq!(
@@ -91076,10 +91077,12 @@ mod tests {
                         .into_iter()
                         .filter(|b| *b > 0),
                 );
+                // Never walked itself: only ever cloned, and a clone is cold.
+                let never_walked = pristine.clone();
                 for budget in budgets {
                     for (warm, cold) in left_spine_3997(chain)
                         .into_iter()
-                        .zip(left_spine_3997(&cold.clone()))
+                        .zip(left_spine_3997(&never_walked))
                     {
                         assert_eq!(
                             settle_walk_3997(warm, budget),
@@ -91089,7 +91092,7 @@ mod tests {
                     }
                     assert_eq!(
                         settle_walk_3997(chain, budget),
-                        settle_walk_3997(&cold.clone(), budget),
+                        settle_walk_3997(&pristine.clone(), budget),
                         "budget {budget} over a {cost}-node chain"
                     );
                 }
@@ -91097,7 +91100,7 @@ mod tests {
                 assert_eq!(settles_before_consumer(chain), full_result == Some(true));
                 assert_eq!(
                     settle_probe(chain),
-                    settle_probe(&cold.clone()),
+                    settle_probe(&pristine.clone()),
                     "the probe reads the same answer"
                 );
             }

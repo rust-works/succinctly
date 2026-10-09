@@ -1747,8 +1747,8 @@ impl PartialEq for PathContextMemo {
 ///
 /// Derived state, like [`BoundBody`]: no part of equality or `Debug`, and a
 /// clone starts empty, so a copy rewritten afterwards is never read through
-/// the original's answer. Nothing rewrites an operand once evaluation has
-/// begun; the resolve passes that do run before it.
+/// the original's answer. The resolve passes rewrite operands in place and
+/// forget it on the way down; nothing else does, once built.
 #[derive(Default)]
 pub struct ArithSettleMemo(core::cell::Cell<u16>);
 
@@ -1760,7 +1760,7 @@ impl ArithSettleMemo {
 
     /// The walk's result (`None`: not recognised) and the nodes it visited,
     /// this node included.
-    pub fn get(&self) -> Option<(Option<bool>, u32)> {
+    pub(crate) fn get(&self) -> Option<(Option<bool>, u32)> {
         let packed = self.0.get();
         if packed & Self::KNOWN == 0 {
             return None;
@@ -1773,9 +1773,15 @@ impl ArithSettleMemo {
         Some((result, u32::from(packed) & Self::MAX_COST))
     }
 
+    /// Forget what was remembered: for a pass about to rewrite the operands
+    /// of the node that holds it in place.
+    pub(crate) fn forget(&self) {
+        self.0.set(0);
+    }
+
     /// Remember a walk of `cost` nodes that ended in `result`. A cost that
     /// does not fit is left unremembered.
-    pub fn set(&self, result: Option<bool>, cost: u32) {
+    pub(crate) fn set(&self, result: Option<bool>, cost: u32) {
         if cost > Self::MAX_COST {
             return;
         }
