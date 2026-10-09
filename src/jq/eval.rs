@@ -135915,13 +135915,6 @@ mod touched_edge_cases_2999 {
         );
     }
 
-    /// #3479: a construct the generic evaluator bridges to the owned evaluator
-    /// evaluates over the DOM document's existing text and index when it is
-    /// handed the whole document, instead of writing the decoded value out and
-    /// indexing it again. `reindex_count` counts every serialize-and-index of an
-    /// `OwnedValue`: building the document is one, and the registered route adds
-    /// no second, where the unregistered `eval` over the same document adds one
-    /// per bridged call.
     /// #2783: the eager evaluator collects a `{...}` holding a bare entry the way
     /// yq's `COLLECT_OBJECT` does. Every row was captured from yq v4.53.3 over
     /// `{"a":1,"l":[1,2]}`.
@@ -135962,6 +135955,13 @@ mod touched_edge_cases_2999 {
         assert_eq!(run("{k: .a}", true), r#"{"k":1}"#);
     }
 
+    /// #3479: a construct the generic evaluator bridges to the owned evaluator
+    /// evaluates over the DOM document's existing text and index when it is
+    /// handed the whole document, instead of writing the decoded value out and
+    /// indexing it again. `reindex_count` counts every serialize-and-index of an
+    /// `OwnedValue`: building the document is one, and the registered route adds
+    /// no second, where the unregistered `eval` over the same document adds one
+    /// per bridged call.
     #[cfg(feature = "regex")]
     #[test]
     fn registered_document_bridges_without_reindexing_3479() {

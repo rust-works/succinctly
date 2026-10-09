@@ -11,9 +11,11 @@
 //! (`pkg/yqlib/operator_collect_object.go`), quirks included, because the
 //! quirks are the behaviour being reproduced (ADR-0018 rule 3).
 //!
-//! A construction with only pair entries never comes here: its cross product is
-//! what this operator computes for them, and the evaluators' own fan-out
-//! already produces it without the round trip through nodes.
+//! A construction with only pair entries never comes here: for distinct keys its
+//! cross product is what this operator computes, and the evaluators' own fan-out
+//! already produces it without the round trip through nodes. A repeated key is the
+//! one difference -- this operator deep-merges the two maps where the fan-out keeps
+//! the last (#4182).
 
 use alloc::string::String;
 use alloc::vec::Vec;

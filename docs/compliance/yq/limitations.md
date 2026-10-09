@@ -4938,10 +4938,12 @@ Residual divergences remain, all in cases yq itself reaches through its node mod
   mapping in yq; `OwnedValue` object keys are strings, so `succinctly yq` raises its usual
   `Cannot use array as object key` error instead (rule 4(a): there is nothing to write the key
   into that we could read back).
-- **Several inputs.** Under `--eval-all` or after `.[] |`, yq's `N` is the number of matching
-  nodes and one bare entry is collected across all of them; `succinctly yq` builds each input's
-  object on its own. A bare entry whose child count differs from the input count is the one
-  place the two models split.
+- **Several inputs.** After a fan-out (`.[] | {.k}`), yq runs `COLLECT_OBJECT` once over every
+  matching node, so `N` is the node count and the size check spans all of them;
+  `succinctly yq` builds each input's object on its own. `.[] | {.k}` over elements whose `k`
+  has different lengths is the `CollectObject: mismatching node sizes` error in yq and no output
+  here, and `[.l[] | {.nope}]` is `[{}]` in yq and `[{},{}]` here (#4184). Pair-only
+  constructions are unaffected (one object per node either way).
 - **Duplicate keys.** yq folds the entries of a `{...}` with `*`, so `{"a": {"x": 1}, "a": {"y": 2}}`
   deep-merges to `a: {x: 1, y: 2}`; `succinctly yq` keeps the last (`a: {y: 2}`), as it did before
   #2783. Scalars and arrays agree (the later one wins either way). A construction holding a bare
@@ -5118,7 +5120,9 @@ off by default.
 The same gate covers the jq-styled **object-construction sugar** real yq's lexer rejects:
 bare identifier keys (`{b: 2}`) and the field shorthand (`{x}`, meaning `{x: .x}`)
 ([#2783](https://github.com/rust-works/succinctly/issues/2783)). `succinctly yq` rejects them
-by default; with `--jq-extensions` they keep their jq meaning.
+by default; with `--jq-extensions` they keep their jq meaning. The flag decides on the entry's
+first character: an entry that starts like an identifier (`{length, "k": 1}`) is jq's field
+shorthand (`{length: .length, ...}`), not yq's bare entry.
 
 `gsub`/`scan`/`splits` specifically: real yq's lexer rejects all three outright, at any
 arity ([#1436](https://github.com/rust-works/succinctly/issues/1436)) — this isn't "3-arg
