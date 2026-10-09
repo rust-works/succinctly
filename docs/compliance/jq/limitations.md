@@ -11186,7 +11186,10 @@ register and keeps answering the moved position
 A compound body (`,`, `//`, `if`, `try`) states it per branch, trackable entries only
 (`compound_states_register_per_result`, #3899): `(.a?, true)` over a `true` register is `["x"]`, while
 a branch that lands off the register (`false`, `1`) or after a navigating branch still refuses
-(`test_destructuring_alt_bind_with_a_compound_body_states_its_register_per_branch_3899`). An answer that is a valid path is printed before the raise of the
+(`test_destructuring_alt_bind_with_a_compound_body_states_its_register_per_branch_3899`). A destructure that
+*succeeds* moves the register before the body runs, and a `?` navigating branch after it is still read as it was: `path(.x |
+(. as [$q] ?// $z | (.[0]?, true)))` on `{"x":[true]}` prints `["x",0]` before raising in jq, and refuses without printing it
+here. An answer that is a valid path is printed before the raise of the
 retry that follows it, as jq does (`test_any_all_path_answer_precedes_retry_raise_3827`).
 
 ## Provenance

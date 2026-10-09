@@ -16430,6 +16430,8 @@ pub(crate) fn any_all_probe_element_notifying<S: EvalSemantics>(
     let mut decided: Option<(usize, u64)> = None;
     let flow = eval_each_owned::<S>(cond, elem, false, Reentry::REBUILT, &mut |out| {
         if out.is_truthy() == target_truthy {
+            // Before the snapshot, so what the consumer does with the answer (it may
+            // run a `?//` of its own) is not counted as a retry of `cond`'s.
             on_decisive();
             let verdicts = decided.map_or(0, |(n, _)| n) + 1;
             decided = Some((verdicts, pipe_retry_generation()));
@@ -43314,7 +43316,7 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
             delivery.sink,
         );
     }
-    finish_any_all_answers::<S>(delivery, flow, owed, target_truthy, trackable, value)
+    finish_any_all_answers::<S>(delivery, flow, owed, trackable, value)
 }
 
 /// The consumer side of `any`/`all`'s path answers (#3827, #3899): each decisive
@@ -43395,10 +43397,10 @@ fn finish_any_all_answers<'a, S: EvalSemantics>(
     mut delivery: AnswerDelivery<'_, 'a>,
     flow: ResolveFlow,
     owed: Option<EvalEscape>,
-    target_truthy: bool,
     trackable: bool,
     value: &'a OwnedValue,
 ) -> ResolveFlow {
+    let target_truthy = delivery.target_truthy;
     let (escape, identity_follows) = match (owed, flow) {
         (Some(escape), _) | (None, ResolveFlow::Escaped(escape)) => (Some(escape), false),
         (None, ResolveFlow::Stopped) => (None, false),
@@ -135138,6 +135140,8 @@ mod compound_states_register_mode_gate_tests {
             "if . then 1 else 2 end",
             "try error(\"x\") catch 2",
             "try (.a) catch 2",
+            // #3899: a destructuring bind over a compound body
+            ". as [$q] ?// $z | (.a?, true)",
         ] {
             let expr = parse(src).unwrap();
             assert!(
@@ -135158,6 +135162,24 @@ mod compound_states_register_mode_gate_tests {
         let expr = parse(".a").unwrap();
         assert!(!compound_states_register_per_result::<JqSemantics>(&expr));
         assert!(!compound_states_register_per_result::<YqSemantics>(&expr));
+    }
+
+    // #3899: the bind arm admits a destructuring pattern over a compound body and
+    // nothing else -- a bare `$var` chain, or a body that is not compound, is
+    // judged elsewhere ([`stage_states_register_per_result`]).
+    #[test]
+    fn a_bind_is_admitted_only_for_a_destructuring_pattern_over_a_compound_body() {
+        for src in [
+            ". as $q ?// $z | (.a?, true)",
+            ". as [$q] ?// $z | .a",
+            ". as [$q] ?// $z | true",
+        ] {
+            let expr = parse(src).unwrap();
+            assert!(
+                !compound_states_register_per_result::<JqSemantics>(&expr),
+                "`{src}` must not be admitted by the compound arm"
+            );
+        }
     }
 }
 
