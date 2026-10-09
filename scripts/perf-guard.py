@@ -365,6 +365,15 @@ DEFAULT_THRESHOLD = 5.0
 # entry's own removal, also #3345) once every row read ~0% again against a
 # merge-base that already included it.
 #
+# `wide_identity` / `users_identity` / `users_compact_latefail` (#3344, then
+# #4167, which closed #3343) carried overrides of the same one-off kind: `find_close`
+# scanning the starting word directly (#3344, -6.7% / -6.7% / -6.4% x86_64) and
+# `census` sorting only the hashes that land on an already-set bit instead of
+# all of them (#4167, `wide_identity` -6.5% x86_64). Both are now in `main`;
+# the entries were removed (#4170) once all three rows read -0.0% / -0.0% /
+# +0.0% on both x86_64 and ARM64-Linux against a merge-base that already
+# included #4167 (PR #4176's perf-guard logs).
+#
 # `users_del_select` / `users_del_bound_select` / `users_update_select` /
 # `users_assign_scores` (#3069) carried overrides of the same one-off kind:
 # the reindex bridge now hands a container back out as the storage that
@@ -439,16 +448,6 @@ QUERY_THRESHOLDS = {
     # default (-2.1%): its re-render dominates. One-off: remove this entry
     # once the change is in `main` and the row reads ~0% again.
     "users_compact_identity": 10.0,
-    # `wide_identity`, `users_identity`, `users_compact_latefail` (#3344):
-    # `find_close` scans the starting word directly before falling back to the
-    # state machine, so the identity rows' container-close lookups got cheaper
-    # (ARM64-Linux -6.3% / -6.5% / -6.1%, x86_64 -6.7% / -6.7% / -6.4% Ir
-    # against the PR's own merge-base; -5.0% is the default threshold). 10.0 leaves headroom over
-    # the measured -6.7% without hiding a real regression. One-off: remove
-    # these entries once the change is in `main` and the rows read ~0% again.
-    "wide_identity": 10.0,
-    "users_identity": 10.0,
-    "users_compact_latefail": 10.0,
     # `users_keys_unsorted`, `arrays_first_map_iterate` (#4160): the default
     # document loop no longer counts newlines up to a value's end for a
     # location the M2 fast path never reads, and counts the ones it still
