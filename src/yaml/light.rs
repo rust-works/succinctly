@@ -8822,17 +8822,24 @@ fn blank_lines_between(text: &[u8], from: usize, to: usize) -> usize {
     breaks.saturating_sub(1)
 }
 
-/// Whether the line just above the one `at` is on is blank (#4093).
+/// Whether the line just above the one `at` is on is blank -- empty or only blanks (#4093).
+/// A block that starts at the very top of the text has no line above it.
 fn blank_line_before(text: &[u8], at: usize) -> bool {
     let line_start = text[..at.min(text.len())]
         .iter()
         .rposition(|&b| b == b'\n')
         .map_or(0, |i| i + 1);
-    let Some(before) = text[..line_start].strip_suffix(b"\n") else {
+    if line_start == 0 {
         return false;
-    };
-    let before = before.strip_suffix(b"\r").unwrap_or(before);
-    before.is_empty() && line_start > 1 || before.last() == Some(&b'\n')
+    }
+    let above_end = line_start - 1;
+    let above_start = text[..above_end]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |i| i + 1);
+    text[above_start..above_end]
+        .iter()
+        .all(|b| matches!(b, b' ' | b'\t' | b'\r'))
 }
 
 /// Build a node's standalone head comment lines as owned strings, inserting
