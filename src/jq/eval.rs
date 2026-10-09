@@ -42859,6 +42859,23 @@ fn stage_is_register_keeping<S: EvalSemantics>(expr: &Expr) -> bool {
             expr: inner,
             catch: Some(handler),
         } => stage_is_register_keeping::<S>(inner) && cannot_move_register(handler),
+        // #3767: a compound stage whose every branch leaves the register alone.
+        // jq backtracks to the fork each branch starts from (a `,` or `//` fork, an
+        // `if` branch, the next pipe stage), so the register after the whole is where
+        // the last branch's own rule leaves it: back at entry here. An `if`'s condition
+        // is a subexp and not asked. A branch that moves it (`.a`) keeps the whole
+        // refused, as does one this predicate cannot judge (a `def` call, which is
+        // never admitted: `cannot_move_register`'s doc).
+        Expr::Comma(branches) => branches.iter().all(branch_keeps_register::<S>),
+        Expr::Pipe(stages) => stages.iter().all(branch_keeps_register::<S>),
+        Expr::Alternative(left, right) => {
+            branch_keeps_register::<S>(left) && branch_keeps_register::<S>(right)
+        }
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => branch_keeps_register::<S>(then_branch) && branch_keeps_register::<S>(else_branch),
         // #3767: a stage that navigates nothing leaves it where it was, and the
         // wrappers peeled above add no movement, so `first(5)`, `limit(1; 5)` and
         // `nth(0; 5)` are as unmoving as the `5` under them.
@@ -42878,6 +42895,16 @@ fn stage_is_register_keeping<S: EvalSemantics>(expr: &Expr) -> bool {
                     && leaves_register_in_place::<S>(stage))
         }
     }
+}
+
+/// A branch of a compound stage ([`stage_is_register_keeping`]'s `,` `//` `if`
+/// and pipe arms) leaves jq's register where it entered: the same three facts the
+/// caller reads of a bare stage (`resolve_seq_stage`), asked here of each branch
+/// because the caller only asked them of the compound as a whole.
+fn branch_keeps_register<S: EvalSemantics>(branch: &Expr) -> bool {
+    cannot_move_register(branch)
+        || leaves_register_in_place::<S>(branch)
+        || stage_is_register_keeping::<S>(branch)
 }
 
 /// Whether a pipe stage `expr` is one whose by-value leaf states jq's path
@@ -90556,19 +90583,64 @@ mod tests {
             "try (try last(.a) catch .a) catch 2",
             "try .a catch .",
             "try first(.a) catch 7",
-            // a compound inner stage is still not read
-            "try (last(.a), select(.)) catch .",
-            "try (select(.) | last(.a)) catch .",
             "first(.a)",
             "first(.a)?",
-            "(last(.a), select(.))",
             // #3767: a wrapper over a stage that navigates still moves the register
             // (`limit(1; .a)` is a path error in jq).
             "limit(1; .a)",
             "limit(2; first(.a))",
             "nth(0; .a)",
             "nth(0; try .a)",
+        ] {
+            let expr = stage(refused);
+            assert!(
+                !stage_leaves_register_in_place::<JqSemantics>(&expr),
+                "{refused}"
+            );
+        }
+        // #3767 part 5: a compound stage is as register-keeping as its least branch.
+        for admitted in [
+            "(select(.), select(.))",
+            "(select(.), 7)",
+            "(empty, last(.a))",
+            "(select(.) // 7)",
+            "(last(.a) // select(.))",
+            "if . then select(.) else last(.a) end",
+            "if .a then select(.) else . end",
+            "(select(.) | select(.))",
+            "(select(.) | (select(.), last(.a)))",
+            "first(select(.), 3)",
             "limit(1; (last(.a), select(.)))",
+            "try (last(.a), select(.)) catch .",
+            "try (select(.) | last(.a)) catch .",
+            "(select(.), select(.))?",
+        ] {
+            let expr = stage(admitted);
+            assert!(
+                stage_leaves_register_in_place::<JqSemantics>(&expr),
+                "{admitted}"
+            );
+            assert!(
+                !stage_leaves_register_in_place::<YqSemantics>(&expr),
+                "{admitted}"
+            );
+        }
+        // ... and one branch that moves it, or that this predicate cannot judge (a `def`
+        // call), keeps the whole refused.
+        for refused in [
+            "(select(.), .a)",
+            "(.a, select(.))",
+            "(select(.) // .a)",
+            "(.a // select(.))",
+            "if .k then select(.) else .a end",
+            "if .k then .a else select(.) end",
+            "(select(.) | .a)",
+            "(select(.), first(.a))",
+            "(select(.), (.a)?)",
+            "(select(.), getpath([\"a\"]))",
+            "(select(.), (def g: select(.); g))",
+            "try (select(.), .a) catch .",
+            "first(select(.), .a)",
         ] {
             let expr = stage(refused);
             assert!(

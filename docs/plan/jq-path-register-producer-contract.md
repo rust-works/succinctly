@@ -530,8 +530,8 @@ Each turns a refusal into an answer and needs its own oracle rows:
   pass the inner register on. A `select` entered on the register already passed a trackable
   branch through; only the register *carried* by an untracked entry was dropped, so the sweep
   gained contexts that enter the stage on a literal (`untracked-*`). Still refused where jq
-  answers, tracked by #3767: `try ... catch H` with a navigating `H` (the rest is #3767 Part 3, below) and either stage inside a compound stage
-  (`limit`/`nth` and an `[E]` collect of a type filter were lifted by #3767 Part 1, below). Not a
+  answers, tracked by #3767: `try ... catch H` with a navigating `H` (the rest is #3767 Part 3, below) and either stage inside a `def` call
+  (compound stages were lifted by #3767 Part 5, below; `limit`/`nth` and an `[E]` collect of a type filter were lifted by #3767 Part 1, below). Not a
   promotion but found on the way,
   #3766 (fixed): `last(f)` returned a copy, so a `last` whose output is the register itself
   (`last($x)`, `last(.)`) lost its identity; the arm now forwards the last branch itself when
@@ -551,7 +551,11 @@ Each turns a refusal into an answer and needs its own oracle rows:
   `cannot_move_register(stage)` after the peel, and deliberately not by widening `cannot_move_register` itself, whose
   other consumers would all move), and an `[E]` collect of `first(f)`/`limit(n; f)`/`nth(n; f)`
   (`array_contents_are_checked` reads them through to `f`, as the resolver's arms forward `f`'s live branches).
-  Still open under #3767: a compound inner stage (`,` `//` `if` on an untracked entry, a pipe, a `def` call).
+  Done by #3767 Part 5: a compound inner stage (`,` `//` `if`, a pipe) whose every branch is itself
+  register-keeping (`stage_is_register_keeping` recurses through `branch_keeps_register`, which asks
+  `cannot_move_register`, the leaf verdict and the stage rule of each branch: jq backtracks to the fork each
+  branch starts from, so the whole is as unmoving as its least branch). Still open under #3767: a `def` call
+  (`def g: last(.a); g | $x`), which `cannot_move_register` never admits.
 - ~~A `reduce` whose source or `UPDATE` navigates.~~ Done by #3732 (`reduce_leaves_register_in_place`, read by
   `resolve_reduce`'s emission and by `leaves_register_in_place`): jq's `reduce` is `INIT; FORK loop; SOURCE; UPDATE;
   BACKTRACK`, so the register is where INIT left it, and an INIT that cannot move it leaves it at the entry whatever

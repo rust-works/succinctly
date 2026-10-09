@@ -120458,6 +120458,175 @@ fn test_register_wrapper_over_navigates_nothing_stage_3767() -> Result<()> {
     ])
 }
 
+/// #3767 (part 5): a compound stage (`,` `//` `if`, a parenthesised pipe) whose every branch
+/// leaves jq's path register alone leaves it alone as a whole. jq backtracks to the fork each
+/// branch starts from, so after `5 | (select(.), select(.))` the register is back at the
+/// root and `$x` is accepted, once per output (`path(. as $x | 5 | (select(.), 7) | $x)` on
+/// `{"a":{"b":1},"k":2}` is `[]` twice), on `path`, `del`, `=` and `|=`. Contrasts: a branch
+/// that navigates (`.a`), a navigating tail (`| .a`) or an unrelated entry still refuses, as
+/// in jq. Rows with a `def` call are left out: `cannot_move_register` never admits a call
+/// and jq answers them, so they stay refused (the safe direction). Every row captured from
+/// jq 1.7.1, on the stdin and `-n` routes.
+#[test]
+fn test_register_compound_stage_of_register_keeping_branches_3767() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | (select(.), select(.)) | $x)",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | (select(.), 7) | $x)",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | (empty, select(.)) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | (select(.) // 7) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | (select(.) // select(.)) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | if . then select(.) else last(.a) end | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | (select(.) | (select(.), select(.))) | $x)",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | first(select(.), 3) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r#"path(. as $x | 5 | try (select(.), error("e")) catch . | $x)"#,
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | (select(.), select(.)) | $x | .k)",
+            "[\"k\"]\n[\"k\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(. as $x | 5 | (select(.), select(.)) | $x.k)",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"(. as $x | 5 | (select(.) // 7) | $x.k) |= 9",
+            "{\"a\":{\"b\":1},\"k\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"(. as $x | 5 | if . then select(.) else last(.a) end | $x.k) = 9",
+            "{\"a\":{\"b\":1},\"k\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | (select(.), (select(.) | select(.))) | $x)",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | (select(.) // (select(.) | last(.a))) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | (select(.), .a) | $x)",
+            "[]\n",
+            r#"Invalid path expression with result {"a":{"b":1},"k":2}"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | (select(.) // .a) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | if .k then select(.) else .a end | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | (select(.) | .a) | $x)",
+            "",
+            r#"Invalid path expression with result {"a":{"b":1},"k":2}"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | (select(.), last(.a)) | $x)",
+            "[]\n",
+            r#"Invalid path expression near attempt to access element "a" of 5"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | (select(.), 7) | .a)",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of 5"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(. as $x | 5 | (select(.), last(.k)) | $x | .a)",
+            "",
+            r#"Invalid path expression near attempt to access element "k" of 5"#,
+            5,
+        ),
+    ])
+}
+
 /// #3767 (part 4): `first(f)`, `limit(n; f)` and `nth(n; f)` inside an `[E]` collect keep
 /// jq's path register, like `last(f)` (part 2): the collect backtracks, and what `f`
 /// navigates is path-checked as in a pipe, so `[first(numbers)]` is `[]` and
