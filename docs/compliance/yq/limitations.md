@@ -2708,9 +2708,12 @@ Both filed together as [#1998](https://github.com/rust-works/succinctly/issues/1
   generic parse error where yq says `'any_c' expects 1 arg but received none` (#2237's carve-out
   for every required-argument builtin), and the second and later arguments of `any_c(f; g; h)`
   are parsed and dropped, so only a user `def any_c(f; g)` of arity two shadows the builtin (a
-  `def` of arity three does not). Not specific to these builtins and not fixed with them: an
-  undefined variable is *no output* in yq (`any_c($nope)` is `false`, `[.[] | $nope]` is `[]`)
-  and an error here, in every position ([#3976](https://github.com/rust-works/succinctly/issues/3976)).
+  `def` of arity three does not). Not specific to these builtins: an
+  undefined variable is *no output* in yq (`any_c($nope)` is `false`, `[.[] | $nope]` is `[]`),
+  which `succinctly yq` now matches in every position
+  ([#3976](https://github.com/rust-works/succinctly/issues/3976),
+  [#2981](https://github.com/rust-works/succinctly/issues/2981)); see the unbound-variable entry
+  below.
 - **`with_entries(f)` rejects numeric keys** that real yq coerces to strings on reassembly
   (`[1,2] | with_entries(.)` succeeds on real yq, errors `Cannot use number (0) as object key`
   on succinctly) — a functional bug on well-formed input, unrelated to this section's
@@ -5179,3 +5182,18 @@ churn rather than a silent mismatch.
 - [`src/jq/document.rs`](../../../src/jq/document.rs) - `DocumentFields`, incl. the `keys_dedup()` violation
 - [jq Limitations](../jq/limitations.md) - the jq-mode counterpart to this page
 - [mikefarah/yq](https://github.com/mikefarah/yq) - upstream reference
+
+### Unbound `$variable` is no output in yq mode (#2981, #2776, #2767, #3976)
+
+yq has no compile-time variable check: a `$name` no binding reaches is a zero-output generator,
+so `$nope` prints nothing (exit 0), `[1, $nope]` is `[1]` and the empty-operand rules apply as for
+any other empty operand (`1 + $nope` is `1`, `$nope // 5` is `5`). `succinctly yq` matches that
+through `EvalSemantics::UNBOUND_VARIABLE_YIELDS_NOTHING`; `succinctly jq` keeps jq's compile error
+(`$nope is not defined`, exit 3). Two spellings fall out of the same rule: `$__loc__` is no builtin
+in yq (it is an unbound variable, so it prints nothing here too), and `$x-1` is the variable named
+`x-1` (the hyphen extension of #1890), not a subtraction.
+
+Still diverging, and not specific to variables (the same on any empty operand such as
+`select(false)`): `[1] | .[$nope]` is `1` in yq and nothing here, `del(.[$nope])` deletes the whole
+sequence in yq and nothing here, and `$nope as $y | 3` is `3` in yq (the body still runs) and
+nothing here. `$ENV.x` for an unset `x` prints nothing in yq and `null` here.

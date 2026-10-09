@@ -298,6 +298,15 @@ pub trait EvalSemantics: Copy + Default {
     /// behavior every existing jq-mode shape was pinned against.
     const ROOT_PATH_CONTEXT_YIELDS_NOTHING: bool;
 
+    /// A `$name` that no binding reaches is a zero-output generator, not an error (#2981,
+    /// #3976). yq has no compile-time variable check: its lookup of an unbound name finds
+    /// nothing and yields nothing (`$nope` prints nothing, `[1, $nope]` is `[1]`, and the
+    /// empty-operand rules of [`Self::EMPTY_OPERAND_BINARY_RULE`] then apply as for any other
+    /// empty operand: `1 + $nope` is `1`). That covers `$__loc__` (#2776, not a builtin in yq)
+    /// and a hyphen-digit tail the lexer folds into the name (`$x-1`, #2767). jq mode rejects
+    /// the program before it runs (`$nope is not defined`, exit 3) and keeps its error.
+    const UNBOUND_VARIABLE_YIELDS_NOTHING: bool;
+
     /// If true (yq), a binary operator whose *operand* produced zero outputs
     /// answers from `yq_empty_operand_output`'s table (this module, private)
     /// instead of contributing no pairings at all. If false (jq), an empty
@@ -394,6 +403,7 @@ impl EvalSemantics for JqSemantics {
     const SELECT_EMITS_ONCE_IF_ANY_TRUTHY: bool = false;
     const UTF8_LOSSY_USES_JQ_MAXIMAL_SUBPART_RULE: bool = true;
     const ROOT_PATH_CONTEXT_YIELDS_NOTHING: bool = false;
+    const UNBOUND_VARIABLE_YIELDS_NOTHING: bool = false;
     const EMPTY_OPERAND_BINARY_RULE: bool = false;
     const BINARY_FANOUT_IS_LEFT_MAJOR: bool = false;
     const READ_ONLY_ABSENT_KEY_IS_EMPTY: bool = false;
@@ -433,6 +443,7 @@ impl EvalSemantics for YqSemantics {
     const SELECT_EMITS_ONCE_IF_ANY_TRUTHY: bool = true;
     const UTF8_LOSSY_USES_JQ_MAXIMAL_SUBPART_RULE: bool = false;
     const ROOT_PATH_CONTEXT_YIELDS_NOTHING: bool = true;
+    const UNBOUND_VARIABLE_YIELDS_NOTHING: bool = true;
     const EMPTY_OPERAND_BINARY_RULE: bool = true;
     const BINARY_FANOUT_IS_LEFT_MAJOR: bool = true;
     const READ_ONLY_ABSENT_KEY_IS_EMPTY: bool = true;
@@ -3595,7 +3606,11 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Expr::Var(name) => {
             // Variable references without context should error
             // In practice, variables are resolved by eval_as which substitutes them
-            QueryResult::Error(EvalError::new(format!("undefined variable: ${name}")))
+            if S::UNBOUND_VARIABLE_YIELDS_NOTHING {
+                QueryResult::None
+            } else {
+                QueryResult::Error(EvalError::new(format!("undefined variable: ${name}")))
+            }
         }
         // A frozen variable snapshot from `substitute_var_tracked` (#844).
         // Outside `path()`/`del()`/assignment resolution this is just an
@@ -3607,6 +3622,9 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // against. `deferred_bind_is_sound` keeps a deferred binding out of
         // every body that can reach here, so this is the loud backstop.
         Expr::DeferredVar(_) => QueryResult::Error(EvalError::new(DEFERRED_BIND_UNRESOLVED)),
+        // #2776: `$__loc__` is no builtin in yq; the lexer reads it as an ordinary `GET_VARIABLE`
+        // nothing binds, so it is as unbound as `$nope` (`UNBOUND_VARIABLE_YIELDS_NOTHING`).
+        Expr::Loc { .. } if S::UNBOUND_VARIABLE_YIELDS_NOTHING => QueryResult::None,
         Expr::Loc { line, file } => {
             // #2688: `$__loc__` names the *program text*, not the input --
             // jq's own `locfile` uses the literal string `<top-level>` for

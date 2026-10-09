@@ -936,23 +936,93 @@ fn run_yq_stdin_with_stderr(
     Ok((stdout, stderr, exit_code))
 }
 
-/// `succinctly jq` gained a compile-time check rejecting an unbound
-/// `$variable` reference (#2734, exit 3, matching real jq). `succinctly yq`
-/// must not gain it too -- real yq treats an unbound `$variable` as a
-/// zero-output generator rather than any kind of error, confirmed live
-/// against yq v4.53.3 (`$nope` alone: exit 0, zero output; `$nope, 1`:
-/// exit 0, prints only `1`) -- filed separately as #2981 since it is the
-/// opposite direction of divergence and needs its own investigation before
-/// a fix. This pins that `succinctly yq`'s current (separately tracked,
-/// still-diverging) runtime-error behaviour is untouched by #2734's jq-mode
-/// change: `jq_runner.rs`'s new compile check is wired into `resolve_all`,
-/// which `yq_runner.rs` never calls (it keeps using the function-only
-/// `resolve_func_calls`).
+/// `succinctly jq` gained a compile-time check rejecting an unbound `$variable` reference
+/// (#2734, exit 3, matching real jq). `succinctly yq` must not gain it too: real yq treats an
+/// unbound `$variable` as a zero-output generator rather than an error, confirmed live against
+/// yq v4.53.3 (`$nope` alone: exit 0, zero output; `$nope, 1`: exit 0, prints only `1`). That
+/// was a divergence here until #2981 -- `jq_runner.rs`'s compile check is wired into
+/// `resolve_all`, which `yq_runner.rs` never calls, so the rule lives in the evaluator
+/// (`EvalSemantics::UNBOUND_VARIABLE_YIELDS_NOTHING`).
 #[test]
 fn test_unbound_variable_is_not_a_compile_error_here_2734() -> Result<()> {
     let (out, err, code) = run_yq_stdin_with_stderr("$nope", "null\n", &[])?;
-    assert_eq!(code, 1, "stdout: {out:?} stderr: {err:?}");
-    assert!(err.contains("undefined variable: $nope"), "stderr: {err:?}");
+    assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""));
+    Ok(())
+}
+
+/// #2981/#3976: an unbound `$name` is a zero-output generator in every position, and the
+/// empty-operand rules then apply as for any other empty operand (yq v4.53.3).
+#[test]
+fn test_yq_unbound_variable_yields_nothing_in_every_position_2981() -> Result<()> {
+    let cases: &[(&str, &str)] = &[
+        (".[0] | $nope", ""),
+        ("[.[] | $nope]", "[]"),
+        ("map($nope)", "[]"),
+        ("select($nope)", ""),
+        (". as $x | $nope", ""),
+        ("$nope, 1", "1"),
+        ("[$nope, 1, $nope]", "[1]"),
+        ("1 + $nope", "1"),
+        ("$nope + 1", "1"),
+        ("length + $nope", "2"),
+        ("$nope - 1", ""),
+        ("$nope * 2", ""),
+        ("$nope == 1", "false"),
+        ("$nope // 5", "5"),
+        ("$nope | length", ""),
+        ("$nope | not", ""),
+        ("$nope.a", ""),
+        ("$nope[0]", ""),
+        ("{\"a\": $nope}", ""),
+        ("\"x\\($nope)y\"", "\"xy\""),
+        ("$nope and true", "false"),
+        ("first($nope)", ""),
+        ("any_c($nope)", "false"),
+        ("with_entries($nope)", "{}"),
+        ("[.[] | select(. > $nope)]", "[]"),
+        ("[.[] | select(. != $nope)]", "[1,2]"),
+        (". = $nope", "[1,2]"),
+        (". |= $nope", "[1,2]"),
+        (".[0] = $nope", "[1,2]"),
+        ("sort_by($nope)", "[1,2]"),
+        ("(.[0], $nope) = 9", "[9,2]"),
+        ("del($nope)", "[1,2]"),
+    ];
+    for (filter, want) in cases {
+        for extra in [&[][..], &["-P"][..]] {
+            let mut args = vec!["-o=json", "-I=0"];
+            args.extend_from_slice(extra);
+            let (out, code) = run_yq_stdin(filter, "[1, 2]\n", &args)?;
+            assert_eq!((out.trim(), code), (*want, 0), "{filter} {extra:?}");
+        }
+    }
+    Ok(())
+}
+
+/// #2776: `$__loc__` is no builtin in yq, so it is an unbound variable like any other.
+/// #2767: a hyphen-digit tail the lexer folds into the name (`$x-1`) names a different, unbound
+/// variable. A bound variable and `--arg` still resolve; jq mode keeps both.
+#[test]
+fn test_yq_loc_and_hyphen_digit_variables_are_unbound_2776_2767() -> Result<()> {
+    for filter in ["$__loc__", "5 as $x | $x-1", "$__loc__ | .file"] {
+        let (out, code) = run_yq_stdin(filter, "{}\n", &["-o=json", "-I=0"])?;
+        assert_eq!((out.trim(), code), ("", 0), "{filter}");
+    }
+    // The spaced form is a subtraction and still computes.
+    let (out, code) = run_yq_stdin("5 as $x | $x - 1", "{}\n", &["-o=json", "-I=0"])?;
+    assert_eq!((out.trim(), code), ("4", 0));
+    // A bound variable is untouched.
+    let (out, code) = run_yq_stdin(".[] as $x | [$x, $nope]", "[1, 2]\n", &["-o=json", "-I=0"])?;
+    assert_eq!((out.trim(), code), ("[1]\n[2]", 0));
+    // jq mode still rejects an unbound variable at compile time and still has `$__loc__`.
+    let (_out, err, code) = run_jq_stdin_with_stderr("$nope", "{}", &["-c"])?;
+    assert_eq!(code, 3, "stderr: {err:?}");
+    assert!(err.contains("$nope is not defined"), "stderr: {err:?}");
+    let (out, _err, code) = run_jq_stdin_with_stderr("$__loc__", "{}", &["-c"])?;
+    assert_eq!(
+        (out.trim(), code),
+        (r#"{"file":"<top-level>","line":1}"#, 0)
+    );
     Ok(())
 }
 
