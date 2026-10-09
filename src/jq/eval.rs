@@ -134091,13 +134091,21 @@ mod tests {
                 // panicking, so a row that moved shows up in the assertion below.
                 other => {
                     // A deferred array (`[., 1]`, `try ([., 1])`) fails when it is
-                    // read, which `into_owned` reports as a missing value: read it
-                    // first, so the failure is the decode failure it is.
-                    let other = other.materialize_lazy::<JqSemantics>();
-                    if matches!(&other, GenericResult::Error(e) if e.is_decode_failure()) {
+                    // read, and `into_owned` reports that as the decode failure it
+                    // is (#4165), as it does for a deferred object (#4044).
+                    // Only a deferred result counts: a value that arrives
+                    // decoded-or-not and fails in `into_owned` is a different
+                    // answer, which should still show as a moved row.
+                    let deferred = matches!(
+                        other,
+                        GenericResult::LazySeq(_)
+                            | GenericResult::LazyKeys { .. }
+                            | GenericResult::LazyObject(_)
+                    );
+                    let owned = other.into_owned::<JqSemantics>();
+                    if deferred && matches!(&owned, Err(e) if e.is_decode_failure()) {
                         return None;
                     }
-                    let owned = other.into_owned::<JqSemantics>();
                     let answer = owned
                         .as_ref()
                         .ok()
