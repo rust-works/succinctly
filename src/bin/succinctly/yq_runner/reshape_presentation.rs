@@ -21,7 +21,9 @@ pub(super) fn supported(expr: &Expr) -> bool {
         Expr::Identity | Expr::Field(_) | Expr::Index { .. } => true,
         Expr::Paren(inner) => supported(inner),
         Expr::Pipe(parts) => parts.iter().all(supported),
-        Expr::Arithmetic { op, left, right } => {
+        Expr::Arithmetic {
+            op, left, right, ..
+        } => {
             !matches!(op, ArithOp::Mul(flags) if flags.append_arrays || flags.only_existing
                 || flags.only_new || flags.deep_merge_arrays || flags.clobber_tags)
                 && supported(left)
@@ -219,7 +221,9 @@ fn trace_at_depth(
                 CommentTree::Array(tree.meta().clone(), trees),
             ))
         }
-        Expr::Arithmetic { op, left, right } => {
+        Expr::Arithmetic {
+            op, left, right, ..
+        } => {
             let l = next(left, input)?;
             let r = next(right, input)?;
             let result = evaluated(expr, value)?;

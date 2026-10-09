@@ -25,6 +25,7 @@ use alloc::rc::Rc;
 #[cfg(test)]
 use std::rc::Rc;
 
+use super::expr::ArithSettleMemo;
 use super::{
     BoundBody, Builtin, Expr, FuncDefBound, ObjectEntry, ObjectKey, Pattern, PatternEntry,
     StringPart,
@@ -850,10 +851,13 @@ pub fn map_subexprs(expr: &Expr, mut f: &mut dyn FnMut(&Expr) -> Expr) -> Expr {
             target: Box::new(f(target)),
             key: Box::new(f(key)),
         },
-        Expr::Arithmetic { op, left, right } => Expr::Arithmetic {
+        Expr::Arithmetic {
+            op, left, right, ..
+        } => Expr::Arithmetic {
             op: *op,
             left: Box::new(f(left)),
             right: Box::new(f(right)),
+            settle: ArithSettleMemo::default(),
         },
         Expr::Compare { op, left, right } => Expr::Compare {
             op: *op,

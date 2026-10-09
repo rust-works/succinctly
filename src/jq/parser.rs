@@ -38,9 +38,9 @@ use super::eval::{
     EvalSemantics, JqSemantics, YqSemantics,
 };
 use super::expr::{
-    ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, FuncDefBound, Import, Include, Libm1,
-    Libm2, Libm3, Literal, MergeFlags, MetaSlot, MetaValue, ModuleMeta, NumberKey, ObjectEntry,
-    ObjectKey, Param, Pattern, PatternEntry, Program, SliceBoundKey, StringPart,
+    ArithOp, ArithSettleMemo, AssignOp, Builtin, CompareOp, Expr, FormatType, FuncDefBound, Import,
+    Include, Libm1, Libm2, Libm3, Literal, MergeFlags, MetaSlot, MetaValue, ModuleMeta, NumberKey,
+    ObjectEntry, ObjectKey, Param, Pattern, PatternEntry, Program, SliceBoundKey, StringPart,
 };
 use super::value::{parse_i64_or_f64_in, NumberRepr, OwnedValue};
 use super::walk::{any_subexpr, map_subexprs};
@@ -1887,7 +1887,9 @@ impl<'a> Parser<'a> {
         match expr {
             Expr::Literal(lit) => Self::const_fold_pattern_key_literal(lit),
             Expr::Paren(inner) => Self::const_fold_pattern_key::<S>(inner),
-            Expr::Arithmetic { op, left, right } => {
+            Expr::Arithmetic {
+                op, left, right, ..
+            } => {
                 let (Some(l), Some(r)) = (
                     Self::const_fold_pattern_key::<S>(left),
                     Self::const_fold_pattern_key::<S>(right),
@@ -2053,6 +2055,7 @@ impl<'a> Parser<'a> {
                 op: ArithOp::Mul(_),
                 left,
                 right,
+                ..
             } if matches!(**left, Expr::Literal(Literal::Int(-1))) => {
                 match Self::fold_index_key(right)? {
                     // #3044: an `Int`-sourced fold (`key: None`, per the
@@ -2826,6 +2829,7 @@ impl<'a> Parser<'a> {
                                         NumberRepr::Float(-f),
                                         text[1..].to_string(),
                                     ))),
+                                    settle: ArithSettleMemo::default(),
                                 }),
                             }
                         }
@@ -7667,6 +7671,7 @@ impl<'a> Parser<'a> {
                 op,
                 left: Box::new(left),
                 right: Box::new(right),
+                settle: ArithSettleMemo::default(),
             };
         }
 
@@ -7704,6 +7709,7 @@ impl<'a> Parser<'a> {
                 op,
                 left: Box::new(left),
                 right: Box::new(right),
+                settle: ArithSettleMemo::default(),
             };
         }
 
@@ -9420,7 +9426,7 @@ mod tests {
         assert!(
             matches!(
                 &product,
-                Expr::Arithmetic { op: ArithOp::Mul(_), left, right }
+                Expr::Arithmetic { op: ArithOp::Mul(_), left, right, .. }
                     if **left == int(2) && is_as(right)
             ),
             "{product:?}"
@@ -11494,6 +11500,7 @@ mod tests {
                 op: ArithOp::Mul(MergeFlags::default()),
                 left: Box::new(Expr::Field("a".into())),
                 right: Box::new(Expr::Field("b".into())),
+                settle: ArithSettleMemo::default(),
             }
         );
 
@@ -11543,6 +11550,7 @@ mod tests {
                     op: ArithOp::Mul(*expected_flags),
                     left: Box::new(Expr::Field("a".into())),
                     right: Box::new(Expr::Field("b".into())),
+                    settle: ArithSettleMemo::default(),
                 },
                 "parsing '.a {op} .b'"
             );
@@ -11562,6 +11570,7 @@ mod tests {
                     op: ArithOp::Mul(combined),
                     left: Box::new(Expr::Field("a".into())),
                     right: Box::new(Expr::Field("b".into())),
+                    settle: ArithSettleMemo::default(),
                 },
                 "parsing '.a {op} .b'"
             );
@@ -11581,6 +11590,7 @@ mod tests {
                 }),
                 left: Box::new(Expr::Field("a".into())),
                 right: Box::new(Expr::Field("b".into())),
+                settle: ArithSettleMemo::default(),
             }
         );
     }
@@ -11657,6 +11667,7 @@ mod tests {
                 op: ArithOp::Mul(MergeFlags::default()),
                 left: Box::new(Expr::Field("a".into())),
                 right: Box::new(Expr::Field("b".into())),
+                settle: ArithSettleMemo::default(),
             }
         );
         assert_eq!(
@@ -11889,7 +11900,9 @@ mod tests {
         // In Jq mode (default), .foo-bar is parsed as .foo minus bar
         let expr = parse(".foo-bar").unwrap();
         match expr {
-            Expr::Arithmetic { left, op, right } => {
+            Expr::Arithmetic {
+                left, op, right, ..
+            } => {
                 assert_eq!(*left, Expr::Field("foo".into()));
                 assert_eq!(op, ArithOp::Sub);
                 // 'bar' is parsed as a bare identifier - FuncCall or Var

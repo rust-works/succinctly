@@ -485,6 +485,9 @@ pub enum Expr {
         op: ArithOp,
         left: Box<Self>,
         right: Box<Self>,
+        /// What `eval::single_valued_pure` found walking this node (#3997).
+        /// Derived state: build with [`Expr::arithmetic`] or `default()`.
+        settle: ArithSettleMemo,
     },
 
     /// Unary minus: `-expr` (#1100). A dedicated single-child variant,
@@ -1727,6 +1730,82 @@ impl Clone for PathContextMemo {
 impl PartialEq for PathContextMemo {
     fn eq(&self, _other: &Self) -> bool {
         true
+    }
+}
+
+/// What `eval::single_valued_pure` found walking an [`Expr::Arithmetic`] node
+/// outside a definition body, and what the walk cost (#3997).
+///
+/// A left-nested chain (`f + f + ... + f`) asks the settle question of every
+/// operator, and each answer is a walk of everything below it: N operators,
+/// N walks of up to the analysis budget. The answer is a pure function of the
+/// subtree, so the first walk leaves it here and the walks of the operators
+/// below read it back instead of descending. It remembers the node **cost**
+/// with the result, so a walk that reaches it charges the budget exactly what
+/// descending would have, and which operands settle -- #3296's reach for
+/// `fib(n)` and `sum_to(n)` -- does not move.
+///
+/// Derived state, like [`BoundBody`]: no part of equality or `Debug`, and a
+/// clone starts empty, so a copy rewritten afterwards is never read through
+/// the original's answer. Nothing rewrites an operand once evaluation has
+/// begun; the resolve passes that do run before it.
+#[derive(Default)]
+pub struct ArithSettleMemo(core::cell::Cell<u16>);
+
+impl ArithSettleMemo {
+    /// The largest cost that fits beside the outcome.
+    const MAX_COST: u32 = 0x0FFF;
+    const KNOWN: u16 = 0x8000;
+    const OUTCOME_SHIFT: u32 = 12;
+
+    /// The walk's result (`None`: not recognised) and the nodes it visited,
+    /// this node included.
+    pub fn get(&self) -> Option<(Option<bool>, u32)> {
+        let packed = self.0.get();
+        if packed & Self::KNOWN == 0 {
+            return None;
+        }
+        let result = match (packed >> Self::OUTCOME_SHIFT) & 0x3 {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        };
+        Some((result, u32::from(packed) & Self::MAX_COST))
+    }
+
+    /// Remember a walk of `cost` nodes that ended in `result`. A cost that
+    /// does not fit is left unremembered.
+    pub fn set(&self, result: Option<bool>, cost: u32) {
+        if cost > Self::MAX_COST {
+            return;
+        }
+        let outcome: u16 = match result {
+            Some(false) => 0,
+            Some(true) => 1,
+            None => 2,
+        };
+        // `cost` fits the low twelve bits (checked above).
+        self.0
+            .set(Self::KNOWN | outcome << Self::OUTCOME_SHIFT | cost as u16);
+    }
+}
+
+impl Clone for ArithSettleMemo {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for ArithSettleMemo {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+/// Deliberately opaque, for the same reason as [`BoundBody`]'s own `Debug`.
+impl core::fmt::Debug for ArithSettleMemo {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("ArithSettleMemo")
     }
 }
 
@@ -3232,6 +3311,7 @@ impl Expr {
             op,
             left: Box::new(left),
             right: Box::new(right),
+            settle: ArithSettleMemo::default(),
         }
     }
 
@@ -3568,6 +3648,23 @@ mod tests {
         );
     }
 
+    /// #3997: every outcome and cost the settle analysis can leave on a node
+    /// reads back as written, and one too big to pack is left unremembered.
+    #[test]
+    fn arith_settle_memo_round_trips_3997() {
+        let memo = ArithSettleMemo::default();
+        assert_eq!(memo.get(), None);
+        for result in [Some(false), Some(true), None] {
+            for cost in [1, 2, 1024, ArithSettleMemo::MAX_COST] {
+                memo.set(result, cost);
+                assert_eq!(memo.get(), Some((result, cost)));
+            }
+        }
+        memo.set(Some(true), 5);
+        memo.set(Some(false), ArithSettleMemo::MAX_COST + 1);
+        assert_eq!(memo.get(), Some((Some(true), 5)), "too big: kept the last");
+    }
+
     #[test]
     fn test_pipe_simplification() {
         // Single element pipe simplifies to the element itself
@@ -3692,6 +3789,7 @@ mod tests {
                 op: ArithOp::Add,
                 left: Box::new(Expr::Literal(Literal::Int(1))),
                 right: Box::new(Expr::Literal(Literal::Int(2))),
+                settle: ArithSettleMemo::default(),
             }
         );
         assert!(matches!(

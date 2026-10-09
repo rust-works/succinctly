@@ -2287,11 +2287,13 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
             then: Box::new(rewrite_namespaced_calls(*then)),
             bound: FuncDefBound::default(),
         },
-        Expr::Arithmetic { op, left, right } => Expr::Arithmetic {
+        Expr::Arithmetic {
+            op, left, right, ..
+        } => Expr::arithmetic(
             op,
-            left: Box::new(rewrite_namespaced_calls(*left)),
-            right: Box::new(rewrite_namespaced_calls(*right)),
-        },
+            rewrite_namespaced_calls(*left),
+            rewrite_namespaced_calls(*right),
+        ),
         Expr::Negate(inner) => Expr::Negate(Box::new(rewrite_namespaced_calls(*inner))),
         Expr::Compare { op, left, right } => Expr::Compare {
             op,

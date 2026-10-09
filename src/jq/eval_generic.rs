@@ -92,8 +92,8 @@ use super::eval::{
 #[cfg(test)]
 use super::expr::FuncDefBound;
 use super::expr::{
-    AssignOp, BindOrigin, BoundBody, Builtin, CompareOp, Expr, FormatType, FuncDefData, Literal,
-    NumberKey, ObjectEntry, ObjectKey, Pattern, StringPart,
+    ArithSettleMemo, AssignOp, BindOrigin, BoundBody, Builtin, CompareOp, Expr, FormatType,
+    FuncDefData, Literal, NumberKey, ObjectEntry, ObjectKey, Pattern, StringPart,
 };
 use super::slice::{literal_component_from_values, slice_str, SliceBounds};
 use super::value::{owned_value_eq, subarray_indices, NumberRepr, OwnedValue};
@@ -13524,7 +13524,9 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // `binary_fanout_each_generic`'s `Err(e)` path -- the one its own
         // comment said was written generically and left ready for a fallible
         // caller.
-        Expr::Arithmetic { op, left, right } => binary_fanout_each_generic::<V, S>(
+        Expr::Arithmetic {
+            op, left, right, ..
+        } => binary_fanout_each_generic::<V, S>(
             |operand, operand_sink| {
                 eval_each_generic::<S, V>(operand, value.clone(), false, cursor, operand_sink)
             },
@@ -17987,7 +17989,9 @@ fn cross_together<S: EvalSemantics, V: DocumentValue>(
             },
             &mut collect,
         ),
-        Expr::Arithmetic { op, left, right } => binary_fanout_each_generic::<V, S>(
+        Expr::Arithmetic {
+            op, left, right, ..
+        } => binary_fanout_each_generic::<V, S>(
             each_operand,
             left,
             right,
@@ -28730,10 +28734,13 @@ fn path_context_resolve_constants<S: EvalSemantics>(
         // ([`path_context_absent_resolvable`]) still refuses arithmetic, so
         // adding the arm here widens what can be rewritten without widening
         // what is routed there.
-        Expr::Arithmetic { op, left, right } => Expr::Arithmetic {
+        Expr::Arithmetic {
+            op, left, right, ..
+        } => Expr::Arithmetic {
             op: *op,
             left: boxed(left)?,
             right: boxed(right)?,
+            settle: ArithSettleMemo::default(),
         },
         Expr::And(left, right) => Expr::And(boxed(left)?, boxed(right)?),
         Expr::Or(left, right) => Expr::Or(boxed(left)?, boxed(right)?),
