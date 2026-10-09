@@ -1922,6 +1922,14 @@ is the revert that established what the other one costs.
    outside that allowlist: a `try ... catch` or `//` in the `UPDATE` (`path(. as $x \| reduce (1) as $i (.; .a // 1) \|
    $x)` is `[]` in jq), and a source that destructures a computed value, which is a path error in jq the fold does not
    model, so accepting the stage there would answer where jq refuses.
+   [#4128](https://github.com/rust-works/succinctly/issues/4128) closes the accepting half of that: a fold source
+   that destructures `.` anywhere in its spine (a nested `reduce` and `select(true) as {...}` included) is resolved
+   when the register is not known to be at `.` (an untracked entry, or the body of another fold whose source may have
+   moved it), so `del(reduce .[]? as $k (.; foreach ((.\|.) \| reduce . as {a:$a} (0; .)) as $x (.; .; .)))` raises as
+   jq does instead of deleting the document, pinned by
+   `test_fold_source_destructuring_the_register_raises_where_it_is_not_4128`. About 11 contrived rows in 40,000 sampled
+   that jq answers (a nested fold under a `?//` bind, a destructuring `foreach` source behind an `and`) are now
+   refused, in the safe direction.
 
    | Filter                                                   | jq                          | Why succinctly still refuses                                                                                                                                                                                              |
    | -------------------------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
