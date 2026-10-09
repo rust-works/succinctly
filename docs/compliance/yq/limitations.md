@@ -5196,4 +5196,9 @@ in yq (it is an unbound variable, so it prints nothing here too), and `$x-1` is 
 Still diverging, and not specific to variables (the same on any empty operand such as
 `select(false)`): `[1] | .[$nope]` is `1` in yq and nothing here, `del(.[$nope])` deletes the whole
 sequence in yq and nothing here, and `$nope as $y | 3` is `3` in yq (the body still runs) and
-nothing here. `$ENV.x` for an unset `x` prints nothing in yq and `null` here.
+nothing here. In yq an empty index operand in `.[X]` stands for *all children*, so a typo'd name
+used as a computed index or key rewrites or deletes data there while this tool leaves the document
+unchanged and exits 0 (it used to fail loudly): on `a: 1 / b: [1,2,3]`, `.[$typo] = 1` sets every
+member, `.b[$typo] += 1` is `b: [2,3,4]`, `del(.[$typo])` is `{}` and `.b[$typo]` prints every
+element ([#4139](https://github.com/rust-works/succinctly/issues/4139)). `$ENV.x` for an unset `x`
+prints nothing in yq and `null` here, and a `--arg __loc__` is not honoured in yq mode.
