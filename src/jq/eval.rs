@@ -20025,6 +20025,16 @@ fn format_uri<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<S
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
             continue;
         }
+        // #4204: yq's `@uri` is Go's `url.QueryEscape`, which writes a space as `+`
+        // where jq writes `%20`. A literal `+` is `%2B` in both.
+        if b == b' ' && S::TAG == EvalTag::Yq {
+            if start < i {
+                result.push_str(&s[start..i]);
+            }
+            result.push('+');
+            start = i + 1;
+            continue;
+        }
         // `start == i` here is common (consecutive non-safe bytes, e.g. the
         // continuation bytes of one multi-byte char) and must be skipped
         // rather than sliced: `&s[i..i]` still panics if `i` isn't a char
@@ -20156,6 +20166,13 @@ fn format_urid<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<S
             // it.
             let end = (i + 3).min(bytes.len());
             return Err(EvalError::urid_invalid_escape(&bytes[i..end]));
+        }
+        // #4204: yq's `@urid` is `url.QueryUnescape`, which reads `+` as a space.
+        // jq's `@urid` leaves it literal.
+        if bytes[i] == b'+' && S::TAG == EvalTag::Yq {
+            result.push(b' ');
+            i += 1;
+            continue;
         }
         // Not a percent sign at all, just copy the byte
         result.push(bytes[i]);
