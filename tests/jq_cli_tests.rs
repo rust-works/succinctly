@@ -65267,6 +65267,208 @@ fn test_destructuring_reduce_leaves_the_register_4048() -> Result<()> {
     ])
 }
 
+/// #4049: a fold entered on an untracked stage whose register value the stage carries steps
+/// its pattern walk from that register, as jq's `path_intact` does, and a `reduce` states the
+/// register it leaves (jq backtracks the loop, so it is `INIT`'s) to the stage that holds it.
+/// #3999 retried the `?//` alternatives past a refusal it could prove but could not *step*, so
+/// `del(try (.a and (reduce . as {a:$a} ?// $a (0; .))))` on `{"a":true}` retried to `$a` and
+/// then refused "with result true" where jq deletes `.a` (its `and` result `true` is
+/// `jv_identical` to the register's `true`); a `null`/`true`/`false` element is identical to a
+/// `null`/`true`/`false` register by kind, so `path(.a | 5 | reduce null as {a:$q} (null; .))`
+/// on `{"a":null}` steps `.a` on the null and is `["a"]` in jq, where it refused at the step.
+/// Contrasts that still refuse as jq does: an element that is not the register (`1`, an
+/// object), a result that is not the register, and a register the fold's `$x` freezes elsewhere.
+/// Recorded residual, the safe direction: a `foreach` entered the same way steps from the
+/// register but states none at its emissions (`foreach` emits from inside the loop, where
+/// the pattern's steps and `UPDATE` have moved jq's register), so its `and` row, which jq
+/// answers, still refuses at the result. Every jq side captured from jq 1.7.1.
+#[test]
+fn test_fold_steps_from_known_untracked_register_4049() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        // The #3999 residual: the retried alternative's constant result is the register.
+        (
+            r#"{"a":true}"#,
+            r"del(try (.a and (reduce . as {a:$a} ?// $a (0; .))))",
+            "{}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"del(.a and (reduce . as {a:$a} ?// $a (0; .)))",
+            "{}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"del(.a and (reduce . as {a:$a} ?// $a ?// $b (0; .)))",
+            "{}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[true]}"#,
+            r"del(.a[0] and (reduce . as [$a] ?// $a (0; .)))",
+            "{\"a\":[]}\n",
+            "",
+            0,
+        ),
+        // Stepping from a `true` register: the element `true` is the register's node, so the
+        // step is intact, `jv_get` raises on the boolean, and `?//` retries.
+        (
+            r#"{"a":true}"#,
+            r"del(.a and (reduce true as {a:$q} ?// $x (true; .)))",
+            "{}\n",
+            "",
+            0,
+        ),
+        // Stepping from a `null` register over a stage that computes without navigating.
+        (
+            r#"{"a":null}"#,
+            r"path(.a | 5 | reduce null as {a:$q} (null; .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"path(.a | 5 | reduce null as {a:$q} (null; $q))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"del(.a | 5 | reduce null as {a:$q} (null; .))",
+            "{}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"path(.a | 5 | reduce true as {a:$q} ?// $z (null; .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"path(.a | 5 | reduce null as [$q] (null; .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r"[null]",
+            r"path(.[0] | 5 | reduce null as [$q] (null; .))",
+            "[0]\n",
+            "",
+            0,
+        ),
+        // The walk's steps extend the register's own path, not the fold's.
+        (
+            r#"{"a":null}"#,
+            r"path(.a | 5 | foreach null as {a:$q} (null; .; $q))",
+            "[\"a\",\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"path(.a | 5 | foreach null as {a:{b:$q}} (null; .; .))",
+            "[\"a\",\"a\",\"b\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"del(.a | 5 | foreach null as {a:$q} (null; .; $q))",
+            "{\"a\":null}\n",
+            "",
+            0,
+        ),
+        // The statement is the register's: a later stage navigates from it natively.
+        (
+            r#"{"a":null}"#,
+            r"[path(.a | 5 | reduce null as {a:$q} (null; .) | .b?)]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"path(.a | 5 | reduce null as {a:$q} (null; .) | .b)",
+            "[\"a\",\"b\"]\n",
+            "",
+            0,
+        ),
+        // Contrasts that still refuse, as jq does.
+        (
+            r#"{"a":1}"#,
+            r"del(.a and (reduce . as {a:$a} ?// $a (0; .)))",
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"del(.a or (reduce . as {a:$a} ?// $a (0; .)))",
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(.a | 5 | reduce null as {a:$q} (null; .))",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of null"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":null}}"#,
+            r"path(.a | 5 | reduce null as {a:$q} (null; .))",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of null"#,
+            5,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"path(.a | 5 | reduce 1 as {a:$q} (null; .))",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of 1"#,
+            5,
+        ),
+        // A fold that mentions a frozen `$x` loses the register (#3984) and refuses at the
+        // step: jq refuses at the result, "with result {\"a\":null}", with the same exit.
+        (
+            r#"{"a":null}"#,
+            r"path(. as $x | .a | 5 | reduce null as {a:$q} (null; $x))",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of null"#,
+            5,
+        ),
+        // Recorded residual (safe direction): jq answers `["a"]`; an `UPDATE` that navigates the
+        // accumulator is not followed on an untracked entry.
+        (
+            r#"{"a":null}"#,
+            r"path(.a | 5 | reduce null as {a:$q} (null; .b))",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of null"#,
+            5,
+        ),
+        // Recorded residual (safe direction): jq answers `{}`; the `foreach` states no register
+        // at its emissions, so the `and` result is not recognised as the register.
+        (
+            r#"{"a":true}"#,
+            r"del(.a and (foreach . as {a:$a} ?// $a (0; .; .)))",
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+    ])
+}
+
 /// #3984: a `reduce`/`foreach` that mentions a frozen `$v` inside a `try`, in a fold body or
 /// after a stage that leaves jq's register where it was (`length`, a literal), is judged
 /// against a register this resolver does not have: the fold's own register is untracked, so
