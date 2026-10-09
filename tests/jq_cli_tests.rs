@@ -121194,3 +121194,82 @@ fn test_def_call_chain_fanout_is_bounded_4124() -> Result<()> {
     assert!(err.contains("exceeded maximum recursion depth"), "{err:?}");
     Ok(())
 }
+
+/// #4125: a `try ... catch` operand of `and`/`or` or unary minus, whose handler reads
+/// the register, refuses where jq refuses instead of writing. Two mechanisms, each
+/// row captured live from jq 1.7.1 (exit 5, no output; the wording differs for the
+/// last two, a residual):
+///
+/// - `R` of `(.a)? or try (.a | error) catch .` runs with the register on `.a`, so
+///   its `.a` is a path error of its own and the handler gets that message (truthy),
+///   not `false`; evaluating the body from the entry gave `false`, which is identical
+///   to the register, and `del` removed `.a`.
+/// - a body that raises `. // X` or `select(. // 1) | error` may raise the register's
+///   node, so the handler's `(.a)?` cannot be pruned as a path error: pruning it
+///   dropped the answer (`del` of the negation wrote nothing, `path` printed nothing).
+#[test]
+fn test_try_catch_operand_of_and_or_negate_refuses_like_jq_4125() -> Result<()> {
+    for (program, doc, message) in [
+        (
+            "del((.a)? or try (.a | error) catch .)",
+            r#"{"a":false,"b":null}"#,
+            "Invalid path expression with result true",
+        ),
+        (
+            "path(.a? or try (.c | error) catch .)",
+            r#"{"a":false,"b":null}"#,
+            "Invalid path expression with result true",
+        ),
+        (
+            "path(try (select(. // 1) | error) catch (.a)? and .[0])",
+            r#"{"a":true}"#,
+            "Invalid path expression",
+        ),
+        (
+            "del(-(try (if true then error(. // 5) else . end) catch (.a)?))",
+            r#"{"a":false,"b":null}"#,
+            "Invalid path expression",
+        ),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", "--", program], Some(doc))?;
+        assert_eq!(code, 5, "#4125: `{program}`: stdout {out:?} stderr {err:?}");
+        assert!(out.is_empty(), "#4125: `{program}` wrote {out:?}");
+        assert!(err.contains(message), "#4125: `{program}`: {err:?}");
+    }
+    Ok(())
+}
+
+/// #4125: the neighbours the fix must leave alone, each captured live from jq 1.7.1: an
+/// `and` whose `L` is falsy stops before `R` (so `R`'s `try` never runs), a body that
+/// raises a fresh value cannot be the register's node, and a body that raises its input
+/// outright is still seeded as the register.
+#[test]
+fn test_try_catch_operand_neighbours_keep_their_answers_4125() -> Result<()> {
+    for (program, doc, want) in [
+        (
+            "path(.a? and try (.c | error) catch .)",
+            r#"{"a":false,"c":null}"#,
+            "[\"a\"]\n",
+        ),
+        (
+            "path(try error({\"a\":true}) catch (.a)?)",
+            r#"{"a":true}"#,
+            "",
+        ),
+        (
+            "path(try error(.) catch (.a)?)",
+            r#"{"a":true}"#,
+            "[\"a\"]\n",
+        ),
+        (
+            "path(try error(. // 1) catch (.a)?)",
+            r#"{"a":true}"#,
+            "[\"a\"]\n",
+        ),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", "--", program], Some(doc))?;
+        assert_eq!(code, 0, "#4125: `{program}`: stderr {err:?}");
+        assert_eq!(out, want, "#4125: `{program}` on {doc}");
+    }
+    Ok(())
+}

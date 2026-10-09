@@ -39479,6 +39479,11 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                         CaughtPayload::OfRegister
                     } else if error_body_raises_its_input::<S>(expr) {
                         CaughtPayload::OfInput
+                    } else if S::TAG == EvalTag::Jq
+                        && (fold_body::depth() == 0 || fold_body::acc_is_register_here())
+                        && try_body_may_raise_alias(expr)
+                    {
+                        CaughtPayload::MayBeRegister
                     } else {
                         CaughtPayload::Value
                     };
@@ -40822,9 +40827,10 @@ fn resolve_optional_sink<'a, S: EvalSemantics>(
                 // guess is loud: an outer `try` must not catch what the
                 // generator would have gone on past.
                 ResolveFlow::Escaped(EvalEscape::Error(e))
-                    if bare_navigation_primitive
-                        && e.is_untracked_navigation_error()
-                        && snapshot.is_register_entry() =>
+                    if e.is_untracked_navigation_error()
+                        && snapshot.is_register_entry()
+                        && (bare_navigation_primitive
+                            || try_scoped_navigation_may_succeed::<S>(inner, value)) =>
                 {
                     ResolveFlow::Escaped(EvalEscape::Error(e.into_guessed_path_refusal()))
                 }
@@ -40839,6 +40845,20 @@ fn resolve_optional_sink<'a, S: EvalSemantics>(
             }
         }
     }
+}
+
+/// Whether a `try`-scoped (`(.a)?`) navigation of a seed that may be jq's register
+/// can answer in jq, so that pruning its refusal could drop the answer (#4125).
+///
+/// On the register node jq navigates; off it, it raises a path error the `try`
+/// swallows. Which of the two holds is not known for a seed marked
+/// [`Snapshot::register_entry`], but the first is only an answer when the
+/// navigation succeeds on the value itself: where it is a type error (`.a` on an
+/// array) the register's node raises it too, and pruning is jq's verdict either
+/// way. Only a pure navigation is probed, by value, so nothing observable runs.
+fn try_scoped_navigation_may_succeed<S: EvalSemantics>(inner: &Expr, value: &OwnedValue) -> bool {
+    let nav = unwrap_paren(inner);
+    is_navigating_leaf(nav) && eval_owned_multi::<S>(nav, value).is_ok_and(|v| !v.is_empty())
 }
 
 /// `a // b`: resolve `a`, pass only its truthy branches through — jq's
@@ -43960,6 +43980,24 @@ fn resolve_flow_as_flow(flow: &ResolveFlow) -> Flow {
     }
 }
 
+/// Whether `expr` holds a `try` whose body always raises after navigating (`try
+/// (.a | error) catch .`), which [`cannot_move_register`] admits because the raise
+/// backtracks the move (#3965).
+///
+/// The navigation still runs, path-checked, against the register jq stands on at
+/// the `try`: off it, `.a` raises a path error of its own *ahead of* the body's
+/// `error`, and the handler receives that message, not the value the body would
+/// have raised (#4125: `(.a)? or try (.a | error) catch .` hands the handler a
+/// string where evaluating the body from the entry hands it `false`). Evaluating
+/// such an operand from the entry is only faithful while the register is the
+/// entry, which [`resolve_from_restored_input`] has just established it is not.
+fn raising_try_navigates(expr: &Expr) -> bool {
+    any_subexpr(expr, &mut |e| match e {
+        Expr::Try { expr: body, .. } => body_always_raises(body) && !cannot_move_register(body),
+        _ => false,
+    })
+}
+
 /// Resolve `expr` against the *original* input `value` with jq's register at
 /// `path` holding `register` -- where one branch of an `and`/`or`'s `L`
 /// left it (#3289): jq's `DUP`ed input, run with the register wherever `L`
@@ -43980,7 +44018,9 @@ fn resolve_flow_as_flow(flow: &ResolveFlow) -> Flow {
 ///   and only their truthiness reaches the result. Seeding a pipe here
 ///   instead would read a bare `.` on the untracked seed as the whole of
 ///   `path()` and refuse "with result" the input (`((.a,.b) and .) |= 3` on
-///   `{"a":"s"}` is jq's "with result true", not the input).
+///   `{"a":"s"}` is jq's "with result true", not the input). Except a `try`
+///   whose body navigates and then always raises ([`raising_try_navigates`]):
+///   that navigation is checked, and its path error is the handler's payload.
 /// - Otherwise `expr` runs as a pipe seeded at `path`, holding the input as
 ///   its value and the register -- the seed #2649's `Expr::AsPattern` arm
 ///   builds for a body whose pattern moved the register -- so a navigation
@@ -44011,7 +44051,7 @@ fn resolve_from_restored_input<'a, S: EvalSemantics>(
     if path.depth() == 0 && (register.unmoved_value().is_some() || !trackable) {
         return resolve_node_sink::<S>(expr, value, trackable, snapshot, frame, keep, sink);
     }
-    if cannot_move_register(expr) {
+    if cannot_move_register(expr) && !raising_try_navigates(expr) {
         return resolve_node_sink::<S>(expr, value, trackable, snapshot, frame, keep, &mut |r| {
             sink(
                 PathBranch::passthrough(Rc::clone(&path), r.value, false, Snapshot::No)
@@ -52037,6 +52077,13 @@ enum CaughtPayload {
     /// the node the body stood on *is* jq's register there, so the payload is the
     /// register's node for a scalar too, which has no storage to compare.
     OfRegister,
+    /// A body that may raise the register's node without the resolver proving it
+    /// ([`try_body_may_raise_alias`]: `error(. // 5)`, `select(. // 1) | error`).
+    /// A payload equal to the register is then jq's register node or a copy of
+    /// it, and which one is not known here, so the handler's seed is marked
+    /// ([`Snapshot::register_entry`]) and a refusal of it is a guess, loud,
+    /// instead of a `(.a)?` quietly pruning an answer jq gives (#4125).
+    MayBeRegister,
 }
 
 /// Whether a `try` body that raised raises *its own input*: `error`, or `error(P)`
@@ -52308,7 +52355,12 @@ fn resolve_catch_sink<'a, S: EvalSemantics>(
             PathBranch::new(PathPrefix::root(), Cow::Owned(payload), true)
         }
         Some(register) => {
-            PathBranch::passthrough(PathPrefix::root(), Cow::Owned(payload), false, Snapshot::No)
+            let snapshot = if caught == CaughtPayload::MayBeRegister && payload == *register {
+                Snapshot::register_entry()
+            } else {
+                Snapshot::No
+            };
+            PathBranch::passthrough(PathPrefix::root(), Cow::Owned(payload), false, snapshot)
                 .with_register(BranchRegister::Unmoved(Cow::Owned(register.clone())))
         }
         None => PathBranch::untracked(Cow::Owned(payload)),
