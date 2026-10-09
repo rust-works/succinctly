@@ -60607,3 +60607,16 @@ fn test_yq_del_nested_field_behind_computed_key_on_scalar_root_noops_2125() -> R
     assert!(err.contains("Cannot index number"), "err={err}");
     Ok(())
 }
+
+/// #4146: `succinctly jq` path-checks `error(msg)`'s message (jq's `def error(msg): msg | error;`),
+/// raising a path error where it navigates an input the register is not on. yq's `error` is not
+/// path-checked and reports the message's own value, captured live from yq v4.53.3
+/// (`del(error(.c))` on `c: 2` is `Error: 2`), so the rule is jq mode's alone (ADR-0018).
+#[test]
+fn test_yq_error_message_is_not_path_checked_4146() -> Result<()> {
+    let (_out, err, code) = run_yq_stdin_with_stderr("del(error(.c))", "a: 1\nc: 2\n", &[])?;
+    assert_ne!(code, 0);
+    assert!(err.contains("Error: 2"), "err={err}");
+    assert!(!err.contains("Invalid path expression"), "err={err}");
+    Ok(())
+}

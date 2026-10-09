@@ -42560,6 +42560,34 @@ fn resolve_leaf_sink<'a, S: EvalSemantics>(
     }
 }
 
+/// The navigation `error(msg)`'s message performs first on its input, if it navigates
+/// (#4146): `error(.c)`, `error(.c | tostring)`, `error(. | .c)`, `error(.c, .d)`,
+/// `error(.c // 1)`, `error(.[])`.
+///
+/// Only the leading step matters: it raises before anything after it runs. A literal or
+/// any other stage first is a value jq builds, so what follows is not this input's to check
+/// and the message is left to the by-value route.
+fn error_message_first_navigation(expr: &Expr) -> Option<BuiltinNavigation> {
+    fn first(message: &Expr) -> Option<BuiltinNavigation> {
+        match message {
+            Expr::Paren(inner) => first(inner),
+            Expr::Pipe(stages) => stages
+                .iter()
+                .find(|stage| !matches!(unwrap_paren(stage), Expr::Identity))
+                .and_then(first),
+            // Each output of `A, B` is its own run, and `A` raises first; `A // B` runs `A`.
+            Expr::Comma(items) => items.first().and_then(first),
+            Expr::Alternative(left, _) => first(left),
+            Expr::Iterate => Some(BuiltinNavigation::Iterate),
+            other => navigation_element(other).map(BuiltinNavigation::Access),
+        }
+    }
+    match expr {
+        Expr::Error(Some(message)) => first(message),
+        _ => None,
+    }
+}
+
 /// [`resolve_leaf`]'s bounded prefix: the shapes that produce at most one
 /// branch without consuming a generator -- an untrackable navigation
 /// refusal, an untracked `.`, and the `is_primitive` family. `None` means
@@ -42619,6 +42647,22 @@ fn resolve_leaf_bounded<'a, S: EvalSemantics>(
                 Expr::Builtin(Builtin::UpperIndex(_) | Builtin::Transpose)
             )
         {
+            // #4146: `def error(msg): msg | error;` -- the message runs in path mode, so a
+            // message that navigates raises jq's path error ahead of the `error`, and that
+            // string (not the value the message would have read) is what a `try` catches.
+            if let Some(navigation) = error_message_first_navigation(expr) {
+                let (error, step) = match navigation {
+                    BuiltinNavigation::Access(element) => (
+                        EvalError::invalid_path_expression_near_access(&element, value),
+                        NavKind::of(&element),
+                    ),
+                    BuiltinNavigation::Iterate => (
+                        EvalError::invalid_path_expression_near_iterate(value),
+                        Some(NavKind::Iterate),
+                    ),
+                };
+                return Some(Err((Vec::new(), refuse(error, step).into())));
+            }
             if let Expr::Builtin(builtin) = expr {
                 match builtin_navigation::<S>(builtin, value) {
                     Ok(Some(navigation)) => {

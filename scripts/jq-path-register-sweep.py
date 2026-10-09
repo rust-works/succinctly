@@ -651,6 +651,11 @@ OPERANDS = [
     "try (.a | error) catch .",
     "try (.[0]?, error) catch (.[0])?",
     "try error([.][0]) catch (.a)?",
+    # (#4146) `error(msg)` is `msg | error`: a message that navigates is path-checked.
+    "try error(.b) catch .",
+    "try error(.a) catch (.a)?",
+    "try error(.b | tostring) catch .",
+    "try error(.[0]) catch 7",
     # (#4019 review) `. // X` is `X` on a null/false register, so a body raising it does not
     # raise the register's own node.
     "try error(. // {\"a\":1}) catch .a",
