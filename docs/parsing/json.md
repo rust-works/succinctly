@@ -571,6 +571,62 @@ Growth: 0.7 MB to 2.8 MB (4x the records) multiplies the base by 16x and the cha
 
 Pinned by `array_index::tests` (the index agrees with the walk at every index and past the end; `build_succeeds_exactly_when_len_checked_does_4035` sweeps every arrangement of up to four members with every separator, leading and trailing delimiter the semi-index accepts; it builds on the third length lookup and never on an element read; never registers a small or malformed array; never answers a partly consumed list from the whole array's index) and `wide_document_array_reads_agree_with_jq_across_repeated_reads_4035`, whose rows are jq 1.7.1's.
 
+### Key Census of a Wide Object (#3343)
+
+`census` (`src/jq/document.rs`) is the key-only walk behind `length`, `keys | length` and the identity print of an object: it hashes every key, finds out whether any key repeats (jq keeps the last of a repeated key), and checks each member's `,` and `:` (#1677). After #3140 made the sibling walk cheaper it was still about a third of the identity print of perf-guard's 2 MB `wide` fixture (158,981 top-level keys). #3343 named two suspects, the #1677 delimiter scans and the 25 M-instruction `sort_unstable` of the hashes.
+
+**The scans were not the cost; the second pass over each key was.** A build with both checks disabled saved 27 M instructions (172 per key), but the scans are two byte reads per key on a compact document. What the check paid for was `text_end()`, which rescans the key to find its closing quote, right after `key_hash_of` had scanned the same key for the raw span it hashes. `key_hash_and_end_of` takes both from the one `raw_and_escaped` scan (`DocumentValue::key_raw_unescaped_with_end`, JSON only), and `DistinctKeyCursors::next`, the `keys_unsorted` probe, uses it too. An escape, an unterminated span or a key with no raw span takes the old two-call path, so those answers cannot differ.
+
+**The sort is replaced by a bitset prefilter for 128 to 2^21 hashes** (`repeated_hashes`). A real object almost never repeats a key, so sorting every hash only proves that nothing matched. One pass sets a bit per hash (the low bits of an already-mixed hash) and records in a second bitset every bit that was set twice; only the hashes on such a bit, roughly a tenth of them and almost all accidental bitset collisions, are sorted. The answer is exact: every occurrence of a repeated hash is on a doubly-set bit, and every other hash is alone on its own bit and so its own value. The bitsets are 8 bits per hash each, rounded up to a power of two (+0.6 MB peak RSS at 159 K keys, 0 at 763 K, +3.1 MB at 1.9 M keys). If more than a quarter of the hashes land on an already-set bit the filter is not filtering (a document that repeats most of its keys, or keys chosen to share low hash bits), so the whole list is sorted instead, bounding the worst case at the bitset pass plus the sort it was meant to avoid.
+
+#### Results
+
+Release build, `scripts/ab-cli.py` (interleaved, output identity gated on every row, 21 reps, 7 on the 100 MB rows), base `ce09e00da` vs this change. A control run (the base binary against itself) read -0.2%..+0.7% on the 7950X. The 7950X and M4 Pro columns below are medians of the 21 interleaved reps.
+
+| row (7950X, median)                  | 2 MB (159 K keys) | 10 MB (763 K) | 16 MB (1.2 M) | 26 MB (1.9 M) | 100 MB (7.1 M) |
+|--------------------------------------|------------------:|--------------:|--------------:|--------------:|---------------:|
+| `length`                             |             -9.3% |         -9.6% |         -9.4% |         -9.2% |          -2.7% |
+| `keys \| length`                     |             -9.7% |        -10.2% |         -9.5% |         -8.6% |                |
+| `.`                                  |             -6.3% |         -6.2% |         -4.9% |         -5.6% |          -3.4% |
+| `keys_unsorted`                      |             -2.9% |         -2.6% |         -3.3% |         -2.0% |          -2.2% |
+| `to_entries` (does not use `census`) |             -0.2% |         +0.6% |         -0.3% |         +0.1% |                |
+
+Objects too small to matter are not charged: `map(length) \| add` over equal objects of 8, 32, 128, 512, 2,048, 8,192 and 32,768 keys reads -2.4%, -3.3%, -4.5%, -6.2%, -8.2%, -9.5% and -10.6% on the 7950X, and below 128 keys the plain sort still runs (measured: with the prefilter on, 8 keys per object was +1.3% to +2.3% slower, 32 a wash). Other shapes on the 7950X: `users` `length` -5.2%, `.` -0.7%, `keys_unsorted` -5.4%; `wide-escaped-keys` `length` -7.5%, `.` -4.1%, `keys_unsorted` -1.5%.
+
+| row (M4 Pro, median)                 | 2 MB (159 K keys) | 10 MB (763 K) | 16 MB (1.2 M) | 26 MB (1.9 M) | 100 MB (7.1 M) |
+|--------------------------------------|------------------:|--------------:|--------------:|--------------:|---------------:|
+| `length`                             |             -9.0% |        -12.3% |         -5.3% |         -6.3% |          -5.3% |
+| `keys \| length`                     |             -9.2% |        -12.8% |         -5.4% |         -7.5% |                |
+| `.`                                  |             -6.8% |         -8.3% |         -3.6% |         -4.0% |          -4.3% |
+| `keys_unsorted`                      |             -1.3% |         -1.6% |         +0.1% |         +0.8% |          +1.0% |
+| `to_entries` (does not use `census`) |             +0.4% |         -1.6% |         -2.1% |         -2.8% |                |
+
+On the M4 Pro (control -0.5%..+0.5%) `map(length) \| add` over equal objects reads -1.4%, -4.8%, -6.1%, -9.5%, -10.2%, -10.4% and -11.8% at 8 to 32,768 keys; `users` `length` -0.3%, `.` -1.9%, `keys_unsorted` -0.9%; `wide-escaped-keys` `length` -7.0%, `.` -4.7%, `keys_unsorted` -1.0%. The 100 MB `keys_unsorted` row (+1.0% median, +1.8% min over 7 reps) is the one row on either box that is slower than its control's range; it is above the prefilter's gate, so what it measures is the key-end change and layout, and the 7950X reads -2.2% on the same row.
+
+Instructions (deterministic): 7950X cachegrind `Ir` on `wide` 2 MB, `length` 245.6 M -> 215.7 M (-12.2%), `.` 459.8 M -> 429.8 M (-6.5%), `keys_unsorted` 282.6 M -> 275.7 M (-2.5%); `users` `length` 0.0%, `.` -1.0%. Apple M5 Max `time -l` instructions retired, same file: `length` 231.1 M -> 202.9 M (-12.2%), `.` 419.7 M -> 391.9 M (-6.6%), `keys_unsorted` -2.8%; 10 MB `length` -15.0%, `.` -7.8%. `scripts/perf-guard.py --check` against a base binary on the 7950X: every row inside its threshold (`wide_identity` -6.5%, inside its 10% override; `wide_keys_unsorted` -2.5%).
+
+#### What did not ship
+
+Each sort candidate was measured against `sort_unstable` in one binary (a temporary switch, so layout is shared), interleaved, before any was kept; the gap fast path against the same tree without it. Both boxes unless a cell says otherwise:
+
+| candidate                                                             | 7950X                                                  | M4 Pro                                   | verdict                                                                              |
+|-----------------------------------------------------------------------|--------------------------------------------------------|------------------------------------------|--------------------------------------------------------------------------------------|
+| a table sized exactly from the `Vec` (#1514's question at 159 K keys) | `length` +3.8% median at 2-16 MB, +12.2% at 7.1 M keys | -2.9% median at 2-16 MB, -5.1% at 7.1 M  | architecture split: not shipped                                                      |
+| in-place radix partition on the top 12 bits, then per-bucket sort     | +5.6% median at 2-16 MB, +37.9% at 7.1 M               | +8.5% median at 2-16 MB, +26.5% at 7.1 M | loses on both                                                                        |
+| bitset prefilter, 16 bits per hash                                    | -2.2% median (2-16 MB)                                 | -5.6% median (2-16 MB)                   | superseded by 8 bits                                                                 |
+| 8 bits per hash instead of 16                                         | a further -1.4% median                                 | not re-measured                          | shipped                                                                              |
+| 32 bits per hash instead of 16                                        | +4.2% median (+8.8% at 16 MB)                          | not measured                             | larger bitsets (1 MB at 159 K keys, a 7950X core's whole L2; mechanism not isolated) |
+| prefilter above 2^21 hashes (7.1 M keys, 16 bits per hash)            | +6.6%                                                  | not measured                             | gate stays at 2^21                                                                   |
+| a canonical-gap fast path in `preceding_gap_ok` / `following_gap_ok`  | `length` -0.3%..+0.1% (no gain), **`.` +3.2%..+3.9%**  | not measured                             | not shipped                                                                          |
+
+The canonical echo's duplicate-key gate (#3333, "Wide objects: one exactly sized table", earlier on this page) went the other way at its own site, where an exactly sized table beat a sort: that gate probes span fingerprints as it scans a document it is about to echo, not a `Vec` of hashes collected for a count, and it was measured on both boxes separately. Nothing here changes it.
+
+The table is the architecture split `KeyHashes` records for #1514 reproduced at 159 K keys, a size the issue said had never been measured: a table that fits an M4 Pro's cache is a random-access loss on a 7950X's 1 MB L2. The prefilter wins on both because its probes are independent reads of a bitset that stays in cache and only a few percent of the list is left to sort. The fast-path row is the case for timing a change whose instruction count falls: 446.6 M -> 441.1 M `Ir` on the identity print (-1.2%), and +3.2%..+3.9% wall-clock.
+
+The second suggestion in the issue, running the #1677 checks inside the identity writer's own per-field walk, is not done: it would change *when* a malformed member is reported, which `test_identity_writer_streams_or_materializes_by_gate_2720` pins. With the second quote scan gone the checks are no longer the cost it was written to remove.
+
+Pinned by `repeated_hashes_tests` (the prefilter equals sort-then-`shared_hashes` for no repeat, two repeats, one value three times, every value twice, all equal and zero, at sizes either side of the 128 floor and either side of the 2^21 ceiling; hashes sharing every low bit; a mostly-repeated list that makes it give up), `key_hash_and_end_tests` (the helper equals the two separate calls, and takes the one-scan path only on an escape-free ASCII key) and `key_raw_unescaped_with_end_declines_what_the_two_calls_would_split_3343` (an unterminated or escaped span declines). A differential sweep of 122 documents (unique, duplicate, escaped-duplicate, non-ASCII, pretty, nine malformed-member shapes, each at 127 to 70,000 keys) across nine queries matched the base binary's stdout, stderr and exit code on all 1,098 comparisons, and `length` / `keys | length` matched jq 1.7.1 on every well-formed one; breaking the distinct count or the key-end arithmetic in a scratch copy fails it.
+
 ---
 
 ## Optimisation Techniques Used

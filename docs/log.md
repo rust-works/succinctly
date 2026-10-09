@@ -2,6 +2,21 @@
 
 Tracks updates to the knowledge wiki pages in `docs/`.
 
+## 2026-10-09 — Key census: one scan per key, a bitset prefilter instead of the sort (issue #3343)
+
+**Sources ingested:**
+- `census`, `repeated_hashes`, `key_hash_and_end_of` and `DistinctKeyCursors::next` in
+  `src/jq/document.rs`; `StandardJson::key_raw_unescaped_with_end` in `src/json/light.rs`
+- Interleaved wall-clock A/B on terminus (7950X) and johns-mac-mini (M4 Pro) over `wide` 2-100 MB,
+  many-small-objects, `users` and `wide-escaped-keys`; cachegrind `Ir`; `time -l` instructions
+  retired; `scripts/perf-guard.py --check` against a base binary
+
+**Pages updated:**
+- [parsing/json.md](parsing/json.md) — new "Key Census of a Wide Object (#3343)" section: the cost
+  was the second quote scan, not the delimiter checks; the prefilter's results and gate; the
+  candidates that lost (sized table, radix partition, gap fast path) with their numbers
+- [optimizations/README.md](optimizations/README.md) — two rows in Notable Failures
+
 ## 2026-10-09 — Settled vs sink-fed operand chains measured, no change (issue #4132)
 
 **Sources ingested:**

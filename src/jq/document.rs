@@ -3077,14 +3077,18 @@ const PREFILTER_MIN: usize = 128;
 const PREFILTER_MAX: usize = 1 << 21;
 
 /// The prefilter gives up when more than `1 / PREFILTER_MAX_ARRIVAL_SHARE` of
-/// the hashes landed on an already-set bit: four times what random hashes
-/// do at [`PREFILTER_BITS_PER_HASH`].
+/// the hashes landed on an already-set bit: four to eight times what random
+/// hashes do (3-6%, as rounding the bitset up to a power of two makes it 8 to
+/// 16 bits per hash).
 const PREFILTER_MAX_ARRIVAL_SHARE: usize = 4;
 
-/// Bits of bitset per hash. The prefilter hands the sort only the hashes
-/// that landed on a bit another hash had already set, about `n / (2 *
-/// BITS_PER_HASH)` of them, so this trades memory against how much is left to
-/// sort.
+/// Bits of bitset per hash, before rounding up to a power of two. The
+/// prefilter hands the sort only the hashes on a bit that was set twice,
+/// roughly `1 / bits per hash` of them, so this trades cache footprint against
+/// how much is left to sort. On a 7950X 16 measured 1.4% slower than 8 and 32
+/// measured 4.2% slower (the two bitsets of a 159 K-key object are 0.5 MB at 8
+/// and 1 MB at 16, against that core's 1 MB L2; the mechanism was not
+/// isolated).
 const PREFILTER_BITS_PER_HASH: usize = 8;
 
 /// The hashes that occur more than once in `hashes`, sorted ascending and
@@ -3097,15 +3101,15 @@ const PREFILTER_BITS_PER_HASH: usize = 8;
 /// spent proving that nothing matched. Instead one pass sets a bit per hash
 /// in a bitset and, in a second bitset, remembers every bit that was already
 /// set. A hash whose bit was never set twice cannot equal any other hash, so
-/// only the hashes on a doubly-set bit -- a few percent, almost all of them
+/// only the hashes on a doubly-set bit -- roughly a tenth, almost all of them
 /// accidental collisions of the *bitset*, not of the hashes -- go on to the
 /// sort. The answer is exact: every occurrence of a repeated hash sits on a
 /// doubly-set bit, and every other hash is distinct.
 ///
 /// Measured against the sort on a 7950X and an M4 Pro: faster at every
-/// width from 159 K to 1.2 M keys on both. The alternatives lost on at least
-/// one of them (an exactly-sized table by 4-10% on the 7950X, an in-place
-/// radix partition by 3-37% on both); see `docs/parsing/json.md`.
+/// width from 159 K to 1.9 M keys on both. The alternatives lost on at least
+/// one of them (an exactly-sized table by 4-12% on the 7950X, an in-place
+/// radix partition by 3-38% on both); see `docs/parsing/json.md`.
 fn repeated_hashes(mut hashes: Vec<u64>) -> (Vec<u64>, usize) {
     let n = hashes.len();
     if !(PREFILTER_MIN..=PREFILTER_MAX).contains(&n) {
@@ -3131,12 +3135,12 @@ fn repeated_hashes(mut hashes: Vec<u64>) -> (Vec<u64>, usize) {
     if arrivals == 0 {
         return (Vec::new(), n);
     }
-    // Random hashes give about `n / (2 * BITS_PER_HASH)` arrivals. Far more
-    // means the filter is not filtering -- a document that really repeats
-    // most of its keys, or keys chosen so their hashes share low bits (the
-    // hash is unkeyed) -- so sort everything rather than also copy it first.
-    // That bounds the worst case at the two bitset allocations, one pass and
-    // the sort the prefilter was meant to avoid.
+    // Random hashes give 3-6% of `n` arrivals. Far more means the filter is
+    // not filtering -- a document that really repeats most of its keys, or
+    // keys chosen so their hashes share low bits (the hash is unkeyed) -- so
+    // sort everything rather than also copy it first. That bounds the worst
+    // case at the two bitset allocations, one pass and the sort the prefilter
+    // was meant to avoid.
     if arrivals > n / PREFILTER_MAX_ARRIVAL_SHARE {
         drop((seen, twice));
         hashes.sort_unstable();
