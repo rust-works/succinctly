@@ -42764,7 +42764,9 @@ fn leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
 /// ([`resolve_from_restored_input`]), and these stages either navigate or take a
 /// navigating condition. (`entry_marker_stage` reads a per-output statement
 /// through its own, different set of wrappers; the two answer different
-/// questions.)
+/// questions.) It does read that predicate once for what a wrapper encloses
+/// (#3767 part 4: `first(5)` is as unmoving as the `5`), but never for a bare
+/// stage, which the caller has asked already.
 fn stage_leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
     last_register_unmoved::<S>() && stage_is_register_keeping(expr)
 }
@@ -42797,7 +42799,14 @@ fn stage_is_register_keeping(expr: &Expr) -> bool {
         // #3767: a stage that navigates nothing leaves it where it was, and the
         // wrappers peeled above add no movement, so `first(5)`, `limit(1; 5)` and
         // `nth(0; 5)` are as unmoving as the `5` under them.
-        stage => is_last_stage(stage) || is_select_stage(stage) || cannot_move_register(stage),
+        //
+        // Only a *peeled* stage is asked: `resolve_seq_stage` has already asked the bare
+        // `expr` (`stage_preserves_register`), so asking it again would repeat that walk.
+        stage => {
+            is_last_stage(stage)
+                || is_select_stage(stage)
+                || (!std::ptr::eq(stage, unwrap_paren(expr)) && cannot_move_register(stage))
+        }
     }
 }
 
@@ -89951,11 +89960,9 @@ mod tests {
         ] {
             assert!(!is_type_filter(&other), "{other:?}");
             assert_eq!(type_filter_keeps(&other, &OwnedValue::Null), None);
-            // Not a `select`/`last` stage. (`length` and the rest navigate nothing, so
-            // since #3767 part 4 the shape half admits them through
-            // `cannot_move_register`, as `resolve_seq_stage` already did bare.)
-            let expr = Expr::Builtin(other);
-            assert!(!is_select_stage(&expr) && !is_last_stage(&expr));
+            assert!(!stage_leaves_register_in_place::<JqSemantics>(
+                &Expr::Builtin(other)
+            ));
         }
 
         let stage = |filter: &str| parse(filter).expect("filter parses");
@@ -90038,6 +90045,16 @@ mod tests {
             assert!(
                 !stage_leaves_register_in_place::<YqSemantics>(&expr),
                 "{admitted}"
+            );
+        }
+        // ... and a bare navigates-nothing stage is `cannot_move_register`'s to answer
+        // (asked by `resolve_seq_stage` itself), not this one's.
+        for (filter, peeled_wrapper) in [("5", false), ("length", false), ("limit(1; .)?", true)] {
+            let expr = stage(filter);
+            assert_eq!(
+                stage_leaves_register_in_place::<JqSemantics>(&expr),
+                peeled_wrapper,
+                "{filter}"
             );
         }
         // ... and one over a stage that navigates, or whose later outputs may, still moves it.

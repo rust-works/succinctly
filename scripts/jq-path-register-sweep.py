@@ -643,6 +643,13 @@ OPERANDS = [
     "nth(0; (.a, 5))",
     "first(error(\"z\"))",
     "first(.a | 5)",
+    # the wrapper rule asks `cannot_move_register` only, so a wrapper over a stage the leaf
+    # verdict admits but that predicate does not list stays refused where jq answers
+    "first(length)",
+    "first(to_entries)",
+    "limit(1; sort)",
+    "first(path(.a))",
+    "first(input_line_number)",
     "[first(numbers)]",
     "[first(strings)]",
     "[first(select(.))]",
