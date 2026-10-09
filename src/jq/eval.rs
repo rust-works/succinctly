@@ -15024,6 +15024,7 @@ fn builtin_operand_is_input(builtin: &Builtin) -> bool {
             | Builtin::ToNumber
             | Builtin::ToJson
             | Builtin::FromJson
+            | Builtin::FromYaml
             | Builtin::Explode
             | Builtin::Implode
             | Builtin::Test(_)
@@ -15344,6 +15345,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::ToNumber => builtin_tonumber::<W, S>(value, optional),
         Builtin::ToJson => builtin_tojson::<W, S>(value, optional),
         Builtin::FromJson => builtin_fromjson::<W, S>(value, optional),
+        Builtin::FromYaml => builtin_from_yaml::<W, S>(value, optional),
 
         // Phase 6: Additional String Functions
         Builtin::Explode => builtin_explode::<W>(value, optional),
@@ -21689,6 +21691,48 @@ fn builtin_tojson<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // documented anywhere for this sibling either.
     let owned = to_owned_or_suppress!(&value, optional);
     QueryResult::Owned(OwnedValue::String(owned_value_to_json::<S>(&owned).into()))
+}
+
+/// Builtin: `from_json` / `from_yaml` (yq, #4206): decode the string as YAML and answer its first
+/// document. JSON is a subset, so one decoder serves both; `"abc" | from_json` is the string
+/// `abc` and `"a: 1"` is `{"a":1}` in yq v4.53.3 too. A value that is not a string passes through
+/// unchanged, an empty string is yq's `EOF` error, and an array or object is an error.
+fn builtin_from_yaml<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    value: StandardJson<'_, W>,
+    optional: bool,
+) -> QueryResult<'_, W> {
+    let text = match &value {
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => cow.into_owned(),
+            Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
+        },
+        StandardJson::Array(_) | StandardJson::Object(_) => {
+            return suppress_or_raise(EvalError::new("EOF"), optional);
+        }
+        _ => return QueryResult::Owned(to_owned_lossy::<S, _>(&value)),
+    };
+    let bytes = text.as_bytes();
+    // Only the empty string is yq's `EOF`: whitespace or a bare comment is a document with no
+    // content, which decodes to null.
+    if bytes.is_empty() {
+        return suppress_or_raise(EvalError::new("EOF"), optional);
+    }
+    let index = match crate::yaml::YamlIndex::build(bytes) {
+        Ok(index) => index,
+        Err(e) => return suppress_or_raise(EvalError::new(format!("yaml: {e}")), optional),
+    };
+    let root = index.root(bytes);
+    let first = match root.value() {
+        crate::yaml::YamlValue::Sequence(docs) => match docs.uncons_cursor() {
+            Some((doc, _)) => doc,
+            None => return QueryResult::Owned(OwnedValue::Null),
+        },
+        _ => root,
+    };
+    match super::eval_generic::to_owned_yaml_cursor::<S, _>(&first) {
+        Ok(v) => QueryResult::Owned(v),
+        Err(e) => suppress_or_raise(e, optional),
+    }
 }
 
 /// Builtin: fromjson - parse JSON string to value
@@ -31169,6 +31213,7 @@ fn builtin_yields_at_most_one_value(builtin: &Builtin) -> bool {
         | Builtin::FormatNamed(_)
         | Builtin::FromEntries
         | Builtin::FromJson
+        | Builtin::FromYaml
         | Builtin::FromJsonStream
         | Builtin::FromStream(_)
         | Builtin::FromUnix
@@ -45632,6 +45677,7 @@ fn cannot_move_register(expr: &Expr) -> bool {
             | Builtin::ToNumber
             | Builtin::ToJson
             | Builtin::FromJson
+            | Builtin::FromYaml
             // #2764: produces nothing, so it navigates nothing --
             // `path(. as $x | [empty] | $x)` is `[]` in jq 1.7.1.
             | Builtin::Empty

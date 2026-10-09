@@ -60967,3 +60967,149 @@ fn test_del_of_a_root_variable_keeps_the_document_3244() -> Result<()> {
     assert_eq!((out.trim(), code), ("null", 0));
     Ok(())
 }
+
+/// Pinned yq v4.53.3: `to_number`, `from_json` and `from_yaml` (#4206). `from_json` and
+/// `from_yaml` both decode YAML and answer the first document; a non-string passes through.
+/// Every row was captured from the pinned binary, `-n -o=json -I=0`.
+#[test]
+fn test_to_number_from_json_from_yaml_4206() -> Result<()> {
+    let args = &["-n", "-o=json", "-I=0"];
+    for (filter, expected) in [
+        (r#""12" | to_number"#, "12"),
+        (r#""1.5" | to_number"#, "1.5"),
+        (r#""0x1f" | to_number"#, "31"),
+        ("12 | to_number", "12"),
+        (r#""12" | to_number | tag"#, r#""!!int""#),
+        (r#""1.5" | to_number | tag"#, r#""!!float""#),
+        (r#""{\"a\":1}" | from_json"#, r#"{"a":1}"#),
+        (r#""[1,2]" | from_json"#, "[1,2]"),
+        (r#""abc" | from_json"#, r#""abc""#),
+        (r#""1" | from_json | tag"#, r#""!!int""#),
+        (r#""{a: 1}" | from_json"#, r#"{"a":1}"#),
+        (r#""1 2" | from_json"#, r#""1 2""#),
+        (r#""null" | from_json"#, "null"),
+        ("1 | from_json", "1"),
+        ("null | from_json", "null"),
+        (r#""a: 1\nb: [x, y]" | from_yaml | .b[1]"#, r#""y""#),
+        (r#""---\na: 1\n---\nb: 2" | from_yaml"#, r#"{"a":1}"#),
+        (r#""- 1\n- 2" | from_yaml | length"#, "2"),
+        (r#""x" | from_yaml | tag"#, r#""!!str""#),
+        (r#""a: &x 1\nb: *x" | from_yaml"#, r#"{"a":1,"b":1}"#),
+        // Only the empty string is an error; blank or comment-only text is an empty document.
+        (r#""\n" | from_yaml"#, "null"),
+        (r#""  " | from_yaml"#, "null"),
+        (r##""# comment" | from_yaml"##, "null"),
+        (r#"{"s": "a: 1"} | .s |= from_yaml"#, r#"{"s":{"a":1}}"#),
+    ] {
+        let (out, code) = run_yq_stdin(filter, "", args)?;
+        assert_eq!((out.trim(), code), (expected, 0), "{filter}");
+    }
+    for filter in [
+        r#""abc" | to_number"#,
+        r#""" | to_number"#,
+        "null | to_number",
+        "true | to_number",
+        r#"" 12" | to_number"#,
+        r#""" | from_json"#,
+        r#""[1, 2" | from_json"#,
+        r#""" | from_yaml"#,
+        r#"["a"] | from_json"#,
+    ] {
+        let (_out, code) = run_yq_stdin(filter, "", args)?;
+        assert_ne!(code, 0, "{filter} must fail");
+    }
+    Ok(())
+}
+
+/// Pinned yq v4.53.3: `with(path; update)` runs `update` for the assignments in it and discards
+/// the value of anything else (#4206). Every row was captured from the pinned binary,
+/// `-n -o=json -I=0`.
+#[test]
+fn test_with_applies_only_the_assignments_of_its_update_4206() -> Result<()> {
+    let args = &["-n", "-o=json", "-I=0"];
+    for (filter, expected) in [
+        ("with(.a; . = 5)", r#"{"a":5}"#),
+        (r#"{"a":{"b":1}} | with(.a; .b = 2)"#, r#"{"a":{"b":2}}"#),
+        (
+            r#"{"a":{"b":1}} | with(.a; .c = 2, .d = 3)"#,
+            r#"{"a":{"b":1,"c":2,"d":3}}"#,
+        ),
+        // A missing path is created, as `|=` does.
+        (
+            r#"{"a":{"b":1}} | with(.z; .b = 2)"#,
+            r#"{"a":{"b":1},"z":{"b":2}}"#,
+        ),
+        (r#"{"a":[1,2]} | with(.a[]; . += 1)"#, r#"{"a":[2,3]}"#),
+        ("[1,2] | with(.[]; . *= 2)", "[2,4]"),
+        ("[1,2] | with(.[]; . = 5)", "[5,5]"),
+        // The value of a non-assignment is discarded.
+        ("[1,2] | with(.[]; . + 1)", "[1,2]"),
+        ("[1,2] | with(.[]; . * 2)", "[1,2]"),
+        (r#"{"a":3} | with(.a; . * 2)"#, r#"{"a":3}"#),
+        (r#"{"a":1} | with(.a; select(. == 1))"#, r#"{"a":1}"#),
+        // Assignments before a non-assignment still apply, and later ones in order.
+        (r#"{"a":1} | with(.a; . = 2 | . + 1)"#, r#"{"a":2}"#),
+        (
+            r#"{"a":{"b":1}} | with(.a; .b = 2 | .c = 3)"#,
+            r#"{"a":{"b":2,"c":3}}"#,
+        ),
+        (
+            r#"{"a":{"b":1}} | with(.a; .b = 2, .b |= . + 5)"#,
+            r#"{"a":{"b":7}}"#,
+        ),
+        (
+            r#"{"a":{"b":1}} | with(.a; .b = 5 | .b)"#,
+            r#"{"a":{"b":5}}"#,
+        ),
+        (
+            r#"[{"a":1},{"a":2}] | with(.[]; .a += 10)"#,
+            r#"[{"a":11},{"a":12}]"#,
+        ),
+        (
+            r#"{"a":{"b":1}} | with(.a | .b; . = 3)"#,
+            r#"{"a":{"b":3}}"#,
+        ),
+        // A filter or a navigation in front of the assignment decides where it lands.
+        (
+            r#"[{"a":1},{"a":2}] | with(.[]; select(.a == 2) | .b = 9)"#,
+            r#"[{"a":1},{"a":2,"b":9}]"#,
+        ),
+        (
+            r#"[{"a":1},{"a":2}] | with(.[]; select(.a == 1) | .b = 1 | .c = 2)"#,
+            r#"[{"a":1,"b":1,"c":2},{"a":2}]"#,
+        ),
+        (
+            r#"{"a":{"b":{}}} | with(.a; .b | .c = 1)"#,
+            r#"{"a":{"b":{"c":1}}}"#,
+        ),
+        (
+            r#"{"a":{}} | with(.a; .b | .c = 1)"#,
+            r#"{"a":{"b":{"c":1}}}"#,
+        ),
+        (
+            r#"{"a":[{"k":1},{"k":2}]} | with(.a; .[] | select(.k == 2) | .z = 1)"#,
+            r#"{"a":[{"k":1},{"k":2,"z":1}]}"#,
+        ),
+        (
+            r#"[{"a":1},{"a":2}] | with(.[] | select(.a == 2); .b = 9)"#,
+            r#"[{"a":1},{"a":2,"b":9}]"#,
+        ),
+        (r#"{"a":1} | with(.a; select(false) | . = 5)"#, r#"{"a":1}"#),
+        (r#"{"a":1} | with(.a; . = null)"#, r#"{"a":null}"#),
+        (". as $x | with(.a; . = 1)", r#"{"a":1}"#),
+    ] {
+        let (out, code) = run_yq_stdin(filter, "", args)?;
+        assert_eq!((out.trim(), code), (expected, 0), "{filter}");
+    }
+    // A comma where the path belongs is yq's "block" error.
+    let (_out, stderr, code) = run_yq_stdin_with_stderr("with(.a, .b; . = 7)", "", args)?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("with must be given a block (;), got UNION instead"),
+        "{stderr}"
+    );
+    // `with`, `to_number` and the decoders are yq names, so jq mode may define them.
+    let (out, code) = run_jq_stdin("def with(a; b): 42; with(1; 2)", "null", &["-c"])?;
+    assert_eq!((out.trim(), code), ("42", 0));
+    Ok(())
+}

@@ -2410,6 +2410,9 @@ pub enum Builtin {
     ToJson,
     /// `fromjson` - parse JSON string to value
     FromJson,
+    /// yq's `from_json` and `from_yaml` (#4206): the string's first YAML document, as a value.
+    /// A non-string passes through unchanged. Yq mode only.
+    FromYaml,
 
     // Phase 6: Additional String Functions
     /// `explode` - string to array of codepoints

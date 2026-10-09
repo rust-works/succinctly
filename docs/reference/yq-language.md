@@ -81,6 +81,20 @@ has (`1 as $a | {$a}` prints nothing). See the
 [limitations entry](../compliance/yq/limitations.md#object-construction-yqs--is-collect_object-not-jqs-sugar-2783)
 for the full table.
 
+### `with`, `to_number`, `from_json` and `from_yaml` (#4206)
+
+```bash
+echo '{"a": {"b": 1}}' | succinctly yq -o=json '.a |= (.c = 2) | with(.a; .d = 3)'   # {"a":{"b":1,"c":2,"d":3}}
+echo '{"a": 1}' | succinctly yq -o=json 'with(.a; . + 1)'                            # {"a":1} -- only assignments take effect
+echo '"12"'            | succinctly yq 'to_number'                                       # 12
+echo '"a: 1"'          | succinctly yq 'from_yaml'                                       # a: 1
+```
+
+`with(path; update)` applies the assignments inside `update` (all of them, in order) to each
+node `path` names and discards the value of anything else; a missing path is created as `|=`
+does. `from_json` and `from_yaml` both decode YAML and answer the first document of a string
+(a non-string passes through). `to_json` and `to_yaml` are not implemented yet (#4206).
+
 ### Operator precedence differs on `|`, `,` and `and`/`or`
 
 The [jq operator-precedence table](jq-language.md#operator-precedence) applies in

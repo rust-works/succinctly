@@ -364,6 +364,88 @@ fn is_ident_start_char(c: char) -> bool {
     c.is_alphabetic() || c == '_'
 }
 
+/// What yq's `with(path; update)` keeps of `update` (#4206): the in-place changes its assignments
+/// make, applied to the node `path` names, and nothing else. yq runs `update` with each node as
+/// its context and discards the value of whatever is not an assignment, so `. = 2 | . + 1`
+/// leaves the node `2`, `.c = 2, .d = 3` applies both, and `select(.a == 2) | .b = 9` writes only
+/// where the select passes. The result is an expression that takes the node and answers it
+/// changed:
+///
+/// - an assignment is itself;
+/// - a comma applies each part in turn;
+/// - `select(f) | rest` is `if f then <rest> else . end`, so a failing select leaves the node;
+/// - a navigation then `rest` (`.b | .c = 1`, `.[] | select(..) | ..`) is `nav |= <rest>`, which
+///   writes through to the document, creating a missing path as yq does;
+/// - an assignment then `rest` runs `rest` on the changed node;
+/// - anything else (a value-producing stage, whose output yq discards) is `.`.
+fn with_update_effect(update: &Expr) -> Expr {
+    match update {
+        Expr::Assign { .. }
+        | Expr::Update { .. }
+        | Expr::CompoundAssign { .. }
+        | Expr::AlternativeAssign { .. } => update.clone(),
+        Expr::Paren(inner) => with_update_effect(inner),
+        Expr::Comma(items) => Expr::pipe(items.iter().map(with_update_effect).collect()),
+        Expr::Pipe(stages) => with_update_pipe_effect(stages),
+        _ => Expr::Identity,
+    }
+}
+
+/// [`with_update_effect`] for the stages of a pipe: the first decides what the rest runs on.
+fn with_update_pipe_effect(stages: &[Expr]) -> Expr {
+    let Some((head, rest)) = stages.split_first() else {
+        return Expr::Identity;
+    };
+    if rest.is_empty() {
+        return with_update_effect(head);
+    }
+    match head {
+        Expr::Builtin(Builtin::Select(condition)) => Expr::If {
+            cond: condition.clone(),
+            then_branch: Box::new(with_update_pipe_effect(rest)),
+            else_branch: Box::new(Expr::Identity),
+        },
+        Expr::Paren(inner) if !matches!(**inner, Expr::Comma(_)) => {
+            let mut stages = vec![(**inner).clone()];
+            stages.extend_from_slice(rest);
+            with_update_pipe_effect(&stages)
+        }
+        head if is_assignment_expr(head) => {
+            Expr::pipe(vec![head.clone(), with_update_pipe_effect(rest)])
+        }
+        head if is_navigation_expr(head) => Expr::Update {
+            path: Box::new(head.clone()),
+            filter: Box::new(with_update_pipe_effect(rest)),
+        },
+        _ => Expr::Identity,
+    }
+}
+
+/// Whether `expr` only walks to nodes of the document (`.b`, `.[0]`, `.[]`, `.a.b`, `.a?`).
+fn is_navigation_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Field(_) | Expr::Index { .. } | Expr::Iterate => true,
+        Expr::Paren(inner) | Expr::Optional(inner) => is_navigation_expr(inner),
+        Expr::Pipe(stages) => !stages.is_empty() && stages.iter().all(is_navigation_expr),
+        _ => false,
+    }
+}
+
+/// Whether `expr` is an assignment (`=`, `|=`, `op=`, `//=`), alone or comma'd or piped with
+/// others.
+fn is_assignment_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Assign { .. }
+        | Expr::Update { .. }
+        | Expr::CompoundAssign { .. }
+        | Expr::AlternativeAssign { .. } => true,
+        Expr::Paren(inner) => is_assignment_expr(inner),
+        Expr::Comma(items) => !items.is_empty() && items.iter().all(is_assignment_expr),
+        Expr::Pipe(stages) => !stages.is_empty() && stages.iter().all(is_assignment_expr),
+        _ => false,
+    }
+}
+
 /// The one definition of what `$name` (the `$` already consumed) desugars
 /// to: jq's two pseudo-variables, `$__loc__`/`$ENV`, get their own
 /// dedicated node; every other name is an ordinary bound-variable
@@ -3182,6 +3264,9 @@ impl<'a> Parser<'a> {
                         "repeat",
                         Self::parse_repeat_expr,
                     )
+                } else if self.mode == ParserMode::Yq && self.matches_keyword("with") {
+                    // #4206: yq's `with(path; update)`; not a jq form.
+                    self.parse_shadowable_special_form(keyword_start, "with", Self::parse_with_expr)
                 } else if self.matches_keyword("range") {
                     self.reject_unless_jq_extensions("range")?;
                     self.parse_shadowable_special_form(
@@ -3708,6 +3793,44 @@ impl<'a> Parser<'a> {
         Ok(Expr::Limit {
             n: Box::new(n),
             expr: Box::new(expr),
+        })
+    }
+
+    /// Parse yq's `with(path; update)` (#4206): `path` is the nodes to work on and `update` runs
+    /// with each as its context. Only an assignment inside `update` takes effect -- yq discards
+    /// the value of any other expression (`[1,2] | with(.[]; . + 1)` is `[1,2]`), and creates a
+    /// missing path the way `|=` does (`with(.z; .b = 2)` adds `z: {b: 2}`). So an update that
+    /// is built from assignments is `path |= update`, and anything else leaves the nodes as
+    /// they are.
+    fn parse_with_expr(&mut self) -> Result<Expr, ParseError> {
+        let start_pos = self.pos;
+        self.consume_keyword("with");
+        self.skip_ws();
+        if let Err(early) = self.expect_or_wrong_arity('(', start_pos) {
+            return early;
+        }
+        self.next();
+        self.skip_ws();
+        let path = self.parse_expr()?;
+        self.skip_ws();
+        if matches!(path, Expr::Comma(_)) {
+            return Err(ParseError::new(
+                "with must be given a block (;), got UNION instead",
+                self.pos,
+            ));
+        }
+        self.expect(';')?;
+        self.skip_ws();
+        let update = self.parse_expr()?;
+        self.skip_ws();
+        if self.peek() != Some(')') {
+            return self.wrong_arity_or_expect(start_pos, ')', vec![path, update]);
+        }
+        self.next();
+        let filter = with_update_effect(&update);
+        Ok(Expr::Update {
+            path: Box::new(path),
+            filter: Box::new(filter),
         })
     }
 
@@ -6178,6 +6301,23 @@ impl<'a> Parser<'a> {
         if self.matches_keyword("tonumber") {
             self.consume_keyword("tonumber");
             return Ok(Some(Builtin::ToNumber));
+        }
+        // #4206: yq's own spellings. `to_number` is `tonumber` (yq words its error differently);
+        // `from_json` and `from_yaml` both decode YAML, JSON being a subset. Not jq names, so a
+        // jq-mode program may define them.
+        if self.mode == ParserMode::Yq {
+            if self.matches_keyword("to_number") {
+                self.consume_keyword("to_number");
+                return Ok(Some(Builtin::ToNumber));
+            }
+            if self.matches_keyword("from_json") {
+                self.consume_keyword("from_json");
+                return Ok(Some(Builtin::FromYaml));
+            }
+            if self.matches_keyword("from_yaml") {
+                self.consume_keyword("from_yaml");
+                return Ok(Some(Builtin::FromYaml));
+            }
         }
         if self.matches_keyword("tojson") {
             self.consume_keyword("tojson");
