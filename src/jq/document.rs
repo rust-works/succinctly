@@ -3132,9 +3132,6 @@ fn repeated_hashes(mut hashes: Vec<u64>) -> (Vec<u64>, usize) {
         twice[at >> 6] |= already;
         arrivals += usize::from(already != 0);
     }
-    if arrivals == 0 {
-        return (Vec::new(), n);
-    }
     // Random hashes give 3-6% of `n` arrivals. Far more means the filter is
     // not filtering -- a document that really repeats most of its keys, or
     // keys chosen so their hashes share low bits (the hash is unkeyed) -- so
