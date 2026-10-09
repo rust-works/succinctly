@@ -17296,7 +17296,10 @@ fn each_object_entries_generic<S: EvalSemantics, V: DocumentValue>(
     sink: &mut dyn Sink<V>,
 ) -> Flow {
     let Some((entry, rest)) = entries.split_first() else {
-        let object: IndexMap<String, OwnedValue> = acc.iter().cloned().collect();
+        let object = match super::eval::object_from_pairs::<S>(acc.iter().cloned()) {
+            Ok(object) => object,
+            Err(e) => return Flow::Escaped(Control::Error(e)),
+        };
         return match sink.push(GenericItem::Owned(OwnedValue::Object(object.into()))) {
             Demand::Continue => Flow::Exhausted,
             Demand::Stop => Flow::Stopped { pending: None },
@@ -26852,11 +26855,14 @@ fn build_object_entries_generic<S: EvalSemantics, V: DocumentValue>(
 ) -> Result<(), ObjectEscapeGeneric> {
     let Some((entry, rest)) = entries.split_first() else {
         let object = if sole {
-            core::mem::take(acc).into_iter().collect::<IndexMap<_, _>>()
+            super::eval::object_from_pairs::<S>(core::mem::take(acc))
         } else {
-            acc.iter().cloned().collect::<IndexMap<_, _>>()
+            super::eval::object_from_pairs::<S>(acc.iter().cloned())
         };
-        out.push(OwnedValue::Object(object.into()));
+        match object {
+            Ok(object) => out.push(OwnedValue::Object(object.into())),
+            Err(e) => return Err(ObjectEscapeGeneric::Control(Control::Error(e))),
+        }
         return Ok(());
     };
 
@@ -52258,6 +52264,117 @@ mod tests {
         };
         let control = eval_each_with_cursor_using::<S, _>(&expr, cursor, &mut on_value);
         (out, control)
+    }
+
+    /// #4182: yq folds the entries of a `{...}` with `*`, so a key that repeats
+    /// deep-merges its values where jq keeps the last. A literal key that
+    /// repeats, and a computed key (which can only be compared at run time),
+    /// are built as `COLLECT_OBJECT`, like a construction with a bare entry;
+    /// distinct literal keys keep the fan-out. Every row was captured from yq
+    /// v4.53.3 (`yq -n -o json -I0`), and each is asked of the cursor entry,
+    /// the streaming sink and the owned-value entry, which build an object in
+    /// three different places.
+    #[test]
+    fn yq_repeated_object_keys_deep_merge_4182() {
+        use crate::jq::{parse_with_mode, ParserMode, YqSemantics};
+        let json = br#"{"k":"a","n":[{"n":"a","v":{"x":1}},{"n":"a","v":{"y":2}}]}"#;
+        let index = JsonIndex::build(json);
+        let join = |values: &[OwnedValue]| {
+            values
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let cursor = |filter: &str| {
+            let expr = parse_with_mode(filter, ParserMode::Yq).expect("filter parses");
+            match eval_with_cursor_using::<YqSemantics, _>(&expr, index.root(json)) {
+                GenericResult::Error(e) => format!("error: {e}"),
+                result => join(&result.collect_owned::<YqSemantics>().unwrap()),
+            }
+        };
+        let sink = |filter: &str| {
+            let expr = parse_with_mode(filter, ParserMode::Yq).expect("filter parses");
+            let mut out = Vec::new();
+            let mut on_value = |result: GenericResult<_>| {
+                let _ = push_generic_owned_values::<_, YqSemantics>(result, &mut out);
+                true
+            };
+            match eval_each_with_cursor_using::<YqSemantics, _>(
+                &expr,
+                index.root(json),
+                &mut on_value,
+            ) {
+                Some(Control::Error(e)) => format!("error: {e}"),
+                _ => join(&out),
+            }
+        };
+        let owned = |filter: &str| {
+            let expr = parse_with_mode(filter, ParserMode::Yq).expect("filter parses");
+            match eval_using::<YqSemantics, _>(&expr, index.root(json).value()) {
+                GenericResult::Error(e) => format!("error: {e}"),
+                result => join(&result.collect_owned::<YqSemantics>().unwrap()),
+            }
+        };
+        for (filter, expected) in [
+            // A literal key that repeats.
+            (r#"{"a":{"x":1},"a":{"y":2}}"#, r#"{"a":{"x":1,"y":2}}"#),
+            (
+                r#"{"a":{"x":1},"b":2,"a":{"y":2}}"#,
+                r#"{"a":{"x":1,"y":2},"b":2}"#,
+            ),
+            (
+                r#"{"a":{"x":1},"a":{"y":2},"a":{"x":9,"z":{"q":1}},"a":{"z":{"r":2}}}"#,
+                r#"{"a":{"x":9,"y":2,"z":{"q":1,"r":2}}}"#,
+            ),
+            (
+                r#"{"a":({"x":1},{"x":2}),"a":{"y":3}}"#,
+                r#"{"a":{"x":1,"y":3}} {"a":{"x":2,"y":3}}"#,
+            ),
+            // Only a map over a map merges; anything else, the later wins.
+            (r#"{"a":[1],"a":[2]}"#, r#"{"a":[2]}"#),
+            (r#"{"a":{"x":1},"a":2}"#, r#"{"a":2}"#),
+            (r#"{"a":2,"a":{"x":1}}"#, r#"{"a":{"x":1}}"#),
+            (r#"{"a":{"x":1},"a":null}"#, r#"{"a":null}"#),
+            (r#"{"a":null,"a":{"x":1}}"#, r#"{"a":{"x":1}}"#),
+            // A computed key is compared at run time.
+            (
+                r#""a" as $k | {($k):{"x":1}, ($k):{"y":2}}"#,
+                r#"{"a":{"x":1,"y":2}}"#,
+            ),
+            (r#"{"a":{"x":1}, ("a"):{"y":2}}"#, r#"{"a":{"x":1,"y":2}}"#),
+            (r#"{("a"):{"x":1}, "a":{"y":2}}"#, r#"{"a":{"x":1,"y":2}}"#),
+            (
+                r#"{"a":{"x":1}, ("b","a"):{"y":2}}"#,
+                r#"{"a":{"x":1},"b":{"y":2}} {"a":{"x":1,"y":2}}"#,
+            ),
+            (
+                r#".n[] | {(.n): .v, (.n): {"q":1}}"#,
+                r#"{"a":{"x":1,"q":1}} {"a":{"y":2,"q":1}}"#,
+            ),
+            (
+                r#"{.k: {"x":1}, (.n[0].n): {"y":2}}"#,
+                r#"{"a":{"x":1,"y":2}}"#,
+            ),
+            // Distinct keys are what they were.
+            (
+                r#"{"a":{"x":1},"b":{"y":2}}"#,
+                r#"{"a":{"x":1},"b":{"y":2}}"#,
+            ),
+            (r#"{("a","b"):1, "c":2}"#, r#"{"a":1,"c":2} {"b":1,"c":2}"#),
+            (r#"{(.k):{"x":1}}"#, r#"{"a":{"x":1}}"#),
+        ] {
+            assert_eq!(cursor(filter), expected, "cursor: {filter}");
+            assert_eq!(sink(filter), expected, "sink: {filter}");
+            assert_eq!(owned(filter), expected, "owned: {filter}");
+        }
+        // jq keeps the last, in the same three places.
+        let expr = crate::jq::parse(r#"{"a":{"x":1},"a":{"y":2}}"#).expect("parses");
+        let jq = eval_with_cursor_using::<JqSemantics, _>(&expr, index.root(json));
+        assert_eq!(
+            join(&jq.collect_owned::<JqSemantics>().unwrap()),
+            r#"{"a":{"y":2}}"#
+        );
     }
 
     /// [`drive_each_sink`] without a cursor: [`eval_each_generic`] called

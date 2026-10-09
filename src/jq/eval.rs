@@ -4363,11 +4363,13 @@ fn build_object_entries<S: EvalSemantics>(
             // Only combination, so nothing will read `acc` again: every enclosing
             // loop is on its final iteration, and the `acc.pop()` each one runs on
             // the way out is a no-op on the emptied vector.
-            core::mem::take(acc).into_iter().collect::<IndexMap<_, _>>()
+            object_from_pairs::<S>(core::mem::take(acc))
         } else {
-            acc.iter().cloned().collect::<IndexMap<_, _>>()
+            object_from_pairs::<S>(acc.iter().cloned())
         };
-        out.push(OwnedValue::Object(object.into()));
+        out.push(OwnedValue::Object(
+            object.map_err(ObjectEscape::Error)?.into(),
+        ));
         return Ok(());
     };
 
@@ -4519,6 +4521,48 @@ pub(crate) fn yq_collects_bare<S: EvalSemantics>(entries: &[super::expr::ObjectE
         && entries
             .iter()
             .any(|entry| matches!(entry.key, ObjectKey::Bare))
+}
+
+/// The object a construction's `(key, value)` pairs assemble into (#4182).
+///
+/// jq keeps the last value of a repeated key. yq folds the entries of a `{...}`
+/// with `*`, so when both values of a repeated key are maps they deep-merge
+/// (`{"a": {"x": 1}, "a": {"y": 2}}` is `a: {x: 1, y: 2}`); for anything else
+/// the later value wins, as in jq. The merge is the left fold
+/// [`collect_object`](super::collect_object::collect_object) runs over a
+/// construction holding a bare entry, so the two assembly routes agree.
+///
+/// This is the one place a construction's pairs become an object, which is why
+/// the fan-out needs no per-construction flag: a computed key that repeats is
+/// only visible here. jq mode collects straight into the map, as it always did.
+pub(crate) fn object_from_pairs<S: EvalSemantics>(
+    pairs: impl IntoIterator<Item = (String, OwnedValue)>,
+) -> Result<IndexMap<String, OwnedValue>, EvalError> {
+    if S::TAG != EvalTag::Yq {
+        return Ok(pairs.into_iter().collect());
+    }
+    let pairs = pairs.into_iter();
+    let mut map = IndexMap::with_capacity(pairs.size_hint().0);
+    for (key, value) in pairs {
+        match map.entry(key) {
+            indexmap::map::Entry::Vacant(slot) => {
+                slot.insert(value);
+            }
+            indexmap::map::Entry::Occupied(mut slot) => {
+                let merged = if matches!(
+                    (slot.get(), &value),
+                    (OwnedValue::Object(_), OwnedValue::Object(_))
+                ) {
+                    let earlier = core::mem::replace(slot.get_mut(), OwnedValue::Null);
+                    arith_mul::<S>(earlier, value, MergeFlags::default())?
+                } else {
+                    value
+                };
+                *slot.get_mut() = merged;
+            }
+        }
+    }
+    Ok(map)
 }
 
 /// Object construction holding a bare entry, as yq's `COLLECT_OBJECT` (#2783).
@@ -8908,7 +8952,10 @@ fn each_object_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
     let Some((entry, rest)) = entries.split_first() else {
-        let object: IndexMap<String, OwnedValue> = acc.iter().cloned().collect();
+        let object = match object_from_pairs::<S>(acc.iter().cloned()) {
+            Ok(object) => object,
+            Err(e) => return Flow::Escaped(Control::Error(e)),
+        };
         return match sink(Item::Owned(OwnedValue::Object(object.into()))) {
             Demand::Continue => Flow::Exhausted,
             Demand::Stop => Flow::Stopped { pending: None },
@@ -11670,7 +11717,7 @@ fn closed_expr_to_owned_node<S: EvalSemantics>(
                     closed_expr_to_owned_at_depth::<S>(&entry.value, depth + 1, escaped)?,
                 ));
             }
-            Some(OwnedValue::Object(out.into_iter().collect()))
+            Some(OwnedValue::Object(object_from_pairs::<S>(out).ok()?.into()))
         }
         _ => None,
     }
@@ -136203,6 +136250,161 @@ mod touched_edge_cases_2999 {
         // `--jq-extensions` keeps the identifier key and the `{x}` shorthand.
         assert_eq!(run("{a}", true), r#"{"a":1}"#);
         assert_eq!(run("{k: .a}", true), r#"{"k":1}"#);
+    }
+
+    /// #4182: the owned evaluator and the closed-literal folder agree with the
+    /// generic one (`yq_repeated_object_keys_deep_merge_4182`) that a repeated
+    /// key deep-merges in yq. The folder is the sharp one: a closed
+    /// `{"a": {..}, "a": {..}}` is answerable without evaluating anything, and
+    /// folding it straight into an `IndexMap` would keep the last.
+    #[test]
+    fn yq_repeated_object_keys_deep_merge_in_the_owned_evaluator_and_folder_4182() {
+        let json = br#"{"k":"a"}"#;
+        let index = JsonIndex::build(json);
+        for (filter, expected) in [
+            (r#"{"a":{"x":1},"a":{"y":2}}"#, r#"{"a":{"x":1,"y":2}}"#),
+            (
+                r#"{"a":({"x":1},{"x":2}),"a":{"y":3}}"#,
+                r#"{"a":{"x":1,"y":3}} {"a":{"x":2,"y":3}}"#,
+            ),
+            (r#"{.k:{"x":1}, ("a"):{"y":2}}"#, r#"{"a":{"x":1,"y":2}}"#),
+            (
+                r#"{"a":{"x":1},"b":{"y":2}}"#,
+                r#"{"a":{"x":1},"b":{"y":2}}"#,
+            ),
+        ] {
+            let expr = parse_with_mode_and_extensions(filter, ParserMode::Yq, false)
+                .expect("filter parses");
+            for (entry, result) in [
+                (
+                    "eval",
+                    eval::<Vec<u64>, YqSemantics>(&expr, index.root(json)),
+                ),
+                (
+                    "eval_full",
+                    eval_full::<Vec<u64>, YqSemantics>(&expr, index.root(json)),
+                ),
+            ] {
+                let got = result
+                    .collect_owned::<YqSemantics>()
+                    .iter()
+                    .map(OwnedValue::to_json)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert_eq!(got, expected, "{entry}: {filter}");
+            }
+        }
+        // The folder merges a repeated key as the evaluators do, in yq mode only.
+        let closed = |filter: &str, mode: ParserMode| {
+            let expr = parse_with_mode_and_extensions(filter, mode, false).expect("filter parses");
+            match mode {
+                ParserMode::Yq => closed_expr_to_owned::<YqSemantics>(&expr),
+                _ => closed_expr_to_owned::<JqSemantics>(&expr),
+            }
+            .map(|v| v.to_json())
+        };
+        assert_eq!(
+            closed(r#"{"a":{"x":1},"a":{"y":2}}"#, ParserMode::Yq).as_deref(),
+            Some(r#"{"a":{"x":1,"y":2}}"#)
+        );
+        assert_eq!(
+            closed(r#"{"a":{"x":1},"a":{"y":2}}"#, ParserMode::Jq).as_deref(),
+            Some(r#"{"a":{"y":2}}"#)
+        );
+        assert_eq!(
+            closed(r#"{"a":{"x":1},"b":{"y":2}}"#, ParserMode::Yq).as_deref(),
+            Some(r#"{"a":{"x":1},"b":{"y":2}}"#)
+        );
+    }
+
+    /// #4182: `object_from_pairs` is where a construction's pairs become an
+    /// object. jq keeps the last value of a repeated key; yq deep-merges a map
+    /// over a map and otherwise takes the later value, folding left, and a
+    /// repeated key keeps the position of its first appearance.
+    #[test]
+    fn object_from_pairs_merges_a_repeated_key_in_yq_only_4182() {
+        let value = |json: &str| {
+            let index = JsonIndex::build(json.as_bytes());
+            crate::jq::eval_generic::to_owned_cursor::<JqSemantics, _>(&index.root(json.as_bytes()))
+                .expect("decodes")
+        };
+        let pairs = |rows: &[(&str, &str)]| {
+            rows.iter()
+                .map(|(k, v)| ((*k).to_string(), value(v)))
+                .collect::<Vec<_>>()
+        };
+        let render = |map: IndexMap<String, OwnedValue>| OwnedValue::Object(map.into()).to_json();
+        for (rows, jq, yq) in [
+            (
+                &[("a", r#"{"x":1}"#), ("a", r#"{"y":2}"#)][..],
+                r#"{"a":{"y":2}}"#,
+                r#"{"a":{"x":1,"y":2}}"#,
+            ),
+            (
+                &[("a", r#"{"x":1}"#), ("b", "0"), ("a", r#"{"y":2}"#)][..],
+                r#"{"a":{"y":2},"b":0}"#,
+                r#"{"a":{"x":1,"y":2},"b":0}"#,
+            ),
+            // Three of a kind fold left, and nested maps merge at every level.
+            (
+                &[
+                    ("a", r#"{"p":{"q":1}}"#),
+                    ("a", r#"{"p":{"r":2}}"#),
+                    ("a", r#"{"p":{"q":3}}"#),
+                ][..],
+                r#"{"a":{"p":{"q":3}}}"#,
+                r#"{"a":{"p":{"q":3,"r":2}}}"#,
+            ),
+            // Anything but a map over a map: the later value wins in both.
+            (
+                &[("a", "[1]"), ("a", "[2]")][..],
+                r#"{"a":[2]}"#,
+                r#"{"a":[2]}"#,
+            ),
+            (
+                &[("a", r#"{"x":1}"#), ("a", "2")][..],
+                r#"{"a":2}"#,
+                r#"{"a":2}"#,
+            ),
+            (
+                &[("a", "2"), ("a", r#"{"x":1}"#)][..],
+                r#"{"a":{"x":1}}"#,
+                r#"{"a":{"x":1}}"#,
+            ),
+            (
+                &[("a", r#"{"x":1}"#), ("a", "null")][..],
+                r#"{"a":null}"#,
+                r#"{"a":null}"#,
+            ),
+            (
+                &[("a", "null"), ("a", r#"{"x":1}"#)][..],
+                r#"{"a":{"x":1}}"#,
+                r#"{"a":{"x":1}}"#,
+            ),
+            (
+                &[("a", "[1]"), ("a", r#"{"x":1}"#)][..],
+                r#"{"a":{"x":1}}"#,
+                r#"{"a":{"x":1}}"#,
+            ),
+            // Distinct keys are untouched.
+            (
+                &[("a", r#"{"x":1}"#), ("b", r#"{"y":2}"#)][..],
+                r#"{"a":{"x":1},"b":{"y":2}}"#,
+                r#"{"a":{"x":1},"b":{"y":2}}"#,
+            ),
+            (&[][..], "{}", "{}"),
+        ] {
+            assert_eq!(
+                render(object_from_pairs::<JqSemantics>(pairs(rows)).unwrap()),
+                jq,
+                "jq: {rows:?}"
+            );
+            assert_eq!(
+                render(object_from_pairs::<YqSemantics>(pairs(rows)).unwrap()),
+                yq,
+                "yq: {rows:?}"
+            );
+        }
     }
 
     /// #3479: a construct the generic evaluator bridges to the owned evaluator

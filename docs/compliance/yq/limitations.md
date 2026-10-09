@@ -4947,6 +4947,13 @@ $ echo $?
 
   yq evaluates every entry before combining any, so an error inside one entry aborts the whole
   construction with no prefix, unlike jq's streaming fan-out.
+- **A repeated key deep-merges (#4182).** yq folds the entries of a `{...}` with `*`, so
+  `{"a": {"x": 1}, "a": {"y": 2}}` is `a: {x: 1, y: 2}` where jq (and a pair-only construction
+  here before #4182) keeps the last. Only a map over a map merges; for anything else the later
+  value wins, as in yq. The merge happens where a construction's pairs become an object, so it
+  covers a literal key that repeats and a computed key that turns out to (`{($k): .., ($k): ..}`)
+  alike, on every route, and costs nothing when no key repeats. It is the same fold the
+  `COLLECT_OBJECT` route above runs.
 
 Residual divergences remain, all in cases yq itself reaches through its node model:
 
@@ -4960,10 +4967,6 @@ Residual divergences remain, all in cases yq itself reaches through its node mod
   has different lengths is the `CollectObject: mismatching node sizes` error in yq and no output
   here, and `[.l[] | {.nope}]` is `[{}]` in yq and `[{},{}]` here (#4184). Pair-only
   constructions are unaffected (one object per node either way).
-- **Duplicate keys.** yq folds the entries of a `{...}` with `*`, so `{"a": {"x": 1}, "a": {"y": 2}}`
-  deep-merges to `a: {x: 1, y: 2}`; `succinctly yq` keeps the last (`a: {y: 2}`), as it did before
-  #2783. Scalars and arrays agree (the later one wins either way). A construction holding a bare
-  entry does merge, since it goes through the same fold.
 - **`,` over one stored list.** yq's `UNION` skips its right operand when both sides evaluate to
   the very same node list, which `$z, $z`, `($z), $z` and `., .` do (`[1] as $z | $z, $z` prints
   once). It is a property of the comma operator everywhere, not of `{...}`, so a bare entry

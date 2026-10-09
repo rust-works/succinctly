@@ -60665,6 +60665,74 @@ fn test_object_construction_is_collect_object_2783() -> Result<()> {
     Ok(())
 }
 
+/// Pinned yq v4.53.3: `{...}` folds its entries with `*`, so a key that repeats
+/// deep-merges its two values where the later would win in jq (#4182). Only a map
+/// over a map merges; a computed key is compared at run time. Every row was
+/// captured from the pinned binary, `-p=json -o=json -I=0`.
+#[test]
+fn test_object_construction_repeated_key_deep_merges_4182() -> Result<()> {
+    let args = &["-p=json", "-o=json", "-I=0"];
+    let input = r#"{"k":"a","n":[{"n":"a","v":{"x":1}},{"n":"a","v":{"y":2}}]}"#;
+    for (filter, expected) in [
+        (r#"{"a":{"x":1},"a":{"y":2}}"#, "{\"a\":{\"x\":1,\"y\":2}}\n"),
+        (
+            r#"{"a":{"x":1},"b":2,"a":{"y":2}}"#,
+            "{\"a\":{\"x\":1,\"y\":2},\"b\":2}\n",
+        ),
+        (
+            r#"{"a":{"x":1},"a":{"y":2},"a":{"x":9,"z":{"q":1}},"a":{"z":{"r":2}}}"#,
+            "{\"a\":{\"x\":9,\"y\":2,\"z\":{\"q\":1,\"r\":2}}}\n",
+        ),
+        (
+            r#"{"a":({"x":1},{"x":2}),"a":{"y":3}}"#,
+            "{\"a\":{\"x\":1,\"y\":3}}\n{\"a\":{\"x\":2,\"y\":3}}\n",
+        ),
+        // Anything but a map over a map: the later one wins.
+        (r#"{"a":[1],"a":[2]}"#, "{\"a\":[2]}\n"),
+        (r#"{"a":{"x":1},"a":2}"#, "{\"a\":2}\n"),
+        (r#"{"a":{"x":1},"a":null}"#, "{\"a\":null}\n"),
+        (r#"{"a":null,"a":{"x":1}}"#, "{\"a\":{\"x\":1}}\n"),
+        // A computed key that turns out to repeat.
+        (
+            r#""a" as $k | {($k):{"x":1}, ($k):{"y":2}}"#,
+            "{\"a\":{\"x\":1,\"y\":2}}\n",
+        ),
+        (
+            r#"{"a":{"x":1}, ("a"):{"y":2}}"#,
+            "{\"a\":{\"x\":1,\"y\":2}}\n",
+        ),
+        (
+            r#"{.k:{"x":1}, (.n[0].n):{"y":2}}"#,
+            "{\"a\":{\"x\":1,\"y\":2}}\n",
+        ),
+        (
+            r#".n[] | {(.n): .v, (.n): {"q":1}}"#,
+            "{\"a\":{\"x\":1,\"q\":1}}\n{\"a\":{\"y\":2,\"q\":1}}\n",
+        ),
+        (
+            r#"{"a":{"x":1}, ("b","a"):{"y":2}}"#,
+            "{\"a\":{\"x\":1},\"b\":{\"y\":2}}\n{\"a\":{\"x\":1,\"y\":2}}\n",
+        ),
+        // The same construction as the value of an assignment from an absent path.
+        (
+            r#".x = (.zz | {"k": {"p":1}, "k": {"q":2}})"#,
+            "{\"k\":\"a\",\"n\":[{\"n\":\"a\",\"v\":{\"x\":1}},{\"n\":\"a\",\"v\":{\"y\":2}}],\"x\":{\"k\":{\"p\":1,\"q\":2}}}\n",
+        ),
+        // Distinct keys are untouched.
+        (
+            r#"{"a":{"x":1},"b":{"y":2}}"#,
+            "{\"a\":{\"x\":1},\"b\":{\"y\":2}}\n",
+        ),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, input, args)?,
+            (expected.into(), String::new(), 0),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
 /// Pinned yq v4.53.3: a later entry with fewer children than the first fails the
 /// whole construction, and a bare entry that splats to a value `*` cannot merge
 /// into a map fails with yq's multiply error (#2783).
