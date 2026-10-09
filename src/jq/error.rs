@@ -838,6 +838,21 @@ impl EvalError {
         Self::new("Array/string slice indices must be integers")
     }
 
+    /// `expected to find 1 number, got {got} instead`: a yq slice bound that
+    /// produced no value (#4197).
+    ///
+    /// Real yq evaluates each bound of `.[S:T]` in full and wants exactly one
+    /// number from it, wherever the slice is read or written and whatever the
+    /// target is (`null` and scalars included), and neither `?` nor `//`
+    /// suppresses it: `.b[select(false):]`, `.b[$typo:]`, `.b[1:select(false)] = 9`
+    /// and `del(.b[select(false):])` all raise it (yq v4.53.3). jq's generator
+    /// model reads an empty bound as "no slice", which is jq mode's rule; only
+    /// the zero count is raised here, since a bound with two or more values
+    /// keeps yq mode's documented generator model (`docs/compliance/yq/limitations.md`).
+    pub fn slice_bound_count(got: usize) -> Self {
+        Self::new(format!("expected to find 1 number, got {got} instead"))
+    }
+
     /// `A slice of an array can only be assigned another array`.
     ///
     /// Writing through a slice splices the replacement in element by element,

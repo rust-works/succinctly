@@ -21890,6 +21890,11 @@ fn each_slice_bound_generic<S: EvalSemantics, V: DocumentValue>(
         if let Some(Err(e)) = collected.iter().find(|b| b.is_err()) {
             return Flow::Escaped(Control::Error(e.clone()));
         }
+        // #4197: yq wants exactly one number from a bound, and a stream that
+        // ended without producing one is an error, not "no slice".
+        if collected.is_empty() {
+            return Flow::Escaped(Control::Error(EvalError::slice_bound_count(0)));
+        }
         for b in collected {
             if sink(b) == Demand::Stop {
                 return Flow::Stopped { pending: None };

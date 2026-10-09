@@ -122487,3 +122487,22 @@ fn test_nth_reads_the_same_position_as_the_bracket_4163() -> Result<()> {
     );
     Ok(())
 }
+
+/// #4197: jq mode keeps its generator model for a slice bound with no output -- the empty
+/// stream is "no slice" on a read and a no-op on a write -- where yq mode raises. Every row
+/// captured live from jq 1.7.1.
+#[test]
+fn test_jq_slice_bound_with_no_output_is_no_slice_4197() -> Result<()> {
+    for (program, want) in [
+        ("[.b[select(false):]]", "[]\n"),
+        ("[.b[1:select(false)]]", "[]\n"),
+        ("[.b[:select(false)]]", "[]\n"),
+        (".b[select(false):1] = [9]", "{\"b\":[1,2,3]}\n"),
+        ("del(.b[select(false):])", "{\"b\":[1,2,3]}\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(r#"{"b":[1,2,3]}"#))?;
+        assert_eq!(code, 0, "#4197: `{program}`: stderr {stderr:?}");
+        assert_eq!(stdout, want, "#4197: `{program}`");
+    }
+    Ok(())
+}

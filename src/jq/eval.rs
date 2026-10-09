@@ -27929,6 +27929,11 @@ fn each_slice_bound<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         if let Some(Err(e)) = collected.iter().find(|b| b.is_err()) {
             return Flow::Escaped(Control::Error(e.clone()));
         }
+        // #4197: yq wants exactly one number from a bound, and a stream that
+        // ended without producing one is an error, not "no slice".
+        if collected.is_empty() {
+            return Flow::Escaped(Control::Error(EvalError::slice_bound_count(0)));
+        }
         for b in collected {
             if sink(b) == Demand::Stop {
                 return Flow::Stopped { pending: None };
@@ -55880,6 +55885,10 @@ fn drive_slice_bound<S: EvalSemantics>(
         let (mut values, escape) = eval_owned_multi_keep_partial::<S>(expr, value);
         if escape.is_some() {
             values = Vec::new();
+        } else if values.is_empty() {
+            // #4197: yq wants exactly one number from a bound; a stream that
+            // ended without producing one is an error, not "no slice".
+            return Err(EvalError::slice_bound_count(0).into());
         }
         let mut resolved = vec_with_capacity(values.len());
         for raw in values {
