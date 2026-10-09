@@ -2114,7 +2114,10 @@ A `del()` target that is a bound variable holding the root keeps the document
 `del(. as $y | $y)`, `del(($y))`, `del($y | .)` and `del(. as $y | ($y, $y))` print the input
 unchanged, as yq does (`{"a":1}` on `a: 1`; `true` and `null` on those scalars), where the
 bare `del(.)` prints nothing. The check is syntactic -- the target is a variable and nothing
-else -- because the resolved branch does not remember how it reached the root. What stays
+else -- because the resolved branch does not remember how it reached the root. So a spelling
+that reaches the root variable through anything but identities still empties the document:
+`. as $y | del($y // .)` and `. as $y | del($y | select(true))` print nothing where yq prints it.
+What stays
 different, all of it yq's node identity ([#2643](https://github.com/rust-works/succinctly/issues/2643)):
 a variable bound below the root (`.a as $y | del($y)` deletes `.a` in yq, refuses here),
 `. as $y | del($y.a)` (yq keeps the document, succinctly deletes `.a`), and the mixed orders

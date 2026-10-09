@@ -57671,8 +57671,9 @@ fn resolve_del_path_branches<'a, S: EvalSemantics>(
 }
 
 /// Whether every output of a `del()` target is a bound variable's node and nothing else (#3244):
-/// `$y`, `($y)`, `$y | .`, `. as $y | $y`, `($y, $y)`. A path step after the variable
-/// (`$y.a`, `$y | .a`) makes it a navigation, which is not this.
+/// `$y`, `($y)`, `$y | .`, `. | $y`, `. as $y | $y`, `($y, $y)`. A path step after the variable
+/// (`$y.a`, `$y | .a`) makes it a navigation, which is not this; neither is `$y // .` or
+/// `$y | select(true)`, which yq also keeps and which this does not recognise.
 fn del_target_is_bound_variable_only(target: &Expr) -> bool {
     match target {
         Expr::Var(_) | Expr::TrackedVar(_) | Expr::DeferredVar(_) => true,
@@ -57681,12 +57682,13 @@ fn del_target_is_bound_variable_only(target: &Expr) -> bool {
         Expr::Comma(branches) => {
             !branches.is_empty() && branches.iter().all(del_target_is_bound_variable_only)
         }
-        Expr::Pipe(stages) => match stages.split_first() {
-            Some((first, rest)) => {
-                del_target_is_bound_variable_only(first) && rest.iter().all(is_identity_stage)
-            }
-            None => false,
-        },
+        // Identities around the variable change nothing, wherever they sit.
+        Expr::Pipe(stages) => {
+            stages
+                .iter()
+                .all(|stage| is_identity_stage(stage) || del_target_is_bound_variable_only(stage))
+                && stages.iter().any(|stage| !is_identity_stage(stage))
+        }
         _ => false,
     }
 }
