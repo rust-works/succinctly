@@ -2490,6 +2490,7 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
         | Expr::ArrayKey(_)
         | Expr::Iterate
         | Expr::RecursiveDescent
+        | Expr::RecursiveDescentWithKeys
         | Expr::Literal(_)
         | Expr::Var(_)
         | Expr::TrackedVar(_)

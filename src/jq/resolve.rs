@@ -1168,6 +1168,7 @@ fn build_call_graph(
         | Expr::Iterate
         | Expr::Literal(_)
         | Expr::RecursiveDescent
+        | Expr::RecursiveDescentWithKeys
         | Expr::Not
         | Expr::Format(_)
         | Expr::Var(_)
@@ -2301,6 +2302,7 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
         | Expr::Iterate
         | Expr::Literal(_)
         | Expr::RecursiveDescent
+        | Expr::RecursiveDescentWithKeys
         | Expr::Not
         | Expr::Format(_)
         | Expr::TrackedVar(_)

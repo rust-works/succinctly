@@ -809,6 +809,7 @@ pub fn map_subexprs(expr: &Expr, mut f: &mut dyn FnMut(&Expr) -> Expr) -> Expr {
         Expr::Iterate => Expr::Iterate,
         Expr::Literal(lit) => Expr::Literal(lit.clone()),
         Expr::RecursiveDescent => Expr::RecursiveDescent,
+        Expr::RecursiveDescentWithKeys => Expr::RecursiveDescentWithKeys,
         Expr::Not => Expr::Not,
         Expr::Format(fmt) => Expr::Format(fmt.clone()),
         Expr::Var(name) => Expr::Var(name.clone()),
@@ -1205,6 +1206,7 @@ pub(crate) fn search_subexpr<F: FnMut(&Expr) -> Visit + ?Sized>(
         | Expr::Iterate
         | Expr::Literal(_)
         | Expr::RecursiveDescent
+        | Expr::RecursiveDescentWithKeys
         | Expr::Not
         | Expr::Format(_)
         | Expr::Var(_)
@@ -1900,6 +1902,7 @@ fn stage_escapes_own_input(expr: &Expr) -> bool {
         | Expr::Object(..)
         | Expr::Literal(..)
         | Expr::RecursiveDescent
+        | Expr::RecursiveDescentWithKeys
         | Expr::Paren(..)
         | Expr::Arithmetic { .. }
         | Expr::Negate(..)
@@ -1957,6 +1960,7 @@ fn node_reads_ambient(node: &Expr) -> bool {
         | Expr::ArrayKey(_)
         | Expr::Iterate
         | Expr::RecursiveDescent
+        | Expr::RecursiveDescentWithKeys
         // `not` and `@base64` and friends all apply to `.`.
         | Expr::Not
         | Expr::Format(_)

@@ -2666,6 +2666,18 @@ impl CommentTree {
         }
     }
 
+    /// Drop the comment trailing object field `key`'s own *key* line (#765), as
+    /// `... comments = ""` does (#2796). Everything else about the key (its quoting, its
+    /// anchor) stays. A no-op for a node that is not an `Object` or a key with no comment.
+    pub fn clear_key_comment(&mut self, key: &str) {
+        if let Self::Object(_, _, keys) = self {
+            if let Some(meta) = keys.get_mut(key) {
+                meta.comment = None;
+                meta.value_absent = false;
+            }
+        }
+    }
+
     /// How object field `key`'s *key* was quoted in the source (`"single"`,
     /// `"double"`, [`KEY_STYLE_STRING`] after `-P`), or `""` for a plain key,
     /// one this isn't an `Object` for, or one with no entry (#3601). Distinct

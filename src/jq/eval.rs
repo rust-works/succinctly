@@ -3561,7 +3561,9 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         Expr::Literal(lit) => QueryResult::Owned(literal_to_owned(lit)),
 
-        Expr::RecursiveDescent => eval_recursive_descent::<W, S>(value),
+        Expr::RecursiveDescent | Expr::RecursiveDescentWithKeys => {
+            eval_recursive_descent::<W, S>(value)
+        }
 
         Expr::Paren(inner) => eval_single::<W, S>(inner, value, optional),
 
@@ -32080,19 +32082,28 @@ fn eval_meta_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     match slot {
-        MetaSlot::LineComment | MetaSlot::Style | MetaSlot::Anchor => {
+        MetaSlot::LineComment
+        | MetaSlot::Style
+        | MetaSlot::Anchor
+        | MetaSlot::HeadComment
+        | MetaSlot::FootComment
+        | MetaSlot::Comments => {
             let identity = Expr::Identity;
+            // `...` (#2796) walks the same value positions `..` does; its key nodes are the
+            // metadata pass's concern, not the value tree's.
+            let target = match target {
+                Expr::RecursiveDescentWithKeys => &Expr::RecursiveDescent,
+                other => other,
+            };
             eval_update::<W, S>(target, &identity, input, optional, true)
         }
-        MetaSlot::Tag | MetaSlot::HeadComment | MetaSlot::FootComment | MetaSlot::Comments => {
-            suppress_or_raise(
-                EvalError::new(format!(
-                    "{} = ... is not yet supported",
-                    meta_slot_keyword(slot)
-                )),
-                optional,
-            )
-        }
+        MetaSlot::Tag => suppress_or_raise(
+            EvalError::new(format!(
+                "{} = ... is not yet supported",
+                meta_slot_keyword(slot)
+            )),
+            optional,
+        ),
     }
 }
 

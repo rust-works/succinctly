@@ -2935,7 +2935,24 @@ impl<'a> Parser<'a> {
 
                 // Check for `..` (recursive descent)
                 if self.peek() == Some('.') {
+                    let start = self.pos;
                     self.next();
+                    // yq's `...` (#2796) is `..` that also visits mapping keys. Only a metadata
+                    // assignment can use the key nodes, so it parses only as that target
+                    // (`... comments = ""`); anywhere else it stays the parse error it was.
+                    if self.mode == ParserMode::Yq && self.peek() == Some('.') {
+                        self.next();
+                        self.skip_ws();
+                        if self.peeks_meta_op_keyword_then_assign() {
+                            self.last_primary_is_term = true;
+                            return Ok(Expr::RecursiveDescentWithKeys);
+                        }
+                        return Err(ParseError::new(
+                            "`...` is only supported as the target of a metadata assignment \
+                             (`... comments = \"\"`)",
+                            start.saturating_sub(1),
+                        ));
+                    }
                     self.last_primary_is_term = true; // #3038: leaf Term, no recursion below to reset a stale flag
                     return Ok(Expr::RecursiveDescent);
                 }
