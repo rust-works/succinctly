@@ -4367,6 +4367,13 @@ its text (`numeric_display_string`, so `==` and `tostring` agree about a compute
   the remaining slice): they still use typed equality / jq's type ordering, where yq's `sort`
   comparator is typed only for null/bool/number pairs and falls back to `strings.Compare` on the
   text (so `"1"` sorts before `1`).
+- **A write keeps the blank lines between a head-comment block and the node below it**
+  ([#4093](https://github.com/rust-works/succinctly/issues/4093)). For a node at column 0 the
+  blank lines after the block are recorded as trailing empty entries of the head comment and
+  printed back; an indented node, and a block that follows a blank line itself, print none, as
+  in yq. A head comment with a blank line after it on a *nested* key
+  (`m:\n  # a\n\n  k: 1`) is still mangled on a write: the comment moves to the next top-level
+  key (pre-existing; yq prints `m:\n  # a\n  k: 1`).
 - **A write keeps the source spelling of an untouched plain scalar**
   ([#3028](https://github.com/rust-works/succinctly/issues/3028)). On the DOM route (`=`, `|=`,
   `del()`, `-P`, `-i`) a null, bool or number that was not spelled the canonical way is

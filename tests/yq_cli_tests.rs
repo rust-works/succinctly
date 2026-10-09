@@ -17936,17 +17936,14 @@ mod dom_standalone_comments_2795 {
 
     /// Known, recorded residual: real yq's `--header-preprocess` slurps a
     /// leading blank line / `%YAML`/`---` marker verbatim ahead of the first
-    /// document (the streaming route's own `write_yq_header`, #2795 PR A) --
-    /// the DOM route only carries structured head/foot *comment lines*, not
-    /// that raw verbatim header, so a marker or an interior blank line in
-    /// the header block does not survive a write. Plain leading `#` comment
-    /// lines (no blank line, no marker) are unaffected -- see the tests
-    /// above. Pinned here so a future header-unification fix has a failing
-    /// test to flip, not a silent behavior change.
+    /// document (the streaming route's own `write_yq_header`, #2795 PR A).
+    /// The DOM route now reproduces the blank line before the first node
+    /// (#4093); a `%YAML` directive and the `---` marker (#4086) are the
+    /// remaining parts of the header it does not carry as structured lines.
+    /// Pinned here so the header-unification fix has a failing test to flip.
     #[test]
     fn header_verbatim_reproduction_is_streaming_only_2795() -> Result<()> {
-        // Real yq: "# lead\n\na: 1\n" (keeps the blank line and the marker).
-        assert_eq!(yq_p(".", "# lead\n\na: 1\n", &[])?, "# lead\na: 1\n");
+        assert_eq!(yq_p(".", "# lead\n\na: 1\n", &[])?, "# lead\n\na: 1\n");
         assert_eq!(yq_p(".", "---\na: 1\n", &[])?, "a: 1\n");
         Ok(())
     }
@@ -46897,6 +46894,236 @@ f:
 e: [-0, 00]
 b: x
 g: [42]
+",
+        ),
+    ];
+    for (doc, filter, extra, want) in cases {
+        let (out, err, code) = run_yq_stdin_with_stderr(filter, doc, extra)?;
+        assert_eq!(out, *want, "`{filter}` {extra:?} on {doc:?}: {err}");
+        assert_eq!(code, 0, "`{filter}` {extra:?} on {doc:?}: {err}");
+    }
+    Ok(())
+}
+
+/// #4093: a write keeps the blank lines between a head-comment block and the node below it
+/// when that node is at column 0 (`# lead` / blank / `version: 2`), where it dropped them.
+/// yq drops them for an indented node, and for a block that itself follows a blank line
+/// (it reads that as the previous node's foot), and so does this. Every row captured live
+/// from yq v4.53.3.
+#[test]
+fn test_yq_dom_write_keeps_blank_lines_after_a_head_comment_4093() -> Result<()> {
+    let cases: &[(&str, &str, &[&str], &str)] = &[
+        (
+            r"# a
+
+k: 1
+",
+            r".zz = 1",
+            &[],
+            r"# a
+
+k: 1
+zz: 1
+",
+        ),
+        (
+            r"# a
+
+# b
+k: 1
+",
+            r".zz = 1",
+            &[],
+            r"# a
+
+# b
+k: 1
+zz: 1
+",
+        ),
+        (
+            r"x: 1
+# a
+
+k: 1
+",
+            r".zz = 1",
+            &[],
+            r"x: 1
+# a
+
+k: 1
+zz: 1
+",
+        ),
+        (
+            r"m:
+  x: 1
+
+  # a
+  k: 1
+",
+            r".zz = 1",
+            &[],
+            r"m:
+  x: 1
+  # a
+  k: 1
+zz: 1
+",
+        ),
+        (
+            r"# a
+
+
+k: 1
+",
+            r".zz = 1",
+            &[],
+            r"# a
+
+
+k: 1
+zz: 1
+",
+        ),
+        (
+            r"# a
+
+k: 1
+# foot
+
+j: 2
+",
+            r".zz = 1",
+            &[],
+            r"# a
+
+k: 1
+# foot
+
+j: 2
+zz: 1
+",
+        ),
+        (
+            r"# a
+
+k: 1
+",
+            r".",
+            &["-P"],
+            r"# a
+
+k: 1
+",
+        ),
+        (
+            r"# a
+
+- 1
+- 2
+",
+            r".[0] = 5",
+            &[],
+            r"# a
+
+- 5
+- 2
+",
+        ),
+        (
+            r"- 1
+# h
+
+- 2
+",
+            r".[0] = 5",
+            &[],
+            r"- 5
+# h
+
+- 2
+",
+        ),
+        (
+            r"# a
+
+k: 1
+",
+            r"del(.k)",
+            &[],
+            r"# a
+
+{}
+",
+        ),
+        (
+            r"# a
+
+k: 1
+j: 2
+",
+            r".zz = 1",
+            &["-I4"],
+            r"# a
+
+k: 1
+j: 2
+zz: 1
+",
+        ),
+        (
+            r"k: 1
+
+# a
+
+j: 2
+",
+            r".zz = 1",
+            &[],
+            r"k: 1
+# a
+j: 2
+zz: 1
+",
+        ),
+        (
+            r"# a
+
+k:
+  - 1
+",
+            r".k[0] = 2",
+            &[],
+            r"# a
+
+k:
+  - 2
+",
+        ),
+        (
+            r"# a
+
+k: 1
+",
+            r".k |= . + 1",
+            &[],
+            r"# a
+
+k: 2
+",
+        ),
+        (
+            r"# a
+
+5
+",
+            r". = 6",
+            &[],
+            r"# a
+
+6
 ",
         ),
     ];
