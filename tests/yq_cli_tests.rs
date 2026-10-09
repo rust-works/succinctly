@@ -60749,6 +60749,9 @@ fn test_path_types_integer_spelled_mapping_keys_2801() -> Result<()> {
         // The matched position's own path, reached through the per-item stream.
         ("[.[] | select(key == true) | path]", r#"[["true"]]"#),
         ("[.[] | select(key == 1.5) | path]", r#"[["1.5"]]"#),
+        // A literal lookup reports the matched key's parsed value, not the name it spelled.
+        (r#"[.["1"] | path]"#, "[[1]]"),
+        (r#"[.["0x1f"] | path]"#, "[[31]]"),
         // The key node itself is unchanged: still a node, still its own line.
         ("[.[] | key | line] | .[0:3]", "[1,2,3]"),
     ] {
@@ -60759,6 +60762,9 @@ fn test_path_types_integer_spelled_mapping_keys_2801() -> Result<()> {
     // A nested mapping: the integer component sits after its parent's string one.
     let (out, code) = run_yq_stdin("[.a[] | path]", "a:\n  1: x\n  \"2\": y\n", args)?;
     assert_eq!((out.trim(), code), (r#"[["a",1],["a","2"]]"#, 0));
+
+    let (out, code) = run_yq_stdin("[.b.2 | path], [.b.2 | key]", "b:\n  2: [q, r]\n", args)?;
+    assert_eq!((out.trim(), code), ("[[\"b\",2]]\n[2]", 0));
 
     // A JSON-sourced mapping has only string keys, whatever they spell.
     let (out, code) = run_yq_stdin(

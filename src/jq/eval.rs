@@ -23080,10 +23080,16 @@ pub(crate) fn getpath_walk_owned_segments<'a, W: Clone + AsRef<[u64]>, S: EvalSe
             }
             // #2801: `path` reports an integer-spelled mapping key as an integer in yq mode,
             // so `getpath` of it reads the member by its text.
-            (OwnedValue::Object(obj), _)
-                if S::TAG == EvalTag::Yq && yq_integer_component_text(segment).is_some() =>
+            (OwnedValue::Object(obj), OwnedValue::Int(_) | OwnedValue::NumberLiteral(..))
+                if S::TAG == EvalTag::Yq =>
             {
-                let text = yq_integer_component_text(segment).unwrap_or_default();
+                let Some(text) = yq_integer_component_text(segment) else {
+                    return if optional {
+                        QueryResult::None
+                    } else {
+                        QueryResult::Error(EvalError::cannot_index(current.type_name(), segment))
+                    };
+                };
                 current = Cow::Owned(obj.get(text.as_str()).cloned().unwrap_or(OwnedValue::Null));
             }
             (

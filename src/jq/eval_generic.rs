@@ -23394,8 +23394,26 @@ fn path_field_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
     if matches!(next, PathNode::Absent) && yq_absent_key_read_is_empty::<S>() {
         return Ok(None);
     }
+    // #2801: yq reports the matched key's parsed value, not the name the filter spelled, so
+    // `.["1"] | path` on `1: x` is `[1]`. Only a name a number can begin with asks the key node.
+    let typed = match &next {
+        PathNode::At(fc)
+            if S::TAG == EvalTag::Yq
+                && matches!(name.as_bytes().first(), Some(b'0'..=b'9' | b'-' | b'+')) =>
+        {
+            let fc: &V::Cursor = fc;
+            fc.prev_sibling().and_then(|kc: V::Cursor| {
+                let display = key_display_string(&kc.value())?.into_owned();
+                Some(yq_path_component(Cow::Owned(display), &kc))
+            })
+        }
+        _ => None,
+    };
     Ok(Some((
-        path.extend_from(OwnedValue::String(name.to_owned().into()), node),
+        path.extend_member_with(
+            || typed.unwrap_or_else(|| OwnedValue::String(name.to_owned().into())),
+            node,
+        ),
         next,
     )))
 }
@@ -25201,13 +25219,16 @@ fn getpath_walk_cursor<S: EvalSemantics, V: DocumentValue>(
         // #2801: in yq mode `path` reports an integer-spelled mapping key as an integer, so an
         // integer segment over a mapping names the member by its text.
         let text_segment;
-        let integer_text = if S::TAG == EvalTag::Yq {
+        let integer_text = if S::TAG == EvalTag::Yq
+            && matches!(segment, OwnedValue::Int(_) | OwnedValue::NumberLiteral(..))
+            && v.as_object().is_some()
+        {
             crate::jq::eval::yq_integer_component_text(segment)
         } else {
             None
         };
         let segment = match integer_text {
-            Some(text) if v.as_object().is_some() => {
+            Some(text) => {
                 text_segment = OwnedValue::String(text.into());
                 &text_segment
             }
@@ -27497,7 +27518,7 @@ fn cursor_path_and_ancestors<C: DocumentCursor>(
 fn cursor_path_and_ancestors_for<S: EvalSemantics, C: DocumentCursor>(
     c: &C,
 ) -> Result<(Vec<OwnedValue>, Vec<C>, bool), EvalError> {
-    let (path, ancestors, at_key, _) = cursor_path_ancestors_members_for::<S, C>(c)?;
+    let (path, ancestors, at_key, _) = cursor_path_ancestors_members_for::<S, C>(c, false)?;
     Ok((path, ancestors, at_key))
 }
 
@@ -27506,6 +27527,7 @@ fn cursor_path_and_ancestors_for<S: EvalSemantics, C: DocumentCursor>(
 #[allow(clippy::type_complexity)] // the four parallel climb results, named at the one caller
 fn cursor_path_ancestors_members_for<S: EvalSemantics, C: DocumentCursor>(
     c: &C,
+    want_members: bool,
 ) -> Result<(Vec<OwnedValue>, Vec<C>, bool, Vec<bool>), EvalError> {
     let retype = S::TAG == EvalTag::Yq;
     let mut members = Vec::new();
@@ -27515,7 +27537,9 @@ fn cursor_path_ancestors_members_for<S: EvalSemantics, C: DocumentCursor>(
     let mut cur = *c;
     let mut first = true;
     while let Some((parent, slot)) = cursor_parent_and_slot(&cur)? {
-        members.push(!matches!(slot, CursorSlot::Element(_)));
+        if want_members {
+            members.push(!matches!(slot, CursorSlot::Element(_)));
+        }
         let key = match slot {
             CursorSlot::Value { key, key_cursor } => retype_member_key(retype, key, &key_cursor),
             // The climb stands on the key node itself, so `cur` is its cursor.
@@ -28146,11 +28170,11 @@ fn path_context_root_for<S: EvalSemantics, V: DocumentValue>(
     // stage handed it (#2416 phase 3). `path`/`parent` are absolute, so the
     // position starts from the input's real path and ancestors, climbed
     // from the cursor itself.
-    let (path, ancestors, at_key, members) = match cursor_path_ancestors_members_for::<S, _>(&root)
-    {
-        Ok(found) => found,
-        Err(e) => return Err(Control::Error(e)),
-    };
+    let (path, ancestors, at_key, members) =
+        match cursor_path_ancestors_members_for::<S, _>(&root, true) {
+            Ok(found) => found,
+            Err(e) => return Err(Control::Error(e)),
+        };
     Ok(PathContextPos {
         node: PathNode::At(root),
         trail: PathContextTrail::from_climb_members(path, ancestors, &members),
