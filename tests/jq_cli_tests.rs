@@ -70089,15 +70089,15 @@ fn test_path_register_last_f_does_not_move_it_3643() -> Result<()> {
         // collect around `last(f)` was lifted by #3767, see
         // `test_collect_last_f_keeps_the_register_3767`).
         (doc, r"path(. as $x | (last(.a) // .k) | $x)", "[]\n", "", 0),
-        // #3767: inside the collect, the generators the `[E]` allowlist does not
-        // read stay refused where jq answers `[]` (jq's own `first(f)`, `//` and
-        // `limit` emit from inside the fork and move the register).
+        // #3767 part 4: `first(f)` inside the collect is read through to `f` and so
+        // answers jq's `[]` (see `test_collect_first_limit_nth_keeps_the_register_3767`);
+        // the `//` the `[E]` allowlist does not read stays refused where jq answers `[]`.
         (
             doc,
             r"path(. as $x | [last(first(.a, .k))] | $x)",
+            "[]\n",
             "",
-            with_root,
-            5,
+            0,
         ),
         (
             doc,
@@ -71418,10 +71418,10 @@ fn test_path_register_last_f_wrappers_and_select_keep_it_3653() -> Result<()> {
 /// Since #3767 the `limit(1; last(f))` rows answer jq's own value (`["a"]` twice,
 /// `{"a":9}`, `null`): `limit` is read through to the `last`, which leaves the
 /// register where the stage entered, so the same pipe outside a fold answers too.
-/// The `first(null)` and `(.b // null)` rows are still refused where jq answers.
+/// Since part 4 the `first(null)` row answers `["a"]` too (a wrapper over a stage that
+/// navigates nothing); the `(.b // null)` row is answered by #3644.
 #[test]
 fn test_foreach_extract_ending_on_untracked_null_after_navigation_refuses_3769() -> Result<()> {
-    let refusal = "jq: error (at <stdin>:1): Invalid path expression with result null\n";
     let extract = ".a? | limit(1; last(.a?))";
     for (filter, stdout, stderr, code) in [
         (
@@ -71448,11 +71448,14 @@ fn test_foreach_extract_ending_on_untracked_null_after_navigation_refuses_3769()
             "",
             0,
         ),
+        // #3767 part 4: `first(null)` is a wrapper over a stage that navigates
+        // nothing, which leaves the register where `.a` left it, so this answers
+        // jq's `["a"]`.
         (
             "path(foreach (1) as $i (.; .; .a | first(null)))".to_string(),
+            "[\"a\"]\n",
             "",
-            refusal,
-            5,
+            0,
         ),
         // #3644: the `//` stage states its register per branch, so this answers
         // jq's `["a"]` (the `.b` branch navigated, `null` is by value).
@@ -79817,42 +79820,42 @@ fn test_terminal_null_after_a_navigation_refuses_loudly_3579() -> Result<()> {
         // the issue's rows: jq answers `["a"]` / `{"a":9}` / `null`; this resolver cannot say where its register is
         (
             r"null",
-            r"path(.a as $x | .a | 5 | first(7) | $x)",
+            r"path(.a as $x | .a | 5 | first(def f: 7; f) | $x)",
             "",
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
         ),
         (
             r"null",
-            r"(.a as $x | .a | 5 | first(7) | $x) = 9",
+            r"(.a as $x | .a | 5 | first(def f: 7; f) | $x) = 9",
             "",
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
         ),
         (
             r"null",
-            r"(.a as $x | .a | 5 | first(7) | $x) |= 9",
+            r"(.a as $x | .a | 5 | first(def f: 7; f) | $x) |= 9",
             "",
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
         ),
         (
             r"null",
-            r"del(.a as $x | .a | 5 | first(7) | $x)",
+            r"del(.a as $x | .a | 5 | first(def f: 7; f) | $x)",
             "",
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
         ),
         (
             r"null",
-            r"(.a as $x | .a | 5 | limit(1; 7) | $x) = 9",
+            r"(.a as $x | .a | 5 | limit(1; def f: 7; f) | $x) = 9",
             "",
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
         ),
         (
             r"null",
-            r"(.a as $x | .a | 5 | first(range(3)) | $x) = 9",
+            r"(.a as $x | .a | 5 | first(def f: range(3); f) | $x) = 9",
             "",
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
@@ -79878,14 +79881,14 @@ fn test_terminal_null_after_a_navigation_refuses_loudly_3579() -> Result<()> {
         ),
         (
             r"null",
-            r"(.a as $x | .a | first(7) | $x) = 9",
+            r"(.a as $x | .a | first(def f: 7; f) | $x) = 9",
             "",
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
         ),
         (
             r"null",
-            r"(.a as $x | .a | [first(7)] | $x) = 9",
+            r"(.a as $x | .a | [first(def f: 7; f)] | $x) = 9",
             "",
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
@@ -79893,28 +79896,28 @@ fn test_terminal_null_after_a_navigation_refuses_loudly_3579() -> Result<()> {
         // a guess, not jq's verdict, so no `try`, `?` or `catch` turns it into a dropped write (jq writes there)
         (
             r"null",
-            r#"try ((.a as $x | .a | 5 | first(7) | $x) = 9) catch "CAUGHT""#,
+            r#"try ((.a as $x | .a | 5 | first(def f: 7; f) | $x) = 9) catch "CAUGHT""#,
             "",
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
         ),
         (
             r"null",
-            r"[path(.a as $x | .a | 5 | first(7) | $x)?]",
+            r"[path(.a as $x | .a | 5 | first(def f: 7; f) | $x)?]",
             "",
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
         ),
         (
             r"null",
-            r#"try path(.a as $x | .a | 5 | first(7) | $x) catch "C""#,
+            r#"try path(.a as $x | .a | 5 | first(def f: 7; f) | $x) catch "C""#,
             "",
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
         ),
         (
             r"null",
-            r"[(.a as $x | .a | 5 | first(7) | $x) = 9?]",
+            r"[(.a as $x | .a | 5 | first(def f: 7; f) | $x) = 9?]",
             "",
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
@@ -79922,14 +79925,14 @@ fn test_terminal_null_after_a_navigation_refuses_loudly_3579() -> Result<()> {
         // in a ?// chain, and a refusal that pre-empts jq's own later error (jq refuses too, at .b: both exit 5, the wording differs)
         (
             r"null",
-            r"[path(. as [$q] ?// $q | .a as $x | .a | 5 | first(7) | $x)]",
+            r"[path(. as [$q] ?// $q | .a as $x | .a | 5 | first(def f: 7; f) | $x)]",
             "",
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
         ),
         (
             r"null",
-            r"del(.a as $x | .a | 5 | first(7) | $x, .b)",
+            r"del(.a as $x | .a | 5 | first(def f: 7; f) | $x, .b)",
             "",
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
@@ -80025,21 +80028,21 @@ fn test_terminal_null_carve_out_keeps_its_answers_3579() -> Result<()> {
         // a non-null document never reached the carve-out: the same shape refuses loudly, as before
         (
             r#"{"a":null}"#,
-            r"path(.a as $x | .a | 5 | first(7) | $x)",
+            r"path(.a as $x | .a | 5 | first(def f: 7; f) | $x)",
             "",
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
         ),
         (
             r#"{"a":null}"#,
-            r"(.a as $x | .a | 5 | first(7) | $x) = 9",
+            r"(.a as $x | .a | 5 | first(def f: 7; f) | $x) = 9",
             "",
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
         ),
         (
             r"[null]",
-            r"path(.[0] as $x | .[0] | 5 | first(7) | $x)",
+            r"path(.[0] as $x | .[0] | 5 | first(def f: 7; f) | $x)",
             "",
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
@@ -80060,6 +80063,131 @@ fn test_terminal_null_carve_out_keeps_its_answers_3579() -> Result<()> {
         (r"null", r"path(.a | 5 | select(true) | null | .[]?)", "", "", 0),
         (r"null", r"[path(.a | 5 | select(true) | null | .[])?]", "[]\n", "", 0),
         (r"null", r#"try path(.a | 5 | select(true) | null | .[]) catch "C""#, "\"C\"\n", "", 0),
+    ])
+}
+
+/// #3767 (part 4): the rows of the two #3579 tests above that wrapped a lost-register
+/// constant in `first(...)`/`limit(...)` (`.a as $x | .a | 5 | first(7) | $x`) are no
+/// longer refused: a wrapper over a stage that navigates nothing leaves jq's register
+/// where `.a` left it, so `$x` re-establishes at `["a"]` and every write lands there,
+/// exactly as jq answers, including under `try` and `?`. The #3579 pins now wrap a
+/// `def` call (`first(def f: 7; f)`), which the allowlist still cannot read. Every row
+/// captured from jq 1.7.1.
+#[test]
+fn test_terminal_null_wrapper_over_a_constant_answers_3767() -> Result<()> {
+    assert_rows_3579(&[
+        (
+            r"null",
+            r"path(.a as $x | .a | 5 | first(7) | $x)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"(.a as $x | .a | 5 | first(7) | $x) = 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"(.a as $x | .a | 5 | first(7) | $x) |= 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"del(.a as $x | .a | 5 | first(7) | $x)",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"(.a as $x | .a | 5 | limit(1; 7) | $x) = 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"(.a as $x | .a | 5 | first(range(3)) | $x) = 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"(.a as $x | .a | first(7) | $x) = 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"(.a as $x | .a | [first(7)] | $x) = 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r#"try ((.a as $x | .a | 5 | first(7) | $x) = 9) catch "CAUGHT""#,
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"[path(.a as $x | .a | 5 | first(7) | $x)?]",
+            "[[\"a\"]]\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r#"try path(.a as $x | .a | 5 | first(7) | $x) catch "C""#,
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"[(.a as $x | .a | 5 | first(7) | $x) = 9?]",
+            "[{\"a\":9}]\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"[path(. as [$q] ?// $q | .a as $x | .a | 5 | first(7) | $x)]",
+            "[[0,\"a\"]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"path(.a as $x | .a | 5 | first(7) | $x)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"(.a as $x | .a | 5 | first(7) | $x) = 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r"[null]",
+            r"path(.[0] as $x | .[0] | 5 | first(7) | $x)",
+            "[0]\n",
+            "",
+            0,
+        ),
     ])
 }
 
@@ -119373,6 +119501,355 @@ fn test_register_catch_handler_over_register_keeping_stage_3767() -> Result<()> 
             doc,
             r#"path(. as $x | try (last(.a), error("e")) catch . | $x)"#,
             "[]\n[]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
+/// #3767 (part 4): `first(E)`, `limit(n; E)` and `nth(n; E)` over an `E` that navigates
+/// nothing leave jq's path register where the stage entered. They emit from inside `E`,
+/// so the register is wherever `E` left it, and a constant never moves it
+/// (`path(. as $x | first(5) | $x)` on `{"a":{"b":1},"k":2}` is `[]`), on `path`, `del`,
+/// `=` and `|=`. The count is a subexp. Contrasts: an `E` that navigates (`first(.a)`) or
+/// whose later outputs do (`limit(2; (5, .a))`) still moves it and refuses, as in jq, and
+/// so does a navigation straight after the wrapper (`first(5) | .k`). The last three rows
+/// are the silent write skip the wrapper shapes caused under a `try` (the refusal was
+/// caught as though it were jq's own, so `del` left the document unchanged where jq
+/// deletes). Every row captured from jq 1.7.1, on the stdin and `-n` routes.
+#[test]
+fn test_register_wrapper_over_navigates_nothing_stage_3767() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | first(5) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | limit(1; 5) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | nth(0; 5) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | limit(2; 5) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | limit(0; 5) | $x)",
+            "",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | nth(1; 5) | $x)",
+            "",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r#"path(. as $x | first("s") | $x)"#,
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | first(null) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | first(limit(1; 5)) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | first(5) | $x | .k)",
+            "[\"k\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | first(5) | .k)",
+            "",
+            r#"Invalid path expression near attempt to access element "k" of 5"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | first(5) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | first(.a) | $x)",
+            "",
+            r#"Invalid path expression with result {"a":{"b":1},"k":2}"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | first((5, .a)) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | limit(2; (5, .a)) | $x)",
+            "[]\n",
+            r#"Invalid path expression with result {"a":{"b":1},"k":2}"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | nth(1; (5, .a)) | $x)",
+            "",
+            r#"Invalid path expression with result {"a":{"b":1},"k":2}"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | first(.a | 5) | $x)",
+            "",
+            r#"Invalid path expression with result {"a":{"b":1},"k":2}"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(. as $x | first(5) | $x.k)",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"(. as $x | first(5) | $x.k) |= 9",
+            "{\"a\":{\"b\":1},\"k\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"(. as $x | limit(1; 5) | $x.k) = 9",
+            "{\"a\":{\"b\":1},\"k\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(. as $x | first(.a) | $x.k)",
+            "",
+            r#"Invalid path expression near attempt to access element "k" of {"a":{"b":1},"k":2}"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(.a? as $y | try ((.a)? and limit(1; 5)) | try ($y | .b))",
+            "{\"a\":{},\"k\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(.a? as $y | try ((.a)? and first(5)) | try ($y | .b))",
+            "{\"a\":{},\"k\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(.a? as $y | try ((.a)? and nth(0; 5)) | try ($y | .b))",
+            "{\"a\":{},\"k\":2}\n",
+            "",
+            0,
+        ),
+    ])
+}
+
+/// #3767 (part 4): `first(f)`, `limit(n; f)` and `nth(n; f)` inside an `[E]` collect keep
+/// jq's path register, like `last(f)` (part 2): the collect backtracks, and what `f`
+/// navigates is path-checked as in a pipe, so `[first(numbers)]` is `[]` and
+/// `[first(1 | .a)]` raises. The output is computed, so a navigation after it inside the
+/// brackets still refuses. Every row captured from jq 1.7.1, on the stdin and `-n` routes.
+#[test]
+fn test_collect_first_limit_nth_keeps_the_register_3767() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [first(numbers)] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | [first(numbers)] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [first(strings)] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [limit(1; numbers)] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [limit(0; numbers)] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [nth(0; values)] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [first(select(.))] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [first(first(numbers))] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [first(last(.a))] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [first(numbers)] | $x | .k)",
+            "[\"k\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [first(numbers)] | .k)",
+            "",
+            r#"Invalid path expression near attempt to access element "k" of []"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [first(1 | .a)] | $x)",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of 1"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [limit(1; 1 | .a)] | $x)",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of 1"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [nth(0; 1 | .a)] | $x)",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of 1"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [first(.a)] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [limit(1; .a)] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [nth(0; .a)] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [first(.a, 5)] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(. as $x | [first(numbers)] | $x.k)",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"(. as $x | [first(numbers)] | $x.k) |= 9",
+            "{\"a\":{\"b\":1},\"k\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [first(1 | .a), 2] | $x)",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of 1"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r#"try path(. as $x | [first(1 | .a)] | $x) catch "caught""#,
+            "\"caught\"\n",
             "",
             0,
         ),

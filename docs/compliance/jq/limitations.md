@@ -1466,15 +1466,19 @@ is the revert that established what the other one costs.
    `test_register_limit_nth_wrappers_and_type_filter_collect_3767`. Still refused where jq
    answers `[]`: a `catch` handler that navigates (Part 3 admits the rest); either stage inside a
    compound stage (a comma, a `//`, a pipe such as `select(.) \| select(.)`, a `def` call), which
-   need the leaf-level verdict for a compound stage described above; a wrapper over an inner
-   stage that merely navigates nothing (`first(.)`, `limit(1; .)`, `limit(1; 5)`), which jq leaves
-   in place and the allowlist does not read through; and an `[E]` collect of a *wrapper* around a
-   type filter (`[first(numbers)]`, `[limit(1; numbers)]`), since the array allowlist reads the
-   stage, not its wrappers. Part 2 lets an `[E]` collect hold `last(f)` (`[last(.a)]`: the claim
+   need the leaf-level verdict for a compound stage described above. Two more shapes were refused
+   after Part 3 and are lifted by Part 4: a wrapper over an inner stage that merely navigates
+   nothing (`first(5)`, `limit(1; 5)`, `nth(0; 5)`, which jq leaves in place), and an `[E]` collect
+   of `first`/`limit`/`nth` (`[first(numbers)]`), whose claim reads through to `f` as `last(f)`'s
+   does; pinned by `test_register_wrapper_over_navigates_nothing_stage_3767` and
+   `test_collect_first_limit_nth_keeps_the_register_3767`. The wrapper rule asks
+   `cannot_move_register` only, so a wrapper over a navigates-nothing stage that rule does not
+   list but the leaf verdict does (`first(to_entries)`, `first(sort)`, `first(path(.a))`) is still
+   refused where jq answers `[]`. Part 2 lets an `[E]` collect hold `last(f)` (`[last(.a)]`: the claim
    reads through to `f`, which the resolver's `last` arm resolves live, so `[last(1 \| .a)]` still raises
    as jq does and the output is demoted, so `[last(.a)] \| .k` still refuses), pinned by
-   `test_collect_last_f_keeps_the_register_3767`; a `last` over `first(f)`, `//` or `limit` inside the
-   brackets stays refused. Part 3 reads a `try E catch H` whose `E` is such a stage and whose handler
+   `test_collect_last_f_keeps_the_register_3767`; a `last` over `//` inside the brackets stays
+   refused (one over `first(f)` or `limit` answers since Part 4, which reads those through). Part 3 reads a `try E catch H` whose `E` is such a stage and whose handler
    cannot move the register (`try last(.a) catch .`, `5 | try select(.) catch 7`): jq runs the
    handler after a backtrack that restores the register, so the inner stage decides, pinned by
    `test_register_catch_handler_over_register_keeping_stage_3767`. A handler that navigates
@@ -1482,12 +1486,13 @@ is the revert that established what the other one costs.
    `[]`), a handler whose payload is the register's own value (`try last(error) catch .`, where
    the error payload is the root itself) or that reads `input` (`catch input`), and a compound
    inner stage (`try (last(.a), error("e")) catch .`) are still refused where jq answers `[]`.
-   Under a `try` the refusal of a `limit`/`first` wrapper shape inside a lost-register `and`/`or` operand is caught, so the write jq makes is
+   Under a `try` the refusal of a `limit`/`first` wrapper shape inside a lost-register `and`/`or` operand used to be caught, so the write jq makes was
    **silently skipped** (`del(.a? as $y \| try ((.a)? and limit(1; 5)) \| try ($y \| .b))` on
-   `{"a":{"b":1},"k":2}` leaves the document unchanged where jq gives `{"a":{},"k":2}`); the
-   same shapes with `first(...)` in place of `limit(...)` behave identically, so this predates
-   #3767, and the later parts of that issue (the inner-stage verdict for a compound or
-   navigates-nothing stage) are what close it.
+   `{"a":{"b":1},"k":2}` left the document unchanged where jq gives `{"a":{},"k":2}`); Part 4 closes
+   the constant-operand shapes (`first(5)`, `limit(1; 5)`, `nth(0; 5)`), pinned in
+   `test_register_wrapper_over_navigates_nothing_stage_3767`; the same skip remains for a wrapper over
+   `to_entries`, `sort` and the like (`del(.a? as $y \| try ((.a)? and first(to_entries)) \| try ($y \| .b))`
+   leaves the document unchanged where jq gives `{"a":{},"k":2}`, as `main` does).
    `select` hands its input through as the very value it received, so a `$x` that reaches it
    keeps its identity, and so does `last(f)`'s result, which is the very value `f` last
    emitted ([#3766](https://github.com/rust-works/succinctly/issues/3766)): a `last` whose
