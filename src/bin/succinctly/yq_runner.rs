@@ -3368,24 +3368,42 @@ enum MetaEffect {
     /// `None` clears the anchor (live-verified: `.a anchor = ""` on
     /// `a: &z 1` => `a: 1`).
     Anchor(Option<String>),
+    /// `head_comment = ""`, `foot_comment = ""` and `comments = ""` (#2796): drop the
+    /// standalone head lines, the trailing line comment and/or the standalone foot lines of
+    /// the node. Only the clearing form is supported; see [`apply_clear`] for where each slot
+    /// lives in the comment tree.
+    Clear {
+        head: bool,
+        line: bool,
+        foot: bool,
+    },
 }
 
 /// One resolved metadata write: which node, and what to do to it.
 struct ResolvedMetaWrite {
     path: Vec<MetaPathStep>,
+    /// The write addresses the mapping *key* node of the member at `path` (`...` visits those;
+    /// `..` and a path do not) rather than its value (#2796).
+    on_key: bool,
     effect: MetaEffect,
 }
 
-/// The three [`MetaSlot`]s this write pass can actually apply. `tag`/
-/// `head_comment`/`foot_comment`/`comments` already error from
+/// The [`MetaSlot`]s this write pass can actually apply. `tag` already errors from
 /// `eval_meta_assign` (`src/jq/eval.rs`) during the real evaluation this
-/// pass runs *before* -- nothing to resolve for them here, and reporting
-/// again would double the diagnostic.
+/// pass runs *before* -- nothing to resolve for it here, and reporting
+/// again would double the diagnostic. `head_comment`/`foot_comment`/`comments` apply only as
+/// the clearing form `= ""` (#2796); a non-empty text is reported from here.
 #[derive(Clone, Copy)]
 enum WritableSlot {
     LineComment,
     Style,
     Anchor,
+    HeadComment,
+    FootComment,
+    Comments,
+    /// `line_comment` aimed at a mapping key node (`...` only, #2796); never produced by
+    /// [`WritableSlot::of`].
+    KeyLineComment,
 }
 
 impl WritableSlot {
@@ -3394,9 +3412,10 @@ impl WritableSlot {
             MetaSlot::LineComment => Some(Self::LineComment),
             MetaSlot::Style => Some(Self::Style),
             MetaSlot::Anchor => Some(Self::Anchor),
-            MetaSlot::Tag | MetaSlot::HeadComment | MetaSlot::FootComment | MetaSlot::Comments => {
-                None
-            }
+            MetaSlot::HeadComment => Some(Self::HeadComment),
+            MetaSlot::FootComment => Some(Self::FootComment),
+            MetaSlot::Comments => Some(Self::Comments),
+            MetaSlot::Tag => None,
         }
     }
 }
@@ -3682,6 +3701,22 @@ fn resolve_meta_assign_writes(
     }
     let mut stages = Vec::new();
     flatten_pipe_stages(expr, &mut stages);
+    // This pass resolves the writes once, against the document it is handed: a filter that asks
+    // which document or file it is on (`select(di == 1) | .b comments = ""`) would resolve for
+    // the wrong one and silently write nothing for the rest (#2796).
+    if jq::walk::contains_builtin(expr, |b| {
+        matches!(b, Builtin::DocumentIndex | Builtin::FileIndex)
+    }) {
+        sink.report(
+            DiagStyle::Yq,
+            &EvalError::new(
+                "metadata assignment cannot depend on document_index/file_index (it is resolved \
+                 once, against the first document)",
+            ),
+            &no_location(),
+        );
+        return None;
+    }
     let top_level = stages
         .iter()
         .filter(|s| matches!(s, Expr::MetaAssign { .. }))
@@ -3690,8 +3725,8 @@ fn resolve_meta_assign_writes(
         sink.report(
             DiagStyle::Yq,
             &EvalError::new(
-                "metadata assignment (line_comment/style/anchor = ...) is only supported as a \
-                 top-level pipe stage",
+                "metadata assignment (line_comment/head_comment/foot_comment/comments/style/anchor \
+                 = ...) is only supported as a top-level pipe stage",
             ),
             &no_location(),
         );
@@ -3751,7 +3786,27 @@ fn resolve_one_meta_assign(
     // `path(TARGET)` names every candidate, creating nothing -- the real
     // evaluation's `TARGET |= .` (see `eval_meta_assign`) is what pads a
     // missing key/index into existence, and it names the same paths.
-    let path_expr = Expr::Builtin(Builtin::Path(Box::new(target.clone())));
+    //
+    // `...` (#2796) names the same value positions `..` does, plus the key node of every
+    // mapping member: those are the candidates a clearing write needs for the comments above
+    // and below an entry (`# mid\nb: 2`), which yq keeps on the key.
+    let with_keys = matches!(target, Expr::RecursiveDescentWithKeys);
+    if with_keys && matches!(slot, WritableSlot::Style | WritableSlot::Anchor) {
+        // Their key-node counterparts (a quoted key, an `&anchor` on a key) are not modelled for
+        // a write, and applying them to the value node would be wrong rather than missing.
+        sink.report(
+            DiagStyle::Yq,
+            &EvalError::new("`...` is only supported with the comment slots (#2796)"),
+            &no_location(),
+        );
+        return false;
+    }
+    let path_target = if with_keys {
+        Expr::RecursiveDescent
+    } else {
+        target.clone()
+    };
+    let path_expr = Expr::Builtin(Builtin::Path(Box::new(path_target)));
     let Some(paths) = evaluate_input_quiet(current, &path_expr) else {
         return true;
     };
@@ -3761,6 +3816,21 @@ fn resolve_one_meta_assign(
         .collect();
     if paths.is_empty() {
         return true;
+    }
+    let mut paths: Vec<(Vec<MetaPathStep>, bool)> =
+        paths.into_iter().map(|path| (path, false)).collect();
+    if with_keys {
+        let mut keys = Vec::new();
+        for (path, _) in &paths {
+            if let Some(OwnedValue::Object(obj)) = owned_value_at(current, path) {
+                for key in obj.keys() {
+                    let mut member = path.clone();
+                    member.push(MetaPathStep::Key(key.clone()));
+                    keys.push((member, true));
+                }
+            }
+        }
+        paths.extend(keys);
     }
 
     // Every slot coerces its right-hand side to text first, never requiring
@@ -3775,16 +3845,20 @@ fn resolve_one_meta_assign(
         // slot's old text (`a: 5 # x` + `.a line_comment |= . + "-suffix"`
         // => `# 5-suffix`, live-verified); a candidate the real evaluation
         // is about to create reads as `null` here, as it does there.
-        for path in paths {
-            let candidate = owned_value_at(current, &path)
-                .cloned()
-                .unwrap_or(OwnedValue::Null);
+        for (path, on_key) in paths {
+            // A key node's own value is its text (`|=` binds `.` to it).
+            let candidate = match (on_key, path.last()) {
+                (true, Some(MetaPathStep::Key(key))) => OwnedValue::String(key.as_str().into()),
+                _ => owned_value_at(current, &path)
+                    .cloned()
+                    .unwrap_or(OwnedValue::Null),
+            };
             let results = evaluate_input(&candidate, &stringify, sink).unwrap_or_default();
             if sink.report_count() != reports_before {
                 return false;
             }
             if let Some(OwnedValue::String(s)) = results.into_iter().next() {
-                texts.push((path, s));
+                texts.push((path, on_key, s));
             }
         }
     } else {
@@ -3798,11 +3872,57 @@ fn resolve_one_meta_assign(
         let Some(OwnedValue::String(s)) = results.into_iter().next() else {
             return true;
         };
-        texts.extend(paths.into_iter().map(|path| (path, s.clone())));
+        texts.extend(
+            paths
+                .into_iter()
+                .map(|(path, on_key)| (path, on_key, s.clone())),
+        );
     }
 
-    for (path, s) in texts {
+    for (path, on_key, s) in texts {
+        // A key node's trailing comment is the key line's own, not the value's: only the
+        // clearing form reaches it (#2796), through the same effect the other slots clear with.
+        let slot = if on_key && matches!(slot, WritableSlot::LineComment) {
+            WritableSlot::KeyLineComment
+        } else {
+            slot
+        };
         let effect = match slot {
+            WritableSlot::HeadComment
+            | WritableSlot::FootComment
+            | WritableSlot::Comments
+            | WritableSlot::KeyLineComment => {
+                // Only the empty string clears. A text of newlines alone is not that: yq writes
+                // blank comment lines for it, which `meta_comment_text` would trim to nothing.
+                if !s.is_empty() {
+                    // Only the clearing form is written so far (#2796): where yq prints a
+                    // set head/foot comment depends on go-yaml's emitter state (a scalar
+                    // value's head lands after its line, a container's foot after the next
+                    // entry), which the emitter here does not model yet.
+                    let (keyword, detail) = match slot {
+                        WritableSlot::HeadComment => ("head_comment", ""),
+                        WritableSlot::FootComment => ("foot_comment", ""),
+                        WritableSlot::KeyLineComment => {
+                            ("line_comment", " on a key node (`...` visits the keys too)")
+                        }
+                        _ => ("comments", ""),
+                    };
+                    sink.report(
+                        DiagStyle::Yq,
+                        &EvalError::new(format!(
+                            "{keyword} = ... is not yet supported for a non-empty text{detail} \
+                             (only the clearing form `{keyword} = \"\"`, #2796)"
+                        )),
+                        &no_location(),
+                    );
+                    return false;
+                }
+                MetaEffect::Clear {
+                    head: matches!(slot, WritableSlot::HeadComment | WritableSlot::Comments),
+                    line: matches!(slot, WritableSlot::Comments | WritableSlot::KeyLineComment),
+                    foot: matches!(slot, WritableSlot::FootComment | WritableSlot::Comments),
+                }
+            }
             WritableSlot::Style => match validate_style(&s) {
                 Some(style) => MetaEffect::Style(style),
                 None => {
@@ -3823,7 +3943,11 @@ fn resolve_one_meta_assign(
                 }
             },
         };
-        out.push(ResolvedMetaWrite { path, effect });
+        out.push(ResolvedMetaWrite {
+            path,
+            on_key,
+            effect,
+        });
     }
     true
 }
@@ -3900,6 +4024,10 @@ fn apply_meta_assign_writes(
         let Some(node_value) = owned_value_at_mut(value, &write.path) else {
             continue;
         };
+        if let MetaEffect::Clear { head, line, foot } = write.effect {
+            apply_clear(write, &steps, tree, head, line, foot);
+            continue;
+        }
         let Some(node) = comment_tree_at_path_or_create_mut(tree, &steps) else {
             continue;
         };
@@ -3928,8 +4056,77 @@ fn apply_meta_assign_writes(
             MetaEffect::Anchor(name) => {
                 node.meta_mut().anchor = name.clone().map(AnchorMark::Declares);
             }
+            // Handled above, before the node is borrowed.
+            MetaEffect::Clear { .. } => {} // patchcov: coverage tolerate-line reason="unreachable: apply_meta_assign_writes sends every Clear to apply_clear and continues before reaching this match (#2796)"
         }
     }
+}
+
+/// Apply a clearing write (`head_comment = ""`, `foot_comment = ""`, `comments = ""`, #2796).
+///
+/// yq keeps a standalone comment on the node it sits next to: the comment lines above `b:`
+/// in a mapping belong to the *key* node `b`, and the ones above a sequence item to the item
+/// itself. This comment tree stores them on the member's own [`NodeMeta`] either way, so what
+/// a write clears depends on which node it addresses:
+///
+/// - a key node (`...` only) clears the member's head/foot lines and its key-line comment;
+/// - a value node clears its trailing line comment, and its head/foot lines only where the
+///   value *is* the node those lines belong to in yq: the document root and a sequence item.
+///   A mapping value's lines are its key's, which `.a head_comment = ""` leaves alone
+///   (live-verified against pinned v4.53.3 on `# mid\nb:` and `# inner\n  c: 2`).
+fn apply_clear(
+    write: &ResolvedMetaWrite,
+    steps: &[TreeStep<'_>],
+    tree: &mut CommentTree,
+    head: bool,
+    line: bool,
+    foot: bool,
+) {
+    if write.on_key {
+        let Some((TreeStep::Key(key), parent_steps)) = steps.split_last() else {
+            return; // patchcov: coverage tolerate-line reason="unreachable: a key-node write is only built for a member (resolve_one_meta_assign pushes `path` + Key(member)), so its last step is always a Key (#2796)"
+        };
+        let Some(parent) = comment_tree_at_path_or_create_mut(tree, parent_steps) else {
+            return; // patchcov: coverage tolerate-line reason="unreachable: the parent path is a candidate of the same path(..) walk and the value tree has it, so the comment tree is grown to it (#2796)"
+        };
+        if line {
+            parent.clear_key_comment(key);
+        }
+        if head || foot {
+            if let CommentTree::Object(_, fields, _) = parent {
+                if let Some(member) = fields.get_mut(*key) {
+                    clear_head_foot(member, head, foot);
+                }
+            }
+        }
+        return;
+    }
+    let Some(node) = comment_tree_at_path_or_create_mut(tree, steps) else {
+        return;
+    };
+    if line {
+        node.meta_mut().comment = None;
+    }
+    let owns_lines = matches!(steps.last(), None | Some(TreeStep::Index(_)));
+    if (head || foot) && owns_lines {
+        clear_head_foot(node, head, foot);
+    }
+}
+
+/// Drop the standalone head and/or foot lines of `node`, keeping everything else.
+fn clear_head_foot(node: &mut CommentTree, head: bool, foot: bool) {
+    let meta = node.meta();
+    let kept_head = if head {
+        Vec::new()
+    } else {
+        meta.head_comment().to_vec()
+    };
+    let kept_foot = if foot {
+        Vec::new()
+    } else {
+        meta.foot_comment().to_vec()
+    };
+    *node.meta_mut() = meta.with_head_foot(kept_head, kept_foot);
 }
 
 /// Evaluate a jq expression directly on a YAML cursor.
@@ -11069,5 +11266,102 @@ mod tests {
         // No style: a YAML key spelled like a number is a typed key and stays bare.
         assert_eq!(yaml_quote_key("1", "", false, false), "1");
         assert_eq!(yaml_quote_key("1", "", false, true), "\"1\"");
+    }
+
+    /// Run `filter` over `yaml` through the production metadata-write path and render the
+    /// single result with the DOM emitter, comments included.
+    fn render_with_comments(yaml: &str, filter: &str) -> String {
+        let expr = jq::parse_with_mode(filter, jq::ParserMode::Yq).unwrap();
+        let results = eval_yaml_with_comments(yaml.as_bytes(), &expr);
+        assert_eq!(results.len(), 1, "{filter}");
+        let config = OutputConfig {
+            output_format: OutputFormat::Yaml,
+            compact: false,
+            raw_output: false,
+            join_output: false,
+            nul_output: false,
+            ascii_output: false,
+            sort_keys: false,
+            no_doc: false,
+            indent_str: "  ".to_string(),
+            use_color: false,
+            json_sourced_floats: false,
+        };
+        let (value, comments) = &results[0];
+        emit_yaml_value(value, comments, &config, "", false)
+    }
+
+    /// #2796: `...` visits the mapping keys too, so its clearing writes reach what yq keeps on
+    /// the key node (the lines above `b:`, the comment after a key whose value starts on the
+    /// next line) and the sequence items' own lines, in every spelling of the slot.
+    #[test]
+    fn dots_clearing_reaches_key_nodes_2796() {
+        let yaml = "a: 1 # line\n# mid\nb:\n  # inner\n  c: 2 # lc\ne: # key line\n  - x\n";
+        for (filter, want) in [
+            ("... comments = \"\"", "a: 1\nb:\n  c: 2\ne:\n  - x"),
+            (
+                "... head_comment = \"\"",
+                "a: 1 # line\nb:\n  c: 2 # lc\ne: # key line\n  - x",
+            ),
+            (
+                "... line_comment = \"\"",
+                "a: 1\n# mid\nb:\n  # inner\n  c: 2\ne:\n  - x",
+            ),
+            // `|=` binds `.` to the key's own text, which a clearing write ignores.
+            ("... comments |= \"\"", "a: 1\nb:\n  c: 2\ne:\n  - x"),
+        ] {
+            assert_eq!(
+                render_with_comments(yaml, filter).trim_end(),
+                want,
+                "{filter}"
+            );
+        }
+    }
+
+    /// #2796: a value node clears its line comment but keeps the lines above a mapping value,
+    /// which belong to its key; a sequence item and the root own theirs.
+    #[test]
+    fn value_clearing_keeps_a_mapping_values_key_lines_2796() {
+        let map = "a: 1 # line\n# mid\nb: 2\n";
+        assert_eq!(
+            render_with_comments(map, ".a comments = \"\"").trim_end(),
+            "a: 1\n# mid\nb: 2"
+        );
+        assert_eq!(
+            render_with_comments(map, ".b head_comment = \"\"").trim_end(),
+            "a: 1 # line\n# mid\nb: 2"
+        );
+        let seq = "# h\n- x # one\n# n\n- y\n";
+        assert_eq!(
+            render_with_comments(seq, ".. head_comment = \"\"").trim_end(),
+            "- x # one\n- y"
+        );
+    }
+
+    /// #2796: a metadata write is resolved once, against the first document, so a filter that
+    /// asks which document or file it is on is refused instead of silently writing nothing for
+    /// the others; one that does not is unaffected.
+    #[test]
+    fn metadata_write_depending_on_the_document_index_is_refused_2796() {
+        let yaml = b"a: 1\n";
+        for filter in [
+            "select(di == 1) | .a comments = \"\"",
+            ".a comments = (fi | tostring)",
+        ] {
+            let expr = jq::parse_with_mode(filter, jq::ParserMode::Yq).unwrap();
+            let mut sink = ErrorSink::default();
+            let root = OwnedValue::Null;
+            assert!(
+                resolve_meta_assign_writes(&expr, &root, &mut sink).is_none(),
+                "{filter}"
+            );
+            assert_eq!(sink.report_count(), 1, "{filter}");
+        }
+        let expr = jq::parse_with_mode(".a comments = \"\"", jq::ParserMode::Yq).unwrap();
+        assert!(
+            resolve_meta_assign_writes(&expr, &OwnedValue::Null, &mut ErrorSink::default())
+                .is_some()
+        );
+        assert_eq!(eval_yaml(yaml, &expr).len(), 1);
     }
 }

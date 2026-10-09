@@ -476,6 +476,11 @@ pub enum Expr {
     /// Recursively descends into all values.
     RecursiveDescent,
 
+    /// yq's `...`: recursive descent that also visits the *key* nodes of every mapping
+    /// (#2796). Only ever parsed as the target of a metadata assignment
+    /// (`... comments = ""`); the value tree sees it as [`Self::RecursiveDescent`].
+    RecursiveDescentWithKeys,
+
     /// Parenthesized expression (for grouping)
     /// This is mostly handled by the parser, but we keep it for clarity.
     Paren(Box<Self>),

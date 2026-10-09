@@ -4273,18 +4273,38 @@ pinned by a `meta_assign_*_798` golden.
 What is refused explicitly (an error, never a silent no-op — the outcome #798's triage
 ruled out), even though real yq supports every one of them:
 
-- **`tag =`, `head_comment =`, `foot_comment =`, `comments =`** raise `<slot> = ... is not
-  yet supported`. Real yq's `.a tag = "!!str"` coerces the value's type, `.a head_comment
-  = "hi"`/`.a foot_comment = "bye"` insert standalone comment lines, and `.a comments =
-  "x"` sets head, line and foot together. None has a write mechanism here yet: `NodeMeta`
-  (`src/jq/eval_generic.rs`) still has no tag slot (#747), and — though #2795 PR B (below)
-  closed the *read-and-print* half, `NodeMeta.head_foot_comment` is now populated from the
-  parsed document and both emitters print it — there is still no way for a filter to
-  *write* a new head/foot value that didn't already exist in the source: `head_comment =`/
-  `foot_comment =`/`comments =` would need their own write mechanism into `CommentTree`,
-  which this issue didn't add. See the identity-round-trip entry below.
-  Remaining: the write forms (`comments =`/`comments |=`) and `...` recursive descent in yq
-  mode; cross-link #1079/#1080/#1085 above.
+- **`tag =`, and `head_comment =`/`foot_comment =`/`comments =` with a non-empty text**
+  raise `<slot> = ... is not yet supported`. Real yq's `.a tag = "!!str"` coerces the
+  value's type, `.a head_comment = "hi"`/`.a foot_comment = "bye"` insert standalone comment
+  lines, and `.a comments = "x"` sets head, line and foot together. Setting a text has no
+  write mechanism here yet: `NodeMeta` (`src/jq/eval_generic.rs`) keeps a node's tag only as
+  the verbatim source spelling (#4078), and where yq *prints* a comment set on a node follows
+  go-yaml's emitter state rather than the node (a scalar mapping value's head lands after
+  its line, before the next key's own head, which then replaces it; a container's foot lands
+  after the next entry's first line), which the emitters here do not model. See the
+  identity-round-trip entry below.
+- **The clearing forms are written** ([#2796](https://github.com/rust-works/succinctly/issues/2796),
+  part 1): `head_comment = ""`, `foot_comment = ""`, `comments = ""` and `line_comment = ""`,
+  `=` or `|=`, on any target, and `...` (yq's recursive descent that also visits mapping
+  keys) as the target of a comment write, so the idiom `... comments = ""` strips every
+  comment in the document. yq keeps a standalone comment on the node it sits next to: the
+  lines above `b:` in a mapping belong to the key `b`, the ones above a sequence item to the
+  item, the ones after the last entry to the document root. `...` clears the key nodes'
+  too; `..` and a path address values only, so `.a head_comment = ""` leaves the `# mid`
+  above `b:` alone and `.. head_comment = ""` clears the root's and the sequence items'
+  lines. `...` parses only as that target (`...` alone stays a parse error) and refuses
+  `style`/`anchor`, whose key-node forms are not modelled. Checked against pinned v4.53.3 by
+  the `meta_assign_clear_*_2796` goldens and a differential fuzz of ~5,900 clearing
+  operations over random commented documents (none differed). Text of newlines alone
+  (`head_comment = "\n"`) is a text, not the clearing form: yq writes blank comment lines for
+  it, so it raises the `not yet supported` error above. A metadata write is resolved once,
+  against the first document, so a filter that asks which document it is on
+  (`select(di == 1) | .b comments = ""`) is refused rather than silently writing nothing for
+  the later ones (this also covers `line_comment`/`style`/`anchor`, which used to drop the
+  write quietly); and a route that keeps no comments at all (`-o json`, a filter with several
+  top-level outputs such as `(.a comments = ""), 1`) ignores a comment write as it always has.
+  A comment after a sequence item's dash (`- # c\n  k: 1`) is lost on any DOM write here, a
+  gap that predates this and that the fuzz skips.
 - **`style = "tagged"`** renders the tag of the node's current value type
   ([#4066](https://github.com/rust-works/succinctly/issues/4066), the last piece of #2707):
   `!!int`/`!!float`/`!!bool`/`!!null`/`!!str` before a scalar, `!!seq`/`!!map` on the header
