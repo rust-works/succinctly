@@ -47334,6 +47334,17 @@ fn yields_only_the_register(e: &Expr) -> bool {
     }
 }
 
+/// Whether `e`, the bound expression of a destructuring `foreach` source, is the register
+/// itself on every output: a bare `.`, a `select(literal)`, or a comma of those (#4150).
+fn bind_hands_on_the_register(e: &Expr) -> bool {
+    match unwrap_paren(e) {
+        Expr::Identity => true,
+        Expr::Builtin(Builtin::Select(_)) => yields_only_the_register(e),
+        Expr::Comma(items) => items.iter().all(bind_hands_on_the_register),
+        _ => false,
+    }
+}
+
 /// Whether a `foreach` SOURCE destructures the register itself (`.`) with an array
 /// or object pattern (#3744): `foreach (. as {a:$a} | .) as $x (...)`. The pattern's tracked index steps move jq's
 /// register onto the matched member and the source is not backtracked past it,
@@ -47381,18 +47392,16 @@ fn source_destructures_register(source: &Expr, through_reduce: bool) -> bool {
     match unwrap_paren(source) {
         // #4128: `select(true) as {a:$a}` binds the register as `. as {a:$a}` does, so under
         // `through_reduce` any source that only hands the register on is the same destructure.
-        // The `foreach` route takes only the bare `.` and `select(literal)`: the resolver
-        // models `(.|.) as {a:$a}` as a computed value there, and a `try`/`?` around it
-        // swallowed the resulting refusal.
+        // The `foreach` route takes a bare `.`, a `select(literal)` and a comma of them
+        // (#4150: `(., .) as {a:$a}` binds per leaf, [`comma_leaves`]); a pipe such as
+        // `(.|.) as {a:$a}` stays out, since the resolver reads it as a computed value and a
+        // `try`/`?` around it swallowed the resulting refusal.
         Expr::AsPattern { expr, patterns, .. } => {
             routes_destructuring(patterns)
                 && if through_reduce {
                     yields_only_the_register(expr)
                 } else {
-                    matches!(
-                        unwrap_paren(expr),
-                        Expr::Identity | Expr::Builtin(Builtin::Select(_))
-                    ) && yields_only_the_register(expr)
+                    bind_hands_on_the_register(expr)
                 }
         }
         Expr::Comma(branches) => branches.iter().any(recurse),
@@ -48935,10 +48944,19 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
         // alternative is the one jq runs.
         // Read only on an escape (#3953): the comparison is O(document), and a walk that
         // succeeds -- one per `reduce` step now -- never asks.
-        let refusal_is_exact = || fresh_head || register.is_some_and(|reg| bound != reg);
         for (i, pattern) in patterns.iter().enumerate() {
             begin_pattern_alternative(i); // #3293
             let is_last = i == last_idx;
+            // #4150: or the walk fails by value, which fails in jq whatever the register
+            // is (`pattern_walk_fails_by_value`), so jq retries. Without it a computed
+            // source with no register in hand (`0 as [$q] ?// $z` in an INIT-navigated
+            // fold's EXTRACT) was a guess here yet an exact refusal to the catchability
+            // test below, and a `try` around the bind swallowed it.
+            let refusal_is_exact = || {
+                fresh_head
+                    || register.is_some_and(|reg| bound != reg)
+                    || (S::TAG == EvalTag::Jq && pattern_walk_fails_by_value::<S>(pattern, bound))
+            };
             let seed = match register {
                 Some(reg) => PatternRegister {
                     path: PathPrefix::root(),
@@ -49101,11 +49119,30 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                             Demand::Stop
                         }
                         ResolveFlow::Escaped(escape) => {
+                            let retries = path_alternative_retries(&escape, is_last);
+                            // Before the generation is read: the by-value run below may hold a
+                            // `?//` of its own, which bumps it (#4150 review).
+                            let guessed = !retries
+                                && S::TAG == EvalTag::Jq
+                                && !is_last
+                                && later_alternative_may_yield::<S>(
+                                    source,
+                                    patterns,
+                                    i + 1,
+                                    body,
+                                    bound,
+                                    identity_at.clone(),
+                                    &all_names,
+                                    value,
+                                    trackable,
+                                );
                             outcome_at = pipe_retry_generation();
-                            outcome = Some(if path_alternative_retries(&escape, is_last) {
+                            outcome = Some(if retries {
                                 BranchOutcome::Retry
                             } else {
-                                BranchOutcome::Return(ResolveFlow::Escaped(escape))
+                                BranchOutcome::Return(ResolveFlow::Escaped(
+                                    guess_unretried_alternative_escape(escape, guessed),
+                                ))
                             });
                             Demand::Stop
                         }
@@ -49669,6 +49706,19 @@ impl FoldSourceAmbient<'_> {
     }
 }
 
+/// Whether INIT, on the fork that produced `init_branch`, navigated and then computed: the
+/// branch is untracked, yet states a live register (`Unmoved`) below the fold's entry, so jq's
+/// register is no longer at the document SOURCE runs on (#4150). `(0, .c)`'s first fork states
+/// the register at the entry (depth 0) and does not count. Jq mode only, like every register
+/// admission here.
+fn init_moved_register<S: EvalSemantics>(init_branch: &PathBranch<'_>, trackable: bool) -> bool {
+    S::TAG == EvalTag::Jq
+        && trackable
+        && !init_branch.trackable
+        && init_branch.path.depth() > 0
+        && matches!(init_branch.register, BranchRegister::Unmoved(_))
+}
+
 /// Which `.` a fold's SOURCE sees on INIT fork `fork_index`, and whether
 /// jq's shared path register still recognises it.
 ///
@@ -49711,6 +49761,7 @@ impl FoldSourceAmbient<'_> {
 ///
 /// The second row is where `relocate` earns its keep: that fork's register
 /// was moved to `["c"]` by INIT, so SOURCE's own `["a"]` is relative to it.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: the resolver's threaded ambients, as `resolve_node_sink`
 fn fold_source_ambient<'v, S: EvalSemantics>(
     fork_index: usize,
     reg: &FoldRegister,
@@ -49719,6 +49770,7 @@ fn fold_source_ambient<'v, S: EvalSemantics>(
     trackable: bool,
     snapshot: &Snapshot,
     frame: &Frame,
+    init_moved: bool,
 ) -> FoldSourceAmbient<'v> {
     if fork_index == 0 {
         // #2031: `doc_branch` stands for the document itself (SOURCE's own
@@ -49767,8 +49819,13 @@ fn fold_source_ambient<'v, S: EvalSemantics>(
         // above already applies) makes a widened acceptance here the
         // *wrong* direction for that mode, with no real-yq oracle to verify
         // it against either way.
-        let source_trackable =
-            path_trackable || reg.identical::<S>(value, snapshot, S::TAG == EvalTag::Jq);
+        // #4150: not when INIT moved the register off the entry ([`init_moved_register`];
+        // `FoldRegister::enter` kept the root `path` and dropped `trackable` for it): jq's SOURCE then runs its first
+        // navigation against a register it is no longer at, and raises, whatever INIT
+        // computed afterwards (`path((foreach .[] as $j ((.a|tostring); .; .)) and true)`
+        // on `{"a":true}`). The equal root paths say nothing about that.
+        let source_trackable = !init_moved
+            && (path_trackable || reg.identical::<S>(value, snapshot, S::TAG == EvalTag::Jq));
         // The widened acceptance above answers a *value*-identity question
         // independent of `doc_branch`'s own path-derived snapshot, so
         // `path_snapshot` (unconditionally `doc_branch`'s own marker,
@@ -50625,6 +50682,86 @@ fn path_alternative_retries(escape: &EvalEscape, is_last: bool) -> bool {
     }
 }
 
+/// The escape [`resolve_as_pattern`] returns for a body refusal [`path_alternative_retries`]
+/// declined to retry (#4150).
+///
+/// On the last alternative the refusal is jq's own: the error propagates normally, and a
+/// `try` around it catches it. On an earlier one declining the retry is this resolver's
+/// guess, not jq's verdict: jq runs the next alternative, and whatever that yields is then
+/// checked at the end of the path, outside any `try` that wrapped the bind
+/// (`path(try (. as [$q] ?// $z | (.a?, null)))` raises `with result null`). Returned as an
+/// ordinary catchable error, the guess was swallowed by that `try` and the write it guarded
+/// went through (`del(try (... or .[0]))` echoed the document). `guessed` says a later
+/// alternative would have produced a value, so the refusal stands in for a retry that
+/// matters: reclassified as the resolver's guess it stays a loud refusal, the safe direction
+/// ADR-0018 asks for. When none would, jq's retry ends in an error too (`try (. as [$q] ?//
+/// $z | .a)` is `[]` in both), and the catchable refusal is already what jq answers.
+fn guess_unretried_alternative_escape(escape: EvalEscape, guessed: bool) -> EvalEscape {
+    match escape {
+        EvalEscape::Error(e) if guessed => EvalEscape::Error(e.into_guessed_path_refusal()),
+        other => other,
+    }
+}
+
+/// Whether any `?//` alternative from `from` on would produce a value on `bound`, run by value
+/// (#4150): the retry [`path_alternative_retries`] declined is one that matters only then.
+/// A pattern that fails by value, or a body that raises before its first output, ends that
+/// alternative as jq's own retry does. Conservative where running it would be observable or
+/// is not judged (a body with effects, a computed key): those say yes, the loud direction.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: the resolver's threaded ambients, as `resolve_as_pattern`
+fn later_alternative_may_yield<S: EvalSemantics>(
+    source: &Expr,
+    patterns: &[Pattern],
+    from: usize,
+    body: &Expr,
+    bound: &OwnedValue,
+    identity_at: Option<Origin>,
+    all_names: &[String],
+    value: &OwnedValue,
+    trackable: bool,
+) -> bool {
+    let later = &patterns[from..];
+    if walk_body_may_have_effects(body) || later.iter().any(pattern_has_computed_key) {
+        return true;
+    }
+    for pattern in later {
+        let mut yielded = false;
+        let _ = each_pattern_binding_set::<S>(pattern, bound, false, &mut |bindings| {
+            // `origin: None`: whether the body yields does not depend on where a binding came from.
+            let bindings: Vec<PatternBinding> = bindings
+                .iter()
+                .map(|(name, value)| PatternBinding {
+                    name: name.clone(),
+                    value: value.clone(),
+                    origin: None,
+                })
+                .collect();
+            let substituted = bind_pattern_body(
+                source,
+                body,
+                pattern,
+                bound,
+                identity_at.clone(),
+                &bindings,
+                all_names,
+            );
+            let first = Expr::FirstExpr(Box::new(substituted));
+            let (outputs, _) =
+                eval_owned_expr_fork::<S>(&first, value, false, Reentry::at_register(trackable));
+            if outputs.is_empty() {
+                Demand::Continue
+            } else {
+                yielded = true;
+                Demand::Stop
+            }
+        });
+        if yielded {
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether a pattern-walk escape out of one `?//` alternative retries the
 /// next -- the walk-side twin of [`path_alternative_retries`], shared by
 /// [`resolve_as_pattern`] and the two fold sites (`resolve_reduce`,
@@ -51402,6 +51539,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
             trackable,
             snapshot,
             frame,
+            init_moved_register::<S>(init_branch, trackable),
         );
         let relocate_base = ambient.relocate_base(&reg.path);
 
@@ -51941,6 +52079,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
             trackable,
             snapshot,
             frame,
+            init_moved_register::<S>(init_branch, trackable),
         );
         let relocate_base = ambient.relocate_base(&reg.path);
 
