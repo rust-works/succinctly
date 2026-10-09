@@ -12,7 +12,7 @@ the settled path itself is [#3296](https://github.com/rust-works/succinctly/issu
 > **TL;DR.** On a chain of `def` calls (`def f: .+1; map(f+f+...+f)`) the settled operand path
 > is faster than the sink-fed one from about 8 terms, and up to 1.29x faster at 200, on both
 > x86_64 and ARM. It is *not* faster because it does less work: it executes **more**
-> instructions (+9% to +18%). The sink-fed path nests its sinks N frames deep, and the deep
+> instructions (+9% to +18%; the sink-fed path runs 8-15% fewer). The sink-fed path nests its sinks N frames deep, and the deep
 > stack misses the data cache. A chain of non-`def` operands does not nest that way and shows
 > none of it, and settling those operands anyway is 3-24% *slower*. Nothing was changed.
 
@@ -51,6 +51,12 @@ control. Measured on `terminus` (Ryzen 9 7950X, one core pinned, load average 1.
 to +1.4% against the settled binary, which is the noise floor for its rows.
 
 ## Results
+
+Everything below was timed through `eval_generic.rs`, the evaluator the CLI runs for a `jq`
+query over a JSON file (every cachegrind symbol on these queries is an `eval_generic` one). The
+`eval.rs` evaluator takes the same `settles_both` decision through `settled_operand_strategy`
+rather than the generic evaluator's `settled_operand_strategy_generic`; it was not timed
+separately, and the decision is stated for the generic one.
 
 ### 1. A chain of `def` calls: sink-fed time over settled time
 
@@ -97,7 +103,10 @@ ARM, `/usr/bin/time -l`, 20,000 elements, minimum of 5 (instructions are determi
 
 The extra D1 misses sit in `eval_each_generic` and in the closures of
 `binary_fanout_each_generic_with` -- the frames the nested sinks stack -- and almost none reach
-the last-level cache (LL misses are about 0.06 M in both), so they are L2 hits. Growing the
+the simulated last-level cache (LL misses are about 0.06 M in both), so they are served by the
+nearer caches on a real machine -- cachegrind does not say which. The M4 Pro was not run under
+a cache simulation: its side of this argument is wall-clock and instructions retired only,
+plus the same code. Growing the
 simulated D1 on the 100-term chain (2,000 elements) separates the two working sets:
 
 | Simulated D1        | Settled | Sink-fed |
@@ -120,8 +129,10 @@ level; the claim rests on the miss counts and the D1-size sweep above.
 ### 3. A chain of non-`def` operands
 
 The issue asked whether `map(.+1+.+1+...)`, which never takes the settled path, pays the same
-cost. It does not: the sink-fed path *is* what it takes, its cost per term stays flat from 2 to
-100 terms, and the "analysis disabled" build matches the shipped one (0.97x-1.00x). Forcing
+cost. It does not: the sink-fed path *is* what it takes, its cost per `.+1` term stays flat
+(7950X: 6.2, 6.1 and 6.4 ms at 25, 50 and 100 terms; M4 Pro: 5.7, 5.7 and 5.9 ms) where a
+sink-fed `def` chain's climbs (7950X: 6.4, 6.4, 6.7 and 7.4 ms per term at 25, 50, 100 and 200,
+against a settled 5.8, 5.6, 5.6 and 5.8), and the "analysis disabled" build matches the shipped one (0.97x-1.00x). Forcing
 those operands through the settled path (the widened variant) is slower on every row:
 
 | Query (20,000 elements) | 7950X sink-fed | 7950X widened | M4 Pro sink-fed | M4 Pro widened |
@@ -151,7 +162,7 @@ No change to `settles_both`, the settle analysis, or either evaluator.
 
 - Narrowing the rule to long chains breaks the stack guarantee for two-term recursion.
 - Widening it regresses every chain and plain operator that is not nested.
-- The residual cost -- 5-9% on a 2-term `def` chain -- is the price of #3296's stack bound.
+- The residual cost -- 6-9% on a 2-term `def` chain -- is the price of #3296's stack bound.
 
 What would address the cause is a smaller frame for `binary_fanout_each_generic_with` and
 `eval_each_generic`, so the sink-fed path stacks cheaper. That is a native-stack-floor change

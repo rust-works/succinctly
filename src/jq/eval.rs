@@ -12188,11 +12188,10 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // lazy argument chain, the `n == 0` each level runs through -- there is
     // nothing to settle.
     //
-    // #4132 measured this choice for speed, which #3296 never did: settling a
-    // chain of `def` calls is faster from about 8 terms (1.29x at 200) though
-    // it runs more instructions, because the sink-fed path nests N sinks and
-    // misses the data cache; it is slower on a 2-term chain (5-9%), and
-    // settling operands that call no `def` is 3-24% slower. Kept as is -- see
+    // #4132 measured this choice for speed, which #3296 never did: settling
+    // beats the sink-fed path on a long chain of `def` calls and loses on a
+    // 2-term one, and settling operands that call no `def` loses. Kept as is;
+    // the numbers and the evidence are in
     // docs/optimizations/jq-settled-operands.md.
     if settles_both(left, right) {
         binary_fanout_each_with::<W, S>(
