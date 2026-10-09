@@ -3843,34 +3843,30 @@ mod tests {
         );
     }
 
-    /// #2687: an arity-1 `def error(m):` does not shadow a bare `break $x`
-    /// (arity 0) -- real jq's own `is_jq_builtin`-style arity distinction
-    /// applies here exactly as it does to a plain `error` call. Confirmed
-    /// live: `def error(m): "S1"; label $out | 1, break $out` still answers
-    /// `1` in jq 1.7.1.
     /// #3997: a node whose operands the resolve pass rewrites in place does
     /// not keep what a settle walk remembered about the old ones.
     #[test]
     fn resolving_an_arithmetic_node_forgets_its_settle_memo_3997() {
         let mut expr = parse("def f: 1; f + f").unwrap();
-        let Expr::FuncDef { then, .. } = &mut expr else {
-            panic!("expected a def") // patchcov: coverage tolerate-line reason="unreachable in a passing suite: the source above starts with a `def` (#3997)"
-        };
-        let Expr::Arithmetic { settle, .. } = &**then else {
-            panic!("expected arithmetic") // patchcov: coverage tolerate-line reason="unreachable in a passing suite: `f + f` is arithmetic (#3997)"
-        };
+        #[rustfmt::skip]
+        let Expr::FuncDef { then, .. } = &mut expr else { panic!("expected a def") };
+        #[rustfmt::skip]
+        let Expr::Arithmetic { settle, .. } = &**then else { panic!("expected arithmetic") };
         settle.set(Some(true), 5);
         assert!(settle.get().is_some());
         resolve_func_calls(&mut expr).unwrap();
-        let Expr::FuncDef { then, .. } = &expr else {
-            unreachable!(); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: resolving keeps the def (#3997)"
-        };
-        let Expr::Arithmetic { settle, .. } = &**then else {
-            unreachable!(); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: resolving keeps the operator (#3997)"
-        };
+        #[rustfmt::skip]
+        let Expr::FuncDef { then, .. } = &expr else { unreachable!() };
+        #[rustfmt::skip]
+        let Expr::Arithmetic { settle, .. } = &**then else { unreachable!() };
         assert!(settle.get().is_none());
     }
 
+    /// #2687: an arity-1 `def error(m):` does not shadow a bare `break $x`
+    /// (arity 0) -- real jq's own `is_jq_builtin`-style arity distinction
+    /// applies here exactly as it does to a plain `error` call. Confirmed
+    /// live: `def error(m): "S1"; label $out | 1, break $out` still answers
+    /// `1` in jq 1.7.1.
     #[test]
     fn break_is_not_shadowed_by_a_different_arity_def_error() {
         assert_eq!(

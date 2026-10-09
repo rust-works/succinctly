@@ -90971,16 +90971,8 @@ mod tests {
     /// `def f: BODY; <use_site>` with `f` installed as a real `DefCall`, so a
     /// use site such as `f + f + f` is a chain whose operands all call a `def`.
     fn installed_use_site_3997(def_source: &str, use_site: &str) -> Expr {
-        let Expr::FuncDef {
-            name,
-            params,
-            body,
-            then,
-            ..
-        } = parse(&format!("{def_source}; {use_site}")).unwrap()
-        else {
-            panic!("expected a def") // patchcov: coverage tolerate-line reason="unreachable in a passing suite: every source this helper parses starts with a `def` (#3997)"
-        };
+        #[rustfmt::skip]
+        let Expr::FuncDef { name, params, body, then, .. } = parse(&format!("{def_source}; {use_site}")).unwrap() else { panic!("expected a def") };
         let def = Rc::new(FuncDefData::new(name, params, *body));
         install_def_calls(&then, &def, 0, false)
     }
@@ -91125,9 +91117,8 @@ mod tests {
             let visits = || SETTLE_WALK_VISITS.with(core::cell::Cell::get);
             let before = visits();
             for node in &spine {
-                let Expr::Arithmetic { left, right, .. } = node else {
-                    unreachable!(); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: `left_spine_3997` yields only arithmetic nodes (#3997)"
-                };
+                #[rustfmt::skip]
+                let Expr::Arithmetic { left, right, .. } = node else { unreachable!() };
                 assert!(settles_both(left, right));
             }
             let spent = visits() - before;
@@ -91154,16 +91145,14 @@ mod tests {
         let cold = chain.clone();
         let printed = format!("{chain:?}");
         assert!(settles_before_consumer(&chain));
-        let Expr::Arithmetic { settle, .. } = &chain else {
-            unreachable!(); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: a three-term chain parses to an arithmetic node (#3997)"
-        };
+        #[rustfmt::skip]
+        let Expr::Arithmetic { settle, .. } = &chain else { unreachable!() };
         assert!(settle.get().is_some(), "the walk remembered the node");
         assert_eq!(chain, cold, "equality ignores the memo");
         assert_eq!(format!("{chain:?}"), printed, "so does Debug");
         let copy = chain.clone();
-        let Expr::Arithmetic { settle, .. } = &copy else {
-            unreachable!(); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: a clone of an arithmetic node is one (#3997)"
-        };
+        #[rustfmt::skip]
+        let Expr::Arithmetic { settle, .. } = &copy else { unreachable!() };
         assert!(settle.get().is_none(), "a clone starts with nothing");
     }
 
@@ -91175,20 +91164,17 @@ mod tests {
     #[test]
     fn only_the_top_level_settle_walk_remembers_3997() {
         let call = installed_use_site_3997("def f: .+1", "f");
-        let Expr::DefCall { def, .. } = &call else {
-            panic!("expected a DefCall") // patchcov: coverage tolerate-line reason="unreachable in a passing suite: `f` under `def f` installs as a DefCall (#3997)"
-        };
+        #[rustfmt::skip]
+        let Expr::DefCall { def, .. } = &call else { panic!("expected a DefCall") };
         assert!(settles_before_consumer(&call));
-        let Expr::Arithmetic { settle, .. } = &def.body else {
-            panic!("expected an arithmetic body") // patchcov: coverage tolerate-line reason="unreachable in a passing suite: the body is `.+1` (#3997)"
-        };
+        #[rustfmt::skip]
+        let Expr::Arithmetic { settle, .. } = &def.body else { panic!("expected an arithmetic body") };
         assert!(settle.get().is_none(), "a body is walked within its def");
 
         let arg = SharedArg::new(parse("1 + 1").unwrap());
         assert!(is_eager_arg(&arg));
-        let Expr::Arithmetic { settle, .. } = arg.expr() else {
-            panic!("expected arithmetic") // patchcov: coverage tolerate-line reason="unreachable in a passing suite: `1 + 1` parses to arithmetic (#3997)"
-        };
+        #[rustfmt::skip]
+        let Expr::Arithmetic { settle, .. } = arg.expr() else { panic!("expected arithmetic") };
         assert!(settle.get().is_none(), "an eager-arg walk is not memoised");
     }
 
