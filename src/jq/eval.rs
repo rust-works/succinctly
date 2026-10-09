@@ -51738,7 +51738,7 @@ fn body_raises_only_its_input(body: &Expr, wide: bool) -> bool {
     match unwrap_bind_source(body) {
         Expr::Error(_) => stage_raises_its_input(body, wide),
         Expr::Pipe(stages) => {
-            for stage in stages.iter() {
+            for stage in stages {
                 if stage_raises_its_input(stage, wide) {
                     return true;
                 }

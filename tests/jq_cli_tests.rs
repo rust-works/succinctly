@@ -62094,7 +62094,7 @@ fn test_try_raising_its_input_states_the_handler_register_per_result_4019() -> R
         "#4019: {stderr:?}"
     );
     let program =
-        r#"path(. as $x | try (if . == 3 then error(.) else . end) catch ((.a)? // 5) | $x)"#;
+        r"path(. as $x | try (if . == 3 then error(.) else . end) catch ((.a)? // 5) | $x)";
     let (stdout, stderr, code) = run_jq_full(&["-c", program], Some("3"))?;
     assert_eq!((stdout.as_str(), code), ("[]\n", 0), "#4019: {stderr:?}");
     Ok(())
