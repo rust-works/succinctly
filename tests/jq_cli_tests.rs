@@ -122160,7 +122160,32 @@ fn test_path_f_stage_leaves_register_4118() -> Result<()> {
             "Invalid path expression",
             5,
         ),
-        // Must not change: a bare `$v0` source and a bare `.` source on an untracked stage.
+        // `path(f)` for an `f` that yields nothing, fans out, or hands the root back.
+        (doc, r"path(. as $x | first(path(empty)) | $x)", "", "", 0),
+        (
+            doc,
+            r"path(. as $x | limit(2; path(.a, .k)) | $x)",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (doc, r"path(. as $x | first(path(..)) | $x)", "[]\n", "", 0),
+        (
+            doc,
+            r"path(. as $x | first(path(.a)) | .a)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        // Must not change: a `.` only in a condition is no mix, and neither is a bare `$v0`
+        // source or a bare `.` source on an untracked stage.
+        (
+            wide,
+            r"del(. as $v0 | length | (if (.>0) then $v0 else $v0 end) as $v1 | try (($v1 | .[]?) | .b?))",
+            "{\"a\":{},\"c\":{},\"d\":false}\n",
+            "",
+            0,
+        ),
         (
             wide,
             r"del(. as $v0 | length | $v0 as $v1 | try (($v1 | .[]?) | .b?))",

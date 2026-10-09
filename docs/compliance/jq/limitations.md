@@ -1514,7 +1514,9 @@ is the revert that established what the other one costs.
    the refusal and skipped the write jq makes (`test_transparent_bind_source_matches_identity_bind_3402` pins the
    never-silent-discard half). It is now the `Unproven` marker, a loud refusal where jq answers
    (`del(. as $v0 | length | (if true then $v0 else . end) as $v1 | try (($v1 | .[]?) | .b?))`), pinned by
-   `test_path_f_stage_leaves_register_4118`.
+   `test_path_f_stage_leaves_register_4118`. The mix is read over the branches `identity_passthrough` reads (an `if`'s
+   arms, a `try` body, the left of `//`, a pipe's stages, a comma's leaves), so a `.` in a condition does not count;
+   a mix through a form it does not read (`($v0 // .)`) is not covered.
    Part 2 lets an `[E]` collect hold `last(f)` (`[last(.a)]`: the claim
    reads through to `f`, which the resolver's `last` arm resolves live, so `[last(1 \| .a)]` still raises
    as jq does and the output is demoted, so `[last(.a)] \| .k` still refuses), pinned by
