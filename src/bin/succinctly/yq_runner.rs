@@ -4189,6 +4189,13 @@ fn apply_meta_assign_writes(
             continue;
         }
         if let MetaEffect::SetEntry { head, foot, line } = &write.effect {
+            // A later stage can have replaced the scalar this was resolved against with a
+            // container, which yq places differently.
+            if matches!(node_value, OwnedValue::Object(_) | OwnedValue::Array(_)) {
+                return Err(set_entry_unsupported(
+                    "a later stage replaced the scalar with a mapping or sequence",
+                ));
+            }
             apply_set_entry(&steps, tree, head.as_ref(), foot.as_ref(), line.as_ref())?;
             continue;
         }
@@ -4280,6 +4287,32 @@ fn set_entry_unsupported(why: &str) -> EvalError {
     ))
 }
 
+/// Whether every collection from the root down to `parent_steps` is block style, `Err` if one is
+/// flow (#2796: a flow collection prints its comments differently), `Ok(false)` if the path is not
+/// in the tree at all.
+fn block_ancestors(tree: &CommentTree, parent_steps: &[TreeStep<'_>]) -> Result<bool, EvalError> {
+    let flow = || set_entry_unsupported("the collection is written in flow style");
+    let mut ancestor = tree;
+    if ancestor.style() == "flow" {
+        return Err(flow());
+    }
+    for step in parent_steps {
+        let next = match (ancestor, step) {
+            (CommentTree::Object(_, fields, _), TreeStep::Key(k)) => fields.get(*k),
+            (CommentTree::Array(_, items), TreeStep::Index(i)) => items.get(*i),
+            _ => None,
+        };
+        let Some(next) = next else {
+            return Ok(false);
+        };
+        if next.style() == "flow" {
+            return Err(flow());
+        }
+        ancestor = next;
+    }
+    Ok(true)
+}
+
 /// Apply a text write to a scalar mapping value or sequence item (`.a.b head_comment = "x"`,
 /// #2796), or refuse it.
 ///
@@ -4311,28 +4344,8 @@ fn apply_set_entry(
     let Some((last, parent_steps)) = steps.split_last() else {
         return Ok(());
     };
-    // Every collection from the root down must be block style.
-    let mut ancestor: &CommentTree = tree;
-    if ancestor.style() == "flow" {
-        return Err(set_entry_unsupported(
-            "the collection is written in flow style",
-        ));
-    }
-    for step in parent_steps {
-        let next = match (ancestor, step) {
-            (CommentTree::Object(_, fields, _), TreeStep::Key(k)) => fields.get(*k),
-            (CommentTree::Array(_, items), TreeStep::Index(i)) => items.get(*i),
-            _ => None,
-        };
-        let Some(next) = next else {
-            return Ok(());
-        };
-        if next.style() == "flow" {
-            return Err(set_entry_unsupported(
-                "the collection is written in flow style",
-            ));
-        }
-        ancestor = next;
+    if !block_ancestors(tree, parent_steps)? {
+        return Ok(());
     }
     let Some(parent) = comment_tree_at_path_or_create_mut(tree, parent_steps) else {
         return Ok(());
@@ -4379,12 +4392,12 @@ fn apply_set_entry(
     let mut members = members;
     if owns_lines(members[index]) {
         return Err(set_entry_unsupported(
-            "the node already has head or foot comment lines",
+            "the node already has head or foot comment lines (in the document or from an earlier write)",
         ));
     }
     if !last_entry && owns_lines(members[index + 1]) {
         return Err(set_entry_unsupported(
-            "the next entry already has head or foot comment lines",
+            "the next entry already has head or foot comment lines (in the document or from an earlier write)",
         ));
     }
     if let Some(line) = line {
@@ -4438,35 +4451,19 @@ fn apply_set_key(
     let Some((TreeStep::Key(key), parent_steps)) = steps.split_last() else {
         return Ok(());
     };
-    let mut ancestor: &CommentTree = tree;
-    if ancestor.style() == "flow" {
-        return Err(set_entry_unsupported(
-            "the collection is written in flow style",
-        ));
+    if !block_ancestors(tree, parent_steps)? {
+        return Ok(());
     }
-    for step in parent_steps {
-        let next = match (ancestor, step) {
-            (CommentTree::Object(_, fields, _), TreeStep::Key(k)) => fields.get(*k),
-            (CommentTree::Array(_, items), TreeStep::Index(i)) => items.get(*i),
-            _ => None,
-        };
-        let Some(next) = next else {
-            return Ok(());
-        };
-        if next.style() == "flow" {
-            return Err(set_entry_unsupported(
-                "the collection is written in flow style",
-            ));
-        }
-        ancestor = next;
-    }
+    // The write may name a member the value tree only gained from the real evaluation (`(.z.y |
+    // key) ...` on a document without `z`): grow the comment tree to it.
+    comment_tree_at_path_or_create_mut(tree, steps);
     let Some(CommentTree::Object(_, fields, _)) =
         comment_tree_at_path_or_create_mut(tree, parent_steps)
     else {
         return Ok(());
     };
     let Some(member) = fields.get_mut(*key) else {
-        return Ok(());
+        return Ok(()); // patchcov: coverage tolerate-line reason="unreachable: the member was grown just above, so the parent object has it (#2796)"
     };
     if foot.is_some() && !member.meta().foot_comment().is_empty() {
         return Err(set_entry_unsupported(
@@ -11989,6 +11986,8 @@ mod tests {
             ("a: [1, 2]\n", ".a[0] foot_comment = \"x\""),
             ("a: {b: 1}\nc: 2\n", ".a head_comment = \"x\""),
             ("a: 1\n", ".a head_comment = \"\\n\""),
+            // A later stage replaced the scalar with a container, which yq places differently.
+            ("a: 1\n", ".a head_comment = \"y\" | .a = {\"x\": 1}"),
         ] {
             let expr = jq::parse_with_mode(filter, jq::ParserMode::Yq).unwrap();
             let mut sink = ErrorSink::default();
