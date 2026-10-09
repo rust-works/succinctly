@@ -5638,10 +5638,19 @@ pub(crate) fn suppresses(e: &EvalError, optional: bool) -> bool {
 ///
 /// Not `Option::is_none_or`: the crate's MSRV is 1.73 and that is 1.82.
 pub(crate) fn try_swallows_scalar_iteration(expr: &Expr, catch: Option<&Expr>) -> bool {
-    matches!(unwrap_bind_source(expr), Expr::Iterate)
-        && catch.map_or(true, |c| {
-            matches!(unwrap_bind_source(c), Expr::Builtin(Builtin::Empty))
-        })
+    matches!(unwrap_bind_source(expr), Expr::Iterate) && catch.map_or(true, is_empty_handler)
+}
+
+/// Whether a `catch` handler is the bare builtin `empty`, which delivers nothing
+/// for any payload (a `break` runs it over `null`, which is the same nothing), so
+/// the boundary is the same as one with no handler. One definition for
+/// [`try_swallows_scalar_iteration`] (the value boundaries and the path walks) and
+/// [`resolve_catch_sink`] (the resolver), so the two cannot disagree about which
+/// handlers run (#3728). Peeled by [`unwrap_bind_source`], as the shape tests
+/// above are: a `def empty:` in scope is a `DefCall`, a closure argument arrives as
+/// `Expr::Shared`, and nothing is evaluated here either way.
+fn is_empty_handler(catch: &Expr) -> bool {
+    matches!(unwrap_bind_source(catch), Expr::Builtin(Builtin::Empty))
 }
 
 /// The constant a `try .[] catch LITERAL` boundary answers with for a scalar
@@ -5671,8 +5680,8 @@ pub(crate) fn try_catches_scalar_iteration_with_literal<'e>(
 }
 
 /// Whether the `?`/`try` boundary over `body` with this handler has nothing to
-/// do for the **owned** `value` (#3728): the shape is [`try_swallows_scalar_iteration`]'s,
-/// `value` is a scalar, and the mode is not yq.
+/// do for the **owned** `value` (#3728): [`swallowing_boundary`](crate::jq::eval_generic::swallowing_boundary)
+/// (a bare `.[]` with no handler or `empty`, not in yq mode) over a scalar.
 ///
 /// The owned twin of `eval_generic::swallowed_scalar_iteration`, for the walks
 /// that hold an [`OwnedValue`] and not a document cursor: the path resolver and
@@ -5689,8 +5698,7 @@ fn owned_scalar_iteration_swallowed<S: EvalSemantics>(
     catch: Option<&Expr>,
     value: &OwnedValue,
 ) -> bool {
-    try_swallows_scalar_iteration(body, catch)
-        && S::TAG != EvalTag::Yq
+    crate::jq::eval_generic::swallowing_boundary::<S>(body, catch)
         && !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_))
 }
 
@@ -5702,6 +5710,12 @@ fn owned_swallowing_boundary<S: EvalSemantics>(expr: &Expr, value: &OwnedValue) 
         Expr::Try { expr, catch } => {
             owned_scalar_iteration_swallowed::<S>(expr, catch.as_deref(), value)
         }
+        // A door answers the bare stage and the one-stage pipe around it alike
+        // (#3673): `. | .[]?` is `.[]?`, as `eval_owned_length` reads it.
+        Expr::Pipe(stages) => match skip_identity_stages(stages) {
+            [only] => owned_swallowing_boundary::<S>(only, value),
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -52361,10 +52375,7 @@ fn resolve_catch_sink<'a, S: EvalSemantics>(
     // #3728: `catch empty` is the same boundary as no handler -- it delivers
     // nothing for any payload -- so the payload is not seeded, the handler is
     // not flattened, and it is not run over a re-indexed copy of the payload.
-    if matches!(
-        unwrap_bind_source(catch_expr),
-        Expr::Builtin(Builtin::Empty)
-    ) {
+    if is_empty_handler(catch_expr) {
         return ResolveFlow::Exhausted;
     }
     // A caught error/break payload is never a snapshot (#1591): jq's own
@@ -89411,6 +89422,13 @@ mod tests {
             "reverse",
             "to_entries",
             r#"getpath(["a"])"#,
+            // A swallowed `.[]` over a scalar (#3728), however it is spelled.
+            ".[]?",
+            "(.[])?",
+            "try .[]",
+            "try .[] catch empty",
+            r#"try .[] catch "c""#,
+            "(.[] | empty)?",
             // Left to the bridge.
             "floor",
             "keys",
@@ -122367,6 +122385,8 @@ mod tests {
                 "try .[]",
                 "try .[] catch empty",
                 "(try .[] catch empty)",
+                // The one-stage pipe around it, as the front doors read both alike.
+                ". | .[]?",
             ] {
                 assert_eq!(boundary(source, scalar), (true, false), "{source}");
             }
@@ -122380,6 +122400,8 @@ mod tests {
                 "(.[] | empty)?",
                 ".[0]?",
                 ".[]",
+                // Two stages are a pipe the door does not read.
+                ".[]? | .[]?",
             ] {
                 assert_eq!(boundary(source, scalar), (false, false), "{source}");
             }

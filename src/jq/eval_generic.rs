@@ -1763,7 +1763,7 @@ pub(crate) fn caught_scalar_iteration<S: EvalSemantics, V: DocumentValue>(
 /// (the four value boundaries) and [`swallowed_path_leaf`] (every path walk: the
 /// path-context step and both `path(f)` walkers), so the mode rule cannot be
 /// changed in one and left behind in another.
-fn swallowing_boundary<S: EvalSemantics>(expr: &Expr, catch: Option<&Expr>) -> bool {
+pub(crate) fn swallowing_boundary<S: EvalSemantics>(expr: &Expr, catch: Option<&Expr>) -> bool {
     crate::jq::eval::try_swallows_scalar_iteration(expr, catch) && S::TAG != EvalTag::Yq
 }
 
