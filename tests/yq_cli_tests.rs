@@ -59899,9 +59899,10 @@ fn test_tag_before_a_flow_collection_inside_a_flow_sequence_4081() -> Result<()>
 /// `parse_flow_sequence`/`parse_flow_mapping`, which open one of their own: a
 /// sequence value came back wrapped in a second sequence (`[k: [c]]` was
 /// `[{"k":[["c"]]}]`), a mapping value came back empty (`[k: {x: 1}]` was
-/// `{"k":{}}`) and an alias value read as a plain scalar (`null`). Every
+/// `{"k":{}}`) and an alias value read as a plain scalar (`null`). Every JSON
 /// expectation is yq v4.53.3's output; the second column is the default YAML
-/// output where it matches too.
+/// output where it matches too, and `None` where yq's own rendering of the row
+/// differs (a complex key) and only the JSON answer is pinned.
 #[test]
 fn test_flow_collection_value_in_a_flow_sequence_pair_4091() -> Result<()> {
     let rows: &[(&str, &str, Option<&str>)] = &[

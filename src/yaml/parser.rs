@@ -5581,18 +5581,19 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         Ok(())
     }
 
-    /// The value of a `key: value` pair in flow context, with the `:` and the
-    /// whitespace after it already consumed: node properties (`&a`, `!tag`), then
-    /// an alias, a flow collection or a scalar.
+    /// A flow node that is not a key: node properties (`&a`, `!tag`), then an
+    /// alias, a flow collection or a scalar. Used for a flow sequence's standalone
+    /// item and for the value of a `key: value` pair (the `:` and the whitespace
+    /// after it already consumed).
     ///
-    /// One definition for the flow mapping and both single-pair forms of a flow
-    /// sequence (`[k: v]`, `[? k : v]`). The pair forms were copies that opened a
+    /// One definition for a flow sequence's items, a flow mapping's values and both
+    /// single-pair forms of a flow sequence (`[k: v]`, `[? k : v]`). The pair forms were copies that opened a
     /// BP node for the value and then called `parse_flow_sequence` /
     /// `parse_flow_mapping`, which open one of their own: a sequence value came
     /// back wrapped in a second sequence and a mapping value came back empty, and
     /// an alias value read as a plain scalar (#4091). A flow collection carries
     /// its own node and needs no wrapper (#332); only a scalar is wrapped.
-    fn parse_flow_pair_value(&mut self) -> Result<(), YamlError> {
+    fn parse_flow_value_node(&mut self) -> Result<(), YamlError> {
         // A property prefix on the value
         self.parse_flow_node_properties()?;
 
@@ -5643,7 +5644,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
             // Parse value (if present before , or ])
             if !matches!(self.peek(), Some(b',' | b']' | b'}') | None) {
-                self.parse_flow_pair_value()?;
+                self.parse_flow_value_node()?;
             } else {
                 // Empty value (null)
                 self.set_ib();
@@ -5701,7 +5702,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
         // Parse value (if present before , or ])
         if !matches!(self.peek(), Some(b',' | b']' | b'}') | None) {
-            self.parse_flow_pair_value()?;
+            self.parse_flow_value_node()?;
         } else {
             // Empty value (null)
             self.set_ib();
@@ -5964,28 +5965,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // alias here prefixes a standalone value instead
                 // (`[&x a, *x]`, `[!!str a]`), so it's consumed only now that
                 // the pair check has ruled that out.
-                self.parse_flow_node_properties()?;
-                if self.peek() == Some(b'*') {
-                    self.parse_alias()?;
-                } else {
-                    // Parse flow value (item) - containers handle their own BP
-                    match self.peek() {
-                        Some(b'[') => {
-                            self.parse_flow_sequence()?;
-                        }
-                        Some(b'{') => {
-                            self.parse_flow_mapping()?;
-                        }
-                        _ => {
-                            // Plain scalar value - wrap in BP
-                            self.set_ib();
-                            self.write_bp_open();
-                            let end = self.parse_flow_scalar()?;
-                            self.set_bp_text_end(end);
-                            self.write_bp_close();
-                        }
-                    }
-                }
+                self.parse_flow_value_node()?;
             }
             self.skip_flow_whitespace();
         }
@@ -6301,7 +6281,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.advance(); // Skip `:`
                 self.skip_flow_whitespace();
 
-                self.parse_flow_pair_value()?;
+                self.parse_flow_value_node()?;
             } else if matches!(self.peek(), Some(b',' | b'}')) {
                 // Key without colon/value - emit empty value (implicit null)
                 self.set_ib();
