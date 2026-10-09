@@ -374,6 +374,34 @@ fn is_ident_start_char(c: char) -> bool {
 /// on which names get pseudo-variable treatment -- the exact "duplicated
 /// predicates diverge silently" shape #2728 found for identifier-start
 /// rules, per CLAUDE.md's #106 note.
+/// Flag every entry of a yq `{...}` whose key may equal an earlier entry's
+/// (#4182), so the evaluators build the construction as yq's `COLLECT_OBJECT`,
+/// which deep-merges the two values, not as a fan-out that keeps the last.
+///
+/// A literal key is compared here. A computed key (`{(.k): ..}`) can only be
+/// compared at run time, so it and every literal after it are flagged; one flag
+/// is enough to route the whole construction, and a construction of distinct
+/// literal keys has none, so it keeps its fan-out.
+fn mark_possibly_repeated_keys(entries: &mut [ObjectEntry]) {
+    let mut computed_before = false;
+    for i in 0..entries.len() {
+        let repeats = match &entries[i].key {
+            ObjectKey::Literal(key) => {
+                computed_before
+                    || entries[..i]
+                        .iter()
+                        .any(|earlier| matches!(&earlier.key, ObjectKey::Literal(k) if k == key))
+            }
+            ObjectKey::Expr(_) => {
+                computed_before = true;
+                i > 0
+            }
+            ObjectKey::Bare => false,
+        };
+        entries[i].may_repeat_key = repeats;
+    }
+}
+
 fn dollar_var_expr(name: String, line: usize) -> Expr {
     if name == "__loc__" {
         // #2774: the parser has no notion of which file it is reading (a
@@ -2383,7 +2411,11 @@ impl<'a> Parser<'a> {
                     }
                 };
 
-                ObjectEntry { key, value }
+                ObjectEntry {
+                    key,
+                    value,
+                    may_repeat_key: false,
+                }
             };
             entries.push(entry);
             self.skip_ws();
@@ -2425,6 +2457,9 @@ impl<'a> Parser<'a> {
             }
         }
 
+        if self.mode == ParserMode::Yq {
+            mark_possibly_repeated_keys(&mut entries);
+        }
         Ok(Expr::Object(entries))
     }
 
@@ -2442,6 +2477,7 @@ impl<'a> Parser<'a> {
             return Ok(ObjectEntry {
                 key: ObjectKey::Bare,
                 value: first,
+                may_repeat_key: false,
             });
         }
         self.next();
@@ -2451,7 +2487,11 @@ impl<'a> Parser<'a> {
             Expr::Literal(Literal::String(s)) => ObjectKey::Literal(s),
             other => ObjectKey::Expr(Box::new(other)),
         };
-        Ok(ObjectEntry { key, value })
+        Ok(ObjectEntry {
+            key,
+            value,
+            may_repeat_key: false,
+        })
     }
 
     /// The value of an object-construction entry.
@@ -9605,8 +9645,44 @@ mod tests {
             Expr::Object(vec![ObjectEntry {
                 key: ObjectKey::Literal("k".into()),
                 value: and(Expr::Pipe(vec![f("a"), f("b")].into()), f("c")),
+                may_repeat_key: false,
             }])
         );
+    }
+
+    /// #4182: a yq `{...}` flags the entries whose key may equal an earlier
+    /// one, so it is built as `COLLECT_OBJECT`; distinct literal keys and every
+    /// jq construction stay unflagged.
+    #[test]
+    fn test_yq_mode_flags_object_entries_that_may_repeat_a_key_4182() {
+        let flags = |filter: &str, mode: ParserMode| match parse_with_mode(filter, mode).unwrap() {
+            Expr::Object(entries) => entries.iter().map(|e| e.may_repeat_key).collect::<Vec<_>>(),
+            other => panic!("not an object: {other:?}"),
+        };
+        for (filter, expected) in [
+            (r#"{"a":1}"#, vec![false]),
+            (r#"{"a":1,"b":2}"#, vec![false, false]),
+            (r#"{"a":1,"a":2}"#, vec![false, true]),
+            (r#"{"a":1,"b":2,"a":3}"#, vec![false, false, true]),
+            (r#"{"a":1,"a":2,"a":3}"#, vec![false, true, true]),
+            // A computed key is only comparable at run time: it flags itself
+            // when something precedes it, and every literal after it.
+            (r"{(.k):1}", vec![false]),
+            (r#"{"a":1,(.k):2}"#, vec![false, true]),
+            (r#"{(.k):1,"a":2}"#, vec![false, true]),
+            (r"{(.k):1,(.j):2}", vec![false, true]),
+        ] {
+            assert_eq!(flags(filter, ParserMode::Yq), expected, "{filter}");
+        }
+        // A bare entry is already collected, and is never flagged itself.
+        assert_eq!(
+            flags(r#"{"a":1,"a":2,$x}"#, ParserMode::Yq),
+            [false, true, false]
+        );
+        // jq keeps the last of a repeated key, so nothing is flagged.
+        for filter in [r#"{"a":1,"a":2}"#, r"{a:1,a:2}", r#"{"a":1,(.k):2}"#] {
+            assert_eq!(flags(filter, ParserMode::Jq), vec![false; 2], "{filter}");
+        }
     }
 
     #[test]

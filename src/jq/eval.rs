@@ -3857,6 +3857,9 @@ pub(crate) fn yq_empty_context_reemit(expr: &Expr) -> Option<Expr> {
                 rewritten.push(ObjectEntry {
                     key: ObjectKey::Literal(key),
                     value: yq_empty_context_reemit(&entry.value)?,
+                    // The rebuilt object is evaluated, and a repeated key
+                    // deep-merges there (#4182).
+                    may_repeat_key: entry.may_repeat_key,
                 });
             }
             Some(Expr::Object(rewritten))
@@ -4509,16 +4512,21 @@ fn eval_object_construction_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     owned_vec_to_result(objects)
 }
 
-/// Whether a `{...}` holds a bare, non-pair entry and so is yq's
-/// `COLLECT_OBJECT` rather than a cross product of `key: value` pairs (#2783).
+/// Whether a `{...}` holds a bare, non-pair entry, or repeats a literal key,
+/// and so is yq's `COLLECT_OBJECT` rather than a cross product of `key: value`
+/// pairs (#2783, #4182).
 ///
-/// Only yq's parser builds [`ObjectKey::Bare`], so the `TAG` test is a
-/// compile-time constant that lets jq mode skip the scan entirely.
+/// A repeated key is the one case where a pair-only construction differs:
+/// `COLLECT_OBJECT` deep-merges the two values where the fan-out keeps the last.
+/// The parser flags the entry ([`ObjectEntry::may_repeat_key`]).
+///
+/// Only yq's parser builds [`ObjectKey::Bare`] or sets the flag, so the `TAG`
+/// test is a compile-time constant that lets jq mode skip the scan entirely.
 pub(crate) fn yq_collects_bare<S: EvalSemantics>(entries: &[super::expr::ObjectEntry]) -> bool {
     S::TAG == EvalTag::Yq
         && entries
             .iter()
-            .any(|entry| matches!(entry.key, ObjectKey::Bare))
+            .any(|entry| matches!(entry.key, ObjectKey::Bare) || entry.may_repeat_key)
 }
 
 /// Object construction holding a bare entry, as yq's `COLLECT_OBJECT` (#2783).
@@ -11488,7 +11496,9 @@ fn closed_expr_shape(expr: &Expr) -> bool {
         Expr::Object(entries) => entries.iter().all(|entry| {
             closed_expr_shape(&entry.value)
                 && match &entry.key {
-                    ObjectKey::Literal(_) => true,
+                    // A repeated key deep-merges in yq (#4182); folding would
+                    // keep the last.
+                    ObjectKey::Literal(_) => !entry.may_repeat_key,
                     ObjectKey::Expr(key) => closed_expr_shape(key),
                     ObjectKey::Bare => false,
                 }
@@ -11654,6 +11664,9 @@ fn closed_expr_to_owned_node<S: EvalSemantics>(
         Expr::Object(entries) => {
             let mut out = vec_with_capacity(entries.len());
             for entry in entries {
+                if entry.may_repeat_key {
+                    return None;
+                }
                 let key = match &entry.key {
                     ObjectKey::Literal(s) => s.clone(),
                     ObjectKey::Bare => return None,
@@ -58769,6 +58782,8 @@ fn owned_to_expr_at_depth(value: &OwnedValue, depth: usize) -> Expr {
                 .map(|(k, v)| ObjectEntry {
                     key: ObjectKey::Literal(k.clone()),
                     value: owned_to_expr_at_depth(v, depth + 1),
+                    // An object's keys are distinct.
+                    may_repeat_key: false,
                 })
                 .collect();
             Expr::Object(entries)
@@ -78491,6 +78506,7 @@ pub(crate) fn install_def_calls(
                     ObjectEntry {
                         key,
                         value: install_def_calls(&entry.value, def, charged, in_recursive_body),
+                        may_repeat_key: entry.may_repeat_key,
                     }
                 })
                 .collect(),
@@ -104394,6 +104410,7 @@ mod tests {
             closed_expr_to_owned::<JqSemantics>(&Expr::Object(vec![ObjectEntry {
                 key: ObjectKey::Literal("a".to_string()),
                 value: Expr::Field("foo".to_string()),
+                may_repeat_key: false,
             }])),
             None
         );
@@ -104403,6 +104420,7 @@ mod tests {
             closed_expr_to_owned::<JqSemantics>(&Expr::Object(vec![ObjectEntry {
                 key: ObjectKey::Expr(Box::new(Expr::Literal(Literal::Int(1)))),
                 value: Expr::Literal(Literal::Bool(true)),
+                may_repeat_key: false,
             }])),
             None
         );
@@ -136203,6 +136221,61 @@ mod touched_edge_cases_2999 {
         // `--jq-extensions` keeps the identifier key and the `{x}` shorthand.
         assert_eq!(run("{a}", true), r#"{"a":1}"#);
         assert_eq!(run("{k: .a}", true), r#"{"k":1}"#);
+    }
+
+    /// #4182: the owned evaluator and the closed-literal folder agree with the
+    /// generic one (`yq_repeated_object_keys_deep_merge_4182`) that a repeated
+    /// key deep-merges in yq. The folder is the sharp one: a closed
+    /// `{"a": {..}, "a": {..}}` is answerable without evaluating anything, and
+    /// folding it through `IndexMap` would keep the last.
+    #[test]
+    fn yq_repeated_object_keys_deep_merge_in_the_owned_evaluator_and_folder_4182() {
+        let json = br#"{"k":"a"}"#;
+        let index = JsonIndex::build(json);
+        for (filter, expected) in [
+            (r#"{"a":{"x":1},"a":{"y":2}}"#, r#"{"a":{"x":1,"y":2}}"#),
+            (
+                r#"{"a":({"x":1},{"x":2}),"a":{"y":3}}"#,
+                r#"{"a":{"x":1,"y":3}} {"a":{"x":2,"y":3}}"#,
+            ),
+            (r#"{.k:{"x":1}, ("a"):{"y":2}}"#, r#"{"a":{"x":1,"y":2}}"#),
+            (
+                r#"{"a":{"x":1},"b":{"y":2}}"#,
+                r#"{"a":{"x":1},"b":{"y":2}}"#,
+            ),
+        ] {
+            let expr = parse_with_mode_and_extensions(filter, ParserMode::Yq, false)
+                .expect("filter parses");
+            for (entry, result) in [
+                (
+                    "eval",
+                    eval::<Vec<u64>, YqSemantics>(&expr, index.root(json)),
+                ),
+                (
+                    "eval_full",
+                    eval_full::<Vec<u64>, YqSemantics>(&expr, index.root(json)),
+                ),
+            ] {
+                let got = result
+                    .collect_owned::<YqSemantics>()
+                    .iter()
+                    .map(OwnedValue::to_json)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert_eq!(got, expected, "{entry}: {filter}");
+            }
+        }
+        // A repeated key is not foldable; distinct ones still are.
+        let closed = |filter: &str| {
+            let expr = parse_with_mode_and_extensions(filter, ParserMode::Yq, false)
+                .expect("filter parses");
+            closed_expr_to_owned::<YqSemantics>(&expr).map(|v| v.to_json())
+        };
+        assert_eq!(closed(r#"{"a":{"x":1},"a":{"y":2}}"#), None);
+        assert_eq!(
+            closed(r#"{"a":{"x":1},"b":{"y":2}}"#).as_deref(),
+            Some(r#"{"a":{"x":1},"b":{"y":2}}"#)
+        );
     }
 
     /// #3479: a construct the generic evaluator bridges to the owned evaluator

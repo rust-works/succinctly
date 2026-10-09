@@ -953,6 +953,7 @@ pub fn map_subexprs(expr: &Expr, mut f: &mut dyn FnMut(&Expr) -> Expr) -> Expr {
                     ObjectEntry {
                         key,
                         value: f(&entry.value),
+                        may_repeat_key: entry.may_repeat_key,
                     }
                 })
                 .collect(),
