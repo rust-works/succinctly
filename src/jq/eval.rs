@@ -43218,6 +43218,7 @@ fn leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
                     | Builtin::InputLineNumber
                     | Builtin::Min
                     | Builtin::MinBy(_)
+                    | Builtin::Path(_)
                     | Builtin::Reverse
                     | Builtin::Sort
                     | Builtin::SortBy(_)
@@ -50460,9 +50461,16 @@ fn source_may_alias_register<S: EvalSemantics>(
     trackable: bool,
     frame: &Frame,
 ) -> bool {
-    // The frame's position is the register's only while the entry is trackable.
+    // The frame's position is the register's only while the entry is trackable. So is `.`:
+    // a passthrough of it is a passthrough of the register only there (#4118). On an
+    // untracked stage `.` is whatever the stage computed, so a source that mixes a bare `.`
+    // with a `$var` marker (`if true then $v0 else . end`) hands the register back on one
+    // branch and not the other; a source of either kind alone is one thing throughout.
     S::TAG == EvalTag::Jq
-        && !identity_passthrough(source, true)
+        && !(identity_passthrough(source, true)
+            && (trackable
+                || !(mentions_marker(source)
+                    && any_subexpr(source, &mut |e| matches!(e, Expr::Identity)))))
         && may_alias_register(source, trackable.then_some(frame))
 }
 
@@ -58456,7 +58464,12 @@ fn substitute_bound_var_at(
     wide: bool,
     keep_container_identity: bool,
 ) -> Expr {
-    let origin = if identity_passthrough(bind_expr, wide) {
+    let origin = if matches!(origin, Some(Origin::Unproven)) {
+        // #4118: the caller found the bound value may be the register by pointer and could
+        // not certify it (an untracked stage, where a passthrough of `.` is not the
+        // register's); the passthrough grammar would mint it a position instead.
+        Origin::Unproven
+    } else if identity_passthrough(bind_expr, wide) {
         debug_assert!(
             matches!(
                 identity_at,
