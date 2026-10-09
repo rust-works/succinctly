@@ -121753,3 +121753,49 @@ fn test_swallowed_iteration_in_path_consumers_answers_what_it_did_3728() -> Resu
         ("[tru]", "[.[] | paths(.[]?)]", "", "invalid boolean", 5),
     ])
 }
+
+/// #4146: `error(msg)`'s message runs in path mode (`def error(msg): msg | error;`), so a
+/// message that navigates an input the register is not on raises jq's path error ahead of
+/// the `error`, and a `try` hands its handler that string, not the value the message would
+/// have read. By value the payload was `false`/`null`, identical to the register, so
+/// `path(.a? or try error(.c) catch .)` printed `["a"]` where jq exits 5. Every row
+/// captured live from jq 1.7.1.
+#[test]
+fn test_error_message_navigation_is_path_checked_4146() -> Result<()> {
+    for (program, doc, message) in [
+        (
+            "path(.a? or try error(.c) catch .)",
+            r#"{"a":false,"c":null}"#,
+            "Invalid path expression with result true",
+        ),
+        (
+            "path({\"c\":false} | try error(.c) catch .)",
+            r#"{"a":false,"c":null}"#,
+            "Invalid path expression with result \"Invalid path expression",
+        ),
+        (
+            "path(.a, ({\"c\":false} | try error(.c | tostring) catch .))",
+            r#"{"a":false,"c":null}"#,
+            "Invalid path expression with result \"Invalid path expression",
+        ),
+    ] {
+        let (_, err, code) = run_jq_full(&["-c", "--", program], Some(doc))?;
+        assert_eq!(code, 5, "#4146: `{program}`: stderr {err:?}");
+        assert!(err.contains(message), "#4146: `{program}`: {err:?}");
+    }
+    // A tracked entry navigates the message natively, and a message that does not
+    // navigate is unchanged.
+    for (program, doc, want) in [
+        ("path(.c | error(.x)?)", r#"{"a":false,"c":null}"#, ""),
+        (
+            "path(. as $x | {\"c\":1} | try error(.c) catch $x)",
+            r#"{"a":false,"c":null}"#,
+            "[]\n",
+        ),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", "--", program], Some(doc))?;
+        assert_eq!(code, 0, "#4146: `{program}`: stderr {err:?}");
+        assert_eq!(out, want, "#4146: `{program}`");
+    }
+    Ok(())
+}

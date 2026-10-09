@@ -42560,6 +42560,18 @@ fn resolve_leaf_sink<'a, S: EvalSemantics>(
     }
 }
 
+/// The element of the first navigation step of `error(msg)`'s message, if it has one
+/// (#4146): `error(.c)`, `error(.c | tostring)`.
+fn error_message_first_navigation(expr: &Expr) -> Option<OwnedValue> {
+    let Expr::Error(Some(message)) = expr else {
+        return None;
+    };
+    match unwrap_paren(message) {
+        Expr::Pipe(stages) => stages.first().and_then(navigation_element),
+        other => navigation_element(other),
+    }
+}
+
 /// [`resolve_leaf`]'s bounded prefix: the shapes that produce at most one
 /// branch without consuming a generator -- an untrackable navigation
 /// refusal, an untracked `.`, and the `is_primitive` family. `None` means
@@ -42619,6 +42631,21 @@ fn resolve_leaf_bounded<'a, S: EvalSemantics>(
                 Expr::Builtin(Builtin::UpperIndex(_) | Builtin::Transpose)
             )
         {
+            // #4146: `def error(msg): msg | error;` -- the message runs in path mode, so a
+            // message that navigates raises jq's path error ahead of the `error`, and that
+            // string (not the value the message would have read) is what a `try` catches.
+            if S::TAG == EvalTag::Jq {
+                if let Some(element) = error_message_first_navigation(expr) {
+                    return Some(Err((
+                        Vec::new(),
+                        refuse(
+                            EvalError::invalid_path_expression_near_access(&element, value),
+                            NavKind::of(&element),
+                        )
+                        .into(),
+                    )));
+                }
+            }
             if let Expr::Builtin(builtin) = expr {
                 match builtin_navigation::<S>(builtin, value) {
                     Ok(Some(navigation)) => {
