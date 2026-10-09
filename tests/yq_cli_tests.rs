@@ -13138,11 +13138,14 @@ fn test_err_unexpected_char_remaining_call_sites_1187() -> Result<()> {
         "must reach parse_mapping_entry, not parse_compact_mapping_entry: {stderr}"
     );
 
-    // `parse_implicit_flow_mapping_entry`: a `!tag` prefix on a bare
-    // `key: value` pair inside `[...]` -- the real tag scanner swallows the
-    // first `:` as part of the tag suffix, so the *second* `:` this
-    // function expects is missing.
-    let (_, stderr, code) = run_yq_stdin_with_stderr(".", "x: [!a: 1]\n", &["-o", "json", "-I0"])?;
+    // `parse_implicit_flow_mapping_entry`: an anchor followed by a comment
+    // that swallows the rest of the line (`&a #c : ]`). The lookahead skips the
+    // anchor and sees the `:` inside the comment, so it approves a pair; the
+    // real parse skips the comment and finds the `:` missing. (This used to be
+    // `x: [!a: 1]`, but that is valid YAML -- `!a:` is a tag, the element the
+    // scalar `1` -- and yq accepts it; #4081's lookahead now skips the tag.)
+    let (_, stderr, code) =
+        run_yq_stdin_with_stderr(".", "x: [&a #c : ]\n", &["-o", "json", "-I0"])?;
     assert_ne!(code, 0);
     assert!(
         stderr.contains("expected ':' in implicit flow mapping entry"),
