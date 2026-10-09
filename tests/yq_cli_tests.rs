@@ -60967,3 +60967,32 @@ fn test_del_of_a_root_variable_keeps_the_document_3244() -> Result<()> {
     assert_eq!((out.trim(), code), ("null", 0));
     Ok(())
 }
+
+/// Pinned yq v4.53.3: `@uri` is Go's `url.QueryEscape` and `@urid` is `url.QueryUnescape`, so a
+/// space is `+` and `+` is a space (#4204). jq's `@uri` writes `%20` and its `@urid` keeps a
+/// literal `+`. Every yq row was captured from the pinned binary, `-n -o=json -I=0`.
+#[test]
+fn test_uri_uses_plus_for_space_like_query_escape_4204() -> Result<()> {
+    let args = &["-n", "-o=json", "-I=0"];
+    for (filter, expected) in [
+        (r#""hello world" | @uri"#, r#""hello+world""#),
+        (r#""é ü" | @uri"#, r#""%C3%A9+%C3%BC""#),
+        (r#""a  b" | @uri"#, r#""a++b""#),
+        (r#""a+b" | @uri"#, r#""a%2Bb""#),
+        (
+            r#""a b/c?d&e=f~g-h_i.j!k*l'm(n)o" | @uri"#,
+            r#""a+b%2Fc%3Fd%26e%3Df~g-h_i.j%21k%2Al%27m%28n%29o""#,
+        ),
+        (r#""a+b" | @urid"#, r#""a b""#),
+        (r#""a+b%2Bc" | @urid"#, r#""a b+c""#),
+        (r#""a%20b" | @urid"#, r#""a b""#),
+        (r#""a b" | @uri | @urid"#, r#""a b""#),
+    ] {
+        let (out, code) = run_yq_stdin(filter, "", args)?;
+        assert_eq!((out.trim(), code), (expected, 0), "{filter}");
+    }
+    // jq mode is unchanged: `%20`, and `+` stays literal on the way back.
+    let (out, code) = run_jq_stdin("@uri, (@uri | @urid)", r#""a b+c""#, &["-r"])?;
+    assert_eq!((out.as_str(), code), ("a%20b%2Bc\na b+c\n", 0));
+    Ok(())
+}
