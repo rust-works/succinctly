@@ -122202,3 +122202,93 @@ fn test_path_f_stage_leaves_register_4118() -> Result<()> {
         ),
     ])
 }
+
+/// #4163: `nth(n)` is jq's `.[n]` (`def nth($n): .[$n];`), so a position read through it names the
+/// same node, key and path as the bracket, including a negative index -- where `nth(-1) | key` used
+/// to answer `-1` and `.[-1] | key` answers the resolved index. Rows 1-3 are jq 1.7.1's own
+/// values; `key` is a succinctly builtin, so those rows pin the equality with `.[n]`.
+#[test]
+fn test_nth_reads_the_same_position_as_the_bracket_4163() -> Result<()> {
+    for doc in [
+        "[10,20,30]",
+        r#"[{"a":1},{"a":2},{"a":3}]"#,
+        r#"{"a":[10,20,30],"b":2}"#,
+    ] {
+        for (nth, bracket) in [
+            ("nth(1)", ".[1]"),
+            ("nth(-1)", ".[-1]"),
+            ("nth(5)", ".[5]"),
+            ("nth(1.5)", ".[1.5]"),
+            ("nth(0,2)", ".[0,2]"),
+            (r#"nth("a")"#, r#".["a"]"#),
+            ("nth(null)", ".[null]"),
+        ] {
+            for tail in [
+                "",
+                " | key",
+                " | tostring | key",
+                " | path",
+                " | tostring | path",
+                " | [key]",
+                " | .. | key",
+            ] {
+                let by_nth = run_jq_stdin(&format!("[{nth}{tail}]"), doc, &["-c"])?;
+                let by_bracket = run_jq_stdin(&format!("[{bracket}{tail}]"), doc, &["-c"])?;
+                assert_eq!(by_nth, by_bracket, "{doc}: {nth}{tail}");
+            }
+            let by_nth = run_jq_stdin(&format!("[path({nth})]"), doc, &["-c"])?;
+            let by_bracket = run_jq_stdin(&format!("[path({bracket})]"), doc, &["-c"])?;
+            assert_eq!(by_nth, by_bracket, "{doc}: path({nth})");
+        }
+    }
+    // The read-modify-write and error shapes route through the same arms.
+    for (nth, bracket) in [
+        ("[nth(1)?]", "[.[1]?]"),
+        ("nth(1) |= 9", ".[1] |= 9"),
+        ("nth(-1) = 7", ".[-1] = 7"),
+        ("del(nth(0))", "del(.[0])"),
+    ] {
+        let doc = "[10,20,30]";
+        assert_eq!(
+            run_jq_stdin(nth, doc, &["-c"])?,
+            run_jq_stdin(bracket, doc, &["-c"])?,
+            "{nth} vs {bracket}"
+        );
+    }
+    for filter in [r#"[nth("a")?]"#, r#"try nth(error("x")) catch ."#] {
+        let (_out, code) = run_jq_stdin(filter, "[10,20,30]", &["-c"])?;
+        assert_eq!(code, 0, "{filter}");
+    }
+    // `nth` is yq surface only behind `--jq-extensions`, over the same arms.
+    for (filter, bracket) in [
+        ("[nth(1)]", "[.[1]]"),
+        ("[nth(-1)]", "[.[-1]]"),
+        ("nth(-1) | key", ".[-1] | key"),
+        ("nth(1) | tostring | key", ".[1] | tostring | key"),
+        ("[nth(5)]", "[.[5]]"),
+    ] {
+        let yq = |filter: &str| -> Result<(String, i32)> {
+            let (output, code) = spawn_with_signal_retry(
+                || {
+                    let mut cmd = Command::new(succinctly_bin());
+                    cmd.args(["yq", "--jq-extensions", "-o=json", "-I=0", filter]);
+                    cmd
+                },
+                Some(b"- 10\n- 20\n- 30\n"),
+            )?;
+            Ok((String::from_utf8(output.stdout)?, code))
+        };
+        assert_eq!(yq(filter)?, yq(bracket)?, "yq: {filter}");
+    }
+    // The values themselves, from jq 1.7.1.
+    assert_eq!(
+        run_jq_stdin("[nth(-1), nth(1), nth(0,2)]", "[10,20,30]", &["-c"])?,
+        ("[30,20,10,30]\n".to_string(), 0)
+    );
+    // And the position: the last element's key is its resolved index.
+    assert_eq!(
+        run_jq_stdin("nth(-1) | key", "[10,20,30]", &["-c"])?,
+        ("2\n".to_string(), 0)
+    );
+    Ok(())
+}
