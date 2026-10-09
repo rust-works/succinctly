@@ -5289,15 +5289,17 @@ fn split_comma_stage(body: &Expr) -> Option<(&[Expr], &[Expr], &[Expr])> {
     };
     // The structural test first: most pipes have no `,` stage, and the
     // predicate walks every stage.
-    let at = stages
-        .iter()
-        .position(|stage| matches!(unwrap_paren(stage), Expr::Comma(_)))?;
+    let (at, branches) =
+        stages
+            .iter()
+            .enumerate()
+            .find_map(|(at, stage)| match unwrap_paren(stage) {
+                Expr::Comma(branches) => Some((at, branches)),
+                _ => None,
+            })?;
     if at == 0 || !stages.iter().all(array_route_stage_is_pure_navigation) {
         return None;
     }
-    let Expr::Comma(branches) = unwrap_paren(&stages[at]) else {
-        return None; // patchcov: coverage tolerate-line reason="unreachable: `position` just found a `Comma` at this index (#3922)"
-    };
     Some((&stages[..at], branches.as_slice(), &stages[at + 1..]))
 }
 
@@ -46683,12 +46685,11 @@ mod tests {
                 ]),
             ] {
                 assert!(seq.holds_only_nodes(), "{doc}");
-                match seq.materialize_atomic::<JqSemantics>() {
-                    Err(Control::Error(e)) => {
-                        assert!(e.is_uncatchable_at_value_position(), "{doc}: {e:?}");
-                    }
-                    other => panic!("{doc}: expected a decode failure, got {other:?}"),
-                }
+                let result = seq.materialize_atomic::<JqSemantics>();
+                assert!(
+                    matches!(&result, Err(Control::Error(e)) if e.is_uncatchable_at_value_position()),
+                    "{doc}: expected an uncatchable decode failure, got {result:?}"
+                );
             }
         }
     }
@@ -47972,13 +47973,42 @@ mod tests {
         assert_eq!(split("[((., .))? | .a]"), None);
     }
 
+    /// #3922: only a sequence of nodes with nothing left to compute is handed
+    /// on unforced; any other source, or a pending `map`, is forced as before.
+    #[test]
+    fn test_holds_only_nodes_declines_other_sequences_3922() {
+        type Seq<'a> = LazySeq<crate::json::light::StandardJson<'a, Vec<u64>>>;
+        let doc = b"[1,2]";
+        let index = JsonIndex::build(doc);
+        assert!(!Seq::new(LazySource::IndexRange { next: 0, len: 2 }).holds_only_nodes());
+        let node = index.root(doc).first_child().expect("one element");
+        assert!(Seq::from_cursors(alloc::vec![node]).holds_only_nodes());
+    }
+
+    /// #3922: a raise out of a branch (or the `tail`) of a `,` stage becomes
+    /// the array's failure, whether the prefix answered one node or many.
+    #[test]
+    fn test_comma_stage_array_raise_3922() {
+        let doc = r#"{"a":"s","b":"t"}"#;
+        for query in ["[.a | ., .x]", "[.[] | ., .x]"] {
+            let index = JsonIndex::build(doc.as_bytes());
+            let expr = crate::jq::parse(query).unwrap();
+            let result =
+                eval_with_cursor_using::<JqSemantics, _>(&expr, index.root(doc.as_bytes()));
+            assert!(
+                matches!(result, GenericResult::Error(_)),
+                "{query}: not an error"
+            );
+        }
+    }
+
     /// #3922: which bodies [`split_comma_stage`] takes. A `,` that heads the
     /// pipe is [`split_comma_head`]'s, so the two never both answer.
     #[test]
     fn test_split_comma_stage_3922() {
         let body = |query: &str| match crate::jq::parse(query).unwrap() {
             Expr::Array(inner) => *inner,
-            other => panic!("`{query}` is not an array construction: {other:?}"),
+            other => other,
         };
         let split = |query: &str| {
             split_comma_stage(&body(query))
@@ -47996,6 +48026,7 @@ mod tests {
         assert_eq!(split("[(., .) | .a]"), None);
         assert!(split_comma_head(&body("[(., .) | .a]")).is_some());
         // No pipe, no `,` stage, a computed stage anywhere, or a `,` under a `?`.
+        assert_eq!(split("1, 2"), None);
         assert_eq!(split("[., .]"), None);
         assert_eq!(split("[.[] | .a]"), None);
         assert_eq!(split("[.[] | (., 1)]"), None);
