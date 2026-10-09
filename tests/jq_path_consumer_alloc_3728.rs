@@ -225,3 +225,55 @@ fn the_streaming_entry_reaches_the_same_shortcuts_3728() {
         }
     }
 }
+
+/// A lone leaf in `path(f)` (`//`, `first`, `try`) is resolved by the path
+/// resolver, which the cursor walkers decline to (#4155). It cloned the whole
+/// expression to flatten it, evaluated a `.` over a scalar to clone it back out,
+/// and walked the empty path it resolved to: about 12 allocator calls per scalar
+/// for `. // .` against `path(.)`'s 3. Each row is bounded against that twin, and
+/// each shortcut has a row that fails with only that shortcut deleted:
+///
+/// - the lazy flatten: `first(.a?)` and `try .a catch empty` would clone the
+///   expression, and `. // .` its two boxes;
+/// - the scalar `.`: `. // .` would evaluate and clone the member;
+/// - the empty-path short circuit: `. // .` would build a trail and a walk list;
+/// - the deferred component clone: `.a?` over a scalar would clone `a` for a
+///   lookup that finds nothing.
+#[test]
+fn a_lone_leaf_in_path_f_is_resolved_without_cloning_or_walking_4155() {
+    // Emits the empty path for every member: the twin's walker emits it too, so
+    // the allowance is the resolver's own per-call state (a branch list, a prefix
+    // root) and the copy of the member it resolves against.
+    assert_rows_like_twin(&[(
+        "[.[] | path(. // .)] | length",
+        "[.[] | path(.)] | length",
+        N as i64,
+        5,
+    )]);
+
+    // `.a` over an integer or a string reaches nothing, so these emit no path and
+    // only the lookup's own error is allowed on top. A `null` member would
+    // answer `["a"]`, so the booleans-and-nulls document is left out.
+    for (name, json) in fixtures().into_iter().take(2) {
+        for swallowed in [
+            "[.[] | path(first(.a?))] | length",
+            "[.[] | path(try .a catch empty)] | length",
+            "[.[] | path(.a? // .)] | length",
+        ] {
+            let (cost, answered) = allocations_collecting(swallowed, &json);
+            let reaches = if swallowed.contains("//") {
+                N as i64
+            } else {
+                0
+            };
+            assert_eq!(answered, reaches, "{name}: `{swallowed}`'s answer");
+            let (twin_cost, _) = allocations_collecting("[.[] | path(.)] | length", &json);
+            assert_costs_like_twin(
+                name,
+                (swallowed, cost),
+                ("[.[] | path(.)] | length", twin_cost),
+                7,
+            );
+        }
+    }
+}

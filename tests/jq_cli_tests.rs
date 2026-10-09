@@ -114956,6 +114956,100 @@ fn test_path_f_swallowed_scalar_iteration_answers_what_it_did_3722() -> Result<(
     Ok(())
 }
 
+/// #4155: the path resolver's shortcuts for a lone leaf (`//`, `first`, `try`)
+/// answer what they did. A `.` over a scalar is borrowed instead of evaluated, the
+/// flattened components are built only where a trailing iterate or a found value
+/// reads them, and a resolution that names the document itself skips the walk.
+///
+/// Every row is jq 1.7.1's own. The scalar members cover each falsy and truthy
+/// kind, since `//` decides on them, and the document rows pin the trailing
+/// `.[]` deferral (#888) the lazy flatten still has to take.
+#[test]
+fn test_path_f_lone_leaf_resolution_answers_what_it_did_4155() -> Result<()> {
+    const MIXED: &str = r#"[1,"a",null,false,[2],{"k":3}]"#;
+    const DOC: &str = r#"{"a":[1,[2]],"b":null}"#;
+    assert_path_rows_3289(&[
+        (
+            MIXED,
+            "[.[] | path(. // .)]",
+            "[[],[],[],[],[],[]]\n",
+            "",
+            0,
+        ),
+        (
+            MIXED,
+            "[.[] | path(.a? // .)]",
+            "[[],[],[],[],[],[]]\n",
+            "",
+            0,
+        ),
+        (
+            MIXED,
+            "[.[] | path(first(.a?))]",
+            "[[\"a\"],[\"a\"]]\n",
+            "",
+            0,
+        ),
+        (
+            MIXED,
+            "[.[] | path(try .a catch empty)]",
+            "[[\"a\"],[\"a\"]]\n",
+            "",
+            0,
+        ),
+        (MIXED, "[.[] | path(. // empty)]", "[[],[],[],[]]\n", "", 0),
+        (
+            MIXED,
+            "[.[] | path(first(.))]",
+            "[[],[],[],[],[],[]]\n",
+            "",
+            0,
+        ),
+        (
+            MIXED,
+            "[.[] | path(try . catch empty)]",
+            "[[],[],[],[],[],[]]\n",
+            "",
+            0,
+        ),
+        (
+            MIXED,
+            "[.[] | path(.[0]? // .)]",
+            "[[],[],[],[],[0],[]]\n",
+            "",
+            0,
+        ),
+        (MIXED, "[path(. // .)]", "[[]]\n", "", 0),
+        (MIXED, "[limit(1; path(. // .))]", "[[]]\n", "", 0),
+        // A trailing iterate is still deferred out of the flattened components.
+        (MIXED, "[path(.[] // .)]", "[[0],[1],[4],[5]]\n", "", 0),
+        (MIXED, "[path(first(.[]))]", "[[0]]\n", "", 0),
+        (
+            MIXED,
+            "[path((.[])?)]",
+            "[[0],[1],[2],[3],[4],[5]]\n",
+            "",
+            0,
+        ),
+        (
+            MIXED,
+            "[.[] | path((. // .) | .[]?)]",
+            "[[0],[\"k\"]]\n",
+            "",
+            0,
+        ),
+        (DOC, "[path(.a[])]", "[[\"a\",0],[\"a\",1]]\n", "", 0),
+        (DOC, "[path((.a[])?)]", "[[\"a\",0],[\"a\",1]]\n", "", 0),
+        (DOC, "[path(.a[]?)]", "[[\"a\",0],[\"a\",1]]\n", "", 0),
+        (DOC, "[path(.a[] // .b)]", "[[\"a\",0],[\"a\",1]]\n", "", 0),
+        (DOC, "[path(.b // .a)]", "[[\"a\"]]\n", "", 0),
+        (DOC, "[path(.b // .b)]", "[[\"b\"]]\n", "", 0),
+        (DOC, "[path(.a | . // .)]", "[[\"a\"]]\n", "", 0),
+        (DOC, "[path(.a[1] | .[]? // .)]", "[[\"a\",1,0]]\n", "", 0),
+        (DOC, "[path(first(.a[]))]", "[[\"a\",0]]\n", "", 0),
+    ])
+}
+
 // ============================================================================
 // #3789: a foreach whose bound element is an empty array must answer its
 // path through `$k`
