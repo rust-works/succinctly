@@ -1230,6 +1230,47 @@ Two things this buys that a profile does not:
 Report the fitted model alongside the measurements in the commit message and PR, not just in your
 own head — "the model fits all seven widths within 3%" is what makes a diagnosis reviewable.
 
+### 11. Attribute an allocation count to call sites — and keep the sampler honest
+
+`examples/alloc_probe_3022.rs` says how many allocator calls one evaluation makes; it cannot say
+where they come from. `examples/alloc_sites_3728.rs` can: it records a backtrace for every
+`period`th allocator call inside the counted window and groups the samples by their first few
+`succinctly::` frames. #3728 found its attribution this way.
+
+```bash
+CARGO_PROFILE_RELEASE_DEBUG=1 CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+CARGO_TARGET_DIR=target/sites \
+    cargo build --release --example alloc_sites_3728
+target/sites/release/examples/alloc_sites_3728 <file.json> '<query>' [period=37] [frames=3]
+```
+
+On #4157's row, `[.[] | path(.[])?] | length` over 2,000 integers (`frames=1`), it reports
+`allocs=14013` (`alloc_probe_3022`: 14,014) and six sites: 28.6% in `error::describe_with` and
+14.3% each in `cannot_iterate_with`, `PreviewSink::new`, `PathTrail::root`,
+`OwnedValue::from_number_literal` and `strip_insignificant_leading_zero_and_plus` — the message
+formatting an outer `?` then drops, 7 allocations per member. Three properties of the tool matter
+when you read a result:
+
+- **Build it for attribution, not for timing.** The shipped profile (fat LTO, one codegen unit, no
+  debug info) gives no `file:line`, and a callee inlined into its caller is not a frame, so its
+  allocations are attributed to the caller. Use the build above in a separate `CARGO_TARGET_DIR`;
+  its counts can differ slightly from the shipped binary's, so take the headline number from
+  `alloc_probe_3022` and use the sampler only for the *shares*.
+- **The re-entrancy guard is checked before the sampling counter advances.** Capturing a backtrace
+  allocates. If those calls advance the counter too, `allocs` is inflated — 255,740 against 14,013
+  on the row above — and the samples lock onto the phase the counter lands on after each capture:
+  at period 37 two of the six sites take 99.9% of the samples (`describe_with` 66.6%,
+  `cannot_iterate_with` 33.3%), at period 101 four sites take about 25% each, and with the guard
+  first the shares stay within a point of 28.6/14.3% at every period. Two cheap checks that the sampler is sound: `allocs`
+  is within a call or two of `alloc_probe_3022`'s count (14,013 against 14,014 above; the probe also
+  renders the answer), and `period=1` returns one sample per allocation (`samples == allocs`) with
+  the same shares as `period=37`.
+- **Pick a prime period, and read two.** A pattern that repeats every `k` allocator calls is
+  sampled at a fraction of its sites when the period shares a factor with `k` (the row above
+  allocates seven times per element: `period=7` or `14` puts 100% of the samples on
+  `PreviewSink::new`). Agreement between two coprime periods is the evidence; one period agreeing
+  with itself is not.
+
 ### Building both halves on a remote box
 
 A source-only tarball plus a reverse patch of the commit under test is enough, with no pushing:
