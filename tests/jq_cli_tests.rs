@@ -62148,6 +62148,18 @@ fn test_try_body_raising_something_else_keeps_refusing_the_handler_4019() -> Res
             "#4019: `{program}`: {stderr:?}"
         );
     }
+    // A frozen `$x` raised from a stage that stepped off its node is the document, not the
+    // register (`.a`): seeding the handler as the register answered `["a","b"]` for it.
+    let program = "path(. as $x | .a | try error($x) catch .b)";
+    let doc = r#"{"a":{"b":1}}"#;
+    let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(doc))?;
+    assert_eq!(code, 5, "#4019: `{program}`: stdout {stdout:?}");
+    assert!(
+        stderr.contains(
+            r#"Invalid path expression near attempt to access element "b" of {"a":{"b":1}}"#
+        ),
+        "#4019: `{program}`: {stderr:?}"
+    );
     Ok(())
 }
 
