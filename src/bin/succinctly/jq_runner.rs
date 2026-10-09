@@ -4397,7 +4397,18 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
             // `values`' end offsets are non-decreasing (find_json_values is
             // a single left-to-right scan), so one LineCounter shared across
             // every value in this file keeps the whole loop O(n) (#1213).
-            let mut line_counter = LineCounter::new(raw);
+            // `locator` wraps it and must be asked for non-decreasing `end`s.
+            //
+            // jq names the line the input value ends on, counted in the whole
+            // file rather than in this value's slice. The M2 fast path never
+            // reads it, so it is resolved only if that path reports an error
+            // (#4160); the general path below resolves it up front because it
+            // hands `&InputLocation` to the evaluator.
+            let mut locator = ValueLocator::new(
+                raw,
+                filename.as_deref(),
+                slurped.as_ref().map(|slurped| slurped.eof_line),
+            );
             for (start, end) in values {
                 let json_bytes = &raw[start..end];
 
@@ -4419,16 +4430,6 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
 
                 // Slow path: build index and evaluate expression
                 let index = JsonIndex::build(json_bytes);
-                // jq names the line the input value ends on, counted in the
-                // whole file rather than in this value's slice.
-                // A slurped array names its last source's EOF line, not a line
-                // in the synthesized buffer (#1520, `InputLocations::slurp_eof`).
-                let line = match &slurped {
-                    Some(slurped) => slurped.eof_line,
-                    None => line_counter.advance_to(end),
-                };
-                let at = InputLocation::at(filename.as_deref(), line);
-
                 // #1576: the M2 fast path, mirroring `yq_runner.rs`'s own
                 // (`can_use_m2_streaming`/`GenericResult::stream_json`) but
                 // scoped to jq's own atomicity contract for array
@@ -4471,7 +4472,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                             let Some(message) = nesting_depth_panic_message(&*payload) else {
                                 std::panic::resume_unwind(payload);
                             };
-                            sink.report(DiagStyle::Jq, &EvalError::new(message), &at);
+                            sink.report(DiagStyle::Jq, &EvalError::new(message), &locator.at(end));
                             true
                         }
                     };
@@ -4485,6 +4486,9 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                     // Else: fall through to the general path just below,
                     // for this one document only.
                 }
+
+                // The general path reads the location in several places below.
+                let at = locator.at(end);
 
                 // A builtin with no native lazy fast path (`sort`, `join`,
                 // ...) falls back to a full `to_owned_cursor` materialization
@@ -6164,16 +6168,78 @@ impl<'a> LineCounter<'a> {
             end >= self.pos,
             "LineCounter::advance_to called with a smaller end than a previous call"
         );
-        self.newlines_before_pos += self.bytes[self.pos..end]
-            .iter()
-            .filter(|&&b| b == b'\n')
-            .count();
+        self.newlines_before_pos += count_newlines(&self.bytes[self.pos..end]);
         self.pos = end;
         let mut count = self.newlines_before_pos;
         if self.bytes.get(end) == Some(&b'\n') {
             count += 1;
         }
         count
+    }
+}
+
+/// Number of `\n` bytes in `bytes` (#4160).
+///
+/// Fixed-width chunks with a `u8` accumulator rather than
+/// `iter().filter().count()`: a chunk holds at most 64 newlines, so the
+/// accumulator cannot overflow, and the inner loop is a plain compare-and-add
+/// over a constant trip count that LLVM turns into vector code on every
+/// target without per-architecture intrinsics. The `filter` form kept a
+/// scalar `usize` counter live across the whole span, which is the term the
+/// #4160 profile attributed to `LineCounter::advance_to` on a 2 MB document.
+///
+/// That it vectorizes is measured end to end (#4172), not pinned: no test or
+/// guard row fails if a toolchain or a change to the fold stops LLVM doing so,
+/// so a re-measurement is the check if this ever reads slower.
+fn count_newlines(bytes: &[u8]) -> usize {
+    let mut chunks = bytes.chunks_exact(64);
+    let mut total = 0usize;
+    for chunk in &mut chunks {
+        total += usize::from(
+            chunk
+                .iter()
+                .fold(0u8, |n, &b| n.wrapping_add(u8::from(b == b'\n'))),
+        );
+    }
+    total + chunks.remainder().iter().filter(|&&b| b == b'\n').count()
+}
+
+/// Per-value input location for the default document loop, resolved on
+/// demand (#4160).
+///
+/// The line a value ends on is only ever read by a diagnostic (an evaluation
+/// error, a write error, a depth panic report), and the M2 fast path never
+/// reads it at all, so counting newlines up to every value's end up front
+/// charged a full pass over the document to runs that report nothing.
+/// [`LineCounter::advance_to`] counts from wherever the previous resolution
+/// stopped, so a value whose location is never asked for costs nothing and
+/// the next one that is asked for picks up its bytes: the whole loop stays
+/// O(n) and every resolved line equals what an eager call per value gave.
+/// `end` offsets must be non-decreasing across calls, as the splitter's are.
+struct ValueLocator<'a> {
+    counter: LineCounter<'a>,
+    filename: Option<&'a str>,
+    /// A slurped array names its last source's EOF line, not a line in the
+    /// synthesized buffer (#1520).
+    slurp_eof: Option<usize>,
+}
+
+impl<'a> ValueLocator<'a> {
+    fn new(raw: &'a [u8], filename: Option<&'a str>, slurp_eof: Option<usize>) -> Self {
+        Self {
+            counter: LineCounter::new(raw),
+            filename,
+            slurp_eof,
+        }
+    }
+
+    /// The location of the value whose exclusive end offset is `end`.
+    fn at(&mut self, end: usize) -> InputLocation {
+        let line = match self.slurp_eof {
+            Some(eof_line) => eof_line,
+            None => self.counter.advance_to(end),
+        };
+        InputLocation::at(self.filename, line)
     }
 }
 
@@ -6193,7 +6259,7 @@ impl<'a> LineCounter<'a> {
 /// per call becomes an O(n^2) loop (#1213).
 fn line_at(bytes: &[u8], end: usize) -> usize {
     let end = end.min(bytes.len());
-    let mut count = bytes[..end].iter().filter(|&&b| b == b'\n').count();
+    let mut count = count_newlines(&bytes[..end]);
     if bytes.get(end) == Some(&b'\n') {
         count += 1;
     }
@@ -10725,6 +10791,63 @@ mod tests {
         assert_eq!(counter.advance_to(1), 0); // "1" ends before any '\n'
         assert_eq!(counter.advance_to(3), 1); // "2" ends right before the '\n'
         assert_eq!(counter.advance_to(5), 1); // "3" ends at EOF, no lookahead
+    }
+
+    /// #4160: the chunked count must equal the naive one at every length
+    /// around the 64-byte chunk boundary, for a buffer with no newline, one
+    /// that is all newlines (the accumulator's worst case) and a mixed one --
+    /// each also offset by one byte so the chunks are not aligned to the
+    /// slice start.
+    #[test]
+    fn test_count_newlines_matches_naive_around_chunk_boundaries_4160() {
+        let naive = |b: &[u8]| b.iter().filter(|&&c| c == b'\n').count();
+        for len in 0..=300usize {
+            let none = vec![b'x'; len];
+            let all = vec![b'\n'; len];
+            let mixed: Vec<u8> = (0..len)
+                .map(|i| if i % 7 == 3 { b'\n' } else { b'a' })
+                .collect();
+            for buf in [&none, &all, &mixed] {
+                assert_eq!(count_newlines(buf), naive(buf), "len={len}");
+                if len > 0 {
+                    assert_eq!(count_newlines(&buf[1..]), naive(&buf[1..]), "len={len} +1");
+                }
+            }
+            assert_eq!(count_newlines(&all), len, "all-newline len={len}");
+        }
+    }
+
+    /// #4160: resolving only some values' locations (the M2 fast path never
+    /// resolves one) must give each resolved value the line an eager call per
+    /// value gave, because the next resolution counts the bytes the skipped
+    /// values covered.
+    #[test]
+    fn test_value_locator_skipped_values_match_line_at_4160() {
+        let bytes = b"1\n2\n{\n\"a\":1\n}\n3\n";
+        let ends: Vec<usize> = find_json_values(bytes)
+            .unwrap()
+            .into_iter()
+            .map(|(_, end)| end)
+            .collect();
+        for mask in 0..(1u32 << ends.len()) {
+            let mut locator = ValueLocator::new(bytes, Some("f.json"), None);
+            for (i, &end) in ends.iter().enumerate() {
+                if mask & (1 << i) == 0 {
+                    continue;
+                }
+                let at = locator.at(end);
+                assert_eq!(at.line, Some(line_at(bytes, end)), "mask={mask} end={end}");
+                assert_eq!(at.file.as_deref(), Some("f.json"));
+            }
+        }
+    }
+
+    /// #4160: a slurped array names the last source's EOF line whatever the
+    /// synthesized buffer holds (#1520), and never touches the counter.
+    #[test]
+    fn test_value_locator_slurp_uses_eof_line_4160() {
+        let mut locator = ValueLocator::new(b"[1,\n2]", None, Some(9));
+        assert_eq!(locator.at(7).line, Some(9));
     }
 
     #[test]

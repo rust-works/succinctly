@@ -449,6 +449,18 @@ QUERY_THRESHOLDS = {
     "wide_identity": 10.0,
     "users_identity": 10.0,
     "users_compact_latefail": 10.0,
+    # `users_keys_unsorted`, `arrays_first_map_iterate` (#4160): the default
+    # document loop no longer counts newlines up to a value's end for a
+    # location the M2 fast path never reads, and counts the ones it still
+    # needs in 64-byte chunks. These two rows run a small document to a
+    # short result, so the per-document line count is a large share of them
+    # (x86_64 -9.4% / -7.0%, ARM64-Linux -6.1% / -3.6% Ir against the PR's
+    # own merge-base; -5.0% is the default threshold). 12.0 and 10.0 leave
+    # headroom over the measured x86_64 drift without hiding a real
+    # regression. One-off: remove these entries once the change is in `main`
+    # and the rows read ~0% again.
+    "users_keys_unsorted": 12.0,
+    "arrays_first_map_iterate": 10.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
