@@ -43166,10 +43166,10 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
                         }
                         match after {
                             AfterVerdict::Stop => Demand::Stop,
-                            // The retry ran dry: `gen` runs on, unless the consumer's
-                            // stop was one no retry passes.
-                            AfterVerdict::Resume if delivery.runs_on() => Demand::Continue,
-                            AfterVerdict::Resume => Demand::Stop,
+                            // The retry ran dry: `gen` runs on. A consumer stop no retry
+                            // passes never gets here: with no retry to supersede it, the
+                            // probe says `Stop`.
+                            AfterVerdict::Resume => Demand::Continue,
                             // The retry's raise follows the answers: a refused one is
                             // superseded by it, a valid path is printed first.
                             AfterVerdict::Raise(control) => {
