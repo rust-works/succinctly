@@ -44556,6 +44556,12 @@ fn patterns_all_bare(patterns: &[Pattern]) -> bool {
 /// the weaker [`reduce_leaves_register_in_place`], which admits a navigating
 /// source and `UPDATE`, so this one now only answers [`cannot_move_register`]
 /// (and the `foreach` twin), where "navigates nothing" is the claim.
+///
+/// Its `patterns_all_bare` conjunct is load-bearing for that claim and is **not** the
+/// one [`reduce_leaves_register_in_place`] dropped (#4048): "navigates nothing" is also
+/// what [`resolve_from_restored_input`] reads, where a register that is not on the input
+/// is never checked, and a destructuring pattern's steps are checked there. Do not align
+/// the two.
 fn reduce_cannot_move_register(
     patterns: &[Pattern],
     input: &Expr,
@@ -50597,9 +50603,6 @@ fn resolve_reduce<'a, S: EvalSemantics>(
     let leaves_in_place =
         S::TAG == EvalTag::Jq && reduce_leaves_register_in_place(input, init, update);
     let register_unmoved = leaves_in_place && trackable;
-    let carried_register = (leaves_in_place && !trackable && !frame.register_loss.is_lost())
-        .then(|| frame.register().cloned())
-        .flatten();
     // #3984: jq mode only, like every register admission here. A syntactic property of the
     // `reduce`, so answered once rather than per INIT fork.
     let mentions_frozen_var =
@@ -51051,8 +51054,13 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         // holds one ([`Frame::register`]), not a lost one.
         if register_unmoved && !emitted.trackable {
             emitted = emitted.with_register(BranchRegister::Unmoved(Cow::Borrowed(value)));
-        } else if let Some(register) = carried_register.as_ref().filter(|_| !emitted.trackable) {
-            emitted = emitted.with_register(BranchRegister::Unmoved(Cow::Owned(register.clone())));
+        } else if leaves_in_place && !trackable && !emitted.trackable {
+            // A frame never carries a register it also records lost
+            // ([`Frame::with_register`]), so `Some` here is a live one.
+            if let Some(register) = frame.register() {
+                emitted =
+                    emitted.with_register(BranchRegister::Unmoved(Cow::Owned(register.clone())));
+            }
         }
         if sink(emitted) == Demand::Stop {
             fork_outcome.stash(ResolveFlow::Stopped);

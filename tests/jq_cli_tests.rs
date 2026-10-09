@@ -64971,6 +64971,15 @@ fn test_destructuring_reduce_leaves_the_register_4048() -> Result<()> {
             "",
             0,
         ),
+        // The bare-variable fold takes the same untracked statement; it answered before
+        // through `cannot_move_register`, so this is the control that it still does.
+        (
+            r#"{"a":[true]}"#,
+            r"path(. as $x | {a:{b:1}} | ((reduce . as $a (0; .)) or true) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
         // Unary minus is resolved live too, on either entry.
         (
             r#"{"a":1,"b":2}"#,

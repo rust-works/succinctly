@@ -1870,9 +1870,9 @@ is the revert that established what the other one costs.
    (`path(.a as $x \| reduce (1) as $i (.a; .b) \| $x)` is `["a"]` in jq, where the register stays on INIT's node), a
    `foreach` with a destructuring pattern (it emits from inside the loop, so the pattern's steps do move the register an
    emission carries), a fold wrapped in `try ... catch`, a fold entered under a `?//` bind, and a source or `UPDATE`
-   outside that allowlist: a `try ... catch` or `//` in the `UPDATE`
-   (`path(. as $x \| reduce (1) as $i (.; .a // 1) \| $x)` is `[]` in jq), and a source that destructures a computed
-   value, which is a path error in jq the fold does not model, so accepting the stage there would answer where jq refuses.
+   outside that allowlist: a `try ... catch` or `//` in the `UPDATE` (`path(. as $x \| reduce (1) as $i (.; .a // 1) \|
+   $x)` is `[]` in jq), and a source that destructures a computed value, which is a path error in jq the fold does not
+   model, so accepting the stage there would answer where jq refuses.
 
    | Filter                                                   | jq                          | Why succinctly still refuses                                                                                                                                                                                              |
    | -------------------------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
