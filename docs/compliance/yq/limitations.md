@@ -5438,13 +5438,16 @@ matches (#4139; captured against yq v4.53.3, on any empty operand such as `selec
 - An index operand with no output stands for *all children*: `.[$nope]` on `[1]` is `1`, on `a: 1 /
   b: [1,2,3]` `.b[$typo]` prints every element, `.[$typo] = 1` sets every member, `.b[$typo] += 1`
   is `b: [2,3,4]`, and `del(.[$typo])` is `{}`. A typo'd name used as a computed index or key
-  therefore rewrites or deletes data, as it does in yq. The children of a scalar or `null` are none,
-  so `.b[$typo] = 1` over `b: 3` stays a no-op.
+  therefore rewrites or deletes data, as it does in yq. The children of a scalar are none, so
+  `.b[$typo] = 1` over `b: 3` stays a no-op. This holds for a write or `del` through an `as` with
+  no source too (`(select(false) as $x | .b) = 9` sets `b`).
 - `has(E)` with no output is `false`.
 
 jq mode keeps its generator model for all three (no key, no output).
 
-Still diverging: a slice bound with no output is an error in yq (`.[$nope:]` is `expected to find 1
+Still diverging: over a `null` or absent operand yq's empty index creates the container
+(`.n[$typo] = 1` over `n: null` is `n: []`, as plain `.n[] = 1` is, which `succinctly yq` already
+does), where this tool leaves the document unchanged; a slice bound with no output is an error in yq (`.[$nope:]` is `expected to find 1
 number, got 0 instead`) and nothing here (#4197); `1 as $y | select(false) as $y | $y` is `1` in yq
 and nothing here, because the outer `$y` is not substituted into a body that rebinds the name;
 `$ENV` is an unbound variable in yq, so `$ENV.x` prints nothing, where it is the environment object

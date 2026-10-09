@@ -60995,6 +60995,32 @@ fn test_yq_empty_operand_as_index_del_and_has_4139() -> Result<()> {
         ("[1,2]", "has(select(false))", "false\n"),
         ("{\"a\":1,\"k\":\"a\"}", "has(.k)", "true\n"),
         ("[10,20]", ".[(1,select(false))]", "20\n"),
+        ("{\"a\":1,\"b\":[1,2,3]}", ".b[$typo]?", "1\n2\n3\n"),
+        (
+            "{\"a\":1,\"b\":[1,2,3]}",
+            ".b[select(false)]? | length",
+            "1\n1\n1\n",
+        ),
+        (
+            "{\"a\":{\"k\":1},\"b\":[1,2,3]}",
+            "(select(false) as $x | .b) = 9",
+            "{\"a\":{\"k\":1},\"b\":9}\n",
+        ),
+        (
+            "{\"a\":{\"k\":1},\"b\":[1,2,3]}",
+            "del(select(false) as $x | .b)",
+            "{\"a\":{\"k\":1}}\n",
+        ),
+        (
+            "{\"a\":{\"k\":1},\"b\":[1,2,3]}",
+            "(select(false) as $x | .b[0]) |= . + 1",
+            "{\"a\":{\"k\":1},\"b\":[2,2,3]}\n",
+        ),
+        (
+            "{\"a\":{\"k\":1},\"b\":[1,2,3]}",
+            ".a | select(false) as $x | key",
+            "\"a\"\n",
+        ),
     ] {
         assert_eq!(
             run_yq_stdin_with_stderr(filter, input, args)?,

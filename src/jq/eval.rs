@@ -7346,6 +7346,10 @@ fn each_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Whether an `as` whose source produced nothing still runs its body (#4139).
 ///
+/// Only the bare `$var` form: yq rejects a destructuring pattern on the right of
+/// `as` outright (`RHS of 'as' operator must be a variable name`), so
+/// [`each_as_pattern`] and `eval_as_pattern` keep their per-output model.
+///
 /// yq's `A as $v | B` is the assign-variable operator followed by `|`: the
 /// operator hands its *context* on whether or not `A` matched anything, and
 /// leaves the variable unset, so `B` runs once against the unchanged input and
@@ -27431,7 +27435,10 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // every child of the operand (#4139); see `yq_empty_index_children`.
         Flow::Exhausted => {
             if !keys_seen && S::TAG == EvalTag::Yq {
-                return eval_single::<W, S>(&yq_empty_index_children(target), value, optional);
+                // `optional` is the bracket's `?`, which covers only the final
+                // index step; the children expression has no such step and
+                // already swallows the iteration of a scalar.
+                return eval_single::<W, S>(&yq_empty_index_children(target), value, false);
             }
         }
         // Our sink is the only thing that can ask the pull to stop, and it
@@ -48570,7 +48577,8 @@ fn resolve_as_source_sink<'a, S: EvalSemantics>(
     // Jq mode only (ADR-0018); no yq row observes the marker (probed over a dozen),
     // so this is the one place the mode is stated.
     let may_alias = core::cell::OnceCell::new();
-    resolve_bind_source_sink::<S>(
+    let bound_any = core::cell::Cell::new(false);
+    let flow = resolve_bind_source_sink::<S>(
         source,
         body,
         var,
@@ -48578,6 +48586,7 @@ fn resolve_as_source_sink<'a, S: EvalSemantics>(
         trackable,
         frame,
         &mut |bound, origin, witnessed| {
+            bound_any.set(true);
             // Equal to the register *now*: an output that differs from it cannot be
             // its node whatever the source forwarded (`(select(false) // .a) as $v`
             // binds `.a`, which an equal-valued sibling register is not).
@@ -48603,7 +48612,14 @@ fn resolve_as_source_sink<'a, S: EvalSemantics>(
             );
             resolve_node_sink::<S>(&substituted, value, trackable, snapshot, frame, keep, sink)
         },
-    )
+    );
+    // yq's `as` runs its body once, with the variable unset, when the source
+    // has no output, so a write or `del` through it reaches the body's paths
+    // (#4139); see `yq_runs_as_body_without_source`.
+    if S::TAG == EvalTag::Yq && !bound_any.get() && matches!(flow, ResolveFlow::Exhausted) {
+        return resolve_node_sink::<S>(body, value, trackable, snapshot, frame, keep, sink);
+    }
+    flow
 }
 
 fn resolve_bind_source_sink<S: EvalSemantics>(

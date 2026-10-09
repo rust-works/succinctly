@@ -21294,10 +21294,13 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         // `eval::yq_empty_index_children`.
         Flow::Exhausted => {
             if !keys_seen && S::TAG == EvalTag::Yq {
+                // `optional` is the bracket's `?`, which covers only the final
+                // index step; the children expression has no such step and
+                // already swallows the iteration of a scalar.
                 return eval_single::<S, V>(
                     &super::eval::yq_empty_index_children(target),
                     value,
-                    optional,
+                    false,
                     cursor,
                 );
             }
@@ -34095,6 +34098,18 @@ fn eval_owned_identity_as<S: EvalSemantics, V: DocumentValue>(
     // -- the same rewrite a computed navigation component gets, and the same
     // predicate gated it (`owned_identity_bind_supported`).
     let (bound_values, control) = owned_identity_bind_values::<S, V>(bind, value, id, optional);
+    // yq's `as` runs its body once, with the variable unset, when the source
+    // has no output (#4139); see `eval::yq_runs_as_body_without_source`.
+    if S::TAG == EvalTag::Yq && bound_values.is_empty() && control.is_none() {
+        return eval_owned_identity_spliced::<S, V>(
+            body,
+            rest,
+            Cow::Borrowed(value),
+            id.clone(),
+            optional,
+            tail,
+        );
+    }
     for (bound, origin) in bound_values {
         // `bind`, not the rewritten source: `is_identity_passthrough` is a
         // question about what the user wrote.
