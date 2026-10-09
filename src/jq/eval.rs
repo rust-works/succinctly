@@ -15631,7 +15631,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         // Phase 21: Extended Date/Time functions (yq)
         Builtin::FromUnix => builtin_from_unix::<W, S>(value, optional),
-        Builtin::ToUnix => builtin_to_unix::<W>(value, optional),
+        Builtin::ToUnix => builtin_to_unix::<W, S>(value, optional),
         Builtin::Tz(zone) => builtin_tz::<W, S>(zone, value, optional),
 
         // Phase 22: File operations (yq)
@@ -72037,12 +72037,22 @@ fn builtin_from_unix<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Builtin: to_unix - convert ISO 8601 date string to Unix epoch
 /// This is semantically identical to fromdate/fromdateiso8601 but with yq naming convention
-fn builtin_to_unix<W: Clone + AsRef<[u64]>>(
+///
+/// yq's `to_unix` is `time.Unix()`, an `!!int`; jq's `fromdate` is a float that prints whole
+/// (#4203). A float in yq mode would print as `1.7052768e+09` and carry the `!!float` tag.
+fn builtin_to_unix<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
     // to_unix is the same as fromdate - parses ISO 8601 string to Unix timestamp
-    builtin_fromdate::<W>(value, optional)
+    match builtin_fromdate::<W>(value, optional) {
+        QueryResult::Owned(OwnedValue::Float(n))
+            if S::TAG == EvalTag::Yq && n.fract() == 0.0 && n.abs() < 9.0e15 =>
+        {
+            QueryResult::Owned(OwnedValue::Int(n as i64))
+        }
+        other => other,
+    }
 }
 
 /// Format Unix timestamp to ISO 8601 string with timezone offset.
@@ -111529,6 +111539,15 @@ mod tests {
                 assert_eq!(n, 0.0);
             }
         );
+
+        // #4203: yq's `to_unix` is an `!!int`.
+        let json = br#""2024-01-15T10:30:00Z""#;
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse("to_unix").unwrap();
+        assert!(matches!(
+            eval::<Vec<u64>, YqSemantics>(&expr, index.root(json)),
+            QueryResult::Owned(OwnedValue::Int(1705314600))
+        ));
 
         query!(br#""2024-01-15T10:30:00Z""#, r"to_unix",
             QueryResult::Owned(OwnedValue::Float(n)) => {
