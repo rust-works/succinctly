@@ -4397,10 +4397,13 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
             // `values`' end offsets are non-decreasing (find_json_values is
             // a single left-to-right scan), so one LineCounter shared across
             // every value in this file keeps the whole loop O(n) (#1213).
+            // `locator` wraps it and must be asked for non-decreasing `end`s.
             //
-            // The location itself is resolved only where a diagnostic reads it
-            // (#4160): the M2 fast path never does, so a run that reports
-            // nothing never counts a newline.
+            // jq names the line the input value ends on, counted in the whole
+            // file rather than in this value's slice. The M2 fast path never
+            // reads it, so it is resolved only if that path reports an error
+            // (#4160); the general path below resolves it up front because it
+            // hands `&InputLocation` to the evaluator.
             let mut locator = ValueLocator::new(
                 raw,
                 filename.as_deref(),
@@ -4427,10 +4430,6 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
 
                 // Slow path: build index and evaluate expression
                 let index = JsonIndex::build(json_bytes);
-                // jq names the line the input value ends on, counted in the
-                // whole file rather than in this value's slice
-                // (`locator.at(end)`, resolved where first read).
-
                 // #1576: the M2 fast path, mirroring `yq_runner.rs`'s own
                 // (`can_use_m2_streaming`/`GenericResult::stream_json`) but
                 // scoped to jq's own atomicity contract for array
@@ -6192,7 +6191,11 @@ fn count_newlines(bytes: &[u8]) -> usize {
     let mut chunks = bytes.chunks_exact(64);
     let mut total = 0usize;
     for chunk in &mut chunks {
-        total += usize::from(chunk.iter().fold(0u8, |n, &b| n + u8::from(b == b'\n')));
+        total += usize::from(
+            chunk
+                .iter()
+                .fold(0u8, |n, &b| n.wrapping_add(u8::from(b == b'\n'))),
+        );
     }
     total + chunks.remainder().iter().filter(|&&b| b == b'\n').count()
 }
