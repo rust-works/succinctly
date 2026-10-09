@@ -47294,10 +47294,21 @@ fn foreach_source_destructures_register(source: &Expr) -> bool {
 fn source_destructures_register(source: &Expr, through_reduce: bool) -> bool {
     let recurse = |e: &Expr| source_destructures_register(e, through_reduce);
     match unwrap_paren(source) {
-        // #4128: `select(true) as {a:$a}` binds the register as `. as {a:$a}` does, so any
-        // source that only hands the register on is the same destructure.
+        // #4128: `select(true) as {a:$a}` binds the register as `. as {a:$a}` does, so under
+        // `through_reduce` any source that only hands the register on is the same destructure.
+        // The `foreach` route takes only the bare `.` and `select(literal)`: the resolver
+        // models `(.|.) as {a:$a}` as a computed value there, and a `try`/`?` around it
+        // swallowed the resulting refusal.
         Expr::AsPattern { expr, patterns, .. } => {
-            routes_destructuring(patterns) && yields_only_the_register(expr)
+            routes_destructuring(patterns)
+                && if through_reduce {
+                    yields_only_the_register(expr)
+                } else {
+                    matches!(
+                        unwrap_paren(expr),
+                        Expr::Identity | Expr::Builtin(Builtin::Select(_))
+                    ) && yields_only_the_register(expr)
+                }
         }
         Expr::Comma(branches) => branches.iter().any(recurse),
         // #3940: a leading stage that only hands the register on (`.`, `(.|.)`, `(., .)`)
@@ -47674,9 +47685,12 @@ fn drive_fold_source_with<S: EvalSemantics>(
     // known to be the register. The ambient still reads as trackable (the enclosing source's
     // movement is not modelled, #3790), so the resolver would check the step against a
     // register that is not where jq's is, and answer; refuse loudly instead, as the body's
-    // own "with result" refusal does for a `.` body.
+    // own "with result" refusal does for a `.` body. A `null` ambient is left to the
+    // resolver's own `null` clause (#4007): on a `null` document the register really is
+    // that `null`, and jq answers.
     if S::TAG == EvalTag::Jq
         && ambient.trackable
+        && !matches!(ambient.value, OwnedValue::Null)
         && fold_body::depth() != 0
         && !fold_body::acc_is_register_here()
         && source_destructures_register(source, true)

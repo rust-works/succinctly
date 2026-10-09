@@ -1927,9 +1927,10 @@ is the revert that established what the other one costs.
    when the register is not known to be at `.` (an untracked entry, or the body of another fold whose source may have
    moved it), so `del(reduce .[]? as $k (.; foreach ((.\|.) \| reduce . as {a:$a} (0; .)) as $x (.; .; .)))` raises as
    jq does instead of deleting the document, pinned by
-   `test_fold_source_destructuring_the_register_raises_where_it_is_not_4128`. About 11 contrived rows in 40,000 sampled
-   that jq answers (a nested fold under a `?//` bind, a destructuring `foreach` source behind an `and`) are now
-   refused, in the safe direction.
+   `test_fold_source_destructuring_the_register_raises_where_it_is_not_4128`. 13 contrived rows in 40,000 sampled that jq
+   answers (a nested fold under a `?//` bind, a destructuring `foreach` source behind an `and`) are now refused, in the
+   safe direction. The bare-`.` and `select(literal)` binds only: a `(.|.) as {...}` or `(., .) as {...}` source is
+   still read as a computed value by the resolver and stays as it was.
 
    | Filter                                                   | jq                          | Why succinctly still refuses                                                                                                                                                                                              |
    | -------------------------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
