@@ -537,6 +537,22 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         None
     }
 
+    /// Whether [`prev_element`](Self::prev_element) answers, so the slot scan
+    /// can step back from the element it remembers to one just before it
+    /// (#4101). The default is `false`: a format without it (YAML) keeps the
+    /// scan from the first element and never pays for the attempt. Only
+    /// meaningful with [`RESUMABLE_ELEMENT_SCAN`](Self::RESUMABLE_ELEMENT_SCAN).
+    const STEPS_BACK: bool = false;
+
+    /// The element before this one: [`next_element`](Self::next_element) run
+    /// backwards, `None` at the first element (#4101). Consulted only when
+    /// [`STEPS_BACK`](Self::STEPS_BACK) holds, and it must then undo
+    /// `next_element` exactly: `c.next_element().and_then(|n| n.prev_element())`
+    /// is `c`.
+    fn prev_element(&self) -> Option<Self> {
+        None
+    }
+
     /// Whether this node, already known to sit at `text_pos`, is preceded
     /// by the delimiter its position in the document requires: nothing if
     /// `expected` is `None` (a container's first child), otherwise exactly

@@ -3774,6 +3774,13 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
         JsonCursor::next_sibling(self)
     }
 
+    const STEPS_BACK: bool = true;
+
+    #[inline]
+    fn prev_element(&self) -> Option<Self> {
+        JsonCursor::prev_sibling(self)
+    }
+
     /// The balanced-parentheses excess at this node's open: a rank lookup.
     #[inline]
     fn tree_depth(&self) -> Option<usize> {
