@@ -109,6 +109,7 @@ pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
         | Builtin::ToNumber
         | Builtin::ToJson
         | Builtin::FromJson
+        | Builtin::FromYaml
         | Builtin::Explode
         | Builtin::Implode
         | Builtin::ToJsonStream
@@ -421,6 +422,7 @@ pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr)
         | Builtin::ToNumber
         | Builtin::ToJson
         | Builtin::FromJson
+        | Builtin::FromYaml
         | Builtin::Explode
         | Builtin::Implode
         | Builtin::ToJsonStream
@@ -1759,6 +1761,7 @@ fn stage_escapes_own_input(expr: &Expr) -> bool {
             | Builtin::ToNumber
             | Builtin::ToJson
             | Builtin::FromJson
+            | Builtin::FromYaml
             | Builtin::Explode
             | Builtin::Implode
             | Builtin::Test(_)
@@ -2112,6 +2115,7 @@ fn node_reads_ambient(node: &Expr) -> bool {
             | Builtin::ToNumber
             | Builtin::ToJson
             | Builtin::FromJson
+            | Builtin::FromYaml
             | Builtin::Explode
             | Builtin::Implode
             | Builtin::Test(_)

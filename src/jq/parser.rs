@@ -374,6 +374,23 @@ fn is_ident_start_char(c: char) -> bool {
 /// on which names get pseudo-variable treatment -- the exact "duplicated
 /// predicates diverge silently" shape #2728 found for identifier-start
 /// rules, per CLAUDE.md's #106 note.
+/// What yq's `with(path; update)` keeps of `update` (#4206): its assignments, applied in order to
+/// the node, and nothing else. yq runs `update` for the changes it makes in place and discards the
+/// value of any other expression, so `. = 2 | . + 1` leaves the node `2` and `.c = 2, .d = 3`
+/// applies both. A part with no assignment contributes nothing (`.`).
+fn with_update_effect(update: &Expr) -> Expr {
+    match update {
+        Expr::Assign { .. }
+        | Expr::Update { .. }
+        | Expr::CompoundAssign { .. }
+        | Expr::AlternativeAssign { .. } => update.clone(),
+        Expr::Paren(inner) => with_update_effect(inner),
+        Expr::Comma(items) => Expr::pipe(items.iter().map(with_update_effect).collect()),
+        Expr::Pipe(stages) => Expr::pipe(stages.iter().map(with_update_effect).collect()),
+        _ => Expr::Identity,
+    }
+}
+
 fn dollar_var_expr(name: String, line: usize) -> Expr {
     if name == "__loc__" {
         // #2774: the parser has no notion of which file it is reading (a
@@ -3182,6 +3199,9 @@ impl<'a> Parser<'a> {
                         "repeat",
                         Self::parse_repeat_expr,
                     )
+                } else if self.mode == ParserMode::Yq && self.matches_keyword("with") {
+                    // #4206: yq's `with(path; update)`; not a jq form.
+                    self.parse_shadowable_special_form(keyword_start, "with", Self::parse_with_expr)
                 } else if self.matches_keyword("range") {
                     self.reject_unless_jq_extensions("range")?;
                     self.parse_shadowable_special_form(
@@ -3708,6 +3728,44 @@ impl<'a> Parser<'a> {
         Ok(Expr::Limit {
             n: Box::new(n),
             expr: Box::new(expr),
+        })
+    }
+
+    /// Parse yq's `with(path; update)` (#4206): `path` is the nodes to work on and `update` runs
+    /// with each as its context. Only an assignment inside `update` takes effect -- yq discards
+    /// the value of any other expression (`[1,2] | with(.[]; . + 1)` is `[1,2]`), and creates a
+    /// missing path the way `|=` does (`with(.z; .b = 2)` adds `z: {b: 2}`). So an update that
+    /// is built from assignments is `path |= update`, and anything else leaves the nodes as
+    /// they are.
+    fn parse_with_expr(&mut self) -> Result<Expr, ParseError> {
+        let start_pos = self.pos;
+        self.consume_keyword("with");
+        self.skip_ws();
+        if let Err(early) = self.expect_or_wrong_arity('(', start_pos) {
+            return early;
+        }
+        self.next();
+        self.skip_ws();
+        let path = self.parse_expr()?;
+        self.skip_ws();
+        if matches!(path, Expr::Comma(_)) {
+            return Err(ParseError::new(
+                "with must be given a block (;), got UNION instead",
+                self.pos,
+            ));
+        }
+        self.expect(';')?;
+        self.skip_ws();
+        let update = self.parse_expr()?;
+        self.skip_ws();
+        if self.peek() != Some(')') {
+            return self.wrong_arity_or_expect(start_pos, ')', vec![path, update]);
+        }
+        self.next();
+        let filter = with_update_effect(&update);
+        Ok(Expr::Update {
+            path: Box::new(path),
+            filter: Box::new(filter),
         })
     }
 
@@ -6178,6 +6236,23 @@ impl<'a> Parser<'a> {
         if self.matches_keyword("tonumber") {
             self.consume_keyword("tonumber");
             return Ok(Some(Builtin::ToNumber));
+        }
+        // #4206: yq's own spellings. `to_number` is `tonumber` (yq words its error differently);
+        // `from_json` and `from_yaml` both decode YAML, JSON being a subset. Not jq names, so a
+        // jq-mode program may define them.
+        if self.mode == ParserMode::Yq {
+            if self.matches_keyword("to_number") {
+                self.consume_keyword("to_number");
+                return Ok(Some(Builtin::ToNumber));
+            }
+            if self.matches_keyword("from_json") {
+                self.consume_keyword("from_json");
+                return Ok(Some(Builtin::FromYaml));
+            }
+            if self.matches_keyword("from_yaml") {
+                self.consume_keyword("from_yaml");
+                return Ok(Some(Builtin::FromYaml));
+            }
         }
         if self.matches_keyword("tojson") {
             self.consume_keyword("tojson");
