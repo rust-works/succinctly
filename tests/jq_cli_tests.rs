@@ -122101,3 +122101,79 @@ fn test_destructure_bind_refusal_survives_try_and_fold_init_4150() -> Result<()>
         ),
     ])
 }
+
+/// #4118: `path(f)` as a pipe stage leaves jq's register where it entered (it saves and
+/// restores the path state around `f`, as `Paths` does), so `first(path(.a))`,
+/// `limit(1; path(.a))`, `nth(0; path(.a))` and a bare `path(.a)` are register-keeping stages and
+/// the rows below answer as jq does. They were refused, and under a `try` the refusal skipped
+/// the write jq makes (`del(.a? as $y | try ((.a)? and first(path(.a))) | try ($y | .b))` echoed
+/// the document where jq deletes `.a.b`). Rows captured from jq 1.7.1 on the stdin and `-n` routes.
+///
+/// Listing the stage unmasked a gap that was already there for `length`, `keys` and
+/// `to_entries`: on an untracked stage a source mixing a bare `.` with a `$var` marker
+/// (`(if true then $v0 else . end) as $v1`) was taken for a passthrough of the register, so
+/// `$v1` was bound as an exact marker and a `try` around its navigation swallowed the refusal
+/// and skipped the write. It is now the `Unproven` marker, a loud refusal (jq answers; the safe
+/// direction), as `test_transparent_bind_source_matches_identity_bind_3402` requires.
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_path_f_stage_leaves_register_4118() -> Result<()> {
+    let doc = r#"{"a":{"b":1},"k":2}"#;
+    let wide = r#"{"a":{"b":1},"c":{"b":1},"d":false}"#;
+    assert_path_rows_both_routes_3749(&[
+        (doc, r"path(. as $x | first(path(.a)) | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | path(.a) | $x)", "[]\n", "", 0),
+        (
+            doc,
+            r"path(. as $x | limit(1; path(.a)) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (doc, r"path(. as $x | nth(0; path(.a)) | $x)", "[]\n", "", 0),
+        (
+            doc,
+            r"path(. as $x | first(path(.a, .k)) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(.a? as $y | try ((.a)? and first(path(.a))) | try ($y | .b))",
+            "{\"a\":{},\"k\":2}\n",
+            "",
+            0,
+        ),
+        // The unmasked gap: jq deletes `.b` under both `a` and `c`; never the silent discard.
+        (
+            wide,
+            r"del(. as $v0 | length | (if true then $v0 else . end) as $v1 | try (($v1 | .[]?) | .b?))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            wide,
+            r"del(. as $v0 | keys | (if true then $v0 else . end) as $v1 | try (($v1 | .[]?) | .b?))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        // Must not change: a bare `$v0` source and a bare `.` source on an untracked stage.
+        (
+            wide,
+            r"del(. as $v0 | length | $v0 as $v1 | try (($v1 | .[]?) | .b?))",
+            "{\"a\":{},\"c\":{},\"d\":false}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"del({a:{b:1}} | try (. as {a:$q} | $q.zz))",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+    ])
+}
