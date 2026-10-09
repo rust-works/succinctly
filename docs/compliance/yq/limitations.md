@@ -2348,6 +2348,22 @@ create the `9:` key that yq's `//` leaves behind as `null`, and a grouped `del()
 scalar (`del(.a[1].b[0], .l[0])`, `del(.a.x.y[0], .l[0])`) raises `Cannot index number with number`
 where the single-path form and yq no-op.
 
+**A boolean or `null` index into an absent container ([#4087](https://github.com/rust-works/succinctly/issues/4087)).**
+yq reads `.a[true]` and `.a[null]` on a document with no `a` as `null`, and a write builds a
+*mapping* keyed by the key's text (`.a[true] = 1` is `a: {true: 1}`, `.a[null] |= 5` is
+`a: {null: 5}`, `.a[true][0] = 1` is `a: {true: [1]}`; a numeric key builds an array), where
+`Cannot index null with boolean` was raised. `eval::yq_bool_null_key_into_null` is the one
+predicate behind the eager and cursor reads and the path component; jq mode keeps raising. One
+residue: a `del()` through such a key on an *explicit* `null` (`d: ~` / `del(.d[true])`, or a
+`null` root) vivifies it to `{}` in yq, as it does to `[null]` for a numeric key (#2323), and leaves
+it `null` here. A boolean or `null` key on a
+scalar target takes the same no-op a numeric key does (`a: 5` / `.a[true] = 1` is unchanged). A
+computed key that is `null` only because its source field is absent (`.a[.b]` with no `b`) is not
+told apart from a literal `null`: it reads as `null` and writes `a: {null: 1}`, where yq answers
+`[]` for the write; this is the key-expression-context difference that already made `.x[.b]` read
+`null` here and the member in yq, and it is pinned by
+`test_yq_computed_null_key_from_an_absent_field_is_a_known_residual_4087`.
+
 ### `=`'s multi-output RHS: real yq takes only the last value, no fan-out
 
 [#1430](https://github.com/rust-works/succinctly/issues/1430) started as a narrower report

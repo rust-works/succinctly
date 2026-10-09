@@ -59840,3 +59840,113 @@ fn test_tag_before_a_flow_collection_inside_a_flow_sequence_4081() -> Result<()>
     }
     Ok(())
 }
+
+/// #4085 follow-up (#4087): a boolean or `null` index into an absent (`null`) container reads as
+/// `null` and a write builds a mapping keyed by the key's text -- `.a[true] = 1` on a document with
+/// no `a` is `a: {true: 1}` -- where it raised `Cannot index null with boolean`. A numeric key keeps
+/// building an array. Every row captured from yq v4.53.3 with `-o=json -I=0`.
+#[test]
+fn test_yq_boolean_null_index_into_an_absent_container_4087() -> Result<()> {
+    let rows: &[(&str, &str, &str)] = &[
+        ("1: y\n", ".a[true]", "null\n"),
+        ("1: y\n", ".a[null]", "null\n"),
+        ("1: y\n", ".a[false]", "null\n"),
+        ("1: y\n", ".a[true].b", "null\n"),
+        ("1: y\n", ".a[true]?", "null\n"),
+        ("1: y\n", "[.a[true], .a[null]]", "[null,null]\n"),
+        ("1: y\n", "true as $k | .a[$k]", "null\n"),
+        ("1: y\n", "null | .[true]", "null\n"),
+        ("1: y\n", ".a | .[null]", "null\n"),
+        (
+            "1: y\n",
+            ".a[true] = 1",
+            "{\"1\":\"y\",\"a\":{\"true\":1}}\n",
+        ),
+        (
+            "1: y\n",
+            ".a[null] |= 5",
+            "{\"1\":\"y\",\"a\":{\"null\":5}}\n",
+        ),
+        (
+            "1: y\n",
+            ".a[false] += 1",
+            "{\"1\":\"y\",\"a\":{\"false\":1}}\n",
+        ),
+        (
+            "1: y\n",
+            ".a[true][0] = 1",
+            "{\"1\":\"y\",\"a\":{\"true\":[1]}}\n",
+        ),
+        (
+            "1: y\n",
+            ".a[true].b.c = 1",
+            "{\"1\":\"y\",\"a\":{\"true\":{\"b\":{\"c\":1}}}}\n",
+        ),
+        (
+            "1: y\n",
+            "true as $k | .a[$k] = 1",
+            "{\"1\":\"y\",\"a\":{\"true\":1}}\n",
+        ),
+        (
+            "1: y\n",
+            "(.a[true], .x) = 1",
+            "{\"1\":\"y\",\"a\":{\"true\":1},\"x\":1}\n",
+        ),
+        (
+            "1: y\n",
+            "(.a[true], .a[null]) = 2",
+            "{\"1\":\"y\",\"a\":{\"true\":2,\"null\":2}}\n",
+        ),
+        ("1: y\n", "del(.a[true])", "{\"1\":\"y\"}\n"),
+        ("1: y\n", "del(.a[true], .x)", "{\"1\":\"y\"}\n"),
+        ("1: y\n", "del(.a[true].b)", "{\"1\":\"y\"}\n"),
+        ("a: {}\nb: [1, 2]\nc: x\nd: ~\n", ".d[true]", "null\n"),
+        (
+            "a: {}\nb: [1, 2]\nc: x\nd: ~\n",
+            ".d[null] = 3",
+            "{\"a\":{},\"b\":[1,2],\"c\":\"x\",\"d\":{\"null\":3}}\n",
+        ),
+        (
+            "a: {}\nb: [1, 2]\nc: x\nd: ~\n",
+            ".a[true] = 1",
+            "{\"a\":{\"true\":1},\"b\":[1,2],\"c\":\"x\",\"d\":null}\n",
+        ),
+        ("a: {}\nb: [1, 2]\nc: x\nd: ~\n", ".b[true]?", ""),
+        ("a: {}\nb: [1, 2]\nc: x\nd: ~\n", ".c[true]?", ""),
+        // A scalar target takes the same no-op a numeric key does (#1181).
+        ("a: 5\n", ".a[true] = 1", "{\"a\":5}\n"),
+        ("a: 5\n", ".a[null] |= 2", "{\"a\":5}\n"),
+        ("a: x\n", "del(.a[true])", "{\"a\":\"x\"}\n"),
+        ("a: 5\n", "(.a[true], .b) = 1", "{\"a\":5,\"b\":1}\n"),
+        ("a: 5\n", ".a[true] += 1", "{\"a\":5}\n"),
+        ("~\n", ".[true]", "null\n"),
+        ("~\n", ".[null] = 1", "{\"null\":1}\n"),
+    ];
+    for &(doc, filter, expected) in rows {
+        let (stdout, code) = run_yq_stdin(filter, doc, &["-o", "json", "-I", "0"])?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (expected, 0),
+            "`{filter}` on {doc:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #4087 review: a computed key that is `null` because its source field is *absent* (`.a[.b]`) is
+/// not told apart from a literal `null` key, so it reads as `null` and writes a mapping keyed
+/// `null`, where yq reads `.a[.b]` as the key expression's own context and answers `[]` for the
+/// write (`a: []`). The read of an existing mapping (`.x[.b]`, yq `1`, here `null`) was already
+/// different before #4087; recorded in `limitations.md`, pinned here as the current behaviour.
+#[test]
+fn test_yq_computed_null_key_from_an_absent_field_is_a_known_residual_4087() -> Result<()> {
+    let doc = "1: y\n";
+    let (out, code) = run_yq_stdin(".a[.b]", doc, &["-o", "json", "-I", "0"])?;
+    assert_eq!((out.as_str(), code), ("null\n", 0));
+    let (out, code) = run_yq_stdin(".a[.b] = 1", doc, &["-o", "json", "-I", "0"])?;
+    assert_eq!(
+        (out.as_str(), code),
+        ("{\"1\":\"y\",\"a\":{\"null\":1}}\n", 0)
+    );
+    Ok(())
+}
