@@ -2,6 +2,21 @@
 
 Tracks updates to the knowledge wiki pages in `docs/`.
 
+## 2026-10-09 — Settled vs sink-fed operand chains measured, no change (issue #4132)
+
+**Sources ingested:**
+- `settles_both`, `settled_operand_strategy`, `settle_then_replay` in `src/jq/eval.rs` and the
+  generic evaluator's `binary_fanout_each_generic`
+- Interleaved wall-clock A/B (shipped / analysis disabled / widened rule, plus a control copy) on
+  terminus (7950X) and johns-mac-mini (M4 Pro), cachegrind `Ir` and D1 misses with a D1-size sweep,
+  and `time -l` instructions retired
+
+**Pages updated:**
+- [optimizations/jq-settled-operands.md](optimizations/jq-settled-operands.md) — new page: the
+  settled path's win on long `def` chains is stack-footprint cache misses, not instructions; the
+  rule is left as is
+- [optimizations/README.md](optimizations/README.md) — index and rejected-experiments rows
+
 ## 2026-10-07 — Canonical-echo strings walk a specials mask (issue #3340)
 
 **Sources ingested:**

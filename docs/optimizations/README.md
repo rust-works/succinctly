@@ -22,6 +22,7 @@ This directory documents optimization techniques used in the succinctly library,
 | **Sparse sets**      | [line-index.md](line-index.md)                           | Elias-Fano line starts, lazy build, crossover                         |
 | **String search**    | [jq-string-search.md](jq-string-search.md)               | memmem vs std Two-Way for jq substring builtins                       |
 | **jq allocation**    | [jq-format-allocation.md](jq-format-allocation.md)       | `@csv`/`@tsv`/`@dsv`/`@sh` byte-scan rewrite — investigated, rejected |
+| **jq operand strategy** | [jq-settled-operands.md](jq-settled-operands.md)      | #4132 settled vs sink-fed `def` chains — cache misses from stack depth, no change |
 | **Select scan**      | [select-scan.md](select-scan.md)                         | #40 scan-length measurement, IB cursor O(n²) fix                      |
 | **`del()` root short-circuit** | [del-root-shortcircuit.md](del-root-shortcircuit.md) | #1651 double-flatten O(d²) fix, k≈1.96→1.14                    |
 | **`del()` path trie** | [del-path-trie.md](del-path-trie.md) | #1690 hash-consed path merge, 6.4x lower per-branch cost               |
@@ -76,6 +77,7 @@ This directory documents optimization techniques used in the succinctly library,
 | jq `#[inline]` hint         | **-1.3%**      | Compiler's decisions were already optimal      | src/jq/eval.rs |
 | jq `memchr::memmem` substring | **Deferred**  | Green micro (5.9×/52×) but scan is a minority of allocation-bound ops; no end-to-end workload (#301) | [jq-string-search.md](jq-string-search.md) |
 | jq `@csv`/`@tsv`/`@dsv`/`@sh` byte-scan rewrite | **No effect** (in noise) | Already at 10-14 GiB/s pre-rewrite; allocation/pass count wasn't the bottleneck | [jq-format-allocation.md](jq-format-allocation.md) |
+| jq settled vs sink-fed operands (#4132) | **No change** (sink-fed 0.91-1.29x of settled) | Sink-fed runs 9-18% fewer instructions but misses D1 up to 1.7x more; widening the settle rule is 3-24% slower | [jq-settled-operands.md](jq-settled-operands.md) |
 
 ---
 
