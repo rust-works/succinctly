@@ -57670,6 +57670,36 @@ fn resolve_del_path_branches<'a, S: EvalSemantics>(
     }
 }
 
+/// Whether every output of a `del()` target is a bound variable's node and nothing else (#3244):
+/// `$y`, `($y)`, `$y | .`, `. as $y | $y`, `($y, $y)`. A path step after the variable
+/// (`$y.a`, `$y | .a`) makes it a navigation, which is not this.
+fn del_target_is_bound_variable_only(target: &Expr) -> bool {
+    match target {
+        Expr::Var(_) | Expr::TrackedVar(_) | Expr::DeferredVar(_) => true,
+        Expr::Paren(inner) => del_target_is_bound_variable_only(inner),
+        Expr::As { body, .. } => del_target_is_bound_variable_only(body),
+        Expr::Comma(branches) => {
+            !branches.is_empty() && branches.iter().all(del_target_is_bound_variable_only)
+        }
+        Expr::Pipe(stages) => match stages.split_first() {
+            Some((first, rest)) => {
+                del_target_is_bound_variable_only(first) && rest.iter().all(is_identity_stage)
+            }
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// `.` or `(.)`.
+fn is_identity_stage(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identity => true,
+        Expr::Paren(inner) => is_identity_stage(inner),
+        _ => false,
+    }
+}
+
 /// Rewrite every computed key in a path expression into the static component it
 /// denotes for `input`, and fan a top-level `Comma` out into one path per
 /// branch, yielding one fully-static path expression per resolved path.
@@ -68648,6 +68678,17 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // (#3207): the input comes back unchanged. Said here rather than left to
     // the per-path walk below.
     if matches!(&resolved, DelPaths::Branches(branches) if branches.is_empty()) {
+        return QueryResult::Owned(result);
+    }
+    // #3244: yq's bare `del(.)` empties the document, but a root reached through a bound
+    // variable is not that: a variable holds a node, the root node has no parent to be removed
+    // from, and yq prints the document unchanged (`. as $y | del($y)` on `a: 1`, and on `true`
+    // and `null`). Said syntactically, because the resolved branch no longer remembers how it
+    // got to the root; a variable bound lower down resolves below the root and is not here.
+    if S::TAG == EvalTag::Yq
+        && matches!(resolved, DelPaths::Root)
+        && del_target_is_bound_variable_only(path_expr)
+    {
         return QueryResult::Owned(result);
     }
 
