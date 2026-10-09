@@ -42720,6 +42720,18 @@ fn resolve_leaf_bounded<'a, S: EvalSemantics>(
         );
 
     if is_primitive {
+        // #4155: `.` over a scalar is that scalar. Evaluating it would clone the
+        // value into a `Vec` just to pop it back out, and a scalar shares no
+        // storage a container's clone would, so borrowing it is not observable.
+        if matches!(expr, Expr::Identity)
+            && !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_))
+        {
+            return Some(Ok(vec![PathBranch::new(
+                PathPrefix::root(),
+                Cow::Borrowed(value),
+                true,
+            )]));
+        }
         // This arm needs every output, not just the first: `values.len()`
         // (0 vs 1 vs many) decides which of three different outcomes this
         // returns below, a distinction a stop-after-first sink would
@@ -42759,8 +42771,6 @@ fn resolve_leaf_bounded<'a, S: EvalSemantics>(
         if let Some(EvalEscape::Halt(code)) = &trailing {
             return Some(Err((Vec::new(), EvalEscape::Halt(*code)))); // patchcov: coverage tolerate-line reason="unreachable: `is_primitive` admits only Identity/Field/Index/Slice, and of those only a Slice's computed bounds can halt -- all four have their own arm in `resolve_node_sink`/`resolve_node_eager`, so none reaches this function. Pre-existing; #2694 only wrapped the return in `Some` (#2694)"
         }
-        let mut components = Vec::new();
-        push_path_components(&mut components, expr);
         return Some(match values.len() {
             // No output prunes the branch — unless there never would have
             // been one because evaluating `expr` itself broke/errored (Halt
@@ -42780,11 +42790,17 @@ fn resolve_leaf_bounded<'a, S: EvalSemantics>(
             // whatever later reads `.snapshot`). `Expr::Identity` against
             // an *untracked* ambient value is handled separately, at the
             // top of this function, before `is_primitive` is even computed.
-            1 => Ok(vec![PathBranch::new(
-                PathPrefix::from_components(components),
-                Cow::Owned(values.pop().expect("len checked")),
-                true,
-            )]),
+            1 => {
+                // #4155: only this arm reads the components, so the clone of a
+                // `Field`'s name is not paid by a lookup that found nothing.
+                let mut components = Vec::new();
+                push_path_components(&mut components, expr);
+                Ok(vec![PathBranch::new(
+                    PathPrefix::from_components(components),
+                    Cow::Owned(values.pop().expect("len checked")),
+                    true,
+                )])
+            }
             // A multi-output primitive is not actually reachable today —
             // indexing/slicing a value always yields zero or one result —
             // but keep this as a named error rather than a panic in case
@@ -57439,6 +57455,18 @@ fn resolve_dynamic_indexes_sink<S: EvalSemantics>(
         }
     }
 
+    /// Whether [`push_path_components`] could flatten `expr` into a run ending in
+    /// a bare iterate. `false` only for a lone leaf: everything the flatten looks
+    /// through (`Pipe`, `Paren`, `Optional`, `Identity`) and `Iterate` itself
+    /// answer `true`, so a `false` here means the flatten would yield a clone of
+    /// `expr` that [`is_bare_iterate`] rejects.
+    fn may_end_in_bare_iterate(expr: &Expr) -> bool {
+        matches!(
+            expr,
+            Expr::Pipe(_) | Expr::Paren(_) | Expr::Optional(_) | Expr::Identity | Expr::Iterate
+        )
+    }
+
     /// Splice a stripped trailing-iterate run back onto an already-assembled
     /// static path expression. Only ever called with a non-empty `trailing`.
     fn append_trailing(expr: Expr, trailing: &[Expr]) -> Expr {
@@ -57476,10 +57504,14 @@ fn resolve_dynamic_indexes_sink<S: EvalSemantics>(
     // `path()` only — `defer_trailing_iterate` is `false` for the write-side
     // callers, whose walkers cannot take a deferred iterate; see this
     // function's doc comment for the four ways that goes wrong.
+    //
+    // #4155: flattening clones `expr` whole when it is a lone leaf (`. // .`,
+    // `first(f)`, `try f`), and the clone is read only to ask whether it ends in
+    // an iterate. A leaf that cannot be one never needs the flat form at all.
     let mut flat = Vec::new();
-    push_path_components(&mut flat, expr);
     let mut trailing = Vec::new();
-    if defer_trailing_iterate {
+    if defer_trailing_iterate && may_end_in_bare_iterate(expr) {
+        push_path_components(&mut flat, expr);
         while let Some(true) = flat.last().map(is_bare_iterate) {
             trailing.push(flat.pop().expect("checked Some above"));
         }
@@ -64838,7 +64870,9 @@ pub(crate) fn each_path_on_owned<S: EvalSemantics>(
     optional: bool,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Flow {
-    let root = PathTrail::root();
+    // Built on the first branch that needs a walk (#4155): a resolution that
+    // names the document itself (`path(. // .)`) never does.
+    let mut root: Option<Rc<PathTrail>> = None;
     // #3293: both verdicts below are stashed behind a `Demand::Stop`, and a
     // `?//` inside `expr` retries past that stop (#1519). A retry that
     // resolves another branch re-invokes the sink, which drops them; one
@@ -64856,6 +64890,15 @@ pub(crate) fn each_path_on_owned<S: EvalSemantics>(
         walk_error.begin();
         stopped_at = None;
         reached.clear();
+        // #4155: the empty path is `path(.)`'s answer and walking it reaches
+        // nothing else, so skip the walk and its bookkeeping.
+        if matches!(resolved, Expr::Identity) {
+            if sink(OwnedValue::Array(Vec::new().into())) == Demand::Stop {
+                stopped_at = Some(pipe_retry_generation());
+                return Demand::Stop;
+            }
+            return Demand::Continue;
+        }
         // A failing walk still emits whatever it reached first (#2680): jq's
         // generator never un-emits an output it already produced, so
         // `path((.a[] | .b) | .c[0:1])` on `{"a":[{"b":{}},5]}` prints
@@ -64868,7 +64911,7 @@ pub(crate) fn each_path_on_owned<S: EvalSemantics>(
         let outcome = walk_path::<S>(
             &resolved,
             WalkNode::Doc(owned),
-            &root,
+            root.get_or_insert_with(PathTrail::root),
             &mut reached,
             optional,
         );
