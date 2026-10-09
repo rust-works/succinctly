@@ -122241,6 +122241,45 @@ fn test_nth_reads_the_same_position_as_the_bracket_4163() -> Result<()> {
             assert_eq!(by_nth, by_bracket, "{doc}: path({nth})");
         }
     }
+    // The read-modify-write and error shapes route through the same arms.
+    for (nth, bracket) in [
+        ("[nth(1)?]", "[.[1]?]"),
+        ("nth(1) |= 9", ".[1] |= 9"),
+        ("nth(-1) = 7", ".[-1] = 7"),
+        ("del(nth(0))", "del(.[0])"),
+    ] {
+        let doc = "[10,20,30]";
+        assert_eq!(
+            run_jq_stdin(nth, doc, &["-c"])?,
+            run_jq_stdin(bracket, doc, &["-c"])?,
+            "{nth} vs {bracket}"
+        );
+    }
+    for filter in [r#"[nth("a")?]"#, r#"try nth(error("x")) catch ."#] {
+        let (_out, code) = run_jq_stdin(filter, "[10,20,30]", &["-c"])?;
+        assert_eq!(code, 0, "{filter}");
+    }
+    // `nth` is yq surface only behind `--jq-extensions`, over the same arms.
+    for (filter, bracket) in [
+        ("[nth(1)]", "[.[1]]"),
+        ("[nth(-1)]", "[.[-1]]"),
+        ("nth(-1) | key", ".[-1] | key"),
+        ("nth(1) | tostring | key", ".[1] | tostring | key"),
+        ("[nth(5)]", "[.[5]]"),
+    ] {
+        let yq = |filter: &str| -> Result<(String, i32)> {
+            let (output, code) = spawn_with_signal_retry(
+                || {
+                    let mut cmd = Command::new(succinctly_bin());
+                    cmd.args(["yq", "--jq-extensions", "-o=json", "-I=0", filter]);
+                    cmd
+                },
+                Some(b"- 10\n- 20\n- 30\n"),
+            )?;
+            Ok((String::from_utf8(output.stdout)?, code))
+        };
+        assert_eq!(yq(filter)?, yq(bracket)?, "yq: {filter}");
+    }
     // The values themselves, from jq 1.7.1.
     assert_eq!(
         run_jq_stdin("[nth(-1), nth(1), nth(0,2)]", "[10,20,30]", &["-c"])?,
