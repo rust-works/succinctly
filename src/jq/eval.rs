@@ -25895,6 +25895,14 @@ pub(crate) fn yq_literal_index_text<S: EvalSemantics>(
     yq_mapping_index_text::<S>(&index_component_value(idx, key))
 }
 
+/// yq (#4087): a boolean or `null` index into an absent (`null`) container reads as `null` and, on
+/// the write side, builds a mapping keyed by the key's text (`.a[true] = 1` on a document with no
+/// `a` is `a: {true: 1}`), where jq raises `Cannot index null with boolean`. A numeric key builds
+/// an array instead and already had its own arms.
+pub(crate) fn yq_bool_null_key_into_null<S: EvalSemantics>(key: &OwnedValue) -> bool {
+    S::TAG == EvalTag::Yq && matches!(key, OwnedValue::Bool(_) | OwnedValue::Null)
+}
+
 /// Whether an index key is a number: a numeric miss on a mapping falls through to the array
 /// rules (#4079), while a boolean or `null` key that finds no member is `null`.
 pub(crate) fn yq_index_key_is_numeric(key: &OwnedValue) -> bool {
@@ -26040,6 +26048,10 @@ fn index_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         ) && yq_field_index_on_scalar_is_empty::<S>() =>
         {
             QueryResult::None
+        }
+        // #4087: yq reads a boolean or `null` key on `null` as `null`.
+        _ if matches!(target, StandardJson::Null) && yq_bool_null_key_into_null::<S>(key) => {
+            QueryResult::One(StandardJson::Null)
         }
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_index(type_name(&target), key)),
@@ -26198,6 +26210,8 @@ pub(crate) fn index_one_owned<S: EvalSemantics>(
         // `.[true]`/`.[[1]]` on `null` still raise "Cannot index null with
         // boolean/array". Confirmed live against jq 1.7.1 (#2872 review).
         (OwnedValue::Object(_), OwnedValue::Null) => Ok(Some(OwnedValue::Null)),
+        // #4087: yq reads a boolean or `null` key on `null` as `null` too.
+        (_, OwnedValue::Null) if yq_bool_null_key_into_null::<S>(key) => Ok(Some(OwnedValue::Null)),
         _ if optional => Ok(None),
         _ => Err(EvalError::cannot_index(owned_type_name(target), key)),
     }
@@ -35294,6 +35308,18 @@ fn key_to_path_component<S: EvalSemantics>(
     // dispatch below without reordering any of its arms.
     if let (OwnedValue::Object(_), Some(text)) = (container, yq_mapping_index_text::<S>(key)) {
         return Ok(Expr::Field(text));
+    }
+    // #4087: and into an absent container, which the write then builds as a mapping, or onto a
+    // scalar, where yq's write is the same no-op as for a numeric key (#1181).
+    if yq_bool_null_key_into_null::<S>(key) {
+        if scalar_noop {
+            return Ok(Expr::Index { idx: 0, key: None });
+        }
+        if matches!(container, OwnedValue::Null) {
+            if let Some(text) = yq_mapping_index_text::<S>(key) {
+                return Ok(Expr::Field(text));
+            }
+        }
     }
     match key {
         OwnedValue::String(s) => Ok(Expr::Field(s.to_string())),
@@ -104726,6 +104752,49 @@ mod tests {
             outcome(br#"{"1":"y"}"#, ".[1]"),
             Err("Cannot index object with number".to_string())
         );
+    }
+
+    /// #4087: yq reads a boolean or `null` index into `null` as `null` and a write builds a
+    /// mapping keyed by its text, on the eager evaluator too -- `index_one`, `index_one_owned` and
+    /// `key_to_path_component`. jq mode keeps raising.
+    #[test]
+    fn test_yq_boolean_null_index_into_null_on_the_eager_route_4087() {
+        for (doc, filter, expected) in [
+            ("null", ".[true]", "null"),
+            ("null", ".[null]", "null"),
+            ("null", ".[false]", "null"),
+            ("null", "true as $k | .[$k]", "null"),
+            ("null", "(. + null) | .[true]", "null"),
+            ("null", ".[true] = 1", r#"{"true":1}"#),
+            ("null", ".[null] |= 5", r#"{"null":5}"#),
+            ("null", ".[true][0] = 1", r#"{"true":[1]}"#),
+            ("null", ".[1] = 1", "[null,1]"),
+            (r#"{"a":1}"#, ".b[true]", "null"),
+            ("null", "(. + null) | .[true]?", "null"),
+            (r#"{"a":1}"#, "[.b[true]?]", "[null]"),
+            (r#"{"a":1}"#, "[(.b + null)[true]?]", "[null]"),
+            ("5", ".[true] = 1", "5"),
+            ("null", ".[true]?", "null"),
+            (r#"{"a":1}"#, ".b[true] = 2", r#"{"a":1,"b":{"true":2}}"#),
+        ] {
+            assert_eq!(
+                yq_outcome(doc.as_bytes(), filter),
+                Ok(expected.to_string()),
+                "{filter} on {doc}"
+            );
+        }
+        for filter in [".[true]", ".[null]", ".[true] = 1"] {
+            assert_eq!(
+                outcome(b"null", filter),
+                Err(if filter.contains("null") {
+                    "Cannot index null with null"
+                } else {
+                    "Cannot index null with boolean"
+                }
+                .to_string()),
+                "jq mode: {filter}"
+            );
+        }
     }
 
     /// Asserts `filter` over each `input` produces the paired outcome.

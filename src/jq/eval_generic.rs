@@ -79,14 +79,15 @@ use super::eval::{
     stop_with_downstream, stop_with_error, stop_with_escape, streams_escaped_generator_prefix,
     streams_unbounded, substitute_bound_var_from, substitute_deferred_var, substitute_vars,
     suppresses, tonumber_from_str, tostring_owned, try_handler_root, vec_with_capacity,
-    yq_absent_key_read_is_empty, yq_assign_rhs_document, yq_dedup_key, yq_empty_context_reemit,
-    yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_first_of_each_key,
-    yq_index_key_is_numeric, yq_literal_index_text, yq_mapping_index_text, yq_negative_index_check,
-    yq_negative_index_error, yq_numeric_index_on_object_is_null, yq_object_key_stringify,
-    yq_read_only_context, yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand,
-    EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail,
-    QueryResult, RangeNum, Reentry, RestPipe, RootWitness, SliceTargetKind, StashedEscape,
-    StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED, WHILE_UNTIL_MAX_STEPS,
+    yq_absent_key_read_is_empty, yq_assign_rhs_document, yq_bool_null_key_into_null, yq_dedup_key,
+    yq_empty_context_reemit, yq_empty_operand_output, yq_field_index_on_scalar_is_empty,
+    yq_first_of_each_key, yq_index_key_is_numeric, yq_literal_index_text, yq_mapping_index_text,
+    yq_negative_index_check, yq_negative_index_error, yq_numeric_index_on_object_is_null,
+    yq_object_key_stringify, yq_read_only_context, yq_scalar_text, BinaryFanoutRules,
+    ComputedSliceBound, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
+    JqSemantics, LimitN, PathTrail, QueryResult, RangeNum, Reentry, RestPipe, RootWitness,
+    SliceTargetKind, StashedEscape, StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED,
+    WHILE_UNTIL_MAX_STEPS,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -20378,6 +20379,10 @@ fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
             && yq_field_index_on_scalar_is_empty::<S>() =>
         {
             GenericResult::None
+        }
+        // #4087: yq reads a boolean or `null` key on `null` as `null`.
+        _ if target.is_null() && yq_bool_null_key_into_null::<S>(key) => {
+            GenericResult::Owned(OwnedValue::Null)
         }
         _ if optional => GenericResult::None,
         _ => GenericResult::Error(EvalError::cannot_index(target.type_name(), key)),
