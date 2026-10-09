@@ -17,6 +17,19 @@ Tracks updates to the knowledge wiki pages in `docs/`.
   rule is left as is
 - [optimizations/README.md](optimizations/README.md) — index and rejected-experiments rows
 
+## 2026-10-09 — Canonical-echo wide objects settle in one exactly sized table (issue #3333)
+
+**Sources ingested:**
+- `scan_canonical_object` / `scan_canonical_object_wide` in `src/json/light.rs` and
+  `KeyHashes::has_repeat` / `SATURATING_KEYS` in `src/jq/document.rs`
+- Callgrind line attribution of `KeyHashes::insert`, cachegrind `Ir`, and interleaved wall-clock A/B
+  with a never-taking holdout on terminus (7950X) and johns-mac-mini (M4 Pro), plus a sort-based
+  alternative measured on both
+
+**Pages updated:**
+- [parsing/json.md](parsing/json.md) — new "Wide objects: one exactly sized table (#3333)" section:
+  the attribution, the table, the layout-band residual, and the rejected sort
+
 ## 2026-10-07 — Canonical-echo strings walk a specials mask (issue #3340)
 
 **Sources ingested:**

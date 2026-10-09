@@ -3312,18 +3312,21 @@ fn scalar_end_pos<W: AsRef<[u64]> + Clone>(
 ///   objects never cross that threshold, and [`KeyHashes::insert`]
 ///   heap-allocates its table on its very first call, which would
 ///   otherwise cost every tiny object a real allocation for no reason.
-///   Past the threshold a real [`KeyHashes`] table takes over, fed each
-///   key through [`key_hash`], and checks `KeyHashes::saturated` right
-///   after every `insert` -- matching every other `KeyHashes` caller in
-///   the tree (`DistinctKeyCursors::next`, `src/jq/document.rs`) -- so it
-///   bails the moment the table can no longer grow instead of paying for
-///   one more doomed string-scan-and-hash first; `insert` degrades to an
-///   unconditional conservative `true` past that point regardless, so
-///   this changes nothing about the answer, only the work spent reaching
-///   it. Either tier's "seen before" answer covers both a genuine
-///   duplicate key and a bare 64-bit hash collision between two distinct
-///   keys; both get the same conservative answer here (bail, don't try to
-///   disambiguate by comparing bytes) since either one means "cannot
+///   Past the threshold `scan_canonical_object_wide` takes over (#3333):
+///   each key's [`key_hash`] is only collected as the object is scanned,
+///   and [`KeyHashes::has_repeat`] settles them all at the closing `}`
+///   through a table sized for exactly that many keys, so nothing is
+///   rehashed on the way up. It stops collecting at
+///   [`KeyHashes::SATURATING_KEYS`] keys, the width at which a table grown
+///   key by key would have turned `saturated()` -- the same bail as every
+///   other `KeyHashes` caller in the tree (`DistinctKeyCursors::next`,
+///   `src/jq/document.rs`) -- so an over-wide object is declined without
+///   paying for one more doomed string-scan-and-hash. A repeat in a wide
+///   object is found at its end rather than at the key; the span is
+///   declined either way. Either tier's "seen before" answer covers both a
+///   genuine duplicate key and a bare 64-bit hash collision between two
+///   distinct keys; both get the same conservative answer here (bail, don't
+///   try to disambiguate by comparing bytes) since either one means "cannot
 ///   certify this object's span as canonical", not "definitely not
 ///   canonical" -- `KeyHashes`'s own doc comment describes the same
 ///   conservatism for its other callers. Both tiers, the seeding handoff
@@ -3614,8 +3617,9 @@ fn canonical_escape_len(bytes: &[u8], i: usize) -> Option<usize> {
 /// comma, each key checked against [`scan_json_string_span`] and hashed
 /// (raw span, undecoded -- see `canonical_compact_jq_span_end`'s own doc
 /// comment for why that's sound) to bail on any repeat -- pairwise below
-/// [`PAIRWISE_SPAN_SCAN_LIMIT`] keys, through a fresh per-object
-/// [`KeyHashes`] above it.
+/// [`PAIRWISE_SPAN_SCAN_LIMIT`] keys, through one exactly sized
+/// [`KeyHashes::has_repeat`] table per object above it
+/// (`scan_canonical_object_wide`).
 fn scan_canonical_object(
     bytes: &[u8],
     pos: usize,
@@ -3629,68 +3633,49 @@ fn scan_canonical_object(
     }
     // Small-object fast path (#2919 review): up to `PAIRWISE_SPAN_SCAN_LIMIT`
     // keys are compared pairwise via a cheap fingerprint, with no
-    // allocation at all. `seen_keys` -- a real `KeyHashes` table -- only
-    // comes into existence once an object turns out to have more keys
-    // than that; see `PAIRWISE_SPAN_SCAN_LIMIT`'s own doc comment.
+    // allocation at all. The hash-collecting tier
+    // (`scan_canonical_object_wide`) only takes over once an object turns
+    // out to have more keys than that; see `PAIRWISE_SPAN_SCAN_LIMIT`'s own
+    // doc comment.
     let mut small_spans: [(usize, usize); PAIRWISE_SPAN_SCAN_LIMIT] =
         [(0, 0); PAIRWISE_SPAN_SCAN_LIMIT];
     let mut small_fps: [u64; PAIRWISE_SPAN_SCAN_LIMIT] = [0; PAIRWISE_SPAN_SCAN_LIMIT];
     let mut small_count = 0usize;
-    let mut seen_keys: Option<KeyHashes> = None;
     loop {
         if bytes.get(i) != Some(&b'"') {
             return None;
         }
         let (key_start, key_end, after_key) = scan_json_string_span(bytes, i, specials)?;
-        if let Some(seen) = seen_keys.as_mut() {
-            // #2919 review: `saturated()` is checked right after `insert`,
-            // matching every other `KeyHashes` caller in the tree
-            // (`DistinctKeyCursors::next`, `src/jq/document.rs`), so this
-            // bails the moment the table can no longer grow instead of
-            // paying for one more doomed string-scan-and-hash first --
-            // `insert` degrades to an unconditional conservative `true`
-            // past that point regardless, so this changes nothing about
-            // the answer, only the work spent reaching it.
-            if seen.insert(key_hash(&bytes[key_start..key_end])) || seen.saturated() {
-                return None;
-            }
+        let fp = key_span_fingerprint(&bytes[i..after_key]);
+        let repeat = (0..small_count).any(|j| {
+            let (s, e) = small_spans[j];
+            small_fps[j] == fp && bytes[s..e] == bytes[key_start..key_end]
+        });
+        if repeat {
+            // A genuine duplicate key, or merely a hash collision --
+            // either way this object's span cannot be certified
+            // canonical (see this function's own doc comment).
+            return None;
+        }
+        if small_count < PAIRWISE_SPAN_SCAN_LIMIT {
+            small_fps[small_count] = fp;
+            small_spans[small_count] = (key_start, key_end);
+            small_count += 1;
         } else {
-            let fp = key_span_fingerprint(&bytes[i..after_key]);
-            let repeat = (0..small_count).any(|j| {
-                let (s, e) = small_spans[j];
-                small_fps[j] == fp && bytes[s..e] == bytes[key_start..key_end]
-            });
-            if repeat {
-                // A genuine duplicate key, or merely a hash collision --
-                // either way this object's span cannot be certified
-                // canonical (see this function's own doc comment).
-                return None;
+            // Overflow past the pairwise limit: the rest of the object is
+            // the table tier's, seeded with the hashes of what the
+            // pairwise scan already collected plus this key (#3333). Whether
+            // any two repeat is decided there, once -- including a bare
+            // 64-bit hash collision between keys the pairwise scan already
+            // proved distinct, which this whole function treats as "bail,
+            // don't try to disambiguate" (see `KeyHashes`'s own doc comment
+            // on `insert`).
+            let mut hashes = Vec::with_capacity(PAIRWISE_SPAN_SCAN_LIMIT * 4);
+            for &(s, e) in &small_spans[..small_count] {
+                hashes.push(key_hash(&bytes[s..e]));
             }
-            if small_count < PAIRWISE_SPAN_SCAN_LIMIT {
-                small_fps[small_count] = fp;
-                small_spans[small_count] = (key_start, key_end);
-                small_count += 1;
-            } else {
-                // Overflow past the pairwise limit: build a real table,
-                // seeded from what the pairwise scan already collected.
-                // None of those `small_count` keys can be a duplicate of
-                // each other -- the pairwise scan above already proved
-                // that -- so the only way this seeding loop's `insert`
-                // reports `true` is a bare 64-bit hash collision between
-                // two already-distinct keys, which this whole function
-                // already treats as "bail, don't try to disambiguate"
-                // (see `KeyHashes`'s own doc comment on `insert`).
-                let mut table = KeyHashes::with_capacity(small_count + 1);
-                for &(s, e) in &small_spans[..small_count] {
-                    if table.insert(key_hash(&bytes[s..e])) {
-                        return None; // patchcov: coverage tolerate-line reason="reachable only through a bare 64-bit hash collision between keys the pairwise scan already proved distinct"
-                    }
-                }
-                if table.insert(key_hash(&bytes[key_start..key_end])) || table.saturated() {
-                    return None;
-                }
-                seen_keys = Some(table);
-            }
+            hashes.push(key_hash(&bytes[key_start..key_end]));
+            return scan_canonical_object_wide(bytes, after_key, depth, specials, hashes);
         }
         if bytes.get(after_key) != Some(&b':') {
             return None;
@@ -3701,6 +3686,58 @@ fn scan_canonical_object(
             Some(b'}') => return Some(i + 1),
             _ => return None,
         }
+    }
+}
+
+/// The rest of an object [`scan_canonical_object`] found wider than
+/// [`PAIRWISE_SPAN_SCAN_LIMIT`] keys (#3333), entered with `after_key` just
+/// past the key that overflowed the pairwise tier and `hashes` holding
+/// every key's [`key_hash`] up to and including it.
+///
+/// Past the pairwise tier the keys' hashes are only *collected*, and one
+/// table sized for exactly that many keys settles them at the closing `}`
+/// ([`KeyHashes::has_repeat`]). A table grown key by key was 83 Ir per key
+/// on a wide object, about half of it rehashing what it had already
+/// placed. The object is declined at the same width a growing table would
+/// have been ([`KeyHashes::SATURATING_KEYS`]), checked as each hash is
+/// pushed so a doomed object costs no more string-scan-and-hash than it
+/// used to (#2919 review).
+///
+/// A repeat is therefore found at the end of the object rather than at the
+/// key. That is the cost of a bail only: the span is declined either way and
+/// the re-render that follows is far larger than the rest of one object's
+/// scan.
+///
+/// A separate function, not a branch in the loop above, so the small-object
+/// loop that nearly every object takes keeps no wide-tier state and no
+/// per-key test for it.
+#[inline(never)]
+fn scan_canonical_object_wide(
+    bytes: &[u8],
+    mut after_key: usize,
+    depth: usize,
+    specials: &mut SpecialMask,
+    mut hashes: Vec<u64>,
+) -> Option<usize> {
+    loop {
+        if bytes.get(after_key) != Some(&b':') {
+            return None;
+        }
+        let mut i = scan_canonical_value(bytes, after_key + 1, depth + 1, specials)?;
+        match bytes.get(i) {
+            Some(b',') => i += 1,
+            Some(b'}') => return (!KeyHashes::has_repeat(&hashes)).then_some(i + 1),
+            _ => return None,
+        }
+        if bytes.get(i) != Some(&b'"') {
+            return None;
+        }
+        let (key_start, key_end, next_after_key) = scan_json_string_span(bytes, i, specials)?;
+        hashes.push(key_hash(&bytes[key_start..key_end]));
+        if hashes.len() >= KeyHashes::SATURATING_KEYS {
+            return None;
+        }
+        after_key = next_after_key;
     }
 }
 
@@ -6950,8 +6987,9 @@ mod tests {
     /// `scan_canonical_object`'s duplicate-key check has *two* tiers
     /// (#2608 review): the first `PAIRWISE_SPAN_SCAN_LIMIT` keys are
     /// compared pairwise with no allocation, and the key that overflows
-    /// that limit seeds a real [`KeyHashes`] table every later key goes
-    /// through. Nothing else in this module's tests reaches the second
+    /// that limit hands the rest of the object to
+    /// `scan_canonical_object_wide`, which collects every later key's hash
+    /// for one exactly sized table (#3333). Nothing else in this module's tests reaches the second
     /// tier -- the corpus above tops out at six keys and the fuzz
     /// generator's objects are narrow -- so the seeding, the table tier
     /// and the *cross-tier* duplicate detection went unexercised.
@@ -6974,7 +7012,7 @@ mod tests {
     /// would pass just as happily if *both* wrongly echoed the duplicate.
     #[test]
     fn canonical_object_key_tiers_2608() {
-        for keys in [17usize, 20, 40] {
+        for keys in [17usize, 20, 40, 300] {
             let doc = wide_canonical_object(keys, None);
             assert!(
                 is_canonical_compact_jq_span(&doc),
@@ -6999,6 +7037,15 @@ mod tests {
             (24, 1, 20),
             (20, 17, 18),
             (24, 17, 20),
+            // #3333: the table tier settles at the closing `}`, so a repeat
+            // must be found when it is the object's *last* key, whether
+            // it repeats a pairwise-tier key or a table-tier one, and
+            // however wide the object has grown by then.
+            (20, 0, 19),
+            (20, 16, 19),
+            (300, 0, 299),
+            (300, 17, 299),
+            (300, 150, 151),
         ] {
             let duplicate = Some((first, repeat));
             let doc = wide_canonical_object(keys, duplicate);
@@ -7024,10 +7071,10 @@ mod tests {
 
     /// The table tier's third exit, after "seen this key" and "the span
     /// ended": [`KeyHashes`] stops growing at its own ceiling, and
-    /// `scan_canonical_object` checks `saturated()` after every `insert`
-    /// so it bails there instead of certifying the rest of a very wide
-    /// object against a table that can no longer record anything (#2608
-    /// review).
+    /// `scan_canonical_object_wide` stops collecting at
+    /// `KeyHashes::SATURATING_KEYS` keys so it bails there instead of
+    /// certifying the rest of a very wide object against a table that
+    /// could no longer record anything (#2608 review, #3333).
     ///
     /// The width is not negotiable -- `KeyHashes::MAX_SLOTS * 3 / 4`
     /// exactly, the point `src/jq/document.rs`'s own
@@ -7041,9 +7088,11 @@ mod tests {
     fn canonical_echo_bails_when_the_key_table_saturates_2608() {
         // `KeyHashes::MAX_SLOTS` (`1 << 20`) * 3/4: the key count at which
         // `insert` would next have doubled a table already at its ceiling,
-        // so `saturated()` first answers `true`. Private to `document.rs`,
-        // hence spelled out here rather than imported.
+        // so `saturated()` first answers `true`. Spelled out here as an
+        // oracle independent of the constant the scan uses, and checked
+        // against it on the next line.
         const SATURATES_AT: usize = 786_432;
+        assert_eq!(KeyHashes::SATURATING_KEYS, SATURATES_AT);
 
         let mut doc = String::with_capacity(SATURATES_AT * 13);
         doc.push('{');

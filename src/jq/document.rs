@@ -2528,8 +2528,9 @@ pub(crate) fn key_only_value_delimiter_ok<F: DocumentFields>(
 /// every pair of key spans.
 ///
 /// What it switches to instead is the caller's own business: a sort of one
-/// hash per key (`spans_repeat`, `src/bin/succinctly/jq_runner.rs`), or a
-/// real [`KeyHashes`] table (`scan_canonical_object`, `src/json/light.rs`).
+/// hash per key (`spans_repeat`, `src/bin/succinctly/jq_runner.rs`), or one
+/// [`KeyHashes::has_repeat`] table over the collected hashes
+/// (`scan_canonical_object_wide`, `src/json/light.rs`, #3333).
 ///
 /// Two independent reasons to keep a pairwise branch at all, one per side of
 /// the threshold:
@@ -2844,6 +2845,56 @@ impl KeyHashes {
     /// Whether nothing has been recorded yet.
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// The key count at which a growing table turns [`saturated`](Self::saturated)
+    /// -- the most distinct keys one object may hold and still be settled
+    /// by a table (#3333).
+    ///
+    /// A caller that collects an object's hashes first and settles them
+    /// afterwards ([`has_repeat`](Self::has_repeat)) stops collecting here,
+    /// so it declines exactly the objects an incrementally filled table
+    /// would, and builds a table no larger than `MAX_SLOTS`.
+    pub const SATURATING_KEYS: usize = Self::MAX_SLOTS * 3 / 4;
+
+    /// Whether `hashes` holds the same value twice, through a table sized
+    /// for exactly that many keys (#3333).
+    ///
+    /// The batch form of [`insert`](Self::insert), for a caller that has
+    /// every hash in hand before it needs the answer: with the count known
+    /// there is nothing to grow, so each key is probed once and never
+    /// rehashed. Conservative in the same way (two distinct keys sharing a
+    /// 64-bit hash count as a repeat), and folds each hash the same way, so
+    /// it agrees with a loop of `insert`s over the same list.
+    ///
+    /// A list of [`SATURATING_KEYS`](Self::SATURATING_KEYS) hashes or more
+    /// answers `true` without building anything, as a saturated table's
+    /// `insert` does: the table sized for it would be wider than
+    /// `MAX_SLOTS`.
+    pub fn has_repeat(hashes: &[u64]) -> bool {
+        // Past the ceiling the answer is the conservative one, as a
+        // saturated table's `insert` gives it, rather than a table wider
+        // than `MAX_SLOTS`.
+        if hashes.len() >= Self::SATURATING_KEYS {
+            return true;
+        }
+        let table = Self::with_capacity(hashes.len());
+        let (mut slots, mask) = (table.slots, table.mask);
+        for &hash in hashes {
+            let hash = Self::fold_hash(hash);
+            let mut at = (hash as usize) & mask;
+            loop {
+                match slots[at] {
+                    0 => {
+                        slots[at] = hash;
+                        break;
+                    }
+                    seen if seen == hash => return true,
+                    _ => at = (at + 1) & mask,
+                }
+            }
+        }
+        false
     }
 
     /// Double the table and re-place what it holds.
@@ -4409,6 +4460,108 @@ mod key_hash_tests {
         let mut seen = KeyHashes::new();
         assert!(!seen.insert(0));
         assert_eq!(seen.into_hashes(), alloc::vec![KeyHashes::fold_hash(0)]);
+    }
+
+    /// [`KeyHashes::has_repeat`] is the batch form of a loop of `insert`s
+    /// (#3333) and must give the same verdict on every list -- a repeat at
+    /// the first, middle and last position, adjacent and far apart, the
+    /// zero hash that folds onto `1`, and lists of every length through the
+    /// table's rounding points.
+    #[test]
+    fn key_hashes_has_repeat_agrees_with_insert_3333() {
+        fn by_insert(hashes: &[u64]) -> bool {
+            let mut seen = KeyHashes::new();
+            hashes.iter().any(|&hash| seen.insert(hash))
+        }
+        fn mix(i: u64) -> u64 {
+            let mut x = i.wrapping_add(1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            x ^= x >> 29;
+            x.wrapping_mul(0xbf58_476d_1ce4_e5b9) ^ (x >> 32)
+        }
+
+        // Two distinct keys sharing a 64-bit hash are the same hash here:
+        // the verdict is "may repeat", which the gate treats as a decline.
+        // The list holds hashes only, so there is nothing to disambiguate
+        // with.
+        assert!(!KeyHashes::has_repeat(&[]));
+        assert!(!KeyHashes::has_repeat(&[7]));
+        assert!(KeyHashes::has_repeat(&[7, 7]));
+        assert!(
+            KeyHashes::has_repeat(&[0, 1]),
+            "zero folds onto one, as `insert` folds it"
+        );
+        assert!(KeyHashes::has_repeat(&[0, 0]));
+        assert!(!KeyHashes::has_repeat(&[0, 2]));
+
+        // Lengths around every power-of-two table size `with_capacity`
+        // rounds to: 4n/3 crosses a power of two at 12, 24, 48, ...
+        for n in [
+            1usize, 11, 12, 13, 16, 17, 23, 24, 25, 47, 48, 49, 100, 1000, 1536, 1537, 5000,
+        ] {
+            let distinct: Vec<u64> = (0..n as u64).map(mix).collect();
+            assert!(!KeyHashes::has_repeat(&distinct), "{n} distinct hashes");
+            assert_eq!(by_insert(&distinct), KeyHashes::has_repeat(&distinct));
+            // A repeat of the first hash at each position, plus the
+            // neighbours of the last.
+            for at in [1, n / 2, n - 1].into_iter().filter(|&at| at > 0 && at < n) {
+                let mut repeated = distinct.clone();
+                repeated[at] = repeated[0];
+                assert!(KeyHashes::has_repeat(&repeated), "{n}: repeat at {at}");
+                assert_eq!(by_insert(&repeated), KeyHashes::has_repeat(&repeated));
+            }
+            // A repeat between the two *last* entries.
+            if n >= 2 {
+                let mut tail = distinct.clone();
+                tail[n - 1] = tail[n - 2];
+                assert!(KeyHashes::has_repeat(&tail), "{n}: repeat at the tail");
+            }
+        }
+    }
+
+    /// The batch form stops where the growing table does (#3333):
+    /// `SATURATING_KEYS` is the count at which `saturated()` first answers
+    /// `true`, one fewer distinct hash settles in a table within the
+    /// ceiling, a repeat in the very last slot of that widest list is
+    /// found, and a list at the ceiling answers conservatively instead of
+    /// building a wider table.
+    #[test]
+    fn key_hashes_has_repeat_stops_at_the_saturating_width_3333() {
+        fn mix(i: u64) -> u64 {
+            let mut x = i.wrapping_add(1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            x ^= x >> 29;
+            x.wrapping_mul(0xbf58_476d_1ce4_e5b9) ^ (x >> 32)
+        }
+
+        let mut seen = KeyHashes::new();
+        for i in 0..KeyHashes::SATURATING_KEYS as u64 - 1 {
+            assert!(!seen.insert(mix(i)));
+        }
+        assert!(!seen.saturated(), "one key short of the width");
+        assert!(!seen.insert(mix(u64::MAX)));
+        assert!(
+            seen.saturated(),
+            "SATURATING_KEYS is where saturated() turns true"
+        );
+
+        let mut widest: Vec<u64> = (0..KeyHashes::SATURATING_KEYS as u64 - 1)
+            .map(mix)
+            .collect();
+        assert!(
+            !KeyHashes::has_repeat(&widest),
+            "the widest list that settles"
+        );
+        let last = widest.len() - 1;
+        widest[last] = widest[0];
+        assert!(
+            KeyHashes::has_repeat(&widest),
+            "a repeat in the very last slot"
+        );
+
+        let over: Vec<u64> = (0..KeyHashes::SATURATING_KEYS as u64).map(mix).collect();
+        assert!(
+            KeyHashes::has_repeat(&over),
+            "at the ceiling the answer is conservative"
+        );
     }
 
     /// The table stops doubling at [`KeyHashes::MAX_SLOTS`] and says so
