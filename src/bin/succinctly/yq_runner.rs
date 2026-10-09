@@ -9170,7 +9170,19 @@ fn run_yq_inner(args: YqCommand) -> Result<i32> {
                 // would flip `any_yaml_doc_output` true in time for result
                 // 2's own (unwanted) separator check to fire on it too.
                 let mut first_result_in_doc = true;
-                for (result, comments) in results {
+                for (result, mut comments) in results {
+                    // A later file's `---` preamble marker is the separator written above
+                    // (#4086): yq prints it once.
+                    if wants_doc_separator && !defer_to_nul_check {
+                        if let Some(rest) = comments
+                            .meta()
+                            .preamble()
+                            .and_then(|pre| pre.strip_prefix("---\n"))
+                        {
+                            let rest = (!rest.is_empty()).then(|| rest.to_string());
+                            *comments.meta_mut() = comments.meta().with_preamble(rest);
+                        }
+                    }
                     // `split_doc` (#1709 code review) takes priority over
                     // the inter-document separator above when both apply --
                     // matches every other call site's own has_split_doc-

@@ -2715,7 +2715,7 @@ pub fn to_owned_with_comments<V: DocumentValue, S: EvalSemantics>(
         // before it) is printed back verbatim before the document on any write, and
         // stands in for the head comments it already contains.
         if is_document_root && is_first_document {
-            if let Some(preamble) = DocumentCursor::document_preamble(c) {
+            if let Some(preamble) = DocumentCursor::document_preamble(c, !is_collection) {
                 let meta = comments.meta();
                 let foot = meta.foot_comment().to_vec();
                 *comments.meta_mut() = meta

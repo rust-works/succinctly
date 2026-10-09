@@ -47136,6 +47136,32 @@ fn test_yq_dom_write_keeps_the_document_start_marker_4086() -> Result<()> {
     let cases: &[(&str, &str, &[&str], &str)] = &[
         (
             r"---
+# c
+5
+",
+            r". = 6",
+            &[],
+            r"---
+# c
+6
+",
+        ),
+        (
+            r"# top
+---
+# c
+5
+",
+            r". = 6",
+            &[],
+            r"# top
+---
+# c
+6
+",
+        ),
+        (
+            r"---
 a: 1
 ",
             r".b = 2",
@@ -47442,6 +47468,40 @@ l:
         let (out, err, code) = run_yq_stdin_with_stderr(filter, doc, extra)?;
         assert_eq!(out, *want, "`{filter}` {extra:?} on {doc:?}: {err}");
         assert_eq!(code, 0, "`{filter}` {extra:?} on {doc:?}: {err}");
+    }
+    Ok(())
+}
+
+/// #4086: in a multi-file run the marker of a later file's preamble is the separator
+/// between the files, printed once; a preamble that opens with comments keeps both.
+/// Captured live from yq v4.53.3.
+#[test]
+fn test_yq_later_files_preamble_marker_is_the_separator_4086() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let write = |name: &str, text: &str| -> Result<String> {
+        let path = dir.path().join(name);
+        std::fs::write(&path, text)?;
+        Ok(path.to_string_lossy().into_owned())
+    };
+    let plain = write("plain.yaml", "x: 5\n")?;
+    let marked = write("marked.yaml", "---\na: 1\n")?;
+    let headed = write("headed.yaml", "# t\n---\na: 1\n")?;
+    for (first, second, want) in [
+        (&plain, &marked, "x: 5\ny: 1\n---\na: 1\ny: 1\n"),
+        (&marked, &plain, "---\na: 1\ny: 1\n---\nx: 5\ny: 1\n"),
+        (&headed, &marked, "# t\n---\na: 1\ny: 1\n---\na: 1\ny: 1\n"),
+        (&plain, &headed, "x: 5\ny: 1\n---\n# t\n---\na: 1\ny: 1\n"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["yq", ".y = 1", first, second])
+            .stdin(Stdio::null())
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8(output.stdout)?, want, "{first} {second}");
     }
     Ok(())
 }

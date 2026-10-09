@@ -7579,7 +7579,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         }
     }
 
-    fn document_preamble(&self) -> Option<&str> {
+    fn document_preamble(&self, through_content: bool) -> Option<&str> {
         if !self.is_document_content() {
             return None;
         }
@@ -7617,7 +7617,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
                 break;
             }
         }
-        marker_seen.then(|| &preamble[..end])
+        marker_seen.then(|| &preamble[..if through_content { preamble.len() } else { end }])
     }
 
     #[inline]

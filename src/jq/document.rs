@@ -847,7 +847,10 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// verbatim, ending in a line break -- else `None` (#4086). Only meaningful for a
     /// document's own content node; yq re-prints it before the first document of a
     /// file on any write, where the DOM writer used to drop the marker.
-    fn document_preamble(&self) -> Option<&str> {
+    ///
+    /// `through_content` extends it over the comments after the marker too (for a bare
+    /// scalar root, which owns them; a collection's first node prints its own).
+    fn document_preamble(&self, _through_content: bool) -> Option<&str> {
         None
     }
 
