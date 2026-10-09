@@ -2068,6 +2068,39 @@ impl BalancedParens<Vec<u64>, NoSelect> {
     }
 }
 
+impl BalancedParens<Vec<u64>, NoSelect> {
+    /// The balanced parentheses of a single leaf, `()`: one word, two bits,
+    /// and no excess or rank directories (#4154).
+    ///
+    /// Answers every query exactly as `BalancedParens::new(vec![1], 2)` does.
+    /// The directories only accelerate scans that cross a word, and a
+    /// two-bit sequence never does: `find_close` answers a leaf from the bit
+    /// after the open before it reads a directory, `rank1` falls back to the
+    /// word count when a directory has no entry for the block, and
+    /// `find_open`/`enclose` never read one. That equivalence is pinned for
+    /// every method and position, in range or not, by
+    /// `test_leaf_answers_like_the_built_pair_4154`.
+    ///
+    /// For callers that build one per scalar (the jq reindex bridge), where
+    /// the eight directory `Vec`s are most of the allocations.
+    pub fn leaf() -> Self {
+        Self {
+            words: alloc::vec![0b01],
+            len: 2,
+            total_ones: 1,
+            l0_min_excess: Vec::new(),
+            l0_word_excess: Vec::new(),
+            l1_min_excess: Vec::new(),
+            l1_block_excess: Vec::new(),
+            l2_min_excess: Vec::new(),
+            l2_block_excess: Vec::new(),
+            rank_l1: Vec::new(),
+            rank_l2: Vec::new(),
+            select: NoSelect,
+        }
+    }
+}
+
 #[allow(deprecated)] // STYLE-0004: keeps the deprecated WithSelect path compiling and tested
 impl BalancedParens<Vec<u64>, WithSelect> {
     /// Build from an owned bitvector with select support enabled.
@@ -3053,6 +3086,56 @@ mod tests {
     // ========================================================================
     // Phase 2: BalancedParens struct tests
     // ========================================================================
+
+    /// #4154: `leaf()` skips the directories `new` builds, so every public
+    /// query must still answer as the built pair does -- at each position in
+    /// range and past the end.
+    #[test]
+    fn test_leaf_answers_like_the_built_pair_4154() {
+        let leaf = BalancedParens::leaf();
+        let built = BalancedParens::new(vec![0b01], 2);
+        assert_eq!(leaf.words(), built.words());
+        assert_eq!(leaf.len(), built.len());
+        assert_eq!(leaf.is_empty(), built.is_empty());
+        assert_eq!(leaf.total_ones(), built.total_ones());
+        assert_eq!(leaf.total_zeros(), built.total_zeros());
+        for p in 0..=130 {
+            assert_eq!(leaf.is_open(p), built.is_open(p), "is_open({p})");
+            assert_eq!(leaf.is_close(p), built.is_close(p), "is_close({p})");
+            assert_eq!(leaf.rank1(p), built.rank1(p), "rank1({p})");
+            assert_eq!(leaf.rank0(p), built.rank0(p), "rank0({p})");
+            assert_eq!(leaf.excess(p), built.excess(p), "excess({p})");
+            assert_eq!(leaf.find_close(p), built.find_close(p), "find_close({p})");
+            assert_eq!(leaf.find_open(p), built.find_open(p), "find_open({p})");
+            assert_eq!(leaf.enclose(p), built.enclose(p), "enclose({p})");
+            assert_eq!(leaf.parent(p), built.parent(p), "parent({p})");
+            assert_eq!(
+                leaf.next_sibling(p),
+                built.next_sibling(p),
+                "next_sibling({p})"
+            );
+            assert_eq!(
+                leaf.prev_sibling(p),
+                built.prev_sibling(p),
+                "prev_sibling({p})"
+            );
+            assert_eq!(
+                leaf.first_child(p),
+                built.first_child(p),
+                "first_child({p})"
+            );
+            assert_eq!(leaf.depth(p), built.depth(p), "depth({p})");
+            assert_eq!(
+                leaf.subtree_size(p),
+                built.subtree_size(p),
+                "subtree_size({p})"
+            );
+            assert_eq!(leaf.select1(p), built.select1(p), "select1({p})");
+            assert_eq!(leaf.select0(p), built.select0(p), "select0({p})");
+        }
+        assert_eq!(leaf.find_close(0), Some(1));
+        assert_eq!(leaf.rank1(2), 1);
+    }
 
     #[test]
     fn test_balanced_parens_new() {
