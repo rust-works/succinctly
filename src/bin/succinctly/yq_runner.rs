@@ -4057,7 +4057,7 @@ fn apply_meta_assign_writes(
                 node.meta_mut().anchor = name.clone().map(AnchorMark::Declares);
             }
             // Handled above, before the node is borrowed.
-            MetaEffect::Clear { .. } => {}
+            MetaEffect::Clear { .. } => {} // patchcov: coverage tolerate-line reason="unreachable: apply_meta_assign_writes sends every Clear to apply_clear and continues before reaching this match (#2796)"
         }
     }
 }
@@ -4084,10 +4084,10 @@ fn apply_clear(
 ) {
     if write.on_key {
         let Some((TreeStep::Key(key), parent_steps)) = steps.split_last() else {
-            return;
+            return; // patchcov: coverage tolerate-line reason="unreachable: a key-node write is only built for a member (resolve_one_meta_assign pushes `path` + Key(member)), so its last step is always a Key (#2796)"
         };
         let Some(parent) = comment_tree_at_path_or_create_mut(tree, parent_steps) else {
-            return;
+            return; // patchcov: coverage tolerate-line reason="unreachable: the parent path is a candidate of the same path(..) walk and the value tree has it, so the comment tree is grown to it (#2796)"
         };
         if line {
             parent.clear_key_comment(key);
@@ -11266,5 +11266,102 @@ mod tests {
         // No style: a YAML key spelled like a number is a typed key and stays bare.
         assert_eq!(yaml_quote_key("1", "", false, false), "1");
         assert_eq!(yaml_quote_key("1", "", false, true), "\"1\"");
+    }
+
+    /// Run `filter` over `yaml` through the production metadata-write path and render the
+    /// single result with the DOM emitter, comments included.
+    fn render_with_comments(yaml: &str, filter: &str) -> String {
+        let expr = jq::parse_with_mode(filter, jq::ParserMode::Yq).unwrap();
+        let results = eval_yaml_with_comments(yaml.as_bytes(), &expr);
+        assert_eq!(results.len(), 1, "{filter}");
+        let config = OutputConfig {
+            output_format: OutputFormat::Yaml,
+            compact: false,
+            raw_output: false,
+            join_output: false,
+            nul_output: false,
+            ascii_output: false,
+            sort_keys: false,
+            no_doc: false,
+            indent_str: "  ".to_string(),
+            use_color: false,
+            json_sourced_floats: false,
+        };
+        let (value, comments) = &results[0];
+        emit_yaml_value(value, comments, &config, "", false)
+    }
+
+    /// #2796: `...` visits the mapping keys too, so its clearing writes reach what yq keeps on
+    /// the key node (the lines above `b:`, the comment after a key whose value starts on the
+    /// next line) and the sequence items' own lines, in every spelling of the slot.
+    #[test]
+    fn dots_clearing_reaches_key_nodes_2796() {
+        let yaml = "a: 1 # line\n# mid\nb:\n  # inner\n  c: 2 # lc\ne: # key line\n  - x\n";
+        for (filter, want) in [
+            ("... comments = \"\"", "a: 1\nb:\n  c: 2\ne:\n  - x"),
+            (
+                "... head_comment = \"\"",
+                "a: 1 # line\nb:\n  c: 2 # lc\ne: # key line\n  - x",
+            ),
+            (
+                "... line_comment = \"\"",
+                "a: 1\n# mid\nb:\n  # inner\n  c: 2\ne:\n  - x",
+            ),
+            // `|=` binds `.` to the key's own text, which a clearing write ignores.
+            ("... comments |= \"\"", "a: 1\nb:\n  c: 2\ne:\n  - x"),
+        ] {
+            assert_eq!(
+                render_with_comments(yaml, filter).trim_end(),
+                want,
+                "{filter}"
+            );
+        }
+    }
+
+    /// #2796: a value node clears its line comment but keeps the lines above a mapping value,
+    /// which belong to its key; a sequence item and the root own theirs.
+    #[test]
+    fn value_clearing_keeps_a_mapping_values_key_lines_2796() {
+        let map = "a: 1 # line\n# mid\nb: 2\n";
+        assert_eq!(
+            render_with_comments(map, ".a comments = \"\"").trim_end(),
+            "a: 1\n# mid\nb: 2"
+        );
+        assert_eq!(
+            render_with_comments(map, ".b head_comment = \"\"").trim_end(),
+            "a: 1 # line\n# mid\nb: 2"
+        );
+        let seq = "# h\n- x # one\n# n\n- y\n";
+        assert_eq!(
+            render_with_comments(seq, ".. head_comment = \"\"").trim_end(),
+            "- x # one\n- y"
+        );
+    }
+
+    /// #2796: a metadata write is resolved once, against the first document, so a filter that
+    /// asks which document or file it is on is refused instead of silently writing nothing for
+    /// the others; one that does not is unaffected.
+    #[test]
+    fn metadata_write_depending_on_the_document_index_is_refused_2796() {
+        let yaml = b"a: 1\n";
+        for filter in [
+            "select(di == 1) | .a comments = \"\"",
+            ".a comments = (fi | tostring)",
+        ] {
+            let expr = jq::parse_with_mode(filter, jq::ParserMode::Yq).unwrap();
+            let mut sink = ErrorSink::default();
+            let root = OwnedValue::Null;
+            assert!(
+                resolve_meta_assign_writes(&expr, &root, &mut sink).is_none(),
+                "{filter}"
+            );
+            assert_eq!(sink.report_count(), 1, "{filter}");
+        }
+        let expr = jq::parse_with_mode(".a comments = \"\"", jq::ParserMode::Yq).unwrap();
+        assert!(
+            resolve_meta_assign_writes(&expr, &OwnedValue::Null, &mut ErrorSink::default())
+                .is_some()
+        );
+        assert_eq!(eval_yaml(yaml, &expr).len(), 1);
     }
 }
