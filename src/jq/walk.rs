@@ -752,6 +752,7 @@ pub fn map_pattern_subexprs(pattern: &Pattern, f: &mut dyn FnMut(&Expr) -> Expr)
                 .map(|entry| PatternEntry {
                     key: match &entry.key {
                         ObjectKey::Literal(s) => ObjectKey::Literal(s.clone()),
+                        ObjectKey::Bare => ObjectKey::Bare,
                         ObjectKey::Expr(e) => ObjectKey::Expr(Box::new(f(e))),
                     },
                     bind: entry.bind.clone(),
@@ -946,6 +947,7 @@ pub fn map_subexprs(expr: &Expr, mut f: &mut dyn FnMut(&Expr) -> Expr) -> Expr {
                 .map(|entry| {
                     let key = match &entry.key {
                         ObjectKey::Literal(s) => ObjectKey::Literal(s.clone()),
+                        ObjectKey::Bare => ObjectKey::Bare,
                         ObjectKey::Expr(e) => ObjectKey::Expr(Box::new(f(e))),
                     };
                     ObjectEntry {

@@ -2078,6 +2078,7 @@ fn is_closed_literal(expr: &Expr) -> bool {
         Expr::Object(entries) => entries.iter().all(|e| {
             let key_closed = match &e.key {
                 ObjectKey::Literal(_) => true,
+                ObjectKey::Bare => false,
                 ObjectKey::Expr(k) => is_closed_literal(k),
             };
             key_closed && is_closed_literal(&e.value)
