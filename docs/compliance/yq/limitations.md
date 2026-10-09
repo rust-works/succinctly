@@ -2332,14 +2332,21 @@ A float literal keeps its spelling (`.[1.0]` finds the `1.0:` member and `.[1.9]
 yq does), but `.[01]` is parsed as the integer `1`, so it finds -- and a write updates -- the `1:`
 member where yq answers the `01:` one (the recorded lost-spelling residual).
 
-**Still raising: a write grouped with other targets.** The single-target forms above (`.a[1] = 7`,
-`|=`, `+=`, `style=`/`anchor=`/`line_comment=`, a computed key) work, but the eager path walker
-(`walk_path`, `step_into`, `classify_static_component`) and `setpath` read a numeric component on
-an object separately from `set_path`, so a write whose targets are enumerated first still raises
-`Cannot index object with number` where yq updates the member (and `del` leaves a mapping's
-member alone): `(.a[1], .a[2]) = 7`,
-`(.a[1], .a.x) = 7`, `(.a[1] // .z) = 3`, `(.a | select(.[1] == "y") | .[1]) = 1`,
-`(.a[1], .l[0]) = 3` and `del(.a[1], .l[0])`.
+**Grouped and multi-target writes follow the same rule
+([#4085](https://github.com/rust-works/succinctly/issues/4085)).** The eager path walker
+(`navigate_static_component_ref`) reads a numeric index on a mapping by its key text, so
+`(.a[1], .a[2]) = 7`, `(.a[1], .a.x) |= "q"`, `(.a[1] // .z) = 3`, `(.a | select(.[1] == "y") | .[1]) = 1`
+and `(.a[1], .l[0]) = 3` update the members as in yq, and `del()` follows yq's two-sided rule: a
+*terminal* index on a mapping deletes nothing (`del(.a[1], .l[0])` leaves `1:` and deletes `.l[0]`,
+#2353), while a continuation walks into the member (`del(.a[1].b)` and `del(.a[1].b, .l[0])` delete
+`b` from the `1:` member), through `delete_path_steps` for one path and `delete_trie_array` for a
+comma-grouped set. A grouped `del()` carrying a float-spelled index keeps raising
+(`del(.a[1.0].b, .a[1].c)`): the trie's edge keeps the truncated index, not its spelling, so it
+cannot tell the `1.0:` member from `1:`, and refusing beats deleting from the wrong one. Two
+residues are shared with string keys and not specific to this issue: `(.a[9] // .z) = 3` does not
+create the `9:` key that yq's `//` leaves behind as `null`, and a grouped `del()` continuing past a
+scalar (`del(.a[1].b[0], .l[0])`, `del(.a.x.y[0], .l[0])`) raises `Cannot index number with number`
+where the single-path form and yq no-op.
 
 ### `=`'s multi-output RHS: real yq takes only the last value, no fan-out
 
