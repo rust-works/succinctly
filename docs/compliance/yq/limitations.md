@@ -3811,6 +3811,13 @@ accepted (`.[(1.0+1):]` is `.[2:]`). `succinctly yq` raises its usual `Array/str
 indices must be integers` for the first group — again only the message text differs —
 and no longer floors/ceils as jq does (`succinctly jq` still does).
 
+A bound with **no** output is not part of that divergence: yq raises `expected to find 1 number,
+got 0 instead` for it wherever the slice is read or written (`.b[select(false):]`, `.b[$typo:]`,
+`.b[1:select(false)] = [9]`, `del(.b[select(false):])`), on every target kind, and neither `?` nor
+`//` suppresses it, so `succinctly yq` raises the same text (#4197, confirmed live against yq
+v4.53.3). Only the zero count is raised; a bound with two or more values keeps the generator
+model described above. jq mode keeps its own rule (an empty bound is "no slice").
+
 ### An integer-shaped overflow float gains a trailing `.0` on the value route (#2419)
 
 This is the yq-mode counterpart to jq mode's
