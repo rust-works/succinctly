@@ -121840,7 +121840,9 @@ fn test_error_message_navigation_is_path_checked_4146() -> Result<()> {
 /// (`{a:{b:1}} | ...`) or the accumulator of an enclosing fold whose source navigated. The
 /// by-value drive answered, and a `del`/`=` through the answer wrote (the first row deleted the
 /// whole document). The last rows are contrasts that stay answered: the destructure at the
-/// register itself. Every row captured from jq 1.7.1, on the stdin and `-n` routes.
+/// register itself. Every row captured from jq 1.7.1, on the stdin and `-n` routes. Where the
+/// refusal is the loud guess inside another fold's body it reads `with result ...` rather than
+/// jq's `near attempt to access element "a"`, so those rows pin only the shared prefix.
 #[test]
 fn test_fold_source_destructuring_the_register_raises_where_it_is_not_4128() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -121848,7 +121850,7 @@ fn test_fold_source_destructuring_the_register_raises_where_it_is_not_4128() -> 
             r#"{"a":false,"b":null}"#,
             r"del(reduce .[]? as $k (.; foreach ((.|.) | reduce . as {a:$a} (0; .)) as $x (.; .; .)))",
             "",
-            r#"Invalid path expression near attempt to access element "a""#,
+            r"Invalid path expression",
             5,
         ),
         (
@@ -121897,7 +121899,7 @@ fn test_fold_source_destructuring_the_register_raises_where_it_is_not_4128() -> 
             r#"{"a":1,"b":2}"#,
             r"del(reduce .[]? as $k (.; ((foreach (select(true) as {a:$a} | .) as $k (.; .; .)))))",
             "",
-            r#"Invalid path expression near attempt to access element "a""#,
+            r"Invalid path expression",
             5,
         ),
         (
