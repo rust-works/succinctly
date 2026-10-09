@@ -121909,6 +121909,21 @@ fn test_fold_source_destructuring_the_register_raises_where_it_is_not_4128() -> 
             r"Invalid path expression",
             5,
         ),
+        // A nested `reduce` with a plain loop pattern: its destructuring SOURCE is read through it.
+        (
+            r#"{"a":false,"b":null}"#,
+            r"del(reduce .[]? as $k (.; foreach (reduce (. as {a:$a} | .) as $q (0; .)) as $x (.; .; .)))",
+            "",
+            r"Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":false,"b":null}"#,
+            r"del(reduce .[]? as $k (.; foreach (reduce (. as {a:$a} | $a) as $q (0; .)) as $x (.; .; .)))",
+            "",
+            r"Invalid path expression",
+            5,
+        ),
         (
             r"[1,2]",
             r"[path(reduce (. as [$a] | $a) as $k (.; .))]",
