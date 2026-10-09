@@ -6187,6 +6187,10 @@ impl<'a> LineCounter<'a> {
 /// target without per-architecture intrinsics. The `filter` form kept a
 /// scalar `usize` counter live across the whole span, which is the term the
 /// #4160 profile attributed to `LineCounter::advance_to` on a 2 MB document.
+///
+/// That it vectorizes is measured end to end (#4172), not pinned: no test or
+/// guard row fails if a toolchain or a change to the fold stops LLVM doing so,
+/// so a re-measurement is the check if this ever reads slower.
 fn count_newlines(bytes: &[u8]) -> usize {
     let mut chunks = bytes.chunks_exact(64);
     let mut total = 0usize;
