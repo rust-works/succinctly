@@ -54971,8 +54971,9 @@ fn value_after_components<S: EvalSemantics>(
     for component in components {
         current = match navigate_static_component_ref::<S>(component, &current)? {
             Some(next) => next,
-            // Zero outputs here can only come from a `?`-suppressed step
-            // that failed to navigate (#2124): every component reaching
+            // Zero outputs here come from a `?`-suppressed step that failed
+            // to navigate (#2124), or, in yq mode, a field/index step into a
+            // scalar (#3039): every component reaching
             // this loop is a bare `Field`/`Index`/`Slice`-family step
             // (`needs_fanout_pass` routes anything else, `Iterate`
             // included, through the real fan-out loop instead), and a
@@ -55238,6 +55239,17 @@ fn navigate_static_component_ref<'v, S: EvalSemantics>(
         if let Some(text) = yq_literal_index_text::<S>(*idx, key.as_ref()) {
             return Ok(Some(current.field(&text)));
         }
+    }
+    // #3039: yq's `traverse` ends `default: return list.New(), nil` -- a field or index
+    // step into a string, number or boolean yields no candidate rather than raising. The
+    // step prunes its branch (the `Ok(None)` a `?`-suppressed step already means), so a
+    // comma sibling still resolves. `null` keeps navigating (it autovivifies), and a
+    // container of the wrong kind still raises below, as in yq.
+    if S::TAG == EvalTag::Yq
+        && matches!(component, Expr::Field(_) | Expr::Index { .. })
+        && is_yq_field_index_noop_scalar(current.value())
+    {
+        return Ok(None);
     }
     Ok(Some(
         match classify_static_component(component, current.value())? {

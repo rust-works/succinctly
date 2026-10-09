@@ -2220,6 +2220,16 @@ $ printf 'null\n' | yq            '(null | .a) = 5'   # null, no-op
 $ printf 'null\n' | succinctly yq '(null | .a) = 5'   # Error: Invalid path expression near attempt to access element "a" of null
 ```
 
+**Fixed for a field/index step by [#3039](https://github.com/rust-works/succinctly/issues/3039):**
+yq's `traverse` ends `default: return list.New(), nil`, so a `Field`/`Index` step into a
+string, number or boolean yields no candidate. The static-tail navigator
+(`navigate_static_component_ref`) now prunes that branch in yq mode, so
+`(.a.b, .x.y) = 99` on `a: 5, x: {}` writes `.x.y` and `del(.c, .a[0])` on `a: ab` keeps its
+`.c` deletion. `null` still autovivifies, a container of the wrong kind still raises, and jq
+mode still raises (jq 1.7.1 does). Still open: an *iterate* step into a scalar
+(`del(.c, .a[])` on `a: ab`), which `resolve_iterate_sink` deliberately leaves raising
+([#2376](https://github.com/rust-works/succinctly/issues/2376)).
+
 **Fixed by [#1298](https://github.com/rust-works/succinctly/issues/1298):** `get_path_mut`
 (the walker #1232 widened) used to have no `Expr::Iterate` arm at all, so a mid-chain `.[]`
 under plain `=` (`.a[].b = 99`) always errored "invalid path component" — in both jq and yq

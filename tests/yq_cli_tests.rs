@@ -27275,42 +27275,26 @@ fn test_yq_slice_assign_scalar_noop_still_propagates_rhs_error_unaffected_by_123
     Ok(())
 }
 
-/// #1233 (deliberate non-goal, filed as #1412): a comma-grouped LHS where
-/// one branch is a genuine write skips `yq_assign_is_total_noop`'s fast
-/// path entirely -- its gate (`!needs_path_prepass`) excludes every
-/// `Comma`-containing path -- so the scalar branch (`.a.x` on `a: 5`)
-/// reaches the write and raises where real yq silently no-ops it.
-///
-/// That divergence is pre-existing and unchanged: a plain `(.a.x, .b.x) =
-/// 9` on the same input raises here both before and after #2481, while yq
-/// answers `{"a":5,"b":{"x":9}}` (v4.53.3). What #2481 did change is
-/// *which* error a failing RHS reports alongside it: the left side is now
-/// walked first, so its own failure surfaces instead of `boom`. Pinned as
-/// the observable consequence of that ordering, not as parity -- yq
-/// reports `boom` here, because its own left-side walk doesn't fail.
+/// #1233 (filed as #1412), closed for the resolver half by #3039: a comma-grouped LHS where
+/// one branch is a genuine write skips `yq_assign_is_total_noop`'s fast path entirely -- its
+/// gate (`!needs_path_prepass`) excludes every `Comma`-containing path -- so the scalar
+/// branch (`.a.x` on `a: 5`) reaches the resolver. It used to raise there where real yq
+/// silently no-ops it, and the left side's own failure outranked the RHS's. It now prunes, so
+/// the real branch runs and a failing RHS reports `boom` exactly as yq does (v4.53.3).
 #[test]
-fn test_yq_comma_lhs_mixed_noop_and_real_write_raises_lhs_error_1233() -> Result<()> {
+fn test_yq_comma_lhs_mixed_noop_and_real_write_reports_rhs_error_1233() -> Result<()> {
     let (_out, err, code) = run_yq_stdin_with_stderr(
         "(.a.x, .b.x) = error(\"boom\")",
         "a: 5\nb: {}\n",
         &["-o", "json"],
     )?;
     assert_ne!(code, 0);
-    assert!(
-        err.contains(r#"Cannot index number with string "x""#),
-        "err={err}"
-    );
+    assert!(err.contains("boom"), "err={err}");
 
-    // The same shape with a harmless RHS raises identically -- proof the
-    // error above is the pre-existing write-path gap surfacing earlier,
-    // not a new failure #2481 introduced.
-    let (_out, err, code) =
-        run_yq_stdin_with_stderr("(.a.x, .b.x) = 9", "a: 5\nb: {}\n", &["-o", "json"])?;
-    assert_ne!(code, 0);
-    assert!(
-        err.contains(r#"Cannot index number with string "x""#),
-        "err={err}"
-    );
+    // The same shape with a harmless RHS writes the real branch and skips the scalar one.
+    let (out, code) = run_yq_stdin("(.a.x, .b.x) = 9", "a: 5\nb: {}\n", &["-o", "json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":5,"b":{"x":9}}"#);
     Ok(())
 }
 
@@ -60118,5 +60102,76 @@ fn test_tags_on_flow_collections_and_mapping_keys_are_kept_4088() -> Result<()> 
             "`{filter}` {args:?} on {doc:?}: stderr {stderr:?}"
         );
     }
+    Ok(())
+}
+
+/// #3039: a comma-grouped `del()`/write whose branch navigates into a scalar prunes that
+/// branch (yq's `traverse` yields no candidate) instead of raising and losing its siblings.
+#[test]
+fn test_yq_comma_branch_crossing_a_scalar_prunes_only_that_branch_3039() -> Result<()> {
+    let cases: &[(&str, &str, &str)] = &[
+        (r#"{"a":"ab","c":1}"#, "del(.c, .a[0])", r#"{"a":"ab"}"#),
+        (r#"{"a":"ab","c":1}"#, "del(.a[0], .c)", r#"{"a":"ab"}"#),
+        (r#"{"a":"ab","c":1}"#, "del(.c, .a.b)", r#"{"a":"ab"}"#),
+        (r#"{"a":"ab","c":1}"#, "del(.c, .a.b.c)", r#"{"a":"ab"}"#),
+        (r#"{"a":true,"c":1}"#, "del(.c, .a[0])", r#"{"a":true}"#),
+        (r#"{"a":"ab"}"#, "del(.a[0], .a[1])", r#"{"a":"ab"}"#),
+        (r#"[1,"ab"]"#, "del(.[0], .[1][0])", r#"["ab"]"#),
+        (r#"{"a":"ab","c":1}"#, "del((.c, .a[0]))", r#"{"a":"ab"}"#),
+        (
+            r#"{"a":"ab","c":1}"#,
+            "del(.c | .., .a[0])",
+            r#"{"a":"ab"}"#,
+        ),
+        (
+            r#"{"a":"ab","c":1}"#,
+            r#"del(.c, .["a"][0])"#,
+            r#"{"a":"ab"}"#,
+        ),
+        (r#"{"a":"ab"}"#, "del(.a, .a[0])", "{}"),
+        (r#"{"a":5}"#, "del(.a, .a[0])", "{}"),
+        (r#"["ab"]"#, "del(.[0], .[0][0])", "[]"),
+        (r#"{"a":{"b":"ab"}}"#, "del(.a, .a.b[0])", "{}"),
+        // Rows that already agreed, and must not change.
+        (r#"{"a":"ab"}"#, "del(.a[0])", r#"{"a":"ab"}"#),
+        (r#"{"a":"ab","c":1}"#, "del(.a.b.c)", r#"{"a":"ab","c":1}"#),
+        (r#"{"a":"ab","c":1}"#, "del(.c, .a[0]?)", r#"{"a":"ab"}"#),
+        // null still autovivifies (#2323).
+        (r#"{"a":null,"c":1}"#, "del(.c, .a[0])", r#"{"a":[]}"#),
+        // The same prune reaches a comma-grouped write (#1419 symptom 2).
+        (
+            r#"{"a":"ab","c":1}"#,
+            "(.c, .a[0]) = 9",
+            r#"{"a":"ab","c":9}"#,
+        ),
+        (
+            r#"{"a":"ab","c":1}"#,
+            "(.c, .a.b) |= 9",
+            r#"{"a":"ab","c":9}"#,
+        ),
+    ];
+    for (doc, filter, want) in cases {
+        let (out, code) = run_yq_stdin(filter, doc, &["-p", "json", "-o", "json", "-I=0"])?;
+        assert_eq!(code, 0, "{filter} on {doc}");
+        assert_eq!(out.trim(), *want, "{filter} on {doc}");
+    }
+
+    // K7: yq still raises inside a doomed key.
+    let (_out, err, code) = run_yq_stdin_with_stderr(
+        "del(.a, .a[-5])",
+        r#"{"a":[1,2]}"#,
+        &["-p", "json", "-o", "json"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(err.contains("out of range"), "err={err}");
+    Ok(())
+}
+
+/// #3039 K8: jq 1.7.1 raises on the same shape, so the prune stays yq-only.
+#[test]
+fn test_jq_comma_branch_crossing_a_scalar_still_raises_3039() -> Result<()> {
+    let (_out, err, code) = run_jq_stdin_with_stderr("del(.a, .a[0])", r#"{"a":"ab"}"#, &["-c"])?;
+    assert_ne!(code, 0);
+    assert!(err.contains("Cannot index string with number"), "err={err}");
     Ok(())
 }
