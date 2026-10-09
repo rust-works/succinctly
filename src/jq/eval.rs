@@ -42783,6 +42783,7 @@ fn leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
                     | Builtin::Join(_)
                     | Builtin::Max
                     | Builtin::MaxBy(_)
+                    | Builtin::InputLineNumber
                     | Builtin::Min
                     | Builtin::MinBy(_)
                     | Builtin::Reverse
@@ -42819,7 +42820,7 @@ fn leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
 /// (#3767 part 4: `first(5)` is as unmoving as the `5`), but never for a bare
 /// stage, which the caller has asked already.
 fn stage_leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
-    last_register_unmoved::<S>() && stage_is_register_keeping(expr)
+    last_register_unmoved::<S>() && stage_is_register_keeping::<S>(expr)
 }
 
 /// The shape half of [`stage_leaves_register_in_place`]: `expr` read through the
@@ -42841,22 +42842,29 @@ fn stage_leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
 /// catch .` is `[]`, `try (last(.a), error("e")) catch .` is `[]` twice, and
 /// `try last(.a) catch .a` is `[]` too (the handler never ran) while `try
 /// (select(.), error({"a":1})) catch .a` raises (it ran, and navigated).
-fn stage_is_register_keeping(expr: &Expr) -> bool {
+fn stage_is_register_keeping<S: EvalSemantics>(expr: &Expr) -> bool {
     match peel_register_transparent(expr) {
         Expr::Try {
             expr: inner,
             catch: Some(handler),
-        } => stage_is_register_keeping(inner) && cannot_move_register(handler),
+        } => stage_is_register_keeping::<S>(inner) && cannot_move_register(handler),
         // #3767: a stage that navigates nothing leaves it where it was, and the
         // wrappers peeled above add no movement, so `first(5)`, `limit(1; 5)` and
         // `nth(0; 5)` are as unmoving as the `5` under them.
         //
         // Only a *peeled* stage is asked: `resolve_seq_stage` has already asked the bare
         // `expr` (`stage_preserves_register`), so asking it again would repeat that walk.
+        //
+        // #4108: the peeled stage is read through the leaf verdict, not only
+        // [`cannot_move_register`]: `first(to_entries)`, `limit(1; sort)` are as unmoving as the
+        // bare `to_entries`/`sort` that [`leaves_register_in_place`] admits, and a `first(E)`
+        // over one is refused where jq answers (a swallowed refusal under `try` then skips a
+        // write).
         stage => {
             is_last_stage(stage)
                 || is_select_stage(stage)
-                || (!core::ptr::eq(stage, unwrap_paren(expr)) && cannot_move_register(stage))
+                || (!core::ptr::eq(stage, unwrap_paren(expr))
+                    && leaves_register_in_place::<S>(stage))
         }
     }
 }
