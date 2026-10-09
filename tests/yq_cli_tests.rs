@@ -22313,7 +22313,7 @@ fn test_eval_all_reduce_merge() -> Result<()> {
     let (stdout, _stderr, code) = run_yq_files(
         "[.] | reduce .[] as $item ({}; . * $item)",
         &[f1.path(), f2.path()],
-        &["--eval-all", "-o", "json", "-I0"],
+        &["--jq-extensions", "--eval-all", "-o", "json", "-I0"],
     )?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), r#"{"a":1,"name":"second","b":2}"#);
@@ -32752,7 +32752,7 @@ fn test_yq_reduce_foreach_accept_full_pattern_1201() -> Result<()> {
     let (output, exit_code) = run_yq_stdin(
         ".a | reduce .[] as {x: $x} (0; . + $x)",
         "a:\n  - x: 1\n  - x: 2\n",
-        &["-o", "json"],
+        &["--jq-extensions", "-o", "json"],
     )?;
     assert_eq!(exit_code, 0, "output: {output:?}");
     assert_eq!(output.trim(), "3");
@@ -32760,7 +32760,7 @@ fn test_yq_reduce_foreach_accept_full_pattern_1201() -> Result<()> {
     let (output, exit_code) = run_yq_stdin(
         ".a | foreach .[] as [$p, $q] (0; . + $p + $q; .)",
         "a:\n  - [1, 2]\n  - [3, 4]\n",
-        &["-o", "json"],
+        &["--jq-extensions", "-o", "json"],
     )?;
     assert_eq!(exit_code, 0, "output: {output:?}");
     assert_eq!(output.lines().collect::<Vec<_>>(), ["3", "10"]);
@@ -41118,7 +41118,7 @@ fn test_fold_and_loop_path_context_2473() -> Result<()> {
         // UPDATE reads the accumulator, which has no position.
         ("reduce .d[] as $x (.a; [.[] | key])", "[0,1]"),
     ] {
-        let (output, code) = run_yq_stdin(filter, doc, args)?;
+        let (output, code) = run_yq_stdin(filter, doc, &["--jq-extensions", "-o=json", "-I=0"])?;
         assert_eq!(code, 0, "`{filter}`: {output:?}");
         assert_eq!(output.trim(), expected, "`{filter}`");
     }
@@ -51403,7 +51403,8 @@ fn test_foreach_register_reentry_is_jq_mode_only_on_the_write_side_2161() -> Res
         "(foreach (1) as $k (null; .a)) = 5",
         "(foreach (1,2) as $k (null; .a)) = 5",
     ] {
-        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "null\n", &[])?;
+        let (stdout, stderr, code) =
+            run_yq_stdin_with_stderr(filter, "null\n", &["--jq-extensions"])?;
         assert_eq!(
             code, 1,
             "`{filter}` -- stdout: {stdout:?} stderr: {stderr:?}"
@@ -51436,7 +51437,8 @@ fn test_reduce_register_reentry_is_jq_mode_only_on_the_write_side_2632() -> Resu
         "(reduce (1) as $k (null; .a)) = 5",
         "(reduce (1,2) as $k (null; .a)) = 5",
     ] {
-        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "null\n", &[])?;
+        let (stdout, stderr, code) =
+            run_yq_stdin_with_stderr(filter, "null\n", &["--jq-extensions"])?;
         assert_eq!(
             code, 1,
             "`{filter}` -- stdout: {stdout:?} stderr: {stderr:?}"
@@ -55030,7 +55032,7 @@ mod computed_float_through_container_2902 {
     /// threshold (`"20000000000.0"`, found in review).
     #[test]
     fn generic_materializer_keeps_the_token_bare_2902() -> Result<()> {
-        check(&[
+        for (filter, want) in [
             (
                 "reduce 1 as $x ([1e10*2]; .[0] | [tostring, key])",
                 "- \"2e+10\"\n- 0",
@@ -55047,7 +55049,12 @@ mod computed_float_through_container_2902 {
                 "reduce 1 as $x ([0.5+0.5]; .[0] | [tostring, key])",
                 "- \"1\"\n- 0",
             ),
-        ])
+        ] {
+            let (out, code) = run_yq_stdin(filter, "null\n", &["--jq-extensions"])?;
+            assert_eq!(code, 0, "`{filter}` exited {code}: {out:?}");
+            assert_eq!(out.trim_end(), want, "`{filter}`");
+        }
+        Ok(())
     }
 
     /// `@yaml`/`@props` spelled a bare `Float` with plain `Display` under a
@@ -57414,7 +57421,7 @@ fn test_yq_fold_container_loop_variable_stays_structural_3896() -> Result<()> {
         ("reduce (.a) as $x (0; [$x] == [$x])", "false"),
         ("[foreach (.a) as $x (0; $x == $x; .)] | .[0]", "false"),
     ] {
-        let (stdout, code) = run_yq_stdin(filter, "a: [.nan]\n", &[])?;
+        let (stdout, code) = run_yq_stdin(filter, "a: [.nan]\n", &["--jq-extensions"])?;
         assert_eq!((stdout.trim_end(), code), (expected, 0), "`{filter}`");
     }
     Ok(())
@@ -58037,7 +58044,7 @@ fn test_yq_reduce_source_that_jq_refuses_in_path_position_still_answers_3726() -
     let (stdout, code) = run_yq_stdin(
         "(reduce unique as $x (.; .)) = 5",
         "[1]",
-        &["-o", "json", "-I0"],
+        &["--jq-extensions", "-o", "json", "-I0"],
     )?;
     assert_eq!(code, 0, "stdout {stdout:?}");
     assert_eq!(stdout, "5\n");
@@ -58064,12 +58071,12 @@ fn test_yq_destructuring_fold_source_still_answers_3489() -> Result<()> {
     for (filter, extra, expected) in [
         (
             "(reduce ([1] as [$a] | $a) as $k (.; .)) = 5",
-            &["-o", "json", "-I0"][..],
+            &["--jq-extensions", "-o", "json", "-I0"][..],
             "5\n",
         ),
         (
             "(reduce (. as {a:$a} | .) as $k (.; .)) = 5",
-            &["-o", "json", "-I0"][..],
+            &["--jq-extensions", "-o", "json", "-I0"][..],
             "5\n",
         ),
         (
@@ -60173,5 +60180,39 @@ fn test_jq_comma_branch_crossing_a_scalar_still_raises_3039() -> Result<()> {
     let (_out, err, code) = run_jq_stdin_with_stderr("del(.a, .a[0])", r#"{"a":"ab"}"#, &["-c"])?;
     assert_ne!(code, 0);
     assert!(err.contains("Cannot index string with number"), "err={err}");
+    Ok(())
+}
+
+/// #2065/#2447/#2605: real yq v4.53.3's lexer rejects `reduce` and `foreach`
+/// (`invalid input text "reduce .a[] as $..."`), so yq mode gates both behind
+/// `--jq-extensions` like the rest of the jq-only surface (#1512).
+#[test]
+fn test_yq_reduce_foreach_are_gated_behind_jq_extensions_2065() -> Result<()> {
+    for filter in [
+        "reduce .a[] as $x (0; . + $x)",
+        "[foreach .a[] as $x (0; . + $x)]",
+        "(reduce .a[] as $x (0; . + $x)) | . + 1",
+    ] {
+        let (_, stderr, code) = run_yq_stdin_with_stderr(filter, "a: [1, 2]\n", &[])?;
+        assert_eq!(code, 1, "`{filter}`: {stderr:?}");
+        assert!(
+            stderr.contains("is not part of yq's syntax") && stderr.contains("--jq-extensions"),
+            "`{filter}`: {stderr:?}"
+        );
+    }
+    for (filter, expected) in [
+        ("reduce .a[] as $x (0; . + $x)", "3"),
+        ("[foreach .a[] as $x (0; . + $x)]", "[1,3]"),
+    ] {
+        let (out, code) = run_yq_stdin(
+            filter,
+            "a: [1, 2]\n",
+            &["--jq-extensions", "-o=json", "-I=0"],
+        )?;
+        assert_eq!((out.trim(), code), (expected, 0), "`{filter}`");
+    }
+    // A mapping key spelled like the keyword is a field name, not the fold.
+    let (out, code) = run_yq_stdin(".reduce", "reduce: 7\n", &[])?;
+    assert_eq!((out.trim(), code), ("7", 0));
     Ok(())
 }
