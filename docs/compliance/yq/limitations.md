@@ -4664,10 +4664,26 @@ Three residuals, each captured live from v4.53.3:
   `null:` member's value here, where yq answers both. Fully resolving either gap needs
   `OwnedValue` to carry the source spelling the way `NumberLiteral` already does for a
   float, which is #2802's own scope.
-- **The path register stays a string** ([#2801](https://github.com/rust-works/succinctly/issues/2801)).
-  yq's `path` types an `!!int` key as an integer component -- `[.[] | path]` on `1: x` is
-  `[[1]]` there and `[["1"]]` here -- and nothing else; `getpath`/`setpath`/`del` read the
-  register's `String`-vs-`Int` as object-key-vs-array-index, so the component is left alone.
+- **`path` types an integer-spelled key as an integer** ([#2801](https://github.com/rust-works/succinctly/issues/2801)).
+  yq's `GetPath` renders a key through `getParsedKey`: a `!!str` key is a string, and any other
+  key is `parseInt64(text)` when that parses and the raw text when it does not. So `1:`, `01:`,
+  `0x1f:`, `0o17:`, `+4:`, `-3:`, `1_0:` and `!!float 9:` are the components `1`, `1`, `31`, `15`,
+  `4`, `-3`, `10` and `9`; `true:`, `~:`, `1.5:`, `1.0:`, `0b11:` and an `i64`-overflowing digit
+  string stay strings, as does any quoted or `!!str`-tagged key and every key of JSON input. The
+  component is the parsed value, never the spelling, and `succinctly yq` now reports it for `path`,
+  `..`/`.[]` walks, a literal lookup (`.["1"] | path` and `.b.2 | path` give `[1]` and `["b",2]`,
+  the matched key's parsed value rather than the name the filter spelled) and, under
+  `--jq-extensions`, `paths`/`leaf_paths`. `setpath`, and `getpath` under the flag, read an integer
+  over a mapping by its decimal text (`setpath([1]; "Q")` updates the `1:` member, as in yq), so a
+  `path` result round-trips for a key spelled in plain decimal. A key spelled `0x1f`, `01`, `+4` or
+  `0o17` reports `31`, `1`, `4` or `15`, and yq's own `.[31]` does not find it either (it compares
+  text), so `setpath([31]; ...)` adds a `31` member instead. What remains, each still a string
+  component: a value that left the document (a mapping after a DOM write or `with_entries`, or
+  `.[] | tostring | path`, `[.] | .[0] | path`), because an `IndexMap<String, _>` keeps no key type;
+  the `path(f)` extension routes that evaluate `f` on an owned copy (`path(.. | select(...))`,
+  `paths(f)`); and a quoted key carrying an explicit `!!int` tag (`!!int "5": x`). Also unchanged:
+  `1_0:` is `!!str` to succinctly's key *node* (`key | tag`) where yq says `!!int`, a resolver gap,
+  and `pick(.[1])` is `{}` in yq but refused here.
 - **An owned object has string keys again.** After a DOM write (`.["1"] = "X" | .[] | key
   | tag` is `!!int` in yq, `!!str` here) or through `with_entries`'s own result
   (`with_entries(.key |= . + 1) | keys | .[0] | tag`), the keys live in an

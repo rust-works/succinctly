@@ -25780,6 +25780,9 @@ fn test_getpath_keeps_the_owned_table_in_yq_mode_2168() -> Result<()> {
         (r#"getpath(["a",-5])"#, "null"),
         (r#"getpath(["a",0])"#, "1"),
         (r#"getpath(["o","k"])"#, "1"),
+        // #2801: an integer over a mapping reads the member by its text, as `path` now
+        // reports an integer-spelled key as an integer; no member `0` reads `null`.
+        (r#"getpath(["o",0])"#, "null"),
         // The yq-only object-slice arm (#1102) still reached, through the
         // walk's hand-off to the owned table.
         (r#"getpath(["a",{"start":0,"end":1}])"#, "[1]"),
@@ -25796,7 +25799,7 @@ fn test_getpath_keeps_the_owned_table_in_yq_mode_2168() -> Result<()> {
             r#"getpath(["s","x"])"#,
             r#"Cannot index string with string "x""#,
         ),
-        (r#"getpath(["o",0])"#, "Cannot index object with number"),
+        (r#"getpath(["o",1.5])"#, "Cannot index object with number"),
     ] {
         let (_out, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &args)?;
         assert_eq!(code, 1, "{filter}: stderr {stderr}");
@@ -60720,5 +60723,108 @@ fn test_object_construction_identifier_sugar_needs_jq_extensions_2783() -> Resul
             "--jq-extensions {filter}"
         );
     }
+    Ok(())
+}
+
+/// Pinned yq v4.53.3: `path` renders a mapping key through `getParsedKey` -- a `!!str` key is a
+/// string and any other key is `parseInt64(text)` when that parses (#2801). Every row was
+/// captured from the pinned binary, `-o=json -I=0`.
+#[test]
+fn test_path_types_integer_spelled_mapping_keys_2801() -> Result<()> {
+    let doc = "1: x\ntrue: y\nnull: z\n1.5: w\n\"2\": v\n~: u\n0x1f: b\n0o17: d\n1.0: e\n-3: f\n+4: g\n1_0: h\n!!str 7: i\n\"8\": j\n!!float 9: k\n99999999999999999999: l\n0b11: m\n";
+    let args = &["-o=json", "-I=0"];
+    for (filter, expected) in [
+        (
+            "[.[] | path]",
+            r#"[[1],["true"],["null"],["1.5"],["2"],["~"],[31],[15],["1.0"],[-3],[4],[10],["7"],["8"],[9],["99999999999999999999"],["0b11"]]"#,
+        ),
+        (
+            "[.[] | path | .[0] | tag]",
+            r#"["!!int","!!str","!!str","!!str","!!str","!!str","!!int","!!int","!!str","!!int","!!int","!!int","!!str","!!str","!!int","!!str","!!str"]"#,
+        ),
+        (
+            "[.. | path]",
+            r#"[[],[1],["true"],["null"],["1.5"],["2"],["~"],[31],[15],["1.0"],[-3],[4],[10],["7"],["8"],[9],["99999999999999999999"],["0b11"]]"#,
+        ),
+        // The matched position's own path, reached through the per-item stream.
+        ("[.[] | select(key == true) | path]", r#"[["true"]]"#),
+        ("[.[] | select(key == 1.5) | path]", r#"[["1.5"]]"#),
+        // A literal lookup reports the matched key's parsed value, not the name it spelled.
+        (r#"[.["1"] | path]"#, "[[1]]"),
+        (r#"[.["0x1f"] | path]"#, "[[31]]"),
+        // The key node itself is unchanged: still a node, still its own line.
+        ("[.[] | key | line] | .[0:3]", "[1,2,3]"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, doc, args)?;
+        assert_eq!((out.trim(), code), (expected, 0), "{filter}");
+    }
+
+    // A nested mapping: the integer component sits after its parent's string one.
+    let (out, code) = run_yq_stdin("[.a[] | path]", "a:\n  1: x\n  \"2\": y\n", args)?;
+    assert_eq!((out.trim(), code), (r#"[["a",1],["a","2"]]"#, 0));
+
+    let (out, code) = run_yq_stdin("[.b.2 | path], [.b.2 | key]", "b:\n  2: [q, r]\n", args)?;
+    assert_eq!((out.trim(), code), ("[[\"b\",2]]\n[2]", 0));
+
+    // A JSON-sourced mapping has only string keys, whatever they spell.
+    let (out, code) = run_yq_stdin(
+        "[.[] | path]",
+        r#"{"1":2,"x":3}"#,
+        &["-p=json", "-o=json", "-I=0"],
+    )?;
+    assert_eq!((out.trim(), code), (r#"[["1"],["x"]]"#, 0));
+
+    // An array index is still an index, and `key` of it still the index.
+    let (out, code) = run_yq_stdin("[.l[] | path], [.l[] | key]", "l: [a, b]\n", args)?;
+    assert_eq!((out.trim(), code), ("[[\"l\",0],[\"l\",1]]\n[0,1]", 0));
+    Ok(())
+}
+
+/// A `path` result of an integer-spelled key names the member again (#2801): `setpath` is real
+/// yq (captured from v4.53.3), `getpath`/`paths` are `--jq-extensions` surface with no oracle, so
+/// their rows pin the round trip rather than a reference answer.
+#[test]
+fn test_integer_path_components_name_the_member_by_text_2801() -> Result<()> {
+    let doc = "1: x\nb: y\n";
+    let plain = &["-o=json", "-I=0"];
+    let ext = &["--jq-extensions", "-o=json", "-I=0"];
+    for (filter, expected) in [
+        // yq v4.53.3.
+        (r#"setpath([1]; "Q")"#, r#"{"1":"Q","b":"y"}"#),
+        (r#"setpath([7]; "N")"#, r#"{"1":"x","b":"y","7":"N"}"#),
+        (r#"setpath(["1"]; "Q")"#, r#"{"1":"Q","b":"y"}"#),
+        ("delpaths([[1]])", r#"{"1":"x","b":"y"}"#),
+    ] {
+        let (out, code) = run_yq_stdin(filter, doc, plain)?;
+        assert_eq!((out.trim(), code), (expected, 0), "{filter}");
+    }
+    for (filter, expected) in [
+        ("getpath([1])", r#""x""#),
+        ("getpath([2])", "null"),
+        (
+            ". as $r | [.[] | path] | map(. as $p | $r | getpath($p))",
+            r#"["x","y"]"#,
+        ),
+        (
+            r#"[.[] | path] as $ps | reduce $ps[] as $p (.; setpath($p; "Z"))"#,
+            r#"{"1":"Z","b":"Z"}"#,
+        ),
+        ("[paths]", r#"[[1],["b"]]"#),
+        ("[leaf_paths]", r#"[[1],["b"]]"#),
+    ] {
+        let (out, code) = run_yq_stdin(filter, doc, ext)?;
+        assert_eq!(
+            (out.trim(), code),
+            (expected, 0),
+            "--jq-extensions {filter}"
+        );
+    }
+    // A fractional component is not an integer one: the mapping refuses it still.
+    let (_out, stderr, code) = run_yq_stdin_with_stderr("getpath([1.5])", doc, ext)?;
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("Cannot index object with number"),
+        "{stderr}"
+    );
     Ok(())
 }
