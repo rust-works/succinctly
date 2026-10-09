@@ -5030,6 +5030,18 @@ Residual divergences remain, all in cases yq itself reaches through its node mod
   `object (...) and number (1) cannot be multiplied`, not yq's `cannot multiply !!map with
   !!int`; the exit status agrees (a message-only divergence shared with every other `*`).
 
+### `with`, `from_json` and `from_yaml` residuals (#4206)
+
+`with(path; update)` is `path |= <what update changes>` (`with_update_effect`): assignments,
+commas, `select(f) | ...`, and a navigation in front of an assignment. An `update` that binds
+a variable first (`(.b = 2) as $x | .c = $x`) is not followed: the binding contributes nothing,
+so the assignment after it is dropped where yq applies both. A value-producing stage ahead of
+an assignment is dropped too.
+
+`from_json`/`from_yaml` decode through the same scalar resolution as input documents, so an
+implicit-tag scalar yq types specially keeps succinctly's type: `"2020-01-01" | from_json | tag`
+is `!!timestamp` in yq and `!!str` here (a date in a *document* has the same gap).
+
 ### Other categories
 
 Float and number formatting ([#1071](https://github.com/rust-works/succinctly/issues/1071),

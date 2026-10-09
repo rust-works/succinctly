@@ -364,6 +364,88 @@ fn is_ident_start_char(c: char) -> bool {
     c.is_alphabetic() || c == '_'
 }
 
+/// What yq's `with(path; update)` keeps of `update` (#4206): the in-place changes its assignments
+/// make, applied to the node `path` names, and nothing else. yq runs `update` with each node as
+/// its context and discards the value of whatever is not an assignment, so `. = 2 | . + 1`
+/// leaves the node `2`, `.c = 2, .d = 3` applies both, and `select(.a == 2) | .b = 9` writes only
+/// where the select passes. The result is an expression that takes the node and answers it
+/// changed:
+///
+/// - an assignment is itself;
+/// - a comma applies each part in turn;
+/// - `select(f) | rest` is `if f then <rest> else . end`, so a failing select leaves the node;
+/// - a navigation then `rest` (`.b | .c = 1`, `.[] | select(..) | ..`) is `nav |= <rest>`, which
+///   writes through to the document, creating a missing path as yq does;
+/// - an assignment then `rest` runs `rest` on the changed node;
+/// - anything else (a value-producing stage, whose output yq discards) is `.`.
+fn with_update_effect(update: &Expr) -> Expr {
+    match update {
+        Expr::Assign { .. }
+        | Expr::Update { .. }
+        | Expr::CompoundAssign { .. }
+        | Expr::AlternativeAssign { .. } => update.clone(),
+        Expr::Paren(inner) => with_update_effect(inner),
+        Expr::Comma(items) => Expr::pipe(items.iter().map(with_update_effect).collect()),
+        Expr::Pipe(stages) => with_update_pipe_effect(stages),
+        _ => Expr::Identity,
+    }
+}
+
+/// [`with_update_effect`] for the stages of a pipe: the first decides what the rest runs on.
+fn with_update_pipe_effect(stages: &[Expr]) -> Expr {
+    let Some((head, rest)) = stages.split_first() else {
+        return Expr::Identity;
+    };
+    if rest.is_empty() {
+        return with_update_effect(head);
+    }
+    match head {
+        Expr::Builtin(Builtin::Select(condition)) => Expr::If {
+            cond: condition.clone(),
+            then_branch: Box::new(with_update_pipe_effect(rest)),
+            else_branch: Box::new(Expr::Identity),
+        },
+        Expr::Paren(inner) if !matches!(**inner, Expr::Comma(_)) => {
+            let mut stages = vec![(**inner).clone()];
+            stages.extend_from_slice(rest);
+            with_update_pipe_effect(&stages)
+        }
+        head if is_assignment_expr(head) => {
+            Expr::pipe(vec![head.clone(), with_update_pipe_effect(rest)])
+        }
+        head if is_navigation_expr(head) => Expr::Update {
+            path: Box::new(head.clone()),
+            filter: Box::new(with_update_pipe_effect(rest)),
+        },
+        _ => Expr::Identity,
+    }
+}
+
+/// Whether `expr` only walks to nodes of the document (`.b`, `.[0]`, `.[]`, `.a.b`, `.a?`).
+fn is_navigation_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Field(_) | Expr::Index { .. } | Expr::Iterate => true,
+        Expr::Paren(inner) | Expr::Optional(inner) => is_navigation_expr(inner),
+        Expr::Pipe(stages) => !stages.is_empty() && stages.iter().all(is_navigation_expr),
+        _ => false,
+    }
+}
+
+/// Whether `expr` is an assignment (`=`, `|=`, `op=`, `//=`), alone or comma'd or piped with
+/// others.
+fn is_assignment_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Assign { .. }
+        | Expr::Update { .. }
+        | Expr::CompoundAssign { .. }
+        | Expr::AlternativeAssign { .. } => true,
+        Expr::Paren(inner) => is_assignment_expr(inner),
+        Expr::Comma(items) => !items.is_empty() && items.iter().all(is_assignment_expr),
+        Expr::Pipe(stages) => !stages.is_empty() && stages.iter().all(is_assignment_expr),
+        _ => false,
+    }
+}
+
 /// The one definition of what `$name` (the `$` already consumed) desugars
 /// to: jq's two pseudo-variables, `$__loc__`/`$ENV`, get their own
 /// dedicated node; every other name is an ordinary bound-variable
@@ -374,23 +456,6 @@ fn is_ident_start_char(c: char) -> bool {
 /// on which names get pseudo-variable treatment -- the exact "duplicated
 /// predicates diverge silently" shape #2728 found for identifier-start
 /// rules, per CLAUDE.md's #106 note.
-/// What yq's `with(path; update)` keeps of `update` (#4206): its assignments, applied in order to
-/// the node, and nothing else. yq runs `update` for the changes it makes in place and discards the
-/// value of any other expression, so `. = 2 | . + 1` leaves the node `2` and `.c = 2, .d = 3`
-/// applies both. A part with no assignment contributes nothing (`.`).
-fn with_update_effect(update: &Expr) -> Expr {
-    match update {
-        Expr::Assign { .. }
-        | Expr::Update { .. }
-        | Expr::CompoundAssign { .. }
-        | Expr::AlternativeAssign { .. } => update.clone(),
-        Expr::Paren(inner) => with_update_effect(inner),
-        Expr::Comma(items) => Expr::pipe(items.iter().map(with_update_effect).collect()),
-        Expr::Pipe(stages) => Expr::pipe(stages.iter().map(with_update_effect).collect()),
-        _ => Expr::Identity,
-    }
-}
-
 fn dollar_var_expr(name: String, line: usize) -> Expr {
     if name == "__loc__" {
         // #2774: the parser has no notion of which file it is reading (a

@@ -21712,7 +21712,9 @@ fn builtin_from_yaml<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         _ => return QueryResult::Owned(to_owned_lossy::<S, _>(&value)),
     };
     let bytes = text.as_bytes();
-    if bytes.iter().all(u8::is_ascii_whitespace) {
+    // Only the empty string is yq's `EOF`: whitespace or a bare comment is a document with no
+    // content, which decodes to null.
+    if bytes.is_empty() {
         return suppress_or_raise(EvalError::new("EOF"), optional);
     }
     let index = match crate::yaml::YamlIndex::build(bytes) {
@@ -21723,7 +21725,7 @@ fn builtin_from_yaml<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let first = match root.value() {
         crate::yaml::YamlValue::Sequence(docs) => match docs.uncons_cursor() {
             Some((doc, _)) => doc,
-            None => return suppress_or_raise(EvalError::new("EOF"), optional),
+            None => return QueryResult::Owned(OwnedValue::Null),
         },
         _ => root,
     };

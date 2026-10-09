@@ -60995,6 +60995,10 @@ fn test_to_number_from_json_from_yaml_4206() -> Result<()> {
         (r#""- 1\n- 2" | from_yaml | length"#, "2"),
         (r#""x" | from_yaml | tag"#, r#""!!str""#),
         (r#""a: &x 1\nb: *x" | from_yaml"#, r#"{"a":1,"b":1}"#),
+        // Only the empty string is an error; blank or comment-only text is an empty document.
+        (r#""\n" | from_yaml"#, "null"),
+        (r#""  " | from_yaml"#, "null"),
+        (r##""# comment" | from_yaml"##, "null"),
         (r#"{"s": "a: 1"} | .s |= from_yaml"#, r#"{"s":{"a":1}}"#),
     ] {
         let (out, code) = run_yq_stdin(filter, "", args)?;
@@ -61065,6 +61069,33 @@ fn test_with_applies_only_the_assignments_of_its_update_4206() -> Result<()> {
             r#"{"a":{"b":1}} | with(.a | .b; . = 3)"#,
             r#"{"a":{"b":3}}"#,
         ),
+        // A filter or a navigation in front of the assignment decides where it lands.
+        (
+            r#"[{"a":1},{"a":2}] | with(.[]; select(.a == 2) | .b = 9)"#,
+            r#"[{"a":1},{"a":2,"b":9}]"#,
+        ),
+        (
+            r#"[{"a":1},{"a":2}] | with(.[]; select(.a == 1) | .b = 1 | .c = 2)"#,
+            r#"[{"a":1,"b":1,"c":2},{"a":2}]"#,
+        ),
+        (
+            r#"{"a":{"b":{}}} | with(.a; .b | .c = 1)"#,
+            r#"{"a":{"b":{"c":1}}}"#,
+        ),
+        (
+            r#"{"a":{}} | with(.a; .b | .c = 1)"#,
+            r#"{"a":{"b":{"c":1}}}"#,
+        ),
+        (
+            r#"{"a":[{"k":1},{"k":2}]} | with(.a; .[] | select(.k == 2) | .z = 1)"#,
+            r#"{"a":[{"k":1},{"k":2,"z":1}]}"#,
+        ),
+        (
+            r#"[{"a":1},{"a":2}] | with(.[] | select(.a == 2); .b = 9)"#,
+            r#"[{"a":1},{"a":2,"b":9}]"#,
+        ),
+        (r#"{"a":1} | with(.a; select(false) | . = 5)"#, r#"{"a":1}"#),
+        (r#"{"a":1} | with(.a; . = null)"#, r#"{"a":null}"#),
         (". as $x | with(.a; . = 1)", r#"{"a":1}"#),
     ] {
         let (out, code) = run_yq_stdin(filter, "", args)?;
