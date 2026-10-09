@@ -1474,12 +1474,14 @@ is the revert that established what the other one costs.
    `test_collect_first_limit_nth_keeps_the_register_3767`. The wrapper rule asks
    `cannot_move_register` only, so a wrapper over a navigates-nothing stage that rule does not
    list but the leaf verdict does (`first(to_entries)`, `first(sort)`, `first(path(.a))`) was
-   refused where jq answers `[]` until [#4108](https://github.com/rust-works/succinctly/issues/4108),
-   which reads the leaf verdict (`leaves_register_in_place`, now also listing
+   refused where jq answers `[]` until [#4108](https://github.com/rust-works/succinctly/issues/4108).
+   #4108 reads the leaf verdict (`leaves_register_in_place`, now also listing
    `input_line_number`) for the peeled stage, pinned by
-   `test_register_wrapper_over_by_value_leaf_stage_4108`. `first(path(f))` stays refused:
+   `test_register_wrapper_over_by_value_leaf_stage_4108`; `map(f)` and `walk(f)` stay refused
+   for an `f` that navigates. `first(path(f))` stays refused ([#4118](https://github.com/rust-works/succinctly/issues/4118)):
    listing `path(f)` in the leaf verdict turned a loud refusal into a silently skipped write
-   on the shape `test_transparent_bind_source_matches_identity_bind_3402` pins. Part 2 lets an `[E]` collect hold `last(f)` (`[last(.a)]`: the claim
+   on the shape `test_transparent_bind_source_matches_identity_bind_3402` pins.
+   Part 2 lets an `[E]` collect hold `last(f)` (`[last(.a)]`: the claim
    reads through to `f`, which the resolver's `last` arm resolves live, so `[last(1 \| .a)]` still raises
    as jq does and the output is demoted, so `[last(.a)] \| .k` still refuses), pinned by
    `test_collect_last_f_keeps_the_register_3767`; a `last` over `//` inside the brackets stays

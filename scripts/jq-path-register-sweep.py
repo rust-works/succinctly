@@ -673,8 +673,10 @@ OPERANDS = [
     "first(error(\"z\"))",
     "first(.a | 5)",
     # a wrapper over a stage the leaf verdict (`leaves_register_in_place`) admits but
-    # `cannot_move_register` does not list (#4108): by-value builtins, `path(f)` and
-    # `input_line_number`, bare and under each wrapper
+    # `cannot_move_register` does not list (#4108): by-value builtins and
+    # `input_line_number`, bare and under each wrapper. `path(.a)`, `first(path(.a))` and
+    # `first(path(.a, .k))` are the contrast: `path(f)` is not in the leaf verdict (#4118),
+    # so those stay refused where jq answers, and a row that moves is a change to read
     "first(length)",
     "first(to_entries)",
     "limit(1; sort)",

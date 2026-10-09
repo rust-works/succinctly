@@ -120436,8 +120436,12 @@ fn test_malformed_element_inside_a_lazy_array_prints_nothing_3909() -> Result<()
 /// `reverse`, `input_line_number`) leave jq's path register where the stage entered,
 /// as the bare stage does. They were refused, and under a `try` the refusal was swallowed as
 /// though it were jq's own, so `del` left the document unchanged where jq deletes. The
-/// contrasts (`first(.a, to_entries)`, a navigation after the stage, `path(f)` read as a path)
-/// still refuse as in jq. Every row captured from jq 1.7.1, on the stdin and `-n` routes.
+/// contrasts (`first(.a, to_entries)`, a navigation after the stage) still refuse as in jq.
+/// Rows over an object input that jq itself fails on inside the `try` (`first(sort)`, `add`,
+/// `reverse`, `map(.)`) expect the unchanged document and pass either way; the `to_entries`
+/// and `input_line_number` rows are the ones that fail without the fix, and the `path` rows
+/// pin the register for every spelling. Every row captured from jq 1.7.1, on the stdin and
+/// `-n` routes.
 #[test]
 fn test_register_wrapper_over_by_value_leaf_stage_4108() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
