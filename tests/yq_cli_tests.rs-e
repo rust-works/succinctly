@@ -60177,6 +60177,7 @@ fn test_jq_comma_branch_crossing_a_scalar_still_raises_3039() -> Result<()> {
     Ok(())
 }
 
+<<<<<<< HEAD
 /// #2065/#2447/#2605: real yq v4.53.3's lexer rejects `reduce` and `foreach`
 /// (`invalid input text "reduce .a[] as $..."`), so yq mode gates both behind
 /// `--jq-extensions` like the rest of the jq-only surface (#1512).
@@ -60208,9 +60209,7 @@ fn test_yq_reduce_foreach_are_gated_behind_jq_extensions_2065() -> Result<()> {
     // A mapping key spelled like the keyword is a field name, not the fold.
     let (out, code) = run_yq_stdin(".reduce", "reduce: 7\n", &[])?;
     assert_eq!((out.trim(), code), ("7", 0));
-    Ok(())
-}
-
+=======
 /// #3040: a YAML float with more than 17 significant digits keeps its source text on every
 /// route (yq v4.53.3), and compares by that text; a computed float is still the shortest f64.
 #[test]
@@ -60238,5 +60237,6 @@ fn test_yq_long_float_keeps_source_text_everywhere_3040() -> Result<()> {
     let (out, code) = run_yq_stdin(".n = 1", "z: 2.7293109604053567083\n", &[])?;
     assert_eq!(code, 0);
     assert_eq!(out, "z: 2.7293109604053567083\nn: 1\n");
+>>>>>>> ce3e6210 (fix(yaml): keep the source text of a float with more than 17 significant digits (#3040))
     Ok(())
 }
