@@ -1862,13 +1862,21 @@ is the revert that established what the other one costs.
    against the base the issue was filed on. Both now answer like jq (a construction does not lose the register), and the
    remaining shapes the fuzzer found were a `reduce` that loses it: jq runs a `reduce`'s source and `UPDATE` in a looped
    branch that backtracks the register to where INIT left it, so `path(.a as $x \| reduce (1) as $i (.; .a) \| try ($x \|
-   .b))` is empty in jq and refused here. A `reduce` with bare-variable patterns and an INIT that cannot move the register
+   .b))` is empty in jq and refused here. A `reduce` whose INIT cannot move the register
    now states it unmoved whatever its source and `UPDATE` navigate, when they are ones the resolver checks as jq does
-   (`reduce_leaves_register_in_place`). Still refused where jq answers: a `reduce` whose INIT navigates
+   (`reduce_leaves_register_in_place`), and since [#4048](https://github.com/rust-works/succinctly/issues/4048) whatever
+   its loop pattern is: a destructuring pattern's steps run inside the same backtracked loop, and the fold's own walk
+   still checks them against the register (`path(. as $x \| reduce . as {a:$a} ?// $a (0; .) \| $x)` is `[]` in both
+   tools; a constructed element still refuses at the pattern's first step, as in jq). On an untracked entry the fold
+   states the register its stage's frame carries, so the same fold as an `and`/`or`/unary-minus operand answers too
+   (`path(. as $x \| {a:{b:1}} \| ((reduce . as {a:$a} ?// $a (0; .)) or true) \| $x)` on `{"a":[true]}` is `[]`; pinned by
+   `test_destructuring_reduce_leaves_the_register_4048`). Still refused where jq answers: a `reduce` whose INIT navigates
    (`path(.a as $x \| reduce (1) as $i (.a; .b) \| $x)` is `["a"]` in jq, where the register stays on INIT's node), a
-   destructuring pattern, and a source or `UPDATE` outside that allowlist: a `try ... catch` or `//` in the `UPDATE`
-   (`path(. as $x \| reduce (1) as $i (.; .a // 1) \| $x)` is `[]` in jq), and a source that destructures a computed
-   value, which is a path error in jq the fold does not model, so accepting the stage there would answer where jq refuses.
+   `foreach` with a destructuring pattern (it emits from inside the loop, so the pattern's steps do move the register an
+   emission carries), a fold wrapped in `try ... catch`, a fold entered under a `?//` bind, and a source or `UPDATE`
+   outside that allowlist: a `try ... catch` or `//` in the `UPDATE` (`path(. as $x \| reduce (1) as $i (.; .a // 1) \|
+   $x)` is `[]` in jq), and a source that destructures a computed value, which is a path error in jq the fold does not
+   model, so accepting the stage there would answer where jq refuses.
 
    | Filter                                                   | jq                          | Why succinctly still refuses                                                                                                                                                                                              |
    | -------------------------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

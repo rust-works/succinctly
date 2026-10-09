@@ -64889,32 +64889,34 @@ fn test_fold_pattern_computed_key_is_not_run_twice_3743() -> Result<()> {
 /// catching it is what jq does too, and it stays catchable.
 /// Every jq side captured from jq 1.7.1; succinctly's exit-5 rows are the recorded
 /// safe-direction divergence. Since #3999 the `and` rows below no longer reach the walk's guess
-/// (the root is provably not the register `true`), so the chain retries and refuses at the
-/// result instead; `test_fold_pattern_against_known_untracked_register_retries_3999` pins the
-/// guess that remains.
+/// (the root is provably not the register `true`), so the chain retries; since #4048 a
+/// destructuring `reduce` also hands the register back, so those rows answer as jq does (`{}`,
+/// `[]`) where #3999 left them refusing at the result. `foreach` still refuses there, and
+/// `test_fold_pattern_against_known_untracked_register_retries_3999` pins the guess that
+/// remains.
 #[test]
 fn test_fold_guessed_pattern_refusal_is_not_catchable_3840() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
         (
             r#"{"a":true}"#,
             r"del(try (.a and (reduce . as {a:$a} ?// $a (0; .))))",
+            "{}\n",
             "",
-            r"Invalid path expression with result true",
-            5,
+            0,
         ),
         (
             r#"{"a":true}"#,
             r#"del(try (.a and (reduce . as {("a"):$a} ?// $a (0; .))))"#,
+            "{}\n",
             "",
-            r"Invalid path expression with result true",
-            5,
+            0,
         ),
         (
             r"[true]",
             r"del(try (.[0] and (reduce . as [$a] ?// $a (0; .))))",
+            "[]\n",
             "",
-            r"Invalid path expression with result true",
-            5,
+            0,
         ),
         (
             r#"{"a":true}"#,
@@ -64926,9 +64928,9 @@ fn test_fold_guessed_pattern_refusal_is_not_catchable_3840() -> Result<()> {
         (
             r#"{"a":true}"#,
             r"del((.a and (reduce . as {a:$a} ?// $a (0; .)))?)",
+            "{}\n",
             "",
-            r"Invalid path expression with result true",
-            5,
+            0,
         ),
         // Unchanged: a guess on the last (here only) alternative is not asked, and the
         // catch answers as jq does.
@@ -64971,8 +64973,9 @@ fn test_fold_guessed_pattern_refusal_is_not_catchable_3840() -> Result<()> {
 /// are unchanged: a chain whose every alternative fails still reaches the catch, and a
 /// step that could succeed (`.a`, `[$a]`) stays the loud guess of #3840. A recorded
 /// divergence in the safe direction: on `[true]` jq answers `[]` (its `and` result
-/// `true` is the register's own boolean), and the retried alternative refuses here, as
-/// the un-wrapped fold already did. Every jq side captured from jq 1.7.1.
+/// `true` is the register's own boolean), and the retried alternative refused here until
+/// #4048, when the destructuring `reduce` began handing the register back. Every jq side
+/// captured from jq 1.7.1.
 #[test]
 fn test_fold_pattern_step_that_never_succeeds_retries_3998() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -65021,14 +65024,14 @@ fn test_fold_pattern_step_that_never_succeeds_retries_3998() -> Result<()> {
             "",
             0,
         ),
-        // Recorded divergence: jq finds `true` identical to the register's boolean and
-        // answers `[]`; the retried alternative refuses, as the un-wrapped fold did.
+        // jq finds `true` identical to the register's boolean and answers `[]`; since #4048
+        // the retried alternative's fold hands the register back, so this does too.
         (
             r"[true]",
             r#"del(try (.[0] and (reduce . as {("a"):$a} ?// $a (0; .))))"#,
+            "[]\n",
             "",
-            r"Invalid path expression with result true",
-            5,
+            0,
         ),
     ])
 }
@@ -65124,6 +65127,141 @@ fn test_fold_pattern_against_known_untracked_register_retries_3999() -> Result<(
             r"del(try (.a | map(.) | reduce . as [$x] ?// $x (0; .)))",
             "",
             r"Invalid path expression near attempt to access element 0 of [1]",
+            5,
+        ),
+    ])
+}
+
+/// #4048: a `reduce` with a destructuring loop pattern leaves jq's register where it entered,
+/// as a bare-variable one does. jq compiles `reduce` as `DUP; INIT; STOREV; FORK loop; SOURCE;
+/// <pattern>; UPDATE; BACKTRACK`, so the pattern's `INDEX` steps run inside the backtracked
+/// loop and only INIT's navigation survives the fold. The fold's own walk still checks the
+/// pattern against the register (a constructed element refuses at its first step), so this
+/// only decides where the register is once the fold has answered. Before this the stage
+/// handed back no register, and a `$x` frozen before the fold, or an `and`/`or`/unary-minus
+/// that took the fold as an operand, was refused where jq answers: `path(. as $x | {a:{b:1}}
+/// | ((reduce . as {a:$a} ?// $a (0; .)) or true) | $x)` on `{"a":[true]}` is jq's `[]`, was
+/// exit 5. On an untracked entry the register is the frame's, so the fold states it for an
+/// operand resolved live. Controls, all jq 1.7.1's own refusals: a constructed element, a
+/// navigating INIT, and a source that navigates into an INIT that does. Every row captured
+/// from jq 1.7.1.
+#[test]
+fn test_destructuring_reduce_leaves_the_register_4048() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        // The issue's row: an untracked stage, the fold the left operand of an `or`.
+        (
+            r#"{"a":[true]}"#,
+            r"path(. as $x | {a:{b:1}} | ((reduce . as {a:$a} ?// $a (0; .)) or true) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        // The same on a trackable entry, a bare destructuring pattern and one with `?//`.
+        (
+            r#"{"a":[true]}"#,
+            r"path(. as $x | (reduce . as {a:$a} ?// $a (0; .)) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[true]}"#,
+            r"path(. as $x | (reduce . as {a:$a} (0; .)) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[[1]]",
+            r"path(. as $x | (reduce .[] as [$a] (0; .)) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(. as $x | reduce .a as {b:$b} (0; .) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        // The bare-variable fold takes the same untracked statement; it answered before
+        // through `cannot_move_register`, so this is the control that it still does.
+        (
+            r#"{"a":[true]}"#,
+            r"path(. as $x | {a:{b:1}} | ((reduce . as $a (0; .)) or true) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        // Unary minus is resolved live too, on either entry.
+        (
+            r#"{"a":1,"b":2}"#,
+            r"path(. as $x | -(reduce . as [$a] ?// $a (0; .)) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            r#"path(. as $x | {"z":1} | -(reduce . as [$a] ?// $a (0; .)) | $x)"#,
+            "[]\n",
+            "",
+            0,
+        ),
+        // The write side: an untracked entry whose register the fold hands on.
+        (
+            r#"{"a":1}"#,
+            r#"del(. as $x | {"z":1} | (reduce . as {z:$a} ?// $a (0; .)) or true | $x.a?)"#,
+            "{}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r#"(. as $x | {"z":1} | (reduce . as {z:$a} ?// $a (0; .)) or true | $x) = 9"#,
+            "9\n",
+            "",
+            0,
+        ),
+        // Where the fold is the right operand and the register is on `.a`.
+        (
+            r#"{"a":true}"#,
+            r"del(try (.a and (reduce . as {a:$a} ?// $a (0; .))))",
+            "{}\n",
+            "",
+            0,
+        ),
+        // Controls. The element is a constructed object, not the register: the walk's first
+        // step refuses, as jq's does.
+        (
+            r#"{"a":[true]}"#,
+            r"path(. as $x | {a:{b:1}} | (reduce . as {a:$a} (0; .)) | $x)",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of {"a":{"b":1}}"#,
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r#"path(. as $x | reduce {"a":1} as {a:$a} (0; .) | $x)"#,
+            "",
+            r#"Invalid path expression near attempt to access element "a" of {"a":1}"#,
+            5,
+        ),
+        // A navigating INIT moves the register off the entry: only INIT's navigation
+        // survives the fold.
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | reduce . as {a:$a} (.a; .) | $x)",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of {"a":1}"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(. as $x | reduce .a as {b:$b} (.a; .) | $x)",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of {"a":{"b":1}}"#,
             5,
         ),
     ])

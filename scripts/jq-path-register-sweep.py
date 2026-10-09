@@ -515,6 +515,21 @@ OPERANDS = [
     "(foreach .a as [$a] ?// $a (0; .; .))",
     "try (reduce . as [$a] ?// $a (0; .)) catch 7",
     "try ((reduce . as [$a] ?// $a (0; .)), .b[0]) catch 1",
+    # (#4048) a destructuring `reduce` leaves jq's register where it entered: the pattern's
+    # steps run inside the backtracked loop, so only INIT's navigation survives the fold.
+    # The contrasts are what must stay refused or moved: an element that is not the
+    # register (a constructed object or array), an UPDATE that reads the bound name or
+    # hands back the register, a navigating INIT, and a navigating source.
+    "(reduce . as {a:$a} (0; $a))",
+    "(reduce . as {a:$a} ?// $a (0; $a))",
+    "(reduce {a:1} as {a:$a} ?// $a (0; .))",
+    "(reduce [[1]] as [[$a]] ?// $a (0; .))",
+    "(reduce .a? as {b:$b} ?// $b (0; .))",
+    "(reduce .[]? as {a:$a} (.; .))",
+    "(reduce . as {a:$a} ?// $a (.a?; .))",
+    "(reduce . as {a:$a} ?// $a (0; .a?))",
+    "(reduce . as {a:$a} ?// $a (.; $a))",
+    "(reduce . as [$a, $b] ?// {a:$a} (.; .))",
     "first(.a)",
     "nth(0; .a)",
     "limit(1; .a)",
