@@ -567,10 +567,11 @@ Each turns a refusal into an answer and needs its own oracle rows:
   (`fold_update_movement_tracked`), and `foreach` states `Unmoved(entry)` per emission whose UPDATE output was at the entry
   (`FoldRegister::resolve_sink` keeps the statement, `advance` carries `self` on it, `foreach_states_register_per_emission` admits the
   stage on a trackable entry only: an untracked one reads an absent statement as "the carried copy stands", #3826). Still
-  refused where jq answers, pinned by `test_recurse_seed_residuals_stay_loud_3580`: a literal ahead of the recursion (the taken `else 1`; a comma
-  sibling ahead of it answers since #3862), a recursion behind a destructuring bind or a `def` call, a pipe nested in a forwarder, a forking
-  `foreach` UPDATE, and a fold inside an `[E]`. (`nth(n; ..)`, a bare-variable bind and a `reduce` UPDATE of `recurse(f)` answer
-  since #3892.) A design note for whoever extends it: **do not convert the handler's `Unmoved` to
+  refused where jq answers, pinned by `test_recurse_seed_residuals_stay_loud_3580`: a pipe nested in a forwarder, a fold inside an
+  `[E]`, an `if` with no recursion in it, a `def` call that takes an argument, and a recursion behind a destructuring bind. (A literal
+  ahead of the recursion in a comma answers since #3862; `nth(n; ..)`, a bare-variable bind and a `reduce` UPDATE of `recurse(f)`
+  since #3892; a by-value `if` branch and a zero-argument `def` call since #3914, by `carry_frame_register` in the `If` arm and a
+  `DefCall` arm in `entry_marker_shape`; the forking `foreach` UPDATE by #4041/#4059.) A design note for whoever extends it: **do not convert the handler's `Unmoved` to
   `AtEntry`** -- the first cut did, and 44 `-(try (.a | error) catch 7)` rows lost a match, because `register_after`, an `any`/`all`
   generator and a fold source all read the value out of an `Unmoved`.
 - ~~The stage-level downgrade in `place_step`: a leaf-local verdict for `,`/`//`/`if`/`try`, which

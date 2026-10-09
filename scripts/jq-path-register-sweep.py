@@ -958,6 +958,18 @@ OPERANDS = [
     ". as [$q] | ..",
     ". as {a:$q} | ..",
     "def f: ..; f",
+    # (#3914) a zero-argument `def` call forwards its body's statements as an inline body does;
+    # an `if` branch that runs states the register it was entered with.
+    "def f: try ..; f",
+    "def f: first(..); f",
+    "def f: ..; first(f)",
+    "def f: (.a | ..); f",
+    "def f: ..; def g: f; g",
+    "def f(a): ..; f(1)",
+    "if false then .. else (1, ..) end",
+    "if true then (try ..) else 1 end",
+    "if false then .. else $x end",
+    "if false then .. else .a end",
     "nth(0; ..)",
     "(.. | .)",
     "(.a | ..)",
