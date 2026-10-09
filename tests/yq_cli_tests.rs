@@ -60017,3 +60017,98 @@ fn test_yq_computed_null_key_from_an_absent_field_is_a_known_residual_4087() -> 
     );
     Ok(())
 }
+
+/// #4088: an explicit tag on a flow-collection value, on an empty flow collection or on a
+/// mapping key (an implicit single-pair entry's included) is kept on YAML output. The
+/// cursor-streaming route wrote a container's tag only for a block one, so `a: !!seq [1, 2]`
+/// printed `a: [1, 2]` (and `.a` the same); the DOM routes (`-P`, `=`, `del()`) dropped a
+/// mapping key's tag outright, and `-P` also dropped a core tag on a container whose kind it
+/// does not restate (`!!str []`, `!!seq {}`). Every expectation is yq v4.53.3's output.
+#[test]
+fn test_tags_on_flow_collections_and_mapping_keys_are_kept_4088() -> Result<()> {
+    let rows: &[(&str, &str, &[&str], &str)] = &[
+        ("a: !!seq [1, 2]", ".", &[], "a: !!seq [1, 2]\n"),
+        ("a: !Foo {x: 1}", ".", &[], "a: !Foo {x: 1}\n"),
+        ("a: !!map {x: 1}", ".", &[], "a: !!map {x: 1}\n"),
+        ("a: !!seq []", ".", &[], "a: !!seq []\n"),
+        ("a: !!map {}", ".", &[], "a: !!map {}\n"),
+        ("a: &x !Foo [1]", ".", &[], "a: &x !Foo [1]\n"),
+        ("a: !!seq [1, 2]", ".a", &[], "!!seq [1, 2]\n"),
+        ("a: &x !Foo [1]", ".a", &[], "&x !Foo [1]\n"),
+        ("a: !Foo {x: 1}", ".a", &[], "!Foo {x: 1}\n"),
+        ("a: !Foo {}", ".a", &[], "!Foo {}\n"),
+        ("a: !!seq [1, 2]", ".a|=.", &[], "a: !!seq [1, 2]\n"),
+        (
+            "- !!seq [1]\n- &a !Foo {x: 1}\n- [!Foo [2]]",
+            ".",
+            &[],
+            "- !!seq [1]\n- &a !Foo {x: 1}\n- [!Foo [2]]\n",
+        ),
+        (
+            "a:\n  - !Foo [1]\n  - !Foo {}",
+            ".",
+            &[],
+            "a:\n  - !Foo [1]\n  - !Foo {}\n",
+        ),
+        ("a: &x !Foo\n  - 1", ".a", &[], "&x !Foo\n- 1\n"),
+        ("a: !!map\n  b: 1", ".a", &[], "!!map\nb: 1\n"),
+        ("[x, !!str []]", ".", &["-P"], "- x\n- !!str []\n"),
+        ("[x, !!str {}]", ".", &["-P"], "- x\n- !!str {}\n"),
+        ("[x, !!str [1]]", ".", &["-P"], "- x\n- !!str\n  - 1\n"),
+        ("a: !!int {a: 1}", ".", &["-P"], "a: !!int\n  a: 1\n"),
+        ("a: !!seq {}", ".", &["-P"], "a: !!seq {}\n"),
+        ("a: !!map []", ".", &["-P"], "a: !!map []\n"),
+        (
+            "a: !!seq [1]\nb: !!map {x: 1}\nc: !!seq []",
+            ".",
+            &["-P"],
+            "a:\n  - 1\nb:\n  x: 1\nc: []\n",
+        ),
+        ("a: !Foo []", ".", &["-P"], "a: !Foo []\n"),
+        ("a: [!Foo k: v]", ".", &["-P"], "a:\n  - !Foo k: v\n"),
+        (
+            "a: [z, !Foo k: v]",
+            ".a[0] = 1",
+            &[],
+            "a: [1, {!Foo k: v}]\n",
+        ),
+        (
+            "a: [!<tag:x,y> k: v]",
+            ".",
+            &["-P"],
+            "a:\n  - !<tag:x,y> k: v\n",
+        ),
+        (
+            "a: [!!str k: v, &q !Foo j: w]",
+            ".",
+            &["-P"],
+            "a:\n  - k: v\n  - &q !Foo j: w\n",
+        ),
+        ("{!Foo k: v}", ".b=1", &[], "{!Foo k: v, b: 1}\n"),
+        ("!Foo k: v", ".b=1", &[], "!Foo k: v\nb: 1\n"),
+        (
+            "!!str k: v\n!!int 1: w\n!!binary b: x",
+            ".z=1",
+            &[],
+            "!!str k: v\n!!int 1: w\n!!binary b: x\nz: 1\n",
+        ),
+        ("&a !Foo k: v", ".b=1", &[], "&a !Foo k: v\nb: 1\n"),
+        ("!!str 1: v", ".z=1", &["-P"], "\"1\": v\nz: 1\n"),
+        (
+            "!!str k: v\n!Foo j: w\n!!binary b: x",
+            ".z=1",
+            &["-P"],
+            "k: v\n!Foo j: w\n!!binary b: x\nz: 1\n",
+        ),
+        ("a: v\n!Foo b: w", "del(.a)", &[], "!Foo b: w\n"),
+    ];
+    for &(doc, filter, args, expected) in rows {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, args)?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (expected, 0),
+            "`{filter}` {args:?} on {doc:?}: stderr {stderr:?}"
+        );
+    }
+    Ok(())
+}

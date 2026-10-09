@@ -1768,9 +1768,23 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         // regardless of what it wraps, silently dropping its anchor (#835).
         let self_ = self.resolve_bare_seq_item();
         if self_.is_container() {
-            if let Some(anchor) = self_.anchor() {
-                out.write_char('&')?;
-                out.write_str(anchor)?;
+            // #4088: the tag rides the same line as the anchor (`&x !Foo [1]`),
+            // and stands alone when there is no anchor (`!!seq [1]`) -- a
+            // container's own tag is written by whoever writes its anchor,
+            // since `stream_yaml_value_at`'s container arms write neither.
+            let anchor = self_.anchor();
+            let tag = self_.explicit_tag_at(None);
+            if anchor.is_some() || tag.is_some() {
+                if let Some(anchor) = anchor {
+                    out.write_char('&')?;
+                    out.write_str(anchor)?;
+                    if tag.is_some() {
+                        out.write_char(' ')?;
+                    }
+                }
+                if let Some(tag) = tag {
+                    out.write_str(tag)?;
+                }
                 if self_.style() != "flow" {
                     return out.write_char('\n');
                 }
@@ -8549,7 +8563,14 @@ fn write_deferred_value<Out: core::fmt::Write, W: AsRef<[u64]>>(
     // for a second resolve on this `absent` branch even though `resolved`
     // was already in hand. `explicit_tag_at` takes the already-resolved
     // value directly instead.
-    let tag = if absent {
+    //
+    // #4088: a *flow* container value is the other case that writes its tag
+    // here -- `stream_yaml_value_at`'s `Array`/`Object` arms never do (only
+    // its scalar arms write theirs), so `a: !!seq [1]` lost the tag. A block
+    // container never reaches this function (both callers route it to their
+    // own anchor/tag branch), and `resolved` is `None` for a container, so
+    // `explicit_tag_at(None)` skips the resolve.
+    let tag = if absent || value.is_container() {
         value.explicit_tag_at(resolved.as_ref())
     } else {
         None
