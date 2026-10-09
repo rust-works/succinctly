@@ -55239,6 +55239,17 @@ fn navigate_static_component_ref<'v, S: EvalSemantics>(
             return Ok(Some(current.field(&text)));
         }
     }
+    // #3039: yq's `traverse` ends `default: return list.New(), nil` -- a field or index
+    // step into a string, number or boolean yields no candidate rather than raising. The
+    // step prunes its branch (the `Ok(None)` a `?`-suppressed step already means), so a
+    // comma sibling still resolves. `null` keeps navigating (it autovivifies), and a
+    // container of the wrong kind still raises below, as in yq.
+    if S::TAG == EvalTag::Yq
+        && matches!(component, Expr::Field(_) | Expr::Index { .. })
+        && is_yq_field_index_noop_scalar(current.value())
+    {
+        return Ok(None);
+    }
     Ok(Some(
         match classify_static_component(component, current.value())? {
             StaticAccess::Field(name) => current.field(name),
