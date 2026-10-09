@@ -2714,18 +2714,7 @@ fn reconcile_presentation_at_depth(
         // equal `.a`'s by coincidence, wrongly keeping `*x`.
         (OwnedValue::Object(_) | OwnedValue::Array(_), _)
         | (_, OwnedValue::Object(_) | OwnedValue::Array(_)) => {
-            let is_write_target = targets.iter().any(|(steps, ..)| steps.is_empty());
-            let anchor = match &pristine_tree.meta().anchor {
-                mark @ Some(AnchorMark::Declares(_)) => mark.clone(),
-                mark @ Some(AnchorMark::Aliases(_)) if !is_write_target => mark.clone(),
-                _ => None,
-            };
-            let tag = pristine_tree.meta().tag().filter(|tag| is_custom_tag(tag));
-            CommentTree::Leaf(
-                NodeMeta::empty_with_anchor(anchor)
-                    .with_tag(tag.map(str::to_string))
-                    .with_preamble(pristine_tree.meta().preamble().map(str::to_string)),
-            )
+            kind_changed_leaf(pristine_tree, targets)
         }
         // Both scalars, any variant/value: same node, only its value
         // changed - its own comment, style and anchor mark survive. Real
@@ -2737,18 +2726,50 @@ fn reconcile_presentation_at_depth(
         //
         // #4078: a written node keeps a custom tag (`!Ref`, `!Foo`) but not a core
         // one, which follows the new value's type (`!!str "dq"` written `5` is `5`).
-        _ => CommentTree::Leaf(written_scalar_meta(
-            pristine_tree.meta(),
-            !same_scalar(pristine_value, result_value),
-            // A closed literal written right here (`.a = true`) brings its own text,
-            // even when the value is the one the node already had (#3028).
-            targets
-                .iter()
-                .any(|(steps, kind, fresh)| steps.is_empty() && *kind == WriteKind::Set && *fresh),
-            pristine_value,
-            result_value,
-        )),
+        _ => written_scalar_leaf(pristine_tree, targets, pristine_value, result_value),
     }
+}
+
+/// The tree for a node whose kind changed (container <-> scalar): it keeps an anchor
+/// declaration, a custom tag and, at the document root, the preamble, never the rest.
+/// Out of line so `reconcile_presentation_at_depth`'s recursive frame stays small (its
+/// #1005 depth-guard test overflows under coverage instrumentation otherwise).
+#[inline(never)]
+fn kind_changed_leaf(pristine_tree: &CommentTree, targets: &[RelTarget<'_>]) -> CommentTree {
+    let is_write_target = targets.iter().any(|(steps, ..)| steps.is_empty());
+    let anchor = match &pristine_tree.meta().anchor {
+        mark @ Some(AnchorMark::Declares(_)) => mark.clone(),
+        mark @ Some(AnchorMark::Aliases(_)) if !is_write_target => mark.clone(),
+        _ => None,
+    };
+    let tag = pristine_tree.meta().tag().filter(|tag| is_custom_tag(tag));
+    CommentTree::Leaf(
+        NodeMeta::empty_with_anchor(anchor)
+            .with_tag(tag.map(str::to_string))
+            .with_preamble(pristine_tree.meta().preamble().map(str::to_string)),
+    )
+}
+
+/// The tree for a scalar a write may have changed (see [`written_scalar_meta`]); out of
+/// line for the same reason as [`kind_changed_leaf`].
+#[inline(never)]
+fn written_scalar_leaf(
+    pristine_tree: &CommentTree,
+    targets: &[RelTarget<'_>],
+    pristine_value: &OwnedValue,
+    result_value: &OwnedValue,
+) -> CommentTree {
+    CommentTree::Leaf(written_scalar_meta(
+        pristine_tree.meta(),
+        !same_scalar(pristine_value, result_value),
+        // A closed literal written right here (`.a = true`) brings its own text, even
+        // when the value is the one the node already had (#3028).
+        targets
+            .iter()
+            .any(|(steps, kind, fresh)| steps.is_empty() && *kind == WriteKind::Set && *fresh),
+        pristine_value,
+        result_value,
+    ))
 }
 
 /// The metadata a scalar keeps once a write has run over it. Untouched, all of it. Written,
