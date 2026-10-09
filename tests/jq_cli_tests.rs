@@ -76264,12 +76264,14 @@ fn test_path_register_by_value_builtin_stages_do_not_move_it_3361() -> Result<()
         // judged as a whole (`test_path_register_compound_stage_states_its_register_per_branch_3644`),
         // and jq answers `[]` for each. Refuse-only, and the open promotions in
         // `docs/plan/jq-path-register-producer-contract.md` section 10.
+        // (`limit(1; sort)` answers since #4108, which reads the leaf verdict through the
+        // wrapper.)
         (
             "[1,2]",
             r"path(. as $x | limit(1; sort) | $x)",
+            "[]\n",
             "",
-            "Invalid path expression",
-            5,
+            0,
         ),
         (
             "[1,2]",
@@ -76292,13 +76294,8 @@ fn test_path_register_by_value_builtin_stages_do_not_move_it_3361() -> Result<()
             "",
             0,
         ),
-        (
-            "[1,2]",
-            r"path(. as $x | try sort | $x)",
-            "",
-            "Invalid path expression",
-            5,
-        ),
+        // (`try sort` answers since #4108: the `try` is peeled to the stage under it.)
+        ("[1,2]", r"path(. as $x | try sort | $x)", "[]\n", "", 0),
         // A multi-output or empty `f` and an empty input keep the register where
         // the stage entered it too, and so does a stage run once per element
         // of a fan-out.
@@ -76552,12 +76549,13 @@ fn test_path_register_more_by_value_builtins_do_not_move_it_3711() -> Result<()>
             bad,
             5,
         ),
+        // `limit(1; reverse)` answers since #4108, which reads the leaf verdict through the wrapper.
         (
             r#"{"a":["x"]}"#,
             r"path(.a | . as $x | limit(1; reverse) | $x[0])",
+            "[\"a\",0]\n",
             "",
-            bad,
-            5,
+            0,
         ),
         // #3580: `join` succeeds here, so it is the `try` body's own output that
         // states the register it left (a `join` is a backtracked `reduce`, #3711), and
@@ -120569,4 +120567,329 @@ fn test_malformed_element_inside_a_lazy_array_prints_nothing_3909() -> Result<()
         }
     }
     Ok(())
+}
+
+/// #4108: `first(E)`, `limit(n; E)` and `nth(n; E)` over an `E` that navigates nothing but is
+/// not one of the constants #3767 part 4 read (`to_entries`, `sort`, `add`, `map(f)`,
+/// `reverse`, `input_line_number`) leave jq's path register where the stage entered,
+/// as the bare stage does. They were refused, and under a `try` the refusal was swallowed as
+/// though it were jq's own, so `del` left the document unchanged where jq deletes. The
+/// contrasts (`first(.a, to_entries)`, a navigation after the stage) still refuse as in jq.
+/// Rows over an object input that jq itself fails on inside the `try` (`first(sort)`, `add`,
+/// `reverse`, `map(.)`) expect the unchanged document and pass either way; the `to_entries`
+/// and `input_line_number` rows are the ones that fail without the fix, and the `path` rows
+/// pin the register for every spelling. Every row captured from jq 1.7.1, on the stdin and
+/// `-n` routes.
+#[test]
+fn test_register_wrapper_over_by_value_leaf_stage_4108() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(.a? as $y | try ((.a)? and first(to_entries)) | try ($y | .b))",
+            "{\"a\":{},\"k\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(.a? as $y | try ((.a)? and first(sort)) | try ($y | .b))",
+            "{\"a\":{\"b\":1},\"k\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(.a? as $y | try ((.a)? and first(add)) | try ($y | .b))",
+            "{\"a\":{\"b\":1},\"k\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(.a? as $y | try ((.a)? and first(input_line_number)) | try ($y | .b))",
+            "{\"a\":{},\"k\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(.a? as $y | try ((.a)? and first(map(.))) | try ($y | .b))",
+            "{\"a\":{\"b\":1},\"k\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(.a? as $y | try ((.a)? and first(reverse)) | try ($y | .b))",
+            "{\"a\":{\"b\":1},\"k\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(.a? as $y | try ((.a)? and limit(1; to_entries)) | try ($y | .b))",
+            "{\"a\":{},\"k\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(.a? as $y | try ((.a)? and limit(1; sort)) | try ($y | .b))",
+            "{\"a\":{\"b\":1},\"k\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(.a? as $y | try ((.a)? and limit(1; add)) | try ($y | .b))",
+            "{\"a\":{\"b\":1},\"k\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(.a? as $y | try ((.a)? and limit(1; input_line_number)) | try ($y | .b))",
+            "{\"a\":{},\"k\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(.a? as $y | try ((.a)? and limit(1; map(.))) | try ($y | .b))",
+            "{\"a\":{\"b\":1},\"k\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(.a? as $y | try ((.a)? and limit(1; reverse)) | try ($y | .b))",
+            "{\"a\":{\"b\":1},\"k\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(.a? as $y | try ((.a)? and nth(0; to_entries)) | try ($y | .b))",
+            "{\"a\":{},\"k\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(.a? as $y | try ((.a)? and nth(0; sort)) | try ($y | .b))",
+            "{\"a\":{\"b\":1},\"k\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(.a? as $y | try ((.a)? and nth(0; add)) | try ($y | .b))",
+            "{\"a\":{\"b\":1},\"k\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(.a? as $y | try ((.a)? and nth(0; input_line_number)) | try ($y | .b))",
+            "{\"a\":{},\"k\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(.a? as $y | try ((.a)? and nth(0; map(.))) | try ($y | .b))",
+            "{\"a\":{\"b\":1},\"k\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(.a? as $y | try ((.a)? and nth(0; reverse)) | try ($y | .b))",
+            "{\"a\":{\"b\":1},\"k\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | first(to_entries) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | first(to_entries) | $x | .k)",
+            "[\"k\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | first(to_entries) | .k)",
+            "",
+            r#"Invalid path expression near attempt to access element "k" of [{"key":"a","value":{"b":1..."#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | limit(1; sort) | $x)",
+            "",
+            r#"object ({"a":{"b":1...) cannot be sorted, as it is not an array"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | limit(1; sort) | $x | .k)",
+            "",
+            r#"object ({"a":{"b":1...) cannot be sorted, as it is not an array"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | limit(1; sort) | .k)",
+            "",
+            r#"object ({"a":{"b":1...) cannot be sorted, as it is not an array"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | first(input_line_number) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | first(input_line_number) | $x | .k)",
+            "[\"k\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | first(input_line_number) | .k)",
+            "",
+            r#"Invalid path expression near attempt to access element "k" of 0"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | nth(0; add) | $x)",
+            "",
+            r#"object ({"b":1}) and number (2) cannot be added"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | nth(0; add) | $x | .k)",
+            "",
+            r#"object ({"b":1}) and number (2) cannot be added"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | nth(0; add) | .k)",
+            "",
+            r#"object ({"b":1}) and number (2) cannot be added"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | first(reverse) | $x)",
+            "",
+            r"Cannot index object with number",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | first(reverse) | $x | .k)",
+            "",
+            r"Cannot index object with number",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | first(reverse) | .k)",
+            "",
+            r"Cannot index object with number",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | limit(1; min) | $x)",
+            "",
+            r#"object ({"a":{"b":1...) and object ({"a":{"b":1...) cannot be iterated over"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | limit(1; min) | $x | .k)",
+            "",
+            r#"object ({"a":{"b":1...) and object ({"a":{"b":1...) cannot be iterated over"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | limit(1; min) | .k)",
+            "",
+            r#"object ({"a":{"b":1...) and object ({"a":{"b":1...) cannot be iterated over"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | first(flatten) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | first(flatten) | $x | .k)",
+            "[\"k\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | first(flatten) | .k)",
+            "",
+            r#"Invalid path expression near attempt to access element "k" of [{"b":1},2]"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | first(.a, to_entries) | $x)",
+            "",
+            r#"Invalid path expression with result {"a":{"b":1},"k":2}"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | limit(2; to_entries, .a) | $x)",
+            "[]\n",
+            r#"Invalid path expression with result {"a":{"b":1},"k":2}"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | first(to_entries) | $x)",
+            "",
+            r"number (5) has no keys",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(.a | first(sort) | .b)",
+            "",
+            r#"object ({"b":1}) cannot be sorted, as it is not an array"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"(.a? as $y | try ((.a)? and first(to_entries)) | try ($y | .b)) |= 7",
+            "{\"a\":{\"b\":7},\"k\":2}\n",
+            "",
+            0,
+        ),
+    ])
 }
