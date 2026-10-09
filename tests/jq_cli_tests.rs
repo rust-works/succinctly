@@ -121196,7 +121196,7 @@ fn test_def_call_chain_fanout_is_bounded_4124() -> Result<()> {
 }
 
 /// #4125: a `try ... catch` operand of `and`/`or` or unary minus, whose handler reads
-/// the register, refuses where jq refuses instead of writing. Three mechanisms, each
+/// the register, refuses where jq refuses instead of writing. Two mechanisms, each
 /// row captured live from jq 1.7.1 (exit 5, no output; the wording differs for the
 /// last two, a residual):
 ///

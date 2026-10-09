@@ -1287,6 +1287,19 @@ is the revert that established what the other one costs.
      `flatten(n)` and `join(s)` is also approximate: jq reports the path error before the
      body's own type error (`null | join(",")` is `near attempt to iterate through null`),
      this resolver the type error, both exit 5 with nothing on stdout.
+   - **A `try` handler that navigates a payload that may be the register's node** (#4125). A body
+     whose raise the resolver cannot prove is the register's own node (`error(. // 5)`,
+     `select(. // 1) | error`) hands its handler a payload that equals the register by value; jq
+     navigates it when it is the node and prunes `(.a)?` as a swallowed path error when it is a
+     copy. Which holds is not known here, so the handler's `(.a)?` (when `.a` succeeds on the
+     payload by value) is a guess, loud and uncatchable (#3267), instead of the silent prune that
+     dropped jq's answer. The price is a refusal where jq answers when an outer `try` swallows the
+     path error: `del(try (try (if true then error(. // 5) else . end) catch (.a)? and .[0]))` on
+     `{"a":true}` leaves the document in jq. Over the path-register sweep's 73 `try`/`catch`
+     operands (12,027 sampled rows) it removed 18 writes where jq refuses and added 10 of these
+     refusals. The refusal's wording differs from jq's for `-(...)` (`boolean (false) cannot be
+     negated`) and `and .[0]` (`near attempt to access element 0`). Not applied inside a fold
+     body that has moved the register, where the entry register is not known.
    - **`map(f)` and `walk(f)` with an `f` outside `cannot_move_register`'s allowlist** are
      refused as a stage and as an operand where jq answers (`path(. as $x | map(.a) | $x)` on
      `[{"a":1}]` is `[]` in jq, and so is `map(sort)` on `[[3],[1]]`): jq path-checks `f` against
