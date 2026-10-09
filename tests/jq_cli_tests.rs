@@ -98030,6 +98030,9 @@ fn test_recurse_seed_residuals_stay_loud_3580() -> Result<()> {
         // that takes an argument binds code the shape cannot see
         (r"path(. as $x | 1 | if false then .a else 1 end | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
         (r"path(. as $x | 1 | def f(a): ..; f(1) | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+        // #3914: a `reduce` UPDATE whose `if` has a by-value branch is the same shape on the fold's own
+        // register and still refuses (jq: `[]`).
+        (r"path(. as $x | reduce (1,2) as $i (1; if false then .. else 1 end) | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
     ])
 }
 
@@ -98069,6 +98072,11 @@ fn test_recurse_seed_through_if_literal_and_def_call_3914() -> Result<()> {
         (r"path(. as $x | 1 | def f: .a; f | $x)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of 1\n", 5),
         (r"path(.a as $y | .c | def f: ..; f | $y)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"b\":{\"b\":null}}\n", 5),
         (r"del(. as $x | 1 | def f: ..; try f | $x | .c)", "{\"a\":{\"b\":{\"b\":null}}}\n", "", 0),
+        // In a fold's UPDATE, under `limit` and `first` (#3914 review).
+        (r"path(. as $x | foreach (1,2) as $i (1; if false then .. else 1 end; $x))", "[]\n[]\n", "", 0),
+        (r"path(. as $x | foreach (1,2) as $i (1; if $i == 1 then try .. else 1 end; $x))", "[]\n[]\n", "", 0),
+        (r"path(. as $x | limit(2; if false then .. else 1 end) | $x)", "[]\n", "", 0),
+        (r"path(. as $x | first(if false then .. else 1 end) | $x)", "[]\n", "", 0),
     ])
 }
 

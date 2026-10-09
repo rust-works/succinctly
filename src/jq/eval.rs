@@ -45432,8 +45432,10 @@ fn is_entry_marker_producer(expr: &Expr) -> bool {
     )
 }
 
-/// How many `def` bodies [`entry_marker_shape`] looks through before it reads a call as opaque.
-const DEF_CALL_SHAPE_DEPTH: u8 = 8;
+/// How many `def` bodies one [`entry_marker_shape`] walk looks through before it reads a call as
+/// opaque. A count, not a depth: nested calls multiply (a comma of `k` calls to a body that is a
+/// comma of `k` calls ...), so a depth cap alone leaves the walk `k^depth` long.
+const DEF_CALL_SHAPE_BUDGET: u32 = 16;
 
 /// [`EntryMarkers`] for `expr`, peeling the wrappers [`entry_marker_stage`]
 /// lists. Each arm is the resolver's own forwarding arm in `resolve_node_sink`
@@ -45442,11 +45444,11 @@ const DEF_CALL_SHAPE_DEPTH: u8 = 8;
 /// never reach the sink, so a producer there states nothing this stage reads
 /// and is not looked at.
 fn entry_marker_shape(expr: &Expr) -> EntryMarkers {
-    entry_marker_shape_in(expr, DEF_CALL_SHAPE_DEPTH)
+    entry_marker_shape_in(expr, &core::cell::Cell::new(DEF_CALL_SHAPE_BUDGET))
 }
 
-/// [`entry_marker_shape`] with `calls` more `def` bodies it may look into.
-fn entry_marker_shape_in(expr: &Expr, calls: u8) -> EntryMarkers {
+/// [`entry_marker_shape`] with `calls` more `def` bodies it may look into, shared by the whole walk.
+fn entry_marker_shape_in(expr: &Expr, calls: &core::cell::Cell<u32>) -> EntryMarkers {
     match expr {
         Expr::Identity
         | Expr::RecursiveDescent
@@ -45548,13 +45550,16 @@ fn entry_marker_shape_in(expr: &Expr, calls: u8) -> EntryMarkers {
         // #3914: `resolve_node_sink`'s `DefCall` arm resolves the bound body against this arm's
         // own input, frame and sink, so a call forwards a branch exactly as the body written in
         // place does. Only a call with no arguments: a closure or `$param` is bound to code
-        // this shape cannot see. The budget keeps a chain of nested calls from walking
-        // unboundedly; past it the call stays opaque, as it was.
+        // this shape cannot see. One budget is shared by the whole walk, so neither a chain of
+        // nested calls nor a fan of them (a comma of calls to a comma of calls ...) walks more
+        // than that many bodies; past it the call stays opaque, as it was.
         Expr::DefCall { def, args, .. } if args.is_empty() && def.params.is_empty() => {
-            match calls.checked_sub(1) {
-                Some(left) => entry_marker_shape_in(&def.body, left),
-                None => EntryMarkers::Opaque,
+            let left = calls.get();
+            if left == 0 {
+                return EntryMarkers::Opaque;
             }
+            calls.set(left - 1);
+            entry_marker_shape_in(&def.body, calls)
         }
         other if any_subexpr(other, &mut is_entry_marker_producer) => EntryMarkers::Opaque,
         _ => EntryMarkers::None,
@@ -45573,7 +45578,7 @@ fn pipe_forwards_last_statement(stages: &[Expr]) -> bool {
 }
 
 /// [`entry_marker_shape`] of a pipe that [`pipe_forwards_last_statement`] holds for.
-fn entry_marker_pipe_shape(stages: &[Expr], calls: u8) -> EntryMarkers {
+fn entry_marker_pipe_shape(stages: &[Expr], calls: &core::cell::Cell<u32>) -> EntryMarkers {
     let stages = pipe_without_trailing_identity(stages);
     entry_marker_shape_in(&stages[stages.len() - 1], calls)
 }
@@ -135590,11 +135595,11 @@ mod neutral_leaves_register_tests_4028 {
         }
     }
 
-    // #3914: a chain of calls is looked through to a bounded depth, then read as opaque, so a
-    // deeply nested `def` cannot make the shape walk unboundedly.
+    // #3914: the walk looks through a bounded number of `def` bodies, then reads a call as opaque.
+    // The budget is a count shared by the whole walk, so the chain's cut-off is exact.
     #[test]
-    fn a_def_call_chain_is_read_to_a_bounded_depth_3914() {
-        let chain = |links: usize| {
+    fn a_def_call_walk_is_bounded_by_a_body_budget_3914() {
+        let chain = |links: u32| {
             let mut src = String::from("def f0: ..; ");
             for i in 1..=links {
                 src.push_str(&format!("def f{i}: f{}; ", i - 1));
@@ -135602,9 +135607,34 @@ mod neutral_leaves_register_tests_4028 {
             src.push_str(&format!("f{links}"));
             bound_marker_shape(&src)
         };
-        assert_eq!(chain(1), "forwarded");
-        assert_eq!(chain(usize::from(DEF_CALL_SHAPE_DEPTH) - 2), "forwarded");
-        assert_eq!(chain(usize::from(DEF_CALL_SHAPE_DEPTH) + 2), "opaque");
+        // `links + 1` calls are charged: the last link's, and each body's call to the one before.
+        assert_eq!(chain(DEF_CALL_SHAPE_BUDGET - 1), "forwarded");
+        assert_eq!(chain(DEF_CALL_SHAPE_BUDGET), "opaque");
+        assert_eq!(chain(DEF_CALL_SHAPE_BUDGET + 8), "opaque");
+    }
+
+    // #3914 review: nested calls multiply -- every level a comma of `k` calls to the level
+    // below -- so a depth cap alone left the walk `k^depth` long (5 levels of 60 took 28 s). One
+    // budget per walk answers it at once.
+    #[test]
+    fn a_fan_of_def_calls_is_not_walked_exponentially_3914() {
+        let levels = 5;
+        let fan = 60;
+        let mut src = String::from("def f0: ..; ");
+        for i in 1..=levels {
+            let calls = vec![format!("f{}", i - 1); fan].join(", ");
+            src.push_str(&format!("def f{i}: ({calls}); "));
+        }
+        src.push_str(&format!("f{levels}"));
+        let started = std::time::Instant::now();
+        let shape = bound_marker_shape(&src);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the walk took {:?}",
+            started.elapsed()
+        );
+        // Past the budget a call is opaque, and one opaque sibling spoils the comma.
+        assert_eq!(shape, "opaque");
     }
 
     #[test]

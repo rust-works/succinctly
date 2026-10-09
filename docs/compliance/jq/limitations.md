@@ -3643,7 +3643,7 @@ answers `["b"]` — and classified the two residuals appended below):
   runs starts from the register the `if` was entered with (its condition is a subexp), so a by-value
   branch states it as a `//` alternate does (`carry_frame_register`): the taken `else 1` of
   `if false then .. else 1 end` is `[]`. And a zero-argument `def` call forwards its body's statements
-  (`entry_marker_shape` reads the call as its body, to a depth of 8 nested calls; the resolver's
+  (`entry_marker_shape` reads the call as its body, to a budget of 16 bodies per walk; the resolver's
   `DefCall` arm resolves the bound body against the same input, frame and sink): `def f: ..; f` is
   `[]` followed by the iterate error, as in jq. Pinned by
   `test_recurse_seed_through_if_literal_and_def_call_3914`. A row from the original list is also gone
@@ -3661,6 +3661,8 @@ answers `["b"]` — and classified the two residuals appended below):
   - an `if` whose branches hold no recursion at all (`if false then .a else 1 end`) and a `def` call
     that takes an argument (`def f(a): ..; f(1)`): the first has no producer for the stage to read,
     the second binds code the shape cannot see;
+  - a `reduce` UPDATE whose `if` has a by-value branch (`reduce (1,2) as $i (1; if false then .. else 1 end)`):
+    the fold reads its UPDATE's register through its own rule;
   - a recursion behind a *destructuring* bind (`(. as [$q] | ..)`): the bind's pattern indexes before
     its body runs, so the stage is opaque on purpose.
 - **A terminal `null`/`true`/`false` is the root path only while nothing navigated
