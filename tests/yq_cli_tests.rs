@@ -47124,6 +47124,17 @@ k: 2
             r"# a
 
 6
+",
+        ),
+    ];
+    for (doc, filter, extra, want) in cases {
+        let (out, err, code) = run_yq_stdin_with_stderr(filter, doc, extra)?;
+        assert_eq!(out, *want, "`{filter}` {extra:?} on {doc:?}: {err}");
+        assert_eq!(code, 0, "`{filter}` {extra:?} on {doc:?}: {err}");
+    }
+    Ok(())
+}
+
 /// #4086: a write keeps the first document's `---` marker, with the comments and blank
 /// lines before it, verbatim -- they used to be dropped, so editing any Kubernetes
 /// manifest, Ansible playbook or generated file that opens with `---` changed its first
