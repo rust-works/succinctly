@@ -3829,6 +3829,11 @@ $ printf 'outer:\n  big: 100000000000000000000\n' | succinctly yq '.outer.big | 
 tools — and so is the plain `.outer.big` identity read, which never goes through the value
 route at all.
 
+[#3040](https://github.com/rust-works/succinctly/issues/3040) later removed the 17-digit cap from
+`is_preservable_float_literal` altogether, so the first literal above (and any `.`/exponent-shaped
+float, however many digits) is now preserved outright on every route, not just through #2438's
+boundary spelling; only the integer-shaped overflow case above remains.
+
 What remains is the trailing `.0` on the integer-shaped spelling. It is not removable in
 isolation: that same `100000000000000000000.0` text is exactly what real yq itself prints
 for the same scalar on JSON output (`yq -o json '[.a]'` on `a: 99999999999999999999` answers

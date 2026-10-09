@@ -352,16 +352,6 @@ fn is_json_number_syntax(s: &str) -> bool {
     crate::json::validate::is_valid_number(s.as_bytes())
 }
 
-/// The maximum count of ASCII digit characters (integer + fraction part
-/// combined) [`is_preservable_float_literal`] allows through. 17 significant
-/// decimal digits is the documented bound beyond which distinct `f64`
-/// values can round to the same printed digits (and, symmetrically, below
-/// which every `f64` round-trips uniquely) — more digits than that means
-/// the source text already carries more precision than the `f64` it parsed
-/// to actually holds, so echoing it back verbatim would silently overstate
-/// precision the parse step already discarded.
-const MAX_PRESERVABLE_FLOAT_DIGITS: usize = 17;
-
 /// True if `s` is safe *and worthwhile* to preserve verbatim as a
 /// document-sourced float's `NumberLiteral` text — used by both YAML's
 /// [`super::light`] `number_literal()` override (a plain scalar) and its
@@ -373,40 +363,18 @@ const MAX_PRESERVABLE_FLOAT_DIGITS: usize = 17;
 ///   resolves to [`Float`](ResolvedScalar::Float) when it overflows `i64`
 ///   (`parse_int_or_float`'s fallback) — that's not a value someone spelled
 ///   as a float, it's an integer too big for `i64`, and echoing its raw
-///   digits back verbatim would silently claim more precision than the
-///   `f64` it parsed to can actually hold (the same concern the digit-count
-///   cap below targets, just via a different trigger). Either a decimal
+///   digits back verbatim would claim a float where the document spelled an
+///   integer (#1129). Either a decimal
 ///   point or an exponent is unambiguous float syntax on its own (`1e2`
 ///   has no `.` but is still a float, not an overflowed integer), so
 ///   either is sufficient here.
-/// - **At most [`MAX_PRESERVABLE_FLOAT_DIGITS`] *significant* digits in the
-///   mantissa** ([`significant_mantissa_digit_count`]) -- every digit from
-///   the mantissa's first nonzero digit onward, the same "significant
-///   figures" rule scientific notation itself uses: a leading zero run
-///   (`0.007`, magnitude, not precision) never counts, however long it is,
-///   the same way an *integer* literal's own leading zeros wouldn't. Two
-///   consequences, both #1211:
-///   - A **zero-valued mantissa** has no nonzero digit at all, so it has
-///     zero significant digits by this same rule -- always within the cap,
-///     needing no separate carve-out. `0.00000000000000000000e-400`
-///     (issue #1211's own repro) stays preserved at any length, matching
-///     real yq; before this fix, counting every digit *including* the
-///     leading zeros silently fell back to a lossy `0` past 17 of them.
-///   - A mantissa with a **long leading-zero run before a handful of real
-///     digits** (`0.000000000000000012345678901234567`, 17 significant
-///     digits behind 17 leading zeros) is preserved too, on the identical
-///     reasoning -- confirmed live against the pinned oracle; the raw-count
-///     predecessor of this check rejected it purely because of magnitude,
-///     the same miscount #1211 reported, just needing one nonzero digit
-///     instead of zero to trigger.
-///
-///   Exponent digits carry no precision (they're a magnitude, not a
-///   significand) and must not count toward this cap either -- an earlier
-///   version of this predicate counted every digit in `s` including the
-///   exponent's, which rejected exactly-round-trippable literals like
-///   `1.2345678901234567e10` (17 mantissa digits, but 19 counted) and
-///   reproduced #1008's catastrophic-decimal-expansion symptom for any
-///   long-enough exponent (caught in that PR's own code review).
+/// - **No cap on the digit count** (#3040). A YAML scalar's value is its text, and real
+///   yq keeps that text byte-for-byte until an operation computes a new number -- including
+///   a literal with more significant digits than an `f64` holds (`2.7293109604053567083`).
+///   An earlier version capped the mantissa at 17 significant digits (#1008, #1211) so the
+///   text would not "overstate precision the parse step discarded"; that rewrote an
+///   untouched value on every route but top-level streaming. Arithmetic still uses the
+///   plain, correctly-rounded `f64` parse, as Go's `ParseFloat` does.
 ///
 /// Exponent notation used to be excluded here entirely (issue #1008's
 /// original symptom): the reasoning was that `format_number_jq_compat` —
@@ -426,49 +394,7 @@ const MAX_PRESERVABLE_FLOAT_DIGITS: usize = 17;
 /// JSON-safe spelling before falling back to this same check.
 #[must_use]
 pub(super) fn is_preservable_float_literal(s: &str) -> bool {
-    let mantissa = match s.find(['e', 'E']) {
-        Some(exp_pos) => &s[..exp_pos],
-        None => s,
-    };
-    (s.contains('.') || s.contains(['e', 'E']))
-        && significant_mantissa_digit_count(mantissa) <= MAX_PRESERVABLE_FLOAT_DIGITS
-        && is_json_number_syntax(s)
-}
-
-/// Count of `mantissa`'s *significant* digits: every digit from the first
-/// nonzero digit onward (including any zero after it, whether between
-/// digits or trailing), ignoring a leading run of zeros before that first
-/// nonzero digit and ignoring sign/`.` characters throughout -- the same
-/// "significant figures" rule scientific notation itself uses (#1211). A
-/// mantissa with no nonzero digit at all -- a zero-valued spelling -- has
-/// zero significant digits by this definition, which is why it needs no
-/// separate carve-out from [`MAX_PRESERVABLE_FLOAT_DIGITS`]: it's already
-/// within any nonnegative cap.
-///
-/// Ignores (does not count, does not reject) anything outside
-/// `0`-`9`/`.`/`+`/`-` -- this runs *before*
-/// [`is_preservable_float_literal`]'s own trailing `is_json_number_syntax`
-/// check (short-circuit `&&` evaluates left to right), so `mantissa` is
-/// **not** yet known to be valid number syntax at this point; this
-/// function stays total over arbitrary input rather than relying on a
-/// precondition its own caller doesn't actually establish until
-/// afterward. A malformed mantissa this function undercounts would still
-/// be caught by that later `is_json_number_syntax` check before `true`
-/// could ever propagate out of `is_preservable_float_literal` as a whole.
-fn significant_mantissa_digit_count(mantissa: &str) -> usize {
-    let mut count = 0usize;
-    let mut seen_nonzero = false;
-    for b in mantissa.bytes() {
-        match b {
-            b'1'..=b'9' => {
-                seen_nonzero = true;
-                count += 1;
-            }
-            b'0' if seen_nonzero => count += 1,
-            _ => {} // leading zero, sign, '.', or (unreachable in practice) anything else
-        }
-    }
-    count
+    (s.contains('.') || s.contains(['e', 'E'])) && is_json_number_syntax(s)
 }
 
 /// A normalized, JSON-safe equivalent spelling for `s`, for a `Float`
@@ -511,8 +437,8 @@ fn significant_mantissa_digit_count(mantissa: &str) -> usize {
 /// framing (real yq's Go-based number model has no equivalent internal
 /// JSON-reindexing constraint forcing it to normalize).
 ///
-/// `None` when nothing here helps (not `.`-or-exponent-shaped at all, the
-/// digit cap is exceeded, or the normalized text is still invalid, e.g.
+/// `None` when nothing here helps (not `.`-or-exponent-shaped at all, or the
+/// normalized text is still invalid, e.g.
 /// `+1.2.3`) -- callers fall back to their own pre-existing bare-`Float`
 /// handling unchanged.
 ///
@@ -525,15 +451,6 @@ fn significant_mantissa_digit_count(mantissa: &str) -> usize {
 /// #954's own self-inconsistency symptom for that one shape: falling
 /// through to the bare-`Float` path left `tostring`/`join` disagreeing
 /// with each other again, exactly what this function exists to prevent).
-///
-/// A mantissa whose own digit count is right at
-/// [`MAX_PRESERVABLE_FLOAT_DIGITS`] can still lose preservation here if it
-/// also needs the trailing-dot completion (the appended `0` pushes it one
-/// digit over) -- accepted as a narrow, safe edge case: the digit cap's
-/// own re-check after normalizing means this never emits a wrong value,
-/// only occasionally declines to preserve an already-rare spelling
-/// (17-significant-digit mantissa *and* a bare trailing dot), falling
-/// back to the always-value-correct bare-`Float` reconstruction instead.
 #[must_use]
 pub(super) fn preservable_float_literal_text(s: &str) -> Option<String> {
     if is_preservable_float_literal(s) {
@@ -1008,34 +925,22 @@ mod tests {
         }
     }
 
+    /// #3040: a literal with more significant digits than an `f64` holds keeps its source
+    /// text, as real yq does; the mantissa length, leading zeros and exponent never matter.
     #[test]
-    fn preservable_float_literal_rejects_beyond_the_digit_cap() {
-        let just_over = "1.".to_string() + &"1".repeat(MAX_PRESERVABLE_FLOAT_DIGITS);
-        assert!(!is_preservable_float_literal(&just_over));
-        let at_cap = "1.".to_string() + &"1".repeat(MAX_PRESERVABLE_FLOAT_DIGITS - 1);
-        assert!(is_preservable_float_literal(&at_cap));
-    }
-
-    /// #1008 code review: an earlier version of the digit cap counted
-    /// exponent digits along with the mantissa's, so a full-precision
-    /// (17-digit) mantissa paired with any multi-digit exponent was
-    /// wrongly rejected -- reproducing #1008's catastrophic-decimal-expansion
-    /// symptom for exactly the round-trip-exact literals the cap exists to
-    /// protect. Only the mantissa's own digit count should matter.
-    #[test]
-    fn preservable_float_literal_digit_cap_ignores_exponent_digits() {
-        let mantissa_at_cap = "1.".to_string() + &"1".repeat(MAX_PRESERVABLE_FLOAT_DIGITS - 1);
-        assert!(is_preservable_float_literal(&format!(
-            "{mantissa_at_cap}e100"
-        )));
-        assert!(is_preservable_float_literal(&format!(
-            "{mantissa_at_cap}e-300"
-        )));
-
-        let mantissa_over_cap = "1.".to_string() + &"1".repeat(MAX_PRESERVABLE_FLOAT_DIGITS);
-        assert!(!is_preservable_float_literal(&format!(
-            "{mantissa_over_cap}e1"
-        )));
+    fn preservable_float_literal_has_no_digit_cap_3040() {
+        for s in [
+            "2.7293109604053567083",
+            "2.7293109604053567083e5",
+            "0.000000000000000000027293109604053567083",
+            "1.00000000000000000000000000000000000000001e-400",
+        ] {
+            assert!(is_preservable_float_literal(s), "expected preserved: {s:?}");
+        }
+        // Still gated on float syntax: a bare digit run is an overflowed integer (#1129).
+        assert!(!is_preservable_float_literal(
+            "123456789012345678901234567890"
+        ));
     }
 
     /// #1211: a zero-mantissa literal has no "significant digits" for the
@@ -1054,43 +959,15 @@ mod tests {
         assert!(is_preservable_float_literal("0.000e-400"));
     }
 
-    /// #1211: a leading run of zeros (before the first nonzero digit) never
-    /// counts toward the cap, the same "significant figures" rule the
-    /// all-zero case above gets -- confirmed live against the pinned oracle
-    /// for a case with real significant digits behind many leading zeros,
-    /// not just the all-zero case #1211 itself reported. The cap still
-    /// applies once there are genuinely too many *significant* digits.
+    /// #1211: a leading run of zeros never matters; kept after #3040 removed the cap.
     #[test]
-    fn preservable_float_literal_leading_zeros_never_count_toward_the_cap() {
-        // A single nonzero digit, however many leading zeros precede it, is
-        // one significant digit -- well within the cap, same "significant
-        // figures" rule a zero mantissa gets (#1211). This is *not* a
-        // regression of the pre-#1211 raw-digit-count behavior: it's the
-        // adjacent bug that behavior also had (a real, live divergence from
-        // the pinned oracle, confirmed during this fix's own review), now
-        // fixed by the same change.
-        let mostly_zeros_one_nonzero_digit = "0.".to_string() + &"0".repeat(30) + "1";
+    fn preservable_float_literal_leading_zeros_stay_preserved() {
+        let mostly_zeros = "0.".to_string() + &"0".repeat(30) + "1";
         assert!(is_preservable_float_literal(&format!(
-            "{mostly_zeros_one_nonzero_digit}e-400"
+            "{mostly_zeros}e-400"
         )));
-        // The cap still applies once there are genuinely too many
-        // *significant* digits, leading zeros or not.
-        let over_cap_significant_digits =
-            "0.".to_string() + &"0".repeat(30) + &"1".repeat(MAX_PRESERVABLE_FLOAT_DIGITS + 1);
-        assert!(!is_preservable_float_literal(&format!(
-            "{over_cap_significant_digits}e-400"
-        )));
-        // Exactly at the cap, leading zeros or not: preservable.
-        let at_cap_significant_digits =
-            "0.".to_string() + &"0".repeat(30) + &"1".repeat(MAX_PRESERVABLE_FLOAT_DIGITS);
-        assert!(is_preservable_float_literal(&format!(
-            "{at_cap_significant_digits}e-400"
-        )));
-        // No leading zeros at all: unaffected by #1211, same as before.
-        let short_mostly_zeros = "0.".to_string() + &"0".repeat(10) + "1";
-        assert!(is_preservable_float_literal(&format!(
-            "{short_mostly_zeros}e-400"
-        )));
+        let many_digits = "0.".to_string() + &"0".repeat(30) + &"1".repeat(40);
+        assert!(is_preservable_float_literal(&format!("{many_digits}e-400")));
     }
 
     // ========================================================================
@@ -1195,33 +1072,18 @@ mod tests {
         assert_eq!(preservable_float_literal_text("+5"), None);
     }
 
+    /// #3040: the normalizing fallback has no digit cap either, including a bare trailing dot
+    /// on a long mantissa.
     #[test]
-    fn preservable_float_literal_text_respects_the_digit_cap() {
-        let over_cap = "+1.".to_string() + &"1".repeat(MAX_PRESERVABLE_FLOAT_DIGITS);
-        assert_eq!(preservable_float_literal_text(&over_cap), None);
-    }
-
-    /// Code review: a mantissa with exactly [`MAX_PRESERVABLE_FLOAT_DIGITS`]
-    /// digits *and* a bare trailing dot (so its digit count is under the
-    /// cap *before* normalization) still gets rejected, because completing
-    /// the dot appends a `0` that pushes the count one over. Documented as
-    /// an accepted, narrow edge case in this function's own doc comment --
-    /// this test exists to pin the *safety* property (falls back to the
-    /// value-correct bare-`Float` path, never a wrong number or invalid
-    /// JSON), not to claim the spelling gets preserved.
-    #[test]
-    fn preservable_float_literal_text_digit_cap_boundary_with_trailing_dot_is_a_safe_miss() {
-        let digits_at_cap = "1".repeat(MAX_PRESERVABLE_FLOAT_DIGITS);
-        // One digit short of the cap plus the completed dot's `0` lands
-        // exactly at the cap -- still preserved.
-        let one_under = "1".repeat(MAX_PRESERVABLE_FLOAT_DIGITS - 1) + ".";
+    fn preservable_float_literal_text_has_no_digit_cap_3040() {
+        let long = "1".repeat(40);
         assert_eq!(
-            preservable_float_literal_text(&one_under),
-            Some(one_under.clone() + "0")
+            preservable_float_literal_text(&format!("+1.{long}")),
+            Some(format!("1.{long}"))
         );
-        // At the cap already, so completing the dot pushes one over --
-        // declines to preserve, rather than silently exceeding the cap.
-        let at_cap = digits_at_cap.clone() + ".";
-        assert_eq!(preservable_float_literal_text(&at_cap), None);
+        assert_eq!(
+            preservable_float_literal_text(&format!("{long}.")),
+            Some(format!("{long}.0"))
+        );
     }
 }
