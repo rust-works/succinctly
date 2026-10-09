@@ -50670,10 +50670,10 @@ mod tests {
             // Within, at and just past the step cap behind the remembered element.
             vec![
                 900,
-                900 - cap,
-                900 - cap - 1,
-                900 - cap - 2,
-                900 - 2 * cap - 5,
+                900usize.saturating_sub(cap),
+                900usize.saturating_sub(cap + 1),
+                900usize.saturating_sub(cap + 2),
+                900usize.saturating_sub(2 * cap + 5),
                 100,
                 99,
                 0,
