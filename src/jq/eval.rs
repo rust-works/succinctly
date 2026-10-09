@@ -47356,18 +47356,52 @@ fn yields_only_the_register(e: &Expr) -> bool {
 /// which [`body_performs_no_step`] now keeps from firing early.) A `?//` chain is left
 /// to the by-value drive as for a fresh source ([`routes_destructuring`]), except as a
 /// nested `foreach`'s own patterns over the register ([`routes_destructuring_chain`], #3948).
+///
+/// The bound expression is a bare `.` or a `select(literal)` that hands it on (#4128); a
+/// `(.|.)`/`(., .)` bind stays out, since the resolver reads it as a computed value. The
+/// other [`source_destructures_register`] mode, through a nested `reduce`, is only for
+/// the places the register is not known to be at `.`.
 fn foreach_source_destructures_register(source: &Expr) -> bool {
+    source_destructures_register(source, false)
+}
+
+/// [`foreach_source_destructures_register`], optionally reading through a nested
+/// `reduce` too (`through_reduce`, #4128).
+///
+/// A `reduce` backtracks its source, so what it destructures never moves the register
+/// of the fold around it (the reason the `foreach` form stops at it). The destructure's
+/// own step is still a tracked `INDEX` run against the value in hand, though, and on a
+/// value the register is not on it raises: `path(. as $x | {a:{b:1}} |
+/// (reduce (. as {a:$a} | $a) as $k (.; .)) and .b? | $x)` is a path error in jq, and
+/// the by-value drive answered `[]`. Only the fold's own pattern walk is modelled by the
+/// resolver, so the caller routes a source that holds one through it when the
+/// accumulator is not known to be the register.
+fn source_destructures_register(source: &Expr, through_reduce: bool) -> bool {
+    let recurse = |e: &Expr| source_destructures_register(e, through_reduce);
     match unwrap_paren(source) {
+        // #4128: `select(true) as {a:$a}` binds the register as `. as {a:$a}` does, so under
+        // `through_reduce` any source that only hands the register on is the same destructure.
+        // The `foreach` route takes only the bare `.` and `select(literal)`: the resolver
+        // models `(.|.) as {a:$a}` as a computed value there, and a `try`/`?` around it
+        // swallowed the resulting refusal.
         Expr::AsPattern { expr, patterns, .. } => {
-            routes_destructuring(patterns) && matches!(unwrap_paren(expr), Expr::Identity)
+            routes_destructuring(patterns)
+                && if through_reduce {
+                    yields_only_the_register(expr)
+                } else {
+                    matches!(
+                        unwrap_paren(expr),
+                        Expr::Identity | Expr::Builtin(Builtin::Select(_))
+                    ) && yields_only_the_register(expr)
+                }
         }
-        Expr::Comma(branches) => branches.iter().any(foreach_source_destructures_register),
+        Expr::Comma(branches) => branches.iter().any(recurse),
         // #3940: a leading stage that only hands the register on (`.`, `(.|.)`, `(., .)`)
         // moves nothing, so the stage after it is the one that meets the register.
         Expr::Pipe(stages) => stages
             .iter()
             .find(|stage| !yields_only_the_register(stage))
-            .is_some_and(foreach_source_destructures_register),
+            .is_some_and(recurse),
         Expr::Foreach {
             input, patterns, ..
         } => {
@@ -47376,15 +47410,22 @@ fn foreach_source_destructures_register(source: &Expr) -> bool {
                 // #4031: the nested fold does not backtrack its source either, so what
                 // that source destructures reaches the outer EXTRACT whatever the
                 // nested loop pattern is (`foreach (foreach (. as [$a] | .) as $k (.; .; .))`).
-                || foreach_source_destructures_register(input)
+                || recurse(input)
+        }
+        Expr::Reduce {
+            input, patterns, ..
+        } if through_reduce => {
+            ((routes_destructuring(patterns) || routes_destructuring_chain(patterns))
+                && yields_only_the_register(input))
+                || recurse(input)
         }
         // #3956: a wrapper that emits what its operand does (`try E`, `E?`, `first(E)`,
         // `limit(n; E)`) meets the register where `E` does, and a `label` runs its body in
         // the same scope, so the destructure behind it is the source's own.
-        Expr::Label { body, .. } => foreach_source_destructures_register(body),
+        Expr::Label { body, .. } => recurse(body),
         other => {
             let peeled = peel_register_transparent(other);
-            !core::ptr::eq(peeled, other) && foreach_source_destructures_register(peeled)
+            !core::ptr::eq(peeled, other) && recurse(peeled)
         }
     }
 }
@@ -47684,6 +47725,15 @@ fn drive_fold_source_with<S: EvalSemantics>(
     // navigated away (`foreach (map(1)|length) as $k (.b; .)`) answered where jq raises
     // "iterate through". Jq mode only: yq's `first` is a root-only operator, not an
     // index, and yq has no `foreach`/`path` to check against.
+    // #4128: a destructure of `.` anywhere in the source's spine, a nested `reduce`'s
+    // included, runs a tracked `INDEX` step against the value in hand. Where the fold's
+    // `.` is not known to be the register (an untracked entry, or the body of another
+    // fold, whose source may have moved it) that step raises in jq; the by-value drive
+    // answered, and a `del` through the answer wrote. Read once: the resolver route below
+    // and the loud refusal after it are both decided by it.
+    let destructures_unplaced_register = S::TAG == EvalTag::Jq
+        && (!ambient.trackable || !(fold_body::depth() == 0 || fold_body::acc_is_register_here()))
+        && source_destructures_register(source, true);
     let has_navigation = any_subexpr(source, &mut |e| {
         is_fold_source_navigation(e)
             || (S::TAG == EvalTag::Jq
@@ -47704,6 +47754,7 @@ fn drive_fold_source_with<S: EvalSemantics>(
     }) || (S::TAG == EvalTag::Jq
         && foreach_source
         && foreach_source_destructures_register(source))
+        || destructures_unplaced_register
         // #3795: a source that can hand the register back by pointer through
         // control flow (`(., 1) | .`) is placed by the resolver too, so the
         // output that *is* the register binds as the register-derived element
@@ -47716,6 +47767,22 @@ fn drive_fold_source_with<S: EvalSemantics>(
         || (fold_body::depth() == 0
             && fold_source_may_alias_register::<S>(source)
             && !binds_a_pattern_or_folds(source));
+    // #4128: the same destructure inside another fold's body, where the accumulator is not
+    // known to be the register. The ambient still reads as trackable (the enclosing source's
+    // movement is not modelled, #3790), so the resolver would check the step against a
+    // register that is not where jq's is, and answer; refuse loudly instead, as the body's
+    // own "with result" refusal does for a `.` body. A `null` ambient is left to the
+    // resolver's own `null` clause (#4007): on a `null` document the register really is
+    // that `null`, and jq answers.
+    if destructures_unplaced_register
+        && ambient.trackable
+        && !matches!(ambient.value, OwnedValue::Null)
+        && fold_body::depth() != 0
+    {
+        return Flow::Escaped(Control::Error(EvalError::invalid_path_expression_guessed(
+            ambient.value,
+        )));
+    }
     // #3790: a fold whose source is the register itself (`.`) emits it as jq's
     // register-derived element at the root: `.` does not move the register and `$k`
     // is bound to that very node, so the element carries the root path (rebased

@@ -121833,3 +121833,124 @@ fn test_error_message_navigation_is_path_checked_4146() -> Result<()> {
     }
     Ok(())
 }
+
+/// #4128: a `reduce`/`foreach` whose source destructures the register (`. as {a:$a}`,
+/// `select(true) as {a:$a}`) or is itself such a fold runs a tracked `INDEX` step against the
+/// value in hand, which raises in jq where that value is not the register: an untracked entry
+/// (`{a:{b:1}} | ...`) or the accumulator of an enclosing fold whose source navigated. The
+/// by-value drive answered, and a `del`/`=` through the answer wrote (the first row deleted the
+/// whole document). The last four rows are contrasts: a destructure at the register itself
+/// stays answered, and two rows that raised before this change still raise. Every row captured from jq 1.7.1, on the stdin and `-n` routes. Where the
+/// refusal is the loud guess inside another fold's body it reads `with result ...` rather than
+/// jq's `near attempt to access element "a"`, so those rows pin only the shared prefix.
+#[test]
+fn test_fold_source_destructuring_the_register_raises_where_it_is_not_4128() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"a":false,"b":null}"#,
+            r"del(reduce .[]? as $k (.; foreach ((.|.) | reduce . as {a:$a} (0; .)) as $x (.; .; .)))",
+            "",
+            r"Invalid path expression",
+            5,
+        ),
+        (
+            r"null",
+            r"path(. as $x | {a:{b:1}} | ((reduce (foreach . as {a:$a} (.; .; .)) as $k (.; .)) or .b?) | $x)",
+            "",
+            r#"Invalid path expression near attempt to access element "a""#,
+            5,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"del(foreach .[]? as $k (.; (reduce (foreach . as {a:$a} (.; .; .)) as $k (.; .)) and (.a)?; .b?))",
+            "",
+            r#"Invalid path expression near attempt to access element "a""#,
+            5,
+        ),
+        (
+            r#"{"a":false,"b":null}"#,
+            r"path(. as $x | {a:{b:1}} | ((reduce (. as {a:$a} | $a) as $k (.; .)) and (.a)?) | $x)",
+            "",
+            r#"Invalid path expression near attempt to access element "a""#,
+            5,
+        ),
+        (
+            r#"{"a":false,"b":null}"#,
+            r"del(. as $x | ((foreach (select(true) as {a:$a} | .) as $k (.; .; .)) or .a) | $x)",
+            "",
+            r"Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"del((foreach (select(true) as {a:$a} | .) as $k (.; .; .)) and .a)",
+            "",
+            r#"Invalid path expression near attempt to access element "a""#,
+            5,
+        ),
+        (
+            r#"{"a":false,"b":null}"#,
+            r"((foreach (select(true) as {a:$a} | .) as $k (.; .; .)) and .a) = 9",
+            "",
+            r#"Invalid path expression near attempt to access element "a""#,
+            5,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            r"del(reduce .[]? as $k (.; ((foreach (select(true) as {a:$a} | .) as $k (.; .; .)))))",
+            "",
+            r"Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":[true]}"#,
+            r"del(. as $x | ((foreach (select(true) as {a:$a} | .) as $k (.; .; .)) and true) | $x)",
+            "",
+            r"Invalid path expression",
+            5,
+        ),
+        // A nested `reduce` with a plain loop pattern: its destructuring SOURCE is read through it.
+        (
+            r#"{"a":false,"b":null}"#,
+            r"del(reduce .[]? as $k (.; foreach (reduce (. as {a:$a} | .) as $q (0; .)) as $x (.; .; .)))",
+            "",
+            r"Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":false,"b":null}"#,
+            r"del(reduce .[]? as $k (.; foreach (reduce (. as {a:$a} | $a) as $q (0; .)) as $x (.; .; .)))",
+            "",
+            r"Invalid path expression",
+            5,
+        ),
+        (
+            r"[1,2]",
+            r"[path(reduce (. as [$a] | $a) as $k (.; .))]",
+            "[[]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(reduce (. as {a:$a} | $a) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | foreach (. as {a:$a} | .) as $k (.; .; .) | $x)",
+            "",
+            r"Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(reduce 1 as $k (.; .a))",
+            "",
+            r"Invalid path expression",
+            5,
+        ),
+    ])
+}
