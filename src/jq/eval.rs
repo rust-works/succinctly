@@ -42805,7 +42805,7 @@ fn stage_is_register_keeping(expr: &Expr) -> bool {
         stage => {
             is_last_stage(stage)
                 || is_select_stage(stage)
-                || (!std::ptr::eq(stage, unwrap_paren(expr)) && cannot_move_register(stage))
+                || (!core::ptr::eq(stage, unwrap_paren(expr)) && cannot_move_register(stage))
         }
     }
 }
