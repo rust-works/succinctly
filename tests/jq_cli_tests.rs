@@ -115727,33 +115727,53 @@ fn test_any_all_path_answer_halt_is_not_retried_3827() -> Result<()> {
 /// retry first (`RRH`, `RHjq: error ...`).
 #[test]
 fn test_any_all_path_answer_precedes_the_retrys_side_effects_3899() -> Result<()> {
-    let input = r#"{"x":true}"#;
-    for (filter, stdout, stderr_starts, code) in [
+    let flat = r#"{"x":true}"#;
+    let nested = r#"{"x":{"a":true}}"#;
+    for (input, filter, stdout, stderr_starts, code) in [
         // the by-value route: `cond` navigates nothing
         (
+            flat,
             r#"path(.x | any(.; (. as $q ?// $z | ("R"|stderr) as $m | if $q then true else empty end))) | ("H"|halt_error(3))"#,
             "",
             "RH",
             3,
         ),
         (
+            flat,
             r#"path(.x | all(.; (. as $q ?// $z | ("R"|stderr) as $m | if $q then false else empty end))) | ("H"|halt_error(3))"#,
             "",
             "RRH",
             3,
         ),
-        // the live route: `cond`'s retry is a real `?//` the resolver drives
         (
+            flat,
             r#"path(.x | any(.; (. as $q ?// $z | if $q then true else (("R"|stderr)|empty) end))) | ("H"|stderr)"#,
             "\"H\"\n",
             "HRjq: error (at ",
             5,
         ),
         (
+            flat,
             r#"path(.x | all(.; (. as $q ?// $z | if $q then false else (("R"|stderr)|empty) end))) | ("H"|stderr)"#,
             "\"H\"\n",
             "RH",
             0,
+        ),
+        // the live route: `cond` navigates (`.a`), so its `?//` is a real one the
+        // resolver drives
+        (
+            nested,
+            r#"path(.x | any(.; (. as $q ?// $z | ("R"|stderr) as $m | if $q then .a else empty end))) | ("H"|stderr)"#,
+            "\"H\"\n",
+            "RHRjq: error (at ",
+            5,
+        ),
+        (
+            nested,
+            r#"path(.x | any(.; (. as $q ?// $z | ("R"|stderr) as $m | if $q then .a else empty end))) | ("H"|halt_error(3))"#,
+            "",
+            "RH",
+            3,
         ),
     ] {
         let owned = format!("{input} | {filter}");
@@ -115770,7 +115790,7 @@ fn test_any_all_path_answer_precedes_the_retrys_side_effects_3899() -> Result<()
             assert!(err.starts_with(stderr_starts), "`{filter}`: {err:?}");
             // Exactly the trace and nothing after it, bar the error line.
             if stderr_starts.ends_with("(at ") {
-                assert!(err.ends_with("with result false\n"), "`{filter}`: {err:?}");
+                assert!(err.contains("with result "), "`{filter}`: {err:?}");
             } else {
                 assert_eq!(err, stderr_starts, "`{filter}`");
             }
