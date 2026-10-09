@@ -60967,3 +60967,29 @@ fn test_del_of_a_root_variable_keeps_the_document_3244() -> Result<()> {
     assert_eq!((out.trim(), code), ("null", 0));
     Ok(())
 }
+
+/// Pinned yq v4.53.3: `to_unix` is an `!!int`, so a whole epoch prints in full where a float
+/// printed `1.7052768e+09` (#4203). Every row was captured from the pinned binary,
+/// `-n -o=json -I=0`.
+#[test]
+fn test_to_unix_answers_an_int_4203() -> Result<()> {
+    let args = &["-n", "-o=json", "-I=0"];
+    for (filter, expected) in [
+        (r#""2024-01-15" | to_unix"#, "1705276800"),
+        (r#""2024-01-15T10:00:00Z" | to_unix"#, "1705312800"),
+        (r#""2024-01-15T10:00:00.5Z" | to_unix"#, "1705312800"),
+        (
+            r#""2024-01-15T10:00:00+02:00" | to_unix | tag"#,
+            r#""!!int""#,
+        ),
+        ("1705276800 | from_unix | to_unix", "1705276800"),
+        (r#""1969-12-31T23:59:59Z" | to_unix"#, "-1"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, "", args)?;
+        assert_eq!((out.trim(), code), (expected, 0), "{filter}");
+    }
+    // YAML output prints the integer too.
+    let (out, code) = run_yq_stdin(r#""2024-01-15" | to_unix"#, "", &["-n"])?;
+    assert_eq!((out.trim(), code), ("1705276800", 0));
+    Ok(())
+}
