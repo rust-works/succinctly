@@ -3674,6 +3674,20 @@ fn is_value_identity_stage(stage: &Expr) -> bool {
     )
 }
 
+/// Whether `expr` contains a `head_comment`, `foot_comment` or `comments` metadata write
+/// anywhere (#2796).
+fn writes_head_foot_or_comments(expr: &Expr) -> bool {
+    jq::walk::any_subexpr(expr, &mut |e| {
+        matches!(
+            e,
+            Expr::MetaAssign {
+                slot: MetaSlot::HeadComment | MetaSlot::FootComment | MetaSlot::Comments,
+                ..
+            }
+        )
+    })
+}
+
 /// Resolve every `Expr::MetaAssign` pipe stage of `expr` into concrete
 /// writes, evaluating each stage's target paths and right-hand side against
 /// the document *that stage* sees -- `root_value` for the first stage, and
@@ -3711,10 +3725,17 @@ fn resolve_meta_assign_writes(
     let mut stages = Vec::new();
     flatten_pipe_stages(expr, &mut stages);
     // This pass resolves the writes once, against the document it is handed: a filter that asks
-    // which document or file it is on (`select(di == 1) | .b comments = ""`) would resolve for
-    // the wrong one and silently write nothing for the rest (#2796).
-    if jq::walk::contains_builtin(expr, |b| {
-        matches!(b, Builtin::DocumentIndex | Builtin::FileIndex)
+    // which document or file it is on before a write (`select(di == 1) | .b comments = ""`)
+    // would resolve for the wrong one and silently write nothing for the rest (#2796). A `di`
+    // after the last write only shapes what is printed, which this pass never sees.
+    let through_last_meta = stages
+        .iter()
+        .rposition(|s| matches!(s, Expr::MetaAssign { .. }))
+        .map_or(0, |last| last + 1);
+    if stages[..through_last_meta].iter().any(|stage| {
+        jq::walk::contains_builtin(stage, |b| {
+            matches!(b, Builtin::DocumentIndex | Builtin::FileIndex)
+        })
     }) {
         sink.report(
             DiagStyle::Yq,
@@ -3904,13 +3925,12 @@ fn resolve_one_meta_assign(
                 // The document root takes a text (#2796): yq prints its head above the document
                 // and its foot below, wherever the document's own entries put theirs. Any other
                 // node's depends on go-yaml's emitter state.
-                let sets_root = !s.is_empty()
+                let text = meta_comment_text(&s);
+                let sets_root = text.is_some()
                     && !on_key
                     && path.is_empty()
-                    && !matches!(slot, WritableSlot::KeyLineComment)
-                    && meta_comment_text(&s).is_some();
-                if sets_root {
-                    let text = meta_comment_text(&s).unwrap_or_default();
+                    && !matches!(slot, WritableSlot::KeyLineComment);
+                if let (true, Some(text)) = (sets_root, text) {
                     let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
                     let head = matches!(slot, WritableSlot::HeadComment | WritableSlot::Comments);
                     let foot = matches!(slot, WritableSlot::FootComment | WritableSlot::Comments);
@@ -3939,6 +3959,12 @@ fn resolve_one_meta_assign(
                             ("line_comment", " on a key node (`...` visits the keys too)")
                         }
                         _ => ("comments", ""),
+                    };
+                    let detail = if meta_comment_text(&s).is_none() {
+                        // yq writes blank comment lines for it.
+                        " made of newlines alone"
+                    } else {
+                        detail
                     };
                     sink.report(
                         DiagStyle::Yq,
@@ -4259,6 +4285,21 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
             Some(writes) => writes,
             None => return Ok(Vec::new()),
         },
+        // A route that keeps no comments of its own (several results, a constructed value, a
+        // bind) cannot place a head, foot or `comments` write, and before #2796 raised for them
+        // from the evaluator: say so instead of printing without it. A route with no use for
+        // comments at all (`-o json`) has nothing to lose.
+        None if need_comments && writes_head_foot_or_comments(expr) => {
+            sink.report(
+                DiagStyle::Yq,
+                &EvalError::new(
+                    "head_comment/foot_comment/comments = ... is only supported as a top-level \
+                     pipe stage of a plain write (#2796)",
+                ),
+                &no_location(),
+            );
+            return Ok(Vec::new());
+        }
         None => Vec::new(),
     };
 
@@ -11456,6 +11497,60 @@ mod tests {
         assert_eq!(
             render_with_comments("42\n", ". comments = \"x\"").trim_end(),
             "42"
+        );
+    }
+
+    /// #2796: a head, foot or `comments` write on a route that keeps no comment tree of its own
+    /// (several results, a constructed value) is refused instead of printing without it, and a
+    /// `di` after the last write does not trip the document-index guard.
+    #[test]
+    fn comment_writes_on_a_route_without_a_tree_are_refused_2796() {
+        for filter in [
+            ". head_comment = \"x\", .a",
+            "{\"r\": .} | .r head_comment = \"z\"",
+            "[. comments = \"\"]",
+        ] {
+            let expr = jq::parse_with_mode(filter, jq::ParserMode::Yq).unwrap();
+            let mut sink = ErrorSink::default();
+            let (groups, _) = evaluate_yaml_direct_filtered(
+                b"a: 1\n",
+                &expr,
+                None,
+                &mut sink,
+                DirectEvalOptions {
+                    need_comments: true,
+                    strip_style: false,
+                    sort_keys: false,
+                    mark_json_sourced: false,
+                },
+            )
+            .unwrap();
+            assert!(groups.into_iter().flatten().next().is_none(), "{filter}");
+            assert_eq!(sink.report_count(), 1, "{filter}");
+        }
+        // Not a comment-keeping route, so nothing to lose.
+        let expr = jq::parse_with_mode(". head_comment = \"x\", .a", jq::ParserMode::Yq).unwrap();
+        let mut sink = ErrorSink::default();
+        let _ = evaluate_yaml_direct_filtered(
+            b"a: 1\n",
+            &expr,
+            None,
+            &mut sink,
+            DirectEvalOptions {
+                need_comments: false,
+                strip_style: false,
+                sort_keys: false,
+                mark_json_sourced: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(sink.report_count(), 0);
+        // A `di` after the last write shapes only what is printed.
+        let expr =
+            jq::parse_with_mode(".a line_comment = \"x\" | .b = di", jq::ParserMode::Yq).unwrap();
+        assert!(
+            resolve_meta_assign_writes(&expr, &OwnedValue::Null, &mut ErrorSink::default())
+                .is_some()
         );
     }
 }
