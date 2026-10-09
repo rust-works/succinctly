@@ -664,14 +664,23 @@ $x (.; .[$x:]))` raises `E2`, was the slice error). What it leaves:
   `foreach`, any number of alternatives, pinned by
   `test_fold_pattern_against_known_untracked_register_retries_3999`. An element equal to the
   register by value (a `map(.)` copy of the array the register sits on) stays the loud guess,
-  and so does a fold whose stage lost the register or whose INIT may have moved it. The
-  register's *position* is still unknown there, so the walk cannot step from it: a row jq
-  answers by stepping from the register's own node (`{"a":true}` with `?// $a`, jq `{}`) still
-  refuses, now at the result ("with result true") rather than at the first step. The first
+  and so does a fold whose stage lost the register or whose INIT may have moved it. Since
+  [#4049](https://github.com/rust-works/succinctly/issues/4049) the walk also *steps* from that
+  register, which sits at the fold's root, so jq's `path_intact` decides each step (a `null` or
+  boolean element is the register's node by kind) and a `reduce` over it hands the stage back
+  the register it entered with: `del(try (.a and (reduce . as {a:$a} ?// $a (0; .))))` on
+  `{"a":true}` is jq's `{}` (it refused "with result true"), and `path(.a | 5 | reduce null as
+  {a:$q} (null; .))` on `{"a":null}` is `["a"]`; a `foreach` steps and extends the register's own
+  path (`["a","a"]`). Pinned by `test_fold_steps_from_known_untracked_register_4049`. **A
+  recorded divergence, in the safe direction**: a `foreach` states no register at its emissions
+  (they run inside the loop, after the pattern's steps and `UPDATE` moved jq's register), so
+  `del(.a and (foreach . as {a:$a} ?// $a (0; .; .)))` on `{"a":true}` (jq `{}`) still refuses
+  at the result, as does a `reduce` whose `UPDATE` jq answers by navigating the accumulator
+  (`path(.a | 5 | reduce null as {a:$q} (null; .b))`, jq `["a"]`). The first
   alternative's refusal on the untracked contexts where no register is carried (`var-rebind`,
   `untracked-*`) is unchanged. Over a seeded sample of 30,027 rows of the 20 `?//` fold operands
-  (`--sample 30000 --seed 11`, `/usr/bin/jq` 1.7.1): REFUSE_WRONG 1,883 to 1,793, MATCH 28,138
-  to 28,228, no ACCEPT_WRONG before or after, none of the 6 DIFF rows moved.
+  (`--sample 30000 --seed 11`, `/usr/bin/jq` 1.7.1) #3999 moved REFUSE_WRONG 1,883 to 1,793 and
+  MATCH 28,138 to 28,228, no ACCEPT_WRONG before or after, none of the 6 DIFF rows moved.
 
 ## A fold over the register itself (#3790)
 
