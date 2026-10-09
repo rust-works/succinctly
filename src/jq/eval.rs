@@ -44774,22 +44774,32 @@ fn handler_leaves_register_on_scalar_payload(handler: &Expr) -> bool {
     }
 }
 
-/// [`cannot_move_register`] of a zero-arity `def` body (#4124), looking through at most
-/// [`DEF_CALL_SHAPE_BUDGET`] nested calls so a recursive `def` reads as it did before the arm
-/// existed (a call that moves the register). Without `std` there is no thread-local to count
-/// with and the answer stays `false`, like every other recognition gated on one (#3790).
+/// [`cannot_move_register`] of a zero-arity `def` body (#4124). One budget of
+/// [`DEF_CALL_SHAPE_BUDGET`] bodies is shared by the whole outermost question, a count and not a
+/// depth: nested calls multiply (a pipe of `k` calls to a body that is a pipe of `k` calls ...), so a
+/// depth cap alone leaves the walk `k^depth` long. Past it the answer is `false`, so a recursive or
+/// fanned-out `def` reads as it did before the arm existed (a call that moves the register). Without
+/// `std` there is no thread-local to count with and the answer stays `false`, like every other
+/// recognition gated on one (#3790).
 #[cfg(feature = "std")]
 fn def_call_body_cannot_move_register(body: &Expr) -> bool {
     use std::cell::Cell;
     thread_local! {
-        static DEPTH: Cell<u32> = const { Cell::new(0) };
+        /// Bodies looked into by the outermost question still being answered.
+        static USED: Cell<u32> = const { Cell::new(0) };
+        /// How many of these questions are nested on this thread; 0 outside any.
+        static NESTED: Cell<u32> = const { Cell::new(0) };
     }
-    if DEPTH.with(Cell::get) >= DEF_CALL_SHAPE_BUDGET {
+    if NESTED.with(Cell::get) == 0 {
+        USED.with(|u| u.set(0));
+    }
+    if USED.with(Cell::get) >= DEF_CALL_SHAPE_BUDGET {
         return false;
     }
-    DEPTH.with(|d| d.set(d.get() + 1));
+    USED.with(|u| u.set(u.get() + 1));
+    NESTED.with(|n| n.set(n.get() + 1));
     let leaves = cannot_move_register(body);
-    DEPTH.with(|d| d.set(d.get() - 1));
+    NESTED.with(|n| n.set(n.get() - 1));
     leaves
 }
 

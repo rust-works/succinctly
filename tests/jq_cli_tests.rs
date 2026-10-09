@@ -120973,3 +120973,22 @@ fn test_def_call_with_a_literal_body_keeps_the_register_4124() -> Result<()> {
     }
     Ok(())
 }
+
+/// #4124 review: the zero-arity `def` call arm shares one budget across the whole question, so a
+/// chain whose every def calls the one below it several times in a pipe ends at once, as it did
+/// before the arm (a depth cap alone made the analysis fanout^16 long: minutes at a fanout of 5).
+#[test]
+fn test_def_call_chain_fanout_is_bounded_4124() -> Result<()> {
+    let mut filter = String::from("path(. as $x | def f0: 1; ");
+    for i in 1..=20 {
+        filter.push_str(&format!(
+            "def f{i}: {}; ",
+            vec![format!("f{}", i - 1); 6].join(" | ")
+        ));
+    }
+    filter.push_str("f20 | $x | .c)");
+    let (_, err, code) = run_jq_full(&["-c", "--", &filter], Some(r#"{"a":1,"c":3}"#))?;
+    assert_eq!(code, 5, "stderr {err:?}");
+    assert!(err.contains("exceeded maximum recursion depth"), "{err:?}");
+    Ok(())
+}
