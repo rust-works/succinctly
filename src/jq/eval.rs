@@ -9770,9 +9770,12 @@ fn relocate_elements<S: EvalSemantics>(
                     .into_iter()
                     .map(|item| (yq_dedup_key::<S>(Some(&item), false), item));
                 items = yq_first_of_each_key(keyed);
+            } else if S::TAG == EvalTag::Yq {
+                // #2799: yq's `sort`: its comparator and its sort -- see `yq_sort_by`.
+                yq_sort_by::<_, S>(&mut items, core::slice::from_ref);
             } else {
-                // jq mode (and yq's `sort`, part 3 of #2799): sort, then drop adjacent equals.
-                // yq's `unique` took the arm above.
+                // jq mode: sort, then drop adjacent equals (`unique`). yq's `unique` took the
+                // first-occurrence arm above and yq's `sort` the arm just before this one.
                 items.sort_by(compare_values::<S>);
                 if matches!(builtin, Builtin::Unique) {
                     items.dedup_by(|a, b| owned_value_eq::<S>(a, b));
@@ -14087,6 +14090,163 @@ pub(crate) fn compare_values<S: EvalSemantics>(
     right: &OwnedValue,
 ) -> core::cmp::Ordering {
     compare_values_at_depth::<S>(left, right, 0)
+}
+
+/// yq mode only (#2799): real yq's `sort`/`sort_by` ordering
+/// (`sortableNodeArray.compare`, `pkg/yqlib/operator_sort.go`, v4.53.3), in place of jq's
+/// type ordering. In order, the first rule that applies decides:
+///
+/// 1. `null` sorts before everything (two nulls tie);
+/// 2. a bool sorts before every non-bool, and `false` before `true`;
+/// 3. two integers compare numerically (`int(lhs - rhs)`, so a wrapped difference keeps its
+///    sign);
+/// 4. two numbers, an integer and a float or two floats, compare as `f64`;
+/// 5. anything else compares the node **texts** byte-wise (`strings.Compare(lhs.Value,
+///    rhs.Value)`), and a container's text is empty -- so a container sorts after the bools and
+///    before every non-empty text, and two containers tie, whatever they hold.
+///
+/// It is **not a strict weak order** (an integer against a string compares by text, two integers
+/// numerically), so the answer for a mixed-type array depends on the algorithm: yq runs Go's
+/// `sort.Stable`, ported in `go_sort.rs`, and the callers use it. Timestamps (a `!!timestamp`
+/// pair compares as times) are not typed by `OwnedValue`, so they compare by text.
+///
+/// Divergence, recorded in `docs/compliance/yq/limitations.md`: yq **panics** on a NaN or an
+/// infinity here (`strconv.ParseFloat: parsing ".nan"`), and this orders NaN before every other
+/// number and the infinities by value, rather than reproduce a crash.
+pub(crate) fn yq_compare_values<S: EvalSemantics>(
+    left: &OwnedValue,
+    right: &OwnedValue,
+) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    match (left.is_null(), right.is_null()) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => return Ordering::Less,
+        (false, true) => return Ordering::Greater,
+        (false, false) => {}
+    }
+    match (left, right) {
+        (OwnedValue::Bool(a), OwnedValue::Bool(b)) => return a.cmp(b),
+        (OwnedValue::Bool(_), _) => return Ordering::Less,
+        (_, OwnedValue::Bool(_)) => return Ordering::Greater,
+        _ => {}
+    }
+    if let (Some(a), Some(b)) = (yq_sort_int(left), yq_sort_int(right)) {
+        return a.wrapping_sub(b).cmp(&0);
+    }
+    if let (Some(a), Some(b)) = (yq_sort_float(left), yq_sort_float(right)) {
+        return super::value::cmp_f64(a, b);
+    }
+    yq_sort_text::<S>(left).cmp(&yq_sort_text::<S>(right))
+}
+
+/// An integer node's value (`!!int`), for [`yq_compare_values`].
+fn yq_sort_int(value: &OwnedValue) -> Option<i64> {
+    match value {
+        OwnedValue::Int(n) | OwnedValue::NumberLiteral(NumberRepr::Int(n), _) => Some(*n),
+        _ => None,
+    }
+}
+
+/// A number node's value as yq's `strconv.ParseFloat(Value)` reads it (`!!int` or `!!float`).
+fn yq_sort_float(value: &OwnedValue) -> Option<f64> {
+    match value {
+        OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => Some(*f),
+        _ => yq_sort_int(value).map(|n| n as f64),
+    }
+}
+
+/// The text yq's fall-back `strings.Compare` sees: a scalar's, or the empty text of a container.
+fn yq_sort_text<S: EvalSemantics>(value: &OwnedValue) -> Cow<'_, str> {
+    yq_scalar_text::<S>(value).unwrap_or(Cow::Borrowed(""))
+}
+
+/// What a value is to [`yq_compare_values`], as a bit for [`yq_sort_by`]'s fast-path test.
+const YQ_NULL: u8 = 1;
+const YQ_BOOL: u8 = 2;
+/// An integer exactly representable as an `f64` (|n| <= 2^53).
+const YQ_INT_EXACT: u8 = 4;
+/// An integer too wide for an `f64` but narrow enough that `lhs - rhs` cannot wrap (|n| < 2^62).
+const YQ_INT_WIDE: u8 = 8;
+const YQ_FLOAT: u8 = 16;
+/// A string or a container: both compare by text (a container's is empty).
+const YQ_TEXT: u8 = 32;
+/// An integer whose difference with another can wrap `i64` (|n| >= 2^62): `int(lhs - rhs)`
+/// then flips sign, so no ordering of it is transitive.
+const YQ_INT_HUGE: u8 = 64;
+
+fn yq_sort_flag(value: &OwnedValue) -> u8 {
+    match value {
+        OwnedValue::Null => YQ_NULL,
+        OwnedValue::Bool(_) => YQ_BOOL,
+        OwnedValue::Int(n) | OwnedValue::NumberLiteral(NumberRepr::Int(n), _) => {
+            let width = n.unsigned_abs();
+            if width <= 1 << 53 {
+                YQ_INT_EXACT
+            } else if width < 1 << 62 {
+                YQ_INT_WIDE
+            } else {
+                YQ_INT_HUGE
+            }
+        }
+        OwnedValue::Float(_) | OwnedValue::NumberLiteral(NumberRepr::Float(..), _) => YQ_FLOAT,
+        OwnedValue::String(_) | OwnedValue::Array(_) | OwnedValue::Object(_) => YQ_TEXT,
+    }
+}
+
+/// Whether [`yq_compare_values`] is a total preorder over values carrying exactly these `flags`.
+///
+/// `null` and bools sort before everything else and among themselves consistently, so they never
+/// break it. Numbers compare numerically and text compares as text, so a position holding both a
+/// number and a text value is where "an integer against a string compares by text" makes the
+/// relation intransitive. Within the numbers, a float against an integer too wide for an `f64` is
+/// too (two such integers can differ as `i64` and tie as `f64`), and so is any integer whose
+/// difference can wrap.
+fn yq_sort_is_total(flags: u8) -> bool {
+    let numbers = YQ_INT_EXACT | YQ_INT_WIDE | YQ_FLOAT;
+    flags & YQ_INT_HUGE == 0
+        && !(flags & numbers != 0 && flags & YQ_TEXT != 0)
+        && !(flags & YQ_FLOAT != 0 && flags & YQ_INT_WIDE != 0)
+}
+
+/// yq mode only (#2799): sort `items` with [`yq_compare_values`] the way yq does.
+///
+/// `keys` yields the `[f]` sort key of an item (for `sort`, the item itself as a one-element
+/// key). When [`yq_sort_is_total`] holds at every key position the comparator is a total
+/// preorder, so every stable sort gives one and the same answer and the fast `slice::sort_by` is
+/// used. Otherwise the comparator is not a strict weak order and the answer depends on the
+/// algorithm, so that goes through [`go_sort::stable_sort_by`], Go's `sort.Stable`, which is what
+/// yq runs.
+pub(crate) fn yq_sort_by<T, S: EvalSemantics>(items: &mut [T], keys: impl Fn(&T) -> &[OwnedValue]) {
+    let mut flags: Vec<u8> = Vec::new();
+    for item in items.iter() {
+        for (at, key) in keys(item).iter().enumerate() {
+            match flags.get_mut(at) {
+                Some(seen) => *seen |= yq_sort_flag(key),
+                None => flags.push(yq_sort_flag(key)),
+            }
+        }
+    }
+    let compare = |a: &T, b: &T| yq_compare_key_arrays::<S>(keys(a), keys(b));
+    if flags.iter().all(|&position| yq_sort_is_total(position)) {
+        items.sort_by(compare);
+    } else {
+        super::go_sort::stable_sort_by(items, compare);
+    }
+}
+
+/// [`yq_compare_values`] over two `[f]` sort keys, lexicographically and then by length -- the
+/// yq-mode twin of [`compare_key_arrays`].
+pub(crate) fn yq_compare_key_arrays<S: EvalSemantics>(
+    a: &[OwnedValue],
+    b: &[OwnedValue],
+) -> core::cmp::Ordering {
+    for (x, y) in a.iter().zip(b.iter()) {
+        match yq_compare_values::<S>(x, y) {
+            core::cmp::Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 /// Panics past [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH)
@@ -18599,7 +18759,12 @@ fn builtin_sort<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // #2327: to_owned_vec_or_suppress!, not a bare match -- see
             // `builtin_del`'s doc comment for the shared reasoning.
             let mut items = to_owned_vec_or_suppress!(elements, optional);
-            items.sort_by(compare_values::<S>);
+            if S::TAG == EvalTag::Yq {
+                // #2799: yq's comparator and sort -- see `yq_sort_by`.
+                yq_sort_by::<_, S>(&mut items, core::slice::from_ref);
+            } else {
+                items.sort_by(compare_values::<S>);
+            }
             QueryResult::Owned(OwnedValue::array_from(items))
         }
         // #1755: a decode failure on the scalar itself must raise
@@ -18653,7 +18818,12 @@ fn builtin_sort_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
 
             // Sort by key
-            keyed.sort_by(|(a, _), (b, _)| compare_key_arrays::<S>(a, b));
+            if S::TAG == EvalTag::Yq {
+                // #2799: yq's comparator and sort -- see `yq_sort_by`.
+                yq_sort_by::<_, S>(&mut keyed, |(key, _)| key.as_slice());
+            } else {
+                keyed.sort_by(|(a, _), (b, _)| compare_key_arrays::<S>(a, b));
+            }
 
             let result: Vec<OwnedValue> = keyed.into_iter().map(|(_, v)| v).collect();
             QueryResult::Owned(OwnedValue::array_from(result))

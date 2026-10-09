@@ -55512,6 +55512,130 @@ mod yq_text_equality_2785 {
         Ok(())
     }
 
+    /// #2799 (part 3): real yq's `sort`/`sort_by` use `sortableNodeArray.compare` and Go's
+    /// `sort.Stable`: `null` first, bools next, two integers numerically, two numbers as floats,
+    /// otherwise the node texts byte-wise (a container's is empty, so containers tie and sort
+    /// before every non-empty text). That is not a strict weak order, so a mixed array's answer
+    /// depends on the algorithm, and these rows (rotations and shuffles of one 28-value pool,
+    /// plus single-kind arrays) pin both. Every expectation was captured live from yq v4.53.3
+    /// (`-o=json -I0`). The first table runs on literals (the bridged route), the second on
+    /// arrays that stay on the cursor route.
+    #[test]
+    fn sort_follows_yqs_comparator_and_go_stable_sort_2799() -> Result<()> {
+        for (filter, want) in [
+            (
+                r#"[null,true,false,0,1,-1,2,10,1.5,1.50,2.0,"","a","B","1","10","2","true","null",[1],[],{"a":1},1e3,100,"é","Z",-10,0.5] | sort"#,
+                r#"[null,false,true,"",[1],[],{"a":1},-10,-1,0,0.5,1,"1",1.5,1.50,2,2.0,10,"10",100,1e3,"2","B","Z","a","null","true","é"]"#,
+            ),
+            (
+                r#"[2,10,1.5,1.50,2.0,"","a","B","1","10","2","true","null",[1],[],{"a":1},1e3,100,"é","Z",-10,0.5,null,true,false,0,1,-1] | sort"#,
+                r#"[null,false,true,"",[1],[],{"a":1},-10,-1,0,0.5,"1",1,1.5,1.50,2,2.0,10,"10",100,1e3,"2","B","Z","a","null","true","é"]"#,
+            ),
+            (
+                r#"["B","1","10","2","true","null",[1],[],{"a":1},1e3,100,"é","Z",-10,0.5,null,true,false,0,1,-1,2,10,1.5,1.50,2.0,"","a"] | sort"#,
+                r#"[null,false,true,[1],[],{"a":1},"",-10,-1,0,0.5,"1",1,1.5,1.50,"10",2,2.0,10,100,1e3,"2","B","Z","a","null","true","é"]"#,
+            ),
+            (
+                r#"[[],{"a":1},1e3,100,"é","Z",-10,0.5,null,true,false,0,1,-1,2,10,1.5,1.50,2.0,"","a","B","1","10","2","true","null",[1]] | sort"#,
+                r#"[null,false,true,[],{"a":1},"",[1],-10,-1,0,0.5,1,"1",1.5,1.50,2,2.0,10,"10",100,1e3,"2","B","Z","a","null","true","é"]"#,
+            ),
+            (
+                r#"[true,10,1,1.50,"a","2",100,[],"é",-10,null,"true",0,-1] | sort"#,
+                r#"[null,true,[],-10,-1,0,1,1.50,10,100,"2","a","true","é"]"#,
+            ),
+            (
+                r#"[1e3,"10","1",2,"null",[],-1,2.0,false,[1],"Z",1.5,10,0.5] | sort"#,
+                r#"[false,[],[1],-1,0.5,"1",1.5,"10",2,2.0,10,1e3,"Z","null"]"#,
+            ),
+            (
+                r#"[1,"Z","true",1e3,true,"B","","a","2",1.50,null,false,10,"10"] | sort"#,
+                r#"[null,false,true,"",1,1.50,10,"10",1e3,"2","B","Z","a","true"]"#,
+            ),
+            (
+                r#"[0,true,"1",[1],{"a":1},10,"2",2.0,"",1.50,"true","null","B",-1] | sort"#,
+                r#"[true,[1],{"a":1},"",-1,0,"1",1.50,10,"2",2.0,"B","null","true"]"#,
+            ),
+            (
+                r#"[{"k":false,"i":0},{"k":100,"i":1},{"k":"","i":2},{"k":-10,"i":3},{"k":"é","i":4},{"k":"10","i":5},{"k":"a","i":6},{"k":10,"i":7},{"k":[],"i":8},{"k":"B","i":9},{"k":"1","i":10},{"k":"null","i":11},{"k":1.50,"i":12},{"k":1.5,"i":13},{"k":-1,"i":14},{"k":"true","i":15}] | sort_by(.k) | map(.i)"#,
+                r"[0,2,8,3,14,10,12,13,5,7,1,9,6,11,15,4]",
+            ),
+            (
+                r#"[{"k":"Z","i":0},{"k":[],"i":1},{"k":"1","i":2},{"k":2,"i":3},{"k":"true","i":4},{"k":null,"i":5},{"k":-1,"i":6},{"k":"B","i":7},{"k":1e3,"i":8},{"k":0,"i":9},{"k":1.50,"i":10},{"k":1,"i":11},{"k":"10","i":12},{"k":"null","i":13},{"k":1.5,"i":14},{"k":-10,"i":15}] | sort_by(.k) | map(.i)"#,
+                r"[5,1,15,6,9,2,11,10,14,12,3,8,7,0,13,4]",
+            ),
+            (
+                r#"[{"k":-1,"i":0},{"k":"a","i":1},{"k":null,"i":2},{"k":1,"i":3},{"k":"2","i":4},{"k":[],"i":5},{"k":true,"i":6},{"k":"1","i":7},{"k":[1],"i":8},{"k":"é","i":9},{"k":false,"i":10},{"k":"Z","i":11},{"k":2,"i":12},{"k":100,"i":13},{"k":-10,"i":14},{"k":"B","i":15}] | sort_by(.k) | map(.i)"#,
+                r"[2,10,6,5,8,14,0,3,7,4,12,13,15,11,1,9]",
+            ),
+            (r#"[2, "10", 3] | sort"#, r#"["10",2,3]"#),
+            (r"[.b, .a] | sort", r"[null,null]"),
+            (r"[3,1,2] | sort", r"[1,2,3]"),
+            (r"[3,1,2] | sort_by(.)", r"[1,2,3]"),
+            (r#"["b","a","C","B"] | sort"#, r#"["B","C","a","b"]"#),
+            (
+                r#"[true,false,null,1,"a"] | sort"#,
+                r#"[null,false,true,1,"a"]"#,
+            ),
+            (r"[[2],[1]] | sort", r"[[2],[1]]"),
+            (r#"[{"a":2},{"a":1}] | sort"#, r#"[{"a":2},{"a":1}]"#),
+            (r#"[1,"1",1.0] | sort"#, r#"[1,"1",1.0]"#),
+            (r"[1.5,1,2.5,0.5] | sort", r"[0.5,1,1.5,2.5]"),
+            (r"[10,9,100,1] | sort", r"[1,9,10,100]"),
+            (r#"["10","9","100","1"] | sort"#, r#"["1","10","100","9"]"#),
+            (
+                r"[9007199254740993, 9007199254740992, 9007199254740994] | sort",
+                r"[9007199254740992,9007199254740993,9007199254740994]",
+            ),
+            (r"[0.1, 0.10, 0.01] | sort", r"[0.01,0.1,0.10]"),
+            (r"[1e3, 1000, 999] | sort", r"[999,1e3,1000]"),
+            (r"[] | sort", r"[]"),
+            (r"[1] | sort", r"[1]"),
+            (
+                r#"[3, 1.5, "a", true, null, 2] | sort_by(.)"#,
+                r#"[null,true,1.5,2,3,"a"]"#,
+            ),
+            (
+                r#"[{"k":2,"v":1},{"k":"10","v":2},{"k":3,"v":3}] | sort_by(.k)"#,
+                r#"[{"k":"10","v":2},{"k":2,"v":1},{"k":3,"v":3}]"#,
+            ),
+            (
+                r#"[{"k":3,"j":1},{"k":1,"j":2},{"k":3,"j":0}] | sort_by(.k, .j)"#,
+                r#"[{"k":1,"j":2},{"k":3,"j":0},{"k":3,"j":1}]"#,
+            ),
+            (
+                r#"[{"k":[2]},{"k":[1]},{"k":"a"}] | sort_by(.k)"#,
+                r#"[{"k":[2]},{"k":[1]},{"k":"a"}]"#,
+            ),
+            (
+                r#"[{"k":1.5},{"k":1},{"k":"a"},{"k":null},{"k":true}] | sort_by(.k)"#,
+                r#"[{"k":null},{"k":true},{"k":1},{"k":1.5},{"k":"a"}]"#,
+            ),
+            (r"[3,1,2] | sort | reverse", r"[3,2,1]"),
+        ] {
+            let (out, code) = run_yq_stdin(filter, "x: 1\n", &["-o=json", "-I=0"])?;
+            assert_eq!((out.trim(), code), (want, 0), "`{filter}`");
+        }
+        let doc = "mix: [3, \"10\", 2, true, null, 1.5, \"a\", [1], {x: 1}, \"B\", 10, \"2\", false]\nints: [5, 3, 9, 1, 3]\nstrs: [b, a, B, c, \"10\", \"9\"]\nrecs:\n  - {k: 3, n: x}\n  - {k: \"10\", n: y}\n  - {k: 2, n: z}\n  - {k: null, n: w}\n  - {k: true, n: v}\n  - {n: u}\n";
+        for (filter, want) in [
+            (
+                r".mix | sort",
+                r#"[null,false,true,[1],{"x":1},1.5,"10",2,3,10,"2","B","a"]"#,
+            ),
+            (r".ints | sort", r"[1,3,3,5,9]"),
+            (r".strs | sort", r#"["10","9","B","a","b","c"]"#),
+            (r".mix | sort | length", r"13"),
+            (
+                r"[.mix[] | select(. != null)] | sort",
+                r#"[false,true,[1],{"x":1},1.5,"10",2,3,10,"2","B","a"]"#,
+            ),
+            (r".ints | sort_by(.) | reverse", r"[9,5,3,3,1]"),
+        ] {
+            let (out, code) = run_yq_stdin(filter, doc, &["-o=json", "-I=0"])?;
+            assert_eq!((out.trim(), code), (want, 0), "`{filter}`");
+        }
+        Ok(())
+    }
+
     /// #2799: `IN(s)` is `any(s == .; .)` and `IN(src; s)` is `any(src == s; .)`, so both take
     /// `==`'s one definition in yq mode -- text equality for scalars, never equal for a
     /// container pairing. (`IN` is a jq-only builtin, reachable through `--jq-extensions`.)
