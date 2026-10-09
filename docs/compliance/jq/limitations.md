@@ -1931,8 +1931,18 @@ is the revert that established what the other one costs.
    answers (a nested fold under a `?//` bind, a destructuring `foreach` source behind an `and`) are now refused, in the
    safe direction. Inside another fold's body the refusal fires whenever that fold's UPDATE is not a pass-through of its
    accumulator, so `del(reduce .[]? as $k (.; reduce (try (. as {a:$a} | .)) as $y (.; .)))` (jq answers `null`) is
-   refused too. The bare-`.` and `select(literal)` binds only: a `(.|.) as {...}` or `(., .) as {...}` source is
-   still read as a computed value by the resolver and stays as it was.
+   refused too. The `foreach` route takes a bare `.`, a `select(literal)` and a comma of them (`(., .) as {...}`, #4150);
+   a `(.|.) as {...}` pipe source is still read as a computed value by the resolver and stays as it was.
+   [#4150](https://github.com/rust-works/succinctly/issues/4150) closes the same accept under `try`/`?`/`and`/`or`: a
+   non-last `?//` alternative's refusal is not retried (the resolver cannot tell jq's path error from its guess), and an
+   enclosing `try` used to swallow it, though jq retries and checks what the next alternative yields at the end of the
+   path, outside the `try`. It is now the uncatchable guess when a later alternative would yield a value, run by value
+   (`test_destructure_bind_refusal_survives_try_and_fold_init_4150`); a body with effects or a computed key is taken to
+   yield, the loud direction. A `foreach` whose INIT navigated and then computed no longer runs its SOURCE as if the
+   register were still at the entry. 20 contrived rows in the sampled sweeps that jq answers (a `?//` bind under `try`/`?`
+   whose later alternative yields and whose result jq's check then passes) are refused, in the safe direction. Still
+   accepted where jq raises, identical on `main` (#4187): a plain-bind prefix (`. as $x | . as {a:$a} | .`) or a bare `.`
+   `?//` chain in a fold source, a `(.|.) as {...}` source, and `reduce . as {a:$a} ?// $a (0; .a?)`.
 
    | Filter                                                   | jq                          | Why succinctly still refuses                                                                                                                                                                                              |
    | -------------------------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

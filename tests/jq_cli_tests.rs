@@ -121954,3 +121954,142 @@ fn test_fold_source_destructuring_the_register_raises_where_it_is_not_4128() -> 
         ),
     ])
 }
+
+/// #4150: a `?//` bind or a fold whose INIT moved the register, under `try`, `?`, `and`/`or`, or a
+/// fold SOURCE, was accepted in path position where jq raises, and `del`/`|=` through it wrote
+/// (`(try (...) catch .) |= 9` overwrote the root). Two causes. (1) A non-last `?//` alternative's
+/// body refusal is not retried (the resolver cannot tell jq's own path error from its guess), and
+/// the refusal came back as an ordinary error that an enclosing `try` swallowed, though jq retries
+/// the next alternative and checks what it yields at the end of the path, outside the `try`: it is
+/// now the uncatchable guess when a later alternative would yield. (2) A `foreach` whose INIT
+/// navigated and then computed ran its SOURCE against a register the equal root paths said was
+/// there; and a destructuring `(., .) as {..}` source was not routed to the resolver at all. The
+/// first 12 rows are the issue's, captured from jq 1.7.1 on the stdin and `-n` routes; the rest are
+/// must-not-change rows jq answers: a `try` that catches the last alternative's own error, and a
+/// fork whose INIT left the register at the entry.
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_destructure_bind_refusal_survives_try_and_fold_init_4150() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"[{"a":1}]"#,
+            r"del(try ((. as [$q] ?// $z | (.a?, null)) or .[0]))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            r"del(((. as {a:$q} ?// $z | (.a, null)) or .b?)?)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[true]",
+            r"del((true and (. as [$q] ?// $z | (.a?, $q)))?)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":[true]}"#,
+            r"del(foreach .a? as $k (0; .; try (((. as [$q] ?// $z | (empty, true))))))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"null",
+            r"del(foreach .a? as $k (0; .; try ((. as [$q] ?// $z | try (.a, true) catch 1) and true)))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"del((foreach .[]? as $j ((. as {a:$a} | .); .; .)) and (.a)?)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":[true]}"#,
+            r"del(foreach .a? as $k (0; try ((. as [$q] ?// $z | (., true)) or (.. | .a?)); .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":false,"b":null}"#,
+            r"path(foreach .a? as $k (0; .; try ((. as [$q] ?// $z | if true then true else .a end) or .[0])))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            r"del(. as $x | ((foreach (select(true) as {a:$a} | .) as $k (.; .; .)) or (.. | .a?)) | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            r"del(foreach .a? as $k (0; try ((. as [$q] ?// $z | try (.a, true) catch 1) or .b?); .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":[true]}"#,
+            r"(try (((foreach ((., .) as {a:$a} | .) as $x (.; .; .)))) catch .) |= 9",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"null",
+            r"path(foreach .a? as $k (0; try ((. as [$q] ?// $z | ({a:1}, true)) or (.. | .a?)); .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        // Must not change: jq answers each of these.
+        (
+            r#"[{"a":1}]"#,
+            r"[path(try (. as [$q] ?// $z | .a))]",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"[{"a":1}]"#,
+            r"[path(try (. as [$q] ?// $z | (.a, null) | true))]",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"[{"a":1}]"#,
+            r"[path(try (. as [$q] ?// $z | (.a?) | true))]",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true,"c":null}"#,
+            r"path(foreach (.a) as $k ((0,.c); $k))",
+            "[\"a\"]\n[\"c\",\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"path(foreach (1,2) as $j (.a; .; .))",
+            "[\"a\"]\n[\"a\"]\n",
+            "",
+            0,
+        ),
+    ])
+}
