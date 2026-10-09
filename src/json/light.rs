@@ -228,6 +228,43 @@ impl JsonIndex<Vec<u64>> {
         index.bridge_tokens = true;
         index
     }
+
+    /// [`build_reindex`](Self::build_reindex) for bridge text that is exactly
+    /// one scalar token starting at offset 0 (#4154): what an
+    /// `OwnedValue::reindexed` over a non-container root writes.
+    ///
+    /// The index of such text depends only on its length -- one interest bit
+    /// at offset 0 and one leaf pair of balanced parentheses -- so it is
+    /// written directly instead of running the scanner, whose temporaries and
+    /// directory build dominate the cost of indexing a single token. A
+    /// differential test pins the result to `build_reindex`'s on every scalar
+    /// spelling the bridge writes.
+    ///
+    /// `len` must be the byte length of that one-token text. Anything else
+    /// (a container, leading whitespace, an empty text) yields an index that
+    /// does not describe it: memory-safe, but wrong. Reach it through
+    /// `OwnedValue::reindexed`, which only calls it for a scalar root.
+    #[doc(hidden)]
+    pub fn build_reindex_scalar(len: usize) -> Self {
+        assert!(
+            u32::try_from(len).is_ok(),
+            "JsonIndex supports inputs up to u32::MAX (4294967295) bytes; got {len} bytes (#188)"
+        );
+        let mut ib = alloc::vec![0u64; len.div_ceil(64)];
+        if let Some(first) = ib.first_mut() {
+            *first = 1;
+        }
+        let ib_rank = build_ib_rank(&ib);
+        Self {
+            ib,
+            ib_len: len,
+            ib_rank,
+            bp: BalancedParens::leaf(),
+            lines: OnceCell::new(),
+            seq_hint: Cell::new(SeqHint::NONE),
+            bridge_tokens: true,
+        }
+    }
 }
 
 impl<W: AsRef<[u64]>> JsonIndex<W> {

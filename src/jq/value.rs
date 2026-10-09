@@ -4427,6 +4427,7 @@ impl OwnedValue {
         Ok(ReindexedDoc::new(
             self.to_json_for_reindex::<S>()?,
             S::REINDEX_BRIDGE_KEEPS_IDENTITY.then_some(self),
+            self.is_scalar_root(),
         ))
     }
 
@@ -4441,7 +4442,11 @@ impl OwnedValue {
     ) -> Result<ReindexedDoc, EvalError> {
         #[cfg(test)]
         reindex_count::bump();
-        let mut doc = ReindexedDoc::new(self.to_json_for_reindex::<S>()?, None);
+        let mut doc = ReindexedDoc::new(
+            self.to_json_for_reindex::<S>()?,
+            None,
+            self.is_scalar_root(),
+        );
         if matches!(self, Self::String(_)) {
             doc.root_string = Some(self.clone());
         }
@@ -4457,7 +4462,13 @@ impl OwnedValue {
     pub fn input_bridge_doc(&self) -> ReindexedDoc {
         #[cfg(test)]
         reindex_count::bump();
-        ReindexedDoc::new(self.to_json_input_bridge(), None)
+        ReindexedDoc::new(self.to_json_input_bridge(), None, self.is_scalar_root())
+    }
+
+    /// Whether the bridge writes this value as one scalar token (#4154): every
+    /// variant but the two containers.
+    fn is_scalar_root(&self) -> bool {
+        !matches!(self, Self::Array(_) | Self::Object(_))
     }
 }
 
@@ -4503,8 +4514,23 @@ pub struct ReindexedDoc {
 }
 
 impl ReindexedDoc {
-    fn new(text: String, source: Option<&OwnedValue>) -> Self {
-        let index = crate::json::JsonIndex::build_reindex(text.as_bytes());
+    fn new(text: String, source: Option<&OwnedValue>, scalar_root: bool) -> Self {
+        // #4154: a one-token document's index follows from its length alone,
+        // so it skips the scanner and the directory build the general
+        // constructor pays for.
+        debug_assert!(
+            !scalar_root
+                || text
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|b| !matches!(b, b'[' | b'{' | b' ' | b'\n' | b'\t' | b'\r')),
+            "a scalar root's bridge text is one token at offset 0, got {text:?}"
+        );
+        let index = if scalar_root {
+            crate::json::JsonIndex::build_reindex_scalar(text.len())
+        } else {
+            crate::json::JsonIndex::build_reindex(text.as_bytes())
+        };
         // Only a container has storage to share. The key is the text's heap
         // buffer, which -- unlike the index's own address, the
         // `document_token` -- does not move when this struct is returned by
@@ -9779,6 +9805,88 @@ mod tests {
             .to_json_for_reindex::<JqSemantics>()
             .expect_err("to_json_for_reindex should report an error at MAX_VALUE_TREE_DEPTH");
         assert_eq!(err.to_string(), "nesting depth exceeds limit of 384");
+    }
+
+    /// #4154: a scalar root's bridge index is written directly rather than
+    /// built by the scanner. It must be the index `build_reindex` makes over
+    /// the same text -- IB, BP, rank directories, the bridge-token flag -- and
+    /// must read the same value back, for every kind of leaf the bridge spells
+    /// and for strings that cross the 64-byte word boundaries or hold
+    /// structural characters. Every container root must stay on the general
+    /// build.
+    #[test]
+    fn scalar_root_bridge_index_matches_the_general_build_4154() {
+        use crate::json::JsonIndex;
+        let literal = |text: &str| OwnedValue::from_number_bytes::<JqSemantics>(text.as_bytes());
+        let mut scalars = vec![
+            OwnedValue::Null,
+            OwnedValue::Bool(true),
+            OwnedValue::Bool(false),
+            OwnedValue::Int(0),
+            OwnedValue::Int(-7),
+            OwnedValue::Int(i64::MIN),
+            OwnedValue::Float(1.5),
+            OwnedValue::Float(-0.0),
+            OwnedValue::Float(1e300 * 1e300),
+            OwnedValue::Float(-1e300 * 1e300),
+            OwnedValue::Float(f64::NAN),
+            literal("1"),
+            literal("1.0"),
+            literal("1e400"),
+            literal("100000000000000000000"),
+            OwnedValue::String("".into()),
+            OwnedValue::String("q\"b\\s\n\u{1}\u{7f}é😀".into()),
+            OwnedValue::String("{}[],:\"[{".into()),
+            OwnedValue::String("  padded  ".into()),
+        ];
+        // Escapes the writer emits (quote, backslash, newline, `\u00XX`) in
+        // runs that straddle each word boundary.
+        for n in [30, 31, 32, 33, 62, 63, 64, 65] {
+            scalars.push(OwnedValue::String("\"".repeat(n).into()));
+            scalars.push(OwnedValue::String("\\".repeat(n).into()));
+            scalars.push(OwnedValue::String("\n\u{1}".repeat(n).into()));
+        }
+        for n in [60, 61, 62, 63, 64, 65, 126, 127, 128, 129, 1000] {
+            scalars.push(OwnedValue::String("x".repeat(n).into()));
+            scalars.push(OwnedValue::String(format!("{{{}", "[,]".repeat(n)).into()));
+        }
+        for value in &scalars {
+            let doc = value.reindexed::<JqSemantics>().unwrap();
+            let general = JsonIndex::build_reindex(doc.text().as_bytes());
+            assert_eq!(doc.index.ib(), general.ib(), "IB for {:?}", doc.text());
+            assert_eq!(doc.index.ib_len(), general.ib_len());
+            for p in 0..=doc.index.ib_len() + 1 {
+                assert_eq!(doc.index.ib_rank1(p), general.ib_rank1(p), "ib_rank1({p})");
+            }
+            assert!(format!("{:?}", doc.index).contains("bridge_tokens: true"));
+            assert_eq!(doc.index.bp().words(), general.bp().words());
+            assert_eq!(doc.index.bp().len(), general.bp().len());
+            let general_root = general.root(doc.text().as_bytes());
+            assert_eq!(
+                format!("{:?}", doc.root().value()),
+                format!("{:?}", general_root.value()),
+                "root value for {:?}",
+                doc.text()
+            );
+            assert!(doc.root().first_child().is_none());
+            assert!(doc.root().next_sibling().is_none());
+            assert!(!doc.registered, "a scalar has no storage to register");
+
+            let bridge = value.input_bridge_doc();
+            let general = JsonIndex::build_reindex(bridge.text().as_bytes());
+            assert_eq!(bridge.index.ib(), general.ib());
+            assert_eq!(bridge.index.bp().words(), general.bp().words());
+            let plain = value.reindexed_without_provenance::<JqSemantics>().unwrap();
+            let general = JsonIndex::build_reindex(plain.text().as_bytes());
+            assert_eq!(plain.index.ib(), general.ib());
+            assert_eq!(plain.index.bp().words(), general.bp().words());
+        }
+        // A container root is not a scalar: its bridge index is the general
+        // build's, which this pins by the nodes it holds.
+        let array = OwnedValue::array_from(vec![OwnedValue::Int(1)]);
+        let doc = array.reindexed::<JqSemantics>().unwrap();
+        assert!(doc.root().first_child().is_some());
+        assert_eq!(doc.index.bp().len(), 4);
     }
 
     /// #3479: the reindex bridge text is written in one pass now; it must be the
