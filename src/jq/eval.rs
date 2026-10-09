@@ -50684,6 +50684,17 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         && patterns_all_bare(patterns)
         && cannot_move_register(input)
         && cannot_move_register(init);
+    // #4126: an UPDATE that is itself a `try` runs its body and its handler with `.` on the
+    // accumulator, which a source and INIT that cannot move jq's register leave on the
+    // register at the first step -- the same standing [`update_returns_its_input`] vets for,
+    // minus the carry-forward (the `try`'s outputs need not be that node, so the accumulator's
+    // standing afterwards is whatever the resolver derives, not assumed).
+    let try_update_on_register = S::TAG == EvalTag::Jq
+        && matches!(unwrap_paren(update), Expr::Try { .. })
+        && fold_body::depth() == 0
+        && patterns_all_bare(patterns)
+        && cannot_move_register(input)
+        && cannot_move_register(init);
     // INIT resolved first, before SOURCE (#2031, reordered from the
     // original #1467/#1872 shape): confirmed live against jq 1.7.1 (via
     // `debug`-instrumented INIT/SOURCE/UPDATE clauses) that real jq
@@ -50962,7 +50973,8 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                             outcome = Some(FoldStepOutcome::Return(aborted.stop(control)));
                             return Demand::Stop;
                         }
-                        let _acc_is_register = (keeps_accumulator && update_at_register)
+                        let _acc_is_register = ((keeps_accumulator || try_update_on_register)
+                            && update_at_register)
                             .then(fold_body::acc_is_register);
                         match reg.resolve::<S>(
                             &substituted,
