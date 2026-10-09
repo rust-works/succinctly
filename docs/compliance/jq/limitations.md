@@ -1505,9 +1505,18 @@ is the revert that established what the other one costs.
    #4108 reads the leaf verdict (`leaves_register_in_place`, now also listing
    `input_line_number`) for the peeled stage, pinned by
    `test_register_wrapper_over_by_value_leaf_stage_4108`; `map(f)` and `walk(f)` stay refused
-   for an `f` that navigates. `first(path(f))` stays refused ([#4118](https://github.com/rust-works/succinctly/issues/4118)):
-   listing `path(f)` in the leaf verdict turned a loud refusal into a silently skipped write
-   on the shape `test_transparent_bind_source_matches_identity_bind_3402` pins.
+   for an `f` that navigates. `path(f)` (and `first`/`limit`/`nth` over it) answers since
+   [#4118](https://github.com/rust-works/succinctly/issues/4118): jq saves and restores the path state around
+   `f`, so the stage leaves the register where it entered, and `leaves_register_in_place` now lists it. Listing it
+   first unmasked a gap that was already there for `length`, `keys` and `to_entries`: on an untracked stage a
+   source mixing a bare `.` with a `$var` marker (`(if true then $v0 else . end) as $v1`) was taken for a
+   passthrough of the register, `$v1` was bound as an exact marker, and a `try` around its navigation swallowed
+   the refusal and skipped the write jq makes (`test_transparent_bind_source_matches_identity_bind_3402` pins the
+   never-silent-discard half). It is now the `Unproven` marker, a loud refusal where jq answers
+   (`del(. as $v0 | length | (if true then $v0 else . end) as $v1 | try (($v1 | .[]?) | .b?))`), pinned by
+   `test_path_f_stage_leaves_register_4118`. The mix is read over the branches `identity_passthrough` reads (an `if`'s
+   arms, a `try` body, the left of `//`, a pipe's stages, a comma's leaves), so a `.` in a condition does not count;
+   a mix through a form it does not read (`($v0 // .)`) is not covered.
    Part 2 lets an `[E]` collect hold `last(f)` (`[last(.a)]`: the claim
    reads through to `f`, which the resolver's `last` arm resolves live, so `[last(1 \| .a)]` still raises
    as jq does and the output is demoted, so `[last(.a)] \| .k` still refuses), pinned by

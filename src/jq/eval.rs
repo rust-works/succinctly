@@ -43265,6 +43265,7 @@ fn leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
                     | Builtin::InputLineNumber
                     | Builtin::Min
                     | Builtin::MinBy(_)
+                    | Builtin::Path(_)
                     | Builtin::Reverse
                     | Builtin::Sort
                     | Builtin::SortBy(_)
@@ -50507,9 +50508,14 @@ fn source_may_alias_register<S: EvalSemantics>(
     trackable: bool,
     frame: &Frame,
 ) -> bool {
-    // The frame's position is the register's only while the entry is trackable.
+    // The frame's position is the register's only while the entry is trackable. So is `.`:
+    // a passthrough of it is a passthrough of the register only there (#4118). On an
+    // untracked stage `.` is whatever the stage computed, so a source that mixes a bare `.`
+    // with a `$var` marker (`if true then $v0 else . end`) hands the register back on one
+    // branch and not the other; a source of either kind alone is one thing throughout.
     S::TAG == EvalTag::Jq
-        && !identity_passthrough(source, true)
+        && !(identity_passthrough(source, true)
+            && (trackable || !passthrough_mixes_dot_and_marker(source)))
         && may_alias_register(source, trackable.then_some(frame))
 }
 
@@ -58054,6 +58060,37 @@ fn identity_passthrough(expr: &Expr, wide: bool) -> bool {
     }
 }
 
+/// Whether an identity-passthrough source can return both a bare `.` and a `$var` marker
+/// (#4118): `if true then $v0 else . end`. Read over the same branches
+/// [`identity_passthrough`] reads (an `if`'s arms, never its condition, a `try` body, the left of
+/// `//`, a pipe's stages, a comma's leaves), so a `.` in a condition or a filter argument does not
+/// count. On an untracked stage `.` is whatever the stage computed while a marker still names the
+/// register's node, so the source is a passthrough of neither.
+fn passthrough_mixes_dot_and_marker(source: &Expr) -> bool {
+    fn leaves(e: &Expr, dot: &mut bool, marker: &mut bool) {
+        match unwrap_bind_source(e) {
+            Expr::Identity => *dot = true,
+            Expr::TrackedVar(_) => *marker = true,
+            Expr::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                leaves(then_branch, dot, marker);
+                leaves(else_branch, dot, marker);
+            }
+            Expr::Try { expr, .. } => leaves(expr, dot, marker),
+            Expr::Alternative(left, _) => leaves(left, dot, marker),
+            Expr::Pipe(stages) => stages.iter().for_each(|e| leaves(e, dot, marker)),
+            Expr::Comma(exprs) => exprs.iter().for_each(|e| leaves(e, dot, marker)),
+            _ => {}
+        }
+    }
+    let (mut dot, mut marker) = (false, false);
+    leaves(source, &mut dot, &mut marker);
+    dot && marker
+}
+
 /// [`is_identity_passthrough`] restricted to the shapes that can never
 /// raise or yield zero outputs: the same grammar without `if`, whose
 /// condition is arbitrary in both respects. This is what a `try` body must
@@ -58503,7 +58540,12 @@ fn substitute_bound_var_at(
     wide: bool,
     keep_container_identity: bool,
 ) -> Expr {
-    let origin = if identity_passthrough(bind_expr, wide) {
+    let origin = if wide && matches!(origin, Some(Origin::Unproven)) {
+        // #4118: the caller found the bound value may be the register by pointer and could
+        // not certify it (an untracked stage, where a passthrough of `.` is not the
+        // register's); the passthrough grammar would mint it a position instead.
+        Origin::Unproven
+    } else if identity_passthrough(bind_expr, wide) {
         debug_assert!(
             matches!(
                 identity_at,
