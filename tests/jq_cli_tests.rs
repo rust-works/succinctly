@@ -122055,6 +122055,14 @@ fn test_destructure_bind_refusal_survives_try_and_fold_init_4150() -> Result<()>
             "Invalid path expression",
             5,
         ),
+        // A `?//` inside the later alternative's own body: the by-value probe runs it.
+        (
+            r#"[{"a":1}]"#,
+            r"del(try ((. as [$q] ?// $z | (. as [$r] ?// $w | (.a?, null))) or .[0]))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
         // Must not change: jq answers each of these.
         (
             r#"[{"a":1}]"#,

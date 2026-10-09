@@ -49119,23 +49119,27 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                             Demand::Stop
                         }
                         ResolveFlow::Escaped(escape) => {
+                            let retries = path_alternative_retries(&escape, is_last);
+                            // Before the generation is read: the by-value run below may hold a
+                            // `?//` of its own, which bumps it (#4150 review).
+                            let guessed = !retries
+                                && S::TAG == EvalTag::Jq
+                                && !is_last
+                                && later_alternative_may_yield::<S>(
+                                    source,
+                                    patterns,
+                                    i + 1,
+                                    body,
+                                    bound,
+                                    identity_at.clone(),
+                                    &all_names,
+                                    value,
+                                    trackable,
+                                );
                             outcome_at = pipe_retry_generation();
-                            outcome = Some(if path_alternative_retries(&escape, is_last) {
+                            outcome = Some(if retries {
                                 BranchOutcome::Retry
                             } else {
-                                let guessed = S::TAG == EvalTag::Jq
-                                    && !is_last
-                                    && later_alternative_may_yield::<S>(
-                                        source,
-                                        patterns,
-                                        i + 1,
-                                        body,
-                                        bound,
-                                        identity_at.clone(),
-                                        &all_names,
-                                        value,
-                                        trackable,
-                                    );
                                 BranchOutcome::Return(ResolveFlow::Escaped(
                                     guess_unretried_alternative_escape(escape, guessed),
                                 ))
@@ -50723,6 +50727,7 @@ fn later_alternative_may_yield<S: EvalSemantics>(
     for pattern in later {
         let mut yielded = false;
         let _ = each_pattern_binding_set::<S>(pattern, bound, false, &mut |bindings| {
+            // `origin: None`: whether the body yields does not depend on where a binding came from.
             let bindings: Vec<PatternBinding> = bindings
                 .iter()
                 .map(|(name, value)| PatternBinding {
