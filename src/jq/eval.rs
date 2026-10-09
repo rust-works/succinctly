@@ -54971,8 +54971,9 @@ fn value_after_components<S: EvalSemantics>(
     for component in components {
         current = match navigate_static_component_ref::<S>(component, &current)? {
             Some(next) => next,
-            // Zero outputs here can only come from a `?`-suppressed step
-            // that failed to navigate (#2124): every component reaching
+            // Zero outputs here come from a `?`-suppressed step that failed
+            // to navigate (#2124), or, in yq mode, a field/index step into a
+            // scalar (#3039): every component reaching
             // this loop is a bare `Field`/`Index`/`Slice`-family step
             // (`needs_fanout_pass` routes anything else, `Iterate`
             // included, through the real fan-out loop instead), and a
