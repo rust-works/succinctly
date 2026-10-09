@@ -3701,6 +3701,22 @@ fn resolve_meta_assign_writes(
     }
     let mut stages = Vec::new();
     flatten_pipe_stages(expr, &mut stages);
+    // This pass resolves the writes once, against the document it is handed: a filter that asks
+    // which document or file it is on (`select(di == 1) | .b comments = ""`) would resolve for
+    // the wrong one and silently write nothing for the rest (#2796).
+    if jq::walk::contains_builtin(expr, |b| {
+        matches!(b, Builtin::DocumentIndex | Builtin::FileIndex)
+    }) {
+        sink.report(
+            DiagStyle::Yq,
+            &EvalError::new(
+                "metadata assignment cannot depend on document_index/file_index (it is resolved \
+                 once, against the first document)",
+            ),
+            &no_location(),
+        );
+        return None;
+    }
     let top_level = stages
         .iter()
         .filter(|s| matches!(s, Expr::MetaAssign { .. }))
@@ -3709,8 +3725,8 @@ fn resolve_meta_assign_writes(
         sink.report(
             DiagStyle::Yq,
             &EvalError::new(
-                "metadata assignment (line_comment/style/anchor = ...) is only supported as a \
-                 top-level pipe stage",
+                "metadata assignment (line_comment/head_comment/foot_comment/comments/style/anchor \
+                 = ...) is only supported as a top-level pipe stage",
             ),
             &no_location(),
         );
@@ -3876,21 +3892,25 @@ fn resolve_one_meta_assign(
             | WritableSlot::FootComment
             | WritableSlot::Comments
             | WritableSlot::KeyLineComment => {
-                if meta_comment_text(&s).is_some() {
+                // Only the empty string clears. A text of newlines alone is not that: yq writes
+                // blank comment lines for it, which `meta_comment_text` would trim to nothing.
+                if !s.is_empty() {
                     // Only the clearing form is written so far (#2796): where yq prints a
                     // set head/foot comment depends on go-yaml's emitter state (a scalar
                     // value's head lands after its line, a container's foot after the next
                     // entry), which the emitter here does not model yet.
-                    let keyword = match slot {
-                        WritableSlot::HeadComment => "head_comment",
-                        WritableSlot::FootComment => "foot_comment",
-                        WritableSlot::KeyLineComment => "line_comment",
-                        _ => "comments",
+                    let (keyword, detail) = match slot {
+                        WritableSlot::HeadComment => ("head_comment", ""),
+                        WritableSlot::FootComment => ("foot_comment", ""),
+                        WritableSlot::KeyLineComment => {
+                            ("line_comment", " on a key node (`...` visits the keys too)")
+                        }
+                        _ => ("comments", ""),
                     };
                     sink.report(
                         DiagStyle::Yq,
                         &EvalError::new(format!(
-                            "{keyword} = ... is not yet supported for a non-empty comment \
+                            "{keyword} = ... is not yet supported for a non-empty text{detail} \
                              (only the clearing form `{keyword} = \"\"`, #2796)"
                         )),
                         &no_location(),

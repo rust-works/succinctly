@@ -4295,9 +4295,16 @@ ruled out), even though real yq supports every one of them:
   lines. `...` parses only as that target (`...` alone stays a parse error) and refuses
   `style`/`anchor`, whose key-node forms are not modelled. Checked against pinned v4.53.3 by
   the `meta_assign_clear_*_2796` goldens and a differential fuzz of ~5,900 clearing
-  operations over random commented documents (none differed). A comment after a sequence
-  item's dash (`- # c\n  k: 1`) is lost on any DOM write here, a gap that predates this and
-  that the fuzz skips.
+  operations over random commented documents (none differed). Text of newlines alone
+  (`head_comment = "\n"`) is a text, not the clearing form: yq writes blank comment lines for
+  it, so it raises the `not yet supported` error above. A metadata write is resolved once,
+  against the first document, so a filter that asks which document it is on
+  (`select(di == 1) | .b comments = ""`) is refused rather than silently writing nothing for
+  the later ones (this also covers `line_comment`/`style`/`anchor`, which used to drop the
+  write quietly); and a route that keeps no comments at all (`-o json`, a filter with several
+  top-level outputs such as `(.a comments = ""), 1`) ignores a comment write as it always has.
+  A comment after a sequence item's dash (`- # c\n  k: 1`) is lost on any DOM write here, a
+  gap that predates this and that the fuzz skips.
 - **`style = "tagged"`** renders the tag of the node's current value type
   ([#4066](https://github.com/rust-works/succinctly/issues/4066), the last piece of #2707):
   `!!int`/`!!float`/`!!bool`/`!!null`/`!!str` before a scalar, `!!seq`/`!!map` on the header
