@@ -35974,6 +35974,7 @@ fn body_performs_no_step(e: &Expr) -> bool {
 /// [`optional_group_is_scope_safe`] says that rewrite cannot be observed
 /// (#2909); otherwise the group stays one opaque element.
 fn push_path_components(out: &mut Vec<Expr>, expr: &Expr) {
+    // A new arm that looks through `expr` also belongs in `may_end_in_bare_iterate`.
     match expr {
         Expr::Identity => {}
         Expr::Pipe(exprs) => {
@@ -36022,6 +36023,23 @@ fn push_path_components(out: &mut Vec<Expr>, expr: &Expr) {
         }
         other => out.push(other.clone()),
     }
+}
+
+/// Whether [`push_path_components`] could flatten `expr` into a run ending in a
+/// bare iterate (#4155). `false` only for a lone leaf: everything the flatten looks
+/// through (`Pipe`, `Paren`, `Optional`, `Identity`) and `Iterate` itself answer
+/// `true`, so a `false` means the flatten would yield a clone of `expr` that
+/// `resolve_dynamic_indexes_sink`'s `is_bare_iterate` rejects, and the caller can skip
+/// building it.
+///
+/// Keep this in step with [`push_path_components`]: a shape it learns to look through
+/// must answer `true` here, or the trailing iterate behind it is no longer deferred
+/// (#888). `may_end_in_bare_iterate_agrees_with_the_flatten_4155` walks the shapes.
+fn may_end_in_bare_iterate(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Pipe(_) | Expr::Paren(_) | Expr::Optional(_) | Expr::Identity | Expr::Iterate
+    )
 }
 
 /// Evaluate an expression against an owned value, preserving the whole output
@@ -58573,18 +58591,6 @@ fn resolve_dynamic_indexes_sink<S: EvalSemantics>(
         }
     }
 
-    /// Whether [`push_path_components`] could flatten `expr` into a run ending in
-    /// a bare iterate. `false` only for a lone leaf: everything the flatten looks
-    /// through (`Pipe`, `Paren`, `Optional`, `Identity`) and `Iterate` itself
-    /// answer `true`, so a `false` here means the flatten would yield a clone of
-    /// `expr` that [`is_bare_iterate`] rejects.
-    fn may_end_in_bare_iterate(expr: &Expr) -> bool {
-        matches!(
-            expr,
-            Expr::Pipe(_) | Expr::Paren(_) | Expr::Optional(_) | Expr::Identity | Expr::Iterate
-        )
-    }
-
     /// Splice a stripped trailing-iterate run back onto an already-assembled
     /// static path expression. Only ever called with a non-empty `trailing`.
     fn append_trailing(expr: Expr, trailing: &[Expr]) -> Expr {
@@ -66053,11 +66059,7 @@ pub(crate) fn each_path_on_owned<S: EvalSemantics>(
         // #4155: the empty path is `path(.)`'s answer and walking it reaches
         // nothing else, so skip the walk and its bookkeeping.
         if matches!(resolved, Expr::Identity) {
-            if sink(OwnedValue::Array(Vec::new().into())) == Demand::Stop {
-                stopped_at = Some(pipe_retry_generation());
-                return Demand::Stop;
-            }
-            return Demand::Continue;
+            return deliver_path(sink, &mut stopped_at, OwnedValue::Array(Vec::new().into()));
         }
         // A failing walk still emits whatever it reached first (#2680): jq's
         // generator never un-emits an output it already produced, so
@@ -66081,8 +66083,8 @@ pub(crate) fn each_path_on_owned<S: EvalSemantics>(
         for (path, _) in &reached {
             // `PathTrail::to_vec` is the one O(depth) flatten, paid exactly
             // once per reached branch (#2058).
-            if sink(OwnedValue::Array(path.to_vec().into())) == Demand::Stop {
-                stopped_at = Some(pipe_retry_generation());
+            let path = OwnedValue::Array(path.to_vec().into());
+            if deliver_path(sink, &mut stopped_at, path) == Demand::Stop {
                 return Demand::Stop;
             }
         }
@@ -66117,6 +66119,21 @@ pub(crate) fn each_path_on_owned<S: EvalSemantics>(
         return Flow::Stopped { pending: None };
     }
     walk_error.resume(flow, direct_retry)
+}
+
+/// Hand one resolved path to `sink`, recording a consumer stop under the retry
+/// generation it happened in ([`each_path_on_owned`]'s #3293 bookkeeping), so the two
+/// places that emit a path cannot disagree about what a stop means.
+fn deliver_path(
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+    stopped_at: &mut Option<u64>,
+    path: OwnedValue,
+) -> Demand {
+    let demand = sink(path);
+    if demand == Demand::Stop {
+        *stopped_at = Some(pipe_retry_generation());
+    }
+    demand
 }
 
 /// Walk `expr` as a path expression, pushing `(path, value-at-path)` for every
@@ -80316,6 +80333,60 @@ mod tests {
     use super::*;
     use crate::jq::error::EvalErrorPayload;
     use crate::jq::{parse, parse_with_mode_and_extensions, ParserMode};
+
+    /// #4155: `may_end_in_bare_iterate` answers `false` only where the flatten
+    /// yields nothing but a clone of the expression, which is what lets
+    /// `resolve_dynamic_indexes_sink` skip building it. A shape the flatten looks
+    /// through must never answer `false`, or a trailing iterate behind it is no
+    /// longer deferred (#888).
+    #[test]
+    fn may_end_in_bare_iterate_agrees_with_the_flatten_4155() {
+        for source in [
+            ".",
+            ".a",
+            ".[]",
+            ".a[]",
+            ".[0]",
+            ".[1:2]",
+            ". // .",
+            ".a? // .",
+            ".[]? // .",
+            "first(.a?)",
+            "first(.[])",
+            "try .a catch empty",
+            "try .[] catch empty",
+            "(.a)",
+            "(.a[])",
+            ".a?",
+            ".a[]?",
+            "(.a[])?",
+            "(.a | .b[])?",
+            "(.a | .b)?",
+            "(.a.b)?",
+            "(.a | .b[0])?",
+            ".a | .b[]",
+            ". | .[]",
+            "(. | .[])",
+            "if . then .a else .[] end",
+            "reduce .[] as $x (.; .a)",
+            "$__loc__",
+            "1",
+            "empty",
+            "select(.a)",
+            "recurse",
+        ] {
+            let expr = parse(source).unwrap();
+            let mut flat = Vec::new();
+            push_path_components(&mut flat, &expr);
+            if !may_end_in_bare_iterate(&expr) {
+                assert_eq!(
+                    flat,
+                    vec![expr.clone()],
+                    "`{source}` flattens to more than a clone of itself"
+                );
+            }
+        }
+    }
     use crate::json::JsonIndex;
 
     /// Collect an [`eval_each`] stream back into a `QueryResult`, so the

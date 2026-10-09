@@ -341,6 +341,46 @@ fn test_dom_route_union_over_a_generator_follows_yq_3479() -> Result<()> {
 /// (`!!null foo`, `!!bool "yes"`, `!!int abc`, `!!str true`, `!!str null`).
 const TAGGED_KINDS: &str = "a: !!null foo\nb: !!bool \"yes\"\nc: !!seq [1]\nd: ~\ne: true\nf: [1, 2]\ng: !!str true\nh: !!str null\ni: !!int abc\nj: 5\nk: {m: !!bool \"false\"}\n";
 
+/// #4155: `path(f)` for a lone `//`, `first` or `try` leaf answers in yq mode what
+/// it did before the path resolver stopped cloning and walking for it.
+///
+/// Real yq has no `path(f)`, so these are not yq's own rows: the lexer rejects the
+/// jq-only spellings and the filters need `--jq-extensions`. They were captured from
+/// the binary built from the parent commit and are identical on this one, which is
+/// the point -- the resolver functions the change touches are generic over
+/// `EvalSemantics`, and yq's `//` is per left output, so `[path(.[] // .)]` answers
+/// `[[0],[1],[],[],[4],[5]]` here where jq's answers `[[0],[1],[4],[5]]`.
+#[test]
+fn test_yq_path_f_lone_leaf_resolution_answers_what_it_did_4155() -> Result<()> {
+    const SEQ: &str = "[1, \"a\", null, false, [2], {k: 3}]\n";
+    const MAP: &str = "a: [1, [2]]\nb: ~\n";
+    let args = ["--jq-extensions", "-o=json", "-I=0"];
+    for (doc, filter, expected) in [
+        (SEQ, "[.[] | path(. // .)]", "[[],[],[],[],[],[]]\n"),
+        (SEQ, "[.[] | path(.a? // .)]", "[[],[],[],[],[],[]]\n"),
+        (SEQ, "[.[] | path(first(.a?))]", "[[\"a\"],[\"a\"]]\n"),
+        (
+            SEQ,
+            "[.[] | path(try .a catch empty)]",
+            "[[\"a\"],[\"a\"]]\n",
+        ),
+        (SEQ, "[.[] | path(. // empty)]", "[[],[],[],[],[],[]]\n"),
+        (SEQ, "[path(.[] // .)]", "[[0],[1],[],[],[4],[5]]\n"),
+        (SEQ, "[path(first(.[]))]", "[[0]]\n"),
+        (MAP, "[path(.a[])]", "[[\"a\",0],[\"a\",1]]\n"),
+        (MAP, "[path((.a[])?)]", "[[\"a\",0],[\"a\",1]]\n"),
+        (MAP, "[path(.b // .a)]", "[[\"a\"]]\n"),
+        (MAP, "[path(.a | . // .)]", "[[\"a\"]]\n"),
+        ("5\n", "[path(. // .)]", "[[]]\n"),
+        ("~\n", "[path(. // .)]", "[[]]\n"),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &args)?;
+        assert_eq!(code, 0, "`{filter}` on {doc:?} -- stderr: {stderr:?}");
+        assert_eq!(stdout, expected, "`{filter}` on {doc:?}");
+    }
+    Ok(())
+}
+
 /// #3716: the `recurse` cap raises in yq mode too, like every evaluator cap.
 ///
 /// Real yq's lexer rejects `recurse` (v4.53.3), so it is a succinctly extension
