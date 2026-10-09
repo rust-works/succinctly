@@ -39696,6 +39696,13 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                 ResolveFlow::Escaped(EvalEscape::Error(e)) if !e.is_uncatchable() => {
                     let caught = if trackable && trackable_body_raises_its_input::<S>(expr) {
                         CaughtPayload::OfRegister
+                    } else if trackable
+                        && e.payload_is_not_a_string()
+                        && marker_body_raises_register::<S>(expr, value, frame)
+                    {
+                        // #4127: the payload is not a message and the body can raise
+                        // nothing else, so it is the frozen `$x` the register's node.
+                        CaughtPayload::OfRegister
                     } else if error_body_raises_its_input::<S>(expr) {
                         CaughtPayload::OfInput
                     } else if S::TAG == EvalTag::Jq
@@ -52702,6 +52709,107 @@ fn body_raises_only_its_input(body: &Expr) -> bool {
                 && branch_raises_only_its_input(else_branch)
         }
         Expr::Comma(items) => !items.is_empty() && items.iter().all(branch_raises_only_its_input),
+        _ => false,
+    }
+}
+
+/// Whether a `try` body entered on a *trackable* value `reg` can raise only a message
+/// string or a frozen `$x` that is `reg`'s very node (#4127): the other half of
+/// [`trackable_body_raises_its_input`], whose grammar is marker-free because a `$x` frozen
+/// elsewhere (`. as $x | .a | try error($x) catch .b`) is not the register.
+///
+/// Here the marker is asked ([`marker_identical`], the rule `path(... | $x)` itself uses), so
+/// `. as $y | .[0] | error($y)` raises the node the `try` stood on even though `.[0]` stepped
+/// off it first: `error`'s argument is evaluated with path tracking suspended and jq's
+/// handler runs against the register the `try`'s fork restored, so
+/// `path(.s | try (. as $y | .[0] | error($y)) catch .[0])` is `["s",0]`.
+///
+/// The grammar is closed over what can raise: navigation by a static key, index, slice or
+/// iterate raises only jq's own message (a string), a comparison or boolean over such
+/// operands is total, and `error` is admitted for a string literal or a marker certified
+/// as `reg`. Anything else (`error`, which raises its input, `error(. // 1)`, a call, a
+/// computed key) could raise a non-string that is not `reg`, so it refuses, as it did. The
+/// caller still has to see a payload that is not a string -- message strings are told
+/// apart by type, never by value, so a string register keeps refusing. Jq mode only
+/// (ADR-0018), and under the same fold gate as [`trackable_body_raises_its_input`].
+fn marker_body_raises_register<S: EvalSemantics>(
+    body: &Expr,
+    reg: &OwnedValue,
+    frame: &Frame,
+) -> bool {
+    S::TAG == EvalTag::Jq
+        && (fold_body::depth() == 0 || fold_body::acc_is_register_here())
+        && (mentions_marker(body) || binds_a_variable(body))
+        && raises_only_strings_or_register::<S>(body, reg, frame, &[], true)
+}
+
+/// Whether `body` has an `as` binding to freeze a variable at: the `try` body is classified
+/// before it is resolved, so a `. as $y | ...` inside it holds a `Var`, not yet a marker.
+fn binds_a_variable(body: &Expr) -> bool {
+    crate::jq::walk::any_subexpr(body, &mut |e| matches!(e, Expr::As { .. }))
+}
+
+/// [`marker_body_raises_register`]'s grammar. `bound` names the variables an `as` inside the
+/// body froze at `reg` itself ([`resolves_to_register`]), which a `$name` stands for in the
+/// way a marker already certified by [`marker_identical`] does. `at_entry` is whether `.` is
+/// still the node the `try` stood on: only there is an `as` source `.` the register, and any
+/// stage that is not `.` takes it off (`.[0] | . as $y | error($y)` raises `1`, not `reg`).
+fn raises_only_strings_or_register<S: EvalSemantics>(
+    expr: &Expr,
+    reg: &OwnedValue,
+    frame: &Frame,
+    bound: &[&str],
+    at_entry: bool,
+) -> bool {
+    let sound = |e: &Expr| raises_only_strings_or_register::<S>(e, reg, frame, bound, at_entry);
+    match unwrap_bind_source(expr) {
+        Expr::Identity
+        | Expr::Literal(_)
+        | Expr::TrackedVar(_)
+        | Expr::Var(_)
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Slice { .. }
+        | Expr::Iterate
+        | Expr::Not
+        | Expr::Builtin(Builtin::Empty) => true,
+        // Stages run on each other's output, so `.` is the entry node only until the first
+        // stage that is not `.` itself.
+        Expr::Pipe(stages) => {
+            let mut here = at_entry;
+            stages.iter().all(|stage| {
+                let ok = raises_only_strings_or_register::<S>(stage, reg, frame, bound, here);
+                here = here && matches!(unwrap_bind_source(stage), Expr::Identity);
+                ok
+            })
+        }
+        Expr::Comma(items) => items.iter().all(sound),
+        Expr::Compare { left, right, .. } | Expr::And(left, right) | Expr::Or(left, right) => {
+            sound(left) && sound(right)
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => sound(cond) && sound(then_branch) && sound(else_branch),
+        // The source runs with path tracking suspended and raises only what it raises on
+        // its own; the body then sees `var` as `reg` only if the source provably is.
+        Expr::As { expr, var, body } => {
+            sound(expr) && {
+                let mut inner: Vec<&str> =
+                    bound.iter().copied().filter(|name| *name != var).collect();
+                if at_entry && resolves_to_register::<S>(expr, true, reg, frame) {
+                    inner.push(var);
+                }
+                raises_only_strings_or_register::<S>(body, reg, frame, &inner, at_entry)
+            }
+        }
+        Expr::Error(Some(msg)) => match unwrap_bind_source(msg) {
+            Expr::TrackedVar(marker) => marker_identical::<S>(marker, reg, frame),
+            Expr::Var(name) => bound.contains(&name.as_str()),
+            Expr::Literal(Literal::String(_)) => true,
+            _ => false,
+        },
         _ => false,
     }
 }
