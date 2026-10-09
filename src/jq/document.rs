@@ -537,6 +537,17 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         None
     }
 
+    /// The element before this one: [`next_element`](Self::next_element) run
+    /// backwards, `None` at the first element (#4101). A format that answers
+    /// it lets the slot scan step back from the element it remembers to one
+    /// just before it, where the default (`None`, also what it answers at the
+    /// first element) sends the scan back to the first element. It must undo
+    /// `next_element` exactly: `c.next_element().and_then(|n| n.prev_element())`
+    /// is `c`.
+    fn prev_element(&self) -> Option<Self> {
+        None
+    }
+
     /// Whether this node, already known to sit at `text_pos`, is preceded
     /// by the delimiter its position in the document requires: nothing if
     /// `expected` is `None` (a container's first child), otherwise exactly
