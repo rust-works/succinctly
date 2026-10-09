@@ -1098,6 +1098,22 @@ fn build_l2_index_scalar(
     (l2_min_excess, l2_block_excess)
 }
 
+/// Excess change (opens minus closes) over bits `bit_idx..valid_bits` of `word`.
+///
+/// Shared by `find_close_from`'s `ScanWord` step and `find_close`'s start-word
+/// scan, which must agree on what a word that holds no match leaves behind.
+#[inline]
+fn word_tail_excess(word: u64, bit_idx: usize, valid_bits: usize) -> i32 {
+    let remaining_bits = valid_bits - bit_idx;
+    let remaining = word >> bit_idx;
+    let ones = if remaining_bits == 64 {
+        remaining.count_ones() as i32
+    } else {
+        (remaining & ((1u64 << remaining_bits) - 1)).count_ones() as i32
+    };
+    2 * ones - remaining_bits as i32
+}
+
 /// Fast byte-level scan to find where excess drops to 0.
 ///
 /// Given a word starting at `start_bit`, scans bytes using lookup tables
@@ -2562,14 +2578,10 @@ impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
             return Some(word_idx * 64 + match_bit);
         }
 
-        let remaining_bits = valid_bits - bit_idx;
-        let remaining = word >> bit_idx;
-        let ones = if remaining_bits == 64 {
-            remaining.count_ones() as i32
-        } else {
-            (remaining & ((1u64 << remaining_bits) - 1)).count_ones() as i32
-        };
-        self.find_close_from((word_idx + 1) * 64, 1 + 2 * ones - remaining_bits as i32)
+        self.find_close_from(
+            (word_idx + 1) * 64,
+            1 + word_tail_excess(word, bit_idx, valid_bits),
+        )
     }
 
     /// Internal: find position where excess drops to 0.
@@ -2625,14 +2637,7 @@ impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
 
                     // No match in this word - compute excess change and move to next word
                     // We need to compute excess change from bit_idx to end of valid bits
-                    let remaining_word = word >> bit_idx;
-                    let remaining_bits = valid_bits - bit_idx;
-                    let ones = if remaining_bits == 64 {
-                        remaining_word.count_ones() as i32
-                    } else {
-                        (remaining_word & ((1u64 << remaining_bits) - 1)).count_ones() as i32
-                    };
-                    excess += 2 * ones - remaining_bits as i32;
+                    excess += word_tail_excess(word, bit_idx, valid_bits);
 
                     // Move to start of next word
                     pos = (word_idx + 1) * 64;
@@ -4346,6 +4351,37 @@ mod tests {
         let bp = BalancedParens::new(vec![u64::MAX], 128);
         assert_eq!(bp.find_close(62), None);
         assert_eq!(bp.find_close(10), None);
+    }
+
+    #[test]
+    fn test_find_close_start_word_excess_carries_across_blocks_3344() {
+        // A non-leaf open mid-word whose close is thousands of bits away:
+        // the start word's leftover excess is handed to the machine and must
+        // survive the L0, L1 and L2 skips. `depth` opens, then a mix of
+        // leaves, then `depth` closes; every open is checked against the
+        // linear scan, at several alignments of the first open.
+        for lead in [0usize, 1, 31, 62, 63] {
+            for depth in [3usize, 70, 600, 2100, 40_000] {
+                let mut bits = vec![false; lead];
+                bits.extend(vec![true; depth]);
+                for _ in 0..(depth / 2) {
+                    bits.extend([true, false]);
+                }
+                bits.extend(vec![false; depth]);
+                let (words, len) = pack_bits(&bits);
+                let bp = BalancedParens::new(words.clone(), len);
+                // Spot-check the opens near the start (their closes are the
+                // far ones) and a stride of the rest.
+                let opens: Vec<usize> = (0..len).filter(|&p| bits[p]).collect();
+                for &p in opens.iter().take(130).chain(opens.iter().step_by(97)) {
+                    assert_eq!(
+                        bp.find_close(p),
+                        find_close(&words, len, p),
+                        "lead {lead} depth {depth} open at {p}"
+                    );
+                }
+            }
+        }
     }
 
     fn pack_bits(bits: &[bool]) -> (Vec<u64>, usize) {
