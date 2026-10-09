@@ -12187,6 +12187,12 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // only add a buffered frame to every level; with none -- every link of a
     // lazy argument chain, the `n == 0` each level runs through -- there is
     // nothing to settle.
+    //
+    // #4132 measured this choice for speed, which #3296 never did: settling
+    // beats the sink-fed path on a long chain of `def` calls and loses on a
+    // 2-term one, and settling operands that call no `def` loses. Kept as is;
+    // the numbers and the evidence are in
+    // docs/optimizations/jq-settled-operands.md.
     if settles_both(left, right) {
         binary_fanout_each_with::<W, S>(
             settled_operand_strategy(each_operand),
