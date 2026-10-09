@@ -17296,7 +17296,10 @@ fn each_object_entries_generic<S: EvalSemantics, V: DocumentValue>(
     sink: &mut dyn Sink<V>,
 ) -> Flow {
     let Some((entry, rest)) = entries.split_first() else {
-        let object: IndexMap<String, OwnedValue> = acc.iter().cloned().collect();
+        let object = match super::eval::object_from_pairs::<S>(acc.iter().cloned()) {
+            Ok(object) => object,
+            Err(e) => return Flow::Escaped(Control::Error(e)),
+        };
         return match sink.push(GenericItem::Owned(OwnedValue::Object(object.into()))) {
             Demand::Continue => Flow::Exhausted,
             Demand::Stop => Flow::Stopped { pending: None },
@@ -26852,11 +26855,14 @@ fn build_object_entries_generic<S: EvalSemantics, V: DocumentValue>(
 ) -> Result<(), ObjectEscapeGeneric> {
     let Some((entry, rest)) = entries.split_first() else {
         let object = if sole {
-            core::mem::take(acc).into_iter().collect::<IndexMap<_, _>>()
+            super::eval::object_from_pairs::<S>(core::mem::take(acc))
         } else {
-            acc.iter().cloned().collect::<IndexMap<_, _>>()
+            super::eval::object_from_pairs::<S>(acc.iter().cloned())
         };
-        out.push(OwnedValue::Object(object.into()));
+        match object {
+            Ok(object) => out.push(OwnedValue::Object(object.into())),
+            Err(e) => return Err(ObjectEscapeGeneric::Control(Control::Error(e))),
+        }
         return Ok(());
     };
 
@@ -29311,7 +29317,6 @@ fn path_context_resolve_constants<S: EvalSemantics>(
                             ObjectKey::Expr(key) => ObjectKey::Expr(boxed(key)?),
                         },
                         value: *boxed(&entry.value)?,
-                        may_repeat_key: entry.may_repeat_key,
                     })
                 })
                 .collect::<Result<Vec<_>, EvalError>>()?,

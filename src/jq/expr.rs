@@ -2972,17 +2972,6 @@ pub struct ObjectEntry {
     pub key: ObjectKey,
     /// The value expression.
     pub value: Expr,
-    /// yq mode only (#4182): this entry's key may equal an earlier entry's, so
-    /// the two values deep-merge (`{"a": {"x": 1}, "a": {"y": 2}}` is `a: {x: 1,
-    /// y: 2}`) where jq keeps the last. yq folds the entries of a construction
-    /// with `*`, which a pair-only fan-out does not do, so such a construction
-    /// is evaluated as `COLLECT_OBJECT`, like one holding a bare entry.
-    ///
-    /// Set by the parser on an entry whose literal key repeats an earlier one,
-    /// on a computed key that has an earlier entry, and on a literal key after a
-    /// computed one (a computed key can only be compared at run time). Never set
-    /// for jq or for a bare entry.
-    pub may_repeat_key: bool,
 }
 
 /// Object key in construction - either literal or dynamic.
@@ -3406,7 +3395,6 @@ impl ObjectEntry {
         Self {
             key: ObjectKey::Literal(key.into()),
             value,
-            may_repeat_key: false,
         }
     }
 
@@ -3415,7 +3403,6 @@ impl ObjectEntry {
         Self {
             key: ObjectKey::Expr(Box::new(key_expr)),
             value,
-            may_repeat_key: false,
         }
     }
 }

@@ -2077,8 +2077,7 @@ fn is_closed_literal(expr: &Expr) -> bool {
         Expr::Arithmetic { left, right, .. } => is_closed_literal(left) && is_closed_literal(right),
         Expr::Object(entries) => entries.iter().all(|e| {
             let key_closed = match &e.key {
-                // A repeated key deep-merges in yq (#4182).
-                ObjectKey::Literal(_) => !e.may_repeat_key,
+                ObjectKey::Literal(_) => true,
                 ObjectKey::Bare => false,
                 ObjectKey::Expr(k) => is_closed_literal(k),
             };
@@ -10896,7 +10895,6 @@ mod tests {
             value: Box::new(Expr::Object(vec![succinctly::jq::ObjectEntry {
                 key: ObjectKey::Expr(Box::new(key)),
                 value: lit(),
-                may_repeat_key: false,
             }])),
         };
         assert_eq!(fresh_of(&object_with_key(lit())), Some(true));

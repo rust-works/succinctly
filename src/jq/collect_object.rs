@@ -11,13 +11,12 @@
 //! (`pkg/yqlib/operator_collect_object.go`), quirks included, because the
 //! quirks are the behaviour being reproduced (ADR-0018 rule 3).
 //!
-//! A construction of pair entries with distinct literal keys never comes here: its
-//! cross product is what this operator computes, and the evaluators' own fan-out
-//! already produces it without the round trip through nodes. A repeated key is the
-//! one difference -- this operator deep-merges the two maps where the fan-out keeps
-//! the last -- so the parser flags every entry whose key may repeat
-//! ([`ObjectEntry::may_repeat_key`](super::expr::ObjectEntry::may_repeat_key)) and
-//! such a construction comes here too (#4182).
+//! A construction with only pair entries never comes here: its cross product is
+//! what this operator computes, and the evaluators' own fan-out already produces
+//! it without the round trip through nodes. A repeated key is where the fold shows,
+//! and the fan-out reproduces it where it assembles each object
+//! ([`object_from_pairs`](super::eval::object_from_pairs), #4182), so the two
+//! routes agree.
 
 use alloc::string::String;
 use alloc::vec::Vec;

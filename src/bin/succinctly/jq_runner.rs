@@ -2252,7 +2252,6 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
                         other => other,
                     },
                     value: rewrite_namespaced_calls(entry.value),
-                    may_repeat_key: entry.may_repeat_key,
                 })
                 .collect();
             Expr::Object(new_entries)

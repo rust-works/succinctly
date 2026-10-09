@@ -4950,11 +4950,10 @@ $ echo $?
 - **A repeated key deep-merges (#4182).** yq folds the entries of a `{...}` with `*`, so
   `{"a": {"x": 1}, "a": {"y": 2}}` is `a: {x: 1, y: 2}` where jq (and a pair-only construction
   here before #4182) keeps the last. Only a map over a map merges; for anything else the later
-  value wins, as in yq. The parser flags the entries whose key may equal an earlier one (a
-  literal key that repeats, a computed key with an earlier entry, a literal after a computed
-  key) and such a construction is evaluated as `COLLECT_OBJECT`, like one holding a bare entry.
-  A computed key can only be compared at run time, so every construction with one takes this
-  route. Distinct literal keys keep the streaming fan-out.
+  value wins, as in yq. The merge happens where a construction's pairs become an object, so it
+  covers a literal key that repeats and a computed key that turns out to (`{($k): .., ($k): ..}`)
+  alike, on every route, and costs nothing when no key repeats. It is the same fold the
+  `COLLECT_OBJECT` route above runs.
 
 Residual divergences remain, all in cases yq itself reaches through its node model:
 
