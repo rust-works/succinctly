@@ -23847,7 +23847,9 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 let mut cursor = CodepointCursor::default();
                 let matches: Vec<OwnedValue> = caps_vec
                     .iter()
-                    .map(|caps| build_match_object(&re, caps, &input, input_is_ascii, &mut cursor))
+                    .map(|caps| {
+                        build_match_object::<S>(&re, caps, &input, input_is_ascii, &mut cursor)
+                    })
                     .collect();
                 QueryResult::ManyOwned(matches)
             } else {
@@ -23856,7 +23858,7 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Some(caps) => {
                         let input_is_ascii = input.is_ascii();
                         let mut cursor = CodepointCursor::default();
-                        QueryResult::Owned(build_match_object(
+                        QueryResult::Owned(build_match_object::<S>(
                             &re,
                             &caps,
                             &input,
@@ -24083,13 +24085,16 @@ fn char_len(matched: &str) -> i64 {
 /// needed to convert byte offsets to jq's codepoint offsets without
 /// re-scanning `input` from byte 0 on every call (#806).
 #[cfg(feature = "regex")]
-fn build_match_object(
+fn build_match_object<S: EvalSemantics>(
     re: &JqRegex,
     caps: &regex::Captures,
     input: &str,
     input_is_ascii: bool,
     cursor: &mut CodepointCursor,
 ) -> OwnedValue {
+    if S::TAG == EvalTag::Yq {
+        return build_match_object_yq(re, caps);
+    }
     let m0 = caps
         .get(0)
         .expect("capture group 0 is always present on a match");
@@ -24192,6 +24197,46 @@ fn build_match_object(
     }
     obj.insert("captures".to_string(), OwnedValue::array_from(captures));
 
+    OwnedValue::Object(obj.into())
+}
+
+/// yq's match object (#4205): Go's `regexp`, so offsets and lengths are **byte** counts, the keys
+/// are `string, offset, length` (then `captures`), and a capture carries `name` only when the
+/// group is named. A group that did not take part is `{"string": null, "offset": -1, "length":
+/// 0}`, whatever the overall match is; a group that matched empty keeps its own offset.
+/// Confirmed against yq v4.53.3 (`"héllo" | match("l")` is offset 3).
+#[cfg(feature = "regex")]
+fn build_match_object_yq(re: &JqRegex, caps: &regex::Captures) -> OwnedValue {
+    let int = |n: usize| OwnedValue::Int(n as i64);
+    let string = |s: &str| OwnedValue::String(s.to_string().into());
+    let m0 = caps
+        .get(0)
+        .expect("capture group 0 is always present on a match");
+    let mut obj = IndexMap::new();
+    obj.insert("string".to_string(), string(m0.as_str()));
+    obj.insert("offset".to_string(), int(m0.start()));
+    obj.insert("length".to_string(), int(m0.len()));
+    let mut captures = Vec::new();
+    for (i, name) in re.capture_names().enumerate().skip(1) {
+        let mut cap = IndexMap::new();
+        match caps.get(i) {
+            Some(m) => {
+                cap.insert("string".to_string(), string(m.as_str()));
+                cap.insert("offset".to_string(), int(m.start()));
+                cap.insert("length".to_string(), int(m.len()));
+            }
+            None => {
+                cap.insert("string".to_string(), OwnedValue::Null);
+                cap.insert("offset".to_string(), OwnedValue::Int(-1));
+                cap.insert("length".to_string(), OwnedValue::Int(0));
+            }
+        }
+        if let Some(name) = name {
+            cap.insert("name".to_string(), string(name));
+        }
+        captures.push(OwnedValue::Object(cap.into()));
+    }
+    obj.insert("captures".to_string(), OwnedValue::array_from(captures));
     OwnedValue::Object(obj.into())
 }
 
