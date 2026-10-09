@@ -4400,11 +4400,18 @@ fn is_yaml_11_bool_word(text: &str) -> bool {
 /// (`!!str 1` is `"1"`, `!!int 5` is `5`, `!!map` is dropped), and keeps every other tag
 /// (`!Ref`, `!!binary`, ...), as yq does (#4078). `!!float` goes the same way: a whole
 /// float prints its own `!!float` when it needs one.
-fn strip_core_tag(meta: NodeMeta) -> NodeMeta {
-    if matches!(
-        meta.tag(),
-        Some("!!str" | "!!int" | "!!float" | "!!bool" | "!!map" | "!!seq" | "!!null")
-    ) {
+///
+/// A scalar's tag only ever restates its type; a container's does only when it names its own
+/// kind (`restates`: `!!seq` on a sequence, `!!map` on a mapping), so `!!str []` and `!!seq {}`
+/// keep theirs (#4088). `!!null` is still dropped from a container, as before.
+fn strip_core_tag(meta: NodeMeta, restates: Option<&str>) -> NodeMeta {
+    let strip = match (meta.tag(), restates) {
+        (Some("!!null"), _) => true,
+        (Some(tag), Some(kind)) => tag == kind,
+        (Some("!!str" | "!!int" | "!!float" | "!!bool" | "!!map" | "!!seq"), None) => true,
+        _ => false,
+    };
+    if strip {
         meta.with_tag(None)
     } else {
         meta
@@ -4441,7 +4448,7 @@ fn strip_presentation_style_at_depth(
                 OwnedValue::String(text) => kept_quote(text, tree.style()),
                 _ => "",
             };
-            CommentTree::Leaf(strip_core_tag(meta.with_style(style)))
+            CommentTree::Leaf(strip_core_tag(meta.with_style(style), None))
         }
         CommentTree::Array(meta, items) => {
             let elements = match value {
@@ -4449,7 +4456,7 @@ fn strip_presentation_style_at_depth(
                 _ => None,
             };
             CommentTree::Array(
-                strip_core_tag(meta.with_style("")),
+                strip_core_tag(meta.with_style(""), Some("!!seq")),
                 items
                     .iter()
                     .enumerate()
@@ -4466,7 +4473,7 @@ fn strip_presentation_style_at_depth(
                 _ => None,
             };
             CommentTree::Object(
-                strip_core_tag(meta.with_style("")),
+                strip_core_tag(meta.with_style(""), Some("!!map")),
                 fields
                     .iter()
                     .map(|(k, v)| {
@@ -4481,7 +4488,9 @@ fn strip_presentation_style_at_depth(
                     .iter()
                     .map(|(k, key_meta)| {
                         // A quoted key spelled as a YAML 1.1 bool keeps its quoting too.
-                        let kept = key_meta.is_quoted() && is_yaml_11_bool_word(k);
+                        // `!!str yes: v` keeps its tag the same way (#4088).
+                        let kept = (key_meta.is_quoted() || key_meta.is_str_tagged())
+                            && is_yaml_11_bool_word(k);
                         (
                             k.clone(),
                             if kept {
@@ -4955,13 +4964,18 @@ fn defers_to_own_block(value: &OwnedValue, comments: &CommentTree) -> bool {
 }
 
 /// `quoted_key` (a key as [`yaml_quote_key`] wrote it) behind mapping key
-/// `key`'s own `&name ` anchor declaration, if it declares one (#2598). The
-/// key-side twin of [`anchor_decl_prefix`], matching `write_yaml_field_key` in
-/// `light.rs`: `&k key: &v 1`. Allocates only for an anchored key.
+/// `key`'s own `&name ` anchor declaration and explicit tag, if it has them
+/// (#2598, #4088). The key-side twin of [`anchor_decl_prefix`], matching
+/// `write_yaml_field_key` in `light.rs`: `&k !Foo key: &v 1`. Allocates only for
+/// an anchored or tagged key.
 fn with_key_anchor(comments: &CommentTree, key: &str, quoted_key: String) -> String {
-    match comments.key_anchor(key) {
-        Some(name) => format!("&{name} {quoted_key}"),
-        None => quoted_key,
+    match (comments.key_anchor(key), comments.key_tag(key)) {
+        (Some(name), Some(tag)) => format!("&{name} {tag} {quoted_key}"),
+        (Some(name), None) => format!("&{name} {quoted_key}"),
+        // #4088: the key's explicit tag, as the streaming writer's
+        // `write_yaml_field_key` does.
+        (None, Some(tag)) => format!("{tag} {quoted_key}"),
+        (None, None) => quoted_key,
     }
 }
 

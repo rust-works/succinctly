@@ -284,11 +284,12 @@ fn merge_tree(
             };
             fields.insert(key.clone(), child);
             let key_tree = if lvalue.is_some() { lt } else { rt };
-            if let Some(meta) = KeyMeta::with_anchor(
+            if let Some(meta) = KeyMeta::with_properties(
                 None,
                 false,
                 key_tree.key_style(key),
                 key_tree.key_anchor(key).map(str::to_string),
+                key_tree.key_tag(key).map(str::to_string),
             ) {
                 keys.insert(key.clone(), meta);
             }

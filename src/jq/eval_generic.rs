@@ -2457,6 +2457,9 @@ pub struct KeyMeta {
     /// The anchor the key declares (`&k key: 1`, #2598), without the `&`.
     /// A key can only declare one: an alias used as a key is a separate gap.
     anchor: Option<String>,
+    /// The explicit tag the key was written with (`!Foo key: 1`, `!!str 1: x`),
+    /// verbatim (#4088).
+    tag: Option<String>,
 }
 
 /// The key style (see [`CommentTree::key_style`]) for a key whose quoting `-P` stripped.
@@ -2489,11 +2492,23 @@ impl KeyMeta {
         style: &'static str,
         anchor: Option<String>,
     ) -> Option<Self> {
+        Self::with_properties(comment, value_absent, style, anchor, None)
+    }
+
+    /// [`Self::with_anchor`] for a key that may also carry an explicit tag
+    /// (`!Foo key: 1`, #4088), which earns the key an entry on its own.
+    pub fn with_properties(
+        comment: Option<String>,
+        value_absent: bool,
+        style: &'static str,
+        anchor: Option<String>,
+        tag: Option<String>,
+    ) -> Option<Self> {
         let style = match style {
             "single" | "double" | KEY_STYLE_STRING => style,
             _ => "",
         };
-        if comment.is_none() && style.is_empty() && anchor.is_none() {
+        if comment.is_none() && style.is_empty() && anchor.is_none() && tag.is_none() {
             return None;
         }
         Some(Self {
@@ -2501,6 +2516,7 @@ impl KeyMeta {
             value_absent,
             style,
             anchor,
+            tag,
         })
     }
 
@@ -2509,11 +2525,12 @@ impl KeyMeta {
     /// `None` once nothing is left to say.
     #[must_use]
     pub fn carried_over(&self, value_absent: bool, keep_style: bool) -> Option<Self> {
-        Self::with_anchor(
+        Self::with_properties(
             self.comment.clone(),
             value_absent,
             if keep_style { self.style } else { "" },
             self.anchor.clone(),
+            self.tag.clone(),
         )
     }
 
@@ -2522,15 +2539,37 @@ impl KeyMeta {
         matches!(self.style, "single" | "double")
     }
 
+    /// Whether the key was written behind an explicit `!!str` (#4088).
+    pub fn is_str_tagged(&self) -> bool {
+        self.tag.as_deref() == Some("!!str")
+    }
+
     /// This entry with its quoting stripped to [`KEY_STYLE_STRING`] (`-P`).
+    ///
+    /// `-P` also drops a core tag that only restates the key's type (`!!str k`
+    /// is `k`, `!!int 1` is `1`) and keeps any other (`!Foo`, `!!binary`), as it
+    /// does for a value (#4088). A dropped `!!str` still leaves the key known to
+    /// be a string, so `!!str 1: v` prints `"1": v`.
     #[must_use]
     pub fn with_style_stripped(&self) -> Self {
+        let was_str = self.tag.as_deref() == Some("!!str");
+        let tag = self
+            .tag
+            .as_deref()
+            .filter(|tag| {
+                !matches!(
+                    *tag,
+                    "!!str" | "!!int" | "!!float" | "!!bool" | "!!null" | "!!map" | "!!seq"
+                )
+            })
+            .map(str::to_string);
         Self {
-            style: if self.style.is_empty() {
+            style: if self.style.is_empty() && !was_str {
                 ""
             } else {
                 KEY_STYLE_STRING
             },
+            tag,
             ..self.clone()
         }
     }
@@ -2645,6 +2684,16 @@ impl CommentTree {
     pub fn key_anchor(&self, key: &str) -> Option<&str> {
         match self {
             Self::Object(_, _, keys) => keys.get(key).and_then(|k| k.anchor.as_deref()),
+            _ => None,
+        }
+    }
+
+    /// The explicit tag object field `key`'s *key* was written with (`!Foo key: 1`,
+    /// #4088), verbatim, or `None` if this isn't an `Object`, has no such key, or the
+    /// key carries none. Distinct from `field(key).meta().tag()`, the *value's* tag.
+    pub fn key_tag(&self, key: &str) -> Option<&str> {
+        match self {
+            Self::Object(_, _, keys) => keys.get(key).and_then(|k| k.tag.as_deref()),
             _ => None,
         }
     }
@@ -2941,11 +2990,18 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
             } else {
                 DocumentCursor::anchor(&field.key_cursor).map(str::to_string)
             };
-            if let Some(meta) = KeyMeta::with_anchor(
+            // #4088: the key's own explicit tag, on the same terms as its anchor.
+            let key_tag = if child_under_alias {
+                None
+            } else {
+                DocumentCursor::explicit_tag_of_non_alias(&field.key_cursor).map(str::to_string)
+            };
+            if let Some(meta) = KeyMeta::with_properties(
                 key_comment,
                 value_absent,
                 field.key_cursor.style(),
                 key_anchor,
+                key_tag,
             ) {
                 key_comment_map.insert(key, meta);
             }

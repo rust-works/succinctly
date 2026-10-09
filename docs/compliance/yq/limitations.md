@@ -4297,9 +4297,17 @@ ruled out), even though real yq supports every one of them:
   random tagged documents. Not matched: a node a write *copies* from elsewhere (`.b = .a`)
   carries no tree entry, so it loses its tag where yq copies it (the existing copy gap); a
   computed value has no tag (#1416); `!!set` members print `null` where yq prints `''`; and a tagged `null` that a path write walks through
-  (`a: !Foo null` + `.a.b = 5`) becomes a mapping where yq leaves the document alone. A tag on a
-  mapping *key* (`? !K key`) is not captured and is still dropped, and a tagged empty value
-  (`a: !Foo` with nothing after it) is written `!Foo null`.
+  (`a: !Foo null` + `.a.b = 5`) becomes a mapping where yq leaves the document alone. A tagged
+  empty value (`a: !Foo` with nothing after it) is written `!Foo null`. A tag on a mapping *key*
+  (`!Foo k: v`, `? !K key`, an implicit pair `[!Foo k: v]`) is kept too
+  ([#4088](https://github.com/rust-works/succinctly/issues/4088)), as is a tag on a flow
+  collection value (`a: !!seq [1, 2]`) on the streaming route; `-P` keeps a core tag on a
+  container it does not restate (`!!str []`, `!!seq {}`). Still not matched: a core `!!null`
+  on a container (`a: !!null [1]`) is dropped by `-P` and kept by the default route, where yq
+  turns the value into `null` on both ([#4111](https://github.com/rust-works/succinctly/issues/4111)). A key's tag
+  is also lost when a write copies the key from elsewhere (`.a = .b` over a tagged key in `.b`,
+  the same copy gap), and a key deleted and written again inherits its old anchor and tag
+  ([#4113](https://github.com/rust-works/succinctly/issues/4113)).
 - **`anchor = "<name>"` with a name go-yaml's emitter refuses** raises real yq's exact
   `yaml: yaml: anchor value must contain valid characters only`. The accepted set is the
   measured one, not YAML 1.2's: printable ASCII except `,`/`[`/`]`/`{`/`}`/`:` and
