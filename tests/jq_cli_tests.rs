@@ -121839,8 +121839,8 @@ fn test_error_message_navigation_is_path_checked_4146() -> Result<()> {
 /// value in hand, which raises in jq where that value is not the register: an untracked entry
 /// (`{a:{b:1}} | ...`) or the accumulator of an enclosing fold whose source navigated. The
 /// by-value drive answered, and a `del`/`=` through the answer wrote (the first row deleted the
-/// whole document). The last rows are contrasts that stay answered: the destructure at the
-/// register itself. Every row captured from jq 1.7.1, on the stdin and `-n` routes. Where the
+/// whole document). The last four rows are contrasts: a destructure at the register itself
+/// stays answered, and two rows that raised before this change still raise. Every row captured from jq 1.7.1, on the stdin and `-n` routes. Where the
 /// refusal is the loud guess inside another fold's body it reads `with result ...` rather than
 /// jq's `near attempt to access element "a"`, so those rows pin only the shared prefix.
 #[test]

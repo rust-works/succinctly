@@ -1929,7 +1929,9 @@ is the revert that established what the other one costs.
    jq does instead of deleting the document, pinned by
    `test_fold_source_destructuring_the_register_raises_where_it_is_not_4128`. 13 contrived rows in 40,000 sampled that jq
    answers (a nested fold under a `?//` bind, a destructuring `foreach` source behind an `and`) are now refused, in the
-   safe direction. The bare-`.` and `select(literal)` binds only: a `(.|.) as {...}` or `(., .) as {...}` source is
+   safe direction. Inside another fold's body the refusal fires whenever that fold's UPDATE is not a pass-through of its
+   accumulator, so `del(reduce .[]? as $k (.; reduce (try (. as {a:$a} | .)) as $y (.; .)))` (jq answers `null`) is
+   refused too. The bare-`.` and `select(literal)` binds only: a `(.|.) as {...}` or `(., .) as {...}` source is
    still read as a computed value by the resolver and stays as it was.
 
    | Filter                                                   | jq                          | Why succinctly still refuses                                                                                                                                                                                              |

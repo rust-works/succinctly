@@ -47276,6 +47276,11 @@ fn yields_only_the_register(e: &Expr) -> bool {
 /// which [`body_performs_no_step`] now keeps from firing early.) A `?//` chain is left
 /// to the by-value drive as for a fresh source ([`routes_destructuring`]), except as a
 /// nested `foreach`'s own patterns over the register ([`routes_destructuring_chain`], #3948).
+///
+/// The bound expression is a bare `.` or a `select(literal)` that hands it on (#4128); a
+/// `(.|.)`/`(., .)` bind stays out, since the resolver reads it as a computed value. The
+/// other [`source_destructures_register`] mode, through a nested `reduce`, is only for
+/// the places the register is not known to be at `.`.
 fn foreach_source_destructures_register(source: &Expr) -> bool {
     source_destructures_register(source, false)
 }
@@ -47640,6 +47645,15 @@ fn drive_fold_source_with<S: EvalSemantics>(
     // navigated away (`foreach (map(1)|length) as $k (.b; .)`) answered where jq raises
     // "iterate through". Jq mode only: yq's `first` is a root-only operator, not an
     // index, and yq has no `foreach`/`path` to check against.
+    // #4128: a destructure of `.` anywhere in the source's spine, a nested `reduce`'s
+    // included, runs a tracked `INDEX` step against the value in hand. Where the fold's
+    // `.` is not known to be the register (an untracked entry, or the body of another
+    // fold, whose source may have moved it) that step raises in jq; the by-value drive
+    // answered, and a `del` through the answer wrote. Read once: the resolver route below
+    // and the loud refusal after it are both decided by it.
+    let destructures_unplaced_register = S::TAG == EvalTag::Jq
+        && (!ambient.trackable || !(fold_body::depth() == 0 || fold_body::acc_is_register_here()))
+        && source_destructures_register(source, true);
     let has_navigation = any_subexpr(source, &mut |e| {
         is_fold_source_navigation(e)
             || (S::TAG == EvalTag::Jq
@@ -47660,15 +47674,7 @@ fn drive_fold_source_with<S: EvalSemantics>(
     }) || (S::TAG == EvalTag::Jq
         && foreach_source
         && foreach_source_destructures_register(source))
-        // #4128: a destructure of `.` anywhere in the source's spine, a nested `reduce`'s
-        // included, runs a tracked `INDEX` step against the value in hand. Where the fold's
-        // `.` is not known to be the register (an untracked entry, or the body of another
-        // fold, whose source may have moved it) that step raises in jq; the by-value drive
-        // answered, and a `del` through the answer wrote.
-        || (S::TAG == EvalTag::Jq
-            && (!ambient.trackable
-                || !(fold_body::depth() == 0 || fold_body::acc_is_register_here()))
-            && source_destructures_register(source, true))
+        || destructures_unplaced_register
         // #3795: a source that can hand the register back by pointer through
         // control flow (`(., 1) | .`) is placed by the resolver too, so the
         // output that *is* the register binds as the register-derived element
@@ -47688,12 +47694,10 @@ fn drive_fold_source_with<S: EvalSemantics>(
     // own "with result" refusal does for a `.` body. A `null` ambient is left to the
     // resolver's own `null` clause (#4007): on a `null` document the register really is
     // that `null`, and jq answers.
-    if S::TAG == EvalTag::Jq
+    if destructures_unplaced_register
         && ambient.trackable
         && !matches!(ambient.value, OwnedValue::Null)
         && fold_body::depth() != 0
-        && !fold_body::acc_is_register_here()
-        && source_destructures_register(source, true)
     {
         return Flow::Escaped(Control::Error(EvalError::invalid_path_expression_guessed(
             ambient.value,
