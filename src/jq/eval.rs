@@ -43333,7 +43333,8 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
 /// follows, so a stop on it is that swallowed break and the next is delivered
 /// all the same; the terminal sink re-enters after a stop for the same reason
 /// (`resolve_terminal_sink`, #3808). A stop a `?//` retries nothing past (a
-/// `halt`, a decode failure) is final instead: nothing runs after it.
+/// `halt`, a decode failure) is never followed by another answer: with no retry
+/// to run, nothing is left to deliver.
 struct AnswerDelivery<'s, 'a> {
     sink: &'s mut dyn FnMut(PathBranch<'a>) -> Demand,
     target_truthy: bool,
@@ -43353,25 +43354,23 @@ impl<'s, 'a> AnswerDelivery<'s, 'a> {
         }
     }
 
-    /// Whether delivery runs on past the last answer's demand. A stop is the
-    /// break the `?//` swallowed, so it does -- but not a `halt` or a decode
-    /// failure behind it, which no `?//` retries -- and the retry announces
-    /// itself to the sinks that stashed a verdict on it (#3293).
-    fn runs_on(&self) -> bool {
+    /// Announce the retry that follows a stop to the sinks that stashed a verdict
+    /// on it (#3293). The stop is the break the `?//` swallowed; a stop no `?//`
+    /// retries past (`halt`, a decode failure) is never followed by a delivery or
+    /// an owed escape, because the retry that would produce either never runs.
+    fn resume(&self) {
         if self.demand == Demand::Stop {
-            if !is_retryable_stop(false) {
-                return false;
-            }
+            debug_assert!(
+                is_retryable_stop(false),
+                "a final stop (halt, decode failure) was followed by another answer"
+            );
             clear_nonretryable_stop();
         }
-        true
     }
 
-    /// Hand `branch` to the consumer, unless an earlier answer's stop was final.
+    /// Hand `branch` to the consumer.
     fn deliver(&mut self, branch: PathBranch<'a>) -> Demand {
-        if !self.runs_on() {
-            return Demand::Stop;
-        }
+        self.resume();
         self.delivered += 1;
         self.demand = (self.sink)(branch);
         self.demand
@@ -43417,11 +43416,8 @@ fn finish_any_all_answers<'a, S: EvalSemantics>(
         ));
     }
     if let Some(escape) = escape {
-        return if delivery.runs_on() {
-            ResolveFlow::Escaped(escape)
-        } else {
-            ResolveFlow::Stopped
-        };
+        delivery.resume();
+        return ResolveFlow::Escaped(escape);
     }
     match delivery.demand {
         Demand::Continue => ResolveFlow::Exhausted,
