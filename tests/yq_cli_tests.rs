@@ -91,6 +91,46 @@ fn test_filter_collect_sort_keys_to_string_spellings_4213() -> Result<()> {
     Ok(())
 }
 
+/// Pinned yq v4.53.3: `..` yields an alias node and stops there, so the aliased mapping's
+/// children are visited once, under the anchor (#4214). Every row was captured from the pinned
+/// binary over `anchors: {base: &b {p: 1, q: 2}, copy: *b}`, `-o=json -I=0`.
+#[test]
+fn test_recursive_descent_stops_at_an_alias_4214() -> Result<()> {
+    let doc = "anchors:\n  base: &b {p: 1, q: 2}\n  copy: *b\n";
+    let args = &["-o=json", "-I=0"];
+    for (filter, expected) in [
+        (
+            r#"[.. | path | join(".")]"#,
+            r#"["","anchors","anchors.base","anchors.base.p","anchors.base.q","anchors.copy"]"#,
+        ),
+        (
+            r#".anchors | [.. | path | join(".")]"#,
+            r#"["anchors","anchors.base","anchors.base.p","anchors.base.q","anchors.copy"]"#,
+        ),
+        (
+            r#".anchors.copy | [.. | path | join(".")]"#,
+            r#"["anchors.copy"]"#,
+        ),
+        (
+            r#"[.. | select(. == 1) | path | join(".")]"#,
+            r#"["anchors.base.p"]"#,
+        ),
+        ("[..] | length", "6"),
+        (r#"[.. | select(tag == "!!int")] | length"#, "2"),
+        ("[.. | key] | length", "5"),
+        // Alias navigation is unchanged: `.[]` still iterates the aliased mapping.
+        (".anchors.copy | [.[]]", "[1,2]"),
+        (".anchors.copy | [.. | select(. == 2)] | length", "0"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, doc, args)?;
+        assert_eq!((out.trim(), code), (expected, 0), "{filter}");
+    }
+    // A document without aliases is untouched.
+    let (out, code) = run_yq_stdin("[..] | length", "a: {b: [1, 2]}\n", args)?;
+    assert_eq!((out.trim(), code), ("5", 0));
+    Ok(())
+}
+
 /// Pinned yq v4.53.3: `*` and `?` in a mapping key are wildcards, so a traversal
 /// emits the value of every matching key in document order (#3374). No match reads
 /// `null` and writes create the pattern as a literal key. Every row captured from
@@ -52195,8 +52235,13 @@ fn test_recurse_structural_descent_over_alias_fanout_completes_3719() -> Result<
         (".root | first(recurse(.[]?)) | length", "2"),
         (".root | first(recurse) | length", "2"),
         (".root | first(..) | length", "2"),
-        (".root | [limit(3; recurse(.[]?))] | length", "3"),
-        (".root | [limit(3; recurse(.[]?)) | length] | .[2]", "2"),
+        // `.root` is itself an alias, and yq's `..` yields an alias node and stops there
+        // (#4214): one node, where the target's children used to be walked as well. The
+        // anchor holding two aliases is three nodes, the same stop one level down.
+        (".root | [limit(3; recurse(.[]?))] | length", "1"),
+        (".root | [limit(3; recurse(.[]?)) | length] | .[2]", "null"),
+        (".a26 | [recurse(.[]?)] | length", "3"),
+        (".a26 | [..] | length", "3"),
     ] {
         let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, &doc, &["--jq-extensions"])?;
         assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");

@@ -14778,6 +14778,12 @@ fn each_recurse_cursor_generic<S: EvalSemantics, V: DocumentValue>(
         if matches!(sink.push(GenericItem::OneCursor(cursor)), Demand::Stop) {
             return Flow::Stopped { pending: None };
         }
+        // #4214: yq's `..` yields an alias node and stops there -- its `Content` is empty --
+        // where reading the node resolves the alias and would deliver the target's
+        // children a second time. `recurse` is `..` (#3719), so it stops with it.
+        if S::TAG == EvalTag::Yq && cursor.is_alias() {
+            continue;
+        }
         // #3023: a scalar has no members, and `.[]?` swallows the error
         // iterating it raises -- but not a failure that escapes `?` (an
         // undecodable string, a scalar the cursor cannot read). Those are
@@ -24211,6 +24217,10 @@ fn path_descent_children<S: EvalSemantics, V: DocumentValue>(
     at: &Rc<PathTrail>,
 ) -> Result<PathDescentChildren<V>, EvalError> {
     let mut children = Vec::new();
+    // #4214: `..` stops at an alias node in yq (see `each_recurse_cursor_generic`).
+    if S::TAG == EvalTag::Yq && matches!(here, PathNode::At(c) if c.is_alias()) {
+        return Ok(children);
+    }
     if let Some(settled) = swallowed_path_leaf::<S, V>(&Expr::Iterate, None, here) {
         settled?;
         return Ok(children);
@@ -26018,6 +26028,10 @@ fn path_context_step_recurse<S: EvalSemantics, V: DocumentValue>(
 ) -> Result<(), Control> {
     guard_path_walk_depth(pos.trail.recursion_depth())?;
     out.push(pos.clone());
+    // #4214: yq's `..` yields an alias node and stops there.
+    if S::TAG == EvalTag::Yq && matches!(&pos.node, PathNode::At(c) if c.is_alias()) {
+        return Ok(());
+    }
     let mut children = Vec::new();
     path_context_step_try::<S, V>(&Expr::Iterate, None, pos, &mut children)?;
     for child in &children {
