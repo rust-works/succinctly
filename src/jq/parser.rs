@@ -3182,6 +3182,20 @@ impl<'a> Parser<'a> {
                         "repeat",
                         Self::parse_repeat_expr,
                     )
+                } else if self.mode == ParserMode::Yq && self.matches_keyword("filter") {
+                    // #4213: yq's `filter(f)`, i.e. `[.[] | select(f)]`.
+                    self.parse_shadowable_special_form(
+                        keyword_start,
+                        "filter",
+                        Self::parse_filter_expr,
+                    )
+                } else if self.mode == ParserMode::Yq && self.matches_keyword("collect") {
+                    // #4213: yq's `collect(f)`, i.e. `[f]`.
+                    self.parse_shadowable_special_form(
+                        keyword_start,
+                        "collect",
+                        Self::parse_collect_expr,
+                    )
                 } else if self.matches_keyword("range") {
                     self.reject_unless_jq_extensions("range")?;
                     self.parse_shadowable_special_form(
@@ -3709,6 +3723,30 @@ impl<'a> Parser<'a> {
             n: Box::new(n),
             expr: Box::new(expr),
         })
+    }
+
+    /// Parse yq's `filter(f)` (#4213): the children of the node that satisfy `f`, as an array --
+    /// `[.[] | select(f)]`. A scalar has no children, so it answers `[]`.
+    fn parse_filter_expr(&mut self) -> Result<Expr, ParseError> {
+        let start_pos = self.pos;
+        self.consume_keyword("filter");
+        let Some(condition) = self.parse_required_single_arg(start_pos)? else {
+            return Err(ParseError::new("filter expects one argument", start_pos));
+        };
+        Ok(Expr::Array(Box::new(Expr::pipe(vec![
+            Expr::Iterate,
+            Expr::Builtin(Builtin::Select(Box::new(condition))),
+        ]))))
+    }
+
+    /// Parse yq's `collect(f)` (#4213): `[f]`.
+    fn parse_collect_expr(&mut self) -> Result<Expr, ParseError> {
+        let start_pos = self.pos;
+        self.consume_keyword("collect");
+        let Some(body) = self.parse_required_single_arg(start_pos)? else {
+            return Err(ParseError::new("collect expects one argument", start_pos));
+        };
+        Ok(Expr::Array(Box::new(body)))
     }
 
     /// Parse `JOIN($idx; idx_expr)`, `JOIN($idx; stream; idx_expr)` or
@@ -5705,9 +5743,16 @@ impl<'a> Parser<'a> {
         // (jq 1.7.1 also reports "sort_keys/1 is not defined") -- the same
         // always-on-in-yq-mode, never-in-jq-mode pattern `downcase`/
         // `upcase` above already use (#2855).
-        if self.mode == ParserMode::Yq && self.matches_keyword("sort_keys") {
+        // #4213: yq also spells it `sortKeys`.
+        if self.mode == ParserMode::Yq
+            && (self.matches_keyword("sort_keys") || self.matches_keyword("sortKeys"))
+        {
             let keyword_start = self.pos;
-            self.consume_keyword("sort_keys");
+            if self.matches_keyword("sortKeys") {
+                self.consume_keyword("sortKeys");
+            } else {
+                self.consume_keyword("sort_keys");
+            }
             self.skip_ws();
             if self.peek() != Some('(') {
                 // Confirmed live against yq v4.53.3: a bare `sort_keys`
@@ -6173,6 +6218,12 @@ impl<'a> Parser<'a> {
         // Phase 6: Type Conversions
         if self.matches_keyword("tostring") {
             self.consume_keyword("tostring");
+            return Ok(Some(Builtin::ToString));
+        }
+        // #4213: yq's `to_string` is `tostring` for a scalar. Not a jq name, so a jq-mode
+        // program may define it.
+        if self.mode == ParserMode::Yq && self.matches_keyword("to_string") {
+            self.consume_keyword("to_string");
             return Ok(Some(Builtin::ToString));
         }
         if self.matches_keyword("tonumber") {

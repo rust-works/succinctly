@@ -51,6 +51,46 @@ fn test_question_marks_in_yq_field_names_3356() -> Result<()> {
     Ok(())
 }
 
+/// Pinned yq v4.53.3: `filter(f)` is `[.[] | select(f)]`, `collect(f)` is `[f]`, `sortKeys` is
+/// `sort_keys` and `to_string` is `tostring` for a scalar (#4213). Every row was captured from
+/// the pinned binary over `a: 1 / b: [x, y] / c: {d: 2} / l: [{k: 1}, {k: 2}]`,
+/// `-o=json -I=0`.
+#[test]
+fn test_filter_collect_sort_keys_to_string_spellings_4213() -> Result<()> {
+    let doc = "a: 1\nb: [x, y]\nc: {d: 2}\nl: [{k: 1}, {k: 2}]\n";
+    let args = &["-o=json", "-I=0"];
+    for (filter, expected) in [
+        (r#".b | filter(. == "x")"#, r#"["x"]"#),
+        (".l | filter(.k > 1)", r#"[{"k":2}]"#),
+        (".l | filter(.k > 5)", "[]"),
+        // A scalar has no children; a map filters its values.
+        (".a | filter(. == 1)", "[]"),
+        ("filter(. == 1)", "[1]"),
+        (".c | filter(. == 2)", "[2]"),
+        (".l | collect(.[])", r#"[{"k":1},{"k":2}]"#),
+        (".b | collect(.[])", r#"["x","y"]"#),
+        (".c | sortKeys(.)", r#"{"d":2}"#),
+        (
+            "sortKeys(.c)",
+            r#"{"a":1,"b":["x","y"],"c":{"d":2},"l":[{"k":1},{"k":2}]}"#,
+        ),
+        (".a | to_string", r#""1""#),
+        ("null | to_string", r#""null""#),
+        (".a | to_string | tag", r#""!!str""#),
+    ] {
+        let (out, code) = run_yq_stdin(filter, doc, args)?;
+        assert_eq!((out.trim(), code), (expected, 0), "{filter}");
+    }
+    // They are yq names, so jq mode may define its own.
+    let (out, code) = run_jq_stdin(
+        "def filter(f): 1; def collect(f): 2; def to_string: 3; [filter(.), collect(.), to_string]",
+        "null",
+        &["-c"],
+    )?;
+    assert_eq!((out.trim(), code), ("[1,2,3]", 0));
+    Ok(())
+}
+
 /// Pinned yq v4.53.3: `*` and `?` in a mapping key are wildcards, so a traversal
 /// emits the value of every matching key in document order (#3374). No match reads
 /// `null` and writes create the pattern as a literal key. Every row captured from
