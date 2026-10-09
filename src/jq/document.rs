@@ -2050,6 +2050,12 @@ pub(crate) fn key_hash_of<V: DocumentValue>(key: &V) -> Option<u64> {
             return Some(hash);
         }
     }
+    decoded_key_hash(key)
+}
+
+/// The hash of a key's decoded spelling, or `None` when it has no reliable
+/// identity -- [`key_hash_of`] past its raw-span fast path.
+fn decoded_key_hash<V: DocumentValue>(key: &V) -> Option<u64> {
     key.decoded_key_str()
         .ok()
         .flatten()
@@ -2061,17 +2067,20 @@ pub(crate) fn key_hash_of<V: DocumentValue>(key: &V) -> Option<u64> {
 ///
 /// On the escape-free ASCII key the hash's raw span already ends at the
 /// closing quote, so the key's end is known without the second quote scan
-/// `text_end` would make. Anything off that path -- an escape, non-ASCII
-/// bytes, no raw span, an unterminated string -- answers exactly what the two
-/// separate calls would have.
+/// `text_end` would make. A non-ASCII key whose span is still escape-free
+/// keeps that end and goes straight to the decoded hash, skipping the raw-span
+/// attempt [`key_hash_of`] would repeat. Anything else -- an escape, no raw
+/// span, an unterminated string -- answers exactly what the two separate calls
+/// would have.
 #[inline]
 pub(crate) fn key_hash_and_end_of<V: DocumentValue>(key: &V) -> (Option<u64>, Option<usize>) {
-    if let Some((raw, end)) = key.key_raw_unescaped_with_end() {
-        if let Some(hash) = ascii_key_hash(raw) {
-            return (Some(hash), Some(end));
-        }
+    match key.key_raw_unescaped_with_end() {
+        Some((raw, end)) => match ascii_key_hash(raw) {
+            Some(hash) => (Some(hash), Some(end)),
+            None => (decoded_key_hash(key), Some(end)),
+        },
+        None => (key_hash_of(key), key.text_end()),
     }
-    (key_hash_of(key), key.text_end())
 }
 
 /// [`key_hash_of`] for a caller holding a whole field.
@@ -2642,11 +2651,11 @@ pub fn key_span_fingerprint(quoted: &[u8]) -> u64 {
 /// as a walk goes, without holding the keys.
 ///
 /// **Only for a caller that cannot sort.** Every batch site here hashes
-/// into a `Vec<u64>` and sorts (or, for `census`, sorts only what a
-/// bitset prefilter could not clear -- `repeated_hashes`) instead, because
-/// a sort streams and a table does not: at 7.1M keys the table is 134 MB, and on a 7950X -- 32 MB of
-/// L3 per CCD -- that cost 24% on the identity path where the sort cost
-/// nothing. An M4 Pro absorbed it and preferred the table, which is the
+/// into a `Vec<u64>` and sorts (or, for `census`, sorts only what a bitset
+/// prefilter could not clear -- `repeated_hashes`) instead, because a sort
+/// streams and a table does not: at 7.1M keys the table is 134 MB, and on a
+/// 7950X -- 32 MB of L3 per CCD -- that cost 24% on the identity path where
+/// the sort cost nothing. An M4 Pro absorbed it and preferred the table, which is the
 /// architecture split CLAUDE.md warns memory-bound results carry. The one
 /// caller that keeps it is [`DistinctKeyCursors`], which must answer per
 /// key as it streams and has nothing to sort yet.
@@ -3067,6 +3076,11 @@ const PREFILTER_MIN: usize = 128;
 /// cache the prefilter relies on and the sort streams better.
 const PREFILTER_MAX: usize = 1 << 21;
 
+/// The prefilter gives up when more than `1 / PREFILTER_MAX_ARRIVAL_SHARE` of
+/// the hashes landed on an already-set bit: four times what random hashes
+/// do at [`PREFILTER_BITS_PER_HASH`].
+const PREFILTER_MAX_ARRIVAL_SHARE: usize = 4;
+
 /// Bits of bitset per hash. The prefilter hands the sort only the hashes
 /// that landed on a bit another hash had already set, about `n / (2 *
 /// BITS_PER_HASH)` of them, so this trades memory against how much is left to
@@ -3099,23 +3113,34 @@ fn repeated_hashes(mut hashes: Vec<u64>) -> (Vec<u64>, usize) {
         return shared_hashes(&hashes);
     }
     // Hashes are well mixed (`key_hash_checked` ends in a splitmix64
-    // finalizer), so the low bits index uniformly. A constructed set of
-    // colliding low bits only costs the sort it would have cost anyway.
+    // finalizer), so the low bits index uniformly.
     let bits = (n * PREFILTER_BITS_PER_HASH).next_power_of_two().max(64);
     let mask = bits - 1;
     let mut seen = vec![0u64; bits / 64];
     let mut twice = vec![0u64; bits / 64];
-    let mut any = false;
+    // Hashes that arrived on a bit another hash had already set.
+    let mut arrivals = 0usize;
     for &hash in &hashes {
         let at = hash as usize & mask;
         let bit = 1u64 << (at & 63);
         let already = seen[at >> 6] & bit;
         seen[at >> 6] |= bit;
         twice[at >> 6] |= already;
-        any |= already != 0;
+        arrivals += usize::from(already != 0);
     }
-    if !any {
+    if arrivals == 0 {
         return (Vec::new(), n);
+    }
+    // Random hashes give about `n / (2 * BITS_PER_HASH)` arrivals. Far more
+    // means the filter is not filtering -- a document that really repeats
+    // most of its keys, or keys chosen so their hashes share low bits (the
+    // hash is unkeyed) -- so sort everything rather than also copy it first.
+    // That bounds the worst case at the two bitset allocations, one pass and
+    // the sort the prefilter was meant to avoid.
+    if arrivals > n / PREFILTER_MAX_ARRIVAL_SHARE {
+        drop((seen, twice));
+        hashes.sort_unstable();
+        return shared_hashes(&hashes);
     }
     drop(seen);
     let mut candidates: Vec<u64> = hashes
@@ -5006,7 +5031,7 @@ mod key_hash_and_end_tests {
 
 #[cfg(test)]
 mod repeated_hashes_tests {
-    use super::{repeated_hashes, shared_hashes, PREFILTER_MAX};
+    use super::{repeated_hashes, shared_hashes, PREFILTER_MAX, PREFILTER_MIN};
 
     /// The reference the prefilter must equal: sort everything.
     fn by_sorting(hashes: &[u64]) -> (Vec<u64>, usize) {
@@ -5031,7 +5056,21 @@ mod repeated_hashes_tests {
     /// repeat, a few, many, and every hash equal.
     #[test]
     fn matches_the_sort_on_every_repeat_shape_3343() {
-        for n in [0usize, 1, 2, 3, 63, 64, 65, 1000, 4096, 50_000] {
+        for n in [
+            0usize,
+            1,
+            2,
+            3,
+            63,
+            64,
+            65,
+            PREFILTER_MIN - 1,
+            PREFILTER_MIN,
+            PREFILTER_MIN + 1,
+            1000,
+            4096,
+            50_000,
+        ] {
             let unique: Vec<u64> = stream(n as u64 + 1).take(n).collect();
             let mut cases: Vec<(&str, Vec<u64>)> = vec![("unique", unique.clone())];
             if n >= 4 {
@@ -5079,12 +5118,31 @@ mod repeated_hashes_tests {
         );
     }
 
-    /// Past the ceiling the plain sort runs; the answer does not change.
+    /// The ceiling is inclusive: `PREFILTER_MAX` hashes still take the
+    /// prefilter, one more takes the plain sort, and both answer what the
+    /// sort does -- with a repeat planted so the answer is not just "none".
     #[test]
-    fn above_the_ceiling_still_matches_the_sort_3343() {
-        let mut hashes: Vec<u64> = stream(7).take(PREFILTER_MAX + 3).collect();
-        let last = hashes.len() - 1;
-        hashes[last] = hashes[100];
+    fn the_ceiling_is_inclusive_and_both_sides_match_the_sort_3343() {
+        for n in [PREFILTER_MAX, PREFILTER_MAX + 1] {
+            let mut hashes: Vec<u64> = stream(7).take(n).collect();
+            let last = hashes.len() - 1;
+            hashes[last] = hashes[100];
+            assert_eq!(
+                repeated_hashes(hashes.clone()),
+                by_sorting(&hashes),
+                "n = {n}"
+            );
+        }
+    }
+
+    /// Most hashes repeating is the other way the filter stops filtering
+    /// (about half land on an already-set bit): it must hand the whole list
+    /// to the sort and still count every distinct value once.
+    #[test]
+    fn a_mostly_repeated_list_gives_up_filtering_and_still_matches_3343() {
+        let base: Vec<u64> = stream(11).take(3000).collect();
+        let mut hashes = base.clone();
+        hashes.extend(base.iter().copied().take(2900));
         assert_eq!(repeated_hashes(hashes.clone()), by_sorting(&hashes));
     }
 }

@@ -10254,4 +10254,38 @@ mod tests {
         assert_eq!(size_of::<JsonElements<'_>>(), 32);
         assert_eq!(size_of::<StandardJson<'_>>(), 40);
     }
+
+    /// `key_raw_unescaped_with_end` (#3343) answers the span and where it
+    /// ends from one scan, and only where the two-call path would agree:
+    /// an unterminated span has no closing quote to end at (`find_end`
+    /// reports one past the text, which `start + raw.len()` would not) and an
+    /// escaped one is not its own decoded key, so both decline.
+    #[test]
+    fn key_raw_unescaped_with_end_declines_what_the_two_calls_would_split_3343() {
+        use crate::jq::document::DocumentValue;
+        fn key(text: &[u8]) -> StandardJson<'_> {
+            StandardJson::String(JsonString { text, start: 1 })
+        }
+
+        let closed = key(br#"{"abc":1}"#);
+        assert_eq!(
+            closed.key_raw_unescaped_with_end(),
+            Some((&b"abc"[..], 6)),
+            "ends one past the closing quote"
+        );
+        assert_eq!(closed.text_end(), Some(6));
+
+        let open = key(br#"{"abc"#);
+        assert!(
+            open.key_raw_unescaped().is_some(),
+            "the old raw-span probe still hashes an unterminated span"
+        );
+        assert_eq!(open.key_raw_unescaped_with_end(), None);
+
+        assert_eq!(key(br#"{"a\nb":1}"#).key_raw_unescaped_with_end(), None);
+        assert_eq!(
+            key(br#"{"":1}"#).key_raw_unescaped_with_end(),
+            Some((&b""[..], 3))
+        );
+    }
 }
