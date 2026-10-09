@@ -60240,3 +60240,32 @@ fn test_yq_long_float_keeps_source_text_everywhere_3040() -> Result<()> {
     assert_eq!(out, "z: 2.7293109604053567083\nn: 1\n");
     Ok(())
 }
+
+/// #2125: `del()` with a nested field behind a multi-branch computed key on a scalar root
+/// no-ops like yq (it raised `Cannot index number with string "b"` before #3039 made the
+/// resolver prune a field/index step into a scalar). jq mode still raises, as jq 1.7.1 does.
+#[test]
+fn test_yq_del_nested_field_behind_computed_key_on_scalar_root_noops_2125() -> Result<()> {
+    for filter in [
+        r#"del(.[("k0","k1")].b)"#,
+        r#"del(.[("k0","k1")][0])"#,
+        r#"del(.[("k0","k1")].b.c)"#,
+    ] {
+        let (out, code) = run_yq_stdin(filter, "2.5\n", &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(out.trim(), "2.5", "{filter}");
+    }
+    // A scalar field of a mapping behaves the same when a sibling is deleted.
+    let (out, code) = run_yq_stdin(
+        r#"del(.c, .[("a","b")].z)"#,
+        "a: 1\nc: 2\n",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":1}"#);
+
+    let (_out, err, code) = run_jq_stdin_with_stderr(r#"del(.[("k0","k1")].b)"#, "2.5", &["-c"])?;
+    assert_ne!(code, 0);
+    assert!(err.contains("Cannot index number"), "err={err}");
+    Ok(())
+}
