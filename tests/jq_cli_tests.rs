@@ -62204,6 +62204,201 @@ fn test_try_body_raising_an_alternative_is_not_the_register_4019() -> Result<()>
     Ok(())
 }
 
+/// #4127: a `try` body that raises a frozen `$x` hands its handler the register's node when
+/// `$x` is that node, wherever the body steps off it first. jq's `error(msg)` evaluates `msg`
+/// with path tracking suspended and its handler runs against the register the `try`'s fork
+/// restored, so `. as $y | .[0] | error($y)` raises the node the `try` stood on. Every row
+/// captured live from jq 1.7.1 (`path`, `del`, `=`, `|=`, and the stage after the `try`).
+#[test]
+fn test_try_body_raising_a_frozen_marker_seeds_the_handler_as_the_register_4127() -> Result<()> {
+    for (program, doc, want) in [
+        (
+            "path(.s | try (. as $y | .[0] | error($y)) catch .[0])",
+            r#"{"s":[1]}"#,
+            "[\"s\",0]\n",
+        ),
+        (
+            "path(.s as $y | .s | try (.[0] | error($y)) catch .[0])",
+            r#"{"s":[1]}"#,
+            "[\"s\",0]\n",
+        ),
+        (
+            "path(.s | . as $y | try (if .[0] == 1 then error($y) else . end) catch .[0])",
+            r#"{"s":[1]}"#,
+            "[\"s\",0]\n",
+        ),
+        (
+            "path(.s | . as $y | try (., error($y)) catch .[0])",
+            r#"{"s":[1]}"#,
+            "[\"s\"]\n[\"s\",0]\n",
+        ),
+        (
+            "path(.s | . as $y | try (.[] | error($y)) catch .[0])",
+            r#"{"s":[1]}"#,
+            "[\"s\",0]\n",
+        ),
+        (
+            "path(.s | try (. as $y | if .[0] == 1 then error($y) else empty end) catch .[0])",
+            r#"{"s":[1]}"#,
+            "[\"s\",0]\n",
+        ),
+        (
+            r#"path(.s | try (. as $y | error($y), error("m")) catch .[0])"#,
+            r#"{"s":[1]}"#,
+            "[\"s\",0]\n",
+        ),
+        (
+            "path(.s | try (.[0] as $q | . as $y | error($y)) catch .[0])",
+            r#"{"s":[1]}"#,
+            "[\"s\",0]\n",
+        ),
+        (
+            "path(.s | try (. as $y | .[0:1] | error($y)) catch .[0])",
+            r#"{"s":[1]}"#,
+            "[\"s\",0]\n",
+        ),
+        (
+            "path(.s | try (. as $y | if (.[0] == 2 | not) then error($y) else . end) catch .[0])",
+            r#"{"s":[1]}"#,
+            "[\"s\",0]\n",
+        ),
+        (
+            "path(.s | try (. as $y | .[5] | error($y)) catch .[0])",
+            r#"{"s":[1]}"#,
+            "[\"s\",0]\n",
+        ),
+        (
+            "path(.s | try (. as $y | .[0] | error($y)) catch (.[0], .[1]))",
+            r#"{"s":[1]}"#,
+            "[\"s\",0]\n[\"s\",1]\n",
+        ),
+        (
+            "path(.s | try (. as $y | .[0] | error($y)) catch .[0] | first(.))",
+            r#"{"s":[1]}"#,
+            "[\"s\",0]\n",
+        ),
+        (
+            "del(.s | . as $y | try (.[0] | error($y)) catch .[0])",
+            r#"{"s":[1]}"#,
+            "{\"s\":[]}\n",
+        ),
+        (
+            "(.s | try (. as $y | .[0] | error($y)) catch .[0]) = 9",
+            r#"{"s":[1]}"#,
+            "{\"s\":[9]}\n",
+        ),
+        (
+            "(.s | try (. as $y | .[0] | error($y)) catch .[0]) |= . + 1",
+            r#"{"s":[1]}"#,
+            "{\"s\":[2]}\n",
+        ),
+        (
+            "path(.s | try (. as $y | .[0] | error($y)) catch .[0])",
+            r#"{"s":[]}"#,
+            "[\"s\",0]\n",
+        ),
+        (
+            "(.s | try (. as $y | .a | error($y)) catch .a) |= 3",
+            r#"{"s":{"a":[2]}}"#,
+            "{\"s\":{\"a\":3}}\n",
+        ),
+        (
+            "path(.s | try (. as $y | .[0] | error($y)) catch .[0])",
+            r#"{"s":[1],"t":[1]}"#,
+            "[\"s\",0]\n",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(doc))?;
+        assert_eq!(code, 0, "#4127: `{program}` on {doc}: stderr {stderr:?}");
+        assert_eq!(stdout, want, "#4127: `{program}` on {doc}");
+    }
+    Ok(())
+}
+
+/// #4127: the payload is the register's node only where the marker is. A `$x` frozen at
+/// another position (the root, a navigated `.s` when the `try` stood at the root), a
+/// variable rebound or bound off a navigation, a `$x` the body raised after a further
+/// `as`, and a body that can raise a non-message of its own all keep refusing, as in jq.
+/// Every row captured live from jq 1.7.1.
+#[test]
+fn test_try_body_raising_a_marker_elsewhere_keeps_refusing_the_handler_4127() -> Result<()> {
+    for (program, doc, message) in [
+        (
+            "path(. as $y | .s | try (error($y)) catch .[0])",
+            r#"{"s":[1]}"#,
+            r#"near attempt to access element 0 of {"s":[1]}"#,
+        ),
+        (
+            "path(.s as $y | try (.s | error($y)) catch .[0])",
+            r#"{"s":[1]}"#,
+            "near attempt to access element 0 of [1]",
+        ),
+        (
+            "path(.s | try (.[0] as $y | error($y)) catch .[0])",
+            r#"{"s":[1]}"#,
+            "near attempt to access element 0 of 1",
+        ),
+        (
+            "path(.s | try (. as $y | 1 as $y | error($y)) catch .[0])",
+            r#"{"s":[1]}"#,
+            "near attempt to access element 0 of 1",
+        ),
+        (
+            "path(.s | try (. as $y | (.[0] | . as $y | error($y))) catch .[0])",
+            r#"{"s":[1]}"#,
+            "near attempt to access element 0 of 1",
+        ),
+        (
+            "path(.s | try (. as $y | .[0] | .x | error($y)) catch .[0])",
+            r#"{"s":[1]}"#,
+            r#"near attempt to access element 0 of "Cannot index number with"#,
+        ),
+        (
+            "path(. as $z | .s | try (. as $y | .[0] | error($z)) catch .[0])",
+            r#"{"s":[1]}"#,
+            r#"near attempt to access element 0 of {"s":[1]}"#,
+        ),
+        (
+            "del(.s | try (.[0] as $y | error($y)) catch .[0])",
+            r#"{"s":[1]}"#,
+            "near attempt to access element 0 of 1",
+        ),
+        // A body that stepped off the node and failed raises jq's own message, a string, not
+        // the marker: the handler's payload is that text, which is not the register's node.
+        (
+            "path(.s | try (. as $y | .x | error($y)) catch .)",
+            r#"{"s":5}"#,
+            r#"with result "Cannot index number"#,
+        ),
+        // Every branch, stage and operand has to raise the marker or a message: one that can
+        // raise anything else (`{"a":1}`) is that value, not the register's node.
+        (
+            r#"path(.s | try (. as $y | if .[0] == 2 then error($y) else error({"a":1}) end) catch .[0])"#,
+            r#"{"s":[1]}"#,
+            r#"near attempt to access element 0 of {"a":1}"#,
+        ),
+        (
+            r#"path(.s | try (. as $y | .[0] | error({"a":1})) catch .[0])"#,
+            r#"{"s":[1]}"#,
+            r#"near attempt to access element 0 of {"a":1}"#,
+        ),
+        (
+            r#"path(.s | try (. as $y | (.[0] == 1) and error({"a":1})) catch .[0])"#,
+            r#"{"s":[1]}"#,
+            r#"near attempt to access element 0 of {"a":1}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(doc))?;
+        assert_eq!(code, 5, "#4127: `{program}` on {doc}: stdout {stdout:?}");
+        assert!(stdout.is_empty(), "#4127: `{program}`: {stdout:?}");
+        assert!(
+            stderr.contains(&format!("Invalid path expression {message}")),
+            "#4127: `{program}`: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3967, flipped by #3644: a compound handler next to an `and`/`or`/`-`
 /// navigation answers as jq does (the `true` row emits nothing, the
 /// array row `[0]`). Both refused before the compound stage stated its register

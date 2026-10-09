@@ -665,6 +665,16 @@ OPERANDS = [
     "try (select(. // 1) | error) catch (.a)?",
     "try last(error) catch .",
     "try last(.a) catch input",
+    # (#4127) a body that raises a `$y` frozen at the `try`'s own node, however it steps off
+    # the node first, so the handler's payload is the register's node; and the contrasts that
+    # raise a message, another node or a value built by hand, which are not.
+    "try (. as $y | .a | error($y)) catch (.a)?",
+    "try (. as $y | if .a then error($y) else empty end) catch (.a)?",
+    "try (. as $y | (., error($y))) catch (.a)?",
+    "try (. as $y | .[0] | error($y)) catch .[0]?",
+    "try (. as $y | .a | . as $z | error($z)) catch (.a)?",
+    "try (. as $y | .a | error({\"a\":1})) catch (.a)?",
+    "try (. as $y | if .a then error($y) else error({\"a\":1}) end) catch (.a)?",
     # (#3767 Part 4) a `first`/`limit`/`nth` over a stage that navigates nothing leaves the
     # register where it was, and the same three around a type filter inside a `[E]` collect
     # are path-checked as in a pipe. The contrasts navigate (`first(.a)`, `[limit(1; .a)]`),
