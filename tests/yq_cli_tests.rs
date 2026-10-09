@@ -18227,10 +18227,10 @@ mod meta_assign_798 {
         assert!(err.contains("parse error"), "stderr: {err}");
     }
 
-    /// `tag =`/`head_comment =`/`foot_comment =`/`comments =` parse (the
-    /// shared grammar is complete) but raise an explicit "not yet
-    /// supported" error rather than silently no-oping -- real yq itself
-    /// fully supports all four; succinctly doesn't yet (#798 PR2/PR3/PR5).
+    /// `tag =` and a non-empty `head_comment =`/`foot_comment =`/`comments =` parse (the
+    /// shared grammar is complete) but raise an explicit "not yet supported" error rather than
+    /// silently no-oping -- real yq itself fully supports them; succinctly writes only the
+    /// clearing form `= ""` of the comment slots so far (#2796), and `...` only with those.
     #[test]
     fn stub_slots_parse_but_raise_not_yet_supported() {
         for (filter, slot) in [
@@ -18238,6 +18238,8 @@ mod meta_assign_798 {
             (".a head_comment = \"hi\"", "head_comment"),
             (".a foot_comment = \"bye\"", "foot_comment"),
             (".a comments = \"x\"", "comments"),
+            ("... comments = \"x\"", "comments"),
+            ("... line_comment = \"x\"", "line_comment"),
         ] {
             let (_out, err, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[]).unwrap();
             assert_eq!(code, 1, "[{filter}] stderr: {err}");
@@ -18245,6 +18247,36 @@ mod meta_assign_798 {
                 err.contains(&format!("{slot} = ... is not yet supported")),
                 "[{filter}] stderr: {err}"
             );
+        }
+    }
+
+    /// The clearing form of the comment slots writes (#2796), and `...` (recursive descent that
+    /// also visits mapping keys) is accepted as the target of a comment write only: anywhere
+    /// else, and with `style`/`anchor`, it is refused rather than applied to the wrong node.
+    #[test]
+    fn clearing_forms_write_and_dots_is_a_comment_target_only() {
+        let doc = "# h\na: 1 # l\n# m\nb: 2\n";
+        let (out, code) = run_yq_stdin("... comments = \"\"", doc, &[]).unwrap();
+        assert_eq!((out.as_str(), code), ("a: 1\nb: 2\n", 0));
+        let (out, code) = run_yq_stdin(".. comments = \"\"", doc, &[]).unwrap();
+        assert_eq!((out.as_str(), code), ("a: 1\n# m\nb: 2\n", 0));
+        for (filter, needle) in [
+            (
+                "...",
+                "only supported as the target of a metadata assignment",
+            ),
+            (
+                "... style = \"double\"",
+                "only supported with the comment slots",
+            ),
+            (
+                "... anchor = \"z\"",
+                "only supported with the comment slots",
+            ),
+        ] {
+            let (_out, err, code) = run_yq_stdin_with_stderr(filter, doc, &[]).unwrap();
+            assert_eq!(code, 1, "[{filter}] stderr: {err}");
+            assert!(err.contains(needle), "[{filter}] stderr: {err}");
         }
     }
 

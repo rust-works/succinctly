@@ -1,0 +1,6 @@
+a: 1 # line
+b:
+  c: 2 # lc
+  # tail
+d: [1, 2] # fl
+# end

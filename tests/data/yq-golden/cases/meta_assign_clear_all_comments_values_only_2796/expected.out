@@ -1,0 +1,8 @@
+a: 1
+# mid
+b:
+  # inner
+  c: 2
+  # tail
+d: [1, 2]
+# end
