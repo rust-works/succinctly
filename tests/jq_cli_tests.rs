@@ -97920,7 +97920,8 @@ fn test_recurse_seed_behind_call_or_fork_keeps_register_3580() -> Result<()> {
         (r"del(. as $x | 1 | (1, ..) | $x | .c)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n", 5),
         // #3892: the bind forwards its body, so the refusal is jq's own iterate error.
         (r"del(. as $x | 1 | (. as $q | ..) | $x | .c)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n", 5),
-        (r"del(. as $x | 1 | def f: ..; f | $x | .c)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"c\" of {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+        // #3914: a zero-argument `def` call forwards its body, so this too is jq's own iterate error.
+        (r"del(. as $x | 1 | def f: ..; f | $x | .c)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n", 5),
         (r"(. as $x | 1 | (1, ..) | $x | .c) |= 9", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n", 5),
     ])
 }
@@ -98008,31 +98009,66 @@ fn test_recurse_seed_through_nth_bind_and_fold_recurse_f_3892() -> Result<()> {
 }
 
 /// #3580, residuals: shapes whose seed (or handler output) the stage cannot read
-/// still refuse, loudly. Each is `[]` or a successful write in jq: a literal ahead of
-/// the recursion in an untaken branch (`(1, ..)` was one until #3862, when each sibling
-/// of a comma began to state the register on its own), a destructuring bind or a
-/// `def` call around it (their arms re-seed the register), a pipe nested inside a
-/// forwarder (`if c then (.. | select(true)) else . end`, or a bare-variable bind's
-/// body, #3892), a `foreach` UPDATE that forks (`fans_out` withholds the
-/// register, so its emissions state nothing), and a fold inside an `[E]` collect. The rows
-/// pin the *current* refusal, and every write
+/// still refuse, loudly. Each is `[]` or a successful write in jq: a pipe nested inside a
+/// forwarder (`if c then (.. | select(true)) else . end`), a `foreach` fold inside an `[E]`
+/// collect, and the neighbours of the shapes #3914 promoted that still state nothing -- a
+/// literal-only `if` branch with no recursion beside it, a `def` call that takes an
+/// argument. (A literal ahead of the recursion in a comma was promoted by #3862, a
+/// zero-argument `def` call and a by-value `if` branch by #3914, and a destructuring
+/// bind keeps its own rule.) The rows pin the *current* refusal, and every write
 /// form must exit non-zero -- never 0 with the document unchanged, which is the
 /// silent write loss #3267 closed.
 #[test]
 fn test_recurse_seed_residuals_stay_loud_3580() -> Result<()> {
     assert_rows_2764(&[
-        (r"path(. as $x | 1 | if false then .. else 1 end | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
-        // #3892: a bind forwards only its body; a pipe or a variable ahead of the
-        // recursion there is the nested-pipe and literal-ahead residual again. (A trailing `.`
-        // after the `try ..` forwards its statement since #4063, and these two answer as jq does.)
-        (r"path(. as $x | 1 | (. as $q | (try ..) | .) | $x)", "[]\n", "", 0),
-        (r"del(. as $x | 1 | (. as $q | (try ..) | .) | $x | .c)", "{\"a\":{\"b\":{\"b\":null}}}\n", "", 0),
-        (r"path(. as $x | 1 | def f: ..; f | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
         // a pipe nested inside a forwarder is opaque (the bare `(.. | select(true))` stage is answered by #3653's own rule)
         (r"path(. as $x | 1 | if true then (.. | select(true)) else . end | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
         (r"del(. as $x | 1 | if true then (.. | select(true)) else . end | $x | .c)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"c\" of {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
         (r"path(. as $x | 1 | [foreach (1,2) as $i (1; try ..; .)] | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
-        (r"del(. as $x | 1 | if false then .. else 1 end | $x | .c)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"c\" of {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+        (r"del(. as $x | 1 | [foreach (1,2) as $i (1; try ..; .)] | $x | .c)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"c\" of {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+        // #3914: an `if` whose branches hold no producer at all states nothing to read, and a `def` call
+        // that takes an argument binds code the shape cannot see
+        (r"path(. as $x | 1 | if false then .a else 1 end | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+        (r"path(. as $x | 1 | def f(a): ..; f(1) | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+    ])
+}
+
+/// #3914: a by-value `if` branch and a zero-argument `def` call state the register a
+/// recursion's seed left, as a comma sibling (#3862) and an alternate (#3906) do.
+/// `if false then .. else 1 end` and `def f: ..; f` were loud refusals where jq answers `[]`
+/// (the later outputs of the `..` still raise, and a `try` around it catches them). Every row was
+/// captured from `/usr/bin/jq` 1.7.1 on [`DOC_2764`]: the write forms, a `try` inside, around and
+/// after, the wrappers (`nth`, `first`), a nested `def`, and a trackable entry whose register is
+/// not the one the stage entered with (`.a as $y | .c | ...`), which still refuses.
+#[test]
+fn test_recurse_seed_through_if_literal_and_def_call_3914() -> Result<()> {
+    assert_rows_2764(&[
+        (r"path(. as $x | 1 | if false then .. else 1 end | $x)", "[]\n", "", 0),
+        (r"del(. as $x | 1 | if false then .. else 1 end | $x | .c)", "{\"a\":{\"b\":{\"b\":null}}}\n", "", 0),
+        (r"(. as $x | 1 | if false then .. else 1 end | $x | .c) = 9", "{\"a\":{\"b\":{\"b\":null}},\"c\":9}\n", "", 0),
+        (r"(. as $x | 1 | if false then .. else 1 end | $x | .c) |= 9", "{\"a\":{\"b\":{\"b\":null}},\"c\":9}\n", "", 0),
+        (r"path(. as $x | 1 | if true then 1 else .. end | $x)", "[]\n", "", 0),
+        (r"path(. as $x | 1 | if false then .. else (1, ..) end | $x)", "[]\n[]\n", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n", 5),
+        (r"path(. as $x | 1 | if true then (try ..) else 1 end | $x)", "[]\n", "", 0),
+        (r"del(. as $x | 1 | if false then (try ..) else 1 end | $x | .c)", "{\"a\":{\"b\":{\"b\":null}}}\n", "", 0),
+        (r"path(. as $x | 1 | if false then .. else .a end | $x)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of 1\n", 5),
+        (r"path(. as $x | 1 | try (if false then .. else .a end) | $x)", "", "", 0),
+        (r"path(.a as $y | .c | if false then .. else 1 end | $y)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"b\":{\"b\":null}}\n", 5),
+        (r"path(. as $x | 1 | if false then .. else 1 end | try ($x | .c))", "[\"c\"]\n", "", 0),
+        (r"del(. as $x | 1 | nth(0; if false then .. else 1 end) | $x | .c)", "{\"a\":{\"b\":{\"b\":null}}}\n", "", 0),
+        (r"del(. as $x | 1 | try (if false then .. else 1 end) | $x | .c)", "{\"a\":{\"b\":{\"b\":null}}}\n", "", 0),
+        (r"path(. as $x | 1 | def f: ..; f | $x)", "[]\n", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n", 5),
+        (r"del(. as $x | 1 | def f: ..; f | $x | .c)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n", 5),
+        (r"(. as $x | 1 | def f: ..; f | $x | .c) = 9", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n", 5),
+        (r"(. as $x | 1 | def f: ..; f | $x | .c) |= 9", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n", 5),
+        (r"path(. as $x | 1 | def f: try ..; f | $x)", "[]\n", "", 0),
+        (r"path(. as $x | 1 | def f: ..; first(f) | $x)", "[]\n", "", 0),
+        (r"path(. as $x | 1 | def f: ..; f | f | $x)", "[]\n", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n", 5),
+        (r"path(. as $x | 1 | def f: ..; def g: f; g | $x)", "[]\n", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n", 5),
+        (r"path(. as $x | 1 | def f: if false then .. else 1 end; f | $x)", "[]\n", "", 0),
+        (r"path(. as $x | 1 | def f: .a; f | $x)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of 1\n", 5),
+        (r"path(.a as $y | .c | def f: ..; f | $y)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"b\":{\"b\":null}}\n", 5),
+        (r"del(. as $x | 1 | def f: ..; try f | $x | .c)", "{\"a\":{\"b\":{\"b\":null}}}\n", "", 0),
     ])
 }
 

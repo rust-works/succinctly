@@ -3639,18 +3639,30 @@ answers `["b"]` — and classified the two residuals appended below):
   recurse spelling with a tracked `f`, not only `..`, so `reduce (1,2) as $i (1; try recurse(.a))` is
   `[]`. Pinned by `test_recurse_seed_through_nth_bind_and_fold_recurse_f_3892`.
 
+  [#3914](https://github.com/rust-works/succinctly/issues/3914) added two more. An `if` branch that
+  runs starts from the register the `if` was entered with (its condition is a subexp), so a by-value
+  branch states it as a `//` alternate does (`carry_frame_register`): the taken `else 1` of
+  `if false then .. else 1 end` is `[]`. And a zero-argument `def` call forwards its body's statements
+  (`entry_marker_shape` reads the call as its body, to a depth of 8 nested calls; the resolver's
+  `DefCall` arm resolves the bound body against the same input, frame and sink): `def f: ..; f` is
+  `[]` followed by the iterate error, as in jq. Pinned by
+  `test_recurse_seed_through_if_literal_and_def_call_3914`. A row from the original list is also gone
+  since the issue was filed: the forking `foreach` UPDATE (`#4041`/`#4059`) and
+  `(. as $q | (try ..) | .)` (`#4063`) answer as jq does.
+
   **What still refuses**, each loudly (an exit 5, never a write that is silently lost) and pinned by
   `test_recurse_seed_residuals_stay_loud_3580`:
-  - an output that is not a recursion's seed or an untracked `.` and so states nothing: a literal
-    ahead of the recursion (the taken `else 1` of `if false then .. else 1 end`) is `[]` in jq.
-    (A literal or variable *sibling* ahead of it in a comma answers since #3862: `(1, ..)` and
-    `(. as $q | $q, (try ..))` state the register per sibling, pinned by
-    `test_recurse_seed_after_a_comma_sibling_states_the_register_3862`);
-  - a recursion behind a destructuring bind or a `def` call (`(. as [$q] | ..)`, `def f: ..; f`): the
-    bind's pattern indexes before its body runs and a call's body is not named, so the stage is
-    opaque. So is a pipe (or `select`) nested inside a forwarder, such as `if true then (.. | select(true))
-    else . end` or a bare-variable bind's body `(. as $q | (try ..) | .)`, though the bare
-    `(.. | select(true))` stage is answered by #3653's own rule.
+  - a pipe (or `select`) nested inside a forwarder, such as `if true then (.. | select(true)) else .
+    end`, though the bare `(.. | select(true))` stage is answered by #3653's own rule: the nested
+    pipe re-seeds in its own stages, so the statement its first output carries is not the outer
+    stage's;
+  - a fold inside an `[E]` collect (`[foreach (1,2) as $i (1; try ..; .)]`), which goes through the
+    collect's own claim;
+  - an `if` whose branches hold no recursion at all (`if false then .a else 1 end`) and a `def` call
+    that takes an argument (`def f(a): ..; f(1)`): the first has no producer for the stage to read,
+    the second binds code the shape cannot see;
+  - a recursion behind a *destructuring* bind (`(. as [$q] | ..)`): the bind's pattern indexes before
+    its body runs, so the stage is opaque on purpose.
 - **A terminal `null`/`true`/`false` is the root path only while nothing navigated
   ([#3579](https://github.com/rust-works/succinctly/issues/3579)).** jq accepts a computed
   `null`, `true` or `false` as a path when it is `jv_identical` to the register, by value alone, so

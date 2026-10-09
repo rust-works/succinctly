@@ -39138,7 +39138,12 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             else_branch,
         } => resolve_cond_fork_stream::<S>(cond, value, trackable, |truthy| {
             let branch = if truthy { then_branch } else { else_branch };
-            resolve_node_sink::<S>(branch, value, trackable, snapshot, frame, keep, sink)
+            // #3914: the branch that runs starts from the register the `if` was entered
+            // with (the condition is a subexp), so a by-value branch states it as a
+            // `//` alternate does ([`carry_frame_register`]).
+            resolve_node_sink::<S>(branch, value, trackable, snapshot, frame, keep, &mut |b| {
+                sink(carry_frame_register(branch, b, frame))
+            })
         }),
         // `E?` (bare postfix `?`, sugar for `try E`, #2235): streams through
         // `resolve_node_sink` rather than collecting via `resolve_node`
@@ -45339,11 +45344,12 @@ fn getpath_preserves_register<S: EvalSemantics>(
 /// `?`, `try` (and its handler), `,`, `if` (its condition is a subexp), `//`
 /// (the right side runs after the left was backtracked), `first(f)`,
 /// `limit(n; f)`, `nth(n; f)`, `label` and a bare-variable bind's body (its
-/// source is a subexp; both since #3892). A `//` is also a producer when its right
+/// source is a subexp; both since #3892) and a `def` call that takes no arguments, which
+/// reads as its body (since #3914). A `//` is also a producer when its right
 /// operand leaves the register alone ([`operand_leaves_register`], #3906): that alternate
 /// states the register the stage entered with ([`carry_frame_register`]). Anything else that hosts a producer -- a
 /// destructuring bind, whose pattern indexes before its body runs, a fold, a
-/// `def` call -- is *opaque*: the stage reads nothing, and the refusal it had
+/// `def` call with arguments -- is *opaque*: the stage reads nothing, and the refusal it had
 /// before stays. A stage that hosts no producer has nothing to read.
 ///
 /// True only when all of these hold, each load-bearing:
@@ -45426,6 +45432,9 @@ fn is_entry_marker_producer(expr: &Expr) -> bool {
     )
 }
 
+/// How many `def` bodies [`entry_marker_shape`] looks through before it reads a call as opaque.
+const DEF_CALL_SHAPE_DEPTH: u8 = 8;
+
 /// [`EntryMarkers`] for `expr`, peeling the wrappers [`entry_marker_stage`]
 /// lists. Each arm is the resolver's own forwarding arm in `resolve_node_sink`
 /// (or its sink helper): the count of `limit`/`nth`, the source of a
@@ -45433,6 +45442,11 @@ fn is_entry_marker_producer(expr: &Expr) -> bool {
 /// never reach the sink, so a producer there states nothing this stage reads
 /// and is not looked at.
 fn entry_marker_shape(expr: &Expr) -> EntryMarkers {
+    entry_marker_shape_in(expr, DEF_CALL_SHAPE_DEPTH)
+}
+
+/// [`entry_marker_shape`] with `calls` more `def` bodies it may look into.
+fn entry_marker_shape_in(expr: &Expr, calls: u8) -> EntryMarkers {
     match expr {
         Expr::Identity
         | Expr::RecursiveDescent
@@ -45460,15 +45474,15 @@ fn entry_marker_shape(expr: &Expr) -> EntryMarkers {
         | Expr::Try {
             expr: inner,
             catch: None,
-        } => entry_marker_shape(inner),
-        Expr::Shared(inner) => entry_marker_shape(inner.expr()),
+        } => entry_marker_shape_in(inner, calls),
+        Expr::Shared(inner) => entry_marker_shape_in(inner.expr(), calls),
         // The handler's outputs state the register `resolve_catch_sink` seeded
         // them with whatever the body is, so a `try` with a handler is a producer
         // in its own right.
         Expr::Try {
             expr: inner,
             catch: Some(_),
-        } => entry_marker_shape(inner).join(EntryMarkers::Forwarded),
+        } => entry_marker_shape_in(inner, calls).join(EntryMarkers::Forwarded),
         Expr::Comma(items) => {
             // #3959: a sibling that leaves the register alone is judged by that, not by what
             // is inside it -- a pipe of non-navigating stages (`(.|length)`, `(2|.+1)`) holds an
@@ -45478,7 +45492,7 @@ fn entry_marker_shape(expr: &Expr) -> EntryMarkers {
                 .iter()
                 .filter(|item| !operand_leaves_register(item))
                 .fold(EntryMarkers::None, |acc, item| {
-                    acc.join(entry_marker_shape(item))
+                    acc.join(entry_marker_shape_in(item, calls))
                 });
             // #3941: jq forks the comma, so each sibling starts from the register the comma
             // was entered with, and a sibling that leaves it alone states it
@@ -45504,7 +45518,7 @@ fn entry_marker_shape(expr: &Expr) -> EntryMarkers {
             then_branch,
             else_branch,
             ..
-        } => entry_marker_shape(then_branch).join(entry_marker_shape(else_branch)),
+        } => entry_marker_shape_in(then_branch, calls).join(entry_marker_shape_in(else_branch, calls)),
         // #3906: the alternate runs after jq backtracked out of the left operand, so one
         // that leaves the register alone states it as the stage entered it
         // ([`carry_frame_register`]) -- a producer in its own right, like a `catch` handler.
@@ -45516,7 +45530,7 @@ fn entry_marker_shape(expr: &Expr) -> EntryMarkers {
         // nothing to state reads nothing. The right operand is only asked when the arms did not already settle it, which keeps a
         // right-nested chain (`a // b // c // ...`) linear.
         Expr::Alternative(left, right) => {
-            let shape = entry_marker_shape(left).join(entry_marker_shape(right));
+            let shape = entry_marker_shape_in(left, calls).join(entry_marker_shape_in(right, calls));
             if shape == EntryMarkers::None && operand_leaves_register(right) {
                 EntryMarkers::Forwarded
             } else {
@@ -45529,7 +45543,18 @@ fn entry_marker_shape(expr: &Expr) -> EntryMarkers {
         // `. | .b?`, `(1, 2) | .`, whose last stage is a leaf). A head that may navigate keeps
         // the pipe as opaque as it was.
         Expr::Pipe(stages) if stages.len() > 1 && pipe_forwards_last_statement(stages) => {
-            entry_marker_pipe_shape(stages)
+            entry_marker_pipe_shape(stages, calls)
+        }
+        // #3914: `resolve_node_sink`'s `DefCall` arm resolves the bound body against this arm's
+        // own input, frame and sink, so a call forwards a branch exactly as the body written in
+        // place does. Only a call with no arguments: a closure or `$param` is bound to code
+        // this shape cannot see. The budget keeps a chain of nested calls from walking
+        // unboundedly; past it the call stays opaque, as it was.
+        Expr::DefCall { def, args, .. } if args.is_empty() && def.params.is_empty() => {
+            match calls.checked_sub(1) {
+                Some(left) => entry_marker_shape_in(&def.body, left),
+                None => EntryMarkers::Opaque,
+            }
         }
         other if any_subexpr(other, &mut is_entry_marker_producer) => EntryMarkers::Opaque,
         _ => EntryMarkers::None,
@@ -45548,9 +45573,9 @@ fn pipe_forwards_last_statement(stages: &[Expr]) -> bool {
 }
 
 /// [`entry_marker_shape`] of a pipe that [`pipe_forwards_last_statement`] holds for.
-fn entry_marker_pipe_shape(stages: &[Expr]) -> EntryMarkers {
+fn entry_marker_pipe_shape(stages: &[Expr], calls: u8) -> EntryMarkers {
     let stages = pipe_without_trailing_identity(stages);
-    entry_marker_shape(&stages[stages.len() - 1])
+    entry_marker_shape_in(&stages[stages.len() - 1], calls)
 }
 
 /// `stages` without the `.` stages at its end (never emptying it): a stage that cannot move the
@@ -135515,6 +135540,71 @@ mod neutral_leaves_register_tests_4028 {
         ] {
             assert_eq!(marker_shape(src), shape, "entry_marker_shape({src})");
         }
+    }
+
+    /// [`entry_marker_shape`] of a program once its leading `def` is bound, as the resolver sees
+    /// it (a call is an `Expr::DefCall`, not the `FuncCall` the parser writes).
+    fn bound_marker_shape(src: &str) -> &'static str {
+        let parsed = parse(src).unwrap();
+        let Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+            bound,
+        } = &parsed
+        else {
+            panic!("`{src}` starts with a def");
+        };
+        let bound_then = bind_def(name, params, body, then, bound);
+        match entry_marker_shape(&bound_then) {
+            EntryMarkers::None => "none",
+            EntryMarkers::Forwarded => "forwarded",
+            EntryMarkers::Opaque => "opaque",
+        }
+    }
+
+    // #3914: a zero-argument `def` call reads as its body, because the resolver's `DefCall` arm
+    // resolves the bound body against the same input, frame and sink.
+    #[test]
+    fn a_def_call_reads_as_its_body_3914() {
+        for (src, shape) in [
+            ("def f: ..; f", "forwarded"),
+            ("def f: try ..; f", "forwarded"),
+            ("def f: if false then .. else 1 end; f", "forwarded"),
+            ("def f: 1; f", "none"),
+            ("def f: .a; f", "none"),
+            // A pipe in the body re-seeds, exactly as it would written in place.
+            ("def f: .. | .; f", "opaque"),
+            ("def f: [..]; f", "opaque"),
+            // A call with an argument binds code the shape cannot see.
+            ("def f(a): ..; f(1)", "opaque"),
+            // The call forwards like the body it names, under the wrappers that forward.
+            ("def f: ..; first(f)", "forwarded"),
+            ("def f: ..; (f, 1)", "forwarded"),
+            ("def f: ..; (f | .)", "forwarded"),
+            // A call within a call.
+            ("def f: ..; def g: f; g", "forwarded"),
+        ] {
+            assert_eq!(bound_marker_shape(src), shape, "entry_marker_shape({src})");
+        }
+    }
+
+    // #3914: a chain of calls is looked through to a bounded depth, then read as opaque, so a
+    // deeply nested `def` cannot make the shape walk unboundedly.
+    #[test]
+    fn a_def_call_chain_is_read_to_a_bounded_depth_3914() {
+        let chain = |links: usize| {
+            let mut src = String::from("def f0: ..; ");
+            for i in 1..=links {
+                src.push_str(&format!("def f{i}: f{}; ", i - 1));
+            }
+            src.push_str(&format!("f{links}"));
+            bound_marker_shape(&src)
+        };
+        assert_eq!(chain(1), "forwarded");
+        assert_eq!(chain(usize::from(DEF_CALL_SHAPE_DEPTH) - 2), "forwarded");
+        assert_eq!(chain(usize::from(DEF_CALL_SHAPE_DEPTH) + 2), "opaque");
     }
 
     #[test]
