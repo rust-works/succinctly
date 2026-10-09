@@ -2981,6 +2981,12 @@ pub enum ObjectKey {
     Literal(String),
     /// Dynamic key from expression: `{(.name): .value}`
     Expr(Box<Expr>),
+    /// yq mode only (#2783): an entry with no `:` at all, `{$a}` or `{.x, "k": 1}`.
+    /// yq's `{...}` is `COLLECT_OBJECT` over a union of `key: value` pairs, so a
+    /// lone expression is a legal entry that is not a pair -- it contributes its
+    /// raw outputs to the union instead of a one-key map. The expression lives in
+    /// [`ObjectEntry::value`] so every walker that visits values visits it.
+    Bare,
 }
 
 /// The number an [`Expr::Index`]/[`Expr::Slice`] component is reported as by

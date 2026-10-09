@@ -4885,41 +4885,76 @@ go-yaml's way: first line after the value, each further line as its own comment 
 the key's indent, an empty line left empty, and — top level only — one blank line before
 the continuation (`a: 1 # m` / blank / `# l`, but `  b: 1 # m` / `  # l` when nested).
 
-### Object-construction shorthand (`{x}`, `{$a}`) has no real-yq equivalent at all (#2783)
+### Object construction: yq's `{...}` is `COLLECT_OBJECT`, not jq's sugar (#2783)
 
-Real yq's `{...}` object-construction grammar has no shorthand concept whatsoever -- not
-even the plain, non-`$` field shorthand jq accepts. Confirmed live against yq v4.53.3:
+Real yq's `{...}` grammar is `{ expr : expr , expr : expr , ... }`. `:` is the binary
+`CREATE_MAP` operator, `,` is `UNION`, and the braces are `COLLECT_OBJECT`. Both sides of a
+pair are ordinary expressions, a bare identifier is not a token at all, and an entry with no
+`:` is legal -- it is simply not a pair. Confirmed live against yq v4.53.3:
 
 ```console
 $ printf 'x: 1\n' | yq '{x}'
 Error: 1:2: lexer: invalid input text "x}"
-```
-
-a bare lexer rejection, not a compile or runtime error. `succinctly yq` already diverges
-here -- it accepts `{x}` as sugar for `{x: .x}`, a deliberate (if previously undocumented)
-convenience extension beyond real yq's stricter grammar.
-
-The `$var` case (`{$a}`, jq's variable-shorthand sugar fixed for jq mode by #2724) is left
-unextended: `succinctly yq` still raises its pre-existing "expected identifier, found '$'"
-parse error, matching neither jq's sugar nor real yq's own behavior for the same input,
-which is a third thing again -- not an error at all:
-
-```console
+$ yq -n '{b: 2}'
+Error: 1:2: lexer: invalid input text "b: 2}"
+$ yq -n '{.a: 5}'            # key is an expression
+1: 5
 $ printf 'x: 1\n' | yq '1 as $a | {$a}'
 $ echo $?
 0
 ```
 
-Empty stdout, exit 0. `--verbose` shows why: `$a` is evaluated as an ordinary
-`GET_VARIABLE` op and handed to `COLLECT_OBJECT` as a bare, non-`key: value` entry, which
-degrades the whole construction to zero results (`"collectObjectOperation, length of
-rotated is 0"` -> `"no matching results, nothing to print"`) -- an incidental quirk of
-yq's object-collection operator, not a deliberate feature.
+`succinctly yq` follows that grammar:
 
-Reproducing real yq's exact behavior needs evaluator-level work (an object-construction
-entry that consumes zero pairs and yields nothing), not a parser change, and interacts
-with the pre-existing, separately-undocumented `{x}` extension above -- both tracked
-together in #2783.
+- **Keys are expressions.** `{.a: 5}`, `{1: 2}`, `{"a" | "b": 1}` and `"k" as $a | {$a: 3}`
+  all parse. A scalar key stringifies (`{1: 2}` is `"1": 2` under `-o json`, as in yq).
+- **Bare identifier keys and the `{x}` shorthand are rejected** by default, matching yq's lexer
+  error. They are succinctly's jq-styled sugar, so they sit behind `--jq-extensions` with the
+  rest of that surface ([#1512](https://github.com/rust-works/succinctly/issues/1512)); the flag
+  keeps `{b: 2}` and `{x}` meaning what they did. `{$a}` is a bare *entry* in both modes, never
+  jq's `{a: $a}` sugar -- the mode decides, not the flag.
+- **A bare entry is reproduced bug-for-bug.** Each entry is evaluated, the entries are
+  `UNION`ed, and `COLLECT_OBJECT` reads the first node's child count as `N`, errors with
+  `CollectObject: mismatching node sizes; ...` if a later node has fewer children, and for
+  each `i < N` splats the `i`-th children (a sequence's items, a mapping's values, nothing for
+  a scalar) and cross-multiplies them with `*`. The visible consequences:
+
+  | filter (`-n`)                                    | yq and `succinctly yq`                          |
+  |--------------------------------------------------|-------------------------------------------------|
+  | `1 as $a \| {$a}`, `{"k"}`, `{[1,2]}`           | no output, exit 0                               |
+  | `{$undefined}`                                   | `{}`                                            |
+  | `{"b", "a": 1}`                                  | no output (the first node is a scalar, `N` = 0) |
+  | `{"a": 1, "b"}`, `{"z": (1,2), 5}`               | `CollectObject: mismatching node sizes` error   |
+  | `[[{"k":1}]] as $a \| {$a}`                     | `k: 1`                                          |
+  | `[{"k":1}] as $a \| {$a}`                       | `1`                                             |
+  | `[{"k":1}] as $a \| {"z": 0, $a}`               | error (`{z: 0} * 1` cannot be multiplied)       |
+
+  yq evaluates every entry before combining any, so an error inside one entry aborts the whole
+  construction with no prefix, unlike jq's streaming fan-out.
+
+Residual divergences remain, all in cases yq itself reaches through its node model:
+
+- **Non-scalar keys.** `{([1]): 1}` and `{"k":1} as $a | {($a): 3}` render a complex `? key`
+  mapping in yq; `OwnedValue` object keys are strings, so `succinctly yq` raises its usual
+  `Cannot use array as object key` error instead (rule 4(a): there is nothing to write the key
+  into that we could read back).
+- **Several inputs.** Under `--eval-all` or after `.[] |`, yq's `N` is the number of matching
+  nodes and one bare entry is collected across all of them; `succinctly yq` builds each input's
+  object on its own. A bare entry whose child count differs from the input count is the one
+  place the two models split.
+- **Duplicate keys.** yq folds the entries of a `{...}` with `*`, so `{"a": {"x": 1}, "a": {"y": 2}}`
+  deep-merges to `a: {x: 1, y: 2}`; `succinctly yq` keeps the last (`a: {y: 2}`), as it did before
+  #2783. Scalars and arrays agree (the later one wins either way). A construction holding a bare
+  entry does merge, since it goes through the same fold.
+- **`,` over one stored list.** yq's `UNION` skips its right operand when both sides evaluate to
+  the very same node list, which `$z, $z`, `($z), $z` and `., .` do (`[1] as $z | $z, $z` prints
+  once). It is a property of the comma operator everywhere, not of `{...}`, so a bare entry
+  shows it too: `[[1,2],[3,4]] as $z | {$z, $z}` is `1 2 3 4` in yq and `1 2 2 4` here.
+- **A parenthesized pair.** `{"x": 1, ("a": 2)}` parses in yq (`:` is an ordinary binary
+  operator); `succinctly yq` accepts a pair only directly inside the braces.
+- **The `*` error text.** The error a failed multiply raises is succinctly's usual
+  `object (...) and number (1) cannot be multiplied`, not yq's `cannot multiply !!map with
+  !!int`; the exit status agrees (a message-only divergence shared with every other `*`).
 
 ### Other categories
 
@@ -5079,6 +5114,11 @@ itself rejects it too (`leaf_paths/0 is not defined`; it's a succinctly-only inv
 modeled on a jq community recipe, see CLAUDE.md) — because, from `succinctly yq`'s
 syntax-surface point of view, it's the same kind of thing as the rest of this list: extra,
 off by default.
+
+The same gate covers the jq-styled **object-construction sugar** real yq's lexer rejects:
+bare identifier keys (`{b: 2}`) and the field shorthand (`{x}`, meaning `{x: .x}`)
+([#2783](https://github.com/rust-works/succinctly/issues/2783)). `succinctly yq` rejects them
+by default; with `--jq-extensions` they keep their jq meaning.
 
 `gsub`/`scan`/`splits` specifically: real yq's lexer rejects all three outright, at any
 arity ([#1436](https://github.com/rust-works/succinctly/issues/1436)) — this isn't "3-arg

@@ -11520,7 +11520,7 @@ fn test_duplicate_mapping_key_survives_slurp_json_color() -> Result<()> {
 /// here so the DOM-path YAML color branch stays covered.
 #[test]
 fn test_null_input_color_output_yaml() -> Result<()> {
-    let (output, code) = run_yq_stdin("{a: 1}", "", &["-n", "-C"])?;
+    let (output, code) = run_yq_stdin(r#"{"a": 1}"#, "", &["-n", "-C"])?;
     assert_eq!(code, 0);
     assert_eq!(output, "\u{1b}[36ma\u{1b}[0m: 1\u{1b}[0m\n");
     Ok(())
@@ -11536,7 +11536,7 @@ fn test_null_input_color_output_yaml() -> Result<()> {
 /// on the DOM path regardless of output format.
 #[test]
 fn test_null_input_color_output_json() -> Result<()> {
-    let (output, code) = run_yq_stdin("{a: 1}", "", &["-n", "-C", "-o", "json", "-I0"])?;
+    let (output, code) = run_yq_stdin(r#"{"a": 1}"#, "", &["-n", "-C", "-o", "json", "-I0"])?;
     assert_eq!(code, 0);
     assert_eq!(
         output,
@@ -12298,11 +12298,16 @@ fn test_line_column_object_construction_is_a_known_limitation() -> Result<()> {
     // the generic evaluator with the cursor threaded into every value
     // expression, so they now answer from the node: real yq v4.53.3 gives
     // `.baz | line` as `2` on this document (its lexer rejects the unquoted
-    // object-key spelling, so the construction itself has no oracle). The
+    // object-key spelling, so the construction itself has no oracle; the quoted
+    // spelling used here is yq grammar). The
     // `column` value is succinctly's own (yq says `1`), a separate,
     // pre-existing divergence this test is not about.
     let yaml = "foo: bar\nbaz: qux\n";
-    let (output, code) = run_yq_stdin(".baz | {l: line, c: column}", yaml, &["-o=json", "-I=0"])?;
+    let (output, code) = run_yq_stdin(
+        r#".baz | {"l": line, "c": column}"#,
+        yaml,
+        &["-o=json", "-I=0"],
+    )?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), r#"{"l":2,"c":6}"#);
     Ok(())
@@ -24116,7 +24121,7 @@ fn test_builtin_in_yq_type_mismatch_never_errors_917() -> Result<()> {
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "false");
 
-    let (out, code) = run_yq_stdin("in({a: 1, b: 2})", "0", &[])?;
+    let (out, code) = run_yq_stdin(r#"in({"a": 1, "b": 2})"#, "0", &[])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "false");
 
@@ -53366,14 +53371,14 @@ mod issue_2091_def_and_binder_wrapped_writes {
     fn test_yaml_def_body_binds_at_definition_site_2091() -> Result<()> {
         let doc = "a: &x 1\nb: *x\nc: 2\n";
         let (wrapped, code) = run_yq_stdin(
-            "def f: {a: .c, b: .a, c: .b}; def g: f; def f: .a = 99; g",
+            r#"def f: {"a": .c, "b": .a, "c": .b}; def g: f; def f: .a = 99; g"#,
             doc,
             &[],
         )?;
         assert_eq!(code, 0);
         // `g` calls the `f` visible where `g` was written -- the reshaping
         // one -- so the result is that filter's own output, unsynced.
-        let (direct, _) = run_yq_stdin("{a: .c, b: .a, c: .b}", doc, &[])?;
+        let (direct, _) = run_yq_stdin(r#"{"a": .c, "b": .a, "c": .b}"#, doc, &[])?;
         assert_eq!(wrapped, direct);
         assert_eq!(wrapped, "a: 2\nb: 1\nc: 1\n");
         Ok(())
@@ -54243,31 +54248,32 @@ fn genuine_yaml_flow_mappings_keep_their_own_grammar_2777() -> Result<()> {
 }
 
 /// #2724: jq mode's `{$a}` object-construction shorthand fix is scoped to
-/// jq mode only -- yq mode still raises the same pre-existing parse error
-/// it always has ("expected identifier, found '$'"), not jq's `{"a":1}".
-/// Real yq's own behavior for this shape is a third, unrelated thing
-/// (silently produces zero output, per a `COLLECT_OBJECT` quirk on a bare
-/// non-pair entry) -- reproducing that needs evaluator-level work, tracked
-/// separately as #2783.
+/// jq mode only. In yq mode `$a` is a bare, non-pair entry of `COLLECT_OBJECT`,
+/// which silently produces zero output (#2783) -- neither jq's `{"a":1}` nor an
+/// error -- with or without `--jq-extensions`, since the mode decides, not the flag.
 #[test]
 fn test_object_construction_var_shorthand_is_jq_mode_only_2724() -> Result<()> {
-    let (stdout, stderr, code) = run_yq_stdin_with_stderr("1 as $a | {$a}", "x: 1\n", &[])?;
-    assert_ne!(code, 0, "stdout: {stdout:?}");
-    assert!(stderr.contains("expected identifier"), "stderr: {stderr:?}");
+    for extra in [&[][..], &["--jq-extensions"][..]] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr("1 as $a | {$a}", "x: 1\n", extra)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            ("", "", 0),
+            "{extra:?}"
+        );
+    }
     Ok(())
 }
 
 /// #2788: jq mode's object-construction trailing-comma allowance
 /// (`{a:1,}`) is likewise jq-mode only -- real yq rejects it too, just for
 /// an unrelated reason of its own (`',' expects 2 args but there is 1`,
-/// live-verified against v4.53.3), so this stays the same pre-existing
-/// parse error succinctly yq always raised for a trailing comma, not jq's
-/// `{"a":1}`.
+/// live-verified against v4.53.3), so `succinctly yq` still refuses it with
+/// a parse error of its own, not jq's `{"a":1}`.
 #[test]
 fn test_object_construction_trailing_comma_is_jq_mode_only_2788() -> Result<()> {
     let (stdout, stderr, code) = run_yq_stdin_with_stderr(r#"{"a":1,}"#, "x: 1\n", &[])?;
     assert_ne!(code, 0, "stdout: {stdout:?}");
-    assert!(stderr.contains("expected identifier"), "stderr: {stderr:?}");
+    assert!(stderr.contains("parse error"), "stderr: {stderr:?}");
     Ok(())
 }
 
@@ -58094,14 +58100,12 @@ fn test_yq_collect_map_navigating_f_keeps_no_path_register_3724() -> Result<()> 
 /// path-checks `f`, so `succinctly yq` keeps evaluating it by value: the discarded
 /// `map({k:1} | .k)` stays a silent no-op, as it was before.
 #[test]
-// The `{k:1}` rows are jq filter literals, not formatting strings.
-#[allow(clippy::literal_string_with_formatting_args)]
 fn test_yq_map_f_in_path_position_stays_by_value_3865() -> Result<()> {
     let doc = r#"[{"a":1},{"a":2}]"#;
     let unchanged = "[\n  {\n    \"a\": 1\n  },\n  {\n    \"a\": 2\n  }\n]\n";
     for filter in [
-        "(map({k:1} | .k) | empty) = 5",
-        "del(map({k:1} | .k) | empty)",
+        r#"(map({"k":1} | .k) | empty) = 5"#,
+        r#"del(map({"k":1} | .k) | empty)"#,
     ] {
         let (stdout, code) = run_yq_stdin(filter, doc, &["-o", "json"])?;
         assert_eq!(code, 0, "`{filter}`: stdout {stdout:?}");
@@ -60618,5 +60622,103 @@ fn test_yq_error_message_is_not_path_checked_4146() -> Result<()> {
     assert_ne!(code, 0);
     assert!(err.contains("Error: 2"), "err={err}");
     assert!(!err.contains("Invalid path expression"), "err={err}");
+    Ok(())
+}
+
+/// Pinned yq v4.53.3: `{...}` is `COLLECT_OBJECT` over a `UNION` of entries, so a
+/// key is any expression and an entry with no `:` is legal but is not a pair (#2783).
+/// Every row below was captured from the pinned binary, `-p=json -o=json -I=0`
+/// over `{"a":1}`.
+#[test]
+fn test_object_construction_is_collect_object_2783() -> Result<()> {
+    let args = &["-p=json", "-o=json", "-I=0"];
+    for (filter, expected) in [
+        // A key is an expression, not an identifier or a string.
+        (r"{.a: 5}", "{\"1\":5}\n"),
+        (r"{1: 2}", "{\"1\":2}\n"),
+        (r#"{"a" | "b": 1}"#, "{\"b\":1}\n"),
+        (r#""k" as $a | {$a: 3}"#, "{\"k\":3}\n"),
+        (r"1 as $k | {$k: 2}", "{\"1\":2}\n"),
+        (r#"{"x": .a, "y": .a}"#, "{\"x\":1,\"y\":1}\n"),
+        // A bare entry degrades by the shape of what it evaluates to.
+        (r"1 as $a | {$a}", ""),
+        (r#"{"k"}"#, ""),
+        (r"{.a}", ""),
+        (r"{[1,2]}", ""),
+        (r#"{"b", "a": 1}"#, ""),
+        (r#"{"x":1} | {.x, "z": 9}"#, ""),
+        (r"{$undefined}", "{}\n"),
+        (r#"[[{"k":1}]] as $a | {$a}"#, "{\"k\":1}\n"),
+        (r#"[{"k":1}] as $a | {$a}"#, "1\n"),
+        (r#"{"k":{"x":1}} as $a | {$a}"#, "1\n"),
+        (r#"[["k",1]] as $a | {$a}"#, "\"k\"\n1\n"),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, r#"{"a":1}"#, args)?,
+            (expected.into(), String::new(), 0),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
+/// Pinned yq v4.53.3: a later entry with fewer children than the first fails the
+/// whole construction, and a bare entry that splats to a value `*` cannot merge
+/// into a map fails with yq's multiply error (#2783).
+#[test]
+fn test_object_construction_collect_errors_2783() -> Result<()> {
+    let args = &["-p=json", "-o=json", "-I=0"];
+    for (filter, needle) in [
+        (
+            r#"{"a": 1, "b"}"#,
+            "CollectObject: mismatching node sizes; are you creating a map with mismatching key value pairs?",
+        ),
+        (r#"{"z": (1,2), 5}"#, "CollectObject: mismatching node sizes"),
+        (
+            r#"{"a":1} as $a | {$a, "b": 2}"#,
+            "CollectObject: mismatching node sizes",
+        ),
+        (r#"[{"k":1}] as $a | {"z": 0, $a}"#, "cannot be multiplied"),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, r#"{"a":1}"#, args)?;
+        assert_eq!(stdout, "", "{filter}");
+        assert_ne!(code, 0, "{filter}");
+        assert!(stderr.contains(needle), "{filter}: {stderr}");
+    }
+    Ok(())
+}
+
+/// Pinned yq v4.53.3 rejects a bare identifier key and the `{x}` shorthand at its
+/// lexer (`invalid input text "b: 2}"`); `succinctly yq` does too unless
+/// `--jq-extensions` asks for jq's sugar, which keeps its jq meaning (#2783).
+#[test]
+fn test_object_construction_identifier_sugar_needs_jq_extensions_2783() -> Result<()> {
+    let plain = &["-p=json", "-o=json", "-I=0"];
+    let extended = &["--jq-extensions", "-p=json", "-o=json", "-I=0"];
+    for (filter, expected, needs_flag) in [
+        (r"{b: 2}", "{\"b\":2}\n", true),
+        (r"{a}", "{\"a\":1}\n", true),
+        (r#"{a, "z": 3}"#, "{\"a\":1,\"z\":3}\n", true),
+        // A quoted key and a `$name` entry are yq grammar, with or without the flag.
+        (r#"{"b": 2}"#, "{\"b\":2}\n", false),
+        (r"1 as $q | {$q}", "", false),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, r#"{"a":1}"#, plain)?;
+        if needs_flag {
+            assert_eq!(stdout, "", "{filter}");
+            assert_ne!(code, 0, "{filter} must be rejected without the flag");
+        } else {
+            assert_eq!(
+                (stdout, stderr, code),
+                (expected.into(), String::new(), 0),
+                "{filter}"
+            );
+        }
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, r#"{"a":1}"#, extended)?,
+            (expected.into(), String::new(), 0),
+            "--jq-extensions {filter}"
+        );
+    }
     Ok(())
 }

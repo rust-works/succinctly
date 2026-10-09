@@ -93519,9 +93519,9 @@ fn test_owned_embed_yq_mode_unchanged_2889() -> Result<()> {
         ))
     };
     for filter in [
-        r". as $x | {k: .} | .k | ($x.a) = 9",
+        r#". as $x | {"k": .} | .k | ($x.a) = 9"#,
         r". as $x | . + {} | ($x.a) |= 9",
-        r". as $x | {k: .} | .k | del($x.a)",
+        r#". as $x | {"k": .} | .k | del($x.a)"#,
     ] {
         let (stdout, stderr, code) = yq(&[], filter)?;
         assert_eq!(
@@ -93536,7 +93536,7 @@ fn test_owned_embed_yq_mode_unchanged_2889() -> Result<()> {
         );
     }
     for filter in [
-        r". as $x | {k: .} | .k | path($x)",
+        r#". as $x | {"k": .} | .k | path($x)"#,
         r". as $x | . + {} | path($x)",
     ] {
         let (stdout, stderr, code) = yq(&["--jq-extensions"], filter)?;

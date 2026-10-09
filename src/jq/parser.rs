@@ -2307,74 +2307,85 @@ impl<'a> Parser<'a> {
             // that value is fully known here and the ordinary shorthand
             // check below (`{foo}` means `{foo: .foo}`) doesn't apply to
             // it -- `{$a}` means `{a: $a}`, not `{a: .a}`.
-            let (key, dollar_shorthand_value) = if self.peek() == Some('(') {
-                // Dynamic key: (expr)
-                self.next();
-                let key_expr = self.parse_expr()?;
-                self.expect(')')?;
-                (ObjectKey::Expr(Box::new(key_expr)), None)
-            } else if self.peek() == Some('"') {
-                // String key
-                let s = self.parse_string_literal()?;
-                (ObjectKey::Literal(s), None)
-            } else if self.mode == ParserMode::Jq && self.peek() == Some('$') {
-                let sigil_offset = self.pos;
-                let (name, line, has_colon) = self.parse_dollar_name()?;
-                if has_colon {
-                    if name == "__loc__" {
-                        return Err(ParseError::new(
-                            "may need parentheses around object key expression",
-                            self.pos,
-                        ));
+            // #2783: yq's `{...}` is `{ expr : expr , ... }` -- both sides of a
+            // pair are ordinary expressions and a bare identifier is not even
+            // a token (`yq '{b: 2}'` is a lexer error). `--jq-extensions` keeps
+            // the identifier key and `{x}` shorthand, so an identifier start
+            // is the only thing that still takes the jq-grammar path there.
+            let entry = if self.mode == ParserMode::Yq
+                && !(self.jq_extensions && self.peek().is_some_and(is_ident_start_char))
+            {
+                self.parse_yq_object_entry()?
+            } else {
+                let (key, dollar_shorthand_value) = if self.peek() == Some('(') {
+                    // Dynamic key: (expr)
+                    self.next();
+                    let key_expr = self.parse_expr()?;
+                    self.expect(')')?;
+                    (ObjectKey::Expr(Box::new(key_expr)), None)
+                } else if self.peek() == Some('"') {
+                    // String key
+                    let s = self.parse_string_literal()?;
+                    (ObjectKey::Literal(s), None)
+                } else if self.mode == ParserMode::Jq && self.peek() == Some('$') {
+                    let sigil_offset = self.pos;
+                    let (name, line, has_colon) = self.parse_dollar_name()?;
+                    if has_colon {
+                        if name == "__loc__" {
+                            return Err(ParseError::new(
+                                "may need parentheses around object key expression",
+                                self.pos,
+                            ));
+                        }
+                        let key_value = dollar_var_expr(name, line);
+                        if let Expr::Var(name) = &key_value {
+                            self.var_sites.push(VarSite {
+                                name: name.clone(),
+                                offset: sigil_offset,
+                            });
+                        }
+                        (ObjectKey::Expr(Box::new(key_value)), None)
+                    } else {
+                        let value = dollar_var_expr(name.clone(), line);
+                        if let Expr::Var(name) = &value {
+                            self.var_sites.push(VarSite {
+                                name: name.clone(),
+                                offset: sigil_offset,
+                            });
+                        }
+                        (ObjectKey::Literal(name), Some(value))
                     }
-                    let key_value = dollar_var_expr(name, line);
-                    if let Expr::Var(name) = &key_value {
-                        self.var_sites.push(VarSite {
-                            name: name.clone(),
-                            offset: sigil_offset,
-                        });
-                    }
-                    (ObjectKey::Expr(Box::new(key_value)), None)
                 } else {
-                    let value = dollar_var_expr(name.clone(), line);
-                    if let Expr::Var(name) = &value {
-                        self.var_sites.push(VarSite {
-                            name: name.clone(),
-                            offset: sigil_offset,
-                        });
-                    }
-                    (ObjectKey::Literal(name), Some(value))
-                }
-            } else {
-                // Identifier key
-                let name = self.parse_ident()?;
-                (ObjectKey::Literal(name), None)
-            };
+                    // Identifier key
+                    let name = self.parse_ident()?;
+                    (ObjectKey::Literal(name), None)
+                };
 
-            self.skip_ws();
-
-            // Check for shorthand: `{foo}` means `{foo: .foo}`
-            let value = if let Some(v) = dollar_shorthand_value {
-                v
-            } else if self.peek() == Some(':') {
-                self.next();
                 self.skip_ws();
-                self.parse_object_value()?
-            } else {
-                // Shorthand: key must be literal identifier
-                match &key {
-                    ObjectKey::Literal(name) => Expr::Field(name.clone()),
-                    ObjectKey::Expr(_) => {
-                        return Err(ParseError::new(
-                            "dynamic key requires explicit value",
-                            self.pos,
-                        ));
+
+                // Check for shorthand: `{foo}` means `{foo: .foo}`
+                let value = if let Some(v) = dollar_shorthand_value {
+                    v
+                } else if self.peek() == Some(':') {
+                    self.next();
+                    self.skip_ws();
+                    self.parse_object_value()?
+                } else {
+                    // Shorthand: key must be literal identifier
+                    match &key {
+                        ObjectKey::Literal(name) => Expr::Field(name.clone()),
+                        ObjectKey::Expr(_) | ObjectKey::Bare => {
+                            return Err(ParseError::new(
+                                "dynamic key requires explicit value",
+                                self.pos,
+                            ));
+                        }
                     }
-                }
+                };
+
+                ObjectEntry { key, value }
             };
-
-            entries.push(ObjectEntry { key, value });
-
+            entries.push(entry);
             self.skip_ws();
             match self.peek() {
                 Some(',') => {
@@ -2415,6 +2426,32 @@ impl<'a> Parser<'a> {
         }
 
         Ok(Expr::Object(entries))
+    }
+
+    /// One entry of a yq-mode `{...}` (#2783): `key: value`, or a bare expression.
+    ///
+    /// yq parses the key as a full expression (`{.a: 5}`, `{1: 2}`,
+    /// `{"a" | "b": 1}`, `"k" as $a | {$a: 3}` all parse), and `:` is just the
+    /// binary operator that pairs it with the value. A string literal with no
+    /// interpolation is folded back to [`ObjectKey::Literal`] so the common
+    /// `{"a": 1}` keeps the shape the evaluators' fast path expects.
+    fn parse_yq_object_entry(&mut self) -> Result<ObjectEntry, ParseError> {
+        let first = self.parse_pipe_no_comma_with_booleans()?;
+        self.skip_ws();
+        if self.peek() != Some(':') {
+            return Ok(ObjectEntry {
+                key: ObjectKey::Bare,
+                value: first,
+            });
+        }
+        self.next();
+        self.skip_ws();
+        let value = self.parse_object_value()?;
+        let key = match first {
+            Expr::Literal(Literal::String(s)) => ObjectKey::Literal(s),
+            other => ObjectKey::Expr(Box::new(other)),
+        };
+        Ok(ObjectEntry { key, value })
     }
 
     /// The value of an object-construction entry.

@@ -17282,6 +17282,9 @@ fn each_object_entries_generic<S: EvalSemantics, V: DocumentValue>(
     };
 
     match &entry.key {
+        // `object_construction_sink_generic` hands a construction holding a bare
+        // entry to `object_construction_generic`, which collects it.
+        ObjectKey::Bare => unreachable!("a bare entry is collected, not streamed"), // patchcov: coverage tolerate-line reason="unreachable: object_construction_sink_generic routes any construction with a bare entry through object_construction_generic first (#2783)"
         ObjectKey::Literal(name) => each_object_value_generic::<S, V>(
             ObjectKeySlot::Literal(name.clone()),
             &entry.value,
@@ -26486,6 +26489,9 @@ fn object_construction_generic<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
+    if super::eval::yq_collects_bare::<S>(entries) {
+        return collect_object_generic::<S, V>(entries, &value, optional, cursor);
+    }
     if let Some(object) = lazy_object_generic::<S, V>(entries, &value, optional, cursor) {
         return object;
     }
@@ -26521,6 +26527,10 @@ fn object_construction_sink_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
+    if super::eval::yq_collects_bare::<S>(entries) {
+        let collected = collect_object_generic::<S, V>(entries, &value, optional, cursor);
+        return drain_result_generic::<V>(collected, sink);
+    }
     if let Some(object) = lazy_object_generic::<S, V>(entries, &value, optional, cursor) {
         return drain_result_generic::<V>(object, sink);
     }
@@ -26528,11 +26538,61 @@ fn object_construction_sink_generic<S: EvalSemantics, V: DocumentValue>(
     each_object_entries_generic::<S, V>(entries, value, optional, cursor, &mut acc, sink)
 }
 
+/// The generic twin of `eval::eval_object_collect`: object construction holding
+/// a bare entry, as yq's `COLLECT_OBJECT` (#2783). Every entry is evaluated with
+/// `cursor` before any is combined, so an escape aborts the whole construction.
+fn collect_object_generic<S: EvalSemantics, V: DocumentValue>(
+    entries: &[ObjectEntry],
+    value: &V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+) -> GenericResult<V> {
+    use super::collect_object::UnionEntry;
+
+    let mut union = vec_with_capacity(entries.len());
+    for entry in entries {
+        if matches!(entry.key, ObjectKey::Bare) {
+            let mut nodes = Vec::new();
+            let trailing = push_generic_owned_values::<_, S>(
+                eval_single::<S, V>(&entry.value, value.clone(), optional, cursor),
+                &mut nodes,
+            );
+            if let Some(control) = trailing {
+                return partial_generic(Vec::new(), control);
+            }
+            union.push(UnionEntry::Bare(nodes));
+            continue;
+        }
+        let mut maps = Vec::new();
+        let mut acc: Vec<(String, OwnedValue)> = Vec::new();
+        match build_object_entries_generic::<S, V>(
+            core::slice::from_ref(entry),
+            value,
+            optional,
+            cursor,
+            true,
+            &mut acc,
+            &mut maps,
+        ) {
+            Ok(()) => {}
+            Err(ObjectEscapeGeneric::Suppressed) => return GenericResult::None,
+            Err(ObjectEscapeGeneric::Control(control)) => {
+                return partial_generic(Vec::new(), control);
+            }
+        }
+        union.push(UnionEntry::Pair(maps));
+    }
+    match super::collect_object::collect_object::<S>(union) {
+        Ok(objects) => owned_vec_to_generic_result(objects),
+        Err(e) => partial_generic(Vec::new(), Control::Error(e)),
+    }
+}
+
 /// The member's key when it is a literal (`{a: ..}`, not `{(expr): ..}`).
 fn literal_object_key(entry: &ObjectEntry) -> Option<&str> {
     match &entry.key {
         ObjectKey::Literal(name) => Some(name),
-        ObjectKey::Expr(_) => None,
+        ObjectKey::Expr(_) | ObjectKey::Bare => None,
     }
 }
 
@@ -26666,6 +26726,7 @@ fn build_object_entries_generic<S: EvalSemantics, V: DocumentValue>(
 
     let (keys, key_trailing) = match &entry.key {
         ObjectKey::Literal(name) => (vec![OwnedValue::String(name.clone().into())], None),
+        ObjectKey::Bare => unreachable!("a bare entry is collected, not built"), // patchcov: coverage tolerate-line reason="unreachable: object_construction_generic routes any construction with a bare entry to collect_object_generic first (#2783)"
         ObjectKey::Expr(key_expr) => {
             let mut keys = Vec::new();
             let trailing = push_generic_owned_values::<_, S>(
@@ -27774,7 +27835,7 @@ fn path_context_single_native(expr: &Expr) -> bool {
         Expr::Object(entries) => entries.iter().all(|entry| {
             path_context_single_native(&entry.value)
                 && match &entry.key {
-                    ObjectKey::Literal(_) => true,
+                    ObjectKey::Literal(_) | ObjectKey::Bare => true,
                     ObjectKey::Expr(key) => path_context_single_native(key),
                 }
         }),
@@ -28280,7 +28341,7 @@ fn path_context_resolvable(expr: &Expr, admits: ResolveAdmits) -> bool {
         Expr::Object(entries) => entries.iter().all(|entry| {
             sub(&entry.value)
                 && match &entry.key {
-                    ObjectKey::Literal(_) => true,
+                    ObjectKey::Literal(_) | ObjectKey::Bare => true,
                     ObjectKey::Expr(key) => sub(key),
                 }
         }),
@@ -29034,6 +29095,7 @@ fn path_context_resolve_constants<S: EvalSemantics>(
                     Ok(ObjectEntry {
                         key: match &entry.key {
                             ObjectKey::Literal(name) => ObjectKey::Literal(name.clone()),
+                            ObjectKey::Bare => ObjectKey::Bare,
                             ObjectKey::Expr(key) => ObjectKey::Expr(boxed(key)?),
                         },
                         value: *boxed(&entry.value)?,
@@ -35698,6 +35760,46 @@ mod tests {
         assert_eq!(depth_guard_panic_message(&other), None);
         let not_text: Box<dyn core::any::Any + Send> = Box::new(7_u32);
         assert_eq!(depth_guard_panic_message(&*not_text), None);
+    }
+
+    /// #2783: the generic evaluator collects a `{...}` holding a bare entry the way
+    /// yq's `COLLECT_OBJECT` does -- the twin of `eval`'s
+    /// `yq_bare_object_entries_collect_like_collect_object_2783`.
+    #[test]
+    fn yq_bare_object_entries_collect_like_collect_object_2783() {
+        use crate::jq::{parse_with_mode, ParserMode};
+
+        let json = br#"{"a":1,"l":[1,2]}"#;
+        let index = JsonIndex::build(json);
+        let run = |filter: &str| -> String {
+            let expr = parse_with_mode(filter, ParserMode::Yq).expect("filter parses");
+            match eval_using::<YqSemantics, _>(&expr, index.root(json).value()) {
+                GenericResult::Error(e) | GenericResult::Partial(_, Control::Error(e)) => {
+                    format!("error: {e}")
+                }
+                result => result
+                    .collect_owned::<YqSemantics>()
+                    .expect("decodes")
+                    .iter()
+                    .map(OwnedValue::to_json)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            }
+        };
+        for (filter, expected) in [
+            ("{.a: 5}", r#"{"1":5}"#),
+            (r#"{"x": .a, "y": (.l[])}"#, r#"{"x":1,"y":1} {"x":1,"y":2}"#),
+            ("1 as $a | {$a}", ""),
+            (r#"{"b", "a": 1}"#, ""),
+            ("{$undefined}", "{}"),
+            (r#"[[{"k":1}]] as $a | {$a}"#, r#"{"k":1}"#),
+            (r#"[["k",1]] as $a | {$a}"#, r#""k" 1"#),
+            (r#"{"z": (1,2), 5}"#, "error: CollectObject: mismatching node sizes; are you creating a map with mismatching key value pairs?"),
+            (r#"{"a": error("boom"), $a}"#, "error: boom"),
+            (r#"{"a": 1, "b": error("boom")}"#, "error: boom"),
+        ] {
+            assert_eq!(run(filter), expected, "{filter}");
+        }
     }
 
     /// #3639: a `label` met at a position with no prefetch hook (the absent-

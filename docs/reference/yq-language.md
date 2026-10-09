@@ -63,6 +63,24 @@ All features from the [jq Language Reference](jq-language.md) work with yq, incl
 - Format strings (`@json`, `@csv`, `@base64`, etc.)
 - Module system (`import`, `include`)
 
+### Object construction follows yq's grammar, not jq's (#2783)
+
+yq's `{...}` is `{ expr : expr , ... }`: a key is an ordinary expression, and an identifier
+by itself is not a token. `succinctly yq` matches:
+
+```bash
+printf 'a: 1\n' | succinctly yq '{"x": .a}'          # x: 1
+printf 'a: 1\n' | succinctly yq '{.a: 5}'            # 1: 5 (a key is an expression)
+printf 'a: 1\n' | succinctly yq '{b: 2}'             # error: bare identifier keys are not yq syntax
+printf 'a: 1\n' | succinctly yq --jq-extensions '{b: 2}'   # b: 2
+```
+
+The jq sugar (`{b: 2}`, `{x}` for `{x: .x}`) needs `--jq-extensions`. `{$a}` is never that
+sugar: it is a bare entry, which yq's `COLLECT_OBJECT` collects by whatever shape its value
+has (`1 as $a | {$a}` prints nothing). See the
+[limitations entry](../compliance/yq/limitations.md#object-construction-yqs--is-collect_object-not-jqs-sugar-2783)
+for the full table.
+
 ### Operator precedence differs on `|`, `,` and `and`/`or`
 
 The [jq operator-precedence table](jq-language.md#operator-precedence) applies in
@@ -208,7 +226,7 @@ These functions access YAML-specific metadata not available in JSON:
 
 ```bash
 # Get line numbers of all items
-succinctly yq '.items[] | {name: .name, line: line}' file.yaml
+succinctly yq '.items[] | {"name": .name, "line": line}' file.yaml
 
 # Find nodes with anchors
 succinctly yq '.. | select(anchor != "")' file.yaml
@@ -313,7 +331,7 @@ echo '[{name: "Alice", age: 30}, {name: "Bob", age: 25}]' | succinctly yq 'pivot
 # Output: {name: ["Alice", "Bob"], age: [30, 25]}
 
 # Load external file
-succinctly yq '. + {config: load("defaults.yaml")}' input.yaml
+succinctly yq '. + {"config": load("defaults.yaml")}' input.yaml
 
 # Get parent of matching node
 succinctly yq '.. | select(.name == "target") | parent' file.yaml
@@ -775,7 +793,7 @@ succinctly yq 'select(.metadata.labels.app == "web")' *.yaml
 succinctly yq '.spec.template.spec.containers[0].image = "nginx:1.25"' -i deployment.yaml
 
 # Get all resource requests
-succinctly yq '.spec.template.spec.containers[] | {name: .name, cpu: .resources.requests.cpu}' deployment.yaml
+succinctly yq '.spec.template.spec.containers[] | {"name": .name, "cpu": .resources.requests.cpu}' deployment.yaml
 ```
 
 ### GitHub Actions Workflow

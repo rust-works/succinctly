@@ -3064,7 +3064,7 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         Expr::Object(entries) => entries.iter().any(|entry| {
             needs_path_context(&entry.value)
                 || match &entry.key {
-                    ObjectKey::Literal(_) => false,
+                    ObjectKey::Literal(_) | ObjectKey::Bare => false,
                     ObjectKey::Expr(key) => needs_path_context(key),
                 }
         }),
@@ -3827,6 +3827,9 @@ pub(crate) fn yq_empty_context_reemit(expr: &Expr) -> Option<Expr> {
             for entry in entries {
                 let key = match &entry.key {
                     ObjectKey::Literal(s) => s.clone(),
+                    // A bare entry (#2783) is `COLLECT_OBJECT`'s, not a pair, so
+                    // there is no key to rebuild an object around.
+                    ObjectKey::Bare => return None,
                     // #2540 review: a dynamic key's own qualifying value
                     // still has to become a `String` the same way any other
                     // object-construction key does (#2508/#2521) -- a
@@ -4374,6 +4377,9 @@ fn build_object_entries<S: EvalSemantics>(
         // `stream_outputs_lossy` -- an undecodable computed key must raise, not
         // silently materialize as `""`.
         ObjectKey::Expr(key_expr) => eval_operand(key_expr),
+        // `eval_object_construction_with` diverts every construction holding a
+        // bare entry to `eval_object_collect` before this recursion starts.
+        ObjectKey::Bare => unreachable!("a bare entry is collected, not built"), // patchcov: coverage tolerate-line reason="unreachable: eval_object_construction_with routes any construction with a bare entry to eval_object_collect first (#2783)"
     };
     let sole = sole && keys.len() == 1;
 
@@ -4456,6 +4462,9 @@ fn eval_object_construction_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     eval_operand: &mut ObjectSlotEvaluator<'_>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    if yq_collects_bare::<S>(entries) {
+        return eval_object_collect::<W, S>(entries, eval_operand, optional);
+    }
     let mut objects = Vec::new();
     let mut acc = Vec::new();
 
@@ -4498,6 +4507,72 @@ fn eval_object_construction_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 
     owned_vec_to_result(objects)
+}
+
+/// Whether a `{...}` holds a bare, non-pair entry and so is yq's
+/// `COLLECT_OBJECT` rather than a cross product of `key: value` pairs (#2783).
+///
+/// Only yq's parser builds [`ObjectKey::Bare`], so the `TAG` test is a
+/// compile-time constant that lets jq mode skip the scan entirely.
+pub(crate) fn yq_collects_bare<S: EvalSemantics>(entries: &[super::expr::ObjectEntry]) -> bool {
+    S::TAG == EvalTag::Yq
+        && entries
+            .iter()
+            .any(|entry| matches!(entry.key, ObjectKey::Bare))
+}
+
+/// Object construction holding a bare entry, as yq's `COLLECT_OBJECT` (#2783).
+///
+/// Each pair entry is built on its own by [`build_object_entries`] -- one
+/// single-key map per key/value combination, which is what yq's `CREATE_MAP`
+/// emits -- and each bare entry contributes its raw outputs;
+/// [`collect_object`](super::collect_object::collect_object) then folds that
+/// union the way yq does. yq evaluates every entry before it combines any, so
+/// an escape inside one aborts the whole construction without emitting a
+/// prefix, unlike jq's streaming fan-out.
+fn eval_object_collect<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    entries: &[super::expr::ObjectEntry],
+    eval_operand: &mut ObjectSlotEvaluator<'_>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let mut union = vec_with_capacity(entries.len());
+    for entry in entries {
+        if matches!(entry.key, ObjectKey::Bare) {
+            let (nodes, trailing) = eval_operand(&entry.value);
+            if let Some(control) = trailing {
+                return object_escape_result(control.into());
+            }
+            union.push(super::collect_object::UnionEntry::Bare(nodes));
+            continue;
+        }
+        let mut maps = Vec::new();
+        let mut acc = Vec::new();
+        if let Err(escape) = build_object_entries::<S>(
+            core::slice::from_ref(entry),
+            eval_operand,
+            optional,
+            true,
+            &mut acc,
+            &mut maps,
+        ) {
+            return object_escape_result(escape);
+        }
+        union.push(super::collect_object::UnionEntry::Pair(maps));
+    }
+    match super::collect_object::collect_object::<S>(union) {
+        Ok(objects) => owned_vec_to_result(objects),
+        Err(e) => QueryResult::Error(e),
+    }
+}
+
+/// The result of an object construction that escaped before producing any output.
+fn object_escape_result<'a, W: Clone + AsRef<[u64]>>(escape: ObjectEscape) -> QueryResult<'a, W> {
+    match escape {
+        ObjectEscape::None => QueryResult::None,
+        ObjectEscape::Error(e) => QueryResult::Error(e),
+        ObjectEscape::Break(label) => QueryResult::Break(label),
+        ObjectEscape::Halt(code) => QueryResult::Halt(code),
+    }
 }
 
 /// Evaluate recursive descent.
@@ -6928,7 +7003,7 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let mut slots: Vec<String> = alloc::vec![String::new(); parts.len()];
             each_string_parts::<W, S>(parts, value, optional, &mut slots, sink)
         }
-        Expr::Object(entries) => {
+        Expr::Object(entries) if !yq_collects_bare::<S>(entries) => {
             let mut acc = Vec::new();
             each_object_entries::<W, S>(entries, value, optional, &mut acc, sink)
         }
@@ -8844,6 +8919,9 @@ fn each_object_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         ObjectKey::Literal(name) => {
             each_object_value::<W, S>(name.clone(), &entry.value, rest, value, optional, acc, sink)
         }
+        // The `Expr::Object` arm of `eval_each` leaves a construction holding a
+        // bare entry to the eager fallback, which collects it.
+        ObjectKey::Bare => unreachable!("a bare entry is collected, not streamed"), // patchcov: coverage tolerate-line reason="unreachable: the Expr::Object arm of eval_each guards on yq_collects_bare, so a bare entry never reaches the streaming fan-out (#2783)"
         ObjectKey::Expr(key_expr) => {
             let escape = StashedEscape::new();
             let flow = eval_each::<W, S>(key_expr, value.clone(), optional, &mut |item| {
@@ -11412,6 +11490,7 @@ fn closed_expr_shape(expr: &Expr) -> bool {
                 && match &entry.key {
                     ObjectKey::Literal(_) => true,
                     ObjectKey::Expr(key) => closed_expr_shape(key),
+                    ObjectKey::Bare => false,
                 }
         }),
         Expr::Pipe(stages) => stages.first().is_some_and(closed_expr_shape),
@@ -11577,6 +11656,7 @@ fn closed_expr_to_owned_node<S: EvalSemantics>(
             for entry in entries {
                 let key = match &entry.key {
                     ObjectKey::Literal(s) => s.clone(),
+                    ObjectKey::Bare => return None,
                     ObjectKey::Expr(e) => {
                         match closed_expr_to_owned_at_depth::<S>(e, depth + 1, escaped)? {
                             OwnedValue::String(s) => s,
@@ -13511,7 +13591,7 @@ fn signed_plain_number<S: EvalSemantics>(value: OwnedValue) -> OwnedValue {
 }
 
 /// Multiply two values.
-fn arith_mul<S: EvalSemantics>(
+pub(super) fn arith_mul<S: EvalSemantics>(
     left: OwnedValue,
     right: OwnedValue,
     flags: MergeFlags,
@@ -76074,6 +76154,9 @@ fn walk_object_entries<M: PatternMode, S: EvalSemantics>(
     };
     let flow = match &entry.key {
         ObjectKey::Literal(key) => per_key(PatternKey::Field(key), out),
+        // Only yq's `{...}` construction parses a bare entry (#2783); an object
+        // destructuring pattern never holds one.
+        ObjectKey::Bare => unreachable!("an object pattern has no bare entry"), // patchcov: coverage tolerate-line reason="unreachable: the pattern parser only builds Literal and Expr keys (#2783)"
         // The key expression runs against `input` -- the pattern's own
         // current node, whatever its kind: jq's `INDEX` needs the key value
         // before it can raise its own "Cannot index <type> with <type>"
@@ -78155,6 +78238,7 @@ pub(crate) fn install_def_calls(
                     let charged = sibling_frame_charge(frames, i as u32, in_recursive_body);
                     let key = match &entry.key {
                         ObjectKey::Literal(s) => ObjectKey::Literal(s.clone()),
+                        ObjectKey::Bare => ObjectKey::Bare,
                         ObjectKey::Expr(e) => ObjectKey::Expr(Box::new(install_def_calls(
                             e,
                             def,
@@ -135838,6 +135922,46 @@ mod touched_edge_cases_2999 {
     /// `OwnedValue`: building the document is one, and the registered route adds
     /// no second, where the unregistered `eval` over the same document adds one
     /// per bridged call.
+    /// #2783: the eager evaluator collects a `{...}` holding a bare entry the way
+    /// yq's `COLLECT_OBJECT` does. Every row was captured from yq v4.53.3 over
+    /// `{"a":1,"l":[1,2]}`.
+    #[test]
+    fn yq_bare_object_entries_collect_like_collect_object_2783() {
+        let json = br#"{"a":1,"l":[1,2]}"#;
+        let index = JsonIndex::build(json);
+        let run = |filter: &str, extensions: bool| {
+            let expr = parse_with_mode_and_extensions(filter, ParserMode::Yq, extensions)
+                .expect("filter parses");
+            match eval::<Vec<u64>, YqSemantics>(&expr, index.root(json)) {
+                QueryResult::Error(e) => format!("error: {}", e.to_string()),
+                result => result
+                    .collect_owned::<YqSemantics>()
+                    .iter()
+                    .map(OwnedValue::to_json)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            }
+        };
+        for (filter, expected) in [
+            ("{.a: 5}", r#"{"1":5}"#),
+            (r#"{"x": .a, "y": (.l[])}"#, r#"{"x":1,"y":1} {"x":1,"y":2}"#),
+            ("1 as $a | {$a}", ""),
+            (r#"{"b", "a": 1}"#, ""),
+            ("{$undefined}", "{}"),
+            (r#"[[{"k":1}]] as $a | {$a}"#, r#"{"k":1}"#),
+            (r#"[["k",1]] as $a | {$a}"#, r#""k" 1"#),
+            (r#"{"k":{"x":1}} as $a | {$a}"#, "1"),
+            (r#"{"z": (1,2), 5}"#, "error: CollectObject: mismatching node sizes; are you creating a map with mismatching key value pairs?"),
+            (r#"{"a": 1, "b"}"#, "error: CollectObject: mismatching node sizes; are you creating a map with mismatching key value pairs?"),
+            (r#"{"a": error("boom"), $a}"#, "error: boom"),
+        ] {
+            assert_eq!(run(filter, false), expected, "{filter}");
+        }
+        // `--jq-extensions` keeps the identifier key and the `{x}` shorthand.
+        assert_eq!(run("{a}", true), r#"{"a":1}"#);
+        assert_eq!(run("{k: .a}", true), r#"{"k":1}"#);
+    }
+
     #[cfg(feature = "regex")]
     #[test]
     fn registered_document_bridges_without_reindexing_3479() {
