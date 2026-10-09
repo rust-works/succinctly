@@ -3127,6 +3127,30 @@ pub enum Literal {
 }
 
 impl Expr {
+    /// `PATH` of a metadata-write target spelled `(PATH | key)`: the mapping-key node of the member
+    /// `PATH` names, which is where yq keeps the comments above and below an entry (#2796).
+    /// `None` for any other target.
+    #[must_use]
+    pub fn key_node_prefix(&self) -> Option<Self> {
+        let mut target = self;
+        while let Self::Paren(inner) = target {
+            target = inner;
+        }
+        let Self::Pipe(stages) = target else {
+            return None;
+        };
+        let (last, prefix) = stages.split_last()?;
+        if !matches!(last, Self::Builtin(Builtin::Key)) || prefix.is_empty() {
+            return None;
+        }
+        Some(match prefix {
+            [only] => only.clone(),
+            _ => Self::pipe(prefix.to_vec()),
+        })
+    }
+}
+
+impl Expr {
     /// Spell an arbitrary value in place as a passthrough snapshot with no
     /// bound node -- the one node that can hold a value no literal syntax
     /// spells (a `NumberLiteral` with its own text, a value above the

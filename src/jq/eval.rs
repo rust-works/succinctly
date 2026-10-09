@@ -32091,9 +32091,12 @@ fn eval_meta_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let identity = Expr::Identity;
             // `...` (#2796) walks the same value positions `..` does; its key nodes are the
             // metadata pass's concern, not the value tree's.
-            let target = match target {
-                Expr::RecursiveDescentWithKeys => &Expr::RecursiveDescent,
-                other => other,
+            // `(PATH | key)` names the key node of `PATH`'s member; the value tree pads `PATH`.
+            let key_prefix = target.key_node_prefix();
+            let target = match (target, &key_prefix) {
+                (Expr::RecursiveDescentWithKeys, _) => &Expr::RecursiveDescent,
+                (_, Some(prefix)) => prefix,
+                (other, None) => other,
             };
             eval_update::<W, S>(target, &identity, input, optional, true)
         }
