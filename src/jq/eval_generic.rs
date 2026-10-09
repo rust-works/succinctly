@@ -2539,6 +2539,11 @@ impl KeyMeta {
         matches!(self.style, "single" | "double")
     }
 
+    /// Whether the key was written behind an explicit `!!str` (#4088).
+    pub fn is_str_tagged(&self) -> bool {
+        self.tag.as_deref() == Some("!!str")
+    }
+
     /// This entry with its quoting stripped to [`KEY_STYLE_STRING`] (`-P`).
     ///
     /// `-P` also drops a core tag that only restates the key's type (`!!str k`

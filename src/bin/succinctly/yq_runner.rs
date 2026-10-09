@@ -4488,7 +4488,9 @@ fn strip_presentation_style_at_depth(
                     .iter()
                     .map(|(k, key_meta)| {
                         // A quoted key spelled as a YAML 1.1 bool keeps its quoting too.
-                        let kept = key_meta.is_quoted() && is_yaml_11_bool_word(k);
+                        // `!!str yes: v` keeps its tag the same way (#4088).
+                        let kept = (key_meta.is_quoted() || key_meta.is_str_tagged())
+                            && is_yaml_11_bool_word(k);
                         (
                             k.clone(),
                             if kept {
@@ -4962,9 +4964,10 @@ fn defers_to_own_block(value: &OwnedValue, comments: &CommentTree) -> bool {
 }
 
 /// `quoted_key` (a key as [`yaml_quote_key`] wrote it) behind mapping key
-/// `key`'s own `&name ` anchor declaration, if it declares one (#2598). The
-/// key-side twin of [`anchor_decl_prefix`], matching `write_yaml_field_key` in
-/// `light.rs`: `&k key: &v 1`. Allocates only for an anchored key.
+/// `key`'s own `&name ` anchor declaration and explicit tag, if it has them
+/// (#2598, #4088). The key-side twin of [`anchor_decl_prefix`], matching
+/// `write_yaml_field_key` in `light.rs`: `&k !Foo key: &v 1`. Allocates only for
+/// an anchored or tagged key.
 fn with_key_anchor(comments: &CommentTree, key: &str, quoted_key: String) -> String {
     match (comments.key_anchor(key), comments.key_tag(key)) {
         (Some(name), Some(tag)) => format!("&{name} {tag} {quoted_key}"),

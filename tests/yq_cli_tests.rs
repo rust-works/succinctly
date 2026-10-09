@@ -60101,6 +60101,14 @@ fn test_tags_on_flow_collections_and_mapping_keys_are_kept_4088() -> Result<()> 
             "k: v\n!Foo j: w\n!!binary b: x\nz: 1\n",
         ),
         ("a: v\n!Foo b: w", "del(.a)", &[], "!Foo b: w\n"),
+        (
+            "!!str yes: v\n!!str k: w",
+            ".x=1",
+            &["-P"],
+            "!!str yes: v\nk: w\nx: 1\n",
+        ),
+        ("!!str on: v\nj: 1", "del(.j)", &["-P"], "!!str on: v\n"),
+        ("!!str yes: v", ".x=1", &[], "!!str yes: v\nx: 1\n"),
     ];
     for &(doc, filter, args, expected) in rows {
         let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, args)?;
