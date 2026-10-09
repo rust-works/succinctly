@@ -5581,6 +5581,40 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         Ok(())
     }
 
+    /// The value of a `key: value` pair in flow context, with the `:` and the
+    /// whitespace after it already consumed: node properties (`&a`, `!tag`), then
+    /// an alias, a flow collection or a scalar.
+    ///
+    /// One definition for the flow mapping and both single-pair forms of a flow
+    /// sequence (`[k: v]`, `[? k : v]`). The pair forms were copies that opened a
+    /// BP node for the value and then called `parse_flow_sequence` /
+    /// `parse_flow_mapping`, which open one of their own: a sequence value came
+    /// back wrapped in a second sequence and a mapping value came back empty, and
+    /// an alias value read as a plain scalar (#4091). A flow collection carries
+    /// its own node and needs no wrapper (#332); only a scalar is wrapped.
+    fn parse_flow_pair_value(&mut self) -> Result<(), YamlError> {
+        // A property prefix on the value
+        self.parse_flow_node_properties()?;
+
+        // A standalone alias
+        if self.peek() == Some(b'*') {
+            return self.parse_alias();
+        }
+        match self.peek() {
+            Some(b'[') => self.parse_flow_sequence(),
+            Some(b'{') => self.parse_flow_mapping(),
+            _ => {
+                // Scalar value - wrap in BP
+                self.set_ib();
+                self.write_bp_open();
+                let end = self.parse_flow_scalar()?;
+                self.set_bp_text_end(end);
+                self.write_bp_close();
+                Ok(())
+            }
+        }
+    }
+
     /// Parse an explicit mapping entry in flow context: `? key : value`
     /// Creates a single-pair mapping as the sequence element.
     fn parse_explicit_flow_mapping_entry(&mut self) -> Result<(), YamlError> {
@@ -5609,22 +5643,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
             // Parse value (if present before , or ])
             if !matches!(self.peek(), Some(b',' | b']' | b'}') | None) {
-                self.set_ib();
-                self.write_bp_open();
-                match self.peek() {
-                    // Nested flow containers need no end of their own (#332)
-                    Some(b'[') => {
-                        self.parse_flow_sequence()?;
-                    }
-                    Some(b'{') => {
-                        self.parse_flow_mapping()?;
-                    }
-                    _ => {
-                        let end = self.parse_flow_scalar()?;
-                        self.set_bp_text_end(end);
-                    }
-                }
-                self.write_bp_close();
+                self.parse_flow_pair_value()?;
             } else {
                 // Empty value (null)
                 self.set_ib();
@@ -5682,22 +5701,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
         // Parse value (if present before , or ])
         if !matches!(self.peek(), Some(b',' | b']' | b'}') | None) {
-            self.set_ib();
-            self.write_bp_open();
-            match self.peek() {
-                // Nested flow containers need no end of their own (#332)
-                Some(b'[') => {
-                    self.parse_flow_sequence()?;
-                }
-                Some(b'{') => {
-                    self.parse_flow_mapping()?;
-                }
-                _ => {
-                    let val_end = self.parse_flow_scalar()?;
-                    self.set_bp_text_end(val_end);
-                }
-            }
-            self.write_bp_close();
+            self.parse_flow_pair_value()?;
         } else {
             // Empty value (null)
             self.set_ib();
@@ -6297,32 +6301,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.advance(); // Skip `:`
                 self.skip_flow_whitespace();
 
-                // Parse value - check for a property or alias first
-                // Check for a property prefix on the value
-                self.parse_flow_node_properties()?;
-
-                // Check for alias (standalone value)
-                if self.peek() == Some(b'*') {
-                    self.parse_alias()?;
-                } else {
-                    // Parse the actual value - for nested containers, they handle their own BP
-                    match self.peek() {
-                        Some(b'[') => {
-                            self.parse_flow_sequence()?;
-                        }
-                        Some(b'{') => {
-                            self.parse_flow_mapping()?;
-                        }
-                        _ => {
-                            // Scalar value - wrap in BP
-                            self.set_ib();
-                            self.write_bp_open();
-                            let end = self.parse_flow_scalar()?;
-                            self.set_bp_text_end(end);
-                            self.write_bp_close();
-                        }
-                    }
-                }
+                self.parse_flow_pair_value()?;
             } else if matches!(self.peek(), Some(b',' | b'}')) {
                 // Key without colon/value - emit empty value (implicit null)
                 self.set_ib();

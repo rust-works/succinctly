@@ -59893,6 +59893,149 @@ fn test_tag_before_a_flow_collection_inside_a_flow_sequence_4081() -> Result<()>
     Ok(())
 }
 
+/// #4091: the value of a pair entry in a flow sequence (`[k: v]`, `[? k : v]`) that
+/// is itself a flow collection, an alias or carries properties answers what yq
+/// answers. The pair forms opened a BP node for the value and then called
+/// `parse_flow_sequence`/`parse_flow_mapping`, which open one of their own: a
+/// sequence value came back wrapped in a second sequence (`[k: [c]]` was
+/// `[{"k":[["c"]]}]`), a mapping value came back empty (`[k: {x: 1}]` was
+/// `{"k":{}}`) and an alias value read as a plain scalar (`null`). Every
+/// expectation is yq v4.53.3's output; the second column is the default YAML
+/// output where it matches too.
+#[test]
+fn test_flow_collection_value_in_a_flow_sequence_pair_4091() -> Result<()> {
+    let rows: &[(&str, &str, Option<&str>)] = &[
+        (
+            "a: [k: [c]]",
+            "{\"a\":[{\"k\":[\"c\"]}]}\n",
+            Some("a: [{k: [c]}]\n"),
+        ),
+        (
+            "a: [k: [c, d]]",
+            "{\"a\":[{\"k\":[\"c\",\"d\"]}]}\n",
+            Some("a: [{k: [c, d]}]\n"),
+        ),
+        (
+            "a: [k: [[c]]]",
+            "{\"a\":[{\"k\":[[\"c\"]]}]}\n",
+            Some("a: [{k: [[c]]}]\n"),
+        ),
+        (
+            "a: [k: []]",
+            "{\"a\":[{\"k\":[]}]}\n",
+            Some("a: [{k: []}]\n"),
+        ),
+        (
+            "a: [k: {x: 1}]",
+            "{\"a\":[{\"k\":{\"x\":1}}]}\n",
+            Some("a: [{k: {x: 1}}]\n"),
+        ),
+        (
+            "a: [k: {x: [1]}]",
+            "{\"a\":[{\"k\":{\"x\":[1]}}]}\n",
+            Some("a: [{k: {x: [1]}}]\n"),
+        ),
+        (
+            "a: [k: {}]",
+            "{\"a\":[{\"k\":{}}]}\n",
+            Some("a: [{k: {}}]\n"),
+        ),
+        (
+            "a: [k: {x: {y: 2}}]",
+            "{\"a\":[{\"k\":{\"x\":{\"y\":2}}}]}\n",
+            Some("a: [{k: {x: {y: 2}}}]\n"),
+        ),
+        (
+            "a: [? k : [c]]",
+            "{\"a\":[{\"k\":[\"c\"]}]}\n",
+            Some("a: [{k: [c]}]\n"),
+        ),
+        (
+            "a: [? k : {x: 1}]",
+            "{\"a\":[{\"k\":{\"x\":1}}]}\n",
+            Some("a: [{k: {x: 1}}]\n"),
+        ),
+        (
+            "a: [z, ? k : [c, d], w]",
+            "{\"a\":[\"z\",{\"k\":[\"c\",\"d\"]},\"w\"]}\n",
+            Some("a: [z, {k: [c, d]}, w]\n"),
+        ),
+        ("a: [{a: 1}: {b: 2}]", "{\"a\":[{\"\":{\"b\":2}}]}\n", None),
+        ("a: [[a, b]: [c]]", "{\"a\":[{\"\":[\"c\"]}]}\n", None),
+        (
+            "a: [&x 1, k: *x]",
+            "{\"a\":[1,{\"k\":1}]}\n",
+            Some("a: [&x 1, {k: *x}]\n"),
+        ),
+        (
+            "a: [&x k: *x]",
+            "{\"a\":[{\"k\":\"k\"}]}\n",
+            Some("a: [{&x k: *x}]\n"),
+        ),
+        (
+            "a: [k: &y [c], j: *y]",
+            "{\"a\":[{\"k\":[\"c\"]},{\"j\":[\"c\"]}]}\n",
+            Some("a: [{k: &y [c]}, {j: *y}]\n"),
+        ),
+        (
+            "a: [k: !Foo [c]]",
+            "{\"a\":[{\"k\":[\"c\"]}]}\n",
+            Some("a: [{k: !Foo [c]}]\n"),
+        ),
+        (
+            "a: [k: !Foo {x: 1}]",
+            "{\"a\":[{\"k\":{\"x\":1}}]}\n",
+            Some("a: [{k: !Foo {x: 1}}]\n"),
+        ),
+        (
+            "a: {m: [k: [c]]}",
+            "{\"a\":{\"m\":[{\"k\":[\"c\"]}]}}\n",
+            Some("a: {m: [{k: [c]}]}\n"),
+        ),
+        (
+            "- [k: {x: 1}]\n- b",
+            "[[{\"k\":{\"x\":1}}],\"b\"]\n",
+            Some("- [{k: {x: 1}}]\n- b\n"),
+        ),
+        (
+            "a: [z, k: [c], w]",
+            "{\"a\":[\"z\",{\"k\":[\"c\"]},\"w\"]}\n",
+            Some("a: [z, {k: [c]}, w]\n"),
+        ),
+    ];
+    for &(doc, json, yaml) in rows {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(".", doc, &["-o=json", "-I0"])?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (json, 0),
+            "json of {doc:?}: stderr {stderr:?}"
+        );
+        if let Some(yaml) = yaml {
+            let (stdout, stderr, code) = run_yq_stdin_with_stderr(".", doc, &[])?;
+            assert_eq!(
+                (stdout.as_str(), code),
+                (yaml, 0),
+                "yaml of {doc:?}: stderr {stderr:?}"
+            );
+        }
+    }
+    // A value read back through navigation and a write sees the same shape.
+    for (doc, filter, expected) in [
+        ("a: [k: [c, d]]", ".a[0].k[1]", "d\n"),
+        ("a: [k: {x: 1}]", ".a[0].k.x", "1\n"),
+        ("a: [k: [c, d]]", ".a[0].k | length", "2\n"),
+        ("a: [z, k: {x: 1}]", ".a[1].k | keys | .[]", "x\n"),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &[])?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (expected, 0),
+            "`{filter}` on {doc:?}: stderr {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #4085 follow-up (#4087): a boolean or `null` index into an absent (`null`) container reads as
 /// `null` and a write builds a mapping keyed by the key's text -- `.a[true] = 1` on a document with
 /// no `a` is `a: {true: 1}` -- where it raised `Cannot index null with boolean`. A numeric key keeps
