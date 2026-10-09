@@ -2,6 +2,20 @@
 
 Tracks updates to the knowledge wiki pages in `docs/`.
 
+## 2026-10-10 — Canonical-echo wide-object key check: table-vs-sort crossover located, table stays (issue #4158)
+
+**Sources ingested:**
+- `KeyHashes::has_repeat` in `src/jq/document.rs` and `scan_canonical_object_wide` in
+  `src/json/light.rs` (#3333), against a sort-based variant of the same tier
+- Interleaved wall-clock A/B (2 runs, 21 reps, plus `--control`) on terminus (7950X) and
+  johns-mac-mini (M4 Pro) over arrays of objects of 17 to 128,000 keys and the `wide` files
+
+**Pages updated:**
+- [parsing/json.md](parsing/json.md) — the "Rejected: sort the collected hashes" paragraph of
+  "Wide objects: one exactly sized table (#3333)" now carries the located crossover (7950X: from
+  64,000 keys, where the table reaches the core's 1 MB L2; M4 Pro: none) and the decision not to
+  add a threshold
+
 ## 2026-10-09 — Key census: one scan per key, a bitset prefilter instead of the sort (issue #3343)
 
 **Sources ingested:**

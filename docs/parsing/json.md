@@ -489,7 +489,29 @@ Against `ce09e00da`, `-c .`, 21 interleaved reps, output identical on every row 
 | array of 100-key objects         | +5.0% / +4.3%        | +7.8% / +7.0%         |
 | array of 17-key objects          | −3.9% / −4.0%        | +0.8% / +0.2%         |
 
-The sort wins a further 7-10% on the 7950X at 136k keys and above (the crossover lies somewhere between 1,000 and 136k keys; it was not located), probably where the table outgrows that core's 1 MB L2. It loses 5-10% on every row above 17 keys on the M4 Pro and on the 100/1,000-key rows on both. A key-count threshold would be a per-architecture constant for a shape few documents have (an object of 100k keys or more), so the table ships; the sort is the measured alternative if a 7950X-class box ever has wide objects as its common case.
+**The crossover, located (#4158).** The sort wins on the 7950X from 64,000 keys per object and loses below it; on the M4 Pro it loses at every width above 17 keys. Same method, `jq -c .`, 21 interleaved reps per run, output identical on all 13 rows, cgu1 + fat LTO builds of one tree that differ only in how `scan_canonical_object_wide` settles its `Vec<u64>` (`has_repeat` against `fold_hash` + `sort_unstable` + an adjacent compare, same `SATURATING_KEYS` ceiling). Each row is an array of objects of the stated width, about 3 MB of input (the 17/100/1,000-key rows are #3333's 2 MB files, the `wide` rows its single objects). Sort against table, min / median wall, two runs each (negative: the sort is faster):
+
+| array of objects of        | table, `has_repeat`    | 7950X min (2 runs) | 7950X med (2 runs) | M4 Pro min (2 runs) | M4 Pro med (2 runs) |
+|----------------------------|------------------------|--------------------|--------------------|---------------------|---------------------|
+| 17 keys                    | 32 slots (256 B)       | +1.3 / +0.5        | +1.1 / +0.9        | −0.9 / +1.8         | +0.7 / +0.7         |
+| 100 keys                   | 256 slots (2 KB)       | +5.7 / +6.3        | +7.7 / +7.3        | +6.8 / +6.5         | +6.2 / +5.5         |
+| 1,000 keys                 | 2,048 slots (16 KB)    | +9.1 / +9.9        | +8.3 / +9.5        | +8.9 / +7.6         | +6.6 / +7.7         |
+| 2,000 keys                 | 4,096 slots (32 KB)    | +11.0 / +7.8       | +9.0 / +9.1        | +9.3 / +7.5         | +8.7 / +7.8         |
+| 4,000 keys                 | 8,192 slots (64 KB)    | +10.0 / +10.5      | +9.9 / +9.9        | +9.7 / +8.6         | +8.9 / +9.5         |
+| 8,000 keys                 | 16,384 slots (128 KB)  | +8.3 / +7.7        | +9.4 / +8.5        | +10.8 / +10.7       | +10.1 / +10.5       |
+| 16,000 keys                | 32,768 slots (256 KB)  | +7.7 / +7.1        | +6.4 / +8.5        | +11.5 / +8.2        | +9.9 / +10.0        |
+| 32,000 keys                | 65,536 slots (512 KB)  | +6.4 / +4.5        | +5.7 / +5.0        | +9.2 / +8.8         | +9.9 / +9.6         |
+| 64,000 keys                | 131,072 slots (1 MB)   | −4.3 / −2.3        | −2.3 / −2.6        | +6.6 / +8.5         | +7.3 / +8.2         |
+| 128,000 keys               | 262,144 slots (2 MB)   | −6.9 / −7.1        | −6.6 / −6.6        | +8.6 / +9.5         | +8.9 / +9.1         |
+| `wide` 2 MB (136k keys)    | 262,144 slots (2 MB)   | −7.6 / −4.7        | −6.1 / −5.4        | +5.9 / +7.6         | +5.7 / +7.6         |
+| `wide` 8 MB (560k keys)    | 1,048,576 slots (8 MB) | −8.0 / −8.2        | −7.9 / −8.6        | +7.7 / +8.4         | +8.6 / +9.6         |
+| `wide` 11.7 MB (700k keys) | 1,048,576 slots (8 MB) | −6.3 / −7.2        | −7.5 / −6.6        | +6.3 / +6.8         | +6.5 / +6.0         |
+
+`ab-cli.py --control` on the 7950X read −1.2%..+1.5% per row (min) and +0.31% median of medians; on the M4 Pro it read −1.4% on every row (−1.9%..−0.7%, 13 of 13 faster), a bias of the second copy on that box, so the M4 Pro's sort penalty is about 1.4 points larger than its column shows. Both boxes idle at the start (checked by hand; `--force` for the harness's own self-matching idle check).
+
+The 7950X flips between 32,000 keys (+4.5% to +6.4%) and 64,000 keys (−2.3% to −4.3%), and the flip is where the table reaches 131,072 slots, the core's whole 1 MB L2 (the 512 KB table below it still fits). That fits the earlier guess: below the L2 a probe is a cache hit and the table wins; above it most probes miss and the sort's sequential passes win. The mechanism is inferred from the flip point, not isolated by a counter run. The M4 Pro never flips because its L2 (16 MB shared by the cluster) holds even the 8 MB table of the 700k-key object; that is an inference from the cache sizes, not a measurement. The sort's margin at 64,000 keys (−2.3% to −4.3%) is at the edge of the layout band; it is a clear win only from 128,000 keys (−6.6% to −7.1%).
+
+**Decision: the table stays, no threshold.** The sort beats the table by more than the ~3% layout band only on an object of at least 128,000 keys, on the 7950X only, and loses 6% to 11% on the M4 Pro at every one of those widths. A gate would be a per-architecture constant for a shape few documents have (one object of 128k or more keys is a 2 MB object), and `target_arch` is the wrong key for it anyway: the variable that moved the result is the core's L2, which differs across x86 parts (256 KB, 1 MB and 2 MB L2 are all in circulation) and which std cannot report portably. Not measured: a Zen-class or Intel box with a different L2 (none other than the 7950X and the Apple boxes was reachable), which is what would move the 64,000-key flip point. If such a box has wide objects as its common case, `has_repeat` is the one place to add the sorted path and the sweep above is the method to price it.
 
 Not done: seeding the table from the BP span. `scan_canonical_object` runs on bytes and recurses, so only a root-level wide object could be seeded, and it would pay a `find_close` per object for an upper bound.
 
