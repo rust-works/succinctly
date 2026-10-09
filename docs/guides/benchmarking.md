@@ -1244,12 +1244,12 @@ CARGO_TARGET_DIR=target/sites \
 target/sites/release/examples/alloc_sites_3728 <file.json> '<query>' [period=37] [frames=3]
 ```
 
-On #4157's row, `[.[] | path(.[])?] | length` over 2,000 integers, it reports
-`allocs=14013` (`alloc_probe_3022`: 14,014) and puts 28.6% of the samples in
-`error::describe_with` and 14.3% each in `dump_truncated_at`, `eval_builtin`,
-`path_iterate_step_generic`, `scalar_to_owned` and `strip_insignificant_leading_zero_and_plus`
-— the message formatting an outer `?` then drops. Two properties of the tool matter when you read
-a result:
+On #4157's row, `[.[] | path(.[])?] | length` over 2,000 integers (`frames=1`), it reports
+`allocs=14013` (`alloc_probe_3022`: 14,014) and six sites: 28.6% in `error::describe_with` and
+14.3% each in `cannot_iterate_with`, `PreviewSink::new`, `PathTrail::root`,
+`OwnedValue::from_number_literal` and `strip_insignificant_leading_zero_and_plus` — the message
+formatting an outer `?` then drops, 7 allocations per member. Three properties of the tool matter
+when you read a result:
 
 - **Build it for attribution, not for timing.** The shipped profile (fat LTO, one codegen unit, no
   debug info) gives no `file:line`, and a callee inlined into its caller is not a frame, so its
@@ -1257,13 +1257,19 @@ a result:
   its counts can differ slightly from the shipped binary's, so take the headline number from
   `alloc_probe_3022` and use the sampler only for the *shares*.
 - **The re-entrancy guard is checked before the sampling counter advances.** Capturing a backtrace
-  allocates. If those calls advance the counter too, `allocs` is inflated — 198,308 against 14,013
-  on the row above — and the samples are biased towards whatever the counter lands on after each
-  capture, so the mix moves with the period (`eval_builtin` is 47.4% of the samples at period 37
-  and out of the top three at period 100, against 14.3% at every period with the guard first).
-  Two cheap checks that the sampler is sound: `allocs` equals
-  `alloc_probe_3022`'s count, and `period=1` returns one sample per allocation
-  (`samples == allocs`) with the same shares as `period=37`.
+  allocates. If those calls advance the counter too, `allocs` is inflated — 255,740 against 14,013
+  on the row above — and the samples lock onto the phase the counter lands on after each capture:
+  at period 37 two of the six sites take 99.9% of the samples (`describe_with` 66.6%,
+  `cannot_iterate_with` 33.3%), at period 101 four sites take about 25% each, and with the guard
+  first the shares stay within a point of 28.6/14.3% at every period. Two cheap checks that the sampler is sound: `allocs`
+  is within a call or two of `alloc_probe_3022`'s count (14,013 against 14,014 above; the probe also
+  renders the answer), and `period=1` returns one sample per allocation (`samples == allocs`) with
+  the same shares as `period=37`.
+- **Pick a prime period, and read two.** A pattern that repeats every `k` allocator calls is
+  sampled at a fraction of its sites when the period shares a factor with `k` (the row above
+  allocates seven times per element: `period=7` or `14` puts 100% of the samples on
+  `PreviewSink::new`). Agreement between two coprime periods is the evidence; one period agreeing
+  with itself is not.
 
 ### Building both halves on a remote box
 

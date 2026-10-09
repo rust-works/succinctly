@@ -24,9 +24,16 @@
 //!
 //! * The re-entrancy guard is tested *before* the sampling counter advances.
 //!   Capturing a backtrace allocates; if those calls advance the counter too,
-//!   `allocs` is inflated (198,308 against 14,013 on the `path(.[])?` row of
+//!   `allocs` is inflated (255,740 against 14,013 on the `path(.[])?` row of
 //!   #4157) and the samples are biased towards whatever the counter lands on
 //!   after each capture, so the mix changes with the period.
+//! * A sample every `period`th call aliases with an allocation pattern that
+//!   repeats every `k` calls when `period` and `k` share a factor: a loop that
+//!   allocates seven times per element, sampled with `period=7` or `14`, sees
+//!   one of its seven sites. Use a prime period and read two of them.
+//! * It is a single-threaded probe: the sample table is behind a mutex taken
+//!   inside the allocator, so another thread allocating in the window would
+//!   serialise behind symbol resolution.
 //! * `Backtrace::force_capture` is used, not `capture`: the latter reads
 //!   `RUST_BACKTRACE` and returns nothing when it is unset.
 
@@ -39,7 +46,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::backtrace::Backtrace;
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -51,8 +58,11 @@ static ARMED: AtomicBool = AtomicBool::new(false);
 /// Allocator calls seen inside the window, outside the sampler itself.
 static CALLS: AtomicUsize = AtomicUsize::new(0);
 static PERIOD: AtomicUsize = AtomicUsize::new(37);
-/// One rendered backtrace per sample. Pushed to under the guard below.
-static SAMPLES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static DEPTH: AtomicUsize = AtomicUsize::new(3);
+/// Samples per call site, interned as they are taken so that memory follows
+/// the number of distinct sites rather than the number of samples. Updated
+/// under the guard below.
+static SITES: Mutex<BTreeMap<String, usize>> = Mutex::new(BTreeMap::new());
 
 thread_local! {
     // Const-initialised and without a destructor, so touching it from inside
@@ -75,7 +85,8 @@ impl Sampling {
         let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
         if n % PERIOD.load(Ordering::Relaxed) == 0 {
             let rendered = Backtrace::force_capture().to_string();
-            SAMPLES.lock().unwrap().push(rendered);
+            let site = site(&rendered, DEPTH.load(Ordering::Relaxed));
+            *SITES.lock().unwrap().entry(site).or_default() += 1;
         }
         IN_SAMPLER.with(|g| g.set(false));
     }
@@ -105,8 +116,27 @@ unsafe impl GlobalAlloc for Sampling {
 #[global_allocator]
 static ALLOCATOR: Sampling = Sampling;
 
-/// `name` without its generic arguments (`f::<A, B<C>>::g` -> `f::g`).
+/// `name` without its generic arguments (`f::<A, B<C>>::g` -> `f::g`), and a
+/// trait-impl frame `<T as Trait>::m` as `T::m`.
 fn strip_generics(name: &str) -> String {
+    let mut name = name.to_string();
+    if name.starts_with('<') {
+        // `<T as Trait>::m`: find the `>` closing the leading `<`.
+        let mut nesting = 0usize;
+        let close = name.char_indices().find_map(|(i, c)| {
+            nesting = match c {
+                '<' => nesting + 1,
+                '>' => nesting - 1,
+                _ => nesting,
+            };
+            (nesting == 0).then_some(i)
+        });
+        if let Some(close) = close {
+            let inner = &name[1..close];
+            let ty = inner.split_once(" as ").map_or(inner, |(ty, _)| ty);
+            name = format!("{ty}{}", &name[close + 1..]);
+        }
+    }
     let mut out = String::with_capacity(name.len());
     let mut nesting = 0usize;
     for c in name.chars() {
@@ -130,7 +160,8 @@ fn site(rendered: &str, depth: usize) -> String {
         let Some((_, name)) = line.trim_start().split_once(": ") else {
             continue;
         };
-        if !name.starts_with("succinctly::") {
+        // An inherent frame, or a trait-impl frame `<succinctly::T as Trait>::m`.
+        if !(name.starts_with("succinctly::") || name.starts_with("<succinctly::")) {
             continue;
         }
         let at = lines
@@ -166,6 +197,7 @@ fn main() {
     let depth: usize = rest.get(1).map_or(3, |d| d.parse().expect("frames"));
     assert!(period > 0 && depth > 0);
     PERIOD.store(period, Ordering::SeqCst);
+    DEPTH.store(depth, Ordering::SeqCst);
 
     let bytes = std::fs::read(path).expect("read fixture");
     let expr = parse_with_mode_and_extensions(query, ParserMode::Jq, true).expect("parse query");
@@ -173,13 +205,29 @@ fn main() {
     let root = index.root(&bytes);
 
     let run = || {
-        let result = eval_with_cursor_using::<JqSemantics, _>(&expr, root);
-        // Rule 9 of the benchmarking guide: never record a row that is really
-        // an error path, however plausible its number looks.
-        if let GenericResult::Error(e) = &result {
-            panic!("query failed: {e:?}");
+        match eval_with_cursor_using::<JqSemantics, _>(&expr, root) {
+            GenericResult::One(_)
+            | GenericResult::OneCursor(_)
+            | GenericResult::Many(_)
+            | GenericResult::ManyCursor(_)
+            | GenericResult::ManyOwned(_)
+            | GenericResult::Owned(_)
+            | GenericResult::None => {}
+            // Rule 9 of the benchmarking guide: never record a row that is
+            // really an error path, however plausible its number looks. A lazy
+            // result is the same trap from the other side: it would leave the
+            // work the caller is owed outside the counted window.
+            GenericResult::Error(e) => panic!("query failed: {e:?}"),
+            GenericResult::LazyKeys { .. }
+            | GenericResult::LazyIndexRange(_)
+            | GenericResult::LazySeq(_)
+            | GenericResult::LazyObject(_) => {
+                panic!("query left a lazy result; this probe expects a settled one")
+            }
+            GenericResult::Break(l) => panic!("query broke out to label {l:?}"),
+            GenericResult::Halt(c) => panic!("query halted with {c}"),
+            GenericResult::Partial(..) => panic!("query returned a partial result"),
         }
-        std::hint::black_box(&result);
     };
     run();
     ARMED.store(true, Ordering::SeqCst);
@@ -187,17 +235,14 @@ fn main() {
     ARMED.store(false, Ordering::SeqCst);
 
     let calls = CALLS.load(Ordering::SeqCst);
-    let samples = std::mem::take(&mut *SAMPLES.lock().unwrap());
-    let mut by_site: HashMap<String, usize> = HashMap::new();
-    for rendered in &samples {
-        *by_site.entry(site(rendered, depth)).or_default() += 1;
-    }
-    let mut ranked: Vec<_> = by_site.into_iter().collect();
+    let sites = std::mem::take(&mut *SITES.lock().unwrap());
+    let samples: usize = sites.values().sum();
+    let mut ranked: Vec<_> = sites.into_iter().collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
-    println!("allocs={calls} samples={} period={period}", samples.len());
+    println!("allocs={calls} samples={samples} period={period}");
     for (site, n) in ranked.iter().take(12) {
-        let share = 100.0 * *n as f64 / samples.len().max(1) as f64;
+        let share = 100.0 * *n as f64 / samples.max(1) as f64;
         println!("{n:6} {share:5.1}%  {site}");
     }
 }
