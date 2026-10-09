@@ -62253,6 +62253,16 @@ fn test_try_body_raising_a_frozen_marker_seeds_the_handler_as_the_register_4127(
             "[\"s\",0]\n",
         ),
         (
+            "path(.s | try (. as $y | .[0:1] | error($y)) catch .[0])",
+            r#"{"s":[1]}"#,
+            "[\"s\",0]\n",
+        ),
+        (
+            "path(.s | try (. as $y | if (.[0] == 2 | not) then error($y) else . end) catch .[0])",
+            r#"{"s":[1]}"#,
+            "[\"s\",0]\n",
+        ),
+        (
             "path(.s | try (. as $y | .[5] | error($y)) catch .[0])",
             r#"{"s":[1]}"#,
             "[\"s\",0]\n",

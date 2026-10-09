@@ -52739,14 +52739,17 @@ fn marker_body_raises_register<S: EvalSemantics>(
 ) -> bool {
     S::TAG == EvalTag::Jq
         && (fold_body::depth() == 0 || fold_body::acc_is_register_here())
-        && (mentions_marker(body) || binds_a_variable(body))
+        && has_a_marker_or_a_bind(body)
         && raises_only_strings_or_register::<S>(body, reg, frame, &[], true)
 }
 
-/// Whether `body` has an `as` binding to freeze a variable at: the `try` body is classified
-/// before it is resolved, so a `. as $y | ...` inside it holds a `Var`, not yet a marker.
-fn binds_a_variable(body: &Expr) -> bool {
-    crate::jq::walk::any_subexpr(body, &mut |e| matches!(e, Expr::As { .. }))
+/// Whether `body` mentions a frozen `$x` marker or has an `as` binding to freeze a variable at:
+/// the `try` body is classified before it is resolved, so a `. as $y | ...` inside it holds a
+/// `Var`, not yet a marker. One walk, since this runs on every caught non-string error.
+fn has_a_marker_or_a_bind(body: &Expr) -> bool {
+    crate::jq::walk::any_subexpr(body, &mut |e| {
+        matches!(e, Expr::TrackedVar(_) | Expr::As { .. })
+    })
 }
 
 /// [`marker_body_raises_register`]'s grammar. `bound` names the variables an `as` inside the
