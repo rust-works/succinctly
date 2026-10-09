@@ -18235,9 +18235,6 @@ mod meta_assign_798 {
     fn stub_slots_parse_but_raise_not_yet_supported() {
         for (filter, slot) in [
             (".a tag = \"!!str\"", "tag"),
-            (".a head_comment = \"hi\"", "head_comment"),
-            (".a foot_comment = \"bye\"", "foot_comment"),
-            (".a comments = \"x\"", "comments"),
             (".. head_comment = \"x\"", "head_comment"),
             ("... comments = \"x\"", "comments"),
             ("... line_comment = \"x\"", "line_comment"),
@@ -18249,6 +18246,23 @@ mod meta_assign_798 {
                 "[{filter}] stderr: {err}"
             );
         }
+        // A container target is not placed yet: where yq prints its foot depends on what follows.
+        for (filter, slot) in [
+            (".a head_comment = \"hi\"", "head_comment"),
+            (".a foot_comment = \"bye\"", "foot_comment"),
+            (".a comments = \"x\"", "comments"),
+        ] {
+            let (_out, err, code) =
+                run_yq_stdin_with_stderr(filter, "a:\n  b: 1\nc: 2\n", &[]).unwrap();
+            assert_eq!(code, 1, "[{filter}] stderr: {err}");
+            assert!(
+                err.contains(&format!("{slot} = ... is not yet supported")),
+                "[{filter}] stderr: {err}"
+            );
+        }
+        // A scalar mapping value takes one, where go-yaml's emitter flushes it (#2796).
+        let (out, code) = run_yq_stdin(".a foot_comment = \"bye\"", "a: 1\nb: 2\n", &[]).unwrap();
+        assert_eq!((out.as_str(), code), ("a: 1\n# bye\n\nb: 2\n", 0));
     }
 
     /// The clearing form of the comment slots writes (#2796), and `...` (recursive descent that
