@@ -18238,6 +18238,7 @@ mod meta_assign_798 {
             (".a head_comment = \"hi\"", "head_comment"),
             (".a foot_comment = \"bye\"", "foot_comment"),
             (".a comments = \"x\"", "comments"),
+            (".. head_comment = \"x\"", "head_comment"),
             ("... comments = \"x\"", "comments"),
             ("... line_comment = \"x\"", "line_comment"),
         ] {

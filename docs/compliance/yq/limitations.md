@@ -4288,8 +4288,8 @@ pinned by a `meta_assign_*_798` golden.
 What is refused explicitly (an error, never a silent no-op — the outcome #798's triage
 ruled out), even though real yq supports every one of them:
 
-- **`tag =`, and `head_comment =`/`foot_comment =`/`comments =` with a non-empty text**
-  raise `<slot> = ... is not yet supported`. Real yq's `.a tag = "!!str"` coerces the
+- **`tag =`, and `head_comment =`/`foot_comment =`/`comments =` with a non-empty text on
+  anything but the document root** raise `<slot> = ... is not yet supported`. Real yq's `.a tag = "!!str"` coerces the
   value's type, `.a head_comment = "hi"`/`.a foot_comment = "bye"` insert standalone comment
   lines, and `.a comments = "x"` sets head, line and foot together. Setting a text has no
   write mechanism here yet: `NodeMeta` (`src/jq/eval_generic.rs`) keeps a node's tag only as
@@ -4298,6 +4298,18 @@ ruled out), even though real yq supports every one of them:
   its line, before the next key's own head, which then replaces it; a container's foot lands
   after the next entry's first line), which the emitters here do not model. See the
   identity-round-trip entry below.
+- **The document root takes a text** ([#2796](https://github.com/rust-works/succinctly/issues/2796),
+  part 2): `. head_comment = "x"`, `. foot_comment = "x"` and `. comments = "x"` (and `|=`)
+  replace the root's own standalone lines, a multi-line text becoming one `# ` line each, and
+  `comments` also sets the line comment a flow or empty container root prints (`# x\n{a: 1} #
+  x\n# x`). A block root keeps the lines that belong to its entries: a trailing comment after
+  a bare last entry is that entry's and stays (`a: 1\n# oldfoot` + `. foot_comment = "x"`
+  prints both), while one after a last entry that carries a line comment is the root's own
+  and is replaced, exactly as yq's parser attaches them. A scalar root takes none of it (`42`
+  stays `42`). Only a write whose every candidate is the root: `.. head_comment = "x"` visits
+  every node and still raises. Checked by 11 `meta_assign_root_*_2796` goldens, the
+  document-shape sweep (flow, empty, scalar and multi-document roots) and a differential fuzz
+  of ~2,800 root writes over random commented documents, none differing.
 - **The clearing forms are written** ([#2796](https://github.com/rust-works/succinctly/issues/2796),
   part 1): `head_comment = ""`, `foot_comment = ""`, `comments = ""` and `line_comment = ""`,
   `=` or `|=`, on any target, and `...` (yq's recursive descent that also visits mapping
