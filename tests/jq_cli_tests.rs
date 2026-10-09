@@ -65448,6 +65448,15 @@ fn test_fold_steps_from_known_untracked_register_4049() -> Result<()> {
             r#"Invalid path expression near attempt to access element "a" of null"#,
             5,
         ),
+        // Recorded residual (safe direction): jq answers `["a"]`; an `UPDATE` that navigates the
+        // accumulator is not followed on an untracked entry.
+        (
+            r#"{"a":null}"#,
+            r"path(.a | 5 | reduce null as {a:$q} (null; .b))",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of null"#,
+            5,
+        ),
         // Recorded residual (safe direction): jq answers `{}`; the `foreach` states no register
         // at its emissions, so the `and` result is not recognised as the register.
         (

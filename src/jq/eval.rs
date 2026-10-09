@@ -46071,8 +46071,9 @@ struct FoldRegister {
 impl FoldRegister {
     /// jq's register *value* when it is known but is not the fold's own tracked
     /// accumulator (#3999): an untrackable register whose enclosing stage still holds it.
-    /// It sits at the fold's root -- an untracked branch does not advance the stage's
-    /// `prefix` -- so a pattern walk steps from it ([`fold_pattern_seed`], #4049), and a
+    /// It sits at the fold's root, which is relative to the stage's `prefix` -- an untracked
+    /// branch does not advance the `prefix`, and the `prefix` is where the register is -- so
+    /// a pattern walk steps from it ([`fold_pattern_seed`], #4049), and a
     /// source element that is not equal to it is provably not its node, which is what
     /// [`fold_walk_refusal_is_guess`] asks.
     fn live_register(&self) -> Option<&OwnedValue> {
@@ -47910,7 +47911,10 @@ struct PatternRegister {
 ///   carried by the stage ([`FoldRegister::live_register`], #4049): any other
 ///   untrackable one holds a placeholder (the ambient value of an untracked stage,
 ///   or the `null` `FoldRegister::advance` leaves), which no step may compare against.
-fn fold_pattern_seed(elem: &FoldSourceValue, reg: &FoldRegister) -> PatternRegister {
+fn fold_pattern_seed<S: EvalSemantics>(
+    elem: &FoldSourceValue,
+    reg: &FoldRegister,
+) -> PatternRegister {
     match (&elem.register_path, &elem.moved) {
         (Some(path), _) => PatternRegister {
             path: Rc::clone(path),
@@ -47938,24 +47942,28 @@ fn fold_pattern_seed(elem: &FoldSourceValue, reg: &FoldRegister) -> PatternRegis
         // as `resolve_as_pattern` seeds the same case (#3120). Reading it as known
         // admitted a computed `null` through `PathPatternMode::step`'s `null`/`bool`
         // identity clause, where jq refuses at the first step.
-        (None, MovedRegister::Unmoved) => match reg.live_register() {
-            // #4049: an untrackable register whose value the frame still carries is where
-            // the stage that holds this fold left it, which is the fold's own root (an
-            // untracked branch does not advance `prefix`), so the walk can step from it and
-            // `PathPatternMode::step`'s identity clause decides, as jq's `path_intact` does.
-            Some(live) => PatternRegister {
-                path: Rc::clone(&reg.path),
-                value: live.clone(),
-                is_input: false,
-                known: true,
-            },
-            None => PatternRegister {
-                path: Rc::clone(&reg.path),
-                value: reg.value.clone(),
-                is_input: false,
-                known: reg.trackable,
-            },
-        },
+        (None, MovedRegister::Unmoved) => {
+            match reg.live_register().filter(|_| S::TAG == EvalTag::Jq) {
+                // #4049: an untrackable register whose value the frame still carries is where
+                // the stage that holds this fold left it. An untracked branch does not advance
+                // the stage's `prefix`, which is that register's position, so the fold's root
+                // (`reg.path`, relative to the prefix) names it, the walk can step from it, and
+                // `PathPatternMode::step`'s identity clause decides, as jq's `path_intact` does.
+                // Jq mode only, like every register admission here.
+                Some(live) => PatternRegister {
+                    path: Rc::clone(&reg.path),
+                    value: live.clone(),
+                    is_input: false,
+                    known: true,
+                },
+                None => PatternRegister {
+                    path: Rc::clone(&reg.path),
+                    value: reg.value.clone(),
+                    is_input: false,
+                    known: reg.trackable,
+                },
+            }
+        }
     }
 }
 
@@ -49367,7 +49375,7 @@ fn each_fold_bind<S: EvalSemantics>(
 ) -> Flow {
     match pattern {
         Pattern::Object(_) | Pattern::Array(_) => {
-            let seed = fold_pattern_seed(elem, reg);
+            let seed = fold_pattern_seed::<S>(elem, reg);
             each_pattern_walk_probed::<S>(
                 pattern,
                 &elem.value,
@@ -49535,9 +49543,9 @@ fn fold_walk_refusal_is_guess<S: EvalSemantics>(
     }
     // #3999: an untrackable register whose value the frame still carries (an `and`/`or`
     // right operand after a left operand that navigated, or any stage that left the
-    // register in place). An element equal to it might be its node by pointer, which the
-    // walk cannot tell (`null` and booleans it can, by kind, but a refusal later in the
-    // pattern is still read as the guess); any other element is provably not the register's node,
+    // register in place). An element equal to it, `null` and booleans included, might be its
+    // node (by pointer, or by kind for those), so the walk's refusal is a guess; any other
+    // element is provably not the register's node,
     // and jq's `path_intact` refuses it too, so the refusal is jq's own verdict (a `?//`
     // retries it). `equals_register`, not `==`: a shared node is the register by
     // pointer even where `==` is false (a `nan` inside it).
