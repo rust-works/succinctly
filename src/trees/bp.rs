@@ -1098,6 +1098,22 @@ fn build_l2_index_scalar(
     (l2_min_excess, l2_block_excess)
 }
 
+/// Excess change (opens minus closes) over bits `bit_idx..valid_bits` of `word`.
+///
+/// The excess `find_close_in_start_word` carries into `find_close_from` when
+/// the close is not in the open's own word.
+#[inline]
+fn word_tail_excess(word: u64, bit_idx: usize, valid_bits: usize) -> i32 {
+    let remaining_bits = valid_bits - bit_idx;
+    let remaining = word >> bit_idx;
+    let ones = if remaining_bits == 64 {
+        remaining.count_ones() as i32
+    } else {
+        (remaining & ((1u64 << remaining_bits) - 1)).count_ones() as i32
+    };
+    2 * ones - remaining_bits as i32
+}
+
 /// Fast byte-level scan to find where excess drops to 0.
 ///
 /// Given a word starting at `start_bit`, scans bytes using lookup tables
@@ -2514,6 +2530,7 @@ impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
     }
 
     /// Find matching close parenthesis.
+    #[inline]
     pub fn find_close(&self, p: usize) -> Option<usize> {
         if p >= self.len || self.is_close(p) {
             return None;
@@ -2527,20 +2544,50 @@ impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
         // `get`, not `is_close`: a truncated document can leave `len` past
         // the last stored word (`[` x 64 gives one word and `len` 128), and
         // the state machine answers `None` there rather than indexing.
+        //
+        // Everything past this probe is out of line (#3344), so this
+        // function stays small enough to inline into the sibling walks.
         let q = p + 1;
         if q < self.len {
-            if let Some(word) = self.words.as_ref().get(q / 64) {
+            if let Some(&word) = self.words.as_ref().get(q / 64) {
                 if (word >> (q % 64)) & 1 == 0 {
                     return Some(q);
                 }
+                return self.find_close_in_start_word(q, word);
             }
         }
-        self.find_close_from(p + 1, 1)
+        self.find_close_from(q, 1)
+    }
+
+    /// Continue `find_close` after the leaf probe missed: `word` is the word
+    /// holding `q` (the bit after the open being matched, itself an open).
+    ///
+    /// Scans that word with the byte tables and, when the close is not in it,
+    /// enters the state machine at the next word boundary with the excess the
+    /// word left behind -- the same step `State::ScanWord` takes, so the word
+    /// is never scanned twice. A block-sequence item in YAML (`1100`) and any
+    /// other node with a small subtree closes in this word (#3344).
+    #[inline(never)]
+    fn find_close_in_start_word(&self, q: usize, word: u64) -> Option<usize> {
+        let word_idx = q / 64;
+        let bit_idx = q % 64;
+        // `q < len` was checked by the caller.
+        let valid_bits = (self.len - word_idx * 64).min(64);
+
+        if let Some(match_bit) = find_close_in_word_fast(word, bit_idx, 1, valid_bits) {
+            return Some(word_idx * 64 + match_bit);
+        }
+
+        self.find_close_from(
+            (word_idx + 1) * 64,
+            1 + word_tail_excess(word, bit_idx, valid_bits),
+        )
     }
 
     /// Internal: find position where excess drops to 0.
     ///
     /// Uses byte-level lookup tables for fast scanning instead of bit-by-bit.
+    #[inline(never)]
     fn find_close_from(&self, start_pos: usize, initial_excess: i32) -> Option<usize> {
         if start_pos >= self.len {
             return None;
@@ -2581,27 +2628,18 @@ impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
                         self.len - word_idx * 64
                     };
 
-                    // Use fast byte-level scan
-                    if let Some(match_bit) =
-                        find_close_in_word_fast(word, bit_idx, excess, valid_bits)
-                    {
-                        return Some(word_idx * 64 + match_bit);
-                    }
-
-                    // No match in this word - compute excess change and move to next word
-                    // We need to compute excess change from bit_idx to end of valid bits
-                    let remaining_word = word >> bit_idx;
-                    let remaining_bits = valid_bits - bit_idx;
-                    let ones = if remaining_bits == 64 {
-                        remaining_word.count_ones() as i32
-                    } else {
-                        (remaining_word & ((1u64 << remaining_bits) - 1)).count_ones() as i32
-                    };
-                    excess += 2 * ones - remaining_bits as i32;
-
-                    // Move to start of next word
-                    pos = (word_idx + 1) * 64;
-                    state = State::FromL0;
+                    // `CheckL0` sent us here because the word's minimum excess
+                    // reaches the target, and the index masks the final partial
+                    // word (#188), so the scan always finds the match. Entries
+                    // are word-aligned (see `State::FromL0`), so there is no
+                    // partial first word whose leftover excess a miss would
+                    // have to carry forward.
+                    let found = find_close_in_word_fast(word, bit_idx, excess, valid_bits);
+                    debug_assert!(
+                        found.is_some(),
+                        "l0 index promised a close in word {word_idx}"
+                    );
+                    return found.map(|match_bit| word_idx * 64 + match_bit);
                 }
 
                 State::CheckL0 => {
@@ -2672,13 +2710,12 @@ impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
                 }
 
                 State::FromL0 => {
-                    if pos % 64 == 0 {
-                        state = State::FromL1;
-                    } else if pos < self.len {
-                        state = State::ScanWord;
-                    } else {
-                        return None;
-                    }
+                    // Both callers enter at a word boundary: `find_close` scans
+                    // the word holding the open's successor itself (#3344), and
+                    // a successor in a word `words` lacks is the boundary
+                    // after the last stored word.
+                    debug_assert_eq!(pos % 64, 0);
+                    state = State::FromL1;
                 }
 
                 State::FromL1 => {
@@ -4239,6 +4276,109 @@ mod tests {
         assert_eq!(find_close(&words, len, 2045), Some(2048));
         assert_eq!(bp.find_close(2046), Some(2047));
         assert_eq!(bp.find_close(0), Some(len - 1));
+    }
+
+    /// `find_close` against the linear scan for every open in `bits`.
+    fn assert_find_close_matches_linear(bits: &[bool], what: &str) {
+        let (words, len) = pack_bits(bits);
+        let bp = BalancedParens::new(words.clone(), len);
+        for p in (0..len).filter(|&p| bits[p]) {
+            assert_eq!(
+                bp.find_close(p),
+                find_close(&words, len, p),
+                "{what}: open at {p}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_find_close_same_word_non_leaf_matches_linear_3344() {
+        // A YAML block-sequence scalar item is `1100` ("(" "(" ")" ")"). Place
+        // it at every offset in a word, including the ones whose window
+        // straddles a word boundary, with padding that is all closes (the
+        // close past the item cannot be mistaken for the item's own) and all
+        // opens (the close is far away).
+        for offset in 0..200usize {
+            for filler in [false, true] {
+                let mut bits = vec![filler; offset];
+                bits.extend([true, true, false, false]);
+                bits.extend(vec![!filler; 70]);
+                assert_find_close_matches_linear(&bits, &format!("1100 at {offset}"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_find_close_every_short_sequence_matches_linear_3344() {
+        // Every bit string up to 14 bits, each followed by a closing run so
+        // the unmatched ones balance, and shifted across a word boundary.
+        for n in 1..=14usize {
+            for pattern in 0u32..(1 << n) {
+                for shift in [0usize, 59, 61, 62, 63] {
+                    let mut bits = vec![false; shift];
+                    bits.extend((0..n).map(|i| (pattern >> i) & 1 == 1));
+                    bits.extend(vec![false; n]);
+                    assert_find_close_matches_linear(&bits, &format!("{pattern:#b}/{n}@{shift}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_find_close_start_word_boundaries_3344() {
+        // Close in the last bit of the starting word, first bit of the next,
+        // and nowhere in the starting word (excess carried into the machine).
+        for gap in 60..70usize {
+            let mut bits = vec![true; gap];
+            bits.extend(vec![false; gap]);
+            assert_find_close_matches_linear(&bits, &format!("nest {gap}"));
+        }
+
+        // A close past `len` in the padding of the last word is not a match.
+        let bp = BalancedParens::new(vec![0b0111u64], 3);
+        assert_eq!(bp.find_close(0), None);
+        assert_eq!(bp.find_close(1), None);
+        let bp = BalancedParens::new(vec![0b0111u64], 4);
+        assert_eq!(bp.find_close(1), None);
+        assert_eq!(bp.find_close(2), Some(3));
+        let bp = BalancedParens::new(vec![0b0011u64], 4);
+        assert_eq!(bp.find_close(0), Some(3));
+
+        // Truncated: `len` past the stored words, non-leaf start.
+        let bp = BalancedParens::new(vec![u64::MAX], 128);
+        assert_eq!(bp.find_close(62), None);
+        assert_eq!(bp.find_close(10), None);
+    }
+
+    #[test]
+    fn test_find_close_start_word_excess_carries_across_blocks_3344() {
+        // A non-leaf open mid-word whose close is thousands of bits away:
+        // the start word's leftover excess is handed to the machine and must
+        // survive the L0, L1 and L2 skips. `depth` opens, then a mix of
+        // leaves, then `depth` closes; every open is checked against the
+        // linear scan, at several alignments of the first open.
+        for lead in [0usize, 1, 31, 62, 63] {
+            for depth in [3usize, 70, 600, 2100, 40_000] {
+                let mut bits = vec![false; lead];
+                bits.extend(vec![true; depth]);
+                for _ in 0..(depth / 2) {
+                    bits.extend([true, false]);
+                }
+                bits.extend(vec![false; depth]);
+                let (words, len) = pack_bits(&bits);
+                let bp = BalancedParens::new(words.clone(), len);
+                // Spot-check the opens near the start (their closes are the
+                // far ones) and a stride of the rest.
+                let opens: Vec<usize> = (0..len).filter(|&p| bits[p]).collect();
+                for &p in opens.iter().take(130).chain(opens.iter().step_by(97)) {
+                    assert_eq!(
+                        bp.find_close(p),
+                        find_close(&words, len, p),
+                        "lead {lead} depth {depth} open at {p}"
+                    );
+                }
+            }
+        }
     }
 
     fn pack_bits(bits: &[bool]) -> (Vec<u64>, usize) {

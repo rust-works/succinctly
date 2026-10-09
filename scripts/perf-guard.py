@@ -439,6 +439,16 @@ QUERY_THRESHOLDS = {
     # default (-2.1%): its re-render dominates. One-off: remove this entry
     # once the change is in `main` and the row reads ~0% again.
     "users_compact_identity": 10.0,
+    # `wide_identity`, `users_identity`, `users_compact_latefail` (#3344):
+    # `find_close` scans the starting word directly before falling back to the
+    # state machine, so the identity rows' container-close lookups got cheaper
+    # (ARM64-Linux -6.3% / -6.5% / -6.1%, x86_64 -6.7% / -6.7% / -6.4% Ir
+    # against the PR's own merge-base; -5.0% is the default threshold). 10.0 leaves headroom over
+    # the measured -6.7% without hiding a real regression. One-off: remove
+    # these entries once the change is in `main` and the rows read ~0% again.
+    "wide_identity": 10.0,
+    "users_identity": 10.0,
+    "users_compact_latefail": 10.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
