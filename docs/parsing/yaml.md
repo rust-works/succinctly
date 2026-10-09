@@ -5506,6 +5506,71 @@ shape and a merged mapping, in order and skipping.
 
 ---
 
+## O10: Skipping Fan-outs Over a Wide YAML Collection — Accepted ✅
+
+**Issue**: #3846 (the YAML half; the JSON half is PR #3852). #2784 made a fan-out that reads
+`key`/`path` at *every* member linear by resuming the slot scan from the last member found.
+A fan-out that **skips** members is not the remembered member's neighbour, so each position
+takes the longer route in `cursor_parent_and_slot`, and two costs there were still `O(members)`.
+
+### What was slow (attributed with `sample`, release, 128,000 members)
+
+- **A mapping**: `scan_for_slot` built `parent.value()` before it tried to resume. A YAML
+  mapping's `value()` is `YamlFields::from_mapping_cursor`, which walks every member for a `<<`
+  merge key. 100% of the samples; `[.[] | select(.a > 3) | key]` took 171.8 s at 128,000.
+- **A block sequence**: `remembered_direct_parent` recognises a direct child of a remembered
+  parent by depth, but an item sits under its `-` node, two levels below the sequence, so the
+  test failed and the parent came from `document_parent` (`BalancedParens::enclose`, 90% of the
+  samples).
+
+### The change
+
+- `resumed_slot` (`src/jq/eval_generic.rs`) walks the remembered scan with cursors alone; the
+  memo already says whether the parent is a mapping, so `parent.value()` is built only for the
+  full scan. A resume that finds nothing, or reaches an undecodable key, falls through to it.
+- `DocumentCursor::element_depth` (default `tree_depth`; JSON is unchanged). `YamlCursor`
+  answers the `-` node's depth for an item that is that node's first child. One bit test rules
+  out a node that is not a first child. Sound because a node inside the parent whose element
+  depth is the parent's plus one is either a BP child of the parent or the only child of a `-`
+  node that is; a miss only falls back to `document_parent`.
+
+### Measured (interleaved A/B, min of 7, output identical on every row)
+
+| row                                    | M4 Pro (before -> after)  | 7950X (before -> after)   |
+|----------------------------------------|---------------------------|---------------------------|
+| block-seq skip, 32,000 items           | 165 ms -> 68 ms           | 244 ms -> 90 ms           |
+| block-seq skip, 64,000                 | 523 ms -> 133 ms          | 792 ms -> 179 ms          |
+| block-seq skip, 128,000                | 1815 ms -> 262 ms         | 2807 ms -> 359 ms         |
+| mapping skip, 8,000 members            | 402 ms -> 16.5 ms         | 580 ms -> 20.7 ms         |
+| mapping skip, 16,000                   | 1572 ms -> 29.6 ms        | 2308 ms -> 40.7 ms        |
+| mapping skip, 32,000                   | 6347 ms -> 56.5 ms        | 9213 ms -> 80.1 ms        |
+| `{k: key, a}` over a sequence, 128,000 | 610 ms -> 122 ms          | 973 ms -> 185 ms          |
+
+Doubling the input now costs about 2x. Holdouts (neighbour fan-out, `path`, `to_entries`,
+a walk with no slot read, JSON array and object rows at 128,000): -1.7% to +0.9% on the M4 Pro,
+-1.2% to +1.2% on the 7950X, except `map tostring | [key]` on the 7950X, +3.7% in the full run and
++1.0%/+1.2% in two re-runs of 15 (not attributed; no instruction counter on that box, and the
+row does not reach the changed branch more than once per position).
+
+### Tests
+
+`element_depth_recognises_exactly_the_direct_children_3846` (`src/yaml/light.rs`) checks soundness
+(an accepted node's `document_parent` is the container) and completeness (every walked element
+passes) over a document holding every item shape.
+`test_yaml_skipping_fan_out_never_asks_a_remembered_parent_for_its_children_3846` counts
+`document_parent` takes and parent-value builds for block and flow sequences and a mapping;
+`test_resumed_yaml_scan_answers_what_the_full_scan_does_with_merge_keys_3846` compares the answers
+with `to_entries`; `test_yaml_key_and_path_of_the_members_a_fan_out_keeps_3846`
+(`tests/yq_cli_tests.rs`) checks irregular shapes end to end.
+
+### Files Modified
+
+- `src/jq/eval_generic.rs` — `resumed_slot`, `scan_for_slot`, `remembered_direct_parent`
+- `src/jq/document.rs` — `DocumentCursor::element_depth`
+- `src/yaml/light.rs` — `YamlCursor::element_depth`
+
+---
+
 ## See Also
 
 - [YamlIndex wiki page](yaml-index.md) — concept overview, dependencies, and academic references
