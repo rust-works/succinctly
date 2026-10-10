@@ -1991,7 +1991,7 @@ is the revert that established what the other one costs.
    yield, the loud direction. A `foreach` whose INIT navigated and then computed no longer runs its SOURCE as if the
    register were still at the entry. 20 contrived rows in the sampled sweeps that jq answers (a `?//` bind under `try`/`?`
    whose later alternative yields and whose result jq's check then passes) are refused, in the safe direction. Still
-   accepted where jq raises, identical on `main`: a `(.|.) as {...}` source (`del(foreach ((.|.) as {a:$a} | .) as
+   accepted where jq raises, identical on `main` ([#4320](https://github.com/rust-works/succinctly/issues/4320)): a `(.|.) as {...}` source (`del(foreach ((.|.) as {a:$a} | .) as
    $y (.; .; .))` deletes the document; routing it first needs `resolve_as_pattern` to read `(.|.)` as the register,
    since #4128's attempt regressed `del(try (... and true))`), and a destructure of a later bare alternative of a
    `?//` chain (`. as $x ?// $y | $y as {a:$a} | .`: `$y` is bound only when the body raises and jq retries;
@@ -2007,7 +2007,7 @@ is the revert that established what the other one costs.
    variable that may hold the register as the bound expression (`. as $x | $x as {a:$a}`, also from inside a `def`
    body, behind `first`/`last`/`limit`/`?`/a comma, or bound outside the source). `source_destructures_register` is one
    walk (`RegisterSpine::reach`) that says whether a node destructures the register, hands it on, or may move it, so
-   the pipe walk and the destructure test cannot drift apart. Still accepted besides the two shapes above: a `$x`
+   the pipe walk and the destructure test cannot drift apart. Still accepted besides the two shapes above (#4320): a `$x`
    returned through a call (`def f: $x; f as {a:$a}`). Pinned by
    `test_foreach_source_destructure_behind_a_chain_bind_if_or_def_refuses_4278`. Over the 29 register-sweep operands
    it adds (374,787 rows), 4,829 wrong accepts and 807 wrong answers go to 972 and 151 (the 972 are all the `(.|.)` and
