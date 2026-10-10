@@ -98582,6 +98582,14 @@ fn test_unreadable_value_collection_split_3266() -> Result<()> {
         (&["-c"], OBJ, ".[0] | [.[] | ., .] | .[0]", "1\n", 0),
         (&["-c"], OBJ, ".[0] | [.[] | ., .] | .[3]", "", 5),
         (&["-c"], OBJ, ".[0] | [.[] | [.]] | length", "", 5),
+        // #4166: and so does a computed branch beside a navigation one, and a
+        // `?` around a group of navigation branches.
+        (&["-c"], OBJ, ".[0] | [.[] | ., 1] | length", "4\n", 0),
+        (&["-c"], OBJ, ".[0] | [.[] | ., 1]", "", 5),
+        (&["-c"], OBJ, ".[0] | [.[] | 1, .] | .[0]", "1\n", 0),
+        (&["-c"], OBJ, ".[0] | [.[] | (., .)?] | length", "4\n", 0),
+        (&["-c"], OBJ, ".[0] | [.[] | (., .)?]", "", 5),
+        (&["-c"], OBJ, ".[0] | [.[] | (., .)?] | .[0]", "1\n", 0),
         (&["-c"], "[1.2.3]", ".[0] | try ([., 1]) catch \"c\"", "", 5),
         // #3922: a `?` around the array no longer decodes what it holds: a
         // decode failure is never caught, so the boundary has nothing to check
@@ -98692,7 +98700,7 @@ fn test_comma_stage_array_matches_jq_3922() -> Result<()> {
         // A prefix that is not a document node declines to the owned route.
         ("[.users[9] | ., .]", "[null,null]\n", 0),
         ("[.nope | .a, .b]", "[null,null]\n", 0),
-        // A computed branch is not this route's.
+        // A computed branch (this route's since #4166).
         (
             "[.users[] | ., 1]",
             "[{\"id\":1,\"n\":\"a\",\"t\":[1,2]},1,{\"id\":2,\"n\":\"b\",\"t\":[]},1,{\"id\":3,\"n\":\"c\",\"t\":[3]},1]\n",
@@ -98709,6 +98717,69 @@ fn test_comma_stage_array_matches_jq_3922() -> Result<()> {
             "[[{\"id\":1,\"n\":\"a\",\"t\":[1,2]},{\"id\":2,\"n\":\"b\",\"t\":[]},{\"id\":3,\"n\":\"c\",\"t\":[3]}],1]\n",
             0,
         ),
+    ];
+    for &(filter, want, want_code) in rows {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (want, want_code),
+            "{filter}: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #4166: the `,`-stage array route over the shapes #3922 left on the owned
+/// route -- a computed branch with nothing after it, a computed tail after
+/// navigation branches, and a `?` around a group of navigation branches --
+/// answers what jq answers on a readable document. Every expectation was
+/// captured from `/usr/bin/jq` 1.7.1 on this document (stdout, exit code).
+#[test]
+fn test_comma_stage_array_residuals_match_jq_4166() -> Result<()> {
+    let doc = r#"{"users":[{"id":1,"n":"a","t":[1,2]},{"id":2,"n":"b","t":[]},{"id":3,"n":"c","t":[3]}],"s":["x",1,[2],{"a":3}]}"#;
+    let rows: &[(&str, &str, i32)] = &[
+        // A computed branch with nothing after it runs per prefix output, in order.
+        ("[.users[] | ., 1]", "[{\"id\":1,\"n\":\"a\",\"t\":[1,2]},1,{\"id\":2,\"n\":\"b\",\"t\":[]},1,{\"id\":3,\"n\":\"c\",\"t\":[3]},1]\n", 0),
+        ("[.users[] | ., length]", "[{\"id\":1,\"n\":\"a\",\"t\":[1,2]},3,{\"id\":2,\"n\":\"b\",\"t\":[]},3,{\"id\":3,\"n\":\"c\",\"t\":[3]},3]\n", 0),
+        ("[.users[] | length, .id]", "[3,1,3,2,3,3]\n", 0),
+        ("[.users[] | .id, (.t | length)]", "[1,2,2,0,3,1]\n", 0),
+        ("[.users[] | .t, (.t[] | . * 10)]", "[[1,2],10,20,[],[3],30]\n", 0),
+        ("[.users[] | .id, empty]", "[1,2,3]\n", 0),
+        ("[.users[] | .n, (1, 2)]", "[\"a\",1,2,\"b\",1,2,\"c\",1,2]\n", 0),
+        ("[.users[] | ., length] | length", "6\n", 0),
+        ("[.users[] | ., length] | .[1]", "3\n", 0),
+        ("[.users[] | ., {id}] | map(type)", "[\"object\",\"object\",\"object\",\"object\",\"object\",\"object\"]\n", 0),
+        // A raise or a `break` in a computed branch is the array's.
+        ("[.users[] | .id, error(\"x\")]", "", 5),
+        ("[.users[] | error(\"x\"), .id]", "", 5),
+        ("try [.users[] | .id, error(\"x\")] catch .", "\"x\"\n", 0),
+        ("[.users[] | .id, error(\"x\")]?", "", 0),
+        ("label $f | [.users[] | .id, break $f]", "", 0),
+        ("[label $f | .users[] | .id, break $f]", "[1]\n", 0),
+        ("[.users[] | .id, (.n | tonumber)]", "", 5),
+        // A computed tail after navigation branches.
+        ("[.users[] | .id, .n | tostring]", "[\"1\",\"a\",\"2\",\"b\",\"3\",\"c\"]\n", 0),
+        ("[.users[] | .t[], .n | length]", "[1,2,1,1,3,1]\n", 0),
+        ("[.users[] | .n, .t | .[0]]", "", 5),
+        ("[.users[] | .id, .t | tojson]", "[\"1\",\"[1,2]\",\"2\",\"[]\",\"3\",\"[3]\"]\n", 0),
+        ("[.users[] | .t, .t | map(. + 1)]", "[[2,3],[2,3],[],[],[4],[4]]\n", 0),
+        ("[.users[] | .t, .t | select(length > 0)]", "[[1,2],[1,2],[3],[3]]\n", 0),
+        ("[.users[] | .id, .id | if . > 1 then error(\"big\") else . end]", "", 5),
+        // `(a, b)?`: per prefix output, the items before the group's first catchable
+        // raise, and nothing after it.
+        ("[.users[] | (.t[0], .n[0], .id)?]", "[1,null,3]\n", 0),
+        ("[.users[] | (.id, .n[0], .id)?]", "[1,2,3]\n", 0),
+        ("[.users[] | (.t[], .n.x)?]", "[1,2,3]\n", 0),
+        ("[.users[] | (., .)?] | length", "6\n", 0),
+        ("[.users[] | (.id, .n)?]", "[1,\"a\",2,\"b\",3,\"c\"]\n", 0),
+        ("[.users[] | (.t, .n)? | .[0]]", "", 5),
+        ("[.users[] | (.n, .t)? | .[0]]", "", 5),
+        ("[.s[] | (.[0], .a)?]", "[2]\n", 0),
+        ("[.s[] | (.a, .[0])?]", "[3]\n", 0),
+        ("[.s[] | (.[], .)?]", "[2,[2],3,{\"a\":3}]\n", 0),
+        ("[.s[] | (., .[])?]", "[\"x\",1,[2],2,{\"a\":3},3]\n", 0),
+        ("[.s[] | ((.[0], .a), .)?]", "[2]\n", 0),
+        ("[.s[] | (., .a)?] | length", "5\n", 0),
     ];
     for &(filter, want, want_code) in rows {
         let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;

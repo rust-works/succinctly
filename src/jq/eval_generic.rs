@@ -5335,10 +5335,20 @@ fn split_comma_head(body: &Expr) -> Option<(&[Expr], &[Expr])> {
     Some((branches, rest))
 }
 
+/// A pipe split at its first `,` stage by [`split_comma_stage`]: the stages
+/// before it, its branches, the stages after it, and whether a `?` covers the
+/// branches as one group (`P | (a, b)?`).
+struct CommaStage<'a> {
+    prefix: &'a [Expr],
+    branches: &'a [Expr],
+    tail: &'a [Expr],
+    guarded: bool,
+}
+
 /// `P | (a, b, ...) | rest`, split into the stages before the `,`, its
-/// branches and the stages after it, when the whole pipe is pure navigation
-/// (#3922); `None` for any other body, and for a `,` that heads the pipe
-/// ([`split_comma_head`]'s).
+/// branches and the stages after it, when the regrouping keeps the pipe's own
+/// order (#3922, #4166); `None` for any other body, and for a `,` that heads
+/// the pipe ([`split_comma_head`]'s).
 ///
 /// `[.[] | ., .]` is a pipe whose head is not a `,`, so [`split_comma_head`]
 /// declined it and the whole pipe ran down the owned route: its `,` stage
@@ -5350,28 +5360,118 @@ fn split_comma_head(body: &Expr) -> Option<(&[Expr], &[Expr])> {
 /// Only the first `,` stage is split: a pipe applies each stage to every output
 /// of the one before, so the outputs are those of `prefix`, and for each of them
 /// those of `branches` in order, then `tail` ([`comma_stage_array_generic`]).
-/// The regrouping is sound for the reason [`split_comma_head`]'s is: every
-/// stage is [`array_route_stage_is_pure_navigation`], so there is no side effect
-/// for the interleaving to reorder, and no stage the `Expr::Pipe` arm routes
-/// differently. That predicate is this route's own, not `path()`'s (#3501).
-fn split_comma_stage(body: &Expr) -> Option<(&[Expr], &[Expr], &[Expr])> {
+/// The `prefix` is always [`array_route_stage_is_pure_navigation`]: it is run
+/// to the end before any branch, which only something with no effect allows,
+/// and it rules out the heads the `Expr::Pipe` arm routes differently (an `as`
+/// head, a slice). That predicate is this route's own, not `path()`'s (#3501).
+///
+/// The rest is the owned route's order, which runs the whole `,` stage per
+/// prefix output (`fold_pipe_stages`' `ManyCursor` arm) and then the tail over
+/// its outputs, where this route runs the tail after each branch (#4166):
+///
+/// - **Navigation branches, any tail.** A branch has no effect, so the only
+///   thing the tail can move past is a branch's raise, and in both orders a
+///   tail raise on an earlier branch's output wins (the owned fold pipes a
+///   `Partial` prefix first). That is on a readable document: over an
+///   unreadable node the owned route decodes the `,` stage's outputs before
+///   any tail runs, and this route reads a node only where the tail reads it
+///   (#3856's rule, as for the `,` body itself).
+/// - **Computed branches, no tail** (`[.[] | ., length]`). Nothing runs between
+///   two branches in either order, so an effect (`input`, `debug`), a raise or
+///   a `break` lands where the owned route lands it.
+/// - **Computed branches and a tail: refused.** The tail would run between two
+///   computed branches, where the owned route runs it after both:
+///   `(debug, 1) | .x` would write `debug` a different number of times.
+///
+/// Whatever is not navigation must not read path context (`key`, `parent`,
+/// `path`): the `Expr::Pipe` arm bridges such a pipe whole. A navigation stage
+/// never does, so the pipe's remembered answer is asked only when some stage
+/// is not navigation.
+///
+/// `(a, b)?` is a `,` stage too, `guarded`: the `?` covers the group, so a
+/// catchable raise ends that output's group rather than the array
+/// ([`guarded_branch`]). Its branches and tail must both be navigation, so
+/// nothing in it has an effect a declined route would repeat.
+fn split_comma_stage(body: &Expr) -> Option<CommaStage<'_>> {
     let Expr::Pipe(stages) = unwrap_paren(body) else {
         return None;
     };
+    let nav = array_route_stage_is_pure_navigation;
     // The structural test first: most pipes have no `,` stage, and the
-    // predicate walks every stage.
-    let (at, branches) =
-        stages
-            .iter()
-            .enumerate()
-            .find_map(|(at, stage)| match unwrap_paren(stage) {
-                Expr::Comma(branches) => Some((at, branches)),
-                _ => None,
-            })?;
-    if at == 0 || !stages.iter().all(array_route_stage_is_pure_navigation) {
-        return None;
+    // predicates walk every stage. A candidate that is refused leaves a later
+    // `,` stage to try, whose prefix then holds the refused one.
+    for (at, stage) in stages.iter().enumerate().skip(1) {
+        let (branches, guarded) = match unwrap_paren(stage) {
+            Expr::Comma(branches) => (branches, false),
+            Expr::Optional(inner) => match unwrap_paren(inner) {
+                Expr::Comma(branches) => (branches, true),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        let (prefix, tail) = (&stages[..at], &stages[at + 1..]);
+        if !prefix.iter().all(nav) {
+            // Every later candidate's prefix holds this one.
+            return None;
+        }
+        let navigation_branches = branches.iter().all(nav);
+        let navigation_tail = tail.iter().all(nav);
+        let order_kept = if guarded {
+            navigation_branches && navigation_tail
+        } else {
+            navigation_branches || tail.is_empty()
+        };
+        // Only a stage that is not navigation can read path context, and the
+        // answer is remembered on the pipe (#3886).
+        if order_kept
+            && ((navigation_branches && navigation_tail)
+                || !crate::jq::eval::pipe_needs_path_context(stages))
+        {
+            return Some(CommaStage {
+                prefix,
+                branches: branches.as_slice(),
+                tail,
+                guarded,
+            });
+        }
     }
-    Some((&stages[..at], branches.as_slice(), &stages[at + 1..]))
+    None
+}
+
+/// One branch's result inside a `(a, b)?` group ([`split_comma_stage`]), under
+/// `try_single_generic`'s own rule with no handler: a catchable raise or a
+/// `break` keeps the items before it and ends the group (`true`), while a
+/// decode failure and a `halt` go on as they are. `None` for a result that
+/// boundary would have to force to learn whether it fails (a lazy one), which
+/// a navigation branch over a node does not answer; the route then declines.
+fn guarded_branch<V: DocumentValue>(result: GenericResult<V>) -> Option<(GenericResult<V>, bool)> {
+    Some(match result {
+        GenericResult::Error(e) if e.is_uncatchable_at_value_position() => {
+            (GenericResult::Error(e), false)
+        }
+        GenericResult::Error(_) | GenericResult::Break(_) => (GenericResult::None, true),
+        GenericResult::Partial(prefix, Control::Error(e))
+            if e.is_uncatchable_at_value_position() =>
+        {
+            (GenericResult::Partial(prefix, Control::Error(e)), false)
+        }
+        GenericResult::Partial(prefix, Control::Error(_) | Control::Break(_)) => {
+            (owned_vec_to_generic_result(prefix), true)
+        }
+        result @ (GenericResult::One(_)
+        | GenericResult::OneCursor(_)
+        | GenericResult::Many(_)
+        | GenericResult::ManyCursor(_)
+        | GenericResult::Owned(_)
+        | GenericResult::ManyOwned(_)
+        | GenericResult::None
+        | GenericResult::Halt(_)
+        | GenericResult::Partial(_, Control::Halt(_))) => (result, false),
+        GenericResult::LazyKeys { .. }
+        | GenericResult::LazyIndexRange(_)
+        | GenericResult::LazySeq(_)
+        | GenericResult::LazyObject(_) => return None,
+    })
 }
 
 /// A jq-mode array over `prefix | (branches) | tail` that keeps its document
@@ -5384,42 +5484,64 @@ fn split_comma_stage(body: &Expr) -> Option<(&[Expr], &[Expr], &[Expr])> {
 /// [`CommaArray`] the plain `,` body fills.
 ///
 /// `None` when the prefix does not answer cursors alone (an owned value, which
-/// is all a value carried without its node can answer; a raise; a lazy result):
-/// the caller then runs the body down the owned route,
-/// which also settles the order of a raise against the items before it. The
-/// prefix is pure navigation, so running it again there costs time, never an
-/// effect.
+/// is all a value carried without its node can answer; a raise; a lazy result),
+/// or a guarded branch answers a lazy result ([`guarded_branch`]): the caller
+/// then runs the body down the owned route, which also settles the order of a
+/// raise against the items before it. Nothing run before a decline has an
+/// effect (the prefix is pure navigation, and so is all of a guarded stage), so
+/// running it again there costs time, never an effect. That time is the
+/// prefix's, measured as noise next to the owned route's own work (#4166: an
+/// owned 14 MB prefix, 0.11-0.12 s against the comma twin's 0.11 s), so the
+/// prefix is not handed back to save it.
 fn comma_stage_array_generic<S: EvalSemantics, V: DocumentValue>(
-    (prefix, branches, tail): (&[Expr], &[Expr], &[Expr]),
+    stage: CommaStage<'_>,
     value: V,
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> Option<GenericResult<V>> {
+    let CommaStage {
+        prefix,
+        branches,
+        tail,
+        guarded,
+    } = stage;
     let head = eval_single::<S, _>(&prefix[0], value, optional, cursor);
     let head = fold_pipe_stages::<S, V>(head, &prefix[1..], optional);
     let mut array = CommaArray::new();
-    let mut run = |node: V::Cursor| -> Option<GenericResult<V>> {
+    // `Some(Some(escape))` is the array's failure, `Some(None)` a guarded
+    // branch's lazy result, which declines the route.
+    let mut run = |node: V::Cursor| -> Option<Option<GenericResult<V>>> {
         for expr in CommaBranches::new(branches) {
             let mut result = eval_single::<S, _>(expr, node.value(), optional, Some(node));
+            let mut ends_group = false;
+            if guarded {
+                let Some((kept, ends)) = guarded_branch(result) else {
+                    return Some(None);
+                };
+                (result, ends_group) = (kept, ends);
+            }
             if !tail.is_empty() {
                 result = fold_pipe_stages::<S, V>(result, tail, optional);
             }
             if let Some(control) = array.push::<S>(result) {
-                return Some(partial_generic(Vec::new(), control));
+                return Some(Some(partial_generic(Vec::new(), control)));
+            }
+            if ends_group {
+                break;
             }
         }
         None
     };
     match head {
         GenericResult::OneCursor(node) => {
-            if let Some(escape) = run(node) {
-                return Some(escape);
+            if let Some(stop) = run(node) {
+                return stop;
             }
         }
         GenericResult::ManyCursor(nodes) => {
             for node in nodes {
-                if let Some(escape) = run(node) {
-                    return Some(escape);
+                if let Some(stop) = run(node) {
+                    return stop;
                 }
             }
         }
@@ -47882,11 +48004,21 @@ mod tests {
             // A prefix that is not a document node declines to the owned route.
             ("[.missing | .a, .b]", "owned"),
             ("[.a.x | ., .]", "owned"),
-            // A computed stage is not pure navigation.
-            ("[.[] | ., length]", "owned"),
-            ("[.[] | length, .]", "owned"),
-            // The `?` covers the group, so it is not the branches of a `,`.
-            ("[.a | (., .)?]", "owned"),
+            // #4166: a computed branch with nothing after it, a computed tail
+            // after navigation branches, and a `?` group of navigation.
+            ("[.[] | ., length]", "mixed"),
+            ("[.[] | length, .]", "mixed"),
+            ("[.[] | ., . | length]", "owned"),
+            ("[.a | ., . | .]", "cursors"),
+            ("[.a | (., .)?]", "cursors"),
+            ("[.[] | (., .[0])?]", "cursors"),
+            // A computed branch with a tail, or a computed stage in or after a
+            // `?` group, keeps the owned route.
+            ("[.a | (., 1) | .]", "owned"),
+            ("[.a | (., length)?]", "owned"),
+            ("[.a | (., .)? | length]", "owned"),
+            // `Expr::Pipe` bridges a path-reading pipe whole.
+            ("[.a | ., key]", "lazy"),
             // The boundary no longer forces an array of nodes and values.
             ("[.a, .b]?", "cursors"),
             ("[.[] | ., .]?", "cursors"),
@@ -49183,7 +49315,7 @@ mod tests {
         };
         let split = |query: &str| {
             split_comma_stage(&body(query))
-                .map(|(prefix, branches, tail)| (prefix.len(), branches.len(), tail.len()))
+                .map(|stage| (stage.prefix.len(), stage.branches.len(), stage.tail.len()))
         };
         assert_eq!(split("[.[] | ., .]"), Some((1, 2, 0)));
         assert_eq!(
@@ -49196,16 +49328,89 @@ mod tests {
         // A `,` heading the pipe is `split_comma_head`'s, never this one's.
         assert_eq!(split("[(., .) | .a]"), None);
         assert!(split_comma_head(&body("[(., .) | .a]")).is_some());
-        // No pipe, no `,` stage, a computed stage anywhere, or a `,` under a `?`.
+        // No pipe, no `,` stage, or a prefix that is not navigation.
         assert_eq!(split("1, 2"), None);
         assert_eq!(split("[., .]"), None);
         assert_eq!(split("[.[] | .a]"), None);
-        assert_eq!(split("[.[] | (., 1)]"), None);
         assert_eq!(split("[.[] | length | (., .)]"), None);
-        assert_eq!(split("[.[] | (., .) | length]"), None);
-        assert_eq!(split("[.[] | ((., .))?]"), None);
-        // `(a, b)?` is not the same branches as `a, b`: the `?` covers the group.
-        assert_eq!(split("[.[] | (., .)?]"), None);
+        // #4166: computed branches with nothing after them, or a computed tail
+        // after navigation branches, keep the pipe's order.
+        assert_eq!(split("[.[] | (., 1)]"), Some((1, 2, 0)));
+        assert_eq!(split("[.[] | length, ., 1]"), Some((1, 3, 0)));
+        assert_eq!(split("[.[] | (., .) | length]"), Some((1, 2, 1)));
+        assert_eq!(split("[.[] | ., . | debug | .a]"), Some((1, 2, 2)));
+        // Computed branches and a tail would run the tail between them.
+        assert_eq!(split("[.[] | (., 1) | .a]"), None);
+        assert_eq!(split("[.[] | (., length) | length]"), None);
+        // A stage that reads path context is bridged whole by `Expr::Pipe`.
+        assert_eq!(split("[.[] | ., key]"), None);
+        assert_eq!(split("[.[] | ., . | parent]"), None);
+        // `(a, b)?` is a guarded group: navigation only, branches and tail.
+        let guarded = |query: &str| split_comma_stage(&body(query)).map(|stage| stage.guarded);
+        assert_eq!(guarded("[.[] | (., .)?]"), Some(true));
+        assert_eq!(guarded("[.[] | ((., .))?]"), Some(true));
+        assert_eq!(guarded("[.[] | (., .)? | .a]"), Some(true));
+        assert_eq!(guarded("[.[] | (., .)]"), Some(false));
+        assert_eq!(guarded("[.[] | (., 1)?]"), None);
+        assert_eq!(guarded("[.[] | (., .)? | length]"), None);
+        // A `?` around anything but a `,` is not a `,` stage.
+        assert_eq!(guarded("[.[] | (.a)?]"), None);
+        // A refused candidate leaves a later `,` stage to split, the refused
+        // one in its prefix.
+        assert_eq!(split("[.[] | (.a, .b)? | ., length]"), Some((2, 2, 0)));
+        assert_eq!(guarded("[.[] | (.a, .b)? | ., length]"), Some(false));
+        assert_eq!(split("[.[] | (., 1) | .a | ., length]"), None);
+    }
+
+    /// #4166: a `(a, b)?` group keeps what `try_single_generic` with no
+    /// handler keeps -- the items before a catchable raise or a `break`,
+    /// ending the group -- passes a decode failure and a `halt` on, and
+    /// declines a lazy result it would have to force.
+    #[test]
+    fn test_guarded_branch_4166() {
+        type R = GenericResult<crate::json::light::StandardJson<'static, Vec<u64>>>;
+        let ends = |r: R| guarded_branch(r).map(|(kept, ends)| (format!("{kept:?}"), ends));
+        assert_eq!(
+            ends(R::Error(EvalError::new("x"))),
+            Some(("None".into(), true))
+        );
+        assert_eq!(ends(R::Break("f".into())), Some(("None".into(), true)));
+        assert_eq!(
+            ends(R::Partial(
+                vec![OwnedValue::Int(1)],
+                Control::Error(EvalError::new("x"))
+            )),
+            Some((format!("{:?}", R::Owned(OwnedValue::Int(1))), true))
+        );
+        assert_eq!(
+            ends(R::Partial(
+                vec![OwnedValue::Int(1)],
+                Control::Break("f".into())
+            )),
+            Some((format!("{:?}", R::Owned(OwnedValue::Int(1))), true))
+        );
+        let decode = EvalError::decode_failure("bad");
+        assert!(decode.is_uncatchable_at_value_position());
+        assert!(matches!(
+            guarded_branch(R::Error(decode.clone())),
+            Some((R::Error(_), false))
+        ));
+        assert!(matches!(
+            guarded_branch(R::Partial(vec![], Control::Error(decode))),
+            Some((R::Partial(..), false))
+        ));
+        assert!(matches!(
+            guarded_branch(R::Halt(3)),
+            Some((R::Halt(3), false))
+        ));
+        assert!(matches!(
+            guarded_branch(R::Partial(vec![], Control::Halt(3))),
+            Some((R::Partial(..), false))
+        ));
+        for passed in [R::None, R::Owned(OwnedValue::Null), R::ManyOwned(vec![])] {
+            assert!(matches!(guarded_branch(passed), Some((_, false))));
+        }
+        assert!(guarded_branch(R::LazyIndexRange(2)).is_none());
     }
 
     /// #3501: the array routes' own predicate admits exactly the
