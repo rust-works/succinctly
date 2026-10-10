@@ -123643,3 +123643,29 @@ fn test_fused_slice_read_does_not_convert_siblings_4195() -> Result<()> {
     assert_eq!((stdout.as_str(), code), ("", 5), "slice built first");
     Ok(())
 }
+
+/// #4260: splitting an empty string has no pieces, and an empty separator yields the characters
+/// alone -- `"" | split(",")` is `[]`, `"abc" / ""` is `["a","b","c"]`. Every row was captured from
+/// `/usr/bin/jq` 1.7.1 (yq v4.53.3 agrees on all of them; see `yq_cli_tests.rs`).
+#[test]
+fn test_string_split_of_an_empty_string_and_by_an_empty_separator_4260() -> Result<()> {
+    for (filter, expected) in [
+        (r#""" | split(",")"#, "[]\n"),
+        (r#""" | split(", ")"#, "[]\n"),
+        (r#""" / ",""#, "[]\n"),
+        (r#""" / """#, "[]\n"),
+        (r#""" | split("")"#, "[]\n"),
+        (r#""abc" / """#, "[\"a\",\"b\",\"c\"]\n"),
+        (r#""s" / """#, "[\"s\"]\n"),
+        (r#""é" / """#, "[\"é\"]\n"),
+        (r#""abc" | split("")"#, "[\"a\",\"b\",\"c\"]\n"),
+        (r#""a,b" / ",""#, "[\"a\",\"b\"]\n"),
+        (r#""," | split(",")"#, "[\"\",\"\"]\n"),
+        (r#"",a," | split(",")"#, "[\"\",\"a\",\"\"]\n"),
+        (r#""a" / "a""#, "[\"\",\"\"]\n"),
+    ] {
+        let (out, code) = run_jq_stdin(filter, "null", &["-c"])?;
+        assert_eq!((out.as_str(), code), (expected, 0), "{filter}");
+    }
+    Ok(())
+}

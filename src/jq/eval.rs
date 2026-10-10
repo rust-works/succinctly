@@ -14327,8 +14327,7 @@ fn arith_div<S: EvalSemantics>(
         _ => match (left, right) {
             // String split: "a,b,c" / "," = ["a", "b", "c"]
             (OwnedValue::String(s), OwnedValue::String(sep)) => {
-                let parts: Vec<OwnedValue> = s.split(&*sep).map(OwnedValue::string).collect();
-                Ok(OwnedValue::array_from(parts))
+                Ok(OwnedValue::array_from(split_string(&s, &sep)))
             }
             (left, right) => Err(EvalError::binary_op(&left, &right, BinOp::Divide)),
         },
@@ -17956,14 +17955,7 @@ fn builtin_split<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                             return QueryResult::Error(EvalError::decode_failure(e.message()))
                         }
                     };
-                    // jq: split("") returns each character as a separate element
-                    // Rust's split("") includes empty strings at boundaries, so special-case it
-                    let parts: Vec<OwnedValue> = if sep.is_empty() {
-                        split_into_individual_chars(&cow)
-                    } else {
-                        cow.split(&*sep).map(OwnedValue::string).collect()
-                    };
-                    QueryResult::Owned(OwnedValue::array_from(parts))
+                    QueryResult::Owned(OwnedValue::array_from(split_string(&cow, &sep)))
                 }
                 _ if optional => QueryResult::None,
                 _ => {
@@ -25835,6 +25827,21 @@ fn yq_split_ignores_arguments<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     QueryResult::Owned(OwnedValue::Array(
         split_into_individual_chars(&input).into(),
     ))
+}
+
+/// jq's and yq's `split(sep)` (and `s / sep`) over a string: an empty string has no pieces
+/// (`"" | split(",")` is `[]`, not `[""]`), an empty separator yields each character, and
+/// anything else is the pieces between occurrences of `sep`. Rust's `str::split` differs on both
+/// edge cases -- one empty piece for an empty haystack, an empty piece at each end for an empty
+/// separator -- which is why this is not a bare call to it (#4260).
+fn split_string(s: &str, sep: &str) -> Vec<OwnedValue> {
+    if s.is_empty() {
+        Vec::new()
+    } else if sep.is_empty() {
+        split_into_individual_chars(s)
+    } else {
+        s.split(sep).map(OwnedValue::string).collect()
+    }
 }
 
 /// One `OwnedValue::String` per Unicode character of `s` -- `split("")`'s

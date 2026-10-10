@@ -62329,3 +62329,35 @@ fn test_fused_slice_read_matches_the_slice_then_read_spelling_4195() -> Result<(
     }
     Ok(())
 }
+
+/// #4260: the same rows as `jq_cli_tests.rs`, in yq mode, captured from yq v4.53.3 (`-p=json
+/// -o=json -I=0`): an empty string splits to nothing and an empty separator gives the characters.
+#[test]
+fn test_yq_string_split_of_an_empty_string_and_by_an_empty_separator_4260() -> Result<()> {
+    let args = &["-p=json", "-o=json", "-I=0"];
+    for (filter, expected) in [
+        // yq's `split(re; flags)` ignores its arguments and gives the characters (#1439).
+        (r#""a,b" | split(",";"g")"#, "[\"a\",\",\",\"b\"]\n"),
+        (r#""" | split(",";"g")"#, "[]\n"),
+        (r#""" | split(",")"#, "[]\n"),
+        (r#""" | split(", ")"#, "[]\n"),
+        (r#""" / ",""#, "[]\n"),
+        (r#""" / """#, "[]\n"),
+        (r#""" | split("")"#, "[]\n"),
+        (r#""abc" / """#, "[\"a\",\"b\",\"c\"]\n"),
+        (r#""s" / """#, "[\"s\"]\n"),
+        (r#""é" / """#, "[\"é\"]\n"),
+        (r#""abc" | split("")"#, "[\"a\",\"b\",\"c\"]\n"),
+        (r#""a,b" / ",""#, "[\"a\",\"b\"]\n"),
+        (r#""," | split(",")"#, "[\"\",\"\"]\n"),
+        (r#"",a," | split(",")"#, "[\"\",\"a\",\"\"]\n"),
+        (r#""a" / "a""#, "[\"\",\"\"]\n"),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, "null", args)?,
+            (expected.into(), String::new(), 0),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
