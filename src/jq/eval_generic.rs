@@ -12239,7 +12239,7 @@ fn eval_single_pipe<S: EvalSemantics, V: DocumentValue>(
         return collect_each_generic::<S, V>(whole.get(exprs), value, optional, cursor);
     }
 
-    // #4195: `E[a:b][k]` and `E[a:b] | length` read the slice's resolved range
+    // #4195, #4288: `E[a:b][k]`, `E[a:b] | length`, `first` and `last` read the slice's resolved range
     // instead of building the slice. Not for a pipe that reads path context: its
     // routing above (and the staged fallback below) needs the slice's own stage.
     if !needs_path && exprs.first().is_some_and(is_slice_head) {
@@ -17877,7 +17877,7 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
         }
     }
 
-    // #4195: the sink route's twin of the fusion in `eval_single_pipe`.
+    // #4195, #4288: the sink route's twin of the fusion in `eval_single_pipe`.
     if !needs_path && !optional && exprs.first().is_some_and(is_slice_head) {
         if let Some((owned, rest)) = fused_slice_pipe_head::<S, V>(exprs, value.clone(), cursor) {
             return finish_fused_slice_pipe::<S, V>(owned, rest, optional, sink);
