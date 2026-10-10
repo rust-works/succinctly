@@ -6219,9 +6219,11 @@ fn count_newlines(bytes: &[u8]) -> usize {
 /// O(n) and every resolved line equals what an eager call per value gave.
 /// `end` offsets must be non-decreasing across calls, as the splitter's are.
 ///
-/// `at` takes `&self` so several [`LazyLocation`]s' readers can share one
-/// locator; the counter sits behind a `RefCell` that is only borrowed for the
-/// duration of one `advance_to`, never across a callback.
+/// The M2 route calls [`at`](Self::at) itself, only where it reports an error;
+/// the general route reads through a per-value [`LazyLocation`] (#4178). `at`
+/// takes `&self` so that wrapper can share the locator with the M2 arm; the
+/// counter sits behind a `RefCell` borrowed only for the duration of one
+/// `advance_to`, which calls nothing back.
 struct ValueLocator<'a> {
     counter: RefCell<LineCounter<'a>>,
     filename: Option<&'a str>,
@@ -6257,7 +6259,7 @@ impl<'a> ValueLocator<'a> {
 /// lets each of them ask without the loop paying a newline count for every
 /// value that reports nothing.
 struct LazyLocation<'l, 'a> {
-    locator: Option<&'l ValueLocator<'a>>,
+    locator: &'l ValueLocator<'a>,
     end: usize,
     resolved: OnceCell<InputLocation>,
 }
@@ -6265,28 +6267,14 @@ struct LazyLocation<'l, 'a> {
 impl<'l, 'a> LazyLocation<'l, 'a> {
     fn new(locator: &'l ValueLocator<'a>, end: usize) -> Self {
         Self {
-            locator: Some(locator),
+            locator,
             end,
             resolved: OnceCell::new(),
         }
     }
 
-    /// A location that is already known (unit tests of the glue).
-    #[cfg(test)]
-    fn fixed(at: InputLocation) -> Self {
-        Self {
-            locator: None,
-            end: 0,
-            resolved: OnceCell::from(at),
-        }
-    }
-
     fn get(&self) -> &InputLocation {
-        self.resolved.get_or_init(|| {
-            self.locator
-                .expect("an unresolved location always has a locator")
-                .at(self.end)
-        })
+        self.resolved.get_or_init(|| self.locator.at(self.end))
     }
 }
 
@@ -12276,6 +12264,11 @@ mod tests {
     /// found during this fix's development routes a *document-sourced*
     /// decode failure through this wrapper (see the sibling note on
     /// `standard_json_to_jq_value`'s doc comment).
+    /// A locator whose every value is at `<stdin>:1`, for the glue's unit tests.
+    fn known_location_4178() -> ValueLocator<'static> {
+        ValueLocator::new(b"", None, Some(1))
+    }
+
     #[test]
     fn test_generic_result_to_jq_values_one_ok_and_err_1192() {
         let json: &[u8] = b"\"hello\"";
@@ -12286,7 +12279,7 @@ mod tests {
         let out = generic_result_to_jq_values(
             GenericResult::One(value),
             cursor,
-            &LazyLocation::fixed(InputLocation::at(None, 1)),
+            &LazyLocation::new(&known_location_4178(), 0),
             &mut sink,
         );
         assert_eq!(out.len(), 1);
@@ -12300,7 +12293,7 @@ mod tests {
         let out = generic_result_to_jq_values(
             GenericResult::One(value),
             cursor,
-            &LazyLocation::fixed(InputLocation::at(None, 1)),
+            &LazyLocation::new(&known_location_4178(), 0),
             &mut sink,
         );
         assert!(out.is_empty());
@@ -12325,7 +12318,7 @@ mod tests {
         let out = generic_result_to_jq_values(
             GenericResult::Many(vs),
             cursor,
-            &LazyLocation::fixed(InputLocation::at(None, 1)),
+            &LazyLocation::new(&known_location_4178(), 0),
             &mut sink,
         );
         assert!(matches!(
@@ -12353,7 +12346,8 @@ mod tests {
         let json: &[u8] = b"null";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
-        let at = LazyLocation::fixed(InputLocation::at(None, 1));
+        let locator = known_location_4178();
+        let at = LazyLocation::new(&locator, 0);
 
         let mut sink = ErrorSink::default();
         let out = generic_result_to_jq_values(GenericResult::None, cursor, &at, &mut sink);
@@ -12469,7 +12463,8 @@ mod tests {
             panic!("expected an array"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the fixed b\"[1, 2, 3]\" literal above always decodes to StandardJson::Array (#2103)"
         };
         let cursors: Vec<_> = elements.cursor_iter().collect();
-        let at = LazyLocation::fixed(InputLocation::at(None, 1));
+        let locator = known_location_4178();
+        let at = LazyLocation::new(&locator, 0);
 
         let mut sink = ErrorSink::default();
         let out =
