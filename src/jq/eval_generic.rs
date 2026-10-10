@@ -43429,6 +43429,45 @@ mod tests {
         );
     }
 
+    /// #4317: `E[a:b][key]` reads the slice at a key taken from the document, with or without a
+    /// cursor, and leaves a key that fails or is not one integer to the ordinary route.
+    #[test]
+    fn test_fused_slice_index_reads_a_key_from_the_document_4317() {
+        let json = br#"{"a":[10,20,30,40],"n":1,"f":1.5,"s":"x","bad":5}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let fused = |src: &str, with_cursor: bool| {
+            let Expr::IndexExpr { target, key } = crate::jq::parse(src).unwrap() else {
+                panic!("an index over a slice: {src}");
+            };
+            fused_slice_index::<JqSemantics, _>(
+                &target,
+                &key,
+                root.value(),
+                with_cursor.then_some(root),
+            )
+        };
+        for with_cursor in [true, false] {
+            // a key read from the document (a borrowed value, or a cursor)
+            assert_eq!(
+                fused(".a[1+0:][.n]", with_cursor),
+                Some(OwnedValue::Int(30))
+            );
+            assert_eq!(
+                fused(".a[:1+2][.n - 3]", with_cursor),
+                Some(OwnedValue::Int(20))
+            );
+            assert_eq!(fused(".a[1+1:][2+3]", with_cursor), Some(OwnedValue::Null));
+            // a key that is not one integer-valued number, or that fails, is declined
+            assert_eq!(fused(".a[1+0:][.f]", with_cursor), None);
+            assert_eq!(fused(".a[1+0:][.s]", with_cursor), None);
+            assert_eq!(fused(".a[1+0:][.missing]", with_cursor), None);
+            assert_eq!(fused(".a[1+0:][.bad.deeper]", with_cursor), None);
+            // a target that is not an array
+            assert_eq!(fused(".s[1+0:][.n]", with_cursor), None);
+        }
+    }
+
     #[test]
     fn test_json_computed_slice_bounds_via_eval_generic() {
         // #615: exercises Expr::SliceExpr through eval_generic's actual
