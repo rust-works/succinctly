@@ -3743,7 +3743,10 @@ fn scan_canonical_object(
 /// A repeat is therefore found at the end of the object rather than at the
 /// key. That is the cost of a bail only: the span is declined either way and
 /// the re-render that follows is far larger than the rest of one object's
-/// scan.
+/// scan. An early checkpoint over the first hashes would recover it for a
+/// repeat inside them, but charges every no-repeat object just past its width
+/// more than it saves, so it was not taken (#4156; `docs/parsing/json.md`,
+/// "Rejected: a checkpoint for a front-loaded repeat").
 ///
 /// A separate function, not a branch in the loop above, so the small-object
 /// loop that nearly every object takes keeps no wide-tier state and no
