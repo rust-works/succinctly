@@ -12539,6 +12539,12 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // `optional = false` and so loses the `?` in `.[$k]?`; and it
         // serialises and re-indexes the whole document per evaluation.
         Expr::IndexExpr { target, key } => {
+            // #4317: `E[a:b][$k]` reads the slice's resolved range, as the `[k]` pipe form does.
+            if matches!(**target, Expr::SliceExpr { .. }) {
+                if let Some(owned) = fused_slice_index::<S, V>(target, key, value.clone(), cursor) {
+                    return GenericResult::Owned(owned);
+                }
+            }
             eval_index_expr::<S, V>(target, key, value, optional, cursor)
         }
 
@@ -14401,6 +14407,12 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // jq mode only -- see `each_index_expr_generic`'s own doc comment
         // for why yq mode keeps the pre-existing eager fallback below.
         Expr::IndexExpr { target, key } if streams_escaped_generator_prefix::<S>() => {
+            // #4317: the sink route's twin of the fusion in `eval_single`.
+            if matches!(**target, Expr::SliceExpr { .. }) {
+                if let Some(owned) = fused_slice_index::<S, V>(target, key, value.clone(), cursor) {
+                    return push_one_generic(GenericItem::Owned(owned), sink);
+                }
+            }
             each_index_expr_generic::<S, V>(target, key, value, optional, cursor, sink)
         }
         // Likewise for a computed slice's bounds (#3471): the slices are pushed
@@ -22642,6 +22654,55 @@ fn fused_slice_pipe_head<S: EvalSemantics, V: DocumentValue>(
     let (slice, read) = fusable_slice_read(exprs)?;
     let owned = try_fused_slice_read::<S, V>(slice, read, value, cursor)?;
     Some((owned, &exprs[2..]))
+}
+
+/// `E[a:b][$k]` for a computed index (#4317): the slice's resolved range read at `k`, without
+/// building the slice. `IndexExpr { target: SliceExpr, key }` is the shape `.[$i:][$k]` parses to
+/// (not a pipe of two stages, so [`fusable_slice_read`] never sees it), and `key` is evaluated
+/// against the original `.`, like the slice's own bounds.
+///
+/// Fused only for a pure target and bounds ([`is_pure_slice_operand`]) and a pure `key` that
+/// yields exactly one integer-valued number; a string, `null`, fractional or non-number key, a
+/// key that fails or fans out, and everything [`try_fused_slice_read`] declines leave the pair
+/// to the ordinary route, which re-derives whatever error or value that stands for. Nothing
+/// visible happens before a decline. Out of line for the reason [`fused_slice_pipe_head`] gives.
+#[inline(never)]
+fn fused_slice_index<S: EvalSemantics, V: DocumentValue>(
+    slice: &Expr,
+    key: &Expr,
+    value: V,
+    cursor: Option<V::Cursor>,
+) -> Option<OwnedValue> {
+    let Expr::SliceExpr { target, start, end } = slice else {
+        return None; // patchcov: coverage tolerate-line reason="unreachable: both call sites match a SliceExpr target first"
+    };
+    let pure_bound =
+        |bound: &Option<Box<Expr>>| bound.as_deref().map_or(true, is_pure_slice_operand);
+    if !(is_pure_slice_operand(target)
+        && pure_bound(start)
+        && pure_bound(end)
+        && is_pure_slice_operand(key))
+    {
+        return None;
+    }
+    let key = match eval_single::<S, V>(key, value.clone(), false, cursor) {
+        GenericResult::One(v) => to_owned::<S, _>(&v).ok()?,
+        GenericResult::OneCursor(c) => to_owned::<S, _>(&c.value()).ok()?,
+        GenericResult::Owned(v) => v,
+        _ => return None,
+    };
+    // Integer-valued only: jq truncates a fractional index and a huge one is not an `i64`, so
+    // those keep the ordinary route.
+    let k = match key {
+        OwnedValue::Int(n) | OwnedValue::NumberLiteral(NumberRepr::Int(n), _) => n,
+        OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _)
+            if f.fract() == 0.0 && f.abs() < 9_007_199_254_740_992.0 =>
+        {
+            f as i64
+        }
+        _ => return None,
+    };
+    try_fused_slice_read::<S, V>(slice, SliceRead::Index(k), value, cursor)
 }
 
 /// Hand a fused slice read's value to the rest of a pipe on the sink route (#4195), as

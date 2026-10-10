@@ -1041,8 +1041,9 @@ anywhere is rejected outright. succinctly indexes lazily and checks the values a
 answers, `E[a:b][k]` with an integer-literal `k`, `E[a:b] | length` and, since
 [#4288](https://github.com/rust-works/succinctly/issues/4288), `E[a:b] | first` and `| last` (jq mode
 only; they are `.[0]` and `.[-1]`), each with a postfix `?` on the slice or on the read looked
-through, converts only the element it names, so a malformed value elsewhere in the range no longer
-raises:
+through, and since [#4317](https://github.com/rust-works/succinctly/issues/4317) `E[a:b][$k]` for a
+computed index that is one integer-valued number, converts only the element it names, so a malformed
+value elsewhere in the range no longer raises:
 
 | Filter                         | Input         | jq                      | succinctly                         |
 |--------------------------------|---------------|-------------------------|------------------------------------|
@@ -1058,8 +1059,9 @@ The unfused spellings above are what a read of the whole slice does, and they st
 every element. The cost of the other choice is the point of the fusion: validating the range
 means touching all of it, which is the O(tail) per read that made a loop over `.[$i:][0]`
 quadratic. Pinned by `test_fused_slice_read_does_not_convert_siblings_4195`. Still unfused, and so
-still O(tail) per read: a computed index (`.[$i:][$k]`), a literal-bound slice (`.[2:][0]`, which
-validates the whole range and would stop doing so), and the `| key`/`| path` reads of
+still O(tail) per read: a literal-bound slice (`.[2:][0]`, which validates the whole range and would
+stop doing so), a computed index that is fractional, a string, `null` or fans out (the ordinary route
+answers or raises it), and the `| key`/`| path` reads of
 [#4286](https://github.com/rust-works/succinctly/issues/4286).
 
 ## Where succinctly errors and jq does not
