@@ -121567,6 +121567,13 @@ fn test_register_collect_as_a_branch_of_a_compound_stage_4152() -> Result<()> {
         ),
         (
             r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | (select(.), ([numbers])) | $x)",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
             r"path(. as $x | 5 | ([numbers], select(.)) | $x)",
             "[]\n[]\n",
             "",

@@ -853,14 +853,13 @@ OPERANDS = [
     "[numbers, strings]",
     "[.[]? | numbers]",
     # (#4152) an `[E]` collect as a branch of a compound stage, read by the same rule as
-    # the bare collect (`collect_keeps_register`), with the entry's trackability handed
-    # down to each `,` `//` `if` branch and the stricter `true` to a pipe's later stages.
-    # The contrasts that must stay refused: a navigation after the collect, a collect
-    # whose contents the resolver does not check (`with_entries`, `walk`, `|=`,
-    # `getpath`), and a collect inside a handler or behind a `try`.
+    # the bare collect (`collect_keeps_register`). The contrasts that must stay refused:
+    # a navigation after the collect, a `getpath` inside it, and the shapes that wrap a
+    # collect (`try`, `?`, `first`), which the bare stage refuses too.
     "(select(.), [numbers])",
     "([numbers], select(.))",
     "([numbers], 7)",
+    "(select(.), ([numbers]))",
     "([numbers], [strings])",
     "if .k then [numbers] else select(.) end",
     "if .k then select(.) else [numbers] end",

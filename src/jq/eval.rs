@@ -43929,8 +43929,8 @@ fn leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
 /// questions.) It does read that predicate once for what a wrapper encloses
 /// (#3767 part 4: `first(5)` is as unmoving as the `5`), but never for a bare
 /// stage, which the caller has asked already.
-fn stage_leaves_register_in_place<S: EvalSemantics>(expr: &Expr, trackable: bool) -> bool {
-    last_register_unmoved::<S>() && stage_is_register_keeping::<S>(expr, trackable)
+fn stage_leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
+    last_register_unmoved::<S>() && stage_is_register_keeping::<S>(expr)
 }
 
 /// The shape half of [`stage_leaves_register_in_place`]: `expr` read through the
@@ -43957,38 +43957,31 @@ fn stage_leaves_register_in_place<S: EvalSemantics>(expr: &Expr, trackable: bool
 /// catch .` is `[]`, `try (last(.a), error("e")) catch .` is `[]` twice, and
 /// `try last(.a) catch .a` is `[]` too (the handler never ran) while `try
 /// (select(.), error({"a":1})) catch .a` raises (it ran, and navigated).
-fn stage_is_register_keeping<S: EvalSemantics>(expr: &Expr, trackable: bool) -> bool {
+fn stage_is_register_keeping<S: EvalSemantics>(expr: &Expr) -> bool {
     match peel_register_transparent(expr) {
         Expr::Try {
             expr: inner,
             catch: Some(handler),
-        } => stage_is_register_keeping::<S>(inner, trackable) && cannot_move_register(handler),
+        } => stage_is_register_keeping::<S>(inner) && cannot_move_register(handler),
         // #3767: a compound stage whose every branch leaves the register alone. jq
         // backtracks to the fork each alternative of a `,`, `//` or `if` starts from, so
         // each begins at the entry register; a pipe threads the register from one stage
         // to the next, so each stage must leave it where it found it. A branch that moves
         // it (`.a`) keeps the whole refused, as does one this predicate cannot judge (a
         // `def` call, never admitted: `cannot_move_register`'s doc).
-        Expr::Comma(branches) => branches
-            .iter()
-            .all(|branch| stage_keeps_register_statically::<S>(branch, trackable)),
-        // Only the first stage of a pipe starts at the entry: a later one reads the
-        // register an earlier stage left, whose trackability this predicate cannot
-        // state, so it is asked with the stricter `true` (#4152).
-        Expr::Pipe(stages) => stages.iter().enumerate().all(|(index, stage)| {
-            stage_keeps_register_statically::<S>(stage, trackable || index > 0)
-        }),
+        Expr::Comma(branches) => branches.iter().all(stage_keeps_register_statically::<S>),
+        Expr::Pipe(stages) => stages.iter().all(stage_keeps_register_statically::<S>),
         Expr::Alternative(left, right) => {
-            stage_keeps_register_statically::<S>(left, trackable)
-                && stage_keeps_register_statically::<S>(right, trackable)
+            stage_keeps_register_statically::<S>(left)
+                && stage_keeps_register_statically::<S>(right)
         }
         Expr::If {
             then_branch,
             else_branch,
             ..
         } => {
-            stage_keeps_register_statically::<S>(then_branch, trackable)
-                && stage_keeps_register_statically::<S>(else_branch, trackable)
+            stage_keeps_register_statically::<S>(then_branch)
+                && stage_keeps_register_statically::<S>(else_branch)
         }
         // #3767: a stage that navigates nothing leaves it where it was, and the
         // wrappers peeled above add no movement, so `first(5)`, `limit(1; 5)` and
@@ -44023,31 +44016,35 @@ fn stage_is_register_keeping<S: EvalSemantics>(expr: &Expr, trackable: bool) -> 
 ///   source (`add`, `flatten`, `map(f)`, `walk(f)`) or never lets touch the register
 ///   (`sort`, `to_entries`), the leaf's own verdict (#3361).
 ///
-/// - [`collect_keeps_register`]: an `[E]` collect the resolver checks as jq does (#3263),
-///   which needs the stage's entry trackability, so `trackable` is that of `expr`'s own
-///   entry. A compound stage hands it down to each branch (a `,` `//` or `if` branch starts
-///   at the stage's entry, #4152); a pipe's later stages are asked with `true`, the
-///   stricter answer, because the register an earlier stage left has no static
-///   trackability.
+/// - [`collect_keeps_register`]: an `[E]` collect the resolver checks as jq does (#3263);
+///   as a bare stage, and since #4152 as a branch of a compound stage, from the one
+///   definition.
 ///
-/// `getpath` is the one shape that needs the run's state beyond that (it is per-*branch*,
+/// `getpath` is the one shape that needs the run's state (it is per-*branch*,
 /// [`getpath_preserves_register`]), so it is answered at the call site only and is not
 /// read as a branch of a compound stage: `(select(.), getpath(["a"]))` stays refused
 /// (the safe direction; jq raises for it too).
-fn stage_keeps_register_statically<S: EvalSemantics>(expr: &Expr, trackable: bool) -> bool {
+fn stage_keeps_register_statically<S: EvalSemantics>(expr: &Expr) -> bool {
     cannot_move_register(expr)
-        || stage_leaves_register_in_place::<S>(expr, trackable)
+        || stage_leaves_register_in_place::<S>(expr)
         || leaves_register_in_place::<S>(expr)
-        || collect_keeps_register::<S>(expr, trackable)
+        || collect_keeps_register::<S>(expr)
 }
 
 /// #3263: an array resolved live whose contents the resolver checks as jq does, and jq's
 /// collect backtracks the register to where it began ([`array_resolves_live`],
 /// [`array_contents_are_checked`]). The bare-stage rule and, since #4152, the rule for a
 /// branch of a compound stage, so the two cannot disagree.
-fn collect_keeps_register<S: EvalSemantics>(expr: &Expr, trackable: bool) -> bool {
-    matches!(expr, Expr::Array(inner)
-        if array_resolves_live::<S>(inner, trackable) && array_contents_are_checked(inner))
+///
+/// Asked with `trackable = false`, the entry-independent answer: `array_resolves_live`
+/// refuses a *trackable* entry only for an `inner` that [`cannot_move_register`], and
+/// `cannot_move_register(Array(inner))` is `cannot_move_register(inner)`, so that collect
+/// is admitted by [`stage_keeps_register_statically`]'s first line either way. The flag
+/// cannot change the stage verdict, which is why a branch, whose entry trackability this
+/// predicate does not know, is not asked for it.
+fn collect_keeps_register<S: EvalSemantics>(expr: &Expr) -> bool {
+    matches!(unwrap_paren(expr), Expr::Array(inner)
+        if array_resolves_live::<S>(inner, false) && array_contents_are_checked(inner))
 }
 
 /// Whether a pipe stage `expr` is one whose by-value leaf states jq's path
@@ -57728,7 +57725,7 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
     // backtracked source; what such a stage navigates on an input the register is not
     // on is refused by [`builtin_navigation`]), an `[E]` collect included, bare or as a branch of
     // a compound stage (#4152); `getpath` alone needs the run's state.
-    let stage_preserves_register = stage_keeps_register_statically::<S>(element, branch_trackable)
+    let stage_preserves_register = stage_keeps_register_statically::<S>(element)
         || getpath_preserves_register::<S>(
             element,
             &current,
@@ -92387,8 +92384,8 @@ mod tests {
             }
             let stage = Expr::Builtin(filter.clone());
             assert!(is_select_stage(&stage) && !is_last_stage(&stage));
-            assert!(stage_leaves_register_in_place::<JqSemantics>(&stage, true));
-            assert!(!stage_leaves_register_in_place::<YqSemantics>(&stage, true));
+            assert!(stage_leaves_register_in_place::<JqSemantics>(&stage));
+            assert!(!stage_leaves_register_in_place::<YqSemantics>(&stage));
         }
         for other in [
             Builtin::Length,
@@ -92399,8 +92396,7 @@ mod tests {
             assert!(!is_type_filter(&other), "{other:?}");
             assert_eq!(type_filter_keeps(&other, &OwnedValue::Null), None);
             assert!(!stage_leaves_register_in_place::<JqSemantics>(
-                &Expr::Builtin(other),
-                true
+                &Expr::Builtin(other)
             ));
         }
 
@@ -92429,11 +92425,11 @@ mod tests {
                 "{admitted}"
             );
             assert!(
-                stage_leaves_register_in_place::<JqSemantics>(&expr, true),
+                stage_leaves_register_in_place::<JqSemantics>(&expr),
                 "{admitted}"
             );
             assert!(
-                !stage_leaves_register_in_place::<YqSemantics>(&expr, true),
+                !stage_leaves_register_in_place::<YqSemantics>(&expr),
                 "{admitted}"
             );
         }
@@ -92456,11 +92452,11 @@ mod tests {
                 "{admitted}"
             );
             assert!(
-                stage_leaves_register_in_place::<JqSemantics>(&expr, true),
+                stage_leaves_register_in_place::<JqSemantics>(&expr),
                 "{admitted}"
             );
             assert!(
-                !stage_leaves_register_in_place::<YqSemantics>(&expr, true),
+                !stage_leaves_register_in_place::<YqSemantics>(&expr),
                 "{admitted}"
             );
         }
@@ -92478,11 +92474,11 @@ mod tests {
         ] {
             let expr = stage(admitted);
             assert!(
-                stage_leaves_register_in_place::<JqSemantics>(&expr, true),
+                stage_leaves_register_in_place::<JqSemantics>(&expr),
                 "{admitted}"
             );
             assert!(
-                !stage_leaves_register_in_place::<YqSemantics>(&expr, true),
+                !stage_leaves_register_in_place::<YqSemantics>(&expr),
                 "{admitted}"
             );
         }
@@ -92491,7 +92487,7 @@ mod tests {
         for (filter, peeled_wrapper) in [("5", false), ("length", false), ("limit(1; .)?", true)] {
             let expr = stage(filter);
             assert_eq!(
-                stage_leaves_register_in_place::<JqSemantics>(&expr, true),
+                stage_leaves_register_in_place::<JqSemantics>(&expr),
                 peeled_wrapper,
                 "{filter}"
             );
@@ -92505,7 +92501,7 @@ mod tests {
         ] {
             let expr = stage(refused);
             assert!(
-                !stage_leaves_register_in_place::<JqSemantics>(&expr, true),
+                !stage_leaves_register_in_place::<JqSemantics>(&expr),
                 "{refused}"
             );
         }
@@ -92545,11 +92541,11 @@ mod tests {
         ] {
             let expr = stage(admitted);
             assert!(
-                stage_leaves_register_in_place::<JqSemantics>(&expr, true),
+                stage_leaves_register_in_place::<JqSemantics>(&expr),
                 "{admitted}"
             );
             assert!(
-                !stage_leaves_register_in_place::<YqSemantics>(&expr, true),
+                !stage_leaves_register_in_place::<YqSemantics>(&expr),
                 "{admitted}"
             );
         }
@@ -92571,7 +92567,7 @@ mod tests {
         ] {
             let expr = stage(refused);
             assert!(
-                !stage_leaves_register_in_place::<JqSemantics>(&expr, true),
+                !stage_leaves_register_in_place::<JqSemantics>(&expr),
                 "{refused}"
             );
         }
@@ -92594,11 +92590,11 @@ mod tests {
         ] {
             let expr = stage(admitted);
             assert!(
-                stage_leaves_register_in_place::<JqSemantics>(&expr, true),
+                stage_leaves_register_in_place::<JqSemantics>(&expr),
                 "{admitted}"
             );
             assert!(
-                !stage_leaves_register_in_place::<YqSemantics>(&expr, true),
+                !stage_leaves_register_in_place::<YqSemantics>(&expr),
                 "{admitted}"
             );
         }
@@ -92621,7 +92617,7 @@ mod tests {
         ] {
             let expr = stage(refused);
             assert!(
-                !stage_leaves_register_in_place::<JqSemantics>(&expr, true),
+                !stage_leaves_register_in_place::<JqSemantics>(&expr),
                 "{refused}"
             );
         }
@@ -92629,49 +92625,47 @@ mod tests {
 
     /// #4152: an `[E]` collect is a branch of a compound stage exactly when it is a bare
     /// stage ([`collect_keeps_register`], one definition), so `(select(.), [numbers])` is
-    /// as register-keeping as `[numbers]`. A `,` `//` or `if` branch starts at the stage's
-    /// entry, so it is asked with the entry's trackability; a pipe's later stages with the
-    /// stricter `true`. A navigation after the collect, a `getpath` inside it, or a
-    /// navigating sibling keeps the whole refused, and yq has no oracle for any of it.
+    /// as register-keeping as `[numbers]`. A navigation after the collect, a `getpath`
+    /// inside it, or a navigating sibling keeps the whole refused, and yq has no oracle
+    /// for any of it.
     #[test]
     fn a_collect_is_a_register_keeping_branch_of_a_compound_stage_4152() {
-        for trackable in [false, true] {
-            for admitted in [
-                "(select(.), [numbers])",
-                "([numbers], select(.))",
-                "([numbers], [strings])",
-                "if .k then [numbers] else select(.) end",
-                "if .k then select(.) else [numbers] end",
-                "([numbers] // 7)",
-                "(select(.) // [numbers])",
-                "(select(.) | [numbers])",
-                "try (select(.), [numbers]) catch 7",
-                "first(select(.), [numbers])",
-            ] {
-                let expr = parse(admitted).unwrap();
-                assert!(
-                    stage_keeps_register_statically::<JqSemantics>(&expr, trackable),
-                    "{admitted} (trackable: {trackable})"
-                );
-                assert!(
-                    !stage_keeps_register_statically::<YqSemantics>(&expr, trackable),
-                    "{admitted} (trackable: {trackable})"
-                );
-            }
-            for refused in [
-                "([numbers] | .a)",
-                "(select(.), [numbers] | .a)",
-                "(select(.), [.a] | .b)",
-                "(select(.), [getpath([\"a\"])])",
-                "if .k then [numbers] else .a end",
-                "(.a // [numbers])",
-            ] {
-                let expr = parse(refused).unwrap();
-                assert!(
-                    !stage_keeps_register_statically::<JqSemantics>(&expr, trackable),
-                    "{refused} (trackable: {trackable})"
-                );
-            }
+        for admitted in [
+            "(select(.), [numbers])",
+            "(select(.), ([numbers]))",
+            "([numbers], select(.))",
+            "([numbers], [strings])",
+            "if .k then [numbers] else select(.) end",
+            "if .k then select(.) else [numbers] end",
+            "([numbers] // 7)",
+            "(select(.) // [numbers])",
+            "(select(.) | [numbers])",
+            "try (select(.), [numbers]) catch 7",
+            "first(select(.), [numbers])",
+        ] {
+            let expr = parse(admitted).unwrap();
+            assert!(
+                stage_keeps_register_statically::<JqSemantics>(&expr),
+                "{admitted}"
+            );
+            assert!(
+                !stage_keeps_register_statically::<YqSemantics>(&expr),
+                "{admitted}"
+            );
+        }
+        for refused in [
+            "([numbers] | .a)",
+            "(select(.), [numbers] | .a)",
+            "(select(.), [.a] | .b)",
+            "(select(.), [getpath([\"a\"])])",
+            "if .k then [numbers] else .a end",
+            "(.a // [numbers])",
+        ] {
+            let expr = parse(refused).unwrap();
+            assert!(
+                !stage_keeps_register_statically::<JqSemantics>(&expr),
+                "{refused}"
+            );
         }
     }
 
