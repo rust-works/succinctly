@@ -307,6 +307,11 @@ pub trait EvalSemantics: Copy + Default {
     /// the program before it runs (`$nope is not defined`, exit 3) and keeps its error.
     const UNBOUND_VARIABLE_YIELDS_NOTHING: bool;
 
+    /// If true (yq), `length` of a string is its UTF-8 byte count, as Go's `len` makes it
+    /// (`"日本" | length` is 6). jq counts characters (`2`), and `utf8bytelength` is its byte
+    /// count (#4270).
+    const STRING_LENGTH_IS_BYTES: bool;
+
     /// If true (yq), `min` and `max` answer nothing for an input that has no element to pick:
     /// an empty array, and anything that is not an array (`[] | min`, `{} | max`, `1 | min`,
     /// #4236). jq answers `null` for an empty array and raises for a non-array.
@@ -414,6 +419,7 @@ impl EvalSemantics for JqSemantics {
     const UTF8_LOSSY_USES_JQ_MAXIMAL_SUBPART_RULE: bool = true;
     const ROOT_PATH_CONTEXT_YIELDS_NOTHING: bool = false;
     const UNBOUND_VARIABLE_YIELDS_NOTHING: bool = false;
+    const STRING_LENGTH_IS_BYTES: bool = false;
     const MIN_MAX_NEED_AN_ELEMENT: bool = false;
     const NULL_ENTRIES_AND_SPLIT_YIELD_NOTHING: bool = false;
     const EMPTY_OPERAND_BINARY_RULE: bool = false;
@@ -456,6 +462,7 @@ impl EvalSemantics for YqSemantics {
     const UTF8_LOSSY_USES_JQ_MAXIMAL_SUBPART_RULE: bool = false;
     const ROOT_PATH_CONTEXT_YIELDS_NOTHING: bool = true;
     const UNBOUND_VARIABLE_YIELDS_NOTHING: bool = true;
+    const STRING_LENGTH_IS_BYTES: bool = true;
     const MIN_MAX_NEED_AN_ELEMENT: bool = true;
     const NULL_ENTRIES_AND_SPLIT_YIELD_NOTHING: bool = true;
     const EMPTY_OPERAND_BINARY_RULE: bool = true;
@@ -15873,6 +15880,15 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// `length` of a string: characters in jq, bytes in yq (#4270).
+pub(crate) fn string_length<S: EvalSemantics>(text: &str) -> i64 {
+    if S::STRING_LENGTH_IS_BYTES {
+        text.len() as i64
+    } else {
+        text.chars().count() as i64
+    }
+}
+
 /// Builtin: length
 fn builtin_length<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
@@ -15883,7 +15899,7 @@ fn builtin_length<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #1620/#1660: an undecodable string must raise, not silently
         // substitute a length of 0.
         StandardJson::String(s) => match s.as_str() {
-            Ok(cow) => QueryResult::Owned(OwnedValue::Int(cow.chars().count() as i64)),
+            Ok(cow) => QueryResult::Owned(OwnedValue::Int(string_length::<S>(&cow))),
             Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         // #2293: `len_checked`, not the bare `count()` -- the same
