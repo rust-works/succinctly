@@ -4466,7 +4466,8 @@ fn eval_object_construction_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     eval_operand: &mut ObjectSlotEvaluator<'_>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    if yq_collects_union::<S>(entries) {
+    let route = yq_object_route::<S>(entries);
+    if route == ObjectRoute::Union {
         return eval_object_collect::<W, S>(entries, eval_operand, optional);
     }
     let mut objects = Vec::new();
@@ -4510,31 +4511,82 @@ fn eval_object_construction_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     }
 
+    if objects.is_empty() && route == ObjectRoute::FanoutThenUnion {
+        return eval_object_collect::<W, S>(entries, eval_operand, optional);
+    }
     owned_vec_to_result(objects)
 }
 
-/// Whether a `{...}` is yq's `COLLECT_OBJECT` rather than a plain cross product of
-/// `key: value` pairs: it holds a bare, non-pair entry (#2783), or a key or value that can
-/// produce no output (#4193).
+/// How a `{...}` is built: as a cross product of its `key: value` pairs, as yq's
+/// `COLLECT_OBJECT` over the union of its entries, or the first and then the second (#4193).
 ///
 /// `COLLECT_OBJECT` takes the union of its entries' maps, so an entry with none is skipped
-/// rather than emptying the construction (`{"a": (1|select(false)), "b": 2}` is `{"b": 2}`)
-/// and a count mismatch drops its neighbours, quirks [`collect_object`](super::collect_object)
-/// reproduces. A cross product is the same thing only while every entry yields something,
-/// which is why a construction whose operands all provably do keeps the cheaper fan-out.
+/// rather than emptying the construction (`{"a": (1|select(false)), "b": 2}` is `{"b": 2}`) and a
+/// count mismatch drops its neighbours, quirks [`collect_object`](super::collect_object)
+/// reproduces. A cross product is the same thing while every entry yields something, and an
+/// entry that yields nothing always empties it, which is what makes the third route sound: build
+/// the cross product, and only when it comes out empty run the union. A construction whose
+/// operands all provably yield one value ([`yields_exactly_one_value`]) never needs the second
+/// look. One that holds a side effect is not built twice: it goes straight to the union.
 ///
-/// Only yq's parser builds [`ObjectKey::Bare`], so the `TAG` test is a
-/// compile-time constant that lets jq mode skip the scan entirely.
-pub(crate) fn yq_collects_union<S: EvalSemantics>(entries: &[super::expr::ObjectEntry]) -> bool {
-    S::TAG == EvalTag::Yq
-        && entries.iter().any(|entry| {
-            !yields_exactly_one_value(&entry.value)
-                || match &entry.key {
-                    ObjectKey::Bare => true,
-                    ObjectKey::Literal(_) => false,
-                    ObjectKey::Expr(key) => !yields_exactly_one_value(key),
-                }
+/// Only yq's parser builds [`ObjectKey::Bare`], so the `TAG` test is a compile-time constant
+/// that lets jq mode skip the scan entirely.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ObjectRoute {
+    /// The cross product of the pairs: jq, and yq while every operand yields one value.
+    Fanout,
+    /// `COLLECT_OBJECT` straight away: a bare entry (#2783), or an operand with a side effect
+    /// that may yield nothing.
+    Union,
+    /// The cross product first, `COLLECT_OBJECT` when it is empty.
+    FanoutThenUnion,
+}
+
+pub(crate) fn yq_object_route<S: EvalSemantics>(
+    entries: &[super::expr::ObjectEntry],
+) -> ObjectRoute {
+    if S::TAG != EvalTag::Yq {
+        return ObjectRoute::Fanout;
+    }
+    let mut may_be_empty = false;
+    for entry in entries {
+        match &entry.key {
+            ObjectKey::Bare => return ObjectRoute::Union,
+            ObjectKey::Literal(_) => {}
+            ObjectKey::Expr(key) => may_be_empty |= !yields_exactly_one_value(key),
+        }
+        may_be_empty |= !yields_exactly_one_value(&entry.value);
+    }
+    if !may_be_empty {
+        return ObjectRoute::Fanout;
+    }
+    let effectful = |expr: &Expr| {
+        super::walk::any_subexpr(expr, &mut |e| {
+            matches!(
+                e,
+                Expr::FuncCall { .. }
+                    | Expr::DefCall { .. }
+                    | Expr::Builtin(
+                        Builtin::Debug
+                            | Builtin::DebugMsg(_)
+                            | Builtin::Stderr
+                            | Builtin::Halt
+                            | Builtin::HaltError
+                            | Builtin::HaltErrorCode(_)
+                            | Builtin::Input
+                            | Builtin::Inputs
+                            | Builtin::InputLineNumber
+                    )
+            )
         })
+    };
+    if entries.iter().any(|entry| {
+        effectful(&entry.value) || matches!(&entry.key, ObjectKey::Expr(key) if effectful(key))
+    }) {
+        ObjectRoute::Union
+    } else {
+        ObjectRoute::FanoutThenUnion
+    }
 }
 
 /// The object a construction's `(key, value)` pairs assemble into (#4182).
@@ -7061,9 +7113,43 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let mut slots: Vec<String> = alloc::vec![String::new(); parts.len()];
             each_string_parts::<W, S>(parts, value, optional, &mut slots, sink)
         }
-        Expr::Object(entries) if !yq_collects_union::<S>(entries) => {
+        Expr::Object(entries) => {
+            let route = yq_object_route::<S>(entries);
+            if route == ObjectRoute::Union {
+                return drain_result(
+                    eval_object_construction::<W, S>(entries, value, optional),
+                    sink,
+                );
+            }
             let mut acc = Vec::new();
-            each_object_entries::<W, S>(entries, value, optional, &mut acc, sink)
+            if route == ObjectRoute::Fanout {
+                return each_object_entries::<W, S>(entries, value, optional, &mut acc, sink);
+            }
+            // #4193: stream the cross product, and take the union only when it delivered nothing.
+            let mut emitted = false;
+            let flow = each_object_entries::<W, S>(
+                entries,
+                value.clone(),
+                optional,
+                &mut acc,
+                &mut |item| {
+                    emitted = true;
+                    sink(item)
+                },
+            );
+            if emitted || !matches!(flow, Flow::Exhausted) {
+                return flow;
+            }
+            drain_result(
+                eval_object_collect::<W, S>(
+                    entries,
+                    &mut |expr| {
+                        stream_outputs::<_, S>(eval_single::<W, S>(expr, value.clone(), optional))
+                    },
+                    optional,
+                ),
+                sink,
+            )
         }
         // #2180 WP3. No `needs_path_context` gate, for the same reason
         // `eval_single`'s own `Expr::Foreach` arm has none: a query that
@@ -9015,7 +9101,7 @@ fn each_object_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         // The `Expr::Object` arm of `eval_each` leaves a construction holding a
         // bare entry to the eager fallback, which collects it.
-        ObjectKey::Bare => unreachable!("a bare entry is collected, not streamed"), // patchcov: coverage tolerate-line reason="unreachable: the Expr::Object arm of eval_each guards on yq_collects_union, so a bare entry never reaches the streaming fan-out (#2783)"
+        ObjectKey::Bare => unreachable!("a bare entry is collected, not streamed"), // patchcov: coverage tolerate-line reason="unreachable: the Expr::Object arm of eval_each sends a construction holding a bare entry down yq_object_route's Union route, so a bare entry never reaches the streaming fan-out (#2783)"
         ObjectKey::Expr(key_expr) => {
             let escape = StashedEscape::new();
             let flow = eval_each::<W, S>(key_expr, value.clone(), optional, &mut |item| {
@@ -31067,7 +31153,7 @@ fn resolves_to_at_most_one_path(expr: &Expr) -> bool {
 }
 
 /// Whether `expr` provably produces exactly one output for any input it does not raise on, the
-/// complement [`yq_collects_union`] needs: an entry that might produce none changes what yq's
+/// complement [`yq_object_route`] needs: an entry that might produce none changes what yq's
 /// `{...}` builds (#4193).
 ///
 /// An allowlist, so a shape not named here is read as "may produce nothing" and costs only the
@@ -137922,9 +138008,9 @@ mod stderr_mute_tests_2709 {
 #[cfg(test)]
 mod object_union_gate_tests_4193 {
     use super::*;
-    use crate::jq::{parse, parse_with_mode, ParserMode};
+    use crate::jq::{parse, parse_with_mode, parse_with_mode_and_extensions, ParserMode};
 
-    fn collects(filter: &str, yq: bool) -> bool {
+    fn route(filter: &str, yq: bool) -> ObjectRoute {
         let expr = if yq {
             parse_with_mode(filter, ParserMode::Yq).expect("filter parses")
         } else {
@@ -137934,23 +138020,23 @@ mod object_union_gate_tests_4193 {
             panic!("`{filter}` is not an object construction");
         };
         if yq {
-            yq_collects_union::<YqSemantics>(&entries)
+            yq_object_route::<YqSemantics>(&entries)
         } else {
-            yq_collects_union::<JqSemantics>(&entries)
+            yq_object_route::<JqSemantics>(&entries)
         }
     }
 
-    // #4193: a `{...}` is yq's `COLLECT_OBJECT` once any key or value might produce nothing, and
-    // keeps the cheaper cross product while every one provably produces exactly one output.
+    // #4193: a `{...}` is built as a cross product while every key and value provably yields one
+    // output, and as the cross product with the union behind it once one might yield nothing.
     #[test]
-    fn yq_collects_a_construction_only_when_an_operand_may_be_empty() {
+    fn yq_looks_behind_an_empty_cross_product_only_when_an_operand_may_be_empty() {
         for filter in [
             r#"{"a": 1, "b": .x, "c": [.y[]], "d": (.z | length)}"#,
             r#"{(.k): .v, "n": "x\(.a)", "s": (.a + 1), "t": (.a // 2)}"#,
             r#"{"a": (if .x then 1 else 2 end), "b": .[0], "c": (.a | tostring)}"#,
             r#"{"a": (.l | map(. + 1)), "b": (.l | sort), "c": (.l | has(0))}"#,
         ] {
-            assert!(!collects(filter, true), "`{filter}` keeps the fan-out");
+            assert_eq!(route(filter, true), ObjectRoute::Fanout, "`{filter}`");
         }
         for filter in [
             r#"{"a": (.x | select(.)), "b": 1}"#,
@@ -137959,7 +138045,6 @@ mod object_union_gate_tests_4193 {
             r#"{"a": $nope}"#,
             r#"{"a": .x[]}"#,
             r#"{"a": (1, 2)}"#,
-            r#"{"a": 1, "b"}"#,
             r#"{"a": (.x | select(.) | length), "b": 1}"#,
             // yq answers nothing for these on an empty array or `null`.
             r#"{"a": ([] | min), "b": 1}"#,
@@ -137967,15 +138052,48 @@ mod object_union_gate_tests_4193 {
             r#"{"a": (.n | to_entries), "b": 1}"#,
             r#"{"a": (.n | split(",")), "b": 1}"#,
         ] {
-            assert!(collects(filter, true), "`{filter}` collects");
+            assert_eq!(
+                route(filter, true),
+                ObjectRoute::FanoutThenUnion,
+                "`{filter}`"
+            );
+        }
+    }
+
+    // A bare entry is always the union; so is an operand that might yield nothing and also has a
+    // side effect, which the second look would run twice.
+    #[test]
+    fn yq_goes_straight_to_the_union_for_a_bare_entry_or_a_side_effect() {
+        for filter in [
+            r#"{"a": 1, "b"}"#,
+            r#"{"a": (.x | debug | select(.)), "b": 1}"#,
+            r#"{"a": (.x | stderr | select(.))}"#,
+            r#"{(.k | debug | select(.)): 1}"#,
+            r#"def f: debug; {"a": (.x | f | select(.))}"#,
+        ] {
+            let expr = parse_with_mode_and_extensions(filter, ParserMode::Yq, true)
+                .expect("filter parses");
+            let object = match expr {
+                Expr::Object(entries) => entries,
+                Expr::FuncDef { then, .. } => match *then {
+                    Expr::Object(entries) => entries,
+                    other => panic!("`{filter}`: {other:?}"),
+                },
+                other => panic!("`{filter}`: {other:?}"),
+            };
+            assert_eq!(
+                yq_object_route::<YqSemantics>(&object),
+                ObjectRoute::Union,
+                "`{filter}`"
+            );
         }
     }
 
     // jq has no `COLLECT_OBJECT`: its cross product is the semantics whatever the operands are.
     #[test]
-    fn jq_never_collects_a_construction() {
+    fn jq_never_looks_behind_the_cross_product() {
         for filter in [r#"{"a": (.x | select(.)), "b": 1}"#, r#"{"a": .x[]}"#] {
-            assert!(!collects(filter, false), "`{filter}`");
+            assert_eq!(route(filter, false), ObjectRoute::Fanout, "`{filter}`");
         }
     }
 }

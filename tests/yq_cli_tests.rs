@@ -61021,6 +61021,38 @@ fn test_object_construction_skips_a_pair_with_no_output_4193() -> Result<()> {
     Ok(())
 }
 
+/// #4193: an operand that may yield nothing is built a second time only when the first build came
+/// out empty, so a side effect inside one must not fire twice either way.
+#[test]
+fn test_object_construction_side_effect_in_a_maybe_empty_operand_fires_once_4193() -> Result<()> {
+    for (filter, expected_out) in [
+        // The operand is empty: yq skips the entry.
+        (r#"{"a":(1|debug|select(false)),"b":2}"#, "{\"b\":2}\n"),
+        // The operand is not: nothing is built twice.
+        (
+            r#"{"a":(1|debug|select(true)),"b":2}"#,
+            "{\"a\":1,\"b\":2}\n",
+        ),
+        (
+            r#"{"a":1,"b":(2|debug|select(false)),"c":(3,4)}"#,
+            "{\"c\":3}\n{\"c\":4}\n",
+        ),
+    ] {
+        let (out, err, code) = run_yq_stdin_with_stderr(
+            filter,
+            "null\n",
+            &["-p=json", "-o=json", "-I=0", "--jq-extensions"],
+        )?;
+        let debug_lines = err.matches("DEBUG").count();
+        assert_eq!(
+            (code, out.as_str(), debug_lines),
+            (0, expected_out, 1),
+            "{filter}: {err}"
+        );
+    }
+    Ok(())
+}
+
 /// Pinned yq v4.53.3: `{...}` folds its entries with `*`, so a key that repeats
 /// deep-merges its two values where the later would win in jq (#4182). Only a map
 /// over a map merges; a computed key is compared at run time. Every row was
