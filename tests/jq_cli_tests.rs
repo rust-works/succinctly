@@ -124083,3 +124083,110 @@ fn test_pipe_effect_before_a_raising_stage_runs_depth_first_4293() -> Result<()>
     }
     Ok(())
 }
+
+/// #4303: once input runs out, jq's `(at ...)` marker says `<unknown>` when
+/// the read that reached the end completed the stream's last value, and names
+/// the last source at its own newline count otherwise -- trailing blank lines
+/// included. Every expectation is jq 1.7.1's own output.
+#[test]
+fn test_error_after_input_runs_out_names_jqs_eof_location_4303() -> Result<()> {
+    let long_then_one = format!("{}1", " ".repeat(4094));
+    let one_then_long = format!("1{}", " ".repeat(4094));
+    // `(args, sources, expected)`: `None` is `<unknown>`, `Some((i, line))`
+    // the `i`th source at `line`.
+    let rows: &[(&[&str], Vec<&[u8]>, Option<(usize, usize)>)] = &[
+        (&["-nc", "[inputs] | error(\"y\")"], vec![b"1 2 3"], None),
+        (&["-nc", "[inputs] | error(\"y\")"], vec![b"1\n2\n3"], None),
+        (
+            &["-nc", "[inputs] | error(\"y\")"],
+            vec![b"1\n2\n3\n"],
+            Some((0, 3)),
+        ),
+        (
+            &["-nc", "[inputs] | error(\"y\")"],
+            vec![b"3\n\n"],
+            Some((0, 2)),
+        ),
+        (
+            &["-nc", "[inputs] | error(\"y\")"],
+            vec![b"3\n\n\n"],
+            Some((0, 3)),
+        ),
+        (
+            &["-nc", "[inputs] | error(\"y\")"],
+            vec![b"\n"],
+            Some((0, 1)),
+        ),
+        (
+            &["-nc", "[inputs] | error(\"y\")"],
+            vec![b"1 2 3\n "],
+            Some((0, 1)),
+        ),
+        (&["-nc", "[inputs] | error(\"y\")"], vec![b"1", b" "], None),
+        (&["-nc", "[inputs] | error(\"y\")"], vec![b"1", b""], None),
+        (
+            &["-nc", "[inputs] | error(\"y\")"],
+            vec![b"1", b"\n"],
+            Some((1, 1)),
+        ),
+        (
+            &["-nc", "[inputs] | error(\"y\")"],
+            vec![b"2\n", b"\n", b"\n"],
+            Some((2, 1)),
+        ),
+        // jq reads 4095 bytes at a time: a value completed in a full read
+        // leaves an empty final one, and a bare `1` at the very end is
+        // completed by the end itself.
+        (
+            &["-nc", "[inputs] | error(\"y\")"],
+            vec![one_then_long.as_bytes()],
+            Some((0, 0)),
+        ),
+        (
+            &["-nc", "[inputs] | error(\"y\")"],
+            vec![long_then_one.as_bytes()],
+            None,
+        ),
+        // Without `-n`, the `break` an `input` past the end raises.
+        (&["-c", "input"], vec![b"1 2 3"], None),
+        (&["-c", "input"], vec![b"3\n\n"], Some((0, 2))),
+        // `-R`: a line without its newline is completed by the end.
+        (&["-nRc", "[inputs] | error(\"y\")"], vec![b"a\nb"], None),
+        (&["-nRc", "[inputs] | error(\"y\")"], vec![b"a\n "], None),
+        (
+            &["-nRc", "[inputs] | error(\"y\")"],
+            vec![b"a\nb\n\n"],
+            Some((0, 3)),
+        ),
+    ];
+    for (args, sources, expected) in rows {
+        let (_, stderr, code, paths) = run_jq_over_byte_files(args, sources)?;
+        let location = match expected {
+            None => "<unknown>".to_string(),
+            Some((i, line)) => format!("{}:{line}", paths[*i]),
+        };
+        let message = if args.contains(&"input") {
+            "break"
+        } else {
+            "y"
+        };
+        assert_eq!(
+            (stderr.lines().last(), code),
+            (
+                Some(format!("jq: error (at {location}): {message}").as_str()),
+                5
+            ),
+            "{args:?} over {sources:?}: {stderr}"
+        );
+    }
+    // stdin is the same stream, named `<stdin>`.
+    for (input, expected) in [("1 2 3", "<unknown>"), ("3\n\n", "<stdin>:2")] {
+        let (_, stderr, code) = run_jq_full(&["-c", "input"], Some(input))?;
+        assert_eq!(
+            (stderr.trim_end(), code),
+            (format!("jq: error (at {expected}): break").as_str(), 5),
+            "{input:?}"
+        );
+    }
+    Ok(())
+}
