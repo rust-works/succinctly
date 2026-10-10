@@ -387,6 +387,17 @@ pub trait EvalSemantics: Copy + Default {
     /// cursor route and real yq v4.53.3 answer (`first((.a, error("E2")) |
     /// key)` raises `E2` alone) and the prefetch already reproduces.
     const CONSUMERS_DRIVE_PREFETCHED_BODY: bool;
+
+    /// If true (jq, #4293), a pipe whose stages before the last may have an
+    /// effect (`pipe_effect_before_last`) is run depth-first, by the
+    /// streaming driver, instead of by the staged fold that runs each stage
+    /// over every input first: jq never runs `("x" | debug)` in
+    /// `[(1, ("x" | debug)) | .x]`, because `.x` raises on `1` before the
+    /// `,` produces its second output. If false (yq), the staged fold stays:
+    /// yq's pipes collect their left side before the next stage runs (see
+    /// [`Self::CONSUMERS_DRIVE_PREFETCHED_BODY`]), and yq has none of the
+    /// effectful builtins outside `--jq-extensions`.
+    const PIPE_EFFECTS_RUN_DEPTH_FIRST: bool;
 }
 
 /// jq-compatible evaluation semantics (default).
@@ -428,6 +439,7 @@ impl EvalSemantics for JqSemantics {
     const ERROR_OF_EMPTY_MESSAGE_ABORTS: bool = false;
     const ALTERNATIVE_IS_PER_LEFT_OUTPUT: bool = false;
     const CONSUMERS_DRIVE_PREFETCHED_BODY: bool = true;
+    const PIPE_EFFECTS_RUN_DEPTH_FIRST: bool = true;
 }
 
 /// yq-compatible evaluation semantics.
@@ -471,6 +483,7 @@ impl EvalSemantics for YqSemantics {
     const ERROR_OF_EMPTY_MESSAGE_ABORTS: bool = true;
     const ALTERNATIVE_IS_PER_LEFT_OUTPUT: bool = true;
     const CONSUMERS_DRIVE_PREFETCHED_BODY: bool = false;
+    const PIPE_EFFECTS_RUN_DEPTH_FIRST: bool = false;
 }
 
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
@@ -3275,6 +3288,45 @@ pub(crate) fn pipe_needs_path_context(stages: &PipeStages) -> bool {
     stages.needs_path_context_or_init(|stages| stages.iter().any(needs_path_context))
 }
 
+/// Whether a stage before the last of a pipe may have an effect, remembered on
+/// the pipe (#4293).
+///
+/// jq runs a pipe depth-first: each output of a stage goes through the rest of
+/// the pipe before the stage produces its next one. A fold that runs a stage
+/// over every input before the next stage starts produces the same values in
+/// the same order, but runs an effect of a later output (a `debug` write, an
+/// `input` read) before a raise of the stages after it on an earlier one, so
+/// `[(1, ("x" | debug)) | .x]` wrote the `DEBUG` line jq never reaches. The
+/// last stage's own effects are in jq's order either way: it runs once per
+/// input, in order.
+///
+/// Remembered, not walked per dispatch: the walk follows a `def` call into its
+/// body, and a pipe inside a recursive `def` is dispatched once per level.
+pub(crate) fn pipe_effect_before_last(stages: &PipeStages) -> bool {
+    stages.effect_before_last_or_init(stages_effect_before_last)
+}
+
+/// [`pipe_effect_before_last`] over a stage slice, unremembered.
+///
+/// A read of the input state (`input_line_number`, `input_filename`) counts
+/// too: it is not an effect, but the fold ran it ahead of an `input` in a later
+/// stage, so `[(input_line_number, input_line_number) | [., input]]` read `0`
+/// twice where jq reads `0`, then `1`.
+pub(crate) fn stages_effect_before_last(stages: &[Expr]) -> bool {
+    match stages.split_last() {
+        Some((_, before)) => before.iter().any(|stage| {
+            walk_body_may_have_effects(stage)
+                || any_subexpr(stage, &mut |e| {
+                    matches!(
+                        e,
+                        Expr::Builtin(Builtin::InputLineNumber | Builtin::InputFilename)
+                    )
+                })
+        }),
+        None => false,
+    }
+}
+
 /// Whether any `\(...)` slot in a string interpolation needs path context
 /// (#1334) -- one definition shared by [`needs_path_context`]'s own
 /// `StringInterpolation` arm (the routing question: does the *whole* pipe
@@ -3571,7 +3623,16 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Expr::Optional(inner) => eval_try::<W, S>(inner, None, value, optional),
 
         Expr::Pipe(exprs) => {
-            eval_pipe::<W, S>(exprs, Some(pipe_needs_path_context(exprs)), value, optional)
+            let effect_before_last = S::PIPE_EFFECTS_RUN_DEPTH_FIRST
+                && exprs.len() > 1
+                && pipe_effect_before_last(exprs);
+            eval_pipe::<W, S>(
+                exprs,
+                Some(pipe_needs_path_context(exprs)),
+                Some(effect_before_last),
+                value,
+                optional,
+            )
         }
 
         Expr::Comma(exprs) => eval_comma::<W, S>(exprs, value, optional),
@@ -9573,7 +9634,10 @@ fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // which produces wrong output rather than an error.
     let needs_path = needs_path.unwrap_or_else(|| exprs.iter().any(needs_path_context));
     if needs_path {
-        return drain_result(eval_pipe::<W, S>(exprs, Some(true), value, optional), sink);
+        return drain_result(
+            eval_pipe::<W, S>(exprs, Some(true), None, value, optional),
+            sink,
+        );
     }
 
     let Some((first, rest)) = exprs.split_first() else {
@@ -26120,6 +26184,7 @@ fn promote_and_extend<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     exprs: &[Expr],
     needs_path: Option<bool>,
+    effect_before_last: Option<bool>,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
@@ -26142,7 +26207,16 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // downstream. A parenthesized bind needs the downstream escape while
     // its alternatives are still live, so drive this shape through the
     // staged pipe and collect its finished outputs.
-    if matches!(exprs.first(), Some(Expr::Paren(inner)) if matches!(inner.as_ref(), Expr::AsPattern { .. }))
+    //
+    // So does an effect before the last stage (#4293): completing stage 1
+    // first runs its effects, and those of every stage after it, for outputs
+    // jq never reaches once a later stage raises. `rest` below is a suffix of
+    // `exprs` with the same last stage, so its answer is `false` whenever this
+    // one is: the recursive calls pass it rather than walk.
+    let effect_before_last = effect_before_last
+        .unwrap_or_else(|| S::PIPE_EFFECTS_RUN_DEPTH_FIRST && stages_effect_before_last(exprs));
+    if effect_before_last
+        || matches!(exprs.first(), Some(Expr::Paren(inner)) if matches!(inner.as_ref(), Expr::AsPattern { .. }))
     {
         let mut outputs = Vec::new();
         let mut conversion_error = None;
@@ -26173,7 +26247,7 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     // Apply remaining expressions to the result
     match result.materialize_cursor() {
-        QueryResult::One(v) => eval_pipe::<W, S>(rest, None, v, optional),
+        QueryResult::One(v) => eval_pipe::<W, S>(rest, None, Some(false), v, optional),
         QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::Many(values) => {
             // Rest-of-pipe applied per element may yield borrowed (One/Many) OR
@@ -26184,7 +26258,7 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let mut borrowed: Vec<StandardJson<'a, W>> = Vec::new();
             let mut owned: Option<Vec<OwnedValue>> = None;
             for v in values {
-                match eval_pipe::<W, S>(rest, None, v, optional).materialize_cursor() {
+                match eval_pipe::<W, S>(rest, None, Some(false), v, optional).materialize_cursor() {
                     QueryResult::One(r) => {
                         if let Err(e) =
                             push_promoted::<_, S>(core::iter::once(r), &mut borrowed, &mut owned)
@@ -114279,6 +114353,66 @@ mod tests {
                     "{filter}, each: {each}"
                 );
             }
+        }
+    }
+
+    /// #4293: only an effect *before* the last stage counts -- the last stage
+    /// runs once per input, in order, so its effects are in jq's order on any
+    /// route -- and a read of the input state there counts like an effect. (An effect behind a `def` call is pinned by the CLI test, since a
+    /// parsed program holds the call unresolved.)
+    #[test]
+    fn stages_effect_before_last_ignores_the_last_stage_4293() {
+        for (filter, expected) in [
+            (".a | debug", false),
+            ("(1, 2) | . + 1", false),
+            ("(1, 2) | (debug, input)", false),
+            ("debug | .a", true),
+            ("(1, input) | error", true),
+            ("(1, 2) | stderr | .a", true),
+            ("(input_line_number, 1) | . + 1", true),
+            ("input_filename | input", true),
+            ("1 | input_line_number", false),
+        ] {
+            let pipe = parse(filter).unwrap();
+            let Expr::Pipe(stages) = &pipe else {
+                panic!("{filter}: not a pipe"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3673)"
+            };
+            assert_eq!(stages_effect_before_last(stages), expected, "{filter}");
+        }
+        assert!(!stages_effect_before_last(&[]));
+    }
+
+    /// #4293: this evaluator's `Expr::Pipe` arm asks the pipe node's memo in jq
+    /// mode, and does not walk at all in yq mode, which keeps the staged fold.
+    #[test]
+    fn eval_pipe_remembers_its_effect_gate_4293() {
+        let json = b"[1,2]";
+        let index = JsonIndex::build(json);
+        // `input`, not `debug`: the dispatch only has to ask, and a raise
+        // (no inputs are registered here) writes nothing to the test's stderr.
+        for (filter, effect) in [(".[] | input | . + 1", true), (".[] | . + 1", false)] {
+            let pipe = parse(filter).unwrap();
+            let Expr::Pipe(stages) = &pipe else {
+                panic!("{filter}: not a pipe"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3673)"
+            };
+            let _ = eval_single::<Vec<u64>, YqSemantics>(&pipe, index.root(json).value(), false);
+            assert_eq!(
+                stages.effect_before_last_or_init(|_| !effect),
+                !effect,
+                "{filter}: yq mode never asked"
+            );
+            let pipe = parse(filter).unwrap();
+            let Expr::Pipe(stages) = &pipe else {
+                panic!("{filter}: not a pipe"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3673)"
+            };
+            let _ = eval_single::<Vec<u64>, JqSemantics>(&pipe, index.root(json).value(), false);
+            assert_eq!(
+                stages.effect_before_last_or_init(|_| unreachable!(
+                    "{filter}: answered by the dispatch"
+                )),
+                effect,
+                "{filter}"
+            );
         }
     }
 

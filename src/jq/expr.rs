@@ -1820,8 +1820,8 @@ impl core::fmt::Debug for ArithSettleMemo {
     }
 }
 
-/// An [`Expr::Pipe`]'s stages, and whether any of them needs path context
-/// (#3886).
+/// An [`Expr::Pipe`]'s stages, whether any of them needs path context
+/// (#3886), and whether a stage before the last may have an effect (#4293).
 ///
 /// Reads as the `Vec<Expr>` it wraps (`Deref`), so a pipe's stages are matched
 /// and indexed as before. The remembered answer is `eval::needs_path_context`
@@ -1836,6 +1836,7 @@ impl core::fmt::Debug for ArithSettleMemo {
 pub struct PipeStages {
     stages: Vec<Expr>,
     needs_path_context: core::cell::Cell<Option<bool>>,
+    effect_before_last: core::cell::Cell<Option<bool>>,
 }
 
 impl PipeStages {
@@ -1848,7 +1849,16 @@ impl PipeStages {
         memo(&self.needs_path_context, || classify(&self.stages))
     }
 
-    /// The stages, without the remembered answer.
+    /// Whether a stage before the last may have an effect, computing it with
+    /// `classify` on the first call (#4293).
+    pub(crate) fn effect_before_last_or_init(
+        &self,
+        classify: impl FnOnce(&[Expr]) -> bool,
+    ) -> bool {
+        memo(&self.effect_before_last, || classify(&self.stages))
+    }
+
+    /// The stages, without the remembered answers.
     pub fn into_vec(self) -> Vec<Expr> {
         self.stages
     }
@@ -1859,6 +1869,7 @@ impl From<Vec<Expr>> for PipeStages {
         Self {
             stages,
             needs_path_context: core::cell::Cell::new(None),
+            effect_before_last: core::cell::Cell::new(None),
         }
     }
 }
@@ -1880,6 +1891,7 @@ impl core::ops::Deref for PipeStages {
 impl core::ops::DerefMut for PipeStages {
     fn deref_mut(&mut self) -> &mut Vec<Expr> {
         self.needs_path_context.set(None);
+        self.effect_before_last.set(None);
         &mut self.stages
     }
 }
@@ -3661,10 +3673,15 @@ mod tests {
             unreachable!(); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3673)"
         };
         assert!(rewritten_stages.needs_path_context_or_init(|_| true));
+        assert!(rewritten_stages.effect_before_last_or_init(|_| true));
         rewritten_stages.push(Expr::Identity);
         assert!(
             !rewritten_stages.needs_path_context_or_init(|_| false),
             "a rewrite forgets"
+        );
+        assert!(
+            !rewritten_stages.effect_before_last_or_init(|_| false),
+            "a rewrite forgets the effect answer too (#4293)"
         );
         assert_eq!(rewritten_stages.clone().into_vec().len(), 3);
         let mut iterated = asked_stages.clone();
