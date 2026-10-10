@@ -6316,10 +6316,11 @@ struct LineCounter<'a> {
     /// `pos`, for [`read_end_line`](Self::read_end_line).
     line_start: usize,
     /// The first newline at or after some earlier position no later than
-    /// `pos`, or `None` once none is left: [`read_end_line`](Self::read_end_line)
-    /// asks for the next newline after each value, and a line holding many
-    /// values would otherwise be rescanned for each (#4308).
-    next_newline: Option<Option<usize>>,
+    /// `pos` (`bytes.len()` once none is left), or `None` before the first
+    /// search: [`read_end_line`](Self::read_end_line) asks for the next
+    /// newline after each value, and a line holding many values would
+    /// otherwise be rescanned for each (#4308).
+    next_newline: Option<usize>,
 }
 
 impl<'a> LineCounter<'a> {
@@ -6370,18 +6371,16 @@ impl<'a> LineCounter<'a> {
         self.newlines_before_pos += count_newlines(counted);
         self.pos = completes_at;
         let next = match self.next_newline {
-            Some(Some(at)) if at >= completes_at => Some(at),
-            Some(None) => None,
+            Some(at) if at >= completes_at => at,
             _ => self.bytes[completes_at..]
                 .iter()
                 .position(|&b| b == b'\n')
-                .map(|offset| completes_at + offset),
+                .map_or(self.bytes.len(), |offset| completes_at + offset),
         };
         self.next_newline = Some(next);
-        let same_read = next.is_some_and(|newline| {
-            (newline - self.line_start) / JQ_READ_CHUNK
-                == (completes_at - self.line_start) / JQ_READ_CHUNK
-        });
+        let same_read = next < self.bytes.len()
+            && (next - self.line_start) / JQ_READ_CHUNK
+                == (completes_at - self.line_start) / JQ_READ_CHUNK;
         self.newlines_before_pos + usize::from(same_read)
     }
 
@@ -11340,8 +11339,18 @@ mod tests {
                     "mask={mask} end={end}"
                 );
                 assert_eq!(first.file.as_deref(), Some("f.json"));
-                counted = end;
-                assert_eq!(locator.counter.borrow().pos, counted, "read counts to end");
+                // To the byte that completes the value (#4308): a container's
+                // closing byte, a number's following byte.
+                counted = if matches!(bytes[end - 1], b'"' | b']' | b'}') {
+                    end - 1
+                } else {
+                    end
+                };
+                assert_eq!(
+                    locator.counter.borrow().pos,
+                    counted,
+                    "read counts to the completion"
+                );
                 // A second read is the memoised answer, not a second count.
                 assert_eq!(at.get().line, first.line);
                 assert_eq!(locator.counter.borrow().pos, counted);
