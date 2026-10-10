@@ -1972,19 +1972,23 @@ is the revert that established what the other one costs.
    yield, the loud direction. A `foreach` whose INIT navigated and then computed no longer runs its SOURCE as if the
    register were still at the entry. 20 contrived rows in the sampled sweeps that jq answers (a `?//` bind under `try`/`?`
    whose later alternative yields and whose result jq's check then passes) are refused, in the safe direction. Still
-   accepted where jq raises, identical on `main` (#4187): a `(.|.) as {...}` source, a destructure of a bound `$x`
-   (`. as $x | $x as {a:$a} | .`) in a fold source, and `reduce . as {a:$a} ?// $a (0; .a?)`.
+   accepted where jq raises, identical on `main` (#4187, residuals in
+   [#4278](https://github.com/rust-works/succinctly/issues/4278)): a `(.|.) as {...}` source, a destructure of a
+   bound `$x` (`. as $x | $x as {a:$a} | .`) in a fold source, a destructure behind a mixed `?//` chain, a nested
+   bind (a later pipe stage, `if`, a `def` call), and `reduce . as {a:$a} ?// $a (0; .a?)`.
    [#4187](https://github.com/rust-works/succinctly/issues/4187) closes two of the families: a plain bind in front of
    the destructure (`. as $x | . as {a:$a} | .`, `source_destructures_register` stopped at the bind and never read its
    body: its source is a subexpression, so the body meets the register where the bind did) and a `?//` chain of
    destructuring patterns on the bare register (`. as {a:$a} ?// [$a] | .`; a chain with a bare `$var` alternative
-   stays with the by-value drive, which matches jq there). `del(foreach (. as $x | . as {a:$a} | .) as $y (.; .; .))`
+   stays with the by-value drive, which matches jq there, as the sweep's `?// $a` operands show). `del(foreach (. as $x | . as {a:$a} | .) as $y (.; .; .))`
    used to delete the document and `(...) = 9` to replace it; both raise as jq does now, pinned by
    `test_foreach_source_plain_bind_before_a_destructure_refuses_4187` and
-   `test_foreach_source_destructuring_chain_on_the_register_refuses_4187`. Over the 24 register-sweep operands for the
-   plain bind (159,867 rows) 1,579 wrong accepts and 211 wrong answers go to 203 and 34 (the rest is the bound-`$x`
-   source above) and 142 matches are lost to a refusal; over the 12 for the chain (79,947 rows) 1,114 and 156 go to
-   none and 188 matches are lost, in nested `?//` binds and `reduce` sources, all in the safe direction.
+   `test_foreach_source_destructuring_chain_on_the_register_refuses_4187`. Over the 21 register-sweep operands for the two families (279,747 rows, final binary) 3,667 wrong accepts and 491
+   wrong answers go to 203 and 34 (the bound-`$x` source above and the `?// $a` operand, identical on `main`), 2,714
+   refusals become matches, and 442 matches are lost to a refusal, in nested `?//` binds and `reduce` sources, all in
+   the safe direction. A plain-bind source inside another fold's body is refused where jq answers
+   (`[path(reduce range(2) as $i (.; foreach (. as $x | . as {a:$a} | .) as $y (.; .; .)))]` is `[[]]` in jq), as a
+   bare destructure is when the accumulator is not a pass-through.
 
    | Filter                                                   | jq                          | Why succinctly still refuses                                                                                                                                                                                              |
    | -------------------------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

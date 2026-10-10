@@ -75972,6 +75972,16 @@ fn test_foreach_source_plain_bind_before_a_destructure_refuses_4187() -> Result<
             "",
             0,
         ),
+        // The price: inside another fold's body the register is not known to be at `.`, so the
+        // source is refused (as the bare `. as {a:$a}` destructure is when the accumulator is
+        // not a pass-through) where jq answers `[[]]`. A loud refusal, not a wrong answer.
+        (
+            r#"{"a":[1,2],"b":null}"#,
+            r"[path(reduce range(2) as $i (.; foreach (. as $x | . as {a:$a} | .) as $y (.; .; .)))]",
+            "",
+            with_result,
+            5,
+        ),
     ])
 }
 

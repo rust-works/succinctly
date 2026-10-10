@@ -48185,8 +48185,9 @@ fn source_destructures_register(source: &Expr, through_reduce: bool) -> bool {
     }
 }
 
-/// [`routes_destructuring_chain`] for a chain every alternative of which is an array or object
-/// pattern (#4187): the chains a bare-`.` bind meets the register through.
+/// A `?//` chain *every* alternative of which is an array or object pattern (#4187): the chains
+/// a bare-`.` bind source meets the register through. [`routes_destructuring_chain`] asks for
+/// *any* destructuring alternative, which a bind source does not (see its comment).
 fn patterns_all_destructuring_chain(patterns: &[Pattern]) -> bool {
     patterns.len() > 1
         && patterns
@@ -48194,9 +48195,11 @@ fn patterns_all_destructuring_chain(patterns: &[Pattern]) -> bool {
             .all(|pattern| !matches!(pattern, Pattern::Var(_)))
 }
 
-/// A `?//` chain whose every alternative is an array or object pattern (#3948):
-/// jq's register follows the first alternative that matches, which the resolver's
-/// per-alternative walk states.
+/// A `?//` chain with at least one array or object pattern (#3948): jq's register follows the
+/// first alternative that matches, which the resolver's per-alternative walk states. Read where
+/// a fold's *own* loop pattern is a chain over the register. [`patterns_all_destructuring_chain`]
+/// is the narrower question a bind source asks (#4187): the quantifiers differ on purpose, since
+/// a chain with a bare `$var` alternative as a source is better left to the by-value drive.
 fn routes_destructuring_chain(patterns: &[Pattern]) -> bool {
     patterns.len() > 1 && routes_fresh_destructuring(patterns)
 }
