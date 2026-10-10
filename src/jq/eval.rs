@@ -74732,10 +74732,49 @@ fn builtin_debug_msg<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Write raw bytes to stderr. No-op under `no_std` (mirrors `eval_env`'s
 /// std/no_std split just below — there is no OS stderr to write to there).
+/// Also a no-op while [`with_stderr_muted`] is in effect on this thread.
 #[cfg(feature = "std")]
 fn write_stderr(s: &str) {
     use std::io::Write;
+    if STDERR_MUTED.with(core::cell::Cell::get) > 0 {
+        return;
+    }
     let _ = std::io::stderr().write_all(s.as_bytes());
+}
+
+#[cfg(feature = "std")]
+thread_local! {
+    /// Nesting depth of [`with_stderr_muted`] on this thread.
+    static STDERR_MUTED: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+/// Run `f` with every `debug`/`stderr`/`halt_error` write suppressed on this thread (#2709).
+///
+/// For a caller that re-evaluates a filter only for its *value* because the real evaluation is
+/// about to run the same filter and must be the one to fire its side effects: without this, the
+/// yq metadata-assignment pass (`resolve_meta_assign_writes`) re-ran every stage ahead of a
+/// `line_comment =` write, so `.a = (.b | debug) | .a line_comment = "y"` printed the
+/// `["DEBUG:",2]` line twice. Only the output is dropped: the builtins still evaluate, pass
+/// their input through, and `halt_error` still halts. The mute lifts when `f` returns or
+/// unwinds. Without `std` there is no stderr to write to, so this just calls `f`.
+#[cfg(feature = "std")]
+pub fn with_stderr_muted<R>(f: impl FnOnce() -> R) -> R {
+    struct Unmute;
+    impl Drop for Unmute {
+        fn drop(&mut self) {
+            STDERR_MUTED.with(|depth| depth.set(depth.get() - 1));
+        }
+    }
+    STDERR_MUTED.with(|depth| depth.set(depth.get() + 1));
+    let _unmute = Unmute;
+    f()
+}
+
+/// `no_std` stand-in for [`with_stderr_muted`]: nothing is ever written, so there is nothing to
+/// mute.
+#[cfg(not(feature = "std"))]
+pub fn with_stderr_muted<R>(f: impl FnOnce() -> R) -> R {
+    f()
 }
 
 #[cfg(not(feature = "std"))]

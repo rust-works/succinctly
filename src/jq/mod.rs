@@ -102,8 +102,8 @@ pub use error::{BinOp, Control, ErrorKind, EvalError, EvalErrorPayload};
 pub use eval::{
     alias_identity, bound_def, enter_file_index_scope, eval, eval_documents_together, eval_lenient,
     eval_owned_with_file_index, expr_key, is_alias_sensitive_assign, nonfinite_display_string,
-    substitute_vars, sync_aliased_paths, with_stack_budget, DefScope, EvalSemantics,
-    FileIndexScope, JqSemantics, QueryResult, VisibleDef, YqSemantics,
+    substitute_vars, sync_aliased_paths, with_stack_budget, with_stderr_muted, DefScope,
+    EvalSemantics, FileIndexScope, JqSemantics, QueryResult, VisibleDef, YqSemantics,
 };
 #[doc(hidden)]
 pub use eval::{eval_full, eval_owned_scalar_fast, eval_reindexed_document};

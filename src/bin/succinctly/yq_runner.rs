@@ -3628,24 +3628,29 @@ fn evaluate_input_quiet(input: &OwnedValue, expr: &jq::Expr) -> Option<Vec<Owned
         .reindexed_without_provenance::<jq::JqSemantics>()
         .ok()
         .map(std::rc::Rc::new)?;
-    match jq::eval_reindexed_document::<YqSemantics>(expr, &doc) {
-        QueryResult::One(v) => generic_to_owned::<YqSemantics, _>(&v).ok().map(|v| vec![v]),
-        QueryResult::OneCursor(c) => generic_to_owned::<YqSemantics, _>(&c.value())
-            .ok()
-            .map(|v| vec![v]),
-        QueryResult::Many(vs) => vs
-            .iter()
-            .map(generic_to_owned::<YqSemantics, _>)
-            .collect::<Result<_, _>>()
-            .ok(),
-        QueryResult::None => Some(Vec::new()),
-        QueryResult::Owned(v) => Some(vec![v]),
-        QueryResult::ManyOwned(vs) => Some(vs),
-        QueryResult::Error(_)
-        | QueryResult::Break(_)
-        | QueryResult::Halt(_)
-        | QueryResult::Partial(..) => None,
-    }
+    // The real evaluation runs this stage again and must be the only one to fire its side
+    // effects: `debug`, `stderr` and `halt_error` nested in the stage would otherwise write twice
+    // (#2709). The conversion is inside the mute too -- a lazy result can still run a builtin.
+    jq::with_stderr_muted(
+        || match jq::eval_reindexed_document::<YqSemantics>(expr, &doc) {
+            QueryResult::One(v) => generic_to_owned::<YqSemantics, _>(&v).ok().map(|v| vec![v]),
+            QueryResult::OneCursor(c) => generic_to_owned::<YqSemantics, _>(&c.value())
+                .ok()
+                .map(|v| vec![v]),
+            QueryResult::Many(vs) => vs
+                .iter()
+                .map(generic_to_owned::<YqSemantics, _>)
+                .collect::<Result<_, _>>()
+                .ok(),
+            QueryResult::None => Some(Vec::new()),
+            QueryResult::Owned(v) => Some(vec![v]),
+            QueryResult::ManyOwned(vs) => Some(vs),
+            QueryResult::Error(_)
+            | QueryResult::Break(_)
+            | QueryResult::Halt(_)
+            | QueryResult::Partial(..) => None,
+        },
+    )
 }
 
 /// How many `Expr::MetaAssign` nodes `expr` contains anywhere, so
