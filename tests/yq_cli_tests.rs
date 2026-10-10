@@ -61901,6 +61901,141 @@ fn test_comment_after_a_sequence_dash_survives_a_dom_write_4231() -> Result<()> 
             ".[0].k = \"w\"",
             &[][..],
             "- # top\n  k: w\n- # t2\n  - 1\n",
+
+/// Pinned yq v4.53.3: a block scalar whose `|`/`>` header sits on a line of its own, below the
+/// `-` or `key:` that owns it, takes its content from lines indented more than that *parent*
+/// block -- which can be no more than the header itself (`a:` / `  >` / `  text`). It used to
+/// read as an empty string (and, under a mapping key, split into a stray `text: b` entry),
+/// losing the text on every read and write (#4259). Every row was captured from the pinned
+/// binary; the writes carry no comment after the dash (that comment is #4231's).
+#[test]
+fn test_block_scalar_header_on_its_own_line_4259() -> Result<()> {
+    for (input, filter, args, expected) in [
+        (
+            "a:\n  - # c\n    >\n    text\n",
+            ".",
+            &["-o=json", "-I=0"][..],
+            "{\"a\":[\"text\\n\"]}\n",
+        ),
+        (
+            "a:\n  - # c\n    >\n    text\n",
+            ".",
+            &[][..],
+            "a:\n  # c\n  - >\n    text\n\n",
+        ),
+        (
+            "a:\n  - # c\n    |-\n    t1\n    t2\n",
+            ".",
+            &["-o=json", "-I=0"][..],
+            "{\"a\":[\"t1\\nt2\"]}\n",
+        ),
+        (
+            "a:\n  - # c\n    |-\n    t1\n    t2\n",
+            ".",
+            &[][..],
+            "a:\n  # c\n  - |-\n    t1\n    t2\n",
+        ),
+        (
+            "a:\n  - # c\n    >2\n     text\n",
+            ".",
+            &["-o=json", "-I=0"][..],
+            "{\"a\":[\" text\\n\"]}\n",
+        ),
+        (
+            "a:\n  - # c\n    >2\n     text\n",
+            ".",
+            &[][..],
+            "a:\n  # c\n  - >2\n     text\n",
+        ),
+        (
+            "a:\n  -\n    >\n    text\n  - x\n",
+            ".",
+            &["-o=json", "-I=0"][..],
+            "{\"a\":[\"text\\n\",\"x\"]}\n",
+        ),
+        (
+            "a:\n  -\n    >\n    text\n  - x\n",
+            ".",
+            &[][..],
+            "a:\n  - >\n    text\n\n  - x\n",
+        ),
+        (
+            "a:\n  >\n  text\nb: 1\n",
+            ".",
+            &["-o=json", "-I=0"][..],
+            "{\"a\":\"text\\n\",\"b\":1}\n",
+        ),
+        (
+            "a:\n  >\n  text\nb: 1\n",
+            ".",
+            &[][..],
+            "a: >\n  text\n\nb: 1\n",
+        ),
+        (
+            "a:\n  # c\n  |\n    text\nb: 1\n",
+            ".",
+            &["-o=json", "-I=0"][..],
+            "{\"a\":\"text\\n\",\"b\":1}\n",
+        ),
+        (
+            "a:\n  # c\n  |\n    text\nb: 1\n",
+            ".",
+            &[][..],
+            "a: |\n  text\n# c\nb: 1\n",
+        ),
+        (
+            "a:\n  - k:\n      |\n        t\n    j: 1\n",
+            ".",
+            &["-o=json", "-I=0"][..],
+            "{\"a\":[{\"k\":\"t\\n\",\"j\":1}]}\n",
+        ),
+        (
+            "a:\n  - k:\n      |\n        t\n    j: 1\n",
+            ".",
+            &[][..],
+            "a:\n  - k: |\n      t\n    j: 1\n",
+        ),
+        (
+            "a:\n  - |\n    t\n  -\n    |+\n    u\n\n  - z\n",
+            ".",
+            &["-o=json", "-I=0"][..],
+            "{\"a\":[\"t\\n\",\"u\\n\\n\",\"z\"]}\n",
+        ),
+        (
+            "a:\n  - |\n    t\n  -\n    |+\n    u\n\n  - z\n",
+            ".",
+            &[][..],
+            "a:\n  - |\n    t\n  - |+\n    u\n\n  - z\n",
+        ),
+        (
+            "x:\n  y:\n    >\n    folded\n    more\n  z: 1\n",
+            ".",
+            &["-o=json", "-I=0"][..],
+            "{\"x\":{\"y\":\"folded more\\n\",\"z\":1}}\n",
+        ),
+        (
+            "x:\n  y:\n    >\n    folded\n    more\n  z: 1\n",
+            ".",
+            &[][..],
+            "x:\n  y: >\n    folded more\n\n  z: 1\n",
+        ),
+        (
+            "a:\n  -\n    >\n    text\n  - x\n",
+            ".z = 1",
+            &[][..],
+            "a:\n  - >\n    text\n\n  - x\nz: 1\n",
+        ),
+        (
+            "a:\n  >\n  text\nb: 1\n",
+            ".b = 2",
+            &[][..],
+            "a: >\n  text\n\nb: 2\n",
+        ),
+        (
+            "x:\n  y:\n    >\n    folded\n    more\n  z: 1\n",
+            ".x.z = 2",
+            &[][..],
+            "x:\n  y: >\n    folded more\n\n  z: 2\n",
         ),
     ] {
         assert_eq!(

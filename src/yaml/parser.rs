@@ -7795,6 +7795,19 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     self.parse_alias()?;
                 }
             }
+            // #4259: a block scalar whose header sits on a line of its own, below the `-` or
+            // `key:` that owns it (`-` / `  >` / `  text`). Its content has to be indented
+            // more than that *parent* block, which may be no more than the header itself
+            // (`a:` / `  >` / `  text`), where the plain-scalar path below measures it
+            // against the header's own line and cut the scalar short. Inside a container
+            // only: the document root has its own handling (`>` at column 0).
+            Some(b'|' | b'>') if !self.json_strict && self.type_stack.len() > 1 => {
+                self.check_mapping_under_mapping_gap(indent, false)?;
+                self.close_deeper_indents(indent);
+                self.attach_document_root_node(indent);
+                let parent = self.innermost_block_indent();
+                self.parse_block_scalar(parent)?;
+            }
             Some(_) => {
                 // Check if this looks like a mapping entry (has `: ` on this line)
                 // This handles both quoted keys ("foo": bar) and unquoted keys (foo: bar)
