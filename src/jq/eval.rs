@@ -5889,12 +5889,21 @@ pub(crate) fn try_swallows_scalar_iteration(expr: &Expr, catch: Option<&Expr>) -
 /// this one. Operands are peeled by [`unwrap_bind_source`], as above, so a
 /// closure argument (`def opt(f): f?;` called as `opt(path(.[]))`) matches too.
 pub(crate) fn try_swallows_scalar_value_iteration(expr: &Expr, catch: Option<&Expr>) -> bool {
-    let iterates = match unwrap_bind_source(expr) {
+    iterates_at_value_position(expr) && catch.map_or(true, is_empty_handler)
+}
+
+/// Whether a value-position boundary's body is a bare `.[]` or `path(.[])`, each
+/// peeled by [`unwrap_bind_source`]: over a scalar both raise `Cannot iterate over
+/// ...` and nothing else. One definition for the two value-boundary shortcuts,
+/// [`try_swallows_scalar_value_iteration`] and
+/// [`try_catches_scalar_iteration_with_literal`], so they cannot disagree about
+/// which bodies they settle (#4280).
+fn iterates_at_value_position(expr: &Expr) -> bool {
+    match unwrap_bind_source(expr) {
         Expr::Iterate => true,
         Expr::Builtin(Builtin::Path(f)) => matches!(unwrap_bind_source(f), Expr::Iterate),
         _ => false,
-    };
-    iterates && catch.map_or(true, is_empty_handler)
+    }
 }
 
 /// Whether a `catch` handler is the bare builtin `empty`, which delivers nothing
@@ -5910,15 +5919,19 @@ fn is_empty_handler(catch: &Expr) -> bool {
     matches!(unwrap_bind_source(catch), Expr::Builtin(Builtin::Empty))
 }
 
-/// The constant a `try .[] catch LITERAL` boundary answers with for a scalar
-/// input (#3704), or `None` when the boundary is not that shape.
+/// The constant a `try .[] catch LITERAL` or `try path(.[]) catch LITERAL`
+/// boundary answers with for a scalar input (#3704, #4280), or `None` when the
+/// boundary is not that shape.
 ///
 /// The handler of such a boundary never reads its input, so the payload
-/// `.[]` would raise -- a preview string and an owned copy of the scalar --
+/// the body would raise -- a preview string and an owned copy of the scalar --
 /// is built only to be handed to a handler that ignores it, and the handler
 /// then runs over a re-indexed one-scalar document. The literal is the
-/// handler's one output whatever the payload. Same shape rules as
-/// [`try_swallows_scalar_iteration`]: both operands are peeled by
+/// handler's one output whatever the payload. Only the value boundaries ask
+/// this (`caught_scalar_iteration`), so the body is the value-position shape
+/// of [`try_swallows_scalar_value_iteration`]; the path walks never settle a
+/// `path(.[])` here, since `path(...)` is not a path expression there. Same
+/// peeling rules as [`try_swallows_scalar_iteration`]: both operands are peeled by
 /// [`unwrap_bind_source`] (a closure argument arrives as `Expr::Shared`), and
 /// a `def` shadowing nothing here is a `DefCall`, never a `Literal`. A string
 /// with an interpolation is an `Expr::Format`/`Interpolation`, not a
@@ -5927,7 +5940,7 @@ pub(crate) fn try_catches_scalar_iteration_with_literal<'e>(
     expr: &Expr,
     catch: Option<&'e Expr>,
 ) -> Option<&'e Literal> {
-    if !matches!(unwrap_bind_source(expr), Expr::Iterate) {
+    if !iterates_at_value_position(expr) {
         return None;
     }
     match unwrap_bind_source(catch?) {
@@ -124162,23 +124175,30 @@ mod tests {
 
         let iterate = Expr::Iterate;
         let parenthesised = Expr::Paren(Box::new(Expr::Iterate));
+        // #4280: `path(.[])` raises the same error over a scalar.
+        let path_iterate = parse("path(.[])").unwrap();
+        let path_parenthesised = parse("(path((.[])))").unwrap();
+        let path_field = parse("path(.a)").unwrap();
         let literal = parse(r#""c""#).unwrap();
         let piped = parse(r#""c" | ."#).unwrap();
         let reads_input = parse(".").unwrap();
         let empty = parse("empty").unwrap();
         let field = parse(".a").unwrap();
 
-        for body in [&iterate, &parenthesised] {
+        for body in [&iterate, &parenthesised, &path_iterate, &path_parenthesised] {
             match settle::<JqSemantics, _>(body, Some(&literal), &scalar) {
                 Some(Ok(v)) => assert_eq!(v.to_json(), r#""c""#),
                 other => panic!("expected the literal, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3704 pin, only reached when the pin is already failing"
             }
+            match settle::<JqSemantics, _>(body, Some(&literal), &undecodable) {
+                Some(Err(e)) => assert!(e.is_decode_failure()),
+                other => panic!("expected a decode failure, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3704 pin, only reached when the pin is already failing"
+            }
+            assert!(settle::<YqSemantics, _>(body, Some(&literal), &scalar).is_none());
+            assert!(settle::<JqSemantics, _>(body, Some(&literal), &container).is_none());
+            assert!(settle::<JqSemantics, _>(body, Some(&reads_input), &scalar).is_none());
         }
-        match settle::<JqSemantics, _>(&iterate, Some(&literal), &undecodable) {
-            Some(Err(e)) => assert!(e.is_decode_failure()),
-            other => panic!("expected a decode failure, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3704 pin, only reached when the pin is already failing"
-        }
-        assert!(settle::<YqSemantics, _>(&iterate, Some(&literal), &scalar).is_none());
+        assert!(settle::<JqSemantics, _>(&path_field, Some(&literal), &scalar).is_none());
         // Not taken: no handler, a handler that is not a literal, a body that is
         // not a bare `.[]`, a container.
         assert!(settle::<JqSemantics, _>(&iterate, None, &scalar).is_none());
@@ -124255,30 +124275,32 @@ mod tests {
             "1.000",
             "100000000000000000000",
         ] {
-            let constant = format!("try .[] catch {literal}");
-            let evaluated = format!("try .[] catch ({literal} | .)");
-            for json in documents {
-                assert_eq!(
-                    pulled::<JqSemantics>(json, &constant),
-                    pulled::<JqSemantics>(json, &evaluated),
-                    "{constant} on {json:?}"
-                );
-                assert_eq!(
-                    pulled::<YqSemantics>(json, &constant),
-                    pulled::<YqSemantics>(json, &evaluated),
-                    "{constant} on {json:?}, yq"
-                );
-                for stop_after in [1, usize::MAX] {
+            for body in [".[]", "path(.[])"] {
+                let constant = format!("try {body} catch {literal}");
+                let evaluated = format!("try {body} catch ({literal} | .)");
+                for json in documents {
                     assert_eq!(
-                        pushed::<JqSemantics>(json, &constant, stop_after),
-                        pushed::<JqSemantics>(json, &evaluated, stop_after),
-                        "{constant} on {json:?}, stop after {stop_after}"
+                        pulled::<JqSemantics>(json, &constant),
+                        pulled::<JqSemantics>(json, &evaluated),
+                        "{constant} on {json:?}"
                     );
                     assert_eq!(
-                        pushed::<YqSemantics>(json, &constant, stop_after),
-                        pushed::<YqSemantics>(json, &evaluated, stop_after),
-                        "{constant} on {json:?}, yq, stop after {stop_after}"
+                        pulled::<YqSemantics>(json, &constant),
+                        pulled::<YqSemantics>(json, &evaluated),
+                        "{constant} on {json:?}, yq"
                     );
+                    for stop_after in [1, usize::MAX] {
+                        assert_eq!(
+                            pushed::<JqSemantics>(json, &constant, stop_after),
+                            pushed::<JqSemantics>(json, &evaluated, stop_after),
+                            "{constant} on {json:?}, stop after {stop_after}"
+                        );
+                        assert_eq!(
+                            pushed::<YqSemantics>(json, &constant, stop_after),
+                            pushed::<YqSemantics>(json, &evaluated, stop_after),
+                            "{constant} on {json:?}, yq, stop after {stop_after}"
+                        );
+                    }
                 }
             }
         }
@@ -124291,6 +124313,19 @@ mod tests {
         };
         let constant = r#"try .[] catch "c""#;
         let evaluated = r#"try .[] catch ("c" | .)"#;
+        assert_eq!(
+            reindexes(&|| drop(pulled::<JqSemantics>(b"5", constant))),
+            0
+        );
+        assert_eq!(
+            reindexes(&|| drop(pushed::<JqSemantics>(b"5", constant, usize::MAX))),
+            0
+        );
+        assert!(reindexes(&|| drop(pulled::<JqSemantics>(b"5", evaluated))) > 0);
+        assert!(reindexes(&|| drop(pushed::<JqSemantics>(b"5", evaluated, usize::MAX))) > 0);
+        // #4280: the same for a `path(.[])` body.
+        let constant = r#"try path(.[]) catch "c""#;
+        let evaluated = r#"try path(.[]) catch ("c" | .)"#;
         assert_eq!(
             reindexes(&|| drop(pulled::<JqSemantics>(b"5", constant))),
             0

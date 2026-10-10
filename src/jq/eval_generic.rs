@@ -1726,8 +1726,9 @@ pub(crate) fn swallowed_scalar_iteration<S: EvalSemantics, V: DocumentValue>(
     Some(scalar_decode_error(value).map_or(Ok(()), Err))
 }
 
-/// What `try .[] catch LITERAL` settles for a scalar `value` without raising
-/// the `Cannot iterate over ...` error its handler would be handed (#3704), or
+/// What `try .[] catch LITERAL` (or `try path(.[]) catch LITERAL`, #4280)
+/// settles for a scalar `value` without raising the `Cannot iterate over ...`
+/// error its handler would be handed (#3704), or
 /// `None` when it must evaluate: `Some(Ok(v))` is the handler's one output,
 /// the literal, and `Some(Err(e))` the failure `try` never catches
 /// ([`scalar_decode_error`]), as in [`swallowed_scalar_iteration`], whose

@@ -20,6 +20,9 @@
 //! which the other two never reach for a document cursor, so only a row here
 //! fails if those shortcuts are deleted).
 //!
+//! `try path(.[]) catch LITERAL` raises the same error over a scalar and takes
+//! the same shortcut (#4280); it is measured beside `.[]` on every route.
+//!
 //! A handler that reads its input (`catch .`) still builds the payload; it is
 //! measured as the lower bound of what the shortcut saves.
 //!
@@ -189,6 +192,8 @@ fn a_caught_iteration_over_a_scalar_allocates_no_more_than_its_twin_3704() {
                 format!("[.[] | try .[] catch {literal}] | length"),
                 // Parenthesised, and a closure argument (`Expr::Shared`).
                 format!("[.[] | (try (.[]) catch {literal})] | length"),
+                // `path(.[])` raises the same error over a scalar (#4280).
+                format!("[.[] | try path(.[]) catch {literal}] | length"),
             ] {
                 let (caught, answered) = allocations_collecting(&query, &json);
                 assert_eq!(answered, N as i64, "{name}: `{query}` answers the literal");
@@ -228,6 +233,7 @@ fn a_caught_iteration_over_a_scalar_allocates_no_more_than_its_twin_when_streame
             for query in [
                 format!(".[] | try .[] catch {literal}"),
                 format!(".[] | (try (.[]) catch {literal})"),
+                format!(".[] | try path(.[]) catch {literal}"),
             ] {
                 let (caught, outputs) = allocations_streaming(&query, &json);
                 assert_eq!(outputs, N, "{name}: `{query}` answers the literal");
@@ -252,21 +258,29 @@ fn a_caught_iteration_over_a_scalar_allocates_no_more_than_its_twin_on_the_value
             let (twin, answered) = allocations_value_route(&twin_query, &json);
             assert_eq!(answered, N as i64, "{name}: the twin's answer");
 
-            let query = format!("[.[] | try .[] catch {literal}] | length");
-            let (caught, answered) = allocations_value_route(&query, &json);
-            assert_eq!(answered, N as i64, "{name}: `{query}` answers the literal");
-            assert_costs_like_twin(name, (&query, caught), (&twin_query, twin), allowance);
+            for query in [
+                format!("[.[] | try .[] catch {literal}] | length"),
+                format!("[.[] | try path(.[]) catch {literal}] | length"),
+            ] {
+                let (caught, answered) = allocations_value_route(&query, &json);
+                assert_eq!(answered, N as i64, "{name}: `{query}` answers the literal");
+                assert_costs_like_twin(name, (&query, caught), (&twin_query, twin), allowance);
+            }
 
             // A consumer that pulls the boundary one output at a time reaches
             // `each_try` rather than `eval_try`; its twin is the same consumer
             // over the bare literal.
             let twin_query = format!("[.[] | first({literal})] | length");
-            let query = format!("[.[] | first(try .[] catch {literal})] | length");
             let (twin, answered) = allocations_value_route(&twin_query, &json);
             assert_eq!(answered, N as i64, "{name}: the twin's answer");
-            let (caught, answered) = allocations_value_route(&query, &json);
-            assert_eq!(answered, N as i64, "{name}: `{query}` answers the literal");
-            assert_costs_like_twin(name, (&query, caught), (&twin_query, twin), allowance);
+            for query in [
+                format!("[.[] | first(try .[] catch {literal})] | length"),
+                format!("[.[] | first(try path(.[]) catch {literal})] | length"),
+            ] {
+                let (caught, answered) = allocations_value_route(&query, &json);
+                assert_eq!(answered, N as i64, "{name}: `{query}` answers the literal");
+                assert_costs_like_twin(name, (&query, caught), (&twin_query, twin), allowance);
+            }
         }
     }
 }
