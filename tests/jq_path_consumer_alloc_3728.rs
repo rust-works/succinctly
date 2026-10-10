@@ -112,6 +112,11 @@ fn assert_rows_like_twin(rows: &[(&str, &str, i64, usize)]) {
 /// seeds nor runs it. The body is `error("x")`, not `.[]`, so no other
 /// shortcut is in play: the twin differs only in a handler (`empty | empty`)
 /// that is not the bare `empty` the shortcut matches, and so is run.
+///
+/// The bound is 5 allocator calls per member, down from 10 (#4226): the lone-leaf
+/// shortcuts (#4155, #4226) made the handler the twin has to run cheaper, so the
+/// saving from not running it is smaller than when this was written (7 per member on
+/// the booleans-and-nulls document). With the shortcut deleted the two cost the same.
 #[test]
 fn a_catch_empty_handler_in_path_f_is_not_run_3728() {
     for (name, json) in fixtures() {
@@ -127,9 +132,9 @@ fn a_catch_empty_handler_in_path_f_is_not_run_3728() {
         // bridge document's three index buffers (it was 10 when each crossing
         // allocated them). `allocations_collecting` warms the thread's pool.
         assert!(
-            empty + 7 * N <= run,
+            empty + 5 * N <= run,
             "{name}: `catch empty` made {empty} allocator calls and the handler the resolver \
-             has to run made {run}; not running it should save at least 7 per member"
+             has to run made {run}; not running it should save at least 5 per member"
         );
         let (streamed, outputs) =
             allocations_streaming(".[] | path(try error(\"x\") catch empty)", &json);
@@ -137,7 +142,7 @@ fn a_catch_empty_handler_in_path_f_is_not_run_3728() {
         let (streamed_run, _) =
             allocations_streaming(".[] | path(try error(\"x\") catch (empty | empty))", &json);
         assert!(
-            streamed + 7 * N <= streamed_run,
+            streamed + 5 * N <= streamed_run,
             "{name}: streamed, {streamed} against {streamed_run}"
         );
     }
@@ -274,6 +279,53 @@ fn a_lone_leaf_in_path_f_is_resolved_without_cloning_or_walking_4155() {
                 ("[.[] | path(.)] | length", twin_cost),
                 7,
             );
+        }
+    }
+}
+
+/// A lone scalar `.` leaf in `path(f)` costs what `path(.)` does (#4226). #4179 left `. // .`
+/// and `first(.)` at 5 allocator calls per scalar member against `path(.)`'s 3: the
+/// member's copy, a `Vec` of one branch, a fresh root `PathPrefix`, and the output array
+/// and sink state both pay. The member's copy stands in for the twin's walker root, so the
+/// bound is the twin's cost plus half an allocator call per member, less than the one call
+/// per member that restoring either allocation below would add. Each has a row that fails
+/// with only it deleted:
+///
+/// - the branch emitted straight to the sink (`lone_scalar_identity` in
+///   `resolve_leaf_sink`): a restored `Vec` of one branch;
+/// - the shared root (`PathPrefix::root`): a restored node per call (`std` only; `no_std`
+///   allocates one per call and is allowed that one more call per member).
+///
+/// The streaming entry (`succinctly jq` drives it) takes the same resolver.
+#[test]
+fn a_lone_scalar_dot_in_path_f_costs_what_path_dot_does_4226() {
+    // `no_std` has no thread-local to share the root through, so there it allocates a node per
+    // call: one more allocator call per member (two halves), still under the two the `Vec`
+    // restored on top of it would make.
+    let allowance_halves = if cfg!(feature = "std") { 1 } else { 2 };
+    assert_rows_like_twin(&[
+        (
+            "[.[] | path(. // .)] | length",
+            "[.[] | path(.)] | length",
+            N as i64,
+            allowance_halves,
+        ),
+        (
+            "[.[] | path(first(.))] | length",
+            "[.[] | path(.)] | length",
+            N as i64,
+            allowance_halves,
+        ),
+    ]);
+
+    for (name, json) in fixtures() {
+        let twin = ".[] | path(.)";
+        let (twin_cost, outputs) = allocations_streaming(twin, &json);
+        assert_eq!(outputs, N, "{name}: `{twin}` emits a path per member");
+        for lone in [".[] | path(. // .)", ".[] | path(first(.))"] {
+            let (cost, outputs) = allocations_streaming(lone, &json);
+            assert_eq!(outputs, N, "{name}: `{lone}` emits a path per member");
+            assert_costs_like_twin(name, (lone, cost), (twin, twin_cost), allowance_halves);
         }
     }
 }

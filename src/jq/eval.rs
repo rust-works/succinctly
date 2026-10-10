@@ -38133,14 +38133,33 @@ impl PathPrefix {
         }
     }
 
-    /// A fresh, empty chain. Not a shared singleton: this crate is
-    /// `no_std`-compatible (no `thread_local`/`once_cell`-style sharing
-    /// available), and re-allocating one `Root` node per fresh chain is O(1)
-    /// regardless. Callers that build many siblings off the same root (e.g.
-    /// per-element loops) should hoist a single `root()` call outside the
-    /// loop and `Rc::clone` it, not call `root()` per element.
+    /// An empty chain. Under `std` a handle on one per-thread `Root` (#4226): a
+    /// `path(f)` per member of a wide fan-out resolves a lone leaf to the root, and
+    /// allocating a node per call was one of the five allocator calls it made for a
+    /// scalar member. `Root` carries nothing and no chain is ever mutated through its
+    /// `Rc`, so sharing it is unobservable; the pointer comparisons made on chains
+    /// ([`same_node_path`], [`same_frame_position`]) are fast paths ahead of a
+    /// structural comparison that also calls two roots equal.
+    ///
+    /// `no_std` has no `thread_local`, so each call there allocates its own node, O(1)
+    /// regardless. Callers that build many siblings off the same root (e.g. per-element
+    /// loops) there should hoist a single `root()` call outside the loop and
+    /// `Rc::clone` it, not call `root()` per element.
     fn root() -> Rc<Self> {
-        Rc::new(Self::Root)
+        #[cfg(feature = "std")]
+        {
+            std::thread_local! {
+                static ROOT: Rc<PathPrefix> = Rc::new(PathPrefix::Root);
+            }
+            // A thread already tearing down its locals can still drop a resolver value that
+            // asks for a root; it gets a node of its own rather than a panic.
+            ROOT.try_with(Rc::clone)
+                .unwrap_or_else(|_| Rc::new(Self::Root))
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            Rc::new(Self::Root)
+        }
     }
 
     fn depth(&self) -> usize {
@@ -43127,6 +43146,15 @@ fn resolve_leaf_sink<'a, S: EvalSemantics>(
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
     let register_loss = &frame.register_loss;
+    // #4226: the lone-scalar `.` bypasses `resolve_leaf`'s `Vec` of one branch, which
+    // `drain_path_result` would empty into this sink on the next line. Any `keep` takes it:
+    // it produces exactly one branch and consumes no generator.
+    if let Some(branch) = lone_scalar_identity(expr, value, trackable) {
+        return match sink(branch) {
+            Demand::Continue => ResolveFlow::Exhausted,
+            Demand::Stop => ResolveFlow::Stopped,
+        };
+    }
     let Keep::AtMost(limit) = keep else {
         return drain_path_result(
             resolve_leaf::<S>(expr, value, trackable, snapshot, frame, keep),
@@ -43269,6 +43297,23 @@ fn error_message_first_navigation(expr: &Expr) -> Option<BuiltinNavigation> {
     }
 }
 
+/// The one branch a trackable `.` over a scalar resolves to (#4155): that scalar, borrowed.
+/// Evaluating it would clone the value into a `Vec` just to pop it back out, and a scalar
+/// shares no storage a container's clone would, so borrowing it is not observable.
+///
+/// One definition for [`resolve_leaf_bounded`] and [`resolve_leaf_sink`], so the collecting
+/// and the streaming form cannot disagree about which shape takes the shortcut (#4226).
+fn lone_scalar_identity<'a>(
+    expr: &Expr,
+    value: &'a OwnedValue,
+    trackable: bool,
+) -> Option<PathBranch<'a>> {
+    (trackable
+        && matches!(expr, Expr::Identity)
+        && !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)))
+    .then(|| PathBranch::new(PathPrefix::root(), Cow::Borrowed(value), true))
+}
+
 /// [`resolve_leaf`]'s bounded prefix: the shapes that produce at most one
 /// branch without consuming a generator -- an untrackable navigation
 /// refusal, an untracked `.`, and the `is_primitive` family. `None` means
@@ -43401,17 +43446,8 @@ fn resolve_leaf_bounded<'a, S: EvalSemantics>(
         );
 
     if is_primitive {
-        // #4155: `.` over a scalar is that scalar. Evaluating it would clone the
-        // value into a `Vec` just to pop it back out, and a scalar shares no
-        // storage a container's clone would, so borrowing it is not observable.
-        if matches!(expr, Expr::Identity)
-            && !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_))
-        {
-            return Some(Ok(vec![PathBranch::new(
-                PathPrefix::root(),
-                Cow::Borrowed(value),
-                true,
-            )]));
+        if let Some(branch) = lone_scalar_identity(expr, value, trackable) {
+            return Some(Ok(vec![branch]));
         }
         // This arm needs every output, not just the first: `values.len()`
         // (0 vs 1 vs many) decides which of three different outcomes this

@@ -115021,6 +115021,35 @@ fn test_path_f_lone_leaf_resolution_answers_what_it_did_4155() -> Result<()> {
         ),
         (MIXED, "[path(. // .)]", "[[]]\n", "", 0),
         (MIXED, "[limit(1; path(. // .))]", "[[]]\n", "", 0),
+        // #4226: the single branch goes straight to the consumer, which can stop it.
+        (
+            MIXED,
+            "[.[] | first(path(. // .))]",
+            "[[],[],[],[],[],[]]\n",
+            "",
+            0,
+        ),
+        (
+            MIXED,
+            "[.[] | isempty(path(. // .))]",
+            "[false,false,false,false,false,false]\n",
+            "",
+            0,
+        ),
+        (
+            MIXED,
+            "[.[] | [limit(2; path(first(.)))]]",
+            "[[[]],[[]],[[]],[[]],[[]],[[]]]\n",
+            "",
+            0,
+        ),
+        (
+            MIXED,
+            "[.[] | label $out | path(. // .), break $out]",
+            "[[],[],[],[],[],[]]\n",
+            "",
+            0,
+        ),
         // A trailing iterate is still deferred out of the flattened components.
         (MIXED, "[path(.[] // .)]", "[[0],[1],[4],[5]]\n", "", 0),
         (MIXED, "[path(first(.[]))]", "[[0]]\n", "", 0),
