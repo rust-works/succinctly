@@ -56346,6 +56346,54 @@ fn wide_document_array_reads_agree_with_jq_across_repeated_reads_4035() -> Resul
     Ok(())
 }
 
+/// #4162: a computed index read in a path context (`path(.[$i])`,
+/// `getpath([$i]) | path(..)`) reads no length, so #4035's index never served
+/// it; a wide array read that way is now answered from a prefix of element ids
+/// the reads extend (`src/jq/array_index.rs`). A loop over a 200-element array,
+/// ascending, descending, strided past the end and mixed with negative indexes
+/// (which do read the length), must give jq 1.7.1's paths.
+#[test]
+fn path_context_index_loops_over_a_wide_array_agree_with_jq_4162() -> Result<()> {
+    let body: Vec<String> = (0..200)
+        .map(|i| format!(r#"{{"a":{{"b":{i}}}}}"#))
+        .collect();
+    let doc = format!("[{}]", body.join(","));
+    for (filter, want) in [
+        (
+            r"[range(0;length) as $i | path(getpath([$i]) | .a.b)] | .[-1]",
+            r#"[199,"a","b"]"#,
+        ),
+        (
+            r"[range(length-1;-1;-1) as $i | path(.[$i].a)] | .[0], .[-1], length",
+            "[199,\"a\"]\n[0,\"a\"]\n200",
+        ),
+        (
+            r"[range(length+1;-1;-3) as $i | path(.[$i])] | .[0:2]",
+            "[[201],[198]]",
+        ),
+        (
+            r"[range(0;length) as $i | path(.[$i], .[-1 - $i])] | .[1], .[-1], length",
+            "[-1]\n[-200]\n400",
+        ),
+        (
+            r"[range(0;length) as $i | getpath([$i]) | path(..)] | length",
+            "600",
+        ),
+        (
+            r#"[range(length-1;-1;-1) as $i | path(getpath([$i, "a", "b"]))] | .[0], .[199]"#,
+            "[199,\"a\",\"b\"]\n[0,\"a\",\"b\"]",
+        ),
+        (
+            r"reduce range(0;length) as $i (.; .[$i].a.b |= . * 2) | .[199], .[64]",
+            "{\"a\":{\"b\":398}}\n{\"a\":{\"b\":128}}",
+        ),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(&doc))?;
+        assert_eq!((out.trim(), err.as_str(), code), (want, "", 0), "{filter}");
+    }
+    Ok(())
+}
+
 /// #3651: a `?//` chain in a fold **source** that destructures a freshly built value
 /// runs jq's *next* alternative, not the first, in path position.
 ///

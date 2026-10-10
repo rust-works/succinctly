@@ -8438,6 +8438,16 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentElements for YamlElements<'a, W> {
         self.element_cursor
             .map(|c| (c.node_id(), c.document_token()))
     }
+
+    /// The list stands at the raw element node (a block item's `-` wrapper,
+    /// not the value `uncons_cursor` resolves it to), which is the node
+    /// `head_id` names, and a cursor is `(text, index, bp_pos)`.
+    fn at_head_id(&self, id: usize) -> Option<Self> {
+        let cursor = self.element_cursor?.at_node_id(id)?;
+        Some(YamlElements {
+            element_cursor: Some(cursor),
+        })
+    }
 }
 
 // ============================================================================
