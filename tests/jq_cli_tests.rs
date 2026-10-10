@@ -123902,3 +123902,57 @@ fn test_pipe_effect_before_a_raising_stage_runs_depth_first_4293() -> Result<()>
     }
     Ok(())
 }
+
+/// #4294: the comma array routes over the shapes #4166 left on the owned route
+/// -- a `,` head with a computed branch and stages after it, the same `,` as a
+/// stage after a prefix, and a `?` group of navigation branches as the whole
+/// body or heading the pipe -- answer what jq answers on a readable document.
+/// Every expectation was captured from `/usr/bin/jq` 1.7.1 on this document
+/// (stdout, exit code).
+#[test]
+fn test_comma_head_and_guarded_body_residuals_match_jq_4294() -> Result<()> {
+    let doc = r#"{"users":[{"id":1,"n":"a","t":[1,2]},{"id":2,"n":"b","t":[]},{"id":3,"n":"c","t":[3]}],"s":["x",1,[2],{"a":3}]}"#;
+    let rows: &[(&str, &str, i32)] = &[
+        // A `,` head with a computed branch and a tail runs the tail per branch.
+        ("[(.users, [1]) | .[0]]", "[{\"id\":1,\"n\":\"a\",\"t\":[1,2]},1]\n", 0),
+        ("[(.users, [1]) | .[0]] | length", "2\n", 0),
+        ("[(.users, length) | .]", "[[{\"id\":1,\"n\":\"a\",\"t\":[1,2]},{\"id\":2,\"n\":\"b\",\"t\":[]},{\"id\":3,\"n\":\"c\",\"t\":[3]}],2]\n", 0),
+        ("[(.users, length) | .] | length", "2\n", 0),
+        ("[(.users[0], (1, 2)) | tostring]", "[\"{\\\"id\\\":1,\\\"n\\\":\\\"a\\\",\\\"t\\\":[1,2]}\",\"1\",\"2\"]\n", 0),
+        ("[(.users[], .s | length) | .id?]", "[]\n", 0),
+        ("[(.users, 1) | .[0]?]", "[{\"id\":1,\"n\":\"a\",\"t\":[1,2]}]\n", 0),
+        ("[(.users[0].t, (.s | length)) | .[0]?]", "[1]\n", 0),
+        ("[(.users, length) | .[0]]", "", 5),
+        ("try [(.users, length) | .[0]] catch .", "\"Cannot index number with number\"\n", 0),
+        ("[(.s[], empty) | type]", "[\"string\",\"number\",\"array\",\"object\"]\n", 0),
+        ("[(error(\"x\"), .users) | .[0]]", "", 5),
+        ("[(.users, error(\"x\")) | .[0]]", "", 5),
+        ("label $f | [(.users, break $f) | .[0]]", "", 0),
+        ("[(.users | length), .s | . , 1]", "[3,1,[\"x\",1,[2],{\"a\":3}],1]\n", 0),
+        // A `,` stage after a prefix with a computed branch and a tail.
+        ("[.users[] | (., 1) | .id?]", "[1,2,3]\n", 0),
+        ("[.users[] | (.n, length) | ., 1]", "[\"a\",1,3,1,\"b\",1,3,1,\"c\",1,3,1]\n", 0),
+        ("[.users[] | (.t, (.t | length)) | tojson]", "[\"[1,2]\",\"2\",\"[]\",\"0\",\"[3]\",\"1\"]\n", 0),
+        ("[.users[] | (.id, error(\"x\")) | . + 1]", "", 5),
+        ("[.users[] | (error(\"x\"), .id) | . + 1]", "", 5),
+        // `(a, b)?` as the whole body or heading the pipe: the items before the group's first catchable raise.
+        ("[(.users, .users)?]", "[[{\"id\":1,\"n\":\"a\",\"t\":[1,2]},{\"id\":2,\"n\":\"b\",\"t\":[]},{\"id\":3,\"n\":\"c\",\"t\":[3]}],[{\"id\":1,\"n\":\"a\",\"t\":[1,2]},{\"id\":2,\"n\":\"b\",\"t\":[]},{\"id\":3,\"n\":\"c\",\"t\":[3]}]]\n", 0),
+        ("[(.users, .users)?] | length", "2\n", 0),
+        ("[(.users[0].id.x, .users)?]", "[]\n", 0),
+        ("[(.users, .users[0].id.x, .s)?]", "[[{\"id\":1,\"n\":\"a\",\"t\":[1,2]},{\"id\":2,\"n\":\"b\",\"t\":[]},{\"id\":3,\"n\":\"c\",\"t\":[3]}]]\n", 0),
+        ("[(.s[0], .users[0])?]", "[\"x\",{\"id\":1,\"n\":\"a\",\"t\":[1,2]}]\n", 0),
+        ("[(.s, .users)? | .[0]]", "[\"x\",{\"id\":1,\"n\":\"a\",\"t\":[1,2]}]\n", 0),
+        ("[(.users, .s)? | .[1]]", "[{\"id\":2,\"n\":\"b\",\"t\":[]},1]\n", 0),
+        ("[(.users[0].t, .s)? | .[]]", "[1,2,\"x\",1,[2],{\"a\":3}]\n", 0),
+        ("[(.users[0].t[], .s[0].x, .s)? | .]", "[1,2]\n", 0),
+    ];
+    for &(filter, want, want_code) in rows {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (want, want_code),
+            "{filter}: {stderr:?}"
+        );
+    }
+    Ok(())
+}

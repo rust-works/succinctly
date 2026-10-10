@@ -5088,28 +5088,67 @@ fn fold_generic_owned_values<V: DocumentValue, S: EvalSemantics>(
 /// realloc costs more than the slack holds.
 const SHRINK_NODES_AT: usize = 64;
 
+///
+/// `guarded` is a `?` around the branches as one group (`[(a, b)?]`,
+/// `[(a, b)? | .x]`, #4294): [`run_comma_branches`] applies
+/// [`guarded_branch`], and `None` is its decline, for the caller to run the
+/// body down the owned route.
 fn comma_array_generic<S: EvalSemantics, V: DocumentValue>(
     exprs: &[Expr],
     tail: &[Expr],
-    value: V,
+    guarded: bool,
+    value: &V,
     optional: bool,
     cursor: Option<V::Cursor>,
-) -> GenericResult<V> {
+) -> Option<GenericResult<V>> {
     let mut array = CommaArray::new();
-    for expr in CommaBranches::new(exprs) {
+    if let Some(stop) =
+        run_comma_branches::<S, V>(&mut array, exprs, tail, guarded, value, optional, cursor)
+    {
+        return stop;
+    }
+    Some(array.finish::<S>())
+}
+
+/// Runs every branch of a `,` against one input, each followed by `tail`, into
+/// `array`: the loop [`comma_array_generic`] and [`comma_stage_array_generic`]
+/// share, so the plain body, the `,` head and the `,` stage cannot drift on
+/// what a guarded group or an escape does (#4294).
+///
+/// `Some(Some(escape))` is the array's failure: atomic, like the rest of
+/// `Expr::Array`, so whatever was collected is discarded and the escape is the
+/// whole answer. `Some(None)` is a guarded branch's lazy result, which
+/// declines the route ([`guarded_branch`]). The tail is the `Expr::Pipe` arm's
+/// own staged fold.
+fn run_comma_branches<S: EvalSemantics, V: DocumentValue>(
+    array: &mut CommaArray<V>,
+    branches: &[Expr],
+    tail: &[Expr],
+    guarded: bool,
+    value: &V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+) -> Option<Option<GenericResult<V>>> {
+    for expr in CommaBranches::new(branches) {
         let mut result = eval_single::<S, _>(expr, value.clone(), optional, cursor);
+        let mut ends_group = false;
+        if guarded {
+            let Some((kept, ends)) = guarded_branch(result) else {
+                return Some(None);
+            };
+            (result, ends_group) = (kept, ends);
+        }
         if !tail.is_empty() {
-            // The `Expr::Pipe` arm's own staged fold, which is all a pipe of
-            // pure navigation reaches there.
             result = fold_pipe_stages::<S, V>(result, tail, optional);
         }
         if let Some(control) = array.push::<S>(result) {
-            // Atomic, like the rest of `Expr::Array`: whatever was collected
-            // is discarded, and the escape is the whole answer.
-            return partial_generic(Vec::new(), control);
+            return Some(Some(partial_generic(Vec::new(), control)));
+        }
+        if ends_group {
+            break;
         }
     }
-    array.finish::<S>()
+    None
 }
 
 /// What [`comma_array_generic`] has collected: its items so far, in order,
@@ -5292,8 +5331,11 @@ impl<'a> Iterator for CommaBranches<'a> {
 }
 
 /// `(a, b, ...) | rest`, split into its `,` branches and the tail each one
-/// runs through, when the whole pipe is pure navigation (#3476); `None` for
-/// any other body.
+/// runs through, when the whole pipe is pure navigation (#3476), when it keeps
+/// the pipe's order with a computed branch or stage (#4294,
+/// [`computed_comma_keeps_order`]), or when a `?` covers navigation branches
+/// followed by navigation (`(a, b)? | rest`, #4294, [`guarded_branch`]); `None`
+/// for any other body. The answer's `prefix` is empty.
 ///
 /// `[(., .) | .data]` reached `Expr::Pipe`, whose head `Expr::Comma` answers
 /// one owned tree per item, and `.data` then ran against each through a
@@ -5308,7 +5350,7 @@ impl<'a> Iterator for CommaBranches<'a> {
 /// remaining stages when a middle stage answers several cursors, as it does
 /// for the same pipe anywhere else.)
 ///
-/// The regrouping is sound because every stage is
+/// The regrouping is sound for an all-navigation pipe because every stage is
 /// [`array_route_stage_is_pure_navigation`]: no side effect for it to reorder,
 /// the argument [`comma_array_generic`] already makes for running a later
 /// branch's failure ahead of an earlier one's decode, and no stage the
@@ -5322,18 +5364,61 @@ impl<'a> Iterator for CommaBranches<'a> {
 /// One thing does change: a node the pipe *discards* is no longer walked
 /// (`[(., .) | .data]` no longer decodes the rest of the document), as
 /// `[.data]` and `(., .) | .data | length` never did.
-fn split_comma_head(body: &Expr) -> Option<(&[Expr], &[Expr])> {
+fn split_comma_head(body: &Expr) -> Option<CommaStage<'_>> {
     let Expr::Pipe(stages) = unwrap_paren(body) else {
         return None;
     };
-    let (head, rest) = stages.split_first()?;
-    let Expr::Comma(branches) = unwrap_paren(head) else {
-        return None;
-    };
-    if rest.is_empty() || !stages.iter().all(array_route_stage_is_pure_navigation) {
+    let (head, tail) = stages.split_first()?;
+    let (branches, guarded) = comma_group(head)?;
+    if tail.is_empty() {
         return None;
     }
-    Some((branches, rest))
+    let nav = array_route_stage_is_pure_navigation;
+    let kept = if branches.iter().all(nav) && tail.iter().all(nav) {
+        true
+    } else {
+        !guarded && computed_comma_keeps_order(stages)
+    };
+    kept.then_some(CommaStage {
+        prefix: &[],
+        branches: branches.as_slice(),
+        tail,
+        guarded,
+    })
+}
+
+/// A `,` stage's branches, and whether a `?` covers them as one group:
+/// `(a, b)` or `(a, b)?`, through parentheses. `None` for any other stage.
+fn comma_group(stage: &Expr) -> Option<(&Vec<Expr>, bool)> {
+    match unwrap_paren(stage) {
+        Expr::Comma(branches) => Some((branches, false)),
+        Expr::Optional(inner) => match unwrap_paren(inner) {
+            Expr::Comma(branches) => Some((branches, true)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether a `,` stage holding a computed branch may have the stages after it
+/// run per branch (#4294), as [`run_comma_branches`] runs them, where the
+/// `Expr::Pipe` arm runs the whole `,` stage first and the tail over its
+/// outputs.
+///
+/// The two orders produce the same values; what can tell them apart is an
+/// effect, or a read of the input state, that one runs and the other does not
+/// -- `[(("x" | debug), 1) | error]` -- and a raise of a later branch against
+/// one of the tail. The second is the same in both: a tail raise on an
+/// earlier branch's output wins, since the owned fold pipes a `Partial`
+/// prefix first. The first is ruled out by asking the pipe whether a stage
+/// before its last may have an effect or read the input state, which covers
+/// every branch and every tail stage the staged fold would run ahead of the
+/// next (#4293's own predicate, remembered on the pipe); the last stage runs
+/// once per output in both orders. A stage that reads path context is
+/// bridged whole by the `Expr::Pipe` arm, so it declines here too.
+fn computed_comma_keeps_order(stages: &crate::jq::expr::PipeStages) -> bool {
+    !crate::jq::eval::pipe_effect_before_last(stages)
+        && !crate::jq::eval::pipe_needs_path_context(stages)
 }
 
 /// A pipe split at its first `,` stage by [`split_comma_stage`]: the stages
@@ -5380,9 +5465,12 @@ struct CommaStage<'a> {
 /// - **Computed branches, no tail** (`[.[] | ., length]`). Nothing runs between
 ///   two branches in either order, so an effect (`input`, `debug`), a raise or
 ///   a `break` lands where the owned route lands it.
-/// - **Computed branches and a tail: refused.** The tail would run between two
-///   computed branches, where the owned route runs it after both:
-///   `(debug, 1) | .x` would write `debug` a different number of times.
+/// - **Computed branches and a tail, nothing effectful before the last stage**
+///   (`[.[] | (., 1) | .a]`, #4294). The tail runs between two computed
+///   branches, where the owned route runs it after both, which only an effect
+///   or a read of the input state could tell apart
+///   ([`computed_comma_keeps_order`]); `(debug, 1) | .x` keeps the owned
+///   route, which runs it depth-first since #4293.
 ///
 /// Whatever is not navigation must not read path context (`key`, `parent`,
 /// `path`): the `Expr::Pipe` arm bridges such a pipe whole. A navigation stage
@@ -5402,13 +5490,8 @@ fn split_comma_stage(body: &Expr) -> Option<CommaStage<'_>> {
     // predicates walk every stage. A candidate that is refused leaves a later
     // `,` stage to try, whose prefix then holds the refused one.
     for (at, stage) in stages.iter().enumerate().skip(1) {
-        let (branches, guarded) = match unwrap_paren(stage) {
-            Expr::Comma(branches) => (branches, false),
-            Expr::Optional(inner) => match unwrap_paren(inner) {
-                Expr::Comma(branches) => (branches, true),
-                _ => continue,
-            },
-            _ => continue,
+        let Some((branches, guarded)) = comma_group(stage) else {
+            continue;
         };
         let (prefix, tail) = (&stages[..at], &stages[at + 1..]);
         if !prefix.iter().all(nav) {
@@ -5420,7 +5503,7 @@ fn split_comma_stage(body: &Expr) -> Option<CommaStage<'_>> {
         let order_kept = if guarded {
             navigation_branches && navigation_tail
         } else {
-            navigation_branches || tail.is_empty()
+            navigation_branches || tail.is_empty() || computed_comma_keeps_order(stages)
         };
         // Only a stage that is not navigation can read path context, and the
         // answer is remembered on the pipe (#3886).
@@ -5509,29 +5592,16 @@ fn comma_stage_array_generic<S: EvalSemantics, V: DocumentValue>(
     let head = eval_single::<S, _>(&prefix[0], value, optional, cursor);
     let head = fold_pipe_stages::<S, V>(head, &prefix[1..], optional);
     let mut array = CommaArray::new();
-    // `Some(Some(escape))` is the array's failure, `Some(None)` a guarded
-    // branch's lazy result, which declines the route.
-    let mut run = |node: V::Cursor| -> Option<Option<GenericResult<V>>> {
-        for expr in CommaBranches::new(branches) {
-            let mut result = eval_single::<S, _>(expr, node.value(), optional, Some(node));
-            let mut ends_group = false;
-            if guarded {
-                let Some((kept, ends)) = guarded_branch(result) else {
-                    return Some(None);
-                };
-                (result, ends_group) = (kept, ends);
-            }
-            if !tail.is_empty() {
-                result = fold_pipe_stages::<S, V>(result, tail, optional);
-            }
-            if let Some(control) = array.push::<S>(result) {
-                return Some(Some(partial_generic(Vec::new(), control)));
-            }
-            if ends_group {
-                break;
-            }
-        }
-        None
+    let mut run = |node: V::Cursor| {
+        run_comma_branches::<S, V>(
+            &mut array,
+            branches,
+            tail,
+            guarded,
+            &node.value(),
+            optional,
+            Some(node),
+        )
     };
     match head {
         GenericResult::OneCursor(node) => {
@@ -13278,12 +13348,39 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             // only where something reads it. yq's printer materializes a
             // `LazySeq` anyway, so yq keeps the owned route below.
             if S::TAG == EvalTag::Jq {
-                if let Expr::Comma(exprs) = unwrap_paren(inner) {
-                    return comma_array_generic::<S, V>(exprs, &[], value, optional, cursor);
+                match comma_group(inner) {
+                    Some((exprs, false)) => {
+                        // An unguarded group never declines.
+                        if let Some(result) =
+                            comma_array_generic::<S, V>(exprs, &[], false, &value, optional, cursor)
+                        {
+                            return result;
+                        }
+                    }
+                    // #4294: a `?` around navigation branches, `[(.a, .b)?]`.
+                    Some((exprs, true))
+                        if exprs.iter().all(array_route_stage_is_pure_navigation) =>
+                    {
+                        if let Some(result) =
+                            comma_array_generic::<S, V>(exprs, &[], true, &value, optional, cursor)
+                        {
+                            return result;
+                        }
+                    }
+                    _ => {}
                 }
                 // #3476: the same body behind a pipe, `[(., .) | .data]`.
-                if let Some((branches, tail)) = split_comma_head(inner) {
-                    return comma_array_generic::<S, V>(branches, tail, value, optional, cursor);
+                if let Some(split) = split_comma_head(inner) {
+                    if let Some(result) = comma_array_generic::<S, V>(
+                        split.branches,
+                        split.tail,
+                        split.guarded,
+                        &value,
+                        optional,
+                        cursor,
+                    ) {
+                        return result;
+                    }
                 }
                 // #3922: and behind a pipe whose head is not the `,`,
                 // `[.[] | ., .]`.
@@ -47943,11 +48040,10 @@ mod tests {
             "[(.a, .b) | .[]?]",
             // A navigation miss is a computed `null`.
             "[(., .) | .missing]",
-            // A computed stage is not pure navigation.
+            // #4294: a computed tail is admitted, but `length` answers scalars.
             "[(., .) | .a | length]",
-            "[(., .) | .a | select(.x)]",
-            // The `,` sits under a `?`, which the head match does not see through.
-            "[((., .))? | .a]",
+            // A `?` group holding a computed branch keeps the owned route.
+            "[((., 1))? | .]",
         ] {
             assert_eq!(
                 comma_array_route::<JqSemantics>(query, doc),
@@ -47955,6 +48051,29 @@ mod tests {
                 "{query}"
             );
         }
+        // #4294: a computed tail with nothing effectful before the last stage
+        // runs per branch, and a `?` around navigation branches is a guarded
+        // group, as the `,` stage route already had both.
+        for query in [
+            "[(., .) | .a | select(.x)]",
+            "[((., .))? | .a]",
+            "[(.a, .b)? | .]",
+        ] {
+            assert_eq!(
+                comma_array_route::<JqSemantics>(query, doc),
+                "cursors",
+                "{query}"
+            );
+        }
+        assert_eq!(
+            comma_array_route::<JqSemantics>("[(.a, length) | .]", doc),
+            "mixed"
+        );
+        // An effect before the last stage keeps the owned route.
+        assert_eq!(
+            comma_array_route::<JqSemantics>("[(.a, (1 | debug)) | .]", doc),
+            "owned"
+        );
         // Parsed as `(.a, .b) | (.[]?, 1)`: a literal in the tail. The body is
         // a `,` of two pipes, so it takes the comma route and holds `.a`'s and
         // `.b`'s elements beside the literal (#3856).
@@ -48040,9 +48159,10 @@ mod tests {
             ("[.a | ., . | .]", "cursors"),
             ("[.a | (., .)?]", "cursors"),
             ("[.[] | (., .[0])?]", "cursors"),
-            // A computed branch with a tail, or a computed stage in or after a
-            // `?` group, keeps the owned route.
-            ("[.a | (., 1) | .]", "owned"),
+            // #4294: a computed branch with a tail runs the tail per branch
+            // when nothing before the last stage has an effect.
+            ("[.a | (., 1) | .]", "mixed"),
+            // A computed stage in or after a `?` group keeps the owned route.
             ("[.a | (., length)?]", "owned"),
             ("[.a | (., .)? | length]", "owned"),
             // `Expr::Pipe` bridges a path-reading pipe whole.
@@ -49282,26 +49402,43 @@ mod tests {
         }
     }
 
-    /// #3476: which bodies [`split_comma_head`] takes, independent of what
-    /// the route then does with them.
+    /// #3476, #4294: which bodies [`split_comma_head`] takes, independent of
+    /// what the route then does with them: `(branches, tail, guarded)`.
     #[test]
     fn test_split_comma_head_3476() {
         let body = |query: &str| match crate::jq::parse(query).unwrap() {
             Expr::Array(inner) => *inner,
-            other => panic!("`{query}` is not an array construction: {other:?}"),
+            other => panic!("`{query}` is not an array construction: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3673)"
         };
         let split = |query: &str| {
-            split_comma_head(&body(query)).map(|(branches, tail)| (branches.len(), tail.len()))
+            split_comma_head(&body(query)).map(|s| (s.branches.len(), s.tail.len(), s.guarded))
         };
-        assert_eq!(split("[(., .) | .a]"), Some((2, 1)));
-        assert_eq!(split("[(.a, .b, .c) | .x | .y]"), Some((3, 2)));
-        assert_eq!(split("[((., .)) | .a]"), Some((2, 1)));
-        // No pipe, no `,` head, a computed stage, or a `,` under a `?`.
+        assert_eq!(split("[(., .) | .a]"), Some((2, 1, false)));
+        assert_eq!(split("[(.a, .b, .c) | .x | .y]"), Some((3, 2, false)));
+        assert_eq!(split("[((., .)) | .a]"), Some((2, 1, false)));
+        // #4294: a computed tail or branch, with nothing that has an effect or
+        // reads the input state before the last stage, and nothing reading path
+        // context.
+        assert_eq!(split("[(., .) | length]"), Some((2, 1, false)));
+        assert_eq!(split("[(., .) | . + 1]"), Some((2, 1, false)));
+        assert_eq!(split("[(.a, [1]) | .[0]]"), Some((2, 1, false)));
+        assert_eq!(split("[(., length) | .]"), Some((2, 1, false)));
+        assert_eq!(split("[(., .) | input]"), Some((2, 1, false)));
+        // #4294: a `?` around navigation branches with a navigation tail.
+        assert_eq!(split("[((., .))? | .a]"), Some((2, 1, true)));
+        assert_eq!(split("[(.a, .b)? | .x]"), Some((2, 1, true)));
+        // No pipe, or no `,` head.
         assert_eq!(split("[., .]"), None);
         assert_eq!(split("[.a | (., .)]"), None);
-        assert_eq!(split("[(., .) | length]"), None);
-        assert_eq!(split("[(., .) | . + 1]"), None);
-        assert_eq!(split("[((., .))? | .a]"), None);
+        // An effect, or a read of the input state, before the last stage.
+        assert_eq!(split("[(., debug) | .a]"), None);
+        assert_eq!(split("[(., input_line_number) | .]"), None);
+        assert_eq!(split("[(., .) | debug | .a]"), None);
+        // A stage reading path context.
+        assert_eq!(split("[(., .a) | key]"), None);
+        // A guarded group holding a computed branch or followed by one.
+        assert_eq!(split("[(., 1)? | .a]"), None);
+        assert_eq!(split("[(., .)? | length]"), None);
     }
 
     /// #3922: only a sequence of nodes with nothing left to compute is handed
@@ -49367,9 +49504,15 @@ mod tests {
         assert_eq!(split("[.[] | length, ., 1]"), Some((1, 3, 0)));
         assert_eq!(split("[.[] | (., .) | length]"), Some((1, 2, 1)));
         assert_eq!(split("[.[] | ., . | debug | .a]"), Some((1, 2, 2)));
-        // Computed branches and a tail would run the tail between them.
-        assert_eq!(split("[.[] | (., 1) | .a]"), None);
-        assert_eq!(split("[.[] | (., length) | length]"), None);
+        // #4294: computed branches and a tail, with no effect or read of the
+        // input state before the last stage: the tail runs between the
+        // branches, and nothing can tell.
+        assert_eq!(split("[.[] | (., 1) | .a]"), Some((1, 2, 1)));
+        assert_eq!(split("[.[] | (., length) | length]"), Some((1, 2, 1)));
+        // With one, the tail running between them would reorder it.
+        assert_eq!(split("[.[] | (., debug) | .a]"), None);
+        assert_eq!(split("[.[] | (., 1) | debug | .a]"), None);
+        assert_eq!(split("[.[] | (., input_filename) | .]"), None);
         // A stage that reads path context is bridged whole by `Expr::Pipe`.
         assert_eq!(split("[.[] | ., key]"), None);
         assert_eq!(split("[.[] | ., . | parent]"), None);
@@ -49387,7 +49530,8 @@ mod tests {
         // one in its prefix.
         assert_eq!(split("[.[] | (.a, .b)? | ., length]"), Some((2, 2, 0)));
         assert_eq!(guarded("[.[] | (.a, .b)? | ., length]"), Some(false));
-        assert_eq!(split("[.[] | (., 1) | .a | ., length]"), None);
+        assert_eq!(split("[.[] | (., debug) | .a | ., length]"), None);
+        assert_eq!(split("[.[] | (., 1) | .a | ., length]"), Some((1, 2, 2)));
     }
 
     /// #4166: a `(a, b)?` group keeps what `try_single_generic` with no
