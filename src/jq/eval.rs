@@ -17371,6 +17371,7 @@ fn builtin_min<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #4236 (yq): a mapping is the extremum of its values (`{"a": 2, "b": 1} | min` is `1`),
         // and an empty one has none.
         StandardJson::Object(fields) if S::MIN_MAX_NEED_AN_ELEMENT => mapping_extremum::<W, S>(
+            // STYLE-0012: routed, at `mapping_extremum`'s `Err(e) => suppress_or_raise(e, optional)`.
             fields.map(|f| to_owned::<S, _>(&f.value())).collect(),
             optional,
             false,
@@ -17418,6 +17419,7 @@ fn builtin_max<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         // #4236 (yq): see `builtin_min`.
         StandardJson::Object(fields) if S::MIN_MAX_NEED_AN_ELEMENT => mapping_extremum::<W, S>(
+            // STYLE-0012: routed, at `mapping_extremum`'s `Err(e) => suppress_or_raise(e, optional)`.
             fields.map(|f| to_owned::<S, _>(&f.value())).collect(),
             optional,
             true,
