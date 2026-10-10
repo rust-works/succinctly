@@ -3128,9 +3128,52 @@ const PREFILTER_BITS_PER_HASH: usize = 8;
 /// radix partition by 3-38% on both); see `docs/parsing/json.md`.
 fn repeated_hashes(mut hashes: Vec<u64>) -> (Vec<u64>, usize) {
     let n = hashes.len();
-    if !(PREFILTER_MIN..=PREFILTER_MAX).contains(&n) {
+    let Some(mut candidates) = prefilter_candidates(&hashes) else {
         hashes.sort_unstable();
         return shared_hashes(&hashes);
+    };
+    // Every hash left out sat alone on its bit, so each is its own value.
+    let alone = n - candidates.len();
+    candidates.sort_unstable();
+    let (shared, distinct) = shared_hashes(&candidates);
+    (shared, alone + distinct)
+}
+
+/// Whether any value occurs more than once in `hashes` (#4169) -- what
+/// `sort_unstable` followed by [`hashes_repeat`] answers, through the same
+/// bitset prefilter as [`repeated_hashes`], for the batch callers that need
+/// only the yes/no and not the shared list or the distinct count.
+///
+/// When no bit was set twice no hash can repeat, and nothing is sorted at
+/// all; otherwise only the candidates on a doubly-set bit are.
+#[doc(hidden)]
+pub fn any_hash_repeats(mut hashes: Vec<u64>) -> bool {
+    match prefilter_candidates(&hashes) {
+        Some(mut candidates) => {
+            candidates.sort_unstable();
+            hashes_repeat(&candidates)
+        }
+        None => {
+            hashes.sort_unstable();
+            hashes_repeat(&hashes)
+        }
+    }
+}
+
+/// The bitset prefilter shared by [`repeated_hashes`] and
+/// [`any_hash_repeats`]: the hashes that landed on a bit another hash had
+/// also set, in their original order and unsorted, or `None` when the
+/// caller should sort the whole list instead -- the count is outside
+/// [`PREFILTER_MIN`]`..=`[`PREFILTER_MAX`], or too many hashes collided on
+/// the bitset for it to be filtering (see [`PREFILTER_MAX_ARRIVAL_SHARE`]).
+///
+/// Every occurrence of a repeated value is among the candidates, so the
+/// candidates repeat exactly when `hashes` does, and each hash left out
+/// occurs exactly once.
+fn prefilter_candidates(hashes: &[u64]) -> Option<Vec<u64>> {
+    let n = hashes.len();
+    if !(PREFILTER_MIN..=PREFILTER_MAX).contains(&n) {
+        return None;
     }
     // Hashes are well mixed (`key_hash_checked` ends in a splitmix64
     // finalizer), so the low bits index uniformly.
@@ -3140,7 +3183,7 @@ fn repeated_hashes(mut hashes: Vec<u64>) -> (Vec<u64>, usize) {
     let mut twice = vec![0u64; bits / 64];
     // Hashes that arrived on a bit another hash had already set.
     let mut arrivals = 0usize;
-    for &hash in &hashes {
+    for &hash in hashes {
         let at = hash as usize & mask;
         let bit = 1u64 << (at & 63);
         let already = seen[at >> 6] & bit;
@@ -3155,24 +3198,19 @@ fn repeated_hashes(mut hashes: Vec<u64>) -> (Vec<u64>, usize) {
     // case at the two bitset allocations, one pass and the sort the prefilter
     // was meant to avoid.
     if arrivals > n / PREFILTER_MAX_ARRIVAL_SHARE {
-        drop((seen, twice));
-        hashes.sort_unstable();
-        return shared_hashes(&hashes);
+        return None;
     }
     drop(seen);
-    let mut candidates: Vec<u64> = hashes
-        .iter()
-        .copied()
-        .filter(|&hash| {
-            let at = hash as usize & mask;
-            twice[at >> 6] & (1u64 << (at & 63)) != 0
-        })
-        .collect();
-    // Every hash left out sat alone on its bit, so each is its own value.
-    let alone = n - candidates.len();
-    candidates.sort_unstable();
-    let (shared, distinct) = shared_hashes(&candidates);
-    (shared, alone + distinct)
+    Some(
+        hashes
+            .iter()
+            .copied()
+            .filter(|&hash| {
+                let at = hash as usize & mask;
+                twice[at >> 6] & (1u64 << (at & 63)) != 0
+            })
+            .collect(),
+    )
 }
 
 /// Take the census of `fields` (see [`KeyCensus`]).
@@ -5059,13 +5097,36 @@ mod key_hash_and_end_tests {
 
 #[cfg(test)]
 mod repeated_hashes_tests {
-    use super::{repeated_hashes, shared_hashes, PREFILTER_MAX, PREFILTER_MIN};
+    use super::{
+        any_hash_repeats, hashes_repeat, repeated_hashes, shared_hashes, PREFILTER_MAX,
+        PREFILTER_MIN,
+    };
 
     /// The reference the prefilter must equal: sort everything.
     fn by_sorting(hashes: &[u64]) -> (Vec<u64>, usize) {
         let mut sorted = hashes.to_vec();
         sorted.sort_unstable();
         shared_hashes(&sorted)
+    }
+
+    /// Both prefiltered answers equal the sort's on `hashes`: the shared list
+    /// and distinct count of [`repeated_hashes`], and the yes/no of
+    /// [`any_hash_repeats`] (#4169), checked against a full sort and
+    /// [`hashes_repeat`] rather than against `repeated_hashes`, so the two
+    /// cannot agree on a shared mistake.
+    fn assert_matches_the_sort(hashes: &[u64], what: &str) {
+        assert_eq!(
+            repeated_hashes(hashes.to_vec()),
+            by_sorting(hashes),
+            "{what}"
+        );
+        let mut sorted = hashes.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(
+            any_hash_repeats(hashes.to_vec()),
+            hashes_repeat(&sorted),
+            "any_hash_repeats, {what}"
+        );
     }
 
     /// xorshift64*, so the inputs are the same on every platform.
@@ -5119,11 +5180,7 @@ mod repeated_hashes_tests {
             cases.push(("all equal", vec![0x9e37_79b9_7f4a_7c15; n]));
             cases.push(("zero", vec![0; n]));
             for (name, hashes) in cases {
-                assert_eq!(
-                    repeated_hashes(hashes.clone()),
-                    by_sorting(&hashes),
-                    "{name}, n = {n}"
-                );
+                assert_matches_the_sort(&hashes, &format!("{name}, n = {n}"));
             }
         }
     }
@@ -5137,13 +5194,12 @@ mod repeated_hashes_tests {
         let (shared, distinct) = repeated_hashes(hashes.clone());
         assert_eq!(shared, Vec::<u64>::new());
         assert_eq!(distinct, 5000);
+        assert!(!any_hash_repeats(hashes.clone()));
         // ...and a real repeat among them is still found.
         let mut with_repeat = hashes;
         with_repeat[4999] = with_repeat[7];
-        assert_eq!(
-            repeated_hashes(with_repeat.clone()),
-            by_sorting(&with_repeat)
-        );
+        assert!(any_hash_repeats(with_repeat.clone()));
+        assert_matches_the_sort(&with_repeat, "one bit, one repeat");
     }
 
     /// The ceiling is inclusive: `PREFILTER_MAX` hashes still take the
@@ -5154,12 +5210,10 @@ mod repeated_hashes_tests {
         for n in [PREFILTER_MAX, PREFILTER_MAX + 1] {
             let mut hashes: Vec<u64> = stream(7).take(n).collect();
             let last = hashes.len() - 1;
+            assert!(!any_hash_repeats(hashes.clone()), "unique, n = {n}");
             hashes[last] = hashes[100];
-            assert_eq!(
-                repeated_hashes(hashes.clone()),
-                by_sorting(&hashes),
-                "n = {n}"
-            );
+            assert!(any_hash_repeats(hashes.clone()), "n = {n}");
+            assert_matches_the_sort(&hashes, &format!("n = {n}"));
         }
     }
 
@@ -5171,7 +5225,7 @@ mod repeated_hashes_tests {
         let base: Vec<u64> = stream(11).take(3000).collect();
         let mut hashes = base.clone();
         hashes.extend(base.iter().copied().take(2900));
-        assert_eq!(repeated_hashes(hashes.clone()), by_sorting(&hashes));
+        assert_matches_the_sort(&hashes, "mostly repeated");
     }
 }
 
