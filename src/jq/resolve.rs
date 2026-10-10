@@ -708,14 +708,15 @@ thread_local! {
 }
 
 /// Count one scope entry examined (see `SCOPE_PROBES`); nothing in a real build.
-#[cfg(test)]
+///
+/// One function with the `#[cfg(test)]` statement inside, not an empty
+/// `#[cfg(not(test))]` twin: coverage attributes an empty one-line
+/// `inline(always)` function's line to nothing, so it reads as uncovered (#4282).
+#[inline(always)]
 fn note_scope_probe() {
+    #[cfg(test)]
     SCOPE_PROBES.with(|n| n.set(n.get() + 1));
 }
-
-#[cfg(not(test))]
-#[inline(always)]
-fn note_scope_probe() {}
 
 /// The one place the module-scope floor is applied.
 ///
