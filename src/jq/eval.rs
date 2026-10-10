@@ -47729,7 +47729,12 @@ impl FoldRegister {
     /// direction-classified differential fuzz showing zero
     /// accept-where-jq-refuses cases) is not satisfiable while a known
     /// instance of that exact class sits live in the same subsystem.
-    fn advance(&self, branch: &PathBranch<'_>, update_expr: &Expr, fold_frame: &Frame) -> Self {
+    fn advance<S: EvalSemantics>(
+        &self,
+        branch: &PathBranch<'_>,
+        update_expr: &Expr,
+        fold_frame: &Frame,
+    ) -> Self {
         if branch.trackable {
             Self {
                 path: Rc::clone(&branch.path),
@@ -47777,11 +47782,30 @@ impl FoldRegister {
             // jq's register sits on `["a"]`. The value stays untracked, so
             // nothing re-establishes against it; the path only tells the
             // terminal that the register had left the root.
+            //
+            // #4071: and record that it was lost there when it was live. UPDATE may or may not
+            // have run the navigation that moved it (a `try`'s handler that navigates), so
+            // EXTRACT's refusal of a frozen `$var` that is, or sits inside, the node it entered
+            // on is the resolver's guess, not jq's verdict ([`guess_refusal`]): left `Kept` it
+            // read as exact and an EXTRACT `try` swallowed it, dropping a path jq names.
+            //
+            // Not when UPDATE's output navigated: its register is then known to have left the
+            // step's entry (`($v|.b?)|floor` is on `.b`), and a refusal of the entry's own node is
+            // jq's verdict, which a `try` around it catches.
+            let mut frame = self.frame.unknown();
+            let navigated = branch.path.depth() > self.path.depth();
+            if S::TAG == EvalTag::Jq
+                && self.trackable
+                && !navigated
+                && !frame.register_loss.is_lost()
+            {
+                frame.register_loss = RegisterLoss::LostAt(Rc::new(self.value.clone()));
+            }
             Self {
                 path: Rc::clone(&self.path),
                 value: OwnedValue::Null,
                 trackable: false,
-                frame: self.frame.unknown(),
+                frame,
                 live_register_known: false,
             }
         }
@@ -52897,7 +52921,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                     return Demand::Stop;
                                 }
                                 let extract_reg =
-                                    active_reg.advance(update_branch, &bound_update, frame);
+                                    active_reg.advance::<S>(update_branch, &bound_update, frame);
                                 // `update_branch` is itself already relocated (it's
                                 // `active_reg.resolve_sink()`'s own output above), and
                                 // `advance()` built `extract_reg` from this same
