@@ -61,7 +61,7 @@ from "0 FAIL" over a clean base. A benchmark cannot measure a shape it does
 not generate: add the generator pattern here before claiming a shape is safe.
 
 **Size.** The full grid is millions of rows; `--list-axes` prints the exact count
-(765 operands, 7 companions, 12 inputs and 37 contexts give 9,846,387 rows as of #4071,
+(771 operands, 7 companions, 12 inputs and 37 contexts give 9,926,307 rows as of #4252,
 and each operand is also swept as a bare pipe stage since #3361). The count grows with
 every operand a change to the register adds, so read it from `--list-axes` rather than
 from here.
