@@ -71216,8 +71216,9 @@ pub fn seed_remaining_inputs_with_error(
     remaining_inputs::seed(documents, exhausted, trailing_error);
 }
 
-/// Counts the reads past the end of the input just seeded (#4303): the first
-/// leaves [`current_input_location`] at the seeded end of input and
+/// Counts the reads past the end of the input just seeded, as jq does (#4303).
+///
+/// The first leaves [`current_input_location`] at the seeded end of input and
 /// `input_line_number` at its line (0 where it is `<unknown>`), and every later
 /// one leaves `<unknown>` and 0, as jq does. Without it, every read past the
 /// end leaves the seeded end of input and `input_line_number` unchanged.
