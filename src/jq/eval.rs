@@ -48397,7 +48397,7 @@ impl<'e> RegisterSpine<'e> {
         match unwrap_paren(e) {
             Expr::Var(name) => self.holds_register(name),
             Expr::TrackedVar(_) => true,
-            Expr::Comma(items) if items.iter().any(|item| self.binds_variable(item)) => {
+            Expr::Comma(items) if items.iter().any(Self::binds_variable) => {
                 items.iter().all(|item| self.binds_register(item))
             }
             Expr::FirstExpr(inner)
@@ -48405,7 +48405,7 @@ impl<'e> RegisterSpine<'e> {
             | Expr::Optional(inner)
             | Expr::Limit { expr: inner, .. }
             | Expr::Label { body: inner, .. }
-                if self.binds_variable(inner) =>
+                if Self::binds_variable(inner) =>
             {
                 self.binds_register(inner)
             }
@@ -48417,15 +48417,15 @@ impl<'e> RegisterSpine<'e> {
     /// Whether `e`'s outputs come from a variable leaf, through the wrappers
     /// [`binds_register`](Self::binds_register) reads: the shapes it answers by the
     /// variable, not by the `.` rules.
-    fn binds_variable(&self, e: &Expr) -> bool {
+    fn binds_variable(e: &Expr) -> bool {
         match unwrap_paren(e) {
             Expr::Var(_) | Expr::TrackedVar(_) => true,
-            Expr::Comma(items) => items.iter().any(|item| self.binds_variable(item)),
+            Expr::Comma(items) => items.iter().any(Self::binds_variable),
             Expr::FirstExpr(inner)
             | Expr::LastExpr(inner)
             | Expr::Optional(inner)
             | Expr::Limit { expr: inner, .. }
-            | Expr::Label { body: inner, .. } => self.binds_variable(inner),
+            | Expr::Label { body: inner, .. } => Self::binds_variable(inner),
             _ => false,
         }
     }
