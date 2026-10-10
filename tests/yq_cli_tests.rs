@@ -61197,6 +61197,13 @@ fn test_yq_pick_array_keys_and_omit_scalar_4257() -> Result<()> {
         ("[1,2]", "pick([\"+1\"])", "[2]\n"),
         ("[1,2]", "pick([\"0\",\"1\"])", "[1,2]\n"),
         ("[1,2]", "pick([\"-1\"])", "[]\n"),
+        // yq's own integer reading: `0x`/`0X` hex, `0o` octal, `_` stripped, a sign after the prefix.
+        ("[1,2]", "pick([\"0x1\"])", "[2]\n"),
+        ("[1,2]", "pick([\"0X1\"])", "[2]\n"),
+        ("[1,2]", "pick([\"0o1\"])", "[2]\n"),
+        ("[1,2]", "pick([\"0x_1\"])", "[2]\n"),
+        ("[1,2]", "pick([\"_1\"])", "[2]\n"),
+        ("[1,2]", "pick([\"0x-1\"])", "[]\n"),
         ("[1,2]", "pick([-1])", "[]\n"),
         ("[1,2]", "pick([-0])", "[1]\n"),
         ("[1,2]", "pick([5])", "[]\n"),
@@ -61210,6 +61217,15 @@ fn test_yq_pick_array_keys_and_omit_scalar_4257() -> Result<()> {
         ("1", "omit([\"a\"])", "1\n"),
         ("\"s\"", "omit([\"a\"])", "\"s\"\n"),
         ("[1,2]", "omit([0])", "[2]\n"),
+        // Only a non-negative integer removes anything from an array.
+        ("[1,2]", "omit([-1])", "[1,2]\n"),
+        ("[1,2]", "omit([1.5])", "[1,2]\n"),
+        ("[1,2]", "omit([1.0])", "[1,2]\n"),
+        ("[1,2]", "omit([\"1\"])", "[1,2]\n"),
+        ("[1,2]", "omit([\"a\"])", "[1,2]\n"),
+        ("[1,2]", "omit([null])", "[1,2]\n"),
+        ("[1,2]", "omit([5])", "[1,2]\n"),
+        ("[1,2]", "omit([0,1])", "[]\n"),
         ("{\"a\":1}", "omit([\"a\"])", "{}\n"),
     ] {
         assert_eq!(
@@ -61228,6 +61244,13 @@ fn test_yq_pick_array_keys_and_omit_scalar_4257() -> Result<()> {
         "pick([true])",
         "pick([[0]])",
         "pick([1.5])",
+        "pick([\"0O1\"])",
+        "pick([\"0b1\"])",
+        "pick([\"+0x1\"])",
+        "pick([\"1e0\"])",
+        "pick([1e30])",
+        "pick([\"9223372036854775808\"])",
+        "pick([9223372036854775808])",
     ] {
         let (stdout, _, code) = run_yq_stdin_with_stderr(filter, "[1,2]", args)?;
         assert_eq!((stdout.as_str(), code), ("", 1), "{filter}");
