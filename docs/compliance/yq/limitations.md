@@ -5533,3 +5533,17 @@ number, got 0 instead`) and nothing here (#4197); `1 as $y | select(false) as $y
 and nothing here, because the outer `$y` is not substituted into a body that rebinds the name;
 `$ENV` is an unbound variable in yq, so `$ENV.x` prints nothing, where it is the environment object
 here (#3029), and a `--arg __loc__` is not honoured in yq mode.
+
+### `..` stops at an alias node — resolved for reads ([#4214](https://github.com/rust-works/succinctly/issues/4214)); the write path, owned routes and merge keys are residual ([#4223](https://github.com/rust-works/succinctly/issues/4223))
+
+yq's recursive descent yields an alias node and does not descend into it, so on
+`anchors: {base: &b {p: 1, q: 2}, copy: *b}` `[..] | length` is 6 and `.. | path` never lists
+`anchors.copy.p`. `succinctly yq` matches that on the cursor-preserving read routes (`..`,
+`.. | path`, `.. | key`, `.. | parent`, `.anchors.copy | ..`); `.anchors.copy[]` still iterates the
+aliased mapping, as in yq. `recurse` and `recurse(.[]?)` are `..` (#3719) and stop with it; yq has
+no `recurse`, so under `--jq-extensions` they follow the `..` rule rather than a reference.
+
+Still diverging: a write through `..` (`(.. | select(tag=="!!int")) |= . + 1` is `p: 2, q: 3` in
+yq and `p: 3, q: 4` here, the shared node incremented twice), `..` over an owned value
+(`to_entries | .[] | ..` expands the alias), a merge key (`<<: *b`, which yq also treats as the
+stop, listing `m.<<` where this lists the merged `m.p`/`m.q`), and `recurse(f; cond)`.
