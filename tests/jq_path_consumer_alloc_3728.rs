@@ -20,9 +20,9 @@
 //! per-member work (`path(.)` for a bare `path(f)`, `paths(.)` for `paths(f)`,
 //! `. // .` for the alternative), in the same process, with a bound of a stated
 //! number of allocator calls per member. The `catch empty` handler is the one
-//! exception: its twin is the same body with a handler the resolver has to run
-//! (`catch (empty | empty)`), which makes the saving the whole difference. Each
-//! shortcut has a row that fails with only that shortcut deleted.
+//! exception: its twin is the same body with no handler, which is what a handler
+//! that is never run costs. Each shortcut has a row that fails with only that
+//! shortcut deleted.
 //!
 //! Counting is gated to the calling thread, so the harness's other threads, and
 //! other tests in this file, cannot add to the window.
@@ -109,42 +109,50 @@ fn assert_rows_like_twin(rows: &[(&str, &str, i64, usize)]) {
 }
 
 /// `catch empty` delivers nothing for any payload, so the resolver neither
-/// seeds nor runs it. The body is `error("x")`, not `.[]`, so no other
-/// shortcut is in play: the twin differs only in a handler (`empty | empty`)
-/// that is not the bare `empty` the shortcut matches, and so is run.
+/// seeds nor runs it: it costs what the same body with no handler at all does,
+/// `path(try error("x"))`, which swallows the error and delivers nothing too.
+/// The body is `error("x")`, not `.[]`, so no other shortcut is in play.
 ///
-/// The saving from not running the handler is 7 allocator calls per member, and 4 on
-/// the booleans-and-nulls document, whose handler is cheaper to run. It was 10 and 6
-/// before #4217 recycled a scalar bridge document's three index buffers, which made the
-/// handler the twin has to run cheaper (8 on the #4155 tip, 7 once `PathPrefix::root`
-/// stopped allocating, #4226). With the shortcut deleted the two cost the same.
+/// The twin is the handler-less body rather than a handler the resolver has to
+/// run (`catch (empty | empty)`) because the pin is that the handler was not run,
+/// and that is a statement about the shortcut alone. Measured against a handler
+/// that has to run, the margin was the cost of running it: 10 and 6 allocator calls
+/// per member when written, 7 and 4 by #4226, each rewritten by hand whenever a perf
+/// change (#4217 recycling a scalar bridge document's index buffers, #4226) made the
+/// handler cheaper, and each rewrite weakened the pin. With the shortcut deleted
+/// `catch empty` costs 4 to 7 more per member than the handler-less body, which
+/// fails the bound; nothing about how cheap a handler is to run moves it.
 #[test]
 fn a_catch_empty_handler_in_path_f_is_not_run_3728() {
     for (name, json) in fixtures() {
-        let saved = if name.contains("booleans") { 4 } else { 7 };
         let (empty, answered) =
             allocations_collecting("[.[] | path(try error(\"x\") catch empty)] | length", &json);
         assert_eq!(answered, 0, "{name}: the handler delivers nothing");
-        let (run, answered) = allocations_collecting(
-            "[.[] | path(try error(\"x\") catch (empty | empty))] | length",
-            &json,
-        );
-        assert_eq!(answered, 0, "{name}: the twin's handler delivers nothing");
         // `allocations_collecting` warms the thread's pool of recycled scalar
         // bridge index buffers (#4217), so the count excludes their first use.
-        assert!(
-            empty + saved * N <= run,
-            "{name}: `catch empty` made {empty} allocator calls and the handler the resolver \
-             has to run made {run}; not running it should save at least {saved} per member"
+        let (bare, answered) =
+            allocations_collecting("[.[] | path(try error(\"x\"))] | length", &json);
+        assert_eq!(
+            answered, 0,
+            "{name}: the handler-less body delivers nothing"
+        );
+        // The counter counts: the body makes an allocation for every member.
+        assert!(bare >= N, "{name}: the handler-less body made {bare}");
+        assert_costs_like_twin(
+            name,
+            ("path(try error(\"x\") catch empty)", empty),
+            ("path(try error(\"x\"))", bare),
+            1,
         );
         let (streamed, outputs) =
             allocations_streaming(".[] | path(try error(\"x\") catch empty)", &json);
         assert_eq!(outputs, 0, "{name}: streamed");
-        let (streamed_run, _) =
-            allocations_streaming(".[] | path(try error(\"x\") catch (empty | empty))", &json);
-        assert!(
-            streamed + saved * N <= streamed_run,
-            "{name}: streamed, {streamed} against {streamed_run}"
+        let (streamed_bare, _) = allocations_streaming(".[] | path(try error(\"x\"))", &json);
+        assert_costs_like_twin(
+            name,
+            (".[] | path(try error(\"x\") catch empty)", streamed),
+            (".[] | path(try error(\"x\"))", streamed_bare),
+            1,
         );
     }
 }
