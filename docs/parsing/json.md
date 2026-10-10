@@ -668,6 +668,40 @@ The second suggestion in the issue, running the #1677 checks inside the identity
 
 Pinned by `repeated_hashes_tests` (the prefilter equals sort-then-`shared_hashes` for no repeat, two repeats, one value three times, every value twice, all equal and zero, at sizes either side of the 128 floor and either side of the 2^21 ceiling; hashes sharing every low bit; a mostly-repeated list that makes it give up), `key_hash_and_end_tests` (the helper equals the two separate calls, and takes the one-scan path only on an escape-free ASCII key) and `key_raw_unescaped_with_end_declines_what_the_two_calls_would_split_3343` (an unterminated or escaped span declines). A differential sweep of 122 documents (unique, duplicate, escaped-duplicate, non-ASCII, pretty, nine malformed-member shapes, each at 127 to 70,000 keys) across nine queries matched the base binary's stdout, stderr and exit code on all 1,098 comparisons, and `length` / `keys | length` matched jq 1.7.1 on every well-formed one; breaking the distinct count or the key-end arithmetic in a scratch copy fails it.
 
+#### The other batch sites (#4169)
+
+Three more places sorted every key hash only to ask whether any repeats. Each now asks `any_hash_repeats` (the same prefilter as `repeated_hashes`, through one shared `prefilter_candidates`, answering only yes or no) or was measured and kept its sort:
+
+| site                                 | reached by (checked with a probe build)                    | outcome            |
+|--------------------------------------|------------------------------------------------------------|--------------------|
+| `keys_repeat` (`document.rs`)        | `to_entries`, `.[]`, `map_values`, `with_entries`, `paths` | prefilter          |
+| `spans_repeat` (`jq_runner.rs`)      | the printer's materialized object arm: `[.]`, `{a: .}`     | prefilter          |
+| `object_keys_repeat` (`document.rs`) | `keys_unsorted`, only past 786,432 keys (table saturation) | **keeps the sort** |
+
+Both shipped sites materialize every field first (about 152 bytes per field for JSON), so the sort is a smaller share of their cost than of `census`'s, and the gain is a few percent at most. Release build, `scripts/ab-cli.py` interleaved, output identity and exit status gated, 21 reps (7 at 100 MB, 31 in the `keys_unsorted` sweep below), base `8dd745d58`; medians, with a holdout (this branch with `any_hash_repeats` forced to the plain sort) to measure the layout band, which read -1.5%..+1.0% on the 7950X and -1.9%..+2.0% on the M4 Pro (a control of the base binary against itself: -1.1%..+0.7% and -2.2%..+0.5%):
+
+| row                            | 2 MB (159 K keys) | 10 MB (763 K) | 16 MB (1.0 M) | 26 MB (1.55 M) | 32 MB (1.88 M) | 100 MB (7.1 M, above the gate) |
+|--------------------------------|------------------:|--------------:|--------------:|---------------:|---------------:|-------------------------------:|
+| `to_entries \| length`, 7950X  |             -1.5% |         -1.3% |         -1.0% |          -0.8% |          -0.8% |                          -1.0% |
+| `[.]`, 7950X                   |             -2.4% |         -2.6% |         -1.7% |          -2.0% |          -2.5% |                          -0.5% |
+| `to_entries \| length`, M4 Pro |             -0.4% |         -2.3% |         -1.7% |          -0.8% |          -2.2% |                          -0.5% |
+| `[.]`, M4 Pro                  |             -3.1% |         -2.8% |         -1.2% |          +0.7% |          -1.7% |                          +1.3% |
+
+The M4 Pro `[.]` rows at 1.55 M to 1.77 M keys (+0.1% to +0.9%) sit inside their holdout's +0.3% to +1.3%; the 100 MB rows are above the 2^21 gate, so they run the sort on both sides and only show the band. Over arrays of equal objects (10 MB each) `map(to_entries | length) | add` reads -0.4% / -1.4% / -0.1% / -1.1% / -1.6% at 32 / 128 / 512 / 2,048 / 32,768 keys per object on the 7950X and +0.4% / -1.9% / +0.8% / -1.3% / -2.7% on the M4 Pro, and `.[] | [.]` -0.3% / -0.1% / -0.6% / -0.9% / -1.9% and +0.5% / +0.4% / +1.0% / -0.9% / -1.1%: inside the band up to 512 keys, where the instruction counts are flat too.
+
+Instructions on the same 2 MB `wide` file: 7950X cachegrind `Ir` `to_entries | length` 990.8 M -> -1.71%, `[.]` 603.6 M -> -2.72%, holdout 0.00% on both; `length` (neither site) -0.16%; 128-key objects -0.3%; 32-key objects (below the gate) 0.00%. M4 Pro `time -l` instructions retired: -1.58% and -1.98%, 128-key objects -0.06% and +0.01%. Peak RSS is unchanged at both sites (26 MB `[.]` 159.3 -> 159.1 MB, `to_entries | length` 1,060.9 -> 1,060.8 MB on the 7950X): the bitsets are small next to the materialized field list and are freed before it is.
+
+**`object_keys_repeat` keeps its sort.** It runs only on `keys_unsorted` past the streaming table's saturation, where it walks keys alone, the shape most like `census`. The prefilter cut its instructions by 6.2% to 6.5% (7950X cachegrind `Ir` at 1.0 M keys -6.50%; M4 Pro retired 1,781.8 M -> 1,671.8 M at 1.0 M keys, 2,927.3 M -> 2,736.6 M at 1.55 M) but its wall-clock on the M4 Pro was not monotone in size:
+
+| keys (`keys_unsorted`) | 1.0 M | 1.06 M | 1.11 M | 1.22 M | 1.33 M | 1.44 M | 1.50 M | 1.55 M | 1.66 M | 1.77 M | 1.88 M | 1.99 M |
+|------------------------|------:|-------:|-------:|-------:|-------:|-------:|-------:|-------:|-------:|-------:|-------:|-------:|
+| M4 Pro (median)        | -2.5% |  -0.6% |  -0.6% |  -1.6% |  -1.3% |  -1.9% |  -1.8% |  +3.9% |  +4.1% |  +3.8% |  -2.7% |  -2.3% |
+| 7950X (median)         | -2.1% |  +0.9% |  -2.2% |  -0.1% |  -0.4% |  -0.9% |  -0.8% |  -0.6% |  -1.5% |  -1.4% |  -1.6% |  -1.6% |
+
+The 1.55 M row reproduced at +3.9% median / +3.1% min over 41 reps with its holdout at -0.1%, and the bump is in the prefilter binary's own times (182.9 ms at 1.77 M keys, 181.9 ms at 1.88 M), so it is not layout. The keys hold no duplicate, the bitsets are the same 2 MB each from 1.05 M to 2.1 M hashes, and the M4 Pro has no profiler to isolate it; with the best case near 2% on either box the sort stays. The two materializing sites showed no such band at the same sizes on the same box.
+
+Pinned by `repeated_hashes_tests`, which now checks `any_hash_repeats` against a full sort and `hashes_repeat` on every input it checks `repeated_hashes` on (forcing the boolean to `false` when candidates exist fails two of them). A differential of base against this change on terminus (unique, duplicate, escaped-duplicate and mostly-duplicate keys, 2 to 900,000 keys, objects and arrays of objects, 14 queries) matched stdout, stderr and exit code on all 742 comparisons.
+
 ---
 
 ## Optimisation Techniques Used
