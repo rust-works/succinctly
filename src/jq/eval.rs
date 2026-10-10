@@ -125085,6 +125085,61 @@ mod tests {
         );
     }
 
+    /// #4226: the collecting form (`resolve_leaf_bounded`) and the streaming form
+    /// (`resolve_leaf_sink`) of a trackable `.` over a scalar both resolve to the
+    /// one borrowed scalar at the root, and a container, or an untracked `.`, takes
+    /// neither shortcut. Driven directly: the evaluator reaches a bare `.` through
+    /// its own arm before it gets to either leaf resolver, so nothing end to end
+    /// exercises the collecting shortcut.
+    #[test]
+    fn lone_scalar_identity_is_one_borrowed_root_branch_in_both_forms_4226() {
+        let identity = parse(".").unwrap();
+        let frame = Frame::enter(&identity);
+        for scalar in [
+            OwnedValue::Null,
+            OwnedValue::Bool(true),
+            OwnedValue::Int(7),
+            OwnedValue::String("s".into()),
+        ] {
+            let Some(Ok(collected)) = resolve_leaf_bounded::<JqSemantics>(
+                &identity,
+                &scalar,
+                true,
+                &Snapshot::No,
+                &frame.register_loss,
+            ) else {
+                panic!("a trackable scalar `.` resolves bounded, without refusing: {scalar:?}");
+            };
+            assert_eq!(collected.len(), 1, "{scalar:?}");
+            assert!(matches!(collected[0].value, Cow::Borrowed(_)), "{scalar:?}");
+            assert!(
+                matches!(&*collected[0].path, PathPrefix::Root),
+                "{scalar:?}"
+            );
+
+            let mut streamed = Vec::new();
+            let flow = resolve_leaf_sink::<JqSemantics>(
+                &identity,
+                &scalar,
+                true,
+                &Snapshot::No,
+                &frame,
+                Keep::First,
+                &mut |branch| {
+                    streamed.push(branch.value.into_owned());
+                    Demand::Stop
+                },
+            );
+            assert!(matches!(flow, ResolveFlow::Stopped), "{flow:?}");
+            assert_eq!(streamed, vec![scalar.clone()]);
+        }
+
+        let container = OwnedValue::array_from(vec![OwnedValue::Int(1)]);
+        assert!(lone_scalar_identity(&identity, &container, true).is_none());
+        assert!(lone_scalar_identity(&identity, &OwnedValue::Int(1), false).is_none());
+        assert!(lone_scalar_identity(&parse(".a").unwrap(), &OwnedValue::Int(1), true).is_none());
+    }
+
     /// #2696: bare `..`/`recurse`/`recurse_down` used to collect the whole
     /// tree (`push_recursive_branches`) before a bounded consumer ever saw
     /// the first branch, unlike the parameterised pair's own sink
