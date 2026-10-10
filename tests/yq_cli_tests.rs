@@ -61371,6 +61371,69 @@ fn test_yq_string_length_counts_bytes_4270() -> Result<()> {
     Ok(())
 }
 
+/// Pinned yq v4.53.3 (#4275): `null` is an empty array for a negative index, so `null | .[-1]`
+/// raises `index [-1] out of range, array size is 0` as `[] | .[-1]` does, unsuppressible by `?`
+/// (#2254). A non-negative index of `null` is `null`. jq answers `null` for every one of them.
+/// Rows captured from the pinned binary, `-p=json -o=json -I=0`, and `/usr/bin/jq` 1.7.1.
+#[test]
+fn test_yq_negative_index_of_null_is_out_of_range_4275() -> Result<()> {
+    let args = &["-p=json", "-o=json", "-I=0"];
+    for (input, filter) in [
+        ("null", ".[-1]"),
+        ("null", ".[-2]"),
+        ("null", "[.[-1]]"),
+        ("null", ".[-1]?"),
+        ("null", ".[-1] // 1"),
+        ("null", ".a[-1]"),
+        ("{\"a\":null}", ".a[-1]"),
+        ("{\"a\":null}", ".a[(-2)]"),
+        ("null", ".[0 - 1]"),
+        ("null", ".[-1 | . + 0]"),
+        ("[]", ".[-1]"),
+        ("[1]", ".[-2]"),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, input, args)?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            ("", 1),
+            "{input} | {filter}: {stderr}"
+        );
+        assert!(
+            stderr.contains("out of range"),
+            "{input} | {filter}: {stderr}"
+        );
+    }
+    for (input, filter, expected) in [
+        ("null", ".[0]", "null\n"),
+        ("null", ".[1]", "null\n"),
+        ("null", ".[1 - 1]", "null\n"),
+        ("{\"a\":null}", ".a[0]", "null\n"),
+        ("{}", ".[-1]", "null\n"),
+        ("[1]", ".[-1]", "1\n"),
+        ("[1]", ".[1]", "null\n"),
+        ("null", ".[-1:]", "[]\n"),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, input, args)?,
+            (expected.into(), String::new(), 0),
+            "{input} | {filter}"
+        );
+    }
+    // The YAML reader takes the cursor route.
+    for filter in [".a[-1]", ".c[-1]"] {
+        let (stdout, _, code) =
+            run_yq_stdin_with_stderr(filter, "a: ~\nb: [1]\n", &["-o=json", "-I=0"])?;
+        assert_eq!((stdout.as_str(), code), ("", 1), "yaml {filter}");
+    }
+    // jq mode: `null` for all of them.
+    for filter in [".[-1]", ".[0]", "[.[-1]]"] {
+        let (out, code) = run_jq_stdin(filter, "null", &["-c"])?;
+        assert_eq!(code, 0, "jq {filter}");
+        assert!(out == "null\n" || out == "[null]\n", "jq {filter}: {out}");
+    }
+    Ok(())
+}
+
 /// Pinned yq v4.53.3 (#4257): `pick` indexes an array by an integer, or by a string that parses as
 /// one (Go's base-10 `ParseInt`: a sign and leading zeros are fine, spaces are not); every other
 /// key, a float included, is an error, and a negative index does not wrap. `omit` leaves a scalar

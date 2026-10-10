@@ -26614,8 +26614,12 @@ fn index_array_by_position<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // mode, so this arm just propagates whichever one it returned.
             Err(e) => QueryResult::Error(e),
         },
-        // jq returns null for index on null
-        StandardJson::Null => QueryResult::One(StandardJson::Null),
+        // jq returns null for index on null. #4275 (yq): `null` is an empty array for a
+        // negative index, so `null | .[-1]` raises what `[] | .[-1]` does.
+        StandardJson::Null => match yq_negative_index_check::<S>(idx, idx, 0) {
+            Some(e) => QueryResult::Error(e),
+            None => QueryResult::One(StandardJson::Null),
+        },
         // (#4079: the callers that know the literal's spelling look the member up first.)
         StandardJson::Object(_) if yq_numeric_index_on_object_is_null::<S>() => {
             QueryResult::One(StandardJson::Null)
@@ -27009,10 +27013,13 @@ pub(crate) fn yq_negative_index_error<S: EvalSemantics>(
     target: &OwnedValue,
     key: &OwnedValue,
 ) -> Option<EvalError> {
-    let OwnedValue::Array(items) = target else {
-        return None;
+    // #4275: yq reads `null` as an empty array for a negative index.
+    let len = match target {
+        OwnedValue::Array(items) => items.len(),
+        OwnedValue::Null => 0,
+        _ => return None,
     };
-    yq_negative_index_error_for_len(S::TAG == EvalTag::Yq, key, items.len())
+    yq_negative_index_error_for_len(S::TAG == EvalTag::Yq, key, len)
 }
 
 /// [`index_one`] for a target that is already an owned value, as when the
@@ -60686,7 +60693,11 @@ fn eval_owned_navigation<S: EvalSemantics>(
                     .unwrap_or(OwnedValue::Null);
                 Ok(Some(element))
             }
-            OwnedValue::Null => Ok(Some(OwnedValue::Null)),
+            // #4275 (yq): `null` is an empty array for a negative index.
+            OwnedValue::Null => match yq_negative_index_error::<S>(input, &OwnedValue::Int(*idx)) {
+                Some(e) => Err(e),
+                None => Ok(Some(OwnedValue::Null)),
+            },
             // #2459: yq mode only -- same rule as `index_array_by_position`'s
             // own `Object` arm. See `yq_numeric_index_on_object_is_null`.
             OwnedValue::Object(map) if yq_numeric_index_on_object_is_null::<S>() => {
