@@ -9990,7 +9990,10 @@ others.
 **Accepted: what is left of the collection split inside the cursor evaluator (#3427, narrowed
 by #3856).** A jq-mode array whose body is a `,` (`[., 1]`, `[., .]`, `[.a, .b]`, `[.[], 1]`,
 `[.b, empty]`, a `,` head behind a pipe of navigation, and since #3922 a `,` stage after a pipe of
-navigation, `[.[] | ., .]`, where each output of the stages before it gets every branch in turn)
+navigation, `[.[] | ., .]`, where each output of the stages before it gets every branch in turn;
+since #4166 that stage may also hold a computed branch when nothing follows it (`[.[] | ., 1]`,
+`[.[] | length, .]`), be followed by computed stages when its branches are navigation
+(`[.[] | ., . | length]`), or be a `?` around navigation branches (`[.[] | (., .[0])?]`))
 holds each document node it collects
 as a cursor, beside whatever the other branches compute, and reads none of them: `[., 1] |
 length` answers over an unreadable value. Printing the array reads every node, so `[., 1]` and
@@ -10010,8 +10013,12 @@ builds an owned value and decodes what it holds, so each of these raises where t
 
 - a construction held inside another: `[[.]]`, `[.[] | [.]]`, `{a: {b: .}}`, since the inner
   construction is materialized to be an element;
-- a computed stream that is not a `,` body, or a pipe with a computed stage (`[.[] | ., 1]`,
-  `[.[] | length, .]`), which is not the pure navigation the regrouping is sound for;
+- a computed stream that is not a `,` body, a pipe with a computed stage before its first `,`
+  stage (`[.[] | length | (., .)]`), a `,` stage with both a computed branch and stages after
+  it (`[.[] | (., 1) | .a]`, where the tail would run between two computed branches that the
+  owned route runs back to back), a computed branch or stage in or after a `(a, b)?` group, and
+  any of these reading path context (`key`, `parent`); the regrouping keeps the pipe's own order
+  only for the shapes above (#4166);
 - a variable bind that decodes at the bind, below;
 - yq mode, whose printer materializes a sequence anyway and so keeps its owned routes.
 
@@ -10027,6 +10034,16 @@ failure, which `?`/`try` let through anyway, so it surfaces where an element is 
 consumer that reads only well-formed nodes answers where it used to raise (`first([.a, .b]?)`,
 `[.a, .b]? | length`), and `.[]` streams the elements before the malformed one. A branch that
 raises (`[.users[0].n.x, 1]?`) is still caught.
+
+**Accepted: a declined `,`-stage prefix is evaluated twice (#4166).** When the stages before a
+`,` stage do not answer document nodes (an owned input, a raise), the route declines and the
+owned route runs the whole body, prefix included, again. The prefix is pure navigation, so this
+costs time and never repeats an effect, and the time was measured as noise next to the owned
+route's own work: `[.users[] | {id}] | [.[] | ., .] | length` on a 14 MB `users` document took
+0.11-0.12 s of user time against 0.11 s for the comma twin `[.[], .[]]` (release, Apple M4 Pro).
+Handing the evaluated prefix back to the caller would need a second entry into the pipe fold
+whose equivalence to the whole-pipe fold is not obvious for every head shape, for no measurable
+gain.
 
 **An object holds its nodes too (#4044, jq mode).** `{a: .users}`, `{meta: .meta, data: .users}`,
 `{x: .b}` and `{a: .}` hold each document node a member names as a cursor and read none of them,
