@@ -19,8 +19,9 @@
 //! ([`object_from_pairs`](super::eval::object_from_pairs), #4182), so the two routes
 //! agree. A pair with *no* maps is where they part: the fan-out ends the construction
 //! at it, the fold skips it and restarts, so
-//! [`yq_collects_object`](super::eval::yq_collects_object) sends every construction
-//! with an operand that may be empty here (#4193).
+//! [`yq_object_route`](super::eval::yq_object_route) sends a construction with an
+//! operand that may be empty here once its cross product has come out empty (#4193,
+//! #4240).
 
 use alloc::string::String;
 use alloc::vec::Vec;

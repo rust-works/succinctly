@@ -61100,6 +61100,71 @@ fn test_object_construction_empty_operand_4193() -> Result<()> {
     Ok(())
 }
 
+/// Pinned yq v4.53.3: a key or an index applied to a string, number or boolean yields nothing, not
+/// `null`, so a plain path can be the empty pair of a `{...}` and the fold must run for it (#4240).
+/// Every row was captured from the pinned binary, `-p=json -o=json -I=0`.
+#[test]
+fn test_object_construction_path_on_a_scalar_is_an_empty_pair_4240() -> Result<()> {
+    let args = &["-p=json", "-o=json", "-I=0"];
+    let input = r#"{"m":"str","n":2,"o":{"k":1},"l":[1,2]}"#;
+    for (filter, expected) in [
+        (r#"{"a":.m.id,"b":.n}"#, "{\"b\":2}\n"),
+        (r#"{"a":.n.id,"b":.n}"#, "{\"b\":2}\n"),
+        (r#"{"a":.m[0],"b":.n,"c":.o.k}"#, "{\"b\":2,\"c\":1}\n"),
+        (r#"{"a":.n,"b":.m.id,"c":.o.k}"#, "{\"c\":1}\n"),
+        (r#"{"a":.n,"b":.o.k,"c":.m.id}"#, ""),
+        (r#"{(.m.id):1,"b":.n}"#, "{\"b\":2}\n"),
+        // A path that resolves keeps the fan-out's answer.
+        (r#"{"a":.o.k,"b":.n}"#, "{\"a\":1,\"b\":2}\n"),
+        (
+            r#"{"a":.l[0],"b":.l[1],"c":(.l|length)}"#,
+            "{\"a\":1,\"b\":2,\"c\":2}\n",
+        ),
+        // Per record of a stream.
+        (r#".l[] | {"a": .x, "b": .}"#, "{\"b\":1}\n{\"b\":2}\n"),
+        (r#".l[] | {"b": ., "a": .x}"#, ""),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, input, args)?,
+            (expected.into(), String::new(), 0),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
+/// #4240: a construction that might be empty is built a second time only when the first build came
+/// out empty, so a side effect inside one must not fire twice either way.
+#[test]
+fn test_object_construction_side_effect_in_a_maybe_empty_operand_fires_once_4240() -> Result<()> {
+    for (filter, expected_out) in [
+        // The operand is empty: yq skips the entry.
+        (r#"{"a":(1|debug|select(false)),"b":2}"#, "{\"b\":2}\n"),
+        // The operand is not: nothing is built twice.
+        (
+            r#"{"a":(1|debug|select(true)),"b":2}"#,
+            "{\"a\":1,\"b\":2}\n",
+        ),
+        (
+            r#"{"a":1,"b":(2|debug|select(false)),"c":(3,4)}"#,
+            "{\"c\":3}\n{\"c\":4}\n",
+        ),
+    ] {
+        let (out, err, code) = run_yq_stdin_with_stderr(
+            filter,
+            "null\n",
+            &["-p=json", "-o=json", "-I=0", "--jq-extensions"],
+        )?;
+        let debug_lines = err.matches("DEBUG").count();
+        assert_eq!(
+            (code, out.as_str(), debug_lines),
+            (0, expected_out, 1),
+            "{filter}: {err}"
+        );
+    }
+    Ok(())
+}
+
 /// Pinned yq v4.53.3: an operand with no output is not the same as no operator
 /// (#4139). `A as $v | B` runs `B` once, with `$v` unset, when `A` has no output;
 /// an empty index operand in `.[E]` stands for every child of the operand, which
