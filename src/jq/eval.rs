@@ -35974,6 +35974,7 @@ fn body_performs_no_step(e: &Expr) -> bool {
 /// [`optional_group_is_scope_safe`] says that rewrite cannot be observed
 /// (#2909); otherwise the group stays one opaque element.
 fn push_path_components(out: &mut Vec<Expr>, expr: &Expr) {
+    // A new arm that looks through `expr` also belongs in `may_end_in_bare_iterate`.
     match expr {
         Expr::Identity => {}
         Expr::Pipe(exprs) => {
@@ -36022,6 +36023,23 @@ fn push_path_components(out: &mut Vec<Expr>, expr: &Expr) {
         }
         other => out.push(other.clone()),
     }
+}
+
+/// Whether [`push_path_components`] could flatten `expr` into a run ending in a
+/// bare iterate (#4155). `false` only for a lone leaf: everything the flatten looks
+/// through (`Pipe`, `Paren`, `Optional`, `Identity`) and `Iterate` itself answer
+/// `true`, so a `false` means the flatten would yield a clone of `expr` that
+/// `resolve_dynamic_indexes_sink`'s `is_bare_iterate` rejects, and the caller can skip
+/// building it.
+///
+/// Keep this in step with [`push_path_components`]: a shape it learns to look through
+/// must answer `true` here, or the trailing iterate behind it is no longer deferred
+/// (#888). `may_end_in_bare_iterate_agrees_with_the_flatten_4155` walks the shapes.
+fn may_end_in_bare_iterate(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Pipe(_) | Expr::Paren(_) | Expr::Optional(_) | Expr::Identity | Expr::Iterate
+    )
 }
 
 /// Evaluate an expression against an owned value, preserving the whole output
@@ -38115,14 +38133,37 @@ impl PathPrefix {
         }
     }
 
-    /// A fresh, empty chain. Not a shared singleton: this crate is
-    /// `no_std`-compatible (no `thread_local`/`once_cell`-style sharing
-    /// available), and re-allocating one `Root` node per fresh chain is O(1)
-    /// regardless. Callers that build many siblings off the same root (e.g.
-    /// per-element loops) should hoist a single `root()` call outside the
-    /// loop and `Rc::clone` it, not call `root()` per element.
+    /// An empty chain. Under `std` a handle on one per-thread `Root` (#4226): a
+    /// `path(f)` per member of a wide fan-out resolves a lone leaf to the root, and
+    /// allocating a node per call was one of the five allocator calls it made for a
+    /// scalar member. `Root` carries nothing and no chain is ever mutated through its
+    /// `Rc`, so sharing it is unobservable; the pointer comparisons made on chains
+    /// ([`same_node_path`], [`same_frame_position`]) are fast paths ahead of a
+    /// structural comparison that also calls two roots equal.
+    ///
+    /// `no_std` has no `thread_local`, so each call there allocates its own node, O(1)
+    /// regardless. Callers that build many siblings off the same root (e.g. per-element
+    /// loops) there should hoist a single `root()` call outside the loop and
+    /// `Rc::clone` it, not call `root()` per element.
+    ///
+    /// Whether two roots are one allocation therefore differs between the builds, so
+    /// pointer identity of a root means nothing: nothing may key on it or assume two
+    /// roots are distinct, and comparing two chains goes by structure.
     fn root() -> Rc<Self> {
-        Rc::new(Self::Root)
+        #[cfg(feature = "std")]
+        {
+            std::thread_local! {
+                static ROOT: Rc<PathPrefix> = Rc::new(PathPrefix::Root);
+            }
+            // A thread already tearing down its locals can still drop a resolver value that
+            // asks for a root; it gets a node of its own rather than a panic.
+            ROOT.try_with(Rc::clone)
+                .unwrap_or_else(|_| Rc::new(Self::Root)) // patchcov: coverage tolerate-line reason="unreachable from a test: it runs only while the thread's own locals are being destroyed, and nothing resolves a path from a thread-local destructor (#4226)"
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            Rc::new(Self::Root)
+        }
     }
 
     fn depth(&self) -> usize {
@@ -38223,10 +38264,10 @@ pub(crate) enum PathTrail {
 }
 
 impl PathTrail {
-    /// A fresh, empty trail. Like [`PathPrefix::root`], not a shared
-    /// singleton — re-allocating one `Root` per walk is O(1) regardless, and
-    /// this crate stays `no_std`-compatible with no `thread_local`-style
-    /// sharing available.
+    /// A fresh, empty trail. Not a shared singleton, unlike [`PathPrefix::root`]
+    /// under `std` (#4226) — re-allocating one `Root` per walk is O(1)
+    /// regardless, and this crate stays `no_std`-compatible with no
+    /// `thread_local`-style sharing available.
     pub(crate) fn root() -> Rc<Self> {
         Rc::new(Self::Root)
     }
@@ -43109,6 +43150,15 @@ fn resolve_leaf_sink<'a, S: EvalSemantics>(
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
     let register_loss = &frame.register_loss;
+    // #4226: the lone-scalar `.` bypasses `resolve_leaf`'s `Vec` of one branch, which
+    // `drain_path_result` would empty into this sink on the next line. Any `keep` takes it:
+    // it produces exactly one branch and consumes no generator.
+    if let Some(branch) = lone_scalar_identity(expr, value, trackable) {
+        return match sink(branch) {
+            Demand::Continue => ResolveFlow::Exhausted,
+            Demand::Stop => ResolveFlow::Stopped,
+        };
+    }
     let Keep::AtMost(limit) = keep else {
         return drain_path_result(
             resolve_leaf::<S>(expr, value, trackable, snapshot, frame, keep),
@@ -43251,6 +43301,23 @@ fn error_message_first_navigation(expr: &Expr) -> Option<BuiltinNavigation> {
     }
 }
 
+/// The one branch a trackable `.` over a scalar resolves to (#4155): that scalar, borrowed.
+/// Evaluating it would clone the value into a `Vec` just to pop it back out, and a scalar
+/// shares no storage a container's clone would, so borrowing it is not observable.
+///
+/// One definition for [`resolve_leaf_bounded`] and [`resolve_leaf_sink`], so the collecting
+/// and the streaming form cannot disagree about which shape takes the shortcut (#4226).
+fn lone_scalar_identity<'a>(
+    expr: &Expr,
+    value: &'a OwnedValue,
+    trackable: bool,
+) -> Option<PathBranch<'a>> {
+    (trackable
+        && matches!(expr, Expr::Identity)
+        && !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)))
+    .then(|| PathBranch::new(PathPrefix::root(), Cow::Borrowed(value), true))
+}
+
 /// [`resolve_leaf`]'s bounded prefix: the shapes that produce at most one
 /// branch without consuming a generator -- an untrackable navigation
 /// refusal, an untracked `.`, and the `is_primitive` family. `None` means
@@ -43383,6 +43450,9 @@ fn resolve_leaf_bounded<'a, S: EvalSemantics>(
         );
 
     if is_primitive {
+        if let Some(branch) = lone_scalar_identity(expr, value, trackable) {
+            return Some(Ok(vec![branch]));
+        }
         // This arm needs every output, not just the first: `values.len()`
         // (0 vs 1 vs many) decides which of three different outcomes this
         // returns below, a distinction a stop-after-first sink would
@@ -43422,8 +43492,6 @@ fn resolve_leaf_bounded<'a, S: EvalSemantics>(
         if let Some(EvalEscape::Halt(code)) = &trailing {
             return Some(Err((Vec::new(), EvalEscape::Halt(*code)))); // patchcov: coverage tolerate-line reason="unreachable: `is_primitive` admits only Identity/Field/Index/Slice, and of those only a Slice's computed bounds can halt -- all four have their own arm in `resolve_node_sink`/`resolve_node_eager`, so none reaches this function. Pre-existing; #2694 only wrapped the return in `Some` (#2694)"
         }
-        let mut components = Vec::new();
-        push_path_components(&mut components, expr);
         return Some(match values.len() {
             // No output prunes the branch — unless there never would have
             // been one because evaluating `expr` itself broke/errored (Halt
@@ -43443,11 +43511,17 @@ fn resolve_leaf_bounded<'a, S: EvalSemantics>(
             // whatever later reads `.snapshot`). `Expr::Identity` against
             // an *untracked* ambient value is handled separately, at the
             // top of this function, before `is_primitive` is even computed.
-            1 => Ok(vec![PathBranch::new(
-                PathPrefix::from_components(components),
-                Cow::Owned(values.pop().expect("len checked")),
-                true,
-            )]),
+            1 => {
+                // #4155: only this arm reads the components, so the clone of a
+                // `Field`'s name is not paid by a lookup that found nothing.
+                let mut components = Vec::new();
+                push_path_components(&mut components, expr);
+                Ok(vec![PathBranch::new(
+                    PathPrefix::from_components(components),
+                    Cow::Owned(values.pop().expect("len checked")),
+                    true,
+                )])
+            }
             // A multi-output primitive is not actually reachable today —
             // indexing/slicing a value always yields zero or one result —
             // but keep this as a named error rather than a panic in case
@@ -58594,10 +58668,14 @@ fn resolve_dynamic_indexes_sink<S: EvalSemantics>(
     // `path()` only — `defer_trailing_iterate` is `false` for the write-side
     // callers, whose walkers cannot take a deferred iterate; see this
     // function's doc comment for the four ways that goes wrong.
+    //
+    // #4155: flattening clones `expr` whole when it is a lone leaf (`. // .`,
+    // `first(f)`, `try f`), and the clone is read only to ask whether it ends in
+    // an iterate. A leaf that cannot be one never needs the flat form at all.
     let mut flat = Vec::new();
-    push_path_components(&mut flat, expr);
     let mut trailing = Vec::new();
-    if defer_trailing_iterate {
+    if defer_trailing_iterate && may_end_in_bare_iterate(expr) {
+        push_path_components(&mut flat, expr);
         while let Some(true) = flat.last().map(is_bare_iterate) {
             trailing.push(flat.pop().expect("checked Some above"));
         }
@@ -65998,7 +66076,9 @@ pub(crate) fn each_path_on_owned<S: EvalSemantics>(
     optional: bool,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Flow {
-    let root = PathTrail::root();
+    // Built on the first branch that needs a walk (#4155): a resolution that
+    // names the document itself (`path(. // .)`) never does.
+    let mut root: Option<Rc<PathTrail>> = None;
     // #3293: both verdicts below are stashed behind a `Demand::Stop`, and a
     // `?//` inside `expr` retries past that stop (#1519). A retry that
     // resolves another branch re-invokes the sink, which drops them; one
@@ -66016,6 +66096,11 @@ pub(crate) fn each_path_on_owned<S: EvalSemantics>(
         walk_error.begin();
         stopped_at = None;
         reached.clear();
+        // #4155: the empty path is `path(.)`'s answer and walking it reaches
+        // nothing else, so skip the walk and its bookkeeping.
+        if matches!(resolved, Expr::Identity) {
+            return deliver_path(sink, &mut stopped_at, OwnedValue::Array(Vec::new().into()));
+        }
         // A failing walk still emits whatever it reached first (#2680): jq's
         // generator never un-emits an output it already produced, so
         // `path((.a[] | .b) | .c[0:1])` on `{"a":[{"b":{}},5]}` prints
@@ -66028,7 +66113,7 @@ pub(crate) fn each_path_on_owned<S: EvalSemantics>(
         let outcome = walk_path::<S>(
             &resolved,
             WalkNode::Doc(owned),
-            &root,
+            root.get_or_insert_with(PathTrail::root),
             &mut reached,
             optional,
         );
@@ -66038,8 +66123,8 @@ pub(crate) fn each_path_on_owned<S: EvalSemantics>(
         for (path, _) in &reached {
             // `PathTrail::to_vec` is the one O(depth) flatten, paid exactly
             // once per reached branch (#2058).
-            if sink(OwnedValue::Array(path.to_vec().into())) == Demand::Stop {
-                stopped_at = Some(pipe_retry_generation());
+            let path = OwnedValue::Array(path.to_vec().into());
+            if deliver_path(sink, &mut stopped_at, path) == Demand::Stop {
                 return Demand::Stop;
             }
         }
@@ -66074,6 +66159,21 @@ pub(crate) fn each_path_on_owned<S: EvalSemantics>(
         return Flow::Stopped { pending: None };
     }
     walk_error.resume(flow, direct_retry)
+}
+
+/// Hand one resolved path to `sink`, recording a consumer stop under the retry
+/// generation it happened in ([`each_path_on_owned`]'s #3293 bookkeeping), so the two
+/// places that emit a path cannot disagree about what a stop means.
+fn deliver_path(
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+    stopped_at: &mut Option<u64>,
+    path: OwnedValue,
+) -> Demand {
+    let demand = sink(path);
+    if demand == Demand::Stop {
+        *stopped_at = Some(pipe_retry_generation());
+    }
+    demand
 }
 
 /// Walk `expr` as a path expression, pushing `(path, value-at-path)` for every
@@ -80273,6 +80373,60 @@ mod tests {
     use super::*;
     use crate::jq::error::EvalErrorPayload;
     use crate::jq::{parse, parse_with_mode_and_extensions, ParserMode};
+
+    /// #4155: `may_end_in_bare_iterate` answers `false` only where the flatten
+    /// yields nothing but a clone of the expression, which is what lets
+    /// `resolve_dynamic_indexes_sink` skip building it. A shape the flatten looks
+    /// through must never answer `false`, or a trailing iterate behind it is no
+    /// longer deferred (#888).
+    #[test]
+    fn may_end_in_bare_iterate_agrees_with_the_flatten_4155() {
+        for source in [
+            ".",
+            ".a",
+            ".[]",
+            ".a[]",
+            ".[0]",
+            ".[1:2]",
+            ". // .",
+            ".a? // .",
+            ".[]? // .",
+            "first(.a?)",
+            "first(.[])",
+            "try .a catch empty",
+            "try .[] catch empty",
+            "(.a)",
+            "(.a[])",
+            ".a?",
+            ".a[]?",
+            "(.a[])?",
+            "(.a | .b[])?",
+            "(.a | .b)?",
+            "(.a.b)?",
+            "(.a | .b[0])?",
+            ".a | .b[]",
+            ". | .[]",
+            "(. | .[])",
+            "if . then .a else .[] end",
+            "reduce .[] as $x (.; .a)",
+            "$__loc__",
+            "1",
+            "empty",
+            "select(.a)",
+            "recurse",
+        ] {
+            let expr = parse(source).unwrap();
+            let mut flat = Vec::new();
+            push_path_components(&mut flat, &expr);
+            if !may_end_in_bare_iterate(&expr) {
+                assert_eq!(
+                    flat,
+                    vec![expr.clone()],
+                    "`{source}` flattens to more than a clone of itself"
+                );
+            }
+        }
+    }
     use crate::json::JsonIndex;
 
     /// Collect an [`eval_each`] stream back into a `QueryResult`, so the
@@ -124931,6 +125085,61 @@ mod tests {
         );
     }
 
+    /// #4226: the collecting form (`resolve_leaf_bounded`) and the streaming form
+    /// (`resolve_leaf_sink`) of a trackable `.` over a scalar both resolve to the
+    /// one borrowed scalar at the root, and a container, or an untracked `.`, takes
+    /// neither shortcut. Driven directly: the evaluator reaches a bare `.` through
+    /// its own arm before it gets to either leaf resolver, so nothing end to end
+    /// exercises the collecting shortcut.
+    #[test]
+    fn lone_scalar_identity_is_one_borrowed_root_branch_in_both_forms_4226() {
+        let identity = parse(".").unwrap();
+        let frame = Frame::enter(&identity);
+        for scalar in [
+            OwnedValue::Null,
+            OwnedValue::Bool(true),
+            OwnedValue::Int(7),
+            OwnedValue::String("s".into()),
+        ] {
+            let Some(Ok(collected)) = resolve_leaf_bounded::<JqSemantics>(
+                &identity,
+                &scalar,
+                true,
+                &Snapshot::No,
+                &frame.register_loss,
+            ) else {
+                panic!("a trackable scalar `.` resolves bounded, without refusing: {scalar:?}");
+            };
+            assert_eq!(collected.len(), 1, "{scalar:?}");
+            assert!(matches!(collected[0].value, Cow::Borrowed(_)), "{scalar:?}");
+            assert!(
+                matches!(&*collected[0].path, PathPrefix::Root),
+                "{scalar:?}"
+            );
+
+            let mut streamed = Vec::new();
+            let flow = resolve_leaf_sink::<JqSemantics>(
+                &identity,
+                &scalar,
+                true,
+                &Snapshot::No,
+                &frame,
+                Keep::First,
+                &mut |branch| {
+                    streamed.push(branch.value.into_owned());
+                    Demand::Stop
+                },
+            );
+            assert!(matches!(flow, ResolveFlow::Stopped), "{flow:?}");
+            assert_eq!(streamed, vec![scalar.clone()]);
+        }
+
+        let container = OwnedValue::array_from(vec![OwnedValue::Int(1)]);
+        assert!(lone_scalar_identity(&identity, &container, true).is_none());
+        assert!(lone_scalar_identity(&identity, &OwnedValue::Int(1), false).is_none());
+        assert!(lone_scalar_identity(&parse(".a").unwrap(), &OwnedValue::Int(1), true).is_none());
+    }
+
     /// #2696: bare `..`/`recurse`/`recurse_down` used to collect the whole
     /// tree (`push_recursive_branches`) before a bounded consumer ever saw
     /// the first branch, unlike the parameterised pair's own sink
@@ -124978,8 +125187,9 @@ mod tests {
                     root_prefix = Some(Rc::clone(&branch.path));
                     Demand::Continue
                 } else {
-                    // The root prefix itself, the seed's reference, and this
-                    // child's own: anything past a handful is a sibling.
+                    // The root prefix itself, the seed's reference, this child's
+                    // own and, under `std`, the thread's cached root (#4226): anything
+                    // past a handful is a sibling.
                     alive_at_second = Rc::strong_count(root_prefix.as_ref().unwrap());
                     Demand::Stop
                 }
@@ -124987,7 +125197,7 @@ mod tests {
             assert!(matches!(flow, ResolveFlow::Stopped), "{flow:?}");
             assert_eq!(calls, 2);
             assert!(
-                alive_at_second <= 4,
+                alive_at_second <= 5,
                 "{alive_at_second} child branches existed at the second delivery"
             );
         }
