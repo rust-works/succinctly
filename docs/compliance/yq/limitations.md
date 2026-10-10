@@ -5052,6 +5052,20 @@ $ echo $?
   covers a literal key that repeats and a computed key that turns out to (`{($k): .., ($k): ..}`)
   alike, on every route, and costs nothing when no key repeats. It is the same fold the
   `COLLECT_OBJECT` route above runs.
+- **A pair with no maps (#4193).** A `key: value` pair whose key or value yields nothing
+  contributes no map to the fold, and the fold restarts after it: `{"a": empty, "b": 2}` is
+  `b: 2`, `{"a": 1, "b": empty, "c": 3}` is `c: 3`, and `{"a": 1, "b": empty}` is nothing, where
+  jq (and this fan-out before #4193) ends the whole construction at the first empty entry. yq
+  also evaluates every entry before it folds, so `{"a": empty, "b": error("boom")}` raises
+  `boom` rather than printing nothing. Whether an operand is empty is only known by running
+  it, so a construction takes this route unless every operand is provably total
+  (`yields_at_least_one_value`: literals, variables, field/index paths, `length`, `map(..)`,
+  operators and pipes of those, ...); a construction of those keeps the fan-out and costs the
+  same as before. jq mode never takes it. Two shapes stay on the fan-out although yq folds
+  them: `$x` with no `as` binding it (yq yields nothing for it, so `{"a": 1, "b": $x, "c": 3}`
+  is `c: 3` there and nothing here) -- a variable is judged total because a bound one is by
+  far the usual case -- and a `select(.>0)` over an array element inside a pair, which yq
+  gives no maps although every element passes (#4239).
 
 Residual divergences remain, all in cases yq itself reaches through its node model:
 
@@ -5064,7 +5078,10 @@ Residual divergences remain, all in cases yq itself reaches through its node mod
   `succinctly yq` builds each input's object on its own. `.[] | {.k}` over elements whose `k`
   has different lengths is the `CollectObject: mismatching node sizes` error in yq and no output
   here, and `[.l[] | {.nope}]` is `[{}]` in yq and `[{},{}]` here (#4184). Pair-only
-  constructions are unaffected (one object per node either way).
+  constructions are unaffected (one object per node either way) unless a pair can be empty
+  (#4193): then the fold spans every node too, so `.v[] | {"n": .p, "m": (.q | select(. > 1))}`
+  over three nodes of which the middle one has no `m` is nothing in yq, and `{"n":1,"m":5}
+  {"n":3,"m":7}` here.
 - **`,` over two variable references.** yq's `UNION` drops its right operand when both operands are
   variable references, whatever they hold: `1 as $z | 2 as $y | $z, $y` prints only `1`, and so does
   `$z, $y, $w`; `., .` collapses too (`succinctly yq` already does that one). Array collection is

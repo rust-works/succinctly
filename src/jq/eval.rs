@@ -4466,7 +4466,7 @@ fn eval_object_construction_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     eval_operand: &mut ObjectSlotEvaluator<'_>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    if yq_collects_bare::<S>(entries) {
+    if yq_collects_object::<S>(entries) {
         return eval_object_collect::<W, S>(entries, eval_operand, optional);
     }
     let mut objects = Vec::new();
@@ -4513,16 +4513,30 @@ fn eval_object_construction_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     owned_vec_to_result(objects)
 }
 
-/// Whether a `{...}` holds a bare, non-pair entry and so is yq's
-/// `COLLECT_OBJECT` rather than a cross product of `key: value` pairs (#2783).
+/// Whether a `{...}` is built as yq's `COLLECT_OBJECT` rather than as the cross
+/// product of its `key: value` pairs: it holds a bare entry (#2783), or a pair
+/// whose key or value may yield nothing (#4193).
 ///
-/// Only yq's parser builds [`ObjectKey::Bare`], so the `TAG` test is a
+/// yq evaluates every entry once and folds the entries' maps; a pair with no
+/// maps empties everything folded before it, so `{"a": empty, "b": 2}` is `b: 2`
+/// and `{"a": 1, "b": empty}` is nothing. The fan-out has no such rule -- an
+/// entry with no outputs ends the whole construction -- and it also stops
+/// evaluating at that entry, where yq goes on to raise the next entry's error.
+/// Whether an operand is empty is only known by running it, so the fan-out is
+/// kept for exactly the operands [`yields_at_least_one_value`] proves total:
+/// the common `{name: .name, n: (.xs | length)}` pays nothing for this.
+///
+/// Only yq's parser builds [`ObjectKey::Bare`], and the `TAG` test is a
 /// compile-time constant that lets jq mode skip the scan entirely.
-pub(crate) fn yq_collects_bare<S: EvalSemantics>(entries: &[super::expr::ObjectEntry]) -> bool {
+pub(crate) fn yq_collects_object<S: EvalSemantics>(entries: &[super::expr::ObjectEntry]) -> bool {
     S::TAG == EvalTag::Yq
-        && entries
-            .iter()
-            .any(|entry| matches!(entry.key, ObjectKey::Bare))
+        && entries.iter().any(|entry| match &entry.key {
+            ObjectKey::Bare => true,
+            ObjectKey::Literal(_) => !yields_at_least_one_value(&entry.value),
+            ObjectKey::Expr(key) => {
+                !yields_at_least_one_value(key) || !yields_at_least_one_value(&entry.value)
+            }
+        })
 }
 
 /// The object a construction's `(key, value)` pairs assemble into (#4182).
@@ -4567,7 +4581,8 @@ pub(crate) fn object_from_pairs<S: EvalSemantics>(
     Ok(map)
 }
 
-/// Object construction holding a bare entry, as yq's `COLLECT_OBJECT` (#2783).
+/// Object construction holding a bare entry, or a pair that may yield nothing, as yq's
+/// `COLLECT_OBJECT` (#2783, #4193).
 ///
 /// Each pair entry is built on its own by [`build_object_entries`] -- one
 /// single-key map per key/value combination, which is what yq's `CREATE_MAP`
@@ -7049,7 +7064,7 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let mut slots: Vec<String> = alloc::vec![String::new(); parts.len()];
             each_string_parts::<W, S>(parts, value, optional, &mut slots, sink)
         }
-        Expr::Object(entries) if !yq_collects_bare::<S>(entries) => {
+        Expr::Object(entries) if !yq_collects_object::<S>(entries) => {
             let mut acc = Vec::new();
             each_object_entries::<W, S>(entries, value, optional, &mut acc, sink)
         }
@@ -9003,7 +9018,7 @@ fn each_object_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         // The `Expr::Object` arm of `eval_each` leaves a construction holding a
         // bare entry to the eager fallback, which collects it.
-        ObjectKey::Bare => unreachable!("a bare entry is collected, not streamed"), // patchcov: coverage tolerate-line reason="unreachable: the Expr::Object arm of eval_each guards on yq_collects_bare, so a bare entry never reaches the streaming fan-out (#2783)"
+        ObjectKey::Bare => unreachable!("a bare entry is collected, not streamed"), // patchcov: coverage tolerate-line reason="unreachable: the Expr::Object arm of eval_each guards on yq_collects_object, so a bare entry never reaches the streaming fan-out (#2783)"
         ObjectKey::Expr(key_expr) => {
             let escape = StashedEscape::new();
             let flow = eval_each::<W, S>(key_expr, value.clone(), optional, &mut |item| {
@@ -31157,6 +31172,135 @@ pub(crate) fn yields_at_most_one_value(expr: &Expr) -> bool {
             }
         }
         Expr::Builtin(builtin) => builtin_yields_at_most_one_value(builtin),
+        _ => false,
+    }
+}
+
+/// Whether `expr` produces at least one value whenever it does not raise: the
+/// converse of [`yields_at_most_one_value`]'s count, for [`yq_collects_object`].
+///
+/// A wrong *admission* leaves the fan-out in place for a construction whose
+/// operand turns out to be empty -- today's answer, no worse -- and a wrong
+/// refusal costs the cheaper route, so the list is short and each entry is one
+/// whose arm in the evaluator never answers `None` for an input it accepts. A
+/// composite is admitted when the parts that must each produce do: a pipe,
+/// an operator, an index and a string interpolation fan out over every part,
+/// so one empty part empties the whole. `//` needs only its right side (an
+/// empty left falls through to it), `,` only one of its items.
+///
+/// Refused on purpose: `select`, `empty`, `.[]`, `..`, `first`/`limit`, the
+/// type filters (`numbers`, `values`), anything under `?` or `try`, and every
+/// generator.
+pub(crate) fn yields_at_least_one_value(expr: &Expr) -> bool {
+    match expr {
+        // A `$x` no `as` binds yields nothing in yq (it is not an error there), which
+        // this cannot see: an operand is judged on its own, and a bound variable is the
+        // overwhelmingly common reading. Refusing it would send every construction that
+        // uses a variable down the slower fold for the sake of a typo.
+        Expr::Literal(_)
+        | Expr::Var(_)
+        | Expr::TrackedVar(_)
+        | Expr::Identity
+        | Expr::Field(_)
+        | Expr::Loc { .. }
+        | Expr::Env
+        | Expr::Not
+        | Expr::Format(_)
+        // `[f]` collects every output of `f` into one array, empty included.
+        | Expr::Array(_) => true,
+        Expr::Index { .. } | Expr::Slice { .. } => true,
+        Expr::Paren(inner) | Expr::Negate(inner) => yields_at_least_one_value(inner),
+        Expr::Pipe(stages) => stages.iter().all(yields_at_least_one_value),
+        Expr::Comma(items) => items.iter().any(yields_at_least_one_value),
+        Expr::Arithmetic { left, right, .. }
+        | Expr::Compare { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right) => {
+            yields_at_least_one_value(left) && yields_at_least_one_value(right)
+        }
+        Expr::Alternative(_, right) => yields_at_least_one_value(right),
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            yields_at_least_one_value(cond)
+                && yields_at_least_one_value(then_branch)
+                && yields_at_least_one_value(else_branch)
+        }
+        Expr::StringInterpolation(parts) => parts.iter().all(|part| match part {
+            StringPart::Literal(_) => true,
+            StringPart::Expr(inner) => yields_at_least_one_value(inner),
+        }),
+        Expr::IndexExpr { target, key } => {
+            yields_at_least_one_value(target) && yields_at_least_one_value(key)
+        }
+        // A nested construction is itself empty when one of its pairs is.
+        Expr::Object(entries) => entries.iter().all(|entry| {
+            yields_at_least_one_value(&entry.value)
+                && match &entry.key {
+                    ObjectKey::Literal(_) => true,
+                    ObjectKey::Expr(key) => yields_at_least_one_value(key),
+                    ObjectKey::Bare => false,
+                }
+        }),
+        Expr::Builtin(builtin) => builtin_yields_at_least_one_value(builtin),
+        _ => false,
+    }
+}
+
+/// The builtin half of [`yields_at_least_one_value`]: the entries of
+/// [`builtin_yields_at_most_one_value`] that answer for every input they
+/// accept -- not the filters (`select`, the type filters) that answer `None`
+/// for one, nor `empty`.
+fn builtin_yields_at_least_one_value(builtin: &Builtin) -> bool {
+    match builtin {
+        Builtin::Type
+        | Builtin::IsNull
+        | Builtin::IsBoolean
+        | Builtin::IsNumber
+        | Builtin::IsString
+        | Builtin::IsArray
+        | Builtin::IsObject
+        | Builtin::Length
+        | Builtin::Keys
+        | Builtin::KeysUnsorted
+        | Builtin::Add
+        | Builtin::Min
+        | Builtin::Max
+        | Builtin::ToString
+        | Builtin::ToNumber
+        | Builtin::AsciiDowncase
+        | Builtin::AsciiUpcase
+        | Builtin::Sort
+        | Builtin::Reverse
+        | Builtin::Unique
+        | Builtin::ToJson
+        | Builtin::Floor
+        | Builtin::Ceil
+        | Builtin::Round
+        | Builtin::Abs
+        | Builtin::Trim
+        | Builtin::Flatten
+        | Builtin::FromEntries => true,
+        // `map(f)` and the sorting family collect over `f`'s outputs into one
+        // value, whatever `f` yields.
+        Builtin::Map(_)
+        | Builtin::MapValues(_)
+        | Builtin::SortBy(_)
+        | Builtin::UniqueBy(_)
+        | Builtin::GroupBy(_) => true,
+        Builtin::Has(arg)
+        | Builtin::In(arg)
+        | Builtin::Contains(arg)
+        | Builtin::Inside(arg)
+        | Builtin::Startswith(arg)
+        | Builtin::Endswith(arg)
+        | Builtin::Ltrimstr(arg)
+        | Builtin::Rtrimstr(arg)
+        | Builtin::Split(arg)
+        | Builtin::Join(arg)
+        | Builtin::GetPath(arg) => yields_at_least_one_value(arg),
         _ => false,
     }
 }
@@ -136720,6 +136864,86 @@ mod touched_edge_cases_2999 {
             closed(r#"{"a":{"x":1},"b":{"y":2}}"#, ParserMode::Yq).as_deref(),
             Some(r#"{"a":{"x":1},"b":{"y":2}}"#)
         );
+    }
+
+    /// #4193: the owned evaluator folds a construction with an empty pair as yq's
+    /// `COLLECT_OBJECT` does (the generic one is `yq_empty_pair_in_object_4193` in
+    /// the CLI suite), jq keeps its cross product, and only an operand that is not
+    /// provably total sends a construction there.
+    #[test]
+    fn yq_object_with_an_empty_pair_is_collected_in_the_owned_evaluator_4193() {
+        let json = br#"{"k":"a","v":[1,2]}"#;
+        let index = JsonIndex::build(json);
+        let run = |filter: &str, mode: ParserMode| {
+            let expr = parse_with_mode_and_extensions(filter, mode, false).expect("parses");
+            let result = match mode {
+                ParserMode::Yq => eval::<Vec<u64>, YqSemantics>(&expr, index.root(json))
+                    .collect_owned::<YqSemantics>(),
+                _ => eval::<Vec<u64>, JqSemantics>(&expr, index.root(json))
+                    .collect_owned::<JqSemantics>(),
+            };
+            result
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        for (filter, yq, jq) in [
+            (r#"{"a":empty,"b":2}"#, r#"{"b":2}"#, ""),
+            (r#"{"a":1,"b":empty,"c":3}"#, r#"{"c":3}"#, ""),
+            (r#"{"a":1,"b":empty}"#, "", ""),
+            (r#"{(empty):1,"b":2}"#, r#"{"b":2}"#, ""),
+            (
+                r#"{"a":(1,2),"b":empty,"c":(3,4)}"#,
+                r#"{"c":3} {"c":4}"#,
+                "",
+            ),
+            (r#"{"a":1,"b":2}"#, r#"{"a":1,"b":2}"#, r#"{"a":1,"b":2}"#),
+        ] {
+            assert_eq!(run(filter, ParserMode::Yq), yq, "yq: {filter}");
+            assert_eq!(run(filter, ParserMode::Jq), jq, "jq: {filter}");
+        }
+
+        // What decides it: `yields_at_least_one_value` must refuse every shape that
+        // can come back empty, and admit the common total ones so the fan-out stays.
+        let collects = |filter: &str| {
+            let expr = parse_with_mode_and_extensions(filter, ParserMode::Yq, true).unwrap();
+            let Expr::Object(entries) = expr else {
+                panic!("not a construction: {filter}")
+            };
+            yq_collects_object::<YqSemantics>(&entries)
+        };
+        for total in [
+            r#"{"a": 1}"#,
+            r#"{"a": .k, "b": .v[0], "c": $__loc__}"#,
+            r"{(.k): .v}",
+            r#"{"n": (.v | length), "t": (.k | tostring), "m": (.v | map(. + 1))}"#,
+            r#"{"a": (.x // 1), "b": (.k | ascii_downcase), "c": "x\(.k)"}"#,
+            r#"{"a": (.v | sort_by(.)), "b": [.v[]], "c": {"d": .k}}"#,
+            // One item of a comma that yields is enough.
+            r#"{"a": (.k, empty)}"#,
+        ] {
+            assert!(!collects(total), "{total}");
+        }
+        for maybe_empty in [
+            r#"{"a": empty}"#,
+            r#"{"a": select(false)}"#,
+            r#"{"a": .v[]}"#,
+            r#"{"a": .k?}"#,
+            r#"{"a": (.k | select(. == "a"))}"#,
+            r#"{"a": (.v | first)}"#,
+            r"{(.v[]): 1}",
+            r#"{"a": {"b": empty}}"#,
+            r#"{"a": (.x // empty)}"#,
+            r#"{"a": (empty, empty)}"#,
+            r#"{"a": try .k}"#,
+        ] {
+            assert!(collects(maybe_empty), "{maybe_empty}");
+        }
+        // jq has no such rule: nothing there is ever collected.
+        let jq = parse_with_mode_and_extensions(r#"{"a": empty}"#, ParserMode::Jq, false).unwrap();
+        let Expr::Object(entries) = jq else { panic!() };
+        assert!(!yq_collects_object::<JqSemantics>(&entries));
     }
 
     /// #4139: yq's `as` runs its body once, with the variable unset, when the
