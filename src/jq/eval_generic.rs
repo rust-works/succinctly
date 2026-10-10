@@ -30682,6 +30682,10 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 // (normally `false`) and lets the outer
                 // `Expr::Optional`/`eval_try`-style catch convert the
                 // resulting `Error` to `None` once instead.
+                // #4236 (yq): `null` has no entries and yields none.
+                if S::NULL_ENTRIES_AND_SPLIT_YIELD_NOTHING && value.is_null() {
+                    return GenericResult::None;
+                }
                 decode_failure_or(&value, false, || {
                     GenericResult::Error(EvalError::has_no_keys(&to_owned_for_diagnostic::<_, S>(
                         &value, cursor,
@@ -31181,9 +31185,14 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // Format/Path/GetPath. Defensive today (see `Reverse`'s sibling
             // comment above for why).
             let cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
-            // jq answers `null` for an empty array, for all four spellings.
+            // jq answers `null` for an empty array, for all four spellings; yq has no element
+            // to pick and picks nothing (#4236).
             if cursors.is_empty() {
-                return GenericResult::Owned(OwnedValue::Null);
+                return if S::MIN_MAX_NEED_AN_ELEMENT {
+                    GenericResult::None
+                } else {
+                    GenericResult::Owned(OwnedValue::Null)
+                };
             }
             let key = match builtin {
                 Builtin::MinBy(f) | Builtin::MaxBy(f) => Some(&**f),
