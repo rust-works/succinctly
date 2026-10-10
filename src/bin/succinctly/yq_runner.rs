@@ -4174,6 +4174,9 @@ fn apply_meta_assign_writes(
     value: &mut OwnedValue,
     tree: &mut CommentTree,
 ) -> Result<(), EvalError> {
+    // Paths a container head was written to earlier in this pipe: that head lives on the
+    // container's first entry, which a clear of the container's own slot does not reach.
+    let mut container_heads: Vec<&[MetaPathStep]> = Vec::new();
     for write in writes {
         let steps: Vec<TreeStep<'_>> = write
             .path
@@ -4186,6 +4189,13 @@ fn apply_meta_assign_writes(
         let Some(node_value) = owned_value_at_mut(value, &write.path) else {
             continue;
         };
+        if let MetaEffect::Clear { head, .. } = write.effect {
+            if head && !write.on_key && container_heads.contains(&write.path.as_slice()) {
+                return Err(set_entry_unsupported(
+                    "a head written to a mapping or sequence earlier in the same expression, then cleared",
+                ));
+            }
+        }
         if let MetaEffect::Clear { head, line, foot } = write.effect {
             apply_clear(write, &steps, tree, head, line, foot);
             continue;
@@ -4220,10 +4230,14 @@ fn apply_meta_assign_writes(
                     ));
                 }
             }
+            if container == Some(false) && matches!(write.path.last(), Some(MetaPathStep::Key(_))) {
+                container_heads.push(write.path.as_slice());
+            }
             apply_set_entry(
                 &steps,
                 tree,
                 container.is_some(),
+                first_key.as_deref(),
                 head.as_ref(),
                 foot.as_ref(),
                 line.as_ref(),
@@ -4388,6 +4402,7 @@ fn apply_set_entry(
     steps: &[TreeStep<'_>],
     tree: &mut CommentTree,
     container: bool,
+    first_key: Option<&str>,
     head: Option<&Vec<String>>,
     foot: Option<&Vec<String>>,
     line: Option<&String>,
@@ -4446,16 +4461,25 @@ fn apply_set_entry(
             "the collection is written in flow style",
         ));
     }
+    if container && matches!(members[index].meta().anchor, Some(AnchorMark::Aliases(_))) {
+        return Err(set_entry_unsupported(
+            "the collection is an alias (yq prints the head after the alias line)",
+        ));
+    }
     if container && is_map {
         // A mapping value that is itself a collection: its head waits for the first key inside
         // it, which prints it just above at that key's indent (a head that key owns wins).
+        debug_assert!(
+            foot.is_none() && line.is_none(),
+            "a container takes only a head: the caller refuses its foot and line comment"
+        );
         if owns_lines(members[index]) {
             return Err(set_entry_unsupported(
                 "the node already has head or foot comment lines (in the document or from an earlier write)",
             ));
         }
         let first = match &mut *members[index] {
-            CommentTree::Object(_, fields, _) => fields.values_mut().next(),
+            CommentTree::Object(_, fields, _) => first_key.and_then(|key| fields.get_mut(key)),
             CommentTree::Array(_, items) => items.first_mut(),
             CommentTree::Leaf(_) => None,
         };
@@ -4478,7 +4502,8 @@ fn apply_set_entry(
             "the node already has head or foot comment lines (in the document or from an earlier write)",
         ));
     }
-    if !last_entry && owns_lines(members[index + 1]) {
+    // A sequence item that is a collection takes only a head, which never touches the next entry.
+    if !container && !last_entry && owns_lines(members[index + 1]) {
         return Err(set_entry_unsupported(
             "the next entry already has head or foot comment lines (in the document or from an earlier write)",
         ));
@@ -12206,6 +12231,16 @@ mod tests {
             render_with_comments("- a: 1\n- b: 2\n", ".[0] head_comment = \"x\"").trim_end(),
             "# x\n- a: 1\n- b: 2"
         );
+        // A head-only write to a sequence item never touches the next item, so a head it owns
+        // is no reason to refuse.
+        assert_eq!(
+            render_with_comments(
+                "a:\n  - b: 1\n  # own\n  - c: 2\n",
+                ".a[0] head_comment = \"h\""
+            )
+            .trim_end(),
+            "a:\n  # h\n  - b: 1\n  # own\n  - c: 2"
+        );
         // A later stage can turn a scalar into a container: the head follows it.
         assert_eq!(
             render_with_comments("a: 1\nb: 2\n", ".a head_comment = \"y\" | .a = {\"x\": 1}")
@@ -12218,6 +12253,18 @@ mod tests {
             ("a:\n  b: 1\nc: 2\n", ".a comments = \"x\""),
             ("a: {}\nc: 2\n", ".a head_comment = \"x\""),
             ("a: {b: 1}\nc: 2\n", ".a head_comment = \"x\""),
+            // The head lives on the first entry, which a clear of the container's own slot
+            // would not reach.
+            (
+                "a:\n  b: 1\nc: 2\n",
+                ".a head_comment = \"h\" | .a head_comment = \"\"",
+            ),
+            (
+                "a:\n  b: 1\nc: 2\n",
+                ".a head_comment = \"h\" | .a comments = \"\"",
+            ),
+            // An alias prints as `*x`: there is no first entry to put the head above.
+            ("a: &x\n  b: 1\nc: *x\nd: 1\n", ".c head_comment = \"h\""),
         ] {
             let expr = jq::parse_with_mode(filter, jq::ParserMode::Yq).unwrap();
             let mut sink = ErrorSink::default();

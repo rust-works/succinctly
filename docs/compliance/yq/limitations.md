@@ -4327,7 +4327,7 @@ ruled out), even though real yq supports every one of them:
   lines are the member's own head and foot (what `# mid` above `b:` is): the next member's
   head for a value head, this member's foot for the rest. A node, or its successor, that
   already owns head or foot lines is refused rather than merged (the order yq flushes them
-  in is not modelled), as is anything under a flow collection, a container target, a text of
+  in is not modelled), as is anything under a flow collection, a container target's foot or line comment (its head is part 5, below), a text of
   newlines alone, and a write to more than one target (`.[] head_comment = "x"`). Checked by
   13 `meta_assign_entry_*_2796` goldens and a differential fuzz of ~5,300 accepted writes
   over random documents with and without comments (none differed; ~4,300 more were refused).
@@ -4337,7 +4337,9 @@ ruled out), even though real yq supports every one of them:
   sequence item (`# x\n- a: 1`); a head the first entry already owns wins in yq, and the write
   is refused here instead. Its foot and line comment, an empty collection and a flow one
   stay `not yet supported` (yq prints a container's foot after the *next* entry's first
-  line). Checked by 5 `meta_assign_container_head_*_2796` goldens and a differential fuzz
+  line). An alias target (`c: *x`) is refused too, and so is clearing the head of a
+  container whose head the same expression just wrote (it sits on the first entry, which the
+  clear does not reach). Checked by 5 `meta_assign_container_head_*_2796` goldens and a differential fuzz
   (~1,300 accepted writes, none differing).
 - **A mapping key takes a text** ([#2796](https://github.com/rust-works/succinctly/issues/2796),
   part 4): `(.a | key) head_comment = "x"`, `foot_comment`, `line_comment` and `comments`, the
