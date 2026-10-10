@@ -26711,7 +26711,7 @@ fn object_construction_generic<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
-    if super::eval::yq_collects_bare::<S>(entries) {
+    if super::eval::yq_collects_union::<S>(entries) {
         return collect_object_generic::<S, V>(entries, &value, optional, cursor);
     }
     if let Some(object) = lazy_object_generic::<S, V>(entries, &value, optional, cursor) {
@@ -26749,7 +26749,7 @@ fn object_construction_sink_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
-    if super::eval::yq_collects_bare::<S>(entries) {
+    if super::eval::yq_collects_union::<S>(entries) {
         let collected = collect_object_generic::<S, V>(entries, &value, optional, cursor);
         return drain_result_generic::<V>(collected, sink);
     }
@@ -52415,7 +52415,7 @@ mod tests {
     /// distinct literal keys keep the fan-out. Every row was captured from yq
     /// v4.53.3 (`yq -n -o json -I0`), and each is asked of the cursor entry,
     /// the streaming sink and the owned-value entry, which build an object in
-    /// three different places.
+    /// three different places. Also holds the #4193 rows: a pair with no output.
     #[test]
     fn yq_repeated_object_keys_deep_merge_4182() {
         use crate::jq::{parse_with_mode, ParserMode, YqSemantics};
@@ -52505,6 +52505,19 @@ mod tests {
             ),
             (r#"{("a","b"):1, "c":2}"#, r#"{"a":1,"c":2} {"b":1,"c":2}"#),
             (r#"{(.k):{"x":1}}"#, r#"{"a":{"x":1}}"#),
+            // #4193: an entry with no output is skipped, and one that is not the first
+            // with a different count takes its neighbours with it (`COLLECT_OBJECT`).
+            (r#"{"a":(1|select(false)),"b":2,"c":3}"#, r#"{"b":2,"c":3}"#),
+            (r#"{"a":(1|select(false))}"#, ""),
+            (r#"{(1|select(false)):1,"b":2}"#, r#"{"b":2}"#),
+            (
+                r#"{"a":1,"b":(1|select(false)),"c":(3,4)}"#,
+                r#"{"c":3} {"c":4}"#,
+            ),
+            (r#"{"a":1,"a":(1|select(false))}"#, ""),
+            (r#"{"a":(1|select(false)),"a":2}"#, r#"{"a":2}"#),
+            (r#"{"a":1,"b":(.n|select(length>5)),"c":2}"#, r#"{"c":2}"#),
+            (r#"{"a":[(1|select(false))],"b":2}"#, r#"{"a":[],"b":2}"#),
         ] {
             assert_eq!(cursor(filter), expected, "cursor: {filter}");
             assert_eq!(sink(filter), expected, "sink: {filter}");

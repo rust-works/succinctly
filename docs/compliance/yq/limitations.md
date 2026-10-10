@@ -5052,6 +5052,17 @@ $ echo $?
   covers a literal key that repeats and a computed key that turns out to (`{($k): .., ($k): ..}`)
   alike, on every route, and costs nothing when no key repeats. It is the same fold the
   `COLLECT_OBJECT` route above runs.
+- **An entry with no output is skipped (#4193).** An operand that yields nothing
+  (`{"a": (1|select(false)), "b": 2, "c": 3}`, `{(1|select(false)): 1, "b": 2}`) drops its own
+  entry and the object is built from the rest, where a cross product would be empty. The same
+  union quirks follow: an empty entry that is not the first, or one whose count differs from the
+  first entry's, takes its neighbours with it (`{"a": 1, "b": (1|select(false)), "c": (3,4)}` is
+  `{"c": 3}` and `{"c": 4}`). A construction is run as `COLLECT_OBJECT` only when some key or value
+  is not provably a single output (a path, literal, arithmetic, `[...]` and the like are; `select`,
+  `?`, `//` over a generator, `.[]` and an unbound variable are not); one whose operands all are
+  keeps the cheaper fan-out, which is the same thing while nothing is empty. yq evaluates every entry
+  before combining any, so an error in one entry now aborts such a construction with no prefix,
+  as it already did for a bare entry.
 
 Residual divergences remain, all in cases yq itself reaches through its node model:
 
@@ -5064,7 +5075,11 @@ Residual divergences remain, all in cases yq itself reaches through its node mod
   `succinctly yq` builds each input's object on its own. `.[] | {.k}` over elements whose `k`
   has different lengths is the `CollectObject: mismatching node sizes` error in yq and no output
   here, and `[.l[] | {.nope}]` is `[{}]` in yq and `[{},{}]` here (#4184). Pair-only
-  constructions are unaffected (one object per node either way).
+  constructions are unaffected (one object per node either way) while every entry yields something;
+  once one yields nothing for some input (#4193), yq's answer for that input depends on the others
+  (`.n[] | {"p": .n, "q": (.v.x | select(. > 0)), "r": .v}` over `[{n: a, v: {x: 1}}, {n: a, v:
+  {y: 2}}]` prints `{"r":{"y":2,"x":null}}` for the second element, a `null` borrowed from the
+  first), where `succinctly yq` builds each input's object on its own (`{"r":{"y":2}}`).
 - **`,` over two variable references.** yq's `UNION` drops its right operand when both operands are
   variable references, whatever they hold: `1 as $z | 2 as $y | $z, $y` prints only `1`, and so does
   `$z, $y, $w`; `., .` collapses too (`succinctly yq` already does that one). Array collection is

@@ -60946,6 +60946,76 @@ fn test_object_construction_is_collect_object_2783() -> Result<()> {
     Ok(())
 }
 
+/// Pinned yq v4.53.3: an entry of a `{...}` whose key or value yields nothing is skipped and the
+/// others still build the object, where the cross product `succinctly yq` built emptied the whole
+/// construction (#4193). The same `COLLECT_OBJECT` quirks follow: an empty entry that is not the
+/// first, or one whose count differs from the first entry's, drops its neighbours too. Every row
+/// was captured from the pinned binary, `-p=json -o=json -I=0`.
+#[test]
+fn test_object_construction_skips_a_pair_with_no_output_4193() -> Result<()> {
+    let args = &["-p=json", "-o=json", "-I=0"];
+    let input = r#"{"k":"a","n":[{"n":"a","v":{"x":1}},{"n":"a","v":{"y":2}}]}"#;
+    for (filter, expected) in [
+        (
+            r#"{"a":(1|select(false)),"b":2,"c":3}"#,
+            "{\"b\":2,\"c\":3}\n",
+        ),
+        (r#"{(1|select(false)):1,"b":2}"#, "{\"b\":2}\n"),
+        (
+            r#"{"a":(1|select(false)),"b":(2|select(false)),"c":3}"#,
+            "{\"c\":3}\n",
+        ),
+        (
+            r#"{"a":((1|select(false)) // 5),"b":2}"#,
+            "{\"a\":5,\"b\":2}\n",
+        ),
+        (r#"{"a":[(1|select(false))],"b":2}"#, "{\"a\":[],\"b\":2}\n"),
+        // A repeated key: the empty entry is skipped before the later one wins.
+        (r#"{"a":(1|select(false)),"a":2}"#, "{\"a\":2}\n"),
+        (
+            r#"{"a":{"x":1},"b":(1|select(false)),"a":{"y":2}}"#,
+            "{\"a\":{\"y\":2}}\n",
+        ),
+        // Not the first entry, or a different count from it: the neighbours go too.
+        (
+            r#"{"a":1,"b":(1|select(false)),"c":(3,4)}"#,
+            "{\"c\":3}\n{\"c\":4}\n",
+        ),
+        (
+            r#"{"a":(1,2),"b":(3|select(false)),"c":(5,6)}"#,
+            "{\"c\":5}\n{\"c\":6}\n",
+        ),
+        (
+            r#"{"a":1,"b":(.n|select(length > 5)),"c":2}"#,
+            "{\"c\":2}\n",
+        ),
+        (r#"{"a":1,"a":(1|select(false))}"#, ""),
+        // A lone empty entry is nothing, as it was.
+        (r#"{"a":(1|select(false))}"#, ""),
+        // Per input of a fan-out.
+        (
+            r#".n[] | {(.v.y | select(. > 0) | tostring): .n, "z": 1}"#,
+            "{\"z\":1}\n{\"2\":\"a\",\"z\":1}\n",
+        ),
+        (
+            r#".n[] | {"p": .n, "q": .v.x, "r": (.v.y | select(. > 0))}"#,
+            "{\"p\":\"a\",\"q\":null,\"r\":2}\n",
+        ),
+        // Entries that fan out still build their cross product.
+        (
+            r#"{"a":(1,2),"b":(3,4)}"#,
+            "{\"a\":1,\"b\":3}\n{\"a\":1,\"b\":4}\n{\"a\":2,\"b\":3}\n{\"a\":2,\"b\":4}\n",
+        ),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, input, args)?,
+            (expected.into(), String::new(), 0),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
 /// Pinned yq v4.53.3: `{...}` folds its entries with `*`, so a key that repeats
 /// deep-merges its two values where the later would win in jq (#4182). Only a map
 /// over a map merges; a computed key is compared at run time. Every row was

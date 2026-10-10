@@ -4466,7 +4466,7 @@ fn eval_object_construction_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     eval_operand: &mut ObjectSlotEvaluator<'_>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    if yq_collects_bare::<S>(entries) {
+    if yq_collects_union::<S>(entries) {
         return eval_object_collect::<W, S>(entries, eval_operand, optional);
     }
     let mut objects = Vec::new();
@@ -4513,16 +4513,28 @@ fn eval_object_construction_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     owned_vec_to_result(objects)
 }
 
-/// Whether a `{...}` holds a bare, non-pair entry and so is yq's
-/// `COLLECT_OBJECT` rather than a cross product of `key: value` pairs (#2783).
+/// Whether a `{...}` is yq's `COLLECT_OBJECT` rather than a plain cross product of
+/// `key: value` pairs: it holds a bare, non-pair entry (#2783), or a key or value that can
+/// produce no output (#4193).
+///
+/// `COLLECT_OBJECT` takes the union of its entries' maps, so an entry with none is skipped
+/// rather than emptying the construction (`{"a": (1|select(false)), "b": 2}` is `{"b": 2}`)
+/// and a count mismatch drops its neighbours, quirks [`collect_object`](super::collect_object)
+/// reproduces. A cross product is the same thing only while every entry yields something,
+/// which is why a construction whose operands all provably do keeps the cheaper fan-out.
 ///
 /// Only yq's parser builds [`ObjectKey::Bare`], so the `TAG` test is a
 /// compile-time constant that lets jq mode skip the scan entirely.
-pub(crate) fn yq_collects_bare<S: EvalSemantics>(entries: &[super::expr::ObjectEntry]) -> bool {
+pub(crate) fn yq_collects_union<S: EvalSemantics>(entries: &[super::expr::ObjectEntry]) -> bool {
     S::TAG == EvalTag::Yq
-        && entries
-            .iter()
-            .any(|entry| matches!(entry.key, ObjectKey::Bare))
+        && entries.iter().any(|entry| {
+            !yields_exactly_one_value(&entry.value)
+                || match &entry.key {
+                    ObjectKey::Bare => true,
+                    ObjectKey::Literal(_) => false,
+                    ObjectKey::Expr(key) => !yields_exactly_one_value(key),
+                }
+        })
 }
 
 /// The object a construction's `(key, value)` pairs assemble into (#4182).
@@ -7049,7 +7061,7 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let mut slots: Vec<String> = alloc::vec![String::new(); parts.len()];
             each_string_parts::<W, S>(parts, value, optional, &mut slots, sink)
         }
-        Expr::Object(entries) if !yq_collects_bare::<S>(entries) => {
+        Expr::Object(entries) if !yq_collects_union::<S>(entries) => {
             let mut acc = Vec::new();
             each_object_entries::<W, S>(entries, value, optional, &mut acc, sink)
         }
@@ -9003,7 +9015,7 @@ fn each_object_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         // The `Expr::Object` arm of `eval_each` leaves a construction holding a
         // bare entry to the eager fallback, which collects it.
-        ObjectKey::Bare => unreachable!("a bare entry is collected, not streamed"), // patchcov: coverage tolerate-line reason="unreachable: the Expr::Object arm of eval_each guards on yq_collects_bare, so a bare entry never reaches the streaming fan-out (#2783)"
+        ObjectKey::Bare => unreachable!("a bare entry is collected, not streamed"), // patchcov: coverage tolerate-line reason="unreachable: the Expr::Object arm of eval_each guards on yq_collects_union, so a bare entry never reaches the streaming fan-out (#2783)"
         ObjectKey::Expr(key_expr) => {
             let escape = StashedEscape::new();
             let flow = eval_each::<W, S>(key_expr, value.clone(), optional, &mut |item| {
@@ -31050,6 +31062,76 @@ fn resolves_to_at_most_one_path(expr: &Expr) -> bool {
                     && end.as_deref().map_or(true, yields_at_most_one_value)
             }
         }
+        _ => false,
+    }
+}
+
+/// Whether `expr` provably produces exactly one output for any input it does not raise on, the
+/// complement [`yq_collects_union`] needs: an entry that might produce none changes what yq's
+/// `{...}` builds (#4193).
+///
+/// An allowlist, so a shape not named here is read as "may produce nothing" and costs only the
+/// slower `COLLECT_OBJECT` route, never a wrong answer. `Expr::Var` and `Expr::Loc` are absent on
+/// purpose: an unbound variable yields nothing in yq mode
+/// ([`EvalSemantics::UNBOUND_VARIABLE_YIELDS_NOTHING`]). So are `Expr::Optional`, `select`, `empty`
+/// and every generator.
+pub(crate) fn yields_exactly_one_value(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_)
+        | Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Slice { .. }
+        | Expr::Env
+        | Expr::Not
+        | Expr::Format(_) => true,
+        // `[f]` is one array however many outputs `f` has, and none still gives `[]`.
+        Expr::Array(_) => true,
+        Expr::Paren(inner) | Expr::Negate(inner) => yields_exactly_one_value(inner),
+        Expr::Pipe(stages) => stages.iter().all(yields_exactly_one_value),
+        Expr::Arithmetic { left, right, .. }
+        | Expr::Compare { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::Alternative(left, right) => {
+            yields_exactly_one_value(left) && yields_exactly_one_value(right)
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            yields_exactly_one_value(cond)
+                && yields_exactly_one_value(then_branch)
+                && yields_exactly_one_value(else_branch)
+        }
+        Expr::StringInterpolation(parts) => parts.iter().all(|part| match part {
+            StringPart::Literal(_) => true,
+            StringPart::Expr(inner) => yields_exactly_one_value(inner),
+        }),
+        Expr::IndexExpr { target, key } => {
+            yields_exactly_one_value(target) && yields_exactly_one_value(key)
+        }
+        Expr::Builtin(builtin) => matches!(
+            builtin,
+            Builtin::Type
+                | Builtin::IsNull
+                | Builtin::IsBoolean
+                | Builtin::IsNumber
+                | Builtin::IsString
+                | Builtin::IsArray
+                | Builtin::IsObject
+                | Builtin::Length
+                | Builtin::Keys
+                | Builtin::KeysUnsorted
+                | Builtin::Add
+                | Builtin::Min
+                | Builtin::Max
+                | Builtin::ToString
+                | Builtin::ToNumber
+                | Builtin::AsciiDowncase
+                | Builtin::AsciiUpcase
+        ),
         _ => false,
     }
 }
@@ -137809,5 +137891,60 @@ mod stderr_mute_tests_2709 {
         let unwound = std::panic::catch_unwind(|| with_stderr_muted(|| panic!("boom")));
         assert!(unwound.is_err());
         assert_eq!(depth(), 0);
+    }
+}
+
+#[cfg(test)]
+mod object_union_gate_tests_4193 {
+    use super::*;
+    use crate::jq::{parse, parse_with_mode, ParserMode};
+
+    fn collects(filter: &str, yq: bool) -> bool {
+        let expr = if yq {
+            parse_with_mode(filter, ParserMode::Yq).expect("filter parses")
+        } else {
+            parse(filter).expect("filter parses")
+        };
+        let Expr::Object(entries) = expr else {
+            panic!("`{filter}` is not an object construction");
+        };
+        if yq {
+            yq_collects_union::<YqSemantics>(&entries)
+        } else {
+            yq_collects_union::<JqSemantics>(&entries)
+        }
+    }
+
+    // #4193: a `{...}` is yq's `COLLECT_OBJECT` once any key or value might produce nothing, and
+    // keeps the cheaper cross product while every one provably produces exactly one output.
+    #[test]
+    fn yq_collects_a_construction_only_when_an_operand_may_be_empty() {
+        for filter in [
+            r#"{"a": 1, "b": .x, "c": [.y[]], "d": (.z | length)}"#,
+            r#"{(.k): .v, "n": "x\(.a)", "s": (.a + 1), "t": (.a // 2)}"#,
+            r#"{"a": (if .x then 1 else 2 end), "b": .[0], "c": (.a | tostring)}"#,
+        ] {
+            assert!(!collects(filter, true), "`{filter}` keeps the fan-out");
+        }
+        for filter in [
+            r#"{"a": (.x | select(.)), "b": 1}"#,
+            "{(.k | select(.)): 1}",
+            r#"{"a": .x?}"#,
+            r#"{"a": $nope}"#,
+            r#"{"a": .x[]}"#,
+            r#"{"a": (1, 2)}"#,
+            r#"{"a": 1, "b"}"#,
+            r#"{"a": (.x | select(.) | length), "b": 1}"#,
+        ] {
+            assert!(collects(filter, true), "`{filter}` collects");
+        }
+    }
+
+    // jq has no `COLLECT_OBJECT`: its cross product is the semantics whatever the operands are.
+    #[test]
+    fn jq_never_collects_a_construction() {
+        for filter in [r#"{"a": (.x | select(.)), "b": 1}"#, r#"{"a": .x[]}"#] {
+            assert!(!collects(filter, false), "`{filter}`");
+        }
     }
 }
