@@ -4678,6 +4678,13 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentElements for JsonElements<'a, W> {
         self.current().map(|c| (c.node_id(), c.document_token()))
     }
 
+    /// An element's list is its cursor (`slot` untagged), and a cursor is
+    /// `(text, index, bp_pos)`, so the node id rebuilds it exactly.
+    fn at_head_id(&self, id: usize) -> Option<Self> {
+        let cursor = self.current()?.at_node_id(id)?;
+        Some(JsonElements { slot: Some(cursor) })
+    }
+
     /// Re-runs the strict validator, mirroring
     /// [`JsonFields::malformed_member_error`]'s own reasoning (#1194) for
     /// the array delimiter class (#1677).

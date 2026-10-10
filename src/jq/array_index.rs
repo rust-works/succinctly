@@ -37,6 +37,40 @@
 //! cost; a refused build is remembered so it is not retried, and so is an
 //! eviction, as in [`super::key_index`].
 //!
+//! # Element reads with no length lookup: a prefix (#4162)
+//!
+//! The path-context index step (`.[$i] | ... | key`, `getpath([$i]) | ... | key`)
+//! reads a non-negative index with no length lookup, so it never reached the
+//! rule above and each read walked to its index: a loop over a wide array was
+//! quadratic in either order. Building the whole index on an element read
+//! would walk the whole array where the reads walk only to their indexes
+//! (three reads near the front of a 1M-element array would walk 1M elements),
+//! so such an array gets an [`ElementPrefix`] instead: the ids of the elements
+//! the reads have walked past, and where that walk stopped. A read inside it
+//! is answered from the ids; a read beyond it resumes the walk there and
+//! records as it goes. It never walks further than the plain reads would, and
+//! no element twice, so a loop over `n` elements is O(n) ascending or
+//! descending.
+//!
+//! It cannot change an answer: `get_cursor(k)` is `k` `uncons_cursor` steps
+//! from the head with no checks, and a prefix is the same steps split across
+//! reads, resumed from the list [`DocumentElements::at_head_id`] rebuilds (a
+//! cursor is its document plus a node, so the rebuilt list is the list the
+//! walk left). Because it makes no checks, a prefix never answers a length.
+//!
+//! A first element read at [`WIDE_ELEMENTS`] or more registers the array, the
+//! second walks, and the third starts the prefix: recording costs a push per
+//! element and the ids' allocation, so starting on the second read made
+//! `path(.[90], .[91])` over 20,000 arrays 10-14% slower than its two walks.
+//! It starts only while element reads run two ahead of length lookups. The
+//! value route makes a length lookup before each element read, so it never
+//! does, and stays on the rule above; a length lookup that finds a prefix hands
+//! the array back to it. A prefix counts against the same limits as an index,
+//! charged for the ids it holds; retired, its array walks element reads for
+//! good but can still be indexed by the length route. A read too far to record
+//! walks and leaves the prefix in place, and only a walk that found its
+//! element registers an array, so a read past the end of a short one does not.
+//!
 //! # Scope
 //!
 //! The memo lives only inside an evaluation's scope ([`memo::enter`], opened
@@ -121,6 +155,101 @@ impl ElementIndex {
     }
 }
 
+/// The most ids one extension of an [`ElementPrefix`] reserves room for up
+/// front; a longer walk grows the vector as it goes.
+const RESERVE_ELEMENTS: usize = 1 << 12;
+
+/// The node ids of an array's first elements, in document order, as element
+/// reads walked them, and the list the walk stopped at (#4162; see the module
+/// doc). Answers element reads only, never a length.
+pub(crate) struct ElementPrefix {
+    ids: Vec<usize>,
+    /// The [`DocumentElements::head_id`] of the list after the last recorded
+    /// element, or `None` once the walk has reached the end of the array.
+    frontier: Option<usize>,
+}
+
+impl ElementPrefix {
+    /// An empty prefix of the list whose head id is `head`.
+    pub(crate) fn new(head: usize) -> Self {
+        Self {
+            ids: Vec::new(),
+            frontier: Some(head),
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// Whether the walk has reached the end of the array, so the prefix is
+    /// the whole array and every read beyond it is past the end.
+    fn is_complete(&self) -> bool {
+        self.frontier.is_none()
+    }
+
+    /// The cursor of element `index` of the array `elements` heads, extending
+    /// the walk to it when it lies past the prefix, or [`Element::Past`] past
+    /// the end; `None` when an id does not resolve (the caller then walks).
+    pub(crate) fn get<E: DocumentElements>(
+        &mut self,
+        elements: &E,
+        index: usize,
+    ) -> Option<Element<E::Cursor>> {
+        if let Some(id) = self.ids.get(index) {
+            let (head, _) = elements.uncons_cursor()?;
+            return head.at_node_id(*id).map(Element::Found);
+        }
+        let Some(frontier) = self.frontier else {
+            return Some(Element::Past);
+        };
+        let mut list = elements.at_head_id(frontier)?;
+        // The ids move into a local for the walk, so the loop does not store
+        // the vector's length back through `self` on every push.
+        let mut ids = core::mem::take(&mut self.ids);
+        let steps = index + 1 - ids.len();
+        // One allocation for the walk to `index` rather than a doubling every
+        // few pushes, capped: `index` may lie far past the end of the array.
+        ids.reserve(steps.min(RESERVE_ELEMENTS));
+        let mut last = None;
+        for _ in 0..steps {
+            let Some((cursor, rest)) = list.uncons_cursor() else {
+                break;
+            };
+            ids.push(cursor.node_id());
+            note_recorded();
+            last = Some(cursor);
+            list = rest;
+        }
+        self.ids = ids;
+        if self.ids.len() > index {
+            self.frontier = list.head_id().map(|(id, _)| id);
+            last.map(Element::Found)
+        } else {
+            self.frontier = None;
+            Some(Element::Past)
+        }
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static RECORDED: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Elements recorded by every prefix so far, for the tests that pin that a
+/// loop over an array walks each element once.
+#[cfg(test)]
+pub(crate) fn recorded() -> usize {
+    RECORDED.with(core::cell::Cell::get)
+}
+
+#[inline(always)]
+fn note_recorded() {
+    #[cfg(test)]
+    RECORDED.with(|r| r.set(r.get() + 1));
+}
+
 /// [`DocumentElements::len_checked`] for a caller inside an evaluation: the
 /// same answer, from an [`ElementIndex`] once the array has proved wide.
 ///
@@ -142,24 +271,48 @@ pub(crate) fn len_checked_memoized<E: DocumentElements>(elements: &E) -> Result<
 }
 
 /// [`DocumentElements::get_cursor`] for a caller inside an evaluation, from an
-/// [`ElementIndex`] when one exists. Never builds one.
+/// [`ElementIndex`] when one exists (never building one), or from an
+/// [`ElementPrefix`] when element reads have outnumbered length lookups.
 #[inline]
 pub(crate) fn get_cursor_memoized<E: DocumentElements>(
     elements: &E,
     index: usize,
 ) -> Option<E::Cursor> {
     match memo::get(elements, index) {
-        Some(Element::Found(cursor)) => Some(cursor),
-        Some(Element::Past) => None,
-        None => elements.get_cursor(index),
+        Read::Answered(Element::Found(cursor)) => Some(cursor),
+        Read::Answered(Element::Past) => None,
+        Read::Walk => elements.get_cursor(index),
+        Read::Unregistered => {
+            let found = elements.get_cursor(index);
+            // Only a walk that found its element proves the array wide: a read
+            // past the end of a short array proves nothing, and registering
+            // one would let the length route index a small array.
+            if found.is_some() {
+                memo::note_wide_read(elements);
+            }
+            found
+        }
     }
+}
+
+/// What the memo says about one element read.
+pub(crate) enum Read<C> {
+    /// An index or a prefix answered it.
+    Answered(Element<C>),
+    /// Walk; the array is registered (or never will be from this read).
+    Walk,
+    /// Walk, and the read is wide but the array is not registered: register
+    /// it if the walk finds the element.
+    Unregistered,
 }
 
 #[cfg(feature = "std")]
 pub(crate) mod memo {
     use std::cell::{Cell, RefCell};
 
-    use super::{DocumentElements, ElementIndex, MAX_INDEXED_ELEMENTS};
+    use super::{
+        DocumentElements, ElementIndex, ElementPrefix, Read, MAX_INDEXED_ELEMENTS, WIDE_ELEMENTS,
+    };
 
     /// Arrays remembered at once, indexed or not. Least recently used first.
     const ENTRIES: usize = 16;
@@ -168,17 +321,31 @@ pub(crate) mod memo {
     /// The length lookup that builds is the one after this many walks of the
     /// array (the registering one included): the third lookup.
     const BUILD_AT: u8 = 2;
+    /// Element reads beyond the length lookups that walk before a prefix
+    /// starts: the registering read and one more, so the third records.
+    const PREFIX_AFTER: u8 = 2;
+    /// `Seen::reads` of an array whose prefix was evicted: element reads walk
+    /// and never start another (no second chance, as for an index), while
+    /// length lookups still count toward building an index. Counting reads
+    /// never gets near it: a prefix starts by `PREFIX_AFTER` past the lookups.
+    const NO_PREFIX: u8 = u8::MAX;
     /// Elements indexed across all the indexes kept.
     const ELEMENT_BUDGET: usize = MAX_INDEXED_ELEMENTS;
 
     enum Kind {
         /// Wide walks have been seen, this many length lookups of them so far
         /// (counting the one that registered it), for an array of this many
-        /// elements: the third lookup builds, sized from the length.
+        /// elements (0 when only element reads have walked it): the third
+        /// lookup builds, sized from the length. `reads` counts element reads;
+        /// the one that puts them [`PREFIX_AFTER`] past the lookups starts a
+        /// prefix, unless they are [`NO_PREFIX`].
         Seen {
             lookups: u8,
             len: usize,
+            reads: u8,
         },
+        /// Element reads with no length lookup to build from (#4162).
+        Prefix(ElementPrefix),
         /// Always walk: the build was refused (malformed, too wide), or the
         /// index was evicted (an evicted array is not given a second chance,
         /// for the reason `key_index` gives).
@@ -274,37 +441,40 @@ pub(crate) mod memo {
     }
 
     /// The length of the list `elements`, if an index (built now, on the
-    /// second length lookup of a wide array) can say; `None` means "walk".
+    /// third length lookup of a wide array) can say; `None` means "walk".
     #[inline]
     pub(crate) fn len<E: DocumentElements>(elements: &E) -> Option<usize> {
         let bloom = BLOOM.with(Cell::get);
         if bloom == 0 {
             return None;
         }
-        answer(elements, bloom, true, |index, _head| Some(index.len()))
+        length(elements, bloom)
     }
 
-    /// Element `index` of the list `elements`, when an existing index can say,
-    /// else `None` to walk. Never builds.
+    /// Element `index` of the list `elements`, when an index or a prefix can
+    /// say, else whether to walk and register. Starts or extends a prefix
+    /// (#4162); never builds an index.
     #[inline]
-    pub(crate) fn get<E: DocumentElements>(
-        elements: &E,
-        index: usize,
-    ) -> Option<super::Element<E::Cursor>> {
+    pub(crate) fn get<E: DocumentElements>(elements: &E, index: usize) -> Read<E::Cursor> {
         let bloom = BLOOM.with(Cell::get);
         if bloom == 0 {
-            return None;
+            return unregistered(index);
         }
-        answer(elements, bloom, false, |ix, head| ix.get(head, index))
+        element(elements, bloom, index)
+    }
+
+    /// A read of an array the memo holds no entry for.
+    #[inline(always)]
+    fn unregistered<C>(index: usize) -> Read<C> {
+        if index >= WIDE_ELEMENTS {
+            Read::Unregistered
+        } else {
+            Read::Walk
+        }
     }
 
     #[inline(never)]
-    fn answer<E: DocumentElements, R>(
-        elements: &E,
-        bloom: u64,
-        may_build: bool,
-        probe: impl FnOnce(&ElementIndex, &E::Cursor) -> Option<R>,
-    ) -> Option<R> {
+    fn length<E: DocumentElements>(elements: &E, bloom: u64) -> Option<usize> {
         let (id, document) = elements.head_id()?;
         if bloom & bit(id) == 0 {
             return None;
@@ -314,67 +484,199 @@ pub(crate) mod memo {
             let state = m.as_mut().filter(|s| s.document == document)?;
             let at = state.entries.iter().position(|e| e.head == id)?;
             let mut entry = state.entries.remove(at);
-            if may_build {
-                if let Kind::Seen { lookups, len } = entry.kind {
+            match entry.kind {
+                Kind::Seen {
+                    lookups,
+                    len,
+                    reads,
+                } => {
                     if lookups < BUILD_AT {
                         entry.kind = Kind::Seen {
                             lookups: lookups + 1,
                             len,
+                            reads,
                         };
-                        state.entries.push(entry);
-                        return None;
+                    } else {
+                        make_room(&mut state.entries, 1, 0);
+                        entry.kind = match ElementIndex::build(elements, len) {
+                            Some(index) => {
+                                note_build();
+                                make_room(&mut state.entries, 1, index.len());
+                                Kind::Indexed(index)
+                            }
+                            None => Kind::Refused, // patchcov: coverage tolerate-line reason="defensive: an array registers only after a walk that succeeded, and the build makes that walk's checks, so it refuses only past MAX_INDEXED_ELEMENTS, which a unit test pins on build_within directly"
+                        };
                     }
-                    make_room(&mut state.entries, 1, 0);
-                    entry.kind = match ElementIndex::build(elements, len) {
-                        Some(index) => {
-                            note_build();
-                            make_room(&mut state.entries, 1, index.len());
-                            Kind::Indexed(index)
-                        }
-                        None => Kind::Refused, // patchcov: coverage tolerate-line reason="defensive: an array registers only after a walk that succeeded, and the build makes that walk's checks, so it refuses only past MAX_INDEXED_ELEMENTS, which a unit test pins on build_within directly"
+                }
+                // A length lookup of an array element reads were walking: the
+                // prefix cannot answer it (it makes no checks), so the array
+                // goes back to the length route, this lookup counting as the
+                // one that registers it there.
+                Kind::Prefix(_) => {
+                    entry.kind = Kind::Seen {
+                        lookups: 1,
+                        len: 0,
+                        reads: 0,
                     };
                 }
+                Kind::Refused | Kind::Indexed(_) => {}
             }
             let found = match &entry.kind {
                 Kind::Indexed(index) => {
-                    let (head, _) = elements.uncons_cursor()?;
-                    let found = probe(index, &head);
-                    if found.is_some() {
-                        note_hit();
-                    }
-                    found
+                    note_hit();
+                    Some(index.len())
                 }
-                Kind::Seen { .. } | Kind::Refused => None,
+                _ => None,
             };
             state.entries.push(entry);
             found
         })
     }
 
-    /// Retire the least recently used indexes (to [`Kind::Refused`]) until
-    /// `incoming` more indexes of `elements` elements fit both the count and
-    /// the element budget.
+    #[inline(never)]
+    fn element<E: DocumentElements>(elements: &E, bloom: u64, index: usize) -> Read<E::Cursor> {
+        let Some((id, document)) = elements.head_id() else {
+            return Read::Walk;
+        };
+        if bloom & bit(id) == 0 {
+            return unregistered(index);
+        }
+        MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            let Some(state) = m.as_mut().filter(|s| s.document == document) else {
+                return Read::Walk;
+            };
+            let Some(at) = state.entries.iter().position(|e| e.head == id) else {
+                return unregistered(index);
+            };
+            let mut entry = state.entries.remove(at);
+            if let Kind::Seen {
+                lookups,
+                len,
+                reads,
+            } = entry.kind
+            {
+                let reads = reads.saturating_add(1);
+                if reads == NO_PREFIX || reads <= lookups.saturating_add(PREFIX_AFTER) {
+                    // Read once or twice, the length route is serving this
+                    // array (a length lookup came before every element read),
+                    // or its prefix was evicted: walk, as #4035 does.
+                    entry.kind = Kind::Seen {
+                        lookups,
+                        len,
+                        reads,
+                    };
+                    state.entries.push(entry);
+                    return Read::Walk;
+                }
+                // Room is made below, for what the extension records.
+                entry.kind = Kind::Prefix(ElementPrefix::new(id));
+            }
+            let found = match &mut entry.kind {
+                Kind::Indexed(ix) => match elements.uncons_cursor() {
+                    Some((head, _)) => ix.get(&head, index),
+                    None => None, // patchcov: coverage tolerate-line reason="defensive: a list with a head id has a first element"
+                },
+                Kind::Prefix(prefix) if index < prefix.len() || prefix.is_complete() => {
+                    prefix.get(elements, index)
+                }
+                // Too far to record: walk this read, and keep the prefix for
+                // the reads it does serve.
+                Kind::Prefix(_) if index >= MAX_INDEXED_ELEMENTS => None,
+                Kind::Prefix(prefix) => {
+                    let found = prefix.get(elements, index);
+                    // Charged for what it holds now, not for `index`, which a
+                    // read past the end of a short array overstates.
+                    make_room(&mut state.entries, 1, prefix.len());
+                    found
+                }
+                Kind::Seen { .. } | Kind::Refused => None,
+            };
+            state.entries.push(entry);
+            match found {
+                Some(element) => {
+                    note_hit();
+                    Read::Answered(element)
+                }
+                None => Read::Walk,
+            }
+        })
+    }
+
+    /// Retire the least recently used indexes (to [`Kind::Refused`]) and
+    /// prefixes (to `Seen` with [`NO_PREFIX`], so the length route can still
+    /// index the array) until `incoming` more of `elements` elements fit both
+    /// the count and the element budget.
     fn make_room(entries: &mut [Entry], incoming: usize, elements: usize) {
-        loop {
-            let (count, held) = entries.iter().fold((0, 0), |(c, n), e| match &e.kind {
-                Kind::Indexed(ix) => (c + 1, n + ix.len()),
-                _ => (c, n),
-            });
+        let (mut count, mut held) = entries.iter().fold((0, 0), |(c, n), e| match &e.kind {
+            Kind::Indexed(ix) => (c + 1, n + ix.len()),
+            Kind::Prefix(p) => (c + 1, n + p.len()),
+            _ => (c, n),
+        });
+        // Oldest first; the loop ends without room only when a single index
+        // is larger than the whole element budget, which MAX_INDEXED_ELEMENTS
+        // (equal to the budget) rules out.
+        for entry in entries.iter_mut() {
             if count + incoming <= INDEXES && held + elements <= ELEMENT_BUDGET {
                 return;
             }
-            match entries
-                .iter()
-                .position(|e| matches!(e.kind, Kind::Indexed(_)))
-            {
-                Some(at) => entries[at].kind = Kind::Refused,
-                None => return, // patchcov: coverage tolerate-line reason="defensive: the loop ends here only when nothing is left to retire yet the budget is still exceeded, i.e. a single index larger than the whole element budget, which MAX_INDEXED_ELEMENTS (equal to the budget) rules out"
-            }
+            let (size, retired) = match &entry.kind {
+                Kind::Indexed(ix) => (ix.len(), Kind::Refused),
+                Kind::Prefix(p) => (
+                    p.len(),
+                    Kind::Seen {
+                        lookups: 0,
+                        len: 0,
+                        reads: NO_PREFIX,
+                    },
+                ),
+                Kind::Seen { .. } | Kind::Refused => continue,
+            };
+            entry.kind = retired;
+            count -= 1;
+            held -= size;
         }
     }
 
+    /// Add an entry for the list whose head id is `id`, dropping the oldest
+    /// when the memo is full.
+    fn register(state: &mut State, id: usize, kind: Kind) {
+        if state.entries.len() >= ENTRIES {
+            state.entries.remove(0);
+        }
+        state.entries.push(Entry { head: id, kind });
+        BLOOM.with(|b| b.set(b.get() | bit(id)));
+    }
+
+    /// Remember that an element read walked `elements` past
+    /// [`WIDE_ELEMENTS`] and found its element, so later element reads of the
+    /// same list count toward a prefix.
+    pub(crate) fn note_wide_read<E: DocumentElements>(elements: &E) {
+        let Some((id, document)) = elements.head_id() else {
+            return; // patchcov: coverage tolerate-line reason="unreachable: a list whose walk just found an element has a head"
+        };
+        MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            let Some(state) = m.as_mut().filter(|s| s.document == document) else {
+                return;
+            };
+            if state.entries.iter().any(|e| e.head == id) {
+                return; // patchcov: coverage tolerate-line reason="defensive: `element` answers Unregistered only when no entry exists, and nothing registers between that probe and the walk"
+            }
+            register(
+                state,
+                id,
+                Kind::Seen {
+                    lookups: 0,
+                    len: 0,
+                    reads: 1,
+                },
+            );
+        });
+    }
+
     /// Remember that a walk of `elements` was wide, so the next length lookup
-    /// of the same list builds an index.
+    /// of the same list counts toward building an index.
     pub(crate) fn note_wide<E: DocumentElements>(elements: &E, len: usize) {
         let Some((id, document)) = elements.head_id() else {
             return; // patchcov: coverage tolerate-line reason="unreachable: a list that just walked to a length of WIDE_ELEMENTS or more has a head"
@@ -384,17 +686,23 @@ pub(crate) mod memo {
             let Some(state) = m.as_mut().filter(|s| s.document == document) else {
                 return;
             };
-            if state.entries.iter().any(|e| e.head == id) {
+            if let Some(entry) = state.entries.iter_mut().find(|e| e.head == id) {
+                // Registered by element reads, or handed back from a prefix,
+                // before any length was known: keep it to size the build.
+                if let Kind::Seen { len: known, .. } = &mut entry.kind {
+                    *known = len;
+                }
                 return;
             }
-            if state.entries.len() >= ENTRIES {
-                state.entries.remove(0);
-            }
-            state.entries.push(Entry {
-                head: id,
-                kind: Kind::Seen { lookups: 1, len },
-            });
-            BLOOM.with(|b| b.set(b.get() | bit(id)));
+            register(
+                state,
+                id,
+                Kind::Seen {
+                    lookups: 1,
+                    len,
+                    reads: 0,
+                },
+            );
         });
     }
 }
@@ -414,12 +722,11 @@ pub(crate) mod memo {
         None
     }
 
-    pub(crate) fn get<E: DocumentElements>(
-        _elements: &E,
-        _index: usize,
-    ) -> Option<super::Element<E::Cursor>> {
-        None
+    pub(crate) fn get<E: DocumentElements>(_elements: &E, _index: usize) -> super::Read<E::Cursor> {
+        super::Read::Walk
     }
+
+    pub(crate) fn note_wide_read<E: DocumentElements>(_elements: &E) {}
 
     pub(crate) fn note_wide<E: DocumentElements>(_elements: &E, _len: usize) {}
 }
@@ -731,6 +1038,472 @@ mod tests {
                     "round {round}"
                 );
             }
+        }
+
+        /// Every element read of `order` over `elements` through the memo, in
+        /// one scope, against the walk; returns the elements the prefixes
+        /// recorded.
+        fn element_loop<E: DocumentElements>(
+            elements: &E,
+            token: usize,
+            order: impl Iterator<Item = usize>,
+        ) -> usize {
+            let _scope = memo::enter(token);
+            let before = recorded();
+            for k in order {
+                assert_eq!(
+                    shown(get_cursor_memoized(elements, k)),
+                    shown(elements.get_cursor(k)),
+                    "element {k}"
+                );
+            }
+            recorded() - before
+        }
+
+        #[test]
+        fn an_element_read_loop_walks_each_element_once_in_either_order_4162() {
+            let n = 300;
+            let doc = wide_array(n);
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            let elements = root.value().as_array().expect("an array document");
+            let token = root.document_token();
+            // Past the end on both sides of the loop, too.
+            let ascending = element_loop(&elements, token, (0..n).chain([n, n + 7]));
+            let descending = element_loop(&elements, token, (0..n).rev().chain([n, n + 7]));
+            // Ascending: below WIDE_ELEMENTS nothing is registered, the first
+            // wide read registers, the second walks, the third records up to
+            // itself, and each later read extends by one: every element at
+            // most once.
+            assert!(ascending > 0 && ascending <= n, "ascending {ascending}");
+            // Descending: the first read registers, the second walks, the
+            // third records the array up to itself, every later read is a hit,
+            // and the reads past the end record the rest on their way there.
+            assert_eq!(descending, n, "descending");
+        }
+
+        #[test]
+        fn a_yaml_sequence_resumes_its_walk_where_it_stopped_4162() {
+            // Block items whose value starts on the next line (the list stands
+            // at the `-` wrapper, the element is its child), nested and flow
+            // sequences, nulls, block scalars and comments: the frontier must
+            // rebuild the list the walk left, not the element it resolved to.
+            let items = [
+                "- a\n",
+                "-\n  k: 1\n  j: 2\n",
+                "- [1, 2]\n",
+                "- - x\n  - y\n",
+                "-\n",
+                "- |\n  text\n",
+                "- # note\n  m: 3\n",
+                "- {f: 1}\n",
+            ];
+            let yaml: String = (0..150).map(|i| items[i % items.len()]).collect();
+            let index = crate::yaml::YamlIndex::build(yaml.as_bytes()).expect("valid YAML");
+            let root = index.root(yaml.as_bytes());
+            let elements = root
+                .first_child()
+                .expect("document content")
+                .value()
+                .as_array()
+                .expect("a sequence");
+            assert_eq!(elements.len(), 150);
+            let token = root.document_token();
+            let ascending = element_loop(&elements, token, (0..152).chain([3, 99]));
+            let descending = element_loop(&elements, token, (0..152).rev());
+            let strided = element_loop(&elements, token, (0..150).step_by(7).rev());
+            assert!(ascending > 0 && ascending <= 150, "ascending {ascending}");
+            assert!(
+                descending > 0 && descending <= 150,
+                "descending {descending}"
+            );
+            assert!(strided > 0 && strided <= 150, "strided {strided}");
+        }
+
+        #[test]
+        fn an_array_read_twice_records_nothing_and_thrice_records_once_4162() {
+            let doc = wide_array(WIDE_ELEMENTS * 4);
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            let _scope = memo::enter(root.document_token());
+            let elements = root.value().as_array().expect("an array document");
+            let k = WIDE_ELEMENTS + 36;
+            let (before, work) = (recorded(), memo::work());
+            assert_eq!(
+                shown(get_cursor_memoized(&elements, k)),
+                shown(elements.get_cursor(k))
+            );
+            assert_eq!((recorded(), memo::work()), (before, work), "read once");
+            assert_eq!(
+                shown(get_cursor_memoized(&elements, k)),
+                shown(elements.get_cursor(k))
+            );
+            assert_eq!((recorded(), memo::work()), (before, work), "read twice");
+            assert_eq!(
+                shown(get_cursor_memoized(&elements, k)),
+                shown(elements.get_cursor(k))
+            );
+            assert_eq!(recorded() - before, k + 1, "the third read records");
+            assert_eq!(memo::work().0, work.0, "and builds no index");
+            // A fourth read inside the prefix walks nothing and is a hit.
+            let hits = memo::work().1;
+            assert_eq!(
+                shown(get_cursor_memoized(&elements, 5)),
+                shown(elements.get_cursor(5))
+            );
+            assert_eq!(recorded() - before, k + 1);
+            assert_eq!(memo::work().1 - hits, 1);
+        }
+
+        #[test]
+        fn a_short_read_of_an_unregistered_array_never_registers_it_4162() {
+            let doc = wide_array(WIDE_ELEMENTS * 4);
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            let _scope = memo::enter(root.document_token());
+            let elements = root.value().as_array().expect("an array document");
+            let (before, work) = (recorded(), memo::work());
+            for round in 0..3 {
+                for k in 0..WIDE_ELEMENTS {
+                    assert_eq!(
+                        shown(get_cursor_memoized(&elements, k)),
+                        shown(elements.get_cursor(k)),
+                        "element {k} round {round}"
+                    );
+                }
+            }
+            assert_eq!((recorded(), memo::work()), (before, work));
+        }
+
+        /// The value route reads the length before every element: it must stay
+        /// on #4035's rule (build on the third length lookup) and never record.
+        #[test]
+        fn a_length_lookup_before_each_element_read_never_starts_a_prefix_4162() {
+            let doc = wide_array(WIDE_ELEMENTS * 4);
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            let _scope = memo::enter(root.document_token());
+            let elements = root.value().as_array().expect("an array document");
+            let (before, work) = (recorded(), memo::work());
+            for round in 0..6 {
+                assert_eq!(
+                    len_checked_memoized(&elements).map_err(|e| format!("{e:?}")),
+                    Ok(WIDE_ELEMENTS * 4)
+                );
+                let k = 200 - round;
+                assert_eq!(
+                    shown(get_cursor_memoized(&elements, k)),
+                    shown(elements.get_cursor(k)),
+                    "round {round}"
+                );
+            }
+            assert_eq!(recorded(), before, "nothing recorded");
+            assert_eq!(
+                memo::work().0 - work.0,
+                1,
+                "built once, on the third lookup"
+            );
+        }
+
+        #[test]
+        fn a_length_lookup_hands_a_prefix_back_to_the_index_4162() {
+            let doc = wide_array(WIDE_ELEMENTS * 4);
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            let _scope = memo::enter(root.document_token());
+            let elements = root.value().as_array().expect("an array document");
+            let work = memo::work();
+            for k in [200, 150, 100] {
+                assert_eq!(
+                    shown(get_cursor_memoized(&elements, k)),
+                    shown(elements.get_cursor(k))
+                );
+            }
+            // Three length lookups: the first hands the prefix back, the third
+            // builds; every one answers the walk's length.
+            for _ in 0..3 {
+                assert_eq!(
+                    len_checked_memoized(&elements).map_err(|e| format!("{e:?}")),
+                    Ok(WIDE_ELEMENTS * 4)
+                );
+            }
+            assert_eq!(memo::work().0 - work.0, 1);
+            let recorded_before = recorded();
+            for k in [250, 3, WIDE_ELEMENTS * 4] {
+                assert_eq!(
+                    shown(get_cursor_memoized(&elements, k)),
+                    shown(elements.get_cursor(k))
+                );
+            }
+            assert_eq!(recorded(), recorded_before, "the index answers");
+        }
+
+        /// One length lookup ahead of a loop of element reads (`.[-1]`, then
+        /// `.[$i]` in a path context) must not leave the loop walking.
+        #[test]
+        fn an_element_loop_after_one_length_lookup_still_records_4162() {
+            let n = WIDE_ELEMENTS * 4;
+            let doc = wide_array(n);
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            let _scope = memo::enter(root.document_token());
+            let elements = root.value().as_array().expect("an array document");
+            assert!(len_checked_memoized(&elements).is_ok());
+            let before = recorded();
+            for k in (0..n).rev() {
+                assert_eq!(
+                    shown(get_cursor_memoized(&elements, k)),
+                    shown(elements.get_cursor(k)),
+                    "element {k}"
+                );
+            }
+            // Three walks (two ahead of the one lookup), then the fourth
+            // records up to itself and every later read is a hit.
+            assert_eq!(recorded() - before, n - 3);
+        }
+
+        #[test]
+        fn a_read_past_the_cap_walks_and_keeps_the_prefix_4162() {
+            let doc = wide_array(WIDE_ELEMENTS * 4);
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            let _scope = memo::enter(root.document_token());
+            let elements = root.value().as_array().expect("an array document");
+            for _ in 0..3 {
+                assert!(get_cursor_memoized(&elements, 100).is_some());
+            }
+            // Too far to record: walked (and past the end), the prefix kept.
+            let before = recorded();
+            assert!(get_cursor_memoized(&elements, MAX_INDEXED_ELEMENTS).is_none());
+            assert_eq!(recorded(), before);
+            let hits = memo::work().1;
+            for k in [100, 50, 0] {
+                assert_eq!(
+                    shown(get_cursor_memoized(&elements, k)),
+                    shown(elements.get_cursor(k))
+                );
+            }
+            assert_eq!(memo::work().1 - hits, 3, "the prefix still answers");
+            // Once the walk has reached the end, the prefix is the whole
+            // array: a read at any distance is past the end, answered without
+            // a walk.
+            assert!(get_cursor_memoized(&elements, WIDE_ELEMENTS * 4 + 9).is_none());
+            let (before, hits) = (recorded(), memo::work().1);
+            assert!(get_cursor_memoized(&elements, MAX_INDEXED_ELEMENTS + 5).is_none());
+            assert_eq!(recorded(), before);
+            assert_eq!(memo::work().1 - hits, 1);
+        }
+
+        /// Review of #4162: a wide-index read past the end of a short array
+        /// proves nothing about its width, so it must not register the array
+        /// (which would let the length route index a small array and take a
+        /// slot).
+        #[test]
+        fn a_read_past_the_end_of_a_short_array_never_registers_it_4162() {
+            let doc = wide_array(10);
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            let _scope = memo::enter(root.document_token());
+            let elements = root.value().as_array().expect("an array document");
+            let (before, work) = (recorded(), memo::work());
+            for _ in 0..4 {
+                assert!(get_cursor_memoized(&elements, WIDE_ELEMENTS + 36).is_none());
+                assert_eq!(
+                    len_checked_memoized(&elements).map_err(|e| format!("{e:?}")),
+                    Ok(10)
+                );
+            }
+            assert_eq!((recorded(), memo::work()), (before, work));
+        }
+
+        /// Review of #4162: a prefix is charged for what it recorded, not for
+        /// the index read, so a read far past the end of a short array does
+        /// not retire the other arrays' indexes.
+        #[test]
+        fn a_far_read_past_the_end_retires_no_other_index_4162() {
+            let a = wide_array(WIDE_ELEMENTS * 2);
+            let b = wide_array(WIDE_ELEMENTS + 3);
+            let doc = format!("[{a},{b}]");
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            let _scope = memo::enter(root.document_token());
+            let outer = root.value().as_array().expect("an array document");
+            let arrays: Vec<_> = outer
+                .collect_values()
+                .iter()
+                .map(|v| v.as_array().expect("an inner array"))
+                .collect();
+            let builds = memo::work().0;
+            for _ in 0..3 {
+                assert!(len_checked_memoized(&arrays[0]).is_ok());
+            }
+            assert_eq!(memo::work().0 - builds, 1, "array a is indexed");
+            for _ in 0..3 {
+                assert!(get_cursor_memoized(&arrays[1], WIDE_ELEMENTS + 1).is_some());
+            }
+            assert!(get_cursor_memoized(&arrays[1], MAX_INDEXED_ELEMENTS - 1).is_none());
+            // a's index still answers its length: a retired one would walk.
+            let hits = memo::work().1;
+            assert_eq!(
+                len_checked_memoized(&arrays[0]).map_err(|e| format!("{e:?}")),
+                Ok(WIDE_ELEMENTS * 2)
+            );
+            assert_eq!(memo::work().1 - hits, 1);
+        }
+
+        #[test]
+        fn more_prefixes_than_slots_retire_the_oldest_and_stay_right_4162() {
+            let inner = wide_array(WIDE_ELEMENTS + 3);
+            let doc = format!("[{}]", vec![inner; 8].join(","));
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            let _scope = memo::enter(root.document_token());
+            let outer = root.value().as_array().expect("an array document");
+            let arrays: Vec<_> = outer
+                .collect_values()
+                .iter()
+                .map(|v| v.as_array().expect("an inner array"))
+                .collect();
+            let read = |n: usize, k: usize| {
+                assert_eq!(
+                    shown(get_cursor_memoized(&arrays[n], k)),
+                    shown(arrays[n].get_cursor(k)),
+                    "array {n} element {k}"
+                );
+            };
+            // Eight prefixes against four slots.
+            for n in 0..8 {
+                for k in [WIDE_ELEMENTS + 2, WIDE_ELEMENTS, 1] {
+                    read(n, k);
+                }
+            }
+            // The retired walk for good and record nothing; the newest are
+            // still answered from their prefixes.
+            let before = recorded();
+            for k in [WIDE_ELEMENTS + 1, 0] {
+                read(0, k);
+                read(1, k);
+            }
+            assert_eq!(recorded(), before, "a retired prefix is not restarted");
+            let hits = memo::work().1;
+            read(7, WIDE_ELEMENTS + 1);
+            assert_eq!(memo::work().1 - hits, 1);
+            // A retired prefix leaves the length route open (review of #4162):
+            // three length lookups index the array, as they would have before
+            // element reads ever touched it.
+            let builds = memo::work().0;
+            for _ in 0..3 {
+                assert_eq!(
+                    len_checked_memoized(&arrays[0]).map_err(|e| format!("{e:?}")),
+                    Ok(WIDE_ELEMENTS + 3)
+                );
+            }
+            assert_eq!(memo::work().0 - builds, 1);
+            read(0, WIDE_ELEMENTS + 2);
+        }
+
+        /// An exhausted list has no head to look up: an element read of an
+        /// empty array, while another array is registered, walks.
+        #[test]
+        fn an_empty_array_read_walks_while_another_is_registered_4162() {
+            let doc = format!("[{},[]]", wide_array(WIDE_ELEMENTS + 3));
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            let _scope = memo::enter(root.document_token());
+            let outer = root.value().as_array().expect("an array document");
+            let arrays: Vec<_> = outer
+                .collect_values()
+                .iter()
+                .map(|v| v.as_array().expect("an inner array"))
+                .collect();
+            assert!(get_cursor_memoized(&arrays[0], WIDE_ELEMENTS + 1).is_some());
+            let (before, work) = (recorded(), memo::work());
+            for _ in 0..3 {
+                assert!(get_cursor_memoized(&arrays[1], WIDE_ELEMENTS + 1).is_none());
+            }
+            assert_eq!((recorded(), memo::work()), (before, work));
+        }
+
+        /// A list of another document than the open scope's walks, records
+        /// nothing, and leaves the scope's own entries answering.
+        #[test]
+        fn a_read_of_another_document_walks_and_records_nothing_4162() {
+            let doc = wide_array(WIDE_ELEMENTS + 3);
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            let other = JsonIndex::build(doc.as_bytes());
+            let other_root = other.root(doc.as_bytes());
+            assert_ne!(root.document_token(), other_root.document_token());
+            let _scope = memo::enter(root.document_token());
+            let elements = root.value().as_array().expect("an array document");
+            let foreign = other_root.value().as_array().expect("an array document");
+            let k = WIDE_ELEMENTS + 1;
+            assert!(get_cursor_memoized(&elements, k).is_some());
+            let (before, work) = (recorded(), memo::work());
+            for _ in 0..3 {
+                assert_eq!(
+                    shown(get_cursor_memoized(&foreign, k)),
+                    shown(foreign.get_cursor(k))
+                );
+            }
+            assert_eq!((recorded(), memo::work()), (before, work));
+            // The scope's array still counts its reads: two more start a prefix.
+            for _ in 0..2 {
+                assert!(get_cursor_memoized(&elements, k).is_some());
+            }
+            assert_eq!(recorded() - before, k + 1);
+        }
+
+        /// With no scope open there is nowhere to register: wide reads walk
+        /// every time and never record.
+        #[test]
+        fn wide_reads_outside_a_scope_walk_and_record_nothing_4162() {
+            let doc = wide_array(WIDE_ELEMENTS + 3);
+            with_root_array(&doc, |elements| {
+                let k = WIDE_ELEMENTS + 1;
+                let (before, work) = (recorded(), memo::work());
+                for _ in 0..4 {
+                    assert_eq!(
+                        shown(get_cursor_memoized(elements, k)),
+                        shown(elements.get_cursor(k))
+                    );
+                }
+                assert_eq!((recorded(), memo::work()), (before, work));
+            });
+        }
+
+        /// An array whose entry was dropped for a newer one keeps its filter
+        /// bit: its next wide read probes, finds no entry, and registers it
+        /// afresh, so two more reads start its prefix.
+        #[test]
+        fn an_evicted_array_registers_again_on_its_next_wide_read_4162() {
+            let inner = wide_array(WIDE_ELEMENTS + 3);
+            let doc = format!("[{}]", vec![inner; 17].join(","));
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            let _scope = memo::enter(root.document_token());
+            let outer = root.value().as_array().expect("an array document");
+            let arrays: Vec<_> = outer
+                .collect_values()
+                .iter()
+                .map(|v| v.as_array().expect("an inner array"))
+                .collect();
+            let k = WIDE_ELEMENTS + 1;
+            for array in &arrays {
+                assert!(get_cursor_memoized(array, k).is_some());
+            }
+            let before = recorded();
+            // Two reads of the evicted first array: a fresh entry would have
+            // started its prefix on the second.
+            for _ in 0..2 {
+                assert_eq!(
+                    shown(get_cursor_memoized(&arrays[0], k)),
+                    shown(arrays[0].get_cursor(k))
+                );
+            }
+            assert_eq!(recorded(), before, "re-registered, not resumed");
+            assert!(get_cursor_memoized(&arrays[0], k).is_some());
+            assert_eq!(recorded() - before, k + 1, "the third read records");
         }
     }
 }
