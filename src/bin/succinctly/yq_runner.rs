@@ -4029,7 +4029,9 @@ fn resolve_one_meta_assign(
                     && !path.is_empty()
                     && !matches!(slot, WritableSlot::KeyLineComment)
                     && meta_comment_text(&s).is_some()
-                    && scalar_entry_in_collection(current, &path);
+                    && (scalar_entry_in_collection(current, &path)
+                        || (matches!(slot, WritableSlot::HeadComment)
+                            && container_entry_in_collection(current, &path)));
                 if sets_entry {
                     let text = meta_comment_text(&s).unwrap_or_default();
                     let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
@@ -4190,13 +4192,42 @@ fn apply_meta_assign_writes(
         }
         if let MetaEffect::SetEntry { head, foot, line } = &write.effect {
             // A later stage can have replaced the scalar this was resolved against with a
-            // container, which yq places differently.
-            if matches!(node_value, OwnedValue::Object(_) | OwnedValue::Array(_)) {
-                return Err(set_entry_unsupported(
-                    "a later stage replaced the scalar with a mapping or sequence",
-                ));
+            // container, or the reverse: only a head is placed for a non-empty container, and
+            // only where yq prints it (above its first child, or above the sequence item).
+            let container = match node_value {
+                OwnedValue::Object(o) => Some(o.is_empty()),
+                OwnedValue::Array(a) => Some(a.is_empty()),
+                _ => None,
+            };
+            // The comment tree may still hold a leaf where a later stage built a container: grow
+            // it to the first entry, which is where the head lands.
+            let first_key = match node_value {
+                OwnedValue::Object(o) => o.keys().next().cloned(),
+                _ => None,
+            };
+            if container == Some(false) {
+                let mut grown = steps.clone();
+                match &first_key {
+                    Some(key) => grown.push(TreeStep::Key(key.as_str())),
+                    None => grown.push(TreeStep::Index(0)),
+                }
+                comment_tree_at_path_or_create_mut(tree, &grown);
             }
-            apply_set_entry(&steps, tree, head.as_ref(), foot.as_ref(), line.as_ref())?;
+            if let Some(empty) = container {
+                if empty || foot.is_some() || line.is_some() {
+                    return Err(set_entry_unsupported(
+                        "a foot or line comment on a mapping or sequence, or any text on an empty one",
+                    ));
+                }
+            }
+            apply_set_entry(
+                &steps,
+                tree,
+                container.is_some(),
+                head.as_ref(),
+                foot.as_ref(),
+                line.as_ref(),
+            )?;
             continue;
         }
         if let MetaEffect::SetKey { head, foot, line } = &write.effect {
@@ -4280,6 +4311,25 @@ fn scalar_entry_in_collection(root: &OwnedValue, path: &[MetaPathStep]) -> bool 
         )
 }
 
+/// Whether `path` addresses a non-empty mapping or sequence that is a value of a mapping or an
+/// item of a sequence in `root` (#2796): a head can be written to one (the foot cannot).
+fn container_entry_in_collection(root: &OwnedValue, path: &[MetaPathStep]) -> bool {
+    let Some((last, parent_path)) = path.split_last() else {
+        return false;
+    };
+    let non_empty_container = match owned_value_at(root, path) {
+        Some(OwnedValue::Object(o)) => !o.is_empty(),
+        Some(OwnedValue::Array(a)) => !a.is_empty(),
+        _ => false,
+    };
+    non_empty_container
+        && matches!(
+            (owned_value_at(root, parent_path), last),
+            (Some(OwnedValue::Object(_)), MetaPathStep::Key(_))
+                | (Some(OwnedValue::Array(_)), MetaPathStep::Index(_))
+        )
+}
+
 /// The refusal for a text write the comment tree cannot place exactly.
 fn set_entry_unsupported(why: &str) -> EvalError {
     EvalError::new(format!(
@@ -4337,6 +4387,7 @@ fn block_ancestors(tree: &CommentTree, parent_steps: &[TreeStep<'_>]) -> Result<
 fn apply_set_entry(
     steps: &[TreeStep<'_>],
     tree: &mut CommentTree,
+    container: bool,
     head: Option<&Vec<String>>,
     foot: Option<&Vec<String>>,
     line: Option<&String>,
@@ -4390,6 +4441,38 @@ fn apply_set_entry(
     }
     let last_entry = index + 1 == count;
     let mut members = members;
+    if container && members[index].style() == "flow" {
+        return Err(set_entry_unsupported(
+            "the collection is written in flow style",
+        ));
+    }
+    if container && is_map {
+        // A mapping value that is itself a collection: its head waits for the first key inside
+        // it, which prints it just above at that key's indent (a head that key owns wins).
+        if owns_lines(members[index]) {
+            return Err(set_entry_unsupported(
+                "the node already has head or foot comment lines (in the document or from an earlier write)",
+            ));
+        }
+        let first = match &mut *members[index] {
+            CommentTree::Object(_, fields, _) => fields.values_mut().next(),
+            CommentTree::Array(_, items) => items.first_mut(),
+            CommentTree::Leaf(_) => None,
+        };
+        let Some(first) = first else {
+            return Ok(());
+        };
+        if owns_lines(first) {
+            return Err(set_entry_unsupported(
+                "the first entry already has head or foot comment lines (in the document or from an earlier write)",
+            ));
+        }
+        if let Some(head) = head {
+            let meta = first.meta();
+            *first.meta_mut() = meta.with_head_foot(head.clone(), Vec::new());
+        }
+        return Ok(());
+    }
     if owns_lines(members[index]) {
         return Err(set_entry_unsupported(
             "the node already has head or foot comment lines (in the document or from an earlier write)",
@@ -11986,8 +12069,8 @@ mod tests {
             ("a: [1, 2]\n", ".a[0] foot_comment = \"x\""),
             ("a: {b: 1}\nc: 2\n", ".a head_comment = \"x\""),
             ("a: 1\n", ".a head_comment = \"\\n\""),
-            // A later stage replaced the scalar with a container, which yq places differently.
-            ("a: 1\n", ".a head_comment = \"y\" | .a = {\"x\": 1}"),
+            // A later stage replaced the scalar with a container, and the write has a foot.
+            ("a: 1\n", ".a foot_comment = \"y\" | .a = {\"x\": 1}"),
         ] {
             let expr = jq::parse_with_mode(filter, jq::ParserMode::Yq).unwrap();
             let mut sink = ErrorSink::default();
@@ -12072,6 +12155,69 @@ mod tests {
             ("a: 1\n", "(.a | key) anchor = \"z\""),
             ("a: 1\n", "(.a | key) head_comment = \"\\n\""),
             ("a: 1\nb: 2\n", "(.[] | key) head_comment = \"x\""),
+        ] {
+            let expr = jq::parse_with_mode(filter, jq::ParserMode::Yq).unwrap();
+            let mut sink = ErrorSink::default();
+            let (groups, _) = evaluate_yaml_direct_filtered(
+                yaml.as_bytes(),
+                &expr,
+                None,
+                &mut sink,
+                DirectEvalOptions {
+                    need_comments: true,
+                    strip_style: false,
+                    sort_keys: false,
+                    mark_json_sourced: false,
+                },
+            )
+            .unwrap();
+            assert!(
+                groups.into_iter().flatten().next().is_none(),
+                "{filter} on {yaml:?}"
+            );
+            assert_eq!(sink.report_count(), 1, "{filter} on {yaml:?}");
+        }
+    }
+
+    /// #2796: a head written to a non-empty mapping or sequence value prints inside it, above
+    /// its first entry at that entry's indent, and above the dash for a sequence item; a head
+    /// the first entry owns wins and the write is refused, and a foot, a line comment or any
+    /// text on an empty collection is not placed at all.
+    #[test]
+    fn container_head_lands_above_its_first_entry_2796() {
+        let nested = "a:\n  b: 1\n  c: 2\ns:\n  - x\n  - y\n";
+        for (filter, want) in [
+            (
+                ".a head_comment = \"x\"",
+                "a:\n  # x\n  b: 1\n  c: 2\ns:\n  - x\n  - y",
+            ),
+            (
+                ".s head_comment = \"x\"",
+                "a:\n  b: 1\n  c: 2\ns:\n  # x\n  - x\n  - y",
+            ),
+        ] {
+            assert_eq!(
+                render_with_comments(nested, filter).trim_end(),
+                want,
+                "{filter}"
+            );
+        }
+        assert_eq!(
+            render_with_comments("- a: 1\n- b: 2\n", ".[0] head_comment = \"x\"").trim_end(),
+            "# x\n- a: 1\n- b: 2"
+        );
+        // A later stage can turn a scalar into a container: the head follows it.
+        assert_eq!(
+            render_with_comments("a: 1\nb: 2\n", ".a head_comment = \"y\" | .a = {\"x\": 1}")
+                .trim_end(),
+            "a:\n  # y\n  x: 1\nb: 2"
+        );
+        for (yaml, filter) in [
+            ("a:\n  # own\n  b: 1\n", ".a head_comment = \"x\""),
+            ("a:\n  b: 1\nc: 2\n", ".a foot_comment = \"x\""),
+            ("a:\n  b: 1\nc: 2\n", ".a comments = \"x\""),
+            ("a: {}\nc: 2\n", ".a head_comment = \"x\""),
+            ("a: {b: 1}\nc: 2\n", ".a head_comment = \"x\""),
         ] {
             let expr = jq::parse_with_mode(filter, jq::ParserMode::Yq).unwrap();
             let mut sink = ErrorSink::default();
