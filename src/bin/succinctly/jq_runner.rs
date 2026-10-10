@@ -4710,7 +4710,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
             std::io::stdin().is_terminal(),
         );
         let (inputs, locations, trailing_error) =
-            match get_inputs(&args, force_read_under_null_input) {
+            match get_inputs(&args, force_read_under_null_input, uses_input_builtins) {
                 Ok(Ok(inputs)) => inputs,
                 // A malformed or undecodable document is a data error, so it goes
                 // out in jq's own diagnostic shape at exit 5 rather than through
@@ -4801,6 +4801,11 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                     // own error is tagged as an uncatchable decode failure.
                     trailing_error.map(|t| (EvalError::new(t.error.message), (t.source, t.line))),
                 );
+                // #4303: where the stream's own end was recorded, reads past it
+                // move on from it as jq's do.
+                if locations.eof_tail.is_some() {
+                    jq::count_reads_past_end();
+                }
             }
 
             if args.null_input {
@@ -5201,6 +5206,7 @@ type Inputs = (Vec<OwnedValue>, InputLocations, Option<TrailingParseError>);
 fn get_inputs(
     args: &JqCommand,
     force_read_under_null_input: bool,
+    track_eof: bool,
 ) -> std::result::Result<Result<Inputs>, i32> {
     // Null input mode: use null as the single input -- unless the filter
     // itself uses `input`/`inputs`/`input_line_number` (#723), in which case
@@ -5371,6 +5377,19 @@ fn get_inputs(
         Vec::new()
     };
 
+    // #4303: how the stream ends, read only by an `input`/`inputs` that runs
+    // past it, so only a program using them pays the scan of the last source.
+    // From the bytes as read, before the UTF-8 substitution below turns an
+    // invalid byte into a three-byte U+FFFD: jq's 4095-byte reads count the
+    // file's own bytes. `--slurp` answers `<unknown>` regardless, JSON `--seq`
+    // keeps its own record-boundary rules (#2947, #3003), and DSV has no jq
+    // oracle.
+    let eof_tail = (track_eof && !args.slurp && !seq_stream_shape && args.input_dsv.is_none())
+        .then(|| {
+            let sources: Vec<&[u8]> = raw_bytes.iter().map(|(_, raw)| raw.as_slice()).collect();
+            EofTail::of(&sources, args.raw_input)
+        });
+
     // All reads happen first, then decoding: a later file's read error still
     // outranks an earlier file's content error, as it did before.
     let mut raw_inputs: Vec<(Option<usize>, String)> = Vec::with_capacity(raw_bytes.len());
@@ -5450,6 +5469,7 @@ fn get_inputs(
             .map(|p| Some(p.to_string_lossy().to_string()))
             .collect(),
     );
+    locations.eof_tail = eof_tail;
 
     // `--slurp`'s single combined value has no content of its own to name a
     // line in -- jq instead names the *last source*'s own newline count at
@@ -5802,6 +5822,125 @@ pub struct InputLocations {
     /// [`UNKNOWN_LINE`] means the same thing for one specific value within
     /// an otherwise-populated table (#1542).
     per_value: Vec<(u32, u32)>,
+    /// How the input stream ends, for [`exhausted`](Self::exhausted) (#4303);
+    /// `None` where it was not recorded, which keeps the per-value fallback.
+    eof_tail: Option<EofTail>,
+}
+
+/// How an input stream ends, which decides jq's `(at ...)` marker once every
+/// input is consumed (#4303).
+///
+/// jq names the last source at that source's own newline count, unless the
+/// read that hit the end of input is the one that completed the stream's last
+/// value; then it says `<unknown>`. jq reads each file with `fgets` into a
+/// 4096-byte buffer, so a read ends after a newline or after
+/// [`JQ_READ_CHUNK`] bytes, and the read that reaches the end is the one left
+/// short of both (or an empty one). A string or container completes on its
+/// closing byte; a number or `true`/`false`/`null` on the byte after it, or at
+/// the end of input. Under `-R` every line is a value, completed by its
+/// newline. Oracle-verified against jq 1.7.1 (`-n '[inputs] | error("y")'`):
+///
+/// ```text
+/// 1\n2\n3\n               => f:3          1\n2\n3                => <unknown>
+/// 3\n\n                    => f:2          1 2 3<space>           => <unknown>
+/// 1<space x4093>           => <unknown>    1<space x4094>         => f:0
+/// <space x4094>1           => <unknown>    (a full read; `1` completes at the end)
+/// `1` then an empty file   => <unknown>    `1` then `\n`           => second:1
+/// (-R) a\n<space>           => <unknown>    (-R) a\nb\n             => f:2
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EofTail {
+    /// Newlines in the last source.
+    newlines: u32,
+    /// Whether the read that reached the end of input completed a value.
+    unknown: bool,
+}
+
+/// The most `fgets` puts in jq's 4096-byte input buffer per read: a line
+/// longer than this is read in pieces of this size (#4303).
+const JQ_READ_CHUNK: usize = 4095;
+
+impl EofTail {
+    /// The tail of `sources`, in command-line order, read as JSON text or, with
+    /// `raw`, as `-R` lines.
+    fn of(sources: &[&[u8]], raw: bool) -> Self {
+        let newlines = sources.last().map_or(0, |last| count_newlines(last));
+        let unknown = if raw {
+            Self::raw_line_ends_at_eof(sources)
+        } else {
+            Self::json_value_completes_in_final_read(sources)
+        };
+        Self {
+            newlines: newlines as u32,
+            unknown,
+        }
+    }
+
+    /// `-R`: whether bytes follow the stream's last newline, which may sit in
+    /// an earlier source. A line without its newline completes at the end.
+    fn raw_line_ends_at_eof(sources: &[&[u8]]) -> bool {
+        for bytes in sources.iter().rev() {
+            match bytes.iter().rposition(|&b| b == b'\n') {
+                Some(at) => return at + 1 < bytes.len(),
+                None if !bytes.is_empty() => return true,
+                None => {}
+            }
+        }
+        false
+    }
+
+    /// JSON: whether the stream's last value completes in the read that
+    /// reaches the end of input.
+    fn json_value_completes_in_final_read(sources: &[&[u8]]) -> bool {
+        let Some((&last, earlier)) = sources.split_last() else {
+            return false;
+        };
+        // Where the final read starts: reads restart after each newline and
+        // take at most `JQ_READ_CHUNK` bytes, so a last line that fills its
+        // reads exactly leaves an empty final read.
+        let line_start = last
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |at| at + 1);
+        let partial = (last.len() - line_start) % JQ_READ_CHUNK;
+        let final_read = last.len() - partial;
+        let (values, malformed) = split_json_values(last);
+        // A parse error ends the stream's values, and jq raises it where its
+        // reads reach the malformed bytes.
+        if let Some(start) = malformed {
+            return start >= final_read;
+        }
+        match values.last() {
+            // At `last.len()` for a bare token that the end of input completes.
+            Some(&(start, end)) => {
+                let completes_at = if matches!(last[start], b'"' | b'[' | b'{') {
+                    end - 1
+                } else {
+                    end
+                };
+                completes_at >= final_read
+            }
+            // No value of its own: a bare number or literal that ends an
+            // earlier source is completed by this one's first byte, or at the
+            // end when it is empty, and that is the final read only when the
+            // whole of this source is.
+            None => final_read == 0 && Self::ends_in_bare_token(earlier),
+        }
+    }
+
+    /// Whether the last non-empty source ends in a number or literal with no
+    /// byte after it, so the next byte read completes it.
+    fn ends_in_bare_token(sources: &[&[u8]]) -> bool {
+        let Some(bytes) = sources.iter().rev().find(|bytes| !bytes.is_empty()) else {
+            return false;
+        };
+        split_json_values(bytes)
+            .0
+            .last()
+            .is_some_and(|&(start, end)| {
+                end == bytes.len() && !matches!(bytes[start], b'"' | b'[' | b'{')
+            })
+    }
 }
 
 impl InputLocations {
@@ -5809,6 +5948,7 @@ impl InputLocations {
         Self {
             files,
             per_value: Vec::new(),
+            eof_tail: None,
         }
     }
 
@@ -5933,8 +6073,12 @@ impl InputLocations {
     /// (#1309, item 5).
     ///
     /// jq names the file its parser has open at EOF, which is the *last* file
-    /// on the command line -- at line 0 when that file contributed no document
-    /// of its own, and at its last document's line otherwise. Oracle-verified
+    /// on the command line, at that file's own newline count -- or says
+    /// `<unknown>` when the read that reached the end completed the stream's
+    /// last value ([`EofTail`], #4303). Where the tail was not recorded, this
+    /// falls back to line 0 when that file contributed no document of its own
+    /// and its last document's line otherwise, which agrees except after
+    /// trailing blank lines and where jq says `<unknown>`. Oracle-verified
     /// against jq 1.7.1:
     ///
     /// ```text
@@ -5965,6 +6109,12 @@ impl InputLocations {
             return None;
         }
         let last_src = self.last_src();
+        // #4303: the stream's own end, where it was recorded. The fallback
+        // below reads the last document's line instead, which differs after
+        // trailing blank lines and misses `<unknown>`.
+        if let Some(tail) = self.eof_tail {
+            return (!tail.unknown).then_some((last_src, tail.newlines));
+        }
         Some(match self.per_value.last() {
             Some(&(src, line)) if src == last_src => (last_src, line),
             _ => (last_src, 0),
@@ -11339,6 +11489,71 @@ mod tests {
         assert_eq!(values.len(), 2);
         assert_eq!(values[0].to_json(), "1");
         assert_eq!(values[1].to_json(), "3");
+    }
+
+    /// #4303: where jq's marker settles once input runs out. Each row's
+    /// expectation is jq 1.7.1's own (`-n '[inputs] | error("y")'`): `None`
+    /// is `<unknown>`, `Some(n)` the last source at line `n`.
+    #[test]
+    fn test_eof_tail_models_jqs_final_read_4303() {
+        let at = |sources: &[&[u8]], raw: bool| {
+            let tail = EofTail::of(sources, raw);
+            (!tail.unknown).then_some(tail.newlines)
+        };
+        let spaces = |n: usize| " ".repeat(n);
+        for (sources, expected) in [
+            (vec![&b"1\n2\n3\n"[..]], Some(3)),
+            (vec![b"1\n2\n3"], None),
+            (vec![b"3\n\n"], Some(2)),
+            (vec![b"1 2 3 \n "], Some(1)),
+            (vec![b"1 2 3 "], None),
+            (vec![b"[1]"], None),
+            (vec![b"\"a\"  "], None),
+            (vec![b""], Some(0)),
+            (vec![b" "], Some(0)),
+            (vec![b"\n"], Some(1)),
+            // Across sources: a bare token completed by the next source.
+            (vec![b"1", b" "], None),
+            (vec![b"1", b""], None),
+            (vec![b"1", b"", b""], None),
+            (vec![b"1", b"\n"], Some(1)),
+            (vec![b"2\n", b" "], Some(0)),
+            (vec![b"[1]", b""], Some(0)),
+            (vec![b"1", b" ", b""], Some(0)),
+        ] {
+            assert_eq!(at(&sources, false), expected, "{sources:?}");
+        }
+        // The 4095-byte read: a value completed in a full read leaves an empty
+        // final one; a bare token at the very end completes at the end.
+        let one_then = |n: usize| format!("1{}", spaces(n));
+        let then_one = |n: usize| format!("{}1", spaces(n));
+        for (text, expected) in [
+            (one_then(4093), None),
+            (one_then(4094), Some(0)),
+            (then_one(4094), None),
+            (format!("{} ", then_one(4094)), None),
+            (then_one(4094) + &spaces(4096), Some(0)),
+            (format!("{}1", spaces(4095)), None),
+            (format!("1\n{}2", spaces(5000)), None),
+            (format!("1\n2{}", spaces(5000)), Some(1)),
+        ] {
+            let len = text.len();
+            assert_eq!(at(&[text.as_bytes()], false), expected, "{len} bytes");
+        }
+        // No sources at all: nothing to complete.
+        assert_eq!(at(&[], false), Some(0));
+        assert_eq!(at(&[], true), Some(0));
+        // `-R`: any byte after the last newline is a line the end completes.
+        for (sources, expected) in [
+            (vec![&b"a\nb"[..]], None),
+            (vec![b"a\nb\n"], Some(2)),
+            (vec![b"a\n "], None),
+            (vec![b""], Some(0)),
+            (vec![b"a", b""], None),
+            (vec![b"a\n", b""], Some(0)),
+        ] {
+            assert_eq!(at(&sources, true), expected, "-R {sources:?}");
+        }
     }
 
     /// #1192: `standard_json_to_jq_value` now surfaces a genuinely

@@ -39022,12 +39022,9 @@ fn test_jq_input_reads_next_document_723() -> Result<()> {
 
 /// jq's own exhaustion error is oddly spelled `break`, not a more
 /// descriptive "No more inputs" -- confirmed live against jq 1.7.1. The
-/// `:0` (not `:1`) is a separate, pre-existing quirk unrelated to #723:
-/// `succinctly jq`'s own location tracking reports line 0 for a document
-/// ending on the input's first line even without `input` involved at all
-/// (confirmed identical on `main` before this change, e.g. `echo '1 2' |
-/// jq '.,error'` reports `:0` for the first value too) -- not something
-/// this issue introduces or should silently paper over here.
+/// location is `<unknown>`: the input `1` has no trailing newline, so the
+/// read that reached the end completed the value (#4303; this pin said
+/// `<stdin>:0` until then, which jq never prints here).
 #[test]
 fn test_jq_input_exhausted_errors_with_break_723() {
     let (stdout, stderr, code) =
@@ -39035,7 +39032,7 @@ fn test_jq_input_exhausted_errors_with_break_723() {
     assert_eq!(code, 5, "stdout: {stdout}\nstderr: {stderr}");
     assert!(stdout.is_empty(), "stdout: {stdout}");
     assert!(
-        stderr.contains("jq: error (at <stdin>:0): break"),
+        stderr.contains("jq: error (at <unknown>): break"),
         "{stderr}"
     );
 }
@@ -89697,7 +89694,8 @@ fn test_paths_filter_stop_reaches_a_retry_in_the_filter_3567() -> Result<()> {
         ("{\"a\":1,\"b\":2}", "first(paths(true))", "[\"a\"]", 0, ""),
         ("{\"a\":1,\"b\":2}", "[limit(2;paths(.))]", "[[\"a\"],[\"b\"]]", 0, ""),
         ("{\"a\":[1,{\"b\":2}]}", "[limit(1;paths(type==\"number\"))]", "[[\"a\",0]]", 0, ""),
-        ("{\"a\":1,\"b\":2}", "first(paths(input))", "", 5, "jq: error (at <stdin>:0): break\n"),
+        // `<unknown>`: the input ends without a newline (#4303).
+        ("{\"a\":1,\"b\":2}", "first(paths(input))", "", 5, "jq: error (at <unknown>): break\n"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(stdout.trim_end(), stdout_expected, "#3567: `{filter}` on {input}");
@@ -124171,6 +124169,161 @@ fn test_pipe_effect_before_a_raising_stage_runs_depth_first_4293() -> Result<()>
             run_jq_interleaved(&["-c", filter], Some(input))?,
             (expected.clone(), *code),
             "{filter}"
+        );
+    }
+    Ok(())
+}
+
+/// #4303: once input runs out, jq's `(at ...)` marker says `<unknown>` when
+/// the read that reached the end completed the stream's last value, and names
+/// the last source at its own newline count otherwise -- trailing blank lines
+/// included. Every expectation is jq 1.7.1's own output.
+#[test]
+fn test_error_after_input_runs_out_names_jqs_eof_location_4303() -> Result<()> {
+    let long_then_one = format!("{}1", " ".repeat(4094));
+    let one_then_long = format!("1{}", " ".repeat(4094));
+    // `(args, sources, expected)`: `None` is `<unknown>`, `Some((i, line))`
+    // the `i`th source at `line`.
+    type Row<'a> = (&'a [&'a str], Vec<&'a [u8]>, Option<(usize, usize)>);
+    let rows: &[Row] = &[
+        (&["-nc", "[inputs] | error(\"y\")"], vec![b"1 2 3"], None),
+        (&["-nc", "[inputs] | error(\"y\")"], vec![b"1\n2\n3"], None),
+        (
+            &["-nc", "[inputs] | error(\"y\")"],
+            vec![b"1\n2\n3\n"],
+            Some((0, 3)),
+        ),
+        (
+            &["-nc", "[inputs] | error(\"y\")"],
+            vec![b"3\n\n"],
+            Some((0, 2)),
+        ),
+        (
+            &["-nc", "[inputs] | error(\"y\")"],
+            vec![b"3\n\n\n"],
+            Some((0, 3)),
+        ),
+        (
+            &["-nc", "[inputs] | error(\"y\")"],
+            vec![b"\n"],
+            Some((0, 1)),
+        ),
+        (
+            &["-nc", "[inputs] | error(\"y\")"],
+            vec![b"1 2 3\n "],
+            Some((0, 1)),
+        ),
+        (&["-nc", "[inputs] | error(\"y\")"], vec![b"1", b" "], None),
+        (&["-nc", "[inputs] | error(\"y\")"], vec![b"1", b""], None),
+        (
+            &["-nc", "[inputs] | error(\"y\")"],
+            vec![b"1", b"\n"],
+            Some((1, 1)),
+        ),
+        (
+            &["-nc", "[inputs] | error(\"y\")"],
+            vec![b"2\n", b"\n", b"\n"],
+            Some((2, 1)),
+        ),
+        // jq reads 4095 bytes at a time: a value completed in a full read
+        // leaves an empty final one, and a bare `1` at the very end is
+        // completed by the end itself.
+        (
+            &["-nc", "[inputs] | error(\"y\")"],
+            vec![one_then_long.as_bytes()],
+            Some((0, 0)),
+        ),
+        (
+            &["-nc", "[inputs] | error(\"y\")"],
+            vec![long_then_one.as_bytes()],
+            None,
+        ),
+        // Without `-n`, the `break` an `input` past the end raises.
+        (&["-c", "input"], vec![b"1 2 3"], None),
+        (&["-c", "input"], vec![b"3\n\n"], Some((0, 2))),
+        // `-R`: a line without its newline is completed by the end.
+        (&["-nRc", "[inputs] | error(\"y\")"], vec![b"a\nb"], None),
+        (&["-nRc", "[inputs] | error(\"y\")"], vec![b"a\n "], None),
+        (
+            &["-nRc", "[inputs] | error(\"y\")"],
+            vec![b"a\nb\n\n"],
+            Some((0, 3)),
+        ),
+    ];
+    for (args, sources, expected) in rows {
+        let (_, stderr, code, paths) = run_jq_over_byte_files(args, sources)?;
+        let location = match expected {
+            None => "<unknown>".to_string(),
+            Some((i, line)) => format!("{}:{line}", paths[*i]),
+        };
+        let message = if args.contains(&"input") {
+            "break"
+        } else {
+            "y"
+        };
+        assert_eq!(
+            (stderr.lines().last(), code),
+            (
+                Some(format!("jq: error (at {location}): {message}").as_str()),
+                5
+            ),
+            "{args:?} over {sources:?}: {stderr}"
+        );
+    }
+    // `input_line_number` follows the marker: the first read past the end
+    // takes its line (0 for `<unknown>`), and every later one is `<unknown>`
+    // at 0. A parse error's own read names where it is, and the reads after
+    // it go on to the end the same way.
+    let erred: &[u8] = b"1\n2 }\n\n\n";
+    let first_past = r#"[input, input, (try input catch "c"), (try input catch "d")]"#;
+    let second_past =
+        r#"[input, input, (try input catch "c"), (try input catch "d"), (try input catch "e")]"#;
+    for (source, filter, expected) in [
+        (
+            &b"1\n2\n\n"[..],
+            "[inputs] | input_line_number".to_string(),
+            Ok("3"),
+        ),
+        (
+            b"1 2 3",
+            "[inputs] | input_line_number".to_string(),
+            Ok("0"),
+        ),
+        (
+            b"1\n2\n",
+            r#"[inputs] | (try input catch "e") | input_line_number"#.to_string(),
+            Ok("0"),
+        ),
+        (
+            b"1\n2\n",
+            r#"[inputs] | (try input catch "e") | error("y")"#.to_string(),
+            Err(None),
+        ),
+        (erred, format!("{first_past} | input_line_number"), Ok("4")),
+        (erred, format!("{first_past} | error(\"y\")"), Err(Some(4))),
+        (erred, format!("{second_past} | error(\"y\")"), Err(None)),
+    ] {
+        let (stdout, stderr, code, paths) = run_jq_over_byte_files(&["-nc", &filter], &[source])?;
+        match expected {
+            Ok(line) => assert_eq!((stdout.trim_end(), code), (line, 0), "{filter}: {stderr}"),
+            Err(line) => {
+                let location =
+                    line.map_or_else(|| "<unknown>".to_string(), |l| format!("{}:{l}", paths[0]));
+                assert_eq!(
+                    (stderr.trim_end(), code),
+                    (format!("jq: error (at {location}): y").as_str(), 5),
+                    "{filter}"
+                );
+            }
+        }
+    }
+    // stdin is the same stream, named `<stdin>`.
+    for (input, expected) in [("1 2 3", "<unknown>"), ("3\n\n", "<stdin>:2")] {
+        let (_, stderr, code) = run_jq_full(&["-c", "input"], Some(input))?;
+        assert_eq!(
+            (stderr.trim_end(), code),
+            (format!("jq: error (at {expected}): break").as_str(), 5),
+            "{input:?}"
         );
     }
     Ok(())

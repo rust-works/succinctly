@@ -113,8 +113,8 @@ pub use eval::{eval_full, eval_owned_scalar_fast, eval_reindexed_document, with_
 // stream" to seed under a `no_std` embedding with no CLI driver anyway).
 #[cfg(feature = "std")]
 pub use eval::{
-    current_input_location, pop_input, pop_remaining_input, seed_remaining_inputs,
-    seed_remaining_inputs_with_error, InputPop, UNKNOWN_INPUT_LINE,
+    count_reads_past_end, current_input_location, pop_input, pop_remaining_input,
+    seed_remaining_inputs, seed_remaining_inputs_with_error, InputPop, UNKNOWN_INPUT_LINE,
 };
 // `input_queue_is_active` exists under both gates (a `const fn` returning
 // `false` without `std`), so `eval_generic` can consult it unconditionally.

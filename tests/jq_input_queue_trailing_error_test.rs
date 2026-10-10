@@ -10,8 +10,8 @@
 #![cfg(feature = "std")]
 
 use succinctly::jq::{
-    current_input_location, pop_input, pop_remaining_input, seed_remaining_inputs_with_error,
-    EvalError, InputPop, OwnedValue,
+    count_reads_past_end, current_input_location, pop_input, pop_remaining_input,
+    seed_remaining_inputs_with_error, EvalError, InputPop, OwnedValue,
 };
 
 #[test]
@@ -21,6 +21,7 @@ fn a_trailing_parse_error_is_delivered_once_after_the_documents_2961() {
         Some((0, 0)),
         Some((EvalError::new("Invalid JSON text"), (0, 1))),
     );
+    count_reads_past_end();
 
     assert!(matches!(
         pop_input(),
@@ -34,11 +35,28 @@ fn a_trailing_parse_error_is_delivered_once_after_the_documents_2961() {
         InputPop::ParseError(e) => assert_eq!(e.message, "Invalid JSON text"),
         _ => panic!("the parse error follows the documents"),
     }
-    // The marker names where the parser stopped, and stays there.
+    // The marker names where the parser stopped. The reads after it go on to
+    // the end of the stream (#4303): the first names the seeded end of input,
+    // and every later one is jq's `<unknown>`. jq 1.7.1 on `1\n2 }\n\n\n`
+    // names line 2 for the error's read, line 4 for the next, then
+    // `<unknown>`.
     assert_eq!(current_input_location(), Some((0, 1)));
     assert!(matches!(pop_input(), InputPop::Exhausted));
+    assert_eq!(current_input_location(), Some((0, 0)));
     assert!(matches!(pop_input(), InputPop::Exhausted));
-    assert_eq!(current_input_location(), Some((0, 1)));
+    assert_eq!(current_input_location(), None);
+
+    // Without the count (a route that did not record the stream's end), every
+    // read past the end leaves the seeded end of input.
+    seed_remaining_inputs_with_error(
+        vec![],
+        Some((0, 7)),
+        Some((EvalError::new("Invalid JSON text"), (0, 1))),
+    );
+    assert!(matches!(pop_input(), InputPop::ParseError(_)));
+    assert!(matches!(pop_input(), InputPop::Exhausted));
+    assert!(matches!(pop_input(), InputPop::Exhausted));
+    assert_eq!(current_input_location(), Some((0, 7)));
 
     // The `Option`-shaped pop reads a trailing error as the end of the
     // stream, and consumes it.
