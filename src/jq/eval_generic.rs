@@ -8946,18 +8946,19 @@ mod slot_memo {
             };
             // The parent's extent is a fact about the parent, so any of its
             // scans can hand it on.
-            let mut extent = state
+            let extent = state
                 .scans
                 .iter()
                 .find(|s| s.parent == parent)
                 .and_then(|s| s.extent);
-            let superseded = state
+            // The scan resumed from goes, and so does any scan already at
+            // `last` (a restart can leave one right after the one resumed
+            // from): two scans of a parent never describe the same element.
+            let before = state.scans.len();
+            state
                 .scans
-                .iter()
-                .position(|s| s.parent == parent && (Some(s.last) == replaces || s.last == last));
-            if let Some(at) = superseded {
-                extent = state.scans.remove(at).extent.or(extent);
-            } else {
+                .retain(|s| !(s.parent == parent && (Some(s.last) == replaces || s.last == last)));
+            if state.scans.len() == before {
                 if state.scans.iter().filter(|s| s.parent == parent).count() == PER_PARENT {
                     if let Some(at) = state.scans.iter().position(|s| s.parent == parent) {
                         state.scans.remove(at);
@@ -51733,6 +51734,25 @@ mod tests {
         assert_eq!(slot_memo::resume_back(1, 7, 500), Some((900, 800)));
         assert_eq!(slot_memo::resume(1, 7, 500), Some((105, 44, false)));
         assert_eq!(slot_memo::resume_back(1, 7, 100), Some((105, 44)));
+        // A read that finds the element right after another scan's replaces that
+        // one and the scan already standing on it, not just one of them.
+        slot_memo::remember(1, 9, 100, 40, Some(101), false, None);
+        slot_memo::remember(1, 9, 101, 41, Some(102), false, None);
+        slot_memo::remember(1, 9, 101, 41, Some(102), false, Some(100));
+        assert_eq!(slot_memo::resume(1, 9, 1_000), Some((101, 41, false)));
+        assert_eq!(
+            slot_memo::resume(1, 9, 101),
+            None,
+            "the scan at 100 is gone"
+        );
+        let mut standing = Vec::new();
+        let _ = slot_memo::find(1, |parent, last, _, _, _| {
+            if parent == 9 {
+                standing.push(last);
+            }
+            None::<()>
+        });
+        assert_eq!(standing, [101], "one scan stands on element 101");
         // A third, started from the first element, evicts the parent's least
         // recently used (900 was last used by `resume_back`, which is read-only;
         // 105 by the `resume` above), and nothing of another parent.
