@@ -75818,6 +75818,84 @@ fn test_foreach_update_unprovable_register_stage_refuses_loudly_4071() -> Result
     ])
 }
 
+/// #4252: an UPDATE whose output navigated and then called a `def` (`($k|.b?) | def f: 1; f`)
+/// leaves jq's register on the node it navigated to. Over a `null` there that node is `null`, which
+/// jq compares to a `null` `$k` by kind, so EXTRACT's `$k|.b?` navigates; the refusal of it was
+/// read as jq's verdict and the `try` around it swallowed it, dropping `["a","b","b"]` (`del`/`=`
+/// wrote nothing and exited 0). It is the resolver's guess now, so it is loud. Over a container
+/// the node cannot equal `$k`, jq's own error is what the `try` catches, and the rows answer as
+/// jq does. Every row captured from jq 1.7.1 with `-c`.
+#[test]
+fn test_foreach_update_navigated_then_def_keeps_the_register_lost_at_the_node_4252() -> Result<()> {
+    let obj = r#"{"a":{"b":1,"c":[1,2]},"z":0}"#;
+    let refused = "Invalid path expression near attempt to access element \"b\" of null";
+    assert_path_rows_3289(&[
+        (
+            "null",
+            r"[path(foreach .a? as $k (0; ($k|.b?) | def f: 1; f; try ($k|.b?)))]",
+            "",
+            refused,
+            5,
+        ),
+        (
+            "null",
+            r"del(foreach .a? as $k (0; ($k|.b?) | def f: 1; f; try ($k|.b?)))",
+            "",
+            refused,
+            5,
+        ),
+        (
+            "null",
+            r"(foreach .a? as $k (0; ($k|.b?) | def f: 1; f; try ($k|.b?))) = 9",
+            "",
+            refused,
+            5,
+        ),
+        (
+            obj,
+            r"[path(foreach .a as $v (0; ($v|.b?) | def f: 1; f; try ($v|.b?)))]",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            obj,
+            r"del(foreach .a as $v (0; ($v|.b?) | def f: 1; f; try ($v|.b?)))",
+            "{\"a\":{\"b\":1,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            obj,
+            r"(foreach .a as $v (0; ($v|.b?) | def f: 1; f; try ($v|.b?))) = 9",
+            "{\"a\":{\"b\":1,\"c\":[1,2]},\"z\":0}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[null,1]}"#,
+            r"[path(foreach .a as $v (0; ($v|.[0]?) | def f: 1; f; try ($v|.[0]?)))]",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            obj,
+            r"[path(foreach .a as $v (0; ($v|.c[0:1]?) | def f: 1; f; try ($v|.b?)))]",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"[path(foreach .a as $v (0; ($v|.[0:1]?) | def f: 1; f; try ($v|.[0:1]?)))]",
+            "",
+            "Invalid path expression near attempt to access element {\"start\":0,",
+            5,
+        ),
+    ])
+}
+
 /// #3941: the same read, outside a fold. A destructuring bind's body is a comma whose
 /// siblings are a navigating pipe and a bare `$q`; `$q`'s statement used to be dropped, so the
 /// body refused where jq answers (`destructure-comma-marker-nav` in the bind-origin sweep).

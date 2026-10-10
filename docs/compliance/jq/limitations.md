@@ -3028,9 +3028,18 @@ is the revert that established what the other one costs.
    and 45 wrong answers into matches or loud refusals and loses 652 matches to a refusal, 480 of
    them on a `null` input, where a write dropped for a path jq names is a no-op anyway. The 12
    operands for `select`, a `def` call and the issue's own shapes (159,867 rows) take
-   1,511 wrong accepts and 27 wrong answers to 377 and 5, and lose 396 matches; the remainder is
-   `($k | .b?) | def f: 1; f` over a `null` register, identical on `main`
-   ([#4252](https://github.com/rust-works/succinctly/issues/4252)). A boolean register
+   1,511 wrong accepts and 27 wrong answers to 377 and 5, and lose 396 matches; the remainder, an
+   UPDATE output that navigated and then called a `def` over a `null` register
+   (`($k | .b?) | def f: 1; f`), is recorded lost at the node it navigated to, not at the step's
+   entry ([#4252](https://github.com/rust-works/succinctly/issues/4252), pinned by
+   `test_foreach_update_navigated_then_def_keeps_the_register_lost_at_the_node_4252`): `.b` of
+   `null` is `null`, which equals a `null` `$k` by `jv_identical`'s kind rule, so the refusal of
+   `$k` is a guess there and loud, while an object `$k` can never equal the node and the `try`
+   catches jq's own error as before. The 9 operands for it (119,907 rows) take 1,885 wrong accepts
+   and 25 wrong answers to none, and lose 400 matches, all on a `null` input where jq's answer is the
+   document unchanged (or an empty list) and the dropped write was a no-op. A component of the path that is
+   a slice is read too (a slice of a container is a fresh value, of `null` is `null`); one the lookup does
+   not model records the loss at the step's entry, the louder answer. A boolean register
    is compared with the result, so an equal one answers and a different one refuses, as in jq
    (jq reads an equal boolean result as the register itself): that holds for a bool-returning
    builtin (`contains(true)`) next to a navigating comma sibling too since #4063.

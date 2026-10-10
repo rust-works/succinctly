@@ -61,7 +61,7 @@ from "0 FAIL" over a clean base. A benchmark cannot measure a shape it does
 not generate: add the generator pattern here before claiming a shape is safe.
 
 **Size.** The full grid is millions of rows; `--list-axes` prints the exact count
-(765 operands, 7 companions, 12 inputs and 37 contexts give 9,846,387 rows as of #4071,
+(772 operands, 7 companions, 12 inputs and 37 contexts give 9,939,627 rows as of #4252,
 and each operand is also swept as a bare pipe stage since #3361). The count grows with
 every operand a change to the register adds, so read it from `--list-axes` rather than
 from here.
@@ -1162,6 +1162,15 @@ OPERANDS = [
     "(foreach .a? as $k (.; select(true); try ($k | .b?)))",
     "(foreach .a? as $k (null; ((now // sort) | ($k | .c?) // (first(($k | length)) | (1, 2))); try ($k | .b?)))",
     "(foreach .a? as $k (0; (try ((length | .)) catch ([($k | .b?)]) | if first(0) then (($k | .b?), true) else sort end); try ($k | .b?)))",
+    # (#4252) an UPDATE output that navigated and then computed leaves jq's register on the node it
+    # navigated to, which a `null`/`true`/`false` `$k` equals by kind; an object `$k` never does.
+    "(foreach .a? as $k (0; ($k | .b?) | def f: 1; f; $k))",
+    "(foreach .a? as $k (0; ($k | .[0]?) | def f: 1; f; try ($k | .[0]?)))",
+    "(foreach .a? as $k (0; ($k | .b?.c?) | def f: 1; f; try ($k | .b?)))",
+    "(foreach .a? as $k (null; ($k | .b?) | def f: 1; f; try ($k | .b?)))",
+    "(foreach .a? as $k (0; (($k | .b?), now) | floor; try ($k | .b?)))",
+    "(foreach .a? as $k (0; ($k | .b?) | def f: 1; f; try ($k | .b?) | .c?))",
+    "(foreach .a? as $k (0; ($k | .[0:1]?) | def f: 1; f; try ($k | .[0:1]?)))",
     # (#3899) a destructuring `?//` bind whose body mixes a navigating and a
     # by-value part. A failed destructure is restored by the fork, so the bare
     # `$var` alternative that runs leaves jq's register where the stage entered
