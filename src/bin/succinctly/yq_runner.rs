@@ -3622,7 +3622,9 @@ fn owned_value_at_mut<'v>(
 /// error/`break`/`halt` (a partial result counts as one), `Some(outputs)`
 /// otherwise. For the metadata write pass's own re-evaluation of pipe
 /// stages the real evaluation is about to run anyway -- whatever fails
-/// there is reported *there*, once, not a second time here.
+/// there is reported *there*, once, not a second time here. The same goes
+/// for `debug`, `stderr` and `halt_error` output, which is muted (#2709): do
+/// not use this for an evaluation whose side effects are the real ones.
 fn evaluate_input_quiet(input: &OwnedValue, expr: &jq::Expr) -> Option<Vec<OwnedValue>> {
     let doc = input
         .reindexed_without_provenance::<jq::JqSemantics>()

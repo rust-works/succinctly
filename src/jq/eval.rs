@@ -137629,3 +137629,30 @@ mod neutral_leaves_register_tests_4028 {
         }
     }
 }
+
+#[cfg(all(test, feature = "std"))]
+mod stderr_mute_tests_2709 {
+    use super::{with_stderr_muted, STDERR_MUTED};
+
+    fn depth() -> u32 {
+        STDERR_MUTED.with(core::cell::Cell::get)
+    }
+
+    // #2709: the mute must lift when the closure returns, nest, and lift again on unwind --
+    // otherwise one muted pass would silence every later `debug`/`stderr` write on the thread.
+    #[test]
+    fn mute_nests_and_lifts_on_return_and_on_unwind() {
+        assert_eq!(depth(), 0);
+        let result = with_stderr_muted(|| {
+            assert_eq!(depth(), 1);
+            with_stderr_muted(|| assert_eq!(depth(), 2));
+            assert_eq!(depth(), 1);
+            7
+        });
+        assert_eq!((result, depth()), (7, 0));
+
+        let unwound = std::panic::catch_unwind(|| with_stderr_muted(|| panic!("boom")));
+        assert!(unwound.is_err());
+        assert_eq!(depth(), 0);
+    }
+}

@@ -19015,6 +19015,37 @@ mod meta_assign_798 {
         Ok(())
     }
 
+    /// #2709: the write's own target expression is also looked up by the pass, and every document
+    /// of a multi-document file runs the pass again; a side effect in either fires once per
+    /// document.
+    #[test]
+    fn side_effects_in_the_target_and_across_documents_fire_once_2709() -> Result<()> {
+        let (out, err, code) = run_yq_stdin_with_stderr(
+            "(.a | debug) line_comment = \"y\"",
+            "a: 1\nb: 2\n",
+            &["--jq-extensions"],
+        )?;
+        assert_eq!(
+            (code, out.as_str(), err.as_str()),
+            (0, "a: 1 # y\nb: 2\n", "[\"DEBUG:\",1]\n")
+        );
+
+        let (out, err, code) = run_yq_stdin_with_stderr(
+            ".a = (.b | debug) | .a line_comment = \"y\"",
+            "a: 1\nb: 2\n---\na: 5\nb: 6\n",
+            &["--jq-extensions"],
+        )?;
+        assert_eq!(
+            (code, out.as_str(), err.as_str()),
+            (
+                0,
+                "a: 2 # y\nb: 2\n---\na: 6 # y\nb: 6\n",
+                "[\"DEBUG:\",2]\n[\"DEBUG:\",6]\n"
+            )
+        );
+        Ok(())
+    }
+
     /// #2709: `halt_error` ahead of a metadata write halts once, with its payload printed once and
     /// the exit code the real evaluation chose -- the pass's own re-run is silent.
     #[test]
