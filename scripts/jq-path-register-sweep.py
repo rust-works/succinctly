@@ -60,12 +60,41 @@ where the base is already ACCEPT_WRONG on thousands of rows reads differently
 from "0 FAIL" over a clean base. A benchmark cannot measure a shape it does
 not generate: add the generator pattern here before claiming a shape is safe.
 
-**Size.** The full grid is about 2,952,000 rows (`--list-axes` prints the exact count:
-237 operands, each also swept as a bare pipe stage since #3361, across 37 contexts),
-which takes hours on a loaded machine. Judge a change with
-`--operand` over the operands it touches (83,187 rows for 14 of them took about
-22 minutes at `--jobs 6` on a box at load 100) plus a seeded `--sample`, and run
-the whole grid only when the change reaches every operand.
+**Size.** The full grid is millions of rows; `--list-axes` prints the exact count
+(742 operands, 7 companions, 12 inputs and 37 contexts give 9,540,027 rows as of #4110,
+and each operand is also swept as a bare pipe stage since #3361). The count grows with
+every operand a change to the register adds, so read it from `--list-axes` rather than
+from here.
+
+Measured rate (#4110): about 200 rows/s with one base and the candidate, debug builds,
+`--jobs 18` (the default, one per core) on an 18-core Apple M5 Max at load average ~8.
+The #4110 report saw about 50 rows/s on a box at load 100 and 130 idle. At 200 rows/s the full grid is
+about 13 hours and `--stage-only` over every operand (636,027 rows) about 53 minutes, so
+the full grid is a once-per-contract-change run, not a per-PR one. The progress line
+prints the running rows/s and an ETA; trust the first one after a few thousand rows.
+
+**Recommended gate.** `--stage-only` keeps every context but only the operand as a
+bare pipe stage and negated, dropping its `and`/`or` shapes (about 1/15 of the rows).
+That is enough to iterate on, and not enough to judge a stage-level rule by (see
+`shapes_for`), so:
+
+  1. While iterating: `--stage-only --operand ...` over the operands the change touches
+     (47,000 rows for 55 operands took about 6 minutes on a quiet box), or
+     `--stage-only` alone over every operand (636,027 rows, about 53 minutes).
+  2. To judge the change: `--operand ...` without `--stage-only` over the touched
+     operands (83,187 rows for 14 operands took about 22 minutes at `--jobs 6` on a
+     box at load 100), plus a seeded `--sample N --seed S` over the whole grid
+     (`--sample 6000 --seed 7` is about 30 seconds). Keep the seed in the PR so the same
+     rows can be re-run.
+
+Run the whole grid only when the change reaches every operand.
+
+**Debug builds.** Build the candidate and every base without `--release`. The pinned
+release profile (fat LTO, one codegen unit) takes much longer to build than the sweep
+saves, and each row compares stdout and exit code, which a debug build produces
+identically. The one thing it changes is speed: a debug build is slower, so a
+`TIMEOUT` is re-run serially (see above) and an operand that is slow rather than
+cubic can time out here and not in a release build.
 
 This is a verification tool, not a CI gate. The pinned `*_3456` rows in
 `tests/jq_cli_tests.rs` are what CI enforces (one per round-2 category); run
@@ -73,8 +102,8 @@ this after touching `PathBranch::register`, `Frame::register_loss`, or any
 path-mode producer/consumer of them in `src/jq/eval.rs`.
 
 Usage:
-  cargo build --release --features cli
-  ./scripts/jq-path-register-sweep.py --candidate target/release/succinctly \\
+  cargo build --features cli
+  ./scripts/jq-path-register-sweep.py --candidate target/debug/succinctly \\
       --base main=/path/to/main-build [--base pre3425=/path/to/older-build]
   ./scripts/jq-path-register-sweep.py --candidate ... --sample 2000 --seed 7
   ./scripts/jq-path-register-sweep.py --candidate ... --list-axes
@@ -1471,6 +1500,25 @@ def is_regression(rec, base, cand):
     return False
 
 
+def progress_line(done, total, elapsed):
+    """`  done/total (elapsed s, rate rows/s, ETA)`: the rate is the run's average so far,
+    which is what a full run is planned around (#4110)."""
+    rate = done / elapsed if elapsed > 0 else 0.0
+    left = (total - done) / rate if rate > 0 else 0.0
+    return f"  {done}/{total} ({elapsed:.0f}s, {rate:.0f} rows/s, ETA {format_duration(left)})"
+
+
+def format_duration(seconds):
+    seconds = int(round(seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--candidate", help="build under test")
@@ -1560,7 +1608,7 @@ def main():
                 partial.write(json.dumps(rec) + "\n")
                 partial.flush()
             if i % 2000 == 0:
-                print(f"  {i}/{len(rows)} ({time.time() - started:.0f}s)", file=sys.stderr)
+                print(progress_line(i, len(rows), time.time() - started), file=sys.stderr)
 
     # A timeout under `--jobs` parallelism can be load, not the row. Re-run
     # each such row alone, once, and believe that answer. A run killed at the
