@@ -4385,9 +4385,11 @@ pub trait DocumentElements: Sized + Copy + Clone {
     /// [`uncons_cursor`](Self::uncons_cursor) yields what walking the original
     /// did (#4162). `None` when `self` is exhausted, `id` names no node, or the
     /// format does not support the element index.
+    // patchcov: coverage tolerate reason="the default for a format without the element index; both shipped formats override it"
     fn at_head_id(&self, _id: usize) -> Option<Self> {
-        None // patchcov: coverage tolerate-line reason="the default for a format without the element index; both shipped formats override it"
+        None
     }
+    // patchcov: coverage end
 
     /// Count the number of elements.
     fn len(&self) -> usize {

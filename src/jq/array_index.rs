@@ -1401,5 +1401,109 @@ mod tests {
             assert_eq!(memo::work().0 - builds, 1);
             read(0, WIDE_ELEMENTS + 2);
         }
+
+        /// An exhausted list has no head to look up: an element read of an
+        /// empty array, while another array is registered, walks.
+        #[test]
+        fn an_empty_array_read_walks_while_another_is_registered_4162() {
+            let doc = format!("[{},[]]", wide_array(WIDE_ELEMENTS + 3));
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            let _scope = memo::enter(root.document_token());
+            let outer = root.value().as_array().expect("an array document");
+            let arrays: Vec<_> = outer
+                .collect_values()
+                .iter()
+                .map(|v| v.as_array().expect("an inner array"))
+                .collect();
+            assert!(get_cursor_memoized(&arrays[0], WIDE_ELEMENTS + 1).is_some());
+            let (before, work) = (recorded(), memo::work());
+            for _ in 0..3 {
+                assert!(get_cursor_memoized(&arrays[1], WIDE_ELEMENTS + 1).is_none());
+            }
+            assert_eq!((recorded(), memo::work()), (before, work));
+        }
+
+        /// A list of another document than the open scope's walks, records
+        /// nothing, and leaves the scope's own entries answering.
+        #[test]
+        fn a_read_of_another_document_walks_and_records_nothing_4162() {
+            let doc = wide_array(WIDE_ELEMENTS + 3);
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            let other = JsonIndex::build(doc.as_bytes());
+            let other_root = other.root(doc.as_bytes());
+            assert_ne!(root.document_token(), other_root.document_token());
+            let _scope = memo::enter(root.document_token());
+            let elements = root.value().as_array().expect("an array document");
+            let foreign = other_root.value().as_array().expect("an array document");
+            let k = WIDE_ELEMENTS + 1;
+            assert!(get_cursor_memoized(&elements, k).is_some());
+            let (before, work) = (recorded(), memo::work());
+            for _ in 0..3 {
+                assert_eq!(
+                    shown(get_cursor_memoized(&foreign, k)),
+                    shown(foreign.get_cursor(k))
+                );
+            }
+            assert_eq!((recorded(), memo::work()), (before, work));
+            // The scope's array still counts its reads: two more start a prefix.
+            for _ in 0..2 {
+                assert!(get_cursor_memoized(&elements, k).is_some());
+            }
+            assert_eq!(recorded() - before, k + 1);
+        }
+
+        /// With no scope open there is nowhere to register: wide reads walk
+        /// every time and never record.
+        #[test]
+        fn wide_reads_outside_a_scope_walk_and_record_nothing_4162() {
+            let doc = wide_array(WIDE_ELEMENTS + 3);
+            with_root_array(&doc, |elements| {
+                let k = WIDE_ELEMENTS + 1;
+                let (before, work) = (recorded(), memo::work());
+                for _ in 0..4 {
+                    assert_eq!(
+                        shown(get_cursor_memoized(elements, k)),
+                        shown(elements.get_cursor(k))
+                    );
+                }
+                assert_eq!((recorded(), memo::work()), (before, work));
+            });
+        }
+
+        /// An array whose entry was dropped for a newer one keeps its filter
+        /// bit: its next wide read probes, finds no entry, and registers it
+        /// afresh, so two more reads start its prefix.
+        #[test]
+        fn an_evicted_array_registers_again_on_its_next_wide_read_4162() {
+            let inner = wide_array(WIDE_ELEMENTS + 3);
+            let doc = format!("[{}]", vec![inner; 17].join(","));
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            let _scope = memo::enter(root.document_token());
+            let outer = root.value().as_array().expect("an array document");
+            let arrays: Vec<_> = outer
+                .collect_values()
+                .iter()
+                .map(|v| v.as_array().expect("an inner array"))
+                .collect();
+            let k = WIDE_ELEMENTS + 1;
+            for array in &arrays {
+                assert!(get_cursor_memoized(array, k).is_some());
+            }
+            let before = recorded();
+            // Two reads of the evicted first array: a fresh entry would have
+            // started its prefix on the second.
+            for _ in 0..2 {
+                assert_eq!(
+                    shown(get_cursor_memoized(&arrays[0], k)),
+                    shown(arrays[0].get_cursor(k))
+                );
+            }
+            assert_eq!(recorded(), before, "re-registered, not resumed");
+            assert!(get_cursor_memoized(&arrays[0], k).is_some());
+            assert_eq!(recorded() - before, k + 1, "the third read records");
+        }
     }
 }
