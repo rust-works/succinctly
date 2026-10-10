@@ -123819,10 +123819,10 @@ mod tests {
             assert!(settle::<YqSemantics, _>(body, None, &scalar).is_none());
             assert!(settle::<JqSemantics, _>(body, Some(&handler), &scalar).is_none());
             // What `?` never swallows still escapes as the failure `.[]` raises.
-            match settle::<JqSemantics, _>(body, None, &undecodable) {
-                Some(Err(e)) => assert!(e.is_decode_failure()),
-                other => panic!("expected a decode failure, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #4157 pin, only reached when the pin is already failing"
-            }
+            let failure = settle::<JqSemantics, _>(body, None, &undecodable)
+                .expect("the shortcut settles an undecodable scalar")
+                .expect_err("an undecodable scalar is not swallowed");
+            assert!(failure.is_decode_failure());
         }
         for source in [
             "path(.a)",
