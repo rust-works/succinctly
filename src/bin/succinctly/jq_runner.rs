@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 
 use succinctly::dsv::{build_index as build_dsv_index, DsvConfig, DsvRows};
 use succinctly::jq::document::{
-    effective_keys, key_hash, key_span_fingerprint, DistinctKeyCursors, DocumentCursor,
-    DocumentValue, IndentSpec, JsonConvention, PAIRWISE_SPAN_SCAN_LIMIT,
+    any_hash_repeats, effective_keys, key_hash, key_span_fingerprint, DistinctKeyCursors,
+    DocumentCursor, DocumentValue, IndentSpec, JsonConvention, PAIRWISE_SPAN_SCAN_LIMIT,
 };
 use succinctly::jq::eval_generic::{
     check_nesting_depth, eval_with_cursor, nesting_depth_panic_message,
@@ -2746,8 +2746,11 @@ impl<'a, W: Clone + AsRef<[u64]>> Frame<'a, W> {
 ///
 /// Small objects -- nearly every object in a real document -- take the
 /// pairwise branch, which allocates nothing. Above the threshold the
-/// pairwise loop is quadratic, so the wide case sorts one 64-bit hash per
-/// key and looks for an adjacent pair.
+/// pairwise loop is quadratic, so the wide case takes one 64-bit hash per
+/// key and asks [`any_hash_repeats`] (#4169), which sorts them and looks for
+/// an adjacent pair -- within its prefilter's gate (128 to 2^21 keys) only
+/// the hashes its bitset could not clear, so the 17-127-key objects between
+/// this pairwise branch and that gate still sort every hash.
 ///
 /// It sorts *hashes*, not the spans it used to (#1514). Sorting `&[u8]`
 /// meant every comparison chased a pointer into a random offset of the
@@ -2775,9 +2778,7 @@ fn spans_repeat(prepared: &[PreparedField<'_>]) -> bool {
                 .any(|j| marks[i] == marks[j] && prepared[i].raw == prepared[j].raw)
         });
     }
-    let mut hashes: Vec<u64> = prepared.iter().map(|field| key_hash(field.raw)).collect();
-    hashes.sort_unstable();
-    hashes.windows(2).any(|pair| pair[0] == pair[1])
+    any_hash_repeats(prepared.iter().map(|field| key_hash(field.raw)).collect())
 }
 
 /// jq's duplicate-key rule over an object's already-walked fields (#1385):

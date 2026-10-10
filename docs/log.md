@@ -2,6 +2,21 @@
 
 Tracks updates to the knowledge wiki pages in `docs/`.
 
+## 2026-10-11 — The #3343 prefilter at the other batch sort sites (issue #4169)
+
+**Sources ingested:**
+- `any_hash_repeats`, `prefilter_candidates`, `keys_repeat` and `object_keys_repeat` in
+  `src/jq/document.rs`; `spans_repeat` in `src/bin/succinctly/jq_runner.rs`
+- Interleaved wall-clock A/B with a control and a holdout on terminus (7950X) and johns-mac-mini
+  (M4 Pro) over `wide` 2-100 MB, a 1.0-2.0 M-key `keys_unsorted` sweep and arrays of equal
+  objects; cachegrind `Ir`; `time -l` instructions retired; peak RSS
+
+**Pages updated:**
+- [parsing/json.md](parsing/json.md) — new "The other batch sites (#4169)" subsection of "Key
+  Census of a Wide Object (#3343)": which queries reach each site, the shipped results, and why
+  `object_keys_repeat` keeps its sort
+- [optimizations/README.md](optimizations/README.md) — one row in Notable Failures
+
 ## 2026-10-10 — Canonical-echo wide-object key check: table-vs-sort crossover located, table stays (issue #4158)
 
 **Sources ingested:**

@@ -5681,6 +5681,66 @@ fn test_duplicate_keys_collapse_past_the_probe_ceiling_1588() -> Result<()> {
     Ok(())
 }
 
+/// #4169: the two batch duplicate checks that ask `any_hash_repeats` --
+/// `keys_repeat` (materialized fields: `to_entries`, `.[]`, `map_values`,
+/// `with_entries`, `paths`) and the printer's `spans_repeat` (`[.]`,
+/// `{a: .}`) -- still find a repeated key once the object is wide enough for
+/// the bitset prefilter (128 hashes and up), and still find none in a clean
+/// one. 200 distinct keys plus `k005` again as the last field: jq keeps the
+/// first position with the last value.
+///
+/// Every expectation below is jq 1.7.1's own output on the same input.
+#[test]
+fn test_duplicate_key_collapses_through_the_prefiltered_batch_checks_4169() -> Result<()> {
+    let fields: Vec<String> = (0..200).map(|i| format!("\"k{i:03}\":{i}")).collect();
+    let clean = format!("{{{}}}", fields.join(","));
+    let repeated = format!("{{{},\"k005\":999}}", fields.join(","));
+
+    for (filter, want_repeated, want_clean) in [
+        (
+            "to_entries | [length, .[5].value, .[199].key]",
+            r#"[200,999,"k199"]"#,
+            r#"[200,5,"k199"]"#,
+        ),
+        (
+            "[.[]] | [length, .[5], .[199]]",
+            "[200,999,199]",
+            "[200,5,199]",
+        ),
+        ("map_values(.) | [length, .k005]", "[200,999]", "[200,5]"),
+        ("with_entries(.) | [length, .k005]", "[200,999]", "[200,5]"),
+        ("[paths] | length", "200", "200"),
+    ] {
+        let (out, _, code) = run_jq_full(&["-c", filter], Some(&repeated))?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(out.trim(), want_repeated, "{filter} on the repeated key");
+        let (out, _, code) = run_jq_full(&["-c", filter], Some(&clean))?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(out.trim(), want_clean, "{filter} on the clean object");
+    }
+
+    // The printer's materialized object arm: the collapsed object prints in
+    // full, `k005` in its first position holding its last value.
+    let collapsed = clean.replacen("\"k005\":5", "\"k005\":999", 1);
+    for (filter, want_repeated, want_clean) in [
+        ("[.]", format!("[{collapsed}]"), format!("[{clean}]")),
+        (
+            "{a: .}",
+            format!("{{\"a\":{collapsed}}}"),
+            format!("{{\"a\":{clean}}}"),
+        ),
+    ] {
+        let (out, _, code) = run_jq_full(&["-c", filter], Some(&repeated))?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(out.trim(), want_repeated, "{filter} on the repeated key");
+        let (out, _, code) = run_jq_full(&["-c", filter], Some(&clean))?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(out.trim(), want_clean, "{filter} on the clean object");
+    }
+
+    Ok(())
+}
+
 /// #1385 review: collapsing must be linear in the field count. Picking each
 /// surviving key by scanning the keys accepted so far made a single
 /// duplicate in a 100K-field object take 8.5 s where not collapsing at all
