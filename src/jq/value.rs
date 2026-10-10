@@ -4505,6 +4505,11 @@ pub struct ReindexedDoc {
     /// Whether [`bridge_provenance`] holds this document's source, so
     /// dropping the document must unregister it.
     registered: bool,
+    /// Whether `index` came from
+    /// [`JsonIndex::build_reindex_scalar_from`](crate::json::JsonIndex::build_reindex_scalar_from),
+    /// so dropping the document may hand its buffers to [`scalar_index_pool`]
+    /// (#4217).
+    scalar_root: bool,
     /// The string this document was written from, when its root is one
     /// (#3479). A string survives the round trip unchanged, so a bridge that
     /// needs the root as an `OwnedValue` can take this instead of unescaping
@@ -4527,7 +4532,7 @@ impl ReindexedDoc {
             "a scalar root's bridge text is one token at offset 0, got {text:?}"
         );
         let index = if scalar_root {
-            crate::json::JsonIndex::build_reindex_scalar(text.len())
+            crate::json::JsonIndex::build_reindex_scalar_from(text.len(), scalar_index_pool::take())
         } else {
             crate::json::JsonIndex::build_reindex(text.as_bytes())
         };
@@ -4545,6 +4550,7 @@ impl ReindexedDoc {
             text,
             index,
             registered,
+            scalar_root,
             root_string: None,
         }
     }
@@ -4571,7 +4577,83 @@ impl Drop for ReindexedDoc {
         if self.registered {
             bridge_provenance::unregister(self.text.as_ptr() as usize);
         }
+        if self.scalar_root {
+            scalar_index_pool::give(self.index.take_scalar_parts());
+        }
     }
+}
+
+/// The buffers of dropped scalar bridge indexes, kept for the next one
+/// (#4217).
+///
+/// A scalar crossing used to allocate its text and three index buffers (the
+/// interest bits, their rank and the leaf's parentheses word) and free all
+/// four a moment later, once per scalar a query bridges (`del(.)`,
+/// `paths(.)`, ... over a million members). The buffers' contents are
+/// rewritten for every document, so a retired document hands them on and a
+/// crossing in steady state allocates only its text.
+///
+/// **Not a shared index.** Each live document still owns its own
+/// [`JsonIndex`](crate::json::JsonIndex), so
+/// [`DocumentCursor::document_token`](super::document::DocumentCursor::document_token),
+/// which is derived from the index's address and keys the root witness, the
+/// embed table and the slot memo, tells two live scalar documents apart. One
+/// prebuilt index shared by every token of the same length would give `5` and
+/// `6` the same token.
+///
+/// Bounded in count and in buffer size, so a burst of documents (or one with
+/// a long string root) does not pin memory. `std` only: without a
+/// thread-local every document builds fresh, as before.
+#[cfg(feature = "std")]
+mod scalar_index_pool {
+    use crate::json::light::ScalarIndexParts;
+    use alloc::vec::Vec;
+    use std::cell::RefCell;
+
+    /// Most buffer sets kept per thread.
+    pub(super) const KEPT: usize = 8;
+
+    thread_local! {
+        static FREE: RefCell<Vec<ScalarIndexParts>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn take() -> ScalarIndexParts {
+        FREE.try_with(|free| free.borrow_mut().pop())
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    }
+
+    /// Buffer sets currently kept on this thread (tests).
+    #[cfg(test)]
+    pub(super) fn len() -> usize {
+        FREE.with(|free| free.borrow().len())
+    }
+
+    pub(super) fn give(parts: ScalarIndexParts) {
+        if !parts.is_small() {
+            return;
+        }
+        // `try_with`: a document dropped while the thread's locals are being
+        // destroyed just frees its buffers.
+        let _ = FREE.try_with(|free| {
+            let mut free = free.borrow_mut();
+            if free.len() < KEPT {
+                free.push(parts);
+            }
+        });
+    }
+}
+
+#[cfg(not(feature = "std"))]
+mod scalar_index_pool {
+    use crate::json::light::ScalarIndexParts;
+
+    pub(super) fn take() -> ScalarIndexParts {
+        ScalarIndexParts::default()
+    }
+
+    pub(super) fn give(_parts: ScalarIndexParts) {}
 }
 
 /// The source value behind each live [`ReindexedDoc`], so that reading a
@@ -9887,6 +9969,83 @@ mod tests {
         let doc = array.reindexed::<JqSemantics>().unwrap();
         assert!(doc.root().first_child().is_some());
         assert_eq!(doc.index.bp().len(), 4);
+    }
+
+    /// #4217: a scalar document's index buffers are recycled into the next
+    /// one. Whatever the dropped document left in them -- a longer interest
+    /// bitmap, a larger rank directory, stale bits -- must not reach the
+    /// next, whichever way the lengths run, and two documents alive at once
+    /// must still be told apart by `document_token` (which a shared index
+    /// would collapse: it is derived from the index's address).
+    #[cfg(feature = "std")]
+    #[test]
+    fn recycled_scalar_index_buffers_leave_no_trace_and_identity_is_kept_4217() {
+        use crate::jq::document::DocumentCursor;
+        let long = OwnedValue::String("x".repeat(1000).into());
+        let short = OwnedValue::Int(7);
+        let mid = OwnedValue::String("y".repeat(100).into());
+        // Long, short and mid in every order, each pair twice: the first
+        // document of a pair leaves its buffers behind and the second, of a
+        // different length, must read as if built fresh.
+        for (first, second) in [
+            (&long, &short),
+            (&short, &long),
+            (&mid, &short),
+            (&short, &mid),
+            (&long, &mid),
+            (&mid, &long),
+        ] {
+            drop(first.reindexed::<JqSemantics>().unwrap());
+            let doc = second.reindexed::<JqSemantics>().unwrap();
+            let fresh = crate::json::JsonIndex::build_reindex(doc.text().as_bytes());
+            assert_eq!(doc.index.ib(), fresh.ib(), "IB after {first:?}");
+            assert_eq!(doc.index.ib_len(), fresh.ib_len());
+            for p in 0..=doc.index.ib_len() + 1 {
+                assert_eq!(doc.index.ib_rank1(p), fresh.ib_rank1(p), "ib_rank1({p})");
+            }
+            assert_eq!(doc.index.bp().words(), fresh.bp().words());
+            assert_eq!(doc.index.bp().len(), fresh.bp().len());
+        }
+
+        // Two live documents: distinct tokens, and a recycled one does not
+        // take over a live neighbour's.
+        let (a, b) = (
+            OwnedValue::Int(5).reindexed::<JqSemantics>().unwrap(),
+            OwnedValue::Int(6).reindexed::<JqSemantics>().unwrap(),
+        );
+        assert_ne!(a.root().document_token(), b.root().document_token());
+        let (ta, tb) = (a.root().document_token(), b.root().document_token());
+        drop(b);
+        let c = OwnedValue::Int(8).reindexed::<JqSemantics>().unwrap();
+        assert_eq!(a.root().document_token(), ta);
+        assert_ne!(c.root().document_token(), ta);
+        assert_eq!(a.text(), "5");
+        assert_eq!(c.text(), "8");
+        let _ = tb;
+    }
+
+    /// #4217: the free list is bounded, so a burst of live scalar documents
+    /// does not leave their buffers pinned afterwards, and a document with a
+    /// long token is not kept at all.
+    #[cfg(feature = "std")]
+    #[test]
+    fn scalar_index_pool_is_bounded_4217() {
+        let live: Vec<ReindexedDoc> = (0..64)
+            .map(|i| OwnedValue::Int(i).reindexed::<JqSemantics>().unwrap())
+            .collect();
+        drop(live);
+        let before = scalar_index_pool::len();
+        assert!(before <= scalar_index_pool::KEPT);
+        assert!(before > 0, "the burst's buffers were kept");
+        // 100 KB of token: its interest bitmap is 1,600 words, past `is_small`.
+        drop(
+            OwnedValue::String("z".repeat(100_000).into())
+                .reindexed::<JqSemantics>()
+                .unwrap(),
+        );
+        // The document took one set from the list (and grew it past keeping);
+        // it gave nothing back.
+        assert_eq!(scalar_index_pool::len(), before - 1, "a big index is kept");
     }
 
     /// #4219: `ReindexedDoc::new` takes `scalar_root` from the value's variant,

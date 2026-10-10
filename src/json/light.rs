@@ -156,14 +156,44 @@ impl SeqHint {
 /// would double a hot per-word array (~6.25% of input) for inputs the index
 /// cannot represent anyway.
 fn build_ib_rank(words: &[u64]) -> Vec<u32> {
-    let mut rank = Vec::with_capacity(words.len() + 1);
+    let mut rank = Vec::new();
+    fill_ib_rank(&mut rank, words);
+    rank
+}
+
+/// [`build_ib_rank`] into `rank`'s existing buffer, which is cleared first.
+#[inline]
+fn fill_ib_rank(rank: &mut Vec<u32>, words: &[u64]) {
+    rank.clear();
+    rank.reserve(words.len() + 1);
     let mut cumulative: u32 = 0;
     rank.push(0); // rank[0] = 0 (no words before word 0)
     for &word in words {
         cumulative += word.count_ones();
         rank.push(cumulative);
     }
-    rank
+}
+
+/// The three heap buffers of a scalar bridge index (#4217): interest bits,
+/// their rank, and the leaf's balanced-parentheses word. Their contents are
+/// scratch -- [`JsonIndex::build_reindex_scalar_from`] overwrites all of
+/// them -- so a retired index's buffers can build the next one without
+/// touching the allocator.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct ScalarIndexParts {
+    ib: Vec<u64>,
+    ib_rank: Vec<u32>,
+    bp_words: Vec<u64>,
+}
+
+impl ScalarIndexParts {
+    /// Whether keeping these buffers around is cheap: no larger than the
+    /// index of a 1 KiB token, so a free list of them never pins a big one.
+    #[must_use]
+    pub fn is_small(&self) -> bool {
+        self.ib.capacity() <= 16 && self.ib_rank.capacity() <= 17 && self.bp_words.capacity() <= 4
+    }
 }
 
 impl JsonIndex<Vec<u64>> {
@@ -246,23 +276,57 @@ impl JsonIndex<Vec<u64>> {
     /// `OwnedValue::reindexed`, which only calls it for a scalar root.
     #[doc(hidden)]
     pub fn build_reindex_scalar(len: usize) -> Self {
+        Self::build_reindex_scalar_from(len, ScalarIndexParts::default())
+    }
+
+    /// [`build_reindex_scalar`](Self::build_reindex_scalar) written into
+    /// `parts`' buffers (#4217), which are cleared and refilled -- their old
+    /// contents never reach the result. With buffers from
+    /// [`take_scalar_parts`](Self::take_scalar_parts) this makes no
+    /// allocator call once they are large enough, which a token of 64 bytes
+    /// or fewer always is after the first.
+    ///
+    /// Same contract as `build_reindex_scalar` for `len`.
+    #[doc(hidden)]
+    pub fn build_reindex_scalar_from(len: usize, parts: ScalarIndexParts) -> Self {
         assert!(
             u32::try_from(len).is_ok(),
             "JsonIndex supports inputs up to u32::MAX (4294967295) bytes; got {len} bytes (#188)"
         );
-        let mut ib = alloc::vec![0u64; len.div_ceil(64)];
+        let ScalarIndexParts {
+            mut ib,
+            mut ib_rank,
+            bp_words,
+        } = parts;
+        ib.clear();
+        ib.resize(len.div_ceil(64), 0);
         if let Some(first) = ib.first_mut() {
             *first = 1;
         }
-        let ib_rank = build_ib_rank(&ib);
+        fill_ib_rank(&mut ib_rank, &ib);
         Self {
             ib,
             ib_len: len,
             ib_rank,
-            bp: BalancedParens::leaf(),
+            bp: BalancedParens::leaf_in(bp_words),
             lines: OnceCell::new(),
             seq_hint: Cell::new(SeqHint::NONE),
             bridge_tokens: true,
+        }
+    }
+
+    /// Take this index's buffers for the next
+    /// [`build_reindex_scalar_from`](Self::build_reindex_scalar_from),
+    /// leaving `self` empty (#4217). Only for an index that call (or
+    /// `build_reindex_scalar`) built: it is the retired scalar document's
+    /// last act, and `self` must be dropped afterwards, never read.
+    #[doc(hidden)]
+    pub fn take_scalar_parts(&mut self) -> ScalarIndexParts {
+        self.ib_len = 0;
+        ScalarIndexParts {
+            ib: core::mem::take(&mut self.ib),
+            ib_rank: core::mem::take(&mut self.ib_rank),
+            bp_words: self.bp.take_words(),
         }
     }
 }
@@ -10333,6 +10397,49 @@ mod tests {
         assert_eq!(
             key(br#"{"":1}"#).key_raw_unescaped_with_end(),
             Some((&b""[..], 3))
+        );
+    }
+
+    /// #4217: `build_reindex_scalar_from` overwrites the buffers it is given.
+    /// Parts full of stale bits, longer and shorter than the index being
+    /// built, must give the index `build_reindex_scalar` makes -- interest
+    /// bits, rank at every position, parentheses -- and `take_scalar_parts`
+    /// must return the same buffers (not copies) for the next build.
+    #[test]
+    fn scalar_index_built_from_dirty_parts_matches_a_fresh_one_4217() {
+        for len in [1usize, 2, 63, 64, 65, 128, 129, 1000] {
+            for stale_words in [0usize, 1, 3, 40] {
+                let dirty = ScalarIndexParts {
+                    ib: alloc::vec![u64::MAX; stale_words],
+                    ib_rank: alloc::vec![u32::MAX; stale_words + 5],
+                    bp_words: alloc::vec![u64::MAX; stale_words],
+                };
+                let reused = JsonIndex::build_reindex_scalar_from(len, dirty);
+                let fresh = JsonIndex::build_reindex_scalar(len);
+                assert_eq!(
+                    reused.ib(),
+                    fresh.ib(),
+                    "IB, len {len}, stale {stale_words}"
+                );
+                assert_eq!(reused.ib_len(), fresh.ib_len());
+                for p in 0..=len + 64 {
+                    assert_eq!(reused.ib_rank1(p), fresh.ib_rank1(p), "ib_rank1({p})");
+                }
+                assert_eq!(reused.bp().words(), fresh.bp().words());
+                assert_eq!(reused.bp().len(), fresh.bp().len());
+                assert!(format!("{reused:?}").contains("bridge_tokens: true"));
+            }
+        }
+
+        let mut index = JsonIndex::build_reindex_scalar(200);
+        let (ib_ptr, rank_ptr) = (index.ib().as_ptr(), index.ib_rank.as_ptr());
+        let parts = index.take_scalar_parts();
+        let again = JsonIndex::build_reindex_scalar_from(150, parts);
+        assert_eq!(again.ib().as_ptr(), ib_ptr, "the IB buffer is reused");
+        assert_eq!(
+            again.ib_rank.as_ptr(),
+            rank_ptr,
+            "the rank buffer is reused"
         );
     }
 }
