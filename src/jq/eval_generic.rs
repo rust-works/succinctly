@@ -51703,10 +51703,10 @@ mod tests {
             assert!(control.is_none(), "{filter}: {control:?}");
             assert_eq!(out, [OwnedValue::Int(n as i64)], "{filter}");
             let scanned = slot_memo::work().0 - scanned_before;
+            let quadratic = 3 * n * n / 8;
             assert!(
                 scanned < 6 * n,
-                "{filter}: visited {scanned} elements over {n}; quadratic would be ~{}",
-                3 * n * n / 8
+                "{filter}: visited {scanned} elements over {n}; quadratic would be ~{quadratic}"
             );
             assert_eq!(
                 slot_memo::missed() - missed_before,
@@ -51741,10 +51741,7 @@ mod tests {
             elements.push(c);
         }
         assert_eq!(elements.len(), n);
-        let slot_of = |c: &crate::json::light::JsonCursor<'_, Vec<u64>>| match cursor_slot(c) {
-            Ok(Some(CursorSlot::Element(i))) => i,
-            other => panic!("not an element slot: {:?}", other.map(|_| ())), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #4164 pin, only reached when the pin is already failing"
-        };
+        let is_slot = |c: &crate::json::light::JsonCursor<'_, Vec<u64>>, at: i64| matches!(cursor_slot(c), Ok(Some(CursorSlot::Element(i))) if i == at);
         let mut state = 0x2545_f491_4f6c_dd1du64;
         let mut random = move || {
             state ^= state << 13;
@@ -51768,7 +51765,7 @@ mod tests {
         for order in orders {
             let _scope = slot_memo::enter(root.document_token());
             for i in order {
-                assert_eq!(slot_of(&elements[i]), i as i64, "element {i}");
+                assert!(is_slot(&elements[i], i as i64), "element {i}");
                 let (path, ancestors, _) = cursor_path_and_ancestors(&elements[i]).unwrap();
                 assert_eq!(path, vec![OwnedValue::Int(i as i64)], "path of {i}");
                 assert!(ancestors[0].same_node(&root), "parent of {i}");
@@ -51890,10 +51887,10 @@ mod tests {
             // cell: each row's first 32 elements are read from its start). Were
             // the outer array's scan evicted by each row's inner scans, its slot
             // alone would add ~rows^3 / 4 visits.
+            let cells = rows * rows;
             assert!(
-                scanned < 12 * rows * rows,
-                "{filter}: visited {scanned} elements over {} cells",
-                rows * rows
+                scanned < 12 * cells,
+                "{filter}: visited {scanned} elements over {cells} cells"
             );
         }
     }
@@ -51916,6 +51913,8 @@ mod tests {
             lasts
         };
         let _scope = slot_memo::enter(1);
+        // A document with no open scope has nothing to touch.
+        slot_memo::touch(2, 7, 900);
         slot_memo::remember(1, 7, 100, 40, Some(101), false, None);
         slot_memo::remember(1, 7, 900, 800, Some(901), false, None);
         // Looking up 900 leaves 100 the parent's least recently used ...
