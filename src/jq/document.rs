@@ -3081,13 +3081,20 @@ impl KeyCensus {
     }
 }
 
-/// Fewest hashes [`repeated_hashes`] runs the bitset prefilter on; below this
-/// the plain sort is already cheap and the two bitsets are not worth
-/// allocating. Measured on `map(length)` over many equal objects: 8 keys per
-/// object is 1-2% slower with the prefilter, 32 is a wash, 128 is 2% faster.
+/// Fewest hashes the bitset prefilter ([`prefilter_candidates`]) runs on;
+/// below this the plain sort is already cheap and the two bitsets are not
+/// worth allocating. Measured for [`repeated_hashes`] on `map(length)` over
+/// many equal objects: 8 keys per object is 1-2% slower with the prefilter,
+/// 32 is a wash, 128 is 2% faster (#3343).
+///
+/// This and [`PREFILTER_MAX`] also gate [`any_hash_repeats`], behind
+/// `to_entries`-style materializing walks and the printer (#4169). Those were
+/// checked against these bounds, not tuned on their own: at 32 to 512 keys
+/// per object they measured within the layout band either way, so retuning
+/// on `length` alone moves them too.
 const PREFILTER_MIN: usize = 128;
 
-/// Most hashes [`repeated_hashes`] runs the bitset prefilter on. Above this
+/// Most hashes the bitset prefilter runs on, for both of its callers. Above this
 /// the bitsets (two of `8 * n` bits, rounded up to a power of two) outgrow the
 /// cache the prefilter relies on and the sort streams better.
 const PREFILTER_MAX: usize = 1 << 21;
@@ -3315,8 +3322,9 @@ fn census<F: DocumentFields>(fields: &F) -> KeyCensus {
 ///
 /// The slice counterpart of [`census`], for callers that have had to
 /// materialize the fields anyway: one hash per key, answered by
-/// [`any_hash_repeats`] (#4169), which sorts only the hashes the bitset
-/// prefilter could not clear.
+/// [`any_hash_repeats`] (#4169), which within the prefilter's gate (128 to
+/// 2^21 hashes) sorts only the hashes its bitset could not clear, and sorts
+/// them all otherwise.
 ///
 /// Deliberately conservative, as [`KeyHashes::insert`] is: two distinct
 /// keys sharing a 64-bit hash answer `true` here. The only caller,

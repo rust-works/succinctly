@@ -2747,8 +2747,10 @@ impl<'a, W: Clone + AsRef<[u64]>> Frame<'a, W> {
 /// Small objects -- nearly every object in a real document -- take the
 /// pairwise branch, which allocates nothing. Above the threshold the
 /// pairwise loop is quadratic, so the wide case takes one 64-bit hash per
-/// key and asks [`any_hash_repeats`], which sorts only the hashes its bitset
-/// prefilter could not clear (#4169) and looks for an adjacent pair.
+/// key and asks [`any_hash_repeats`] (#4169), which sorts them and looks for
+/// an adjacent pair -- within its prefilter's gate (128 to 2^21 keys) only
+/// the hashes its bitset could not clear, so the 17-127-key objects between
+/// this pairwise branch and that gate still sort every hash.
 ///
 /// It sorts *hashes*, not the spans it used to (#1514). Sorting `&[u8]`
 /// meant every comparison chased a pointer into a random offset of the
