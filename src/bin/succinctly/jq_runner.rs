@@ -4669,7 +4669,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
             // value and reads nothing after it, this file or any later one
             // (#4313), so the files that follow are not run either.
             if let Some(offset) = split_error {
-                let at = InputLocation::at(filename.as_deref(), line_at(raw, offset));
+                let at = InputLocation::at(filename.as_deref(), parse_error_line(raw, offset));
                 sink.report(DiagStyle::Jq, &EvalError::new("Invalid JSON text"), &at);
                 break;
             }
@@ -6014,7 +6014,7 @@ impl InputLocations {
         if ends.len() == values {
             let mut line_counter = LineCounter::new(raw.as_bytes());
             for &end in ends {
-                self.push(src, line_counter.advance_to(end));
+                self.push(src, line_counter.read_end_line(end));
             }
         } else {
             let line = content_lines(raw);
@@ -6312,6 +6312,15 @@ struct LineCounter<'a> {
     bytes: &'a [u8],
     pos: usize,
     newlines_before_pos: usize,
+    /// Where the line holding `pos` starts: one past the last newline before
+    /// `pos`, for [`read_end_line`](Self::read_end_line).
+    line_start: usize,
+    /// The first newline at or after some earlier position no later than
+    /// `pos` (`bytes.len()` once none is left), or `None` before the first
+    /// search: [`read_end_line`](Self::read_end_line) asks for the next
+    /// newline after each value, and a line holding many values would
+    /// otherwise be rescanned for each (#4308).
+    next_newline: Option<usize>,
 }
 
 impl<'a> LineCounter<'a> {
@@ -6320,7 +6329,59 @@ impl<'a> LineCounter<'a> {
             bytes,
             pos: 0,
             newlines_before_pos: 0,
+            line_start: 0,
+            next_newline: None,
         }
+    }
+
+    /// jq's line for the value whose exclusive end offset is `end` (#4308):
+    /// the number of newlines its reads have consumed once the value is
+    /// complete, which is every newline up to the end of the read that
+    /// completes it.
+    ///
+    /// jq reads its input with `fgets` into a 4096-byte buffer, so a read runs
+    /// through the next newline or [`JQ_READ_CHUNK`] bytes, counted from the
+    /// start of the line. A string or container completes on its closing
+    /// byte; a number or literal on the byte after it, or at the end. So
+    /// `1 2\n` puts both values on line 1, where the newline-after-`end` rule
+    /// of [`advance_to`](Self::advance_to) put `1` on line 0. Oracle-verified
+    /// against jq 1.7.1: `1 2\n3\n` is 1, 1, 2; `"a" "b"\n\n"c"\n` is 1, 1,
+    /// 3; `[1,\n2] 3\n4` is 2, 2, 2.
+    ///
+    /// Non-decreasing `end`s, as for `advance_to`; each byte is scanned a
+    /// bounded number of times across the whole sequence.
+    fn read_end_line(&mut self, end: usize) -> usize {
+        let end = end.min(self.bytes.len());
+        let completes_at = match end.checked_sub(1).map(|last| self.bytes[last]) {
+            Some(b'"' | b']' | b'}') => end - 1,
+            _ => end,
+        };
+        self.line_at_read_of(completes_at)
+    }
+
+    /// [`read_end_line`](Self::read_end_line) for the byte at `completes_at`
+    /// itself (the end of input when it is `bytes.len()`): the newlines up to
+    /// the end of the read holding it.
+    fn line_at_read_of(&mut self, completes_at: usize) -> usize {
+        let completes_at = completes_at.min(self.bytes.len()).max(self.pos);
+        let counted = &self.bytes[self.pos..completes_at];
+        if let Some(last) = counted.iter().rposition(|&b| b == b'\n') {
+            self.line_start = self.pos + last + 1;
+        }
+        self.newlines_before_pos += count_newlines(counted);
+        self.pos = completes_at;
+        let next = match self.next_newline {
+            Some(at) if at >= completes_at => at,
+            _ => self.bytes[completes_at..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(self.bytes.len(), |offset| completes_at + offset),
+        };
+        self.next_newline = Some(next);
+        let same_read = next < self.bytes.len()
+            && (next - self.line_start) / JQ_READ_CHUNK
+                == (completes_at - self.line_start) / JQ_READ_CHUNK;
+        self.newlines_before_pos + usize::from(same_read)
     }
 
     /// Same result [`line_at`] would return for this `end`, given every
@@ -6406,7 +6467,7 @@ impl<'a> ValueLocator<'a> {
     fn at(&self, end: usize) -> InputLocation {
         let line = match self.slurp_eof {
             Some(eof_line) => eof_line,
-            None => self.counter.borrow_mut().advance_to(end),
+            None => self.counter.borrow_mut().read_end_line(end),
         };
         InputLocation::at(self.filename, line)
     }
@@ -6440,7 +6501,10 @@ impl<'l, 'a> LazyLocation<'l, 'a> {
 }
 
 /// jq's line number for the value whose exclusive end offset is `end` within
-/// `bytes`.
+/// `bytes`, by the newline-after-`end` rule: right for a value its line ends
+/// on and for the end of input. A JSON document's values use
+/// [`LineCounter::read_end_line`] instead, which also places a value that
+/// completes mid-line (#4308).
 ///
 /// jq's `(at <file>:<line>)` marker names the line on which the input value
 /// *ends*, so callers pass the exclusive end offset from [`find_json_values`].
@@ -6463,21 +6527,75 @@ fn line_at(bytes: &[u8], end: usize) -> usize {
 }
 
 /// jq's `(at <file>:<line>)` line once its parser has stopped on a malformed
-/// value starting at `start` (#2961): every newline up to and including the
-/// one ending that value's line, since jq's lexer reads to the next delimiter
-/// before it raises. On a document with one value per line that is exact --
-/// `1\n2 }\n\n\n` reports line 2, `1\n2\n}\n3\n` line 3. A malformed value
-/// spanning several lines, or cut off at end of input, is where it is not:
-/// jq names wherever its parser gave up inside it, or `<unknown>` at EOF, and
-/// this names the end of its first line instead. Recorded in
-/// `docs/compliance/jq/limitations.md`.
+/// value starting at `start` (#2961, #4308): every newline up to the end of the
+/// read in which jq detects the fault, by [`LineCounter::line_at_read_of`]'s
+/// read model. One definition for the default document loop and the
+/// materializing input path.
+///
+/// Where jq detects it is where a parser that accepts jq's spellings first
+/// fails, [`validate_jq_lenient`](succinctly::json::validate::validate_jq_lenient),
+/// with two adjustments: jq checks a string's contents only once the string is
+/// complete, so a fault inside one is detected at its closing quote, and a value
+/// cut off at the end of input at the end. Oracle-verified against jq 1.7.1
+/// (the marker after a `try input` reaches the error): `0\n[1,\n2,\n}\n` line
+/// 4, `0\n{"a":\n1 2}\n` line 3, `0\n[\n"a<TAB>b"]\n` line 3, `1\n2 }\n\n\n`
+/// line 2.
 fn parse_error_line(bytes: &[u8], start: usize) -> usize {
+    use succinctly::json::validate::{validate_jq_lenient, ValidationErrorKind as Kind};
     let start = start.min(bytes.len());
-    let line_end = bytes[start..]
-        .iter()
-        .position(|&b| b == b'\n')
-        .map_or(bytes.len(), |offset| start + offset);
-    line_at(bytes, line_end)
+    let detected = match validate_jq_lenient(&bytes[start..]) {
+        Err(error) => {
+            let at = start + error.position.offset;
+            match error.kind {
+                Kind::UnclosedString | Kind::UnexpectedEof { .. } => bytes.len(),
+                Kind::ControlCharacter { .. }
+                | Kind::InvalidEscape { .. }
+                | Kind::InvalidUnicodeEscape { .. }
+                | Kind::UnpairedSurrogate { .. } => string_close_from(bytes, at),
+                // jq's lexer takes a whole token before its parser sees it: a
+                // string where a separator belongs is refused at its closing
+                // quote, and a bad literal or number (`truex`, `1x`) at the
+                // delimiter that ends it.
+                _ => token_end(bytes, at),
+            }
+        }
+        // The splitter refused a value this parser accepts: place it where it
+        // starts.
+        Ok(()) => start,
+    };
+    LineCounter::new(bytes).line_at_read_of(detected)
+}
+
+/// Where jq's lexer completes the token at `at`: a string's closing quote, the
+/// delimiter after a run of literal or number bytes, or `at` itself for a
+/// structural byte (#4308).
+fn token_end(bytes: &[u8], at: usize) -> usize {
+    match bytes.get(at) {
+        Some(b'"') => string_close_from(bytes, at + 1),
+        Some(&b) if is_bare_token_byte(b) => bytes[at..]
+            .iter()
+            .position(|&b| !is_bare_token_byte(b))
+            .map_or(bytes.len(), |offset| at + offset),
+        _ => at,
+    }
+}
+
+/// A byte jq's lexer reads as part of a literal or number token.
+fn is_bare_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'+' | b'.')
+}
+
+/// The closing quote of the string `at` is inside (past backslash escapes),
+/// or the end of input when it never closes.
+fn string_close_from(bytes: &[u8], mut at: usize) -> usize {
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' => at += 2,
+            b'"' => return at,
+            _ => at += 1,
+        }
+    }
+    bytes.len()
 }
 
 /// jq reads all of its input files as **one concatenated byte stream** (#4305), so a token
@@ -11095,6 +11213,88 @@ mod tests {
     /// that is all newlines (the accumulator's worst case) and a mixed one --
     /// each also offset by one byte so the chunks are not aligned to the
     /// slice start.
+    /// #4308: a value's line is every newline up to the end of the read that
+    /// completes it. Each document's expectations are jq 1.7.1's own `(at ...)`
+    /// lines for `jq -c error` over it.
+    #[test]
+    fn test_read_end_line_matches_jq_4308() {
+        let lines = |doc: &str| {
+            let bytes = doc.as_bytes();
+            let mut counter = LineCounter::new(bytes);
+            split_json_values(bytes)
+                .0
+                .iter()
+                .map(|&(_, end)| counter.read_end_line(end))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(lines("1 2\n3\n"), [1, 1, 2]);
+        assert_eq!(lines("\"a\" \"b\"\n\n\"c\"\n"), [1, 1, 3]);
+        assert_eq!(lines("[1,\n2] 3\n4"), [2, 2, 2]);
+        assert_eq!(lines("1\n2"), [1, 1]);
+        assert_eq!(lines("1 2 3"), [0, 0, 0]);
+        assert_eq!(lines("1 \n"), [1]);
+        assert_eq!(lines("{} []\r\n"), [1, 1]);
+        // A line longer than one read: a value completed in a full read that
+        // ends before the newline does not take it.
+        let long = format!("1{}2\n", " ".repeat(5000));
+        assert_eq!(lines(&long), [0, 1]);
+        // `1` completes at byte 4094, in the first full read; the newline is in
+        // the next one.
+        let exact = format!("{}1 \n", " ".repeat(4093));
+        assert_eq!(lines(&exact), [0]);
+        let past = format!("{}1\n", " ".repeat(4094));
+        assert_eq!(lines(&past), [1]);
+        // Many values on one line (inside one read) resolve without
+        // rescanning it per value.
+        let wide = "1 ".repeat(2_000) + "\n";
+        assert!(lines(&wide).iter().all(|&line| line == 1));
+    }
+
+    /// #4308: a parse error's line is the end of the read in which jq detects
+    /// it. Expectations are jq 1.7.1's marker after a `try input` reaches the
+    /// error.
+    #[test]
+    fn test_parse_error_line_matches_jq_4308() {
+        // The malformed value as `get_inputs` finds it: the first span the
+        // strict parse refuses, or where the splitter gave up.
+        let at = |doc: &str| {
+            let bytes = doc.as_bytes();
+            let (spans, split_error) = split_json_values(bytes);
+            let start = spans
+                .iter()
+                .find(|&&(start, end)| {
+                    succinctly::json::validate::validate_jq_lenient(&bytes[start..end]).is_err()
+                })
+                .map(|&(start, _)| start)
+                .or(split_error)
+                .expect("a malformed value");
+            parse_error_line(bytes, start)
+        };
+        assert_eq!(at("1\n2 }\n\n\n"), 2);
+        assert_eq!(at("1\n2\n}\n3\n"), 3);
+        assert_eq!(at("0\n[1,\n2,\n}\n"), 4);
+        assert_eq!(at("0\n{\"a\":\n1 2}\n"), 3);
+        assert_eq!(at("0\n[\n\"a\tb\"]\n"), 3);
+        assert_eq!(at("1\n\"ab\ncd\"\n"), 3);
+        assert_eq!(at("1\n\"ab"), 1);
+        assert_eq!(at("1\n[1,"), 1);
+        // A whole token is lexed before the parser refuses it: a string where a
+        // separator belongs at its closing quote, a bad literal or number at
+        // the delimiter after it.
+        assert_eq!(at("0\n[\"a\" \"b\nc\"]\n"), 3);
+        assert_eq!(at("0\n{\"a\" \"b\nc\"}\n"), 3);
+        assert_eq!(at(&format!("0\n[{}1 \"ab\"]\n", " ".repeat(4090))), 2);
+        assert_eq!(at(&format!("0\n{}truex\n", " ".repeat(4092))), 2);
+        assert_eq!(at(&format!("0\n{}1x\n", " ".repeat(4093))), 2);
+        // A fault inside a string is placed at its close, past an escaped
+        // quote, or at the end when the string never closes.
+        assert_eq!(at("0\n[\"a\tb\\\"c\n\"]\n"), 3);
+        assert_eq!(at("0\n\"a\tb"), 1);
+        // A value the splitter refused but jq's spellings accept is placed
+        // where it starts.
+        assert_eq!(parse_error_line(b"1\n2\n", 2), 2);
+    }
+
     #[test]
     fn test_count_newlines_matches_naive_around_chunk_boundaries_4160() {
         let naive = |b: &[u8]| b.iter().filter(|&&c| c == b'\n').count();
@@ -11177,8 +11377,18 @@ mod tests {
                     "mask={mask} end={end}"
                 );
                 assert_eq!(first.file.as_deref(), Some("f.json"));
-                counted = end;
-                assert_eq!(locator.counter.borrow().pos, counted, "read counts to end");
+                // To the byte that completes the value (#4308): a container's
+                // closing byte, a number's following byte.
+                counted = if matches!(bytes[end - 1], b'"' | b']' | b'}') {
+                    end - 1
+                } else {
+                    end
+                };
+                assert_eq!(
+                    locator.counter.borrow().pos,
+                    counted,
+                    "read counts to the completion"
+                );
                 // A second read is the memoised answer, not a second count.
                 assert_eq!(at.get().line, first.line);
                 assert_eq!(locator.counter.borrow().pos, counted);
