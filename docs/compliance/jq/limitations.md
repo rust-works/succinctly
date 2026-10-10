@@ -1993,8 +1993,8 @@ is the revert that established what the other one costs.
    whose later alternative yields and whose result jq's check then passes) are refused, in the safe direction. Still
    accepted where jq raises, identical on `main`: a `(.|.) as {...}` source (`del(foreach ((.|.) as {a:$a} | .) as
    $y (.; .; .))` deletes the document; routing it first needs `resolve_as_pattern` to read `(.|.)` as the register,
-   since #4128's attempt regressed `del(try (... and true))`), and `reduce . as {a:$a} ?// $a (0; .a?)` as an `and`
-   operand, which now refuses with a different message from jq's, not a wrong answer.
+   since #4128's attempt regressed `del(try (... and true))`). `[path(reduce . as {a:$a} ?// $a (0; .a?) and true)]`,
+   listed with them, refuses as jq does (exit 5) with a different message, on `main` too.
    [#4278](https://github.com/rust-works/succinctly/issues/4278) closes the other carriers #4187 left: a destructure
    behind a mixed `?//` chain (`. as $x ?// [$q] | . as {a:$a} | .`, either order), a plain bind that is a later pipe
    stage (`(. as $x | .) | . as {a:$a} | .`), an `if` branch, a no-argument `def` call (bodies read with a budget of 16
@@ -2003,7 +2003,7 @@ is the revert that established what the other one costs.
    it adds (213,147 rows), 1,294 wrong accepts and 204 wrong answers go to 127 and 34 (the 127 are all the `(.|.)`
    operand), 1,059 refusals become matches, and 59 matches are lost to a refusal, all inside another fold's body (a
    `reduce` UPDATE or source), the price #4187 already pays. Over the #3744/#4187/#4278 operands as bare stages
-   (51,531 rows), a mixed chain under `try`/`?`/`-` also refuses 40 rows jq answers: the resolver's refusal of a
+   (51,531 rows), a mixed chain under `try`/`?` also refuses 16 rows jq answers: the resolver's refusal of a
    non-last `?//` alternative is the uncatchable one (#4150), where jq's own error is caught.
    [#4187](https://github.com/rust-works/succinctly/issues/4187) closes two of the families: a plain bind in front of
    the destructure (`. as $x | . as {a:$a} | .`, `source_destructures_register` stopped at the bind and never read its
