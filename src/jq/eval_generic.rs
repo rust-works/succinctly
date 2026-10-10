@@ -8632,13 +8632,15 @@ mod slot_memo {
         WORK.with(std::cell::Cell::get)
     }
 
-    #[cfg(test)]
+    #[inline(always)]
     pub(crate) fn note_scanned() {
+        #[cfg(test)]
         WORK.with(|w| w.set((w.get().0 + 1, w.get().1)));
     }
 
-    #[cfg(test)]
+    #[inline(always)]
     pub(crate) fn note_neighbour() {
+        #[cfg(test)]
         WORK.with(|w| w.set((w.get().0, w.get().1 + 1)));
     }
 
@@ -8654,16 +8656,14 @@ mod slot_memo {
         MISSED.with(std::cell::Cell::get)
     }
 
-    #[cfg(test)]
+    #[inline(always)]
+    #[cfg_attr(not(test), allow(unused_variables))]
     pub(crate) fn note_missed(document: usize, parent: usize) {
+        #[cfg(test)]
         if remembers(document, parent) {
             MISSED.with(|m| m.set(m.get() + 1));
         }
     }
-
-    #[cfg(not(test))]
-    #[inline(always)]
-    pub(crate) fn note_missed(_document: usize, _parent: usize) {}
 
     // How many times `scan_for_slot` built the parent's value, which for a YAML
     // mapping walks every member (#3846): a resume must not.
@@ -8677,22 +8677,11 @@ mod slot_memo {
         VALUED.with(std::cell::Cell::get)
     }
 
-    #[cfg(test)]
+    #[inline(always)]
     pub(crate) fn note_parent_valued() {
+        #[cfg(test)]
         VALUED.with(|v| v.set(v.get() + 1));
     }
-
-    #[cfg(not(test))]
-    #[inline(always)]
-    pub(crate) fn note_parent_valued() {}
-
-    #[cfg(not(test))]
-    #[inline(always)]
-    pub(crate) fn note_scanned() {}
-
-    #[cfg(not(test))]
-    #[inline(always)]
-    pub(crate) fn note_neighbour() {}
 
     /// What a [`Guard`] puts back when it drops.
     enum Restore {
