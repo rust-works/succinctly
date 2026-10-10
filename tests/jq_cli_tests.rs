@@ -124216,7 +124216,7 @@ fn test_error_after_input_runs_out_names_jqs_eof_location_4303() -> Result<()> {
             Ok(line) => assert_eq!((stdout.trim_end(), code), (line, 0), "{filter}: {stderr}"),
             Err(line) => {
                 let location =
-                    line.map_or("<unknown>".to_string(), |l| format!("{}:{l}", paths[0]));
+                    line.map_or_else(|| "<unknown>".to_string(), |l| format!("{}:{l}", paths[0]));
                 assert_eq!(
                     (stderr.trim_end(), code),
                     (format!("jq: error (at {location}): y").as_str(), 5),

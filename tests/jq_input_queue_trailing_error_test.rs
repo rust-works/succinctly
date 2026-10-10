@@ -34,11 +34,16 @@ fn a_trailing_parse_error_is_delivered_once_after_the_documents_2961() {
         InputPop::ParseError(e) => assert_eq!(e.message, "Invalid JSON text"),
         _ => panic!("the parse error follows the documents"),
     }
-    // The marker names where the parser stopped, and stays there.
+    // The marker names where the parser stopped. The reads after it go on to
+    // the end of the stream (#4303): the first names the seeded end of input,
+    // and every later one is jq's `<unknown>`. jq 1.7.1 on `1\n2 }\n\n\n`
+    // names line 2 for the error's read, line 4 for the next, then
+    // `<unknown>`.
     assert_eq!(current_input_location(), Some((0, 1)));
     assert!(matches!(pop_input(), InputPop::Exhausted));
+    assert_eq!(current_input_location(), Some((0, 0)));
     assert!(matches!(pop_input(), InputPop::Exhausted));
-    assert_eq!(current_input_location(), Some((0, 1)));
+    assert_eq!(current_input_location(), None);
 
     // The `Option`-shaped pop reads a trailing error as the end of the
     // stream, and consumes it.
