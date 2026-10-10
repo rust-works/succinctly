@@ -10024,7 +10024,12 @@ by #3856).** A jq-mode array whose body is a `,` (`[., 1]`, `[., .]`, `[.a, .b]`
 navigation, `[.[] | ., .]`, where each output of the stages before it gets every branch in turn;
 since #4166 that stage may also hold a computed branch when nothing follows it (`[.[] | ., 1]`,
 `[.[] | length, .]`), be followed by computed stages when its branches are navigation
-(`[.[] | ., . | length]`), or be a `?` around navigation branches (`[.[] | (., .[0])?]`))
+(`[.[] | ., . | length]`), or be a `?` around navigation branches (`[.[] | (., .[0])?]`); since
+#4294 a computed branch may also be followed by further stages, at the head or after a prefix,
+when nothing before the pipe's last stage has an effect or reads the input state
+(`[(.users, [1]) | .[0]]`, `[(.users, length) | .]`, `[.[] | (., 1) | .a]`), and a `?` around
+navigation branches may be the whole body or head the pipe (`[(.users, .users)?]`,
+`[(.a, .b)? | .x]`))
 holds each document node it collects
 as a cursor, beside whatever the other branches compute, and reads none of them: `[., 1] |
 length` answers over an unreadable value. Printing the array reads every node, so `[., 1]` and
@@ -10046,10 +10051,11 @@ builds an owned value and decodes what it holds, so each of these raises where t
   construction is materialized to be an element;
 - a computed stream that is not a `,` body, a pipe with a computed stage before its first `,`
   stage (`[.[] | length | (., .)]`), a `,` stage with both a computed branch and stages after
-  it (`[.[] | (., 1) | .a]`, where the tail would run between two computed branches that the
-  owned route runs back to back), a computed branch or stage in or after a `(a, b)?` group, and
+  it when a stage before the last has an effect or reads the input state
+  (`[(.a, ("x" | debug)) | .b]`, where the tail would run between two branches that the owned
+  route runs back to back, #4294), a computed branch or stage in or after a `(a, b)?` group, and
   any of these reading path context (`key`, `parent`); the regrouping keeps the pipe's own order
-  only for the shapes above (#4166);
+  only for the shapes above (#4166, #4294);
 - a variable bind that decodes at the bind, below;
 - yq mode, whose printer materializes a sequence anyway and so keeps its owned routes.
 
