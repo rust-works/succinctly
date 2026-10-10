@@ -122623,6 +122623,100 @@ fn test_swallowed_path_iteration_answers_what_it_did_4157() -> Result<()> {
     ])
 }
 
+/// #4280: `try path(.[]) catch LITERAL` settles a scalar without building the
+/// `Cannot iterate over ...` payload its handler ignores, and still answers the literal
+/// for a scalar and the paths for a container. A handler that reads its input still gets
+/// the message; in path position the boundary is not shortcut (`path(...)` is not a path
+/// expression there). The valid-JSON rows are jq 1.7.1's own; the undecodable string, which
+/// jq cannot read, escapes as it does for `try .[] catch "c"`.
+#[test]
+fn test_caught_path_iteration_with_a_literal_answers_what_it_did_4280() -> Result<()> {
+    const MIXED: &str = r#"[1,"a",null,true,[2],{"k":3}]"#;
+    assert_path_rows_3289(&[
+        (
+            MIXED,
+            "[.[] | try path(.[]) catch 1]",
+            "[1,1,1,1,[0],[\"k\"]]\n",
+            "",
+            0,
+        ),
+        (
+            MIXED,
+            "[.[] | try path(.[]) catch null]",
+            "[null,null,null,null,[0],[\"k\"]]\n",
+            "",
+            0,
+        ),
+        (
+            MIXED,
+            "[.[] | try path(.[]) catch false]",
+            "[false,false,false,false,[0],[\"k\"]]\n",
+            "",
+            0,
+        ),
+        (
+            MIXED,
+            r#"[.[] | (try (path(.[])) catch "c")]"#,
+            "[\"c\",\"c\",\"c\",\"c\",[0],[\"k\"]]\n",
+            "",
+            0,
+        ),
+        (
+            MIXED,
+            r#"def safe(f): try f catch "c"; [.[] | safe(path(.[]))]"#,
+            "[\"c\",\"c\",\"c\",\"c\",[0],[\"k\"]]\n",
+            "",
+            0,
+        ),
+        (
+            MIXED,
+            r#"[.[] | first(try path(.[]) catch "c")]"#,
+            "[\"c\",\"c\",\"c\",\"c\",[0],[\"k\"]]\n",
+            "",
+            0,
+        ),
+        (
+            MIXED,
+            r#"[limit(3; .[] | try path(.[]) catch "c")]"#,
+            "[\"c\",\"c\",\"c\"]\n",
+            "",
+            0,
+        ),
+        // A handler that reads its input still gets the message.
+        (
+            MIXED,
+            "[.[] | try path(.[]) catch .]",
+            "[\"Cannot iterate over number (1)\",\"Cannot iterate over string (\\\"a\\\")\",\
+             \"Cannot iterate over null (null)\",\"Cannot iterate over boolean (true)\",[0],[\"k\"]]\n",
+            "",
+            0,
+        ),
+        // Path position: not shortcut, so jq's path errors stand.
+        (
+            MIXED,
+            r#"[.[] | path(try path(.[]) catch "c")]"#,
+            "",
+            "Invalid path expression with result \"c\"",
+            5,
+        ),
+        (
+            MIXED,
+            r#"[path(try path(.[]) catch "c")]"#,
+            "",
+            "Invalid path expression with result [0]",
+            5,
+        ),
+        // A document jq cannot read: what `try` never catches still escapes.
+        (
+            r#"["\ud800",1]"#,
+            r#"[.[] | try path(.[]) catch "c"]"#,
+            "",
+            "invalid unicode escape sequence",
+            5,
+        ),
+    ])
+}
+
 /// #4146: `error(msg)`'s message runs in path mode (`def error(msg): msg | error;`), so a
 /// message that navigates an input the register is not on raises jq's path error ahead of
 /// the `error`, and a `try` hands its handler that string, not the value the message would
