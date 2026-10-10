@@ -62121,3 +62121,71 @@ fn test_block_scalar_header_on_its_own_line_4259() -> Result<()> {
     }
     Ok(())
 }
+
+/// #4195: `E[a:b][k]` and `E[a:b] | length` read the slice's resolved range instead of building
+/// the slice, in yq mode as in jq mode. The rows marked yq v4.53.3 are that tool's own answers; the
+/// out-of-range negative index is the one place yq raises where jq answers `null`, so the fusion
+/// has to leave it to the ordinary route. The unfused spelling (the slice in parentheses) is the
+/// slice-then-read evaluation the fused form must equal, including for a document that carries
+/// comments, anchors and a repeated key, which an owned copy flattens.
+#[test]
+fn test_fused_slice_read_matches_the_slice_then_read_spelling_4195() -> Result<()> {
+    // yq v4.53.3
+    for (filter, expected) in [
+        ("1 as $i | .[$i:][0]", "20\n"),
+        ("1 as $i | .[$i:] | length", "2\n"),
+        ("1 as $i | .[$i:][-1]", "30\n"),
+        ("1 as $i | .[$i:][9]", "null\n"),
+    ] {
+        assert_eq!(
+            run_yq_stdin(filter, "[10, 20, 30]", &["-o", "json", "-I", "0"])?,
+            (expected.to_string(), 0),
+            "{filter}"
+        );
+    }
+    let (stdout, code) = run_yq_stdin(
+        "1 as $i | .[$i:][-9]",
+        "[10, 20, 30]",
+        &["-o", "json", "-I", "0"],
+    )?;
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("", 1),
+        "yq raises, jq answers null"
+    );
+
+    let docs = [
+        "[]",
+        "[10, 20, 30]",
+        "- a: 1\n  a: 2 # kept?\n- &x {b: 3}\n- *x\n# trailing\n- [4, 5]\n",
+        "k:\n  - 1\n  - 2\n",
+        "scalar",
+        "null",
+    ];
+    let bounds = ["$i:", ":$i", "$i:$j", "$neg:", "(1,2):", "$z:", "length-1:"];
+    let reads = [
+        ("[0]", "| .[0]"),
+        ("[1]", "| .[1]"),
+        ("[-1]", "| .[-1]"),
+        ("[-9]", "| .[-9]"),
+        ("[7]", "| .[7]"),
+        ("| length", "| length"),
+    ];
+    let prelude = "1 as $i | 2 as $j | -2 as $neg | null as $z | ";
+    for doc in docs {
+        for target in [".", ".k"] {
+            for bound in bounds {
+                for (fused_read, unfused_read) in reads {
+                    let fused = format!("{prelude}{target}[{bound}]{fused_read}");
+                    let unfused = format!("{prelude}({target}[{bound}]) {unfused_read}");
+                    assert_eq!(
+                        run_yq_stdin(&fused, doc, &[])?,
+                        run_yq_stdin(&unfused, doc, &[])?,
+                        "{doc:?}: {fused}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}

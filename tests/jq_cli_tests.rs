@@ -122965,3 +122965,281 @@ fn test_jq_general_path_slurp_error_line_4178() -> Result<()> {
     assert_eq!(code, 5);
     Ok(())
 }
+
+/// Variables every #4195 row binds, so a computed bound (`$i`, `$j`, `$neg`) keeps the slice on
+/// `Expr::SliceExpr` rather than the static `Expr::Slice`.
+const SLICE_READ_PRELUDE: &str = r#"1 as $i | 4 as $j | -2 as $neg | "x" as $s | null as $z | "#;
+
+/// #4195: `E[a:b][k]` and `E[a:b] | length` read the slice's resolved range instead of building
+/// the slice, and must answer exactly what the slice would -- values, errors and exit codes alike.
+/// The unfused spelling puts the slice in parentheses, which the fusion does not look through, so
+/// it is the slice-then-read evaluation the fused form has to equal.
+#[test]
+fn test_fused_slice_read_equals_the_unfused_spelling_4195() -> Result<()> {
+    let docs = [
+        "[]",
+        "[10,20,30]",
+        "[1,2,3,4,5,6,7]",
+        r#"[null,false,{"a":1},"s",[],[2,3]]"#,
+        "null",
+        r#""hello""#,
+        "7",
+        r#"{"a":[1,2,3]}"#,
+    ];
+    let bounds = [
+        "$i:",
+        ":$i",
+        "$i:$j",
+        "$j:$i",
+        "$neg:",
+        ":$neg",
+        "$neg:$j",
+        "$i+1:",
+        "length-1:",
+        "$z:",
+        "$s:",
+        ":$s",
+        "(1,2):",
+        "$i:(1,2)",
+        "(empty):",
+        "($i|error):",
+    ];
+    // (the read as written after the slice, the same read as a pipe stage)
+    let reads = [
+        ("[0]", "| .[0]"),
+        ("[1]", "| .[1]"),
+        ("[-1]", "| .[-1]"),
+        ("[-9]", "| .[-9]"),
+        ("[7]", "| .[7]"),
+        ("| length", "| length"),
+        ("[0] | tostring", "| .[0] | tostring"),
+    ];
+    for doc in docs {
+        for bound in bounds {
+            for (fused_read, unfused_read) in reads {
+                let fused = format!("{SLICE_READ_PRELUDE}.[{bound}]{fused_read}");
+                let unfused = format!("{SLICE_READ_PRELUDE}(.[{bound}]) {unfused_read}");
+                assert_eq!(
+                    run_jq_stdin(&fused, doc, &["-c"])?,
+                    run_jq_stdin(&unfused, doc, &["-c"])?,
+                    "{doc}: {fused}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// #4195: the fused read's values, from jq 1.7.1. The slice is clamped by its own bounds, so the
+/// index is relative to it (`.[1:3][5]` is `null` although the array has a seventh element), a
+/// negative index counts from the slice's end, and `length` is the slice's width.
+#[test]
+fn test_fused_slice_read_values_4195() -> Result<()> {
+    let doc = "[1,2,3,4,5,6,7]";
+    for (filter, expected) in [
+        ("5 as $i | .[$i:][0]", "6\n"),
+        ("5 as $i | .[$i:][1]", "7\n"),
+        ("5 as $i | .[$i:][2]", "null\n"),
+        ("5 as $i | .[$i:][-1]", "7\n"),
+        ("5 as $i | .[$i:][-3]", "null\n"),
+        ("1 as $i | .[$i:3][5]", "null\n"),
+        ("(-2) as $i | .[$i:][0]", "6\n"),
+        ("(-2) as $i | .[:$i][-1]", "5\n"),
+        ("9 as $i | .[$i:][0]", "null\n"),
+        ("3 as $i | .[$i:] | length", "4\n"),
+        ("3 as $i | .[:$i] | length", "3\n"),
+        ("9 as $i | .[$i:] | length", "0\n"),
+        ("2 as $i | 5 as $j | .[$j:$i] | length", "0\n"),
+        // A fractional bound widens the slice, as it does for a literal one.
+        ("1.5 as $i | .[$i:][0]", "2\n"),
+        ("2.5 as $i | .[:$i][-1]", "3\n"),
+        ("null as $i | .[$i:][0]", "1\n"),
+    ] {
+        assert_eq!(
+            run_jq_stdin(filter, doc, &["-c"])?,
+            (expected.to_string(), 0),
+            "{filter}"
+        );
+    }
+    // The reads compose with the rest of the pipe.
+    assert_eq!(
+        run_jq_stdin("3 as $i | .[$i:][0] | . * 10", doc, &["-c"])?,
+        ("40\n".to_string(), 0)
+    );
+    assert_eq!(
+        run_jq_stdin("3 as $i | [(.[$i:] | length), .[$i:][0]]", doc, &["-c"])?,
+        ("[4,4]\n".to_string(), 0)
+    );
+    Ok(())
+}
+
+/// #4195: the fusion hands the pair to today's route whenever it does not model the shape, so a
+/// generator or empty bound, a bound that raises, a string/null/object target, `?`, and a demand
+/// from outside (`first`, `limit`, `try`) all answer what the unfused spelling does.
+#[test]
+fn test_fused_slice_read_declines_to_the_ordinary_route_4195() -> Result<()> {
+    let doc = "[10,20,30,40]";
+    for (fused, unfused) in [
+        // a bound with several outputs: one slice per pair
+        ("[.[(0,1):][0]]", "[(.[(0,1):])[0]]"),
+        ("[.[(0,1):] | length]", "[(.[(0,1):]) | length]"),
+        ("[.[0:(2,3)][-1]]", "[(.[0:(2,3)])[-1]]"),
+        // a bound with no output: no slice at all
+        ("[.[(empty):][0]]", "[(.[(empty):])[0]]"),
+        // a bound that raises, and one that is not a number
+        (
+            "try .[(1|error):][0] catch .",
+            "try (.[(1|error):])[0] catch .",
+        ),
+        (r#"try .["x":][0] catch ."#, r#"try (.["x":])[0] catch ."#),
+        ("try .[[1]:][0] catch .", "try (.[[1]:])[0] catch ."),
+        // `?` suppresses only the slice step, and covers the whole postfix chain here
+        (r#".["x":][0]?"#, r#"(.["x":])[0]?"#),
+        (r#"[.["x":]?[0]]"#, r#"[(.["x":]?)[0]]"#),
+        // targets that are not arrays
+        (r#""abcdef" | .[2:][0]"#, r#""abcdef" | (.[2:])[0]"#),
+        (
+            r#""abcdef" | .[2:] | length"#,
+            r#""abcdef" | (.[2:]) | length"#,
+        ),
+        ("null | .[2:][0]", "null | (.[2:])[0]"),
+        ("null | .[2:] | length", "null | (.[2:]) | length"),
+        (
+            r#"{"a":1} | try .[2:][0] catch ."#,
+            r#"{"a":1} | try (.[2:])[0] catch ."#,
+        ),
+        ("5 | try .[2:][0] catch .", "5 | try (.[2:])[0] catch ."),
+        // demand from outside
+        (
+            "first(.[1:][0], error(\"never\"))",
+            "first((.[1:])[0], error(\"never\"))",
+        ),
+        ("[limit(1; .[1:][0], 99)]", "[limit(1; (.[1:])[0], 99)]"),
+        (
+            "[.[1:][0], .[2:] | length]",
+            "[(.[1:])[0], (.[2:]) | length]",
+        ),
+        // a read the fusion does not own
+        (".[1:][0:1]", "(.[1:])[0:1]"),
+        (".[1:][]", "(.[1:])[]"),
+        (".[1:][0.5]", "(.[1:])[0.5]"),
+    ] {
+        // These rows have literal bounds, so give each a computed one of the same value.
+        let fused = fused
+            .replace(".[1:]", ".[($i+0):]")
+            .replace(".[2:]", ".[($i+1):]");
+        let unfused = unfused
+            .replace(".[1:]", ".[($i+0):]")
+            .replace(".[2:]", ".[($i+1):]");
+        let fused = format!("1 as $i | {fused}");
+        let unfused = format!("1 as $i | {unfused}");
+        assert_eq!(
+            run_jq_stdin(&fused, doc, &["-c"])?,
+            run_jq_stdin(&unfused, doc, &["-c"])?,
+            "{fused}"
+        );
+    }
+    Ok(())
+}
+
+/// #4195: the documents and targets the fused read declines because the array itself cannot be
+/// read -- a malformed array, a target that is itself undecodable, an absent field, an error
+/// raised by the stage after the read -- answer what the unfused spelling does.
+#[test]
+fn test_fused_slice_read_declines_unreadable_targets_4195() -> Result<()> {
+    for doc in [
+        "[1,,2]",
+        "[1,2,",
+        "1.2.3",
+        "[tru]",
+        r#"{"a":[1,2,3]}"#,
+        r#"{"a":1.2.3}"#,
+        "[]",
+        "{}",
+    ] {
+        for (fused, unfused) in [
+            ("1 as $i | .[$i:][0]", "1 as $i | (.[$i:]) | .[0]"),
+            ("1 as $i | .[$i:] | length", "1 as $i | (.[$i:]) | length"),
+            ("1 as $i | .a[$i:][0]", "1 as $i | (.a[$i:]) | .[0]"),
+            ("1 as $i | .b[$i:] | length", "1 as $i | (.b[$i:]) | length"),
+            // an error raised after the read, caught and uncaught
+            (
+                r#"1 as $i | try (.[$i:][0] | error("boom")) catch ."#,
+                r#"1 as $i | try ((.[$i:]) | .[0] | error("boom")) catch ."#,
+            ),
+            (
+                r#"0 as $i | .[$i:][0] | error("boom")"#,
+                r#"0 as $i | (.[$i:]) | .[0] | error("boom")"#,
+            ),
+        ] {
+            assert_eq!(
+                run_jq_stdin(fused, doc, &["-c"])?,
+                run_jq_stdin(unfused, doc, &["-c"])?,
+                "{doc}: {fused}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// #4195: pins that the fusion runs, and what it does not do. The read names one element, so a
+/// malformed element elsewhere in the range is not converted -- the way `.[0]` and `length` never
+/// look inside a sibling (jq itself rejects such a document at parse). The unfused spelling builds
+/// the whole slice and so still raises. A test of "no work was done" must be able to fail: if the
+/// pair stopped fusing, the first rows would raise. Each context below reaches the fusion through
+/// a different driver, so each has its own row.
+#[test]
+fn test_fused_slice_read_does_not_convert_siblings_4195() -> Result<()> {
+    let doc = "[1,1.2.3,3]";
+    let contexts = [
+        "{}",
+        "[{}] | .[0]",
+        "{a: {}} | .a",
+        "first({})",
+        "{} as $x | $x",
+        "if true then {} else 0 end",
+        "try {} catch \"caught\"",
+        "def f: {}; f",
+        ". as $d | $d | {}",
+        "[range(1) as $_ | {}] | .[0]",
+        "label $out | {}",
+        "({}, 9) | select(. != 9)",
+        "{} | tostring | tonumber",
+    ];
+    for (read, expected) in [
+        ("0 as $i | .[$i:][0]", "1\n"),
+        ("0 as $i | .[$i:][2]", "3\n"),
+        ("0 as $i | .[$i:] | length", "3\n"),
+    ] {
+        for context in contexts {
+            let filter = context.replace("{}", &format!("({read})"));
+            let (stdout, code) = run_jq_stdin(&filter, doc, &["-c"])?;
+            assert_eq!((stdout.as_str(), code), (expected, 0), "{filter}");
+        }
+    }
+    // A read per element of `.[]`, and in a `map` body, reaches the fusion through both drivers.
+    for (filter, expected) in [
+        ("0 as $i | .[] | .[$i:][0]", "1\n4\n"),
+        ("0 as $i | .[] | .[$i:] | length", "3\n2\n"),
+        // `map` runs its body per element through the non-sink driver.
+        ("0 as $i | map(.[$i:][0])", "[1,4]\n"),
+        ("0 as $i | map(.[$i:] | length)", "[3,2]\n"),
+    ] {
+        assert_eq!(
+            run_jq_stdin(filter, "[[1,1.2.3,3],[4,5]]", &["-c"])?,
+            (expected.to_string(), 0),
+            "{filter}"
+        );
+    }
+    // The element the read names is converted, so its own malformation still raises.
+    let (stdout, code) = run_jq_stdin("0 as $i | .[$i:][1]", doc, &["-c"])?;
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("", 5),
+        "reading the malformed element"
+    );
+    // The unfused spelling converts the whole range.
+    let (stdout, code) = run_jq_stdin("0 as $i | (.[$i:]) | .[0]", doc, &["-c"])?;
+    assert_eq!((stdout.as_str(), code), ("", 5), "slice built first");
+    Ok(())
+}
