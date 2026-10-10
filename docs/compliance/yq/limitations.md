@@ -5401,9 +5401,15 @@ so `*` also finds `1: y`, `true: t` and `1.5: w` (the generator spells a matchin
 text for any scalar `k` (`has(1)`, `has(true)`, `has(1.5)`); a leading-zero literal compares by
 its resolved text (`has(01)` is true here, false in yq, the recorded `01` residual). One gap
 remains: a *computed* string key (`.[ "x?" + "?" ]`) is still an exact lookup, because it is not
-a literal in the filter text. Once a name holds a `*` the rest of the run stays in it, as in yq (`.a*+=3` writes the key `a*+`);
-the operator bytes after a *plain* name still end it, so `.a+1`, `.a%1`, `.a<1`, `.a>1` and `.a@1`
-are operations here and the keys `a+1`, ... in yq ([#4079](https://github.com/rust-works/succinctly/issues/4079)).
+a literal in the filter text. Once a name holds a `*` the rest of the run stays in it, as in yq (`.a*+=3` writes the key `a*+`).
+**Resolved ([#4237](https://github.com/rust-works/succinctly/issues/4237), the rest of
+[#4079](https://github.com/rust-works/succinctly/issues/4079)):** the same holds for a plain name:
+yq's `PathElement` token is `\.[^ ;\}\{\:\[\],\|\.\[\(\)=\n!]+\??`, so every operator byte
+straight after a `.` or a name stays in it, and `.a+1`, `.a%1`, `.a<1`, `.a>1`, `.a@1`, `.>1` and
+`.+1` are the keys `a+1`, ... where `succinctly yq` read operations before. A space ends the name
+(`.a + 1`, `.a >1` and `. > 1` still compare), `=` and `!` are never in one (`.a==1`, `.a!=1` compare,
+`.a>=1` is the assignment `.a> = 1`), and `succinctly jq` is unchanged. `.> 1` is a lexer error in yq
+and a parse error here (the message differs).
 
 A wildcard key costs one pass over the mapping's keys plus one keyed lookup per match, and
 a keyed lookup into a document object is linear in its key count ([#3913](https://github.com/rust-works/succinctly/issues/3913)),

@@ -348,6 +348,20 @@ pub(crate) fn join_expr_arity(expr: &Expr) -> Option<usize> {
     }
 }
 
+/// Whether `c` can be part of an unquoted path element in yq's lexer (#4237).
+///
+/// yq's `PathElement` token is `\.[^ ;\}\{\:\[\],\|\.\[\(\)=\n!]+\??`
+/// (`lexer_participle.go`, v4.53.3): after a `.`, every character but the ones
+/// listed belongs to the name, operators included. So `.a+1` is the key `a+1`, `.>1` the
+/// key `>1`, and `.a<=3` is the key `a<` assigned `3`. Only a space (or one of the listed
+/// punctuation marks) ends the name, which is why `. > 1`, `.a > 1` and `.a >1` compare.
+fn is_yq_path_element_char(c: char) -> bool {
+    !matches!(
+        c,
+        ' ' | ';' | '}' | '{' | ':' | '[' | ']' | ',' | '|' | '.' | '(' | ')' | '=' | '\n' | '!'
+    )
+}
+
 /// The one definition of "does a bare identifier (function/parameter name,
 /// zero-arg call, `def` name) start here" -- underscore included, since jq
 /// accepts `_` as an identifier-start character throughout and
@@ -1344,31 +1358,26 @@ impl<'a> Parser<'a> {
         // too: real yq's unquoted field is any run of the bytes below, so `.ab*` and `.a*b` are
         // wildcard keys (`matchKey`) and `.1` is the key `1`, where `.a*2` is the key `a*2`
         // and not a product (`.a * 2` is).
-        let mut name =
-            if self.mode == ParserMode::Yq && matches!(self.peek(), Some('?' | '*' | '0'..='9')) {
-                String::new()
-            } else {
-                self.parse_ident()?
-            };
+        //
+        // #4237: and so does any other character yq's lexer allows in a name that is not an
+        // identifier start (`.>1`, `.+1`, `.$x`, `.@x`): the run below takes the rest.
+        let mut name = if self.mode == ParserMode::Yq
+            && self
+                .peek()
+                .is_some_and(|c| is_yq_path_element_char(c) && c != '"' && !is_ident_start_char(c))
+        {
+            String::new()
+        } else {
+            self.parse_ident()?
+        };
         if self.mode != ParserMode::Yq {
             return Ok(name);
         }
 
         let suffix_start = self.pos;
-        // #2800: a name that holds a `*` is a wildcard pattern, and there yq keeps the rest of the
-        // run too (`.a*+=3` writes the key `a*+`), where the operator bytes after a plain name
-        // still end it (`.a+1` is a sum here; in yq it is the key `a+1`, #4079).
-        let mut wildcard = name.contains('*');
-        while self.peek().is_some_and(|c| {
-            c.is_alphanumeric()
-                || matches!(c, '_' | '-' | '/' | '?' | '*' | '\t' | '\r' | '\u{a0}')
-                || (wildcard
-                    && matches!(
-                        c,
-                        '+' | '%' | '<' | '>' | '@' | '#' | '~' | '^' | '&' | '$' | '\''
-                    ))
-        }) {
-            wildcard |= self.peek() == Some('*');
+        // yq keeps every byte `is_yq_path_element_char` allows, operators after a plain
+        // name included (`.a+1` is the key `a+1`, #4079/#4237), and so does the run below.
+        while self.peek().is_some_and(is_yq_path_element_char) {
             self.next();
         }
         if self.pos > suffix_start && self.input.as_bytes()[self.pos - 1] == b'?' {
@@ -2981,10 +2990,14 @@ impl<'a> Parser<'a> {
                 //
                 // #2800: `.*` and `.*c` are a wildcard key in yq (no space after the dot, which is
                 // what tells them from `. * 2`), so the `*` is not a multiplication here.
+                //
+                // #4237: more generally, yq's `.` followed at once by any character that is
+                // not in `is_yq_path_element_char`'s exclusions starts a name, operator
+                // characters included (`.>1` is the key `>1`, not a comparison).
                 if (self.is_eof() || self.is_expr_terminator())
                     && !(self.mode == ParserMode::Yq
                         && self.pos == dot_end
-                        && matches!(self.peek(), Some('?' | '*')))
+                        && self.peek().is_some_and(is_yq_path_element_char))
                 {
                     self.last_primary_is_term = true; // #3038: leaf Term
                     return Ok(Expr::Identity);

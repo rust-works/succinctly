@@ -98794,7 +98794,7 @@ mod tests {
     /// `YqSemantics` at all.
     #[test]
     fn test_builtin_map_values_yq_mode_does_not_collapse_duplicate_key_1829() {
-        yq_query!(br#"{"a": 10, "a": 2}"#, "map_values(.+1)",
+        yq_query!(br#"{"a": 10, "a": 2}"#, "map_values(. + 1)",
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 assert_eq!(obj.len(), 1);
                 assert_eq!(obj.get("a"), Some(&OwnedValue::Int(3)));
