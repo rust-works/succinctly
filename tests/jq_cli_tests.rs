@@ -123875,6 +123875,24 @@ fn test_pipe_effect_before_a_raising_stage_runs_depth_first_4293() -> Result<()>
             0,
         ),
     ];
+    // A read of the input state is not an effect, but it must still run
+    // after the `input` an earlier output's later stage consumed.
+    for (filter, expected) in [
+        (
+            "[(input_line_number, input_line_number) | [., input]]",
+            "[[0,1],[1,2]]\n",
+        ),
+        (
+            "[(input_filename, input_filename) | [., input]]",
+            "[[null,1],[\"<stdin>\",2]]\n",
+        ),
+    ] {
+        assert_eq!(
+            run_jq_interleaved(&["-nc", filter], Some("1\n2\n3\n4\n"))?,
+            (expected.to_string(), 0),
+            "{filter}"
+        );
+    }
     for (input, filter, expected, code) in rows {
         assert_eq!(
             run_jq_interleaved(&["-c", filter], Some(input))?,

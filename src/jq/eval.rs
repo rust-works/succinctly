@@ -3307,9 +3307,22 @@ pub(crate) fn pipe_effect_before_last(stages: &PipeStages) -> bool {
 }
 
 /// [`pipe_effect_before_last`] over a stage slice, unremembered.
+///
+/// A read of the input state (`input_line_number`, `input_filename`) counts
+/// too: it is not an effect, but the fold ran it ahead of an `input` in a later
+/// stage, so `[(input_line_number, input_line_number) | [., input]]` read `0`
+/// twice where jq reads `0`, then `1`.
 pub(crate) fn stages_effect_before_last(stages: &[Expr]) -> bool {
     match stages.split_last() {
-        Some((_, before)) => before.iter().any(walk_body_may_have_effects),
+        Some((_, before)) => before.iter().any(|stage| {
+            walk_body_may_have_effects(stage)
+                || any_subexpr(stage, &mut |e| {
+                    matches!(
+                        e,
+                        Expr::Builtin(Builtin::InputLineNumber | Builtin::InputFilename)
+                    )
+                })
+        }),
         None => false,
     }
 }
@@ -114345,7 +114358,7 @@ mod tests {
 
     /// #4293: only an effect *before* the last stage counts -- the last stage
     /// runs once per input, in order, so its effects are in jq's order on any
-    /// route. (An effect behind a `def` call is pinned by the CLI test, since a
+    /// route -- and a read of the input state there counts like an effect. (An effect behind a `def` call is pinned by the CLI test, since a
     /// parsed program holds the call unresolved.)
     #[test]
     fn stages_effect_before_last_ignores_the_last_stage_4293() {
@@ -114356,6 +114369,9 @@ mod tests {
             ("debug | .a", true),
             ("(1, input) | error", true),
             ("(1, 2) | stderr | .a", true),
+            ("(input_line_number, 1) | . + 1", true),
+            ("input_filename | input", true),
+            ("1 | input_line_number", false),
         ] {
             let pipe = parse(filter).unwrap();
             let Expr::Pipe(stages) = &pipe else {
