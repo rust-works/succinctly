@@ -2816,33 +2816,33 @@ fn attach_dash_comment(mut tree: CommentTree, value: &OwnedValue, comment: Strin
         head.extend(meta.head_comment().iter().cloned());
         meta.with_head_foot(head, meta.foot_comment().to_vec())
     }
-    let block = tree.style() != "flow";
-    match (&mut tree, value) {
-        (CommentTree::Array(_, items), OwnedValue::Array(values))
-            if block && !values.is_empty() =>
-        {
-            if let Some(first) = items.first_mut() {
-                let meta = with_head(first.meta(), comment);
-                *first.meta_mut() = meta;
+    if tree.style() != "flow" {
+        match (&mut tree, value) {
+            (CommentTree::Array(_, items), OwnedValue::Array(values)) if !values.is_empty() => {
+                if let Some(first) = items.first_mut() {
+                    let meta = with_head(first.meta(), comment);
+                    *first.meta_mut() = meta;
+                    return tree;
+                }
             }
-        }
-        (CommentTree::Object(_, fields, _), OwnedValue::Object(map))
-            if block && !map.is_empty() =>
-        {
-            if let Some(first) = map
-                .iter()
-                .next()
-                .and_then(|(key, _)| fields.get_mut(key.as_str()))
-            {
-                let meta = with_head(first.meta(), comment);
-                *first.meta_mut() = meta;
+            (CommentTree::Object(_, fields, _), OwnedValue::Object(map)) if !map.is_empty() => {
+                let first = map
+                    .iter()
+                    .next()
+                    .and_then(|(key, _)| fields.get_mut(key.as_str()));
+                if let Some(first) = first {
+                    let meta = with_head(first.meta(), comment);
+                    *first.meta_mut() = meta;
+                    return tree;
+                }
             }
-        }
-        (own, _) => {
-            let meta = with_head(own.meta(), comment);
-            *own.meta_mut() = meta;
+            _ => {}
         }
     }
+    // A scalar, an empty or a flow container, or a tree that does not line up with its
+    // value (a merge key, a repeated key): the item itself, so the comment is never lost.
+    let meta = with_head(tree.meta(), comment);
+    *tree.meta_mut() = meta;
     tree
 }
 
