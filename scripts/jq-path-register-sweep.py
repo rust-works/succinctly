@@ -480,6 +480,14 @@ OPERANDS = [
     "(foreach (def g: .; def f: g; def g: . as {a:$a} | .; f) as $k (.; .; .))",
     "(foreach ((if true then . else . end) | . as {a:$a} | .) as $k (.; .; .))",
     "(foreach (def f: .; f | . as {a:$a} | .) as $k (.; .; .))",
+    # ...and the second review's: a name two chain alternatives bind, a `$x` behind `first` or a
+    # comma, a `$x` bound outside the source, and a run of calls to one pass-through `def`.
+    "(foreach (. as $a ?// {a:$a} | $a as {a:$b} | .) as $k (.; .; .))",
+    "(foreach (. as $x ?// [$x] | $x as {a:$a} | .) as $k (.; .; .))",
+    "(foreach (. as $x | first($x) as {a:$a} | .) as $k (.; .; .))",
+    "(foreach (. as $x | ($x, $x) as {a:$a} | .) as $k (.; .; .))",
+    "(. as $x | foreach ($x as {a:$a} | .) as $k (.; .; .))",
+    "(foreach (def f: .; f | f | f | f | . as {a:$a} | .) as $k (.; .; .))",
     "(foreach ((.|.) as {a:$a} | .) as $k (.; .; .))",
     # ...and the same inside a nested fold: a nested `foreach` over `.` moves the register
     # for the outer one, a nested `reduce` does not (it is backtracked), so the latter is

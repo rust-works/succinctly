@@ -76174,7 +76174,10 @@ fn test_foreach_source_destructuring_chain_on_the_register_refuses_4187() -> Res
 /// was driven by value and `del`/`=`/`|=` through it deleted or replaced the document. Also
 /// pinned: a mixed chain's bare alternative holding the register, a `def` body reading a `$x`
 /// bound around it, a call bound where its `def` was written (not to a later shadowing one), and
-/// a pass-through `if` or call as an earlier pipe stage. The contrasts are a `reduce`
+/// a pass-through `if` or call as an earlier pipe stage; then a name two chain alternatives bind,
+/// a `$x` behind `first` or a comma or bound outside the source, a run of 17 calls to one
+/// pass-through `def`, a `def` installed outside the source (the `DefCall` route), and an
+/// installed body whose own call names a spine `def` (which panicked). The contrasts are a `reduce`
 /// source (backtracked, so the root in jq too), a chain whose body emits only a bound name, a
 /// `def` and an `if` branch with no destructure on the taken path, a `$x` rebound by a pattern,
 /// a `$x` bound to a member, and a call whose body navigates. Every row captured from jq 1.7.1 with
@@ -76365,6 +76368,69 @@ fn test_foreach_source_destructure_behind_a_chain_bind_if_or_def_refuses_4278() 
             "",
             "Cannot index boolean with string \"a\"",
             5,
+        ),
+        (
+            doc,
+            r"def h: if false then h else . end; def k: h; del(foreach (. as $x | def h: .; k) as $y (.; .; .))",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach (. as $a ?// {a:$a} | $a as {a:$b} | .) as $y (.; .; .))",
+            "",
+            "Cannot index boolean with string \"a\"",
+            5,
+        ),
+        (
+            doc,
+            r"del(foreach (. as $x ?// [$x] | $x as {a:$a} | .) as $y (.; .; .))",
+            "",
+            "Cannot index object with number",
+            5,
+        ),
+        (
+            doc,
+            r"def f: .; del(foreach (f|f|f|f|f|f|f|f|f|f|f|f|f|f|f|f|f | . as {a:$a} | .) as $y (.; .; .))",
+            "",
+            "Invalid path expression with result {\"a\":false,\"b\":null}",
+            5,
+        ),
+        (
+            doc,
+            r". as $x | del(foreach ($x as {a:$a} | .) as $y (.; .; .))",
+            "",
+            "Invalid path expression with result {\"a\":false,\"b\":null}",
+            5,
+        ),
+        (
+            doc,
+            r"del(foreach (. as $x | first($x) as {a:$a} | .) as $y (.; .; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            doc,
+            r"del(foreach (. as $x | ($x, $x) as {a:$a} | .) as $y (.; .; .))",
+            "",
+            "Invalid path expression with result {\"a\":false,\"b\":null}",
+            5,
+        ),
+        (
+            doc,
+            r"def f: . as {a:$a} | .; del(foreach (f) as $y (.; .; .))",
+            "",
+            "Invalid path expression with result {\"a\":false,\"b\":null}",
+            5,
+        ),
+        (
+            doc,
+            r"def f: .; [path(foreach (f) as $y (.; .; .))]",
+            "[[]]\n",
+            "",
+            0,
         ),
     ])
 }
