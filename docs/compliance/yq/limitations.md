@@ -4984,8 +4984,14 @@ through (#4231: `.a[0].b = 5` over `- b: 1\n- # own\n  c: 2\n` keeps `# own`; it
 One gap remains on the cursor route: printing such an item by itself (`.a[1]` over that document)
 omits the comment, where yq prints `# own` above `c: 2` ([#4256](https://github.com/rust-works/succinctly/issues/4256)).
 Two other shapes keep losing it: an alias item (`- # al` / `  *x`; the DOM writer has no head
-comment for an alias, the explicit #2796 error) and a block-scalar item, which is read as an empty
-string before any comment is involved ([#4259](https://github.com/rust-works/succinctly/issues/4259)).
+comment for an alias, the explicit #2796 error) and a *scalar* item (`- # c` / `  plain`, a block
+scalar included; [#4268](https://github.com/rust-works/succinctly/issues/4268)).
+
+A block scalar whose `|`/`>` header is on a line of its own below the owning `-` or `key:`
+(`a:` / `  >` / `  text`) reads its text since #4259; a header with an anchor or tag in front of
+it on that line (`&x |`) still measures its content against the header's own line and reads
+as an empty string when the text sits at the header's indent
+([#4271](https://github.com/rust-works/succinctly/issues/4271)).
 
 Four known gaps this write shares with every other write form, none specific to #798:
 

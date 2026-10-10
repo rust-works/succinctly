@@ -62037,6 +62037,24 @@ fn test_block_scalar_header_on_its_own_line_4259() -> Result<()> {
             &[][..],
             "x:\n  y: >\n    folded more\n\n  z: 2\n",
         ),
+        (
+            "a:\r\n  >\r\n  text\r\nb: 1\r\n",
+            ".",
+            &["-o=json", "-I=0"][..],
+            "{\"a\":\"text\\n\",\"b\":1}\n",
+        ),
+        (
+            "a:\n\n  # x\n\n  >\n  text\n",
+            ".",
+            &["-o=json", "-I=0"][..],
+            "{\"a\":\"text\\n\"}\n",
+        ),
+        (
+            "a:\n  - k: # n\n      |\n        t\n",
+            ".",
+            &["-o=json", "-I=0"][..],
+            "{\"a\":[{\"k\":\"t\\n\"}]}\n",
+        ),
     ] {
         assert_eq!(
             run_yq_stdin_with_stderr(filter, input, args)?,

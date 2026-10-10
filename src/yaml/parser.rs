@@ -7580,6 +7580,37 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         Ok(())
     }
 
+    /// Whether the nearest earlier line that is neither blank nor a comment leaves its value for
+    /// the next line: a key written up to its colon (`a:`, `- k:`) or a bare `-`, a trailing
+    /// comment aside. The only place a block scalar header on a line of its own can belong
+    /// (#4259); a header anywhere else is not a value slot and keeps the path it always took.
+    fn previous_content_line_defers_its_value(&self) -> bool {
+        let mut line_start = self.pos;
+        while line_start > 0 && !is_line_break(self.input[line_start - 1]) {
+            line_start -= 1;
+        }
+        let mut end = line_start;
+        while end > 0 {
+            let mut prev_end = end - 1;
+            if prev_end > 0 && self.input[prev_end] == b'\n' && self.input[prev_end - 1] == b'\r' {
+                prev_end -= 1;
+            }
+            let mut prev_start = prev_end;
+            while prev_start > 0 && !is_line_break(self.input[prev_start - 1]) {
+                prev_start -= 1;
+            }
+            end = prev_start;
+            let line = &self.input[prev_start..prev_end];
+            let rest = &line[line.iter().take_while(|&&b| b == b' ').count()..];
+            if rest.is_empty() || rest[0] == b'#' {
+                continue;
+            }
+            return line_ends_with_colon_before_comment(rest)
+                || (rest[0] == b'-' && line_is_bare_dash_before_comment(rest));
+        }
+        false
+    }
+
     /// Dispatch the block-context node that begins at the cursor, treating
     /// `indent` as its indentation level.
     ///
@@ -7801,7 +7832,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // (`a:` / `  >` / `  text`), where the plain-scalar path below measures it
             // against the header's own line and cut the scalar short. Inside a container
             // only: the document root has its own handling (`>` at column 0).
-            Some(b'|' | b'>') if !self.json_strict && self.type_stack.len() > 1 => {
+            Some(b'|' | b'>')
+                if !self.json_strict
+                    && self.type_stack.len() > 1
+                    && self.previous_content_line_defers_its_value() =>
+            {
                 self.check_mapping_under_mapping_gap(indent, false)?;
                 self.close_deeper_indents(indent);
                 self.attach_document_root_node(indent);
@@ -7891,6 +7926,29 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
         Ok(())
     }
+}
+
+/// Whether `line` is, ignoring a trailing ` #` comment and the whitespace before it, a key
+/// written up to its colon (`k:`, `- k:`).
+pub(crate) fn line_ends_with_colon_before_comment(line: &[u8]) -> bool {
+    let code_end = (0..line.len())
+        .find(|&i| line[i] == b'#' && (i == 0 || matches!(line[i - 1], b' ' | b'\t')))
+        .unwrap_or(line.len());
+    let mut end = code_end;
+    while end > 0 && matches!(line[end - 1], b' ' | b'\t') {
+        end -= 1;
+    }
+    end > 0 && line[end - 1] == b':'
+}
+
+/// Whether `line` (already without its leading spaces) is a `-` and nothing else, a trailing
+/// comment aside.
+fn line_is_bare_dash_before_comment(line: &[u8]) -> bool {
+    line.first() == Some(&b'-')
+        && line[1..]
+            .iter()
+            .find(|&&b| !matches!(b, b' ' | b'\t'))
+            .map_or(true, |&b| b == b'#')
 }
 
 /// Scan a tag's raw extent starting at a `!` in `bytes[start..]` (must be

@@ -6306,19 +6306,6 @@ impl<'a> YamlString<'a> {
         (content_start, content_end)
     }
 
-    /// Whether `line` is, ignoring a trailing ` #` comment and the whitespace before it, a
-    /// key written up to its colon (`k:`).
-    fn ends_with_colon_before_comment(line: &[u8]) -> bool {
-        let code_end = (0..line.len())
-            .find(|&i| line[i] == b'#' && (i == 0 || matches!(line[i - 1], b' ' | b'\t')))
-            .unwrap_or(line.len());
-        let mut end = code_end;
-        while end > 0 && matches!(line[end - 1], b' ' | b'\t') {
-            end -= 1;
-        }
-        end > 0 && line[end - 1] == b':'
-    }
-
     /// The indent of the block that owns a block scalar whose header is the first thing on
     /// its line (`a:` / `  >` / `  text`, `-` / `  |` / `  text`, #4259), or `None` when
     /// something else comes first on the line (`key: |`, `- |`, `--- |`) and
@@ -6361,7 +6348,9 @@ impl<'a> YamlString<'a> {
                     .map(|i| (i, &rest[1 + i..]));
                 return Some(match after {
                     // A key whose value is deferred (`- k:`, comment aside): the key's own column.
-                    Some((gap, content)) if Self::ends_with_colon_before_comment(content) => {
+                    Some((gap, content))
+                        if crate::yaml::parser::line_ends_with_colon_before_comment(content) =>
+                    {
                         indent + 1 + gap
                     }
                     _ => indent,
