@@ -22557,8 +22557,8 @@ fn single_slice_bound<S: EvalSemantics, V: DocumentValue>(
     seen
 }
 
-/// Answer `E[a:b][k]` / `E[a:b] | length` from the slice's resolved range
-/// without building the slice (#4195). `slice` is the stage
+/// Answer `E[a:b][k]` / `E[a:b] | length` / `E[a:b] | first` / `| last` (#4288) from the
+/// slice's resolved range without building the slice (#4195). `slice` is the stage
 /// [`fusable_slice_read`] returned.
 ///
 /// `None` means "not modelled here", and the caller runs today's route on the
@@ -22583,6 +22583,11 @@ fn try_fused_slice_read<S: EvalSemantics, V: DocumentValue>(
     let Expr::SliceExpr { target, start, end } = slice else {
         return None; // patchcov: coverage tolerate-line reason="unreachable: fusable_slice_read returns only a SliceExpr stage"
     };
+    // jq's `first` is `.[0]` and `last` is `.[-1]`; yq's are other builtins. Decided before
+    // anything is evaluated, so yq pays nothing for the decline.
+    if matches!(read, SliceRead::First | SliceRead::Last) && S::TAG != EvalTag::Jq {
+        return None;
+    }
     // The target first: it is the cheapest thing to rule out, so a string, `null`
     // or object target declines before either bound is evaluated.
     let target = match eval_single::<S, V>(target, value.clone(), false, cursor) {
@@ -22600,10 +22605,8 @@ fn try_fused_slice_read<S: EvalSemantics, V: DocumentValue>(
         resolve_computed_slice_bounds::<S>(SliceTargetKind::Sliceable, &start, &end).ok()?;
     let len = crate::jq::array_index::len_checked_memoized(&elements).ok()?;
     let range = SliceBounds::from_literals(start, end).resolve(len);
-    // jq's `first` is `.[0]` and `last` is `.[-1]`; yq's are other builtins.
     let k = match read {
         SliceRead::Index(k) => k,
-        SliceRead::First | SliceRead::Last if S::TAG != EvalTag::Jq => return None,
         SliceRead::First => 0,
         SliceRead::Last => -1,
         SliceRead::Length => return Some(OwnedValue::Int(range.len() as i64)),
