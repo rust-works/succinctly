@@ -75,6 +75,57 @@ fn splat(node: &OwnedValue) -> Vec<OwnedValue> {
 pub(crate) fn collect_object<S: EvalSemantics>(
     entries: Vec<UnionEntry>,
 ) -> Result<Vec<OwnedValue>, EvalError> {
+    if !entries.is_empty() && entries.iter().all(|e| matches!(e, UnionEntry::Pair(_))) {
+        return collect_pairs::<S>(entries);
+    }
+    collect_union::<S>(entries)
+}
+
+/// [`collect_union`] for a construction of pair entries only (#4193), without the node model.
+///
+/// Every pair contributes a union node with one child, so `N` is 1, no node can be smaller than
+/// it, and the loop in [`collect_union`] runs once over `children[k][0]`, whose `splat` is the
+/// pair's own maps. What is left is a left fold over those lists: the first non-empty one seeds
+/// the aggregate, each later one is cross-multiplied into it, and one that is empty empties it
+/// (the next then seeds it afresh). That is what this does directly on the owned maps, which is
+/// the common case of a `{...}` with a `select` in it and has no business cloning every value
+/// through `Array` wrappers. [`collect_union`] stays the one place that models the node layout;
+/// `pairs_fold_matches_the_node_model` pins the two together.
+fn collect_pairs<S: EvalSemantics>(entries: Vec<UnionEntry>) -> Result<Vec<OwnedValue>, EvalError> {
+    let mut aggregate: Vec<OwnedValue> = Vec::new();
+    for entry in entries {
+        let UnionEntry::Pair(mut maps) = entry else {
+            unreachable!("collect_object only sends pair entries here"); // patchcov: coverage tolerate-line reason="unreachable: the caller checked every entry is a Pair before routing here (#4193)"
+        };
+        if aggregate.is_empty() {
+            aggregate = maps;
+            continue;
+        }
+        // One map each is the case that matters: merged by move, with no copy of either.
+        if let (1, 1) = (aggregate.len(), maps.len()) {
+            if let (Some(held), Some(addition)) = (aggregate.pop(), maps.pop()) {
+                aggregate.push(arith_mul::<S>(held, addition, MergeFlags::default())?);
+            }
+            continue;
+        }
+        let mut next: Vec<OwnedValue> = Vec::new();
+        for held in &aggregate {
+            next.try_reserve(maps.len())
+                .map_err(|_| cannot_reserve_cross_product(&[aggregate.len(), maps.len()]))?;
+            for addition in &maps {
+                next.push(arith_mul::<S>(
+                    held.clone(),
+                    addition.clone(),
+                    MergeFlags::default(),
+                )?);
+            }
+        }
+        aggregate = next;
+    }
+    Ok(aggregate)
+}
+
+fn collect_union<S: EvalSemantics>(entries: Vec<UnionEntry>) -> Result<Vec<OwnedValue>, EvalError> {
     let mut union: Vec<OwnedValue> = vec_with_capacity(entries.len());
     for entry in entries {
         match entry {
@@ -153,6 +204,60 @@ mod tests {
                 .collect::<IndexMap<_, _>>()
                 .into(),
         )
+    }
+
+    /// #4193: the pair-only fold is `collect_union`'s node model with the wrappers taken off, for
+    /// every shape of entry list: lone, repeated key, an empty entry first / middle / last, and
+    /// fan-out of different widths.
+    #[test]
+    fn pairs_fold_matches_the_node_model() {
+        let one = |k: &str, n: i64| object(&[(k, int(n))]);
+        let nested = |k: &str, inner: &str, n: i64| object(&[(k, object(&[(inner, int(n))]))]);
+        let entry = |maps: Vec<OwnedValue>| UnionEntry::Pair(maps);
+        let cases: Vec<Vec<Vec<OwnedValue>>> = alloc::vec![
+            alloc::vec![alloc::vec![one("a", 1)]],
+            alloc::vec![alloc::vec![one("a", 1)], alloc::vec![one("b", 2)]],
+            alloc::vec![alloc::vec![one("a", 1)], alloc::vec![one("a", 2)]],
+            alloc::vec![
+                alloc::vec![nested("a", "x", 1)],
+                alloc::vec![nested("a", "y", 2)]
+            ],
+            alloc::vec![alloc::vec![]],
+            alloc::vec![alloc::vec![], alloc::vec![one("b", 2)]],
+            alloc::vec![
+                alloc::vec![one("a", 1)],
+                alloc::vec![],
+                alloc::vec![one("c", 3)]
+            ],
+            alloc::vec![
+                alloc::vec![one("a", 1)],
+                alloc::vec![one("b", 2)],
+                alloc::vec![]
+            ],
+            alloc::vec![alloc::vec![one("a", 1)], alloc::vec![], alloc::vec![]],
+            alloc::vec![
+                alloc::vec![one("a", 1), one("a", 2)],
+                alloc::vec![one("b", 3), one("b", 4), one("b", 5)],
+            ],
+            alloc::vec![
+                alloc::vec![one("a", 1), one("a", 2)],
+                alloc::vec![],
+                alloc::vec![one("c", 3), one("c", 4)],
+            ],
+            alloc::vec![
+                alloc::vec![one("a", 1)],
+                alloc::vec![one("b", 2), one("b", 3)],
+                alloc::vec![one("c", 4)],
+            ],
+        ];
+        for case in cases {
+            let build = || case.iter().cloned().map(entry).collect::<Vec<_>>();
+            assert_eq!(
+                collect_pairs::<YqSemantics>(build()).unwrap(),
+                collect_union::<YqSemantics>(build()).unwrap(),
+                "{case:?}"
+            );
+        }
     }
 
     fn array(items: &[OwnedValue]) -> OwnedValue {
