@@ -5656,6 +5656,7 @@ fn get_inputs(
                     let documents_before = values.len();
                     let mut ends = Vec::new();
                     let mut offset = 0;
+                    let mut faults = LineCounter::new(raw.as_bytes());
                     loop {
                         let segment = &raw[offset..];
                         let (parsed, parse_error) = parse_json_stream_prefix(segment);
@@ -5697,17 +5698,17 @@ fn get_inputs(
                         let (Some(error), Some(start)) = (parse_error, start) else {
                             break;
                         };
+                        let (_, line, resume) = meet_fault(&mut faults, raw.as_bytes(), start);
                         resumed_errors.push((
                             values.len(),
                             TrailingParseError {
                                 error,
                                 source: u32::try_from(src).unwrap_or(u32::MAX),
-                                line: u32::try_from(parse_error_line(raw.as_bytes(), start))
-                                    .unwrap_or(u32::MAX),
+                                line: u32::try_from(line).unwrap_or(u32::MAX),
                                 seq_warning: false,
                             },
                         ));
-                        let mut next = read_after_fault(raw.as_bytes(), start);
+                        let mut next = resume;
                         while next < raw.len() && !raw.is_char_boundary(next) {
                             next += 1;
                         }
@@ -6022,22 +6023,34 @@ impl EofTail {
             .map_or(0, |at| at + 1);
         let partial = (last.len() - line_start) % JQ_READ_CHUNK;
         let final_read = last.len() - partial;
-        let (values, malformed) = split_json_values(last);
-        // A parse error ends the stream's values, and jq raises it where its
-        // reads reach the malformed bytes.
-        if let Some(start) = malformed {
-            return start >= final_read;
-        }
-        match values.last() {
-            // At `last.len()` for a bare token that the end of input completes.
-            Some(&(start, end)) => {
-                let completes_at = if matches!(last[start], b'"' | b'[' | b'{') {
-                    end - 1
+        // The last thing jq completes in this source: a value, or a parse error
+        // where its reads meet the fault. Past a fault jq resumes at its next
+        // read (#4311), so the stream's last event may follow one.
+        let mut faults = LineCounter::new(last);
+        let mut last_event = None;
+        let mut offset = 0;
+        loop {
+            let (values, malformed) = split_json_values(&last[offset..]);
+            if let Some(&(start, end)) = values.last() {
+                // At `last.len()` for a bare token that the end of input completes.
+                last_event = Some(if matches!(last[offset + start], b'"' | b'[' | b'{') {
+                    offset + end - 1
                 } else {
-                    end
-                };
-                completes_at >= final_read
+                    offset + end
+                });
             }
+            let Some(start) = malformed else {
+                break;
+            };
+            let (detected, _, resume) = meet_fault(&mut faults, last, offset + start);
+            last_event = Some(detected);
+            if resume >= last.len() {
+                break;
+            }
+            offset = resume;
+        }
+        match last_event {
+            Some(completes_at) => completes_at >= final_read,
             // No value of its own: a bare number or literal that ends an
             // earlier source is completed by this one's first byte, or at the
             // end when it is empty, and that is the final read only when the
@@ -6466,6 +6479,21 @@ impl<'a> LineCounter<'a> {
         self.line_at_read_of(completes_at)
     }
 
+    /// Where the read holding `at` ends, given that the last call was
+    /// [`line_at_read_of`](Self::line_at_read_of)`(at)`: one past the next
+    /// newline, or the end of its [`JQ_READ_CHUNK`] bytes, whichever is first
+    /// (#4311). Uses the line start and next newline that call left behind, so
+    /// it costs nothing more.
+    fn read_end(&self, at: usize) -> usize {
+        let at = at.max(self.line_start);
+        let chunk_end =
+            self.line_start + ((at - self.line_start) / JQ_READ_CHUNK + 1) * JQ_READ_CHUNK;
+        match self.next_newline {
+            Some(newline) if newline < chunk_end && newline < self.bytes.len() => newline + 1,
+            _ => chunk_end.min(self.bytes.len()),
+        }
+    }
+
     /// [`read_end_line`](Self::read_end_line) for the byte at `completes_at`
     /// itself (the end of input when it is `bytes.len()`): the newlines up to
     /// the end of the read holding it.
@@ -6651,26 +6679,26 @@ fn parse_error_line(bytes: &[u8], start: usize) -> usize {
     LineCounter::new(bytes).line_at_read_of(parse_error_detection(bytes, start))
 }
 
-/// Where jq resumes after the parse error in the malformed value starting at
-/// `start` (#4311): the start of the read after the one that met the fault,
-/// which runs through the next newline or to the end of its [`JQ_READ_CHUNK`]
-/// bytes, whichever comes first; the end of input when the fault is there.
-/// jq discards what is left of that read, so `1 } 2\n3\n` reads `1`, the
-/// error, then `3`.
-fn read_after_fault(bytes: &[u8], start: usize) -> usize {
+/// The fault in the malformed value starting at `start`, as jq meets it
+/// (#4311): the byte it detects it at ([`parse_error_detection`]), its line,
+/// and where jq resumes reading -- the start of the read after the one holding
+/// that byte, which runs through the next newline or to the end of its
+/// [`JQ_READ_CHUNK`] bytes; the end of input when the fault is there. jq
+/// discards what is left of that read, so `1 } 2\n3\n` reads `1`, the error,
+/// then `3`.
+///
+/// `counter` is carried across the faults of one source, whose starts only
+/// increase, so a source with many faults is scanned once rather than from its
+/// first byte per fault.
+fn meet_fault(counter: &mut LineCounter<'_>, bytes: &[u8], start: usize) -> (usize, usize, usize) {
     let detected = parse_error_detection(bytes, start);
-    if detected >= bytes.len() {
-        return bytes.len();
-    }
-    let line_start = bytes[..detected]
-        .iter()
-        .rposition(|&b| b == b'\n')
-        .map_or(0, |at| at + 1);
-    let read_end = line_start + ((detected - line_start) / JQ_READ_CHUNK + 1) * JQ_READ_CHUNK;
-    match bytes[detected..].iter().position(|&b| b == b'\n') {
-        Some(offset) if detected + offset < read_end => detected + offset + 1,
-        _ => read_end.min(bytes.len()),
-    }
+    let line = counter.line_at_read_of(detected);
+    let resume = if detected >= bytes.len() {
+        bytes.len()
+    } else {
+        counter.read_end(detected)
+    };
+    (detected, line, resume)
 }
 
 /// Whether jq never reads the value at `span` because the fault in the
@@ -6783,17 +6811,40 @@ fn stitch_json_file_seams<'a>(raws: impl Iterator<Item = &'a mut Vec<u8>>) {
 }
 
 /// Where the open tail of a file starts ([`stitch_json_file_seams`]), if it has one.
+///
+/// Past a malformed byte the search goes on where jq resumes reading (#4311): a program
+/// whose `input` catches the error reads on, so a token cut off after it still continues
+/// in the next file.
 fn open_tail_start(raw: &[u8]) -> Option<usize> {
-    match split_json_values(raw) {
-        // The splitter gave up at `start`: a truncated token runs into the end of the file;
-        // anything else is a malformed byte no later file can repair.
-        (_, Some(start)) => token_runs_to_end(&raw[start..]).then_some(start),
-        // Every token is whole, but a bare number or keyword at the very end is only
-        // delimited by the next byte.
-        (spans, None) => spans
-            .last()
-            .filter(|&&(start, end)| end == raw.len() && !matches!(raw[start], b'{' | b'[' | b'"'))
-            .map(|&(start, _)| start),
+    let mut faults = LineCounter::new(raw);
+    let mut offset = 0;
+    loop {
+        match split_json_values(&raw[offset..]) {
+            // The splitter gave up at `start`: a truncated token runs into the end of the
+            // file; anything else is a malformed byte, after which jq resumes.
+            (_, Some(start)) => {
+                let start = offset + start;
+                if token_runs_to_end(&raw[start..]) {
+                    return Some(start);
+                }
+                let (_, _, resume) = meet_fault(&mut faults, raw, start);
+                if resume >= raw.len() {
+                    return None;
+                }
+                offset = resume;
+            }
+            // Every token is whole, but a bare number or keyword at the very end is only
+            // delimited by the next byte.
+            (spans, None) => {
+                return spans
+                    .last()
+                    .map(|&(start, end)| (offset + start, offset + end))
+                    .filter(|&(start, end)| {
+                        end == raw.len() && !matches!(raw[start], b'{' | b'[' | b'"')
+                    })
+                    .map(|(start, _)| start)
+            }
+        }
     }
 }
 

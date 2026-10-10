@@ -7622,7 +7622,10 @@ discards the rest of the read the error is in and goes on parsing at the next on
 files too, and so does succinctly since [#4311](https://github.com/rust-works/succinctly/issues/4311)
 (`1 } 2\n3\n` reads `1`, the error, then `3`). On every route, a number or literal that the
 faulty byte itself completes is lost to the error (`1\n2]` reads only `1`; `1\n2 ]` reads
-`2` too), as in jq. Since
+`2` too), as in jq. Where jq resumes is counted in 4095-byte reads of the file's own bytes,
+and succinctly counts them in the text after invalid UTF-8 became U+FFFD, so on a line longer
+than one read that holds invalid bytes the resumption point can move by a few bytes, the
+residual recorded below for the line model. Since
 [#4308](https://github.com/rust-works/succinctly/issues/4308) the `(at …)` marker a later
 error names after the parse error has been read matches jq's: every newline up to the end of
 the read in which jq detects the fault, at the fault itself for a malformed container

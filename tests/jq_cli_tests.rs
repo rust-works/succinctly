@@ -124616,12 +124616,51 @@ fn test_input_resumes_after_a_caught_parse_error_4311() -> Result<()> {
             "{filter} over {doc:?}: {stderr}"
         );
     }
-    // Into the next file.
-    let (stdout, _, code, _) = run_jq_over_byte_files(
-        &["-nc", r#"[limit(4; repeat(try input catch "E"))]"#],
-        &[b"1\n}\n", b"2\n"],
-    )?;
-    assert_eq!((stdout.as_str(), code), ("[1,\"E\",2,\"E\"]\n", 0));
+    // Into the next file, and a token cut off after a fault continues there.
+    let reads = r#"[limit(6; repeat(try input catch "E"))]"#;
+    let reads_and_lines =
+        r#"[limit(4; repeat(try [input, input_line_number] catch ["E", input_line_number]))]"#;
+    for (files, filter, expected) in [
+        (
+            &[&b"1\n}\n"[..], b"2\n"][..],
+            reads,
+            "[1,\"E\",2,\"E\",\"E\",\"E\"]\n",
+        ),
+        (
+            &[b"1\n}\n2\n3", b"3\n4\n"],
+            reads,
+            "[1,\"E\",2,33,4,\"E\"]\n",
+        ),
+        (
+            &[b"}\n[1,", b"2]\n5\n"],
+            reads,
+            "[\"E\",[1,2],5,\"E\",\"E\",\"E\"]\n",
+        ),
+        (
+            &[b"}\ntr", b"ue\n"],
+            reads,
+            "[\"E\",true,\"E\",\"E\",\"E\",\"E\"]\n",
+        ),
+        // A value read after resuming is the stream's last: the first read past
+        // the end is already `<unknown>` at line 0.
+        (
+            &[b"}\n2"],
+            reads_and_lines,
+            "[[\"E\",1],[2,1],[\"E\",0],[\"E\",0]]\n",
+        ),
+        (
+            &[b"[1,}\n2"],
+            reads_and_lines,
+            "[[\"E\",1],[2,1],[\"E\",0],[\"E\",0]]\n",
+        ),
+    ] {
+        let (stdout, stderr, code, _) = run_jq_over_byte_files(&["-nc", filter], files)?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (expected, 0),
+            "{files:?}: {stderr}"
+        );
+    }
     // Plain processing still stops at the first parse error, and loses the
     // number its faulty byte completes, as jq does.
     let (stdout, _, code, _) = run_jq_over_byte_files(&["-c", "."], &[b"1\n2]\n3\n"])?;
