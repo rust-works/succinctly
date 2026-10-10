@@ -43438,7 +43438,7 @@ mod tests {
         let root = index.root(json);
         let fused = |src: &str, with_cursor: bool| {
             let Expr::IndexExpr { target, key } = crate::jq::parse(src).unwrap() else {
-                panic!("an index over a slice: {src}");
+                panic!("an index over a slice: {src}"); // patchcov: coverage tolerate-line reason="unreachable: every source below parses to an IndexExpr over a SliceExpr; this is the test's own malformed-fixture message (#4317)"
             };
             fused_slice_index::<JqSemantics, _>(
                 &target,
@@ -43463,6 +43463,8 @@ mod tests {
             assert_eq!(fused(".a[1+0:][.s]", with_cursor), None);
             assert_eq!(fused(".a[1+0:][.missing]", with_cursor), None);
             assert_eq!(fused(".a[1+0:][.bad.deeper]", with_cursor), None);
+            // the whole document as the key: a value, or a cursor on it, that is no number
+            assert_eq!(fused(".a[1+0:][.]", with_cursor), None);
             // a target that is not an array
             assert_eq!(fused(".s[1+0:][.n]", with_cursor), None);
         }
