@@ -61901,6 +61901,16 @@ fn test_comment_after_a_sequence_dash_survives_a_dom_write_4231() -> Result<()> 
             ".[0].k = \"w\"",
             &[][..],
             "- # top\n  k: w\n- # t2\n  - 1\n",
+        ),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, input, args)?,
+            (expected.into(), String::new(), 0),
+            "{filter} {args:?} over {input:?}"
+        );
+    }
+    Ok(())
+}
 
 /// Pinned yq v4.53.3: a block scalar whose `|`/`>` header sits on a line of its own, below the
 /// `-` or `key:` that owns it, takes its content from lines indented more than that *parent*
