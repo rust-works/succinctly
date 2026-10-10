@@ -5408,7 +5408,8 @@ yq's `PathElement` token is `\.[^ ;\}\{\:\[\],\|\.\[\(\)=\n!]+\??`, so every ope
 straight after a `.` or a name stays in it, and `.a+1`, `.a%1`, `.a<1`, `.a>1`, `.a@1`, `.>1` and
 `.+1` are the keys `a+1`, ... where `succinctly yq` read operations before. A space ends the name
 (`.a + 1`, `.a >1` and `. > 1` still compare), `=` and `!` are never in one (`.a==1`, `.a!=1` compare,
-`.a>=1` is the assignment `.a> = 1`), and `succinctly jq` is unchanged. `.> 1` is a lexer error in yq
+`.a>=1` is the assignment `.a> = 1`, and `.a+=1` writes a key `a+` instead of incrementing `a`), and
+`succinctly jq` is unchanged. `.> 1` is a lexer error in yq
 and a parse error here (the message differs).
 
 A wildcard key costs one pass over the mapping's keys plus one keyed lookup per match, and

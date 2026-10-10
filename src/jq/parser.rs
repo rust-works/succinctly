@@ -362,6 +362,12 @@ fn is_yq_path_element_char(c: char) -> bool {
     )
 }
 
+/// A yq name that does not start like an identifier (`.1`, `.>1`, `.$x`, `.@x`): a path-element
+/// character that is neither a letter nor `_`, and not the `"` that opens a quoted name.
+fn begins_yq_name_outside_an_identifier(c: char) -> bool {
+    is_yq_path_element_char(c) && c != '"' && !is_ident_start_char(c)
+}
+
 /// The one definition of "does a bare identifier (function/parameter name,
 /// zero-arg call, `def` name) start here" -- underscore included, since jq
 /// accepts `_` as an identifier-start character throughout and
@@ -1120,6 +1126,16 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `skip_ws()` after the `.` of a path, except in yq mode when a name character follows
+    /// at once: yq's name takes tab, carriage return, U+00A0 and `#` as part of the key
+    /// (`.<TAB>a` is the key `\ta`, `.#c` the key `#c`), so there is no whitespace or comment
+    /// to skip (#4237).
+    fn skip_ws_after_dot(&mut self) {
+        if !(self.mode == ParserMode::Yq && self.peek().is_some_and(is_yq_path_element_char)) {
+            self.skip_ws();
+        }
+    }
+
     /// Check if we're at the end of input.
     fn is_eof(&self) -> bool {
         self.pos >= self.input.len()
@@ -1337,20 +1353,18 @@ impl<'a> Parser<'a> {
         Ok(self.input[start..self.pos].to_string())
     }
 
-    /// Parse an unquoted field name. In yq, `?` and `/` can be part of the
-    /// key: `.x?//1` reads `x?//1`, while `.x??` reads `x?` optionally.
-    /// Leave only the final adjacent `?` for the navigation-optional parser.
+    /// Parse an unquoted field name. In yq the name is the longest run of
+    /// [`is_yq_path_element_char`] bytes, so `?`, `/`, a tab, a carriage return, a
+    /// nonbreaking space (U+00A0) and every operator character belong to it
+    /// (`.x?//1` reads `x?//1`, `.a+1` reads `a+1`; #3377, #4237); a final `?` is left for
+    /// the navigation-optional parser, so `.x??` reads `x?` optionally.
     ///
-    /// #3377: real yq also keeps a tab, carriage return, or nonbreaking
-    /// space (U+00A0) that follows the field stem as part of the key
-    /// itself -- confirmed live against yq v4.53.3 with `{"x\t":7}` /
-    /// `.x\t?` (and `.x\t` with no suffix at all): both print `7`, not
-    /// `null`. Unlike a literal space or newline (`unexpected '?' after
-    /// whitespace` below, #3370), these three bytes are never lexer
-    /// separators in real yq's unquoted-field grammar, so they belong in
-    /// this loop's own charset rather than being left to `skip_ws()` --
-    /// which would otherwise discard them before the trailing-`?` check
-    /// ever sees them.
+    /// The bytes that are not whitespace to yq (tab, carriage return, U+00A0) are why the
+    /// callers do not `skip_ws()` before this in yq mode when such a byte follows the `.`
+    /// (see [`Self::skip_ws_after_dot`]): confirmed live against yq v4.53.3 with
+    /// `{"x\t":7}` / `.x\t?` (and `.x\t` with no suffix at all): both print `7`, not
+    /// `null`. A literal space or newline does end a name (`unexpected '?' after
+    /// whitespace` below, #3370).
     fn parse_field_ident(&mut self) -> Result<String, ParseError> {
         // Yq accepts an empty name before the optional marker (`.?`), and
         // a leading `?` can itself be part of a longer unquoted name (`.??`).
@@ -1364,7 +1378,7 @@ impl<'a> Parser<'a> {
         let mut name = if self.mode == ParserMode::Yq
             && self
                 .peek()
-                .is_some_and(|c| is_yq_path_element_char(c) && c != '"' && !is_ident_start_char(c))
+                .is_some_and(begins_yq_name_outside_an_identifier)
         {
             String::new()
         } else {
@@ -2940,7 +2954,7 @@ impl<'a> Parser<'a> {
                 // is what makes `. style = ...` a root metadata write (#798)
                 // rather than a field access, see below.
                 let dot_end = self.pos;
-                self.skip_ws();
+                self.skip_ws_after_dot();
 
                 // Check for `..` (recursive descent)
                 if self.peek() == Some('.') {
@@ -7550,7 +7564,7 @@ impl<'a> Parser<'a> {
                 Some('.') => {
                     self.next();
                     let dot_end = self.pos;
-                    self.skip_ws();
+                    self.skip_ws_after_dot();
 
                     // Yq allows `.?` as an empty field name, but a space or
                     // newline between the dot and `?` is a lexer error.

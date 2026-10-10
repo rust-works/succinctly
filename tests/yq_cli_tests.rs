@@ -37485,6 +37485,22 @@ fn test_path_element_takes_operator_characters_4237() -> Result<()> {
             "{filter}"
         );
     }
+    // A tab, a carriage return and `#` right after the `.` are name bytes too, not
+    // whitespace or a comment, and an unspaced compound assignment writes the key
+    // `a+` (it is `.a+ = 1`), not a sum.
+    let doc2 = "{\"a\":1,\"\\ta\":3,\"#c\":5}";
+    for (filter, expected) in [
+        (".\ta", "3\n"),
+        (".#c", "5\n"),
+        (".a+=1", "{\"a\":1,\"\\ta\":3,\"#c\":5,\"a+\":1}\n"),
+        (".a += 1", "{\"a\":2,\"\\ta\":3,\"#c\":5}\n"),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, doc2, &["-p=json", "-o=json", "-I=0"])?,
+            (expected.into(), String::new(), 0),
+            "{filter:?}"
+        );
+    }
     // The same over a stream of numbers, where a key lookup on a scalar is empty.
     for (filter, expected) in [
         (r"select(.>1)", ""),

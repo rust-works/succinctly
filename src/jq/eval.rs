@@ -95949,7 +95949,7 @@ mod tests {
     /// `regression_issue_400_pipe_keeps_the_prefix_before_an_error` above).
     #[test]
     fn test_pipe_partial_prefix_discarded_in_yq_mode_2373() {
-        yq_query!(b"null", r#"(1,2,error("x")) | .+10"#,
+        yq_query!(b"null", r#"(1,2,error("x")) | . + 10"#,
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "x");
             }
