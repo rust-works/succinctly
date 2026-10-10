@@ -12040,13 +12040,15 @@ fn try_single_generic<S: EvalSemantics, V: DocumentValue>(
 /// copies the slice at most once, on the first fallback that asks, however
 /// many cursor elements the arm then runs it for.
 ///
-/// It also answers whether any stage needs path context (#3886): from the
-/// given pipe's own memo, which outlives this dispatch, or for a sub-slice
-/// once per `PipeWhole`, however many cursor elements share it.
+/// It also answers whether any stage needs path context (#3886), and whether
+/// a stage before the last may have an effect (#4293): from the given pipe's
+/// own memo, which outlives this dispatch, or for a sub-slice once per
+/// `PipeWhole`, however many cursor elements share it.
 struct PipeWhole<'a> {
     given: Option<&'a Expr>,
     rebuilt: core::cell::OnceCell<Expr>,
     needs_path_context: core::cell::OnceCell<bool>,
+    effect_before_last: core::cell::OnceCell<bool>,
 }
 
 impl<'a> PipeWhole<'a> {
@@ -12055,6 +12057,7 @@ impl<'a> PipeWhole<'a> {
             given: Some(expr),
             rebuilt: core::cell::OnceCell::new(),
             needs_path_context: core::cell::OnceCell::new(),
+            effect_before_last: core::cell::OnceCell::new(),
         }
     }
 
@@ -12063,6 +12066,7 @@ impl<'a> PipeWhole<'a> {
             given: None,
             rebuilt: core::cell::OnceCell::new(),
             needs_path_context: core::cell::OnceCell::new(),
+            effect_before_last: core::cell::OnceCell::new(),
         }
     }
 
@@ -12078,6 +12082,19 @@ impl<'a> PipeWhole<'a> {
             _ => *self
                 .needs_path_context
                 .get_or_init(|| exprs.iter().any(needs_path_context)),
+        }
+    }
+
+    /// Whether a stage of `exprs` before the last may have an effect, with
+    /// [`needs_path_context`](Self::needs_path_context)'s memo rules.
+    fn effect_before_last(&self, exprs: &[Expr]) -> bool {
+        match self.given {
+            Some(Expr::Pipe(stages)) if core::ptr::eq(stages.as_slice(), exprs) => {
+                crate::jq::eval::pipe_effect_before_last(stages)
+            }
+            _ => *self
+                .effect_before_last
+                .get_or_init(|| crate::jq::eval::stages_effect_before_last(exprs)),
         }
     }
 
@@ -12168,6 +12185,16 @@ fn eval_single_pipe<S: EvalSemantics, V: DocumentValue>(
 
     if exprs.is_empty() {
         return GenericResult::One(value);
+    }
+
+    // #4293: the staged fold below runs each stage over every input before the
+    // next stage sees the first, so an effect before the last stage ran for an
+    // output jq never reaches -- `[(1, ("x" | debug)) | .x]` wrote a `DEBUG`
+    // line, `[.[] | (input, input) | error]` consumed an input, ahead of the
+    // raise that ends jq's run. The streaming driver runs the pipe depth-first.
+    // A lone stage has no later stage for its effects to run ahead of.
+    if S::PIPE_EFFECTS_RUN_DEPTH_FIRST && exprs.len() > 1 && whole.effect_before_last(exprs) {
+        return collect_each_generic::<S, V>(whole.get(exprs), value, optional, cursor);
     }
 
     // Keep the bind alive while a downstream stop/error unwinds into

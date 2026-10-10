@@ -123763,3 +123763,124 @@ fn test_string_split_of_an_empty_string_and_by_an_empty_separator_4260() -> Resu
     }
     Ok(())
 }
+
+/// #4293: jq runs a pipe depth-first, so when a later stage raises on the
+/// first output of an earlier one, the earlier stage never produces its next
+/// output, and an effect there never runs. The staged fold ran each stage over
+/// every input first, so a `debug`/`stderr` wrote and an `input` consumed a
+/// value jq never reaches, and `[(input, input) | error]` then reported the
+/// wrong line and a stray `break`. Captured from jq 1.7.1 with stdout and
+/// stderr interleaved; the last row is the order when nothing raises.
+#[test]
+fn test_pipe_effect_before_a_raising_stage_runs_depth_first_4293() -> Result<()> {
+    let inputs = "[{\"a\":1}]\n10\n20\n30\n";
+    let pair = "[3,4]\n";
+    let not_x = "Cannot index number with string \"x\"";
+    let rows: &[(&str, &str, String, i32)] = &[
+        (
+            inputs,
+            "[.[] | (input, input) | error]",
+            [
+                "jq: error (at <stdin>:2) (not a string): 10",
+                "jq: error (at <stdin>:3): Cannot iterate over number (20)",
+                "jq: error (at <stdin>:4): Cannot iterate over number (30)\n",
+            ]
+            .join("\n"),
+            5,
+        ),
+        (
+            inputs,
+            "[(input, input) | error]",
+            [
+                "jq: error (at <stdin>:2) (not a string): 10",
+                "jq: error (at <stdin>:4) (not a string): 30\n",
+            ]
+            .join("\n"),
+            5,
+        ),
+        (
+            inputs,
+            "[.[] | (1, (\"x\"|debug)) | .x]",
+            [
+                format!("jq: error (at <stdin>:1): {not_x}"),
+                "jq: error (at <stdin>:2): Cannot iterate over number (10)".into(),
+                "jq: error (at <stdin>:3): Cannot iterate over number (20)".into(),
+                "jq: error (at <stdin>:4): Cannot iterate over number (30)\n".into(),
+            ]
+            .join("\n"),
+            5,
+        ),
+        (
+            inputs,
+            "[(1, (\"x\"|debug)) | .x]",
+            (1..=4)
+                .map(|line| format!("jq: error (at <stdin>:{line}): {not_x}\n"))
+                .collect(),
+            5,
+        ),
+        (
+            pair,
+            "[(1,2) | debug | error]",
+            "[\"DEBUG:\",1]\njq: error (at <stdin>:1) (not a string): 1\n".into(),
+            5,
+        ),
+        (
+            pair,
+            "[range(3) | debug | error]",
+            "[\"DEBUG:\",0]\njq: error (at <stdin>:1) (not a string): 0\n".into(),
+            5,
+        ),
+        (
+            pair,
+            "[(.[] | debug) | error]",
+            "[\"DEBUG:\",3]\njq: error (at <stdin>:1) (not a string): 3\n".into(),
+            5,
+        ),
+        (
+            pair,
+            "[(1, (\"x\"|debug)) | .x] | length",
+            format!("jq: error (at <stdin>:1): {not_x}\n"),
+            5,
+        ),
+        // The effect behind a `def` call.
+        (
+            pair,
+            "def f: (1, (\"x\"|debug)); [f | .x]",
+            format!("jq: error (at <stdin>:1): {not_x}\n"),
+            5,
+        ),
+        // A value carried without its node: the owned evaluator's fold.
+        (
+            pair,
+            "[1,2] as $a | $a | [(.[] | debug) | error]",
+            "[\"DEBUG:\",1]\njq: error (at <stdin>:1) (not a string): 1\n".into(),
+            5,
+        ),
+        (
+            pair,
+            "try [.[] | (1, (\"x\"|debug)) | .x] catch \"c\"",
+            "\"c\"\n".into(),
+            0,
+        ),
+        (
+            pair,
+            "[(1, (\"x\"|stderr)) | error(\"t\")]",
+            "jq: error (at <stdin>:1): t\n".into(),
+            5,
+        ),
+        (
+            pair,
+            "[(1,2) | debug | . + 1]",
+            "[\"DEBUG:\",1]\n[\"DEBUG:\",2]\n[2,3]\n".into(),
+            0,
+        ),
+    ];
+    for (input, filter, expected, code) in rows {
+        assert_eq!(
+            run_jq_interleaved(&["-c", filter], Some(input))?,
+            (expected.clone(), *code),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
