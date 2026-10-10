@@ -429,37 +429,21 @@ DEFAULT_THRESHOLD = 5.0
 # merge-base, outputs byte-identical). Now in `main` (#3691); the entry was
 # removed (#3693) once the row read ~0% again against a merge-base that
 # already included it.
+#
+# `users_yq_del_select` (#2664), `users_compact_identity` (#3340), and
+# `users_keys_unsorted` / `arrays_first_map_iterate` (#4160, PR #4172) carried
+# overrides of the same one-off kind: the shared YAML walk reading a mapping's
+# members without building a `DocumentField` each (-5.2% x86_64), the
+# canonical-echo gate's string arm walking one 64-byte specials mask per block
+# (-7.0% x86_64 / -5.1% instructions retired on an M4 Pro), and the default
+# document loop no longer counting newlines up to a value's end for a location
+# the M2 fast path never reads (x86_64 -9.4% / -7.0%, ARM64-Linux -6.1% /
+# -3.6% Ir). All three changes are now in `main`; the entries were removed
+# (#4228) once the four rows read -0.0% / -0.0% / -0.0% / +0.0% on x86_64 and
+# -0.0% / +0.0% / -0.0% / +0.0% on ARM64-Linux against a merge-base that
+# already included them (PR #4222's perf-guard logs).
 QUERY_THRESHOLDS = {
     "wide_keys_unsorted": 10.0,
-    # `users_yq_del_select` (#2664): the shared walk reads a YAML object's
-    # members and scalar children without building a `DocumentField` each or
-    # entering the whole walk, so the yq-mode `del(.users[] | select(...))`
-    # row got cheaper (-5.2% x86_64 against the PR's own merge-base, -5.0% is
-    # the default threshold; ARM64-Linux stayed inside it). One-off: remove
-    # this entry once the change is in `main` and the row reads ~0% again.
-    "users_yq_del_select": 8.0,
-    # `users_compact_identity` (#3340): the canonical-echo gate's string arm
-    # walks one 64-byte specials mask per block instead of every byte of every
-    # string, so the compact identity row on a `users` document got cheaper
-    # (-7.0% x86_64 Ir against the PR's own merge-base, measured on a 7950X
-    # with this script; -5.1% instructions retired on an M4 Pro, whose
-    # ARM64-Linux twin could not be measured here and is expected to land near
-    # it, hence 10.0 and not 8.0). `users_compact_latefail` stays inside the
-    # default (-2.1%): its re-render dominates. One-off: remove this entry
-    # once the change is in `main` and the row reads ~0% again.
-    "users_compact_identity": 10.0,
-    # `users_keys_unsorted`, `arrays_first_map_iterate` (#4160): the default
-    # document loop no longer counts newlines up to a value's end for a
-    # location the M2 fast path never reads, and counts the ones it still
-    # needs in 64-byte chunks. These two rows run a small document to a
-    # short result, so the per-document line count is a large share of them
-    # (x86_64 -9.4% / -7.0%, ARM64-Linux -6.1% / -3.6% Ir against the PR's
-    # own merge-base; -5.0% is the default threshold). 12.0 and 10.0 leave
-    # headroom over the measured x86_64 drift without hiding a real
-    # regression. One-off: remove these entries once the change is in `main`
-    # and the rows read ~0% again.
-    "users_keys_unsorted": 12.0,
-    "arrays_first_map_iterate": 10.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
