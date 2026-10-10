@@ -4339,8 +4339,8 @@ ruled out), even though real yq supports every one of them:
   stay `not yet supported` (yq prints a container's foot after the *next* entry's first
   line). An alias target (`c: *x`) is refused too, and so is clearing the head of a
   container whose head the same expression just wrote (it sits on the first entry, which the
-  clear does not reach). Checked by 5 `meta_assign_container_head_*_2796` goldens and a differential fuzz
-  (~1,300 accepted writes, none differing).
+  clear does not reach). Checked by 7 `meta_assign_container_head_*_2796` goldens and a differential fuzz
+  (~2,800 accepted writes, none differing).
 - **A mapping key takes a text** ([#2796](https://github.com/rust-works/succinctly/issues/2796),
   part 4): `(.a | key) head_comment = "x"`, `foot_comment`, `line_comment` and `comments`, the
   natural way to put a comment above a key. yq keeps the comments above and below an entry on

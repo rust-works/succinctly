@@ -4473,27 +4473,24 @@ fn apply_set_entry(
             foot.is_none() && line.is_none(),
             "a container takes only a head: the caller refuses its foot and line comment"
         );
-        if owns_lines(members[index]) {
-            return Err(set_entry_unsupported(
-                "the node already has head or foot comment lines (in the document or from an earlier write)",
-            ));
-        }
         let first = match &mut *members[index] {
             CommentTree::Object(_, fields, _) => first_key.and_then(|key| fields.get_mut(key)),
             CommentTree::Array(_, items) => items.first_mut(),
             CommentTree::Leaf(_) => None,
         };
         let Some(first) = first else {
-            return Ok(());
-        };
-        if owns_lines(first) {
             return Err(set_entry_unsupported(
-                "the first entry already has head or foot comment lines (in the document or from an earlier write)",
+                "the collection's first entry has no comment node",
+            )); // patchcov: coverage tolerate-line reason="unreachable: the caller grew the comment tree to the value's first entry (#2796)"
+        };
+        if !first.meta().head_comment().is_empty() {
+            return Err(set_entry_unsupported(
+                "the first entry already has head comment lines (in the document or from an earlier write)",
             ));
         }
         if let Some(head) = head {
             let meta = first.meta();
-            *first.meta_mut() = meta.with_head_foot(head.clone(), Vec::new());
+            *first.meta_mut() = meta.with_head_foot(head.clone(), meta.foot_comment().to_vec());
         }
         return Ok(());
     }
@@ -12231,6 +12228,24 @@ mod tests {
             render_with_comments("- a: 1\n- b: 2\n", ".[0] head_comment = \"x\"").trim_end(),
             "# x\n- a: 1\n- b: 2"
         );
+        // The collection's own key head and the first entry's foot are not in the way: the head
+        // goes above the first entry, and the foot stays where it was.
+        for (yaml, want) in [
+            (
+                "s: 1\n# mid\na:\n  b: 1\nz: 2\n",
+                "s: 1\n# mid\na:\n  # x\n  b: 1\nz: 2",
+            ),
+            (
+                "a:\n  b: 1\n  # foot\n  c: 2\nz: 2\n",
+                "a:\n  # x\n  b: 1\n  # foot\n  c: 2\nz: 2",
+            ),
+        ] {
+            assert_eq!(
+                render_with_comments(yaml, ".a head_comment = \"x\"").trim_end(),
+                want,
+                "{yaml:?}"
+            );
+        }
         // A head-only write to a sequence item never touches the next item, so a head it owns
         // is no reason to refuse.
         assert_eq!(
