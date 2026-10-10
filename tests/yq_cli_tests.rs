@@ -18246,9 +18246,9 @@ mod meta_assign_798 {
                 "[{filter}] stderr: {err}"
             );
         }
-        // A container target is not placed yet: where yq prints its foot depends on what follows.
+        // A container's foot and line are not placed: where yq prints its foot depends on what
+        // follows (its head, above the first entry, is: #2796).
         for (filter, slot) in [
-            (".a head_comment = \"hi\"", "head_comment"),
             (".a foot_comment = \"bye\"", "foot_comment"),
             (".a comments = \"x\"", "comments"),
         ] {

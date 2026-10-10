@@ -4331,6 +4331,14 @@ ruled out), even though real yq supports every one of them:
   newlines alone, and a write to more than one target (`.[] head_comment = "x"`). Checked by
   13 `meta_assign_entry_*_2796` goldens and a differential fuzz of ~5,300 accepted writes
   over random documents with and without comments (none differed; ~4,300 more were refused).
+- **A mapping or sequence value takes a head** ([#2796](https://github.com/rust-works/succinctly/issues/2796),
+  part 5): `.a head_comment = "x"` on a non-empty block mapping or sequence prints inside it,
+  above its first entry at that entry's indent (`a:\n  # x\n  b: 1`), and above the dash for a
+  sequence item (`# x\n- a: 1`); a head the first entry already owns wins in yq, and the write
+  is refused here instead. Its foot and line comment, an empty collection and a flow one
+  stay `not yet supported` (yq prints a container's foot after the *next* entry's first
+  line). Checked by 5 `meta_assign_container_head_*_2796` goldens and a differential fuzz
+  (~1,300 accepted writes, none differing).
 - **A mapping key takes a text** ([#2796](https://github.com/rust-works/succinctly/issues/2796),
   part 4): `(.a | key) head_comment = "x"`, `foot_comment`, `line_comment` and `comments`, the
   natural way to put a comment above a key. yq keeps the comments above and below an entry on
