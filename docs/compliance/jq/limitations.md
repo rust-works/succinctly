@@ -3036,8 +3036,10 @@ is the revert that established what the other one costs.
    `null` is `null`, which equals a `null` `$k` by `jv_identical`'s kind rule, so the refusal of
    `$k` is a guess there and loud, while an object `$k` can never equal the node and the `try`
    catches jq's own error as before. The 9 operands for it (119,907 rows) take 1,885 wrong accepts
-   and 25 wrong answers to none, and lose 400 matches, all on a `null` input where the dropped
-   write was a no-op. A boolean register
+   and 25 wrong answers to none, and lose 400 matches, all on a `null` input where jq's answer is the
+   document unchanged (or an empty list) and the dropped write was a no-op. A component of the path that is
+   a slice is read too (a slice of a container is a fresh value, of `null` is `null`); one the lookup does
+   not model records the loss at the step's entry, the louder answer. A boolean register
    is compared with the result, so an equal one answers and a different one refuses, as in jq
    (jq reads an equal boolean result as the register itself): that holds for a bool-returning
    builtin (`contains(true)`) next to a navigating comma sibling too since #4063.

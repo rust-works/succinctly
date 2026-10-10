@@ -75879,6 +75879,20 @@ fn test_foreach_update_navigated_then_def_keeps_the_register_lost_at_the_node_42
             "",
             0,
         ),
+        (
+            obj,
+            r"[path(foreach .a as $v (0; ($v|.c[0:1]?) | def f: 1; f; try ($v|.b?)))]",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"[path(foreach .a as $v (0; ($v|.[0:1]?) | def f: 1; f; try ($v|.[0:1]?)))]",
+            "",
+            "Invalid path expression near attempt to access element {\"start\":0,",
+            5,
+        ),
     ])
 }
 

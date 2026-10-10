@@ -47796,9 +47796,11 @@ impl FoldRegister {
             // `null`/`true`/`false` register, which `jv_identical` compares by kind).
             let mut frame = self.frame.unknown();
             if S::TAG == EvalTag::Jq && self.trackable && !frame.register_loss.is_lost() {
-                let navigated = branch.path.depth() > self.path.depth();
+                let navigated = branch.path.depth() > self.path.depth()
+                    && path_extends(&branch.path, &self.path);
                 let at = if navigated {
-                    node_below(&self.value, &branch.path.to_vec()[self.path.depth()..])
+                    let components = components_from_root(&branch.path);
+                    node_below(&self.value, &components[self.path.depth()..])
                 } else {
                     None
                 };
@@ -47816,33 +47818,54 @@ impl FoldRegister {
     }
 }
 
-/// The node `root` holds at `components` (a path's field and index steps, root to leaf), reading a
-/// missing member or a step through `null` as `null` as `.b?` does, or `None` for a component
-/// this does not model (a slice, a key on the wrong kind) -- the caller then falls back to the
+/// The node `root` holds at `components` (a path's field, index and slice steps, root to leaf),
+/// reading a missing member or a step through `null` as `null` as `.b?` does, or `None` for a
+/// component this does not model (a key on the wrong kind) -- the caller then falls back to the
 /// node it started from, which is the wider, louder answer (#4252).
-fn node_below(root: &OwnedValue, components: &[Expr]) -> Option<OwnedValue> {
-    let mut node = root;
+fn node_below(root: &OwnedValue, components: &[&Expr]) -> Option<OwnedValue> {
+    let mut node = root.clone();
     for component in components {
-        node = match (node, strip_optional(component)) {
-            (OwnedValue::Null, Expr::Field(_) | Expr::Index { .. }) => {
+        node = match (&node, strip_optional(component)) {
+            (OwnedValue::Null, Expr::Field(_) | Expr::Index { .. } | Expr::Slice { .. }) => {
                 return Some(OwnedValue::Null)
             }
             (OwnedValue::Object(map), Expr::Field(key)) => match map.get(key.as_str()) {
-                Some(member) => member,
+                Some(member) => member.clone(),
                 None => return Some(OwnedValue::Null),
             },
             (OwnedValue::Array(items), Expr::Index { idx, .. }) => {
                 let len = i64::try_from(items.len()).ok()?;
                 let at = if *idx < 0 { idx + len } else { *idx };
                 match usize::try_from(at).ok().and_then(|at| items.get(at)) {
-                    Some(item) => item,
+                    Some(item) => item.clone(),
                     None => return Some(OwnedValue::Null),
                 }
+            }
+            (OwnedValue::Array(items), Expr::Slice { start, end, .. }) => {
+                let range = SliceBounds::from_literals(*start, *end).resolve(items.len());
+                OwnedValue::array_from(items[range].to_vec())
+            }
+            (OwnedValue::String(text), Expr::Slice { start, end, .. }) => {
+                let range = SliceBounds::from_literals(*start, *end).resolve(text.chars().count());
+                OwnedValue::string(slice::slice_str(text, range))
             }
             _ => return None,
         };
     }
-    Some(node.clone())
+    Some(node)
+}
+
+/// Whether `path` is `base` followed by further components: `base` is the ancestor of `path` at
+/// `base`'s own depth.
+fn path_extends(path: &PathPrefix, base: &Rc<PathPrefix>) -> bool {
+    let mut cur = path;
+    while cur.depth() > base.depth() {
+        match cur {
+            PathPrefix::Node { parent, .. } => cur = parent,
+            PathPrefix::Root => return false,
+        }
+    }
+    core::ptr::eq(cur, Rc::as_ptr(base)) || *cur == **base
 }
 
 /// Whether `e` is a step whose evaluation moves jq's path register -- the test
@@ -138403,7 +138426,10 @@ mod node_below_tests_4252 {
     #[test]
     fn reads_the_node_a_path_leads_to() {
         let doc = doc();
-        let at = |components: &[Expr]| node_below(&doc, components);
+        let at = |components: &[Expr]| {
+            let borrowed: Vec<&Expr> = components.iter().collect();
+            node_below(&doc, &borrowed)
+        };
         assert_eq!(at(&[]), Some(doc.clone()));
         assert_eq!(
             at(&[field("a"), index(1), field("b")]),
@@ -138432,13 +138458,82 @@ mod node_below_tests_4252 {
         );
     }
 
+    fn slice(start: Option<i64>, end: Option<i64>) -> Expr {
+        Expr::Slice {
+            start,
+            end,
+            start_key: None,
+            end_key: None,
+        }
+    }
+
+    /// A slice component yields the slice, as a fresh array or string; one below a `null` is `null`.
+    #[test]
+    fn reads_through_a_slice() {
+        let doc = OwnedValue::object_from([
+            (
+                "a".to_string(),
+                OwnedValue::array_from(vec![
+                    OwnedValue::Int(1),
+                    OwnedValue::Int(2),
+                    OwnedValue::Int(3),
+                ]),
+            ),
+            ("s".to_string(), OwnedValue::string("héllo")),
+            ("n".to_string(), OwnedValue::Null),
+        ]);
+        let at = |components: &[Expr]| {
+            let borrowed: Vec<&Expr> = components.iter().collect();
+            node_below(&doc, &borrowed)
+        };
+        assert_eq!(
+            at(&[field("a"), slice(Some(1), None)]),
+            Some(OwnedValue::array_from(vec![
+                OwnedValue::Int(2),
+                OwnedValue::Int(3)
+            ]))
+        );
+        assert_eq!(
+            at(&[field("a"), slice(None, Some(-1)), index(1)]),
+            Some(OwnedValue::Int(2))
+        );
+        assert_eq!(
+            at(&[field("s"), slice(Some(1), Some(3))]),
+            Some(OwnedValue::string("él"))
+        );
+        assert_eq!(
+            at(&[field("n"), slice(Some(0), Some(1))]),
+            Some(OwnedValue::Null)
+        );
+        // A slice of a number is an error in jq, so no such path exists: declined.
+        assert_eq!(at(&[field("a"), index(0), slice(Some(0), Some(1))]), None);
+    }
+
+    /// The prefix a navigated output's path must extend before its tail is read off the entry.
+    #[test]
+    fn a_path_extends_only_its_own_ancestor() {
+        let root = PathPrefix::root();
+        let a = PathPrefix::extend_many(&root, vec![field("a")]);
+        let ab = PathPrefix::extend_many(&root, vec![field("a"), field("b")]);
+        let c = PathPrefix::extend_many(&root, vec![field("c")]);
+        assert!(path_extends(&ab, &a));
+        assert!(path_extends(&ab, &root));
+        assert!(path_extends(&a, &a));
+        assert!(!path_extends(&ab, &c));
+        assert!(!path_extends(&a, &ab));
+    }
+
     /// A component this does not model, or one that does not fit the node, answers `None`: the
     /// caller then records the loss at the node it started from, the wider and louder answer.
     #[test]
     fn declines_a_component_it_does_not_model() {
         let doc = doc();
-        assert_eq!(node_below(&doc, &[index(0)]), None);
-        assert_eq!(node_below(&doc, &[field("a"), field("b")]), None);
-        assert_eq!(node_below(&doc, &[field("a"), Expr::Identity]), None);
+        let none = |components: &[Expr]| {
+            let borrowed: Vec<&Expr> = components.iter().collect();
+            node_below(&doc, &borrowed)
+        };
+        assert_eq!(none(&[index(0)]), None);
+        assert_eq!(none(&[field("a"), field("b")]), None);
+        assert_eq!(none(&[field("a"), Expr::Identity]), None);
     }
 }
