@@ -61,7 +61,7 @@ from "0 FAIL" over a clean base. A benchmark cannot measure a shape it does
 not generate: add the generator pattern here before claiming a shape is safe.
 
 **Size.** The full grid is millions of rows; `--list-axes` prints the exact count
-(772 operands, 7 companions, 12 inputs and 37 contexts give 9,939,627 rows as of #4252,
+(793 operands, 7 companions, 12 inputs and 37 contexts give 10,219,347 rows as of #4187,
 and each operand is also swept as a bare pipe stage since #3361). The count grows with
 every operand a change to the register adds, so read it from `--list-axes` rather than
 from here.
@@ -423,6 +423,33 @@ OPERANDS = [
     "(reduce (. as [$a] | .) as $k (.; .))",
     "(reduce (. as {a:$a} | $a) as $k (.; .))",
     "try (foreach (. as {a:$a} | .) as $k (.; .; .)) catch 7",
+    # (#4187) a plain bind in front of the destructure does not move the register (its source is a
+    # subexpression), so the destructure behind it is the source's own; the contrasts bind a
+    # different value, destructure something the bind produced, or follow it with a navigation.
+    "(foreach (. as $x | . as {a:$a} | .) as $k (.; .; .))",
+    "(foreach (. as $x | . as [$a] | .) as $k (.; .; .))",
+    "(foreach (.a as $x | . as {a:$a} | .) as $k (.; .; .))",
+    "(foreach (. as $x | . as {a:$a} | $x) as $k (.; .; .))",
+    "(foreach (. as $x | . as {a:$a} | .a) as $k (.; .; $k))",
+    "(foreach (. as $x | $x as {a:$a} | .) as $k (.; .; .))",
+    "(foreach (. as $x | .) as $k (.; .; .))",
+    "(foreach (. as $x | . as $y | . as {a:$a} | .) as $k (.; .; .))",
+    "(foreach (. as $x ?// $y | . as {a:$a} | .) as $k (.; .; .))",
+    "(reduce (. as $x | . as {a:$a} | .) as $k (.; .))",
+    "(reduce (. as $x | . as [$a] | $a) as $k (.; .))",
+    "(foreach (. as $x | foreach . as {a:$a} (0; .; .)) as $k (.; .; .))",
+    # (#4187) a `?//` chain on the bare register as a fold source: jq's register follows the first
+    # alternative that matches and a failed one is retried from the fork, which the resolver's
+    # per-alternative walk states; the by-value drive answered the root.
+    "(foreach (. as {a:$a} ?// [$a] | .) as $k (.; .; .))",
+    "(foreach (. as [$a] ?// {a:$a} | .) as $k (.; .; .))",
+    "(foreach (. as {a:$a} ?// [$a] | $a) as $k (.; .; .))",
+    "(foreach (. as {a:$a} ?// [$a] | .) as $k (.; $k; .))",
+    "(foreach (. as {a:$a} ?// [$a] | .) as {b:$b} (.; .; .))",
+    "(foreach (. as $x | . as {a:$a} ?// [$a] | .) as $k (.; .; .))",
+    "(reduce (. as {a:$a} ?// [$a] | .) as $k (.; .))",
+    "(reduce (. as [$a] ?// {a:$a} | .) as $k (.; .))",
+    "(reduce (. as {a:$a} ?// $a | .) as $k (.; .))",
     # ...and the same inside a nested fold: a nested `foreach` over `.` moves the register
     # for the outer one, a nested `reduce` does not (it is backtracked), so the latter is
     # the contrast that must keep the by-value drive.

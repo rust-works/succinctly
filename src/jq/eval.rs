@@ -48134,8 +48134,16 @@ fn source_destructures_register(source: &Expr, through_reduce: bool) -> bool {
         // (#4150: `(., .) as {a:$a}` binds per leaf, [`comma_leaves`]); a pipe such as
         // `(.|.) as {a:$a}` stays out, since the resolver reads it as a computed value and a
         // `try`/`?` around it swallowed the resulting refusal.
+        // #4187: a plain bind (`. as $x | BODY`, or a `?//` chain of bare `$var`s) does not move the
+        // register -- its source runs as a subexpression -- so its body meets the register where the
+        // bind did, and a destructure there is the source's own.
+        Expr::As { body, .. } => recurse(body),
+        Expr::AsPattern { patterns, body, .. } if patterns_all_bare(patterns) => recurse(body),
+        // #4187: a `?//` chain of destructuring patterns only. One with a bare `$var` alternative
+        // (`. as {a:$a} ?// $a`) is left to the by-value drive: nothing in the register sweep
+        // accepts a wrong answer through it, and routing it loses matches the drive makes.
         Expr::AsPattern { expr, patterns, .. } => {
-            routes_destructuring(patterns)
+            (routes_destructuring(patterns) || patterns_all_destructuring_chain(patterns))
                 && if through_reduce {
                     yields_only_the_register(expr)
                 } else {
@@ -48177,9 +48185,21 @@ fn source_destructures_register(source: &Expr, through_reduce: bool) -> bool {
     }
 }
 
-/// A `?//` chain whose every alternative is an array or object pattern (#3948):
-/// jq's register follows the first alternative that matches, which the resolver's
-/// per-alternative walk states.
+/// A `?//` chain *every* alternative of which is an array or object pattern (#4187): the chains
+/// a bare-`.` bind source meets the register through. [`routes_destructuring_chain`] asks for
+/// *any* destructuring alternative, which a bind source does not (see its comment).
+fn patterns_all_destructuring_chain(patterns: &[Pattern]) -> bool {
+    patterns.len() > 1
+        && patterns
+            .iter()
+            .all(|pattern| !matches!(pattern, Pattern::Var(_)))
+}
+
+/// A `?//` chain with at least one array or object pattern (#3948): jq's register follows the
+/// first alternative that matches, which the resolver's per-alternative walk states. Read where
+/// a fold's *own* loop pattern is a chain over the register. [`patterns_all_destructuring_chain`]
+/// is the narrower question a bind source asks (#4187): the quantifiers differ on purpose, since
+/// a chain with a bare `$var` alternative as a source is better left to the by-value drive.
 fn routes_destructuring_chain(patterns: &[Pattern]) -> bool {
     patterns.len() > 1 && routes_fresh_destructuring(patterns)
 }
