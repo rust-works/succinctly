@@ -113,13 +113,14 @@ fn assert_rows_like_twin(rows: &[(&str, &str, i64, usize)]) {
 /// shortcut is in play: the twin differs only in a handler (`empty | empty`)
 /// that is not the bare `empty` the shortcut matches, and so is run.
 ///
-/// The bound is 5 allocator calls per member, down from 10 (#4226): the lone-leaf
-/// shortcuts (#4155, #4226) made the handler the twin has to run cheaper, so the
-/// saving from not running it is smaller than when this was written (7 per member on
-/// the booleans-and-nulls document). With the shortcut deleted the two cost the same.
+/// The saving from not running the handler is 10 allocator calls per member, and 6 on
+/// the booleans-and-nulls document, whose handler is cheaper to run: 8 per member on the
+/// #4155 tip, which was already under this test's old flat 10, and 7 once `PathPrefix::root`
+/// stopped allocating (#4226). With the shortcut deleted the two cost the same.
 #[test]
 fn a_catch_empty_handler_in_path_f_is_not_run_3728() {
     for (name, json) in fixtures() {
+        let saved = if name.contains("booleans") { 6 } else { 10 };
         let (empty, answered) =
             allocations_collecting("[.[] | path(try error(\"x\") catch empty)] | length", &json);
         assert_eq!(answered, 0, "{name}: the handler delivers nothing");
@@ -132,9 +133,9 @@ fn a_catch_empty_handler_in_path_f_is_not_run_3728() {
         // bridge document's three index buffers (it was 10 when each crossing
         // allocated them). `allocations_collecting` warms the thread's pool.
         assert!(
-            empty + 5 * N <= run,
+            empty + saved * N <= run,
             "{name}: `catch empty` made {empty} allocator calls and the handler the resolver \
-             has to run made {run}; not running it should save at least 5 per member"
+             has to run made {run}; not running it should save at least {saved} per member"
         );
         let (streamed, outputs) =
             allocations_streaming(".[] | path(try error(\"x\") catch empty)", &json);
@@ -142,7 +143,7 @@ fn a_catch_empty_handler_in_path_f_is_not_run_3728() {
         let (streamed_run, _) =
             allocations_streaming(".[] | path(try error(\"x\") catch (empty | empty))", &json);
         assert!(
-            streamed + 5 * N <= streamed_run,
+            streamed + saved * N <= streamed_run,
             "{name}: streamed, {streamed} against {streamed_run}"
         );
     }

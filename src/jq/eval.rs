@@ -38145,6 +38145,10 @@ impl PathPrefix {
     /// regardless. Callers that build many siblings off the same root (e.g. per-element
     /// loops) there should hoist a single `root()` call outside the loop and
     /// `Rc::clone` it, not call `root()` per element.
+    ///
+    /// Whether two roots are one allocation therefore differs between the builds, so
+    /// pointer identity of a root means nothing: nothing may key on it or assume two
+    /// roots are distinct, and comparing two chains goes by structure.
     fn root() -> Rc<Self> {
         #[cfg(feature = "std")]
         {
@@ -38154,7 +38158,7 @@ impl PathPrefix {
             // A thread already tearing down its locals can still drop a resolver value that
             // asks for a root; it gets a node of its own rather than a panic.
             ROOT.try_with(Rc::clone)
-                .unwrap_or_else(|_| Rc::new(Self::Root))
+                .unwrap_or_else(|_| Rc::new(Self::Root)) // patchcov: coverage tolerate-line reason="unreachable from a test: it runs only while the thread's own locals are being destroyed, and nothing resolves a path from a thread-local destructor (#4226)"
         }
         #[cfg(not(feature = "std"))]
         {
@@ -125128,8 +125132,9 @@ mod tests {
                     root_prefix = Some(Rc::clone(&branch.path));
                     Demand::Continue
                 } else {
-                    // The root prefix itself, the seed's reference, and this
-                    // child's own: anything past a handful is a sibling.
+                    // The root prefix itself, the seed's reference, this child's
+                    // own and, under `std`, the thread's cached root (#4226): anything
+                    // past a handful is a sibling.
                     alive_at_second = Rc::strong_count(root_prefix.as_ref().unwrap());
                     Demand::Stop
                 }
@@ -125137,7 +125142,7 @@ mod tests {
             assert!(matches!(flow, ResolveFlow::Stopped), "{flow:?}");
             assert_eq!(calls, 2);
             assert!(
-                alive_at_second <= 4,
+                alive_at_second <= 5,
                 "{alive_at_second} child branches existed at the second delivery"
             );
         }
