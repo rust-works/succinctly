@@ -5070,10 +5070,11 @@ $ echo $?
   against the fold-first route #4193 shipped: a `select` in a pair -5% to -8% (and -1% to +3% against
   the fan-out it replaced); a construction that is empty for every record is built twice, +54%
   (`.users[] | {"n": .name, "s": (.score | select(. > 1e8))}`). jq mode never takes the fold.
-  Two shapes stay on the fan-out although yq folds them: `$x` with no `as` binding it (yq yields nothing for it, so `{"a": 1, "b": $x, "c": 3}`
-  is `c: 3` there and nothing here) -- a variable is judged total because a bound one is by
-  far the usual case -- and a `select(.>0)` over an array element inside a pair, which yq
-  gives no maps although every element passes (#4239).
+  Two shapes stay on the fan-out although yq folds them: `$x` with no `as` binding it (yq
+  yields nothing for it, so `{"a": 1, "b": $x, "c": 3}` is `c: 3` there and nothing here) -- a
+  variable is judged total because a bound one is by far the usual case -- and a `select(.>0)`
+  over an array element inside a pair, which yq gives no maps although every element passes
+  (#4239).
 
 Residual divergences remain, all in cases yq itself reaches through its node model:
 

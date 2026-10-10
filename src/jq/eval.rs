@@ -4517,7 +4517,19 @@ fn eval_object_construction_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     owned_vec_to_result(objects)
 }
 
-/// How a `{...}` is built: as the cross product of its `key: value` pairs, as yq's
+/// How a `{...}` is built (see [`yq_object_route`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ObjectRoute {
+    /// The cross product of the pairs: jq, and yq while every operand is total.
+    Fanout,
+    /// `COLLECT_OBJECT` straight away: a bare entry (#2783), or an operand that might yield
+    /// nothing and has a side effect.
+    Union,
+    /// The cross product first, `COLLECT_OBJECT` when it is empty.
+    FanoutThenUnion,
+}
+
+/// Pick how a `{...}` is built: as the cross product of its `key: value` pairs, as yq's
 /// `COLLECT_OBJECT` over the union of its entries, or the first and then the second
 /// (#2783, #4193, #4240).
 ///
@@ -4537,17 +4549,6 @@ fn eval_object_construction_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ///
 /// Only yq's parser builds [`ObjectKey::Bare`], and the `TAG` test is a compile-time constant that
 /// lets jq mode skip the scan entirely.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum ObjectRoute {
-    /// The cross product of the pairs: jq, and yq while every operand is total.
-    Fanout,
-    /// `COLLECT_OBJECT` straight away: a bare entry (#2783), or an operand that might yield
-    /// nothing and has a side effect.
-    Union,
-    /// The cross product first, `COLLECT_OBJECT` when it is empty.
-    FanoutThenUnion,
-}
-
 pub(crate) fn yq_object_route<S: EvalSemantics>(
     entries: &[super::expr::ObjectEntry],
 ) -> ObjectRoute {
@@ -4579,7 +4580,8 @@ pub(crate) fn yq_object_route<S: EvalSemantics>(
 }
 
 /// Whether a key or value of `entry` holds something that writes or reads outside the value:
-/// building the construction twice would do it twice.
+/// building the construction twice would do it twice. The visible effects the evaluator has are
+/// stderr writes, halting and consuming input; a user function is assumed to hold one.
 fn operand_may_have_effect(entry: &super::expr::ObjectEntry) -> bool {
     let effectful = |expr: &Expr| {
         super::walk::any_subexpr(expr, &mut |e| {
@@ -31293,18 +31295,20 @@ pub(crate) fn yields_at_most_one_value(expr: &Expr) -> bool {
 /// Whether `expr` produces at least one value whenever it does not raise: the
 /// converse of [`yields_at_most_one_value`]'s count, for [`yq_object_route`].
 ///
-/// A wrong *admission* leaves the fan-out in place for a construction whose
-/// operand turns out to be empty -- today's answer, no worse -- and a wrong
-/// refusal costs the cheaper route, so the list is short and each entry is one
-/// whose arm in the evaluator never answers `None` for an input it accepts. A
-/// composite is admitted when the parts that must each produce do: a pipe,
-/// an operator, an index and a string interpolation fan out over every part,
-/// so one empty part empties the whole. `//` needs only its right side (an
-/// empty left falls through to it), `,` only one of its items.
+/// A wrong *admission* keeps the cross product for a construction whose operand turns out to be
+/// empty -- the answer #4193 replaced -- and a wrong refusal only costs the second look, so the
+/// list is short and each entry is one whose arm in the evaluator never answers `None` for an
+/// input it accepts. A composite is admitted when the parts that must each produce do: a pipe, an
+/// operator and a string interpolation fan out over every part, so one empty part empties the
+/// whole. `//` needs only its right side (an empty left falls through to it), `,` only one of its
+/// items.
 ///
-/// Refused on purpose: `select`, `empty`, `.[]`, `..`, `first`/`limit`, the
-/// type filters (`numbers`, `values`), anything under `?` or `try`, and every
-/// generator.
+/// **A path is refused** (`.a`, `.[0]`, `.[1:2]`, `.[E]`): yq yields nothing, not `null`, for a key
+/// or an index applied to a string, number or boolean, and so does `succinctly yq` (#4240), so
+/// `{"a": .m.id, "b": .n}` over a string `m` is `{"b": 2}`. Re-admitting one brings that back.
+///
+/// Also refused on purpose: `select`, `empty`, `.[]`, `..`, `first`/`limit`, the type filters
+/// (`numbers`, `values`), anything under `?` or `try`, and every generator.
 pub(crate) fn yields_at_least_one_value(expr: &Expr) -> bool {
     match expr {
         // A `$x` no `as` binds yields nothing in yq (it is not an error there), which

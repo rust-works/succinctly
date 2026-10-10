@@ -61120,6 +61120,10 @@ fn test_object_construction_path_on_a_scalar_is_an_empty_pair_4240() -> Result<(
             r#"{"a":.l[0],"b":.l[1],"c":(.l|length)}"#,
             "{\"a\":1,\"b\":2,\"c\":2}\n",
         ),
+        // An object under a numeric index, and an absent key, are `null`, not empty.
+        (r#"{"a":.o[0],"b":.n}"#, "{\"a\":null,\"b\":2}\n"),
+        (r#"{"a":.o.k,"b":.o.zz.q}"#, "{\"a\":1,\"b\":null}\n"),
+        (r#"{"a":.n["x"],"b":.l[0]}"#, "{\"b\":1}\n"),
         // Per record of a stream.
         (r#".l[] | {"a": .x, "b": .}"#, "{\"b\":1}\n{\"b\":2}\n"),
         (r#".l[] | {"b": ., "a": .x}"#, ""),
@@ -61128,6 +61132,29 @@ fn test_object_construction_path_on_a_scalar_is_an_empty_pair_4240() -> Result<(
             run_yq_stdin_with_stderr(filter, input, args)?,
             (expected.into(), String::new(), 0),
             "{filter}"
+        );
+    }
+    // An array under a string key is an error in both, with or without an empty path beside it, and
+    // yq evaluates every entry first, so an empty path does not hide a later entry's error.
+    for filter in [
+        r#"{"a":.l.id,"b":.n}"#,
+        r#"{"a":.m.id,"b":error("x")}"#,
+        r#"{"a":.l["x"],"b":.n}"#,
+    ] {
+        let (stdout, _, code) = run_yq_stdin_with_stderr(filter, input, args)?;
+        assert_eq!((stdout.as_str(), code), ("", 1), "{filter}");
+    }
+    // The same through the YAML reader, which is a different input route.
+    let yaml = "m: str\nn: 2\no: {k: 1}\n";
+    for (filter, expected) in [
+        (r#"{"a":.m.id,"b":.n}"#, "{\"b\":2}\n"),
+        (r#"{"a":.n,"b":.m.id,"c":.o.k}"#, "{\"c\":1}\n"),
+        (r#"{"a":.o.k,"b":.n}"#, "{\"a\":1,\"b\":2}\n"),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, yaml, &["-o=json", "-I=0"])?,
+            (expected.into(), String::new(), 0),
+            "yaml: {filter}"
         );
     }
     Ok(())
