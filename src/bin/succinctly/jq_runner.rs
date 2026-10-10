@@ -6691,7 +6691,7 @@ fn bare_token_lost_to_fault(bytes: &[u8], span: (usize, usize), malformed: usize
 fn parse_error_detection(bytes: &[u8], start: usize) -> usize {
     use succinctly::json::validate::{validate_jq_lenient, ValidationErrorKind as Kind};
     let start = start.min(bytes.len());
-    let detected = match validate_jq_lenient(&bytes[start..]) {
+    match validate_jq_lenient(&bytes[start..]) {
         Err(error) => {
             let at = start + error.position.offset;
             match error.kind {
@@ -6710,8 +6710,7 @@ fn parse_error_detection(bytes: &[u8], start: usize) -> usize {
         // The splitter refused a value this parser accepts: place it where it
         // starts.
         Ok(()) => start,
-    };
-    detected
+    }
 }
 
 /// Where jq's lexer completes the token at `at`: a string's closing quote, the

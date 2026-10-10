@@ -70866,6 +70866,10 @@ mod remaining_inputs {
     /// of real jq's own `0`).
     pub const UNKNOWN_LINE: u32 = u32::MAX;
 
+    /// A parse error among the queued documents: how many documents come
+    /// before it, the error, and the `(source, line)` jq's marker names there.
+    type QueuedError = (usize, EvalError, (u32, u32));
+
     thread_local! {
         // `(document, source tag, 1-based end line)`. The source tag is opaque
         // here: the CLI assigns it and resolves it back to a file name itself,
@@ -70893,7 +70897,7 @@ mod remaining_inputs {
         // parser stopped there -- each delivered by exactly one pop, once
         // those documents are read (#2961). jq resumes after a parse error at
         // its next read, so documents may follow one (#4311). See `pop_input`.
-        static ERRORS: RefCell<VecDeque<(usize, EvalError, (u32, u32))>> = const { RefCell::new(VecDeque::new()) };
+        static ERRORS: RefCell<VecDeque<QueuedError>> = const { RefCell::new(VecDeque::new()) };
         // How many documents `pop_input` has handed out since the seed, which
         // decides when the next of `ERRORS` is due.
         static POPPED: Cell<usize> = const { Cell::new(0) };
