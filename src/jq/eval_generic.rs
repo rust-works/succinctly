@@ -4421,6 +4421,19 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
         return GenericResult::Owned(value);
     }
 
+    // #4283: nor does a `del` whose paths are the same whatever `.` is,
+    // whose `del(.[]?)` hands `owned` back by move. Off under the #2889 embed
+    // table, as `eval_owned_reindex_free` is below; the shape is checked
+    // first, so other stages skip that thread-local read.
+    if let Some(answer) = crate::jq::eval::fixed_path_del::<S>(expr, &owned) {
+        if !embed_table_active() {
+            return GenericResult::Owned(match answer {
+                crate::jq::eval::FixedPathDel::Null => OwnedValue::Null,
+                crate::jq::eval::FixedPathDel::Input => owned,
+            });
+        }
+    }
+
     // #2889: `add`/`min`/`max` relocate one of their inputs rather than
     // computing a new value, and the round trip below would rebuild that
     // input as a copy -- costing the node identity jq keeps
@@ -37251,6 +37264,36 @@ mod tests {
             Reentry::REBUILT,
         );
         assert!(matches!(result, GenericResult::Error(_)));
+    }
+
+    /// #4283: `del(.)` is answered without the reindex bridge in jq mode, the
+    /// same observable proof as the closed stage above: a value the bridge
+    /// refuses to write out still deletes to `null`. yq mode keeps the bridge
+    /// (and so its depth error), its `del(.)` answering differently.
+    #[test]
+    fn eval_on_owned_answers_a_fixed_path_del_without_the_bridge_4283() {
+        let mut deep = OwnedValue::Null;
+        for _ in 0..crate::jq::value::MAX_VALUE_TREE_DEPTH {
+            deep = OwnedValue::array_from(vec![deep]);
+        }
+        let expr = crate::jq::parse("del(.)").unwrap();
+        let result = eval_on_owned::<JqSemantics, crate::json::light::StandardJson<'_, Vec<u64>>>(
+            &expr,
+            deep.clone(),
+            false,
+            Reentry::REBUILT,
+        );
+        assert!(
+            matches!(result, GenericResult::Owned(OwnedValue::Null)),
+            "{result:?}"
+        );
+        let result = eval_on_owned::<YqSemantics, crate::json::light::StandardJson<'_, Vec<u64>>>(
+            &expr,
+            deep,
+            false,
+            Reentry::REBUILT,
+        );
+        assert!(matches!(result, GenericResult::Error(_)), "{result:?}");
     }
 
     fn round_trips_unchanged<S: EvalSemantics>(value: &OwnedValue) -> bool {

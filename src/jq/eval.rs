@@ -9935,6 +9935,64 @@ pub(crate) fn eval_owned_closed<S: EvalSemantics>(expr: &Expr) -> Option<OwnedVa
     }
 }
 
+/// What a `del` whose path set is the same whatever `.` is answers
+/// ([`fixed_path_del`], #4283).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FixedPathDel {
+    /// `del(.)`: `null`, for any input.
+    Null,
+    /// `del(.[]?)` over a value with nothing to iterate: the input itself.
+    Input,
+}
+
+/// `del(.)`, and `del(.[]?)` over a scalar or an empty container, decided
+/// without the reindex bridge (#4283): the two `del` targets whose path set
+/// does not depend on what `.` holds.
+///
+/// `[.[] | del(.[]?)]` sent every scalar member over the bridge -- its text
+/// written, a one-token index built over it and the scalar decoded back out by
+/// `builtin_del` -- to delete nothing. `path(.)` is `[]` on any input, so
+/// `del(.)` is `null`. `path(.[]?)` yields nothing on a scalar or an empty
+/// container (jq 1.7.1: `[path(.[]?)]` is `[]` for a number, a string, a
+/// boolean, `null`, `[]` and `{}`), so `del(.[]?)` is `delpaths([])`, the
+/// input unchanged. A caller holding the input by value hands it back by move,
+/// literal spelling and all; one holding a borrow clones it.
+///
+/// jq mode only: yq v4.53.3 prints nothing for `del(.)` and `[]` for
+/// `null | del(.[]?)`. Every other shape is `None`, left to the bridge with
+/// its diagnostics and identity rules. Callers keep it off while the #2889
+/// embed table is active, as they do [`eval_owned_reindex_free`], so a node a
+/// binding tracks is never answered here.
+pub(crate) fn fixed_path_del<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<FixedPathDel> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    let target = match unwrap_paren(expr) {
+        Expr::Builtin(Builtin::Del(target)) => target,
+        // `. | del(.)` is `del(.)`, and a lone stage may arrive wrapped (#3692).
+        Expr::Pipe(stages) => match skip_identity_stages(stages) {
+            [only] => return fixed_path_del::<S>(only, input),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    match unwrap_paren(target) {
+        Expr::Identity => Some(FixedPathDel::Null),
+        Expr::Optional(inner) if matches!(unwrap_paren(inner), Expr::Iterate) => {
+            let nothing_to_iterate = match input {
+                OwnedValue::Array(items) => items.is_empty(),
+                OwnedValue::Object(fields) => fields.is_empty(),
+                _ => true,
+            };
+            nothing_to_iterate.then_some(FixedPathDel::Input)
+        }
+        _ => None,
+    }
+}
+
 /// The [`eval_owned_pure_in`] `door` arms that answer one builtin over the
 /// owned input (#3707): `has(<literal>)`, `keys`, `startswith(<literal>)`,
 /// `endswith(<literal>)` and `tostring`.
@@ -11276,6 +11334,17 @@ fn eval_each_owned_past_front_doors<S: EvalSemantics>(
         return flow;
     }
     if !super::eval_generic::embed_table_active() {
+        // #4283: see `eval_generic::eval_on_owned_over`.
+        if let Some(answer) = fixed_path_del::<S>(expr, input) {
+            let value = match answer {
+                FixedPathDel::Null => OwnedValue::Null,
+                FixedPathDel::Input => input.clone(),
+            };
+            return match sink(value) {
+                Demand::Continue => Flow::Exhausted,
+                Demand::Stop => Flow::Stopped { pending: None },
+            };
+        }
         if let Some(result) = eval_owned_reindex_free::<S>(expr, input) {
             return match result {
                 Ok(value) => match sink(value) {
@@ -61221,6 +61290,15 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             None => owned_vec_to_result(values),
         };
     }
+    // #4283: see `eval_generic::eval_on_owned_over`.
+    if let Some(answer) = fixed_path_del::<S>(expr, input) {
+        if !super::eval_generic::embed_table_active() {
+            return QueryResult::Owned(match answer {
+                FixedPathDel::Null => OwnedValue::Null,
+                FixedPathDel::Input => input.clone(),
+            });
+        }
+    }
     // After the fast path on purpose: it never reaches a resolver, and
     // demoting rebuilds `expr` whenever it holds a marker at all.
     eval_owned_input_bridge::<W, S>(&reentry.reroot::<S>(expr), input, optional)
@@ -90863,6 +90941,148 @@ mod tests {
             assert!(eval_owned_closed::<JqSemantics>(&expr).is_none(), "{src}");
             assert!(eval_owned_closed::<YqSemantics>(&expr).is_none(), "{src}");
         }
+    }
+
+    /// #4283: `fixed_path_del` answers `del(.)`, and `del(.[]?)` over a scalar
+    /// or an empty container, the way the reindex bridge does on every value,
+    /// and declines every other target, a non-empty container under `.[]?`
+    /// and yq mode.
+    #[test]
+    fn fixed_path_del_agrees_with_the_reindex_bridge_4283() {
+        let mut values = pure_value_matrix();
+        values.push(OwnedValue::from_number_literal::<JqSemantics>("1.50"));
+        values.push(OwnedValue::from_number_literal::<JqSemantics>("-0"));
+        values.push(OwnedValue::from_number_literal::<JqSemantics>("1e1000"));
+        values.push(OwnedValue::array_from(vec![]));
+        values.push(OwnedValue::object_from(Vec::<(String, OwnedValue)>::new()));
+        let accepted = [
+            ("del(.)", FixedPathDel::Null),
+            ("(del(.))", FixedPathDel::Null),
+            ("del((.))", FixedPathDel::Null),
+            (". | del(.)", FixedPathDel::Null),
+            ("del(.[]?)", FixedPathDel::Input),
+            ("del((.[])?)", FixedPathDel::Input),
+            ("(. | del(.[]?))", FixedPathDel::Input),
+        ];
+        let mut answered = [0usize; 2];
+        for value in &values {
+            let iterable = match value {
+                OwnedValue::Array(items) => !items.is_empty(),
+                OwnedValue::Object(fields) => !fields.is_empty(),
+                _ => false,
+            };
+            for (src, arm) in accepted {
+                let expr = parse(src).unwrap();
+                let fast = fixed_path_del::<JqSemantics>(&expr, value);
+                if arm == FixedPathDel::Input && iterable {
+                    assert_eq!(fast, None, "{src} on {value:?}");
+                    continue;
+                }
+                assert_eq!(fast, Some(arm), "jq mode: {src:?} on {value:?}");
+                answered[usize::from(arm == FixedPathDel::Input)] += 1;
+                // Compared as printed: the bridge reparses a computed `Int` as
+                // a literal of the same spelling, which this route keeps
+                // computed, as jq does.
+                let (bridge, ended) = normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                    &expr, value, false,
+                ));
+                let bridge: Vec<String> = bridge.iter().map(OwnedValue::to_json).collect();
+                let expected = match arm {
+                    FixedPathDel::Null => "null".to_string(),
+                    FixedPathDel::Input => value.to_json(),
+                };
+                assert_eq!(
+                    (vec![expected], "ok"),
+                    (bridge, ended.as_str()),
+                    "jq mode: {src:?} on {value:?}"
+                );
+                // yq's answers differ (`del(.)` prints nothing there, and
+                // `null | del(.[]?)` is `[]`), so it keeps the bridge.
+                assert_eq!(
+                    fixed_path_del::<YqSemantics>(&expr, value),
+                    None,
+                    "yq: {src:?}"
+                );
+            }
+        }
+        // Every value under each `Null` source; under each `Input` source,
+        // every value with nothing to iterate.
+        let flat = values
+            .iter()
+            .filter(|v| match v {
+                OwnedValue::Array(items) => items.is_empty(),
+                OwnedValue::Object(fields) => fields.is_empty(),
+                _ => true,
+            })
+            .count();
+        assert!(
+            flat > 20,
+            "the matrix must hold scalars and empty containers"
+        );
+        assert_eq!(answered, [4 * values.len(), 3 * flat]);
+        // Any other target is the bridge's, whatever the input.
+        for src in [
+            "del(.[])",
+            "del(.a)",
+            "del(.[0])",
+            "del(.[0]?)",
+            "del(.a?)",
+            "del(.[]?.a)",
+            "del(., .)",
+            "del(empty)",
+            "del(..)",
+            "del(.)?",
+            "del(.) | .a",
+            "del(.), 1",
+            ".",
+            "path(.)",
+        ] {
+            let expr = parse(src).unwrap();
+            for value in [OwnedValue::Int(5), OwnedValue::Null] {
+                assert_eq!(fixed_path_del::<JqSemantics>(&expr, &value), None, "{src}");
+            }
+        }
+    }
+
+    /// #4283: both of this file's owned routes answer `del(.)` without the
+    /// reindex bridge -- observable because a value the bridge refuses to
+    /// write out (past `MAX_VALUE_TREE_DEPTH`, #3261) still deletes to `null`
+    /// -- and `del(.[]?)` over a literal keeps its spelling.
+    #[test]
+    fn owned_routes_answer_a_fixed_path_del_without_the_bridge_4283() {
+        let mut deep = OwnedValue::Null;
+        for _ in 0..crate::jq::value::MAX_VALUE_TREE_DEPTH {
+            deep = OwnedValue::array_from(vec![deep]);
+        }
+        let literal = OwnedValue::from_number_literal::<JqSemantics>("1.50");
+        for (src, input, expected) in [("del(.)", &deep, "null"), ("del(.[]?)", &literal, "1.50")] {
+            let expr = parse(src).unwrap();
+            let eager =
+                eval_owned_input::<Vec<u64>, JqSemantics>(&expr, input, false, Reentry::REBUILT);
+            let (eager, ended) = normalize(eager);
+            let eager: Vec<String> = eager.iter().map(OwnedValue::to_json).collect();
+            assert_eq!(
+                (eager, ended.as_str()),
+                (vec![expected.to_string()], "ok"),
+                "{src}"
+            );
+            let mut lazy = Vec::new();
+            let flow =
+                eval_each_owned::<JqSemantics>(&expr, input, false, Reentry::REBUILT, &mut |v| {
+                    lazy.push(v.to_json());
+                    Demand::Continue
+                });
+            assert!(matches!(flow, Flow::Exhausted), "{src}: {}", ending(flow));
+            assert_eq!(lazy, [expected], "{src}");
+        }
+        // yq mode still bridges, and so still meets the depth error.
+        let eager = eval_owned_input::<Vec<u64>, YqSemantics>(
+            &parse("del(.)").unwrap(),
+            &deep,
+            false,
+            Reentry::REBUILT,
+        );
+        assert!(matches!(eager, QueryResult::Error(_)));
     }
 
     /// How a stream of owned outputs ended, for comparing two routes.
