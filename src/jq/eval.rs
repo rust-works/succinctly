@@ -137160,6 +137160,59 @@ mod touched_edge_cases_2999 {
         );
     }
 
+    /// #4236: `min`/`max` of an empty array or a scalar, and `to_entries`/`with_entries`/`split` of
+    /// `null`, answer nothing in yq (pinned in the CLI suite) where jq answers `null` or raises;
+    /// a mapping is the extremum of its values. The owned evaluator's own arms, which the
+    /// CLI's generic evaluator bridges to.
+    #[test]
+    fn yq_builtins_with_nothing_to_work_on_answer_nothing_in_the_owned_evaluator_4236() {
+        let run = |json: &[u8], filter: &str, yq: bool| {
+            let index = JsonIndex::build(json);
+            let expr = parse_with_mode_and_extensions(
+                filter,
+                if yq { ParserMode::Yq } else { ParserMode::Jq },
+                true,
+            )
+            .expect("parses");
+            let join = |values: Vec<OwnedValue>| {
+                values
+                    .iter()
+                    .map(OwnedValue::to_json)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            if yq {
+                let result = eval::<Vec<u64>, YqSemantics>(&expr, index.root(json));
+                if matches!(result, QueryResult::Error(_)) {
+                    return "error".to_string();
+                }
+                join(result.collect_owned::<YqSemantics>())
+            } else {
+                let result = eval::<Vec<u64>, JqSemantics>(&expr, index.root(json));
+                if matches!(result, QueryResult::Error(_)) {
+                    return "error".to_string();
+                }
+                join(result.collect_owned::<JqSemantics>())
+            }
+        };
+        for (json, filter, yq, jq) in [
+            (&b"[]"[..], "min", "", "null"),
+            (b"[]", "max", "", "null"),
+            (b"{}", "min", "", "error"),
+            (b"1", "max", "", "error"),
+            (b"null", "to_entries", "", "error"),
+            (b"null", "with_entries(.)", "", "error"),
+            (b"null", "split(\",\")", "", "error"),
+            (b"{\"a\":2,\"b\":1}", "min", "1", "error"),
+            (b"{\"a\":2,\"b\":1}", "max", "2", "error"),
+            (b"[3,1,2]", "min", "1", "1"),
+            (b"\"a,b\"", "split(\",\")", "[\"a\",\"b\"]", "[\"a\",\"b\"]"),
+        ] {
+            assert_eq!(run(json, filter, true), yq, "yq: {filter}");
+            assert_eq!(run(json, filter, false), jq, "jq: {filter}");
+        }
+    }
+
     /// #4139: yq's `as` runs its body once, with the variable unset, when the
     /// source has no output. The CLI is served by the generic evaluator, so the
     /// owned evaluator's two `as` implementations (`eval_as` through `eval_full`,

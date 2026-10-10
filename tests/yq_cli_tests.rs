@@ -61100,6 +61100,65 @@ fn test_object_construction_empty_operand_4193() -> Result<()> {
     Ok(())
 }
 
+/// Pinned yq v4.53.3: a few builtins answer nothing, not an error or `null`, for an input they
+/// have nothing to work on (#4236): `min`/`max` of an empty array, a scalar or an empty mapping
+/// (a mapping is the extremum of its values), and `to_entries`/`with_entries`/`split` of `null`.
+/// jq keeps its `null` and its errors. Every row was captured from the pinned binary and
+/// `/usr/bin/jq` 1.7.1, `-p=json -o=json -I=0`.
+#[test]
+fn test_yq_builtins_that_answer_nothing_4236() -> Result<()> {
+    let args = &["-p=json", "-o=json", "-I=0"];
+    for (input, filter, expected) in [
+        ("[]", "min", ""),
+        ("[]", "max", ""),
+        ("{}", "min", ""),
+        ("{}", "max", ""),
+        ("1", "min", ""),
+        ("\"s\"", "max", ""),
+        ("true", "min", ""),
+        ("null", "max", ""),
+        ("null", "to_entries", ""),
+        ("null", "with_entries(.)", ""),
+        ("null", "split(\",\")", ""),
+        // A mapping is the extremum of its values.
+        ("{\"a\":2,\"b\":1}", "min", "1\n"),
+        ("{\"a\":2,\"b\":1}", "max", "2\n"),
+        // Everything else keeps its answer.
+        ("[3,1,2]", "min", "1\n"),
+        ("[3,1,2]", "max", "3\n"),
+        ("{\"a\":1}", "to_entries", "[{\"key\":\"a\",\"value\":1}]\n"),
+        ("\"a,b\"", "split(\",\")", "[\"a\",\"b\"]\n"),
+        ("[]", "to_entries", "[]\n"),
+        ("{}", "with_entries(.)", "{}\n"),
+        // Inside a construction an empty one is a skipped entry (#4193).
+        ("[]", "{\"a\": min, \"b\": 1}", "{\"b\":1}\n"),
+        ("null", "{\"a\": to_entries, \"b\": 2}", "{\"b\":2}\n"),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, input, args)?,
+            (expected.into(), String::new(), 0),
+            "{input} | {filter}"
+        );
+    }
+    // jq mode is unchanged.
+    for (input, filter, expected_out, expected_code) in [
+        ("[]", "min", "null\n", 0),
+        ("[]", "max", "null\n", 0),
+        ("null", "to_entries", "", 5),
+        ("null", "split(\",\")", "", 5),
+        ("{\"a\":1}", "min", "", 5),
+        ("1", "min", "", 5),
+    ] {
+        let (out, code) = run_jq_stdin(filter, input, &["-c"])?;
+        assert_eq!(
+            (out.as_str(), code),
+            (expected_out, expected_code),
+            "jq: {input} | {filter}"
+        );
+    }
+    Ok(())
+}
+
 /// Pinned yq v4.53.3: a key or an index applied to a string, number or boolean yields nothing, not
 /// `null`, so a plain path can be the empty pair of a `{...}` and the fold must run for it (#4240).
 /// Every row was captured from the pinned binary, `-p=json -o=json -I=0`.
