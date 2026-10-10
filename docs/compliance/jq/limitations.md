@@ -7617,12 +7617,14 @@ difference remains, pre-existing: the error reads `Invalid JSON text` where jq q
 parser (`jq: parse error: Unfinished JSON term at EOF at line 2, column 5`, with no `(at …)`
 marker from the driver loop). A parse error stops the whole input stream on both routes, as it
 does in jq: the files after the malformed one are not read ([#4313](https://github.com/rust-works/succinctly/issues/4313);
-the lazy per-file route used to move on to the next file). And the
-`(at …)` marker a later error names after the parse error has been read counts newlines
-through the end of the line the malformed value starts on, which is jq's answer whenever that
-value sits on one line (`1\n2 }\n\n\n` → line 2); for a malformed value spanning several lines
-jq names wherever its parser gave up inside it, and for one cut off at end of input
-`<unknown>`, where succinctly still names the end of its first line.
+the lazy per-file route used to move on to the next file). Under `input`/`inputs`, jq instead
+discards the rest of the read the error is in and goes on parsing at the next one, where
+succinctly stops ([#4311](https://github.com/rust-works/succinctly/issues/4311)). Since
+[#4308](https://github.com/rust-works/succinctly/issues/4308) the `(at …)` marker a later
+error names after the parse error has been read matches jq's: every newline up to the end of
+the read in which jq detects the fault, at the fault itself for a malformed container
+(`0\n[1,\n2,\n}\n` → line 4), at the closing quote for a string holding a raw control
+character, and at the end of input for a value cut off there.
 
 **The materializing flag routes still validate whatever the filter — down to `-n`/`input`
 now, closed by [#2662](https://github.com/rust-works/succinctly/issues/2662) for

@@ -124441,3 +124441,58 @@ fn test_error_after_input_runs_out_names_jqs_eof_location_4303() -> Result<()> {
     }
     Ok(())
 }
+
+/// #4308: jq's `(at <file>:<line>)` line for a value is every newline up to the
+/// end of the read that completes it, so a value that completes mid-line takes
+/// that line's newline; and a parse error's line is the end of the read in
+/// which jq detects it. Every expectation is jq 1.7.1's own, on both the
+/// default document loop (`error`) and the materializing input path (a program
+/// using `input_line_number`).
+#[test]
+fn test_error_lines_follow_jqs_reads_4308() -> Result<()> {
+    let lines_of = |stderr: &str, path: &str| -> Vec<usize> {
+        let marker = format!("(at {path}:");
+        stderr
+            .lines()
+            .filter_map(|line| {
+                let rest = &line[line.find(&marker)? + marker.len()..];
+                rest[..rest.find(')')?].parse().ok()
+            })
+            .collect()
+    };
+    for (doc, expected) in [
+        ("1 2\n3\n", vec![1, 1, 2]),
+        ("\"a\" \"b\"\n\n\"c\"\n", vec![1, 1, 3]),
+        ("[1,\n2] 3\n4", vec![2, 2, 2]),
+        ("1\n2", vec![1, 1]),
+    ] {
+        for filter in ["error", "error, (input_line_number | empty)"] {
+            let (_, stderr, code, paths) =
+                run_jq_over_byte_files(&["-c", filter], &[doc.as_bytes()])?;
+            assert_eq!(
+                (lines_of(&stderr, &paths[0]), code),
+                (expected.clone(), 5),
+                "{filter} over {doc:?}: {stderr}"
+            );
+        }
+    }
+    // The marker once `try` has caught the parse error that ends the reads.
+    for (doc, expected) in [
+        ("1\n2 }\n\n\n", 2),
+        ("0\n[1,\n2,\n}\n", 4),
+        ("0\n{\"a\":\n1 2}\n", 3),
+        ("0\n[\n\"a\tb\"]\n", 3),
+        ("1\n\"ab\ncd\"\n", 3),
+    ] {
+        let (_, stderr, code, paths) = run_jq_over_byte_files(
+            &["-nc", "try (repeat(input) | empty) catch error(\"x\")"],
+            &[doc.as_bytes()],
+        )?;
+        assert_eq!(
+            (lines_of(&stderr, &paths[0]), code),
+            (vec![expected], 5),
+            "{doc:?}: {stderr}"
+        );
+    }
+    Ok(())
+}

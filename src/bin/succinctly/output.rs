@@ -129,9 +129,10 @@ impl DiagStyle {
 
 /// Where an input value came from, for jq's `(at <file>:<line>)` marker.
 ///
-/// jq reports the line on which the input value *ends*, 1-based, and falls back
-/// to `<stdin>` when reading a pipe and `<unknown>` under `-n` (there is no
-/// input to point at).
+/// jq reports the number of newlines its reads have consumed once the value is
+/// complete (#4308: a value that completes mid-line takes that line's newline),
+/// and falls back to `<stdin>` when reading a pipe and `<unknown>` under `-n`
+/// (there is no input to point at).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InputLocation {
     /// Source file, or `None` for stdin.
