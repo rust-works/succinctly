@@ -48258,22 +48258,26 @@ fn bind_hands_on_the_register(e: &Expr) -> bool {
 /// fold, and its by-value drive is right (`foreach (reduce . as {a:$a} (0; .)) as
 /// $x (.; .; .)`).
 ///
-/// Only the source's own spine is read (the bind itself, a comma's branches, a
-/// pipe's first stage that does not just hand the register on (#3940), a nested
-/// `foreach` over `.`), never a builtin's argument or a `def`
-/// body, where `.` is another value. A nested `foreach . as [$q] (...)` moves the
+/// Only the source's own spine is read (the bind itself and its body, a comma's
+/// branches, a pipe's stages up to the first that may move the register (#3940,
+/// #4278), an `if`'s branches, a no-argument `def` call's body (#4278), a nested
+/// `foreach` over `.`), never a builtin's argument, where `.` is another value. A nested
+/// `foreach . as [$q] (...)` moves the
 /// register for the outer fold too (#3853): it does not backtrack its source, so what it
 /// destructures reaches the outer EXTRACT. (An earlier routing of it answered a root
 /// where jq refuses inside an `or` under a `try`, 54 sampled rows; those were the
 /// resolver's uncatchable "with result" refusal of a `.` body after a moved register,
-/// which [`body_performs_no_step`] now keeps from firing early.) A `?//` chain is left
-/// to the by-value drive as for a fresh source ([`routes_destructuring`]), except as a
-/// nested `foreach`'s own patterns over the register ([`routes_destructuring_chain`], #3948).
+/// which [`body_performs_no_step`] now keeps from firing early.) A `?//` chain of
+/// destructuring patterns on the register is the source's own destructure (#4187); one with a
+/// bare `$var` alternative is not by itself, but a destructure in its body is (#4278), as is a
+/// nested `foreach`'s own chain over the register ([`routes_destructuring_chain`], #3948).
 ///
-/// The bound expression is a bare `.` or a `select(literal)` that hands it on (#4128); a
-/// `(.|.)`/`(., .)` bind stays out, since the resolver reads it as a computed value. The
-/// other [`source_destructures_register`] mode, through a nested `reduce`, is only for
-/// the places the register is not known to be at `.`.
+/// The bound expression is a bare `.`, a `select(literal)` that hands it on (#4128), a comma of
+/// those (#4150), or a variable that may hold the register (#4278: bound to it on the spine, or
+/// bound outside the source), also behind `first`/`last`/`limit`/`?`/`label`
+/// ([`RegisterSpine::binds_register`]). A `(.|.)` bind stays out, since the resolver reads it as
+/// a computed value. The other [`source_destructures_register`] mode, through a nested
+/// `reduce`, is only for the places the register is not known to be at `.`.
 fn foreach_source_destructures_register(source: &Expr) -> bool {
     source_destructures_register(source, false)
 }
@@ -48290,61 +48294,400 @@ fn foreach_source_destructures_register(source: &Expr) -> bool {
 /// resolver, so the caller routes a source that holds one through it when the
 /// accumulator is not known to be the register.
 fn source_destructures_register(source: &Expr, through_reduce: bool) -> bool {
-    let recurse = |e: &Expr| source_destructures_register(e, through_reduce);
-    match unwrap_paren(source) {
-        // #4128: `select(true) as {a:$a}` binds the register as `. as {a:$a}` does, so under
-        // `through_reduce` any source that only hands the register on is the same destructure.
-        // The `foreach` route takes a bare `.`, a `select(literal)` and a comma of them
-        // (#4150: `(., .) as {a:$a}` binds per leaf, [`comma_leaves`]); a pipe such as
-        // `(.|.) as {a:$a}` stays out, since the resolver reads it as a computed value and a
-        // `try`/`?` around it swallowed the resulting refusal.
-        // #4187: a plain bind (`. as $x | BODY`, or a `?//` chain of bare `$var`s) does not move the
-        // register -- its source runs as a subexpression -- so its body meets the register where the
-        // bind did, and a destructure there is the source's own.
-        Expr::As { body, .. } => recurse(body),
-        Expr::AsPattern { patterns, body, .. } if patterns_all_bare(patterns) => recurse(body),
-        // #4187: a `?//` chain of destructuring patterns only. One with a bare `$var` alternative
-        // (`. as {a:$a} ?// $a`) is left to the by-value drive: nothing in the register sweep
-        // accepts a wrong answer through it, and routing it loses matches the drive makes.
-        Expr::AsPattern { expr, patterns, .. } => {
-            (routes_destructuring(patterns) || patterns_all_destructuring_chain(patterns))
-                && if through_reduce {
-                    yields_only_the_register(expr)
-                } else {
-                    bind_hands_on_the_register(expr)
+    let mut walk = RegisterSpine {
+        through_reduce,
+        vars: Vec::new(),
+        defs: Vec::new(),
+        installed: Vec::new(),
+        calls: SPINE_CALL_BUDGET,
+    };
+    walk.reach(source) == Reach::Destructures
+}
+
+/// Calls `visit` with each variable `pattern` binds, in order. One traversal for
+/// [`collect_pattern_var_names`] (owned) and the spine walk (borrowed).
+fn visit_pattern_names<'e>(pattern: &'e Pattern, visit: &mut impl FnMut(&'e str)) {
+    match pattern {
+        Pattern::Var(name) => visit(name),
+        Pattern::Object(entries) => {
+            for entry in entries {
+                // `{$b: P}` binds `$b` as well as what `P` binds (#2649).
+                if let Some(bind) = &entry.bind {
+                    visit(bind);
                 }
+                visit_pattern_names(&entry.pattern, visit);
+            }
         }
-        Expr::Comma(branches) => branches.iter().any(recurse),
-        // #3940: a leading stage that only hands the register on (`.`, `(.|.)`, `(., .)`)
-        // moves nothing, so the stage after it is the one that meets the register.
-        Expr::Pipe(stages) => stages
+        Pattern::Array(patterns) => {
+            for pattern in patterns {
+                visit_pattern_names(pattern, visit);
+            }
+        }
+    }
+}
+
+/// How many distinct `def` bodies one [`source_destructures_register`] walk reads (#4278).
+/// Each body is read once ([`SpineDef::reach`]), so this bounds the definitions a walk
+/// explores, not the calls to them. Past it a call is read as destructuring: the source is
+/// routed, the loud direction, since reading it as opaque would leave a destructure behind it
+/// to the by-value drive, which answers where jq raises.
+const SPINE_CALL_BUDGET: u32 = 16;
+
+/// What a node on a fold source's spine does with jq's register ([`RegisterSpine::reach`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// It destructures the register: the source goes through the resolver.
+    Destructures,
+    /// It hands the register on unmoved, so the next pipe stage meets it where this one did.
+    HandsOn,
+    /// Anything else: it may move the register, so the walk stops there.
+    Opaque,
+}
+
+/// One definition in scope on the spine (`def NAME: BODY; REST`, before the calls in `REST`
+/// are installed), with how many variables were bound around it. A call reads `BODY` with
+/// those variables and the definitions up to and including this one (its index in
+/// [`RegisterSpine::defs`]), as jq binds it lexically (#4278).
+struct SpineDef<'e> {
+    name: &'e str,
+    body: &'e Expr,
+    vars: usize,
+    /// The body's reach, once read: the scope is fixed per definition, so every call to it
+    /// reads the same, and `f | f | ... | f` costs one body. [`Reach::HandsOn`] while the
+    /// body is being read, so a recursive call is taken to hand the register on: the reading
+    /// that routes more, the loud direction.
+    reach: Option<Reach>,
+}
+
+/// The state of one [`source_destructures_register`] walk down a fold source's spine.
+struct RegisterSpine<'e> {
+    /// See [`source_destructures_register`].
+    through_reduce: bool,
+    /// The variables bound so far on the spine, innermost last, each with whether it may hold
+    /// the register (#4278: `. as $x | $x as {a:$a}` destructures the register as `. as
+    /// {a:$a}` does). A later binding of the same name shadows an earlier one.
+    vars: Vec<(&'e str, bool)>,
+    /// The no-argument definitions in scope on the spine, innermost last.
+    defs: Vec<SpineDef<'e>>,
+    /// The reach of each installed call's body read so far, by body, with the same
+    /// in-progress rule as [`SpineDef::reach`].
+    installed: Vec<(*const Expr, Reach)>,
+    /// What is left of [`SPINE_CALL_BUDGET`].
+    calls: u32,
+}
+
+impl<'e> RegisterSpine<'e> {
+    /// Whether `$name` is bound on the spine to what may be the register itself.
+    fn holds_register(&self, name: &str) -> bool {
+        self.vars
             .iter()
-            .find(|stage| !yields_only_the_register(stage))
-            .is_some_and(recurse),
-        Expr::Foreach {
-            input, patterns, ..
-        } => {
-            ((routes_destructuring(patterns) || routes_destructuring_chain(patterns))
-                && yields_only_the_register(input))
-                // #4031: the nested fold does not backtrack its source either, so what
-                // that source destructures reaches the outer EXTRACT whatever the
-                // nested loop pattern is (`foreach (foreach (. as [$a] | .) as $k (.; .; .))`).
-                || recurse(input)
+            .rev()
+            .find(|(bound, _)| *bound == name)
+            .is_some_and(|(_, register)| *register)
+    }
+
+    /// Whether `e`, the bound expression of a bind, is the register on every output: what
+    /// [`bind_hands_on_the_register`] (or, through a `reduce`, [`yields_only_the_register`])
+    /// accepts, or a variable that may hold it (#4278): one the spine bound to the register,
+    /// or one bound outside the source (substituted as a [`Expr::TrackedVar`] marker, at the
+    /// register or not: destructuring either is a tracked step jq raises on here), also
+    /// behind the wrappers that hand their operand's value on (`first($x)`, `$x?`, a comma
+    /// of them). A call returning `$x` is not read.
+    fn binds_register(&self, e: &Expr) -> bool {
+        match unwrap_paren(e) {
+            Expr::Var(name) => self.holds_register(name),
+            Expr::TrackedVar(_) => true,
+            Expr::Comma(items) if items.iter().any(Self::binds_variable) => {
+                items.iter().all(|item| self.binds_register(item))
+            }
+            Expr::FirstExpr(inner)
+            | Expr::LastExpr(inner)
+            | Expr::Optional(inner)
+            | Expr::Limit { expr: inner, .. }
+            | Expr::Label { body: inner, .. }
+                if Self::binds_variable(inner) =>
+            {
+                self.binds_register(inner)
+            }
+            _ if self.through_reduce => yields_only_the_register(e),
+            _ => bind_hands_on_the_register(e),
         }
-        Expr::Reduce {
-            input, patterns, ..
-        } if through_reduce => {
-            ((routes_destructuring(patterns) || routes_destructuring_chain(patterns))
-                && yields_only_the_register(input))
-                || recurse(input)
+    }
+
+    /// Whether `e`'s outputs come from a variable leaf, through the wrappers
+    /// [`binds_register`](Self::binds_register) reads: the shapes it answers by the
+    /// variable, not by the `.` rules.
+    fn binds_variable(e: &Expr) -> bool {
+        match unwrap_paren(e) {
+            Expr::Var(_) | Expr::TrackedVar(_) => true,
+            Expr::Comma(items) => items.iter().any(Self::binds_variable),
+            Expr::FirstExpr(inner)
+            | Expr::LastExpr(inner)
+            | Expr::Optional(inner)
+            | Expr::Limit { expr: inner, .. }
+            | Expr::Label { body: inner, .. } => Self::binds_variable(inner),
+            _ => false,
         }
-        // #3956: a wrapper that emits what its operand does (`try E`, `E?`, `first(E)`,
-        // `limit(n; E)`) meets the register where `E` does, and a `label` runs its body in
-        // the same scope, so the destructure behind it is the source's own.
-        Expr::Label { body, .. } => recurse(body),
-        other => {
-            let peeled = peel_register_transparent(other);
-            !core::ptr::eq(peeled, other) && recurse(peeled)
+    }
+
+    /// The names a bind of `expr` to `patterns` binds, each with whether it may hold the
+    /// register. A destructuring alternative's names hold members. The first bare `$var`
+    /// alternative holds `expr` when it matches, the register if [`binds_register`] says so;
+    /// a later one only on a retry after the body raised (#4278), and is read as not the
+    /// register. A name more than one alternative binds is one variable whose value depends
+    /// on which matched, so it may hold the register if any binding of it may (`. as $a ?//
+    /// {a:$a} | $a as {a:$b}`).
+    ///
+    /// [`binds_register`]: Self::binds_register
+    fn chain_names(&self, expr: &Expr, patterns: &'e [Pattern]) -> Vec<(&'e str, bool)> {
+        let mut register = self.binds_register(expr);
+        let mut names: Vec<(&'e str, bool)> = Vec::new();
+        let mut bind =
+            |name: &'e str, held: bool| match names.iter_mut().find(|(bound, _)| *bound == name) {
+                Some((_, any)) => *any |= held,
+                None => names.push((name, held)),
+            };
+        for pattern in patterns {
+            match pattern {
+                Pattern::Var(name) => {
+                    bind(name, register);
+                    register = false;
+                }
+                _ => visit_pattern_names(pattern, &mut |name| bind(name, false)),
+            }
+        }
+        names
+    }
+
+    /// `body`'s reach with `names` bound, each to the register or not.
+    fn with_vars(&mut self, names: &[(&'e str, bool)], body: &'e Expr) -> Reach {
+        let depth = self.vars.len();
+        self.vars.extend_from_slice(names);
+        let reach = self.reach(body);
+        self.vars.truncate(depth);
+        reach
+    }
+
+    /// The definition at `at` in [`defs`](Self::defs) called: its body read with the variables
+    /// bound around it and the definitions up to and including itself, once per walk.
+    fn through_def(&mut self, at: usize) -> Reach {
+        if let Some(reach) = self.defs[at].reach {
+            return reach;
+        }
+        if self.calls == 0 {
+            return Reach::Destructures;
+        }
+        self.calls -= 1;
+        self.defs[at].reach = Some(Reach::HandsOn);
+        let SpineDef { body, vars, .. } = self.defs[at];
+        let vars_tail = self.vars.split_off(vars.min(self.vars.len()));
+        let defs_tail = self.defs.split_off(at + 1);
+        let reach = self.reach(body);
+        self.vars.extend(vars_tail);
+        self.defs.extend(defs_tail);
+        self.defs[at].reach = Some(reach);
+        reach
+    }
+
+    /// An installed call's body, read once per walk with no spine variables or definitions:
+    /// resolution installed it where it was written, which the walk never saw, so a variable
+    /// it cannot see is read as not the register and its own calls are installed too.
+    fn through_installed(&mut self, body: &'e Expr) -> Reach {
+        let key: *const Expr = body;
+        if let Some(&(_, reach)) = self.installed.iter().find(|(seen, _)| *seen == key) {
+            return reach;
+        }
+        if self.calls == 0 {
+            return Reach::Destructures;
+        }
+        self.calls -= 1;
+        self.installed.push((key, Reach::HandsOn));
+        let vars = core::mem::take(&mut self.vars);
+        let defs = core::mem::take(&mut self.defs);
+        let reach = self.reach(body);
+        self.vars = vars;
+        self.defs = defs;
+        if let Some(entry) = self.installed.iter_mut().find(|(seen, _)| *seen == key) {
+            entry.1 = reach;
+        }
+        reach
+    }
+
+    /// What `e` does with the register as a fold source, or a stage of one.
+    fn reach(&mut self, e: &'e Expr) -> Reach {
+        match unwrap_paren(e) {
+            Expr::Identity => Reach::HandsOn,
+            // #4187: a plain bind (`. as $x | BODY`, or a `?//` chain of bare `$var`s) does
+            // not move the register -- its source runs as a subexpression -- so its body
+            // meets the register where the bind did, and a destructure there is the source's
+            // own. #4278: the variables it binds are tracked, so a later `$x as {a:$a}` of a
+            // `$x` bound to the register is that destructure too. In a chain of bare `$var`s
+            // only the first is read as the register: it always matches, and the others hold
+            // `null` unless the body raises and jq retries, which routing them would model
+            // with a refusal a `try` around the fold then swallows (`. as $x ?// $y | $y as
+            // {a:$a}` under `try`, in a `reduce` UPDATE, raised in jq and answered here).
+            Expr::As { expr, var, body } => {
+                let register = self.binds_register(expr);
+                self.with_vars(&[(var.as_str(), register)], body)
+            }
+            Expr::AsPattern {
+                expr,
+                patterns,
+                body,
+            } if patterns_all_bare(patterns) => {
+                let names = self.chain_names(expr, patterns);
+                self.with_vars(&names, body)
+            }
+            // #4128: `select(true) as {a:$a}` binds the register as `. as {a:$a}` does, so
+            // under `through_reduce` any source that only hands the register on is the same
+            // destructure. The `foreach` route takes a bare `.`, a `select(literal)` and a
+            // comma of them (#4150: `(., .) as {a:$a}` binds per leaf, [`comma_leaves`]); a
+            // pipe such as `(.|.) as {a:$a}` stays out, since the resolver reads it as a
+            // computed value and a `try`/`?` around it swallowed the resulting refusal.
+            // #4187: a `?//` chain of destructuring patterns only. One with a bare `$var`
+            // alternative (`. as {a:$a} ?// $a`) is left to the by-value drive: nothing in the
+            // register sweep accepts a wrong answer through it, and routing it loses matches
+            // the drive makes.
+            // #4278: whatever the chain, its body runs after it, on the register where the
+            // matched alternative left it, so a destructure in the body is the source's own
+            // (`. as $x ?// [$q] | . as {a:$a} | .`). Its names are [`chain_names`]: the first
+            // bare `$var` alternative holds the register when it matches (`. as [$q] ?// $x |
+            // $x as {a:$a}`). A destructuring alternative may have moved the register, so the
+            // chain never hands it on.
+            //
+            // [`chain_names`]: Self::chain_names
+            Expr::AsPattern {
+                expr,
+                patterns,
+                body,
+            } => {
+                if (routes_destructuring(patterns) || patterns_all_destructuring_chain(patterns))
+                    && self.binds_register(expr)
+                {
+                    return Reach::Destructures;
+                }
+                let names = self.chain_names(expr, patterns);
+                match self.with_vars(&names, body) {
+                    Reach::Destructures => Reach::Destructures,
+                    _ => Reach::Opaque,
+                }
+            }
+            Expr::Comma(branches) => {
+                let mut reach = Reach::HandsOn;
+                for branch in branches {
+                    match self.reach(branch) {
+                        Reach::Destructures => return Reach::Destructures,
+                        Reach::Opaque => reach = Reach::Opaque,
+                        Reach::HandsOn => {}
+                    }
+                }
+                reach
+            }
+            // #3940: a stage that only hands the register on (`.`, `(.|.)`, `(., .)`) moves
+            // nothing, so the stage after it is the one that meets the register. #4278: so does
+            // any stage [`reach`](Self::reach) reads as handing it on (a plain bind, an `if`, a
+            // call whose body does); the walk stops at the first stage that may move it.
+            Expr::Pipe(stages) => {
+                for stage in stages {
+                    match self.reach(stage) {
+                        Reach::HandsOn => {}
+                        other => return other,
+                    }
+                }
+                Reach::HandsOn
+            }
+            // #4278: the condition runs as a subexpression, so either branch meets the
+            // register where the `if` did.
+            Expr::If {
+                then_branch,
+                else_branch,
+                ..
+            } => match (self.reach(then_branch), self.reach(else_branch)) {
+                (Reach::Destructures, _) | (_, Reach::Destructures) => Reach::Destructures,
+                (Reach::HandsOn, Reach::HandsOn) => Reach::HandsOn,
+                _ => Reach::Opaque,
+            },
+            // #4278: a call with no arguments runs its body where the call is, in the scope the
+            // definition was written in. Only such a call: a closure or `$param` binds code the
+            // walk would have to substitute. A definition with parameters is another arity: it
+            // neither shadows a no-argument one nor is reached by a call without arguments.
+            Expr::FuncDef {
+                name,
+                params,
+                body,
+                then,
+                ..
+            } => {
+                let depth = self.defs.len();
+                if params.is_empty() {
+                    self.defs.push(SpineDef {
+                        name,
+                        body,
+                        vars: self.vars.len(),
+                        reach: None,
+                    });
+                }
+                let reach = self.reach(then);
+                self.defs.truncate(depth);
+                reach
+            }
+            Expr::FuncCall { name, args, .. } if args.is_empty() => {
+                // The definition itself stays in scope in its body, for a recursive call.
+                match self.defs.iter().rposition(|def| def.name == name) {
+                    Some(at) => self.through_def(at),
+                    None => Reach::Opaque,
+                }
+            }
+            Expr::DefCall { def, args, .. } if args.is_empty() && def.params.is_empty() => {
+                // The body lives in the `Rc` the call holds, which outlives this walk's borrow
+                // of the call.
+                let body: &'e Expr = &def.body;
+                self.through_installed(body)
+            }
+            Expr::Foreach {
+                input, patterns, ..
+            } => {
+                let destructures = ((routes_destructuring(patterns)
+                    || routes_destructuring_chain(patterns))
+                    && yields_only_the_register(input))
+                    // #4031: the nested fold does not backtrack its source either, so what
+                    // that source destructures reaches the outer EXTRACT whatever the
+                    // nested loop pattern is (`foreach (foreach (. as [$a] | .) as $k (.; .; .))`).
+                    || self.reach(input) == Reach::Destructures;
+                if destructures {
+                    Reach::Destructures
+                } else {
+                    Reach::Opaque
+                }
+            }
+            Expr::Reduce {
+                input, patterns, ..
+            } if self.through_reduce => {
+                let destructures = ((routes_destructuring(patterns)
+                    || routes_destructuring_chain(patterns))
+                    && yields_only_the_register(input))
+                    || self.reach(input) == Reach::Destructures;
+                if destructures {
+                    Reach::Destructures
+                } else {
+                    Reach::Opaque
+                }
+            }
+            // #3956: a wrapper that emits what its operand does (`try E`, `E?`, `first(E)`,
+            // `limit(n; E)`) meets the register where `E` does, and a `label` runs its body in
+            // the same scope, so the destructure behind it is the source's own.
+            Expr::Label { body, .. } => self.reach(body),
+            other => {
+                let peeled = peel_register_transparent(other);
+                if !core::ptr::eq(peeled, other) {
+                    self.reach(peeled)
+                } else if yields_only_the_register(other) {
+                    // `select(literal)` (#3956).
+                    Reach::HandsOn
+                } else {
+                    Reach::Opaque
+                }
+            }
         }
     }
 }
@@ -77136,26 +77479,9 @@ fn try_pattern_alternatives<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Collect every variable name a pattern would bind, recursively.
 pub(crate) fn collect_pattern_var_names(pattern: &Pattern, names: &mut Vec<String>) {
-    match pattern {
-        Pattern::Var(name) => names.push(name.clone()),
-        Pattern::Object(entries) => {
-            for entry in entries {
-                // `{$b: P}` is one `PatternEntry` carrying both the `$b`
-                // bind and the sub-pattern `P` (#2649) -- both names must be
-                // visible here so the null short-circuit below and
-                // `pattern_alternatives_var_names` still see `$b`.
-                if let Some(bind) = &entry.bind {
-                    names.push(bind.clone());
-                }
-                collect_pattern_var_names(&entry.pattern, names);
-            }
-        }
-        Pattern::Array(patterns) => {
-            for p in patterns {
-                collect_pattern_var_names(p, names);
-            }
-        }
-    }
+    // `{$b: P}` binds both `$b` and what `P` binds (#2649), so the null short-circuit and
+    // `pattern_alternatives_var_names` see `$b` too. One traversal, [`visit_pattern_names`].
+    visit_pattern_names(pattern, &mut |name| names.push(String::from(name)));
 }
 
 // #1368: this used to be `substitute_bindings`, a private fold over

@@ -450,6 +450,45 @@ OPERANDS = [
     "(reduce (. as {a:$a} ?// [$a] | .) as $k (.; .))",
     "(reduce (. as [$a] ?// {a:$a} | .) as $k (.; .))",
     "(reduce (. as {a:$a} ?// $a | .) as $k (.; .))",
+    # (#4278) the carriers #4187 left: a mixed `?//` chain with a destructure in its body, a plain
+    # bind that is a later pipe stage, an `if` branch, a no-argument `def` call, and a `$x` the
+    # spine bound to the register. The contrasts bind something else, shadow `$x`, emit a
+    # member, or sit under a `reduce`, which backtracks its source. `(.|.) as {...}` is still
+    # accepted where jq raises (it needs the resolver to read `(.|.)` as the register).
+    "(foreach (. as $x ?// [$q] | . as {a:$a} | .) as $k (.; .; .))",
+    "(foreach (. as {a:$a} ?// $z | . as {a:$b} | .) as $k (.; .; .))",
+    "(foreach (. as {a:$a} ?// $z | $z) as $k (.; .; .))",
+    "(foreach ((. as $x | .) | . as {a:$a} | .) as $k (.; .; .))",
+    "(foreach ((. as $x | .) | . as {a:$a} | $a) as $k (.; .; .))",
+    "(foreach (def f: . as {a:$a} | .; . as $x | f) as $k (.; .; .))",
+    "(foreach (def f: . as {a:$a} | $a; f) as $k (.; .; .))",
+    "(foreach (def f: .a; f | . as {a:$a} | .) as $k (.; .; .))",
+    "(foreach (. as $x | if true then . as {a:$a} | . else . end) as $k (.; .; .))",
+    "(foreach (if .a then . as {a:$a} | .a else . end) as $k (.; .; $k))",
+    "(foreach (. as $x | $x as {a:$a} | .a) as $k (.; .; $k))",
+    "(foreach (.a as $x | $x as {a:$a} | .) as $k (.; .; .))",
+    "(foreach (. as $x | . as {a:$x} | $x as {a:$a} | .) as $k (.; .; .))",
+    "(reduce (. as $x ?// [$q] | . as {a:$a} | .) as $k (.; .))",
+    "(reduce (. as $x | $x as {a:$a} | .) as $k (.; .))",
+    # ...and the review's: a bare alternative of a mixed chain holding the register, a `def`
+    # body reading a `$x` bound around it, a call bound where the `def` was written (not a later
+    # shadowing one), and a pass-through `if` or call as an earlier pipe stage.
+    "(foreach (. as [$q] ?// $x | $x as {a:$a} | .) as $k (.; .; .))",
+    "(foreach (. as $x ?// $y | $y as {a:$a} | .) as $k (.; .; .))",
+    "(foreach (. as $x | def f: $x as {a:$a} | .; f) as $k (.; .; .))",
+    "(foreach (def g: . as {a:$a} | .; def f: g; def g: .; f) as $k (.; .; .))",
+    "(foreach (def g: .; def f: g; def g: . as {a:$a} | .; f) as $k (.; .; .))",
+    "(foreach ((if true then . else . end) | . as {a:$a} | .) as $k (.; .; .))",
+    "(foreach (def f: .; f | . as {a:$a} | .) as $k (.; .; .))",
+    # ...and the second review's: a name two chain alternatives bind, a `$x` behind `first` or a
+    # comma, a `$x` bound outside the source, and a run of calls to one pass-through `def`.
+    "(foreach (. as $a ?// {a:$a} | $a as {a:$b} | .) as $k (.; .; .))",
+    "(foreach (. as $x ?// [$x] | $x as {a:$a} | .) as $k (.; .; .))",
+    "(foreach (. as $x | first($x) as {a:$a} | .) as $k (.; .; .))",
+    "(foreach (. as $x | ($x, $x) as {a:$a} | .) as $k (.; .; .))",
+    "(. as $x | foreach ($x as {a:$a} | .) as $k (.; .; .))",
+    "(foreach (def f: .; f | f | f | f | . as {a:$a} | .) as $k (.; .; .))",
+    "(foreach ((.|.) as {a:$a} | .) as $k (.; .; .))",
     # ...and the same inside a nested fold: a nested `foreach` over `.` moves the register
     # for the outer one, a nested `reduce` does not (it is backtracked), so the latter is
     # the contrast that must keep the by-value drive.
