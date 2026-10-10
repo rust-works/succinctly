@@ -6480,7 +6480,7 @@ impl<'a> LineCounter<'a> {
     }
 
     /// Where the read holding `at` ends, given that the last call was
-    /// [`line_at_read_of`](Self::line_at_read_of)`(at)`: one past the next
+    /// [`line_at_read_of`](Self::line_at_read_of) of `at`: one past the next
     /// newline, or the end of its [`JQ_READ_CHUNK`] bytes, whichever is first
     /// (#4311). Uses the line start and next newline that call left behind, so
     /// it costs nothing more.
