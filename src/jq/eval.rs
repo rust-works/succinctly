@@ -44097,14 +44097,35 @@ fn stage_is_register_keeping<S: EvalSemantics>(expr: &Expr) -> bool {
 ///   source (`add`, `flatten`, `map(f)`, `walk(f)`) or never lets touch the register
 ///   (`sort`, `to_entries`), the leaf's own verdict (#3361).
 ///
-/// The shapes that need the run's state instead (an `[E]` collect resolved live,
-/// `getpath`) are answered at the call site only, so they are not read as a branch
-/// of a compound stage: `(select(.), [numbers])` stays refused where `[numbers]`
-/// alone is admitted (the safe direction).
+/// - [`collect_keeps_register`]: an `[E]` collect the resolver checks as jq does (#3263);
+///   as a bare stage, and since #4152 as a branch of a compound stage, from the one
+///   definition.
+///
+/// `getpath` is the one shape that needs the run's state (it is per-*branch*,
+/// [`getpath_preserves_register`]), so it is answered at the call site only and is not
+/// read as a branch of a compound stage: `(select(.), getpath(["a"]))` stays refused
+/// (the safe direction; jq raises for it too).
 fn stage_keeps_register_statically<S: EvalSemantics>(expr: &Expr) -> bool {
     cannot_move_register(expr)
         || stage_leaves_register_in_place::<S>(expr)
         || leaves_register_in_place::<S>(expr)
+        || collect_keeps_register::<S>(expr)
+}
+
+/// #3263: an array resolved live whose contents the resolver checks as jq does, and jq's
+/// collect backtracks the register to where it began ([`array_resolves_live`],
+/// [`array_contents_are_checked`]). The bare-stage rule and, since #4152, the rule for a
+/// branch of a compound stage, so the two cannot disagree.
+///
+/// Asked with `trackable = false`, the entry-independent answer: `array_resolves_live`
+/// refuses a *trackable* entry only for an `inner` that [`cannot_move_register`], and
+/// `cannot_move_register(Array(inner))` is `cannot_move_register(inner)`, so that collect
+/// is admitted by [`stage_keeps_register_statically`]'s first line either way. The flag
+/// cannot change the stage verdict, which is why a branch, whose entry trackability this
+/// predicate does not know, is not asked for it.
+fn collect_keeps_register<S: EvalSemantics>(expr: &Expr) -> bool {
+    matches!(unwrap_paren(expr), Expr::Array(inner)
+        if array_resolves_live::<S>(inner, false) && array_contents_are_checked(inner))
 }
 
 /// Whether a pipe stage `expr` is one whose by-value leaf states jq's path
@@ -57783,13 +57804,9 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
     // [`stage_keeps_register_statically`] holds the static admissions (#3643 `last(f)`, #3653
     // `select(f)` and the type filters, #3361 the by-value stages jq defines over a
     // backtracked source; what such a stage navigates on an input the register is not
-    // on is refused by [`builtin_navigation`]); the two below need the run's state.
+    // on is refused by [`builtin_navigation`]), an `[E]` collect included, bare or as a branch of
+    // a compound stage (#4152); `getpath` alone needs the run's state.
     let stage_preserves_register = stage_keeps_register_statically::<S>(element)
-        // #3263: an array resolved live whose contents the resolver checks as
-        // jq does, and jq's collect backtracks the register to where it began.
-        || matches!(element, Expr::Array(inner)
-            if array_resolves_live::<S>(inner, branch_trackable)
-                && array_contents_are_checked(inner))
         || getpath_preserves_register::<S>(
             element,
             &current,
@@ -92686,6 +92703,52 @@ mod tests {
             let expr = stage(refused);
             assert!(
                 !stage_leaves_register_in_place::<JqSemantics>(&expr),
+                "{refused}"
+            );
+        }
+    }
+
+    /// #4152: an `[E]` collect is a branch of a compound stage exactly when it is a bare
+    /// stage ([`collect_keeps_register`], one definition), so `(select(.), [numbers])` is
+    /// as register-keeping as `[numbers]`. A navigation after the collect, a `getpath`
+    /// inside it, or a navigating sibling keeps the whole refused, and yq has no oracle
+    /// for any of it.
+    #[test]
+    fn a_collect_is_a_register_keeping_branch_of_a_compound_stage_4152() {
+        for admitted in [
+            "(select(.), [numbers])",
+            "(select(.), ([numbers]))",
+            "([numbers], select(.))",
+            "([numbers], [strings])",
+            "if .k then [numbers] else select(.) end",
+            "if .k then select(.) else [numbers] end",
+            "([numbers] // 7)",
+            "(select(.) // [numbers])",
+            "(select(.) | [numbers])",
+            "try (select(.), [numbers]) catch 7",
+            "first(select(.), [numbers])",
+        ] {
+            let expr = parse(admitted).unwrap();
+            assert!(
+                stage_keeps_register_statically::<JqSemantics>(&expr),
+                "{admitted}"
+            );
+            assert!(
+                !stage_keeps_register_statically::<YqSemantics>(&expr),
+                "{admitted}"
+            );
+        }
+        for refused in [
+            "([numbers] | .a)",
+            "(select(.), [numbers] | .a)",
+            "(select(.), [.a] | .b)",
+            "(select(.), [getpath([\"a\"])])",
+            "if .k then [numbers] else .a end",
+            "(.a // [numbers])",
+        ] {
+            let expr = parse(refused).unwrap();
+            assert!(
+                !stage_keeps_register_statically::<JqSemantics>(&expr),
                 "{refused}"
             );
         }

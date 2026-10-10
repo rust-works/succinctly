@@ -1558,10 +1558,15 @@ is the revert that established what the other one costs.
    `test_register_compound_stage_of_register_keeping_branches_3767`. A branch that navigates
    (`(select(.), .a)`) or a navigating tail (`(select(.) \| .a)`) keeps the whole refused, as in jq. Still
    refused where jq answers: a `def` call (`def g: last(.a); g \| $x`, which `cannot_move_register`
-   never admits: a name is not a body), a branch that is an `[E]` collect or `getpath` (admitted as a
-   bare stage by the run's state, which a branch is not asked: `(select(.), [numbers])`), and a
-   compound `catch` handler (`try (select(.), error("e")) catch (select(.), 7)`: only a handler
-   that navigates nothing is read).
+   never admits: a name is not a body), a branch that is a `getpath` (admitted as a bare stage by the
+   run's state, which a branch is not asked), and a compound `catch` handler
+   (`try (select(.), error("e")) catch (select(.), 7)`: only a handler that navigates nothing is read).
+   An `[E]` collect as a branch of a compound stage is read by the rule that reads it as a bare stage
+   (#4152): `5 \| (select(.), [numbers])`, `5 \| ([numbers] // 7)` and `5 \| if . then [numbers] else
+   select(.) end` leave `$x` at the root (`[]` per output), pinned by
+   `test_register_collect_as_a_branch_of_a_compound_stage_4152`. A collect inside a wrapper is refused as a
+   bare stage and as a branch alike, where jq answers `[]`: `5 \| try [numbers] catch 7`,
+   `5 \| [numbers]?` and `5 \| first([numbers])`, with or without a compound around them.
    Under a `try` the refusal of a `limit`/`first` wrapper shape inside a lost-register `and`/`or` operand used to be caught, so the write jq makes was
    **silently skipped** (`del(.a? as $y \| try ((.a)? and limit(1; 5)) \| try ($y \| .b))` on
    `{"a":{"b":1},"k":2}` left the document unchanged where jq gives `{"a":{},"k":2}`); Part 4 closes

@@ -556,8 +556,9 @@ Each turns a refusal into an answer and needs its own oracle rows:
   the static admissions that `resolve_seq_stage` reads too: jq backtracks to the fork each alternative of a
   `,` `//` `if` starts from, and a pipe threads the register through, so the whole is as unmoving as its
   least branch). Still open under #3767: a `def` call (`def g: last(.a); g | $x`), which `cannot_move_register`
-  never admits; an `[E]` collect or `getpath` as a branch (those need the run's state); a compound `catch`
-  handler.
+  never admits; `getpath` as a branch (it needs the run's state); a compound `catch`
+  handler. An `[E]` collect as a branch was lifted by #4152 (`collect_keeps_register`, one definition for the bare
+  stage and a branch).
 - ~~A `reduce` whose source or `UPDATE` navigates.~~ Done by #3732 (`reduce_leaves_register_in_place`, read by
   `resolve_reduce`'s emission and by `leaves_register_in_place`): jq's `reduce` is `INIT; FORK loop; SOURCE; UPDATE;
   BACKTRACK`, so the register is where INIT left it, and an INIT that cannot move it leaves it at the entry whatever
