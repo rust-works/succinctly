@@ -3007,8 +3007,17 @@ is the revert that established what the other one costs.
    the accumulator is identical to the register, so such a sibling navigates, the builtin is a
    by-value leaf on a *trackable* entry, and the comma states the entry value for a sibling that leaves
    it alone. What still drops a path there is a sibling that navigates through the accumulator and
-   then computes (`. | .b? | tostring`), the same shape through `$v` being read since #4063's first half;
-   a loud refusal that becomes an empty answer on a deep `//` shape is #4071. A boolean register
+   then computes (`. | .b? | tostring`), the same shape through `$v` being read since #4063's first half.
+   An UPDATE that ends in a `try` whose handler navigates a frozen `$v`, followed by another stage
+   (`try (length | .) catch ($v | .b) | .`), refuses loudly where jq answers
+   ([#4071](https://github.com/rust-works/succinctly/issues/4071), pinned by
+   `test_foreach_update_navigating_handler_then_stage_refuses_loudly_4071`): the handler runs only if
+   the body raised, so the register is at the step's entry or one navigation below it, and the
+   resolver cannot say which. It used to leave the register unrecorded as lost, so EXTRACT's refusal
+   of `$v` read as jq's verdict, an EXTRACT `try` swallowed it, and `del`/`=` through the fold wrote
+   nothing and exited 0 where jq names `["a","b"]` (`path(...)` answered `[]`). Recorded lost
+   (jq mode, a live register only), the refusal is the guess of #3267 and uncatchable. A handler that
+   cannot move the register, and a `try` with no stage after it, still answer as jq does. A boolean register
    is compared with the result, so an equal one answers and a different one refuses, as in jq
    (jq reads an equal boolean result as the register itself): that holds for a bool-returning
    builtin (`contains(true)`) next to a navigating comma sibling too since #4063.
