@@ -70888,11 +70888,15 @@ mod remaining_inputs {
         // list and whether the whole input was slurped into one value; see
         // `seed`.
         static EXHAUSTED: Cell<Option<(u32, u32)>> = const { Cell::new(None) };
-        // The parse error that ended the input stream after the queued
-        // documents, with where jq's marker names once its parser stopped
-        // there -- delivered by exactly one pop, after the last document
-        // (#2961). See `pop_input`.
-        static TRAILING_ERROR: RefCell<Option<(EvalError, (u32, u32))>> = const { RefCell::new(None) };
+        // The parse errors in the input stream, in order, each with how many
+        // documents come before it and where jq's marker names once its
+        // parser stopped there -- each delivered by exactly one pop, once
+        // those documents are read (#2961). jq resumes after a parse error at
+        // its next read, so documents may follow one (#4311). See `pop_input`.
+        static ERRORS: RefCell<VecDeque<(usize, EvalError, (u32, u32))>> = const { RefCell::new(VecDeque::new()) };
+        // How many documents `pop_input` has handed out since the seed, which
+        // decides when the next of `ERRORS` is due.
+        static POPPED: Cell<usize> = const { Cell::new(0) };
         // Whether a read has already found the stream at its end. jq's first
         // such read leaves the marker at `EXHAUSTED`; every later one leaves it
         // at `<unknown>` with `input_line_number` at 0 (#4303).
@@ -70924,13 +70928,19 @@ mod remaining_inputs {
     /// once every document has been consumed -- jq's parser position after EOF
     /// -- or `None` for jq's `<unknown>`, which is what slurping leaves behind
     /// (the whole input became one value, so no file position survives).
+    ///
+    /// `errors` are `(documents before it, error, marker)`, in order of the
+    /// first field.
     pub fn seed(
         documents: Vec<(OwnedValue, u32, u32)>,
         exhausted: Option<(u32, u32)>,
-        trailing_error: Option<(EvalError, (u32, u32))>,
+        errors: Vec<(usize, EvalError, (u32, u32))>,
     ) {
+        debug_assert!(errors.windows(2).all(|w| w[0].0 <= w[1].0));
+        debug_assert!(errors.iter().all(|e| e.0 <= documents.len()));
         QUEUE.with(|q| *q.borrow_mut() = documents.into());
-        TRAILING_ERROR.with(|t| *t.borrow_mut() = trailing_error);
+        ERRORS.with(|e| *e.borrow_mut() = errors.into());
+        POPPED.with(|p| p.set(0));
         LAST_LINE.with(|l| l.set(0));
         SEEDED.with(|s| s.set(true));
         CURRENT.with(|c| c.set(None));
@@ -70976,19 +70986,39 @@ mod remaining_inputs {
     /// inconsistent: `[inputs]` on `1\n2\n` stops at its first failed read
     /// (line 2), and one more `try input` is the second (line 0).
     ///
-    /// Once the documents run out, a stream that ended in a parse error
-    /// delivers that error exactly once, moving the marker and the line to
-    /// where jq's parser stopped (#2961). The reads after it go on to the end
-    /// of the stream as above: on `1\n2 }\n\n\n`, jq names line 2 for the
+    /// A parse error is delivered exactly once, by the read after the
+    /// documents before it, moving the marker and the line to where jq's
+    /// parser stopped (#2961); the documents jq read after resuming follow it
+    /// (#4311). Once everything has been read, the reads go on to the end of
+    /// the stream as above: on `1\n2 }\n\n\n`, jq names line 2 for the
     /// error's read, line 4 for the next, and `<unknown>` after that.
     pub fn pop_input() -> Pop {
+        let popped_so_far = POPPED.with(Cell::get);
+        let error_due = ERRORS.with(|e| {
+            let mut errors = e.borrow_mut();
+            match errors.front() {
+                Some(&(before, ..)) if before <= popped_so_far => errors.pop_front(),
+                _ => None,
+            }
+        });
+        if let Some((_, error, at)) = error_due {
+            // `input_line_number` follows the parser to the error's line, as
+            // it does for a document: jq answers 2 after `input, input, (try
+            // input catch 0)` on `1\n2 }\n\n\n`.
+            LAST_LINE.with(|l| l.set(at.1));
+            CURRENT.with(|c| c.set(Some(at)));
+            return Pop::ParseError(error);
+        }
         let popped = QUEUE.with(|q| q.borrow_mut().pop_front());
         if let Some((doc, src, line)) = popped {
+            POPPED.with(|p| p.set(popped_so_far + 1));
             LAST_LINE.with(|l| l.set(line));
             CURRENT.with(|c| c.set(Some((src, line))));
             return Pop::Document(doc);
         }
-        if let Some((error, at)) = TRAILING_ERROR.with(|t| t.borrow_mut().take()) {
+        // Unreachable by the seed's own invariant (every error comes before
+        // or at the end of the documents), kept as the end of the stream.
+        if let Some((_, error, at)) = ERRORS.with(|e| e.borrow_mut().pop_front()) {
             // `input_line_number` follows the parser to the error's line, as
             // it does for a document: jq answers 2 after `input, input, (try
             // input catch 0)` on `1\n2 }\n\n\n`.
@@ -71224,7 +71254,7 @@ pub fn seed_remaining_inputs(
     documents: Vec<(OwnedValue, u32, u32)>,
     exhausted: Option<(u32, u32)>,
 ) {
-    remaining_inputs::seed(documents, exhausted, None);
+    remaining_inputs::seed(documents, exhausted, Vec::new());
 }
 
 /// [`seed_remaining_inputs`] for an input stream that ended in a parse error
@@ -71241,7 +71271,29 @@ pub fn seed_remaining_inputs_with_error(
     exhausted: Option<(u32, u32)>,
     trailing_error: Option<(EvalError, (u32, u32))>,
 ) {
-    remaining_inputs::seed(documents, exhausted, trailing_error);
+    let before = documents.len();
+    let errors = trailing_error
+        .into_iter()
+        .map(|(error, at)| (before, error, at))
+        .collect();
+    remaining_inputs::seed(documents, exhausted, errors);
+}
+
+/// [`seed_remaining_inputs`] for an input stream with parse errors among its
+/// documents (#4311): jq resumes reading after a parse error that `input`
+/// raises, so documents can follow one.
+///
+/// Each error is `(documents before it, error, marker)`, in order of the first
+/// field (at most `documents.len()`); `input` raises each as an ordinary
+/// catchable error once those documents are read, and [`pop_input`] hands it
+/// to the CLI driver, which stops there as jq's main loop does.
+#[cfg(feature = "std")]
+pub fn seed_remaining_inputs_with_errors(
+    documents: Vec<(OwnedValue, u32, u32)>,
+    exhausted: Option<(u32, u32)>,
+    errors: Vec<(usize, EvalError, (u32, u32))>,
+) {
+    remaining_inputs::seed(documents, exhausted, errors);
 }
 
 /// Counts the reads past the end of the input just seeded, as jq does (#4303).

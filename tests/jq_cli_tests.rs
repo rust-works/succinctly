@@ -124496,3 +124496,137 @@ fn test_error_lines_follow_jqs_reads_4308() -> Result<()> {
     }
     Ok(())
 }
+
+/// #4311: after a parse error that `input` raises and `try` catches, jq
+/// discards the rest of the read the fault is in and keeps reading at the next
+/// one (a newline, or 4095 bytes, at a time); a number or literal the faulty
+/// byte itself completes is never read; and a value jq reads after resuming
+/// keeps its own line. Every expectation was captured from jq 1.7.1.
+#[test]
+fn test_input_resumes_after_a_caught_parse_error_4311() -> Result<()> {
+    let rows: &[(&str, &str, &str)] = &[
+        (
+            "1\n}\n2\n",
+            "[limit(6; repeat(try input catch \"E\"))]",
+            "[1,\"E\",2,\"E\",\"E\",\"E\"]\n",
+        ),
+        (
+            "1\n}\n2\n",
+            "[limit(6; repeat(try (input | input_line_number) catch -1))]",
+            "[1,-1,3,-1,-1,-1]\n",
+        ),
+        (
+            "1 } 2\n3\n",
+            "[limit(6; repeat(try input catch \"E\"))]",
+            "[1,\"E\",3,\"E\",\"E\",\"E\"]\n",
+        ),
+        (
+            "1 } 2\n3\n",
+            "[limit(6; repeat(try (input | input_line_number) catch -1))]",
+            "[1,-1,2,-1,-1,-1]\n",
+        ),
+        (
+            "1 } } 2\n3\n",
+            "[limit(6; repeat(try input catch \"E\"))]",
+            "[1,\"E\",3,\"E\",\"E\",\"E\"]\n",
+        ),
+        (
+            "1 } } 2\n3\n",
+            "[limit(6; repeat(try (input | input_line_number) catch -1))]",
+            "[1,-1,2,-1,-1,-1]\n",
+        ),
+        (
+            "}{SP4092}123 4\n5\n",
+            "[limit(6; repeat(try input catch \"E\"))]",
+            "[\"E\",3,4,5,\"E\",\"E\"]\n",
+        ),
+        (
+            "}{SP4092}123 4\n5\n",
+            "[limit(6; repeat(try (input | input_line_number) catch -1))]",
+            "[-1,1,1,2,-1,-1]\n",
+        ),
+        (
+            "[1,\n}\n2\n",
+            "[limit(6; repeat(try input catch \"E\"))]",
+            "[\"E\",2,\"E\",\"E\",\"E\",\"E\"]\n",
+        ),
+        (
+            "[1,\n}\n2\n",
+            "[limit(6; repeat(try (input | input_line_number) catch -1))]",
+            "[-1,3,-1,-1,-1,-1]\n",
+        ),
+        (
+            "\"abc\n2\n3\n",
+            "[limit(6; repeat(try input catch \"E\"))]",
+            "[\"E\",\"E\",\"E\",\"E\",\"E\",\"E\"]\n",
+        ),
+        (
+            "\"abc\n2\n3\n",
+            "[limit(6; repeat(try (input | input_line_number) catch -1))]",
+            "[-1,-1,-1,-1,-1,-1]\n",
+        ),
+        (
+            "{\"a\":\n1 2}\n4\n",
+            "[limit(6; repeat(try input catch \"E\"))]",
+            "[\"E\",4,\"E\",\"E\",\"E\",\"E\"]\n",
+        ),
+        (
+            "{\"a\":\n1 2}\n4\n",
+            "[limit(6; repeat(try (input | input_line_number) catch -1))]",
+            "[-1,3,-1,-1,-1,-1]\n",
+        ),
+        (
+            "1\n2]\n3\n",
+            "[limit(6; repeat(try input catch \"E\"))]",
+            "[1,\"E\",3,\"E\",\"E\",\"E\"]\n",
+        ),
+        (
+            "1\n2]\n3\n",
+            "[limit(6; repeat(try (input | input_line_number) catch -1))]",
+            "[1,-1,3,-1,-1,-1]\n",
+        ),
+        (
+            "1\n\"a\"]\n3\n",
+            "[limit(6; repeat(try input catch \"E\"))]",
+            "[1,\"a\",\"E\",3,\"E\",\"E\"]\n",
+        ),
+        (
+            "1\n\"a\"]\n3\n",
+            "[limit(6; repeat(try (input | input_line_number) catch -1))]",
+            "[1,2,-1,3,-1,-1]\n",
+        ),
+        (
+            "}\n}\n}\n4\n",
+            "[limit(6; repeat(try input catch \"E\"))]",
+            "[\"E\",\"E\",\"E\",4,\"E\",\"E\"]\n",
+        ),
+        (
+            "}\n}\n}\n4\n",
+            "[limit(6; repeat(try (input | input_line_number) catch -1))]",
+            "[-1,-1,-1,4,-1,-1]\n",
+        ),
+    ];
+    for &(doc, filter, expected) in rows {
+        let doc = doc.replace("{SP4092}", &" ".repeat(4092));
+        let (stdout, stderr, code, _) =
+            run_jq_over_byte_files(&["-nc", filter], &[doc.as_bytes()])?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (expected, 0),
+            "{filter} over {doc:?}: {stderr}"
+        );
+    }
+    // Into the next file.
+    let (stdout, _, code, _) = run_jq_over_byte_files(
+        &["-nc", r#"[limit(4; repeat(try input catch "E"))]"#],
+        &[b"1\n}\n", b"2\n"],
+    )?;
+    assert_eq!((stdout.as_str(), code), ("[1,\"E\",2,\"E\"]\n", 0));
+    // Plain processing still stops at the first parse error, and loses the
+    // number its faulty byte completes, as jq does.
+    let (stdout, _, code, _) = run_jq_over_byte_files(&["-c", "."], &[b"1\n2]\n3\n"])?;
+    assert_eq!((stdout.as_str(), code), ("1\n", 5));
+    let (stdout, _, code, _) = run_jq_over_byte_files(&["-c", "."], &[b"1\n2 ]\n3\n"])?;
+    assert_eq!((stdout.as_str(), code), ("1\n2\n", 5));
+    Ok(())
+}

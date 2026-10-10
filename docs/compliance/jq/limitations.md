@@ -7618,8 +7618,11 @@ parser (`jq: parse error: Unfinished JSON term at EOF at line 2, column 5`, with
 marker from the driver loop). A parse error stops the whole input stream on both routes, as it
 does in jq: the files after the malformed one are not read ([#4313](https://github.com/rust-works/succinctly/issues/4313);
 the lazy per-file route used to move on to the next file). Under `input`/`inputs`, jq instead
-discards the rest of the read the error is in and goes on parsing at the next one, where
-succinctly stops ([#4311](https://github.com/rust-works/succinctly/issues/4311)). Since
+discards the rest of the read the error is in and goes on parsing at the next one, into later
+files too, and so does succinctly since [#4311](https://github.com/rust-works/succinctly/issues/4311)
+(`1 } 2\n3\n` reads `1`, the error, then `3`). On every route, a number or literal that the
+faulty byte itself completes is lost to the error (`1\n2]` reads only `1`; `1\n2 ]` reads
+`2` too), as in jq. Since
 [#4308](https://github.com/rust-works/succinctly/issues/4308) the `(at …)` marker a later
 error names after the parse error has been read matches jq's: every newline up to the end of
 the read in which jq detects the fault, at the fault itself for a malformed container

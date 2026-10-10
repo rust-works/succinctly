@@ -11,7 +11,8 @@
 
 use succinctly::jq::{
     count_reads_past_end, current_input_location, pop_input, pop_remaining_input,
-    seed_remaining_inputs_with_error, EvalError, InputPop, OwnedValue,
+    seed_remaining_inputs_with_error, seed_remaining_inputs_with_errors, EvalError, InputPop,
+    OwnedValue,
 };
 
 #[test]
@@ -68,4 +69,47 @@ fn a_trailing_parse_error_is_delivered_once_after_the_documents_2961() {
     assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(3)));
     assert_eq!(pop_remaining_input(), None);
     assert!(matches!(pop_input(), InputPop::Exhausted));
+}
+
+/// #4311: parse errors among the documents are each delivered once, by the
+/// read after the documents before them, and the documents jq read after
+/// resuming follow; two errors may come back to back, and one may end the
+/// stream.
+#[test]
+fn parse_errors_among_the_documents_are_delivered_in_order_4311() {
+    let error = |message: &str| EvalError::new(message);
+    seed_remaining_inputs_with_errors(
+        vec![
+            (OwnedValue::Int(1), 0, 1),
+            (OwnedValue::Int(2), 0, 4),
+            (OwnedValue::Int(3), 0, 5),
+        ],
+        Some((0, 6)),
+        vec![
+            (1, error("first"), (0, 2)),
+            (1, error("second"), (0, 3)),
+            (3, error("last"), (0, 6)),
+        ],
+    );
+    let mut reads = Vec::new();
+    for _ in 0..7 {
+        reads.push(match pop_input() {
+            InputPop::Document(OwnedValue::Int(n)) => format!("{n}@{:?}", current_input_location()),
+            InputPop::Document(_) => unreachable!("only integers are seeded"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3673)"
+            InputPop::ParseError(e) => format!("{}@{:?}", e.message, current_input_location()),
+            InputPop::Exhausted => "end".to_string(),
+        });
+    }
+    assert_eq!(
+        reads,
+        [
+            "1@Some((0, 1))",
+            "first@Some((0, 2))",
+            "second@Some((0, 3))",
+            "2@Some((0, 4))",
+            "3@Some((0, 5))",
+            "last@Some((0, 6))",
+            "end",
+        ]
+    );
 }
