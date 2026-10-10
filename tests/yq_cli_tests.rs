@@ -35956,7 +35956,7 @@ fn test_first_over_lazy_prefix_applies_every_stage_1565() -> Result<()> {
         ),
         // `Owned` arm again, but from a `LazySeq` (`map(f)`) source.
         (
-            "first(map(.+1) | first | . + 100)",
+            "first(map(. + 1) | first | . + 100)",
             "- 1\n- 2\n- 3\n",
             "102\n",
         ),
@@ -37443,14 +37443,98 @@ fn test_yq_fromjson_lone_high_surrogate_raises_2013() -> Result<()> {
 // shape.
 // ---------------------------------------------------------------------------
 
+/// Pinned yq v4.53.3: after a `.`, every character but a space and the punctuation
+/// `; } { : [ ] , | . ( ) = ! \n` belongs to the name (`PathElement` in
+/// `lexer_participle.go`), operators included, so `.a+1` is the key `a+1` and `.>1` the
+/// key `>1` -- not a sum or a comparison (#4237, #4079). A space ends the name, and `=`
+/// and `!` are never in one, which is why `.a == 1`, `.==2`, `.!=1` and `. >1` are still
+/// operations. Every row was captured from the pinned binary.
+#[test]
+fn test_path_element_takes_operator_characters_4237() -> Result<()> {
+    let doc = r#"{"a":1,"a+1":10,"a-b":5,"b":2,">1":7,"a*2":3,"a<":4,"a>":6}"#;
+    for (filter, expected) in [
+        (r".a+1", "10\n"),
+        (r".a>1", "null\n"),
+        (r".a<3", "null\n"),
+        (r".a%2", "null\n"),
+        (r".>1", "7\n"),
+        (r".+1", "null\n"),
+        (r".a + 1", "2\n"),
+        (r".a >1", "false\n"),
+        (r".a < 3", "true\n"),
+        (r".a<", "4\n"),
+        (r".a>", "6\n"),
+        (
+            r".a>=1",
+            "{\"a\":1,\"a+1\":10,\"a-b\":5,\"b\":2,\">1\":7,\"a*2\":3,\"a<\":4,\"a>\":1}\n",
+        ),
+        (r#".a<=9 | .["a<"]"#, "9\n"),
+        (r".b.>1", ""),
+        (r".a@x", "null\n"),
+        (r".a$y", "null\n"),
+        (r".a#c", "null\n"),
+        (r"[.a+1, .b]", "[10,2]\n"),
+        (r".a+1 | . + 1", "11\n"),
+        (r".a?", "1\n"),
+        (r".a+1?", "10\n"),
+        (r".c+1?", "null\n"),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, doc, &["-p=json", "-o=json", "-I=0"])?,
+            (expected.into(), String::new(), 0),
+            "{filter}"
+        );
+    }
+    // A tab, a carriage return and `#` right after the `.` are name bytes too, not
+    // whitespace or a comment, and an unspaced compound assignment writes the key
+    // `a+` (it is `.a+ = 1`), not a sum.
+    let doc2 = "{\"a\":1,\"\\ta\":3,\"#c\":5}";
+    for (filter, expected) in [
+        (".\ta", "3\n"),
+        (".#c", "5\n"),
+        (".a+=1", "{\"a\":1,\"\\ta\":3,\"#c\":5,\"a+\":1}\n"),
+        (".a += 1", "{\"a\":2,\"\\ta\":3,\"#c\":5}\n"),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, doc2, &["-p=json", "-o=json", "-I=0"])?,
+            (expected.into(), String::new(), 0),
+            "{filter:?}"
+        );
+    }
+    // The same over a stream of numbers, where a key lookup on a scalar is empty.
+    for (filter, expected) in [
+        (r"select(.>1)", ""),
+        (r"select(.>=2)", "1\n2\n3\n"),
+        (r"select(. >1)", "2\n3\n"),
+        (r"select(.<3)", ""),
+        (r".+1", ""),
+        (r".!=1", "false\ntrue\ntrue\n"),
+        (r".==2", "false\ntrue\nfalse\n"),
+        (r". > 1", "false\ntrue\ntrue\n"),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(
+                &format!("[1,2,3] | .[] | {filter}"),
+                "null",
+                &["-o=json", "-I=0"],
+            )?,
+            (expected.into(), String::new(), 0),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
 /// #2975: `Parser::peek_str`'s byte-offset arithmetic is shared by both
 /// modes -- a multi-byte character right after a field name panicked here
 /// too before the fix (confirmed live on the pre-fix binary: same "byte
 /// index N is not a char boundary" panic, exit 101). Now a clean parse
-/// error, no panic.
+/// error, no panic. (A multi-byte character right after a *name* is now part of the
+/// name, as in yq's `PathElement`, #4237: `.a（` is a key lookup, so the token here is a
+/// literal.)
 #[test]
 fn test_yq_multi_byte_character_after_a_token_is_a_parse_error_not_a_panic_2975() -> Result<()> {
-    let (stdout, stderr, code) = run_yq_stdin_with_stderr(".a（", "a: 1\n", &[])?;
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr("1（", "a: 1\n", &[])?;
     assert_eq!(code, 1, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "", "no document should be emitted");
     assert!(stderr.contains("parse error"), "stderr: {stderr:?}");
@@ -38079,11 +38163,11 @@ fn test_reduce_and_foreach_see_every_duplicate_key_1687() -> Result<()> {
         "the invariant to agree with"
     );
 
-    let (out, code) = run_yq_stdin("reduce (keys|.[]) as $k (0; .+1)", dup, &args)?;
+    let (out, code) = run_yq_stdin("reduce (keys|.[]) as $k (0; . + 1)", dup, &args)?;
     assert_eq!(code, 0);
     assert_eq!(out.trim(), "3");
 
-    let (out, code) = run_yq_stdin("[foreach (keys|.[]) as $k (0; .+1; .)]", dup, &args)?;
+    let (out, code) = run_yq_stdin("[foreach (keys|.[]) as $k (0; . + 1; .)]", dup, &args)?;
     assert_eq!(code, 0);
     assert_eq!(out.trim(), "[1,2,3]");
 
@@ -52946,7 +53030,7 @@ fn test_alternative_lazy_keys_passthrough_2476() -> Result<()> {
 fn test_alternative_lazy_seq_materializes_before_truthiness_2476() -> Result<()> {
     let doc = "a: [1, 2, 3]\n";
 
-    let (stdout, stderr, code) = run_yq_stdin_with_stderr(".a | (map(.+1) // [])", doc, &[])?;
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(".a | (map(. + 1) // [])", doc, &[])?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
     assert_eq!(stdout.trim(), "- 2\n- 3\n- 4", "stdout: {stdout:?}");
 
@@ -53858,15 +53942,15 @@ fn test_wrong_arity_single_arg_keeps_yq_parse_error_2749() -> Result<()> {
 fn test_resource_limit_caps_are_uncatchable_in_yq_mode_2132() -> Result<()> {
     for (filter, want_err) in [
         (
-            "[.a | while(true; .+1)?] | length",
+            "[.a | while(true; . + 1)?] | length",
             "while: maximum iterations exceeded",
         ),
         (
-            "[.a | try while(true; .+1) catch \"caught\"] | length",
+            "[.a | try while(true; . + 1) catch \"caught\"] | length",
             "while: maximum iterations exceeded",
         ),
         (
-            "[.a | until(false; .+1)?] | length",
+            "[.a | until(false; . + 1)?] | length",
             "until: maximum iterations exceeded",
         ),
         (
@@ -56503,7 +56587,7 @@ fn test_comma_count_argument_extensions_2863() -> Result<()> {
         ("[limit(1,2; 10,20,30)]", "[10,10,20]"),
         ("[nth(0,1; 10,20,30)]", "[10,20]"),
         // yq pipes bind tighter than commas: 1, (2 | .+1).
-        ("[limit(1,2|.+1; 10,20,30)]", "[10,10,20,30]"),
+        ("[limit(1,2|. + 1; 10,20,30)]", "[10,10,20,30]"),
     ] {
         let (stdout, stderr, code) =
             run_yq_stdin_with_stderr(filter, "null", &["--jq-extensions", "-o=json", "-I0"])?;

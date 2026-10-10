@@ -163,7 +163,11 @@ A pattern finds a typed key by its text too (`*` matches `1: y`, `true: t` and `
 `succinctly jq` keeps `*` an operator (`.a*2` is a product) and has no digit-leading field.
 A numeric, boolean or `null` *index* finds a mapping's member by the same text (`.[1]` is the `1:`
 member, `.[true]` the `true:` one, `.[1] = "z"` updates it or creates the key `1`); a miss is `null`.
-Still open: names with other punctuation (`.a+1`); see [limitations.md](../compliance/yq/limitations.md).
+The same holds for every other operator character straight after a `.` or a name (#4237): yq's
+unquoted name runs to the next space or one of ``; } { : [ ] , | . ( ) = ! `` and a newline, so
+`.a+1`, `.a>1`, `.a<3`, `.a%2`, `.>1` and `.+1` are the keys `a+1`, `a>1`, ... and not a sum or a
+comparison (`.a + 1`, `.a >1` and `. > 1` are), and `.a>=1` is the assignment `.a> = 1`. `=` and `!`
+are never part of a name, so `.a==1` and `.a!=1` compare. `succinctly jq` keeps them operators.
 
 ### `==`/`!=` compare scalars by text, with a wildcard on the right
 

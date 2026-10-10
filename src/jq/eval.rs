@@ -96023,7 +96023,7 @@ mod tests {
     /// `regression_issue_400_pipe_keeps_the_prefix_before_an_error` above).
     #[test]
     fn test_pipe_partial_prefix_discarded_in_yq_mode_2373() {
-        yq_query!(b"null", r#"(1,2,error("x")) | .+10"#,
+        yq_query!(b"null", r#"(1,2,error("x")) | . + 10"#,
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "x");
             }
@@ -98868,7 +98868,7 @@ mod tests {
     /// `YqSemantics` at all.
     #[test]
     fn test_builtin_map_values_yq_mode_does_not_collapse_duplicate_key_1829() {
-        yq_query!(br#"{"a": 10, "a": 2}"#, "map_values(.+1)",
+        yq_query!(br#"{"a": 10, "a": 2}"#, "map_values(. + 1)",
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 assert_eq!(obj.len(), 1);
                 assert_eq!(obj.get("a"), Some(&OwnedValue::Int(3)));
