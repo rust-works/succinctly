@@ -39,7 +39,7 @@
 //!
 //! # Element reads with no length lookup: a prefix (#4162)
 //!
-//! The path-context index step (`.[$i] | ... | key`, `getpath([$i]) | path`)
+//! The path-context index step (`.[$i] | ... | key`, `getpath([$i]) | ... | key`)
 //! reads a non-negative index with no length lookup, so it never reached the
 //! rule above and each read walked to its index: a loop over a wide array was
 //! quadratic in either order. Building the whole index on an element read
