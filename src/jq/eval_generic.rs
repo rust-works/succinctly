@@ -5102,12 +5102,23 @@ fn comma_array_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
 ) -> Option<GenericResult<V>> {
     let mut array = CommaArray::new();
-    if let Some(stop) =
-        run_comma_branches::<S, V>(&mut array, exprs, tail, guarded, value, optional, cursor)
-    {
-        return stop;
+    match run_comma_branches::<S, V>(&mut array, exprs, tail, guarded, value, optional, cursor) {
+        BranchesEnd::Done => Some(array.finish::<S>()),
+        BranchesEnd::Escape(escape) => Some(escape),
+        BranchesEnd::Decline => None,
     }
-    Some(array.finish::<S>())
+}
+
+/// How [`run_comma_branches`] left its input.
+enum BranchesEnd<V: DocumentValue> {
+    /// Every branch ran; the array may take the next input.
+    Done,
+    /// The array's failure: atomic, like the rest of `Expr::Array`, so
+    /// whatever was collected is discarded and the escape is the whole answer.
+    Escape(GenericResult<V>),
+    /// A guarded branch answered a lazy result ([`guarded_branch`]), which
+    /// declines the route.
+    Decline,
 }
 
 /// Runs every branch of a `,` against one input, each followed by `tail`, into
@@ -5115,11 +5126,7 @@ fn comma_array_generic<S: EvalSemantics, V: DocumentValue>(
 /// share, so the plain body, the `,` head and the `,` stage cannot drift on
 /// what a guarded group or an escape does (#4294).
 ///
-/// `Some(Some(escape))` is the array's failure: atomic, like the rest of
-/// `Expr::Array`, so whatever was collected is discarded and the escape is the
-/// whole answer. `Some(None)` is a guarded branch's lazy result, which
-/// declines the route ([`guarded_branch`]). The tail is the `Expr::Pipe` arm's
-/// own staged fold.
+/// The tail is the `Expr::Pipe` arm's own staged fold.
 fn run_comma_branches<S: EvalSemantics, V: DocumentValue>(
     array: &mut CommaArray<V>,
     branches: &[Expr],
@@ -5128,13 +5135,13 @@ fn run_comma_branches<S: EvalSemantics, V: DocumentValue>(
     value: &V,
     optional: bool,
     cursor: Option<V::Cursor>,
-) -> Option<Option<GenericResult<V>>> {
+) -> BranchesEnd<V> {
     for expr in CommaBranches::new(branches) {
         let mut result = eval_single::<S, _>(expr, value.clone(), optional, cursor);
         let mut ends_group = false;
         if guarded {
             let Some((kept, ends)) = guarded_branch(result) else {
-                return Some(None);
+                return BranchesEnd::Decline;
             };
             (result, ends_group) = (kept, ends);
         }
@@ -5142,13 +5149,13 @@ fn run_comma_branches<S: EvalSemantics, V: DocumentValue>(
             result = fold_pipe_stages::<S, V>(result, tail, optional);
         }
         if let Some(control) = array.push::<S>(result) {
-            return Some(Some(partial_generic(Vec::new(), control)));
+            return BranchesEnd::Escape(partial_generic(Vec::new(), control));
         }
         if ends_group {
             break;
         }
     }
-    None
+    BranchesEnd::Done
 }
 
 /// What [`comma_array_generic`] has collected: its items so far, in order,
@@ -5592,16 +5599,20 @@ fn comma_stage_array_generic<S: EvalSemantics, V: DocumentValue>(
     let head = eval_single::<S, _>(&prefix[0], value, optional, cursor);
     let head = fold_pipe_stages::<S, V>(head, &prefix[1..], optional);
     let mut array = CommaArray::new();
-    let mut run = |node: V::Cursor| {
-        run_comma_branches::<S, V>(
-            &mut array,
-            branches,
-            tail,
-            guarded,
-            &node.value(),
-            optional,
-            Some(node),
-        )
+    // `Some(answer)` ends the route: the array's failure, or `None` for a
+    // decline.
+    let mut run = |node: V::Cursor| match run_comma_branches::<S, V>(
+        &mut array,
+        branches,
+        tail,
+        guarded,
+        &node.value(),
+        optional,
+        Some(node),
+    ) {
+        BranchesEnd::Done => None,
+        BranchesEnd::Escape(escape) => Some(Some(escape)),
+        BranchesEnd::Decline => Some(None),
     };
     match head {
         GenericResult::OneCursor(node) => {
