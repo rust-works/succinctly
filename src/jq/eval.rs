@@ -307,6 +307,16 @@ pub trait EvalSemantics: Copy + Default {
     /// the program before it runs (`$nope is not defined`, exit 3) and keeps its error.
     const UNBOUND_VARIABLE_YIELDS_NOTHING: bool;
 
+    /// If true (yq), `min` and `max` answer nothing for an input that has no element to pick:
+    /// an empty array, and anything that is not an array (`[] | min`, `{} | max`, `1 | min`,
+    /// #4236). jq answers `null` for an empty array and raises for a non-array.
+    const MIN_MAX_NEED_AN_ELEMENT: bool;
+
+    /// If true (yq), `to_entries`, `with_entries` and `split` answer nothing for a `null` input
+    /// where jq raises (`null | to_entries`, `null | split(",")`, #4236). Every other
+    /// input keeps the answer it had.
+    const NULL_ENTRIES_AND_SPLIT_YIELD_NOTHING: bool;
+
     /// If true (yq), a binary operator whose *operand* produced zero outputs
     /// answers from `yq_empty_operand_output`'s table (this module, private)
     /// instead of contributing no pairings at all. If false (jq), an empty
@@ -404,6 +414,8 @@ impl EvalSemantics for JqSemantics {
     const UTF8_LOSSY_USES_JQ_MAXIMAL_SUBPART_RULE: bool = true;
     const ROOT_PATH_CONTEXT_YIELDS_NOTHING: bool = false;
     const UNBOUND_VARIABLE_YIELDS_NOTHING: bool = false;
+    const MIN_MAX_NEED_AN_ELEMENT: bool = false;
+    const NULL_ENTRIES_AND_SPLIT_YIELD_NOTHING: bool = false;
     const EMPTY_OPERAND_BINARY_RULE: bool = false;
     const BINARY_FANOUT_IS_LEFT_MAJOR: bool = false;
     const READ_ONLY_ABSENT_KEY_IS_EMPTY: bool = false;
@@ -444,6 +456,8 @@ impl EvalSemantics for YqSemantics {
     const UTF8_LOSSY_USES_JQ_MAXIMAL_SUBPART_RULE: bool = false;
     const ROOT_PATH_CONTEXT_YIELDS_NOTHING: bool = true;
     const UNBOUND_VARIABLE_YIELDS_NOTHING: bool = true;
+    const MIN_MAX_NEED_AN_ELEMENT: bool = true;
+    const NULL_ENTRIES_AND_SPLIT_YIELD_NOTHING: bool = true;
     const EMPTY_OPERAND_BINARY_RULE: bool = true;
     const BINARY_FANOUT_IS_LEFT_MAJOR: bool = true;
     const READ_ONLY_ABSENT_KEY_IS_EMPTY: bool = true;
@@ -17308,6 +17322,26 @@ fn builtin_all_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     any_all_gen_cond::<W, S>(gen, cond, value, optional, false)
 }
 
+/// yq's `min`/`max` of a mapping: the extremum of its values, nothing for an empty one (#4236).
+/// `items` is the values already materialised, so a decode failure surfaces here once.
+fn mapping_extremum<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    items: Result<Vec<OwnedValue>, EvalError>,
+    optional: bool,
+    want_max: bool,
+) -> QueryResult<'a, W> {
+    match items {
+        Ok(items) => {
+            let pick = if want_max {
+                items.into_iter().max_by(compare_values::<S>)
+            } else {
+                items.into_iter().min_by(compare_values::<S>)
+            };
+            pick.map_or(QueryResult::None, QueryResult::Owned)
+        }
+        Err(e) => suppress_or_raise(e, optional),
+    }
+}
+
 /// Builtin: min
 fn builtin_min<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
@@ -17323,12 +17357,31 @@ fn builtin_min<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // caveat.
             let items = to_owned_vec_or_suppress!(elements, optional);
             if items.is_empty() {
-                return QueryResult::Owned(OwnedValue::Null);
+                // yq has no element to pick, so it picks nothing (#4236).
+                return if S::MIN_MAX_NEED_AN_ELEMENT {
+                    QueryResult::None
+                } else {
+                    QueryResult::Owned(OwnedValue::Null)
+                };
             }
 
             let min = items.into_iter().min_by(compare_values::<S>).unwrap();
             QueryResult::Owned(min)
         }
+        // #4236 (yq): a mapping is the extremum of its values (`{"a": 2, "b": 1} | min` is `1`),
+        // and an empty one has none.
+        StandardJson::Object(fields) if S::MIN_MAX_NEED_AN_ELEMENT => mapping_extremum::<W, S>(
+            // STYLE-0012: routed, at `mapping_extremum`'s `Err(e) => suppress_or_raise(e, optional)`.
+            fields.map(|f| to_owned::<S, _>(&f.value())).collect(),
+            optional,
+            false,
+        ),
+        // A scalar has no element either. A decode failure on it still raises, as in the arm
+        // below.
+        _ if S::MIN_MAX_NEED_AN_ELEMENT => match scalar_decode_failure(&value) {
+            Some(e) => QueryResult::Error(e),
+            None => QueryResult::None,
+        },
         // #1755: a decode failure on the scalar itself must raise
         // unconditionally, never be suppressed by `optional`/`?` (the
         // #1247/#1620 rule) or misreported as an ordinary type error.
@@ -17354,12 +17407,27 @@ fn builtin_max<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // `builtin_min`'s sibling comment above.
             let items = to_owned_vec_or_suppress!(elements, optional);
             if items.is_empty() {
-                return QueryResult::Owned(OwnedValue::Null);
+                return if S::MIN_MAX_NEED_AN_ELEMENT {
+                    QueryResult::None
+                } else {
+                    QueryResult::Owned(OwnedValue::Null)
+                };
             }
 
             let max = items.into_iter().max_by(compare_values::<S>).unwrap();
             QueryResult::Owned(max)
         }
+        // #4236 (yq): see `builtin_min`.
+        StandardJson::Object(fields) if S::MIN_MAX_NEED_AN_ELEMENT => mapping_extremum::<W, S>(
+            // STYLE-0012: routed, at `mapping_extremum`'s `Err(e) => suppress_or_raise(e, optional)`.
+            fields.map(|f| to_owned::<S, _>(&f.value())).collect(),
+            optional,
+            true,
+        ),
+        _ if S::MIN_MAX_NEED_AN_ELEMENT => match scalar_decode_failure(&value) {
+            Some(e) => QueryResult::Error(e),
+            None => QueryResult::None,
+        },
         // #1755: same reasoning as builtin_min's own scalar arm above.
         _ => scalar_fallback(&value, optional, || {
             EvalError::pair_cannot_be_iterated(
@@ -17806,6 +17874,10 @@ fn builtin_split<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `[["a","b"]]`, where jq gives two results. Bug-for-bug (ADR-0018).
         ArgFanout::yq_native::<S>(),
         |sep_owned| {
+            // #4236 (yq): `null | split(..)` is nothing whatever the separator is.
+            if S::NULL_ENTRIES_AND_SPLIT_YIELD_NOTHING && matches!(value, StandardJson::Null) {
+                return QueryResult::None;
+            }
             let OwnedValue::String(sep) = sep_owned else {
                 return QueryResult::Error(EvalError::new(
                     "split input and separator must be strings",
@@ -19316,6 +19388,8 @@ fn builtin_to_entries<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
             QueryResult::Owned(OwnedValue::array_from(entries))
         }
+        // #4236 (yq): `null` has no entries and yields none. `with_entries` composes this.
+        StandardJson::Null if S::NULL_ENTRIES_AND_SPLIT_YIELD_NOTHING => QueryResult::None,
         _ => {
             // #1820: the Array/Object arms are already checked (this is
             // `to_owned`'s own "primary" call site); the residual
@@ -31366,6 +31440,9 @@ pub(crate) fn yields_at_least_one_value(expr: &Expr) -> bool {
 /// [`builtin_yields_at_most_one_value`] that answer for every input they
 /// accept -- not the filters (`select`, the type filters) that answer `None`
 /// for one, nor `empty`.
+///
+/// `min`/`max` (an empty array, a scalar), `to_entries` and `split` (a `null`) are absent on
+/// purpose: yq answers nothing for those inputs and so does `succinctly yq` (#4236).
 fn builtin_yields_at_least_one_value(builtin: &Builtin) -> bool {
     match builtin {
         Builtin::Type
@@ -31379,8 +31456,6 @@ fn builtin_yields_at_least_one_value(builtin: &Builtin) -> bool {
         | Builtin::Keys
         | Builtin::KeysUnsorted
         | Builtin::Add
-        | Builtin::Min
-        | Builtin::Max
         | Builtin::ToString
         | Builtin::ToNumber
         | Builtin::AsciiDowncase
@@ -31411,7 +31486,6 @@ fn builtin_yields_at_least_one_value(builtin: &Builtin) -> bool {
         | Builtin::Endswith(arg)
         | Builtin::Ltrimstr(arg)
         | Builtin::Rtrimstr(arg)
-        | Builtin::Split(arg)
         | Builtin::Join(arg)
         | Builtin::GetPath(arg) => yields_at_least_one_value(arg),
         _ => false,
@@ -137097,6 +137171,59 @@ mod touched_edge_cases_2999 {
             yq_object_route::<JqSemantics>(&entries),
             ObjectRoute::Fanout
         );
+    }
+
+    /// #4236: `min`/`max` of an empty array or a scalar, and `to_entries`/`with_entries`/`split` of
+    /// `null`, answer nothing in yq (pinned in the CLI suite) where jq answers `null` or raises;
+    /// a mapping is the extremum of its values. The owned evaluator's own arms, which the
+    /// CLI's generic evaluator bridges to.
+    #[test]
+    fn yq_builtins_with_nothing_to_work_on_answer_nothing_in_the_owned_evaluator_4236() {
+        let run = |json: &[u8], filter: &str, yq: bool| {
+            let index = JsonIndex::build(json);
+            let expr = parse_with_mode_and_extensions(
+                filter,
+                if yq { ParserMode::Yq } else { ParserMode::Jq },
+                true,
+            )
+            .expect("parses");
+            let join = |values: Vec<OwnedValue>| {
+                values
+                    .iter()
+                    .map(OwnedValue::to_json)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            if yq {
+                let result = eval::<Vec<u64>, YqSemantics>(&expr, index.root(json));
+                if matches!(result, QueryResult::Error(_)) {
+                    return "error".to_string();
+                }
+                join(result.collect_owned::<YqSemantics>())
+            } else {
+                let result = eval::<Vec<u64>, JqSemantics>(&expr, index.root(json));
+                if matches!(result, QueryResult::Error(_)) {
+                    return "error".to_string();
+                }
+                join(result.collect_owned::<JqSemantics>())
+            }
+        };
+        for (json, filter, yq, jq) in [
+            (&b"[]"[..], "min", "", "null"),
+            (b"[]", "max", "", "null"),
+            (b"{}", "min", "", "error"),
+            (b"1", "max", "", "error"),
+            (b"null", "to_entries", "", "error"),
+            (b"null", "with_entries(.)", "", "error"),
+            (b"null", "split(\",\")", "", "error"),
+            (b"{\"a\":2,\"b\":1}", "min", "1", "error"),
+            (b"{\"a\":2,\"b\":1}", "max", "2", "error"),
+            (b"[3,1,2]", "min", "1", "1"),
+            (b"\"a,b\"", "split(\",\")", "[\"a\",\"b\"]", "[\"a\",\"b\"]"),
+        ] {
+            assert_eq!(run(json, filter, true), yq, "yq: {filter}");
+            assert_eq!(run(json, filter, false), jq, "jq: {filter}");
+        }
     }
 
     /// #4139: yq's `as` runs its body once, with the variable unset, when the
