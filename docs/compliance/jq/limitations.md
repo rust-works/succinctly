@@ -1564,7 +1564,8 @@ is the revert that established what the other one costs.
    `select` stages and constants navigates nothing at stage level and is read branch by branch
    (#4151): `try (select(.), error("e")) catch (select(.), 7)`, `catch (numbers // 7)` and `catch (if .
    then select(.) else 7 end)` leave `$x` at the root, pinned by
-   `test_register_catch_handler_compound_of_select_stages_4151`. Still refused where jq answers: any `try ... catch`
+   `test_register_catch_handler_compound_of_select_stages_4151`. Still refused where jq answers: a handler with an
+   unreachable navigating branch behind a literal condition (`catch (if true then select(.) else .a end)`), and any `try ... catch`
    inside a `foreach` UPDATE, with the plain handler `catch .` as much as with this one
    (`path(foreach .a? as $k (0; try (try (select(.), error("e")) catch .); $k))` on `null`).
    An `[E]` collect as a branch of a compound stage is read by the rule that reads it as a bare stage

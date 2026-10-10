@@ -44019,7 +44019,7 @@ fn stage_leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
 /// `last(f)` or a `select(f)`/type filter, a stage that navigates nothing
 /// ([`cannot_move_register`]: `first(5)`, `limit(1; 5)`, `nth(0; 5)` are as
 /// unmoving as the `5` under them), a `try E catch H` over one whose
-/// handler cannot move it, or a compound stage (`,` `//` `if`, a pipe) of
+/// handler navigates nothing ([`handler_navigates_nothing`], #4151), or a compound stage (`,` `//` `if`, a pipe) of
 /// stages that each leave it alone ([`stage_keeps_register_statically`], #3767).
 ///
 /// A compound stage keeps the register only if *every* branch does: `(select(.) | .a)` is
@@ -44031,9 +44031,11 @@ fn stage_leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
 /// register is back where the stage entered whatever `E` navigated before it
 /// raised, and on the success path it is wherever `E` left it: the inner stage
 /// decides, exactly as for a bare `E`. The handler then runs on the error's
-/// payload, a value with no position of its own; one that cannot move the
-/// register ([`cannot_move_register`]) leaves it alone, and one that navigates
-/// raises when it runs, in jq as here, so it is not admitted. Captured against
+/// payload, a value with no position of its own; one that navigates nothing
+/// ([`handler_navigates_nothing`]: [`cannot_move_register`], or a compound of
+/// `select` stages and constants read branch by branch, #4151) leaves it alone,
+/// and one that navigates raises when it runs, in jq as here, so it is not
+/// admitted. Captured against
 /// jq 1.7.1, `path(. as $x | W | $x)` on `{"a":{"b":1},"k":2}`: `try last(.a)
 /// catch .` is `[]`, `try (last(.a), error("e")) catch .` is `[]` twice, and
 /// `try last(.a) catch .a` is `[]` too (the handler never ran) while `try
@@ -44096,7 +44098,7 @@ fn stage_is_register_keeping<S: EvalSemantics>(expr: &Expr) -> bool {
 /// here.
 fn handler_navigates_nothing(handler: &Expr) -> bool {
     cannot_move_register(handler)
-        || match unwrap_paren(handler) {
+        || match peel_register_transparent(handler) {
             Expr::Comma(branches) => branches.iter().all(handler_navigates_nothing),
             Expr::Pipe(stages) => stages.iter().all(handler_navigates_nothing),
             Expr::Alternative(left, right) => {
@@ -92809,6 +92811,8 @@ mod tests {
             "(select(.) | 7)",
             "(select(.) | (select(.), numbers))",
             "((select(.), 7))",
+            "((select(.))?, 7)",
+            "(first(select(.)), 7)",
         ] {
             assert!(handler_navigates_nothing(&handler(admitted)), "{admitted}");
         }
@@ -92823,6 +92827,7 @@ mod tests {
             "if . then select(.) else .a end",
             "(select(.), last(.a))",
             "(select(.), getpath([\"a\"]))",
+            "((.a)?, 7)",
         ] {
             assert!(!handler_navigates_nothing(&handler(refused)), "{refused}");
         }
