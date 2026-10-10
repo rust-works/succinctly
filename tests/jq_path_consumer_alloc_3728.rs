@@ -123,10 +123,13 @@ fn a_catch_empty_handler_in_path_f_is_not_run_3728() {
             &json,
         );
         assert_eq!(answered, 0, "{name}: the twin's handler delivers nothing");
+        // 7 per member on the cheapest fixture since #4217 recycled a scalar
+        // bridge document's three index buffers (it was 10 when each crossing
+        // allocated them). `allocations_collecting` warms the thread's pool.
         assert!(
-            empty + 10 * N <= run,
+            empty + 7 * N <= run,
             "{name}: `catch empty` made {empty} allocator calls and the handler the resolver \
-             has to run made {run}; not running it should save at least 10 per member"
+             has to run made {run}; not running it should save at least 7 per member"
         );
         let (streamed, outputs) =
             allocations_streaming(".[] | path(try error(\"x\") catch empty)", &json);
@@ -134,7 +137,7 @@ fn a_catch_empty_handler_in_path_f_is_not_run_3728() {
         let (streamed_run, _) =
             allocations_streaming(".[] | path(try error(\"x\") catch (empty | empty))", &json);
         assert!(
-            streamed + 10 * N <= streamed_run,
+            streamed + 7 * N <= streamed_run,
             "{name}: streamed, {streamed} against {streamed_run}"
         );
     }

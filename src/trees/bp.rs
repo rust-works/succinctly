@@ -2083,8 +2083,19 @@ impl BalancedParens<Vec<u64>, NoSelect> {
     /// the eight directory `Vec`s are most of the allocations.
     #[doc(hidden)]
     pub fn leaf() -> Self {
+        Self::leaf_in(Vec::new())
+    }
+
+    /// [`leaf`](Self::leaf), written into `words`' buffer instead of a fresh
+    /// one (#4217): the bridge recycles the word `Vec` of a dropped scalar
+    /// document, so a crossing in steady state allocates none.
+    ///
+    /// `words` is overwritten, not read: any contents are discarded.
+    pub(crate) fn leaf_in(mut words: Vec<u64>) -> Self {
+        words.clear();
+        words.push(0b01);
         Self {
-            words: alloc::vec![0b01],
+            words,
             len: 2,
             total_ones: 1,
             l0_min_excess: Vec::new(),
@@ -2097,6 +2108,17 @@ impl BalancedParens<Vec<u64>, NoSelect> {
             rank_l2: Vec::new(),
             select: NoSelect,
         }
+    }
+
+    /// Hand back the word buffer, leaving this sequence empty (#4217).
+    ///
+    /// For a [`leaf`](Self::leaf) being retired: its buffer feeds the next
+    /// [`leaf_in`](Self::leaf_in). Afterwards `self` holds no allocation and
+    /// answers nothing meaningful; drop it.
+    pub(crate) fn take_words(&mut self) -> Vec<u64> {
+        self.len = 0;
+        self.total_ones = 0;
+        core::mem::take(&mut self.words)
     }
 }
 
@@ -3085,6 +3107,28 @@ mod tests {
     // ========================================================================
     // Phase 2: BalancedParens struct tests
     // ========================================================================
+
+    /// #4217: a leaf written into a recycled buffer is the leaf `leaf()`
+    /// makes, whatever the buffer held, and `take_words` hands the buffer back.
+    #[test]
+    fn test_leaf_in_ignores_the_buffer_it_reuses_4217() {
+        let fresh = BalancedParens::leaf();
+        for dirty in [vec![], vec![u64::MAX; 9], vec![0b10]] {
+            let reused = BalancedParens::leaf_in(dirty);
+            assert_eq!(reused.words(), fresh.words());
+            assert_eq!(reused.len(), fresh.len());
+            assert_eq!(reused.total_ones(), fresh.total_ones());
+            for p in 0..=4 {
+                assert_eq!(reused.find_close(p), fresh.find_close(p), "find_close({p})");
+                assert_eq!(reused.rank1(p), fresh.rank1(p), "rank1({p})");
+            }
+        }
+        let mut leaf = BalancedParens::leaf_in(Vec::with_capacity(32));
+        let words = leaf.take_words();
+        assert_eq!(words, vec![0b01]);
+        assert!(words.capacity() >= 32, "the buffer comes back, not a copy");
+        assert_eq!(leaf.len(), 0);
+    }
 
     /// #4154: `leaf()` skips the directories `new` builds, so every public
     /// query must still answer as the built pair does -- at each position in
