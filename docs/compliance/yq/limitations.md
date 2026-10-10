@@ -5430,12 +5430,25 @@ through `EvalSemantics::UNBOUND_VARIABLE_YIELDS_NOTHING`; `succinctly jq` keeps 
 in yq (it is an unbound variable, so it prints nothing here too), and `$x-1` is the variable named
 `x-1` (the hyphen extension of #1890), not a subtraction.
 
-Still diverging, and not specific to variables (the same on any empty operand such as
-`select(false)`): `[1] | .[$nope]` is `1` in yq and nothing here, `del(.[$nope])` deletes the whole
-sequence in yq and nothing here, and `$nope as $y | 3` is `3` in yq (the body still runs) and
-nothing here. In yq an empty index operand in `.[X]` stands for *all children*, so a typo'd name
-used as a computed index or key rewrites or deletes data there while this tool leaves the document
-unchanged and exits 0 (it used to fail loudly): on `a: 1 / b: [1,2,3]`, `.[$typo] = 1` sets every
-member, `.b[$typo] += 1` is `b: [2,3,4]`, `del(.[$typo])` is `{}` and `.b[$typo]` prints every
-element ([#4139](https://github.com/rust-works/succinctly/issues/4139)). `$ENV.x` for an unset `x`
-prints nothing in yq and `null` here, and a `--arg __loc__` is not honoured in yq mode.
+An empty operand that binds or indexes is not "no operator" in yq either, and `succinctly yq`
+matches (#4139; captured against yq v4.53.3, on any empty operand such as `select(false)`):
+
+- `A as $v | B` runs `B` once, with `$v` unset, when `A` has no output (`select(false) as $z | .a`
+  is `.a`, and `$nope as $y | 3` is `3`). jq runs `B` per output of `A`, so nothing.
+- An index operand with no output stands for *all children*: `.[$nope]` on `[1]` is `1`, on `a: 1 /
+  b: [1,2,3]` `.b[$typo]` prints every element, `.[$typo] = 1` sets every member, `.b[$typo] += 1`
+  is `b: [2,3,4]`, and `del(.[$typo])` is `{}`. A typo'd name used as a computed index or key
+  therefore rewrites or deletes data, as it does in yq. The children of a scalar are none, so
+  `.b[$typo] = 1` over `b: 3` stays a no-op. This holds for a write or `del` through an `as` with
+  no source too (`(select(false) as $x | .b) = 9` sets `b`).
+- `has(E)` with no output is `false`.
+
+jq mode keeps its generator model for all three (no key, no output).
+
+Still diverging: over a `null` or absent operand yq's empty index creates the container
+(`.n[$typo] = 1` over `n: null` is `n: []`, as plain `.n[] = 1` is, which `succinctly yq` already
+does), where this tool leaves the document unchanged; a slice bound with no output is an error in yq (`.[$nope:]` is `expected to find 1
+number, got 0 instead`) and nothing here (#4197); `1 as $y | select(false) as $y | $y` is `1` in yq
+and nothing here, because the outer `$y` is not substituted into a body that rebinds the name;
+`$ENV` is an unbound variable in yq, so `$ENV.x` prints nothing, where it is the environment object
+here (#3029), and a `--arg __loc__` is not honoured in yq mode.

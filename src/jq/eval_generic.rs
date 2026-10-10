@@ -15441,7 +15441,8 @@ fn each_as_generic<S: EvalSemantics, V: DocumentValue>(
                 || body_reads().is_some(),
             )
     };
-    fanout_arg_each_generic_deferring::<S, V, _>(
+    let bound_any = core::cell::Cell::new(false);
+    let flow = fanout_arg_each_generic_deferring::<S, V, _>(
         expr,
         value.clone(),
         optional,
@@ -15449,6 +15450,7 @@ fn each_as_generic<S: EvalSemantics, V: DocumentValue>(
         &defer,
         |bound| match bound {
             Bound::Value(mut bound_val, origin) => {
+                bound_any.set(true);
                 // #2889: the binding holds this node's `OwnedValue` for the
                 // body's whole dynamic extent, exactly as jq's `. as $x` holds
                 // a reference to `.`'s `jv`. Registering it makes a later
@@ -15473,6 +15475,7 @@ fn each_as_generic<S: EvalSemantics, V: DocumentValue>(
             // checks, and a sound body holds no `path(...)`, assignment or
             // `del`.
             Bound::Deferred(node) => {
+                bound_any.set(true);
                 #[cfg(test)]
                 DEFERRED_TAKEN.with(|n| n.set(n.get() + 1));
                 if names_var() {
@@ -15490,7 +15493,13 @@ fn each_as_generic<S: EvalSemantics, V: DocumentValue>(
                 }
             }
         },
-    )
+    );
+    // yq's `as` runs its body once, with the variable unbound, when the source
+    // has no output (#4139); see `eval::yq_runs_as_body_without_source`.
+    if super::eval::yq_runs_as_body_without_source::<S>(bound_any.get(), &flow) {
+        return eval_each_generic::<S, V>(body, value, optional, cursor, sink);
+    }
+    flow
 }
 
 /// Lazy twin of `eval::each_as_pattern` (#2180 WP2b widens #1596 the same
@@ -21199,7 +21208,9 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
     // `LazyIndexRange`/`LazySeq` are all shapes `eval_each_generic` has no
     // native lazy arm for anyway, so nothing here gives up laziness that
     // pre-#2138 code already had).
+    let mut keys_seen = false;
     let mut sink = |item: GenericItem<V>| -> Demand {
+        keys_seen = true;
         match item {
             GenericItem::One(v) => {
                 // STYLE-0012: this materializes the *key* generator's
@@ -21277,7 +21288,23 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         // `owned_vec_to_generic_result` fallback below already collapses to
         // `None` (#1048), the same as the old `if keys.is_empty() { return
         // GenericResult::None }` early check did.
-        Flow::Exhausted => {}
+        //
+        // yq reads an index with no output as no index at all, so `.[E]` is
+        // every child of the operand (#4139); see
+        // `eval::yq_empty_index_children`.
+        Flow::Exhausted => {
+            if !keys_seen && S::TAG == EvalTag::Yq {
+                // `optional` is the bracket's `?`, which covers only the final
+                // index step; the children expression has no such step and
+                // already swallows the iteration of a scalar.
+                return eval_single::<S, V>(
+                    &super::eval::yq_empty_index_children(target),
+                    value,
+                    false,
+                    cursor,
+                );
+            }
+        }
         // Our sink is the only thing that can ask the pull to stop, and it
         // only ever does so through `escape_generic!`/`ensure_owned!`, both
         // of which set `terminal` before returning `Demand::Stop` -- so
@@ -34071,6 +34098,18 @@ fn eval_owned_identity_as<S: EvalSemantics, V: DocumentValue>(
     // -- the same rewrite a computed navigation component gets, and the same
     // predicate gated it (`owned_identity_bind_supported`).
     let (bound_values, control) = owned_identity_bind_values::<S, V>(bind, value, id, optional);
+    // yq's `as` runs its body once, with the variable unset, when the source
+    // has no output (#4139); see `eval::yq_runs_as_body_without_source`.
+    if S::TAG == EvalTag::Yq && bound_values.is_empty() && control.is_none() {
+        return eval_owned_identity_spliced::<S, V>(
+            body,
+            rest,
+            Cow::Borrowed(value),
+            id.clone(),
+            optional,
+            tail,
+        );
+    }
     for (bound, origin) in bound_values {
         // `bind`, not the rewritten source: `is_identity_passthrough` is a
         // question about what the user wrote.
