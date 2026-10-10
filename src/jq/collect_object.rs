@@ -1,4 +1,5 @@
-//! yq's `COLLECT_OBJECT` for a `{...}` that holds a bare entry (#2783).
+//! yq's `COLLECT_OBJECT` for a `{...}` that holds a bare entry (#2783) or a pair that
+//! may yield nothing (#4193).
 //!
 //! yq has no object-construction shorthand. Its `{ expr : expr , ... }` is the
 //! `COLLECT_OBJECT` operator over a `UNION` of entries, and a `key: value` pair
@@ -11,12 +12,15 @@
 //! (`pkg/yqlib/operator_collect_object.go`), quirks included, because the
 //! quirks are the behaviour being reproduced (ADR-0018 rule 3).
 //!
-//! A construction with only pair entries never comes here: its cross product is
-//! what this operator computes, and the evaluators' own fan-out already produces
-//! it without the round trip through nodes. A repeated key is where the fold shows,
-//! and the fan-out reproduces it where it assembles each object
-//! ([`object_from_pairs`](super::eval::object_from_pairs), #4182), so the two
-//! routes agree.
+//! A construction whose pairs all yield something never needs the fold: its cross
+//! product is what this operator computes, and the evaluators' own fan-out already
+//! produces it without the round trip through nodes. A repeated key is where the fold
+//! shows, and the fan-out reproduces it where it assembles each object
+//! ([`object_from_pairs`](super::eval::object_from_pairs), #4182), so the two routes
+//! agree. A pair with *no* maps is where they part: the fan-out ends the construction
+//! at it, the fold skips it and restarts, so
+//! [`yq_collects_object`](super::eval::yq_collects_object) sends every construction
+//! with an operand that may be empty here (#4193).
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -64,6 +68,29 @@ fn splat(node: &OwnedValue) -> Vec<OwnedValue> {
     }
 }
 
+/// Every member of `held` multiplied by every member of `additions`, `held` outermost.
+///
+/// The product of two data-controlled lengths: reserved a row at a time, so an
+/// oversized one is refused rather than aborting the process.
+fn multiply<S: EvalSemantics>(
+    held: &[OwnedValue],
+    additions: &[OwnedValue],
+) -> Result<Vec<OwnedValue>, EvalError> {
+    let mut next: Vec<OwnedValue> = Vec::new();
+    for member in held {
+        next.try_reserve(additions.len())
+            .map_err(|_| cannot_reserve_cross_product(&[held.len(), additions.len()]))?;
+        for addition in additions {
+            next.push(arith_mul::<S>(
+                member.clone(),
+                addition.clone(),
+                MergeFlags::default(),
+            )?);
+        }
+    }
+    Ok(next)
+}
+
 /// [`collect_object`] for a construction of pairs only (#4193): the same fold, without
 /// wrapping each pair's maps as a union node and splatting them back out.
 ///
@@ -73,6 +100,7 @@ fn splat(node: &OwnedValue) -> Vec<OwnedValue> {
 /// `collect_object`'s general loop describes -- so `{"a": 1, "b": empty, "c": 3}` is
 /// `c: 3` and a trailing empty pair leaves nothing.
 fn fold_pairs<S: EvalSemantics>(entries: Vec<UnionEntry>) -> Result<Vec<OwnedValue>, EvalError> {
+    debug_assert!(entries.iter().all(|e| matches!(e, UnionEntry::Pair(_))));
     let mut aggregate: Vec<OwnedValue> = Vec::new();
     for entry in entries {
         if let UnionEntry::Pair(maps) = entry {
@@ -90,19 +118,7 @@ fn fold_pairs<S: EvalSemantics>(entries: Vec<UnionEntry>) -> Result<Vec<OwnedVal
                 }
                 continue;
             }
-            let mut next: Vec<OwnedValue> = Vec::new();
-            for held in &aggregate {
-                next.try_reserve(maps.len())
-                    .map_err(|_| cannot_reserve_cross_product(&[aggregate.len(), maps.len()]))?;
-                for addition in &maps {
-                    next.push(arith_mul::<S>(
-                        held.clone(),
-                        addition.clone(),
-                        MergeFlags::default(),
-                    )?);
-                }
-            }
-            aggregate = next;
+            aggregate = multiply::<S>(&aggregate, &maps)?;
         }
     }
     Ok(aggregate)
@@ -165,22 +181,7 @@ pub(crate) fn collect_object<S: EvalSemantics>(
                 aggregate = splatted;
                 continue;
             }
-            // The product of two data-controlled lengths: reserved a row at a time,
-            // so an oversized one is refused rather than aborting the process.
-            let mut next: Vec<OwnedValue> = Vec::new();
-            for held in &aggregate {
-                next.try_reserve(splatted.len()).map_err(|_| {
-                    cannot_reserve_cross_product(&[aggregate.len(), splatted.len()])
-                })?;
-                for addition in &splatted {
-                    next.push(arith_mul::<S>(
-                        held.clone(),
-                        addition.clone(),
-                        MergeFlags::default(),
-                    )?);
-                }
-            }
-            aggregate = next;
+            aggregate = multiply::<S>(&aggregate, &splatted)?;
         }
         out.extend(aggregate);
     }

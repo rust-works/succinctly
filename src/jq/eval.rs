@@ -4581,7 +4581,8 @@ pub(crate) fn object_from_pairs<S: EvalSemantics>(
     Ok(map)
 }
 
-/// Object construction holding a bare entry, as yq's `COLLECT_OBJECT` (#2783).
+/// Object construction holding a bare entry, or a pair that may yield nothing, as yq's
+/// `COLLECT_OBJECT` (#2783, #4193).
 ///
 /// Each pair entry is built on its own by [`build_object_entries`] -- one
 /// single-key map per key/value combination, which is what yq's `CREATE_MAP`
@@ -31192,6 +31193,10 @@ pub(crate) fn yields_at_most_one_value(expr: &Expr) -> bool {
 /// generator.
 pub(crate) fn yields_at_least_one_value(expr: &Expr) -> bool {
     match expr {
+        // A `$x` no `as` binds yields nothing in yq (it is not an error there), which
+        // this cannot see: an operand is judged on its own, and a bound variable is the
+        // overwhelmingly common reading. Refusing it would send every construction that
+        // uses a variable down the slower fold for the sake of a typo.
         Expr::Literal(_)
         | Expr::Var(_)
         | Expr::TrackedVar(_)

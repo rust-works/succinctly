@@ -5061,7 +5061,11 @@ $ echo $?
   it, so a construction takes this route unless every operand is provably total
   (`yields_at_least_one_value`: literals, variables, field/index paths, `length`, `map(..)`,
   operators and pipes of those, ...); a construction of those keeps the fan-out and costs the
-  same as before. jq mode never takes it.
+  same as before. jq mode never takes it. Two shapes stay on the fan-out although yq folds
+  them: `$x` with no `as` binding it (yq yields nothing for it, so `{"a": 1, "b": $x, "c": 3}`
+  is `c: 3` there and nothing here) -- a variable is judged total because a bound one is by
+  far the usual case -- and a `select(.>0)` over an array element inside a pair, which yq
+  gives no maps although every element passes (#4239).
 
 Residual divergences remain, all in cases yq itself reaches through its node model:
 

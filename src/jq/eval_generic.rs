@@ -26761,7 +26761,7 @@ fn object_construction_sink_generic<S: EvalSemantics, V: DocumentValue>(
 }
 
 /// The generic twin of `eval::eval_object_collect`: object construction holding
-/// a bare entry, as yq's `COLLECT_OBJECT` (#2783). Every entry is evaluated with
+/// a bare entry or a pair that may yield nothing, as yq's `COLLECT_OBJECT` (#2783, #4193). Every entry is evaluated with
 /// `cursor` before any is combined, so an escape aborts the whole construction.
 fn collect_object_generic<S: EvalSemantics, V: DocumentValue>(
     entries: &[ObjectEntry],
