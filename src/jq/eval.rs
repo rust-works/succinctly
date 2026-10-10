@@ -13939,13 +13939,25 @@ pub(super) fn arith_mul<S: EvalSemantics>(
                 // performs for `%` (#1230).
                 (OwnedValue::String(s), _, _, Some(n_repr))
                 | (_, OwnedValue::String(s), Some(n_repr), _) => {
+                    // #4269 (yq): a fractional (or non-finite) count is refused, as is a negative
+                    // one below. An integral float still repeats: a JSON-sourced `2.0` does in yq,
+                    // a YAML-sourced or literal one does not, and the two cannot be told apart.
+                    if S::TAG == EvalTag::Yq {
+                        if let NumberRepr::Float(f) = n_repr {
+                            if !f.is_finite() || f.fract() != 0.0 {
+                                return Err(EvalError::new("cannot multiply !!str with !!float"));
+                            }
+                        }
+                    }
                     let n = match n_repr {
                         NumberRepr::Int(n) => n,
                         // `as` truncates toward zero and saturates, matching
                         // jq's intmax_t cast (mirrors `mod_floats` above).
                         NumberRepr::Float(n) => n as i64,
                     };
-                    if n < 0 {
+                    if n < 0 && S::TAG == EvalTag::Yq {
+                        Err(EvalError::new("cannot repeat string by a negative number"))
+                    } else if n < 0 {
                         Ok(OwnedValue::Null)
                     } else {
                         // `n` comes from the document, so an absurd count
