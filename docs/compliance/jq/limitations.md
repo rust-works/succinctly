@@ -10242,9 +10242,31 @@ the partial slice, are +3% to +8% slower on the M4 Pro (10 MB: `sub` +8.1%, `.[0
 generic evaluator's own cost per call, not an index build, and it is what #3479 is now judged
 against: a ceiling of +10% wall-clock and about +5% instructions for a yq-native `-R` row, in place
 of its original "no row outside the control's noise floor", which these rows do not meet. The string
-builtins that exist only under `--jq-extensions` (`ltrimstr`, `startswith`, `ascii_downcase`,
-+9% to +19% as merged) are above even the ceiling and stay a recorded exception; a native generic
-arm per builtin is what removes them.
+builtins that exist only under `--jq-extensions` (`ltrimstr`, `startswith`, `ascii_downcase`) were
++9% to +19% as merged and were recorded as an exception above the ceiling (#3685). Re-measured on
+`main` at a4aa4827a after #3642 and #3679 narrowed the bridge (7 and 14 MB of `-R` lines of the
+`users` document, interleaved `scripts/ab-cli.py`, 9 reps, output identity gated, against the same
+pre-#3535 base `98e7631a4`), none of them is above the ceiling any more, and the exception is
+withdrawn:
+
+| row (`--jq-extensions -R`)              | M4 Pro (min / median)         | 7950X (min / median)          |
+|-----------------------------------------|-------------------------------|-------------------------------|
+| `startswith("{")`                       | +2.3..+2.6% / +1.2..+1.6%     | -7.7..-7.4% / -9.3..-7.3%     |
+| `ltrimstr("{")`                         | +2.2..+4.3% / +0.3..+1.3%     | -4.0..-3.0% / -3.3..-3.0%     |
+| `ascii_downcase`                        | -3.9..-1.0% / -4.1..-1.1%     | -6.9..-6.5% / -6.8..-6.6%     |
+| `length` (yq-native, as the comparison) | -9.0..-7.8% / -8.3..-8.0%     | -21.2..-20.6% / -21.3..-21.2% |
+| `.`                                     | -66.8..-66.1% / -66.5..-65.0% | -68.3..-66.7% / -68.1..-66.5% |
+
+The controls (the same binary twice) read -1.6%..+2.6% on the M4 Pro and -1.6%..+0.9% on the 7950X,
+so the one row above the M4 Pro's control by its minimum (`ltrimstr` at 7 MB, +4.3%) is still well
+inside the ceiling, and its median (+1.3%) is inside the control. Run in the reverse direction on
+the M4 Pro (head as the baseline) the signs flip as they should (`length` +9.7%..+9.9%, `.` +181%..+204%).
+The instruction half of the ceiling (about +5%) holds too: retired instructions on the M4 Pro
+(`/usr/bin/time -l`, minimum of 5, the 7 MB document) are -1.3% for `startswith`, -3.1% for
+`ltrimstr`, -5.6% for `ascii_downcase` and -12.9% for `length`. No instruction counts were taken on
+the 7950X, where the wall-clock margin is -3% or better.
+Which change closed the gap was not attributed: the original figures were taken as merged in #3535,
+before #3642 and #3679, and with every row inside the ceiling there is nothing left to attribute.
 
 Cursor metadata on that route is **not** read from the document it evaluates: the text is
 throwaway serialization, so `line`, `column`, `document_index`, `anchor`, `style`, the comment
