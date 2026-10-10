@@ -138068,7 +138068,7 @@ mod object_union_gate_tests_4193 {
             r#"{"a": 1, "b"}"#,
             r#"{"a": (.x | debug | select(.)), "b": 1}"#,
             r#"{"a": (.x | stderr | select(.))}"#,
-            r#"{(.k | debug | select(.)): 1}"#,
+            "{(.k | debug | select(.)): 1}",
             r#"def f: debug; {"a": (.x | f | select(.))}"#,
         ] {
             let expr = parse_with_mode_and_extensions(filter, ParserMode::Yq, true)

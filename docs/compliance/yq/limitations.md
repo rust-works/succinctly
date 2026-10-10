@@ -5055,19 +5055,21 @@ $ echo $?
 - **An entry with no output is skipped (#4193).** An operand that yields nothing
   (`{"a": (1|select(false)), "b": 2, "c": 3}`, `{(1|select(false)): 1, "b": 2}`) drops its own
   entry and the object is built from the rest, where a cross product would be empty. The same
-  union quirks follow: an empty entry that is not the first, or one whose count differs from the
-  first entry's, takes its neighbours with it (`{"a": 1, "b": (1|select(false)), "c": (3,4)}` is
-  `{"c": 3}` and `{"c": 4}`). A construction runs as `COLLECT_OBJECT` when some key or value is not
-  provably a single output: a path, literal, arithmetic, `[...]`, `if`, interpolation and the
-  builtins that map one input to one answer (`length`, `keys`, `map`, `sort`, `has`, ...) are;
-  `select`, `?`, `.[]`, a comma, `//` over a generator, an unbound variable and every other
-  builtin are not. A construction whose operands all are keeps the streaming fan-out, which is the
-  same thing while nothing is empty; the rest are built eagerly, as yq does, so `first({"a": .[]})`
-  no longer stops early. yq evaluates every entry before combining any, so an error in one entry
-  aborts such a construction with no prefix, as it already did for a bare entry. A builtin yq
-  answers with nothing for an input where `succinctly yq` answers a value or an error
-  (`[] | min`, `null | to_entries`) keeps its entry here; that is the builtin's divergence, not
-  the construction's (#4236).
+  union quirks follow: the result is the cross product of the entries after the last empty one, so
+  an empty entry that is not the first takes the entries before it with it
+  (`{"a": 1, "b": (1|select(false)), "c": (3,4)}` is `{"c": 3}` and `{"c": 4}`, and
+  `{"a": 1, "b": (1|select(false))}` is nothing). The cross product is built first, since an empty
+  operand always empties it, and only an empty one is rebuilt as `COLLECT_OBJECT`. A construction
+  whose operands all provably yield one value (a path, literal, arithmetic, `[...]`, `if`,
+  interpolation, and the builtins that map one input to one answer: `length`, `keys`, `map`,
+  `sort`, `has`, ...) never looks again; one with a side effect in an operand that might yield
+  nothing (`debug`, `stderr`, `input`, a user function) goes straight to `COLLECT_OBJECT` rather than
+  run it twice. Cost: a construction that comes out empty for every record is built twice, about 1.7x
+  the construction's share of a query (`.users[] | {"n": .name, "s": (.score | select(. > 1e8))}`
+  over 14 MB: +69% wall-clock on an M4 Pro, where the output is empty) -- the one place the old,
+  wrong-in-general answer was cheaper. A builtin yq answers with nothing for an input where
+  `succinctly yq` answers a value or an error (`[] | min`, `null | to_entries`) keeps its entry
+  here; that is the builtin's divergence, not the construction's (#4236).
 
 Residual divergences remain, all in cases yq itself reaches through its node model:
 
