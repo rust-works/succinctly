@@ -9935,6 +9935,43 @@ pub(crate) fn eval_owned_closed<S: EvalSemantics>(expr: &Expr) -> Option<OwnedVa
     }
 }
 
+/// `del(.)`, and `del(.[]?)` over a scalar, answered over the owned input
+/// (#4283): the two `del` targets whose path set is the same whatever `.` is.
+///
+/// `[.[] | del(.[]?)]` sent every scalar member over the reindex bridge -- its
+/// text written, a one-token index built over it and the scalar decoded back
+/// out by `builtin_del` -- to delete nothing. `path(.)` is `[]` on any input,
+/// so `del(.)` is `null`; `path(.[]?)` yields nothing on a scalar (jq 1.7.1:
+/// `[path(.[]?)]` is `[]` for a number, a string, a boolean and `null`), so
+/// `del(.[]?)` is `delpaths([])`, the input itself -- handed back by move, the
+/// node and its literal spelling kept, where the bridge handed back a re-read
+/// copy.
+///
+/// jq mode only: yq v4.53.3 prints nothing for `del(.)` and `[]` for
+/// `null | del(.[]?)`. Every other shape is declined, `input` handed back
+/// untouched (`Err`), so its diagnostics and identity rules stay the bridge's.
+pub(crate) fn eval_owned_fixed_path_del<S: EvalSemantics>(
+    expr: &Expr,
+    input: OwnedValue,
+) -> Result<OwnedValue, OwnedValue> {
+    if S::TAG != EvalTag::Jq {
+        return Err(input);
+    }
+    let Expr::Builtin(Builtin::Del(target)) = unwrap_paren(expr) else {
+        return Err(input);
+    };
+    match unwrap_paren(target) {
+        Expr::Identity => Ok(OwnedValue::Null),
+        Expr::Optional(inner)
+            if matches!(unwrap_paren(inner), Expr::Iterate)
+                && !matches!(input, OwnedValue::Array(_) | OwnedValue::Object(_)) =>
+        {
+            Ok(input)
+        }
+        _ => Err(input),
+    }
+}
+
 /// The [`eval_owned_pure_in`] `door` arms that answer one builtin over the
 /// owned input (#3707): `has(<literal>)`, `keys`, `startswith(<literal>)`,
 /// `endswith(<literal>)` and `tostring`.
@@ -90862,6 +90899,90 @@ mod tests {
             let expr = parse(src).unwrap();
             assert!(eval_owned_closed::<JqSemantics>(&expr).is_none(), "{src}");
             assert!(eval_owned_closed::<YqSemantics>(&expr).is_none(), "{src}");
+        }
+    }
+
+    /// #4283: `eval_owned_fixed_path_del` answers `del(.)`, and `del(.[]?)`
+    /// over a scalar, the way the reindex bridge does on every value, keeps a
+    /// number literal's spelling, and declines every other target, a
+    /// container under `.[]?` and yq mode -- handing the input back untouched.
+    #[test]
+    fn eval_owned_fixed_path_del_agrees_with_the_reindex_bridge_4283() {
+        let mut values = pure_value_matrix();
+        values.push(OwnedValue::from_number_literal::<JqSemantics>("1.50"));
+        values.push(OwnedValue::from_number_literal::<JqSemantics>("-0"));
+        values.push(OwnedValue::from_number_literal::<JqSemantics>("1e1000"));
+        let accepted = ["del(.)", "del(.[]?)", "(del(.))", "del((.))", "del((.[])?)"];
+        let mut answered = 0;
+        for value in &values {
+            let scalar = !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_));
+            for src in accepted {
+                let expr = parse(src).unwrap();
+                let iterate = src.contains("[]");
+                let fast = eval_owned_fixed_path_del::<JqSemantics>(&expr, value.clone());
+                if iterate && !scalar {
+                    let declined = fast.expect_err(src);
+                    assert_eq!(declined.to_json(), value.to_json(), "{src} on {value:?}");
+                    continue;
+                }
+                let fast = fast.unwrap_or_else(|_| panic!("jq mode: {src:?} on {value:?}")); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make (#4283)"
+                answered += 1;
+                // Compared as printed: the bridge reparses a computed `Int` as
+                // a literal of the same spelling, which this route keeps
+                // computed, as jq does.
+                let (bridge, ended) = normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                    &expr, value, false,
+                ));
+                let bridge: Vec<String> = bridge.iter().map(OwnedValue::to_json).collect();
+                assert_eq!(
+                    (vec![fast.to_json()], "ok"),
+                    (bridge, ended.as_str()),
+                    "jq mode: {src:?} on {value:?}"
+                );
+                let expected = if iterate {
+                    value.to_json()
+                } else {
+                    "null".to_string()
+                };
+                assert_eq!(fast.to_json(), expected, "jq mode: {src:?} on {value:?}");
+                // yq's answers differ (`del(.)` prints nothing there, and
+                // `null | del(.[]?)` is `[]`), so it keeps the bridge.
+                assert!(
+                    eval_owned_fixed_path_del::<YqSemantics>(&expr, value.clone()).is_err(),
+                    "yq mode: {src:?} on {value:?}"
+                );
+            }
+        }
+        assert!(answered > values.len(), "the matrix must reach both arms");
+        // The literal's own spelling, not a respelling of its value.
+        let literal = OwnedValue::from_number_literal::<JqSemantics>("1.50");
+        let kept = eval_owned_fixed_path_del::<JqSemantics>(&parse("del(.[]?)").unwrap(), literal);
+        assert_eq!(kept.map(|v| v.to_json()).ok().as_deref(), Some("1.50"));
+        // Any other target is the bridge's, whatever the input.
+        for src in [
+            "del(.[])",
+            "del(.a)",
+            "del(.[0])",
+            "del(.[0]?)",
+            "del(.a?)",
+            "del(.[]?.a)",
+            "del(., .)",
+            "del(empty)",
+            "del(..)",
+            "del(.)?",
+            "del(.) | .",
+            ".",
+            "path(.)",
+        ] {
+            let expr = parse(src).unwrap();
+            for value in [OwnedValue::Int(5), OwnedValue::Null] {
+                let declined = eval_owned_fixed_path_del::<JqSemantics>(&expr, value.clone());
+                assert_eq!(
+                    declined.map_err(|v| v.to_json()),
+                    Err(value.to_json()),
+                    "{src}"
+                );
+            }
         }
     }
 

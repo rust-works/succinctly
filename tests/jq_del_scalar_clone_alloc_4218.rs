@@ -12,14 +12,20 @@
 //!   `delete_at_path`, which only reads it (it now lends the path unless an
 //!   alias table is installed).
 //!
-//! What remains per member is the reindex bridge (text, interest bits, their
-//! rank, the two-bit sequence: #4154) and the two decodes of the scalar.
+//! What remained per member was the reindex bridge (text, interest bits, their
+//! rank, the two-bit sequence: #4154), whose index buffers #4217 then pooled,
+//! and the two decodes of the scalar. Neither row crosses the bridge any more
+//! (#4283): `del(.)` is `null` and `del(.[]?)` over a scalar is the input
+//! itself, so both are answered over the owned member
+//! (`eval::eval_owned_fixed_path_del`), and the only call left is that member's
+//! own decode.
 //!
 //! The bounds are absolute because the term is the bridge's own: there is no
 //! twin query doing the same legitimate work without crossing it. Each is the
-//! measured cost, so either fix alone, put back, exceeds it: the integer
-//! `del(.[]?)` row reads 8 per member with only one of the two in place, and 10
-//! with neither (`del(.)`: 7 and 8).
+//! measured cost. With #4283's route disabled every row reads 3 per member on
+//! the integers, 5 on the strings and 1 on the booleans and nulls; with #4218's
+//! two fixes put back as well, the integer `del(.[]?)` row read 10 (`del(.)`:
+//! 8).
 //!
 //! Counting is gated to the calling thread (`tests/common/counting_alloc.rs`), so
 //! the harness's other threads, and other tests in this file, cannot add to the
@@ -63,14 +69,12 @@ fn fixtures() -> Vec<(&'static str, String)> {
 }
 
 /// Allocator calls per member a row may make, on each fixture in `fixtures`
-/// order: the bridge's four, the scalar's two decodes (an owned string is one
-/// more call each) and nothing else. The booleans and nulls need no decode
-/// allocation.
-const PER_MEMBER: [usize; 3] = [6, 8, 4];
+/// order: the member's one decode (a number literal's spelling, a string's
+/// buffer) and nothing else. The booleans and nulls need no decode allocation.
+const PER_MEMBER: [usize; 3] = [1, 1, 0];
 
 /// Calls independent of the member count (the result array and the one-time
-/// tables a first evaluation builds): 22 measured on the integer and boolean
-/// rows, 12 on the strings.
+/// tables a first evaluation builds): 22 measured on every row.
 const FIXED: usize = 32;
 
 const ROWS: [&str; 2] = ["[.[] | del(.[]?)] | length", "[.[] | del(.)] | length"];
