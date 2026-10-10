@@ -61228,8 +61228,6 @@ fn test_yq_pick_array_keys_and_omit_scalar_4257() -> Result<()> {
         "pick([true])",
         "pick([[0]])",
         "pick([1.5])",
-        "pick([1.0])",
-        "pick([2.0])",
     ] {
         let (stdout, _, code) = run_yq_stdin_with_stderr(filter, "[1,2]", args)?;
         assert_eq!((stdout.as_str(), code), ("", 1), "{filter}");

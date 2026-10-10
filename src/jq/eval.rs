@@ -76055,6 +76055,17 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 if S::TAG == EvalTag::Yq {
                     let idx = match key {
                         OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _) => *i,
+                        // An integral float is an index: a JSON-sourced `1.0` is one in yq
+                        // (`[10,20] | pick([.[0]])` over `[1.0, ...]`), and a document or
+                        // filter spelling cannot be told apart here, so a YAML-sourced or
+                        // literal `1.0` -- an error in yq -- is accepted too. A fractional
+                        // float is an error in both.
+                        OwnedValue::Float(f)
+                        | OwnedValue::NumberLiteral(NumberRepr::Float(f), _)
+                            if f.is_finite() && f.fract() == 0.0 =>
+                        {
+                            *f as i64
+                        }
                         OwnedValue::String(text) => match text.parse::<i64>() {
                             Ok(i) => i,
                             Err(_) => return pick_unindexable_key(key),
