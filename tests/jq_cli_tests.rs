@@ -122539,3 +122539,110 @@ fn test_jq_empty_operand_keeps_the_generator_model_4139() -> Result<()> {
     }
     Ok(())
 }
+
+/// 100 one-line records `{"n":0}` .. `{"n":99}`.
+fn lines_of_records_4178() -> String {
+    (0..100).map(|n| format!("{{\"n\":{n}}}\n")).collect()
+}
+
+/// #4178: `--arg` keeps the query off the M2 fast path, so every value goes
+/// through the general path, which resolves a value's `(at <file>:<line>)`
+/// only when a diagnostic reads it. The values that error are far apart and
+/// the ones between them never ask for a location, so the line the second
+/// one names depends on the bytes the skipped values covered being counted
+/// by then. Lines checked against jq 1.7.1.
+#[test]
+fn test_jq_general_path_error_lines_after_skipped_values_4178() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "--arg",
+            "k",
+            "1",
+            r#"if .n == 50 or .n == 70 then error("boom") else empty end"#,
+        ],
+        Some(&lines_of_records_4178()),
+    )?;
+    assert_eq!(stdout, "");
+    assert_eq!(
+        stderr,
+        "jq: error (at <stdin>:51): boom\njq: error (at <stdin>:71): boom\n"
+    );
+    assert_eq!(code, 5);
+    Ok(())
+}
+
+/// #4178: the first and the last value of the stream both ask, and nothing
+/// in between does.
+#[test]
+fn test_jq_general_path_error_lines_first_and_last_value_4178() -> Result<()> {
+    let (_, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "--arg",
+            "k",
+            "1",
+            r#"if .n == 0 or .n == 99 then error("boom") else empty end"#,
+        ],
+        Some(&lines_of_records_4178()),
+    )?;
+    assert_eq!(
+        stderr,
+        "jq: error (at <stdin>:1): boom\njq: error (at <stdin>:100): boom\n"
+    );
+    assert_eq!(code, 5);
+    Ok(())
+}
+
+/// #4178: a location read through `sort_by`, which also misses the M2 fast
+/// path, for every value of the stream.
+#[test]
+fn test_jq_general_path_sort_by_error_line_per_value_4178() -> Result<()> {
+    let (_, stderr, code) = run_jq_full(&["-c", "sort_by(.n)"], Some("1\n2\n\n3"))?;
+    assert_eq!(
+        stderr,
+        "jq: error (at <stdin>:1): Cannot iterate over number (1)\n\
+         jq: error (at <stdin>:2): Cannot iterate over number (2)\n\
+         jq: error (at <stdin>:3): Cannot iterate over number (3)\n"
+    );
+    assert_eq!(code, 5);
+    Ok(())
+}
+
+/// #4178: each file has its own counter, so a skipped value in the first
+/// file must not leak its newlines into the second file's line.
+#[test]
+fn test_jq_general_path_error_lines_across_files_4178() -> Result<()> {
+    let (_, stderr, code, paths) = run_jq_over_files(
+        &[
+            "-c",
+            "--arg",
+            "k",
+            "1",
+            r#"if .n == 4 or .n == 1 then error("boom") else empty end"#,
+        ],
+        &["{\"n\":1}\n{\"n\":2}\n", "\n\n{\"n\":3}\n{\"n\":4}"],
+    )?;
+    assert_eq!(
+        stderr,
+        format!(
+            "jq: error (at {}:1): boom\njq: error (at {}:3): boom\n",
+            paths[0], paths[1]
+        )
+    );
+    assert_eq!(code, 5);
+    Ok(())
+}
+
+/// #4178: a slurped array names the last source's EOF line (#1520) whichever
+/// path evaluates it.
+#[test]
+fn test_jq_general_path_slurp_error_line_4178() -> Result<()> {
+    let (_, stderr, code) = run_jq_full(
+        &["-s", "--arg", "k", "1", r#"error("boom")"#],
+        Some("1\n2\n3\n"),
+    )?;
+    assert_eq!(stderr, "jq: error (at <stdin>:3): boom\n");
+    assert_eq!(code, 5);
+    Ok(())
+}
