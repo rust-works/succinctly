@@ -60990,6 +60990,11 @@ fn test_object_construction_skips_a_pair_with_no_output_4193() -> Result<()> {
             "{\"c\":2}\n",
         ),
         (r#"{"a":1,"a":(1|select(false))}"#, ""),
+        // A builtin that is a single output stays one.
+        (
+            r#"{"a":([3,1]|sort),"b":(null|length)}"#,
+            "{\"a\":[1,3],\"b\":0}\n",
+        ),
         // A lone empty entry is nothing, as it was.
         (r#"{"a":(1|select(false))}"#, ""),
         // Per input of a fan-out.

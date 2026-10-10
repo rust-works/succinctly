@@ -31078,6 +31078,7 @@ fn resolves_to_at_most_one_path(expr: &Expr) -> bool {
 pub(crate) fn yields_exactly_one_value(expr: &Expr) -> bool {
     match expr {
         Expr::Literal(_)
+        | Expr::TrackedVar(_)
         | Expr::Identity
         | Expr::Field(_)
         | Expr::Index { .. }
@@ -31112,26 +31113,50 @@ pub(crate) fn yields_exactly_one_value(expr: &Expr) -> bool {
         Expr::IndexExpr { target, key } => {
             yields_exactly_one_value(target) && yields_exactly_one_value(key)
         }
-        Expr::Builtin(builtin) => matches!(
-            builtin,
-            Builtin::Type
-                | Builtin::IsNull
-                | Builtin::IsBoolean
-                | Builtin::IsNumber
-                | Builtin::IsString
-                | Builtin::IsArray
-                | Builtin::IsObject
-                | Builtin::Length
-                | Builtin::Keys
-                | Builtin::KeysUnsorted
-                | Builtin::Add
-                | Builtin::Min
-                | Builtin::Max
-                | Builtin::ToString
-                | Builtin::ToNumber
-                | Builtin::AsciiDowncase
-                | Builtin::AsciiUpcase
-        ),
+        Expr::Builtin(builtin) => builtin_yields_exactly_one_value(builtin),
+        _ => false,
+    }
+}
+
+/// The builtin half of [`yields_exactly_one_value`]: each of these maps one input to one output
+/// in yq, an empty array and `null` included, and raises rather than yielding nothing. The ones
+/// yq has were checked against v4.53.3 on `null`, an object, a string and an array, which is why
+/// `min`/`max` (nothing for `[]`), `to_entries`/`with_entries` and `split` (nothing for `null`)
+/// are absent; `add`, `to_number` and the case mappers are jq-extension surface in yq mode and
+/// follow jq's single answer. An argument that picks the answer is checked too; one that is only
+/// collected or sorted on is not.
+fn builtin_yields_exactly_one_value(builtin: &Builtin) -> bool {
+    match builtin {
+        Builtin::Type
+        | Builtin::IsNull
+        | Builtin::IsBoolean
+        | Builtin::IsNumber
+        | Builtin::IsString
+        | Builtin::IsArray
+        | Builtin::IsObject
+        | Builtin::Length
+        | Builtin::Keys
+        | Builtin::KeysUnsorted
+        | Builtin::Add
+        | Builtin::ToString
+        | Builtin::ToNumber
+        | Builtin::AsciiDowncase
+        | Builtin::AsciiUpcase
+        | Builtin::Reverse
+        | Builtin::Sort
+        | Builtin::Unique
+        | Builtin::Flatten
+        | Builtin::FromEntries
+        | Builtin::Any
+        | Builtin::All
+        | Builtin::Map(_)
+        | Builtin::MapValues(_)
+        | Builtin::SortBy(_)
+        | Builtin::GroupBy(_)
+        | Builtin::UniqueBy(_) => true,
+        Builtin::Has(arg) | Builtin::Contains(arg) | Builtin::Join(arg) | Builtin::Test(arg) => {
+            yields_exactly_one_value(arg)
+        }
         _ => false,
     }
 }
@@ -137923,6 +137948,7 @@ mod object_union_gate_tests_4193 {
             r#"{"a": 1, "b": .x, "c": [.y[]], "d": (.z | length)}"#,
             r#"{(.k): .v, "n": "x\(.a)", "s": (.a + 1), "t": (.a // 2)}"#,
             r#"{"a": (if .x then 1 else 2 end), "b": .[0], "c": (.a | tostring)}"#,
+            r#"{"a": (.l | map(. + 1)), "b": (.l | sort), "c": (.l | has(0))}"#,
         ] {
             assert!(!collects(filter, true), "`{filter}` keeps the fan-out");
         }
@@ -137935,6 +137961,11 @@ mod object_union_gate_tests_4193 {
             r#"{"a": (1, 2)}"#,
             r#"{"a": 1, "b"}"#,
             r#"{"a": (.x | select(.) | length), "b": 1}"#,
+            // yq answers nothing for these on an empty array or `null`.
+            r#"{"a": ([] | min), "b": 1}"#,
+            r#"{"a": (.e | max), "b": 1}"#,
+            r#"{"a": (.n | to_entries), "b": 1}"#,
+            r#"{"a": (.n | split(",")), "b": 1}"#,
         ] {
             assert!(collects(filter, true), "`{filter}` collects");
         }

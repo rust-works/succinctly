@@ -5057,12 +5057,17 @@ $ echo $?
   entry and the object is built from the rest, where a cross product would be empty. The same
   union quirks follow: an empty entry that is not the first, or one whose count differs from the
   first entry's, takes its neighbours with it (`{"a": 1, "b": (1|select(false)), "c": (3,4)}` is
-  `{"c": 3}` and `{"c": 4}`). A construction is run as `COLLECT_OBJECT` only when some key or value
-  is not provably a single output (a path, literal, arithmetic, `[...]` and the like are; `select`,
-  `?`, `//` over a generator, `.[]` and an unbound variable are not); one whose operands all are
-  keeps the cheaper fan-out, which is the same thing while nothing is empty. yq evaluates every entry
-  before combining any, so an error in one entry now aborts such a construction with no prefix,
-  as it already did for a bare entry.
+  `{"c": 3}` and `{"c": 4}`). A construction runs as `COLLECT_OBJECT` when some key or value is not
+  provably a single output: a path, literal, arithmetic, `[...]`, `if`, interpolation and the
+  builtins that map one input to one answer (`length`, `keys`, `map`, `sort`, `has`, ...) are;
+  `select`, `?`, `.[]`, a comma, `//` over a generator, an unbound variable and every other
+  builtin are not. A construction whose operands all are keeps the streaming fan-out, which is the
+  same thing while nothing is empty; the rest are built eagerly, as yq does, so `first({"a": .[]})`
+  no longer stops early. yq evaluates every entry before combining any, so an error in one entry
+  aborts such a construction with no prefix, as it already did for a bare entry. A builtin yq
+  answers with nothing for an input where `succinctly yq` answers a value or an error
+  (`[] | min`, `null | to_entries`) keeps its entry here; that is the builtin's divergence, not
+  the construction's (#4236).
 
 Residual divergences remain, all in cases yq itself reaches through its node model:
 

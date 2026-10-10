@@ -52518,6 +52518,11 @@ mod tests {
             (r#"{"a":(1|select(false)),"a":2}"#, r#"{"a":2}"#),
             (r#"{"a":1,"b":(.n|select(length>5)),"c":2}"#, r#"{"c":2}"#),
             (r#"{"a":[(1|select(false))],"b":2}"#, r#"{"a":[],"b":2}"#),
+            // A builtin that is a single output stays one.
+            (
+                r#"{"a":([3,1]|sort),"b":(null|length)}"#,
+                r#"{"a":[1,3],"b":0}"#,
+            ),
         ] {
             assert_eq!(cursor(filter), expected, "cursor: {filter}");
             assert_eq!(sink(filter), expected, "sink: {filter}");
