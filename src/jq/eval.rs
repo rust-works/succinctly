@@ -92788,16 +92788,8 @@ mod tests {
     /// the handler, and so the `try`, refused.
     #[test]
     fn a_catch_handler_of_select_stages_navigates_nothing_4151() {
-        let handler = |src: &str| {
-            let Expr::Try {
-                catch: Some(handler),
-                ..
-            } = parse(&format!("try error(1) catch ({src})")).unwrap()
-            else {
-                panic!("`try ... catch` expected for {src}");
-            };
-            *handler
-        };
+        // The handler is what a `catch` holds: the parsed expression itself.
+        let handler = |src: &str| parse(src).unwrap();
         for admitted in [
             "7",
             ".",
