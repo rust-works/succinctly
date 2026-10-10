@@ -11360,6 +11360,43 @@ mod tests {
         assert_eq!(open_tail_start(b"1 ]\n"), None);
     }
 
+    /// #4305: what [`token_runs_to_end`] calls cut off by the end of the file.
+    #[test]
+    fn token_runs_to_end_tells_a_cut_token_from_a_malformed_one_4305() {
+        // Cut: an unclosed container (an escaped quote and a bracket in a string do not close
+        // or open anything), an unclosed string, a bare token with no byte after it.
+        for cut in [
+            &b"{\"a\\\"b\":"[..],
+            b"[1, \"]\"",
+            b"[[1],",
+            b"\"ab",
+            b"\"a\\\"",
+            b"-",
+            b"1e",
+            b"tru",
+        ] {
+            assert!(token_runs_to_end(cut), "{:?}", String::from_utf8_lossy(cut));
+        }
+        // Not cut: balanced, over-closed, a closed string, a token a delimiter ends, nothing.
+        for whole in [
+            &b"{\"a\\\"b\":1}"[..],
+            b"{}}",
+            b"[1]]",
+            b"\"ab\"",
+            b"\"a\\\"b\"",
+            b"1 ",
+            b"1,",
+            b"-e5]",
+            b"",
+        ] {
+            assert!(
+                !token_runs_to_end(whole),
+                "{:?}",
+                String::from_utf8_lossy(whole)
+            );
+        }
+    }
+
     /// #4305: the tail moves onto the next file, through an empty one, and the last file
     /// keeps whatever it ends with.
     #[test]
