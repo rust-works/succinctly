@@ -852,6 +852,40 @@ OPERANDS = [
     "[select(.)]",
     "[numbers, strings]",
     "[.[]? | numbers]",
+    # (#4152) an `[E]` collect as a branch of a compound stage, read by the same rule as
+    # the bare collect (`collect_keeps_register`), with the entry's trackability handed
+    # down to each `,` `//` `if` branch and the stricter `true` to a pipe's later stages.
+    # The contrasts that must stay refused: a navigation after the collect, a collect
+    # whose contents the resolver does not check (`with_entries`, `walk`, `|=`,
+    # `getpath`), and a collect inside a handler or behind a `try`.
+    "(select(.), [numbers])",
+    "([numbers], select(.))",
+    "([numbers], 7)",
+    "([numbers], [strings])",
+    "if .k then [numbers] else select(.) end",
+    "if .k then select(.) else [numbers] end",
+    "([numbers] // 7)",
+    "(select(.) // [numbers])",
+    "(select(.) | [numbers])",
+    "([numbers] | select(.))",
+    "([numbers] | length)",
+    "(select(.), ([numbers] | length))",
+    "(select(.), [.a])",
+    "(select(.), [.a?])",
+    "([.[]?], select(.))",
+    "(select(.), [last(.a)])",
+    "(select(.), [numbers] | .a)",
+    "([numbers] | .a)",
+    "(select(.), [numbers, getpath([\"a\"])])",
+    "(select(.), [with_entries(.)])",
+    "(select(.), [walk(.)])",
+    "(select(.), [.k |= . + 1])",
+    "(select(.), try [numbers] catch 7)",
+    "try (select(.), [numbers]) catch 7",
+    "try (select(.), [numbers]) catch .a",
+    "try (select(.), error(\"e\")) catch [numbers]",
+    "first(select(.), [numbers])",
+    "limit(2; (select(.), [numbers]))",
     # (#3653 review) a `last`/`select` whose output *is* the register: `.` and, in
     # the contexts that bind it, `$x`. `select` hands its input through as the
     # very value it received, so the register keeps its identity; `last(f)`'s

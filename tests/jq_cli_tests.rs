@@ -121548,6 +121548,180 @@ fn test_register_compound_stage_of_register_keeping_branches_3767() -> Result<()
     ])
 }
 
+/// #4152: an `[E]` collect as a branch of a compound stage (`,` `//` `if`, a parenthesised
+/// pipe) is read by the rule that reads it as a bare stage (#3263): jq's collect backtracks the
+/// register to where it began, so `5 | (select(.), [numbers])` leaves `$x` at the root, once per
+/// output, on `path`, `del`, `=` and `|=`. Contrasts that must still refuse as jq does: a
+/// navigation after the collect or inside it (`[.a]` on a scalar), and a collect whose contents
+/// the resolver does not check (`with_entries`, `|=`). Every row captured from jq 1.7.1, on the
+/// stdin and `-n` routes.
+#[test]
+fn test_register_collect_as_a_branch_of_a_compound_stage_4152() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | (select(.), [numbers]) | $x)",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | ([numbers], select(.)) | $x)",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | if . then [numbers] else select(.) end | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | if . then select(.) else [numbers] end | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | ([numbers] // 7) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | (select(.) // [numbers]) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | ([numbers], [strings]) | $x)",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | (select(.) | [numbers]) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | (select(.), [numbers]) | $x)",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | try (select(.), [numbers]) catch 7 | $x)",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | first(select(.), [numbers]) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | limit(2; (select(.), [numbers])) | $x)",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | (select(.), [numbers]) | $x | .k)",
+            "[\"k\"]\n[\"k\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(. as $x | 5 | (select(.), [numbers]) | $x.k)",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"(. as $x | 5 | ([numbers] // 7) | $x.k) |= 9",
+            "{\"a\":{\"b\":1},\"k\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"(. as $x | 5 | if . then [numbers] else select(.) end | $x.k) = 9",
+            "{\"a\":{\"b\":1},\"k\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | (select(.), [numbers]) | .a)",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of 5"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | (select(.), [numbers] | .a) | $x)",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of 5"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | ([numbers] | .a) | $x)",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of [5]"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | (select(.), [.a]) | $x)",
+            "[]\n",
+            r#"Invalid path expression near attempt to access element "a" of 5"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | (select(.), [.k |= . + 1]) | $x)",
+            "[]\n",
+            r#"Cannot index number with string "k""#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | (select(.), [with_entries(.)]) | $x)",
+            "[]\n",
+            r"number (5) has no keys",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(. as $x | 5 | (select(.), [with_entries(.)]) | $x | .k)",
+            "",
+            r"number (5) has no keys",
+            5,
+        ),
+    ])
+}
+
 /// #3767 (part 4): `first(f)`, `limit(n; f)` and `nth(n; f)` inside an `[E]` collect keep
 /// jq's path register, like `last(f)` (part 2): the collect backtracks, and what `f`
 /// navigates is path-checked as in a pipe, so `[first(numbers)]` is `[]` and
