@@ -76049,16 +76049,31 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let mut result = Vec::new();
 
             for key in keys {
-                let idx = match key {
-                    OwnedValue::Int(i) => *i,
-                    OwnedValue::Float(f) => *f as i64,
-                    OwnedValue::NumberLiteral(NumberRepr::Int(i), _) => *i,
-                    OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => *f as i64,
-                    _ => continue, // Skip non-numeric indices
+                // #4257 (yq): an array is indexed by an integer, by a string that
+                // `yq_parse_int64` reads as one, or by an integral float; any other key raises
+                // (or yields nothing under `?`), and a negative index does not wrap -- it matches
+                // nothing. jq mode keeps its own reading: skip a non-numeric key, wrap a negative.
+                let actual_idx = if S::TAG == EvalTag::Yq {
+                    match yq_pick_index(key) {
+                        Some(idx) => idx,
+                        None if optional => return QueryResult::None,
+                        None => return pick_unindexable_key(key),
+                    }
+                } else {
+                    let idx = match key {
+                        OwnedValue::Int(i) => *i,
+                        OwnedValue::Float(f) => *f as i64,
+                        OwnedValue::NumberLiteral(NumberRepr::Int(i), _) => *i,
+                        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => *f as i64,
+                        _ => continue, // Skip non-numeric indices
+                    };
+                    // Handle negative indices
+                    if idx < 0 {
+                        len + idx
+                    } else {
+                        idx
+                    }
                 };
-
-                // Handle negative indices
-                let actual_idx = if idx < 0 { len + idx } else { idx };
 
                 if actual_idx >= 0 && actual_idx < len {
                     // #1755: to_owned, not to_owned_lossy -- an
@@ -76079,6 +76094,34 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             EvalError::new("pick: input must be an object or array")
         }),
     }
+}
+
+/// How yq reads a `pick` key against an array (#4257): an integer, a string `yq_parse_int64` accepts
+/// (`"1"`, `"0x1"`, `"1_0"`), or an integral float that fits an `i64` (a JSON-sourced `1.0` is an
+/// index in yq; a YAML-sourced or literal one is not, and cannot be told apart here). `None` for
+/// everything else, which yq refuses.
+fn yq_pick_index(key: &OwnedValue) -> Option<i64> {
+    match key {
+        OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _) => Some(*i),
+        OwnedValue::String(text) => yq_parse_int64(text),
+        OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _)
+            if f.is_finite() && f.fract() == 0.0 && f.abs() < 9.0e18 =>
+        {
+            Some(*f as i64)
+        }
+        _ => None,
+    }
+}
+
+/// yq's refusal of an array `pick` key that is not an index (#4257).
+fn pick_unindexable_key<'a, W: Clone + AsRef<[u64]>>(key: &OwnedValue) -> QueryResult<'a, W> {
+    QueryResult::Error(EvalError::new(format!(
+        "cannot index array with {}",
+        match key {
+            OwnedValue::String(text) => text.to_string(),
+            other => other.to_json(),
+        }
+    )))
 }
 
 /// Builtin: omit(keys) - remove specified keys from object/indices from array
@@ -76202,10 +76245,24 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // instead of skipping the unresolvable key, unlike this array's
             // own sibling `delete_keys` (`delpaths`), which already used
             // `resolve_read_index` and correctly treats `nan` as no match.
-            let omit_indices: BTreeSet<usize> = keys
-                .iter()
-                .filter_map(|k| resolve_read_index(k, arr.len()))
-                .collect();
+            // #4257 (yq): only a non-negative integer removes anything. A negative index does
+            // not wrap, and a string or float key matches nothing.
+            let omit_indices: BTreeSet<usize> = if S::TAG == EvalTag::Yq {
+                keys.iter()
+                    .filter_map(|k| match k {
+                        OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _)
+                            if *i >= 0 =>
+                        {
+                            usize::try_from(*i).ok()
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            } else {
+                keys.iter()
+                    .filter_map(|k| resolve_read_index(k, arr.len()))
+                    .collect()
+            };
 
             // #1755: to_owned, not to_owned_lossy -- an undecodable kept
             // element must raise, not silently become "".
@@ -76226,6 +76283,11 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #1755: a decode failure on the scalar itself must raise
         // unconditionally, checked ahead of `optional` -- see
         // `scalar_decode_failure`.
+        // #4257 (yq): there is nothing to remove from a scalar, so it passes through.
+        _ if S::TAG == EvalTag::Yq => match scalar_decode_failure(&value) {
+            Some(e) => QueryResult::Error(e),
+            None => QueryResult::One(value),
+        },
         _ => scalar_fallback(&value, optional, || {
             EvalError::new("omit: input must be an object or array")
         }),

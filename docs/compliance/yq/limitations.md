@@ -4521,6 +4521,12 @@ its text (`numeric_display_string`, so `==` and `tostring` agree about a compute
   comparator rejects the values of a mapping that are maps, booleans or of mixed types
   (`{a: true, b: false} | min` is `!!bool not yet supported for comparison`) exactly as for an
   array (#4055), where this keeps jq's ordering.
+- **`pick` on an array and `omit` (#4257).** In yq mode `pick` indexes an array by an integer, by a
+  string `yq`'s own `parseInt64` accepts (`"1"`, `"0x1"`, `"0o1"`, `"1_0"`), or by an integral float;
+  any other key raises, and a negative index matches nothing. `omit` removes only non-negative integer
+  indices from an array and leaves a scalar alone. One gap: an integral float key is an index here,
+  while yq raises for a YAML-sourced or filter-literal one (`pick([1.0])`; a JSON-sourced `1.0` is an
+  index in yq too, so the two cannot be told apart in the owned value). jq mode is unchanged.
 - **A write keeps the blank lines between a head-comment block and the node below it**
   ([#4093](https://github.com/rust-works/succinctly/issues/4093)). For a node at column 0 the
   blank lines after the block are recorded as trailing empty entries of the head comment and

@@ -61184,6 +61184,92 @@ fn test_object_construction_empty_operand_4193() -> Result<()> {
     Ok(())
 }
 
+/// Pinned yq v4.53.3 (#4257): `pick` indexes an array by an integer, or by a string that parses as
+/// one (Go's base-10 `ParseInt`: a sign and leading zeros are fine, spaces are not); every other
+/// key, a float included, is an error, and a negative index does not wrap. `omit` leaves a scalar
+/// alone. Every row was captured from the pinned binary, `-p=json -o=json -I=0`.
+#[test]
+fn test_yq_pick_array_keys_and_omit_scalar_4257() -> Result<()> {
+    let args = &["-p=json", "-o=json", "-I=0"];
+    for (input, filter, expected) in [
+        ("[1,2]", "pick([\"1\"])", "[2]\n"),
+        ("[1,2]", "pick([\"01\"])", "[2]\n"),
+        ("[1,2]", "pick([\"+1\"])", "[2]\n"),
+        ("[1,2]", "pick([\"0\",\"1\"])", "[1,2]\n"),
+        ("[1,2]", "pick([\"-1\"])", "[]\n"),
+        // yq's own integer reading: `0x`/`0X` hex, `0o` octal, `_` stripped, a sign after the prefix.
+        ("[1,2]", "pick([\"0x1\"])", "[2]\n"),
+        ("[1,2]", "pick([\"0X1\"])", "[2]\n"),
+        ("[1,2]", "pick([\"0o1\"])", "[2]\n"),
+        ("[1,2]", "pick([\"0x_1\"])", "[2]\n"),
+        ("[1,2]", "pick([\"_1\"])", "[2]\n"),
+        ("[1,2]", "pick([\"0x-1\"])", "[]\n"),
+        ("[1,2]", "pick([-1])", "[]\n"),
+        ("[1,2]", "pick([-0])", "[1]\n"),
+        ("[1,2]", "pick([5])", "[]\n"),
+        ("[1,2]", "pick([0,0])", "[1,1]\n"),
+        ("[1,2]", "pick([1,0])", "[2,1]\n"),
+        ("[1,2]", "pick([])", "[]\n"),
+        ("{\"a\":1}", "pick([\"a\"])", "{\"a\":1}\n"),
+        ("{\"a\":1}", "pick([\"b\"])", "{}\n"),
+        ("null", "omit([\"a\"])", "null\n"),
+        ("true", "omit([\"a\"])", "true\n"),
+        ("1", "omit([\"a\"])", "1\n"),
+        ("\"s\"", "omit([\"a\"])", "\"s\"\n"),
+        ("[1,2]", "omit([0])", "[2]\n"),
+        // Only a non-negative integer removes anything from an array.
+        ("[1,2]", "omit([-1])", "[1,2]\n"),
+        ("[1,2]", "omit([1.5])", "[1,2]\n"),
+        ("[1,2]", "omit([1.0])", "[1,2]\n"),
+        ("[1,2]", "omit([\"1\"])", "[1,2]\n"),
+        ("[1,2]", "omit([\"a\"])", "[1,2]\n"),
+        ("[1,2]", "omit([null])", "[1,2]\n"),
+        ("[1,2]", "omit([5])", "[1,2]\n"),
+        ("[1,2]", "omit([0,1])", "[]\n"),
+        ("{\"a\":1}", "omit([\"a\"])", "{}\n"),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, input, args)?,
+            (expected.into(), String::new(), 0),
+            "{input} | {filter}"
+        );
+    }
+    // An error in yq, whichever way it is worded: a key that is not an index.
+    for filter in [
+        "pick([\"a\"])",
+        "pick([\" 1\"])",
+        "pick([\"1.0\"])",
+        "pick([0,\"a\"])",
+        "pick([null])",
+        "pick([true])",
+        "pick([[0]])",
+        "pick([1.5])",
+        "pick([\"0O1\"])",
+        "pick([\"0b1\"])",
+        "pick([\"+0x1\"])",
+        "pick([\"1e0\"])",
+        "pick([1e30])",
+        "pick([\"9223372036854775808\"])",
+        "pick([9223372036854775808])",
+    ] {
+        let (stdout, _, code) = run_yq_stdin_with_stderr(filter, "[1,2]", args)?;
+        assert_eq!((stdout.as_str(), code), ("", 1), "{filter}");
+    }
+    // The same through the YAML reader.
+    for (input, filter, expected) in [
+        ("a: [1, 2]\n", ".a | pick([\"1\"])", "[2]\n"),
+        ("a: [1, 2]\n", ".a | omit([\"x\"])", "[1,2]\n"),
+        ("a: ~\n", ".a | omit([\"x\"])", "null\n"),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, input, &["-o=json", "-I=0"])?,
+            (expected.into(), String::new(), 0),
+            "yaml: {input} | {filter}"
+        );
+    }
+    Ok(())
+}
+
 /// Pinned yq v4.53.3: a few builtins answer nothing, not an error or `null`, for an input they
 /// have nothing to work on (#4236): `min`/`max` of an empty array, a scalar or an empty mapping
 /// (a mapping is the extremum of its values), and `to_entries`/`with_entries`/`split` of `null`.
