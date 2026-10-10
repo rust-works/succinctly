@@ -76049,6 +76049,25 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let mut result = Vec::new();
 
             for key in keys {
+                // #4257 (yq): an array is indexed by an integer, or by a string that parses as
+                // one (Go's base-10 `ParseInt`); any other key raises, and a negative index
+                // does not wrap -- it matches nothing.
+                if S::TAG == EvalTag::Yq {
+                    let idx = match key {
+                        OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _) => *i,
+                        OwnedValue::String(text) => match text.parse::<i64>() {
+                            Ok(i) => i,
+                            Err(_) => return pick_unindexable_key(key),
+                        },
+                        _ => return pick_unindexable_key(key),
+                    };
+                    if idx >= 0 && idx < len {
+                        // See the Object arm above for the routing of this conversion.
+                        let owned = to_owned_or_suppress!(&arr[idx as usize], optional);
+                        result.push(owned);
+                    }
+                    continue;
+                }
                 let idx = match key {
                     OwnedValue::Int(i) => *i,
                     OwnedValue::Float(f) => *f as i64,
@@ -76079,6 +76098,17 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             EvalError::new("pick: input must be an object or array")
         }),
     }
+}
+
+/// yq's refusal of an array `pick` key that is not an index (#4257).
+fn pick_unindexable_key<'a, W: Clone + AsRef<[u64]>>(key: &OwnedValue) -> QueryResult<'a, W> {
+    QueryResult::Error(EvalError::new(format!(
+        "cannot index array with {}",
+        match key {
+            OwnedValue::String(text) => text.to_string(),
+            other => other.to_json(),
+        }
+    )))
 }
 
 /// Builtin: omit(keys) - remove specified keys from object/indices from array
@@ -76226,6 +76256,11 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #1755: a decode failure on the scalar itself must raise
         // unconditionally, checked ahead of `optional` -- see
         // `scalar_decode_failure`.
+        // #4257 (yq): there is nothing to remove from a scalar, so it passes through.
+        _ if S::TAG == EvalTag::Yq => match scalar_decode_failure(&value) {
+            Some(e) => QueryResult::Error(e),
+            None => QueryResult::One(value),
+        },
         _ => scalar_fallback(&value, optional, || {
             EvalError::new("omit: input must be an object or array")
         }),
