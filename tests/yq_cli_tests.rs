@@ -18969,6 +18969,96 @@ mod meta_assign_798 {
         Ok(())
     }
 
+    /// #2709: the metadata pass re-evaluates every stage ahead of the write only to learn the
+    /// document the write sees, so a `debug`/`stderr`/`halt_error` inside such a stage must still
+    /// fire exactly once -- from the real evaluation -- and a side effect in the write's own
+    /// right-hand side, which only the pass evaluates, must not be muted.
+    #[test]
+    fn side_effects_before_a_metadata_write_fire_once_2709() -> Result<()> {
+        let input = "a: 1\nb: 2\n";
+        let debug_line = "[\"DEBUG:\",2]\n";
+        for (filter, expected_out, expected_err) in [
+            (
+                ".a = (.b | debug) | .a line_comment = \"y\"",
+                "a: 2 # y\nb: 2\n",
+                debug_line,
+            ),
+            (
+                ".a = (.b | stderr) | .a line_comment = \"y\"",
+                "a: 2 # y\nb: 2\n",
+                "2",
+            ),
+            (
+                ".a |= (. | debug) | .a line_comment = \"y\"",
+                "a: 1 # y\nb: 2\n",
+                "[\"DEBUG:\",1]\n",
+            ),
+            (
+                ".a = 3 | select(.b | debug) | .a line_comment = \"y\"",
+                "a: 3 # y\nb: 2\n",
+                debug_line,
+            ),
+            (
+                ".a line_comment = (.b | debug | tostring)",
+                "a: 1 # 2\nb: 2\n",
+                debug_line,
+            ),
+            (".a = (.b | debug) | .a = .a", "a: 2\nb: 2\n", debug_line),
+        ] {
+            let (out, err, code) = run_yq_stdin_with_stderr(filter, input, &["--jq-extensions"])?;
+            assert_eq!(
+                (code, out.as_str(), err.as_str()),
+                (0, expected_out, expected_err),
+                "[{filter}]"
+            );
+        }
+        Ok(())
+    }
+
+    /// #2709: the write's own target expression is also looked up by the pass, and every document
+    /// of a multi-document file runs the pass again; a side effect in either fires once per
+    /// document.
+    #[test]
+    fn side_effects_in_the_target_and_across_documents_fire_once_2709() -> Result<()> {
+        let (out, err, code) = run_yq_stdin_with_stderr(
+            "(.a | debug) line_comment = \"y\"",
+            "a: 1\nb: 2\n",
+            &["--jq-extensions"],
+        )?;
+        assert_eq!(
+            (code, out.as_str(), err.as_str()),
+            (0, "a: 1 # y\nb: 2\n", "[\"DEBUG:\",1]\n")
+        );
+
+        let (out, err, code) = run_yq_stdin_with_stderr(
+            ".a = (.b | debug) | .a line_comment = \"y\"",
+            "a: 1\nb: 2\n---\na: 5\nb: 6\n",
+            &["--jq-extensions"],
+        )?;
+        assert_eq!(
+            (code, out.as_str(), err.as_str()),
+            (
+                0,
+                "a: 2 # y\nb: 2\n---\na: 6 # y\nb: 6\n",
+                "[\"DEBUG:\",2]\n[\"DEBUG:\",6]\n"
+            )
+        );
+        Ok(())
+    }
+
+    /// #2709: `halt_error` ahead of a metadata write halts once, with its payload printed once and
+    /// the exit code the real evaluation chose -- the pass's own re-run is silent.
+    #[test]
+    fn halt_error_before_a_metadata_write_prints_once_2709() -> Result<()> {
+        let (out, err, code) = run_yq_stdin_with_stderr(
+            ".a = (.b | halt_error) | .a line_comment = \"y\"",
+            "a: 1\nb: 2\n",
+            &[],
+        )?;
+        assert_eq!((code, out.as_str(), err.as_str()), (1, "", "2\n"));
+        Ok(())
+    }
+
     /// The existing `line_comment`/`style`/`anchor` GET-forms are the
     /// regression gate this PR's own staging plan calls for: byte-identical
     /// before and after adding the assignment grammar.
