@@ -5873,6 +5873,27 @@ pub(crate) fn try_swallows_scalar_iteration(expr: &Expr, catch: Option<&Expr>) -
     matches!(unwrap_bind_source(expr), Expr::Iterate) && catch.map_or(true, is_empty_handler)
 }
 
+/// [`try_swallows_scalar_iteration`] for `path(.[])` (#4157): `expr` is a
+/// `path(f)` whose argument is a bare `.[]`, and the handler, if any, is `empty`.
+///
+/// `path(.[])` over a scalar raises the same `Cannot iterate over ...` that `.[]`
+/// does (through `path_iterate_step_generic`), so a boundary around it has the
+/// same nothing to catch, and the same message to skip building.
+///
+/// Kept apart from [`try_swallows_scalar_iteration`] on purpose: that one also
+/// feeds the path-position walkers (`swallowing_boundary` ->
+/// `swallowed_path_leaf`), where `path(...)` is not a path expression and
+/// `path(.[])?` must still evaluate to raise jq's path error. Only the *value*
+/// boundaries (`swallowed_scalar_iteration`, `owned_swallowing_boundary`) ask
+/// this one. Both operands are peeled by [`unwrap_bind_source`], as above, so a
+/// closure argument (`def opt(f): f?;` called as `opt(path(.[]))`) matches too.
+pub(crate) fn try_swallows_scalar_path_iteration(expr: &Expr, catch: Option<&Expr>) -> bool {
+    matches!(
+        unwrap_bind_source(expr),
+        Expr::Builtin(Builtin::Path(f)) if matches!(unwrap_bind_source(f), Expr::Iterate)
+    ) && catch.map_or(true, is_empty_handler)
+}
+
 /// Whether a `catch` handler is the bare builtin `empty`, which delivers nothing
 /// for any payload (a `break` runs it over `null`, which is the same nothing), so
 /// the boundary is the same as one with no handler. One definition for
@@ -5934,13 +5955,25 @@ fn owned_scalar_iteration_swallowed<S: EvalSemantics>(
         && !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_))
 }
 
+/// [`owned_scalar_iteration_swallowed`] for a *value* boundary, which also
+/// swallows `path(.[])` (#4157). The resolver's `Try`/`Optional` arms ask the
+/// narrow one: in path position `path(...)` is not a path expression.
+fn owned_value_iteration_swallowed<S: EvalSemantics>(
+    body: &Expr,
+    catch: Option<&Expr>,
+    value: &OwnedValue,
+) -> bool {
+    crate::jq::eval_generic::value_swallowing_boundary::<S>(body, catch)
+        && !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_))
+}
+
 /// [`owned_scalar_iteration_swallowed`] for a whole boundary expression: `expr`
 /// is `body?` or `try body catch handler`, optionally parenthesised (#3728).
 fn owned_swallowing_boundary<S: EvalSemantics>(expr: &Expr, value: &OwnedValue) -> bool {
     match unwrap_paren(expr) {
-        Expr::Optional(inner) => owned_scalar_iteration_swallowed::<S>(inner, None, value),
+        Expr::Optional(inner) => owned_value_iteration_swallowed::<S>(inner, None, value),
         Expr::Try { expr, catch } => {
-            owned_scalar_iteration_swallowed::<S>(expr, catch.as_deref(), value)
+            owned_value_iteration_swallowed::<S>(expr, catch.as_deref(), value)
         }
         // A door answers the bare stage and the one-stage pipe around it alike
         // (#3673): `. | .[]?` is `.[]?`, as `eval_owned_length` reads it.
@@ -123741,6 +123774,114 @@ mod tests {
         let container = eval_owned_closed::<JqSemantics>(&array).unwrap();
         assert_eq!(boundary(".[]?", &container), (false, false));
         assert_eq!(boundary("try .[] catch empty", &container), (false, false));
+    }
+
+    /// #4157: the value boundaries also settle `path(.[])` over a scalar, and the
+    /// path-position boundary does not. Taken for `path(.[])` with no handler or
+    /// `catch empty`, under any parentheses, in jq mode -- by `swallowed_scalar_iteration`
+    /// and `owned_swallowing_boundary`, not by `swallowing_boundary`, which the path walks
+    /// use and where `path(...)` is not a path expression. Not taken in yq mode, over a
+    /// container, for a handler that runs, or for a `path(f)` whose argument is not a bare
+    /// `.[]`.
+    #[test]
+    fn path_iteration_is_a_value_boundary_only_4157() {
+        use crate::jq::eval_generic::{
+            swallowed_scalar_iteration as settle, swallowing_boundary, value_swallowing_boundary,
+        };
+        let scalar_json: &[u8] = b"5";
+        let scalar_index = JsonIndex::build(scalar_json);
+        let scalar = scalar_index.root(scalar_json).value();
+        let container_json: &[u8] = b"[1]";
+        let container_index = JsonIndex::build(container_json);
+        let container = container_index.root(container_json).value();
+        let undecodable_json: &[u8] = br#""\ud800""#;
+        let undecodable_index = JsonIndex::build(undecodable_json);
+        let undecodable = undecodable_index.root(undecodable_json).value();
+
+        let path_iterate = parse("path(.[])").unwrap();
+        let parenthesised = parse("(path((.[])))").unwrap();
+        let empty = parse("empty").unwrap();
+        let handler = parse(r#""c""#).unwrap();
+        for body in [&path_iterate, &parenthesised] {
+            assert!(value_swallowing_boundary::<JqSemantics>(body, None));
+            assert!(value_swallowing_boundary::<JqSemantics>(body, Some(&empty)));
+            assert!(!value_swallowing_boundary::<YqSemantics>(body, None));
+            // Never the path walks' boundary.
+            assert!(!swallowing_boundary::<JqSemantics>(body, None));
+            assert!(!swallowing_boundary::<JqSemantics>(body, Some(&empty)));
+            assert!(matches!(
+                settle::<JqSemantics, _>(body, None, &scalar),
+                Some(Ok(()))
+            ));
+            assert!(settle::<JqSemantics, _>(body, None, &container).is_none());
+            assert!(settle::<YqSemantics, _>(body, None, &scalar).is_none());
+            assert!(settle::<JqSemantics, _>(body, Some(&handler), &scalar).is_none());
+            // What `?` never swallows still escapes as the failure `.[]` raises.
+            match settle::<JqSemantics, _>(body, None, &undecodable) {
+                Some(Err(e)) => assert!(e.is_decode_failure()),
+                other => panic!("expected a decode failure, got {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #4157 pin, only reached when the pin is already failing"
+            }
+        }
+        for source in [
+            "path(.a)",
+            "path(.[0])",
+            "path(.[]?)",
+            "path(.[] | .[])",
+            "path(.)",
+        ] {
+            let body = parse(source).unwrap();
+            assert!(
+                !value_swallowing_boundary::<JqSemantics>(&body, None),
+                "{source}"
+            );
+            assert!(
+                settle::<JqSemantics, _>(&body, None, &scalar).is_none(),
+                "{source}"
+            );
+        }
+
+        // The owned front door: taken for `path(.[])?` / `try path(.[])` over an owned
+        // scalar in jq mode, not over a container, not in yq mode.
+        let boundary = |source: &str, value: &OwnedValue| {
+            let expr = parse(source).unwrap();
+            (
+                owned_swallowing_boundary::<JqSemantics>(&expr, value),
+                owned_swallowing_boundary::<YqSemantics>(&expr, value),
+            )
+        };
+        for scalar in [
+            OwnedValue::Null,
+            OwnedValue::Int(5),
+            OwnedValue::String("abc".into()),
+        ] {
+            for source in [
+                "path(.[])?",
+                "(path(.[]))?",
+                "try path(.[])",
+                "try path(.[]) catch empty",
+                ". | path(.[])?",
+            ] {
+                assert_eq!(boundary(source, &scalar), (true, false), "{source}");
+            }
+            for source in [
+                r#"try path(.[]) catch "c""#,
+                "path(.[])",
+                "path(.a)?",
+                "path(.[]?)?",
+            ] {
+                assert_eq!(boundary(source, &scalar), (false, false), "{source}");
+            }
+        }
+        let array = parse("[1]").unwrap();
+        let container = eval_owned_closed::<JqSemantics>(&array).unwrap();
+        assert_eq!(boundary("path(.[])?", &container), (false, false));
+        // The resolver's narrow gate keeps declining it: in path position `path(...)`
+        // is not a path expression.
+        assert!(!owned_scalar_iteration_swallowed::<JqSemantics>(
+            &parse("path(.[])").unwrap(),
+            None,
+            &OwnedValue::Int(5),
+        ));
     }
 
     /// #3704: the constant-handler shortcut's gate, which no output can show.
