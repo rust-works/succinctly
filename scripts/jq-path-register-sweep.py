@@ -1162,6 +1162,14 @@ OPERANDS = [
     "(foreach .a? as $k (.; select(true); try ($k | .b?)))",
     "(foreach .a? as $k (null; ((now // sort) | ($k | .c?) // (first(($k | length)) | (1, 2))); try ($k | .b?)))",
     "(foreach .a? as $k (0; (try ((length | .)) catch ([($k | .b?)]) | if first(0) then (($k | .b?), true) else sort end); try ($k | .b?)))",
+    # (#4252) an UPDATE output that navigated and then computed leaves jq's register on the node it
+    # navigated to, which a `null`/`true`/`false` `$k` equals by kind; an object `$k` never does.
+    "(foreach .a? as $k (0; ($k | .b?) | def f: 1; f; $k))",
+    "(foreach .a? as $k (0; ($k | .[0]?) | def f: 1; f; try ($k | .[0]?)))",
+    "(foreach .a? as $k (0; ($k | .b?.c?) | def f: 1; f; try ($k | .b?)))",
+    "(foreach .a? as $k (null; ($k | .b?) | def f: 1; f; try ($k | .b?)))",
+    "(foreach .a? as $k (0; (($k | .b?), now) | floor; try ($k | .b?)))",
+    "(foreach .a? as $k (0; ($k | .b?) | def f: 1; f; try ($k | .b?) | .c?))",
     # (#3899) a destructuring `?//` bind whose body mixes a navigating and a
     # by-value part. A failed destructure is restored by the fork, so the bare
     # `$var` alternative that runs leaves jq's register where the stage entered

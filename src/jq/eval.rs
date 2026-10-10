@@ -47789,17 +47789,21 @@ impl FoldRegister {
             // on is the resolver's guess, not jq's verdict ([`guess_refusal`]): left `Kept` it
             // read as exact and an EXTRACT `try` swallowed it, dropping a path jq names.
             //
-            // Not when UPDATE's output navigated: its register is then known to have left the
-            // step's entry (`($v|.b?)|floor` is on `.b`), and a refusal of the entry's own node is
-            // jq's verdict, which a `try` around it catches.
+            // When UPDATE's output navigated, the register has left the step's entry and is at
+            // or under the node it navigated to (`($v|.b?)|floor` is on `.b`): it is lost *there*
+            // (#4252), so a refusal of the entry's own node stays jq's exact verdict, which a
+            // `try` around it catches, unless that node could equal the one navigated to (a
+            // `null`/`true`/`false` register, which `jv_identical` compares by kind).
             let mut frame = self.frame.unknown();
-            let navigated = branch.path.depth() > self.path.depth();
-            if S::TAG == EvalTag::Jq
-                && self.trackable
-                && !navigated
-                && !frame.register_loss.is_lost()
-            {
-                frame.register_loss = RegisterLoss::LostAt(Rc::new(self.value.clone()));
+            if S::TAG == EvalTag::Jq && self.trackable && !frame.register_loss.is_lost() {
+                let navigated = branch.path.depth() > self.path.depth();
+                let at = if navigated {
+                    node_below(&self.value, &branch.path.to_vec()[self.path.depth()..])
+                } else {
+                    None
+                };
+                frame.register_loss =
+                    RegisterLoss::LostAt(Rc::new(at.unwrap_or_else(|| self.value.clone())));
             }
             Self {
                 path: Rc::clone(&self.path),
@@ -47810,6 +47814,35 @@ impl FoldRegister {
             }
         }
     }
+}
+
+/// The node `root` holds at `components` (a path's field and index steps, root to leaf), reading a
+/// missing member or a step through `null` as `null` as `.b?` does, or `None` for a component
+/// this does not model (a slice, a key on the wrong kind) -- the caller then falls back to the
+/// node it started from, which is the wider, louder answer (#4252).
+fn node_below(root: &OwnedValue, components: &[Expr]) -> Option<OwnedValue> {
+    let mut node = root;
+    for component in components {
+        node = match (node, strip_optional(component)) {
+            (OwnedValue::Null, Expr::Field(_) | Expr::Index { .. }) => {
+                return Some(OwnedValue::Null)
+            }
+            (OwnedValue::Object(map), Expr::Field(key)) => match map.get(key.as_str()) {
+                Some(member) => member,
+                None => return Some(OwnedValue::Null),
+            },
+            (OwnedValue::Array(items), Expr::Index { idx, .. }) => {
+                let len = i64::try_from(items.len()).ok()?;
+                let at = if *idx < 0 { idx + len } else { *idx };
+                match usize::try_from(at).ok().and_then(|at| items.get(at)) {
+                    Some(item) => item,
+                    None => return Some(OwnedValue::Null),
+                }
+            }
+            _ => return None,
+        };
+    }
+    Some(node.clone())
 }
 
 /// Whether `e` is a step whose evaluation moves jq's path register -- the test
@@ -138337,5 +138370,75 @@ mod stderr_mute_tests_2709 {
         let unwound = std::panic::catch_unwind(|| with_stderr_muted(|| panic!("boom")));
         assert!(unwound.is_err());
         assert_eq!(depth(), 0);
+    }
+}
+
+#[cfg(test)]
+mod node_below_tests_4252 {
+    use super::*;
+
+    fn doc() -> OwnedValue {
+        OwnedValue::object_from([
+            (
+                "a".to_string(),
+                OwnedValue::array_from(vec![
+                    OwnedValue::Null,
+                    OwnedValue::object_from([("b".to_string(), OwnedValue::Int(2))]),
+                ]),
+            ),
+            ("n".to_string(), OwnedValue::Null),
+        ])
+    }
+
+    fn field(name: &str) -> Expr {
+        Expr::Field(name.to_string())
+    }
+
+    fn index(idx: i64) -> Expr {
+        Expr::Index { idx, key: None }
+    }
+
+    /// #4252: the node a navigated UPDATE output left jq's register on is read off the step's
+    /// entry the way `.b?` reads it, a missing member and a step through `null` being `null`.
+    #[test]
+    fn reads_the_node_a_path_leads_to() {
+        let doc = doc();
+        let at = |components: &[Expr]| node_below(&doc, components);
+        assert_eq!(at(&[]), Some(doc.clone()));
+        assert_eq!(
+            at(&[field("a"), index(1), field("b")]),
+            Some(OwnedValue::Int(2))
+        );
+        assert_eq!(
+            at(&[field("a"), index(-1), field("b")]),
+            Some(OwnedValue::Int(2))
+        );
+        assert_eq!(at(&[field("a"), index(0)]), Some(OwnedValue::Null));
+        // A missing member, an index past the end, and any step below a `null` are `null`.
+        assert_eq!(at(&[field("zz")]), Some(OwnedValue::Null));
+        assert_eq!(at(&[field("a"), index(9)]), Some(OwnedValue::Null));
+        assert_eq!(at(&[field("a"), index(-9)]), Some(OwnedValue::Null));
+        assert_eq!(
+            at(&[field("n"), field("x"), index(3)]),
+            Some(OwnedValue::Null)
+        );
+        // The postfix `?` a component can carry is looked through.
+        assert_eq!(
+            at(&[field("a"), Expr::Optional(Box::new(index(1)))]),
+            Some(OwnedValue::object_from([(
+                "b".to_string(),
+                OwnedValue::Int(2)
+            )]))
+        );
+    }
+
+    /// A component this does not model, or one that does not fit the node, answers `None`: the
+    /// caller then records the loss at the node it started from, the wider and louder answer.
+    #[test]
+    fn declines_a_component_it_does_not_model() {
+        let doc = doc();
+        assert_eq!(node_below(&doc, &[index(0)]), None);
+        assert_eq!(node_below(&doc, &[field("a"), field("b")]), None);
+        assert_eq!(node_below(&doc, &[field("a"), Expr::Identity]), None);
     }
 }
