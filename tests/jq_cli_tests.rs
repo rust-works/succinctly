@@ -39126,9 +39126,9 @@ fn test_jq_null_input_reduce_inputs_over_multiple_files_723() -> Result<()> {
     // Each file ends in a newline: jq reads the files as one byte stream (#4305), so `1` then `2`
     // with nothing between them is the one number `12`.
     let mut f1 = NamedTempFile::new()?;
-    write!(f1, "1\n")?;
+    writeln!(f1, "1")?;
     let mut f2 = NamedTempFile::new()?;
-    write!(f2, "2\n")?;
+    writeln!(f2, "2")?;
     let (stdout, stderr, code) = run_jq_full(
         &[
             "-cn",
@@ -41280,6 +41280,24 @@ fn test_jq_input_files_are_one_byte_stream_4305() -> Result<()> {
             "{files:?}"
         );
     }
+
+    // Recorded residual (limitations.md): the moved tail keeps its newline, so the value is on
+    // line 2 here and on line 1 in jq, which counts the later file's own lines.
+    let (stdout, stderr, code, _paths) =
+        run_jq_over_files(&["-c", "[., input_line_number]"], &["{\"a\":\n", "1}\n"])?;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "[{\"a\":1},2]\n");
+
+    // The other input modes already read the whole list at once and are not stitched again: `-R`
+    // joins `1` and `2` into the one line `12` as jq does, and `--validate` is strict per file, so
+    // a value spanning two files is rejected there as an incomplete document (exit 3).
+    let (stdout, stderr, code, _paths) = run_jq_over_files(&["-R", "."], &["1", "2\n"])?;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "\"12\"\n");
+    let (stdout, stderr, code, _paths) =
+        run_jq_over_files(&["--validate", "-c", "."], &["{\"a\":", "1}\n"])?;
+    assert_eq!(code, 3, "{stderr}");
+    assert_eq!(stdout, "");
 
     // `true` then `false` is the one token `truefalse` to jq, which rejects it.
     let (stdout, _stderr, code, _paths) = run_jq_over_files(&["-c", "."], &["true", "false\n"])?;

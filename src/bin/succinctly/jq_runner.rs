@@ -4290,7 +4290,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
         // `input_filename`'s names for this route's source tags, which are the
         // indexes into `raw_inputs` below (#3046).
         jq::cli_context::set_input_names(input_names(&files));
-        let raw_inputs: Vec<Vec<u8>> = if files.is_empty() {
+        let mut raw_inputs: Vec<Vec<u8>> = if files.is_empty() {
             vec![read_stdin_bytes()?]
         } else {
             match files
@@ -4302,9 +4302,10 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 Err(unopenable) => return Ok(report_unopenable_input(&unopenable)),
             }
         };
-        let mut raw_inputs = raw_inputs;
-        // #4305: see [`stitch_json_file_seams`].
-        stitch_json_file_seams(raw_inputs.iter_mut());
+        // #4305: see [`stitch_json_file_seams`]. Not under `--validate`, which is strict per file.
+        if !args.validate {
+            stitch_json_file_seams(raw_inputs.iter_mut());
+        }
         // Substitution is skipped under `--validate` so the strict validator
         // in the loop below still sees the *original* bytes (#1247).
         // Substituting first silently repaired a non-UTF-8 document, leaving
@@ -5263,7 +5264,9 @@ fn get_inputs(
     let json_input_mode = args.input_dsv.is_none() && !args.raw_input && !args.seq;
     // #4305: jq reads every input file as one byte stream, so a token still open at the end of
     // a file continues in the next one.
-    if json_input_mode {
+    // `--validate` is strict per file (an empty file is rejected too), so it reads the files as
+    // written.
+    if json_input_mode && !args.validate {
         stitch_json_file_seams(raw_bytes.iter_mut().map(|(_, raw)| raw));
     }
 
@@ -6501,6 +6504,8 @@ fn stitch_json_file_seams<'a>(raws: impl Iterator<Item = &'a mut Vec<u8>>) {
     let mut carry: Vec<u8> = Vec::new();
     for (index, raw) in raws.iter_mut().enumerate() {
         if !carry.is_empty() {
+            // Exact, not amortized: a doubled capacity on a multi-gigabyte file is the cost.
+            raw.reserve_exact(carry.len());
             raw.splice(0..0, std::mem::take(&mut carry));
         }
         if index < last {

@@ -6399,7 +6399,8 @@ file ends continues in the next one: `1` then `2\n` is the one number `12`, `{"a
 file (a truncated container or string, or a bare number or keyword that runs to the file's end) is moved
 onto the front of the next file, through an empty one, and the last file keeps whatever it ends with
 (`stitch_json_file_seams`). Plain JSON only; `--seq` and `-R` already read the whole file list at once
-(#1571, #1809), and DSV input has no jq oracle. The value is complete in the later file, which is what
+(#1571, #1809), DSV input has no jq oracle, and `--validate` is strict per file (it rejects an empty file
+too), so it reads the files as written and rejects a value that spans two. The value is complete in the later file, which is what
 jq's `input_filename` and a diagnostic name for it, and where the tail now sits. Pinned by
 `test_jq_input_files_are_one_byte_stream_4305`.
 
