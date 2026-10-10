@@ -8550,7 +8550,10 @@ pub(crate) struct RootCopy {
 /// (`.[] | ... | [key]`) asks for the elements in document order, and the
 /// scans summed over `n` of them are `O(n^2)`. Remembering where the last
 /// scan of a wide parent stopped lets the next one start there, and answers
-/// the element after it, or the same one read again, with no scan at all.
+/// the element after it, or the same one read again, with no scan at all. A
+/// parent keeps two such scans (#4164), so two fan-outs at distant offsets of
+/// one array each resume from their own; three or more still replace one
+/// another.
 ///
 /// Scoped, not global: an entry names one document's parent by node id, so
 /// it is installed by an evaluation entry point for the document it
@@ -8568,10 +8571,11 @@ mod slot_memo {
 
     use super::RootCopy;
 
-    /// How many wide parents are remembered at once: a document has a handful
-    /// of wide levels, and each position's climb touches each of them. The
-    /// least recently used is dropped, so an outer array read at every
-    /// position outlives the inner arrays that come and go beneath it.
+    /// How many scans are remembered at once, across all parents (a parent
+    /// holds at most [`PER_PARENT`] of them): a document has a handful of wide
+    /// levels, and each position's climb touches each of them. The least
+    /// recently used is dropped, so an outer array read at every position
+    /// outlives the inner arrays that come and go beneath it.
     const CAPACITY: usize = 4;
 
     /// How many scans of one parent are remembered at once (#4164): two
@@ -8795,29 +8799,55 @@ mod slot_memo {
         });
     }
 
-    /// The element of `parent` a scan found -- its node id and index -- that
-    /// is nearest before `target`: the one a scan resumes from (#4164 keeps
-    /// more than one per parent, so the nearest is the cheapest).
-    pub(crate) fn resume(
+    /// The element of `parent` a scan found -- its node id, index, and whether
+    /// it is a mapping's -- that is nearest before `target`: the one a scan
+    /// resumes from (#4164 keeps more than one per parent, so the nearest is
+    /// the cheapest). Read-only; [`touch`] marks it used once it is.
+    pub(crate) fn nearest_before(
         document: usize,
         parent: usize,
         target: usize,
     ) -> Option<(usize, i64, bool)> {
         MEMO.with(|m| {
-            let mut m = m.borrow_mut();
-            let state = m.as_mut().filter(|s| s.document == document)?;
-            let at = state
+            let m = m.borrow();
+            let state = m.as_ref().filter(|s| s.document == document)?;
+            let scan = state
                 .scans
                 .iter()
-                .enumerate()
-                .filter(|(_, s)| s.parent == parent && s.last < target)
-                .max_by_key(|(_, s)| s.last)
-                .map(|(at, _)| at)?;
-            let scan = state.scans.remove(at);
-            let found = (scan.last, scan.index, scan.members);
-            state.scans.push(scan);
-            Some(found)
+                .filter(|s| s.parent == parent && s.last < target)
+                .max_by_key(|s| s.last)?;
+            Some((scan.last, scan.index, scan.members))
         })
+    }
+
+    /// Mark the scan of `parent` that found `last` most recently used.
+    pub(crate) fn touch(document: usize, parent: usize, last: usize) {
+        MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            let Some(state) = m.as_mut().filter(|s| s.document == document) else {
+                return;
+            };
+            if let Some(at) = state
+                .scans
+                .iter()
+                .position(|s| s.parent == parent && s.last == last)
+            {
+                let scan = state.scans.remove(at);
+                state.scans.push(scan);
+            }
+        });
+    }
+
+    /// [`nearest_before`], marked used (the tests' way to read a scan).
+    #[cfg(test)]
+    pub(crate) fn resume(
+        document: usize,
+        parent: usize,
+        target: usize,
+    ) -> Option<(usize, i64, bool)> {
+        let found = nearest_before(document, parent, target)?;
+        touch(document, parent, found.0);
+        Some(found)
     }
 
     /// The element of `parent` a scan found -- its node id and index -- that
@@ -8990,13 +9020,15 @@ mod slot_memo {
         Guard
     }
 
-    pub(crate) fn resume(
+    pub(crate) fn nearest_before(
         _document: usize,
         _parent: usize,
         _target: usize,
     ) -> Option<(usize, i64, bool)> {
         None
     }
+
+    pub(crate) fn touch(_document: usize, _parent: usize, _last: usize) {}
 
     pub(crate) fn resume_back(
         _document: usize,
@@ -27395,24 +27427,27 @@ fn resumed_slot<C: DocumentCursor>(c: &C, parent: &C) -> Option<CursorSlot<C>> {
     let document = c.document_token();
     let parent_id = parent.node_id();
     let target = c.node_id();
-    let before = slot_memo::resume(document, parent_id, target);
+    let before = slot_memo::nearest_before(document, parent_id, target);
     // A scan remembered after `c` is stepped back from when it is nearer than
     // the one before it (#4164): two fan-outs at distant offsets each keep
     // their own, and a descending pair would otherwise scan forward from the
-    // far, lower one. When the walk declines, the forward resume decides.
+    // far, lower one. Nearer by node id, which is only a proxy for elements;
+    // the walk gates itself on its own estimate and bound, and when it
+    // declines the forward resume decides.
     if C::STEPS_BACK {
-        // `map_or(true, ..)`, not `is_none_or`: the MSRV is 1.73.
-        let nearer = before.map_or(true, |(low, _, _)| {
-            slot_memo::resume_back(document, parent_id, target)
-                .is_some_and(|(high, _)| high - target < target - low)
-        });
-        if nearer {
-            if let Some(slot) = resumed_slot_back(c, parent) {
-                return Some(slot);
+        if let Some((high, index)) = slot_memo::resume_back(document, parent_id, target) {
+            // `map_or(true, ..)`, not `is_none_or`: the MSRV is 1.73.
+            if before.map_or(true, |(low, _, _)| high - target < target - low) {
+                if let Some(slot) = resumed_slot_back(c, parent, high, index) {
+                    return Some(slot);
+                }
             }
         }
     }
     let (last, index, members) = before?;
+    // Only a scan the read resumes from counts as used: one the walk back
+    // replaced instead would otherwise outlive its sibling in the LRU order.
+    slot_memo::touch(document, parent_id, last);
     let mut cursor = c.at_node_id(last).and_then(|l| l.next_element());
     if members {
         while let Some(kc) = cursor {
@@ -27459,8 +27494,9 @@ fn resumed_slot<C: DocumentCursor>(c: &C, parent: &C) -> Option<CursorSlot<C>> {
     None
 }
 
-/// The slot of `c` in `parent` when a scan of `parent` remembers an element
-/// *after* `c` (#4101): step back from it with
+/// The slot of `c` in `parent`, given the element a scan of `parent` remembers
+/// *after* `c` (`last`, at `index`; #4101, the nearest such scan, #4164): step
+/// back from it with
 /// [`prev_element`](DocumentCursor::prev_element), `O(distance)`, where the
 /// scan from the first element is `O(index of c)`. Elements only: a mapping's
 /// scan keeps no member index to bound the walk with.
@@ -27476,14 +27512,15 @@ fn resumed_slot<C: DocumentCursor>(c: &C, parent: &C) -> Option<CursorSlot<C>> {
 /// wildly in size wastes at most that many steps, and `None` (the scan from
 /// the first element then decides) also when the chain passes `c` without
 /// meeting it.
-fn resumed_slot_back<C: DocumentCursor>(c: &C, parent: &C) -> Option<CursorSlot<C>> {
-    if !C::STEPS_BACK {
-        return None;
-    }
+fn resumed_slot_back<C: DocumentCursor>(
+    c: &C,
+    parent: &C,
+    last: usize,
+    index: i64,
+) -> Option<CursorSlot<C>> {
     let document = c.document_token();
     let parent_id = parent.node_id();
     let target = c.node_id();
-    let (last, index) = slot_memo::resume_back(document, parent_id, target)?;
     let bound = (index / 2).min(SLOT_MEMO_MAX_BACK);
     let span = last.checked_sub(parent_id).filter(|s| *s > 0)?;
     let estimate = u128::try_from(index).ok()? * u128::try_from(last - target).ok()? / span as u128;
@@ -27524,11 +27561,12 @@ fn resumed_slot_back<C: DocumentCursor>(c: &C, parent: &C) -> Option<CursorSlot<
 /// nothing to resume from), remembering where the scan ends for the next
 /// (#3702).
 ///
-/// A read before the remembered element steps back from it when the format can
+/// A read before a remembered element steps back from it when the format can
 /// ([`resumed_slot_back`], #4101); when it cannot, or the walk is longer than
-/// the scan from the first element, this scan replaces the memo: a pipe that
-/// alternates a read near the start with a read near the end gets no help, as
-/// it got none before.
+/// the scan from the first element, this scan is added beside the parent's
+/// others (#4164: two fan-outs at distant offsets each keep their own, so a
+/// pipe that alternates a read near the start with a read near the end is
+/// linear), evicting the parent's least recently used if it holds two.
 fn element_slot_resumable<C: DocumentCursor>(
     c: &C,
     parent: &C,
@@ -51790,6 +51828,81 @@ mod tests {
                 .all(|(_, e)| *e == Some((2_000, 3))),
             "{listed:?}"
         );
+    }
+
+    /// #4164: a parent holding two scans does not cost the table its other
+    /// parents: a wide matrix read in order -- an outer array and an inner
+    /// array per row, `path` climbing both -- stays linear in its cells.
+    // The memo these pin is `std`-only: `no_std` has no `thread_local!`.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_wide_matrix_slot_reads_stay_linear_with_two_scans_per_parent_4164() {
+        let rows = 100usize;
+        let doc = format!(
+            "[{}]",
+            (0..rows)
+                .map(|r| format!(
+                    "[{}]",
+                    (0..rows)
+                        .map(|c| (r * rows + c).to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        for filter in [
+            "[.[] | .[] | tostring | path] | length",
+            "[(length/2|floor) as $h | range(0;$h) as $i | (getpath([$i]), getpath([$i+$h])) | .[] | tostring | path] | length",
+        ] {
+            let (scanned_before, _) = slot_memo::work();
+            let (out, control) = drive_each_sink::<JqSemantics>(doc.as_bytes(), filter);
+            assert!(control.is_none(), "{filter}: {control:?}");
+            assert_eq!(out, [OwnedValue::Int((rows * rows) as i64)], "{filter}");
+            let scanned = slot_memo::work().0 - scanned_before;
+            // The cells cost what one scan per parent made them cost (~11 per
+            // cell: each row's first 32 elements are read from its start). Were
+            // the outer array's scan evicted by each row's inner scans, its slot
+            // alone would add ~rows^3 / 4 visits.
+            assert!(
+                scanned < 12 * rows * rows,
+                "{filter}: visited {scanned} elements over {} cells",
+                rows * rows
+            );
+        }
+    }
+
+    /// #4164: looking up the scan to resume from does not mark it used --
+    /// the read may be served by the other scan of the parent instead -- and
+    /// `touch` does.
+    // The memo these pin is `std`-only: `no_std` has no `thread_local!`.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_slot_memo_lookup_is_read_only_until_touched_4164() {
+        let standing = |parent: usize| {
+            let mut lasts = Vec::new();
+            let _ = slot_memo::find(1, |p, last, _, _, _| {
+                if p == parent {
+                    lasts.push(last);
+                }
+                None::<()>
+            });
+            lasts
+        };
+        let _scope = slot_memo::enter(1);
+        slot_memo::remember(1, 7, 100, 40, Some(101), false, None);
+        slot_memo::remember(1, 7, 900, 800, Some(901), false, None);
+        // Looking up 900 leaves 100 the parent's least recently used ...
+        assert_eq!(
+            slot_memo::nearest_before(1, 7, 1_000),
+            Some((900, 800, false))
+        );
+        slot_memo::remember(1, 7, 400, 300, Some(401), false, None);
+        assert_eq!(standing(7), [900, 400], "100 was the least recently used");
+        // ... and touching it makes the other one the oldest.
+        slot_memo::touch(1, 7, 900);
+        slot_memo::remember(1, 7, 450, 350, Some(451), false, None);
+        assert_eq!(standing(7), [900, 450], "400 was the least recently used");
     }
 
     /// #3702: the memo keeps the parents a pipe is still reading. Least
