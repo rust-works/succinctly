@@ -26711,7 +26711,7 @@ fn object_construction_generic<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
-    if super::eval::yq_collects_bare::<S>(entries) {
+    if super::eval::yq_collects_object::<S>(entries) {
         return collect_object_generic::<S, V>(entries, &value, optional, cursor);
     }
     if let Some(object) = lazy_object_generic::<S, V>(entries, &value, optional, cursor) {
@@ -26749,7 +26749,7 @@ fn object_construction_sink_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
-    if super::eval::yq_collects_bare::<S>(entries) {
+    if super::eval::yq_collects_object::<S>(entries) {
         let collected = collect_object_generic::<S, V>(entries, &value, optional, cursor);
         return drain_result_generic::<V>(collected, sink);
     }

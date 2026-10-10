@@ -64,6 +64,50 @@ fn splat(node: &OwnedValue) -> Vec<OwnedValue> {
     }
 }
 
+/// [`collect_object`] for a construction of pairs only (#4193): the same fold, without
+/// wrapping each pair's maps as a union node and splatting them back out.
+///
+/// Every pair is one child of its node, so `N` is 1 and the size check cannot fail; the
+/// aggregate is the first pair's maps, and each later pair multiplies into it. A pair
+/// with no maps empties the aggregate, and the next one seeds it afresh -- the restart
+/// `collect_object`'s general loop describes -- so `{"a": 1, "b": empty, "c": 3}` is
+/// `c: 3` and a trailing empty pair leaves nothing.
+fn fold_pairs<S: EvalSemantics>(entries: Vec<UnionEntry>) -> Result<Vec<OwnedValue>, EvalError> {
+    let mut aggregate: Vec<OwnedValue> = Vec::new();
+    for entry in entries {
+        if let UnionEntry::Pair(maps) = entry {
+            if aggregate.is_empty() {
+                aggregate = maps;
+                continue;
+            }
+            // One map meeting one map is the common case. Moving the held map in, not
+            // a clone of it, leaves its storage unshared so the merge extends it in place
+            // instead of copying it once per pair.
+            if let ([_], [_]) = (aggregate.as_slice(), maps.as_slice()) {
+                let mut maps = maps;
+                if let (Some(held), Some(addition)) = (aggregate.pop(), maps.pop()) {
+                    aggregate.push(arith_mul::<S>(held, addition, MergeFlags::default())?);
+                }
+                continue;
+            }
+            let mut next: Vec<OwnedValue> = Vec::new();
+            for held in &aggregate {
+                next.try_reserve(maps.len())
+                    .map_err(|_| cannot_reserve_cross_product(&[aggregate.len(), maps.len()]))?;
+                for addition in &maps {
+                    next.push(arith_mul::<S>(
+                        held.clone(),
+                        addition.clone(),
+                        MergeFlags::default(),
+                    )?);
+                }
+            }
+            aggregate = next;
+        }
+    }
+    Ok(aggregate)
+}
+
 /// `collectObjectOperator` over the union of `entries`, evaluated for one input.
 ///
 /// `CREATE_MAP` wraps a pair's maps in a one-element sequence (one inner
@@ -75,6 +119,9 @@ fn splat(node: &OwnedValue) -> Vec<OwnedValue> {
 pub(crate) fn collect_object<S: EvalSemantics>(
     entries: Vec<UnionEntry>,
 ) -> Result<Vec<OwnedValue>, EvalError> {
+    if !entries.is_empty() && entries.iter().all(|e| matches!(e, UnionEntry::Pair(_))) {
+        return fold_pairs::<S>(entries);
+    }
     let mut union: Vec<OwnedValue> = vec_with_capacity(entries.len());
     for entry in entries {
         match entry {

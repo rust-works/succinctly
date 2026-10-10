@@ -61014,6 +61014,92 @@ fn test_object_construction_repeated_key_deep_merges_4182() -> Result<()> {
     Ok(())
 }
 
+/// Pinned yq v4.53.3: a `key: value` pair of `{...}` whose key or value yields
+/// nothing contributes no map, and `COLLECT_OBJECT` folds what is left -- an empty
+/// pair empties everything before it, so a trailing one empties the lot (#4193).
+/// jq's cross product would end the whole construction at the first empty entry.
+/// Every row was captured from the pinned binary, `-p=json -o=json -I=0`.
+#[test]
+fn test_object_construction_empty_operand_4193() -> Result<()> {
+    let args = &["-p=json", "-o=json", "-I=0"];
+    let input = r#"{"k":"a","v":[{"p":1,"q":5},{"p":2,"q":0}]}"#;
+    for (filter, expected) in [
+        // A pair with no maps empties everything folded before it, and a trailing one empties the lot:
+        (
+            r#"{"a":(.k|select(false)),"b":2,"c":3}"#,
+            "{\"b\":2,\"c\":3}\n",
+        ),
+        (r#"{"a":1,"b":(.k|select(false)),"c":3}"#, "{\"c\":3}\n"),
+        (r#"{"a":1,"b":2,"c":(.k|select(false))}"#, ""),
+        (
+            r#"{"a":(.k|select(false)),"b":(.k|select(false)),"c":3}"#,
+            "{\"c\":3}\n",
+        ),
+        (
+            r#"{"a":1,"b":(.k|select(false)),"c":(.k|select(false)),"d":4}"#,
+            "{\"d\":4}\n",
+        ),
+        (r#"{"a":(1,2),"b":(.k|select(false)),"c":3}"#, "{\"c\":3}\n"),
+        (r#"{"a":(1,2),"b":3,"c":(.k|select(false))}"#, ""),
+        // A computed key can be the empty operand, and fan-out entries around it still multiply:
+        (r#"{(.k|select(false)):1,"b":2}"#, "{\"b\":2}\n"),
+        (r#"{"a":1,(.k|select(false)):1,"b":2}"#, "{\"b\":2}\n"),
+        (
+            r#"{"a":1,"b":(5,6),"c":(.k|select(false)),"d":(7,8)}"#,
+            "{\"d\":7}\n{\"d\":8}\n",
+        ),
+        // A repeated key still merges around the empty pair; a lone empty pair is nothing; an all-total construction is untouched:
+        (
+            r#"{"a":{"x":1},"b":(.k|select(false)),"a":{"y":2}}"#,
+            "{\"a\":{\"y\":2}}\n",
+        ),
+        (r#"{"a":(.k|select(false))}"#, ""),
+        (r"{(.k|select(false)):1}", ""),
+        (r#"{"a":1,"b":2}"#, "{\"a\":1,\"b\":2}\n"),
+        (
+            r#"{"a":(.v|map(.p)),"b":(.k|length),"c":(.k // "z")}"#,
+            "{\"a\":[1,2],\"b\":1,\"c\":\"a\"}\n",
+        ),
+        // A pair that cannot be empty but is not provably total takes the same route
+        // and must fold exactly as the fan-out would.
+        (
+            r#"{"a":1,"b":(.k|select(true)),"c":.v[0].p}"#,
+            "{\"a\":1,\"b\":\"a\",\"c\":1}\n",
+        ),
+        (
+            r#"{"a":{"x":1},"b":(.k|select(true)),"a":{"y":2}}"#,
+            "{\"a\":{\"x\":1,\"y\":2},\"b\":\"a\"}\n",
+        ),
+        (
+            r#"{"a":(1,2),"b":(.k|select(true)),"c":(3,4)}"#,
+            "{\"a\":1,\"b\":\"a\",\"c\":3}\n{\"a\":1,\"b\":\"a\",\"c\":4}\n{\"a\":2,\"b\":\"a\",\"c\":3}\n{\"a\":2,\"b\":\"a\",\"c\":4}\n",
+        ),
+        // Over a stream of inputs. yq folds those jointly (#4184); these two
+        // rows are ones where that agrees with a fold per record.
+        (
+            r#".v[] | {"p": .p, "q": (.q | select(. > 1)), "r": 3}"#,
+            "{\"p\":1,\"q\":5,\"r\":3}\n{\"r\":3}\n",
+        ),
+        (
+            r#".v[] | {"r": 3, "p": .p, "q": (.q | select(. > 1))}"#,
+            "{\"r\":3,\"p\":1,\"q\":5}\n",
+        ),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, input, args)?,
+            (expected.into(), String::new(), 0),
+            "{filter}"
+        );
+    }
+    // yq evaluates every entry before it folds any, so an empty pair does not
+    // hide the error of an entry after it (jq stops at the empty one).
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr(r#"{"a":(.k|select(false)),"b":error("boom")}"#, input, args)?;
+    assert_eq!((stdout.as_str(), code), ("", 1));
+    assert!(stderr.contains("boom"), "{stderr}");
+    Ok(())
+}
+
 /// Pinned yq v4.53.3: an operand with no output is not the same as no operator
 /// (#4139). `A as $v | B` runs `B` once, with `$v` unset, when `A` has no output;
 /// an empty index operand in `.[E]` stands for every child of the operand, which
