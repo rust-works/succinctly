@@ -8984,28 +8984,46 @@ mod slot_memo {
             let Some(state) = m.as_mut().filter(|s| s.document == document) else {
                 return;
             };
-            // The parent's extent is a fact about the parent, so any of its
-            // scans can hand it on.
-            let extent = state
-                .scans
-                .iter()
-                .find(|s| s.parent == parent)
-                .and_then(|s| s.extent);
-            // The scan resumed from goes, and so does any scan already at
-            // `last` (a restart can leave one right after the one resumed
-            // from): two scans of a parent never describe the same element.
-            let before = state.scans.len();
-            state
-                .scans
-                .retain(|s| !(s.parent == parent && (Some(s.last) == replaces || s.last == last)));
-            if state.scans.len() == before {
-                if state.scans.iter().filter(|s| s.parent == parent).count() == PER_PARENT {
-                    if let Some(at) = state.scans.iter().position(|s| s.parent == parent) {
-                        state.scans.remove(at);
+            // One pass over the table: this runs for every element a fan-out
+            // advances to. The parent's extent is a fact about the parent, so
+            // any of its scans can hand it on; the scan resumed from goes, and
+            // so does any scan already at `last` (a restart can leave one right
+            // after the one resumed from): two scans of a parent never describe
+            // the same element.
+            let mut extent = None;
+            let mut kept = 0;
+            let mut superseded = None;
+            let mut superseded_twice = false;
+            for (at, scan) in state.scans.iter().enumerate() {
+                if scan.parent != parent {
+                    continue;
+                }
+                kept += 1;
+                extent = extent.or(scan.extent);
+                if Some(scan.last) == replaces || scan.last == last {
+                    if superseded.is_none() {
+                        superseded = Some(at);
+                    } else {
+                        superseded_twice = true;
                     }
                 }
-                if state.scans.len() == CAPACITY {
-                    state.scans.remove(0);
+            }
+            match superseded {
+                Some(at) if !superseded_twice => {
+                    state.scans.remove(at);
+                }
+                Some(_) => state.scans.retain(|s| {
+                    !(s.parent == parent && (Some(s.last) == replaces || s.last == last))
+                }),
+                None => {
+                    if kept == PER_PARENT {
+                        if let Some(at) = state.scans.iter().position(|s| s.parent == parent) {
+                            state.scans.remove(at);
+                        }
+                    }
+                    if state.scans.len() == CAPACITY {
+                        state.scans.remove(0);
+                    }
                 }
             }
             state.scans.push(Scan {
