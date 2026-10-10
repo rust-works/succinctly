@@ -5105,7 +5105,7 @@ fn comma_array_generic<S: EvalSemantics, V: DocumentValue>(
     match run_comma_branches::<S, V>(&mut array, exprs, tail, guarded, value, optional, cursor) {
         BranchesEnd::Done => Some(array.finish::<S>()),
         BranchesEnd::Escape(escape) => Some(escape),
-        BranchesEnd::Decline => None,
+        BranchesEnd::Decline => None, // patchcov: coverage tolerate-line reason="unreachable: a guarded group is admitted only over navigation branches, which answer document nodes or owned values and never the lazy result guarded_branch declines on; kept as the route's own decline should a navigation shape that answers one be admitted (#4294)"
     }
 }
 
@@ -5141,7 +5141,7 @@ fn run_comma_branches<S: EvalSemantics, V: DocumentValue>(
         let mut ends_group = false;
         if guarded {
             let Some((kept, ends)) = guarded_branch(result) else {
-                return BranchesEnd::Decline;
+                return BranchesEnd::Decline; // patchcov: coverage tolerate-line reason="unreachable: a guarded group is admitted only over navigation branches, which answer document nodes or owned values and never the lazy result guarded_branch declines on; kept as the route's own decline should a navigation shape that answers one be admitted (#4294)"
             };
             (result, ends_group) = (kept, ends);
         }
@@ -5612,7 +5612,7 @@ fn comma_stage_array_generic<S: EvalSemantics, V: DocumentValue>(
     ) {
         BranchesEnd::Done => None,
         BranchesEnd::Escape(escape) => Some(Some(escape)),
-        BranchesEnd::Decline => Some(None),
+        BranchesEnd::Decline => Some(None), // patchcov: coverage tolerate-line reason="unreachable: a guarded group is admitted only over navigation branches, which answer document nodes or owned values and never the lazy result guarded_branch declines on; kept as the route's own decline should a navigation shape that answers one be admitted (#4294)"
     };
     match head {
         GenericResult::OneCursor(node) => {
@@ -13359,39 +13359,31 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             // only where something reads it. yq's printer materializes a
             // `LazySeq` anyway, so yq keeps the owned route below.
             if S::TAG == EvalTag::Jq {
-                match comma_group(inner) {
-                    Some((exprs, false)) => {
-                        // An unguarded group never declines.
-                        if let Some(result) =
-                            comma_array_generic::<S, V>(exprs, &[], false, &value, optional, cursor)
-                        {
-                            return result;
-                        }
-                    }
-                    // #4294: a `?` around navigation branches, `[(.a, .b)?]`.
-                    Some((exprs, true))
-                        if exprs.iter().all(array_route_stage_is_pure_navigation) =>
+                // An unguarded `,` body never declines; a `?` around
+                // navigation branches (`[(.a, .b)?]`, #4294) may.
+                let body = match comma_group(inner) {
+                    Some((exprs, guarded))
+                        if !guarded || exprs.iter().all(array_route_stage_is_pure_navigation) =>
                     {
-                        if let Some(result) =
-                            comma_array_generic::<S, V>(exprs, &[], true, &value, optional, cursor)
-                        {
-                            return result;
-                        }
+                        comma_array_generic::<S, V>(exprs, &[], guarded, &value, optional, cursor)
                     }
-                    _ => {}
-                }
+                    _ => None,
+                };
                 // #3476: the same body behind a pipe, `[(., .) | .data]`.
-                if let Some(split) = split_comma_head(inner) {
-                    if let Some(result) = comma_array_generic::<S, V>(
-                        split.branches,
-                        split.tail,
-                        split.guarded,
-                        &value,
-                        optional,
-                        cursor,
-                    ) {
-                        return result;
-                    }
+                let body = body.or_else(|| {
+                    split_comma_head(inner).and_then(|split| {
+                        comma_array_generic::<S, V>(
+                            split.branches,
+                            split.tail,
+                            split.guarded,
+                            &value,
+                            optional,
+                            cursor,
+                        )
+                    })
+                });
+                if let Some(result) = body {
+                    return result;
                 }
                 // #3922: and behind a pipe whose head is not the `,`,
                 // `[.[] | ., .]`.
