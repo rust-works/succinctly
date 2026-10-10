@@ -5057,15 +5057,24 @@ $ echo $?
   `b: 2`, `{"a": 1, "b": empty, "c": 3}` is `c: 3`, and `{"a": 1, "b": empty}` is nothing, where
   jq (and this fan-out before #4193) ends the whole construction at the first empty entry. yq
   also evaluates every entry before it folds, so `{"a": empty, "b": error("boom")}` raises
-  `boom` rather than printing nothing. Whether an operand is empty is only known by running
-  it, so a construction takes this route unless every operand is provably total
-  (`yields_at_least_one_value`: literals, variables, field/index paths, `length`, `map(..)`,
-  operators and pipes of those, ...); a construction of those keeps the fan-out and costs the
-  same as before. jq mode never takes it. Two shapes stay on the fan-out although yq folds
-  them: `$x` with no `as` binding it (yq yields nothing for it, so `{"a": 1, "b": $x, "c": 3}`
-  is `c: 3` there and nothing here) -- a variable is judged total because a bound one is by
-  far the usual case -- and a `select(.>0)` over an array element inside a pair, which yq
-  gives no maps although every element passes (#4239).
+  `boom` rather than printing nothing. An empty operand always empties the cross product, and when
+  none is empty the two are the same thing, so a construction whose operands might be empty is built
+  as the cross product first and rebuilt as the fold only when that comes out empty (#4240): a record
+  pays the fold only if its construction is empty. A construction whose operands are all provably
+  total (`yields_at_least_one_value`: literals, variables, `length`, `map(..)`, operators and pipes
+  of those, ...) is never rebuilt. A path is not total -- yq yields nothing, not `null`, for a key
+  or an index applied to a string, number or boolean, so `{"a": .m.id, "b": .n}` over `{m: s, n: 2}`
+  is `b: 2` -- and nor is anything else that can come back empty (`select`, `.[]`, `?`). An operand
+  that might be empty and has a side effect (`debug`, `stderr`, `input`, a user function) goes straight
+  to the fold rather than run twice. Cost, M4 Pro, interleaved, 7 and 14 MB `users` documents,
+  against the fold-first route #4193 shipped: a `select` in a pair -5% to -8% (and -1% to +3% against
+  the fan-out it replaced); a construction that is empty for every record is built twice, +54%
+  (`.users[] | {"n": .name, "s": (.score | select(. > 1e8))}`). jq mode never takes the fold.
+  Two shapes stay on the fan-out although yq folds them: `$x` with no `as` binding it (yq
+  yields nothing for it, so `{"a": 1, "b": $x, "c": 3}` is `c: 3` there and nothing here) -- a
+  variable is judged total because a bound one is by far the usual case -- and a `select(.>0)`
+  over an array element inside a pair, which yq gives no maps although every element passes
+  (#4239).
 
 Residual divergences remain, all in cases yq itself reaches through its node model:
 

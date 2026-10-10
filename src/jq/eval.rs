@@ -4466,7 +4466,8 @@ fn eval_object_construction_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     eval_operand: &mut ObjectSlotEvaluator<'_>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    if yq_collects_object::<S>(entries) {
+    let route = yq_object_route::<S>(entries);
+    if route == ObjectRoute::Union {
         return eval_object_collect::<W, S>(entries, eval_operand, optional);
     }
     let mut objects = Vec::new();
@@ -4510,33 +4511,114 @@ fn eval_object_construction_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     }
 
+    if objects.is_empty() && route == ObjectRoute::FanoutThenUnion {
+        return eval_object_collect::<W, S>(entries, eval_operand, optional);
+    }
     owned_vec_to_result(objects)
 }
 
-/// Whether a `{...}` is built as yq's `COLLECT_OBJECT` rather than as the cross
-/// product of its `key: value` pairs: it holds a bare entry (#2783), or a pair
-/// whose key or value may yield nothing (#4193).
+/// How a `{...}` is built (see [`yq_object_route`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ObjectRoute {
+    /// The cross product of the pairs: jq, and yq while every operand is total.
+    Fanout,
+    /// `COLLECT_OBJECT` straight away: a bare entry (#2783), or an operand that might yield
+    /// nothing and has a side effect.
+    Union,
+    /// The cross product first, `COLLECT_OBJECT` when it is empty.
+    FanoutThenUnion,
+}
+
+/// Pick how a `{...}` is built: as the cross product of its `key: value` pairs, as yq's
+/// `COLLECT_OBJECT` over the union of its entries, or the first and then the second
+/// (#2783, #4193, #4240).
 ///
-/// yq evaluates every entry once and folds the entries' maps; a pair with no
-/// maps empties everything folded before it, so `{"a": empty, "b": 2}` is `b: 2`
-/// and `{"a": 1, "b": empty}` is nothing. The fan-out has no such rule -- an
-/// entry with no outputs ends the whole construction -- and it also stops
-/// evaluating at that entry, where yq goes on to raise the next entry's error.
-/// Whether an operand is empty is only known by running it, so the fan-out is
-/// kept for exactly the operands [`yields_at_least_one_value`] proves total:
-/// the common `{name: .name, n: (.xs | length)}` pays nothing for this.
+/// yq evaluates every entry once and folds the entries' maps; a pair with no maps empties
+/// everything folded before it, so `{"a": empty, "b": 2}` is `b: 2` and `{"a": 1, "b": empty}` is
+/// nothing. The cross product has no such rule -- an entry with no outputs ends the whole
+/// construction -- and it also stops evaluating at that entry, where yq goes on to raise the next
+/// entry's error. But an empty operand always empties the cross product, and when no operand is
+/// empty the two are the same thing, so a construction whose operands might be empty builds the
+/// cross product first and runs the fold only when that comes out empty
+/// ([`ObjectRoute::FanoutThenUnion`]). One whose operands are all provably total
+/// ([`yields_at_least_one_value`]) never needs the second look, and one that holds a side effect is
+/// not built twice: it goes straight to the fold.
 ///
-/// Only yq's parser builds [`ObjectKey::Bare`], and the `TAG` test is a
-/// compile-time constant that lets jq mode skip the scan entirely.
-pub(crate) fn yq_collects_object<S: EvalSemantics>(entries: &[super::expr::ObjectEntry]) -> bool {
-    S::TAG == EvalTag::Yq
-        && entries.iter().any(|entry| match &entry.key {
-            ObjectKey::Bare => true,
-            ObjectKey::Literal(_) => !yields_at_least_one_value(&entry.value),
-            ObjectKey::Expr(key) => {
-                !yields_at_least_one_value(key) || !yields_at_least_one_value(&entry.value)
-            }
+/// A path is not total: yq yields nothing, not `null`, for a key or an index applied to a string,
+/// number or boolean, and so does `succinctly yq`.
+///
+/// Only yq's parser builds [`ObjectKey::Bare`], and the `TAG` test is a compile-time constant that
+/// lets jq mode skip the scan entirely.
+pub(crate) fn yq_object_route<S: EvalSemantics>(
+    entries: &[super::expr::ObjectEntry],
+) -> ObjectRoute {
+    if S::TAG != EvalTag::Yq {
+        return ObjectRoute::Fanout;
+    }
+    // One pass, and no walk of an operand that is a plain path or literal: this runs once per
+    // input record, and the usual construction is nothing but those.
+    let (mut all_total, mut all_plain) = (true, true);
+    for entry in entries {
+        let key = match &entry.key {
+            ObjectKey::Bare => return ObjectRoute::Union,
+            ObjectKey::Literal(_) => None,
+            ObjectKey::Expr(key) => Some(&**key),
+        };
+        for operand in key.into_iter().chain(core::iter::once(&entry.value)) {
+            all_total &= yields_at_least_one_value(operand);
+            all_plain &= is_plain_navigation(operand);
+        }
+    }
+    if all_total {
+        return ObjectRoute::Fanout;
+    }
+    if all_plain || !entries.iter().any(operand_may_have_effect) {
+        ObjectRoute::FanoutThenUnion
+    } else {
+        ObjectRoute::Union
+    }
+}
+
+/// Whether a key or value of `entry` holds something that writes or reads outside the value:
+/// building the construction twice would do it twice. The visible effects the evaluator has are
+/// stderr writes, halting and consuming input; a user function is assumed to hold one.
+fn operand_may_have_effect(entry: &super::expr::ObjectEntry) -> bool {
+    let effectful = |expr: &Expr| {
+        super::walk::any_subexpr(expr, &mut |e| {
+            matches!(
+                e,
+                Expr::FuncCall { .. }
+                    | Expr::DefCall { .. }
+                    | Expr::Builtin(
+                        Builtin::Debug
+                            | Builtin::DebugMsg(_)
+                            | Builtin::Stderr
+                            | Builtin::Halt
+                            | Builtin::HaltError
+                            | Builtin::HaltErrorCode(_)
+                            | Builtin::Input
+                            | Builtin::Inputs
+                            | Builtin::InputLineNumber
+                    )
+            )
         })
+    };
+    effectful(&entry.value) || matches!(&entry.key, ObjectKey::Expr(key) if effectful(key))
+}
+
+/// A literal, `.`, or a chain of keys and indexes: it cannot have a side effect, which is all
+/// [`yq_object_route`] needs to know about it without walking it.
+fn is_plain_navigation(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_)
+        | Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Slice { .. } => true,
+        Expr::Paren(inner) => is_plain_navigation(inner),
+        Expr::Pipe(stages) => stages.iter().all(is_plain_navigation),
+        _ => false,
+    }
 }
 
 /// The object a construction's `(key, value)` pairs assemble into (#4182).
@@ -7064,9 +7146,43 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let mut slots: Vec<String> = alloc::vec![String::new(); parts.len()];
             each_string_parts::<W, S>(parts, value, optional, &mut slots, sink)
         }
-        Expr::Object(entries) if !yq_collects_object::<S>(entries) => {
+        Expr::Object(entries) => {
+            let route = yq_object_route::<S>(entries);
+            if route == ObjectRoute::Union {
+                return drain_result(
+                    eval_object_construction::<W, S>(entries, value, optional),
+                    sink,
+                );
+            }
             let mut acc = Vec::new();
-            each_object_entries::<W, S>(entries, value, optional, &mut acc, sink)
+            if route == ObjectRoute::Fanout {
+                return each_object_entries::<W, S>(entries, value, optional, &mut acc, sink);
+            }
+            // #4240: stream the cross product, and take the fold only when it delivered nothing.
+            let mut emitted = false;
+            let flow = each_object_entries::<W, S>(
+                entries,
+                value.clone(),
+                optional,
+                &mut acc,
+                &mut |item| {
+                    emitted = true;
+                    sink(item)
+                },
+            );
+            if emitted || !matches!(flow, Flow::Exhausted) {
+                return flow;
+            }
+            drain_result(
+                eval_object_collect::<W, S>(
+                    entries,
+                    &mut |expr| {
+                        stream_outputs::<_, S>(eval_single::<W, S>(expr, value.clone(), optional))
+                    },
+                    optional,
+                ),
+                sink,
+            )
         }
         // #2180 WP3. No `needs_path_context` gate, for the same reason
         // `eval_single`'s own `Expr::Foreach` arm has none: a query that
@@ -9018,7 +9134,7 @@ fn each_object_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         // The `Expr::Object` arm of `eval_each` leaves a construction holding a
         // bare entry to the eager fallback, which collects it.
-        ObjectKey::Bare => unreachable!("a bare entry is collected, not streamed"), // patchcov: coverage tolerate-line reason="unreachable: the Expr::Object arm of eval_each guards on yq_collects_object, so a bare entry never reaches the streaming fan-out (#2783)"
+        ObjectKey::Bare => unreachable!("a bare entry is collected, not streamed"), // patchcov: coverage tolerate-line reason="unreachable: the Expr::Object arm of eval_each sends a construction holding a bare entry down yq_object_route's Union route, so a bare entry never reaches the streaming fan-out (#2783)"
         ObjectKey::Expr(key_expr) => {
             let escape = StashedEscape::new();
             let flow = eval_each::<W, S>(key_expr, value.clone(), optional, &mut |item| {
@@ -31177,20 +31293,22 @@ pub(crate) fn yields_at_most_one_value(expr: &Expr) -> bool {
 }
 
 /// Whether `expr` produces at least one value whenever it does not raise: the
-/// converse of [`yields_at_most_one_value`]'s count, for [`yq_collects_object`].
+/// converse of [`yields_at_most_one_value`]'s count, for [`yq_object_route`].
 ///
-/// A wrong *admission* leaves the fan-out in place for a construction whose
-/// operand turns out to be empty -- today's answer, no worse -- and a wrong
-/// refusal costs the cheaper route, so the list is short and each entry is one
-/// whose arm in the evaluator never answers `None` for an input it accepts. A
-/// composite is admitted when the parts that must each produce do: a pipe,
-/// an operator, an index and a string interpolation fan out over every part,
-/// so one empty part empties the whole. `//` needs only its right side (an
-/// empty left falls through to it), `,` only one of its items.
+/// A wrong *admission* keeps the cross product for a construction whose operand turns out to be
+/// empty -- the answer #4193 replaced -- and a wrong refusal only costs the second look, so the
+/// list is short and each entry is one whose arm in the evaluator never answers `None` for an
+/// input it accepts. A composite is admitted when the parts that must each produce do: a pipe, an
+/// operator and a string interpolation fan out over every part, so one empty part empties the
+/// whole. `//` needs only its right side (an empty left falls through to it), `,` only one of its
+/// items.
 ///
-/// Refused on purpose: `select`, `empty`, `.[]`, `..`, `first`/`limit`, the
-/// type filters (`numbers`, `values`), anything under `?` or `try`, and every
-/// generator.
+/// **A path is refused** (`.a`, `.[0]`, `.[1:2]`, `.[E]`): yq yields nothing, not `null`, for a key
+/// or an index applied to a string, number or boolean, and so does `succinctly yq` (#4240), so
+/// `{"a": .m.id, "b": .n}` over a string `m` is `{"b": 2}`. Re-admitting one brings that back.
+///
+/// Also refused on purpose: `select`, `empty`, `.[]`, `..`, `first`/`limit`, the type filters
+/// (`numbers`, `values`), anything under `?` or `try`, and every generator.
 pub(crate) fn yields_at_least_one_value(expr: &Expr) -> bool {
     match expr {
         // A `$x` no `as` binds yields nothing in yq (it is not an error there), which
@@ -31201,14 +31319,12 @@ pub(crate) fn yields_at_least_one_value(expr: &Expr) -> bool {
         | Expr::Var(_)
         | Expr::TrackedVar(_)
         | Expr::Identity
-        | Expr::Field(_)
         | Expr::Loc { .. }
         | Expr::Env
         | Expr::Not
         | Expr::Format(_)
         // `[f]` collects every output of `f` into one array, empty included.
         | Expr::Array(_) => true,
-        Expr::Index { .. } | Expr::Slice { .. } => true,
         Expr::Paren(inner) | Expr::Negate(inner) => yields_at_least_one_value(inner),
         Expr::Pipe(stages) => stages.iter().all(yields_at_least_one_value),
         Expr::Comma(items) => items.iter().any(yields_at_least_one_value),
@@ -31232,9 +31348,6 @@ pub(crate) fn yields_at_least_one_value(expr: &Expr) -> bool {
             StringPart::Literal(_) => true,
             StringPart::Expr(inner) => yields_at_least_one_value(inner),
         }),
-        Expr::IndexExpr { target, key } => {
-            yields_at_least_one_value(target) && yields_at_least_one_value(key)
-        }
         // A nested construction is itself empty when one of its pairs is.
         Expr::Object(entries) => entries.iter().all(|entry| {
             yields_at_least_one_value(&entry.value)
@@ -136905,25 +137018,33 @@ mod touched_edge_cases_2999 {
         }
 
         // What decides it: `yields_at_least_one_value` must refuse every shape that
-        // can come back empty, and admit the common total ones so the fan-out stays.
-        let collects = |filter: &str| {
+        // can come back empty, and admit the total ones so the fan-out is all there is.
+        let route = |filter: &str| {
             let expr = parse_with_mode_and_extensions(filter, ParserMode::Yq, true).unwrap();
             let Expr::Object(entries) = expr else {
                 panic!("not a construction: {filter}")
             };
-            yq_collects_object::<YqSemantics>(&entries)
+            yq_object_route::<YqSemantics>(&entries)
         };
         for total in [
             r#"{"a": 1}"#,
-            r#"{"a": .k, "b": .v[0], "c": $__loc__}"#,
-            r"{(.k): .v}",
-            r#"{"n": (.v | length), "t": (.k | tostring), "m": (.v | map(. + 1))}"#,
-            r#"{"a": (.x // 1), "b": (.k | ascii_downcase), "c": "x\(.k)"}"#,
-            r#"{"a": (.v | sort_by(.)), "b": [.v[]], "c": {"d": .k}}"#,
+            r#"{"a": 1, "c": $__loc__, "d": (1 + 2)}"#,
+            r#"{"n": ("abc" | length), "m": ([1, 2] | map(. + 1))}"#,
+            r#"{"a": (1 // 2), "b": ("K" | ascii_downcase), "c": "x\(1)"}"#,
+            r#"{"a": ([3, 1] | sort_by(.)), "b": [.v[]], "c": {"d": 1}}"#,
             // One item of a comma that yields is enough.
-            r#"{"a": (.k, empty)}"#,
+            r#"{"a": (1, empty)}"#,
         ] {
-            assert!(!collects(total), "{total}");
+            assert_eq!(route(total), ObjectRoute::Fanout, "{total}");
+        }
+        // A path is not total: yq yields nothing, not null, for a key or an index on a scalar
+        // (#4240). Plain paths cost no walk to classify.
+        for path in [
+            r#"{"a": .k, "b": .v[0]}"#,
+            r"{(.k): .v}",
+            r#"{"a": .k.id, "b": .v[0].p}"#,
+        ] {
+            assert_eq!(route(path), ObjectRoute::FanoutThenUnion, "{path}");
         }
         for maybe_empty in [
             r#"{"a": empty}"#,
@@ -136937,13 +137058,45 @@ mod touched_edge_cases_2999 {
             r#"{"a": (.x // empty)}"#,
             r#"{"a": (empty, empty)}"#,
             r#"{"a": try .k}"#,
+            r#"{"n": (.v | length), "m": (.v | map(. + 1))}"#,
         ] {
-            assert!(collects(maybe_empty), "{maybe_empty}");
+            assert_eq!(
+                route(maybe_empty),
+                ObjectRoute::FanoutThenUnion,
+                "{maybe_empty}"
+            );
         }
-        // jq has no such rule: nothing there is ever collected.
+        // A bare entry is always folded, and so is an operand that might be empty and has a side
+        // effect, which building twice would run twice.
+        for union in [
+            r#"{"a": 1, "b"}"#,
+            r#"{"a": (.k | debug | select(.))}"#,
+            r#"{"a": (.k | stderr | select(.)), "b": 1}"#,
+            "{(.k | debug | select(.)): 1}",
+            r#"def f: debug; {"a": (.k | f | select(.))}"#,
+        ] {
+            let expr = parse_with_mode_and_extensions(union, ParserMode::Yq, true).unwrap();
+            let entries = match expr {
+                Expr::Object(entries) => entries,
+                Expr::FuncDef { then, .. } => match *then {
+                    Expr::Object(entries) => entries,
+                    other => panic!("{union}: {other:?}"),
+                },
+                other => panic!("{union}: {other:?}"),
+            };
+            assert_eq!(
+                yq_object_route::<YqSemantics>(&entries),
+                ObjectRoute::Union,
+                "{union}"
+            );
+        }
+        // jq has no such rule: its cross product is the answer whatever the operands are.
         let jq = parse_with_mode_and_extensions(r#"{"a": empty}"#, ParserMode::Jq, false).unwrap();
         let Expr::Object(entries) = jq else { panic!() };
-        assert!(!yq_collects_object::<JqSemantics>(&entries));
+        assert_eq!(
+            yq_object_route::<JqSemantics>(&entries),
+            ObjectRoute::Fanout
+        );
     }
 
     /// #4139: yq's `as` runs its body once, with the variable unset, when the

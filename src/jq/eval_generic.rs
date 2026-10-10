@@ -26711,7 +26711,8 @@ fn object_construction_generic<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
-    if super::eval::yq_collects_object::<S>(entries) {
+    let route = super::eval::yq_object_route::<S>(entries);
+    if route == super::eval::ObjectRoute::Union {
         return collect_object_generic::<S, V>(entries, &value, optional, cursor);
     }
     if let Some(object) = lazy_object_generic::<S, V>(entries, &value, optional, cursor) {
@@ -26733,6 +26734,10 @@ fn object_construction_generic<S: EvalSemantics, V: DocumentValue>(
     // prints `a: 1e+100`, as real yq does) -- since #2902 the
     // `Expr::Array`/`Expr::Comma` arms above do the same.
     match built {
+        // #4240: an empty cross product is where the fold may differ.
+        Ok(()) if objects.is_empty() && route == super::eval::ObjectRoute::FanoutThenUnion => {
+            collect_object_generic::<S, V>(entries, &value, optional, cursor)
+        }
         Ok(()) => owned_vec_to_generic_result(objects),
         Err(ObjectEscapeGeneric::Suppressed) => GenericResult::None,
         Err(ObjectEscapeGeneric::Control(control)) => partial_generic(objects, control),
@@ -26749,7 +26754,8 @@ fn object_construction_sink_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
-    if super::eval::yq_collects_object::<S>(entries) {
+    let route = super::eval::yq_object_route::<S>(entries);
+    if route == super::eval::ObjectRoute::Union {
         let collected = collect_object_generic::<S, V>(entries, &value, optional, cursor);
         return drain_result_generic::<V>(collected, sink);
     }
@@ -26757,7 +26763,45 @@ fn object_construction_sink_generic<S: EvalSemantics, V: DocumentValue>(
         return drain_result_generic::<V>(object, sink);
     }
     let mut acc = Vec::new();
+    if route == super::eval::ObjectRoute::FanoutThenUnion {
+        // #4240: stream the cross product, and take the fold only when it delivered nothing.
+        let mut counting = EmittedSink {
+            inner: &mut *sink,
+            emitted: false,
+        };
+        let flow = each_object_entries_generic::<S, V>(
+            entries,
+            value.clone(),
+            optional,
+            cursor,
+            &mut acc,
+            &mut counting,
+        );
+        if counting.emitted || !matches!(flow, Flow::Exhausted) {
+            return flow;
+        }
+        let collected = collect_object_generic::<S, V>(entries, &value, optional, cursor);
+        return drain_result_generic::<V>(collected, sink);
+    }
     each_object_entries_generic::<S, V>(entries, value, optional, cursor, &mut acc, sink)
+}
+
+/// A [`Sink`] that notes whether anything reached it, for a route that falls back when nothing
+/// did (#4240).
+struct EmittedSink<'a, V: DocumentValue> {
+    inner: &'a mut dyn Sink<V>,
+    emitted: bool,
+}
+
+impl<V: DocumentValue> Sink<V> for EmittedSink<'_, V> {
+    fn push(&mut self, item: GenericItem<V>) -> Demand {
+        self.emitted = true;
+        self.inner.push(item)
+    }
+
+    fn budget(&self) -> Budget {
+        self.inner.budget()
+    }
 }
 
 /// The generic twin of `eval::eval_object_collect`: object construction holding
