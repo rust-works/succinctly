@@ -48294,36 +48294,39 @@ fn source_destructures_register(source: &Expr, through_reduce: bool) -> bool {
         through_reduce,
         vars: Vec::new(),
         defs: Vec::new(),
+        installed: Vec::new(),
         calls: SPINE_CALL_BUDGET,
     };
     walk.reach(source) == Reach::Destructures
 }
 
-/// The variables `pattern` binds, borrowed. [`collect_pattern_var_names`] is the owned form.
-fn pattern_names<'e>(pattern: &'e Pattern, names: &mut Vec<&'e str>) {
+/// Calls `visit` with each variable `pattern` binds, in order. One traversal for
+/// [`collect_pattern_var_names`] (owned) and the spine walk (borrowed).
+fn visit_pattern_names<'e>(pattern: &'e Pattern, visit: &mut impl FnMut(&'e str)) {
     match pattern {
-        Pattern::Var(name) => names.push(name),
+        Pattern::Var(name) => visit(name),
         Pattern::Object(entries) => {
             for entry in entries {
                 // `{$b: P}` binds `$b` as well as what `P` binds (#2649).
                 if let Some(bind) = &entry.bind {
-                    names.push(bind);
+                    visit(bind);
                 }
-                pattern_names(&entry.pattern, names);
+                visit_pattern_names(&entry.pattern, visit);
             }
         }
         Pattern::Array(patterns) => {
             for pattern in patterns {
-                pattern_names(pattern, names);
+                visit_pattern_names(pattern, visit);
             }
         }
     }
 }
 
-/// How many `def` bodies one [`source_destructures_register`] walk reads through, over the
-/// whole walk (#4278): a chain or a fan of calls stops there and is read as possibly moving
-/// the register, as a call was before, so a recursive or exponential definition cannot make
-/// the walk run away. The same shape of budget [`entry_marker_shape_in`] keeps.
+/// How many distinct `def` bodies one [`source_destructures_register`] walk reads (#4278).
+/// Each body is read once ([`SpineDef::reach`]), so this bounds the definitions a walk
+/// explores, not the calls to them. Past it a call is read as destructuring: the source is
+/// routed, the loud direction, since reading it as opaque would leave a destructure behind it
+/// to the by-value drive, which answers where jq raises.
 const SPINE_CALL_BUDGET: u32 = 16;
 
 /// What a node on a fold source's spine does with jq's register ([`RegisterSpine::reach`]).
@@ -48345,6 +48348,11 @@ struct SpineDef<'e> {
     name: &'e str,
     body: &'e Expr,
     vars: usize,
+    /// The body's reach, once read: the scope is fixed per definition, so every call to it
+    /// reads the same, and `f | f | ... | f` costs one body. [`Reach::HandsOn`] while the
+    /// body is being read, so a recursive call is taken to hand the register on: the reading
+    /// that routes more, the loud direction.
+    reach: Option<Reach>,
 }
 
 /// The state of one [`source_destructures_register`] walk down a fold source's spine.
@@ -48357,6 +48365,9 @@ struct RegisterSpine<'e> {
     vars: Vec<(&'e str, bool)>,
     /// The no-argument definitions in scope on the spine, innermost last.
     defs: Vec<SpineDef<'e>>,
+    /// The reach of each installed call's body read so far, by body, with the same
+    /// in-progress rule as [`SpineDef::reach`].
+    installed: Vec<(*const Expr, Reach)>,
     /// What is left of [`SPINE_CALL_BUDGET`].
     calls: u32,
 }
@@ -48373,12 +48384,45 @@ impl<'e> RegisterSpine<'e> {
 
     /// Whether `e`, the bound expression of a bind, is the register on every output: what
     /// [`bind_hands_on_the_register`] (or, through a `reduce`, [`yields_only_the_register`])
-    /// accepts, or a `$var` the spine bound to the register (#4278).
+    /// accepts, or a variable that may hold it (#4278): one the spine bound to the register,
+    /// or one bound outside the source (substituted as a [`Expr::TrackedVar`] marker, at the
+    /// register or not: destructuring either is a tracked step jq raises on here), also
+    /// behind the wrappers that hand their operand's value on (`first($x)`, `$x?`, a comma
+    /// of them). A call returning `$x` is not read.
     fn binds_register(&self, e: &Expr) -> bool {
         match unwrap_paren(e) {
             Expr::Var(name) => self.holds_register(name),
+            Expr::TrackedVar(_) => true,
+            Expr::Comma(items) if items.iter().any(|item| self.binds_variable(item)) => {
+                items.iter().all(|item| self.binds_register(item))
+            }
+            Expr::FirstExpr(inner)
+            | Expr::LastExpr(inner)
+            | Expr::Optional(inner)
+            | Expr::Limit { expr: inner, .. }
+            | Expr::Label { body: inner, .. }
+                if self.binds_variable(inner) =>
+            {
+                self.binds_register(inner)
+            }
             _ if self.through_reduce => yields_only_the_register(e),
             _ => bind_hands_on_the_register(e),
+        }
+    }
+
+    /// Whether `e`'s outputs come from a variable leaf, through the wrappers
+    /// [`binds_register`](Self::binds_register) reads: the shapes it answers by the
+    /// variable, not by the `.` rules.
+    fn binds_variable(&self, e: &Expr) -> bool {
+        match unwrap_paren(e) {
+            Expr::Var(_) | Expr::TrackedVar(_) => true,
+            Expr::Comma(items) => items.iter().any(|item| self.binds_variable(item)),
+            Expr::FirstExpr(inner)
+            | Expr::LastExpr(inner)
+            | Expr::Optional(inner)
+            | Expr::Limit { expr: inner, .. }
+            | Expr::Label { body: inner, .. } => self.binds_variable(inner),
+            _ => false,
         }
     }
 
@@ -48386,23 +48430,26 @@ impl<'e> RegisterSpine<'e> {
     /// register. A destructuring alternative's names hold members. The first bare `$var`
     /// alternative holds `expr` when it matches, the register if [`binds_register`] says so;
     /// a later one only on a retry after the body raised (#4278), and is read as not the
-    /// register.
+    /// register. A name more than one alternative binds is one variable whose value depends
+    /// on which matched, so it may hold the register if any binding of it may (`. as $a ?//
+    /// {a:$a} | $a as {a:$b}`).
     ///
     /// [`binds_register`]: Self::binds_register
     fn chain_names(&self, expr: &Expr, patterns: &'e [Pattern]) -> Vec<(&'e str, bool)> {
         let mut register = self.binds_register(expr);
-        let mut names = Vec::new();
+        let mut names: Vec<(&'e str, bool)> = Vec::new();
+        let mut bind =
+            |name: &'e str, held: bool| match names.iter_mut().find(|(bound, _)| *bound == name) {
+                Some((_, any)) => *any |= held,
+                None => names.push((name, held)),
+            };
         for pattern in patterns {
             match pattern {
                 Pattern::Var(name) => {
-                    names.push((name.as_str(), register));
+                    bind(name, register);
                     register = false;
                 }
-                _ => {
-                    let mut members = Vec::new();
-                    pattern_names(pattern, &mut members);
-                    names.extend(members.into_iter().map(|name| (name, false)));
-                }
+                _ => visit_pattern_names(pattern, &mut |name| bind(name, false)),
             }
         }
         names
@@ -48417,20 +48464,48 @@ impl<'e> RegisterSpine<'e> {
         reach
     }
 
-    /// A call's body, read in the scope `def` names (its variables and definitions), or with no
-    /// variables at all for an installed call, whose definition site the walk never saw: a
-    /// variable it cannot see is read as not the register. Past the budget the call is opaque.
-    fn through_def(&mut self, body: &'e Expr, def: Option<(usize, usize)>) -> Reach {
+    /// The definition at `at` in [`defs`](Self::defs) called: its body read with the variables
+    /// bound around it and the definitions up to and including itself, once per walk.
+    fn through_def(&mut self, at: usize) -> Reach {
+        if let Some(reach) = self.defs[at].reach {
+            return reach;
+        }
         if self.calls == 0 {
-            return Reach::Opaque;
+            return Reach::Destructures;
         }
         self.calls -= 1;
-        let (vars, defs) = def.unwrap_or((0, self.defs.len()));
-        let vars_tail = self.vars.split_off(vars);
-        let defs_tail = self.defs.split_off(defs);
+        self.defs[at].reach = Some(Reach::HandsOn);
+        let SpineDef { body, vars, .. } = self.defs[at];
+        let vars_tail = self.vars.split_off(vars.min(self.vars.len()));
+        let defs_tail = self.defs.split_off(at + 1);
         let reach = self.reach(body);
         self.vars.extend(vars_tail);
         self.defs.extend(defs_tail);
+        self.defs[at].reach = Some(reach);
+        reach
+    }
+
+    /// An installed call's body, read once per walk with no spine variables or definitions:
+    /// resolution installed it where it was written, which the walk never saw, so a variable
+    /// it cannot see is read as not the register and its own calls are installed too.
+    fn through_installed(&mut self, body: &'e Expr) -> Reach {
+        let key: *const Expr = body;
+        if let Some(&(_, reach)) = self.installed.iter().find(|(seen, _)| *seen == key) {
+            return reach;
+        }
+        if self.calls == 0 {
+            return Reach::Destructures;
+        }
+        self.calls -= 1;
+        self.installed.push((key, Reach::HandsOn));
+        let vars = core::mem::take(&mut self.vars);
+        let defs = core::mem::take(&mut self.defs);
+        let reach = self.reach(body);
+        self.vars = vars;
+        self.defs = defs;
+        if let Some(entry) = self.installed.iter_mut().find(|(seen, _)| *seen == key) {
+            entry.1 = reach;
+        }
         reach
     }
 
@@ -48545,6 +48620,7 @@ impl<'e> RegisterSpine<'e> {
                         name,
                         body,
                         vars: self.vars.len(),
+                        reach: None,
                     });
                 }
                 let reach = self.reach(then);
@@ -48554,10 +48630,7 @@ impl<'e> RegisterSpine<'e> {
             Expr::FuncCall { name, args, .. } if args.is_empty() => {
                 // The definition itself stays in scope in its body, for a recursive call.
                 match self.defs.iter().rposition(|def| def.name == name) {
-                    Some(at) => {
-                        let SpineDef { body, vars, .. } = self.defs[at];
-                        self.through_def(body, Some((vars, at + 1)))
-                    }
+                    Some(at) => self.through_def(at),
                     None => Reach::Opaque,
                 }
             }
@@ -48565,7 +48638,7 @@ impl<'e> RegisterSpine<'e> {
                 // The body lives in the `Rc` the call holds, which outlives this walk's borrow
                 // of the call.
                 let body: &'e Expr = &def.body;
-                self.through_def(body, None)
+                self.through_installed(body)
             }
             Expr::Foreach {
                 input, patterns, ..
@@ -77403,10 +77476,8 @@ fn try_pattern_alternatives<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// Collect every variable name a pattern would bind, recursively.
 pub(crate) fn collect_pattern_var_names(pattern: &Pattern, names: &mut Vec<String>) {
     // `{$b: P}` binds both `$b` and what `P` binds (#2649), so the null short-circuit and
-    // `pattern_alternatives_var_names` see `$b` too. One traversal, [`pattern_names`].
-    let mut borrowed = Vec::new();
-    pattern_names(pattern, &mut borrowed);
-    names.extend(borrowed.into_iter().map(String::from));
+    // `pattern_alternatives_var_names` see `$b` too. One traversal, [`visit_pattern_names`].
+    visit_pattern_names(pattern, &mut |name| names.push(String::from(name)));
 }
 
 // #1368: this used to be `substitute_bindings`, a private fold over
