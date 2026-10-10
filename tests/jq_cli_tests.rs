@@ -122163,6 +122163,111 @@ fn test_swallowed_iteration_in_path_consumers_answers_what_it_did_3728() -> Resu
     ])
 }
 
+/// #4157: a `?`/`try` around `path(.[])` settles a scalar without stepping the `.[]`
+/// whose `Cannot iterate over ...` it drops, and still answers what it did.
+///
+/// Only the value boundaries recognise `path(.[])`; in path position `path(...)` is not a
+/// path expression, so `path(path(.[])?)` over a container still raises jq's path error and
+/// a scalar root still answers `[]`. The valid-JSON rows are jq 1.7.1's own; the rows jq
+/// cannot read were captured from the binary built from the parent commit and are identical
+/// on this one.
+#[test]
+fn test_swallowed_path_iteration_answers_what_it_did_4157() -> Result<()> {
+    const MIXED: &str = r#"[1,"a",null,true,[2],{"k":3}]"#;
+    assert_path_rows_3289(&[
+        (MIXED, "[.[] | path(.[])?]", "[[0],[\"k\"]]\n", "", 0),
+        (MIXED, "[.[] | (path(.[]))?]", "[[0],[\"k\"]]\n", "", 0),
+        (MIXED, "[.[] | try path(.[])]", "[[0],[\"k\"]]\n", "", 0),
+        (
+            MIXED,
+            "[.[] | try path(.[]) catch empty]",
+            "[[0],[\"k\"]]\n",
+            "",
+            0,
+        ),
+        (
+            MIXED,
+            "def opt(f): f?; [.[] | opt(path(.[]))]",
+            "[[0],[\"k\"]]\n",
+            "",
+            0,
+        ),
+        // A handler that is not `empty` still runs.
+        (
+            MIXED,
+            r#"[.[] | try path(.[]) catch "c"]"#,
+            "[\"c\",\"c\",\"c\",\"c\",[0],[\"k\"]]\n",
+            "",
+            0,
+        ),
+        (
+            MIXED,
+            "[.[] | [path(.[])?] | length]",
+            "[0,0,0,0,1,1]\n",
+            "",
+            0,
+        ),
+        (
+            MIXED,
+            "[limit(2; .[] | path(.[])?)]",
+            "[[0],[\"k\"]]\n",
+            "",
+            0,
+        ),
+        // The owned evaluator `paths(f)` runs its filter through.
+        (MIXED, "[paths(path(.[])?)]", "[[4],[5]]\n", "", 0),
+        (MIXED, "[.[] | paths(path(.[])?)]", "[]\n", "", 0),
+        // Path position: `path(...)` is not a path expression, so the boundary around it
+        // is not shortcut. A container's path is refused; a scalar root has none.
+        (
+            MIXED,
+            "[.[] | path(path(.[])?)]",
+            "",
+            "Invalid path expression with result [0]",
+            5,
+        ),
+        (
+            MIXED,
+            "[path(.[] | path(.[])?)]",
+            "",
+            "Invalid path expression with result [0]",
+            5,
+        ),
+        ("1", "[path(1 | path(.[])?)]", "[]\n", "", 0),
+        ("1", "[path(path(.[])?)]", "[]\n", "", 0),
+        // Documents jq cannot read: what `?` never swallows still escapes.
+        (
+            r#"["\ud800"]"#,
+            "[.[] | path(.[])?]",
+            "",
+            "invalid unicode escape sequence",
+            5,
+        ),
+        (
+            r#"["\ud800"]"#,
+            "[paths(path(.[])?)]",
+            "",
+            "invalid unicode escape sequence",
+            5,
+        ),
+        (
+            r#""\ud800""#,
+            "path(.[])?",
+            "",
+            "invalid unicode escape sequence",
+            5,
+        ),
+        (
+            "[1.2.3,[4]]",
+            "[.[] | path(.[])?]",
+            "",
+            "invalid numeric literal",
+            5,
+        ),
+        ("[tru]", "[.[] | path(.[])?]", "", "invalid boolean", 5),
+    ])
+}
+
 /// #4146: `error(msg)`'s message runs in path mode (`def error(msg): msg | error;`), so a
 /// message that navigates an input the register is not on raises jq's path error ahead of
 /// the `error`, and a `try` hands its handler that string, not the value the message would

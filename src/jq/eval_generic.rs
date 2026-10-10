@@ -1695,7 +1695,8 @@ fn scalar_decode_error<V: DocumentValue>(value: &V) -> Option<EvalError> {
 ///
 /// `Some(Ok(()))` is the swallowed `Cannot iterate over ...`; `Some(Err(e))` is
 /// the failure `?` never swallows, which [`scalar_decode_error`] names exactly
-/// as the `Iterate` arm does.
+/// as the `Iterate` arm does. The body is a bare `.[]` or `path(.[])` (#4157),
+/// which raise the same error over a scalar ([`value_swallowing_boundary`]).
 ///
 /// The cheap tests come first, and the shortcut is not taken in yq mode. The
 /// shape test is an O(1) match on the AST, so a body that is not a bare `.[]`
@@ -1716,7 +1717,7 @@ pub(crate) fn swallowed_scalar_iteration<S: EvalSemantics, V: DocumentValue>(
     catch: Option<&Expr>,
     value: &V,
 ) -> Option<Result<(), EvalError>> {
-    if !swallowing_boundary::<S>(expr, catch)
+    if !value_swallowing_boundary::<S>(expr, catch)
         || value.as_array().is_some()
         || value.as_object().is_some()
     {
@@ -1765,6 +1766,17 @@ pub(crate) fn caught_scalar_iteration<S: EvalSemantics, V: DocumentValue>(
 /// changed in one and left behind in another.
 pub(crate) fn swallowing_boundary<S: EvalSemantics>(expr: &Expr, catch: Option<&Expr>) -> bool {
     crate::jq::eval::try_swallows_scalar_iteration(expr, catch) && S::TAG != EvalTag::Yq
+}
+
+/// [`swallowing_boundary`] for a boundary at a *value* position, which also
+/// swallows `path(.[])` (#4157): [`swallowed_scalar_iteration`] and the owned
+/// front door. Not for the path walks -- [`swallowed_path_leaf`] keeps
+/// [`swallowing_boundary`], because `path(...)` is not a path expression there.
+pub(crate) fn value_swallowing_boundary<S: EvalSemantics>(
+    expr: &Expr,
+    catch: Option<&Expr>,
+) -> bool {
+    crate::jq::eval::try_swallows_scalar_value_iteration(expr, catch) && S::TAG != EvalTag::Yq
 }
 
 /// What stepping the scalar `node` (the value at `cursor`) with `.[]?` raises,
