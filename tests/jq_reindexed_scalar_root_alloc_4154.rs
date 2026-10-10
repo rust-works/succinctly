@@ -126,6 +126,11 @@ const N: usize = 2_000;
 /// row read three higher; before #4154 integers made 16-18.
 type Ceilings = [usize; 3];
 
+/// Without `std` there is no thread-local to keep a dropped document's index
+/// buffers in (#4217), so every crossing allocates them afresh: three more
+/// calls per member than the ceilings above, which are the pooled counts.
+const UNPOOLED: usize = if cfg!(feature = "std") { 0 } else { 3 };
+
 fn fixtures() -> Vec<(&'static str, String, Ceilings)> {
     let join = |parts: Vec<String>| parts.join(",");
     vec![
@@ -169,9 +174,10 @@ fn a_scalar_crossing_the_reindex_bridge_allocates_a_handful_of_times_4154() {
             let (cost, answered) = allocations_collecting(query, &json);
             assert_eq!(answered, answer, "{name}: `{query}`'s answer");
             assert!(
-                cost <= ceiling * N,
+                cost <= (ceiling + UNPOOLED) * N,
                 "{name}: `{query}` made {cost} allocator calls over {N} members \
-                 (allowing {ceiling} per member)"
+                 (allowing {} per member)",
+                ceiling + UNPOOLED
             );
         }
     }
