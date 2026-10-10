@@ -4770,9 +4770,6 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
             // this function's own stated safety goal.
             if args.null_input && !force_read_under_null_input {
                 jq::seed_remaining_inputs(Vec::new(), locations.exhausted(args.slurp));
-                if locations.eof_tail.is_some() {
-                    jq::count_reads_past_end();
-                }
             } else {
                 // Moves rather than clones: `inputs` isn't read again on
                 // this branch (the null-input arm below uses `OwnedValue::
@@ -11540,13 +11537,12 @@ mod tests {
             (format!("1\n{}2", spaces(5000)), None),
             (format!("1\n2{}", spaces(5000)), Some(1)),
         ] {
-            assert_eq!(
-                at(&[text.as_bytes()], false),
-                expected,
-                "{} bytes",
-                text.len()
-            );
+            let len = text.len();
+            assert_eq!(at(&[text.as_bytes()], false), expected, "{len} bytes");
         }
+        // No sources at all: nothing to complete.
+        assert_eq!(at(&[], false), Some(0));
+        assert_eq!(at(&[], true), Some(0));
         // `-R`: any byte after the last newline is a line the end completes.
         for (sources, expected) in [
             (vec![&b"a\nb"[..]], None),
