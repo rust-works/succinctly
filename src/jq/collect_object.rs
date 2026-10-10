@@ -76,13 +76,12 @@ pub(crate) fn collect_object<S: EvalSemantics>(
     entries: Vec<UnionEntry>,
 ) -> Result<Vec<OwnedValue>, EvalError> {
     if !entries.is_empty() && entries.iter().all(|e| matches!(e, UnionEntry::Pair(_))) {
-        let lists = entries
-            .into_iter()
-            .filter_map(|entry| match entry {
-                UnionEntry::Pair(maps) => Some(maps),
-                UnionEntry::Bare(_) => None,
-            })
-            .collect();
+        let mut lists = vec_with_capacity(entries.len());
+        for entry in entries {
+            if let UnionEntry::Pair(maps) = entry {
+                lists.push(maps);
+            }
+        }
         return collect_pairs::<S>(lists);
     }
     collect_union::<S>(entries)
@@ -114,21 +113,32 @@ fn collect_pairs<S: EvalSemantics>(
             }
             continue;
         }
-        let mut next: Vec<OwnedValue> = Vec::new();
-        for held in &aggregate {
-            next.try_reserve(maps.len())
-                .map_err(|_| cannot_reserve_cross_product(&[aggregate.len(), maps.len()]))?;
-            for addition in &maps {
-                next.push(arith_mul::<S>(
-                    held.clone(),
-                    addition.clone(),
-                    MergeFlags::default(),
-                )?);
-            }
-        }
-        aggregate = next;
+        aggregate = cross_multiply::<S>(&aggregate, &maps)?;
     }
     Ok(aggregate)
+}
+
+/// Each of `held` multiplied by each of `additions`, `held` major.
+///
+/// The product of two data-controlled lengths: reserved a row at a time, so an oversized one is
+/// refused rather than aborting the process.
+fn cross_multiply<S: EvalSemantics>(
+    held: &[OwnedValue],
+    additions: &[OwnedValue],
+) -> Result<Vec<OwnedValue>, EvalError> {
+    let mut next: Vec<OwnedValue> = Vec::new();
+    for left in held {
+        next.try_reserve(additions.len())
+            .map_err(|_| cannot_reserve_cross_product(&[held.len(), additions.len()]))?;
+        for addition in additions {
+            next.push(arith_mul::<S>(
+                left.clone(),
+                addition.clone(),
+                MergeFlags::default(),
+            )?);
+        }
+    }
+    Ok(next)
 }
 
 fn collect_union<S: EvalSemantics>(entries: Vec<UnionEntry>) -> Result<Vec<OwnedValue>, EvalError> {
@@ -175,22 +185,7 @@ fn collect_union<S: EvalSemantics>(entries: Vec<UnionEntry>) -> Result<Vec<Owned
                 aggregate = splatted;
                 continue;
             }
-            // The product of two data-controlled lengths: reserved a row at a time,
-            // so an oversized one is refused rather than aborting the process.
-            let mut next: Vec<OwnedValue> = Vec::new();
-            for held in &aggregate {
-                next.try_reserve(splatted.len()).map_err(|_| {
-                    cannot_reserve_cross_product(&[aggregate.len(), splatted.len()])
-                })?;
-                for addition in &splatted {
-                    next.push(arith_mul::<S>(
-                        held.clone(),
-                        addition.clone(),
-                        MergeFlags::default(),
-                    )?);
-                }
-            }
-            aggregate = next;
+            aggregate = cross_multiply::<S>(&aggregate, &splatted)?;
         }
         out.extend(aggregate);
     }
