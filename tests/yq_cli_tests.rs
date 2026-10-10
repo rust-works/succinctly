@@ -62373,6 +62373,12 @@ fn test_fused_slice_read_matches_the_slice_then_read_spelling_4195() -> Result<(
         ("[-9]", "| .[-9]"),
         ("[7]", "| .[7]"),
         ("| length", "| length"),
+        // #4288: yq's `first`/`last` are not jq's, so the fused read declines them; a `?` on
+        // either stage is looked through.
+        ("| first", "| first"),
+        ("| last", "| last"),
+        ("[0]?", "| .[0]?"),
+        ("| length?", "| length?"),
     ];
     let prelude = "1 as $i | 2 as $j | -2 as $neg | null as $z | ";
     for doc in docs {

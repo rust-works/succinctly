@@ -12242,7 +12242,7 @@ fn eval_single_pipe<S: EvalSemantics, V: DocumentValue>(
     // #4195: `E[a:b][k]` and `E[a:b] | length` read the slice's resolved range
     // instead of building the slice. Not for a pipe that reads path context: its
     // routing above (and the staged fallback below) needs the slice's own stage.
-    if !needs_path && matches!(exprs.first(), Some(Expr::SliceExpr { .. })) {
+    if !needs_path && exprs.first().is_some_and(is_slice_head) {
         if let Some((owned, rest)) = fused_slice_pipe_head::<S, V>(exprs, value.clone(), cursor) {
             return fold_pipe_stages::<S, V>(GenericResult::Owned(owned), rest, optional);
         }
@@ -17878,7 +17878,7 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
     }
 
     // #4195: the sink route's twin of the fusion in `eval_single_pipe`.
-    if !needs_path && !optional && matches!(exprs.first(), Some(Expr::SliceExpr { .. })) {
+    if !needs_path && !optional && exprs.first().is_some_and(is_slice_head) {
         if let Some((owned, rest)) = fused_slice_pipe_head::<S, V>(exprs, value.clone(), cursor) {
             return finish_fused_slice_pipe::<S, V>(owned, rest, optional, sink);
         }
@@ -22453,6 +22453,11 @@ enum SliceRead {
     Index(i64),
     /// `E[a:b] | length`.
     Length,
+    /// `E[a:b] | first`, jq's `.[0]` (#4288). jq mode only: yq's `first` is a different
+    /// builtin, so the fused read declines there.
+    First,
+    /// `E[a:b] | last`, jq's `.[-1]` (#4288). jq mode only, as [`SliceRead::First`].
+    Last,
 }
 
 /// A navigation expression that evaluates twice to the same single value with
@@ -22480,16 +22485,45 @@ fn is_pure_slice_operand(expr: &Expr) -> bool {
     }
 }
 
+/// Whether a pipe's first stage is a computed slice, bare or under a postfix `?` (#4288): the
+/// cheap check in front of [`fusable_slice_read`] on the two pipe drivers.
+fn is_slice_head(stage: &Expr) -> bool {
+    match stage {
+        Expr::SliceExpr { .. } => true,
+        Expr::Optional(inner) => matches!(**inner, Expr::SliceExpr { .. }),
+        _ => false,
+    }
+}
+
 /// The leading `E[a:b]` stage and the read that follows it, when the pair can
 /// be fused (#4195): a computed slice over a pure target with pure bounds,
-/// followed by `[k]` or `length`. Static; nothing is evaluated here.
+/// followed by `[k]`, `length`, `first` or `last` (#4288). Static; nothing is
+/// evaluated here.
+///
+/// A postfix `?` on either stage (`E[a:b]?[0]`, `E[a:b][0]?`) is looked through: the
+/// fused read answers only a readable array with bounds that resolve, which neither
+/// stage can fail on, and declines everything else to the ordinary route, which
+/// applies the `?` itself.
 fn fusable_slice_read(stages: &[Expr]) -> Option<(&Expr, SliceRead)> {
-    let [slice @ Expr::SliceExpr { target, start, end }, read, ..] = stages else {
+    let [head, read, ..] = stages else {
         return None;
+    };
+    let slice = match head {
+        Expr::Optional(inner) => inner.as_ref(),
+        other => other,
+    };
+    let Expr::SliceExpr { target, start, end } = slice else {
+        return None;
+    };
+    let read = match read {
+        Expr::Optional(inner) => inner.as_ref(),
+        other => other,
     };
     let read = match read {
         Expr::Index { idx, key: None } => SliceRead::Index(*idx),
         Expr::Builtin(Builtin::Length) => SliceRead::Length,
+        Expr::Builtin(Builtin::First) => SliceRead::First,
+        Expr::Builtin(Builtin::Last) => SliceRead::Last,
         _ => return None,
     };
     // `map_or(true, ..)` rather than `is_none_or`: the crate's MSRV is 1.73 and
@@ -22566,8 +22600,13 @@ fn try_fused_slice_read<S: EvalSemantics, V: DocumentValue>(
         resolve_computed_slice_bounds::<S>(SliceTargetKind::Sliceable, &start, &end).ok()?;
     let len = crate::jq::array_index::len_checked_memoized(&elements).ok()?;
     let range = SliceBounds::from_literals(start, end).resolve(len);
-    let SliceRead::Index(k) = read else {
-        return Some(OwnedValue::Int(range.len() as i64));
+    // jq's `first` is `.[0]` and `last` is `.[-1]`; yq's are other builtins.
+    let k = match read {
+        SliceRead::Index(k) => k,
+        SliceRead::First | SliceRead::Last if S::TAG != EvalTag::Jq => return None,
+        SliceRead::First => 0,
+        SliceRead::Last => -1,
+        SliceRead::Length => return Some(OwnedValue::Int(range.len() as i64)),
     };
     let width = range.len() as i64;
     let resolved = if k < 0 { width + k } else { k };
@@ -43262,16 +43301,24 @@ mod tests {
         assert_eq!(gate(".[]?[$i:][0]"), None);
         assert_eq!(gate("(.a, .b)[$i:][0]"), None);
         assert_eq!(gate(".[first(.a, .b):][0]"), None);
-        // A read other than `[<integer literal>]` and `length`.
+        // #4288: `first`, `last`, and a `?` on the slice or on the read.
+        assert_eq!(gate(".[$i:] | first"), Some(SliceRead::First));
+        assert_eq!(gate(".[$i:] | last"), Some(SliceRead::Last));
+        assert_eq!(gate(".[$i:] | first?"), Some(SliceRead::First));
+        assert_eq!(gate(".[$i:][0]?"), Some(SliceRead::Index(0)));
+        assert_eq!(gate(".[$i:] | length?"), Some(SliceRead::Length));
+        assert_eq!(gate(".[$i:]?[0]"), Some(SliceRead::Index(0)));
+        assert_eq!(gate(".[$i:]? | last"), Some(SliceRead::Last));
+        // A read other than `[<integer literal>]`, `length`, `first` and `last`.
         assert_eq!(gate(".[$i:][$k]"), None);
         assert_eq!(gate(".[$i:][0:1]"), None);
         assert_eq!(gate(".[$i:][]"), None);
-        assert_eq!(gate(".[$i:] | first"), None);
+        assert_eq!(gate(".[$i:] | first(.)"), None);
+        assert_eq!(gate(".[$i:] | nth(1)"), None);
         assert_eq!(gate(".[$i:] | keys"), None);
         // Not a computed slice at the head of the pipe.
         assert_eq!(gate(".[1:][0]"), None);
         assert_eq!(gate("(.[$i:])[0]"), None);
-        assert_eq!(gate(".[$i:]?[0]"), None);
         assert_eq!(gate("length | .[$i:][0]"), None);
         assert_eq!(gate(".[$i:]"), None);
     }
