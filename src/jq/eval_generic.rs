@@ -12089,6 +12089,15 @@ fn eval_single_pipe<S: EvalSemantics, V: DocumentValue>(
         return collect_each_generic::<S, V>(whole.get(exprs), value, optional, cursor);
     }
 
+    // #4195: `E[a:b][k]` and `E[a:b] | length` read the slice's resolved range
+    // instead of building the slice. Not for a pipe that reads path context: its
+    // routing above (and the staged fallback below) needs the slice's own stage.
+    if !needs_path && matches!(exprs.first(), Some(Expr::SliceExpr { .. })) {
+        if let Some((owned, rest)) = fused_slice_pipe_head::<S, V>(exprs, value.clone(), cursor) {
+            return fold_pipe_stages::<S, V>(GenericResult::Owned(owned), rest, optional);
+        }
+    }
+
     let current = eval_single::<S, _>(&exprs[0], value, optional, cursor);
     fold_pipe_stages::<S, V>(current, &exprs[1..], optional)
 }
@@ -17707,6 +17716,13 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
         }
     }
 
+    // #4195: the sink route's twin of the fusion in `eval_single_pipe`.
+    if !needs_path && !optional && matches!(exprs.first(), Some(Expr::SliceExpr { .. })) {
+        if let Some((owned, rest)) = fused_slice_pipe_head::<S, V>(exprs, value.clone(), cursor) {
+            return finish_fused_slice_pipe::<S, V>(owned, rest, optional, sink);
+        }
+    }
+
     let Some((first, rest)) = exprs.split_first() else {
         // This slice *does* reach zero length in practice: a bare
         // `keys_unsorted[]` drives `each_lazy_keys_iterate_sink`'s `!sorted`
@@ -22261,6 +22277,186 @@ fn slice_one_generic_computed<S: EvalSemantics, V: DocumentValue>(
         Err(e) => return GenericResult::Error(e),
     };
     slice_one_generic::<S, V>(target, s, e, optional)
+}
+
+/// What a fused slice stage answers from the resolved range (#4195).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SliceRead {
+    /// `E[a:b][k]` for an integer-literal `k`.
+    Index(i64),
+    /// `E[a:b] | length`.
+    Length,
+}
+
+/// A navigation expression that evaluates twice to the same single value with
+/// no effect in between: what a fused slice may evaluate and then decline.
+///
+/// Deliberately smaller than the evaluator's own single-valued analysis
+/// (`eval::single_valued_pure`, tied to the settle budget): a literal, a
+/// variable, a path read, arithmetic over those, and `length` cover a bound
+/// such as `$i`, `$i+1`, `length-1` or `.n`, and anything else just keeps
+/// today's route.
+fn is_pure_slice_operand(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_)
+        | Expr::Var(_)
+        | Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Builtin(Builtin::Length) => true,
+        Expr::Paren(inner) | Expr::Negate(inner) => is_pure_slice_operand(inner),
+        Expr::Arithmetic { left, right, .. } => {
+            is_pure_slice_operand(left) && is_pure_slice_operand(right)
+        }
+        Expr::Pipe(stages) => stages.iter().all(is_pure_slice_operand),
+        _ => false,
+    }
+}
+
+/// The leading `E[a:b]` stage and the read that follows it, when the pair can
+/// be fused (#4195): a computed slice over a pure target with pure bounds,
+/// followed by `[k]` or `length`. Static; nothing is evaluated here.
+fn fusable_slice_read(stages: &[Expr]) -> Option<(&Expr, SliceRead)> {
+    let [slice @ Expr::SliceExpr { target, start, end }, read, ..] = stages else {
+        return None;
+    };
+    let read = match read {
+        Expr::Index { idx, key: None } => SliceRead::Index(*idx),
+        Expr::Builtin(Builtin::Length) => SliceRead::Length,
+        _ => return None,
+    };
+    // `map_or(true, ..)` rather than `is_none_or`: the crate's MSRV is 1.73 and
+    // `Option::is_none_or` is stable since 1.82.
+    let pure_bound =
+        |bound: &Option<Box<Expr>>| bound.as_deref().map_or(true, is_pure_slice_operand);
+    (is_pure_slice_operand(target) && pure_bound(start) && pure_bound(end)).then_some((slice, read))
+}
+
+/// The one value `bound` produces, or `None` when it produces none, several, or
+/// escapes -- the fused slice's cue to leave the pair to the ordinary route.
+fn single_slice_bound<S: EvalSemantics, V: DocumentValue>(
+    bound: &Option<Box<Expr>>,
+    value: V,
+    cursor: Option<V::Cursor>,
+    round: fn(f64) -> f64,
+) -> Option<ComputedSliceBound> {
+    let mut seen: Option<ComputedSliceBound> = None;
+    let mut extra = false;
+    let flow = each_slice_bound_generic::<S, V>(bound, value, cursor, round, &mut |b| {
+        if seen.is_some() {
+            extra = true;
+            return Demand::Stop;
+        }
+        seen = Some(b);
+        Demand::Continue
+    });
+    if extra || !matches!(flow, Flow::Exhausted) {
+        return None;
+    }
+    seen
+}
+
+/// Answer `E[a:b][k]` / `E[a:b] | length` from the slice's resolved range
+/// without building the slice (#4195). `slice` is the stage
+/// [`fusable_slice_read`] returned.
+///
+/// `None` means "not modelled here", and the caller runs today's route on the
+/// same input: a bound that is not exactly one value, a target that is not a
+/// readable array, a bound that fails to classify, a malformed array, a yq
+/// index that resolves below the range (yq raises there), an element that does
+/// not convert. Nothing visible happens before a decline -- the target and
+/// bounds are pure by the static gate -- so the ordinary route re-derives
+/// whatever error or value the decline stands for.
+///
+/// The value is the one the slice would have held at that position: the same
+/// bound resolution (`resolve_computed_slice_bounds`, `SliceBounds::resolve`)
+/// and the same per-element `to_owned` that `slice_one_generic` ends in. What
+/// differs is only the elements the read does not name, which are not
+/// converted -- the way `.[k]` and `length` never look inside a sibling.
+fn try_fused_slice_read<S: EvalSemantics, V: DocumentValue>(
+    slice: &Expr,
+    read: SliceRead,
+    value: V,
+    cursor: Option<V::Cursor>,
+) -> Option<OwnedValue> {
+    let Expr::SliceExpr { target, start, end } = slice else {
+        return None; // patchcov: coverage tolerate-line reason="unreachable: fusable_slice_read returns only a SliceExpr stage"
+    };
+    // The target first: it is the cheapest thing to rule out, so a string, `null`
+    // or object target declines before either bound is evaluated.
+    let target = match eval_single::<S, V>(target, value.clone(), false, cursor) {
+        GenericResult::One(v) => v,
+        GenericResult::OneCursor(c) => c.value(),
+        _ => return None,
+    };
+    if unreadable_value_error(&target).is_some() {
+        return None;
+    }
+    let elements = target.as_array()?;
+    let start = single_slice_bound::<S, V>(start, value.clone(), cursor, f64::floor)?;
+    let end = single_slice_bound::<S, V>(end, value, cursor, f64::ceil)?;
+    let (start, end) =
+        resolve_computed_slice_bounds::<S>(SliceTargetKind::Sliceable, &start, &end).ok()?;
+    let len = crate::jq::array_index::len_checked_memoized(&elements).ok()?;
+    let range = SliceBounds::from_literals(start, end).resolve(len);
+    let SliceRead::Index(k) = read else {
+        return Some(OwnedValue::Int(range.len() as i64));
+    };
+    let width = range.len() as i64;
+    let resolved = if k < 0 { width + k } else { k };
+    if resolved < 0 {
+        // jq reads a position before the slice as `null`; yq raises, which the
+        // ordinary route does.
+        return (S::TAG == EvalTag::Jq).then_some(OwnedValue::Null);
+    }
+    if resolved >= width {
+        return Some(OwnedValue::Null);
+    }
+    let position = range.start + resolved as usize;
+    let cursor = crate::jq::array_index::get_cursor_memoized(&elements, position)?;
+    to_owned::<S, _>(&cursor.value()).ok()
+}
+
+/// The fused head of a pipe (#4195): when `exprs` starts with a slice and a read
+/// [`fusable_slice_read`] accepts, and [`try_fused_slice_read`] answers, the read's
+/// value and the stages after it. `None` leaves the whole pipe to the ordinary route.
+///
+/// Out of line on purpose: the two pipe drivers are on the evaluator's recursion
+/// path, and what this builds (the bounds, the target, the element) must not widen
+/// their native frames, which the stack-depth guard is calibrated against.
+#[inline(never)]
+fn fused_slice_pipe_head<S: EvalSemantics, V: DocumentValue>(
+    exprs: &[Expr],
+    value: V,
+    cursor: Option<V::Cursor>,
+) -> Option<(OwnedValue, &[Expr])> {
+    let (slice, read) = fusable_slice_read(exprs)?;
+    let owned = try_fused_slice_read::<S, V>(slice, read, value, cursor)?;
+    Some((owned, &exprs[2..]))
+}
+
+/// Hand a fused slice read's value to the rest of a pipe on the sink route (#4195), as
+/// the slice's single output would have been. The driver in `eval_each_pipe_generic`
+/// forwards the downstream flow unchanged for a first stage that cannot retry, and a
+/// pure slice cannot; what it adds on an escape is the nonretryable mark. Out of line
+/// for the reason [`fused_slice_pipe_head`] gives.
+#[inline(never)]
+fn finish_fused_slice_pipe<S: EvalSemantics, V: DocumentValue>(
+    owned: OwnedValue,
+    rest: &[Expr],
+    optional: bool,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    let item = GenericItem::Owned(owned);
+    if rest.is_empty() {
+        return push_one_generic(item, sink);
+    }
+    let flow =
+        continue_pipe_element_generic::<S, V>(item, &mut RestPipe::new(rest), optional, sink);
+    if let Flow::Escaped(control) = &flow {
+        mark_nonretryable_escape(control);
+    }
+    flow
 }
 
 /// Evaluate a builtin function.
@@ -42857,6 +43053,89 @@ mod tests {
                 OwnedValue::Null,
                 OwnedValue::Null,
             ]
+        );
+    }
+
+    /// #4195: which `E[a:b]` + read pairs the static gate hands to the fused read. The gate is
+    /// purely syntactic, so every refusal below is a pair that keeps today's route.
+    #[test]
+    fn test_fusable_slice_read_gate_4195() {
+        fn gate(src: &str) -> Option<SliceRead> {
+            let Expr::Pipe(stages) = crate::jq::parse(src).unwrap() else {
+                return None;
+            };
+            fusable_slice_read(stages.as_slice()).map(|(_, read)| read)
+        }
+        // The two reads, over bounds and targets built from variables, paths and arithmetic.
+        assert_eq!(gate(".[$i:][0]"), Some(SliceRead::Index(0)));
+        assert_eq!(gate(".[$i:][-3]"), Some(SliceRead::Index(-3)));
+        assert_eq!(gate(".[:$i][7]"), Some(SliceRead::Index(7)));
+        assert_eq!(gate(".[$i:] | length"), Some(SliceRead::Length));
+        assert_eq!(gate(".a.b[$i:$j+1][0]"), Some(SliceRead::Index(0)));
+        assert_eq!(gate(".[length-1:][0]"), Some(SliceRead::Index(0)));
+        assert_eq!(gate(".[.n:(-$i)][0]"), Some(SliceRead::Index(0)));
+        assert_eq!(gate("$x[$i:][0]"), Some(SliceRead::Index(0)));
+        // A bound or target that could fan out, fail, or have an effect is not pure.
+        assert_eq!(gate(".[(1,2):][0]"), None);
+        assert_eq!(gate(".[$i:(1,2)][0]"), None);
+        assert_eq!(gate(".[input:][0]"), None);
+        assert_eq!(gate(".[($i|debug):][0]"), None);
+        assert_eq!(gate(".[]?[$i:][0]"), None);
+        assert_eq!(gate("(.a, .b)[$i:][0]"), None);
+        assert_eq!(gate(".[first(.a, .b):][0]"), None);
+        // A read other than `[<integer literal>]` and `length`.
+        assert_eq!(gate(".[$i:][$k]"), None);
+        assert_eq!(gate(".[$i:][0:1]"), None);
+        assert_eq!(gate(".[$i:][]"), None);
+        assert_eq!(gate(".[$i:] | first"), None);
+        assert_eq!(gate(".[$i:] | keys"), None);
+        // Not a computed slice at the head of the pipe.
+        assert_eq!(gate(".[1:][0]"), None);
+        assert_eq!(gate("(.[$i:])[0]"), None);
+        assert_eq!(gate(".[$i:]?[0]"), None);
+        assert_eq!(gate("length | .[$i:][0]"), None);
+        assert_eq!(gate(".[$i:]"), None);
+    }
+
+    /// #4195: the fused read takes a bound only when it is exactly one value; a generator,
+    /// an empty bound, and one that raises are all left to the ordinary route.
+    #[test]
+    fn test_single_slice_bound_declines_anything_but_one_value_4195() {
+        let json = br"[1,2,3]";
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let pull = |src: Option<&str>, round: fn(f64) -> f64| {
+            let bound = src.map(|s| Box::new(crate::jq::parse(s).unwrap()));
+            single_slice_bound::<JqSemantics, _>(&bound, root.value(), Some(root), round)
+        };
+        assert!(matches!(pull(Some("2"), f64::floor), Some(Ok(Some(2)))));
+        // a fractional bound is rounded the way a literal one is: down for a start, up for an end
+        assert!(matches!(pull(Some("1.5"), f64::floor), Some(Ok(Some(1)))));
+        assert!(matches!(pull(Some("1.5"), f64::ceil), Some(Ok(Some(2)))));
+        // an open side is one value too
+        assert!(matches!(pull(None, f64::floor), Some(Ok(None))));
+        assert!(pull(Some("(1,2)"), f64::floor).is_none());
+        assert!(pull(Some("empty"), f64::floor).is_none());
+        assert!(pull(Some("error(\"x\")"), f64::floor).is_none());
+    }
+
+    /// #4195: a target with no cursor of its own (a bare borrowed value) is read the same way.
+    #[test]
+    fn test_fused_slice_read_of_a_target_without_a_cursor_4195() {
+        let json = br"[10,20,30,40]";
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let Expr::Pipe(pair) = crate::jq::parse(".[1+0:][0]").unwrap() else {
+            panic!("a pipe of slice and read");
+        };
+        let (slice, read) = fusable_slice_read(pair.as_slice()).unwrap();
+        assert_eq!(
+            try_fused_slice_read::<JqSemantics, _>(slice, read, root.value(), None),
+            Some(OwnedValue::Int(20))
+        );
+        assert_eq!(
+            try_fused_slice_read::<JqSemantics, _>(slice, SliceRead::Length, root.value(), None),
+            Some(OwnedValue::Int(3))
         );
     }
 
