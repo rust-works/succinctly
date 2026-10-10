@@ -70869,6 +70869,12 @@ mod remaining_inputs {
         // such read leaves the marker at `EXHAUSTED`; every later one leaves it
         // at `<unknown>` with `input_line_number` at 0 (#4303).
         static PAST_END: Cell<bool> = const { Cell::new(false) };
+        // Whether reads past the end are counted as above. Off unless the CLI
+        // asks after seeding (`count_reads_past_end`): it does so only where it
+        // recorded the stream's own end, since a route that falls back (JSON
+        // `--seq`, which does not yet raise jq's truncated-number error on a
+        // last record) would count a read jq spends on an error (#4303).
+        static COUNT_PAST_END: Cell<bool> = const { Cell::new(false) };
     }
 
     /// One read from the input stream.
@@ -70902,6 +70908,12 @@ mod remaining_inputs {
         CURRENT.with(|c| c.set(None));
         EXHAUSTED.with(|e| e.set(exhausted));
         PAST_END.with(|p| p.set(false));
+        COUNT_PAST_END.with(|c| c.set(false));
+    }
+
+    /// Counts the reads past the end from here on: see `COUNT_PAST_END`.
+    pub fn count_reads_past_end() {
+        COUNT_PAST_END.with(|c| c.set(true));
     }
 
     /// Whether a CLI driver has seeded the queue on this thread.
@@ -70955,6 +70967,10 @@ mod remaining_inputs {
             LAST_LINE.with(|l| l.set(at.1));
             CURRENT.with(|c| c.set(Some(at)));
             return Pop::ParseError(error);
+        }
+        if !COUNT_PAST_END.with(Cell::get) {
+            CURRENT.with(|c| c.set(EXHAUSTED.with(Cell::get)));
+            return Pop::Exhausted;
         }
         let at = if PAST_END.with(|p| p.replace(true)) {
             None
@@ -71198,6 +71214,18 @@ pub fn seed_remaining_inputs_with_error(
     trailing_error: Option<(EvalError, (u32, u32))>,
 ) {
     remaining_inputs::seed(documents, exhausted, trailing_error);
+}
+
+/// Counts the reads past the end of the input just seeded (#4303): the first
+/// leaves [`current_input_location`] at the seeded end of input and
+/// `input_line_number` at its line (0 where it is `<unknown>`), and every later
+/// one leaves `<unknown>` and 0, as jq does. Without it, every read past the
+/// end leaves the seeded end of input and `input_line_number` unchanged.
+///
+/// For a CLI driver that seeded the true end of the stream; a seed resets it.
+#[cfg(feature = "std")]
+pub fn count_reads_past_end() {
+    remaining_inputs::count_reads_past_end();
 }
 
 /// One read from the `input`/`inputs` queue: a document, the parse error the

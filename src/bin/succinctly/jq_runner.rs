@@ -4770,6 +4770,9 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
             // this function's own stated safety goal.
             if args.null_input && !force_read_under_null_input {
                 jq::seed_remaining_inputs(Vec::new(), locations.exhausted(args.slurp));
+                if locations.eof_tail.is_some() {
+                    jq::count_reads_past_end();
+                }
             } else {
                 // Moves rather than clones: `inputs` isn't read again on
                 // this branch (the null-input arm below uses `OwnedValue::
@@ -4801,6 +4804,11 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                     // own error is tagged as an uncatchable decode failure.
                     trailing_error.map(|t| (EvalError::new(t.error.message), (t.source, t.line))),
                 );
+                // #4303: where the stream's own end was recorded, reads past it
+                // move on from it as jq's do.
+                if locations.eof_tail.is_some() {
+                    jq::count_reads_past_end();
+                }
             }
 
             if args.null_input {

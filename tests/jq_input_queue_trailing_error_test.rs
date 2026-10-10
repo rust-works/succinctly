@@ -10,8 +10,8 @@
 #![cfg(feature = "std")]
 
 use succinctly::jq::{
-    current_input_location, pop_input, pop_remaining_input, seed_remaining_inputs_with_error,
-    EvalError, InputPop, OwnedValue,
+    count_reads_past_end, current_input_location, pop_input, pop_remaining_input,
+    seed_remaining_inputs_with_error, EvalError, InputPop, OwnedValue,
 };
 
 #[test]
@@ -21,6 +21,7 @@ fn a_trailing_parse_error_is_delivered_once_after_the_documents_2961() {
         Some((0, 0)),
         Some((EvalError::new("Invalid JSON text"), (0, 1))),
     );
+    count_reads_past_end();
 
     assert!(matches!(
         pop_input(),
@@ -44,6 +45,18 @@ fn a_trailing_parse_error_is_delivered_once_after_the_documents_2961() {
     assert_eq!(current_input_location(), Some((0, 0)));
     assert!(matches!(pop_input(), InputPop::Exhausted));
     assert_eq!(current_input_location(), None);
+
+    // Without the count (a route that did not record the stream's end), every
+    // read past the end leaves the seeded end of input.
+    seed_remaining_inputs_with_error(
+        vec![],
+        Some((0, 7)),
+        Some((EvalError::new("Invalid JSON text"), (0, 1))),
+    );
+    assert!(matches!(pop_input(), InputPop::ParseError(_)));
+    assert!(matches!(pop_input(), InputPop::Exhausted));
+    assert!(matches!(pop_input(), InputPop::Exhausted));
+    assert_eq!(current_input_location(), Some((0, 7)));
 
     // The `Option`-shaped pop reads a trailing error as the end of the
     // stream, and consumes it.
