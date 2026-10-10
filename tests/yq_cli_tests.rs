@@ -56246,6 +56246,110 @@ fn test_drive_slice_bound_yq_mode_end_bound_error_from_start_sink_2267() -> Resu
     Ok(())
 }
 
+/// #4197: a slice bound that produces no value is an error in yq, wherever the slice is read
+/// or written and whatever the target is. `?` and `//` do not suppress it, a write leaves the
+/// document unprinted, and an unbound variable is the same empty bound. jq mode's generator
+/// model (an empty bound is "no slice") is unchanged and pinned in `jq_cli_tests.rs`. Every
+/// row captured live from yq v4.53.3 (`Error: expected to find 1 number, got 0 instead`,
+/// exit 1).
+#[test]
+fn test_slice_bound_with_no_output_is_an_error_4197() -> Result<()> {
+    let doc = "a: 1\nb: [1, 2, 3]\ns: abcdef\nn: null\no: {x: 1}\n";
+    for program in [
+        // Each bound, both, and a bound that is an unbound variable.
+        ".b[select(false):]",
+        ".b[:select(false)]",
+        ".b[1:select(false)]",
+        ".b[select(false):1]",
+        ".b[select(false):select(false)]",
+        ".b[$typo:]",
+        // Every target kind, `null` and scalars included.
+        ".s[select(false):2]",
+        ".n[select(false):]",
+        ".a[select(false):]",
+        ".o[select(false):]",
+        ".b[0:2][select(false):]",
+        // `?`, `//`, a collect and a pipe do not absorb it.
+        ".b[select(false):]?",
+        ".b[select(false):] // 5",
+        "[.b[select(false):]]",
+        "[.b[select(false):]?]",
+        ".b | .[select(false):]",
+        // The write forms resolve the same bound.
+        ".b[select(false):1] = [9]",
+        ".b[1:select(false)] = [9]",
+        ".b[select(false):1] |= [7]",
+        ".b[select(false):] += [1]",
+        "del(.b[select(false):])",
+        "del(.b[:select(false)])",
+        // A consumer that reads the path (`key`, `path`, `parent`, `file_index`) walks the slice
+        // in path position, a separate bound driver; it raises the same error.
+        ".b[select(false):] | key",
+        ".b[1:select(false)] | path",
+        ".b[$typo:] | parent",
+        ".n[select(false):]? | file_index",
+        ".b[0:2][select(false):] | key",
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(program, doc, &[])?;
+        assert_eq!(
+            code, 1,
+            "#4197: `{program}`: stdout {stdout:?} stderr {stderr:?}"
+        );
+        assert!(stdout.is_empty(), "#4197: `{program}`: {stdout:?}");
+        assert!(
+            stderr.contains("expected to find 1 number, got 0 instead"),
+            "#4197: `{program}`: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #4197: the same error through the bridged route (`-n`, which evaluates over an owned
+/// value) as through the document route above.
+#[test]
+fn test_slice_bound_with_no_output_is_an_error_on_the_owned_route_4197() -> Result<()> {
+    for program in [
+        "{\"b\":[1,2,3]} | .b[select(false):]",
+        "{\"b\":[1,2,3]} | .b[1:select(false)]",
+        "{\"b\":[1,2,3]} | .b[select(false):1] = [9]",
+        "{\"b\":[1,2,3]} | del(.b[select(false):])",
+        "[1,2,3] | .[$typo:]",
+        "{\"b\":[1,2,3]} | .b[select(false):] | key",
+        "{\"b\":[1,2,3]} | .b[1:select(false)] | path",
+        "[1,2,3] | .[$typo:] | parent",
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(program, "", &["-n"])?;
+        assert_eq!(
+            code, 1,
+            "#4197: `{program}`: stdout {stdout:?} stderr {stderr:?}"
+        );
+        assert!(stdout.is_empty(), "#4197: `{program}`: {stdout:?}");
+        assert!(
+            stderr.contains("expected to find 1 number, got 0 instead"),
+            "#4197: `{program}`: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #4197: what is not an empty bound is untouched -- a single-valued bound, an open bound, and
+/// an empty *right-hand side* of a slice assignment (yq leaves the document as it was).
+#[test]
+fn test_slice_with_values_keeps_its_answer_4197() -> Result<()> {
+    let doc = "b: [1, 2, 3]\n";
+    for (program, want) in [
+        (".b[1:]", "- 2\n- 3\n"),
+        (".b[:1]", "- 1\n"),
+        (".b[(0|select(true)):2]", "- 1\n- 2\n"),
+        (".b[1:2] = (select(false))", "b: [1, 2, 3]\n"),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(program, doc, &[])?;
+        assert_eq!(code, 0, "#4197: `{program}`: stderr {stderr:?}");
+        assert_eq!(stdout, want, "#4197: `{program}`");
+    }
+    Ok(())
+}
+
 /// #2693 regression guard: an explicit YAML tag must still resolve when
 /// `recurse` is driven through a *bounded* consumer.
 ///

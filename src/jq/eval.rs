@@ -27500,8 +27500,8 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // patchcov: coverage end
     }
     match flow {
-        // An empty `start` stream never evaluated `end` or the target at
-        // all, and collapses to `None` here like any other zero-result
+        // jq mode: an empty `start` stream never evaluated `end` or the
+        // target at all, and collapses to `None` here like any other zero-result
         // pull.
         Flow::Exhausted => owned_vec_to_result(out),
         // The collector never asks the worker to stop, and the worker
@@ -27945,7 +27945,8 @@ fn slice_pair<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// the reasons `each_slice_bound_generic`'s own doc comment gives (real yq
 /// evaluates a bound in full before slicing; #2351's prefix discard;
 /// #2372's raise-before-any-slice classification): a `ComputedSliceBound`
-/// only ever reaches `sink` as `Ok` there.
+/// only ever reaches `sink` as `Ok` there. A bound that produces no value at all is an
+/// error there, not an empty pairing (#4197).
 fn each_slice_bound<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     bound: &Option<Box<Expr>>,
     value: StandardJson<'_, W>,
@@ -27973,6 +27974,11 @@ fn each_slice_bound<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         if let Some(Err(e)) = collected.iter().find(|b| b.is_err()) {
             return Flow::Escaped(Control::Error(e.clone()));
+        }
+        // #4197: yq wants exactly one number from a bound, and a stream that
+        // ended without producing one is an error, not "no slice".
+        if collected.is_empty() {
+            return Flow::Escaped(Control::Error(EvalError::slice_bound_empty()));
         }
         for b in collected {
             if sink(b) == Demand::Stop {
@@ -55928,6 +55934,10 @@ fn drive_slice_bound<S: EvalSemantics>(
         let (mut values, escape) = eval_owned_multi_keep_partial::<S>(expr, value);
         if escape.is_some() {
             values = Vec::new();
+        } else if values.is_empty() {
+            // #4197: yq wants exactly one number from a bound; a stream that
+            // ended without producing one is an error, not "no slice".
+            return Err(EvalError::slice_bound_empty().into());
         }
         let mut resolved = vec_with_capacity(values.len());
         for raw in values {
