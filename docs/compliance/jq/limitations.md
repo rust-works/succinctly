@@ -3026,7 +3026,11 @@ is the revert that established what the other one costs.
    `try (length | .)` over a number, whose handler never runs, refuses as well. Over the 11 operands
    of the register sweep that exercise the `try` shape (146,547 rows) it turns 2,773 wrong accepts
    and 45 wrong answers into matches or loud refusals and loses 652 matches to a refusal, 480 of
-   them on a `null` input, where a write dropped for a path jq names is a no-op anyway. A boolean register
+   them on a `null` input, where a write dropped for a path jq names is a no-op anyway. The 12
+   operands for `select`, a `def` call and the issue's own shapes (159,867 rows) take
+   1,511 wrong accepts and 27 wrong answers to 377 and 5, and lose 396 matches; the remainder is
+   `($k | .b?) | def f: 1; f` over a `null` register, identical on `main`
+   ([#4252](https://github.com/rust-works/succinctly/issues/4252)). A boolean register
    is compared with the result, so an equal one answers and a different one refuses, as in jq
    (jq reads an equal boolean result as the register itself): that holds for a bool-returning
    builtin (`contains(true)`) next to a navigating comma sibling too since #4063.
