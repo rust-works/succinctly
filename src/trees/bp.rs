@@ -2091,8 +2091,7 @@ impl BalancedParens<Vec<u64>, NoSelect> {
     /// document, so a crossing in steady state allocates none.
     ///
     /// `words` is overwritten, not read: any contents are discarded.
-    #[doc(hidden)]
-    pub fn leaf_in(mut words: Vec<u64>) -> Self {
+    pub(crate) fn leaf_in(mut words: Vec<u64>) -> Self {
         words.clear();
         words.push(0b01);
         Self {
@@ -2116,8 +2115,7 @@ impl BalancedParens<Vec<u64>, NoSelect> {
     /// For a [`leaf`](Self::leaf) being retired: its buffer feeds the next
     /// [`leaf_in`](Self::leaf_in). Afterwards `self` holds no allocation and
     /// answers nothing meaningful; drop it.
-    #[doc(hidden)]
-    pub fn take_words(&mut self) -> Vec<u64> {
+    pub(crate) fn take_words(&mut self) -> Vec<u64> {
         self.len = 0;
         self.total_ones = 0;
         core::mem::take(&mut self.words)

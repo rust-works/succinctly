@@ -156,7 +156,7 @@ impl SeqHint {
 /// would double a hot per-word array (~6.25% of input) for inputs the index
 /// cannot represent anyway.
 fn build_ib_rank(words: &[u64]) -> Vec<u32> {
-    let mut rank = Vec::new();
+    let mut rank = Vec::with_capacity(words.len() + 1);
     fill_ib_rank(&mut rank, words);
     rank
 }
@@ -179,20 +179,21 @@ fn fill_ib_rank(rank: &mut Vec<u32>, words: &[u64]) {
 /// scratch -- [`JsonIndex::build_reindex_scalar_from`] overwrites all of
 /// them -- so a retired index's buffers can build the next one without
 /// touching the allocator.
-#[doc(hidden)]
 #[derive(Default)]
-pub struct ScalarIndexParts {
+pub(crate) struct ScalarIndexParts {
     ib: Vec<u64>,
     ib_rank: Vec<u32>,
     bp_words: Vec<u64>,
 }
 
 impl ScalarIndexParts {
-    /// Whether keeping these buffers around is cheap: no larger than the
-    /// index of a 1 KiB token, so a free list of them never pins a big one.
+    /// Whether keeping these buffers around is cheap: the index they last
+    /// held was that of a token of 1 KiB or less, so a free list of them never
+    /// pins a big one. Judged by what they held, not by capacity, which
+    /// amortized growth rounds past any fixed limit.
     #[must_use]
-    pub fn is_small(&self) -> bool {
-        self.ib.capacity() <= 16 && self.ib_rank.capacity() <= 17 && self.bp_words.capacity() <= 4
+    pub(crate) fn is_small(&self) -> bool {
+        self.ib.len() <= 16 && self.ib_rank.len() <= 17
     }
 }
 
@@ -287,8 +288,7 @@ impl JsonIndex<Vec<u64>> {
     /// or fewer always is after the first.
     ///
     /// Same contract as `build_reindex_scalar` for `len`.
-    #[doc(hidden)]
-    pub fn build_reindex_scalar_from(len: usize, parts: ScalarIndexParts) -> Self {
+    pub(crate) fn build_reindex_scalar_from(len: usize, parts: ScalarIndexParts) -> Self {
         assert!(
             u32::try_from(len).is_ok(),
             "JsonIndex supports inputs up to u32::MAX (4294967295) bytes; got {len} bytes (#188)"
@@ -320,8 +320,7 @@ impl JsonIndex<Vec<u64>> {
     /// leaving `self` empty (#4217). Only for an index that call (or
     /// `build_reindex_scalar`) built: it is the retired scalar document's
     /// last act, and `self` must be dropped afterwards, never read.
-    #[doc(hidden)]
-    pub fn take_scalar_parts(&mut self) -> ScalarIndexParts {
+    pub(crate) fn take_scalar_parts(&mut self) -> ScalarIndexParts {
         self.ib_len = 0;
         ScalarIndexParts {
             ib: core::mem::take(&mut self.ib),
