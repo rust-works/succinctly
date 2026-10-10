@@ -8799,24 +8799,46 @@ mod slot_memo {
         });
     }
 
-    /// The element of `parent` a scan found -- its node id, index, and whether
-    /// it is a mapping's -- that is nearest before `target`: the one a scan
-    /// resumes from (#4164 keeps more than one per parent, so the nearest is
-    /// the cheapest). Read-only; [`touch`] marks it used once it is.
-    pub(crate) fn nearest_before(
-        document: usize,
-        parent: usize,
-        target: usize,
-    ) -> Option<(usize, i64, bool)> {
+    /// What [`neighbours`] found: node id and index of each scan, and whether
+    /// the one before is a mapping's.
+    #[derive(Default)]
+    pub(crate) struct Around {
+        pub(crate) before: Option<(usize, i64, bool)>,
+        pub(crate) after: Option<(usize, i64)>,
+    }
+
+    /// The scans of `parent` a read of `target` may resume from, in one pass:
+    /// the element nearest *before* it -- its node id, index, and whether it
+    /// is a mapping's -- which a scan resumes from, and, when `after` asks
+    /// (the format can step back, sequences only, #4101), the element nearest
+    /// *after* it -- node id and index -- which a walk back starts at (#4164
+    /// keeps more than one per parent, so the nearest is the cheapest).
+    /// Read-only; [`touch`] marks the one a read resumes from used.
+    pub(crate) fn neighbours(document: usize, parent: usize, target: usize, after: bool) -> Around {
         MEMO.with(|m| {
             let m = m.borrow();
-            let state = m.as_ref().filter(|s| s.document == document)?;
-            let scan = state
-                .scans
-                .iter()
-                .filter(|s| s.parent == parent && s.last < target)
-                .max_by_key(|s| s.last)?;
-            Some((scan.last, scan.index, scan.members))
+            let Some(state) = m.as_ref().filter(|s| s.document == document) else {
+                return Around::default();
+            };
+            let mut before: Option<&Scan> = None;
+            let mut later: Option<&Scan> = None;
+            for scan in state.scans.iter().filter(|s| s.parent == parent) {
+                if scan.last < target {
+                    if before.map_or(true, |b| scan.last > b.last) {
+                        before = Some(scan);
+                    }
+                } else if after
+                    && !scan.members
+                    && scan.last > target
+                    && later.map_or(true, |l| scan.last < l.last)
+                {
+                    later = Some(scan);
+                }
+            }
+            Around {
+                before: before.map(|s| (s.last, s.index, s.members)),
+                after: later.map(|s| (s.last, s.index)),
+            }
         })
     }
 
@@ -8838,39 +8860,27 @@ mod slot_memo {
         });
     }
 
-    /// [`nearest_before`], marked used (the tests' way to read a scan).
+    /// The scan [`neighbours`] finds before `target`, marked used (the tests'
+    /// way to read a scan).
     #[cfg(test)]
     pub(crate) fn resume(
         document: usize,
         parent: usize,
         target: usize,
     ) -> Option<(usize, i64, bool)> {
-        let found = nearest_before(document, parent, target)?;
+        let found = neighbours(document, parent, target, false).before?;
         touch(document, parent, found.0);
         Some(found)
     }
 
-    /// The element of `parent` a scan found -- its node id and index -- that
-    /// is nearest *after* `target`, when the scan was of a sequence's
-    /// elements (#4101): the point to step back from. Read-only.
+    /// The scan [`neighbours`] finds after `target`.
+    #[cfg(test)]
     pub(crate) fn resume_back(
         document: usize,
         parent: usize,
         target: usize,
     ) -> Option<(usize, i64)> {
-        MEMO.with(|m| {
-            let mut m = m.borrow_mut();
-            let state = m.as_mut().filter(|s| s.document == document)?;
-            // Recency is not touched: a walk that finds nothing must not keep
-            // this parent alive past one a fan-out is still reading, and
-            // `remember` refreshes it when the walk succeeds.
-            let scan = state
-                .scans
-                .iter()
-                .filter(|s| s.parent == parent && !s.members && s.last > target)
-                .min_by_key(|s| s.last)?;
-            Some((scan.last, scan.index))
-        })
+        neighbours(document, parent, target, true).after
     }
 
     /// The first remembered scan of `document` that `f` accepts, given its
@@ -9020,23 +9030,22 @@ mod slot_memo {
         Guard
     }
 
-    pub(crate) fn nearest_before(
+    #[derive(Default)]
+    pub(crate) struct Around {
+        pub(crate) before: Option<(usize, i64, bool)>,
+        pub(crate) after: Option<(usize, i64)>,
+    }
+
+    pub(crate) fn neighbours(
         _document: usize,
         _parent: usize,
         _target: usize,
-    ) -> Option<(usize, i64, bool)> {
-        None
+        _after: bool,
+    ) -> Around {
+        Around::default()
     }
 
     pub(crate) fn touch(_document: usize, _parent: usize, _last: usize) {}
-
-    pub(crate) fn resume_back(
-        _document: usize,
-        _parent: usize,
-        _target: usize,
-    ) -> Option<(usize, i64)> {
-        None
-    }
 
     pub(crate) fn find<R>(
         _document: usize,
@@ -27427,20 +27436,19 @@ fn resumed_slot<C: DocumentCursor>(c: &C, parent: &C) -> Option<CursorSlot<C>> {
     let document = c.document_token();
     let parent_id = parent.node_id();
     let target = c.node_id();
-    let before = slot_memo::nearest_before(document, parent_id, target);
+    let slot_memo::Around { before, after } =
+        slot_memo::neighbours(document, parent_id, target, C::STEPS_BACK);
     // A scan remembered after `c` is stepped back from when it is nearer than
     // the one before it (#4164): two fan-outs at distant offsets each keep
     // their own, and a descending pair would otherwise scan forward from the
     // far, lower one. Nearer by node id, which is only a proxy for elements;
     // the walk gates itself on its own estimate and bound, and when it
     // declines the forward resume decides.
-    if C::STEPS_BACK {
-        if let Some((high, index)) = slot_memo::resume_back(document, parent_id, target) {
-            // `map_or(true, ..)`, not `is_none_or`: the MSRV is 1.73.
-            if before.map_or(true, |(low, _, _)| high - target < target - low) {
-                if let Some(slot) = resumed_slot_back(c, parent, high, index) {
-                    return Some(slot);
-                }
+    if let Some((high, index)) = after {
+        // `map_or(true, ..)`, not `is_none_or`: the MSRV is 1.73.
+        if before.map_or(true, |(low, _, _)| high - target < target - low) {
+            if let Some(slot) = resumed_slot_back(c, parent, high, index) {
+                return Some(slot);
             }
         }
     }
@@ -51894,7 +51902,7 @@ mod tests {
         slot_memo::remember(1, 7, 900, 800, Some(901), false, None);
         // Looking up 900 leaves 100 the parent's least recently used ...
         assert_eq!(
-            slot_memo::nearest_before(1, 7, 1_000),
+            slot_memo::neighbours(1, 7, 1_000, false).before,
             Some((900, 800, false))
         );
         slot_memo::remember(1, 7, 400, 300, Some(401), false, None);
