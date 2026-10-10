@@ -4304,7 +4304,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
         };
         // #4305: see [`stitch_json_file_seams`]. Not under `--validate`, which is strict per file.
         if !args.validate {
-            stitch_json_file_seams(raw_inputs.iter_mut());
+            stitch_json_file_seams(raw_inputs.iter_mut(), false);
         }
         // Substitution is skipped under `--validate` so the strict validator
         // in the loop below still sees the *original* bytes (#1247).
@@ -5295,7 +5295,7 @@ fn get_inputs(
     // `--validate` is strict per file (an empty file is rejected too), so it reads the files as
     // written.
     if json_input_mode && !args.validate {
-        stitch_json_file_seams(raw_bytes.iter_mut().map(|(_, raw)| raw));
+        stitch_json_file_seams(raw_bytes.iter_mut().map(|(_, raw)| raw), track_eof);
     }
 
     // #1525: real jq warns on stderr when it drops a malformed --seq
@@ -6030,7 +6030,7 @@ impl EofTail {
         let mut last_event = None;
         let mut offset = 0;
         loop {
-            let (values, malformed) = split_json_values(&last[offset..]);
+            let (values, malformed) = split_json_values_strict(&last[offset..]);
             if let Some(&(start, end)) = values.last() {
                 // At `last.len()` for a bare token that the end of input completes.
                 last_event = Some(if matches!(last[offset + start], b'"' | b'[' | b'{') {
@@ -6790,7 +6790,11 @@ fn string_close_from(bytes: &[u8], mut at: usize) -> usize {
 /// Recorded residual: the moved tail keeps its newlines, so `input_line_number` for a value
 /// that began in an earlier file and had a newline inside it counts them in the later file
 /// (jq counts the later file's lines alone).
-fn stitch_json_file_seams<'a>(raws: impl Iterator<Item = &'a mut Vec<u8>>) {
+///
+/// `resumes` is set for a program using `input`/`inputs`, which reads past a parse error the
+/// way jq does (#4311), so the search for the open tail does too ([`open_tail_start`]); any
+/// other program stops at the first parse error and never reads what follows it.
+fn stitch_json_file_seams<'a>(raws: impl Iterator<Item = &'a mut Vec<u8>>, resumes: bool) {
     let mut raws: Vec<&mut Vec<u8>> = raws.collect();
     let Some(last) = raws.len().checked_sub(1) else {
         return;
@@ -6803,7 +6807,7 @@ fn stitch_json_file_seams<'a>(raws: impl Iterator<Item = &'a mut Vec<u8>>) {
             raw.splice(0..0, std::mem::take(&mut carry));
         }
         if index < last {
-            if let Some(start) = open_tail_start(raw) {
+            if let Some(start) = open_tail_start(raw, resumes) {
                 carry = raw.split_off(start);
             }
         }
@@ -6812,20 +6816,30 @@ fn stitch_json_file_seams<'a>(raws: impl Iterator<Item = &'a mut Vec<u8>>) {
 
 /// Where the open tail of a file starts ([`stitch_json_file_seams`]), if it has one.
 ///
-/// Past a malformed byte the search goes on where jq resumes reading (#4311): a program
-/// whose `input` catches the error reads on, so a token cut off after it still continues
-/// in the next file.
-fn open_tail_start(raw: &[u8]) -> Option<usize> {
+/// With `resumes`, the search goes on past a malformed value where jq resumes reading
+/// (#4311): a program whose `input` catches the error reads on, so a token cut off after it
+/// still continues in the next file. A malformed value is then found as `get_inputs` finds
+/// it ([`split_json_values_strict`]), since a fault the lenient splitter lets through moves
+/// where jq resumes. Without it, the first value the splitter refuses ends the search.
+fn open_tail_start(raw: &[u8], resumes: bool) -> Option<usize> {
     let mut faults = LineCounter::new(raw);
     let mut offset = 0;
     loop {
-        match split_json_values(&raw[offset..]) {
+        let split = if resumes {
+            split_json_values_strict(&raw[offset..])
+        } else {
+            split_json_values(&raw[offset..])
+        };
+        match split {
             // The splitter gave up at `start`: a truncated token runs into the end of the
             // file; anything else is a malformed byte, after which jq resumes.
             (_, Some(start)) => {
                 let start = offset + start;
                 if token_runs_to_end(&raw[start..]) {
                     return Some(start);
+                }
+                if !resumes {
+                    return None;
                 }
                 let (_, _, resume) = meet_fault(&mut faults, raw, start);
                 if resume >= raw.len() {
@@ -6894,6 +6908,24 @@ fn token_runs_to_end(tail: &[u8]) -> bool {
             b.is_ascii_whitespace() || matches!(b, b'"' | b'[' | b'{' | b',' | b':' | b']' | b'}')
         }),
         None => false,
+    }
+}
+
+/// [`split_json_values`], with a value the splitter accepts but jq's parser refuses (`[1 2]`,
+/// `{1:2}`) taken as the malformed one (#4311): the spans before it, and its start. That is
+/// where `get_inputs`' stream parse stops, so the read jq resumes at follows it. Validates
+/// every span, so only the routes that resume past a parse error ask for it.
+fn split_json_values_strict(bytes: &[u8]) -> (Vec<(usize, usize)>, Option<usize>) {
+    let (mut spans, malformed) = split_json_values(bytes);
+    match spans.iter().position(|&(start, end)| {
+        succinctly::json::validate::validate_jq_lenient(&bytes[start..end]).is_err()
+    }) {
+        Some(bad) => {
+            let start = spans[bad].0;
+            spans.truncate(bad);
+            (spans, Some(start))
+        }
+        None => (spans, malformed),
     }
 }
 
@@ -11808,7 +11840,7 @@ mod tests {
     fn stitch_json_file_seams_moves_the_open_tail_forward_4305() {
         let stitched = |files: &[&[u8]]| -> Vec<Vec<u8>> {
             let mut raws: Vec<Vec<u8>> = files.iter().map(|f| f.to_vec()).collect();
-            stitch_json_file_seams(raws.iter_mut());
+            stitch_json_file_seams(raws.iter_mut(), false);
             raws
         };
         assert_eq!(
