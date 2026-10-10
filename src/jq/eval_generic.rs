@@ -29943,14 +29943,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 /// holding.
 fn builtin_expr<'e>(whole: Option<&'e Expr>, builtin: &Builtin) -> Cow<'e, Expr> {
     match whole {
-        Some(expr) => {
-            debug_assert!(
-                matches!(expr, Expr::Builtin(b) if core::ptr::eq(b, builtin)),
-                "the dispatched node must be the one `builtin` was borrowed from"
-            );
-            Cow::Borrowed(expr)
-        }
-        None => Cow::Owned(Expr::Builtin(builtin.clone())),
+        // Pointer identity, not just shape: a `whole` that is not the node
+        // `builtin` was borrowed from is cloned from `builtin`, as if it had
+        // not been passed, so a mismatched pair costs the allocations back
+        // and never evaluates the wrong expression.
+        Some(expr @ Expr::Builtin(b)) if core::ptr::eq(b, builtin) => Cow::Borrowed(expr),
+        _ => Cow::Owned(Expr::Builtin(builtin.clone())),
     }
 }
 
@@ -31771,15 +31769,11 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
         // Same live-input-queue deferral as the #2968 arms above (#1309).
         Builtin::AnyF(_) | Builtin::AllF(_) | Builtin::IsValid(_)
             if crate::jq::input_queue_is_active()
-                && crate::jq::walk::uses_input_builtins(&Expr::Builtin(builtin.clone())) =>
+                && crate::jq::walk::uses_input_builtins(&builtin_expr(whole, builtin)) =>
         {
             // patchcov: coverage tolerate-line reason="the CLI evaluates every program that uses input/inputs on the eager route (jq_runner's can_use_lazy_path excludes them), so this guard never fires today -- #2968's identical guards on the arms above are equally unfired; kept for the day the lazy path admits such a program (#1309)"
-            bridge_to_full_evaluator::<S, _>(
-                &Expr::Builtin(builtin.clone()),
-                value,
-                cursor,
-                optional,
-            ) // patchcov: coverage tolerate-line reason="see above: the input-queue deferral never fires from the CLI"
+            bridge_to_full_evaluator::<S, _>(&builtin_expr(whole, builtin), value, cursor, optional)
+            // patchcov: coverage tolerate-line reason="see above: the input-queue deferral never fires from the CLI"
         }
         Builtin::AnyF(cond) if cursor.is_some() => {
             any_all_f_generic::<S, V>(cond, &value, optional, cursor.expect("guarded"), true)
