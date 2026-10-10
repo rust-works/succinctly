@@ -9889,6 +9889,173 @@ mod tests {
         assert_eq!(doc.index.bp().len(), 4);
     }
 
+    /// #4219: `ReindexedDoc::new` takes `scalar_root` from the value's variant,
+    /// not from the text, so a serializer that ever wrapped or padded a scalar
+    /// (a BOM, a leading newline, a wrapper for a new variant) would be indexed
+    /// as a different document with no failure. Every non-container variant,
+    /// through every route that builds a `ReindexedDoc`, must write exactly one
+    /// token at offset 0, and the length-only index must equal the scanner's on
+    /// the interest bits, their rank at every position, and the parentheses.
+    ///
+    /// The variant census below is an exhaustive `match` with no wildcard: a
+    /// new `OwnedValue` variant stops this test compiling until it has a case.
+    #[test]
+    fn every_scalar_variant_bridges_as_one_token_at_offset_zero_4219() {
+        use crate::json::JsonIndex;
+        let literal = |text: &str| OwnedValue::from_number_bytes::<JqSemantics>(text.as_bytes());
+
+        #[derive(Default)]
+        struct Seen {
+            null: bool,
+            boolean: bool,
+            int: bool,
+            float: bool,
+            nan_instance: bool,
+            infinity: bool,
+            number_literal: bool,
+            string: bool,
+        }
+        let mut seen = Seen::default();
+
+        let scalars = vec![
+            OwnedValue::Null,
+            OwnedValue::Bool(true),
+            OwnedValue::Bool(false),
+            OwnedValue::Int(0),
+            OwnedValue::Int(-1),
+            OwnedValue::Int(i64::MAX),
+            OwnedValue::Int(i64::MIN),
+            // A computed float spells its digits as the bridge's own token.
+            OwnedValue::Float(0.0),
+            OwnedValue::Float(-0.0),
+            OwnedValue::Float(1.5),
+            OwnedValue::Float(0.1 + 0.2),
+            OwnedValue::Float(1e300),
+            OwnedValue::Float(f64::MIN_POSITIVE),
+            OwnedValue::Float(f64::INFINITY),
+            OwnedValue::Float(f64::NEG_INFINITY),
+            OwnedValue::Float(1e300 * 1e300),
+            OwnedValue::Float(f64::NAN),
+            OwnedValue::Float(-f64::NAN),
+            OwnedValue::Float(f64::from_bits(0x7ff0_0000_0000_0001)),
+            OwnedValue::fresh_nan_instance(false),
+            OwnedValue::fresh_nan_instance(true),
+            OwnedValue::document_nan_instance(false, 0x1000),
+            literal("0"),
+            literal("-0"),
+            literal("1"),
+            literal("1.0"),
+            literal("1.50"),
+            literal("1e2"),
+            literal("1E-2"),
+            literal("1e400"),
+            literal("-1e400"),
+            literal("1e-400"),
+            literal("100000000000000000000"),
+            literal("0.1000000000000000055511151231257827"),
+            literal(&"9".repeat(400)),
+            OwnedValue::String("".into()),
+            OwnedValue::String(" ".into()),
+            OwnedValue::String("\n".into()),
+            OwnedValue::String("\u{feff}".into()),
+            OwnedValue::String("[".into()),
+            OwnedValue::String("{\"a\": [1, 2]}".into()),
+            OwnedValue::String("1 2".into()),
+            OwnedValue::String("q\"b\\s\n\u{1}\u{7f}é😀".into()),
+            OwnedValue::String("x".repeat(200).into()),
+        ];
+        for value in &scalars {
+            match value {
+                OwnedValue::Null => seen.null = true,
+                OwnedValue::Bool(_) => seen.boolean = true,
+                OwnedValue::Int(_) => seen.int = true,
+                OwnedValue::Float(f) if f.is_infinite() => seen.infinity = true,
+                OwnedValue::Float(_) => seen.float = true,
+                OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if is_nan_instance(*f) => {
+                    seen.nan_instance = true;
+                }
+                OwnedValue::NumberLiteral(..) => seen.number_literal = true,
+                OwnedValue::String(_) => seen.string = true,
+                OwnedValue::Array(_) | OwnedValue::Object(_) => {
+                    panic!("a container is not a scalar root: {value:?}")
+                }
+            }
+            assert!(value.is_scalar_root(), "{value:?}");
+
+            // Every route that hands `ReindexedDoc::new` a `scalar_root` flag:
+            // `reindexed` and `reindexed_without_provenance` (each under both
+            // modes' spellings) and `input_bridge_doc`.
+            let docs = [
+                ("reindexed/jq", value.reindexed::<JqSemantics>().unwrap()),
+                ("reindexed/yq", value.reindexed::<YqSemantics>().unwrap()),
+                (
+                    "reindexed_without_provenance/jq",
+                    value.reindexed_without_provenance::<JqSemantics>().unwrap(),
+                ),
+                (
+                    "reindexed_without_provenance/yq",
+                    value.reindexed_without_provenance::<YqSemantics>().unwrap(),
+                ),
+                ("input_bridge_doc", value.input_bridge_doc()),
+            ];
+            for (route, doc) in &docs {
+                let text = doc.text();
+                let bytes = text.as_bytes();
+                let what = format!("{route} of {value:?}: {text:?}");
+
+                // One token at offset 0: not empty, nothing before or after it.
+                assert!(!text.is_empty(), "empty text, {what}");
+                assert_eq!(text, text.trim_matches([' ', '\n', '\t', '\r']), "{what}");
+                assert!(!text.starts_with('\u{feff}'), "BOM, {what}");
+
+                // The scanner, which reads the text rather than the variant,
+                // must see that one token too -- a second token or a container
+                // would show as another interest bit or a longer BP.
+                let general = JsonIndex::build_reindex(bytes);
+                assert_eq!(general.ib_rank1(general.ib_len()), 1, "{what}");
+                assert_eq!(general.ib()[0] & 1, 1, "interest bit at 0, {what}");
+                assert_eq!(general.bp().len(), 2, "one leaf pair, {what}");
+
+                let index = &doc.index;
+                assert_eq!(index.ib_len(), general.ib_len(), "{what}");
+                assert_eq!(index.ib(), general.ib(), "IB, {what}");
+                for p in 0..=general.ib_len() + 1 {
+                    assert_eq!(
+                        index.ib_rank1(p),
+                        general.ib_rank1(p),
+                        "ib_rank1({p}), {what}"
+                    );
+                }
+                assert_eq!(index.bp().len(), general.bp().len(), "BP len, {what}");
+                assert_eq!(index.bp().words(), general.bp().words(), "BP, {what}");
+                assert!(
+                    format!("{index:?}").contains("bridge_tokens: true"),
+                    "{what}"
+                );
+                assert!(
+                    !doc.registered,
+                    "a scalar has no storage to register, {what}"
+                );
+            }
+        }
+
+        // Every variant had a case; the match above has no wildcard, so a new
+        // variant fails to compile before this can pass vacuously.
+        let Seen {
+            null,
+            boolean,
+            int,
+            float,
+            nan_instance,
+            infinity,
+            number_literal,
+            string,
+        } = seen;
+        assert!(
+            null && boolean && int && float && nan_instance && infinity && number_literal && string
+        );
+    }
+
     /// #3479: the reindex bridge text is written in one pass now; it must be the
     /// bytes the nested per-node form wrote, for every kind of leaf the bridge
     /// has a spelling for (computed floats, NaN instances, infinities, number
