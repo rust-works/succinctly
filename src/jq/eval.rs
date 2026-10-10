@@ -26540,8 +26540,12 @@ fn index_array_by_position<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // mode, so this arm just propagates whichever one it returned.
             Err(e) => QueryResult::Error(e),
         },
-        // jq returns null for index on null
-        StandardJson::Null => QueryResult::One(StandardJson::Null),
+        // jq returns null for index on null. #4275 (yq): `null` is an empty array for a
+        // negative index, so `null | .[-1]` raises what `[] | .[-1]` does.
+        StandardJson::Null => match yq_negative_index_check::<S>(idx, idx, 0) {
+            Some(e) => QueryResult::Error(e),
+            None => QueryResult::One(StandardJson::Null),
+        },
         // (#4079: the callers that know the literal's spelling look the member up first.)
         StandardJson::Object(_) if yq_numeric_index_on_object_is_null::<S>() => {
             QueryResult::One(StandardJson::Null)

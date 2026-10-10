@@ -12455,6 +12455,11 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                     None => GenericResult::Owned(OwnedValue::Null),
                 }
             } else if cursor_is_null(&value, cursor.as_ref()) {
+                // #4275 (yq): `null` is an empty array for a negative index, so `null | .[-1]`
+                // raises the out-of-range error `[] | .[-1]` does (see the array arm above).
+                if let Some(e) = yq_negative_index_check::<S>(*idx, *idx, 0) {
+                    return GenericResult::Error(e);
+                }
                 // jq returns null for index on null, as the `Expr::Field` arm
                 // above already does for `.foo`. Without this, `null | .[0]`
                 // errored while `null | .[$n]` — the same query, and the same
@@ -20963,6 +20968,12 @@ fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
             } else if target.is_null()
                 || (target.as_object().is_some() && yq_numeric_index_on_object_is_null::<S>())
             {
+                // #4275 (yq): `null` is an empty array for a negative index.
+                if target.is_null() {
+                    if let Some(e) = idx.and_then(|i| yq_negative_index_check::<S>(i, i, 0)) {
+                        return GenericResult::Error(e);
+                    }
+                }
                 GenericResult::Owned(OwnedValue::Null)
             } else if yq_field_index_on_scalar_is_empty::<S>() {
                 // #2482 (yq mode): every yq-mode `Object` case was already
