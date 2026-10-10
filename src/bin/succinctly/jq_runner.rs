@@ -4290,7 +4290,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
         // `input_filename`'s names for this route's source tags, which are the
         // indexes into `raw_inputs` below (#3046).
         jq::cli_context::set_input_names(input_names(&files));
-        let raw_inputs: Vec<Vec<u8>> = if files.is_empty() {
+        let mut raw_inputs: Vec<Vec<u8>> = if files.is_empty() {
             vec![read_stdin_bytes()?]
         } else {
             match files
@@ -4302,6 +4302,10 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 Err(unopenable) => return Ok(report_unopenable_input(&unopenable)),
             }
         };
+        // #4305: see [`stitch_json_file_seams`]. Not under `--validate`, which is strict per file.
+        if !args.validate {
+            stitch_json_file_seams(raw_inputs.iter_mut());
+        }
         // Substitution is skipped under `--validate` so the strict validator
         // in the loop below still sees the *original* bytes (#1247).
         // Substituting first silently repaired a non-UTF-8 document, leaving
@@ -5258,6 +5262,13 @@ fn get_inputs(
     // JSON input mode is the only mode that runs the strict validator at all
     // -- `-R`, `--seq` and DSV never do, and must not start now.
     let json_input_mode = args.input_dsv.is_none() && !args.raw_input && !args.seq;
+    // #4305: jq reads every input file as one byte stream, so a token still open at the end of
+    // a file continues in the next one.
+    // `--validate` is strict per file (an empty file is rejected too), so it reads the files as
+    // written.
+    if json_input_mode && !args.validate {
+        stitch_json_file_seams(raw_bytes.iter_mut().map(|(_, raw)| raw));
+    }
 
     // #1525: real jq warns on stderr when it drops a malformed --seq
     // record; succinctly silently ignored malformed records entirely
@@ -5560,11 +5571,10 @@ fn get_inputs(
     // changes what happens to the *values* afterward, not how records/lines
     // are delimited) -- so both handle the whole file list at once via
     // [`build_seq_values`]/[`build_raw_input_values`] rather than per file
-    // inside the loop below. Plain JSON keeps the per-file loop unchanged:
-    // `find_json_values`/`parse_json_stream` never had a record delimiter
-    // to lose in the first place (multiple JSON files are just independent
-    // value streams concatenated in the output, with no
-    // boundary-spanning-value concept to get wrong). DSV rows are
+    // inside the loop below. Plain JSON keeps the per-file loop: a token
+    // open where one file ends is moved onto the next file up front
+    // ([`stitch_json_file_seams`], #4305), so each file is a run of whole
+    // tokens by the time it gets here. DSV rows are
     // line-oriented and unverified either way (no jq DSV oracle to check
     // against), so they also keep the per-file loop -- including when
     // combined with `-R` (`args.raw_input && args.input_dsv.is_some()`),
@@ -6467,6 +6477,107 @@ fn parse_error_line(bytes: &[u8], start: usize) -> usize {
         .position(|&b| b == b'\n')
         .map_or(bytes.len(), |offset| start + offset);
     line_at(bytes, line_end)
+}
+
+/// jq reads all of its input files as **one concatenated byte stream** (#4305), so a token
+/// still open where a file ends continues at the start of the next one: `1` then `2\n` is
+/// the single number `12`, `{"a":` then `1}\n` is `{"a":1}`, `tr` then `ue\n` is `true`.
+/// Each file here is indexed and located on its own, so the open tail of a file is moved onto
+/// the front of the next, which leaves every file a run of whole tokens the per-file machinery
+/// already handles. jq completes such a value while reading the later file, so the later
+/// file is also the one `input_filename` and a diagnostic name for it, which is where the
+/// tail now sits.
+///
+/// An open tail is a truncated container or string, or a bare number or keyword that runs to
+/// the end of the file (it ends only at the next byte). A file that is only that tail
+/// (an empty file between two others leaves it standing) hands it on again. The last file has
+/// no successor and is left alone, as is a malformed token no later file can repair.
+///
+/// Recorded residual: the moved tail keeps its newlines, so `input_line_number` for a value
+/// that began in an earlier file and had a newline inside it counts them in the later file
+/// (jq counts the later file's lines alone).
+fn stitch_json_file_seams<'a>(raws: impl Iterator<Item = &'a mut Vec<u8>>) {
+    let mut raws: Vec<&mut Vec<u8>> = raws.collect();
+    let Some(last) = raws.len().checked_sub(1) else {
+        return;
+    };
+    let mut carry: Vec<u8> = Vec::new();
+    for (index, raw) in raws.iter_mut().enumerate() {
+        if !carry.is_empty() {
+            // Exact, not amortized: a doubled capacity on a multi-gigabyte file is the cost.
+            raw.reserve_exact(carry.len());
+            raw.splice(0..0, std::mem::take(&mut carry));
+        }
+        if index < last {
+            if let Some(start) = open_tail_start(raw) {
+                carry = raw.split_off(start);
+            }
+        }
+    }
+}
+
+/// Where the open tail of a file starts ([`stitch_json_file_seams`]), if it has one.
+fn open_tail_start(raw: &[u8]) -> Option<usize> {
+    match split_json_values(raw) {
+        // The splitter gave up at `start`: a truncated token runs into the end of the file;
+        // anything else is a malformed byte no later file can repair.
+        (_, Some(start)) => token_runs_to_end(&raw[start..]).then_some(start),
+        // Every token is whole, but a bare number or keyword at the very end is only
+        // delimited by the next byte.
+        (spans, None) => spans
+            .last()
+            .filter(|&&(start, end)| end == raw.len() && !matches!(raw[start], b'{' | b'[' | b'"'))
+            .map(|&(start, _)| start),
+    }
+}
+
+/// Whether `tail`, which starts at the first byte of a token the splitter could not finish,
+/// is cut off by the end of the file rather than malformed: an unclosed container or string,
+/// or a bare token with no byte after it to end it.
+fn token_runs_to_end(tail: &[u8]) -> bool {
+    match tail.first() {
+        Some(b'{' | b'[') => {
+            let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
+            for &b in tail {
+                if in_string {
+                    match (escaped, b) {
+                        (true, _) => escaped = false,
+                        (false, b'\\') => escaped = true,
+                        (false, b'"') => in_string = false,
+                        _ => {}
+                    }
+                } else {
+                    match b {
+                        b'"' => in_string = true,
+                        b'{' | b'[' => depth += 1,
+                        b'}' | b']' => depth = depth.saturating_sub(1),
+                        _ => {}
+                    }
+                }
+            }
+            in_string || depth > 0
+        }
+        Some(b'"') => {
+            let (mut escaped, mut closed) = (false, false);
+            for &b in &tail[1..] {
+                match (escaped, b) {
+                    (true, _) => escaped = false,
+                    (false, b'\\') => escaped = true,
+                    (false, b'"') => {
+                        closed = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            !closed
+        }
+        // jq's literal boundary: whitespace and `"[{,:]}`.
+        Some(_) => !tail.iter().any(|&b| {
+            b.is_ascii_whitespace() || matches!(b, b'"' | b'[' | b'{' | b',' | b':' | b']' | b'}')
+        }),
+        None => false,
+    }
 }
 
 /// Find the byte ranges of JSON values in a byte slice.
@@ -11217,6 +11328,107 @@ mod tests {
                 .to_json(),
             "{\"a\":7,\"b\":{\"c\":\"\u{FFFD}\"}}"
         );
+    }
+
+    /// #4305: the open tail of a file is what jq would continue in the next one.
+    #[test]
+    fn open_tail_start_finds_what_the_next_file_continues_4305() {
+        // A bare number or keyword at the very end is only ended by the next byte.
+        assert_eq!(open_tail_start(b"1"), Some(0));
+        assert_eq!(open_tail_start(b"[1]\n2"), Some(4));
+        assert_eq!(open_tail_start(b"true"), Some(0));
+        assert_eq!(open_tail_start(b"1."), Some(0));
+        assert_eq!(open_tail_start(b"-"), Some(0));
+        assert_eq!(open_tail_start(b"tr"), Some(0));
+        // A truncated container or string, however much of it came before.
+        assert_eq!(open_tail_start(b"{\"a\":"), Some(0));
+        assert_eq!(open_tail_start(b"1 [1, {\"a\": [2"), Some(2));
+        assert_eq!(open_tail_start(b"{\n  \"a\":\n"), Some(0));
+        assert_eq!(open_tail_start(b"\"ab"), Some(0));
+        assert_eq!(open_tail_start(b"\"a\\\""), Some(0));
+        assert_eq!(open_tail_start(b"{\"a\":\"x}"), Some(0));
+        // A whole value is not: a string, container, or a scalar a byte follows.
+        assert_eq!(open_tail_start(b"\"ab\""), None);
+        assert_eq!(open_tail_start(b"{\"a\":1}"), None);
+        assert_eq!(open_tail_start(b"[1]"), None);
+        assert_eq!(open_tail_start(b"1\n"), None);
+        assert_eq!(open_tail_start(b"1 "), None);
+        assert_eq!(open_tail_start(b""), None);
+        assert_eq!(open_tail_start(b"  \n"), None);
+        // A malformed byte no later file can repair stays where it is.
+        assert_eq!(open_tail_start(b"1 } 2"), None);
+        assert_eq!(open_tail_start(b"1 ]\n"), None);
+    }
+
+    /// #4305: what [`token_runs_to_end`] calls cut off by the end of the file.
+    #[test]
+    fn token_runs_to_end_tells_a_cut_token_from_a_malformed_one_4305() {
+        // Cut: an unclosed container (an escaped quote and a bracket in a string do not close
+        // or open anything), an unclosed string, a bare token with no byte after it.
+        for cut in [
+            &b"{\"a\\\"b\":"[..],
+            b"[1, \"]\"",
+            b"[[1],",
+            b"\"ab",
+            b"\"a\\\"",
+            b"-",
+            b"1e",
+            b"tru",
+        ] {
+            assert!(token_runs_to_end(cut));
+        }
+        // Not cut: balanced, over-closed, a closed string, a token a delimiter ends, nothing.
+        for whole in [
+            &b"{\"a\\\"b\":1}"[..],
+            b"{}}",
+            b"[1]]",
+            b"\"ab\"",
+            b"\"a\\\"b\"",
+            b"1 ",
+            b"1,",
+            b"-e5]",
+            b"",
+        ] {
+            assert!(!token_runs_to_end(whole));
+        }
+    }
+
+    /// #4305: the tail moves onto the next file, through an empty one, and the last file
+    /// keeps whatever it ends with.
+    #[test]
+    fn stitch_json_file_seams_moves_the_open_tail_forward_4305() {
+        let stitched = |files: &[&[u8]]| -> Vec<Vec<u8>> {
+            let mut raws: Vec<Vec<u8>> = files.iter().map(|f| f.to_vec()).collect();
+            stitch_json_file_seams(raws.iter_mut());
+            raws
+        };
+        assert_eq!(
+            stitched(&[b"1", b"2\n"]),
+            vec![b"".to_vec(), b"12\n".to_vec()]
+        );
+        assert_eq!(
+            stitched(&[b"[0] {\"a\":", b"1}\n"]),
+            vec![b"[0] ".to_vec(), b"{\"a\":1}\n".to_vec()]
+        );
+        assert_eq!(
+            stitched(&[b"1", b"", b"2", b"3\n"]),
+            vec![b"".to_vec(), b"".to_vec(), b"".to_vec(), b"123\n".to_vec()]
+        );
+        // The last file has no successor; whole values and whitespace move nothing.
+        assert_eq!(
+            stitched(&[b"1\n", b"2"]),
+            vec![b"1\n".to_vec(), b"2".to_vec()]
+        );
+        assert_eq!(
+            stitched(&[b"{}", b"2\n"]),
+            vec![b"{}".to_vec(), b"2\n".to_vec()]
+        );
+        assert_eq!(
+            stitched(&[b"1 ", b"2\n"]),
+            vec![b"1 ".to_vec(), b"2\n".to_vec()]
+        );
+        assert_eq!(stitched(&[b"{\"a\":"]), vec![b"{\"a\":".to_vec()]);
+        assert_eq!(stitched(&[]), Vec::<Vec<u8>>::new());
     }
 
     #[test]

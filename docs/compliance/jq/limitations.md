@@ -6390,6 +6390,27 @@ Wrapping the evaluation in
 so a recursion too deep for it refuses instead; running recursive `def`s at any real depth
 still needs a thread reserved at a comparable size.
 
+## Input files are one byte stream (#4305)
+
+jq 1.7.1 reads all of its input files as one concatenated byte stream, so a token still open where a
+file ends continues in the next one: `1` then `2\n` is the one number `12`, `{"a":` then `1}\n` is
+`{"a":1}`, `tr` then `ue\n` is `true`, and `true` then `false\n` is the one malformed token
+`truefalse`. `succinctly jq` indexes each file on its own, so before any of that runs the open tail of a
+file (a truncated container or string, or a bare number or keyword that runs to the file's end) is moved
+onto the front of the next file, through an empty one, and the last file keeps whatever it ends with
+(`stitch_json_file_seams`). Plain JSON only; `--seq` and `-R` already read the whole file list at once
+(#1571, #1809), DSV input has no jq oracle, and `--validate` is strict per file (it rejects an empty file
+too), so it reads the files as written and rejects a value that spans two. The value is complete in the later file, which is what
+jq's `input_filename` and a diagnostic name for it, and where the tail now sits. Pinned by
+`test_jq_input_files_are_one_byte_stream_4305`.
+
+**Recorded residual:** the moved tail keeps its newlines, so `input_line_number` for a value that began in
+an earlier file and has a newline inside it (a pretty-printed object cut across two files) counts those
+lines in the later file as well, where jq counts the later file's own lines: `{"a":\n` then `1}\n` is line
+2 here and 1 in jq. Parse errors in the same shape name their line the same way. A parse error mid-file
+(`1 } 2` then `3\n`) still lets the next file's values through where jq stops reading at the error
+(unchanged by this section).
+
 ## `input`/`inputs` residuals after #1309
 
 [#1309](https://github.com/rust-works/succinctly/issues/1309) closed four of the five gaps

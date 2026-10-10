@@ -39123,10 +39123,12 @@ fn test_jq_input_and_outer_loop_share_one_queue_723() -> Result<()> {
 
 #[test]
 fn test_jq_null_input_reduce_inputs_over_multiple_files_723() -> Result<()> {
+    // Each file ends in a newline: jq reads the files as one byte stream (#4305), so `1` then `2`
+    // with nothing between them is the one number `12`.
     let mut f1 = NamedTempFile::new()?;
-    write!(f1, "1")?;
+    writeln!(f1, "1")?;
     let mut f2 = NamedTempFile::new()?;
-    write!(f2, "2")?;
+    writeln!(f2, "2")?;
     let (stdout, stderr, code) = run_jq_full(
         &[
             "-cn",
@@ -41221,6 +41223,86 @@ fn test_jq_seq_slurp_truncated_record_across_file_boundary_1550() -> Result<()> 
     assert_eq!(code, 5, "{stderr}");
     assert!(stderr.contains("(at <unknown>): x"), "{stderr}");
 
+    Ok(())
+}
+
+/// #4305: jq reads all of its input files as one concatenated byte stream, so a token still
+/// open where a file ends continues in the next: `1` then `2\n` is the one number `12`, a
+/// `{"a":` is closed by the next file's `1}`. The open tail is moved onto the next file
+/// before anything parses, so `-s`, `input`/`inputs`, `input_filename` and the lazy route all
+/// see jq's values, and a value jq completes in the later file is named by the later file.
+/// Every expectation is jq 1.7.1's own output.
+#[test]
+fn test_jq_input_files_are_one_byte_stream_4305() -> Result<()> {
+    let rows: &[(&[&str], &[&str], &str)] = &[
+        (&["-c", "."], &["1", "2\n"], "12\n"),
+        (&["-c", "."], &["1", "2", "3\n"], "123\n"),
+        (&["-c", "."], &["1", "", "2\n"], "12\n"),
+        (&["-c", "."], &["{\"a\":", "1}\n"], "{\"a\":1}\n"),
+        (&["-c", "."], &["\"ab", "cd\"\n"], "\"abcd\"\n"),
+        (&["-c", "."], &["tr", "ue\n"], "true\n"),
+        (&["-c", "."], &["-", "5\n"], "-5\n"),
+        (&["-c", "."], &["1.", "5\n"], "1.5\n"),
+        (
+            &["-c", "."],
+            &["{\n  \"a\":\n", "  [1,\n", "2]\n}\n"],
+            "{\"a\":[1,2]}\n",
+        ),
+        (&["-sc", "."], &["1", "2\n"], "[12]\n"),
+        (&["-sc", "."], &["{\"a\":", "1}\n"], "[{\"a\":1}]\n"),
+        (&["-nc", "[inputs]"], &["1", "2\n"], "[12]\n"),
+        (&["-nc", "input"], &["1", "2\n"], "12\n"),
+        (&["-c", "[., input_line_number]"], &["1", "2\n"], "[12,1]\n"),
+        // Contrasts: a file that ends on a whole value, or in whitespace, is not joined.
+        (&["-c", "."], &["{\"a\":1}", "2\n"], "{\"a\":1}\n2\n"),
+        (&["-c", "."], &["\"a\"", "1\n"], "\"a\"\n1\n"),
+        (&["-c", "."], &["1\n", "2\n"], "1\n2\n"),
+        (&["-c", "."], &["1 ", "2\n"], "1\n2\n"),
+    ];
+    for (args, files, expected) in rows {
+        let (stdout, stderr, code, _paths) = run_jq_over_files(args, files)?;
+        assert_eq!(code, 0, "{args:?} over {files:?}: {stderr}");
+        assert_eq!(&stdout, expected, "{args:?} over {files:?}");
+    }
+
+    // The value is complete in the later file, which is the file `input_filename` names.
+    for files in [&["1", "2\n"][..], &["{\"a\":", "1}\n"][..]] {
+        let (stdout, stderr, code, paths) =
+            run_jq_over_files(&["-c", "[., input_filename]"], files)?;
+        assert_eq!(code, 0, "{stderr}");
+        let joined: serde_json::Value = serde_json::from_str(files.concat().trim_end())?;
+        assert_eq!(
+            stdout,
+            format!(
+                "[{joined},{}]\n",
+                serde_json::Value::from(paths[1].as_str())
+            ),
+            "{files:?}"
+        );
+    }
+
+    // Recorded residual (limitations.md): the moved tail keeps its newline, so the value is on
+    // line 2 here and on line 1 in jq, which counts the later file's own lines.
+    let (stdout, stderr, code, _paths) =
+        run_jq_over_files(&["-c", "[., input_line_number]"], &["{\"a\":\n", "1}\n"])?;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "[{\"a\":1},2]\n");
+
+    // The other input modes already read the whole list at once and are not stitched again: `-R`
+    // joins `1` and `2` into the one line `12` as jq does, and `--validate` is strict per file, so
+    // a value spanning two files is rejected there as an incomplete document (exit 3).
+    let (stdout, stderr, code, _paths) = run_jq_over_files(&["-R", "."], &["1", "2\n"])?;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "\"12\"\n");
+    let (stdout, stderr, code, _paths) =
+        run_jq_over_files(&["--validate", "-c", "."], &["{\"a\":", "1}\n"])?;
+    assert_eq!(code, 3, "{stderr}");
+    assert_eq!(stdout, "");
+
+    // `true` then `false` is the one token `truefalse` to jq, which rejects it.
+    let (stdout, _stderr, code, _paths) = run_jq_over_files(&["-c", "."], &["true", "false\n"])?;
+    assert_eq!(code, 5);
+    assert_eq!(stdout, "");
     Ok(())
 }
 
@@ -120738,8 +120820,8 @@ fn test_slurp_multiple_files_keep_order_and_last_file_location_2847() -> Result<
     assert_eq!((out.as_str(), code), ("[1,2,3,[4]]\n", 0), "stderr {err}");
 
     // Empty files in the middle and at the ends contribute nothing, and
-    // never a stray comma.
-    let (out, err, code, _) = run_jq_over_files(&["-sc", "."], &["", "1", "", "2\n", ""])?;
+    // never a stray comma. (`1` with no newline would join the next file's `2`, #4305.)
+    let (out, err, code, _) = run_jq_over_files(&["-sc", "."], &["", "1\n", "", "2\n", ""])?;
     assert_eq!((out.as_str(), code), ("[1,2]\n", 0), "stderr {err}");
 
     let (out, err, code, paths) =
