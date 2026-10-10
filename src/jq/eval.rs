@@ -48382,6 +48382,32 @@ impl<'e> RegisterSpine<'e> {
         }
     }
 
+    /// The names a bind of `expr` to `patterns` binds, each with whether it may hold the
+    /// register. A destructuring alternative's names hold members. The first bare `$var`
+    /// alternative holds `expr` when it matches, the register if [`binds_register`] says so;
+    /// a later one only on a retry after the body raised (#4278), and is read as not the
+    /// register.
+    ///
+    /// [`binds_register`]: Self::binds_register
+    fn chain_names(&self, expr: &Expr, patterns: &'e [Pattern]) -> Vec<(&'e str, bool)> {
+        let mut register = self.binds_register(expr);
+        let mut names = Vec::new();
+        for pattern in patterns {
+            match pattern {
+                Pattern::Var(name) => {
+                    names.push((name.as_str(), register));
+                    register = false;
+                }
+                _ => {
+                    let mut members = Vec::new();
+                    pattern_names(pattern, &mut members);
+                    names.extend(members.into_iter().map(|name| (name, false)));
+                }
+            }
+        }
+        names
+    }
+
     /// `body`'s reach with `names` bound, each to the register or not.
     fn with_vars(&mut self, names: &[(&'e str, bool)], body: &'e Expr) -> Reach {
         let depth = self.vars.len();
@@ -48417,8 +48443,10 @@ impl<'e> RegisterSpine<'e> {
             // meets the register where the bind did, and a destructure there is the source's
             // own. #4278: the variables it binds are tracked, so a later `$x as {a:$a}` of a
             // `$x` bound to the register is that destructure too. In a chain of bare `$var`s
-            // every name is read as the register: the first always matches, but a raise in the
-            // body retries the next one bound to the same value.
+            // only the first is read as the register: it always matches, and the others hold
+            // `null` unless the body raises and jq retries, which routing them would model
+            // with a refusal a `try` around the fold then swallows (`. as $x ?// $y | $y as
+            // {a:$a}` under `try`, in a `reduce` UPDATE, raised in jq and answered here).
             Expr::As { expr, var, body } => {
                 let register = self.binds_register(expr);
                 self.with_vars(&[(var.as_str(), register)], body)
@@ -48428,13 +48456,7 @@ impl<'e> RegisterSpine<'e> {
                 patterns,
                 body,
             } if patterns_all_bare(patterns) => {
-                let register = self.binds_register(expr);
-                let mut names = Vec::new();
-                for pattern in patterns {
-                    pattern_names(pattern, &mut names);
-                }
-                let names: Vec<(&'e str, bool)> =
-                    names.into_iter().map(|name| (name, register)).collect();
+                let names = self.chain_names(expr, patterns);
                 self.with_vars(&names, body)
             }
             // #4128: `select(true) as {a:$a}` binds the register as `. as {a:$a}` does, so
@@ -48449,32 +48471,23 @@ impl<'e> RegisterSpine<'e> {
             // the drive makes.
             // #4278: whatever the chain, its body runs after it, on the register where the
             // matched alternative left it, so a destructure in the body is the source's own
-            // (`. as $x ?// [$q] | . as {a:$a} | .`). A destructuring alternative's names hold
-            // members; a bare `$var` alternative's holds the bound value, the register when
-            // that alternative matches (`. as [$q] ?// $x | $x as {a:$a}`). A destructuring
-            // alternative may have moved the register, so the chain never hands it on.
+            // (`. as $x ?// [$q] | . as {a:$a} | .`). Its names are [`chain_names`]: the first
+            // bare `$var` alternative holds the register when it matches (`. as [$q] ?// $x |
+            // $x as {a:$a}`). A destructuring alternative may have moved the register, so the
+            // chain never hands it on.
+            //
+            // [`chain_names`]: Self::chain_names
             Expr::AsPattern {
                 expr,
                 patterns,
                 body,
             } => {
-                let register = self.binds_register(expr);
                 if (routes_destructuring(patterns) || patterns_all_destructuring_chain(patterns))
-                    && register
+                    && self.binds_register(expr)
                 {
                     return Reach::Destructures;
                 }
-                let mut names = Vec::new();
-                for pattern in patterns {
-                    match pattern {
-                        Pattern::Var(name) => names.push((name.as_str(), register)),
-                        _ => {
-                            let mut members = Vec::new();
-                            pattern_names(pattern, &mut members);
-                            names.extend(members.into_iter().map(|name| (name, false)));
-                        }
-                    }
-                }
+                let names = self.chain_names(expr, patterns);
                 match self.with_vars(&names, body) {
                     Reach::Destructures => Reach::Destructures,
                     _ => Reach::Opaque,
