@@ -42996,6 +42996,26 @@ mod tests {
         assert!(pull(Some("error(\"x\")"), f64::floor).is_none());
     }
 
+    /// #4195: a target with no cursor of its own (a bare borrowed value) is read the same way.
+    #[test]
+    fn test_fused_slice_read_of_a_target_without_a_cursor_4195() {
+        let json = br"[10,20,30,40]";
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let Expr::Pipe(pair) = crate::jq::parse(".[1+0:][0]").unwrap() else {
+            panic!("a pipe of slice and read");
+        };
+        let (slice, read) = fusable_slice_read(pair.as_slice()).unwrap();
+        assert_eq!(
+            try_fused_slice_read::<JqSemantics, _>(slice, read, root.value(), None),
+            Some(OwnedValue::Int(20))
+        );
+        assert_eq!(
+            try_fused_slice_read::<JqSemantics, _>(slice, SliceRead::Length, root.value(), None),
+            Some(OwnedValue::Int(3))
+        );
+    }
+
     #[test]
     fn test_json_computed_slice_bounds_via_eval_generic() {
         // #615: exercises Expr::SliceExpr through eval_generic's actual

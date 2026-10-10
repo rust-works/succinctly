@@ -123142,6 +123142,51 @@ fn test_fused_slice_read_declines_to_the_ordinary_route_4195() -> Result<()> {
     Ok(())
 }
 
+/// #4195: a fused read hands its value to the stages after it as the slice's single output would
+/// have been -- through the sink driver at the top of a filter, and through `map`'s body -- so a
+/// consumer that stops early, an error raised after the read, and a `,` fan-out after it all
+/// behave as without the fusion. Values are jq 1.7.1's own.
+#[test]
+fn test_fused_slice_read_feeds_the_rest_of_the_pipe_4195() -> Result<()> {
+    let doc = "[1,2,3,4,5,6,7]";
+    for (filter, expected) in [
+        ("3 as $i | .[$i:] | length | . + 1", "5\n"),
+        ("3 as $i | .[$i:] | .[0] | tostring", "\"4\"\n"),
+        (
+            "3 as $i | first(.[$i:] | length | ., error(\"never\"))",
+            "4\n",
+        ),
+        ("3 as $i | [limit(1; .[$i:] | .[0] | ., 99)]", "[4]\n"),
+        (
+            "3 as $i | try (.[$i:] | length | error(\"boom\")) catch .",
+            "\"boom\"\n",
+        ),
+        ("3 as $i | [.[$i:] | length | ., 0]", "[4,0]\n"),
+    ] {
+        assert_eq!(
+            run_jq_stdin(filter, doc, &["-c"])?,
+            (expected.to_string(), 0),
+            "{filter}"
+        );
+    }
+    let (stdout, stderr, code) =
+        run_jq_stdin_streams("3 as $i | .[$i:] | length | error(\"boom\")", doc, &["-c"])?;
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("", "jq: error (at <stdin>:0): boom\n", 5)
+    );
+    // The same stages behind a `map` body, which runs them through the non-sink driver.
+    assert_eq!(
+        run_jq_stdin(
+            "0 as $i | map(.[$i:] | length | . + 1)",
+            "[[1,2,3,4,5],[1,2,3,4]]",
+            &["-c"]
+        )?,
+        ("[6,5]\n".to_string(), 0)
+    );
+    Ok(())
+}
+
 /// #4195: the documents and targets the fused read declines because the array itself cannot be
 /// read -- a malformed array, a target that is itself undecodable, an absent field, an error
 /// raised by the stage after the read -- answer what the unfused spelling does.
