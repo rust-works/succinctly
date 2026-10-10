@@ -3314,7 +3314,9 @@ fn census<F: DocumentFields>(fields: &F) -> KeyCensus {
 /// Whether any key *may* occur more than once among already-walked fields.
 ///
 /// The slice counterpart of [`census`], for callers that have had to
-/// materialize the fields anyway. One [`KeyHashes`] probe per key, no sort.
+/// materialize the fields anyway: one hash per key, answered by
+/// [`any_hash_repeats`] (#4169), which sorts only the hashes the bitset
+/// prefilter could not clear.
 ///
 /// Deliberately conservative, as [`KeyHashes::insert`] is: two distinct
 /// keys sharing a 64-bit hash answer `true` here. The only caller,
@@ -3329,9 +3331,7 @@ fn keys_repeat<V: DocumentValue, C: DocumentCursor>(fields: &[DocumentField<V, C
     if fields.len() < 2 {
         return false;
     }
-    let mut hashes: Vec<u64> = fields.iter().filter_map(field_key_hash).collect();
-    hashes.sort_unstable();
-    hashes_repeat(&hashes)
+    any_hash_repeats(fields.iter().filter_map(field_key_hash).collect())
 }
 
 /// [`keys_repeat`] for a caller holding a live [`DocumentFields`] walk
