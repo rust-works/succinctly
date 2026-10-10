@@ -6552,7 +6552,11 @@ fn parse_error_line(bytes: &[u8], start: usize) -> usize {
                 | Kind::InvalidEscape { .. }
                 | Kind::InvalidUnicodeEscape { .. }
                 | Kind::UnpairedSurrogate { .. } => string_close_from(bytes, at),
-                _ => at,
+                // jq's lexer takes a whole token before its parser sees it: a
+                // string where a separator belongs is refused at its closing
+                // quote, and a bad literal or number (`truex`, `1x`) at the
+                // delimiter that ends it.
+                _ => token_end(bytes, at),
             }
         }
         // The splitter refused a value this parser accepts: place it where it
@@ -6560,6 +6564,25 @@ fn parse_error_line(bytes: &[u8], start: usize) -> usize {
         Ok(()) => start,
     };
     LineCounter::new(bytes).line_at_read_of(detected)
+}
+
+/// Where jq's lexer completes the token at `at`: a string's closing quote, the
+/// delimiter after a run of literal or number bytes, or `at` itself for a
+/// structural byte (#4308).
+fn token_end(bytes: &[u8], at: usize) -> usize {
+    match bytes.get(at) {
+        Some(b'"') => string_close_from(bytes, at + 1),
+        Some(&b) if is_bare_token_byte(b) => bytes[at..]
+            .iter()
+            .position(|&b| !is_bare_token_byte(b))
+            .map_or(bytes.len(), |offset| at + offset),
+        _ => at,
+    }
+}
+
+/// A byte jq's lexer reads as part of a literal or number token.
+fn is_bare_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'+' | b'.')
 }
 
 /// The closing quote of the string `at` is inside (past backslash escapes),
@@ -11255,6 +11278,14 @@ mod tests {
         assert_eq!(at("1\n\"ab\ncd\"\n"), 3);
         assert_eq!(at("1\n\"ab"), 1);
         assert_eq!(at("1\n[1,"), 1);
+        // A whole token is lexed before the parser refuses it: a string where a
+        // separator belongs at its closing quote, a bad literal or number at
+        // the delimiter after it.
+        assert_eq!(at("0\n[\"a\" \"b\nc\"]\n"), 3);
+        assert_eq!(at("0\n{\"a\" \"b\nc\"}\n"), 3);
+        assert_eq!(at(&format!("0\n[{}1 \"ab\"]\n", " ".repeat(4090))), 2);
+        assert_eq!(at(&format!("0\n{}truex\n", " ".repeat(4092))), 2);
+        assert_eq!(at(&format!("0\n{}1x\n", " ".repeat(4093))), 2);
     }
 
     #[test]

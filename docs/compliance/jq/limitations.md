@@ -7624,7 +7624,11 @@ succinctly stops ([#4311](https://github.com/rust-works/succinctly/issues/4311))
 error names after the parse error has been read matches jq's: every newline up to the end of
 the read in which jq detects the fault, at the fault itself for a malformed container
 (`0\n[1,\n2,\n}\n` → line 4), at the closing quote for a string holding a raw control
-character, and at the end of input for a value cut off there.
+character, and at the end of input for a value cut off there. One case still differs: on a
+line longer than jq's 4095-byte read that holds invalid UTF-8, the read boundary is counted in
+the text after each invalid byte became a three-byte U+FFFD, where jq counts the bytes it read,
+so a value within a few bytes of the boundary can be placed one line off. Invalid bytes are
+substituted before the line model sees the text, and a genuine U+FFFD looks the same.
 
 **The materializing flag routes still validate whatever the filter — down to `-n`/`input`
 now, closed by [#2662](https://github.com/rust-works/succinctly/issues/2662) for
