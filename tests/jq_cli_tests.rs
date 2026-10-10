@@ -123855,6 +123855,15 @@ fn test_fused_slice_read_equals_the_unfused_spelling_4195() -> Result<()> {
         ("[-1]?", "| .[-1]?"),
         ("| first?", "| first?"),
         ("| length?", "| length?"),
+        // #4317: a computed index (`$i` is 1, `$j` 4, `$neg` -2, `$s` a string, `$z` null).
+        ("[$i]", "| .[$i]"),
+        ("[$j]", "| .[$j]"),
+        ("[$neg]", "| .[$neg]"),
+        ("[$i+$j]", "| .[$i+$j]"),
+        ("[$s]", "| .[$s]"),
+        ("[$z]", "| .[$z]"),
+        ("[$i]?", "| .[$i]?"),
+        ("[$neg] | tostring", "| .[$neg] | tostring"),
     ];
     for doc in docs {
         for bound in bounds {
@@ -123904,6 +123913,17 @@ fn test_fused_slice_read_values_4195() -> Result<()> {
         ("1.5 as $i | .[$i:][0]", "2\n"),
         ("2.5 as $i | .[:$i][-1]", "3\n"),
         ("null as $i | .[$i:][0]", "1\n"),
+        // #4317: a computed index reads the slice's resolved range, as a literal one does.
+        ("5 as $i | 0 as $k | .[$i:][$k]", "6\n"),
+        ("5 as $i | 1 as $k | .[$i:][$k]", "7\n"),
+        ("5 as $i | (-1) as $k | .[$i:][$k]", "7\n"),
+        ("5 as $i | 9 as $k | .[$i:][$k]", "null\n"),
+        ("5 as $i | (-9) as $k | .[$i:][$k]", "null\n"),
+        ("1 as $i | 2 as $k | .[$i:3][$k]", "null\n"),
+        ("5 as $i | 1.5 as $k | .[$i:][$k]", "7\n"),
+        ("5 as $i | 1e0 as $k | .[$i:][$k]", "7\n"),
+        ("5 as $i | (0.5+0.5) as $k | .[$i:][$k]", "7\n"),
+        ("5 as $i | 1 as $k | .[$i:][$k]?", "7\n"),
         // #4288: `first` is `.[0]` and `last` is `.[-1]` of the slice, `null` on an empty one.
         ("5 as $i | .[$i:] | first", "6\n"),
         ("5 as $i | .[$i:] | last", "7\n"),
@@ -124121,6 +124141,10 @@ fn test_fused_slice_read_does_not_convert_siblings_4195() -> Result<()> {
         ("0 as $i | .[$i:] | last", "3\n"),
         ("0 as $i | .[$i:]?[0]", "1\n"),
         ("0 as $i | .[$i:][2]?", "3\n"),
+        // #4317
+        ("0 as $i | .[$i:][$i+2]", "3\n"),
+        ("0 as $i | .[$i:][$i]", "1\n"),
+        ("0 as $i | (-1) as $k | .[$i:][$k]", "3\n"),
     ] {
         for context in contexts {
             let filter = context.replace("{}", &format!("({read})"));

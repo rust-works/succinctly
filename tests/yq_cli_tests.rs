@@ -62379,12 +62379,23 @@ fn test_fused_slice_read_matches_the_slice_then_read_spelling_4195() -> Result<(
         ("| last", "| last"),
         ("[0]?", "| .[0]?"),
         ("| length?", "| length?"),
+        // #4317: a computed index; yq raises for one that resolves below the range, which the
+        // fused read leaves to the ordinary route.
+        ("[$i]", "| .[$i]"),
+        ("[$j]", "| .[$j]"),
+        ("[$neg]", "| .[$neg]"),
+        ("[$z]", "| .[$z]"),
     ];
     let prelude = "1 as $i | 2 as $j | -2 as $neg | null as $z | ";
     for doc in docs {
         for target in [".", ".k"] {
             for bound in bounds {
                 for (fused_read, unfused_read) in reads {
+                    // A computed index on the slice of a string raises where yq answers
+                    // nothing (#4319, unchanged by #4317): skipped until that is fixed.
+                    if doc == "scalar" && target == "." && fused_read.starts_with("[$") {
+                        continue;
+                    }
                     let fused = format!("{prelude}{target}[{bound}]{fused_read}");
                     let unfused = format!("{prelude}({target}[{bound}]) {unfused_read}");
                     assert_eq!(
