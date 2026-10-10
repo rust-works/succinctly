@@ -48261,19 +48261,23 @@ fn bind_hands_on_the_register(e: &Expr) -> bool {
 /// Only the source's own spine is read (the bind itself and its body, a comma's
 /// branches, a pipe's stages up to the first that may move the register (#3940,
 /// #4278), an `if`'s branches, a no-argument `def` call's body (#4278), a nested
-/// `foreach` over `.`), never a builtin's argument, where `.` is another value. A nested `foreach . as [$q] (...)` moves the
+/// `foreach` over `.`), never a builtin's argument, where `.` is another value. A nested
+/// `foreach . as [$q] (...)` moves the
 /// register for the outer fold too (#3853): it does not backtrack its source, so what it
 /// destructures reaches the outer EXTRACT. (An earlier routing of it answered a root
 /// where jq refuses inside an `or` under a `try`, 54 sampled rows; those were the
 /// resolver's uncatchable "with result" refusal of a `.` body after a moved register,
-/// which [`body_performs_no_step`] now keeps from firing early.) A `?//` chain is left
-/// to the by-value drive as for a fresh source ([`routes_destructuring`]), except as a
-/// nested `foreach`'s own patterns over the register ([`routes_destructuring_chain`], #3948).
+/// which [`body_performs_no_step`] now keeps from firing early.) A `?//` chain of
+/// destructuring patterns on the register is the source's own destructure (#4187); one with a
+/// bare `$var` alternative is not by itself, but a destructure in its body is (#4278), as is a
+/// nested `foreach`'s own chain over the register ([`routes_destructuring_chain`], #3948).
 ///
-/// The bound expression is a bare `.` or a `select(literal)` that hands it on (#4128); a
-/// `(.|.)`/`(., .)` bind stays out, since the resolver reads it as a computed value. The
-/// other [`source_destructures_register`] mode, through a nested `reduce`, is only for
-/// the places the register is not known to be at `.`.
+/// The bound expression is a bare `.`, a `select(literal)` that hands it on (#4128), a comma of
+/// those (#4150), or a variable that may hold the register (#4278: bound to it on the spine, or
+/// bound outside the source), also behind `first`/`last`/`limit`/`?`/`label`
+/// ([`RegisterSpine::binds_register`]). A `(.|.)` bind stays out, since the resolver reads it as
+/// a computed value. The other [`source_destructures_register`] mode, through a nested
+/// `reduce`, is only for the places the register is not known to be at `.`.
 fn foreach_source_destructures_register(source: &Expr) -> bool {
     source_destructures_register(source, false)
 }
