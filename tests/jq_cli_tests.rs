@@ -75896,6 +75896,157 @@ fn test_foreach_update_navigated_then_def_keeps_the_register_lost_at_the_node_42
     ])
 }
 
+/// #4187: a plain bind in front of a destructure in a `foreach` source (`. as $x | . as {a:$a} | .`)
+/// does not move jq's register (its source is a subexpression), so the destructure behind it is
+/// the source's own: its step moves the register onto `.a` and the emitted `.` is no longer there.
+/// `source_destructures_register` stopped at the `. as $x` and never read its body, so the source
+/// was driven by value and `path`, `del` and `=` through it answered the root: `= 9` replaced the
+/// whole document and `del` deleted it, where jq raises. A `reduce` source is backtracked, so it
+/// answers the root in jq too, as does a plain bind with no destructure behind it. Every row
+/// captured from jq 1.7.1 with `-c`.
+#[test]
+fn test_foreach_source_plain_bind_before_a_destructure_refuses_4187() -> Result<()> {
+    let doc = r#"{"a":false,"b":null}"#;
+    let with_result = "Invalid path expression with result";
+    assert_path_rows_3289(&[
+        (
+            doc,
+            r"del(foreach (. as $x | . as {a:$a} | .) as $y (.; .; .))",
+            "",
+            with_result,
+            5,
+        ),
+        (
+            doc,
+            r"(foreach (. as $x | . as {a:$a} | .) as $y (.; .; .)) = 9",
+            "",
+            with_result,
+            5,
+        ),
+        (
+            doc,
+            r"[path(foreach (. as $x | . as {a:$a} | .) as $y (.; .; .))]",
+            "",
+            with_result,
+            5,
+        ),
+        (
+            doc,
+            r"del(try (foreach (. as $x | . as {a:$a} | .) as $y (.; .; .)))",
+            "",
+            with_result,
+            5,
+        ),
+        (
+            doc,
+            r"[path(foreach (. as $x | . as {a:$a} | $x) as $y (.; .; .))]",
+            "",
+            with_result,
+            5,
+        ),
+        (
+            doc,
+            r"del(reduce .[]? as $k (.; foreach (. as $x | . as {a:$a} | .) as $y (.; .; .)))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            doc,
+            r"[path(foreach (.a as $x | . as {a:$a} | .) as $y (.; .; .))]",
+            "",
+            with_result,
+            5,
+        ),
+        (
+            doc,
+            r"[path(reduce (. as $x | . as {a:$a} | .) as $y (.; .))]",
+            "[[]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(foreach (. as $x | .) as $y (.; .; .))]",
+            "[[]]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
+/// #4187: a `?//` chain of destructuring patterns on the bare register as a `foreach` source
+/// (`. as {a:$a} ?// [$a] | .`). jq's register follows the first alternative that matches and a
+/// failed one is retried from the fork, so on `{"a":[1]}` the object pattern matches, the emitted
+/// `.` is no longer at the register, and the last alternative's `.[0]` of the object raises. The
+/// by-value drive answered the root, so `del` deleted the document and `=` replaced it. A `reduce`
+/// source is backtracked, so it answers the root in jq too, and a chain with a bare `$var`
+/// alternative (`. as {a:$a} ?// $a`) is left to the by-value drive, which matches jq there. Every
+/// row captured from jq 1.7.1 with `-c`.
+#[test]
+fn test_foreach_source_destructuring_chain_on_the_register_refuses_4187() -> Result<()> {
+    let doc = r#"{"a":[1]}"#;
+    let cannot_index = "Cannot index object with number";
+    assert_path_rows_3289(&[
+        (
+            doc,
+            r"[path(foreach (. as {a:$a} ?// [$a] | .) as $y (.; .; .))]",
+            "",
+            cannot_index,
+            5,
+        ),
+        (
+            doc,
+            r"del(foreach (. as {a:$a} ?// [$a] | .) as $y (.; .; .))",
+            "",
+            cannot_index,
+            5,
+        ),
+        (
+            doc,
+            r"(foreach (. as {a:$a} ?// [$a] | .) as $y (.; .; .)) = 9",
+            "",
+            cannot_index,
+            5,
+        ),
+        (
+            doc,
+            r"del(foreach (. as $x | . as {a:$a} ?// [$a] | .) as $y (.; .; .))",
+            "",
+            cannot_index,
+            5,
+        ),
+        (
+            doc,
+            r"[path(foreach (. as [$a] ?// {a:$a} | .) as $y (.; .; .))]",
+            "",
+            "Invalid path expression with result",
+            5,
+        ),
+        (
+            doc,
+            r"del(reduce (. as {a:$a} ?// [$a] | .) as $y (.; .))",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"[path(reduce (. as [$a] ?// {a:$a} | .) as $y (.; .))]",
+            "[[]]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach (. as {a:$a} ?// $a | .) as $y (.; .; .)) = 9",
+            "9\n",
+            "",
+            0,
+        ),
+    ])
+}
+
 /// #3941: the same read, outside a fold. A destructuring bind's body is a comma whose
 /// siblings are a navigating pipe and a bare `$q`; `$q`'s statement used to be dropped, so the
 /// body refused where jq answers (`destructure-comma-marker-nav` in the bind-origin sweep).
