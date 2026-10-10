@@ -114,7 +114,8 @@ pub use eval::{eval_full, eval_owned_scalar_fast, eval_reindexed_document, with_
 #[cfg(feature = "std")]
 pub use eval::{
     count_reads_past_end, current_input_location, pop_input, pop_remaining_input,
-    seed_remaining_inputs, seed_remaining_inputs_with_error, InputPop, UNKNOWN_INPUT_LINE,
+    seed_remaining_inputs, seed_remaining_inputs_with_error, seed_remaining_inputs_with_errors,
+    InputPop, UNKNOWN_INPUT_LINE,
 };
 // `input_queue_is_active` exists under both gates (a `const fn` returning
 // `false` without `std`), so `eval_generic` can consult it unconditionally.
