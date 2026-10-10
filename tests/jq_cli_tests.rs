@@ -124653,6 +124653,19 @@ fn test_input_resumes_after_a_caught_parse_error_4311() -> Result<()> {
             reads_and_lines,
             "[[\"E\",1],[2,1],[\"E\",0],[\"E\",0]]\n",
         ),
+        // A value jq's parser refuses though it is shaped like one (`{1:2}`,
+        // `[1 2]`) is the fault: its read is discarded with the `12` in it,
+        // and nothing after it is the stream's last event.
+        (
+            &[b"}\n{1:2} 12", b"34 5\n6\n"],
+            reads,
+            "[\"E\",\"E\",34,5,6,\"E\"]\n",
+        ),
+        (
+            &[b"[1 2] \"x\n"],
+            reads_and_lines,
+            "[[\"E\",1],[\"E\",1],[\"E\",0],[\"E\",0]]\n",
+        ),
     ] {
         let (stdout, stderr, code, _) = run_jq_over_byte_files(&["-nc", filter], files)?;
         assert_eq!(

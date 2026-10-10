@@ -11775,30 +11775,38 @@ mod tests {
     #[test]
     fn open_tail_start_finds_what_the_next_file_continues_4305() {
         // A bare number or keyword at the very end is only ended by the next byte.
-        assert_eq!(open_tail_start(b"1"), Some(0));
-        assert_eq!(open_tail_start(b"[1]\n2"), Some(4));
-        assert_eq!(open_tail_start(b"true"), Some(0));
-        assert_eq!(open_tail_start(b"1."), Some(0));
-        assert_eq!(open_tail_start(b"-"), Some(0));
-        assert_eq!(open_tail_start(b"tr"), Some(0));
+        assert_eq!(open_tail_start(b"1", false), Some(0));
+        assert_eq!(open_tail_start(b"[1]\n2", false), Some(4));
+        assert_eq!(open_tail_start(b"true", false), Some(0));
+        assert_eq!(open_tail_start(b"1.", false), Some(0));
+        assert_eq!(open_tail_start(b"-", false), Some(0));
+        assert_eq!(open_tail_start(b"tr", false), Some(0));
         // A truncated container or string, however much of it came before.
-        assert_eq!(open_tail_start(b"{\"a\":"), Some(0));
-        assert_eq!(open_tail_start(b"1 [1, {\"a\": [2"), Some(2));
-        assert_eq!(open_tail_start(b"{\n  \"a\":\n"), Some(0));
-        assert_eq!(open_tail_start(b"\"ab"), Some(0));
-        assert_eq!(open_tail_start(b"\"a\\\""), Some(0));
-        assert_eq!(open_tail_start(b"{\"a\":\"x}"), Some(0));
+        assert_eq!(open_tail_start(b"{\"a\":", false), Some(0));
+        assert_eq!(open_tail_start(b"1 [1, {\"a\": [2", false), Some(2));
+        assert_eq!(open_tail_start(b"{\n  \"a\":\n", false), Some(0));
+        assert_eq!(open_tail_start(b"\"ab", false), Some(0));
+        assert_eq!(open_tail_start(b"\"a\\\"", false), Some(0));
+        assert_eq!(open_tail_start(b"{\"a\":\"x}", false), Some(0));
         // A whole value is not: a string, container, or a scalar a byte follows.
-        assert_eq!(open_tail_start(b"\"ab\""), None);
-        assert_eq!(open_tail_start(b"{\"a\":1}"), None);
-        assert_eq!(open_tail_start(b"[1]"), None);
-        assert_eq!(open_tail_start(b"1\n"), None);
-        assert_eq!(open_tail_start(b"1 "), None);
-        assert_eq!(open_tail_start(b""), None);
-        assert_eq!(open_tail_start(b"  \n"), None);
+        assert_eq!(open_tail_start(b"\"ab\"", false), None);
+        assert_eq!(open_tail_start(b"{\"a\":1}", false), None);
+        assert_eq!(open_tail_start(b"[1]", false), None);
+        assert_eq!(open_tail_start(b"1\n", false), None);
+        assert_eq!(open_tail_start(b"1 ", false), None);
+        assert_eq!(open_tail_start(b"", false), None);
+        assert_eq!(open_tail_start(b"  \n", false), None);
         // A malformed byte no later file can repair stays where it is.
-        assert_eq!(open_tail_start(b"1 } 2"), None);
-        assert_eq!(open_tail_start(b"1 ]\n"), None);
+        assert_eq!(open_tail_start(b"1 } 2", false), None);
+        // #4311: a program that resumes past a parse error searches on where jq
+        // resumes, the read after the fault's, with the fault found by jq's
+        // parser (`{1:2}` is one, though the splitter takes it).
+        assert_eq!(open_tail_start(b"1 } 2", true), None);
+        assert_eq!(open_tail_start(b"}\n2", true), Some(2));
+        assert_eq!(open_tail_start(b"}\n[1,", true), Some(2));
+        assert_eq!(open_tail_start(b"}\n{1:2} 12", true), None);
+        assert_eq!(open_tail_start(b"}\n{1:2}\n12", true), Some(8));
+        assert_eq!(open_tail_start(b"1 ]\n", false), None);
     }
 
     /// #4305: what [`token_runs_to_end`] calls cut off by the end of the file.
