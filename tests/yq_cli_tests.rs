@@ -61316,6 +61316,61 @@ fn test_yq_string_repeat_by_a_negative_or_fractional_count_4269() -> Result<()> 
     Ok(())
 }
 
+/// Pinned yq v4.53.3 (#4270): `length` of a string is its UTF-8 byte count, as Go's `len` makes it.
+/// jq counts characters. Every yq row was captured from the pinned binary, `-p=json -o=json -I=0`
+/// (and, for the YAML rows, `-o=json -I=0`), every jq row from `/usr/bin/jq` 1.7.1.
+#[test]
+fn test_yq_string_length_counts_bytes_4270() -> Result<()> {
+    let args = &["-p=json", "-o=json", "-I=0"];
+    for (input, filter, expected) in [
+        ("\"héllo\"", "length", "6\n"),
+        ("\"日本\"", "length", "6\n"),
+        ("\"日本語\"", "length", "9\n"),
+        ("\"😀\"", "length", "4\n"),
+        ("\"e\\u0301\"", "length", "3\n"),
+        ("\"abc\"", "length", "3\n"),
+        ("\"\"", "length", "0\n"),
+        ("null", "length", "0\n"),
+        ("[\"日本\",\"x\"]", "map(length)", "[6,1]\n"),
+        ("[\"日本\",\"x\"]", "length", "2\n"),
+        ("{\"é\":\"ü\"}", "keys | map(length)", "[2]\n"),
+        ("{\"a\":\"héllo\"}", ".a as $x | $x | length", "6\n"),
+        ("{\"a\":\"héllo\"}", "(.a + \"é\") | length", "8\n"),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, input, args)?,
+            (expected.into(), String::new(), 0),
+            "{input} | {filter}"
+        );
+    }
+    // The same through the YAML reader.
+    for (input, filter, expected) in [
+        ("a: héllo\n", ".a | length", "6\n"),
+        ("a: [日本, x]\n", ".a | map(length)", "[6,1]\n"),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, input, &["-o=json", "-I=0"])?,
+            (expected.into(), String::new(), 0),
+            "yaml: {input} | {filter}"
+        );
+    }
+    // jq mode counts characters (and `utf8bytelength` counts bytes).
+    for (input, filter, expected) in [
+        ("\"héllo\"", "length", "5\n"),
+        ("\"日本\"", "length", "2\n"),
+        ("\"😀\"", "length", "1\n"),
+        ("\"日本\"", "utf8bytelength", "6\n"),
+    ] {
+        let (out, code) = run_jq_stdin(filter, input, &["-c"])?;
+        assert_eq!(
+            (out.as_str(), code),
+            (expected, 0),
+            "jq: {input} | {filter}"
+        );
+    }
+    Ok(())
+}
+
 /// Pinned yq v4.53.3 (#4257): `pick` indexes an array by an integer, or by a string that parses as
 /// one (Go's base-10 `ParseInt`: a sign and leading zeros are fine, spaces are not); every other
 /// key, a float included, is an error, and a negative index does not wrap. `omit` leaves a scalar

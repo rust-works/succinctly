@@ -30937,7 +30937,7 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 // below answer (#3597).
                 .filter(|_| !is_json_sourced_number(&value, cursor.as_ref()))
             {
-                GenericResult::Owned(OwnedValue::Int(s.chars().count() as i64))
+                GenericResult::Owned(OwnedValue::Int(super::eval::string_length::<S>(&s)))
             } else if let Some(elements) = value.as_array() {
                 // #2261: `_checked` refuses a trailing stray comma after a
                 // real last element (`[1,]`) -- the array counterpart of
