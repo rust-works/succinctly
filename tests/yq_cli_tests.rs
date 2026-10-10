@@ -60948,9 +60948,9 @@ fn test_object_construction_is_collect_object_2783() -> Result<()> {
 
 /// Pinned yq v4.53.3: an entry of a `{...}` whose key or value yields nothing is skipped and the
 /// others still build the object, where the cross product `succinctly yq` built emptied the whole
-/// construction (#4193). The same `COLLECT_OBJECT` quirks follow: an empty entry that is not the
-/// first, or one whose count differs from the first entry's, drops its neighbours too. Every row
-/// was captured from the pinned binary, `-p=json -o=json -I=0`.
+/// construction (#4193). The same `COLLECT_OBJECT` quirk follows: the result is the cross product of
+/// the entries after the last empty one, so an empty entry takes the ones before it along. Every
+/// row was captured from the pinned binary, `-p=json -o=json -I=0`.
 #[test]
 fn test_object_construction_skips_a_pair_with_no_output_4193() -> Result<()> {
     let args = &["-p=json", "-o=json", "-I=0"];
@@ -60976,7 +60976,10 @@ fn test_object_construction_skips_a_pair_with_no_output_4193() -> Result<()> {
             r#"{"a":{"x":1},"b":(1|select(false)),"a":{"y":2}}"#,
             "{\"a\":{\"y\":2}}\n",
         ),
-        // Not the first entry, or a different count from it: the neighbours go too.
+        // A key or an index applied to a scalar yields nothing in yq, so a plain path is empty too.
+        (r#"{"a":.k.id,"b":.n[0].n}"#, "{\"b\":\"a\"}\n"),
+        (r#"{"a":.n[0].n,"b":.k[0],"c":.k.x}"#, ""),
+        // An empty entry empties the cross product, so the entries before the last empty one go.
         (
             r#"{"a":1,"b":(1|select(false)),"c":(3,4)}"#,
             "{\"c\":3}\n{\"c\":4}\n",

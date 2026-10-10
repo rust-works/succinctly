@@ -76,7 +76,14 @@ pub(crate) fn collect_object<S: EvalSemantics>(
     entries: Vec<UnionEntry>,
 ) -> Result<Vec<OwnedValue>, EvalError> {
     if !entries.is_empty() && entries.iter().all(|e| matches!(e, UnionEntry::Pair(_))) {
-        return collect_pairs::<S>(entries);
+        let lists = entries
+            .into_iter()
+            .filter_map(|entry| match entry {
+                UnionEntry::Pair(maps) => Some(maps),
+                UnionEntry::Bare(_) => None,
+            })
+            .collect();
+        return collect_pairs::<S>(lists);
     }
     collect_union::<S>(entries)
 }
@@ -89,14 +96,13 @@ pub(crate) fn collect_object<S: EvalSemantics>(
 /// the aggregate, each later one is cross-multiplied into it, and one that is empty empties it
 /// (the next then seeds it afresh). That is what this does directly on the owned maps, which is
 /// the common case of a `{...}` with a `select` in it and has no business cloning every value
-/// through `Array` wrappers. [`collect_union`] stays the one place that models the node layout;
+/// through `Array` wrappers. It takes the lists, so no entry is unwrapped twice. [`collect_union`] stays the one place that models the node layout;
 /// `pairs_fold_matches_the_node_model` pins the two together.
-fn collect_pairs<S: EvalSemantics>(entries: Vec<UnionEntry>) -> Result<Vec<OwnedValue>, EvalError> {
+fn collect_pairs<S: EvalSemantics>(
+    lists: Vec<Vec<OwnedValue>>,
+) -> Result<Vec<OwnedValue>, EvalError> {
     let mut aggregate: Vec<OwnedValue> = Vec::new();
-    for entry in entries {
-        let UnionEntry::Pair(mut maps) = entry else {
-            unreachable!("collect_object only sends pair entries here"); // patchcov: coverage tolerate-line reason="unreachable: the caller checked every entry is a Pair before routing here (#4193)"
-        };
+    for mut maps in lists {
         if aggregate.is_empty() {
             aggregate = maps;
             continue;
@@ -253,7 +259,7 @@ mod tests {
         for case in cases {
             let build = || case.iter().cloned().map(entry).collect::<Vec<_>>();
             assert_eq!(
-                collect_pairs::<YqSemantics>(build()).unwrap(),
+                collect_pairs::<YqSemantics>(case.clone()).unwrap(),
                 collect_union::<YqSemantics>(build()).unwrap(),
                 "{case:?}"
             );

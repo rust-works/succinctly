@@ -52559,6 +52559,8 @@ mod tests {
                 r#"{"c":3} {"c":4}"#,
             ),
             (r#"{"a":1,"a":(1|select(false))}"#, ""),
+            // A key applied to a string yields nothing: a path can be the empty entry.
+            (r#"{"a":.k.id,"b":.n[0].n}"#, r#"{"b":"a"}"#),
             (r#"{"a":(1|select(false)),"a":2}"#, r#"{"a":2}"#),
             (r#"{"a":1,"b":(.n|select(length>5)),"c":2}"#, r#"{"c":2}"#),
             (r#"{"a":[(1|select(false))],"b":2}"#, r#"{"a":[],"b":2}"#),

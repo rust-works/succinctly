@@ -4548,18 +4548,33 @@ pub(crate) fn yq_object_route<S: EvalSemantics>(
     if S::TAG != EvalTag::Yq {
         return ObjectRoute::Fanout;
     }
-    let mut may_be_empty = false;
+    // One pass, and no walk of an operand that is a plain path or literal: this runs once per
+    // input record, and the usual construction is nothing but those.
+    let (mut all_one, mut all_plain) = (true, true);
     for entry in entries {
-        match &entry.key {
+        let key = match &entry.key {
             ObjectKey::Bare => return ObjectRoute::Union,
-            ObjectKey::Literal(_) => {}
-            ObjectKey::Expr(key) => may_be_empty |= !yields_exactly_one_value(key),
+            ObjectKey::Literal(_) => None,
+            ObjectKey::Expr(key) => Some(&**key),
+        };
+        for operand in key.into_iter().chain(core::iter::once(&entry.value)) {
+            all_one &= yields_exactly_one_value(operand);
+            all_plain &= is_plain_navigation(operand);
         }
-        may_be_empty |= !yields_exactly_one_value(&entry.value);
     }
-    if !may_be_empty {
+    if all_one {
         return ObjectRoute::Fanout;
     }
+    if all_plain || !entries.iter().any(operand_may_have_effect) {
+        ObjectRoute::FanoutThenUnion
+    } else {
+        ObjectRoute::Union
+    }
+}
+
+/// Whether a key or value of `entry` holds something that writes or reads outside the value:
+/// building the construction twice would do it twice.
+fn operand_may_have_effect(entry: &super::expr::ObjectEntry) -> bool {
     let effectful = |expr: &Expr| {
         super::walk::any_subexpr(expr, &mut |e| {
             matches!(
@@ -4580,12 +4595,21 @@ pub(crate) fn yq_object_route<S: EvalSemantics>(
             )
         })
     };
-    if entries.iter().any(|entry| {
-        effectful(&entry.value) || matches!(&entry.key, ObjectKey::Expr(key) if effectful(key))
-    }) {
-        ObjectRoute::Union
-    } else {
-        ObjectRoute::FanoutThenUnion
+    effectful(&entry.value) || matches!(&entry.key, ObjectKey::Expr(key) if effectful(key))
+}
+
+/// A literal, `.`, or a chain of keys and indexes: it cannot have a side effect, which is all
+/// [`yq_object_route`] needs to know about it without walking it.
+fn is_plain_navigation(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_)
+        | Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Slice { .. } => true,
+        Expr::Paren(inner) => is_plain_navigation(inner),
+        Expr::Pipe(stages) => stages.iter().all(is_plain_navigation),
+        _ => false,
     }
 }
 
@@ -31157,18 +31181,17 @@ fn resolves_to_at_most_one_path(expr: &Expr) -> bool {
 /// `{...}` builds (#4193).
 ///
 /// An allowlist, so a shape not named here is read as "may produce nothing" and costs only the
-/// slower `COLLECT_OBJECT` route, never a wrong answer. `Expr::Var` and `Expr::Loc` are absent on
-/// purpose: an unbound variable yields nothing in yq mode
-/// ([`EvalSemantics::UNBOUND_VARIABLE_YIELDS_NOTHING`]). So are `Expr::Optional`, `select`, `empty`
-/// and every generator.
+/// second look, never a wrong answer. `Expr::Var` and `Expr::Loc` are absent on purpose: an
+/// unbound variable yields nothing in yq mode
+/// ([`EvalSemantics::UNBOUND_VARIABLE_YIELDS_NOTHING`]). So are `Expr::Field`, `Expr::Index`,
+/// `Expr::Slice` and `Expr::IndexExpr`: yq yields nothing, not `null`, for a key or index applied
+/// to a string, number or boolean (`"s" | .id`), and so does `succinctly yq`. And `Expr::Optional`,
+/// `select`, `empty` and every generator.
 pub(crate) fn yields_exactly_one_value(expr: &Expr) -> bool {
     match expr {
         Expr::Literal(_)
         | Expr::TrackedVar(_)
         | Expr::Identity
-        | Expr::Field(_)
-        | Expr::Index { .. }
-        | Expr::Slice { .. }
         | Expr::Env
         | Expr::Not
         | Expr::Format(_) => true,
@@ -31196,9 +31219,6 @@ pub(crate) fn yields_exactly_one_value(expr: &Expr) -> bool {
             StringPart::Literal(_) => true,
             StringPart::Expr(inner) => yields_exactly_one_value(inner),
         }),
-        Expr::IndexExpr { target, key } => {
-            yields_exactly_one_value(target) && yields_exactly_one_value(key)
-        }
         Expr::Builtin(builtin) => builtin_yields_exactly_one_value(builtin),
         _ => false,
     }
@@ -138028,17 +138048,21 @@ mod object_union_gate_tests_4193 {
 
     // #4193: a `{...}` is built as a cross product while every key and value provably yields one
     // output, and as the cross product with the union behind it once one might yield nothing.
+    // A path is one that might: yq (and we) yield nothing, not `null`, for a key or an index
+    // applied to a string, number or boolean.
     #[test]
     fn yq_looks_behind_an_empty_cross_product_only_when_an_operand_may_be_empty() {
         for filter in [
-            r#"{"a": 1, "b": .x, "c": [.y[]], "d": (.z | length)}"#,
-            r#"{(.k): .v, "n": "x\(.a)", "s": (.a + 1), "t": (.a // 2)}"#,
-            r#"{"a": (if .x then 1 else 2 end), "b": .[0], "c": (.a | tostring)}"#,
-            r#"{"a": (.l | map(. + 1)), "b": (.l | sort), "c": (.l | has(0))}"#,
+            r#"{"a": 1, "b": "x", "c": [.y[]], "d": (1 + 2)}"#,
+            r#"{"n": "x\(1)", "t": (if true then 1 else 2 end), "u": ("abc" | length)}"#,
+            r#"{("k"): [1, 2], "l": ([1, 3] | sort), "m": ([1] | has(0))}"#,
         ] {
             assert_eq!(route(filter, true), ObjectRoute::Fanout, "`{filter}`");
         }
         for filter in [
+            r#"{"a": .x, "b": .y.z, "c": .[0]}"#,
+            "{(.k): .v}",
+            r#"{"a": (.x | length), "b": (.l | map(. + 1))}"#,
             r#"{"a": (.x | select(.)), "b": 1}"#,
             "{(.k | select(.)): 1}",
             r#"{"a": .x?}"#,

@@ -5059,12 +5059,14 @@ $ echo $?
   an empty entry that is not the first takes the entries before it with it
   (`{"a": 1, "b": (1|select(false)), "c": (3,4)}` is `{"c": 3}` and `{"c": 4}`, and
   `{"a": 1, "b": (1|select(false))}` is nothing). The cross product is built first, since an empty
-  operand always empties it, and only an empty one is rebuilt as `COLLECT_OBJECT`. A construction
-  whose operands all provably yield one value (a path, literal, arithmetic, `[...]`, `if`,
-  interpolation, and the builtins that map one input to one answer: `length`, `keys`, `map`,
-  `sort`, `has`, ...) never looks again; one with a side effect in an operand that might yield
-  nothing (`debug`, `stderr`, `input`, a user function) goes straight to `COLLECT_OBJECT` rather than
-  run it twice. Cost: a construction that comes out empty for every record is built twice, about 1.7x
+  operand always empties it, and only an empty one is rebuilt as `COLLECT_OBJECT`. A path counts as
+  one that might be empty: yq yields nothing, not `null`, for a key or an index applied to a
+  string, number or boolean (`{"a": .m.id, "b": .n}` over `{m: s, n: 2}` is `{"b": 2}`). Only a
+  construction whose operands all provably yield one value (literals, arithmetic, `[...]`, `if`,
+  interpolation, and the builtins that map one input to one answer: `length`, `keys`, `map`, `sort`,
+  `has`, ...) never looks again. One with a side effect in an operand that might yield nothing
+  (`debug`, `stderr`, `input`, a user function) goes straight to `COLLECT_OBJECT` rather than run
+  it twice. Cost: a construction that comes out empty for every record is built twice, about 1.7x
   the construction's share of a query (`.users[] | {"n": .name, "s": (.score | select(. > 1e8))}`
   over 14 MB: +69% wall-clock on an M4 Pro, where the output is empty) -- the one place the old,
   wrong-in-general answer was cheaper. A builtin yq answers with nothing for an input where
