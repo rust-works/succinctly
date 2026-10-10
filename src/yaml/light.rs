@@ -8356,6 +8356,18 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentElements for YamlElements<'a, W> {
         YamlElements::uncons_resolved_cursor(self)
     }
 
+    fn first_dash_comment(&self) -> Option<String> {
+        let (raw, _) = self.uncons_raw_cursor()?;
+        // Asked of every element of every sequence a write rebuilds, so the cheap probe
+        // goes first: almost no item carries a comment, and only then is the structural
+        // test worth making. It is the cursor-route writer's own (`wrapper_comment`): the
+        // comment is the wrapper's only when the item really was a bare `-` whose value
+        // deferred, i.e. resolving it moves the cursor.
+        let comment = raw.line_comment_raw()?;
+        (raw.bp_position() != raw.resolve_bare_seq_item().bp_position())
+            .then(|| comment.to_string())
+    }
+
     fn get(&self, index: usize) -> Option<Self::Value> {
         YamlElements::get(self, index)
     }
