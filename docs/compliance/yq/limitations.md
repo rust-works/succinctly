@@ -5066,11 +5066,11 @@ $ echo $?
   or an index applied to a string, number or boolean, so `{"a": .m.id, "b": .n}` over `{m: s, n: 2}`
   is `b: 2` -- and nor is anything else that can come back empty (`select`, `.[]`, `?`). An operand
   that might be empty and has a side effect (`debug`, `stderr`, `input`, a user function) goes straight
-  to the fold rather than run twice. Cost, M4 Pro, interleaved against the fold-first route of #4238:
-  the constructions that route paid +9% to +16% for read -1% to +3%; a construction that is empty
-  for every record is built twice, +69% wall-clock on a 14 MB document against a build that does
-  not (`.users[] | {"n": .name, "s": (.score | select(. > 1e8))}`). jq mode never takes the fold. Two shapes stay on the fan-out although yq folds
-  them: `$x` with no `as` binding it (yq yields nothing for it, so `{"a": 1, "b": $x, "c": 3}`
+  to the fold rather than run twice. Cost, M4 Pro, interleaved, 7 and 14 MB `users` documents,
+  against the fold-first route #4193 shipped: a `select` in a pair -5% to -8% (and -1% to +3% against
+  the fan-out it replaced); a construction that is empty for every record is built twice, +54%
+  (`.users[] | {"n": .name, "s": (.score | select(. > 1e8))}`). jq mode never takes the fold.
+  Two shapes stay on the fan-out although yq folds them: `$x` with no `as` binding it (yq yields nothing for it, so `{"a": 1, "b": $x, "c": 3}`
   is `c: 3` there and nothing here) -- a variable is judged total because a bound one is by
   far the usual case -- and a `select(.>0)` over an array element inside a pair, which yq
   gives no maps although every element passes (#4239).
