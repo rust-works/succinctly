@@ -1993,18 +1993,26 @@ is the revert that established what the other one costs.
    whose later alternative yields and whose result jq's check then passes) are refused, in the safe direction. Still
    accepted where jq raises, identical on `main`: a `(.|.) as {...}` source (`del(foreach ((.|.) as {a:$a} | .) as
    $y (.; .; .))` deletes the document; routing it first needs `resolve_as_pattern` to read `(.|.)` as the register,
-   since #4128's attempt regressed `del(try (... and true))`). `[path(reduce . as {a:$a} ?// $a (0; .a?) and true)]`,
-   listed with them, refuses as jq does (exit 5) with a different message, on `main` too.
+   since #4128's attempt regressed `del(try (... and true))`), and a destructure of a later bare alternative of a
+   `?//` chain (`. as $x ?// $y | $y as {a:$a} | .`: `$y` is bound only when the body raises and jq retries;
+   routing it made a `try` around a `reduce` UPDATE swallow the resolver's refusal, 26 new wrong accepts, so it is
+   left as it was). `[path(reduce . as {a:$a} ?// $a (0; .a?) and true)]`, listed with them, refuses as jq does (exit
+   5) with a different message, on `main` too.
    [#4278](https://github.com/rust-works/succinctly/issues/4278) closes the other carriers #4187 left: a destructure
-   behind a mixed `?//` chain (`. as $x ?// [$q] | . as {a:$a} | .`, either order), a plain bind that is a later pipe
-   stage (`(. as $x | .) | . as {a:$a} | .`), an `if` branch, a no-argument `def` call (bodies read with a budget of 16
-   per walk), and a `$x` the spine bound to the register (`. as $x | $x as {a:$a} | .`). Pinned by
-   `test_foreach_source_destructure_behind_a_chain_bind_if_or_def_refuses_4278`. Over the 16 register-sweep operands
-   it adds (213,147 rows), 1,294 wrong accepts and 204 wrong answers go to 127 and 34 (the 127 are all the `(.|.)`
-   operand), 1,059 refusals become matches, and 59 matches are lost to a refusal, all inside another fold's body (a
-   `reduce` UPDATE or source), the price #4187 already pays. Over the #3744/#4187/#4278 operands as bare stages
-   (51,531 rows), a mixed chain under `try`/`?` also refuses 16 rows jq answers: the resolver's refusal of a
-   non-last `?//` alternative is the uncatchable one (#4150), where jq's own error is caught.
+   behind a mixed `?//` chain (`. as $x ?// [$q] | . as {a:$a} | .`, either order, and `. as [$q] ?// $x | $x as
+   {a:$a}`, whose bare alternative holds the register when it matches), a pass-through stage before it (a plain bind,
+   an `if`, a no-argument call: `(. as $x | .) | . as {a:$a} | .`), an `if` branch, a no-argument `def` call (its body
+   read in the scope the `def` was written in, with a budget of 16 bodies per walk), and a `$x` the spine bound to the
+   register (`. as $x | $x as {a:$a} | .`, also from inside a `def` body). `source_destructures_register` is one walk
+   (`RegisterSpine::reach`) that says whether a node destructures the register, hands it on, or may move it, so the
+   pipe walk and the destructure test cannot drift apart. Pinned by
+   `test_foreach_source_destructure_behind_a_chain_bind_if_or_def_refuses_4278`. Over the 23 register-sweep operands
+   it adds (294,867 rows), 3,529 wrong accepts and 551 wrong answers go to 972 and 151 (the 972 are all the two
+   operands above), 2,020 refusals become matches, and 249 matches are lost to a refusal: 107 inside another fold's
+   body (a `reduce` UPDATE or source), the price #4187 already pays, and the rest the mixed chain `. as {a:$a} ?// $z
+   | . as {a:$b} | .` under `try`/`?`/`and`, where jq catches its own error but the resolver's refusal of a non-last
+   `?//` alternative is the uncatchable one (#4150). Nothing that matched jq became a wrong accept, on those rows, on
+   the #3744/#4187/#4278 operands as bare stages (56,979 rows) or on a `--sample 6000 --seed 7` over the whole grid.
    [#4187](https://github.com/rust-works/succinctly/issues/4187) closes two of the families: a plain bind in front of
    the destructure (`. as $x | . as {a:$a} | .`, `source_destructures_register` stopped at the bind and never read its
    body: its source is a subexpression, so the body meets the register where the bind did) and a `?//` chain of
