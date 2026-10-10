@@ -5372,7 +5372,10 @@ struct CommaStage<'a> {
 /// - **Navigation branches, any tail.** A branch has no effect, so the only
 ///   thing the tail can move past is a branch's raise, and in both orders a
 ///   tail raise on an earlier branch's output wins (the owned fold pipes a
-///   `Partial` prefix first).
+///   `Partial` prefix first). That is on a readable document: over an
+///   unreadable node the owned route decodes the `,` stage's outputs before
+///   any tail runs, and this route reads a node only where the tail reads it
+///   (#3856's rule, as for the `,` body itself).
 /// - **Computed branches, no tail** (`[.[] | ., length]`). Nothing runs between
 ///   two branches in either order, so an effect (`input`, `debug`), a raise or
 ///   a `break` lands where the owned route lands it.
@@ -5382,7 +5385,8 @@ struct CommaStage<'a> {
 ///
 /// Whatever is not navigation must not read path context (`key`, `parent`,
 /// `path`): the `Expr::Pipe` arm bridges such a pipe whole. A navigation stage
-/// never does, so the walk is asked only of the others.
+/// never does, so the pipe's remembered answer is asked only when some stage
+/// is not navigation.
 ///
 /// `(a, b)?` is a `,` stage too, `guarded`: the `?` covers the group, so a
 /// catchable raise ends that output's group rather than the array
@@ -5392,41 +5396,46 @@ fn split_comma_stage(body: &Expr) -> Option<CommaStage<'_>> {
     let Expr::Pipe(stages) = unwrap_paren(body) else {
         return None;
     };
+    let nav = array_route_stage_is_pure_navigation;
     // The structural test first: most pipes have no `,` stage, and the
-    // predicates walk every stage.
-    let (at, branches, guarded) =
-        stages
-            .iter()
-            .enumerate()
-            .find_map(|(at, stage)| match unwrap_paren(stage) {
-                Expr::Comma(branches) => Some((at, branches, false)),
-                Expr::Optional(inner) => match unwrap_paren(inner) {
-                    Expr::Comma(branches) => Some((at, branches, true)),
-                    _ => None,
-                },
-                _ => None,
-            })?;
-    let (prefix, tail) = (&stages[..at], &stages[at + 1..]);
-    if at == 0 || !prefix.iter().all(array_route_stage_is_pure_navigation) {
-        return None;
+    // predicates walk every stage. A candidate that is refused leaves a later
+    // `,` stage to try, whose prefix then holds the refused one.
+    for (at, stage) in stages.iter().enumerate().skip(1) {
+        let (branches, guarded) = match unwrap_paren(stage) {
+            Expr::Comma(branches) => (branches, false),
+            Expr::Optional(inner) => match unwrap_paren(inner) {
+                Expr::Comma(branches) => (branches, true),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        let (prefix, tail) = (&stages[..at], &stages[at + 1..]);
+        if !prefix.iter().all(nav) {
+            // Every later candidate's prefix holds this one.
+            return None;
+        }
+        let navigation_branches = branches.iter().all(nav);
+        let navigation_tail = tail.iter().all(nav);
+        let order_kept = if guarded {
+            navigation_branches && navigation_tail
+        } else {
+            navigation_branches || tail.is_empty()
+        };
+        // Only a stage that is not navigation can read path context, and the
+        // answer is remembered on the pipe (#3886).
+        if order_kept
+            && ((navigation_branches && navigation_tail)
+                || !crate::jq::eval::pipe_needs_path_context(stages))
+        {
+            return Some(CommaStage {
+                prefix,
+                branches: branches.as_slice(),
+                tail,
+                guarded,
+            });
+        }
     }
-    let reads_no_path = |e: &Expr| {
-        array_route_stage_is_pure_navigation(e) || !crate::jq::eval::needs_path_context(e)
-    };
-    let navigation_branches = branches.iter().all(array_route_stage_is_pure_navigation);
-    let admitted = if guarded {
-        navigation_branches && tail.iter().all(array_route_stage_is_pure_navigation)
-    } else if navigation_branches {
-        tail.iter().all(reads_no_path)
-    } else {
-        tail.is_empty() && branches.iter().all(reads_no_path)
-    };
-    admitted.then_some(CommaStage {
-        prefix,
-        branches: branches.as_slice(),
-        tail,
-        guarded,
-    })
+    None
 }
 
 /// One branch's result inside a `(a, b)?` group ([`split_comma_stage`]), under
@@ -49346,6 +49355,11 @@ mod tests {
         assert_eq!(guarded("[.[] | (., .)? | length]"), None);
         // A `?` around anything but a `,` is not a `,` stage.
         assert_eq!(guarded("[.[] | (.a)?]"), None);
+        // A refused candidate leaves a later `,` stage to split, the refused
+        // one in its prefix.
+        assert_eq!(split("[.[] | (.a, .b)? | ., length]"), Some((2, 2, 0)));
+        assert_eq!(guarded("[.[] | (.a, .b)? | ., length]"), Some(false));
+        assert_eq!(split("[.[] | (., 1) | .a | ., length]"), None);
     }
 
     /// #4166: a `(a, b)?` group keeps what `try_single_generic` with no
