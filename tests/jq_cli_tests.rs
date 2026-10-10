@@ -123846,12 +123846,29 @@ fn test_fused_slice_read_equals_the_unfused_spelling_4195() -> Result<()> {
         ("[7]", "| .[7]"),
         ("| length", "| length"),
         ("[0] | tostring", "| .[0] | tostring"),
+        // #4288: `first` and `last`, a `?` on the read, and either through a `?` on the slice.
+        ("| first", "| first"),
+        ("| last", "| last"),
+        ("| first | tostring", "| first | tostring"),
+        ("| last | tostring", "| last | tostring"),
+        ("[0]?", "| .[0]?"),
+        ("[-1]?", "| .[-1]?"),
+        ("| first?", "| first?"),
+        ("| length?", "| length?"),
     ];
     for doc in docs {
         for bound in bounds {
             for (fused_read, unfused_read) in reads {
                 let fused = format!("{SLICE_READ_PRELUDE}.[{bound}]{fused_read}");
                 let unfused = format!("{SLICE_READ_PRELUDE}(.[{bound}]) {unfused_read}");
+                assert_eq!(
+                    run_jq_stdin(&fused, doc, &["-c"])?,
+                    run_jq_stdin(&unfused, doc, &["-c"])?,
+                    "{doc}: {fused}"
+                );
+                // #4288: a `?` on the slice itself, which the fusion looks through.
+                let fused = format!("{SLICE_READ_PRELUDE}.[{bound}]?{fused_read}");
+                let unfused = format!("{SLICE_READ_PRELUDE}(.[{bound}]?) {unfused_read}");
                 assert_eq!(
                     run_jq_stdin(&fused, doc, &["-c"])?,
                     run_jq_stdin(&unfused, doc, &["-c"])?,
@@ -123887,6 +123904,17 @@ fn test_fused_slice_read_values_4195() -> Result<()> {
         ("1.5 as $i | .[$i:][0]", "2\n"),
         ("2.5 as $i | .[:$i][-1]", "3\n"),
         ("null as $i | .[$i:][0]", "1\n"),
+        // #4288: `first` is `.[0]` and `last` is `.[-1]` of the slice, `null` on an empty one.
+        ("5 as $i | .[$i:] | first", "6\n"),
+        ("5 as $i | .[$i:] | last", "7\n"),
+        ("1 as $i | .[$i:3] | last", "3\n"),
+        ("9 as $i | .[$i:] | first", "null\n"),
+        ("9 as $i | .[$i:] | last", "null\n"),
+        ("3 as $i | 3 as $j | .[$i:$j] | last", "null\n"),
+        ("5 as $i | .[$i:]? | first", "6\n"),
+        ("5 as $i | .[$i:][0]?", "6\n"),
+        ("5 as $i | .[$i:]?[-1]", "7\n"),
+        ("5 as $i | .[$i:] | first?", "6\n"),
     ] {
         assert_eq!(
             run_jq_stdin(filter, doc, &["-c"])?,
@@ -124088,6 +124116,11 @@ fn test_fused_slice_read_does_not_convert_siblings_4195() -> Result<()> {
         ("0 as $i | .[$i:][0]", "1\n"),
         ("0 as $i | .[$i:][2]", "3\n"),
         ("0 as $i | .[$i:] | length", "3\n"),
+        // #4288
+        ("0 as $i | .[$i:] | first", "1\n"),
+        ("0 as $i | .[$i:] | last", "3\n"),
+        ("0 as $i | .[$i:]?[0]", "1\n"),
+        ("0 as $i | .[$i:][2]?", "3\n"),
     ] {
         for context in contexts {
             let filter = context.replace("{}", &format!("({read})"));

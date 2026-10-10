@@ -1038,8 +1038,11 @@ costs no stack depth. What it leaves:
 jq parses the whole input before it evaluates anything, so a document with a malformed value
 anywhere is rejected outright. succinctly indexes lazily and checks the values a filter reads
 (`sjq --validate` is the strict RFC 8259 pass up front). The computed-slice read the fusion
-answers, `E[a:b][k]` with an integer-literal `k` and `E[a:b] | length`, converts only the
-element it names, so a malformed value elsewhere in the range no longer raises:
+answers, `E[a:b][k]` with an integer-literal `k`, `E[a:b] | length` and, since
+[#4288](https://github.com/rust-works/succinctly/issues/4288), `E[a:b] | first` and `| last` (jq mode
+only; they are `.[0]` and `.[-1]`), each with a postfix `?` on the slice or on the read looked
+through, converts only the element it names, so a malformed value elsewhere in the range no longer
+raises:
 
 | Filter                         | Input         | jq                      | succinctly                         |
 |--------------------------------|---------------|-------------------------|------------------------------------|
@@ -1048,12 +1051,16 @@ element it names, so a malformed value elsewhere in the range no longer raises:
 | `0 as $i \| .[$i:][1]`         | `[1,1.2.3,3]` | rejects the document    | raises (it reads the bad element)  |
 | `0 as $i \| (.[$i:]) \| .[0]`  | `[1,1.2.3,3]` | rejects the document    | raises (the slice is built whole)  |
 | `.[0:3][0]`                    | `[1,1.2.3,3]` | rejects the document    | raises (a literal slice, unfused)  |
+| `0 as $i \| .[$i:] \| last`    | `[1,1.2.3,3]` | rejects the document    | `3`                                |
 
 This is the posture `.[0]` and `length` already have: neither looks inside a sibling element.
 The unfused spellings above are what a read of the whole slice does, and they still convert
 every element. The cost of the other choice is the point of the fusion: validating the range
 means touching all of it, which is the O(tail) per read that made a loop over `.[$i:][0]`
-quadratic. Pinned by `test_fused_slice_read_does_not_convert_siblings_4195`.
+quadratic. Pinned by `test_fused_slice_read_does_not_convert_siblings_4195`. Still unfused, and so
+still O(tail) per read: a computed index (`.[$i:][$k]`), a literal-bound slice (`.[2:][0]`, which
+validates the whole range and would stop doing so), and the `| key`/`| path` reads of
+[#4286](https://github.com/rust-works/succinctly/issues/4286).
 
 ## Where succinctly errors and jq does not
 
