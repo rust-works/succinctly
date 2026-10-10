@@ -38260,10 +38260,10 @@ pub(crate) enum PathTrail {
 }
 
 impl PathTrail {
-    /// A fresh, empty trail. Like [`PathPrefix::root`], not a shared
-    /// singleton — re-allocating one `Root` per walk is O(1) regardless, and
-    /// this crate stays `no_std`-compatible with no `thread_local`-style
-    /// sharing available.
+    /// A fresh, empty trail. Not a shared singleton, unlike [`PathPrefix::root`]
+    /// under `std` (#4226) — re-allocating one `Root` per walk is O(1)
+    /// regardless, and this crate stays `no_std`-compatible with no
+    /// `thread_local`-style sharing available.
     pub(crate) fn root() -> Rc<Self> {
         Rc::new(Self::Root)
     }
