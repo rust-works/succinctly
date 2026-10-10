@@ -17,7 +17,7 @@
 //! and the two decodes of the scalar. Neither row crosses the bridge any more
 //! (#4283): `del(.)` is `null` and `del(.[]?)` over a scalar is the input
 //! itself, so both are answered over the owned member
-//! (`eval::eval_owned_fixed_path_del`), and the only call left is that member's
+//! (`eval::fixed_path_del`), and the only call left is that member's
 //! own decode.
 //!
 //! The bounds are absolute because the term is the bridge's own: there is no

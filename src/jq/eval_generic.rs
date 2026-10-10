@@ -4421,16 +4421,18 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
         return GenericResult::Owned(value);
     }
 
-    // #4283: nor does a `del` whose paths are the same whatever `.` is. Off
-    // under the #2889 embed table, as `eval_owned_reindex_free` is below.
-    let owned = if embed_table_active() {
-        owned
-    } else {
-        match crate::jq::eval::eval_owned_fixed_path_del::<S>(expr, owned) {
-            Ok(value) => return GenericResult::Owned(value),
-            Err(owned) => owned,
+    // #4283: nor does a `del` whose paths are the same whatever `.` is,
+    // whose `del(.[]?)` hands `owned` back by move. Off under the #2889 embed
+    // table, as `eval_owned_reindex_free` is below; the shape is checked
+    // first, so other stages skip that thread-local read.
+    if let Some(answer) = crate::jq::eval::fixed_path_del::<S>(expr, &owned) {
+        if !embed_table_active() {
+            return GenericResult::Owned(match answer {
+                crate::jq::eval::FixedPathDel::Null => OwnedValue::Null,
+                crate::jq::eval::FixedPathDel::Input => owned,
+            });
         }
-    };
+    }
 
     // #2889: `add`/`min`/`max` relocate one of their inputs rather than
     // computing a new value, and the round trip below would rebuild that
