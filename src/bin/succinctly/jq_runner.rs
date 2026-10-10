@@ -11375,7 +11375,7 @@ mod tests {
             b"1e",
             b"tru",
         ] {
-            assert!(token_runs_to_end(cut), "{:?}", String::from_utf8_lossy(cut));
+            assert!(token_runs_to_end(cut));
         }
         // Not cut: balanced, over-closed, a closed string, a token a delimiter ends, nothing.
         for whole in [
@@ -11389,11 +11389,7 @@ mod tests {
             b"-e5]",
             b"",
         ] {
-            assert!(
-                !token_runs_to_end(whole),
-                "{:?}",
-                String::from_utf8_lossy(whole)
-            );
+            assert!(!token_runs_to_end(whole));
         }
     }
 
