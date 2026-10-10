@@ -31188,7 +31188,10 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // jq answers `null` for an empty array, for all four spellings; yq has no element
             // to pick and picks nothing (#4236).
             if cursors.is_empty() {
-                return if S::MIN_MAX_NEED_AN_ELEMENT {
+                // `min_by`/`max_by` are not yq builtins; as a gated extension they follow jq.
+                return if S::MIN_MAX_NEED_AN_ELEMENT
+                    && matches!(builtin, Builtin::Min | Builtin::Max)
+                {
                     GenericResult::None
                 } else {
                     GenericResult::Owned(OwnedValue::Null)

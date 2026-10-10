@@ -4513,8 +4513,14 @@ its text (`numeric_display_string`, so `==` and `tostring` agree about a compute
   (`{a: 2, b: 1} | min` is `1`), and `null | to_entries`, `null | with_entries(.)` and
   `null | split(",")` print nothing where jq raises. Every other input keeps its answer. Inside a
   `{...}` such an operand is an empty entry (#4193). jq mode is unchanged
-  (`EvalSemantics::MIN_MAX_NEED_AN_ELEMENT`, `NULL_ENTRIES_AND_SPLIT_YIELD_NOTHING`). A broader
-  sweep of 100 builtins over ten inputs found no other builtin whose emptiness differs.
+  (`EvalSemantics::MIN_MAX_NEED_AN_ELEMENT`, `NULL_ENTRIES_AND_SPLIT_YIELD_NOTHING`), and so are
+  `min_by`/`max_by`, which are not yq builtins. A sweep of 100 builtins over ten inputs found no
+  other builtin whose emptiness differs. Not reproduced: yq's `min`/`max` also turn a `null`
+  node into `[]` when it is *written* through (`[null, {a: 2}] | .[] |= min` is `[[], 2]`, and
+  `(.[] | min) = 5` rewrites the `null` too), where this leaves the node as it was; and yq's
+  comparator rejects the values of a mapping that are maps, booleans or of mixed types
+  (`{a: true, b: false} | min` is `!!bool not yet supported for comparison`) exactly as for an
+  array (#4055), where this keeps jq's ordering.
 - **A write keeps the blank lines between a head-comment block and the node below it**
   ([#4093](https://github.com/rust-works/succinctly/issues/4093)). For a node at column 0 the
   blank lines after the block are recorded as trailing empty entries of the head comment and

@@ -17322,6 +17322,26 @@ fn builtin_all_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     any_all_gen_cond::<W, S>(gen, cond, value, optional, false)
 }
 
+/// yq's `min`/`max` of a mapping: the extremum of its values, nothing for an empty one (#4236).
+/// `items` is the values already materialised, so a decode failure surfaces here once.
+fn mapping_extremum<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    items: Result<Vec<OwnedValue>, EvalError>,
+    optional: bool,
+    want_max: bool,
+) -> QueryResult<'a, W> {
+    match items {
+        Ok(items) => {
+            let pick = if want_max {
+                items.into_iter().max_by(compare_values::<S>)
+            } else {
+                items.into_iter().min_by(compare_values::<S>)
+            };
+            pick.map_or(QueryResult::None, QueryResult::Owned)
+        }
+        Err(e) => suppress_or_raise(e, optional),
+    }
+}
+
 /// Builtin: min
 fn builtin_min<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
@@ -17350,17 +17370,11 @@ fn builtin_min<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         // #4236 (yq): a mapping is the extremum of its values (`{"a": 2, "b": 1} | min` is `1`),
         // and an empty one has none.
-        StandardJson::Object(fields) if S::MIN_MAX_NEED_AN_ELEMENT => {
-            let items: Result<Vec<OwnedValue>, EvalError> =
-                fields.map(|f| to_owned::<S, _>(&f.value())).collect();
-            match items {
-                Ok(items) => items
-                    .into_iter()
-                    .min_by(compare_values::<S>)
-                    .map_or(QueryResult::None, QueryResult::Owned),
-                Err(e) => suppress_or_raise(e, optional),
-            }
-        }
+        StandardJson::Object(fields) if S::MIN_MAX_NEED_AN_ELEMENT => mapping_extremum::<W, S>(
+            fields.map(|f| to_owned::<S, _>(&f.value())).collect(),
+            optional,
+            false,
+        ),
         // A scalar has no element either. A decode failure on it still raises, as in the arm
         // below.
         _ if S::MIN_MAX_NEED_AN_ELEMENT => match scalar_decode_failure(&value) {
@@ -17403,17 +17417,11 @@ fn builtin_max<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(max)
         }
         // #4236 (yq): see `builtin_min`.
-        StandardJson::Object(fields) if S::MIN_MAX_NEED_AN_ELEMENT => {
-            let items: Result<Vec<OwnedValue>, EvalError> =
-                fields.map(|f| to_owned::<S, _>(&f.value())).collect();
-            match items {
-                Ok(items) => items
-                    .into_iter()
-                    .max_by(compare_values::<S>)
-                    .map_or(QueryResult::None, QueryResult::Owned),
-                Err(e) => suppress_or_raise(e, optional),
-            }
-        }
+        StandardJson::Object(fields) if S::MIN_MAX_NEED_AN_ELEMENT => mapping_extremum::<W, S>(
+            fields.map(|f| to_owned::<S, _>(&f.value())).collect(),
+            optional,
+            true,
+        ),
         _ if S::MIN_MAX_NEED_AN_ELEMENT => match scalar_decode_failure(&value) {
             Some(e) => QueryResult::Error(e),
             None => QueryResult::None,
@@ -17864,6 +17872,10 @@ fn builtin_split<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `[["a","b"]]`, where jq gives two results. Bug-for-bug (ADR-0018).
         ArgFanout::yq_native::<S>(),
         |sep_owned| {
+            // #4236 (yq): `null | split(..)` is nothing whatever the separator is.
+            if S::NULL_ENTRIES_AND_SPLIT_YIELD_NOTHING && matches!(value, StandardJson::Null) {
+                return QueryResult::None;
+            }
             let OwnedValue::String(sep) = sep_owned else {
                 return QueryResult::Error(EvalError::new(
                     "split input and separator must be strings",
@@ -17888,8 +17900,6 @@ fn builtin_split<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     };
                     QueryResult::Owned(OwnedValue::array_from(parts))
                 }
-                // #4236 (yq): `null | split(",")` is nothing, not an error.
-                StandardJson::Null if S::NULL_ENTRIES_AND_SPLIT_YIELD_NOTHING => QueryResult::None,
                 _ if optional => QueryResult::None,
                 _ => {
                     QueryResult::Error(EvalError::new("split input and separator must be strings"))
@@ -31428,8 +31438,9 @@ pub(crate) fn yields_at_least_one_value(expr: &Expr) -> bool {
 /// [`builtin_yields_at_most_one_value`] that answer for every input they
 /// accept -- not the filters (`select`, the type filters) that answer `None`
 /// for one, nor `empty`.
-// `min`/`max` (an empty array, a scalar), `to_entries`/`with_entries` and `split` (a `null`) are absent:
-// yq answers nothing for those inputs and so does `succinctly yq` (#4236).
+///
+/// `min`/`max` (an empty array, a scalar), `to_entries` and `split` (a `null`) are absent on
+/// purpose: yq answers nothing for those inputs and so does `succinctly yq` (#4236).
 fn builtin_yields_at_least_one_value(builtin: &Builtin) -> bool {
     match builtin {
         Builtin::Type

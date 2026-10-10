@@ -61120,6 +61120,8 @@ fn test_yq_builtins_that_answer_nothing_4236() -> Result<()> {
         ("null", "to_entries", ""),
         ("null", "with_entries(.)", ""),
         ("null", "split(\",\")", ""),
+        ("null", "split(1)", ""),
+        ("null", "split(null)", ""),
         // A mapping is the extremum of its values.
         ("{\"a\":2,\"b\":1}", "min", "1\n"),
         ("{\"a\":2,\"b\":1}", "max", "2\n"),
@@ -61138,6 +61140,39 @@ fn test_yq_builtins_that_answer_nothing_4236() -> Result<()> {
             run_yq_stdin_with_stderr(filter, input, args)?,
             (expected.into(), String::new(), 0),
             "{input} | {filter}"
+        );
+    }
+    // The same through the YAML reader, whose cursor route is not the JSON one.
+    for (input, filter, expected) in [
+        ("a: []\n", ".a | min", ""),
+        ("a: {}\n", ".a | max", ""),
+        ("a: ~\n", ".a | to_entries", ""),
+        ("a: ~\n", ".a | with_entries(.)", ""),
+        ("a: ~\n", ".a | split(\",\")", ""),
+        ("a: {x: 2, y: 1}\n", ".a | min", "1\n"),
+        ("a: [3, 1]\n", ".a | max", "3\n"),
+        (
+            "a: []\nb: 1\n",
+            "{\"a\": (.a | min), \"b\": .b}",
+            "{\"b\":1}\n",
+        ),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, input, &["-o=json", "-I=0"])?,
+            (expected.into(), String::new(), 0),
+            "yaml: {input} | {filter}"
+        );
+    }
+    // `min_by`/`max_by` are not yq builtins; as the gated extension they follow jq.
+    for filter in ["min_by(.a)", "max_by(.a)"] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(
+                filter,
+                "[]",
+                &["-p=json", "-o=json", "-I=0", "--jq-extensions"]
+            )?,
+            ("null\n".into(), String::new(), 0),
+            "{filter}"
         );
     }
     // jq mode is unchanged.
