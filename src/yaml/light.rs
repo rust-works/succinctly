@@ -6155,7 +6155,10 @@ impl<'a> YamlString<'a> {
     ) -> Option<usize> {
         // The base indent is the mapping key's (for `key: |`) or the line's.
         // For `- key: |`, the key is at indent 2 (after `- `), not 0.
-        let base_indent = Self::compute_key_indent(text, indicator_pos);
+        // A header on a line of its own (`-` / `  >` / `  text`, #4259) is measured against
+        // the block that owns it, which can be no less indented than the header itself.
+        let base_indent = Self::own_line_header_parent_indent(text, indicator_pos)
+            .unwrap_or_else(|| Self::compute_key_indent(text, indicator_pos));
 
         // Explicit indentation: content is at base_indent + N spaces.
         if let Some(indent) = explicit_indent {
@@ -6301,6 +6304,61 @@ impl<'a> YamlString<'a> {
         };
 
         (content_start, content_end)
+    }
+
+    /// The indent of the block that owns a block scalar whose header is the first thing on
+    /// its line (`a:` / `  >` / `  text`, `-` / `  |` / `  text`, #4259), or `None` when
+    /// something else comes first on the line (`key: |`, `- |`, `--- |`) and
+    /// [`Self::compute_key_indent`] applies.
+    ///
+    /// YAML measures the content against that parent, not against the header's own line, so
+    /// `a:` / `  >` / `  text` has content at the header's indent. The parent is read off the
+    /// nearest earlier line that is neither blank nor a comment: its key's column, or for a
+    /// sequence item the dash's -- or, for `- k:`, the key's.
+    fn own_line_header_parent_indent(text: &[u8], indicator_pos: usize) -> Option<usize> {
+        let mut line_start = indicator_pos;
+        while line_start > 0 && !is_line_break(text[line_start - 1]) {
+            line_start -= 1;
+        }
+        if text[line_start..indicator_pos].iter().any(|&b| b != b' ') {
+            return None;
+        }
+        let mut end = line_start;
+        while end > 0 {
+            // `end` is the start of a line: the one before it ends at the break that precedes.
+            let mut prev_end = end - 1;
+            if prev_end > 0 && text[prev_end] == b'\n' && text[prev_end - 1] == b'\r' {
+                prev_end -= 1;
+            }
+            let mut prev_start = prev_end;
+            while prev_start > 0 && !is_line_break(text[prev_start - 1]) {
+                prev_start -= 1;
+            }
+            let line = &text[prev_start..prev_end];
+            let indent = line.iter().take_while(|&&b| b == b' ').count();
+            let rest = &line[indent..];
+            end = prev_start;
+            if rest.is_empty() || rest[0] == b'#' {
+                continue;
+            }
+            if rest[0] == b'-' && matches!(rest.get(1), None | Some(b' ' | b'\t')) {
+                let after = rest[1..]
+                    .iter()
+                    .position(|b| !matches!(b, b' ' | b'\t'))
+                    .map(|i| (i, &rest[1 + i..]));
+                return Some(match after {
+                    // A key whose value is deferred (`- k:`, comment aside): the key's own column.
+                    Some((gap, content))
+                        if crate::yaml::parser::line_ends_with_colon_before_comment(content) =>
+                    {
+                        indent + 1 + gap
+                    }
+                    _ => indent,
+                });
+            }
+            return Some(indent);
+        }
+        None
     }
 
     /// Compute the indentation of the mapping key associated with a block scalar.
