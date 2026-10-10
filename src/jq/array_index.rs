@@ -58,12 +58,15 @@
 //! cursor is its document plus a node, so the rebuilt list is the list the
 //! walk left). Because it makes no checks, a prefix never answers a length.
 //!
-//! A first element read at [`WIDE_ELEMENTS`] or more registers the array; the
-//! second element read starts the prefix, but only once element reads
-//! outnumber length lookups. The value route makes a length lookup before
-//! each element read, so it never does, and stays on the rule above; a length
-//! lookup that finds a prefix hands the array back to it. A prefix counts
-//! against the same limits as an index and is retired the same way.
+//! A first element read at [`WIDE_ELEMENTS`] or more registers the array, the
+//! second walks, and the third starts the prefix: recording costs a push per
+//! element and the ids' allocation, so starting on the second read made
+//! `path(.[90], .[91])` over 20,000 arrays 10-14% slower than its two walks.
+//! It starts only while element reads run two ahead of length lookups. The
+//! value route makes a length lookup before each element read, so it never
+//! does, and stays on the rule above; a length lookup that finds a prefix hands
+//! the array back to it. A prefix counts against the same limits as an index
+//! and is retired the same way.
 //!
 //! # Scope
 //!
@@ -149,6 +152,10 @@ impl ElementIndex {
     }
 }
 
+/// The most ids one extension of an [`ElementPrefix`] reserves room for up
+/// front; a longer walk grows the vector as it goes.
+const RESERVE_ELEMENTS: usize = 1 << 12;
+
 /// The node ids of an array's first elements, in document order, as element
 /// reads walked them, and the list the walk stopped at (#4162; see the module
 /// doc). Answers element reads only, never a length.
@@ -188,6 +195,10 @@ impl ElementPrefix {
             return Some(Element::Past);
         };
         let mut list = elements.at_head_id(frontier)?;
+        // One allocation for the walk to `index` rather than a doubling every
+        // few pushes, capped: `index` may lie far past the end of the array.
+        self.ids
+            .reserve((index + 1 - self.ids.len()).min(RESERVE_ELEMENTS));
         loop {
             let Some((cursor, rest)) = list.uncons_cursor() else {
                 self.frontier = None;
@@ -272,6 +283,9 @@ pub(crate) mod memo {
     /// The length lookup that builds is the one after this many walks of the
     /// array (the registering one included): the third lookup.
     const BUILD_AT: u8 = 2;
+    /// Element reads beyond the length lookups that walk before a prefix
+    /// starts: the registering read and one more, so the third records.
+    const PREFIX_AFTER: u8 = 2;
     /// Elements indexed across all the indexes kept.
     const ELEMENT_BUDGET: usize = MAX_INDEXED_ELEMENTS;
 
@@ -280,7 +294,8 @@ pub(crate) mod memo {
         /// (counting the one that registered it), for an array of this many
         /// elements (0 when only element reads have walked it): the third
         /// lookup builds, sized from the length. `reads` counts element reads;
-        /// the one that makes them outnumber the lookups starts a prefix.
+        /// the one that puts them [`PREFIX_AFTER`] past the lookups starts a
+        /// prefix.
         Seen {
             lookups: u8,
             len: usize,
@@ -504,9 +519,10 @@ pub(crate) mod memo {
             } = entry.kind
             {
                 let reads = reads.saturating_add(1);
-                if reads <= lookups {
-                    // The length route is serving this array (a length lookup
-                    // came before every element read): walk, as #4035 does.
+                if reads <= lookups.saturating_add(PREFIX_AFTER) {
+                    // Read once or twice, or the length route is serving this
+                    // array (a length lookup came before every element read):
+                    // walk, as #4035 does.
                     entry.kind = Kind::Seen {
                         lookups,
                         len,
@@ -977,12 +993,13 @@ mod tests {
             let ascending = element_loop(&elements, token, (0..n).chain([n, n + 7]));
             let descending = element_loop(&elements, token, (0..n).rev().chain([n, n + 7]));
             // Ascending: below WIDE_ELEMENTS nothing is registered, the first
-            // wide read registers, the second records up to itself, and each
-            // later read extends by one: every element at most once.
+            // wide read registers, the second walks, the third records up to
+            // itself, and each later read extends by one: every element at
+            // most once.
             assert!(ascending > 0 && ascending <= n, "ascending {ascending}");
-            // Descending: the first read registers, the second records the
-            // array up to itself, every later read is a hit, and the reads
-            // past the end record the last element on their way there.
+            // Descending: the first read registers, the second walks, the
+            // third records the array up to itself, every later read is a hit,
+            // and the reads past the end record the rest on their way there.
             assert_eq!(descending, n, "descending");
         }
 
@@ -1025,7 +1042,7 @@ mod tests {
         }
 
         #[test]
-        fn an_array_read_once_records_nothing_and_twice_records_once_4162() {
+        fn an_array_read_twice_records_nothing_and_thrice_records_once_4162() {
             let doc = wide_array(WIDE_ELEMENTS * 4);
             let index = JsonIndex::build(doc.as_bytes());
             let root = index.root(doc.as_bytes());
@@ -1042,9 +1059,14 @@ mod tests {
                 shown(get_cursor_memoized(&elements, k)),
                 shown(elements.get_cursor(k))
             );
-            assert_eq!(recorded() - before, k + 1, "the second read records");
+            assert_eq!((recorded(), memo::work()), (before, work), "read twice");
+            assert_eq!(
+                shown(get_cursor_memoized(&elements, k)),
+                shown(elements.get_cursor(k))
+            );
+            assert_eq!(recorded() - before, k + 1, "the third read records");
             assert_eq!(memo::work().0, work.0, "and builds no index");
-            // A third read inside the prefix walks nothing and is a hit.
+            // A fourth read inside the prefix walks nothing and is a hit.
             let hits = memo::work().1;
             assert_eq!(
                 shown(get_cursor_memoized(&elements, 5)),
@@ -1156,7 +1178,9 @@ mod tests {
                     "element {k}"
                 );
             }
-            assert_eq!(recorded() - before, n - 1);
+            // Three walks (two ahead of the one lookup), then the fourth
+            // records up to itself and every later read is a hit.
+            assert_eq!(recorded() - before, n - 3);
         }
 
         #[test]
@@ -1166,7 +1190,7 @@ mod tests {
             let root = index.root(doc.as_bytes());
             let _scope = memo::enter(root.document_token());
             let elements = root.value().as_array().expect("an array document");
-            for _ in 0..2 {
+            for _ in 0..3 {
                 assert!(get_cursor_memoized(&elements, 100).is_some());
             }
             assert!(get_cursor_memoized(&elements, MAX_INDEXED_ELEMENTS).is_none());
