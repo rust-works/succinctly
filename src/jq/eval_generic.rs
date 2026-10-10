@@ -1776,9 +1776,7 @@ pub(crate) fn value_swallowing_boundary<S: EvalSemantics>(
     expr: &Expr,
     catch: Option<&Expr>,
 ) -> bool {
-    (crate::jq::eval::try_swallows_scalar_iteration(expr, catch)
-        || crate::jq::eval::try_swallows_scalar_path_iteration(expr, catch))
-        && S::TAG != EvalTag::Yq
+    crate::jq::eval::try_swallows_scalar_value_iteration(expr, catch) && S::TAG != EvalTag::Yq
 }
 
 /// What stepping the scalar `node` (the value at `cursor`) with `.[]?` raises,

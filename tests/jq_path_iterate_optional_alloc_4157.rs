@@ -61,7 +61,9 @@ fn fixtures() -> Vec<(&'static str, String)> {
 
 /// `swallowed` must cost what `twin` does, within `allowance_halves` half
 /// allocator calls per member: a message built per member would add at least
-/// two more (it made seven before the shortcut).
+/// two more (it made seven before the shortcut). The swallowing rows reach no
+/// path at all, so they sit far under their twin and a half call of slack is
+/// enough to catch one allocation per member coming back.
 #[track_caller]
 fn assert_costs_like_twin(
     name: &str,
@@ -103,7 +105,7 @@ fn a_swallowed_path_iteration_builds_no_message_4157() {
                 name,
                 (swallowed, cost),
                 ("[.[] | path(.)] | length", twin_cost),
-                6,
+                1,
             );
         }
     }
@@ -117,7 +119,7 @@ fn the_streaming_entry_reaches_the_same_shortcut_4157() {
         for swallowed in [".[] | path(.[])?", ".[] | try path(.[]) catch empty"] {
             let (cost, outputs) = allocations_streaming(swallowed, &json);
             assert_eq!(outputs, 0, "{name}: `{swallowed}` reaches nothing");
-            assert_costs_like_twin(name, (swallowed, cost), (".[] | path(.)", twin_cost), 6);
+            assert_costs_like_twin(name, (swallowed, cost), (".[] | path(.)", twin_cost), 1);
         }
     }
 }

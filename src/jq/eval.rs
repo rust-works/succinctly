@@ -5873,32 +5873,36 @@ pub(crate) fn try_swallows_scalar_iteration(expr: &Expr, catch: Option<&Expr>) -
     matches!(unwrap_bind_source(expr), Expr::Iterate) && catch.map_or(true, is_empty_handler)
 }
 
-/// [`try_swallows_scalar_iteration`] for `path(.[])` (#4157): `expr` is a
-/// `path(f)` whose argument is a bare `.[]`, and the handler, if any, is `empty`.
+/// [`try_swallows_scalar_iteration`] for a boundary at a *value* position (#4157):
+/// the body is a bare `.[]` or `path(.[])`, and the handler, if any, is `empty`.
 ///
 /// `path(.[])` over a scalar raises the same `Cannot iterate over ...` that `.[]`
 /// does (through `path_iterate_step_generic`), so a boundary around it has the
-/// same nothing to catch, and the same message to skip building.
+/// same nothing to catch, and the same message to skip building. The body is
+/// peeled once, so a boundary that matches neither pays one match.
 ///
 /// Kept apart from [`try_swallows_scalar_iteration`] on purpose: that one also
 /// feeds the path-position walkers (`swallowing_boundary` ->
 /// `swallowed_path_leaf`), where `path(...)` is not a path expression and
 /// `path(.[])?` must still evaluate to raise jq's path error. Only the *value*
 /// boundaries (`swallowed_scalar_iteration`, `owned_swallowing_boundary`) ask
-/// this one. Both operands are peeled by [`unwrap_bind_source`], as above, so a
+/// this one. Operands are peeled by [`unwrap_bind_source`], as above, so a
 /// closure argument (`def opt(f): f?;` called as `opt(path(.[]))`) matches too.
-pub(crate) fn try_swallows_scalar_path_iteration(expr: &Expr, catch: Option<&Expr>) -> bool {
-    matches!(
-        unwrap_bind_source(expr),
-        Expr::Builtin(Builtin::Path(f)) if matches!(unwrap_bind_source(f), Expr::Iterate)
-    ) && catch.map_or(true, is_empty_handler)
+pub(crate) fn try_swallows_scalar_value_iteration(expr: &Expr, catch: Option<&Expr>) -> bool {
+    let iterates = match unwrap_bind_source(expr) {
+        Expr::Iterate => true,
+        Expr::Builtin(Builtin::Path(f)) => matches!(unwrap_bind_source(f), Expr::Iterate),
+        _ => false,
+    };
+    iterates && catch.map_or(true, is_empty_handler)
 }
 
 /// Whether a `catch` handler is the bare builtin `empty`, which delivers nothing
 /// for any payload (a `break` runs it over `null`, which is the same nothing), so
 /// the boundary is the same as one with no handler. One definition for
-/// [`try_swallows_scalar_iteration`] (the value boundaries and the path walks) and
-/// [`resolve_catch_sink`] (the resolver), so the two cannot disagree about which
+/// [`try_swallows_scalar_iteration`] (the path walks),
+/// [`try_swallows_scalar_value_iteration`] (the value boundaries) and
+/// [`resolve_catch_sink`] (the resolver), so the three cannot disagree about which
 /// handlers run (#3728). Peeled by [`unwrap_bind_source`], as the shape tests
 /// above are: a `def empty:` in scope is a `DefCall`, a closure argument arrives as
 /// `Expr::Shared`, and nothing is evaluated here either way.
@@ -5951,29 +5955,27 @@ fn owned_scalar_iteration_swallowed<S: EvalSemantics>(
     catch: Option<&Expr>,
     value: &OwnedValue,
 ) -> bool {
-    crate::jq::eval_generic::swallowing_boundary::<S>(body, catch)
-        && !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_))
+    crate::jq::eval_generic::swallowing_boundary::<S>(body, catch) && is_owned_scalar(value)
 }
 
-/// [`owned_scalar_iteration_swallowed`] for a *value* boundary, which also
-/// swallows `path(.[])` (#4157). The resolver's `Try`/`Optional` arms ask the
-/// narrow one: in path position `path(...)` is not a path expression.
-fn owned_value_iteration_swallowed<S: EvalSemantics>(
-    body: &Expr,
-    catch: Option<&Expr>,
-    value: &OwnedValue,
-) -> bool {
-    crate::jq::eval_generic::value_swallowing_boundary::<S>(body, catch)
-        && !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_))
+/// Whether an owned `value` has no members to list, so a swallowed `.[]` over it
+/// is the `Cannot iterate over ...` and nothing else. One definition for the
+/// path-position gate above and the value-position one below.
+fn is_owned_scalar(value: &OwnedValue) -> bool {
+    !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_))
 }
 
 /// [`owned_scalar_iteration_swallowed`] for a whole boundary expression: `expr`
 /// is `body?` or `try body catch handler`, optionally parenthesised (#3728).
 fn owned_swallowing_boundary<S: EvalSemantics>(expr: &Expr, value: &OwnedValue) -> bool {
     match unwrap_paren(expr) {
-        Expr::Optional(inner) => owned_value_iteration_swallowed::<S>(inner, None, value),
+        Expr::Optional(inner) => {
+            crate::jq::eval_generic::value_swallowing_boundary::<S>(inner, None)
+                && is_owned_scalar(value)
+        }
         Expr::Try { expr, catch } => {
-            owned_value_iteration_swallowed::<S>(expr, catch.as_deref(), value)
+            crate::jq::eval_generic::value_swallowing_boundary::<S>(expr, catch.as_deref())
+                && is_owned_scalar(value)
         }
         // A door answers the bare stage and the one-stage pipe around it alike
         // (#3673): `. | .[]?` is `.[]?`, as `eval_owned_length` reads it.
