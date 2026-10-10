@@ -4334,6 +4334,17 @@ pub trait DocumentElements: Sized + Copy + Clone {
     /// Get the first element's cursor and remaining elements.
     fn uncons_cursor(&self) -> Option<(Self::Cursor, Self)>;
 
+    /// The comment written after the `-` of the first element when its value starts on a
+    /// later line (`- # note` / `  k: v`), `#` and all, or `None` (#4231).
+    ///
+    /// [`uncons_cursor`](Self::uncons_cursor) resolves such a bare `-` to its value, and
+    /// the comment lives on the `-` wrapper that resolution steps past, so a consumer that
+    /// rebuilds the presentation from the cursor (the DOM write route) cannot see it
+    /// otherwise. JSON has no such comment, hence the default.
+    fn first_dash_comment(&self) -> Option<String> {
+        None
+    }
+
     /// Get element by index (0-based).
     fn get(&self, index: usize) -> Option<Self::Value>;
 

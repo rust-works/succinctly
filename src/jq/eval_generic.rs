@@ -2805,6 +2805,47 @@ fn normalized_preamble(preamble: &str) -> String {
         .collect()
 }
 
+/// Put the comment after a bare `-` (`- # note` / `  k: v`) where yq keeps it (#4231): the
+/// head comment of the node the item's value starts with. For a non-empty block mapping or
+/// sequence that is its first key or first element, which the writer renders on the dash's
+/// line; for a scalar, an empty or a flow container -- which has no line of its own to start
+/// on -- it is the item itself, rendered above the dash. `tree`/`value` are the item's own.
+fn attach_dash_comment(mut tree: CommentTree, value: &OwnedValue, comment: String) -> CommentTree {
+    fn with_head(meta: &NodeMeta, comment: String) -> NodeMeta {
+        let mut head = vec![comment];
+        head.extend(meta.head_comment().iter().cloned());
+        meta.with_head_foot(head, meta.foot_comment().to_vec())
+    }
+    let block = tree.style() != "flow";
+    match (&mut tree, value) {
+        (CommentTree::Array(_, items), OwnedValue::Array(values))
+            if block && !values.is_empty() =>
+        {
+            if let Some(first) = items.first_mut() {
+                let meta = with_head(first.meta(), comment);
+                *first.meta_mut() = meta;
+            }
+        }
+        (CommentTree::Object(_, fields, _), OwnedValue::Object(map))
+            if block && !map.is_empty() =>
+        {
+            if let Some(first) = map
+                .iter()
+                .next()
+                .and_then(|(key, _)| fields.get_mut(key.as_str()))
+            {
+                let meta = with_head(first.meta(), comment);
+                *first.meta_mut() = meta;
+            }
+        }
+        (own, _) => {
+            let meta = with_head(own.meta(), comment);
+            *own.meta_mut() = meta;
+        }
+    }
+    tree
+}
+
 /// Whether [`to_owned_with_comments_at_depth`] should read this node's own
 /// standalone head/foot off its own cursor, or skip that read outright
 /// because the caller already knows it will be discarded -- a mapping
@@ -3049,6 +3090,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
                 return Err(elem_cursor.malformed_delimiter_error());
             }
             let elem_value = elem_cursor.value();
+            let dash_comment = elems.first_dash_comment();
             let (v, c) = to_owned_with_comments_at_depth::<_, S>(
                 &elem_value,
                 Some(&elem_cursor),
@@ -3056,6 +3098,11 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
                 child_under_alias,
                 HeadFootRead::Own,
             )?;
+            // #4231: `- # note` before a value on the next line.
+            let c = match dash_comment {
+                Some(comment) if !child_under_alias => attach_dash_comment(c, &v, comment),
+                _ => c,
+            };
             items.push(v);
             comment_items.push(c);
             last_elem = Some(elem_cursor);

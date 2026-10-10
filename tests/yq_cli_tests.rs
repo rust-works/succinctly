@@ -61741,3 +61741,87 @@ fn test_match_object_follows_gos_regexp_4205() -> Result<()> {
     );
     Ok(())
 }
+
+/// Pinned yq v4.53.3: a comment after a bare `-` (`- # note` with the value on the next
+/// line) survives a write that takes the DOM route (#4231). yq reads it as the head comment
+/// of the value's first node: the first key of a block mapping and the first element of a
+/// block sequence keep it on the dash's line, and a scalar, an empty or a flow container
+/// puts it above the dash. Every row was captured from the pinned binary.
+#[test]
+fn test_comment_after_a_sequence_dash_survives_a_dom_write_4231() -> Result<()> {
+    for (input, filter, args, expected) in [
+        (
+            "a:\n  - b: 1\n  - # own\n    c: 2\n",
+            ".a[0].b = 5",
+            &[][..],
+            "a:\n  - b: 5\n  - # own\n    c: 2\n",
+        ),
+        (
+            "a:\n  - b: 1\n  - # own\n    c: 2\n",
+            ".a[1].c = 7",
+            &[][..],
+            "a:\n  - b: 1\n  - # own\n    c: 7\n",
+        ),
+        (
+            "a:\n  - # c1\n    x\n  - # c2\n    - 1\n  - # c3\n    k: v\n  - k2: v2 # tail\n",
+            ".a[0] = \"z\"",
+            &[][..],
+            "a:\n  # c1\n  - z\n  - # c2\n    - 1\n  - # c3\n    k: v\n  - k2: v2 # tail\n",
+        ),
+        (
+            "a:\n  - # c1\n    x\n  - # c2\n    - 1\n  - # c3\n    k: v\n  - k2: v2 # tail\n",
+            ".a[2].k = \"z\"",
+            &[][..],
+            "a:\n  # c1\n  - x\n  - # c2\n    - 1\n  - # c3\n    k: z\n  - k2: v2 # tail\n",
+        ),
+        (
+            "a:\n  - # c1\n    x\n  - # c2\n    - 1\n  - # c3\n    k: v\n  - k2: v2 # tail\n",
+            ".a[1][0] = 9",
+            &[][..],
+            "a:\n  # c1\n  - x\n  - # c2\n    - 9\n  - # c3\n    k: v\n  - k2: v2 # tail\n",
+        ),
+        (
+            "a:\n  - # c1\n    x\n  - # c2\n    - 1\n  - # c3\n    k: v\n  - k2: v2 # tail\n",
+            ".z = 1",
+            &[][..],
+            "a:\n  # c1\n  - x\n  - # c2\n    - 1\n  - # c3\n    k: v\n  - k2: v2 # tail\nz: 1\n",
+        ),
+        (
+            "a:\n  - # a\n    - # b\n      k: v\n  - # own\n    # more\n    c: 2\n    d: 3\n  - # e\n    {}\n  - # f\n    []\n  - # g\n    [1, 2]\n  - # h\n    {x: 1}\n  - # i\n    \"str\"\nb: 1\n",
+            ".b = 2",
+            &[][..],
+            "a:\n  - # a\n    - # b\n      k: v\n  - # own\n    # more\n    c: 2\n    d: 3\n  # e\n  - {}\n  # f\n  - []\n  # g\n  - [1, 2]\n  # h\n  - {x: 1}\n  # i\n  - \"str\"\nb: 2\n",
+        ),
+        (
+            "a:\n  - # a\n    - # b\n      k: v\n  - # own\n    # more\n    c: 2\n    d: 3\n  - # e\n    {}\n  - # f\n    []\n  - # g\n    [1, 2]\n  - # h\n    {x: 1}\n  - # i\n    \"str\"\nb: 1\n",
+            ".b = 2",
+            &["-P"][..],
+            "a:\n  - # a\n    - # b\n      k: v\n  - # own\n    # more\n    c: 2\n    d: 3\n  # e\n  - {}\n  # f\n  - []\n  # g\n  - - 1\n    - 2\n  # h\n  - x: 1\n  # i\n  - str\nb: 2\n",
+        ),
+        (
+            "a:\n  b:\n    - # deep\n      x: 1\n      y:\n        - # deeper\n          z: 2\n",
+            ".a.b[0].x = 5",
+            &[][..],
+            "a:\n  b:\n    - # deep\n      x: 5\n      y:\n        - # deeper\n          z: 2\n",
+        ),
+        (
+            "a:\n  b:\n    - # deep\n      x: 1\n      y:\n        - # deeper\n          z: 2\n",
+            ".a.b[0].y[0].z = 7",
+            &[][..],
+            "a:\n  b:\n    - # deep\n      x: 1\n      y:\n        - # deeper\n          z: 7\n",
+        ),
+        (
+            "- # top\n  k: v\n- # t2\n  - 1\n",
+            ".[0].k = \"w\"",
+            &[][..],
+            "- # top\n  k: w\n- # t2\n  - 1\n",
+        ),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, input, args)?,
+            (expected.into(), String::new(), 0),
+            "{filter} {args:?} over {input:?}"
+        );
+    }
+    Ok(())
+}

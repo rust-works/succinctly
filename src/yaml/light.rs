@@ -8356,6 +8356,17 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentElements for YamlElements<'a, W> {
         YamlElements::uncons_resolved_cursor(self)
     }
 
+    fn first_dash_comment(&self) -> Option<String> {
+        let (raw, _) = self.uncons_raw_cursor()?;
+        // The same test the cursor-route writer makes (`wrapper_comment`): the comment is
+        // the wrapper's own only when the item really was a bare `-` whose value deferred,
+        // i.e. resolving it moves the cursor.
+        (raw.bp_position() != raw.resolve_bare_seq_item().bp_position())
+            .then(|| raw.line_comment_raw())
+            .flatten()
+            .map(ToString::to_string)
+    }
+
     fn get(&self, index: usize) -> Option<Self::Value> {
         YamlElements::get(self, index)
     }
