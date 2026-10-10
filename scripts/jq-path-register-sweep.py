@@ -61,7 +61,7 @@ from "0 FAIL" over a clean base. A benchmark cannot measure a shape it does
 not generate: add the generator pattern here before claiming a shape is safe.
 
 **Size.** The full grid is millions of rows; `--list-axes` prints the exact count
-(753 operands, 7 companions, 12 inputs and 37 contexts give 9,686,547 rows as of #4071,
+(765 operands, 7 companions, 12 inputs and 37 contexts give 9,846,387 rows as of #4071,
 and each operand is also swept as a bare pipe stage since #3361). The count grows with
 every operand a change to the register adds, so read it from `--list-axes` rather than
 from here.
@@ -1147,6 +1147,21 @@ OPERANDS = [
     "(foreach .a? as $k (.; try (length | .) catch ($k | .b) | .; try ($k | .b?)))",
     "(foreach .a? as $k (0; try (tostring | .) catch ($k | .b) | .; try ($k | .b?)))",
     "(foreach .a? as $k (0; try (length | .) catch ($k | .b) | .; $k))",
+    # (#4071) the same gate, reached by any UPDATE the resolver cannot prove leaves the register
+    # (`select`, a `def` call, a comma into either) rather than only by a navigating handler; and
+    # the issue's own two shapes.
+    "(foreach .a? as $k (0; select(true); try ($k | .b?)))",
+    "(foreach .a? as $k (0; def f: .+1; f; try ($k | .b?)))",
+    "(foreach .a? as $k (0; (., 1) | select(true); try ($k | .b?)))",
+    "(foreach .a? as $k (0; (1, ($k | .b?)) | select(true); try ($k | .b?)))",
+    "(foreach .a? as $k (0; ($k | .b?) | select(true); try ($k | .b?)))",
+    "(foreach .a? as $k (0; ($k | .b?) | def f: 1; f; try ($k | .b?)))",
+    "(foreach .a? as $k (0; reduce 1 as $q (.; .+1); try ($k | .b?)))",
+    "(foreach .a? as $k (0; first(.+1); try ($k | .b?)))",
+    "(foreach .a? as $k (null; select(true); try ($k | .b?)))",
+    "(foreach .a? as $k (.; select(true); try ($k | .b?)))",
+    "(foreach .a? as $k (null; ((now // sort) | ($k | .c?) // (first(($k | length)) | (1, 2))); try ($k | .b?)))",
+    "(foreach .a? as $k (0; (try ((length | .)) catch ([($k | .b?)]) | if first(0) then (($k | .b?), true) else sort end); try ($k | .b?)))",
     # (#3899) a destructuring `?//` bind whose body mixes a navigating and a
     # by-value part. A failed destructure is restored by the fork, so the bare
     # `$var` alternative that runs leaves jq's register where the stage entered

@@ -47792,19 +47792,15 @@ impl FoldRegister {
             // Not when UPDATE's output navigated: its register is then known to have left the
             // step's entry (`($v|.b?)|floor` is on `.b`), and a refusal of the entry's own node is
             // jq's verdict, which a `try` around it catches.
-            let frame = self.frame.unknown();
+            let mut frame = self.frame.unknown();
             let navigated = branch.path.depth() > self.path.depth();
-            let frame = if S::TAG == EvalTag::Jq
+            if S::TAG == EvalTag::Jq
                 && self.trackable
                 && !navigated
                 && !frame.register_loss.is_lost()
             {
-                frame
-                    .with_register_loss(RegisterLoss::LostAt(Rc::new(self.value.clone())))
-                    .into_owned()
-            } else {
-                frame
-            };
+                frame.register_loss = RegisterLoss::LostAt(Rc::new(self.value.clone()));
+            }
             Self {
                 path: Rc::clone(&self.path),
                 value: OwnedValue::Null,

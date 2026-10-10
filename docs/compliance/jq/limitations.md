@@ -3008,23 +3008,25 @@ is the revert that established what the other one costs.
    by-value leaf on a *trackable* entry, and the comma states the entry value for a sibling that leaves
    it alone. What still drops a path there is a sibling that navigates through the accumulator and
    then computes (`. | .b? | tostring`), the same shape through `$v` being read since #4063's first half.
-   An UPDATE that ends in a `try` whose handler navigates a frozen `$v`, followed by another stage
-   (`try (length | .) catch ($v | .b) | .`), refuses loudly where jq answers
+   An UPDATE the resolver cannot prove leaves the register where the step entered, followed by an
+   EXTRACT that refuses a frozen `$v` under a `try`, refuses loudly where jq answers
    ([#4071](https://github.com/rust-works/succinctly/issues/4071), pinned by
-   `test_foreach_update_navigating_handler_then_stage_refuses_loudly_4071`): the handler runs only if
-   the body raised, so the register is at the step's entry or one navigation below it, and the
-   resolver cannot say which. It used to leave the register unrecorded as lost, so EXTRACT's refusal
-   of `$v` read as jq's verdict, an EXTRACT `try` swallowed it, and `del`/`=` through the fold wrote
-   nothing and exited 0 where jq names `["a","b"]` (`path(...)` answered `[]`). Recorded lost
-   (jq mode, a live register only, and not when UPDATE's output itself navigated, `($v|.b?)|floor`,
-   whose register has left the entry), the refusal is the guess of #3267 and uncatchable. A handler
-   that cannot move the register, and a `try` with no stage after it, still answer as jq does. The
-   price is rows jq answers that refuse now: the resolver cannot tell a body that raised (the
-   handler ran and moved the register) from one that did not, so a `try (length | .)` over a number,
-   whose handler never runs, refuses as well. Over the 11 operands of the register sweep that
-   exercise it (146,547 rows) it turns 2,773 wrong accepts and 45 wrong answers into matches or loud
-   refusals and loses 652 matches to a refusal, 480 of them on a `null` input, where a write dropped
-   for a path jq names is a no-op anyway. A boolean register
+   `test_foreach_update_navigating_handler_then_stage_refuses_loudly_4071` and
+   `test_foreach_update_unprovable_register_stage_refuses_loudly_4071`): a `try` whose handler
+   navigates `$v` (`try (length | .) catch ($v | .b) | .`; the handler runs only if the body raised,
+   so the register is at the entry or one navigation below it), `select(true)`, a `def` call, and a
+   comma into either. They used to leave the register unrecorded as lost, so EXTRACT's refusal of
+   `$v` read as jq's verdict, an EXTRACT `try` swallowed it, and `del`/`=` through the fold wrote
+   nothing and exited 0 where jq names `["a","b"]` (`path(...)` answered `[]`). Recorded lost (jq mode,
+   a live register only, and not when UPDATE's output itself navigated, `($v|.b?)|floor`, whose
+   register has left the entry), the refusal is the guess of #3267 and uncatchable. A handler that
+   cannot move the register, and a `try` with no stage after it, still answer as jq does; yq mode is
+   unchanged (the register is a jq-mode statement, ADR-0018). The price is rows jq answers that
+   refuse now: the resolver cannot tell a body that raised from one that did not, so a
+   `try (length | .)` over a number, whose handler never runs, refuses as well. Over the 11 operands
+   of the register sweep that exercise the `try` shape (146,547 rows) it turns 2,773 wrong accepts
+   and 45 wrong answers into matches or loud refusals and loses 652 matches to a refusal, 480 of
+   them on a `null` input, where a write dropped for a path jq names is a no-op anyway. A boolean register
    is compared with the result, so an equal one answers and a different one refuses, as in jq
    (jq reads an equal boolean result as the register itself): that holds for a bool-returning
    builtin (`contains(true)`) next to a navigating comma sibling too since #4063.

@@ -75753,6 +75753,71 @@ fn test_foreach_update_navigating_handler_then_stage_refuses_loudly_4071() -> Re
     ])
 }
 
+/// #4071: the same record of a lost register is made for any UPDATE the resolver cannot prove
+/// leaves jq's register where the step entered, not only a `try` with a navigating handler:
+/// `select(true)`, a `def` call, and a comma into either dropped the path and skipped the write
+/// the same way, and refuse loudly now. An UPDATE whose own output navigated
+/// (`($v|.b?)|select(true)`) has left the entry, so a refusal of the entry's node stays jq's
+/// exact verdict, and the issue's two original shapes (a `null` source, and a `catch` that
+/// builds `[$v|.b?]`) answer as jq does or refuse loudly. Every row captured from jq 1.7.1
+/// with `-c`.
+#[test]
+fn test_foreach_update_unprovable_register_stage_refuses_loudly_4071() -> Result<()> {
+    let doc = r#"{"a":{"b":{"b":3}},"z":1}"#;
+    let refused = "Invalid path expression near attempt to access element \"b\"";
+    assert_path_rows_3289(&[
+        (
+            doc,
+            r"[path(foreach .a as $v (0; select(true); try ($v|.b?)))]",
+            "",
+            refused,
+            5,
+        ),
+        (
+            doc,
+            r"del(foreach .a as $v (0; select(true); try ($v|.b?)))",
+            "",
+            refused,
+            5,
+        ),
+        (
+            doc,
+            r"(foreach .a as $v (0; def f: .+1; f; try ($v|.b?))) = 9",
+            "",
+            refused,
+            5,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; (1,($v|.b?)) | select(true); try ($v|.b?)))]",
+            "",
+            refused,
+            5,
+        ),
+        (
+            doc,
+            r"(foreach .a? as $v (0; (try ((length | .)) catch ([($v|.b?)]) | if first(0) then (($v|.b?), true) else sort end); try ($v|.b?))) = 9",
+            "",
+            refused,
+            5,
+        ),
+        (
+            doc,
+            r"[path(foreach .a as $v (0; ($v|.b?) | select(true); try ($v|.b?)))]",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null,"z":{"b":1}}"#,
+            r"[path(foreach .a? as $v (null; ((now // sort) | ($v|.c?) // (first(($v | length)) | (1,2))); try ($v|.b?)))]",
+            "[[\"a\",\"b\"],[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
 /// #3941: the same read, outside a fold. A destructuring bind's body is a comma whose
 /// siblings are a navigating pipe and a bare `$q`; `$q`'s statement used to be dropped, so the
 /// body refused where jq answers (`destructure-comma-marker-nav` in the bind-origin sweep).
