@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use indexmap::IndexMap;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -4401,11 +4402,10 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
             // `locator` wraps it and must be asked for non-decreasing `end`s.
             //
             // jq names the line the input value ends on, counted in the whole
-            // file rather than in this value's slice. The M2 fast path never
-            // reads it, so it is resolved only if that path reports an error
-            // (#4160); the general path below resolves it up front because it
-            // hands `&InputLocation` to the evaluator.
-            let mut locator = ValueLocator::new(
+            // file rather than in this value's slice. Only a diagnostic reads
+            // it, so it is resolved when one does (#4160 on the M2 fast path,
+            // #4178 on the general path through `LazyLocation`).
+            let locator = ValueLocator::new(
                 raw,
                 filename.as_deref(),
                 slurped.as_ref().map(|slurped| slurped.eof_line),
@@ -4488,8 +4488,9 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                     // for this one document only.
                 }
 
-                // The general path reads the location in several places below.
-                let at = locator.at(end);
+                // The general path reads the location in several places below,
+                // all of them diagnostics; it is counted on the first read (#4178).
+                let at = LazyLocation::new(&locator, end);
 
                 // A builtin with no native lazy fast path (`sort`, `join`,
                 // ...) falls back to a full `to_owned_cursor` materialization
@@ -4550,7 +4551,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                                 OutputItem::Lazy(v) => match v.try_materialize() {
                                     Ok(owned) => last_output = Some(owned),
                                     Err(e) => {
-                                        sink.report(DiagStyle::Jq, &e, &at);
+                                        sink.report(DiagStyle::Jq, &e, at.get());
                                         return Ok(true);
                                     }
                                 },
@@ -4588,7 +4589,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                         let stop = route_write_error(
                             sink,
                             &mut out,
-                            || at.clone(),
+                            || at.get().clone(),
                             |o| match &result {
                                 OutputItem::Lazy(v) => {
                                     write_output_jq_value(o, v, &output_config, &mut record_scratch)
@@ -4637,7 +4638,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                         // panic's own exit 101) would still be a hard,
                         // uncontrolled process exit for what #1793 exists to
                         // turn into an ordinary, recoverable diagnostic.
-                        sink.report(DiagStyle::Jq, &EvalError::new(message), &at);
+                        sink.report(DiagStyle::Jq, &EvalError::new(message), at.get());
                         // Mirrors the same check a few lines below, after the
                         // ordinary per-result loop -- halt/halt_error (#791)
                         // outranks everything else, including remaining
@@ -6206,7 +6207,7 @@ fn count_newlines(bytes: &[u8]) -> usize {
 }
 
 /// Per-value input location for the default document loop, resolved on
-/// demand (#4160).
+/// demand (#4160, #4178).
 ///
 /// The line a value ends on is only ever read by a diagnostic (an evaluation
 /// error, a write error, a depth panic report), and the M2 fast path never
@@ -6217,8 +6218,14 @@ fn count_newlines(bytes: &[u8]) -> usize {
 /// the next one that is asked for picks up its bytes: the whole loop stays
 /// O(n) and every resolved line equals what an eager call per value gave.
 /// `end` offsets must be non-decreasing across calls, as the splitter's are.
+///
+/// The M2 route calls [`at`](Self::at) itself, only where it reports an error;
+/// the general route reads through a per-value [`LazyLocation`] (#4178). `at`
+/// takes `&self` so that wrapper can share the locator with the M2 arm; the
+/// counter sits behind a `RefCell` borrowed only for the duration of one
+/// `advance_to`, which calls nothing back.
 struct ValueLocator<'a> {
-    counter: LineCounter<'a>,
+    counter: RefCell<LineCounter<'a>>,
     filename: Option<&'a str>,
     /// A slurped array names its last source's EOF line, not a line in the
     /// synthesized buffer (#1520).
@@ -6228,19 +6235,46 @@ struct ValueLocator<'a> {
 impl<'a> ValueLocator<'a> {
     fn new(raw: &'a [u8], filename: Option<&'a str>, slurp_eof: Option<usize>) -> Self {
         Self {
-            counter: LineCounter::new(raw),
+            counter: RefCell::new(LineCounter::new(raw)),
             filename,
             slurp_eof,
         }
     }
 
     /// The location of the value whose exclusive end offset is `end`.
-    fn at(&mut self, end: usize) -> InputLocation {
+    fn at(&self, end: usize) -> InputLocation {
         let line = match self.slurp_eof {
             Some(eof_line) => eof_line,
-            None => self.counter.advance_to(end),
+            None => self.counter.borrow_mut().advance_to(end),
         };
         InputLocation::at(self.filename, line)
+    }
+}
+
+/// One value's input location, resolved the first time a diagnostic reads it
+/// and kept for the rest of that value (#4178).
+///
+/// The general (non-M2) path of the document loop hands the location to the
+/// evaluator glue, which reads it from several independent error arms; this
+/// lets each of them ask without the loop paying a newline count for every
+/// value that reports nothing.
+struct LazyLocation<'l, 'a> {
+    locator: &'l ValueLocator<'a>,
+    end: usize,
+    resolved: OnceCell<InputLocation>,
+}
+
+impl<'l, 'a> LazyLocation<'l, 'a> {
+    fn new(locator: &'l ValueLocator<'a>, end: usize) -> Self {
+        Self {
+            locator,
+            end,
+            resolved: OnceCell::new(),
+        }
+    }
+
+    fn get(&self) -> &InputLocation {
+        self.resolved.get_or_init(|| self.locator.at(self.end))
     }
 }
 
@@ -7649,7 +7683,7 @@ fn evaluate_bytes_streaming<'a>(
     json_bytes: &'a [u8],
     expr: &jq::Expr,
     index: &'a JsonIndex,
-    at: &InputLocation,
+    at: &LazyLocation<'_, '_>,
     sink: &mut ErrorSink,
     on_value: &mut JqValueSink<'a, '_>,
 ) -> Result<()> {
@@ -7678,8 +7712,8 @@ fn evaluate_bytes_streaming<'a>(
     // an I/O failure swallow the evaluator's own diagnostic.
     match control {
         None => {}
-        Some(jq::Control::Error(e)) => sink.report(DiagStyle::Jq, &e, at),
-        Some(jq::Control::Break(label)) => sink.report_break(DiagStyle::Jq, &label, at),
+        Some(jq::Control::Error(e)) => sink.report(DiagStyle::Jq, &e, at.get()),
+        Some(jq::Control::Break(label)) => sink.report_break(DiagStyle::Jq, &label, at.get()),
         Some(jq::Control::Halt(code)) => sink.request_halt(code),
     }
     if let Some(e) = write_err {
@@ -7716,13 +7750,13 @@ fn evaluate_bytes_streaming<'a>(
 /// other erroring arm around it does.
 fn to_jq_values<'a, W: Clone + AsRef<[u64]>>(
     value: OwnedValue,
-    at: &InputLocation,
+    at: &LazyLocation<'_, '_>,
     sink: &mut ErrorSink,
 ) -> Vec<OutputItem<'a, W>> {
     match value.check_tree_depth() {
         Ok(()) => vec![OutputItem::Owned(value)],
         Err(e) => {
-            sink.report(DiagStyle::Jq, &e, at);
+            sink.report(DiagStyle::Jq, &e, at.get());
             Vec::new()
         }
     }
@@ -7768,14 +7802,14 @@ fn validate_lazy_seq_cursor<Wrd: Clone + AsRef<[u64]>>(
 fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
     result: GenericResult<StandardJson<'a, W>>,
     cursor: JsonCursor<'a, W>,
-    at: &InputLocation,
+    at: &LazyLocation<'_, '_>,
     sink: &mut ErrorSink,
 ) -> Vec<OutputItem<'a, W>> {
     match result {
         GenericResult::One(v) => match standard_json_to_jq_value(v, &cursor) {
             Ok(jq_value) => vec![OutputItem::Lazy(jq_value)],
             Err(e) => {
-                sink.report(DiagStyle::Jq, &e, at);
+                sink.report(DiagStyle::Jq, &e, at.get());
                 vec![]
             }
         },
@@ -7792,7 +7826,7 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
                 match standard_json_to_jq_value(v, &cursor) {
                     Ok(jq_value) => out.push(OutputItem::Lazy(jq_value)),
                     Err(e) => {
-                        sink.report(DiagStyle::Jq, &e, at);
+                        sink.report(DiagStyle::Jq, &e, at.get());
                         break;
                     }
                 }
@@ -7842,7 +7876,7 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
                 )
             }
             Err(e) => {
-                sink.report(DiagStyle::Jq, &e, at);
+                sink.report(DiagStyle::Jq, &e, at.get());
                 vec![]
             }
         },
@@ -7910,17 +7944,17 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
                     match converted {
                         Ok(out) => vec![OutputItem::Lazy(JqValue::Array(out))],
                         Err(e) => {
-                            sink.report(DiagStyle::Jq, &e, at);
+                            sink.report(DiagStyle::Jq, &e, at.get());
                             vec![]
                         }
                     }
                 }
                 Err(jq::Control::Error(e)) => {
-                    sink.report(DiagStyle::Jq, &e, at);
+                    sink.report(DiagStyle::Jq, &e, at.get());
                     vec![]
                 }
                 Err(jq::Control::Break(label)) => {
-                    sink.report_break(DiagStyle::Jq, &label, at);
+                    sink.report_break(DiagStyle::Jq, &label, at.get());
                     vec![]
                 }
                 Err(jq::Control::Halt(code)) => {
@@ -7948,7 +7982,7 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
                         map.insert(key, value);
                     }
                     Err(e) => {
-                        sink.report(DiagStyle::Jq, &e, at);
+                        sink.report(DiagStyle::Jq, &e, at.get());
                         return vec![];
                     }
                 }
@@ -7957,7 +7991,7 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
         }
         GenericResult::None => vec![],
         GenericResult::Error(e) => {
-            sink.report(DiagStyle::Jq, &e, at);
+            sink.report(DiagStyle::Jq, &e, at.get());
             vec![]
         }
         GenericResult::Owned(v) => to_jq_values(v, at, sink),
@@ -7966,7 +8000,7 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
             .flat_map(|v| to_jq_values(v, at, sink))
             .collect(),
         GenericResult::Break(label) => {
-            sink.report_break(DiagStyle::Jq, &label, at);
+            sink.report_break(DiagStyle::Jq, &label, at.get());
             vec![]
         }
         // `halt`/`halt_error` (#791): not a diagnostic, so no `sink.report*`
@@ -7983,13 +8017,13 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
         // over-deep one must report cleanly rather than panic, same as
         // every other arm in this function (see `to_jq_values`'s own doc).
         GenericResult::Partial(vs, jq::Control::Error(e)) => {
-            sink.report(DiagStyle::Jq, &e, at);
+            sink.report(DiagStyle::Jq, &e, at.get());
             vs.into_iter()
                 .flat_map(|v| to_jq_values(v, at, sink))
                 .collect()
         }
         GenericResult::Partial(vs, jq::Control::Break(label)) => {
-            sink.report_break(DiagStyle::Jq, &label, at);
+            sink.report_break(DiagStyle::Jq, &label, at.get());
             vs.into_iter()
                 .flat_map(|v| to_jq_values(v, at, sink))
                 .collect()
@@ -10831,7 +10865,7 @@ mod tests {
             .map(|(_, end)| end)
             .collect();
         for mask in 0..(1u32 << ends.len()) {
-            let mut locator = ValueLocator::new(bytes, Some("f.json"), None);
+            let locator = ValueLocator::new(bytes, Some("f.json"), None);
             for (i, &end) in ends.iter().enumerate() {
                 if mask & (1 << i) == 0 {
                     continue;
@@ -10847,8 +10881,57 @@ mod tests {
     /// synthesized buffer holds (#1520), and never touches the counter.
     #[test]
     fn test_value_locator_slurp_uses_eof_line_4160() {
-        let mut locator = ValueLocator::new(b"[1,\n2]", None, Some(9));
+        let locator = ValueLocator::new(b"[1,\n2]", None, Some(9));
         assert_eq!(locator.at(7).line, Some(9));
+    }
+
+    /// #4178: a `LazyLocation` counts nothing until it is read, resolves to
+    /// what `line_at` gives for its value however many earlier values were
+    /// never read, and keeps that answer for every later read of the same
+    /// value.
+    #[test]
+    fn test_lazy_location_resolves_on_first_read_only_4178() {
+        let bytes = b"1\n2\n{\n\"a\":1\n}\n3\n";
+        let ends: Vec<usize> = find_json_values(bytes)
+            .unwrap()
+            .into_iter()
+            .map(|(_, end)| end)
+            .collect();
+        for mask in 0..(1u32 << ends.len()) {
+            let locator = ValueLocator::new(bytes, Some("f.json"), None);
+            let mut counted = 0;
+            for (i, &end) in ends.iter().enumerate() {
+                let at = LazyLocation::new(&locator, end);
+                if mask & (1 << i) == 0 {
+                    // Dropped unread: the counter must not have moved.
+                    assert_eq!(locator.counter.borrow().pos, counted, "mask={mask} i={i}");
+                    continue;
+                }
+                assert_eq!(locator.counter.borrow().pos, counted, "read is lazy");
+                let first = at.get().clone();
+                assert_eq!(
+                    first.line,
+                    Some(line_at(bytes, end)),
+                    "mask={mask} end={end}"
+                );
+                assert_eq!(first.file.as_deref(), Some("f.json"));
+                counted = end;
+                assert_eq!(locator.counter.borrow().pos, counted, "read counts to end");
+                // A second read is the memoised answer, not a second count.
+                assert_eq!(at.get().line, first.line);
+                assert_eq!(locator.counter.borrow().pos, counted);
+            }
+        }
+    }
+
+    /// #4178: a slurped value's `LazyLocation` names the EOF line (#1520) and
+    /// never touches the counter.
+    #[test]
+    fn test_lazy_location_slurp_uses_eof_line_4178() {
+        let locator = ValueLocator::new(b"[1,\n2]", None, Some(9));
+        let at = LazyLocation::new(&locator, 7);
+        assert_eq!(at.get().line, Some(9));
+        assert_eq!(locator.counter.borrow().pos, 0);
     }
 
     #[test]
@@ -12181,6 +12264,11 @@ mod tests {
     /// found during this fix's development routes a *document-sourced*
     /// decode failure through this wrapper (see the sibling note on
     /// `standard_json_to_jq_value`'s doc comment).
+    /// A locator whose every value is at `<stdin>:1`, for the glue's unit tests.
+    fn known_location_4178() -> ValueLocator<'static> {
+        ValueLocator::new(b"", None, Some(1))
+    }
+
     #[test]
     fn test_generic_result_to_jq_values_one_ok_and_err_1192() {
         let json: &[u8] = b"\"hello\"";
@@ -12191,7 +12279,7 @@ mod tests {
         let out = generic_result_to_jq_values(
             GenericResult::One(value),
             cursor,
-            &InputLocation::at(None, 1),
+            &LazyLocation::new(&known_location_4178(), 0),
             &mut sink,
         );
         assert_eq!(out.len(), 1);
@@ -12205,7 +12293,7 @@ mod tests {
         let out = generic_result_to_jq_values(
             GenericResult::One(value),
             cursor,
-            &InputLocation::at(None, 1),
+            &LazyLocation::new(&known_location_4178(), 0),
             &mut sink,
         );
         assert!(out.is_empty());
@@ -12230,7 +12318,7 @@ mod tests {
         let out = generic_result_to_jq_values(
             GenericResult::Many(vs),
             cursor,
-            &InputLocation::at(None, 1),
+            &LazyLocation::new(&known_location_4178(), 0),
             &mut sink,
         );
         assert!(matches!(
@@ -12258,7 +12346,8 @@ mod tests {
         let json: &[u8] = b"null";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
-        let at = InputLocation::at(None, 1);
+        let locator = known_location_4178();
+        let at = LazyLocation::new(&locator, 0);
 
         let mut sink = ErrorSink::default();
         let out = generic_result_to_jq_values(GenericResult::None, cursor, &at, &mut sink);
@@ -12374,7 +12463,8 @@ mod tests {
             panic!("expected an array"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the fixed b\"[1, 2, 3]\" literal above always decodes to StandardJson::Array (#2103)"
         };
         let cursors: Vec<_> = elements.cursor_iter().collect();
-        let at = InputLocation::at(None, 1);
+        let locator = known_location_4178();
+        let at = LazyLocation::new(&locator, 0);
 
         let mut sink = ErrorSink::default();
         let out =
