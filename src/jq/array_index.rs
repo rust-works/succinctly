@@ -195,22 +195,30 @@ impl ElementPrefix {
             return Some(Element::Past);
         };
         let mut list = elements.at_head_id(frontier)?;
+        // The ids move into a local for the walk, so the loop does not store
+        // the vector's length back through `self` on every push.
+        let mut ids = core::mem::take(&mut self.ids);
+        let steps = index + 1 - ids.len();
         // One allocation for the walk to `index` rather than a doubling every
         // few pushes, capped: `index` may lie far past the end of the array.
-        self.ids
-            .reserve((index + 1 - self.ids.len()).min(RESERVE_ELEMENTS));
-        loop {
+        ids.reserve(steps.min(RESERVE_ELEMENTS));
+        let mut last = None;
+        for _ in 0..steps {
             let Some((cursor, rest)) = list.uncons_cursor() else {
-                self.frontier = None;
-                return Some(Element::Past);
+                break;
             };
-            self.ids.push(cursor.node_id());
+            ids.push(cursor.node_id());
             note_recorded();
+            last = Some(cursor);
             list = rest;
-            if self.ids.len() > index {
-                self.frontier = list.head_id().map(|(id, _)| id);
-                return Some(Element::Found(cursor));
-            }
+        }
+        self.ids = ids;
+        if self.ids.len() > index {
+            self.frontier = list.head_id().map(|(id, _)| id);
+            last.map(Element::Found)
+        } else {
+            self.frontier = None;
+            Some(Element::Past)
         }
     }
 }
@@ -531,7 +539,8 @@ pub(crate) mod memo {
                     state.entries.push(entry);
                     return None;
                 }
-                make_room(&mut state.entries, 1, 0);
+                // No `make_room` here: an empty prefix holds nothing, and the
+                // extension below makes room for what it will record.
                 entry.kind = Kind::Prefix(ElementPrefix::new(id));
             }
             let mut retire = false;
@@ -566,22 +575,26 @@ pub(crate) mod memo {
     /// [`Kind::Refused`]) until `incoming` more of `elements` elements fit
     /// both the count and the element budget.
     fn make_room(entries: &mut [Entry], incoming: usize, elements: usize) {
-        loop {
-            let (count, held) = entries.iter().fold((0, 0), |(c, n), e| match &e.kind {
-                Kind::Indexed(ix) => (c + 1, n + ix.len()),
-                Kind::Prefix(p) => (c + 1, n + p.len()),
-                _ => (c, n),
-            });
+        let (mut count, mut held) = entries.iter().fold((0, 0), |(c, n), e| match &e.kind {
+            Kind::Indexed(ix) => (c + 1, n + ix.len()),
+            Kind::Prefix(p) => (c + 1, n + p.len()),
+            _ => (c, n),
+        });
+        // Oldest first; the loop ends without room only when a single index
+        // is larger than the whole element budget, which MAX_INDEXED_ELEMENTS
+        // (equal to the budget) rules out.
+        for entry in entries.iter_mut() {
             if count + incoming <= INDEXES && held + elements <= ELEMENT_BUDGET {
                 return;
             }
-            match entries
-                .iter()
-                .position(|e| matches!(e.kind, Kind::Indexed(_) | Kind::Prefix(_)))
-            {
-                Some(at) => entries[at].kind = Kind::Refused,
-                None => return, // patchcov: coverage tolerate-line reason="defensive: the loop ends here only when nothing is left to retire yet the budget is still exceeded, i.e. a single index larger than the whole element budget, which MAX_INDEXED_ELEMENTS (equal to the budget) rules out"
-            }
+            let size = match &entry.kind {
+                Kind::Indexed(ix) => ix.len(),
+                Kind::Prefix(p) => p.len(),
+                Kind::Seen { .. } | Kind::Refused => continue,
+            };
+            entry.kind = Kind::Refused;
+            count -= 1;
+            held -= size;
         }
     }
 
