@@ -11515,7 +11515,7 @@ mod tests {
             (one_then(4094), Some(0)),
             (then_one(4094), None),
             (format!("{} ", then_one(4094)), None),
-            (format!("{}", then_one(4094)) + &spaces(4096), Some(0)),
+            (then_one(4094) + &spaces(4096), Some(0)),
             (format!("{}1", spaces(4095)), None),
             (format!("1\n{}2", spaces(5000)), None),
             (format!("1\n2{}", spaces(5000)), Some(1)),

@@ -39022,12 +39022,9 @@ fn test_jq_input_reads_next_document_723() -> Result<()> {
 
 /// jq's own exhaustion error is oddly spelled `break`, not a more
 /// descriptive "No more inputs" -- confirmed live against jq 1.7.1. The
-/// `:0` (not `:1`) is a separate, pre-existing quirk unrelated to #723:
-/// `succinctly jq`'s own location tracking reports line 0 for a document
-/// ending on the input's first line even without `input` involved at all
-/// (confirmed identical on `main` before this change, e.g. `echo '1 2' |
-/// jq '.,error'` reports `:0` for the first value too) -- not something
-/// this issue introduces or should silently paper over here.
+/// location is `<unknown>`: the input `1` has no trailing newline, so the
+/// read that reached the end completed the value (#4303; this pin said
+/// `<stdin>:0` until then, which jq never prints here).
 #[test]
 fn test_jq_input_exhausted_errors_with_break_723() {
     let (stdout, stderr, code) =
@@ -39035,7 +39032,7 @@ fn test_jq_input_exhausted_errors_with_break_723() {
     assert_eq!(code, 5, "stdout: {stdout}\nstderr: {stderr}");
     assert!(stdout.is_empty(), "stdout: {stdout}");
     assert!(
-        stderr.contains("jq: error (at <stdin>:0): break"),
+        stderr.contains("jq: error (at <unknown>): break"),
         "{stderr}"
     );
 }
@@ -89697,7 +89694,8 @@ fn test_paths_filter_stop_reaches_a_retry_in_the_filter_3567() -> Result<()> {
         ("{\"a\":1,\"b\":2}", "first(paths(true))", "[\"a\"]", 0, ""),
         ("{\"a\":1,\"b\":2}", "[limit(2;paths(.))]", "[[\"a\"],[\"b\"]]", 0, ""),
         ("{\"a\":[1,{\"b\":2}]}", "[limit(1;paths(type==\"number\"))]", "[[\"a\",0]]", 0, ""),
-        ("{\"a\":1,\"b\":2}", "first(paths(input))", "", 5, "jq: error (at <stdin>:0): break\n"),
+        // `<unknown>`: the input ends without a newline (#4303).
+        ("{\"a\":1,\"b\":2}", "first(paths(input))", "", 5, "jq: error (at <unknown>): break\n"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(stdout.trim_end(), stdout_expected, "#3567: `{filter}` on {input}");
@@ -124094,7 +124092,8 @@ fn test_error_after_input_runs_out_names_jqs_eof_location_4303() -> Result<()> {
     let one_then_long = format!("1{}", " ".repeat(4094));
     // `(args, sources, expected)`: `None` is `<unknown>`, `Some((i, line))`
     // the `i`th source at `line`.
-    let rows: &[(&[&str], Vec<&[u8]>, Option<(usize, usize)>)] = &[
+    type Row<'a> = (&'a [&'a str], Vec<&'a [u8]>, Option<(usize, usize)>);
+    let rows: &[Row] = &[
         (&["-nc", "[inputs] | error(\"y\")"], vec![b"1 2 3"], None),
         (&["-nc", "[inputs] | error(\"y\")"], vec![b"1\n2\n3"], None),
         (
