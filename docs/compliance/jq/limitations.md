@@ -10239,6 +10239,10 @@ The controls (the same binary twice) read -1.6%..+2.6% on the M4 Pro and -1.6%..
 so the one row above the M4 Pro's control by its minimum (`ltrimstr` at 7 MB, +4.3%) is still well
 inside the ceiling, and its median (+1.3%) is inside the control. Run in the reverse direction on
 the M4 Pro (head as the baseline) the signs flip as they should (`length` +9.7%..+9.9%, `.` +181%..+204%).
+The instruction half of the ceiling (about +5%) holds too: retired instructions on the M4 Pro
+(`/usr/bin/time -l`, minimum of 5, the 7 MB document) are -1.3% for `startswith`, -3.1% for
+`ltrimstr`, -5.6% for `ascii_downcase` and -12.9% for `length`. No instruction counts were taken on
+the 7950X, where the wall-clock margin is -3% or better.
 Which change closed the gap was not attributed: the original figures were taken as merged in #3535,
 before #3642 and #3679, and with every row inside the ceiling there is nothing left to attribute.
 
