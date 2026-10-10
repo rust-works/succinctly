@@ -137068,7 +137068,7 @@ mod touched_edge_cases_2999 {
             r#"{"a": 1, "b"}"#,
             r#"{"a": (.k | debug | select(.))}"#,
             r#"{"a": (.k | stderr | select(.)), "b": 1}"#,
-            r#"{(.k | debug | select(.)): 1}"#,
+            "{(.k | debug | select(.)): 1}",
             r#"def f: debug; {"a": (.k | f | select(.))}"#,
         ] {
             let expr = parse_with_mode_and_extensions(union, ParserMode::Yq, true).unwrap();
