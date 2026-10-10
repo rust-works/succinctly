@@ -61184,6 +61184,53 @@ fn test_object_construction_empty_operand_4193() -> Result<()> {
     Ok(())
 }
 
+/// Pinned yq v4.53.3 (#4269): a string repeated by a negative count, or by a fractional one, is
+/// an error in yq where jq answers `null` and truncates. A non-negative integer repeats, and so
+/// does `null` (once). Rows captured from the pinned binary, `-p=json -o=json -I=0`.
+#[test]
+fn test_yq_string_repeat_by_a_negative_or_fractional_count_4269() -> Result<()> {
+    let args = &["-p=json", "-o=json", "-I=0"];
+    for (input, filter, expected) in [
+        ("null", r#""s" * 0"#, "\"\"\n"),
+        ("null", r#""s" * 1"#, "\"s\"\n"),
+        ("null", r#""s" * 2"#, "\"ss\"\n"),
+        ("null", r#"2 * "s""#, "\"ss\"\n"),
+        ("null", r#""" * 5"#, "\"\"\n"),
+        ("null", r#""s" * null"#, "\"s\"\n"),
+        (r#"{"s":"ab","n":2}"#, ".s * .n", "\"abab\"\n"),
+        (r#"{"s":"ab","n":2.0}"#, ".n * .s", "\"abab\"\n"),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, input, args)?,
+            (expected.into(), String::new(), 0),
+            "{input} | {filter}"
+        );
+    }
+    for (input, filter) in [
+        ("null", r#""s" * -1"#),
+        ("null", r#""s" * 0.5"#),
+        ("null", r#""s" * 1.5"#),
+        ("null", r#"1.5 * "s""#),
+        (r#"{"s":"ab","n":-1}"#, ".s * .n"),
+        (r#"{"s":"ab","n":-1}"#, ".n * .s"),
+        (r#"{"s":"ab","n":1.5}"#, ".s * .n"),
+        (r#"{"s":"ab","n":1.5}"#, ".n * .s"),
+    ] {
+        let (stdout, _, code) = run_yq_stdin_with_stderr(filter, input, args)?;
+        assert_eq!((stdout.as_str(), code), ("", 1), "{input} | {filter}");
+    }
+    // jq mode keeps its readings: a negative count is `null`, a fractional one truncates.
+    for (filter, expected) in [
+        (r#""s" * -1"#, "null\n"),
+        (r#""s" * 0.5"#, "\"\"\n"),
+        (r#""s" * 2.5"#, "\"ss\"\n"),
+    ] {
+        let (out, code) = run_jq_stdin(filter, "null", &["-c"])?;
+        assert_eq!((out.as_str(), code), (expected, 0), "jq: {filter}");
+    }
+    Ok(())
+}
+
 /// Pinned yq v4.53.3 (#4257): `pick` indexes an array by an integer, or by a string that parses as
 /// one (Go's base-10 `ParseInt`: a sign and leading zeros are fine, spaces are not); every other
 /// key, a float included, is an error, and a negative index does not wrap. `omit` leaves a scalar

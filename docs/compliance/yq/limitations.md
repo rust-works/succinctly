@@ -4527,6 +4527,10 @@ its text (`numeric_display_string`, so `==` and `tostring` agree about a compute
   indices from an array and leaves a scalar alone. One gap: an integral float key is an index here,
   while yq raises for a YAML-sourced or filter-literal one (`pick([1.0])`; a JSON-sourced `1.0` is an
   index in yq too, so the two cannot be told apart in the owned value). jq mode is unchanged.
+- **A string repeated by an integral float count (#4269).** In yq mode `"s" * n` raises for a negative
+  or a fractional `n` (as yq does) and repeats for an integer. An integral float (`2.0`) repeats here,
+  and in yq when it comes from JSON (`{"n": 2.0}`); a YAML-sourced or filter-literal `2.0` is
+  `cannot multiply !!str with !!float` in yq, which cannot be told apart in the owned value.
 - **A write keeps the blank lines between a head-comment block and the node below it**
   ([#4093](https://github.com/rust-works/succinctly/issues/4093)). For a node at column 0 the
   blank lines after the block are recorded as trailing empty entries of the head comment and
