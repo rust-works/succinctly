@@ -3163,8 +3163,8 @@ pub fn any_hash_repeats(mut hashes: Vec<u64>) -> bool {
 /// The bitset prefilter shared by [`repeated_hashes`] and
 /// [`any_hash_repeats`]: the hashes that landed on a bit another hash had
 /// also set, in their original order and unsorted, or `None` when the
-/// caller should sort the whole list instead -- the count is outside
-/// [`PREFILTER_MIN`]`..=`[`PREFILTER_MAX`], or too many hashes collided on
+/// caller should sort the whole list instead -- the count is below
+/// [`PREFILTER_MIN`] or above [`PREFILTER_MAX`], or too many hashes collided on
 /// the bitset for it to be filtering (see [`PREFILTER_MAX_ARRIVAL_SHARE`]).
 ///
 /// Every occurrence of a repeated value is among the candidates, so the
