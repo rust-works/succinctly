@@ -41226,6 +41226,37 @@ fn test_jq_seq_slurp_truncated_record_across_file_boundary_1550() -> Result<()> 
     Ok(())
 }
 
+/// #4313: jq's parser stops at the first malformed value and reads nothing after it, this file
+/// or any later one, so the values of the files that follow are never printed; the values before
+/// the error are, and the exit code is 5. The lazy route used to move on to the next file after
+/// reporting the error. Stdout and exit code from jq 1.7.1; its parser message is worded
+/// differently (`Unmatched '}' at line 1, column 3`), which this does not compare.
+#[test]
+fn test_jq_parse_error_stops_the_whole_input_stream_4313() -> Result<()> {
+    let rows: &[(&[&str], &[&str], &str)] = &[
+        (&["-c", "."], &["1 } 2", "3\n"], "1\n"),
+        (&["-c", "."], &["1 }", "[1,2]\n"], "1\n"),
+        (&["-c", "."], &["1\n", "2 }", "3\n"], "1\n2\n"),
+        (&["-c", "."], &["1 }", "2 }\n"], "1\n"),
+        (&["-c", "."], &["\"a\"\n\"b\tc\"\n", "3\n"], "\"a\"\n"),
+        (&["-c", "."], &["[1,2,", "3\n"], ""),
+        (&["-r", "."], &["1 }", "2\n"], "1\n"),
+        (&["-e", "."], &["1 }", "2\n"], "1\n"),
+        (&["-sc", "."], &["1 }", "2\n"], ""),
+        (&["-nc", "[inputs]"], &["1 }", "2\n"], ""),
+    ];
+    for (args, files, expected) in rows {
+        let (stdout, stderr, code, _paths) = run_jq_over_files(args, files)?;
+        assert_eq!(code, 5, "{args:?} over {files:?}: {stderr}");
+        assert_eq!(&stdout, expected, "{args:?} over {files:?}: {stderr}");
+    }
+    // Control: with no parse error every file is read.
+    let (stdout, stderr, code, _paths) = run_jq_over_files(&["-c", "."], &["1\n", "2\n", "3\n"])?;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "1\n2\n3\n");
+    Ok(())
+}
+
 /// #4305: jq reads all of its input files as one concatenated byte stream, so a token still
 /// open where a file ends continues in the next: `1` then `2\n` is the one number `12`, a
 /// `{"a":` is closed by the next file's `1}`. The open tail is moved onto the next file

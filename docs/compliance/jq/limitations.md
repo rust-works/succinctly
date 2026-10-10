@@ -7612,12 +7612,12 @@ A rejected later value no longer takes the values before it with it: on `{"ok":1
 by `["a<TAB>b"]` (or a truncated `[1,2,`), succinctly prints `{"ok":1}` and then exits 5, as jq
 does, on both input routes — closed by [#2961](https://github.com/rust-works/succinctly/issues/2961),
 which keeps the splitter's clean prefix instead of discarding it, and queues the parse error
-behind it for `input`/`inputs` (catchable there, delivered once, `break` after). Two
-differences remain, both pre-existing: the error reads `Invalid JSON text` where jq quotes its
+behind it for `input`/`inputs` (catchable there, delivered once, `break` after). One
+difference remains, pre-existing: the error reads `Invalid JSON text` where jq quotes its
 parser (`jq: parse error: Unfinished JSON term at EOF at line 2, column 5`, with no `(at …)`
-marker from the driver loop), and on the lazy per-file route a splitter error moves on to the
-next file, where jq stops the whole stream — the [#355](https://github.com/rust-works/succinctly/issues/355)
-continue-past-error rule below. The `input`/`inputs` route stops there, as jq does. And the
+marker from the driver loop). A parse error stops the whole input stream on both routes, as it
+does in jq: the files after the malformed one are not read ([#4313](https://github.com/rust-works/succinctly/issues/4313);
+the lazy per-file route used to move on to the next file). And the
 `(at …)` marker a later error names after the parse error has been read counts newlines
 through the end of the line the malformed value starts on, which is jq's answer whenever that
 value sits on one line (`1\n2 }\n\n\n` → line 2); for a malformed value spanning several lines

@@ -4665,12 +4665,13 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 }
             }
             // The malformed value, reported only once everything before it
-            // has been processed. Moving on to the next file afterwards is
-            // the recorded #355 continue-past-error divergence (jq stops the
-            // whole stream); only the lost prefix was #2961.
+            // has been processed. jq's parser stops at the first malformed
+            // value and reads nothing after it, this file or any later one
+            // (#4313), so the files that follow are not run either.
             if let Some(offset) = split_error {
                 let at = InputLocation::at(filename.as_deref(), line_at(raw, offset));
                 sink.report(DiagStyle::Jq, &EvalError::new("Invalid JSON text"), &at);
+                break;
             }
         }
     } else {
