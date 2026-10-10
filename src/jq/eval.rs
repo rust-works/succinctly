@@ -47788,8 +47788,16 @@ impl FoldRegister {
             // EXTRACT's refusal of a frozen `$var` that is, or sits inside, the node it entered
             // on is the resolver's guess, not jq's verdict ([`guess_refusal`]): left `Kept` it
             // read as exact and an EXTRACT `try` swallowed it, dropping a path jq names.
+            //
+            // Not when UPDATE's output navigated: its register is then known to have left the
+            // step's entry (`($v|.b?)|floor` is on `.b`), and a refusal of the entry's own node is
+            // jq's verdict, which a `try` around it catches.
             let frame = self.frame.unknown();
-            let frame = if S::TAG == EvalTag::Jq && self.trackable && !frame.register_loss.is_lost()
+            let navigated = branch.path.depth() > self.path.depth();
+            let frame = if S::TAG == EvalTag::Jq
+                && self.trackable
+                && !navigated
+                && !frame.register_loss.is_lost()
             {
                 frame
                     .with_register_loss(RegisterLoss::LostAt(Rc::new(self.value.clone())))
