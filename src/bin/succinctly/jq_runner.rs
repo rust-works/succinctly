@@ -11286,6 +11286,13 @@ mod tests {
         assert_eq!(at(&format!("0\n[{}1 \"ab\"]\n", " ".repeat(4090))), 2);
         assert_eq!(at(&format!("0\n{}truex\n", " ".repeat(4092))), 2);
         assert_eq!(at(&format!("0\n{}1x\n", " ".repeat(4093))), 2);
+        // A fault inside a string is placed at its close, past an escaped
+        // quote, or at the end when the string never closes.
+        assert_eq!(at("0\n[\"a\tb\\\"c\n\"]\n"), 3);
+        assert_eq!(at("0\n\"a\tb"), 1);
+        // A value the splitter refused but jq's spellings accept is placed
+        // where it starts.
+        assert_eq!(parse_error_line(b"1\n2\n", 2), 2);
     }
 
     #[test]
