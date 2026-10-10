@@ -12543,7 +12543,9 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             optional,
         ),
 
-        Expr::Builtin(builtin) => eval_builtin::<S, _>(builtin, value, optional, cursor),
+        Expr::Builtin(builtin) => {
+            eval_builtin_in::<S, _>(Some(expr), builtin, value, optional, cursor)
+        }
 
         // Comparison operations: routed through the shared lazy fanout
         // machinery (#1481) rather than a hand-rolled eager loop --
@@ -29975,6 +29977,37 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
+    eval_builtin_in::<S, V>(None, builtin, value, optional, cursor)
+}
+
+/// The `Expr::Builtin` node a bridging arm hands the full evaluator: the one
+/// `builtin` was dispatched from when the dispatcher passed it down, else a
+/// copy (#4218).
+///
+/// An arm that crosses to the owned evaluator needs an `&Expr`, and rebuilding
+/// one from `&Builtin` clones the whole argument tree -- two allocator calls
+/// for `del(.[]?)`, per scalar member, for a node the caller was already
+/// holding.
+fn builtin_expr<'e>(whole: Option<&'e Expr>, builtin: &Builtin) -> Cow<'e, Expr> {
+    match whole {
+        // Pointer identity, not just shape: a `whole` that is not the node
+        // `builtin` was borrowed from is cloned from `builtin`, as if it had
+        // not been passed, so a mismatched pair costs the allocations back
+        // and never evaluates the wrong expression.
+        Some(expr @ Expr::Builtin(b)) if core::ptr::eq(b, builtin) => Cow::Borrowed(expr),
+        _ => Cow::Owned(Expr::Builtin(builtin.clone())),
+    }
+}
+
+/// [`eval_builtin`], told which `Expr::Builtin` node `builtin` sits in (#4218).
+/// `whole` is `None` for a caller that holds a bare `Builtin`.
+fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
+    whole: Option<&Expr>,
+    builtin: &Builtin,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+) -> GenericResult<V> {
     // #2471 (gate reason 1 of spine 2416): a map-family body that reads path
     // context is evaluated once per member, at the member's own position.
     // Gated on `needs_path_context` so an ordinary `map_values(.+1)` never
@@ -31016,7 +31049,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         | Builtin::UpperIn(_)
         | Builtin::UpperInSrc(..)
         | Builtin::Skip(..) => {
-            let expr = Expr::Builtin(builtin.clone());
+            let expr = builtin_expr(whole, builtin);
             if crate::jq::input_queue_is_active() && crate::jq::walk::uses_input_builtins(&expr) {
                 bridge_to_full_evaluator::<S, _>(&expr, value, cursor, optional)
             } else {
@@ -31056,7 +31089,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         Builtin::Reverse => {
             if !reordering_may_keep_cursors::<V>(cursor.as_ref()) {
                 return bridge_to_full_evaluator::<S, _>(
-                    &Expr::Builtin(builtin.clone()),
+                    &builtin_expr(whole, builtin),
                     value,
                     cursor,
                     optional,
@@ -31146,7 +31179,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 .filter(|_| reordering_may_keep_cursors::<V>(cursor.as_ref()))
             else {
                 return bridge_to_full_evaluator::<S, _>(
-                    &Expr::Builtin(builtin.clone()),
+                    &builtin_expr(whole, builtin),
                     value,
                     cursor,
                     optional,
@@ -31208,7 +31241,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 .filter(|_| reordering_may_keep_cursors::<V>(cursor.as_ref()))
             else {
                 return bridge_to_full_evaluator::<S, _>(
-                    &Expr::Builtin(builtin.clone()),
+                    &builtin_expr(whole, builtin),
                     value,
                     cursor,
                     optional,
@@ -31285,7 +31318,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             match eval_has_generic::<S, _>(key_expr, value.clone(), optional, cursor) {
                 Some(result) => result,
                 None => bridge_to_full_evaluator::<S, _>(
-                    &Expr::Builtin(builtin.clone()),
+                    &builtin_expr(whole, builtin),
                     value,
                     cursor,
                     optional,
@@ -31309,7 +31342,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 ));
             }
             eval_on_owned::<S, _>(
-                &Expr::Builtin(builtin.clone()),
+                &builtin_expr(whole, builtin),
                 owned,
                 optional,
                 Reentry::Against(root),
@@ -31401,7 +31434,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             let rooted = if S::REINDEX_BRIDGE_KEEPS_IDENTITY {
                 None
             } else {
-                reindexed_root_for::<S, _>(&Expr::Builtin(builtin.clone()), cursor.as_ref())
+                reindexed_root_for::<S, _>(&builtin_expr(whole, builtin), cursor.as_ref())
             };
             let owned = owned_or_suppress!(
                 match rooted
@@ -31426,7 +31459,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     None => owned_vec_to_generic_result(values),
                 };
             }
-            let owned_builtin_expr = Expr::Builtin(builtin.clone());
+            let owned_builtin_expr = builtin_expr(whole, builtin);
             eval_on_owned_over::<S, _>(
                 &owned_builtin_expr,
                 owned,
@@ -31795,15 +31828,11 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         // Same live-input-queue deferral as the #2968 arms above (#1309).
         Builtin::AnyF(_) | Builtin::AllF(_) | Builtin::IsValid(_)
             if crate::jq::input_queue_is_active()
-                && crate::jq::walk::uses_input_builtins(&Expr::Builtin(builtin.clone())) =>
+                && crate::jq::walk::uses_input_builtins(&builtin_expr(whole, builtin)) =>
         {
             // patchcov: coverage tolerate-line reason="the CLI evaluates every program that uses input/inputs on the eager route (jq_runner's can_use_lazy_path excludes them), so this guard never fires today -- #2968's identical guards on the arms above are equally unfired; kept for the day the lazy path admits such a program (#1309)"
-            bridge_to_full_evaluator::<S, _>(
-                &Expr::Builtin(builtin.clone()),
-                value,
-                cursor,
-                optional,
-            ) // patchcov: coverage tolerate-line reason="see above: the input-queue deferral never fires from the CLI"
+            bridge_to_full_evaluator::<S, _>(&builtin_expr(whole, builtin), value, cursor, optional)
+            // patchcov: coverage tolerate-line reason="see above: the input-queue deferral never fires from the CLI"
         }
         Builtin::AnyF(cond) if cursor.is_some() => {
             any_all_f_generic::<S, V>(cond, &value, optional, cursor.expect("guarded"), true)
@@ -31853,7 +31882,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // (e.g. `path(...)`/`del(...)` nested inside this builtin's own
             // argument), so it must be checked against this call's own root.
             let root = RootWitness::of(cursor.as_ref());
-            let expr = Expr::Builtin(builtin.clone());
+            let expr = builtin_expr(whole, builtin);
             let rooted = reindexed_root_for::<S, _>(&expr, cursor.as_ref());
             let owned = owned_or_suppress!(
                 bridge_input_over::<_, S>(&expr, &value, cursor, rooted.as_deref()),

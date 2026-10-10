@@ -69430,15 +69430,28 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // per-path walk below safe: the sibling-shifting `delete_expr_paths_at`
     // existed for (#424, a negative index resolving against a length an
     // earlier sibling already shortened) needs a sibling to shift under it.
-    let paths: Vec<Expr> = match resolved {
-        DelPaths::Verbatim => vec![path_expr.clone()],
-        DelPaths::Root => vec![Expr::Identity],
-        DelPaths::Branches(branches) => assemble_path_branches(branches),
+    //
+    // #4218: the verbatim and root shapes lend the path they already hold
+    // instead of copying it into a `Vec`. Only an installed alias table
+    // rewrites a path, and that is the one case that needs an owned copy; a
+    // `del(.[]?)` over 2,000 scalars paid two allocator calls per member
+    // (the `Optional` box and the `Vec`'s own) to hand `delete_at_path` a
+    // path it only reads.
+    let identity = Expr::Identity;
+    let lend = !alias_identity::active();
+    let mut paths: Cow<'_, [Expr]> = match resolved {
+        DelPaths::Verbatim if lend => Cow::Borrowed(core::slice::from_ref(path_expr)),
+        DelPaths::Root if lend => Cow::Borrowed(core::slice::from_ref(&identity)),
+        DelPaths::Verbatim => Cow::Owned(vec![path_expr.clone()]),
+        DelPaths::Root => Cow::Owned(vec![Expr::Identity]),
+        DelPaths::Branches(branches) => Cow::Owned(assemble_path_branches(branches)),
     };
     // #1351: `del(.b.p)` on `b: *x` deletes from the anchor's node; `del(.b)`
-    // (a path ending at the alias) removes that position only.
-    let mut paths = paths;
-    alias_identity::redirect_paths(&mut paths, &result, del_redirect);
+    // (a path ending at the alias) removes that position only. A lent path
+    // has no table to consult, so only an owned one is redirected.
+    if let Cow::Owned(owned) = &mut paths {
+        alias_identity::redirect_paths(owned, &result, del_redirect);
+    }
     debug_assert!(
         paths.len() <= 1,
         "a multi-path del() match set should have been merged into a DeleteTrie (#1690)"
@@ -69470,7 +69483,7 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // condition, so a second per-path check here would be unreachable dead
     // code, not a real fallback.)
     let mut result = result;
-    for path in &paths {
+    for path in paths.iter() {
         // yq's chained-scalar-slice del() rule (#1116, generalized by
         // #1219 to a whole trailing slice-run) — a *different* rule from
         // #1101's no-op above: rewrite the path to delete the parent key
