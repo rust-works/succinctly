@@ -44043,7 +44043,7 @@ fn stage_is_register_keeping<S: EvalSemantics>(expr: &Expr) -> bool {
         Expr::Try {
             expr: inner,
             catch: Some(handler),
-        } => stage_is_register_keeping::<S>(inner) && cannot_move_register(handler),
+        } => stage_is_register_keeping::<S>(inner) && handler_navigates_nothing(handler),
         // #3767: a compound stage whose every branch leaves the register alone. jq
         // backtracks to the fork each alternative of a `,`, `//` or `if` starts from, so
         // each begins at the entry register; a pipe threads the register from one stage
@@ -44083,6 +44083,32 @@ fn stage_is_register_keeping<S: EvalSemantics>(expr: &Expr) -> bool {
                     && leaves_register_in_place::<S>(stage))
         }
     }
+}
+
+/// Whether a `catch` handler navigates nothing at stage level (#4151): it runs on the
+/// error's payload, a value with no position of its own, so one that moves no register is
+/// fine however its branches combine. [`cannot_move_register`] answers for the node as a
+/// whole and so refuses a compound whose branches are `select` stages
+/// ([`is_select_stage`], a stage-level fact it has no admission for): `catch (select(.), 7)`
+/// is read branch by branch, through `,` `//` `if` and a pipe, each branch either
+/// navigating nothing or a `select`/type filter. A handler that navigates (`.a`,
+/// `last(.a)`) is not admitted, whether or not it runs: it raises when it does, in jq as
+/// here.
+fn handler_navigates_nothing(handler: &Expr) -> bool {
+    cannot_move_register(handler)
+        || match unwrap_paren(handler) {
+            Expr::Comma(branches) => branches.iter().all(handler_navigates_nothing),
+            Expr::Pipe(stages) => stages.iter().all(handler_navigates_nothing),
+            Expr::Alternative(left, right) => {
+                handler_navigates_nothing(left) && handler_navigates_nothing(right)
+            }
+            Expr::If {
+                then_branch,
+                else_branch,
+                ..
+            } => handler_navigates_nothing(then_branch) && handler_navigates_nothing(else_branch),
+            stage => is_select_stage(stage),
+        }
 }
 
 /// The static half of "this stage leaves jq's register where it entered", the one
@@ -92749,6 +92775,80 @@ mod tests {
             let expr = parse(refused).unwrap();
             assert!(
                 !stage_keeps_register_statically::<JqSemantics>(&expr),
+                "{refused}"
+            );
+        }
+    }
+
+    /// #4151: a `catch` handler is read branch by branch ([`handler_navigates_nothing`]):
+    /// `select` stages and type filters navigate nothing at stage level, through `,` `//`
+    /// `if` and a pipe, while a branch that navigates (`.a`, `last(.a)`, `first(.a)`) keeps
+    /// the handler, and so the `try`, refused.
+    #[test]
+    fn a_catch_handler_of_select_stages_navigates_nothing_4151() {
+        let handler = |src: &str| {
+            let Expr::Try {
+                catch: Some(handler),
+                ..
+            } = parse(&format!("try error(1) catch ({src})")).unwrap()
+            else {
+                panic!("`try ... catch` expected for {src}");
+            };
+            *handler
+        };
+        for admitted in [
+            "7",
+            ".",
+            "select(.)",
+            "numbers",
+            "(select(.), 7)",
+            "(select(.), select(.))",
+            "(select(.) // 7)",
+            "(numbers // 7)",
+            "if . then select(.) else 7 end",
+            "(select(.) | 7)",
+            "(select(.) | (select(.), numbers))",
+            "((select(.), 7))",
+        ] {
+            assert!(handler_navigates_nothing(&handler(admitted)), "{admitted}");
+        }
+        for refused in [
+            ".a",
+            "last(.a)",
+            "first(.a)",
+            "(select(.), .a)",
+            "(.a, select(.))",
+            "(select(.) | .a)",
+            "(select(.) // .a)",
+            "if . then select(.) else .a end",
+            "(select(.), last(.a))",
+            "(select(.), getpath([\"a\"]))",
+        ] {
+            assert!(!handler_navigates_nothing(&handler(refused)), "{refused}");
+        }
+        // ... and the `try` as a stage: admitted over a register-keeping body only.
+        for admitted in [
+            "try (select(.), error(\"e\")) catch (select(.), 7)",
+            "try last(.a) catch (select(.), 7)",
+            "try select(.) catch (numbers // 7)",
+        ] {
+            let expr = parse(admitted).unwrap();
+            assert!(
+                stage_leaves_register_in_place::<JqSemantics>(&expr),
+                "{admitted}"
+            );
+            assert!(
+                !stage_leaves_register_in_place::<YqSemantics>(&expr),
+                "{admitted}"
+            );
+        }
+        for refused in [
+            "try .a catch (select(.), 7)",
+            "try (select(.), error(\"e\")) catch (select(.), .a)",
+        ] {
+            let expr = parse(refused).unwrap();
+            assert!(
+                !stage_leaves_register_in_place::<JqSemantics>(&expr),
                 "{refused}"
             );
         }

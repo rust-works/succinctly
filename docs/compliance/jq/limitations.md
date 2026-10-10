@@ -1559,8 +1559,14 @@ is the revert that established what the other one costs.
    (`(select(.), .a)`) or a navigating tail (`(select(.) \| .a)`) keeps the whole refused, as in jq. Still
    refused where jq answers: a `def` call (`def g: last(.a); g \| $x`, which `cannot_move_register`
    never admits: a name is not a body), a branch that is a `getpath` (admitted as a bare stage by the
-   run's state, which a branch is not asked), and a compound `catch` handler
-   (`try (select(.), error("e")) catch (select(.), 7)`: only a handler that navigates nothing is read).
+   run's state, which a branch is not asked), and a compound `catch` handler that
+   navigates (`try (select(.), error("e")) catch (select(.), .a)`). A handler that is a compound of
+   `select` stages and constants navigates nothing at stage level and is read branch by branch
+   (#4151): `try (select(.), error("e")) catch (select(.), 7)`, `catch (numbers // 7)` and `catch (if .
+   then select(.) else 7 end)` leave `$x` at the root, pinned by
+   `test_register_catch_handler_compound_of_select_stages_4151`. Still refused where jq answers: any `try ... catch`
+   inside a `foreach` UPDATE, with the plain handler `catch .` as much as with this one
+   (`path(foreach .a? as $k (0; try (try (select(.), error("e")) catch .); $k))` on `null`).
    An `[E]` collect as a branch of a compound stage is read by the rule that reads it as a bare stage
    (#4152): `5 \| (select(.), [numbers])`, `5 \| ([numbers] // 7)` and `5 \| if . then [numbers] else
    select(.) end` leave `$x` at the root (`[]` per output), pinned by

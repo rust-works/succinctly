@@ -120954,6 +120954,98 @@ fn test_seq_slurp_materializes_lazy_results_and_the_wrap_boundary_2847() -> Resu
 // #3767 Part 3: a `try ... catch` handler over a register-keeping stage
 // ============================================================================
 
+/// #4151: a `catch` handler that is a compound of `select` stages navigates nothing at stage
+/// level, so `try E catch H` over a register-keeping `E` leaves jq's path register alone for it
+/// as it does for a handler that cannot move it (#3767 part 3): the handler runs on the error's
+/// payload, a value with no position, and `select(f)` hands it through. Read branch by branch
+/// through `,` `//` `if` and a pipe. Contrast: a handler that navigates after the `select`
+/// (`select(.) | .a`) still refuses, as in jq. (`catch (select(.), .a)` is left out: jq prints
+/// `[]` before it raises and this refuses before printing, so stdout differs, as before.)
+/// Every row captured from jq 1.7.1 with `-c` on `{"a":{"b":1},"k":2}`, on the stdin and `-n`
+/// routes.
+#[test]
+fn test_register_catch_handler_compound_of_select_stages_4151() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r#"path(. as $x | try (select(.), error("e")) catch (select(.), 7) | $x)"#,
+            "[]\n[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r#"path(. as $x | 5 | try (select(.), error("e")) catch (select(.), 7) | $x)"#,
+            "[]\n[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r#"path(. as $x | 5 | try error("e") catch (select(.) | 7) | $x)"#,
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r#"path(. as $x | 5 | try error("e") catch (numbers // 7) | $x)"#,
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r#"path(. as $x | 5 | try error("e") catch (if . then select(.) else 7 end) | $x)"#,
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | try last(.a) catch (select(.), 7) | $x)",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | 5 | try select(.) catch (numbers // 7) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r#"path(. as $x | 5 | try (select(.), error("e")) catch (select(.), 7) | $x | .k)"#,
+            "[\"k\"]\n[\"k\"]\n[\"k\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r#"del(. as $x | 5 | try (select(.), error("e")) catch (select(.), 7) | $x.k)"#,
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r#"(. as $x | 5 | try (select(.), error("e")) catch (select(.), 7) | $x.k) |= 9"#,
+            "{\"a\":{\"b\":1},\"k\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r#"path(. as $x | 5 | try error("e") catch (select(.) | .a) | $x)"#,
+            "",
+            r#"Invalid path expression near attempt to access element "a" of "e""#,
+            5,
+        ),
+    ])
+}
+
 /// jq runs a `try`'s handler after a backtrack to the fork the `try` set, and a
 /// backtrack restores the path state saved there, so `try E catch H` leaves
 /// jq's path register where `E` does: back at the entry for `last(f)`,
