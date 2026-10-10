@@ -549,6 +549,15 @@ would cover only the last two spellings, leaving `1_000` → `1000` and `0X2A` �
 perfectly consumable output that succinctly simply declines to match — with no justification
 at all. The justification is the spec target, which is why the case belongs here.
 
+### A fused slice read does not validate the rest of the range (#4195)
+
+`E[a:b][k]` and `E[a:b] | length` over a computed slice read the range's resolved bounds and
+convert only the element they name, in yq mode as in jq mode. A malformed JSON value elsewhere
+in the range (`[1,1.2.3,3]` read as `0 as $i | .[$i:][0]`) therefore does not raise, where the
+slice written out in full (`(.[$i:]) | .[0]`) still does. It is an input-validation posture,
+not an evaluator rule, and the same as `.[0]` and `length`; the table and the reasoning are in
+[jq limitations § A fused slice read does not validate the rest of the range](../jq/limitations.md#a-fused-slice-read-does-not-validate-the-rest-of-the-range-4195).
+
 ## Open divergences (bugs, not decisions)
 
 Representative cases, each live-verified. These are gaps to close, listed here so they are

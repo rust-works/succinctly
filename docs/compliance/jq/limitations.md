@@ -1033,6 +1033,28 @@ costs no stack depth. What it leaves:
   `cond` does not see the second output jq delivers when the retry follows `first`'s stop: the
   loop is collected eagerly there.
 
+## A fused slice read does not validate the rest of the range (#4195)
+
+jq parses the whole input before it evaluates anything, so a document with a malformed value
+anywhere is rejected outright. succinctly indexes lazily and checks the values a filter reads
+(`sjq --validate` is the strict RFC 8259 pass up front). The computed-slice read the fusion
+answers, `E[a:b][k]` with an integer-literal `k` and `E[a:b] | length`, converts only the
+element it names, so a malformed value elsewhere in the range no longer raises:
+
+| Filter                         | Input         | jq                      | succinctly                         |
+|--------------------------------|---------------|-------------------------|------------------------------------|
+| `0 as $i \| .[$i:][0]`         | `[1,1.2.3,3]` | rejects the document    | `1`                                |
+| `0 as $i \| .[$i:] \| length`  | `[1,1.2.3,3]` | rejects the document    | `3`                                |
+| `0 as $i \| .[$i:][1]`         | `[1,1.2.3,3]` | rejects the document    | raises (it reads the bad element)  |
+| `0 as $i \| (.[$i:]) \| .[0]`  | `[1,1.2.3,3]` | rejects the document    | raises (the slice is built whole)  |
+| `.[0:3][0]`                    | `[1,1.2.3,3]` | rejects the document    | raises (a literal slice, unfused)  |
+
+This is the posture `.[0]` and `length` already have: neither looks inside a sibling element.
+The unfused spellings above are what a read of the whole slice does, and they still convert
+every element. The cost of the other choice is the point of the fusion: validating the range
+means touching all of it, which is the O(tail) per read that made a loop over `.[$i:][0]`
+quadratic. Pinned by `test_fused_slice_read_does_not_convert_siblings_4195`.
+
 ## Where succinctly errors and jq does not
 
 A probe is only admitted to the corpus if jq errors on it, so the corpus is blind to the

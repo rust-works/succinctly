@@ -12000,15 +12000,9 @@ fn eval_single_pipe<S: EvalSemantics, V: DocumentValue>(
     // #4195: `E[a:b][k]` and `E[a:b] | length` read the slice's resolved range
     // instead of building the slice. Not for a pipe that reads path context: its
     // routing above (and the staged fallback below) needs the slice's own stage.
-    if !needs_path {
-        if let Some((slice, read)) = fusable_slice_read(exprs) {
-            if let Some(owned) = try_fused_slice_read::<S, V>(slice, read, value.clone(), cursor) {
-                return fold_pipe_stages::<S, V>(
-                    GenericResult::Owned(owned),
-                    &exprs[2..],
-                    optional,
-                );
-            }
+    if !needs_path && matches!(exprs.first(), Some(Expr::SliceExpr { .. })) {
+        if let Some((owned, rest)) = fused_slice_pipe_head::<S, V>(exprs, value.clone(), cursor) {
+            return fold_pipe_stages::<S, V>(GenericResult::Owned(owned), rest, optional);
         }
     }
 
@@ -17630,29 +17624,10 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
         }
     }
 
-    // #4195: the sink route's twin of the fusion in `eval_single_pipe`. The fused
-    // answer is one owned value, handed to the rest of the pipe as the slice's
-    // single output would be: the driver below forwards the downstream flow
-    // unchanged for a first stage that cannot retry, and a pure slice cannot.
-    if !needs_path && !optional {
-        if let Some((slice, read)) = fusable_slice_read(exprs) {
-            if let Some(owned) = try_fused_slice_read::<S, V>(slice, read, value.clone(), cursor) {
-                let item = GenericItem::Owned(owned);
-                let rest = &exprs[2..];
-                if rest.is_empty() {
-                    return push_one_generic(item, sink);
-                }
-                let flow = continue_pipe_element_generic::<S, V>(
-                    item,
-                    &mut RestPipe::new(rest),
-                    optional,
-                    sink,
-                );
-                if let Flow::Escaped(control) = &flow {
-                    mark_nonretryable_escape(control);
-                }
-                return flow;
-            }
+    // #4195: the sink route's twin of the fusion in `eval_single_pipe`.
+    if !needs_path && !optional && matches!(exprs.first(), Some(Expr::SliceExpr { .. })) {
+        if let Some((owned, rest)) = fused_slice_pipe_head::<S, V>(exprs, value.clone(), cursor) {
+            return finish_fused_slice_pipe::<S, V>(owned, rest, optional, sink);
         }
     }
 
@@ -22315,9 +22290,9 @@ fn try_fused_slice_read<S: EvalSemantics, V: DocumentValue>(
     let Expr::SliceExpr { target, start, end } = slice else {
         return None; // patchcov: coverage tolerate-line reason="unreachable: fusable_slice_read returns only a SliceExpr stage"
     };
-    let start = single_slice_bound::<S, V>(start, value.clone(), cursor, f64::floor)?;
-    let end = single_slice_bound::<S, V>(end, value.clone(), cursor, f64::ceil)?;
-    let target = match eval_single::<S, V>(target, value, false, cursor) {
+    // The target first: it is the cheapest thing to rule out, so a string, `null`
+    // or object target declines before either bound is evaluated.
+    let target = match eval_single::<S, V>(target, value.clone(), false, cursor) {
         GenericResult::One(v) => v,
         GenericResult::OneCursor(c) => c.value(),
         _ => return None,
@@ -22326,6 +22301,8 @@ fn try_fused_slice_read<S: EvalSemantics, V: DocumentValue>(
         return None;
     }
     let elements = target.as_array()?;
+    let start = single_slice_bound::<S, V>(start, value.clone(), cursor, f64::floor)?;
+    let end = single_slice_bound::<S, V>(end, value, cursor, f64::ceil)?;
     let (start, end) =
         resolve_computed_slice_bounds::<S>(SliceTargetKind::Sliceable, &start, &end).ok()?;
     let len = crate::jq::array_index::len_checked_memoized(&elements).ok()?;
@@ -22346,6 +22323,48 @@ fn try_fused_slice_read<S: EvalSemantics, V: DocumentValue>(
     let position = range.start + resolved as usize;
     let cursor = crate::jq::array_index::get_cursor_memoized(&elements, position)?;
     to_owned::<S, _>(&cursor.value()).ok()
+}
+
+/// The fused head of a pipe (#4195): when `exprs` starts with a slice and a read
+/// [`fusable_slice_read`] accepts, and [`try_fused_slice_read`] answers, the read's
+/// value and the stages after it. `None` leaves the whole pipe to the ordinary route.
+///
+/// Out of line on purpose: the two pipe drivers are on the evaluator's recursion
+/// path, and what this builds (the bounds, the target, the element) must not widen
+/// their native frames, which the stack-depth guard is calibrated against.
+#[inline(never)]
+fn fused_slice_pipe_head<S: EvalSemantics, V: DocumentValue>(
+    exprs: &[Expr],
+    value: V,
+    cursor: Option<V::Cursor>,
+) -> Option<(OwnedValue, &[Expr])> {
+    let (slice, read) = fusable_slice_read(exprs)?;
+    let owned = try_fused_slice_read::<S, V>(slice, read, value, cursor)?;
+    Some((owned, &exprs[2..]))
+}
+
+/// Hand a fused slice read's value to the rest of a pipe on the sink route (#4195), as
+/// the slice's single output would have been. The driver in `eval_each_pipe_generic`
+/// forwards the downstream flow unchanged for a first stage that cannot retry, and a
+/// pure slice cannot; what it adds on an escape is the nonretryable mark. Out of line
+/// for the reason [`fused_slice_pipe_head`] gives.
+#[inline(never)]
+fn finish_fused_slice_pipe<S: EvalSemantics, V: DocumentValue>(
+    owned: OwnedValue,
+    rest: &[Expr],
+    optional: bool,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    let item = GenericItem::Owned(owned);
+    if rest.is_empty() {
+        return push_one_generic(item, sink);
+    }
+    let flow =
+        continue_pipe_element_generic::<S, V>(item, &mut RestPipe::new(rest), optional, sink);
+    if let Flow::Escaped(control) = &flow {
+        mark_nonretryable_escape(control);
+    }
+    flow
 }
 
 /// Evaluate a builtin function.
@@ -42959,7 +42978,7 @@ mod tests {
     /// an empty bound, and one that raises are all left to the ordinary route.
     #[test]
     fn test_single_slice_bound_declines_anything_but_one_value_4195() {
-        let json = br#"[1,2,3]"#;
+        let json = br"[1,2,3]";
         let index = JsonIndex::build(json);
         let root = index.root(json);
         let pull = |src: Option<&str>, round: fn(f64) -> f64| {
