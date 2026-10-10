@@ -2,8 +2,9 @@
 //! allocation tests share (#4161).
 //!
 //! Included by `tests/jq_recurse_alloc_3023.rs`, `tests/jq_swallowed_iterate_alloc_3689.rs`,
-//! `tests/jq_caught_iterate_alloc_3704.rs` and `tests/jq_path_consumer_alloc_3728.rs`
-//! via `#[path = "common/counting_alloc.rs"] mod counting_alloc;`. Lives under
+//! `tests/jq_caught_iterate_alloc_3704.rs`, `tests/jq_path_consumer_alloc_3728.rs`,
+//! `tests/jq_reindexed_scalar_root_alloc_4154.rs`, `tests/jq_path_iterate_optional_alloc_4157.rs`
+//! and `tests/jq_del_scalar_clone_alloc_4218.rs` via `#[path = "common/counting_alloc.rs"] mod counting_alloc;`. Lives under
 //! `tests/common/` because cargo auto-discovers `tests/*.rs` as test binaries
 //! but not files in subdirectories.
 //!
