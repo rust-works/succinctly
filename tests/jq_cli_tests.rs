@@ -124178,6 +124178,53 @@ fn test_error_after_input_runs_out_names_jqs_eof_location_4303() -> Result<()> {
             "{args:?} over {sources:?}: {stderr}"
         );
     }
+    // `input_line_number` follows the marker: the first read past the end
+    // takes its line (0 for `<unknown>`), and every later one is `<unknown>`
+    // at 0. A parse error's own read names where it is, and the reads after
+    // it go on to the end the same way.
+    let erred: &[u8] = b"1\n2 }\n\n\n";
+    let first_past = r#"[input, input, (try input catch "c"), (try input catch "d")]"#;
+    let second_past =
+        r#"[input, input, (try input catch "c"), (try input catch "d"), (try input catch "e")]"#;
+    for (source, filter, expected) in [
+        (
+            &b"1\n2\n\n"[..],
+            "[inputs] | input_line_number".to_string(),
+            Ok("3"),
+        ),
+        (
+            b"1 2 3",
+            "[inputs] | input_line_number".to_string(),
+            Ok("0"),
+        ),
+        (
+            b"1\n2\n",
+            r#"[inputs] | (try input catch "e") | input_line_number"#.to_string(),
+            Ok("0"),
+        ),
+        (
+            b"1\n2\n",
+            r#"[inputs] | (try input catch "e") | error("y")"#.to_string(),
+            Err(None),
+        ),
+        (erred, format!("{first_past} | input_line_number"), Ok("4")),
+        (erred, format!("{first_past} | error(\"y\")"), Err(Some(4))),
+        (erred, format!("{second_past} | error(\"y\")"), Err(None)),
+    ] {
+        let (stdout, stderr, code, paths) = run_jq_over_byte_files(&["-nc", &filter], &[source])?;
+        match expected {
+            Ok(line) => assert_eq!((stdout.trim_end(), code), (line, 0), "{filter}: {stderr}"),
+            Err(line) => {
+                let location =
+                    line.map_or("<unknown>".to_string(), |l| format!("{}:{l}", paths[0]));
+                assert_eq!(
+                    (stderr.trim_end(), code),
+                    (format!("jq: error (at {location}): y").as_str(), 5),
+                    "{filter}"
+                );
+            }
+        }
+    }
     // stdin is the same stream, named `<stdin>`.
     for (input, expected) in [("1 2 3", "<unknown>"), ("3\n\n", "<stdin>:2")] {
         let (_, stderr, code) = run_jq_full(&["-c", "input"], Some(input))?;

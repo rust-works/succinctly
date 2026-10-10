@@ -6455,20 +6455,18 @@ file the user passed. A confidently wrong position is worse than the divergence,
 divergence is what these filters get. `at_offset`/`at_position`/`line`/`column` are
 succinctly extensions, so no jq-compliance question arises either way.
 
-One divergence remains, unrelated to the eager-evaluator root cause above.
-
-**`input_line_number` keeps its line after a failed read.** jq resets it to 0 after an
-`input` that finds nothing, but *not* after an `[inputs]` that exhausts the same stream:
+**Resolved by #4303: `input_line_number` after a failed read.** This was recorded as a
+divergence because jq looked inconsistent: it reset `input_line_number` to 0 after an `input`
+that found nothing, but not after an `[inputs]` that exhausted the same stream. One rule
+explains both readings. The first read that finds the stream at its end leaves the marker and
+`input_line_number` at the end of input: the last source's newline count, or `<unknown>` and 0
+when that final read completed the stream's last value. Every later failed read leaves
+`<unknown>` and 0. `[inputs]` stops at its first failed read; the extra `try input` is the second:
 
 ```
 $ printf '1\n2\n' | jq -cn '[inputs]|length, input_line_number, (try input catch "e"), input_line_number'
-2  2  "e"  0                      # jq
-2  2  "e"  2                      # succinctly
+2  2  "e"  0                      # jq, and succinctly since #4303
 ```
-
-Deliberately not matched. jq is not self-consistent between the two exhaustion paths, and
-a single probe admitting two readings is not a model worth encoding; the reset is not
-reproduced until the rule behind it is known.
 
 ## A truncating consumer of `map(f)` skips the elements it never needed
 

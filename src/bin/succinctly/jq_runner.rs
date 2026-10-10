@@ -5372,6 +5372,19 @@ fn get_inputs(
         Vec::new()
     };
 
+    // #4303: how the stream ends, read only by an `input`/`inputs` that runs
+    // past it, so only a program using them pays the scan of the last source.
+    // From the bytes as read, before the UTF-8 substitution below turns an
+    // invalid byte into a three-byte U+FFFD: jq's 4095-byte reads count the
+    // file's own bytes. `--slurp` answers `<unknown>` regardless, JSON `--seq`
+    // keeps its own record-boundary rules (#2947, #3003), and DSV has no jq
+    // oracle.
+    let eof_tail = (track_eof && !args.slurp && !seq_stream_shape && args.input_dsv.is_none())
+        .then(|| {
+            let sources: Vec<&[u8]> = raw_bytes.iter().map(|(_, raw)| raw.as_slice()).collect();
+            EofTail::of(&sources, args.raw_input)
+        });
+
     // All reads happen first, then decoding: a later file's read error still
     // outranks an earlier file's content error, as it did before.
     let mut raw_inputs: Vec<(Option<usize>, String)> = Vec::with_capacity(raw_bytes.len());
@@ -5451,14 +5464,7 @@ fn get_inputs(
             .map(|p| Some(p.to_string_lossy().to_string()))
             .collect(),
     );
-    // #4303: how the stream ends, read only by an `input`/`inputs` that runs
-    // past it, so only a program using them pays the scan of the last source.
-    // `--slurp` answers `<unknown>` regardless, JSON `--seq` keeps its own
-    // record-boundary rules (#2947, #3003), and DSV has no jq oracle.
-    if track_eof && !args.slurp && !seq_stream_shape && args.input_dsv.is_none() {
-        let sources: Vec<&[u8]> = raw_inputs.iter().map(|(_, raw)| raw.as_bytes()).collect();
-        locations.eof_tail = Some(EofTail::of(&sources, args.raw_input));
-    }
+    locations.eof_tail = eof_tail;
 
     // `--slurp`'s single combined value has no content of its own to name a
     // line in -- jq instead names the *last source*'s own newline count at
@@ -5893,7 +5899,13 @@ impl EofTail {
             .map_or(0, |at| at + 1);
         let partial = (last.len() - line_start) % JQ_READ_CHUNK;
         let final_read = last.len() - partial;
-        match split_json_values(last).0.last() {
+        let (values, malformed) = split_json_values(last);
+        // A parse error ends the stream's values, and jq raises it where its
+        // reads reach the malformed bytes.
+        if let Some(start) = malformed {
+            return start >= final_read;
+        }
+        match values.last() {
             // At `last.len()` for a bare token that the end of input completes.
             Some(&(start, end)) => {
                 let completes_at = if matches!(last[start], b'"' | b'[' | b'{') {

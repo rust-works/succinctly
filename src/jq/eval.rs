@@ -70865,6 +70865,10 @@ mod remaining_inputs {
         // there -- delivered by exactly one pop, after the last document
         // (#2961). See `pop_input`.
         static TRAILING_ERROR: RefCell<Option<(EvalError, (u32, u32))>> = const { RefCell::new(None) };
+        // Whether a read has already found the stream at its end. jq's first
+        // such read leaves the marker at `EXHAUSTED`; every later one leaves it
+        // at `<unknown>` with `input_line_number` at 0 (#4303).
+        static PAST_END: Cell<bool> = const { Cell::new(false) };
     }
 
     /// One read from the input stream.
@@ -70897,6 +70901,7 @@ mod remaining_inputs {
         SEEDED.with(|s| s.set(true));
         CURRENT.with(|c| c.set(None));
         EXHAUSTED.with(|e| e.set(exhausted));
+        PAST_END.with(|p| p.set(false));
     }
 
     /// Whether a CLI driver has seeded the queue on this thread.
@@ -70924,19 +70929,18 @@ mod remaining_inputs {
     /// `jq -n 'input,input' one.json empty.json` reports `empty.json:0`, not
     /// `one.json:1`.
     ///
-    /// `LAST_LINE` is deliberately *not* touched on a failed pop, even though
-    /// jq's own `input_line_number` does reset to 0 after a failed `input`.
-    /// jq is not self-consistent there -- after `[inputs]` has exhausted the
-    /// same stream it still reports the last document's line -- and one probe
-    /// with two readings is not a model worth encoding. Recorded as a
-    /// divergence instead; see `docs/compliance/jq/limitations.md`.
+    /// `input_line_number` follows the marker (#4303): the first failed read
+    /// leaves it at `EXHAUSTED`'s line, or 0 where that is `<unknown>`, and
+    /// every later failed read leaves the marker at `<unknown>` and the line at
+    /// 0. That one rule is both of the readings once recorded as jq being
+    /// inconsistent: `[inputs]` on `1\n2\n` stops at its first failed read
+    /// (line 2), and one more `try input` is the second (line 0).
     ///
     /// Once the documents run out, a stream that ended in a parse error
-    /// delivers that error exactly once, moving the marker to where jq's
-    /// parser stopped, and reads after it are exhausted with the marker left
-    /// there: jq never reads past a parse error, and `jq -n '(try input catch
-    /// null), ..., error("x")'` still names the malformed file's position
-    /// (#2961).
+    /// delivers that error exactly once, moving the marker and the line to
+    /// where jq's parser stopped (#2961). The reads after it go on to the end
+    /// of the stream as above: on `1\n2 }\n\n\n`, jq names line 2 for the
+    /// error's read, line 4 for the next, and `<unknown>` after that.
     pub fn pop_input() -> Pop {
         let popped = QUEUE.with(|q| q.borrow_mut().pop_front());
         if let Some((doc, src, line)) = popped {
@@ -70950,10 +70954,15 @@ mod remaining_inputs {
             // input catch 0)` on `1\n2 }\n\n\n`.
             LAST_LINE.with(|l| l.set(at.1));
             CURRENT.with(|c| c.set(Some(at)));
-            EXHAUSTED.with(|e| e.set(Some(at)));
             return Pop::ParseError(error);
         }
-        CURRENT.with(|c| c.set(EXHAUSTED.with(Cell::get)));
+        let at = if PAST_END.with(|p| p.replace(true)) {
+            None
+        } else {
+            EXHAUSTED.with(Cell::get)
+        };
+        CURRENT.with(|c| c.set(at));
+        LAST_LINE.with(|l| l.set(at.map_or(0, |(_, line)| line)));
         Pop::Exhausted
     }
 
