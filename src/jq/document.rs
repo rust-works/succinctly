@@ -3359,6 +3359,15 @@ fn keys_repeat<V: DocumentValue, C: DocumentCursor>(fields: &[DocumentField<V, C
 /// streaming walk has already run on every field it examined. This caller
 /// needs neither.
 ///
+/// It sorts every hash rather than asking [`any_hash_repeats`], which its
+/// siblings [`keys_repeat`] and `spans_repeat` (`jq_runner.rs`) do (#4169).
+/// Measured on `keys_unsorted` over `wide` objects of 1.0 M to 2.0 M keys
+/// (this function only runs past the 786,432-key saturation point), the
+/// prefilter cut instructions by 6.5% but read -2.5% to +4.1% wall-clock on
+/// an M4 Pro, slower at 1.55 M to 1.77 M keys and faster on either side;
+/// the 7950X read +0.9% to -2.1%. The mechanism of the M4 Pro band was not
+/// isolated, and the best case is about 2%, so the sort stays here.
+///
 /// `Vec::new()` and push, never `with_capacity` off a bound: #1588 measured
 /// a hint 16x too large at **149.2 MiB** against 37.1 for no hint at all, on
 /// a table whose exact size was 29.1 -- `alloc_zeroed`'s pages do fault in,
