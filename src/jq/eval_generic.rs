@@ -8550,7 +8550,10 @@ pub(crate) struct RootCopy {
 /// (`.[] | ... | [key]`) asks for the elements in document order, and the
 /// scans summed over `n` of them are `O(n^2)`. Remembering where the last
 /// scan of a wide parent stopped lets the next one start there, and answers
-/// the element after it, or the same one read again, with no scan at all.
+/// the element after it, or the same one read again, with no scan at all. A
+/// parent keeps two such scans (#4164), so two fan-outs at distant offsets of
+/// one array each resume from their own; three or more still replace one
+/// another.
 ///
 /// Scoped, not global: an entry names one document's parent by node id, so
 /// it is installed by an evaluation entry point for the document it
@@ -8568,11 +8571,18 @@ mod slot_memo {
 
     use super::RootCopy;
 
-    /// How many wide parents are remembered at once: a document has a handful
-    /// of wide levels, and each position's climb touches each of them. The
-    /// least recently used is dropped, so an outer array read at every
-    /// position outlives the inner arrays that come and go beneath it.
+    /// How many scans are remembered at once, across all parents (a parent
+    /// holds at most [`PER_PARENT`] of them): a document has a handful of wide
+    /// levels, and each position's climb touches each of them. The least
+    /// recently used is dropped, so an outer array read at every position
+    /// outlives the inner arrays that come and go beneath it.
     const CAPACITY: usize = 4;
+
+    /// How many scans of one parent are remembered at once (#4164): two
+    /// fan-outs reading distant offsets of one array each resume from their
+    /// own, where one entry per parent had them evict each other on every
+    /// read. A single fan-out still holds exactly one.
+    const PER_PARENT: usize = 2;
 
     struct Scan {
         parent: usize,
@@ -8622,13 +8632,15 @@ mod slot_memo {
         WORK.with(std::cell::Cell::get)
     }
 
-    #[cfg(test)]
+    #[inline(always)]
     pub(crate) fn note_scanned() {
+        #[cfg(test)]
         WORK.with(|w| w.set((w.get().0 + 1, w.get().1)));
     }
 
-    #[cfg(test)]
+    #[inline(always)]
     pub(crate) fn note_neighbour() {
+        #[cfg(test)]
         WORK.with(|w| w.set((w.get().0, w.get().1 + 1)));
     }
 
@@ -8644,16 +8656,14 @@ mod slot_memo {
         MISSED.with(std::cell::Cell::get)
     }
 
-    #[cfg(test)]
+    #[inline(always)]
+    #[cfg_attr(not(test), allow(unused_variables))]
     pub(crate) fn note_missed(document: usize, parent: usize) {
+        #[cfg(test)]
         if remembers(document, parent) {
             MISSED.with(|m| m.set(m.get() + 1));
         }
     }
-
-    #[cfg(not(test))]
-    #[inline(always)]
-    pub(crate) fn note_missed(_document: usize, _parent: usize) {}
 
     // How many times `scan_for_slot` built the parent's value, which for a YAML
     // mapping walks every member (#3846): a resume must not.
@@ -8667,22 +8677,11 @@ mod slot_memo {
         VALUED.with(std::cell::Cell::get)
     }
 
-    #[cfg(test)]
+    #[inline(always)]
     pub(crate) fn note_parent_valued() {
+        #[cfg(test)]
         VALUED.with(|v| v.set(v.get() + 1));
     }
-
-    #[cfg(not(test))]
-    #[inline(always)]
-    pub(crate) fn note_parent_valued() {}
-
-    #[cfg(not(test))]
-    #[inline(always)]
-    pub(crate) fn note_scanned() {}
-
-    #[cfg(not(test))]
-    #[inline(always)]
-    pub(crate) fn note_neighbour() {}
 
     /// What a [`Guard`] puts back when it drops.
     enum Restore {
@@ -8789,47 +8788,88 @@ mod slot_memo {
         });
     }
 
-    /// The element of `parent` the last scan found -- its node id and index --
-    /// when `target` comes after it.
+    /// What [`neighbours`] found: node id and index of each scan, and whether
+    /// the one before is a mapping's.
+    #[derive(Default)]
+    pub(crate) struct Around {
+        pub(crate) before: Option<(usize, i64, bool)>,
+        pub(crate) after: Option<(usize, i64)>,
+    }
+
+    /// The scans of `parent` a read of `target` may resume from, in one pass:
+    /// the element nearest *before* it -- its node id, index, and whether it
+    /// is a mapping's -- which a scan resumes from, and, when `after` asks
+    /// (the format can step back, sequences only, #4101), the element nearest
+    /// *after* it -- node id and index -- which a walk back starts at (#4164
+    /// keeps more than one per parent, so the nearest is the cheapest).
+    /// Read-only; [`touch`] marks the one a read resumes from used.
+    pub(crate) fn neighbours(document: usize, parent: usize, target: usize, after: bool) -> Around {
+        MEMO.with(|m| {
+            let m = m.borrow();
+            let Some(state) = m.as_ref().filter(|s| s.document == document) else {
+                return Around::default();
+            };
+            let mut before: Option<&Scan> = None;
+            let mut later: Option<&Scan> = None;
+            for scan in state.scans.iter().filter(|s| s.parent == parent) {
+                if scan.last < target {
+                    if before.map_or(true, |b| scan.last > b.last) {
+                        before = Some(scan);
+                    }
+                } else if after
+                    && !scan.members
+                    && scan.last > target
+                    && later.map_or(true, |l| scan.last < l.last)
+                {
+                    later = Some(scan);
+                }
+            }
+            Around {
+                before: before.map(|s| (s.last, s.index, s.members)),
+                after: later.map(|s| (s.last, s.index)),
+            }
+        })
+    }
+
+    /// Mark the scan of `parent` that found `last` most recently used.
+    pub(crate) fn touch(document: usize, parent: usize, last: usize) {
+        MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            let Some(state) = m.as_mut().filter(|s| s.document == document) else {
+                return;
+            };
+            if let Some(at) = state
+                .scans
+                .iter()
+                .position(|s| s.parent == parent && s.last == last)
+            {
+                let scan = state.scans.remove(at);
+                state.scans.push(scan);
+            }
+        });
+    }
+
+    /// The scan [`neighbours`] finds before `target`, marked used (the tests'
+    /// way to read a scan).
+    #[cfg(test)]
     pub(crate) fn resume(
         document: usize,
         parent: usize,
         target: usize,
     ) -> Option<(usize, i64, bool)> {
-        MEMO.with(|m| {
-            let mut m = m.borrow_mut();
-            let state = m.as_mut().filter(|s| s.document == document)?;
-            let at = state
-                .scans
-                .iter()
-                .position(|s| s.parent == parent && s.last < target)?;
-            let scan = state.scans.remove(at);
-            let found = (scan.last, scan.index, scan.members);
-            state.scans.push(scan);
-            Some(found)
-        })
+        let found = neighbours(document, parent, target, false).before?;
+        touch(document, parent, found.0);
+        Some(found)
     }
 
-    /// The element of `parent` the last scan found -- its node id and index --
-    /// when `target` comes *before* it and the scan was of a sequence's
-    /// elements (#4101): the point to step back from. Read-only.
+    /// The scan [`neighbours`] finds after `target`.
+    #[cfg(test)]
     pub(crate) fn resume_back(
         document: usize,
         parent: usize,
         target: usize,
     ) -> Option<(usize, i64)> {
-        MEMO.with(|m| {
-            let mut m = m.borrow_mut();
-            let state = m.as_mut().filter(|s| s.document == document)?;
-            // Recency is not touched: a walk that finds nothing must not keep
-            // this parent alive past one a fan-out is still reading, and
-            // `remember` refreshes it when the walk succeeds.
-            let scan = state
-                .scans
-                .iter()
-                .find(|s| s.parent == parent && !s.members && s.last > target)?;
-            Some((scan.last, scan.index))
-        })
+        neighbours(document, parent, target, true).after
     }
 
     /// The first remembered scan of `document` that `f` accepts, given its
@@ -8869,14 +8909,21 @@ mod slot_memo {
             let m = m.borrow();
             let mut found = [None; CAPACITY];
             if let Some(state) = m.as_ref().filter(|s| s.document == document) {
-                for (slot, scan) in found
-                    .iter_mut()
-                    .zip(state.scans.iter().filter(|s| s.parent < id))
-                {
-                    *slot = Some(Candidate {
+                let mut listed = 0;
+                for scan in state.scans.iter().filter(|s| s.parent < id) {
+                    // Two scans of one parent are one candidate (#4164).
+                    if found[..listed]
+                        .iter()
+                        .flatten()
+                        .any(|c: &Candidate| c.parent == scan.parent)
+                    {
+                        continue;
+                    }
+                    found[listed] = Some(Candidate {
                         parent: scan.parent,
                         extent: scan.extent,
                     });
+                    listed += 1;
                 }
             }
             found
@@ -8900,12 +8947,18 @@ mod slot_memo {
             let Some(state) = m.as_mut().filter(|s| s.document == document) else {
                 return;
             };
-            if let Some(scan) = state.scans.iter_mut().find(|s| s.parent == parent) {
+            for scan in state.scans.iter_mut().filter(|s| s.parent == parent) {
                 scan.extent = Some((end, depth));
             }
         });
     }
 
+    /// Remember that a scan of `parent` found the element `last` (index
+    /// `index`). `replaces` is the `last` of the remembered scan this one was
+    /// resumed from, which it supersedes (#4164); a scan that started from
+    /// the first element passes `None` and is added beside the parent's
+    /// others, evicting the parent's least recently used if it already holds
+    /// [`PER_PARENT`], else the table's if that is full.
     pub(crate) fn remember(
         document: usize,
         parent: usize,
@@ -8913,17 +8966,54 @@ mod slot_memo {
         index: i64,
         next: Option<usize>,
         members: bool,
+        replaces: Option<usize>,
     ) {
         MEMO.with(|m| {
             let mut m = m.borrow_mut();
             let Some(state) = m.as_mut().filter(|s| s.document == document) else {
                 return;
             };
+            // One pass over the table: this runs for every element a fan-out
+            // advances to. The parent's extent is a fact about the parent, so
+            // any of its scans can hand it on; the scan resumed from goes, and
+            // so does any scan already at `last` (a restart can leave one right
+            // after the one resumed from): two scans of a parent never describe
+            // the same element.
             let mut extent = None;
-            if let Some(at) = state.scans.iter().position(|s| s.parent == parent) {
-                extent = state.scans.remove(at).extent;
-            } else if state.scans.len() == CAPACITY {
-                state.scans.remove(0);
+            let mut kept = 0;
+            let mut superseded = None;
+            let mut superseded_twice = false;
+            for (at, scan) in state.scans.iter().enumerate() {
+                if scan.parent != parent {
+                    continue;
+                }
+                kept += 1;
+                extent = extent.or(scan.extent);
+                if Some(scan.last) == replaces || scan.last == last {
+                    if superseded.is_none() {
+                        superseded = Some(at);
+                    } else {
+                        superseded_twice = true;
+                    }
+                }
+            }
+            match superseded {
+                Some(at) if !superseded_twice => {
+                    state.scans.remove(at);
+                }
+                Some(_) => state.scans.retain(|s| {
+                    !(s.parent == parent && (Some(s.last) == replaces || s.last == last))
+                }),
+                None => {
+                    if kept == PER_PARENT {
+                        if let Some(at) = state.scans.iter().position(|s| s.parent == parent) {
+                            state.scans.remove(at);
+                        }
+                    }
+                    if state.scans.len() == CAPACITY {
+                        state.scans.remove(0);
+                    }
+                }
             }
             state.scans.push(Scan {
                 parent,
@@ -8947,21 +9037,22 @@ mod slot_memo {
         Guard
     }
 
-    pub(crate) fn resume(
-        _document: usize,
-        _parent: usize,
-        _target: usize,
-    ) -> Option<(usize, i64, bool)> {
-        None
+    #[derive(Default)]
+    pub(crate) struct Around {
+        pub(crate) before: Option<(usize, i64, bool)>,
+        pub(crate) after: Option<(usize, i64)>,
     }
 
-    pub(crate) fn resume_back(
+    pub(crate) fn neighbours(
         _document: usize,
         _parent: usize,
         _target: usize,
-    ) -> Option<(usize, i64)> {
-        None
+        _after: bool,
+    ) -> Around {
+        Around::default()
     }
+
+    pub(crate) fn touch(_document: usize, _parent: usize, _last: usize) {}
 
     pub(crate) fn find<R>(
         _document: usize,
@@ -8993,6 +9084,7 @@ mod slot_memo {
         _index: i64,
         _next: Option<usize>,
         _members: bool,
+        _replaces: Option<usize>,
     ) {
     }
 
@@ -27164,7 +27256,7 @@ fn cursor_slot<C: DocumentCursor>(c: &C) -> Result<Option<CursorSlot<C>>, EvalEr
 fn cursor_parent_and_slot<C: DocumentCursor>(
     c: &C,
 ) -> Result<Option<(C, CursorSlot<C>)>, EvalError> {
-    if let Some((parent_id, index, advanced, members)) = remembered_neighbour(c) {
+    if let Some((parent_id, index, advanced, members, from)) = remembered_neighbour(c) {
         if let Some(parent) = c.at_node_id(parent_id) {
             if members {
                 // A member value read again, or the one after the remembered
@@ -27172,7 +27264,7 @@ fn cursor_parent_and_slot<C: DocumentCursor>(
                 // which names the malformed member.
                 if let Some(slot) = c.prev_sibling().and_then(|k| member_slot(k, true)) {
                     if advanced {
-                        remember_member(c.document_token(), parent_id, c);
+                        remember_member(c.document_token(), parent_id, c, Some(from));
                     }
                     return Ok(Some((parent, slot)));
                 }
@@ -27185,6 +27277,7 @@ fn cursor_parent_and_slot<C: DocumentCursor>(
                         index,
                         c.next_element().map(|n| n.node_id()),
                         false,
+                        Some(from),
                     );
                 }
                 return Ok(Some((parent, CursorSlot::Element(index))));
@@ -27304,8 +27397,9 @@ fn remembered_direct_parent<C: DocumentCursor>(c: &C) -> Option<C> {
 }
 
 /// The parent's node id and the index of `c`, whether `c` is a new element
-/// rather than the remembered one itself, and whether the parent is a mapping
-/// (then `c` is a member *value* and the index is unused), when `c` is a
+/// rather than the remembered one itself, whether the parent is a mapping
+/// (then `c` is a member *value* and the index is unused), and the remembered
+/// element matched (the one a new scan supersedes), when `c` is a
 /// remembered element or the one right after it ([`slot_memo`], #3702,
 /// #3839): a fan-out reading each
 /// element in turn finds every one after the first this way, with no scan and
@@ -27313,7 +27407,7 @@ fn remembered_direct_parent<C: DocumentCursor>(c: &C) -> Option<C> {
 /// parentheses, `O(distance to the parent's open)`, so for the `i`th element
 /// of a wide array it is `O(i)` as well. Integer comparisons only: each
 /// remembered scan carries the node id of the element after its last.
-fn remembered_neighbour<C: DocumentCursor>(c: &C) -> Option<(usize, i64, bool, bool)> {
+fn remembered_neighbour<C: DocumentCursor>(c: &C) -> Option<(usize, i64, bool, bool, usize)> {
     if !C::RESUMABLE_ELEMENT_SCAN {
         return None;
     }
@@ -27321,9 +27415,9 @@ fn remembered_neighbour<C: DocumentCursor>(c: &C) -> Option<(usize, i64, bool, b
     let found = slot_memo::find(c.document_token(), |parent, last, index, next, members| {
         if id == last {
             // The same element read again (`key`, then `path`, at one position).
-            Some((parent, index, false, members))
+            Some((parent, index, false, members, last))
         } else if next == Some(id) {
-            Some((parent, index + 1, true, members))
+            Some((parent, index + 1, true, members, last))
         } else {
             None
         }
@@ -27349,9 +27443,26 @@ fn resumed_slot<C: DocumentCursor>(c: &C, parent: &C) -> Option<CursorSlot<C>> {
     let document = c.document_token();
     let parent_id = parent.node_id();
     let target = c.node_id();
-    let Some((last, index, members)) = slot_memo::resume(document, parent_id, target) else {
-        return resumed_slot_back(c, parent);
-    };
+    let slot_memo::Around { before, after } =
+        slot_memo::neighbours(document, parent_id, target, C::STEPS_BACK);
+    // A scan remembered after `c` is stepped back from when it is nearer than
+    // the one before it (#4164): two fan-outs at distant offsets each keep
+    // their own, and a descending pair would otherwise scan forward from the
+    // far, lower one. Nearer by node id, which is only a proxy for elements;
+    // the walk gates itself on its own estimate and bound, and when it
+    // declines the forward resume decides.
+    if let Some((high, index)) = after {
+        // `map_or(true, ..)`, not `is_none_or`: the MSRV is 1.73.
+        if before.map_or(true, |(low, _, _)| high - target < target - low) {
+            if let Some(slot) = resumed_slot_back(c, parent, high, index) {
+                return Some(slot);
+            }
+        }
+    }
+    let (last, index, members) = before?;
+    // Only a scan the read resumes from counts as used: one the walk back
+    // replaced instead would otherwise outlive its sibling in the LRU order.
+    slot_memo::touch(document, parent_id, last);
     let mut cursor = c.at_node_id(last).and_then(|l| l.next_element());
     if members {
         while let Some(kc) = cursor {
@@ -27366,7 +27477,7 @@ fn resumed_slot<C: DocumentCursor>(c: &C, parent: &C) -> Option<CursorSlot<C>> {
             let is_value = vc.same_node(c);
             if is_value || kc.same_node(c) {
                 let slot = member_slot(kc, is_value)?;
-                remember_member(document, parent_id, &vc);
+                remember_member(document, parent_id, &vc, Some(last));
                 return Some(slot);
             }
             cursor = vc.next_element();
@@ -27387,6 +27498,7 @@ fn resumed_slot<C: DocumentCursor>(c: &C, parent: &C) -> Option<CursorSlot<C>> {
                     at,
                     next.map(|n| n.node_id()),
                     false,
+                    Some(last),
                 );
                 return Some(CursorSlot::Element(at));
             }
@@ -27397,8 +27509,9 @@ fn resumed_slot<C: DocumentCursor>(c: &C, parent: &C) -> Option<CursorSlot<C>> {
     None
 }
 
-/// The slot of `c` in `parent` when a scan of `parent` remembers an element
-/// *after* `c` (#4101): step back from it with
+/// The slot of `c` in `parent`, given the element a scan of `parent` remembers
+/// *after* `c` (`last`, at `index`; #4101, the nearest such scan, #4164): step
+/// back from it with
 /// [`prev_element`](DocumentCursor::prev_element), `O(distance)`, where the
 /// scan from the first element is `O(index of c)`. Elements only: a mapping's
 /// scan keeps no member index to bound the walk with.
@@ -27414,14 +27527,15 @@ fn resumed_slot<C: DocumentCursor>(c: &C, parent: &C) -> Option<CursorSlot<C>> {
 /// wildly in size wastes at most that many steps, and `None` (the scan from
 /// the first element then decides) also when the chain passes `c` without
 /// meeting it.
-fn resumed_slot_back<C: DocumentCursor>(c: &C, parent: &C) -> Option<CursorSlot<C>> {
-    if !C::STEPS_BACK {
-        return None;
-    }
+fn resumed_slot_back<C: DocumentCursor>(
+    c: &C,
+    parent: &C,
+    last: usize,
+    index: i64,
+) -> Option<CursorSlot<C>> {
     let document = c.document_token();
     let parent_id = parent.node_id();
     let target = c.node_id();
-    let (last, index) = slot_memo::resume_back(document, parent_id, target)?;
     let bound = (index / 2).min(SLOT_MEMO_MAX_BACK);
     let span = last.checked_sub(parent_id).filter(|s| *s > 0)?;
     let estimate = u128::try_from(index).ok()? * u128::try_from(last - target).ok()? / span as u128;
@@ -27446,6 +27560,7 @@ fn resumed_slot_back<C: DocumentCursor>(c: &C, parent: &C) -> Option<CursorSlot<
                     at,
                     Some(from.node_id()),
                     false,
+                    Some(last),
                 );
             }
             return Some(CursorSlot::Element(at));
@@ -27461,11 +27576,12 @@ fn resumed_slot_back<C: DocumentCursor>(c: &C, parent: &C) -> Option<CursorSlot<
 /// nothing to resume from), remembering where the scan ends for the next
 /// (#3702).
 ///
-/// A read before the remembered element steps back from it when the format can
+/// A read before a remembered element steps back from it when the format can
 /// ([`resumed_slot_back`], #4101); when it cannot, or the walk is longer than
-/// the scan from the first element, this scan replaces the memo: a pipe that
-/// alternates a read near the start with a read near the end gets no help, as
-/// it got none before.
+/// the scan from the first element, this scan is added beside the parent's
+/// others (#4164: two fan-outs at distant offsets each keep their own, so a
+/// pipe that alternates a read near the start with a read near the end is
+/// linear), evicting the parent's least recently used if it holds two.
 fn element_slot_resumable<C: DocumentCursor>(
     c: &C,
     parent: &C,
@@ -27486,6 +27602,7 @@ fn element_slot_resumable<C: DocumentCursor>(
                     index,
                     elem.next_element().map(|n| n.node_id()),
                     false,
+                    None,
                 );
             }
             return Some(CursorSlot::Element(index));
@@ -27516,7 +27633,12 @@ fn next_member_value_id<C: DocumentCursor>(c: &C) -> Option<usize> {
 
 /// Remember that a scan of `parent_id`'s members last found the member whose
 /// value is `value_cursor`.
-fn remember_member<C: DocumentCursor>(document: usize, parent_id: usize, value_cursor: &C) {
+fn remember_member<C: DocumentCursor>(
+    document: usize,
+    parent_id: usize,
+    value_cursor: &C,
+    replaces: Option<usize>,
+) {
     slot_memo::remember(
         document,
         parent_id,
@@ -27524,6 +27646,7 @@ fn remember_member<C: DocumentCursor>(document: usize, parent_id: usize, value_c
         0,
         next_member_value_id(value_cursor),
         true,
+        replaces,
     );
 }
 
@@ -27569,7 +27692,7 @@ fn member_slot_resumable<C: DocumentCursor>(
         let is_value = field.value_cursor.same_node(c);
         if is_value || field.key_cursor.same_node(c) {
             if scanned >= SLOT_MEMO_MIN_SCAN {
-                remember_member(document, parent_id, &field.value_cursor);
+                remember_member(document, parent_id, &field.value_cursor, None);
             }
             return Ok(Some(slot_of(field.key_cursor, is_value)?));
         }
@@ -51534,6 +51657,268 @@ mod tests {
         check(&members, root.document_token(), "yaml mapping");
     }
 
+    /// #4164: two fan-outs reading distant offsets of one wide array, in turn,
+    /// are linear in the elements, not `~3n^2/8`: each holds its own remembered
+    /// scan, so a read after the first of each is a remembered element's
+    /// neighbour. Ascending, descending, and the first-and-last zig-zag; the
+    /// computed index (`getpath`, `.[$i]`, `nth`) is the only way a program
+    /// reads like this on cursors.
+    // The memo these pin is `std`-only: `no_std` has no `thread_local!`.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_interleaved_fan_out_slot_reads_are_linear_in_the_elements_4164() {
+        let n = 1500usize;
+        let doc = format!(
+            "[{}]",
+            (0..n)
+                .map(|i| format!("{{\"a\":{{\"b\":{i}}}}}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        for filter in [
+            "[(length/2|floor) as $h | range(0;$h) as $i | (getpath([$i]), getpath([$i+$h])) | tostring | [key]] | length",
+            "[(length/2|floor) as $h | range(0;$h) as $i | (.[$i], .[$i+$h]) | tostring | path] | length",
+            "[(length/2|floor) as $h | range(0;$h) as $i | (nth($i), nth($i+$h)) | tostring | [key]] | length",
+            // The other way round, and both descending: each fan-out steps back
+            // from its own scan, not forward from the other's.
+            "[(length/2|floor) as $h | range(0;$h) as $i | (getpath([$i+$h]), getpath([$i])) | tostring | [key]] | length",
+            "[(length/2|floor) as $h | range($h-1;-1;-1) as $i | (getpath([$i]), getpath([$i+$h])) | tostring | [key]] | length",
+            // The first-and-last zig-zag: the two ends.
+            "[range(0;length/2|floor) as $i | (getpath([$i]), getpath([length-1-$i])) | tostring | [key]] | length",
+        ] {
+            let (scanned_before, _) = slot_memo::work();
+            let missed_before = slot_memo::missed();
+            let (out, control) = drive_each_sink::<JqSemantics>(doc.as_bytes(), filter);
+            assert!(control.is_none(), "{filter}: {control:?}");
+            assert_eq!(out, [OwnedValue::Int(n as i64)], "{filter}");
+            let scanned = slot_memo::work().0 - scanned_before;
+            let quadratic = 3 * n * n / 8;
+            assert!(
+                scanned < 6 * n,
+                "{filter}: visited {scanned} elements over {n}; quadratic would be ~{quadratic}"
+            );
+            assert_eq!(
+                slot_memo::missed() - missed_before,
+                0,
+                "{filter}: a position took its parent from `document_parent` although its parent is remembered"
+            );
+        }
+    }
+
+    /// #4164: interleaving fan-outs answers what the scan from the first
+    /// element does -- slots, paths and parents -- for two and three fan-outs
+    /// (three overflow the two scans a parent keeps, and must still answer
+    /// correctly), ascending, descending, mixed, and a pseudo-random order.
+    // The memo these pin is `std`-only: `no_std` has no `thread_local!`.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_interleaved_slot_scans_answer_what_the_full_scan_does_4164() {
+        let n = 1200usize;
+        let doc = format!(
+            "[{}]",
+            (0..n)
+                .map(|i| format!("{{\"a\":{i}}}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let index = JsonIndex::build(doc.as_bytes());
+        let root = index.root(doc.as_bytes());
+        let mut elements = Vec::new();
+        let mut next = root.first_child();
+        while let Some(c) = next {
+            next = c.next_sibling();
+            elements.push(c);
+        }
+        assert_eq!(elements.len(), n);
+        let is_slot = |c: &crate::json::light::JsonCursor<'_, Vec<u64>>, at: i64| matches!(cursor_slot(c), Ok(Some(CursorSlot::Element(i))) if i == at);
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut random = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        let h = n / 3;
+        let orders: Vec<Vec<usize>> = vec![
+            (0..h).flat_map(|i| [i, i + h]).collect(),
+            (0..h).flat_map(|i| [i + h, i]).collect(),
+            (0..h).rev().flat_map(|i| [i, i + h]).collect(),
+            (0..h).flat_map(|i| [i, h + (h - 1 - i)]).collect(),
+            (0..h).flat_map(|i| [i, i + h, i + 2 * h]).collect(),
+            (0..h).rev().flat_map(|i| [i + 2 * h, i + h, i]).collect(),
+            (0..h)
+                .flat_map(|i| [i + 2 * h, i, h + (h - 1 - i)])
+                .collect(),
+            (0..4 * n).map(|_| random()).collect(),
+        ];
+        for order in orders {
+            let _scope = slot_memo::enter(root.document_token());
+            for i in order {
+                assert!(is_slot(&elements[i], i as i64), "element {i}");
+                let (path, ancestors, _) = cursor_path_and_ancestors(&elements[i]).unwrap();
+                assert_eq!(path, vec![OwnedValue::Int(i as i64)], "path of {i}");
+                assert!(ancestors[0].same_node(&root), "parent of {i}");
+            }
+        }
+    }
+
+    /// #4164: a parent keeps two scans, each superseded only by the read that
+    /// resumed from it; a read that started from the first element is added
+    /// beside them, evicting the parent's least recently used, and the nearest
+    /// scan before or after a target is the one a read resumes from.
+    // The memo these pin is `std`-only: `no_std` has no `thread_local!`.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_slot_memo_keeps_two_scans_per_parent_4164() {
+        let _scope = slot_memo::enter(1);
+        slot_memo::remember(1, 7, 100, 40, Some(101), false, None);
+        slot_memo::remember(1, 7, 900, 800, Some(901), false, None);
+        // Both are kept; the nearest before, and the nearest after, a target.
+        assert_eq!(slot_memo::resume(1, 7, 1_000), Some((900, 800, false)));
+        assert_eq!(slot_memo::resume(1, 7, 500), Some((100, 40, false)));
+        assert_eq!(slot_memo::resume_back(1, 7, 50), Some((100, 40)));
+        assert_eq!(slot_memo::resume_back(1, 7, 500), Some((900, 800)));
+        assert_eq!(slot_memo::resume_back(1, 7, 950), None);
+        // A read resumed from the first replaces it and leaves the second.
+        slot_memo::remember(1, 7, 105, 44, Some(106), false, Some(100));
+        assert_eq!(slot_memo::resume_back(1, 7, 500), Some((900, 800)));
+        assert_eq!(slot_memo::resume(1, 7, 500), Some((105, 44, false)));
+        assert_eq!(slot_memo::resume_back(1, 7, 100), Some((105, 44)));
+        // A read that finds the element right after another scan's replaces that
+        // one and the scan already standing on it, not just one of them.
+        slot_memo::remember(1, 9, 100, 40, Some(101), false, None);
+        slot_memo::remember(1, 9, 101, 41, Some(102), false, None);
+        slot_memo::remember(1, 9, 101, 41, Some(102), false, Some(100));
+        assert_eq!(slot_memo::resume(1, 9, 1_000), Some((101, 41, false)));
+        assert_eq!(
+            slot_memo::resume(1, 9, 101),
+            None,
+            "the scan at 100 is gone"
+        );
+        let mut standing = Vec::new();
+        let _ = slot_memo::find(1, |parent, last, _, _, _| {
+            if parent == 9 {
+                standing.push(last);
+            }
+            None::<()>
+        });
+        assert_eq!(standing, [101], "one scan stands on element 101");
+        // A third, started from the first element, evicts the parent's least
+        // recently used (900 was last used by `resume_back`, which is read-only;
+        // 105 by the `resume` above), and nothing of another parent.
+        slot_memo::remember(1, 8, 50, 33, None, false, None);
+        slot_memo::remember(1, 7, 400, 300, Some(401), false, None);
+        assert_eq!(slot_memo::resume(1, 7, 450), Some((400, 300, false)));
+        assert_eq!(slot_memo::resume(1, 7, 1_000), Some((400, 300, false)));
+        assert_eq!(slot_memo::resume(1, 7, 410), Some((400, 300, false)));
+        assert_eq!(slot_memo::resume(1, 8, 60), Some((50, 33, false)));
+        // The parent's extent is recorded on every one of its scans, and
+        // `candidates` lists the parent once.
+        slot_memo::set_extent(1, 7, 2_000, 3);
+        let listed: Vec<_> = slot_memo::candidates(1, 5_000)
+            .into_iter()
+            .flatten()
+            .map(|c| (c.parent, c.extent))
+            .collect();
+        assert_eq!(
+            listed.iter().filter(|(p, _)| *p == 7).count(),
+            1,
+            "{listed:?}"
+        );
+        assert!(listed.contains(&(7, Some((2_000, 3)))), "{listed:?}");
+        // A new scan of the parent inherits its extent.
+        slot_memo::remember(1, 7, 450, 350, None, false, None);
+        let listed: Vec<_> = slot_memo::candidates(1, 5_000)
+            .into_iter()
+            .flatten()
+            .map(|c| (c.parent, c.extent))
+            .collect();
+        assert!(
+            listed
+                .iter()
+                .filter(|(p, _)| *p == 7)
+                .all(|(_, e)| *e == Some((2_000, 3))),
+            "{listed:?}"
+        );
+    }
+
+    /// #4164: a parent holding two scans does not cost the table its other
+    /// parents: a wide matrix read in order -- an outer array and an inner
+    /// array per row, `path` climbing both -- stays linear in its cells.
+    // The memo these pin is `std`-only: `no_std` has no `thread_local!`.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_wide_matrix_slot_reads_stay_linear_with_two_scans_per_parent_4164() {
+        let rows = 100usize;
+        let doc = format!(
+            "[{}]",
+            (0..rows)
+                .map(|r| format!(
+                    "[{}]",
+                    (0..rows)
+                        .map(|c| (r * rows + c).to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        for filter in [
+            "[.[] | .[] | tostring | path] | length",
+            "[(length/2|floor) as $h | range(0;$h) as $i | (getpath([$i]), getpath([$i+$h])) | .[] | tostring | path] | length",
+        ] {
+            let (scanned_before, _) = slot_memo::work();
+            let (out, control) = drive_each_sink::<JqSemantics>(doc.as_bytes(), filter);
+            assert!(control.is_none(), "{filter}: {control:?}");
+            assert_eq!(out, [OwnedValue::Int((rows * rows) as i64)], "{filter}");
+            let scanned = slot_memo::work().0 - scanned_before;
+            // The cells cost what one scan per parent made them cost (~11 per
+            // cell: each row's first 32 elements are read from its start). Were
+            // the outer array's scan evicted by each row's inner scans, its slot
+            // alone would add ~rows^3 / 4 visits.
+            let cells = rows * rows;
+            assert!(
+                scanned < 12 * cells,
+                "{filter}: visited {scanned} elements over {cells} cells"
+            );
+        }
+    }
+
+    /// #4164: looking up the scan to resume from does not mark it used --
+    /// the read may be served by the other scan of the parent instead -- and
+    /// `touch` does.
+    // The memo these pin is `std`-only: `no_std` has no `thread_local!`.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_slot_memo_lookup_is_read_only_until_touched_4164() {
+        let standing = |parent: usize| {
+            let mut lasts = Vec::new();
+            let _ = slot_memo::find(1, |p, last, _, _, _| {
+                if p == parent {
+                    lasts.push(last);
+                }
+                None::<()>
+            });
+            lasts
+        };
+        let _scope = slot_memo::enter(1);
+        // A document with no open scope has nothing to touch.
+        slot_memo::touch(2, 7, 900);
+        slot_memo::remember(1, 7, 100, 40, Some(101), false, None);
+        slot_memo::remember(1, 7, 900, 800, Some(901), false, None);
+        // Looking up 900 leaves 100 the parent's least recently used ...
+        assert_eq!(
+            slot_memo::neighbours(1, 7, 1_000, false).before,
+            Some((900, 800, false))
+        );
+        slot_memo::remember(1, 7, 400, 300, Some(401), false, None);
+        assert_eq!(standing(7), [900, 400], "100 was the least recently used");
+        // ... and touching it makes the other one the oldest.
+        slot_memo::touch(1, 7, 900);
+        slot_memo::remember(1, 7, 450, 350, Some(451), false, None);
+        assert_eq!(standing(7), [900, 450], "400 was the least recently used");
+    }
+
     /// #3702: the memo keeps the parents a pipe is still reading. Least
     /// recently *used*, not oldest: an outer array read at every position must
     /// outlive the inner arrays that come and go beneath it, or a wide matrix
@@ -51544,11 +51929,11 @@ mod tests {
     fn test_slot_memo_drops_the_least_recently_used_parent_3702() {
         let _scope = slot_memo::enter(1);
         for parent in 1..=4 {
-            slot_memo::remember(1, parent, 100 * parent, 7, None, false);
+            slot_memo::remember(1, parent, 100 * parent, 7, None, false, None);
         }
         // A read of parent 1 makes parent 2 the least recently used.
         assert_eq!(slot_memo::resume(1, 1, 10_000), Some((100, 7, false)));
-        slot_memo::remember(1, 5, 500, 7, None, false);
+        slot_memo::remember(1, 5, 500, 7, None, false, None);
         assert_eq!(slot_memo::resume(1, 2, 10_000), None, "least recently used");
         // Order is now 3, 4, 1, 5 (every `resume` above moved its parent to
         // the back; look at them in that order again). A `find` is a use too.
@@ -51560,7 +51945,7 @@ mod tests {
         }
         // Order: 3, 4, 1, 5. Reading 3 through `find` makes 4 the oldest.
         assert!(slot_memo::find(1, |parent, _, _, _, _| (parent == 3).then_some(())).is_some());
-        slot_memo::remember(1, 6, 600, 7, None, false);
+        slot_memo::remember(1, 6, 600, 7, None, false, None);
         assert_eq!(slot_memo::resume(1, 4, 10_000), None, "least recently used");
         for parent in [1, 3, 5, 6] {
             assert!(
@@ -51568,8 +51953,8 @@ mod tests {
                 "parent {parent} was dropped"
             );
         }
-        // Remembering a parent again replaces its entry rather than adding one.
-        slot_memo::remember(1, 3, 333, 9, None, false);
+        // A scan resumed from an entry replaces it rather than adding one.
+        slot_memo::remember(1, 3, 333, 9, None, false, Some(300));
         assert_eq!(slot_memo::resume(1, 3, 10_000), Some((333, 9, false)));
         // An element after the target is not a place to resume from.
         assert_eq!(slot_memo::resume(1, 3, 300), None);
@@ -51582,11 +51967,11 @@ mod tests {
     #[test]
     fn test_slot_memo_scopes_nest_per_document_3702() {
         let _outer = slot_memo::enter(1);
-        slot_memo::remember(1, 7, 70, 3, Some(71), false);
+        slot_memo::remember(1, 7, 70, 3, Some(71), false, None);
         {
             let _inner = slot_memo::enter(2);
             assert_eq!(slot_memo::resume(1, 7, 1_000), None, "another document");
-            slot_memo::remember(2, 9, 90, 5, None, false);
+            slot_memo::remember(2, 9, 90, 5, None, false, None);
             assert_eq!(slot_memo::resume(2, 9, 1_000), Some((90, 5, false)));
             // The same document again is the scope already open.
             let _same = slot_memo::enter(2);
