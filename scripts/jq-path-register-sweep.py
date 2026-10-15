@@ -1013,7 +1013,7 @@ OPERANDS = [
     # first they are the register once and the destructure after them meets it: in the body of a `reduce` whose
     # source moved the register it raises, as a bare `. as {a:$a}` does. Contrasts: a `try`/`?` around the
     # destructure catches the raise (answered), and a `try`/`?` around the `first` alone does not (the
-    # residual: `try first(., X) | D` and `first(., X)? | D` are still accepted where jq raises).
+    # residual, #4676: `try first(., X) | D` and `first(., X)? | D` are still accepted where jq raises).
     "(reduce (nth(0; ., {a:1}) | . as {a:$a} | .) as $k (.; .))",
     "(reduce (first(., {a:1}) | . as [$a] | .) as $k (.; .))",
     "(reduce (first(., {a:1}) | . as {a:$a} | $a) as $k (.; .))",

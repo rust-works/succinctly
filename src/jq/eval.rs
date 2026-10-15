@@ -53662,8 +53662,10 @@ fn drive_fold_source_with<S: EvalSemantics>(
         // the register may be where the accumulator is, and the refusal stays the resolver's guess
         // that nothing catches.
         // #4667: read with `first(., X)` as the `.` it emits.
-        let leading = collapse_first_dot_wrappers(source);
-        let refusal = match leading_destructure_of_dot_element(&leading).filter(|_| in_moved_body) {
+        let refusal = match in_moved_body
+            .then(|| leading_destructure_of_dot_element(&collapse_first_dot_wrappers(source)))
+            .flatten()
+        {
             Some(element) => {
                 EvalError::invalid_path_expression_near_access(&element, ambient.value)
             }

@@ -2423,8 +2423,10 @@ is the revert that established what the other one costs.
    body raises too ([#4667](https://github.com/rust-works/succinctly/issues/4667): these emit their comma's first leaf only,
    so they are the register once, which `collapse_first_dot_wrappers` shows the register walk; pinned by
    `test_moved_reduce_body_source_destructuring_first_of_dot_comma_raises_4667`); read only where no `try`/`?` is in the source, as a
-   caught raise is answered. Still accepted: the `try`/`?` around the wrapper alone (`try first(., X) | . as {a:$a} | .`,
-   `first(., X)? | ...`), whose destructure sits outside the catch, because the source is then not `try`-free. The same shapes on a
+   caught raise is answered. A divergence from jq
+   ([#4676](https://github.com/rust-works/succinctly/issues/4676)): a `try`/`?` around the wrapper alone (`try first(., X) | . as {a:$a} | .`,
+   `first(., X)? | ...`) leaves the destructure outside the catch, so jq raises, but the source is then not `try`-free and is still
+   accepted (`del` deletes the document). The same shapes on a
    `null` document, where a `null` that is not the register is `jv_identical` to it by kind (the path the pattern moved
    jq's register to). A `null`/boolean *literal* bound by a destructure in a fold source (`null as {b:$b} | .`, or a `$x`
    bound to one outside the fold) has no marker, and jq's `jv_identical` makes it the register only when the register holds the same one, so it is
