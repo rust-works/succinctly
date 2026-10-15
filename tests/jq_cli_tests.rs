@@ -134121,8 +134121,8 @@ fn test_reduce_body_source_destructuring_dot_behind_an_alternative_or_handler_in
 /// `near attempt to access element`; the register walk read the wrapper as its whole comma (opaque), never
 /// saw the destructure, and drove the source by value, so `del` deleted the document and `=`/`|=` replaced
 /// it. Controls: a `try`/`?` around the destructure catches the raise, the accumulator is the register
-/// when the source did not move it (`reduce 1 as $i`) or the fold is not nested, a fresh first leaf
-/// (`first({a:1}, .)`) and `limit(2; ..)` raise, as they did. Every row captured from jq 1.7.1; stdout and
+/// when the source did not move it (`reduce 1 as $i`), a fresh first leaf (`first({a:1}, .)`) and
+/// `limit(2; ..)` raise, as they did, and so does a `foreach` that is not nested. Every row captured from jq 1.7.1; stdout and
 /// the exit status are pinned.
 #[test]
 fn test_moved_reduce_body_source_destructuring_first_of_dot_comma_raises_4667() -> Result<()> {
@@ -134267,6 +134267,13 @@ fn test_moved_reduce_body_source_destructuring_first_of_dot_comma_raises_4667() 
             (stdout, exit),
             "`{filter}` on {input}: stderr {err:?}"
         );
+        // In the moved body the error is jq's own, naming the step, not the "with result" guess.
+        if exit == 5 && filter.contains("reduce .[]?") {
+            assert!(
+                err.contains("near attempt to access element"),
+                "`{filter}` on {input}: stderr {err:?}"
+            );
+        }
     }
     Ok(())
 }

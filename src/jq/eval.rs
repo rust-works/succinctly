@@ -53304,10 +53304,7 @@ fn resolve_marker_ifs(source: &Expr) -> Expr {
 fn leading_destructure_of_dot_element(source: &Expr) -> Option<OwnedValue> {
     match unwrap_paren(source) {
         Expr::Pipe(stages) => {
-            // #4667: `first(., X)` is `.` once, as a `.` stage is.
-            let first = stages
-                .iter()
-                .find(|stage| !is_identity_stage(stage) && !first_output_is_dot_only(stage))?;
+            let first = stages.iter().find(|stage| !is_identity_stage(stage))?;
             leading_destructure_of_dot_element(first)
         }
         Expr::AsPattern { expr, patterns, .. }
@@ -53664,7 +53661,9 @@ fn drive_fold_source_with<S: EvalSemantics>(
         // state is refused at the end of the path, outside any `try` around the fold. Anywhere else
         // the register may be where the accumulator is, and the refusal stays the resolver's guess
         // that nothing catches.
-        let refusal = match leading_destructure_of_dot_element(source).filter(|_| in_moved_body) {
+        // #4667: read with `first(., X)` as the `.` it emits.
+        let leading = collapse_first_dot_wrappers(source);
+        let refusal = match leading_destructure_of_dot_element(&leading).filter(|_| in_moved_body) {
             Some(element) => {
                 EvalError::invalid_path_expression_near_access(&element, ambient.value)
             }
