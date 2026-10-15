@@ -1009,6 +1009,29 @@ OPERANDS = [
     "(reduce 1 as $i (.; -(reduce ((., {a:1}) | all(. as [$a] | .; .)) as $j (.; .))))",
     "(reduce 1 as $i (.; reduce (try (., error(\"x\"), {a:1}) | isempty(. as {a:$a} | .)) as $k (.; .)))",
     "(reduce 1 as $i (.; reduce (label $f | (., break $f, {a:1}) | any(. as {a:$a} | .; .)) as $k (.; .)))",
+    # (#4667) `first(., X)`, `limit(1; ., X)` and `nth(0; ., X)` emit their comma's first leaf only, so with `.`
+    # first they are the register once and the destructure after them meets it: in the body of a `reduce` whose
+    # source moved the register it raises, as a bare `. as {a:$a}` does. Contrasts: a `try`/`?` around the
+    # destructure catches the raise (answered), and a `try`/`?` around the `first` alone does not (the
+    # residual: `try first(., X) | D` and `first(., X)? | D` are still accepted where jq raises).
+    "(reduce (nth(0; ., {a:1}) | . as {a:$a} | .) as $k (.; .))",
+    "(reduce (first(., {a:1}) | . as [$a] | .) as $k (.; .))",
+    "(reduce (first(., {a:1}) | . as {a:$a} | $a) as $k (.; .))",
+    "(reduce (first(first(., {a:1}), 2) | . as {a:$a} | .) as $k (.; .))",
+    "(reduce (first((., 1), {a:1}) | . as {a:$a} | .) as $k (.; .))",
+    "(reduce (first(.) | . as {a:$a} | .) as $k (.; .))",
+    "(reduce (first(., {a:1}) | . | . as {a:$a} | .) as $k (.; .))",
+    "(reduce (first(., {a:1}) | . as {b:$b} | .) as $k (.; .))",
+    "(reduce (first(., {a:1}) | . as {a:$a} ?// $a | .) as $k (.; .))",
+    "(reduce (try (first(., {a:1}) | . as {a:$a} | .)) as $k (.; .))",
+    "(reduce ((first(., {a:1}) | . as {a:$a} | .)?) as $k (.; .))",
+    "(reduce (try first(., {a:1}) | . as {a:$a} | .) as $k (.; .))",
+    "(reduce (first(., {a:1}) | (. as {a:$a} | .)?) as $k (.; .))",
+    "(reduce (first(., {a:1}, .) | . as {a:$a} | .) as $k (.; .))",
+    "(reduce (limit(2; ., {a:1}) | . as {a:$a} | .) as $k (.; .))",
+    "(foreach (first(., {a:1}) | . as {a:$a} | .) as $k (.; .; .))",
+    "(foreach (limit(1; ., {a:1}) | . as {a:$a} | .) as $k (.; .; .))",
+    "(foreach (nth(0; ., {a:1}) | . as {a:$a} | .) as $k (.; .; .))",
     "(reduce (def f: .|tostring; f as {a:$a} | .) as $k (.; .))",
     "(reduce (def f: ., .; f as {a:$a} | .) as $k (.; .))",
     # (#4522) a call whose `def` hands the register on next to a fresh value, and a fresh

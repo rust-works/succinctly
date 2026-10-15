@@ -134115,6 +134115,162 @@ fn test_reduce_body_source_destructuring_dot_behind_an_alternative_or_handler_in
     Ok(())
 }
 
+/// #4667: `first(., X)`, `limit(1; ., X)` and `nth(0; ., X)` emit their comma's first leaf only, which is
+/// `.`, so a `. as {a:$a} | ..` after them meets the accumulator. In the body of a `reduce` whose source
+/// moved jq's register onto an element that is not the register, so the pattern's `INDEX` step raises
+/// `near attempt to access element`; the register walk read the wrapper as its whole comma (opaque), never
+/// saw the destructure, and drove the source by value, so `del` deleted the document and `=`/`|=` replaced
+/// it. Controls: a `try`/`?` around the destructure catches the raise, the accumulator is the register
+/// when the source did not move it (`reduce 1 as $i`) or the fold is not nested, a fresh first leaf
+/// (`first({a:1}, .)`) and `limit(2; ..)` raise, as they did. Every row captured from jq 1.7.1; stdout and
+/// the exit status are pinned.
+#[test]
+fn test_moved_reduce_body_source_destructuring_first_of_dot_comma_raises_4667() -> Result<()> {
+    let rows: &[(&str, &str, &str, i32)] = &[
+        (
+            r#"{"a":5}"#,
+            r#"[path(reduce .[]? as $i (.; reduce (first(., {a:1}) | . as {a:$a} | .) as $j (.; .)))]"#,
+            r#""#,
+            5,
+        ),
+        (
+            r#"{"a":5}"#,
+            r#"[path(reduce .[]? as $i (.; reduce (limit(1; ., {a:1}) | . as {a:$a} | .) as $j (.; .)))]"#,
+            r#""#,
+            5,
+        ),
+        (
+            r#"{"a":5}"#,
+            r#"[path(reduce .[]? as $i (.; reduce (nth(0; ., {a:1}) | . as {a:$a} | .) as $j (.; .)))]"#,
+            r#""#,
+            5,
+        ),
+        (
+            r#"{"a":5}"#,
+            r#"[path(reduce .[]? as $i (.; reduce (first(., {a:1}) | . as [$x] | .) as $j (.; .)))]"#,
+            r#""#,
+            5,
+        ),
+        (
+            r#"{"a":5}"#,
+            r#"[path(reduce .[]? as $i (.; reduce (first(., {a:1}) | . as {a:$a} | $a) as $j (.; .)))]"#,
+            r#""#,
+            5,
+        ),
+        (
+            r#"{"a":5}"#,
+            r#"[path(reduce .[]? as $i (.; reduce (first(first(., {a:1}), 2) | . as {a:$a} | .) as $j (.; .)))]"#,
+            r#""#,
+            5,
+        ),
+        (
+            r#"{"a":5}"#,
+            r#"[path(reduce .[]? as $i (.; reduce (first((., 1), {a:1}) | . as {a:$a} | .) as $j (.; .)))]"#,
+            r#""#,
+            5,
+        ),
+        (
+            r#"{"a":5}"#,
+            r#"[path(reduce .[]? as $i (.; reduce (first(., {a:1}) | . | . as {a:$a} | .) as $j (.; .)))]"#,
+            r#""#,
+            5,
+        ),
+        (
+            r#"{"a":5}"#,
+            r#"del(reduce .[]? as $i (.; reduce (first(., {a:1}) | . as {a:$a} | .) as $j (.; .)))"#,
+            r#""#,
+            5,
+        ),
+        (
+            r#"{"a":5}"#,
+            r#"(reduce .[]? as $i (.; reduce (first(., {a:1}) | . as {a:$a} | .) as $j (.; .))) |= 9"#,
+            r#""#,
+            5,
+        ),
+        (
+            r#"{"a":5}"#,
+            r#"(reduce .[]? as $i (.; reduce (nth(0; ., {a:1}) | . as {a:$a} | .) as $j (.; .))) = 9"#,
+            r#""#,
+            5,
+        ),
+        (
+            r#"{"a":5}"#,
+            r#"[path(reduce .[]? as $i (.; foreach (first(., {a:1}) | . as {a:$a} | .) as $j (.; .; .)))]"#,
+            r#""#,
+            5,
+        ),
+        (
+            r#"{"a":5}"#,
+            r#"[path(reduce .[]? as $i (.; foreach (limit(1; ., {a:1}) | . as {a:$a} | .) as $j (.; .; .)))]"#,
+            r#""#,
+            5,
+        ),
+        (
+            r#"{"a":5}"#,
+            r#"[path(reduce .[]? as $i (.; reduce (try (first(., {a:1}) | . as {a:$a} | .)) as $j (.; .)))]"#,
+            "[[]]\n",
+            0,
+        ),
+        (
+            r#"{"a":5}"#,
+            r#"[path(reduce .[]? as $i (.; reduce ((first(., {a:1}) | . as {a:$a} | .)?) as $j (.; .)))]"#,
+            "[[]]\n",
+            0,
+        ),
+        (
+            r#"{"a":5}"#,
+            r#"[path(reduce .[]? as $i (.; reduce (first(., {a:1}) | (. as {a:$a} | .)?) as $j (.; .)))]"#,
+            "[[]]\n",
+            0,
+        ),
+        (
+            r#"{"a":5}"#,
+            r#"[path(reduce 1 as $i (.; reduce (first(., {a:1}) | . as {a:$a} | .) as $j (.; .)))]"#,
+            "[[]]\n",
+            0,
+        ),
+        (
+            r#"{"a":5}"#,
+            r#"[path(foreach (first(., {a:1}) | . as {a:$a} | .) as $j (.; .; .))]"#,
+            r#""#,
+            5,
+        ),
+        (
+            r#"{"a":5}"#,
+            r#"[path(reduce (first(., {a:1}) | . as {a:$a} | .) as $j (.; .))]"#,
+            "[[]]\n",
+            0,
+        ),
+        (
+            r#"{"a":5}"#,
+            r#"[path(reduce .[]? as $i (.; reduce (first({a:1}, .) | . as {a:$a} | .) as $j (.; .)))]"#,
+            r#""#,
+            5,
+        ),
+        (
+            r#"{"a":5}"#,
+            r#"[path(reduce .[]? as $i (.; reduce (limit(2; ., {a:1}) | . as {a:$a} | .) as $j (.; .)))]"#,
+            r#""#,
+            5,
+        ),
+        (
+            r#"{"a":5}"#,
+            r#"[path(reduce .[]? as $i (.; reduce (first(., {a:1}) | . as {b:$b} | .) as $j (.; .)))]"#,
+            r#""#,
+            5,
+        ),
+    ];
+    for &(input, filter, stdout, exit) in rows {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (out.as_str(), code),
+            (stdout, exit),
+            "`{filter}` on {input}: stderr {err:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #4604: `select($x)` passes the register on by `$x`'s own truthiness, whatever node it is bound to, so
 /// a fold source `select($x) | . as {a:$a} | .` in the body of a `reduce` whose source moved the register
 /// destructures `.`, which is the accumulator and not the register there, and raises in jq. The

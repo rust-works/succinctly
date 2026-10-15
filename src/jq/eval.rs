@@ -52639,6 +52639,37 @@ impl<'e> RegisterSpine<'e> {
     }
 }
 
+/// Whether `e` is `first(., X)`, `limit(1; ., X)` or `nth(0; ., X)` (#4667), or the same over a
+/// bare `.`: a wrapper that emits one output, its first leaf, and that leaf is `.`. The other
+/// leaves never run.
+fn first_output_is_dot_only(e: &Expr) -> bool {
+    let leads_with_dot =
+        |inner: &Expr| is_identity_stage(inner) || comma_first_leaf_is_identity(inner);
+    match unwrap_bind_source(e) {
+        Expr::FirstExpr(inner) | Expr::Builtin(Builtin::FirstStream(inner)) => {
+            leads_with_dot(inner)
+        }
+        Expr::Limit { n, expr } => limit_takes_one(n) && leads_with_dot(expr),
+        Expr::NthExpr { n, expr } | Expr::Builtin(Builtin::NthStream(n, expr)) => {
+            limit_literal_count(n) == Some(0.0) && leads_with_dot(expr)
+        }
+        _ => false,
+    }
+}
+
+/// `source` with every `first(., X)`/`limit(1; ., X)`/`nth(0; ., X)` ([`first_output_is_dot_only`])
+/// replaced by the `.` it emits (#4667). Only the register walk reads the copy: peeling the wrapper
+/// there would leave the whole comma, whose other leaves it reads as not the register, so a
+/// destructure after it would go unseen.
+fn collapse_first_dot_wrappers(source: &Expr) -> Expr {
+    let mapped = map_subexprs(source, &mut collapse_first_dot_wrappers);
+    if first_output_is_dot_only(&mapped) {
+        Expr::Identity
+    } else {
+        mapped
+    }
+}
+
 /// The bound expression of a `?//` chain with a bare `$var` alternative that is the whole
 /// operand of a `first(..)`, `limit(n; ..)` or `nth(n; ..)` with a literal `n` (#4483), read
 /// through the wrappers that hand the chain on unchanged (#4497): a `try` without a handler, a
@@ -53273,7 +53304,10 @@ fn resolve_marker_ifs(source: &Expr) -> Expr {
 fn leading_destructure_of_dot_element(source: &Expr) -> Option<OwnedValue> {
     match unwrap_paren(source) {
         Expr::Pipe(stages) => {
-            let first = stages.iter().find(|stage| !is_identity_stage(stage))?;
+            // #4667: `first(., X)` is `.` once, as a `.` stage is.
+            let first = stages
+                .iter()
+                .find(|stage| !is_identity_stage(stage) && !first_output_is_dot_only(stage))?;
             leading_destructure_of_dot_element(first)
         }
         Expr::AsPattern { expr, patterns, .. }
@@ -53442,6 +53476,15 @@ fn drive_fold_source_with<S: EvalSemantics>(
         && (source_destructures_register(pruned.as_ref().unwrap_or(source), true)
             || caught_destructure_in_unrouted_body(source, foreach_source, ambient)
             || (in_moved_body && array_wrapped_destructure_of_register(source))
+            // #4667: in the body of a `reduce` whose source moved the register, `first(., X) | . as
+            // {a:$a} | .` destructures the accumulator, which is not the register, and the raise
+            // reaches the fold. Where a `try` could catch it the source keeps being driven by value.
+            || (in_moved_body
+                && raise_reaches_fold
+                && any_subexpr(source, &mut |e| {
+                    first_output_is_dot_only(e) && !is_identity_stage(e)
+                })
+                && source_destructures_register(&collapse_first_dot_wrappers(source), true))
             || (raise_reaches_fold
                 && select_passes
                 && pruned.is_none()
