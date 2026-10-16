@@ -76082,6 +76082,85 @@ fn test_foreach_update_composed_seed_first_recursion_verdict_follows_jq_4706() -
     ])
 }
 
+/// #4706 review: the falsy-register rows (`null`/`false`: a falsy seed has no children, so `any(recurse; .)`
+/// ends on the seed either way), the `recurse(f; c)` / `..` generators, a neutral pipe head, and a zero-arity
+/// `def` called inside the verdict. Every jq side captured from jq 1.7.1 on `[1]`.
+#[test]
+fn test_foreach_update_composed_seed_first_recursion_verdict_shapes_follow_jq_4706() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r"[1]",
+            r"[path(foreach .[]? as $k (0; (any(recurse; .) | not); $k))?]",
+            "[[0]]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"[path(foreach .[]? as $k (0; (isempty(recurse) | not); $k))?]",
+            "[[0]]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"[path(foreach .[]? as $k (null; (any(recurse; .) | not); $k))?]",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"[path(foreach .[]? as $k (null; (isempty(recurse) | not); $k))?]",
+            "[[0]]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"[path(foreach .[]? as $k (false; (any(recurse; .) | not); $k))?]",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"[path(foreach .[]? as $k (false; (isempty(recurse) | not); $k))?]",
+            "[[0]]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"[path(foreach .[]? as $k (0; (isempty(recurse(.[]?; . != null)) | not); $k))?]",
+            "[[0]]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"[path(foreach .[]? as $k (0; (isempty(. | recurse) | not); $k))?]",
+            "[[0]]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"[path(foreach .[]? as $k (0; (isempty(if . then . else . end | recurse) | not); $k))?]",
+            "[[0]]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"[path(foreach .[]? as $k (0; (any(.. ; .) | not); $k))?]",
+            "[[0]]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
 /// #4699 (#4661 residual): a verdict builtin as the UPDATE of a fold that sits in another fold's UPDATE. The nested
 /// fold's `advance` did not carry the register past it (`cannot_move_register` is `false` for a builtin
 /// UPDATE), so the enclosing EXTRACT's `$k` was refused where jq
