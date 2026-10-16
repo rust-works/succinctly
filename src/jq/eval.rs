@@ -50263,13 +50263,17 @@ fn verdict_builtin_leaves_register(update: &Expr) -> bool {
             })
         };
         match unwrap_paren(expr) {
-            Expr::Builtin(Builtin::IsEmpty(gen)) => {
-                verdict_operand_leaves_register(gen).then_some(true)
-            }
-            Expr::Builtin(Builtin::AnyCond(gen, cond) | Builtin::AllCond(gen, cond)) => {
-                (verdict_operand_leaves_register(gen) && verdict_operand_leaves_register(cond))
-                    .then_some(true)
-            }
+            Expr::Builtin(Builtin::IsEmpty(gen)) => (verdict_operand_leaves_register(gen)
+                || seed_first_recursion(gen, false))
+            .then_some(true),
+            Expr::Builtin(Builtin::AnyCond(gen, cond)) => ((verdict_operand_leaves_register(gen)
+                && verdict_operand_leaves_register(cond))
+                || (matches!(unwrap_paren(cond), Expr::Identity)
+                    && seed_first_recursion(gen, true)))
+            .then_some(true),
+            Expr::Builtin(Builtin::AllCond(gen, cond)) => (verdict_operand_leaves_register(gen)
+                && verdict_operand_leaves_register(cond))
+            .then_some(true),
             Expr::Pipe(stages) => fold(stages),
             Expr::Comma(items) => fold(items),
             // #4641: `and`/`or` are not subexps: `DUP; L; JUMP_F; POP; R`, so `R` runs from the
@@ -50303,6 +50307,45 @@ fn verdict_builtin_leaves_register(update: &Expr) -> bool {
         }
     }
     leaves(update) == Some(true)
+}
+
+/// Whether `gen`, the generator of an `isempty` or `any(g; .)` (#4706), is a recursion that emits
+/// its seed first, at the register the verdict entered with, and is read nowhere past it: the
+/// verdict stops on that first output, so the later outputs, which navigate, never run.
+/// `plain_only` admits only the f-less `recurse`/`..` (the `any` case, where a falsy seed is
+/// `null`/`false`, which has no children, so the search ends on the seed either way);
+/// `recurse(f)` and `recurse(f; c)` emit `.` before they evaluate `f`, so `isempty` alone may
+/// read them. Neutral stages may precede it in a pipe, and a zero-arity `def` is read through.
+fn seed_first_recursion(gen: &Expr, plain_only: bool) -> bool {
+    match unwrap_paren(gen) {
+        Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => true,
+        Expr::Builtin(Builtin::RecurseF(_) | Builtin::RecurseCond(..)) => !plain_only,
+        Expr::Pipe(stages) => match stages.split_last() {
+            Some((last, head)) => {
+                head.iter().all(neutral_leaves_register) && seed_first_recursion(last, plain_only)
+            }
+            None => false,
+        },
+        Expr::DefCall { def, args, .. } if args.is_empty() && def.params.is_empty() => {
+            within_def_call_budget_with(|| Some(seed_first_recursion(&def.body, plain_only)))
+                .unwrap_or(false)
+        }
+        Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+            ..
+        } if params.is_empty()
+            && matches!(
+                unwrap_paren(then),
+                Expr::FuncCall { name: called, args, .. } if called == name && args.is_empty()
+            ) =>
+        {
+            seed_first_recursion(body, plain_only)
+        }
+        _ => false,
+    }
 }
 
 /// Whether `operand` (the generator or `cond` of a verdict builtin, #4641) leaves jq's register

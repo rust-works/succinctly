@@ -75901,6 +75901,187 @@ fn test_foreach_update_verdict_over_forking_extract_recurse_or_alt_bind_operand_
     ])
 }
 
+/// #4706 (#4698 residual): the verdict composed with another stage (`| not`, `and`) or behind a zero-arity
+/// `def` is read as the bare spelling is. `isempty(g)` stops on `g`'s first output, and a `recurse`/`..`
+/// emits its seed first, at the register the verdict entered with, so the later outputs, which navigate,
+/// never run. `any(recurse; .)` is the same only for the f-less recursion with the identity `cond`: a falsy
+/// seed (`null`/`false`) has no children, so the search ends on the seed either way. The controls are the
+/// verdicts decided on a descendant (`any(recurse; . == 1)`, `all(recurse; .)`, a `select` over the
+/// recursion), which keep the refusal (swallowed by the `?`). Every jq side captured from jq 1.7.1 on `[1]`.
+#[test]
+fn test_foreach_update_composed_seed_first_recursion_verdict_follows_jq_4706() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r"[1]",
+            r"[path(foreach .[]? as $k (0; (isempty(recurse) | not); $k))?]",
+            "[[0]]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"del(foreach .[]? as $k (0; (isempty(recurse) | not); $k))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"(foreach .[]? as $k (0; (isempty(recurse) | not); $k)) = 5",
+            "[5]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"[path(foreach .[]? as $k (0; (isempty(recurse) and true); $k))?]",
+            "[[0]]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"del(foreach .[]? as $k (0; (isempty(recurse) and true); $k))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"(foreach .[]? as $k (0; (isempty(recurse) and true); $k)) = 5",
+            "[5]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"[path(foreach .[]? as $k (0; (true and isempty(recurse)); $k))?]",
+            "[[0]]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"del(foreach .[]? as $k (0; (true and isempty(recurse)); $k))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"(foreach .[]? as $k (0; (true and isempty(recurse)); $k)) = 5",
+            "[5]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"[path(foreach .[]? as $k (0; (any(recurse; .) | not); $k))?]",
+            "[[0]]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"del(foreach .[]? as $k (0; (any(recurse; .) | not); $k))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"(foreach .[]? as $k (0; (any(recurse; .) | not); $k)) = 5",
+            "[5]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"[path(foreach .[]? as $k (0; isempty(def f: recurse; f); $k))?]",
+            "[[0]]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"del(foreach .[]? as $k (0; isempty(def f: recurse; f); $k))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"(foreach .[]? as $k (0; isempty(def f: recurse; f); $k)) = 5",
+            "[5]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"[path(foreach .[]? as $k (0; (isempty(recurse(.[]?)) | not); $k))?]",
+            "[[0]]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"del(foreach .[]? as $k (0; (isempty(recurse(.[]?)) | not); $k))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"(foreach .[]? as $k (0; (isempty(recurse(.[]?)) | not); $k)) = 5",
+            "[5]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"[path(foreach .[]? as $k (0; (isempty(..) | not); $k))?]",
+            "[[0]]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"del(foreach .[]? as $k (0; (isempty(..) | not); $k))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"(foreach .[]? as $k (0; (isempty(..) | not); $k)) = 5",
+            "[5]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"[path(foreach .[]? as $k (0; (any(recurse; . == 1) | not); $k))?]",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"[path(foreach .[]? as $k (0; (all(recurse; .) | not); $k))?]",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"[path(foreach .[]? as $k (0; (isempty(recurse | select(. == 1)) | not); $k))?]",
+            "[]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
 /// #4699 (#4661 residual): a verdict builtin as the UPDATE of a fold that sits in another fold's UPDATE. The nested
 /// fold's `advance` did not carry the register past it (`cannot_move_register` is `false` for a builtin
 /// UPDATE), so the enclosing EXTRACT's `$k` was refused where jq

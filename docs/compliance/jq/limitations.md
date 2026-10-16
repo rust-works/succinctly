@@ -876,10 +876,12 @@ $x (.; .[$x:]))` raises `E2`, was the slice error). What it leaves:
   `?//` bind operand (`isempty(. as $q ?// $z | .)`: `isempty(g)` is `g | false`, so jq path-checks nothing `g` emits, and a body that
   steps nowhere raises nothing even where `.` is an accumulator that need not be the register). Pinned by
   `test_foreach_update_verdict_over_forking_extract_recurse_or_alt_bind_operand_follows_jq_4698`.
-  Only the bare spellings are fixed: `isempty(recurse)` composed (`(isempty(recurse) | not)`, `(recurse and true)`, `(any(recurse; .) | not)`)
-  or behind a `def` (`isempty(def f: recurse; f)`) is still refused where jq answers, and under `?`/`try` the refusal is swallowed
-  (`[path(foreach .[]? as $k (0; (isempty(recurse) | not); $k))?]` on `[1]` is `[]`, jq prints `[[0]]`): the static view
-  (`verdict_operand_leaves_register`) does not admit a recursion, whose later outputs do move the register.
+  **Since [#4706](https://github.com/rust-works/succinctly/issues/4706)** the composed spellings answer as jq does too: `isempty(recurse)`
+  (and `recurse(f)`, `recurse(f; c)`, `..`) behind a `| not`, an `and`/`or`, a neutral pipe stage or a zero-arity `def`, and `any(recurse; .)` with the
+  f-less recursion and the identity `cond` (a falsy seed has no children, so the search ends on the seed either way). `isempty` stops on the seed, so the
+  later outputs, which navigate, never run. Pinned by `test_foreach_update_composed_seed_first_recursion_verdict_follows_jq_4706`. Still refused where
+  jq answers: `any(recurse(f); .)` (`[path(foreach .[]? as $k (0; (any(recurse(.[]?); .) | not); $k))?]` on `[1]` is `[]`, jq prints `[[0]]`), and a verdict
+  decided on a descendant (`any(recurse; . == 1)`, `all(recurse; .)`), which jq itself refuses or answers from a moved register.
   **Since [#4699](https://github.com/rust-works/succinctly/issues/4699)** a fold whose UPDATE is a verdict builtin, nested in another
   fold's UPDATE, leaves the register where it entered, as a neutral UPDATE does: `foreach .a? as $k (0; foreach (1,2) as $j (1;
   isempty(1); .); $k)` and the `reduce` spelling (`reduce (1,2) as $j (1; isempty(reduce (1,2) as $i (1; try .a)))`) answer as jq
