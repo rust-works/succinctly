@@ -60132,9 +60132,13 @@ fn fold_escape_outcome<S: EvalSemantics>(
     aborted: &StashedEscape,
 ) -> FoldStepOutcome {
     if path_alternative_retries(&e, is_last)
+        // #4806: at any depth. The error is the exact kind (a guess is the uncatchable
+        // `GuessedPathRefusal`, which `is_untracked_navigation_error` excludes), jq's own raise on
+        // a value the walk knows is not the register -- the computed INIT of a `reduce` nested in
+        // a fold body (`reduce . as [$a] ?// $a ({"a":5}; .a)`) -- and jq's `?//` retries it onto
+        // the next alternative with the state slot handed back as `null` (`LOADVN`).
         || (S::TAG == EvalTag::Jq
             && !is_last
-            && fold_body::depth() == 0
             && matches!(&e, EvalEscape::Error(err) if err.is_untracked_navigation_error()))
     {
         FoldStepOutcome::Retry
