@@ -6294,6 +6294,18 @@ written where it stands: `.`, `-P`, and a write that leaves the scalar alone or 
 (`.b = .a`, `. as $v | {"z": $v}`, `pick`), a recursive merge over it (`. *d {"a": "n"}`) and a document whose
 root is a block scalar carry no such comment, or print an extra document, where yq keeps it ([#5003](https://github.com/rust-works/succinctly/issues/5003)).
 
+### The header an input starts with ([#5008](https://github.com/rust-works/succinctly/issues/5008))
+
+yq slurps the empty and comment lines at the front of an input and prints them back before the first
+document verbatim, whatever the filter. `succinctly yq` does that on the streaming `.` route, for a header
+with a `---` marker (#4086), and, since #5008, for a header of empty lines alone. Still different on the
+routes that go through the document tree (`-P`, a write, a navigated or computed result): a header that holds
+a comment as well loses its leading empty lines (`\n\n# c` / `a: 1` under `-P` prints `# c` first, where
+yq prints the two empty lines), a run of empty lines between two header comments is one empty line (yq keeps
+the run), and an empty line with a carriage return in it (`\r\n`) reads as a bare `# ` in yq. An input of empty lines
+only (`\n`, `\n\n`) is read as one line break (#4099), so a write to it prints no empty line, where yq
+prints the ones it was given (`\n` / `.a = 1` is `\n` / `a: 1` in yq).
+
 ### `line` and `column` residuals ([#4363](https://github.com/rust-works/succinctly/issues/4363))
 
 A node that carries an `&anchor` or `!tag` reports the position of its first property token, as in

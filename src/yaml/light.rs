@@ -8035,7 +8035,20 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
                 break;
             }
         }
-        marker_seen.then(|| &preamble[..if through_content { preamble.len() } else { end }])
+        if !marker_seen {
+            // No marker: the header is the blank lines before the content, which yq's
+            // header-preprocess prints back verbatim on every route (#5008). A line holding a
+            // carriage return is not empty to yq (it prints a bare `# `), and a header that
+            // holds a comment is the first node's head comment: neither is handled here.
+            //
+            // Only before a node the text actually holds: an input that is empty or all empty
+            // lines is read as one line break (#4099), which yq prints no empty line for.
+            let blank_only = !preamble.is_empty()
+                && self.text.get(start).is_some_and(|&b| !is_line_break(b))
+                && preamble.split_inclusive('\n').all(|line| line == "\n");
+            return blank_only.then_some(preamble);
+        }
+        Some(&preamble[..if through_content { preamble.len() } else { end }])
     }
 
     #[inline]

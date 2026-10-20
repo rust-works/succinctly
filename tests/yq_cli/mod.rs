@@ -60,4 +60,5 @@ mod i4983;
 mod i4996;
 mod i4997;
 mod i5001;
+mod i5008;
 mod i865;
