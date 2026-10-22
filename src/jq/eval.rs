@@ -61169,6 +61169,7 @@ fn fold_source_ambient<'v, S: EvalSemantics>(
     snapshot: &Snapshot,
     frame: &Frame,
     init_moved: bool,
+    init_register: Option<Frame>,
 ) -> FoldSourceAmbient<'v> {
     if fork_index == 0 {
         // #2031: `doc_branch` stands for the document itself (SOURCE's own
@@ -61264,12 +61265,14 @@ fn fold_source_ambient<'v, S: EvalSemantics>(
                 (true, true) => reg.frame.with_register(Some(&OwnedValue::Null)),
                 (true, false) => frame.with_register(Some(&OwnedValue::Null)),
                 (false, true) => register_frame(reg),
-                (false, false) => frame.clone(),
+                (false, false) => init_register.clone().unwrap_or_else(|| frame.clone()),
             },
             register_non_null: reg.register_is_non_null(),
             register_null: reg.register_is_null(),
             register_null_off_root,
-            frame_names_register: init_moved_off_entry || entered_on_register,
+            frame_names_register: init_moved_off_entry
+                || entered_on_register
+                || init_register.is_some(),
         };
     }
     // A later fork's ambient is `null`, so `branch_provenance`'s
@@ -61306,13 +61309,17 @@ fn fold_source_ambient<'v, S: EvalSemantics>(
             register_frame(reg)
         } else if entered_on_register {
             frame.clone()
+        } else if let Some(register) = &init_register {
+            register.clone()
         } else {
             frame.unknown()
         },
         register_non_null: reg.register_is_non_null(),
         register_null: reg.register_is_null(),
         register_null_off_root: false,
-        frame_names_register: init_moved_off_entry || entered_on_register,
+        frame_names_register: init_moved_off_entry
+            || entered_on_register
+            || init_register.is_some(),
     }
 }
 
@@ -61329,6 +61336,39 @@ fn init_moved_register_frame<S: EvalSemantics>(source_trackable: bool, reg: &Fol
         && reg.trackable
         && reg.path.depth() > 0
         && !reg.frame.register_loss.is_lost()
+}
+
+/// The frame SOURCE runs in where INIT navigated and then computed (#5042): jq's register is where the
+/// navigation left it (`.a | tostring` leaves it on `.a`, [`init_moved_register`]) holding the value the
+/// branch states, which [`FoldRegister::enter`] cannot carry for an untracked INIT. Outside every fold body, on
+/// a fold entered at a known position with no register loss; `None` elsewhere.
+fn init_navigated_register_frame<S: EvalSemantics>(
+    init_branch: &PathBranch<'_>,
+    trackable: bool,
+    frame: &Frame,
+) -> Option<Frame> {
+    if S::TAG != EvalTag::Jq
+        || init_branch.trackable
+        || init_branch.path.depth() == 0
+        || fold_body::depth() != 0
+        || frame.at.is_none()
+        || frame.register_loss.is_lost()
+        || !(trackable || frame.register().is_some())
+    {
+        return None;
+    }
+    let BranchRegister::Unmoved(register) = &init_branch.register else {
+        return None;
+    };
+    // A `null` register is identical to every `null` in jq whatever its position, so no frame names it.
+    if matches!(register.as_ref(), OwnedValue::Null) {
+        return None;
+    }
+    Some(
+        frame
+            .extend(&init_branch.path)
+            .with_register(Some(register)),
+    )
 }
 
 /// Whether a fold whose INIT cannot move jq's register ([`FoldRegister::enter`]'s `live_register_known`) was
@@ -63371,6 +63411,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
             snapshot,
             frame,
             init_moved_register::<S>(init_branch, trackable),
+            init_navigated_register_frame::<S>(init_branch, trackable, frame),
         );
         let relocate_base = ambient.relocate_base(&reg.path);
 
@@ -64341,6 +64382,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
             snapshot,
             frame,
             init_moved_register::<S>(init_branch, trackable),
+            init_navigated_register_frame::<S>(init_branch, trackable, frame),
         );
         let relocate_base = ambient.relocate_base(&reg.path);
 
