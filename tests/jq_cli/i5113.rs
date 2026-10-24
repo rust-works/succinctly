@@ -800,3 +800,184 @@ fn test_5113_literal_sibling_reading_stays_unread_where_the_lookahead_cannot_pla
         ),
     ])
 }
+
+// A `null` literal `then` stores `null`, and the next step's `.a` of it is falsy, so that step takes the computed `else`
+// (the fold) where a stored `1` or boolean makes `.a` raise and the handler answers. The step ends with `null` again
+// (a fold that hands its input on stores it whether or not its caught source emits), so the lookahead reads it as the
+// step an INIT of `null` resolves, and the `then` is read on a step that is not the fork's last.
+
+/// #5113 residual: a handler `try` (and the `?` and `elif` spellings) around an `if` with a `null` `then`, on a source
+/// of two steps, where the step that takes the fold on the stored `null` is the `foreach`'s last. Captured from
+/// `/usr/bin/jq` 1.7.1, both routes.
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
+fn test_5113_null_then_read_when_the_next_step_takes_the_fold_on_the_stored_null() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"a":{"a":null}}"#,
+            r"[path(. as $x | foreach (.a,.a) as $i (.; try (if .a then null else foreach (try ($x as {a:$a} | .)) as $y (.; .; .) end) catch 1; $i))?]",
+            "[[\"a\"]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"a":null}}"#,
+            r"path(. as $x | foreach (.a,.a) as $i (.; try (if .a then null else foreach (try ($x as {a:$a} | .)) as $y (.; .; .) end) catch 1; $i))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"a":null}}"#,
+            r"del(. as $x | foreach (.a,.a) as $i (.; try (if .a then null else foreach (try ($x as {a:$a} | .)) as $y (.; .; .) end) catch 1; $i))",
+            "{}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"a":null}}"#,
+            r"[path(. as $x | foreach (.a,.a) as $i (.; (if .a then null else foreach (try ($x as {a:$a} | .)) as $y (.; .; .) end)?; $i))?]",
+            "[[\"a\"]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"a":null}}"#,
+            r"[path(. as $x | foreach (.a,.a) as $i (.; try (if .a then null elif .b then 3 else foreach (try ($x as {a:$a} | .)) as $y (.; .; .) end) catch 1; $i))?]",
+            "[[\"a\"]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"b":true}"#,
+            r"[path(. as $x | foreach (.a,.) as $i (.; try (if .b then null else (foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) end) catch 1; .a))?]",
+            "[[\"a\",\"a\"],[\"a\",\"a\"]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"b":true}"#,
+            r"[path(. as $x | foreach (.a,.) as $i (.; try (if .b then null else (foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) end) catch 1; $i))?]",
+            "[[\"a\"]]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
+/// #5113: a `null` state beside a leading comma sibling is not read (jq answers `[["a"],["a"],["a"]]`, the build refuses
+/// and `?` empties it). Each row must answer as jq does or stay refused, on both routes.
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
+fn test_5113_null_state_reading_stays_unread_beside_a_leading_comma_sibling() -> Result<()> {
+    // (document, filter, jq's stdout)
+    let rows: &[(&str, &str, &str)] = &[(
+        r#"{"a":{"a":null}}"#,
+        r"[path(. as $x | foreach (.a,.a) as $i (.; (7, try (if .a then null else foreach (try ($x as {a:$a} | .)) as $y (.; .; .) end) catch 1); $i))?]",
+        "[[\"a\"],[\"a\"],[\"a\"]]\n",
+    )];
+    for &(input, filter, jq_stdout) in rows {
+        for (stdout, stderr, code) in [
+            run_jq_full(&["-c", filter], Some(input))?,
+            run_jq_full(&["-nc", &format!("{input} | {filter}")], None)?,
+        ] {
+            let emptied = stdout == "[]\n" && code == 0 && stderr.is_empty();
+            let answered = stdout == jq_stdout && code == 0 && stderr.is_empty();
+            assert!(
+                emptied || answered,
+                "`{filter}` on {input}: neither jq's {jq_stdout:?} nor a refusal under `?`: {stdout:?} {stderr:?} exit {code}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// #5113: what the `null`-state reading does not read, pinned as it stands (a fix flips them; jq answers each). It is
+/// read for a `null` state only (a stored `false`, which `.` also finds falsy), for a fold that hands its input on
+/// (`foreach ... (5; .; .)`, `(.; 5; .)` and `(.; .; 5)` store or emit `5`, not `null`), for a fold whose source is a
+/// caught `$x as P | .` (`try (.a | .)` and `try ($x as P | $a)` are not), and where the step that takes the fold is the `foreach`'s last:
+/// with others after it (an unbounded source, one of eleven steps, a third step with an EXTRACT that emits) the step
+/// keeps the whole-`if` refusal, which a `?` truncates. jq answers each; each row is a refusal here, or `[]` under a `?`.
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
+fn test_5113_null_state_reading_stays_unread_for_a_state_or_fold_it_does_not_name() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            "[1]",
+            r"path(. as $x | foreach (.,.a) as $i (.; try (if . then false else foreach (try ($x as {a:$a} | .)) as $y (.; .; .) end) catch 1; $i))",
+            "",
+            "Invalid path expression with result [1]",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"b":2}"#,
+            r"[path(. as $x | foreach .[] as $i ((., null, .a); try (if . then null else foreach (try ($x as {a:$a} | .)) as $y (5; .; .) end) catch 1; $i))?]",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"path(. as $x | foreach .[] as $i ((., .a); try (if . then null else foreach (try ($x as {a:$a} | .)) as $y (.; 5; .) end) catch .; $i))",
+            "",
+            "Invalid path expression with result null",
+            5,
+        ),
+        (
+            r#"{"a":{"a":null}}"#,
+            r"del(. as $x | foreach (.a,.a,.a,.a,.a,.a,.a,.a,.a,.a) as $i (.; try (if .a then null elif . then false else foreach (try (.a | .)) as $y (.; .; .) end) catch .; $i))",
+            "",
+            "Invalid path expression with result {\"a\":null}",
+            5,
+        ),
+        (
+            r#"{"a":{"a":null}}"#,
+            r"[path(. as $x | foreach .[] as $i (.; try (if .a then null else foreach (try ($x as {a:$a} | .)) as $y (.; .; .) end) catch 1; $i))?]",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"a":null}}"#,
+            r"(. as $x | foreach .[] as $i (.; try (if .a then null else foreach (try ($x as {a:$a} | .)) as $y (.; .; .) end) catch 1; $i)) |= 9",
+            "",
+            "Invalid path expression with result {\"a\":null}",
+            5,
+        ),
+        (
+            r#"{"a":{"a":null}}"#,
+            r"[path(. as $x | foreach (.a,.a,.a,.a,.a,.a,.a,.a,.a,.a,.a) as $i (.; try (if .a then null else foreach (try ($x as {a:$a} | .)) as $y (.; .; .) end) catch 1; $i))?]",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"b":true}"#,
+            r"[path(. as $x | foreach (.a,.,.a) as $i (.; try (if .b then null else foreach (try ($x as {a:$a} | .)) as $y (.; .; .) end) catch 1; .))?]",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"b":true}"#,
+            r"path(. as $x | foreach (.a,.,.a) as $i (.; try (if .b then null else foreach (try ($x as {a:$a} | .)) as $y (.; .; .) end) catch 1; .a))",
+            "",
+            "Invalid path expression near attempt to access element \"a\" of null",
+            5,
+        ),
+        (
+            r#"{"a":{"a":null}}"#,
+            r"[path(. as $x | foreach (.a,.a) as $i (.; try (if .a then null else foreach (try ($x as {a:$a} | $a)) as $y (.; .; .) end) catch 1; $i))?]",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"b":true}"#,
+            r"path(. as $x | foreach (.a,.a) as $i (.; try (if .b then null else foreach (try ($x as {a:$a} | .)) as $y (.; .; 5) end) catch 1; $i))",
+            "",
+            "Invalid path expression with result null",
+            5,
+        ),
+    ])
+}

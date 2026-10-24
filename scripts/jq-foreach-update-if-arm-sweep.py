@@ -8,9 +8,9 @@ this is that grid. `jq-fold-body-register-grid-sweep.py` has no `if` UPDATE, so 
 
 Grid: UPDATE (`if C then A else B end`, `C` in `.a`, `.`, `.b`, a literal in one arm (`1`, `null`, `true`,
 `false`) and the fold FE in the other, both orders, plus `elif` chains) x FE (a `try`-caught `$x` destructure, a
-`?//` chain) x wrapper (none, `try .. catch`, comma siblings, `?`, `| .`, `label`) x loop source (short, ten items long, unbounded) x EXTRACT x INIT (one,
+`?//` chain, four folds that do not hand their input on or whose source is not that destructure (#5113)) x wrapper (none, `try .. catch`, comma siblings, `?`, `| .`, `label`) x loop source (short, ten items long, unbounded) x EXTRACT x INIT (one,
 two and three values, and two behind a pipe, which succinctly's static bound cannot count) x the loop's pattern (`$i`,
-`?//` chains) x write context x document. The full product is about 7.9 million rows: `--n` (40,000 by default) samples
+`?//` chains) x write context x document. The full product is about 23.9 million rows: `--n` (40,000 by default) samples
 it deterministically (`--seed`), decoding each sampled index into its row, and `--only` narrows it to one axis value
 (`--only null-then`, `--only alt-obj`) to sample that slice densely.
 
@@ -46,6 +46,12 @@ import sys
 FOLDS = [
     ("fe", "foreach (try ($x as {a:$a} | .)) as $y (.; .; .)"),
     ("fe-chain", "foreach (try ($x as {a:$a} ?// [$a] | .)) as $y (.; .; .)"),
+    # #5113: folds that do not hand their input on (INIT, UPDATE or EXTRACT stores another value), and one whose source
+    # is not a caught destructure: the state a step stores after them is not the `null` they were entered with.
+    ("fe-init", "foreach (try ($x as {a:$a} | .)) as $y (5; .; .)"),
+    ("fe-upd", "foreach (try ($x as {a:$a} | .)) as $y (.; 5; .)"),
+    ("fe-ext", "foreach (try ($x as {a:$a} | .)) as $y (.; .; 5)"),
+    ("fe-plain", "foreach (try (.a | .)) as $y (.; .; .)"),
 ]
 # arm pairs: (name, then, else); {F} is the fold, `1` the literal.
 ARMS = [
@@ -93,6 +99,7 @@ SOURCES = [
     "(.,.a)",
     ".",
     "(.a,.a)",
+    "(.a,.,.a)",
     "(.a,.b)",
     "(.,.a,.,.a,.,.a,.,.a,.,.a)",
     "(.a,.a,.a,.a,.a,.a,.a,.a,.a,.a)",
