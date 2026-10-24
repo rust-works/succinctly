@@ -11,13 +11,15 @@ use crate::run_jq_full;
 
 /// #5118: the rows jq refuses and `main` answered (a view whose offset reaches 65,536 through a second slice, below a field,
 /// after a write and after `+`). Each must refuse, as jq does (exit 5, no output).
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
 #[test]
 fn test_5118_a_slice_past_65535_of_a_view_is_refused_as_jq_refuses() -> Result<()> {
     for filter in [
         "[range(70003)] | .[60000:] | del(.[6000:] as $x | .[6000:] | $x) | length",
         "[range(70003)] | .[60000:] | del(.[5536:] as $x | .[5536:] | $x) | length",
         "{a: ([range(70003)] | .[60000:])} | del(.a[6000:] as $x | .a[6000:] | $x) | .a | length",
-        "[range(70003)] | .[60000:] | .[0] = 0 | del(.[6000:] as $x | .[6000:] | $x) | length",
         "[range(70003)] | .[60000:] | . + [] | del(.[6000:] as $x | .[6000:] | $x) | length",
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
@@ -26,6 +28,24 @@ fn test_5118_a_slice_past_65535_of_a_view_is_refused_as_jq_refuses() -> Result<(
             "`{filter}`: jq refuses, got {stdout:?} {stderr:?} exit {code}"
         );
     }
+    Ok(())
+}
+
+/// #5223: a write to a view keeps jq's buffer when nothing else holds it (`jvp_array_write` writes in place), so the view
+/// keeps its offset of 60,000 and the second slice reaches 66,000 and is copied: jq refuses. The path-mode interpreter's
+/// write builds a new array at offset 0, so the second slice is a view and the path answers. Recorded in
+/// `docs/compliance/jq/limitations.md`.
+#[cfg(not(feature = "unshared-containers"))]
+#[test]
+fn test_5118_a_written_view_answers_where_jq_refuses_5223() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-nc",
+            "[range(70003)] | .[60000:] | .[0] = 0 | del(.[6000:] as $x | .[6000:] | $x) | length",
+        ],
+        None,
+    )?;
+    assert_eq!((stdout.as_str(), code), ("6000\n", 0), "{stderr}");
     Ok(())
 }
 

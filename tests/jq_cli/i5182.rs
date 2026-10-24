@@ -170,6 +170,10 @@ fn test_5182_uncaught_foreign_foreach_where_the_marker_is_the_register_is_unchan
 /// A `?` over a step the nested `foreach` still refuses (its bind body is `$a`, not `.`: `bare_bind_source_key` reads `.` only)
 /// used to be answered by step 1's wrong emission, which the raise removed. jq answers `[["a"]]`; the refusal is dropped by the
 /// `?` and the path is `[]`, pinned here (a divergence, not jq's answer) until a bind body other than `.` is read.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5182_step_two_refusal_a_question_mark_drops_until_a_non_dot_bind_body_is_read() -> Result<()>
@@ -177,7 +181,7 @@ fn test_5182_step_two_refusal_a_question_mark_drops_until_a_non_dot_bind_body_is
     assert_path_rows_both_routes_3749(&[(
         r#"{"a":null}"#,
         r". as $x | [path(foreach (.a?, 1) as $i (null; try foreach ($x as {a:$a} | $a) as $y (.; .; .); .))?]",
-        "[]\n",
+        "[[\"a\"]]\n",
         "",
         0,
     )])

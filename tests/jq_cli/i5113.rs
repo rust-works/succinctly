@@ -349,15 +349,19 @@ fn test_5113_literal_then_lookahead_reads_an_unbounded_source() -> Result<()> {
 /// #5113 review: the lookahead reads a step's handler literal only where the real last step does. On a fork that is not
 /// INIT's last, the fork's last step takes the whole-`if` resolve and refuses, so the earlier step's literal `then` must
 /// not be read either: it printed `["a"]` before the refusal where `main` printed nothing. jq answers four `["a"]`.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5113_lookahead_agrees_with_the_last_step_of_an_earlier_init_fork() -> Result<()> {
     assert_path_rows_both_routes_3749(&[(
         "null",
         r"path(. as $x | foreach (.a,.a) as $i ((.,.); try (if not then 0 elif .b then 1 else foreach (try ($x as {a:$a} | .)) as $y (.; .; .) end) catch 2; $i))",
+        "[\"a\"]\n[\"a\"]\n[\"a\"]\n[\"a\"]\n",
         "",
-        "Invalid path expression with result null",
-        5,
+        0,
     )])
 }
 
@@ -758,6 +762,7 @@ fn test_5113_handler_literal_read_beside_a_literal_sibling() -> Result<()> {
 /// element, which a lookahead started from the `then` literal cannot see (it printed a truncated answer before the
 /// lookahead ran on the unbound UPDATE). jq answers `[["a"]]`, `[["a"],["a"]]`, `[["a"],["a"]]`,
 /// `[["a","a"],["a","a"]]` and `[[],[],["b"],["b"],["a"]]`.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5113_literal_sibling_reading_stays_unread_where_the_lookahead_cannot_place_the_step(
@@ -766,35 +771,74 @@ fn test_5113_literal_sibling_reading_stays_unread_where_the_lookahead_cannot_pla
         (
             r#"{"a":{"a":null}}"#,
             r"[path(. as $x | foreach (.a,.) as $i (.; (if .a then 1 else foreach (try ($x as {a:$a} | .)) as $y (.; .; .) end, .b?); $i))?]",
-            "[]\n",
+            "[[\"a\"]]\n",
             "",
             0,
         ),
         (
             r#"{"a":{"a":null}}"#,
             r"[path(. as $x | foreach (.a,.) as $i (.; (if .a then 1 else foreach (try ($x as {a:$a} | .)) as $y (.; .; .) end, null); $i))?]",
-            "[]\n",
+            "[[\"a\"],[\"a\"]]\n",
             "",
             0,
         ),
         (
             r#"{"a":{"a":null}}"#,
             r"[path(. as $x | foreach (.a,.) as $i (.; (if .a then 1 else foreach (try ($x as {a:$a} | .)) as $y (.; .; .) end, 7, .b?); $i))?]",
-            "[]\n",
+            "[[\"a\"],[\"a\"]]\n",
             "",
             0,
         ),
         (
             r#"{"a":{"a":null}}"#,
             r"[path(. as $x | foreach (.a,.) as {a:$i} ?// $i (.; (if .a then 1 else foreach (try ($x as {a:$a} | .)) as $y (.; .; .) end, 7); $i))?]",
-            "[]\n",
+            "[[\"a\",\"a\"],[\"a\",\"a\"]]\n",
             "",
             0,
         ),
         (
             r#"{"a":{"a":null}}"#,
             r"[path(. as $x | foreach (.,.b,.a) as $i (.; (if .a then 1 else foreach (try ($x as {a:$a} | .)) as $y (.; .; .) end, $i); $i))?]",
-            "[]\n",
+            "[[],[],[\"b\"],[\"b\"],[\"a\"]]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
+/// #5223 Phase 3: this issue's repro rows, with `path`, `del` and `|=`
+/// wherever the row is a `path(...)`, as jq 1.7.1 answers them (stdout, the
+/// first error message, the exit code). The path-mode interpreter carries
+/// jq's register, so they match by construction, on both routes.
+#[cfg(not(feature = "unshared-containers"))]
+#[test]
+fn test_superseded_rows_match_jq_through_the_path_mode_interpreter_5113() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"a":{"a":null}}"#,
+            r"[path(. as $x | foreach .a as $i ((.,.); try (if .a then 1 else foreach (try ($x as {a:$a} | .)) as $y (.; .; .) end) catch 1; $i))?]",
+            "[[\"a\"]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"a":null}}"#,
+            r"[path(. as $x | foreach (.a,.) as $i (.; try (if .a then 1 else foreach (try ($x as {a:$a} | .)) as $y (.; .; .) end) catch 1; $i))?]",
+            "[[\"a\"],[]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"b":true}"#,
+            r"[path(. as $x | foreach (.a,.) as $i (.; try (if .b then null else foreach (try ($x as {a:$a} | .)) as $y (.; .; .) end) catch 1; .a))?]",
+            "[[\"a\",\"a\"],[\"a\",\"a\"]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"a":null}}"#,
+            r#"[path(. as $x | foreach .a as {a:$k} ?// $k (.; (if .a then null else foreach (try ($x as {a:$a} | .)) as $y (.; .; .) end, 7); if $k == null then error("x") else $k end))?]"#,
+            "[[\"a\"]]\n",
             "",
             0,
         ),

@@ -231,6 +231,10 @@ fn test_foreach_update_if_with_a_navigating_else_keeps_the_rows_that_matched_503
 /// `del` leaves the document, because the step after an emptied one cannot be placed at the register the bind moved
 /// (7 of 12,000 grid rows that matched jq turned into refusals when it was read). Recorded in `limitations.md`; these
 /// rows move when those readings do.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_if_with_a_navigating_else_keeps_the_extract_and_mirrored_foreach_reading_5034(
 ) -> Result<()> {
@@ -239,13 +243,13 @@ fn test_foreach_update_if_with_a_navigating_else_keeps_the_extract_and_mirrored_
             r#"{"a":1,"b":2}"#,
             r"path(. as $x | foreach (.a,.b) as $i (.; .; if . then foreach (try ($x as {a:$a} | .)) as $y (.; .; .) else .a end))",
             "",
-            "Invalid path expression with result",
-            5,
+            "",
+            0,
         ),
         (
             r#"{"a":1}"#,
             r#"try del(. as $x | foreach (null,.a) as $i (.; if .a then .b else foreach (try ($x as {a:$a} | .)) as $y (.; .; .) end; .a)) catch "C""#,
-            "\"C\"\n",
+            "{\"a\":1}\n",
             "",
             0,
         ),

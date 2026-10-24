@@ -3799,6 +3799,28 @@ impl OwnedValue {
         }
     }
 
+    /// Give every string and number literal in this tree its own shared
+    /// storage, so that [`jv_identical`] answers for them as jq's
+    /// `jv_identical` does for the `jv`s `jv_parse` allocates (#5223, D5.1).
+    ///
+    /// The path-mode interpreter's input is a document materialized for it
+    /// alone, so its tree is uniquely owned: the containers' copy-on-write
+    /// points (`Rc::make_mut`) do not copy here, and each container keeps the
+    /// storage it was built with. Computed numbers (`Int`/`Float`) have no
+    /// storage in jq either and are left as they are; a JSON document's
+    /// numbers all materialize as `NumberLiteral`s, which this promotes.
+    ///
+    /// A no-op under the `unshared-containers` holdout, whose `promote` is one.
+    pub(crate) fn promote_identities(&mut self) {
+        match self {
+            Self::String(s) => s.promote(),
+            Self::NumberLiteral(_, spelling) => spelling.promote(),
+            Self::Array(items) => items.iter_mut().for_each(Self::promote_identities),
+            Self::Object(map) => map.values_mut().for_each(Self::promote_identities),
+            Self::Null | Self::Bool(_) | Self::Int(_) | Self::Float(_) => {}
+        }
+    }
+
     /// Create an object from key-value pairs.
     pub fn object_from(pairs: impl IntoIterator<Item = (String, Self)>) -> Self {
         Self::Object(pairs.into_iter().collect())
@@ -5383,6 +5405,47 @@ pub(crate) fn jq_identical<S: EvalSemantics>(a: &OwnedValue, b: &OwnedValue) -> 
     }
 }
 
+/// jq 1.7.1's `jv_identical`, exactly: the test the path-mode interpreter
+/// (#5223) applies at jq's three register check sites.
+///
+/// Two values must agree on `kind_flags` first, so a number *literal* is never
+/// identical to a computed number. After that, an allocated `jv` (array,
+/// object, string, number literal) compares by pointer, and anything else by
+/// the bits of its payload:
+///
+/// - `null`/`true`/`false` compare by kind and value;
+/// - `Int`/`Float` are computed doubles and compare by their `f64` bits, so
+///   `Int(2)` and `Float(2.0)` are identical and `0.0` and `-0.0` are not;
+/// - arrays, objects, strings and number literals compare by storage
+///   ([`OwnedValue::shares_storage_with`]).
+///
+/// Unlike [`jq_identical`], which `==` consults only for containers and NaN
+/// instances, this is the whole rule. Its precondition is promotion: an
+/// unpromoted string or literal is identical to nothing, so a caller that
+/// asks it of document scalars materializes them promoted first
+/// (`promote_identities`). Under the `unshared-containers` holdout nothing is
+/// ever shared, so only the unallocated kinds can be identical there.
+pub(crate) fn jv_identical(a: &OwnedValue, b: &OwnedValue) -> bool {
+    match (a, b) {
+        (OwnedValue::Null, OwnedValue::Null) => true,
+        (OwnedValue::Bool(x), OwnedValue::Bool(y)) => x == y,
+        (OwnedValue::Int(_) | OwnedValue::Float(_), OwnedValue::Int(_) | OwnedValue::Float(_)) => {
+            computed_bits(a) == computed_bits(b)
+        }
+        _ => a.shares_storage_with(b),
+    }
+}
+
+/// The double a computed number holds, as bits: [`jv_identical`]'s payload
+/// comparison for `Int`/`Float`.
+fn computed_bits(value: &OwnedValue) -> Option<u64> {
+    match value {
+        OwnedValue::Int(i) => Some((*i as f64).to_bits()),
+        OwnedValue::Float(f) => Some(f.to_bits()),
+        _ => None,
+    }
+}
+
 /// Order two `f64`s the way jq's own comparator does: NaN sorts strictly
 /// below every other float, including another NaN (#421).
 ///
@@ -6138,6 +6201,97 @@ mod tests {
         assert!(n.shares_storage_with(&n.clone()));
         assert!(!n.shares_storage_with(&OwnedValue::Int(5)));
         assert!(!n.shares_storage_with(&s));
+    }
+
+    /// `jv_identical` (#5223) on every kind: computed numbers by their double's
+    /// bits, a literal never against a computed number, promoted scalars and
+    /// containers by storage, and `null`/booleans by kind and value.
+    #[test]
+    #[cfg(not(feature = "unshared-containers"))]
+    fn jv_identical_on_every_kind_5223() {
+        let two = OwnedValue::Int(2);
+        assert!(jv_identical(&two, &OwnedValue::Float(2.0)));
+        assert!(!jv_identical(
+            &OwnedValue::Float(0.0),
+            &OwnedValue::Float(-0.0)
+        ));
+        assert!(!jv_identical(&two, &OwnedValue::Int(3)));
+
+        let mut spelling = SharableLiteral::from("2");
+        spelling.promote();
+        let literal = OwnedValue::NumberLiteral(NumberRepr::Int(2), spelling);
+        assert!(jv_identical(&literal, &literal.clone()));
+        assert!(!jv_identical(&literal, &two));
+        let twin = OwnedValue::NumberLiteral(NumberRepr::Int(2), "2".into());
+        assert!(!jv_identical(&literal, &twin));
+
+        let mut text = SharableString::from("s");
+        text.promote();
+        let text = OwnedValue::String(text);
+        assert!(jv_identical(&text, &text.clone()));
+        assert!(!jv_identical(&text, &OwnedValue::string("s")));
+
+        let array = OwnedValue::Array(vec![OwnedValue::Null].into());
+        assert!(jv_identical(&array, &array.clone()));
+        assert!(!jv_identical(
+            &array,
+            &OwnedValue::Array(vec![OwnedValue::Null].into())
+        ));
+
+        assert!(jv_identical(&OwnedValue::Null, &OwnedValue::Null));
+        assert!(jv_identical(
+            &OwnedValue::Bool(true),
+            &OwnedValue::Bool(true)
+        ));
+        assert!(!jv_identical(
+            &OwnedValue::Bool(true),
+            &OwnedValue::Bool(false)
+        ));
+        assert!(!jv_identical(&OwnedValue::Null, &OwnedValue::Bool(false)));
+    }
+
+    /// A promoted document gives each node one identity (#5223, D5.1): the
+    /// same node reached twice is identical, equal scalars from different
+    /// places are not, the containers keep their storage, and the document
+    /// prints exactly as before.
+    #[test]
+    #[cfg(not(feature = "unshared-containers"))]
+    fn promote_identities_gives_each_document_node_one_identity_5223() {
+        let json = br#"{"a":"s","b":"s","c":1,"d":1,"e":[1.0,"s"]}"#;
+        let index = crate::json::JsonIndex::build(json);
+        let mut doc = crate::jq::eval_generic::to_owned::<crate::jq::JqSemantics, _>(
+            &index.root(json).value(),
+        )
+        .expect("a valid document");
+        let before = doc.to_json_jq_preserve();
+        let e_storage = doc.as_object().expect("an object")["e"].clone();
+        doc.promote_identities();
+        assert_eq!(doc.to_json_jq_preserve(), before);
+
+        let map = doc.as_object().expect("an object");
+        for key in ["a", "c"] {
+            assert!(jv_identical(&map[key], &map[key].clone()), "{key}");
+        }
+        assert!(!jv_identical(&map["a"], &map["b"]));
+        assert!(!jv_identical(&map["c"], &map["d"]));
+        assert!(!jv_identical(&map["c"], &OwnedValue::Int(1)));
+        let items = map["e"].as_array().expect("an array");
+        assert!(jv_identical(&items[0], &items[0].clone()));
+        assert!(jv_identical(&items[1], &items[1].clone()));
+        assert!(!jv_identical(&items[1], &map["a"]));
+        // A clone taken before promotion shares the array's storage with the
+        // tree, so `make_mut` copied it; the promoted tree has its own.
+        assert!(!jv_identical(&map["e"], &e_storage));
+    }
+
+    /// Under the holdout nothing shares storage, so only the kinds jq compares
+    /// by value can be identical (#5223).
+    #[test]
+    #[cfg(feature = "unshared-containers")]
+    fn jv_identical_under_the_holdout_compares_only_by_value_5223() {
+        let array = OwnedValue::Array(vec![OwnedValue::Null].into());
+        assert!(!jv_identical(&array, &array.clone()));
+        assert!(jv_identical(&OwnedValue::Int(2), &OwnedValue::Float(2.0)));
     }
 
     /// The holdout never promotes: its A/B twin must not share a scalar

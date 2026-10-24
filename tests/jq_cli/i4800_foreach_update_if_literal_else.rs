@@ -517,6 +517,10 @@ fn test_foreach_update_if_with_a_literal_then_beside_a_fold_in_the_else_4800() -
 /// answers are pinned as they stand (a fix flips them; #5208 flipped the second row, a step whose state is the register, to jq's `[]`).
 /// Reading it changed the last row, `(7, if .a then null elif .b
 /// then 2 else FE end)` on `{"b":true}`, from one wrong answer (`[]`) to another (`[[]]`).
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_if_with_a_literal_then_past_a_falsy_elif_stays_differing_4800() -> Result<()>
 {
@@ -524,7 +528,7 @@ fn test_foreach_update_if_with_a_literal_then_past_a_falsy_elif_stays_differing_
         (
             r#"{"a":{"a":null}}"#,
             r"[path(. as $x | foreach . as $i (.; try (if .c then 7 elif .a then 1 else (foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) end) catch 1; $i))?]",
-            "[]\n",
+            "[[]]\n",
             "",
             0,
         ),
@@ -538,14 +542,14 @@ fn test_foreach_update_if_with_a_literal_then_past_a_falsy_elif_stays_differing_
         (
             r#"{"b":true,"a":1}"#,
             r"[path(. as $x | foreach . as $i (.; try (if .c then 7 elif .b then null else (foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) end) catch 1; $i))?]",
-            "[]\n",
+            "[[]]\n",
             "",
             0,
         ),
         (
             r#"{"b":true}"#,
             r"[path(. as $x | foreach . as $i (.; (7, if .a then null elif .b then 2 else (foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) end); $i))?]",
-            "[]\n",
+            "[[],[]]\n",
             "",
             0,
         ),
@@ -565,13 +569,17 @@ fn test_foreach_update_if_with_a_literal_then_past_a_falsy_elif_stays_differing_
 /// the stored literal (the last row; the base answers `[]` there too). The last step of an earlier INIT fork is read
 /// since #5113 (`tests/jq_cli/i5113.rs`): the next fork stores INIT's own output. So is a `try ... catch` that is a comma
 /// item beside a literal sibling (the second row, now jq's `[["a"],["a"]]`).
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_wrapped_if_with_a_literal_else_stays_differing_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
         (
             r#"{"a":null}"#,
             r"[path(. as $x | foreach .a as $i (.; (if .a then (foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) else null end, .a); $i))?]",
-            "[]\n",
+            "[[\"a\"]]\n",
             "",
             0,
         ),
@@ -585,28 +593,28 @@ fn test_foreach_update_wrapped_if_with_a_literal_else_stays_differing_4800() -> 
         (
             r#"{"a":null}"#,
             r"[path(. as $x | foreach .a as $i (.; try (if .a then (foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) else .a end) catch 1; $i))?]",
-            "[]\n",
+            "[[\"a\"]]\n",
             "",
             0,
         ),
         (
             r#"{"a":null}"#,
             r"(. as $x | foreach (.,.a) as $i (.; (if . then (.b | foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) else false end, if . then (.b | foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) else false end); null)) |= 9",
+            "{\"a\":9}\n",
             "",
-            "Invalid path expression with result null",
-            5,
+            0,
         ),
         (
             r#"{"b":true}"#,
             r"[path(. as $x | foreach (.a,.) as $i (.; try (if .b then null else (foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) end) catch 1; .a))?]",
+            "[[\"a\",\"a\"],[\"a\",\"a\"]]\n",
             "",
-            "Invalid path expression near attempt to access element \"a\" of null",
-            5,
+            0,
         ),
         (
             r#"{"b":true}"#,
             r"[path(. as $x | foreach (.a,.) as $i (.; try (if .b then null else (foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) end) catch 1; $i))?]",
-            "[]\n",
+            "[[\"a\"]]\n",
             "",
             0,
         ),
@@ -620,7 +628,7 @@ fn test_foreach_update_wrapped_if_with_a_literal_else_stays_differing_4800() -> 
         (
             r#"{"a":{"a":null}}"#,
             r#"[path(. as $x | foreach .a as {a:$k} ?// $k (.; (if .a then null else (foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) end, 7); (if $k == null then error("x") else $k end)))?]"#,
-            "[]\n",
+            "[[\"a\"]]\n",
             "",
             0,
         ),
@@ -632,6 +640,7 @@ fn test_foreach_update_wrapped_if_with_a_literal_else_stays_differing_4800() -> 
 /// read by `alternate_update_shape`, which is the one route that still reaches the `return None` of its `Pipe` arm
 /// (the literal-arm rows above are resolved as the arm and never get there). Where jq answers `[[]]` or `[[],[]]`
 /// these answer `[]`; the answers are pinned as they stand (a fix flips them), and the rows keep the arm covered.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_wrapped_if_with_an_undecidable_condition_stays_differing_4800() -> Result<()>
 {
@@ -639,28 +648,28 @@ fn test_foreach_update_wrapped_if_with_an_undecidable_condition_stays_differing_
         (
             r#"{"a":true,"b":2}"#,
             r"[path(foreach . as $i (.; if .a? then 7 else .b end | .; $i))?]",
-            "[]\n",
+            "[[]]\n",
             "",
             0,
         ),
         (
             r#"{"a":true,"b":2}"#,
             r"[path(foreach . as $i (.; if .a as $x | $x then 7 else .b end | .; $i))?]",
-            "[]\n",
+            "[[]]\n",
             "",
             0,
         ),
         (
             r#"{"a":true,"b":2}"#,
             r"[path(foreach . as $i (.; (if (.a,.b) then 7 else .b end) | select(true); $i))?]",
-            "[]\n",
+            "[[],[]]\n",
             "",
             0,
         ),
         (
             r#"{"a":false,"b":2}"#,
             r"[path(foreach . as $i (.; if range(2) then 7 else .b end | .; $i))?]",
-            "[]\n",
+            "[[],[]]\n",
             "",
             0,
         ),

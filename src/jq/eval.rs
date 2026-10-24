@@ -13320,8 +13320,10 @@ fn binary_fanout_each_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     //         this     exit 3, the halt wins        <- inner keeps `pending`
     //
     // Left and right therefore answer differently, deliberately rather than
-    // by accident; both rows are pinned in
-    // `test_short_circuit_side_effect_leaks_820_932_987`. Preserving the
+    // by accident (the pair spelled in `path(...)` runs through the path-mode
+    // interpreter since #5223, which answers jq's path error in both, so
+    // `test_short_circuit_side_effect_leaks_820_932_987` no longer reaches
+    // this arm). Preserving the
     // outer `pending` instead would move the first row back to exit 3, away
     // from jq.
     //
@@ -31134,6 +31136,22 @@ pub fn eval_full<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     eval_single::<W, S>(expr, cursor.value(), false)
 }
 
+/// Run `expr` through the path-mode interpreter on `input` (#5223): every
+/// output collected, and the escape that ended the run kept after them.
+fn path_mode_query<'a, W: Clone + AsRef<[u64]>>(
+    expr: &Expr,
+    input: OwnedValue,
+) -> QueryResult<'a, W> {
+    let mut outputs = Vec::new();
+    match super::path_mode::run_program(expr, input, &mut |v| {
+        outputs.push(v);
+        true
+    }) {
+        None => owned_vec_to_result(outputs),
+        Some(control) => partial(outputs, control),
+    }
+}
+
 /// The generic evaluator's result in this evaluator's shape (spine 2416,
 /// phase 3). Lazy variants are materialized first; a cursor stays a cursor
 /// where [`QueryResult`] can hold one, and a batch of cursors becomes their
@@ -31239,6 +31257,21 @@ pub fn eval_lenient<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// `needs_path_context` can see -- the overwhelming majority of
 /// `--eval-all` filters pay zero extra cost over a normal `evaluate_input`.
 pub fn eval_owned_with_file_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    file_origin: &[usize],
+) -> QueryResult<'a, W> {
+    // #5223: a jq program with a path target the shipped walkers cannot take
+    // natively runs whole through the path-mode interpreter.
+    if S::TAG == EvalTag::Jq && super::path_mode::takes_program(expr) {
+        return path_mode_query(expr, input.clone());
+    }
+    eval_owned_unrouted::<W, S>(expr, input, file_origin)
+}
+
+/// [`eval_owned_with_file_index`] without the path-mode routing: the entry the
+/// path-mode interpreter delegates a C builtin's call through (#5223).
+pub(crate) fn eval_owned_unrouted<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
     file_origin: &[usize],
@@ -68838,7 +68871,7 @@ fn eval_recurse_cond<S: EvalSemantics>(
 /// It used to end the walk as though it had finished, which answered a finite
 /// walk over a larger document silently short and left a write through it
 /// silently partial.
-const RECURSE_MAX_ITEMS: usize = 10000;
+pub(crate) const RECURSE_MAX_ITEMS: usize = 10000;
 
 /// Whether `recurse(f)` / `recurse(f; cond)` is bare `recurse` (#3703).
 ///
@@ -68900,7 +68933,7 @@ pub(crate) fn is_gated_structural_descent(f: &Expr, cond: Option<&Expr>) -> bool
 /// `null` again, forever, and `.a.b` is as likely to land on the same node as
 /// to leave it. A pipe through anything else (`.[]? | .`, a slice, a comma, a
 /// call) is a computed `f` whose outputs need not be tree nodes at all.
-fn is_tree_descending_f(f: &Expr) -> bool {
+pub(crate) fn is_tree_descending_f(f: &Expr) -> bool {
     fn step(e: &Expr) -> &Expr {
         let mut e = e;
         while let Expr::Paren(inner) | Expr::Optional(inner) = e {
@@ -81976,7 +82009,7 @@ fn eval_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// instead, the one guard in the file that chose that failure mode. See
 /// [`docs/compliance/jq/limitations.md`](../../docs/compliance/jq/limitations.md)
 /// for the recorded divergence (real jq has no such cap at all).
-const MAX_RANGE: usize = 100000;
+pub(crate) const MAX_RANGE: usize = 100000;
 
 /// The error [`each_range`]'s `emit` raises once a caller that actually
 /// wanted every value (its sink kept answering [`Demand::Continue`]) hits a
@@ -84508,7 +84541,7 @@ pub(crate) fn yq_integer_component_text(component: &OwnedValue) -> Option<String
 /// indexed, so `1 | setpath(["a"]; 1)` is an error rather than `{"a":1}`
 /// (#359), and so does a container indexed with the wrong kind of key —
 /// `{} | setpath([0]; 1)`, `[] | setpath(["a"]; 1)`.
-fn set_value_at_path<S: EvalSemantics>(
+pub(crate) fn set_value_at_path<S: EvalSemantics>(
     value: OwnedValue,
     path: &[OwnedValue],
     new_val: OwnedValue,
@@ -92678,6 +92711,20 @@ fn delpaths_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     paths_owned: OwnedValue,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // jq mode: one definition with the path-mode interpreter's
+    // ([`delpaths_jq_prepare`]/[`delpaths_jq_apply`]). The validation errors
+    // raise whatever `optional` says, and before the value is decoded; a
+    // decode failure bypasses `optional`, as below.
+    if S::TAG != EvalTag::Yq {
+        let paths = match delpaths_jq_prepare(paths_owned) {
+            Ok(paths) => paths,
+            Err(e) => return QueryResult::Error(e),
+        };
+        return match to_owned::<S, _>(value).and_then(|v| delpaths_jq_apply(v, &paths)) {
+            Ok(v) => QueryResult::Owned(v),
+            Err(e) => suppress_or_raise(e, optional),
+        };
+    }
     let OwnedValue::Array(mut paths) = paths_owned else {
         return QueryResult::Error(EvalError::paths_must_be_array());
     };
@@ -92898,6 +92945,60 @@ fn delpaths_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(e) if optional && !e.is_uncatchable_at_value_position() => QueryResult::None,
         Err(e) => e.into(),
     }
+}
+
+/// jq mode's `delpaths` argument, validated and ready to apply: every entry
+/// must be an array (checked before anything is deleted), a path holding a
+/// NaN names no element at any depth and is dropped, and the list is sorted
+/// in jq's value order, so the batch applies as one regardless of the order
+/// written. The one definition [`delpaths_one`] and the path-mode
+/// interpreter (#5223) share.
+pub(crate) fn delpaths_jq_prepare(paths: OwnedValue) -> Result<ArrayVec, EvalError> {
+    let OwnedValue::Array(mut paths) = paths else {
+        return Err(EvalError::paths_must_be_array());
+    };
+    if let Some(bad) = paths.iter().find(|p| !matches!(p, OwnedValue::Array(_))) {
+        return Err(EvalError::path_must_be_array_not(bad.type_name()));
+    }
+    paths.retain(|path| match path {
+        OwnedValue::Array(components) => !components
+            .iter()
+            .any(|key| matches!(key, OwnedValue::Float(f) if f.is_nan())),
+        _ => false,
+    });
+    paths.sort_by(compare_values::<JqSemantics>);
+    Ok(paths)
+}
+
+/// Delete a [`delpaths_jq_prepare`]d batch from `value`: nothing for an empty
+/// list, everything (`null`) when the first path is empty, else
+/// [`delete_paths_sorted`].
+pub(crate) fn delpaths_jq_apply(
+    value: OwnedValue,
+    paths: &ArrayVec,
+) -> Result<OwnedValue, EvalError> {
+    let paths: Vec<&[OwnedValue]> = paths
+        .iter()
+        .filter_map(|path| match path {
+            OwnedValue::Array(components) => Some(components.as_slice()),
+            _ => None,
+        })
+        .collect();
+    match paths.first() {
+        None => Ok(value),
+        Some([]) => Ok(OwnedValue::Null),
+        Some(_) => delete_paths_sorted::<JqSemantics>(value, &paths, 0),
+    }
+}
+
+/// jq mode's `delpaths(paths)` on an owned value the caller owns, for the
+/// path-mode interpreter (#5223): [`delpaths_jq_prepare`] then
+/// [`delpaths_jq_apply`].
+pub(crate) fn delpaths_jq_owned(
+    value: OwnedValue,
+    paths: OwnedValue,
+) -> Result<OwnedValue, EvalError> {
+    delpaths_jq_apply(value, &delpaths_jq_prepare(paths)?)
 }
 
 /// [`document_number_f64`] for a `JsonNumber`: its source bytes under `S`'s

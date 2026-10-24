@@ -218,9 +218,9 @@ enum DevSubcommand {
     Bench(BenchCommand),
     /// Report how many words the select word scans traverse (#40)
     SelectStats(SelectStatsArgs),
-    /// Run a jq filter through the #5223 path-mode spike (dev-only)
+    /// Run a jq filter through the #5223 path-mode interpreter (dev-only)
     #[command(hide = true)]
-    JqPathSpike(jq_path_spike::JqPathSpikeArgs),
+    JqPathMode(jq_path_mode::JqPathModeArgs),
 }
 
 /// Arguments for the select scan-length report.
@@ -1917,7 +1917,7 @@ fn run_main() -> Result<()> {
                 let exit_code = select_stats_report::run(&args.data_dir, args.markdown.as_ref())?;
                 std::process::exit(exit_code);
             }
-            DevSubcommand::JqPathSpike(args) => std::process::exit(jq_path_spike::run(args)),
+            DevSubcommand::JqPathMode(args) => std::process::exit(jq_path_mode::run(args)),
         },
         Command::InstallAliases(args) => install_aliases(args),
         #[cfg(feature = "bench-runner")]
@@ -2782,7 +2782,7 @@ mod front_matter;
 mod generators;
 mod jq_bench;
 mod jq_locate;
-mod jq_path_spike;
+mod jq_path_mode;
 mod jq_runner;
 mod jq_seq_reader;
 mod json_validate;

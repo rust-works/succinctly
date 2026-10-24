@@ -129,6 +129,7 @@ runs:
         esac
 
     - uses: action-works/patchcov-action@v2
+      id: patchcov
       with:
         # Pin patchcov itself (#3873, #3880, #4324), deliberately and not through the
         # action's own default, so a patchcov release cannot change measured coverage
@@ -170,7 +171,38 @@ runs:
         baseline-workflow: ${{ inputs.baseline-workflow }}
         baseline-artifact-name: coverage-baseline-${{ inputs.name }}
         artifact-name: coverage-summary-${{ inputs.name }}
-        comment-header: coverage-${{ inputs.name }}
+        # The comment is posted by the steps below, cut to fit GitHub's limit first.
+        comment: 'false'
+
+    # GitHub refuses a comment over 65,536 characters, and patchcov lists every
+    # tolerated region and every line of unchanged code whose coverage changed: a
+    # change that moves much unchanged code out of coverage rendered 377,000
+    # characters, and the action's own sticky-comment step failed the job (#5223).
+    # fit-comment.py keeps the headline figures and the patch section, cuts the
+    # longest lists to their first entries, and the untruncated comment is uploaded
+    # beside the summary. The gates above have already run; this only reports.
+    - name: Fit the coverage comment under GitHub's limit
+      id: fit
+      if: always() && github.event_name == 'pull_request' && steps.patchcov.outputs.comment-path != ''
+      shell: bash
+      env:
+        COMMENT_PATH: ${{ steps.patchcov.outputs.comment-path }}
+        FULL_ARTIFACT: coverage-comment-${{ inputs.name }}
+      run: python3 "${{ github.action_path }}/fit-comment.py" "$COMMENT_PATH" coverage-comment.md "$FULL_ARTIFACT"
+
+    - name: Upload the full coverage comment
+      if: always() && steps.fit.outcome == 'success'
+      uses: actions/upload-artifact@v7
+      with:
+        name: coverage-comment-${{ inputs.name }}
+        path: ${{ steps.patchcov.outputs.comment-path }}
+
+    - name: Comment coverage on PR
+      if: always() && steps.fit.outcome == 'success'
+      uses: marocchino/sticky-pull-request-comment@v3
+      with:
+        header: coverage-${{ inputs.name }}
+        path: coverage-comment.md
 
     - name: Report disk headroom
       if: always()

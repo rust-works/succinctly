@@ -1,37 +1,31 @@
 #!/usr/bin/env python3
 """Three-way differential run for the #5223 Phase 0 go/no-go: jq 1.7.1, a
-`main` build, and the path-mode spike, row by row.
+`main` build, and the path-mode interpreter, row by row.
 
 Rows are JSON lines `{"args": [...], "stdin": "...", "source": "..."}`, where
 `args` is the argv after the binary, `["jq", "-c", PROG]` as a sweep calls it
-(a row for any other subcommand is skipped). They come from `scripts/jq-path-spike-rows/*.jsonl`
-(hand-written repros) or from a directory `scripts/jq-path-spike-record.py`
+(a row for any other subcommand is skipped). They come from `scripts/jq-path-mode-rows/*.jsonl`
+(hand-written repros) or from a directory `scripts/jq-path-mode-record.py`
 filled while a sweep ran against `main`. Duplicates are run once.
 
 Each row compares **stdout and exit code** with jq's, as the sweeps do:
 
-  both          main and the spike match jq
-  gain          only the spike matches jq
-  LOSS          only main matches jq, and the spike's run touched no stub:
-                the gate's failure class
-  LOSS-stub     only main matches jq, on a run that answered a builtin
-                through the fresh stub where jq's own version can hand back
-                its input or navigates it (`path-spike: stubbed: ...`)
+  both          main and the interpreter match jq
+  gain          only the interpreter matches jq
+  LOSS          only main matches jq: the gate's failure class
   neither       neither matches jq
-  neither-stub  neither matches jq, on a stubbed run
-  unsupported   the spike declined the row (exit 64, `path-spike: unsupported`)
+  unsupported   the interpreter declined the row (exit 64, `path-mode: unsupported`)
   oracle-skip   jq timed out, so the row says nothing
 
-A `-stub` row is the issue's "unstubbed builtin" case, which does not fail the
-gate; a LOSS or a neither still needs tracing to a construct rule (which
+A LOSS or a neither still needs tracing to a construct rule (which
 falsifies the model) or to something else. `--out` writes every row that is
 not `both`, with all three answers, for that tracing. Exit status 1 on any
 LOSS.
 
 Usage:
-    cargo build --release --features cli          # the spike, this branch
-    ./scripts/jq-path-spike-3way.py --main <main build> \
-        --rows scripts/jq-path-spike-rows/repros.jsonl --rows <record dir> \
+    cargo build --release --features cli          # the interpreter, this branch
+    ./scripts/jq-path-mode-3way.py --main <main build> \
+        --rows scripts/jq-path-mode-rows/repros.jsonl --rows <record dir> \
         [--sample N --seed S] [--jobs N] [--out FILE]
 """
 import argparse
@@ -92,22 +86,20 @@ def classify(row, opts):
     if jq is None:
         return "oracle-skip", row, None, None, None
     main = run([opts.main, "jq"] + row["args"], row["stdin"], opts.timeout)
-    spike = run([opts.spike, "jq"] + row["args"], row["stdin"], opts.timeout)
-    if spike is not None and spike[0] == UNSUPPORTED_EXIT and "path-spike: unsupported" in spike[2]:
-        return "unsupported", row, jq, main, spike
+    got = run([opts.path_mode, "jq"] + row["args"], row["stdin"], opts.timeout)
+    if got is not None and got[0] == UNSUPPORTED_EXIT and "path-mode: unsupported" in got[2]:
+        return "unsupported", row, jq, main, got
     same = lambda r: r is not None and (r[0], r[1]) == (jq[0], jq[1])
-    m, s = same(main), same(spike)
+    m, s = same(main), same(got)
     cls = "both" if m and s else "gain" if s else "LOSS" if m else "neither"
-    if cls in ("LOSS", "neither") and spike is not None and "path-spike: stubbed:" in spike[2]:
-        cls += "-stub"
-    return cls, row, jq, main, spike
+    return cls, row, jq, main, got
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--rows", action="append", required=True, help="a .jsonl file or a record directory")
     ap.add_argument("--main", required=True, help="a succinctly build of main")
-    ap.add_argument("--spike", default=os.path.join(HERE, "jq-path-spike.sh"))
+    ap.add_argument("--path-mode", default=os.path.join(HERE, "jq-path-mode.sh"))
     ap.add_argument("--jq", default="/usr/bin/jq")
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--timeout", type=float, default=10.0)
@@ -128,14 +120,14 @@ def main():
     with cf.ThreadPoolExecutor(max_workers=opts.jobs) as pool:
         futures = [pool.submit(classify, row, opts) for row in rows]
         for done, fut in enumerate(cf.as_completed(futures), 1):
-            cls, row, jq, main_r, spike = fut.result()
+            cls, row, jq, main_r, got = fut.result()
             counts[cls] += 1
             by_source[row["source"]][cls] += 1
             if out and cls != "both":
                 show = lambda r: None if r is None else {"rc": r[0], "stdout": r[1], "stderr": r[2][:400]}
                 out.write(
                     json.dumps(
-                        {"class": cls, **row, "jq": show(jq), "main": show(main_r), "spike": show(spike)}
+                        {"class": cls, **row, "jq": show(jq), "main": show(main_r), "path_mode": show(got)}
                     )
                     + "\n"
                 )
@@ -144,7 +136,7 @@ def main():
     if out:
         out.close()
 
-    order = ["both", "gain", "LOSS", "LOSS-stub", "neither", "neither-stub", "unsupported", "oracle-skip"]
+    order = ["both", "gain", "LOSS", "neither", "unsupported", "oracle-skip"]
     print("| class | rows |")
     print("|---|---|")
     for cls in order:

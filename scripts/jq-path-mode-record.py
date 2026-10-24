@@ -5,13 +5,13 @@ with the real binary.
 
 Point a sweep's `--bin` (or `--candidate`) at this file with
 
-    SPIKE_RECORD_BIN=<a main build>  SPIKE_RECORD_DIR=<empty dir>
+    PATH_MODE_RECORD_BIN=<a main build>  PATH_MODE_RECORD_DIR=<empty dir>
 
 and every invocation appends one JSON line, `{"args": [...], "stdin": "..."}`
 (the argv after the binary, and the bytes on stdin), to
-`$SPIKE_RECORD_DIR/rows.jsonl` under an exclusive lock, so parallel sweep jobs
+`$PATH_MODE_RECORD_DIR/rows.jsonl` under an exclusive lock, so parallel sweep jobs
 never interleave. The sweep itself sees exactly what the real binary does, so
-its own verdicts stay valid. `scripts/jq-path-spike-3way.py --rows` reads the
+its own verdicts stay valid. `scripts/jq-path-mode-3way.py --rows` reads the
 directory back. Nothing in the sweeps changes.
 """
 import fcntl
@@ -22,8 +22,8 @@ import sys
 
 
 def main():
-    real = os.environ["SPIKE_RECORD_BIN"]
-    out_dir = os.environ["SPIKE_RECORD_DIR"]
+    real = os.environ["PATH_MODE_RECORD_BIN"]
+    out_dir = os.environ["PATH_MODE_RECORD_DIR"]
     data = sys.stdin.buffer.read()
     record = {"args": sys.argv[1:], "stdin": data.decode("utf-8", "surrogateescape")}
     with open(os.path.join(out_dir, "rows.jsonl"), "a", encoding="utf-8") as log:

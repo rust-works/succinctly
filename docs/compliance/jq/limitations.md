@@ -514,6 +514,28 @@ anything else at any depth. The `setpath_*` probes added alongside it pin the re
 surface — wrong-key-type on a real container, out-of-bounds negative and NaN indices, and a
 non-array path argument.
 
+## Dynamic path targets run on the path-mode interpreter (#5223)
+
+Since [#5223](https://github.com/rust-works/succinctly/issues/5223) ([ADR-0026](../../adrs/adr-0026.md)), a jq-mode program whose path target is more than navigation runs whole through the path-mode interpreter (`src/jq/path_mode.rs`), which carries jq 1.7.1's path register `(path, value)` with every output and checks it with `jv_identical` where jq does.
+A target counts as dynamic when an argument of `path`/`del`/`pick`, or the target of `=`, `|=`, `op=` or `//=`, binds, folds, branches, retries a `?//`, catches an error with a handler, or calls a function.
+Targets made only of navigation (`.a`, `.[i]`, `.[$k]`, `.[a:b]`, `.[]`, `..`, `recurse`, `recurse(.[]?)`), or of value filters over it (`try S`, `try S catch empty`, `first(S)`, `S // T`, `select(c)` for a condition with no `?//`, function call or input), stay on the streaming walkers, which answer them as jq does.
+A program that uses `key`, `file_index`, `filename` or a cursor-metadata builtin (`line`, `column`, `document_index`, `anchor`, `style`, the comment builtins, `at_offset`, `at_position`) stays on the shipped route too, and so does a document the interpreter cannot materialize whole (a lone surrogate, nesting past 256 levels): the shipped route decodes only what the program reads.
+yq mode is unchanged.
+
+So the sections below that describe the path resolver's inferred register (the `Path-mode ...` sections, the register refusals under [Where succinctly errors and jq does not](#where-succinctly-errors-and-jq-does-not), the "artefact guard" and every "refused where jq answers" row) describe the shipped route, which jq mode now reaches only for the programs just listed.
+For a program the interpreter takes, the answer is jq's: the refusals those sections record no longer apply to it, and the superseded issues' rows are pinned as jq answers them (`tests/jq_cli/iN.rs`, `test_superseded_rows_match_jq_through_the_path_mode_interpreter_N`).
+
+The interpreter's own recorded divergences:
+
+- **A write to an unshared slice view.** jq's `jvp_array_write` writes a slice in place when nothing else holds it, so the slice keeps its offset into the original buffer.
+  The interpreter's write builds a new array at offset 0.
+  The difference is observable only through jq's 65,536-element slice-copy rule: `[range(70003)] | .[60000:] | .[0] = 0 | del(.[6000:] as $x | .[6000:] | $x) | length` is `6000` here and an `Invalid path expression` in jq, whose second slice reaches offset 66,000 and is copied (`test_5118_a_written_view_answers_where_jq_refuses_5223`).
+- **A walk jq never finishes raises the existing caps.** `null | [path(recurse(.a))] | length` and `path(recurse(.a?; true))` on `{"a":null}` never return in jq; they raise `recurse: maximum nodes exceeded` here after 10,000 nodes, as the value walker does (the shipped path walker pruned a `null` node's children and answered `1`, #856).
+  `until`/`while`, `range` and `repeat` keep their caps the same way (see the sections on each below).
+- **`del(.[nan])`** loops forever in jq 1.7.1; here the NaN path names no element and the document comes back unchanged.
+  `path(.[nan])` is jq's `[null]`.
+- **A `?` around a function call** (`def opt(f): f?; path(opt(.a))`) formats the index error the `?` then drops: the same answer as jq, at two allocator calls per member that the shipped walker's settled lookup avoids.
+
 ## `as` binds the Term before it, in jq mode (#3397)
 
 jq's grammar makes `Term "as" Patterns '|' Exp` an `Exp` production, so an `as` binds
@@ -7299,35 +7321,16 @@ shapes keep the eager route: a filter reading `parent` (a succinctly extension w
 ordering to follow, which sees the document with every target already created), and
 `sort_keys(f)`'s skip-absent pre-filter (yq only).
 
-One jq 1.7.1 quirk is deliberately not reproduced: a `?//` retry that re-enters `_modify`
-after a write already succeeded corrupts jq's `reduce` accumulator and fails with `Paths must
-be specified as an array`, having fired the target three times
-(`(. as $x ?// $y | (.|stderr)[(0,1)]) += "x"` on `[1,2]`). That is jq's VM stack, not a
-rule, and it fires on *any* retry through `_modify`, even one whose writes all succeed.
-succinctly keeps the first failed write's own error instead (`number (1) and string ("x")
-cannot be added`, here after firing the target twice), which keeps jq's exit code. The same
-holds when the chain is longer than the write needs and an earlier retry already raised: on a
-`null` document `(limit(1; foreach (foreach . as [$a] ?// {a:$a} ?// $a (0; .; .)) as $x (.; .; .))) |= 9`
-(and the `+= 1` form) fails in jq with `Paths must be specified as an array`, because the
-third alternative is a second retry through `_modify`, where the two-alternative chain
-raises its own `Cannot index array with string "a"`. succinctly reports the second
-alternative's error in both cases, exit 5 either way
-([#3963](https://github.com/rust-works/succinctly/issues/3963); the nested `foreach` is
-incidental: `(limit(1; . as [$a] ?// {a:$a} ?// $a | .)) |= 9` shows the same message).
-`=` is
-different in jq, and succinctly follows it: `_assign`'s `reduce` carries on with the retried
-alternative, so `(. as $x ?// $y | .[if $x == null then 0 else -5 end]) = 1` on `[1]` is `[1]`
-(it raised `Out of bounds negative array index` here before #2974's review). It carries on
-from `null`, not from what the earlier paths built: a write that raised left the reduce state
-at the `null` its `DUPN` hands back, so the retried alternative's paths are written onto
-`null` (#3859). `(.x | .. | (. as [$q] ?// $z | $z)) = 9` on `{"x":[null],"k":3}` is
-`{"x":[9]}` in jq and here, with `k` gone (it kept `k` before #3859;
-`test_destructuring_alt_bind_writes_and_a_retry_resumes_from_null_3859`). A retry that
-resolves no path at all is a jq quirk too, `null` for `=`, and is not reproduced:
-`(. as $x ?// $y | ("A"|stderr) as $_ | if $x == null then empty else .[-5] end) = 1`
-on `[1]` retains `[1]`, writes `AA`, and exits 0 (pinned jq 1.7.1 writes `AA`,
-returns `null`, and exits 0). Before #3808 the abandoned alternative's
-`Out of bounds negative array index` incorrectly survived that empty retry.
+A `?//` retry that re-enters `_modify` after a write reads `_modify`'s `LOADVN`-emptied `$$$$dot`, and jq 1.7.1 fails with `Paths must be specified as an array`.
+It fires on *any* retry through `_modify`, even one whose writes all succeed: `(. as $x ?// $y | (.|stderr)[(0,1)]) += "x"` on `[1,2]` fires the target three times and raises it.
+It fires too when the chain is longer than the write needs: on a `null` document `(limit(1; foreach (foreach . as [$a] ?// {a:$a} ?// $a (0; .; .)) as $x (.; .; .))) |= 9`, the `+= 1` form and `(limit(1; . as [$a] ?// {a:$a} ?// $a | .)) |= 9` raise it, where the two-alternative chain raises its own `Cannot index array with string "a"` ([#3963](https://github.com/rust-works/succinctly/issues/3963)).
+Since [#5223](https://github.com/rust-works/succinctly/issues/5223) succinctly raises jq's message in every one of these: the path-mode interpreter runs jq's own `_modify` body whenever the update or the paths can retry.
+The shipped evaluator kept the first failed write's own error instead, a divergence recorded here until the switch.
+`=` is different in jq, and succinctly follows it: `_assign`'s `reduce` carries on with the retried alternative, so `(. as $x ?// $y | .[if $x == null then 0 else -5 end]) = 1` on `[1]` is `[1]` (it raised `Out of bounds negative array index` here before #2974's review).
+It carries on from `null`, not from what the earlier paths built: a write that raised left the reduce state at the `null` its `DUPN` hands back, so the retried alternative's paths are written onto `null` (#3859).
+`(.x | .. | (. as [$q] ?// $z | $z)) = 9` on `{"x":[null],"k":3}` is `{"x":[9]}` in jq and here, with `k` gone (`test_destructuring_alt_bind_writes_and_a_retry_resumes_from_null_3859`).
+A retry that resolves no path at all is `null` for `=`, in jq and, since #5223, here: `(. as $x ?// $y | ("A"|stderr) as $_ | if $x == null then empty else .[-5] end) = 1` on `[1]` writes `AA`, prints `null` and exits 0 (the shipped evaluator retained `[1]`).
+Before #3808 the abandoned alternative's `Out of bounds negative array index` incorrectly survived that empty retry.
 
 #3808 also stamps the verdicts at path-mode `INDEX`, terminal path refusal,
 computed-key object patterns, and owned `path()` continuations. An empty or raising
@@ -7335,8 +7338,8 @@ computed-key object patterns, and owned `path()` continuations. An empty or rais
 re-enters the sink; a clean retry no longer returns the previous computed-key or
 continuation error. `test_path_sink_retry_*_3808` checks stdout, attempt traces,
 errors and exit status on document and owned inputs, with `path`/`del`/`=`/`|=`
-read/write probes. Update assignments retain their documented accumulated write
-error; a retry's own raise or halt still takes precedence.
+read/write probes.
+Update assignments raise jq's `Paths must be specified as an array` through the path-mode interpreter (above); a retry's own raise or halt still takes precedence.
 
 That interleave has a price, and it is charged only where it buys something. The
 streaming route keeps two documents where the eager one keeps one, so on a 1.5 MB /

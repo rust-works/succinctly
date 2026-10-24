@@ -196,7 +196,6 @@
 # fold_register_var_from_navigated_binding too and leaving the one refuse-only
 # shape below: jq's own pointer-identity artifact on an empty merge, which has
 # no rule to model rather than a gap this widening could close.
-fold_register_empty_merge_artifact         path-tracking   jq accepts `$x + {}` only because an empty merge returns its left operand's pointer; mirrored `{} + $x` refuses there too, so there is no rule to model — #1466
 
 #
 # Extended by #2416 phase 0 (the oracle-backed net for retiring the eager

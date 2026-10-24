@@ -7481,6 +7481,12 @@ fn eval_using_unscoped<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     value: V,
 ) -> GenericResult<V> {
+    // #5223: as [`eval_with_cursor_unscoped`].
+    if S::TAG == EvalTag::Jq && super::path_mode::takes_program(expr) {
+        if let Ok(owned) = to_owned_with_cursor::<_, S>(&value, None) {
+            return path_mode_collect::<V>(expr, owned);
+        }
+    }
     if takes_input_queue_bridge(expr) {
         let owned = owned_or_err!(to_owned_with_cursor::<_, S>(&value, None));
         // #2642: the cursor is `None` here -- `Owned` demotes any `Snapshot`
@@ -7488,6 +7494,19 @@ fn eval_using_unscoped<S: EvalSemantics, V: DocumentValue>(
         return eval_each_owned_collect::<S, V>(expr, &owned, false, Reentry::REBUILT);
     }
     eval_single::<S, V>(expr, value, false, None)
+}
+
+/// Run `expr` through the path-mode interpreter on `owned` (#5223): every
+/// output collected, and the escape that ended the run kept after them.
+fn path_mode_collect<V: DocumentValue>(expr: &Expr, owned: OwnedValue) -> GenericResult<V> {
+    let mut outputs = Vec::new();
+    match super::path_mode::run_program(expr, owned, &mut |v| {
+        outputs.push(v);
+        true
+    }) {
+        None => owned_vec_to_generic_result(outputs),
+        Some(control) => partial_generic(outputs, control),
+    }
 }
 
 /// Whether `expr` should be handed to `eval.rs`'s demand-driven evaluator
@@ -10578,6 +10597,26 @@ fn eval_with_cursor_unscoped<S: EvalSemantics, C: DocumentCursor>(
     expr: &Expr,
     cursor: C,
 ) -> GenericResult<C::Value> {
+    // #5223: a jq program with a path target the shipped walkers cannot take
+    // natively runs whole through the path-mode interpreter, which carries
+    // jq's register. It needs the whole document: one that cannot be decoded
+    // (a lone surrogate, or nesting past the materializer's 256 levels) stays
+    // on the shipped route, which decodes only what the program reads (#4412)
+    // and walks deeper (#3850).
+    if S::TAG == EvalTag::Jq && super::path_mode::takes_program(expr) {
+        if let Ok(owned) = to_owned_cursor::<S, _>(&cursor) {
+            return path_mode_collect::<C::Value>(expr, owned);
+        }
+    }
+    eval_with_cursor_shipped::<S, C>(expr, cursor)
+}
+
+/// [`eval_with_cursor_unscoped`]'s route for every program the path-mode
+/// interpreter does not take.
+fn eval_with_cursor_shipped<S: EvalSemantics, C: DocumentCursor>(
+    expr: &Expr,
+    cursor: C,
+) -> GenericResult<C::Value> {
     // #3702: the scans for the slots this evaluation reads resume across its
     // fan-outs, over this document.
     let _slots = slot_memo::enter(cursor.document_token());
@@ -10700,6 +10739,24 @@ pub fn eval_each_with_cursor_using<S: EvalSemantics, C: DocumentCursor>(
 
 /// [`eval_each_with_cursor_using`] inside the anchor scope it opens (#3134).
 fn eval_each_with_cursor_unscoped<S: EvalSemantics, C: DocumentCursor>(
+    expr: &Expr,
+    cursor: C,
+    on_value: &mut dyn FnMut(GenericResult<C::Value>) -> bool,
+) -> Option<Control> {
+    // #5223: as [`eval_with_cursor_unscoped`], each output streamed.
+    if S::TAG == EvalTag::Jq && super::path_mode::takes_program(expr) {
+        if let Ok(owned) = to_owned_cursor::<S, _>(&cursor) {
+            return super::path_mode::run_program(expr, owned, &mut |v| {
+                on_value(GenericResult::Owned(v))
+            });
+        }
+    }
+    eval_each_with_cursor_shipped::<S, C>(expr, cursor, on_value)
+}
+
+/// [`eval_each_with_cursor_unscoped`]'s route for every program the path-mode
+/// interpreter does not take.
+fn eval_each_with_cursor_shipped<S: EvalSemantics, C: DocumentCursor>(
     expr: &Expr,
     cursor: C,
     on_value: &mut dyn FnMut(GenericResult<C::Value>) -> bool,

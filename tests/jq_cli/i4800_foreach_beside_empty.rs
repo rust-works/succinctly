@@ -721,6 +721,10 @@ fn test_caught_foreign_marker_destructure_foreach_beside_an_empty_comma_item_480
 /// the register itself is not the bare `FE`, so the UPDATE is refused naming its own state where jq names the
 /// sibling's value. Only the refusal's kind is pinned here, as the sibling tests do. (A `null` literal sibling is
 /// read item by item since #5018: `test_5018_null_sibling_beside_a_bare_caught_bind_foreach_update`.)
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_caught_foreign_marker_destructure_foreach_beside_a_value_item_stays_refused_4800(
 ) -> Result<()> {
@@ -742,9 +746,9 @@ fn test_caught_foreign_marker_destructure_foreach_beside_a_value_item_stays_refu
         (
             r#"{"a":null}"#,
             r"path(. as $x | foreach (.a,.) as $i (.; (foreach (try ($x as {a:$a} | .)) as $y (.; .; .)), (foreach (try ($x as {a:$a} | .)) as $y (.; .; .)); .))",
+            "[\"a\"]\n[\"a\"]\n",
             "",
-            "Invalid path expression with result",
-            5,
+            0,
         ),
     ])
 }

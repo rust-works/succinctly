@@ -163,3 +163,203 @@ fn test_5181_shapes_the_walk_does_not_read_are_unchanged() -> Result<()> {
         ),
     ])
 }
+
+/// #5223 Phase 3: this issue's repro rows, with `path`, `del` and `|=`
+/// wherever the row is a `path(...)`, as jq 1.7.1 answers them (stdout, the
+/// first error message, the exit code). The path-mode interpreter carries
+/// jq's register, so they match by construction, on both routes.
+#[cfg(not(feature = "unshared-containers"))]
+#[test]
+fn test_superseded_rows_match_jq_through_the_path_mode_interpreter_5181() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#,
+            r"path(. as $x | .a | $x.a as $q | $q)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#,
+            r"del(. as $x | .a | $x.a as $q | $q)",
+            "{\"b\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#,
+            r"(. as $x | .a | $x.a as $q | $q) |= 9",
+            "{\"a\":9,\"b\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#,
+            r"path(. as $x | .a | $x | .a as $q | $q)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#,
+            r"del(. as $x | .a | $x | .a as $q | $q)",
+            "{\"b\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#,
+            r"(. as $x | .a | $x | .a as $q | $q) |= 9",
+            "{\"a\":9,\"b\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#,
+            r"path(. as $x | .a | $x.a as {b:$q} ?// $q | $q)",
+            "[\"a\",\"b\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#,
+            r"del(. as $x | .a | $x.a as {b:$q} ?// $q | $q)",
+            "{\"a\":{\"c\":{\"b\":3}},\"b\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#,
+            r"(. as $x | .a | $x.a as {b:$q} ?// $q | $q) |= 9",
+            "{\"a\":{\"b\":9,\"c\":{\"b\":3}},\"b\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#,
+            r"path(. as $x | .a | $x | .a as {b:$q} ?// $q | $q)",
+            "[\"a\",\"b\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#,
+            r"del(. as $x | .a | $x | .a as {b:$q} ?// $q | $q)",
+            "{\"a\":{\"c\":{\"b\":3}},\"b\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#,
+            r"(. as $x | .a | $x | .a as {b:$q} ?// $q | $q) |= 9",
+            "{\"a\":{\"b\":9,\"c\":{\"b\":3}},\"b\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#,
+            r"path(. as $x | .a | $x | first(.a) as {b:$q} | $q)",
+            "[\"a\",\"b\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#,
+            r"del(. as $x | .a | $x | first(.a) as {b:$q} | $q)",
+            "{\"a\":{\"c\":{\"b\":3}},\"b\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#,
+            r"(. as $x | .a | $x | first(.a) as {b:$q} | $q) |= 9",
+            "{\"a\":{\"b\":9,\"c\":{\"b\":3}},\"b\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#,
+            r"path(. as $x | .a | $x | (.a | limit(1; .)) as {b:$q} | $q)",
+            "[\"a\",\"b\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#,
+            r"del(. as $x | .a | $x | (.a | limit(1; .)) as {b:$q} | $q)",
+            "{\"a\":{\"c\":{\"b\":3}},\"b\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#,
+            r"(. as $x | .a | $x | (.a | limit(1; .)) as {b:$q} | $q) |= 9",
+            "{\"a\":{\"b\":9,\"c\":{\"b\":3}},\"b\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#,
+            r"path(. as $x | .a | foreach 1 as $i ($x; .a as {b:$q} | $q))",
+            "[\"a\",\"b\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#,
+            r"del(. as $x | .a | foreach 1 as $i ($x; .a as {b:$q} | $q))",
+            "{\"a\":{\"c\":{\"b\":3}},\"b\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#,
+            r"(. as $x | .a | foreach 1 as $i ($x; .a as {b:$q} | $q)) |= 9",
+            "{\"a\":{\"b\":9,\"c\":{\"b\":3}},\"b\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#,
+            r"path(. as $x | .a | first($x.a) as {b:$q} | $q)",
+            "[\"a\",\"b\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#,
+            r"del(. as $x | .a | first($x.a) as {b:$q} | $q)",
+            "{\"a\":{\"c\":{\"b\":3}},\"b\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#,
+            r"(. as $x | .a | first($x.a) as {b:$q} | $q) |= 9",
+            "{\"a\":{\"b\":9,\"c\":{\"b\":3}},\"b\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#,
+            r"path(. as $x | .a | $x | .b as {b:$q} ?// $q | $q)",
+            "",
+            "Invalid path expression with result 2",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#,
+            r"del(. as $x | .a | $x | .b as {b:$q} ?// $q | $q)",
+            "",
+            "Invalid path expression with result 2",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#,
+            r"(. as $x | .a | $x | .b as {b:$q} ?// $q | $q) |= 9",
+            "",
+            "Invalid path expression with result 2",
+            5,
+        ),
+    ])
+}

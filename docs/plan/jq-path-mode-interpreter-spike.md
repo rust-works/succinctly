@@ -1,10 +1,12 @@
 # Phase 0 of #5223: a path-mode interpreter that carries jq's register
 
-**Status: spike landed, verdict GO.** This note is the go/no-go report the
-[#5223](https://github.com/rust-works/succinctly/issues/5223) design asks for before any
-replacement work starts. The design itself is on the issue. This report covers what Phase 0
-built, how it was measured, and what the measurement says. Phases 1 to 3 (identity
-preconditions, shadow mode, switch) are still open on the issue.
+**Status: implemented.** This note is the go/no-go report the
+[#5223](https://github.com/rust-works/succinctly/issues/5223) design asked for before any
+replacement work started; its verdict was GO. Phases 1 to 3 (identity preconditions, shadow
+mode, switch) have since landed: the spike is now `src/jq/path_mode.rs`, and a jq-mode program
+with a dynamic path target runs on it ([ADR-0026](../adrs/adr-0026.md)). The sections below
+describe Phase 0 as it was built and measured; later changes (native C builtins, writes, the
+routing rule) are on the issue and in the ADR.
 
 ## What was built
 

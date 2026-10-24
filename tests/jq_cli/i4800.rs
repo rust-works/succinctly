@@ -12,6 +12,10 @@ use anyhow::Result;
 /// a node of its own (`.a`, `7`), a state-dependent count (`limit(.; .)`) and a raising one (`1/0`), where jq
 /// answers the outputs it reached before it raised and only the refusal's kind is pinned here. Every other
 /// row captured from jq 1.7.1.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_single_pattern_bind_beside_limit_of_dot_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -340,36 +344,36 @@ fn test_foreach_update_single_pattern_bind_beside_limit_of_dot_4800() -> Result<
         (
             r#"{"a":null}"#,
             r"path(foreach (1,2) as $i (.; (. as {a:$q} | .), limit(0.5; .a); null))",
-            "",
-            "Invalid path expression with result",
+            "[\"a\"]\n[\"a\"]\n",
+            r#"Invalid path expression near attempt to access element "a" of null"#,
             5,
         ),
         (
             r#"{"a":null}"#,
             r"path(foreach (1,2) as $i (.; (. as {a:$q} | .), limit(1; 7); null))",
-            "",
-            "Invalid path expression with result",
+            "[\"a\"]\n",
+            "Invalid path expression with result null",
             5,
         ),
         (
             r#"{"a":null}"#,
             r"path(foreach (1,2) as $i (.; (. as {a:$q} | .), limit(.; .); null))",
-            "",
-            "Invalid path expression with result",
+            "[\"a\"]\n",
+            r#"object ({"a":null}) and number (1) cannot be subtracted"#,
             5,
         ),
         (
             r#"{"a":null}"#,
             r"path(foreach (1,2) as $i (.; (. as {a:$q} | .), limit(1/0; .); null))",
-            "",
-            "Invalid path expression with result",
+            "[\"a\"]\n",
+            "number (1) and number (0) cannot be divided because the divisor is zero",
             5,
         ),
         (
             r#"{"a":null}"#,
             r"path(foreach (1,2) as $i (.; (. as {a:$q} | .), limit(1; .a); null))",
-            "",
-            "Invalid path expression with result",
+            "[\"a\"]\n[\"a\"]\n",
+            r#"Invalid path expression near attempt to access element "a" of null"#,
             5,
         ),
     ])
@@ -600,6 +604,163 @@ fn test_foreach_with_an_emitting_nothing_extract_ignores_an_inert_update_4800() 
             r"path(. as $x | foreach . as $i (.; foreach (try ($x as {a:$a} | .)) as $y (.; .; .); .))",
             "",
             "Invalid path expression with result",
+            5,
+        ),
+    ])
+}
+
+/// #5223 Phase 3: this issue's repro rows, with `path`, `del` and `|=`
+/// wherever the row is a `path(...)`, as jq 1.7.1 answers them (stdout, the
+/// first error message, the exit code). The path-mode interpreter carries
+/// jq's register, so they match by construction, on both routes.
+#[test]
+fn test_superseded_rows_match_jq_through_the_path_mode_interpreter_4800() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"a":null}"#,
+            r"path(. as $x | foreach (.a,.) as $i (.; foreach (try ($x as {a:$a} | .)) as $y (.; .; .); .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"del(. as $x | foreach (.a,.) as $i (.; foreach (try ($x as {a:$a} | .)) as $y (.; .; .); .))",
+            "{}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"(. as $x | foreach (.a,.) as $i (.; foreach (try ($x as {a:$a} | .)) as $y (.; .; .); .)) |= 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"path(. as $x | foreach (.a,.) as $i (.; not | foreach (try ($x as {a:$a} | .)) as $y (.; .; .); .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"del(. as $x | foreach (.a,.) as $i (.; not | foreach (try ($x as {a:$a} | .)) as $y (.; .; .); .))",
+            "{}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"(. as $x | foreach (.a,.) as $i (.; not | foreach (try ($x as {a:$a} | .)) as $y (.; .; .); .)) |= 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"path(. as $x | foreach (.a,.) as $i (.; try (foreach (try ($x as {a:$a} | .)) as $y (.; .; .)); .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"del(. as $x | foreach (.a,.) as $i (.; try (foreach (try ($x as {a:$a} | .)) as $y (.; .; .)); .))",
+            "{}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"(. as $x | foreach (.a,.) as $i (.; try (foreach (try ($x as {a:$a} | .)) as $y (.; .; .)); .)) |= 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"path(. as $x | foreach . as $i (.; 1 | foreach ($x as {a:$a}|.) as $y (.; .; .); $i))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"del(. as $x | foreach . as $i (.; 1 | foreach ($x as {a:$a}|.) as $y (.; .; .); $i))",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"(. as $x | foreach . as $i (.; 1 | foreach ($x as {a:$a}|.) as $y (.; .; .); $i)) |= 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(foreach (1) as $i (.; . as {a:$q} | .; $i))",
+            "",
+            "Invalid path expression with result 1",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(foreach (1) as $i (.; . as {a:$q} | .; $i))",
+            "",
+            "Invalid path expression with result 1",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"(foreach (1) as $i (.; . as {a:$q} | .; $i)) |= 9",
+            "",
+            "Invalid path expression with result 1",
+            5,
+        ),
+        (
+            r"null",
+            r"path(. as $x | foreach . as $i (.; 1 | ($x as {a:$q} | .); $i))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"del(. as $x | foreach . as $i (.; 1 | ($x as {a:$q} | .); $i))",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"(. as $x | foreach . as $i (.; 1 | ($x as {a:$q} | .); $i)) |= 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"path(. as $x | foreach (.a,.) as $i (.; (1 | foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) // 5; $i))",
+            "[\"a\"]\n",
+            "Invalid path expression with result {\"a\":null}",
+            5,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"del(. as $x | foreach (.a,.) as $i (.; (1 | foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) // 5; $i))",
+            "",
+            "Invalid path expression with result {\"a\":null}",
+            5,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"(. as $x | foreach (.a,.) as $i (.; (1 | foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) // 5; $i)) |= 9",
+            "",
+            "Invalid path expression with result {\"a\":null}",
             5,
         ),
     ])

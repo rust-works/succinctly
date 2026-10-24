@@ -279,6 +279,7 @@ fn test_5103_partial_empty_and_string_slices_stay_other_nodes() -> Result<()> {
 /// elements where jq raises, and `main` deleted through `.a[65536:] as $x | .a[65536:]`. One evaluation bound as `. as
 /// $x` is still the copy the register stands on. Captured from `/usr/bin/jq` 1.7.1 on a 70,003-element array, on the
 /// `-n` route (the document built in the filter) and on stdin.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_5103_copied_slice_past_offset_65535_is_a_new_array_per_evaluation() -> Result<()> {
     // (filter, stdout, first stderr line, exit code)
@@ -319,13 +320,12 @@ fn test_5103_copied_slice_past_offset_65535_is_a_new_array_per_evaluation() -> R
             "",
             0,
         ),
-        // jq answers (a view at offset 65,535); since #5118 a slice resolved against a container this long raises the gate
-        // that reads a slice starting past 0 as possibly copied, so this is refused loudly.
+        // jq answers (a view at offset 65,535): #5118's gate refused it, the path-mode interpreter (#5223) shares the view.
         (
             r"path(.a[65535:] as $x | .a[65535:] | $x)",
+            "[\"a\",{\"start\":65535,\"end\":null}]\n",
             "",
-            "Invalid path expression with result [65535,65536",
-            5,
+            0,
         ),
     ];
     let document = big_document_5103();

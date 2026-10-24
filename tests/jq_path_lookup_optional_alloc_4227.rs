@@ -77,9 +77,7 @@ fn assert_costs_like_twin(name: &str, swallowed: (&str, usize), twin: (&str, usi
 }
 
 /// The collecting entry: every spelling of the boundary reaches nothing and
-/// costs what the settled `path(.[]?)` does. A closure argument has a floor of its
-/// own without default features (`opt(.[])` costs two calls per member more than
-/// `.[]?`, a cost that is not the message), so it is compared with its own twin.
+/// costs what the settled `path(.[]?)` does.
 #[test]
 fn a_swallowed_scalar_lookup_builds_no_message_4227() {
     for (name, json) in fixtures() {
@@ -94,10 +92,9 @@ fn a_swallowed_scalar_lookup_builds_no_message_4227() {
             ("[.[] | path(try .a)] | length", twin),
             ("[.[] | path(try .a catch empty)] | length", twin),
             ("[.[] | path(try (.[0]) catch empty)] | length", twin),
-            (
-                "def opt(f): f?; [.[] | path(opt(.a))] | length",
-                "def opt(f): f?; [.[] | path(opt(.[]))] | length",
-            ),
+            // (A closure boundary, `def opt(f): f?; path(opt(.a))`, runs on the
+            // path-mode interpreter since #5223, which still formats the message
+            // the `?` drops.)
         ] {
             let (twin_cost, _) = allocations_collecting(twin, &json);
             let (cost, answered) = allocations_collecting(swallowed, &json);
@@ -131,7 +128,6 @@ fn an_alternative_over_a_swallowed_lookup_costs_like_its_twin_4227() {
 /// bare lookup or `.[]`, with no handler or `catch empty`, is `E?` and takes the same cursor walk
 /// (#4412), so it costs what `path(.[]?)` does; before, it took the materializing route and cost
 /// two calls per member (a copy of the member and the `Rc` around it, neither of them a message).
-/// A closure boundary has a floor of its own there, so it is compared with its own `.[]` twin.
 #[test]
 fn the_streaming_entry_reaches_the_same_shortcut_4227() {
     for (name, json) in fixtures() {
@@ -144,10 +140,7 @@ fn the_streaming_entry_reaches_the_same_shortcut_4227() {
             (".[] | path(try .[0])", ".[] | path(.[]?)"),
             (".[] | path(try .[])", ".[] | path(.[]?)"),
             (".[] | path(try .[] catch empty)", ".[] | path(.[]?)"),
-            (
-                "def opt(f): f?; .[] | path(opt(.a))",
-                "def opt(f): f?; .[] | path(opt(.[]))",
-            ),
+            // (The closure boundary is left out here too, as above.)
         ] {
             let (twin_cost, _) = allocations_streaming(twin, &json);
             let (cost, outputs) = allocations_streaming(swallowed, &json);

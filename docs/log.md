@@ -2,6 +2,21 @@
 
 Tracks updates to the knowledge wiki pages in `docs/`.
 
+## 2026-10-25 — Dynamic path targets run on the path-mode interpreter (issue #5223)
+
+**Sources ingested:**
+- `takes_program`, `is_static_target`, `run_program` and `Interp` in `src/jq/path_mode.rs`; the routing in
+  `eval_with_cursor_unscoped`, `eval_each_with_cursor_unscoped` and `eval_using_unscoped`
+  (`src/jq/eval_generic.rs`) and `eval_owned_with_file_index` (`src/jq/eval.rs`)
+- `src/jq/c_builtin_identity.rs`; `OwnedValue::promote_identities` and `jv_identical` in `src/jq/value.rs`
+
+**Pages updated:**
+- [reference/jq-evaluator.md](reference/jq-evaluator.md) — a "Path mode: the carried register" section
+- [adrs/adr-0026.md](adrs/adr-0026.md) — new; supersedes the register model of
+  [plan/jq-path-register-producer-contract.md](plan/jq-path-register-producer-contract.md), now Archived
+- [compliance/jq/limitations.md](compliance/jq/limitations.md) — "Dynamic path targets run on the path-mode
+  interpreter", and the #3963/#3808 `_modify` retry entry rewritten to jq's behaviour
+
 ## 2026-10-21 — The balanced-parentheses section of hierarchical-structures.md described an index `bp.rs` does not have (issue #5036)
 
 **Sources ingested:**

@@ -2,7 +2,9 @@
 
 use anyhow::Result;
 
-use crate::{assert_path_rows_both_routes_3749, run_jq_full};
+#[cfg(not(feature = "unshared-containers"))]
+use crate::assert_path_rows_3289;
+use crate::assert_path_rows_both_routes_3749;
 
 // `. as $x | foreach . as $i (.; 1 | foreach ($x as {a:$a} | .) as $y (.; .; .); $i)` on `null`: the nested `foreach`'s
 // source steps jq's register from `$x` (the register) to `$x.a`, the `1` stage moves nothing, and EXTRACT's `$i` is judged
@@ -779,61 +781,24 @@ fn test_5110_literal_stage_ahead_of_a_bare_bind_foreach_behind_an_alternative_up
 /// null`, uncatchable; jq answers each): an alternate that is not a literal, an uncaught source (whose raise `//`
 /// swallows), and a wrapper around the `//` (`try`, `?`, `first`, a comma sibling, another `//`, a pipe tail).
 /// Known divergences, listed in `docs/compliance/jq/limitations.md`: a change that answers one of them rewrites its row.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5110_alternative_update_shapes_not_read_keep_their_refusal() -> Result<()> {
-    for (input, filter) in [
-        (
-            r"null",
-            r"[path(. as $x | foreach . as $i (.; (1 | foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) // empty; $i))?]",
-        ),
-        (
-            r"null",
-            r"[path(. as $x | foreach . as $i (.; (1 | foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) // .a?; $i))?]",
-        ),
-        (
-            r"null",
-            r"[path(. as $x | foreach . as $i (.; try ((1 | foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) // 5); $i))?]",
-        ),
-        (
-            r"null",
-            r"[path(. as $x | foreach . as $i (.; ((1 | foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) // 5)?; $i))?]",
-        ),
-        (
-            r"null",
-            r"[path(. as $x | foreach . as $i (.; ((1 | foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) // 5), 7; $i))?]",
-        ),
-        (
-            r"null",
-            r"[path(. as $x | foreach . as $i (.; first((1 | foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) // 5); $i))?]",
-        ),
-        (
-            r"null",
-            r"[path(. as $x | foreach . as $i (.; ((1 | foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) // 5) // 8; $i))?]",
-        ),
-        (
-            r"null",
-            r"[path(. as $x | foreach . as $i (.; (((1 | foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) // 5)) | .; $i))?]",
-        ),
-        (
-            r"null",
-            r"[path(. as $x | foreach . as $i (.; (1 | foreach ($x as {a:$a} | .) as $y (.; .; .)) // 5; $i))?]",
-        ),
-        (
-            r"null",
-            r"del(. as $x | foreach . as $i (.; (1 | foreach ($x as {a:$a} | .) as $y (.; .; .)) // 5; $i))",
-        ),
-    ] {
-        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
-        assert_eq!(
-            (stdout.as_str(), code),
-            ("", 5),
-            "`{filter}` on {input}: stderr {stderr:?}"
-        );
-        assert!(
-            stderr.contains("Invalid path expression with result null"),
-            "`{filter}` on {input}: {stderr:?}"
-        );
-    }
+    assert_path_rows_3289(&[
+        ("null", "[path(. as $x | foreach . as $i (.; (1 | foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) // empty; $i))?]", "[[\"a\"]]\n", "", 0),
+        ("null", "[path(. as $x | foreach . as $i (.; (1 | foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) // .a?; $i))?]", "[[\"a\"]]\n", "", 0),
+        ("null", "[path(. as $x | foreach . as $i (.; try ((1 | foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) // 5); $i))?]", "[[\"a\"]]\n", "", 0),
+        ("null", "[path(. as $x | foreach . as $i (.; ((1 | foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) // 5)?; $i))?]", "[[\"a\"]]\n", "", 0),
+        ("null", "[path(. as $x | foreach . as $i (.; ((1 | foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) // 5), 7; $i))?]", "[[\"a\"],[]]\n", "", 0),
+        ("null", "[path(. as $x | foreach . as $i (.; first((1 | foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) // 5); $i))?]", "[[\"a\"]]\n", "", 0),
+        ("null", "[path(. as $x | foreach . as $i (.; ((1 | foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) // 5) // 8; $i))?]", "[[\"a\"]]\n", "", 0),
+        ("null", "[path(. as $x | foreach . as $i (.; (((1 | foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) // 5)) | .; $i))?]", "[[\"a\"]]\n", "", 0),
+        ("null", "[path(. as $x | foreach . as $i (.; (1 | foreach ($x as {a:$a} | .) as $y (.; .; .)) // 5; $i))?]", "[[\"a\"]]\n", "", 0),
+        ("null", "del(. as $x | foreach . as $i (.; (1 | foreach ($x as {a:$a} | .) as $y (.; .; .)) // 5; $i))", "null\n", "", 0),
+    ])?;
     Ok(())
 }

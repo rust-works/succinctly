@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-use crate::{assert_path_rows_both_routes_3749, run_jq_full};
+use crate::assert_path_rows_both_routes_3749;
 
 // `(B, 7) // 5`: `//` keeps the truthy outputs of the comma, so the bind's `.` is the UPDATE's unchecked output as it is
 // alone, and a sibling that cannot move the register runs from the register the comma was entered with, so the chain and
@@ -92,25 +92,42 @@ fn test_5170_rows_that_keep_their_reading() -> Result<()> {
     ])
 }
 
-/// #5170: a bind whose body emits more than once (`(.,.)`, `range(2)`) beside a literal sibling stays refused, not read.
-/// jq answers each with more paths; the resolver delivers a generator body's outputs fewer times than jq when the state is
-/// not the register (#5193; a comma of dots was #5185, fixed by #5188 and kept out here unmeasured), so reading the
-/// sibling here would turn a refusal into a truncated answer. Pinned as refusals, whose message is the old one.
+/// #5170: a bind whose body emits more than once (`(.,.)`, `range(2)`) beside a literal sibling was refused, not read: the
+/// resolver delivered a generator body's outputs fewer times than jq when the state is not the register (#5193). The
+/// path-mode interpreter (#5223) answers each with jq's paths. Rows captured from jq 1.7.1, both routes.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
-fn test_5170_a_fanning_out_bind_body_beside_a_sibling_stays_refused() -> Result<()> {
-    for filter in [
-        r"null | path(. as $x | foreach (.a,.a) as $i (.a; (($x as {a:$a} | (.,.)), 7) // 5; $i))",
-        r"null | path(. as $x | foreach (.a,.) as $i (.; (($x as {a:$a} | range(2)), 7) // 5; $i))",
-        r"null | path(. as $x | foreach (.a,.) as $i (.; (($x as {a:$a} | (range(2) | .)), 7) // 5; $i))",
-        r"null | (. as $x | foreach (.a,.) as $i (.; (($x as {a:$a} | range(2)), 7) // 5; $i)) |= 9",
-    ] {
-        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
-        assert_eq!(code, 5, "{filter}: stdout {stdout:?} stderr {stderr:?}");
-        assert!(
-            stderr.contains("Invalid path expression near attempt to access element \"a\" of null"),
-            "{filter}: stderr {stderr:?}"
-        );
-    }
+fn test_5170_a_fanning_out_bind_body_beside_a_sibling_answers_as_jq_does() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            "null",
+            r"path(. as $x | foreach (.a,.a) as $i (.a; (($x as {a:$a} | (.,.)), 7) // 5; $i))",
+            "[\"a\",\"a\"]\n[\"a\",\"a\",\"a\"]\n[\"a\",\"a\",\"a\"]\n[\"a\",\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            r"path(. as $x | foreach (.a,.) as $i (.; (($x as {a:$a} | range(2)), 7) // 5; $i))",
+            "[\"a\",\"a\"]\n[\"a\",\"a\"]\n[\"a\"]\n[\"a\"]\n[\"a\"]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            r"path(. as $x | foreach (.a,.) as $i (.; (($x as {a:$a} | (range(2) | .)), 7) // 5; $i))",
+            "[\"a\",\"a\"]\n[\"a\",\"a\"]\n[\"a\"]\n[\"a\"]\n[\"a\"]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            r"(. as $x | foreach (.a,.) as $i (.; (($x as {a:$a} | range(2)), 7) // 5; $i)) |= 9",
+            "9\n",
+            "",
+            0,
+        ),
+    ])?;
     Ok(())
 }

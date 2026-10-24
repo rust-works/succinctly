@@ -3959,12 +3959,13 @@ fn test_cannot_index_wording_is_spelling_independent() -> Result<()> {
 /// and, in an assignment, overwrites — element zero. jq yields null on the read
 /// and errors on the write; both halves are checked here because only the read
 /// half is observable in the golden corpus (`index_nan_key`).
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_nan_key_reads_null_and_rejects_writes() -> Result<()> {
     let (output, _) = run_jq_stdin("[.[nan]]", "[10,20,30]", &["-c"])?;
     assert_eq!(output.trim(), "[null]");
 
-    for filter in [".[nan] = 5", ".[nan] |= 5", "path(.[nan])", "del(.[nan])"] {
+    for filter in [".[nan] = 5", ".[nan] |= 5"] {
         let stderr = jq_stderr(filter, "[10,20,30]", &[])?;
         assert!(
             stderr.contains("Cannot set array element at NaN index"),
@@ -3977,6 +3978,13 @@ fn test_nan_key_reads_null_and_rejects_writes() -> Result<()> {
             "`{filter}` must not emit a mutated document"
         );
     }
+    // The path itself is jq's `[null]` (#5223: the path-mode interpreter answers
+    // where the shipped resolver refused). jq 1.7.1 loops forever on `del(.[nan])`;
+    // here the NaN path names no element, so nothing is deleted.
+    let (output, code) = run_jq_stdin("path(.[nan])", "[10,20,30]", &["-c"])?;
+    assert_eq!((output.trim(), code), ("[null]", 0));
+    let (output, code) = run_jq_stdin("del(.[nan])", "[10,20,30]", &["-c"])?;
+    assert_eq!((output.trim(), code), ("[10,20,30]", 0));
     Ok(())
 }
 
@@ -18608,15 +18616,21 @@ fn test_resolve_recurse_cond_still_gates_null_child_emission() -> Result<()> {
 /// either (confirmed live: `null.a?` is `null` again, `true` keeps accepting
 /// it, `path()` prints ever-longer paths until killed -- real jq's actual
 /// unbounded semantics here, not a succinctly gap). This pins succinctly's
-/// own documented, deliberate divergence instead: `cond` present must
-/// terminate in exactly the same 2 outputs the no-`cond` case does.
+/// own documented divergence instead. Since #5223 the path-mode interpreter
+/// walks it as jq does, so the walk is bounded by the `recurse` cap (#3716),
+/// not by pruning the null node (#856): 10,000 paths, then the cap's error.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_resolve_recurse_cond_still_bounds_null_current_growth_854() -> Result<()> {
     let (stdout, stderr, code) =
         run_jq_full(&["-c", r"path(recurse(.a?; true))"], Some(r#"{"a":null}"#))?;
-    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "[]\n[\"a\"]\n");
-    assert_eq!(stderr, "");
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    assert_eq!(stdout.lines().count(), 10_000);
+    assert!(stdout.starts_with("[]\n[\"a\"]\n[\"a\",\"a\"]\n"));
+    assert!(
+        stderr.contains("recurse: maximum nodes exceeded"),
+        "{stderr:?}"
+    );
     Ok(())
 }
 
@@ -32604,30 +32618,26 @@ fn test_settled_operand_keeps_jq_order_3296() -> Result<()> {
 }
 
 /// #3262 / ADR-0025: the path routes take the native-stack floor as well --
-/// a lazy-link chain read inside `path()` (the path resolver's `DefCall` and
-/// `Shared` arms), inside `|=`, and with a path-context builtin (`key`) at the
-/// base case (the generic evaluator's path-context arms) refuses where it
-/// aborted the process, and answers shallow.
+/// a lazy-link chain with a path-context builtin (`key`) at the base case (the
+/// generic evaluator's path-context arms) refuses where it aborted the process,
+/// and answers shallow. The same chain read inside `path()` or `|=` runs through
+/// the path-mode interpreter since #5223 and answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_argument_chain_refuses_on_the_path_routes_3262() -> Result<()> {
     let def = "def f(n): if n == 0 then .a else f(n - 1 | select(true)) end;";
-    for (filter, input) in [
-        (format!("{def} [path(f(3000))]"), r#"{"a":1}"#),
-        (format!("{def} f(3000) |= 2"), r#"{"a":1}"#),
-        (
-            "def f(n): if n == 0 then (.a | key) else f(n - 1 | select(true)) end; f(3000)"
-                .to_string(),
-            r#"{"a":{"b":1}}"#,
-        ),
-    ] {
-        let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some(input))?;
-        assert_eq!(code, 5, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
-        assert!(
-            stderr.contains("exceeded maximum recursion depth"),
-            "{filter}: stderr: {stderr:?}"
-        );
-    }
+    let filter = "def f(n): if n == 0 then (.a | key) else f(n - 1 | select(true)) end; f(3000)";
+    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1}}"#))?;
+    assert_eq!(code, 5, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("exceeded maximum recursion depth"),
+        "{filter}: stderr: {stderr:?}"
+    );
+    // The path-mode interpreter (#5223) runs `path` and `|=` on the CLI's
+    // evaluation thread and answers the 3000-deep chain, as jq 1.7.1 does.
     for (filter, input, expected) in [
+        (format!("{def} [path(f(3000))]"), r#"{"a":1}"#, r#"[["a"]]"#),
+        (format!("{def} f(3000) |= 2"), r#"{"a":1}"#, r#"{"a":2}"#),
         (format!("{def} [path(f(50))]"), r#"{"a":1}"#, r#"[["a"]]"#),
         (format!("{def} f(50) |= 2"), r#"{"a":1}"#, r#"{"a":2}"#),
         (
@@ -44102,12 +44112,14 @@ fn test_generator_argument_backtracking_still_evaluates_the_tail_1279() -> Resul
     Ok(())
 }
 
-/// The leaks themselves, asserting today's WRONG behaviour so the eventual
-/// fix's diff shows exactly which ones closed.
+/// The leaks themselves, asserting the behaviour so a fix's diff shows exactly
+/// which ones closed.
 ///
-/// Each row records what real jq does in a comment; the assertion is
-/// succinctly's current output. When a stage of the #820 design lands, the
-/// corresponding rows flip to jq's column and move into the test above.
+/// The last pair, `binary_fanout_each`'s left/right `pending` asymmetry, was
+/// spelled in `path(...)`; since #5223 those programs run through the
+/// path-mode interpreter, which raises jq's path error in both spellings, so
+/// both rows now hold jq's answer and the asymmetry is no longer pinned here.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
     let cases: &[SideEffectCase] = &[
@@ -44125,7 +44137,7 @@ fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
         // pair now. Both captured live against jq 1.7.1, which raises the
         // path error with no stderr in either spelling.
         //
-        // Inner (left) operand keeps its `pending`: the halt wins outright.
+        // Inner (left) operand: the shipped evaluator let the halt win (exit 3).
         (
             &[
                 "-cn",
@@ -44133,13 +44145,11 @@ fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
             ],
             None,
             "",
-            "x",
-            3,
+            "jq: error (at <unknown>): Invalid path expression with result false",
+            5,
         ),
-        // Outer (right) operand drops its `pending`: the halt's stderr write
-        // has already happened, but the halt itself is discarded and the
-        // path error surfaces instead -- so succinctly writes a stray `x`
-        // that jq never does.
+        // Outer (right) operand: the shipped evaluator wrote a stray `x` before
+        // the path error.
         (
             &[
                 "-cn",
@@ -44147,7 +44157,7 @@ fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
             ],
             None,
             "",
-            "xjq: error (at <unknown>): Invalid path expression with result false",
+            "jq: error (at <unknown>): Invalid path expression with result false",
             5,
         ),
     ];
@@ -57870,6 +57880,7 @@ fn test_recurse_cap_stopping_consumers_and_boundary_3716() -> Result<()> {
 /// #3716, the less common routes: past the native stack budget both walkers
 /// fall back to an explicit stack that checks the cap itself, a `?//` inside `f`
 /// does not retry past the cap, and the shape the cap exists for.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_recurse_cap_queued_walk_retry_and_null_loop_3716() -> Result<()> {
     let cap_error = "recurse: maximum nodes exceeded";
@@ -57928,11 +57939,13 @@ fn test_recurse_cap_queued_walk_retry_and_null_loop_3716() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-nc", "null | [recurse(.a)] | length"], None)?;
     assert_eq!((stdout.as_str(), code), ("", 5), "{stderr:?}");
     assert!(stderr.contains(cap_error), "{stderr:?}");
-    // The path walker prunes a null node's children (#856), so the same walk in
-    // path position ends on its own and never meets the cap.
+    // The same walk in path position meets the cap too (#5223): the path-mode
+    // interpreter walks `.a` of `null` as jq does, where the shipped path walker
+    // pruned a null node's children (#856) and answered 1.
     let (stdout, stderr, code) =
         run_jq_full(&["-nc", "null | [path(recurse(.a))] | length"], None)?;
-    assert_eq!((stdout.as_str(), code), ("1\n", 0), "{stderr:?}");
+    assert_eq!((stdout.as_str(), code), ("", 5), "{stderr:?}");
+    assert!(stderr.contains(cap_error), "{stderr:?}");
     Ok(())
 }
 
@@ -66400,25 +66413,21 @@ fn test_literal_null_destructure_in_a_fold_source_moves_a_null_register_below_th
     Ok(())
 }
 
-/// #4707: the one shape the fix above trades a wrong answer for a refusal on. A comma that follows the literal
-/// `null` destructure in the innermost of three folds, on a `null` document: jq prints `["a"]`, `[]`, `["a"]`,
-/// `[]` (its register is restored at the comma's fork point, so the `1` is no path output), the by-value drive
-/// printed `["a"]`, `[]`, `[]`, `[]`, and the resolver, which now places the destructure, raises `Invalid path
-/// expression with result 1` on the second pass of the innermost fold, where its accumulator is untracked. Pinned
-/// as the refusal it is, so that a change to it is seen; the answer is jq's, and it belongs to the follow-up that
-/// teaches the resolver not to check an emission of that fold.
+/// #4707: a comma that follows the literal `null` destructure in the innermost of three folds, on a
+/// `null` document: jq restores its register at the comma's fork point, so the `1` is no path output.
+/// The shipped resolver raised `Invalid path expression with result 1` on the second pass of the
+/// innermost fold; the path-mode interpreter (#5223) prints jq 1.7.1's paths.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
-fn test_comma_after_a_null_destructure_in_the_innermost_of_three_folds_stays_refused_4707(
+fn test_comma_after_a_null_destructure_in_the_innermost_of_three_folds_answers_as_jq_does_4707(
 ) -> Result<()> {
-    let filter = r"path(foreach (1,2) as $i (.; foreach (foreach (1,2) as $k (.; foreach ((null as {a:$a} | .), 1) as $y (.; $y; .); .)) as $z (.; .; .); .))";
-    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("null"))?;
-    assert_eq!(code, 5, "stderr: {stderr:?}");
-    assert!(
-        stderr.contains("Invalid path expression with result 1"),
-        "stderr: {stderr:?}"
-    );
-    assert_eq!(stdout, "[\"a\"]\n[]\n");
-    Ok(())
+    assert_path_rows_3289(&[(
+        "null",
+        r"path(foreach (1,2) as $i (.; foreach (foreach (1,2) as $k (.; foreach ((null as {a:$a} | .), 1) as $y (.; $y; .); .)) as $z (.; .; .); .))",
+        "[\"a\"]\n[]\n[\"a\"]\n[]\n[\"a\"]\n[]\n[\"a\"]\n[]\n",
+        "",
+        0,
+    )])
 }
 
 /// #4637: a `foreach` (or `reduce`) source that begins with a destructure of `.`, in the body of a `reduce` whose
@@ -67393,6 +67402,10 @@ fn test_bound_result_under_swallowing_construct_is_judged_per_value_4444() -> Re
 /// grammar: the refusal it would swallow turned `(.o|(walk(.)?) as $y|$y) = 1` into a
 /// silent no-op and `(walk(.)?, .)` into a bind of the register, where jq raises.
 /// Every row is a live jq 1.7.1 capture.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_walk_identity_of_a_container_is_not_swallowed_4444() -> Result<()> {
     const DOC: &str = r#"{"o":{"x":1},"a":[1],"s":"s"}"#;
@@ -67405,10 +67418,10 @@ fn test_walk_identity_of_a_container_is_not_swallowed_4444() -> Result<()> {
         (r"path(.o|(walk(.)?, .) as $y|$y)", "", 5),
         (r"path(.o|(walk(.) // 3) as $y|$y)", "", 5),
         (r"path(.a|(walk(.)?) as $y|$y)", "", 5),
-        // A bare `walk(.)` of a scalar is the register (#4456); under a construct it stays
-        // off the grammar with the containers, a refusal where jq answers.
+        // A bare `walk(.)` of a scalar is the register (#4456), and so it is under a construct
+        // (the shipped resolver refused this one; the path-mode interpreter answers, #5223).
         (r"path(.s|walk(.) as $y|$y)", "[\"s\"]\n", 0),
-        (r"path(.s|(walk(.)?) as $y|$y)", "", 5),
+        (r"path(.s|(walk(.)?) as $y|$y)", "[\"s\"]\n", 0),
     ];
     for (filter, want_stdout, want_code) in ROWS {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(DOC))?;
@@ -70875,36 +70888,30 @@ fn test_argument_navigation_builtins_forward_a_computed_result_2746() -> Result<
     Ok(())
 }
 
-/// #2746: `isempty`/`INDEX(gen;f)` are "opaque" stages for
-/// register-preservation purposes, the same pre-existing rule
-/// `docs/compliance/jq/limitations.md` already documents for
-/// `reduce`/`foreach`/`first(...)`: a `$x` bound before the stage is still
-/// itself, but this resolver does not carry the *live register* through the
-/// stage, so `path(. as $x | INDEX(.[]; .) | $x)` raises "Invalid path
-/// expression with result [1,2,3]" rather than naming a path. `INDEX`
-/// (`reduce`-based in jq's own definition) diverges from real jq here exactly
-/// as the pre-existing `add`/bare `reduce` already do (jq answers `[]` -- the
-/// register genuinely survives in the C implementation) -- an
-/// already-documented, unrelated divergence, not something #2746 introduces
-/// or is scoped to fix. `isempty` is not `reduce`-based, and its own answer
-/// happens to already match jq (both raise). `last(f)` was in this list until
-/// #3643 promoted it to jq's answer (`[]`,
-/// `test_path_register_last_f_does_not_move_it_3643`). All confirmed live
-/// against jq 1.7.1.
+/// #2746: `isempty` drops jq's register (`path(. as $x | isempty(.[]) | $x)`
+/// raises "Invalid path expression with result [1,2,3]" in jq 1.7.1), while
+/// `INDEX(gen; f)` is `reduce`-based in jq's own definition and keeps it (`[]`).
+/// The shipped resolver did not carry the live register through `INDEX` and
+/// raised for both; the path-mode interpreter (#5223) answers each as jq does.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_argument_navigation_builtins_drop_the_register_like_reduce_2746() -> Result<()> {
-    for filter in [
-        "path(. as $x | isempty(.[]) | $x)",
-        "path(. as $x | INDEX(.[]; .) | $x)",
-    ] {
-        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("[1,2,3]"))?;
-        assert_ne!(code, 0, "{filter}: stdout {stdout:?}");
-        assert!(
-            stderr.contains("Invalid path expression with") && stderr.contains("[1,2,3]"),
-            "{filter}: {stderr:?}"
-        );
-    }
-    Ok(())
+    assert_path_rows_3289(&[
+        (
+            "[1,2,3]",
+            "path(. as $x | isempty(.[]) | $x)",
+            "",
+            "Invalid path expression with result [1,2,3]",
+            5,
+        ),
+        (
+            "[1,2,3]",
+            "path(. as $x | INDEX(.[]; .) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+    ])
 }
 
 /// #2746: nested inside `[...]`, `last(f)`/`isempty(f)`/`INDEX(gen;f)` are
@@ -73080,6 +73087,10 @@ fn test_destructuring_reduce_leaves_the_register_4048() -> Result<()> {
 /// register but states none at its emissions (`foreach` emits from inside the loop, where
 /// the pattern's steps and `UPDATE` have moved jq's register), so its `and` row, which jq
 /// answers, still refuses at the result. Every jq side captured from jq 1.7.1.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_fold_steps_from_known_untracked_register_4049() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -73243,7 +73254,7 @@ fn test_fold_steps_from_known_untracked_register_4049() -> Result<()> {
             r#"{"a":null}"#,
             r"path(. as $x | .a | 5 | reduce null as {a:$q} (null; $x))",
             "",
-            r#"Invalid path expression near attempt to access element "a" of null"#,
+            r#"Invalid path expression with result {"a":null}"#,
             5,
         ),
         // The residual this row used to record is #4131: an `UPDATE` that navigates the
@@ -74334,30 +74345,35 @@ fn test_foreach_that_is_a_fold_update_reads_the_outer_frozen_var_4499() -> Resul
 /// fold's *source*, bound outside both folds: jq refuses it (the outer source moved the register
 /// onto the element), and handing the enclosing register to that source accepted it
 /// (`jq-fold-body-register-grid-sweep.py`, `rd-nav/fe/x-idx`).
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_that_is_a_fold_update_keeps_init_marker_refused_4499() -> Result<()> {
-    for (doc, filter, stderr_part) in [
+    assert_path_rows_3289(&[
         (
             r#"{"a":{"b":1}}"#,
-            r"path(foreach .a as $w (.; foreach (1,2) as $i ($w; try .b; .); .))",
-            "Invalid path expression",
+            "path(foreach .a as $w (.; foreach (1,2) as $i ($w; try .b; .); .))",
+            "[\"a\",\"b\"]\n",
+            "",
+            0,
         ),
         (
             r#"{"a":{"b":1}}"#,
-            r"path(foreach .a as $w (.; foreach (1,2) as $i ($w; .b; .); .))",
-            "Invalid path expression",
+            "path(foreach .a as $w (.; foreach (1,2) as $i ($w; .b; .); .))",
+            "[\"a\",\"b\"]\n",
+            r#"Invalid path expression near attempt to access element "b" of 1"#,
+            5,
         ),
         (
             "[null]",
-            r"path(. as $x | reduce .[]? as $i (.; foreach ($x | .[0]) as $y (.; .; .)))",
-            "Invalid path expression",
+            "path(. as $x | reduce .[]? as $i (.; foreach ($x | .[0]) as $y (.; .; .)))",
+            "",
+            "Invalid path expression near attempt to access element 0 of [null]",
+            5,
         ),
-    ] {
-        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
-        assert_eq!(code, 5, "{filter}: {stderr}");
-        assert_eq!(stdout, "", "{filter}");
-        assert!(stderr.contains(stderr_part), "{filter}: {stderr}");
-    }
+    ])?;
     Ok(())
 }
 
@@ -76747,6 +76763,10 @@ fn test_foreach_update_verdict_over_a_reduce_computed_extract_or_non_null_regist
 /// accumulator that need not be the register. Every jq side captured from jq 1.7.1 on `null`. The controls are
 /// operands whose steps navigate (they keep the refusal jq makes), and one the build still refuses where jq answers
 /// (an EXTRACT that navigates after the first output, `(5, .a)`).
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_verdict_over_forking_extract_recurse_or_alt_bind_operand_follows_jq_4698(
 ) -> Result<()> {
@@ -76985,9 +77005,9 @@ fn test_foreach_update_verdict_over_forking_extract_recurse_or_alt_bind_operand_
         (
             r"null",
             r"path(foreach .a? as $k (0; isempty(foreach (1,2) as $i (1; try .a; (5, .a))); $k))",
+            "[\"a\",\"a\"]\n",
             "",
-            "Invalid path expression with result null",
-            5,
+            0,
         ),
         (
             r"null",
@@ -77803,6 +77823,10 @@ fn test_foreach_update_zero_arity_def_around_verdict_follows_jq_4720() -> Result
 /// the identity `cond` the admission reads. On `[1]` the seed does decide both, so jq prints `[0]` / `[[0]]` for
 /// all four. A refusal is the safe direction; this pins that it stays one rather than becoming a wrong answer,
 /// so a later promotion has to change the row on purpose.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_composed_any_recurse_not_decided_on_the_seed_stays_refused_4706(
 ) -> Result<()> {
@@ -77810,28 +77834,28 @@ fn test_foreach_update_composed_any_recurse_not_decided_on_the_seed_stays_refuse
         (
             r"[1]",
             r"path(foreach .[]? as $k (0; (any(recurse(.[]?); .) | not); $k))",
+            "[0]\n",
             "",
-            "Invalid path expression with result 1",
-            5,
+            0,
         ),
         (
             r"[1]",
             r"[path(foreach .[]? as $k (0; (any(recurse(.[]?); .) | not); $k))?]",
-            "[]\n",
+            "[[0]]\n",
             "",
             0,
         ),
         (
             r"[1]",
             r"path(foreach .[]? as $k (0; (any(recurse; true) | not); $k))",
+            "[0]\n",
             "",
-            "Invalid path expression with result 1",
-            5,
+            0,
         ),
         (
             r"[1]",
             r"[path(foreach .[]? as $k (0; (any(recurse; true) | not); $k))?]",
-            "[]\n",
+            "[[0]]\n",
             "",
             0,
         ),
@@ -78196,6 +78220,10 @@ fn test_fold_alt_bind_of_init_dot_behind_a_navigating_source_retries_4596() -> R
 /// it, so the identity (`true` once `g` ran to its end after a swallowed answer) had no register to
 /// state and the emission was refused where jq answers `[0]`. An operand with any other fan-out
 /// (a comma) still withholds it. Every jq side captured from jq 1.7.1.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_fold_update_isempty_with_a_pattern_bind_keeps_the_register_4354() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -78249,9 +78277,9 @@ fn test_fold_update_isempty_with_a_pattern_bind_keeps_the_register_4354() -> Res
         (
             "[true]",
             r"path(foreach .[]? as $k (.; all(.; . as [$q] ?// $z | $z); .))",
+            "[0]\n",
             "",
-            "Invalid path expression",
-            5,
+            0,
         ),
     ])
 }
@@ -78270,6 +78298,10 @@ fn test_fold_update_isempty_with_a_pattern_bind_keeps_the_register_4354() -> Res
 /// sitting off it, which jq refuses inside the `try`, are unchanged. Every jq side captured
 /// from jq 1.7.1. `reduce $v as $i (0; $i.b)` (#4008, which navigates the loop variable through a
 /// static tail) takes the same route: the `$v` SOURCE is the mention.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_nested_fold_over_frozen_var_with_untracked_register_stays_loud_3984() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -78277,63 +78309,63 @@ fn test_nested_fold_over_frozen_var_with_untracked_register_stays_loud_3984() ->
             r#"{"a":{"b":1,"c":[1,2]},"z":0}"#,
             r"del(. as $x | length | try (reduce 1 as $i ($x; .a)))",
             "",
-            r#"Invalid path expression near attempt to access element "a""#,
+            r#"Invalid path expression with result {"b":1,"c":[1,2]}"#,
             5,
         ),
         (
             r#"{"a":{"b":1,"c":[1,2]},"z":0}"#,
             r"del(. as $x | length | try (foreach 1 as $i ($x; .; .a)))",
+            "{\"z\":0}\n",
             "",
-            r#"Invalid path expression near attempt to access element "a""#,
-            5,
+            0,
         ),
         (
             r#"{"a":{"b":1,"c":[1,2]},"z":0}"#,
             r"del(foreach .a as $v ([3,1,2]; (($v | .b?), 1); try (foreach 1 as $i ($v; .; .b))))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
             "",
-            r#"Invalid path expression near attempt to access element "b""#,
-            5,
+            0,
         ),
         (
             r#"{"a":{"b":1,"c":[1,2]},"z":0}"#,
             r"(foreach .a as $v ([3,1,2]; (($v | .b?), 1); try (foreach 1 as $i ($v; .; .b)))) = 9",
+            "{\"a\":{\"b\":9,\"c\":[1,2]},\"z\":0}\n",
             "",
-            r#"Invalid path expression near attempt to access element "b""#,
-            5,
+            0,
         ),
         (
             r#"{"a":{"b":1,"c":[1,2]},"z":0}"#,
             r"[path(foreach .a as $v ([3,1,2]; (($v | .b?), 1); try (foreach 1 as $i ($v; .; .b))))]",
+            "[[\"a\",\"b\"]]\n",
             "",
-            r#"Invalid path expression near attempt to access element "b""#,
-            5,
+            0,
         ),
         (
             r#"{"a":{"b":1,"c":[1,2]},"z":0}"#,
             r"del(foreach .a as $v ([3,1,2]; (($v | .b?), 1); try (reduce 1 as $i ($v; .b))))",
             "",
-            r#"Invalid path expression near attempt to access element "b""#,
+            "Invalid path expression with result 1",
             5,
         ),
         (
             r#"{"a":{"b":1,"c":[1,2]},"z":0}"#,
             r"del(foreach .a as $v ([3,1,2]; (($v | .b?), 1); try (reduce $v as $i (0; $i.b))))",
             "",
-            r#"Invalid path expression near attempt to access element "b""#,
+            "Invalid path expression with result 1",
             5,
         ),
         (
             r#"{"a":{"b":1,"c":[1,2]},"z":0}"#,
             r"(foreach .a as $v ([3,1,2]; (($v | .b?), 1); try (reduce $v as $i (0; $i.b)))) = 9",
             "",
-            r#"Invalid path expression near attempt to access element "b""#,
+            "Invalid path expression with result 1",
             5,
         ),
         (
             r#"{"a":{"b":1,"c":[1,2]},"z":0}"#,
             r"[path(foreach .a as $v ([3,1,2]; (($v | .b?), 1); try (reduce $v as $i (0; $i.b))))]",
             "",
-            r#"Invalid path expression near attempt to access element "b""#,
+            "Invalid path expression with result 1",
             5,
         ),
         // Controls.
@@ -78377,6 +78409,10 @@ fn test_nested_fold_over_frozen_var_with_untracked_register_stays_loud_3984() ->
 /// compound stage ([`cannot_move_register`] is deliberately stricter than a per-branch verdict):
 /// `path(foreach (null) as {a:$x} (.a // "s"; .; $x))` is `["a"]` in jq and refuses here, the
 /// recorded cost.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_fold_init_that_navigates_then_computes_does_not_keep_the_ambient_register_4013(
 ) -> Result<()> {
@@ -78384,65 +78420,65 @@ fn test_fold_init_that_navigates_then_computes_does_not_keep_the_ambient_registe
         (
             "null",
             r"(foreach (null) as {a:$x} (.a|tostring; .; $x)) = 5",
+            "{\"a\":{\"a\":5}}\n",
             "",
-            r#"Invalid path expression near attempt to access element "a""#,
-            5,
+            0,
         ),
         (
             "null",
             r"path(foreach (null) as {a:$x} (.a|tostring; .; $x))",
+            "[\"a\",\"a\"]\n",
             "",
-            r#"Invalid path expression near attempt to access element "a""#,
-            5,
+            0,
         ),
         (
             "null",
             r"(foreach (null) as {a:$x} (.a|tostring; .; $x)) |= 5",
+            "{\"a\":{\"a\":5}}\n",
             "",
-            r#"Invalid path expression near attempt to access element "a""#,
-            5,
+            0,
         ),
         (
             "null",
             r"(reduce (null) as {a:$x} (.a|tostring; $x)) = 5",
+            "{\"a\":5}\n",
             "",
-            r#"Invalid path expression near attempt to access element "a""#,
-            5,
+            0,
         ),
         (
             "null",
             r"path(reduce (null) as {a:$x} (.a|tostring; $x))",
+            "[\"a\"]\n",
             "",
-            r#"Invalid path expression near attempt to access element "a""#,
-            5,
+            0,
         ),
         (
             "null",
             r"path(foreach (null) as {a:$x} (.a|.b|tostring; .; $x))",
+            "[\"a\",\"b\",\"a\"]\n",
             "",
-            r#"Invalid path expression near attempt to access element "a""#,
-            5,
+            0,
         ),
         (
             "null",
             r"(foreach (null) as [$x] (.a|length; .; $x)) = 5",
+            "{\"a\":[5]}\n",
             "",
-            r"Invalid path expression near attempt to access element 0",
-            5,
+            0,
         ),
         (
             "null",
             r"(reduce (null) as {a:$x} (.a|tostring; $x)) |= 5",
+            "{\"a\":5}\n",
             "",
-            r#"Invalid path expression near attempt to access element "a""#,
-            5,
+            0,
         ),
         (
             "null",
             r#"path(foreach (null) as {a:$x} (.a // "s"; .; $x))"#,
+            "[\"a\"]\n",
             "",
-            r#"Invalid path expression near attempt to access element "a""#,
-            5,
+            0,
         ),
         // Controls.
         (
@@ -79256,28 +79292,28 @@ fn test_nested_foreach_pattern_chain_on_a_null_register_answers_the_member_it_mo
 }
 
 /// #3963: a three-alternative `?//` chain under an `|=`/`op=` write fails in jq 1.7.1 with
-/// `Paths must be specified as an array` -- the second retry through `_modify` corrupts its
-/// `reduce` accumulator, a VM-stack quirk the project deliberately does not reproduce
-/// (`limitations.md`, #2974). succinctly reports the earlier alternative's own error instead, so
-/// the exit code (5) and the empty stdout match jq and only the message differs. The rows pin
-/// that recorded divergence, and that `=` (which carries on with the retried alternative) and
-/// the two-alternative chain (whose retry raises its own error) still answer as jq does.
+/// `Paths must be specified as an array` -- the second retry through `_modify` reads its
+/// `LOADVN`-emptied `$$$$dot`. The shipped evaluator reported the earlier alternative's own error
+/// instead (a recorded divergence, #2974); the path-mode interpreter (#5223) runs jq's `_modify`
+/// body when the paths can retry and raises jq's message. `=` (which carries on with the retried
+/// alternative) and the two-alternative chain (whose retry raises its own error) answer as jq does.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
-fn test_three_alternative_chain_under_limit_update_keeps_the_earlier_error_3963() -> Result<()> {
+fn test_three_alternative_chain_under_limit_update_raises_as_jq_does_3963() -> Result<()> {
     let nested = r"foreach (foreach . as [$a] ?// {a:$a} ?// $a (0; .; .)) as $x (.; .; .)";
     let flat = r". as [$a] ?// {a:$a} ?// $a | .";
     for (filter, message) in [
         (
             format!("(limit(1; {nested})) |= 9"),
-            r#"Cannot index array with string "a""#,
+            "Paths must be specified as an array",
         ),
         (
             format!("(limit(1; {flat})) |= 9"),
-            r#"Cannot index array with string "a""#,
+            "Paths must be specified as an array",
         ),
         (
             format!("(limit(1; {nested})) += 1"),
-            "array ([1]) and number (1) cannot be added",
+            "Paths must be specified as an array",
         ),
     ] {
         let (output, stderr, code) = run_jq_full(&["-c", &filter], Some("null"))?;
@@ -80997,9 +81033,9 @@ fn test_reduce_update_try_body_navigation_is_caught_4459() -> Result<()> {
         (
             doc,
             r"path(reduce .[]? as $i (.; (., (.a)?)))",
+            "[]\n",
             "",
-            r#"Invalid path expression with result {"a":true}"#,
-            5,
+            0,
         ),
         // Controls: nested `try`, a handler on a body that navigates nothing, and a source that
         // moves nothing (the accumulator is still the register).
@@ -81050,55 +81086,35 @@ fn test_reduce_update_try_body_navigation_is_caught_4459() -> Result<()> {
 /// states the register on its own, see
 /// [`test_comma_siblings_state_the_register_on_their_own_3862`].) Pinned on both
 /// routes so lifting any is a deliberate change; the jq answers are in each row.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_any_all_pipe_stage_verdict_residuals_stay_refused_3757() -> Result<()> {
-    for (input, filter, jq_answer, expected) in [
-        // #3826: a `def` whose body defines another is a `FuncDef` until bound, which the peel
-        // does not read.
+    assert_path_rows_both_routes_3749(&[
         (
             r#"{"a":false}"#,
-            r"path(. as $x | def f: def g: any; g; f | $x)",
-            "[]",
-            r#"Invalid path expression with result {"a":false}"#,
+            "path(. as $x | def f: def g: any; g; f | $x)",
+            "[]\n",
+            "",
+            0,
         ),
-        // #3826: a `def` call with an argument binds code the admission cannot read.
         (
             r#"{"a":false}"#,
-            r"path(. as $x | def f(g): any; f(.a) | $x)",
-            "[]",
-            r#"Invalid path expression with result {"a":false}"#,
+            "path(. as $x | def f(g): any; f(.a) | $x)",
+            "[]\n",
+            "",
+            0,
         ),
-        // (A `reduce` whose `UPDATE` is `isempty` over a generator that navigates was refused here
-        // until #4486: the resolver path-checks the generator live, so the fold leaves the register
-        // where `INIT` put it. See `test_reduce_update_caught_or_isempty_leaves_the_register_4486`.)
-        // #3826: on an untracked entry a generator the allowlist cannot prove leaves the
-        // register in place states a loss, which the stage does not override.
         (
             r#"{"a":1}"#,
-            r"path(. as $x | 1 | isempty(def f: 2; f) | $x)",
-            "[]",
-            r#"Invalid path expression with result {"a":1}"#,
+            "path(. as $x | 1 | isempty(def f: 2; f) | $x)",
+            "[]\n",
+            "",
+            0,
         ),
-    ] {
-        let routes = [
-            ("stdin", run_jq_full(&["-c", filter], Some(input))?),
-            (
-                "-n",
-                run_jq_full(&["-nc", &format!("{input} | {filter}")], None)?,
-            ),
-        ];
-        for (route, (stdout, stderr, code)) in routes {
-            assert_eq!(
-                (stdout.as_str(), code),
-                ("", 5),
-                "`{filter}` on {input} via {route} (jq answers {jq_answer}): stderr {stderr:?}"
-            );
-            assert!(
-                stderr.contains(expected),
-                "`{filter}` on {input} via {route}: {stderr:?}"
-            );
-        }
-    }
+    ])?;
     Ok(())
 }
 
@@ -82526,6 +82542,37 @@ fn assert_path_rows_via_3749(
                 err.is_empty(),
                 "`{filter}` on {input}: unexpected stderr {err:?}"
             );
+        } else {
+            assert!(
+                err.contains(message),
+                "`{filter}` on {input}: stderr {err:?} lacks {message:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// #5223: each of `filters`, run with `-c` on `input`, against `want`'s
+/// `(stdout, error message, exit code)` in order, every row captured from jq
+/// 1.7.1; an empty message means no stderr. For the generated matrices whose
+/// programs the shipped resolver refused and the path-mode interpreter answers
+/// as jq does.
+#[cfg(not(feature = "unshared-containers"))]
+fn assert_filters_match_jq_5223(
+    input: &str,
+    filters: &[String],
+    want: &[(&str, &str, i32)],
+) -> Result<()> {
+    assert_eq!(filters.len(), want.len(), "one captured row per filter");
+    for (filter, &(stdout, message, exit)) in filters.iter().zip(want) {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (out.as_str(), code),
+            (stdout, exit),
+            "`{filter}` on {input}: stderr {err:?}"
+        );
+        if message.is_empty() {
+            assert!(err.is_empty(), "`{filter}` on {input}: stderr {err:?}");
         } else {
             assert!(
                 err.contains(message),
@@ -83972,25 +84019,27 @@ fn test_path_register_long_and_chain_is_bounded_3456() -> Result<()> {
 /// (`test_path_register_last_f_does_not_move_it_3643`), and `isempty(g)` by
 /// #3763 (`test_isempty_and_bare_any_all_state_the_register_3763`): an emitting
 /// generator leaves the register on the node it navigated to.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_path_register_drain_producers_lose_the_register_uncatchably_3456() -> Result<()> {
     let doc = r#"{"a":{"b":1},"k":1,"l":[1,2]}"#;
-    let access_a = r#"Invalid path expression near attempt to access element "a""#;
-    let access_k = r#"Invalid path expression near attempt to access element "k""#;
     assert_path_rows_3289(&[
         (
             doc,
             r"del(. as $x | INDEX(.l[]; .) | try ($x | .a))",
+            "{\"k\":1,\"l\":[1,2]}\n",
             "",
-            access_a,
-            5,
+            0,
         ),
         (
             doc,
             r"del(. as $x | [.l | sort] | try ($x | .a))",
+            "{\"k\":1,\"l\":[1,2]}\n",
             "",
-            access_a,
-            5,
+            0,
         ),
         // An unchecked `[E]` entered at `.l` records no position at all
         // (`LostSomewhere`), so even a `$x` that cannot be inside `.l` stays a
@@ -83999,9 +84048,9 @@ fn test_path_register_drain_producers_lose_the_register_uncatchably_3456() -> Re
         (
             doc,
             r"del(. as $x | .l | [. | sort] | try ($x | .k))",
+            "{\"a\":{\"b\":1},\"k\":1,\"l\":[1,2]}\n",
             "",
-            access_k,
-            5,
+            0,
         ),
     ])
 }
@@ -84063,6 +84112,10 @@ fn test_path_register_drain_producers_keep_where_they_lost_it_3456() -> Result<(
 /// `{"a":{"b":1},"k":2}`. `first(f)`, `nth(n; f)` and `limit(n; f)` emit from
 /// inside the generator and *do* move it, so they stay refused; so does a
 /// navigation off `last`'s own (by-value) result.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_path_register_last_f_does_not_move_it_3643() -> Result<()> {
     let doc = r#"{"a":{"b":1},"k":2}"#;
@@ -84157,13 +84210,7 @@ fn test_path_register_last_f_does_not_move_it_3643() -> Result<()> {
             "",
             0,
         ),
-        (
-            doc,
-            r"path(. as $x | [last(.a // .k)] | $x)",
-            "",
-            with_root,
-            5,
-        ),
+        (doc, r"path(. as $x | [last(.a // .k)] | $x)", "[]\n", "", 0),
     ])
 }
 
@@ -84589,6 +84636,10 @@ fn test_collect_last_f_keeps_the_register_3767() -> Result<()> {
 /// contrast rows are an output that is not the register (`last(.a)` moved off
 /// it), still refused. #3786 lifted the first version's restriction to an `f` that
 /// navigates nothing, once #3780 and #3797 closed the reduce-update hole it guarded.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_path_register_last_f_keeps_the_identity_of_its_output_3766() -> Result<()> {
     let doc = r#"{"a":{"b":1},"k":2}"#;
@@ -84879,23 +84930,23 @@ fn test_path_register_last_f_keeps_the_identity_of_its_output_3766() -> Result<(
         (
             r#"{"a":true,"k":2}"#,
             r"del(reduce .[]? as $k (.; last(first(.))))",
+            "null\n",
             "",
-            "Invalid path expression with result",
-            5,
+            0,
         ),
         (
             r#"{"a":true,"k":2}"#,
             r"del(reduce .[]? as $k (.; last(select(true))))",
+            "null\n",
             "",
-            "Invalid path expression with result",
-            5,
+            0,
         ),
         (
             r#"{"a":true,"k":2}"#,
             r"del(reduce .[]? as $k (.; last(limit(1; .))))",
+            "null\n",
             "",
-            "Invalid path expression with result",
-            5,
+            0,
         ),
     ])
 }
@@ -85642,6 +85693,10 @@ fn test_foreach_keeps_the_register_for_a_frozen_variable_after_it_3761() -> Resu
 /// done here. On `{"a":true,"b":2}` the four `.[]?` rows match jq since #3770:
 /// with the generator no longer withholding the fold register, `$k` (`true`) is
 /// identical to it by kind.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_true_or_update_extracting_the_variable_never_answers_the_root_3775() -> Result<()> {
     assert_path_rows_3289(&[
@@ -85681,31 +85736,148 @@ fn test_foreach_true_or_update_extracting_the_variable_never_answers_the_root_37
             5,
         ),
     ])?;
-    for doc in [
-        "null",
-        r#"{"b":2}"#,
-        r#"{"a":false}"#,
-        r#"{"a":null,"b":2}"#,
-    ] {
-        for filter in [
-            r"path(foreach .a? as $k (0; (true or .[]?); $k))",
-            r"(foreach .a? as $k (0; (true or .[]?); $k)) = 9",
-            r"(foreach .a? as $k (0; (true or .[]?); $k)) |= 9",
-            r"del(foreach .a? as $k (0; (true or .[]?); $k))",
-            r"path(foreach .a as $k (0; (true or .b); null))",
-        ] {
-            let (out, err, code) = run_jq_full(&["-c", filter], Some(&format!("{doc}\n")))?;
-            assert_eq!(
-                (out.as_str(), code),
-                ("", 5),
-                "{filter} on {doc}: stderr {err:?}"
-            );
-            assert!(
-                err.contains("Invalid path expression with result"),
-                "{filter} on {doc}: stderr {err:?}"
-            );
-        }
-    }
+    assert_path_rows_3289(&[
+        (
+            "null",
+            "path(foreach .a? as $k (0; (true or .[]?); $k))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            "(foreach .a? as $k (0; (true or .[]?); $k)) = 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            "(foreach .a? as $k (0; (true or .[]?); $k)) |= 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            "del(foreach .a? as $k (0; (true or .[]?); $k))",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            "path(foreach .a as $k (0; (true or .b); null))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"b":2}"#,
+            "path(foreach .a? as $k (0; (true or .[]?); $k))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"b":2}"#,
+            "(foreach .a? as $k (0; (true or .[]?); $k)) = 9",
+            "{\"b\":2,\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"b":2}"#,
+            "(foreach .a? as $k (0; (true or .[]?); $k)) |= 9",
+            "{\"b\":2,\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"b":2}"#,
+            "del(foreach .a? as $k (0; (true or .[]?); $k))",
+            "{\"b\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"b":2}"#,
+            "path(foreach .a as $k (0; (true or .b); null))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false}"#,
+            "path(foreach .a? as $k (0; (true or .[]?); $k))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false}"#,
+            "(foreach .a? as $k (0; (true or .[]?); $k)) = 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false}"#,
+            "(foreach .a? as $k (0; (true or .[]?); $k)) |= 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false}"#,
+            "del(foreach .a? as $k (0; (true or .[]?); $k))",
+            "{}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false}"#,
+            "path(foreach .a as $k (0; (true or .b); null))",
+            "",
+            "Invalid path expression with result null",
+            5,
+        ),
+        (
+            r#"{"a":null,"b":2}"#,
+            "path(foreach .a? as $k (0; (true or .[]?); $k))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null,"b":2}"#,
+            "(foreach .a? as $k (0; (true or .[]?); $k)) = 9",
+            "{\"a\":9,\"b\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null,"b":2}"#,
+            "(foreach .a? as $k (0; (true or .[]?); $k)) |= 9",
+            "{\"a\":9,\"b\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null,"b":2}"#,
+            "del(foreach .a? as $k (0; (true or .[]?); $k))",
+            "{\"b\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null,"b":2}"#,
+            "path(foreach .a as $k (0; (true or .b); null))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+    ])?;
     // jq refuses nothing here and neither do we: the shapes that always matched
     let (out, _, code) = run_jq_full(
         &["-c", r"path(foreach .a? as $k (0; true; $k))"],
@@ -86989,31 +87161,34 @@ fn test_foreach_update_comma_with_a_bare_builtin_sibling_3960() -> Result<()> {
 /// (the fourth row, which now expects jq's write). Update the expectations when the others are fixed.
 /// Every row captured from jq 1.7.1 with `-c`: `del` writes `{"a":{"c":[1,2]},"z":0}` in all but
 /// `ascii_downcase?`, which leaves the document alone.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_comma_bare_builtin_exclusions_characterize_3960() -> Result<()> {
     let doc = r#"{"a":{"b":1,"c":[1,2]},"z":0}"#;
-    let refusal = "Invalid path expression near attempt to access element \"b\"";
     assert_path_rows_3289(&[
         (
             doc,
             r#"del(foreach .a as $v ("abc"; (($v | .b?), ltrimstr("x")); try ($v | .b?)))"#,
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
             "",
-            refusal,
-            5,
+            0,
         ),
         (
             doc,
             r"del(foreach .a as $v ([3,1]; (($v | .b?), min); try ($v | .b?)))",
+            "{\"a\":{\"c\":[1,2]},\"z\":0}\n",
             "",
-            refusal,
-            5,
+            0,
         ),
         (
             doc,
             r#"del(foreach .a as $v ("abc"; (($v | .b?), ascii_downcase?); try ($v | .b?)))"#,
+            "{\"a\":{\"b\":1,\"c\":[1,2]},\"z\":0}\n",
             "",
-            refusal,
-            5,
+            0,
         ),
         (
             doc,
@@ -89001,10 +89176,13 @@ fn test_foreach_update_null_source_register_shapes_keep_the_register_4063() -> R
 /// writes included. The `catch ([$v|.b?])` / `if first(0)` shape still refuses loudly. Every row
 /// captured from jq 1.7.1 with `-c`; the controls keep answering (a handler that cannot move
 /// the register, and no stage after the `try`).
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_navigating_handler_then_stage_answers_4071() -> Result<()> {
     let doc = r#"{"a":{"b":{"b":3}},"z":1}"#;
-    let refused = "Invalid path expression near attempt to access element \"b\"";
     assert_path_rows_3289(&[
         (
             doc,
@@ -89037,9 +89215,9 @@ fn test_foreach_update_navigating_handler_then_stage_answers_4071() -> Result<()
         (
             doc,
             r"[path(foreach .a? as $v (0; (try ((length | .)) catch ([($v|.b?)]) | if first(0) then (($v|.b?), true) else sort end); try ($v|.b?)))]",
+            "[[\"a\",\"b\"]]\n",
             "",
-            refused,
-            5,
+            0,
         ),
         (
             doc,
@@ -89073,31 +89251,34 @@ fn test_foreach_update_navigating_handler_then_stage_answers_4071() -> Result<()
 /// exact verdict, and the issue's two original shapes (a `null` source, and a `catch` that
 /// builds `[$v|.b?]`) answer as jq does or refuse loudly. Every row captured from jq 1.7.1
 /// with `-c`.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_unprovable_register_stage_4071() -> Result<()> {
     let doc = r#"{"a":{"b":{"b":3}},"z":1}"#;
-    let refused = "Invalid path expression near attempt to access element \"b\"";
     assert_path_rows_3289(&[
         (
             doc,
             r"[path(foreach .a as $v (0; select(true); try ($v|.b?)))]",
+            "[[\"a\",\"b\"]]\n",
             "",
-            refused,
-            5,
+            0,
         ),
         (
             doc,
             r"del(foreach .a as $v (0; select(true); try ($v|.b?)))",
+            "{\"a\":{},\"z\":1}\n",
             "",
-            refused,
-            5,
+            0,
         ),
         (
             doc,
             r"(foreach .a as $v (0; def f: .+1; f; try ($v|.b?))) = 9",
+            "{\"a\":{\"b\":9},\"z\":1}\n",
             "",
-            refused,
-            5,
+            0,
         ),
         (
             doc,
@@ -89109,9 +89290,9 @@ fn test_foreach_update_unprovable_register_stage_4071() -> Result<()> {
         (
             doc,
             r"(foreach .a? as $v (0; (try ((length | .)) catch ([($v|.b?)]) | if first(0) then (($v|.b?), true) else sort end); try ($v|.b?))) = 9",
+            "{\"a\":{\"b\":9},\"z\":1}\n",
             "",
-            refused,
-            5,
+            0,
         ),
         (
             doc,
@@ -89137,31 +89318,34 @@ fn test_foreach_update_unprovable_register_stage_4071() -> Result<()> {
 /// wrote nothing and exited 0). It is the resolver's guess now, so it is loud. Over a container
 /// the node cannot equal `$k`, jq's own error is what the `try` catches, and the rows answer as
 /// jq does. Every row captured from jq 1.7.1 with `-c`.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_navigated_then_def_keeps_the_register_lost_at_the_node_4252() -> Result<()> {
     let obj = r#"{"a":{"b":1,"c":[1,2]},"z":0}"#;
-    let refused = "Invalid path expression near attempt to access element \"b\" of null";
     assert_path_rows_3289(&[
         (
             "null",
             r"[path(foreach .a? as $k (0; ($k|.b?) | def f: 1; f; try ($k|.b?)))]",
+            "[[\"a\",\"b\",\"b\"]]\n",
             "",
-            refused,
-            5,
+            0,
         ),
         (
             "null",
             r"del(foreach .a? as $k (0; ($k|.b?) | def f: 1; f; try ($k|.b?)))",
+            "null\n",
             "",
-            refused,
-            5,
+            0,
         ),
         (
             "null",
             r"(foreach .a? as $k (0; ($k|.b?) | def f: 1; f; try ($k|.b?))) = 9",
+            "{\"a\":{\"b\":{\"b\":9}}}\n",
             "",
-            refused,
-            5,
+            0,
         ),
         (
             obj,
@@ -89201,9 +89385,9 @@ fn test_foreach_update_navigated_then_def_keeps_the_register_lost_at_the_node_42
         (
             r#"{"a":null}"#,
             r"[path(foreach .a as $v (0; ($v|.[0:1]?) | def f: 1; f; try ($v|.[0:1]?)))]",
+            "[[\"a\",{\"start\":0,\"end\":1},{\"start\":0,\"end\":1}]]\n",
             "",
-            "Invalid path expression near attempt to access element {\"start\":0,",
-            5,
+            0,
         ),
     ])
 }
@@ -91944,6 +92128,7 @@ fn test_foreach_update_alternate_first_wrapper_keeps_the_register_4028() -> Resu
 /// is C-coded: none of them leaves jq's path register anywhere but where the
 /// stage entered it, so a `$x` frozen there re-establishes it after the stage
 /// and a write through it lands. Every row captured from jq 1.7.1 with `-c`.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_path_register_by_value_builtin_stages_do_not_move_it_3361() -> Result<()> {
     assert_path_rows_3289(&[
@@ -92158,17 +92343,11 @@ fn test_path_register_by_value_builtin_stages_do_not_move_it_3361() -> Result<()
         (
             r#"[{"a":1}]"#,
             r"path(. as $x | map(.a) | $x)",
+            "[]\n",
             "",
-            "Invalid path expression",
-            5,
+            0,
         ),
-        (
-            "[[1]]",
-            r"path(. as $x | map(.[0]) | $x)",
-            "",
-            "Invalid path expression",
-            5,
-        ),
+        ("[[1]]", r"path(. as $x | map(.[0]) | $x)", "[]\n", "", 0),
         // An `f` outside `cannot_move_register`'s allowlist is judged the same
         // way even where it navigates nothing in jq's sense (`sort` is C-coded,
         // `add` iterates the element, which is the register): jq answers `[]`,
@@ -92177,17 +92356,11 @@ fn test_path_register_by_value_builtin_stages_do_not_move_it_3361() -> Result<()
         (
             "[[3],[1]]",
             r"path(. as $x | map(sort) | $x)",
+            "[]\n",
             "",
-            "Invalid path expression",
-            5,
+            0,
         ),
-        (
-            "[[1],[2]]",
-            r"path(. as $x | map(add) | $x)",
-            "",
-            "Invalid path expression",
-            5,
-        ),
+        ("[[1],[2]]", r"path(. as $x | map(add) | $x)", "[]\n", "", 0),
         // The same builtins inside a compound stage (a collect, a generator
         // consumer, a comma, an `if`, a `try`) are read as a loss: the stage is
         // judged as a whole (`test_path_register_compound_stage_states_its_register_per_branch_3644`),
@@ -92202,13 +92375,7 @@ fn test_path_register_by_value_builtin_stages_do_not_move_it_3361() -> Result<()
             "",
             0,
         ),
-        (
-            "[1,2]",
-            r"path(. as $x | [sort] | $x)",
-            "",
-            "Invalid path expression",
-            5,
-        ),
+        ("[1,2]", r"path(. as $x | [sort] | $x)", "[]\n", "", 0),
         (
             "[1,2]",
             r"path(. as $x | (sort, add) | $x)",
@@ -92264,6 +92431,10 @@ fn test_path_register_by_value_builtin_stages_do_not_move_it_3361() -> Result<()
 /// on, and `unique_by` (which iterates a computed array) stays refused. The
 /// last rows are #3712: `flatten(1)` was missing from the builtins that name the
 /// navigation they do, so a `foreach` source accepted it where jq raises.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_path_register_more_by_value_builtins_do_not_move_it_3711() -> Result<()> {
     let objs = r#"[{"a":1},{"a":2}]"#;
@@ -92474,9 +92645,9 @@ fn test_path_register_more_by_value_builtins_do_not_move_it_3711() -> Result<()>
         (
             r#"{"a":["x"]}"#,
             r#"path(.a | . as $x | [join(",")] | $x[0])"#,
+            "[\"a\",0]\n",
             "",
-            bad,
-            5,
+            0,
         ),
         // `limit(1; reverse)` answers since #4108, which reads the leaf verdict through the wrapper.
         (
@@ -93197,6 +93368,9 @@ fn test_walk_over_an_array_that_produces_raises_where_jq_raises_3723() -> Result
 /// The other half: a `walk(f)` body that jq answers must stay silent in the same
 /// collect, so the inline observation does not over-refuse a body that merely
 /// *mentions* navigation. Each row is captured from jq 1.7.1 (exit 0, nothing).
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
 #[test]
 fn test_walk_over_an_array_that_produces_stays_silent_for_a_body_jq_answers_3723() -> Result<()> {
     for (input, body) in [
@@ -93216,17 +93390,19 @@ fn test_walk_over_an_array_that_produces_stays_silent_for_a_body_jq_answers_3723
     Ok(())
 }
 
-/// The one #3723 shape still answered where jq raises, pinned as today's behaviour
-/// so a follow-up flips it on purpose: a collect that holds a `getpath` is
-/// evaluated by value (#2759), so nothing in it is path-checked.
-/// `{"a":[1]} | path(. as $x | [walk(getpath(["a"])?)] | try .[0])` exits 5 in jq
-/// 1.7.1 and 0 here.
+/// The one #3723 shape the shipped resolver answered where jq raises: a collect
+/// that holds a `getpath` was evaluated by value (#2759), so nothing in it was
+/// path-checked. The path-mode interpreter (#5223) raises as jq 1.7.1 does.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
-fn test_walk_over_an_array_residual_getpath_collect_differs_from_jq_3723() -> Result<()> {
+fn test_walk_over_an_array_getpath_collect_raises_as_jq_does_3723() -> Result<()> {
     let filter = r#"path(. as $x | [walk(getpath(["a"])?)] | try .[0])"#;
     let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":[1]}"#))?;
-    assert_eq!(code, 0, "#3723 residual: stderr={stderr:?}");
-    assert_eq!(stdout, "", "#3723 residual");
+    assert_eq!((stdout.as_str(), code), ("", 5), "#3723: stderr={stderr:?}");
+    assert!(
+        stderr.contains("Invalid path expression near attempt to iterate through [1]"),
+        "#3723: stderr={stderr:?}"
+    );
     Ok(())
 }
 
@@ -93241,6 +93417,9 @@ fn test_walk_over_an_array_residual_getpath_collect_differs_from_jq_3723() -> Re
 /// non-empty shape the probe never reached: a navigating `f` that yields output on
 /// the rebuilt array raised at the terminal check, so a later `| empty` or `try`
 /// hid it.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
 #[test]
 fn test_walk_over_an_array_observes_trailing_f_inline_3736() -> Result<()> {
     for (input, filter, code, want_stdout) in [
@@ -93277,13 +93456,13 @@ fn test_walk_over_an_array_observes_trailing_f_inline_3736() -> Result<()> {
     Ok(())
 }
 
-/// #3736 collects the root level's trailing `f` before delivering any output, so a
-/// consumer that stops early still sees an effectful `f` with several outputs run
-/// to completion: `first(path(walk(debug, debug)))` over `[null,[null]]` prints 8
-/// `DEBUG` lines here where jq 1.7.1 prints 7 (9 before #3736, which ran the walk
-/// twice). Pinned as today's behaviour so a lazy root level flips it on purpose.
+/// #3736: the shipped walker collected the root level's trailing `f` before
+/// delivering any output, so `first(path(walk(debug, debug)))` over
+/// `[null,[null]]` printed 8 `DEBUG` lines. The path-mode interpreter (#5223)
+/// runs `walk` as jq's own definition and prints jq 1.7.1's 7.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
-fn test_walk_over_an_array_root_f_runs_to_completion_under_first_3736() -> Result<()> {
+fn test_walk_over_an_array_root_f_debugs_as_jq_does_under_first_3736() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
         &["-c", "first(path(walk(debug, debug)))"],
         Some("[null,[null]]"),
@@ -93292,7 +93471,7 @@ fn test_walk_over_an_array_root_f_runs_to_completion_under_first_3736() -> Resul
     assert_eq!(stdout, "");
     assert_eq!(
         stderr.matches("DEBUG").count(),
-        8,
+        7,
         "#3736: stderr={stderr:?}"
     );
     Ok(())
@@ -94748,6 +94927,10 @@ fn test_and_or_path_by_value_operands_track_the_register_3428() -> Result<()> {
 /// alone -- is refused with the two-argument form's conservatism. Every row
 /// captured from jq 1.7.1 except that one, which is pinned as the current
 /// (refuse-only) behaviour so lifting it is a deliberate change.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_path_register_range_and_paths_do_not_move_it_3456() -> Result<()> {
     assert_path_rows_3289(&[
@@ -94825,9 +95008,9 @@ fn test_path_register_range_and_paths_do_not_move_it_3456() -> Result<()> {
         (
             r#"{"a":2}"#,
             r"path(. as $x | range(.a) | $x)",
+            "[]\n[]\n",
             "",
-            "Invalid path expression with result",
-            5,
+            0,
         ),
     ])
 }
@@ -96093,6 +96276,10 @@ fn assert_rows_3579(rows: &[(&str, &str, &str, &str, i32)]) -> Result<()> {
 /// a `select(true)` stage moved to
 /// `test_path_register_last_f_wrappers_and_select_keep_it_3653` once a `select`
 /// stage kept the register: they are answered now, exactly as jq answers them.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_terminal_null_after_a_navigation_refuses_loudly_3579() -> Result<()> {
     assert_rows_3579(&[
@@ -96100,44 +96287,32 @@ fn test_terminal_null_after_a_navigation_refuses_loudly_3579() -> Result<()> {
         (
             r"null",
             r"path(.a as $x | .a | 5 | first(def f: 7; f) | $x)",
-            "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
-            5,
+            "[\"a\"]\n", "", 0,
         ),
         (
             r"null",
             r"(.a as $x | .a | 5 | first(def f: 7; f) | $x) = 9",
-            "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
-            5,
+            "{\"a\":9}\n", "", 0,
         ),
         (
             r"null",
             r"(.a as $x | .a | 5 | first(def f: 7; f) | $x) |= 9",
-            "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
-            5,
+            "{\"a\":9}\n", "", 0,
         ),
         (
             r"null",
             r"del(.a as $x | .a | 5 | first(def f: 7; f) | $x)",
-            "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
-            5,
+            "null\n", "", 0,
         ),
         (
             r"null",
             r"(.a as $x | .a | 5 | limit(1; def f: 7; f) | $x) = 9",
-            "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
-            5,
+            "{\"a\":9}\n", "", 0,
         ),
         (
             r"null",
             r"(.a as $x | .a | 5 | first(def f: range(3); f) | $x) = 9",
-            "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
-            5,
+            "{\"a\":9}\n", "", 0,
         ),
         // #3580: `first(..)` delivers the seed with jq's register where `.a` left it, so
         // `$x` re-establishes at `["a"]` and the write lands there, as in jq. It was a
@@ -96161,59 +96336,45 @@ fn test_terminal_null_after_a_navigation_refuses_loudly_3579() -> Result<()> {
         (
             r"null",
             r"(.a as $x | .a | first(def f: 7; f) | $x) = 9",
-            "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
-            5,
+            "{\"a\":9}\n", "", 0,
         ),
         (
             r"null",
             r"(.a as $x | .a | [first(def f: 7; f)] | $x) = 9",
-            "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
-            5,
+            "{\"a\":9}\n", "", 0,
         ),
         // a guess, not jq's verdict, so no `try`, `?` or `catch` turns it into a dropped write (jq writes there)
         (
             r"null",
             r#"try ((.a as $x | .a | 5 | first(def f: 7; f) | $x) = 9) catch "CAUGHT""#,
-            "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
-            5,
+            "{\"a\":9}\n", "", 0,
         ),
         (
             r"null",
             r"[path(.a as $x | .a | 5 | first(def f: 7; f) | $x)?]",
-            "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
-            5,
+            "[[\"a\"]]\n", "", 0,
         ),
         (
             r"null",
             r#"try path(.a as $x | .a | 5 | first(def f: 7; f) | $x) catch "C""#,
-            "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
-            5,
+            "[\"a\"]\n", "", 0,
         ),
         (
             r"null",
             r"[(.a as $x | .a | 5 | first(def f: 7; f) | $x) = 9?]",
-            "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
-            5,
+            "[{\"a\":9}]\n", "", 0,
         ),
         // in a ?// chain, and a refusal that pre-empts jq's own later error (jq refuses too, at .b: both exit 5, the wording differs)
         (
             r"null",
             r"[path(. as [$q] ?// $q | .a as $x | .a | 5 | first(def f: 7; f) | $x)]",
-            "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
-            5,
+            "[[0,\"a\"]]\n", "", 0,
         ),
         (
             r"null",
             r"del(.a as $x | .a | 5 | first(def f: 7; f) | $x, .b)",
             "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"b\" of 7\n",
             5,
         ),
         // more register-dropping stages between the navigation and the terminal
@@ -96246,6 +96407,10 @@ fn test_terminal_null_after_a_navigation_refuses_loudly_3579() -> Result<()> {
 /// `null`/`true`/`false` never reached the carve-out, and the same shape
 /// refuses there exactly as before. `true` and `false` cannot be navigated at
 /// all, so no pipe on them reaches the carve-out after a navigation.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_terminal_null_carve_out_keeps_its_answers_3579() -> Result<()> {
     assert_rows_3579(&[
@@ -96308,23 +96473,17 @@ fn test_terminal_null_carve_out_keeps_its_answers_3579() -> Result<()> {
         (
             r#"{"a":null}"#,
             r"path(.a as $x | .a | 5 | first(def f: 7; f) | $x)",
-            "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
-            5,
+            "[\"a\"]\n", "", 0,
         ),
         (
             r#"{"a":null}"#,
             r"(.a as $x | .a | 5 | first(def f: 7; f) | $x) = 9",
-            "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
-            5,
+            "{\"a\":9}\n", "", 0,
         ),
         (
             r"[null]",
             r"path(.[0] as $x | .[0] | 5 | first(def f: 7; f) | $x)",
-            "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
-            5,
+            "[0]\n", "", 0,
         ),
         // computed values after a navigation that jq and this resolver both answer
         (r"null", r"path(.a | tostring | null)", "[\"a\"]\n", "", 0),
@@ -98972,6 +99131,10 @@ fn test_path_through_bound_variable_matches_jq_2072() -> Result<()> {
 /// captured live against `/usr/bin/jq` 1.7.1 on 2026-09-10 -- stdout
 /// (`-c`) verbatim for the accepting rows, and the exact stderr message
 /// plus exit code for the refusing ones.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_destructuring_moves_path_register_2649() -> Result<()> {
     let d = r#"{"a":[1,2,3],"b":{"c":5}}"#;
@@ -99162,24 +99325,18 @@ fn test_destructuring_moves_path_register_2649() -> Result<()> {
         );
     }
 
-    // Refuse-only pins: rows where real jq *answers* (comment gives jq's
-    // own `-c` output) but succinctly must still refuse rather than risk a
-    // fabricated path. `?//`'s retry-on-body-error semantics (jq falls to
-    // the next alternative on a path error raised *inside* the body, not
-    // just on a pattern-step error) are exactly the shape the design's
-    // "artefact guard" (see `docs/compliance/jq/limitations.md`) declines
-    // to reproduce, because the resolver itself raises refusals jq never
-    // does (an untracked stage cannot certify a marker source) and cannot
-    // tell those apart from a genuine jq path error -- retrying on both
-    // alike risks landing on the wrong alternative and fabricating a path
-    // a write would then corrupt data through. Exit 5 and empty stdout are
-    // the only assertions; each row is otherwise a pure jq answer, not a
-    // succinctly one.
-    // jq: ["a"]
-    let refused = "path(. as {a:$q} | .a as $z | $z)";
-    let (stdout, stderr, code) = run_jq_full(&["-c", refused], Some(d))?;
-    assert_eq!(code, 5, "`{refused}`: stdout={stdout} stderr={stderr}");
-    assert!(stdout.is_empty(), "`{refused}` must not print: {stdout}");
+    // Former refuse-only pins: rows where real jq answers and the shipped
+    // resolver refused rather than risk a fabricated path, because it raised
+    // refusals jq never does and could not tell them from jq's own path errors
+    // (the "artefact guard"). The path-mode interpreter (#5223) carries jq's
+    // register, so they answer as jq does.
+    let answered = "path(. as {a:$q} | .a as $z | $z)";
+    let (stdout, stderr, code) = run_jq_full(&["-c", answered], Some(d))?;
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("[\"a\"]\n", 0),
+        "`{answered}`: stderr={stderr}"
+    );
     // The other former refuse-only pin of this block answers since #4115: the body leads with
     // a navigation of an ambient that is not the register the pattern moved to, which is
     // jq's own path error and sends it to the `$z` alternative -- jq's `["a"]`.
@@ -105057,31 +105214,106 @@ fn test_try_wrapped_if_bind_source_keeps_register_3279() -> Result<()> {
 /// whose step is a type error, a body without a swallowed error, and a source
 /// whose pattern cannot match by type are unchanged and still match jq. Every
 /// jq-side row was captured from jq 1.7.1.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_alt_destructuring_of_a_passthrough_source_under_try_never_writes_3781() -> Result<()> {
     let doc = r#"{"a":{"b":1}}"#;
-    for filter in [
-        r"del(select(true) as {a:$v0} ?// $v0 | try .a)",
-        r"del((.|.) as {a:$v0} ?// $v0 | try .a)",
-        r"del(first(.) as {a:$v0} ?// $v0 | try .a)",
-        r"del(first(.) as {a:$v0} ?// $v0 | (.a)?)",
-        r"(first(.) as {a:$v0} ?// $v0 | try .a) |= 5",
-        r"(first(.) as {a:$v0} ?// $v0 | try .a) = 5",
-        r"[path(select(true) as {a:$v0} ?// $v0 | try .a)]",
-        r"[path(first(.) as {a:$v0} ?// $v0 | try .b)]",
-        r"[path(select(true) as {a:{b:$v0}} ?// $v0 | try .a)]",
-        r"del(select(.a) as {a:$v0} ?// $v0 | try .a)",
-        r"del(limit(1; .) as {a:$v0} ?// $v0 | try .a)",
-        r"del(last(.) as {a:$v0} ?// $v0 | try .a)",
-        r"del(select(true) as {a:$v0} ?// {b:$v0} ?// $v0 | try .a)",
-    ] {
-        let (out, err, code) = run_jq_full(&["-c", filter], Some(&format!("{doc}\n")))?;
-        assert_eq!((out.as_str(), code), ("", 5), "{filter}: stderr {err:?}");
-        assert!(
-            err.contains("Invalid path expression"),
-            "{filter}: stderr {err:?}"
-        );
-    }
+    assert_path_rows_3289(&[
+        (
+            r#"{"a":{"b":1}}"#,
+            "del(select(true) as {a:$v0} ?// $v0 | try .a)",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            "del((.|.) as {a:$v0} ?// $v0 | try .a)",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            "del(first(.) as {a:$v0} ?// $v0 | try .a)",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            "del(first(.) as {a:$v0} ?// $v0 | (.a)?)",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            "(first(.) as {a:$v0} ?// $v0 | try .a) |= 5",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            "(first(.) as {a:$v0} ?// $v0 | try .a) = 5",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            "[path(select(true) as {a:$v0} ?// $v0 | try .a)]",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            "[path(first(.) as {a:$v0} ?// $v0 | try .b)]",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            "[path(select(true) as {a:{b:$v0}} ?// $v0 | try .a)]",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            "del(select(.a) as {a:$v0} ?// $v0 | try .a)",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            "del(limit(1; .) as {a:$v0} ?// $v0 | try .a)",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            "del(last(.) as {a:$v0} ?// $v0 | try .a)",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            "del(select(true) as {a:$v0} ?// {b:$v0} ?// $v0 | try .a)",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+    ])?;
     // unchanged and matching jq
     for (input, filter, expected) in [
         (
@@ -105111,13 +105343,22 @@ fn test_alt_destructuring_of_a_passthrough_source_under_try_never_writes_3781() 
         );
     }
     // the array register: the same shape through an array pattern
-    for filter in [
-        r"[path(first(.) as [$v0] ?// $v0 | try .[0])]",
-        r"del(first(.) as [$v0] ?// $v0 | try .[0])",
-    ] {
-        let (out, err, code) = run_jq_full(&["-c", filter], Some("[[1]]\n"))?;
-        assert_eq!((out.as_str(), code), ("", 5), "{filter}: stderr {err:?}");
-    }
+    assert_path_rows_3289(&[
+        (
+            "[[1]]",
+            "[path(first(.) as [$v0] ?// $v0 | try .[0])]",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            "[[1]]",
+            "del(first(.) as [$v0] ?// $v0 | try .[0])",
+            "[[1]]\n",
+            "",
+            0,
+        ),
+    ])?;
     // a refusal that is provably exact (the head is a copy, not the register), a
     // nested pattern that is a certain type error, and a postfix `?` on a bare
     // navigation keep jq's answer
@@ -105157,6 +105398,10 @@ fn test_alt_destructuring_of_a_passthrough_source_under_try_never_writes_3781() 
 /// retry. The first and last groups match jq; the `?//` corruption rows
 /// keep `main`'s refusal (jq edits `.a`; the bare `.` source already
 /// corrupts, a pre-existing gap), never a write.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_try_if_widening_does_not_leak_3279() -> Result<()> {
     for (input, filter, expected, expected_code) in [
@@ -105178,35 +105423,43 @@ fn test_try_if_widening_does_not_leak_3279() -> Result<()> {
             "#3279 review: `{filter}` on {input}: stderr={stderr:?}"
         );
     }
-    for (input, filter) in [
+    assert_path_rows_3289(&[
         (
-            "{\"a\":2,\"b\":3}",
+            r#"{"a":2,"b":3}"#,
             "del((. | .) as {a:$v} ?// $v | $v.x?, $v)",
+            "{\"b\":3}\n",
+            "",
+            0,
         ),
         (
-            "{\"a\":2,\"b\":3}",
+            r#"{"a":2,"b":3}"#,
             "del((try (if true then . else . end) catch 1) as {a:$v0} ?// $v0 | ($v0[0]?, $v0))",
+            "{\"b\":3}\n",
+            "",
+            0,
         ),
         (
-            "{\"a\":2}",
+            r#"{"a":2}"#,
             "((. | .) as {a:$v0} ?// $v0 | ($v0[0]?, $v0)) = 9",
+            "{\"a\":9}\n",
+            "",
+            0,
         ),
         (
-            "{\"a\":2,\"b\":3}",
+            r#"{"a":2,"b":3}"#,
             "(((if true then . else . end) // 0) as {a:$v} ?// $v | $v.x?, $v) |= 5",
+            "{\"a\":5,\"b\":3}\n",
+            "",
+            0,
         ),
         (
-            "{\"a\":2}",
+            r#"{"a":2}"#,
             "[path((. | .) as {a:$v0} ?// $v0 | ($v0[0]?, $v0))]",
+            "[[\"a\"]]\n",
+            "",
+            0,
         ),
-    ] {
-        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
-        assert_eq!(
-            (stdout.as_str(), code),
-            ("", 5),
-            "#3279 review: `{filter}` on {input} must refuse, not write: stderr={stderr:?}"
-        );
-    }
+    ])?;
     Ok(())
 }
 
@@ -106235,8 +106488,8 @@ fn test_fold_loop_variable_rebound_by_as_3898() -> Result<()> {
         r"reduce (.) as $x ({a:1}; $x as $y | ($y.a) = 9)",
         r"reduce (.,.) as $x (.; $x as $y | ($y.a) = 9)",
     ];
-    // Pinned, not endorsed: a `?//` chain of binds is not aliased, so this refuses
-    // where jq answers `{"a":9}`. Flip it if the alias learns `?//`.
+    // A `?//` chain of binds, which the shipped resolver did not alias and refused, answers jq's
+    // `{"a":9}` through the path-mode interpreter (#5223).
     let residual = r"reduce (.) as $x (.; $x as [$y] ?// $y | ($y.a) = 9)";
     // Both routes: stdin through the generic evaluator, and `-n 'input | ...'`
     // through `eval.rs`'s owned fold.
@@ -106273,11 +106526,11 @@ fn test_fold_loop_variable_rebound_by_as_3898() -> Result<()> {
                 "#3898: `{filter}` (wrap={wrap}) refused for the wrong reason: {stderr:?}"
             );
         }
-        let (stdout, _, code) = run(residual)?;
+        let (stdout, stderr, code) = run(residual)?;
         assert_eq!(
             (stdout.as_str(), code),
-            ("", 5),
-            "#3898 residual (wrap={wrap}): `{residual}`"
+            (r#"{"a":9}"#, 0),
+            "#3898 (wrap={wrap}): `{residual}`: stderr={stderr:?}"
         );
     }
     Ok(())
@@ -106567,14 +106820,13 @@ fn test_fold_loop_variable_in_path_position_3329() -> Result<()> {
         assert!(stderr.contains("Invalid path expression"), "{stderr:?}");
     }
     // A member a later one shadows is in no value the accumulator holds:
-    // `.[]` yields it, but its child is the *last* member's. The descent
-    // declines (a refusal where jq answers `{}`), never answers with the
-    // wrong node.
+    // `.[]` yields it, but its child is the *last* member's. The shipped
+    // descent declined; the path-mode interpreter (#5223) answers jq's `{}`.
     let (stdout, stderr, code) = run_jq_full(
         &["-c", r"reduce .[] as $x (.; del(.a | $x))"],
         Some(r#"{"a":{"x":1},"a":{"x":2}}"#),
     )?;
-    assert_eq!((stdout.trim(), code), ("", 5), "#3897: {stderr:?}");
+    assert_eq!((stdout.trim(), code), ("{}", 0), "#3897: {stderr:?}");
     Ok(())
 }
 
@@ -108378,53 +108630,140 @@ fn test_scalar_bind_keeps_node_identity_3191() -> Result<()> {
     // and two equal literals. These are the rows a pass-through where jq
     // allocates would fabricate an answer on -- the unsafe direction.
     //
-    // And, last, the rows jq answers that stay refused here: builtins the
-    // generic evaluator bridges through the owned re-index round trip
-    // (`ltrimstr`, `sub`, `abs`), and jq's constant pool (`def f: 5` is
-    // one `jv` across calls). Refusing is the safe direction; see
-    // `docs/compliance/jq/limitations.md`.
-    for (input, filter) in [
-        (r#""s""#, r#". as $x | {k:"s"} | .k | path($x)"#),
-        (r"5", r". as $x | {k:5} | .k | path($x)"),
-        (r"5", r". as $x | {k:(.+0)} | .k | path($x)"),
-        (r#""s""#, r". as $x | ascii_downcase | path($x)"),
-        (r#""s""#, r#". as $x | . + "" | path($x)"#),
-        (r#""s""#, r". as $x | tojson | fromjson | path($x)"),
-        (r#""abc""#, r". as $x | .[0:] | path($x)"),
-        // A full-range slice of the *placed* handle too: the cursor route's
-        // hand-the-input-back shortcut would carry the promoted identity
-        // through it, and a write through `$x` would then land where jq
-        // refuses (found by the bind-origin fuzz, #3191).
-        (r#""abc""#, r". as $x | {k:.} | .k | .[0:] | path($x)"),
-        (r#""abc""#, r". as $x | {k:.} | .k | .[0:3] | path($x)"),
-        (r#""abc""#, r". as $x | ([.] | min) | .[0:] | ($x) = 9"),
-        (r"5", r". as $x | . + 0 | path($x)"),
-        (r"5", r". as $x | floor | path($x)"),
-        (r"5", r". as $x | tostring | tonumber | path($x)"),
-        (r#"["s","s"]"#, r".[0] as $x | .[1] | path($x)"),
-        (r#""s""#, r#""s" as $x | "s" | path($x)"#),
-        // `strings` hands its input back only for the node it was bound from: a
-        // sibling holding an equal string is another storage, so jq refuses.
+    // And, last, the rows jq answers that the shipped resolver refused:
+    // builtins the generic evaluator bridged through the owned re-index round
+    // trip (`ltrimstr`, `sub`, `abs`), and jq's constant pool (`def f: 5` is
+    // one `jv` across calls). The path-mode interpreter (#5223) answers them.
+    assert_path_rows_3289(&[
+        (
+            r#""s""#,
+            r#". as $x | {k:"s"} | .k | path($x)"#,
+            "",
+            r#"Invalid path expression with result "s""#,
+            5,
+        ),
+        (
+            "5",
+            ". as $x | {k:5} | .k | path($x)",
+            "",
+            "Invalid path expression with result 5",
+            5,
+        ),
+        (
+            "5",
+            ". as $x | {k:(.+0)} | .k | path($x)",
+            "",
+            "Invalid path expression with result 5",
+            5,
+        ),
+        (
+            r#""s""#,
+            ". as $x | ascii_downcase | path($x)",
+            "",
+            r#"Invalid path expression with result "s""#,
+            5,
+        ),
+        (
+            r#""s""#,
+            r#". as $x | . + "" | path($x)"#,
+            "",
+            r#"Invalid path expression with result "s""#,
+            5,
+        ),
+        (
+            r#""s""#,
+            ". as $x | tojson | fromjson | path($x)",
+            "",
+            r#"Invalid path expression with result "s""#,
+            5,
+        ),
+        (
+            r#""abc""#,
+            ". as $x | .[0:] | path($x)",
+            "",
+            r#"Invalid path expression with result "abc""#,
+            5,
+        ),
+        (
+            r#""abc""#,
+            ". as $x | {k:.} | .k | .[0:] | path($x)",
+            "",
+            r#"Invalid path expression with result "abc""#,
+            5,
+        ),
+        (
+            r#""abc""#,
+            ". as $x | {k:.} | .k | .[0:3] | path($x)",
+            "",
+            r#"Invalid path expression with result "abc""#,
+            5,
+        ),
+        (
+            r#""abc""#,
+            ". as $x | ([.] | min) | .[0:] | ($x) = 9",
+            "",
+            r#"Invalid path expression with result "abc""#,
+            5,
+        ),
+        (
+            "5",
+            ". as $x | . + 0 | path($x)",
+            "",
+            "Invalid path expression with result 5",
+            5,
+        ),
+        (
+            "5",
+            ". as $x | floor | path($x)",
+            "",
+            "Invalid path expression with result 5",
+            5,
+        ),
+        (
+            "5",
+            ". as $x | tostring | tonumber | path($x)",
+            "",
+            "Invalid path expression with result 5",
+            5,
+        ),
+        (
+            r#"["s","s"]"#,
+            ".[0] as $x | .[1] | path($x)",
+            "",
+            r#"Invalid path expression with result "s""#,
+            5,
+        ),
+        (
+            r#""s""#,
+            r#""s" as $x | "s" | path($x)"#,
+            "",
+            r#"Invalid path expression with result "s""#,
+            5,
+        ),
         (
             r#"{"a":"abc","b":"abc"}"#,
-            r".a as $x | .b | strings | path($x)",
+            ".a as $x | .b | strings | path($x)",
+            "",
+            r#"Invalid path expression with result "abc""#,
+            5,
         ),
-        (r#""abc""#, r#". as $x | ltrimstr("z") | path($x)"#),
-        (r#""abc""#, r#". as $x | sub("z";"y") | path($x)"#),
-        (r"5", r". as $x | abs | path($x)"),
-        (r"5", r"def f: 5; f as $x | f | path($x)"),
-    ] {
-        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
-        assert_eq!(
-            (stdout.as_str(), code),
-            ("", 5),
-            "#3191: `{filter}` on `{input}` must refuse: stderr={stderr:?}"
-        );
-        assert!(
-            stderr.contains("Invalid path expression"),
-            "#3191: `{filter}`: stderr={stderr:?}"
-        );
-    }
+        (
+            r#""abc""#,
+            r#". as $x | ltrimstr("z") | path($x)"#,
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#""abc""#,
+            r#". as $x | sub("z";"y") | path($x)"#,
+            "[]\n",
+            "",
+            0,
+        ),
+        ("5", ". as $x | abs | path($x)", "[]\n", "", 0),
+        ("5", "def f: 5; f as $x | f | path($x)", "[]\n", "", 0),
+    ])?;
     Ok(())
 }
 
@@ -108778,6 +109117,7 @@ fn test_owned_embed_keeps_node_identity_on_the_input_bridge_2889() -> Result<()>
 /// - A scalar root, which never enters the embed table on this route.
 #[test]
 // jq filter literals are not formatting strings.
+#[cfg(not(feature = "unshared-containers"))]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_input_bridge_embed_residuals_refuse_cleanly_2889() -> Result<()> {
     for (input, filter) in [
@@ -108831,9 +109171,6 @@ fn test_input_bridge_embed_residuals_refuse_cleanly_2889() -> Result<()> {
         // `eval.rs`'s nested reuse, `input | .a as $y | {k:.} | .k.a`,
         // answer since #3069's bridge provenance -- see
         // `test_bridge_provenance_keeps_path_identity_3069`.)
-        // A scalar root never enters the table on this route. jq answers.
-        ("1", r"input | . as $x | [.] | .[0] | path($x)"),
-        ("1", r"[input | . as $x | [.] | .[0] | path($x)]"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-n", "-c", filter], Some(input))?;
         assert_eq!(
@@ -108843,6 +109180,19 @@ fn test_input_bridge_embed_residuals_refuse_cleanly_2889() -> Result<()> {
         assert!(
             stderr.contains("Invalid path expression"),
             "#2889 Stage B: `{filter}` -- stderr: {stderr:?}"
+        );
+    }
+    // A scalar root never entered the shipped route's table, which refused
+    // these; the path-mode interpreter (#5223) answers as jq does.
+    for (filter, expected) in [
+        (r"input | . as $x | [.] | .[0] | path($x)", "[]\n"),
+        (r"[input | . as $x | [.] | .[0] | path($x)]", "[[]]\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-n", "-c", filter], Some("1"))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (expected, 0),
+            "`{filter}`: {stderr:?}"
         );
     }
     Ok(())
@@ -113155,37 +113505,126 @@ fn test_write_through_root_snapshot_after_subexp_stage_under_try_3186() -> Resul
 /// instead (ADR-0018 rule 4). The lossy stage was `has(k)` until #3456, which
 /// proved `has` leaves the register alone (`cannot_move_register`); `contains`
 /// is the same kind of C-coded boolean this resolver still cannot vouch for.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
-    for filter in [
-        r#"del(. as $x | contains({"a":{}}) | try ($x | .a))"#,
-        r#"del(. as $x | ("a"|test("a")) | try ($x | .a))"#,
-        r#"del(. as $x | contains({"a":{}}) | ($x | .a)?)"#,
-        r#"del(. as $x | contains({"a":{}}) | ($x.a)?)"#,
-        r#"del(. as $x | contains({"a":{}}) | try $x["a"])"#,
-        r#"del(. as $x | contains({"a":{}}) | try ($x | .[]))"#,
-        r#"del(. as $x | contains({"a":{}}) | "a" as $k | try ($x | .[$k]))"#,
-        r#"del(. as $x | contains({"a":{}}) | 0 as $i | try ($x | .l[$i:1]))"#,
-        r#"del(. as $x | contains({"a":{}}) | try ($x as {a:$q} | $q))"#,
-        r#"del(. as $x | contains({"a":{}}) | try ($x | .a) catch empty)"#,
-        r#"del(. as $x | contains({"a":{}}) | $x | try .a)"#,
-        r#"del(. as $x | contains({"a":{}}) | label $out | try ($x | .a))"#,
-        // The loss happens *inside* the `try`: its own frame predates it.
-        r#"del(try (. as $x | contains({"a":{}}) | $x | .a))"#,
-        r#"del((. as $x | contains({"a":{}}) | $x | .a)?)"#,
-        // And a value-position `?` around the whole write catches nothing.
-        r#"[del(. as $x | contains({"a":{}}) | try ($x | .a))?]"#,
-        r"del(. as $x | (def f: 5; f) | try ($x | .k))",
-    ] {
-        let (stdout, stderr, code) =
-            run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1},"k":1,"l":[1,2]}"#))?;
-        assert_eq!(code, 5, "{filter}: stdout: {stdout:?}");
-        assert!(stdout.is_empty(), "{filter}: stdout: {stdout:?}");
-        assert!(
-            stderr.contains("Invalid path expression near attempt to"),
-            "{filter}: stderr: {stderr:?}"
-        );
-    }
+    assert_path_rows_3289(&[
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r#"del(. as $x | contains({"a":{}}) | try ($x | .a))"#,
+            "{\"k\":1,\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r#"del(. as $x | ("a"|test("a")) | try ($x | .a))"#,
+            "{\"k\":1,\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r#"del(. as $x | contains({"a":{}}) | ($x | .a)?)"#,
+            "{\"k\":1,\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r#"del(. as $x | contains({"a":{}}) | ($x.a)?)"#,
+            "{\"k\":1,\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r#"del(. as $x | contains({"a":{}}) | try $x["a"])"#,
+            "{\"k\":1,\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r#"del(. as $x | contains({"a":{}}) | try ($x | .[]))"#,
+            "{}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r#"del(. as $x | contains({"a":{}}) | "a" as $k | try ($x | .[$k]))"#,
+            "{\"k\":1,\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r#"del(. as $x | contains({"a":{}}) | 0 as $i | try ($x | .l[$i:1]))"#,
+            "{\"a\":{\"b\":1},\"k\":1,\"l\":[2]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r#"del(. as $x | contains({"a":{}}) | try ($x as {a:$q} | $q))"#,
+            "{\"k\":1,\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r#"del(. as $x | contains({"a":{}}) | try ($x | .a) catch empty)"#,
+            "{\"k\":1,\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r#"del(. as $x | contains({"a":{}}) | $x | try .a)"#,
+            "{\"k\":1,\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r#"del(. as $x | contains({"a":{}}) | label $out | try ($x | .a))"#,
+            "{\"k\":1,\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r#"del(try (. as $x | contains({"a":{}}) | $x | .a))"#,
+            "{\"k\":1,\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r#"del((. as $x | contains({"a":{}}) | $x | .a)?)"#,
+            "{\"k\":1,\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r#"[del(. as $x | contains({"a":{}}) | try ($x | .a))?]"#,
+            "[{\"k\":1,\"l\":[1,2]}]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            "del(. as $x | (def f: 5; f) | try ($x | .k))",
+            "{\"a\":{\"b\":1},\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+    ])?;
 
     // Controls: a refusal jq raises too stays catchable, exactly as in jq
     // 1.7.1 -- decided by the value actually refused, not by what the `try`
@@ -113300,15 +113739,19 @@ fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
         assert_eq!(stdout.trim_end(), expected, "{filter}");
     }
 
-    // The recorded price (docs/compliance/jq/limitations.md, #3267): a value
-    // at or inside the lost register that jq's register did *not* land on --
-    // its refusal is exact and caught in jq 1.7.1, which prints the document
-    // unchanged -- but this resolver cannot tell the stage that left the
-    // register alone (`contains`) from one that moved it there (`first(.a)`), so
-    // it refuses loudly rather than risk the silent loss above.
+    // The price the shipped resolver recorded (#3267): a value at or inside the
+    // lost register that jq's register did *not* land on -- its refusal is exact
+    // and caught in jq 1.7.1, which prints the document unchanged. The resolver
+    // could not tell the stage that left the register alone (`contains`) from one
+    // that moved it there and refused loudly; the path-mode interpreter (#5223)
+    // answers as jq does.
     let filter = r#"del(.a as $y | contains({"z":1}) | try ($y | .b))"#;
-    let (stdout, _stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1},"k":1}"#))?;
-    assert_eq!(code, 5, "{filter}: stdout: {stdout:?}");
+    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1},"k":1}"#))?;
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("{\"a\":{\"b\":1},\"k\":1}\n", 0),
+        "{filter}: stderr: {stderr:?}"
+    );
     Ok(())
 }
 
@@ -114454,6 +114897,9 @@ fn test_recurse_seed_behind_call_or_fork_keeps_register_3580() -> Result<()> {
 /// UPDATE of `recurse(f)`. Each was a loud refusal where jq answers. The write
 /// forms carry a `try` inside, around and after the producer, and every row was
 /// captured live from jq 1.7.1 on `{"a":{"b":{"b":null}},"c":2}`.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
 #[test]
 fn test_recurse_seed_through_nth_bind_and_fold_recurse_f_3892() -> Result<()> {
     assert_rows_2764(&[
@@ -114531,8 +114977,9 @@ fn test_recurse_seed_through_nth_bind_and_fold_recurse_f_3892() -> Result<()> {
     ])
 }
 
-/// #3580, residuals: shapes whose seed (or handler output) the stage cannot read
-/// still refuse, loudly. Each is `[]` or a successful write in jq: a pipe nested inside a
+/// #3580, residuals: shapes whose seed (or handler output) the shipped stage could
+/// not read refused, loudly; the path-mode interpreter (#5223) answers each as jq
+/// does, and the rows are jq's. Each is `[]` or a successful write in jq: a pipe nested inside a
 /// forwarder (`if c then (.. | select(true)) else . end`, answered since #4123), a `foreach` fold inside an `[E]`
 /// collect, and the neighbours of the shapes #3914 promoted that still state nothing -- a
 /// literal-only `if` branch with no recursion beside it, a `def` call that takes an
@@ -114541,20 +114988,46 @@ fn test_recurse_seed_through_nth_bind_and_fold_recurse_f_3892() -> Result<()> {
 /// bind keeps its own rule.) The rows pin the *current* refusal, and every write
 /// form must exit non-zero -- never 0 with the document unchanged, which is the
 /// silent write loss #3267 closed.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_recurse_seed_residuals_stay_loud_3580() -> Result<()> {
     assert_rows_2764(&[
-        (r"path(. as $x | 1 | [foreach (1,2) as $i (1; try ..; .)] | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
-        (r"del(. as $x | 1 | [foreach (1,2) as $i (1; try ..; .)] | $x | .c)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"c\" of {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+        (
+            r"path(. as $x | 1 | [foreach (1,2) as $i (1; try ..; .)] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"del(. as $x | 1 | [foreach (1,2) as $i (1; try ..; .)] | $x | .c)",
+            "{\"a\":{\"b\":{\"b\":null}}}\n",
+            "",
+            0,
+        ),
         // #3914: an `if` whose branches hold no producer at all states nothing to read, and a `def` call
         // that takes an argument binds code the shape cannot see
         // (`if false then .a else 1 end` is answered since #4124: a literal condition reads only the
         // branch it runs)
-        (r"path(. as $x | 1 | if false then .a else 1 end | $x)", "[]\n", "", 0),
-        (r"path(. as $x | 1 | def f(a): ..; f(1) | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+        (
+            r"path(. as $x | 1 | if false then .a else 1 end | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"path(. as $x | 1 | def f(a): ..; f(1) | $x)",
+            "[]\n",
+            "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n",
+            5,
+        ),
         // #3914: a `reduce` UPDATE whose `if` has a by-value branch is the same shape on the fold's own
         // register; #4124's literal-condition rule answers it (jq: `[]`).
-        (r"path(. as $x | reduce (1,2) as $i (1; if false then .. else 1 end) | $x)", "[]\n", "", 0),
+        (
+            r"path(. as $x | reduce (1,2) as $i (1; if false then .. else 1 end) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
     ])
 }
 
@@ -115188,6 +115661,10 @@ fn test_array_admits_self_checked_builtins_via_cli_3283() -> Result<()> {
 /// the container the construct produced rather than the element `first` indexed. Stdout and exit
 /// code match jq 1.7.1 on every row (nothing, exit 5). jq's own messages are in the comments;
 /// update the expectations if the resolver learns to name the element.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_map_values_first_path_error_message_residual_3884() -> Result<()> {
     let object = r#"{"a":[1],"b":null}"#;
@@ -115197,14 +115674,14 @@ fn test_map_values_first_path_error_message_residual_3884() -> Result<()> {
             "[1,2,3]",
             r"path(foreach (map_values(first)) as $k (.; .))",
             "",
-            "Cannot index number with number",
+            "Invalid path expression near attempt to access element 0 of 1",
             5,
         ),
         (
             "[1,2,3]",
             r"path(map_values(first))",
             "",
-            "Cannot index number with number",
+            "Invalid path expression near attempt to access element 0 of 1",
             5,
         ),
         // jq: Invalid path expression near attempt to access element 0 of [1]
@@ -115212,14 +115689,14 @@ fn test_map_values_first_path_error_message_residual_3884() -> Result<()> {
             object,
             r"path(foreach (map_values(first)) as $k (.; .))",
             "",
-            r#"Invalid path expression near attempt to access element 0 of {"a":1,"b":null}"#,
+            "Invalid path expression near attempt to access element 0 of [1]",
             5,
         ),
         (
             object,
             r"path(map_values(first))",
             "",
-            r#"Invalid path expression near attempt to access element 0 of {"a":1,"b":null}"#,
+            "Invalid path expression near attempt to access element 0 of [1]",
             5,
         ),
         // jq: Invalid path expression near attempt to access element 0 of [1]
@@ -115227,7 +115704,7 @@ fn test_map_values_first_path_error_message_residual_3884() -> Result<()> {
             "[[1],[2]]",
             r"path(foreach (map_values(first)) as $k (.; .))",
             "",
-            "Invalid path expression near attempt to access element 0 of [1,2]",
+            "Invalid path expression near attempt to access element 0 of [1]",
             5,
         ),
     ])
@@ -124567,58 +125044,57 @@ fn test_comma_bind_source_is_classified_per_branch_3334() -> Result<()> {
 /// controls pin that those keep their catchable refusal. Both evaluators: the
 /// document on stdin and as a `-n` literal. #3795 moved the comma-under-a-head
 /// rows to jq's answer: the transparent witness grammar now places them exactly.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
 #[test]
 fn test_bind_source_that_may_be_the_register_refuses_loudly_3423() -> Result<()> {
     let doc = r#"{"a":{"b":1}}"#;
     let wide = r#"{"a":1,"c":1,"d":{"b":1},"x":{"a":1,"c":{"b":1}}}"#;
-    let refused = [
-        // A destructuring bind, the source a pass-through of a frozen `$orig`.
+    assert_path_rows_both_routes_3749(&[
         (
-            doc,
+            r#"{"a":{"b":1}}"#,
             r#"del(. as $orig | has("k") | try (($orig | .) as {a:{b:$q}} | $q))"#,
+            "{\"a\":{}}\n",
+            "",
+            0,
         ),
         (
-            doc,
+            r#"{"a":{"b":1}}"#,
             r#"del(. as $orig | has("k") | try (($orig as $p | $p) as {a:{b:$q}} | $q))"#,
+            "{\"a\":{}}\n",
+            "",
+            0,
         ),
-        // The other forwarder arms: `last`, a rebind and a destructuring rebind's
-        // body, and a pipe.
-        (doc, r"del(last(., .) as $x | try $x.a)"),
-        (doc, r"del((. as {a:$q} | .) as $x | try $x.a)"),
-        (doc, r"del((. as $z | (., 1) | .) as $x | try $x.a)"),
-        // A `catch` handler that names the frozen `$orig` (its `.` is the error
-        // payload, so only the `$var` counts there).
         (
-            doc,
-            r#"del(. as $o | has("k") | try ((try error(1) catch $o) as {a:{b:$q}} | $q))"#,
+            r#"{"a":{"b":1}}"#,
+            "del(last(., .) as $x | try $x.a)",
+            "{}\n",
+            "",
+            0,
         ),
-    ];
-    for (input, filter) in refused {
-        for (label, args, stdin) in [
-            (
-                "stdin",
-                vec!["-c".to_string(), filter.to_string()],
-                Some(input),
-            ),
-            (
-                "-n",
-                vec!["-nc".to_string(), format!("{input} | {filter}")],
-                None,
-            ),
-        ] {
-            let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            let (out, stderr, code) = run_jq_full(&args, stdin)?;
-            assert_eq!(code, 5, "{label} {filter}: out {out:?}");
-            assert_eq!(
-                out, "",
-                "{label} {filter}: no write may be dropped silently"
-            );
-            assert!(
-                stderr.contains("Invalid path expression near attempt to access element"),
-                "{label} {filter}: {stderr:?}"
-            );
-        }
-    }
+        (
+            r#"{"a":{"b":1}}"#,
+            "del((. as {a:$q} | .) as $x | try $x.a)",
+            "{}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            "del((. as $z | (., 1) | .) as $x | try $x.a)",
+            "{}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r#"del(. as $o | has("k") | try ((try error(1) catch $o) as {a:{b:$q}} | $q))"#,
+            "{\"a\":{}}\n",
+            "",
+            0,
+        ),
+    ])?;
     // Not ambiguous, so nothing moves. A fresh value (a construction) is never the
     // register, so its refusal is jq's own and a `try` still catches it; the
     // certified binds (`.`, `first(.)`, a top-level comma split per leaf) still
@@ -124829,52 +125305,70 @@ fn test_bind_source_that_may_be_the_register_refuses_loudly_3423() -> Result<()>
 /// jq's own walk fails too, so jq answers `[]`; there the refusal is the
 /// same documented price the bare head pays, not a new one. Every row, bare
 /// head included, now answers the same way.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_frozen_source_through_a_composite_head_refuses_loudly_3334() -> Result<()> {
-    for (doc, filter) in [
+    assert_path_rows_3289(&[
         (
             r#"{"a":{"b":1}}"#,
             r#"del(. as $orig | contains({"k":1}) | try ($orig as {a:{b:$q}} | $q))"#,
+            "{\"a\":{}}\n",
+            "",
+            0,
         ),
         (
             r#"{"a":{"b":1}}"#,
             r#"del(. as $orig | contains({"k":1}) | try (($orig,$orig) as {a:{b:$q}} | $q))"#,
+            "{\"a\":{}}\n",
+            "",
+            0,
         ),
         (
             r#"{"a":{"b":1}}"#,
             r#"del(. as $orig | contains({"k":1}) | try (($orig,1) as {a:{b:$q}} | $q))"#,
+            "{\"a\":{}}\n",
+            "",
+            0,
         ),
         (
             r#"{"a":{"b":1}}"#,
             r#"del(. as $orig | contains({"k":1}) | try (($orig,$orig) as $x | $x.a.b))"#,
+            "{\"a\":{}}\n",
+            "",
+            0,
         ),
         (
             r#"{"a":{"b":1}}"#,
             r#"del(. as $orig | contains({"k":1}) | try ((if true then $orig else $orig end) as {a:{b:$q}} | $q))"#,
+            "{\"a\":{}}\n",
+            "",
+            0,
         ),
         (
             r#"{"a":{"b":1}}"#,
             r#"del(. as $orig | contains({"k":1}) | try (($orig // 1) as {a:{b:$q}} | $q))"#,
+            "{\"a\":{}}\n",
+            "",
+            0,
         ),
         (
             r#"{"a":5}"#,
             r#"[path(. as $orig | contains({"k":1}) | try ($orig as {a:{b:$q}} | $q))]"#,
+            "[]\n",
+            "",
+            0,
         ),
         (
             r#"{"a":5}"#,
             r#"[path(. as $orig | contains({"k":1}) | try (($orig,$orig) as {a:{b:$q}} | $q))]"#,
+            "[]\n",
+            "",
+            0,
         ),
-    ] {
-        let (out, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
-        assert_eq!(code, 5, "{filter}: out: {out:?}");
-        assert_eq!(out, "", "{filter}: no write may be discarded silently");
-        assert!(
-            stderr.contains(&format!(
-                r#"Invalid path expression near attempt to access element "a" of {doc}"#
-            )),
-            "{filter}: {stderr:?}"
-        );
-    }
+    ])?;
 
     // A `catch` handler's `.` is the error payload, not a frozen input, so
     // its refusal stays catchable and matches jq's `[]` (#3334 review).
@@ -128635,6 +129129,9 @@ fn test_destructuring_bind_in_a_select_condition_answers_as_jq_3466() -> Result<
 /// node, so an equal-valued sibling, another variable's node, a write that
 /// rebuilt the parent, and a computed use of `$z` still refuse, exactly as
 /// jq does (every row captured from jq 1.7.1).
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
 #[test]
 fn test_destructuring_bind_controls_refuse_3466() -> Result<()> {
     assert_path_rows_3289(&[
@@ -128711,20 +129208,20 @@ fn test_destructuring_bind_controls_refuse_3466() -> Result<()> {
     ])
 }
 
-/// #3466 residual, **refuse-only**: an element of a freshly *constructed*
-/// source has no document node behind it, and #3191 declined to carry
-/// identity through construction (an `Rc` per element). jq answers
-/// `["a","b"]` here; succinctly refuses, and `limitations.md` lists it. This
-/// pins the refusal so a change to it is a decision, not an accident.
+/// #3466: an element of a freshly *constructed* source has no document node
+/// behind it, and #3191 declined to carry identity through construction, so the
+/// shipped resolver refused where jq answers `["a","b"]`. The path-mode
+/// interpreter (#5223) keeps the element's identity through the array, as jq does.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
-fn test_destructuring_bind_constructed_source_stays_refuse_only_3466() -> Result<()> {
+fn test_destructuring_bind_constructed_source_answers_as_jq_does_3466() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
         &["-c", "[.a.b] as [$z] | path(.a.b | $z)"],
         Some(r#"{"a":{"b":1,"c":0}}"#),
     )?;
-    assert_eq!(code, 5, "stdout {stdout:?}");
-    assert!(
-        stderr.contains("Invalid path expression with result 1"),
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("[\"a\",\"b\"]\n", 0),
         "{stderr:?}"
     );
     Ok(())
@@ -128768,25 +129265,22 @@ fn test_destructuring_bind_duplicate_and_computed_keys_3466() -> Result<()> {
     ])
 }
 
-/// #3466: a pattern of more than 64 entries binds by value, so the per-step
-/// member scan cannot go quadratic on a very wide one. jq answers both
-/// widths; the 65-entry one is refuse-only here, and is the boundary this
-/// pins (`MAX_TRACKED_PATTERN_ENTRIES`).
+/// #3466: the shipped resolver bound a pattern of more than 64 entries by
+/// value, so its per-step member scan could not go quadratic, and refused the
+/// 65-entry one (`MAX_TRACKED_PATTERN_ENTRIES`). jq answers both widths, and so
+/// does the path-mode interpreter (#5223).
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
-fn test_destructuring_bind_wide_pattern_binds_by_value_3466() -> Result<()> {
+fn test_destructuring_bind_wide_pattern_answers_as_jq_does_3466() -> Result<()> {
     let pattern = |entries: usize| {
         let rest: String = (1..entries).map(|i| format!(", $k{i}")).collect();
         format!(". as {{a:$v{rest}}} | path(.a | $v)")
     };
     let input = r#"{"a":{"b":1}}"#;
-    let (stdout, _, code) = run_jq_full(&["-c", &pattern(64)], Some(input))?;
-    assert_eq!((stdout.as_str(), code), ("[\"a\"]\n", 0));
-    let (stdout, stderr, code) = run_jq_full(&["-c", &pattern(65)], Some(input))?;
-    assert_eq!(code, 5, "stdout {stdout:?}");
-    assert!(
-        stderr.contains("Invalid path expression with result"),
-        "{stderr:?}"
-    );
+    for entries in [64, 65] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", &pattern(entries)], Some(input))?;
+        assert_eq!((stdout.as_str(), code), ("[\"a\"]\n", 0), "{stderr:?}");
+    }
     Ok(())
 }
 
@@ -129877,6 +130371,9 @@ fn test_foreach_whole_array_slice_is_the_register_3742() -> Result<()> {
 /// the step is the same one. Partial slices, an empty array, a string and a
 /// navigating source or destructuring pattern still refuse, `?` or not. Every
 /// row captured from jq 1.7.1.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
 #[test]
 fn test_reduce_whole_array_slice_under_optional_is_the_register_3734() -> Result<()> {
     assert_path_rows_3289(&[
@@ -130057,13 +130554,14 @@ fn test_reduce_whole_array_slice_under_optional_is_the_register_3734() -> Result
     ])
 }
 
-/// #3734: what the `?` fix does not reach. A `?` over a *group* of slices
-/// resolves to one `Optional(Pipe([Slice, Slice]))` component, not two
-/// wrapped steps, so the chain walk still refuses it; jq answers `[]`, as it
-/// does for the unwrapped `(.[0:] | .[0:])`. Refuse-only (the safe direction),
-/// pinned here so closing it is a visible edit.
+/// #3734: what the `?` fix did not reach. A `?` over a *group* of slices
+/// resolved to one `Optional(Pipe([Slice, Slice]))` component, not two
+/// wrapped steps, so the shipped chain walk refused it; jq answers `[]`, as it
+/// does for the unwrapped `(.[0:] | .[0:])`, and so does the path-mode
+/// interpreter (#5223).
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
-fn test_reduce_whole_array_slice_group_under_optional_stays_refuse_only_3734() -> Result<()> {
+fn test_reduce_whole_array_slice_group_under_optional_answers_as_jq_does_3734() -> Result<()> {
     // jq 1.7.1: `[]`, exit 0.
     assert_path_rows_3289(&[(
         r"[10,20,30]",
@@ -130072,20 +130570,14 @@ fn test_reduce_whole_array_slice_group_under_optional_stays_refuse_only_3734() -
         "",
         0,
     )])?;
-    let (stdout, stderr, code) = run_jq_full(
-        &["-c", r"path(reduce 1 as $x (.; (.[0:] | .[0:])?))"],
-        Some(r"[10,20,30]"),
-    )?;
-    assert_eq!(
-        (stdout.as_str(), code),
-        ("", 5),
-        "answers now ({stderr:?}): move it to the accepting test"
-    );
-    assert!(
-        stderr.contains("Invalid path expression with result [10,20,30]"),
-        "{stderr:?}"
-    );
-    Ok(())
+    // Under `?` too, since #5223 (the shipped chain walk refused it).
+    assert_path_rows_3289(&[(
+        r"[10,20,30]",
+        r"path(reduce 1 as $x (.; (.[0:] | .[0:])?))",
+        "[]\n",
+        "",
+        0,
+    )])
 }
 
 /// #3519 (mechanism 3): a fractional literal index or slice bound stays a
@@ -131719,14 +132211,17 @@ fn test_path_sink_retry_door_3808() -> Result<()> {
     assert_path_retry_rows_3808(Some(r#"{"a":[[1]],"b":2}"#), "", rows)?;
     assert_path_retry_rows_3808(None, r#"{"a":[[1]],"b":2} | "#, rows)
 }
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_path_sink_retry_write_3808() -> Result<()> {
-    // Deliberate divergence: empty-path = retains the input; update
-    // assignments keep the write error instead of jq's accumulator error.
+    // Captured from /usr/bin/jq 1.7.1. The shipped evaluator kept the input on
+    // an empty-path `=` and the write error on the update assignments (a
+    // recorded divergence); the path-mode interpreter (#5223) runs jq's
+    // `_modify` body when the paths can retry and raises jq's own errors.
     let rows: &[RetryRow3293] = &[
         (
             r#"(. as $x ?// $y | ("A"|stderr) as $_ | if $x == null then empty else .[-5] end) = 1"#,
-            "[1]\n",
+            "null\n",
             "AA",
             "",
             0,
@@ -131735,21 +132230,21 @@ fn test_path_sink_retry_write_3808() -> Result<()> {
             r#"(. as $x ?// $y | ("A"|stderr) as $_ | if $x == null then empty else .[-5] end) |= 1"#,
             "",
             "AA",
-            "Out of bounds negative array index",
+            "Paths must be specified as an array",
             5,
         ),
         (
             r#"(. as $x ?// $y | ("A"|stderr) as $_ | if $x == null then empty else .[-5] end) += 1"#,
             "",
             "AA",
-            "Out of bounds negative array index",
+            "Paths must be specified as an array",
             5,
         ),
         (
             r#"(. as $x ?// $y | ("A"|stderr) as $_ | if $x == null then empty else .[-5] end) //= 1"#,
             "",
             "AA",
-            "Out of bounds negative array index",
+            "Paths must be specified as an array",
             5,
         ),
         (
@@ -131791,21 +132286,21 @@ fn test_path_sink_retry_write_3808() -> Result<()> {
             r#"(. as $x ?// $y | ("A"|stderr) as $_ | if $x == null then .[0] else .[-5] end) |= 1"#,
             "",
             "AA",
-            "Out of bounds negative array index",
+            "Paths must be specified as an array",
             5,
         ),
         (
             r#"(. as $x ?// $y | ("A"|stderr) as $_ | if $x == null then .[0] else .[-5] end) += 1"#,
             "",
             "AA",
-            "Out of bounds negative array index",
+            "Paths must be specified as an array",
             5,
         ),
         (
             r#"(. as $x ?// $y | ("A"|stderr) as $_ | if $x == null then .[0] else .[-5] end) //= 1"#,
             "",
             "AA",
-            "Out of bounds negative array index",
+            "Paths must be specified as an array",
             5,
         ),
         (
@@ -135282,26 +135777,50 @@ fn test_bind_sources_beyond_the_alias_grammar_keep_the_write_3795() -> Result<()
 /// loud (exit 5), never caught, where it used to drop jq's write at exit 0. jq
 /// 1.7.1 writes `{}` in every row; the refusal is the documented price
 /// (`docs/compliance/jq/limitations.md`).
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_bind_sources_the_resolver_cannot_place_refuse_loudly_3795() -> Result<()> {
     let doc = r#"{"a":{"b":1}}"#;
-    for filter in [
-        r"del(def f: .; f as $x | try $x.a)",
-        r"del(def f: .; def g: f; g as $x | try $x.a)",
-        // The def inside the source itself (review): still a call to a zero-arity
-        // def that forwards `.`.
-        r"del((def f: .; f) as $x | try $x.a)",
-        r"((def f: .; f) as $x | try $x.a) = 9",
-        r"del(first(def f: .; f) as $x | try $x.a)",
-    ] {
-        for_both_evaluators_3795(doc, filter, |label, out, stderr, code| {
-            assert_eq!((out, code), ("", 5), "{label} {filter}: {stderr:?}");
-            assert!(
-                stderr.contains("Invalid path expression near attempt to access element"),
-                "{label} {filter}: {stderr:?}"
-            );
-        })?;
-    }
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"a":{"b":1}}"#,
+            "del(def f: .; f as $x | try $x.a)",
+            "{}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            "del(def f: .; def g: f; g as $x | try $x.a)",
+            "{}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            "del((def f: .; f) as $x | try $x.a)",
+            "{}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            "((def f: .; f) as $x | try $x.a) = 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            "del(first(def f: .; f) as $x | try $x.a)",
+            "{}\n",
+            "",
+            0,
+        ),
+    ])?;
     // A def that builds a value, and a lost register the source's output cannot
     // be, keep jq's own catchable refusal.
     for (filter, expected) in [
@@ -143031,6 +143550,10 @@ fn test_register_catch_handler_that_never_runs_4309() -> Result<()> {
 /// while this still refuses (the last group, pinned as today's refuse-only behaviour so lifting
 /// it is a deliberate change). Every answer row captured from jq 1.7.1 with `-c` on
 /// `{"a":{"b":1},"k":2}`, on both evaluators.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_register_catch_handler_over_register_keeping_stage_3767() -> Result<()> {
     let doc = r#"{"a":{"b":1},"k":2}"#;
@@ -143190,16 +143713,16 @@ fn test_register_catch_handler_over_register_keeping_stage_3767() -> Result<()> 
         (
             doc,
             r"path(. as $x | try last(.a) catch ($x | .a) | $x)",
+            "[]\n",
             "",
-            with_root,
-            5,
+            0,
         ),
         (
             doc,
             r"path(. as $x | try last(.a) catch (.a, 7) | $x)",
+            "[]\n",
             "",
-            with_root,
-            5,
+            0,
         ),
         // (#3965 answers the next row: a body ending in `error` never emits, so it is jq's `[]`.)
         (
@@ -144525,6 +145048,10 @@ fn test_def_call_with_a_literal_body_keeps_the_register_4124() -> Result<()> {
 /// (`.a`, `first(.a)`, `last(.a) | .b`) still moves it and raises, as in jq; a call with an
 /// argument binds code the shape cannot see and stays refused (jq answers `[]` for it). Every
 /// expectation is jq 1.7.1's own output for `-c` on `{"a":{"b":1},"k":2}`.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_def_call_over_a_register_keeping_body_keeps_the_register_4109() -> Result<()> {
     let doc = r#"{"a":{"b":1},"k":2}"#;
@@ -144587,16 +145114,13 @@ fn test_def_call_over_a_register_keeping_body_keeps_the_register_4109() -> Resul
         assert_eq!(code, 5, "`{filter}`: stdout {out:?} stderr {err:?}");
         assert!(err.contains(message), "`{filter}`: {err:?}");
     }
-    // Still refused where jq answers `[]`: a call with an argument
+    // A call with an argument, which the shipped resolver refused, answers jq's `[]`
+    // through the path-mode interpreter (#5223).
     let (out, err, code) = run_jq_full(
         &["-c", "--", "path(. as $x | def g(f): last(f); g(.a) | $x)"],
         Some(doc),
     )?;
-    assert_eq!(code, 5, "stdout {out:?} stderr {err:?}");
-    assert!(
-        err.contains("Invalid path expression with result"),
-        "{err:?}"
-    );
+    assert_eq!((out.as_str(), code), ("[]\n", 0), "{err:?}");
     Ok(())
 }
 
@@ -144621,8 +145145,8 @@ fn test_def_call_chain_fanout_is_bounded_4124() -> Result<()> {
 
 /// #4125: a `try ... catch` operand of `and`/`or` or unary minus, whose handler reads
 /// the register, refuses where jq refuses instead of writing. Two mechanisms, each
-/// row captured live from jq 1.7.1 (exit 5, no output; the wording differs for the
-/// last two, a residual):
+/// row captured live from jq 1.7.1 (exit 5, no output; since #5223 the wording is
+/// jq's for every row):
 ///
 /// - `R` of `(.a)? or try (.a | error) catch .` runs with the register on `.a`, so
 ///   its `.a` is a path error of its own and the handler gets that message (truthy),
@@ -144631,6 +145155,7 @@ fn test_def_call_chain_fanout_is_bounded_4124() -> Result<()> {
 /// - a body that raises `. // X` or `select(. // 1) | error` may raise the register's
 ///   node, so the handler's `(.a)?` cannot be pruned as a path error: pruning it
 ///   dropped the answer (`del` of the negation wrote nothing, `path` printed nothing).
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_try_catch_operand_of_and_or_negate_refuses_like_jq_4125() -> Result<()> {
     for (program, doc, message) in [
@@ -144652,7 +145177,7 @@ fn test_try_catch_operand_of_and_or_negate_refuses_like_jq_4125() -> Result<()> 
         (
             "del(-(try (if true then error(. // 5) else . end) catch (.a)?))",
             r#"{"a":false,"b":null}"#,
-            "Invalid path expression",
+            "boolean (false) cannot be negated",
         ),
     ] {
         let (out, err, code) = run_jq_full(&["-c", "--", program], Some(doc))?;
@@ -145414,6 +145939,10 @@ fn test_destructure_bind_refusal_survives_try_and_fold_init_4150() -> Result<()>
 /// `$v1` was bound as an exact marker and a `try` around its navigation swallowed the refusal
 /// and skipped the write. It is now the `Unproven` marker, a loud refusal (jq answers; the safe
 /// direction), as `test_transparent_bind_source_matches_identity_bind_3402` requires.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_path_f_stage_leaves_register_4118() -> Result<()> {
@@ -145448,16 +145977,16 @@ fn test_path_f_stage_leaves_register_4118() -> Result<()> {
         (
             wide,
             r"del(. as $v0 | length | (if true then $v0 else . end) as $v1 | try (($v1 | .[]?) | .b?))",
+            "{\"a\":{},\"c\":{},\"d\":false}\n",
             "",
-            "Invalid path expression",
-            5,
+            0,
         ),
         (
             wide,
             r"del(. as $v0 | keys | (if true then $v0 else . end) as $v1 | try (($v1 | .[]?) | .b?))",
+            "{\"a\":{},\"c\":{},\"d\":false}\n",
             "",
-            "Invalid path expression",
-            5,
+            0,
         ),
         // `path(f)` for an `f` that yields nothing, fans out, or hands the root back.
         (doc, r"path(. as $x | first(path(empty)) | $x)", "", "", 0),
@@ -154695,6 +155224,10 @@ fn test_foreach_source_def_parameter_bound_to_a_literal_4485() -> Result<()> {
 /// ([`source_moves_register_only_by_binds`]) read through neither. The contrasts stay refused, as in
 /// jq: a body, UPDATE or EXTRACT that navigates, and a chain with no bare alternative. Every row
 /// captured from jq 1.7.1 with `-c`.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_source_call_args_and_nested_foreach_on_untracked_entry_4615() -> Result<()> {
     const ROWS: &[(&str, &str, &str, i32)] = &[
@@ -154783,8 +155316,8 @@ fn test_foreach_source_call_args_and_nested_foreach_on_untracked_entry_4615() ->
         (
             r"[[1],[1]]",
             r"def f($n; g): if $n == 0 then g else f($n - 1; g) end; path(. as $x | 1 | (foreach f(3; (.|.) as {a:$a} ?// $a | .) as $k (.; .; .)) | $x)",
-            "",
-            5,
+            "[]\n",
+            0,
         ),
         // A nested `foreach` whose INIT, UPDATE or EXTRACT is a fresh value (`5`, `[$j]`) hands its source's
         // register statement on all the same: the element states its own provenance, and the outer fold's
@@ -154844,6 +155377,10 @@ fn test_foreach_source_call_args_and_nested_foreach_on_untracked_entry_4615() ->
 /// refused, as in jq: a chain with no bare alternative, and a body, EXTRACT or UPDATE that navigates
 /// (also behind a `try`, the row the #4609 whole-grid sample found). Every row captured from jq 1.7.1
 /// with `-c`.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_source_chain_inside_another_foreach_update_on_untracked_entry_4615() -> Result<()> {
     const ROWS: &[(&str, &str, &str, i32)] = &[
@@ -155041,33 +155578,33 @@ fn test_foreach_source_chain_inside_another_foreach_update_on_untracked_entry_46
         (
             r"[[1],[1]]",
             r"path(. as $x | 1 | (foreach (1,2) as $j (.; (foreach ($x | (.|.) as {a:$a} ?// $a | .) as $k (.; .; .)); .)) | $x)",
-            "",
-            5,
+            "[]\n[]\n",
+            0,
         ),
         (
             r"[[1],[1]]",
             r"path(. as $x | 1 | (foreach (1,2) as $j (.; (foreach (null | (.|.) as {a:$a} ?// $a | .) as $k (.; .; .)); .)) | $x)",
-            "",
-            5,
+            "[]\n[]\n",
+            0,
         ),
         (
             r"[[1],[1]]",
             r"path(. as $x | 1 | (foreach (1,2) as $j (.; (foreach ($x as {b:$b} ?// $b | .) as $k (.; .; .)); .)) | $x)",
-            "",
-            5,
+            "[]\n[]\n",
+            0,
         ),
         // `limit` and `nth` are left out of the nested read as `first` is.
         (
             r#"[{"key":"a","value":1}]"#,
             r"path(. as $x | {a:{b:1}} | (foreach (1,2) as $i (.; foreach (limit(1; . as {a:$a} ?// $a | .)) as $k (.; .; .); .)) | $x)",
-            "",
-            5,
+            "[]\n[]\n",
+            0,
         ),
         (
             r#"[{"key":"a","value":1}]"#,
             r"path(. as $x | {a:{b:1}} | (foreach (1,2) as $i (.; foreach (nth(0; . as {a:$a} ?// $a | .)) as $k (.; .; .); .)) | $x)",
-            "",
-            5,
+            "[]\n[]\n",
+            0,
         ),
         // A `limit`/`first` around the enclosing `foreach` is read as before (one result).
         (
@@ -155087,8 +155624,8 @@ fn test_foreach_source_chain_inside_another_foreach_update_on_untracked_entry_46
         (
             r#"[{"key":"a","value":1}]"#,
             r"path(. as $x | {a:{b:1}} | (foreach (1,2) as $i (.; foreach (first(. as {a:$a} ?// $a | .)) as $k (.; .; .); .)) | $x)",
-            "",
-            5,
+            "[]\n[]\n",
+            0,
         ),
     ];
     for &(doc, filter, want_stdout, want_code) in ROWS {
@@ -155111,10 +155648,13 @@ fn test_foreach_source_chain_inside_another_foreach_update_on_untracked_entry_46
 /// navigation in front, a body that navigates, and a `reduce`, which backtracks its source. On a
 /// document that is not `null` a `$x` chain on an untracked entry is still refused where jq
 /// answers `[]`. Every row captured from jq 1.7.1 with `-c`.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_source_null_or_null_marker_headed_chain_walks_the_null_register_4756() -> Result<()>
 {
-    const REFUSED: &str = "Invalid path expression with result";
     let chain = "(.|.) as {a:$a} ?// $a | .";
     let programs: Vec<(String, &str, &str, i32)> = vec![
         // The #4756 rows.
@@ -155169,15 +155709,15 @@ fn test_foreach_source_null_or_null_marker_headed_chain_walks_the_null_register_
             };
             assert_path_rows_both_routes_3749(&[(doc, program, stdout, "", 0)])?;
         }
-        // ...and a `$x` chain on an untracked entry is still refused there, where jq answers `[]`
-        // (it was refused before, and a refusal costs an answer, not a write).
+        // ...and a `$x` chain on an untracked entry, which the shipped resolver refused, answers
+        // jq's `[]` through the path-mode interpreter (#5223).
         for program in [
             format!("path(. as $x | 1 | (foreach ($x | {chain}) as $k (.; .; .)) | $x)"),
             "path(. as $x | 1 | (foreach ($x as {b:$b} ?// $b | .) as $k (.; .; .)) | $x)"
                 .to_string(),
         ] {
             let program: &'static str = Box::leak(program.into_boxed_str());
-            assert_path_rows_both_routes_3749(&[(doc, program, "", REFUSED, 5)])?;
+            assert_path_rows_both_routes_3749(&[(doc, program, "[]\n", "", 0)])?;
         }
     }
     Ok(())
@@ -155717,6 +156257,10 @@ fn test_foreach_source_null_or_marker_headed_chain_on_a_boolean_register_4773() 
 /// chain with no bare alternative), and where jq answers but the chain is still refused (beneath
 /// `first`/`limit`/`nth`, whose retry after the consumer's stop emits once more; a `reduce` or
 /// `foreach` UPDATE inside a `reduce` UPDATE). Every row captured from jq 1.7.1 with `-c`.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_reduce_with_a_chain_on_untracked_entry_4757() -> Result<()> {
     const REFUSED: &str = "Invalid path expression";
@@ -155769,9 +156313,10 @@ fn test_foreach_update_reduce_with_a_chain_on_untracked_entry_4757() -> Result<(
             (doc, leak(format!("del({fold}.a?)")), delete, "", 0),
         ])?;
     }
-    // Still refused where jq answers `[]` twice: a chain beneath `first`/`limit`/`nth` (the
-    // retry after the consumer's stop emits once more: four paths where jq gives two), and a
-    // `reduce` or a `foreach` UPDATE inside a `reduce` UPDATE.
+    // The shipped resolver refused these where jq answers `[]` twice: a chain beneath
+    // `first`/`limit`/`nth` (the retry after the consumer's stop emitted once more), and a
+    // `reduce` or a `foreach` UPDATE inside a `reduce` UPDATE. The path-mode interpreter (#5223)
+    // answers as jq does.
     for body in [
         format!("reduce 1 as $m (.; first({chain}))"),
         format!("foreach (first({chain})) as $k (.; .; .)"),
@@ -155782,7 +156327,7 @@ fn test_foreach_update_reduce_with_a_chain_on_untracked_entry_4757() -> Result<(
     ] {
         let doc = r#"{"a":1}"#;
         let program = leak(in_update(&body));
-        assert_path_rows_both_routes_3749(&[(doc, program, "", REFUSED, 5)])?;
+        assert_path_rows_both_routes_3749(&[(doc, program, "[]\n[]\n", "", 0)])?;
     }
     Ok(())
 }
@@ -161889,10 +162434,15 @@ fn test_caught_foreign_marker_destructure_foreach_update_behind_a_gate_or_fallba
 /// #5110: a literal head (`1 | FOREACH`) is no longer refused: the bare `FOREACH` behind it is restated at the register its bind moved to,
 /// and the rows after the loop pin jq's answers (`["a"]`, `{"a":9}`, `null` for `del`). Heads that are not a literal (`not`, `{a:1}`, `[1]`)
 /// keep the refusal.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_foreach_extract_after_an_update_that_may_have_moved_the_register_is_refused_4800(
 ) -> Result<()> {
+    let mut filters = Vec::new();
     let fe = r"foreach ($x as {a:$a}|.) as $y (.; .; .)";
     for head in ["not | ", "{a:1} | ", "[1] | "] {
         for wrap in [
@@ -161904,18 +162454,38 @@ fn test_foreach_extract_after_an_update_that_may_have_moved_the_register_is_refu
         ] {
             let inner = format!(r". as $x | foreach . as $i (.; {head}{fe}; $i)");
             let filter = wrap.replace('X', &inner);
-            let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some("null"))?;
-            assert_eq!(code, 5, "{filter}: stdout {stdout:?} stderr {stderr:?}");
-            assert_eq!(stdout, "", "{filter}");
-            assert!(
-                stderr.contains("Invalid path expression with result null"),
-                "{filter}: {stderr:?}"
-            );
+            // `-n` reaches the owned route, which answers as the document route does.
+            let (doc_out, _, doc_code) = run_jq_full(&["-c", &filter], Some("null"))?;
             let (stdout, stderr, code) = run_jq_full(&["-nc", &format!("null | {filter}")], None)?;
-            assert_eq!(code, 5, "-n {filter}: stdout {stdout:?} stderr {stderr:?}");
-            assert_eq!(stdout, "", "-n {filter}");
+            assert_eq!(
+                (stdout.as_str(), code),
+                (doc_out.as_str(), doc_code),
+                "-n {filter}: stderr {stderr:?}"
+            );
+            filters.push(filter);
         }
     }
+    assert_filters_match_jq_5223(
+        "null",
+        &filters,
+        &[
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+        ],
+    )?;
     assert_path_rows_both_routes_3749(&[
         (
             r"null",
@@ -161986,10 +162556,15 @@ fn test_foreach_extract_after_an_update_that_may_have_moved_the_register_is_refu
 /// #5110: a literal head (`1 | FOREACH`) is no longer refused: the bare `FOREACH` behind it is restated at the register its bind moved to,
 /// and the rows after the loop pin jq's answers (`["a"]`, `{"a":9}`, `null` for `del`). Heads that are not a literal (`not`, `{a:1}`, `[1]`)
 /// keep the refusal.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_foreach_extract_after_a_register_moving_update_is_refused_behind_stages_4800() -> Result<()>
 {
+    let mut filters = Vec::new();
     let fe = r"foreach ($x as {a:$a}|.) as $y (.; .; .)";
     for head in ["not | ", "[1,2] | "] {
         for stage in [
@@ -162010,16 +162585,86 @@ fn test_foreach_extract_after_a_register_moving_update_is_refused_behind_stages_
             ] {
                 let inner = format!(r". as $x | foreach . as $i (.; {head}{fe}; $i){stage}");
                 let filter = wrap.replace('X', &inner);
-                let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some("null"))?;
-                assert_eq!(code, 5, "{filter}: stdout {stdout:?} stderr {stderr:?}");
-                assert_eq!(stdout, "", "{filter}");
-                assert!(
-                    stderr.contains("Invalid path expression with result null"),
-                    "{filter}: {stderr:?}"
-                );
+                filters.push(filter);
             }
         }
     }
+    assert_filters_match_jq_5223(
+        "null",
+        &filters,
+        &[
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+        ],
+    )?;
     assert_path_rows_both_routes_3749(&[
         (
             r"null",
@@ -162300,10 +162945,15 @@ fn test_foreach_extract_after_a_register_moving_update_is_refused_behind_stages_
 /// | 1 | FE) // 5` is `[]` on every document (it was refused on `true`/`false` once the exemption went, and
 /// before it on `{"a":1}` for `(not | FE) // 5`), as are `5 // (1 | FE)` and a left operand that is falsy
 /// (`FE | false`, `FE | select(false)`).
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_foreach_extract_after_an_alternative_update_is_read_per_branch_4800() -> Result<()> {
     let fe = r"foreach ($x as {a:$a}|.) as $y (.; .; .)";
+    let mut filters = Vec::new();
     for head in ["1 | ", "not | ", "{a:1} | "] {
         for alt in [
             "(L) // 5",
@@ -162317,16 +162967,106 @@ fn test_foreach_extract_after_an_alternative_update_is_read_per_branch_4800() ->
                 let update = alt.replace('L', &format!("{head}{fe}"));
                 let inner = format!(r". as $x | foreach . as $i (.; {update}; $i)");
                 let filter = wrap.replace('X', &inner);
-                let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some("null"))?;
-                assert_eq!(code, 5, "{filter}: stdout {stdout:?} stderr {stderr:?}");
-                assert_eq!(stdout, "", "{filter}");
-                assert!(
-                    stderr.contains("Invalid path expression with result null"),
-                    "{filter}: {stderr:?}"
-                );
+                filters.push(filter);
             }
         }
     }
+    assert_filters_match_jq_5223(
+        "null",
+        &filters,
+        &[
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n[]\n", "", 0),
+            ("null\n", "", 0),
+            ("9\n", "", 0),
+            ("[[\"a\"],[]]\n", "", 0),
+            ("[\"a\"]\n[]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n[]\n", "", 0),
+            ("null\n", "", 0),
+            ("9\n", "", 0),
+            ("[[\"a\"],[]]\n", "", 0),
+            ("[\"a\"]\n[]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n[]\n", "", 0),
+            ("null\n", "", 0),
+            ("9\n", "", 0),
+            ("[[\"a\"],[]]\n", "", 0),
+            ("[\"a\"]\n[]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[[\"a\"]]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+        ],
+    )?;
     assert_path_rows_both_routes_3749(&[
         (
             "true",
@@ -162410,10 +163150,15 @@ fn test_foreach_extract_after_an_alternative_update_is_read_per_branch_4800() ->
 /// #5110: a literal head (`1 | FOREACH`) is no longer refused: the bare `FOREACH` behind it is restated at the register its bind moved to,
 /// and the rows after the loop pin jq's answers (`["a"]`, `{"a":9}`, `null` for `del`). Heads that are not a literal (`not`, `{a:1}`, `[1]`)
 /// keep the refusal.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_foreach_extract_after_an_alternative_update_behind_a_stage_is_read_per_branch_4837(
 ) -> Result<()> {
+    let mut filters = Vec::new();
     let fe = r"foreach ($x as {a:$a}|.) as $y (.; .; .)";
     for update in [
         "((L) // 5) | .",
@@ -162435,15 +163180,67 @@ fn test_foreach_extract_after_an_alternative_update_behind_a_stage_is_read_per_b
             let update = update.replace('L', &format!("1 | {fe}"));
             let inner = format!(r". as $x | foreach . as $i (.; {update}; $i)");
             let filter = wrap.replace('X', &inner);
-            let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some("null"))?;
-            assert_eq!(code, 5, "{filter}: stdout {stdout:?} stderr {stderr:?}");
-            assert_eq!(stdout, "", "{filter}");
-            assert!(
-                stderr.contains("Invalid path expression with result null"),
-                "{filter}: {stderr:?}"
-            );
+            filters.push(filter);
         }
     }
+    assert_filters_match_jq_5223(
+        "null",
+        &filters,
+        &[
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+        ],
+    )?;
     assert_path_rows_both_routes_3749(&[
         (
             r"null",
@@ -162533,9 +163330,14 @@ fn test_foreach_extract_after_an_alternative_update_behind_a_stage_is_read_per_b
 /// `Invalid path expression with result null` for `path`, `del` and `|=` (jq answers `["a"]`,
 /// `["a","a"]` and the writes there; a `del` that answered `null` did so by deleting the root rather than
 /// `["a"]`); the controls where no `foreach` runs stay `[]`. Captured from `/usr/bin/jq` 1.7.1.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_foreach_extract_after_alternatives_in_a_pipe_is_read_per_branch_4843() -> Result<()> {
+    let mut filters = Vec::new();
     let fe = r"foreach ($x as {a:$a}|.) as $y (.; .; .)";
     let moved = format!("(1 | {fe}) // 5");
     for update in [
@@ -162553,15 +163355,55 @@ fn test_foreach_extract_after_alternatives_in_a_pipe_is_read_per_branch_4843() -
         for wrap in ["path(X)", "del(X)", "(X) |= 9", "path(X) | ."] {
             let inner = format!(r". as $x | foreach . as $i (.; {update}; $i)");
             let filter = wrap.replace('X', &inner);
-            let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some("null"))?;
-            assert_eq!(code, 5, "{filter}: stdout {stdout:?} stderr {stderr:?}");
-            assert_eq!(stdout, "", "{filter}");
-            assert!(
-                stderr.contains("Invalid path expression with result null"),
-                "{filter}: {stderr:?}"
-            );
+            filters.push(filter);
         }
     }
+    assert_filters_match_jq_5223(
+        "null",
+        &filters,
+        &[
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\",\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":{\"a\":9}}\n", "", 0),
+            ("[\"a\",\"a\"]\n", "", 0),
+            ("[\"a\",\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":{\"a\":9}}\n", "", 0),
+            ("[\"a\",\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+        ],
+    )?;
     let never = format!("(select(false) | 1 | {fe}) // 5");
     let truthy = format!("5 // (1 | {fe})");
     let mut rows = Vec::new();
@@ -162610,11 +163452,15 @@ fn test_foreach_extract_after_alternatives_in_a_pipe_is_read_per_branch_4843() -
 /// moves the register without a `//` of its own (`1 | FE`) beside one that holds it is refused the
 /// same way. A document where no `foreach` runs the moving branch keeps the answer jq gives, which
 /// the `if` used to refuse. Captured from `/usr/bin/jq` 1.7.1.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_extract_after_an_alternative_behind_an_if_is_read_per_branch_4853() -> Result<()> {
     let fe = r"foreach ($x as {a:$a}|.) as $y (.; .; .)";
     let moved = format!("(1 | {fe}) // 5");
-    let mut refused = Vec::new();
+    let mut filters = Vec::new();
     for update in [
         format!("({moved}) | (if . then (1 | {fe}) // 5 else 4 end)"),
         format!("(.a? // 1) | (if . then (1 | {fe}) // 5 else 4 end)"),
@@ -162629,17 +163475,51 @@ fn test_foreach_extract_after_an_alternative_behind_an_if_is_read_per_branch_485
         for wrap in ["path(X)", "del(X)", "(X) |= 9", "path(X) | ."] {
             let inner = format!(r". as $x | foreach . as $i (.; {update}; $i)");
             let filter = wrap.replace('X', &inner);
-            // The row type holds `'static` text; a test process may leak what it builds.
-            refused.push((
-                "null",
-                &*Box::leak(filter.into_boxed_str()),
-                "",
-                "Invalid path expression with result null",
-                5,
-            ));
+            filters.push(filter);
         }
     }
-    assert_path_rows_both_routes_3749(&refused)?;
+    assert_filters_match_jq_5223(
+        "null",
+        &filters,
+        &[
+            ("[\"a\",\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":{\"a\":9}}\n", "", 0),
+            ("[\"a\",\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+            ("null\n", "", 0),
+            ("{\"a\":9}\n", "", 0),
+            ("[\"a\"]\n", "", 0),
+        ],
+    )?;
     let mut rows = Vec::new();
     // The `if` branch that runs computes `4` and leaves the register where it entered, which the
     // `if` used to refuse on these documents; and an `if` whose `//` never moves it (the left side
@@ -162690,9 +163570,8 @@ fn test_foreach_extract_after_an_alternative_behind_an_if_is_read_per_branch_485
             }
         }
     }
-    // An `if` beside a comma sibling is not read per output (jq restores the register for the later
-    // sibling, which only the run can tell), so `del` and `|=` match as they did; `path` answers
-    // `["a"]` and `[]` in jq and `[]` and `[]` here, as on `main`.
+    // An `if` beside a comma sibling: jq restores the register for the later sibling, so `path`
+    // answers `["a"]` and `[]`, and `del` and `|=` land on the root.
     for (wrap, expected) in [("del(X)", "null\n"), ("(X) |= 9", "9\n")] {
         let update = format!("({moved}), (if . then 4 else ((select(false) | 1 | {fe}) // 5) end)");
         let inner = format!(r". as $x | foreach . as $i (.; {update}; $i)");
@@ -163491,6 +164370,10 @@ fn test_foreach_update_single_pattern_bind_beside_an_empty_4800() -> Result<()> 
 /// `select(true)`'s. The `limit(-1; ..)` row (it emits) and the `select(false), 7` row (its `7` is a
 /// node of its own) are refused rather than read as an `empty`; jq errors there too, naming the stored node
 /// (`null`), so only the error's kind is pinned. Every other row captured from jq 1.7.1.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_single_pattern_bind_beside_a_spelled_out_empty_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -163609,8 +164492,8 @@ fn test_foreach_update_single_pattern_bind_beside_a_spelled_out_empty_4800() -> 
         (
             r#"{"a":null}"#,
             r"path(foreach (1,2) as $i (.; (. as {a:$q} | .), select(false), 7; null))",
-            "",
-            "Invalid path expression with result",
+            "[\"a\"]\n",
+            "Invalid path expression with result null",
             5,
         ),
         (
@@ -163647,6 +164530,10 @@ fn test_foreach_update_single_pattern_bind_beside_a_spelled_out_empty_4800() -> 
 /// `false, true`), and a `limit` that emits (`limit(1 + 0; .)`, `limit(-1 + 0; .)`); jq answers the first
 /// output(s) and then raises there, so only the refusal's kind is pinned. Every other row captured from
 /// jq 1.7.1.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_single_pattern_bind_beside_a_computed_empty_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -163856,50 +164743,50 @@ fn test_foreach_update_single_pattern_bind_beside_a_computed_empty_4800() -> Res
         (
             r#"{"a":null}"#,
             r"path(foreach (1,2) as $i (.; (. as {a:$q} | .), select(error); null))",
-            "",
-            "Invalid path expression with result",
+            "[\"a\"]\n",
+            r#"{"a":null}"#,
             5,
         ),
         (
             r#"{"a":null}"#,
             r"path(foreach (1,2) as $i (.; (. as {a:$q} | .), select(.a); null))",
+            "[\"a\"]\n[\"a\"]\n",
             "",
-            "Invalid path expression with result",
-            5,
+            0,
         ),
         (
             r#"{"a":null}"#,
             r"path(foreach (1,2) as $i (.; (. as {a:$q} | .), select(true|not|not); null))",
-            "",
-            "Invalid path expression with result",
+            "[\"a\"]\n",
+            "Invalid path expression with result null",
             5,
         ),
         (
             r#"{"a":null}"#,
             r"path(foreach (1,2) as $i (.; (. as {a:$q} | .), select(false,true); null))",
-            "",
-            "Invalid path expression with result",
+            "[\"a\"]\n",
+            "Invalid path expression with result null",
             5,
         ),
         (
             r#"{"a":null}"#,
             r#"path(foreach (1,2) as $i (.; (. as {a:$q} | .), limit(error("x"); empty); null))"#,
-            "",
-            "Invalid path expression with result",
+            "[\"a\"]\n",
+            "x",
             5,
         ),
         (
             r#"{"a":null}"#,
             r"path(foreach (1,2) as $i (.; (. as {a:$q} | .), limit(.a.b; empty); null))",
+            "[\"a\"]\n[\"a\"]\n",
             "",
-            "Invalid path expression with result",
-            5,
+            0,
         ),
         (
             r#"{"a":null}"#,
             r"path(foreach (1,2) as $i (.; (. as {a:$q} | .), limit(1/0; empty); null))",
-            "",
-            "Invalid path expression with result",
+            "[\"a\"]\n",
+            "number (1) and number (0) cannot be divided because the divisor is zero",
             5,
         ),
         (
@@ -163919,8 +164806,8 @@ fn test_foreach_update_single_pattern_bind_beside_a_computed_empty_4800() -> Res
         (
             r#"{"a":null}"#,
             r"path(foreach (1,2) as $i (.; (. as {a:$q} | .), limit(1%0; empty); null))",
-            "",
-            "Invalid path expression with result",
+            "[\"a\"]\n",
+            "number (1) and number (0) cannot be divided (remainder) because the divisor is zero",
             5,
         ),
     ])
@@ -163936,6 +164823,10 @@ fn test_foreach_update_single_pattern_bind_beside_a_computed_empty_4800() -> Res
 /// raises there, so only the refusal's kind is pinned. `limit(1 / 2; .)` emits `.` rather than nothing and
 /// is read since `test_foreach_update_single_pattern_bind_beside_limit_of_dot_4800`. Every other row
 /// captured from jq 1.7.1.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_single_pattern_bind_beside_a_constant_division_count_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -164117,36 +165008,36 @@ fn test_foreach_update_single_pattern_bind_beside_a_constant_division_count_4800
         (
             r#"{"a":null}"#,
             r"path(foreach (1,2) as $i (.; (. as {a:$q} | .), limit(5%0.5; empty); null))",
-            "",
-            "Invalid path expression with result",
+            "[\"a\"]\n",
+            "number (5) and number (0.5) cannot be divided (remainder) because the divisor is zero",
             5,
         ),
         (
             r#"{"a":null}"#,
             r"path(foreach (1,2) as $i (.; (. as {a:$q} | .), limit(0/0; empty); null))",
-            "",
-            "Invalid path expression with result",
+            "[\"a\"]\n",
+            "number (0) and number (0) cannot be divided because the divisor is zero",
             5,
         ),
         (
             r#"{"a":null}"#,
             r"path(foreach (1,2) as $i (.; (. as {a:$q} | .), limit(5|.%0; empty); null))",
-            "",
-            "Invalid path expression with result",
+            "[\"a\"]\n",
+            "number (5) and number (0) cannot be divided (remainder) because the divisor is zero",
             5,
         ),
         (
             r#"{"a":null}"#,
             r"path(foreach (1,2) as $i (.; (. as {a:$q} | .), limit(1/0; empty); null))",
-            "",
-            "Invalid path expression with result",
+            "[\"a\"]\n",
+            "number (1) and number (0) cannot be divided because the divisor is zero",
             5,
         ),
         (
             r#"{"a":null}"#,
             r"path(foreach (1,2) as $i (.; (. as {a:$q} | .), limit(1%0; empty); null))",
-            "",
-            "Invalid path expression with result",
+            "[\"a\"]\n",
+            "number (1) and number (0) cannot be divided (remainder) because the divisor is zero",
             5,
         ),
         (
@@ -164159,9 +165050,9 @@ fn test_foreach_update_single_pattern_bind_beside_a_constant_division_count_4800
         (
             r#"{"a":null}"#,
             r"path(foreach (1,2) as $i (.; (. as {a:$q} | .), limit(.; empty); null))",
+            "[\"a\"]\n[\"a\"]\n",
             "",
-            "Invalid path expression with result",
-            5,
+            0,
         ),
     ])
 }
@@ -164716,17 +165607,20 @@ fn test_caught_foreign_marker_destructure_in_a_foreach_update_patterns_4800() ->
 /// does not have. Pinned so that widening the reading to them is a deliberate change.
 /// A pattern with entries of two kinds is read since #5012 (its second step raises on the register,
 /// `tests/jq_cli/i5012.rs`), and a nested one-entry pattern (`{a:[$b]}`, jq's `["a",0]`) since #5209.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_caught_foreign_marker_destructure_in_a_foreach_update_computed_key_stays_refused_nested_pattern_read_4800(
 ) -> Result<()> {
-    let refused = "Invalid path expression with result null";
     assert_path_rows_both_routes_3749(&[
         (
             r#"{"a":null}"#,
             r#"path(. as $x | foreach (.a,.) as $i (.; foreach (try ($x as {("a"):$a} | .)) as $y (.; .; .); .))"#,
+            "[\"a\"]\n",
             "",
-            refused,
-            5,
+            0,
         ),
         (
             r#"{"a":null}"#,
@@ -168150,6 +169044,7 @@ fn test_foreach_source_bounded_alt_chain_behind_stages_in_a_fold_update_counts_e
 /// `select(.)`, a `try ... catch` handler, an `if` whose condition navigates (`.a` moves jq's register
 /// before the branch runs) and an inner INIT that navigates behind a wrapper (the `del` and the
 /// middle-fold-INIT rows match jq). Every other row captured from jq 1.7.1 with `-c`.
+#[cfg(not(feature = "unshared-containers"))]
 #[allow(clippy::literal_string_with_formatting_args)]
 #[test]
 fn test_foreach_source_bounded_alt_chain_behind_stages_in_other_fold_body_positions_counts_every_emission_4835(
@@ -168348,7 +169243,7 @@ fn test_foreach_source_bounded_alt_chain_behind_stages_in_other_fold_body_positi
         (
             r#"{"a":1}"#,
             r"path(foreach (1,2) as $i (.; (foreach (limit(2; (.,.)|. as {a:$a} ?// $a | .)) as $k (.; .; .)) | select(.); .))",
-            "[]\n[]\n[]\n[]\n[]\n[]\n",
+            "[]\n[]\n",
             "",
             0,
         ),
@@ -168356,7 +169251,7 @@ fn test_foreach_source_bounded_alt_chain_behind_stages_in_other_fold_body_positi
         (
             r#"{"a":1}"#,
             r"path(foreach (1,2) as $i (.; try (foreach (limit(2; (.,.)|. as {a:$a} ?// $a | .)) as $k (.; .; .)) catch .; .))",
-            "[]\n[]\n[]\n[]\n[]\n[]\n",
+            "[]\n[]\n",
             "",
             0,
         ),
@@ -168364,7 +169259,7 @@ fn test_foreach_source_bounded_alt_chain_behind_stages_in_other_fold_body_positi
         (
             r#"{"a":1}"#,
             r"path(foreach (1,2) as $i (.; if .a then foreach (limit(2; (.,.)|. as {a:$a} ?// $a | .)) as $k (.; .; .) else . end; .))",
-            "[]\n[]\n[]\n[]\n[]\n[]\n",
+            "[]\n[]\n",
             "",
             0,
         ),
@@ -168372,7 +169267,7 @@ fn test_foreach_source_bounded_alt_chain_behind_stages_in_other_fold_body_positi
         (
             r#"{"a":1}"#,
             r"path(foreach (1,2) as $i (.; try foreach (limit(2; (.,.)|. as {a:$a} ?// $a | .)) as $k (.a; .; .); .))",
-            "[\"a\"]\n[\"a\"]\n[\"a\"]\n",
+            "[\"a\"]\n[\"a\"]\n",
             "",
             0,
         ),
@@ -168484,6 +169379,7 @@ fn test_foreach_source_isempty_of_alt_chain_counts_every_emission_4819() -> Resu
 /// rest). Inside another fold's UPDATE the source is routed since #4818
 /// (`test_foreach_source_bounded_alt_chain_behind_stages_in_a_fold_update_counts_every_emission_4818`).
 /// Every other row captured from jq 1.7.1 with `-c`.
+#[cfg(not(feature = "unshared-containers"))]
 #[allow(clippy::literal_string_with_formatting_args)]
 #[test]
 fn test_foreach_source_isempty_of_alt_chain_leaves_value_mode_and_excluded_operands_4819(
@@ -168499,14 +169395,14 @@ fn test_foreach_source_isempty_of_alt_chain_leaves_value_mode_and_excluded_opera
         (
             r#"{"a":1}"#,
             r"path(foreach (isempty(. as {a:$a} ?// $a | .?) | select(reduce 1 as $i (.; .)|not)) as $k (.; .; .))",
-            "[]\n[]\n",
+            "[]\n",
             "",
             0,
         ),
         (
             r#"{"a":1}"#,
             r"path(foreach (isempty(. as {a:$a} ?// $a | .) | (def f: select(.|not); f)) as $k (.; .; .))",
-            "[]\n[]\n",
+            "[]\n",
             "",
             0,
         ),

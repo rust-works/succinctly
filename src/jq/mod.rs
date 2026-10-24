@@ -71,6 +71,7 @@
 //! ```
 
 mod array_index;
+mod c_builtin_identity;
 mod collect_object;
 mod deferred_bind;
 pub mod document;
@@ -89,10 +90,10 @@ mod lazy;
 mod local_zone;
 mod math;
 mod parser;
-// #5223 Phase 0: the register-carrying path-mode spike, reachable only from
-// `succinctly dev jq-path-spike` and its own tests.
+// #5223: the register-carrying path-mode interpreter, reachable only from
+// `succinctly dev jq-path-mode` and its own tests.
 #[doc(hidden)]
-pub mod path_spike;
+pub mod path_mode;
 pub mod resolve;
 mod slice;
 pub mod stream;

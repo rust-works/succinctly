@@ -268,3 +268,28 @@ fn test_fold_source_null_init_inside_a_fold_body_unchanged_5013() -> Result<()> 
         ),
     ])
 }
+
+/// #5223 Phase 3: this issue's repro rows, with `path`, `del` and `|=`
+/// wherever the row is a `path(...)`, as jq 1.7.1 answers them (stdout, the
+/// first error message, the exit code). The path-mode interpreter carries
+/// jq's register, so they match by construction, on both routes.
+#[cfg(not(feature = "unshared-containers"))]
+#[test]
+fn test_superseded_rows_match_jq_through_the_path_mode_interpreter_5013() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"a":null}"#,
+            r#"[path(. as $x | foreach (.a,.) as $i (.; try (foreach (try ($x as {a:$a} | .)) as $y (.a?; .; error("x"))) catch (.); $i))?]"#,
+            "[[\"a\"],[]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"a":true}}"#,
+            r"(. as $x | foreach (.,.a) as $i (.; (try (foreach ($x as {a:$a} | .) as $y (.a?; empty; error($x))) catch null)?; $i)) = 9",
+            "",
+            "Cannot index number with string \"a\"",
+            5,
+        ),
+    ])
+}

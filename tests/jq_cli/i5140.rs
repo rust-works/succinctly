@@ -2,7 +2,9 @@
 
 use anyhow::Result;
 
-use crate::{assert_path_rows_both_routes_3749, run_jq_full};
+#[cfg(not(feature = "unshared-containers"))]
+use crate::assert_path_rows_3289;
+use crate::assert_path_rows_both_routes_3749;
 
 // `reduce SRC as $i (INIT; W(. as {b:$q} | .))`: every output of the UPDATE is the accumulator's own node, so jq's register
 // is INIT's however far the bind navigated, and the final check passes. `update_returns_its_input` read `.`, a pipe, a
@@ -588,69 +590,26 @@ fn test_5140_reduce_update_bind_of_dot_behind_first_limit_nth_comma_if() -> Resu
 /// navigates, a `break` out of a `label` under a comma, `if`, `first`
 /// or `limit` (which is why the `label` read-through stays sound), and a `limit` count that is not a finite nonzero constant. Known divergences, listed in
 /// `docs/compliance/jq/limitations.md`: a change that answers one of them rewrites its row.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5140_wrappers_not_read_keep_their_refusal() -> Result<()> {
-    for (input, filter) in [
-        (
-            r#"{"a":{"b":1},"b":2}"#,
-            r"path(reduce (1,2) as $i (.; label $f | ((. as {b:$q} | .), break $f)))",
-        ),
-        (
-            r#"{"a":{"b":1},"b":2}"#,
-            r"(reduce (1,2) as $i (.; label $f | ((. as {b:$q} | .), break $f))) |= 9",
-        ),
-        (
-            r#"{"a":{"b":1},"b":2}"#,
-            r"path(reduce (1,2) as $i (.; label $f | if . then (. as {b:$q} | .), break $f else . end))",
-        ),
-        (
-            r#"{"a":{"b":1},"b":2}"#,
-            r"(reduce (1,2) as $i (.; label $f | if . then (. as {b:$q} | .), break $f else . end)) |= 9",
-        ),
-        (
-            r#"{"a":{"b":1},"b":2}"#,
-            r"path(reduce (1,2) as $i (.; label $f | first((. as {b:$q} | .), break $f)))",
-        ),
-        (
-            r#"{"a":{"b":1},"b":2}"#,
-            r"(reduce (1,2) as $i (.; label $f | first((. as {b:$q} | .), break $f))) |= 9",
-        ),
-        (
-            r#"{"a":{"b":1},"b":2}"#,
-            r"path(reduce (1,2) as $i (.; label $f | limit(2; (. as {b:$q} | .), break $f)))",
-        ),
-        (
-            r#"{"a":{"b":1},"b":2}"#,
-            r"(reduce (1,2) as $i (.; label $f | limit(2; (. as {b:$q} | .), break $f))) |= 9",
-        ),
-        (
-            r#"{"a":{"b":1},"b":2}"#,
-            r"path(reduce (1,2) as $i (.; limit(1e1000; . as {b:$q} | .)))",
-        ),
-        (
-            r#"{"a":{"b":1},"b":2}"#,
-            r"(reduce (1,2) as $i (.; limit(1e1000; . as {b:$q} | .))) |= 9",
-        ),
-        (
-            r#"{"a":{"b":1},"b":2}"#,
-            r"path(reduce (1,2) as $i (.; (first(. as {b:$q} | .)) // 5))",
-        ),
-        (
-            r#"{"a":{"b":1},"b":2}"#,
-            r"path(reduce (1,2) as $i (.; if .a then . as {b:$q} | . else . end))",
-        ),
-    ] {
-        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
-        assert_eq!(
-            (stdout.as_str(), code),
-            ("", 5),
-            "`{filter}` on {input}: stderr {stderr:?}"
-        );
-        assert!(
-            stderr.contains("Invalid path expression with result"),
-            "`{filter}` on {input}: {stderr:?}"
-        );
-    }
+    assert_path_rows_3289(&[
+        (r#"{"a":{"b":1},"b":2}"#, "path(reduce (1,2) as $i (.; label $f | ((. as {b:$q} | .), break $f)))", "[]\n", "", 0),
+        (r#"{"a":{"b":1},"b":2}"#, "(reduce (1,2) as $i (.; label $f | ((. as {b:$q} | .), break $f))) |= 9", "9\n", "", 0),
+        (r#"{"a":{"b":1},"b":2}"#, "path(reduce (1,2) as $i (.; label $f | if . then (. as {b:$q} | .), break $f else . end))", "[]\n", "", 0),
+        (r#"{"a":{"b":1},"b":2}"#, "(reduce (1,2) as $i (.; label $f | if . then (. as {b:$q} | .), break $f else . end)) |= 9", "9\n", "", 0),
+        (r#"{"a":{"b":1},"b":2}"#, "path(reduce (1,2) as $i (.; label $f | first((. as {b:$q} | .), break $f)))", "[]\n", "", 0),
+        (r#"{"a":{"b":1},"b":2}"#, "(reduce (1,2) as $i (.; label $f | first((. as {b:$q} | .), break $f))) |= 9", "9\n", "", 0),
+        (r#"{"a":{"b":1},"b":2}"#, "path(reduce (1,2) as $i (.; label $f | limit(2; (. as {b:$q} | .), break $f)))", "[]\n", "", 0),
+        (r#"{"a":{"b":1},"b":2}"#, "(reduce (1,2) as $i (.; label $f | limit(2; (. as {b:$q} | .), break $f))) |= 9", "9\n", "", 0),
+        (r#"{"a":{"b":1},"b":2}"#, "path(reduce (1,2) as $i (.; limit(1e1000; . as {b:$q} | .)))", "[]\n", "", 0),
+        (r#"{"a":{"b":1},"b":2}"#, "(reduce (1,2) as $i (.; limit(1e1000; . as {b:$q} | .))) |= 9", "9\n", "", 0),
+        (r#"{"a":{"b":1},"b":2}"#, "path(reduce (1,2) as $i (.; (first(. as {b:$q} | .)) // 5))", "[]\n", "", 0),
+        (r#"{"a":{"b":1},"b":2}"#, "path(reduce (1,2) as $i (.; if .a then . as {b:$q} | . else . end))", "[]\n", "", 0),
+    ])?;
     Ok(())
 }

@@ -982,3 +982,28 @@ fn test_fold_source_caught_x_that_is_the_register_in_another_fold_body_walks_it_
         ),
     ])
 }
+
+/// #5223 Phase 3: this issue's repro rows, with `path`, `del` and `|=`
+/// wherever the row is a `path(...)`, as jq 1.7.1 answers them (stdout, the
+/// first error message, the exit code). The path-mode interpreter carries
+/// jq's register, so they match by construction, on both routes.
+#[cfg(not(feature = "unshared-containers"))]
+#[test]
+fn test_superseded_rows_match_jq_through_the_path_mode_interpreter_5030() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#, r"del(. as $x | foreach (try reduce ($x as {b:$q} | .) as $w (0; .)) as $y (.a; .; .))", "{\"a\":{\"b\":1,\"c\":{\"b\":3}},\"b\":2}\n", "", 0),
+        (r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#, r"del(.a as $x | foreach ($x | . as {b:$q} | .) as $y (.a; .; .))", "", "Invalid path expression with result {\"b\":1,\"c\":{\"b\":3}}", 5),
+        (r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#, r"path(. as $x | foreach (try ($x | . as {b:$q} | .), 1) as $y (.a; .; .))", "[\"a\"]\n", "", 0),
+        (r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#, r"del(. as $x | foreach (try ($x | . as {b:$q} | .), 1) as $y (.a; .; .))", "{\"b\":2}\n", "", 0),
+        (r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#, r"(. as $x | foreach (try ($x | . as {b:$q} | .), 1) as $y (.a; .; .)) |= 9", "{\"a\":9,\"b\":2}\n", "", 0),
+        (r#"{"a":{"b":1},"c":{"b":2}}"#, r"path(.a as $x | .nope | reduce ($x as {b:$b} | .) as $y (.; .))", "", "Invalid path expression near attempt to access element \"b\" of {\"b\":1}", 5),
+        (r#"{"a":{"b":1},"c":{"b":2}}"#, r"del(.a as $x | .nope | reduce ($x as {b:$b} | .) as $y (.; .))", "", "Invalid path expression near attempt to access element \"b\" of {\"b\":1}", 5),
+        (r#"{"a":{"b":1},"c":{"b":2}}"#, r"(.a as $x | .nope | reduce ($x as {b:$b} | .) as $y (.; .)) |= 9", "", "Invalid path expression near attempt to access element \"b\" of {\"b\":1}", 5),
+        (r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#, r"path(. as $x | foreach ($x as {b:$q} | .) as $y (.a|tostring; .; .))", "", "Invalid path expression near attempt to access element \"b\" of {\"a\":{\"b\":1,\"c\":{\"b\":3}},\"...", 5),
+        (r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#, r"del(. as $x | foreach ($x as {b:$q} | .) as $y (.a|tostring; .; .))", "", "Invalid path expression near attempt to access element \"b\" of {\"a\":{\"b\":1,\"c\":{\"b\":3}},\"...", 5),
+        (r#"{"a":{"b":1,"c":{"b":3}},"b":2}"#, r"(. as $x | foreach ($x as {b:$q} | .) as $y (.a|tostring; .; .)) |= 9", "", "Invalid path expression near attempt to access element \"b\" of {\"a\":{\"b\":1,\"c\":{\"b\":3}},\"...", 5),
+        (r#"{"a":{"a":{"b":1}},"b":{"b":1}}"#, r"path(.a.c as $x | foreach (try ($x | . as {b:$q} | .)) as $y (.a; .; $y))", "", "", 0),
+        (r#"{"a":{"a":{"b":1}},"b":{"b":1}}"#, r"del(.a.c as $x | foreach (try ($x | . as {b:$q} | .)) as $y (.a; .; $y))", "{\"a\":{\"a\":{\"b\":1}},\"b\":{\"b\":1}}\n", "", 0),
+        (r#"{"a":{"a":{"b":1}},"b":{"b":1}}"#, r"(.a.c as $x | foreach (try ($x | . as {b:$q} | .)) as $y (.a; .; $y)) |= 9", "{\"a\":{\"a\":{\"b\":1}},\"b\":{\"b\":1}}\n", "", 0),
+    ])
+}

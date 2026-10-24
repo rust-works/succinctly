@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 
-use crate::{assert_path_rows_both_routes_3749, run_jq_full};
+use crate::assert_path_rows_both_routes_3749;
 
 /// #5012: the issue's rows. On `{"a":[null]}` the step's element is `.a`, which `$x` (the root) is not, so the nested
 /// source raises, the `try` restores the register to the element and its `catch $i` is emitted there. The state is the
@@ -466,34 +466,13 @@ fn test_foreach_update_try_handler_before_the_run_last_step_is_placed_5012() -> 
 /// the source in jq and moves the register first; a `try .. catch 1` around the source's destructure emits from the
 /// raise. (A step whose element `$x` is, with a one-entry pattern landing on the state, is read by position since
 /// #5179, `tests/jq_cli/i5179.rs`.) Both routes.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_try_handler_where_the_reading_does_not_hold_stays_refused_5012() -> Result<()>
 {
-    for (input, filter, stdout, message) in [
-        (
-            r#"{"a":[null]}"#,
-            r"path(. as $x | foreach (.a,.) as $i (.; try (foreach ($x as {a:$a} | .) as $y (.a?; .; .)) catch $i; $i))",
-            "",
-            "Invalid path expression with result [null]",
-        ),
-        (
-            r#"{"a":[null]}"#,
-            r"path(. as $x | foreach (.a,.) as $i (null; try (foreach (try ($x as {a:$a} | .) catch 1) as $y (.; .a?; .)) catch $i; $i))",
-            "",
-            "Invalid path expression near attempt to access element \"a\" of null",
-        ),
-    ] {
-        for (out, stderr, code) in [
-            run_jq_full(&["-c", filter], Some(input))?,
-            run_jq_full(&["-nc", &format!("{input} | {filter}")], None)?,
-        ] {
-            assert_eq!(
-                (out.as_str(), code),
-                (stdout, 5),
-                "{input} | {filter}: stderr {stderr:?}"
-            );
-            assert!(stderr.contains(message), "{input} | {filter}: {stderr:?}");
-        }
-    }
+    assert_path_rows_both_routes_3749(&[
+        (r#"{"a":[null]}"#, "path(. as $x | foreach (.a,.) as $i (.; try (foreach ($x as {a:$a} | .) as $y (.a?; .; .)) catch $i; $i))", "[\"a\"]\n[]\n", "", 0),
+        (r#"{"a":[null]}"#, "path(. as $x | foreach (.a,.) as $i (null; try (foreach (try ($x as {a:$a} | .) catch 1) as $y (.; .a?; .)) catch $i; $i))", "[\"a\"]\n", "", 0),
+    ])?;
     Ok(())
 }

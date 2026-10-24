@@ -382,3 +382,98 @@ fn test_5175_right_operand_with_a_bind_source_that_navigates_an_outer_marker() -
         ),
     ])
 }
+
+/// #5223 Phase 3: this issue's repro rows, with `path`, `del` and `|=`
+/// wherever the row is a `path(...)`, as jq 1.7.1 answers them (stdout, the
+/// first error message, the exit code). The path-mode interpreter carries
+/// jq's register, so they match by construction, on both routes.
+#[cfg(not(feature = "unshared-containers"))]
+#[test]
+fn test_superseded_rows_match_jq_through_the_path_mode_interpreter_5175() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"a":null}"#,
+            r"path(. as $x | reduce (.a,.) as $i (.; (($x as {a:$a} ?// $a | $a) // 5)?))",
+            "",
+            "Invalid path expression with result 5",
+            5,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"del(. as $x | reduce (.a,.) as $i (.; (($x as {a:$a} ?// $a | $a) // 5)?))",
+            "",
+            "Invalid path expression with result 5",
+            5,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"(. as $x | reduce (.a,.) as $i (.; (($x as {a:$a} ?// $a | $a) // 5)?)) |= 9",
+            "",
+            "Invalid path expression with result 5",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(. as $x | foreach (1,2) as $i (false; try (($x as {a:$a} | 5) // .a as $q | 1)))",
+            "",
+            "Invalid path expression with result 5",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"del(. as $x | foreach (1,2) as $i (false; try (($x as {a:$a} | 5) // .a as $q | 1)))",
+            "",
+            "Invalid path expression with result 5",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"(. as $x | foreach (1,2) as $i (false; try (($x as {a:$a} | 5) // .a as $q | 1))) |= 9",
+            "",
+            "Invalid path expression with result 5",
+            5,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"path(. as $x | reduce (1,2) as $i (.; try (($x as {a:$a} | .) // $x)))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"del(. as $x | reduce (1,2) as $i (.; try (($x as {a:$a} | .) // $x)))",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"(. as $x | reduce (1,2) as $i (.; try (($x as {a:$a} | .) // $x))) |= 9",
+            "9\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"path(. as $x | reduce (.a,.) as $i (null; (($x as {a:$a} ?// $a | .a) // 5)?))",
+            "",
+            "Invalid path expression with result null",
+            5,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"del(. as $x | reduce (.a,.) as $i (null; (($x as {a:$a} ?// $a | .a) // 5)?))",
+            "",
+            "Invalid path expression with result null",
+            5,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"(. as $x | reduce (.a,.) as $i (null; (($x as {a:$a} ?// $a | .a) // 5)?)) |= 9",
+            "",
+            "Invalid path expression with result null",
+            5,
+        ),
+    ])
+}

@@ -73,6 +73,20 @@ copy per step, in jq as well (`/usr/bin/jq` 1.7.1: 0.16 s at 10,000 steps, 0.71 
 See [the #3025 spike](../plan/issue-3025-spike.md) for the 200,000-digit
 cost and the [implementation results](../plan/issue-3025-results.md).
 
+### Path mode: the carried register
+
+jq's `path(f)` runs `f` with a register `(path, value)` that only navigation advances, and checks
+it with pointer identity (`jv_identical`) at every index, `getpath` and the end of the path. A
+jq-mode program whose path target is more than navigation -- an argument of `path`/`del`/`pick`,
+or an assignment target, that binds, folds, branches, retries a `?//` or calls a function -- runs
+whole through the path-mode interpreter ([src/jq/path_mode.rs](../../src/jq/path_mode.rs)), which
+carries that register with every output instead of inferring it. Its values use `OwnedValue`'s
+storage identity (shared containers, promoted strings and number literals), and jq's C builtins
+that hand back their input are listed in `src/jq/c_builtin_identity.rs`. Navigation-only targets
+and value filters over them (`select`, `//`, `first`, a caught `try`) stay on the streaming
+walkers. See [ADR-0026](../adrs/adr-0026.md) for the decision and the
+[Phase 0 spike report](../plan/jq-path-mode-interpreter-spike.md) for how it was measured.
+
 ### Streaming
 
 For large outputs, the evaluator supports streaming via `StreamableValue`, writing results incrementally without buffering the entire output. The YAML identity query (`yq '.'`) uses direct cursor-to-JSON streaming (P9 optimization).
@@ -98,6 +112,6 @@ The implementation covers a substantial subset of jq:
 
 ## Source & Docs
 
-- Implementation: [src/jq/](../../src/jq/) (parser.rs, expr.rs, eval.rs, eval_generic.rs, value.rs, stream.rs, lazy.rs, document.rs)
+- Implementation: [src/jq/](../../src/jq/) (parser.rs, expr.rs, eval.rs, eval_generic.rs, path_mode.rs, value.rs, stream.rs, lazy.rs, document.rs)
 - CLI integration: [src/bin/succinctly/jq_runner.rs](../../src/bin/succinctly/jq_runner.rs), [src/bin/succinctly/yq_runner.rs](../../src/bin/succinctly/yq_runner.rs)
 - CLI guide: [guides/cli.md](../guides/cli.md)

@@ -274,13 +274,17 @@ fn test_foreach_update_nth_over_dropped_dot_binds_4800() -> Result<()> {
 /// #4800: what stays refused. A dropped `.a` is a navigation that raises where the state is no object
 /// (`[1]`), which the bind-and-`.` reading does not cover, so `nth(1; .a, B)` with an `empty` EXTRACT keeps
 /// the refusal naming the state where jq prints nothing (jq 1.7.1: exit 0). Not a wrong accept.
+///
+/// #5223: the path-mode interpreter carries jq's register, so the rows the shipped resolver
+/// refused here now hold jq 1.7.1's answers.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 fn test_foreach_update_nth_over_a_dropped_navigation_keeps_its_refusal_4800() -> Result<()> {
     assert_path_rows_both_routes_3749(&[(
         r#"{"a":null}"#,
         r"path(foreach (1,2) as $i (.; nth(1; .a, (. as {a:$q} | .)); empty))",
         "",
-        "Invalid path expression with result {\"a\":null}",
-        5,
+        "",
+        0,
     )])
 }

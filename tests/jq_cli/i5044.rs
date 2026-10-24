@@ -332,3 +332,70 @@ fn test_foreach_extract_if_with_a_source_that_hands_the_register_on_keeps_the_ro
         ),
     ])
 }
+
+/// #5223 Phase 3: this issue's repro rows, with `path`, `del` and `|=`
+/// wherever the row is a `path(...)`, as jq 1.7.1 answers them (stdout, the
+/// first error message, the exit code). The path-mode interpreter carries
+/// jq's register, so they match by construction, on both routes.
+#[cfg(not(feature = "unshared-containers"))]
+#[test]
+fn test_superseded_rows_match_jq_through_the_path_mode_interpreter_5044() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"a":1,"b":2}"#,
+            r"path(. as $x | reduce (.a,.b) as $i (.; if . then foreach (try ($x as {a:$a} | .)) as $y (.; .; .) else .a end))",
+            "",
+            "Invalid path expression near attempt to access element \"a\" of null",
+            5,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            r"del(. as $x | reduce (.a,.b) as $i (.; if . then foreach (try ($x as {a:$a} | .)) as $y (.; .; .) else .a end))",
+            "",
+            "Invalid path expression near attempt to access element \"a\" of null",
+            5,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            r"(. as $x | reduce (.a,.b) as $i (.; if . then foreach (try ($x as {a:$a} | .)) as $y (.; .; .) else .a end)) |= 9",
+            "",
+            "Invalid path expression near attempt to access element \"a\" of null",
+            5,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            r"[path(. as $x | reduce (.a,.b) as $i (.; if . then foreach (try ($x as {a:$a} | .)) as $y (.; .; .) else .a end))?]",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            r"path(. as $x | foreach (.a,.b) as $i (.; .; if . then foreach (try ($x as {a:$a} | .)) as $y (.; .; .) else .a end))",
+            "",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            r"del(. as $x | foreach (.a,.b) as $i (.; .; if . then foreach (try ($x as {a:$a} | .)) as $y (.; .; .) else .a end))",
+            "{\"a\":1,\"b\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            r"(. as $x | foreach (.a,.b) as $i (.; .; if . then foreach (try ($x as {a:$a} | .)) as $y (.; .; .) else .a end)) |= 9",
+            "{\"a\":1,\"b\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r#"try del(. as $x | foreach (null,.a) as $i (.; if .a then .b else foreach (try ($x as {a:$a} | .)) as $y (.; .; .) end; .a)) catch "C""#,
+            "{\"a\":1}\n",
+            "",
+            0,
+        ),
+    ])
+}
