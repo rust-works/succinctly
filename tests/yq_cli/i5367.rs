@@ -20,3 +20,16 @@ fn test_posix_bracket_classes_stay_ascii_in_yq_mode_5367() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn test_posix_brackets_stay_ascii_for_yq_sub_and_capture_5367() -> Result<()> {
+    // yq's `sub` replaces every match; its classes are ASCII, so `é` and `ö` are left alone.
+    for (filter, want) in [
+        (r#""héllo wörld" | sub("[[:alpha:]]+";"X")"#, "XéX XöX\n"),
+        (r#""héllo" | capture("(?<w>[[:alpha:]]+)")"#, "w: h\n"),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, "", &["-n"])?;
+        assert_eq!((stdout.as_str(), code), (want, 0), "{filter}");
+    }
+    Ok(())
+}

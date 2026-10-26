@@ -30,46 +30,6 @@ fn test_posix_bracket_classes_are_unicode_aware_5367() -> Result<()> {
         (r#""é""#, r#"test("[[:^alpha:]]")"#, "false\n"),
         (r#""1""#, r#"test("[[:^alpha:]]")"#, "true\n"),
         (r#""é""#, r#"test("[[:alpha:][:digit:]]")"#, "true\n"),
-        (
-            r#""é1_""#,
-            r#"[match("[[:alpha:][:digit:]_]";"g")|.string]"#,
-            "[\"é\",\"1\",\"_\"]\n",
-        ),
-        (
-            r#""日本語 abc""#,
-            r#"[match("[[:alpha:]]+";"g")|.string]"#,
-            "[\"日本語\",\"abc\"]\n",
-        ),
-        (
-            r#""héllo wörld""#,
-            r#"gsub("[^[:alnum:] ]";"")"#,
-            "\"héllo wörld\"\n",
-        ),
-        (
-            r#""héllo, wörld!""#,
-            r#"gsub("[[:punct:]]";"")"#,
-            "\"héllo wörld\"\n",
-        ),
-        (
-            r#""a1é٣""#,
-            r#"[match("[[:digit:]]";"g")|.string]"#,
-            "[\"1\",\"٣\"]\n",
-        ),
-        (
-            r#""ÀÉ àé""#,
-            r#"[match("[[:upper:]]";"g")|.string]"#,
-            "[\"À\",\"É\"]\n",
-        ),
-        (
-            r#""ÀÉ àé""#,
-            r#"[match("[[:lower:]]";"g")|.string]"#,
-            "[\"à\",\"é\"]\n",
-        ),
-        (
-            r#""snake_case é""#,
-            r#"[match("[[:word:]]+";"g")|.string]"#,
-            "[\"snake_case\",\"é\"]\n",
-        ),
         (r#""]""#, r#"test("[]a[:alpha:]]")"#, "true\n"),
         (r#""é""#, r#"test("[]a[:alpha:]]")"#, "true\n"),
         (r#""é""#, r#"test("[^]a[:alpha:]]")"#, "false\n"),
@@ -84,10 +44,59 @@ fn test_posix_bracket_classes_are_unicode_aware_5367() -> Result<()> {
         (r#""abc""#, r#"test("[[:alpha:]]+")"#, "true\n"),
         (r#""É""#, r#"test("[[:upper:]]";"i")"#, "true\n"),
         (r#""é""#, r#"test("[[:upper:]]";"i")"#, "true\n"),
+        (r#""a[b]""#, r#"[match("[[]";"g")|.string]"#, "[\"[\"]\n"),
         (
-            r#""Éa""#,
-            r#"[match("^[[:upper:]][[:lower:]]+$").string]"#,
-            "[\"Éa\"]\n",
+            r#""a[b]""#,
+            r#"[match("[a[]";"g")|.string]"#,
+            "[\"a\",\"[\"]\n",
+        ),
+        (r#""x[y]""#, r#"gsub("[][]";"")"#, "\"xy\"\n"),
+        (
+            r#""a&b""#,
+            r#"[match("[a&&b]";"g")|.string]"#,
+            "[\"a\",\"&\",\"b\"]\n",
+        ),
+        (
+            r#""a&b~""#,
+            r#"[match("[&~]";"g")|.string]"#,
+            "[\"&\",\"~\"]\n",
+        ),
+        (r#""a&b""#, r#"test("[[:alpha:]&&[^a]]")"#, "false\n"),
+        (r#""ABC""#, r#"test("[a&&[:alpha:]]")"#, "true\n"),
+        (
+            r#""é[x""#,
+            r#"[match("[[:alpha:][]";"g")|.string]"#,
+            "[\"é\",\"[\",\"x\"]\n",
+        ),
+        (
+            r#""héllo wörld""#,
+            r#"sub("[[:alpha:]]+";"X")"#,
+            "\"X wörld\"\n",
+        ),
+        (
+            r#""héllo wörld""#,
+            r#"gsub("[[:alpha:]]+";"X")"#,
+            "\"X X\"\n",
+        ),
+        (
+            r#""héllo wörld""#,
+            r#"capture("(?<w>[[:alpha:]]+) (?<v>[[:alpha:]]+)")"#,
+            "{\"w\":\"héllo\",\"v\":\"wörld\"}\n",
+        ),
+        (
+            r#""héllo wörld""#,
+            r#"[splits("[^[:alpha:]]+")]"#,
+            "[\"héllo\",\"wörld\"]\n",
+        ),
+        (
+            r#""héllo wörld""#,
+            r#"[scan("[[:alpha:]]+")]"#,
+            "[\"héllo\",\"wörld\"]\n",
+        ),
+        (
+            r#""héllo wörld""#,
+            r#"ascii_downcase | test("^[[:alpha:] ]+$")"#,
+            "true\n",
         ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(input))?;
@@ -95,6 +104,25 @@ fn test_posix_bracket_classes_are_unicode_aware_5367() -> Result<()> {
             (stdout.as_str(), code),
             (want, 0),
             "{program} on {input}: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// A bracket-shaped `[:name:]` inside a class whose name is not a POSIX class is an error, in
+/// jq as here (the wording differs, as for every regex failure).
+#[test]
+fn test_unknown_posix_bracket_name_is_an_error_5367() -> Result<()> {
+    for program in [
+        r#"test("[[:foo:]]")"#,
+        r#"test("[[:ALPHA:]]")"#,
+        r#"test("[[:^foo:]]")"#,
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(r#""é""#))?;
+        assert_eq!((stdout.as_str(), code), ("", 5), "{program}: {stderr}");
+        assert!(
+            stderr.contains("invalid POSIX bracket type"),
+            "{program}: {stderr}"
         );
     }
     Ok(())

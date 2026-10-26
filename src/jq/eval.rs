@@ -25424,15 +25424,18 @@ fn unicode_posix_class(name: &str) -> Option<&'static str> {
     })
 }
 
-/// Rewrite the POSIX brackets (`[:alpha:]`, `[:^alpha:]`) inside a character class into nested
-/// Unicode classes (#5367). Oniguruma's are Unicode-aware, so `"é" | test("[[:alpha:]]")` is
+/// Rewrite the character classes of a jq pattern to what Oniguruma's Perl syntax means by them
+/// (#5367): the POSIX brackets (`[:alpha:]`, `[:^alpha:]`) inside a class become nested Unicode
+/// classes, and a `[`, `&` or `~` inside a class is the literal character. Oniguruma's are Unicode-aware, so `"é" | test("[[:alpha:]]")` is
 /// `true` in jq; the `regex` crate's are ASCII, so it was `false`. Outside a class a `[:alpha:]` is
 /// an ordinary class of those characters in both engines and is not touched, nor is an escaped
-/// bracket; a name this does not know is left for the crate to accept or reject.
+/// bracket. A bracket-shaped `[:word:]` (lowercase letters, optionally led by `^`) whose name is not
+/// a POSIX class is an error, as in jq (`invalid POSIX bracket type`); `ascii` and `xdigit` are
+/// ASCII in both engines and are left to the crate.
 #[cfg(feature = "regex")]
-fn translate_posix_brackets(pattern: &str) -> std::borrow::Cow<'_, str> {
-    if !pattern.contains("[:") {
-        return std::borrow::Cow::Borrowed(pattern);
+fn translate_posix_brackets(pattern: &str) -> Result<std::borrow::Cow<'_, str>, EvalError> {
+    if !pattern.contains('[') {
+        return Ok(std::borrow::Cow::Borrowed(pattern));
     }
     let chars: Vec<char> = pattern.chars().collect();
     let mut out = String::new();
@@ -25463,32 +25466,39 @@ fn translate_posix_brackets(pattern: &str) -> std::borrow::Cow<'_, str> {
             continue;
         }
         if c == '[' {
-            if chars.get(i + 1) == Some(&':') {
-                let rest = &chars[i + 2..];
-                if let Some(end) = rest.windows(2).position(|w| w == [':', ']']) {
-                    let name: String = rest[..end].iter().collect();
-                    let (negated, bare) = match name.strip_prefix('^') {
-                        Some(bare) => (true, bare),
-                        None => (false, name.as_str()),
-                    };
-                    if let Some(body) = unicode_posix_class(bare) {
-                        out.push('[');
-                        if negated {
-                            out.push('^');
-                        }
-                        out.push_str(body);
-                        out.push(']');
-                        changed = true;
-                        i += 2 + end + 2;
-                        at_start = false;
-                        continue;
+            if let Some((name_end, negated, name)) = posix_bracket_at(&chars, i) {
+                if matches!(name.as_str(), "ascii" | "xdigit") {
+                    // Identical in both engines: copied through as written.
+                    out.extend(&chars[i..name_end]);
+                } else if let Some(body) = unicode_posix_class(&name) {
+                    out.push('[');
+                    if negated {
+                        out.push('^');
                     }
+                    out.push_str(body);
+                    out.push(']');
+                    changed = true;
+                } else {
+                    return Err(EvalError::new("invalid regex: invalid POSIX bracket type"));
                 }
+                i = name_end;
+                at_start = false;
+                continue;
             }
-            depth += 1;
-            at_start = true;
+            // Oniguruma's Perl syntax has no nested classes or set operators: a `[` inside a
+            // class is a literal `[`, as are `&` and `~` (the `regex` crate would read them as
+            // a nested class, an intersection and a symmetric difference).
+            out.push_str("\\[");
+            changed = true;
+            at_start = false;
+            i += 1;
+            continue;
         } else if c == ']' && !at_start {
             depth -= 1;
+        } else if c == '&' || c == '~' {
+            out.push('\\');
+            changed = true;
+            at_start = false;
         } else if c == '^' && at_start {
             // A leading `^` keeps the position "first".
             out.push(c);
@@ -25500,11 +25510,35 @@ fn translate_posix_brackets(pattern: &str) -> std::borrow::Cow<'_, str> {
         out.push(c);
         i += 1;
     }
-    if changed {
+    Ok(if changed {
         std::borrow::Cow::Owned(out)
     } else {
         std::borrow::Cow::Borrowed(pattern)
+    })
+}
+
+/// The POSIX bracket starting at `chars[at]` (a `[`): the index just past its closing `:]`,
+/// whether it is negated (`[:^name:]`), and its name. `None` unless it is `[:` + an optional `^` +
+/// ASCII letters + `:]`, so a `[:` that is not a bracket costs a few characters, not a
+/// scan of the rest of the pattern.
+#[cfg(feature = "regex")]
+fn posix_bracket_at(chars: &[char], at: usize) -> Option<(usize, bool, String)> {
+    if chars.get(at + 1) != Some(&':') {
+        return None;
     }
+    let mut j = at + 2;
+    let negated = chars.get(j) == Some(&'^');
+    if negated {
+        j += 1;
+    }
+    let name_start = j;
+    while chars.get(j).is_some_and(char::is_ascii_alphabetic) {
+        j += 1;
+    }
+    if j == name_start || chars.get(j) != Some(&':') || chars.get(j + 1) != Some(&']') {
+        return None;
+    }
+    Some((j + 2, negated, chars[name_start..j].iter().collect()))
 }
 
 /// Build regex flags from jq flag string
@@ -25515,7 +25549,7 @@ fn build_regex<S: EvalSemantics>(pattern: &str, flags: Option<&str>) -> Result<J
     let mut pattern = if S::TAG == EvalTag::Yq {
         pattern.to_string()
     } else {
-        translate_posix_brackets(pattern).into_owned()
+        translate_posix_brackets(pattern)?.into_owned()
     };
 
     // Apply flags

@@ -7176,7 +7176,9 @@ A POSIX bracket inside a character class (`[[:alpha:]]`, `[[:^upper:]]`, ...) is
 Each class was compared with the pinned jq over every scalar value.
 Nothing jq matches is missed, and the only extra matches are code points that the `regex` crate's Unicode 16 tables assign and Oniguruma's older tables do not.
 yq mode keeps the ASCII classes, as Go's `regexp` has them.
-Four exotic shapes still differ: an unknown name (`[[:foo:]]`) is accepted here and is `invalid POSIX bracket type` in jq, a range from a POSIX bracket (`[[:alpha:]-z]`) is accepted here and an error in jq, a nested class or `&&` inside a class means set union or intersection here and a literal `[` or `&` in jq's Perl syntax, and a negated bracket under the `i` flag (`test("[[:^upper:]]";"i")`) is case-folded before the negation here and is not in jq.
+Three exotic shapes still differ: a range from a POSIX bracket (`[[:alpha:]-z]`) and a doubled hyphen (`[a--b]`) are accepted here and an error in jq, and a negated bracket under the `i` flag (`test("[[:^upper:]]";"i")`) is case-folded before the negation here and is not in jq.
+An unknown bracket name (`[[:foo:]]`, `[[:ALPHA:]]`) is an error in both, with this crate's wording.
+In jq mode a `[`, `&` or `~` inside a class is the literal character, as in Oniguruma's Perl syntax, where the `regex` crate would read a nested class, an intersection and a symmetric difference.
 
 ## Regex flags `l` and `n`
 
