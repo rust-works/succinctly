@@ -26377,7 +26377,7 @@ fn eval_sub_replacement<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // by `capture_object` purely from `regex::Captures` substrings of the
     // already-matched subject string; the `regex` crate operates on `&str`,
     // so that subject was necessarily valid UTF-8 already, and every capture
-    // group is a clean substring of it (or absent). `captures` itself can
+    // group is a clean substring of it (or `null`, for one that took no part, #5363). `captures` itself can
     // therefore never carry undecodable content for `stream_outputs_lossy`'s
     // unchecked fold to silently launder.
     //
@@ -26975,17 +26975,20 @@ fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     )
 }
 
-/// Extract named captures from an already-obtained `Captures` into a jq object.
+/// Extract named captures from an already-obtained `Captures` into a jq object, in group order.
+///
+/// A named group that took no part in the match (`"b" | capture("(?<x>a)?(?<y>b)")`) is there
+/// with a `null` value, as in jq (#5363); unnamed groups are not part of the object.
 #[cfg(feature = "regex")]
 fn capture_object(re: &JqRegex, caps: &regex::Captures) -> OwnedValue {
     let mut entries = IndexMap::new();
     for name in re.capture_names().flatten() {
-        if let Some(m) = caps.name(name) {
-            entries.insert(
-                name.to_string(),
-                OwnedValue::String(m.as_str().to_string().into()),
-            );
-        }
+        // #5363: a group that took no part in the match is `null`, not absent -- jq builds this
+        // object from every named capture, whether or not it matched.
+        let value = caps.name(name).map_or(OwnedValue::Null, |m| {
+            OwnedValue::String(m.as_str().to_string().into())
+        });
+        entries.insert(name.to_string(), value);
     }
     OwnedValue::Object(entries.into())
 }
@@ -27684,9 +27687,10 @@ fn scan_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // Has capture groups - return array of captured strings
             let mut captured = Vec::new();
             for i in 1..capture_count {
-                if let Some(m) = caps.get(i) {
-                    captured.push(OwnedValue::String(m.as_str().to_string().into()));
-                }
+                // #5363: a group that took no part in the match is `null` in its place.
+                captured.push(caps.get(i).map_or(OwnedValue::Null, |m| {
+                    OwnedValue::String(m.as_str().to_string().into())
+                }));
             }
             results.push(OwnedValue::array_from(captured));
         } else {
