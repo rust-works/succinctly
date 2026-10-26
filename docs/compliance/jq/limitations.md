@@ -523,7 +523,7 @@ The interpreter's own recorded divergences:
   The interpreter's write builds a new array at offset 0.
   The difference is observable only through jq's 65,536-element slice-copy rule: `[range(70003)] | .[60000:] | .[0] = 0 | del(.[6000:] as $x | .[6000:] | $x) | length` is `6000` here and an `Invalid path expression` in jq, whose second slice reaches offset 66,000 and is copied (`test_5118_a_written_view_answers_where_jq_refuses_5223`).
 - **A walk jq never finishes raises the existing caps.** `null | [path(recurse(.a))] | length` and `path(recurse(.a?; true))` on `{"a":null}` never return in jq; they raise `recurse: maximum nodes exceeded` here after 10,000 nodes, as the value walker does (the shipped path walker pruned a `null` node's children and answered `1`, #856).
-  `until`/`while`, `range` and `repeat` keep their caps the same way (see the sections on each below).
+  `until`/`while`, `range` (at `MAX_RANGE_TOTAL`) and `repeat` keep their caps the same way (see the sections on each below).
 - **`del(.[nan])`** loops forever in jq 1.7.1 on an array; here the NaN path names no element and the document comes back unchanged.
   `path(.[nan])` is jq's `[null]`.
   The same holds on every route, for a key held in a variable (`nan as $v | del(.[$v])`) and for `|= empty` through one (#5245).
@@ -10150,13 +10150,16 @@ verification are both about value mode; a follow-up applying the identical
 demand-driven treatment to `resolve_repeat_sink` would close this the
 same way.
 
-### `reduce`/`foreach`'s own step budget (#695/#2079): a flat per-step cap that refuses input-sized folds (#5292)
+### `reduce`/`foreach`'s own step budget (#695/#2079): meters the INIT forks past the first (#5292)
 
 > The budget's raise is uncatchable by `?`/`try`/`catch` since #2132 -- see "Every resource cap is uncatchable" below.
 
-> This section used to be headed "bounds genuine fanout, not ordinary element count", and that was never true of the shipped cap.
-> The budget is a flat count of steps, so a plain 200,000-element fold (`reduce range(200000) as $x (0; . + $x)`) is refused where jq answers `19999900000`.
-> #5292 tracks lifting it; the history below is why the number is what it is.
+> This section used to be headed "bounds genuine fanout, not ordinary element count", and that was never true of the shipped cap: it was a flat count of steps, so a plain 200,000-element fold (`reduce range(200000) as $x (0; . + $x)`) was refused where jq answers `19999900000`.
+> Since #5292 the budget is charged only by the INIT forks past the first.
+> The first fork runs the source once, so its steps are as many as the source has elements, which is what jq pays too: `reduce .users[] as $u (0; . + $u.score)` over 699,050 users answers.
+> Only the later forks multiply that cost, which is the product #695 was written against, so those are the only steps counted.
+> A fold with one INIT fork is therefore not capped at all, in `reduce` and `foreach`, in value mode and in `path()` mode, and for `foreach`'s EXTRACT charge as well.
+> The history below is why the number is what it is.
 
 `REDUCE_FOREACH_MAX_STEPS` (`src/jq/eval.rs`) is a shared step budget charged
 against `reduce`/`foreach` once per UPDATE eval, and -- `foreach` only --
@@ -10737,6 +10740,14 @@ same one a computed bracket's component stream gets.
 
 > The cap's raise is uncatchable by `?`/`try`/`catch` since #2132 -- see "Every resource cap is uncatchable" just below.
 
+> Since #5292 `MAX_RANGE` (`100000`) is the size of the batches a range is built in, not a limit on the range.
+> Each batch is handed to the consumer before the next is built, resuming where the cap cut the last one short (the running value, for a float range, so accumulation is bit-identical to an unbatched walk).
+> `[range(200000)] | length`, `reduce range(1000000) as $x (0; . + $x)` and `last(range(0; 2000000; 3))` answer as jq does.
+> A new cap, `MAX_RANGE_TOTAL` (2^26 = 67,108,864 values handed to a consumer that keeps asking), takes the old one's place: `[range(1e18)]` and a never-ending `range(nan)` raise `range: maximum iterations exceeded` there instead of growing until the host process is killed.
+> That is about 2 GiB of values for a consumer that keeps them all, and jq has no such cap.
+> `first`, `limit` and `nth` still build one batch.
+> The rest of this section is written for the old cap; the demand-aware raise it describes now happens at `MAX_RANGE_TOTAL`.
+
 `MAX_RANGE` (`src/jq/eval.rs`, `100000`, shared by `eval_range_values` and
 `eval_range_values_f64`) caps how many values a single `(from, to, step)`
 combination will accumulate before raising, mirroring
@@ -10790,7 +10801,7 @@ own repro table didn't happen to list, not new ones introduced by this fix.
 
 ### Every resource cap is uncatchable by `?`/`try`/`catch` (#2132) -- shared by the six cap sections
 
-The six evaluator-imposed caps documented in this file -- `range`'s `MAX_RANGE` (#2089, above),
+The six evaluator-imposed caps documented in this file -- `range`'s `MAX_RANGE_TOTAL` (#2089, #5292, above),
 `while`/`until`'s `WHILE_UNTIL_MAX_STEPS` (#534/#2087), `reduce`/`foreach`'s
 `REDUCE_FOREACH_MAX_STEPS` (#695/#2079), `repeat`'s `MAX_ITERATIONS` (#2014), `recurse(f)`'s
 `RECURSE_MAX_ITEMS` (#3716, which ended the walk silently until then), and a recursive
