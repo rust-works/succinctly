@@ -51,6 +51,11 @@ fn test_capture_and_scan_keep_a_group_that_did_not_match_as_null_5363() -> Resul
             r#""a" | sub("(?<x>a)(?<y>z)?"; "\(has("y"))")"#,
             "\"true\"\n",
         ),
+        // `gsub` evaluates its replacement per match, each against its own object.
+        (
+            r#""ab" | gsub("(?<x>a)|(?<y>b)"; "[\(.x)|\(.y)]")"#,
+            "\"[a|null][null|b]\"\n",
+        ),
         // Unchanged: a group that matched, and `match`, which already listed every group.
         (
             r#""ab" | capture("(?<x>a)(?<y>b)")"#,

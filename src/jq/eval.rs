@@ -26377,7 +26377,7 @@ fn eval_sub_replacement<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // by `capture_object` purely from `regex::Captures` substrings of the
     // already-matched subject string; the `regex` crate operates on `&str`,
     // so that subject was necessarily valid UTF-8 already, and every capture
-    // group is a clean substring of it (or absent). `captures` itself can
+    // group is a clean substring of it (or `null`, for one that took no part, #5363). `captures` itself can
     // therefore never carry undecodable content for `stream_outputs_lossy`'s
     // unchecked fold to silently launder.
     //
@@ -26975,7 +26975,10 @@ fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     )
 }
 
-/// Extract named captures from an already-obtained `Captures` into a jq object.
+/// Extract named captures from an already-obtained `Captures` into a jq object, in group order.
+///
+/// A named group that took no part in the match (`"b" | capture("(?<x>a)?(?<y>b)")`) is there
+/// with a `null` value, as in jq (#5363); unnamed groups are not part of the object.
 #[cfg(feature = "regex")]
 fn capture_object(re: &JqRegex, caps: &regex::Captures) -> OwnedValue {
     let mut entries = IndexMap::new();
