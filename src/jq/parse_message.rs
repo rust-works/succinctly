@@ -155,6 +155,7 @@ fn check_string(token: &[u8]) -> Result<(), Stop> {
         }
         let Some(&escape) = token.get(at) else {
             return Err(Stop::Fault("Expected escape character at end of string"));
+            // patchcov: coverage tolerate-line reason="unreachable: a backslash puts the scanner in its escape state, which cannot close the string, so a finished token never ends on one (jq keeps the check as a guard)"
         };
         at += 1;
         match escape {
@@ -481,6 +482,38 @@ mod tests {
         ] {
             assert_eq!(message(text), None, "{text:?}");
         }
+    }
+
+    /// The faults a container reports for a misplaced token, and the value that survives a
+    /// following token (every row captured live from jq 1.7.1).
+    #[test]
+    fn misplaced_tokens_5309() {
+        for (text, want) in [
+            (
+                "[1[",
+                "Expected separator between values at line 1, column 3",
+            ),
+            ("[1:", "':' not as part of an object at line 1, column 3"),
+            ("{1:", "Object keys must be strings at line 1, column 3"),
+            (
+                "{\"a\",",
+                "Objects must consist of key:value pairs at line 1, column 5",
+            ),
+            // The second top-level value is complete when the `[` arrives, and that is the fault.
+            ("1 2[", "Unexpected extra JSON values"),
+            ("1e", "Invalid numeric literal at EOF at line 1, column 2"),
+            ("1e+", "Invalid numeric literal at EOF at line 1, column 3"),
+            (".", "Invalid numeric literal at EOF at line 1, column 1"),
+            // Valid escapes, and a surrogate pair, inside a text that fails later.
+            (
+                "\"a\\n\\/\\u00e9\\ud83d\\ude00\" 1",
+                "Unexpected extra JSON values",
+            ),
+        ] {
+            assert_eq!(message(text).as_deref(), Some(want), "{text:?}");
+        }
+        assert_eq!(message("1e+5"), None);
+        assert_eq!(message("-1E-5"), None);
     }
 
     #[test]
