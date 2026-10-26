@@ -164,3 +164,4 @@ mod i5338;
 mod i5339;
 mod i5351;
 mod i5361;
+mod i5363;
