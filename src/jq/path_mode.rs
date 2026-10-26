@@ -47,7 +47,7 @@ use super::error::{dump_truncated_with, Control, EvalError};
 use super::eval::{
     apply_compare_op, arith_combine, arith_negate, compare_values, is_tree_descending_f,
     native_stack_exhausted, owned_to_string, range_max_exceeded_error, EvalTag, JqSemantics,
-    QueryResult, MAX_EMPTY_REPEAT_ROUNDS, MAX_EVAL_FRAMES, MAX_RANGE, RECURSE_MAX_ITEMS,
+    QueryResult, MAX_EMPTY_REPEAT_ROUNDS, MAX_EVAL_FRAMES, MAX_RANGE_TOTAL, RECURSE_MAX_ITEMS,
     REPEAT_WIDTH_BUDGET, WHILE_UNTIL_MAX_STEPS,
 };
 use super::expr::{
@@ -2302,7 +2302,7 @@ impl<'e> Interp<'e> {
                     let mut emitted = 0;
                     while cmp(below, &current, &end) {
                         emitted += 1;
-                        if emitted > MAX_RANGE {
+                        if emitted > MAX_RANGE_TOTAL {
                             return Err(Raise::Fatal(range_max_exceeded_error()));
                         }
                         sink(current.clone(), reg.clone())?;
@@ -3454,7 +3454,7 @@ fn range_values(start: OwnedValue, end: &OwnedValue, reg: &Reg, sink: &mut Sink<
             return Ok(());
         }
         emitted += 1;
-        if emitted > MAX_RANGE {
+        if emitted > MAX_RANGE_TOTAL {
             return Err(Raise::Fatal(range_max_exceeded_error()));
         }
         let value = first.take().unwrap_or_else(|| number_owned(cur));
