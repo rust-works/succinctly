@@ -520,6 +520,76 @@ fn is_assignment_expr(expr: &Expr) -> bool {
     }
 }
 
+/// The prefix of the variable a shorthand object key's output is bound to (#5323). It starts
+/// with `%`, which no jq variable name can, so it never meets a program's own.
+const SHORTHAND_KEY_VAR: &str = "%shorthand key";
+
+/// `body` with `var` bound to each output of `source`.
+fn bind_var(source: Expr, var: String, body: Expr) -> Expr {
+    Expr::As {
+        expr: Box::new(source),
+        var,
+        body: Box::new(body),
+    }
+}
+
+/// An object construction whose interpolated shorthand keys (`{"a\(1,2)"}`) may yield several
+/// values (#5323). jq evaluates the key once and indexes with that output, so each key output
+/// pairs with its own value, and the entries nest first-outermost. `entries` holds each such
+/// entry as `{($v): .[$v]}` over the variable `marks` names (`(index, variable, key string)`,
+/// in entry order), and the object is rebuilt so that variable is bound where jq binds it:
+///
+/// ```text
+/// {E1, "a\(K)", E3}  ==>  {E1} as $o | (K as $v | {($v): .[$v], E3}) as $r | $o + $r
+/// ```
+///
+/// The entries before a key are a loop of their own and run first; `$o + $r` inserts the later
+/// entries after them, as the object construction would.
+fn lower_multi_valued_shorthand_keys(
+    mut entries: Vec<ObjectEntry>,
+    marks: Vec<(usize, String, Expr)>,
+) -> Expr {
+    let mut later: Option<Expr> = None;
+    let mut first_index = entries.len();
+    for (index, var, key_string) in marks.into_iter().rev() {
+        let segment = Expr::Object(entries.split_off(index));
+        let body = match later.take() {
+            None => segment,
+            Some(rest) => {
+                let (head_var, rest_var) = (format!("{var} head"), format!("{var} rest"));
+                let both = Expr::arithmetic(
+                    ArithOp::Add,
+                    Expr::Var(head_var.clone()),
+                    Expr::Var(rest_var.clone()),
+                );
+                bind_var(segment, head_var, bind_var(rest, rest_var, both))
+            }
+        };
+        later = Some(bind_var(key_string, var, body));
+        first_index = index;
+    }
+    let lowered = later.expect("at least one multi-valued key");
+    let lowered = if first_index == 0 {
+        lowered
+    } else {
+        let (head_var, rest_var) = (
+            format!("{SHORTHAND_KEY_VAR} head {first_index}"),
+            format!("{SHORTHAND_KEY_VAR} rest {first_index}"),
+        );
+        let both = Expr::arithmetic(
+            ArithOp::Add,
+            Expr::Var(head_var.clone()),
+            Expr::Var(rest_var.clone()),
+        );
+        bind_var(
+            Expr::Object(entries),
+            head_var,
+            bind_var(lowered, rest_var, both),
+        )
+    };
+    Expr::Paren(Box::new(lowered))
+}
+
 /// Whether `expr` yields exactly one value on every input -- a conservative syntactic check,
 /// `false` for anything it cannot see through (a call, a generator, an iteration). A string
 /// interpolation is one when every `\(E)` is (#5298).
@@ -2711,6 +2781,9 @@ impl<'a> Parser<'a> {
         self.skip_ws();
 
         let mut entries = Vec::new();
+        // #5323: the interpolated shorthand keys that may yield several values, as `(index of
+        // the entry, the variable its key output is bound to, the key string)`.
+        let mut multi_valued_keys: Vec<(usize, String, Expr)> = Vec::new();
 
         // Empty object
         if self.peek() == Some('}') {
@@ -2774,7 +2847,7 @@ impl<'a> Parser<'a> {
                     self.parse_yq_object_entry()?
                 } else {
                     let mut string_key: Option<Expr> = None;
-                    let (key, dollar_shorthand_value) = if self.peek() == Some('(') {
+                    let (mut key, dollar_shorthand_value) = if self.peek() == Some('(') {
                         // Dynamic key: (expr)
                         self.next();
                         let key_expr = self.parse_expr()?;
@@ -2844,18 +2917,25 @@ impl<'a> Parser<'a> {
                     } else if let Some(key_string) = string_key {
                         // #5298: `{"a\(1)"}` is `{"a\(1)": .["a\(1)"]}`. jq reads the key once and
                         // indexes with that value, so an interpolation that could yield several
-                        // would pair each key with its own value; reading the string twice, as
-                        // this does, would pair every key with every value. Only a string that
-                        // is surely one value takes the shorthand.
-                        if !is_surely_single_valued(&key_string) {
-                            return Err(ParseError::new(
-                                "an interpolated object key written without a value must be a single value; write the value out",
-                                self.pos,
-                            ));
-                        }
-                        Expr::IndexExpr {
-                            target: Box::new(Expr::Identity),
-                            key: Box::new(key_string),
+                        // pairs each key with its own value; reading the string twice, as this
+                        // does, would pair every key with every value. A string that is surely
+                        // one value takes the shorthand as written.
+                        if is_surely_single_valued(&key_string) {
+                            Expr::IndexExpr {
+                                target: Box::new(Expr::Identity),
+                                key: Box::new(key_string),
+                            }
+                        } else {
+                            // #5323: any other string binds its output once, to a variable the
+                            // entry's key and value both read, and the object is rebuilt around
+                            // that binding after the loop (`lower_multi_valued_shorthand_keys`).
+                            let var = format!("{SHORTHAND_KEY_VAR} {}", self.pos);
+                            key = ObjectKey::Expr(Box::new(Expr::Var(var.clone())));
+                            multi_valued_keys.push((entries.len(), var.clone(), key_string));
+                            Expr::IndexExpr {
+                                target: Box::new(Expr::Identity),
+                                key: Box::new(Expr::Var(var)),
+                            }
                         }
                     } else {
                         // Shorthand: key must be literal identifier
@@ -2913,7 +2993,13 @@ impl<'a> Parser<'a> {
             }
         }
 
-        Ok(Expr::Object(entries))
+        if multi_valued_keys.is_empty() {
+            return Ok(Expr::Object(entries));
+        }
+        Ok(lower_multi_valued_shorthand_keys(
+            entries,
+            multi_valued_keys,
+        ))
     }
 
     /// A parenthesised run of `key: value` pairs at an entry position of a yq-mode `{...}`
@@ -11816,16 +11902,19 @@ mod tests {
             assert!(first_key_is_expr(source), "{source}");
             assert!(first_value_indexes_dot(source), "{source}");
         }
+        // A string that may yield several values still takes the shorthand (#5323): it is rebuilt
+        // around a variable bound to the key's output, so the object is no `Expr::Object`.
         for source in [
             r#"{"a\(1,2)"}"#,
             r#"{"a\(.xs[])"}"#,
             r#"{"a\(empty)"}"#,
             r#"{"a\(foo)"}"#,
+            r#"{b: 1, "a\(1,2)", c: 2}"#,
         ] {
-            let error = jq(source).expect_err(source);
             assert!(
-                error.to_string().contains("must be a single value"),
-                "{source}: {error}"
+                matches!(jq(source), Ok(Expr::Paren(inner)) if matches!(*inner, Expr::As { .. } | Expr::Pipe(_))),
+                "{source}: {:?}",
+                jq(source)
             );
         }
         // A bare format is no key, an unterminated string is still an error, and a plain string key
