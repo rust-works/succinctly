@@ -12807,17 +12807,15 @@ fat-body defs of 50 terms, every one used and included: 585 ms to 28 ms on an Ap
 1.9 s to 57 ms on an AMD 7950X, output identical; 2000 of them run in 112 ms and 245 ms).
 Programs whose modules are only top-level, or only dependencies, are unchanged.
 
-### `modulemeta` answers from the module's header and `def`s, with two gaps in the header (#5321)
+### `modulemeta` answers from the module's header and `def`s (#5321, #5344)
 
 `modulemeta` resolves its input like an `import` does, on the library directories alone, and answers the header metadata, then `deps` and `defs`.
 The current directory is not searched, as in jq: a `cw.jq` beside the invocation is `module not found: cw`.
 A module that is found but fails to load prints its diagnostic to stderr and answers `null` with exit 0, as jq does.
-Four things differ, all in the parts of a module that succinctly's parser reads more narrowly than jq's.
-A metadata value is a literal here (string, number, boolean, `null`, array, object), where jq takes any constant expression, so `module {a:(1+2)};` is a parse error here and `{"a":3,...}` in jq.
-A metadata number is read as a double, so `-0` prints `0` and a literal such as `100000000000000000001` prints rounded, where jq 1.7.1 keeps the literal.
-A module whose last item is a lone `.` (`def f: 1; .`) is accepted, where jq reports `library should only have function definitions, not a main expression`, because the parser reads it as an empty body.
-The wording of the parse error, and of `Module metadata must be an object`, is succinctly's own, the same fidelity limit as a module's syntax error above.
-Both are tracked in [#5344](https://github.com/rust-works/succinctly/issues/5344).
+The metadata of a `module` header and of an `import`/`include` directive is an ordinary expression that is folded to a constant object, as in jq (#5344): `module {a:(1+2)};` answers `{"a":3,...}`, `({a:1}+{b:2})` and `{a:[1,(2+3)]}` fold, a keyword or a quoted key is fine, a number literal keeps its spelling (`1.50`, `100000000000000000001`, `0.1e2` as `1E+1`), and an expression that does not fold is `Module metadata must be constant` while one that folds to anything but an object is `Module metadata must be an object`.
+A unary minus is not constant in jq (`module {a:-1};` is refused), and is not here.
+Three folds jq makes are not made here, and each is refused as `Module metadata must be constant`: `$__loc__` (jq answers `{"file":...,"line":...}`; the parser does not know the file), a pipe through the identity (`(.|1)` is `1` in jq), and an object shorthand `{$__loc__}`.
+The wording of a syntax error in the metadata is succinctly's own, the same fidelity limit as a module's syntax error above; where jq reports a second `Module metadata must be constant` after its syntax error, only the first is reported here.
 
 ### Module-scope gaps that are genuinely open
 

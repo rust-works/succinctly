@@ -942,13 +942,7 @@ fn meta_value_to_owned(value: &jq::MetaValue) -> OwnedValue {
         jq::MetaValue::Null => OwnedValue::Null,
         jq::MetaValue::Bool(b) => OwnedValue::Bool(*b),
         jq::MetaValue::String(s) => OwnedValue::string(s.clone()),
-        jq::MetaValue::Number(n) => {
-            if n.fract() == 0.0 && n.abs() < 9_007_199_254_740_992.0 {
-                OwnedValue::Int(*n as i64)
-            } else {
-                OwnedValue::Float(*n)
-            }
-        }
+        jq::MetaValue::Number(literal) => OwnedValue::from(literal.clone()),
         jq::MetaValue::Array(items) => {
             OwnedValue::Array(items.iter().map(meta_value_to_owned).collect())
         }
@@ -11760,7 +11754,7 @@ mod tests {
         assert_eq!(
             search(MetaValue::Array(vec![
                 string("a"),
-                MetaValue::Number(1.0),
+                MetaValue::Number(jq::Literal::Int(1)),
                 string("/abs"),
                 string("."),
                 string(""),
@@ -11771,7 +11765,7 @@ mod tests {
         // Anything else is an empty list, which finds nothing.
         for value in [
             MetaValue::Null,
-            MetaValue::Number(1.0),
+            MetaValue::Number(jq::Literal::Int(1)),
             MetaValue::Bool(true),
             MetaValue::Object(Vec::new()),
         ] {

@@ -2007,8 +2007,9 @@ pub enum MetaValue {
     Null,
     /// String value
     String(String),
-    /// Number value
-    Number(f64),
+    /// A number: a literal keeps the spelling it was written with (`1.50`, `0.1e2`, and
+    /// `100000000000000000001`, which a double would round), a computed one is plain (#5344)
+    Number(Literal),
     /// Boolean value
     Bool(bool),
     /// Array of values

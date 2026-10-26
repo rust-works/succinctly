@@ -34,8 +34,8 @@ use alloc::collections::BTreeSet;
 use std::collections::BTreeSet;
 
 use super::eval::{
-    arith_combine, compare_values, contains_retrying_pattern_bind, yq_scalar_text_eq, EvalError,
-    EvalSemantics, JqSemantics, YqSemantics,
+    apply_compare_op, arith_combine, compare_values, contains_retrying_pattern_bind,
+    yq_scalar_text_eq, EvalError, EvalSemantics, JqSemantics, YqSemantics,
 };
 use super::expr::{
     ArithOp, ArithSettleMemo, AssignOp, Builtin, CompareOp, Expr, FormatType, FuncDefBound, Import,
@@ -569,6 +569,117 @@ fn is_surely_single_valued(expr: &Expr) -> bool {
             | Builtin::Round,
         ) => true,
         _ => false,
+    }
+}
+
+/// jq's constant folding for module metadata (#5344): the value of `expr` when it is built
+/// only from literals, or `None` when jq would call it `Module metadata must be constant`.
+///
+/// What folds, captured live against jq 1.7.1: a `null`/`true`/`false`/number/string literal
+/// without interpolation (a number keeps its spelling, `1.50` and `0.1e2` print as written
+/// and as `1E+1`), parentheses, an array of constants, an object whose keys are constant
+/// strings (an identifier, a keyword, a quoted string or a parenthesised constant string)
+/// and whose values are constant, and an arithmetic or comparison operator over two
+/// constants that does not fail (`(1+2)`, `("x"*2)`, `({a:1}+{b:2})`, `(null+1)`). A
+/// repeated key keeps its first position and takes the last value. Not constant: unary
+/// minus (`-1`), `and`/`or`/`//`, a pipe, a comma outside an array, a path, a variable, a
+/// call, an interpolated string, and an operator that fails (`1+"x"`, `1/0`).
+fn fold_constant(expr: &Expr) -> Option<OwnedValue> {
+    match expr {
+        Expr::Literal(literal) => Some(OwnedValue::from(literal.clone())),
+        Expr::Paren(inner) => fold_constant(inner),
+        Expr::Array(inner) => {
+            // `[]` is an array of an empty comma; a lone item has no comma at all.
+            let items = match &**inner {
+                Expr::Comma(items) => items.iter().map(fold_constant).collect::<Option<_>>()?,
+                single => vec![fold_constant(single)?],
+            };
+            Some(OwnedValue::array_from(items))
+        }
+        Expr::Object(entries) => {
+            let mut pairs: Vec<(String, OwnedValue)> = Vec::new();
+            for entry in entries {
+                let key = match &entry.key {
+                    ObjectKey::Literal(key) => key.clone(),
+                    ObjectKey::Expr(key) => fold_constant(key)?.as_str()?.to_string(),
+                    ObjectKey::Bare => return None,
+                };
+                let value = fold_constant(&entry.value)?;
+                match pairs.iter_mut().find(|(seen, _)| *seen == key) {
+                    Some(pair) => pair.1 = value,
+                    None => pairs.push((key, value)),
+                }
+            }
+            Some(OwnedValue::object_from(pairs))
+        }
+        Expr::Arithmetic {
+            op, left, right, ..
+        } => arith_combine::<JqSemantics>(*op, fold_constant(left)?, fold_constant(right)?).ok(),
+        Expr::Compare { op, left, right } => Some(OwnedValue::Bool(
+            apply_compare_op::<JqSemantics>(*op, &fold_constant(left)?, &fold_constant(right)?),
+        )),
+        _ => None,
+    }
+}
+
+/// Whether `text` holds a unary minus outside a string or a comment: a `-` at the start of
+/// an operand, which is to say after nothing or after an opening bracket, a comma, a colon or
+/// an operator. A `-` after an operand is a subtraction, which jq does fold.
+fn has_unary_minus(text: &str) -> bool {
+    let mut previous: Option<char> = None;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                while let Some(inner) = chars.next() {
+                    match inner {
+                        '\\' => {
+                            chars.next();
+                        }
+                        '"' => break,
+                        _ => {}
+                    }
+                }
+                previous = Some('"');
+            }
+            '#' => {
+                for inner in chars.by_ref() {
+                    if inner == '\n' {
+                        break;
+                    }
+                }
+            }
+            c if c.is_whitespace() => {}
+            '-' => {
+                if previous.map_or(true, |p| "([{,:;|=!<>+-*/%".contains(p)) {
+                    return true;
+                }
+                previous = Some('-');
+            }
+            c => previous = Some(c),
+        }
+    }
+    false
+}
+
+/// [`fold_constant`]'s result as the metadata value the AST keeps.
+fn meta_from_owned(value: &OwnedValue) -> MetaValue {
+    match value {
+        OwnedValue::Null => MetaValue::Null,
+        OwnedValue::Bool(b) => MetaValue::Bool(*b),
+        OwnedValue::Int(n) => MetaValue::Number(Literal::Int(*n)),
+        OwnedValue::Float(f) => MetaValue::Number(Literal::Float(*f)),
+        OwnedValue::NumberLiteral(repr, text) => {
+            MetaValue::Number(Literal::NumberLiteral(*repr, text.to_string()))
+        }
+        OwnedValue::String(s) => MetaValue::String(s.as_str().to_string()),
+        OwnedValue::Array(items) => MetaValue::Array(items.iter().map(meta_from_owned).collect()),
+        OwnedValue::Object(fields) => MetaValue::Object(
+            fields
+                .iter()
+                .map(|(key, value)| (key.clone(), meta_from_owned(value)))
+                .collect(),
+        ),
     }
 }
 
@@ -9554,11 +9665,11 @@ impl<'a> Parser<'a> {
 
         self.skip_ws();
 
-        // Parse optional metadata
-        let metadata = if self.peek() == Some('{') {
-            Some(self.parse_metadata_object()?)
-        } else {
+        // Parse optional metadata: any constant expression, not only an object literal (#5344)
+        let metadata = if self.peek() == Some(';') {
             None
+        } else {
+            Some(self.parse_metadata_object()?)
         };
 
         self.skip_ws();
@@ -9589,11 +9700,11 @@ impl<'a> Parser<'a> {
 
         self.skip_ws();
 
-        // Parse optional metadata
-        let metadata = if self.peek() == Some('{') {
-            Some(self.parse_metadata_object()?)
-        } else {
+        // Parse optional metadata: any constant expression, not only an object literal (#5344)
+        let metadata = if self.peek() == Some(';') {
             None
+        } else {
+            Some(self.parse_metadata_object()?)
         };
 
         self.skip_ws();
@@ -9612,122 +9723,34 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// Parse a metadata object: `{ key: value, ... }`
+    /// Parse the metadata of a `module` header or an `import`/`include` directive: any
+    /// expression, folded to an object the way jq folds it (#5344).
+    ///
+    /// jq reads an ordinary expression here, not an object literal, and requires it to be
+    /// constant (see [`fold_constant`]): `{search:(1+2)}`, `({a:1}+{b:2})`, `{a:[1,(2+3)]}` are
+    /// accepted, `{a:.}` is `Module metadata must be constant`, and an expression that
+    /// folds to anything but an object is `Module metadata must be an object`. Both errors
+    /// are reported at the start of the expression.
     fn parse_metadata_object(&mut self) -> Result<MetaObject, ParseError> {
-        if self.peek() != Some('{') {
-            return Err(ParseError::new("expected '{' for metadata", self.pos));
-        }
-        self.next();
-        self.skip_ws();
-
-        let mut map = MetaObject::new();
-
-        while self.peek() != Some('}') {
-            // Parse key: an identifier, or a string literal as in any jq object (#5321)
-            let key = if self.peek() == Some('"') {
-                self.parse_string_literal()?
-            } else {
-                self.parse_ident()?
-            };
-            self.skip_ws();
-
-            // Expect ':'
-            if self.peek() != Some(':') {
-                return Err(ParseError::new("expected ':' in metadata object", self.pos));
-            }
-            self.next();
-            self.skip_ws();
-
-            // Parse value
-            let value = self.parse_meta_value()?;
-            // A repeated key keeps its first position and takes the last value.
-            match map.iter_mut().find(|(seen, _)| *seen == key) {
-                Some(entry) => entry.1 = value,
-                None => map.push((key, value)),
-            }
-
-            self.skip_ws();
-
-            // Check for comma or end
-            if self.peek() == Some(',') {
-                self.next();
-                self.skip_ws();
-            } else if self.peek() != Some('}') {
-                return Err(ParseError::new(
-                    "expected ',' or '}' in metadata object",
-                    self.pos,
-                ));
-            }
-        }
-
-        self.next(); // consume '}'
-        Ok(map)
-    }
-
-    /// Parse a metadata value (string, number, bool, array, or object).
-    fn parse_meta_value(&mut self) -> Result<MetaValue, ParseError> {
-        self.skip_ws();
-
-        match self.peek() {
-            Some('"') => Ok(MetaValue::String(self.parse_string_literal()?)),
-            Some('{') => Ok(MetaValue::Object(self.parse_metadata_object()?)),
-            Some('[') => {
-                self.next();
-                self.skip_ws();
-                let mut arr = Vec::new();
-                while self.peek() != Some(']') {
-                    arr.push(self.parse_meta_value()?);
-                    self.skip_ws();
-                    if self.peek() == Some(',') {
-                        self.next();
-                        self.skip_ws();
-                    } else if self.peek() != Some(']') {
-                        return Err(ParseError::new(
-                            "expected ',' or ']' in metadata array",
-                            self.pos,
-                        ));
-                    }
-                }
-                self.next(); // consume ']'
-                Ok(MetaValue::Array(arr))
-            }
-            Some('n') if self.matches_keyword("null") => {
-                self.consume_keyword("null");
-                Ok(MetaValue::Null)
-            }
-            Some('t') if self.matches_keyword("true") => {
-                self.consume_keyword("true");
-                Ok(MetaValue::Bool(true))
-            }
-            Some('f') if self.matches_keyword("false") => {
-                self.consume_keyword("false");
-                Ok(MetaValue::Bool(false))
-            }
-            Some(c) if c.is_ascii_digit() || c == '-' => {
-                let num_str = self.parse_number_str()?;
-                let num: f64 = num_str
-                    .parse()
-                    .map_err(|_| ParseError::new("invalid number in metadata", self.pos))?;
-                Ok(MetaValue::Number(num))
-            }
-            _ => Err(ParseError::new("invalid metadata value", self.pos)),
-        }
-    }
-
-    /// Parse a number as a string (for metadata).
-    fn parse_number_str(&mut self) -> Result<String, ParseError> {
         let start = self.pos;
-        if self.peek() == Some('-') {
-            self.next();
+        let expr = self.parse_expr()?;
+        // The lexer reads `-1` as one negative literal, so the tree cannot tell it from a
+        // literal; jq's unary minus is a call, which is not constant.
+        let folded = if has_unary_minus(&self.input[start..self.pos]) {
+            None
+        } else {
+            fold_constant(&expr)
+        };
+        let Some(folded) = folded else {
+            return Err(ParseError::new("Module metadata must be constant", start));
+        };
+        match folded.as_object() {
+            Some(fields) => Ok(fields
+                .iter()
+                .map(|(key, value)| (key.clone(), meta_from_owned(value)))
+                .collect()),
+            None => Err(ParseError::new("Module metadata must be an object", start)),
         }
-        while let Some(c) = self.peek() {
-            if c.is_ascii_digit() || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-' {
-                self.next();
-            } else {
-                break;
-            }
-        }
-        Ok(self.input[start..self.pos].to_string())
     }
 
     /// Parse a namespaced call: `namespace::func` or `namespace::func(args)`.
