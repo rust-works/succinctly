@@ -92558,16 +92558,21 @@ fn builtin_exp2<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// #2936's review was the last bare-cast widening in the math family
 /// (`pow(869389897822472004; 1)` printed `…472100` where jq prints
 /// `…472000`).
+///
+/// A `-0` integer spelling is negative zero in jq mode (#5364), read through
+/// [`signed_number_repr`] like every arithmetic operator; yq mode reads it as integer
+/// zero.
 fn math_operand<S: EvalSemantics>(
     value: &OwnedValue,
     optional: bool,
 ) -> Result<f64, Option<EvalError>> {
-    match value {
-        OwnedValue::Int(n) | OwnedValue::NumberLiteral(NumberRepr::Int(n), _) => {
-            Ok(int_to_f64::<S>(*n))
-        }
-        OwnedValue::Float(n) | OwnedValue::NumberLiteral(NumberRepr::Float(n), _) => Ok(*n),
-        _ if optional => Err(None),
+    // #5364: through `signed_number_repr`, so a `-0` integer spelling is negative zero in jq
+    // mode as it is for the arithmetic operators; read as `Int(0)` it lost its sign here
+    // (`pow(-0;1)` is `-0` in jq, `atan2(-0;-1)` is `-pi`). yq mode keeps it integer zero.
+    match signed_number_repr::<S>(value) {
+        Some(NumberRepr::Int(n)) => Ok(int_to_f64::<S>(n)),
+        Some(NumberRepr::Float(n)) => Ok(n),
+        None if optional => Err(None),
         // jq's `LIBM_DDD` wording (`pow("a"; 1)` is `string ("a") number
         // required`, captured live against 1.7.1), shared with the unary
         // family's `get_float_value` (#3042).
@@ -151549,6 +151554,16 @@ mod tests {
             math_operand::<YqSemantics>(&int_literal, false),
             Ok(869_389_897_822_472_004_i64 as f64)
         );
+
+        // #5364: a `-0` integer spelling keeps its sign in jq mode and is integer zero in yq mode.
+        let negative_zero = OwnedValue::NumberLiteral(NumberRepr::Int(0), "-0".into());
+        let jq_zero = math_operand::<JqSemantics>(&negative_zero, false).unwrap();
+        assert!(jq_zero == 0.0 && jq_zero.is_sign_negative());
+        let yq_zero = math_operand::<YqSemantics>(&negative_zero, false).unwrap();
+        assert!(yq_zero == 0.0 && yq_zero.is_sign_positive());
+        let plain_zero = OwnedValue::NumberLiteral(NumberRepr::Int(0), "0".into());
+        let jq_plain = math_operand::<JqSemantics>(&plain_zero, false).unwrap();
+        assert!(jq_plain.is_sign_positive());
 
         // The float sibling is untouched by #2937 (that spelling's own
         // rounding is #2936's territory) -- both modes just unwrap it.
