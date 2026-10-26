@@ -421,9 +421,9 @@ limitation is recorded in [jq limitations](../compliance/jq/limitations.md#skip-
 
 Object-construction keys may be an identifier, a string, an interpolated string or a format applied to one
 (`{"a\(.k)": 1}`, `{@base64 "x\(.k)"}`), a `$name`, or a parenthesised expression (#5298). A key that is a string
-and has no value is shorthand for indexing with it, `{"a\(.k)"}` being `{("a\(.k)"): .["a\(.k)"]}`; see the
-[limitations](../compliance/jq/limitations.md#an-interpolated-shorthand-object-key-that-may-yield-several-values-5298)
-for the one form refused.
+and has no value is shorthand for indexing with it, `{"a\(.k)"}` being `{("a\(.k)"): .["a\(.k)"]}`. As in jq the
+string is read once per key, so one that yields several (`{"a\(1,2)"}`) pairs each key with its own value: `{"a1":.a1}`
+then `{"a2":.a2}` (#5323).
 
 Object-construction values use jq's restricted `ExpD` production, where
 `,` separates entries: `{a: 1, b: 2}` is two entries; write `{a: (1,2)}` to

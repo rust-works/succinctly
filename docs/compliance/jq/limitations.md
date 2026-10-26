@@ -498,18 +498,6 @@ anything else at any depth. The `setpath_*` probes added alongside it pin the re
 surface — wrong-key-type on a real container, out-of-bounds negative and NaN indices, and a
 non-array path argument.
 
-## An interpolated shorthand object key that may yield several values (#5298)
-
-An object key may be a string with an interpolation or a format applied to one: `{"a\(.k)": 1}`, `{@base64 "x\(.k)"}`.
-With no value it is shorthand, `{"a$\(1+1)"}` for `{"a$2": .["a$2"]}`, and `succinctly jq` answers it as jq does.
-jq reads the key once and indexes with that value, so a string that yields several (`{"a\(1,2)"}`) pairs each key with its own value: `{"a1":.a1}` then `{"a2":.a2}`.
-This implementation reads the string twice, once as the key and once inside `.[K]`, which would pair every key with every value.
-A shorthand whose string is not surely one value is therefore refused at compile time (exit 3, `an interpolated object key written without a value must be a single value`) rather than answered differently.
-"Surely one value" is a syntactic check: fields, indices, slices, literals, variables, formats, arithmetic, comparison, `and`/`or`, `//` and `if` over those, `tostring`/`length`/`type` and the case and rounding builtins, and array constructions.
-A call to anything else, an iteration, a comma, `empty` or a postfix `?` is refused, though some of them yield one value.
-A key with an explicit value (`{"a\(1,2)": 3}`) has no such limit and fans out as jq does.
-The exact pairing is tracked in [#5323](https://github.com/rust-works/succinctly/issues/5323).
-
 ## Dynamic path targets run on the path-mode interpreter (#5223)
 
 Since [#5223](https://github.com/rust-works/succinctly/issues/5223) ([ADR-0026](../../adrs/adr-0026.md)), a jq-mode program whose path target is more than navigation runs whole through the path-mode interpreter (`src/jq/path_mode.rs`), which carries jq 1.7.1's path register `(path, value)` with every output and checks it with `jv_identical` where jq does.

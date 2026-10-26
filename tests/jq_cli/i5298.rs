@@ -1,8 +1,8 @@
 //! #5298: an object key written as an interpolated string or a format applied to one
 //! (`{"a$\\(1+1)"}`, `{"a\\(.k)": 1}`, `{@base64 "x\\(.k)"}`) is jq's `String` production, and
 //! the key alone is shorthand for `{(K): .[K]}`. Every expected output is what jq 1.7.1 prints.
-//! A shorthand whose string may yield several values is refused (pinned below): jq reads the key
-//! once and pairs each key with its own value, which `.[K]` re-evaluating `K` would not.
+//! A shorthand whose string may yield several values pairs each key with its own value, as jq
+//! does (#5323, `i5323.rs`).
 
 use anyhow::Result;
 
@@ -74,17 +74,6 @@ const OTHER_INPUTS: &[(&str, &str, &str, i32)] = &[
     ("\"s\"", "{\"\\(.)\"}", "", 5),
 ];
 
-/// Shorthands over a string that may yield several values (or none): jq answers, this refuses at
-/// compile time (exit 3) rather than pair every key with every value.
-const REFUSED: &[&str] = &[
-    "{\"a\\(.x?)\"}",
-    "{\"a\\(1,2)\"}",
-    "{\"a\\(.arr[])\"}",
-    "{@base64 \"a\\(1,2)\"}",
-    "{\"a\\(empty)\"}",
-    "{\"a\\(range(2))\", \"b\"}",
-];
-
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq string interpolation reads like a format argument
 fn test_interpolated_string_object_keys_answer_as_jq_5298() -> Result<()> {
@@ -104,23 +93,6 @@ fn test_interpolated_string_object_keys_answer_as_jq_5298() -> Result<()> {
             (stdout.as_str(), code),
             (*want, *want_code),
             "{input} | `{filter}`: {stderr}"
-        );
-    }
-    Ok(())
-}
-
-#[test]
-#[allow(clippy::literal_string_with_formatting_args)] // jq string interpolation reads like a format argument
-fn test_multi_valued_interpolated_shorthand_key_is_refused_5298() -> Result<()> {
-    for filter in REFUSED {
-        let (stdout, stderr, code) =
-            run_jq_full(&["-n", "-c", &format!("{INPUT} | {filter}")], None)?;
-        assert_eq!((stdout.as_str(), code), ("", 3), "`{filter}`: {stderr}");
-        assert!(
-            stderr.contains(
-                "an interpolated object key written without a value must be a single value"
-            ),
-            "`{filter}`: {stderr}"
         );
     }
     Ok(())
