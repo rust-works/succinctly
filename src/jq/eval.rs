@@ -25398,10 +25398,125 @@ fn validate_yq_match_flags(flags: &str) -> Result<(), EvalError> {
     Ok(())
 }
 
+/// A POSIX bracket's body as a Rust class (#5367), for the names whose Unicode meaning in
+/// Oniguruma (jq's regex engine, UTF-8 encoding) differs from the `regex` crate's ASCII-only
+/// `[:name:]`. `ascii` and `xdigit` are ASCII in both and are left to the crate.
+///
+/// Each body is the union Oniguruma documents for its Unicode case, checked against the pinned
+/// jq over every scalar value (`alpha` is `Alphabetic`, `lower`/`upper` the `Lowercase`/
+/// `Uppercase` properties, and so on).
+#[cfg(feature = "regex")]
+fn unicode_posix_class(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "alpha" => r"\p{Alphabetic}",
+        "alnum" => r"\p{Alphabetic}\p{Nd}",
+        "blank" => r"\p{Zs}\t",
+        "cntrl" => r"\p{Cc}",
+        "digit" => r"\p{Nd}",
+        "graph" => r"[^\p{Zs}\p{Zl}\p{Zp}\p{Cc}\p{Cn}]",
+        "lower" => r"\p{Lowercase}",
+        "print" => r"\p{Zs}[^\p{Zs}\p{Zl}\p{Zp}\p{Cc}\p{Cn}]",
+        "punct" => r"\p{P}\p{S}",
+        "space" => r"\p{Zs}\p{Zl}\p{Zp}\t-\r\x{85}",
+        "upper" => r"\p{Uppercase}",
+        "word" => r"\p{Alphabetic}\p{M}\p{Nd}\p{Pc}",
+        _ => return None,
+    })
+}
+
+/// Rewrite the POSIX brackets (`[:alpha:]`, `[:^alpha:]`) inside a character class into nested
+/// Unicode classes (#5367). Oniguruma's are Unicode-aware, so `"é" | test("[[:alpha:]]")` is
+/// `true` in jq; the `regex` crate's are ASCII, so it was `false`. Outside a class a `[:alpha:]` is
+/// an ordinary class of those characters in both engines and is not touched, nor is an escaped
+/// bracket; a name this does not know is left for the crate to accept or reject.
+#[cfg(feature = "regex")]
+fn translate_posix_brackets(pattern: &str) -> std::borrow::Cow<'_, str> {
+    if !pattern.contains("[:") {
+        return std::borrow::Cow::Borrowed(pattern);
+    }
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = String::new();
+    let mut changed = false;
+    // Open classes, and whether the next char is the first of the class (after an optional `^`),
+    // where a `]` is a literal.
+    let mut depth = 0usize;
+    let mut at_start = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            out.push(c);
+            if let Some(&next) = chars.get(i + 1) {
+                out.push(next);
+            }
+            at_start = false;
+            i += 2;
+            continue;
+        }
+        if depth == 0 {
+            if c == '[' {
+                depth = 1;
+                at_start = true;
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '[' {
+            if chars.get(i + 1) == Some(&':') {
+                let rest = &chars[i + 2..];
+                if let Some(end) = rest.windows(2).position(|w| w == [':', ']']) {
+                    let name: String = rest[..end].iter().collect();
+                    let (negated, bare) = match name.strip_prefix('^') {
+                        Some(bare) => (true, bare),
+                        None => (false, name.as_str()),
+                    };
+                    if let Some(body) = unicode_posix_class(bare) {
+                        out.push('[');
+                        if negated {
+                            out.push('^');
+                        }
+                        out.push_str(body);
+                        out.push(']');
+                        changed = true;
+                        i += 2 + end + 2;
+                        at_start = false;
+                        continue;
+                    }
+                }
+            }
+            depth += 1;
+            at_start = true;
+        } else if c == ']' && !at_start {
+            depth -= 1;
+        } else if c == '^' && at_start {
+            // A leading `^` keeps the position "first".
+            out.push(c);
+            i += 1;
+            continue;
+        } else {
+            at_start = false;
+        }
+        out.push(c);
+        i += 1;
+    }
+    if changed {
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(pattern)
+    }
+}
+
 /// Build regex flags from jq flag string
 #[cfg(feature = "regex")]
-fn build_regex(pattern: &str, flags: Option<&str>) -> Result<JqRegex, EvalError> {
-    let mut pattern = pattern.to_string();
+fn build_regex<S: EvalSemantics>(pattern: &str, flags: Option<&str>) -> Result<JqRegex, EvalError> {
+    // #5367: jq's POSIX brackets are Unicode-aware (Oniguruma); yq's are Go's `regexp`, which is
+    // ASCII-only, as the `regex` crate's are -- so only jq mode rewrites them.
+    let mut pattern = if S::TAG == EvalTag::Yq {
+        pattern.to_string()
+    } else {
+        translate_posix_brackets(pattern).into_owned()
+    };
 
     // Apply flags
     let mut suppress_empty = false;
@@ -25858,7 +25973,7 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
 
             // Build regex
-            let re = match build_regex(pattern, flags) {
+            let re = match build_regex::<S>(pattern, flags) {
                 Ok(r) => r,
                 Err(_e) if optional => return QueryResult::None,
                 Err(e) => return e.into(),
@@ -26873,7 +26988,7 @@ fn builtin_test_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
 
             // Build regex with flags
-            let re = match build_regex(pattern, flags) {
+            let re = match build_regex::<S>(pattern, flags) {
                 Ok(r) => r,
                 Err(_e) if optional => return QueryResult::None,
                 Err(e) => return e.into(),
@@ -26944,7 +27059,7 @@ fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
 
             // Build regex
-            let re = match build_regex(pattern, flags) {
+            let re = match build_regex::<S>(pattern, flags) {
                 Ok(r) => r,
                 Err(_e) if optional => return QueryResult::None,
                 Err(e) => return e.into(),
@@ -27142,7 +27257,7 @@ fn yq_sub_arity3_empty_replace<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
             };
 
-            let re = match build_regex(&pattern, None) {
+            let re = match build_regex::<S>(&pattern, None) {
                 Ok(r) => r,
                 Err(_e) if optional => return QueryResult::None,
                 Err(e) => return e.into(),
@@ -27211,7 +27326,7 @@ fn sub_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     // Build regex
-    let re = match build_regex(pattern, flags) {
+    let re = match build_regex::<S>(pattern, flags) {
         Ok(r) => r,
         Err(_e) if optional => return QueryResult::None,
         Err(e) => return e.into(),
@@ -27667,7 +27782,7 @@ fn scan_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     // Build regex
-    let re = match build_regex(pattern, Some(global_flags)) {
+    let re = match build_regex::<S>(pattern, Some(global_flags)) {
         Ok(r) => r,
         Err(_e) if optional => return QueryResult::None,
         Err(e) => return e.into(),
@@ -27824,7 +27939,7 @@ fn split_regex_resolved<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // rather than fanning out.
     let mut matches = Vec::new();
     for flags in global_flags {
-        let re = match build_regex(pattern, Some(flags)) {
+        let re = match build_regex::<S>(pattern, Some(flags)) {
             Ok(r) => r,
             Err(_e) if optional => return QueryResult::None,
             Err(e) => return e.into(),
@@ -27938,7 +28053,7 @@ fn splits_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // because `flags` is a plain (non-`$`) parameter (#1279).
     let mut matches = Vec::new();
     for flags in global_flags {
-        let re = match build_regex(pattern, Some(flags)) {
+        let re = match build_regex::<S>(pattern, Some(flags)) {
             Ok(r) => r,
             Err(_e) if optional => return QueryResult::None,
             Err(e) => return e.into(),

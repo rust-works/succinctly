@@ -167,3 +167,4 @@ mod i5351;
 mod i5361;
 mod i5363;
 mod i5364;
+mod i5367;

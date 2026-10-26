@@ -7168,6 +7168,16 @@ belongs there and has no remainder): #2669 only removed the route-dependence, it
 newly decide this. A route that genuinely reads a member (`.a and true`) still raises.
 Pinned by `test_boolean_routes_agree_on_a_malformed_document_2669`.
 
+## POSIX bracket classes are Unicode-aware, up to the Unicode version (#5367)
+
+A POSIX bracket inside a character class (`[[:alpha:]]`, `[[:^upper:]]`, ...) is rewritten to a nested Unicode class with Oniguruma's definitions before the pattern reaches the `regex` crate, whose own are ASCII-only.
+`alpha` is `\p{Alphabetic}`, `alnum` adds `\p{Nd}`, `lower` and `upper` are the `Lowercase` and `Uppercase` properties, `punct` is `\p{P}\p{S}`, `word` adds `\p{M}` and `\p{Pc}`, and `space`, `blank`, `cntrl`, `digit`, `graph` and `print` follow the same documentation.
+`[:ascii:]` and `[:xdigit:]` are ASCII in both engines.
+Each class was compared with the pinned jq over every scalar value.
+Nothing jq matches is missed, and the only extra matches are code points that the `regex` crate's Unicode 16 tables assign and Oniguruma's older tables do not.
+yq mode keeps the ASCII classes, as Go's `regexp` has them.
+Four exotic shapes still differ: an unknown name (`[[:foo:]]`) is accepted here and is `invalid POSIX bracket type` in jq, a range from a POSIX bracket (`[[:alpha:]-z]`) is accepted here and an error in jq, a nested class or `&&` inside a class means set union or intersection here and a literal `[` or `&` in jq's Perl syntax, and a negated bracket under the `i` flag (`test("[[:^upper:]]";"i")`) is case-folded before the negation here and is not in jq.
+
 ## Regex flags `l` and `n`
 
 [ADR-0019](../../adrs/adr-0019.md) accepted two regex-flag gaps as permanent — rule 4(d)
