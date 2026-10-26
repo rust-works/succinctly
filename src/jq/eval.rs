@@ -25398,10 +25398,159 @@ fn validate_yq_match_flags(flags: &str) -> Result<(), EvalError> {
     Ok(())
 }
 
+/// A POSIX bracket's body as a Rust class (#5367), for the names whose Unicode meaning in
+/// Oniguruma (jq's regex engine, UTF-8 encoding) differs from the `regex` crate's ASCII-only
+/// `[:name:]`. `ascii` and `xdigit` are ASCII in both and are left to the crate.
+///
+/// Each body is the union Oniguruma documents for its Unicode case, checked against the pinned
+/// jq over every scalar value (`alpha` is `Alphabetic`, `lower`/`upper` the `Lowercase`/
+/// `Uppercase` properties, and so on).
+#[cfg(feature = "regex")]
+fn unicode_posix_class(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "alpha" => r"\p{Alphabetic}",
+        "alnum" => r"\p{Alphabetic}\p{Nd}",
+        "blank" => r"\p{Zs}\t",
+        "cntrl" => r"\p{Cc}",
+        "digit" => r"\p{Nd}",
+        "graph" => r"[^\p{Zs}\p{Zl}\p{Zp}\p{Cc}\p{Cn}]",
+        "lower" => r"\p{Lowercase}",
+        "print" => r"\p{Zs}[^\p{Zs}\p{Zl}\p{Zp}\p{Cc}\p{Cn}]",
+        "punct" => r"\p{P}\p{S}",
+        "space" => r"\p{Zs}\p{Zl}\p{Zp}\t-\r\x{85}",
+        "upper" => r"\p{Uppercase}",
+        "word" => r"\p{Alphabetic}\p{M}\p{Nd}\p{Pc}",
+        _ => return None,
+    })
+}
+
+/// Rewrite the character classes of a jq pattern to what Oniguruma's Perl syntax means by them
+/// (#5367): the POSIX brackets (`[:alpha:]`, `[:^alpha:]`) inside a class become nested Unicode
+/// classes, and a `[`, `&` or `~` inside a class is the literal character. Oniguruma's are Unicode-aware, so `"é" | test("[[:alpha:]]")` is
+/// `true` in jq; the `regex` crate's are ASCII, so it was `false`. Outside a class a `[:alpha:]` is
+/// an ordinary class of those characters in both engines and is not touched, nor is an escaped
+/// bracket. A bracket-shaped `[:word:]` (lowercase letters, optionally led by `^`) whose name is not
+/// a POSIX class is an error, as in jq (`invalid POSIX bracket type`); `ascii` and `xdigit` are
+/// ASCII in both engines and are left to the crate.
+#[cfg(feature = "regex")]
+fn translate_posix_brackets(pattern: &str) -> Result<std::borrow::Cow<'_, str>, EvalError> {
+    if !pattern.contains('[') {
+        return Ok(std::borrow::Cow::Borrowed(pattern));
+    }
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = String::new();
+    let mut changed = false;
+    // Open classes, and whether the next char is the first of the class (after an optional `^`),
+    // where a `]` is a literal.
+    let mut depth = 0usize;
+    let mut at_start = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            out.push(c);
+            if let Some(&next) = chars.get(i + 1) {
+                out.push(next);
+            }
+            at_start = false;
+            i += 2;
+            continue;
+        }
+        if depth == 0 {
+            if c == '[' {
+                depth = 1;
+                at_start = true;
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '[' {
+            if let Some((name_end, negated, name)) = posix_bracket_at(&chars, i) {
+                if matches!(name.as_str(), "ascii" | "xdigit") {
+                    // Identical in both engines: copied through as written.
+                    out.extend(&chars[i..name_end]);
+                } else if let Some(body) = unicode_posix_class(&name) {
+                    out.push('[');
+                    if negated {
+                        out.push('^');
+                    }
+                    out.push_str(body);
+                    out.push(']');
+                    changed = true;
+                } else {
+                    return Err(EvalError::new("invalid regex: invalid POSIX bracket type"));
+                }
+                i = name_end;
+                at_start = false;
+                continue;
+            }
+            // Oniguruma's Perl syntax has no nested classes or set operators: a `[` inside a
+            // class is a literal `[`, as are `&` and `~` (the `regex` crate would read them as
+            // a nested class, an intersection and a symmetric difference).
+            out.push_str("\\[");
+            changed = true;
+            at_start = false;
+            i += 1;
+            continue;
+        } else if c == ']' && !at_start {
+            depth -= 1;
+        } else if c == '&' || c == '~' {
+            out.push('\\');
+            changed = true;
+            at_start = false;
+        } else if c == '^' && at_start {
+            // A leading `^` keeps the position "first".
+            out.push(c);
+            i += 1;
+            continue;
+        } else {
+            at_start = false;
+        }
+        out.push(c);
+        i += 1;
+    }
+    Ok(if changed {
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(pattern)
+    })
+}
+
+/// The POSIX bracket starting at `chars[at]` (a `[`): the index just past its closing `:]`,
+/// whether it is negated (`[:^name:]`), and its name. `None` unless it is `[:` + an optional `^` +
+/// ASCII letters + `:]`, so a `[:` that is not a bracket costs a few characters, not a
+/// scan of the rest of the pattern.
+#[cfg(feature = "regex")]
+fn posix_bracket_at(chars: &[char], at: usize) -> Option<(usize, bool, String)> {
+    if chars.get(at + 1) != Some(&':') {
+        return None;
+    }
+    let mut j = at + 2;
+    let negated = chars.get(j) == Some(&'^');
+    if negated {
+        j += 1;
+    }
+    let name_start = j;
+    while chars.get(j).is_some_and(char::is_ascii_alphabetic) {
+        j += 1;
+    }
+    if j == name_start || chars.get(j) != Some(&':') || chars.get(j + 1) != Some(&']') {
+        return None;
+    }
+    Some((j + 2, negated, chars[name_start..j].iter().collect()))
+}
+
 /// Build regex flags from jq flag string
 #[cfg(feature = "regex")]
-fn build_regex(pattern: &str, flags: Option<&str>) -> Result<JqRegex, EvalError> {
-    let mut pattern = pattern.to_string();
+fn build_regex<S: EvalSemantics>(pattern: &str, flags: Option<&str>) -> Result<JqRegex, EvalError> {
+    // #5367: jq's POSIX brackets are Unicode-aware (Oniguruma); yq's are Go's `regexp`, which is
+    // ASCII-only, as the `regex` crate's are -- so only jq mode rewrites them.
+    let mut pattern = if S::TAG == EvalTag::Yq {
+        pattern.to_string()
+    } else {
+        translate_posix_brackets(pattern)?.into_owned()
+    };
 
     // Apply flags
     let mut suppress_empty = false;
@@ -25858,7 +26007,7 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
 
             // Build regex
-            let re = match build_regex(pattern, flags) {
+            let re = match build_regex::<S>(pattern, flags) {
                 Ok(r) => r,
                 Err(_e) if optional => return QueryResult::None,
                 Err(e) => return e.into(),
@@ -26873,7 +27022,7 @@ fn builtin_test_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
 
             // Build regex with flags
-            let re = match build_regex(pattern, flags) {
+            let re = match build_regex::<S>(pattern, flags) {
                 Ok(r) => r,
                 Err(_e) if optional => return QueryResult::None,
                 Err(e) => return e.into(),
@@ -26944,7 +27093,7 @@ fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
 
             // Build regex
-            let re = match build_regex(pattern, flags) {
+            let re = match build_regex::<S>(pattern, flags) {
                 Ok(r) => r,
                 Err(_e) if optional => return QueryResult::None,
                 Err(e) => return e.into(),
@@ -27142,7 +27291,7 @@ fn yq_sub_arity3_empty_replace<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
             };
 
-            let re = match build_regex(&pattern, None) {
+            let re = match build_regex::<S>(&pattern, None) {
                 Ok(r) => r,
                 Err(_e) if optional => return QueryResult::None,
                 Err(e) => return e.into(),
@@ -27211,7 +27360,7 @@ fn sub_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     // Build regex
-    let re = match build_regex(pattern, flags) {
+    let re = match build_regex::<S>(pattern, flags) {
         Ok(r) => r,
         Err(_e) if optional => return QueryResult::None,
         Err(e) => return e.into(),
@@ -27667,7 +27816,7 @@ fn scan_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     // Build regex
-    let re = match build_regex(pattern, Some(global_flags)) {
+    let re = match build_regex::<S>(pattern, Some(global_flags)) {
         Ok(r) => r,
         Err(_e) if optional => return QueryResult::None,
         Err(e) => return e.into(),
@@ -27824,7 +27973,7 @@ fn split_regex_resolved<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // rather than fanning out.
     let mut matches = Vec::new();
     for flags in global_flags {
-        let re = match build_regex(pattern, Some(flags)) {
+        let re = match build_regex::<S>(pattern, Some(flags)) {
             Ok(r) => r,
             Err(_e) if optional => return QueryResult::None,
             Err(e) => return e.into(),
@@ -27938,7 +28087,7 @@ fn splits_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // because `flags` is a plain (non-`$`) parameter (#1279).
     let mut matches = Vec::new();
     for flags in global_flags {
-        let re = match build_regex(pattern, Some(flags)) {
+        let re = match build_regex::<S>(pattern, Some(flags)) {
             Ok(r) => r,
             Err(_e) if optional => return QueryResult::None,
             Err(e) => return e.into(),
