@@ -65905,7 +65905,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
             i
         };
         let mut unmetered = usize::MAX;
-        let mut budget = fold_fork_budget(fork_index == 0, &mut unmetered, &mut shared_budget);
+        let budget = fold_fork_budget(fork_index == 0, &mut unmetered, &mut shared_budget);
         let (mut reg, acc) =
             FoldRegister::enter(init_branch, value, trackable, init_keeps_register, frame);
         if mentions_frozen_var {
@@ -66016,7 +66016,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         let source_may_alias = fold_source_may_alias_register::<S>(input);
         let source_flow = drive_fold_source::<S>(input, &ambient, relocate_base, &mut |elem| {
             aborted.begin();
-            if let Some(control) = charge_budget(&mut budget, "reduce") {
+            if let Some(control) = charge_budget(budget, "reduce") {
                 return aborted.stop(control);
             }
             // #2979: one attempt per `?//` alternative, in order -- jq's
@@ -66190,7 +66190,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                             update_at_register && moved_reg.as_ref().map_or(true, |(_, at)| *at);
                         let acc_input = acc.take().unwrap_or(OwnedValue::Null);
                         if let Some(control) =
-                            charge_alternative_update(&mut budget, &mut ran_update, "reduce")
+                            charge_alternative_update(budget, &mut ran_update, "reduce")
                         {
                             outcome = Some(FoldStepOutcome::Return(aborted.stop(control)));
                             return Demand::Stop;
@@ -67015,7 +67015,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
             i
         };
         let mut unmetered = usize::MAX;
-        let mut budget = fold_fork_budget(fork_index == 0, &mut unmetered, &mut shared_budget);
+        let budget = fold_fork_budget(fork_index == 0, &mut unmetered, &mut shared_budget);
         let (mut reg, mut state) =
             FoldRegister::enter(init_branch, value, trackable, init_keeps_register, frame);
         if mentions_frozen_var {
@@ -67096,7 +67096,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
             steps += 1;
             downstream_stopped = None;
             aborted.begin();
-            if let Some(control) = charge_budget(&mut budget, "foreach") {
+            if let Some(control) = charge_budget(budget, "foreach") {
                 return aborted.stop(control);
             }
             // #2979: one attempt per `?//` alternative, in order -- see
@@ -67216,7 +67216,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                         // #5018: set per UPDATE item below ([`UpdateFlags`]).
                         let update_states_entry = core::cell::Cell::new(false);
                         if let Some(control) =
-                            charge_alternative_update(&mut budget, &mut ran_update, "foreach")
+                            charge_alternative_update(budget, &mut ran_update, "foreach")
                         {
                             outcome = Some(FoldStepOutcome::Return(aborted.stop(control)));
                             return Demand::Stop;
@@ -67395,7 +67395,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                 }
                             };
                             if let Some(ext_expr) = &bound_extract {
-                                if let Some(control) = charge_budget(&mut budget, "foreach") {
+                                if let Some(control) = charge_budget(budget, "foreach") {
                                     outcome = Some(FoldStepOutcome::Return(aborted.stop(control)));
                                     return Demand::Stop;
                                 }
@@ -102562,6 +102562,19 @@ mod tests {
         assert!(truncated);
     }
 
+    /// #5292: the path-mode fold (`resolve_foreach`) agrees.
+    #[test]
+    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
+    fn test_foreach_path_mode_first_fork_is_not_budgeted_5292() {
+        assert_eq!(
+            outputs(
+                b"null",
+                "[path(foreach (range(100000), range(100000)) as $x (.; .))] | length"
+            ),
+            ["200000"]
+        );
+    }
+
     /// The numbers a batched integer range hands over, in order, and how it ended.
     fn batched_ints(from: i64, to: i64, step: i64, cap: usize) -> (Vec<i64>, usize, RangeEnd) {
         let mut seen = Vec::new();
@@ -102590,7 +102603,7 @@ mod tests {
         let (seen, _, end) = batched_ints(10, -400_000, -3, usize::MAX);
         assert_eq!(
             seen,
-            (0..)
+            (0..=(10 + 400_000) / 3 + 1)
                 .map(|k| 10 - 3 * k)
                 .take_while(|n| *n > -400_000)
                 .collect::<Vec<i64>>()
@@ -124934,15 +124947,6 @@ mod tests {
             ),
             ["200000"]
         );
-        // ...and the path-mode fold (`path(...)` resolves the fold through
-        // `resolve_reduce`) agrees.
-        assert_eq!(
-            outputs(
-                b"null",
-                "path(reduce (range(100000), range(100000)) as $x (.; .))"
-            ),
-            ["[]"]
-        );
         // The forks past the first are still metered: 2 forks x 100,001
         // elements is 100,001 charged steps against a budget of 100,000.
         query!(b"null", r"reduce (range(100000), 0) as $x ((0,1); .+1)",
@@ -124953,6 +124957,20 @@ mod tests {
         );
     }
 
+    /// #5292: the path-mode fold (`path(...)` resolves it through `resolve_reduce`)
+    /// agrees.
+    #[test]
+    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
+    fn test_reduce_path_mode_first_fork_is_not_budgeted_5292() {
+        assert_eq!(
+            outputs(
+                b"null",
+                "path(reduce (range(100000), range(100000)) as $x (.; .))"
+            ),
+            ["[]"]
+        );
+    }
+
     #[test]
     fn test_foreach_first_fork_is_not_budgeted_5292() {
         // #5292: see `test_reduce_first_fork_is_not_budgeted_5292`.
@@ -124960,13 +124978,6 @@ mod tests {
             outputs(
                 b"null",
                 "[foreach (range(100000), range(100000)) as $x (0; .+1)] | length"
-            ),
-            ["200000"]
-        );
-        assert_eq!(
-            outputs(
-                b"null",
-                "[path(foreach (range(100000), range(100000)) as $x (.; .))] | length"
             ),
             ["200000"]
         );
