@@ -49,6 +49,13 @@ fn test_backslash_w_is_oniguruma_s_word_class_5373() -> Result<()> {
         ),
         (r#""A_9""#, r#"test("^\\w+$")"#, "true\n"),
         (r#""a b""#, r#"[splits("\\W+")]"#, "[\"a\",\"b\"]\n"),
+        (r#""²""#, r#"test("\\w";"i")"#, "true\n"),
+        (
+            r#""A²""#,
+            r#"[match("\\w";"gi")|.string]"#,
+            "[\"A\",\"²\"]\n",
+        ),
+        (r#""a b""#, r#"test("a\\ \\w";"x")"#, "true\n"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(input))?;
         assert_eq!(

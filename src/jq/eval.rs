@@ -25464,7 +25464,8 @@ fn translate_posix_brackets(pattern: &str) -> Result<std::borrow::Cow<'_, str>, 
         if c == '\\' {
             // #5373: jq's `\w` is its POSIX `word` plus six Latin-1 characters and without the
             // two joiners the `regex` crate's `\w` adds. Always a bracketed class, so that a
-            // following `-` in `[\w-.]` is a literal and not the end of a range.
+            // following `-` in `[\w-.]` is a literal and not the end of a range (jq refuses a range
+            // from `\w` as an error, which this accepts).
             if let Some(&w @ ('w' | 'W')) = chars.get(i + 1) {
                 out.push('[');
                 if w == 'W' {
