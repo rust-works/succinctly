@@ -92562,6 +92562,12 @@ fn math_operand<S: EvalSemantics>(
     value: &OwnedValue,
     optional: bool,
 ) -> Result<f64, Option<EvalError>> {
+    // #5364: a `-0` integer spelling is negative zero in jq mode, as it is for the arithmetic
+    // operators (`signed_number_repr`) and the one-argument math builtins; read as `Int(0)` it
+    // lost its sign here (`pow(-0;1)` is `-0` in jq, `atan2(-0;-1)` is `-pi`).
+    if S::TAG != EvalTag::Yq && is_negative_zero_int_literal(value) {
+        return Ok(-0.0);
+    }
     match value {
         OwnedValue::Int(n) | OwnedValue::NumberLiteral(NumberRepr::Int(n), _) => {
             Ok(int_to_f64::<S>(*n))
