@@ -3991,7 +3991,6 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
     }
 
     const STEPS_BACK: bool = true;
-    const HAS_EXPLICIT_TAGS: bool = false;
 
     #[inline]
     fn prev_element(&self) -> Option<Self> {
@@ -4341,6 +4340,15 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
     }
 
     #[inline]
+    fn to_owned_values_jq(cursors: &[Self]) -> Result<Vec<OwnedValue>, EvalError> {
+        cursors
+            .iter()
+            .map(|cursor| {
+                crate::jq::to_owned_standard_json::<crate::jq::JqSemantics, W>(&cursor.value())
+            })
+            .collect()
+    }
+
     fn stream_sequence_json<Out: core::fmt::Write>(
         cursors: &[Self],
         out: &mut Out,

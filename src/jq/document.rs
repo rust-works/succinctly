@@ -15,6 +15,7 @@ use std::borrow::Cow;
 
 use super::error::{debug_assert_materialization_error, EvalError};
 use super::stream::{StreamFailure, StreamResult};
+use super::value::OwnedValue;
 
 /// Indentation configuration for cursor/lazy streaming output.
 ///
@@ -465,16 +466,6 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// between the shared walk costing 26-40% and 2-5% more than the
     /// hand-written one it replaced on a 10 MB `--slurp`.
     const REUSE_FIELD_VALUE: bool = false;
-
-    /// Whether a node of this format can carry an explicit tag (`!!str 1`), which only a
-    /// cursor can look up, by the node's byte position ([`explicit_tag`](Self::explicit_tag)).
-    ///
-    /// `true` by default, so a new format materializes through its cursors. `false` for
-    /// JSON, which has none: a node's value then says all there is to say about it, and a
-    /// walk over [`DocumentValue`]s skips the position lookup a cursor walk makes for every
-    /// container (#5306: decoding a `group_by` group that way cost 16-22% on a full
-    /// output). A format that sets it `false` must leave `explicit_tag` at its default.
-    const HAS_EXPLICIT_TAGS: bool = true;
 
     /// Whether a sequence's elements, and a mapping's members, are exactly the
     /// chain [`next_element`](Self::next_element) walks from the first, so that
@@ -1171,6 +1162,18 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         _numbers: JsonConvention,
     ) -> StreamResult {
         Err(StreamFailure::Fmt)
+    }
+
+    /// `cursors` decoded to owned values, in jq mode, for a `group_by` group a consumer has
+    /// pulled (#5306).
+    ///
+    /// The default walks each cursor, which is the only decode that can resolve an explicit
+    /// tag (`!!str 1`) by the node's byte position. JSON has no tags, so its cursor decodes
+    /// the node's value with the evaluator's own materializer instead, which skips that
+    /// lookup for every container and measures 15-20% cheaper over a group that is the
+    /// whole of a 70 MB document.
+    fn to_owned_values_jq(cursors: &[Self]) -> Result<Vec<OwnedValue>, EvalError> {
+        crate::jq::eval_generic::to_owned_all_cursors::<crate::jq::JqSemantics, _>(cursors)
     }
 
     /// The YAML counterpart of
