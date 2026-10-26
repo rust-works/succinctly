@@ -3829,6 +3829,20 @@ enum LazySource<V: DocumentValue> {
     /// `may_repeat` does. No cursor in it has been walked: whoever reads an
     /// element validates it (#3856).
     Mixed(alloc::vec::IntoIter<LazyElem<V>>),
+    /// `group_by(f)`'s answer in jq mode (#5306): an array of arrays whose elements are all
+    /// document nodes. `cursors` holds every element in group order, `ends[i]` is where group
+    /// `i` stops in it, and `next` is the group to hand out. A group is decoded when it is
+    /// pulled, into the owned array it is, and dropped once the stage after it has read it, so
+    /// `group_by(f) | map(g)` holds the cursors and one group, not the decoded array.
+    ///
+    /// jq mode only: the decode is `JqSemantics`' because `advance` has no mode to dispatch on,
+    /// and the only producer, `group_by_array_generic`, is not built under yq. Every node was
+    /// validated when its key was read (#1755), so the decode cannot fail on a bad node.
+    Groups {
+        cursors: Vec<V::Cursor>,
+        ends: Vec<usize>,
+        next: usize,
+    },
 }
 
 // See `LazyElem`'s `Debug` impl above for why this is hand-written, not derived.
@@ -3851,6 +3865,11 @@ impl<V: DocumentValue> core::fmt::Debug for LazySource<V> {
             Self::Mixed(elems) => f
                 .debug_struct("LazySource::Mixed")
                 .field("len", &elems.len())
+                .finish(),
+            Self::Groups { ends, next, .. } => f
+                .debug_struct("LazySource::Groups")
+                .field("next", next)
+                .field("groups", &ends.len())
                 .finish(),
         }
     }
@@ -3929,6 +3948,20 @@ impl<V: DocumentValue> LazySource<V> {
                 Some(LazyElem::Cursor(cursor))
             }
             Self::Mixed(elems) => elems.next(),
+            Self::Groups {
+                cursors,
+                ends,
+                next,
+            } => {
+                let Some(&end) = ends.get(*next) else {
+                    return Ok(None);
+                };
+                let start = if *next == 0 { 0 } else { ends[*next - 1] };
+                *next += 1;
+                Some(LazyElem::Owned(OwnedValue::array_from(
+                    to_owned_all_cursors::<JqSemantics, _>(&cursors[start..end])?,
+                )))
+            }
         })
     }
 }
@@ -4051,6 +4084,16 @@ impl<V: DocumentValue> LazySeq<V> {
             cursors,
             next: 0,
             may_repeat: true,
+        })
+    }
+
+    /// `group_by`'s groups, `ends` the exclusive end of each in `cursors` (#5306) -- see
+    /// [`LazySource::Groups`].
+    fn from_groups(cursors: Vec<V::Cursor>, ends: Vec<usize>) -> Self {
+        Self::new(LazySource::Groups {
+            cursors,
+            ends,
+            next: 0,
         })
     }
 
@@ -25166,6 +25209,57 @@ fn sort_family_array_generic<S: EvalSemantics, V: DocumentValue>(
     GenericResult::LazySeq(Box::new(LazySeq::from_cursors(reorder(keyed))))
 }
 
+/// `group_by(f)` over an array's element cursors, in jq mode (#5306): sort the cursors by
+/// `[f]` (stable, so equal keys keep their input order) and cut the sorted run wherever the
+/// key changes under `==`. The groups stay cursors until a consumer pulls one
+/// ([`LazySource::Groups`]).
+///
+/// Every element is checked for decodability before any key is read (#1755): the bridge this
+/// replaces decoded the whole array first, so an undecodable element reports its decode error
+/// even when an earlier element's key raises, or `try` would catch it.
+fn group_by_array_generic<S: EvalSemantics, V: DocumentValue>(
+    f: &Expr,
+    cursors: Vec<V::Cursor>,
+    optional: bool,
+) -> GenericResult<V> {
+    for cursor in &cursors {
+        if let Some(control) = push_generic_document_validation_error(cursor, 0) {
+            return sort_family_control(control);
+        }
+    }
+    let mut keyed: Vec<(Vec<OwnedValue>, V::Cursor)> = vec_with_capacity(cursors.len());
+    for cursor in cursors {
+        match sort_key_generic::<S, V>(f, &cursor, optional) {
+            Ok(key) => keyed.push((key, cursor)),
+            Err(control) => return sort_family_control(control),
+        }
+    }
+    keyed.sort_by(|(a, _), (b, _)| compare_key_arrays::<S>(a, b));
+
+    let mut sorted: Vec<V::Cursor> = vec_with_capacity(keyed.len());
+    let mut ends: Vec<usize> = Vec::new();
+    let mut group_key: Option<Vec<OwnedValue>> = None;
+    for (key, cursor) in keyed {
+        // `key_arrays_eq`, not `compare_key_arrays(..) == Equal`: whether two keys are one group
+        // is `==`'s question, which keeps a yq-mode Int and Float apart (#950). The sort above
+        // stays widening.
+        if !group_key
+            .as_ref()
+            .is_some_and(|current| key_arrays_eq::<S>(current, &key))
+        {
+            if !sorted.is_empty() {
+                ends.push(sorted.len());
+            }
+            group_key = Some(key);
+        }
+        sorted.push(cursor);
+    }
+    if !sorted.is_empty() {
+        ends.push(sorted.len());
+    }
+    GenericResult::LazySeq(Box::new(LazySeq::from_groups(sorted, ends)))
+}
+
 /// `sort`/`sort_by`'s ordering step, shared with `unique`/`unique_by`, which
 /// jq defines as a sort followed by a dedup.
 ///
@@ -34013,6 +34107,33 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 }
                 keyed.into_iter().map(|(_, cursor)| cursor).collect()
             })
+        }
+
+        // #5306: `group_by(f)` on an array, in jq mode. The `_` bridge below re-serializes the
+        // whole array and re-indexes it before `eval.rs` materializes every element into a
+        // `(key, element)` pair, which cost twice what `sort_by` costs and more memory than jq.
+        // Here the keys are read off the cursors, only the cursors are sorted, and an element
+        // is materialized once, straight into its group.
+        //
+        // Not yq: its `group_by` is an ordered map on the first key's text and never sorts, and
+        // `eval.rs` keeps that and every non-array wording; those inputs bridge, as before.
+        Builtin::GroupBy(f) if S::TAG != EvalTag::Yq && value.as_array().is_some() => {
+            let Some(elements) = value
+                .as_array()
+                .filter(|_| reordering_may_keep_cursors::<V>(cursor.as_ref()))
+            else {
+                return bridge_to_full_evaluator::<S, _>(
+                    &builtin_expr(whole, builtin),
+                    value,
+                    cursor,
+                    optional,
+                );
+            };
+            if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
+                return GenericResult::Error(err);
+            }
+            let cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
+            group_by_array_generic::<S, V>(f, cursors, optional)
         }
 
         // The single-element half of the same family. `min`/`max` answer one
@@ -52358,6 +52479,44 @@ mod tests {
             .collect_owned::<JqSemantics>()
             .unwrap();
         assert_eq!(vec![built], want);
+    }
+
+    /// #5306: `group_by(f)` over an array answers a `Groups` source, which holds the sorted
+    /// cursors and cuts them into groups, and decodes a group only when it is pulled: the first
+    /// pull builds the first group alone, and the groups come in key order with equal keys in
+    /// input order.
+    #[test]
+    fn test_group_by_answers_groups_decoded_on_pull_5306() {
+        let doc = r#"[{"a":2,"i":0},{"a":1,"i":1},{"a":2,"i":2},{"a":1,"i":3},{"a":3,"i":4}]"#;
+        let index = JsonIndex::build(doc.as_bytes());
+        let expr = parse("group_by(.a)").unwrap();
+        let GenericResult::LazySeq(mut seq) =
+            eval_with_cursor_using::<JqSemantics, _>(&expr, index.root(doc.as_bytes()))
+        else {
+            panic!("group_by over an array is a sequence of groups"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#5306)"
+        };
+        let LazySource::Groups { ends, next, .. } = &seq.source else {
+            panic!("expected a Groups source, got {:?}", seq.source); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#5306)"
+        };
+        assert_eq!((ends.as_slice(), *next), ([2, 4, 5].as_slice(), 0));
+        let Some(Ok(LazyElem::Owned(first))) = seq.next() else {
+            panic!("the first pull decodes the first group"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#5306)"
+        };
+        assert_eq!(first.to_json(), r#"[{"a":1,"i":1},{"a":1,"i":3}]"#);
+        let LazySource::Groups { next, .. } = &seq.source else {
+            panic!("the source stays a Groups source"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#5306)"
+        };
+        assert_eq!(*next, 1);
+        let rest = seq.materialize_atomic::<JqSemantics>().unwrap();
+        assert_eq!(
+            rest.to_json(),
+            r#"[[{"a":2,"i":0},{"a":2,"i":2}],[{"a":3,"i":4}]]"#
+        );
+        let debug = format!(
+            "{:?}",
+            eval_with_cursor_using::<JqSemantics, _>(&expr, index.root(doc.as_bytes()))
+        );
+        assert!(debug.contains("LazySource::Groups"), "{debug}");
     }
 
     /// #3856: a sequence with no stage and a source that is neither a cursor
