@@ -466,6 +466,16 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// hand-written one it replaced on a 10 MB `--slurp`.
     const REUSE_FIELD_VALUE: bool = false;
 
+    /// Whether a node of this format can carry an explicit tag (`!!str 1`), which only a
+    /// cursor can look up, by the node's byte position ([`explicit_tag`](Self::explicit_tag)).
+    ///
+    /// `true` by default, so a new format materializes through its cursors. `false` for
+    /// JSON, which has none: a node's value then says all there is to say about it, and a
+    /// walk over [`DocumentValue`]s skips the position lookup a cursor walk makes for every
+    /// container (#5306: decoding a `group_by` group that way cost 16-22% on a full
+    /// output). A format that sets it `false` must leave `explicit_tag` at its default.
+    const HAS_EXPLICIT_TAGS: bool = true;
+
     /// Whether a sequence's elements, and a mapping's members, are exactly the
     /// chain [`next_element`](Self::next_element) walks from the first, so that
     /// a scan for one can resume from one an earlier scan already reached

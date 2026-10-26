@@ -3958,9 +3958,18 @@ impl<V: DocumentValue> LazySource<V> {
                 };
                 let start = if *next == 0 { 0 } else { ends[*next - 1] };
                 *next += 1;
-                Some(LazyElem::Owned(OwnedValue::array_from(
-                    to_owned_all_cursors::<JqSemantics, _>(&cursors[start..end])?,
-                )))
+                let group = &cursors[start..end];
+                let items = if <V::Cursor as DocumentCursor>::HAS_EXPLICIT_TAGS {
+                    to_owned_all_cursors::<JqSemantics, _>(group)?
+                } else {
+                    // Nothing in the group can carry a tag, so decoding its values is the
+                    // same walk without the position lookup a cursor makes per container.
+                    group
+                        .iter()
+                        .map(|cursor| to_owned::<JqSemantics, _>(&cursor.value()))
+                        .collect::<Result<Vec<_>, _>>()?
+                };
+                Some(LazyElem::Owned(OwnedValue::array_from(items)))
             }
         })
     }

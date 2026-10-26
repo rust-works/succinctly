@@ -3991,6 +3991,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
     }
 
     const STEPS_BACK: bool = true;
+    const HAS_EXPLICIT_TAGS: bool = false;
 
     #[inline]
     fn prev_element(&self) -> Option<Self> {
