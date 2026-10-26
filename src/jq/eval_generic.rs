@@ -14351,14 +14351,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // yq mode keeps the bridge (`eval::eval_string_interpolation`: its
         // slots take only a first value, which this recursion does not model).
         Expr::StringInterpolation(parts) if S::TAG != EvalTag::Yq && !needs_path_context(expr) => {
-            let mut slots: Vec<String> = vec![String::new(); parts.len()];
-            let mut out = Vec::new();
-            match build_string_parts_generic::<S, V>(
-                parts, &value, optional, cursor, &mut slots, &mut out,
-            ) {
-                Ok(()) => owned_vec_to_generic_result(out),
-                Err(control) => partial_generic(out, control),
-            }
+            collect_string_interpolation_generic::<S, V>(parts, &value, optional, cursor)
         }
         Expr::As { .. } => collect_each_generic::<S, V>(expr, value, optional, cursor),
 
@@ -15343,12 +15336,14 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // generator at all (`eval::eval_string_interpolation`'s own doc
         // comment), so it stays on the pre-existing eager fallback below,
         // matching `eval.rs`'s own jq-mode gate.
-        Expr::StringInterpolation(parts) if S::TAG != EvalTag::Yq && !needs_path_context(expr) => {
-            // #5305: native, not bridged -- the bridge materialized and
-            // reindexed the whole ambient value (`.users[] | "\(.name)"`
-            // copied every user record) to read one field of it.
-            let mut slots: Vec<String> = vec![String::new(); parts.len()];
-            each_string_parts_generic::<S, V>(parts, value, optional, cursor, &mut slots, sink)
+        // #5305: a slot that reads no position is read at the cursor, not bridged -- the
+        // bridge materialized and reindexed the whole ambient value (`.users[] |
+        // "\(.name)"` copied every user record) to read one field of it. The arm keeps
+        // its original shape, one call, and decides inside: this function is on every
+        // recursion's path, and a second arm grew its debug frame past ADR-0025's floor
+        // (`test_literal_dollar_argument_matches_jq_3260`).
+        Expr::StringInterpolation(_) if S::TAG != EvalTag::Yq => {
+            each_string_interpolation_generic::<S, V>(expr, value, cursor, optional, sink)
         }
         // -- #1556's `eval.rs` twin, mirrored here at last (#2180 WP2b): the
         // one construct the two arm sets had already drifted on --
@@ -20989,6 +20984,42 @@ fn each_negate_generic<S: EvalSemantics, V: DocumentValue>(
         Flow::Escaped(control) => Some(control),
     });
     finish_fork_flow(control, optional)
+}
+
+/// [`eval_each_generic`]'s jq-mode `Expr::StringInterpolation` arm, out of line (#5305): a slot
+/// that reads a position keeps the owned bridge, every other interpolation is read at the cursor.
+#[inline(never)]
+fn each_string_interpolation_generic<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    value: V,
+    cursor: Option<V::Cursor>,
+    optional: bool,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    let Expr::StringInterpolation(parts) = expr else {
+        unreachable!("only the interpolation arm calls this"); // patchcov: coverage tolerate-line reason="unreachable: the one call site matches Expr::StringInterpolation"
+    };
+    if needs_path_context(expr) {
+        return bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink);
+    }
+    let mut slots: Vec<String> = vec![String::new(); parts.len()];
+    each_string_parts_generic::<S, V>(parts, value, optional, cursor, &mut slots, sink)
+}
+
+/// [`eval_single`]'s `Expr::StringInterpolation` arm, out of line for the same reason (#5305).
+#[inline(never)]
+fn collect_string_interpolation_generic<S: EvalSemantics, V: DocumentValue>(
+    parts: &[StringPart],
+    value: &V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+) -> GenericResult<V> {
+    let mut slots: Vec<String> = vec![String::new(); parts.len()];
+    let mut out = Vec::new();
+    match build_string_parts_generic::<S, V>(parts, value, optional, cursor, &mut slots, &mut out) {
+        Ok(()) => owned_vec_to_generic_result(out),
+        Err(control) => partial_generic(out, control),
+    }
 }
 
 /// Eager twin of [`each_string_parts_generic`] and the cursor-threaded twin of
