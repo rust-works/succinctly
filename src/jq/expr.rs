@@ -1891,9 +1891,80 @@ pub struct PipeStages {
     stages: Vec<Expr>,
     needs_path_context: core::cell::Cell<Option<bool>>,
     effect_before_last: core::cell::Cell<Option<bool>>,
+    shape: core::cell::Cell<Option<PipeShape>>,
+    tails: TailCopies,
 }
 
+/// What a pipe's stages hold, syntactically: the three facts the owned
+/// re-entry asks of the pipe it is about to run, each of which is an exact
+/// early-out for a walk it would otherwise make over every stage (#5404).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct PipeShape {
+    /// A `$var` marker (`Expr::TrackedVar`) is somewhere in it: without one a
+    /// re-entry has nothing to rewrite.
+    pub(crate) tracked_var: bool,
+    /// A node that can start a resolver invocation is somewhere in it: without
+    /// one nothing reads a rewritten marker.
+    pub(crate) resolver_node: bool,
+    /// An `Expr::As` is somewhere in it: without one no bind can reach a
+    /// resolver.
+    pub(crate) bind: bool,
+}
+
+/// The longest pipe that keeps owned copies of its tails (#5404).
+///
+/// A pipe of `n` stages keeps up to `n - 2` copies, `n - 1` stages down to 2,
+/// so the memory is quadratic in `n`: 8,128 stage copies at the limit, held for
+/// as long as the program. A longer pipe copies its tail per call, as it did
+/// before the cache.
+pub(crate) const MAX_KEPT_TAIL_STAGES: usize = 128;
+
+/// A pipe's owned tails: slot `i` holds the `Expr::Pipe` over `stages[i..]`,
+/// once something asked for it. `Some(None)` is a tail that must be copied
+/// afresh each time (see [`PipeStages::kept_tail`]).
+///
+/// Derived state, like the memos beside it: it is built on first use, a clone
+/// starts without it, and `DerefMut` drops it.
+#[derive(Default)]
+struct TailCopies(core::cell::OnceCell<Box<[core::cell::OnceCell<Option<Rc<Expr>>>]>>);
+
 impl PipeStages {
+    /// The owned `Expr::Pipe` over `stages[from..]`, built by `build` on the
+    /// first ask and kept (#5404), or `None` when this pipe keeps no copy of
+    /// that tail: `build` declined it, the tail is shorter than two stages (a
+    /// lone stage is handed on as itself), or the pipe is longer than
+    /// [`MAX_KEPT_TAIL_STAGES`].
+    ///
+    /// Why a copy is wanted at all: the doors and the bridge of the owned
+    /// evaluator are keyed on a whole `&Expr`, so a rest of several stages
+    /// needs a pipe of its own to be handed on. Built per call it is `n - 1`,
+    /// `n - 2`, ... stages for each value that goes down a pipe of `n`, and the
+    /// copy starts with no memo, so the analyses a pipe asks of itself re-walk
+    /// it too. Kept, both are paid once per program.
+    ///
+    /// `build` returns `None` for a tail that must not be kept: one holding a
+    /// node that remembers what evaluation did to it (#3148) would carry that
+    /// from one call to the next.
+    pub(crate) fn kept_tail(
+        &self,
+        from: usize,
+        build: impl FnOnce(&[Expr]) -> Option<Expr>,
+    ) -> Option<Rc<Expr>> {
+        let len = self.stages.len();
+        if from == 0 || len < from + 2 || len > MAX_KEPT_TAIL_STAGES {
+            return None;
+        }
+        let slots = self.tails.0.get_or_init(|| {
+            (0..len)
+                .map(|_| core::cell::OnceCell::new())
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        });
+        slots[from]
+            .get_or_init(|| build(&self.stages[from..]).map(Rc::new))
+            .clone()
+    }
+
     /// Whether any stage needs path context, computing it with `classify` on
     /// the first call.
     pub(crate) fn needs_path_context_or_init(
@@ -1912,6 +1983,17 @@ impl PipeStages {
         memo(&self.effect_before_last, || classify(&self.stages))
     }
 
+    /// What the stages hold, computing it with `classify` on the first call
+    /// (#5404).
+    pub(crate) fn shape_or_init(&self, classify: impl FnOnce(&[Expr]) -> PipeShape) -> PipeShape {
+        if let Some(known) = self.shape.get() {
+            return known;
+        }
+        let shape = classify(&self.stages);
+        self.shape.set(Some(shape));
+        shape
+    }
+
     /// The stages, without the remembered answers.
     pub fn into_vec(self) -> Vec<Expr> {
         self.stages
@@ -1924,6 +2006,8 @@ impl From<Vec<Expr>> for PipeStages {
             stages,
             needs_path_context: core::cell::Cell::new(None),
             effect_before_last: core::cell::Cell::new(None),
+            shape: core::cell::Cell::new(None),
+            tails: TailCopies::default(),
         }
     }
 }
@@ -1946,6 +2030,8 @@ impl core::ops::DerefMut for PipeStages {
     fn deref_mut(&mut self) -> &mut Vec<Expr> {
         self.needs_path_context.set(None);
         self.effect_before_last.set(None);
+        self.shape.set(None);
+        self.tails.0.take();
         &mut self.stages
     }
 }
@@ -3799,6 +3885,96 @@ mod tests {
             !iterated.needs_path_context_or_init(|_| false),
             "a rewrite by iteration forgets"
         );
+    }
+
+    /// #5404: a pipe keeps the owned copy of a tail it was asked for, builds it
+    /// once, and forgets it when its stages change or when it is cloned.
+    #[test]
+    fn test_pipe_stages_keep_a_tail_copy_5404() {
+        let build = |stages: &[Expr]| Some(Expr::Pipe(stages.to_vec().into()));
+        let stages = |n: usize| PipeStages::from(vec![Expr::Identity; n]);
+        let mut pipe = stages(5);
+        let first = pipe.kept_tail(1, build).expect("a tail of four stages");
+        assert!(matches!(&*first, Expr::Pipe(tail) if tail.len() == 4));
+        let again = pipe.kept_tail(1, |_| unreachable!("kept"));
+        assert!(again.is_some_and(|again| Rc::ptr_eq(&again, &first)));
+        assert!(
+            pipe.kept_tail(2, build)
+                .is_some_and(|tail| matches!(&*tail, Expr::Pipe(t) if t.len() == 3)),
+            "each offset has its own"
+        );
+        assert!(pipe.kept_tail(3, build).is_some(), "a tail of two stages");
+        assert!(pipe
+            .kept_tail(4, |_| unreachable!("a lone stage is not kept"))
+            .is_none());
+        assert!(pipe
+            .kept_tail(0, |_| unreachable!("the pipe itself is not a tail"))
+            .is_none());
+        assert!(
+            pipe.clone().kept_tail(1, |_| None).is_none(),
+            "a clone starts without the copies"
+        );
+        pipe.push(Expr::Identity);
+        assert!(
+            pipe.kept_tail(1, |s| Some(Expr::Pipe(s.to_vec().into())))
+                .is_some_and(|tail| matches!(&*tail, Expr::Pipe(t) if t.len() == 5)),
+            "a rewrite of the stages drops the copies"
+        );
+    }
+
+    /// #5404: a pipe remembers what its stages hold, asks once, and forgets it
+    /// when its stages change or when it is cloned.
+    #[test]
+    fn test_pipe_stages_remember_their_shape_5404() {
+        let bind = PipeShape {
+            bind: true,
+            ..PipeShape::default()
+        };
+        let mut pipe = PipeStages::from(vec![Expr::Identity; 2]);
+        assert_eq!(pipe.shape_or_init(|_| bind), bind);
+        assert_eq!(
+            pipe.shape_or_init(|_| unreachable!("answered from the memo")),
+            bind
+        );
+        assert_eq!(
+            pipe.clone().shape_or_init(|_| PipeShape::default()),
+            PipeShape::default(),
+            "a clone starts without it"
+        );
+        pipe.push(Expr::Identity);
+        assert_eq!(
+            pipe.shape_or_init(|stages| {
+                assert_eq!(stages.len(), 3, "asked of the stages as they now are");
+                PipeShape::default()
+            }),
+            PipeShape::default(),
+            "a rewrite of the stages forgets it"
+        );
+    }
+
+    /// #5404: a tail `build` declines is asked once and stays declined, and a
+    /// pipe past the limit keeps nothing.
+    #[test]
+    fn test_pipe_stages_remember_a_declined_tail_and_keep_none_past_the_limit_5404() {
+        let pipe = PipeStages::from(vec![Expr::Identity; 4]);
+        let mut asks = 0;
+        for _ in 0..3 {
+            assert!(pipe
+                .kept_tail(1, |_| {
+                    asks += 1;
+                    None
+                })
+                .is_none());
+        }
+        assert_eq!(asks, 1);
+        let long = PipeStages::from(vec![Expr::Identity; MAX_KEPT_TAIL_STAGES + 1]);
+        assert!(long
+            .kept_tail(1, |_| unreachable!("too long to keep copies"))
+            .is_none());
+        let longest = PipeStages::from(vec![Expr::Identity; MAX_KEPT_TAIL_STAGES]);
+        assert!(longest
+            .kept_tail(1, |s| Some(Expr::Pipe(s.to_vec().into())))
+            .is_some());
     }
 
     #[test]

@@ -495,8 +495,8 @@ use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
 use super::expr::{
     retention_scope, ArithOp, ArithSettleMemo, AssignOp, BindOrigin, BoundBody, Builtin, CompareOp,
     Expr, FormatType, FuncDefBound, FuncDefData, Libm1, Libm2, Libm3, Literal, MergeFlags,
-    MetaSlot, NumberKey, ObjectEntry, ObjectKey, Origin, Param, Pattern, PatternEntry, PipeStages,
-    SharedArg, SliceBoundKey, StringPart, Tracked,
+    MetaSlot, NumberKey, ObjectEntry, ObjectKey, Origin, Param, Pattern, PatternEntry, PipeShape,
+    PipeStages, SharedArg, SliceBoundKey, StringPart, Tracked,
 };
 use super::value::{
     assert_value_tree_depth, check_value_tree_depth, cmp_f64, document_number_f64,
@@ -3513,6 +3513,25 @@ pub(crate) fn pipe_needs_path_context(stages: &PipeStages) -> bool {
     stages.needs_path_context_or_init(|stages| stages.iter().any(needs_path_context))
 }
 
+/// What the stages of a pipe hold (see [`PipeShape`]), remembered on the pipe
+/// (#5404): the early-outs of the owned re-entry's per-call walks, which a pipe
+/// of `n` stages over computed values made `n` times per value, each over the
+/// rest of the pipe.
+pub(crate) fn pipe_shape(stages: &PipeStages) -> PipeShape {
+    stages.shape_or_init(|stages| {
+        let mut shape = PipeShape::default();
+        for stage in stages {
+            any_subexpr(stage, &mut |e| {
+                shape.tracked_var |= matches!(e, Expr::TrackedVar(_));
+                shape.resolver_node |= may_enter_resolver_node(e);
+                shape.bind |= matches!(e, Expr::As { .. });
+                false
+            });
+        }
+        shape
+    })
+}
+
 /// Whether a stage before the last of a pipe may have an effect, remembered on
 /// the pipe (#4293).
 ///
@@ -3858,6 +3877,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Some(effect_before_last),
                 value,
                 optional,
+                Some(PipeTail::whole(exprs)),
             )
         }
 
@@ -10040,7 +10060,7 @@ fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let needs_path = needs_path.unwrap_or_else(|| exprs.iter().any(needs_path_context));
     if needs_path {
         return drain_result(
-            eval_pipe::<W, S>(exprs, Some(true), None, value, optional),
+            eval_pipe::<W, S>(exprs, Some(true), None, value, optional, None),
             sink,
         );
     }
@@ -28244,16 +28264,77 @@ fn promote_and_extend<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     Ok(())
 }
 
+/// The stages of a program's own pipe from `from` on, with the pipe that owns
+/// them (#5404).
+///
+/// What lets [`eval_owned_pipe`] hand a rest of several stages on without
+/// copying it per call: the owner keeps one copy of each tail
+/// ([`PipeStages::kept_tail`]). The owner and the offset are one value so that
+/// the slice a caller evaluates and the tail it would keep cannot disagree --
+/// [`Self::stages`] is the slice, derived from both.
+#[derive(Clone, Copy)]
+struct PipeTail<'p> {
+    owner: &'p PipeStages,
+    from: usize,
+}
+
+impl<'p> PipeTail<'p> {
+    /// All of `owner`'s stages.
+    fn whole(owner: &'p PipeStages) -> Self {
+        Self { owner, from: 0 }
+    }
+
+    /// The stages this tail covers.
+    fn stages(self) -> &'p [Expr] {
+        &self.owner[self.from..]
+    }
+
+    /// Whether `tail` (if any) is `exprs` themselves. A negated `matches!`
+    /// rather than `Option::is_none_or`, which is 1.82 where the MSRV is 1.73.
+    fn covers(tail: Option<Self>, exprs: &[Expr]) -> bool {
+        !matches!(tail, Some(t) if !core::ptr::eq(t.stages(), exprs))
+    }
+
+    /// The tail after its first stage.
+    fn rest(self) -> Self {
+        Self {
+            owner: self.owner,
+            from: self.from + 1,
+        }
+    }
+
+    /// The owned `Expr::Pipe` over these stages if the owner keeps one: not
+    /// for a tail that holds evaluation state, whose copy has to start empty
+    /// each call ([`holds_evaluation_state`], #3148).
+    fn kept_copy(self) -> Option<Rc<Expr>> {
+        self.owner.kept_tail(self.from, |stages| {
+            if stages.iter().any(holds_evaluation_state) {
+                return None;
+            }
+            #[cfg(test)]
+            owned_pipe_copies::bump();
+            Some(Expr::Pipe(stages.to_vec().into()))
+        })
+    }
+}
+
 /// Evaluate a pipe (chain) of expressions.
 ///
-/// `needs_path` is as for [`eval_each_pipe`].
+/// `needs_path` is as for [`eval_each_pipe`]. `tail` says which pipe of the
+/// program `exprs` are the stages of, when it is one (`None` for stages made
+/// on the spot); [`eval_owned_pipe`] keeps its copy of the rest there.
 fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     exprs: &[Expr],
     needs_path: Option<bool>,
     effect_before_last: Option<bool>,
     value: StandardJson<'a, W>,
     optional: bool,
+    tail: Option<PipeTail<'_>>,
 ) -> QueryResult<'a, W> {
+    debug_assert!(
+        PipeTail::covers(tail, exprs),
+        "the tail names other stages than the ones evaluated"
+    );
     // Check if any expression in the pipe needs path context (PathNoArg, Parent)
     if needs_path.unwrap_or_else(|| exprs.iter().any(needs_path_context)) {
         // #1755: to_owned, not to_owned_lossy -- an undecodable input
@@ -28303,6 +28384,7 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 
     let (first, rest) = exprs.split_first().unwrap();
+    let rest_tail = tail.map(PipeTail::rest);
 
     // Evaluate first expression
     let result = eval_single::<W, S>(first, value, optional);
@@ -28313,7 +28395,7 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     // Apply remaining expressions to the result
     match result.materialize_cursor() {
-        QueryResult::One(v) => eval_pipe::<W, S>(rest, None, Some(false), v, optional),
+        QueryResult::One(v) => eval_pipe::<W, S>(rest, None, Some(false), v, optional, rest_tail),
         QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::Many(values) => {
             // Rest-of-pipe applied per element may yield borrowed (One/Many) OR
@@ -28324,7 +28406,9 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let mut borrowed: Vec<StandardJson<'a, W>> = Vec::new();
             let mut owned: Option<Vec<OwnedValue>> = None;
             for v in values {
-                match eval_pipe::<W, S>(rest, None, Some(false), v, optional).materialize_cursor() {
+                match eval_pipe::<W, S>(rest, None, Some(false), v, optional, rest_tail)
+                    .materialize_cursor()
+                {
                     QueryResult::One(r) => {
                         if let Err(e) =
                             push_promoted::<_, S>(core::iter::once(r), &mut borrowed, &mut owned)
@@ -28421,7 +28505,7 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Owned(v) => {
             // Continue piping with owned value using eval_owned_pipe
             // Convert the result type since eval_owned_pipe uses Vec<u64> internally
-            match eval_owned_pipe::<Vec<u64>, S>(rest, v, optional) {
+            match eval_owned_pipe::<Vec<u64>, S>(rest, v, optional, rest_tail) {
                 QueryResult::Owned(o) => QueryResult::Owned(o),
                 QueryResult::Error(e) => QueryResult::Error(e),
                 QueryResult::None => QueryResult::None,
@@ -28445,7 +28529,9 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
             }
         }
-        QueryResult::ManyOwned(vs) => pipe_owned_prefix::<S, W>(rest, vs, None, optional),
+        QueryResult::ManyOwned(vs) => {
+            pipe_owned_prefix::<S, W>(rest, vs, None, optional, rest_tail)
+        }
         // `first`'s own stream produced `vs` before terminating in
         // `outer_control` (#400, #494): pipe each already-produced value
         // through `rest` first — jq's generator still pairs those with the
@@ -28484,7 +28570,7 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             partial(Vec::new(), outer_control)
         }
         QueryResult::Partial(vs, outer_control) => {
-            pipe_owned_prefix::<S, W>(rest, vs, Some(outer_control), optional)
+            pipe_owned_prefix::<S, W>(rest, vs, Some(outer_control), optional, rest_tail)
         }
     }
 }
@@ -28499,10 +28585,11 @@ fn pipe_owned_prefix<'a, S: EvalSemantics, W>(
     vs: Vec<OwnedValue>,
     trailing: Option<Control>,
     optional: bool,
+    tail: Option<PipeTail<'_>>,
 ) -> QueryResult<'a, W> {
     let mut all_results: Vec<OwnedValue> = Vec::new();
     for v in vs {
-        match eval_owned_pipe::<Vec<u64>, S>(rest, v, optional).materialize_cursor() {
+        match eval_owned_pipe::<Vec<u64>, S>(rest, v, optional, tail).materialize_cursor() {
             QueryResult::Owned(r) => all_results.push(r),
             QueryResult::OneCursor(_) => unreachable!(),
             QueryResult::ManyOwned(rs) => all_results.extend(rs),
@@ -28525,11 +28612,19 @@ fn pipe_owned_prefix<'a, S: EvalSemantics, W>(
 }
 
 /// Evaluate a pipe with an OwnedValue as input.
+///
+/// `tail` is as for [`eval_pipe`]: the pipe of the program that `exprs` are the
+/// stages of, if any.
 fn eval_owned_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     exprs: &[Expr],
     value: OwnedValue,
     optional: bool,
+    tail: Option<PipeTail<'_>>,
 ) -> QueryResult<'a, W> {
+    debug_assert!(
+        PipeTail::covers(tail, exprs),
+        "the tail names other stages than the ones evaluated"
+    );
     if exprs.is_empty() {
         return QueryResult::Owned(value);
     }
@@ -28550,25 +28645,36 @@ fn eval_owned_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // pins it here; #3692's twin of that test drives the streaming evaluator,
     // which never reaches this function). A rest of two or more stages still
     // needs an owned `Expr::Pipe` to hand on, which `RestPipe` builds once per
-    // drive; here each element is its own call and the AST has no slot to cache
-    // one in.
+    // drive; here each element is its own call, so the pipe of the program that
+    // owns the rest keeps one for it (#5404) -- built per call, a chain of `n`
+    // stages over one value copied `n - 1`, `n - 2`, ... of them, and each copy
+    // re-ran the analyses a pipe asks of itself. A rest with no owner (stages
+    // made on the spot), a pipe too long to keep copies for, and a rest holding
+    // evaluation state are copied per call.
     //
     // One call to `eval_owned_input` below, not one per branch: it is
     // `#[inline(always)]`, so a second call site would emit its large body twice
     // in this recursive function.
+    let kept;
     let copy;
     let rest: &Expr = match exprs {
         [stage] if !holds_evaluation_state(stage) => stage,
-        _ => {
-            #[cfg(test)]
-            owned_pipe_copies::bump();
-            copy = if exprs.len() == 1 {
-                exprs[0].clone()
-            } else {
-                Expr::Pipe(exprs.to_vec().into())
-            };
-            &copy
-        }
+        _ => match tail.and_then(PipeTail::kept_copy) {
+            Some(whole) => {
+                kept = whole;
+                &kept
+            }
+            None => {
+                #[cfg(test)]
+                owned_pipe_copies::bump();
+                copy = if exprs.len() == 1 {
+                    exprs[0].clone()
+                } else {
+                    Expr::Pipe(exprs.to_vec().into())
+                };
+                &copy
+            }
+        },
     };
 
     // Deliberately not `eval_owned_expr`: that returns a single `OwnedValue` and
@@ -42139,6 +42245,15 @@ pub(crate) fn demote_for_reentry<'e>(expr: &'e Expr, root: &RootWitness) -> Cow<
 /// can start a resolver invocation -- the only reader of the change. When
 /// either is missing the re-entry hands `expr` back borrowed.
 fn reentry_can_observe(expr: &Expr, rewrite: &dyn Fn(&Tracked) -> Option<Origin>) -> bool {
+    // A pipe remembers whether it holds either half (#5404): the answer is
+    // `false` without the other half's walk, and a pipe of `n` stages that
+    // each owned value goes down is asked once per stage.
+    if let Expr::Pipe(stages) = expr {
+        let shape = pipe_shape(stages);
+        if !shape.tracked_var || !shape.resolver_node {
+            return false;
+        }
+    }
     // One walk for both questions: this runs once per re-entry, which on a
     // per-element shape is once per element, so a second pass over a
     // marker-bearing body was measurable (about +1% on a 7950X).
@@ -111319,7 +111434,7 @@ mod tests {
                     other => vec![other],
                 };
                 let before = owned_pipe_copies::get();
-                let got = show(eval_owned_pipe::<Vec<u64>, S>(&rest, input(), false));
+                let got = show(eval_owned_pipe::<Vec<u64>, S>(&rest, input(), false, None));
                 assert_eq!(
                     owned_pipe_copies::get() - before,
                     copies_expected,
@@ -111343,6 +111458,164 @@ mod tests {
         }
         run::<JqSemantics>();
         run::<YqSemantics>();
+    }
+
+    /// Run `program` over `input`, on this thread so the copy counter of
+    /// [`owned_pipe_copies`] sees it, and return what it printed and how many
+    /// rest copies it made.
+    fn run_counting_owned_pipe_copies<S: EvalSemantics>(
+        program: &str,
+        input: &'static [u8],
+    ) -> (String, usize) {
+        let expr = parse(program).unwrap();
+        let index = crate::json::JsonIndex::build(input);
+        let before = owned_pipe_copies::get();
+        let out: Vec<String> = eval_full::<Vec<u64>, S>(&expr, index.root(input))
+            .collect_owned::<S>()
+            .iter()
+            .map(OwnedValue::to_json)
+            .collect();
+        (out.join(","), owned_pipe_copies::get() - before)
+    }
+
+    /// A parenthesized pipe of `stages` stages that computes a value at each
+    /// stage: `(. + 1 | . + 1 | ...)`.
+    fn parenthesized_increments(stages: usize) -> String {
+        format!("({})", vec![". + 1"; stages].join(" | "))
+    }
+
+    /// #5404: the rest of a pipe of the program is copied once, not once per
+    /// value. A pipe of `n` stages over computed values made `n - 1`, `n - 2`,
+    /// ... stage copies for each value that went down it; the pipe now keeps
+    /// the copy of each tail, so the count is `n - 2` (the tails of two or more
+    /// stages) however many values follow, and the output is the one the
+    /// per-call copy gave.
+    #[test]
+    fn test_owned_pipe_rest_is_copied_once_per_program_not_per_value_5404() {
+        fn run<S: EvalSemantics>() {
+            const STAGES: usize = 12;
+            let program = format!("[.[] | {}] | add", parenthesized_increments(STAGES));
+            let (one, copies_one) = run_counting_owned_pipe_copies::<S>(&program, b"[10]");
+            let (many, copies_many) =
+                run_counting_owned_pipe_copies::<S>(&program, b"[10,20,30,40,50,60,70,80]");
+            assert_eq!(one, "22", "({:?})", S::TAG);
+            assert_eq!(
+                many,
+                "456",
+                "({:?}): 360 plus 12 for each of 8 values",
+                S::TAG
+            );
+            assert_eq!(
+                copies_one,
+                STAGES - 2,
+                "one value copies each tail of two or more stages once ({:?})",
+                S::TAG
+            );
+            assert_eq!(
+                copies_many,
+                copies_one,
+                "eight values copy no more than one does ({:?})",
+                S::TAG
+            );
+        }
+        run::<JqSemantics>();
+        run::<YqSemantics>();
+    }
+
+    /// #5404: a rest that holds a `def` is not kept. A copy kept on the
+    /// program's own pipe would carry what evaluation did to the `def`'s nodes
+    /// from one value to the next (#3148), which is the retention the per-call
+    /// copy exists to avoid, so each value still makes its own.
+    #[test]
+    fn test_owned_pipe_rest_holding_a_def_is_copied_per_value_5404() {
+        let program = "def f: . + 1; [.[] | (. + 1 | f | f | f)] | add";
+        let (one, copies_one) = run_counting_owned_pipe_copies::<JqSemantics>(program, b"[10]");
+        let (three, copies_three) =
+            run_counting_owned_pipe_copies::<JqSemantics>(program, b"[10,20,30]");
+        assert_eq!(one, "14");
+        assert_eq!(three, "72");
+        assert!(copies_one > 0, "the rest of several stages is copied");
+        assert_eq!(
+            copies_three,
+            3 * copies_one,
+            "each value makes the copies one value makes"
+        );
+    }
+
+    /// #5404: a pipe longer than [`MAX_KEPT_TAIL_STAGES`] keeps no copies (they
+    /// are quadratic in its length) and still answers as it did.
+    #[test]
+    fn test_owned_pipe_longer_than_the_kept_limit_copies_per_value_5404() {
+        let stages = crate::jq::expr::MAX_KEPT_TAIL_STAGES + 1;
+        let program = format!("[.[] | {}] | add", parenthesized_increments(stages));
+        // A pipe this long recurses past a test thread's default stack.
+        const STACK: usize = 256 * 1024 * 1024;
+        let (out, copies) = std::thread::Builder::new()
+            .stack_size(STACK)
+            .spawn(move || {
+                with_stack_budget(STACK, || {
+                    run_counting_owned_pipe_copies::<JqSemantics>(&program, b"[0,0]")
+                })
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(out, (2 * stages).to_string());
+        assert!(
+            copies >= 2 * (stages - 2),
+            "{copies} copies for two values over {stages} stages"
+        );
+    }
+
+    /// #5404: [`pipe_shape`] reads what the stages hold, so the walks it lets
+    /// the owned re-entry skip are skipped only when they could not have said
+    /// yes.
+    #[test]
+    fn test_pipe_shape_reports_what_the_stages_hold_5404() {
+        let shape = |src: &str| -> PipeShape {
+            let Expr::Pipe(stages) = parse(src).unwrap() else {
+                panic!("`{src}` is a pipe");
+            };
+            pipe_shape(&stages)
+        };
+        assert_eq!(shape(". + 1 | . + 2 | . + 3"), PipeShape::default());
+        assert!(shape("(. as $x | . + $x) | . + 1").bind);
+        assert!(!shape(". + 1 | . + 2").bind);
+        assert!(shape(". + 1 | path(.a) | . + 3").resolver_node);
+        assert!(shape(". + 1 | (.a = 1) | . + 3").resolver_node);
+        assert!(shape(". + 1 | (. | tostring) | . + 3").resolver_node);
+        assert!(!shape(". + 1 | (. + 2) | . + 3").resolver_node);
+        assert!(
+            !shape("(. as $x | path(.a)) | . + 1").tracked_var,
+            "a parsed program holds no marker: they exist only mid-evaluation"
+        );
+    }
+
+    /// #5404: [`PipeTail`] names the stages it was made from and the ones after
+    /// its first, so the tail kept for a rest is the rest.
+    #[test]
+    fn test_pipe_tail_stages_follow_the_owner_5404() {
+        let Expr::Pipe(stages) = parse(". + 1 | . + 2 | . + 3 | . + 4").unwrap() else {
+            panic!("a pipe");
+        };
+        let whole = PipeTail::whole(&stages);
+        assert!(core::ptr::eq(whole.stages(), &stages[..]));
+        assert!(PipeTail::covers(Some(whole), &stages));
+        assert!(PipeTail::covers(None, &stages[1..]));
+        let rest = whole.rest();
+        assert!(core::ptr::eq(rest.stages(), &stages[1..]));
+        assert!(PipeTail::covers(Some(rest), &stages[1..]));
+        assert!(!PipeTail::covers(Some(rest), &stages[2..]));
+        assert_eq!(rest.rest().stages().len(), 2);
+        assert!(whole
+            .rest()
+            .rest()
+            .kept_copy()
+            .is_some_and(|kept| matches!(&*kept, Expr::Pipe(tail) if tail.len() == 2)));
+        assert!(
+            rest.rest().rest().kept_copy().is_none(),
+            "a lone stage is handed on as itself, not kept"
+        );
     }
 
     /// #3682: the three peel doors no longer copy a lone rest into an owned
