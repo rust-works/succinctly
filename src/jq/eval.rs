@@ -153488,9 +153488,16 @@ mod share_audit_2999 {
             "[limit(300; range([]; {}; [1]) | length)] | length",
             &[(Kind::ArrayMakeMut, 1), (Kind::ArrayUnwrap, 299)],
         );
+        // `last(f)` no longer retains (#5377): it is jq's `reduce`, which lets go of each value
+        // as the next arrives, so it appends in place like the consumers above.
         assert_forced(
             b"null",
             "last(limit(300; range([]; {}; [1]))) | length",
+            &[(Kind::ArrayMakeMut, 1), (Kind::ArrayUnwrap, 299)],
+        );
+        assert_forced(
+            b"null",
+            "[limit(300; range([]; {}; [1]))] | last | length",
             &[(Kind::ArrayMakeMut, 299), (Kind::ArrayUnwrap, 299)],
         );
     }
