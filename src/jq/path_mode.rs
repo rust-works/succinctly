@@ -343,6 +343,9 @@ enum Frame<'e> {
         params: &'e [Param],
         body: &'e Expr,
         parent: Env<'e>,
+        /// Whether a call to this def with no parameters runs as a tail loop (#5379),
+        /// worked out on the first call.
+        tail: Cell<Option<bool>>,
     },
     /// A closure parameter: an argument expression and its caller's
     /// environment, and whether the argument is pure there
@@ -834,9 +837,6 @@ pub struct Interp<'e> {
     /// The `def` bodies [`Self::pure`] and [`Self::single`] are looking inside right
     /// now, by address, so a definition that reaches itself is seen as it is (#5263).
     def_walk: RefCell<Vec<usize>>,
-    /// Whether the body of a `def` with no parameters ends in a call that can bring a tail
-    /// loop round again (#5379), by the address of the body: asked on every call.
-    tail_loops: RefCell<BTreeMap<usize, bool>>,
     /// Array slices as `jvp_array_slice` makes them: a view (`offset`, `size`)
     /// into the root allocation. Keyed by `(root, offset, size)`, so equal
     /// slices of one array are one value; each view maps back to its root
@@ -1259,6 +1259,7 @@ impl<'e> Interp<'e> {
                     params,
                     body,
                     parent: env.clone(),
+                    tail: Cell::new(None),
                 });
             }
         }
@@ -1269,7 +1270,6 @@ impl<'e> Interp<'e> {
             next_label: Cell::new(0),
             depth: Cell::new(0),
             def_walk: RefCell::new(Vec::new()),
-            tail_loops: RefCell::new(BTreeMap::new()),
             slices: RefCell::new(BTreeMap::new()),
             slice_roots: RefCell::new(BTreeMap::new()),
         }
@@ -1558,6 +1558,7 @@ impl<'e> Interp<'e> {
                     params,
                     body,
                     parent: env.clone(),
+                    tail: Cell::new(None),
                 });
                 self.eval(then, &env, input, reg, sink)
             }
@@ -3135,7 +3136,7 @@ impl<'e> Interp<'e> {
         // runs as a loop, not as nested frames.
         let loops = matches!(
             &callee,
-            Callee::Def { name, params: [], body, .. } if self.loops_in_place(name, body)
+            Callee::Def { name, params: [], body, env } if Self::loops_in_place(env, name, body)
         );
         if loops {
             return self.call_def_loop(callee, input, reg, sink);
@@ -3225,6 +3226,7 @@ impl<'e> Interp<'e> {
                             params,
                             body,
                             parent: env.clone(),
+                            tail: Cell::new(None),
                         });
                         expr = then;
                     }
@@ -3304,16 +3306,18 @@ impl<'e> Interp<'e> {
         }
     }
 
-    /// Whether a call to the `def` `name` with no parameters, whose body is `body`, runs as a
-    /// loop (#5379): its spine ends in a call to the def itself or to one declared in it.
-    /// Asked on every call, so remembered by the address of the body.
-    fn loops_in_place(&self, name: &str, body: &'e Expr) -> bool {
-        let key = body as *const Expr as usize;
-        if let Some(known) = self.tail_loops.borrow().get(&key) {
-            return *known;
+    /// Whether a call to the `def` `name` with no parameters, whose body is `body` and whose
+    /// frame is the innermost of `env`, runs as a loop (#5379): its spine ends in a call to
+    /// the def itself or to one declared in it. Asked on every call, so remembered on the frame.
+    fn loops_in_place(env: &Env<'e>, name: &str, body: &'e Expr) -> bool {
+        let Some(Frame::Def { tail, .. }) = env.0.as_deref() else {
+            return declared_tail_call(body, name); // patchcov: coverage tolerate-line reason="unreachable: a Callee::Def's env is its own Def frame"
+        };
+        if let Some(known) = tail.get() {
+            return known;
         }
         let known = declared_tail_call(body, name);
-        self.tail_loops.borrow_mut().insert(key, known);
+        tail.set(Some(known));
         known
     }
 
@@ -3326,7 +3330,7 @@ impl<'e> Interp<'e> {
     }
 
     /// `expr`'s one output, for an `expr` that [`Self::settles`] says yields at
-    /// most one: `None` if it yields nothing.
+    /// most one: `None` if it yields nothing. A second output is raised, not dropped.
     fn one(
         &self,
         expr: &'e Expr,
@@ -3335,14 +3339,20 @@ impl<'e> Interp<'e> {
         reg: Reg,
     ) -> Result<Option<(OwnedValue, Reg)>, Raise> {
         let mut out = None;
+        let mut more = false;
         self.eval(expr, env, input, reg, &mut |v, r| {
-            debug_assert!(
-                out.is_none(),
-                "a single-valued stage yields at most one output"
-            );
-            out = Some((v, r));
+            if out.is_some() {
+                more = true;
+            } else {
+                out = Some((v, r));
+            }
             Ok(())
         })?;
+        if more {
+            return Err(unsupported(
+                "a stage a tail loop ran ahead of its call answered more than once",
+            )); // patchcov: coverage tolerate-line reason="unreachable while stage_settles admits only stages that answer at most once; kept so a mis-admission is loud, not a lost output"
+        }
         Ok(out)
     }
 

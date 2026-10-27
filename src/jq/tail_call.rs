@@ -272,6 +272,7 @@ fn pipe_settles_in(stages: &PipeStages, cx: &Ctx<'_>) -> bool {
 /// that ends in one keeps the nested path and its pipes the fused evaluation they
 /// had. The stages in front of the call are asked with the local defs taken to
 /// settle: a yes only sends the call through a loop that finds out for itself.
+#[inline]
 pub(crate) fn tail_reachable(def: &FuncDefData, jq: bool) -> bool {
     def.tail_reachable_or_init(jq, |body| reach(body, def, jq, &mut Vec::new()))
 }
@@ -424,18 +425,22 @@ pub(crate) fn body_is_reusable(body: &Expr) -> bool {
 }
 
 /// The most outputs a tail loop may emit ahead of its calls (the front branches
-/// of a comma), over all its rounds (#5379): 2^22.
+/// of a comma), over all its rounds (#5379): 2^20.
 ///
 /// A generator that tail-calls itself (`def f: ., (. + 1 | f)`) emits one output
 /// per round, and a consumer that collects (`[...]`, an argument of a builtin) holds
 /// them all: the round budget alone would let it hold 2^24 of them, gigabytes,
 /// before it refused. jq's own loop runs until its heap is gone. Counted in
 /// outputs, not bytes.
-pub(crate) const MAX_LOOP_OUTPUTS: usize = 1 << 22;
+pub(crate) const MAX_LOOP_OUTPUTS: usize = 1 << 20;
 
 /// Rounds a loop runs before it is charged for the outputs it emitted, so a def
 /// that is not recursive at all, whose one round emits a long range, is not.
 pub(crate) const OUTPUT_BUDGET_AFTER_ROUNDS: usize = 64;
+
+/// What a round that binds a body of its own is charged against [`MAX_LOOP_ROUNDS`], in
+/// rounds that bind none (#5379).
+const BOUND_ROUND_WEIGHT: usize = 16;
 
 /// What a tail loop may still spend (#5379).
 ///
@@ -462,10 +467,14 @@ impl TailRounds {
         }
     }
 
-    /// Charge one more round.
-    pub(crate) fn charge_round(&mut self) -> Result<(), EvalError> {
+    /// Charge one more round, which `bound` a body of its own: such a round costs the
+    /// bind (a rebuilt copy of the body) as well as the walk, and is charged
+    /// [`BOUND_ROUND_WEIGHT`] times as much, so the time to refuse a loop that never ends
+    /// does not grow with the size of its body as fast as it would.
+    pub(crate) fn charge_round(&mut self, bound: bool) -> Result<(), EvalError> {
         self.taken += 1;
-        match self.rounds.checked_sub(1) {
+        let weight = if bound { BOUND_ROUND_WEIGHT } else { 1 };
+        match self.rounds.checked_sub(weight) {
             Some(left) => {
                 self.rounds = left;
                 Ok(())
@@ -724,10 +733,10 @@ mod tests {
         let def = definition("def f: f; f");
         let mut rounds = TailRounds::new(&def);
         rounds.rounds = 2;
-        assert!(rounds.charge_round().is_ok());
-        assert!(rounds.charge_round().is_ok());
+        assert!(rounds.charge_round(false).is_ok());
+        assert!(rounds.charge_round(false).is_ok());
         let refused = rounds
-            .charge_round()
+            .charge_round(false)
             .expect_err("the third round is over budget");
         assert_eq!(refused.to_string(), "f/0 exceeded maximum recursion depth");
 
@@ -737,11 +746,17 @@ mod tests {
         assert_eq!(rounds.rounds, MAX_LOOP_ROUNDS);
         assert!(rounds.charge_outputs(MAX_LOOP_OUTPUTS + 1).is_ok());
         for _ in 0..OUTPUT_BUDGET_AFTER_ROUNDS {
-            rounds.charge_round().expect("within the round budget");
+            rounds.charge_round(false).expect("within the round budget");
         }
         let refused = rounds
             .charge_outputs(1)
             .expect_err("one output past the budget");
         assert_eq!(refused.to_string(), "f/0: maximum outputs exceeded");
+
+        // A round that bound a body of its own is charged more.
+        let mut rounds = TailRounds::new(&def);
+        rounds.rounds = BOUND_ROUND_WEIGHT;
+        assert!(rounds.charge_round(true).is_ok());
+        assert!(rounds.charge_round(false).is_err());
     }
 }

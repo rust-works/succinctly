@@ -7989,7 +7989,7 @@ A loop is stopped after `MAX_LOOP_ROUNDS` (2^24) rounds, the bound `until` and `
 jq spins on `def f: f; f` in constant memory until it is killed, and a loop cannot be told from one that ends, so the refusal is the one the nested form raised: `f/0 exceeded maximum recursion depth`, uncatchable.
 It takes the time of 2^24 rounds to come (a second or two in a release build for a small body, where the nested form was refused in milliseconds).
 That is a divergence in the direction ADR-0018 permits for a loop that never answers, and the cost of the same bound for one that would.
-A generator that tail-calls itself (`def f: ., (. + 1 | f)`) is also refused after 2^22 outputs emitted ahead of its calls, once it has run 64 rounds, with `f/0: maximum outputs exceeded`, where a consumer that collects would hold every one of them until the rounds ran out; a consumer that stops (`first`, `limit`) is not charged for what it never asks for.
+A generator that tail-calls itself (`def f: ., (. + 1 | f)`) is also refused after 2^20 outputs emitted ahead of its calls, once it has run 64 rounds, with `f/0: maximum outputs exceeded`, where a consumer that collects would hold every one of them until the rounds ran out; a consumer that stops (`first`, `limit`) is not charged for what it never asks for.
 The bound counts outputs, not bytes.
 The path-mode interpreter asks the same question about a stage over the program as written, so a stage there that calls a def (rather than being one of the shapes above) nests, where on the other routes it settles when the def's body does.
 See the amendment to [ADR-0025](../../adrs/adr-0025.md#amendment-zero-argument-tail-calls-loop-in-place-5379).

@@ -456,7 +456,7 @@ fn test_a_program_that_reads_a_path_loops_too_5379() -> Result<()> {
 
 /// A generator that tail-calls itself holds every output it emitted while a consumer that
 /// collects (`[...]`) is waiting for its end, and jq's loop runs until its heap is gone. The
-/// outputs a loop emits ahead of its calls are bounded (2^22), apart from its rounds, so the
+/// outputs a loop emits ahead of its calls are bounded (2^20), apart from its rounds, so the
 /// collecting consumer is refused in a few hundred MB, not gigabytes.
 #[test]
 fn test_a_tail_generator_under_a_collector_is_bounded_5379() -> Result<()> {

@@ -63,31 +63,31 @@ use super::eval::{
     classify_skip_n, clear_nonretryable_stop, collapse_vec, collect_pattern_var_names,
     compare_key_arrays, compare_values, debug_assert_materialization_error, def_spine_len,
     demote_for_reentry, descriptor_slice_bounds, each_path_on_owned, each_pattern_binding_set,
-    each_range_batches, each_recurse_walk, enter_def_call, entries_to_object, eval_each_owned,
-    eval_full_unrouted as full_eval, finish_fork_flow, finish_fork_from_flow, finish_short_circuit,
-    fold_escaped_generator_prefix, foreach_forks, format_owned, has_type_mismatch_is_permissive,
-    index_component_value, index_in_array_bounds, index_one_owned_read as index_owned_by_key,
-    is_assignment_expr, is_eager_arg, is_identity_passthrough, is_retryable_control,
-    is_retryable_stop, key_arrays_eq, limit_raising, literal_to_owned, mark_nonretryable_escape,
-    native_stack_exhausted, needs_path_context, numeric_key_to_array_index, numeric_key_to_index,
-    numeric_length_owned, owned_bound_to_i64_for, owned_index_key_to_expr, owned_to_string,
-    pattern_alternatives_var_names, pipe_needs_path_context, prefer_pending_control,
-    probe_def_call, range_from_literal_override, range_max_exceeded_error, range_num, reads_parent,
-    recurse_walk_flow, reduce_forks, reroot_for_reentry, reroot_markers,
-    resolve_computed_slice_bounds, resume_from_escape, reverse_length_is_empty, select_emits,
-    settle_then_replay, settles_before_consumer, settles_both, shared_arg_depth_refusal,
-    slice_component_value, slice_object_as_yq_children, slice_owned_value_read_computed,
-    stop_with_downstream, stop_with_error, stop_with_escape, streams_escaped_generator_prefix,
-    streams_unbounded, substitute_bound_var_from, substitute_deferred_var, substitute_vars,
-    suppresses, tonumber_from_str, tostring_owned, tostring_owned_styled, try_handler_root,
-    vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
-    yq_bool_null_key_into_null, yq_dedup_key, yq_empty_context_reemit, yq_empty_operand_output,
-    yq_field_index_on_scalar_is_empty, yq_first_of_each_key, yq_index_key_is_numeric,
-    yq_literal_index_text, yq_mapping_index_text, yq_negative_index_check, yq_negative_index_error,
-    yq_numeric_index_on_object_is_null, yq_object_key_stringify, yq_read_only_context,
-    yq_scalar_text, yq_sort_by, BinaryFanoutRules, ComputedSliceBound, Control, Demand,
-    EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail,
-    QueryResult, RangeEnd, RangeNum, Reentry, RestPipe, RootWitness, SliceTargetKind,
+    each_range_batches, each_recurse_walk, enter_def_call, enter_def_call_in, entries_to_object,
+    eval_each_owned, eval_full_unrouted as full_eval, finish_fork_flow, finish_fork_from_flow,
+    finish_short_circuit, fold_escaped_generator_prefix, foreach_forks, format_owned,
+    has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
+    index_one_owned_read as index_owned_by_key, is_assignment_expr, is_eager_arg,
+    is_identity_passthrough, is_retryable_control, is_retryable_stop, key_arrays_eq, limit_raising,
+    literal_to_owned, mark_nonretryable_escape, native_stack_exhausted, needs_path_context,
+    numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned, owned_bound_to_i64_for,
+    owned_index_key_to_expr, owned_to_string, pattern_alternatives_var_names,
+    pipe_needs_path_context, prefer_pending_control, probe_def_call, range_from_literal_override,
+    range_max_exceeded_error, range_num, reads_parent, recurse_walk_flow, reduce_forks,
+    reroot_for_reentry, reroot_markers, resolve_computed_slice_bounds, resume_from_escape,
+    reverse_length_is_empty, select_emits, settle_then_replay, settles_before_consumer,
+    settles_both, shared_arg_depth_refusal, slice_component_value, slice_object_as_yq_children,
+    slice_owned_value_read_computed, stop_with_downstream, stop_with_error, stop_with_escape,
+    streams_escaped_generator_prefix, streams_unbounded, substitute_bound_var_from,
+    substitute_deferred_var, substitute_vars, suppresses, tonumber_from_str, tostring_owned,
+    tostring_owned_styled, try_handler_root, vec_with_capacity, yq_absent_key_read_is_empty,
+    yq_assign_rhs_document, yq_bool_null_key_into_null, yq_dedup_key, yq_empty_context_reemit,
+    yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_first_of_each_key,
+    yq_index_key_is_numeric, yq_literal_index_text, yq_mapping_index_text, yq_negative_index_check,
+    yq_negative_index_error, yq_numeric_index_on_object_is_null, yq_object_key_stringify,
+    yq_read_only_context, yq_scalar_text, yq_sort_by, BinaryFanoutRules, ComputedSliceBound,
+    Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN,
+    PathTrail, QueryResult, RangeEnd, RangeNum, Reentry, RestPipe, RootWitness, SliceTargetKind,
     StashedEscape, StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED, MAX_RANGE_TOTAL,
 };
 #[cfg(test)]
@@ -16640,16 +16640,17 @@ fn each_def_tail_loop_generic<S: EvalSemantics, V: DocumentValue>(
     let mut body = body;
     let mut body_frames = frames;
     let mut first_hop = true;
-    // Whether `body` can be run again as it is, asked at the first hop back to it.
+    // See `eval::each_def_tail_loop`.
+    let mut hot = bound.is_hot();
     let mut reusable: Option<bool> = None;
     let mut cur = TailValue::Node(value, cursor);
     loop {
-        let _round = match enter_def_call(&callee, body_frames, bound) {
+        let _round = match enter_def_call_in(&callee, body_frames, hot) {
             Ok(guard) => guard,
             Err(e) => return Flow::Escaped(Control::Error(e)),
         };
         let mut walked = Rc::clone(&body);
-        let (next, next_body, next_frames) = loop {
+        let (next, next_body, next_frames, next_hot, fresh) = loop {
             match tail_step_generic::<S, V>(&walked, &mut cur, optional, &mut rounds, sink) {
                 Tail::Call {
                     def: next,
@@ -16657,15 +16658,23 @@ fn each_def_tail_loop_generic<S: EvalSemantics, V: DocumentValue>(
                     bound: node_bound,
                 } => {
                     // See `eval::each_def_tail_loop`.
-                    if Rc::ptr_eq(next, &callee)
-                        && *reusable.get_or_insert_with(|| body_is_reusable(&body))
-                    {
-                        break (Rc::clone(next), Rc::clone(&body), body_frames);
+                    if Rc::ptr_eq(next, &callee) {
+                        if *reusable.get_or_insert_with(|| body_is_reusable(&body)) {
+                            break (Rc::clone(next), Rc::clone(&body), body_frames, false, false);
+                        }
+                    } else {
+                        reusable = None;
                     }
-                    reusable = None;
                     match bind_next(next, node_frames, node_bound, first_hop, body_frames) {
                         Ok((next_body, next_frames)) => {
-                            break (Rc::clone(next), next_body, next_frames)
+                            let next_hot = first_hop && node_bound.is_hot();
+                            break (
+                                Rc::clone(next),
+                                next_body,
+                                next_frames,
+                                next_hot,
+                                !first_hop,
+                            );
                         }
                         Err(e) => return Flow::Escaped(Control::Error(e)),
                     }
@@ -16675,10 +16684,11 @@ fn each_def_tail_loop_generic<S: EvalSemantics, V: DocumentValue>(
                 Tail::Done(flow) => return flow,
             }
         };
-        if let Err(e) = rounds.charge_round() {
+        if let Err(e) = rounds.charge_round(fresh) {
             return Flow::Escaped(Control::Error(e));
         }
-        (callee, body, body_frames, first_hop) = (next, next_body, next_frames, false);
+        (callee, body, body_frames, first_hop, hot) =
+            (next, next_body, next_frames, false, next_hot);
     }
 }
 

@@ -97055,10 +97055,20 @@ pub(crate) fn enter_def_call(
     frames: u32,
     bound: &BoundBody,
 ) -> Result<DefCallGuard, EvalError> {
+    enter_def_call_in(def, frames, bound.is_hot())
+}
+
+/// [`enter_def_call`] for a caller that knows whether the call is hot without the node
+/// at hand: a tail loop's later rounds, which no node of the body they run is the call of (#5379).
+pub(crate) fn enter_def_call_in(
+    def: &FuncDefData,
+    frames: u32,
+    hot: bool,
+) -> Result<DefCallGuard, EvalError> {
     if native_stack_exhausted() {
         return Err(def_call_depth_refusal(def));
     }
-    let scope = if bound.is_hot() {
+    let scope = if hot {
         retention_scope::Scope::Hot
     } else {
         retention_scope::Scope::Cold
@@ -98161,11 +98171,14 @@ fn each_def_tail_loop<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut body = body;
     let mut body_frames = frames;
     let mut first_hop = true;
+    // Whether the call this round is the call of is hot (#3148): the entry node's, then
+    // the node of the first hop's, and a later round's is no node's, so cold.
+    let mut hot = bound.is_hot();
     // Whether `body` can be run again as it is, asked at the first hop back to it.
     let mut reusable: Option<bool> = None;
     let mut cur = TailValue::Borrowed(value);
     loop {
-        let _round = match enter_def_call(&callee, body_frames, bound) {
+        let _round = match enter_def_call_in(&callee, body_frames, hot) {
             Ok(guard) => guard,
             Err(e) => return Flow::Escaped(Control::Error(e)),
         };
@@ -98173,7 +98186,7 @@ fn each_def_tail_loop<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // first, as the embed table's guards are) before the next one starts.
         let mut holds = super::eval_generic::EmbedGuards::default();
         let mut walked = Rc::clone(&body);
-        let (next, next_body, next_frames) = loop {
+        let (next, next_body, next_frames, next_hot, fresh) = loop {
             match tail_step::<W, S>(&walked, &mut cur, optional, &mut holds, &mut rounds, sink) {
                 Tail::Call {
                     def: next,
@@ -98182,15 +98195,23 @@ fn each_def_tail_loop<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 } => {
                     // The call jumps back to the def this round runs, and its body has
                     // nothing but its jumps to evaluate: run the same body again.
-                    if Rc::ptr_eq(next, &callee)
-                        && *reusable.get_or_insert_with(|| body_is_reusable(&body))
-                    {
-                        break (Rc::clone(next), Rc::clone(&body), body_frames);
+                    if Rc::ptr_eq(next, &callee) {
+                        if *reusable.get_or_insert_with(|| body_is_reusable(&body)) {
+                            break (Rc::clone(next), Rc::clone(&body), body_frames, false, false);
+                        }
+                    } else {
+                        reusable = None;
                     }
-                    reusable = None;
                     match bind_next(next, node_frames, node_bound, first_hop, body_frames) {
                         Ok((next_body, next_frames)) => {
-                            break (Rc::clone(next), next_body, next_frames)
+                            let next_hot = first_hop && node_bound.is_hot();
+                            break (
+                                Rc::clone(next),
+                                next_body,
+                                next_frames,
+                                next_hot,
+                                !first_hop,
+                            );
                         }
                         Err(e) => return Flow::Escaped(Control::Error(e)),
                     }
@@ -98200,10 +98221,11 @@ fn each_def_tail_loop<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Tail::Done(flow) => return flow,
             }
         };
-        if let Err(e) = rounds.charge_round() {
+        if let Err(e) = rounds.charge_round(fresh) {
             return Flow::Escaped(Control::Error(e));
         }
-        (callee, body, body_frames, first_hop) = (next, next_body, next_frames, false);
+        (callee, body, body_frames, first_hop, hot) =
+            (next, next_body, next_frames, false, next_hot);
     }
 }
 
