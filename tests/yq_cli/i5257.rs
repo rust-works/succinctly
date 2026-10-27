@@ -191,6 +191,23 @@ const ROWS: &[(&str, &str)] = &[
         "b: !!seq [1]\nc: !!seq [1] # tc\n",
     ),
     ("b: !!seq [1]\nc: []\n", "b: !!seq [1]\nc: !!seq [1]\n"),
+    ("b: !!seq [1]\nc: \n  - 9\n", "b: !!seq [1]\nc: !!seq [1]\n"),
+    (
+        "b: !!seq [1]\nc: \n  y: 9\n",
+        "b: !!seq [1]\nc: !!seq [1]\n",
+    ),
+    (
+        "b: !!seq [1]\nc: !!seq\n  - 9\n",
+        "b: !!seq [1]\nc: !!seq\n  - 1\n",
+    ),
+    (
+        "b: !!seq [1]\nc: !!map\n  y: 9\n",
+        "b: !!seq [1]\nc: !!seq [1]\n",
+    ),
+    (
+        "b: !!seq [1]\nc: !bar\n  - 9\n",
+        "b: !!seq [1]\nc: !bar [1]\n",
+    ),
     ("b: !!map {x: 1}\n", "b: !!map {x: 1}\nc: !!map {x: 1}\n"),
     (
         "b: !!map {x: 1}\nc: [9]\n",
@@ -216,6 +233,26 @@ const ROWS: &[(&str, &str)] = &[
         "b: !!map {x: 1}\nc: []\n",
         "b: !!map {x: 1}\nc: !!map {x: 1}\n",
     ),
+    (
+        "b: !!map {x: 1}\nc: \n  - 9\n",
+        "b: !!map {x: 1}\nc: !!map {x: 1}\n",
+    ),
+    (
+        "b: !!map {x: 1}\nc: \n  y: 9\n",
+        "b: !!map {x: 1}\nc: !!map {x: 1}\n",
+    ),
+    (
+        "b: !!map {x: 1}\nc: !!seq\n  - 9\n",
+        "b: !!map {x: 1}\nc: !!map {x: 1}\n",
+    ),
+    (
+        "b: !!map {x: 1}\nc: !!map\n  y: 9\n",
+        "b: !!map {x: 1}\nc: !!map\n  x: 1\n",
+    ),
+    (
+        "b: !!map {x: 1}\nc: !bar\n  - 9\n",
+        "b: !!map {x: 1}\nc: !bar {x: 1}\n",
+    ),
     ("b: !foo [1]\n", "b: !foo [1]\nc: !foo [1]\n"),
     ("b: !foo [1]\nc: [9]\n", "b: !foo [1]\nc: !foo [1]\n"),
     ("b: !foo [1]\nc: {y: 2}\n", "b: !foo [1]\nc: !foo [1]\n"),
@@ -226,6 +263,20 @@ const ROWS: &[(&str, &str)] = &[
         "b: !foo [1]\nc: !foo [1] # tc\n",
     ),
     ("b: !foo [1]\nc: []\n", "b: !foo [1]\nc: !foo [1]\n"),
+    ("b: !foo [1]\nc: \n  - 9\n", "b: !foo [1]\nc: !foo [1]\n"),
+    ("b: !foo [1]\nc: \n  y: 9\n", "b: !foo [1]\nc: !foo [1]\n"),
+    (
+        "b: !foo [1]\nc: !!seq\n  - 9\n",
+        "b: !foo [1]\nc: !foo [1]\n",
+    ),
+    (
+        "b: !foo [1]\nc: !!map\n  y: 9\n",
+        "b: !foo [1]\nc: !foo [1]\n",
+    ),
+    (
+        "b: !foo [1]\nc: !bar\n  - 9\n",
+        "b: !foo [1]\nc: !bar [1]\n",
+    ),
     ("b: !foo {x: 1}\n", "b: !foo {x: 1}\nc: !foo {x: 1}\n"),
     (
         "b: !foo {x: 1}\nc: [9]\n",
@@ -251,6 +302,26 @@ const ROWS: &[(&str, &str)] = &[
         "b: !foo {x: 1}\nc: []\n",
         "b: !foo {x: 1}\nc: !foo {x: 1}\n",
     ),
+    (
+        "b: !foo {x: 1}\nc: \n  - 9\n",
+        "b: !foo {x: 1}\nc: !foo {x: 1}\n",
+    ),
+    (
+        "b: !foo {x: 1}\nc: \n  y: 9\n",
+        "b: !foo {x: 1}\nc: !foo {x: 1}\n",
+    ),
+    (
+        "b: !foo {x: 1}\nc: !!seq\n  - 9\n",
+        "b: !foo {x: 1}\nc: !foo {x: 1}\n",
+    ),
+    (
+        "b: !foo {x: 1}\nc: !!map\n  y: 9\n",
+        "b: !foo {x: 1}\nc: !foo {x: 1}\n",
+    ),
+    (
+        "b: !foo {x: 1}\nc: !bar\n  - 9\n",
+        "b: !foo {x: 1}\nc: !bar {x: 1}\n",
+    ),
     ("b: [1]\n", "b: [1]\nc: [1]\n"),
     ("b: [1]\nc: [9]\n", "b: [1]\nc: [1]\n"),
     ("b: [1]\nc: {y: 2}\n", "b: [1]\nc: [1]\n"),
@@ -258,6 +329,11 @@ const ROWS: &[(&str, &str)] = &[
     ("b: [1]\nc: !bar [9]\n", "b: [1]\nc: !bar [1]\n"),
     ("b: [1]\nc: x # tc\n", "b: [1]\nc: [1] # tc\n"),
     ("b: [1]\nc: []\n", "b: [1]\nc: [1]\n"),
+    ("b: [1]\nc: \n  - 9\n", "b: [1]\nc: [1]\n"),
+    ("b: [1]\nc: \n  y: 9\n", "b: [1]\nc: [1]\n"),
+    ("b: [1]\nc: !!seq\n  - 9\n", "b: [1]\nc: !!seq\n  - 1\n"),
+    ("b: [1]\nc: !!map\n  y: 9\n", "b: [1]\nc: [1]\n"),
+    ("b: [1]\nc: !bar\n  - 9\n", "b: [1]\nc: !bar [1]\n"),
     ("b: {x: 1}\n", "b: {x: 1}\nc: {x: 1}\n"),
     ("b: {x: 1}\nc: [9]\n", "b: {x: 1}\nc: {x: 1}\n"),
     ("b: {x: 1}\nc: {y: 2}\n", "b: {x: 1}\nc: {x: 1}\n"),
@@ -265,6 +341,14 @@ const ROWS: &[(&str, &str)] = &[
     ("b: {x: 1}\nc: !bar [9]\n", "b: {x: 1}\nc: !bar {x: 1}\n"),
     ("b: {x: 1}\nc: x # tc\n", "b: {x: 1}\nc: {x: 1} # tc\n"),
     ("b: {x: 1}\nc: []\n", "b: {x: 1}\nc: {x: 1}\n"),
+    ("b: {x: 1}\nc: \n  - 9\n", "b: {x: 1}\nc: {x: 1}\n"),
+    ("b: {x: 1}\nc: \n  y: 9\n", "b: {x: 1}\nc: {x: 1}\n"),
+    ("b: {x: 1}\nc: !!seq\n  - 9\n", "b: {x: 1}\nc: {x: 1}\n"),
+    (
+        "b: {x: 1}\nc: !!map\n  y: 9\n",
+        "b: {x: 1}\nc: !!map\n  x: 1\n",
+    ),
+    ("b: {x: 1}\nc: !bar\n  - 9\n", "b: {x: 1}\nc: !bar {x: 1}\n"),
     ("b: !!seq\n  - 1\n", "b: !!seq\n  - 1\nc: !!seq\n  - 1\n"),
     ("b: !!seq\n  - 1\nc: [9]\n", "b: !!seq\n  - 1\nc: [1]\n"),
     (
@@ -286,6 +370,26 @@ const ROWS: &[(&str, &str)] = &[
     (
         "b: !!seq\n  - 1\nc: []\n",
         "b: !!seq\n  - 1\nc: !!seq\n  - 1\n",
+    ),
+    (
+        "b: !!seq\n  - 1\nc: \n  - 9\n",
+        "b: !!seq\n  - 1\nc: !!seq\n  - 1\n",
+    ),
+    (
+        "b: !!seq\n  - 1\nc: \n  y: 9\n",
+        "b: !!seq\n  - 1\nc: !!seq\n  - 1\n",
+    ),
+    (
+        "b: !!seq\n  - 1\nc: !!seq\n  - 9\n",
+        "b: !!seq\n  - 1\nc: !!seq\n  - 1\n",
+    ),
+    (
+        "b: !!seq\n  - 1\nc: !!map\n  y: 9\n",
+        "b: !!seq\n  - 1\nc: !!seq\n  - 1\n",
+    ),
+    (
+        "b: !!seq\n  - 1\nc: !bar\n  - 9\n",
+        "b: !!seq\n  - 1\nc: !bar\n  - 1\n",
     ),
     ("b: !foo\n  x: 1\n", "b: !foo\n  x: 1\nc: !foo\n  x: 1\n"),
     (
@@ -312,6 +416,26 @@ const ROWS: &[(&str, &str)] = &[
         "b: !foo\n  x: 1\nc: []\n",
         "b: !foo\n  x: 1\nc: !foo\n  x: 1\n",
     ),
+    (
+        "b: !foo\n  x: 1\nc: \n  - 9\n",
+        "b: !foo\n  x: 1\nc: !foo\n  x: 1\n",
+    ),
+    (
+        "b: !foo\n  x: 1\nc: \n  y: 9\n",
+        "b: !foo\n  x: 1\nc: !foo\n  x: 1\n",
+    ),
+    (
+        "b: !foo\n  x: 1\nc: !!seq\n  - 9\n",
+        "b: !foo\n  x: 1\nc: !foo\n  x: 1\n",
+    ),
+    (
+        "b: !foo\n  x: 1\nc: !!map\n  y: 9\n",
+        "b: !foo\n  x: 1\nc: !foo\n  x: 1\n",
+    ),
+    (
+        "b: !foo\n  x: 1\nc: !bar\n  - 9\n",
+        "b: !foo\n  x: 1\nc: !bar\n  x: 1\n",
+    ),
     ("b: >\n  q\n", "b: >\n  q\n\nc: >\n  q\n\n"),
     ("b: >\n  q\nc: [9]\n", "b: >\n  q\n\nc: >\n  q\n\n"),
     ("b: >\n  q\nc: {y: 2}\n", "b: >\n  q\n\nc: >\n  q\n\n"),
@@ -322,6 +446,17 @@ const ROWS: &[(&str, &str)] = &[
     ),
     ("b: >\n  q\nc: x # tc\n", "b: >\n  q\n\nc: > # tc\n  q\n\n"),
     ("b: >\n  q\nc: []\n", "b: >\n  q\n\nc: >\n  q\n\n"),
+    ("b: >\n  q\nc: \n  - 9\n", "b: >\n  q\n\nc: >\n  q\n\n"),
+    ("b: >\n  q\nc: \n  y: 9\n", "b: >\n  q\n\nc: >\n  q\n\n"),
+    ("b: >\n  q\nc: !!seq\n  - 9\n", "b: >\n  q\n\nc: >\n  q\n\n"),
+    (
+        "b: >\n  q\nc: !!map\n  y: 9\n",
+        "b: >\n  q\n\nc: >\n  q\n\n",
+    ),
+    (
+        "b: >\n  q\nc: !bar\n  - 9\n",
+        "b: >\n  q\n\nc: !bar >\n  q\n\n",
+    ),
     ("b: |-\n  q\n  r\n", "b: |-\n  q\n  r\nc: |-\n  q\n  r\n"),
     (
         "b: |-\n  q\n  r\nc: [9]\n",
@@ -346,6 +481,26 @@ const ROWS: &[(&str, &str)] = &[
     (
         "b: |-\n  q\n  r\nc: []\n",
         "b: |-\n  q\n  r\nc: |-\n  q\n  r\n",
+    ),
+    (
+        "b: |-\n  q\n  r\nc: \n  - 9\n",
+        "b: |-\n  q\n  r\nc: |-\n  q\n  r\n",
+    ),
+    (
+        "b: |-\n  q\n  r\nc: \n  y: 9\n",
+        "b: |-\n  q\n  r\nc: |-\n  q\n  r\n",
+    ),
+    (
+        "b: |-\n  q\n  r\nc: !!seq\n  - 9\n",
+        "b: |-\n  q\n  r\nc: |-\n  q\n  r\n",
+    ),
+    (
+        "b: |-\n  q\n  r\nc: !!map\n  y: 9\n",
+        "b: |-\n  q\n  r\nc: |-\n  q\n  r\n",
+    ),
+    (
+        "b: |-\n  q\n  r\nc: !bar\n  - 9\n",
+        "b: |-\n  q\n  r\nc: !bar |-\n  q\n  r\n",
     ),
 ];
 
