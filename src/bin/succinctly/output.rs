@@ -173,9 +173,10 @@ impl core::fmt::Display for InputLocation {
 
 /// Collects uncaught evaluation errors from the runners.
 ///
-/// Evaluation *continues* after an uncaught error — jq reports the diagnostic
+/// jq's evaluation *continues* after an uncaught error — it reports the diagnostic
 /// and moves to the next input — so the failure has to be remembered rather
-/// than returned. `hit()` then drives the process exit code (#355).
+/// than returned. `hit()` then drives the process exit code (#355). yq's runner
+/// stops at the first error the program raises ([`Self::program_error_count`], #2810).
 ///
 /// One definition shared by both runners: the jq and yq paths previously each
 /// carried their own `eprintln!`, which is how the two drifted from upstream
@@ -184,12 +185,17 @@ impl core::fmt::Display for InputLocation {
 pub struct ErrorSink {
     hit: bool,
     report_count: usize,
+    /// How many of the reports the program itself raised (see [`Self::program_error_count`]).
+    program_errors: usize,
     halt: Option<i32>,
 }
 
 impl ErrorSink {
     /// Report an uncaught evaluation error and mark the run as failed.
     pub fn report(&mut self, style: DiagStyle, err: &EvalError, at: &InputLocation) {
+        if !err.is_decode_failure() && !err.is_resource_limit() {
+            self.program_errors += 1;
+        }
         self.emit(style, &err.message, err.payload_is_not_a_string(), at);
     }
 
@@ -237,11 +243,15 @@ impl ErrorSink {
 
     /// Report an error surfaced by a streaming operation ([`StreamError`]).
     pub fn report_stream(&mut self, style: DiagStyle, err: &StreamError, at: &InputLocation) {
+        if err.raised_by_program {
+            self.program_errors += 1;
+        }
         self.emit(style, &err.message, err.not_a_string, at);
     }
 
     /// Report a `break` that escaped its label — an uncaught error like any other.
     pub fn report_break(&mut self, style: DiagStyle, label: &str, at: &InputLocation) {
+        self.program_errors += 1;
         self.emit(style, &format!("break ${label} not in label"), false, at);
     }
 
@@ -262,6 +272,14 @@ impl ErrorSink {
     /// Whether any uncaught error was reported during the run.
     pub fn hit(&self) -> bool {
         self.hit
+    }
+
+    /// How many reported errors the program itself raised: an `error(...)`, a type error, a
+    /// `break` with no label. A failure to decode a value and an evaluator resource cap are
+    /// reported but not counted, because real yq has no counterpart for either, so they never
+    /// end a run the way one of these does (#2810).
+    pub fn program_error_count(&self) -> usize {
+        self.program_errors
     }
 
     /// How many uncaught errors have been reported so far. Unlike `hit()`
