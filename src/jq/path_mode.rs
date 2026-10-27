@@ -57,7 +57,9 @@ use super::expr::{
 };
 use super::parser::parse;
 use super::resolve::ModuleRun;
-use super::tail_call::{declared_tail_call, stage_settles};
+use super::tail_call::{
+    declared_tail_call, stage_settles, MAX_LOOP_OUTPUTS, OUTPUT_BUDGET_AFTER_ROUNDS,
+};
 use super::value::{
     jv_identical, ArrayVec, NumberRepr, OwnedValue, SharableLiteral, SharableString,
 };
@@ -476,12 +478,6 @@ impl<'e> Env<'e> {
     }
 }
 
-/// The visits one tail-loop question to [`Interp::single`] may make (#5379), and so how
-/// far into the bodies of the defs a stage calls it follows. Small on purpose: a chain of
-/// defs that each call the one below it several times is one visit per path through it,
-/// and the question is asked every round.
-const SETTLE_FUEL: u32 = 64;
-
 const T_VAR: &str = "__sp_t";
 
 /// The prefix of a variable read as `LOADVN` ([`Env::take_var`]): the prelude
@@ -838,12 +834,9 @@ pub struct Interp<'e> {
     /// The `def` bodies [`Self::pure`] and [`Self::single`] are looking inside right
     /// now, by address, so a definition that reaches itself is seen as it is (#5263).
     def_walk: RefCell<Vec<usize>>,
-    /// What is left of the one question a tail loop is asking [`Self::single`] about a
-    /// stage (#5379): `single` follows a call into the body of its def, and a chain of
-    /// defs that each call the one below it several times is one visit per path through
-    /// it, so the question is bounded, and the answer once it is spent is the
-    /// conservative one (the stage may yield more). `None` outside such a question.
-    single_fuel: Cell<Option<u32>>,
+    /// Whether the body of a `def` with no parameters ends in a call that can bring a tail
+    /// loop round again (#5379), by the address of the body: asked on every call.
+    tail_loops: RefCell<BTreeMap<usize, bool>>,
     /// Array slices as `jvp_array_slice` makes them: a view (`offset`, `size`)
     /// into the root allocation. Keyed by `(root, offset, size)`, so equal
     /// slices of one array are one value; each view maps back to its root
@@ -1276,7 +1269,7 @@ impl<'e> Interp<'e> {
             next_label: Cell::new(0),
             depth: Cell::new(0),
             def_walk: RefCell::new(Vec::new()),
-            single_fuel: Cell::new(None),
+            tail_loops: RefCell::new(BTreeMap::new()),
             slices: RefCell::new(BTreeMap::new()),
             slice_roots: RefCell::new(BTreeMap::new()),
         }
@@ -2420,10 +2413,7 @@ impl<'e> Interp<'e> {
         }
         single.set(Some(false));
         let known = self.single(body, env);
-        // An answer worked out inside a bounded tail-loop question ([`Self::single_fuel`])
-        // may be a no only because the fuel ran out, which a later read with the whole
-        // budget would not give: it is not remembered.
-        single.set(self.single_fuel.get().is_none().then_some(known));
+        single.set(Some(known));
         known
     }
 
@@ -2434,12 +2424,6 @@ impl<'e> Interp<'e> {
     /// call to a `def` with parameters counts as one that may yield more.
     fn single(&self, expr: &'e Expr, env: &Env<'e>) -> bool {
         use Expr as E;
-        if let Some(left) = self.single_fuel.get() {
-            if left == 0 {
-                return false;
-            }
-            self.single_fuel.set(Some(left - 1));
-        }
         match expr {
             E::Identity
             | E::Literal(_)
@@ -3149,7 +3133,11 @@ impl<'e> Interp<'e> {
     ) -> R {
         // #5379: a `def` with no parameters whose body ends in a call jq jumps to
         // runs as a loop, not as nested frames.
-        if matches!(&callee, Callee::Def { params: [], body, .. } if declared_tail_call(body)) {
+        let loops = matches!(
+            &callee,
+            Callee::Def { name, params: [], body, .. } if self.loops_in_place(name, body)
+        );
+        if loops {
             return self.call_def_loop(callee, input, reg, sink);
         }
         let _depth = self.enter_call(&callee)?;
@@ -3197,6 +3185,7 @@ impl<'e> Interp<'e> {
     /// does, and a condition runs from `reg.sub()` as `Expr::If`'s arm does. A
     /// condition or a stage that does not [`Self::settles`] ends the walk there:
     /// that node, and the call in it, nest as before.
+    #[inline(never)]
     fn call_def_loop(
         &self,
         callee: Callee<'e>,
@@ -3206,6 +3195,8 @@ impl<'e> Interp<'e> {
     ) -> R {
         let mut callee = callee;
         let mut rounds = MAX_LOOP_ROUNDS;
+        // Rounds taken and outputs emitted ahead of the calls, for the output bound.
+        let (mut taken, mut outputs) = (0usize, 0usize);
         // The def the loop started at, which a refusal is named for.
         let entry = match &callee {
             Callee::Def { name, .. } => *name,
@@ -3247,7 +3238,7 @@ impl<'e> Interp<'e> {
                         cond,
                         then_branch,
                         else_branch,
-                    } if self.settles(cond, &env) => {
+                    } if Self::settles(cond) => {
                         let Some((c, _)) = self.one(cond, &env, input.clone(), reg.sub())? else {
                             return Ok(());
                         };
@@ -3259,7 +3250,7 @@ impl<'e> Interp<'e> {
                         expr: source,
                         var,
                         body: as_body,
-                    } if self.settles(source, &env) => {
+                    } if Self::settles(source) => {
                         let Some((v, _)) = self.one(source, &env, input.clone(), reg.sub())? else {
                             return Ok(());
                         };
@@ -3268,9 +3259,7 @@ impl<'e> Interp<'e> {
                     }
                     Expr::Pipe(stages)
                         if stages.len() > 1
-                            && stages[..stages.len() - 1]
-                                .iter()
-                                .all(|stage| self.settles(stage, &env)) =>
+                            && stages[..stages.len() - 1].iter().all(Self::settles) =>
                     {
                         let (last, before) = stages.split_last().expect("two or more stages");
                         for stage in before {
@@ -3284,7 +3273,20 @@ impl<'e> Interp<'e> {
                     Expr::Comma(items) if !items.is_empty() => {
                         let (last, before) = items.split_last().expect("one or more items");
                         for item in before {
-                            self.eval(item, &env, input.clone(), reg.clone(), sink)?;
+                            let mut emitted = 0usize;
+                            self.eval(item, &env, input.clone(), reg.clone(), &mut |v, r| {
+                                emitted += 1;
+                                sink(v, r)
+                            })?;
+                            outputs = outputs.saturating_add(emitted);
+                            if outputs > MAX_LOOP_OUTPUTS && taken >= OUTPUT_BUDGET_AFTER_ROUNDS {
+                                return Err(Raise::Fatal(EvalError::resource_limit(format!(
+                                    "{}/0: maximum outputs exceeded",
+                                    ModuleRun::display_name(
+                                        entry.strip_prefix("_sp_").unwrap_or(entry)
+                                    )
+                                ))));
+                            }
                         }
                         expr = last;
                     }
@@ -3298,39 +3300,29 @@ impl<'e> Interp<'e> {
                 )))
             })?;
             callee = next;
+            taken += 1;
         }
     }
 
-    /// Whether a tail loop may run `expr` to its one output before the call it
-    /// leads to: [`Self::single`], and the writes that carry a loop's state in its
-    /// value (`.n += 1 | f`). An assignment answers once per output of its right
-    /// side, an update once whatever its filter yields (the first).
-    ///
-    /// The question is bounded ([`Self::single_fuel`]), and it is asked again every
-    /// round: a stage that calls a def with a large body, or a chain of them, is not
-    /// settled, which only keeps the nested path.
-    fn settles(&self, expr: &'e Expr, env: &Env<'e>) -> bool {
-        // The shipped evaluators' question first: it knows the builtins and
-        // operators a loop that keeps its state in the value writes, and the
-        // route a program takes does not change what a loop does.
-        if stage_settles(expr) {
-            return true;
+    /// Whether a call to the `def` `name` with no parameters, whose body is `body`, runs as a
+    /// loop (#5379): its spine ends in a call to the def itself or to one declared in it.
+    /// Asked on every call, so remembered by the address of the body.
+    fn loops_in_place(&self, name: &str, body: &'e Expr) -> bool {
+        let key = body as *const Expr as usize;
+        if let Some(known) = self.tail_loops.borrow().get(&key) {
+            return *known;
         }
-        let before = self.single_fuel.replace(Some(SETTLE_FUEL));
-        let settled = self.settles_within(expr, env);
-        self.single_fuel.set(before);
-        settled
+        let known = declared_tail_call(body, name);
+        self.tail_loops.borrow_mut().insert(key, known);
+        known
     }
 
-    fn settles_within(&self, expr: &'e Expr, env: &Env<'e>) -> bool {
-        match expr {
-            Expr::Paren(inner) => self.settles_within(inner, env),
-            Expr::Update { .. } => true,
-            Expr::Assign { value, .. }
-            | Expr::CompoundAssign { value, .. }
-            | Expr::AlternativeAssign { value, .. } => self.single(value, env),
-            _ => self.single(expr, env),
-        }
+    /// Whether a tail loop may run `expr` to its one output before the call it leads to
+    /// (#5379): the question the shipped evaluators ask ([`stage_settles`]), of the program as
+    /// written. A call to a def is a call by name here and is not followed, so a stage that
+    /// calls one nests, where on the shipped routes it settles when the def's body does.
+    fn settles(expr: &Expr) -> bool {
+        stage_settles(expr, true)
     }
 
     /// `expr`'s one output, for an `expr` that [`Self::settles`] says yields at
