@@ -6101,7 +6101,8 @@ This is a rule 4(b) decision, not a mode difference: the caps are not a referenc
 either tool, so there is no yq catch semantics to match, and letting `try` swallow one would
 report a truncated result as a clean answer. See the jq page's "Every resource cap is
 uncatchable" section for the full account and oracle rows; pinned by
-`test_resource_limit_caps_are_uncatchable_in_yq_mode_2132` (`tests/yq_cli_tests.rs`) and, for the tail-call spelling (`def f: f; ...`, which stops at the round budget), `test_a_call_that_never_ends_still_ends_in_yq_mode_5379`.
+`test_resource_limit_caps_are_uncatchable_in_yq_mode_2132` (`tests/yq_cli_tests.rs`).
+A tail call that never ends (`def f: f; ...`) stops at the round budget (`MAX_LOOP_ROUNDS`, #5379) with the same refusal, pinned by `test_a_call_that_never_ends_still_ends_in_yq_mode_5379`.
 
 ## Where the two modes deliberately differ from each other
 
