@@ -8,7 +8,7 @@
 use std::io::Write;
 
 use anyhow::Result;
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempDir};
 
 use crate::{run_yq_files, run_yq_stdin_with_stderr};
 
@@ -120,6 +120,69 @@ fn test_2810_runs_without_a_program_error_are_unchanged() -> Result<()> {
     assert!(
         stdout.contains("a: 1\n") && stdout.contains("c: 3\n"),
         "{stdout:?}"
+    );
+    Ok(())
+}
+
+/// `--split-exp` stops at the first error too: yq writes `out_0.yml` for the first document and
+/// nothing for the third (v4.53.3, `a: 1`, `a: x`, `a: 3`), and with the failure first it writes
+/// no file at all.
+#[test]
+fn test_2810_split_exp_stops_at_the_first_error() -> Result<()> {
+    for (input, files) in [
+        ("a: 1\n---\na: x\n---\na: 3\n", vec!["out_0.yml"]),
+        ("a: x\n---\na: 1\n", vec![]),
+    ] {
+        let dir = TempDir::new()?;
+        let pattern = format!(
+            "\"{}/out_\" + ($index|tostring) + \".yml\"",
+            dir.path().display()
+        );
+        let (stdout, stderr, code) =
+            run_yq_stdin_with_stderr(".a | tonumber", input, &["--split-exp", &pattern])?;
+        assert_eq!((code, stdout.as_str()), (1, ""), "{stderr}");
+        assert_eq!(error_lines(&stderr), 1, "{stderr}");
+        let mut written: Vec<String> = std::fs::read_dir(dir.path())?
+            .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect::<std::io::Result<_>>()?;
+        written.sort();
+        assert_eq!(written, files, "{input:?}");
+    }
+    Ok(())
+}
+
+/// The DOM fallback `--sort-keys` takes over an aliased document is a route of its own: the
+/// second document fails, so the first one stays and the third is never evaluated; with the
+/// failure first nothing prints. (`-S` is not a yq flag, so these two rows are not captured
+/// from yq; they pin that this route follows the others.)
+#[test]
+fn test_2810_the_sort_keys_fallback_stops_at_the_first_error() -> Result<()> {
+    let late = "a: &x {k: 1}\nb: *x\n---\na: &y 2\nb: *y\n---\na: &z {k: 3}\nb: *z\n";
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(".a | keys", late, &["-S"])?;
+    assert_eq!((code, stdout.as_str()), (1, "- k\n"), "{stderr}");
+    assert_eq!(error_lines(&stderr), 1, "{stderr}");
+
+    let first = "a: &x 1\nb: *x\n---\na: &y {k: 1}\nb: *y\n";
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(".a | keys", first, &["-S"])?;
+    assert_eq!((code, stdout.as_str()), (1, ""), "{stderr}");
+    assert_eq!(error_lines(&stderr), 1, "{stderr}");
+    Ok(())
+}
+
+/// An evaluator resource cap is reported but is not an error the program raised, so the run
+/// still reaches the next document.
+#[test]
+fn test_2810_a_resource_cap_does_not_end_the_run() -> Result<()> {
+    let (_, stderr, code) = run_yq_stdin_with_stderr(
+        "[range(100000000)] | length",
+        "a: 1\n---\na: 2\n",
+        &["--jq-extensions"],
+    )?;
+    assert_eq!(code, 1, "{stderr}");
+    assert_eq!(
+        stderr.matches("maximum iterations exceeded").count(),
+        2,
+        "{stderr}"
     );
     Ok(())
 }

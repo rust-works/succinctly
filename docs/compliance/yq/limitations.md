@@ -2221,7 +2221,9 @@ $ printf 'a: x\n---\na: 1\n---\na: 2\n' | yq '.a | tonumber'   # Error: ... and 
 What differed was the second row: succinctly kept evaluating the documents after a failing one and printed their results, with one diagnostic per failing document.
 It now stops at the first error the program raises, in every route that prints to stdout (the streamed one, the evaluated one and the `--sort-keys`/mapping-sort DOM fallback), across documents and across files, with that one diagnostic and exit 1.
 A failure to decode a value (`a: "bad \q escape"`) and an evaluator resource cap are not such errors: yq has no counterpart for either, so the run still reaches the documents after one (#355, #1615, #1817).
-`--split-exp` and `--inplace` keep going past an error as before, and `--eval-all` and `--slurp` evaluate everything together, so they have no later document to stop before.
+`--split-exp` stops the same way and keeps the files of the results before the error, as yq does.
+`--inplace` keeps going past an error as before, and leaves a file that failed untouched (#1615).
+`--eval-all` and `--slurp` evaluate everything together, so they have no later document to stop before.
 
 The `error` operator itself still differs: yq raises it for a document that `select` already dropped (`printf 'a: 1\n' | yq 'select(false) | error("x")'` is `Error: x`), where succinctly does not evaluate it.
 That is the gap of a pipe whose left side is empty, recorded under #5261 in the `as`-binding notes below, not a property of the run.

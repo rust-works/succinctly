@@ -10450,8 +10450,9 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                         // is already part-written when it fails -- same truncation
                         // the identity branches produce, so it needs the same
                         // stop. Gated on `truncated`, never on `stats.error`: an
-                        // ordinary uncaught error writes nothing to `out` and must
-                        // still continue to the next document (#355).
+                        // ordinary uncaught error writes nothing to `out`, so it
+                        // leaves nothing unterminated; the caller ends the run on
+                        // one the program raised (`eval_error_ends_run!`, #2810).
                         if stats.truncated {
                             stream_truncated.set(true);
                         }
@@ -10585,8 +10586,9 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                         // is already part-written when it fails -- same truncation
                         // the identity branches produce, so it needs the same
                         // stop. Gated on `truncated`, never on `stats.error`: an
-                        // ordinary uncaught error writes nothing to `out` and must
-                        // still continue to the next document (#355).
+                        // ordinary uncaught error writes nothing to `out`, so it
+                        // leaves nothing unterminated; the caller ends the run on
+                        // one the program raised (`eval_error_ends_run!`, #2810).
                         if stats.truncated {
                             stream_truncated.set(true);
                         }
@@ -11258,7 +11260,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                         strip_style: args.pretty_print,
                         sort_keys: output_config.sort_keys,
                         mark_json_sourced: *format == InputFormat::Json,
-                        stop_at_error: false,
+                        stop_at_error: true,
                     },
                 )?;
                 global_doc_index += num_docs;
@@ -11292,6 +11294,10 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                     }
                 }
                 if sink.halted().is_some() {
+                    break 'files;
+                }
+                // #2810: yq stops writing at the first error, so a later file is not read.
+                if sink.program_error_count() > 0 {
                     break 'files;
                 }
             }

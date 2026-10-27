@@ -173,9 +173,10 @@ impl core::fmt::Display for InputLocation {
 
 /// Collects uncaught evaluation errors from the runners.
 ///
-/// Evaluation *continues* after an uncaught error — jq reports the diagnostic
+/// jq's evaluation *continues* after an uncaught error — it reports the diagnostic
 /// and moves to the next input — so the failure has to be remembered rather
-/// than returned. `hit()` then drives the process exit code (#355).
+/// than returned. `hit()` then drives the process exit code (#355). yq's runner
+/// stops at the first error the program raises ([`Self::program_error_count`], #2810).
 ///
 /// One definition shared by both runners: the jq and yq paths previously each
 /// carried their own `eprintln!`, which is how the two drifted from upstream
