@@ -604,6 +604,7 @@ fn report_stream_decode_failure(sink: &mut ErrorSink, err: &EvalError) {
         &succinctly::jq::stream::StreamError {
             message: err.message.clone(),
             not_a_string: false,
+            raised_by_program: false,
         },
         &no_location(),
     );
@@ -1991,6 +1992,9 @@ struct DirectEvalOptions {
     /// Route JSON input through `YamlIndex::mark_json_sourced` instead of
     /// evaluating genuine YAML source — see the function's own doc comment.
     mark_json_sourced: bool,
+    /// Stop evaluating further documents at the first error the program raises, as real yq
+    /// does (#2810). Off for the callers that keep going: `--split-exp` and `--inplace`.
+    stop_at_error: bool,
 }
 
 /// Evaluate YAML *or JSON* input directly using the generic evaluator with
@@ -2026,6 +2030,7 @@ fn evaluate_yaml_direct_filtered(
         strip_style,
         sort_keys,
         mark_json_sourced,
+        stop_at_error,
     } = opts;
     // #2279: build_json_sourced parses with JSON's flow-sequence delimiter
     // rules *and* marks the index; the two cannot be applied separately,
@@ -2049,6 +2054,7 @@ fn evaluate_yaml_direct_filtered(
         YamlValue::Sequence(mut docs) => {
             let mut doc_results = Vec::new();
             let mut local_idx = 0;
+            let errors_before = sink.program_error_count();
             while let Some((cursor, rest)) = docs.uncons_cursor() {
                 // Check if this document should be evaluated
                 let should_eval = match doc_filter {
@@ -2078,6 +2084,11 @@ fn evaluate_yaml_direct_filtered(
                 // documents in this file — the caller checks `sink.halted()`
                 // too, to stop further *files*.
                 if sink.halted().is_some() {
+                    break;
+                }
+                // #2810: real yq stops at the first error the program raises, so no later
+                // document is evaluated; the documents before it keep their results.
+                if stop_at_error && sink.program_error_count() > errors_before {
                     break;
                 }
             }
@@ -2273,6 +2284,7 @@ fn stream_yaml_sort_keys_alias_fallback<W: Write>(
             strip_style,
             sort_keys,
             mark_json_sourced: false,
+            stop_at_error: true,
         },
     );
     let (doc_results, num_docs) = eval_result?; // patchcov: coverage tolerate-line reason="unreachable: bytes already parsed successfully by every caller (#1350)"
@@ -10587,6 +10599,15 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
         }};
     }
 
+    // #2810: real yq stops at the first error the program raises and reads no further document or
+    // file, keeping what the earlier ones already printed. A decode failure (`stream_truncated`),
+    // a resource cap and a `halt` are not that kind of error and have their own handling.
+    macro_rules! eval_error_ends_run {
+        () => {
+            sink.halted().is_none() && !stream_truncated.get() && sink.program_error_count() > 0
+        };
+    }
+
     if can_fast_path {
         // M2 streaming fast path: evaluate expression and stream results directly
         // Track global document index across all files for --doc filtering
@@ -10704,6 +10725,9 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                             // replaces. Real yq aborts the whole run on this
                             // input anyway.
                             if sink.halted().is_some() || stream_truncated.get() {
+                                break;
+                            }
+                            if eval_error_ends_run!() {
                                 break;
                             }
                         }
@@ -10879,7 +10903,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                         },
                     )?;
                     global_doc_index += num_docs;
-                    if sink.halted().is_some() || stream_truncated.get() {
+                    if sink.halted().is_some() || stream_truncated.get() || eval_error_ends_run!() {
                         break 'm2_files;
                     }
                     continue 'm2_files;
@@ -10912,7 +10936,10 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                                 // streaming further documents and files
                                 // instead of stopping immediately.
                                 // #1615: see the `Sequence` arm's note above.
-                                if sink.halted().is_some() || stream_truncated.get() {
+                                if sink.halted().is_some()
+                                    || stream_truncated.get()
+                                    || eval_error_ends_run!()
+                                {
                                     break 'm2_files;
                                 }
                             }
@@ -10993,7 +11020,10 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                                     );
                                     // See the matching check in the `Sequence` arm above.
                                     // #1615 adds the truncation term.
-                                    if sink.halted().is_some() || stream_truncated.get() {
+                                    if sink.halted().is_some()
+                                        || stream_truncated.get()
+                                        || eval_error_ends_run!()
+                                    {
                                         break 'm2_files;
                                     }
                                 }
@@ -11228,6 +11258,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                         strip_style: args.pretty_print,
                         sort_keys: output_config.sort_keys,
                         mark_json_sourced: *format == InputFormat::Json,
+                        stop_at_error: false,
                     },
                 )?;
                 global_doc_index += num_docs;
@@ -11901,6 +11932,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                             strip_style: args.pretty_print,
                             sort_keys: output_config.sort_keys,
                             mark_json_sourced: false,
+                            stop_at_error: false,
                         },
                     )?;
                     global_doc_index += num_docs;
@@ -12154,6 +12186,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                     strip_style: args.pretty_print,
                     sort_keys: output_config.sort_keys,
                     mark_json_sourced: *format == InputFormat::Json,
+                    stop_at_error: true,
                 },
             )?;
             global_doc_index += num_docs;
@@ -12161,6 +12194,11 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             // halt/halt_error (#791) outranks evaluating any further
             // files — whatever was collected so far still prints below.
             if sink.halted().is_some() {
+                break 'collect;
+            }
+            // #2810: real yq reads no further after an error the program raised; what the earlier
+            // documents produced still prints.
+            if sink.program_error_count() > 0 {
                 break 'collect;
             }
         }
@@ -12921,6 +12959,7 @@ mod tests {
                 strip_style: false,
                 sort_keys: false,
                 mark_json_sourced: false,
+                stop_at_error: false,
             },
         )
         .unwrap();
@@ -12941,6 +12980,7 @@ mod tests {
                 strip_style: false,
                 sort_keys: false,
                 mark_json_sourced: false,
+                stop_at_error: false,
             },
         )
         .unwrap();
@@ -14499,6 +14539,7 @@ mod tests {
                     strip_style: false,
                     sort_keys: false,
                     mark_json_sourced: false,
+                    stop_at_error: false,
                 },
             )
             .unwrap();
@@ -14518,6 +14559,7 @@ mod tests {
                 strip_style: false,
                 sort_keys: false,
                 mark_json_sourced: false,
+                stop_at_error: false,
             },
         )
         .unwrap();
@@ -14611,6 +14653,7 @@ mod tests {
                     strip_style: false,
                     sort_keys: false,
                     mark_json_sourced: false,
+                    stop_at_error: false,
                 },
             )
             .unwrap();
@@ -14695,6 +14738,7 @@ mod tests {
                     strip_style: false,
                     sort_keys: false,
                     mark_json_sourced: false,
+                    stop_at_error: false,
                 },
             )
             .unwrap();
@@ -14798,6 +14842,7 @@ mod tests {
                     strip_style: false,
                     sort_keys: false,
                     mark_json_sourced: false,
+                    stop_at_error: false,
                 },
             )
             .unwrap();

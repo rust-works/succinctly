@@ -146,6 +146,10 @@ pub struct StreamError {
     pub message: String,
     /// Whether the raised payload was something other than a string.
     pub not_a_string: bool,
+    /// Whether the program itself raised the error (`error(...)`, a type error, a `break` with no
+    /// label), as opposed to a failure to decode a value or an evaluator resource cap, which yq's
+    /// own evaluator has no counterpart for (#2810).
+    pub raised_by_program: bool,
 }
 
 /// A failure raised while *streaming* a document to output.

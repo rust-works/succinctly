@@ -42460,17 +42460,17 @@ fn test_streamed_truncation_does_not_weld_doc_separator_1615() -> Result<()> {
         "the materializing route must still reach the second document: {output:?}"
     );
 
-    // ...and an ordinary uncaught evaluation error still attempts every
-    // document on the streamed route too, because it writes nothing to stdout.
-    // That is the case `StreamStats::truncated` exists to keep separate from a
-    // decode failure: gating on `stats.error` instead would have stopped here.
+    // ...but an error the program raises ends the run, as yq's does (#2810): the
+    // second document is never evaluated, so the error is reported once. This is
+    // the case `StreamStats::truncated` and `StreamError::raised_by_program` exist
+    // to keep separate from a decode failure, which still continues.
     let (_, stderr, exit_code) =
         run_yq_split(".missing // error(\"boom\")", "a: 1\n---\nb: 2\n", &[])?;
     assert_eq!(exit_code, 1);
     assert_eq!(
         stderr.matches("boom").count(),
-        2,
-        "an ordinary eval error must not stop the document loop: {stderr}"
+        1,
+        "an error the program raises must end the document loop: {stderr}"
     );
     Ok(())
 }

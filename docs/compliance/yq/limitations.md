@@ -2208,25 +2208,25 @@ slice-bound-resolution call sites (gated per-site since only those call sites la
 this one discards at the *runner's* emission boundary, unconditionally for every yq-mode result,
 since the whole file is yq-only.
 
-**Open divergence, not fixed here:** real yq's discard is whole-*run*, not per-document/
-per-result. A late error partway through a multi-document input also erases an earlier
-document's already-streamed output in real yq —
+**Settled by [#2810](https://github.com/rust-works/succinctly/issues/2810): the discard is not whole-run, but the run stops at the first error.**
+The earlier note here said real yq erases an earlier document's output when a later document fails.
+It does not; the example behind it, `(.a, (select(.a==2) | error("x")))`, fails in document 1 as well, because yq's `error` fires even when `select` yields nothing.
+Every error that really depends on a later document leaves the earlier output in place (yq v4.53.3):
 
 ```bash
-$ printf 'a: 1\n---\na: 2\n' | yq '(.a, (select(.a==2) | error("x")))'   # (nothing) -- doc 1's `1` is gone too
+$ printf 'a: 1\n---\na: 2\n---\na: x\n' | yq '.a | tonumber'   # 1, ---, 2, then Error: cannot convert node value [x] ...
+$ printf 'a: x\n---\na: 1\n---\na: 2\n' | yq '.a | tonumber'   # Error: ... and nothing else: documents 2 and 3 are never evaluated
 ```
 
-succinctly's fix (above) discards per top-level result, so under plain multi-document input
-(no `--eval-all`) each document still gets its own independent collapse decision — document 1's
-output survives even though a later document's evaluation fails. Matching real yq exactly would
-mean buffering every document's output for the whole run and discarding it on any late failure,
-which would give up the M2 streaming architecture's core memory advantage (3–4% of yq's at
-100 MB) for every run, not just the ones that error. Tracked as an explicit, deliberate
-divergence rather than an oversight — see
-[#2427](https://github.com/rust-works/succinctly/issues/2427) for the sibling per-run-vs-
-per-node streaming residue, and
-[#2810](https://github.com/rust-works/succinctly/issues/2810) for the whole-run case
-specifically.
+What differed was the second row: succinctly kept evaluating the documents after a failing one and printed their results, with one diagnostic per failing document.
+It now stops at the first error the program raises, in every route that prints to stdout (the streamed one, the evaluated one and the `--sort-keys`/mapping-sort DOM fallback), across documents and across files, with that one diagnostic and exit 1.
+A failure to decode a value (`a: "bad \q escape"`) and an evaluator resource cap are not such errors: yq has no counterpart for either, so the run still reaches the documents after one (#355, #1615, #1817).
+`--split-exp` and `--inplace` keep going past an error as before, and `--eval-all` and `--slurp` evaluate everything together, so they have no later document to stop before.
+
+The `error` operator itself still differs: yq raises it for a document that `select` already dropped (`printf 'a: 1\n' | yq 'select(false) | error("x")'` is `Error: x`), where succinctly does not evaluate it.
+That is the gap of a pipe whose left side is empty, recorded under #5261 in the `as`-binding notes below, not a property of the run.
+
+See [#2427](https://github.com/rust-works/succinctly/issues/2427) for the sibling per-run-vs-per-node streaming residue.
 
 ### Regex flag grammar — `test`/`match`/`capture` fixed
 

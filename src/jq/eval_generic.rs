@@ -7151,6 +7151,7 @@ impl<V: DocumentValue> GenericResult<V> {
                 stats.error = Some(crate::jq::stream::StreamError {
                     message: format!("break ${label} not in label"),
                     not_a_string: false,
+                    raised_by_program: true,
                 });
             }
             Self::Halt(code) => {
@@ -7391,6 +7392,7 @@ impl<V: DocumentValue> GenericResult<V> {
                 stats.error = Some(crate::jq::stream::StreamError {
                     message: format!("break ${label} not in label"),
                     not_a_string: false,
+                    raised_by_program: true,
                 });
             }
             Self::Halt(code) => {
@@ -7533,6 +7535,7 @@ fn stream_error(e: &EvalError) -> crate::jq::stream::StreamError {
     crate::jq::stream::StreamError {
         message: e.message.clone(),
         not_a_string: e.payload_is_not_a_string(),
+        raised_by_program: !e.is_decode_failure() && !e.is_resource_limit(),
     }
 }
 
@@ -7556,6 +7559,7 @@ fn control_to_stream_outcome(
             Some(crate::jq::stream::StreamError {
                 message: format!("break ${label} not in label"),
                 not_a_string: false,
+                raised_by_program: true,
             }),
             None,
         ),
