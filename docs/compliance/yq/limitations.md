@@ -1956,6 +1956,15 @@ unchanged in jq mode. Non-string-input error wording (`array (...) cannot be mat
 is not a string` vs. real yq's `cannot split !!seq, can only split strings`) is a separate,
 pre-existing gap unrelated to arity, not addressed here.
 
+### Regex patterns are read as Go's `regexp` reads them (#5374, #5388)
+
+yq compiles a pattern with Go's `regexp` (RE2), and `succinctly yq` now reads it the same way before handing it to the `regex` crate (`src/jq/go_regex.rs`).
+`\w`, `\d`, `\s` and `\b` are ASCII (`\s` has no `\v`), `\Q..\E` is a literal span, `\<` is a plain `<`, a `{` that starts no repeat is a literal, `\0` and `\12` are octal, and `$` is the end of the text only (jq's `$` also matches before a final newline).
+What Go refuses is refused with Go's own message (`error parsing regexp: invalid nested repetition operator: `++``): `a++`, `(?x)`, `(?=`, `[a--b]`, `\Z`, `\1`, `\c`, a repeat with nothing to repeat, an unclosed group or class, a counted repeat past 1000.
+Pinned by `tests/yq_cli/i5388.rs` (115 rows captured from yq v4.53.3) and checked against yq over 3,000 random patterns with no difference.
+Still different: a `\p{Name}` that Go's tables do not have but the crate's loose matching does (`\p{IsL}`, `\p{Alphabetic}`, `\p{Grek}`), and a named group whose name starts with a digit (`(?P<1n>a)`), which the crate refuses.
+jq mode keeps Oniguruma's own rules (see the jq limitations).
+
 ### Global regex zero-width-match iteration — resolved, real yq uses Go's `regexp`
 
 [#1255](https://github.com/rust-works/succinctly/issues/1255) resolved a divergence in
@@ -2025,7 +2034,7 @@ The same table applies to object keys, bracket steps (`.x["a\tb"]`) and every ot
 double-quoted scalars are a different lexer (YAML, see above) and are unchanged. Pinned by
 `tests/yq_cli/i4916.rs` (147 rows captured from yq v4.53.3). Still different: a run of backslashes ahead of `\(` (yq alternates between a literal `\(` and an interpolation as the run grows: `"x\\(1)y"` is the text `x\(1)y`, `"x\\\\(1)y"` is `x\1y`; here every pair decodes first), a `\(` that never closes
 (`"a\(b"` is the text `a\(b` in yq, a parse error here), a `\"` inside an interpolation's expression
-(`"\(\"a\")"`), the regex dialect (Go's RE2 rejects `\u0061` in a pattern, the Rust engine accepts it)
+(`"\(\"a\")"`)
 and a string-literal `@format` (`@base64 "x\q"`, where both refuse with different wording).
 
 ### String interpolation with a multi-valued `\(...)` slot — yq takes the first value only
