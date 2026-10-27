@@ -530,3 +530,166 @@ fn test_yq_reads_a_pattern_as_go_does_5388() -> Result<()> {
     }
     Ok(())
 }
+
+/// What the merged translator left to the `regex` crate: a flag set and cleared in one group, a repeated
+/// or digit-led group name, the surrogate category, and the `\p` names (Go's table, not the crate's).
+const RESIDUAL_ROWS: &[(&str, &str, &str, i32)] = &[
+    ("\"a\" | test(\"(?i-i)a\")", "true\n", "", 0),
+    ("\"a\" | test(\"(?s-s)a\")", "true\n", "", 0),
+    ("\"a\" | test(\"(?m-m)a\")", "true\n", "", 0),
+    ("\"a\" | test(\"(?U-U)a\")", "true\n", "", 0),
+    ("\"a\" | test(\"(?i-i:a)\")", "true\n", "", 0),
+    ("\"a\" | test(\"(?is-is)a\")", "true\n", "", 0),
+    ("\"a\" | test(\"(?-ii)a\")", "true\n", "", 0),
+    ("\"a\" | test(\"(?ii)a\")", "true\n", "", 0),
+    ("\"a\" | test(\"(?i-s)a\")", "true\n", "", 0),
+    ("\"a\" | test(\"(?i-i)A\")", "false\n", "", 0),
+    ("\"a\" | test(\"(?ii)A\")", "true\n", "", 0),
+    ("\"a\" | test(\"(?-ii)A\")", "false\n", "", 0),
+    ("\"a\" | test(\"(?i-is)A\")", "false\n", "", 0),
+    ("\"a\" | test(\"(?P<n>a)(?P<n>a)\")", "false\n", "", 0),
+    ("\"a\" | test(\"(?<m>a)(?<m>a)\")", "false\n", "", 0),
+    ("\"a\" | test(\"(?P<1a>a)\")", "true\n", "", 0),
+    ("\"a\" | test(\"\\p{Cs}\")", "false\n", "", 0),
+    ("\"a\" | test(\"\\P{Cs}\")", "true\n", "", 0),
+    ("\"a\" | test(\"[\\p{Cs}]\")", "false\n", "", 0),
+    ("\"a\" | test(\"[\\P{Cs}]\")", "true\n", "", 0),
+    ("\"a\" | test(\"[^\\p{Cs}]\")", "true\n", "", 0),
+    ("\"a\" | test(\"\\p{Surrogate}\")", "false\n", "", 0),
+    ("\"a\" | test(\"\\p{CS}\")", "false\n", "", 0),
+    (
+        "\"a\" | test(\"\\p{Alphabetic}\")",
+        "",
+        "Error: error parsing regexp: invalid character class range: `\\p{Alphabetic}`",
+        1,
+    ),
+    (
+        "\"a\" | test(\"\\p{Old_Italic}\")",
+        "",
+        "Error: error parsing regexp: invalid character class range: `\\p{Old_Italic}`",
+        1,
+    ),
+    (
+        "\"a\" | test(\"\\p{OldItalic}\")",
+        "",
+        "Error: error parsing regexp: invalid character class range: `\\p{OldItalic}`",
+        1,
+    ),
+    (
+        "\"a\" | test(\"\\p{SignWriting}\")",
+        "",
+        "Error: error parsing regexp: invalid character class range: `\\p{SignWriting}`",
+        1,
+    ),
+    (
+        "\"a\" | test(\"\\p{Garay}\")",
+        "",
+        "Error: error parsing regexp: invalid character class range: `\\p{Garay}`",
+        1,
+    ),
+    ("\"a\" | test(\"\\p{Greek}\")", "false\n", "", 0),
+    ("\"a\" | test(\"\\p{greek}\")", "false\n", "", 0),
+    ("\"a\" | test(\"\\p{GREEK}\")", "false\n", "", 0),
+    ("\"a\" | test(\"\\p{Letter}\")", "true\n", "", 0),
+    ("\"a\" | test(\"\\p{Cased_Letter}\")", "true\n", "", 0),
+    ("\"a\" | test(\"\\p{lu}\")", "false\n", "", 0),
+    ("\"a\" | test(\"\\p{Any}\")", "true\n", "", 0),
+    ("\"a\" | test(\"\\p{Assigned}\")", "true\n", "", 0),
+    ("\"a\" | test(\"\\p{ASCII}\")", "true\n", "", 0),
+    ("\"a\" | test(\"\\p{Han}\")", "false\n", "", 0),
+    ("\"a\" | test(\"\\pl\")", "true\n", "", 0),
+    ("\"a\" | test(\"\\pL\")", "true\n", "", 0),
+    (
+        "\"a\" | test(\"\\pX\")",
+        "",
+        "Error: error parsing regexp: invalid character class range: `\\pX`",
+        1,
+    ),
+    (
+        "\"a\" | test(\"\\pa\")",
+        "",
+        "Error: error parsing regexp: invalid character class range: `\\pa`",
+        1,
+    ),
+    (
+        "\"a\" | test(\"\\p0\")",
+        "",
+        "Error: error parsing regexp: invalid character class range: `\\p0`",
+        1,
+    ),
+    (
+        "\"a\" | test(\"\\p_\")",
+        "",
+        "Error: error parsing regexp: invalid character class range: `\\p_`",
+        1,
+    ),
+    (
+        "\"a\" | test(\"\\pé\")",
+        "",
+        "Error: error parsing regexp: invalid character class range: `\\pé`",
+        1,
+    ),
+    (
+        "\"a\" | test(\"\\p\")",
+        "",
+        "Error: error parsing regexp: invalid character class range: `\\p`",
+        1,
+    ),
+    (
+        "\"a\" | test(\"[\\p\")",
+        "",
+        "Error: error parsing regexp: invalid character class range: `\\p`",
+        1,
+    ),
+    (
+        "\"a\" | test(\"[a\\p\")",
+        "",
+        "Error: error parsing regexp: invalid character class range: `\\p`",
+        1,
+    ),
+    ("\"a\" | test(\"\\p{^Lu}\")", "true\n", "", 0),
+    ("\"a\" | test(\"\\P{^Lu}\")", "false\n", "", 0),
+    (
+        "\"a\" | test(\"[\\pX]\")",
+        "",
+        "Error: error parsing regexp: invalid character class range: `\\pX`",
+        1,
+    ),
+    (
+        "\"a\" | test(\"(\\pX\")",
+        "",
+        "Error: error parsing regexp: invalid character class range: `\\pX`",
+        1,
+    ),
+    (
+        "\"a\" | test(\"\\pX)\")",
+        "",
+        "Error: error parsing regexp: invalid character class range: `\\pX`",
+        1,
+    ),
+    (
+        "\"a\" | test(\"\\pX{1001}\")",
+        "",
+        "Error: error parsing regexp: invalid character class range: `\\pX`",
+        1,
+    ),
+    (
+        "\"a\" | test(\"\\pX[[:foo:]]\")",
+        "",
+        "Error: error parsing regexp: invalid character class range: `\\pX`",
+        1,
+    ),
+];
+
+#[test]
+fn test_yq_pattern_flags_names_and_unicode_classes_5388() -> Result<()> {
+    for (filter, want_out, want_err, want_code) in RESIDUAL_ROWS {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "", ARGS)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.trim(), code),
+            (*want_out, *want_err, *want_code),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
