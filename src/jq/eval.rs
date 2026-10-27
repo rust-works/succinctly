@@ -125478,7 +125478,7 @@ mod tests {
         assert!(root.charge("until").is_ok());
         match root.charge("until") {
             Err(Control::Error(e)) => {
-                assert!(e.message.contains("until: maximum iterations exceeded"))
+                assert!(e.message.contains("until: maximum iterations exceeded"));
             }
             other => panic!("the round cap should have refused: {other:?}"),
         }
