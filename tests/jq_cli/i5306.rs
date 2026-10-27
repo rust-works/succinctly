@@ -96,3 +96,34 @@ fn test_group_by_undecodable_element_wins_over_a_key_error_5306() -> Result<()> 
     }
     Ok(())
 }
+
+/// Output flags on the same array: the groups print from the document, so the writer's own
+/// indent, tab and key-sort handling has to match jq's.
+const FLAG_INPUT: &str =
+    r#"[{"b":1,"a":"x"},{"b":2,"a":"y"},{"b":1,"a":"z","c":[1,{"d":null}]},{"a":0}]"#;
+
+/// (flags, filter, expected output, exit code), run on [`FLAG_INPUT`].
+const FLAG_ROWS: &[(&[&str], &str, &str, i32)] = &[
+    (&["--tab"], "group_by(.b)", "[\n\t[\n\t\t{\n\t\t\t\"a\": 0\n\t\t}\n\t],\n\t[\n\t\t{\n\t\t\t\"b\": 1,\n\t\t\t\"a\": \"x\"\n\t\t},\n\t\t{\n\t\t\t\"b\": 1,\n\t\t\t\"a\": \"z\",\n\t\t\t\"c\": [\n\t\t\t\t1,\n\t\t\t\t{\n\t\t\t\t\t\"d\": null\n\t\t\t\t}\n\t\t\t]\n\t\t}\n\t],\n\t[\n\t\t{\n\t\t\t\"b\": 2,\n\t\t\t\"a\": \"y\"\n\t\t}\n\t]\n]\n", 0),
+    (&["--indent", "1"], "group_by(.b)", "[\n [\n  {\n   \"a\": 0\n  }\n ],\n [\n  {\n   \"b\": 1,\n   \"a\": \"x\"\n  },\n  {\n   \"b\": 1,\n   \"a\": \"z\",\n   \"c\": [\n    1,\n    {\n     \"d\": null\n    }\n   ]\n  }\n ],\n [\n  {\n   \"b\": 2,\n   \"a\": \"y\"\n  }\n ]\n]\n", 0),
+    (&[], "group_by(.b)", "[\n  [\n    {\n      \"a\": 0\n    }\n  ],\n  [\n    {\n      \"b\": 1,\n      \"a\": \"x\"\n    },\n    {\n      \"b\": 1,\n      \"a\": \"z\",\n      \"c\": [\n        1,\n        {\n          \"d\": null\n        }\n      ]\n    }\n  ],\n  [\n    {\n      \"b\": 2,\n      \"a\": \"y\"\n    }\n  ]\n]\n", 0),
+    (&["-S", "-c"], "group_by(.b)", "[[{\"a\":0}],[{\"a\":\"x\",\"b\":1},{\"a\":\"z\",\"b\":1,\"c\":[1,{\"d\":null}]}],[{\"a\":\"y\",\"b\":2}]]\n", 0),
+    (&["-c"], "group_by(.b) | map(length)", "[1,2,1]\n", 0),
+    (&["--indent", "3"], "[] | group_by(.a)", "[]\n", 0),
+    (&["--tab"], "group_by(.b) | .[1:]", "[\n\t[\n\t\t{\n\t\t\t\"b\": 1,\n\t\t\t\"a\": \"x\"\n\t\t},\n\t\t{\n\t\t\t\"b\": 1,\n\t\t\t\"a\": \"z\",\n\t\t\t\"c\": [\n\t\t\t\t1,\n\t\t\t\t{\n\t\t\t\t\t\"d\": null\n\t\t\t\t}\n\t\t\t]\n\t\t}\n\t],\n\t[\n\t\t{\n\t\t\t\"b\": 2,\n\t\t\t\"a\": \"y\"\n\t\t}\n\t]\n]\n", 0),
+];
+
+#[test]
+fn test_group_by_output_flags_answer_as_jq_5306() -> Result<()> {
+    for (flags, filter, want, want_code) in FLAG_ROWS {
+        let mut args: Vec<&str> = flags.to_vec();
+        args.push(filter);
+        let (stdout, stderr, code) = run_jq_full(&args, Some(FLAG_INPUT))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (*want, *want_code),
+            "{flags:?} `{filter}`: {stderr}"
+        );
+    }
+    Ok(())
+}

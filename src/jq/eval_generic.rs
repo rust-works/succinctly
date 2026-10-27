@@ -52548,6 +52548,32 @@ mod tests {
         assert!(debug.contains("LazySource::Groups"), "{debug}");
     }
 
+    /// #5306: a YAML sequence groups too, and a group decodes through the cursors -- the only
+    /// walk that resolves an explicit tag -- where JSON decodes the values: `!!str 2` is the
+    /// string `"2"` in its group.
+    #[test]
+    fn test_group_by_decodes_yaml_groups_through_the_cursors_5306() {
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"- {a: 1, b: !!str 2}\n- {a: 2, b: 3}\n- {a: 1, b: x}\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index
+            .root(yaml)
+            .first_child()
+            .expect("YAML document should have content");
+        let expr = parse("group_by(.a)").unwrap();
+        let GenericResult::LazySeq(seq) = eval_with_cursor_using::<JqSemantics, _>(&expr, root)
+        else {
+            panic!("group_by over a sequence is a sequence of groups"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#5306)"
+        };
+        assert_eq!(seq.plain_groups().map(|groups| groups.len()), Some(2));
+        let built = seq.materialize_atomic::<JqSemantics>().unwrap();
+        assert_eq!(
+            built.to_json(),
+            r#"[[{"a":1,"b":"2"},{"a":1,"b":"x"}],[{"a":2,"b":3}]]"#
+        );
+    }
+
     /// #3856: a sequence with no stage and a source that is neither a cursor
     /// list nor a mixed list (a `map` source whose `map` was never pushed)
     /// still reads through the iterator, both when built and when a stage
