@@ -38,6 +38,8 @@ pub(super) fn supported(expr: &Expr) -> bool {
             supported(f)
         }
         Expr::Builtin(Builtin::Sort) => true,
+        // Paths given as a literal; one built from the document is for the plain route.
+        Expr::Builtin(Builtin::Pick(paths)) => is_closed_literal(paths),
         Expr::Assign { path, value } => static_path(path) && supported(value),
         Expr::Update { path, filter } => static_path(path) && supported(filter),
         _ => false,
@@ -524,6 +526,13 @@ fn trace_at_depth(
                 CommentTree::Object(tree.meta().clone(), fields, keys),
             ))
         }
+        // #5003: a picked entry is the document's own node, key and all: its comments, style,
+        // anchor and tag come with it, as do the document's head comment and the key's.
+        Expr::Builtin(Builtin::Pick(_)) => {
+            let result = evaluated(expr, value)?;
+            let picked = pick_tree(value, tree, &result, depth + 1)?;
+            Some((result, picked))
+        }
         Expr::Builtin(Builtin::WithEntries(f)) => {
             let entries = next(&Expr::Builtin(Builtin::ToEntries), input)?;
             let mapped = next(&Expr::Builtin(Builtin::Map(f.clone())), &entries)?;
@@ -567,6 +576,37 @@ fn trace_at_depth(
         _ if is_closed_literal(expr) => Some((evaluated(expr, value)?, CommentTree::empty())),
         _ => None,
     }
+}
+
+/// The presentation of what `pick` kept of `value` (#5003): the tree of the whole node where the
+/// result holds all of it, and for a mapping that lost entries, the entries it still holds, in
+/// the result's order, each with its own key properties. `None` where the result is not a
+/// selection of the node (an array that lost elements: the plain route decides those).
+fn pick_tree(
+    value: &OwnedValue,
+    tree: &CommentTree,
+    result: &OwnedValue,
+    depth: usize,
+) -> Option<CommentTree> {
+    if depth >= MAX_VALUE_TREE_DEPTH {
+        return None;
+    }
+    if value == result {
+        return Some(tree.clone());
+    }
+    let (OwnedValue::Object(kept), OwnedValue::Object(picked)) = (value, result) else {
+        return None;
+    };
+    let mut fields = IndexMap::new();
+    let mut keys = IndexMap::new();
+    for (key, picked_value) in picked {
+        let child = pick_tree(kept.get(key)?, tree.field(key), picked_value, depth + 1)?;
+        fields.insert(key.clone(), child);
+        if let Some(meta) = tree.key_meta(key) {
+            keys.insert(key.clone(), meta.clone());
+        }
+    }
+    Some(CommentTree::Object(tree.meta().clone(), fields, keys))
 }
 
 fn merge_tree(

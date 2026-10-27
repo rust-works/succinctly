@@ -6439,9 +6439,18 @@ yq keeps), and a root with an explicit tag (`# c` / `!!null` written `.a = 1` pr
 ### A block scalar header's comment ([#5001](https://github.com/rust-works/succinctly/issues/5001))
 
 A comment after a block scalar's `|`/`>` indicator stays on the header line in the places the value is
-written where it stands: `.`, `-P`, and a write that leaves the scalar alone or replaces it. A copy of the scalar
-(`.b = .a`, `. as $v | {"z": $v}`, `pick`), a recursive merge over it (`. *d {"a": "n"}`) and a document whose
-root is a block scalar carry no such comment, or print an extra document, where yq keeps it ([#5003](https://github.com/rust-works/succinctly/issues/5003)).
+written where it stands: `.`, `-P`, and a write that leaves the scalar alone or replaces it.
+A plain copy (`.b = .a`) and `pick` keep it since [#5257](https://github.com/rust-works/succinctly/issues/5257) and [#5003](https://github.com/rust-works/succinctly/issues/5003).
+A copy made through a variable (`. as $v | {"z": $v}`), a recursive merge over it (`. *d {"a": "n"}`) and a slice (`.[0:1]`) carry no such comment, where yq keeps it ([#5003](https://github.com/rust-works/succinctly/issues/5003)).
+
+`pick` copies the document's nodes, so what it keeps is printed as written: trailing comments, flow style, quoting, anchors, tags, a key's own quoting and comment, and the document's head comment.
+Swept against yq v4.53.3 over ten documents (comments, flow collections, anchors and aliases, tags, explicit keys, merge keys, several documents) and eighteen paths, plain and under `-P`.
+Still different:
+
+- **A document that opens with `--- # comment`** and has its first entry picked: yq prints `# first` fused to the entry (`# firsta: 1 # one`), which it cannot read back.
+  This build prints the entry alone.
+- **A picked alias whose anchor is not picked** (`pick(["d"])` over `c: &k {z: 1}` / `d: *k`) prints the resolved mapping here and `d: *k` in yq, which then cannot resolve the alias (the anchor soundness rule).
+- **`.. | pick(...)`, and `pick(...)` on a value built by the program,** carry no presentation: the replay reads the document, not a computed value.
 
 ### `line` and `column` residuals ([#4363](https://github.com/rust-works/succinctly/issues/4363))
 

@@ -71,6 +71,7 @@ mod i4983;
 mod i4996;
 mod i4997;
 mod i5001;
+mod i5003;
 mod i5052;
 mod i5053;
 mod i5053_crlf;

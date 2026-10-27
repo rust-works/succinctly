@@ -2764,6 +2764,15 @@ impl CommentTree {
         }
     }
 
+    /// Everything the tree holds about object field `key`'s *key* (its quoting, anchor, tag and
+    /// own-line comment), or `None` if this isn't an `Object` or the key has no entry (#5003).
+    pub fn key_meta(&self, key: &str) -> Option<&KeyMeta> {
+        match self {
+            Self::Object(_, _, keys) => keys.get(key),
+            _ => None,
+        }
+    }
+
     /// How object field `key`'s *key* was quoted in the source (`"single"`,
     /// `"double"`, [`KEY_STYLE_STRING`] after `-P`), or `""` for a plain key,
     /// one this isn't an `Object` for, or one with no entry (#3601). Distinct
