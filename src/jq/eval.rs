@@ -80780,6 +80780,9 @@ fn eval_last_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    if let Some(fold) = last_as_reduce(expr) {
+        return eval_single::<W, S>(&fold, value, optional);
+    }
     let result = eval_single::<W, S>(expr, value, optional);
     match result.materialize_cursor() {
         QueryResult::One(v) => QueryResult::One(v),
@@ -80807,6 +80810,34 @@ fn eval_last_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Partial(_, Control::Halt(code)) => QueryResult::Halt(code),
     }
 }
+
+/// jq's own definition of `last(f)`, `reduce f as $x (null; $x)`, when `f` makes the values it
+/// emits (#5377). `reduce` holds one value at a time and streams its source, `range` included,
+/// so `last(range(30000000) * 2)` stays flat where collecting the generator first held every
+/// value it made (killed at 3 GB; jq's is 2.5 MB). Whatever `last` does with an empty source, an
+/// error after the final value (`last(1, error("x"))` raises, it does not answer `1`) and a
+/// `break` or `halt` is then `reduce`'s own.
+///
+/// `None` for navigation alone (`.[]`, `.a[] | select(.b)`, `..`): its outputs are nodes of the
+/// document, which a collecting `last` holds as cursors -- a pointer each -- where `reduce` would
+/// decode every one it binds; and for `map(g)`, one output that stays lazy. Anything else
+/// computes its values, whether the generator is spelled `range`, a user's `def`, `inputs` or
+/// `splits`, and takes the `reduce` route.
+pub(crate) fn last_as_reduce(f: &Expr) -> Option<Expr> {
+    // `map(g)` is one output, a sequence that stays lazy through `last` (#725); there is nothing
+    // to stream.
+    let one_lazy_output = matches!(unwrap_paren(f), Expr::Builtin(Builtin::Map(_)));
+    (!is_register_navigation(f) && !one_lazy_output).then(|| Expr::Reduce {
+        input: Box::new(f.clone()),
+        patterns: vec![Pattern::Var(String::from(LAST_VAR))],
+        init: Box::new(Expr::Literal(Literal::Null)),
+        update: Box::new(Expr::Var(String::from(LAST_VAR))),
+    })
+}
+
+/// The variable `last(f)`'s `reduce` binds. It starts with `%`, which no jq variable name can,
+/// so it never meets a program's own.
+const LAST_VAR: &str = "%last";
 
 /// Evaluate `nth(n; expr)` - take nth output.
 fn eval_nth_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
@@ -153388,9 +153419,16 @@ mod share_audit_2999 {
             "[limit(300; range([]; {}; [1]) | length)] | length",
             &[(Kind::ArrayMakeMut, 1), (Kind::ArrayUnwrap, 299)],
         );
+        // `last(f)` no longer retains (#5377): it is jq's `reduce`, which lets go of each value
+        // as the next arrives, so it appends in place like the consumers above.
         assert_forced(
             b"null",
             "last(limit(300; range([]; {}; [1]))) | length",
+            &[(Kind::ArrayMakeMut, 1), (Kind::ArrayUnwrap, 299)],
+        );
+        assert_forced(
+            b"null",
+            "[limit(300; range([]; {}; [1]))] | last | length",
             &[(Kind::ArrayMakeMut, 299), (Kind::ArrayUnwrap, 299)],
         );
     }
@@ -157116,5 +157154,51 @@ mod never_identical_tests_5176 {
             ])
         };
         assert!(never_identical(&short("x"), &short("y")));
+    }
+
+    /// #5377: `last(f)` takes the `reduce` route unless `f` is navigation alone, whose outputs
+    /// are cursors into the document and not values to decode.
+    #[test]
+    fn last_runs_as_reduce_unless_it_navigates_5377() {
+        use crate::jq::parse;
+
+        let operand = |source: &str| {
+            let Expr::LastExpr(inner) = parse(source).unwrap() else {
+                panic!("`{source}` is a last(f)"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#5377)"
+            };
+            *inner
+        };
+        for source in [
+            "last(range(5))",
+            "last(range(3) * 2)",
+            "last(.[] | range(2))",
+            "last(repeat(1))",
+            "last(0 | while(. < 5; . + 1))",
+            "last(0 | until(. > 5; . + 1))",
+            "last(recurse(if . < 5 then . + 1 else empty end))",
+            "last(.[] | tostring)",
+            "last(1, 2, 3)",
+            "last(inputs)",
+            "last(splits(\"a\"))",
+        ] {
+            let fold = last_as_reduce(&operand(source));
+            assert!(
+                matches!(fold, Some(Expr::Reduce { .. })),
+                "{source}: {fold:?}"
+            );
+        }
+        for source in [
+            "last(.[])",
+            "last(.a[] | select(.b))",
+            "last(..)",
+            "last(.a, .b)",
+            "last(first(.[]))",
+            "last(map(. * 2))",
+        ] {
+            assert!(
+                last_as_reduce(&operand(source)).is_none(),
+                "{source} keeps the collecting route"
+            );
+        }
     }
 }
