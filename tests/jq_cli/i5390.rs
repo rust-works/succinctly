@@ -11,6 +11,7 @@ use crate::{run_jq_full, run_jq_stdin};
 
 const DOC: &str = r#"{"a":1,"b":{"c":[1,2,{"d":3}],"e":null},"f":[[1],[2,3]]}"#;
 
+#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_pick_over_a_recurse_walk_matches_jq_5390() -> Result<()> {
     let picked = "{\"a\":1,\"b\":{\"c\":[1,2,{\"d\":3}]},\"f\":[[1],[2,3]]}\n";
@@ -93,6 +94,7 @@ fn test_pick_over_a_recurse_walk_matches_jq_5390() -> Result<()> {
 /// 50,000 one-element arrays: the fold is linear, so this takes about a second in a debug
 /// build, where a copy of the state per pick took about half a minute. The bound sits well
 /// between the two, so a slow machine does not trip it but a quadratic fold does.
+#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_pick_over_a_recurse_walk_is_not_quadratic_5390() -> Result<()> {
     let doc = format!("[{}]", vec!["[1]"; 50_000].join(","));
