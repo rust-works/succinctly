@@ -199,12 +199,13 @@ fn test_copying_presentation_leaves_the_values_alone_5249() -> Result<()> {
 
 /// A source a later stage rewrites has presentation that no longer describes the target, so the
 /// copy is skipped: yq copies what the node held when it was read (`c: [1] # t`), this prints the
-/// plain value (recorded in `limitations.md`).
+/// plain value (recorded in `limitations.md`). The source itself keeps its comment beside the
+/// scalar that overwrote it (`b: 5 # t`, #5258), as yq prints it.
 #[test]
 fn test_a_source_rewritten_by_a_later_stage_copies_nothing_5249() -> Result<()> {
     let (output, exit_code) = run_yq_stdin(".c = .b | .b = 5", "b: [1] # t\n", &[])?;
     assert_eq!(exit_code, 0);
-    assert_eq!(output, "b: 5\nc:\n  - 1\n");
+    assert_eq!(output, "b: 5 # t\nc:\n  - 1\n");
     Ok(())
 }
 

@@ -3402,10 +3402,11 @@ fn reconcile_presentation_at_depth(
         // falls back to the empty tree for a non-matching variant, the same
         // outcome a freshly-built `Array`/`Object` with empty children would
         // give, and a kind-changed node's children carry no presentation
-        // memory of their own either way. Comment and style are still
-        // dropped, since neither describes anything that survived the kind
-        // change (a document root, which a write rewrote, keeps its head and foot comments,
-        // #4997; see [`kind_changed_leaf`]). [`enforce_anchor_soundness`], run afterwards, is what
+        // memory of their own either way. Style is still dropped, since it
+        // describes nothing that survived the kind change, and so is the comment
+        // unless the new value fits on the comment's line (#5258, below). A document
+        // root, which a write rewrote, keeps its head and foot comments, #4997; see
+        // [`kind_changed_leaf`]. [`enforce_anchor_soundness`], run afterwards, is what
         // decides whether a carried `Declares` mark is still emittable.
         //
         // An `Aliases` mark is handled differently (found in review): unlike
@@ -3434,10 +3435,21 @@ fn reconcile_presentation_at_depth(
             let rewrites_the_document = depth == 0 && !targets.is_empty();
             let container_result =
                 matches!(result_value, OwnedValue::Object(_) | OwnedValue::Array(_));
+            // A node's own same-line comment stays on its line while the new value fits
+            // there: an empty `{}` / `[]`, or a scalar (#5258). A non-empty block
+            // container breaks the line, and yq then parks the comment on the next
+            // line, which succinctly drops (docs/compliance/yq/limitations.md). A
+            // document root keeps no comment beside a scalar, as before.
+            let keeps_line_comment = match result_value {
+                OwnedValue::Object(fields) => fields.is_empty(),
+                OwnedValue::Array(items) => items.is_empty(),
+                _ => !rewrites_the_document,
+            };
             kind_changed_leaf(
                 pristine_tree,
                 targets,
                 rewrites_the_document.then_some(container_result),
+                keeps_line_comment,
             )
         }
         // Both scalars, any variant/value: same node, only its value
@@ -3473,7 +3485,8 @@ fn grown_container_meta(meta: &NodeMeta, grown: bool) -> NodeMeta {
 }
 
 /// The tree for a node whose kind changed (container <-> scalar): it keeps an anchor
-/// declaration, a custom tag and, at the document root, the preamble, never the rest -- except
+/// declaration, a custom tag, at the document root the preamble and, when `keeps_line_comment`, its
+/// same-line comment (#5258), never the rest -- except
 /// that the root of a document a write rewrote keeps the document's head comment and, for a
 /// container, its foot (#4997).
 /// Out of line so `reconcile_presentation_at_depth`'s recursive frame stays small (its
@@ -3485,6 +3498,9 @@ fn kind_changed_leaf(
     // `Some(container)` at the root of a document a write has rewritten, `container` being whether
     // the new root is a mapping or sequence (#4997).
     rewritten_document: Option<bool>,
+    // The node's same-line comment stays beside the new value (#5258): the value fits on the
+    // line (an empty `{}` / `[]`, or a scalar below the document root).
+    keeps_line_comment: bool,
 ) -> CommentTree {
     let is_write_target = targets.iter().any(|(steps, ..)| steps.is_empty());
     let anchor = match &pristine_tree.meta().anchor {
@@ -3493,9 +3509,17 @@ fn kind_changed_leaf(
         _ => None,
     };
     let tag = pristine_tree.meta().tag().filter(|tag| is_custom_tag(tag));
-    let meta = NodeMeta::empty_with_anchor(anchor)
+    let mut meta = NodeMeta::empty_with_anchor(anchor)
         .with_tag(tag.map(str::to_string))
         .with_preamble(pristine_tree.meta().preamble().map(str::to_string));
+    if keeps_line_comment {
+        meta.comment.clone_from(&pristine_tree.meta().comment);
+        // Only an empty `{}` / `[]` keeps it at the root, and the root prints the comment beside
+        // it only when it is flow-styled (the one spelling an empty container has).
+        if rewritten_document == Some(true) {
+            meta = meta.with_style("flow");
+        }
+    }
     // The comments around a document stay around whatever it is rewritten to: `# c` / `null`
     // written `.a = 1` is `# c` / `a: 1`, and so is a comment-only file. The head always; the
     // foot with a container, which prints it (a scalar root does not).
@@ -7266,6 +7290,12 @@ fn strip_presentation_style_at_depth(
         CommentTree::Leaf(meta) => {
             let style = match value {
                 OwnedValue::String(text) => kept_quote(text, tree.style()),
+                // A kind-changed node is a `Leaf` even when it now holds an empty collection,
+                // which keeps its one spelling and the comment beside it (#5258).
+                OwnedValue::Object(members) if members.is_empty() && tree.style() == "flow" => {
+                    "flow"
+                }
+                OwnedValue::Array(items) if items.is_empty() && tree.style() == "flow" => "flow",
                 _ => "",
             };
             CommentTree::Leaf(strip_core_tag(meta.with_style(style), None))
