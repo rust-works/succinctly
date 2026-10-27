@@ -25364,20 +25364,42 @@ fn group_value<V: DocumentValue>(group: &[V::Cursor]) -> GenericResult<V> {
     GenericResult::LazySeq(Box::new(LazySeq::from_cursors(group.to_vec())))
 }
 
-/// `map(h)` over `group_by`'s groups, run to the end now (#5306): `h` is folded over each
-/// group's cursors as it would be over any array, and only its outputs are kept, so a group
-/// that `h` reads in part (`.[0].id`, `length`) is never decoded and one that it keeps is
-/// decoded once. Eager on purpose, as `map` is in jq: a failing, breaking or halting `h`
-/// stops here, inside whatever `label` or `try` encloses the `map`, and a later `first` cannot
-/// skip it.
+/// Whether `fold_lazy_seq_stage` answers `h` over a cursor sequence from the cursors alone,
+/// without decoding it: the point reads and `length` of its `Groups`/`Cursors` arms, and a
+/// pipe that starts with one (`.[0].id`).
+fn reads_cursors_alone(h: &Expr) -> bool {
+    match unwrap_paren(h) {
+        Expr::Index { key: None, .. }
+        | Expr::Slice { .. }
+        | Expr::Builtin(Builtin::First | Builtin::Last | Builtin::Length) => true,
+        Expr::Pipe(stages) => matches!(
+            stages.first().map(unwrap_paren),
+            Some(Expr::Index { key: None, .. } | Expr::Builtin(Builtin::Last) | Expr::Slice { .. })
+        ),
+        _ => false,
+    }
+}
+
+/// `map(h)` over `group_by`'s groups, run to the end now (#5306): a group that `h` reads in
+/// part (`.[0].id`, `length`) is folded over its cursors and never decoded; any other `h` runs
+/// on the group decoded once, as it ran on every group before. Only `h`'s outputs are kept.
+/// Eager on purpose, as `map` is in jq: a failing, breaking or halting `h` stops here, inside
+/// whatever `label` or `try` encloses the `map`, and a later `first` cannot skip it.
 fn map_groups_eagerly<S: EvalSemantics, V: DocumentValue>(
     groups: &[&[V::Cursor]],
     h: &Expr,
 ) -> GenericResult<V> {
+    let on_cursors = reads_cursors_alone(h);
     let mut out: Vec<LazyElem<V>> = vec_with_capacity(groups.len());
     for group in groups {
-        let result =
-            fold_lazy_seq_stage::<S, V>(Box::new(LazySeq::from_cursors(group.to_vec())), h, false);
+        let result = if on_cursors {
+            fold_lazy_seq_stage::<S, V>(Box::new(LazySeq::from_cursors(group.to_vec())), h, false)
+        } else {
+            match decode_group::<V>(S::TAG, group) {
+                Ok(owned) => eval_on_owned::<S, V>(h, owned, false, Reentry::REBUILT),
+                Err(e) => GenericResult::Error(e),
+            }
+        };
         match into_lazy_items::<V, S>(result) {
             Ok(items) => out.extend(items),
             Err(Control::Error(e)) => return GenericResult::Error(e),
