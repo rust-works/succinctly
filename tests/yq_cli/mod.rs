@@ -109,4 +109,5 @@ mod i5363;
 mod i5367;
 mod i5374;
 mod i5388;
+mod i5397;
 mod i865;

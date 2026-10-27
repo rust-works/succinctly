@@ -4253,9 +4253,12 @@ rule above, over an object, array, string, number or `null` root alike. (A branc
 `.x[3][0:1][0]`, whose slice makes it inert, creates `.x[3]` in yq and does not here; that predates
 #1325.)
 
-Still different: a bare root slice whose bounds are computed (`.[($i):3]`) is not recognised as the
-stop (the group is deleted as if it were absent), and a branch that raises before the stop raises
-with this tool's wording rather than yq's, as everywhere else.
+A bare root slice whose bounds are computed (`.[(1+1):3]`, `.[:(.b)]`, `.[(.b):3][0:1]`) is the stop too ([#5397](https://github.com/rust-works/succinctly/issues/5397)).
+Its bounds are read against the root, and it counts when each one is exactly one integer, which is what yq's `ParseInt` takes.
+A bound that gives none, several, `null`, a string or a fractional number is not the stop, and raises or is resolved as it was before.
+
+Still different: a computed bound on a slice that follows another (`.[0:1][(1+1):3]`) is not recognised as the stop (the group is deleted as if it were absent), because yq reads that bound against the earlier slice's result.
+A branch that raises before the stop raises with this tool's wording rather than yq's, as everywhere else.
 
 ### `del()` through a slice-run and a field tail: per element, one gap ([#2344](https://github.com/rust-works/succinctly/issues/2344), [#4542](https://github.com/rust-works/succinctly/issues/4542))
 

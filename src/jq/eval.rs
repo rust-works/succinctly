@@ -86668,7 +86668,7 @@ fn delete_trie_array(
 /// own answer is itself inconsistent/order-sensitive with no coherent rule
 /// to replicate, the same territory `builtin_del`'s own known-gap test
 /// already documents. See #1223's follow-up discussion.
-fn rewrite_yq_del_comma_branches(
+fn rewrite_yq_del_comma_branches<S: EvalSemantics>(
     expr: &Expr,
     root: &OwnedValue,
 ) -> Result<Option<Expr>, EvalError> {
@@ -86676,7 +86676,7 @@ fn rewrite_yq_del_comma_branches(
     collect_del_comma_leaves(expr, &mut leaves);
     // The leaves the stop swallows, by address: `rewrite_yq_del_comma_leaves` meets the same nodes
     // while it rebuilds the tree, so the two traversals need not number them alike.
-    let swallowed: Vec<&Expr> = match yq_del_stop_leaf(&leaves, root) {
+    let swallowed: Vec<&Expr> = match yq_del_stop_leaf::<S>(&leaves, root) {
         Some(stop) => leaves[..=stop].to_vec(),
         None => Vec::new(),
     };
@@ -86684,20 +86684,95 @@ fn rewrite_yq_del_comma_branches(
 }
 
 /// Whether a `del()` comma branch is a bare run of slices on the root (`.[2:3]`, `.[2:3][0:1]`,
-/// `(.[2:3])?`, `.[2:3] | .[0:1]`): every step a slice with literal bounds, nothing before them.
+/// `(.[2:3])?`, `.[2:3] | .[0:1]`): every step a slice, nothing before them.
 ///
 /// yq builds every slice result as a replacement of the node it slices, so the result of a slice
 /// of the root has no parent, and `deleteChildOperator` walks the matches backwards and returns at
 /// the first one without a parent (#1325): the branches after it in the comma group are deleted and
 /// everything from it back to the first is not. Anything else after the run (`.[2:3][0]`, `.[2:3].x`)
 /// is a child of the replacement and has a parent, so it is inert but stops nothing.
-fn is_bare_root_slice_run(branch: &Expr) -> bool {
-    if needs_path_prepass(branch) {
-        return false;
-    }
+///
+/// A bound that is computed (`.[(1+1):3]`, `.[(.b):3]`) is read against `root` first
+/// ([`fold_root_slice_bounds`], #5397).
+fn is_bare_root_slice_run<S: EvalSemantics>(branch: &Expr, root: &OwnedValue) -> bool {
+    let folded: Expr;
+    let branch = if needs_path_prepass(branch) {
+        match fold_root_slice_bounds::<S>(branch, root) {
+            Some(f) => {
+                folded = f;
+                &folded
+            }
+            None => return false,
+        }
+    } else {
+        branch
+    };
     let mut steps = Vec::new();
     flatten_delete_path(branch, false, &mut steps);
     !steps.is_empty() && steps.iter().all(|s| s.component.is_slice())
+}
+
+/// `branch` with each computed slice bound replaced by the integer it reads as against `root`, or
+/// `None` when it is not a bare run of slices on the root or a bound is not one integer yq takes
+/// (#5397).
+///
+/// yq parses a bound into `strconv.ParseInt`, so only exactly one number that is integer-shaped
+/// slices (`.[(1+1):3]`); none, several, `null`, a string and a fractional float raise there, and
+/// they keep raising here because the branch is then left to the resolver as before. A bound is
+/// read against the input of the slice it belongs to, so only the first slice of the run qualifies:
+/// yq reads `.[0:1][(.b):3]`'s second bound against the first slice's result and raises on it.
+fn fold_root_slice_bounds<S: EvalSemantics>(branch: &Expr, root: &OwnedValue) -> Option<Expr> {
+    fn bound<S: EvalSemantics>(
+        bound: &Option<Box<Expr>>,
+        root: &OwnedValue,
+        round: fn(f64) -> f64,
+    ) -> Result<Option<i64>, ()> {
+        let Some(expr) = bound else {
+            return Ok(None);
+        };
+        let (values, escape) = eval_owned_multi_keep_partial::<S>(expr, root);
+        let [value] = values.as_slice() else {
+            return Err(());
+        };
+        let number = matches!(
+            value,
+            OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)
+        );
+        if escape.is_some() || !number {
+            return Err(());
+        }
+        owned_bound_to_i64_for::<S>(value, round).map_err(|_| ())
+    }
+    match branch {
+        Expr::Identity | Expr::Slice { .. } => Some(branch.clone()),
+        Expr::Paren(inner) => {
+            fold_root_slice_bounds::<S>(inner, root).map(|f| Expr::Paren(Box::new(f)))
+        }
+        Expr::Optional(inner) => {
+            fold_root_slice_bounds::<S>(inner, root).map(|f| Expr::Optional(Box::new(f)))
+        }
+        Expr::SliceExpr { target, start, end } if matches!(**target, Expr::Identity) => {
+            let start = bound::<S>(start, root, f64::floor).ok()?;
+            let end = bound::<S>(end, root, f64::ceil).ok()?;
+            Some(Expr::slice(start, end))
+        }
+        Expr::Pipe(stages) => {
+            // A leading `.` leaves the root as the next stage's input.
+            let lead = stages
+                .iter()
+                .take_while(|s| matches!(s, Expr::Identity))
+                .count();
+            let (first, rest) = stages[lead..].split_first()?;
+            if rest.iter().any(needs_path_prepass) {
+                return None;
+            }
+            let first = fold_root_slice_bounds::<S>(first, root)?;
+            let mut folded = vec![first];
+            folded.extend(rest.iter().cloned());
+            Some(Expr::pipe(folded))
+        }
+        _ => None,
+    }
 }
 
 /// The leaves of a comma group in source order: the branches that are not themselves a
@@ -86737,11 +86812,17 @@ fn is_comma_group(expr: &Expr) -> bool {
 /// `{"x":[1]}` is `{"x":[1,null,null,null]}`). A leaf before the stop that may do that would have to
 /// keep its creation and lose its delete, which this does not model, so the stop is not applied to a
 /// group holding one (the group then behaves as it did before #1325).
-fn yq_del_stop_leaf(leaves: &[&Expr], root: &OwnedValue) -> Option<usize> {
-    let stop = leaves.iter().rposition(|l| is_bare_root_slice_run(l))?;
+fn yq_del_stop_leaf<S: EvalSemantics>(leaves: &[&Expr], root: &OwnedValue) -> Option<usize> {
+    // Once per leaf: a computed bound is evaluated to decide this.
+    let runs: Vec<bool> = leaves
+        .iter()
+        .map(|l| is_bare_root_slice_run::<S>(l, root))
+        .collect();
+    let stop = runs.iter().rposition(|&run| run)?;
     leaves[..stop]
         .iter()
-        .all(|leaf| del_leaf_only_deletes(leaf, root))
+        .zip(&runs)
+        .all(|(leaf, &run)| run || del_leaf_only_deletes(leaf, root))
         .then_some(stop)
 }
 
@@ -87680,7 +87761,7 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // still applies to its resolved output.
     let rewritten_comma_path_expr: Expr;
     let path_expr: &Expr = if S::TAG == EvalTag::Yq {
-        match rewrite_yq_del_comma_branches(path_expr, &result) {
+        match rewrite_yq_del_comma_branches::<S>(path_expr, &result) {
             Ok(Some(rewritten)) => {
                 rewritten_comma_path_expr = rewritten;
                 &rewritten_comma_path_expr
