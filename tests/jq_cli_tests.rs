@@ -102068,12 +102068,12 @@ fn test_resource_limit_caps_are_uncatchable_2132() -> Result<()> {
     for (label, expr, want_err) in [
         (
             "WHILE_UNTIL_MAX_STEPS/while",
-            "while(true; .+1)",
+            "while(true; ., .)",
             "while: maximum iterations exceeded",
         ),
         (
             "WHILE_UNTIL_MAX_STEPS/until",
-            "until(false; .+1)",
+            "until(false; ., .)",
             "until: maximum iterations exceeded",
         ),
         // Genuine fan-out past the shared reduce/foreach budget -- the same
@@ -102257,13 +102257,13 @@ fn test_resource_limit_is_not_a_destructuring_retry_2132() -> Result<()> {
         (
             "reduce source ?//",
             "null",
-            "[reduce (1,2) as $x ?// $y (0; if $x != null then (0|until(false;.+1)) else 1 end)]",
+            "[reduce (1,2) as $x ?// $y (0; if $x != null then (0|until(false; ., .)) else 1 end)]",
             "until: maximum iterations exceeded",
         ),
         (
             "foreach source ?//",
             "null",
-            "[foreach (1,2) as $x ?// $y (0; if $x != null then (0|until(false;.+1)) else 1 end; .)] | length",
+            "[foreach (1,2) as $x ?// $y (0; if $x != null then (0|until(false; ., .)) else 1 end; .)] | length",
             "until: maximum iterations exceeded",
         ),
         (

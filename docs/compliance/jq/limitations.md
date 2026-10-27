@@ -10533,6 +10533,13 @@ state's top-level container once per round.
 
 > The budget's raise is uncatchable by `?`/`try`/`catch` since #2132 -- see "Every resource cap is uncatchable" below.
 
+> Since #5292 `WHILE_UNTIL_MAX_STEPS` (`100000`) bounds fan-out and recursion, not length.
+> A round whose `cond` and `update` each answer once steps in place, as the loops always have, and is charged only against `MAX_LOOP_ROUNDS` (2^24 = 16,777,216 rounds for the whole call): `0 | until(. >= 300000; . + 1)` and `[0 | while(. < 300000; . + 1)] | length` answer as jq does.
+> A round that forks (a `cond` or `update` that answers more or fewer than once, or an operand driven through a live sink for a `?//`) starts branches that nest a native frame each, and every round of such a branch is charged against `WHILE_UNTIL_MAX_STEPS` as well, so `until(false; ., .)` and `until(. > 40; .+1, .+2)` still raise after about 100,000 rounds.
+> `LoopCounters`/`LoopBudget` (`src/jq/eval.rs`) carry this in the value, generic and path-interpreter evaluators.
+> The round cap replaces the step cap for the loops jq spins in: `0 | until(false; . + 1)` raises `until: maximum iterations exceeded` after a few seconds where jq never returns, and `[0 | while(true; . + 1)]` raises at 16,777,216 collected values (about 1 GiB) where jq grows until it is killed.
+> The rest of this section is written for the flat 100,000-state cap, and its transcripts show it.
+
 `WHILE_UNTIL_MAX_STEPS` (`src/jq/eval.rs`) is a shared step budget for
 `while`/`until`'s backtracking-generator evaluation, decremented once per
 state visited across the whole recursion tree regardless of branching --
@@ -10795,7 +10802,7 @@ this is a genuine, if narrower, instance of the same divergence. (At the
   suppresses the raised error, but `drain_result` has already delivered the
   capped batch to the sink before `emit` decides whether to raise, so
   nothing distinguishes it from a genuine result once the error itself is
-  swallowed. Not specific to `range` (`[while(true;.+1)?]` shows the same
+  swallowed. Not specific to `range` (`[while(true;.+1)?]` showed the same
   pattern for `WHILE_UNTIL_MAX_STEPS`), so tracked as a general evaluator
   question rather than here: [#2132](https://github.com/rust-works/succinctly/issues/2132).
 - `eval_range_values`'s integer stepping (`i += step`) has no overflow
