@@ -5947,10 +5947,11 @@ fn comma_stage_array_generic<S: EvalSemantics, V: DocumentValue>(
 /// colliding-decode-failure-key -- and if so, the `Control::Error` a
 /// caller should raise.
 ///
-/// **One caller remains**: `sort_by`/`unique_by`/`min_by`/`max_by`'s
-/// comparison key (`key_elements_generic`), which needs the #1247/#1194
-/// validation below without materializing an `OwnedValue` for the element
-/// it only ever reorders. Not a truthiness-specific helper despite this
+/// **Two callers remain**: `sort_by`/`unique_by`/`min_by`/`max_by`'s
+/// comparison key (`key_elements_generic`), and `group_by`'s check of every
+/// element ahead of its keys (`group_by_array_generic`, #5306), which need
+/// the #1247/#1194 validation below without materializing an `OwnedValue`
+/// for the element they only ever reorder or cut. Not a truthiness-specific helper despite this
 /// function's former name (#2413) -- and, since #2692, not a truthiness
 /// helper at all.
 ///
