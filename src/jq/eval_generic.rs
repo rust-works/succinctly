@@ -11874,7 +11874,7 @@ fn fold_lazy_seq_stage<S: EvalSemantics, V: DocumentValue>(
             Expr::Index { idx, key: None } => {
                 let resolved = if *idx < 0 { len as i64 + idx } else { *idx };
                 if let Some(e) = yq_negative_index_check::<S>(*idx, resolved, len) {
-                    return GenericResult::Error(e);
+                    return GenericResult::Error(e); // patchcov: coverage tolerate-line reason="unreachable: only a yq-mode check answers an error, and group_by cuts a Groups source in jq mode alone (#5306)"
                 }
                 return usize::try_from(resolved)
                     .ok()
@@ -25353,7 +25353,7 @@ fn decode_group<V: DocumentValue>(
 ) -> Result<OwnedValue, EvalError> {
     let items = match tag {
         EvalTag::Jq => <V::Cursor as DocumentCursor>::to_owned_values::<JqSemantics>(group)?,
-        EvalTag::Yq => <V::Cursor as DocumentCursor>::to_owned_values::<YqSemantics>(group)?,
+        EvalTag::Yq => <V::Cursor as DocumentCursor>::to_owned_values::<YqSemantics>(group)?, // patchcov: coverage tolerate-line reason="unreachable: group_by cuts a Groups source in jq mode alone, so its tag is never Yq (#5306)"
     };
     Ok(OwnedValue::array_from(items))
 }
@@ -25396,6 +25396,11 @@ fn map_groups_eagerly<S: EvalSemantics, V: DocumentValue>(
             fold_lazy_seq_stage::<S, V>(Box::new(LazySeq::from_cursors(group.to_vec())), h, false)
         } else {
             match decode_group::<V>(S::TAG, group) {
+                // `map(.)` keeps the group as it decoded: a pass through `eval_on_owned` would
+                // only hand the same array back, at the price of indexing it again.
+                Ok(owned) if matches!(unwrap_paren(h), Expr::Identity) => {
+                    GenericResult::Owned(owned)
+                }
                 Ok(owned) => eval_on_owned::<S, V>(h, owned, false, Reentry::REBUILT),
                 Err(e) => GenericResult::Error(e),
             }
