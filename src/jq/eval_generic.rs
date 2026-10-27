@@ -22271,14 +22271,22 @@ fn items_to_generic_result<V: DocumentValue, S: EvalSemantics>(
 /// so the error is jq's `Cannot index <container> with <key>`, and the
 /// null-input passthrough is reached only for a valid key kind (`null | .["a"]`
 /// is `null`, `null | .[null]` errors).
+///
+/// `cursor` is the node `target` was read from, when there is one (#3563): a
+/// null test reads the node's explicit tag before its text (`a: !!null foo` is
+/// null, `a: !!str null` is not -- [`cursor_is_null`]), as the literal field and
+/// index arms do (#3533). A target reached with no cursor keeps the text test.
 fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
     target: V,
+    cursor: Option<&V::Cursor>,
     key: &OwnedValue,
     optional: bool,
 ) -> GenericResult<V> {
     if let Some(err) = unreadable_value_error(&target) {
         return GenericResult::Error(err);
     }
+    // Lazy: the tag lookup is paid only on the arms that ask whether the target is null.
+    let target_is_null = || cursor_is_null(&target, cursor);
     // #3453: an array key on an array is jq's subarray search -- see
     // `eval.rs`'s `index_one` arm. Anything else, and yq, falls through.
     if let (OwnedValue::Array(needle), Some(elements), true) =
@@ -22319,7 +22327,7 @@ fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
             } =>
         {
             match crate::jq::eval::yq_array_string_key_index::<S>(key) {
-                Some(index) => index_one_generic::<S, V>(target, &index, optional),
+                Some(index) => index_one_generic::<S, V>(target, cursor, &index, optional),
                 None => GenericResult::None, // patchcov: coverage tolerate-line reason="unreachable: the guard just answered Some"
             }
         }
@@ -22336,7 +22344,7 @@ fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
                     // #1677/#1995: same checks as `Expr::Field`'s own arm.
                     Err(err) => GenericResult::Error(err),
                 }
-            } else if target.is_null() {
+            } else if target_is_null() {
                 if absent_is_empty {
                     GenericResult::None
                 } else {
@@ -22402,14 +22410,12 @@ fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
                 }
             // #2459: yq mode only, the `Object` half of this condition --
             // see `yq_numeric_index_on_object_is_null`.
-            } else if target.is_null()
-                || (target.as_object().is_some() && yq_numeric_index_on_object_is_null::<S>())
-            {
+            } else if target.as_object().is_some() && yq_numeric_index_on_object_is_null::<S>() {
+                GenericResult::Owned(OwnedValue::Null)
+            } else if target_is_null() {
                 // #4275 (yq): `null` is an empty array for a negative index.
-                if target.is_null() {
-                    if let Some(e) = idx.and_then(|i| yq_negative_index_check::<S>(i, i, 0)) {
-                        return GenericResult::Error(e);
-                    }
+                if let Some(e) = idx.and_then(|i| yq_negative_index_check::<S>(i, i, 0)) {
+                    return GenericResult::Error(e);
                 }
                 GenericResult::Owned(OwnedValue::Null)
             } else if yq_field_index_on_scalar_is_empty::<S>() {
@@ -22437,13 +22443,13 @@ fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
         // .s[$k]`, and `{} as $k | .s[$k]` are all empty on `s: x`).
         _ if target.as_array().is_none()
             && target.as_object().is_none()
-            && !target.is_null()
+            && !target_is_null()
             && yq_field_index_on_scalar_is_empty::<S>() =>
         {
             GenericResult::None
         }
         // #4087: yq reads a boolean or `null` key on `null` as `null`.
-        _ if target.is_null() && yq_bool_null_key_into_null::<S>(key) => {
+        _ if target_is_null() && yq_bool_null_key_into_null::<S>(key) => {
             GenericResult::Owned(OwnedValue::Null)
         }
         _ if optional => GenericResult::None,
@@ -22637,8 +22643,11 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         // Normalized the same way the old once-for-all-keys `targets` match
         // did, minus the arms that used to return early: those now escape
         // through `escape_generic!` so the running accumulator survives.
-        enum KeyTargets<V> {
-            Native(Vec<V>),
+        // `Native` pairs each target with the cursor it was read from (#3563), so the null
+        // tests in `index_one_generic` can read the node's explicit tag; a target that
+        // arrived as a value alone carries none.
+        enum KeyTargets<V: DocumentValue> {
+            Native(Vec<(V, Option<V::Cursor>)>),
             Owned(Vec<OwnedValue>),
         }
         let key_targets = match eval_single::<S, V>(target, value.clone(), false, cursor) {
@@ -22754,12 +22763,16 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                     fold: |t| index_owned_checked::<S>(t, k, optional),
                 }
             }
-            GenericResult::One(v) => KeyTargets::Native(vec![v]),
-            GenericResult::Many(vs) => KeyTargets::Native(vs),
-            GenericResult::OneCursor(c) => KeyTargets::Native(vec![c.value()]),
-            GenericResult::ManyCursor(cs) => {
-                KeyTargets::Native(cs.iter().map(DocumentCursor::value).collect())
+            GenericResult::One(v) => KeyTargets::Native(vec![(v, None)]),
+            GenericResult::Many(vs) => {
+                KeyTargets::Native(vs.into_iter().map(|v| (v, None)).collect())
             }
+            GenericResult::OneCursor(c) => KeyTargets::Native(vec![(c.value(), Some(c))]),
+            GenericResult::ManyCursor(cs) => KeyTargets::Native(
+                cs.into_iter()
+                    .map(|c| (c.value(), Some(c)))
+                    .collect(),
+            ),
             // An owned target (a computed, non-navigational left side) has
             // no borrowed representation here; round-trip it through the
             // shared owned-value path. `LazySeq` shares this arm too:
@@ -22806,8 +22819,8 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                 if reserved.is_err() {
                     escape_generic!(Control::Error(cannot_reserve_cross_product(&[ts.len()])));
                 }
-                for t in &ts {
-                    match index_one_generic::<S, V>(t.clone(), k, optional) {
+                for (t, tc) in &ts {
+                    match index_one_generic::<S, V>(t.clone(), tc.as_ref(), k, optional) {
                         GenericResult::OneCursor(c) => {
                             if any_owned {
                                 // Not `owned_or_err!`: that bare-returns and
