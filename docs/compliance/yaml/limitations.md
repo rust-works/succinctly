@@ -361,10 +361,12 @@ scalar can still answer from untagged inference even though `succinctly yq '.'`'
 for the same input is always correct. Tracked as
 [#747](https://github.com/rust-works/succinctly/issues/747). The *cursor-holding* null tests are
 the exception ([#3533](https://github.com/rust-works/succinctly/issues/3533)): `length`, literal
-field and index access (`.a | .b`, `.a | .[0]`), computed and multi-key indexing (`.a | .[$k]`,
-`.a | .[0,1]`, [#3563](https://github.com/rust-works/succinctly/issues/3563)), yq's `map` no-op, `has`,
-`first`/`last`/`values` (behind `--jq-extensions`) and the path-step walkers consult an explicit `!!null`/`!!str` tag before
-the text, so `a: !!null foo` has `length` `0` and `a: !!str null` has `length` `4`, as in yq. A
+field and index access (`.a | .b`, `.a | .[0]`), yq's `map` no-op, `has`, `first`/`last`/`values`
+(behind `--jq-extensions`) and the path-step walkers consult an explicit `!!null`/`!!str` tag before
+the text, so `a: !!null foo` has `length` `0` and `a: !!str null` has `length` `4`, as in yq.
+Computed and multi-key indexing (`.a | .[$k]`, `.a | .[0,1]`) reads the tag the same way
+([#3563](https://github.com/rust-works/succinctly/issues/3563)).
+A
 document with no explicit tag at all skips the lookup (`YamlIndex::has_explicit_tags`); one with
 a tag pays about 5% on a string-`length`-heavy query. What stays text-based, because it has no
 cursor or reaches the test before its container arms: a container tagged `!!null`

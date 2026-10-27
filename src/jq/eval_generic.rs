@@ -22406,14 +22406,12 @@ fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
                 }
             // #2459: yq mode only, the `Object` half of this condition --
             // see `yq_numeric_index_on_object_is_null`.
-            } else if target_is_null()
-                || (target.as_object().is_some() && yq_numeric_index_on_object_is_null::<S>())
-            {
+            } else if target.as_object().is_some() && yq_numeric_index_on_object_is_null::<S>() {
+                GenericResult::Owned(OwnedValue::Null)
+            } else if target_is_null() {
                 // #4275 (yq): `null` is an empty array for a negative index.
-                if target_is_null() {
-                    if let Some(e) = idx.and_then(|i| yq_negative_index_check::<S>(i, i, 0)) {
-                        return GenericResult::Error(e);
-                    }
+                if let Some(e) = idx.and_then(|i| yq_negative_index_check::<S>(i, i, 0)) {
+                    return GenericResult::Error(e);
                 }
                 GenericResult::Owned(OwnedValue::Null)
             } else if yq_field_index_on_scalar_is_empty::<S>() {

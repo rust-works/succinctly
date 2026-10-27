@@ -28,6 +28,21 @@ fn test_3563_tagged_null_scalar_indexes_as_null() -> Result<()> {
             (".a | .[0,1]", "null\nnull\n"),
             ("0 as $k | .a | .[$k]", "null\n"),
             (".a | .[true,null]", "null\nnull\n"),
+            // The negative-index rule for a null target (#4275) reads the tag too.
+            (".a | .[0,1]?", "null\nnull\n"),
+            (r#".a | .["b"]?"#, "null\n"),
+        ],
+    )
+}
+
+/// Several targets at once: each is judged by its own tag.
+#[test]
+fn test_3563_each_target_is_judged_by_its_own_tag() -> Result<()> {
+    check(
+        "l: [!!null foo, !!str null, ~, bar]\n",
+        &[
+            (".l[] | .[0,1]", "null\nnull\nnull\nnull\n"),
+            (r#".l[] | .["b"]"#, "null\nnull\n"),
         ],
     )
 }
