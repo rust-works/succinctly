@@ -196,8 +196,7 @@ impl<V> ObjectStore<V> {
     #[inline]
     fn note_vacant_insert(&mut self, slot: usize) {
         if let Some(shadows) = self.shadows.as_deref_mut() {
-            shadows.live_pos.push(shadows.order.len());
-            shadows.order.push(Occurrence::Live(slot));
+            shadows.push_live(slot);
         }
     }
 
@@ -212,6 +211,13 @@ impl<V> ObjectStore<V> {
 }
 
 impl<V> Shadows<V> {
+    /// Records a key that was just appended to the map at `slot`.
+    #[inline]
+    fn push_live(&mut self, slot: usize) {
+        self.live_pos.push(self.order.len());
+        self.order.push(Occurrence::Live(slot));
+    }
+
     /// A side list for a map with `len` slots and no shadow yet.
     fn with_live_slots(len: usize) -> Self {
         Self {
@@ -323,6 +329,11 @@ impl<V> ObjectMapOf<V> {
 
     /// The earliest entry for `key`: the collapsed view's value when the key
     /// does not repeat, the first shadow's otherwise.
+    ///
+    /// A scan of the side list when the object has shadows, so a caller that
+    /// asks for many keys of a large object with shadows pays O(entries) per
+    /// key; the phase that needs it (yq's `+` and `pick`) measures before
+    /// adding an index.
     pub fn first_occurrence<Q>(&self, key: &Q) -> Option<&V>
     where
         Q: ?Sized + Hash + Equivalent<String>,
@@ -461,6 +472,9 @@ impl<V: Clone> ObjectMapOf<V> {
         match old {
             None => store.note_vacant_insert(slot),
             Some(old_value) => {
+                // `insert_full` dropped the incoming key for an existing one, so the
+                // shadow takes a copy of the map's. Only a repeat pays this; a
+                // key seen for the first time never reaches this arm.
                 let key = store
                     .map
                     .get_index(slot)
@@ -750,8 +764,7 @@ impl<'a, V> VacantMapEntry<'a, V> {
     pub fn insert(self, value: V) -> &'a mut V {
         let slot = self.entry.index();
         if let Some(shadows) = self.shadows.as_deref_mut() {
-            shadows.live_pos.push(shadows.order.len());
-            shadows.order.push(Occurrence::Live(slot));
+            shadows.push_live(slot);
         }
         self.entry.insert(value)
     }

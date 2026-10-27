@@ -3812,9 +3812,12 @@ impl OwnedValue {
 
     /// Convert to a mutable object reference, if possible.
     ///
-    /// A copy-on-write point (#2999): on a shared map this is where the
-    /// copy happens, attributed to this method's caller.
-    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+    /// Hands out the [`ObjectMap`] itself, not its `IndexMap` (#1344), so the
+    /// copy-on-write point (#2999) is the first mutator called on it -- not
+    /// this method, which writes nothing -- and `share-stats` attributes the
+    /// copy to that call. The mutators that keep a repeated key's earlier
+    /// entries in step are inherent methods of [`ObjectMapOf`]; a raw
+    /// `&mut IndexMap` borrow (`DerefMut`) collapses them first.
     pub fn as_object_mut(&mut self) -> Option<&mut ObjectMap> {
         match self {
             Self::Object(obj) => Some(obj),
