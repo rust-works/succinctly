@@ -4125,6 +4125,35 @@ impl<V: DocumentValue> LazySeq<V> {
             )
     }
 
+    /// The groups still to hand out, as slices of the cursors they cut, when this is a
+    /// [`LazySource::Groups`] with no `map` stage on top and nothing buffered (#5306): the
+    /// shape `group_by(f)` answers. Every node in it was validated when the groups were cut,
+    /// so a writer can render it from the document as it stands, decoding nothing.
+    pub fn plain_groups(&self) -> Option<Vec<&[V::Cursor]>> {
+        if self.instructions.is_some() || !self.pending.is_empty() {
+            return None;
+        }
+        let LazySource::Groups {
+            cursors,
+            ends,
+            next,
+        } = &self.source
+        else {
+            return None;
+        };
+        let mut start = if *next == 0 { 0 } else { ends[*next - 1] };
+        Some(
+            ends[*next..]
+                .iter()
+                .map(|&end| {
+                    let group = &cursors[start..end];
+                    start = end;
+                    group
+                })
+                .collect(),
+        )
+    }
+
     /// Run one `Instruction` against one pending item, re-dispatching to
     /// whichever `EvalSemantics` the stage was pushed with. `LazyElem::Cursor`
     /// stays inside the generic cursor evaluator — the actual win;
