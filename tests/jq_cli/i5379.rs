@@ -115,6 +115,36 @@ fn test_every_tail_position_loops_in_place_5379() -> Result<()> {
             "200000",
         ),
         (
+            "an as binding in front of the call",
+            "def f: if . < N then . as $x | $x + 1 | f else . end; 0 | f",
+            "200000",
+        ),
+        (
+            "an as binding around the condition",
+            "def f: . as $x | if $x < N then $x + 1 | f else $x end; 0 | f",
+            "200000",
+        ),
+        (
+            "two as bindings",
+            "def f: if . < N then . as $x | ($x + 1) as $y | $y | f else . end; 0 | f",
+            "200000",
+        ),
+        (
+            "an as binding of a constant",
+            "def f: if . < N then 1 as $one | . + $one | f else . end; 0 | f",
+            "200000",
+        ),
+        (
+            "an as binding that yields nothing",
+            "def f: if . < N then empty as $x | . + 1 | f else . end; [0 | f]",
+            "[]",
+        ),
+        (
+            "a comma after an as binding",
+            "def f: if . < 5 then . as $x | ., ($x + 1 | f) else . end; [0 | f]",
+            "[0,1,2,3,4,5]",
+        ),
+        (
             "a stage that selects",
             "def f: if . < N then . + 1 | select(. >= 0) | f else . end; 0 | f",
             "200000",
@@ -320,6 +350,18 @@ fn test_a_call_over_the_input_document_loops_too_5379() -> Result<()> {
             "a wrapper def",
             "0",
             "def f: if . < N then . + 1 | f else . end; def g: f; g",
+            "200000",
+        ),
+        (
+            "an as binding of the input node",
+            "0",
+            "def f: . as $x | if $x < N then $x + 1 | f else $x end; f",
+            "200000",
+        ),
+        (
+            "an as binding of a member",
+            r#"{"a":{"n":0}}"#,
+            "def f: .n as $n | if $n < N then .n = $n + 1 | f else $n end; .a | f",
             "200000",
         ),
         (

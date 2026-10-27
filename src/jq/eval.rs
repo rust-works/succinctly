@@ -98017,6 +98017,7 @@ fn tail_step<'e, 'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     body: &'e Expr,
     cur: &mut TailValue<'a, W>,
     optional: bool,
+    holds: &mut super::eval_generic::EmbedGuards,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Tail<'e> {
     let mut expr = body;
@@ -98051,6 +98052,51 @@ fn tail_step<'e, 'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Ok(None) => return Tail::Done(Flow::Exhausted),
                 Err(flow) => return Tail::Done(flow),
             },
+            // `src as $x | body`: the body is rebuilt with the one value of `src` in
+            // place of `$x`, and the walk goes on in it over the same input. A node of
+            // the document is bound as `each_as` binds it, with its origin and its
+            // entry in the embed table for the rest of the round; a value the loop
+            // built has no node, so none.
+            Expr::As {
+                expr: source,
+                var,
+                body: as_body,
+            } if S::TAG == EvalTag::Jq && stage_settles(source) => {
+                let (mut bound, origin) = match &*cur {
+                    TailValue::Owned(_) => match tail_one::<W, S>(source, cur, optional) {
+                        Ok(Some(TailValue::Owned(bound))) => (bound, None),
+                        Ok(Some(TailValue::Borrowed(node))) => match to_owned::<S, _>(&node) {
+                            Ok(bound) => (bound, None),
+                            Err(e) => return Tail::Done(Flow::Escaped(Control::Error(e))),
+                        },
+                        Ok(None) => return Tail::Done(Flow::Exhausted),
+                        Err(flow) => return Tail::Done(flow),
+                    },
+                    TailValue::Borrowed(node) => {
+                        let mut bound = None;
+                        let flow = fanout_arg_each_with_origin::<W, S, _>(
+                            source,
+                            node.clone(),
+                            optional,
+                            |value, origin| {
+                                bound = Some((value, origin));
+                                Flow::Exhausted
+                            },
+                        );
+                        match (flow, bound) {
+                            (Flow::Exhausted, Some(bound)) => bound,
+                            (Flow::Exhausted, None) => return Tail::Done(Flow::Exhausted),
+                            (flow, _) => return Tail::Done(flow),
+                        }
+                    }
+                };
+                holds.hold(super::eval_generic::embed_table_push::<S>(
+                    origin.as_ref(),
+                    &mut bound,
+                ));
+                let rebuilt = substitute_bound_var_from::<S>(source, as_body, var, &bound, origin);
+                return Tail::Bound(Rc::new(rebuilt));
+            }
             Expr::Pipe(stages) if pipe_settles_before_last(stages) => {
                 let Some((last, before)) = stages.split_last() else {
                     return Tail::Rest(expr);
@@ -98111,9 +98157,12 @@ fn each_def_tail_loop<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Ok(guard) => guard,
             Err(e) => return Flow::Escaped(Control::Error(e)),
         };
+        // What the round's `as` bindings hold, released with the round (newest
+        // first, as the embed table's guards are) before the next one starts.
+        let mut holds = super::eval_generic::EmbedGuards::default();
         let mut walked = Rc::clone(&body);
         let next = loop {
-            match tail_step::<W, S>(&walked, &mut cur, optional, sink) {
+            match tail_step::<W, S>(&walked, &mut cur, optional, &mut holds, sink) {
                 Tail::Call(next) => break next,
                 Tail::Bound(then) => walked = then,
                 Tail::Rest(rest) => return tail_each::<W, S>(rest, &cur, optional, sink),

@@ -168,12 +168,15 @@ fn assert_flat(route: &str, program: Program, measure: fn(&str) -> (i64, i64)) {
 
 #[test]
 fn a_tail_loop_holds_no_memory_per_round_5379() {
-    let shapes: [(&str, Program); 3] = [
+    let shapes: [(&str, Program); 4] = [
         ("if/pipe", |n| {
             format!("def f: if . < {n} then . + 1 | f else . end; 0 | f")
         }),
         ("through a nested def", |n| {
             format!("def f: def g: f; if . < {n} then . + 1 | g else . end; 0 | f")
+        }),
+        ("with an as binding", |n| {
+            format!("def f: if . < {n} then . as $x | $x + 1 | f else . end; 0 | f")
         }),
         ("through a wrapper", |n| {
             format!("def f: if . < {n} then . + 1 | f else . end; def g: f; 0 | g")

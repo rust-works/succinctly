@@ -1601,6 +1601,18 @@ fn a_tail_recursive_def_runs_as_a_loop_5379() {
                 "def f: def h: f; if . < 200000 then . + 1 | h else . end; f",
                 ok(&["200000"]),
             ),
+            // An `as` binding in front of the call: the body runs from the register at
+            // entry, the source from `reg.sub()`.
+            (
+                "0",
+                "def f: if . < 200000 then . as $x | ($x + 1) as $y | $y | f else . end; f",
+                ok(&["200000"]),
+            ),
+            (
+                r#"{"a":0}"#,
+                "def f: .a as $n | if $n < 200000 then .a = $n + 1 | f else $n end; [f, path(.a)]",
+                ok(&[r#"[200000,["a"]]"#]),
+            ),
             // A comma emits its front branches before the call, and a consumer that
             // stops ends the loop.
             (

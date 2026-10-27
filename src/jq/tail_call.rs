@@ -65,6 +65,9 @@ pub(crate) fn spine_has_tail_call(body: &Expr) -> bool {
     loop {
         match expr {
             Expr::Paren(inner) => expr = inner,
+            // `src as $x | body`: the call is in `body`, which keeps what follows
+            // `as` last in the body.
+            Expr::As { body, .. } => expr = body,
             Expr::DefCall { .. } => return tail_def(expr).is_some(),
             Expr::If {
                 then_branch,
@@ -102,6 +105,7 @@ pub(crate) fn declared_tail_call(then: &Expr) -> bool {
     loop {
         match expr {
             Expr::Paren(inner) => expr = inner,
+            Expr::As { body, .. } => expr = body,
             Expr::FuncCall { args, .. } => return args.is_empty(),
             Expr::DefCall { .. } => return tail_def(expr).is_some(),
             Expr::FuncDef { then, .. } => expr = then,
@@ -307,6 +311,9 @@ mod tests {
             ("def f: (. + 1 | f); f", true),
             ("def f: ., (. + 1 | f); f", true),
             ("def f: def g: f; . + 1 | g; f", true),
+            ("def f: . as $x | f; f", true),
+            ("def f: . as $x | if $x then . + 1 | f else . end; f", true),
+            ("def f: . as $x | [f]; f", false),
             // A call that is not last, or not a call, or not a jump in jq.
             ("def f: f | . + 1; f", false),
             ("def f: [f]; f", false),

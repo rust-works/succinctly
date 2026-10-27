@@ -3230,6 +3230,19 @@ impl<'e> Interp<'e> {
                         };
                         expr = if truthy(&c) { then_branch } else { else_branch };
                     }
+                    // `gen_destructure` with a plain `$var`, as `Expr::As`'s arm: the
+                    // source runs from `reg.sub()` and the body from the register at entry.
+                    Expr::As {
+                        expr: source,
+                        var,
+                        body: as_body,
+                    } if self.settles(source, &env) => {
+                        let Some((v, _)) = self.one(source, &env, input.clone(), reg.sub())? else {
+                            return Ok(());
+                        };
+                        env = env.var_ref(var, v);
+                        expr = as_body;
+                    }
                     Expr::Pipe(stages)
                         if stages.len() > 1
                             && stages[..stages.len() - 1]

@@ -16481,6 +16481,7 @@ fn tail_step_generic<'e, S: EvalSemantics, V: DocumentValue>(
     body: &'e Expr,
     cur: &mut TailValue<V>,
     optional: bool,
+    holds: &mut EmbedGuards,
     sink: &mut dyn Sink<V>,
 ) -> TailGeneric<'e> {
     let mut expr = body;
@@ -16512,6 +16513,61 @@ fn tail_step_generic<'e, S: EvalSemantics, V: DocumentValue>(
                 Ok(None) => return TailGeneric::Done(Flow::Exhausted),
                 Err(flow) => return TailGeneric::Done(flow),
             },
+            // `src as $x | body`: see `eval::tail_step`. A node is bound as
+            // `each_as_generic` binds it, decoded (a deferred bind is for a body that
+            // is evaluated where the node is, and the next round is not), with its
+            // origin, its entry in the embed table and its anchor for the round.
+            Expr::As {
+                expr: source,
+                var,
+                body: as_body,
+            } if S::TAG == EvalTag::Jq && stage_settles(source) => {
+                let (mut bound, origin) = match &*cur {
+                    TailValue::Owned(_) => match tail_one_generic::<S, V>(source, cur, optional) {
+                        Ok(Some(GenericItem::Owned(bound))) => (bound, None),
+                        Ok(Some(item)) => match owned_identity_materialize::<V, S>(item) {
+                            Ok(bound) => (bound, None),
+                            Err(control) => return TailGeneric::Done(Flow::Escaped(control)),
+                        },
+                        Ok(None) => return TailGeneric::Done(Flow::Exhausted),
+                        Err(flow) => return TailGeneric::Done(flow),
+                    },
+                    TailValue::Node(node, cursor) => {
+                        let mut bound = None;
+                        let flow = fanout_arg_each_generic_deferring::<S, V, _>(
+                            source,
+                            node.clone(),
+                            optional,
+                            *cursor,
+                            &|_, _| false,
+                            |got| {
+                                if let Bound::Value(value, origin) = got {
+                                    bound = Some((value, origin));
+                                }
+                                Flow::Exhausted
+                            },
+                        );
+                        match (flow, bound) {
+                            (Flow::Exhausted, Some(bound)) => bound,
+                            (Flow::Exhausted, None) => return TailGeneric::Done(Flow::Exhausted),
+                            (flow, _) => return TailGeneric::Done(flow),
+                        }
+                    }
+                };
+                holds.hold(embed_table_push::<S>(origin.as_ref(), &mut bound));
+                let anchor = match &*cur {
+                    TailValue::Node(_, cursor) => *cursor,
+                    TailValue::Owned(_) => None,
+                };
+                holds.hold(embed_anchor_push::<S, _>(
+                    origin.as_ref(),
+                    &bound,
+                    anchor.as_ref(),
+                    as_body,
+                ));
+                let rebuilt = substitute_bound_var_from::<S>(source, as_body, var, &bound, origin);
+                return TailGeneric::Bound(Rc::new(rebuilt));
+            }
             Expr::Pipe(stages)
                 if pipe_settles_before_last(stages) && !yq_context_pipe_applies::<S>(stages) =>
             {
@@ -16570,9 +16626,11 @@ fn each_def_tail_loop_generic<S: EvalSemantics, V: DocumentValue>(
             Ok(guard) => guard,
             Err(e) => return Flow::Escaped(Control::Error(e)),
         };
+        // What the round's `as` bindings hold, released with the round.
+        let mut holds = EmbedGuards::default();
         let mut walked = Rc::clone(&body);
         let next = loop {
-            match tail_step_generic::<S, V>(&walked, &mut cur, optional, sink) {
+            match tail_step_generic::<S, V>(&walked, &mut cur, optional, &mut holds, sink) {
                 TailGeneric::Call(next) => break next,
                 TailGeneric::Bound(then) => walked = then,
                 TailGeneric::Rest(rest) => {
