@@ -52,6 +52,15 @@ fn test_interpolation_over_a_document_matches_jq_5305() -> Result<()> {
             "[\"11\",\"21\",\"late\"]\n",
         ),
         (r#"[("\(.s[]?)" | length)]"#, "[]\n"),
+        // An earlier slot's error escapes through the slots around it, streamed and collected.
+        (
+            r#"[try "\(.s.x)-\(.b[])" catch .]"#,
+            "[\"Cannot index string with string \\\"x\\\"\"]\n",
+        ),
+        (
+            r#"[.b[] | try "\(.s.x)-\(.)" catch "c"]"#,
+            "[\"c\",\"c\"]\n",
+        ),
         // The collected and object-value forms, and the per-element builtins that take them.
         (r#"[.a[] | {k: "\(.)"}]"#, "[{\"k\":\"1\"},{\"k\":\"2\"}]\n"),
         (r#".a | map("<\(.)>")"#, "[\"<1>\",\"<2>\"]\n"),
