@@ -217,3 +217,16 @@ fn test_group_by_counts_nesting_from_the_array_5306() -> Result<()> {
     assert_eq!((stdout.as_str(), code), ("1\n", 0), "{stderr}");
     Ok(())
 }
+
+/// A stray comma with no element (`[,]`) is the one malformed array no element walk can see, so
+/// `group_by` checks the array itself before it collects the cursors, and raises the strict
+/// validator's error as `.` does -- uncatchable, so `try` and `?` do not hide it.
+#[test]
+fn test_group_by_empty_array_with_a_stray_comma_raises_5306() -> Result<()> {
+    for filter in ["group_by(.a)", "group_by(.a)?", "try group_by(.a) catch ."] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("[,]"))?;
+        assert_eq!((stdout.as_str(), code), ("", 5), "`{filter}`: {stderr}");
+        assert!(stderr.contains("Invalid JSON text"), "`{filter}`: {stderr}");
+    }
+    Ok(())
+}

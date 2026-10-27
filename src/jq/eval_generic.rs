@@ -52746,6 +52746,36 @@ mod tests {
         );
     }
 
+    /// #5306: an alias-bearing YAML sequence keeps `group_by` on the bridge, as `sort_by` does
+    /// (#1687): reordering its nodes could leave an alias ahead of its anchor, so the groups are
+    /// built from the decoded values and no `Groups` source is answered.
+    #[test]
+    fn test_group_by_over_an_alias_bearing_sequence_takes_the_bridge_5306() {
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"- &x {a: 2}
+- {a: 1}
+- *x
+";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index
+            .root(yaml)
+            .first_child()
+            .expect("YAML document should have content");
+        let expr = parse("group_by(.a)").unwrap();
+        let result = eval_with_cursor_using::<JqSemantics, _>(&expr, root);
+        assert!(
+            !matches!(&result, GenericResult::LazySeq(seq) if seq.plain_groups().is_some()),
+            "an alias keeps the groups off the cursors: {result:?}"
+        );
+        let built = match result {
+            GenericResult::Owned(value) => value,
+            GenericResult::LazySeq(seq) => seq.materialize_atomic::<JqSemantics>().unwrap(),
+            other => panic!("unexpected result {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#5306)"
+        };
+        assert_eq!(built.to_json(), r#"[[{"a":1}],[{"a":2},{"a":2}]]"#);
+    }
+
     /// #3856: a sequence with no stage and a source that is neither a cursor
     /// list nor a mixed list (a `map` source whose `map` was never pushed)
     /// still reads through the iterator, both when built and when a stage
