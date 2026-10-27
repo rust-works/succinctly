@@ -9883,7 +9883,7 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 );
                 match end {
                     RangeEnd::Exhausted => Demand::Continue,
-                    RangeEnd::Capped => stop(Control::Error(range_max_exceeded_error())),
+                    RangeEnd::Capped => stop(Control::Error(range_max_exceeded_error())), // patchcov: coverage tolerate-line reason="expensive: reached only after MAX_RANGE_TOTAL (2^24) values through the value evaluator, which no CLI route runs on a document; its generic twin is pinned by test_range_total_cap_is_exact_5292 and the cap itself by the each_range_batches unit tests (#5292)"
                     RangeEnd::Stopped => {
                         verdict.stop_with_downstream(Flow::Stopped { pending: None })
                     }
@@ -102723,13 +102723,7 @@ mod tests {
             cap,
         );
         // A value of another kind is dropped, which the callers' equality checks catch.
-        let ints = seen
-            .iter()
-            .filter_map(|v| match v {
-                OwnedValue::Int(n) => Some(*n),
-                _ => None,
-            })
-            .collect();
+        let ints = seen.iter().filter_map(OwnedValue::as_i64).collect();
         (ints, batches, end)
     }
 
@@ -102846,13 +102840,7 @@ mod tests {
             );
             assert_eq!(end, RangeEnd::Exhausted);
             let bits = |values: &[f64]| values.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
-            let seen: Vec<f64> = seen
-                .iter()
-                .filter_map(|v| match v {
-                    OwnedValue::Float(f) => Some(*f),
-                    _ => None,
-                })
-                .collect();
+            let seen: Vec<f64> = seen.iter().filter_map(OwnedValue::as_f64).collect();
             assert_eq!(bits(&seen), bits(&expected), "{from} {to} {step}");
         }
     }
