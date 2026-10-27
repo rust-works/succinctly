@@ -27306,17 +27306,19 @@ fn test_wide_recursive_string_interpolation_reports_cleanly_not_stack_overflow_2
 /// evaluator's arm covers.
 ///
 /// Real jq survives none of these: `isempty`/`first` over `def f: [f]; f` die
-/// with `cannot allocate memory` (exit 134) and `path(def f: f; f)` never
-/// terminates at all (confirmed live, killed at timeout). Erroring is the
-/// deliberate divergence ADR-0018 permits; what this pins is that it stays an
-/// *error* on all three routes rather than an abort on any of them.
+/// with `cannot allocate memory` (exit 134), and the same recursion under
+/// `path()` does not terminate either. (`def f: f; f` is a tail call, which jq
+/// loops on forever and succinctly stops at its round budget since #5379, so
+/// these rows nest it.) Erroring is the deliberate divergence ADR-0018
+/// permits; what this pins is that it stays an *error* on all three routes
+/// rather than an abort on any of them.
 #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_recursion_guard_reaches_lazy_and_path_evaluators_1371() -> Result<()> {
     for filter in [
         "isempty(def f: [f]; f)",
         "first(def f: [f]; f)",
-        "path(def f: f; f)",
+        "path(def f: [f]; f)",
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-cn", filter], None)?;
         assert_eq!(code, 5, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
@@ -27453,17 +27455,18 @@ cover(3)
 /// the path-context pipeline, the two evaluators whose `DefCall` arms are
 /// separate from both the plain and the demand-driven one.
 ///
-/// Real jq hangs indefinitely on all three (confirmed live, killed at
-/// timeout), so there is no oracle output to match here -- what is pinned is
-/// that the guard is reachable from these routes at all, rather than the
-/// recursion running until the native stack gives out.
+/// Real jq hangs indefinitely on the tail-call spelling of all three (`def f: f;
+/// ...`, confirmed live, killed at timeout), and succinctly now loops it up to the round
+/// budget (#5379), so the rows nest the call. There is no oracle output to match
+/// here -- what is pinned is that the guard is reachable from these routes at all,
+/// rather than the recursion running until the native stack gives out.
 #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_recursion_guard_reaches_path_routes_1371() -> Result<()> {
     for filter in [
-        "def f: f; path(f)",
-        "def f: f; path(.a | f)",
-        "def f: f; .a | f | key",
+        "def f: [f]; path(f)",
+        "def f: [f]; path(.a | f)",
+        "def f: [f]; .a | f | key",
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1}}"#))?;
         assert_eq!(code, 5, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");

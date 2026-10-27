@@ -365,3 +365,38 @@ fn test_a_tail_loop_that_never_ends_hits_the_round_budget_5379() -> Result<()> {
     );
     Ok(())
 }
+
+/// A program with a dynamic path target runs on the path-mode interpreter, which keeps jq's path
+/// register; the loop carries it from stage to stage. Answers captured from jq 1.7.1.
+#[test]
+fn test_a_program_that_reads_a_path_loops_too_5379() -> Result<()> {
+    for (label, doc, body, want) in [
+        (
+            "a path read after the loop",
+            r#"{"a":0}"#,
+            "def f: if . < N then . + 1 | f else . end; [(.a | f), path(.a)]",
+            r#"[200000,["a"]]"#,
+        ),
+        (
+            "a path through the loop",
+            r#"{"a":{"a":{"a":0}}}"#,
+            r#"def f: if type == "object" then .a | f else . end; [path(f)]"#,
+            r#"[["a","a","a"]]"#,
+        ),
+        (
+            "an update before the call",
+            "[0]",
+            "def f: if (.[0] // 0) < N then .[0] += 1 | f else .[0] end; [f, path(.[0])]",
+            "[200000,[0]]",
+        ),
+    ] {
+        let filter = body.replace('N', &DEEP.to_string());
+        let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some(doc))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (want, 0),
+            "[{label}] `{filter}` over {doc} -- {stderr:?}"
+        );
+    }
+    Ok(())
+}
