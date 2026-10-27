@@ -57,7 +57,7 @@ use super::expr::{
 };
 use super::parser::parse;
 use super::resolve::ModuleRun;
-use super::tail_call::declared_tail_call;
+use super::tail_call::{declared_tail_call, stage_settles};
 use super::value::{
     jv_identical, ArrayVec, NumberRepr, OwnedValue, SharableLiteral, SharableString,
 };
@@ -476,8 +476,10 @@ impl<'e> Env<'e> {
     }
 }
 
-/// The visits one tail-loop question to [`Interp::single`] may make (#5379): the
-/// shipped evaluator's `SETTLE_ANALYSIS_BUDGET` for the same question.
+/// The visits one tail-loop question to [`Interp::single`] may make (#5379), and so how
+/// far into the bodies of the defs a stage calls it follows. Small on purpose: a chain of
+/// defs that each call the one below it several times is one visit per path through it,
+/// and the question is asked every round.
 const SETTLE_FUEL: u32 = 64;
 
 const T_VAR: &str = "__sp_t";
@@ -2418,7 +2420,10 @@ impl<'e> Interp<'e> {
         }
         single.set(Some(false));
         let known = self.single(body, env);
-        single.set(Some(known));
+        // An answer worked out inside a bounded tail-loop question ([`Self::single_fuel`])
+        // may be a no only because the fuel ran out, which a later read with the whole
+        // budget would not give: it is not remembered.
+        single.set(self.single_fuel.get().is_none().then_some(known));
         known
     }
 
@@ -3201,16 +3206,17 @@ impl<'e> Interp<'e> {
     ) -> R {
         let mut callee = callee;
         let mut rounds = MAX_LOOP_ROUNDS;
+        // The def the loop started at, which a refusal is named for.
+        let entry = match &callee {
+            Callee::Def { name, .. } => *name,
+            Callee::Arg { .. } => "",
+        };
         loop {
             let _depth = self.enter_call(&callee)?;
-            let Callee::Def {
-                name, body, env, ..
-            } = &callee
-            else {
+            let Callee::Def { body, env, .. } = &callee else {
                 return Err(unsupported("a tail loop over a closure parameter"));
                 // patchcov: coverage tolerate-line reason="unreachable: call_with starts a loop for a Callee::Def only, and a round continues with one"
             };
-            let name = *name;
             let mut env = env.clone();
             let mut expr: &'e Expr = body;
             let next = loop {
@@ -3288,7 +3294,7 @@ impl<'e> Interp<'e> {
             rounds = rounds.checked_sub(1).ok_or_else(|| {
                 Raise::Fatal(EvalError::resource_limit(format!(
                     "{}/0 exceeded maximum recursion depth",
-                    ModuleRun::display_name(name.strip_prefix("_sp_").unwrap_or(name))
+                    ModuleRun::display_name(entry.strip_prefix("_sp_").unwrap_or(entry))
                 )))
             })?;
             callee = next;
@@ -3304,6 +3310,12 @@ impl<'e> Interp<'e> {
     /// round: a stage that calls a def with a large body, or a chain of them, is not
     /// settled, which only keeps the nested path.
     fn settles(&self, expr: &'e Expr, env: &Env<'e>) -> bool {
+        // The shipped evaluators' question first: it knows the builtins and
+        // operators a loop that keeps its state in the value writes, and the
+        // route a program takes does not change what a loop does.
+        if stage_settles(expr) {
+            return true;
+        }
         let before = self.single_fuel.replace(Some(SETTLE_FUEL));
         let settled = self.settles_within(expr, env);
         self.single_fuel.set(before);
