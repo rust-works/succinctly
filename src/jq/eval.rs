@@ -86671,12 +86671,16 @@ fn is_comma_group(expr: &Expr) -> bool {
 /// keep its creation and lose its delete, which this does not model, so the stop is not applied to a
 /// group holding one (the group then behaves as it did before #1325).
 fn yq_del_stop_leaf<S: EvalSemantics>(leaves: &[&Expr], root: &OwnedValue) -> Option<usize> {
-    let stop = leaves
+    // Once per leaf: a computed bound is evaluated to decide this.
+    let runs: Vec<bool> = leaves
         .iter()
-        .rposition(|l| is_bare_root_slice_run::<S>(l, root))?;
+        .map(|l| is_bare_root_slice_run::<S>(l, root))
+        .collect();
+    let stop = runs.iter().rposition(|&run| run)?;
     leaves[..stop]
         .iter()
-        .all(|leaf| del_leaf_only_deletes(leaf, root) || is_bare_root_slice_run::<S>(leaf, root))
+        .zip(&runs)
+        .all(|(leaf, &run)| run || del_leaf_only_deletes(leaf, root))
         .then_some(stop)
 }
 
