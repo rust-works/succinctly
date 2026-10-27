@@ -25424,17 +25424,31 @@ fn unicode_posix_class(name: &str) -> Option<&'static str> {
     })
 }
 
+/// What Oniguruma's `\w` matches, as a class body (#5373): its Unicode `word` (alphabetic,
+/// marks, decimal digits, connector punctuation) plus U+00B2, U+00B3, U+00B9 and U+00BC-U+00BE,
+/// which its ISO-8859-1 table for code points below 256 counts as word characters. The `regex`
+/// crate's `\w` has those six missing and U+200C/U+200D (`Join_Control`) extra. Only outside a
+/// class: inside `[...]` jq's `\w` is the plain Unicode word, without the six.
+#[cfg(feature = "regex")]
+const JQ_WORD_CLASS: &str = r"\p{Alphabetic}\p{M}\p{Nd}\p{Pc}\x{B2}\x{B3}\x{B9}\x{BC}-\x{BE}";
+
+/// The same inside a character class (`[\w-]`, `[^\W]`), where Oniguruma does not apply the
+/// Latin-1 table: the six characters are not in it (#5373).
+#[cfg(feature = "regex")]
+const JQ_WORD_CLASS_IN_CLASS: &str = r"\p{Alphabetic}\p{M}\p{Nd}\p{Pc}";
+
 /// Rewrite the character classes of a jq pattern to what Oniguruma's Perl syntax means by them
 /// (#5367): the POSIX brackets (`[:alpha:]`, `[:^alpha:]`) inside a class become nested Unicode
-/// classes, and a `[`, `&` or `~` inside a class is the literal character. Oniguruma's are Unicode-aware, so `"é" | test("[[:alpha:]]")` is
-/// `true` in jq; the `regex` crate's are ASCII, so it was `false`. Outside a class a `[:alpha:]` is
-/// an ordinary class of those characters in both engines and is not touched, nor is an escaped
-/// bracket. A bracket-shaped `[:word:]` (lowercase letters, optionally led by `^`) whose name is not
+/// classes, and a `[`, `&` or `~` inside a class is the literal character. Oniguruma's are
+/// Unicode-aware, so `"é" | test("[[:alpha:]]")` is `true` in jq; the `regex` crate's are ASCII, so
+/// it was `false`. `\w` and `\W` become jq's own word class ([`JQ_WORD_CLASS`], #5373). Outside a
+/// class a `[:alpha:]` is an ordinary class of those characters in both engines and is not touched,
+/// nor is an escaped bracket. A bracket-shaped `[:word:]` (lowercase letters, optionally led by `^`) whose name is not
 /// a POSIX class is an error, as in jq (`invalid POSIX bracket type`); `ascii` and `xdigit` are
 /// ASCII in both engines and are left to the crate.
 #[cfg(feature = "regex")]
 fn translate_posix_brackets(pattern: &str) -> Result<std::borrow::Cow<'_, str>, EvalError> {
-    if !pattern.contains('[') {
+    if !pattern.contains('[') && !pattern.contains("\\w") && !pattern.contains("\\W") {
         return Ok(std::borrow::Cow::Borrowed(pattern));
     }
     let chars: Vec<char> = pattern.chars().collect();
@@ -25448,6 +25462,26 @@ fn translate_posix_brackets(pattern: &str) -> Result<std::borrow::Cow<'_, str>, 
     while i < chars.len() {
         let c = chars[i];
         if c == '\\' {
+            // #5373: jq's `\w` is its POSIX `word` plus six Latin-1 characters and without the
+            // two joiners the `regex` crate's `\w` adds. Always a bracketed class, so that a
+            // following `-` in `[\w-.]` is a literal and not the end of a range (jq refuses a range
+            // from `\w` as an error, which this accepts).
+            if let Some(&w @ ('w' | 'W')) = chars.get(i + 1) {
+                out.push('[');
+                if w == 'W' {
+                    out.push('^');
+                }
+                out.push_str(if depth == 0 {
+                    JQ_WORD_CLASS
+                } else {
+                    JQ_WORD_CLASS_IN_CLASS
+                });
+                out.push(']');
+                changed = true;
+                at_start = false;
+                i += 2;
+                continue;
+            }
             out.push(c);
             if let Some(&next) = chars.get(i + 1) {
                 out.push(next);
