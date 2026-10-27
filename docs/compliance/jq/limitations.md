@@ -522,7 +522,7 @@ The interpreter's own recorded divergences:
 - **A write to an unshared slice view.** jq's `jvp_array_write` writes a slice in place when nothing else holds it, so the slice keeps its offset into the original buffer.
   The interpreter's write builds a new array at offset 0.
   The difference is observable only through jq's 65,536-element slice-copy rule: `[range(70003)] | .[60000:] | .[0] = 0 | del(.[6000:] as $x | .[6000:] | $x) | length` is `6000` here and an `Invalid path expression` in jq, whose second slice reaches offset 66,000 and is copied (`test_5118_a_written_view_answers_where_jq_refuses_5223`).
-- **A walk jq never finishes raises the existing caps.** `null | [path(recurse(.a))] | length` and `path(recurse(.a?; true))` on `{"a":null}` never return in jq; they raise `recurse: maximum nodes exceeded` here after 10,000 nodes, as the value walker does (the shipped path walker pruned a `null` node's children and answered `1`, #856).
+- **A walk jq never finishes raises the existing caps.** `null | [path(recurse(.a))] | length` and `path(recurse(.a?; true))` on `{"a":null}` never return in jq; they raise `recurse: maximum nodes exceeded` here after 2^20 nodes (fewer for a path, which costs more of the cap the longer it is, see "`recurse(f)` raises at 2^20 nodes" below), as the value walker does (the shipped path walker pruned a `null` node's children and answered `1`, #856).
   `until`/`while`, `range` (at `MAX_RANGE_TOTAL`) and `repeat` keep their caps the same way (see the sections on each below).
 - **`del(.[nan])`** loops forever in jq 1.7.1 on an array; here the NaN path names no element and the document comes back unchanged.
   `path(.[nan])` is jq's `[null]`.
@@ -1234,9 +1234,9 @@ retry's child is fine), was the abandoned alternative's `E`. The value and path 
   needed no change. No row here runs queued: it starts only in a walk deeper than the native
   budget.
 
-## `recurse(f)` raises at 10,000 nodes unless `f` descends the tree (#3703, #3716, #3737, #3867)
+## `recurse(f)` raises at 2^20 nodes unless `f` descends the tree (#3703, #3716, #3737, #3867, #5378)
 
-`recurse(f)` and `recurse(f; cond)` deliver at most `RECURSE_MAX_ITEMS` (10,000) nodes, in the value
+`recurse(f)` and `recurse(f; cond)` deliver at most `RECURSE_MAX_ITEMS` (2^20, 1,048,576) nodes, in the value
 walker and in the path walker behind `path(recurse(f))`, `del`, `|=` and `pick` over it. A walk that
 reaches the cap with a node still to visit **raises** `recurse: maximum nodes exceeded`
 (`ErrorKind::ResourceLimit`, exit 5, uncatchable by `?`/`try`/`catch`/`?//` like every cap in this
@@ -1245,12 +1245,26 @@ cap exists: an unbounded `f` (`null | recurse(.a)` yields `null` forever in jq, 
 consumer here would grow until memory ran out) cannot be told from a long one by looking at it.
 Before #3716 the cap ended the walk as though it had finished: **silently, with exit 0**, so a finite
 walk over a larger document answered short and a write through it stopped at the same node.
+Until #5378 the cap was 10,000, which refused an ordinary computed loop (`0 | [recurse(if . < 300000 then . + 1 else empty end)] | length`, 300001 in jq).
 
-The nodes delivered before the cap stay delivered, as with `range`: a streamed consumer prints 10,000
+**A node pays for its size.**
+A node of a capped `recurse` walk costs `1 + size / 64` of the cap.
+`size` is the node's length in units: a path key (in path position), a byte of a string, an element of an array, a field of an object.
+A node under 64 units costs exactly one, so ordinary data is counted node for node.
+`null | [path(recurse(.a))]` (a path as long as the walk is deep), `"" | [recurse(. + "x")]` and `[] | [recurse(. + [1])]` each hold about 2^26 units when the cap raises, not the 2^39 that counting nodes alone would allow.
+Measured on an Apple M4 Pro debug build, the peak of `[] | [recurse(. + [1])] | length` is 3.3 GB (2.5 GB at the 10,000-node cap) and of `null | [path(recurse(.a))] | length` 2.3 GB (1.7 GB), each raising the cap's error in under 6 s.
+`path(recurse(.a?; true))` on `{"a":null}` delivers 11,554 paths and then raises, about the 10,000 it delivered before #5378.
+The measure is shallow: a node that shares its children (`recurse([.])`) costs one, and an object of 1 KB of small fields costs one, so `[recurse(f)]` over an `f` that makes such objects still holds about 1 GB at 2^20 nodes.
+A cap that measured a node's bytes exactly would need a deep size the walkers do not have.
+
+**The value walker and the path walker can disagree on a deep document.**
+A path costs a node its depth, which a value does not, so past 63 levels `[path(recurse(f))]`, `del`, `|=` and `pick` reach the cap at fewer nodes than `[recurse(f)]` does over the same document (a document is at most 384 levels deep).
+Both stay exact for a document under 64 levels.
+The nodes delivered before the cap stay delivered, as with `range`: a streamed consumer prints 2^20
 outputs and then the error, a collecting one (`[recurse(f)]`, `length`) raises instead of answering, and
 a write through the walk (`|=`, `=`, `del`, `pick`) raises instead of finishing partially. A consumer
-that stops first never meets it (`first`, `limit(10000; ...)`, `isempty`, `nth(9999; ...)`), and the
-boundary is exact: a 10,000-node document answers, a 10,001-node one raises, because the cap fires only
+that stops first never meets it (`first`, `limit(1048576; ...)`, `isempty`, `nth(1048575; ...)`), and the
+boundary is exact: a walk whose nodes cost 2^20 in all answers, one that costs 2^20 + 1 raises, because the cap fires only
 when a node remains. It replaces a deferred `f`/`cond` error rather than the other way round, since the
 cap is the error the walk's size decided. Both evaluators and both modes share the one walker (yq's
 `recurse` is a succinctly extension behind `--jq-extensions`, real yq's lexer rejects it).
@@ -1313,9 +1327,9 @@ that depends only on `f`: `.[]?`, `.[]`, or a chain of `.field`, `.[n]` and `.[]
 output (unrelated nodes have disjoint subtrees; an ancestor's outputs sit at a different depth from a
 descendant's), so such a walk visits a node more than once only after a `cond` gives one child a **second
 truthy verdict**, which `select` re-emits once per output. The walk starts with no cap and the cap comes
-back (10,000, counting the nodes already delivered) the moment a `cond` does that, so a forking walk is
+back (2^20, counting the nodes already delivered) the moment a `cond` does that, so a forking walk is
 refused and everything else is answered. The fork is seen at a child's *second* truthy verdict, after the
-first verdict's subtree was walked, so a walk can deliver more than 10,000 nodes (a streamed consumer prints
+first verdict's subtree was walked, so a walk can deliver more than 2^20 nodes (a streamed consumer prints
 them, bounded by the document) before it raises at the next node. `.[]` without the `?` raises its own
 `Cannot iterate over ...` at a scalar, as before; only the cap changed. `yields_at_most_one_value` still
 decides which walks take the fast `walk_descendants_gated`; every other tree-descending walk runs

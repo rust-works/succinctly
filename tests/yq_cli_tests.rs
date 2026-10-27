@@ -545,8 +545,8 @@ fn test_yq_path_f_lone_leaf_resolution_answers_what_it_did_4155() -> Result<()> 
 /// finite document silently short. yq reports it as `Error: ...`, exit 1.
 #[test]
 fn test_yq_recurse_cap_raises_instead_of_ending_silently_3716() -> Result<()> {
-    // 6,000 one-element sequences: 12,001 nodes, past the cap.
-    let doc = "- - 1\n".repeat(6000);
+    // 524,289 one-element sequences: 1,048,579 nodes, past the cap (2^20).
+    let doc = "- - 1\n".repeat(524_289);
     let args = ["--jq-extensions", "-o=json", "-I=0"];
     // `f` is spelled `.[]? | .`: a `cond` that cannot fork over bare `.[]?` is
     // uncapped since #3737 (`test_yq_recurse_gated_cond_has_no_node_cap_3737`).
@@ -566,7 +566,7 @@ fn test_yq_recurse_cap_raises_instead_of_ending_silently_3716() -> Result<()> {
     // A bare `.[]?` is uncapped (#3703), and a consumer that stops first never
     // meets the cap.
     for (filter, want) in [
-        ("[recurse(.[]?)] | length", "12001\n"),
+        ("[recurse(.[]?)] | length", "1048579\n"),
         ("[limit(3; recurse(.[]? | .; true))] | length", "3\n"),
     ] {
         let (stdout, code) = run_yq_stdin(filter, &doc, &args)?;
@@ -1026,8 +1026,11 @@ fn test_yq_recurse_gated_cond_has_no_node_cap_3737() -> Result<()> {
         let (stdout, code) = run_yq_stdin(filter, &doc, &args)?;
         assert_eq!((stdout.as_str(), code), (want, 0), "`{filter}`");
     }
+    // ... and it raises once the walk is past the cap (2^20), which the document
+    // above, 12,001 nodes, is not.
+    let big = "- - 1\n".repeat(524_289);
     let (stdout, stderr, code) =
-        run_yq_stdin_with_stderr("[recurse(.[]?; (true, true))] | length", &doc, &args)?;
+        run_yq_stdin_with_stderr("[recurse(.[]?; (true, true))] | length", &big, &args)?;
     assert_eq!((stdout.as_str(), code), ("", 1), "{stderr:?}");
     assert!(
         stderr.contains("recurse: maximum nodes exceeded"),
