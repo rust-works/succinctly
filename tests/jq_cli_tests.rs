@@ -102126,12 +102126,12 @@ fn test_resource_limit_caps_are_uncatchable_2132() -> Result<()> {
         ),
         (
             "MAX_EVAL_FRAMES",
-            "def f: f; f",
+            "def f: [f]; f",
             "f/0 exceeded maximum recursion depth",
         ),
         (
             "MAX_EVAL_FRAMES, generator",
-            "def f: 1, f; f",
+            "def f: 1, [f]; f",
             "f/0 exceeded maximum recursion depth",
         ),
         // #3261: MAX_VALUE_TREE_DEPTH, reached via reduce/foreach's own
@@ -102274,7 +102274,7 @@ fn test_resource_limit_is_not_a_destructuring_retry_2132() -> Result<()> {
         (
             "eager ?//, recursion",
             "1",
-            "[. as $x ?// $y | if $x != null then (def f: f; f) else 1 end]",
+            "[. as $x ?// $y | if $x != null then (def f: [f]; f) else 1 end]",
             "f/0 exceeded maximum recursion depth",
         ),
         (

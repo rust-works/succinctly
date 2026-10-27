@@ -59081,7 +59081,7 @@ mod issue_2091_def_and_binder_wrapped_writes {
     /// evaluation ever started.
     #[test]
     fn test_yaml_self_recursive_def_gate_terminates_2091() -> Result<()> {
-        let (_output, _stderr, code) = run_yq_stdin_with_stderr("def f: f; f", DOC, &[])?;
+        let (_output, _stderr, code) = run_yq_stdin_with_stderr("def f: [f]; f", DOC, &[])?;
         // The evaluator's own recursion limit reports the error; the point is
         // that we get here at all rather than hanging in the gate.
         assert_eq!(code, 1);
@@ -59492,11 +59492,11 @@ fn test_resource_limit_caps_are_uncatchable_in_yq_mode_2132() -> Result<()> {
             "until: maximum iterations exceeded",
         ),
         (
-            "def f: f; try f catch \"caught\"",
+            "def f: [f]; try f catch \"caught\"",
             "f/0 exceeded maximum recursion depth",
         ),
         (
-            "def f: f; [f?] | length",
+            "def f: [f]; [f?] | length",
             "f/0 exceeded maximum recursion depth",
         ),
     ] {

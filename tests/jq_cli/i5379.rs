@@ -95,6 +95,26 @@ fn test_every_tail_position_loops_in_place_5379() -> Result<()> {
             "111111",
         ),
         (
+            "an assignment before the call",
+            "def f: if .n < N then .n += 1 | f else .n end; {\"n\":0} | f",
+            "200000",
+        ),
+        (
+            "an update before the call",
+            "def f: if .a < N then .a |= . + 1 | f else .a end; {\"a\":0} | f",
+            "200000",
+        ),
+        (
+            "an array built before the call",
+            "def f: if . < N then [., 1] | add | f else . end; 0 | f",
+            "200000",
+        ),
+        (
+            "a map before the call",
+            "def f: if (.[0] // 0) < N then map(. + 1) | f else .[0] end; [0] | f",
+            "200000",
+        ),
+        (
             "a stage that selects",
             "def f: if . < N then . + 1 | select(. >= 0) | f else . end; 0 | f",
             "200000",
@@ -257,5 +277,91 @@ fn test_a_call_that_is_not_a_tail_call_still_hits_the_guard_5379() -> Result<()>
             "[{label}] `{filter}` -- {stderr:?}"
         );
     }
+    Ok(())
+}
+
+/// The same loop over a document: a call whose input is a node of the input goes through the
+/// document evaluator, not the one above, and carries the node, then a built value, between rounds.
+/// Answers captured from jq 1.7.1.
+#[test]
+fn test_a_call_over_the_input_document_loops_too_5379() -> Result<()> {
+    for (label, doc, body, want) in [
+        (
+            "the input itself",
+            "0",
+            "def f: if . < N then . + 1 | f else . end; f",
+            "200000",
+        ),
+        (
+            "a member",
+            r#"{"a":{"b":0}}"#,
+            "def f: if . < N then . + 1 | f else . end; .a.b | f",
+            "200000",
+        ),
+        (
+            "one loop per element",
+            "[0,1,2]",
+            "def f: if . < 100000 then . + 1 | f else . end; [.[] | f]",
+            "[100000,100000,100000]",
+        ),
+        (
+            "a member read each round",
+            r#"{"a":[1,2,3]}"#,
+            "def f: if (.a | length) < 3 then . else .a |= .[1:] | f end; f | .a",
+            "[2,3]",
+        ),
+        (
+            "a member consumed each round",
+            r#"{"n":0}"#,
+            "def f: if .n < N then .n += 1 | f else .n end; f",
+            "200000",
+        ),
+        (
+            "a wrapper def",
+            "0",
+            "def f: if . < N then . + 1 | f else . end; def g: f; g",
+            "200000",
+        ),
+        (
+            "mutual recursion through a nested def",
+            "0",
+            "def a: def b: . + 1 | a; if . < N then . + 1 | b else . end; a",
+            "200000",
+        ),
+        (
+            "limit over a generator",
+            "0",
+            "[limit(100000; def f: ., (.+1|f); f)] | length",
+            "100000",
+        ),
+        (
+            "an error at depth, caught",
+            "0",
+            r#"def f: if . < N then . + 1 | f else error("boom") end; try f catch ."#,
+            r#""boom""#,
+        ),
+    ] {
+        let filter = body.replace('N', &DEEP.to_string());
+        let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some(doc))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (want, 0),
+            "[{label}] `{filter}` over {doc} -- {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A tail loop that never ends is stopped by the round budget (`MAX_LOOP_ROUNDS`, the bound
+/// `until` and `while` keep for a loop that steps in place) with the refusal the nested form
+/// raised. jq spins on `def f: f; f`, in 2 MB, until it is killed. Uncatchable, like that refusal.
+#[test]
+fn test_a_tail_loop_that_never_ends_hits_the_round_budget_5379() -> Result<()> {
+    let (stdout, stderr, code) = run(r#"[try (def f: f; f) catch "caught"]"#)?;
+    assert_eq!((stdout.as_str(), code), ("", 5), "{stderr:?}");
+    assert!(
+        stderr.contains("f/0 exceeded maximum recursion depth"),
+        "{stderr:?}"
+    );
     Ok(())
 }
