@@ -135,6 +135,9 @@ fn test_interpolation_raises_when_a_slot_reads_the_malformed_field_5305() -> Res
     for filter in [
         r#""\(.bad)""#,
         r#"["\(.bad)"]"#,
+        // Behind a slot that yields: the error escapes the recursion around it.
+        r#""\(.bad)-\(.name)""#,
+        r#"["\(.bad)-\(.name)"]"#,
         r#""\(.)""#,
         r#".. | "\(.)""#,
     ] {
