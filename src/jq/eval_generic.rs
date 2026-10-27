@@ -4126,7 +4126,7 @@ impl<V: DocumentValue> LazySeq<V> {
     }
 
     /// The groups still to hand out, as slices of the cursors they cut, when this is a
-    /// [`LazySource::Groups`] with no `map` stage on top and nothing buffered (#5306): the
+    /// `LazySource::Groups` with no `map` stage on top and nothing buffered (#5306): the
     /// shape `group_by(f)` answers. Every node in it was validated when the groups were cut,
     /// so a writer can render it from the document as it stands, decoding nothing.
     pub fn plain_groups(&self) -> Option<Vec<&[V::Cursor]>> {
