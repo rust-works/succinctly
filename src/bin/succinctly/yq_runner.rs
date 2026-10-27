@@ -3434,10 +3434,20 @@ fn reconcile_presentation_at_depth(
             let rewrites_the_document = depth == 0 && !targets.is_empty();
             let container_result =
                 matches!(result_value, OwnedValue::Object(_) | OwnedValue::Array(_));
+            // A node's own same-line comment stays on its line while the new value fits
+            // there: a scalar, or an empty `{}` / `[]` (#5258). A non-empty block
+            // container breaks the line, and yq then parks the comment on the next
+            // line, which succinctly drops (docs/compliance/yq/limitations.md).
+            let fits_on_the_line = match result_value {
+                OwnedValue::Object(fields) => fields.is_empty(),
+                OwnedValue::Array(items) => items.is_empty(),
+                _ => true,
+            };
             kind_changed_leaf(
                 pristine_tree,
                 targets,
                 rewrites_the_document.then_some(container_result),
+                fits_on_the_line,
             )
         }
         // Both scalars, any variant/value: same node, only its value
@@ -3485,6 +3495,9 @@ fn kind_changed_leaf(
     // `Some(container)` at the root of a document a write has rewritten, `container` being whether
     // the new root is a mapping or sequence (#4997).
     rewritten_document: Option<bool>,
+    // The new value fits on the node's own line (a scalar or an empty `{}` / `[]`), so the
+    // node's same-line comment stays beside it (#5258).
+    keeps_line_comment: bool,
 ) -> CommentTree {
     let is_write_target = targets.iter().any(|(steps, ..)| steps.is_empty());
     let anchor = match &pristine_tree.meta().anchor {
@@ -3493,9 +3506,12 @@ fn kind_changed_leaf(
         _ => None,
     };
     let tag = pristine_tree.meta().tag().filter(|tag| is_custom_tag(tag));
-    let meta = NodeMeta::empty_with_anchor(anchor)
+    let mut meta = NodeMeta::empty_with_anchor(anchor)
         .with_tag(tag.map(str::to_string))
         .with_preamble(pristine_tree.meta().preamble().map(str::to_string));
+    if keeps_line_comment && rewritten_document.is_none() {
+        meta.comment.clone_from(&pristine_tree.meta().comment);
+    }
     // The comments around a document stay around whatever it is rewritten to: `# c` / `null`
     // written `.a = 1` is `# c` / `a: 1`, and so is a comment-only file. The head always; the
     // foot with a container, which prints it (a scalar root does not).
