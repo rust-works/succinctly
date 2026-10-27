@@ -81,6 +81,14 @@ fn test_5340_strptime_unset_fields_are_the_zeroed_tm() -> Result<()> {
             "invalid gmtime representation",
             5,
         ),
+        // `fromdate` runs the same parser over a fixed format, so a partial date never reaches the defaults.
+        (
+            "null",
+            r#""2015-03" | fromdate"#,
+            "",
+            r#"date "2015-03" does not match format "%Y-%m-%dT%H:%M:%SZ""#,
+            5,
+        ),
         // A format that sets every field is unchanged.
         (
             "null",
