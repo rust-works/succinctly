@@ -24709,8 +24709,14 @@ fn builtin_upper_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `builtin_tostring`'s identical reasoning -- no principled exemption
     // documented anywhere for this sibling either.
     let current = to_owned_or_suppress!(&value, optional);
+    // #5306: `.[]` over an array already held as a value is its elements. Running it through
+    // `eval_owned_multi` rebuilt a temporary document from the whole array and decoded every
+    // element out of it again, which was most of `INDEX`'s time and memory.
+    if let OwnedValue::Array(elements) = &current {
+        return build_upper_index::<W, S>(elements, idx_expr);
+    }
     match eval_owned_multi::<S>(&Expr::Iterate, &current) {
-        Ok(rows) => build_upper_index::<W, S>(rows, idx_expr),
+        Ok(rows) => build_upper_index::<W, S>(&rows, idx_expr),
         Err(e) => e.into(),
     }
 }
@@ -24729,7 +24735,7 @@ fn builtin_upper_index_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // documented anywhere for this sibling either.
     let current = to_owned_or_suppress!(&value, optional);
     match eval_owned_multi::<S>(stream, &current) {
-        Ok(rows) => build_upper_index::<W, S>(rows, idx_expr),
+        Ok(rows) => build_upper_index::<W, S>(&rows, idx_expr),
         Err(e) => e.into(),
     }
 }
@@ -24740,11 +24746,24 @@ fn builtin_upper_index_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// `idx_expr` error aborts with no partial object, matching `reduce`'s
 /// "only the final value is observable" semantics.
 fn build_upper_index<'a, W, S: EvalSemantics>(
-    rows: Vec<OwnedValue>,
+    rows: &[OwnedValue],
     idx_expr: &Expr,
 ) -> QueryResult<'a, W> {
-    let mut obj = IndexMap::new();
-    for row in &rows {
+    let mut obj = IndexMap::with_capacity(rows.len());
+    for row in rows {
+        // #5306: a plain `.name` read of an object row is its member (null when absent), which
+        // the general evaluator below reaches through a fresh result vector per row.
+        // (jq mode only: yq's own member lookup also follows merge keys.)
+        if let (true, Expr::Field(name), OwnedValue::Object(fields)) =
+            (S::TAG != EvalTag::Yq, idx_expr, row)
+        {
+            let key = fields.get(name.as_str()).map_or_else(
+                || owned_to_string::<S>(&OwnedValue::Null),
+                owned_to_string::<S>,
+            );
+            obj.insert(key, row.clone());
+            continue;
+        }
         let keys = match eval_owned_multi::<S>(idx_expr, row) {
             Ok(k) => k,
             Err(e) => return e.into(),
