@@ -80882,21 +80882,12 @@ fn eval_last_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// error after the final value (`last(1, error("x"))` raises, it does not answer `1`) and a
 /// `break` or `halt` is then `reduce`'s own.
 ///
-/// `None` for a navigation or any other `f` without a generator in it: its outputs are nodes of
-/// the document, which a collecting `last` holds as cursors, where `reduce` would decode every
-/// one it binds.
+/// `None` for navigation alone (`.[]`, `.a[] | select(.b)`, `..`): its outputs are nodes of the
+/// document, which a collecting `last` holds as cursors -- a pointer each -- where `reduce` would
+/// decode every one it binds. Anything else computes its values, whether the generator is spelled
+/// `range`, a user's `def`, `inputs` or `splits`, and takes the `reduce` route.
 pub(crate) fn last_as_reduce(f: &Expr) -> Option<Expr> {
-    let generates = any_subexpr(f, &mut |e| {
-        matches!(
-            e,
-            Expr::Range { .. }
-                | Expr::Repeat(_)
-                | Expr::While { .. }
-                | Expr::Until { .. }
-                | Expr::Builtin(Builtin::RecurseF(_) | Builtin::RecurseCond(..))
-        )
-    });
-    generates.then(|| Expr::Reduce {
+    (!is_register_navigation(f)).then(|| Expr::Reduce {
         input: Box::new(f.clone()),
         patterns: vec![Pattern::Var(String::from(LAST_VAR))],
         init: Box::new(Expr::Literal(Literal::Null)),
@@ -157225,10 +157216,10 @@ mod never_identical_tests_5176 {
         assert!(never_identical(&short("x"), &short("y")));
     }
 
-    /// #5377: `last(f)` takes the `reduce` route exactly when `f` has a generator in it; a
-    /// navigation keeps the collecting one, whose outputs are cursors, not values to decode.
+    /// #5377: `last(f)` takes the `reduce` route unless `f` is navigation alone, whose outputs
+    /// are cursors into the document and not values to decode.
     #[test]
-    fn last_runs_as_reduce_only_for_a_generator_5377() {
+    fn last_runs_as_reduce_unless_it_navigates_5377() {
         use crate::jq::parse;
 
         let operand = |source: &str| {
@@ -157245,7 +157236,10 @@ mod never_identical_tests_5176 {
             "last(0 | while(. < 5; . + 1))",
             "last(0 | until(. > 5; . + 1))",
             "last(recurse(if . < 5 then . + 1 else empty end))",
-            "last(recurse(. + 1; . < 5))",
+            "last(.[] | tostring)",
+            "last(1, 2, 3)",
+            "last(inputs)",
+            "last(splits(\"a\"))",
         ] {
             let fold = last_as_reduce(&operand(source));
             assert!(
@@ -157257,8 +157251,8 @@ mod never_identical_tests_5176 {
             "last(.[])",
             "last(.a[] | select(.b))",
             "last(..)",
-            "last(.[] | tostring)",
-            "last(1, 2, 3)",
+            "last(.a, .b)",
+            "last(first(.[]))",
         ] {
             assert!(
                 last_as_reduce(&operand(source)).is_none(),

@@ -1,7 +1,8 @@
-//! #5377: `last(f)` over a generator that makes its values runs as the `reduce f as $x (null; $x)`
-//! jq defines it by, so it holds one value at a time: `last(range(30000000) * 2)` was killed at
-//! 3 GB where jq stays at 2.5 MB. The rows are what jq 1.7.1 prints, for the generators that take
-//! the `reduce` route and the navigations that keep the collecting one.
+//! #5377: `last(f)` runs as the `reduce f as $x (null; $x)` jq defines it by unless `f` is
+//! navigation alone, so it holds one value at a time: `last(range(30000000) * 2)` was killed at
+//! 3 GB where jq stays at 2.5 MB. The rows are what jq 1.7.1 prints, for the computed generators
+//! that take the `reduce` route, the navigations that keep the collecting one, and `last(f)` in
+//! path position.
 
 use anyhow::Result;
 
@@ -48,12 +49,23 @@ const ROWS: &[(&str, &str, &str, i32)] = &[
     ),
     ("null", "last(range(2; 5) | . * .)", "16\n", 0),
     ("null", "last(range(2) | range(.))", "0\n", 0),
+    ("null", "def g: range(5); last(g)", "4\n", 0),
+    ("null", "last(\"abab\" | splits(\"a\"))", "\"b\"\n", 0),
+    ("null", "last(1, 2, 3)", "3\n", 0),
+    ("null", "last(empty, empty)", "null\n", 0),
+    ("null", "last((1,2) as $x | $x * 10)", "20\n", 0),
     ("[1,2,3]", "last(.[] | range(2))", "1\n", 0),
     ("[1,2,3]", "last(.[])", "3\n", 0),
     ("{\"a\":[1,2,{\"x\":1}]}", "last(.a[])", "{\"x\":1}\n", 0),
     ("[[1,2],[3,4]]", "last(.[] | .[])", "4\n", 0),
     ("[1,2,3]", "[last(range(3)), last(.[])]", "[2,3]\n", 0),
     ("[1,2,3]", "last(.[] | select(. > 1))", "3\n", 0),
+    ("[1,2,3]", "last(.[] | tostring)", "\"3\"\n", 0),
+    ("[1,2,3]", "last(paths)", "[2]\n", 0),
+    ("{\"a\":[1,2]}", "last(.. | numbers)", "2\n", 0),
+    ("[1,2,3]", "path(last(.[]))", "", 5),
+    ("[1,2,3]", "path(last(range(3)))?", "", 0),
+    ("[1,2,3]", "last(.[]) |= 9", "", 5),
 ];
 
 #[test]
