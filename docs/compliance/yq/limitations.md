@@ -463,13 +463,12 @@ Two interactions were left open by #1709 itself (the second since closed by #200
    ([#2004](https://github.com/rust-works/succinctly/issues/2004)). Real yq's own `--colors
    -0` flushes earlier valid results before erroring on a later NUL-containing one —
    live-verified: `yq --colors -0 '.[]'` on `["hello", "wor\0ld", "x"]` prints `hello\0` to
-   stdout, then errors on the second element, exit 1. succinctly buffers the whole multi-result
-   render for `--colors` (the pre-existing mechanism `colorize_yaml`/`colorize_json` need to
-   re-lex ANSI spans), and used to scan that buffer once before writing anything, so a NUL
-   anywhere discarded every earlier result too. It now writes the results that end before the
-   first NUL (colorized as a prefix of the buffered render — the colorizer resets its lexer
-   state at each recorded result boundary, so that is the same text) and then raises the same
-   error, with the same stdout and exit code as yq. The memory cost of coloring is unchanged.
+   stdout, then errors on the second element, exit 1. succinctly used to buffer the whole
+   multi-result render for `--colors` and scan that buffer once before writing anything, so a
+   NUL anywhere discarded every earlier result too.
+   It now writes the results that end before the first NUL and then raises the same error, with
+   the same stdout and exit code as yq.
+   Since [#808](https://github.com/rust-works/succinctly/issues/808) `--colors` streams, and `--colors -0` checks one result at a time like uncolored `-0`: each clean result is colorized as it is flushed, which is the same text as that slice of the whole colored render, because the colorizer resets its lexer state at each result boundary.
 
 ### Anchor-on-alias at document-root level — rule 4(b)
 

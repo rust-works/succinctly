@@ -53,18 +53,24 @@ impl Terminator {
         }
     }
 
-    /// Write this terminator to an `io::Write` sink. `write_all(b"\n")`
-    /// rather than `writeln!(writer)` for the newline case -- this is
+    /// Write this terminator to an `io::Write` sink. `write_all` rather
+    /// than `writeln!(writer)` for the newline case -- this is
     /// jq_runner.rs's own default-output-path terminator write, not just
     /// yq's occasional doc-separator one, so it keeps the exact zero-
     /// formatting-overhead shape jq_runner.rs used before this hoist
     /// rather than detouring through `fmt::Arguments` machinery on every
     /// value.
     pub fn write_io<W: std::io::Write>(self, writer: &mut W) -> std::io::Result<()> {
+        writer.write_all(self.as_str().as_bytes())
+    }
+
+    /// This terminator's text: what the two writers below write, and what
+    /// yq's streamed `--colors -o=json` feeds its colorizer (#808).
+    pub fn as_str(self) -> &'static str {
         match self {
-            Self::Nul => writer.write_all(&[0]),
-            Self::Newline => writer.write_all(b"\n"),
-            Self::None => Ok(()),
+            Self::Nul => "\0",
+            Self::Newline => "\n",
+            Self::None => "",
         }
     }
 
@@ -73,11 +79,7 @@ impl Terminator {
     /// process's own `io::Write` sink directly (yq's M2 fast path's
     /// per-result callbacks, at the time of writing).
     pub fn write_fmt<W: core::fmt::Write>(self, writer: &mut W) -> core::fmt::Result {
-        match self {
-            Self::Nul => writer.write_char('\0'),
-            Self::Newline => writer.write_char('\n'),
-            Self::None => Ok(()),
-        }
+        writer.write_str(self.as_str())
     }
 }
 
@@ -968,27 +970,135 @@ impl ColorScheme {
 /// This is a simple parser that adds colors to JSON tokens.
 pub fn colorize_json(json: &str, scheme: &ColorScheme) -> String {
     let mut result = String::with_capacity(json.len() * 2);
-    let mut chars = json.chars().peekable();
-    let mut in_string = false;
-    let mut escape_next = false;
-    let mut depth_stack: Vec<char> = Vec::new(); // Track context: '{' for object, '[' for array
-    let mut expecting_key = false; // True when next string in object is a key
+    let mut colorizer = JsonColorizer::default();
+    colorizer.push_str(json, scheme, &mut result);
+    colorizer.finish(scheme, &mut result);
+    result
+}
 
-    while let Some(c) = chars.next() {
-        if escape_next {
-            result.push(c);
-            escape_next = false;
-            continue;
+/// The token [`JsonColorizer`] has started but not finished: the one
+/// character of lookahead [`colorize_json`] needs, kept as state so a token
+/// split across two writes is colored the same as one written whole (#808).
+#[derive(Clone, Copy, Default)]
+enum JsonToken {
+    #[default]
+    None,
+    /// `true`, `false` or `null`: alphabetic characters continue it.
+    Keyword,
+    /// A number: digits and `.eE+-` continue it.
+    Number,
+    /// An `n`, colored once the next character says whether it starts `null`
+    /// or the [`NAN_COLOR_MARKER`] `nan`.
+    N,
+    /// `na` of the NaN marker: the next character, whatever it is, ends it.
+    Na,
+}
+
+/// [`colorize_json`] one chunk at a time, for a streamed render (#808):
+/// [`Self::push_str`] colors each chunk as it arrives, and [`Self::finish`]
+/// closes what the last one left open. Its state is the open token plus one
+/// entry per open container, so it holds none of the text it has seen.
+#[derive(Default)]
+pub struct JsonColorizer {
+    in_string: bool,
+    escape_next: bool,
+    depth_stack: Vec<char>, // Track context: '{' for object, '[' for array
+    expecting_key: bool,    // True when next string in object is a key
+    token: JsonToken,
+}
+
+impl JsonColorizer {
+    /// Colors `json` into `result`, carrying any token it ends inside over to
+    /// the next call.
+    pub fn push_str(&mut self, json: &str, scheme: &ColorScheme, result: &mut String) {
+        let mut rest = json;
+        while let Some(c) = rest.chars().next() {
+            // A run of bytes that cannot change the state is copied whole:
+            // string content up to a quote or escape, whitespace between
+            // tokens, or the rest of a keyword or number. Each run ends at an
+            // ASCII byte, so on a character boundary (#808).
+            let run = match self.token {
+                JsonToken::None if self.escape_next => 0,
+                JsonToken::None if self.in_string => plain_run(rest, |b| b == b'"' || b == b'\\'),
+                JsonToken::None => plain_run(rest, |b| !b.is_ascii_whitespace()),
+                JsonToken::Keyword => plain_run(rest, |b| !b.is_ascii_alphabetic()),
+                JsonToken::Number => plain_run(rest, |b| {
+                    !(b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'+' | b'-'))
+                }),
+                _ => 0,
+            };
+            if run > 0 {
+                result.push_str(&rest[..run]);
+                rest = &rest[run..];
+                continue;
+            }
+            self.push_char(c, scheme, result);
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+
+    /// Closes the token the input ended inside, if any.
+    pub fn finish(&mut self, scheme: &ColorScheme, result: &mut String) {
+        match core::mem::take(&mut self.token) {
+            JsonToken::None => {}
+            JsonToken::Keyword | JsonToken::Number => result.push_str(&scheme.reset),
+            JsonToken::N => {
+                result.push_str(&scheme.null);
+                result.push('n');
+                result.push_str(&scheme.reset);
+            }
+            JsonToken::Na => push_nan(scheme, result),
+        }
+    }
+
+    fn push_char(&mut self, c: char, scheme: &ColorScheme, result: &mut String) {
+        // A token only starts outside a string, and nothing that continues
+        // one is a quote, so an open token means `in_string` is false.
+        match self.token {
+            JsonToken::None => {}
+            JsonToken::Keyword if c.is_alphabetic() => {
+                result.push(c);
+                return;
+            }
+            JsonToken::Number if c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E' | '+' | '-') => {
+                result.push(c); // patchcov: coverage tolerate-line reason="unreachable: push_str copies every character this arm accepts as part of a run, so push_char never sees one with a number open (#808)"
+                return; // patchcov: coverage tolerate-line reason="unreachable: see the line above (#808)"
+            }
+            JsonToken::Keyword | JsonToken::Number => {
+                result.push_str(&scheme.reset);
+                self.token = JsonToken::None;
+            }
+            JsonToken::N if c == 'a' => {
+                self.token = JsonToken::Na;
+                return;
+            }
+            JsonToken::N => {
+                result.push_str(&scheme.null);
+                result.push('n');
+                self.token = JsonToken::Keyword;
+                return self.push_char(c, scheme, result);
+            }
+            JsonToken::Na => {
+                self.token = JsonToken::None;
+                push_nan(scheme, result);
+                return;
+            }
         }
 
-        if in_string {
+        if self.escape_next {
+            result.push(c);
+            self.escape_next = false;
+            return;
+        }
+
+        if self.in_string {
             if c == '\\' {
                 result.push(c);
-                escape_next = true;
+                self.escape_next = true;
             } else if c == '"' {
                 result.push(c);
                 result.push_str(&scheme.reset);
-                in_string = false;
+                self.in_string = false;
             } else {
                 result.push(c);
             }
@@ -996,42 +1106,42 @@ pub fn colorize_json(json: &str, scheme: &ColorScheme) -> String {
             match c {
                 '"' => {
                     // Use expecting_key to determine if this is a key
-                    if expecting_key {
+                    if self.expecting_key {
                         result.push_str(&scheme.key);
-                        expecting_key = false; // After seeing key, next string is value
+                        self.expecting_key = false; // After seeing key, next string is value
                     } else {
                         result.push_str(&scheme.string);
                     }
                     result.push(c);
-                    in_string = true;
+                    self.in_string = true;
                 }
                 '{' => {
                     result.push_str(&scheme.object);
                     result.push(c);
                     result.push_str(&scheme.reset);
-                    depth_stack.push('{');
-                    expecting_key = true; // First thing in object is a key
+                    self.depth_stack.push('{');
+                    self.expecting_key = true; // First thing in object is a key
                 }
                 '[' => {
                     result.push_str(&scheme.array);
                     result.push(c);
                     result.push_str(&scheme.reset);
-                    depth_stack.push('[');
+                    self.depth_stack.push('[');
                     // Arrays don't have keys
                 }
                 '}' => {
                     result.push_str(&scheme.object);
                     result.push(c);
                     result.push_str(&scheme.reset);
-                    depth_stack.pop();
-                    expecting_key = false;
+                    self.depth_stack.pop();
+                    self.expecting_key = false;
                 }
                 ']' => {
                     result.push_str(&scheme.array);
                     result.push(c);
                     result.push_str(&scheme.reset);
-                    depth_stack.pop();
-                    expecting_key = false;
+                    self.depth_stack.pop();
+                    self.expecting_key = false;
                 }
                 ':' => {
                     // #3110: real jq wraps the key/value `:` in the *object*
@@ -1044,7 +1154,7 @@ pub fn colorize_json(json: &str, scheme: &ColorScheme) -> String {
                     result.push(c);
                     result.push_str(&scheme.reset);
                     // After colon, we're expecting a value, not a key
-                    expecting_key = false;
+                    self.expecting_key = false;
                 }
                 ',' => {
                     // #3110: real jq colors the comma with its *enclosing
@@ -1052,7 +1162,7 @@ pub fn colorize_json(json: &str, scheme: &ColorScheme) -> String {
                     // inside `{...}` (confirmed live against jq 1.7.1 with a
                     // custom `JQ_COLORS`, default colors share `1;39` so the
                     // distinction only shows with a custom spec).
-                    let color = if depth_stack.last() == Some(&'{') {
+                    let color = if self.depth_stack.last() == Some(&'{') {
                         &scheme.object
                     } else {
                         &scheme.array
@@ -1061,37 +1171,21 @@ pub fn colorize_json(json: &str, scheme: &ColorScheme) -> String {
                     result.push(c);
                     result.push_str(&scheme.reset);
                     // After comma in object context, next string is a key
-                    if depth_stack.last() == Some(&'{') {
-                        expecting_key = true;
+                    if self.depth_stack.last() == Some(&'{') {
+                        self.expecting_key = true;
                     }
                 }
                 't' => {
-                    // true
+                    // true; the rest of the keyword continues the token
                     result.push_str(&scheme.true_);
                     result.push(c);
-                    // Consume rest of the keyword
-                    while let Some(&next) = chars.peek() {
-                        if next.is_alphabetic() {
-                            result.push(chars.next().unwrap());
-                        } else {
-                            break;
-                        }
-                    }
-                    result.push_str(&scheme.reset);
+                    self.token = JsonToken::Keyword;
                 }
                 'f' => {
                     // false
                     result.push_str(&scheme.false_);
                     result.push(c);
-                    // Consume rest of the keyword
-                    while let Some(&next) = chars.peek() {
-                        if next.is_alphabetic() {
-                            result.push(chars.next().unwrap());
-                        } else {
-                            break;
-                        }
-                    }
-                    result.push_str(&scheme.reset);
+                    self.token = JsonToken::Keyword;
                 }
                 'n' => {
                     // `null`, or `NAN_COLOR_MARKER` ("nan") standing in for a
@@ -1100,52 +1194,16 @@ pub fn colorize_json(json: &str, scheme: &ColorScheme) -> String {
                     // `jq::value::NAN_SENTINEL`'s parse-time NaN marker,
                     // same problem, different pipeline). The two share no
                     // other letter, and `format_json_impl` never emits any
-                    // other bare n-leading token here, so one peek at the
-                    // second character is sufficient -- no need to buffer
-                    // the whole word just to compare it afterward.
-                    if chars.peek() == Some(&'a') {
-                        chars.next(); // 'a'
-                        chars.next(); // 'n'
-                                      // jq wraps a NaN's "null" spelling in its number
-                                      // color, then its null color, confirmed live against
-                                      // jq 1.7.1 on both Linux and macOS: `nan` prints
-                                      // `\e[0;39m\e[0;90mnull\e[0m\e[0m`.
-                        result.push_str(&scheme.number);
-                        result.push_str(&scheme.null);
-                        result.push_str("null");
-                        result.push_str(&scheme.reset);
-                        result.push_str(&scheme.reset);
-                    } else {
-                        result.push_str(&scheme.null);
-                        result.push(c);
-                        while let Some(&next) = chars.peek() {
-                            if next.is_alphabetic() {
-                                result.push(chars.next().unwrap());
-                            } else {
-                                break;
-                            }
-                        }
-                        result.push_str(&scheme.reset);
-                    }
+                    // other bare n-leading token here, so the second
+                    // character alone decides which (`JsonToken::N`) -- no
+                    // need to buffer the whole word just to compare it
+                    // afterward.
+                    self.token = JsonToken::N;
                 }
                 '0'..='9' | '-' | '.' | 'e' | 'E' | '+' => {
                     result.push_str(&scheme.number);
                     result.push(c);
-                    // Consume rest of number
-                    while let Some(&next) = chars.peek() {
-                        if next.is_ascii_digit()
-                            || next == '.'
-                            || next == 'e'
-                            || next == 'E'
-                            || next == '+'
-                            || next == '-'
-                        {
-                            result.push(chars.next().unwrap());
-                        } else {
-                            break;
-                        }
-                    }
-                    result.push_str(&scheme.reset);
+                    self.token = JsonToken::Number;
                 }
                 _ => {
                     // Whitespace and other characters
@@ -1154,8 +1212,22 @@ pub fn colorize_json(json: &str, scheme: &ColorScheme) -> String {
             }
         }
     }
+}
 
-    result
+/// The length of `text`'s leading run of bytes `stops` rejects.
+pub(crate) fn plain_run(text: &str, stops: impl Fn(u8) -> bool) -> usize {
+    text.bytes().position(stops).unwrap_or(text.len())
+}
+
+/// jq wraps a NaN's "null" spelling in its number color, then its null
+/// color, confirmed live against jq 1.7.1 on both Linux and macOS: `nan`
+/// prints `\e[0;39m\e[0;90mnull\e[0m\e[0m`.
+fn push_nan(scheme: &ColorScheme, result: &mut String) {
+    result.push_str(&scheme.number);
+    result.push_str(&scheme.null);
+    result.push_str("null");
+    result.push_str(&scheme.reset);
+    result.push_str(&scheme.reset);
 }
 
 #[cfg(test)]
@@ -1428,6 +1500,43 @@ mod tests {
         assert!(ColorScheme::from_spec("bogus:0;39:0;39:0;39:0;32:1;39:1;39:9;95").is_none());
         assert!(ColorScheme::from_spec("0;31:bogus").is_none());
         assert!(ColorScheme::from_spec("0;31;4:0;39:0;39:0;39:0;32:1;39:1;39:0;31m").is_none());
+    }
+
+    /// #808: yq's `--colors -o=json` colors a streamed render in the pieces the streamers write,
+    /// so coloring it piecewise must give the bytes coloring it whole does -- including a
+    /// keyword, number or the NaN marker split between two pieces, or ending the input.
+    #[test]
+    fn test_json_colorizer_output_is_independent_of_chunking_808() {
+        let scheme = ColorScheme::default();
+        for json in [
+            r#"{"a":[true,false,null,-1.5e+3,"s\"x"],"b":nan,"c":{}}"#,
+            "[nan]",
+            "nan",
+            "na",
+            "n",
+            "tru",
+            "12",
+            "[\"é\",\"\\\\\"]\n\0",
+        ] {
+            let whole = colorize_json(json, &scheme);
+            let ends: Vec<usize> = json.char_indices().map(|(i, _)| i).skip(1).collect();
+            let in_pieces = |cuts: &[usize]| {
+                let mut colorizer = JsonColorizer::default();
+                let mut result = String::new();
+                let mut start = 0;
+                for &cut in cuts {
+                    colorizer.push_str(&json[start..cut], &scheme, &mut result);
+                    start = cut;
+                }
+                colorizer.push_str(&json[start..], &scheme, &mut result);
+                colorizer.finish(&scheme, &mut result);
+                result
+            };
+            assert_eq!(in_pieces(&ends), whole, "{json:?} one character at a time");
+            for &cut in &ends {
+                assert_eq!(in_pieces(&[cut]), whole, "{json:?} cut at {cut}");
+            }
+        }
     }
 
     #[test]

@@ -90,32 +90,157 @@ impl<W: Write> core::fmt::Write for FmtWriter<W> {
     }
 }
 
-/// Either a direct passthrough to the real output writer, or an in-memory
-/// buffer collecting output to be colorized afterward. `colorize_yaml`/
-/// `output::colorize_json` are pure text-level re-lexers over an already
-/// fully-rendered string, so buffering the duplicate-key-safe cursor
-/// streamer's output and running it through them unmodified reuses that
-/// existing coloring code without teaching the streamers anything about
-/// ANSI codes (#748).
+/// Which re-lexer colors a `--colors` render (#808). A selector rather than
+/// a constructed [`Colorizer`], so the uncolored path builds nothing.
+#[derive(Clone, Copy, Debug)]
+enum ColorSyntax {
+    Yaml,
+    Json,
+}
+
+/// A text-level re-lexer run over a render as it streams (#808).
+/// `colorize_yaml`/`output::colorize_json` color text the cursor streamers
+/// have already rendered, which keeps the streamers free of ANSI codes
+/// (#748); running them incrementally keeps that and drops the whole-output
+/// buffer #748 colored afterwards.
+///
+/// The streamers write a token at a time, and coloring each write as it
+/// arrived cost `--colors -o=json` a fifth of its run time over coloring one
+/// buffer. So `raw` collects writes, [`COLOR_BLOCK_BYTES`] at a time, and
+/// each block is colored in one call into `colored` and written: the lexers
+/// give the same bytes however their input is cut, and the working set stays
+/// a block or two.
+struct Colorizer {
+    lexer: ColorLexer,
+    raw: String,
+    colored: String,
+}
+
+/// How much text [`Colorizer`] collects before coloring and writing it: the
+/// size of the `BufWriter` behind the real writer.
+const COLOR_BLOCK_BYTES: usize = 8 * 1024;
+
+enum ColorLexer {
+    Yaml(YamlColorizer),
+    Json(output::JsonColorizer, Box<ColorScheme>),
+}
+
+impl Colorizer {
+    fn new(syntax: ColorSyntax) -> Self {
+        let lexer = match syntax {
+            ColorSyntax::Yaml => ColorLexer::Yaml(YamlColorizer::default()),
+            ColorSyntax::Json => ColorLexer::Json(output::JsonColorizer::default(), Box::default()),
+        };
+        Self {
+            lexer,
+            raw: String::new(),
+            colored: String::new(),
+        }
+    }
+
+    fn write<W: Write>(&mut self, writer: &mut W, s: &str) -> core::fmt::Result {
+        if self.raw.len() + s.len() < COLOR_BLOCK_BYTES {
+            self.raw.push_str(s);
+            return Ok(());
+        }
+        self.color_raw();
+        // A write this large (a whole `-0` result, say) is colored in place,
+        // a block at a time, rather than copied into `raw` first.
+        let mut rest = s;
+        while !rest.is_empty() {
+            let mut end = rest.len().min(COLOR_BLOCK_BYTES);
+            while !rest.is_char_boundary(end) {
+                end += 1;
+            }
+            self.color(&rest[..end]);
+            self.drain(writer)?;
+            rest = &rest[end..];
+        }
+        Ok(())
+    }
+
+    /// Ends a streamed result. YAML's colorizer closes the spans still open
+    /// before writing `terminator` (#1708); JSON's reads it as the
+    /// whitespace or stray byte it is, as it did inside the buffered render.
+    fn end_result<W: Write>(
+        &mut self,
+        writer: &mut W,
+        terminator: Terminator,
+    ) -> core::fmt::Result {
+        if matches!(self.lexer, ColorLexer::Json(..)) {
+            return self.write(writer, terminator.as_str());
+        }
+        // YAML's boundary goes after everything written before it.
+        self.color_raw();
+        if let ColorLexer::Yaml(yaml) = &mut self.lexer {
+            yaml.boundary(terminator, &mut self.colored);
+        }
+        if self.colored.len() < COLOR_BLOCK_BYTES {
+            return Ok(());
+        }
+        self.drain(writer)
+    }
+
+    /// Colors and writes what is left, closing what the render left open:
+    /// the last span, and any text a YAML list marker's lookahead still
+    /// holds.
+    fn finish<W: Write>(&mut self, writer: &mut W) -> core::fmt::Result {
+        self.color_raw();
+        match &mut self.lexer {
+            ColorLexer::Yaml(yaml) => yaml.finish(&mut self.colored),
+            ColorLexer::Json(json, scheme) => json.finish(scheme, &mut self.colored),
+        }
+        self.drain(writer)
+    }
+
+    fn color_raw(&mut self) {
+        let mut raw = core::mem::take(&mut self.raw);
+        self.color(&raw);
+        raw.clear();
+        self.raw = raw;
+    }
+
+    fn color(&mut self, s: &str) {
+        match &mut self.lexer {
+            ColorLexer::Yaml(yaml) => yaml.push_str(s, &mut self.colored),
+            ColorLexer::Json(json, scheme) => json.push_str(s, scheme, &mut self.colored),
+        }
+    }
+
+    fn drain<W: Write>(&mut self, writer: &mut W) -> core::fmt::Result {
+        if self.colored.is_empty() {
+            return Ok(());
+        }
+        let written = writer.write_all(self.colored.as_bytes());
+        self.colored.clear();
+        written.map_err(|_| core::fmt::Error)
+    }
+}
+
+/// Where a streamed render writes: straight to the real output writer, or
+/// through a [`Colorizer`] on its way there, or one result at a time through
+/// [`NulCheckedSink`].
 enum ColorSink<'a, W: Write> {
-    Buffered(String, Vec<usize>),
+    /// `--colors` (#808), unless `-0` needs [`NulCheckedSink`]'s per-result
+    /// check first.
+    Colored(&'a mut W, Colorizer),
     Direct(FmtWriter<&'a mut W>),
     /// Per-result NUL-checked buffering (#1709), used instead of `Direct`
-    /// when `-0`/`--nul-output` is active and `--color` isn't. See
+    /// (or `Colored`, #808) when `-0`/`--nul-output` is active. See
     /// [`NulCheckedSink`]'s own doc comment for why this needs to buffer
     /// one result at a time rather than either streaming straight through
     /// (`Direct`, which would leak an invalid result's own already-rendered
     /// prefix bytes before detecting its embedded NUL) or buffering the
-    /// whole document like `Buffered` does (which would reintroduce the
-    /// #789-class memory regression a prior attempt at this issue, PR
-    /// #1767, measured and got closed over).
+    /// whole document (which would reintroduce the #789-class memory
+    /// regression a prior attempt at this issue, PR #1767, measured and got
+    /// closed over).
     NulChecked(NulCheckedSink<'a, W>),
 }
 
 impl<W: Write> core::fmt::Write for ColorSink<'_, W> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         match self {
-            ColorSink::Buffered(buf, _) => buf.write_str(s),
+            ColorSink::Colored(writer, colorizer) => colorizer.write(*writer, s),
             ColorSink::Direct(w) => w.write_str(s),
             ColorSink::NulChecked(sink) => sink.buf.write_str(s),
         }
@@ -157,14 +282,14 @@ struct PendingSeparator<'a> {
     settled: bool,
 }
 
-/// Per-result buffered writer used when `-0`/`--nul-output` is active and
-/// `--color` isn't (#1709). Buffers ONE streamed result's rendered text at
-/// a time -- not the whole document/stream, unlike `ColorSink::Buffered`
-/// above (which exists for an unrelated reason, color re-lexing, and pays
-/// for materializing every result of a whole document up front as an
-/// accepted, pre-existing cost of `--color` specifically). A per-*result*
-/// buffer keeps bounded, O(one result) memory regardless of document size,
-/// matching this crate's M2 streaming architecture's own memory guarantee.
+/// Per-result buffered writer used when `-0`/`--nul-output` is active
+/// (#1709). Buffers ONE streamed result's rendered text at a time -- not the
+/// whole document/stream. A per-*result* buffer keeps bounded, O(one result)
+/// memory regardless of document size, matching this crate's M2 streaming
+/// architecture's own memory guarantee. With `--colors` too, a result that
+/// passes the check goes through `colorizer` instead of straight to `writer`
+/// (#808; #2004's flush-then-error order, which buffering the whole colored
+/// render used to give).
 ///
 /// A prior attempt at this exact issue (PR #1767, closed without merging)
 /// buffered the entire rendered stream instead whenever `-0` was set, and
@@ -185,6 +310,7 @@ struct NulCheckedSink<'a, W: Write> {
     buf: String,
     nul_detected: &'a Cell<bool>,
     separator: Option<PendingSeparator<'a>>,
+    colorizer: Option<Colorizer>,
 }
 
 impl<W: Write> NulCheckedSink<'_, W> {
@@ -203,13 +329,28 @@ impl<W: Write> NulCheckedSink<'_, W> {
             self.buf.clear();
             return Err(core::fmt::Error);
         }
+        self.settle_separator()?;
+        match &mut self.colorizer {
+            Some(colorizer) => colorizer.write(self.writer, &self.buf)?,
+            None => self
+                .writer
+                .write_all(self.buf.as_bytes())
+                .map_err(|_| core::fmt::Error)?,
+        }
+        self.buf.clear();
+        Ok(())
+    }
+
+    /// Writes this document's pending `---`, once: before its first result
+    /// that survives the NUL check.
+    fn settle_separator(&mut self) -> core::fmt::Result {
         if let Some(sep) = &mut self.separator {
             if !sep.settled {
                 // Reuses the same guard/write/set-flag logic every other
                 // terminator mode's separator goes through, rather than
                 // hand-duplicating it here (#1709 code review) -- `true`
                 // for `will_output` since reaching this point already
-                // means this result survived the NUL check above.
+                // means this result survived the NUL check.
                 // `Terminator::Nul` is a literal, not `self.terminator`:
                 // this sink is only ever constructed for that terminator
                 // (see its one call site in `stream_maybe_colored`), so a
@@ -226,11 +367,25 @@ impl<W: Write> NulCheckedSink<'_, W> {
                 sep.settled = true;
             }
         }
-        self.writer
-            .write_all(self.buf.as_bytes())
-            .map_err(|_| core::fmt::Error)?;
-        self.buf.clear();
         Ok(())
+    }
+
+    /// The end of a `--colors -0` render: the bytes #2004's whole-buffer
+    /// version wrote. A render that passed the NUL check writes its document
+    /// separator even when it rendered nothing (the colorizer still writes
+    /// its reset), and one stopped by a NUL writes nothing more unless an
+    /// earlier result was already written -- then its colorizer is finished,
+    /// which writes any text a list marker's lookahead still holds.
+    fn finish_colored(&mut self, nul_detected: bool) -> core::fmt::Result {
+        let wrote_a_result = self.separator.as_ref().map_or(true, |sep| sep.settled);
+        if nul_detected && !wrote_a_result {
+            return Ok(());
+        }
+        self.settle_separator()?;
+        match &mut self.colorizer {
+            Some(colorizer) => colorizer.finish(self.writer),
+            None => Ok(()), // patchcov: coverage tolerate-line reason="unreachable: the only caller checks colorizer.is_some() first (#808)"
+        }
     }
 
     /// [`Self::flush_body`] plus the real terminator -- the evaluated
@@ -238,43 +393,27 @@ impl<W: Write> NulCheckedSink<'_, W> {
     /// [`ColorSink::write_result_terminator`].
     fn flush_result(&mut self, terminator: Terminator) -> core::fmt::Result {
         self.flush_body()?;
-        terminator
-            .write_io(self.writer)
-            .map_err(|_| core::fmt::Error)
+        match &mut self.colorizer {
+            Some(colorizer) => colorizer.end_result(self.writer, terminator),
+            None => terminator
+                .write_io(self.writer)
+                .map_err(|_| core::fmt::Error),
+        }
     }
 }
 
 impl<W: Write> ColorSink<'_, W> {
-    /// Records a streamed result's boundary as a byte offset into the
-    /// buffer, instead of writing a real terminator character into it
-    /// (#1708). `colorize_yaml` re-lexes the whole buffer once, at the end,
-    /// and inserts the real terminator at each recorded offset, closing
-    /// whatever color span is still open there first -- which an in-band
-    /// marker character can't do safely, since this crate's own writers can
-    /// and do emit any raw byte (including a chosen marker's own value)
-    /// when the source YAML/JSON explicitly encodes one. A no-op in
-    /// `Direct` mode, whose caller writes its terminator immediately
-    /// instead (see `stream_cursor!`).
-    fn record_boundary(&mut self) {
-        if let ColorSink::Buffered(buf, boundaries) = self {
-            boundaries.push(buf.len());
-        }
-    }
-
     /// Writes a streamed result's terminator through whichever mode `self`
-    /// is in: records a boundary for `colorize_yaml` to place later when
-    /// `Buffered`, or writes it immediately when `Direct` -- so a caller
-    /// never needs its own `use_color` check to pick between the two, only
-    /// `ColorSink`'s own variant (which already reflects it). Named
-    /// distinctly from the free [`write_terminator`] function (which writes
-    /// to the real `$writer`/`OutputConfig` outside any `ColorSink` at all)
-    /// to keep the two apart when searching this file.
+    /// is in: through the colorizer when `Colored`, which closes whatever
+    /// color span is still open first (#1708), or immediately when `Direct`
+    /// -- so a caller never needs its own `use_color` check to pick between
+    /// the two, only `ColorSink`'s own variant (which already reflects it).
+    /// Named distinctly from the free [`write_terminator`] function (which
+    /// writes to the real `$writer`/`OutputConfig` outside any `ColorSink`
+    /// at all) to keep the two apart when searching this file.
     fn write_result_terminator(&mut self, terminator: Terminator) -> core::fmt::Result {
         match self {
-            ColorSink::Buffered(..) => {
-                self.record_boundary();
-                Ok(())
-            }
+            ColorSink::Colored(writer, colorizer) => colorizer.end_result(*writer, terminator),
             ColorSink::Direct(_) => terminator.write_fmt(self),
             ColorSink::NulChecked(sink) => sink.flush_result(terminator),
         }
@@ -394,11 +533,11 @@ macro_rules! json_ascii {
     }};
 }
 
-/// Streams through `render` directly when `use_color` is false. When true,
-/// renders into a buffer instead (still via the duplicate-key-safe cursor
-/// streamer passed in as `render`), then runs the buffer through `colorize`
-/// before writing the colorized result (#748).
-/// Render `render`'s output to `writer`, colorizing first if asked.
+/// Render `render`'s output to `writer`, colorizing it on the way when
+/// `use_color` is set: `render` streams into a [`ColorSink`] that colors each
+/// write as `syntax` and passes it straight on (#808), so `--colors` keeps the
+/// cursor streamers' constant memory and early output instead of buffering
+/// the whole result first, as #748 did.
 ///
 /// The nested `Result` is #1615's decode-failure channel, not redundancy: the
 /// outer `anyhow::Result` is a genuine *write* failure (the process cannot
@@ -413,101 +552,48 @@ macro_rules! json_ascii {
 /// included — the same keep-the-prefix-and-diagnose trade #1641/#1679 settled
 /// for their own streaming sites.
 ///
-/// `terminator`/`separator` (#1709): when `terminator` is `Terminator::Nul`
-/// and `use_color` is false, dispatches to `ColorSink::NulChecked` instead
-/// of `Direct` — see that type's own doc comment for why per-result
-/// buffering, not raw passthrough, is required to match real yq's own
-/// flush-then-error atomicity without regressing this crate's streaming
-/// memory guarantee. `separator` threads `stream_cursor!`'s own
-/// `$doc_streamed`/`no_doc` state through for the YAML call sites' lazy
-/// `---` emission; `None` for JSON, which has no separator concept.
+/// `terminator`/`separator` (#1709): when `terminator` is `Terminator::Nul`,
+/// dispatches to `ColorSink::NulChecked` instead of `Direct` — see that
+/// type's own doc comment for why per-result buffering, not raw passthrough,
+/// is required to match real yq's own flush-then-error atomicity without
+/// regressing this crate's streaming memory guarantee. `separator` threads
+/// `stream_cursor!`'s own `$doc_streamed`/`no_doc` state through for the YAML
+/// call sites' lazy `---` emission; `None` for JSON, which has no separator
+/// concept.
 ///
-/// The `use_color` path keeps its existing whole-buffer shape (color
-/// re-lexing already requires materializing the whole rendered document, a
-/// pre-existing cost unrelated to `-0`); a `-0`+`--color` combination is
-/// checked for an embedded NUL over that same already-buffered content,
-/// split at the recorded result boundaries so it is flush-then-error atomic
-/// like the no-color path (#2004): earlier clean results are written (each
-/// colorized on its own, which is the same text as the whole render's slice
-/// of it), then the NUL-bearing result stops the run, as in real yq's
-/// `--colors -0`.
+/// `-0` with `--colors` is NUL-checked the same way, one result at a time,
+/// each clean result colorized as it is flushed (#2004): earlier clean results
+/// are written, then the NUL-bearing one stops the run, as in real yq's
+/// `--colors -0`. Only the YAML call sites (`separator` is `Some`) are
+/// checked: JSON's own `on_value` closures write the raw `\0` terminator
+/// into the colored text, which a NUL check would mistake for one inside a
+/// value, and `--colors -o=json -0` already can't be safely consumed by a
+/// NUL-delimited reader once ANSI escapes are mixed in.
 fn stream_maybe_colored<W: Write, T>(
     writer: &mut W,
     use_color: bool,
     terminator: Terminator,
     separator: Option<DocSeparatorArgs<'_>>,
-    colorize: impl FnOnce(&str, &[usize]) -> String,
+    syntax: ColorSyntax,
     render: impl FnOnce(&mut ColorSink<'_, W>) -> Result<T, StreamFailure>,
 ) -> anyhow::Result<Result<T, EvalError>> {
-    if use_color {
-        let mut sink = ColorSink::Buffered(String::new(), Vec::new());
+    if use_color && !(terminator == Terminator::Nul && separator.is_some()) {
+        let mut sink = ColorSink::Colored(writer, Colorizer::new(syntax));
         let rendered = render(&mut sink);
-        let ColorSink::Buffered(buf, boundaries) = sink else {
-            unreachable!("stream_maybe_colored always constructs ColorSink::Buffered here")
+        let ColorSink::Colored(writer, mut colorizer) = sink else {
+            unreachable!("stream_maybe_colored always constructs ColorSink::Colored here")
+            // patchcov: coverage tolerate-line reason="unreachable: the sink was constructed as Colored two lines up and render only borrows it (#808)"
         };
-        // `separator.is_some()` doubles as "this is a YAML call site"
-        // (#1709): YAML's `Buffered` mode never embeds a raw terminator
-        // character into `buf` itself (`write_result_terminator` records a
-        // boundary offset instead, exactly so `colorize_yaml` can place a
-        // real terminator later, correctly relative to whatever color span
-        // is open there). JSON's own on_value closures write
-        // `terminator.write_fmt(w)` directly, so JSON's buffer *does*
-        // contain raw `\0` terminator bytes between every result when
-        // `-0` is active -- scanning it here would false-positive on the
-        // terminator's own byte, not a value actually containing one.
-        // Narrowing this check to YAML leaves `--color -o=json -0`
-        // unvalidated; that combination already can't be safely consumed
-        // by a NUL-delimited reader once ANSI escapes are mixed in, so
-        // `-0`'s own reason for existing doesn't really apply to it either.
-        //
-        // #2004: the scan is per result, not per document: real yq's `--colors
-        // -0` writes every earlier clean result before it fails on a later
-        // NUL-bearing one. The render is already buffered whole and
-        // `boundaries` records where each result ends, so the results before
-        // the first NUL are colorized as a prefix (one call, the same text as
-        // that slice of the whole render) and written, then the NUL stops the
-        // run.
-        let nul_at = if terminator == Terminator::Nul && separator.is_some() {
-            buf.find('\0')
-        } else {
-            None
+        // A decode failure keeps the prefix it already wrote, so it needs its
+        // last span closed like a complete render; a write failure has no
+        // writer left to close it on.
+        let rendered = match rendered {
+            Err(StreamFailure::Fmt) => rendered,
+            _ => match colorizer.finish(writer) {
+                Ok(()) => rendered,
+                Err(e) => Err(StreamFailure::from(e)),
+            },
         };
-        // The results that end at or before the NUL; the one containing it,
-        // and everything after, is not written.
-        let (body, body_boundaries) = match nul_at {
-            Some(pos) => {
-                let clean = boundaries.iter().take_while(|&&b| b <= pos).count();
-                let end = if clean == 0 { 0 } else { boundaries[clean - 1] };
-                (&buf[..end], &boundaries[..clean])
-            }
-            None => (&buf[..], &boundaries[..]),
-        };
-        // #1709: `separator` is only ever `Some` for a NUL-checked YAML
-        // call site (its caller skipped its own eager
-        // `emit_yaml_doc_separator` call for exactly this reason -- see
-        // the `NulChecked` branch below), and the NUL scan just above
-        // already gates reaching this point on "the document's own
-        // content survived." Write the separator now, directly to
-        // `writer` -- never colorized, matching every other call site's
-        // own separator write -- before the colorized body. A no-op for
-        // every other `use_color` call (terminator != Nul, or JSON, both
-        // of which pass `None`). Skipped when the very first result holds
-        // the NUL: nothing of this document was written.
-        let writes_body = nul_at.is_none() || !body.is_empty() || !body_boundaries.is_empty();
-        if let Some(sep) = separator {
-            if writes_body {
-                if *sep.doc_streamed && !sep.no_doc {
-                    write_doc_separator_marker(writer, terminator)?;
-                }
-                *sep.doc_streamed = true;
-            }
-        }
-        if writes_body {
-            write!(writer, "{}", colorize(body, body_boundaries))?;
-        }
-        if nul_at.is_some() {
-            return Err(anyhow::anyhow!(NUL_OUTPUT_ERROR_MESSAGE));
-        }
         match rendered {
             Ok(value) => Ok(Ok(value)),
             Err(StreamFailure::Decode(e)) => Ok(Err(e)),
@@ -524,6 +610,7 @@ fn stream_maybe_colored<W: Write, T>(
                 no_doc: s.no_doc,
                 settled: false,
             }),
+            colorizer: use_color.then(|| Colorizer::new(syntax)),
         };
         let mut sink = ColorSink::NulChecked(sink_state);
         let rendered = render(&mut sink);
@@ -542,19 +629,27 @@ fn stream_maybe_colored<W: Write, T>(
         // failure is still real, already-checked content, and this file's
         // own established keep-the-prefix-and-diagnose trade (#1641/#1679,
         // this function's own doc comment above) says to write it rather
-        // than silently drop it -- the `Buffered`/color arm above already
-        // does this unconditionally. Only a genuine write failure
+        // than silently drop it. Only a genuine write failure
         // (`StreamFailure::Fmt`) means the underlying writer itself is
         // already broken, with nothing left to safely flush.
-        let rendered = if !matches!(rendered, Err(StreamFailure::Fmt)) && !sink_state.buf.is_empty()
-        {
-            match sink_state.flush_body() {
+        let mut rendered =
+            if !matches!(rendered, Err(StreamFailure::Fmt)) && !sink_state.buf.is_empty() {
+                match sink_state.flush_body() {
+                    Ok(()) => rendered,
+                    Err(e) => Err(StreamFailure::from(e)),
+                }
+            } else {
+                rendered
+            };
+        // A NUL stops the render through the same `fmt::Error` a broken
+        // writer does; only the latter leaves nothing to finish on.
+        let writer_failed = matches!(rendered, Err(StreamFailure::Fmt)) && !nul_detected.get();
+        if sink_state.colorizer.is_some() && !writer_failed {
+            rendered = match sink_state.finish_colored(nul_detected.get()) {
                 Ok(()) => rendered,
                 Err(e) => Err(StreamFailure::from(e)),
-            }
-        } else {
-            rendered
-        };
+            };
+        }
         if nul_detected.get() {
             return Err(anyhow::anyhow!(NUL_OUTPUT_ERROR_MESSAGE));
         }
@@ -583,10 +678,10 @@ fn stream_or_report<W: Write>(
     use_color: bool,
     terminator: Terminator,
     sink: &mut ErrorSink,
-    colorize: impl FnOnce(&str, &[usize]) -> String,
+    syntax: ColorSyntax,
     render: impl FnOnce(&mut ColorSink<'_, W>) -> Result<(), StreamFailure>,
 ) -> anyhow::Result<bool> {
-    match stream_maybe_colored(writer, use_color, terminator, None, colorize, render)? {
+    match stream_maybe_colored(writer, use_color, terminator, None, syntax, render)? {
         Ok(()) => Ok(true),
         Err(e) => {
             report_stream_decode_failure(sink, &e);
@@ -7840,9 +7935,9 @@ fn output_value<W: Write>(
         reject_nul_output(&output, config)?;
         write_pending_separator(writer, separator, terminator_from_config(config))?;
         if config.use_color {
-            // No boundary recorded here -- `write_terminator` below writes
-            // directly to `writer`, outside this buffer (#1708).
-            write!(writer, "{}", colorize_yaml(&output, Terminator::None, &[]))?;
+            // No boundary here -- `write_terminator` below writes directly
+            // to `writer`, after the colored text (#1708).
+            write!(writer, "{}", colorize_yaml(&output))?;
         } else {
             write!(writer, "{output}")?;
         }
@@ -9263,10 +9358,11 @@ fn yaml_quote_key(s: &str, style: &str, flow: bool, json_sourced: bool) -> Strin
     }
 }
 
-/// Whether a compact block-sequence item's remaining source (the text
-/// right after `- `, as returned by `Chars::as_str()` at that point) opens
-/// with a mapping key rather than a scalar value — i.e. whether an
-/// unquoted `:` appears before the line ends.
+/// Whether a compact block-sequence item opens with a mapping key rather
+/// than a scalar value — i.e. whether an unquoted `:` appears before the
+/// line ends. Fed the item one character at a time, from its first
+/// non-blank character, by [`YamlColorizer`], which holds the text back
+/// until [`Self::step`] answers.
 ///
 /// `colorize_yaml`'s state machine colors a token *as it's written*, one
 /// `char` at a time, with no ability to go back and re-color something it
@@ -9275,160 +9371,288 @@ fn yaml_quote_key(s: &str, style: &str, flow: bool, json_sourced: bool) -> Strin
 /// and the only way to tell is to look ahead. Before #785, `- ` was always
 /// followed by either a scalar value or a newline (a container value's
 /// mapping always started on its own line), so this ambiguity never arose.
-/// A nested compact marker (`- - 1`) recurses naturally: the caller
-/// re-invokes this same lookahead for the *inner* `-` too, so a mapping
-/// arbitrarily many `- ` markers deep (`- - a: 1`) still finds its `:` and
-/// colors `a`, while a purely scalar nested sequence (`- - 1\n  - 2`) does
-/// not color the inner marker - real, but narrow and, like the rest of
-/// this colorizer, not oracle-matched against real yq's own (differently
-/// coded) `-C` output, so left as a known residual gap rather than chased
-/// further (#785).
-fn compact_item_opens_with_key(rest_of_line: &str) -> bool {
-    let mut quote: Option<char> = None;
-    let mut chars = rest_of_line.chars();
-    while let Some(c) = chars.next() {
-        match quote {
+/// A purely scalar nested sequence (`- - 1\n  - 2`) does not color the
+/// inner marker - real, but narrow and, like the rest of this colorizer,
+/// not oracle-matched against real yq's own (differently coded) `-C`
+/// output, so left as a known residual gap rather than chased further
+/// (#785).
+///
+/// The answer is bounded by the item's own line, its own result and
+/// [`LOOKAHEAD_LIMIT`] (#808): the whole-buffer scan this replaced read on
+/// through a quote that never closed on its line (an apostrophe in
+/// `- don't`) and into the next result, which a streamed render can only
+/// follow by holding everything after the marker. Neither reach was right:
+/// text past the line or the result is not part of the item.
+#[derive(Default)]
+struct CompactItemLookahead {
+    /// The item's text so far, replayed once the answer is in.
+    held: String,
+    quote: Option<char>,
+    skip_next: bool,
+}
+
+/// The most text a [`CompactItemLookahead`] holds before answering "not a
+/// key": a mapping key this long in a compact sequence item is colored as a
+/// value instead, so that `-C` stays within a bounded working set (#808).
+const LOOKAHEAD_LIMIT: usize = 64 * 1024;
+
+impl CompactItemLookahead {
+    /// The answer, once `c` settles it.
+    fn step(&mut self, c: char) -> Option<bool> {
+        if c == '\n' {
+            return Some(false);
+        }
+        if self.skip_next {
+            self.skip_next = false; // The escaped character.
+            return None;
+        }
+        match self.quote {
             Some(q) => {
                 if c == '\\' {
-                    chars.next(); // Skip the escaped character.
+                    self.skip_next = true;
                 } else if c == q {
-                    quote = None;
+                    self.quote = None;
                 }
+                None
             }
             None => match c {
-                '\n' => return false,
-                '"' | '\'' => quote = Some(c),
-                ':' => return true,
-                _ => {}
+                '"' | '\'' => {
+                    self.quote = Some(c);
+                    None
+                }
+                ':' => Some(true),
+                _ => None,
             },
         }
     }
-    false
+}
+
+/// Where [`YamlColorizer`] is relative to a list marker's question: does the
+/// item open with a key?
+enum MarkerState {
+    /// No question open.
+    None,
+    /// Right after a marker, before the item's first non-blank character.
+    /// Blanks pass straight through; a quote, a line break or a result
+    /// boundary makes the answer irrelevant (each colors the same either
+    /// way), so only another character opens [`Self::Holding`].
+    AfterMarker,
+    /// Holding the item's text until its line answers.
+    Holding(CompactItemLookahead),
+}
+
+/// The bytes that can move [`YamlColorizer`] or its lookahead out of a state
+/// in which it writes each character unchanged: quotes, the escape, a key's
+/// `:` and the end of a line.
+fn is_yaml_color_stop(b: u8) -> bool {
+    matches!(b, b'\n' | b'"' | b'\'' | b':' | b'\\')
 }
 
 /// Colorize YAML output (basic ANSI colors).
-///
-/// `boundaries` are byte offsets into `yaml`, recorded by
-/// [`ColorSink::record_boundary`] instead of writing a real terminator
-/// character into the buffer (#1708): at each one, this closes whatever
-/// color span is still open at that exact position first, then writes the
-/// real terminator -- rather than leaving it for the unconditional trailing
-/// reset below to close, which is what put the terminator *inside* the
-/// color span in the first place. Driving this off recorded positions
-/// rather than an in-band marker character avoids having to pick a marker
-/// guaranteed absent from real content -- this crate's own writers can and
-/// do emit any raw byte, including a chosen marker's own value, when the
-/// source YAML/JSON explicitly encodes one. A caller with nothing to mark
-/// (the identity/DOM paths, which write their terminator directly outside
-/// any buffer) passes an empty slice, and `yaml` is colorized exactly as
-/// before.
-// A per-statement `#[allow]` on a `close_and_terminate!()` invocation below
-// doesn't reach the assignments the macro expands to (rustc: "will be
-// ignored, since it's applied to the macro invocation"), so this covers the
-// whole function instead.
-#[allow(unused_assignments)] // STYLE-0004: close_and_terminate!'s state
-                             // resets serve its two call sites asymmetrically -- `at_key_start`/
-                             // `escape_next` are read by the main loop below but dead at the trailing
-                             // drain (nothing reads them after this function returns), while
-                             // `trailing_reset_needed` is read by the final check below but dead inside
-                             // the main loop (unconditionally overwritten by the very next line there).
-                             // Sharing one macro between both sites, rather than hand-duplicating this
-                             // close/terminate logic, is worth the resulting dead stores.
-fn colorize_yaml(yaml: &str, terminator: Terminator, boundaries: &[usize]) -> String {
-    let mut result = String::with_capacity(yaml.len() * 2 + boundaries.len() * 5);
-    let mut in_string = false;
-    let mut escape_next = false;
-    let mut at_key_start = true;
-    let mut in_key = false;
-    let mut boundary_idx = 0;
-    let mut byte_pos = 0usize;
-    // Whether the unconditional trailing reset below is still needed.
-    // `close_and_terminate!` (a boundary was just closed) clears it; any
-    // subsequently pushed content sets it again. Stays `true` throughout
-    // when `boundaries` is empty (the identity/DOM callers), so behaves
-    // exactly as before this mechanism existed for them.
-    let mut trailing_reset_needed = true;
+fn colorize_yaml(yaml: &str) -> String {
+    let mut result = String::with_capacity(yaml.len() * 2);
+    let mut colorizer = YamlColorizer::default();
+    colorizer.push_str(yaml, &mut result);
+    colorizer.finish(&mut result);
+    result
+}
 
-    // One recorded boundary per streamed result, so this correctly places
-    // every terminator in a multi-result stream, not just the last one --
-    // and closes both spans a boundary can land inside (a still-open key
-    // *or* string color), not just `in_key`, so a leftover open span from
-    // one result can never bleed its missing reset into the next. A single
-    // definition (rather than duplicating this at both call sites below)
-    // keeps the in-loop and post-loop drains from drifting apart on a
-    // future edit.
-    macro_rules! close_and_terminate {
-        () => {
-            if in_key || in_string {
-                result.push_str("\x1b[0m");
-                in_key = false;
-                in_string = false;
+/// [`colorize_yaml`] one chunk at a time, for a streamed render (#808): a
+/// result is colored as it is written instead of after the whole output has
+/// been buffered. Only a list marker's [`CompactItemLookahead`] holds text
+/// back, and only until the item's line answers it.
+struct YamlColorizer {
+    in_string: bool,
+    escape_next: bool,
+    at_key_start: bool,
+    in_key: bool,
+    /// Whether [`Self::finish`]'s trailing reset is still needed.
+    /// [`Self::boundary`] (a result was just closed) clears it; any
+    /// subsequently pushed content sets it again. Stays `true` throughout
+    /// when no boundary is ever recorded (the identity/DOM callers).
+    trailing_reset_needed: bool,
+    marker: MarkerState,
+    /// The answer a held item settled on, while its text is replayed. A
+    /// nested marker in it (`- - a: 1`) asks the same question of the same
+    /// rest of the line, so it takes this answer instead of holding the line
+    /// again -- which kept a line of `- - - …` linear rather than holding one
+    /// copy of it per marker.
+    replay_answer: Option<bool>,
+}
+
+impl Default for YamlColorizer {
+    fn default() -> Self {
+        Self {
+            in_string: false,
+            escape_next: false,
+            at_key_start: true,
+            in_key: false,
+            trailing_reset_needed: true,
+            marker: MarkerState::None,
+            replay_answer: None,
+        }
+    }
+}
+
+impl YamlColorizer {
+    fn push_str(&mut self, yaml: &str, result: &mut String) {
+        let mut rest = yaml;
+        while let Some(c) = rest.chars().next() {
+            // A run of bytes that cannot change the state is copied whole:
+            // per character, the loop costs twice what coloring a buffered
+            // render did (#808). Every byte that can is ASCII, so a run ends
+            // on a character boundary.
+            let run = match &mut self.marker {
+                MarkerState::Holding(lookahead) if !lookahead.skip_next => {
+                    let room = LOOKAHEAD_LIMIT.saturating_sub(lookahead.held.len());
+                    let mut run = output::plain_run(rest, is_yaml_color_stop).min(room);
+                    while !rest.is_char_boundary(run) {
+                        run -= 1;
+                    }
+                    lookahead.held.push_str(&rest[..run]);
+                    if lookahead.held.len() >= LOOKAHEAD_LIMIT {
+                        self.settle(false, result);
+                    }
+                    run
+                }
+                MarkerState::AfterMarker => {
+                    let run = output::plain_run(rest, |b| b != b' ');
+                    result.push_str(&rest[..run]);
+                    run
+                }
+                MarkerState::None if !self.escape_next => {
+                    // A key's indentation leaves `at_key_start` set.
+                    let run = if self.at_key_start {
+                        output::plain_run(rest, |b| b != b' ')
+                    } else {
+                        output::plain_run(rest, is_yaml_color_stop)
+                    };
+                    result.push_str(&rest[..run]);
+                    run
+                }
+                _ => 0,
+            };
+            if run > 0 {
+                self.trailing_reset_needed = true;
+                rest = &rest[run..];
+                continue;
             }
-            let _ = terminator.write_fmt(&mut result);
-            at_key_start = true;
-            escape_next = false;
-            trailing_reset_needed = false;
-        };
+            self.push_char(c, result);
+            rest = &rest[c.len_utf8()..];
+        }
     }
 
-    let mut chars = yaml.chars();
-    while let Some(c) = chars.next() {
-        while boundary_idx < boundaries.len() && boundaries[boundary_idx] <= byte_pos {
-            close_and_terminate!();
-            boundary_idx += 1;
+    /// Ends a streamed result: closes both spans it can end inside (a still
+    /// open key *or* string color), so a leftover open span from one result
+    /// can never bleed its missing reset into the next, then writes
+    /// `terminator` (#1708). An item still held is answered first: the
+    /// result's end is the end of its line.
+    fn boundary(&mut self, terminator: Terminator, result: &mut String) {
+        self.settle(false, result);
+        self.marker = MarkerState::None;
+        if self.in_key || self.in_string {
+            result.push_str("\x1b[0m");
+            self.in_key = false;
+            self.in_string = false;
         }
-        // Real content follows -- if a boundary just fired above, its
-        // terminator is no longer the buffer's final byte, so the trailing
-        // safety-net reset is needed again.
-        trailing_reset_needed = true;
+        result.push_str(terminator.as_str());
+        self.at_key_start = true;
+        self.escape_next = false;
+        self.trailing_reset_needed = false;
+    }
 
-        if escape_next {
+    /// Answers an item the input ended inside (the end of the text is the
+    /// end of its line), then closes the last span unless a boundary already
+    /// did -- a reset *after* that boundary's terminator would be the same
+    /// "reset must precede terminator" defect #1708 was filed for, just
+    /// relocated to the tail of the output.
+    fn finish(&mut self, result: &mut String) {
+        self.settle(false, result);
+        if self.trailing_reset_needed {
+            result.push_str("\x1b[0m");
+        }
+    }
+
+    fn push_char(&mut self, c: char, result: &mut String) {
+        match &mut self.marker {
+            MarkerState::None => {}
+            MarkerState::AfterMarker => {
+                if c.is_whitespace() && c != '\n' {
+                    result.push(c);
+                    self.trailing_reset_needed = true;
+                    return;
+                }
+                self.marker = MarkerState::None;
+                if !matches!(c, '"' | '\'' | '\n') {
+                    match self.replay_answer {
+                        Some(opens_with_key) => self.at_key_start = opens_with_key,
+                        None => {
+                            self.marker = MarkerState::Holding(CompactItemLookahead::default());
+                            return self.push_char(c, result);
+                        }
+                    }
+                }
+            }
+            MarkerState::Holding(lookahead) => {
+                lookahead.held.push(c);
+                if let Some(opens_with_key) = lookahead.step(c) {
+                    self.settle(opens_with_key, result);
+                } else if lookahead.held.len() >= LOOKAHEAD_LIMIT {
+                    self.settle(false, result);
+                }
+                return;
+            }
+        }
+        // Real content follows -- if a boundary just fired, its terminator
+        // is no longer the output's final byte, so the trailing safety-net
+        // reset is needed again.
+        self.trailing_reset_needed = true;
+
+        if self.escape_next {
             result.push(c);
-            escape_next = false;
-            byte_pos += c.len_utf8();
-            continue;
+            self.escape_next = false;
+            return;
         }
 
-        if c == '\\' && (in_string || in_key) {
+        if c == '\\' && (self.in_string || self.in_key) {
             result.push(c);
-            escape_next = true;
-            byte_pos += c.len_utf8();
-            continue;
+            self.escape_next = true;
+            return;
         }
 
         match c {
             '"' | '\'' => {
-                if in_string {
+                if self.in_string {
                     result.push(c);
                     result.push_str("\x1b[0m");
-                    in_string = false;
+                    self.in_string = false;
                 } else {
                     result.push_str("\x1b[32m"); // Green for strings
                     result.push(c);
-                    in_string = true;
+                    self.in_string = true;
                 }
-                at_key_start = false;
+                self.at_key_start = false;
             }
-            ':' if !in_string => {
+            ':' if !self.in_string => {
                 // Only close a color span that's actually open (`in_key`)
                 // - otherwise this `:` belongs to a value that was never
                 // colored (e.g. a quoted-key's colon after the closing
                 // quote already reset color, or a `:` inside an uncolored
                 // token), and unconditionally emitting a reset here would
                 // write an orphaned `\x1b[0m` with no matching open.
-                if in_key {
+                if self.in_key {
                     result.push_str("\x1b[0m");
                 }
                 result.push(c);
-                in_key = false;
-                at_key_start = false;
+                self.in_key = false;
+                self.at_key_start = false;
             }
             '\n' => {
                 result.push(c);
-                at_key_start = true;
-                in_key = false;
+                self.at_key_start = true;
+                self.in_key = false;
             }
-            '-' if at_key_start => {
+            '-' if self.at_key_start => {
                 result.push_str("\x1b[33m"); // Yellow for list markers
                 result.push(c);
                 result.push_str("\x1b[0m");
@@ -9436,39 +9660,37 @@ fn colorize_yaml(yaml: &str, terminator: Terminator, boundaries: &[usize]) -> St
                 // #785) puts its mapping's first key directly after `- `
                 // on the same line, instead of on a fresh line (which
                 // already re-triggers `at_key_start` via the `\n` arm
-                // above) - see `compact_item_opens_with_key`'s doc comment.
-                at_key_start = compact_item_opens_with_key(chars.as_str());
+                // above) - see `CompactItemLookahead`'s doc comment.
+                self.marker = MarkerState::AfterMarker;
             }
-            _ if at_key_start && !c.is_whitespace() && !in_string => {
+            _ if self.at_key_start && !c.is_whitespace() && !self.in_string => {
                 result.push_str("\x1b[36m"); // Cyan for keys
                 result.push(c);
-                in_key = true;
-                at_key_start = false;
+                self.in_key = true;
+                self.at_key_start = false;
             }
             _ => {
                 result.push(c);
                 if !c.is_whitespace() {
-                    at_key_start = false;
+                    self.at_key_start = false;
                 }
             }
         }
-        byte_pos += c.len_utf8();
     }
-    while boundary_idx < boundaries.len() {
-        // A boundary at (or past) the very end of `yaml` -- e.g. the last
-        // streamed result's terminator, with no further content after it.
-        close_and_terminate!();
-        boundary_idx += 1;
+
+    /// Answers a held item, then colors the text it held back. A nested
+    /// marker in that text takes the same answer ([`Self::replay_answer`]).
+    fn settle(&mut self, opens_with_key: bool, result: &mut String) {
+        let MarkerState::Holding(lookahead) =
+            core::mem::replace(&mut self.marker, MarkerState::None)
+        else {
+            return;
+        };
+        self.at_key_start = opens_with_key;
+        self.replay_answer = Some(opens_with_key);
+        self.push_str(&lookahead.held, result);
+        self.replay_answer = None;
     }
-    // Skipped when the buffer's last write was already a boundary's own
-    // terminator (the ordinary case for every M2 evaluated-color result) --
-    // otherwise this would place a redundant reset *after* that terminator,
-    // the same "reset must precede terminator" defect #1708 was filed for,
-    // just relocated to the tail of the buffer instead of the middle.
-    if trailing_reset_needed {
-        result.push_str("\x1b[0m");
-    }
-    result
 }
 
 /// Parse a `--argjson` value into an `OwnedValue`.
@@ -10199,11 +10421,11 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     //
     // `can_stream_pretty_or_colored` gates every M2 fast path below,
     // stdout, `--slurp`, and `--inplace` alike: color, when requested, is
-    // handled by `stream_maybe_colored` buffering the (still
-    // duplicate-key-safe) cursor-streamed output and running it through the
-    // existing `colorize_yaml`/`colorize_json` post-processors, rather than
-    // falling back to the DOM/IndexMap path that would collapse duplicate
-    // mapping keys (#442, #748, #809).
+    // handled by `stream_maybe_colored` running the (still
+    // duplicate-key-safe) cursor-streamed output through the existing
+    // `colorize_yaml`/`colorize_json` re-lexers as it is written (#808),
+    // rather than falling back to the DOM/IndexMap path that would collapse
+    // duplicate mapping keys (#442, #748, #809).
     let can_stream_pretty_or_colored = !args.pretty_print;
     // `--ascii-output` no longer appears here (#1700). It used to gate the
     // whole disjunction (#1693) because no M2 JSON streamer could escape
@@ -10447,14 +10669,15 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                         )?;
                         None
                     };
-                    // No boundary recorded here -- the terminator is written
-                    // directly to `$writer` below, outside this buffer (#1708).
+                    // No result ended here -- the terminator is written
+                    // directly to `$writer` below, after the colorizer has
+                    // closed its last span (#1708).
                     let rendered = stream_maybe_colored(
                         $writer,
                         $use_color,
                         terminator,
                         nul_separator,
-                        |s, boundaries| colorize_yaml(s, Terminator::None, boundaries),
+                        ColorSyntax::Yaml,
                         |out| $cursor.stream_yaml_as_document(out, yaml_indent, sort_keys),
                     )?;
                     // #1615: this identity/P9 branch skips evaluation, so it
@@ -10519,9 +10742,9 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                         // on `result.produces_output()` itself (#1709 code
                         // review): a document producing zero results must
                         // never offer a separator opportunity at all, colored
-                        // or not -- the color/`Buffered` arm of
-                        // `stream_maybe_colored` has no empty-buffer guard of
-                        // its own the way the non-color `NulChecked` arm does,
+                        // or not -- the colored `NulChecked` arm of
+                        // `stream_maybe_colored` writes the separator for an
+                        // empty render, where the non-color arm does not,
                         // so an ungated `Some(..)` here wrote a stray `---`
                         // around an empty middle document even when nothing
                         // failed the NUL check at all. Live-verified regression:
@@ -10543,15 +10766,12 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                             None
                         };
                         // #1708: the per-result terminator write runs *inside*
-                        // this buffered render callback, so a real terminator
-                        // byte here would become part of what gets colorized --
-                        // record the result's boundary instead when colorizing,
-                        // so `colorize_yaml` can place the real terminator
-                        // itself afterward, correctly relative to whatever
-                        // color span is open at each result boundary. The
-                        // non-colored path (`$writer` written directly, no
-                        // buffering) is unaffected and still writes the real
-                        // terminator either way.
+                        // this render callback, so it goes through the sink's
+                        // `write_result_terminator`: when colorizing, that
+                        // closes whatever color span is open at the result's
+                        // end before writing the real terminator. The
+                        // non-colored path writes the real terminator
+                        // directly.
                         // #4926: a sort/reverse/unique of the document's own sequence keeps the
                         // comment block above it, which the items' streaming has no node to read.
                         let reordered_head =
@@ -10561,7 +10781,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                             $use_color,
                             terminator,
                             nul_separator,
-                            |s, boundaries| colorize_yaml(s, terminator, boundaries),
+                            ColorSyntax::Yaml,
                             |out| {
                                 if reordered_head {
                                     $cursor
@@ -10618,7 +10838,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                         $use_color,
                         terminator,
                         None,
-                        |s, _boundaries| output::colorize_json(s, &ColorScheme::default()),
+                        ColorSyntax::Json,
                         |sink| {
                             json_ascii!($output_config.ascii_output, sink, |out| {
                                 // Explicit `DocumentCursor::stream_json(...)`
@@ -10673,7 +10893,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                             $use_color,
                             terminator,
                             None,
-                            |s, _boundaries| output::colorize_json(s, &ColorScheme::default()),
+                            ColorSyntax::Json,
                             |sink| {
                                 json_ascii!($output_config.ascii_output, sink, |out| {
                                     result
@@ -10683,34 +10903,20 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                                             sort_keys,
                                             JsonConvention::Preserve,
                                             |w| {
-                                                // #1709: `--color`'s `Buffered` mode
-                                                // needs the raw terminator byte
-                                                // written straight into its buffer
-                                                // (JSON's own colorizer re-lexes
-                                                // that unmodified, unlike YAML's
-                                                // boundary-based one -- see
-                                                // `stream_maybe_colored`'s own
-                                                // comment on this). `write_result_
-                                                // terminator` would silently drop
-                                                // it there. Every other mode
-                                                // (`Direct`, `NulChecked`) is
-                                                // unaffected either way -- `Direct`'s
-                                                // own arm is exactly `terminator.
-                                                // write_fmt(self)`, and `NulChecked`
-                                                // needs the dispatch to trigger its
-                                                // per-result flush. `dispatch_
-                                                // result_terminator` (not
-                                                // `write_result_terminator`
+                                                // `Colored` feeds the raw
+                                                // terminator byte to JSON's
+                                                // colorizer (#1709, #808),
+                                                // `Direct` writes it, and
+                                                // `NulChecked` needs the dispatch
+                                                // to trigger its per-result flush.
+                                                // `dispatch_result_terminator`
+                                                // (not `write_result_terminator`
                                                 // directly) since `--ascii-output`
                                                 // wraps `w` in `AsciiEscapeWriter`
                                                 // here, which has no
                                                 // `ColorSink`-specific methods of
                                                 // its own.
-                                                if $use_color {
-                                                    terminator.write_fmt(w)
-                                                } else {
-                                                    w.dispatch_result_terminator(terminator)
-                                                }
+                                                w.dispatch_result_terminator(terminator)
                                             },
                                         )
                                         .map_err(StreamFailure::from)
@@ -10893,15 +11099,15 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                         if is_identity {
                             // P9 path for identity on single doc
                             let streamed_ok = if can_yaml_fast_path {
-                                // No boundary recorded here --
-                                // `write_terminator` below writes directly,
-                                // outside this buffer (#1708).
+                                // patchcov: coverage tolerate-line reason="unreachable: this whole `_ =>` arm is dead code, see the tolerated lines below"
+                                // No result ended here -- `write_terminator`
+                                // below writes directly, after the colored text (#1708).
                                 stream_or_report(
                                     &mut writer,
                                     output_config.use_color,
                                     terminator_from_config(&output_config),
                                     &mut sink,
-                                    |s, boundaries| colorize_yaml(s, Terminator::None, boundaries),
+                                    ColorSyntax::Yaml, // patchcov: coverage tolerate-line reason="unreachable: this whole `_ =>` arm is dead code -- `root.value()` always reports the virtual document sequence, so single-document YAML never falls through here (see the tolerated arm below)"
                                     |out| root.stream_yaml_document(out, yaml_indent, sort_keys),
                                 )?
                             } else {
@@ -10910,9 +11116,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                                     output_config.use_color,
                                     terminator_from_config(&output_config),
                                     &mut sink,
-                                    |s, _boundaries| {
-                                        output::colorize_json(s, &ColorScheme::default())
-                                    },
+                                    ColorSyntax::Json, // patchcov: coverage tolerate-line reason="unreachable: this whole `_ =>` arm is dead code -- `root.value()` always reports the virtual document sequence, so single-document YAML never falls through here (see the tolerated arm below)"
                                     |sink| {
                                         json_ascii!(output_config.ascii_output, sink, |out| {
                                             root.stream_json_document(out, json_indent, sort_keys)
@@ -11109,17 +11313,15 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                             if is_identity {
                                 // P9 path for identity on single doc
                                 let streamed_ok = if can_yaml_fast_path {
-                                    // No boundary recorded here --
-                                    // `write_terminator` below writes
-                                    // directly, outside this buffer (#1708).
+                                    // patchcov: coverage tolerate-line reason="unreachable: this whole `_ =>` arm is dead code, see the tolerated lines below"
+                                    // No result ended here -- `write_terminator`
+                                    // below writes directly, after the colored text (#1708).
                                     stream_or_report(
                                         &mut writer,
                                         output_config.use_color,
                                         terminator_from_config(&output_config),
                                         &mut sink,
-                                        |s, boundaries| {
-                                            colorize_yaml(s, Terminator::None, boundaries)
-                                        },
+                                        ColorSyntax::Yaml, // patchcov: coverage tolerate-line reason="unreachable: this whole `_ =>` arm is dead code -- `root.value()` always reports the virtual document sequence, so single-document YAML never falls through here (see the tolerated arm below)"
                                         |out| {
                                             root.stream_yaml_document(out, yaml_indent, sort_keys)
                                         },
@@ -11130,9 +11332,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                                         output_config.use_color,
                                         terminator_from_config(&output_config),
                                         &mut sink,
-                                        |s, _boundaries| {
-                                            output::colorize_json(s, &ColorScheme::default())
-                                        },
+                                        ColorSyntax::Json, // patchcov: coverage tolerate-line reason="unreachable: this whole `_ =>` arm is dead code -- `root.value()` always reports the virtual document sequence, so single-document YAML never falls through here (see the tolerated arm below)"
                                         |sink| {
                                             json_ascii!(output_config.ascii_output, sink, |out| {
                                                 root.stream_json_document(
@@ -11626,8 +11826,8 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 // matching jq/yq `-e` semantics for arrays.
                 any_truthy = true;
             }
-            // Buffer-and-colorize (#748, extended to `--slurp` by #809, and
-            // to `-o=json` by #1577): `stream_yaml_sequence`/
+            // Colorize-as-it-streams (#748, extended to `--slurp` by #809, to
+            // `-o=json` by #1577, streamed by #808): `stream_yaml_sequence`/
             // `stream_json_sequence` are both generic over `core::fmt::Write`,
             // so each slots into `stream_maybe_colored` unmodified.
             let streamed_ok = if output_config.output_format == OutputFormat::Json {
@@ -11636,7 +11836,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                     output_config.use_color,
                     terminator_from_config(&output_config),
                     &mut sink,
-                    |s, _boundaries| output::colorize_json(s, &ColorScheme::default()),
+                    ColorSyntax::Json,
                     |sink| {
                         json_ascii!(output_config.ascii_output, sink, |out| {
                             stream_json_sequence(
@@ -11651,14 +11851,14 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                     },
                 )?
             } else {
-                // No boundary recorded here -- `write_terminator` below
-                // writes directly, outside this buffer (#1708).
+                // No result ended here -- `write_terminator` below
+                // writes directly, after the colored text (#1708).
                 stream_or_report(
                     &mut writer,
                     output_config.use_color,
                     terminator_from_config(&output_config),
                     &mut sink,
-                    |s, boundaries| colorize_yaml(s, Terminator::None, boundaries),
+                    ColorSyntax::Yaml,
                     |out| {
                         stream_yaml_sequence(
                             cursors.iter().copied(),
@@ -12557,11 +12757,10 @@ fn run_exit_code(sink: &ErrorSink, exit_status: bool, any_truthy: bool) -> i32 {
 mod tests {
     use super::*;
 
-    /// #2004: `stream_maybe_colored` colorizes the results before the first NUL as a prefix of
-    /// the buffered render, which is only sound if that is the same text as the corresponding
-    /// leading slice of the whole render. The colorizer resets its lexer state at every
-    /// recorded boundary, so it is -- including for results that open a span another result
-    /// closes.
+    /// #2004: `stream_maybe_colored` writes the colorized results before the first NUL and
+    /// stops, which is only sound if that is the same text as the corresponding leading slice
+    /// of the whole colored render. The colorizer resets its lexer state at every result
+    /// boundary, so it is -- including for results that open a span another result closes.
     #[test]
     fn test_colorize_yaml_prefix_at_a_boundary_is_a_prefix_of_the_whole_2004() {
         // Each case is the results, in order; the buffer is their concatenation (no terminator
@@ -12581,10 +12780,14 @@ mod tests {
                 })
                 .collect();
             for terminator in [Terminator::Nul, Terminator::Newline, Terminator::None] {
-                let whole = colorize_yaml(&buf, terminator, &boundaries);
+                let whole = colorize_yaml_in_pieces(&buf, terminator, &boundaries, &[]);
                 for k in 1..=boundaries.len() {
-                    let prefix =
-                        colorize_yaml(&buf[..boundaries[k - 1]], terminator, &boundaries[..k]);
+                    let prefix = colorize_yaml_in_pieces(
+                        &buf[..boundaries[k - 1]],
+                        terminator,
+                        &boundaries[..k],
+                        &[],
+                    );
                     assert!(
                         whole.starts_with(&prefix),
                         "{results:?} {terminator:?} k={k}\nprefix: {prefix:?}\nwhole:  {whole:?}"
@@ -12592,6 +12795,282 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Colors `yaml` through [`YamlColorizer`] in pieces: a piece ends at every one of `cuts`
+    /// and every one of `boundaries`, and a result ends at each of the latter.
+    fn colorize_yaml_in_pieces(
+        yaml: &str,
+        terminator: Terminator,
+        boundaries: &[usize],
+        cuts: &[usize],
+    ) -> String {
+        let mut events: Vec<(usize, bool)> = boundaries.iter().map(|&b| (b, true)).collect();
+        events.extend(cuts.iter().map(|&c| (c, false)));
+        events.sort_unstable();
+        let mut colorizer = YamlColorizer::default();
+        let mut result = String::new();
+        let mut start = 0;
+        for (pos, ends_result) in events {
+            colorizer.push_str(&yaml[start..pos], &mut result);
+            start = pos;
+            if ends_result {
+                colorizer.boundary(terminator, &mut result);
+            }
+        }
+        colorizer.push_str(&yaml[start..], &mut result);
+        colorizer.finish(&mut result);
+        result
+    }
+
+    /// #808: a streamed render reaches the colorizer in whatever pieces the streamers write, so
+    /// coloring it piecewise must give the bytes coloring it whole does. The cases a piece can
+    /// end inside: a list marker's lookahead (held until its line or result answers it), a
+    /// nested marker, a quoted scalar and an escape.
+    #[test]
+    fn test_yaml_colorizer_output_is_independent_of_chunking_808() {
+        for (yaml, boundaries) in [
+            ("- a: 1\n  b: 2\n- - x: 'it''s'\n  - 3\n", &[][..]),
+            ("- foobar: 1", &[5][..]),
+            ("- foo\nbar: 1\n", &[6, 13][..]),
+            ("key: \"a\\\"b\"\n- \"q: x\"\n- k\\: v\n- ", &[][..]),
+            ("\"k\": v\n-", &[7][..]),
+            ("é: ü\n- ö", &[][..]),
+        ] {
+            for terminator in [Terminator::Nul, Terminator::Newline, Terminator::None] {
+                let whole = colorize_yaml_in_pieces(yaml, terminator, boundaries, &[]);
+                let char_ends: Vec<usize> = yaml.char_indices().map(|(i, _)| i).skip(1).collect();
+                assert_eq!(
+                    colorize_yaml_in_pieces(yaml, terminator, boundaries, &char_ends),
+                    whole,
+                    "{yaml:?} one character at a time"
+                );
+                for &cut in &char_ends {
+                    assert_eq!(
+                        colorize_yaml_in_pieces(yaml, terminator, boundaries, &[cut]),
+                        whole,
+                        "{yaml:?} cut at {cut}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// #808: a list item's "does it open with a key" lookahead stops at the end of its own line
+    /// and its own result, and after [`LOOKAHEAD_LIMIT`] bytes, so a streamed `-C` holds at
+    /// most that much. The whole-buffer scan it replaced read on into the next result (coloring
+    /// `foo` as a key because the *next* result is `bar: 1`) and, through an apostrophe, onto
+    /// later lines; a streamed render could only follow either by holding the rest of the output.
+    #[test]
+    fn test_yaml_colorizer_lookahead_is_bounded_808() {
+        let marker = "\x1b[33m-\x1b[0m";
+        assert_eq!(
+            colorize_yaml_in_pieces("- foobar: 1", Terminator::Newline, &[5], &[]),
+            format!("{marker} foo\n\x1b[36mbar\x1b[0m: 1\x1b[0m")
+        );
+        assert!(
+            colorize_yaml("- don't\nk's: 1\n").starts_with(&format!("{marker} don")),
+            "an apostrophe's quote ends with its line"
+        );
+        let key = "x".repeat(100);
+        assert!(colorize_yaml(&format!("- {key}: 1"))
+            .starts_with(&format!("{marker} \x1b[36m{key}\x1b[0m:")));
+        let long_key = "x".repeat(LOOKAHEAD_LIMIT);
+        assert!(
+            colorize_yaml(&format!("- {long_key}: 1")).starts_with(&format!("{marker} xxx")),
+            "past the limit the item is answered as a value"
+        );
+        // Each nested marker takes the outer answer rather than holding the rest of the line
+        // again: one copy of the line, not one per marker.
+        let nested = format!("{}a: 1", "- ".repeat(10_000));
+        let colored = colorize_yaml(&nested);
+        assert_eq!(colored.matches(marker).count(), 10_000);
+        assert!(colored.ends_with("\x1b[36ma\x1b[0m: 1\x1b[0m"));
+    }
+
+    /// A `Write` that shares what it was handed, so a test can read it while the writer is
+    /// still borrowed by a render.
+    struct SharedWriter(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// #808: `--colors` writes a render as it is colored, a buffer's worth at a time, not after
+    /// the render returns -- what gives `-C` constant memory and lets `| head` stop it early --
+    /// and the bytes are the whole-output colorizer's.
+    #[test]
+    fn test_colored_render_reaches_the_writer_before_it_returns_808() {
+        use core::fmt::Write as _;
+        let yaml = "a: 1\n".repeat(COLOR_BLOCK_BYTES);
+        let json = format!("[{}", "1,".repeat(COLOR_BLOCK_BYTES));
+        for (syntax, first, rest, expected) in [
+            (
+                ColorSyntax::Yaml,
+                yaml.as_str(),
+                "b: x\n",
+                colorize_yaml(&format!("{yaml}b: x\n")),
+            ),
+            (
+                ColorSyntax::Json,
+                json.as_str(),
+                "2]",
+                output::colorize_json(&format!("{json}2]"), &ColorScheme::default()),
+            ),
+        ] {
+            let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let mut writer = SharedWriter(seen.clone());
+            let rendered = stream_maybe_colored(
+                &mut writer,
+                true,
+                Terminator::Newline,
+                None,
+                syntax,
+                |out| {
+                    // A token at a time, as the streamers write (ASCII, so every cut is a
+                    // character boundary).
+                    for piece in first.as_bytes().chunks(3) {
+                        out.write_str(core::str::from_utf8(piece).unwrap())?;
+                    }
+                    let written_mid_render = seen.borrow().len();
+                    out.write_str(rest)?;
+                    Ok(written_mid_render)
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert!(
+                rendered > 0,
+                "{syntax:?}: nothing written before the render returned"
+            );
+            writer.flush().unwrap();
+            assert_eq!(String::from_utf8(seen.take()).unwrap(), expected);
+        }
+    }
+
+    /// A `Write` whose every write fails, for the paths that report a dead output.
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("closed"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// #808: a write larger than a block is cut into blocks without splitting a character, a
+    /// result's end drains a block's worth of color, and a finish with nothing left writes
+    /// nothing.
+    #[test]
+    fn test_colorizer_block_edges_808() {
+        // The block boundary (byte 8192) falls inside the two-byte `é`.
+        let json = format!(
+            "[\"{}é{}\"]",
+            "a".repeat(COLOR_BLOCK_BYTES - 3),
+            "b".repeat(10)
+        );
+        assert!(!json.is_char_boundary(COLOR_BLOCK_BYTES));
+        let mut colorizer = Colorizer::new(ColorSyntax::Json);
+        let mut out = Vec::new();
+        colorizer.write(&mut out, &json).unwrap();
+        colorizer.finish(&mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            output::colorize_json(&json, &ColorScheme::default())
+        );
+
+        // Under a block of text, over one once colored: the result's end writes it.
+        let yaml = "a: 1\n".repeat(COLOR_BLOCK_BYTES / 5 - 10);
+        assert!(yaml.len() < COLOR_BLOCK_BYTES);
+        let mut colorizer = Colorizer::new(ColorSyntax::Yaml);
+        let mut out = Vec::new();
+        colorizer.write(&mut out, &yaml).unwrap();
+        assert_eq!(out, Vec::<u8>::new());
+        colorizer.end_result(&mut out, Terminator::Newline).unwrap();
+        assert!(!out.is_empty(), "the colored block was not written");
+        colorizer.finish(&mut out).unwrap();
+        let mut expected = String::new();
+        let mut lexer = YamlColorizer::default();
+        lexer.push_str(&yaml, &mut expected);
+        lexer.boundary(Terminator::Newline, &mut expected);
+        lexer.finish(&mut expected);
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
+
+        let mut out = Vec::new();
+        Colorizer::new(ColorSyntax::Json).finish(&mut out).unwrap();
+        assert_eq!(out, Vec::<u8>::new());
+    }
+
+    /// #808: a dead output is reported as a write error, whether the render fills a block
+    /// (the write fails mid-render) or ends short of one (the write fails closing the last span).
+    #[test]
+    fn test_colored_render_to_a_failing_writer_808() {
+        use core::fmt::Write as _;
+        for terminator in [Terminator::Newline, Terminator::Nul] {
+            for body in [
+                "[1]".to_string(),
+                format!("[{}1]", "1,".repeat(COLOR_BLOCK_BYTES)),
+            ] {
+                let err = stream_maybe_colored(
+                    &mut FailingWriter,
+                    true,
+                    terminator,
+                    None,
+                    ColorSyntax::Json,
+                    |out| out.write_str(&body).map_err(StreamFailure::from),
+                )
+                .unwrap_err();
+                assert_eq!(err.to_string(), "Write error", "{terminator:?}");
+            }
+        }
+        // `-0` with a document separator checks each result before coloring it, so the
+        // short render's colored text is only written when the render finishes.
+        let mut doc_streamed = false;
+        let err = stream_maybe_colored(
+            &mut FailingWriter,
+            true,
+            Terminator::Nul,
+            Some(DocSeparatorArgs {
+                doc_streamed: &mut doc_streamed,
+                no_doc: true,
+            }),
+            ColorSyntax::Yaml,
+            |out| out.write_str("a: 1\n").map_err(StreamFailure::from),
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "Write error");
+    }
+
+    /// #808: the lookahead's quote tracking (an escaped quote does not close a quote, a closing
+    /// quote re-exposes the `:`), the cut at the limit falling inside a character, and a blank
+    /// other than a space after a marker.
+    #[test]
+    fn test_yaml_colorizer_lookahead_edges_808() {
+        let key = "\x1b[36m";
+        assert!(
+            colorize_yaml("- x\"a\\\"b\": 1\n").contains(key),
+            "key after a quoted run"
+        );
+        assert!(
+            !colorize_yaml("- x\"a\\\":b\" c\n").contains(key),
+            "a colon inside the quote is not a key"
+        );
+        // `é` straddles the limit: the run stops before it and the character itself settles it.
+        let straddle = format!("- {}é: 1\n", "x".repeat(LOOKAHEAD_LIMIT - 1));
+        assert!(!colorize_yaml(&straddle).contains(key));
+        let tab = colorize_yaml("- \tk: 1\n");
+        assert!(tab.contains('\t'), "{tab:?}");
+        assert!(tab.contains(&format!("{key}k")), "{tab:?}");
     }
 
     /// #2706: a write followed by a *static* navigation is split into the write and the steps
