@@ -1561,6 +1561,86 @@ fn loops_run_in_constant_stack_and_in_jqs_order_5223() {
     });
 }
 
+/// #5379: a call with no arguments, last in the body of a `def`, runs as a loop, as jq's
+/// `TAIL_CALL_JQ` does. The nested form was refused at `MAX_EVAL_FRAMES` live calls (about
+/// 13,000 levels here, on the native-stack floor). The register follows the input from stage to
+/// stage, so a path through the loop is the path jq reports.
+#[test]
+fn a_tail_recursive_def_runs_as_a_loop_5379() {
+    on_big_stack(|| {
+        check(&[
+            (
+                "0",
+                "def f: if . < 300000 then . + 1 | f else . end; f",
+                ok(&["300000"]),
+            ),
+            (
+                r#"{"a":0}"#,
+                "def f: if . < 200000 then . + 1 | f else . end; [(.a | f), path(.a)]",
+                ok(&[r#"[200000,["a"]]"#]),
+            ),
+            // The register is carried through the stages in front of the call.
+            (
+                r#"{"a":{"a":{"a":0}}}"#,
+                r#"def f: if type == "object" then .a | f else . end; [path(f)]"#,
+                ok(&[r#"[["a","a","a"]]"#]),
+            ),
+            (
+                r#"{"a":{"a":{"a":0}}}"#,
+                r#"def f: if type == "object" then .a | f else . end; path(f)"#,
+                ok(&[r#"["a","a","a"]"#]),
+            ),
+            (
+                "[0]",
+                "def f: if (.[0] // 0) < 200000 then .[0] += 1 | f else .[0] end; [f, path(.[0])]",
+                ok(&["[200000,[0]]"]),
+            ),
+            // An outer def called from a nested one.
+            (
+                "0",
+                "def f: def h: f; if . < 200000 then . + 1 | h else . end; f",
+                ok(&["200000"]),
+            ),
+            // A comma emits its front branches before the call, and a consumer that
+            // stops ends the loop.
+            (
+                "0",
+                "def f: if . < 5 then ., (. + 1 | f) else . end; [f]",
+                ok(&["[0,1,2,3,4,5]"]),
+            ),
+            (
+                "0",
+                "[limit(3; def f: ., (. + 1 | f); f)]",
+                ok(&["[0,1,2]"]),
+            ),
+            (
+                "0",
+                r#"def f: if . < 200000 then . + 1 | f else error("boom") end; try f catch ."#,
+                ok(&[r#""boom""#]),
+            ),
+            // The stages the loop passes through do not make a path of what they build.
+            (
+                "0",
+                "def f: if . < 3 then . + 1 | f else . end; [path(f)]",
+                err(&[], "Invalid path expression with result 3"),
+            ),
+            // jq loops on this forever; the round budget stops it with the refusal the
+            // nested form raised.
+            (
+                "0",
+                "def f: f; f",
+                err(&[], "f/0 exceeded maximum recursion depth"),
+            ),
+            // Not a call jq jumps from: it still nests, and still reaches the guard.
+            (
+                "0",
+                "def f: [f]; f",
+                err(&[], "f/0 exceeded maximum recursion depth"),
+            ),
+        ]);
+    });
+}
+
 /// Every routed library entry answers a dynamic path program as jq 1.7.1
 /// does, through the interpreter: the collecting cursor entry, `eval_using` on
 /// a document value and eval.rs's owned entry. A document that cannot be

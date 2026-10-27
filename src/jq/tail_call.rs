@@ -97,7 +97,7 @@ pub(crate) fn spine_has_tail_call(body: &Expr) -> bool {
 /// zero-argument call by name (or one already installed) at the end of the spine.
 /// May say yes for a call that turns out to be a builtin, which only sends the
 /// body through the loop, whose answer is the nested one's.
-fn declared_tail_call(then: &Expr) -> bool {
+pub(crate) fn declared_tail_call(then: &Expr) -> bool {
     let mut expr = then;
     loop {
         match expr {
