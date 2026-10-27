@@ -2304,6 +2304,7 @@ impl<'e> Interp<'e> {
                         emitted += 1;
                         if emitted > MAX_RANGE_TOTAL {
                             return Err(Raise::Fatal(range_max_exceeded_error()));
+                            // patchcov: coverage tolerate-line reason="expensive: reached only after MAX_RANGE_TOTAL (2^26) values have been emitted, seconds of CPU and no test of the 2^26-value kind is cheap; the cap is pinned by the each_range_batches_* unit tests (#5292)"
                         }
                         sink(current.clone(), reg.clone())?;
                         current = compound_step("_sp_upd_add", &current, &step)?;
@@ -3455,7 +3456,7 @@ fn range_values(start: OwnedValue, end: &OwnedValue, reg: &Reg, sink: &mut Sink<
         }
         emitted += 1;
         if emitted > MAX_RANGE_TOTAL {
-            return Err(Raise::Fatal(range_max_exceeded_error()));
+            return Err(Raise::Fatal(range_max_exceeded_error())); // patchcov: coverage tolerate-line reason="expensive: reached only after MAX_RANGE_TOTAL (2^26) values have been emitted, seconds of CPU and no test of the 2^26-value kind is cheap; the cap is pinned by the each_range_batches_* unit tests (#5292)"
         }
         let value = first.take().unwrap_or_else(|| number_owned(cur));
         sink(value, reg.clone())?;

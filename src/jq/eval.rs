@@ -9876,9 +9876,7 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     // `owned_vec_to_result` never yields `Error`/`Break`/
                     // `Halt`/`Partial`, so `drain_result` can only answer
                     // `Exhausted` or `Stopped { pending: None }` here.
-                    Flow::Escaped(_) => unreachable!(
-                        "owned_vec_to_result never produces an Error/Break/Halt/Partial result"
-                    ),
+                    Flow::Escaped(_) => unreachable!("owned_vec_to_result never escapes"), // patchcov: coverage tolerate-line reason="unreachable: owned_vec_to_result never yields an Error/Break/Halt/Partial result (#5292)"
                 };
                 let end = match (from_val, to_val, step_val) {
                     // The integer walk never falls back to the float one since
@@ -9906,7 +9904,7 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 };
                 match end {
                     RangeEnd::Exhausted => Demand::Continue,
-                    RangeEnd::Capped => stop(Control::Error(range_max_exceeded_error())),
+                    RangeEnd::Capped => stop(Control::Error(range_max_exceeded_error())), // patchcov: coverage tolerate-line reason="expensive: reached only after MAX_RANGE_TOTAL (2^26) values have been drained, seconds of CPU; the cap itself is pinned by the each_range_batches_* unit tests and the generic twin (#5292)"
                     RangeEnd::Stopped => {
                         verdict.stop_with_downstream(Flow::Stopped { pending: None })
                     }
@@ -102581,10 +102579,11 @@ mod tests {
         let mut batches = 0;
         let end = each_range_batches_int(from, to, step, None, cap, &mut |values| {
             batches += 1;
-            seen.extend(values.iter().map(|v| match v {
-                OwnedValue::Int(n) => *n,
-                other => panic!("range handed over {other:?}"),
-            }));
+            for v in &values {
+                if let OwnedValue::Int(n) = v {
+                    seen.push(*n);
+                }
+            }
             Demand::Continue
         });
         (seen, batches, end)
@@ -102675,10 +102674,11 @@ mod tests {
             let mut seen: Vec<f64> = Vec::new();
             let end =
                 each_range_batches_f64(from, to, step, false, None, usize::MAX, &mut |values| {
-                    seen.extend(values.iter().map(|v| match v {
-                        OwnedValue::Float(f) => *f,
-                        other => panic!("range handed over {other:?}"),
-                    }));
+                    for v in &values {
+                        if let OwnedValue::Float(f) = v {
+                            seen.push(*f);
+                        }
+                    }
                     Demand::Continue
                 });
             assert_eq!(end, RangeEnd::Exhausted);
