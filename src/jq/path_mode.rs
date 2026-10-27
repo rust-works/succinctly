@@ -47,8 +47,8 @@ use super::error::{dump_truncated_with, Control, EvalError};
 use super::eval::{
     apply_compare_op, arith_combine, arith_negate, compare_values, is_tree_descending_f,
     native_stack_exhausted, owned_to_string, range_max_exceeded_error, EvalTag, JqSemantics,
-    QueryResult, MAX_EMPTY_REPEAT_ROUNDS, MAX_EVAL_FRAMES, MAX_RANGE, RECURSE_MAX_ITEMS,
-    REPEAT_WIDTH_BUDGET, WHILE_UNTIL_MAX_STEPS,
+    QueryResult, MAX_EMPTY_REPEAT_ROUNDS, MAX_EVAL_FRAMES, MAX_RANGE, MAX_RANGE_TOTAL,
+    RECURSE_MAX_ITEMS, REPEAT_WIDTH_BUDGET, WHILE_UNTIL_MAX_STEPS,
 };
 use super::expr::{
     ArithOp, Builtin, CompareOp, Expr, Literal, MergeFlags, NumberKey, ObjectKey, Param, Pattern,
@@ -2272,7 +2272,8 @@ impl<'e> Interp<'e> {
     /// The three `$` parameters are subexps (earlier outermost). The loop
     /// emits `$init` itself first, then each `. + $by`, all at the entry
     /// register (a variable and a binary operator move nothing), and stops
-    /// past `MAX_RANGE` values with the shipped `range` cap.
+    /// past the shipped `range` cap: `MAX_RANGE_TOTAL` values over numbers,
+    /// `MAX_RANGE` over anything else.
     #[allow(clippy::too_many_arguments)]
     fn range_by(
         &self,
@@ -2300,10 +2301,23 @@ impl<'e> Interp<'e> {
                     };
                     let mut current = start.clone();
                     let mut emitted = 0;
+                    // #5292: a walk over numbers is capped at `MAX_RANGE_TOTAL`; one over
+                    // anything else copies a growing value at every step, which makes
+                    // it quadratic, so it keeps the `MAX_RANGE` cap.
+                    let cap = if [&start, &end, &step]
+                        .iter()
+                        .all(|v| number_f64(v).is_some())
+                    {
+                        MAX_RANGE_TOTAL
+                    } else {
+                        MAX_RANGE
+                    };
                     while cmp(below, &current, &end) {
                         emitted += 1;
-                        if emitted > MAX_RANGE {
+                        if emitted > cap {
                             return Err(Raise::Fatal(range_max_exceeded_error()));
+                            // patchcov: coverage tolerate-line reason="expensive: reached only after MAX_RANGE_TOTAL (2^24) values, or MAX_RANGE of a walk over non-numbers, have been emitted through the path interpreter; the cap itself is pinned by test_range_total_cap_is_exact_5292 and the each_range_batches unit tests (#5292)"
+                            // patchcov: coverage tolerate-line reason="expensive: reached only after MAX_RANGE_TOTAL (2^24) values have been emitted, seconds of CPU and no test of the 2^26-value kind is cheap; the cap is pinned by the each_range_batches_* unit tests (#5292)"
                         }
                         sink(current.clone(), reg.clone())?;
                         current = compound_step("_sp_upd_add", &current, &step)?;
@@ -3439,7 +3453,7 @@ impl<'e> Interp<'e> {
 }
 
 /// `RANGE`: the start value itself first, then computed successors, each
-/// at `reg`, while below `end`. Past `MAX_RANGE` values it raises the
+/// at `reg`, while below `end`. Past `MAX_RANGE_TOTAL` values it raises the
 /// shipped evaluator's uncatchable cap (a documented divergence: jq's
 /// `range` is bounded only by memory).
 fn range_values(start: OwnedValue, end: &OwnedValue, reg: &Reg, sink: &mut Sink<'_>) -> R {
@@ -3454,8 +3468,8 @@ fn range_values(start: OwnedValue, end: &OwnedValue, reg: &Reg, sink: &mut Sink<
             return Ok(());
         }
         emitted += 1;
-        if emitted > MAX_RANGE {
-            return Err(Raise::Fatal(range_max_exceeded_error()));
+        if emitted > MAX_RANGE_TOTAL {
+            return Err(Raise::Fatal(range_max_exceeded_error())); // patchcov: coverage tolerate-line reason="expensive: reached only after MAX_RANGE_TOTAL (2^24) values have been emitted, seconds of CPU and no test of the 2^26-value kind is cheap; the cap is pinned by the each_range_batches_* unit tests (#5292)"
         }
         let value = first.take().unwrap_or_else(|| number_owned(cur));
         sink(value, reg.clone())?;

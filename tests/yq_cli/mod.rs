@@ -96,6 +96,7 @@ mod i5261;
 mod i5278;
 mod i5283;
 mod i5286;
+mod i5292;
 mod i5293;
 mod i5297;
 mod i5299;

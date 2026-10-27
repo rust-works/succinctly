@@ -1500,7 +1500,7 @@ fn a_recursion_too_deep_is_refused_not_overflowed_5223() {
 /// long loop costs no native stack per iteration; an impure argument keeps
 /// the `builtin.jq` body. The shipped evaluator's caps stay, each a
 /// documented divergence from jq's unbounded loop: 100,000 `until`/`while`
-/// states and `range` values, 10,000 nodes for a `recurse(f)` that is not a
+/// states, 10,000 nodes for a `recurse(f)` that is not a
 /// tree descent, and `repeat`'s round limits. Every expected answer under a
 /// cap is jq 1.7.1's; the capped rows are the shipped evaluator's.
 #[test]
@@ -1514,11 +1514,8 @@ fn loops_run_in_constant_stack_and_in_jqs_order_5223() {
                 err(&[], "until: maximum iterations exceeded"),
             ),
             ("0", "[range(0; 100000; 1)] | length", ok(&["100000"])),
-            (
-                "0",
-                "[range(100001)] | length",
-                err(&[], "range: maximum iterations exceeded"),
-            ),
+            // #5292: past 100,000 values `range` goes on, as jq's does.
+            ("0", "[range(100001)] | length", ok(&["100001"])),
             (
                 "0",
                 "[recurse(if . < 9999 then . + 1 else empty end)] | length",
@@ -1694,18 +1691,12 @@ fn the_interpreter_internals_a_cli_run_does_not_reach_5223() {
     });
 }
 
-/// Rows that reach the interpreter's less common arms, each jq 1.7.1's answer
-/// but the first, which is the shipped `range` cap the interpreter keeps
-/// (`MAX_RANGE`, a recorded divergence).
+/// Rows that reach the interpreter's less common arms, each jq 1.7.1's answer.
 #[test]
 fn less_common_interpreter_arms_answer_as_jq_does_5223() {
     on_big_stack(|| {
         check(&[
-            (
-                "null",
-                "[range(0; 200000; 1)] | length",
-                err(&[], "range: maximum iterations exceeded"),
-            ),
+            ("null", "[range(0; 200000; 1)] | length", ok(&["200000"])),
             // A zero-arity def as a C builtin's argument.
             ("null", r#"def f: "a"; "ab" | ltrimstr(f)"#, ok(&[r#""b""#])),
             // An `until` condition that raises.

@@ -62,7 +62,7 @@ use super::eval::{
     classify_skip_n, clear_nonretryable_stop, collapse_vec, collect_pattern_var_names,
     compare_key_arrays, compare_values, debug_assert_materialization_error, def_spine_len,
     demote_for_reentry, descriptor_slice_bounds, each_path_on_owned, each_pattern_binding_set,
-    each_recurse_walk, enter_def_call, entries_to_object, eval_each_owned,
+    each_range_batches, each_recurse_walk, enter_def_call, entries_to_object, eval_each_owned,
     eval_full_unrouted as full_eval, finish_fork_flow, finish_fork_from_flow, finish_short_circuit,
     fold_escaped_generator_prefix, foreach_forks, format_owned, has_type_mismatch_is_permissive,
     index_component_value, index_in_array_bounds, index_one_owned_read as index_owned_by_key,
@@ -71,23 +71,24 @@ use super::eval::{
     native_stack_exhausted, needs_path_context, numeric_key_to_array_index, numeric_key_to_index,
     numeric_length_owned, owned_bound_to_i64_for, owned_index_key_to_expr, owned_to_string,
     pattern_alternatives_var_names, pipe_needs_path_context, prefer_pending_control,
-    probe_def_call, range_from_literal_override, range_max_exceeded_error, range_num,
-    range_values_f64, range_values_int, reads_parent, recurse_walk_flow, reduce_forks,
-    reroot_for_reentry, reroot_markers, resolve_computed_slice_bounds, resume_from_escape,
-    reverse_length_is_empty, select_emits, settle_then_replay, settles_before_consumer,
-    settles_both, shared_arg_depth_refusal, slice_component_value, slice_object_as_yq_children,
-    slice_owned_value_read_computed, stop_with_downstream, stop_with_error, stop_with_escape,
-    streams_escaped_generator_prefix, streams_unbounded, substitute_bound_var_from,
-    substitute_deferred_var, substitute_vars, suppresses, tonumber_from_str, tostring_owned,
-    tostring_owned_styled, try_handler_root, vec_with_capacity, yq_absent_key_read_is_empty,
-    yq_assign_rhs_document, yq_bool_null_key_into_null, yq_dedup_key, yq_empty_context_reemit,
-    yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_first_of_each_key,
-    yq_index_key_is_numeric, yq_literal_index_text, yq_mapping_index_text, yq_negative_index_check,
-    yq_negative_index_error, yq_numeric_index_on_object_is_null, yq_object_key_stringify,
-    yq_read_only_context, yq_scalar_text, yq_sort_by, BinaryFanoutRules, ComputedSliceBound,
-    Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN,
-    PathTrail, QueryResult, RangeNum, Reentry, RestPipe, RootWitness, SliceTargetKind,
-    StashedEscape, StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED, WHILE_UNTIL_MAX_STEPS,
+    probe_def_call, range_from_literal_override, range_max_exceeded_error, range_num, reads_parent,
+    recurse_walk_flow, reduce_forks, reroot_for_reentry, reroot_markers,
+    resolve_computed_slice_bounds, resume_from_escape, reverse_length_is_empty, select_emits,
+    settle_then_replay, settles_before_consumer, settles_both, shared_arg_depth_refusal,
+    slice_component_value, slice_object_as_yq_children, slice_owned_value_read_computed,
+    stop_with_downstream, stop_with_error, stop_with_escape, streams_escaped_generator_prefix,
+    streams_unbounded, substitute_bound_var_from, substitute_deferred_var, substitute_vars,
+    suppresses, tonumber_from_str, tostring_owned, tostring_owned_styled, try_handler_root,
+    vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
+    yq_bool_null_key_into_null, yq_dedup_key, yq_empty_context_reemit, yq_empty_operand_output,
+    yq_field_index_on_scalar_is_empty, yq_first_of_each_key, yq_index_key_is_numeric,
+    yq_literal_index_text, yq_mapping_index_text, yq_negative_index_check, yq_negative_index_error,
+    yq_numeric_index_on_object_is_null, yq_object_key_stringify, yq_read_only_context,
+    yq_scalar_text, yq_sort_by, BinaryFanoutRules, ComputedSliceBound, Control, Demand,
+    EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail,
+    QueryResult, RangeEnd, RangeNum, Reentry, RestPipe, RootWitness, SliceTargetKind,
+    StashedEscape, StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED, MAX_RANGE_TOTAL,
+    WHILE_UNTIL_MAX_STEPS,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -20679,9 +20680,8 @@ fn each_boolean_generic<S: EvalSemantics, V: DocumentValue>(
 /// this mirrors `each_range`'s own nesting rather than replacing it: each of
 /// `from`/`to`/`step` drives the one inside it, and a `Demand::Stop` from the
 /// sink unwinds all three. The values themselves come from
-/// [`super::eval::range_values_int`]/[`super::eval::range_values_f64`], the
-/// same `MAX_RANGE`-capped definitions `each_range` uses -- one cap, not a
-/// second copy to drift.
+/// [`super::eval::each_range_batches`], the same batched, `MAX_RANGE_TOTAL`-capped
+/// definition `each_range` uses -- one cap, not a second copy to drift.
 fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
     from: &Expr,
     to: Option<&Expr>,
@@ -20707,7 +20707,7 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
 
     // See `each_range`'s own note (#3071): the 1-arg/2-arg call shapes (no
     // explicit step expression) select the float path's NaN-tolerant loop
-    // condition in `range_values_f64`, not the runtime step value.
+    // condition in `range_batch_f64`, not the runtime step value.
     let implicit_step = step.is_none();
     // `emit` is the *only* closure in this function that touches `sink` --
     // it is called from three different nested closures below (`from`'s,
@@ -20733,36 +20733,34 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
      -> Demand {
         match (range_num(from), range_num(to), range_num(step)) {
             (Ok(from_val), Ok(to_val), Ok(step_val)) => {
-                let (values, truncated) = match (from_val, to_val, step_val) {
-                    // `from_literal` is forwarded on this arm too (#3103):
-                    // an integer literal generally renders identically to
-                    // its own `i64` (so `from_literal` is usually `None`
-                    // here anyway), but `-0` is the one legal-JSON
-                    // exception -- see `each_range`'s own note.
-                    (RangeNum::Int(f), RangeNum::Int(t), RangeNum::Int(st)) => {
-                        range_values_int(f, t, st, from_literal)
+                // #5292: handed over a batch at a time, as `each_range` does.
+                let end = each_range_batches(
+                    from_val,
+                    to_val,
+                    step_val,
+                    implicit_step,
+                    from_literal,
+                    MAX_RANGE_TOTAL,
+                    &mut |values| {
+                        for v in values {
+                            if sink.push(GenericItem::Owned(v)) == Demand::Stop {
+                                return Demand::Stop;
+                            }
+                        }
+                        Demand::Continue
+                    },
+                );
+                match end {
+                    RangeEnd::Stopped => {
+                        verdict.stop_with_downstream(Flow::Stopped { pending: None })
                     }
-                    (f, t, st) => range_values_f64(
-                        f.as_f64(),
-                        t.as_f64(),
-                        st.as_f64(),
-                        implicit_step,
-                        from_literal,
-                    ),
-                };
-                for v in values {
-                    if sink.push(GenericItem::Owned(v)) == Demand::Stop {
-                        return verdict.stop_with_downstream(Flow::Stopped { pending: None });
-                    }
+                    // Only raises once the sink has taken everything the cap
+                    // allowed and still wants more -- `each_range`'s #2089 rule:
+                    // `first(range(1e18))` stops early and never sees this,
+                    // `[range(1e18)]` does.
+                    RangeEnd::Capped => stop(Control::Error(range_max_exceeded_error())),
+                    RangeEnd::Exhausted => Demand::Continue,
                 }
-                // Truncation only raises once the sink has taken everything
-                // the capped batch held and still wants more --
-                // `each_range`'s #2089 rule, unchanged: `first(range(1e18))`
-                // stops early and never sees this, `[range(1e18)]` does.
-                if truncated {
-                    return stop(Control::Error(range_max_exceeded_error()));
-                }
-                Demand::Continue
             }
             // #3409: at least one operand isn't a plain number -- only
             // reachable from range/3 (see this closure's own doc comment).
