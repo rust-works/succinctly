@@ -88,7 +88,6 @@ use super::eval::{
     EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail,
     QueryResult, RangeEnd, RangeNum, Reentry, RestPipe, RootWitness, SliceTargetKind,
     StashedEscape, StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED, MAX_RANGE_TOTAL,
-    WHILE_UNTIL_MAX_STEPS,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -18146,7 +18145,7 @@ fn each_loop_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
-    let mut budget = WHILE_UNTIL_MAX_STEPS;
+    let mut counters = crate::jq::eval::LoopCounters::new();
     let state = LoopState::Document(value, cursor);
     let spec = LoopSpec {
         kind,
@@ -18156,7 +18155,7 @@ fn each_loop_generic<S: EvalSemantics, V: DocumentValue>(
         stream: crate::jq::eval::loop_stream_budget(update),
         cond_stream: crate::jq::eval::loop_stream_budget(cond),
     };
-    match loop_step_generic::<S, V>(spec, state, &mut budget, sink) {
+    match loop_step_generic::<S, V>(spec, state, &mut counters.root(), sink) {
         Ok(Demand::Continue) => Flow::Exhausted,
         Ok(Demand::Stop) => Flow::Stopped { pending: None },
         Err(Control::Error(e)) if suppresses(&e, optional) => Flow::Exhausted,
@@ -18204,7 +18203,7 @@ impl crate::jq::eval::Nonretryable for LoopAbort {
 fn loop_step_generic<S: EvalSemantics, V: DocumentValue>(
     spec: LoopSpec<'_>,
     mut state: LoopState<V>,
-    budget: &mut usize,
+    budget: &mut crate::jq::eval::LoopBudget<'_>,
     sink: &mut dyn Sink<V>,
 ) -> Result<Demand, Control> {
     let LoopSpec {
@@ -18217,14 +18216,7 @@ fn loop_step_generic<S: EvalSemantics, V: DocumentValue>(
     // `until` steps on a falsy `cond`; `while` on a truthy one.
     let continues_on = kind == LoopKind::While;
     loop {
-        if *budget == 0 {
-            // #2132: uncatchable -- see `EvalError::resource_limit`.
-            return Err(Control::Error(EvalError::resource_limit(format!(
-                "{}: maximum iterations exceeded",
-                kind.name()
-            ))));
-        }
-        *budget -= 1;
+        budget.charge(kind.name())?;
 
         // #3617: a `cond` holding a `?//` runs the branch each of its outputs
         // chooses inside its sink, so the retry can follow a failure that branch
@@ -18278,7 +18270,9 @@ fn loop_step_generic<S: EvalSemantics, V: DocumentValue>(
                 continue;
             }
             for next_state in next {
-                if loop_step_generic::<S, V>(spec, next_state, budget, sink)? == Demand::Stop {
+                if loop_step_generic::<S, V>(spec, next_state, &mut budget.fork(), sink)?
+                    == Demand::Stop
+                {
                     return Ok(Demand::Stop);
                 }
             }
@@ -18286,7 +18280,9 @@ fn loop_step_generic<S: EvalSemantics, V: DocumentValue>(
         }
 
         for bit in bits {
-            if loop_decided_generic::<S, V>(spec, &state, bit, budget, sink)? == Demand::Stop {
+            if loop_decided_generic::<S, V>(spec, &state, bit, &mut budget.fork(), sink)?
+                == Demand::Stop
+            {
                 return Ok(Demand::Stop);
             }
         }
@@ -18303,7 +18299,7 @@ fn loop_decided_generic<S: EvalSemantics, V: DocumentValue>(
     spec: LoopSpec<'_>,
     state: &LoopState<V>,
     bit: bool,
-    budget: &mut usize,
+    budget: &mut crate::jq::eval::LoopBudget<'_>,
     sink: &mut dyn Sink<V>,
 ) -> Result<Demand, Control> {
     let continues_on = spec.kind == LoopKind::While;
@@ -18324,7 +18320,7 @@ fn loop_decided_generic<S: EvalSemantics, V: DocumentValue>(
     }
     let (next, update_control) = state.fork::<S>(spec.update, spec.optional);
     for next_state in next {
-        if loop_step_generic::<S, V>(spec, next_state, budget, sink)? == Demand::Stop {
+        if loop_step_generic::<S, V>(spec, next_state, &mut budget.fork(), sink)? == Demand::Stop {
             return Ok(Demand::Stop);
         }
     }
@@ -18345,7 +18341,7 @@ fn loop_decided_generic<S: EvalSemantics, V: DocumentValue>(
 fn loop_update_streaming<S: EvalSemantics, V: DocumentValue>(
     spec: LoopSpec<'_>,
     state: &LoopState<V>,
-    budget: &mut usize,
+    budget: &mut crate::jq::eval::LoopBudget<'_>,
     sink: &mut dyn Sink<V>,
 ) -> Result<Demand, Control> {
     stream_loop_branches::<V>(
@@ -18353,7 +18349,8 @@ fn loop_update_streaming<S: EvalSemantics, V: DocumentValue>(
         |each_sink| state.each::<S>(spec.update, spec.optional, each_sink),
         &mut |item| {
             let next = LoopState::<V>::from_item::<S>(item)?;
-            loop_step_generic::<S, V>(spec, next, budget, sink)
+            let mut branch = budget.fork();
+            loop_step_generic::<S, V>(spec, next, &mut branch, sink)
         },
     )
 }
@@ -18364,7 +18361,7 @@ fn loop_update_streaming<S: EvalSemantics, V: DocumentValue>(
 fn loop_cond_streaming<S: EvalSemantics, V: DocumentValue>(
     spec: LoopSpec<'_>,
     state: &LoopState<V>,
-    budget: &mut usize,
+    budget: &mut crate::jq::eval::LoopBudget<'_>,
     sink: &mut dyn Sink<V>,
 ) -> Result<Demand, Control> {
     stream_loop_branches::<V>(
@@ -18372,7 +18369,8 @@ fn loop_cond_streaming<S: EvalSemantics, V: DocumentValue>(
         |each_sink| state.each::<S>(spec.cond, spec.optional, each_sink),
         &mut |item| {
             let bit = generic_item_truthiness::<_, S>(item)?;
-            loop_decided_generic::<S, V>(spec, state, bit, budget, sink)
+            let mut branch = budget.fork();
+            loop_decided_generic::<S, V>(spec, state, bit, &mut branch, sink)
         },
     )
 }

@@ -1500,7 +1500,7 @@ fn a_recursion_too_deep_is_refused_not_overflowed_5223() {
 /// long loop costs no native stack per iteration; an impure argument keeps
 /// the `builtin.jq` body. The shipped evaluator's caps stay, each a
 /// documented divergence from jq's unbounded loop: 100,000 `until`/`while`
-/// states, 10,000 nodes for a `recurse(f)` that is not a
+/// states once a round forks (and 16.7M in all, #5292), 10,000 nodes for a `recurse(f)` that is not a
 /// tree descent, and `repeat`'s round limits. Every expected answer under a
 /// cap is jq 1.7.1's; the capped rows are the shipped evaluator's.
 #[test]
@@ -1508,11 +1508,8 @@ fn loops_run_in_constant_stack_and_in_jqs_order_5223() {
     on_big_stack(|| {
         check(&[
             ("0", "until(. >= 99999; . + 1)", ok(&["99999"])),
-            (
-                "0",
-                "until(. >= 100000; . + 1)",
-                err(&[], "until: maximum iterations exceeded"),
-            ),
+            // #5292: past 100,000 states `until` goes on, as jq's does.
+            ("0", "until(. >= 300000; . + 1)", ok(&["300000"])),
             ("0", "[range(0; 100000; 1)] | length", ok(&["100000"])),
             // #5292: past 100,000 values `range` goes on, as jq's does.
             ("0", "[range(100001)] | length", ok(&["100001"])),

@@ -6067,7 +6067,7 @@ The reachable ones without `--jq-extensions` are `while`/`until` and a recursive
 which `?`/`try`/`catch` never swallow, in both modes alike:
 
 ```console
-$ printf 'a: 1\n' | succinctly yq '[.a | while(true; .+1)?] | length'
+$ printf 'a: 1\n' | succinctly yq '[.a | while(true; ., .)?] | length'
 Error: while: maximum iterations exceeded
 $ printf 'a: 1\n' | succinctly yq 'def f: f; try f catch "caught"'
 Error: f/0 exceeded maximum recursion depth
