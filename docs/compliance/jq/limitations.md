@@ -5635,6 +5635,10 @@ pipe of navigation the same way. Any item that is not a document node still make
 whole array owned, and collapsed: a computed one (`[., 1]`), or the `null` a missing key
 reads as (`[.a, .missing]`).
 
+`group_by(f)`'s groups render from the document too (#5306).
+`[{"a":1,"a":2},{"a":1}] | group_by(.a)` echoes `{"a":1,"a":2}` under `--preserve-input`, as `sort_by(.a)` does, where the groups used to be built owned and collapsed.
+The same holds for a key that is not valid text: the source spelling is written, not the decoded one.
+
 This is the split the flag already has for numbers, not a new one: `--preserve-input`
 echoes `4e4` as written while `.n + 0` still evaluates to `40000`. The flag chooses how a
 value is *spelled* on the way out; it never changes what the value model *is*. Gating the
@@ -7145,7 +7149,7 @@ them to fail: `nested_arrays(300) | not` now answers `false` at exit 0, where it
 raise `nesting depth exceeds limit of 256`. This is a corollary of the same rule the rest of
 this section's #2692 instance rests on, not a fresh decision, and it does not touch the
 guard itself — `sort_by`/`unique_by`/`min_by`/`max_by` still materialize a comparison key
-through `key_elements_generic`, the one caller left, and still trip it on the same document.
+through `key_elements_generic`, and `group_by` checks each element's depth from the array it sits in (#5306), and still trip it on the same document.
 Pinned by `test_truthiness_probes_do_not_trip_the_depth_guard_2692`
 (`tests/jq_cli_tests.rs`).
 

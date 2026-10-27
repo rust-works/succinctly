@@ -2859,7 +2859,7 @@ fn item_bind_origin<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
     }
 }
 
-fn to_owned<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
+pub(crate) fn to_owned<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
     value: &StandardJson<'_, W>,
 ) -> Result<OwnedValue, EvalError> {
     // #2889 Stage B: `eval_generic::to_owned_cursor`'s reuse, on this

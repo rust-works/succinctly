@@ -9602,6 +9602,18 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
         // (#3856): its nodes are not walked when it is built, so this is
         // where they are read.
         GenericResult::LazySeq(seq) => {
+            // #5306: `group_by`'s groups print from the document as they stand, each node a
+            // cursor: they were validated when the groups were cut, so there is nothing to
+            // decode and nothing left to fail.
+            if let Some(groups) = seq.plain_groups() {
+                let groups = groups
+                    .into_iter()
+                    .map(|group| {
+                        JqValue::Array(group.iter().copied().map(JqValue::Cursor).collect())
+                    })
+                    .collect();
+                return vec![OutputItem::Lazy(JqValue::Array(groups))];
+            }
             match seq.drain_atomic() {
                 // All-or-nothing, matching `materialize_atomic`'s own atomicity
                 // contract ("real jq's array construction is all-or-nothing:

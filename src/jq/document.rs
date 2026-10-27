@@ -15,6 +15,8 @@ use std::borrow::Cow;
 
 use super::error::{debug_assert_materialization_error, EvalError};
 use super::stream::{StreamFailure, StreamResult};
+use super::value::OwnedValue;
+use super::EvalSemantics;
 
 /// Indentation configuration for cursor/lazy streaming output.
 ///
@@ -1161,6 +1163,17 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         _numbers: JsonConvention,
     ) -> StreamResult {
         Err(StreamFailure::Fmt)
+    }
+
+    /// `cursors` decoded to owned values under `S`, for a `group_by` group something has to
+    /// hold as a value (#5306).
+    ///
+    /// The default walks each cursor, which is the only decode that can resolve an explicit
+    /// tag (`!!str 1`) by the node's byte position. JSON has none, so its cursor decodes the
+    /// node's value with the evaluator's own materializer instead, which skips that lookup
+    /// for every container.
+    fn to_owned_values<S: EvalSemantics>(cursors: &[Self]) -> Result<Vec<OwnedValue>, EvalError> {
+        crate::jq::eval_generic::to_owned_all_cursors::<S, _>(cursors)
     }
 
     /// The YAML counterpart of

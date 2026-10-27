@@ -1061,10 +1061,10 @@ same document) and the last of `limit`/`nth`'s duplicate-key loss in the second.
 
 **Three gaps #1687 deliberately did not close**, alongside the four below:
 
-- **`group_by`** returns an array *of arrays*. `LazySeq` has no nested-lazy form and
-  `OwnedValue::Array(Vec<OwnedValue>)` cannot hold a cursor, so there is no lossless
-  representation for it today — it keeps the bridge, and real yq preserves where succinctly
-  collapses. The same representation limit as #1102 below, one level up.
+- **`group_by`** returns an array *of arrays*. In jq mode it is a cursor-backed sequence of
+  groups since #5306 (`LazySource::Groups`), but yq's `group_by` is an ordered map on the first
+  key's text that never sorts (#2799), so it keeps the bridge, and real yq preserves where
+  succinctly collapses. The same representation limit as #1102 below, one level up.
 - **`while`/`until`** compute their state from step 1 onward, so only the seed `.` could ever
   stay a cursor; folding through an `OwnedValue` state is inherent, not a wiring gap.
 - **`reduce`/`foreach`'s bindings.** The fix recovers the *number and order* of the input

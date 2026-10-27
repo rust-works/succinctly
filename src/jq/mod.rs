@@ -109,6 +109,8 @@ pub mod walk;
 
 pub use error::{BinOp, Control, ErrorKind, EvalError, EvalErrorPayload};
 pub(crate) use eval::nonfinite_yaml_spelling;
+// #5306: `json::light` decodes a `group_by` group with the evaluator's own JSON materializer.
+pub(crate) use eval::to_owned as to_owned_standard_json;
 pub use eval::{
     alias_identity, bound_def, enter_file_index_scope, enter_file_names_scope,
     enter_source_positions_scope, eval, eval_documents_together, eval_lenient,

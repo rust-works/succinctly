@@ -3262,8 +3262,8 @@ use crate::jq::escape::{write_json_body_jq, write_json_body_yq};
 use crate::jq::stream::{StreamFailure, StreamResult};
 use crate::jq::{
     format_number_jq_compat, is_jq_canonical_number, jq_canonical_number_prefix,
-    nesting_depth_exceeded_message, nonfinite_display_string, EvalError, JqSemantics, NumberRepr,
-    OwnedValue, MAX_VALUE_TREE_DEPTH,
+    nesting_depth_exceeded_message, nonfinite_display_string, EvalError, EvalSemantics,
+    JqSemantics, NumberRepr, OwnedValue, MAX_VALUE_TREE_DEPTH,
 };
 
 /// A [`JsonError`] as the uncatchable decode failure (#1620) every
@@ -4337,6 +4337,13 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
     #[inline]
     fn supports_sequence_streaming() -> bool {
         true
+    }
+
+    fn to_owned_values<S: EvalSemantics>(cursors: &[Self]) -> Result<Vec<OwnedValue>, EvalError> {
+        cursors
+            .iter()
+            .map(|cursor| crate::jq::to_owned_standard_json::<S, W>(&cursor.value()))
+            .collect()
     }
 
     #[inline]
