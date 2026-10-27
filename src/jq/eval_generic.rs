@@ -99,8 +99,7 @@ use super::expr::{
 use super::path_mode::Route;
 use super::slice::{literal_component_from_values, slice_str, SliceBounds};
 use super::tail_call::{
-    pipe_settles_before_last, spine_has_tail_call, stage_settles, tail_def, TailBindings,
-    TailRounds,
+    bind_next, pipe_settles_before_last, stage_settles, tail_def, tail_reachable, Tail, TailRounds,
 };
 use super::value::{owned_value_eq, subarray_indices, NumberRepr, OwnedValue};
 
@@ -16386,9 +16385,11 @@ fn each_def_call_generic<S: EvalSemantics, V: DocumentValue>(
 ) -> Flow {
     match bind_def_call(def, args, frames, bound) {
         // #5379: see `eval::each_def_tail_loop`.
-        Ok(body) if spine_has_tail_call(&body) => each_def_tail_loop_generic::<S, V>(
-            def, frames, bound, body, value, optional, cursor, sink,
-        ),
+        Ok(body) if tail_reachable(def, S::TAG == EvalTag::Jq) => {
+            each_def_tail_loop_generic::<S, V>(
+                def, frames, bound, body, value, optional, cursor, sink,
+            )
+        }
         Ok(body) => match enter_def_call(def, frames, bound) {
             Ok(_guard) => eval_each_generic::<S, V>(&body, value, optional, cursor, sink),
             Err(e) => Flow::Escaped(Control::Error(e)),
@@ -16420,14 +16421,6 @@ impl<V: DocumentValue> TailValue<V> {
             lazy => Self::Owned(owned_identity_materialize::<V, S>(lazy)?),
         })
     }
-}
-
-/// Where a tail loop's walk of one round's body ended: `eval::Tail`'s twin.
-enum TailGeneric<'e> {
-    Call(Rc<FuncDefData>),
-    Rest(&'e Expr),
-    Bound(Rc<Expr>),
-    Done(Flow),
 }
 
 /// Push `expr`'s outputs over `cur` into `sink`.
@@ -16482,8 +16475,9 @@ fn tail_step_generic<'e, S: EvalSemantics, V: DocumentValue>(
     cur: &mut TailValue<V>,
     optional: bool,
     holds: &mut EmbedGuards,
+    rounds: &mut TailRounds,
     sink: &mut dyn Sink<V>,
-) -> TailGeneric<'e> {
+) -> Tail<'e> {
     let mut expr = body;
     loop {
         match expr {
@@ -16494,11 +16488,11 @@ fn tail_step_generic<'e, S: EvalSemantics, V: DocumentValue>(
                 body,
                 then,
                 bound,
-            } => return TailGeneric::Bound(bind_def(name, params, body, then, bound)),
+            } => return Tail::Bound(bind_def(name, params, body, then, bound)),
             Expr::DefCall { .. } => {
                 return match tail_def(expr) {
-                    Some(def) => TailGeneric::Call(Rc::clone(def)),
-                    None => TailGeneric::Rest(expr),
+                    Some((def, frames, bound)) => Tail::Call { def, frames, bound },
+                    None => Tail::Rest(expr),
                 }
             }
             Expr::If {
@@ -16508,10 +16502,10 @@ fn tail_step_generic<'e, S: EvalSemantics, V: DocumentValue>(
             } if stage_settles(cond) => match tail_one_generic::<S, V>(cond, cur, optional) {
                 Ok(Some(item)) => match generic_item_truthiness::<V, S>(item) {
                     Ok(truthy) => expr = if truthy { then_branch } else { else_branch },
-                    Err(control) => return TailGeneric::Done(Flow::Escaped(control)),
+                    Err(control) => return Tail::Done(Flow::Escaped(control)),
                 },
-                Ok(None) => return TailGeneric::Done(Flow::Exhausted),
-                Err(flow) => return TailGeneric::Done(flow),
+                Ok(None) => return Tail::Done(Flow::Exhausted),
+                Err(flow) => return Tail::Done(flow),
             },
             // `src as $x | body`: see `eval::tail_step`. A node is bound as
             // `each_as_generic` binds it, decoded (a deferred bind is for a body that
@@ -16522,15 +16516,29 @@ fn tail_step_generic<'e, S: EvalSemantics, V: DocumentValue>(
                 var,
                 body: as_body,
             } if S::TAG == EvalTag::Jq && stage_settles(source) => {
+                // A body that never names the variable has nothing to bind, and
+                // `each_as_generic` leaves the node undecoded then (#3856): the source
+                // still runs, for its error or its lack of an output, and the walk goes
+                // on in the body as it is.
+                if !mentions_var(as_body, var) {
+                    match tail_one_generic::<S, V>(source, cur, optional) {
+                        Ok(Some(_)) => {
+                            expr = as_body;
+                            continue;
+                        }
+                        Ok(None) => return Tail::Done(Flow::Exhausted),
+                        Err(flow) => return Tail::Done(flow),
+                    }
+                }
                 let (mut bound, origin) = match &*cur {
                     TailValue::Owned(_) => match tail_one_generic::<S, V>(source, cur, optional) {
                         Ok(Some(GenericItem::Owned(bound))) => (bound, None),
                         Ok(Some(item)) => match owned_identity_materialize::<V, S>(item) {
                             Ok(bound) => (bound, None),
-                            Err(control) => return TailGeneric::Done(Flow::Escaped(control)),
+                            Err(control) => return Tail::Done(Flow::Escaped(control)),
                         },
-                        Ok(None) => return TailGeneric::Done(Flow::Exhausted),
-                        Err(flow) => return TailGeneric::Done(flow),
+                        Ok(None) => return Tail::Done(Flow::Exhausted),
+                        Err(flow) => return Tail::Done(flow),
                     },
                     TailValue::Node(node, cursor) => {
                         let mut bound = None;
@@ -16549,8 +16557,8 @@ fn tail_step_generic<'e, S: EvalSemantics, V: DocumentValue>(
                         );
                         match (flow, bound) {
                             (Flow::Exhausted, Some(bound)) => bound,
-                            (Flow::Exhausted, None) => return TailGeneric::Done(Flow::Exhausted),
-                            (flow, _) => return TailGeneric::Done(flow),
+                            (Flow::Exhausted, None) => return Tail::Done(Flow::Exhausted),
+                            (flow, _) => return Tail::Done(flow),
                         }
                     }
                 };
@@ -16566,46 +16574,59 @@ fn tail_step_generic<'e, S: EvalSemantics, V: DocumentValue>(
                     as_body,
                 ));
                 let rebuilt = substitute_bound_var_from::<S>(source, as_body, var, &bound, origin);
-                return TailGeneric::Bound(Rc::new(rebuilt));
+                return Tail::Bound(Rc::new(rebuilt));
             }
+            // In yq mode a pipe that reads node metadata (`line`, `column`, `style`, a
+            // comment, an anchor) is left to `eval_each_pipe_generic`, whose owned
+            // identity carries the node a stage ahead of the getter left (#4696).
             Expr::Pipe(stages)
-                if pipe_settles_before_last(stages) && !yq_context_pipe_applies::<S>(stages) =>
+                if pipe_settles_before_last(stages)
+                    && !yq_context_pipe_applies::<S>(stages)
+                    && !(S::TAG == EvalTag::Yq && reads_any_node_metadata(stages)) =>
             {
                 let Some((last, before)) = stages.split_last() else {
-                    return TailGeneric::Rest(expr);
+                    return Tail::Rest(expr);
                 };
                 for stage in before {
                     match tail_one_generic::<S, V>(stage, cur, optional) {
                         Ok(Some(item)) => match TailValue::from_item::<S>(item) {
                             Ok(next) => *cur = next,
-                            Err(control) => return TailGeneric::Done(Flow::Escaped(control)),
+                            Err(control) => return Tail::Done(Flow::Escaped(control)),
                         },
-                        Ok(None) => return TailGeneric::Done(Flow::Exhausted),
-                        Err(flow) => return TailGeneric::Done(flow),
+                        Ok(None) => return Tail::Done(Flow::Exhausted),
+                        Err(flow) => return Tail::Done(flow),
                     }
                 }
                 expr = last;
             }
             Expr::Comma(items) if !items.is_empty() => {
                 let Some((last, before)) = items.split_last() else {
-                    return TailGeneric::Rest(expr);
+                    return Tail::Rest(expr);
                 };
                 for item in before {
-                    match tail_each_generic::<S, V>(item, cur, optional, sink) {
+                    let mut emitted = 0usize;
+                    let flow = tail_each_generic::<S, V>(item, cur, optional, &mut |output| {
+                        emitted += 1;
+                        sink.push(output)
+                    });
+                    if let Err(e) = rounds.charge_outputs(emitted) {
+                        return Tail::Done(Flow::Escaped(Control::Error(e)));
+                    }
+                    match flow {
                         Flow::Exhausted => {}
-                        other => return TailGeneric::Done(other),
+                        other => return Tail::Done(other),
                     }
                 }
                 expr = last;
             }
-            _ => return TailGeneric::Rest(expr),
+            _ => return Tail::Rest(expr),
         }
     }
 }
 
 /// `eval::each_def_tail_loop` for the generic evaluator (#5379).
 #[inline(never)]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // STYLE-0004: `eval::each_def_tail_loop`'s list, plus the cursor
 fn each_def_tail_loop_generic<S: EvalSemantics, V: DocumentValue>(
     def: &Rc<FuncDefData>,
     frames: u32,
@@ -16616,37 +16637,48 @@ fn each_def_tail_loop_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
-    let mut bodies = TailBindings::new(def, &body, frames);
-    let mut rounds = TailRounds::new();
+    let mut rounds = TailRounds::new(def);
     let mut callee = Rc::clone(def);
     let mut body = body;
+    let mut body_frames = frames;
+    let mut first_hop = true;
     let mut cur = TailValue::Node(value, cursor);
     loop {
-        let _round = match enter_def_call(&callee, frames, bound) {
+        let _round = match enter_def_call(&callee, body_frames, bound) {
             Ok(guard) => guard,
             Err(e) => return Flow::Escaped(Control::Error(e)),
         };
         // What the round's `as` bindings hold, released with the round.
         let mut holds = EmbedGuards::default();
         let mut walked = Rc::clone(&body);
-        let next = loop {
-            match tail_step_generic::<S, V>(&walked, &mut cur, optional, &mut holds, sink) {
-                TailGeneric::Call(next) => break next,
-                TailGeneric::Bound(then) => walked = then,
-                TailGeneric::Rest(rest) => {
-                    return tail_each_generic::<S, V>(rest, &cur, optional, sink)
-                }
-                TailGeneric::Done(flow) => return flow,
+        let (next, next_body, next_frames) = loop {
+            match tail_step_generic::<S, V>(
+                &walked,
+                &mut cur,
+                optional,
+                &mut holds,
+                &mut rounds,
+                sink,
+            ) {
+                Tail::Call {
+                    def: next,
+                    frames: node_frames,
+                    bound: node_bound,
+                } => match bind_next(next, node_frames, node_bound, first_hop, body_frames) {
+                    Ok((next_body, next_frames)) => {
+                        break (Rc::clone(next), next_body, next_frames)
+                    }
+                    Err(e) => return Flow::Escaped(Control::Error(e)),
+                },
+                Tail::Bound(then) => walked = then,
+                Tail::Rest(rest) => return tail_each_generic::<S, V>(rest, &cur, optional, sink),
+                Tail::Done(flow) => return flow,
             }
         };
-        if let Err(e) = rounds.charge(&next) {
+        if let Err(e) = rounds.charge_round() {
             return Flow::Escaped(Control::Error(e));
         }
-        body = match bodies.body_of(&next) {
-            Ok(b) => b,
-            Err(e) => return Flow::Escaped(Control::Error(e)),
-        };
-        callee = next;
+        (callee, body, body_frames, first_hop) = (next, next_body, next_frames, false);
     }
 }
 

@@ -1679,6 +1679,8 @@ pub struct FuncDefData {
     pub body: Expr,
     /// Whether `body` needs path context, remembered on first ask.
     needs_path_context: PathContextMemo,
+    /// What the tail-call loop (`tail_call`) asks of `body`, remembered on first ask (#5379).
+    tail: TailMemo,
 }
 
 impl FuncDefData {
@@ -1689,6 +1691,7 @@ impl FuncDefData {
             params,
             body,
             needs_path_context: PathContextMemo::default(),
+            tail: TailMemo::default(),
         }
     }
 
@@ -1704,6 +1707,25 @@ impl FuncDefData {
     /// are not part of it and stay the caller's to walk.
     pub fn needs_path_context_or_init(&self, classify: impl FnOnce(&Expr) -> bool) -> bool {
         memo(&self.needs_path_context.0, || classify(&self.body))
+    }
+
+    /// Whether a tail-call loop could pass through `body` to a call at its end,
+    /// computing it with `classify` on the first call, for jq (`jq`) or yq mode
+    /// (#5379). Asked on every call of every `def`, so it is a read of a cell.
+    pub(crate) fn tail_reachable_or_init(
+        &self,
+        jq: bool,
+        classify: impl FnOnce(&Expr) -> bool,
+    ) -> bool {
+        let slot = if jq { &self.tail.jq } else { &self.tail.yq };
+        memo(slot, || classify(&self.body))
+    }
+
+    /// Whether a call to this definition, with no arguments, answers at most
+    /// once and can be run to its one value ahead of the call that follows it,
+    /// computing it with `classify` on the first call (#5379).
+    pub(crate) fn settles_or_init(&self, classify: impl FnOnce(&Expr) -> bool) -> bool {
+        memo(&self.tail.settles, || classify(&self.body))
     }
 }
 
@@ -1726,6 +1748,31 @@ impl core::fmt::Debug for FuncDefData {
 /// the copy is never read through an answer computed for the original.
 #[derive(Default)]
 struct PathContextMemo(core::cell::Cell<Option<bool>>);
+
+/// A [`FuncDefData`]'s remembered answers about its body for the tail-call loop
+/// (#5379): whether the loop can reach a call at the end of it (in jq and in yq
+/// mode, which differ on `as`), and whether a call to it settles.
+///
+/// Derived state like [`PathContextMemo`]: no part of equality, and a clone
+/// starts empty.
+#[derive(Default)]
+struct TailMemo {
+    jq: core::cell::Cell<Option<bool>>,
+    yq: core::cell::Cell<Option<bool>>,
+    settles: core::cell::Cell<Option<bool>>,
+}
+
+impl Clone for TailMemo {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for TailMemo {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
 
 impl Clone for PathContextMemo {
     fn clone(&self) -> Self {

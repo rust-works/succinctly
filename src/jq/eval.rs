@@ -49,8 +49,7 @@ use super::local_zone::{self, LocalZone};
 use super::math;
 use super::slice::{self, SliceBounds};
 use super::tail_call::{
-    pipe_settles_before_last, spine_has_tail_call, stage_settles, tail_def, TailBindings,
-    TailRounds,
+    bind_next, pipe_settles_before_last, stage_settles, tail_def, tail_reachable, Tail, TailRounds,
 };
 use super::walk::{
     any_pattern_key, any_subexpr, map_builtin_subexprs, map_pattern_subexprs, map_subexprs,
@@ -97877,7 +97876,7 @@ fn eval_def_call<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #5379: the loop is sink-driven, so a body that ends in a tail call is
         // collected from it; `eval_each` with a sink that never stops delivers
         // what `eval_single` would (see `drain_result`).
-        Ok(body) if spine_has_tail_call(&body) => {
+        Ok(body) if tail_reachable(def, S::TAG == EvalTag::Jq) => {
             let mut items: Vec<Item<'a, W>> = Vec::new();
             let flow = each_def_tail_loop::<W, S>(
                 def,
@@ -97919,7 +97918,7 @@ fn each_def_call<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
     match bind_def_call(def, args, frames, bound) {
-        Ok(body) if spine_has_tail_call(&body) => {
+        Ok(body) if tail_reachable(def, S::TAG == EvalTag::Jq) => {
             each_def_tail_loop::<W, S>(def, frames, bound, body, value, optional, sink)
         }
         Ok(body) => match enter_def_call(def, frames, bound) {
@@ -97948,22 +97947,6 @@ impl<'a, W> TailValue<'a, W> {
             Item::Owned(v) => Self::Owned(v),
         }
     }
-}
-
-/// Where a tail loop's walk of one round's body ended (#5379).
-enum Tail<'e> {
-    /// A call jq jumps to, over the value the walk left in the loop: run its
-    /// body next, with this level gone.
-    Call(Rc<FuncDefData>),
-    /// The walk reached something it does not pass through: evaluate it over the
-    /// value, as the nested call would have.
-    Rest(&'e Expr),
-    /// The walk reached a `def` declared in the body and bound what follows it:
-    /// carry on from there, over the same value, in the same round.
-    Bound(Rc<Expr>),
-    /// The round is over without a call: the walk delivered what the body
-    /// yields, or ended in a flow the caller returns.
-    Done(Flow),
 }
 
 /// Push `expr`'s outputs over `cur` into `sink`.
@@ -98018,6 +98001,7 @@ fn tail_step<'e, 'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     cur: &mut TailValue<'a, W>,
     optional: bool,
     holds: &mut super::eval_generic::EmbedGuards,
+    rounds: &mut TailRounds,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Tail<'e> {
     let mut expr = body;
@@ -98033,7 +98017,7 @@ fn tail_step<'e, 'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             } => return Tail::Bound(bind_def(name, params, body, then, bound)),
             Expr::DefCall { .. } => {
                 return match tail_def(expr) {
-                    Some(def) => Tail::Call(Rc::clone(def)),
+                    Some((def, frames, bound)) => Tail::Call { def, frames, bound },
                     None => Tail::Rest(expr),
                 }
             }
@@ -98065,6 +98049,9 @@ fn tail_step<'e, 'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 let (mut bound, origin) = match &*cur {
                     TailValue::Owned(_) => match tail_one::<W, S>(source, cur, optional) {
                         Ok(Some(TailValue::Owned(bound))) => (bound, None),
+                        // STYLE-0012: unreachable for want of a case -- `cur` is a built
+                        // value, so every output of the source is one too -- and a decode
+                        // failure must raise whatever `optional` is, were it reached.
                         Ok(Some(TailValue::Borrowed(node))) => match to_owned::<S, _>(&node) {
                             Ok(bound) => (bound, None),
                             Err(e) => return Tail::Done(Flow::Escaped(Control::Error(e))),
@@ -98117,7 +98104,15 @@ fn tail_step<'e, 'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // As `eval_each`'s own `Comma` arm: each branch in front runs to
                 // completion over the same value before the next starts.
                 for item in before {
-                    match tail_each::<W, S>(item, cur, optional, sink) {
+                    let mut emitted = 0usize;
+                    let flow = tail_each::<W, S>(item, cur, optional, &mut |output| {
+                        emitted += 1;
+                        sink(output)
+                    });
+                    if let Err(e) = rounds.charge_outputs(emitted) {
+                        return Tail::Done(Flow::Escaped(Control::Error(e)));
+                    }
+                    match flow {
                         Flow::Exhausted => {}
                         other => return Tail::Done(other),
                     }
@@ -98135,8 +98130,9 @@ fn tail_step<'e, 'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// ambient frame depth and the bodies the round's own calls retained (#3148) do
 /// not grow with the number of rounds.
 ///
-/// `frames` and `bound` are the call node's. A round budget ([`TailRounds`])
-/// stops a loop that never ends with the refusal the nested form reached.
+/// `frames` and `bound` are the call node's. The next round's body is bound by
+/// [`bind_next`]. A round budget ([`TailRounds`]) stops a loop that never ends
+/// with the refusal the nested form reached.
 #[inline(never)]
 fn each_def_tail_loop<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     def: &Rc<FuncDefData>,
@@ -98147,13 +98143,14 @@ fn each_def_tail_loop<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
-    let mut bodies = TailBindings::new(def, &body, frames);
-    let mut rounds = TailRounds::new();
+    let mut rounds = TailRounds::new(def);
     let mut callee = Rc::clone(def);
     let mut body = body;
+    let mut body_frames = frames;
+    let mut first_hop = true;
     let mut cur = TailValue::Borrowed(value);
     loop {
-        let _round = match enter_def_call(&callee, frames, bound) {
+        let _round = match enter_def_call(&callee, body_frames, bound) {
             Ok(guard) => guard,
             Err(e) => return Flow::Escaped(Control::Error(e)),
         };
@@ -98161,22 +98158,27 @@ fn each_def_tail_loop<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // first, as the embed table's guards are) before the next one starts.
         let mut holds = super::eval_generic::EmbedGuards::default();
         let mut walked = Rc::clone(&body);
-        let next = loop {
-            match tail_step::<W, S>(&walked, &mut cur, optional, &mut holds, sink) {
-                Tail::Call(next) => break next,
+        let (next, next_body, next_frames) = loop {
+            match tail_step::<W, S>(&walked, &mut cur, optional, &mut holds, &mut rounds, sink) {
+                Tail::Call {
+                    def: next,
+                    frames: node_frames,
+                    bound: node_bound,
+                } => match bind_next(next, node_frames, node_bound, first_hop, body_frames) {
+                    Ok((next_body, next_frames)) => {
+                        break (Rc::clone(next), next_body, next_frames)
+                    }
+                    Err(e) => return Flow::Escaped(Control::Error(e)),
+                },
                 Tail::Bound(then) => walked = then,
                 Tail::Rest(rest) => return tail_each::<W, S>(rest, &cur, optional, sink),
                 Tail::Done(flow) => return flow,
             }
         };
-        if let Err(e) = rounds.charge(&next) {
+        if let Err(e) = rounds.charge_round() {
             return Flow::Escaped(Control::Error(e));
         }
-        body = match bodies.body_of(&next) {
-            Ok(b) => b,
-            Err(e) => return Flow::Escaped(Control::Error(e)),
-        };
-        callee = next;
+        (callee, body, body_frames, first_hop) = (next, next_body, next_frames, false);
     }
 }
 
