@@ -2615,63 +2615,57 @@ impl<'e> Interp<'e> {
         }
         // The shipped evaluator's budgets, a documented divergence from jq's
         // unbounded loop (#5292, [`crate::jq::eval::LoopBudget`]): one state per
-        // test, against `MAX_LOOP_ROUNDS` for the whole tree and also against
-        // `WHILE_UNTIL_MAX_STEPS` once a round has forked.
+        // test against `MAX_LOOP_ROUNDS` for the whole tree, and each branch a
+        // forking round starts against `WHILE_UNTIL_MAX_STEPS`, charged when the
+        // branch is entered.
         let mut counters = LoopCounters::new();
         let which = if is_while { "while" } else { "until" };
-        // The refusal is the uncatchable resource limit (#2132).
-        let refuse = |charged: Result<(), Control>| match charged {
-            Err(Control::Error(e)) => Err(Raise::Fatal(e)),
-            _ => Ok(()),
-        };
-        let mut work = vec![Work::Test(input, reg)];
+        let mut work = vec![Work::Test(input, reg, false)];
         while let Some(item) = work.pop() {
             match item {
-                Work::Emit(v, r) => {
-                    if is_while {
-                        refuse(counters.budget().emit(which))?;
-                    }
-                    sink(v, r)?;
-                }
+                Work::Emit(v, r) => sink(v, r)?,
                 Work::Raise(raise) => return Err(raise),
-                Work::Test(v, r) => {
-                    refuse(counters.budget().charge(which))?;
+                Work::Test(v, r, forked) => {
+                    // A branch a fork started is charged when it is entered (as the
+                    // value and cursor evaluators charge on recursing into it), not
+                    // when its siblings are queued: a consumer that stops never enters
+                    // the rest. The refusal is the uncatchable resource limit (#2132).
+                    let mut budget = counters.budget();
+                    let charged = if forked {
+                        budget.fork(which).map(drop)
+                    } else {
+                        Ok(())
+                    };
+                    charged
+                        .and_then(|()| budget.charge(which))
+                        .map_err(control_raise)?;
                     let conds = self.collect_outputs(cond, env, v.clone(), r.sub());
-                    // A round steps in place when `cond` answers once, without a
-                    // trailing error; otherwise each branch it starts is a fork
-                    // (see `LoopBudget`).
+                    // A round steps in place when `cond` answers once without a
+                    // trailing error; otherwise the branches it starts are forks.
                     let forks = conds.values.len() != 1 || conds.end.is_err();
                     if let Err(raise) = conds.end {
                         work.push(Work::Raise(raise));
                     }
                     for (c, _) in conds.values.into_iter().rev() {
-                        let stepping =
-                            matches!((truthy(&c), is_while), (true, true) | (false, false));
-                        if stepping && forks {
-                            refuse(counters.budget().fork(which).map(drop))?;
-                        }
                         match (truthy(&c), is_while) {
                             (true, true) => {
-                                work.push(Work::Step(v.clone(), r.clone()));
+                                work.push(Work::Step(v.clone(), r.clone(), forks));
                                 work.push(Work::Emit(v.clone(), r.clone()));
                             }
                             (true, false) => work.push(Work::Emit(v.clone(), r.clone())),
                             (false, true) => {}
-                            (false, false) => work.push(Work::Step(v.clone(), r.clone())),
+                            (false, false) => work.push(Work::Step(v.clone(), r.clone(), forks)),
                         }
                     }
                 }
-                Work::Step(v, r) => {
+                Work::Step(v, r, cond_forked) => {
                     let steps = self.collect_outputs(step, env, v, r);
-                    let forks = steps.values.len() != 1 || steps.end.is_err();
+                    let forks = cond_forked || steps.values.len() != 1 || steps.end.is_err();
                     if let Err(raise) = steps.end {
                         work.push(Work::Raise(raise));
                     }
                     for (next, reg) in steps.values.into_iter().rev() {
-                        if forks {
-                            refuse(counters.budget().fork(which).map(drop))?;
-                        }
-                        work.push(Work::Test(next, reg));
+                        work.push(Work::Test(next, reg, forks));
                     }
                 }
             }
@@ -2715,12 +2709,12 @@ impl<'e> Interp<'e> {
             Some(_) => Some(recurse_max_items()),
         };
         let mut visited = 0usize;
-        let mut work = vec![Work::Test(input, reg)];
+        let mut work = vec![Work::Test(input, reg, false)];
         while let Some(item) = work.pop() {
             match item {
                 Work::Raise(raise) => return Err(raise),
-                Work::Emit(v, r) | Work::Step(v, r) => work.push(Work::Test(v, r)), // patchcov: coverage tolerate-line reason="unreachable: recurse pushes only Test and Raise items"
-                Work::Test(v, r) => {
+                Work::Emit(v, r) | Work::Step(v, r, _) => work.push(Work::Test(v, r, false)), // patchcov: coverage tolerate-line reason="unreachable: recurse pushes only Test and Raise items"
+                Work::Test(v, r, _) => {
                     if cap.is_some_and(|cap| visited >= cap) {
                         return Err(Raise::Fatal(EvalError::resource_limit(
                             "recurse: maximum nodes exceeded",
@@ -2772,7 +2766,7 @@ impl<'e> Interp<'e> {
                         }
                     }
                     for (child, rc) in kept.into_iter().rev() {
-                        work.push(Work::Test(child, rc));
+                        work.push(Work::Test(child, rc, false));
                     }
                 }
             }
@@ -3584,10 +3578,12 @@ struct Outputs {
 enum Work {
     /// Hand this output to the consumer.
     Emit(OwnedValue, Reg),
-    /// Run the loop's condition (or `recurse`'s visit) on this value.
-    Test(OwnedValue, Reg),
-    /// Run the loop's step on this value.
-    Step(OwnedValue, Reg),
+    /// Run the loop's condition (or `recurse`'s visit) on this value; the flag is
+    /// whether the round that produced it forked (#5292, `LoopBudget`), which is
+    /// charged when the branch is entered.
+    Test(OwnedValue, Reg, bool),
+    /// Run the loop's step on this value; the flag is whether `cond` forked.
+    Step(OwnedValue, Reg, bool),
     /// Raise the error a condition or step ended in, once the work it
     /// produced before the error is done.
     Raise(Raise),

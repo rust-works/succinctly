@@ -1499,10 +1499,12 @@ fn a_recursion_too_deep_is_refused_not_overflowed_5223() {
 /// on a heap work list when their arguments are pure, in jq's order, so a
 /// long loop costs no native stack per iteration; an impure argument keeps
 /// the `builtin.jq` body. The shipped evaluator's caps stay, each a
-/// documented divergence from jq's unbounded loop: 100,000 `until`/`while`
-/// states once a round forks (and 16.7M in all, #5292), 2^20 nodes for a `recurse(f)` that is not a
-/// tree descent (#5378), and `repeat`'s round limits. Every expected answer under a
-/// cap is jq 1.7.1's; the capped rows are the shipped evaluator's.
+/// documented divergence from jq's unbounded loop: 100,000 forks and 16.7M
+/// rounds for `until`/`while` (#5292), 2^20 nodes for a `recurse(f)` that is
+/// not a tree descent (#5378), and `repeat`'s round limits. Every expected
+/// answer under a cap is jq 1.7.1's; the capped rows are the shipped
+/// evaluator's, and `until_while_caps_hold_in_the_path_interpreter_5292` pins
+/// the loop caps.
 #[test]
 fn loops_run_in_constant_stack_and_in_jqs_order_5223() {
     on_big_stack(|| {
@@ -1734,6 +1736,28 @@ fn until_while_caps_hold_in_the_path_interpreter_5292() {
             (
                 "0",
                 "[while(true; .+1)] | length",
+                err(&[], "while: maximum iterations exceeded"),
+            ),
+            // A branch is charged when it is entered, not when its siblings are
+            // queued: a consumer that stops never enters the rest (this spent the
+            // fork budget at the first element of a 200,000-element array).
+            (
+                "null",
+                "[range(200000)] | first(path(until(type == \"number\"; .[])))",
+                ok(&["[0]"]),
+            ),
+            // A round whose `cond` and `step` both fork spends one fork per branch
+            // entered, as the value evaluator does (131,070 here before: over 100,000).
+            (
+                "{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":{\"a\":1}}}}}}}}",
+                "[path(until(type != \"object\", type != \"object\"; .a, .a))] | length",
+                ok(&["131072"]),
+            ),
+            // A trailing error makes the round a fork, so it is not an unbounded
+            // lineage: the pre-change interpreter answered 150,000 states here.
+            (
+                "0",
+                "[limit(150000; path(while((true, error(\"x\")); .)))] | length",
                 err(&[], "while: maximum iterations exceeded"),
             ),
             // A loop that forks once and then steps in place is as long as it is.

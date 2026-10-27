@@ -18386,11 +18386,8 @@ fn loop_step_generic<S: EvalSemantics, V: DocumentValue>(
         // `update` output -- continue in place rather than recursing, so this
         // step costs no stack depth (`until_step`'s own rationale).
         if cond_control.is_none() && bits.len() == 1 && bits[0] == continues_on {
-            if kind == LoopKind::While {
-                budget.emit(kind.name())?;
-                if sink.push(state.emit()) == Demand::Stop {
-                    return Ok(Demand::Stop);
-                }
+            if kind == LoopKind::While && sink.push(state.emit()) == Demand::Stop {
+                return Ok(Demand::Stop);
             }
             // #3503: an `update` holding a `?//` runs the rest of the loop
             // inside its sink, so the retry can follow a later round's failure.
@@ -18471,11 +18468,8 @@ fn loop_decided_generic<S: EvalSemantics, V: DocumentValue>(
         }
         return Ok(Demand::Continue);
     }
-    if spec.kind == LoopKind::While {
-        budget.emit(spec.kind.name())?;
-        if sink.push(state.emit()) == Demand::Stop {
-            return Ok(Demand::Stop);
-        }
+    if spec.kind == LoopKind::While && sink.push(state.emit()) == Demand::Stop {
+        return Ok(Demand::Stop);
     }
     if let Some(_level) = crate::jq::eval::loop_enter_stream(spec.stream) {
         // #3503: see [`loop_update_streaming`].

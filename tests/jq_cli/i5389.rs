@@ -105,14 +105,12 @@ fn assert_capped(filters: &[&str]) -> Result<()> {
 
 /// What stays bounded on the value evaluator, and uncatchable.
 #[test]
-fn test_forks_and_emissions_stay_bounded() -> Result<()> {
+fn test_forks_stay_bounded() -> Result<()> {
     assert_capped(&[
         // A tree of forks: every round forks, 100,000 forks spend the budget.
         "0 | until(false; ., .)",
         "[0 | while(true; ., .)] | length",
         "try (0 | until(false; ., .)) catch \"caught\"",
-        // A runaway `while` hands over states until the emission cap, then raises.
-        "[0 | while(true; . + 1)] | length",
     ])
 }
 

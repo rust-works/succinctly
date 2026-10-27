@@ -6059,7 +6059,7 @@ extension under ADR-0018 rule 5 -- a decision this entry doesn't make, only surf
 
 ## Evaluator resource caps apply in yq mode too, and are uncatchable (#2132)
 
-The five caps `succinctly jq` documents -- `MAX_RANGE_TOTAL`, `MAX_LOOP_ROUNDS`, `MAX_LOOP_EMITTED`, `WHILE_UNTIL_MAX_STEPS`,
+The caps `succinctly jq` documents -- `MAX_RANGE_TOTAL`, `MAX_LOOP_ROUNDS`, `WHILE_UNTIL_MAX_STEPS`,
 `REDUCE_FOREACH_MAX_STEPS`, `repeat`'s `MAX_ITERATIONS`, `MAX_EVAL_FRAMES` -- are shared
 evaluator limits, so they apply to `succinctly yq` as well; real yq v4.53.3 has none of them.
 The reachable ones without `--jq-extensions` are `while`/`until` and a recursive `def`

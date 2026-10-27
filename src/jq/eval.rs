@@ -75699,10 +75699,9 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ///
 /// Kept separate from `WHILE_UNTIL_MAX_STEPS`: the two pairs of
 /// constructs charge budget at different granularity (up to two
-/// evaluator calls per source element here vs. one combined cond+update
-/// pair per recursion-tree node there), so the shared numeric value
-/// today is coincidence, not a relationship a shared symbol should
-/// encode.
+/// evaluator calls per source element here vs. one fork per branch
+/// there), so the shared numeric value today is coincidence, not a
+/// relationship a shared symbol should encode.
 ///
 /// #2079: originally `10000`, which degenerated into a plain cap on
 /// *input-element count* for the overwhelmingly common single-INIT-fork,
@@ -75792,13 +75791,6 @@ impl<'b> FoldBudget<'b> {
 /// (`until(false; [.[0]+1, .[1]+"x"])`) is not bounded in practice, as in jq.
 pub(crate) const MAX_LOOP_ROUNDS: usize = 1 << 24;
 
-/// The most states one `while` call emits, across its whole tree (#5292): 2^20 =
-/// 1,048,576. A consumer that keeps every state (`[while(true; .a += 1)]`) holds
-/// them all, and a state is any value, so a count of 2^24 would be gigabytes of
-/// objects; this is the same number of states at a tenth of the memory per state
-/// a bare-number `range` can hold. `until` emits only where a branch ends.
-pub(crate) const MAX_LOOP_EMITTED: usize = 1 << 20;
-
 /// The counters one `while`/`until` call charges (#5292).
 ///
 /// [`WHILE_UNTIL_MAX_STEPS`] bounds forks, not length (#534: `until(.>N;
@@ -75813,7 +75805,6 @@ pub(crate) const MAX_LOOP_EMITTED: usize = 1 << 20;
 pub(crate) struct LoopCounters {
     rounds: usize,
     forks: usize,
-    emitted: usize,
 }
 
 impl LoopCounters {
@@ -75821,7 +75812,6 @@ impl LoopCounters {
         Self {
             rounds: MAX_LOOP_ROUNDS,
             forks: WHILE_UNTIL_MAX_STEPS,
-            emitted: MAX_LOOP_EMITTED,
         }
     }
 
@@ -75853,25 +75843,18 @@ impl LoopBudget<'_> {
         Ok(())
     }
 
-    /// The budget of one branch a round forks into, which nests a frame (or a
-    /// work item): charged once against the fork budget.
+    /// The budget of one branch a round forks into, which nests a native frame:
+    /// charged once against the fork budget, and refused outright once the
+    /// thread's native stack is half spent (ADR-0025), which the budget alone does
+    /// not bound -- every call gets its own, so loops in a pipe add their depths.
     pub(crate) fn fork(&mut self, what: &str) -> Result<LoopBudget<'_>, Control> {
-        if self.counters.forks == 0 {
+        if self.counters.forks == 0 || native_stack_exhausted() {
             return Err(Self::refusal(what));
         }
         self.counters.forks -= 1;
         Ok(LoopBudget {
             counters: &mut *self.counters,
         })
-    }
-
-    /// One state a `while` emits.
-    pub(crate) fn emit(&mut self, what: &str) -> Result<(), Control> {
-        if self.counters.emitted == 0 {
-            return Err(Self::refusal(what));
-        }
-        self.counters.emitted -= 1;
-        Ok(())
     }
 }
 
@@ -80592,8 +80575,9 @@ pub(crate) fn finish_fork_from_flow<'a, W>(
 ///
 /// `range(infinite)` needs no entry here -- it self-caps, at `MAX_RANGE_TOTAL`
 /// values (#5292; it was `MAX_RANGE` before), so an eager operand that holds one
-/// builds those and raises -- and `while`/`until` have no sink arm at all, so
-/// both reach bounded evaluation regardless.
+/// builds those and raises -- and `while`/`until` reach bounded evaluation too:
+/// their sink arm (`each_loop`, #5292) stops with its consumer, and a fold drives
+/// it through `eval_single`'s capped rounds (`MAX_LOOP_ROUNDS`).
 ///
 /// Consulted for *both* operands a fold drives -- `input` and `INIT`.
 /// Guarding only `input` still hung on `reduce .[] as $x (repeat(1); .+$x)`:
@@ -81049,6 +81033,20 @@ fn each_loop<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
+    // A `?//` in either operand streams its rounds through a live sink, and the
+    // consumer would then run inside the loop's still-held native levels
+    // ([`RecurseNativeLevel`]), spending the shared budget a downstream `?//` loop
+    // needs to keep jq's retry: those loops stay eager, as they were.
+    if loop_stream_budget(cond).is_some() || loop_stream_budget(update).is_some() {
+        return drain_result(
+            if is_while {
+                eval_while::<W, S>(cond, update, value, optional)
+            } else {
+                eval_until::<W, S>(cond, update, value, optional)
+            },
+            sink,
+        );
+    }
     // #1755/#1953: see `eval_until`.
     let initial = match to_owned::<S, _>(&value) {
         Ok(v) => v,
@@ -81575,7 +81573,6 @@ fn while_step<S: EvalSemantics>(
         // `update` output — continue the loop in place rather than
         // recursing, so this step costs no stack depth (see [`until_step`]).
         if cond_control.is_none() && cond_vals.len() == 1 && cond_vals[0].is_truthy() {
-            budget.emit("while")?;
             if outputs.push(state.clone()) == Demand::Stop {
                 return Ok(Demand::Stop);
             }
@@ -81661,7 +81658,6 @@ fn while_decided<S: EvalSemantics>(
     if !truthy {
         return Ok(Demand::Continue);
     }
-    budget.emit("while")?;
     if outputs.push(state.clone()) == Demand::Stop {
         return Ok(Demand::Stop);
     }
@@ -125791,7 +125787,7 @@ mod tests {
     }
 
     #[test]
-    fn loop_budget_counts_rounds_forks_and_emissions_separately_5292() {
+    fn loop_budget_counts_rounds_and_forks_separately_5292() {
         // A root lineage of in-place rounds spends only the round count, however
         // far past the fork budget it goes.
         let mut counters = LoopCounters::new();
@@ -125830,27 +125826,6 @@ mod tests {
         let mut budget = counters.budget();
         assert!(budget.charge("until").is_ok());
         assert_refused(budget.charge("until"), "until");
-
-        // ...and the emission cap a `while` that keeps handing states over.
-        let mut counters = LoopCounters::new();
-        let mut budget = counters.budget();
-        for _ in 0..MAX_LOOP_EMITTED {
-            assert!(budget.emit("while").is_ok());
-        }
-        assert_refused(budget.emit("while"), "while");
-    }
-
-    #[test]
-    fn test_runaway_while_stops_at_the_emission_cap_5292() {
-        // `[while(true; .+1)]` collects one state per round: refused at
-        // `MAX_LOOP_EMITTED` (a million scalars, tens of MB), not at the round
-        // cap, where a fat state would have held gigabytes.
-        query!(b"null", r"[0 | while(true; .+1)] | length",
-            QueryResult::Error(e) => {
-                assert!(e.message.contains("while: maximum iterations exceeded"));
-                assert!(e.is_resource_limit());
-            }
-        );
     }
 
     #[test]

@@ -59475,7 +59475,7 @@ fn test_wrong_arity_single_arg_keeps_yq_parse_error_2749() -> Result<()> {
 /// use the guards yq mode reaches unaided: `while`/`until`'s
 /// `WHILE_UNTIL_MAX_STEPS` (a loop whose `update` forks: `(1, 2)`; `., .` is one
 /// node in yq mode, and a loop that steps in place runs to the 2^24-round cap
-/// instead, seconds and gigabytes) and a recursive `def` past `MAX_EVAL_FRAMES`.
+/// instead, seconds and half a gigabyte) and a recursive `def` past `MAX_EVAL_FRAMES`.
 #[test]
 fn test_resource_limit_caps_are_uncatchable_in_yq_mode_2132() -> Result<()> {
     for (filter, want_err) in [
