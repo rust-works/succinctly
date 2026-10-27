@@ -2890,6 +2890,11 @@ impl<'e> Interp<'e> {
             Builtin::Sort if matches!(input, OwnedValue::Array(_)) => {
                 sink(sort_by_keys(&input, &input, false)?, reg)
             }
+            // #5390: `pick`'s fold moves its state from write to write, as
+            // `=` and `|=` do, instead of running jq's `reduce` body.
+            Builtin::Pick(f) if !reg.tracking() && !Self::may_retry(f, env) => {
+                self.pick_native(f, env, input, reg, sink)
+            }
             Builtin::Recurse => self.recurse(None, None, env, input, reg, sink),
             Builtin::RecurseF(f) => self.recurse(Some(f), None, env, input, reg, sink),
             Builtin::RecurseCond(f, c) => self.recurse(Some(f), Some(c), env, input, reg, sink),
@@ -3302,6 +3307,43 @@ impl<'e> Interp<'e> {
         self.eval(value, env, input.clone(), reg.sub(), &mut |v, _| {
             sink(write(paths, input.clone(), &v, &reg)?, reg.clone())
         })
+    }
+
+    /// `pick(paths)` outside path mode, with jq 1.7.1's body's meaning:
+    ///
+    /// ```text
+    /// def pick(pathexps): . as $in
+    ///   | reduce path(pathexps) as $a (null; setpath($a; $in | getpath($a)));
+    /// ```
+    ///
+    /// Each path of `paths` (computed on the input) is read from the input and
+    /// written into a state that starts as `null`. The state moves from write
+    /// to write, so a uniquely owned result is written in place rather than
+    /// copied per path: jq's body, run by the interpreter, held the state and
+    /// copied it once per path, quadratic in the paths picked (#5390). The
+    /// caller has checked that `paths` cannot retry ([`Self::may_retry`]).
+    fn pick_native(
+        &self,
+        paths: &'e Expr,
+        env: &Env<'e>,
+        input: OwnedValue,
+        reg: Reg,
+        sink: &mut Sink<'_>,
+    ) -> R {
+        let source = input.clone();
+        let state = RefCell::new(OwnedValue::Null);
+        self.paths_then_writes(paths, env, input, &reg, &mut |path| {
+            let OwnedValue::Array(keys) = &path else {
+                return Err(unsupported("a path that is not an array")); // patchcov: coverage tolerate-line reason="unreachable: path() emits arrays only"
+            };
+            let picked = self.getpath_value(&source, keys)?;
+            let before = state.replace(OwnedValue::Null);
+            let after = super::eval::set_value_at_path::<JqSemantics>(before, keys, picked)
+                .map_err(raise_eval)?;
+            *state.borrow_mut() = after;
+            Ok(())
+        })?;
+        sink(state.into_inner(), reg)
     }
 
     /// `path(paths)` on `input`, each path handed to `write` in order -- but
