@@ -4309,9 +4309,12 @@ fn copy_alias_marks(src: &CommentTree, dst: &mut CommentTree) {
 ///   it had. So `b: [1]` over a block `c: [9]` is `c: [1]`, a block `b` over a non-empty flow
 ///   `c` stays flow, and a block `b` over an empty or scalar `c` is block.
 ///
-/// Not copied here: a scalar's own quoting (`b: "q"` copies to a new `c: "q"` in yq), an explicit
-/// tag, the node's own head and foot lines, and an anchor declaration, which the target never takes
-/// ([`propagate_assign_alias_marks`] owns every alias mark, so the copy carries none).
+/// A scalar's quoting and an explicit tag, and a container's tag, are copied by
+/// [`copied_scalar_presentation`] and [`copied_container_tag`] (#5257).
+///
+/// Not copied here: the node's own head and foot lines, and an anchor declaration, which the
+/// target never takes ([`propagate_assign_alias_marks`] owns every alias mark, so the copy
+/// carries none).
 ///
 /// The copy is made only when the finished value at the target equals the value at the source:
 /// a source a later stage rewrites (`.c = .b | .b = 5`) has presentation that no longer
@@ -4321,6 +4324,7 @@ fn copy_alias_marks(src: &CommentTree, dst: &mut CommentTree) {
 fn propagate_assign_copied_presentation(
     expr: &Expr,
     value: &OwnedValue,
+    pristine_value: &OwnedValue,
     pristine: &CommentTree,
     tree: &mut CommentTree,
 ) {
@@ -4360,25 +4364,121 @@ fn propagate_assign_copied_presentation(
                 }
                 // What the target was before the write decides it, not the tree, which the write
                 // has already grown to the new value's shape. An alias target is no container of
-                // its own kind: the write turns it into one.
-                let keeps_own_style = match (comment_tree_at_path(pristine, &path_steps), &copy) {
-                    (Some(old), _) if old.alias_name().is_some() => false,
-                    (Some(CommentTree::Array(_, old)), CommentTree::Array(..)) => !old.is_empty(),
-                    (Some(CommentTree::Object(_, old, _)), CommentTree::Object(..)) => {
-                        !old.is_empty()
+                // its own kind: the write turns it into one. A tag names a container's type, so
+                // one the source and target do not share is a change of type (#5257).
+                let old = comment_tree_at_path(pristine, &path_steps)
+                    .zip(owned_value_at(pristine_value, &meta_path_of(&path_steps)));
+                let same_container_type = |old: &CommentTree| {
+                    old.meta().tag().or(copy_kind_tag(&copy))
+                        == source.meta().tag().or(copy_kind_tag(&copy))
+                };
+                let keeps_own_style = match (old, &copy) {
+                    (Some((old, _)), _) if old.alias_name().is_some() => false,
+                    (Some((old @ CommentTree::Array(_, items), _)), CommentTree::Array(..)) => {
+                        !items.is_empty() && same_container_type(old)
                     }
+                    (
+                        Some((old @ CommentTree::Object(_, fields, _), _)),
+                        CommentTree::Object(..),
+                    ) => !fields.is_empty() && same_container_type(old),
                     _ => false,
                 };
-                if !matches!(copy, CommentTree::Leaf(_))
-                    && (!keeps_own_style || source.meta().style == "flow")
-                {
-                    meta.style = source.meta().style;
+                if matches!(copy, CommentTree::Leaf(_)) {
+                    meta = copied_scalar_presentation(meta, &source, read, old);
+                } else {
+                    if !keeps_own_style || source.meta().style == "flow" {
+                        meta.style = source.meta().style;
+                    }
+                    if !keeps_own_style {
+                        meta = copied_container_tag(meta, &source, old);
+                    }
+                    // The target's own same-line comment stays beside a copy written on that
+                    // line, as it does beside a scalar (`c: [1] # tc`), unless the source brings
+                    // its own.
+                    if meta.comment.is_none() && meta.style == "flow" {
+                        meta.comment = old.and_then(|(tree, _)| tree.meta().comment.clone());
+                    }
                 }
                 *copy.meta_mut() = meta;
                 *target = copy;
             } // patchcov: coverage tolerate-line reason="unreachable: the value at the target exists (checked above), and the tree stops short of it only at a leaf, which the lookup grows (#5249)"
         }
     }
+}
+
+/// What a scalar copied by a plain assignment takes of the source's quoting and explicit tag
+/// (#5257), given the target as it was before the write. `meta` is the target's meta as the
+/// write left it (its own comment, and the quoting and tag it kept).
+///
+/// go-yaml's `Set` takes the source's style when the target is new, is not a scalar, is written
+/// plain with no tag, or changes type (`str` to `int`), and otherwise keeps its own, so
+/// `.c = .b` over `c: "old"` stays double-quoted whatever `b` was and over `c: old` becomes
+/// `b`'s `'q'`. The tag is the source's, except that a custom tag on the target stays
+/// (`!foo old` takes `b: x` as `!foo x`). A custom tag does not count towards the type: it is
+/// the type of the text, as for an untagged scalar.
+fn copied_scalar_presentation(
+    meta: NodeMeta,
+    source: &CommentTree,
+    read: &OwnedValue,
+    old: Option<(&CommentTree, &OwnedValue)>,
+) -> NodeMeta {
+    fn scalar_type<'a>(tree: &'a CommentTree, value: &OwnedValue) -> &'a str {
+        match tree.meta().tag() {
+            Some(tag) if !is_custom_tag(tag) => tag,
+            _ => core_tag_of(value),
+        }
+    }
+    let old_scalar = old.filter(|(tree, value)| {
+        matches!(tree, CommentTree::Leaf(_))
+            && !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_))
+    });
+    let takes_style = match old_scalar {
+        None => true,
+        Some((tree, value)) => {
+            (tree.meta().style.is_empty() && tree.meta().tag().is_none())
+                || scalar_type(tree, value) != scalar_type(source, read)
+        }
+    };
+    let old_custom_tag = old
+        .and_then(|(tree, _)| tree.meta().tag())
+        .filter(|tag| is_custom_tag(tag))
+        .map(str::to_string);
+    let meta = if takes_style {
+        meta.with_style(source.meta().style)
+    } else {
+        meta
+    };
+    match (old_custom_tag, source.meta().tag()) {
+        (Some(tag), _) => meta.with_tag(Some(tag)),
+        // A custom tag is the source's whatever the quoting does; a core one only rides along
+        // with the style that spells it.
+        (None, Some(tag)) if is_custom_tag(tag) => meta.with_tag(Some(tag.to_string())),
+        (None, tag) if takes_style => meta.with_tag(tag.map(str::to_string)),
+        (None, _) => meta,
+    }
+}
+
+/// The core tag of a copied container's kind: `!!seq` or `!!map`.
+fn copy_kind_tag(copy: &CommentTree) -> Option<&'static str> {
+    match copy {
+        CommentTree::Array(..) => Some("!!seq"),
+        CommentTree::Object(..) => Some("!!map"),
+        CommentTree::Leaf(_) => None,
+    }
+}
+
+/// The tag a container copied by a plain assignment takes (#5257): the source's, unless the
+/// target already carried a custom tag, which stays (`c: !bar [9]` takes `b: [1]` as `!bar [1]`).
+fn copied_container_tag(
+    meta: NodeMeta,
+    source: &CommentTree,
+    old: Option<(&CommentTree, &OwnedValue)>,
+) -> NodeMeta {
+    let old_custom_tag = old
+        .and_then(|(tree, _)| tree.meta().tag())
+        .filter(|tag| is_custom_tag(tag))
+        .map(str::to_string);
+    meta.with_tag(old_custom_tag.or_else(|| source.meta().tag().map(str::to_string)))
 }
 
 /// Drop every anchor declaration and alias mark at or under `node`.
@@ -6888,9 +6988,9 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
     // Copy the source's trailing comment and flow style through a plain assignment from a static
     // read (#5249). It comes before the alias pass below and carries no anchor mark of its own,
     // so that pass stays the one place an alias mark is decided.
-    if let Some((_, pristine)) = &presentation_sync_ctx {
+    if let Some((pristine_value, pristine)) = &presentation_sync_ctx {
         for (value, comments) in docs.iter_mut().flatten() {
-            propagate_assign_copied_presentation(expr, value, pristine, comments);
+            propagate_assign_copied_presentation(expr, value, pristine_value, pristine, comments);
         }
     }
 
