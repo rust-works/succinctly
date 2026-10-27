@@ -600,7 +600,7 @@ fn pick_pair(keys: &Expr, input: &ResultWithComments) -> Option<ResultWithCommen
             let mut picked = IndexMap::new();
             let mut fields = IndexMap::new();
             let mut key_metas = IndexMap::new();
-            for key in keys.iter() {
+            for key in &keys {
                 let OwnedValue::String(key) = key else {
                     return None;
                 };
@@ -621,7 +621,7 @@ fn pick_pair(keys: &Expr, input: &ResultWithComments) -> Option<ResultWithCommen
         OwnedValue::Array(items) => {
             let mut picked = Vec::new();
             let mut children = Vec::new();
-            for index in keys.iter() {
+            for index in &keys {
                 let (OwnedValue::Int(index) | OwnedValue::NumberLiteral(NumberRepr::Int(index), _)) =
                     index
                 else {
