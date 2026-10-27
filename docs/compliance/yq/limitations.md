@@ -6444,13 +6444,18 @@ A plain copy (`.b = .a`) and `pick` keep it since [#5257](https://github.com/rus
 A copy made through a variable (`. as $v | {"z": $v}`), a recursive merge over it (`. *d {"a": "n"}`) and a slice (`.[0:1]`) carry no such comment, where yq keeps it ([#5003](https://github.com/rust-works/succinctly/issues/5003)).
 
 `pick` copies the document's nodes, so what it keeps is printed as written: trailing comments, flow style, quoting, anchors, tags, a key's own quoting and comment, and the document's head comment.
-Swept against yq v4.53.3 over ten documents (comments, flow collections, anchors and aliases, tags, explicit keys, merge keys, several documents) and eighteen paths, plain and under `-P`.
+`pick` takes the keys of a mapping or the indices of a sequence, in the order listed.
+Swept against yq v4.53.3 over twelve documents (comments, flow collections, anchors and aliases, tags, explicit keys, merge keys, sequences, several documents) and the key lists a mapping or sequence takes, plain and under `-P`.
 Still different:
 
-- **A document that opens with `--- # comment`** and has its first entry picked: yq prints `# first` fused to the entry (`# firsta: 1 # one`), which it cannot read back.
+- **A document that opens with `--- # comment`** and has an entry picked: yq prints the comment fused to the entry (`# firsta: 1 # one`), which it cannot read back.
   This build prints the entry alone.
+- **A document opened by `---` over a comment line** (`---` / `# h` / `a: 1` / `b: ...`) with a later entry picked: yq keeps `# h` under the marker, this build prints the marker alone.
 - **A picked alias whose anchor is not picked** (`pick(["d"])` over `c: &k {z: 1}` / `d: *k`) prints the resolved mapping here and `d: *k` in yq, which then cannot resolve the alias (the anchor soundness rule).
-- **`.. | pick(...)`, and `pick(...)` on a value built by the program,** carry no presentation: the replay reads the document, not a computed value.
+- **A picked mapping that holds a merge key** (`c:` / `  <<: *x`) prints the merged members here and `!!merge <<: *x` in yq ([#4954](https://github.com/rust-works/succinctly/issues/4954)).
+- **A key listed twice** (`pick(["a", "a"])`) prints the entry once here and twice in yq, which a mapping cannot hold.
+- **A `pick` that is not the whole filter** (`.. | pick(...)`, `.c = pick(...)`, `{"z": pick(...)}`, `.[] | pick(...)`) and a pick over a computed value carry no presentation: the replay reads the document, not a computed value.
+- **A document past 1 MiB**: the replay converts the whole document with its comments, where the plain route reads only what is picked (2.7x the time and 3x the memory on a 10 MB document), so a larger one prints the result without the kept nodes' comments and styles, as before.
 
 ### `line` and `column` residuals ([#4363](https://github.com/rust-works/succinctly/issues/4363))
 

@@ -2778,10 +2778,7 @@ impl CommentTree {
     /// one this isn't an `Object` for, or one with no entry (#3601). Distinct
     /// from `field(key).style()`, which is the *value's* style (#739).
     pub fn key_style(&self, key: &str) -> &'static str {
-        match self {
-            Self::Object(_, _, keys) => keys.get(key).map_or("", |k| k.style),
-            _ => "",
-        }
+        self.key_meta(key).map_or("", |k| k.style)
     }
 
     /// The anchor object field `key`'s *key* declares (`&k key: 1`, #2598),
@@ -2789,20 +2786,14 @@ impl CommentTree {
     /// key, or the key declares none. Distinct from
     /// `field(key).declared_anchor()`, which is the *value's* anchor.
     pub fn key_anchor(&self, key: &str) -> Option<&str> {
-        match self {
-            Self::Object(_, _, keys) => keys.get(key).and_then(|k| k.anchor.as_deref()),
-            _ => None,
-        }
+        self.key_meta(key).and_then(|k| k.anchor.as_deref())
     }
 
     /// The explicit tag object field `key`'s *key* was written with (`!Foo key: 1`,
     /// #4088), verbatim, or `None` if this isn't an `Object`, has no such key, or the
     /// key carries none. Distinct from `field(key).meta().tag()`, the *value's* tag.
     pub fn key_tag(&self, key: &str) -> Option<&str> {
-        match self {
-            Self::Object(_, _, keys) => keys.get(key).and_then(|k| k.tag.as_deref()),
-            _ => None,
-        }
+        self.key_meta(key).and_then(|k| k.tag.as_deref())
     }
 
     /// The same key-scoped comment as [`Self::key_comment`], but only when

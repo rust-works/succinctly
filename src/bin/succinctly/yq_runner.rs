@@ -6560,6 +6560,12 @@ fn top_level_comma_branches(expr: &Expr) -> Option<Vec<&Expr>> {
     Some(out)
 }
 
+/// The largest document a `pick` replays the presentation of (#5003). The replay converts the
+/// whole document with its comments, where the plain route reads only what is picked: on a 10 MB
+/// document that was 2.7x the time and 3x the memory for the same output. Past this size `pick`
+/// prints its result without the comments and styles of the nodes it kept, as it did before.
+const PICK_REPLAY_MAX_BYTES: usize = 1 << 20;
+
 /// Evaluate a jq expression directly on a YAML cursor.
 ///
 /// This uses the generic evaluator to preserve position metadata (line/column).
@@ -6966,7 +6972,11 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
                 }
             }
         }
-    } else if need_comments && reshape_presentation::needed(expr) {
+    } else if need_comments
+        && reshape_presentation::needed(expr)
+        && (cursor.text().len() <= PICK_REPLAY_MAX_BYTES
+            || !reshape_presentation::contains_pick(expr))
+    {
         if let Ok(results) = &mut docs {
             if results.len() == 1
                 && matches!(results[0].0, OwnedValue::Array(_) | OwnedValue::Object(_))

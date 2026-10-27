@@ -6,7 +6,7 @@
 
 use super::{
     collect_write_targets, is_closed_literal, reconcile_presentation, CommentTree, Expr, IndexMap,
-    NodeMeta, OwnedValue, ResultWithComments,
+    NodeMeta, NumberRepr, OwnedValue, ResultWithComments,
 };
 use succinctly::jq::document::{DocumentCursor, DocumentElements, DocumentFields, DocumentValue};
 use succinctly::jq::eval_generic::{to_owned_with_comments, AnchorMark, KeyMeta};
@@ -42,6 +42,17 @@ pub(super) fn supported(expr: &Expr) -> bool {
         Expr::Builtin(Builtin::Pick(paths)) => is_closed_literal(paths),
         Expr::Assign { path, value } => static_path(path) && supported(value),
         Expr::Update { path, filter } => static_path(path) && supported(filter),
+        _ => false,
+    }
+}
+
+/// Whether `expr` replays a `pick`. The replay reads the presentation of the whole document, where
+/// the plain route reads what is picked, so the caller bounds it by the document's size (#5003).
+pub(super) fn contains_pick(expr: &Expr) -> bool {
+    match expr {
+        Expr::Builtin(Builtin::Pick(_)) => true,
+        Expr::Paren(inner) => contains_pick(inner),
+        Expr::Pipe(parts) => parts.iter().any(contains_pick),
         _ => false,
     }
 }
@@ -528,11 +539,7 @@ fn trace_at_depth(
         }
         // #5003: a picked entry is the document's own node, key and all: its comments, style,
         // anchor and tag come with it, as do the document's head comment and the key's.
-        Expr::Builtin(Builtin::Pick(_)) => {
-            let result = evaluated(expr, value)?;
-            let picked = pick_tree(value, tree, &result, depth + 1)?;
-            Some((result, picked))
-        }
+        Expr::Builtin(Builtin::Pick(keys)) => pick_pair(keys, input),
         Expr::Builtin(Builtin::WithEntries(f)) => {
             let entries = next(&Expr::Builtin(Builtin::ToEntries), input)?;
             let mapped = next(&Expr::Builtin(Builtin::Map(f.clone())), &entries)?;
@@ -578,35 +585,62 @@ fn trace_at_depth(
     }
 }
 
-/// The presentation of what `pick` kept of `value` (#5003): the tree of the whole node where the
-/// result holds all of it, and for a mapping that lost entries, the entries it still holds, in
-/// the result's order, each with its own key properties. `None` where the result is not a
-/// selection of the node (an array that lost elements: the plain route decides those).
-fn pick_tree(
-    value: &OwnedValue,
-    tree: &CommentTree,
-    result: &OwnedValue,
-    depth: usize,
-) -> Option<CommentTree> {
-    if depth >= MAX_VALUE_TREE_DEPTH {
-        return None;
-    }
-    if value == result {
-        return Some(tree.clone());
-    }
-    let (OwnedValue::Object(kept), OwnedValue::Object(picked)) = (value, result) else {
+/// `pick(keys)` replayed from the document's own tree (#5003): the keys it lists that the mapping
+/// holds, or the elements at the indices it lists, in the listed order, each with the presentation
+/// of its own node and, for a mapping, of its own key. The value is built here too, so the caller's
+/// comparison with the authoritative result decides whether the tree is used (a repeated key, which
+/// yq prints twice and a mapping cannot hold, is the plain route's).
+fn pick_pair(keys: &Expr, input: &ResultWithComments) -> Option<ResultWithComments> {
+    let (value, tree) = input;
+    let OwnedValue::Array(keys) = evaluated(keys, &OwnedValue::Null)? else {
         return None;
     };
-    let mut fields = IndexMap::new();
-    let mut keys = IndexMap::new();
-    for (key, picked_value) in picked {
-        let child = pick_tree(kept.get(key)?, tree.field(key), picked_value, depth + 1)?;
-        fields.insert(key.clone(), child);
-        if let Some(meta) = tree.key_meta(key) {
-            keys.insert(key.clone(), meta.clone());
+    match value {
+        OwnedValue::Object(members) => {
+            let mut picked = IndexMap::new();
+            let mut fields = IndexMap::new();
+            let mut key_metas = IndexMap::new();
+            for key in keys.iter() {
+                let OwnedValue::String(key) = key else {
+                    return None;
+                };
+                let Some(member) = members.get(key.as_ref()) else {
+                    continue;
+                };
+                picked.insert(key.to_string(), member.clone());
+                fields.insert(key.to_string(), tree.field(key).clone());
+                if let Some(meta) = tree.key_meta(key) {
+                    key_metas.insert(key.to_string(), meta.clone());
+                }
+            }
+            Some((
+                OwnedValue::Object(picked.into()),
+                CommentTree::Object(tree.meta().clone(), fields, key_metas),
+            ))
         }
+        OwnedValue::Array(items) => {
+            let mut picked = Vec::new();
+            let mut children = Vec::new();
+            for index in keys.iter() {
+                let (OwnedValue::Int(index) | OwnedValue::NumberLiteral(NumberRepr::Int(index), _)) =
+                    index
+                else {
+                    return None;
+                };
+                let index = usize::try_from(*index).ok()?;
+                let Some(item) = items.get(index) else {
+                    continue;
+                };
+                picked.push(item.clone());
+                children.push(tree.at_index(index).clone());
+            }
+            Some((
+                OwnedValue::Array(picked.into_iter().collect()),
+                CommentTree::Array(tree.meta().clone(), children),
+            ))
+        }
+        _ => None,
     }
-    Some(CommentTree::Object(tree.meta().clone(), fields, keys))
 }
 
 fn merge_tree(
