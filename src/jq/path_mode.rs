@@ -476,6 +476,10 @@ impl<'e> Env<'e> {
     }
 }
 
+/// The visits one tail-loop question to [`Interp::single`] may make (#5379): the
+/// shipped evaluator's `SETTLE_ANALYSIS_BUDGET` for the same question.
+const SETTLE_FUEL: u32 = 64;
+
 const T_VAR: &str = "__sp_t";
 
 /// The prefix of a variable read as `LOADVN` ([`Env::take_var`]): the prelude
@@ -832,6 +836,12 @@ pub struct Interp<'e> {
     /// The `def` bodies [`Self::pure`] and [`Self::single`] are looking inside right
     /// now, by address, so a definition that reaches itself is seen as it is (#5263).
     def_walk: RefCell<Vec<usize>>,
+    /// What is left of the one question a tail loop is asking [`Self::single`] about a
+    /// stage (#5379): `single` follows a call into the body of its def, and a chain of
+    /// defs that each call the one below it several times is one visit per path through
+    /// it, so the question is bounded, and the answer once it is spent is the
+    /// conservative one (the stage may yield more). `None` outside such a question.
+    single_fuel: Cell<Option<u32>>,
     /// Array slices as `jvp_array_slice` makes them: a view (`offset`, `size`)
     /// into the root allocation. Keyed by `(root, offset, size)`, so equal
     /// slices of one array are one value; each view maps back to its root
@@ -1264,6 +1274,7 @@ impl<'e> Interp<'e> {
             next_label: Cell::new(0),
             depth: Cell::new(0),
             def_walk: RefCell::new(Vec::new()),
+            single_fuel: Cell::new(None),
             slices: RefCell::new(BTreeMap::new()),
             slice_roots: RefCell::new(BTreeMap::new()),
         }
@@ -2418,6 +2429,12 @@ impl<'e> Interp<'e> {
     /// call to a `def` with parameters counts as one that may yield more.
     fn single(&self, expr: &'e Expr, env: &Env<'e>) -> bool {
         use Expr as E;
+        if let Some(left) = self.single_fuel.get() {
+            if left == 0 {
+                return false;
+            }
+            self.single_fuel.set(Some(left - 1));
+        }
         match expr {
             E::Identity
             | E::Literal(_)
@@ -3282,9 +3299,20 @@ impl<'e> Interp<'e> {
     /// leads to: [`Self::single`], and the writes that carry a loop's state in its
     /// value (`.n += 1 | f`). An assignment answers once per output of its right
     /// side, an update once whatever its filter yields (the first).
+    ///
+    /// The question is bounded ([`Self::single_fuel`]), and it is asked again every
+    /// round: a stage that calls a def with a large body, or a chain of them, is not
+    /// settled, which only keeps the nested path.
     fn settles(&self, expr: &'e Expr, env: &Env<'e>) -> bool {
+        let before = self.single_fuel.replace(Some(SETTLE_FUEL));
+        let settled = self.settles_within(expr, env);
+        self.single_fuel.set(before);
+        settled
+    }
+
+    fn settles_within(&self, expr: &'e Expr, env: &Env<'e>) -> bool {
         match expr {
-            Expr::Paren(inner) => self.settles(inner, env),
+            Expr::Paren(inner) => self.settles_within(inner, env),
             Expr::Update { .. } => true,
             Expr::Assign { value, .. }
             | Expr::CompoundAssign { value, .. }
