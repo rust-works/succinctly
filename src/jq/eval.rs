@@ -48,6 +48,10 @@ use super::glob::yq_match_key;
 use super::local_zone::{self, LocalZone};
 use super::math;
 use super::slice::{self, SliceBounds};
+use super::tail_call::{
+    pipe_settles_before_last, spine_has_tail_call, stage_settles, tail_def, TailBindings,
+    TailRounds,
+};
 use super::walk::{
     any_pattern_key, any_subexpr, map_builtin_subexprs, map_pattern_subexprs, map_subexprs,
     search_subexpr, Visit,
@@ -7352,6 +7356,11 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             frames,
             bound,
         } => match bind_def_call(def, args, *frames, bound) {
+            // #5379: a body that ends in a call jq jumps to loops in place
+            // instead of nesting; any other body takes the path it always did.
+            Ok(body) if spine_has_tail_call(&body) => {
+                each_def_tail_loop::<W, S>(def, *frames, bound, body, value, optional, sink)
+            }
             Ok(body) => match enter_def_call(def, *frames, bound) {
                 Ok(_guard) => eval_each::<W, S>(&body, value, optional, sink),
                 Err(e) => Flow::Escaped(Control::Error(e)),
@@ -97035,7 +97044,7 @@ pub(crate) fn native_stack_exhausted() -> bool {
 
 /// The refusal of a call to `def` that recursed too deep: by
 /// [`MAX_EVAL_FRAMES`], or by the native-stack floor (ADR-0025).
-fn def_call_depth_refusal(def: &FuncDefData) -> EvalError {
+pub(crate) fn def_call_depth_refusal(def: &FuncDefData) -> EvalError {
     // #2132: uncatchable -- `def f: f; try f catch "caught"` answered
     // `"caught"` at exit 0 with a plain `new`. See
     // `EvalError::resource_limit`.
@@ -97259,13 +97268,13 @@ thread_local! {
 /// where a nested `Shared` counts by its own remembered answer and a `,` of
 /// constant-cost alternatives is admitted -- or an operand for [`settles_before_consumer`], which
 /// must be single-valued and walks into every `Shared`.
-struct PureWalk {
+pub(crate) struct PureWalk {
     budget: u32,
     for_eager_arg: bool,
 }
 
 impl PureWalk {
-    const fn new(for_eager_arg: bool) -> Self {
+    pub(crate) const fn new(for_eager_arg: bool) -> Self {
         Self {
             budget: SETTLE_ANALYSIS_BUDGET,
             for_eager_arg,
@@ -97277,7 +97286,7 @@ impl PureWalk {
 /// within the raw body of `within` when given: `None` if `expr` is not
 /// recognised as single-valued and effect-free or the budget runs out,
 /// otherwise whether it calls a `def`.
-fn single_valued_pure(
+pub(crate) fn single_valued_pure(
     expr: &Expr,
     within: Option<&FuncDefData>,
     walk: &mut PureWalk,
@@ -97615,7 +97624,7 @@ pub(crate) fn probe_def_call(
 
 /// What [`bind_def_call`] and [`probe_def_call`] cache: `def`'s body with
 /// `args` bound and the definition installed over it.
-fn bind_def_call_body(
+pub(crate) fn bind_def_call_body(
     def: &Rc<FuncDefData>,
     args: &[Expr],
     frames: u32,
@@ -97876,11 +97885,229 @@ fn eval_def_call<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     match bind_def_call(def, args, frames, cache) {
+        // #5379: the loop is sink-driven, so a body that ends in a tail call is
+        // collected from it; `eval_each` with a sink that never stops delivers
+        // what `eval_single` would (see `drain_result`).
+        Ok(body) if spine_has_tail_call(&body) => {
+            let mut items: Vec<Item<'a, W>> = Vec::new();
+            let flow = each_def_tail_loop::<W, S>(
+                def,
+                frames,
+                cache,
+                body,
+                value,
+                optional,
+                &mut |item| {
+                    items.push(item);
+                    Demand::Continue
+                },
+            );
+            take_stopping_items_to_result::<W, S>(items, flow)
+        }
         Ok(body) => match enter_def_call(def, frames, cache) {
             Ok(_guard) => eval_single::<W, S>(&body, value, optional),
             Err(e) => QueryResult::Error(e),
         },
         Err(e) => QueryResult::Error(e),
+    }
+}
+
+/// What a tail loop carries from one round to the next (#5379): the value
+/// the next round's body runs over.
+///
+/// A stage ahead of the call hands on a value the way `eval_each_pipe` receives
+/// one, borrowed from the document or built, and a built one is run through the
+/// owned evaluator, as that pipe runs its rest.
+enum TailValue<'a, W> {
+    Borrowed(StandardJson<'a, W>),
+    Owned(OwnedValue),
+}
+
+impl<'a, W> TailValue<'a, W> {
+    fn from_item(item: Item<'a, W>) -> Self {
+        match item {
+            Item::Borrowed(v) => Self::Borrowed(v),
+            Item::Owned(v) => Self::Owned(v),
+        }
+    }
+}
+
+/// Where a tail loop's walk of one round's body ended (#5379).
+enum Tail<'e> {
+    /// A call jq jumps to, over the value the walk left in the loop: run its
+    /// body next, with this level gone.
+    Call(Rc<FuncDefData>),
+    /// The walk reached something it does not pass through: evaluate it over the
+    /// value, as the nested call would have.
+    Rest(&'e Expr),
+    /// The walk reached a `def` declared in the body and bound what follows it:
+    /// carry on from there, over the same value, in the same round.
+    Bound(Rc<Expr>),
+    /// The round is over without a call: the walk delivered what the body
+    /// yields, or ended in a flow the caller returns.
+    Done(Flow),
+}
+
+/// Push `expr`'s outputs over `cur` into `sink`.
+fn tail_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    cur: &TailValue<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    match cur {
+        TailValue::Borrowed(v) => eval_each::<W, S>(expr, v.clone(), optional, sink),
+        TailValue::Owned(v) => {
+            eval_each_owned::<S>(expr, v, optional, Reentry::REBUILT, &mut |o| {
+                sink(Item::Owned(o))
+            })
+        }
+    }
+}
+
+/// Run a stage that [`stage_settles`] over `cur` to its one value: `Ok(None)` if
+/// it yields nothing, and the flow it ended in if it escaped.
+fn tail_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    cur: &TailValue<'a, W>,
+    optional: bool,
+) -> Result<Option<TailValue<'a, W>>, Flow> {
+    let mut out: Option<TailValue<'a, W>> = None;
+    let flow = tail_each::<W, S>(expr, cur, optional, &mut |item| {
+        debug_assert!(out.is_none(), "a settled stage yields at most one output");
+        out = Some(TailValue::from_item(item));
+        Demand::Continue
+    });
+    match flow {
+        Flow::Exhausted => Ok(out),
+        other => Err(other),
+    }
+}
+
+/// Walk a bound body's tail spine over `cur` (#5379), passing through exactly the
+/// nodes that have nothing left to run once the call at its end has: the
+/// condition of an `if`, the stages of a pipe and the branches of a comma in
+/// front of it. `cur` is left at the value the call (or the rest) runs over.
+///
+/// Anything the walk cannot pass through ends it at that node as
+/// [`Tail::Rest`], which the caller evaluates the nested way. That is every node
+/// whose condition or earlier stage is not [`stage_settles`] (a generator, a
+/// builtin with an effect): jq keeps the fork point on its heap stack, and here
+/// the fork point lives in the native frames the nested call keeps.
+fn tail_step<'e, 'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    body: &'e Expr,
+    cur: &mut TailValue<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Tail<'e> {
+    let mut expr = body;
+    loop {
+        match expr {
+            Expr::Paren(inner) => expr = inner,
+            Expr::FuncDef {
+                name,
+                params,
+                body,
+                then,
+                bound,
+            } => return Tail::Bound(bind_def(name, params, body, then, bound)),
+            Expr::DefCall { .. } => {
+                return match tail_def(expr) {
+                    Some(def) => Tail::Call(Rc::clone(def)),
+                    None => Tail::Rest(expr),
+                }
+            }
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+            } if stage_settles(cond) => match tail_one::<W, S>(cond, cur, optional) {
+                Ok(Some(c)) => {
+                    let truthy = match &c {
+                        TailValue::Borrowed(v) => json_is_truthy(v),
+                        TailValue::Owned(v) => v.is_truthy(),
+                    };
+                    expr = if truthy { then_branch } else { else_branch };
+                }
+                Ok(None) => return Tail::Done(Flow::Exhausted),
+                Err(flow) => return Tail::Done(flow),
+            },
+            Expr::Pipe(stages) if pipe_settles_before_last(stages) => {
+                let Some((last, before)) = stages.split_last() else {
+                    return Tail::Rest(expr);
+                };
+                for stage in before {
+                    match tail_one::<W, S>(stage, cur, optional) {
+                        Ok(Some(next)) => *cur = next,
+                        Ok(None) => return Tail::Done(Flow::Exhausted),
+                        Err(flow) => return Tail::Done(flow),
+                    }
+                }
+                expr = last;
+            }
+            Expr::Comma(items) if !items.is_empty() => {
+                let Some((last, before)) = items.split_last() else {
+                    return Tail::Rest(expr);
+                };
+                // As `eval_each`'s own `Comma` arm: each branch in front runs to
+                // completion over the same value before the next starts.
+                for item in before {
+                    match tail_each::<W, S>(item, cur, optional, sink) {
+                        Flow::Exhausted => {}
+                        other => return Tail::Done(other),
+                    }
+                }
+                expr = last;
+            }
+            _ => return Tail::Rest(expr),
+        }
+    }
+}
+
+/// Run a call to `def` whose bound `body` ends in a call jq jumps to, in place
+/// (#5379): each round enters the callee the way an `Expr::DefCall` evaluation
+/// does ([`enter_def_call`]) and leaves it before the next, so native depth, the
+/// ambient frame depth and the bodies the round's own calls retained (#3148) do
+/// not grow with the number of rounds.
+///
+/// `frames` and `bound` are the call node's. A round budget ([`TailRounds`])
+/// stops a loop that never ends with the refusal the nested form reached.
+fn each_def_tail_loop<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    def: &Rc<FuncDefData>,
+    frames: u32,
+    bound: &BoundBody,
+    body: Rc<Expr>,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    let mut bodies = TailBindings::new(def, &body, frames);
+    let mut rounds = TailRounds::new();
+    let mut callee = Rc::clone(def);
+    let mut body = body;
+    let mut cur = TailValue::Borrowed(value);
+    loop {
+        let _round = match enter_def_call(&callee, frames, bound) {
+            Ok(guard) => guard,
+            Err(e) => return Flow::Escaped(Control::Error(e)),
+        };
+        let mut walked = Rc::clone(&body);
+        let next = loop {
+            match tail_step::<W, S>(&walked, &mut cur, optional, sink) {
+                Tail::Call(next) => break next,
+                Tail::Bound(then) => walked = then,
+                Tail::Rest(rest) => return tail_each::<W, S>(rest, &cur, optional, sink),
+                Tail::Done(flow) => return flow,
+            }
+        };
+        if let Err(e) = rounds.charge(&next) {
+            return Flow::Escaped(Control::Error(e));
+        }
+        body = match bodies.body_of(&next) {
+            Ok(b) => b,
+            Err(e) => return Flow::Escaped(Control::Error(e)),
+        };
+        callee = next;
     }
 }
 
