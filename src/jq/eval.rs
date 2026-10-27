@@ -25422,6 +25422,31 @@ const JQ_WORD_CLASS: &str = r"\p{Alphabetic}\p{M}\p{Nd}\p{Pc}\x{B2}\x{B3}\x{B9}\
 #[cfg(feature = "regex")]
 const JQ_WORD_CLASS_IN_CLASS: &str = r"\p{Alphabetic}\p{M}\p{Nd}\p{Pc}";
 
+/// Whose regex syntax a pattern is written in, which decides how [`translate_regex_classes`]
+/// rewrites its classes: jq's Oniguruma (#5367, #5373) or yq's Go `regexp` (RE2, #5374).
+#[cfg(feature = "regex")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegexDialect {
+    Oniguruma,
+    Go,
+}
+
+/// Go's (RE2's) shorthand classes, which are ASCII where the `regex` crate's are Unicode (#5374):
+/// `\w` is `[0-9A-Za-z_]`, `\d` is `[0-9]` and `\s` is `[\t\n\f\r ]` (no `\v`, which the crate's
+/// `(?-u:\s)` has). The body of the class, without its brackets or a `^`.
+#[cfg(feature = "regex")]
+fn go_shorthand_class(shorthand: char) -> Option<(&'static str, bool)> {
+    Some(match shorthand {
+        'w' => ("0-9A-Za-z_", false),
+        'W' => ("0-9A-Za-z_", true),
+        'd' => ("0-9", false),
+        'D' => ("0-9", true),
+        's' => (r"\t\n\f\r ", false),
+        'S' => (r"\t\n\f\r ", true),
+        _ => return None,
+    })
+}
+
 /// Rewrite the character classes of a jq pattern to what Oniguruma's Perl syntax means by them
 /// (#5367): the POSIX brackets (`[:alpha:]`, `[:^alpha:]`) inside a class become nested Unicode
 /// classes, and a `[`, `&` or `~` inside a class is the literal character. Oniguruma's are
@@ -25431,9 +25456,19 @@ const JQ_WORD_CLASS_IN_CLASS: &str = r"\p{Alphabetic}\p{M}\p{Nd}\p{Pc}";
 /// nor is an escaped bracket. A bracket-shaped `[:word:]` (lowercase letters, optionally led by `^`) whose name is not
 /// a POSIX class is an error, as in jq (`invalid POSIX bracket type`); `ascii` and `xdigit` are
 /// ASCII in both engines and are left to the crate.
+///
+/// In [`RegexDialect::Go`] (#5374) the POSIX brackets are ASCII in both engines and are copied
+/// through; `\w \W \d \D \s \S` become the ASCII classes of [`go_shorthand_class`] (bracketed,
+/// inside a class too) and `\b \B` outside a class become `(?-u:\b)`/`(?-u:\B)`.
 #[cfg(feature = "regex")]
-fn translate_posix_brackets(pattern: &str) -> Result<std::borrow::Cow<'_, str>, EvalError> {
-    if !pattern.contains('[') && !pattern.contains("\\w") && !pattern.contains("\\W") {
+fn translate_regex_classes(
+    pattern: &str,
+    dialect: RegexDialect,
+) -> Result<std::borrow::Cow<'_, str>, EvalError> {
+    if !pattern.contains('[')
+        && !(pattern.contains('\\')
+            && (dialect == RegexDialect::Go || pattern.contains("\\w") || pattern.contains("\\W")))
+    {
         return Ok(std::borrow::Cow::Borrowed(pattern));
     }
     let chars: Vec<char> = pattern.chars().collect();
@@ -25447,11 +25482,39 @@ fn translate_posix_brackets(pattern: &str) -> Result<std::borrow::Cow<'_, str>, 
     while i < chars.len() {
         let c = chars[i];
         if c == '\\' {
+            // #5374: Go's `\w \W \d \D \s \S` are ASCII classes and its `\b \B` an ASCII
+            // word boundary; the `regex` crate's are Unicode. Always a bracketed class, as below,
+            // so a following `-` stays a literal.
+            if dialect == RegexDialect::Go {
+                if let Some((body, negated)) = chars.get(i + 1).and_then(|&k| go_shorthand_class(k))
+                {
+                    out.push('[');
+                    if negated {
+                        out.push('^');
+                    }
+                    out.push_str(body);
+                    out.push(']');
+                    changed = true;
+                    at_start = false;
+                    i += 2;
+                    continue;
+                }
+                if depth == 0 {
+                    if let Some(&b @ ('b' | 'B')) = chars.get(i + 1) {
+                        out.push_str("(?-u:\\");
+                        out.push(b);
+                        out.push(')');
+                        changed = true;
+                        i += 2;
+                        continue;
+                    }
+                }
+            }
             // #5373: jq's `\w` is its POSIX `word` plus six Latin-1 characters and without the
             // two joiners the `regex` crate's `\w` adds. Always a bracketed class, so that a
             // following `-` in `[\w-.]` is a literal and not the end of a range (jq refuses a range
             // from `\w` as an error, which this accepts).
-            if let Some(&w @ ('w' | 'W')) = chars.get(i + 1) {
+            if let (RegexDialect::Oniguruma, Some(&w @ ('w' | 'W'))) = (dialect, chars.get(i + 1)) {
                 out.push('[');
                 if w == 'W' {
                     out.push('^');
@@ -25486,7 +25549,7 @@ fn translate_posix_brackets(pattern: &str) -> Result<std::borrow::Cow<'_, str>, 
         }
         if c == '[' {
             if let Some((name_end, negated, name)) = posix_bracket_at(&chars, i) {
-                if matches!(name.as_str(), "ascii" | "xdigit") {
+                if dialect == RegexDialect::Go || matches!(name.as_str(), "ascii" | "xdigit") {
                     // Identical in both engines: copied through as written.
                     out.extend(&chars[i..name_end]);
                 } else if let Some(body) = unicode_posix_class(&name) {
@@ -25564,12 +25627,15 @@ fn posix_bracket_at(chars: &[char], at: usize) -> Option<(usize, bool, String)> 
 #[cfg(feature = "regex")]
 fn build_regex<S: EvalSemantics>(pattern: &str, flags: Option<&str>) -> Result<JqRegex, EvalError> {
     // #5367: jq's POSIX brackets are Unicode-aware (Oniguruma); yq's are Go's `regexp`, which is
-    // ASCII-only, as the `regex` crate's are -- so only jq mode rewrites them.
-    let mut pattern = if S::TAG == EvalTag::Yq {
-        pattern.to_string()
+    // ASCII-only, as the `regex` crate's are -- so yq mode leaves them alone. #5374: but yq's
+    // `\w \d \s \b` are ASCII too, where the crate's are Unicode, and a `[` inside a class is a
+    // literal in both dialects.
+    let dialect = if S::TAG == EvalTag::Yq {
+        RegexDialect::Go
     } else {
-        translate_posix_brackets(pattern)?.into_owned()
+        RegexDialect::Oniguruma
     };
+    let mut pattern = translate_regex_classes(pattern, dialect)?.into_owned();
 
     // Apply flags
     let mut suppress_empty = false;
