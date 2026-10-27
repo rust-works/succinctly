@@ -80884,10 +80884,14 @@ fn eval_last_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ///
 /// `None` for navigation alone (`.[]`, `.a[] | select(.b)`, `..`): its outputs are nodes of the
 /// document, which a collecting `last` holds as cursors -- a pointer each -- where `reduce` would
-/// decode every one it binds. Anything else computes its values, whether the generator is spelled
-/// `range`, a user's `def`, `inputs` or `splits`, and takes the `reduce` route.
+/// decode every one it binds; and for `map(g)`, one output that stays lazy. Anything else
+/// computes its values, whether the generator is spelled `range`, a user's `def`, `inputs` or
+/// `splits`, and takes the `reduce` route.
 pub(crate) fn last_as_reduce(f: &Expr) -> Option<Expr> {
-    (!is_register_navigation(f)).then(|| Expr::Reduce {
+    // `map(g)` is one output, a sequence that stays lazy through `last` (#725); there is nothing
+    // to stream.
+    let one_lazy_output = matches!(unwrap_paren(f), Expr::Builtin(Builtin::Map(_)));
+    (!is_register_navigation(f) && !one_lazy_output).then(|| Expr::Reduce {
         input: Box::new(f.clone()),
         patterns: vec![Pattern::Var(String::from(LAST_VAR))],
         init: Box::new(Expr::Literal(Literal::Null)),
@@ -157253,6 +157257,7 @@ mod never_identical_tests_5176 {
             "last(..)",
             "last(.a, .b)",
             "last(first(.[]))",
+            "last(map(. * 2))",
         ] {
             assert!(
                 last_as_reduce(&operand(source)).is_none(),
