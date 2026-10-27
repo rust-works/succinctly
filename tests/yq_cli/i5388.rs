@@ -679,6 +679,44 @@ const RESIDUAL_ROWS: &[(&str, &str, &str, i32)] = &[
         "Error: error parsing regexp: invalid character class range: `\\pX`",
         1,
     ),
+    ("\"a\" | test(\"[\\p{Cs}a]\")", "true\n", "", 0),
+    ("\"a\" | test(\"[^\\P{Cs}]\")", "false\n", "", 0),
+    ("\"a\" | test(\"[^\\p{Cs}a]\")", "false\n", "", 0),
+    ("\"a\" | test(\"[\\P{Cs}]\")", "true\n", "", 0),
+    (
+        "\"a\" | test(\"\\p^\")",
+        "",
+        "Error: error parsing regexp: invalid character class range: `\\p^`",
+        1,
+    ),
+    (
+        "\"a\" | test(\"\\p{^^L}\")",
+        "",
+        "Error: error parsing regexp: invalid character class range: `\\p{^^L}`",
+        1,
+    ),
+    (
+        "\"a\" | test(\"\\p{^}\")",
+        "",
+        "Error: error parsing regexp: invalid character class range: `\\p{^}`",
+        1,
+    ),
+    (
+        "\"a\" | test(\"\\P{^}\")",
+        "",
+        "Error: error parsing regexp: invalid character class range: `\\P{^}`",
+        1,
+    ),
+    ("\"a\" | test(\"(?s-s:a)\")", "true\n", "", 0),
+    ("\"a\" | test(\"^a(?i-i)*$\")", "true\n", "", 0),
+    ("\"a\" | test(\"a(?i-i)*A\")", "false\n", "", 0),
+    (
+        "\"a\" | test(\"(?i-i)*a\")",
+        "",
+        "Error: error parsing regexp: missing argument to repetition operator: `*`",
+        1,
+    ),
+    ("\"a\" | test(\"^a(?i)*A$\")", "true\n", "", 0),
 ];
 
 #[test]
