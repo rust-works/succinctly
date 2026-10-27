@@ -10155,10 +10155,13 @@ same way.
 > The budget's raise is uncatchable by `?`/`try`/`catch` since #2132 -- see "Every resource cap is uncatchable" below.
 
 > This section used to be headed "bounds genuine fanout, not ordinary element count", and that was never true of the shipped cap: it was a flat count of steps, so a plain 200,000-element fold (`reduce range(200000) as $x (0; . + $x)`) was refused where jq answers `19999900000`.
-> Since #5292 the budget is charged only by the INIT forks past the first.
-> The first fork runs the source once, so its steps are as many as the source has elements, which is what jq pays too: `reduce .users[] as $u (0; . + $u.score)` over 699,050 users answers.
-> Only the later forks multiply that cost, which is the product #695 was written against, so those are the only steps counted.
-> A fold with one INIT fork is therefore not capped at all, in `reduce` and `foreach`, in value mode and in `path()` mode, and for `foreach`'s EXTRACT charge as well.
+> Since #5292 the budget counts fan-out, not length.
+> The first INIT fork runs the source once, so its UPDATE evaluations are as many as the source has elements, which is what jq pays too: `reduce .users[] as $u (0; . + $u.score)` over 699,050 users answers.
+> Those are free, and so is the first EXTRACT of each UPDATE's outputs.
+> What is charged is what multiplies that cost: every step of the forks past the first (the product #695 was written against), and every EXTRACT past the first that one UPDATE fans out into.
+> So `reduce range(50001) as $x ((0,1,2); .+$x)` and `foreach range(100000) as $x (0; range(100000); empty)` (1e10 EXTRACT evaluations) still raise, and a fold with one INIT fork and one EXTRACT per element is not capped at all.
+> The same holds in `foreach` and `reduce`, in value mode and in the yq-mode `path()` resolver (`FoldBudget`, `src/jq/eval.rs`).
+> A fold whose INIT fans out wide over a short source (`[reduce (1) as $x (range(200000); .+1)] | length`) is still refused, as it was: each fork is its own fold, and 200,000 of them are charged.
 > The history below is why the number is what it is.
 
 `REDUCE_FOREACH_MAX_STEPS` (`src/jq/eval.rs`) is a shared step budget charged
@@ -10740,30 +10743,32 @@ same one a computed bracket's component stream gets.
 
 > The cap's raise is uncatchable by `?`/`try`/`catch` since #2132 -- see "Every resource cap is uncatchable" just below.
 
-> Since #5292 `MAX_RANGE` (`100000`) is the size of the batches a range is built in, not a limit on the range.
-> Each batch is handed to the consumer before the next is built, resuming where the cap cut the last one short (the running value, for a float range, so accumulation is bit-identical to an unbatched walk).
+> Since #5292 `MAX_RANGE` (`100000`) is the size of the batches a numeric range is built in, not a limit on the range.
+> Each batch is handed to the consumer before the next is built, resuming where the batch was cut (the running value, for a float range, so accumulation is bit-identical to an unbatched walk).
 > `[range(200000)] | length`, `reduce range(1000000) as $x (0; . + $x)` and `last(range(0; 2000000; 3))` answer as jq does.
-> A new cap, `MAX_RANGE_TOTAL` (2^26 = 67,108,864 values handed to a consumer that keeps asking), takes the old one's place: `[range(1e18)]` and a never-ending `range(nan)` raise `range: maximum iterations exceeded` there instead of growing until the host process is killed.
-> That is about 2 GiB of values for a consumer that keeps them all, and jq has no such cap.
-> `first`, `limit` and `nth` still build one batch.
-> The rest of this section is written for the old cap; the demand-aware raise it describes now happens at `MAX_RANGE_TOTAL`.
+> A new cap, `MAX_RANGE_TOTAL` (2^24 = 16,777,216 values of one `(from, to, step)` combination handed to a consumer that keeps asking, exact), takes the old one's place: `[range(1e18)]` and a never-ending `range(nan)` raise `range: maximum iterations exceeded` there instead of growing until the host process is killed.
+> jq has no such cap, so `[range(20000000)] | length` is refused here.
+> The cap is a count, not a memory bound: a bare integer is about 32 bytes, so a consumer that keeps all of them holds about 512 MiB when it fires, but one that keeps more per value (`[range(1e18) | {a: .}]`, roughly 300 bytes each) holds several GiB, and `last(range(30000000) * 2)` collects its operand too (`last(f)` does not stream, as `reduce f as $x (null; $x)` does in jq).
+> A consumer that collects a range before an outer `first`/`limit` could stop it (a builtin's generator argument: `first([1] | has(range(1e18)))`; a fold operand next to `repeat`) pays for up to the cap first, seconds and about 512 MiB, where it used to pay for one 100,000-value batch.
+> A demand-driven consumer builds only the batches it consumes: `first(range(1e18))` builds one, `[limit(200000; range(1000000))]` two, and a stop inside a batch never sees a cap.
+> The range of a non-numeric operand (`range("a"; "z"; "b")`, the `range/3` desugar over strings or containers) keeps the 100,000-value cap: it copies the value it emits at every step, so a growing value makes it quadratic and a cap in the millions would never be reached.
+> The rest of this section is written for the old cap, and its transcripts show it: a numeric range no longer stops at 100,000 values, and the demand-aware raise it describes now happens at `MAX_RANGE_TOTAL`.
 
-`MAX_RANGE` (`src/jq/eval.rs`, `100000`, shared by `eval_range_values` and
-`eval_range_values_f64`) caps how many values a single `(from, to, step)`
-combination will accumulate before raising, mirroring
-`REDUCE_FOREACH_MAX_STEPS`'s own resource-exhaustion rationale two sections
-above -- real jq's `range` is bounded only by memory, and a single
+`MAX_RANGE_TOTAL` (`src/jq/eval.rs`, 2^24; `100000` until #5292) caps how many
+values a single `(from, to, step)` combination will hand over before raising,
+mirroring `REDUCE_FOREACH_MAX_STEPS`'s own resource-exhaustion rationale two
+sections above -- real jq's `range` is bounded only by memory, and a single
 materializing call (`[range(1e18)]`, `reduce range(1e18) as $x (0;.+$x)`)
 could otherwise try to allocate an unbounded `Vec` in one shot.
 
 ```console
-$ echo null | jq -c '[range(100001)] | length'             # jq 1.7.1
-100001
-$ echo null | succinctly jq -c '[range(100001)] | length'
+$ echo null | jq -c '[range(16777217)] | length'             # jq 1.7.1
+16777217
+$ echo null | succinctly jq -c '[range(16777217)] | length'
 jq: error (at <stdin>:1): range: maximum iterations exceeded    # exit 5
 ```
 
-Before this fix, exceeding the cap silently returned the truncated prefix as
+Before #2089, exceeding the cap (then 100,000 values) silently returned the truncated prefix as
 a **success** (`100000`, wrong, exit 0, empty stderr) instead of raising --
 the one guard in this file that chose that failure mode, found auditing
 #2079's own fix. `range: maximum iterations exceeded` now matches the
@@ -10771,22 +10776,22 @@ the one guard in this file that chose that failure mode, found auditing
 under ADR-0018 rule 4c, same as `REDUCE_FOREACH_MAX_STEPS`.
 
 **The cap is per-combination and demand-aware, not a hard ceiling on
-`range`'s total output**: whether truncation actually raises depends on
-whether the *consumer* still wanted more once the capped batch was
+`range`'s total output**: whether reaching it actually raises depends on
+whether the *consumer* still wanted more once the last batch was
 delivered. `first`/`limit`/`nth`'s own early stop never sees it —
 `first(range(1e18))` still returns `0` instantly, no error, because the
-consumer stopped asking within the first few (well under `100000`) values
+consumer stopped asking within the first few values
 `each_range`'s sink was ever offered. A demand-driven consumer that *does*
-ask past the cap (`[limit(200000; range(1000000))]`, `nth(150000;
-range(1000000))`) raises just like the eager materializing shapes above —
-real jq answers `200000`/`150000` for both (confirmed live), so these are
-genuine, if narrower, instances of the same pre-existing divergence #2089's
-own repro table didn't happen to list, not new ones introduced by this fix.
+ask past the cap (`nth(20000000; range(1e18))`) raises just like the eager
+materializing shapes above — real jq answers `20000000` (confirmed live), so
+this is a genuine, if narrower, instance of the same divergence. (At the
+100,000-value cap #2089 set, `[limit(200000; range(1000000))]` and
+`nth(150000; range(1000000))` were such shapes; they answer as jq does since #5292.)
 
 **Two known gaps this fix doesn't close, found reviewing it:**
 
-- `range(...)?`/`try range(...)` still lets the truncated prefix through as
-  ordinary output (`[range(100001)?] | length` => `100000`, exit 0) — `?`
+- `range(...)?`/`try range(...)` still let the truncated prefix through as
+  ordinary output at the time (`[range(100001)?] | length` => `100000`, exit 0) — `?`
   suppresses the raised error, but `drain_result` has already delivered the
   capped batch to the sink before `emit` decides whether to raise, so
   nothing distinguishes it from a genuine result once the error itself is
@@ -10801,7 +10806,7 @@ own repro table didn't happen to list, not new ones introduced by this fix.
 
 ### Every resource cap is uncatchable by `?`/`try`/`catch` (#2132) -- shared by the six cap sections
 
-The six evaluator-imposed caps documented in this file -- `range`'s `MAX_RANGE_TOTAL` (#2089, #5292, above),
+The six evaluator-imposed caps documented in this file -- `range`'s `MAX_RANGE_TOTAL` (#2089, #5292, above; the `MAX_RANGE` of a non-numeric one),
 `while`/`until`'s `WHILE_UNTIL_MAX_STEPS` (#534/#2087), `reduce`/`foreach`'s
 `REDUCE_FOREACH_MAX_STEPS` (#695/#2079), `repeat`'s `MAX_ITERATIONS` (#2014), `recurse(f)`'s
 `RECURSE_MAX_ITEMS` (#3716, which ended the walk silently until then), and a recursive
@@ -10834,16 +10839,17 @@ Nor does the tag look at message text: a user's own
 `error("range: maximum iterations exceeded")` is still caught (#1660's lesson).
 
 **The prefix still streams.** A cap is an error that ends the stream, not one that
-retroactively discards it: `range(100001)?` prints `0` through `99999` and *then* the error on
-stderr at exit 5, as #2089 established for the un-suppressed form. An early-stopping
-consumer never reaches the cap at all (`[limit(5; range(100001))?]` is `[0,1,2,3,4]`).
+retroactively discards it: `(reduce range(50001) as $x ((0,1,2); .+$x))?` prints the first two
+folds' results and *then* the error on stderr at exit 5 (it was `range(100001)?` printing `0`
+through `99999` before #5292 lifted that cap), as #2089 established for the un-suppressed form. An early-stopping
+consumer never reaches the cap at all (`[limit(5; range(1e18))?]` is `[0,1,2,3,4]`).
 
 **`?//` is a catch boundary too.** Review of the first cut found the destructuring-alternative
 retry (`try_pattern_alternatives`, `each_pattern_alternatives` and its generic twin, and
 `reduce`/`foreach`'s `is_retryable_control`) still consulting `is_decode_failure()` alone --
 #1620/#1660's own exclusion -- so a cap raised inside a `?//` body read as "try the next
 alternative": `[. as $x ?// $y | if $x != null then range(100002) else 1 end] | length`
-answered `100001` at exit 0. All of them, and `suppresses` (the ambient-`?` rule every fold
+answered `100001` at exit 0 (when `range` stopped at 100,000 values). All of them, and `suppresses` (the ambient-`?` rule every fold
 construct shares), now use the one value-position predicate the `?`/`try` dispatch points
 always did.
 

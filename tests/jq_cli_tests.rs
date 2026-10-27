@@ -68630,7 +68630,7 @@ fn test_m2_lazyseq_halt_prints_nothing_1576() -> Result<()> {
 // own doc comment) established that an overflowing candidate can never
 // satisfy the range's own `< to`/`> to` condition either way, so it now ends
 // the loop and keeps whatever was already pushed, rather than bailing to
-// the pre-existing, `MAX_RANGE`-capped `eval_range_values_f64` -- for
+// the pre-existing, `MAX_RANGE`-capped float walk (`range_batch_f64`) -- for
 // `Int`/`Int`/`Int` operands, that fallback is no longer reachable at all.
 //
 // An earlier version of this fix gated the `i64` path behind a blanket
@@ -102010,8 +102010,8 @@ fn test_boolean_routes_agree_on_a_malformed_document_2669() -> Result<()> {
 ///
 /// These caps (`MAX_RANGE_TOTAL`, `WHILE_UNTIL_MAX_STEPS`, `REDUCE_FOREACH_MAX_STEPS`,
 /// `repeat`'s `MAX_ITERATIONS`, `MAX_EVAL_FRAMES`) are succinctly's own, with
-/// no jq counterpart: jq 1.7.1 has no cap at all. (`range`'s, at 2^26 values
-/// since #5292, costs seconds and gigabytes to reach, so it is pinned by
+/// no jq counterpart: jq 1.7.1 has no cap at all. (`range`'s, at 2^24 values
+/// since #5292, costs seconds and half a gigabyte to reach, so it is pinned by
 /// `error.rs` and the batching unit tests rather than here. It used to be
 /// `[range(100001)?] | length`, `100001` in jq.) A `?`/`try` written against jq semantics cannot
 /// have meant "accept a truncated result", so letting the catch swallow the
@@ -102223,14 +102223,14 @@ fn test_resource_limit_is_not_a_destructuring_retry_2132() -> Result<()> {
         (
             "reduce source ?//",
             "null",
-            "[reduce range(50001) as $x ?// $y ((0,1,2); .+$x)]",
-            "reduce: maximum iterations exceeded",
+            "[reduce (1,2) as $x ?// $y (0; if $x != null then (0|until(false;.+1)) else 1 end)]",
+            "until: maximum iterations exceeded",
         ),
         (
             "foreach source ?//",
             "null",
-            "[foreach range(50001) as $x ?// $y ((0,1,2); .+$x; .)] | length",
-            "foreach: maximum iterations exceeded",
+            "[foreach (1,2) as $x ?// $y (0; if $x != null then (0|until(false;.+1)) else 1 end; .)] | length",
+            "until: maximum iterations exceeded",
         ),
         (
             "ambient ? over a fold (suppresses)",
@@ -102254,6 +102254,19 @@ fn test_resource_limit_is_not_a_destructuring_retry_2132() -> Result<()> {
         ),
         ("[1]", "[1] as [$a] ?// $b | $b", "null"),
         ("[[1,2]]", ".[] as [$a] ?// [$b] | [$a,$b]", "[1,null]"),
+        // The ordinary-error twins of the two fold-source rows above: the same
+        // programs with `error("x")` where those hit a cap retry the next
+        // alternative, so the cap rows pin the tag, not the shape.
+        (
+            "null",
+            r#"[reduce (1,2) as $x ?// $y (0; if $x != null then error("x") else 1 end)]"#,
+            "[1]",
+        ),
+        (
+            "null",
+            r#"[foreach (1,2) as $x ?// $y (0; if $x != null then error("x") else 1 end; .)]"#,
+            "[1,1]",
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
         assert_eq!(code, 0, "`{filter}`: stderr {stderr:?}");
@@ -102629,14 +102642,15 @@ fn range_bounds_validate_only_what_they_read_2698() -> Result<()> {
     Ok(())
 }
 
-/// #2698 keeps #2089's `MAX_RANGE` rule: truncation raises only once a
-/// consumer has taken the whole capped batch and still wants more.
+/// #2698 keeps #2089's rule, as #5292 reshaped it: a consumer that stops inside
+/// the first batch never sees a cap, and one that takes more than a batch gets
+/// the values, as jq gives them.
 ///
 /// This is the rule most at risk from moving where the bounds are evaluated,
 /// because it depends on what the *sink* does, not on the bounds -- and the
 /// native arm now owns both sides of that conversation. Real jq has no cap
-/// and would try to build 10^18 elements here, so there is no oracle row:
-/// these pin succinctly's own documented divergence.
+/// and would try to build 10^18 elements for the first rows, so those have no
+/// oracle row; the last two do.
 #[test]
 fn range_max_iterations_rule_survives_the_native_arm_2698() -> Result<()> {
     // A demand-driven consumer stops inside the capped batch and never sees
@@ -102646,16 +102660,16 @@ fn range_max_iterations_rule_survives_the_native_arm_2698() -> Result<()> {
     let (out, _, code) = run_jq_full(&["-c", "[limit(3; range(1e18))]"], Some("null"))?;
     assert_eq!((out.trim(), code), ("[0,1,2]", 0));
 
-    // An unbounded one takes everything and must raise rather than silently
-    // return a 100000-element prefix.
-    for filter in ["[range(1e18)]", "reduce range(1e18) as $x (0;.+$x)"] {
-        let (_, err, code) = run_jq_full(&["-c", filter], Some("null"))?;
-        assert_ne!(
-            code, 0,
-            "#2698: `{filter}` must raise, not truncate silently"
-        );
-        assert!(
-            err.contains("maximum iterations exceeded"),
+    // One that takes more than a batch is handed every value, rather than a
+    // 100000-element prefix, silently or with an error (jq 1.7.1: the same).
+    for (filter, want) in [
+        ("[range(250000)] | length", "250000"),
+        ("reduce range(250000) as $x (0;.+$x)", "31249875000"),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some("null"))?;
+        assert_eq!(
+            (out.trim(), code),
+            (want, 0),
             "#2698: `{filter}` -- stderr: {err:?}"
         );
     }

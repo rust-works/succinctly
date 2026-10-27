@@ -9811,8 +9811,8 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `from`/`to`/`step` closures that call it are separate closures live
     // at the same time -- each needs to *set* an escape it discovers on its
     // own, which a shared `&mut Option<Control>` can't give more than one
-    // of simultaneously (#2089: `emit` gained its own write here once
-    // `eval_range_values`/`_f64` could raise on `MAX_RANGE`).
+    // of simultaneously (#2089: `emit` gained its own write here once a range
+    // could raise on its cap).
     // #3293: one slot for the escape or the consumer's stop, reset at the top
     // of every operand closure -- see `eval_generic::each_range_generic`'s
     // identical fold for why a stale one of either kind must not survive a
@@ -9821,12 +9821,10 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let stop = |control: Control| verdict.stop_with_downstream(Flow::Escaped(control));
 
     // One (from, to, step) combination's values, forwarded to the wrapping
-    // `sink`. Reuses `eval_range_values`/`_f64` and `drain_result` verbatim
-    // -- each combination still eagerly builds one `MAX_RANGE`-capped `Vec`
-    // exactly as before (#1556 is scoped to the bound expressions, not that
-    // pre-existing cap). #2089: whether truncation should actually raise
-    // depends on what `sink` does with the capped batch, not merely on
-    // whether it happened -- `eval_range`'s own sink (used by `[range(...)]`,
+    // `sink` a batch at a time (#5292; the batches are built by
+    // `range_batch_int`/`_f64`). #2089: whether reaching the cap should
+    // actually raise depends on what `sink` does with the last batch, not
+    // merely on whether it was reached -- `eval_range`'s own sink (used by `[range(...)]`,
     // `reduce`, ...) always answers `Continue`, so for it `Flow::Exhausted`
     // means "delivered everything I had and the caller still wants more",
     // exactly the silent-wrong-data case this issue is about. A
@@ -9865,46 +9863,27 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
      -> Demand {
         match (range_num(from), range_num(to), range_num(step)) {
             (Ok(from_val), Ok(to_val), Ok(step_val)) => {
-                // #5292: handed over a `MAX_RANGE` batch at a time, each drained
-                // into `sink` before the next is built.
-                let mut each = |values: Vec<OwnedValue>| match drain_result(
-                    owned_vec_to_result::<W>(values),
-                    sink,
-                ) {
-                    Flow::Exhausted => Demand::Continue,
-                    Flow::Stopped { .. } => Demand::Stop,
-                    // `owned_vec_to_result` never yields `Error`/`Break`/
-                    // `Halt`/`Partial`, so `drain_result` can only answer
-                    // `Exhausted` or `Stopped { pending: None }` here.
-                    Flow::Escaped(_) => unreachable!("owned_vec_to_result never escapes"), // patchcov: coverage tolerate-line reason="unreachable: owned_vec_to_result never yields an Error/Break/Halt/Partial result (#5292)"
-                };
-                let end = match (from_val, to_val, step_val) {
-                    // The integer walk never falls back to the float one since
-                    // #2219 -- an `i64` overflow now ends its loop and keeps
-                    // whatever was already pushed, rather than bailing; see
-                    // `range_batch_int`'s own doc comment. The float walk is
-                    // reachable only via the other match arm below (any
-                    // non-integer operand). `from_literal` is forwarded on
-                    // this arm too (#3103): an integer literal generally
-                    // renders identically to its own `i64` (so `from_literal`
-                    // is usually `None` here anyway), but `-0` is the one
-                    // legal-JSON exception.
-                    (RangeNum::Int(f), RangeNum::Int(t), RangeNum::Int(st)) => {
-                        each_range_batches_int(f, t, st, from_literal, MAX_RANGE_TOTAL, &mut each)
-                    }
-                    (f, t, st) => each_range_batches_f64(
-                        f.as_f64(),
-                        t.as_f64(),
-                        st.as_f64(),
-                        implicit_step,
-                        from_literal,
-                        MAX_RANGE_TOTAL,
-                        &mut each,
-                    ),
-                };
+                // #5292: handed over a batch at a time, each drained into `sink`
+                // before the next is built.
+                let end = each_range_batches(
+                    from_val,
+                    to_val,
+                    step_val,
+                    implicit_step,
+                    from_literal,
+                    MAX_RANGE_TOTAL,
+                    &mut |values| {
+                        for v in values {
+                            if sink(Item::Owned(v)) == Demand::Stop {
+                                return Demand::Stop;
+                            }
+                        }
+                        Demand::Continue
+                    },
+                );
                 match end {
                     RangeEnd::Exhausted => Demand::Continue,
-                    RangeEnd::Capped => stop(Control::Error(range_max_exceeded_error())), // patchcov: coverage tolerate-line reason="expensive: reached only after MAX_RANGE_TOTAL (2^26) values have been drained, seconds of CPU; the cap itself is pinned by the each_range_batches_* unit tests and the generic twin (#5292)"
+                    RangeEnd::Capped => stop(Control::Error(range_max_exceeded_error())),
                     RangeEnd::Stopped => {
                         verdict.stop_with_downstream(Flow::Stopped { pending: None })
                     }
@@ -64579,12 +64558,12 @@ fn walk_escape_retries(control: &Control, is_last: bool, guessed: bool) -> bool 
 /// bind failed ran nothing. `ran_update` is the caller's per-element flag,
 /// reset with each element.
 fn charge_alternative_update(
-    budget: &mut usize,
+    budget: &mut FoldBudget<'_>,
     ran_update: &mut bool,
     what: &str,
 ) -> Option<Control> {
     if core::mem::replace(ran_update, true) {
-        charge_budget(budget, what)
+        budget.charge_step(what)
     } else {
         None
     }
@@ -65902,8 +65881,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
             fork_index += 1;
             i
         };
-        let mut unmetered = usize::MAX;
-        let budget = fold_fork_budget(fork_index == 0, &mut unmetered, &mut shared_budget);
+        let mut budget = FoldBudget::for_fork(&mut shared_budget, fork_index == 0);
         let (mut reg, acc) =
             FoldRegister::enter(init_branch, value, trackable, init_keeps_register, frame);
         if mentions_frozen_var {
@@ -66014,7 +65992,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         let source_may_alias = fold_source_may_alias_register::<S>(input);
         let source_flow = drive_fold_source::<S>(input, &ambient, relocate_base, &mut |elem| {
             aborted.begin();
-            if let Some(control) = charge_budget(budget, "reduce") {
+            if let Some(control) = budget.charge_step("reduce") {
                 return aborted.stop(control);
             }
             // #2979: one attempt per `?//` alternative, in order -- jq's
@@ -66188,7 +66166,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                             update_at_register && moved_reg.as_ref().map_or(true, |(_, at)| *at);
                         let acc_input = acc.take().unwrap_or(OwnedValue::Null);
                         if let Some(control) =
-                            charge_alternative_update(budget, &mut ran_update, "reduce")
+                            charge_alternative_update(&mut budget, &mut ran_update, "reduce")
                         {
                             outcome = Some(FoldStepOutcome::Return(aborted.stop(control)));
                             return Demand::Stop;
@@ -67012,8 +66990,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
             fork_index += 1;
             i
         };
-        let mut unmetered = usize::MAX;
-        let budget = fold_fork_budget(fork_index == 0, &mut unmetered, &mut shared_budget);
+        let mut budget = FoldBudget::for_fork(&mut shared_budget, fork_index == 0);
         let (mut reg, mut state) =
             FoldRegister::enter(init_branch, value, trackable, init_keeps_register, frame);
         if mentions_frozen_var {
@@ -67094,7 +67071,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
             steps += 1;
             downstream_stopped = None;
             aborted.begin();
-            if let Some(control) = charge_budget(budget, "foreach") {
+            if let Some(control) = budget.charge_step("foreach") {
                 return aborted.stop(control);
             }
             // #2979: one attempt per `?//` alternative, in order -- see
@@ -67214,11 +67191,13 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                         // #5018: set per UPDATE item below ([`UpdateFlags`]).
                         let update_states_entry = core::cell::Cell::new(false);
                         if let Some(control) =
-                            charge_alternative_update(budget, &mut ran_update, "foreach")
+                            charge_alternative_update(&mut budget, &mut ran_update, "foreach")
                         {
                             outcome = Some(FoldStepOutcome::Return(aborted.stop(control)));
                             return Demand::Stop;
                         }
+                        // #5292: EXTRACT runs this UPDATE run has made, for the budget.
+                        let mut extract_evals = 0usize;
                         // An UPDATE escape still delivers the outputs before it, as
                         // jq's generator does (`path(foreach (1) as $x (.; (.a,
                         // error("x"))))` prints `["a"]` before raising), and then
@@ -67393,7 +67372,10 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                 }
                             };
                             if let Some(ext_expr) = &bound_extract {
-                                if let Some(control) = charge_budget(budget, "foreach") {
+                                extract_evals += 1;
+                                if let Some(control) =
+                                    budget.charge_extract("foreach", extract_evals - 1)
+                                {
                                     outcome = Some(FoldStepOutcome::Return(aborted.stop(control)));
                                     return Demand::Stop;
                                 }
@@ -75536,7 +75518,10 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// INIT fork, mirroring `WHILE_UNTIL_MAX_STEPS`'s "whole tree, not
 /// per-branch" accounting. Charged once per UPDATE eval, and — in
 /// `foreach` only — once more per EXTRACT eval (a genuine evaluator
-/// invocation, not free output-copying).
+/// invocation, not free output-copying), by every fork but the first: that
+/// fork's UPDATE evals and each UPDATE's first EXTRACT are free, since they
+/// are as many as the source has elements and jq pays them too (#5292, see
+/// [`FoldBudget`]).
 ///
 /// Kept separate from `WHILE_UNTIL_MAX_STEPS`: the two pairs of
 /// constructs charge budget at different granularity (up to two
@@ -75582,27 +75567,47 @@ pub(crate) fn charge_budget(budget: &mut usize, what: &str) -> Option<Control> {
     None
 }
 
-/// The budget an INIT fork of a `reduce`/`foreach` charges its steps against
-/// (#5292): `unmetered` for the first fork, the fold's `shared` budget for every
-/// later one.
+/// What an INIT fork of a `reduce`/`foreach` is charged against the fold's
+/// shared step budget (#5292).
 ///
-/// The step budget guards the product of INIT forks and source length (#695:
-/// `reduce range(100000) as $x ((range(100000)); .+$x)` is 1e10 round trips).
-/// The first fork runs the source once, so its steps are as many as the source
-/// has elements -- the cost jq pays too, and the one an ordinary fold over
-/// input-sized data (a `reduce` over 700,000 array elements) must not be
-/// refused for. Only the forks past it multiply that cost, so only they are
-/// metered. The caller owns `unmetered` (set to `usize::MAX`), so its
-/// decrements never exhaust it in any run that finishes.
-pub(crate) fn fold_fork_budget<'b>(
-    first_fork: bool,
-    unmetered: &'b mut usize,
+/// The budget guards fan-out, not length (#695: `reduce range(100000) as $x
+/// ((range(100000)); .+$x)` is 1e10 round trips). The first fork runs the
+/// source once, so its steps are as many as the source has elements -- the
+/// cost jq pays too, and the one an ordinary fold over input-sized data (a
+/// `reduce` over 700,000 array elements) must not be refused for -- so a step
+/// of its is free, and so is the first EXTRACT of an UPDATE's output. What is
+/// charged is what multiplies that: every step of a later fork, and every
+/// EXTRACT past the first that one UPDATE fans out into.
+pub(crate) struct FoldBudget<'b> {
     shared: &'b mut usize,
-) -> &'b mut usize {
-    if first_fork {
-        unmetered
-    } else {
-        shared
+    /// Whether this fork's steps are charged: every fork but the first.
+    metered: bool,
+}
+
+impl<'b> FoldBudget<'b> {
+    pub(crate) fn for_fork(shared: &'b mut usize, first_fork: bool) -> Self {
+        Self {
+            shared,
+            metered: !first_fork,
+        }
+    }
+
+    /// One source element's UPDATE run (or a retried `?//` alternative's).
+    pub(crate) fn charge_step(&mut self, what: &str) -> Option<Control> {
+        if self.metered {
+            charge_budget(self.shared, what)
+        } else {
+            None
+        }
+    }
+
+    /// One EXTRACT run, `nth` being how many this UPDATE run has already made.
+    pub(crate) fn charge_extract(&mut self, what: &str, nth: usize) -> Option<Control> {
+        if self.metered || nth > 0 {
+            charge_budget(self.shared, what)
+        } else {
+            None
+        }
     }
 }
 
@@ -75666,7 +75671,7 @@ fn try_reduce_step_alternatives<S: EvalSemantics>(
     acc_input: OwnedValue,
     optional: bool,
     mark_loop_vars: bool,
-    budget: &mut usize,
+    budget: &mut FoldBudget<'_>,
 ) -> (OwnedValue, Option<Control>) {
     let last_idx = patterns.len() - 1;
     let invert_dedup = patterns.len() > 1;
@@ -75704,7 +75709,7 @@ fn try_reduce_step_alternatives<S: EvalSemantics>(
                 let substituted =
                     substitute_fold_step(update, bindings, all_var_names, mark_loop_vars);
 
-                if let Some(control) = charge_budget(budget, "reduce") {
+                if let Some(control) = budget.charge_step("reduce") {
                     outcome_at = pipe_retry_generation();
                     outcome = Some(StepOutcome::Return(control));
                     return Demand::Stop;
@@ -78923,7 +78928,7 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
     state_input: OwnedValue,
     optional: bool,
     mark_loop_vars: bool,
-    budget: &mut usize,
+    budget: &mut FoldBudget<'_>,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> (OwnedValue, Flow) {
     let last_idx = patterns.len() - 1;
@@ -78984,7 +78989,7 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                 // by whoever set it.
                 clear_nonretryable_stop();
 
-                if let Some(control) = charge_budget(budget, "foreach") {
+                if let Some(control) = budget.charge_step("foreach") {
                     outcome_at = pipe_retry_generation();
                     outcome = Some(AlternativeOutcome::Return(Flow::Escaped(control)));
                     return Demand::Stop;
@@ -79022,6 +79027,8 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                 // outlive it (#3293).
                 let step_outcome = StashedVerdict::<FoldUpdateVerdict>::new();
                 let mut last_update: Option<OwnedValue> = None;
+                // #5292: EXTRACT runs this UPDATE run has made, for the budget.
+                let mut extract_evals = 0usize;
 
                 let on_update = &mut |update_val: OwnedValue| -> Demand {
                     step_outcome.begin();
@@ -79037,7 +79044,10 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                             // its own accounting. Conditional on EXTRACT being
                             // present, exactly as before -- the implicit-identity
                             // form performs no extra evaluation to charge for.
-                            if let Some(control) = charge_budget(budget, "foreach") {
+                            extract_evals += 1;
+                            if let Some(control) =
+                                budget.charge_extract("foreach", extract_evals - 1)
+                            {
                                 // `update_val` is also the state a `?//` retry at
                                 // this same position would resume from (#1458), but
                                 // a budget cap is never retryable -- straight to
@@ -79931,7 +79941,9 @@ impl FoldDirectRetry {
 /// drives the source either.
 ///
 /// The budget is charged across every fork, not per fork (#695), the same
-/// "whole tree, not per-branch" accounting `WHILE_UNTIL_MAX_STEPS` uses.
+/// "whole tree, not per-branch" accounting `WHILE_UNTIL_MAX_STEPS` uses --
+/// except that the first fork's per-element steps are free (#5292, see
+/// [`FoldBudget`]).
 #[allow(clippy::too_many_arguments)] // STYLE-0004: INIT, source and retry flags are one fold's own ambients, as `reduce_forks`
 pub(crate) fn foreach_forks<S: EvalSemantics>(
     patterns: &[Pattern],
@@ -79985,8 +79997,7 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
     let init_flow = drive_init(&mut |init_val| {
         terminal.begin();
         let first = core::mem::take(&mut first_fork);
-        let mut unmetered = usize::MAX;
-        let budget = fold_fork_budget(first, &mut unmetered, &mut shared_budget);
+        let mut budget = FoldBudget::for_fork(&mut shared_budget, first);
         // #3896: sharing holds on every fork -- a constant source is shared on each --
         // while the path marking stays first-fork-only. A marker is the element's own
         // storage (`Origin::Untracked`, nothing registered), which on a later fork is
@@ -80032,7 +80043,7 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
                 step_state,
                 optional,
                 mark,
-                &mut *budget,
+                &mut budget,
                 sink,
             );
             state = new_state;
@@ -80126,8 +80137,7 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
     let init_flow = drive_init(&mut |init_val| {
         terminal.begin();
         let first = core::mem::take(&mut first_fork);
-        let mut unmetered = usize::MAX;
-        let budget = fold_fork_budget(first, &mut unmetered, &mut shared_budget);
+        let mut budget = FoldBudget::for_fork(&mut shared_budget, first);
         // #3896: sharing holds on every fork -- a constant source is shared on each --
         // while the path marking stays first-fork-only. A marker is the element's own
         // storage (`Origin::Untracked`, nothing registered), which on a later fork is
@@ -80162,7 +80172,7 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
                 step_acc,
                 optional,
                 mark,
-                &mut *budget,
+                &mut budget,
             );
             acc = new_acc;
             match step_control {
@@ -80276,9 +80286,10 @@ pub(crate) fn finish_fork_from_flow<'a, W>(
 /// that sink stops; an eager one does not, so `reduce repeat(1) as $x
 /// (0; .+1)` would spin forever rather than raising.
 ///
-/// `range(infinite)` needs no entry here -- it self-caps -- and `while`/
-/// `until` have no sink arm at all, so both reach bounded evaluation
-/// regardless.
+/// `range(infinite)` needs no entry here -- it self-caps, at `MAX_RANGE_TOTAL`
+/// values (#5292; it was `MAX_RANGE` before), so an eager operand that holds one
+/// builds those and raises -- and `while`/`until` have no sink arm at all, so
+/// both reach bounded evaluation regardless.
 ///
 /// Consulted for *both* operands a fold drives -- `input` and `INIT`.
 /// Guarding only `input` still hung on `reduce .[] as $x (repeat(1); .+$x)`:
@@ -81570,42 +81581,49 @@ fn eval_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
-/// Cap on the number of values `range(from; to; step)` will accumulate --
-/// shared by [`eval_range_values`] and [`range_batch_f64`] (#1029: was
+/// The size of the batches `range(from; to; step)` is built in (#1029: was
 /// two independent `const MAX_RANGE` copies, the structural twin of the
-/// `MAX_ITEMS` triplication #1023 fixed for the recurse family).
+/// `MAX_ITEMS` triplication #1023 fixed for the recurse family), and the cap
+/// on the values of a `range` whose operands are not all numbers
+/// ([`range_values_generic`]).
 ///
-/// Real jq's `range` is bounded only by memory; this exists purely as a
-/// resource-exhaustion guard against a single materializing call
-/// (`[range(1e18)]`, `reduce range(1e18) as $x (0; .+$x)`, ...) trying to
-/// allocate an unbounded `Vec` in one shot, the same reasoning
-/// [`REDUCE_FOREACH_MAX_STEPS`]/[`WHILE_UNTIL_MAX_STEPS`] already establish
-/// for their own guards. Kept at the same magnitude as
-/// `REDUCE_FOREACH_MAX_STEPS` rather than re-derived, so the three share one
-/// "how much may a single eager accumulation hold" answer.
+/// Real jq's `range` is bounded only by memory. Until #5292 this was the cap on
+/// every range, a resource-exhaustion guard against a single materializing call
+/// (`[range(1e18)]`, `reduce range(1e18) as $x (0; .+$x)`, ...) allocating an
+/// unbounded `Vec` in one shot; it refused `[range(200000)]`. A numeric range
+/// is now handed over this many values at a time ([`each_range_batches`]) and
+/// capped by [`MAX_RANGE_TOTAL`] instead. The generic walk keeps this cap: it
+/// copies the value it emits at every step, so a growing string or container
+/// makes it quadratic, and a cap in the millions would never be reached.
 ///
-/// Exhausting it now *raises*, matching every sibling guard in this file --
+/// Exhausting a cap *raises*, matching every sibling guard in this file --
 /// #2089 found it silently truncating to a wrong, unflagged answer at exit 0
 /// instead, the one guard in the file that chose that failure mode. See
 /// [`docs/compliance/jq/limitations.md`](../../docs/compliance/jq/limitations.md)
 /// for the recorded divergence (real jq has no such cap at all).
 pub(crate) const MAX_RANGE: usize = 100000;
 
-/// The most values one `range` call hands over to a consumer that keeps asking
-/// (#5292): 2^26, about 1.5 GiB if every one is kept.
+/// The most values one numeric `range(from; to; step)` hands over to a consumer
+/// that keeps asking (#5292): 2^24 = 16,777,216, about 512 MiB if every one is
+/// kept as a bare number. It counts one `(from, to, step)` combination, as
+/// [`MAX_RANGE`] did, and is exact: the last batch is cut at it.
 ///
-/// [`MAX_RANGE`] is only the size of the batches a range is built in; this is
-/// the cap on how many of them it will build. Real jq's `range` is bounded only
-/// by memory, and so is a range here until this many values have gone by --
-/// below it, a `reduce`/`foreach`/`[...]` over `range(200000)` or
-/// `range(10000000)` answers as jq does. The cap exists so `[range(1e18)]` and
-/// a never-ending `range(nan)` raise instead of growing until the host
-/// process is killed (ADR-0018 rule 4c).
-pub(crate) const MAX_RANGE_TOTAL: usize = 1 << 26;
+/// Real jq's `range` is bounded only by memory, and so is a range here until
+/// this many values have gone by: below it, a `reduce`/`foreach`/`[...]` over
+/// `range(200000)` or `range(10000000)` answers as jq does. It is a count, not
+/// a memory bound: a consumer that keeps more than a bare number per value
+/// (`[range(1e18) | {a: .}]`) holds several times as much when it fires. The
+/// cap exists so `[range(1e18)]` and a never-ending `range(nan)` raise
+/// instead of growing until the host process is killed (ADR-0018 rule 4c). It
+/// is also the most an eager consumer of an unbounded generator that an outer
+/// `first` would have cut short builds first
+/// (`first([1] | has(range(1e18)))`).
+pub(crate) const MAX_RANGE_TOTAL: usize = 1 << 24;
 
 /// The error [`each_range`]'s `emit` raises once a caller that actually
-/// wanted every value (its sink kept answering [`Demand::Continue`]) hits a
-/// [`MAX_RANGE`]-truncated batch -- shared so callers can't drift in wording.
+/// wanted every value (its sink kept answering [`Demand::Continue`]) reaches
+/// the cap ([`MAX_RANGE_TOTAL`], [`MAX_RANGE`]) -- shared so callers can't
+/// drift in wording.
 pub(crate) fn range_max_exceeded_error() -> EvalError {
     // #2132: uncatchable -- `[range(100001)?] | length` answered `100000`
     // at exit 0 with a plain `new`, the silent truncation #2089 closed for
@@ -81621,12 +81639,13 @@ fn eval_range_values<'a, W: Clone + AsRef<[u64]>>(
     step: i64,
     first_value: Option<&OwnedValue>,
 ) -> (QueryResult<'a, W>, bool) {
-    let (values, resume) = range_batch_int(from, to, step, first_value);
+    let (values, resume) = range_batch_int(from, to, step, first_value, MAX_RANGE);
     (owned_vec_to_result(values), resume.is_some())
 }
 
 /// Helper to generate range values, in batches of [`MAX_RANGE`] --
-/// issue #2131's revised fix, further revised by #2219.
+/// issue #2131's revised fix, further revised by #2219. (`MAX_RANGE` below
+/// stands for `max_len`, which is that but for the last batch before a cap.)
 ///
 /// Always returns `(values, resume)` -- an `i64` overflow at any point
 /// (cap-boundary lookahead or the loop's own per-iteration advance) ends the
@@ -81744,16 +81763,18 @@ fn eval_range_values<'a, W: Clone + AsRef<[u64]>>(
 /// rest of this module's `#2131`-tagged tests for the sign/step-width
 /// combinations swept to confirm the data-sourced case.
 ///
-/// One [`MAX_RANGE`]-sized batch is all this builds: the second half of its
-/// result is the `from` the next batch resumes at when the cap cut the range
-/// short (#5292), the very candidate the cap-boundary lookahead above already
-/// computes and checks, and `None` when the range ended within the batch.
-/// [`each_range_batches_int`] drives it until the range runs out.
+/// One batch of at most `max_len` values ([`MAX_RANGE`] but for the last batch
+/// before a cap) is all this builds: the second half of its result is the
+/// `from` the next batch resumes at when `max_len` cut the range short (#5292),
+/// the very candidate the cap-boundary lookahead above already computes and
+/// checks, and `None` when the range ended within the batch.
+/// [`each_range_batches`] drives it until the range runs out.
 fn range_batch_int(
     from: i64,
     to: i64,
     step: i64,
     first_value: Option<&OwnedValue>,
+    max_len: usize,
 ) -> (Vec<OwnedValue>, Option<i64>) {
     let mut values: Vec<OwnedValue> = Vec::new();
     let mut resume: Option<i64> = None;
@@ -81772,7 +81793,7 @@ fn range_batch_int(
         let mut i = from;
         while i < to {
             values.push(next_value(i));
-            if values.len() >= MAX_RANGE {
+            if values.len() >= max_len {
                 // Cap hit on the push that just happened. Whether this is a
                 // *real* truncation depends on whether one more value would
                 // exist -- which still needs the next candidate, but this
@@ -81793,7 +81814,7 @@ fn range_batch_int(
                 break;
             }
             // Same proof as the cap-hit lookahead above, just reached one
-            // push earlier (below `MAX_RANGE`, not at it): an overflowing
+            // push earlier (below `max_len`, not at it): an overflowing
             // `i.checked_add(step)` here means the true next value exceeds
             // `i64::MAX`, and `to` is always a valid `i64`, so that next
             // value could never satisfy `< to` either -- the range is
@@ -81811,7 +81832,7 @@ fn range_batch_int(
         let mut i = from;
         while i > to {
             values.push(next_value(i));
-            if values.len() >= MAX_RANGE {
+            if values.len() >= max_len {
                 resume = i.checked_add(step).filter(|next| *next > to);
                 break;
             }
@@ -81872,18 +81893,20 @@ fn range_batch_int(
 /// actually pushed, avoids cloning the literal's `Box<str>` for a
 /// combination that never uses it.
 ///
-/// One [`MAX_RANGE`]-sized batch is all this builds: the second half of its
-/// result is the running value the next batch resumes at when the cap cut the
-/// range short (#5292) -- the `i` the loop had reached, so a resumed walk
-/// accumulates by the same repeated additions an uncapped one would -- and
-/// `None` when the range ended within the batch. [`each_range_batches_f64`]
-/// drives it until the range runs out.
+/// One batch of at most `max_len` values ([`MAX_RANGE`] but for the last batch
+/// before a cap) is all this builds: the second half of its result is the
+/// running value the next batch resumes at when `max_len` cut the range short
+/// (#5292) -- the `i` the loop had reached, so a resumed walk accumulates by the
+/// same repeated additions an uncapped one would -- and `None` when the range
+/// ended within the batch. [`each_range_batches`] drives it until the range
+/// runs out.
 fn range_batch_f64(
     from: f64,
     to: f64,
     step: f64,
     implicit_step: bool,
     first_value: Option<&OwnedValue>,
+    max_len: usize,
 ) -> (Vec<OwnedValue>, Option<f64>) {
     let mut values: Vec<OwnedValue> = Vec::new();
     let mut resume: Option<f64> = None;
@@ -81966,7 +81989,7 @@ fn range_batch_f64(
     match cmp_f64(step, 0.0) {
         core::cmp::Ordering::Greater => {
             let mut i = from;
-            while continue_ascending(i) && values.len() < MAX_RANGE {
+            while continue_ascending(i) && values.len() < max_len {
                 values.push(next_value(i));
                 i += step;
             }
@@ -81974,7 +81997,7 @@ fn range_batch_f64(
         }
         core::cmp::Ordering::Less => {
             let mut i = from;
-            while continue_descending(i) && values.len() < MAX_RANGE {
+            while continue_descending(i) && values.len() < max_len {
                 values.push(next_value(i));
                 i += step;
             }
@@ -81986,75 +82009,86 @@ fn range_batch_f64(
     (values, resume)
 }
 
-/// How a range driven in batches ended ([`each_range_batches_int`],
-/// [`each_range_batches_f64`]).
+/// How a range driven in batches ended ([`each_range_batches`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RangeEnd {
     /// The range ran out: every value was handed over.
     Exhausted,
     /// The consumer stopped asking before the range ran out.
     Stopped,
-    /// [`MAX_RANGE_TOTAL`] values were handed over and the range goes on.
+    /// The cap on the values handed over was reached and the range goes on.
     Capped,
 }
 
-/// `range(from; to; step)` over integers, handed to `each` one
-/// [`MAX_RANGE`]-sized batch at a time until the range runs out, `each` stops
-/// it, or `cap` values (callers pass [`MAX_RANGE_TOTAL`]) have gone by (#5292).
+/// A numeric `range` driven in batches (#5292): `batch(from, max_len)` builds
+/// one of at most `max_len` values and the point the next resumes at, and each
+/// is handed to `each` before the next is built, until the range runs out,
+/// `each` stops it, or `cap` values have gone by (the last batch is cut at it).
 ///
 /// The batches are what keeps `first(range(1e18))` and `limit` from building
 /// anything near a whole range, and what lets `reduce range(1000000) as $x
-/// (0; . + $x)` run: each batch is drained before the next is built, so a
-/// consumer that lets go of its values holds one batch at a time.
-pub(crate) fn each_range_batches_int(
-    from: i64,
-    to: i64,
-    step: i64,
-    first_value: Option<&OwnedValue>,
+/// (0; . + $x)` run: a consumer that lets go of its values holds one batch at
+/// a time.
+fn drive_range_batches<T>(
+    mut from: T,
     cap: usize,
+    mut batch: impl FnMut(T, usize) -> (Vec<OwnedValue>, Option<T>),
     each: &mut dyn FnMut(Vec<OwnedValue>) -> Demand,
 ) -> RangeEnd {
-    let mut from = from;
-    let mut first_value = first_value;
     let mut handed = 0usize;
-    loop {
-        let (values, resume) = range_batch_int(from, to, step, first_value.take());
+    while handed < cap {
+        let (values, resume) = batch(from, MAX_RANGE.min(cap - handed));
         handed += values.len();
         if each(values) == Demand::Stop {
             return RangeEnd::Stopped;
         }
         match resume {
             None => return RangeEnd::Exhausted,
-            Some(_) if handed >= cap => return RangeEnd::Capped,
             Some(next) => from = next,
         }
     }
+    // `cap` values went by and the last batch still had a value after it.
+    RangeEnd::Capped
 }
 
-/// [`each_range_batches_int`] over floats (`implicit_step`: see
-/// [`range_batch_f64`]).
-pub(crate) fn each_range_batches_f64(
-    from: f64,
-    to: f64,
-    step: f64,
+/// `range(from; to; step)` over numbers, handed to `each` in batches of at most
+/// [`MAX_RANGE`] values and at most `cap` in all (callers pass
+/// [`MAX_RANGE_TOTAL`]): integers when all three operands are, floats
+/// otherwise (`implicit_step`: see [`range_batch_f64`]). `from_literal` is the
+/// first value's source spelling (#3103); see [`range_from_literal_override`].
+pub(crate) fn each_range_batches(
+    from: RangeNum,
+    to: RangeNum,
+    step: RangeNum,
     implicit_step: bool,
-    first_value: Option<&OwnedValue>,
+    from_literal: Option<&OwnedValue>,
     cap: usize,
     each: &mut dyn FnMut(Vec<OwnedValue>) -> Demand,
 ) -> RangeEnd {
-    let mut from = from;
-    let mut first_value = first_value;
-    let mut handed = 0usize;
-    loop {
-        let (values, resume) = range_batch_f64(from, to, step, implicit_step, first_value.take());
-        handed += values.len();
-        if each(values) == Demand::Stop {
-            return RangeEnd::Stopped;
-        }
-        match resume {
-            None => return RangeEnd::Exhausted,
-            Some(_) if handed >= cap => return RangeEnd::Capped,
-            Some(next) => from = next,
+    let mut first_value = from_literal;
+    match (from, to, step) {
+        // The integer walk never falls back to the float one since #2219 -- an
+        // `i64` overflow ends its loop and keeps whatever was already pushed,
+        // rather than bailing; see `range_batch_int`'s own doc comment.
+        // `from_literal` is forwarded on this arm too (#3103): an integer
+        // literal generally renders identically to its own `i64` (so it is
+        // usually `None` here anyway), but `-0` is the one legal-JSON exception.
+        (RangeNum::Int(f), RangeNum::Int(t), RangeNum::Int(st)) => drive_range_batches(
+            f,
+            cap,
+            |from, max_len| range_batch_int(from, t, st, first_value.take(), max_len),
+            each,
+        ),
+        (f, t, st) => {
+            let (t, st) = (t.as_f64(), st.as_f64());
+            drive_range_batches(
+                f.as_f64(),
+                cap,
+                |from, max_len| {
+                    range_batch_f64(from, t, st, implicit_step, first_value.take(), max_len)
+                },
+                each,
+            )
         }
     }
 }
@@ -82092,13 +82126,16 @@ pub(crate) fn each_range_batches_f64(
 /// `from` into a primitive before emitting it, so whatever spelling it
 /// already carries (including a `NumberLiteral`) survives automatically.
 ///
-/// Capped at [`MAX_RANGE`] per call, same as the numeric paths -- real jq's
-/// `range` has no such cap, this is succinctly's own resource-exhaustion
-/// guard (#2089/#2131). The lookahead after the `MAX_RANGE`-th value keeps
-/// the same "truncated only if a genuine next value exists" precision the
-/// numeric paths have: it computes the next value anyway (needed either way
-/// to keep looping), so checking it costs one extra `compare_values` call,
-/// not a second traversal.
+/// Capped at [`MAX_RANGE`] per call -- real jq's `range` has no such cap, this
+/// is succinctly's own resource-exhaustion guard (#2089/#2131). Unlike the
+/// numeric paths (batched, and capped at [`MAX_RANGE_TOTAL`], #5292) it keeps
+/// the small cap: it copies the value it emits at every step, so a growing
+/// string or container makes it quadratic and a cap in the millions would
+/// never be reached. The lookahead after the `MAX_RANGE`-th value keeps the
+/// same "truncated only if a genuine next value exists" precision the numeric
+/// paths have: it computes the next value anyway (needed either way to keep
+/// looping), so checking it costs one extra `compare_values` call, not a
+/// second traversal.
 ///
 /// **Cost (#3439).** Each step is O(|step|) when the consumer lets go of the
 /// emitted value before this loop advances: `current` is then uniquely owned
@@ -82148,7 +82185,7 @@ pub(crate) fn range_values_generic<S: EvalSemantics>(
         }
         count += 1;
         let next = arith_add::<S>(current, step.clone())?;
-        if count >= MAX_RANGE_TOTAL {
+        if count >= MAX_RANGE {
             return if continues(&next, to) {
                 Err(range_max_exceeded_error())
             } else {
@@ -102560,33 +102597,39 @@ mod tests {
         assert!(truncated);
     }
 
-    /// #5292: the path-mode fold (`resolve_foreach`) agrees.
-    #[test]
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
-    fn test_foreach_path_mode_first_fork_is_not_budgeted_5292() {
-        assert_eq!(
-            outputs(
-                b"null",
-                "[path(foreach (range(100000), range(100000)) as $x (.; .))] | length"
-            ),
-            ["200000"]
-        );
-    }
-
-    /// The numbers a batched integer range hands over, in order, and how it ended.
-    fn batched_ints(from: i64, to: i64, step: i64, cap: usize) -> (Vec<i64>, usize, RangeEnd) {
+    /// The values a batched numeric range hands over, in order, the number of
+    /// batches, and how it ended.
+    fn batched(
+        from: RangeNum,
+        to: RangeNum,
+        step: RangeNum,
+        cap: usize,
+    ) -> (Vec<OwnedValue>, usize, RangeEnd) {
         let mut seen = Vec::new();
         let mut batches = 0;
-        let end = each_range_batches_int(from, to, step, None, cap, &mut |values| {
+        let end = each_range_batches(from, to, step, false, None, cap, &mut |values| {
             batches += 1;
-            for v in &values {
-                if let OwnedValue::Int(n) = v {
-                    seen.push(*n);
-                }
-            }
+            seen.extend(values);
             Demand::Continue
         });
         (seen, batches, end)
+    }
+
+    fn batched_ints(from: i64, to: i64, step: i64, cap: usize) -> (Vec<i64>, usize, RangeEnd) {
+        let (seen, batches, end) = batched(
+            RangeNum::Int(from),
+            RangeNum::Int(to),
+            RangeNum::Int(step),
+            cap,
+        );
+        let ints = seen
+            .iter()
+            .map(|v| match v {
+                OwnedValue::Int(n) => *n,
+                other => panic!("an integer range handed over {other:?}"),
+            })
+            .collect();
+        (ints, batches, end)
     }
 
     /// #5292: a range longer than one `MAX_RANGE` batch is handed over whole, in
@@ -102624,32 +102667,55 @@ mod tests {
         );
     }
 
-    /// #5292: the walk ends at its cap, not before and not unbounded: the batch
-    /// that reaches `cap` values is the last, and a range with more left reports
+    /// #5292: the walk ends at its cap exactly -- the last batch is cut at it --
+    /// not before and not unbounded, and a range with more left reports
     /// [`RangeEnd::Capped`] rather than raising or looping on.
     #[test]
-    fn test_range_batches_int_stop_at_the_total_cap_5292() {
-        let (seen, batches, end) = batched_ints(0, i64::MAX, 1, 250_000);
-        assert_eq!((seen.len(), batches, end), (300_000, 3, RangeEnd::Capped));
-        assert_eq!(seen, (0..300_000).collect::<Vec<i64>>());
+    fn test_range_batches_stop_at_the_total_cap_exactly_5292() {
+        for cap in [1, 99_999, 100_000, 100_001, 250_000] {
+            let (seen, _, end) = batched_ints(0, i64::MAX, 1, cap);
+            assert_eq!(seen, (0..cap as i64).collect::<Vec<i64>>(), "cap {cap}");
+            assert_eq!(end, RangeEnd::Capped, "cap {cap}");
+        }
 
-        // A range that ends exactly at the cap is exhausted, not capped.
-        let (seen, _, end) = batched_ints(0, 200_000, 1, 200_000);
-        assert_eq!((seen.len(), end), (200_000, RangeEnd::Exhausted));
+        // A range that ends exactly at the cap is exhausted, not capped -- on a
+        // batch boundary and off it.
+        for len in [100_000, 200_000, 150_000, 7] {
+            let (seen, _, end) = batched_ints(0, len, 1, len as usize);
+            assert_eq!((seen.len(), end), (len as usize, RangeEnd::Exhausted));
+        }
+
+        // The float walk is cut at the cap the same way.
+        let (seen, _, end) = batched(
+            RangeNum::Float(0.5),
+            RangeNum::Float(1e18),
+            RangeNum::Float(1.0),
+            150_001,
+        );
+        assert_eq!((seen.len(), end), (150_001, RangeEnd::Capped));
+        assert_eq!(seen.last(), Some(&OwnedValue::Float(150_000.5)));
     }
 
     /// #5292: a consumer that stops ends the walk at that batch, whatever remains.
     #[test]
-    fn test_range_batches_int_stop_when_the_consumer_does_5292() {
+    fn test_range_batches_stop_when_the_consumer_does_5292() {
         let mut batches = 0;
-        let end = each_range_batches_int(0, i64::MAX, 1, None, usize::MAX, &mut |_| {
-            batches += 1;
-            if batches == 2 {
-                Demand::Stop
-            } else {
-                Demand::Continue
-            }
-        });
+        let end = each_range_batches(
+            RangeNum::Int(0),
+            RangeNum::Int(i64::MAX),
+            RangeNum::Int(1),
+            false,
+            None,
+            usize::MAX,
+            &mut |_| {
+                batches += 1;
+                if batches == 2 {
+                    Demand::Stop
+                } else {
+                    Demand::Continue
+                }
+            },
+        );
         assert_eq!((batches, end), (2, RangeEnd::Stopped));
     }
 
@@ -102671,22 +102737,22 @@ mod tests {
             }
             assert!(expected.len() > 2 * MAX_RANGE, "{from} {to} {step}");
 
-            let mut seen: Vec<f64> = Vec::new();
-            let end =
-                each_range_batches_f64(from, to, step, false, None, usize::MAX, &mut |values| {
-                    for v in &values {
-                        if let OwnedValue::Float(f) = v {
-                            seen.push(*f);
-                        }
-                    }
-                    Demand::Continue
-                });
-            assert_eq!(end, RangeEnd::Exhausted);
-            assert_eq!(
-                seen.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
-                expected.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
-                "{from} {to} {step}"
+            let (seen, _, end) = batched(
+                RangeNum::Float(from),
+                RangeNum::Float(to),
+                RangeNum::Float(step),
+                usize::MAX,
             );
+            assert_eq!(end, RangeEnd::Exhausted);
+            let bits = |values: &[f64]| values.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+            let seen: Vec<f64> = seen
+                .iter()
+                .map(|v| match v {
+                    OwnedValue::Float(f) => *f,
+                    other => panic!("a float range handed over {other:?}"),
+                })
+                .collect();
+            assert_eq!(bits(&seen), bits(&expected), "{from} {to} {step}");
         }
     }
 
@@ -102696,10 +102762,10 @@ mod tests {
     fn test_range_batches_keep_the_first_values_spelling_on_the_first_batch_only_5292() {
         let literal = OwnedValue::NumberLiteral(NumberRepr::Float(0.0), "0.0".into());
         let mut firsts = Vec::new();
-        each_range_batches_f64(
-            0.0,
-            250_000.0,
-            1.0,
+        each_range_batches(
+            RangeNum::Float(0.0),
+            RangeNum::Float(250_000.0),
+            RangeNum::Float(1.0),
             false,
             Some(&literal),
             usize::MAX,
@@ -102708,10 +102774,12 @@ mod tests {
                 Demand::Continue
             },
         );
+        // `PartialEq` compares a literal with a float by value, so the spelling
+        // is what `identical` checks.
         assert_eq!(firsts.len(), 3);
-        assert_eq!(firsts[0], literal);
-        assert_eq!(firsts[1], OwnedValue::Float(MAX_RANGE as f64));
-        assert_eq!(firsts[2], OwnedValue::Float(2.0 * MAX_RANGE as f64));
+        assert!(firsts[0].identical(&literal), "{:?}", firsts[0]);
+        assert!(firsts[1].identical(&OwnedValue::Float(MAX_RANGE as f64)));
+        assert!(firsts[2].identical(&OwnedValue::Float(2.0 * MAX_RANGE as f64)));
     }
 
     /// #2131 (revised fix): sweeps a magnitude-diverse, deterministic grid
@@ -123829,7 +123897,7 @@ mod tests {
         // Neither real call site can construct this (the 1-arg/2-arg
         // grammar has no way to spell a negative step), so this pins the
         // guard directly rather than through a filter.
-        let _ = range_batch_f64(0.0, 5.0, -1.0, true, None);
+        let _ = range_batch_f64(0.0, 5.0, -1.0, true, None, MAX_RANGE);
     }
 
     #[test]
@@ -124957,20 +125025,6 @@ mod tests {
         );
     }
 
-    /// #5292: the path-mode fold (`path(...)` resolves it through `resolve_reduce`)
-    /// agrees.
-    #[test]
-    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
-    fn test_reduce_path_mode_first_fork_is_not_budgeted_5292() {
-        assert_eq!(
-            outputs(
-                b"null",
-                "path(reduce (range(100000), range(100000)) as $x (.; .))"
-            ),
-            ["[]"]
-        );
-    }
-
     #[test]
     fn test_foreach_first_fork_is_not_budgeted_5292() {
         // #5292: see `test_reduce_first_fork_is_not_budgeted_5292`.
@@ -125010,21 +125064,44 @@ mod tests {
 
     #[test]
     fn test_foreach_extract_fanout_charged_independently_of_input_length() {
-        // Two input elements (far fewer than the budget) whose UPDATE
+        // Three input elements (far fewer than the budget) whose UPDATE
         // each fans out to 50,001 outputs; each output gets its own
         // EXTRACT eval (#695). Pins that EXTRACT fanout is charged
         // independently of input-element count -- a design charging only
         // once per input element would never trip here, since there are
-        // only two. Two INIT forks, the first uncharged (#5292): its
-        // 2 x 50,001 outputs survive whole. In the second, 2 UPDATE charges
-        // (one per element) precede the EXTRACT fan-out, so
-        // `REDUCE_FOREACH_MAX_STEPS - 2` more outputs survive before the
-        // budget is exhausted mid-fanout.
-        query!(b"null", r"foreach (1,2) as $x ((0,1); range(50001); .)",
+        // only three. The first fork's per-element steps are free (#5292), and
+        // so is the first EXTRACT of each UPDATE's outputs, but the other
+        // 50,000 are charged: 100,000 for the first two elements, which
+        // spends the budget, and the third element's second EXTRACT is the
+        // one refused. So 2 x 50,001 outputs and the third element's first
+        // survive.
+        query!(b"null", r"foreach (1,2,3) as $x (0; range(50001); .)",
             QueryResult::Partial(prefix, Control::Error(e)) => {
-                assert_eq!(prefix.len(), 2 * 50001 + REDUCE_FOREACH_MAX_STEPS - 2);
+                assert_eq!(prefix.len(), 2 * 50001 + 1);
                 assert!(e.message.contains("foreach: maximum iterations exceeded"));
             }
+        );
+    }
+
+    #[test]
+    fn test_foreach_single_fork_extract_fanout_stays_bounded_5292() {
+        // #5292 frees the first INIT fork's per-element steps, not the fan-out
+        // inside one of them: 100,000 elements x 100,000 EXTRACT evals each is
+        // 1e10 evaluations in one fork, and the budget still refuses it (after
+        // the 100,000 evaluations past each element's first that it allows).
+        query!(b"null", r"foreach range(100000) as $x (0; range(100000); empty)",
+            QueryResult::Error(e) => {
+                assert!(e.message.contains("foreach: maximum iterations exceeded"));
+            }
+        );
+        // ...while the same number of EXTRACT evals spread one per element is
+        // an ordinary fold.
+        assert_eq!(
+            outputs(
+                b"null",
+                "[foreach range(200000) as $x (0; .+1; select(. % 100000 == 0))]"
+            ),
+            ["[100000,200000]"]
         );
     }
 

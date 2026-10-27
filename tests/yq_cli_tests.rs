@@ -3723,7 +3723,7 @@ fn test_yq_range_multi_output_bound_fanout_and_laziness_1556() -> Result<()> {
 /// here routes through `each_range_generic` (`eval_generic.rs`), the
 /// document-input evaluator -- a distinct code path from the `-n`/
 /// `--input-format json` route `each_range` (`eval.rs`) covers, both fixed by
-/// the same shared `range_values_f64` change. Also covers a document-sourced
+/// the same shared `range_batch_f64` change. Also covers a document-sourced
 /// `from` (`.x`), not just a filter-text literal.
 #[test]
 fn test_yq_range_first_element_keeps_from_literal_spelling_3103() -> Result<()> {
