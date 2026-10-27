@@ -6,7 +6,7 @@
 
 use super::{
     collect_write_targets, is_closed_literal, reconcile_presentation, CommentTree, Expr, IndexMap,
-    NodeMeta, OwnedValue, ResultWithComments,
+    NodeMeta, NumberRepr, OwnedValue, ResultWithComments,
 };
 use succinctly::jq::document::{DocumentCursor, DocumentElements, DocumentFields, DocumentValue};
 use succinctly::jq::eval_generic::{to_owned_with_comments, AnchorMark, KeyMeta};
@@ -38,8 +38,21 @@ pub(super) fn supported(expr: &Expr) -> bool {
             supported(f)
         }
         Expr::Builtin(Builtin::Sort) => true,
+        // Paths given as a literal; one built from the document is for the plain route.
+        Expr::Builtin(Builtin::Pick(paths)) => is_closed_literal(paths),
         Expr::Assign { path, value } => static_path(path) && supported(value),
         Expr::Update { path, filter } => static_path(path) && supported(filter),
+        _ => false,
+    }
+}
+
+/// Whether `expr` replays a `pick`. The replay reads the presentation of the whole document, where
+/// the plain route reads what is picked, so the caller bounds it by the document's size (#5003).
+pub(super) fn contains_pick(expr: &Expr) -> bool {
+    match expr {
+        Expr::Builtin(Builtin::Pick(_)) => true,
+        Expr::Paren(inner) => contains_pick(inner),
+        Expr::Pipe(parts) => parts.iter().any(contains_pick),
         _ => false,
     }
 }
@@ -524,6 +537,9 @@ fn trace_at_depth(
                 CommentTree::Object(tree.meta().clone(), fields, keys),
             ))
         }
+        // #5003: a picked entry is the document's own node, key and all: its comments, style,
+        // anchor and tag come with it, as do the document's head comment and the key's.
+        Expr::Builtin(Builtin::Pick(keys)) => pick_pair(keys, input),
         Expr::Builtin(Builtin::WithEntries(f)) => {
             let entries = next(&Expr::Builtin(Builtin::ToEntries), input)?;
             let mapped = next(&Expr::Builtin(Builtin::Map(f.clone())), &entries)?;
@@ -565,6 +581,64 @@ fn trace_at_depth(
             Some((result, meta))
         }
         _ if is_closed_literal(expr) => Some((evaluated(expr, value)?, CommentTree::empty())),
+        _ => None,
+    }
+}
+
+/// `pick(keys)` replayed from the document's own tree (#5003): the keys it lists that the mapping
+/// holds, or the elements at the indices it lists, in the listed order, each with the presentation
+/// of its own node and, for a mapping, of its own key. The value is built here too, so the caller's
+/// comparison with the authoritative result decides whether the tree is used (a repeated key, which
+/// yq prints twice and a mapping cannot hold, is the plain route's).
+fn pick_pair(keys: &Expr, input: &ResultWithComments) -> Option<ResultWithComments> {
+    let (value, tree) = input;
+    let OwnedValue::Array(keys) = evaluated(keys, &OwnedValue::Null)? else {
+        return None;
+    };
+    match value {
+        OwnedValue::Object(members) => {
+            let mut picked = IndexMap::new();
+            let mut fields = IndexMap::new();
+            let mut key_metas = IndexMap::new();
+            for key in &keys {
+                let OwnedValue::String(key) = key else {
+                    return None;
+                };
+                let Some(member) = members.get(key.as_ref()) else {
+                    continue;
+                };
+                picked.insert(key.to_string(), member.clone());
+                fields.insert(key.to_string(), tree.field(key).clone());
+                if let Some(meta) = tree.key_meta(key) {
+                    key_metas.insert(key.to_string(), meta.clone());
+                }
+            }
+            Some((
+                OwnedValue::Object(picked.into()),
+                CommentTree::Object(tree.meta().clone(), fields, key_metas),
+            ))
+        }
+        OwnedValue::Array(items) => {
+            let mut picked = Vec::new();
+            let mut children = Vec::new();
+            for index in &keys {
+                let (OwnedValue::Int(index) | OwnedValue::NumberLiteral(NumberRepr::Int(index), _)) =
+                    index
+                else {
+                    return None;
+                };
+                let index = usize::try_from(*index).ok()?;
+                let Some(item) = items.get(index) else {
+                    continue;
+                };
+                picked.push(item.clone());
+                children.push(tree.at_index(index).clone());
+            }
+            Some((
+                OwnedValue::Array(picked.into_iter().collect()),
+                CommentTree::Array(tree.meta().clone(), children),
+            ))
+        }
         _ => None,
     }
 }
