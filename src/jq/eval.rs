@@ -49,7 +49,8 @@ use super::local_zone::{self, LocalZone};
 use super::math;
 use super::slice::{self, SliceBounds};
 use super::tail_call::{
-    bind_next, pipe_settles_before_last, stage_settles, tail_def, tail_reachable, Tail, TailRounds,
+    bind_next, body_is_reusable, pipe_settles_before_last, stage_settles, tail_def, tail_reachable,
+    Tail, TailRounds,
 };
 use super::walk::{
     any_pattern_key, any_subexpr, map_builtin_subexprs, map_pattern_subexprs, map_subexprs,
@@ -97876,10 +97877,7 @@ fn eval_def_call<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #5379: the loop is sink-driven, so a body that ends in a tail call is
         // collected from it; `eval_each` with a sink that never stops delivers
         // what `eval_single` would (see `drain_result`).
-        Ok(body)
-            if tail_reachable(def, S::TAG == EvalTag::Jq)
-                && !matches!(&*body, Expr::DefCall { .. }) =>
-        {
+        Ok(body) if tail_reachable(def, S::TAG == EvalTag::Jq) => {
             let mut items: Vec<Item<'a, W>> = Vec::new();
             let flow = each_def_tail_loop::<W, S>(
                 def,
@@ -97921,12 +97919,7 @@ fn each_def_call<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
     match bind_def_call(def, args, frames, bound) {
-        // A body that is no more than a call (`def g: f`) is nested one level: the
-        // callee runs its own loop, and a loop that passes through `g` hops into it.
-        Ok(body)
-            if tail_reachable(def, S::TAG == EvalTag::Jq)
-                && !matches!(&*body, Expr::DefCall { .. }) =>
-        {
+        Ok(body) if tail_reachable(def, S::TAG == EvalTag::Jq) => {
             each_def_tail_loop::<W, S>(def, frames, bound, body, value, optional, sink)
         }
         Ok(body) => match enter_def_call(def, frames, bound) {
@@ -97982,12 +97975,23 @@ fn tail_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> Result<Option<TailValue<'a, W>>, Flow> {
     let mut out: Option<TailValue<'a, W>> = None;
+    let mut more = false;
     let flow = tail_each::<W, S>(expr, cur, optional, &mut |item| {
-        debug_assert!(out.is_none(), "a settled stage yields at most one output");
-        out = Some(TailValue::from_item(item));
+        if out.is_some() {
+            more = true;
+        } else {
+            out = Some(TailValue::from_item(item));
+        }
         Demand::Continue
     });
     match flow {
+        // A stage that was taken to answer once answered again: raised rather than
+        // dropped, were a recognition ever to admit one that does not.
+        Flow::Exhausted if more => {
+            Err(Flow::Escaped(Control::Error(EvalError::new(String::from(
+                "a stage a tail loop ran ahead of its call answered more than once", // patchcov: coverage tolerate-line reason="unreachable while stage_settles admits only stages that answer at most once; kept so a mis-admission is loud, not a lost output"
+            )))))
+        }
         Flow::Exhausted => Ok(out),
         other => Err(other),
     }
@@ -98012,6 +98016,7 @@ fn tail_step<'e, 'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     rounds: &mut TailRounds,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Tail<'e> {
+    let jq = S::TAG == EvalTag::Jq;
     let mut expr = body;
     loop {
         match expr {
@@ -98033,7 +98038,7 @@ fn tail_step<'e, 'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 cond,
                 then_branch,
                 else_branch,
-            } if stage_settles(cond) => match tail_one::<W, S>(cond, cur, optional) {
+            } if stage_settles(cond, jq) => match tail_one::<W, S>(cond, cur, optional) {
                 Ok(Some(c)) => {
                     let truthy = match &c {
                         TailValue::Borrowed(v) => json_is_truthy(v),
@@ -98053,7 +98058,7 @@ fn tail_step<'e, 'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 expr: source,
                 var,
                 body: as_body,
-            } if S::TAG == EvalTag::Jq && stage_settles(source) => {
+            } if jq && stage_settles(source, jq) => {
                 let (mut bound, origin) = match &*cur {
                     TailValue::Owned(_) => match tail_one::<W, S>(source, cur, optional) {
                         Ok(Some(TailValue::Owned(bound))) => (bound, None),
@@ -98092,7 +98097,7 @@ fn tail_step<'e, 'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 let rebuilt = substitute_bound_var_from::<S>(source, as_body, var, &bound, origin);
                 return Tail::Bound(Rc::new(rebuilt));
             }
-            Expr::Pipe(stages) if pipe_settles_before_last(stages) => {
+            Expr::Pipe(stages) if pipe_settles_before_last(stages, jq) => {
                 let Some((last, before)) = stages.split_last() else {
                     return Tail::Rest(expr);
                 };
@@ -98117,12 +98122,12 @@ fn tail_step<'e, 'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         emitted += 1;
                         sink(output)
                     });
-                    if let Err(e) = rounds.charge_outputs(emitted) {
-                        return Tail::Done(Flow::Escaped(Control::Error(e)));
-                    }
                     match flow {
                         Flow::Exhausted => {}
                         other => return Tail::Done(other),
+                    }
+                    if let Err(e) = rounds.charge_outputs(emitted) {
+                        return Tail::Done(Flow::Escaped(Control::Error(e)));
                     }
                 }
                 expr = last;
@@ -98156,6 +98161,8 @@ fn each_def_tail_loop<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut body = body;
     let mut body_frames = frames;
     let mut first_hop = true;
+    // Whether `body` can be run again as it is, asked at the first hop back to it.
+    let mut reusable: Option<bool> = None;
     let mut cur = TailValue::Borrowed(value);
     loop {
         let _round = match enter_def_call(&callee, body_frames, bound) {
@@ -98172,12 +98179,22 @@ fn each_def_tail_loop<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     def: next,
                     frames: node_frames,
                     bound: node_bound,
-                } => match bind_next(next, node_frames, node_bound, first_hop, body_frames) {
-                    Ok((next_body, next_frames)) => {
-                        break (Rc::clone(next), next_body, next_frames)
+                } => {
+                    // The call jumps back to the def this round runs, and its body has
+                    // nothing but its jumps to evaluate: run the same body again.
+                    if Rc::ptr_eq(next, &callee)
+                        && *reusable.get_or_insert_with(|| body_is_reusable(&body))
+                    {
+                        break (Rc::clone(next), Rc::clone(&body), body_frames);
                     }
-                    Err(e) => return Flow::Escaped(Control::Error(e)),
-                },
+                    reusable = None;
+                    match bind_next(next, node_frames, node_bound, first_hop, body_frames) {
+                        Ok((next_body, next_frames)) => {
+                            break (Rc::clone(next), next_body, next_frames)
+                        }
+                        Err(e) => return Flow::Escaped(Control::Error(e)),
+                    }
+                }
                 Tail::Bound(then) => walked = then,
                 Tail::Rest(rest) => return tail_each::<W, S>(rest, &cur, optional, sink),
                 Tail::Done(flow) => return flow,

@@ -40,6 +40,7 @@ use super::eval::{
 };
 use super::expr::{BoundBody, Builtin, Expr, FuncDefData, PipeStages};
 use super::resolve::ModuleRun;
+use super::walk::{search_subexpr, Visit};
 
 /// Where a tail loop's walk of one round's body ended (#5379).
 pub(crate) enum Tail<'e> {
@@ -114,6 +115,14 @@ pub(crate) fn bind_next(
 /// same kind of question).
 const SETTLE_BUDGET: u32 = 1024;
 
+/// What a question to [`settles`] knows beyond the expression: the mode, and the names
+/// of the defs declared in the body being walked, whose calls are still calls by name
+/// in the raw body.
+struct Ctx<'a> {
+    jq: bool,
+    locals: &'a [&'a str],
+}
+
 /// Whether `expr` yields at most one output and does nothing observable besides
 /// once it has: the recognition [`single_valued_pure`] gives an operand that
 /// [`settles_before_consumer`](super::eval::settles_before_consumer) (without its
@@ -133,29 +142,40 @@ const SETTLE_BUDGET: u32 = 1024;
 /// `input`) does not disqualify: it happens while the stage runs, before its one
 /// output, which is where jq runs it relative to the call too, and none of those
 /// shapes can emit a value and then raise.
-pub(crate) fn stage_settles(expr: &Expr) -> bool {
-    let mut budget = SETTLE_BUDGET;
-    settles(expr, &mut budget)
+///
+/// In yq mode a key or a slice bound that is computed does not settle: an index
+/// whose key yields nothing answers every child there (`.a[select(false)]`).
+pub(crate) fn stage_settles(expr: &Expr, jq: bool) -> bool {
+    settles_in(expr, &Ctx { jq, locals: &[] })
 }
 
-fn settles(expr: &Expr, budget: &mut u32) -> bool {
+fn settles_in(expr: &Expr, cx: &Ctx<'_>) -> bool {
+    let mut budget = SETTLE_BUDGET;
+    settles(expr, &mut budget, cx)
+}
+
+fn settles(expr: &Expr, budget: &mut u32, cx: &Ctx<'_>) -> bool {
     let Some(left) = budget.checked_sub(1) else {
         return false;
     };
     *budget = left;
     match expr {
-        Expr::Paren(inner) | Expr::Negate(inner) => settles(inner, budget),
-        Expr::Pipe(stages) => stages.iter().all(|stage| settles(stage, budget)),
+        Expr::Paren(inner) | Expr::Negate(inner) => settles(inner, budget, cx),
+        Expr::Pipe(stages) => stages.iter().all(|stage| settles(stage, budget, cx)),
         Expr::If {
             cond,
             then_branch,
             else_branch,
-        } => settles(cond, budget) && settles(then_branch, budget) && settles(else_branch, budget),
+        } => {
+            settles(cond, budget, cx)
+                && settles(then_branch, budget, cx)
+                && settles(else_branch, budget, cx)
+        }
         Expr::Arithmetic { left, right, .. }
         | Expr::Compare { left, right, .. }
         | Expr::And(left, right)
         | Expr::Or(left, right)
-        | Expr::Alternative(left, right) => settles(left, budget) && settles(right, budget),
+        | Expr::Alternative(left, right) => settles(left, budget, cx) && settles(right, budget, cx),
         // `[f]` collects every output of `f`: one array, or the error `f` raised.
         // An update answers once whatever its filter yields (it takes the first).
         Expr::Array(_) | Expr::Update { .. } => true,
@@ -163,12 +183,23 @@ fn settles(expr: &Expr, budget: &mut u32) -> bool {
         // in jq's own definition).
         Expr::Assign { value, .. }
         | Expr::CompoundAssign { value, .. }
-        | Expr::AlternativeAssign { value, .. } => settles(value, budget),
+        | Expr::AlternativeAssign { value, .. } => settles(value, budget, cx),
+        // A call to a def declared in the body being walked: optimistic, the bound
+        // call is asked the real question when the walk reaches it.
+        Expr::FuncCall { name, .. } if cx.locals.contains(&name.as_str()) => true,
         Expr::DefCall { def, args, .. } if args.is_empty() && def.params.is_empty() => def
-            .settles_or_init(|body| {
+            .settles_or_init(cx.jq, |body| {
                 let mut fresh = SETTLE_BUDGET;
-                settles(body, &mut fresh)
+                settles(
+                    body,
+                    &mut fresh,
+                    &Ctx {
+                        jq: cx.jq,
+                        locals: &[],
+                    },
+                )
             }),
+        Expr::IndexExpr { .. } | Expr::SliceExpr { .. } if !cx.jq => false,
         Expr::Builtin(builtin) if builtin_settles(builtin) => true,
         _ => {
             yields_at_most_one_value(expr)
@@ -217,40 +248,56 @@ fn builtin_settles(builtin: &Builtin) -> bool {
 /// Whether a pipe's stages in front of its last are all [`stage_settles`], and
 /// the evaluator would not take a different route for the pipe than running
 /// them in order (`needs_path_context`).
-pub(crate) fn pipe_settles_before_last(stages: &PipeStages) -> bool {
+pub(crate) fn pipe_settles_before_last(stages: &PipeStages, jq: bool) -> bool {
+    pipe_settles_in(stages, &Ctx { jq, locals: &[] })
+}
+
+fn pipe_settles_in(stages: &PipeStages, cx: &Ctx<'_>) -> bool {
     let Some((_, before)) = stages.split_last() else {
         return false;
     };
-    !pipe_needs_path_context(stages) && before.iter().all(stage_settles)
+    !pipe_needs_path_context(stages) && before.iter().all(|stage| settles_in(stage, cx))
 }
 
-/// Whether a walk of `def`'s body could reach a call at the end of it, for jq
-/// (`jq`) or yq mode; remembered on the definition (#5379).
+/// Whether a walk of `def`'s body could reach a call that can bring the loop round
+/// again, for jq (`jq`) or yq mode; remembered on the definition (#5379).
 ///
 /// Asked on every call of every `def`, so the whole answer is a read of a cell
-/// after the first. Of the raw body, where the definition's own calls are still
-/// calls by name, so it is optimistic about a zero-argument call (it may be a
-/// builtin, or a self call a stage ahead of it would not let the walk past): a
-/// yes only sends the call through the loop, whose answer is the nested one's.
+/// after the first. It is asked of the raw body, where the definition's own calls
+/// (and those of a def declared inside it) are still calls by name, and only such a
+/// call can bring a loop round: a call to the def itself, or to one declared in
+/// its body, whose own calls may come back. A call to an earlier def (a helper,
+/// which is a call already resolved in the raw body) or to a closure parameter
+/// cannot, and a helper that loops runs its own loop when it is called, so a body
+/// that ends in one keeps the nested path and its pipes the fused evaluation they
+/// had. The stages in front of the call are asked with the local defs taken to
+/// settle: a yes only sends the call through a loop that finds out for itself.
 pub(crate) fn tail_reachable(def: &FuncDefData, jq: bool) -> bool {
-    def.tail_reachable_or_init(jq, |body| reach(body, jq))
+    def.tail_reachable_or_init(jq, |body| reach(body, def, jq, &mut Vec::new()))
 }
 
-fn reach(body: &Expr, jq: bool) -> bool {
+fn reach<'a>(body: &'a Expr, def: &FuncDefData, jq: bool, locals: &mut Vec<&'a str>) -> bool {
+    let depth = locals.len();
     let mut expr = body;
-    loop {
+    let reached = loop {
         match expr {
             Expr::Paren(inner) => expr = inner,
-            Expr::FuncCall { args, .. } => return args.is_empty(),
-            Expr::DefCall { .. } => return tail_def(expr).is_some(),
+            Expr::FuncCall { name, args, .. } => {
+                break args.is_empty()
+                    && ((def.params.is_empty() && *name == def.name)
+                        || locals.contains(&name.as_str()));
+            }
             // The walk binds what follows a `def` declared in the body.
-            Expr::FuncDef { then, .. } => expr = then,
+            Expr::FuncDef { name, then, .. } => {
+                locals.push(name.as_str());
+                expr = then;
+            }
             // `src as $x | body` is passed through in jq mode only.
             Expr::As {
                 expr: source, body, ..
             } => {
-                if !jq || !stage_settles(source) {
-                    return false;
+                if !jq || !settles_in(source, &Ctx { jq, locals }) {
+                    break false;
                 }
                 expr = body;
             }
@@ -259,61 +306,121 @@ fn reach(body: &Expr, jq: bool) -> bool {
                 then_branch,
                 else_branch,
             } => {
-                if !stage_settles(cond) {
-                    return false;
+                if !settles_in(cond, &Ctx { jq, locals }) {
+                    break false;
                 }
-                if reach(then_branch, jq) {
-                    return true;
+                if reach(then_branch, def, jq, locals) {
+                    break true;
                 }
                 expr = else_branch;
             }
             Expr::Pipe(stages) => match stages.last() {
-                Some(last) if pipe_settles_before_last(stages) => expr = last,
-                _ => return false,
+                Some(last) if pipe_settles_in(stages, &Ctx { jq, locals }) => expr = last,
+                _ => break false,
             },
             Expr::Comma(items) => match items.last() {
                 Some(last) => expr = last,
-                None => return false,
+                None => break false,
             },
-            _ => return false,
+            _ => break false,
         }
-    }
+    };
+    locals.truncate(depth);
+    reached
 }
 
-/// [`reach`] for what a `def` the interpreter has not bound yet declares: a
-/// zero-argument call by name at the end of the spine, with the stages in front
-/// of it left to the interpreter's own question (it keeps its own notion of
-/// "answers once", over its environment).
-pub(crate) fn declared_tail_call(then: &Expr) -> bool {
-    let mut expr = then;
+/// [`tail_reachable`] for the path-mode interpreter, which walks the program as
+/// written (a call is a call by name there, a helper included) and keeps its own
+/// notion of "answers once" over its environment: only the call at the end of the
+/// spine is asked, and it is `name`'s own or a def declared in the body.
+pub(crate) fn declared_tail_call(body: &Expr, name: &str) -> bool {
+    fn walk<'a>(body: &'a Expr, name: &str, locals: &mut Vec<&'a str>) -> bool {
+        let depth = locals.len();
+        let mut expr = body;
+        let reached = loop {
+            match expr {
+                Expr::Paren(inner) => expr = inner,
+                Expr::As { body, .. } => expr = body,
+                Expr::FuncCall {
+                    name: callee, args, ..
+                } => {
+                    break args.is_empty() && (callee == name || locals.contains(&callee.as_str()));
+                }
+                Expr::FuncDef { name, then, .. } => {
+                    locals.push(name.as_str());
+                    expr = then;
+                }
+                Expr::If {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    if walk(then_branch, name, locals) {
+                        break true;
+                    }
+                    expr = else_branch;
+                }
+                Expr::Pipe(stages) => match stages.last() {
+                    Some(last) => expr = last,
+                    None => break false,
+                },
+                Expr::Comma(items) => match items.last() {
+                    Some(last) => expr = last,
+                    None => break false,
+                },
+                _ => break false,
+            }
+        };
+        locals.truncate(depth);
+        reached
+    }
+    walk(body, name, &mut Vec::new())
+}
+
+/// How many calls of the tail spine of `expr` jump (#5379): [`tail_def`]s through
+/// parentheses, an `as` body, both branches of an `if`, the last stage of a pipe
+/// and the last branch of a comma.
+fn spine_calls(expr: &Expr) -> usize {
+    let mut expr = expr;
     loop {
         match expr {
             Expr::Paren(inner) => expr = inner,
             Expr::As { body, .. } => expr = body,
-            Expr::FuncCall { args, .. } => return args.is_empty(),
-            Expr::DefCall { .. } => return tail_def(expr).is_some(),
-            Expr::FuncDef { then, .. } => expr = then,
+            Expr::DefCall { .. } => return usize::from(tail_def(expr).is_some()),
             Expr::If {
                 then_branch,
                 else_branch,
                 ..
-            } => {
-                if declared_tail_call(then_branch) {
-                    return true;
-                }
-                expr = else_branch;
-            }
+            } => return spine_calls(then_branch) + spine_calls(else_branch),
             Expr::Pipe(stages) => match stages.last() {
                 Some(last) => expr = last,
-                None => return false,
+                None => return 0,
             },
             Expr::Comma(items) => match items.last() {
                 Some(last) => expr = last,
-                None => return false,
+                None => return 0,
             },
-            _ => return false,
+            _ => return 0,
         }
     }
+}
+
+/// Whether a round's bound `body` can be run again for the next round as it is
+/// (#5379): its only calls are the ones the loop jumps from, and it declares no
+/// `def`. Then no node of it is ever evaluated through its own cache, so none can turn hot
+/// (#3148) and keep a call tree, and binding the same body again would only
+/// rebuild what it already holds. Asked once for a body, not per round.
+pub(crate) fn body_is_reusable(body: &Expr) -> bool {
+    let mut calls = 0usize;
+    let declares = search_subexpr(body, &mut |e| match e {
+        Expr::DefCall { .. } => {
+            calls += 1;
+            Visit::Skip
+        }
+        Expr::FuncDef { .. } => Visit::Found,
+        _ => Visit::Descend,
+    });
+    !declares && calls == spine_calls(body)
 }
 
 /// The most outputs a tail loop may emit ahead of its calls (the front branches
@@ -322,8 +429,13 @@ pub(crate) fn declared_tail_call(then: &Expr) -> bool {
 /// A generator that tail-calls itself (`def f: ., (. + 1 | f)`) emits one output
 /// per round, and a consumer that collects (`[...]`, an argument of a builtin) holds
 /// them all: the round budget alone would let it hold 2^24 of them, gigabytes,
-/// before it refused. jq's own loop runs until its heap is gone.
-const MAX_LOOP_OUTPUTS: usize = 1 << 22;
+/// before it refused. jq's own loop runs until its heap is gone. Counted in
+/// outputs, not bytes.
+pub(crate) const MAX_LOOP_OUTPUTS: usize = 1 << 22;
+
+/// Rounds a loop runs before it is charged for the outputs it emitted, so a def
+/// that is not recursive at all, whose one round emits a long range, is not.
+pub(crate) const OUTPUT_BUDGET_AFTER_ROUNDS: usize = 64;
 
 /// What a tail loop may still spend (#5379).
 ///
@@ -334,7 +446,8 @@ const MAX_LOOP_OUTPUTS: usize = 1 << 22;
 /// does not. The outputs it emits ahead of its calls are bounded separately.
 pub(crate) struct TailRounds {
     rounds: usize,
-    outputs: usize,
+    taken: usize,
+    emitted: usize,
     def: Rc<FuncDefData>,
 }
 
@@ -343,13 +456,15 @@ impl TailRounds {
     pub(crate) fn new(def: &Rc<FuncDefData>) -> Self {
         Self {
             rounds: MAX_LOOP_ROUNDS,
-            outputs: MAX_LOOP_OUTPUTS,
+            taken: 0,
+            emitted: 0,
             def: Rc::clone(def),
         }
     }
 
     /// Charge one more round.
     pub(crate) fn charge_round(&mut self) -> Result<(), EvalError> {
+        self.taken += 1;
         match self.rounds.checked_sub(1) {
             Some(left) => {
                 self.rounds = left;
@@ -359,25 +474,25 @@ impl TailRounds {
         }
     }
 
-    /// Charge `emitted` outputs a round sent to the consumer.
+    /// Charge `emitted` outputs a round sent to the consumer, once the loop has
+    /// run [`OUTPUT_BUDGET_AFTER_ROUNDS`] rounds.
     pub(crate) fn charge_outputs(&mut self, emitted: usize) -> Result<(), EvalError> {
-        match self.outputs.checked_sub(emitted) {
-            Some(left) => {
-                self.outputs = left;
-                Ok(())
-            }
-            None => Err(EvalError::resource_limit(format!(
+        self.emitted = self.emitted.saturating_add(emitted);
+        if self.emitted > MAX_LOOP_OUTPUTS && self.taken >= OUTPUT_BUDGET_AFTER_ROUNDS {
+            return Err(EvalError::resource_limit(format!(
                 "{}/{}: maximum outputs exceeded",
                 ModuleRun::display_name(&self.def.name),
                 self.def.params.len()
-            ))),
+            )));
         }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jq::eval::{bind_def_call_body, install_def_calls};
     use crate::jq::parse;
 
     /// The definition of `def f: <body>; f`, as the evaluators hold it.
@@ -391,8 +506,30 @@ mod tests {
         Rc::new(FuncDefData::new(name, params, *body))
     }
 
+    /// The last definition of a program of defs, as the evaluators hold it: the calls in its
+    /// body to the defs before it are installed, and its own are still calls by name.
+    fn last_definition(src: &str) -> Rc<FuncDefData> {
+        let mut earlier: Vec<Rc<FuncDefData>> = Vec::new();
+        let mut rest = parse(src).expect("parses");
+        while let Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+            ..
+        } = rest
+        {
+            let body = earlier
+                .iter()
+                .fold(*body, |body, def| install_def_calls(&body, def, 0, false));
+            earlier.push(Rc::new(FuncDefData::new(name, params, body)));
+            rest = *then;
+        }
+        earlier.pop().expect("a def")
+    }
+
     #[test]
-    fn the_spine_ends_in_a_zero_argument_call_5379() {
+    fn the_spine_ends_in_a_call_that_can_bring_the_loop_round_5379() {
         // (program, reachable in jq mode, reachable in yq mode)
         for (src, jq, yq) in [
             ("def f: f; f", true, true),
@@ -405,7 +542,14 @@ mod tests {
             ),
             ("def f: (. + 1 | f); f", true, true),
             ("def f: ., (. + 1 | f); f", true, true),
+            // A def declared in the body: the call to it, or to the def from inside it.
             ("def f: def g: f; . + 1 | g; f", true, true),
+            // A local helper used as the condition or a stage settles for the walk's purposes.
+            (
+                "def f: def step: . + 1; if . < 3 then step | f else . end; f",
+                true,
+                true,
+            ),
             // Passed through in jq mode only.
             ("def f: . as $x | f; f", true, false),
             (
@@ -441,11 +585,26 @@ mod tests {
         }
     }
 
+    /// A call to an earlier def is a helper, already resolved in the raw body: it runs its
+    /// own loop if it has one, and nothing it calls can come back, so a body that ends in
+    /// one is not the loop's to walk. Nor is a closure parameter, or a call to a def with a
+    /// parameter, or to another def's name.
     #[test]
-    fn a_call_with_an_argument_is_not_a_jump_5379() {
-        let def = definition("def f(n): if n > 0 then f(n - 1) else 0 end; f(3)");
-        // `f(n - 1)` is a call by name with an argument: not a zero-argument call.
-        assert!(!tail_reachable(&def, true));
+    fn a_trailing_call_that_cannot_come_back_is_not_a_loop_5379() {
+        for (src, why) in [
+            ("def render: . + 1; def top: sort | render; top", "a helper"),
+            ("def ap(g): g; ap(1)", "a closure parameter"),
+            ("def f: other; f", "another def's name"),
+            (
+                "def f($n): if $n > 0 then f else . end; f(3)",
+                "a zero-argument call is not a call to a def that takes a parameter",
+            ),
+        ] {
+            assert!(
+                !tail_reachable(&last_definition(src), true),
+                "{why}: `{src}`"
+            );
+        }
     }
 
     #[test]
@@ -486,15 +645,28 @@ mod tests {
             ("empty", true),
         ] {
             let expr = parse(src).expect("parses");
-            assert_eq!(stage_settles(&expr), want, "`{src}`");
+            assert_eq!(stage_settles(&expr, true), want, "`{src}`");
         }
+    }
+
+    /// An index whose key yields nothing answers every child in yq, and nothing in jq, so a
+    /// computed key or bound does not settle in yq mode.
+    #[test]
+    fn a_computed_index_settles_in_jq_mode_only_5379() {
+        for src in [".a[select(false)]", ".[.n]", ".a[1:.n]", "(.a)[.n] + 1"] {
+            let expr = parse(src).expect("parses");
+            assert!(stage_settles(&expr, true), "jq: `{src}`");
+            assert!(!stage_settles(&expr, false), "yq: `{src}`");
+        }
+        // A literal key reads one child in both.
+        let expr = parse(".a[1] + .a[0:1][0]").expect("parses");
+        assert!(stage_settles(&expr, false));
     }
 
     /// A call to a def with no parameters settles when the def's body does, and the answer
     /// is the definition's own: asked again, it is read back.
     #[test]
     fn a_call_to_a_settling_def_settles_5379() {
-        use crate::jq::eval::install_def_calls;
         for (def_src, want) in [
             ("def g: . + 1; g", true),
             ("def g: .n += 1; g", true),
@@ -513,8 +685,37 @@ mod tests {
             };
             let def = Rc::new(FuncDefData::new(name, params, *body));
             let call = install_def_calls(&then, &def, 0, false);
-            assert_eq!(stage_settles(&call), want, "`{def_src}`");
-            assert_eq!(stage_settles(&call), want, "`{def_src}`, remembered");
+            assert_eq!(stage_settles(&call, true), want, "`{def_src}`");
+            assert_eq!(stage_settles(&call, true), want, "`{def_src}`, remembered");
+        }
+    }
+
+    /// A body is run again as it is only when its calls are all jumps and it declares nothing
+    /// that a round could reach twice.
+    #[test]
+    fn a_body_with_only_jumps_is_reused_5379() {
+        for (src, want) in [
+            ("def f: if . < 3 then . + 1 | f else . end; f", true),
+            ("def f: ., (. + 1 | f); f", true),
+            ("def f: . as $x | if $x < 3 then f else . end; f", true),
+            // Another call, in a stage or the condition: its node would turn hot.
+            (
+                "def g: . + 1; def f: if . < 3 then g | f else . end; f",
+                false,
+            ),
+            (
+                "def g: . < 3; def f: if g then . + 1 | f else . end; f",
+                false,
+            ),
+            // A def declared in the body is bound once and kept.
+            (
+                "def f: def g: f; if . < 3 then . + 1 | g else . end; f",
+                false,
+            ),
+        ] {
+            let def = last_definition(src);
+            let body = bind_def_call_body(&def, &[], 0).expect("binds");
+            assert_eq!(body_is_reusable(&body), want, "`{src}`");
         }
     }
 
@@ -530,9 +731,14 @@ mod tests {
             .expect_err("the third round is over budget");
         assert_eq!(refused.to_string(), "f/0 exceeded maximum recursion depth");
 
+        // Outputs are charged once the loop has run a few rounds: a def that is not
+        // recursive, whose one round emits a long range, is not.
         let mut rounds = TailRounds::new(&def);
         assert_eq!(rounds.rounds, MAX_LOOP_ROUNDS);
-        assert!(rounds.charge_outputs(MAX_LOOP_OUTPUTS).is_ok());
+        assert!(rounds.charge_outputs(MAX_LOOP_OUTPUTS + 1).is_ok());
+        for _ in 0..OUTPUT_BUDGET_AFTER_ROUNDS {
+            rounds.charge_round().expect("within the round budget");
+        }
         let refused = rounds
             .charge_outputs(1)
             .expect_err("one output past the budget");

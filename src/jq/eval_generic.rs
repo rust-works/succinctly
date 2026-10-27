@@ -99,7 +99,8 @@ use super::expr::{
 use super::path_mode::Route;
 use super::slice::{literal_component_from_values, slice_str, SliceBounds};
 use super::tail_call::{
-    bind_next, pipe_settles_before_last, stage_settles, tail_def, tail_reachable, Tail, TailRounds,
+    bind_next, body_is_reusable, pipe_settles_before_last, stage_settles, tail_def, tail_reachable,
+    Tail, TailRounds,
 };
 use super::value::{owned_value_eq, subarray_indices, NumberRepr, OwnedValue};
 
@@ -16372,7 +16373,7 @@ fn each_if_generic<S: EvalSemantics, V: DocumentValue>(
 /// `def r($p1; $p2): ... r($p1 - 1; $p2) ...; r(12000; 7)` that it had run: the
 /// arm's locals are what moved the frame, so they live here instead.
 #[inline(never)]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // STYLE-0004: `eval::each_def_call`'s list, plus the cursor
 fn each_def_call_generic<S: EvalSemantics, V: DocumentValue>(
     def: &Rc<FuncDefData>,
     args: &[Expr],
@@ -16384,13 +16385,8 @@ fn each_def_call_generic<S: EvalSemantics, V: DocumentValue>(
     sink: &mut dyn Sink<V>,
 ) -> Flow {
     match bind_def_call(def, args, frames, bound) {
-        // #5379: see `eval::each_def_tail_loop`. A body that is no more than a call
-        // (`def g: f`) is nested one level: the callee runs its own loop, and a loop
-        // that passes through `g` hops into it.
-        Ok(body)
-            if tail_reachable(def, S::TAG == EvalTag::Jq)
-                && !matches!(&*body, Expr::DefCall { .. }) =>
-        {
+        // #5379: see `eval::each_def_tail_loop`.
+        Ok(body) if tail_reachable(def, S::TAG == EvalTag::Jq) => {
             each_def_tail_loop_generic::<S, V>(
                 def, frames, bound, body, value, optional, cursor, sink,
             )
@@ -16457,12 +16453,22 @@ fn tail_one_generic<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
 ) -> Result<Option<GenericItem<V>>, Flow> {
     let mut out: Option<GenericItem<V>> = None;
+    let mut more = false;
     let flow = tail_each_generic::<S, V>(expr, cur, optional, &mut |item| {
-        debug_assert!(out.is_none(), "a settled stage yields at most one output");
-        out = Some(item);
+        if out.is_some() {
+            more = true;
+        } else {
+            out = Some(item);
+        }
         Demand::Continue
     });
     match flow {
+        // See `eval::tail_one`.
+        Flow::Exhausted if more => {
+            Err(Flow::Escaped(Control::Error(EvalError::new(String::from(
+                "a stage a tail loop ran ahead of its call answered more than once", // patchcov: coverage tolerate-line reason="unreachable while stage_settles admits only stages that answer at most once; kept so a mis-admission is loud, not a lost output"
+            )))))
+        }
         Flow::Exhausted => Ok(out),
         other => Err(other),
     }
@@ -16479,10 +16485,10 @@ fn tail_step_generic<'e, S: EvalSemantics, V: DocumentValue>(
     body: &'e Expr,
     cur: &mut TailValue<V>,
     optional: bool,
-    holds: &mut EmbedGuards,
     rounds: &mut TailRounds,
     sink: &mut dyn Sink<V>,
 ) -> Tail<'e> {
+    let jq = S::TAG == EvalTag::Jq;
     let mut expr = body;
     loop {
         match expr {
@@ -16504,7 +16510,7 @@ fn tail_step_generic<'e, S: EvalSemantics, V: DocumentValue>(
                 cond,
                 then_branch,
                 else_branch,
-            } if stage_settles(cond) => match tail_one_generic::<S, V>(cond, cur, optional) {
+            } if stage_settles(cond, jq) => match tail_one_generic::<S, V>(cond, cur, optional) {
                 Ok(Some(item)) => match generic_item_truthiness::<V, S>(item) {
                     Ok(truthy) => expr = if truthy { then_branch } else { else_branch },
                     Err(control) => return Tail::Done(Flow::Escaped(control)),
@@ -16512,22 +16518,32 @@ fn tail_step_generic<'e, S: EvalSemantics, V: DocumentValue>(
                 Ok(None) => return Tail::Done(Flow::Exhausted),
                 Err(flow) => return Tail::Done(flow),
             },
-            // `src as $x | body`: see `eval::tail_step`. A node is bound as
-            // `each_as_generic` binds it, decoded (a deferred bind is for a body that
-            // is evaluated where the node is, and the next round is not), with its
-            // origin, its entry in the embed table and its anchor for the round.
+            // `src as $x | body`: see `eval::tail_step`. A body that never names the
+            // variable has nothing to bind, and `each_as_generic` leaves the node
+            // undecoded then (#3856): the source still runs (and a lazy answer is forced,
+            // for its error and its effects), and the walk goes on in the body as it is. A
+            // body that names it binds a value the loop built, as `each_as_generic` binds
+            // a computed one. A node of the document it names is bound by the nested
+            // evaluator, which defers the decode of what the body never reads (#3856).
             Expr::As {
                 expr: source,
                 var,
                 body: as_body,
-            } if S::TAG == EvalTag::Jq && stage_settles(source) => {
-                // A body that never names the variable has nothing to bind, and
-                // `each_as_generic` leaves the node undecoded then (#3856): the source
-                // still runs, for its error or its lack of an output, and the walk goes
-                // on in the body as it is.
+            } if jq && stage_settles(source, jq) => {
                 if !mentions_var(as_body, var) {
                     match tail_one_generic::<S, V>(source, cur, optional) {
-                        Ok(Some(_)) => {
+                        Ok(Some(item)) => {
+                            if matches!(
+                                item,
+                                GenericItem::LazyKeys { .. }
+                                    | GenericItem::LazyIndexRange(_)
+                                    | GenericItem::LazySeq(_)
+                                    | GenericItem::LazyObject(_)
+                            ) {
+                                if let Err(control) = owned_identity_materialize::<V, S>(item) {
+                                    return Tail::Done(Flow::Escaped(control));
+                                }
+                            }
                             expr = as_body;
                             continue;
                         }
@@ -16535,57 +16551,26 @@ fn tail_step_generic<'e, S: EvalSemantics, V: DocumentValue>(
                         Err(flow) => return Tail::Done(flow),
                     }
                 }
-                let (mut bound, origin) = match &*cur {
-                    TailValue::Owned(_) => match tail_one_generic::<S, V>(source, cur, optional) {
-                        Ok(Some(GenericItem::Owned(bound))) => (bound, None),
-                        Ok(Some(item)) => match owned_identity_materialize::<V, S>(item) {
-                            Ok(bound) => (bound, None),
-                            Err(control) => return Tail::Done(Flow::Escaped(control)),
-                        },
-                        Ok(None) => return Tail::Done(Flow::Exhausted),
-                        Err(flow) => return Tail::Done(flow),
+                if matches!(cur, TailValue::Node(..)) {
+                    return Tail::Rest(expr);
+                }
+                let bound = match tail_one_generic::<S, V>(source, cur, optional) {
+                    Ok(Some(GenericItem::Owned(bound))) => bound,
+                    Ok(Some(item)) => match owned_identity_materialize::<V, S>(item) {
+                        Ok(bound) => bound,
+                        Err(control) => return Tail::Done(Flow::Escaped(control)),
                     },
-                    TailValue::Node(node, cursor) => {
-                        let mut bound = None;
-                        let flow = fanout_arg_each_generic_deferring::<S, V, _>(
-                            source,
-                            node.clone(),
-                            optional,
-                            *cursor,
-                            &|_, _| false,
-                            |got| {
-                                if let Bound::Value(value, origin) = got {
-                                    bound = Some((value, origin));
-                                }
-                                Flow::Exhausted
-                            },
-                        );
-                        match (flow, bound) {
-                            (Flow::Exhausted, Some(bound)) => bound,
-                            (Flow::Exhausted, None) => return Tail::Done(Flow::Exhausted),
-                            (flow, _) => return Tail::Done(flow),
-                        }
-                    }
+                    Ok(None) => return Tail::Done(Flow::Exhausted),
+                    Err(flow) => return Tail::Done(flow),
                 };
-                holds.hold(embed_table_push::<S>(origin.as_ref(), &mut bound));
-                let anchor = match &*cur {
-                    TailValue::Node(_, cursor) => *cursor,
-                    TailValue::Owned(_) => None,
-                };
-                holds.hold(embed_anchor_push::<S, _>(
-                    origin.as_ref(),
-                    &bound,
-                    anchor.as_ref(),
-                    as_body,
-                ));
-                let rebuilt = substitute_bound_var_from::<S>(source, as_body, var, &bound, origin);
+                let rebuilt = substitute_bound_var_from::<S>(source, as_body, var, &bound, None);
                 return Tail::Bound(Rc::new(rebuilt));
             }
             // In yq mode a pipe that reads node metadata (`line`, `column`, `style`, a
             // comment, an anchor) is left to `eval_each_pipe_generic`, whose owned
             // identity carries the node a stage ahead of the getter left (#4696).
             Expr::Pipe(stages)
-                if pipe_settles_before_last(stages)
+                if pipe_settles_before_last(stages, jq)
                     && !yq_context_pipe_applies::<S>(stages)
                     && !(S::TAG == EvalTag::Yq && reads_any_node_metadata(stages)) =>
             {
@@ -16609,17 +16594,25 @@ fn tail_step_generic<'e, S: EvalSemantics, V: DocumentValue>(
                     return Tail::Rest(expr);
                 };
                 for item in before {
+                    // The consumer's own budget goes with the sink (#2666): a `first`
+                    // behind the loop must reach the lazy sequence of a front branch.
                     let mut emitted = 0usize;
-                    let flow = tail_each_generic::<S, V>(item, cur, optional, &mut |output| {
-                        emitted += 1;
-                        sink.push(output)
-                    });
-                    if let Err(e) = rounds.charge_outputs(emitted) {
-                        return Tail::Done(Flow::Escaped(Control::Error(e)));
-                    }
+                    let budget = sink.budget();
+                    let flow = tail_each_generic::<S, V>(
+                        item,
+                        cur,
+                        optional,
+                        &mut forward_budget(budget, |output| {
+                            emitted += 1;
+                            sink.push(output)
+                        }),
+                    );
                     match flow {
                         Flow::Exhausted => {}
                         other => return Tail::Done(other),
+                    }
+                    if let Err(e) = rounds.charge_outputs(emitted) {
+                        return Tail::Done(Flow::Escaped(Control::Error(e)));
                     }
                 }
                 expr = last;
@@ -16647,34 +16640,36 @@ fn each_def_tail_loop_generic<S: EvalSemantics, V: DocumentValue>(
     let mut body = body;
     let mut body_frames = frames;
     let mut first_hop = true;
+    // Whether `body` can be run again as it is, asked at the first hop back to it.
+    let mut reusable: Option<bool> = None;
     let mut cur = TailValue::Node(value, cursor);
     loop {
         let _round = match enter_def_call(&callee, body_frames, bound) {
             Ok(guard) => guard,
             Err(e) => return Flow::Escaped(Control::Error(e)),
         };
-        // What the round's `as` bindings hold, released with the round.
-        let mut holds = EmbedGuards::default();
         let mut walked = Rc::clone(&body);
         let (next, next_body, next_frames) = loop {
-            match tail_step_generic::<S, V>(
-                &walked,
-                &mut cur,
-                optional,
-                &mut holds,
-                &mut rounds,
-                sink,
-            ) {
+            match tail_step_generic::<S, V>(&walked, &mut cur, optional, &mut rounds, sink) {
                 Tail::Call {
                     def: next,
                     frames: node_frames,
                     bound: node_bound,
-                } => match bind_next(next, node_frames, node_bound, first_hop, body_frames) {
-                    Ok((next_body, next_frames)) => {
-                        break (Rc::clone(next), next_body, next_frames)
+                } => {
+                    // See `eval::each_def_tail_loop`.
+                    if Rc::ptr_eq(next, &callee)
+                        && *reusable.get_or_insert_with(|| body_is_reusable(&body))
+                    {
+                        break (Rc::clone(next), Rc::clone(&body), body_frames);
                     }
-                    Err(e) => return Flow::Escaped(Control::Error(e)),
-                },
+                    reusable = None;
+                    match bind_next(next, node_frames, node_bound, first_hop, body_frames) {
+                        Ok((next_body, next_frames)) => {
+                            break (Rc::clone(next), next_body, next_frames)
+                        }
+                        Err(e) => return Flow::Escaped(Control::Error(e)),
+                    }
+                }
                 Tail::Bound(then) => walked = then,
                 Tail::Rest(rest) => return tail_each_generic::<S, V>(rest, &cur, optional, sink),
                 Tail::Done(flow) => return flow,

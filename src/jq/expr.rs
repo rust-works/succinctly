@@ -1724,8 +1724,13 @@ impl FuncDefData {
     /// Whether a call to this definition, with no arguments, answers at most
     /// once and can be run to its one value ahead of the call that follows it,
     /// computing it with `classify` on the first call (#5379).
-    pub(crate) fn settles_or_init(&self, classify: impl FnOnce(&Expr) -> bool) -> bool {
-        memo(&self.tail.settles, || classify(&self.body))
+    pub(crate) fn settles_or_init(&self, jq: bool, classify: impl FnOnce(&Expr) -> bool) -> bool {
+        let slot = if jq {
+            &self.tail.settles_jq
+        } else {
+            &self.tail.settles_yq
+        };
+        memo(slot, || classify(&self.body))
     }
 }
 
@@ -1759,7 +1764,8 @@ struct PathContextMemo(core::cell::Cell<Option<bool>>);
 struct TailMemo {
     jq: core::cell::Cell<Option<bool>>,
     yq: core::cell::Cell<Option<bool>>,
-    settles: core::cell::Cell<Option<bool>>,
+    settles_jq: core::cell::Cell<Option<bool>>,
+    settles_yq: core::cell::Cell<Option<bool>>,
 }
 
 impl Clone for TailMemo {
