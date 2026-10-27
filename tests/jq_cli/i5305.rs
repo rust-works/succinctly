@@ -182,7 +182,7 @@ fn test_interpolation_of_inputs_leaves_the_rest_of_the_queue_5305() -> Result<()
 #[test]
 fn test_interpolation_cursor_path_stops_after_sixty_four_parts_5305() -> Result<()> {
     let doc = r#"{"name":"a","bad":tru}"#;
-    let program = |slots: usize| format!("\"{}\"", r#"\(.name)"#.repeat(slots));
+    let program = |slots: usize| format!("\"{}\"", r"\(.name)".repeat(slots));
     let (out, code) = run_jq_stdin(&program(64), doc, &["-c"])?;
     assert_eq!(
         (out.as_str(), code),
