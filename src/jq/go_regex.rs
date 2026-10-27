@@ -919,3 +919,52 @@ const GO_CATEGORY_ALIASES: &[(&str, &str)] = &[
     ("Unassigned", "Cn"),
     ("Uppercaseletter", "Lu"),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every name Go's table has must be one the crate understands, positive, negated and inside a
+    /// class, or `\p{Name}` would be accepted by Go and refused here (#5388).
+    #[test]
+    fn test_every_go_unicode_name_compiles_5388() {
+        let mut names: Vec<&str> = Vec::new();
+        names.extend(GO_CATEGORIES);
+        names.extend(GO_SCRIPTS);
+        names.extend(GO_CATEGORY_ALIASES.iter().map(|&(alias, _)| alias));
+        names.extend(["Any", "Assigned", "Ascii", "Lc"]);
+        for name in names {
+            for template in ["\\p{NAME}", "\\P{NAME}", "[\\p{NAME}]", "(?i)\\p{NAME}"] {
+                let pattern = template.replace("NAME", name);
+                let translated = translate(&pattern).unwrap_or_else(|e| panic!("{pattern}: {e}"));
+                regex::Regex::new(&translated)
+                    .unwrap_or_else(|e| panic!("{pattern} -> {translated}: {e}"));
+            }
+        }
+    }
+
+    /// A name that cannot be written for the crate becomes an unnamed group; the others keep theirs.
+    #[test]
+    fn test_unusable_group_names_become_unnamed_5388() {
+        let re =
+            regex::Regex::new(&translate("(?P<1a>a)(?P<n>b)(?P<n>c)(?<m>d)").unwrap()).unwrap();
+        let names: Vec<Option<&str>> = re.capture_names().collect();
+        assert_eq!(names, [None, None, Some("n"), None, Some("m")]);
+    }
+
+    /// `(?i-i)` is `i` set and then cleared, written once; `(?-ii)` clears it twice.
+    #[test]
+    fn test_flags_are_written_once_5388() {
+        for (pattern, text, want) in [
+            ("(?i-i)a", "A", false),
+            ("(?-ii)a", "A", false),
+            ("(?ii)a", "A", true),
+            ("(?i-s)a.", "A\n", false),
+            ("(?is-i)a.", "A\n", false),
+            ("(?i-i:a)a", "Aa", false),
+        ] {
+            let re = regex::Regex::new(&translate(pattern).unwrap()).unwrap();
+            assert_eq!(re.is_match(text), want, "{pattern:?} on {text:?}");
+        }
+    }
+}
