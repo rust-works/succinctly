@@ -68641,21 +68641,36 @@ pub(crate) mod recurse_cap_override {
     }
 }
 
-/// Path components that cost a path-position `recurse` walk one more node of
-/// its [`RECURSE_MAX_ITEMS`] cap.
+/// Units of size that cost a capped `recurse` walk one more node of its
+/// [`RECURSE_MAX_ITEMS`] cap.
 ///
-/// A node of a path walk is as big as its path: `null | [path(recurse(.a))]`
-/// holds `n` paths of up to `n` keys, so a count of nodes alone bounds nothing
-/// once the cap is 2^20 (4 GB in two seconds, where the old 10,000 held about
-/// 50 million keys). [`recurse_node_cost`] charges a node `1 + depth / 64`,
-/// which keeps the cap an exact node count for any path under 64 keys and
-/// holds the keys a capped walk delivers to about 2^26, as before.
-pub(crate) const RECURSE_PATH_KEYS_PER_NODE: usize = 64;
+/// A node is as big as the value it holds and, in path position, the path that
+/// reaches it: `null | [path(recurse(.a))]` holds `n` paths of up to `n` keys,
+/// `"" | [recurse(. + "x")]` `n` strings of up to `n` bytes, so a count of nodes
+/// alone bounds nothing once the cap is 2^20 (4 GB in two seconds for the first,
+/// where the old 10,000 held about 50 million keys). [`recurse_node_cost`]
+/// charges a node `1 + size / 64`, which keeps the cap an exact node count for
+/// any node under 64 units and holds the units a capped walk delivers to about
+/// 2^26, as before. A unit is a path key, a byte of a string, an element of an
+/// array or a field of an object: a shallow measure, so a node that shares its
+/// children (`[.]`) is cheap, and 1 KB of small fields is still one node.
+pub(crate) const RECURSE_SIZE_PER_NODE: usize = 64;
 
-/// What delivering a node at `path_depth` costs a capped path-position
-/// `recurse` walk ([`RECURSE_PATH_KEYS_PER_NODE`]).
-pub(crate) const fn recurse_node_cost(path_depth: usize) -> usize {
-    1 + path_depth / RECURSE_PATH_KEYS_PER_NODE
+/// What delivering a node of `size` units costs a capped `recurse` walk
+/// ([`RECURSE_SIZE_PER_NODE`]).
+pub(crate) const fn recurse_node_cost(size: usize) -> usize {
+    1 + size / RECURSE_SIZE_PER_NODE
+}
+
+/// The units of `value` a capped `recurse` walk is charged for
+/// ([`RECURSE_SIZE_PER_NODE`]): its length, if it is a string or a container.
+pub(crate) fn recurse_value_size(value: &OwnedValue) -> usize {
+    match value {
+        OwnedValue::String(s) => s.len(),
+        OwnedValue::Array(items) => items.len(),
+        OwnedValue::Object(fields) => fields.len(),
+        _ => 0,
+    }
 }
 
 /// Whether `recurse(f)` / `recurse(f; cond)` is bare `recurse` (#3703).
@@ -69084,7 +69099,7 @@ enum RecurseAbort {
 /// different from `range`'s or `until`'s cap.
 ///
 /// It used to be its own abort, mapped to an ordinary end, so the walk
-/// delivered 10,000 nodes and finished with exit 0: `[recurse(.[]?; true)] |
+/// delivered 10,000 nodes (the cap then) and finished with exit 0: `[recurse(.[]?; true)] |
 /// length` on a 12,001-node document answered `10000`, and `recurse(f) |= ...`
 /// left everything past the cap untouched. Being an escape, it rides the same
 /// plumbing as any other: the nodes delivered before it stay delivered, a
@@ -69459,7 +69474,7 @@ impl<S: EvalSemantics> ValueRecurseWalk<'_, '_, '_, S> {
         if self.emitted >= self.cap {
             return Some(recurse_cap_abort());
         }
-        self.emitted += 1;
+        self.emitted += recurse_node_cost(recurse_value_size(&node));
         if (self.sink)(node.clone()) == Demand::Stop {
             return Some(RecurseAbort::Stopped(None));
         }
@@ -69545,7 +69560,7 @@ impl<S: EvalSemantics> ValueRecurseWalk<'_, '_, '_, S> {
 
         while !stack.is_empty() && self.emitted < self.cap {
             let current = stack.pop().expect("loop condition checked non-empty");
-            self.emitted += 1;
+            self.emitted += recurse_node_cost(recurse_value_size(&current));
             if (self.sink)(current.clone()) == Demand::Stop {
                 return Some(RecurseAbort::Stopped(pending_error));
             }
@@ -69864,7 +69879,7 @@ impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
         if self.emitted >= self.cap {
             return Some(recurse_cap_abort());
         }
-        self.emitted += recurse_node_cost(node.path.depth());
+        self.emitted += recurse_node_cost(node.path.depth() + recurse_value_size(&node.value));
         if (self.sink)(Self::delivered(&node)) == Demand::Stop {
             return Some(RecurseAbort::Stopped(None));
         }
@@ -70015,7 +70030,8 @@ impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
 
         while !stack.is_empty() && self.emitted < self.cap {
             let current = stack.pop().expect("loop condition checked non-empty");
-            self.emitted += recurse_node_cost(current.path.depth());
+            self.emitted +=
+                recurse_node_cost(current.path.depth() + recurse_value_size(&current.value));
             if (self.sink)(Self::delivered(&current)) == Demand::Stop {
                 return Some(RecurseAbort::Stopped(pending_error));
             }
@@ -141557,6 +141573,35 @@ mod tests {
         }
     }
 
+    /// #5378: a node of a capped walk also costs by its own size, so a node that
+    /// grows by one unit a round (`. + "x"`, `. + [1]`) is bounded by the units
+    /// it holds, not by how many nodes there are: with a cap of 1,000 the walk
+    /// delivers the nodes whose costs add up to it, then raises.
+    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
+    #[test]
+    fn recurse_node_cost_charges_a_growing_value_5378() {
+        let _cap = recurse_cap_override::scoped(1000);
+        let (mut spent, mut delivered) = (0_usize, 0_usize);
+        while spent < 1000 {
+            spent += recurse_node_cost(delivered);
+            delivered += 1;
+        }
+        for walk in [
+            r#""" | [recurse(. + "x")] | length"#,
+            "[] | [recurse(. + [1])] | length",
+            "[] | [recurse(. + [1]; true)] | length",
+        ] {
+            let (values, end) = outputs_and_end(b"null", walk);
+            assert!(values.is_empty(), "`{walk}`: {values:?}");
+            assert!(end.contains("maximum nodes exceeded"), "`{walk}`: {end}");
+        }
+        // The count it stops at is the one the cost rule gives: stream the lengths.
+        let (values, end) = outputs_and_end(b"null", r#""" | recurse(. + "x") | length"#);
+        assert_eq!(values.len(), delivered);
+        assert_eq!(values.last().cloned(), Some((delivered - 1).to_string()));
+        assert!(end.contains("maximum nodes exceeded"), "{end}");
+    }
+
     /// #5378: a node of a capped path-position walk costs `1 + depth / 64` of
     /// the cap, so a path that grows with the walk (`null | recurse(.a)`) cannot
     /// hold more than about 2^26 keys however large the cap is, and a path under
@@ -141568,6 +141613,10 @@ mod tests {
         assert_eq!(recurse_node_cost(63), 1);
         assert_eq!(recurse_node_cost(64), 2);
         assert_eq!(recurse_node_cost(640), 11);
+        // A string, an array and an object are charged by length, the rest are not.
+        assert_eq!(recurse_value_size(&OwnedValue::from("x".repeat(130))), 130);
+        assert_eq!(recurse_value_size(&OwnedValue::Int(7)), 0);
+        assert_eq!(recurse_value_size(&OwnedValue::Null), 0);
         let _cap = recurse_cap_override::scoped(1000);
         let (mut spent, mut delivered) = (0_usize, 0_usize);
         while spent < 1000 {

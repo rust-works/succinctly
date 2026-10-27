@@ -47,8 +47,8 @@ use super::error::{dump_truncated_with, Control, EvalError};
 use super::eval::{
     apply_compare_op, arith_combine, arith_negate, compare_values, is_tree_descending_f,
     native_stack_exhausted, owned_to_string, range_max_exceeded_error, recurse_max_items,
-    recurse_node_cost, EvalTag, JqSemantics, LoopCounters, QueryResult, MAX_EMPTY_REPEAT_ROUNDS,
-    MAX_EVAL_FRAMES, MAX_RANGE, MAX_RANGE_TOTAL, REPEAT_WIDTH_BUDGET,
+    recurse_node_cost, recurse_value_size, EvalTag, JqSemantics, LoopCounters, QueryResult,
+    MAX_EMPTY_REPEAT_ROUNDS, MAX_EVAL_FRAMES, MAX_RANGE, MAX_RANGE_TOTAL, REPEAT_WIDTH_BUDGET,
 };
 use super::expr::{
     ArithOp, Builtin, CompareOp, Expr, Literal, MergeFlags, NumberKey, ObjectKey, Param, Pattern,
@@ -145,8 +145,8 @@ fn storage_addr(items: &ArrayVec) -> usize {
 struct PathList(Option<Rc<(Self, OwnedValue, usize)>>);
 
 /// Unlinks the list a node at a time: the default drop recurses once per
-/// component, and a path as long as a `recurse` walk is deep (10,000 nodes
-/// under the cap) would overflow a 2 MiB thread.
+/// component, and a path as long as a `recurse` walk is deep (about 11,500 nodes
+/// under the cap, #5378) would overflow a 2 MiB thread.
 impl Drop for PathList {
     fn drop(&mut self) {
         let mut next = self.0.take();
@@ -2709,7 +2709,9 @@ impl<'e> Interp<'e> {
                             "recurse: maximum nodes exceeded",
                         )));
                     }
-                    visited += recurse_node_cost(r.path.as_ref().map_or(0, PathList::len));
+                    visited += recurse_node_cost(
+                        r.path.as_ref().map_or(0, PathList::len) + recurse_value_size(&v),
+                    );
                     sink(v.clone(), r.clone())?;
                     let children = match f {
                         Some(f) => self.collect_outputs(f, env, v, r),

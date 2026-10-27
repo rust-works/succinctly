@@ -1247,17 +1247,19 @@ Before #3716 the cap ended the walk as though it had finished: **silently, with 
 walk over a larger document answered short and a write through it stopped at the same node.
 Until #5378 the cap was 10,000, which refused an ordinary computed loop (`0 | [recurse(if . < 300000 then . + 1 else empty end)] | length`, 300001 in jq).
 
-**The cap counts nodes, not the memory they hold.**
-`[recurse(f)]` over an `f` that makes 1 KB objects holds about 1 GB at 2^20 nodes, and a string that grows by a character per node (`"" | [recurse(. + "x")]`) holds about 2^39 bytes, where jq never returns for the same program.
-Both raise the cap's error only after the memory is spent, so a program that builds large nodes needs a `limit` or a `first` of its own.
-A cap that measured a node's size would be exact, and needs a value-size measure the walkers do not have.
+**A node pays for its size.**
+A node of a capped `recurse` walk costs `1 + size / 64` of the cap.
+`size` is the node's length in units: a path key (in path position), a byte of a string, an element of an array, a field of an object.
+A node under 64 units costs exactly one, so ordinary data is counted node for node.
+`null | [path(recurse(.a))]` (a path as long as the walk is deep), `"" | [recurse(. + "x")]` and `[] | [recurse(. + [1])]` each hold about 2^26 units when the cap raises, not the 2^39 that counting nodes alone would allow.
+Measured on an Apple M4 Pro debug build, the peak of `[] | [recurse(. + [1])] | length` is 3.3 GB (2.5 GB at the 10,000-node cap) and of `null | [path(recurse(.a))] | length` 2.3 GB (1.7 GB), each raising the cap's error in under 6 s.
+`path(recurse(.a?; true))` on `{"a":null}` delivers 11,554 paths and then raises, about the 10,000 it delivered before #5378.
+The measure is shallow: a node that shares its children (`recurse([.])`) costs one, and an object of 1 KB of small fields costs one, so `[recurse(f)]` over an `f` that makes such objects still holds about 1 GB at 2^20 nodes.
+A cap that measured a node's bytes exactly would need a deep size the walkers do not have.
 
-**A path-position walk pays for the length of its path.**
-`null | [path(recurse(.a))]` holds `n` paths of up to `n` keys each, so counting nodes alone would let it spend gigabytes in a few seconds.
-A node of a capped `path(recurse(f))`, `del`, `|=` or `pick` walk therefore costs `1 + depth / 64` of the cap, where `depth` is the number of keys in its path.
-Any path under 64 keys costs exactly one, so a document of ordinary depth is counted node for node.
-The null loop above delivers 11,554 paths and then raises, about the 10,000 it delivered before #5378.
-
+**The value walker and the path walker can disagree on a deep document.**
+A path costs a node its depth, which a value does not, so past 63 levels `[path(recurse(f))]`, `del`, `|=` and `pick` reach the cap at fewer nodes than `[recurse(f)]` does over the same document (a document is at most 384 levels deep).
+Both stay exact for a document under 64 levels.
 The nodes delivered before the cap stay delivered, as with `range`: a streamed consumer prints 2^20
 outputs and then the error, a collecting one (`[recurse(f)]`, `length`) raises instead of answering, and
 a write through the walk (`|=`, `=`, `del`, `pick`) raises instead of finishing partially. A consumer
