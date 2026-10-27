@@ -2316,6 +2316,7 @@ impl<'e> Interp<'e> {
                         emitted += 1;
                         if emitted > cap {
                             return Err(Raise::Fatal(range_max_exceeded_error()));
+                            // patchcov: coverage tolerate-line reason="expensive: reached only after MAX_RANGE_TOTAL (2^24) values, or MAX_RANGE of a walk over non-numbers, have been emitted through the path interpreter; the cap itself is pinned by test_range_total_cap_is_exact_5292 and the each_range_batches unit tests (#5292)"
                             // patchcov: coverage tolerate-line reason="expensive: reached only after MAX_RANGE_TOTAL (2^24) values have been emitted, seconds of CPU and no test of the 2^26-value kind is cheap; the cap is pinned by the each_range_batches_* unit tests (#5292)"
                         }
                         sink(current.clone(), reg.clone())?;

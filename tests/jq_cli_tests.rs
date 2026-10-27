@@ -58988,6 +58988,40 @@ fn test_range_past_the_old_cap_answers_as_jq_does_2089_5292() -> Result<()> {
     Ok(())
 }
 
+/// #5292: a numeric `range` ends at `MAX_RANGE_TOTAL` (2^24 = 16,777,216) values for
+/// a consumer that keeps asking, exactly: one more raises the uncatchable cap error.
+/// jq has no cap, so this pins succinctly's own divergence, on both routes (`-n` runs
+/// `each_range`, a stdin document `each_range_generic`).
+#[test]
+fn test_range_total_cap_is_exact_5292() -> Result<()> {
+    for (filter, want) in [
+        ("[range(16777216)] | length", Some("16777216")),
+        ("[range(16777217)] | length", None),
+    ] {
+        for (label, args, input) in [
+            ("-n", vec!["-nc", filter], None),
+            ("document", vec!["-c", filter], Some("null")),
+        ] {
+            let (stdout, stderr, code) = run_jq_full(&args, input)?;
+            match want {
+                Some(want) => assert_eq!(
+                    (stdout.trim_end(), code),
+                    (want, 0),
+                    "{label} `{filter}`: stderr {stderr:?}"
+                ),
+                None => {
+                    assert_eq!(code, 5, "{label} `{filter}`: stdout {stdout:?}");
+                    assert!(
+                        stderr.contains("range: maximum iterations exceeded"),
+                        "{label} `{filter}`: stderr {stderr:?}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// #2089 boundary: landing exactly on the cap must not raise -- only
 /// genuinely exceeding it should. Verified against jq 1.7.1 (`100000`).
 #[test]

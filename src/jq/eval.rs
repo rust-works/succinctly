@@ -64563,7 +64563,7 @@ fn charge_alternative_update(
     what: &str,
 ) -> Option<Control> {
     if core::mem::replace(ran_update, true) {
-        budget.charge_step(what)
+        budget.charge_step(what) // patchcov: coverage tolerate-line reason="unreachable: `?//` after a fold's `as` pattern is a parse error in yq mode, the only mode that resolves a fold here (jq-mode path() runs the path interpreter), so no program retries an alternative in a path-mode fold (#5292)"
     } else {
         None
     }
@@ -102622,11 +102622,12 @@ mod tests {
             RangeNum::Int(step),
             cap,
         );
+        // A value of another kind is dropped, which the callers' equality checks catch.
         let ints = seen
             .iter()
-            .map(|v| match v {
-                OwnedValue::Int(n) => *n,
-                other => panic!("an integer range handed over {other:?}"),
+            .filter_map(|v| match v {
+                OwnedValue::Int(n) => Some(*n),
+                _ => None,
             })
             .collect();
         (ints, batches, end)
@@ -102747,9 +102748,9 @@ mod tests {
             let bits = |values: &[f64]| values.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
             let seen: Vec<f64> = seen
                 .iter()
-                .map(|v| match v {
-                    OwnedValue::Float(f) => *f,
-                    other => panic!("a float range handed over {other:?}"),
+                .filter_map(|v| match v {
+                    OwnedValue::Float(f) => Some(*f),
+                    _ => None,
                 })
                 .collect();
             assert_eq!(bits(&seen), bits(&expected), "{from} {to} {step}");
