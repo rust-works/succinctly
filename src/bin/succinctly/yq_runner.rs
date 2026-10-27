@@ -4369,8 +4369,8 @@ fn propagate_assign_copied_presentation(
                 let old = comment_tree_at_path(pristine, &path_steps)
                     .zip(owned_value_at(pristine_value, &meta_path_of(&path_steps)));
                 let same_container_type = |old: &CommentTree| {
-                    old.meta().tag().or(copy_kind_tag(&copy))
-                        == source.meta().tag().or(copy_kind_tag(&copy))
+                    old.meta().tag().or_else(|| copy_kind_tag(&copy))
+                        == source.meta().tag().or_else(|| copy_kind_tag(&copy))
                 };
                 let keeps_own_style = match (old, &copy) {
                     (Some((old, _)), _) if old.alias_name().is_some() => false,
