@@ -1264,7 +1264,7 @@ The nodes delivered before the cap stay delivered, as with `range`: a streamed c
 outputs and then the error, a collecting one (`[recurse(f)]`, `length`) raises instead of answering, and
 a write through the walk (`|=`, `=`, `del`, `pick`) raises instead of finishing partially. A consumer
 that stops first never meets it (`first`, `limit(1048576; ...)`, `isempty`, `nth(1048575; ...)`), and the
-boundary is exact: a 2^20-node document answers, a 2^20 + 1-node one raises, because the cap fires only
+boundary is exact: a walk whose nodes cost 2^20 in all answers, one that costs 2^20 + 1 raises, because the cap fires only
 when a node remains. It replaces a deferred `f`/`cond` error rather than the other way round, since the
 cap is the error the walk's size decided. Both evaluators and both modes share the one walker (yq's
 `recurse` is a succinctly extension behind `--jq-extensions`, real yq's lexer rejects it).

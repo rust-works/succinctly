@@ -18651,6 +18651,12 @@ fn test_resolve_recurse_cond_still_gates_null_child_emission() -> Result<()> {
 /// tests in `src/jq/eval.rs` pin the cap's behaviour on a 10,000-node walk.
 const RECURSE_CAP: usize = 1 << 20;
 
+/// What the root array of `RECURSE_CAP / 2 + 1` elements costs the cap beyond
+/// its own node (#5378: a node costs `1 + size / 64`), so a walk over such a
+/// document delivers `RECURSE_CAP - RECURSE_BIG_ROOT_EXTRA` nodes before it
+/// raises. Every other node of these documents is under 64 units, so costs one.
+const RECURSE_BIG_ROOT_EXTRA: usize = (RECURSE_CAP / 2 + 1) / 64;
+
 /// Review-driven regression guard on #854's own rewrite of `resolve_recurse_sink`'s
 /// `Some(cond)` arm: switching `cond`'s own evaluation to
 /// `eval_owned_multi_keep_partial` must not drop the pre-existing
@@ -57970,7 +57976,7 @@ fn test_recurse_gated_cond_runs_in_jq_order_3737() -> Result<()> {
 /// comments. Rows that stop before the cap still answer, and the boundary is
 /// exact: a 2^20-node document answers and a 2^20 + 1-node one raises, because
 /// the cap fires only when a node remains. Streamed consumers have delivered
-/// 2^20 outputs by then, which is jq's own prefix.
+/// every output before it by then, which is jq's own prefix.
 ///
 /// The rows spell `f` as `.[]? | .`, which walks the same tree but is not the
 /// bare `.[]?` whose walk is provably bounded by it: a `cond` that cannot fork
@@ -58024,7 +58030,11 @@ fn test_recurse_cap_raises_instead_of_ending_silently_3716() -> Result<()> {
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc.as_str()))?;
         assert_eq!(code, 5, "`{filter}` -- stderr: {stderr:?}");
-        assert_eq!(stdout.lines().count(), RECURSE_CAP, "`{filter}`");
+        assert_eq!(
+            stdout.lines().count(),
+            RECURSE_CAP - RECURSE_BIG_ROOT_EXTRA,
+            "`{filter}`"
+        );
         assert!(stderr.contains(cap_error), "`{filter}` -- {stderr:?}");
     }
     Ok(())
@@ -58032,8 +58042,8 @@ fn test_recurse_cap_raises_instead_of_ending_silently_3716() -> Result<()> {
 
 /// #3716, the rows that still answer: a consumer that stops before the cap never
 /// meets it, `.[]?` without a `cond` is uncapped (#3703), and the boundary is
-/// exact -- a 2^20-node document answers and a 2^20 + 1-node one raises,
-/// because the cap fires only when a node remains. Every answer here is jq's
+/// exact -- a document whose nodes cost 2^20 in all answers and one that costs
+/// one more raises, because the cap fires only when a node remains. Every answer here is jq's
 /// own. (A `cond` that cannot fork over bare `.[]?` is uncapped too, since
 /// #3737, and has its own test.)
 #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
@@ -58050,26 +58060,30 @@ fn test_recurse_cap_stopping_consumers_and_boundary_3716() -> Result<()> {
         ),
         ("[limit(3; recurse(.[]? | .; true))] | length", "3\n"),
         (
-            "[limit(1048576; recurse(.[]? | .; true))] | length",
-            "1048576\n",
+            "[limit(1040384; recurse(.[]? | .; true))] | length",
+            "1040384\n",
         ),
         ("isempty(recurse(.[]? | .; true))", "false\n"),
-        ("[nth(1048575; recurse(.[]? | .; true))] | length", "1\n"),
+        ("[nth(1040383; recurse(.[]? | .; true))] | length", "1\n"),
         ("[recurse(.[]?)] | length", "1048579\n"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc.as_str()))?;
         assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
         assert_eq!(stdout, want, "`{filter}`");
     }
-    // The boundary: 524,287 one-element arrays and a bare number is exactly
-    // 2^20 nodes, 524,288 arrays is 2^20 + 1.
-    let at_cap = format!(
-        "[{}]",
-        [vec!["[1]"; RECURSE_CAP / 2 - 1], vec!["1"]]
-            .concat()
-            .join(",")
-    );
-    let past_cap = format!("[{}]", vec!["[1]"; RECURSE_CAP / 2].join(","));
+    // The boundary. The root array costs `1 + elements / 64` of the cap, so the
+    // documents hold 524,288 elements (a cost of 8,193): 516,095 one-element
+    // arrays and 8,193 bare numbers are 1 + 1,032,190 + 8,193 = 1,040,384 nodes
+    // and a cost of exactly 2^20; one more bare number is a node past it (the
+    // root's cost does not move, 524,289 / 64 being 8,192 as well).
+    let elements = |arrays: usize, numbers: usize| {
+        format!(
+            "[{}]",
+            [vec!["[1]"; arrays], vec!["1"; numbers]].concat().join(",")
+        )
+    };
+    let at_cap = elements(516_095, 8_193);
+    let past_cap = elements(516_095, 8_194);
     for filter in [
         "[recurse(.[]? | .; true)] | length",
         "[path(recurse(.[]? | .; true))] | length",
@@ -58078,7 +58092,7 @@ fn test_recurse_cap_stopping_consumers_and_boundary_3716() -> Result<()> {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(at_cap.as_str()))?;
         assert_eq!(
             (stdout.as_str(), code),
-            ("1048576\n", 0),
+            ("1040384\n", 0),
             "`{filter}` -- {stderr:?}"
         );
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(past_cap.as_str()))?;
@@ -58110,7 +58124,11 @@ fn test_recurse_cap_retry_and_null_loop_3716() -> Result<()> {
         Some(doc.as_str()),
     )?;
     assert_eq!((stdout.as_str(), code), ("", 5), "{stderr:?}");
-    assert_eq!(stderr.matches('A').count(), RECURSE_CAP, "{stderr:?}");
+    assert_eq!(
+        stderr.matches('A').count(),
+        RECURSE_CAP - RECURSE_BIG_ROOT_EXTRA,
+        "{stderr:?}"
+    );
     assert!(stderr.contains(cap_error), "{stderr:?}");
     // The shape the cap exists for: `.a` of `null` is `null` forever in jq.
     // Bounded consumers answer as jq does; a collecting one raises instead of
