@@ -7967,6 +7967,25 @@ Three differences remain, all in the direction of erroring rather than aborting:
   accounting change; tracked separately as a future architectural improvement, not part of
   #1371's scope.
 
+**A call with no arguments, last in its body, runs in place, as in jq (#5379).**
+jq compiles it to a jump (`TAIL_CALL_JQ`), so `def f: if . < 300000 then . + 1 | f else . end; 0 | f` runs in constant space: 3,000,000 levels in 13 MB.
+`succinctly jq` and `succinctly yq` run the same call as a loop in place of a nested call, where it was refused after 7,569 levels (`MAX_EVAL_FRAMES` counts about 5.3 frames per call of that program).
+The positions are jq's: the last stage of a pipe, an `if`/`elif`/`else` branch, the last branch of a comma, the body of an `as` binding, and a `def` declared in the body.
+The callee is any def with no parameters: the same one, a wrapper, an outer def called from a nested one, the other half of a mutual recursion.
+The condition and the stages in front of the call are run to their one value first, so they must answer at most once (a comparison, arithmetic, a field, a slice, `length`, `select`, `[f]`, `map`, an assignment such as `.n += 1`, a call to a def that does).
+A loop holds no memory per round, which `tests/jq_tail_call_alloc_5379.rs` pins.
+Several things still nest, and are refused at `MAX_EVAL_FRAMES` or the native-stack floor as before.
+A call with arguments (`f(n - 1)`) nests, and jq does not jump from one either.
+A call under `try`, `?` or `label` nests, as in jq.
+A call behind a generator condition or a generator stage (`if (a, b) then`, `.[] | f`, `(.,.) | f`) nests, where jq keeps the fork point on its heap stack.
+A call behind a stage that is not recognised as answering at most once nests too, such as an object construction or a builtin outside the list.
+A call in an `as` whose source is a generator, a destructuring pattern (`. as [$a] | f`), and yq's `as` nest.
+A call in a pipe that reads path context (`key`, `parent`) nests, and so does one the path resolver walks (`path(f)` through `resolve_node_sink`, a `|=` target in the document evaluators); the path-mode interpreter, which runs a program with a dynamic path target as a whole, loops.
+A loop that never ends is stopped, where jq spins on `def f: f; f` in constant memory until it is killed.
+It stops after `MAX_LOOP_ROUNDS` (2^24) rounds, the bound `until` and `while` keep for a loop that steps in place (#5292), with the refusal the nested form raised: `f/0 exceeded maximum recursion depth`, uncatchable.
+That is a divergence in the direction ADR-0018 permits (matching would never answer).
+See the amendment to [ADR-0025](../../adrs/adr-0025.md#amendment-zero-argument-tail-calls-loop-in-place-5379).
+
 Recursion through a bare parameter is quadratic in time in both tools — a call-by-name
 parameter is re-evaluated at each use, so reading one at depth `d` costs `O(d)`. A
 `$`-style parameter is bound to a value once per call (#3149), so recursion through one is
