@@ -7968,22 +7968,25 @@ Three differences remain, all in the direction of erroring rather than aborting:
   #1371's scope.
 
 **A call with no arguments, last in its body, runs in place, as in jq (#5379).**
-jq compiles it to a jump (`TAIL_CALL_JQ`), so `def f: if . < 300000 then . + 1 | f else . end; 0 | f` runs in constant space: 3,000,000 levels in 13 MB.
+jq compiles it to a jump (`TAIL_CALL_JQ`), so `def f: if . < 300000 then . + 1 | f else . end; 0 | f` runs in constant space: 3,000,000 levels in 2.5 MB of jq 1.7.1 on macOS.
 `succinctly jq` and `succinctly yq` run the same call as a loop in place of a nested call, where it was refused after 7,569 levels (`MAX_EVAL_FRAMES` counts about 5.3 frames per call of that program).
-The positions are jq's: the last stage of a pipe, an `if`/`elif`/`else` branch, the last branch of a comma, the body of an `as` binding, and a `def` declared in the body.
+That program now answers 3,000,000 levels in 13.7 MB (release, Apple M5 Max), the same peak as at 300,000.
+The positions are the ones the loop can leave nothing behind from: the last stage of a pipe, an `if`/`elif`/`else` branch, the last branch of a comma, the body of an `as` binding (jq mode), and a `def` declared in the body.
 The callee is any def with no parameters: the same one, a wrapper, an outer def called from a nested one, the other half of a mutual recursion.
-The condition and the stages in front of the call are run to their one value first, so they must answer at most once (a comparison, arithmetic, a field, a slice, `length`, `select`, `[f]`, `map`, an assignment such as `.n += 1`, a call to a def that does).
+The condition and the stages in front of the call are run to their one value first, so they must answer at most once (a comparison, arithmetic, a field, a slice, `length`, `select`, `[f]`, `map`, an assignment such as `.n += 1`, a call to a def with no parameters whose body does, or any of those composed).
 A loop holds no memory per round, which `tests/jq_tail_call_alloc_5379.rs` pins.
 Several things still nest, and are refused at `MAX_EVAL_FRAMES` or the native-stack floor as before.
 A call with arguments (`f(n - 1)`) nests, and jq does not jump from one either.
 A call under `try`, `?` or `label` nests, as in jq.
 A call behind a generator condition or a generator stage (`if (a, b) then`, `.[] | f`, `(.,.) | f`) nests, where jq keeps the fork point on its heap stack.
+A call in a comma branch that is not the last nests: jq also jumps from it (`[def f: if . < 300000 then (. + 1 | f), 7 else . end; 0 | f] | length` is `300001` in 55 MB), keeping the branches still to run on its heap.
 A call behind a stage that is not recognised as answering at most once nests too, such as an object construction or a builtin outside the list.
 A call in an `as` whose source is a generator, a destructuring pattern (`. as [$a] | f`), and yq's `as` nest.
 A call in a pipe that reads path context (`key`, `parent`) nests, and so does one the path resolver walks (`path(f)` through `resolve_node_sink`, a `|=` target in the document evaluators); the path-mode interpreter, which runs a program with a dynamic path target as a whole, loops.
-A loop that never ends is stopped, where jq spins on `def f: f; f` in constant memory until it is killed.
-It stops after `MAX_LOOP_ROUNDS` (2^24) rounds, the bound `until` and `while` keep for a loop that steps in place (#5292), with the refusal the nested form raised: `f/0 exceeded maximum recursion depth`, uncatchable.
-That is a divergence in the direction ADR-0018 permits (matching would never answer).
+A loop is stopped after `MAX_LOOP_ROUNDS` (2^24) rounds, the bound `until` and `while` keep for a loop that steps in place (#5292), whether it would have ended or not: `def f: if . < 17000000 then . + 1 | f else . end; 0 | f` is refused, where jq answers it in 3.2 s.
+jq spins on `def f: f; f` in constant memory until it is killed, and a loop cannot be told from one that ends, so the refusal is the one the nested form raised: `f/0 exceeded maximum recursion depth`, uncatchable.
+That is a divergence in the direction ADR-0018 permits for a loop that never answers, and the cost of the same bound for one that would.
+A generator that tail-calls itself (`def f: ., (. + 1 | f)`) is also refused after 2^22 outputs emitted ahead of its calls, with `f/0: maximum outputs exceeded`, where a consumer that collects would hold every one of them until the rounds ran out; a consumer that stops (`first`, `limit`) is not charged for what it never asks for.
 See the amendment to [ADR-0025](../../adrs/adr-0025.md#amendment-zero-argument-tail-calls-loop-in-place-5379).
 
 Recursion through a bare parameter is quadratic in time in both tools — a call-by-name

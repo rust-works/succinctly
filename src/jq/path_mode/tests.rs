@@ -1653,6 +1653,31 @@ fn a_tail_recursive_def_runs_as_a_loop_5379() {
     });
 }
 
+/// #5379: what the tail loop asks of the interpreter's `single` is bounded, and what it
+/// learns while the bound runs out is not kept. A closure parameter read once the fuel of a
+/// loop's question was spent used to be cached as not single-valued for good, and every deeper
+/// read of it then nested: the program answers `[0,[]]` in jq 1.7.1, and did on the shipped
+/// route. A stage a long chain of `+ 0` makes too big for the interpreter's own question is
+/// still one the shared question settles, so the loop runs on both routes.
+#[test]
+fn the_tail_loops_settle_question_is_bounded_and_not_remembered_5379() {
+    on_big_stack(|| {
+        let plus_zeros = " + 0".repeat(40);
+        let deep_arg = format!(
+            "def r(n): def g: r(n - 1{plus_zeros}); def f: if n > 0 then g else . end; f; \
+             [(0 | r(100)), path(if true then . else . end)]"
+        );
+        let long_stage = format!(
+            "def f: if . < 20000 then . + 1{plus_zeros} | f else . end; \
+             [(0 | f), path(if true then .a else .b end)]"
+        );
+        check(&[
+            ("0", &deep_arg, ok(&["[0,[]]"])),
+            (r#"{"a":1}"#, &long_stage, ok(&[r#"[20000,["a"]]"#])),
+        ]);
+    });
+}
+
 /// Every routed library entry answers a dynamic path program as jq 1.7.1
 /// does, through the interpreter: the collecting cursor entry, `eval_using` on
 /// a document value and eval.rs's owned entry. A document that cannot be

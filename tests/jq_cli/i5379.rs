@@ -17,7 +17,7 @@ fn run(filter: &str) -> Result<(String, String, i32)> {
 #[test]
 fn test_the_issue_program_answers_where_it_was_refused_5379() -> Result<()> {
     // The issue's own repro at 300,000, and past what a stack could hold: jq answers 3,000,000
-    // in 13 MB.
+    // in constant space.
     let levels = if cfg!(debug_assertions) {
         1_000_000
     } else {
@@ -410,6 +410,7 @@ fn test_a_tail_loop_that_never_ends_hits_the_round_budget_5379() -> Result<()> {
 
 /// A program with a dynamic path target runs on the path-mode interpreter, which keeps jq's path
 /// register; the loop carries it from stage to stage. Answers captured from jq 1.7.1.
+#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_a_program_that_reads_a_path_loops_too_5379() -> Result<()> {
     for (label, doc, body, want) in [
@@ -438,6 +439,45 @@ fn test_a_program_that_reads_a_path_loops_too_5379() -> Result<()> {
             (stdout.trim_end(), code),
             (want, 0),
             "[{label}] `{filter}` over {doc} -- {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A generator that tail-calls itself holds every output it emitted while a consumer that
+/// collects (`[...]`) is waiting for its end, and jq's loop runs until its heap is gone. The
+/// outputs a loop emits ahead of its calls are bounded (2^22), apart from its rounds, so the
+/// collecting consumer is refused in a few hundred MB, not gigabytes.
+#[test]
+fn test_a_tail_generator_under_a_collector_is_bounded_5379() -> Result<()> {
+    let (stdout, stderr, code) = run("[def f: ., (. + 1 | f); 0 | f] | length")?;
+    assert_eq!((stdout.as_str(), code), ("", 5), "{stderr:?}");
+    assert!(
+        stderr.contains("f/0: maximum outputs exceeded"),
+        "{stderr:?}"
+    );
+    // A consumer that stops is not charged for what it never asks for.
+    let (stdout, stderr, code) = run("first(def f: ., (. + 1 | f); 0 | f)")?;
+    assert_eq!((stdout.trim_end(), code), ("0", 0), "{stderr:?}");
+    Ok(())
+}
+
+/// An `as` whose body never names the variable binds nothing, and over a document the node is
+/// not read (#3856): the answer does not depend on whether the call is in tail position. The
+/// document is one this reader accepts and jq's parser does not (a lone escape), so the row has
+/// no jq capture; the non-tail spelling is the reference.
+#[test]
+fn test_an_unread_as_binding_does_not_decode_the_node_5379() -> Result<()> {
+    let doc = r#"{"a":"\q","b":1}"#;
+    for filter in [
+        "def g: 5; def f: .a as $u | g; f",
+        "def g: 5; def f: .a as $u | [g] | .[0]; f",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            ("5", 0),
+            "`{filter}` -- {stderr:?}"
         );
     }
     Ok(())

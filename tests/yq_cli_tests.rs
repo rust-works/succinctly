@@ -59081,7 +59081,7 @@ mod issue_2091_def_and_binder_wrapped_writes {
     /// evaluation ever started.
     #[test]
     fn test_yaml_self_recursive_def_gate_terminates_2091() -> Result<()> {
-        let (_output, _stderr, code) = run_yq_stdin_with_stderr("def f: [f]; f", DOC, &[])?;
+        let (_output, _stderr, code) = run_yq_stdin_with_stderr("def f: f; f", DOC, &[])?;
         // The evaluator's own recursion limit reports the error; the point is
         // that we get here at all rather than hanging in the gate.
         assert_eq!(code, 1);

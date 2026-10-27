@@ -27306,12 +27306,11 @@ fn test_wide_recursive_string_interpolation_reports_cleanly_not_stack_overflow_2
 /// evaluator's arm covers.
 ///
 /// Real jq survives none of these: `isempty`/`first` over `def f: [f]; f` die
-/// with `cannot allocate memory` (exit 134), and the same recursion under
-/// `path()` does not terminate either. (`def f: f; f` is a tail call, which jq
-/// loops on forever and succinctly stops at its round budget since #5379, so
-/// these rows nest it.) Erroring is the deliberate divergence ADR-0018
-/// permits; what this pins is that it stays an *error* on all three routes
-/// rather than an abort on any of them.
+/// with `cannot allocate memory` (exit 134), and so does `path(def f: [f]; f)`
+/// (confirmed live). (`def f: f; f` is a tail call, which jq loops on forever and
+/// succinctly stops at its round budget since #5379, so these rows nest it.)
+/// Erroring is the deliberate divergence ADR-0018 permits; what this pins is that
+/// it stays an *error* on all three routes rather than an abort on any of them.
 #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 fn test_recursion_guard_reaches_lazy_and_path_evaluators_1371() -> Result<()> {
