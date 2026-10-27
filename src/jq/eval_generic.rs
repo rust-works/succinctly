@@ -3829,19 +3829,22 @@ enum LazySource<V: DocumentValue> {
     /// `may_repeat` does. No cursor in it has been walked: whoever reads an
     /// element validates it (#3856).
     Mixed(alloc::vec::IntoIter<LazyElem<V>>),
-    /// `group_by(f)`'s answer in jq mode (#5306): an array of arrays whose elements are all
-    /// document nodes. `cursors` holds every element in group order, `ends[i]` is where group
-    /// `i` stops in it, and `next` is the group to hand out. A group is decoded when it is
-    /// pulled, into the owned array it is, and dropped once the stage after it has read it, so
-    /// `group_by(f) | map(g)` holds the cursors and one group, not the decoded array.
+    /// `group_by(f)`'s answer (#5306): an array of arrays whose elements are all document
+    /// nodes. `cursors` holds every element in group order, `ends[i]` is where group `i`
+    /// stops in it, and `next` is the group to hand out.
     ///
-    /// jq mode only: the decode is `JqSemantics`' because `advance` has no mode to dispatch on,
-    /// and the only producer, `group_by_array_generic`, is not built under yq. Every node was
-    /// validated when its key was read (#1755), so the decode cannot fail on a bad node.
+    /// Nothing in it can fail: every node was validated when the groups were cut (#1755).
+    /// What reads it therefore stays on the cursors where it can -- `length` counts the
+    /// groups, `.[n]`/`first`/`last` hand one group on as a cursor sequence, `map(f)` runs
+    /// `f` over each group's cursors (`map_groups_eagerly`), `.[]` yields the groups as cursor
+    /// sequences, and a printed result is written from the document -- and a group is decoded
+    /// only when something has to hold it as a value (`advance`, `materialize_atomic`).
+    /// `tag` is the mode that decode follows, which `advance` has no type parameter for.
     Groups {
         cursors: Vec<V::Cursor>,
         ends: Vec<usize>,
         next: usize,
+        tag: EvalTag,
     },
 }
 
@@ -3952,15 +3955,17 @@ impl<V: DocumentValue> LazySource<V> {
                 cursors,
                 ends,
                 next,
+                tag,
             } => {
                 let Some(&end) = ends.get(*next) else {
                     return Ok(None);
                 };
-                let start = if *next == 0 { 0 } else { ends[*next - 1] };
+                let start = group_start(ends, *next);
                 *next += 1;
-                let items =
-                    <V::Cursor as DocumentCursor>::to_owned_values_jq(&cursors[start..end])?;
-                Some(LazyElem::Owned(OwnedValue::array_from(items)))
+                Some(LazyElem::Owned(decode_group::<V>(
+                    *tag,
+                    &cursors[start..end],
+                )?))
             }
         })
     }
@@ -4089,11 +4094,12 @@ impl<V: DocumentValue> LazySeq<V> {
 
     /// `group_by`'s groups, `ends` the exclusive end of each in `cursors` (#5306) -- see
     /// [`LazySource::Groups`].
-    fn from_groups(cursors: Vec<V::Cursor>, ends: Vec<usize>) -> Self {
+    fn from_groups(cursors: Vec<V::Cursor>, ends: Vec<usize>, tag: EvalTag) -> Self {
         Self::new(LazySource::Groups {
             cursors,
             ends,
             next: 0,
+            tag,
         })
     }
 
@@ -4121,7 +4127,7 @@ impl<V: DocumentValue> LazySeq<V> {
             && self.pending.is_empty()
             && matches!(
                 self.source,
-                LazySource::Cursors { .. } | LazySource::Mixed(_)
+                LazySource::Cursors { .. } | LazySource::Mixed(_) | LazySource::Groups { .. }
             )
     }
 
@@ -4137,19 +4143,14 @@ impl<V: DocumentValue> LazySeq<V> {
             cursors,
             ends,
             next,
+            ..
         } = &self.source
         else {
             return None;
         };
-        let mut start = if *next == 0 { 0 } else { ends[*next - 1] };
         Some(
-            ends[*next..]
-                .iter()
-                .map(|&end| {
-                    let group = &cursors[start..end];
-                    start = end;
-                    group
-                })
+            (*next..ends.len())
+                .map(|i| &cursors[group_start(ends, i)..ends[i]])
                 .collect(),
         )
     }
@@ -4273,6 +4274,20 @@ impl<V: DocumentValue> LazySeq<V> {
                 }
                 LazySource::Mixed(elems) => {
                     return to_owned_all_elems_shared::<S, V>(elems.as_slice())
+                        .map(OwnedValue::array_from)
+                        .map_err(Control::Error);
+                }
+                // #5306: one pass, a group at a time, without the `LazyElem` list the
+                // generic drain below builds first.
+                LazySource::Groups {
+                    cursors,
+                    ends,
+                    next,
+                    tag,
+                } => {
+                    return (*next..ends.len())
+                        .map(|i| decode_group::<V>(*tag, &cursors[group_start(ends, i)..ends[i]]))
+                        .collect::<Result<Vec<_>, _>>()
                         .map(OwnedValue::array_from)
                         .map_err(Control::Error);
                 }
@@ -11832,6 +11847,75 @@ fn fold_lazy_seq_stage<S: EvalSemantics, V: DocumentValue>(
             }
         }
     }
+    // #5306: `group_by`'s groups, none of them decoded. Nothing here can fail, so each of these
+    // answers from the cursors alone, as `Cursors` does above.
+    if let Some(groups) = seq.plain_groups() {
+        let len = groups.len();
+        match unwrap_paren(expr) {
+            Expr::Builtin(Builtin::Map(h)) => return map_groups_eagerly::<S, V>(&groups, h),
+            Expr::Builtin(Builtin::Length) => {
+                return GenericResult::Owned(OwnedValue::Int(len as i64))
+            }
+            Expr::Builtin(Builtin::First) | Expr::Index { idx: 0, key: None } => {
+                return groups
+                    .first()
+                    .map_or(GenericResult::Owned(OwnedValue::Null), |g| {
+                        group_value::<V>(g)
+                    })
+            }
+            Expr::Builtin(Builtin::Last) => {
+                return groups
+                    .last()
+                    .map_or(GenericResult::Owned(OwnedValue::Null), |g| {
+                        group_value::<V>(g)
+                    })
+            }
+            Expr::Index { idx, key: None } => {
+                let resolved = if *idx < 0 { len as i64 + idx } else { *idx };
+                if let Some(e) = yq_negative_index_check::<S>(*idx, resolved, len) {
+                    return GenericResult::Error(e);
+                }
+                return usize::try_from(resolved)
+                    .ok()
+                    .and_then(|i| groups.get(i))
+                    .map_or(GenericResult::Owned(OwnedValue::Null), |g| {
+                        group_value::<V>(g)
+                    });
+            }
+            Expr::Slice { start, end, .. } => {
+                let range = SliceBounds::from_literals(*start, *end).resolve(len);
+                let mut cursors = Vec::new();
+                let mut ends = Vec::new();
+                for group in &groups[range] {
+                    cursors.extend_from_slice(group);
+                    ends.push(cursors.len());
+                }
+                return GenericResult::LazySeq(Box::new(LazySeq::from_groups(
+                    cursors,
+                    ends,
+                    S::TAG,
+                )));
+            }
+            // `.[0].name`, `.[-1] | length`: the head is one of the reads above, and what is
+            // left of the pipe runs on what it answers.
+            Expr::Pipe(stages)
+                if matches!(
+                    stages.first().map(unwrap_paren),
+                    Some(
+                        Expr::Index { key: None, .. }
+                            | Expr::Builtin(Builtin::Last)
+                            | Expr::Slice { .. }
+                    )
+                ) =>
+            {
+                let (head, rest) = stages.split_first().expect("checked by the guard above");
+                drop(groups);
+                let head_result = fold_lazy_seq_stage::<S, V>(seq, head, optional);
+                return fold_pipe_stages::<S, V>(head_result, rest, optional);
+            }
+            _ => {}
+        }
+    }
     match unwrap_paren(expr) {
         // In place (#789 code review follow-up): reuses the `Box`'s
         // existing heap slot instead of freeing it and allocating a
@@ -12249,6 +12333,20 @@ fn each_lazy_seq_iterate_sink<S: EvalSemantics, V: DocumentValue>(
     // one. Past the window the tail streams one element at a time exactly
     // as before, so the remaining divergence is bounded to "an element past
     // the window, when the consumer stopped before reaching it".
+    // #5306: `group_by`'s groups cannot fail to be read, so there is nothing to validate ahead
+    // of the first one: each goes on as the cursor sequence it is, undecoded.
+    if let Some(groups) = seq.plain_groups() {
+        return drive_pipe_elements_generic::<S, V>(
+            groups.into_iter().map(|group| {
+                Ok(GenericItem::LazySeq(Box::new(LazySeq::from_cursors(
+                    group.to_vec(),
+                ))))
+            }),
+            rest,
+            optional,
+            sink,
+        );
+    }
     let window = match sink.budget() {
         Budget::Unbounded => usize::MAX,
         Budget::AtMost(n) => n,
@@ -25238,10 +25336,60 @@ fn sort_family_array_generic<S: EvalSemantics, V: DocumentValue>(
     GenericResult::LazySeq(Box::new(LazySeq::from_cursors(reorder(keyed))))
 }
 
+/// Where group `i` starts in a [`LazySource::Groups`]' cursors: the end of the group before it.
+fn group_start(ends: &[usize], i: usize) -> usize {
+    if i == 0 {
+        0
+    } else {
+        ends[i - 1]
+    }
+}
+
+/// One `group_by` group decoded to the owned array it is, under the mode it was cut in.
+fn decode_group<V: DocumentValue>(
+    tag: EvalTag,
+    group: &[V::Cursor],
+) -> Result<OwnedValue, EvalError> {
+    let items = match tag {
+        EvalTag::Jq => <V::Cursor as DocumentCursor>::to_owned_values::<JqSemantics>(group)?,
+        EvalTag::Yq => <V::Cursor as DocumentCursor>::to_owned_values::<YqSemantics>(group)?,
+    };
+    Ok(OwnedValue::array_from(items))
+}
+
+/// One group as the array it is, still on its cursors (`.[n]`, `first`, `last`, and each
+/// group `.[]` yields).
+fn group_value<V: DocumentValue>(group: &[V::Cursor]) -> GenericResult<V> {
+    GenericResult::LazySeq(Box::new(LazySeq::from_cursors(group.to_vec())))
+}
+
+/// `map(h)` over `group_by`'s groups, run to the end now (#5306): `h` is folded over each
+/// group's cursors as it would be over any array, and only its outputs are kept, so a group
+/// that `h` reads in part (`.[0].id`, `length`) is never decoded and one that it keeps is
+/// decoded once. Eager on purpose, as `map` is in jq: a failing, breaking or halting `h`
+/// stops here, inside whatever `label` or `try` encloses the `map`, and a later `first` cannot
+/// skip it.
+fn map_groups_eagerly<S: EvalSemantics, V: DocumentValue>(
+    groups: &[&[V::Cursor]],
+    h: &Expr,
+) -> GenericResult<V> {
+    let mut out: Vec<LazyElem<V>> = vec_with_capacity(groups.len());
+    for group in groups {
+        let result =
+            fold_lazy_seq_stage::<S, V>(Box::new(LazySeq::from_cursors(group.to_vec())), h, false);
+        match into_lazy_items::<V, S>(result) {
+            Ok(items) => out.extend(items),
+            Err(Control::Error(e)) => return GenericResult::Error(e),
+            Err(Control::Break(label)) => return GenericResult::Break(label),
+            Err(Control::Halt(code)) => return GenericResult::Halt(code),
+        }
+    }
+    GenericResult::LazySeq(Box::new(LazySeq::from_mixed(out)))
+}
+
 /// `group_by(f)` over an array's element cursors, in jq mode (#5306): sort the cursors by
 /// `[f]` (stable, so equal keys keep their input order) and cut the sorted run wherever the
-/// key changes under `==`. The groups stay cursors until a consumer pulls one
-/// ([`LazySource::Groups`]).
+/// key changes under `==`. The groups stay cursors ([`LazySource::Groups`]).
 ///
 /// Every element is checked for decodability before any key is read (#1755): the bridge this
 /// replaces decoded the whole array first, so an undecodable element reports its decode error
@@ -25252,7 +25400,8 @@ fn group_by_array_generic<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
 ) -> GenericResult<V> {
     for cursor in &cursors {
-        if let Some(control) = push_generic_document_validation_error(cursor, 0) {
+        // Depth 1: the elements sit one level inside the array, as the bridge counted them.
+        if let Some(control) = push_generic_document_validation_error(cursor, 1) {
             return sort_family_control(control);
         }
     }
@@ -25286,7 +25435,7 @@ fn group_by_array_generic<S: EvalSemantics, V: DocumentValue>(
     if !sorted.is_empty() {
         ends.push(sorted.len());
     }
-    GenericResult::LazySeq(Box::new(LazySeq::from_groups(sorted, ends)))
+    GenericResult::LazySeq(Box::new(LazySeq::from_groups(sorted, ends, S::TAG)))
 }
 
 /// `sort`/`sort_by`'s ordering step, shared with `unique`/`unique_by`, which
@@ -34146,7 +34295,7 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
         //
         // Not yq: its `group_by` is an ordered map on the first key's text and never sorts, and
         // `eval.rs` keeps that and every non-array wording; those inputs bridge, as before.
-        Builtin::GroupBy(f) if S::TAG != EvalTag::Yq && value.as_array().is_some() => {
+        Builtin::GroupBy(f) if S::TAG != EvalTag::Yq => {
             let Some(elements) = value
                 .as_array()
                 .filter(|_| reordering_may_keep_cursors::<V>(cursor.as_ref()))

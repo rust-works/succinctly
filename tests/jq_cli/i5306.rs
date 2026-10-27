@@ -127,3 +127,93 @@ fn test_group_by_output_flags_answer_as_jq_5306() -> Result<()> {
     }
     Ok(())
 }
+
+/// The ways a consumer reads `group_by`'s groups without a decode, on four groups of which the
+/// second makes `ascii_downcase` fail: `map` runs to the end whatever follows it (`first`, `limit`,
+/// `.[0]` cannot skip the failure), a `break` or `halt` in its body stops where jq stops it, and
+/// the point reads answer as jq does.
+const READ_INPUT: &str = r#"[{"a":1,"b":"x"},{"a":2,"b":5},{"a":3,"b":"z"},{"a":1,"b":"w"}]"#;
+
+/// (filter, expected `-c` output, exit code), run on [`READ_INPUT`].
+const READ_ROWS: &[(&str, &str, i32)] = &[
+    ("group_by(.a) | map(.[0].b | ascii_downcase) | first", "", 5),
+    ("group_by(.a) | map(.[0].b | ascii_downcase) | .[0]", "", 5),
+    ("first(group_by(.a) | map(.[0].b | ascii_downcase) | .[])", "", 5),
+    ("[limit(1; group_by(.a) | map(.[0].b | ascii_downcase) | .[])]", "", 5),
+    ("try (group_by(.a) | map(.[0].b | ascii_downcase) | first) catch \"c\"", "\"c\"\n", 0),
+    ("label $out | group_by(.a) | map(break $out)", "", 0),
+    ("try (label $out | group_by(.a) | map(break $out)) catch \"caught\"", "", 0),
+    ("[label $out | group_by(.a) | map(if .[0].a == 2 then break $out else . end)]", "[]\n", 0),
+    ("(group_by(.a) | map(error(\"x\"))), 3", "", 5),
+    ("(group_by(.a) | map(halt)), 3", "", 0),
+    ("1, (group_by(.a) | map(halt)), 3", "1\n", 0),
+    ("group_by(.a) | .[1] | length", "1\n", 0),
+    ("group_by(.a) | .[-1] | length", "1\n", 0),
+    ("group_by(.a) | last | length", "1\n", 0),
+    ("group_by(.a) | .[1:3] | length", "2\n", 0),
+    ("group_by(.a) | .[0][0].b", "\"x\"\n", 0),
+    ("group_by(.a) | .[-1][0]", "{\"a\":3,\"b\":\"z\"}\n", 0),
+    ("group_by(.a) | .[1:] | map(length)", "[1,1]\n", 0),
+    ("group_by(.a) | .[:1]", "[[{\"a\":1,\"b\":\"x\"},{\"a\":1,\"b\":\"w\"}]]\n", 0),
+    ("group_by(.a) | .[9]", "null\n", 0),
+    ("group_by(.a) | length", "3\n", 0),
+    ("group_by(.a)[] | length", "2\n1\n1\n", 0),
+    ("[group_by(.a)[] | .[0].a]", "[1,2,3]\n", 0),
+    ("first(group_by(.a)[])", "[{\"a\":1,\"b\":\"x\"},{\"a\":1,\"b\":\"w\"}]\n", 0),
+    ("group_by(.a)[1]", "[{\"a\":2,\"b\":5}]\n", 0),
+    ("group_by(.a) | map(.[0].a)", "[1,2,3]\n", 0),
+    ("group_by(.a) | map(.[1:])", "[[{\"a\":1,\"b\":\"w\"}],[],[]]\n", 0),
+    ("group_by(.a) | map(empty)", "[]\n", 0),
+    ("group_by(.a) | map(first, last)", "[{\"a\":1,\"b\":\"x\"},{\"a\":1,\"b\":\"w\"},{\"a\":2,\"b\":5},{\"a\":2,\"b\":5},{\"a\":3,\"b\":\"z\"},{\"a\":3,\"b\":\"z\"}]\n", 0),
+    ("group_by(.a) | map(map(.a))", "[[1,1],[2],[3]]\n", 0),
+    ("group_by(.a) | map({n: length, f: .[0].b})", "[{\"n\":2,\"f\":\"x\"},{\"n\":1,\"f\":5},{\"n\":1,\"f\":\"z\"}]\n", 0),
+    ("reduce group_by(.a)[] as $g (0; . + ($g | length))", "4\n", 0),
+    ("try (group_by(.a) | length) catch .", "3\n", 0),
+    ("group_by(.a) as $g | $g[0] | length", "2\n", 0),
+];
+
+#[test]
+fn test_group_by_groups_read_as_jq_reads_them_5306() -> Result<()> {
+    for (filter, want, want_code) in READ_ROWS {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(READ_INPUT))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (*want, *want_code),
+            "`{filter}`: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// A decode failure outranks a key error whichever element holds it, because every element is
+/// checked before any key is read; an interleaved check-then-key loop reports `boom` here.
+#[test]
+fn test_group_by_checks_every_element_before_reading_a_key_5306() -> Result<()> {
+    let input = r#"[{"a":1},{"a":2,"s":"\ud800"}]"#;
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"try group_by(error("boom")) catch ."#],
+        Some(input),
+    )?;
+    assert_eq!((stdout.as_str(), code), ("", 5), "{stderr}");
+    assert!(
+        stderr.contains("invalid unicode escape sequence"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+/// The elements sit one level inside the array: 256 levels of nesting in an element is one level
+/// too many, as it is for every other builtin that reads the array whole.
+#[test]
+fn test_group_by_counts_nesting_from_the_array_5306() -> Result<()> {
+    let deep = |levels: usize| format!("[{}{}]", "[".repeat(levels), "]".repeat(levels));
+    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by(.a?) | length"], Some(&deep(256)))?;
+    assert_eq!((stdout.as_str(), code), ("", 5), "{stderr}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 256"),
+        "{stderr}"
+    );
+    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by(.a?) | length"], Some(&deep(255)))?;
+    assert_eq!((stdout.as_str(), code), ("1\n", 0), "{stderr}");
+    Ok(())
+}
