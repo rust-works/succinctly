@@ -4,6 +4,10 @@
 //! A non-empty block container does not fit on the line: yq parks the comment on the next line
 //! (or drops it past the last key), which this tool does not reproduce (`limitations.md`).
 //!
+//! The rows cover the document root (an empty `{}` / `[]` keeps the comment, a scalar does not),
+//! anchors, aliases and tags on the node, and the last key of a mapping, where yq drops the
+//! comment a block container cannot carry.
+//!
 //! Every output is captured from yq v4.53.3.
 
 use anyhow::Result;
@@ -135,6 +139,58 @@ const ROWS: &[(&str, &str, &str)] = &[
         ".b = .c",
         "b: {} # u\nc: {} # u\n",
     ),
+    ("1 # t\n", ". = {}", "{} # t\n"),
+    ("1 # t\n", ". = []", "[] # t\n"),
+    ("1 # t\n", ". = 5", "5\n"),
+    ("1 # t\n", ". = \"s\"", "s\n"),
+    ("[1, 2] # t\n", ". = {}", "{} # t\n"),
+    ("[1, 2] # t\n", ". = []", "[] # t\n"),
+    ("[1, 2] # t\n", ". = 5", "5\n"),
+    ("[1, 2] # t\n", ". = \"s\"", "s\n"),
+    ("{a: 1} # t\n", ". = {}", "{} # t\n"),
+    ("{a: 1} # t\n", ". = []", "[] # t\n"),
+    ("{a: 1} # t\n", ". = 5", "5\n"),
+    ("{a: 1} # t\n", ". = \"s\"", "s\n"),
+    ("[] # t\n", ". = {}", "{} # t\n"),
+    ("[] # t\n", ". = []", "[] # t\n"),
+    ("[] # t\n", ". = 5", "5\n"),
+    ("[] # t\n", ". = \"s\"", "s\n"),
+    (
+        "a: &x [1] # t\nb: *x # u\n",
+        ".a = 5",
+        "a: &x 5 # t\nb: *x # u\n",
+    ),
+    (
+        "a: &x [1] # t\nb: *x # u\n",
+        ".a = {}",
+        "a: &x {} # t\nb: *x # u\n",
+    ),
+    (
+        "a: &x [1] # t\nb: *x # u\n",
+        ".b = 5",
+        "a: &x [1] # t\nb: 5 # u\n",
+    ),
+    ("a: !foo [1] # t\n", ".a = {}", "a: !foo {} # t\n"),
+    ("a: !foo [1] # t\n", ".a = 5", "a: !foo 5 # t\n"),
+    ("a: &x 1 # t\nb: *x\n", ".a = {}", "a: &x {} # t\nb: *x\n"),
+    (
+        "a: [1] # head\n# foot\nb: 2\n",
+        ".a = 5",
+        "a: 5 # head\n# foot\nb: 2\n",
+    ),
+    ("# head\na: [1] # t\n", ".a = 5", "# head\na: 5 # t\n"),
+    (
+        "a: 1\nb: [1] # t\n",
+        ".b = {\"y\": 2}",
+        "a: 1\nb:\n  y: 2\n",
+    ),
+    ("a: 1\nb: [1] # t\n", ".b = [9]", "a: 1\nb: [9] # t\n"),
+    ("a: 1\nb: # t\n  x: 1\n", ".b = 5", "a: 1\nb: 5 # t\n"),
+    (
+        "a: 1\nb: # t\n  x: 1\n",
+        ".b = {\"y\": 2}",
+        "a: 1\nb: # t\n  y: 2\n",
+    ),
 ];
 
 #[test]
@@ -173,5 +229,41 @@ fn test_5258_b_a_non_empty_container_result_drops_the_comment() -> Result<()> {
 fn test_5258_c_json_output_is_unchanged() -> Result<()> {
     let (out, code) = run_yq_stdin(".b = 5", "b: [1, 2] # t\n", &["-o=json", "-I=0"])?;
     assert_eq!((out.as_str(), code), ("{\"b\":5}\n", 0));
+    Ok(())
+}
+
+/// `-P` keeps an empty collection flow, and the comment beside it.
+const PRETTY_ROWS: &[(&str, &str, &str)] = &[
+    ("[1] # t\n", ". = {}", "{} # t\n"),
+    ("a: [1] # t\n", ".a = {}", "a: {} # t\n"),
+    ("a: [1] # t\n", ".a = 5", "a: 5 # t\n"),
+    ("a: 1 # t\n", ".a = []", "a: [] # t\n"),
+];
+
+#[test]
+fn test_5258_d_pretty_print_keeps_the_comment_beside_an_empty_collection() -> Result<()> {
+    for (input, filter, want) in PRETTY_ROWS {
+        let (out, code) = run_yq_stdin(filter, input, &["-P"])?;
+        assert_eq!(code, 0, "{filter} on {input:?}");
+        assert_eq!(&out, want, "{filter} on {input:?}");
+    }
+    Ok(())
+}
+
+/// A block mapping whose key line carries the comment (`b: # t`): the comment belongs to the key,
+/// which a write over the value leaves alone. Over `{}` / `[]` yq writes `b: # t` and the empty
+/// collection on the next line, which it cannot read back; over `null` it moves the comment beside
+/// the value. This tool prints `b: {} # t` and `b: # t` (recorded in `limitations.md`).
+#[test]
+fn test_5258_e_a_key_line_comment_stays_on_the_key() -> Result<()> {
+    for (filter, want) in [
+        (".b = {}", "a: 1\nb: {} # t\n"),
+        (".b = []", "a: 1\nb: [] # t\n"),
+        (".b = null", "a: 1\nb: # t\n"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, "a: 1\nb: # t\n  x: 1\n", &[])?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(out, want, "{filter}");
+    }
     Ok(())
 }

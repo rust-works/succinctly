@@ -6519,7 +6519,9 @@ documents x 8 filters. Still different:
 
 A node's own trailing comment (`b: [1, 2] # t`, `b: 1 # t`, `b: {} # t`) stays beside its new value when a write changes the node's kind and the value still fits on that line.
 That is a scalar or an empty `{}` / `[]`: `.b = 5` over `b: [1, 2] # t` is `b: 5 # t`, and `.b = {}` over `b: 1 # t` is `b: {} # t`, as in yq.
-Swept against yq v4.53.3: four container sources (flow sequence, flow mapping, empty `[]`, empty `{}`) against ten scalar writes (`null`, a quoted string, a string that needs quoting, a multi-line string that becomes `|- # t`, a float, a boolean, `length`, `tostring`), and five sources including a scalar against `{}` and `[]`.
+A document root follows the same rule except that a root scalar keeps no comment (`1 # t` written `. = 5` is `5`), as before.
+`-P` keeps an empty collection flow, and the comment with it.
+Swept against yq v4.53.3: four container sources (flow sequence, flow mapping, empty `[]`, empty `{}`) against ten writes (a number, `null`, a quoted string, a string that needs quoting, a multi-line string that becomes `|- # t`, a float, a boolean, `length`, `tostring`, a copy of another node), five sources including a scalar against `{}` and `[]`, the document root, a node with an anchor, an alias or a tag, and a last key.
 Still different:
 
 - **A non-empty block container written over the node** (`.b = {"y": 2}`, `.b = [9]`).
@@ -6527,6 +6529,7 @@ Still different:
   This build drops it in every case: it would otherwise print a comment beside an entry it never described.
 - **A block mapping whose key line carries the comment** (`b: # t` / `  x: 1`) overwritten with an empty `{}` / `[]`.
   yq writes `b: # t` and the `{}` on the next line, which it cannot read back as the same document; this build writes `b: {} # t`.
+- **An explicit-key entry** (`? [1] # t` / `: 2`) written through `.[] = 5` prints `'': 5` here and `? [1] # t` / `: 5` in yq: the complex key is spelled `""` ([#3992](https://github.com/rust-works/succinctly/issues/3992)), a different mechanism from the comment.
 - **The same block mapping overwritten with `null`** prints `b: null # t` in yq and `b: # t` here (the key comment is kept and the value is the empty scalar).
 
 ### `kind` of an alias on the owned routes ([#4866](https://github.com/rust-works/succinctly/issues/4866))
