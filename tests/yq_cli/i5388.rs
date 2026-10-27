@@ -1,7 +1,7 @@
 //! #5388: yq's regex is Go's `regexp` (RE2), and `succinctly yq` now reads the pattern the way Go's parser does
 //! (`src/jq/go_regex.rs`): `\Q..\E` is a literal span, `\<` a plain `<`, a `{` that starts no repeat is a literal,
 //! `\0`/`\12` are octal, `$` is the end of the text only, and what Go refuses is refused with Go's wording
-//! (`a++`, `(?x)`, `[a--b]`, `\Z`, `\1`, a repeat with nothing to repeat, an unclosed group or class). Every row is a
+//! (`a++`, `(?x)`, `[a--b]`, `\Z`, `\1`, a repeat with nothing to repeat, an unclosed group or class, counted repeats that nest past 1000). Every row is a
 //! live yq v4.53.3 capture: stdout, stderr and exit code.
 
 use anyhow::Result;
@@ -457,6 +457,65 @@ const ROWS: &[(&str, &str, &str, i32)] = &[
         "",
         0,
     ),
+    (
+        "\"a\" | test(\"(a{100}){100}\")",
+        "",
+        "Error: error parsing regexp: invalid repeat count: `{100}`",
+        1,
+    ),
+    (
+        "\"a\" | test(\"((a{10}){10}){11}\")",
+        "",
+        "Error: error parsing regexp: invalid repeat count: `{11}`",
+        1,
+    ),
+    (
+        "\"a\" | test(\"(((a{100}){100}){100})\")",
+        "",
+        "Error: error parsing regexp: invalid repeat count: `{100}`",
+        1,
+    ),
+    ("\"a\" | test(\"(a{10}){100}\")", "false\n", "", 0),
+    (
+        "\"a\" | test(\"(a{10}){101}\")",
+        "",
+        "Error: error parsing regexp: invalid repeat count: `{101}`",
+        1,
+    ),
+    ("\"a\" | test(\"(a{500}){2}\")", "false\n", "", 0),
+    (
+        "\"a\" | test(\"(a{501}){2}\")",
+        "",
+        "Error: error parsing regexp: invalid repeat count: `{2}`",
+        1,
+    ),
+    (
+        "\"a\" | test(\"(a{2}|b{501}){2}\")",
+        "",
+        "Error: error parsing regexp: invalid repeat count: `{2}`",
+        1,
+    ),
+    (
+        "\"a\" | test(\"(a{0}){2000}\")",
+        "",
+        "Error: error parsing regexp: invalid repeat count: `{2000}`",
+        1,
+    ),
+    (
+        "\"a\" | test(\"(a{1}){1001}\")",
+        "",
+        "Error: error parsing regexp: invalid repeat count: `{1001}`",
+        1,
+    ),
+    ("\"a\" | test(\"(a*){500}\")", "true\n", "", 0),
+    (
+        "\"a\" | test(\"(a{3,}){334}\")",
+        "",
+        "Error: error parsing regexp: invalid repeat count: `{334}`",
+        1,
+    ),
+    ("\"a\" | test(\"a{50}(b{30})\")", "false\n", "", 0),
+    ("\"a\" | test(\"(a{2}){2}(b{600}){1}\")", "false\n", "", 0),
 ];
 
 #[test]

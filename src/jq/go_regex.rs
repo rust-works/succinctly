@@ -33,6 +33,8 @@ pub(crate) fn translate(pattern: &str) -> Result<String, String> {
         atom_is_assertion: false,
         atom_repeated: false,
         pending_flags: String::new(),
+        atom_need: 1,
+        levels: alloc::vec![1],
     };
     t.run()?;
     t.flush_flags();
@@ -61,11 +63,24 @@ struct Translator {
     /// A flag-only group `(?i)` is written out just before the next thing that is not a repeat
     /// operator, so that `a(?i)*` and `a*(?i)+` can still repeat what came before it.
     pending_flags: String,
+    /// The product of the counted repeats nested in the last atom (`(a{10}){20}` needs 200),
+    /// and the largest such product of the atoms before it at each open group's level, outermost
+    /// first: Go's `repeatIsValid(re, 1000)`, which refuses a counted repeat that takes a nested
+    /// product past 1000.
+    atom_need: u64,
+    levels: Vec<u64>,
 }
 
 impl Translator {
     fn text(&self, from: usize, to: usize) -> String {
         self.c[from..to.min(self.c.len())].iter().collect()
+    }
+
+    /// Fold the last atom's need into its group level's.
+    fn fold_atom(&mut self) {
+        if let Some(level) = self.levels.last_mut() {
+            *level = (*level).max(self.atom_need);
+        }
     }
 
     fn flush_flags(&mut self) {
@@ -93,6 +108,8 @@ impl Translator {
                 '(' => self.open_group()?,
                 '|' => {
                     self.flush_flags();
+                    self.fold_atom();
+                    self.atom_need = 1;
                     self.out.push('|');
                     self.can_repeat = false;
                     self.i += 1;
@@ -102,6 +119,8 @@ impl Translator {
                         return Err(parse_error("unexpected )", &self.whole()));
                     };
                     self.flush_flags();
+                    self.fold_atom();
+                    self.atom_need = self.levels.pop().unwrap_or(1);
                     self.out.push(')');
                     self.atom_start = open;
                     self.atom_is_assertion = false;
@@ -121,7 +140,7 @@ impl Translator {
                 '*' | '+' | '?' => {
                     let start = self.i;
                     self.i += 1;
-                    self.repeat(start, self.i, last_repeat)?;
+                    self.repeat(start, self.i, last_repeat, None)?;
                     repeat = Some(start);
                 }
                 '{' => match self.parse_repeat() {
@@ -134,7 +153,7 @@ impl Translator {
                             ));
                         }
                         self.i = end;
-                        self.repeat(start, end, last_repeat)?;
+                        self.repeat(start, end, last_repeat, Some((min, max)))?;
                         repeat = Some(start);
                     }
                     None => {
@@ -159,6 +178,8 @@ impl Translator {
     /// Start an atom that matches text.
     fn atom(&mut self, text: &str) {
         self.flush_flags();
+        self.fold_atom();
+        self.atom_need = 1;
         self.atom_start = self.out.len();
         self.atom_is_assertion = false;
         self.atom_repeated = false;
@@ -185,6 +206,7 @@ impl Translator {
         start: usize,
         mut end: usize,
         last_repeat: Option<usize>,
+        counted: Option<(u64, Option<u64>)>,
     ) -> Result<(), String> {
         let lazy = self.peek(end) == Some('?');
         if lazy {
@@ -201,6 +223,18 @@ impl Translator {
                 "missing argument to repetition operator",
                 &self.text(start, end),
             ));
+        }
+        if let Some((min, max)) = counted {
+            let count = max.unwrap_or(min);
+            let need = if count == 0 {
+                1
+            } else {
+                count.saturating_mul(self.atom_need.max(1))
+            };
+            if (min >= 2 || max.is_some_and(|m| m >= 2)) && need > MAX_REPEAT {
+                return Err(parse_error("invalid repeat count", &self.text(start, end)));
+            }
+            self.atom_need = need;
         }
         if self.atom_is_assertion || self.atom_repeated {
             self.out.insert_str(self.atom_start, "(?:");
@@ -536,6 +570,9 @@ impl Translator {
         if self.peek(start + 1) != Some('?') {
             self.flush_flags();
             self.groups.push(self.out.len());
+            self.fold_atom();
+            self.levels.push(1);
+            self.atom_need = 1;
             self.out.push('(');
             self.can_repeat = false;
             self.i += 1;
@@ -564,6 +601,9 @@ impl Translator {
             }
             self.flush_flags();
             self.groups.push(self.out.len());
+            self.fold_atom();
+            self.levels.push(1);
+            self.atom_need = 1;
             self.out.push_str(&format!("(?P<{name}>"));
             self.can_repeat = false;
             self.i = end + 1;
@@ -596,6 +636,9 @@ impl Translator {
                     if ch == ':' {
                         self.flush_flags();
                         self.groups.push(self.out.len());
+                        self.fold_atom();
+                        self.levels.push(1);
+                        self.atom_need = 1;
                         self.out.push_str(&format!("(?{flags}:"));
                         self.can_repeat = false;
                     } else if !flags.is_empty() {
@@ -630,7 +673,7 @@ fn perl_class(shorthand: char) -> String {
 
 /// A literal character outside a class, escaped unless it is a letter, a digit or not ASCII.
 fn push_literal(out: &mut String, ch: char) {
-    if ch.is_ascii_alphanumeric() || !ch.is_ascii() {
+    if ch.is_ascii_alphanumeric() || (!ch.is_ascii() && !ch.is_whitespace() && !ch.is_control()) {
         out.push(ch);
     } else {
         out.push_str(&format!("\\x{{{:X}}}", ch as u32));
