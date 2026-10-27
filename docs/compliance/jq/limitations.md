@@ -9806,7 +9806,7 @@ A NUL byte inside the string ends C `strptime` in jq and is scanned past here (a
 yq's `to_unix` keeps its own lenient ISO 8601 parser (`builtin_fromdate`): its yq oracle has not been captured for the
 forms above, so it is not changed here.
 
-### `strptime` weekday and yearday of a format that sets no date, and `%j` (#5340)
+### `strptime` weekday and yearday of a format that sets no date, and `%j` (#5340, #5383)
 
 `strptime` starts from jq's zeroed `struct tm`, so a field the format leaves unset is year 1900, month 0 and day 0 (`"10:15" | strptime("%H:%M")` is `[1900,0,0,10,15,0,...]`), and the weekday and yearday are computed from that date, day 0 included.
 The year, month and day are the same on every libc, and so is every format that sets a date field (`"2015-03" | strptime("%Y-%m")` is `[2015,2,0,0,0,0,6,58]`).
@@ -9815,7 +9815,7 @@ glibc leaves jq's sentinels `8` and `367` (`[1900,0,0,10,15,0,8,367]`), and the 
 succinctly answers the date's own weekday and yearday (`[1900,0,0,10,15,0,0,-1]`, `[1900,0,15,0,0,0,1,14]`), which matches neither libc on those rows and the macOS pin on every row that sets a date.
 `%j` with a year read (`%Y`, `%y`, `%C`) and nothing that sets the month or day derives them from the day of year, as the pin's libc does (#5383): `"2015 060" | strptime("%Y %j")` is `[2015,2,1,0,0,0,0,59]`, `"2015 366"` rolls into `[2016,0,1,...]`, and day 0 and 367 are refused.
 `%j` next to a month or day (`%m`, `%d`, `%e`, `%b`, `%D`, `%F`) or with no year is order-dependent in the pin's libc and aborts jq on several rows (`Assertion failed: (yday == tm->tm_yday || tm->tm_yday == 367)` in `set_tm_yday`, e.g. `"060" | strptime("%j")`), so there is no answer to match; succinctly keeps the month and day as read and recomputes the yearday from them.
-glibc's `%j` was not captured.
+glibc's `%j` was not captured, so the rows above are the macOS pin's and glibc may differ on them.
 
 ### `truncate_stream` with a `NaN` depth slices from 0 (#4971)
 

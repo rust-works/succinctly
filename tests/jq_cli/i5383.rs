@@ -176,3 +176,61 @@ fn test_5383_strptime_day_of_year_sets_month_and_day() -> Result<()> {
         ),
     ])
 }
+
+/// #5383: `%j` next to a month or day, or with no year, keeps the month and day as read. These are succinctly's own
+/// answers, not the pin's: the libc is order-dependent there and `/usr/bin/jq` aborts on all of them but the last
+/// (`Assertion failed: (yday == tm->tm_yday || tm->tm_yday == 367)`), so there is nothing to match.
+#[test]
+fn test_5383_strptime_day_of_year_next_to_a_date_or_without_a_year_is_unchanged() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            "null",
+            r#""2015 15 060" | strptime("%Y %d %j")"#,
+            "[2015,0,15,0,0,0,4,14]\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            r#""2015 060 5" | strptime("%Y %j %e")"#,
+            "[2015,0,5,0,0,0,1,4]\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            r#""03/05/15 060" | strptime("%D %j")"#,
+            "[2015,2,5,0,0,0,4,63]\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            r#""2015-03-05 060" | strptime("%F %j")"#,
+            "[2015,2,5,0,0,0,4,63]\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            r#""060" | strptime("%j")"#,
+            "[1900,0,0,0,0,0,0,-1]\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            r#""060 10:30" | strptime("%j %H:%M")"#,
+            "[1900,0,0,10,30,0,0,-1]\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            r#""2015 03 060" | strptime("%Y %m %j")"#,
+            "[2015,2,0,0,0,0,6,58]\n",
+            "",
+            0,
+        ),
+    ])
+}
