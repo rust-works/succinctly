@@ -24734,6 +24734,10 @@ fn builtin_upper_index_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `..._or_suppress` fix, same reasoning -- no principled exemption
     // documented anywhere for this sibling either.
     let current = to_owned_or_suppress!(&value, optional);
+    // #5306: `INDEX(.[]; f)` is `INDEX(f)`, see `builtin_upper_index`.
+    if let (Expr::Iterate, OwnedValue::Array(elements)) = (stream, &current) {
+        return build_upper_index::<W, S>(elements, idx_expr);
+    }
     match eval_owned_multi::<S>(stream, &current) {
         Ok(rows) => build_upper_index::<W, S>(&rows, idx_expr),
         Err(e) => e.into(),
