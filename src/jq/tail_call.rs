@@ -39,7 +39,7 @@ use super::eval::{
     bind_def_call_body, def_call_depth_refusal, pipe_needs_path_context, single_valued_pure,
     yields_at_most_one_value, PureWalk, MAX_LOOP_ROUNDS,
 };
-use super::expr::{Expr, FuncDefData, PipeStages};
+use super::expr::{Builtin, Expr, FuncDefData, PipeStages};
 
 /// The def a node calls in tail position, if it is a call jq would jump to:
 /// no arguments, to a def with no parameters.
@@ -147,6 +147,62 @@ fn declared_tail_call(then: &Expr) -> bool {
 pub(crate) fn stage_settles(expr: &Expr) -> bool {
     single_valued_pure(expr, None, &mut PureWalk::new(false)).is_some()
         || yields_at_most_one_value(expr)
+        || settles_once_more(expr)
+}
+
+/// What [`stage_settles`] adds to the two recognitions it borrows: the shapes a
+/// loop that carries its state in the value writes ahead of its call
+/// (`.n += 1 | f`, `.a |= .[1:] | f`, `map(g) | f`) and that neither names.
+///
+/// An assignment answers once per output of its right side (`rhs as $v | ...`
+/// in jq's own definition), so it settles when that side does; `|=` answers
+/// once whatever its filter yields (it takes the first). The builtins are the
+/// ones that collect, or compute, one answer per input.
+fn settles_once_more(expr: &Expr) -> bool {
+    match expr {
+        Expr::Paren(inner) => stage_settles(inner),
+        Expr::Pipe(stages) => stages.iter().all(stage_settles),
+        Expr::Assign { value, .. }
+        | Expr::CompoundAssign { value, .. }
+        | Expr::AlternativeAssign { value, .. } => stage_settles(value),
+        // `[f]` collects every output of `f`: one array, or the error `f` raised.
+        Expr::Update { .. } | Expr::Array(_) => true,
+        Expr::Builtin(builtin) => matches!(
+            builtin,
+            Builtin::Map(_)
+                | Builtin::MapValues(_)
+                | Builtin::WithEntries(_)
+                | Builtin::ToEntries
+                | Builtin::FromEntries
+                | Builtin::Sort
+                | Builtin::SortBy(_)
+                | Builtin::GroupBy(_)
+                | Builtin::Unique
+                | Builtin::UniqueBy(_)
+                | Builtin::Reverse
+                | Builtin::Flatten
+                | Builtin::Transpose
+                | Builtin::Del(_)
+                | Builtin::Min
+                | Builtin::Max
+                | Builtin::MinBy(_)
+                | Builtin::MaxBy(_)
+                | Builtin::Floor
+                | Builtin::Ceil
+                | Builtin::Round
+                | Builtin::Sqrt
+                | Builtin::Fabs
+                | Builtin::Abs
+                | Builtin::ToJson
+                | Builtin::Utf8ByteLength
+                | Builtin::Explode
+                | Builtin::Implode
+                | Builtin::Trim
+                | Builtin::Ltrim
+                | Builtin::Rtrim
+        ),
+        _ => false,
+    }
 }
 
 /// Whether a pipe's stages in front of its last are all [`stage_settles`], and
@@ -215,5 +271,131 @@ impl TailRounds {
             }
             None => Err(def_call_depth_refusal(def)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jq::eval::install_def_calls;
+    use crate::jq::parse;
+
+    /// The bound body of `def f: <body>; f`: the one a call to `f` runs, with `f`'s own calls
+    /// installed as `DefCall`s.
+    fn bound_body(src: &str) -> (Rc<FuncDefData>, Rc<Expr>) {
+        let Expr::FuncDef {
+            name, params, body, ..
+        } = parse(src).expect("parses")
+        else {
+            panic!("`{src}` does not start with a def");
+        };
+        let def = Rc::new(FuncDefData::new(name, params, *body));
+        let body = bind_def_call_body(&def, &[], 0).expect("binds");
+        (def, body)
+    }
+
+    #[test]
+    fn the_spine_ends_in_a_zero_argument_call_5379() {
+        for (src, want) in [
+            ("def f: f; f", true),
+            ("def f: if . < 3 then . + 1 | f else . end; f", true),
+            ("def f: if . < 3 then . else . + 1 | f end; f", true),
+            (
+                "def f: if . < 3 then . + 1 | f elif . < 5 then . | f else . end; f",
+                true,
+            ),
+            ("def f: (. + 1 | f); f", true),
+            ("def f: ., (. + 1 | f); f", true),
+            ("def f: def g: f; . + 1 | g; f", true),
+            // A call that is not last, or not a call, or not a jump in jq.
+            ("def f: f | . + 1; f", false),
+            ("def f: [f]; f", false),
+            ("def f: 1 + f; f", false),
+            ("def f: f, 1; f", false),
+            ("def f: try f catch .; f", false),
+            ("def f: f?; f", false),
+            ("def f: label $out | f; f", false),
+            ("def f: if f then . else . end; f", false),
+            ("def f: . + 1; f", false),
+            ("def f: if . < 3 then 1 else 2 end; f", false),
+        ] {
+            let (_, body) = bound_body(src);
+            assert_eq!(spine_has_tail_call(&body), want, "`{src}`");
+        }
+    }
+
+    #[test]
+    fn a_call_with_an_argument_is_not_a_jump_5379() {
+        let Expr::FuncDef {
+            name, params, body, ..
+        } = parse("def f(n): if n > 0 then f(n - 1) else 0 end; f(3)").expect("parses")
+        else {
+            panic!("a def");
+        };
+        let def = Rc::new(FuncDefData::new(name, params, *body));
+        let installed = install_def_calls(&def.body, &def, 0, true);
+        assert!(!spine_has_tail_call(&installed));
+    }
+
+    #[test]
+    fn a_stage_settles_when_it_answers_at_most_once_5379() {
+        for (src, want) in [
+            // The recognitions `single_valued_pure` and `yields_at_most_one_value` give.
+            (". + 1", true),
+            (". < 3", true),
+            (".a.b", true),
+            (".[1:]", true),
+            ("length", true),
+            ("select(. > 1)", true),
+            ("tostring | length", true),
+            ("[.[] | . + 1]", true),
+            // Writes ahead of a call, and what collects.
+            (".n += 1", true),
+            (".a |= . + 1", true),
+            (".a = 1", true),
+            (".a //= 1", true),
+            ("map(. + 1)", true),
+            ("sort", true),
+            ("del(.a)", true),
+            // A generator, however it is spelled.
+            (".[]", false),
+            ("(., .)", false),
+            ("1, 2", false),
+            ("range(3)", false),
+            ("recurse", false),
+            (".n += (1, 2)", false),
+            ("first(.[])", false),
+            ("limit(3; .[])", false),
+            ("empty", true),
+        ] {
+            let expr = parse(src).expect("parses");
+            assert_eq!(stage_settles(&expr), want, "`{src}`");
+        }
+    }
+
+    #[test]
+    fn rebinding_shares_a_body_per_def_5379() {
+        let (def, body) = bound_body("def f: if . < 3 then . + 1 | f else . end; f");
+        let (other, _) = bound_body("def g: . + 1; g");
+        let mut bodies = TailBindings::new(&def, &body, 0);
+        // A self call runs the body it is already running.
+        assert!(Rc::ptr_eq(&bodies.body_of(&def).expect("self"), &body));
+        // Another def binds once and is kept.
+        let first = bodies.body_of(&other).expect("binds");
+        let again = bodies.body_of(&other).expect("kept");
+        assert!(Rc::ptr_eq(&first, &again));
+    }
+
+    #[test]
+    fn the_round_budget_runs_out_5379() {
+        let (def, _) = bound_body("def f: f; f");
+        let mut rounds = TailRounds(2);
+        assert!(rounds.charge(&def).is_ok());
+        assert!(rounds.charge(&def).is_ok());
+        let refused = rounds
+            .charge(&def)
+            .expect_err("the third round is over budget");
+        assert_eq!(refused.to_string(), "f/0 exceeded maximum recursion depth");
+        assert_eq!(TailRounds::new().0, MAX_LOOP_ROUNDS);
     }
 }

@@ -7355,18 +7355,7 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             args,
             frames,
             bound,
-        } => match bind_def_call(def, args, *frames, bound) {
-            // #5379: a body that ends in a call jq jumps to loops in place
-            // instead of nesting; any other body takes the path it always did.
-            Ok(body) if spine_has_tail_call(&body) => {
-                each_def_tail_loop::<W, S>(def, *frames, bound, body, value, optional, sink)
-            }
-            Ok(body) => match enter_def_call(def, *frames, bound) {
-                Ok(_guard) => eval_each::<W, S>(&body, value, optional, sink),
-                Err(e) => Flow::Escaped(Control::Error(e)),
-            },
-            Err(e) => Flow::Escaped(Control::Error(e)),
-        },
+        } => each_def_call::<W, S>(def, args, *frames, bound, value, optional, sink),
         // Lazy only for an argument the *user* wrote, not for a link in a
         // recursion's own argument chain (#1371).
         //
@@ -97912,6 +97901,35 @@ fn eval_def_call<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// [`eval_each`]'s `Expr::DefCall` arm, out of line (#5379): a body that ends in a
+/// call jq jumps to loops in place instead of nesting, and any other body takes
+/// the path it always did.
+///
+/// Out of line because the arm's locals are in `eval_each`'s own frame, which
+/// every level of a recursive `def` pays for (ADR-0025 counts it against the
+/// native-stack floor).
+#[inline(never)]
+fn each_def_call<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    def: &Rc<FuncDefData>,
+    args: &[Expr],
+    frames: u32,
+    bound: &BoundBody,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    match bind_def_call(def, args, frames, bound) {
+        Ok(body) if spine_has_tail_call(&body) => {
+            each_def_tail_loop::<W, S>(def, frames, bound, body, value, optional, sink)
+        }
+        Ok(body) => match enter_def_call(def, frames, bound) {
+            Ok(_guard) => eval_each::<W, S>(&body, value, optional, sink),
+            Err(e) => Flow::Escaped(Control::Error(e)),
+        },
+        Err(e) => Flow::Escaped(Control::Error(e)),
+    }
+}
+
 /// What a tail loop carries from one round to the next (#5379): the value
 /// the next round's body runs over.
 ///
@@ -97994,6 +98012,7 @@ fn tail_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// whose condition or earlier stage is not [`stage_settles`] (a generator, a
 /// builtin with an effect): jq keeps the fork point on its heap stack, and here
 /// the fork point lives in the native frames the nested call keeps.
+#[inline(never)]
 fn tail_step<'e, 'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     body: &'e Expr,
     cur: &mut TailValue<'a, W>,
@@ -98072,6 +98091,7 @@ fn tail_step<'e, 'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ///
 /// `frames` and `bound` are the call node's. A round budget ([`TailRounds`])
 /// stops a loop that never ends with the refusal the nested form reached.
+#[inline(never)]
 fn each_def_tail_loop<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     def: &Rc<FuncDefData>,
     frames: u32,

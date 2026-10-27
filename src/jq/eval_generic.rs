@@ -98,6 +98,10 @@ use super::expr::{
 };
 use super::path_mode::Route;
 use super::slice::{literal_component_from_values, slice_str, SliceBounds};
+use super::tail_call::{
+    pipe_settles_before_last, spine_has_tail_call, stage_settles, tail_def, TailBindings,
+    TailRounds,
+};
 use super::value::{owned_value_eq, subarray_indices, NumberRepr, OwnedValue};
 
 /// Recursion-depth ceiling for [`to_owned`]/[`to_owned_cursor`]/
@@ -15245,13 +15249,9 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             args,
             frames,
             bound,
-        } => match bind_def_call(def, args, *frames, bound) {
-            Ok(body) => match enter_def_call(def, *frames, bound) {
-                Ok(_guard) => eval_each_generic::<S, V>(&body, value, optional, cursor, sink),
-                Err(e) => Flow::Escaped(Control::Error(e)),
-            },
-            Err(e) => Flow::Escaped(Control::Error(e)),
-        },
+        } => {
+            each_def_call_generic::<S, V>(def, args, *frames, bound, value, optional, cursor, sink)
+        }
         // Same split as `eval.rs`'s own `Shared` arm, for the same measured
         // reason -- see there. A link in a recursion's own argument chain
         // takes the cheaper eager path (it is single-valued, so no demand is
@@ -16362,6 +16362,233 @@ fn each_if_generic<S: EvalSemantics, V: DocumentValue>(
     match escape.take(&cond_flow, crate::jq::eval::direct_pattern_retry(cond)) {
         Some(control) => Flow::Escaped(control),
         None => cond_flow,
+    }
+}
+
+/// [`eval_each_generic`]'s `Expr::DefCall` arm, out of line (#5379).
+///
+/// The arm used to be written in place. Adding the loop's call to it grew
+/// `eval_each_generic`'s own frame, which every level of a recursive `def`
+/// pays, and a debug build's native-stack floor (ADR-0025) then refused
+/// `def r($p1; $p2): ... r($p1 - 1; $p2) ...; r(12000; 7)` that it had run: the
+/// arm's locals are what moved the frame, so they live here instead.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn each_def_call_generic<S: EvalSemantics, V: DocumentValue>(
+    def: &Rc<FuncDefData>,
+    args: &[Expr],
+    frames: u32,
+    bound: &BoundBody,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    match bind_def_call(def, args, frames, bound) {
+        // #5379: see `eval::each_def_tail_loop`.
+        Ok(body) if spine_has_tail_call(&body) => each_def_tail_loop_generic::<S, V>(
+            def, frames, bound, body, value, optional, cursor, sink,
+        ),
+        Ok(body) => match enter_def_call(def, frames, bound) {
+            Ok(_guard) => eval_each_generic::<S, V>(&body, value, optional, cursor, sink),
+            Err(e) => Flow::Escaped(Control::Error(e)),
+        },
+        Err(e) => Flow::Escaped(Control::Error(e)),
+    }
+}
+
+/// What a tail loop carries from one round to the next (#5379): the value the
+/// next round's body runs over, as a stage of a pipe hands it on --
+/// [`continue_pipe_element_generic`] is the one definition of how each kind of
+/// item continues, and this is its loop-carried form.
+enum TailValue<V: DocumentValue> {
+    /// A node of the document (or a value read from one), and the cursor it
+    /// came from when it has one.
+    Node(V, Option<V::Cursor>),
+    /// A value a stage built, which has no node of its own (#2642).
+    Owned(OwnedValue),
+}
+
+impl<V: DocumentValue> TailValue<V> {
+    /// The value one item of a stage's output is, for the stage after it.
+    fn from_item<S: EvalSemantics>(item: GenericItem<V>) -> Result<Self, Control> {
+        Ok(match item {
+            GenericItem::One(v) => Self::Node(v, None),
+            GenericItem::OneCursor(c) => Self::Node(c.value(), Some(c)),
+            GenericItem::OneCursorValue(c, v) => Self::Node(v, Some(c)),
+            GenericItem::Owned(o) => Self::Owned(o),
+            lazy => Self::Owned(owned_identity_materialize::<V, S>(lazy)?),
+        })
+    }
+}
+
+/// Where a tail loop's walk of one round's body ended: `eval::Tail`'s twin.
+enum TailGeneric<'e> {
+    Call(Rc<FuncDefData>),
+    Rest(&'e Expr),
+    Bound(Rc<Expr>),
+    Done(Flow),
+}
+
+/// Push `expr`'s outputs over `cur` into `sink`.
+fn tail_each_generic<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    cur: &TailValue<V>,
+    optional: bool,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    match cur {
+        TailValue::Node(v, cursor) => {
+            eval_each_generic::<S, V>(expr, v.clone(), optional, *cursor, sink)
+        }
+        // As `continue_pipe_element_generic`'s `Owned` arm: `o` is a computed
+        // intermediate value, never document-backed (#2642).
+        TailValue::Owned(o) => {
+            eval_each_owned::<S>(expr, o, optional, Reentry::REBUILT, &mut |o| {
+                sink.push(GenericItem::Owned(o))
+            })
+        }
+    }
+}
+
+/// Run a stage that settles over `cur` to its one item: `Ok(None)` if it yields
+/// nothing, and the flow it ended in if it escaped.
+fn tail_one_generic<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    cur: &TailValue<V>,
+    optional: bool,
+) -> Result<Option<GenericItem<V>>, Flow> {
+    let mut out: Option<GenericItem<V>> = None;
+    let flow = tail_each_generic::<S, V>(expr, cur, optional, &mut |item| {
+        debug_assert!(out.is_none(), "a settled stage yields at most one output");
+        out = Some(item);
+        Demand::Continue
+    });
+    match flow {
+        Flow::Exhausted => Ok(out),
+        other => Err(other),
+    }
+}
+
+/// `eval::tail_step` over the generic evaluator's values (#5379).
+///
+/// One rule more than the plain evaluator's: in yq mode a pipe with a union in
+/// it is evaluated over a whole context list, branch-major
+/// ([`yq_context_pipe_applies`]), which is not the stage-by-stage order the walk
+/// follows, so such a pipe is left to [`eval_each_generic`].
+#[inline(never)]
+fn tail_step_generic<'e, S: EvalSemantics, V: DocumentValue>(
+    body: &'e Expr,
+    cur: &mut TailValue<V>,
+    optional: bool,
+    sink: &mut dyn Sink<V>,
+) -> TailGeneric<'e> {
+    let mut expr = body;
+    loop {
+        match expr {
+            Expr::Paren(inner) => expr = inner,
+            Expr::FuncDef {
+                name,
+                params,
+                body,
+                then,
+                bound,
+            } => return TailGeneric::Bound(bind_def(name, params, body, then, bound)),
+            Expr::DefCall { .. } => {
+                return match tail_def(expr) {
+                    Some(def) => TailGeneric::Call(Rc::clone(def)),
+                    None => TailGeneric::Rest(expr),
+                }
+            }
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+            } if stage_settles(cond) => match tail_one_generic::<S, V>(cond, cur, optional) {
+                Ok(Some(item)) => match generic_item_truthiness::<V, S>(item) {
+                    Ok(truthy) => expr = if truthy { then_branch } else { else_branch },
+                    Err(control) => return TailGeneric::Done(Flow::Escaped(control)),
+                },
+                Ok(None) => return TailGeneric::Done(Flow::Exhausted),
+                Err(flow) => return TailGeneric::Done(flow),
+            },
+            Expr::Pipe(stages)
+                if pipe_settles_before_last(stages) && !yq_context_pipe_applies::<S>(stages) =>
+            {
+                let Some((last, before)) = stages.split_last() else {
+                    return TailGeneric::Rest(expr);
+                };
+                for stage in before {
+                    match tail_one_generic::<S, V>(stage, cur, optional) {
+                        Ok(Some(item)) => match TailValue::from_item::<S>(item) {
+                            Ok(next) => *cur = next,
+                            Err(control) => return TailGeneric::Done(Flow::Escaped(control)),
+                        },
+                        Ok(None) => return TailGeneric::Done(Flow::Exhausted),
+                        Err(flow) => return TailGeneric::Done(flow),
+                    }
+                }
+                expr = last;
+            }
+            Expr::Comma(items) if !items.is_empty() => {
+                let Some((last, before)) = items.split_last() else {
+                    return TailGeneric::Rest(expr);
+                };
+                for item in before {
+                    match tail_each_generic::<S, V>(item, cur, optional, sink) {
+                        Flow::Exhausted => {}
+                        other => return TailGeneric::Done(other),
+                    }
+                }
+                expr = last;
+            }
+            _ => return TailGeneric::Rest(expr),
+        }
+    }
+}
+
+/// `eval::each_def_tail_loop` for the generic evaluator (#5379).
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn each_def_tail_loop_generic<S: EvalSemantics, V: DocumentValue>(
+    def: &Rc<FuncDefData>,
+    frames: u32,
+    bound: &BoundBody,
+    body: Rc<Expr>,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    let mut bodies = TailBindings::new(def, &body, frames);
+    let mut rounds = TailRounds::new();
+    let mut callee = Rc::clone(def);
+    let mut body = body;
+    let mut cur = TailValue::Node(value, cursor);
+    loop {
+        let _round = match enter_def_call(&callee, frames, bound) {
+            Ok(guard) => guard,
+            Err(e) => return Flow::Escaped(Control::Error(e)),
+        };
+        let mut walked = Rc::clone(&body);
+        let next = loop {
+            match tail_step_generic::<S, V>(&walked, &mut cur, optional, sink) {
+                TailGeneric::Call(next) => break next,
+                TailGeneric::Bound(then) => walked = then,
+                TailGeneric::Rest(rest) => {
+                    return tail_each_generic::<S, V>(rest, &cur, optional, sink)
+                }
+                TailGeneric::Done(flow) => return flow,
+            }
+        };
+        if let Err(e) = rounds.charge(&next) {
+            return Flow::Escaped(Control::Error(e));
+        }
+        body = match bodies.body_of(&next) {
+            Ok(b) => b,
+            Err(e) => return Flow::Escaped(Control::Error(e)),
+        };
+        callee = next;
     }
 }
 
