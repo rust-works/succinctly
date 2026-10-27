@@ -90428,9 +90428,13 @@ struct BrokenDownTime {
 /// Parse a time string according to strptime format specifiers
 #[allow(clippy::type_complexity)] // STYLE-0004: return mirrors strptime's broken-down-time field set
 fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), String> {
-    let mut year: i64 = 1970;
+    // #5340: jq hands the libc a zeroed `struct tm` (`memset(&tm, 0, sizeof(tm))`), so a field the
+    // format does not set stays `tm_year = 0` (1900), `tm_mon = 0` and `tm_mday = 0` -- not the
+    // epoch's 1970-01-01. `weekday`/`yearday` are then computed from that date, `mday = 0`
+    // included (`"2015" | strptime("%Y")` is `[2015,0,0,0,0,0,3,-1]`).
+    let mut year: i64 = 1900;
     let mut month: i64 = 1;
-    let mut day: i64 = 1;
+    let mut day: i64 = 0;
     let mut hour: i64 = 0;
     let mut minute: i64 = 0;
     let mut second: i64 = 0;
@@ -90440,7 +90444,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
     // computed from the date, not taken from the parsed input.
     #[allow(unused_variables, unused_assignments)]
     // STYLE-0004: weekday parsed from %w/%u then recomputed from the date (jq parity)
-    let mut weekday: i64 = 4; // Thursday (Jan 1, 1970)
+    let mut weekday: i64 = 0;
     #[allow(unused_variables, unused_assignments)]
     // STYLE-0004: yearday parsed from %j then recomputed from the date (jq parity)
     let mut yearday: i64 = 0;
