@@ -35,6 +35,7 @@ pub(crate) fn translate(pattern: &str) -> Result<String, String> {
         pending_flags: String::new(),
         atom_need: 1,
         levels: alloc::vec![1],
+        names: Vec::new(),
     };
     t.run()?;
     t.flush_flags();
@@ -69,6 +70,9 @@ struct Translator {
     /// product past 1000.
     atom_need: u64,
     levels: Vec<u64>,
+    /// The group names written so far: Go takes a name twice and one that starts with a digit, the
+    /// crate takes neither, so a repeat or a digit-led name is written as an unnamed group.
+    names: Vec<String>,
 }
 
 impl Translator {
@@ -421,9 +425,9 @@ impl Translator {
     }
 
     /// `\p{Name}`, `\pN`, `\P..`, `\p{^Name}` at `start`, as the crate's class and where it ends.
-    /// A name with anything but letters, digits and `_` (`Script=Greek`, `Age=1.1`) is an error in
-    /// Go. Which names it knows is its own table (it refuses `Alphabetic` and `Grek`, accepts
-    /// `greek`), which the crate's loose matching does not follow, so that is left to the crate.
+    /// Which names Go knows is its own table (it refuses `Alphabetic`, `Script=Greek` and `Old_Italic`,
+    /// accepts `greek` and `Letter`), which the crate's loose matching does not follow, so the name
+    /// is looked up in [`go_unicode_table`] and written as the crate's.
     fn unicode_class(&self, start: usize) -> Result<(String, usize), String> {
         let mut negated = self.c[start + 1] == 'P';
         let mut j = start + 2;
@@ -451,17 +455,21 @@ impl Translator {
             negated = !negated;
             name = rest.to_string();
         }
-        if name.is_empty()
-            || !name
-                .chars()
-                .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-        {
+        let Some((body, invert)) = go_unicode_table(&name) else {
             return Err(parse_error(
                 "invalid character class range",
                 &self.text(start, j),
             ));
+        };
+        if invert {
+            negated = !negated;
         }
-        let text = format!("\\{}{{{}}}", if negated { 'P' } else { 'p' }, name);
+        // The surrogates are in Go's tables and in no string, which the crate has no name for.
+        let text = match (body, negated) {
+            ("Cs", false) => "[^\\x{0}-\\x{10FFFF}]".to_string(),
+            ("Cs", true) => "[\\x{0}-\\x{10FFFF}]".to_string(),
+            _ => format!("\\{}{{{}}}", if negated { 'P' } else { 'p' }, body),
+        };
         Ok((text, j))
     }
 
@@ -505,7 +513,7 @@ impl Translator {
                 }
             }
             // `\p{..}`, `\P{..}`.
-            if self.c.len() - i > 2 && self.c[i] == '\\' && matches!(self.c[i + 1], 'p' | 'P') {
+            if self.c.len() - i > 1 && self.c[i] == '\\' && matches!(self.c[i + 1], 'p' | 'P') {
                 let (text, next) = self.unicode_class(i)?;
                 out.push_str(&text);
                 i = next;
@@ -604,7 +612,12 @@ impl Translator {
             self.fold_atom();
             self.levels.push(1);
             self.atom_need = 1;
-            self.out.push_str(&format!("(?P<{name}>"));
+            if name.starts_with(|ch: char| ch.is_ascii_digit()) || self.names.contains(&name) {
+                self.out.push('(');
+            } else {
+                self.out.push_str(&format!("(?P<{name}>"));
+                self.names.push(name);
+            }
             self.can_repeat = false;
             self.i = end + 1;
             return Ok(());
@@ -613,12 +626,16 @@ impl Translator {
         let mut j = start + 2;
         let mut negative = false;
         let mut saw_flag = false;
-        let mut flags = String::new();
+        // What each flag ends up as, in the order Go applies them: `(?i-i)` sets `i` and clears it
+        // again, which the crate refuses as a duplicate flag, so only the last word on each is
+        // written.
+        let mut state: Vec<(char, bool)> = Vec::new();
         while let Some(ch) = self.peek(j) {
             j += 1;
             match ch {
                 'i' | 'm' | 's' | 'U' => {
-                    flags.push(ch);
+                    state.retain(|&(flag, _)| flag != ch);
+                    state.push((ch, !negative));
                     saw_flag = true;
                 }
                 '-' => {
@@ -627,12 +644,20 @@ impl Translator {
                     }
                     negative = true;
                     saw_flag = false;
-                    flags.push('-');
                 }
                 ':' | ')' => {
                     if negative && !saw_flag {
                         break;
                     }
+                    let flags = {
+                        let on: String = state.iter().filter(|s| s.1).map(|s| s.0).collect();
+                        let off: String = state.iter().filter(|s| !s.1).map(|s| s.0).collect();
+                        match (on.is_empty(), off.is_empty()) {
+                            (_, true) => on,
+                            (true, false) => format!("-{off}"),
+                            (false, false) => format!("{on}-{off}"),
+                        }
+                    };
                     if ch == ':' {
                         self.flush_flags();
                         self.groups.push(self.out.len());
@@ -677,5 +702,269 @@ fn push_literal(out: &mut String, ch: char) {
         out.push(ch);
     } else {
         out.push_str(&format!("\\x{{{:X}}}", ch as u32));
+    }
+}
+
+/// Go's `canonicalName`: a leading uppercase letter, then lowercase, with `_`, `-` and spaces
+/// dropped.
+fn go_canonical_name(name: &str) -> String {
+    let mut out = String::new();
+    for ch in name.chars().filter(|&ch| !matches!(ch, '_' | '-' | ' ')) {
+        out.push(if out.is_empty() {
+            ch.to_ascii_uppercase()
+        } else {
+            ch.to_ascii_lowercase()
+        });
+    }
+    out
+}
+
+/// `unicodeTable` in `parse.go`: the crate's name for Go's `\p{name}`, and whether the set is
+/// inverted (`Assigned` is the inverse of `Cn`). Matched as the Go that built yq v4.53.3 does: the
+/// name is canonicalised, then looked up among the categories, the scripts whose name is its own
+/// canonical form (so `Old_Italic` and `SignWriting` are unreachable, as in yq) and the category
+/// aliases (`Letter`, `Cased_Letter`).
+fn go_unicode_table(name: &str) -> Option<(&'static str, bool)> {
+    let name = go_canonical_name(name);
+    match name.as_str() {
+        "Any" => return Some(("Any", false)),
+        "Assigned" => return Some(("Cn", true)),
+        "Ascii" => return Some(("ASCII", false)),
+        "Lc" => return Some(("LC", false)),
+        _ => {}
+    }
+    if let Some(found) = GO_CATEGORIES.iter().find(|&&c| c == name) {
+        return Some((found, false));
+    }
+    if let Some(found) = GO_SCRIPTS.iter().find(|&&c| c == name) {
+        return Some((found, false));
+    }
+    GO_CATEGORY_ALIASES
+        .iter()
+        .find(|&&(alias, _)| alias == name)
+        .map(|&(_, category)| (category, false))
+}
+
+/// `unicode.Categories` (`LC` is handled above as `Lc`).
+const GO_CATEGORIES: &[&str] = &[
+    "C", "Cc", "Cf", "Cn", "Co", "Cs", "L", "Ll", "Lm", "Lo", "Lt", "Lu", "M", "Mc", "Me", "Mn",
+    "N", "Nd", "Nl", "No", "P", "Pc", "Pd", "Pe", "Pf", "Pi", "Po", "Ps", "S", "Sc", "Sk", "Sm",
+    "So", "Z", "Zl", "Zp", "Zs",
+];
+
+/// The `unicode.Scripts` keys that are their own canonical name, less the four that need Unicode 16
+/// or 17 (Garay, Sidetic, Sunuwar, Todhri), which the Go that built yq does not have.
+const GO_SCRIPTS: &[&str] = &[
+    "Adlam",
+    "Ahom",
+    "Arabic",
+    "Armenian",
+    "Avestan",
+    "Balinese",
+    "Bamum",
+    "Batak",
+    "Bengali",
+    "Bhaiksuki",
+    "Bopomofo",
+    "Brahmi",
+    "Braille",
+    "Buginese",
+    "Buhid",
+    "Carian",
+    "Chakma",
+    "Cham",
+    "Cherokee",
+    "Chorasmian",
+    "Common",
+    "Coptic",
+    "Cuneiform",
+    "Cypriot",
+    "Cyrillic",
+    "Deseret",
+    "Devanagari",
+    "Dogra",
+    "Duployan",
+    "Elbasan",
+    "Elymaic",
+    "Ethiopic",
+    "Georgian",
+    "Glagolitic",
+    "Gothic",
+    "Grantha",
+    "Greek",
+    "Gujarati",
+    "Gurmukhi",
+    "Han",
+    "Hangul",
+    "Hanunoo",
+    "Hatran",
+    "Hebrew",
+    "Hiragana",
+    "Inherited",
+    "Javanese",
+    "Kaithi",
+    "Kannada",
+    "Katakana",
+    "Kawi",
+    "Kharoshthi",
+    "Khmer",
+    "Khojki",
+    "Khudawadi",
+    "Lao",
+    "Latin",
+    "Lepcha",
+    "Limbu",
+    "Lisu",
+    "Lycian",
+    "Lydian",
+    "Mahajani",
+    "Makasar",
+    "Malayalam",
+    "Mandaic",
+    "Manichaean",
+    "Marchen",
+    "Medefaidrin",
+    "Miao",
+    "Modi",
+    "Mongolian",
+    "Mro",
+    "Multani",
+    "Myanmar",
+    "Nabataean",
+    "Nandinagari",
+    "Newa",
+    "Nko",
+    "Nushu",
+    "Ogham",
+    "Oriya",
+    "Osage",
+    "Osmanya",
+    "Palmyrene",
+    "Phoenician",
+    "Rejang",
+    "Runic",
+    "Samaritan",
+    "Saurashtra",
+    "Sharada",
+    "Shavian",
+    "Siddham",
+    "Sinhala",
+    "Sogdian",
+    "Soyombo",
+    "Sundanese",
+    "Syriac",
+    "Tagalog",
+    "Tagbanwa",
+    "Takri",
+    "Tamil",
+    "Tangsa",
+    "Tangut",
+    "Telugu",
+    "Thaana",
+    "Thai",
+    "Tibetan",
+    "Tifinagh",
+    "Tirhuta",
+    "Toto",
+    "Ugaritic",
+    "Vai",
+    "Vithkuqi",
+    "Wancho",
+    "Yezidi",
+    "Yi",
+];
+
+/// `unicode.CategoryAliases`, by canonical name.
+const GO_CATEGORY_ALIASES: &[(&str, &str)] = &[
+    ("Casedletter", "LC"),
+    ("Closepunctuation", "Pe"),
+    ("Cntrl", "Cc"),
+    ("Combiningmark", "M"),
+    ("Connectorpunctuation", "Pc"),
+    ("Control", "Cc"),
+    ("Currencysymbol", "Sc"),
+    ("Dashpunctuation", "Pd"),
+    ("Decimalnumber", "Nd"),
+    ("Digit", "Nd"),
+    ("Enclosingmark", "Me"),
+    ("Finalpunctuation", "Pf"),
+    ("Format", "Cf"),
+    ("Initialpunctuation", "Pi"),
+    ("Letter", "L"),
+    ("Letternumber", "Nl"),
+    ("Lineseparator", "Zl"),
+    ("Lowercaseletter", "Ll"),
+    ("Mark", "M"),
+    ("Mathsymbol", "Sm"),
+    ("Modifierletter", "Lm"),
+    ("Modifiersymbol", "Sk"),
+    ("Nonspacingmark", "Mn"),
+    ("Number", "N"),
+    ("Openpunctuation", "Ps"),
+    ("Other", "C"),
+    ("Otherletter", "Lo"),
+    ("Othernumber", "No"),
+    ("Otherpunctuation", "Po"),
+    ("Othersymbol", "So"),
+    ("Paragraphseparator", "Zp"),
+    ("Privateuse", "Co"),
+    ("Punct", "P"),
+    ("Punctuation", "P"),
+    ("Separator", "Z"),
+    ("Spaceseparator", "Zs"),
+    ("Spacingmark", "Mc"),
+    ("Surrogate", "Cs"),
+    ("Symbol", "S"),
+    ("Titlecaseletter", "Lt"),
+    ("Unassigned", "Cn"),
+    ("Uppercaseletter", "Lu"),
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every name Go's table has must be one the crate understands, positive, negated and inside a
+    /// class, or `\p{Name}` would be accepted by Go and refused here (#5388).
+    #[test]
+    fn test_every_go_unicode_name_compiles_5388() {
+        let mut names: Vec<&str> = Vec::new();
+        names.extend(GO_CATEGORIES);
+        names.extend(GO_SCRIPTS);
+        names.extend(GO_CATEGORY_ALIASES.iter().map(|&(alias, _)| alias));
+        names.extend(["Any", "Assigned", "Ascii", "Lc"]);
+        for name in names {
+            for template in ["\\p{NAME}", "\\P{NAME}", "[\\p{NAME}]", "(?i)\\p{NAME}"] {
+                let pattern = template.replace("NAME", name);
+                let translated = translate(&pattern).unwrap_or_else(|e| panic!("{pattern}: {e}"));
+                regex::Regex::new(&translated)
+                    .unwrap_or_else(|e| panic!("{pattern} -> {translated}: {e}"));
+            }
+        }
+    }
+
+    /// A name that cannot be written for the crate becomes an unnamed group; the others keep theirs.
+    #[test]
+    fn test_unusable_group_names_become_unnamed_5388() {
+        let re =
+            regex::Regex::new(&translate("(?P<1a>a)(?P<n>b)(?P<n>c)(?<m>d)").unwrap()).unwrap();
+        let names: Vec<Option<&str>> = re.capture_names().collect();
+        assert_eq!(names, [None, None, Some("n"), None, Some("m")]);
+    }
+
+    /// `(?i-i)` is `i` set and then cleared, written once; `(?-ii)` clears it twice.
+    #[test]
+    fn test_flags_are_written_once_5388() {
+        for (pattern, text, want) in [
+            ("(?i-i)a", "A", false),
+            ("(?-ii)a", "A", false),
+            ("(?ii)a", "A", true),
+            ("(?i-s)a.", "A\n", false),
+            ("(?is-i)a.", "A\n", false),
+            ("(?i-i:a)a", "Aa", false),
+        ] {
+            let re = regex::Regex::new(&translate(pattern).unwrap()).unwrap();
+            assert_eq!(re.is_match(text), want, "{pattern:?} on {text:?}");
+        }
     }
 }
