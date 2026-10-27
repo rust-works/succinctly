@@ -90445,9 +90445,11 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
     #[allow(unused_variables, unused_assignments)]
     // STYLE-0004: weekday parsed from %w/%u then recomputed from the date (jq parity)
     let mut weekday: i64 = 0;
-    #[allow(unused_variables, unused_assignments)]
-    // STYLE-0004: yearday parsed from %j then recomputed from the date (jq parity)
-    let mut yearday: i64 = 0;
+    // #5383: `%j` (1-366), and whether a year was read and whether anything set the month or day,
+    // which decide at the end whether the libc derives the month and day from it.
+    let mut day_of_year: Option<i64> = None;
+    let mut year_read = false;
+    let mut date_read = false;
 
     let mut input_iter = input.chars().peekable();
     let mut fmt_iter = fmt.chars().peekable();
@@ -90462,18 +90464,23 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                 }
                 Some('Y') => {
                     year = parse_digits(&mut input_iter, 4)?;
+                    year_read = true;
                 }
                 Some('y') => {
                     let y = parse_digits(&mut input_iter, 2)?;
                     year = if y >= 69 { 1900 + y } else { 2000 + y };
+                    year_read = true;
                 }
                 Some('m') => {
                     month = parse_digits(&mut input_iter, 2)?;
+                    date_read = true;
                 }
                 Some('d') => {
                     day = parse_digits(&mut input_iter, 2)?;
+                    date_read = true;
                 }
                 Some('e') => {
+                    date_read = true;
                     // Skip leading space if present
                     if input_iter.peek() == Some(&' ') {
                         input_iter.next();
@@ -90524,6 +90531,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                     year = t.year;
                     month = t.month;
                     day = t.day;
+                    date_read = true;
                     hour = t.hour;
                     minute = t.minute;
                     second = t.second;
@@ -90551,11 +90559,15 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                         hour = 0;
                     }
                 }
-                #[allow(unused_assignments)]
-                // STYLE-0004: assignment superseded once the date is recomputed (jq parity)
                 Some('j') => {
-                    // Parse day-of-year, but we recalculate it from the date for consistency
-                    yearday = parse_digits(&mut input_iter, 3)? - 1; // Convert to 0-indexed
+                    // #5383: the libc rejects day 0 and 367+ outright; the yearday printed is
+                    // recomputed from the date, which this day of year only sets (below) when a
+                    // year was read and nothing set the month or day.
+                    let yd = parse_digits(&mut input_iter, 3)?;
+                    if !(1..=366).contains(&yd) {
+                        return Err(format!("day of year {yd} out of range"));
+                    }
+                    day_of_year = Some(yd);
                 }
                 #[allow(unused_assignments)]
                 // STYLE-0004: assignment superseded once the date is recomputed (jq parity)
@@ -90590,6 +90602,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                             break;
                         }
                     }
+                    date_read = true;
                     let name_lower = name.to_lowercase();
                     let months = [
                         "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct",
@@ -90611,9 +90624,11 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                 Some('C') => {
                     let century = parse_digits(&mut input_iter, 2)?;
                     year = century * 100 + (year % 100);
+                    year_read = true;
                 }
                 Some('D') => {
                     // mm/dd/yy
+                    date_read = true;
                     month = parse_digits(&mut input_iter, 2)?;
                     if input_iter.next() != Some('/') {
                         return Err("expected '/'".to_string());
@@ -90627,6 +90642,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                 }
                 Some('F') => {
                     // yyyy-mm-dd
+                    date_read = true;
                     year = parse_digits(&mut input_iter, 4)?;
                     if input_iter.next() != Some('-') {
                         return Err("expected '-'".to_string());
@@ -90736,6 +90752,34 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
         return Err("trailing input".to_string());
     }
     let remainder: String = input_iter.collect();
+
+    // #5383: with a year read and no month or day, the libc derives them from `%j`
+    // (`"2015 060" | strptime("%Y %j")` is `[2015,2,1,0,0,0,0,59]`), a day past the end of the
+    // year rolling into the next (`"2015 366"` is 2016-01-01). A month or day read next to `%j`
+    // is order- and platform-dependent in the libc (some rows abort jq) and stays as read.
+    if let (Some(mut yd), true, false) = (day_of_year, year_read, date_read) {
+        let days_in_year = if yearday_for_civil(year, 12, 31) == 365 {
+            366
+        } else {
+            365
+        };
+        if yd > days_in_year {
+            yd -= days_in_year;
+            year += 1;
+        }
+        let leap = yearday_for_civil(year, 12, 31) == 365;
+        let month_start: [i64; 12] = if leap {
+            [0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335]
+        } else {
+            [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+        };
+        let idx = month_start
+            .iter()
+            .rposition(|&start| start < yd)
+            .unwrap_or(0);
+        month = idx as i64 + 1;
+        day = yd - month_start[idx];
+    }
 
     // `%m`/`%d`/`%e`/`%D`/`%F` parse up to 2 digits with no range check of
     // their own (`parse_digits` just accepts `00`-`99`), so an out-of-range
