@@ -9813,8 +9813,9 @@ The year, month and day are the same on every libc, and so is every format that 
 The weekday and yearday of a format that sets no date are the platform libc's in jq, which succinctly does not call.
 glibc leaves jq's sentinels `8` and `367` (`[1900,0,0,10,15,0,8,367]`), and the macOS pin computes them from `mday = 0` with the 1900 weekday error jq's own comment admits (`[1900,0,0,10,15,0,6,-1]`, and weekday `0` for `"15" | strptime("%d")`, where 15 Jan 1900 was a Monday).
 succinctly answers the date's own weekday and yearday (`[1900,0,0,10,15,0,0,-1]`, `[1900,0,15,0,0,0,1,14]`), which matches neither libc on those rows and the macOS pin on every row that sets a date.
-`%j` is read and discarded, as before: succinctly keeps the month and day the format set, where the pin's libc derives them from the day of year once a year was read (`"2015 060" | strptime("%Y %j")` is `[2015,2,1,0,0,0,0,59]` there, `[2015,0,0,0,0,0,3,-1]` here), rejects day 0 and 367, and aborts with `Assertion failed: (yday == tm->tm_yday || tm->tm_yday == 367)` in `set_tm_yday` when no year was read (`"060" | strptime("%j")`), so there is no answer to match for that row.
-The `%j` rows are tracked in #5383.
+`%j` with a year read (`%Y`, `%y`, `%C`) and nothing that sets the month or day derives them from the day of year, as the pin's libc does (#5383): `"2015 060" | strptime("%Y %j")` is `[2015,2,1,0,0,0,0,59]`, `"2015 366"` rolls into `[2016,0,1,...]`, and day 0 and 367 are refused.
+`%j` next to a month or day (`%m`, `%d`, `%e`, `%b`, `%D`, `%F`) or with no year is order-dependent in the pin's libc and aborts jq on several rows (`Assertion failed: (yday == tm->tm_yday || tm->tm_yday == 367)` in `set_tm_yday`, e.g. `"060" | strptime("%j")`), so there is no answer to match; succinctly keeps the month and day as read and recomputes the yearday from them.
+glibc's `%j` was not captured.
 
 ### `truncate_stream` with a `NaN` depth slices from 0 (#4971)
 
