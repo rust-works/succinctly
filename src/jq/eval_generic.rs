@@ -55,6 +55,7 @@ use super::document::{
     LazyKeyLedger,
 };
 use super::error::EvalEscape;
+use super::eval::LoopAbort;
 use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, binary_fanout_rules, bind_def, bind_def_call,
     boolean_fanout_bools, boolean_fanout_each, bound_shape, by_key_scope,
@@ -18284,8 +18285,8 @@ impl LoopKind {
 /// empty end;`), so a multi-output `cond` forks the rest of the loop per
 /// output (#534), each branch of a multi-output `update` runs to its own end
 /// before the next starts, the single-output step loops in place so an
-/// ordinary loop costs no stack depth, and one [`WHILE_UNTIL_MAX_STEPS`]
-/// budget is shared across the whole tree (#2087). Outputs stream to `sink`
+/// ordinary loop costs no stack depth, and one [`crate::jq::eval::LoopCounters`]
+/// budget is shared across the whole tree (#2087, #5292). Outputs stream to `sink`
 /// as each branch decides them rather than collecting into a `Vec`, which
 /// is the same order the eager `outputs.push` produces; a downstream
 /// `Demand::Stop` (`first(while(true; . + 1))`) unwinds the tree at once,
@@ -18326,7 +18327,7 @@ fn each_loop_generic<S: EvalSemantics, V: DocumentValue>(
         stream: crate::jq::eval::loop_stream_budget(update),
         cond_stream: crate::jq::eval::loop_stream_budget(cond),
     };
-    match loop_step_generic::<S, V>(spec, state, &mut counters.root(), sink) {
+    match loop_step_generic::<S, V>(spec, state, &mut counters.budget(), sink) {
         Ok(Demand::Continue) => Flow::Exhausted,
         Ok(Demand::Stop) => Flow::Stopped { pending: None },
         Err(Control::Error(e)) if suppresses(&e, optional) => Flow::Exhausted,
@@ -18346,23 +18347,6 @@ struct LoopSpec<'e> {
     optional: bool,
     stream: Option<crate::jq::eval::RecurseNativeBudget>,
     cond_stream: Option<crate::jq::eval::RecurseNativeBudget>,
-}
-
-/// Why one branch of a streamed operand's subtree ended early (#3503, #3617), the
-/// [`StashedVerdict`] payload of [`stream_loop_branches`].
-enum LoopAbort {
-    /// The sink answered [`Demand::Stop`].
-    Stopped,
-    /// A later round raised.
-    Escaped(Control),
-}
-
-/// A `halt` or a decode failure is never retried past, whichever way it got
-/// here; a stop is retried past exactly as an escaping `break` is.
-impl crate::jq::eval::Nonretryable for LoopAbort {
-    fn is_nonretryable(&self) -> bool {
-        matches!(self, Self::Escaped(control) if control.is_nonretryable())
-    }
 }
 
 /// One branch of [`each_loop_generic`]'s tree -- `until_step`/`while_step`
@@ -18441,8 +18425,12 @@ fn loop_step_generic<S: EvalSemantics, V: DocumentValue>(
                 continue;
             }
             for next_state in next {
-                if loop_step_generic::<S, V>(spec, next_state, &mut budget.fork(), sink)?
-                    == Demand::Stop
+                if loop_step_generic::<S, V>(
+                    spec,
+                    next_state,
+                    &mut budget.fork(kind.name())?,
+                    sink,
+                )? == Demand::Stop
                 {
                     return Ok(Demand::Stop);
                 }
@@ -18451,9 +18439,7 @@ fn loop_step_generic<S: EvalSemantics, V: DocumentValue>(
         }
 
         for bit in bits {
-            if loop_decided_generic::<S, V>(spec, &state, bit, &mut budget.fork(), sink)?
-                == Demand::Stop
-            {
+            if loop_decided_generic::<S, V>(spec, &state, bit, budget, sink)? == Demand::Stop {
                 return Ok(Demand::Stop);
             }
         }
@@ -18491,7 +18477,9 @@ fn loop_decided_generic<S: EvalSemantics, V: DocumentValue>(
     }
     let (next, update_control) = state.fork::<S>(spec.update, spec.optional);
     for next_state in next {
-        if loop_step_generic::<S, V>(spec, next_state, &mut budget.fork(), sink)? == Demand::Stop {
+        if loop_step_generic::<S, V>(spec, next_state, &mut budget.fork(spec.kind.name())?, sink)?
+            == Demand::Stop
+        {
             return Ok(Demand::Stop);
         }
     }
@@ -18520,7 +18508,7 @@ fn loop_update_streaming<S: EvalSemantics, V: DocumentValue>(
         |each_sink| state.each::<S>(spec.update, spec.optional, each_sink),
         &mut |item| {
             let next = LoopState::<V>::from_item::<S>(item)?;
-            let mut branch = budget.fork();
+            let mut branch = budget.fork(spec.kind.name())?;
             loop_step_generic::<S, V>(spec, next, &mut branch, sink)
         },
     )
@@ -18540,8 +18528,7 @@ fn loop_cond_streaming<S: EvalSemantics, V: DocumentValue>(
         |each_sink| state.each::<S>(spec.cond, spec.optional, each_sink),
         &mut |item| {
             let bit = generic_item_truthiness::<_, S>(item)?;
-            let mut branch = budget.fork();
-            loop_decided_generic::<S, V>(spec, state, bit, &mut branch, sink)
+            loop_decided_generic::<S, V>(spec, state, bit, budget, sink)
         },
     )
 }

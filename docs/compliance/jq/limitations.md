@@ -1432,10 +1432,10 @@ costs no stack depth. What it leaves:
   operand that *is* a `?//` bind is covered, and one wrapped in an `if`, `first` or a pipe keeps
   the previous answer when the retry produces nothing or raises (a retry that produces a value
   is recognised).
-- **On the owned route `first(while(...))` runs one `update` past the consumer's stop** (an `A`
-  on stderr where jq prints none), with or without a `?//`, and `first(until(...))` over a `?//`
-  `cond` does not see the second output jq delivers when the retry follows `first`'s stop: the
-  loop is collected eagerly there.
+- **On the owned route a loop holding a `?//` is collected eagerly**, so `first(until(...))` over a
+  `?//` `cond` does not see the second output jq delivers when the retry follows `first`'s stop,
+  and `first(while(...))` runs one `update` past the consumer's stop (an `A` on stderr where jq
+  prints none). A loop without one streams to its consumer since #5292.
 
 ## A fused slice read does not validate the rest of the range (#4195)
 
@@ -10563,11 +10563,15 @@ state's top-level container once per round.
 
 > The budget's raise is uncatchable by `?`/`try`/`catch` since #2132 -- see "Every resource cap is uncatchable" below.
 
-> Since #5292 `WHILE_UNTIL_MAX_STEPS` (`100000`) bounds fan-out and recursion, not length.
-> A round whose `cond` and `update` each answer once steps in place, as the loops always have, and is charged only against `MAX_LOOP_ROUNDS` (2^24 = 16,777,216 rounds for the whole call): `0 | until(. >= 300000; . + 1)` and `[0 | while(. < 300000; . + 1)] | length` answer as jq does.
-> A round that forks (a `cond` or `update` that answers more or fewer than once, or an operand driven through a live sink for a `?//`) starts branches that nest a native frame each, and every round of such a branch is charged against `WHILE_UNTIL_MAX_STEPS` as well, so `until(false; ., .)` and `until(. > 40; .+1, .+2)` still raise after about 100,000 rounds.
+> Since #5292 `WHILE_UNTIL_MAX_STEPS` (`100000`) bounds forks, not length.
+> A round whose `cond` and `update` each answer once steps in place, as the loops always have, nests no native frame, and is charged only against `MAX_LOOP_ROUNDS` (2^24 = 16,777,216 rounds for the whole call): `0 | until(. >= 300000; . + 1)` and `[0 | while(. < 300000; . + 1)] | length` answer as jq does, on every route.
+> A fork (a `cond` or `update` that answers more or fewer than once, a trailing error that makes a round answer once and then raise, or an operand driven through a live sink for a `?//`) starts branches that nest a native frame or a work item each, and entering each one is charged once against `WHILE_UNTIL_MAX_STEPS`, so `until(false; ., .)` and `until(. > 40; .+1, .+2)` still raise after about 100,000 forks; the rounds inside a branch count as any others, so a loop that forks once and then runs long is as long as it is (`[0 | until(. >= 300000; if . == 0 then (1, 2) else .+1 end)]` is `[300000,300000]`, as in jq).
+> A fork is also refused once the thread's native stack is half spent (ADR-0025), since the fork budget is per call and loops in a pipe add their depths.
 > `LoopCounters`/`LoopBudget` (`src/jq/eval.rs`) carry this in the value, generic and path-interpreter evaluators.
-> The round cap replaces the step cap for the loops jq spins in: `0 | until(false; . + 1)` raises `until: maximum iterations exceeded` after a few seconds where jq never returns, and `[0 | while(true; . + 1)]` raises at 16,777,216 collected values (about 1 GiB) where jq grows until it is killed.
+> One ceiling is not jq's, and is a divergence (ADR-0018 rule 4c): a loop longer than `MAX_LOOP_ROUNDS` rounds raises `until: maximum iterations exceeded` (`0 | until(. >= 20000000; . + 1)` answers in jq after a few seconds), which is also what a loop that never ends meets, a few seconds in where jq never returns.
+> It is a count, not a time or memory bound: a body whose cost grows with the round (`until(false; [.[0]+1, .[1] + "x"])`) is not bounded in practice, as in jq, and `[while(true; .a += 1)]` over an object holds every state until the count is reached (about 0.5 GiB for numbers, several GiB for objects), where jq grows until it is killed.
+> `first`, `limit`, `any`, `isempty` and `label`/`break` over a `while` or `until` take the state they stop at and run no further round, on every route (the value evaluator's `eval_each` has a streaming arm, `each_loop`; an operand holding a `?//` keeps the eager arm, below).
+> Where a `cond` or `update` answers more than once, every output of a round is still collected before the first branch is entered, so the later outputs' side effects run before a consumer's stop (`first(0 | until(. > 0; (.+1), ("x" | debug)))` writes a `DEBUG` line jq does not); that is a divergence that predates #5292.
 > The rest of this section is written for the flat 100,000-state cap, and its transcripts show it.
 
 `WHILE_UNTIL_MAX_STEPS` (`src/jq/eval.rs`) is a shared step budget for
@@ -10844,7 +10848,7 @@ this is a genuine, if narrower, instance of the same divergence. (At the
 ### Every resource cap is uncatchable by `?`/`try`/`catch` (#2132) -- shared by the six cap sections
 
 The six evaluator-imposed caps documented in this file -- `range`'s `MAX_RANGE_TOTAL` (#2089, #5292, above; the `MAX_RANGE` of a non-numeric one),
-`while`/`until`'s `WHILE_UNTIL_MAX_STEPS` (#534/#2087), `reduce`/`foreach`'s
+`while`/`until`'s `MAX_LOOP_ROUNDS` and `WHILE_UNTIL_MAX_STEPS` (#534/#2087/#5292), `reduce`/`foreach`'s
 `REDUCE_FOREACH_MAX_STEPS` (#695/#2079), `repeat`'s `MAX_ITERATIONS` (#2014), `recurse(f)`'s
 `RECURSE_MAX_ITEMS` (#3716, which ended the walk silently until then), and a recursive
 `def` past `MAX_EVAL_FRAMES` (#1371) -- raise as `ErrorKind::ResourceLimit`
