@@ -53,23 +53,19 @@ impl Terminator {
         }
     }
 
-    /// Write this terminator to an `io::Write` sink. `write_all(b"\n")`
-    /// rather than `writeln!(writer)` for the newline case -- this is
+    /// Write this terminator to an `io::Write` sink. `write_all` rather
+    /// than `writeln!(writer)` for the newline case -- this is
     /// jq_runner.rs's own default-output-path terminator write, not just
     /// yq's occasional doc-separator one, so it keeps the exact zero-
     /// formatting-overhead shape jq_runner.rs used before this hoist
     /// rather than detouring through `fmt::Arguments` machinery on every
     /// value.
     pub fn write_io<W: std::io::Write>(self, writer: &mut W) -> std::io::Result<()> {
-        match self {
-            Self::Nul => writer.write_all(&[0]),
-            Self::Newline => writer.write_all(b"\n"),
-            Self::None => Ok(()),
-        }
+        writer.write_all(self.as_str().as_bytes())
     }
 
-    /// This terminator's text, for a caller that feeds it to a colorizer
-    /// rather than writing it (yq's streamed `--colors -o=json`, #808).
+    /// This terminator's text: what the two writers below write, and what
+    /// yq's streamed `--colors -o=json` feeds its colorizer (#808).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Nul => "\0",
@@ -83,11 +79,7 @@ impl Terminator {
     /// process's own `io::Write` sink directly (yq's M2 fast path's
     /// per-result callbacks, at the time of writing).
     pub fn write_fmt<W: core::fmt::Write>(self, writer: &mut W) -> core::fmt::Result {
-        match self {
-            Self::Nul => writer.write_char('\0'),
-            Self::Newline => writer.write_char('\n'),
-            Self::None => Ok(()),
-        }
+        writer.write_str(self.as_str())
     }
 }
 
