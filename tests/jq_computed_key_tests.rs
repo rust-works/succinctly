@@ -1424,7 +1424,7 @@ fn test_write_clobber_through_a_static_optional_comma_raises_instead_of_swallowi
 /// Since #490/#570, `builtin_recurse_f` (the value evaluator, used by bare
 /// `[recurse(.a?)]`) queues a null child like any other value instead of
 /// filtering it out, so it is no longer bounded by pruning — it runs to its
-/// own 10,000-node `RECURSE_MAX_ITEMS` cap, which raises (#3716; it ended the
+/// own 2^20-node `RECURSE_MAX_ITEMS` cap, which raises (#3716; it ended the
 /// walk silently and answered the root followed by 9,999 nulls before).
 /// `resolve_recurse_sink` (the path-tracking evaluator behind
 /// `path(recurse(f) | ...)`) still has to prune the null child instead: its

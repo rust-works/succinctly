@@ -1518,9 +1518,15 @@ fn loops_run_in_constant_stack_and_in_jqs_order_5223() {
                 "[recurse(if . < 9999 then . + 1 else empty end)] | length",
                 ok(&["10000"]),
             ),
+            // #5378: the cap is 2^20 nodes, so 50,001 answers as jq's does.
             (
                 "0",
                 "[recurse(if . < 50000 then . + 1 else empty end)] | length",
+                ok(&["50001"]),
+            ),
+            (
+                "0",
+                "[recurse(if . < 1100000 then . + 1 else empty end)] | length",
                 err(&[], "recurse: maximum nodes exceeded"),
             ),
             (

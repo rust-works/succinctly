@@ -68599,7 +68599,64 @@ fn eval_recurse_cond<S: EvalSemantics>(
 /// It used to end the walk as though it had finished, which answered a finite
 /// walk over a larger document silently short and left a write through it
 /// silently partial.
-pub(crate) const RECURSE_MAX_ITEMS: usize = 10000;
+pub(crate) const RECURSE_MAX_ITEMS: usize = 1 << 20;
+
+/// [`RECURSE_MAX_ITEMS`], or what a test asked for instead
+/// ([`recurse_cap_override`]): a walk past 2^20 nodes is seconds long in a debug
+/// build, which is too slow for the dozens of rows that pin how the cap behaves.
+#[inline]
+pub(crate) fn recurse_max_items() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = recurse_cap_override::get() {
+        return cap;
+    }
+    RECURSE_MAX_ITEMS
+}
+
+/// Test-only override of [`recurse_max_items`], so a row that pins the cap's
+/// behaviour can use a document of a few thousand nodes (#5378).
+#[cfg(test)]
+pub(crate) mod recurse_cap_override {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static CAP: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn get() -> Option<usize> {
+        CAP.with(Cell::get)
+    }
+
+    /// Holds the cap at `cap` on this thread until it is dropped.
+    pub(crate) struct Scoped(Option<usize>);
+
+    pub(crate) fn scoped(cap: usize) -> Scoped {
+        Scoped(CAP.with(|c| c.replace(Some(cap))))
+    }
+
+    impl Drop for Scoped {
+        fn drop(&mut self) {
+            CAP.with(|c| c.set(self.0));
+        }
+    }
+}
+
+/// Path components that cost a path-position `recurse` walk one more node of
+/// its [`RECURSE_MAX_ITEMS`] cap.
+///
+/// A node of a path walk is as big as its path: `null | [path(recurse(.a))]`
+/// holds `n` paths of up to `n` keys, so a count of nodes alone bounds nothing
+/// once the cap is 2^20 (4 GB in two seconds, where the old 10,000 held about
+/// 50 million keys). [`recurse_node_cost`] charges a node `1 + depth / 64`,
+/// which keeps the cap an exact node count for any path under 64 keys and
+/// holds the keys a capped walk delivers to about 2^26, as before.
+pub(crate) const RECURSE_PATH_KEYS_PER_NODE: usize = 64;
+
+/// What delivering a node at `path_depth` costs a capped path-position
+/// `recurse` walk ([`RECURSE_PATH_KEYS_PER_NODE`]).
+pub(crate) const fn recurse_node_cost(path_depth: usize) -> usize {
+    1 + path_depth / RECURSE_PATH_KEYS_PER_NODE
+}
 
 /// Whether `recurse(f)` / `recurse(f; cond)` is bare `recurse` (#3703).
 ///
@@ -68711,7 +68768,7 @@ fn recurse_item_cap(f: &Expr) -> usize {
     if is_tree_descending_f(f) {
         usize::MAX
     } else {
-        RECURSE_MAX_ITEMS
+        recurse_max_items()
     }
 }
 
@@ -69476,7 +69533,7 @@ impl<S: EvalSemantics> ValueRecurseWalk<'_, '_, '_, S> {
     /// with ([`is_tree_descending_f`]) is [`RECURSE_MAX_ITEMS`] again, counting
     /// the nodes already delivered.
     fn forked(&mut self) {
-        self.cap = RECURSE_MAX_ITEMS;
+        self.cap = recurse_max_items();
     }
 
     /// Visit the subtree below an already-delivered `node` with an explicit
@@ -69807,7 +69864,7 @@ impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
         if self.emitted >= self.cap {
             return Some(recurse_cap_abort());
         }
-        self.emitted += 1;
+        self.emitted += recurse_node_cost(node.path.depth());
         if (self.sink)(Self::delivered(&node)) == Demand::Stop {
             return Some(RecurseAbort::Stopped(None));
         }
@@ -69920,7 +69977,7 @@ impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
     /// ([`is_tree_descending_f`]) is [`RECURSE_MAX_ITEMS`] again --
     /// [`ValueRecurseWalk::forked`]'s path-mode twin.
     fn forked(&mut self) {
-        self.cap = RECURSE_MAX_ITEMS;
+        self.cap = recurse_max_items();
     }
 
     /// The branch the sink sees for a visited `node`.
@@ -69958,7 +70015,7 @@ impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
 
         while !stack.is_empty() && self.emitted < self.cap {
             let current = stack.pop().expect("loop condition checked non-empty");
-            self.emitted += 1;
+            self.emitted += recurse_node_cost(current.path.depth());
             if (self.sink)(Self::delivered(&current)) == Demand::Stop {
                 return Some(RecurseAbort::Stopped(pending_error));
             }
@@ -141075,6 +141132,8 @@ mod tests {
 
     #[test]
     fn test_recurse_f_max_items_cap_replaces_a_pending_error_842() {
+        // Pins the cap's behaviour on a 10,000-node walk, not the 2^20-node one (#5378).
+        let _cap = recurse_cap_override::scoped(10_000);
         // Review of #842's fix: a `pending_error` deferred past `MAX_ITEMS`
         // items must not surface just because of where the (internal,
         // non-jq-semantic) 10000-item safety cap happened to land relative
@@ -141106,6 +141165,8 @@ mod tests {
     #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_resolve_recurse_sink_max_items_cap_replaces_a_pending_error_842() {
+        // Pins the cap's behaviour on a 10,000-node walk, not the 2^20-node one (#5378).
+        let _cap = recurse_cap_override::scoped(10_000);
         // Path-position sibling of the previous test: `resolve_recurse_sink`'s
         // own `stack.is_empty()` check (its `else` branch, hit only when
         // the cap stops the drain before a `pending_error` would otherwise
@@ -141144,6 +141205,8 @@ mod tests {
     #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_recurse_family_max_items_gate_agrees_across_value_and_path_position_1023() {
+        // Pins the cap's behaviour on a 10,000-node walk, not the 2^20-node one (#5378).
+        let _cap = recurse_cap_override::scoped(10_000);
         let large_doc = format!(
             r#"{{"items":[{}],"bad":5}}"#,
             (0..15000)
@@ -141389,6 +141452,8 @@ mod tests {
 
     #[test]
     fn test_recurse_cond_max_items_cap_replaces_a_pending_error_854() {
+        // Pins the cap's behaviour on a 10,000-node walk, not the 2^20-node one (#5378).
+        let _cap = recurse_cap_override::scoped(10_000);
         // Review of #842's fix, now exercised via `cond`'s own deferred
         // error rather than `f`'s: a `pending_error` sourced from `cond`
         // and deferred past `MAX_ITEMS` items must not surface just because
@@ -141454,6 +141519,73 @@ mod tests {
             ),
             (vec!["3".to_string()], String::new())
         );
+    }
+
+    /// #5378: past the native stack budget both walkers fall back to an explicit
+    /// stack that checks the cap itself. A chain 300 levels deep ending in a
+    /// 10,001-element array meets a 10,000-node cap in the queued part, in the
+    /// value walker, the path walker and a write through it; the same chain with
+    /// 9,000 elements (9,301 nodes) is under it. Both are run fully native and
+    /// fully queued.
+    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
+    #[test]
+    fn recurse_cap_in_the_queued_walk_5378() {
+        let _cap = recurse_cap_override::scoped(10_000);
+        for levels in [0, u32::MAX] {
+            for walk in [
+                "[recurse(.[]? | .; true)] | length",
+                "[path(recurse(.[]? | .; true))] | length",
+                r#"(recurse(.[]? | .; true) | select(type == "number")) |= . + 1"#,
+            ] {
+                let filter = format!("reduce range(300) as $i ([range(10001)]; [.]) | {walk}");
+                let (values, end) = recurse_native_levels_override::with(levels, || {
+                    outputs_and_end(b"null", &filter)
+                });
+                assert!(values.is_empty(), "`{filter}` ({levels}): {values:?}");
+                assert!(
+                    end.contains("maximum nodes exceeded"),
+                    "`{filter}` ({levels}): {end}"
+                );
+            }
+            let under =
+                "reduce range(300) as $i ([range(9000)]; [.]) | [recurse(.[]? | .; true)] | length";
+            assert_eq!(
+                recurse_native_levels_override::with(levels, || outputs_and_end(b"null", under)),
+                (vec!["9301".to_string()], String::new()),
+                "({levels} native levels)"
+            );
+        }
+    }
+
+    /// #5378: a node of a capped path-position walk costs `1 + depth / 64` of
+    /// the cap, so a path that grows with the walk (`null | recurse(.a)`) cannot
+    /// hold more than about 2^26 keys however large the cap is, and a path under
+    /// 64 keys is counted node for node.
+    #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
+    #[test]
+    fn recurse_node_cost_charges_a_long_path_5378() {
+        assert_eq!(recurse_node_cost(0), 1);
+        assert_eq!(recurse_node_cost(63), 1);
+        assert_eq!(recurse_node_cost(64), 2);
+        assert_eq!(recurse_node_cost(640), 11);
+        let _cap = recurse_cap_override::scoped(1000);
+        let (mut spent, mut delivered) = (0_usize, 0_usize);
+        while spent < 1000 {
+            spent += recurse_node_cost(delivered);
+            delivered += 1;
+        }
+        for levels in [0, u32::MAX] {
+            let (values, end) = recurse_native_levels_override::with(levels, || {
+                outputs_and_end(br#"{"a":null}"#, "path(recurse(.a?; true)) | length")
+            });
+            assert_eq!(values.len(), delivered, "({levels} native levels)");
+            assert_eq!(
+                values.last().cloned(),
+                Some((delivered - 1).to_string()),
+                "({levels} native levels)"
+            );
+            assert!(end.contains("maximum nodes exceeded"), "{end}");
+        }
     }
 
     /// #3867: a finite walk over more than [`RECURSE_MAX_ITEMS`] nodes is answered
@@ -141572,6 +141704,8 @@ mod tests {
     #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn recurse_cap_lifts_until_a_cond_forks_3867() {
+        // Pins the cap's behaviour on a 10,000-node walk, not the 2^20-node one (#5378).
+        let _cap = recurse_cap_override::scoped(10_000);
         let early = format!("[{}]", vec!["[0]"; 6000].join(","));
         let late = format!("[{},[7]]", vec!["[0]"; 6000].join(","));
         for (doc, cond) in [
@@ -141635,6 +141769,8 @@ mod tests {
     #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
     #[test]
     fn test_resolve_recurse_cond_max_items_cap_replaces_a_pending_error_854() {
+        // Pins the cap's behaviour on a 10,000-node walk, not the 2^20-node one (#5378).
+        let _cap = recurse_cap_override::scoped(10_000);
         // Path-position sibling of the previous test: `resolve_recurse_sink`'s
         // own `stack.is_empty()` check needs the same coverage when the
         // deferred error is sourced from `cond` rather than `f`.
