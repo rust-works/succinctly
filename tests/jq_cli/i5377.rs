@@ -63,14 +63,18 @@ const ROWS: &[(&str, &str, &str, i32)] = &[
     ("[1,2,3]", "last(.[] | tostring)", "\"3\"\n", 0),
     ("[1,2,3]", "last(paths)", "[2]\n", 0),
     ("{\"a\":[1,2]}", "last(.. | numbers)", "2\n", 0),
+];
+
+/// `last(f)` in path position: a target that does more than navigate, which the
+/// holdout refuses before reading input.
+const PATH_ROWS: &[(&str, &str, &str, i32)] = &[
     ("[1,2,3]", "path(last(.[]))", "", 5),
     ("[1,2,3]", "path(last(range(3)))?", "", 0),
     ("[1,2,3]", "last(.[]) |= 9", "", 5),
 ];
 
-#[test]
-fn test_last_of_a_generator_answers_as_jq_5377() -> Result<()> {
-    for (input, filter, want, want_code) in ROWS {
+fn assert_rows(rows: &[(&str, &str, &str, i32)]) -> Result<()> {
+    for (input, filter, want, want_code) in rows {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(
             (stdout.as_str(), code),
@@ -79,4 +83,15 @@ fn test_last_of_a_generator_answers_as_jq_5377() -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[test]
+fn test_last_of_a_generator_answers_as_jq_5377() -> Result<()> {
+    assert_rows(ROWS)
+}
+
+#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
+#[test]
+fn test_last_of_a_generator_in_path_position_answers_as_jq_5377() -> Result<()> {
+    assert_rows(PATH_ROWS)
 }

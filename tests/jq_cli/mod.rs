@@ -173,6 +173,6 @@ mod i5363;
 mod i5364;
 mod i5367;
 mod i5373;
+mod i5377;
 mod i5383;
 mod i5390;
-mod i5377;
