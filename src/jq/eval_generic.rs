@@ -20993,8 +20993,8 @@ const MAX_CURSOR_INTERPOLATION_PARTS: usize = 64;
 /// without copying the ambient value. Any other slot -- a call, `..`, `del(.x)`, `tojson`, a
 /// recursion through `\(f(n-1))`, a position read such as `key`, an `inputs` -- keeps the owned
 /// bridge, which evaluates the whole interpolation against one copy of the ambient value. The
-/// walk is bounded by the slot's own text and never enters a nested interpolation, so it cannot
-/// compound with nesting depth.
+/// walk is bounded by the slot's own text (the parser caps expression nesting at 256) and never
+/// enters a nested interpolation, so it cannot compound with nesting depth.
 fn interpolation_reads_by_navigation(parts: &[StringPart]) -> bool {
     fn navigation(expr: &Expr) -> bool {
         match expr {

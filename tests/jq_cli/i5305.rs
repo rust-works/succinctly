@@ -132,7 +132,9 @@ fn test_interpolation_raises_when_a_slot_reads_the_malformed_field_5305() -> Res
     Ok(())
 }
 
-/// An interpolation with a slot that is not plain navigation keeps the owned copy, so it still
+/// A snapshot of the current limitation, not a contract: extending the cursor path to more slot
+/// kinds should update these rows. An interpolation with a slot that is not plain navigation keeps
+/// the owned copy, so it still
 /// decodes the whole ambient value first (the verdict of a string depends on how it is spelled,
 /// `docs/compliance/jq/limitations.md`), and a slot that reads a position keeps its answer.
 #[test]
@@ -172,6 +174,28 @@ fn test_interpolation_of_inputs_leaves_the_rest_of_the_queue_5305() -> Result<()
         (out.as_str(), code),
         ("\"1\"\n1\n[2,3]\n", 0),
         "stderr: {stderr}"
+    );
+    Ok(())
+}
+
+/// The cursor path covers at most 64 parts; a longer interpolation keeps the owned copy.
+#[test]
+fn test_interpolation_cursor_path_stops_after_sixty_four_parts_5305() -> Result<()> {
+    let doc = r#"{"name":"a","bad":tru}"#;
+    let program = |slots: usize| format!("\"{}\"", r#"\(.name)"#.repeat(slots));
+    let (out, code) = run_jq_stdin(&program(64), doc, &["-c"])?;
+    assert_eq!(
+        (out.as_str(), code),
+        (format!("\"{}\"\n", "a".repeat(64)).as_str(), 0)
+    );
+    assert_jq_raises(
+        "5305",
+        "65 parts",
+        &["-c"],
+        &program(65),
+        doc,
+        5,
+        "invalid boolean",
     );
     Ok(())
 }
