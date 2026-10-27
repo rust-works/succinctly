@@ -68,3 +68,26 @@ fn test_a_getter_after_a_settled_stage_keeps_the_nodes_position_5379() -> Result
     }
     Ok(())
 }
+
+/// An index whose key yields nothing answers every child in yq, so a computed key is not a stage
+/// the loop runs to its one value: the loop leaves it to the evaluator and the answer is
+/// yq's.
+#[test]
+fn test_an_index_with_no_key_is_not_run_to_one_value_5379() -> Result<()> {
+    let doc = "a: [1, 2, 3]\nb: x\nn: 2\n";
+    for filter in [
+        "def g: .; def f: (.a[select(false)]) | g; f",
+        "def g: .; def f: if (.a[select(false)] | length) > 0 then . else g end; f | .n",
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &["-o", "json", "-I0"])?;
+        assert_eq!(code, 0, "`{filter}`: {stderr:?}");
+        assert!(!stdout.is_empty(), "`{filter}`: {stdout:?}");
+    }
+    let (stdout, _, code) = run_yq_stdin_with_stderr(
+        "def g: .; def f: (.a[select(false)]) | g; f",
+        doc,
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!((stdout.as_str(), code), ("1\n2\n3\n", 0));
+    Ok(())
+}

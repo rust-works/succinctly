@@ -115,6 +115,16 @@ fn test_every_tail_position_loops_in_place_5379() -> Result<()> {
             "200000",
         ),
         (
+            "a helper declared in the body, used ahead of the call",
+            "def f: def step: . + 1; if . < N then step | f else . end; 0 | f",
+            "200000",
+        ),
+        (
+            "a helper declared in the body, as the condition",
+            "def f: def small: . < N; if small then . + 1 | f else . end; 0 | f",
+            "200000",
+        ),
+        (
             "an as binding in front of the call",
             "def f: if . < N then . as $x | $x + 1 | f else . end; 0 | f",
             "200000",
@@ -477,6 +487,70 @@ fn test_an_unread_as_binding_does_not_decode_the_node_5379() -> Result<()> {
         assert_eq!(
             (stdout.trim_end(), code),
             ("5", 0),
+            "`{filter}` -- {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A def that ends in a call to an earlier def is not a loop: the helper runs its own loop if it
+/// has one, and the pipe in front of it keeps the fused evaluation it always had. The answers
+/// are the nested ones'.
+#[test]
+fn test_a_def_that_ends_in_a_helper_is_not_a_loop_5379() -> Result<()> {
+    for (filter, doc, want) in [
+        (
+            "def pretty: tostring; def top: sort_by(.) | .[0:2] | pretty; top",
+            "[3,1,2]",
+            r#""[1,2]""#,
+        ),
+        ("def ap(g): g; ap(. + 1)", "1", "2"),
+        (
+            "def count: map(select(. > 1)) | length; def show: tostring; count | show",
+            "[1,2,3]",
+            r#""2""#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (want, 0),
+            "`{filter}` -- {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A loop that is not recursive at all is not charged for the outputs of its one round: a long
+/// range ahead of a call to a helper is a finite program.
+#[test]
+fn test_a_long_range_ahead_of_a_call_is_not_refused_5379() -> Result<()> {
+    let (stdout, stderr, code) = run("last(def g: 7; def f: range(4300000), g; f)")?;
+    assert_eq!((stdout.trim_end(), code), ("7", 0), "{stderr:?}");
+    Ok(())
+}
+
+/// The answer to a source nothing reads does not depend on the call being in tail position
+/// (`map(.a)` over `[1]` raises in jq), and a consumer that stops reaches the front branch of
+/// the loop's comma as it reaches the inline spelling's: both print `2` here (#2666 documents
+/// why not jq's error).
+#[test]
+fn test_an_unread_source_and_a_stopping_consumer_agree_with_the_nested_form_5379() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"def g: "ok"; def f: (map(.a)) as $u | g; f"#],
+        Some("[1]"),
+    )?;
+    assert_eq!((stdout.as_str(), code), ("", 5), "{stderr:?}");
+    assert!(stderr.contains("Cannot index number"), "{stderr:?}");
+
+    let doc = r#"[1,"x",3]"#;
+    let looped = "def f: if length > 0 then (map(.+1) | .[]), (.[1:] | f) else empty end; first(f)";
+    let inline = "first(map(.+1) | .[])";
+    for filter in [looped, inline] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            ("2", 0),
             "`{filter}` -- {stderr:?}"
         );
     }

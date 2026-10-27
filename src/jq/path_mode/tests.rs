@@ -1655,14 +1655,14 @@ fn a_tail_recursive_def_runs_as_a_loop_5379() {
     });
 }
 
-/// #5379: what the tail loop asks of the interpreter's `single` is bounded, and what it
-/// learns while the bound runs out is not kept. A closure parameter read once the fuel of a
-/// loop's question was spent used to be cached as not single-valued for good, and every deeper
-/// read of it then nested: the program answers `[0,[]]` in jq 1.7.1, and did on the shipped
-/// route. A stage a long chain of `+ 0` makes too big for the interpreter's own question is
-/// still one the shared question settles, so the loop runs on both routes.
+/// #5379: the tail loop asks the shared question about a stage, not the interpreter's own
+/// `single`, so what a loop does does not depend on the route a program takes, and the
+/// closure parameters the interpreter caches an answer for are read as they always were. A
+/// long chain of `+ 0` is a stage the shared question settles (the program answers
+/// `[0,[]]` in jq 1.7.1, and a `def r(n)` with a long argument must not turn lazy), so the
+/// loop runs on this route too.
 #[test]
-fn the_tail_loops_settle_question_is_bounded_and_not_remembered_5379() {
+fn the_tail_loops_settle_question_is_the_shared_one_5379() {
     on_big_stack(|| {
         let plus_zeros = " + 0".repeat(40);
         let deep_arg = format!(

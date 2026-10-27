@@ -27454,9 +27454,10 @@ cover(3)
 /// the path-context pipeline, the two evaluators whose `DefCall` arms are
 /// separate from both the plain and the demand-driven one.
 ///
-/// Real jq hangs indefinitely on the tail-call spelling of all three (`def f: f;
-/// ...`, confirmed live, killed at timeout), and succinctly now loops it up to the round
-/// budget (#5379), so the rows nest the call. There is no oracle output to match
+/// Real jq hangs indefinitely on the tail-call spelling of `path(f)` and `path(.a | f)`
+/// (`def f: f; ...`, confirmed live, killed at timeout; `key` is no jq builtin, so the third
+/// row has no jq to hang), and succinctly now loops it up to the round budget (#5379), so
+/// the rows nest the call. There is no oracle output to match
 /// here -- what is pinned is that the guard is reachable from these routes at all,
 /// rather than the recursion running until the native stack gives out.
 #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
