@@ -6589,23 +6589,24 @@ It is a divergence from a reference that rejects, not a licence: [ADR-0018](../.
 A user who wants jq's rejection has `--validate` or `succinctly json validate`.
 `test_forwarding_filter_echoes_a_string_with_an_undecodable_escape_5308`, `test_reading_filter_raises_on_a_string_with_an_undecodable_escape_5308` and `test_validate_rejects_a_string_with_an_undecodable_escape_5308` pin the split.
 
-### A string interpolation answers over a malformed sibling its slots do not read (#5305)
+### A string interpolation of plain navigation answers over a malformed sibling its slots do not read (#5305)
 
-jq 1.7.1 rejects a document with a malformed token anywhere in it at parse time, whatever the filter, with exit 2.
+jq 1.7.1 rejects a document with a malformed token anywhere in it before the filter produces anything, with exit 5.
 A jq-mode `"\(.name)"` used to decode the whole object its slot read from, because the evaluator copied the ambient value into an owned one first, so it raised over a malformed sibling that `.name` and `[.name]` never touched.
-It now reads each slot at the cursor, which is what made `.users[] | "\(.name)"` 2-3x faster, and so validates only what its slots navigate.
-This is the rule of [#2103](https://github.com/rust-works/succinctly/issues/2103), [#3476](https://github.com/rust-works/succinctly/issues/3476) and [#5308](https://github.com/rust-works/succinctly/issues/5308), "a filter validates only what it reads", applied to a string interpolation:
+An interpolation whose slots are all plain navigation (`.`, a field or index, `.[]`, `?`, parentheses and pipes of those, or a literal) now reads each slot at the cursor, which made `.users[] | "\(.name)"` 3-4x faster, and so validates only what its slots navigate.
+An interpolation with any other slot (a call, `..`, `del(.x)`, a position read such as `key`) keeps the copy and its eager decode, so its verdict still depends on how the string is spelled.
+This is the rule of [#2103](https://github.com/rust-works/succinctly/issues/2103), [#3476](https://github.com/rust-works/succinctly/issues/3476) and [#5308](https://github.com/rust-works/succinctly/issues/5308), "a filter validates only what it reads", applied to a string interpolation, and it is sanctioned by the same [ADR-0018](../../adrs/adr-0018.md) #2103 amendment those entries cite:
 
 ```
-$ echo '{"name":"a","bad":tru}' | jq  -c '"\(.name)"'   # (parses nothing) exit 2
-$ echo '{"name":"a","bad":tru}' | sjq -c '"\(.name)"'   # "a"               exit 0
-$ echo '{"name":"a","bad":tru}' | sjq -c '"\(.bad)"'    # (raises)          exit 5
+$ echo '{"name":"a","bad":tru}' | jq  -c '"\(.name)"'              # parse error   exit 5
+$ echo '{"name":"a","bad":tru}' | sjq -c '"\(.name)"'              # "a"            exit 0
+$ echo '{"name":"a","bad":tru}' | sjq -c '"\(.bad)"'               # (raises)       exit 5
+$ echo '{"name":"a","bad":tru}' | sjq -c '"\(.name | ascii_upcase)"'  # (raises)       exit 5, the copy
 ```
 
-The last row shows the rule still holds: a slot that reads the malformed token raises.
+The third row shows the rule still holds: a slot that reads the malformed token raises.
 A user who wants jq's rejection has `--validate` or `succinctly json validate`.
-It is a divergence from a reference that rejects, not a licence: [ADR-0018](../../adrs/adr-0018.md)'s decision order still applies, and the cost argument is context, not a condition it accepts.
-`test_interpolation_reads_only_the_fields_its_slots_navigate_5305` and `test_interpolation_raises_when_a_slot_reads_the_malformed_field_5305` pin the split.
+`test_interpolation_reads_only_the_fields_its_slots_navigate_5305`, `test_interpolation_raises_when_a_slot_reads_the_malformed_field_5305` and `test_interpolation_with_a_call_slot_keeps_the_copy_5305` pin the split.
 
 ### PR #2291 code review: eleven more sibling paths, found by a systematic sweep
 
@@ -8487,7 +8488,7 @@ non-path-context case through `bridge_to_each_owned_flow` and leaves the existin
 `needs_path_context`-gated native arm alone), `Expr::IndexExpr`'s key (`each_index_expr`/
 `each_index_expr_generic`, jq mode only — yq mode's key stream keeps its retroactive
 discard-on-later-escape rule, which a sink push that has already been delivered cannot undo),
-`Expr::StringInterpolation` (jq mode only, bridged — yq mode is not a fan-out generator there at
+`Expr::StringInterpolation` (jq mode only, bridged until #5305, which reads an interpolation of plain navigation at the cursor — yq mode is not a fan-out generator there at
 all) and `Expr::Object` (`each_object_entries`/`each_object_value`, native in both files,
 mirroring `build_object_entries`'s own entries-recurse/key-encloses-value nesting).
 `eval_each_generic` also gained the `Expr::Range` arm `eval.rs`'s `each_range` (#1556) already
