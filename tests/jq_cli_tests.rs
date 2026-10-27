@@ -22925,7 +22925,8 @@ fn test_strptime_hour_minute_out_of_range_errors_971() -> Result<()> {
     // real jq.
     let (stdout, _, code) = run_jq_full(&["-c", r#"strptime("%H:%M:%S")"#], Some("\"23:59:60\""))?;
     assert_eq!(code, 0, "stdout: {stdout:?}");
-    assert_eq!(stdout.trim(), "[1970,0,1,23,59,60,4,0]");
+    // #5340: the unset date is jq's zeroed `tm` (macOS pin: weekday 6, the libc's).
+    assert_eq!(stdout.trim(), "[1900,0,0,23,59,60,0,-1]");
 
     // Boundary values stay valid, including %I's jq-accepted "00" (a real
     // jq oracle divergence from the naive 1-12 range a first pass assumed).
@@ -22954,7 +22955,8 @@ fn test_strptime_unrecognized_month_name_errors_971() -> Result<()> {
 
     let (stdout, _, code) = run_jq_full(&["-c", r#"strptime("%b")"#], Some("\"Jan\""))?;
     assert_eq!(code, 0, "stdout: {stdout:?}");
-    assert_eq!(stdout.trim(), "[1970,0,1,0,0,0,4,0]");
+    // #5340: the unset date is jq's zeroed `tm` (macOS pin: weekday 6, the libc's).
+    assert_eq!(stdout.trim(), "[1900,0,0,0,0,0,0,-1]");
     Ok(())
 }
 
