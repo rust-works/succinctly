@@ -3318,10 +3318,15 @@ impl<'e> Interp<'e> {
     ///
     /// Each path of `paths` (computed on the input) is read from the input and
     /// written into a state that starts as `null`. The state moves from write
-    /// to write, so a uniquely owned result is written in place rather than
+    /// to write, so the containers it builds are written in place rather than
     /// copied per path: jq's body, run by the interpreter, held the state and
-    /// copied it once per path, quadratic in the paths picked (#5390). The
-    /// caller has checked that `paths` cannot retry ([`Self::may_retry`]).
+    /// copied it once per path, quadratic in the paths picked (#5390). (A pick
+    /// of a whole container shares it with the input, and the first write
+    /// inside it copies that one container, once.) The caller has checked that
+    /// `paths` cannot retry ([`Self::may_retry`]) and that no path is being
+    /// tracked: inside `path(...)` or an assignment's target `pick` keeps its
+    /// prelude body, as `=` does. `Interp` runs jq programs only, as
+    /// [`Self::assign_native`] relies on, so the writes are `JqSemantics`'.
     fn pick_native(
         &self,
         paths: &'e Expr,

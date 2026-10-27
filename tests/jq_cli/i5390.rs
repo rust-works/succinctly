@@ -39,8 +39,53 @@ fn test_pick_over_a_recurse_walk_matches_jq_5390() -> Result<()> {
     // An error in the walk still raises, after the picks before it.
     let (stdout, stderr, code) = run_jq_full(&["-c", "pick(recurse(.[] | .))"], Some(DOC))?;
     assert_eq!((stdout.as_str(), code), ("", 5), "{stderr:?}");
+    // The fold's own errors are jq's `reduce` body's: a write at a negative index of
+    // the empty state, a read through a non-container. (`first(...)` is a dynamic
+    // target, so these run on the interpreter.)
+    for (doc, filter, message) in [
+        (
+            "[1,2]",
+            "pick(first(.[-1], .[0]))",
+            "Out of bounds negative array index",
+        ),
+        (
+            "[1,2]",
+            "pick(first(.[-5], .[0]))",
+            "Out of bounds negative array index",
+        ),
+        (
+            r#"{"a":5}"#,
+            "pick(first(.a.b, .a))",
+            "Cannot index number with string \"b\"",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!((stdout.as_str(), code), ("", 5), "`{filter}` -- {stderr:?}");
+        assert!(stderr.contains(message), "`{filter}` -- {stderr:?}");
+    }
+    // Whole containers picked, and a pick that reads through `null`.
+    for (doc, filter, want) in [
+        (
+            r#"{"a":{"b":1}}"#,
+            "pick(first(.a, .a.b))",
+            "{\"a\":{\"b\":1}}\n",
+        ),
+        (
+            r#"{"a":null}"#,
+            "pick(first(.a.b.c))",
+            "{\"a\":{\"b\":{\"c\":null}}}\n",
+        ),
+        ("null", "pick(first(.[2]))", "[null,null,null]\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (want, 0),
+            "`{filter}` -- {stderr:?}"
+        );
+    }
     // A `?//` in the paths keeps jq's own body (the fold's error can be retried).
-    let (stdout, code) = run_jq_stdin(r#"pick(.a as [$p] ?// $p | .a)"#, DOC, &["-c"])?;
+    let (stdout, code) = run_jq_stdin(r"pick(.a as [$p] ?// $p | .a)", DOC, &["-c"])?;
     assert_eq!((stdout.as_str(), code), ("{\"a\":1}\n", 0));
     Ok(())
 }
