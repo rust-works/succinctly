@@ -384,7 +384,7 @@ impl<W: Write> NulCheckedSink<'_, W> {
         self.settle_separator()?;
         match &mut self.colorizer {
             Some(colorizer) => colorizer.finish(self.writer),
-            None => Ok(()),
+            None => Ok(()), // patchcov: coverage tolerate-line reason="unreachable: the only caller checks colorizer.is_some() first (#808)"
         }
     }
 
@@ -582,6 +582,7 @@ fn stream_maybe_colored<W: Write, T>(
         let rendered = render(&mut sink);
         let ColorSink::Colored(writer, mut colorizer) = sink else {
             unreachable!("stream_maybe_colored always constructs ColorSink::Colored here")
+            // patchcov: coverage tolerate-line reason="unreachable: the sink was constructed as Colored two lines up and render only borrows it (#808)"
         };
         // A decode failure keeps the prefix it already wrote, so it needs its
         // last span closed like a complete render; a write failure has no
@@ -11098,6 +11099,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                         if is_identity {
                             // P9 path for identity on single doc
                             let streamed_ok = if can_yaml_fast_path {
+                                // patchcov: coverage tolerate-line reason="unreachable: this whole `_ =>` arm is dead code, see the tolerated lines below"
                                 // No result ended here -- `write_terminator`
                                 // below writes directly, after the colored text (#1708).
                                 stream_or_report(
@@ -11105,7 +11107,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                                     output_config.use_color,
                                     terminator_from_config(&output_config),
                                     &mut sink,
-                                    ColorSyntax::Yaml,
+                                    ColorSyntax::Yaml, // patchcov: coverage tolerate-line reason="unreachable: this whole `_ =>` arm is dead code -- `root.value()` always reports the virtual document sequence, so single-document YAML never falls through here (see the tolerated arm below)"
                                     |out| root.stream_yaml_document(out, yaml_indent, sort_keys),
                                 )?
                             } else {
@@ -11114,7 +11116,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                                     output_config.use_color,
                                     terminator_from_config(&output_config),
                                     &mut sink,
-                                    ColorSyntax::Json,
+                                    ColorSyntax::Json, // patchcov: coverage tolerate-line reason="unreachable: this whole `_ =>` arm is dead code -- `root.value()` always reports the virtual document sequence, so single-document YAML never falls through here (see the tolerated arm below)"
                                     |sink| {
                                         json_ascii!(output_config.ascii_output, sink, |out| {
                                             root.stream_json_document(out, json_indent, sort_keys)
@@ -11311,6 +11313,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                             if is_identity {
                                 // P9 path for identity on single doc
                                 let streamed_ok = if can_yaml_fast_path {
+                                    // patchcov: coverage tolerate-line reason="unreachable: this whole `_ =>` arm is dead code, see the tolerated lines below"
                                     // No result ended here -- `write_terminator`
                                     // below writes directly, after the colored text (#1708).
                                     stream_or_report(
@@ -11318,7 +11321,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                                         output_config.use_color,
                                         terminator_from_config(&output_config),
                                         &mut sink,
-                                        ColorSyntax::Yaml,
+                                        ColorSyntax::Yaml, // patchcov: coverage tolerate-line reason="unreachable: this whole `_ =>` arm is dead code -- `root.value()` always reports the virtual document sequence, so single-document YAML never falls through here (see the tolerated arm below)"
                                         |out| {
                                             root.stream_yaml_document(out, yaml_indent, sort_keys)
                                         },
@@ -11329,7 +11332,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                                         output_config.use_color,
                                         terminator_from_config(&output_config),
                                         &mut sink,
-                                        ColorSyntax::Json,
+                                        ColorSyntax::Json, // patchcov: coverage tolerate-line reason="unreachable: this whole `_ =>` arm is dead code -- `root.value()` always reports the virtual document sequence, so single-document YAML never falls through here (see the tolerated arm below)"
                                         |sink| {
                                             json_ascii!(output_config.ascii_output, sink, |out| {
                                                 root.stream_json_document(
@@ -12947,8 +12950,127 @@ mod tests {
                 rendered > 0,
                 "{syntax:?}: nothing written before the render returned"
             );
+            writer.flush().unwrap();
             assert_eq!(String::from_utf8(seen.take()).unwrap(), expected);
         }
+    }
+
+    /// A `Write` whose every write fails, for the paths that report a dead output.
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("closed"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// #808: a write larger than a block is cut into blocks without splitting a character, a
+    /// result's end drains a block's worth of color, and a finish with nothing left writes
+    /// nothing.
+    #[test]
+    fn test_colorizer_block_edges_808() {
+        // The block boundary (byte 8192) falls inside the two-byte `é`.
+        let json = format!(
+            "[\"{}é{}\"]",
+            "a".repeat(COLOR_BLOCK_BYTES - 3),
+            "b".repeat(10)
+        );
+        assert!(!json.is_char_boundary(COLOR_BLOCK_BYTES));
+        let mut colorizer = Colorizer::new(ColorSyntax::Json);
+        let mut out = Vec::new();
+        colorizer.write(&mut out, &json).unwrap();
+        colorizer.finish(&mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            output::colorize_json(&json, &ColorScheme::default())
+        );
+
+        // Under a block of text, over one once colored: the result's end writes it.
+        let yaml = "a: 1\n".repeat(COLOR_BLOCK_BYTES / 5 - 10);
+        assert!(yaml.len() < COLOR_BLOCK_BYTES);
+        let mut colorizer = Colorizer::new(ColorSyntax::Yaml);
+        let mut out = Vec::new();
+        colorizer.write(&mut out, &yaml).unwrap();
+        assert_eq!(out, Vec::<u8>::new());
+        colorizer.end_result(&mut out, Terminator::Newline).unwrap();
+        assert!(!out.is_empty(), "the colored block was not written");
+        colorizer.finish(&mut out).unwrap();
+        let mut expected = String::new();
+        let mut lexer = YamlColorizer::default();
+        lexer.push_str(&yaml, &mut expected);
+        lexer.boundary(Terminator::Newline, &mut expected);
+        lexer.finish(&mut expected);
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
+
+        let mut out = Vec::new();
+        Colorizer::new(ColorSyntax::Json).finish(&mut out).unwrap();
+        assert_eq!(out, Vec::<u8>::new());
+    }
+
+    /// #808: a dead output is reported as a write error, whether the render fills a block
+    /// (the write fails mid-render) or ends short of one (the write fails closing the last span).
+    #[test]
+    fn test_colored_render_to_a_failing_writer_808() {
+        use core::fmt::Write as _;
+        for terminator in [Terminator::Newline, Terminator::Nul] {
+            for body in [
+                "[1]".to_string(),
+                format!("[{}1]", "1,".repeat(COLOR_BLOCK_BYTES)),
+            ] {
+                let err = stream_maybe_colored(
+                    &mut FailingWriter,
+                    true,
+                    terminator,
+                    None,
+                    ColorSyntax::Json,
+                    |out| out.write_str(&body).map_err(StreamFailure::from),
+                )
+                .unwrap_err();
+                assert_eq!(err.to_string(), "Write error", "{terminator:?}");
+            }
+        }
+        // `-0` with a document separator checks each result before coloring it, so the
+        // short render's colored text is only written when the render finishes.
+        let mut doc_streamed = false;
+        let err = stream_maybe_colored(
+            &mut FailingWriter,
+            true,
+            Terminator::Nul,
+            Some(DocSeparatorArgs {
+                doc_streamed: &mut doc_streamed,
+                no_doc: true,
+            }),
+            ColorSyntax::Yaml,
+            |out| out.write_str("a: 1\n").map_err(StreamFailure::from),
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "Write error");
+    }
+
+    /// #808: the lookahead's quote tracking (an escaped quote does not close a quote, a closing
+    /// quote re-exposes the `:`), the cut at the limit falling inside a character, and a blank
+    /// other than a space after a marker.
+    #[test]
+    fn test_yaml_colorizer_lookahead_edges_808() {
+        let key = "\x1b[36m";
+        assert!(
+            colorize_yaml("- x\"a\\\"b\": 1\n").contains(key),
+            "key after a quoted run"
+        );
+        assert!(
+            !colorize_yaml("- x\"a\\\":b\" c\n").contains(key),
+            "a colon inside the quote is not a key"
+        );
+        // `é` straddles the limit: the run stops before it and the character itself settles it.
+        let straddle = format!("- {}é: 1\n", "x".repeat(LOOKAHEAD_LIMIT - 1));
+        assert!(!colorize_yaml(&straddle).contains(key));
+        let tab = colorize_yaml("- \tk: 1\n");
+        assert!(tab.contains('\t'), "{tab:?}");
+        assert!(tab.contains(&format!("{key}k")), "{tab:?}");
     }
 
     /// #2706: a write followed by a *static* navigation is split into the write and the steps

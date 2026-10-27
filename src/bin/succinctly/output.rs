@@ -1061,8 +1061,8 @@ impl JsonColorizer {
                 return;
             }
             JsonToken::Number if c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E' | '+' | '-') => {
-                result.push(c);
-                return;
+                result.push(c); // patchcov: coverage tolerate-line reason="unreachable: push_str copies every character this arm accepts as part of a run, so push_char never sees one with a number open (#808)"
+                return; // patchcov: coverage tolerate-line reason="unreachable: see the line above (#808)"
             }
             JsonToken::Keyword | JsonToken::Number => {
                 result.push_str(&scheme.reset);
