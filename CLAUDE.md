@@ -632,13 +632,23 @@ under Feature Flags above for the rest and why they're all needed.
 | **100KB** |  8.2 ms (11.9 MiB/s)  | 12.0 ms  (8.1 MiB/s)  | **1.5x**   |
 | **1MB**   | 38.9 ms (25.7 MiB/s)  | 70.9 ms (14.1 MiB/s)  | **1.8x**   |
 
-### jq Query Performance (Apple M4 Pro)
+### jq Query Performance (Apple M4 Pro, jq 1.7.1)
 
 | Size      | succinctly            | jq                    | Speedup    |
 |-----------|-----------------------|-----------------------|------------|
-| **10KB**  |  3.3 ms  (3.0 MiB/s)  |  3.3 ms  (3.0 MiB/s)  | **1.0x**   |
-| **100KB** |  4.1 ms (24.4 MiB/s)  |  5.7 ms (17.5 MiB/s)  | **1.4x**   |
-| **1MB**   | 13.0 ms (76.9 MiB/s)  | 32.0 ms (31.3 MiB/s)  | **2.5x**   |
+| **10KB**  |   3.9 ms ( 2.4 MiB/s) |   3.1 ms ( 3.0 MiB/s) | **0.8x**   |
+| **100KB** |   4.7 ms (17.7 MiB/s) |   7.3 ms (11.4 MiB/s) | **1.6x**   |
+| **1MB**   |  11.9 ms (67.7 MiB/s) |  50.4 ms (16.0 MiB/s) | **4.2x**   |
+
+### jq Query Performance (AMD Ryzen 9 7950X, jq 1.7.1)
+
+| Size      | succinctly            | jq                    | Speedup    |
+|-----------|-----------------------|-----------------------|------------|
+| **10KB**  |   2.0 ms ( 4.5 MiB/s) |   2.1 ms ( 4.3 MiB/s) | **1.0x**   |
+| **100KB** |   3.1 ms (27.2 MiB/s) |   5.0 ms (16.9 MiB/s) | **1.6x**   |
+| **1MB**   |  12.5 ms (64.4 MiB/s) |  34.9 ms (23.1 MiB/s) | **2.8x**   |
+
+Both tables above: `comprehensive` pattern, `.` (identity), #5336 re-run. The M1 Max and Neoverse tables predate it (jq 1.6 / system jq). Wider query mix and 100 MB figures: [docs/benchmarks/jq.md](docs/benchmarks/jq.md) -- which also shows where succinctly loses: `INDEX(.id)` is 0.64-0.76x on the 7950X (100 KB to 100 MB, #5306) and every query is 0.7-0.9x on the M4 Pro at 10 KB and below.
 
 To regenerate: `succinctly bench run jq_bench`
 
@@ -684,7 +694,7 @@ To regenerate: `succinctly bench run jq_bench`
 |-----------|-------------------------|-----------------------|------------|
 | **10KB**  | 1.8 ms  (5.4 MiB/s)     | 5.1 ms (1.9 MiB/s)    | **2.9x**   |
 | **100KB** | 3.1 ms (29.7 MiB/s)     | 20.0 ms (4.6 MiB/s)   | **6.5x**   |
-| **1MB**   | 14.7 ms (62.6 MiB/s)    | 152.2 ms (6.1 MiB/s)  | **10.3x**  |
+| **1MB**   | 14.7 ms (62.6 MiB/s)    | 152.2 ms (6.1 MiB/s)  | **10.3x**   |
 
 ### yq Query Performance (ARM Neoverse-V1)
 

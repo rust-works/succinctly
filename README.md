@@ -177,21 +177,23 @@ See [docs/benchmarks/rust-parsers.md](docs/benchmarks/rust-parsers.md) for detai
 
 Comparison of `succinctly jq .` vs `jq .` for formatting/printing JSON files.
 
-#### x86_64 (AMD Ryzen 9 7950X, 10MB files)
+#### x86_64 (AMD Ryzen 9 7950X, 10MB files, jq 1.7.1)
 
 | Pattern           | jq       | succinctly    | Speedup  | jq Mem  | succ Mem | Mem Ratio  |
 |-------------------|----------|---------------|----------|---------|----------|------------|
-| **nested**        |  147.8ms |  **54.5ms**   | **2.7x** |   22 MB |    26 MB |      1.16x |
-| **strings**       |  141.3ms |  **59.0ms**   | **2.4x** |   14 MB |    14 MB |      1.02x |
-| **numbers**       |  268.7ms | **127.3ms**   | **2.1x** |   87 MB |    15 MB |      0.18x |
-| **pathological**  |  796.7ms | **410.2ms**   | **1.9x** |  472 MB |    17 MB |      0.04x |
-| **comprehensive** |  381.9ms | **220.9ms**   | **1.7x** |  149 MB |    14 MB |      0.09x |
-| **users**         |  205.6ms | **125.4ms**   | **1.6x** |   68 MB |    12 MB |      0.18x |
-| **unicode**       |  169.4ms | **113.0ms**   | **1.5x** |   31 MB |    16 MB |      0.51x |
-| **arrays**        |  738.2ms | **388.9ms**   | **1.9x** |  367 MB |    17 MB |      0.05x |
-| **literals**      |  279.5ms | **228.7ms**   | **1.2x** |   50 MB |    16 MB |      0.33x |
+| **numbers**       |  236.2ms |    **60.8ms** | **3.9x** |   91 MB |    37 MB |      0.41x |
+| **nested**        |  144.5ms |    **39.0ms** | **3.7x** |   23 MB |    35 MB |      1.49x |
+| **arrays**        |  608.6ms |   **164.7ms** | **3.7x** |  385 MB |    51 MB |      0.13x |
+| **strings**       |  128.9ms |    **36.0ms** | **3.6x** |   15 MB |    33 MB |      2.21x |
+| **comprehensive** |  335.2ms |   **105.0ms** | **3.2x** |  156 MB |    42 MB |      0.27x |
+| **unicode**       |  150.2ms |    **53.5ms** | **2.8x** |   32 MB |    38 MB |      1.17x |
+| **pathological**  |  670.4ms |   **244.7ms** | **2.7x** |  495 MB |    64 MB |      0.13x |
+| **users**         |  181.8ms |    **71.2ms** | **2.6x** |   71 MB |    31 MB |      0.44x |
+| **literals**      |  241.7ms |   **114.1ms** | **2.1x** |   53 MB |    46 MB |      0.86x |
 
 #### ARM (Neoverse-V1, 1MB files)
+
+*The Neoverse-V1 and Apple M1 Max tables below predate the jq 1.7.1 re-run of #5336 (jq 1.6 and a system jq); the 7950X table above and the [Apple M4 Pro section](docs/benchmarks/jq.md) are jq 1.7.1.*
 
 | Pattern           | jq       | succinctly    | Speedup  |
 |-------------------|----------|---------------|----------|
