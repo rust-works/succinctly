@@ -468,10 +468,7 @@ Two interactions were left open by #1709 itself (the second since closed by #200
    NUL anywhere discarded every earlier result too.
    It now writes the results that end before the first NUL and then raises the same error, with
    the same stdout and exit code as yq.
-   Since [#808](https://github.com/rust-works/succinctly/issues/808) `--colors` streams, and
-   `--colors -0` checks one result at a time like uncolored `-0`: each clean result is
-   colorized as it is flushed, which is the same text as that slice of the whole colored
-   render, because the colorizer resets its lexer state at each result boundary.
+   Since [#808](https://github.com/rust-works/succinctly/issues/808) `--colors` streams, and `--colors -0` checks one result at a time like uncolored `-0`: each clean result is colorized as it is flushed, which is the same text as that slice of the whole colored render, because the colorizer resets its lexer state at each result boundary.
 
 ### Anchor-on-alias at document-root level — rule 4(b)
 
