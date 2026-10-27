@@ -21462,6 +21462,11 @@ fn eval_first_or_last_generic<S: EvalSemantics, V: DocumentValue>(
     // always `false` on every dispatch path that reaches this function
     // today, and `last(empty)?` (`null`) vs. `last(error("x"))?` (empty)
     // stays correct entirely via that outer boundary, not anything here.
+    // #5377: a generator that makes its values runs as the `reduce` jq defines `last` by, which
+    // holds one at a time.
+    if let Some(fold) = crate::jq::last_as_reduce(inner) {
+        return eval_single::<S, V>(&fold, value, optional, cursor);
+    }
     match eval_single::<S, V>(inner, value, optional, cursor) {
         GenericResult::One(v) => GenericResult::One(v),
         GenericResult::OneCursor(c) => GenericResult::OneCursor(c),
