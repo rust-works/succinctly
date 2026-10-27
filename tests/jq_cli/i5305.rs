@@ -52,6 +52,16 @@ fn test_interpolation_over_a_document_matches_jq_5305() -> Result<()> {
             "[\"11\",\"21\",\"late\"]\n",
         ),
         (r#"[("\(.s[]?)" | length)]"#, "[]\n"),
+        // A later navigation slot's error escapes through the earlier slot's combinations,
+        // streamed and collected.
+        (
+            r#"try "\(.a[])-\(.s[])" catch ."#,
+            "\"Cannot iterate over string (\\\"x\\\")\"\n",
+        ),
+        (
+            r#"[try "\(.a[])-\(.b[])-\(.s[])" catch .]"#,
+            "[\"Cannot iterate over string (\\\"x\\\")\"]\n",
+        ),
         // An earlier slot's error escapes through the slots around it, streamed and collected.
         (
             r#"[try "\(.s.x)-\(.b[])" catch .]"#,
