@@ -30,6 +30,8 @@
 use alloc::format;
 #[cfg(not(test))]
 use alloc::rc::Rc;
+#[cfg(not(test))]
+use alloc::vec::Vec;
 #[cfg(test)]
 use std::rc::Rc;
 
