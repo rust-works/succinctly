@@ -6,7 +6,7 @@ Comprehensive benchmarks comparing `succinctly jq .` vs `jq .` for JSON formatti
 
 **See also**: [JsonIndex wiki page](../parsing/json-index.md) for architecture overview and academic references.
 
-Results are provided for ARM (Apple M4 Pro, Apple M1 Max, AWS Graviton) and x86_64 (AMD Zen 4) platforms. The AMD Ryzen 9 7950X and Apple M4 Pro sections were re-run against jq 1.7.1 in #5336 and include a query mix beyond `.`; the other platforms' sections were measured against the jq version named in each.
+Results are provided for ARM (Apple M4 Pro, Apple M1 Max, AWS Graviton) and x86_64 (AMD Zen 4) platforms. The AMD Ryzen 9 7950X and Apple M4 Pro sections were re-run against jq 1.7.1 in #5336 and include a query mix beyond `.`; the other platforms' sections were measured against the jq version named in each, so do not compare speedups across sections whose jq version differs.
 
 ## Architectural Differences
 
@@ -56,7 +56,7 @@ cargo build --release --features bench-runner
 **CPU**: AMD Ryzen 9 7950X 16-Core Processor
 **OS**: Linux 6.18.54.1-microsoft-standard-WSL2 (WSL2)
 **jq version**: jq-1.7.1
-**succinctly**: Built with `--release --features cli,bench-runner` (commit `4395a966a` plus the `users_mix` query set)
+**succinctly**: Built with `--release --features cli,bench-runner` from `main` @ `4395a966a` plus the `users_mix` query set added in the same PR as this section (#5336); eval code is `main`'s
 **Date**: 2026-10-27 (re-run against jq 1.7.1, #5336)
 **Method**: median of 3 timed runs after 1 warmup for `.`; median of 5 for the query mix; output MD5 identical to jq on every row
 
@@ -605,7 +605,7 @@ The `users_mix` query set (`succinctly dev bench jq --patterns users --queries u
 **CPU**: Apple M4 Pro (12 cores)
 **OS**: macOS 26.5.1
 **jq version**: jq-1.7.1 (Apple build, 1.7.1-apple)
-**succinctly**: Built with `--release --features cli,bench-runner` (commit `4395a966a` plus the `users_mix` query set)
+**succinctly**: Built with `--release --features cli,bench-runner` from `main` @ `4395a966a` plus the `users_mix` query set added in the same PR as this section (#5336); eval code is `main`'s
 **Date**: 2026-10-27 (re-run against jq 1.7.1, #5336)
 **Method**: median of 3 timed runs after 1 warmup for `.`; median of 5 for the query mix; output MD5 identical to jq on every row
 

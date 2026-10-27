@@ -2040,7 +2040,7 @@ fn run_jq_benchmark(args: BenchJqArgs) -> Result<()> {
     ];
     let all_sizes = vec!["1kb", "10kb", "100kb", "1mb", "10mb", "100mb"];
 
-    let patterns = if args.patterns == "all" {
+    let patterns: Vec<String> = if args.patterns == "all" {
         all_patterns.into_iter().map(String::from).collect()
     } else {
         args.patterns
@@ -2061,19 +2061,40 @@ fn run_jq_benchmark(args: BenchJqArgs) -> Result<()> {
     // Parse query types
     let queries: Vec<jq_bench::QueryType> = if args.queries == "all" {
         jq_bench::QueryType::all().to_vec()
-    } else if args.queries == "users_mix" {
-        jq_bench::QueryType::users_mix().to_vec()
     } else {
-        args.queries
-            .split(',')
-            .filter_map(|s| jq_bench::QueryType::from_str(s.trim()))
-            .collect()
+        // `users_mix` expands in place, so it combines with other names; an unknown name is an
+        // error rather than silently dropped (a typo must not leave a partial run).
+        let mut queries = Vec::new();
+        let mut unknown = Vec::new();
+        for name in args.queries.split(',').map(str::trim) {
+            if name == "users_mix" {
+                queries.extend_from_slice(jq_bench::QueryType::users_mix());
+            } else if let Some(q) = jq_bench::QueryType::from_str(name) {
+                queries.push(q);
+            } else {
+                unknown.push(name);
+            }
+        }
+        if !queries.is_empty() && !unknown.is_empty() {
+            anyhow::bail!("Unknown query type(s): {}", unknown.join(", "));
+        }
+        queries
     };
 
     if queries.is_empty() {
         anyhow::bail!(
             "No valid query types specified. Available: identity, keys_unsorted, keys_unsorted_length, keys_unsorted_map, keys_unsorted_select, map, select, users_navigate, users_length, users_select, users_map, users_sort_by, users_interpolate, users_group_by, users_index (or users_mix for the users-pattern set)"
         );
+    }
+
+    // The `users_*` queries read `.users`; on another pattern both tools would error or answer
+    // `null`, hash-match, and report a meaningless speedup.
+    if queries.iter().any(jq_bench::QueryType::is_users_shaped) {
+        if let Some(p) = patterns.iter().find(|p| p.as_str() != "users") {
+            anyhow::bail!(
+                "the users_* queries need `--patterns users` (got pattern `{p}`): they read `.users`"
+            );
+        }
     }
 
     let config = jq_bench::BenchConfig {
@@ -3061,6 +3082,28 @@ mod tests {
         let err = run_jq_benchmark(args).unwrap_err();
         assert!(
             err.to_string().contains("No valid query types specified"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_run_jq_benchmark_rejects_a_partly_unknown_query_list() {
+        let args = bench_jq_args("users", "1kb", "identity,users_sortby", "./nonexistent");
+        let err = run_jq_benchmark(args).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Unknown query type(s): users_sortby"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_run_jq_benchmark_rejects_users_queries_on_other_patterns() {
+        // `users_mix` combines with other names, and is refused off the `users` pattern
+        let args = bench_jq_args("arrays", "1kb", "identity,users_mix", "./nonexistent");
+        let err = run_jq_benchmark(args).unwrap_err();
+        assert!(
+            err.to_string().contains("need `--patterns users`"),
             "unexpected error: {err}"
         );
     }

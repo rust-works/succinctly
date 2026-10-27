@@ -648,7 +648,7 @@ under Feature Flags above for the rest and why they're all needed.
 | **100KB** |   3.1 ms (27.2 MiB/s) |   5.0 ms (16.9 MiB/s) | **1.6x**   |
 | **1MB**   |  12.5 ms (64.4 MiB/s) |  34.9 ms (23.1 MiB/s) | **2.8x**   |
 
-Both tables above: `comprehensive` pattern, `.` (identity), #5336 re-run. The M1 Max and Neoverse tables predate it (jq 1.6 / system jq). Wider query mix and 100 MB figures: [docs/benchmarks/jq.md](docs/benchmarks/jq.md).
+Both tables above: `comprehensive` pattern, `.` (identity), #5336 re-run. The M1 Max and Neoverse tables predate it (jq 1.6 / system jq). Wider query mix and 100 MB figures: [docs/benchmarks/jq.md](docs/benchmarks/jq.md) -- which also shows where succinctly loses: `INDEX(.id)` is 0.64-0.76x on the 7950X (100 KB to 100 MB, #5306) and every query is 0.7-0.9x on the M4 Pro at 10 KB and below.
 
 To regenerate: `succinctly bench run jq_bench`
 

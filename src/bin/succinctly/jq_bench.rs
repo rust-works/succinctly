@@ -175,7 +175,15 @@ impl QueryType {
 
     /// Every query type, for looking one up by its query string
     fn every() -> impl Iterator<Item = &'static Self> {
-        Self::all().iter().chain(Self::users_mix().iter().skip(1))
+        // `users_mix()` leads with `Identity`, which `all()` already has.
+        Self::all()
+            .iter()
+            .chain(Self::users_mix().iter().filter(|q| **q != Self::Identity))
+    }
+
+    /// Whether the query reads the `users` pattern's shape and is meaningless on any other
+    pub fn is_users_shaped(&self) -> bool {
+        Self::users_mix().contains(self) && *self != Self::Identity
     }
 }
 
@@ -691,7 +699,7 @@ pub fn generate_markdown(results: &[BenchmarkResult], memory_mode: bool) -> Stri
     let cpu_info = get_cpu_info();
     md.push_str(&format!("**CPU**: {cpu_info}\n\n"));
 
-    // Collect unique queries from results, in QueryType::all() order
+    // Collect unique queries from results, in QueryType::every() order
     let queries: Vec<&str> = QueryType::every()
         .map(QueryType::query)
         .filter(|q| results.iter().any(|r| r.query == *q))
