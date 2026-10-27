@@ -109,7 +109,7 @@ scalar-yaml = []
 select-stats = ["std"]
 
 # Unified benchmark runner (succinctly bench list/run/orchestrate/nodes/sync/report)
-bench-runner = ["cli", "dep:chrono", "dep:serde_yaml"]
+bench-runner = ["cli", "dep:chrono", "dep:serde_yaml", "dep:toml", "dep:sha2"]
 
 [dependencies]
 bytemuck = { version = "1.14", features = ["derive"] }
@@ -130,6 +130,8 @@ md5 = { version = "0.8", optional = true }
 ctrlc = { version = "3.4", optional = true }
 chrono = { version = "0.4", optional = true }
 serde_yaml = { version = "0.9", optional = true }
+toml = { version = "0.9.6", optional = true }
+sha2 = { version = "0.10.9", optional = true }
 
 # The system time zone for the `local-zone` feature. Not on Windows, which has no
 # zoneinfo directory for `tzdb-zoneinfo` to read: the released Windows binary keeps

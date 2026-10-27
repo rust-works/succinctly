@@ -1,0 +1,35 @@
+# Pinned inputs for `succinctly dev compare jq` (#5409).
+#
+# Everything the comparison measures against is named here; the harness never
+# uses whatever `jq` is on PATH. Add a [[reference]] to compare another tool.
+
+schema_version = 1
+
+# jq 1.7.1 is the primary reference (tests/data/jq-golden/JQ_VERSION, ADR-0018).
+[[reference]]
+id = "jq-1.7.1"
+version = "1.7.1"
+role = "primary"
+source_url = "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-1.7.1.tar.gz"
+source_sha256 = "478c9ca129fd2e3443fe27314b455e211e0d8c60bc8ff7df703873deeee580c2"
+
+# jq 1.8.1 is secondary: only behaviour new in 1.8.x that succinctly implements
+# (the `since-1.8.1` suite), run against 1.8.1 alone, never counted as a
+# divergence in the 1.7.1 columns.
+[[reference]]
+id = "jq-1.8.1"
+version = "1.8.1"
+role = "secondary"
+source_url = "https://github.com/jqlang/jq/releases/download/jq-1.8.1/jq-1.8.1.tar.gz"
+source_sha256 = "2be64e7129cecb11d5906290eba10af694fb9e3e7f9fc208a311dc33ca837eb0"
+
+# The build under test. `--all-features` is not a superset build (CLAUDE.md, #3006).
+[succinctly]
+profile = "release"
+features = "cli,simd,regex,serde"
+
+[corpus]
+manifest = "tests/data/bench-corpus/manifest.json"
+
+[queries]
+smoke = "comparison/jq/queries/smoke.tsv"

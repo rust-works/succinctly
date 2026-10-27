@@ -221,6 +221,23 @@ enum DevSubcommand {
     /// Run a jq filter through the #5223 path-mode interpreter (dev-only)
     #[command(hide = true)]
     JqPathMode(jq_path_mode::JqPathModeArgs),
+    /// Reproducible comparison of jq and succinctly jq (#5409)
+    #[cfg(feature = "bench-runner")]
+    Compare(CompareCommand),
+}
+
+#[cfg(feature = "bench-runner")]
+#[derive(Debug, Parser)]
+struct CompareCommand {
+    #[command(subcommand)]
+    command: CompareSubcommand,
+}
+
+#[cfg(feature = "bench-runner")]
+#[derive(Debug, Subcommand)]
+enum CompareSubcommand {
+    /// jq vs succinctly jq (pinned reference, interleaved timing, output gate)
+    Jq(compare::CompareJqArgs),
 }
 
 /// Arguments for the select scan-length report.
@@ -1918,6 +1935,10 @@ fn run_main() -> Result<()> {
                 std::process::exit(exit_code);
             }
             DevSubcommand::JqPathMode(args) => std::process::exit(jq_path_mode::run(args)),
+            #[cfg(feature = "bench-runner")]
+            DevSubcommand::Compare(c) => match c.command {
+                CompareSubcommand::Jq(args) => std::process::exit(compare::run(args)?),
+            },
         },
         Command::InstallAliases(args) => install_aliases(args),
         #[cfg(feature = "bench-runner")]
@@ -2772,6 +2793,8 @@ fn format_bytes(bytes: usize) -> String {
 
 #[cfg(feature = "bench-runner")]
 mod bench_runner;
+#[cfg(feature = "bench-runner")]
+mod compare;
 mod corpus_stats;
 mod dsv_bench;
 mod dsv_generators;

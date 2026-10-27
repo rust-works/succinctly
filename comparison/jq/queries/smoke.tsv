@@ -1,0 +1,21 @@
+# id<TAB>flags<TAB>filter<TAB>input   (flags are space-separated; '-' means none)
+identity	-c	.	{"a":[1,2,{"b":null}],"c":"x"}
+field	-	.a	{"a":42}
+iterate	-c	.[]	[1,"two",[3]]
+length	-	length	"héllo"
+keys	-c	keys	{"b":1,"a":2}
+map_select	-c	map(select(. > 1))	[1,2,3]
+sort_by	-c	sort_by(.n)	[{"n":3},{"n":1}]
+group_by	-c	group_by(. % 2)	[1,2,3,4]
+reduce	-	reduce .[] as $x (0; . + $x)	[1,2,3,4]
+to_entries	-c	to_entries	{"a":1,"b":2}
+csv	-r	@csv	[1,"a,b",null]
+tojson	-	tojson	{"a":[1.5,1e2]}
+update	-c	.a |= . + 1	{"a":1}
+paths	-c	[paths]	{"a":{"b":1},"c":[2]}
+limit	-c	[limit(3; range(100))]	null
+try_catch	-	try error("x") catch .	null
+regex	-r	test("^a.c$")	"abc"
+raw_output	-r	.s	{"s":"line"}
+sort_keys	-S	.	{"b":1,"a":{"d":1,"c":2}}
+big_int	-c	.	[100000000000000000000, 1.000000000000000000001]

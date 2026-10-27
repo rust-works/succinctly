@@ -73,3 +73,6 @@ fuzz/target/
 *.toml-e
 *.md-e
 *.py-e
+
+# `succinctly dev compare jq` run output (#5409)
+/data/compare/
