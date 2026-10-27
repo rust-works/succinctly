@@ -1877,6 +1877,10 @@ impl core::fmt::Debug for ArithSettleMemo {
 /// An [`Expr::Pipe`]'s stages, whether any of them needs path context
 /// (#3886), and whether a stage before the last may have an effect (#4293).
 ///
+/// It also remembers what the stages syntactically hold (`PipeShape`, #5404)
+/// and keeps the owned copy of each tail the owned evaluator hands on
+/// (`kept_tail`, #5404).
+///
 /// Reads as the `Vec<Expr>` it wraps (`Deref`), so a pipe's stages are matched
 /// and indexed as before. The remembered answer is `eval::needs_path_context`
 /// over every stage: a pipe asks it on each dispatch to choose its route, and
@@ -1885,7 +1889,8 @@ impl core::fmt::Debug for ArithSettleMemo {
 ///
 /// Derived state, like [`FuncDefData`]'s memo: it takes no part in equality or
 /// `Debug`, a clone starts empty, and `DerefMut` forgets it, because any
-/// rewrite of a stage goes through `&mut Vec<Expr>` and may change the answer.
+/// rewrite of a stage goes through `&mut Vec<Expr>` and may change the answer
+/// (or, for the tail copies, no longer be a copy of the stages).
 #[derive(Default)]
 pub struct PipeStages {
     stages: Vec<Expr>,
@@ -1926,7 +1931,10 @@ pub(crate) const MAX_KEPT_TAIL_STAGES: usize = 128;
 /// Derived state, like the memos beside it: it is built on first use, a clone
 /// starts without it, and `DerefMut` drops it.
 #[derive(Default)]
-struct TailCopies(core::cell::OnceCell<Box<[core::cell::OnceCell<Option<Rc<Expr>>>]>>);
+struct TailCopies(core::cell::OnceCell<TailSlots>);
+
+/// One slot per offset of a pipe, see [`TailCopies`].
+type TailSlots = Box<[core::cell::OnceCell<Option<Rc<Expr>>>]>;
 
 impl PipeStages {
     /// The owned `Expr::Pipe` over `stages[from..]`, built by `build` on the
