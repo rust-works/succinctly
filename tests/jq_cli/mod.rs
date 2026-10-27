@@ -154,6 +154,7 @@ mod i5301;
 mod i5302;
 mod i5303;
 mod i5304;
+mod i5305;
 mod i5308;
 mod i5309;
 mod i5312;

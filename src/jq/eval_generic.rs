@@ -14344,6 +14344,15 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         {
             collect_each_generic::<S, V>(expr, value, optional, cursor)
         }
+        // #5305: jq mode's interpolation, collected, with the cursor threaded
+        // into every slot -- the wildcard bridge below materialized and
+        // reindexed the whole ambient value to read a field of it, so
+        // `[.users[] | "\(.name)"]` and `map("\(.name)")` copied every record.
+        // yq mode keeps the bridge (`eval::eval_string_interpolation`: its
+        // slots take only a first value, which this recursion does not model).
+        Expr::StringInterpolation(parts) if S::TAG != EvalTag::Yq && !needs_path_context(expr) => {
+            collect_string_interpolation_generic::<S, V>(parts, &value, optional, cursor)
+        }
         Expr::As { .. } => collect_each_generic::<S, V>(expr, value, optional, cursor),
 
         // #2416 phase 3: destructuring `as` natively via
@@ -15327,8 +15336,14 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // generator at all (`eval::eval_string_interpolation`'s own doc
         // comment), so it stays on the pre-existing eager fallback below,
         // matching `eval.rs`'s own jq-mode gate.
+        // #5305: a slot that reads no position is read at the cursor, not bridged -- the
+        // bridge materialized and reindexed the whole ambient value (`.users[] |
+        // "\(.name)"` copied every user record) to read one field of it. The arm keeps
+        // its original shape, one call, and decides inside: this function is on every
+        // recursion's path, and a second arm grew its debug frame past ADR-0025's floor
+        // (`test_literal_dollar_argument_matches_jq_3260`).
         Expr::StringInterpolation(_) if S::TAG != EvalTag::Yq => {
-            bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink)
+            each_string_interpolation_generic::<S, V>(expr, value, cursor, optional, sink)
         }
         // -- #1556's `eval.rs` twin, mirrored here at last (#2180 WP2b): the
         // one construct the two arm sets had already drifted on --
@@ -20969,6 +20984,148 @@ fn each_negate_generic<S: EvalSemantics, V: DocumentValue>(
         Flow::Escaped(control) => Some(control),
     });
     finish_fork_flow(control, optional)
+}
+
+/// [`eval_each_generic`]'s jq-mode `Expr::StringInterpolation` arm, out of line (#5305): a slot
+/// that reads a position keeps the owned bridge, every other interpolation is read at the cursor.
+#[inline(never)]
+fn each_string_interpolation_generic<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    value: V,
+    cursor: Option<V::Cursor>,
+    optional: bool,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    let Expr::StringInterpolation(parts) = expr else {
+        unreachable!("only the interpolation arm calls this"); // patchcov: coverage tolerate-line reason="unreachable: the one call site matches Expr::StringInterpolation"
+    };
+    if needs_path_context(expr) {
+        return bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink);
+    }
+    let mut slots: Vec<String> = vec![String::new(); parts.len()];
+    each_string_parts_generic::<S, V>(parts, value, optional, cursor, &mut slots, sink)
+}
+
+/// [`eval_single`]'s `Expr::StringInterpolation` arm, out of line for the same reason (#5305).
+#[inline(never)]
+fn collect_string_interpolation_generic<S: EvalSemantics, V: DocumentValue>(
+    parts: &[StringPart],
+    value: &V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+) -> GenericResult<V> {
+    let mut slots: Vec<String> = vec![String::new(); parts.len()];
+    let mut out = Vec::new();
+    match build_string_parts_generic::<S, V>(parts, value, optional, cursor, &mut slots, &mut out) {
+        Ok(()) => owned_vec_to_generic_result(out),
+        Err(control) => partial_generic(out, control),
+    }
+}
+
+/// Eager twin of [`each_string_parts_generic`] and the cursor-threaded twin of
+/// [`super::eval::build_string_parts`] (#5305): one string per combination of
+/// the `\(...)` slots' outputs, the last slot outermost, collected into `out`.
+fn build_string_parts_generic<S: EvalSemantics, V: DocumentValue>(
+    parts: &[StringPart],
+    value: &V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    slots: &mut [String],
+    out: &mut Vec<OwnedValue>,
+) -> Result<(), Control> {
+    let Some((part, rest)) = parts.split_last() else {
+        out.push(OwnedValue::String(slots.concat().into()));
+        return Ok(());
+    };
+    let idx = rest.len();
+
+    match part {
+        StringPart::Literal(s) => {
+            slots[idx].clone_from(s);
+            build_string_parts_generic::<S, V>(rest, value, optional, cursor, slots, out)
+        }
+        StringPart::Expr(expr) => {
+            let mut vals = Vec::new();
+            let trailing = push_generic_owned_values::<_, S>(
+                eval_single::<S, V>(expr, value.clone(), optional, cursor),
+                &mut vals,
+            );
+
+            for v in vals {
+                slots[idx] = crate::jq::eval::owned_to_string::<S>(&v);
+                build_string_parts_generic::<S, V>(rest, value, optional, cursor, slots, out)?;
+            }
+
+            if let Some(control) = trailing {
+                return Err(control);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Jq-mode string interpolation with the cursor threaded into every
+/// `\(...)` slot (#5305) -- the generic twin of [`super::eval::each_string_parts`],
+/// arm for arm: the same last-slot-outermost nesting (`"\(1,2)-\(3,4)"` varies
+/// the first slot fastest), the same `?//` retry stash, the same demand
+/// forwarding.
+///
+/// `eval_each_generic`'s `Expr::StringInterpolation` arm used to bridge to the
+/// owned flow, which materializes (and reindexes) the whole ambient value
+/// before a slot reads one field of it: `.users[] | "\(.name)"` copied every
+/// user record, and ran at 0.8x jq against `.name + ""` at 1.7x.
+fn each_string_parts_generic<S: EvalSemantics, V: DocumentValue>(
+    parts: &[StringPart],
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    slots: &mut [String],
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    let Some((part, rest)) = parts.split_last() else {
+        return match sink.push(GenericItem::Owned(OwnedValue::String(
+            slots.concat().into(),
+        ))) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped { pending: None },
+        };
+    };
+    let idx = rest.len();
+
+    match part {
+        StringPart::Literal(s) => {
+            slots[idx].clone_from(s);
+            each_string_parts_generic::<S, V>(rest, value, optional, cursor, slots, sink)
+        }
+        StringPart::Expr(expr) => {
+            let escape = StashedEscape::new();
+            let flow =
+                eval_each_generic::<S, V>(expr, value.clone(), optional, cursor, &mut |item| {
+                    // #3293: a re-invocation after a stop is a `?//` retry inside
+                    // the driven operand; it supersedes whatever the retried-past
+                    // call decided.
+                    escape.begin();
+                    let owned = match generic_item_into_owned::<_, S>(item) {
+                        Ok(v) => v,
+                        Err(control) => return escape.stop(control),
+                    };
+                    slots[idx] = crate::jq::eval::owned_to_string::<S>(&owned);
+                    match each_string_parts_generic::<S, V>(
+                        rest,
+                        value.clone(),
+                        optional,
+                        cursor,
+                        slots,
+                        sink,
+                    ) {
+                        Flow::Exhausted => Demand::Continue,
+                        Flow::Stopped { .. } => Demand::Stop,
+                        Flow::Escaped(control) => escape.stop(control),
+                    }
+                });
+            escape.resume(flow, crate::jq::eval::direct_pattern_retry(expr))
+        }
+    }
 }
 
 /// Shared resolution of [`each_take_first_generic`]'s and
