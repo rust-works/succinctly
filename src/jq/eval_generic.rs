@@ -3965,7 +3965,7 @@ impl<V: DocumentValue> LazySource<V> {
                 Some(LazyElem::Owned(decode_group::<V>(
                     *tag,
                     &cursors[start..end],
-                )?))
+                )?)) // patchcov: coverage tolerate-line reason="unreachable: collect_cursors_checked decoded every element before the Groups source was built, so a group cannot fail to decode on a pull (#5306)"
             }
         })
     }
