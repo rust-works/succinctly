@@ -57,6 +57,23 @@ fn test_yq_shorthand_classes_are_go_s_ascii_classes_5374() -> Result<()> {
         ),
         ("\"\\\\w\" | test(\"\\\\\\\\w\")", "true\n"),
         ("\"é\" | test(\"\\\\w|é\")", "true\n"),
+        ("\"a\" | test(\"(?i)\\\\W\")", "false\n"),
+        ("\"K\" | test(\"(?i)\\\\W\")", "false\n"),
+        ("\"\\u212a\" | test(\"(?i)\\\\W\")", "true\n"),
+        ("\"\\u017f\" | test(\"(?i)[^\\\\W]\")", "true\n"),
+        ("\"é\" | test(\"(?i)[^\\\\W]\")", "false\n"),
+        ("\"é\" | test(\"\\\\B\")", "true\n"),
+        ("\"éa\" | [match(\"\\\\B\";\"g\")|.offset]", "[0]\n"),
+        ("\"é\" | test(\"\\\\S\")", "true\n"),
+        (
+            "\"a b\" | [match(\"\\\\S+\";\"g\")|.string]",
+            "[\"a\",\"b\"]\n",
+        ),
+        ("\"1٣\" | [match(\"\\\\D\";\"g\")|.string]", "[\"٣\"]\n"),
+        ("\"x-y\" | test(\"[\\\\w]-\")", "true\n"),
+        ("\"é[\" | [match(\"[\\\\w[]\";\"g\")|.string]", "[\"[\"]\n"),
+        ("\"a b\" | test(\"a\\\\sb\")", "true\n"),
+        ("\"a\\u000bb\" | test(\"a\\\\sb\")", "false\n"),
     ] {
         let (stdout, code) = run_yq_stdin(filter, "", ARGS)?;
         assert_eq!((stdout.as_str(), code), (want, 0), "{filter}");

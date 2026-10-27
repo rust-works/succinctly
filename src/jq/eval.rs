@@ -25433,7 +25433,8 @@ enum RegexDialect {
 
 /// Go's (RE2's) shorthand classes, which are ASCII where the `regex` crate's are Unicode (#5374):
 /// `\w` is `[0-9A-Za-z_]`, `\d` is `[0-9]` and `\s` is `[\t\n\f\r ]` (no `\v`, which the crate's
-/// `(?-u:\s)` has). The body of the class, without its brackets or a `^`.
+/// `(?-u:\s)` has; the space is `\x20`, which a verbose `(?x)` does not ignore). The body of the
+/// class, without its brackets or a `^`.
 #[cfg(feature = "regex")]
 fn go_shorthand_class(shorthand: char) -> Option<(&'static str, bool)> {
     Some(match shorthand {
@@ -25441,8 +25442,8 @@ fn go_shorthand_class(shorthand: char) -> Option<(&'static str, bool)> {
         'W' => ("0-9A-Za-z_", true),
         'd' => ("0-9", false),
         'D' => ("0-9", true),
-        's' => (r"\t\n\f\r ", false),
-        'S' => (r"\t\n\f\r ", true),
+        's' => (r"\t\n\f\r\x20", false),
+        'S' => (r"\t\n\f\r\x20", true),
         _ => return None,
     })
 }
