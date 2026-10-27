@@ -7465,6 +7465,17 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // as genuinely unbounded here as it is in real jq.
         Expr::Repeat(expr) => each_repeat::<W, S>(expr, value, optional, sink),
 
+        // #5292: `until`/`while` hand each state to the consumer as it is decided.
+        // The `_` fallback below evaluates them eagerly, which collects every state
+        // and cannot stop: `first(0 | while(true; .+1))` ran the whole round cap
+        // and held the states, where a stop at the first one is jq's answer.
+        Expr::Until { cond, update } => {
+            each_loop::<W, S>(false, cond, update, value, optional, sink)
+        }
+        Expr::While { cond, update } => {
+            each_loop::<W, S>(true, cond, update, value, optional, sink)
+        }
+
         // #2180 WP1: the *nested* short-circuiting consumers. `limit` had
         // the only demand-forwarding arm here, and it was the only consumer
         // that worked when nested inside another one -- that contrast is
@@ -75716,9 +75727,9 @@ pub(crate) const REDUCE_FOREACH_MAX_STEPS: usize = 100_000;
 /// `reduce`/`foreach` do not.
 pub(crate) const REPEAT_WIDTH_BUDGET: usize = 10_000;
 
-/// Check-and-charge one unit against a shared step budget (#695), the
-/// same check `until_step`/`while_step` each inline for their own cap.
-/// `what` names the construct in the resulting error message.
+/// Check-and-charge one unit against a shared step budget (#695).
+/// `what` names the construct in the resulting error message. (`while`/`until`
+/// charge their rounds, forks and emissions through [`LoopBudget`] instead.)
 pub(crate) fn charge_budget(budget: &mut usize, what: &str) -> Option<Control> {
     if *budget == 0 {
         // #2132: uncatchable -- see `EvalError::resource_limit`.
@@ -75776,80 +75787,131 @@ impl<'b> FoldBudget<'b> {
 
 /// The most rounds one `while`/`until` call runs, across its whole tree (#5292):
 /// 2^24 = 16,777,216. jq's loops are bounded only by memory and time; this stops
-/// `until(false; .+1)` and `[while(true; .+1)]` with an error where jq spins or
-/// is killed, and is about the same as [`MAX_RANGE_TOTAL`] for the same reason.
+/// `until(false; .+1)` and a runaway `while` with an error where jq spins or is
+/// killed. It counts rounds, not time: a body whose cost grows with the round
+/// (`until(false; [.[0]+1, .[1]+"x"])`) is not bounded in practice, as in jq.
 pub(crate) const MAX_LOOP_ROUNDS: usize = 1 << 24;
 
-/// The counters one `while`/`until` call charges its rounds against (#5292).
+/// The most states one `while` call emits, across its whole tree (#5292): 2^20 =
+/// 1,048,576. A consumer that keeps every state (`[while(true; .a += 1)]`) holds
+/// them all, and a state is any value, so a count of 2^24 would be gigabytes of
+/// objects; this is the same number of states at a tenth of the memory per state
+/// a bare-number `range` can hold. `until` emits only where a branch ends.
+pub(crate) const MAX_LOOP_EMITTED: usize = 1 << 20;
+
+/// The counters one `while`/`until` call charges (#5292).
 ///
-/// [`WHILE_UNTIL_MAX_STEPS`] bounds fan-out and recursion, not length (#534:
-/// `until(.>N; .+1,.+2)` visits a tree of states exponential in the depth, one
-/// native stack frame per fork). A round whose `cond` and `update` each answer
-/// once steps in place, as the loops do (`until_step`'s fast path): its rounds
-/// are as many as the loop is long, which jq runs too and which an ordinary
-/// `until(. >= 300000; .+1)` needs, so they are charged only against
-/// [`MAX_LOOP_ROUNDS`]. Every round of a branch that a fork starts (more or fewer
-/// than one output, or an operand driven through a live sink) is charged against
-/// [`WHILE_UNTIL_MAX_STEPS`] as well, which is what bounds the tree and the stack.
+/// [`WHILE_UNTIL_MAX_STEPS`] bounds forks, not length (#534: `until(.>N;
+/// .+1,.+2)` visits a tree of states exponential in the depth, one native stack
+/// frame per fork). A round whose `cond` and `update` each answer once steps in
+/// place, as the loops do (`until_step`'s fast path), nests no frame, so a loop of
+/// them is as long as it is and jq runs it too (`until(. >= 300000; .+1)`):
+/// charged only against [`MAX_LOOP_ROUNDS`]. Each branch a fork starts (a `cond` or
+/// `update` that answered more or fewer than once, or an operand driven through
+/// a live sink) is charged once against [`WHILE_UNTIL_MAX_STEPS`], which bounds
+/// the tree and the stack depth; the rounds in it count as any others.
 pub(crate) struct LoopCounters {
     rounds: usize,
-    forked: usize,
+    forks: usize,
+    emitted: usize,
 }
 
 impl LoopCounters {
     pub(crate) fn new() -> Self {
         Self {
             rounds: MAX_LOOP_ROUNDS,
-            forked: WHILE_UNTIL_MAX_STEPS,
+            forks: WHILE_UNTIL_MAX_STEPS,
+            emitted: MAX_LOOP_EMITTED,
         }
     }
 
-    /// The budget of the call's root branch.
-    pub(crate) fn root(&mut self) -> LoopBudget<'_> {
-        self.budget(false)
-    }
-
-    /// The budget of a branch that is (`forked`) or is not a later one of a fork.
-    pub(crate) fn budget(&mut self, forked: bool) -> LoopBudget<'_> {
-        LoopBudget {
-            counters: self,
-            forked,
-        }
+    /// The budget a call's rounds are charged to.
+    pub(crate) fn budget(&mut self) -> LoopBudget<'_> {
+        LoopBudget { counters: self }
     }
 }
 
-/// One branch of a `while`/`until` call's tree, charging a [`LoopCounters`].
+/// A branch of a `while`/`until` call's tree, charging a [`LoopCounters`].
 pub(crate) struct LoopBudget<'b> {
     counters: &'b mut LoopCounters,
-    /// Whether this branch is a later one of some fork: its rounds are charged
-    /// against the fan-out budget too.
-    forked: bool,
 }
 
 impl LoopBudget<'_> {
-    /// One round: `what` names the loop in the error that refuses it.
+    /// The uncatchable refusal: `what` names the loop (#2132).
+    fn refusal(what: &str) -> Control {
+        Control::Error(EvalError::resource_limit(format!(
+            "{what}: maximum iterations exceeded"
+        )))
+    }
+
+    /// One round.
     pub(crate) fn charge(&mut self, what: &str) -> Result<(), Control> {
-        if self.counters.rounds == 0 || (self.forked && self.counters.forked == 0) {
-            // #2132: uncatchable -- see `EvalError::resource_limit`.
-            return Err(Control::Error(EvalError::resource_limit(format!(
-                "{what}: maximum iterations exceeded"
-            ))));
+        if self.counters.rounds == 0 {
+            return Err(Self::refusal(what));
         }
         self.counters.rounds -= 1;
-        if self.forked {
-            self.counters.forked -= 1;
-        }
         Ok(())
     }
 
-    /// The budget of a branch of a round that was not an in-place step (its
-    /// `cond` or `update` did not answer exactly once): the rest of that tree is
-    /// charged against the fan-out budget too.
-    pub(crate) fn fork(&mut self) -> LoopBudget<'_> {
-        LoopBudget {
-            counters: &mut *self.counters,
-            forked: true,
+    /// The budget of one branch a round forks into, which nests a frame (or a
+    /// work item): charged once against the fork budget.
+    pub(crate) fn fork(&mut self, what: &str) -> Result<LoopBudget<'_>, Control> {
+        if self.counters.forks == 0 {
+            return Err(Self::refusal(what));
         }
+        self.counters.forks -= 1;
+        Ok(LoopBudget {
+            counters: &mut *self.counters,
+        })
+    }
+
+    /// One state a `while` emits.
+    pub(crate) fn emit(&mut self, what: &str) -> Result<(), Control> {
+        if self.counters.emitted == 0 {
+            return Err(Self::refusal(what));
+        }
+        self.counters.emitted -= 1;
+        Ok(())
+    }
+}
+
+/// Where a value-evaluator `while`/`until` call sends the states it emits
+/// (#5292): the eager arms collect them, the demand-driven one hands each to its
+/// consumer, whose [`Demand::Stop`] unwinds the whole tree.
+trait LoopOut {
+    fn push(&mut self, value: OwnedValue) -> Demand;
+}
+
+impl LoopOut for Vec<OwnedValue> {
+    fn push(&mut self, value: OwnedValue) -> Demand {
+        Self::push(self, value);
+        Demand::Continue
+    }
+}
+
+/// [`LoopOut`] over a consumer's sink.
+struct SinkOut<'s>(&'s mut dyn FnMut(OwnedValue) -> Demand);
+
+impl LoopOut for SinkOut<'_> {
+    fn push(&mut self, value: OwnedValue) -> Demand {
+        (self.0)(value)
+    }
+}
+
+/// Why one branch of a streamed `cond`/`update`'s subtree ended early (#3503,
+/// #3617), the [`StashedVerdict`] payload of [`LoopOperand::drive_each`].
+pub(crate) enum LoopAbort {
+    /// The sink answered [`Demand::Stop`].
+    Stopped,
+    /// A later round raised.
+    Escaped(Control),
+}
+
+/// A `halt` or a decode failure is never retried past, whichever way it got
+/// here; a stop is retried past exactly as an escaping `break` is.
+impl Nonretryable for LoopAbort {
+    fn is_nonretryable(&self) -> bool {
+        matches!(self, Self::Escaped(control) if control.is_nonretryable())
     }
 }
 
@@ -80920,10 +80982,13 @@ fn eval_nth_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     )
 }
 
-/// Total recursive fork budget for `while`/`until` (#534): shared across the
-/// whole backtracking tree (decremented once per state visited, regardless
-/// of branching), not per-branch, so the common non-forking case bounds
-/// total work to the same step cap the old flat loop used.
+/// Total fork budget for `while`/`until` (#534): shared across the whole
+/// backtracking tree, not per-branch, and spent once per branch a fork starts
+/// (a `cond` or `update` that answered more or fewer than once, or an operand
+/// driven through a live sink), which is what bounds the tree and the native
+/// stack depth. Since #5292 a round that steps in place spends none of it (see
+/// [`LoopCounters`]); until then it was decremented once per state visited,
+/// which is the history below.
 ///
 /// #2087: originally `10000`, which -- the identical bug shape
 /// [`REDUCE_FOREACH_MAX_STEPS`] had before #2079 -- degenerated into a
@@ -80966,6 +81031,56 @@ pub(crate) fn loop_stream_budget(operand: &Expr) -> Option<RecurseNativeBudget> 
 /// overflow the stack either (#3503). Hold the guard while the round runs.
 pub(crate) fn loop_enter_stream(budget: Option<RecurseNativeBudget>) -> Option<RecurseNativeLevel> {
     budget?.enter_level(0)
+}
+
+/// `until`/`while` as a demand-driven source (#5292): [`until_step`]/[`while_step`]
+/// over a [`SinkOut`], so a consumer's [`Demand::Stop`] unwinds the tree at once and
+/// no state is collected on its behalf. The eager [`eval_until`]/[`eval_while`]
+/// remain for the callers that want every output.
+///
+/// A trailing error is silenced under an ambient `optional` and the states already
+/// handed over stand, the [`finish_fork`] rule (#1902: never a decode failure or a
+/// resource-limit raise -- [`suppresses`]); a `break`/`halt` always propagates.
+fn each_loop<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    is_while: bool,
+    cond: &Expr,
+    update: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    // #1755/#1953: see `eval_until`.
+    let initial = match to_owned::<S, _>(&value) {
+        Ok(v) => v,
+        Err(e) if suppresses(&e, optional) => return Flow::Exhausted,
+        Err(e) => return Flow::Escaped(Control::Error(e)),
+    };
+    let demoted_cond = demote_for_reentry(cond, &RootWitness::Owned);
+    let demoted_update = demote_for_reentry(update, &RootWitness::Owned);
+    let cond = LoopOperand::new(cond, &demoted_cond);
+    let update = LoopOperand::new(update, &demoted_update);
+    let mut counters = LoopCounters::new();
+    let mut emit = |state: OwnedValue| sink(Item::Owned(state));
+    let mut out = SinkOut(&mut emit);
+    let step = if is_while {
+        while_step::<S>
+    } else {
+        until_step::<S>
+    };
+    match step(
+        cond,
+        update,
+        initial,
+        optional,
+        &mut out,
+        &mut counters.budget(),
+        true,
+    ) {
+        Ok(Demand::Continue) => Flow::Exhausted,
+        Ok(Demand::Stop) => Flow::Stopped { pending: None },
+        Err(Control::Error(e)) if suppresses(&e, optional) => Flow::Exhausted,
+        Err(control) => Flow::Escaped(control),
+    }
 }
 
 /// Evaluate `until(cond; update)` - apply update until cond is true.
@@ -81011,7 +81126,7 @@ fn eval_until<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         initial,
         optional,
         &mut outputs,
-        &mut counters.root(),
+        &mut counters.budget(),
         true,
     );
     finish_fork(outputs, result.err(), optional)
@@ -81071,20 +81186,30 @@ impl<'e> LoopOperand<'e> {
         input: &OwnedValue,
         optional: bool,
         ambient: bool,
-        step: &mut dyn FnMut(OwnedValue) -> Result<(), Control>,
-    ) -> Result<(), Control> {
+        step: &mut dyn FnMut(OwnedValue) -> Result<Demand, Control>,
+    ) -> Result<Demand, Control> {
         let expr = if ambient { self.expr } else { self.demoted };
-        let abort = StashedEscape::new();
+        let abort: StashedVerdict<LoopAbort> = StashedVerdict::new();
+        let stash = |end: LoopAbort| {
+            if let LoopAbort::Escaped(control) = &end {
+                mark_nonretryable_escape(control);
+            }
+            abort.stash(end);
+            Demand::Stop
+        };
         let flow = eval_each_owned::<S>(expr, input, optional, Reentry::Proven, &mut |next| {
             abort.begin();
             match step(next) {
-                Ok(()) => Demand::Continue,
-                Err(control) => abort.stop(control),
+                Ok(Demand::Continue) => Demand::Continue,
+                Ok(Demand::Stop) => stash(LoopAbort::Stopped),
+                Err(control) => stash(LoopAbort::Escaped(control)),
             }
         });
-        match abort.resume(flow, direct_pattern_retry(expr)) {
-            Flow::Escaped(control) => Err(control),
-            Flow::Exhausted | Flow::Stopped { .. } => Ok(()),
+        let abort = abort.take_unless(|at| retry_superseded(&flow, at, direct_pattern_retry(expr)));
+        match (abort, flow) {
+            (Some(LoopAbort::Escaped(control)), _) | (None, Flow::Escaped(control)) => Err(control),
+            (Some(LoopAbort::Stopped), _) | (None, Flow::Stopped { .. }) => Ok(Demand::Stop),
+            (None, Flow::Exhausted) => Ok(Demand::Continue),
         }
     }
 
@@ -81222,10 +81347,10 @@ fn until_step<S: EvalSemantics>(
     update: LoopOperand<'_>,
     mut state: OwnedValue,
     optional: bool,
-    outputs: &mut Vec<OwnedValue>,
+    outputs: &mut dyn LoopOut,
     budget: &mut LoopBudget<'_>,
     ambient: bool,
-) -> Result<(), Control> {
+) -> Result<Demand, Control> {
     // #3036: `state` is the caller's own input on the first round only.
     // `cond`/`update` carry their own pre-demoted twin ([`LoopOperand`]),
     // computed once by `eval_until` rather than re-walked every round:
@@ -81241,7 +81366,6 @@ fn until_step<S: EvalSemantics>(
         // (the update, a later round, the consumer) raises.
         if let Some(_level) = cond.enter_stream() {
             return cond.drive_each::<S>(&state, optional, ambient, &mut |cond_val| {
-                let mut branch = budget.fork();
                 until_decided::<S>(
                     cond,
                     update,
@@ -81249,7 +81373,7 @@ fn until_step<S: EvalSemantics>(
                     cond_val.is_truthy(),
                     optional,
                     outputs,
-                    &mut branch,
+                    budget,
                     ambient,
                 )
             });
@@ -81265,7 +81389,7 @@ fn until_step<S: EvalSemantics>(
             // its sink, so the retry can follow a failure a later round raises.
             if let Some(_level) = update.enter_stream() {
                 return update.drive_each::<S>(&state, optional, ambient, &mut |next| {
-                    let mut branch = budget.fork();
+                    let mut branch = budget.fork("until")?;
                     until_step::<S>(cond, update, next, optional, outputs, &mut branch, false)
                 });
             }
@@ -81276,7 +81400,7 @@ fn until_step<S: EvalSemantics>(
                     ambient = false;
                     continue;
                 }
-                OwnedRound::Done => return Ok(()),
+                OwnedRound::Done => return Ok(Demand::Continue),
                 OwnedRound::Declined(declined) => state = declined,
             }
             let (update_vals, update_control) = update.fork::<S>(&state, optional, ambient);
@@ -81286,37 +81410,43 @@ fn until_step<S: EvalSemantics>(
                 continue;
             }
             for update_val in update_vals {
-                until_step::<S>(
+                if until_step::<S>(
                     cond,
                     update,
                     update_val,
                     optional,
                     outputs,
-                    &mut budget.fork(),
+                    &mut budget.fork("until")?,
                     false,
-                )?;
+                )? == Demand::Stop
+                {
+                    return Ok(Demand::Stop);
+                }
             }
             return match update_control {
                 Some(control) => Err(control),
-                None => Ok(()),
+                None => Ok(Demand::Continue),
             };
         }
 
         for cond_val in &cond_vals {
-            until_decided::<S>(
+            if until_decided::<S>(
                 cond,
                 update,
                 &state,
                 cond_val.is_truthy(),
                 optional,
                 outputs,
-                &mut budget.fork(),
+                budget,
                 ambient,
-            )?;
+            )? == Demand::Stop
+            {
+                return Ok(Demand::Stop);
+            }
         }
         return match cond_control {
             Some(control) => Err(control),
-            None => Ok(()),
+            None => Ok(Demand::Continue),
         };
     }
 }
@@ -81332,33 +81462,35 @@ fn until_decided<S: EvalSemantics>(
     state: &OwnedValue,
     truthy: bool,
     optional: bool,
-    outputs: &mut Vec<OwnedValue>,
+    outputs: &mut dyn LoopOut,
     budget: &mut LoopBudget<'_>,
     ambient: bool,
-) -> Result<(), Control> {
+) -> Result<Demand, Control> {
     if truthy {
-        outputs.push(state.clone());
-        return Ok(());
+        return Ok(outputs.push(state.clone()));
     }
     if let Some(_level) = update.enter_stream() {
         return update.drive_each::<S>(state, optional, ambient, &mut |next| {
-            let mut branch = budget.fork();
+            let mut branch = budget.fork("until")?;
             until_step::<S>(cond, update, next, optional, outputs, &mut branch, false)
         });
     }
     let (update_vals, update_control) = update.fork::<S>(state, optional, ambient);
     for update_val in update_vals {
-        until_step::<S>(
+        if until_step::<S>(
             cond,
             update,
             update_val,
             optional,
             outputs,
-            &mut budget.fork(),
+            &mut budget.fork("until")?,
             false,
-        )?;
+        )? == Demand::Stop
+        {
+            return Ok(Demand::Stop);
+        }
     }
-    update_control.map_or(Ok(()), Err)
+    update_control.map_or(Ok(Demand::Continue), Err)
 }
 
 /// Evaluate `while(cond; update)` - output values while cond is true.
@@ -81392,7 +81524,7 @@ fn eval_while<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         initial,
         optional,
         &mut outputs,
-        &mut counters.root(),
+        &mut counters.budget(),
         true,
     );
     finish_fork(outputs, result.err(), optional)
@@ -81409,10 +81541,10 @@ fn while_step<S: EvalSemantics>(
     update: LoopOperand<'_>,
     mut state: OwnedValue,
     optional: bool,
-    outputs: &mut Vec<OwnedValue>,
+    outputs: &mut dyn LoopOut,
     budget: &mut LoopBudget<'_>,
     ambient: bool,
-) -> Result<(), Control> {
+) -> Result<Demand, Control> {
     // #3036: `state` is the caller's own input on the first round only.
     // `cond`/`update` carry their own pre-demoted twin ([`LoopOperand`]),
     // computed once by `eval_while` rather than re-walked every round --
@@ -81424,7 +81556,6 @@ fn while_step<S: EvalSemantics>(
         // #3617: see [`until_step`].
         if let Some(_level) = cond.enter_stream() {
             return cond.drive_each::<S>(&state, optional, ambient, &mut |cond_val| {
-                let mut branch = budget.fork();
                 while_decided::<S>(
                     cond,
                     update,
@@ -81432,7 +81563,7 @@ fn while_step<S: EvalSemantics>(
                     cond_val.is_truthy(),
                     optional,
                     outputs,
-                    &mut branch,
+                    budget,
                     ambient,
                 )
             });
@@ -81444,11 +81575,14 @@ fn while_step<S: EvalSemantics>(
         // `update` output — continue the loop in place rather than
         // recursing, so this step costs no stack depth (see [`until_step`]).
         if cond_control.is_none() && cond_vals.len() == 1 && cond_vals[0].is_truthy() {
-            outputs.push(state.clone());
+            budget.emit("while")?;
+            if outputs.push(state.clone()) == Demand::Stop {
+                return Ok(Demand::Stop);
+            }
             // #3503: see [`until_step`].
             if let Some(_level) = update.enter_stream() {
                 return update.drive_each::<S>(&state, optional, ambient, &mut |next| {
-                    let mut branch = budget.fork();
+                    let mut branch = budget.fork("while")?;
                     while_step::<S>(cond, update, next, optional, outputs, &mut branch, false)
                 });
             }
@@ -81459,7 +81593,7 @@ fn while_step<S: EvalSemantics>(
                     ambient = false;
                     continue;
                 }
-                OwnedRound::Done => return Ok(()),
+                OwnedRound::Done => return Ok(Demand::Continue),
                 OwnedRound::Declined(declined) => state = declined,
             }
             let (update_vals, update_control) = update.fork::<S>(&state, optional, ambient);
@@ -81469,37 +81603,43 @@ fn while_step<S: EvalSemantics>(
                 continue;
             }
             for update_val in update_vals {
-                while_step::<S>(
+                if while_step::<S>(
                     cond,
                     update,
                     update_val,
                     optional,
                     outputs,
-                    &mut budget.fork(),
+                    &mut budget.fork("while")?,
                     false,
-                )?;
+                )? == Demand::Stop
+                {
+                    return Ok(Demand::Stop);
+                }
             }
             return match update_control {
                 Some(control) => Err(control),
-                None => Ok(()),
+                None => Ok(Demand::Continue),
             };
         }
 
         for cond_val in &cond_vals {
-            while_decided::<S>(
+            if while_decided::<S>(
                 cond,
                 update,
                 &state,
                 cond_val.is_truthy(),
                 optional,
                 outputs,
-                &mut budget.fork(),
+                budget,
                 ambient,
-            )?;
+            )? == Demand::Stop
+            {
+                return Ok(Demand::Stop);
+            }
         }
         return match cond_control {
             Some(control) => Err(control),
-            None => Ok(()),
+            None => Ok(Demand::Continue),
         };
     }
 }
@@ -81514,33 +81654,39 @@ fn while_decided<S: EvalSemantics>(
     state: &OwnedValue,
     truthy: bool,
     optional: bool,
-    outputs: &mut Vec<OwnedValue>,
+    outputs: &mut dyn LoopOut,
     budget: &mut LoopBudget<'_>,
     ambient: bool,
-) -> Result<(), Control> {
+) -> Result<Demand, Control> {
     if !truthy {
-        return Ok(());
+        return Ok(Demand::Continue);
     }
-    outputs.push(state.clone());
+    budget.emit("while")?;
+    if outputs.push(state.clone()) == Demand::Stop {
+        return Ok(Demand::Stop);
+    }
     if let Some(_level) = update.enter_stream() {
         return update.drive_each::<S>(state, optional, ambient, &mut |next| {
-            let mut branch = budget.fork();
+            let mut branch = budget.fork("while")?;
             while_step::<S>(cond, update, next, optional, outputs, &mut branch, false)
         });
     }
     let (update_vals, update_control) = update.fork::<S>(state, optional, ambient);
     for update_val in update_vals {
-        while_step::<S>(
+        if while_step::<S>(
             cond,
             update,
             update_val,
             optional,
             outputs,
-            &mut budget.fork(),
+            &mut budget.fork("while")?,
             false,
-        )?;
+        )? == Demand::Stop
+        {
+            return Ok(Demand::Stop);
+        }
     }
-    update_control.map_or(Ok(()), Err)
+    update_control.map_or(Ok(Demand::Continue), Err)
 }
 
 /// Demand-driven twin of [`eval_repeat`] (#2014): pulls one round of
@@ -102933,7 +103079,10 @@ mod tests {
             RangeNum::Int(step),
             cap,
         );
-        // A value of another kind is dropped, which the callers' equality checks catch.
+        assert!(
+            seen.iter().all(|v| matches!(v, OwnedValue::Int(_))),
+            "an integer range handed over another kind"
+        );
         let ints = seen.iter().filter_map(OwnedValue::as_i64).collect();
         (ints, batches, end)
     }
@@ -103051,6 +103200,10 @@ mod tests {
             );
             assert_eq!(end, RangeEnd::Exhausted);
             let bits = |values: &[f64]| values.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+            assert!(
+                seen.iter().all(|v| matches!(v, OwnedValue::Float(_))),
+                "a float range handed over another kind: {from} {to} {step}"
+            );
             let seen: Vec<f64> = seen.iter().filter_map(OwnedValue::as_f64).collect();
             assert_eq!(bits(&seen), bits(&expected), "{from} {to} {step}");
         }
@@ -125624,63 +125777,109 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_until_budget_exceeded_errors() {
-        // #5292: a loop that steps in place is bounded by `MAX_LOOP_ROUNDS` (16.7M
-        // rounds, seconds, so not run here: `loop_budget_*` below pins the
-        // counters). A loop whose `update` forks is bounded by
-        // `WHILE_UNTIL_MAX_STEPS`, and each fork nests a native frame: the
-        // CLI-level rows (`tests/jq_cli_tests.rs`) run it on the big stack.
-        let mut counters = LoopCounters::new();
-        let mut root = counters.root();
-        let mut fork = root.fork();
-        for _ in 0..WHILE_UNTIL_MAX_STEPS {
-            assert!(fork.charge("until").is_ok());
-        }
-        match fork.charge("until") {
+    /// The refusal a spent counter answers with, and that it is the uncatchable kind.
+    fn assert_refused<T: core::fmt::Debug>(charged: Result<T, Control>, what: &str) {
+        match charged {
             Err(Control::Error(e)) => {
-                assert!(e.message.contains("until: maximum iterations exceeded"));
+                assert!(e
+                    .message
+                    .contains(&format!("{what}: maximum iterations exceeded")));
                 assert!(e.is_resource_limit());
             }
-            other => panic!("the fan-out budget should have refused: {other:?}"),
+            other => panic!("the {what} budget should have refused: {other:?}"),
         }
     }
 
     #[test]
-    fn loop_budget_charges_in_place_rounds_against_the_round_cap_only_5292() {
+    fn loop_budget_counts_rounds_forks_and_emissions_separately_5292() {
+        // A root lineage of in-place rounds spends only the round count, however
+        // far past the fork budget it goes.
         let mut counters = LoopCounters::new();
         {
-            let mut root = counters.root();
-            // Far past the fan-out budget: the root lineage is not metered by it.
+            let mut budget = counters.budget();
             for _ in 0..3 * WHILE_UNTIL_MAX_STEPS {
-                assert!(root.charge("while").is_ok());
+                assert!(budget.charge("while").is_ok());
             }
         }
         assert_eq!(counters.rounds, MAX_LOOP_ROUNDS - 3 * WHILE_UNTIL_MAX_STEPS);
-        assert_eq!(counters.forked, WHILE_UNTIL_MAX_STEPS);
+        assert_eq!(counters.forks, WHILE_UNTIL_MAX_STEPS);
 
-        // A fork spends both, and the rounds it spends come out of the same total.
+        // A fork spends one fork, and the rounds in the branch it starts are
+        // ordinary rounds (a loop that forks once and then runs long is not
+        // metered for its length).
         {
-            let mut root = counters.root();
-            assert!(root.fork().charge("while").is_ok());
+            let mut budget = counters.budget();
+            let mut branch = budget.fork("while").unwrap();
+            for _ in 0..2 * WHILE_UNTIL_MAX_STEPS {
+                assert!(branch.charge("while").is_ok());
+            }
         }
-        assert_eq!(counters.forked, WHILE_UNTIL_MAX_STEPS - 1);
-        assert_eq!(
-            counters.rounds,
-            MAX_LOOP_ROUNDS - 3 * WHILE_UNTIL_MAX_STEPS - 1
-        );
+        assert_eq!(counters.forks, WHILE_UNTIL_MAX_STEPS - 1);
 
-        // The round cap refuses the root lineage, with the loop's own name.
+        // The fork budget is what refuses a tree of forks...
+        let mut counters = LoopCounters::new();
+        let mut budget = counters.budget();
+        for _ in 0..WHILE_UNTIL_MAX_STEPS {
+            assert!(budget.fork("until").is_ok());
+        }
+        assert_refused(budget.fork("until").map(drop), "until");
+
+        // ...the round cap a loop that never ends...
         let mut counters = LoopCounters::new();
         counters.rounds = 1;
-        let mut root = counters.root();
-        assert!(root.charge("until").is_ok());
-        match root.charge("until") {
-            Err(Control::Error(e)) => {
-                assert!(e.message.contains("until: maximum iterations exceeded"));
-            }
-            other => panic!("the round cap should have refused: {other:?}"),
+        let mut budget = counters.budget();
+        assert!(budget.charge("until").is_ok());
+        assert_refused(budget.charge("until"), "until");
+
+        // ...and the emission cap a `while` that keeps handing states over.
+        let mut counters = LoopCounters::new();
+        let mut budget = counters.budget();
+        for _ in 0..MAX_LOOP_EMITTED {
+            assert!(budget.emit("while").is_ok());
         }
+        assert_refused(budget.emit("while"), "while");
+    }
+
+    #[test]
+    fn test_runaway_while_stops_at_the_emission_cap_5292() {
+        // `[while(true; .+1)]` collects one state per round: refused at
+        // `MAX_LOOP_EMITTED` (a million scalars, tens of MB), not at the round
+        // cap, where a fat state would have held gigabytes.
+        query!(b"null", r"[0 | while(true; .+1)] | length",
+            QueryResult::Error(e) => {
+                assert!(e.message.contains("while: maximum iterations exceeded"));
+                assert!(e.is_resource_limit());
+            }
+        );
+    }
+
+    #[test]
+    fn test_while_and_until_stream_to_an_early_stopping_consumer_5292() {
+        // The eager arms collect every state and cannot stop: these ran the
+        // whole round cap (a second and half a gigabyte for a number, killed at
+        // 4 GB for an object) where jq stops at the first state.
+        for (filter, want) in [
+            ("first(0 | while(true; .+1))", "0"),
+            ("[limit(5; 1 | while(true; . * 2))]", "[1,2,4,8,16]"),
+            ("isempty(0 | while(true; .+1))", "false"),
+            ("any(0 | while(true; .+1); . > 5)", "true"),
+            ("[limit(3; 0 | until(. > 3; .+1, .+2))]", "[4,5,4]"),
+            (
+                r#"first({"a":1,"b":[1,2,3]} | while(true; .a += 1))"#,
+                r#"{"a":1,"b":[1,2,3]}"#,
+            ),
+        ] {
+            assert_eq!(outputs(b"null", filter), [want], "`{filter}`");
+        }
+        // ...and the states a consumer takes are the ones the loop emits.
+        assert_eq!(
+            outputs(b"null", "[0 | while(. < 3; .+1, .+2)]"),
+            ["[0,1,2,2]"]
+        );
+        assert_eq!(
+            outputs(b"null", "[0 | until(. > 3; .+1, .+2)]"),
+            ["[4,5,4,4,5,4,5,4]"]
+        );
     }
 
     #[test]
@@ -125718,11 +125917,14 @@ mod tests {
             outputs(b"null", r"[0 | while(. < 300000; . + 1)] | length"),
             ["300000"]
         );
-        // ...also from inside a fork's first branch: an update that answers once
-        // steps in place however it was reached.
+        // ...also in the first branch of a fork: the fork spends one of the
+        // 100,000, and the rounds in each branch are only rounds.
         assert_eq!(
-            outputs(b"null", r"[0 | until(. >= 150000; . + 1)] | length"),
-            ["1"]
+            outputs(
+                b"null",
+                r"[0 | until(. >= 150000; if . == 0 then (.+1, .+1) else .+1 end)] | length"
+            ),
+            ["2"]
         );
     }
 

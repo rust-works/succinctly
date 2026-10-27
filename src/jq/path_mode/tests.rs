@@ -1694,6 +1694,58 @@ fn the_interpreter_internals_a_cli_run_does_not_reach_5223() {
     });
 }
 
+/// #5292: the interpreter's `until`/`while` are bounded without a counter of their
+/// own length: a fork spends the fork budget (an `update`, a `cond`, or a trailing
+/// error that makes a round answer other than once), a loop that never ends the round
+/// cap, a `while` that keeps emitting the emission cap -- each the uncatchable
+/// resource limit, whatever the program wraps it in.
+#[test]
+fn until_while_caps_hold_in_the_path_interpreter_5292() {
+    on_big_stack(|| {
+        check(&[
+            (
+                "0",
+                "until(false; ., .)",
+                err(&[], "until: maximum iterations exceeded"),
+            ),
+            (
+                "0",
+                "[while(true; ., .)] | length",
+                err(&[], "while: maximum iterations exceeded"),
+            ),
+            // A round that answers once and then raises is a fork: it used to park
+            // one error per round and run all 2^24 of them.
+            (
+                "0",
+                "[until((false, error(\"x\")); .)] | length",
+                err(&[], "until: maximum iterations exceeded"),
+            ),
+            (
+                "0",
+                "[until(false; (., error(\"x\")))] | length",
+                err(&[], "until: maximum iterations exceeded"),
+            ),
+            // ...uncatchable.
+            (
+                "0",
+                "try (until(false; ., .)) catch \"caught\"",
+                err(&[], "until: maximum iterations exceeded"),
+            ),
+            (
+                "0",
+                "[while(true; .+1)] | length",
+                err(&[], "while: maximum iterations exceeded"),
+            ),
+            // A loop that forks once and then steps in place is as long as it is.
+            (
+                "0",
+                "[until(. >= 150000; if . == 0 then (1, 2) else .+1 end)]",
+                ok(&["[150000,150000]"]),
+            ),
+        ]);
+    });
+}
+
 /// Rows that reach the interpreter's less common arms, each jq 1.7.1's answer.
 #[test]
 fn less_common_interpreter_arms_answer_as_jq_does_5223() {

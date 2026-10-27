@@ -97,7 +97,8 @@ pub enum ErrorKind {
     /// catchable, with one narrow bare-postfix-`?` exception.
     UntrackedNavigation,
     /// See [`EvalError::is_resource_limit`] -- always uncatchable (#2132).
-    /// An evaluator-imposed cap (`MAX_RANGE_TOTAL`, `WHILE_UNTIL_MAX_STEPS`,
+    /// An evaluator-imposed cap (`MAX_RANGE_TOTAL`, `MAX_LOOP_ROUNDS`,
+    /// `MAX_LOOP_EMITTED`, `WHILE_UNTIL_MAX_STEPS`,
     /// `REDUCE_FOREACH_MAX_STEPS`, `repeat`'s `MAX_ITERATIONS`,
     /// `MAX_EVAL_FRAMES`) that has no jq counterpart, so no `?`/`try` can
     /// have been written to expect it.
@@ -1455,7 +1456,8 @@ impl EvalError {
     }
 
     /// An evaluator-imposed resource cap was exceeded (#2132): `range`'s
-    /// `MAX_RANGE_TOTAL`, `while`/`until`'s `WHILE_UNTIL_MAX_STEPS`,
+    /// `MAX_RANGE_TOTAL`, `while`/`until`'s `MAX_LOOP_ROUNDS`, `MAX_LOOP_EMITTED` and
+    /// `WHILE_UNTIL_MAX_STEPS`,
     /// `reduce`/`foreach`'s `REDUCE_FOREACH_MAX_STEPS`, `repeat`'s
     /// `MAX_ITERATIONS`, or a recursive `def` past `MAX_EVAL_FRAMES`.
     ///

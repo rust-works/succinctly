@@ -2618,43 +2618,60 @@ impl<'e> Interp<'e> {
         // test, against `MAX_LOOP_ROUNDS` for the whole tree and also against
         // `WHILE_UNTIL_MAX_STEPS` once a round has forked.
         let mut counters = LoopCounters::new();
-        let mut work = vec![Work::Test(input, reg, false)];
+        let which = if is_while { "while" } else { "until" };
+        // The refusal is the uncatchable resource limit (#2132).
+        let refuse = |charged: Result<(), Control>| match charged {
+            Err(Control::Error(e)) => Err(Raise::Fatal(e)),
+            _ => Ok(()),
+        };
+        let mut work = vec![Work::Test(input, reg)];
         while let Some(item) = work.pop() {
             match item {
-                Work::Emit(v, r) => sink(v, r)?,
-                Work::Raise(raise) => return Err(raise),
-                Work::Test(v, r, forked) => {
-                    let which = if is_while { "while" } else { "until" };
-                    if let Err(Control::Error(e)) = counters.budget(forked).charge(which) {
-                        return Err(Raise::Fatal(e));
+                Work::Emit(v, r) => {
+                    if is_while {
+                        refuse(counters.budget().emit(which))?;
                     }
+                    sink(v, r)?;
+                }
+                Work::Raise(raise) => return Err(raise),
+                Work::Test(v, r) => {
+                    refuse(counters.budget().charge(which))?;
                     let conds = self.collect_outputs(cond, env, v.clone(), r.sub());
+                    // A round steps in place when `cond` answers once, without a
+                    // trailing error; otherwise each branch it starts is a fork
+                    // (see `LoopBudget`).
+                    let forks = conds.values.len() != 1 || conds.end.is_err();
                     if let Err(raise) = conds.end {
                         work.push(Work::Raise(raise));
                     }
-                    // A round steps in place when `cond` answers once (see
-                    // `LoopBudget`); otherwise its branches are forks.
-                    let forked = forked || conds.values.len() != 1;
                     for (c, _) in conds.values.into_iter().rev() {
+                        let stepping =
+                            matches!((truthy(&c), is_while), (true, true) | (false, false));
+                        if stepping && forks {
+                            refuse(counters.budget().fork(which).map(drop))?;
+                        }
                         match (truthy(&c), is_while) {
                             (true, true) => {
-                                work.push(Work::Step(v.clone(), r.clone(), forked));
+                                work.push(Work::Step(v.clone(), r.clone()));
                                 work.push(Work::Emit(v.clone(), r.clone()));
                             }
                             (true, false) => work.push(Work::Emit(v.clone(), r.clone())),
                             (false, true) => {}
-                            (false, false) => work.push(Work::Step(v.clone(), r.clone(), forked)),
+                            (false, false) => work.push(Work::Step(v.clone(), r.clone())),
                         }
                     }
                 }
-                Work::Step(v, r, forked) => {
+                Work::Step(v, r) => {
                     let steps = self.collect_outputs(step, env, v, r);
+                    let forks = steps.values.len() != 1 || steps.end.is_err();
                     if let Err(raise) = steps.end {
                         work.push(Work::Raise(raise));
                     }
-                    let forked = forked || steps.values.len() != 1;
                     for (next, reg) in steps.values.into_iter().rev() {
-                        work.push(Work::Test(next, reg, forked));
+                        if forks {
+                            refuse(counters.budget().fork(which).map(drop))?;
+                        }
+                        work.push(Work::Test(next, reg));
                     }
                 }
             }
@@ -2698,12 +2715,12 @@ impl<'e> Interp<'e> {
             Some(_) => Some(recurse_max_items()),
         };
         let mut visited = 0usize;
-        let mut work = vec![Work::Test(input, reg, false)];
+        let mut work = vec![Work::Test(input, reg)];
         while let Some(item) = work.pop() {
             match item {
                 Work::Raise(raise) => return Err(raise),
-                Work::Emit(v, r) | Work::Step(v, r, _) => work.push(Work::Test(v, r, false)), // patchcov: coverage tolerate-line reason="unreachable: recurse pushes only Test and Raise items"
-                Work::Test(v, r, _) => {
+                Work::Emit(v, r) | Work::Step(v, r) => work.push(Work::Test(v, r)), // patchcov: coverage tolerate-line reason="unreachable: recurse pushes only Test and Raise items"
+                Work::Test(v, r) => {
                     if cap.is_some_and(|cap| visited >= cap) {
                         return Err(Raise::Fatal(EvalError::resource_limit(
                             "recurse: maximum nodes exceeded",
@@ -2755,7 +2772,7 @@ impl<'e> Interp<'e> {
                         }
                     }
                     for (child, rc) in kept.into_iter().rev() {
-                        work.push(Work::Test(child, rc, false));
+                        work.push(Work::Test(child, rc));
                     }
                 }
             }
@@ -3567,12 +3584,10 @@ struct Outputs {
 enum Work {
     /// Hand this output to the consumer.
     Emit(OwnedValue, Reg),
-    /// Run the loop's condition (or `recurse`'s visit) on this value; the flag
-    /// is whether it is in a branch some round forked, whose rounds the fan-out
-    /// budget also counts (#5292, [`crate::jq::eval::LoopBudget`]).
-    Test(OwnedValue, Reg, bool),
-    /// Run the loop's step on this value; the flag is as for `Test`.
-    Step(OwnedValue, Reg, bool),
+    /// Run the loop's condition (or `recurse`'s visit) on this value.
+    Test(OwnedValue, Reg),
+    /// Run the loop's step on this value.
+    Step(OwnedValue, Reg),
     /// Raise the error a condition or step ended in, once the work it
     /// produced before the error is done.
     Raise(Raise),

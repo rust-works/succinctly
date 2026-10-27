@@ -10563,11 +10563,16 @@ state's top-level container once per round.
 
 > The budget's raise is uncatchable by `?`/`try`/`catch` since #2132 -- see "Every resource cap is uncatchable" below.
 
-> Since #5292 `WHILE_UNTIL_MAX_STEPS` (`100000`) bounds fan-out and recursion, not length.
-> A round whose `cond` and `update` each answer once steps in place, as the loops always have, and is charged only against `MAX_LOOP_ROUNDS` (2^24 = 16,777,216 rounds for the whole call): `0 | until(. >= 300000; . + 1)` and `[0 | while(. < 300000; . + 1)] | length` answer as jq does.
-> A round that forks (a `cond` or `update` that answers more or fewer than once, or an operand driven through a live sink for a `?//`) starts branches that nest a native frame each, and every round of such a branch is charged against `WHILE_UNTIL_MAX_STEPS` as well, so `until(false; ., .)` and `until(. > 40; .+1, .+2)` still raise after about 100,000 rounds.
+> Since #5292 `WHILE_UNTIL_MAX_STEPS` (`100000`) bounds forks, not length.
+> A round whose `cond` and `update` each answer once steps in place, as the loops always have, nests no native frame, and is charged only against `MAX_LOOP_ROUNDS` (2^24 = 16,777,216 rounds for the whole call): `0 | until(. >= 300000; . + 1)` and `[0 | while(. < 300000; . + 1)] | length` answer as jq does, on every route.
+> A fork (a `cond` or `update` that answers more or fewer than once, a trailing error that makes a round answer once and then raise, or an operand driven through a live sink for a `?//`) starts branches that nest a native frame or a work item each, and each one is charged once against `WHILE_UNTIL_MAX_STEPS`, so `until(false; ., .)` and `until(. > 40; .+1, .+2)` still raise after about 100,000 forks; the rounds inside a branch count as any others, so a loop that forks once and then runs long is as long as it is (`[0 | until(. >= 300000; if . == 0 then (1, 2) else .+1 end)]` is `[300000,300000]`, as in jq).
+> A `?//` operand streams its rounds through a live sink, one native frame per round, so such a loop still stops at about 100,000 rounds where jq answers (`[0 | until(. >= 300000; . as [$a] ?// $a | $a + 1)]`).
 > `LoopCounters`/`LoopBudget` (`src/jq/eval.rs`) carry this in the value, generic and path-interpreter evaluators.
-> The round cap replaces the step cap for the loops jq spins in: `0 | until(false; . + 1)` raises `until: maximum iterations exceeded` after a few seconds where jq never returns, and `[0 | while(true; . + 1)]` raises at 16,777,216 collected values (about 1 GiB) where jq grows until it is killed.
+> Two ceilings are not jq's, and are divergences (ADR-0018 rule 4c):
+> a loop longer than `MAX_LOOP_ROUNDS` rounds raises `until: maximum iterations exceeded` (`0 | until(. >= 20000000; . + 1)` answers in jq after a few seconds), which is also what a loop that never ends meets, a few seconds in where jq never returns;
+> and a `while` that hands over more than `MAX_LOOP_EMITTED` (2^20 = 1,048,576) states raises, because a consumer that keeps every state holds them all and a state is any value (`[while(true; .a += 1)]` over an object is hundreds of bytes a state, gigabytes at 2^24), where jq grows until it is killed.
+> Both are counts, not time or memory bounds: a body whose cost grows with the round (`until(false; [.[0]+1, .[1] + "x"])`) is not bounded in practice, as in jq.
+> `first`, `limit`, `any`, `isempty` and `label`/`break` over a `while` stop it at the state they take, on every route (the value evaluator's `eval_each` has a streaming arm, `each_loop`); the eager `eval_while`/`eval_until` serve the callers that want every output.
 > The rest of this section is written for the flat 100,000-state cap, and its transcripts show it.
 
 `WHILE_UNTIL_MAX_STEPS` (`src/jq/eval.rs`) is a shared step budget for
@@ -10844,7 +10849,7 @@ this is a genuine, if narrower, instance of the same divergence. (At the
 ### Every resource cap is uncatchable by `?`/`try`/`catch` (#2132) -- shared by the six cap sections
 
 The six evaluator-imposed caps documented in this file -- `range`'s `MAX_RANGE_TOTAL` (#2089, #5292, above; the `MAX_RANGE` of a non-numeric one),
-`while`/`until`'s `WHILE_UNTIL_MAX_STEPS` (#534/#2087), `reduce`/`foreach`'s
+`while`/`until`'s `MAX_LOOP_ROUNDS`, `MAX_LOOP_EMITTED` and `WHILE_UNTIL_MAX_STEPS` (#534/#2087/#5292), `reduce`/`foreach`'s
 `REDUCE_FOREACH_MAX_STEPS` (#695/#2079), `repeat`'s `MAX_ITERATIONS` (#2014), `recurse(f)`'s
 `RECURSE_MAX_ITEMS` (#3716, which ended the walk silently until then), and a recursive
 `def` past `MAX_EVAL_FRAMES` (#1371) -- raise as `ErrorKind::ResourceLimit`
