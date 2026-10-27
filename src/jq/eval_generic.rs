@@ -14515,13 +14515,15 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         {
             collect_each_generic::<S, V>(expr, value, optional, cursor)
         }
-        // #5305: jq mode's interpolation, collected, with the cursor threaded
-        // into every slot -- the wildcard bridge below materialized and
-        // reindexed the whole ambient value to read a field of it, so
+        // #5305: jq mode's interpolation of plain navigation, collected, with the
+        // cursor threaded into every slot -- the wildcard bridge below materialized
+        // and reindexed the whole ambient value to read a field of it, so
         // `[.users[] | "\(.name)"]` and `map("\(.name)")` copied every record.
-        // yq mode keeps the bridge (`eval::eval_string_interpolation`: its
-        // slots take only a first value, which this recursion does not model).
-        Expr::StringInterpolation(parts) if S::TAG != EvalTag::Yq && !needs_path_context(expr) => {
+        // Every other slot, and yq mode (`eval::eval_string_interpolation`: its slots
+        // take only a first value, which this recursion does not model), keep the bridge.
+        Expr::StringInterpolation(parts)
+            if S::TAG != EvalTag::Yq && interpolation_reads_by_navigation(parts) =>
+        {
             collect_string_interpolation_generic::<S, V>(parts, &value, optional, cursor)
         }
         Expr::As { .. } => collect_each_generic::<S, V>(expr, value, optional, cursor),
@@ -15458,13 +15460,11 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // a fix -- every reach of either through *any* lazy consumer today
         // already keeps full cursor/duplicate-key fidelity, since
         // `eval_each_generic`'s wildcard falls to `eval_single`'s own native
-        // arm). `Negate` and `StringInterpolation` mirror `eval_single`'s own
-        // `needs_path_context` gate immediately below: a path-context operand
-        // keeps the pre-existing native arm (untouched, still eager -- no
-        // established lazy twin for either of *those* shapes exists yet),
-        // and everything else takes the demand-forwarding owned bridge,
-        // exactly the wildcard it already took before this change, minus the
-        // eagerness.
+        // arm). `Negate` was bridged here too until #2626 made it native;
+        // a `StringInterpolation` of plain navigation is read at the cursor
+        // (#5305), and every other one takes the demand-forwarding owned
+        // bridge, exactly the wildcard it already took before this change,
+        // minus the eagerness.
         Expr::Builtin(Builtin::Select(cond)) => {
             each_select_generic::<S, V>(cond, value, cursor, sink)
         }
@@ -15507,8 +15507,8 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // generator at all (`eval::eval_string_interpolation`'s own doc
         // comment), so it stays on the pre-existing eager fallback below,
         // matching `eval.rs`'s own jq-mode gate.
-        // #5305: a slot that reads no position is read at the cursor, not bridged -- the
-        // bridge materialized and reindexed the whole ambient value (`.users[] |
+        // #5305: an interpolation of plain navigation is read at the cursor, not bridged --
+        // the bridge materialized and reindexed the whole ambient value (`.users[] |
         // "\(.name)"` copied every user record) to read one field of it. The arm keeps
         // its original shape, one call, and decides inside: this function is on every
         // recursion's path, and a second arm grew its debug frame past ADR-0025's floor
@@ -21153,8 +21153,42 @@ fn each_negate_generic<S: EvalSemantics, V: DocumentValue>(
     finish_fork_flow(control, optional)
 }
 
-/// [`eval_each_generic`]'s jq-mode `Expr::StringInterpolation` arm, out of line (#5305): a slot
-/// that reads a position keeps the owned bridge, every other interpolation is read at the cursor.
+/// Most parts an interpolation may have and still take the cursor path: the recursion over its
+/// parts costs native stack per part, and the program's own text is the only bound on it.
+const MAX_CURSOR_INTERPOLATION_PARTS: usize = 64;
+
+/// Whether every `\(...)` slot of an interpolation is plain navigation (#5305): `.`, a field or
+/// index, `.[]`, `?`, parentheses and pipes of those, or a literal.
+///
+/// Such a slot reads the node it stands at and nothing else, so it can be read at the cursor
+/// without copying the ambient value. Any other slot -- a call, `..`, `del(.x)`, `tojson`, a
+/// recursion through `\(f(n-1))`, a position read such as `key`, an `inputs` -- keeps the owned
+/// bridge, which evaluates the whole interpolation against one copy of the ambient value. The
+/// walk is bounded by the slot's own text (the parser caps expression nesting at 256) and never
+/// enters a nested interpolation, so it cannot compound with nesting depth.
+fn interpolation_reads_by_navigation(parts: &[StringPart]) -> bool {
+    fn navigation(expr: &Expr) -> bool {
+        match expr {
+            Expr::Identity
+            | Expr::Field(_)
+            | Expr::Index { .. }
+            | Expr::Iterate
+            | Expr::Literal(_) => true,
+            Expr::Optional(inner) | Expr::Paren(inner) => navigation(inner),
+            Expr::Pipe(stages) => stages.iter().all(navigation),
+            _ => false,
+        }
+    }
+    parts.len() <= MAX_CURSOR_INTERPOLATION_PARTS
+        && parts.iter().all(|part| match part {
+            StringPart::Literal(_) => true,
+            StringPart::Expr(expr) => navigation(expr),
+        })
+}
+
+/// [`eval_each_generic`]'s jq-mode `Expr::StringInterpolation` arm, out of line (#5305): an
+/// interpolation whose slots are plain navigation is read at the cursor, every other one keeps the
+/// owned bridge ([`interpolation_reads_by_navigation`]).
 #[inline(never)]
 fn each_string_interpolation_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
@@ -21163,10 +21197,12 @@ fn each_string_interpolation_generic<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
+    // Kept as a re-destructure, not a parameter: the arm's one-call shape is what holds the
+    // calling function's debug frame under ADR-0025's floor.
     let Expr::StringInterpolation(parts) = expr else {
         unreachable!("only the interpolation arm calls this"); // patchcov: coverage tolerate-line reason="unreachable: the one call site matches Expr::StringInterpolation"
     };
-    if needs_path_context(expr) {
+    if !interpolation_reads_by_navigation(parts) {
         return bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink);
     }
     let mut slots: Vec<String> = vec![String::new(); parts.len()];
