@@ -338,9 +338,12 @@ struct BenchJqArgs {
     #[arg(short, long, default_value = "all")]
     sizes: String,
 
-    /// Query types to benchmark (comma-separated, or "all")
+    /// Query types to benchmark (comma-separated, "all", or "users_mix")
     /// Available: identity (.), keys_unsorted, keys_unsorted_length,
-    /// keys_unsorted_map, keys_unsorted_select, map, select
+    /// keys_unsorted_map, keys_unsorted_select, map, select; and, for
+    /// `--patterns users` only: users_navigate, users_length, users_select,
+    /// users_map, users_sort_by, users_interpolate, users_group_by, users_index
+    /// ("users_mix" is identity plus all of them)
     #[arg(short, long, default_value = "identity")]
     queries: String,
 
@@ -2058,6 +2061,8 @@ fn run_jq_benchmark(args: BenchJqArgs) -> Result<()> {
     // Parse query types
     let queries: Vec<jq_bench::QueryType> = if args.queries == "all" {
         jq_bench::QueryType::all().to_vec()
+    } else if args.queries == "users_mix" {
+        jq_bench::QueryType::users_mix().to_vec()
     } else {
         args.queries
             .split(',')
@@ -2067,7 +2072,7 @@ fn run_jq_benchmark(args: BenchJqArgs) -> Result<()> {
 
     if queries.is_empty() {
         anyhow::bail!(
-            "No valid query types specified. Available: identity, keys_unsorted, keys_unsorted_length, keys_unsorted_map, keys_unsorted_select, map, select"
+            "No valid query types specified. Available: identity, keys_unsorted, keys_unsorted_length, keys_unsorted_map, keys_unsorted_select, map, select, users_navigate, users_length, users_select, users_map, users_sort_by, users_interpolate, users_group_by, users_index (or users_mix for the users-pattern set)"
         );
     }
 

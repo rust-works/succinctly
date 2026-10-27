@@ -38,6 +38,24 @@ pub enum QueryType {
     Map,
     /// `select(true)` over a plain container - general-container comparison
     Select,
+    // The queries below read the `users` pattern's `{"users":[{id,name,email,age,active,score},..]}`
+    // shape and are only meaningful there (#5336): run them with `--patterns users`.
+    /// `.users[0].name` - navigation to one leaf
+    UsersNavigate,
+    /// `.users | length`
+    UsersLength,
+    /// `[.users[] | select(.age > 50) | .name]` - filter and project
+    UsersSelect,
+    /// `.users | map(.score)` - projection
+    UsersMap,
+    /// `.users | sort_by(.age)` - sort the records
+    UsersSortBy,
+    /// `.users[] | "\(.name) <\(.email)>"` - string interpolation (#5305)
+    UsersInterpolate,
+    /// `.users | group_by(.age)` (#5306)
+    UsersGroupBy,
+    /// `.users | INDEX(.id)` (#5306)
+    UsersIndex,
 }
 
 impl QueryType {
@@ -51,6 +69,14 @@ impl QueryType {
             Self::KeysUnsortedSelect => "keys_unsorted | select(true)",
             Self::Map => "map(.)",
             Self::Select => "select(true)",
+            Self::UsersNavigate => ".users[0].name",
+            Self::UsersLength => ".users | length",
+            Self::UsersSelect => "[.users[] | select(.age > 50) | .name]",
+            Self::UsersMap => ".users | map(.score)",
+            Self::UsersSortBy => ".users | sort_by(.age)",
+            Self::UsersInterpolate => r#".users[] | "\(.name) <\(.email)>""#,
+            Self::UsersGroupBy => ".users | group_by(.age)",
+            Self::UsersIndex => ".users | INDEX(.id)",
         }
     }
 
@@ -64,6 +90,14 @@ impl QueryType {
             Self::KeysUnsortedSelect => "keys_unsorted_select",
             Self::Map => "map",
             Self::Select => "select",
+            Self::UsersNavigate => "users_navigate",
+            Self::UsersLength => "users_length",
+            Self::UsersSelect => "users_select",
+            Self::UsersMap => "users_map",
+            Self::UsersSortBy => "users_sort_by",
+            Self::UsersInterpolate => "users_interpolate",
+            Self::UsersGroupBy => "users_group_by",
+            Self::UsersIndex => "users_index",
         }
     }
 
@@ -76,6 +110,16 @@ impl QueryType {
             Self::KeysUnsortedSelect => "eager fallback",
             Self::Map => "lazy (#725)",
             Self::Select => "native (single-value arm)",
+            // Query shapes, not execution-path claims: which arm answers each is not
+            // established by this benchmark.
+            Self::UsersNavigate => "navigation",
+            Self::UsersLength => "length",
+            Self::UsersSelect => "filter and project",
+            Self::UsersMap => "projection",
+            Self::UsersSortBy => "sort",
+            Self::UsersInterpolate => "string interpolation",
+            Self::UsersGroupBy => "group_by",
+            Self::UsersIndex => "INDEX",
         }
     }
 
@@ -89,6 +133,14 @@ impl QueryType {
             "keys_unsorted_select" => Some(Self::KeysUnsortedSelect),
             "map" => Some(Self::Map),
             "select" => Some(Self::Select),
+            "users_navigate" => Some(Self::UsersNavigate),
+            "users_length" => Some(Self::UsersLength),
+            "users_select" => Some(Self::UsersSelect),
+            "users_map" => Some(Self::UsersMap),
+            "users_sort_by" => Some(Self::UsersSortBy),
+            "users_interpolate" => Some(Self::UsersInterpolate),
+            "users_group_by" => Some(Self::UsersGroupBy),
+            "users_index" => Some(Self::UsersIndex),
             _ => None,
         }
     }
@@ -104,6 +156,26 @@ impl QueryType {
             Self::Map,
             Self::Select,
         ]
+    }
+
+    /// The queries over the `users` pattern's shape (#5336), for `--queries users_mix`
+    pub fn users_mix() -> &'static [Self] {
+        &[
+            Self::Identity,
+            Self::UsersNavigate,
+            Self::UsersLength,
+            Self::UsersSelect,
+            Self::UsersMap,
+            Self::UsersSortBy,
+            Self::UsersInterpolate,
+            Self::UsersGroupBy,
+            Self::UsersIndex,
+        ]
+    }
+
+    /// Every query type, for looking one up by its query string
+    fn every() -> impl Iterator<Item = &'static Self> {
+        Self::all().iter().chain(Self::users_mix().iter().skip(1))
     }
 }
 
@@ -620,16 +692,14 @@ pub fn generate_markdown(results: &[BenchmarkResult], memory_mode: bool) -> Stri
     md.push_str(&format!("**CPU**: {cpu_info}\n\n"));
 
     // Collect unique queries from results, in QueryType::all() order
-    let queries: Vec<&str> = QueryType::all()
-        .iter()
+    let queries: Vec<&str> = QueryType::every()
         .map(QueryType::query)
         .filter(|q| results.iter().any(|r| r.query == *q))
         .collect();
 
     if queries.len() > 1 {
         for query in &queries {
-            let query_path = QueryType::all()
-                .iter()
+            let query_path = QueryType::every()
                 .find(|q| q.query() == *query)
                 .map(QueryType::path_description)
                 .unwrap_or_default();
@@ -868,8 +938,34 @@ mod tests {
 
     #[test]
     fn test_query_type_from_str_round_trips_names() {
-        for q in QueryType::all() {
+        for q in QueryType::every() {
             assert_eq!(QueryType::from_str(q.name()), Some(*q));
+        }
+    }
+
+    #[test]
+    fn test_users_mix_query_strings() {
+        // Fed to real `jq`/`succinctly jq` subprocesses, like the generic queries above (#5336).
+        let got: Vec<&str> = QueryType::users_mix()
+            .iter()
+            .map(QueryType::query)
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ".",
+                ".users[0].name",
+                ".users | length",
+                "[.users[] | select(.age > 50) | .name]",
+                ".users | map(.score)",
+                ".users | sort_by(.age)",
+                r#".users[] | "\(.name) <\(.email)>""#,
+                ".users | group_by(.age)",
+                ".users | INDEX(.id)",
+            ]
+        );
+        for q in QueryType::users_mix() {
+            assert_ne!(q.path_description(), "");
         }
     }
 
