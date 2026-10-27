@@ -1643,13 +1643,15 @@ fn a_tail_recursive_def_runs_as_a_loop_5379() {
                 "def f: f; f",
                 err(&[], "f/0 exceeded maximum recursion depth"),
             ),
-            // Not a call jq jumps from: it still nests, and still reaches the guard.
-            (
-                "0",
-                "def f: [f]; f",
-                err(&[], "f/0 exceeded maximum recursion depth"),
-            ),
         ]);
+        // Not a call jq jumps from: it still nests, and still reaches the guard. The
+        // guard is the native-stack floor, a thread-local `no_std` does not have.
+        #[cfg(feature = "std")]
+        check(&[(
+            "0",
+            "def f: [f]; f",
+            err(&[], "f/0 exceeded maximum recursion depth"),
+        )]);
     });
 }
 

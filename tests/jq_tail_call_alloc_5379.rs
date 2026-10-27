@@ -243,7 +243,11 @@ fn a_tail_loop_over_a_document_node_holds_no_memory_per_round_5379() {
 /// a body reused round after round would turn hot on the second round (#3148) and keep it, where
 /// a nested call's fresh nodes are freed as they return. `fib(18)` is about 8,000 calls, 14 MB
 /// kept and under a megabyte not.
+///
+/// `std` only: the retention scope that frees a call's tree when it returns is backed by a
+/// thread-local, which `no_std` does not have (see `retention_scope`).
 #[test]
+#[cfg(feature = "std")]
 fn a_non_tail_call_in_a_loop_body_is_not_kept_5379() {
     let program = "def fib(n): if n < 2 then n else fib(n - 1) + fib(n - 2) end; \
                    def f: if . < 5 then . + (fib(18) * 0) + 1 | f else . end; 0 | f";
