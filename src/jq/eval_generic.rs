@@ -16384,8 +16384,13 @@ fn each_def_call_generic<S: EvalSemantics, V: DocumentValue>(
     sink: &mut dyn Sink<V>,
 ) -> Flow {
     match bind_def_call(def, args, frames, bound) {
-        // #5379: see `eval::each_def_tail_loop`.
-        Ok(body) if tail_reachable(def, S::TAG == EvalTag::Jq) => {
+        // #5379: see `eval::each_def_tail_loop`. A body that is no more than a call
+        // (`def g: f`) is nested one level: the callee runs its own loop, and a loop
+        // that passes through `g` hops into it.
+        Ok(body)
+            if tail_reachable(def, S::TAG == EvalTag::Jq)
+                && !matches!(&*body, Expr::DefCall { .. }) =>
+        {
             each_def_tail_loop_generic::<S, V>(
                 def, frames, bound, body, value, optional, cursor, sink,
             )

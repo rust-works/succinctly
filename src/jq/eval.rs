@@ -97876,7 +97876,10 @@ fn eval_def_call<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #5379: the loop is sink-driven, so a body that ends in a tail call is
         // collected from it; `eval_each` with a sink that never stops delivers
         // what `eval_single` would (see `drain_result`).
-        Ok(body) if tail_reachable(def, S::TAG == EvalTag::Jq) => {
+        Ok(body)
+            if tail_reachable(def, S::TAG == EvalTag::Jq)
+                && !matches!(&*body, Expr::DefCall { .. }) =>
+        {
             let mut items: Vec<Item<'a, W>> = Vec::new();
             let flow = each_def_tail_loop::<W, S>(
                 def,
@@ -97918,7 +97921,12 @@ fn each_def_call<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
     match bind_def_call(def, args, frames, bound) {
-        Ok(body) if tail_reachable(def, S::TAG == EvalTag::Jq) => {
+        // A body that is no more than a call (`def g: f`) is nested one level: the
+        // callee runs its own loop, and a loop that passes through `g` hops into it.
+        Ok(body)
+            if tail_reachable(def, S::TAG == EvalTag::Jq)
+                && !matches!(&*body, Expr::DefCall { .. }) =>
+        {
             each_def_tail_loop::<W, S>(def, frames, bound, body, value, optional, sink)
         }
         Ok(body) => match enter_def_call(def, frames, bound) {
