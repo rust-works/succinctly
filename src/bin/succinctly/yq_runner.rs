@@ -7110,21 +7110,40 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
             // Same reasoning as `LazyKeys`/`LazyIndexRange` above, for a
             // composed `map` chain (#724, #725) that never resolved into a
             // narrower shape before reaching this materializing DOM boundary.
-            GenericResult::LazySeq(seq) => match seq.materialize_atomic::<YqSemantics>() {
-                Ok(v) => Ok(vec![no_comments(v)]),
-                Err(jq::Control::Error(e)) => {
-                    sink.report(DiagStyle::Yq, &e, &no_location());
-                    Ok(vec![])
+            //
+            // A sequence whose elements are still document nodes keeps what each node
+            // carries (its tag, comment, anchor and quoting), as `map(.)` does (#5429). Not
+            // when the filter reads `key`: that hands over a mapping's key node, which yq
+            // prints bare however it was written.
+            GenericResult::LazySeq(seq) => {
+                let keeps_nodes = need_comments
+                    && presentation_sync_ctx.is_none()
+                    && !jq::walk::any_subexpr(expr, &mut |e| {
+                        matches!(e, Expr::Builtin(Builtin::Key))
+                    });
+                let built = if keeps_nodes {
+                    seq.drain_atomic()
+                        .map(reshape_presentation::sequence_of_nodes)
+                } else {
+                    seq.materialize_atomic::<YqSemantics>()
+                        .map(|v| Ok(no_comments(v)))
+                };
+                match built {
+                    Ok(Ok(pair)) => Ok(vec![pair]),
+                    Ok(Err(e)) | Err(jq::Control::Error(e)) => {
+                        sink.report(DiagStyle::Yq, &e, &no_location());
+                        Ok(vec![])
+                    }
+                    Err(jq::Control::Break(label)) => {
+                        sink.report_break(DiagStyle::Yq, &label, &no_location());
+                        Ok(vec![])
+                    }
+                    Err(jq::Control::Halt(code)) => {
+                        sink.request_halt(code);
+                        Ok(vec![])
+                    }
                 }
-                Err(jq::Control::Break(label)) => {
-                    sink.report_break(DiagStyle::Yq, &label, &no_location());
-                    Ok(vec![])
-                }
-                Err(jq::Control::Halt(code)) => {
-                    sink.request_halt(code);
-                    Ok(vec![])
-                }
-            },
+            }
             // jq mode builds this; yq never does, but the DOM boundary answers it
             // as the owned object it stands for (#4044).
             GenericResult::LazyObject(obj) => {

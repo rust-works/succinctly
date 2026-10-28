@@ -4261,7 +4261,8 @@ reads as a plain `!!str`, and an alias element (`*x`) as the value it names (`ma
 `[!!float 1, !!binary aGk=, &x !!str 5, *x]` is `["!!float","!!binary","!!str",""]` in yq,
 `["!!float","!!str","!!str","!!str"]` after a slice here; without the slice both agree). How a
 sliced value's tag is *rendered* in YAML output (`- !!str 2` vs `- "2"`) is the missing explicit-tag
-slot, [#1416](https://github.com/rust-works/succinctly/issues/1416).
+slot, [#1416](https://github.com/rust-works/succinctly/issues/1416), for a computed-bound slice.
+A literal-bound slice (`.[1:]`, `.a[:2]`) keeps each element's tag, comment, anchor and quoting (#5429).
 
 ### `.[]` over a non-container is now a silent no-op — two residual gaps remain (#2346)
 
@@ -4714,8 +4715,9 @@ other and with real yq.
 call sites — any read through a real YAML document).
 Most filters that build a value out of document nodes keep the node's tag, as yq does:
 `map(.)`, `[.a]`, `[.a, .b]`, `{"k": .a}`, `to_entries`, `with_entries(.)` over a mapping, `sort`, `reverse`, `unique` and `. + []` over a sequence.
+So does a sequence built from nodes ([#5429](https://github.com/rust-works/succinctly/issues/5429)): `[.[]]`, `[.[] | select(...)]`, `[(.a, .b)]`, `[.a] + [.b]`, a literal-bound slice (`.[1:]`, `.a[:2]`), `flatten`, `flatten(n)` and `map_values(f)`, so `[.Outputs[]]` over a CloudFormation template prints `Value: !Ref Bucket`.
 A custom tag is still lost when the value leaves cursor tracking on one of the routes
-[#5429](https://github.com/rust-works/succinctly/issues/5429) lists (`[.[]]`, array slices, `map_values`, `$x`, array `+`, `flatten`), on `with_entries(.)` over a sequence, on most filters under `--eval-all` ([#4380](https://github.com/rust-works/succinctly/issues/4380)), and in a `load()`ed document.
+[#5429](https://github.com/rust-works/succinctly/issues/5429) still lists (a variable, `.a as $x | [$x]`; a further stage after a construction, `[.a] | .`; an iterating operand inside one, `[.a[].b] + [.c]`; a computed slice bound; `map_values(select(...))`), on `with_entries(.)` over a sequence, on most filters under `--eval-all` ([#4380](https://github.com/rust-works/succinctly/issues/4380)), and in a `load()`ed document.
 The tag is lost there together with the node's comment, anchor and quoting, because those routes keep none of a node's presentation.
 Input that is not YAML carries no tag to lose.
 This is not a regression from this fix: `tag`'s own prior, unconditional (non-cursor) implementation
