@@ -496,7 +496,7 @@ use super::expr::{
     retention_scope, ArithOp, ArithSettleMemo, AssignOp, BindOrigin, BoundBody, Builtin, CompareOp,
     Expr, FormatType, FuncDefBound, FuncDefData, Libm1, Libm2, Libm3, Literal, MergeFlags,
     MetaSlot, NumberKey, ObjectEntry, ObjectKey, Origin, Param, Pattern, PatternEntry, PipeStages,
-    SharedArg, SliceBoundKey, StringPart, Tracked,
+    SharedArg, SliceBoundKey, StringPart, TailPlan, Tracked,
 };
 use super::value::{
     assert_value_tree_depth, check_value_tree_depth, cmp_f64, document_number_f64,
@@ -11655,6 +11655,19 @@ enum RestCopy {
 }
 
 impl RestCopy {
+    /// The pipe over a tail that holds evaluation state, as its owner split it
+    /// (#5421), built on the first call that asks and kept until this is
+    /// dropped, as [`Self::owned_pipe`] is.
+    fn split_pipe(&mut self, stages: impl FnOnce() -> Vec<Expr>) -> &Expr {
+        if !matches!(self, Self::Owned(_)) {
+            *self = Self::Owned(Expr::Pipe(stages().into()));
+        }
+        match self {
+            Self::Owned(whole) => whole,
+            Self::Unasked | Self::Bare => unreachable!("the split pipe was just built"), // patchcov: coverage tolerate-line reason="unreachable: the `if` above replaces every other state with `Owned` before this match"
+        }
+    }
+
     /// The owned pipe over `stages`, built on the first call.
     fn owned_pipe(&mut self, stages: &[Expr]) -> &Expr {
         if !matches!(self, Self::Owned(_)) {
@@ -11764,12 +11777,19 @@ impl<'a> RestPipe<'a> {
         // A rest of several stages: the copy the owner keeps, once it keeps one
         // (#5417); this `RestPipe`'s own, built on the first call, otherwise.
         let kept;
-        let whole = match lone.is_none().then(|| self.tail().kept_copy()).flatten() {
-            Some(copy) => {
+        let whole = match lone.is_none().then(|| self.tail().plan()) {
+            Some(TailPlan::Whole(copy)) => {
                 kept = copy;
-                &*kept
+                kept.expr()
             }
-            None => self.copy.owned_pipe(self.stages),
+            Some(TailPlan::Split) => {
+                let tail = self.tail();
+                self.copy.split_pipe(|| {
+                    let owner = tail.owner.expect("only a tail with an owner splits");
+                    split_tail_of(owner, owner.len() - tail.stages.len())
+                })
+            }
+            Some(TailPlan::Copy) | None => self.copy.owned_pipe(self.stages),
         };
         if lone.is_some() {
             eval_each_owned_past_front_doors::<S>(whole, input, optional, reentry, sink)
@@ -28429,12 +28449,9 @@ impl<'p> PipeTail<'p> {
         }
     }
 
-    /// The owned `Expr::Pipe` over these stages if the owner keeps one. It
-    /// does not for a tail that holds evaluation state, whose copy has to start
-    /// empty each call ([`holds_evaluation_state`], #3148), nor for one past
-    /// [`MAX_KEPT_TAIL_NODES`] nodes.
-    fn kept_copy(self) -> Option<Rc<Expr>> {
-        kept_copy_of(self.owner, self.from)
+    /// What the owner hands on for these stages ([`tail_plan_of`]).
+    fn plan(self) -> TailPlan {
+        tail_plan_of(self.owner, self.from)
     }
 }
 
@@ -28491,31 +28508,46 @@ impl<'p> RestTail<'p> {
         }
     }
 
-    /// The owned `Expr::Pipe` over these stages if the owner keeps one
-    /// ([`PipeTail::kept_copy`]).
-    pub(crate) fn kept_copy(self) -> Option<Rc<Expr>> {
-        let owner = self.owner?;
-        kept_copy_of(owner, owner.len() - self.stages.len())
+    /// What the owner hands on for these stages ([`PipeTail::plan`]); a tail
+    /// with no owner is copied.
+    pub(crate) fn plan(self) -> TailPlan {
+        match self.owner {
+            Some(owner) => tail_plan_of(owner, owner.len() - self.stages.len()),
+            None => TailPlan::Copy,
+        }
     }
 }
 
-/// The copy `owner` keeps of its stages from `from` on, if it keeps one.
-fn kept_copy_of(owner: &PipeStages, from: usize) -> Option<Rc<Expr>> {
-    owner.kept_tail(from, |stages| {
-        let mut nodes = 0usize;
-        let small = !stages.iter().any(|stage| {
-            any_subexpr(stage, &mut |_| {
-                nodes += 1;
-                nodes > MAX_KEPT_TAIL_NODES
-            })
-        });
-        let keep = small && !stages.iter().any(holds_evaluation_state);
-        #[cfg(test)]
-        if keep {
-            owned_pipe_copies::bump();
-        }
-        keep
-    })
+/// What `owner` hands on for its stages from `from` on ([`PipeStages::tail_plan`]).
+///
+/// A tail, or a run of stateless stages in one that holds evaluation state
+/// ([`holds_evaluation_state`], #3148), is kept up to [`MAX_KEPT_TAIL_NODES`]
+/// nodes.
+fn tail_plan_of(owner: &PipeStages, from: usize) -> TailPlan {
+    owner.tail_plan(from, holds_evaluation_state, may_keep_run)
+}
+
+/// The stages that stand for the tail of `owner` from `from` on, once
+/// [`tail_plan_of`] has split it (#5421).
+fn split_tail_of(owner: &PipeStages, from: usize) -> Vec<Expr> {
+    owner.split_tail(from, may_keep_run)
+}
+
+/// Whether a tail or a run of stateless stages is small enough to keep: no
+/// more than [`MAX_KEPT_TAIL_NODES`] nodes.
+fn may_keep_run(stages: &[Expr]) -> bool {
+    let mut nodes = 0usize;
+    let small = !stages.iter().any(|stage| {
+        any_subexpr(stage, &mut |_| {
+            nodes += 1;
+            nodes > MAX_KEPT_TAIL_NODES
+        })
+    });
+    #[cfg(test)]
+    if small {
+        owned_pipe_copies::bump();
+    }
+    small
 }
 
 /// The most nodes a kept tail may hold (#5404). A pipe keeps up to `n - 2`
@@ -28868,15 +28900,20 @@ fn eval_owned_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `#[inline(always)]`, so a second call site would emit its large body twice
     // in this recursive function.
     let kept;
+    let split;
     let copy;
     let rest: &Expr = match exprs {
         [stage] if !holds_evaluation_state(stage) => stage,
-        _ => match tail.kept_copy() {
-            Some(whole) => {
+        _ => match tail.plan() {
+            TailPlan::Whole(whole) => {
                 kept = whole;
-                &kept
+                kept.expr()
             }
-            None => {
+            TailPlan::Split => {
+                split = Expr::Pipe(split_tail_of(tail.owner, tail.from).into());
+                &split
+            }
+            TailPlan::Copy => {
                 #[cfg(test)]
                 owned_pipe_copies::bump();
                 copy = if exprs.len() == 1 {
@@ -111959,16 +111996,14 @@ mod tests {
         assert!(core::ptr::eq(rest.stages(), &stages[1..]));
         assert_eq!(rest.rest().stages().len(), 2);
         assert!(
-            whole.rest().rest().kept_copy().is_none(),
+            matches!(whole.rest().rest().plan(), TailPlan::Copy),
             "the first ask keeps nothing"
         );
-        assert!(whole
-            .rest()
-            .rest()
-            .kept_copy()
-            .is_some_and(|kept| matches!(&*kept, Expr::Pipe(tail) if tail.len() == 2)));
         assert!(
-            rest.rest().rest().kept_copy().is_none(),
+            matches!(whole.rest().rest().plan(), TailPlan::Whole(kept) if matches!(kept.expr(), Expr::Pipe(tail) if tail.len() == 2))
+        );
+        assert!(
+            matches!(rest.rest().rest().plan(), TailPlan::Copy),
             "a lone stage is handed on as itself, not kept"
         );
     }
