@@ -311,7 +311,11 @@ impl<V> ObjectMapOf<V> {
     }
 
     /// Whether another handle currently shares this storage, i.e.
-    /// whether the next write through this handle will copy it.
+    /// whether the next write through this handle will copy the map.
+    ///
+    /// The side list of a repeated key is a separate allocation, copied only
+    /// by a write that changes it (a new key, a removal, a new repeat), so a
+    /// shared side list does not show here.
     ///
     /// Always `false` under `unshared-containers`, where every clone
     /// already copied eagerly.
@@ -571,6 +575,41 @@ impl<V: Clone> ObjectMapOf<V> {
         map_mut(&mut self.map).values_mut()
     }
 
+    /// The slot, key and a mutable reference to the value for `key` -- the
+    /// live (last) entry when the key repeats.
+    #[inline]
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+    pub fn get_full_mut<Q>(&mut self, key: &Q) -> Option<(usize, &String, &mut V)>
+    where
+        Q: ?Sized + Hash + Equivalent<String>,
+    {
+        map_mut(&mut self.map).get_full_mut(key)
+    }
+
+    /// The key and a mutable reference to the value for `key`.
+    #[inline]
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+    pub fn get_key_value_mut<Q>(&mut self, key: &Q) -> Option<(&String, &mut V)>
+    where
+        Q: ?Sized + Hash + Equivalent<String>,
+    {
+        map_mut(&mut self.map).get_key_value_mut(key)
+    }
+
+    /// The collapsed view's first entry, mutably.
+    #[inline]
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+    pub fn first_mut(&mut self) -> Option<(&String, &mut V)> {
+        map_mut(&mut self.map).first_mut()
+    }
+
+    /// The collapsed view's last entry, mutably.
+    #[inline]
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+    pub fn last_mut(&mut self) -> Option<(&String, &mut V)> {
+        map_mut(&mut self.map).last_mut()
+    }
+
     /// Sets `key` to `value`, returning the value it replaced.
     ///
     /// An existing key's live (last) entry is replaced and earlier entries
@@ -580,12 +619,16 @@ impl<V: Clone> ObjectMapOf<V> {
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     pub fn insert(&mut self, key: String, value: V) -> Option<V> {
         let map = map_mut(&mut self.map);
-        let Some(shadows) = live_shadows_mut(&mut self.shadows) else {
+        if self.shadows.is_none() {
             return map.insert(key, value);
-        };
+        }
         let (slot, old) = map.insert_full(key, value);
         if old.is_none() {
-            shadows.push_live(slot);
+            // Only a new key changes the side list; replacing a live value
+            // must not copy a side list another handle shares.
+            if let Some(shadows) = live_shadows_mut(&mut self.shadows) {
+                shadows.push_live(slot);
+            }
         }
         old
     }
@@ -599,14 +642,14 @@ impl<V: Clone> ObjectMapOf<V> {
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     pub fn entry(&mut self, key: String) -> ObjectMapEntry<'_, V> {
         let map = map_mut(&mut self.map);
-        let shadows = live_shadows_mut(&mut self.shadows);
         match map.entry(key) {
             indexmap::map::Entry::Occupied(entry) => {
                 ObjectMapEntry::Occupied(OccupiedMapEntry(entry))
             }
-            indexmap::map::Entry::Vacant(entry) => {
-                ObjectMapEntry::Vacant(VacantMapEntry { entry, shadows })
-            }
+            indexmap::map::Entry::Vacant(entry) => ObjectMapEntry::Vacant(VacantMapEntry {
+                entry,
+                shadows: &mut self.shadows,
+            }),
         }
     }
 
@@ -737,7 +780,7 @@ pub struct OccupiedMapEntry<'a, V>(indexmap::map::OccupiedEntry<'a, String, V>);
 /// An [`ObjectMapEntry`] for a key the object lacks.
 pub struct VacantMapEntry<'a, V> {
     entry: indexmap::map::VacantEntry<'a, String, V>,
-    shadows: Option<&'a mut Shadows<V>>,
+    shadows: &'a mut Option<ShadowsInnerOf<V>>,
 }
 
 impl<'a, V> OccupiedMapEntry<'a, V> {
@@ -772,25 +815,27 @@ impl<'a, V> OccupiedMapEntry<'a, V> {
     }
 }
 
-impl<'a, V> VacantMapEntry<'a, V> {
+impl<V> VacantMapEntry<'_, V> {
     /// The key that would be inserted.
     #[inline]
     pub fn key(&self) -> &String {
         self.entry.key()
     }
+}
 
+impl<'a, V: Clone> VacantMapEntry<'a, V> {
     /// Appends the key with `value`.
     #[inline]
     pub fn insert(self, value: V) -> &'a mut V {
         let slot = self.entry.index();
-        if let Some(shadows) = self.shadows {
+        if let Some(shadows) = live_shadows_mut(self.shadows) {
             shadows.push_live(slot);
         }
         self.entry.insert(value)
     }
 }
 
-impl<'a, V> ObjectMapEntry<'a, V> {
+impl<V> ObjectMapEntry<'_, V> {
     /// The key this entry is for.
     #[inline]
     pub fn key(&self) -> &String {
@@ -799,7 +844,9 @@ impl<'a, V> ObjectMapEntry<'a, V> {
             Self::Vacant(entry) => entry.key(),
         }
     }
+}
 
+impl<'a, V: Clone> ObjectMapEntry<'a, V> {
     /// Runs `f` on the key's live value if the object has the key, then
     /// returns the entry for chaining.
     #[inline]
@@ -1372,6 +1419,41 @@ mod tests {
         collapsed.collapse();
         assert!(!map.ptr_eq(&collapsed));
         assert!(!collapsed.has_shadows());
+        assert_eq!(owned(&map), pairs(&[("a", 1), ("a", 2)]));
+    }
+
+    #[test]
+    fn value_only_accessors_keep_the_shadows() {
+        let mut map = with_repeats(&[("a", 1), ("b", 2), ("a", 3)]);
+        *map.get_full_mut("a").unwrap().2 += 10;
+        *map.get_key_value_mut("b").unwrap().1 += 10;
+        *map.first_mut().unwrap().1 += 100;
+        *map.last_mut().unwrap().1 += 1000;
+        assert_eq!(owned(&map), pairs(&[("a", 1), ("b", 1012), ("a", 113)]));
+        map.assert_invariants();
+    }
+
+    #[test]
+    #[cfg(not(feature = "unshared-containers"))]
+    fn replacing_a_live_value_does_not_copy_a_shared_side_list() {
+        let map = with_repeats(&[("a", 1), ("a", 2)]);
+        let mut copy = map.clone();
+        copy.insert("a".into(), 9);
+        copy.entry("a".into()).and_modify(|v| *v += 1);
+        assert!(
+            Rc::ptr_eq(
+                map.shadows.as_ref().unwrap(),
+                copy.shadows.as_ref().unwrap()
+            ),
+            "the side list was copied by a write that did not change it"
+        );
+        assert_eq!(owned(&copy), pairs(&[("a", 1), ("a", 10)]));
+        // A new key does change it.
+        copy.insert("b".into(), 5);
+        assert!(!Rc::ptr_eq(
+            map.shadows.as_ref().unwrap(),
+            copy.shadows.as_ref().unwrap()
+        ));
         assert_eq!(owned(&map), pairs(&[("a", 1), ("a", 2)]));
     }
 

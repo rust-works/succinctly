@@ -6283,9 +6283,12 @@ mod tests {
         assert!(sized.capacity() >= 8);
     }
 
-    /// `as_object`/`as_object_mut` keep returning a bare `&IndexMap`
-    /// (#3000's public-API promise): the boxing is not supposed to show up
-    /// in either signature, only in the variant's own payload.
+    /// `as_object` keeps returning a bare `&IndexMap` (#3000's public-API
+    /// promise): the boxing is not supposed to show up in the signature, only
+    /// in the variant's own payload. `as_object_mut` returns `&mut ObjectMap`
+    /// since #1344 so the shadow-aware mutators are reachable, and an
+    /// `&mut IndexMap` annotation still compiles by deref coercion -- which is
+    /// what the `let` below exercises.
     #[test]
     fn as_object_accessors_still_hand_out_a_bare_index_map_3000() {
         let mut value = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
