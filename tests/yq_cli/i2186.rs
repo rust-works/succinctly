@@ -1,11 +1,10 @@
-//! #2186: the routes that print a repeated mapping key once, where yq v4.53.3 prints it twice.
+//! #2186: the routes that printed a repeated mapping key once, where yq v4.53.3 prints it twice.
 //!
-//! The DOM route's result is an `OwnedValue` (`ResultWithComments`), so anything that reaches
-//! it has merged `a: 1 / a: 2` into `a: 2` before output; `docs/compliance/yq/limitations.md`
-//! lists the routes. The collapsed rows pin today's answer, not yq's: when a duplicate-capable
-//! value (#1344 (b)) lands, a row flips to yq's answer (the document, every key kept) and its
-//! entry in that page goes. The first test is the control: it shows the document really has a
-//! repeated key and that the cursor route, which a plain `.` takes, still keeps it.
+//! The DOM route's result is an `OwnedValue` (`ResultWithComments`). It used to be `IndexMap`-backed,
+//! so anything that reached it had merged `a: 1 / a: 2` into `a: 2` before output. Since the
+//! duplicate-capable value (#1344, ADR-0027) those routes print yq's answer, every key kept. The
+//! first test is the control: it shows the document really has a repeated key and that the cursor
+//! route, which a plain `.` takes, keeps it.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -35,7 +34,6 @@ fn inplace(contents: &str, filter: &str) -> Result<String> {
 }
 
 const DUP: &str = "a: 1\na: 2\nb: 3\n";
-const COLLAPSED: &str = "a: 2\nb: 3\n";
 
 #[test]
 fn the_cursor_route_keeps_the_repeated_key_2186() -> Result<()> {
@@ -55,13 +53,30 @@ fn the_cursor_route_keeps_the_repeated_key_2186() -> Result<()> {
 }
 
 #[test]
-fn the_dom_forcing_routes_collapse_the_repeated_key_2186() -> Result<()> {
+fn the_dom_forcing_routes_keep_the_repeated_key_2186() -> Result<()> {
     let rows: &[(&str, &[&str], &str)] = &[
-        (".", &["-P"], COLLAPSED),
-        (".", &["--arg", "z", "y"], COLLAPSED),
-        (".", &["--eval-all"], COLLAPSED),
-        (".[0]", &["--slurp"], COLLAPSED),
-        (".b = 5", &[], "a: 2\nb: 5\n"),
+        (".", &["-P"], DUP),
+        (".", &["--arg", "z", "y"], DUP),
+        (".", &["--eval-all"], DUP),
+    ];
+    for (filter, args, expected) in rows {
+        let (out, code) = run_yq_stdin(filter, DUP, args)?;
+        assert_eq!(code, 0, "{filter} {args:?}");
+        assert_eq!(out, *expected, "{filter} {args:?}");
+    }
+    Ok(())
+}
+
+/// Since #1344 (ADR-0027) the owned value holds a repeated key's earlier entry beside the
+/// collapsed view, so the routes above and these -- `--slurp`'s document and a write through a
+/// path -- all print yq's answer: every entry, the written one replacing only the last.
+#[test]
+fn the_routes_without_a_comment_tree_keep_the_repeated_key_2186() -> Result<()> {
+    let rows: &[(&str, &[&str], &str)] = &[
+        (".[0]", &["--slurp"], DUP),
+        (".b = 5", &[], "a: 1\na: 2\nb: 5\n"),
+        (".c = 1", &[], "a: 1\na: 2\nb: 3\nc: 1\n"),
+        ("del(.b)", &[], "a: 1\na: 2\n"),
     ];
     for (filter, args, expected) in rows {
         let (out, code) = run_yq_stdin(filter, DUP, args)?;
@@ -91,13 +106,13 @@ fn the_dom_route_keeps_a_large_integers_spelling_through_a_lazy_seq_2186() -> Re
     Ok(())
 }
 
-/// `-i` follows stdout: a read-only filter is evaluated on cursors and keeps the repeated key
-/// (the #1343 bullet no longer lists `-i`), while a write rebuilds the document and collapses.
+/// `-i` follows stdout: a read-only filter is evaluated on cursors and keeps the repeated key,
+/// and since #1344 a write keeps it too (yq: `.b = 5` leaves both `a` entries).
 #[test]
-fn inplace_keeps_the_key_for_a_read_only_filter_and_collapses_for_a_write_2186() -> Result<()> {
+fn inplace_keeps_the_repeated_key_for_a_read_only_filter_and_for_a_write_2186() -> Result<()> {
     assert_eq!(inplace(DUP, "keys")?, "- a\n- a\n- b\n");
     assert_eq!(inplace(DUP, "to_entries | length")?, "3\n");
-    assert_eq!(inplace(DUP, ".b = 5")?, "a: 2\nb: 5\n");
-    assert_eq!(inplace(DUP, "del(.b)")?, "a: 2\n");
+    assert_eq!(inplace(DUP, ".b = 5")?, "a: 1\na: 2\nb: 5\n");
+    assert_eq!(inplace(DUP, "del(.b)")?, "a: 1\na: 2\n");
     Ok(())
 }

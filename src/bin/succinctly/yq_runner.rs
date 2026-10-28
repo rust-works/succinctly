@@ -21,14 +21,14 @@ use succinctly::jq::eval_generic::{
     check_nesting_depth, depth_guard_panic_message, eval_with_cursor_using,
     to_owned as generic_to_owned, to_owned_cursor as generic_to_owned_cursor,
     to_owned_with_comments, to_owned_yaml_cursor, AnchorMark, CommentTree, GenericResult, NodeMeta,
-    KEY_STYLE_STRING, VALUE_STYLE_STRING,
+    ObjectBuilder, KEY_STYLE_STRING, VALUE_STYLE_STRING,
 };
 use succinctly::jq::stream::StreamFailure;
 use succinctly::jq::{
     self, alias_identity, assert_value_tree_depth, is_alias_sensitive_assign,
     nesting_depth_exceeded_message, nonfinite_display_string, nonfinite_literal_display,
     sync_aliased_paths, Builtin, DefScope, EvalError, Expr, Literal, MetaSlot, NumberRepr,
-    ObjectKey, ObjectMap, ObjectMapOf, OwnedValue, QueryResult, YqSemantics,
+    ObjectKey, ObjectMap, OwnedValue, QueryResult, YqSemantics,
 };
 use succinctly::json::light::JsonCursor;
 use succinctly::json::validate;
@@ -1769,7 +1769,7 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
     // `[...]` nesting used to panic here.
     check_nesting_depth(depth)?;
     Ok(if let Some(fields) = value.as_object() {
-        let mut map = ObjectMapOf::new();
+        let mut map = ObjectBuilder::new();
         let mut guard = DisplayKeyGuard::default();
         let mut f = fields;
         let mut is_first = true;
@@ -1790,9 +1790,9 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
             // only callers of `parse_input`, hence of this function)
             // silently accepted `{"a" 1, "b": 2}` when every other route
             // into the evaluator correctly raised.
-            let key = field.checked_key(&f, &map, &mut guard, is_first)?;
+            let key = field.checked_key(&f, map.map(), &mut guard, is_first)?;
             // yq keeps a repeated mapping key's earlier entry (ADR-0027, #1344).
-            map.push_occurrence(
+            map.push::<YqSemantics>(
                 key,
                 to_owned_canonicalizing_numbers_at_depth(
                     &field.value,
@@ -1816,7 +1816,7 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
         // `container_tail_gap_ok` arm here, closing #2211's `{,}` gap the
         // same way `eval_generic::to_owned_at_depth` does since #2358.
         tail_gap_ok(Some(cursor), last_field.as_ref(), b'}')?;
-        OwnedValue::Object(map)
+        OwnedValue::Object(map.finish())
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
         let mut elems = elements;

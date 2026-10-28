@@ -127,10 +127,10 @@ fn test_a_comma_reads_a_colliding_undecodable_key_as_dot_does_5283() -> Result<(
     Ok(())
 }
 
-/// Colored and NUL-terminated output keep the route they were tuned on: the repeated key is
-/// still merged there, a gap this change does not close.
+/// Colored and NUL-terminated output keep the route they were tuned on, and since #1344
+/// (ADR-0027) that route keeps the repeated key too, as yq does (#5414).
 #[test]
-fn test_color_and_nul_output_keep_the_dom_route_5283() -> Result<()> {
+fn test_color_and_nul_output_keep_the_repeated_key_on_the_dom_route_5283() -> Result<()> {
     let strip_ansi = |text: &str| {
         let mut out = String::new();
         let mut chars = text.chars();
@@ -151,11 +151,11 @@ fn test_color_and_nul_output_keep_the_dom_route_5283() -> Result<()> {
     assert_eq!(code, 0);
     let colored = strip_ansi(&colored);
     assert!(
-        colored.contains("a: 2") && !colored.contains("a: 1"),
+        colored.contains("a: 2") && colored.contains("a: 1"),
         "{colored:?}"
     );
     let (nul, code) = run_yq_stdin("., .b", DUP, &["-0"])?;
     assert_eq!(code, 0);
-    assert!(nul.contains("a: 2") && !nul.contains("a: 1"), "{nul:?}");
+    assert!(nul.contains("a: 2") && nul.contains("a: 1"), "{nul:?}");
     Ok(())
 }

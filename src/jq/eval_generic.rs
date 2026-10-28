@@ -439,15 +439,14 @@ fn to_owned_checked_at_depth<S: EvalSemantics, V: DocumentValue>(
 ) -> Result<OwnedValue, EvalError> {
     check_nesting_depth(depth)?;
     if let Some(fields) = value.as_object_rendered() {
-        let mut map = ObjectMapOf::new();
+        let mut map = ObjectBuilder::new();
         let mut guard = DisplayKeyGuard::default();
         let mut f = fields;
         let mut is_first = true;
         let mut last_field: Option<V::Cursor> = None;
         while let Some((field, rest)) = f.uncons() {
-            let key = field.checked_key(&f, &map, &mut guard, is_first)?;
-            push_field::<S, _>(
-                &mut map,
+            let key = field.checked_key(&f, map.map(), &mut guard, is_first)?;
+            map.push::<S>(
                 key,
                 to_owned_checked_at_depth::<S, _>(&field.value, depth + 1)?,
             );
@@ -459,7 +458,7 @@ fn to_owned_checked_at_depth<S: EvalSemantics, V: DocumentValue>(
             return Err(f.malformed_member_error());
         }
         child_tail_gap_ok(last_field.as_ref(), b'}')?;
-        Ok(OwnedValue::Object(map))
+        Ok(OwnedValue::Object(map.finish()))
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
         let mut elems = elements;
@@ -666,7 +665,7 @@ fn to_owned_at_depth<S: EvalSemantics, V: DocumentValue>(
     }
     // Check containers first (arrays and objects have no type ambiguity)
     if let Some(fields) = value.as_object_rendered() {
-        let mut map = ObjectMapOf::new();
+        let mut map = ObjectBuilder::new();
         let mut guard = DisplayKeyGuard::default();
         let mut f = fields;
         let mut is_first = true;
@@ -679,9 +678,8 @@ fn to_owned_at_depth<S: EvalSemantics, V: DocumentValue>(
             // #1803: the #1642 key resolution and the #1677 delimiter
             // checks, as the one shared definition -- see
             // `DocumentField::checked_key` for which fault raises and why.
-            let key = field.checked_key(&f, &map, &mut guard, is_first)?;
-            push_field::<S, _>(
-                &mut map,
+            let key = field.checked_key(&f, map.map(), &mut guard, is_first)?;
+            map.push::<S>(
                 key,
                 to_owned_at_depth::<S, _>(&field.value, Some(&field.value_cursor), depth + 1)?,
             );
@@ -702,7 +700,7 @@ fn to_owned_at_depth<S: EvalSemantics, V: DocumentValue>(
         // (only ever hit at the true top level) still can't, for the reason
         // this function's own doc comment above explains.
         tail_gap_ok(cursor, last_field.as_ref(), b'}')?;
-        Ok(OwnedValue::Object(map))
+        Ok(OwnedValue::Object(map.finish()))
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
         let mut elems = elements;
@@ -1232,22 +1230,67 @@ pub fn validate_cursor<S: EvalSemantics, C: DocumentCursor>(cursor: &C) -> Resul
     result
 }
 
-/// Appends a member to an object being built by a cursor-to-owned walk.
+/// An object under construction by a cursor-to-owned walk.
 ///
 /// A mode that keeps a repeated mapping key (`!S::COLLAPSE_DUPLICATE_KEYS`, yq) records the earlier
-/// entry beside the collapsed view ([`ObjectMapOf::push_occurrence`], ADR-0027); the others replace it,
-/// as an `IndexMap::insert` always did. The one definition every materializer shares, so the walks
-/// cannot disagree about which mode keeps what (#1344).
-#[inline]
-pub(super) fn push_field<S: EvalSemantics, V: Clone>(
-    map: &mut ObjectMapOf<V>,
-    key: String,
-    value: V,
-) {
-    if S::COLLAPSE_DUPLICATE_KEYS {
-        map.insert(key, value);
-    } else {
-        map.push_occurrence(key, value);
+/// entry beside the collapsed view ([`ObjectMapOf::push_occurrence`], ADR-0027); the others replace
+/// it, as an `IndexMap::insert` always did. The members go into a plain `IndexMap`, exactly the walk's
+/// old hot loop, until a key repeats; only then does the map move into an [`ObjectMapOf`] that holds
+/// the shadow. One definition every materializer shares, so the walks cannot disagree about which
+/// mode keeps what (#1344).
+#[doc(hidden)]
+pub struct ObjectBuilder<V> {
+    plain: IndexMap<String, V>,
+    shadowed: Option<ObjectMapOf<V>>,
+}
+
+impl<V: Clone> ObjectBuilder<V> {
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            plain: IndexMap::new(),
+            shadowed: None,
+        }
+    }
+
+    /// The collapsed view so far, for the key-collision checks.
+    #[inline]
+    pub fn map(&self) -> &IndexMap<String, V> {
+        match &self.shadowed {
+            Some(shadowed) => shadowed,
+            None => &self.plain,
+        }
+    }
+
+    /// Appends a member.
+    #[inline]
+    pub fn push<S: EvalSemantics>(&mut self, key: String, value: V) {
+        if let Some(shadowed) = &mut self.shadowed {
+            shadowed.push_occurrence(key, value);
+        } else if S::COLLAPSE_DUPLICATE_KEYS {
+            self.plain.insert(key, value);
+        } else {
+            match self.plain.entry(key) {
+                indexmap::map::Entry::Vacant(slot) => {
+                    slot.insert(value);
+                }
+                indexmap::map::Entry::Occupied(slot) => {
+                    // The first repeat: the members so far become the collapsed view.
+                    let key = slot.key().clone();
+                    let mut shadowed = ObjectMapOf::from(core::mem::take(&mut self.plain));
+                    shadowed.push_occurrence(key, value);
+                    self.shadowed = Some(shadowed);
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub fn finish(self) -> ObjectMapOf<V> {
+        match self.shadowed {
+            Some(shadowed) => shadowed,
+            None => ObjectMapOf::from(self.plain),
+        }
     }
 }
 
@@ -1260,7 +1303,7 @@ trait CursorWalkOutput {
     /// arm skip the per-key `String` and the per-object collision map, which
     /// are all a walk that builds nothing would spend them on (#3478).
     const KEEPS_MEMBERS: bool;
-    fn object(map: ObjectMapOf<Self::Out>) -> Self::Out;
+    fn object(map: ObjectBuilder<Self::Out>) -> Self::Out;
     fn array(items: Vec<Self::Out>) -> Self::Out;
     fn scalar(value: OwnedValue) -> Self::Out;
     /// A bound node's own value, standing in for a subtree the walk would
@@ -1282,8 +1325,8 @@ struct BuildOwned;
 impl CursorWalkOutput for BuildOwned {
     type Out = OwnedValue;
     const KEEPS_MEMBERS: bool = true;
-    fn object(map: ObjectMapOf<OwnedValue>) -> OwnedValue {
-        OwnedValue::Object(map)
+    fn object(map: ObjectBuilder<OwnedValue>) -> OwnedValue {
+        OwnedValue::Object(map.finish())
     }
     fn array(items: Vec<OwnedValue>) -> OwnedValue {
         OwnedValue::array_from(items)
@@ -1309,7 +1352,7 @@ struct CheckOnly;
 impl CursorWalkOutput for CheckOnly {
     type Out = ();
     const KEEPS_MEMBERS: bool = false;
-    fn object(_: ObjectMapOf<()>) {}
+    fn object(_: ObjectBuilder<()>) {}
     fn array(_: Vec<()>) {}
     fn scalar(_: OwnedValue) {}
     /// Never: validating is walking, so no subtree may be skipped.
@@ -1365,7 +1408,7 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
     check_depth(depth)?;
     let value = known.unwrap_or_else(|| cursor.value());
     if let Some(fields) = value.as_object_rendered() {
-        let mut map = ObjectMapOf::new();
+        let mut map = ObjectBuilder::new();
         let mut guard = DisplayKeyGuard::default();
         // #3478: the collision bookkeeping of a walk that keeps no members
         // (`CheckOnly`), lazy until an undecodable key appears; `map` and
@@ -1394,7 +1437,7 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
             // half of `checked_key` that is not a delimiter check) on a
             // slimmer member (#2664).
             f.try_for_each_member(|key, member_value, value_cursor| {
-                let key = checked_member_key(&key, &f, &map, &mut guard)?;
+                let key = checked_member_key(&key, &f, map.map(), &mut guard)?;
                 let child = walk_child::<S, _, B>(
                     &value_cursor,
                     Some(member_value),
@@ -1403,7 +1446,7 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
                     scalar_override,
                     nested,
                 )?;
-                push_field::<S, _>(&mut map, key, child);
+                map.push::<S>(key, child);
                 Ok(())
             })?;
             return Ok(B::object(map));
@@ -1415,7 +1458,7 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
             // only one would leave the cursor and value domains disagreeing
             // about whether a document is valid.
             let key = if B::KEEPS_MEMBERS {
-                field.checked_key(&f, &map, &mut guard, is_first)?
+                field.checked_key(&f, map.map(), &mut guard, is_first)?
             } else {
                 field.checked_key_lazy(&f, || value.as_object_rendered(), consumed, &mut ledger)?;
                 String::new()
@@ -1434,7 +1477,7 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
             if !nested.is_empty() {
                 // A later member with the same key replaces the value, so an
                 // earlier watched member is in no value this walk returns.
-                if map.contains_key(&key) {
+                if map.map().contains_key(&key) {
                     watched.retain(|(_, k)| !matches!(k, OwnedValue::String(k) if *k == key));
                 }
                 let node = field.value_cursor.node_id();
@@ -1443,7 +1486,7 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
                 }
             }
             if B::KEEPS_MEMBERS {
-                push_field::<S, _>(&mut map, key, child);
+                map.push::<S>(key, child);
             }
             last_field = Some(field.value_cursor);
             f = rest;
@@ -3118,7 +3161,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
         ),
     };
     if let Some(fields) = value.as_object_rendered() {
-        let mut map = IndexMap::new();
+        let mut map = ObjectBuilder::new();
         let mut comment_map = IndexMap::new();
         let mut key_comment_map = IndexMap::new();
         let mut guard = DisplayKeyGuard::default();
@@ -3165,7 +3208,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
             // check below is a trait-default no-op. `to_owned_with_comments`
             // is `pub`, so a future JSON-typed caller silently inherited a
             // walk that accepted `{"a" 1}` -- closing that latent gap.
-            let key = field.checked_key(&f, &map, &mut guard, is_first)?;
+            let key = field.checked_key(&f, map.map(), &mut guard, is_first)?;
             // `skip_own_head_foot: true` -- standalone head/foot comments on
             // a mapping entry live on its *key* node, not its value (#798
             // PR2, #2795 PR B review) -- see `DocumentCursor::head_comment`'s
@@ -3187,7 +3230,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
                     *c.meta_mut() = c.meta().with_head_foot(field_head, field_foot);
                 }
             }
-            map.insert(key.clone(), v);
+            map.push::<S>(key.clone(), v);
             comment_map.insert(key.clone(), c);
             // A comment trailing the key's own line, when the value is
             // deferred to a following line (issue #765) - distinct from
@@ -3256,7 +3299,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
         // top level, same residual gap its own doc comment describes.
         tail_gap_ok(cursor, last_field.as_ref(), b'}')?;
         Ok((
-            OwnedValue::Object(map.into()),
+            OwnedValue::Object(map.finish()),
             CommentTree::Object(own_meta, comment_map, key_comment_map),
         ))
     } else if let Some(elements) = value.as_array() {
@@ -4619,7 +4662,7 @@ fn owned_from_standard_json_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
             OwnedValue::array_from(items)
         }
         StandardJson::Object(fields) => {
-            let mut map = IndexMap::new();
+            let mut map = ObjectBuilder::new();
             let mut remaining = *fields;
             while let Some((field, rest)) = remaining.uncons() {
                 // A key that isn't `StandardJson::String` at all (e.g.
@@ -4633,7 +4676,7 @@ fn owned_from_standard_json_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
                     None => return Err(EvalError::malformed_json_text(field.key_cursor().text())),
                 };
                 let value = owned_from_standard_json_at_depth::<S, W>(&field.value(), depth + 1)?;
-                map.insert(key, value);
+                map.push::<S>(key, value);
                 remaining = rest;
             }
             // A child with no sibling to pair as a value -- `{invalid}`,
@@ -4642,7 +4685,7 @@ fn owned_from_standard_json_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
             if let Some(tail) = remaining.unpaired_tail() {
                 return Err(EvalError::malformed_json_text(tail.text()));
             }
-            OwnedValue::Object(map.into())
+            OwnedValue::Object(map.finish())
         }
         // See `to_owned_at_depth`'s own `is_error` arm (#1194/#1247): a
         // structurally malformed value raises rather than becoming `null`.

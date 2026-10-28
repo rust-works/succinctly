@@ -503,7 +503,7 @@ use super::value::{
     infinite_float_preview_text, int_to_f64, jq_identical, jq_literal_int_to_f64, jq_numeric_cmp,
     numeric_repr_cmp, owned_value_eq, owned_value_eq_at_depth_generic, subarray_indices,
     subarray_positions, window_matches, ArrayVec, NumberRepr, ObjectMap, ObjectMapEntry,
-    ObjectMapOf, OwnedValue,
+    OwnedValue,
 };
 
 /// Which binary operator an operand that produced *zero outputs* is being
@@ -2553,19 +2553,19 @@ fn to_owned_lossy_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
             OwnedValue::array_from(items)
         }
         StandardJson::Object(fields) => {
-            let mut map = IndexMap::new();
+            let mut map = super::eval_generic::ObjectBuilder::new();
             for field in *fields {
                 // Get the key as a string
                 if let StandardJson::String(key_str_val) = field.key() {
                     if let Ok(cow) = key_str_val.as_str() {
-                        map.insert(
+                        map.push::<S>(
                             cow.into_owned(),
                             to_owned_lossy_at_depth::<S, W>(&field.value(), depth + 1),
                         );
                     }
                 }
             }
-            OwnedValue::Object(map.into())
+            OwnedValue::Object(map.finish())
         }
         StandardJson::Error(_) => OwnedValue::Null,
     }
@@ -2944,7 +2944,7 @@ fn to_owned_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
             OwnedValue::array_from(items)
         }
         StandardJson::Object(fields) => {
-            let mut map = ObjectMapOf::new();
+            let mut map = super::eval_generic::ObjectBuilder::new();
             let mut guard = DisplayKeyGuard::default();
             // `uncons`/`rest`, not `for field in *fields`: a `for` loop
             // consumes the `Iterator` impl, whose `next()` reports `None`
@@ -2971,9 +2971,8 @@ fn to_owned_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
                 // #1734/#1677/#2262: key resolution and delimiter checks in
                 // one shared call -- see `DocumentField::checked_key`. This
                 // function had none of the delimiter half before #2262.
-                let key = field.checked_key(&f, &map, &mut guard, is_first)?;
-                super::eval_generic::push_field::<S, _>(
-                    &mut map,
+                let key = field.checked_key(&f, map.map(), &mut guard, is_first)?;
+                map.push::<S>(
                     key,
                     to_owned_at_depth::<S, W>(&field.value, Some(&field.value_cursor), depth + 1)?,
                 );
@@ -2986,7 +2985,7 @@ fn to_owned_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
             }
             // #2403: same reasoning as the array arm's own check above.
             tail_gap_ok(cursor, last_field.as_ref(), b'}')?;
-            OwnedValue::Object(map)
+            OwnedValue::Object(map.finish())
         }
         // #2286 review: this arm used to silently substitute `Null` for a
         // bareword-garbage token (`StandardJson::Error`, e.g. `xyz123`),
@@ -75660,6 +75659,9 @@ fn owned_to_expr_at_depth(value: &OwnedValue, depth: usize) -> Expr {
                 Expr::Array(Box::new(Expr::Comma(elements)))
             }
         }
+        // An object that repeats a key (yq, ADR-0027) has no construction that rebuilds it: `{a:
+        // 1, a: 2}` is `{a: 2}`. It stays a frozen value in the expression instead.
+        OwnedValue::Object(obj) if obj.has_shadows() => Expr::tracked_value(value.clone()),
         OwnedValue::Object(obj) => {
             // Build object construction expression
             let entries: Vec<ObjectEntry> = obj
