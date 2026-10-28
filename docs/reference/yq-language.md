@@ -689,6 +689,7 @@ surface (#1512):
 | `JOIN(idx; idx_expr)` and its 3/4-argument forms     | Join a stream against an `INDEX` (#3046)      |
 | `walk(f)`                                            | Recursively transform every node (#1714)      |
 | `reduce`, `foreach`                                  | Fold keywords (#2065, #2447, #2605)           |
+| `. as {a: $v}`, `. as [$a]`                          | Destructuring patterns in `as` (#5433)        |
 | `floor`, `ceil`, `round`, `sqrt`, `fabs`             | Basic math functions (#1714; past `i64` range now a `Float`, not saturated, #2937) |
 | `abs`, `trunc`                                       | Absolute value / truncate to integer (#1885)  |
 | `log`, `log2`, `log10`                               | Logarithms (#1714)                            |

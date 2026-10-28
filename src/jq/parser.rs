@@ -4932,6 +4932,9 @@ impl<'a> Parser<'a> {
     /// - `$var` - simple variable binding
     /// - `{key: $var, ...}` - object destructuring
     /// - `[$first, $second, ...]` - array destructuring
+    ///
+    /// Only `$var` is yq's: its `as` takes a variable name and nothing else (#5433), so
+    /// the two destructuring forms are gated behind `--jq-extensions` in yq mode.
     fn parse_pattern(&mut self) -> Result<Pattern, ParseError> {
         if self.pattern_depth == 0 {
             self.pattern_computed_keys = 0;
@@ -4983,6 +4986,7 @@ impl<'a> Parser<'a> {
             }
             Some('{') => {
                 // Object pattern: {key: $var, ...}
+                self.reject_unless_jq_extensions("destructuring pattern")?;
                 self.next();
                 self.skip_ws();
 
@@ -5141,6 +5145,7 @@ impl<'a> Parser<'a> {
             }
             Some('[') => {
                 // Array pattern: [$first, $second, ...]
+                self.reject_unless_jq_extensions("destructuring pattern")?;
                 self.next();
                 self.skip_ws();
 
@@ -11389,9 +11394,14 @@ mod tests {
         }
 
         // jq mode and yq mode share the pattern grammar (real yq has no
-        // pattern keys at all), so both modes reject the same constants.
-        let err = parse_program_with_mode(". as {(1): $x} | .", ParserMode::Yq).unwrap_err();
+        // pattern keys at all, so yq needs `--jq-extensions` to reach it, #5433),
+        // so both modes reject the same constants.
+        let err =
+            parse_program_with_mode_and_extensions(". as {(1): $x} | .", ParserMode::Yq, true)
+                .unwrap_err();
         assert_eq!(err.message, "Cannot use number (1) as object key");
+        let err = parse_program_with_mode(". as {(1): $x} | .", ParserMode::Yq).unwrap_err();
+        assert!(err.message.contains("--jq-extensions"), "{}", err.message);
 
         // Accept (parses for runtime evaluation): string constants and
         // genuinely computed keys -- a *string* const destructures by the
