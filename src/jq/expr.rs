@@ -1985,7 +1985,7 @@ impl PipeStages {
             .get_or_init(|| {
                 let tail = &self.stages[from..];
                 may_keep(tail).then(|| {
-                    let mut copy = PipeStages::from(tail.to_vec());
+                    let mut copy = Self::from(tail.to_vec());
                     copy.tails.origin = Some((Rc::downgrade(&table), at));
                     Rc::new(Expr::Pipe(copy))
                 })

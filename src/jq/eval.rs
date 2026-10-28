@@ -111756,11 +111756,11 @@ mod tests {
             );
         }
         assert!(
-            pipes.iter().any(|p| pipe_holds_tracked_var(p))
+            pipes.iter().any(pipe_holds_tracked_var)
                 && pipes.iter().any(|p| !pipe_holds_tracked_var(p))
-                && pipes.iter().any(|p| pipe_holds_bind(p))
+                && pipes.iter().any(pipe_holds_bind)
                 && pipes.iter().any(|p| !pipe_holds_bind(p))
-                && pipes.iter().any(|p| pipe_holds_resolver_node(p))
+                && pipes.iter().any(pipe_holds_resolver_node)
                 && pipes.iter().any(|p| !pipe_holds_resolver_node(p)),
             "the corpus holds both answers for every fact"
         );
