@@ -1752,12 +1752,29 @@ mod tests {
     #[test]
     fn test_json_color_writer_replaces_invalid_utf8_5415() {
         let scheme = ColorScheme::default();
-        for bytes in [&b"[\"a\xffb\"]"[..], &b"\"\xc3"[..], &b"\"\xe2\x98"[..]] {
+        for bytes in [
+            &b"[\"a\xffb\"]"[..],
+            &b"\"\xc3"[..],
+            &b"\"\xe2\x98"[..],
+            &b"\"\x80\x80\x80\x80"[..],
+        ] {
             let mut out = Vec::new();
             write_colorized_json(&mut out, bytes, &scheme).unwrap();
             let want = colorize_json(&String::from_utf8_lossy(bytes), &scheme);
             assert_eq!(String::from_utf8(out).unwrap(), want, "{bytes:?}");
         }
+    }
+
+    /// Bytes that no character completes are not held back for one.
+    #[test]
+    fn test_incomplete_tail_5415() {
+        assert_eq!(incomplete_tail(b""), 0);
+        assert_eq!(incomplete_tail(b"ab"), 0);
+        assert_eq!(incomplete_tail("é".as_bytes()), 0);
+        assert_eq!(incomplete_tail(&"é".as_bytes()[..1]), 1);
+        assert_eq!(incomplete_tail(&"☃".as_bytes()[..2]), 2);
+        assert_eq!(incomplete_tail(&"😀".as_bytes()[..3]), 3);
+        assert_eq!(incomplete_tail(b"a\x80\x80\x80\x80"), 0);
     }
 
     /// An invalid byte does not take a character split across two writes down with it.
@@ -1790,6 +1807,8 @@ mod tests {
             }
         }
         let scheme = ColorScheme::default();
+        assert!(Broken.write(b"x").is_err());
+        Broken.flush().unwrap();
         let mut broken = Broken;
         let mut writer = JsonColorWriter::new(&mut broken, &scheme);
         writer.write_all(b"[1]").unwrap();

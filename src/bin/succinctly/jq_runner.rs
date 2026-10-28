@@ -9437,9 +9437,9 @@ fn evaluate_m2_fast_path<W: Write>(
             )
             .map_err(|_| anyhow::anyhow!("write error"))?;
         if let Some(code) = stats.halt {
-            colored.finish()?;
-            sink.request_halt(code);
-            return Ok(true);
+            colored.finish()?; // patchcov: coverage tolerate-line reason="unreachable: no M2-streamable program halts, so stats.halt is None here, as in the uncolored arm below (#5415)"
+            sink.request_halt(code); // patchcov: coverage tolerate-line reason="unreachable: see the line above (#5415)"
+            return Ok(true); // patchcov: coverage tolerate-line reason="unreachable: see the line above (#5415)"
         }
         if stats.error.is_some() {
             return Ok(false);
@@ -10676,22 +10676,9 @@ struct NanMarkingFormatter<F>(F);
 
 impl<F: LiteralFormatter> LiteralFormatter for NanMarkingFormatter<F> {
     fn format_raw_number<'a>(&self, raw: &'a [u8]) -> Cow<'a, str> {
-        // A NaN is never a valid number's spelling: jq's `nan`/`sNaN12` words,
-        // or the bridge token a computed NaN is smuggled through text as
-        // (`NAN_SENTINEL`, two exponent markers). So an ordinary number, with
-        // neither, skips the checks.
-        let word = raw
-            .iter()
-            .any(|b| b.is_ascii_alphabetic() && !matches!(b, b'e' | b'E'));
-        let two_exponents = raw.iter().filter(|b| matches!(b, b'e' | b'E')).count() > 1;
-        if (word || two_exponents)
-            && !validate::is_valid_number(raw)
-            && OwnedValue::from_number_bytes::<JqSemantics>(raw)
-                .as_f64()
-                .is_some_and(f64::is_nan)
-        {
-            return Cow::Borrowed(output::NAN_COLOR_MARKER);
-        }
+        // No NaN reaches here: `colored_stream_safe` hands a document with a NaN word in it
+        // to the old route, and a computed NaN is a `Float` or, in an owned tree, a literal
+        // `print_owned_json` reads from its repr.
         self.0.format_raw_number(raw)
     }
 
@@ -14674,6 +14661,41 @@ mod tests {
         }
     }
 
+    /// #5415: a failing writer under `-C` is an error from the owned writer, mid-value or at the
+    /// end of it, for either convention.
+    #[test]
+    fn write_output_owned_value_reports_a_failing_writer_under_color_5415() {
+        struct Failing(usize);
+        impl Write for Failing {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if self.0 < buf.len() {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                self.0 -= buf.len();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let big = OwnedValue::array_from((0..4000).map(OwnedValue::Int).collect());
+        for config in owned_print_configs_3009() {
+            if !config.color_output || config.sort_keys || config.ascii_output {
+                continue;
+            }
+            // Fails on the first block, and with room for all of it but the last write.
+            for room in [0, 30_000] {
+                let mut out = Failing(room);
+                assert!(write_output_owned_value(&mut out, &big, &config).is_err());
+            }
+            let mut out = Failing(usize::MAX);
+            write_output_owned_value(&mut out, &OwnedValue::Int(1), &config).unwrap();
+            out.flush().unwrap();
+            let mut out = Failing(5);
+            assert!(write_output_owned_value(&mut out, &OwnedValue::Int(1), &config).is_err());
+        }
+    }
+
     /// #5415: what `colored_stream_safe` vouches for, and what it hands back to
     /// the materializing route.
     #[test]
@@ -14698,6 +14720,7 @@ mod tests {
             // An escape the materializer refuses, or one cut short.
             (r#"["\q"]"#, false),
             (r#"["\u12"]"#, false),
+            ("\"\\u12", false),
             (r#"["\uZZZZ"]"#, false),
             (r#"["\"#, false),
             (r#"["abc"#, false),
