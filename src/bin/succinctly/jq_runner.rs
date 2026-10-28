@@ -4702,11 +4702,12 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     // handling was already correct, just newly *exercised* here for the
     // first time, since `sort_keys` could never reach this gate before
     // (the outer `can_use_lazy_path` excluded it outright). It has no
-    // `color`/`ascii` handling of its own, though: `color_output` and
-    // `ascii_output` route to the general lazy path below instead, which
-    // applies both by materializing the one output value and reusing
-    // `format_json`'s existing `ascii`/color options (see
-    // `write_output_jq_value`'s own comment on that branch).
+    // `ascii` handling of its own, though: `ascii_output` routes to the
+    // general lazy path below instead, which applies it by materializing the
+    // one output value and reusing `format_json`'s existing `ascii` option
+    // (see `write_output_jq_value`'s own comment on that branch). `-C` takes
+    // this path for a result that is one cursor, colored as it is written
+    // (#5415, see the call below).
     let can_json_fast_path = can_use_m2_streaming(&expr)
         && m2_json_fallback_safe(&expr)
         && !m2_has_stderr_effect(&expr)
@@ -4714,7 +4715,6 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
         && !output_config.join_output
         && !output_config.raw_output0
         && !output_config.unbuffered
-        && !output_config.color_output
         && !output_config.ascii_output
         && context.named.is_empty();
 
@@ -5097,7 +5097,20 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 // arms (`LazyKeys`'s sorted branch, `sequence_streamable_
                 // cursors`'s `None` fallback) can still reach
                 // `to_owned_cursor_at_depth`'s panic guard.
-                if can_json_fast_path {
+                // #5415: `-C` takes it too, colored as it is written, with
+                // two exceptions that keep `-C`'s bytes what the materializing
+                // route made them. `color_streams` is false under
+                // `--preserve-input`, which echoes source text the colored
+                // route re-renders, and for a document `colored_stream_safe`
+                // does not vouch for. And a result that is not one cursor,
+                // which `evaluate_m2_fast_path` hands back (see there).
+                let color_streams = output_config.color_output
+                    && !output_config.convention.preserves_source_values()
+                    && colored_stream_safe(json_bytes);
+                if can_json_fast_path && (!output_config.color_output || color_streams) {
+                    let color = output_config
+                        .color_output
+                        .then_some(&output_config.color_scheme);
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         evaluate_m2_fast_path(
                             json_bytes,
@@ -5108,6 +5121,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                             json_indent,
                             args.sort_keys,
                             json_numbers,
+                            color,
                             args.exit_status,
                             &mut had_output,
                             &mut last_output,
@@ -5182,80 +5196,83 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 // when either unwinds, and the other three are plain data
                 // regardless.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let mut on_value = |sink: &mut ErrorSink,
-                                        result: OutputItem<'_>|
-                     -> Result<bool> {
-                        had_output = true;
-                        // For exit_status tracking, we need to check the last value
-                        if args.exit_status {
-                            match &result {
-                                // `-e` is the flag that forces materialization at
-                                // all, so it is where a decode failure first
-                                // becomes observable here (#1247). Report and skip
-                                // the value rather than letting an undecodable
-                                // string count as a truthiness answer; `sink`
-                                // drives the exit code. `try_materialize`, not
-                                // `materialize` (#2850): this call used to leak
-                                // Rust's raw panic backtrace to stderr past
-                                // `MAX_NESTING_DEPTH`/`MAX_VALUE_TREE_DEPTH`
-                                // levels of nesting, ahead of the clean,
-                                // correctly exit-5'd diagnostic this `match`
-                                // already produces below -- a CLI-output
-                                // boundary has no business panicking for input
-                                // depth alone.
-                                OutputItem::Lazy(v) => match v.try_materialize() {
-                                    Ok(owned) => last_output = Some(owned),
-                                    Err(e) => {
-                                        sink.report(DiagStyle::Jq, &e, at.get());
-                                        return Ok(true);
+                    let mut on_value =
+                        |sink: &mut ErrorSink, result: OutputItem<'_>| -> Result<bool> {
+                            had_output = true;
+                            // For exit_status tracking, we need to check the last value
+                            if args.exit_status {
+                                match &result {
+                                    // `-e` is the flag that forces materialization at
+                                    // all, so it is where a decode failure first
+                                    // becomes observable here (#1247). Report and skip
+                                    // the value rather than letting an undecodable
+                                    // string count as a truthiness answer; `sink`
+                                    // drives the exit code. `try_materialize`, not
+                                    // `materialize` (#2850): this call used to leak
+                                    // Rust's raw panic backtrace to stderr past
+                                    // `MAX_NESTING_DEPTH`/`MAX_VALUE_TREE_DEPTH`
+                                    // levels of nesting, ahead of the clean,
+                                    // correctly exit-5'd diagnostic this `match`
+                                    // already produces below -- a CLI-output
+                                    // boundary has no business panicking for input
+                                    // depth alone.
+                                    OutputItem::Lazy(v) => match v.try_materialize() {
+                                        Ok(owned) => last_output = Some(owned),
+                                        Err(e) => {
+                                            sink.report(DiagStyle::Jq, &e, at.get());
+                                            return Ok(true);
+                                        }
+                                    },
+                                    // An owned result records its *truthiness*, not
+                                    // itself (#3009). Both readers of `last_output`
+                                    // only ever ask `matches!(last, Null |
+                                    // Bool(false))`, which is why the M2 path
+                                    // already synthesizes a `Bool` here rather than
+                                    // materializing (`record_exit_status`). Cloning
+                                    // the value instead would be a refcount bump in
+                                    // the shipped build but a deep copy under the
+                                    // `unshared-containers` holdout, i.e. a cost
+                                    // that shows up only in the configuration used
+                                    // to measure this change. There is no `Err`
+                                    // counterpart: an owned value cannot fail to
+                                    // materialize, and its depth was settled by
+                                    // `to_jq_values` before it got here.
+                                    OutputItem::Owned(v) => {
+                                        last_output = Some(OwnedValue::Bool(!matches!(
+                                            v,
+                                            OwnedValue::Null | OwnedValue::Bool(false)
+                                        )));
                                     }
-                                },
-                                // An owned result records its *truthiness*, not
-                                // itself (#3009). Both readers of `last_output`
-                                // only ever ask `matches!(last, Null |
-                                // Bool(false))`, which is why the M2 path
-                                // already synthesizes a `Bool` here rather than
-                                // materializing (`record_exit_status`). Cloning
-                                // the value instead would be a refcount bump in
-                                // the shipped build but a deep copy under the
-                                // `unshared-containers` holdout, i.e. a cost
-                                // that shows up only in the configuration used
-                                // to measure this change. There is no `Err`
-                                // counterpart: an owned value cannot fail to
-                                // materialize, and its depth was settled by
-                                // `to_jq_values` before it got here.
-                                OutputItem::Owned(v) => {
-                                    last_output = Some(OwnedValue::Bool(!matches!(
-                                        v,
-                                        OwnedValue::Null | OwnedValue::Bool(false)
-                                    )));
                                 }
                             }
-                        }
-                        // A malformed document is a data error, not an I/O
-                        // one: it belongs in jq's diagnostic channel (exit 5)
-                        // rather than aborting the process through `anyhow`
-                        // (#1194). Stop emitting results for *this* document,
-                        // but fall through to the halt check below and carry
-                        // on with the rest of the stream (#355) -- real jq
-                        // stops at the first parse error instead, a
-                        // divergence recorded in
-                        // `docs/compliance/jq/limitations.md`.
-                        let stop = route_write_error(
-                            sink,
-                            &mut out,
-                            || at.get().clone(),
-                            |o| match &result {
-                                OutputItem::Lazy(v) => {
-                                    write_output_jq_value(o, v, &output_config, &mut record_scratch)
-                                }
-                                OutputItem::Owned(v) => {
-                                    write_output_owned_value(o, v, &output_config)
-                                }
-                            },
-                        )?;
-                        Ok(!stop)
-                    };
+                            // A malformed document is a data error, not an I/O
+                            // one: it belongs in jq's diagnostic channel (exit 5)
+                            // rather than aborting the process through `anyhow`
+                            // (#1194). Stop emitting results for *this* document,
+                            // but fall through to the halt check below and carry
+                            // on with the rest of the stream (#355) -- real jq
+                            // stops at the first parse error instead, a
+                            // divergence recorded in
+                            // `docs/compliance/jq/limitations.md`.
+                            let stop = route_write_error(
+                                sink,
+                                &mut out,
+                                || at.get().clone(),
+                                |o| match &result {
+                                    OutputItem::Lazy(v) => write_output_jq_value_colored(
+                                        o,
+                                        v,
+                                        &output_config,
+                                        &mut record_scratch,
+                                        color_streams,
+                                    ),
+                                    OutputItem::Owned(v) => {
+                                        write_output_owned_value(o, v, &output_config)
+                                    }
+                                },
+                            )?;
+                            Ok(!stop)
+                        };
                     evaluate_bytes_streaming(
                         json_bytes,
                         &expr,
@@ -9217,6 +9234,83 @@ fn m2_has_stderr_effect(expr: &Expr) -> bool {
     })
 }
 
+/// How deep a document may nest for [`colored_stream_safe`] to vouch for it:
+/// well inside the 256 levels past which the materializing writer refuses.
+const COLORED_STREAM_MAX_DEPTH: usize = 128;
+
+/// Whether `json` is a document whose `-C` render the streaming printers give
+/// the same bytes, and the same refusals, as the materializing writer `-C`
+/// used to render every record with (#5415). `false` is "not proven", never
+/// "malformed": such a document is rendered the old way, which is correct for
+/// any input. A sufficient test, made in one pass per document:
+///
+/// - every string is one the materializer decodes: each `\` escape is a
+///   valid one, and no `\u` names a surrogate. The streaming printers echo a
+///   string's source text, so an unpaired surrogate (`"\ud800"`, #1247) would
+///   print where the materializer refuses it;
+/// - nesting stays within [`COLORED_STREAM_MAX_DEPTH`], where the materializer
+///   refuses past 256 with a diagnostic of its own and the printers past 384
+///   with another (#1818, #2850);
+/// - no word other than `true`, `false` and `null` stands as a value: jq reads
+///   `nan`, `NaN`, `sNaN12` and `Infinity` as numbers (#2877). The streamers
+///   print a NaN as a plain `null` where the colorizer needs the marker to
+///   color it as jq does (#3413), and echo `Infinity` under `--preserve-input`.
+///   Outside a string the letters of those three words and an exponent's `E`
+///   are the only ones allowed, and an `n` is followed by a `u`, not an `a`.
+fn colored_stream_safe(json: &[u8]) -> bool {
+    let mut depth = 0usize;
+    let mut at = 0;
+    while let Some(&byte) = json.get(at) {
+        at += 1;
+        match byte {
+            b'"' => loop {
+                // An unterminated string is the old route's to report.
+                let Some(len) = json[at..].iter().position(|&b| b == b'"' || b == b'\\') else {
+                    return false;
+                };
+                at += len;
+                if json[at] == b'"' {
+                    at += 1;
+                    break;
+                }
+                match json.get(at + 1) {
+                    Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => at += 2,
+                    Some(b'u') => {
+                        let Some(hex) = json.get(at + 2..at + 6) else {
+                            return false;
+                        };
+                        let surrogate =
+                            hex[0] | 0x20 == b'd' && matches!(hex[1] | 0x20, b'8'..=b'f');
+                        if surrogate || !hex.iter().all(u8::is_ascii_hexdigit) {
+                            return false;
+                        }
+                        at += 6;
+                    }
+                    _ => return false,
+                }
+            },
+            b'[' | b'{' => {
+                depth += 1;
+                if depth > COLORED_STREAM_MAX_DEPTH {
+                    return false;
+                }
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            b'n' if json.get(at).is_some_and(|b| b | 0x20 == b'a') => return false,
+            b if b.is_ascii_alphabetic()
+                && !matches!(
+                    b,
+                    b't' | b'r' | b'u' | b'e' | b'f' | b'a' | b'l' | b's' | b'n' | b'E'
+                ) =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
 /// Evaluate one JSON document through the M2 fast path (#1576): stream
 /// straight from `GenericResult`'s cursors instead of the materializing
 /// `generic_result_to_jq_values`/`print_json` stack that feeds
@@ -9275,6 +9369,7 @@ fn evaluate_m2_fast_path<W: Write>(
     indent: IndentSpec,
     sort_keys: bool,
     numbers: JsonConvention,
+    color: Option<&ColorScheme>,
     exit_status: bool,
     had_output: &mut bool,
     last_output: &mut Option<OwnedValue>,
@@ -9293,6 +9388,16 @@ fn evaluate_m2_fast_path<W: Write>(
             *last_output = Some(OwnedValue::Bool(!stats.last_was_falsy));
         }
     };
+
+    // A colored render takes a result that is one cursor into the document
+    // and nothing else: every other result is owned, or a sequence of values,
+    // and is streamed by a writer that spells an overflowing literal (`1e999`
+    // in `map(.)?`) differently from the one `-C` used to render through. It
+    // is left to the general path, which renders as `print_json` does, and
+    // nothing has been written (#5415).
+    if color.is_some() && !matches!(result, GenericResult::OneCursor(_)) {
+        return Ok(false);
+    }
 
     if matches!(result, GenericResult::LazySeq(_)) {
         let mut buf = String::new();
@@ -9315,6 +9420,33 @@ fn evaluate_m2_fast_path<W: Write>(
         *had_output = *had_output || stats.count > 0;
         record_exit_status(last_output, &stats);
         out.write_all(buf.as_bytes())?;
+        Ok(true)
+    } else if let Some(scheme) = color {
+        // #5415: the same single result, colored a block at a time on its way
+        // to `out`. The streamer's own per-value buffer is still the only
+        // whole-result copy; an error means it has written nothing to
+        // `colored`, so dropping it unfinished discards nothing.
+        let mut colored = output::JsonColorWriter::new(out, scheme);
+        let stats = result
+            .stream_json::<_, JqSemantics>(
+                &mut colored,
+                indent,
+                sort_keys,
+                numbers,
+                write_result_newline,
+            )
+            .map_err(|_| anyhow::anyhow!("write error"))?;
+        if let Some(code) = stats.halt {
+            colored.finish()?; // patchcov: coverage tolerate-line reason="unreachable: no M2-streamable program halts, so stats.halt is None here, as in the uncolored arm below (#5415)"
+            sink.request_halt(code); // patchcov: coverage tolerate-line reason="unreachable: see the line above (#5415)"
+            return Ok(true); // patchcov: coverage tolerate-line reason="unreachable: see the line above (#5415)"
+        }
+        if stats.error.is_some() {
+            return Ok(false);
+        }
+        colored.finish()?;
+        *had_output = *had_output || stats.count > 0;
+        record_exit_status(last_output, &stats);
         Ok(true)
     } else {
         let mut writer = FmtWriter(out);
@@ -9927,11 +10059,26 @@ fn reject_raw_output0_nul(s: &str, config: &OutputConfig) -> Result<()> {
 /// All or nothing per record: a value that fails to decode leaves none of
 /// the record on `out` (#3265). `scratch` is the caller's reusable buffer
 /// for that; its contents on entry and on return are unspecified.
+#[cfg(test)]
 fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
     out: &mut Out,
     value: &JqValue<'_, Wrd>,
     config: &OutputConfig,
     scratch: &mut Vec<u8>,
+) -> Result<()> {
+    write_output_jq_value_colored(out, value, config, scratch, false)
+}
+
+/// [`write_output_jq_value`], with `stream_color` set when `-C` may render
+/// this record through `print_json` rather than materializing it: the
+/// caller has proved the record's document is one the two give the same
+/// bytes for (`colored_stream_safe`, #5415).
+fn write_output_jq_value_colored<Out: Write, Wrd: Clone + AsRef<[u64]>>(
+    out: &mut Out,
+    value: &JqValue<'_, Wrd>,
+    config: &OutputConfig,
+    scratch: &mut Vec<u8>,
+    stream_color: bool,
 ) -> Result<()> {
     // Raw-output string, if any -- resolved and NUL-checked before
     // writing *any* byte of this record, including the `--seq` RS
@@ -10004,12 +10151,12 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
     scratch.clear();
     let written = (|| {
         if !is_raw_record(&as_str, config) {
-            render_json_body(scratch, value, config)?;
+            render_json_body(scratch, value, config, stream_color)?;
         }
         if write_output_raw_prologue(out, as_str, config)? {
             return Ok(());
         }
-        out.write_all(scratch)?;
+        write_json_body(out, scratch, config)?;
         write_terminator(out, config)
     })();
     // Don't pin one huge record's buffer for the rest of a long stream,
@@ -10027,6 +10174,14 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
 /// all take, so a flag added to it reaches all three (#3909).
 fn writes_lazily(config: &OutputConfig) -> bool {
     !config.sort_keys && !config.color_output && !config.ascii_output
+}
+
+/// Whether a `-C` record is still written by the streaming writers, with its
+/// text colored on the way out, rather than materialized for `format_json`
+/// (#5415). `-S` and `-a` still need the whole value, so they keep the
+/// materializing route, and color its text in blocks afterwards.
+fn streams_colored(config: &OutputConfig) -> bool {
+    config.color_output && !config.sort_keys && !config.ascii_output
 }
 
 /// The source text of a cursor-backed `value` when the compact jq-compat
@@ -10071,6 +10226,7 @@ fn render_json_body<Wrd: Clone + AsRef<[u64]>>(
     out: &mut Vec<u8>,
     value: &JqValue<'_, Wrd>,
     config: &OutputConfig,
+    stream_color: bool,
 ) -> Result<()> {
     // `JqCompat` uses the jq-compatible formatter (reformats numbers); a
     // source-preserving convention uses the preserve formatter (keeps the
@@ -10117,6 +10273,23 @@ fn render_json_body<Wrd: Clone + AsRef<[u64]>>(
                 None,
             )?;
         }
+    } else if stream_color && streams_colored(config) {
+        // #5415: `-C` renders the uncolored text the same way, with a NaN
+        // spelled as `NAN_COLOR_MARKER` for the colorizer, and the caller
+        // colors it as it copies the record out. The old route built an
+        // `OwnedValue` of the whole record and two whole-output `String`s.
+        // Never under `--preserve-input` (`stream_color` is false there):
+        // that convention echoes number text the old route re-rendered.
+        print_json(
+            out,
+            value,
+            &NanMarkingFormatter(JqCompatFormatter),
+            config,
+            0,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            None,
+        )?;
     } else {
         // For complex output (pretty-print, sort_keys, colors, ascii),
         // materialize first -- and surface a decode failure rather than
@@ -10148,7 +10321,7 @@ fn render_json_body<Wrd: Clone + AsRef<[u64]>>(
             .map_err(|e| anyhow::Error::from(MalformedJsonError::new(e)))?;
         // Nothing can fail past `try_materialize`, so take the formatted
         // `String`'s allocation as the buffer rather than copying into it.
-        *out = format_json(&owned, config).into_bytes();
+        *out = format_json_text(&owned, config).into_bytes();
     }
     Ok(())
 }
@@ -10302,6 +10475,35 @@ fn write_output_owned_value<Out: Write>(
         } else {
             print_owned_json(out, value, &JqCompatFormatter, config, 0)?;
         }
+    } else if streams_colored(config) {
+        // #5415: streamed through the colorizer, no whole-record `String`.
+        // `print_owned_json` cannot fail past its depth check, which the
+        // caller made before this was handed the value (`to_jq_values`).
+        let mut colored = output::JsonColorWriter::new(out, &config.color_scheme);
+        if config.convention.preserves_source_values() {
+            print_owned_json(
+                &mut colored,
+                value,
+                &NanMarkingFormatter(PreserveFormatter),
+                config,
+                0,
+            )?;
+        } else {
+            print_owned_json(
+                &mut colored,
+                value,
+                &NanMarkingFormatter(JqCompatFormatter),
+                config,
+                0,
+            )?;
+        }
+        colored.finish()?;
+    } else if config.color_output {
+        output::write_colorized_json(
+            out,
+            format_json_text(value, config).as_bytes(),
+            &config.color_scheme,
+        )?;
     } else {
         out.write_all(format_json(value, config).as_bytes())?;
     }
@@ -10342,6 +10544,12 @@ trait LiteralFormatter {
 
     /// Format a computed integer.
     fn format_int(&self, i: i64) -> String;
+
+    /// Whether a NaN is spelled `NAN_COLOR_MARKER` (#5415). A constant per
+    /// formatter, so the uncolored printers compile it away.
+    fn marks_nan(&self) -> bool {
+        false
+    }
 }
 
 /// jq-compatible formatter: reformats numbers according to jq's rules.
@@ -10457,6 +10665,50 @@ impl LiteralFormatter for PreserveFormatter {
 
     fn format_int(&self, i: i64) -> String {
         format!("{i}")
+    }
+}
+
+/// Wraps a formatter so a NaN is spelled `NAN_COLOR_MARKER` rather than
+/// `null`, for text only the colorizer will read (#5415). `format_json` does
+/// the same through `JsonFormatOpts::mark_nan_for_color` (#3413): jq colors a
+/// NaN's `null` as a number wrapping a null, not as a plain null.
+struct NanMarkingFormatter<F>(F);
+
+impl<F: LiteralFormatter> LiteralFormatter for NanMarkingFormatter<F> {
+    fn format_raw_number<'a>(&self, raw: &'a [u8]) -> Cow<'a, str> {
+        // No NaN reaches here: `colored_stream_safe` hands a document with a NaN word in it
+        // to the old route, and a computed NaN is a `Float` or, in an owned tree, a literal
+        // `print_owned_json` reads from its repr.
+        self.0.format_raw_number(raw)
+    }
+
+    fn format_float(&self, f: f64) -> String {
+        if f.is_nan() {
+            return output::NAN_COLOR_MARKER.to_string();
+        }
+        self.0.format_float(f)
+    }
+
+    fn format_int(&self, i: i64) -> String {
+        self.0.format_int(i)
+    }
+
+    fn marks_nan(&self) -> bool {
+        true
+    }
+}
+
+/// Writes a rendered JSON body to `out`, colored when `-C` asks for it, a
+/// block at a time (#5415).
+fn write_json_body<Out: Write>(
+    out: &mut Out,
+    body: &[u8],
+    config: &OutputConfig,
+) -> std::io::Result<()> {
+    if config.color_output {
+        output::write_colorized_json(out, body, &config.color_scheme)
+    } else {
+        out.write_all(body)
     }
 }
 
@@ -11631,6 +11883,14 @@ where
         OwnedValue::Int(n) => out.write_all(formatter.format_int(*n).as_bytes())?,
         OwnedValue::Float(f) => out.write_all(formatter.format_float(*f).as_bytes())?,
         // The `_` on the repr is load-bearing -- see this function's doc.
+        //
+        // A computed NaN is a literal whose text is `null` and whose repr says
+        // NaN, so a marking formatter reads it from there (#5415).
+        OwnedValue::NumberLiteral(succinctly::jq::NumberRepr::Float(f), _)
+            if formatter.marks_nan() && f.is_nan() =>
+        {
+            out.write_all(output::NAN_COLOR_MARKER.as_bytes())?;
+        }
         OwnedValue::NumberLiteral(_, literal) => {
             out.write_all(formatter.format_raw_number(literal.as_bytes()).as_bytes())?;
         }
@@ -11681,6 +11941,18 @@ where
 
 /// Format a value as JSON.
 fn format_json(value: &OwnedValue, config: &OutputConfig) -> String {
+    let json = format_json_text(value, config);
+    if config.color_output {
+        output::colorize_json(&json, &config.color_scheme)
+    } else {
+        json
+    }
+}
+
+/// [`format_json`]'s text before it is colored: with `-C`, a NaN is
+/// `NAN_COLOR_MARKER` rather than `null`, so it is only valid input to the
+/// colorizer (#3413). Split out so a caller can color it in blocks (#5415).
+fn format_json_text(value: &OwnedValue, config: &OutputConfig) -> String {
     let opts = JsonFormatOpts {
         indent: if config.compact {
             ""
@@ -11704,13 +11976,7 @@ fn format_json(value: &OwnedValue, config: &OutputConfig) -> String {
         // the non-colorized branch.
         mark_nan_for_color: config.color_output,
     };
-    let json = output::format_json(value, &opts);
-
-    if config.color_output {
-        output::colorize_json(&json, &config.color_scheme)
-    } else {
-        json
-    }
+    output::format_json(value, &opts)
 }
 
 #[cfg(test)]
@@ -14368,7 +14634,110 @@ mod tests {
                     String::from_utf8_lossy(&via_rebuild),
                     "byte mismatch for {value:?} under `{flags}`"
                 );
+
+                // #5415: and `-C` through `print_json` and the block-wise
+                // colorizer, rather than the materializing route.
+                let mut streamed = Vec::new();
+                let streamed_err = write_output_jq_value_colored(
+                    &mut streamed,
+                    &rebuilt,
+                    config,
+                    &mut Vec::new(),
+                    // As the caller sets it: never under `--preserve-input`.
+                    !config.convention.preserves_source_values(),
+                )
+                .err()
+                .map(|e| e.to_string());
+                assert_eq!(
+                    direct_err, streamed_err,
+                    "streamed error mismatch for {value:?} under `{flags}`"
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&direct),
+                    String::from_utf8_lossy(&streamed),
+                    "streamed byte mismatch for {value:?} under `{flags}`"
+                );
             }
+        }
+    }
+
+    /// #5415: a failing writer under `-C` is an error from the owned writer, mid-value or at the
+    /// end of it, for either convention.
+    #[test]
+    fn write_output_owned_value_reports_a_failing_writer_under_color_5415() {
+        struct Failing(usize);
+        impl Write for Failing {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if self.0 < buf.len() {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                self.0 -= buf.len();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let big = OwnedValue::array_from((0..4000).map(OwnedValue::Int).collect());
+        for config in owned_print_configs_3009() {
+            if !config.color_output || config.sort_keys || config.ascii_output {
+                continue;
+            }
+            // Fails on the first block, and with room for all of it but the last write.
+            for room in [0, 30_000] {
+                let mut out = Failing(room);
+                assert!(write_output_owned_value(&mut out, &big, &config).is_err());
+            }
+            let mut out = Failing(usize::MAX);
+            write_output_owned_value(&mut out, &OwnedValue::Int(1), &config).unwrap();
+            out.flush().unwrap();
+            let mut out = Failing(5);
+            assert!(write_output_owned_value(&mut out, &OwnedValue::Int(1), &config).is_err());
+        }
+    }
+
+    /// #5415: what `colored_stream_safe` vouches for, and what it hands back to
+    /// the materializing route.
+    #[test]
+    fn colored_stream_safe_vouches_only_for_what_the_streamers_match_5415() {
+        let deep_ok = format!("{}1{}", "[".repeat(128), "]".repeat(128));
+        let deep_not = format!("{}1{}", "[".repeat(129), "]".repeat(129));
+        for (doc, want) in [
+            (
+                r#"{"a":[1,2.5e3,-0,true,false,null,"x\n\"\\\/\b\f\r\t\u00e9\u0000"]}"#,
+                true,
+            ),
+            ("", true),
+            ("[nul]", true),
+            (r#"["nan","NaN","Infinity"]"#, true),
+            (deep_ok.as_str(), true),
+            (deep_not.as_str(), false),
+            // An unpaired or paired surrogate escape, in a value or a key.
+            (r#"{"a":"\ud800"}"#, false),
+            (r#"["\uDC00"]"#, false),
+            (r#"["\ud83d\ude00"]"#, false),
+            (r#"{"\ud800":1}"#, false),
+            // An escape the materializer refuses, or one cut short.
+            (r#"["\q"]"#, false),
+            (r#"["\u12"]"#, false),
+            ("\"\\u12", false),
+            (r#"["\uZZZZ"]"#, false),
+            (r#"["\"#, false),
+            (r#"["abc"#, false),
+            // A word that is a number to jq.
+            ("nan", false),
+            ("[NaN]", false),
+            ("[-nan]", false),
+            ("[sNaN12]", false),
+            ("[nAn]", false),
+            ("[Infinity]", false),
+            ("[infinity]", false),
+            ("[-Infinity]", false),
+            // A string's own closing quote after an escaped backslash.
+            (r#"["\\", nan]"#, false),
+            (r#"["\\"]"#, true),
+        ] {
+            assert_eq!(colored_stream_safe(doc.as_bytes()), want, "{doc:.60}");
         }
     }
 
