@@ -82945,6 +82945,26 @@ fn walk_impl_at_depth<S: EvalSemantics>(
             }
             OwnedValue::array_from(new_arr)
         }
+        // `map_values(w)` rewrites each key's live entry and leaves a repeated key's earlier entries
+        // as read (yq, ADR-0027), so an object that has any starts from itself.
+        OwnedValue::Object(obj) if obj.has_shadows() => {
+            let mut new_obj = obj.clone();
+            for (k, v) in obj {
+                let (vs, control) = walk_impl_at_depth::<S>(f, v, optional, depth + 1);
+                if let Some(control) = control {
+                    return (Vec::new(), Some(control));
+                }
+                match vs.into_iter().next() {
+                    Some(new_v) => {
+                        new_obj.insert(k, new_v);
+                    }
+                    None => {
+                        new_obj.shift_remove(k.as_str());
+                    }
+                }
+            }
+            OwnedValue::Object(new_obj)
+        }
         OwnedValue::Object(obj) => {
             let mut new_obj = IndexMap::with_capacity(obj.len());
             for (k, v) in obj {

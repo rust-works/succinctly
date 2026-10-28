@@ -324,3 +324,27 @@ fn yaml_output_of_a_repeated_key_prints_every_entry_1344() -> Result<()> {
     }
     Ok(())
 }
+
+/// The `--jq-extensions` builtins have no yq oracle, so these rows follow the rule the oracle rows
+/// show: a listing builtin sees every entry, a rewrite reaches the last one and passes the rest
+/// through (jq defines `walk(f)` over `map_values`).
+#[test]
+fn the_gated_builtins_keep_a_repeated_key_1344() -> Result<()> {
+    for (filter, extra, expected) in [
+        (
+            "[tostream]",
+            &[][..],
+            r#"[[["a"],1],[["a"],2],[["b"],3],[["b"]]]"#,
+        ),
+        ("walk(.)", &[], r#"{"a":1,"a":2,"b":3}"#),
+        ("[paths]", &["--eval-all"], r#"[["a"],["a"],["b"]]"#),
+        ("[leaf_paths]", &[], r#"[["a"],["a"],["b"]]"#),
+    ] {
+        let mut args = vec!["--jq-extensions", "-o=json", "-I=0"];
+        args.extend_from_slice(extra);
+        let (out, code) = run_yq_stdin(filter, D, &args)?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(out.trim(), expected, "{filter}");
+    }
+    Ok(())
+}
