@@ -3695,6 +3695,18 @@ impl<'a> Parser<'a> {
                 // rather than a field access, see below.
                 let dot_end = self.pos;
                 self.skip_ws_after_dot();
+                // #5447: in jq a `.` is a token of its own and `.name` is another, so whitespace
+                // after the dot ends the identity: `. .a` is the identity with a `.a` suffix and
+                // `. a` is a syntax error. yq's whitespace after a dot carries meaning of its
+                // own (#798, #4237), so only jq mode reads it this way.
+                let jq_gap = self.mode == ParserMode::Jq && self.pos > dot_end;
+
+                // `. .a`, `. ."a"`, `. .["a"]`: the second dot is a suffix, not half of `..`.
+                if jq_gap && self.peek() == Some('.') {
+                    let term = self.parse_postfix(Expr::Identity)?;
+                    self.last_primary_is_term = true;
+                    return Ok(term);
+                }
 
                 // Check for `..` (recursive descent)
                 if self.peek() == Some('.') {
@@ -3756,6 +3768,13 @@ impl<'a> Parser<'a> {
                         && self.pos == dot_end
                         && self.peek().is_some_and(is_yq_path_element_char))
                 {
+                    self.last_primary_is_term = true; // #3038: leaf Term
+                    return Ok(Expr::Identity);
+                }
+
+                // #5447: a name after a gap is not this `.`'s field; leave it, so the caller
+                // meets it as the stray token jq's grammar does.
+                if jq_gap && self.peek().is_some_and(is_ident_start_char) {
                     self.last_primary_is_term = true; // #3038: leaf Term
                     return Ok(Expr::Identity);
                 }
@@ -8550,6 +8569,18 @@ impl<'a> Parser<'a> {
                     let dot_end = self.pos;
                     self.skip_ws_after_dot();
 
+                    // #5447: `.a. b` and `.a . b` are syntax errors in jq; a quote or a bracket
+                    // after the gap (`.a . "b"`, `.a .["b"]`) is still a suffix.
+                    if self.mode == ParserMode::Jq
+                        && self.pos > dot_end
+                        && self.peek().is_some_and(is_ident_start_char)
+                    {
+                        return Err(ParseError::new(
+                            "syntax error, unexpected IDENT after '.'",
+                            self.pos,
+                        ));
+                    }
+
                     // Yq allows `.?` as an empty field name, but a space or
                     // newline between the dot and `?` is a lexer error.
                     if self.mode == ParserMode::Yq
@@ -13053,6 +13084,32 @@ mod tests {
             parse("keys_unsorted").unwrap(),
             Expr::Builtin(Builtin::KeysUnsorted)
         );
+    }
+
+    /// #5447: whitespace after a `.` ends the identity in jq mode (`. .a` is a suffix, `. a` is a
+    /// syntax error); yq mode keeps its own whitespace rules after a dot (#798, #4237).
+    #[test]
+    fn test_jq_whitespace_after_a_dot_is_not_part_of_the_next_token_5447() {
+        for source in [
+            ". .a",
+            ". .\"a\"",
+            ". .[\"a\"]",
+            ".a . \"b\"",
+            ". as $x | $x",
+        ] {
+            assert!(
+                parse_with_mode(source, ParserMode::Jq).is_ok(),
+                "jq mode must accept `{source}`"
+            );
+        }
+        for source in [". a", ". true", ".a. b", ".a . b", ". .."] {
+            assert!(
+                parse_with_mode(source, ParserMode::Jq).is_err(),
+                "jq mode must reject `{source}`"
+            );
+        }
+        // yq's rules are unchanged: a gap before a name is still a field access there.
+        assert!(parse_with_mode(". a", ParserMode::Yq).is_ok());
     }
 
     /// #5444: yq's lexer has no `@text` or `@html` token and no bare `env` (it has `env(NAME)`),
