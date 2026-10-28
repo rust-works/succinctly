@@ -1070,6 +1070,8 @@ enum BoundSlot {
     /// Bound while a `DefCall` evaluation was live. The body stays in the
     /// holder until that evaluation's [`retention_scope`] closes; the node
     /// owns the holder, so a node dropped earlier frees the body with it.
+    /// A `no_std` build binds every body into a holder that is already empty
+    /// (#5422), so there `Held` means "released".
     /// Never [`Reach::Hot`]: a hot node's body is kept.
     Held {
         holder: Rc<retention_scope::Holder>,

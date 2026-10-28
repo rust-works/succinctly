@@ -287,15 +287,19 @@ fn retained_after_first_run(query: &str) -> (i64, i64) {
 }
 
 /// A call tree evaluated once is freed as it returns, in every build: `fib(14)` is about 1,200
-/// calls and 2 MB kept (`fib(21)` is 59 MB, but overflows a debug test thread's stack). The `no_std` build has no scope stack to free it with, so it declines to
+/// calls and 2 MB kept. The `no_std` build has no scope stack to free it with, so it declines to
 /// keep a node's body on the first reach instead (#5422).
+///
+/// `fib(14)`, not `fib(21)` (59 MB kept): a debug test thread's 2 MiB stack overflows on the
+/// deeper call. Both builds hold about 2 KB; the bound leaves room for allocator size classes
+/// and nothing near a kept level of the tree.
 #[test]
 fn a_call_tree_evaluated_once_is_not_retained_5422() {
     let program = "def fib(n): if n < 2 then n else fib(n - 1) + fib(n - 2) end; fib(14)";
     let (answer, retained) = retained_after_first_run(program);
     assert_eq!(answer, 377);
     assert!(
-        retained < 64 * 1024,
+        retained < 16 * 1024,
         "the expression kept {retained} bytes of the call tree after one evaluation"
     );
 }
