@@ -184,3 +184,4 @@ mod i5417;
 mod i5421;
 mod i5424;
 mod i5436;
+mod i5441;

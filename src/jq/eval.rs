@@ -3524,19 +3524,36 @@ pub(crate) fn pipe_needs_path_context(stages: &PipeStages) -> bool {
 /// the node pays no more than it did and one that does not pays once.
 pub(crate) fn pipe_holds_tracked_var(stages: &PipeStages) -> bool {
     stages.holds_tracked_var_or_init(|stages| {
-        stages
-            .iter()
-            .any(|stage| any_subexpr(stage, &mut |e| matches!(e, Expr::TrackedVar(_))))
+        stages.iter().any(|stage| match kept_run_of(stage) {
+            Some(run) => pipe_holds_tracked_var(run),
+            None => any_subexpr(stage, &mut |e| matches!(e, Expr::TrackedVar(_))),
+        })
     })
+}
+
+/// The pipe a stage hands on as a kept run of a split tail ([`TailPlan::Split`]):
+/// `Shared` around an `Expr::Pipe`, which remembers the facts the early-outs
+/// below ask of it. A tail split around the stages that differ per call is
+/// built for each call, so a fact read through the run is read once, where a
+/// walk of its stages is paid again by every call (#5441).
+fn kept_run_of(stage: &Expr) -> Option<&PipeStages> {
+    match stage {
+        Expr::Shared(arg) => match arg.expr() {
+            Expr::Pipe(run) => Some(run),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Whether the stages of a pipe hold a node that can start a resolver
 /// invocation ([`may_enter_resolver_node`]), remembered on the pipe (#5404).
 pub(crate) fn pipe_holds_resolver_node(stages: &PipeStages) -> bool {
     stages.holds_resolver_node_or_init(|stages| {
-        stages
-            .iter()
-            .any(|stage| any_subexpr(stage, &mut may_enter_resolver_node))
+        stages.iter().any(|stage| match kept_run_of(stage) {
+            Some(run) => pipe_holds_resolver_node(run),
+            None => any_subexpr(stage, &mut may_enter_resolver_node),
+        })
     })
 }
 
@@ -3545,9 +3562,10 @@ pub(crate) fn pipe_holds_resolver_node(stages: &PipeStages) -> bool {
 /// destructuring bind is an `Expr::AsPattern`, which it does not).
 pub(crate) fn pipe_holds_bind(stages: &PipeStages) -> bool {
     stages.holds_bind_or_init(|stages| {
-        stages
-            .iter()
-            .any(|stage| any_subexpr(stage, &mut |e| matches!(e, Expr::As { .. })))
+        stages.iter().any(|stage| match kept_run_of(stage) {
+            Some(run) => pipe_holds_bind(run),
+            None => any_subexpr(stage, &mut |e| matches!(e, Expr::As { .. })),
+        })
     })
 }
 
@@ -3577,7 +3595,19 @@ pub(crate) fn pipe_effect_before_last(stages: &PipeStages) -> bool {
 /// twice where jq reads `0`, then `1`.
 pub(crate) fn stages_effect_before_last(stages: &[Expr]) -> bool {
     match stages.split_last() {
-        Some((_, before)) => before.iter().any(|stage| {
+        Some((_, before)) => before.iter().any(stage_may_have_effect),
+        None => false,
+    }
+}
+
+/// Whether one stage of a pipe may have an effect or read the input state, as
+/// [`stages_effect_before_last`] counts them. A kept run of a split tail is
+/// asked of its remembered fact and its last stage, which that fact leaves out
+/// (#5441).
+fn stage_may_have_effect(stage: &Expr) -> bool {
+    match kept_run_of(stage) {
+        Some(run) => pipe_effect_before_last(run) || run.last().is_some_and(stage_may_have_effect),
+        None => {
             walk_body_may_have_effects(stage)
                 || any_subexpr(stage, &mut |e| {
                     matches!(
@@ -3585,8 +3615,7 @@ pub(crate) fn stages_effect_before_last(stages: &[Expr]) -> bool {
                         Expr::Builtin(Builtin::InputLineNumber | Builtin::InputFilename)
                     )
                 })
-        }),
-        None => false,
+        }
     }
 }
 
@@ -11211,6 +11240,26 @@ fn static_path_expr(path: &OwnedValue) -> Option<Expr> {
     })
 }
 
+/// [`eval_each_owned_split_head`] for the eager re-entry (#5441), collected with
+/// the escape that ended it, if any.
+#[inline(never)]
+fn eval_owned_input_split_head<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+    reentry: Reentry,
+) -> QueryResult<'a, W> {
+    let mut collected = Vec::new();
+    let flow = eval_each_owned_split_head::<S>(expr, input, optional, reentry, &mut |value| {
+        collected.push(value);
+        Demand::Continue
+    });
+    match flow {
+        Some(Flow::Escaped(control)) => partial(collected, control),
+        _ => owned_vec_to_result(collected),
+    }
+}
+
 /// [`embed_peel_step`] for the eager re-entry (#3180): the peeled stage's
 /// outputs run through `rest` on [`eval_each_owned`], collected with the
 /// escape that ended them, if any -- the same shape as
@@ -11918,10 +11967,77 @@ pub(crate) fn eval_each_owned<S: EvalSemantics>(
     if matches!(unwrap_paren(expr), Expr::Pipe(stages) if lone_plain_stage(stages).is_some()) {
         lone_pipe_entries::bump();
     }
+    if let Some(flow) = eval_each_owned_split_head::<S>(expr, input, optional, reentry, sink) {
+        return flow;
+    }
     if let Some(flow) = eval_each_owned_front_doors::<S>(expr, input, optional, sink) {
         return flow;
     }
     eval_each_owned_past_front_doors::<S>(expr, input, optional, reentry, sink)
+}
+
+/// The kept run a split tail starts with (#5441, [`TailPlan::Split`]), and the
+/// stages after it: `expr` is that run (a `Shared` around an `Expr::Pipe`), or
+/// a pipe whose first stage is.
+///
+/// A run behind a `Shared` is not a pipe the doors of this evaluator key on, so
+/// handed on as it is the tail bridges, and a container the run passes on
+/// (`[.] | .[0]`) comes out of the bridge a copy that is equal to it in value
+/// only, where jq compares the two by identity (`[nan] as $a | ... | . == $a`).
+/// The run is the same stages as the flat pipe has in its place, so it is
+/// evaluated as a pipe, on the doors, and what follows it is the rest.
+fn split_head(expr: &Expr) -> Option<(&Expr, &[Expr])> {
+    match expr {
+        Expr::Shared(arg) if matches!(arg.expr(), Expr::Pipe(_)) => Some((arg.expr(), &[])),
+        Expr::Pipe(stages) => match stages.split_first() {
+            Some((Expr::Shared(arg), rest)) if matches!(arg.expr(), Expr::Pipe(_)) => {
+                Some((arg.expr(), rest))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// [`eval_each_owned`]'s door for a tail that starts with a kept run
+/// ([`split_head`]): the run's outputs go through the rest of the tail on
+/// [`eval_each_owned`] in turn.
+#[inline(never)]
+fn eval_each_owned_split_head<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+    reentry: Reentry,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Option<Flow> {
+    let (run, rest) = split_head(expr)?;
+    let rest = match rest {
+        [] => None,
+        [only] => Some(only.clone()),
+        stages => Some(Expr::Pipe(stages.to_vec().into())),
+    };
+    let Some(rest) = rest else {
+        return Some(eval_each_owned::<S>(run, input, optional, reentry, sink));
+    };
+    // The flow that ended the rest of the tail for some output of the run, which
+    // the run's own flow (stopped by the sink below) must not replace.
+    let mut ended = None;
+    let flow =
+        eval_each_owned::<S>(
+            run,
+            input,
+            optional,
+            reentry,
+            &mut |value| match eval_each_owned::<S>(&rest, &value, optional, Reentry::REBUILT, sink)
+            {
+                Flow::Exhausted => Demand::Continue,
+                other => {
+                    ended = Some(other);
+                    Demand::Stop
+                }
+            },
+        );
+    Some(ended.unwrap_or(flow))
 }
 
 /// [`eval_each_owned`] for an `expr` whose front doors
@@ -77685,6 +77801,12 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(e) => e.into(),
         };
     }
+    // #5441: a tail that starts with a kept run, as in the lazy twin. Out of line:
+    // this function is inlined into recursive callers, and a stack frame of theirs
+    // that grows is a depth limit that moves.
+    if split_head(expr).is_some() {
+        return eval_owned_input_split_head::<W, S>(expr, input, optional, reentry);
+    }
     // #3180: the relocating fold and the embed peel, as in the lazy twin
     // [`eval_each_owned`]. An eager caller -- an array constructor's
     // collect, `[input | . as $x | {k:.} | .k | path($x)]` -- reaches a
@@ -112082,11 +112204,10 @@ mod tests {
     /// tails after the last such stage are the same for every value, and are
     /// kept once, as for a body that reads none (#5424). Forty values copy
     /// nothing more per value for a variable read in the first stage than for
-    /// a body that reads none; a variable read in the last stage shares no
-    /// tail, and answers the same. A tail copied because it holds one hands its
-    /// own tails on the link, so the tails after the variable are kept however
-    /// the copy was reached: a variable in the middle copies one tail for each
-    /// stage before it, where it copied one for every stage.
+    /// a body that reads none. A tail that holds the stage is split around it
+    /// (#5441), its runs the ones the pipe keeps, so a variable read in the
+    /// middle or in the last stage copies nothing more per value either; one
+    /// read in every stage has no run to share, and copies each tail.
     #[test]
     fn test_body_that_reads_its_variable_shares_the_tails_after_it_5436() {
         fn run<S: EvalSemantics>() {
@@ -112118,13 +112239,13 @@ mod tests {
                     "as, middle",
                     format!("[range(0;N) | . as $x | ({after} | . + $x | {after})] | add"),
                     doubled + 40 * (STAGES - 1),
-                    Some(20),
+                    Some(4),
                 ),
                 (
                     "as, last stage",
                     format!("[range(0;N) | . as $x | ({after} | . + $x)] | add"),
                     doubled,
-                    None,
+                    Some(4),
                 ),
                 (
                     "as, every stage",
