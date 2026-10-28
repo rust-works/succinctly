@@ -12741,6 +12741,8 @@ inside another call's output -- keeps its body at once, as before, since such no
 bounded by the program's size. A static probe that binds a body to choose an evaluation
 route shares the cache without counting as a reach. See `BoundBody` and `retention_scope`
 (`src/jq/expr.rs`).
+A `--no-default-features` build has no `thread_local!` to hold a scope stack, so it holds nothing: a body is not kept on a node's first reach and is kept from the second (#5422).
+That bounds a call tree evaluated once there too (`fib(24)` held 251 MB before, under 2 KB after), at the price of one more bind for a node reached twice.
 
 A tree evaluated **more than once** is still kept whole, after its second evaluation rather
 than its first: `fib(24)` over two inputs peaks at 9 MB on the first and returns to the

@@ -1028,13 +1028,20 @@ pub enum MetaSlot {
 ///   before #3148 after its first.
 /// - **Cold**: bound with no scope open -- a call reached outside every
 ///   `DefCall` evaluation, which is a top-level call site not itself inside
-///   a call's output, or any call in a `no_std` build, which has no
-///   `thread_local!` -- and kept for the node's lifetime, exactly as before
+///   a call's output -- and kept for the node's lifetime, exactly as before
 ///   #3148. Such nodes are bounded by the program's size; a cold body's own
 ///   calls are held, not kept.
 ///
 /// What stays retained is therefore bounded by the live call stack plus the
 /// call trees of the subtrees evaluated more than once.
+///
+/// **A `no_std` build has no scope stack** (`thread_local!`), so it places
+/// every bind as a *held* one whose scope has already closed (#5422): the body
+/// is not kept on a node's first reach, and is bound again and kept on its
+/// second. The same bound on what stays retained holds, but a hot body's own
+/// calls turn hot a reach at a time rather than at once, and a node reached
+/// twice pays one more bind. Before this a `no_std` build kept every call's
+/// body: `fib(24)` held 251 MB.
 ///
 /// Only an **evaluation** reaches a node ([`Self::get_or_try_init`]). A
 /// static probe that binds a body to look inside it before choosing a route
@@ -1413,16 +1420,26 @@ pub(crate) mod retention_scope {
         }
     }
 
+    /// `no_std` has no `thread_local!` to hang a scope stack on, so no scope
+    /// ever opens -- and a body bound with none open would be kept for the
+    /// node's lifetime, the whole call tree of a `fib` (#5422: 251 MB for
+    /// `fib(24)`). Instead every bind is placed as if under a cold scope that
+    /// has already closed: [`hold`] returns a holder that holds nothing, so a
+    /// node reached once frees its body when its caller drops it, and the node
+    /// is kept from its second reach on (`BoundBody::bind_slow`). What it costs
+    /// is one extra bind of a node reached twice, and the "hot all the way
+    /// down" rule: with no scope to say a call is hot, a hot body's own calls
+    /// turn hot one reach each, a round at a time.
     #[cfg(not(feature = "std"))]
     mod imp {
         use super::{Expr, Holder, Rc, Scope};
 
         pub(crate) fn innermost() -> Option<Scope> {
-            None
+            Some(Scope::Cold)
         }
 
-        pub(crate) fn hold(body: &Rc<Expr>) -> Rc<Holder> {
-            Rc::new(Holder(core::cell::RefCell::new(Some(Rc::clone(body)))))
+        pub(crate) fn hold(_body: &Rc<Expr>) -> Rc<Holder> {
+            Rc::new(Holder(core::cell::RefCell::new(None)))
         }
 
         #[must_use]
@@ -4339,6 +4356,7 @@ mod tests {
     /// already-populated `BoundBody` must return the cached value without
     /// re-invoking `bind` -- confirms the early `self.0.get()` return still
     /// holds after switching the populate path from `get_or_init` to `set`.
+    #[cfg(feature = "std")]
     #[test]
     fn test_bound_body_second_call_returns_cached_without_rebinding_2092() {
         let bound = BoundBody::default();
@@ -4368,8 +4386,10 @@ mod tests {
 
     /// #3148: with no retention scope open -- a top-level call site -- the
     /// first bind keeps the body for the node's lifetime (cold), as before
-    /// #3148, and a second use makes it hot without binding again. Holds
-    /// under `no_std` too, where no scope ever opens.
+    /// #3148, and a second use makes it hot without binding again. `std`
+    /// only: a `no_std` build never has a scope open and holds nothing at all
+    /// (see the test below).
+    #[cfg(feature = "std")]
     #[test]
     fn test_bound_body_without_scope_keeps_cold_then_hot_3148() {
         let bound = BoundBody::default();
@@ -4385,6 +4405,34 @@ mod tests {
         assert!(Rc::ptr_eq(&first, &second), "reused, not re-bound");
         assert!(bound.is_hot(), "a second use is hot");
         assert_eq!(binds, 1);
+    }
+
+    /// #5422: a `no_std` build has no scope stack, so the first bind frees
+    /// the body with the caller's last reference -- the `fib` shape, where a
+    /// node is reached once -- rather than keeping it for the node's
+    /// lifetime; the second reach binds once more and keeps the result, hot,
+    /// and the third reuses it.
+    #[cfg(not(feature = "std"))]
+    #[test]
+    fn test_bound_body_without_scope_frees_cold_then_keeps_hot_5422() {
+        let bound = BoundBody::default();
+        let mut binds = 0usize;
+        let mut bind = || {
+            binds += 1;
+            Ok::<_, ()>(Rc::new(Expr::Identity))
+        };
+        let first = bound.get_or_try_init(&mut bind).unwrap();
+        assert!(bound.available().is_none(), "a first use is not kept");
+        assert!(!bound.is_hot(), "a first use is cold");
+        let weak = Rc::downgrade(&first);
+        drop(first);
+        assert!(weak.upgrade().is_none(), "the body died with its caller");
+        let second = bound.get_or_try_init(&mut bind).unwrap();
+        assert!(bound.is_hot(), "a second use is hot");
+        assert!(bound.available().is_some(), "a hot node keeps its body");
+        let third = bound.get_or_try_init(&mut bind).unwrap();
+        assert!(Rc::ptr_eq(&second, &third), "reused, not re-bound");
+        assert_eq!(binds, 2);
     }
 
     /// #3148: a first bind inside a cold scope is held only until that scope
@@ -4472,6 +4520,9 @@ mod tests {
         let _ = bound.probe(&mut bind).unwrap();
         assert!(!bound.is_hot(), "probes alone never make a node hot");
         let first = bound.get_or_try_init(&mut bind).unwrap();
+        // A `no_std` build holds nothing (#5422), so a probed body is gone
+        // once its caller lets go and every evaluation binds again.
+        #[cfg(feature = "std")]
         assert!(
             Rc::ptr_eq(&probed, &first),
             "evaluation reuses the probed body"
@@ -4482,7 +4533,14 @@ mod tests {
         );
         bound.get_or_try_init(&mut bind).unwrap();
         assert!(bound.is_hot(), "the second evaluation is");
+        #[cfg(feature = "std")]
         assert_eq!(binds, 1);
+        #[cfg(not(feature = "std"))]
+        {
+            // Two probes and two evaluations, each binding afresh.
+            assert_eq!(binds, 4);
+            drop(probed);
+        }
     }
 
     /// #3148 review: pruning is amortised. A scope whose own entries are
