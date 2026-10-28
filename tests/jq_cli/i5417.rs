@@ -82,31 +82,59 @@ fn test_parenthesized_pipe_driven_one_output_at_a_time_matches_jq_5417() -> Resu
     Ok(())
 }
 
-/// A pipe long enough that the quadratic copy was the cost answers as the flat spelling does,
-/// for every consumer, and in the time a linear walk takes (the unit test pins the copies; this
-/// is the end-to-end check that the answers did not move).
+/// A pipe long enough that the quadratic copy was the cost answers as jq does, for every
+/// consumer. The unit test pins the copies; this is the end-to-end check that the answers did
+/// not move. Values captured from jq 1.7.1 for 60 stages over 300 values.
 #[test]
-fn test_long_parenthesized_pipe_agrees_with_the_flat_spelling_5417() -> Result<()> {
+fn test_long_parenthesized_pipe_matches_jq_5417() -> Result<()> {
     let long = vec![". + 1"; 60].join(" | ");
-    for shape in [
-        "[range(0;300) | (PIPE) | select(. % 7 == 0)] | length",
-        "last(range(0;300) | (PIPE))",
-        "[limit(100; range(0;300) | (PIPE))] | add",
-        "first(range(0;300) | (PIPE) | select(. > 200))",
-        "[range(0;300) | (. + input_line_number | PIPE)] | add",
-        "reduce range(0;300) as $i (0; ($i | (PIPE)) + .)",
+    for (shape, want) in [
+        (
+            "[range(0;300) | (PIPE) | select(. % 7 == 0)] | length",
+            "43\n",
+        ),
+        ("last(range(0;300) | (PIPE))", "359\n"),
+        ("[limit(100; range(0;300) | (PIPE))] | add", "10950\n"),
+        ("first(range(0;300) | (PIPE) | select(. > 200))", "201\n"),
+        (
+            "[range(0;300) | (. + input_line_number | PIPE)] | add",
+            "62850\n",
+        ),
+        // A body that is rebuilt for each value still copies its rest per value (#5421); its
+        // answer is the same.
+        (
+            "reduce range(0;300) as $i (0; ($i | (PIPE)) + .)",
+            "62850\n",
+        ),
     ] {
-        let parenthesized = shape.replace("PIPE", &long);
-        let flat = shape
-            .replace(
-                "(. + input_line_number | PIPE)",
-                &format!(". + input_line_number | {long}"),
-            )
-            .replace("(PIPE)", &long);
-        let (got, stderr, status) = run_jq_full(&["-n", "-c", &parenthesized], None)?;
-        let (want, _, _) = run_jq_full(&["-n", "-c", &flat], None)?;
-        assert_eq!(status, 0, "`{shape}` -- {stderr:?}");
-        assert_eq!(got, want, "`{shape}`");
+        let filter = shape.replace("PIPE", &long);
+        let (stdout, stderr, status) = run_jq_full(&["-n", "-c", &filter], None)?;
+        assert_eq!(
+            (stdout.as_str(), status),
+            (want, 0),
+            "`{shape}` -- {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The same pipes over a document: the values of its first stage are cursors into the input,
+/// the computed ones owned, and the pipe is driven through the generic evaluator.
+#[test]
+fn test_parenthesized_pipe_over_a_document_matches_jq_5417() -> Result<()> {
+    for (filter, want) in [
+        (format!("[.[] | ({T}) | select(. > 6)]"), "[7,8]\n"),
+        (format!("[.[] | ({T})] | add"), "26\n"),
+        (format!("last(.[] | ({T}))"), "8\n"),
+        (format!("[limit(2; .[] | ({T}))]"), "[5,6]\n"),
+        (format!("first(.[] | ({T}) | select(. > 6))"), "7\n"),
+    ] {
+        let (stdout, stderr, status) = run_jq_full(&["-c", &filter], Some("[1,2,3,4]"))?;
+        assert_eq!(
+            (stdout.as_str(), status),
+            (want, 0),
+            "`{filter}` -- {stderr:?}"
+        );
     }
     Ok(())
 }

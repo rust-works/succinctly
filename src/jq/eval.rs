@@ -11576,9 +11576,9 @@ pub(crate) mod lone_pipe_entries {
 
 /// Test-only observable (#3715): how many times [`eval_owned_pipe`] or a
 /// [`RestPipe`] (#5417) copied the rest of its pipe on this thread, a copy kept
-/// on its pipe (#5404) counting once, when it is built. A stateless lone stage makes none; a lone stage
-/// holding a `def`, and a rest of two or more stages that the pipe does not
-/// keep, make one per call.
+/// on its pipe (#5404) counting once, when it is built. A stateless lone stage
+/// makes none; a lone stage holding a `def`, and a rest of two or more stages
+/// that the pipe does not keep, make one per call.
 #[cfg(test)]
 pub(crate) mod owned_pipe_copies {
     use core::cell::Cell;
@@ -28513,6 +28513,9 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     {
         let mut outputs = Vec::new();
         let mut conversion_error = None;
+        // The path-context check at the top of this function has passed, so no
+        // stage of the pipe needs it (#5417).
+        debug_assert!(!tail.sink().needs_path_context());
         let flow =
             eval_each_pipe::<W, S>(
                 tail.sink(),
@@ -111714,12 +111717,13 @@ mod tests {
     }
 
     /// #5417: a pipe driven one output at a time (`select`, `last`, `limit`,
-    /// `first`, `reduce`/`foreach` over it) hands its rest on through a
+    /// `first`, `any`/`all`/`isempty` over it) hands its rest on through a
     /// [`RestPipe`] per value of its first stage, which built the owned copy of
     /// the rest afresh each time. It asks the pipe that owns the rest instead,
     /// so the copies are the ones the pipe keeps, however many values go down
     /// it; and so is the effect arm of `eval_pipe`, which drove the pipe stage
-    /// by stage without its owner.
+    /// by stage without its owner. A `reduce`/`foreach` body that
+    /// mentions its variable is rebuilt per value and still copies (#5421).
     #[test]
     fn test_sink_driven_pipe_rest_is_copied_once_per_program_not_per_value_5417() {
         fn run<S: EvalSemantics>() {
