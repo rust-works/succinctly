@@ -491,20 +491,31 @@ impl<V: Clone> ObjectMapOf<V> {
             }
             return;
         };
+        self.shadow_replaced(slot, old_value);
+    }
+
+    /// The value at `slot` of the collapsed view was just replaced by a later entry of the same key
+    /// (a caller that filled a plain `IndexMap` with `insert_full`, then moved it in with
+    /// [`From`]): keep the replaced `old` value as the key's earlier entry. The same step
+    /// [`push_occurrence`](Self::push_occurrence) takes on a repeat, so a builder can use the
+    /// plain map's single-lookup `insert_full` for every member and pay for the side list only
+    /// at the first repeat.
+    pub fn shadow_replaced(&mut self, slot: usize, old: V) {
         // `insert_full` dropped the incoming key for an existing one, so the
         // shadow takes a copy of the map's. Only a repeat pays this; a key
         // seen for the first time never reaches here.
-        let key = map
+        let key = self
+            .map
             .get_index(slot)
             .map(|(k, _)| k.clone())
-            .expect("insert_full returned a live slot");
-        let len = map.len();
+            .expect("the replaced slot is live");
+        let len = self.map.len();
         let shadows = shadows_mut(
             self.shadows
                 .get_or_insert_with(|| Shadows::with_live_slots(len).into()),
         );
         let pos = shadows.live_pos[slot];
-        shadows.order[pos] = Occurrence::Shadow(key, old_value);
+        shadows.order[pos] = Occurrence::Shadow(key, old);
         shadows.live_pos[slot] = shadows.order.len();
         shadows.order.push(Occurrence::Live(slot));
     }
@@ -898,6 +909,25 @@ enum OccurrencesInner<'a, V> {
 }
 
 impl<'a, V> Occurrences<'a, V> {
+    /// The same iteration, each entry flagged `true` when it is its key's live (last) entry and
+    /// `false` when it is a shadow -- for a writer that keys per-entry presentation by key and must
+    /// not hand a shadow its live entry's.
+    #[inline]
+    pub fn flagged(self) -> FlaggedOccurrences<'a, V> {
+        FlaggedOccurrences(self)
+    }
+
+    #[inline]
+    fn next_flagged(&mut self) -> Option<(&'a String, &'a V, bool)> {
+        match &mut self.0 {
+            OccurrencesInner::Plain(iter) => iter.next().map(|(k, v)| (k, v, true)),
+            OccurrencesInner::Ordered { map, entries } => {
+                let entry = entries.next()?;
+                Self::resolve(map, entry).map(|(k, v)| (k, v, matches!(entry, Occurrence::Live(_))))
+            }
+        }
+    }
+
     #[inline]
     fn resolve(
         map: &'a IndexMap<String, V>,
@@ -907,6 +937,23 @@ impl<'a, V> Occurrences<'a, V> {
             Occurrence::Shadow(key, value) => Some((key, value)),
             Occurrence::Live(slot) => map.get_index(*slot),
         }
+    }
+}
+
+/// [`Occurrences::flagged`]'s iterator.
+pub struct FlaggedOccurrences<'a, V>(Occurrences<'a, V>);
+
+impl<'a, V> Iterator for FlaggedOccurrences<'a, V> {
+    type Item = (&'a String, &'a V, bool);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next_flagged()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
     }
 }
 

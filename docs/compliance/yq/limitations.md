@@ -1000,7 +1000,22 @@ $ succinctly yq --eval-all -o=json -I0 '. as $x | [$x]' f1.yaml f2.yaml
 `. as $d | $d` (no collect in the body) agrees, as does every other row of #2427's own
 capture table.
 
-### Duplicate mapping keys — the format leak, `.[]` collapse and the sort family are resolved; narrower gaps remain
+### Duplicate mapping keys — an owned value keeps every entry (#1344); a few narrower gaps remain
+
+**Since [#1344](https://github.com/rust-works/succinctly/issues/1344) ([ADR-0027](../../adrs/adr-0027.md)) an `OwnedValue::Object` keeps a repeated mapping key's earlier entries beside its collapsed `IndexMap`.**
+`succinctly yq` records them where it materializes a document (the owned input of `-s`/`--eval-all`, the value a `[...]`, a binding, `..`, a write or a comma holds) and every writer prints all of them.
+`succinctly jq` never records one (a JSON document with a repeated key is the last value to jq), so jq mode is unchanged.
+Navigation, `.[]`, `map_values` and every write through a path act on the last entry, as yq does; `del` removes every entry; `+` overwrites the first; `to_entries`, `with_entries`, `from_entries`, `omit` and the writers see all of them.
+The 68 oracle rows in `tests/yq_cli/i1344.rs` pin it against yq v4.53.3, on a plain run and under `--eval-all`.
+What is still different, each a place that has not been taught the entries (an earlier entry survives until something copies the map through a raw `IndexMap` borrow, which keeps only the last):
+
+- **`contains`** on a mapping with a repeated key tests only the last entry (`contains({"a":1})` is `false`, yq `true`).
+- **`sort_keys`** collapses a repeated key (yq copies the last value over the earlier entries: `{"a":2,"a":2,"b":3}`).
+- **A comment, anchor or style on an earlier entry** is not carried on the routes that hold a `CommentTree`, which is keyed by key and describes the last entry: the earlier entry is written plain.
+  An alias to an anchor declared on an earlier entry is written as that entry's value, since the anchor is not.
+- **Object slicing** (#1102) and the other `IndexMap` builders that have not been converted.
+
+The sections below are the history of how each member was closed; where a bullet there says a route "collapses", this paragraph supersedes it.
 
 The subject of [ADR-0018](../../adrs/adr-0018.md)'s worked example.
 [#1398](https://github.com/rust-works/succinctly/issues/1398) resolved the two divergences it
@@ -1065,20 +1080,9 @@ a real fan-out for a generator `n` — closing an internal contradiction in the 
 (`[keys|.[]] | length` answered 3 while `reduce (keys|.[]) as $k (0; .+1)` answered 2 on the
 same document) and the last of `limit`/`nth`'s duplicate-key loss in the second.
 
-**Three gaps #1687 deliberately did not close**, alongside the four below:
-
-- **`group_by`** returns an array *of arrays*. In jq mode it is a cursor-backed sequence of
-  groups since #5306 (`LazySource::Groups`), but yq's `group_by` is an ordered map on the first
-  key's text that never sorts (#2799), so it keeps the bridge, and real yq preserves where
-  succinctly collapses. The same representation limit as #1102 below, one level up.
-- **`while`/`until`** compute their state from step 1 onward, so only the seed `.` could ever
-  stay a cursor; folding through an `OwnedValue` state is inherent, not a wiring gap.
-- **`reduce`/`foreach`'s bindings.** The fix recovers the *number and order* of the input
-  stream's elements, not each element's own shape: the accumulator and every `$x` a pattern
-  binds are `OwnedValue` in both evaluators (`substitute_bound_var` takes `&OwnedValue`, and no
-  duplicate-key-capable owned type exists in this crate), so an element that gets bound is
-  collapsed at the bind. `reduce .[] as $x (null; $x)` therefore still answers
-  `{"b":3,"a":2}` where `first(.[])` on the same document answers `{"b":1,"a":2,"b":3}`.
+**Three gaps #1687 deliberately did not close** were closed by #1344, which gave the owned value somewhere to keep the entries:
+`group_by` (an array of arrays), `while`/`until` (their state is an `OwnedValue`) and `reduce`/`foreach`'s bindings now print `{"b":1,"a":2,"b":3}` for the element the old text below shows collapsing to `{"b":3,"a":2}`.
+Pinned by `test_group_by_and_while_until_keep_a_repeated_key_1687` and `test_reduce_binding_keeps_duplicate_keys_1687`.
 
 **And one deliberate divergence from real yq, not a gap.** The cursor-backed reordering above
 is switched off entirely for a document carrying any `*alias`, via
@@ -1093,61 +1097,32 @@ alias-bearing document to the DOM path for them instead, losing the marks rather
 emitting a file succinctly could not read back. The gate is on *aliases*, not anchors: an unreferenced
 `&x` is valid YAML wherever it lands.
 
-Three narrower gaps #1398's fix deliberately left alone remain open, each already filed before
-it landed (a fourth, [#1342](https://github.com/rust-works/succinctly/issues/1342),
-`paths(node_filter)` collapsing a duplicate key, is closed: `paths(f)` walks the document and
-runs `f` on the node each path names whenever the format keeps duplicates, as `paths` does;
-jq mode, which collapses them anyway, keeps the owned producer):
+Three narrower gaps #1398's fix deliberately left alone were filed before it landed (a fourth, [#1342](https://github.com/rust-works/succinctly/issues/1342), `paths(node_filter)` collapsing a duplicate key, is closed: `paths(f)` walks the document and runs `f` on the node each path names whenever the format keeps duplicates, as `paths` does; jq mode, which collapses them anyway, keeps the owned producer):
 
-- [#1343](https://github.com/rust-works/succinctly/issues/1343) — `-s` with a non-identity filter
-  and `--eval-all` still route through `parse_input`/`OwnedValue` for *both* formats (a
-  pre-existing, format-symmetric bug, not a new one #1398 introduced).
-  `-i` no longer belongs to this bullet: since [#1349](https://github.com/rust-works/succinctly/issues/1349)
-  a read-only `-i` filter (`paths`, `keys`, `to_entries`) evaluates on cursors and keeps the repeated key.
-  A write under `-i` still collapses, with the writes below.
-- [#1344](https://github.com/rust-works/succinctly/issues/1344) — `del`/`with_entries`/
-  `map_values`/`walk` (and `recurse(f)`/`recurse(f; cond)` with a general `f`) fall through
-  `eval_generic.rs`'s wildcard bridge (`eval_on_owned`), which still materializes via an
-  `IndexMap` and collapses duplicates for both formats today. #1687 closed the same class for
-  the sort family and `reduce`/`foreach` above; this list is the remaining membership.
-  `tostream` (under `--jq-extensions`) and `..`/bare `recurse` now keep the repeated key, with
-  one limit: `..` only prints the node intact where its result streams as a cursor (`..`, or
-  `..` piped into `select`/`key`/`path`/another navigation stage). Anywhere else the node is
-  materialized and collapses -- `[..]`, `.., 1`, `.. as $x | $x`, `.. // 1` -- where yq keeps
-  both entries (`[..]` is `[{"a":1,"a":2,"b":3},2,3]` in yq).
-- [#1102](https://github.com/rust-works/succinctly/issues/1102) — object slicing (`.[S:E]` on
-  an object) must materialize into an `OwnedValue::Object` to build yq's AST-child-list view
-  before slicing it, with no cursor-preserving alternative available (the operation inherently
-  needs to reorder/slice entries, not just stream them) — a real representation limit, not a
-  missed wiring like the three above.
+- - [#1343](https://github.com/rust-works/succinctly/issues/1343) — `-s` with a non-identity filter and `--eval-all` route through `parse_input`/`OwnedValue` for *both* formats.
+  Closed by #1344: that owned input keeps the repeated key, and `-s 'paths'`, `--eval-all '.'` and `--eval-all 'keys'` match yq.
+  `-i` follows stdout since [#1349](https://github.com/rust-works/succinctly/issues/1349).
+- - [#1344](https://github.com/rust-works/succinctly/issues/1344) — `del`/`with_entries`/`map_values`/`walk` (and `recurse(f)`/`recurse(f; cond)`) fell through `eval_generic.rs`'s wildcard bridge (`eval_on_owned`), which materialized via an `IndexMap`.
+  Closed (see the paragraph above): `[..]`, `.., 1` and `.. as $x | $x` print the node intact, as does every other shape in this list except `contains` and `sort_keys`.
+- - [#1102](https://github.com/rust-works/succinctly/issues/1102) — object slicing (`.[S:E]` on an object) must materialize into an `OwnedValue::Object` to build yq's AST-child-list view before slicing it.
+  Still a gap: the view is built from the collapsed map.
 
 **[#2186](https://github.com/rust-works/succinctly/issues/2186) records the routes that collapse
 by construction, which is a wider set than the issue's own `LazySeq` arm.**
 The DOM route's result type is `ResultWithComments = (OwnedValue, CommentTree)` (`yq_runner.rs`).
 It has no cursor variant, and `OwnedValue::Object` is an `IndexMap`, so whatever reaches the route has merged a repeated key before it is printed.
 That includes a `LazySeq` of cursors, which is why the issue's own fix (`drain_atomic`, as on the jq side) does not transfer: `jq_runner.rs` has a cursor-carrying `JqValue` to hand each element to, and the yq route has nothing equivalent.
-Real yq v4.53.3 keeps both entries on every row below, run on `a: 1 / a: 2 / b: 3`:
-
-| Invocation                          | succinctly yq | yq v4.53.3           |
-|-------------------------------------|---------------|----------------------|
-| `-P '.'`                            | `a: 2 / b: 3` | `a: 1 / a: 2 / b: 3` |
-| `--eval-all '.'` (yq: `ea '.'`)     | `a: 2 / b: 3` | `a: 1 / a: 2 / b: 3` |
-| `-P '., .'`                         | `a: 2 / b: 3` | `a: 1 / a: 2 / b: 3` |
-| `'.b = 5'`, on stdout or under `-i` | `a: 2 / b: 5` | `a: 1 / a: 2 / b: 5` |
-| `-i 'del(.b)'`                      | `a: 2`        | `a: 1 / a: 2`        |
-
-`-P` and `--arg` send every filter down the route, so `.` itself collapses under them.
+Real yq v4.53.3 keeps both entries on every row, run on `a: 1 / a: 2 / b: 3`; every row below printed `a: 2 / b: 3` (or `a: 2 / b: 5`, `a: 2`) before #1344 and prints yq's answer now:
+`-P '.'`, `--eval-all '.'` (yq: `ea '.'`), `-P '., .'`, `'.b = 5'` on stdout or under `-i`, and `-i 'del(.b)'`.
+`-P` and `--arg` send every filter down the route, so `.` itself used to collapse under them.
 `--arg` has no yq twin to compare against, since yq v4.53.3 rejects the flag.
-`-s` with a non-identity filter (`-s '.[0]'`) has none either, because yq's `-s` is `--split-exp`, but it takes the same route and collapses.
-The two write rows are the "every assignment" half of [#1344](https://github.com/rust-works/succinctly/issues/1344)'s (b) decision.
-`[...]` around a cursor result (`[.[0]]`, [#2063](https://github.com/rust-works/succinctly/issues/2063)) is a further member that stays collapsed on stdout.
+`-s` with a non-identity filter (`-s '.[0]'`) has none either, because yq's `-s` is `--split-exp`, but it takes the same route and keeps the entries now.
+`[...]` around a cursor result (`[.[0]]`, [#2063](https://github.com/rust-works/succinctly/issues/2063)) keeps them too.
 A top-level comma stopped being a member in [#5283](https://github.com/rust-works/succinctly/issues/5283).
 When every branch is navigation (`., .b`, `.a, .zz`, `(.a, .b), .l`), stdout streams the branches one at a time through the M2 writers, so a repeated key and a node's flow style survive as they do for each branch alone.
 A branch that errors during evaluation prints nothing for the others, and a document separator is written once, before the first branch that prints.
 A failure found while a later branch streams (an undecodable scalar in a document yq rejects whole) comes after the earlier branches were written, as it does for `.[]` (#1615).
 A branch that answers an alias prints `*a`, as `.[]` and yq do, where the DOM route's per-result soundness rule expanded it (`.x, .y` on `x: &a {p: 1} / y: {q: *a}`).
-`-C`, `-0`, `-i`, `-s`, `--eval-all`, `-P` and a branch that is not navigation (`.a // .b`, `.a, (.b | length)`) keep the DOM route and its collapse.
-All of them close together once `OwnedValue::Object` can hold a repeated key, or the route can carry a cursor.
 The wiring fault the issue's triage also named no longer reproduces: `-P 'map(.)'`, `-P 'sort'` and `-P 'reverse'` print `99999999999999999999` as yq does, where the triage saw `1e+20` (`the_dom_route_keeps_a_large_integers_spelling_through_a_lazy_seq_2186` pins it).
 
 **[#2626](https://github.com/rust-works/succinctly/issues/2626) closed one member that was
@@ -1349,25 +1324,11 @@ containing deep nesting would have been walked by the pre-check but never reache
 evaluator, which rejects a non-string key immediately without descending into it) — all
 avoided by converting the panic at its source instead of predicting it from a second walk.
 
-**Known cost: `--inplace`/`--slurp` with well-formed, duplicate-keyed JSON input still
-collapses those duplicates** (`{"a":1,"a":2}` → `{"a":2}`) — `any_input_is_json` is a blanket,
-content-independent gate (computed from `--input-format`/file extension alone, never from
-whether the document is actually malformed), so it declines the fast path for *every* JSON-
-sourced `--slurp`/`--inplace` invocation, not just the malformed ones this fix exists for. This
-is the exact #996 regression that gate caused before #996 fixed it at the source for the
-*other* two JSON M2 gates (`can_json_fast_path`/`can_yaml_fast_path`, the plain stdout path,
-both left untouched by this fix — see below). Accepted deliberately: `--inplace` mutating a
-file on a false accept is a correctness/data-safety concern; a collapsed duplicate key on
-*well-formed* input is a narrower, already-tracked one
-([#1343](https://github.com/rust-works/succinctly/issues/1343), "the DOM fallback for
-`--slurp`/`--eval-all`/`--inplace` still collapses duplicate keys for both formats" — already
-true before this fix for any filter forcing that fallback; this fix just widens which filters
-do). This same collapsing is also what the CLI test suite uses to *prove* the fast path
-actually declined for well-formed JSON input, not merely that ordinary output happened to match
-either way (`test_yq_slurp_fast_path_rejects_trailing_comma_2276`/
-`test_yq_inplace_fast_path_rejects_trailing_comma_leaves_file_untouched_2276`'s own duplicate-
-key assertions) — a `[1,2,3]`-shaped well-formed check alone can't distinguish "the fast path
-ran" from "silently fell back and produced the same bytes."
+**Former cost, closed by #1344: `--inplace`/`--slurp` with well-formed, duplicate-keyed JSON input collapsed those duplicates** (`{"a":1,"a":2}` → `{"a":2}`).
+`any_input_is_json` is a blanket, content-independent gate (computed from `--input-format`/file extension alone, never from whether the document is actually malformed), so it declines the fast path for *every* JSON-sourced `--slurp`/`--inplace` invocation, not just the malformed ones this fix exists for.
+Accepted deliberately: `--inplace` mutating a file on a false accept is a correctness/data-safety concern.
+The fallback's owned value keeps the repeated key since #1344, so the output no longer differs between the two routes, and the duplicate key no longer proves which route ran.
+The malformed-input rows of `test_yq_slurp_fast_path_rejects_trailing_comma_2276` and `test_yq_inplace_fast_path_rejects_trailing_comma_leaves_file_untouched_2276` are what guard the gate now.
 
 **A further collateral cost, narrowed by #4394**: `any_input_is_json` is one run-wide boolean with
 no per-file M2-vs-DOM switch (a per-file version was not attempted — each of
@@ -2975,8 +2936,7 @@ Error: object key "" is ambiguous: a complex or undecodable key's display form c
 with another key of the same name and cannot be represented
 ```
 
-An *ordinary* repeated key (no decode failure on either side) is unaffected and still
-collapses to its last value, matching yq's normal duplicate-key handling.
+An *ordinary* repeated key (no decode failure on either side) is unaffected: since #1344 it keeps every entry, as yq does.
 
 **Every materializing route also catches a second, wider trigger: a complex key**
 ([#1749](https://github.com/rust-works/succinctly/issues/1749) for
@@ -3000,8 +2960,9 @@ streams the mapping with both entries, under #222's `""` spelling: `.`, `-o json
 `to_entries`, `length`, `has`, and `select(.)`. `select`/`if`'s own validation walk
 deliberately keeps the narrower decode-failure-only flag so it does not refuse what yq itself
 streams. This is an [ADR-0018](../../adrs/adr-0018.md) rule-4(b) divergence on the
-materializing routes only: yq keeps both keys there too, and `OwnedValue::Object` cannot until
-a duplicate-capable object exists ([#1344](https://github.com/rust-works/succinctly/issues/1344)).
+materializing routes only: yq keeps both keys there too, and a duplicate-capable object
+([#1344](https://github.com/rust-works/succinctly/issues/1344)) holds the entries of an *ordinary* repeated key but not a pair of
+keys that share one fallback spelling (the guard still refuses those).
 
 **A top-level comma of navigation reads such a document the way `.` does (#5283, answering #2645).**
 Real yq rejects the document for every filter, as it rejects a single undecodable key, so this is the same divergence as `.`, not a new one.

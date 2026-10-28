@@ -816,7 +816,7 @@ fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> 
             if obj.is_empty() {
                 return "{}".to_string();
             }
-            let mut entries: Vec<(&String, &OwnedValue)> = obj.iter().collect();
+            let mut entries: Vec<(&String, &OwnedValue)> = obj.occurrences().collect();
             if opts.sort_keys {
                 entries.sort_by(|a, b| a.0.cmp(b.0));
             }

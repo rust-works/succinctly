@@ -1061,7 +1061,7 @@ expression: rendered
   jq  .a | parent
    => [{"a":2,"d":[10,20]}]
   yq  .a | parent
-   => [{"a":2,"d":[10,20]}]
+   => [{"a":1,"a":2,"d":[10,20]}]
 {"a":1,"a":2,"d":[10,20]}
   jq  .a[] | key
    => []
@@ -1316,7 +1316,7 @@ expression: rendered
   jq  .a? | parent
    => [{"a":2,"d":[10,20]}]
   yq  .a? | parent
-   => [{"a":2,"d":[10,20]}]
+   => [{"a":1,"a":2,"d":[10,20]}]
 {"a":1,"a":2,"d":[10,20]}
   jq  .a?.b | key
    => []
@@ -1576,7 +1576,7 @@ expression: rendered
   jq  .a | parent
    => [{"a":{"b":2},"d":[10,20]}]
   yq  .a | parent
-   => [{"a":{"b":2},"d":[10,20]}]
+   => [{"a":{"b":1,"b":2},"d":[10,20]}]
 {"a":{"b":1,"b":2},"d":[10,20]}
   jq  .a[] | key
    => ["b"]
@@ -1591,7 +1591,7 @@ expression: rendered
   jq  .a[] | parent
    => [{"b":2}]
   yq  .a[] | parent
-   => [{"b":2}]
+   => [{"b":1,"b":2}]
 {"a":{"b":1,"b":2},"d":[10,20]}
   jq  .d[] | key
    => [0, 1]
@@ -1731,7 +1731,7 @@ expression: rendered
   jq  .a.zz | parent
    => [{"b":2}]
   yq  .a.zz | parent
-   => [{"b":2}]
+   => [{"b":1,"b":2}]
 {"a":{"b":1,"b":2},"d":[10,20]}
   jq  .a.zz.yy | key
    => ["yy"]
@@ -1831,7 +1831,7 @@ expression: rendered
   jq  .a? | parent
    => [{"a":{"b":2},"d":[10,20]}]
   yq  .a? | parent
-   => [{"a":{"b":2},"d":[10,20]}]
+   => [{"a":{"b":1,"b":2},"d":[10,20]}]
 {"a":{"b":1,"b":2},"d":[10,20]}
   jq  .a?.b | key
    => ["b"]
@@ -1871,7 +1871,7 @@ expression: rendered
   jq  .a? | select(key == "a")
    => [{"b":2}]
   yq  .a? | select(key == "a")
-   => [{"b":2}]
+   => [{"b":1,"b":2}]
 {"a":{"b":1,"b":2},"d":[10,20]}
   jq  .a? | select(true) | key
    => ["a"]
@@ -1891,7 +1891,7 @@ expression: rendered
   jq  .a.zz? | [path, parent]
    => [[["a","zz"],{"b":2}]]
   yq  .a.zz? | [path, parent]
-   => [[["a","zz"],{"b":2}]]
+   => [[["a","zz"],{"b":1,"b":2}]]
 {"a":{"b":1,"b":2},"d":[10,20]}
   jq  .d[9]? | key
    => [9]
@@ -1986,7 +1986,7 @@ expression: rendered
   jq  .a[("b"+"")] | parent
    => [{"b":2}]
   yq  .a[("b"+"")] | parent
-   => [{"b":2}]
+   => [{"b":1,"b":2}]
 {"a":{"b":1,"b":2},"d":[10,20]}
   jq  .a[("b"+"")]? | key
    => ["b"]

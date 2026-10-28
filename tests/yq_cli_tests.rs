@@ -5516,34 +5516,20 @@ fn test_yq_slurp_fast_path_rejects_trailing_comma_2276() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "[[1,2,3]]");
 
-    // #2276 review: "still round-trips correctly" above can't tell "the M2
-    // fast path ran" apart from "silently fell back to the DOM path and it
-    // happened to produce the same bytes" -- `[1,2,3]` alone is identical
-    // either way. A *duplicate* mapping key can distinguish them: only the
-    // M2 fast path preserves one (the DOM fallback's `OwnedValue::Object`
-    // is `IndexMap`-backed and collapses it to the last value, #442/#1343).
-    // `any_input_is_json` (`yq_runner.rs`) is a blanket, content-independent
-    // gate -- it declines the fast path for *every* `--input-format json`
-    // `--slurp` invocation, well-formed or not, not just the malformed ones
-    // this test's first half exercises -- so this must observe the
-    // duplicate *collapsing*, proving the DOM fallback is what actually
-    // ran, not the other way around. This is the documented, accepted
-    // "known cost" of the conservative fix (CHANGELOG.md, #1343): pinned
-    // here as a regression guard against the fast path being silently
-    // (and incorrectly) reintroduced for JSON input without re-closing
-    // the comma-gap/depth holes it would reopen.
+    // A repeated mapping key used to tell the routes apart here: only the M2 fast path kept
+    // both entries, and the DOM fallback (an `IndexMap`-backed `OwnedValue`) collapsed them to
+    // the last (#442/#1343), which proved the conservative gate (`any_input_is_json`) had sent
+    // every `--input-format json` `--slurp` run to the fallback. Since #1344 (ADR-0027) the
+    // fallback keeps both entries too, as yq does, so the key no longer discriminates; the
+    // malformed-input rows above (`[1,]` is refused only because the fallback validates) are
+    // what guard the gate now.
     let (output, code) = run_yq_stdin(
         ".",
         r#"{"a":1,"a":2}"#,
         &["--slurp", "--input-format", "json", "-o", "json", "-I=0"],
     )?;
     assert_eq!(code, 0);
-    assert_eq!(
-        output.trim(),
-        r#"[{"a":2}]"#,
-        "the duplicate key collapsing proves the DOM fallback ran, not \
-         the M2 fast path -- matching this fix's documented, accepted cost"
-    );
+    assert_eq!(output.trim(), r#"[{"a":1,"a":2}]"#);
 
     Ok(())
 }
@@ -5621,12 +5607,9 @@ fn test_yq_inplace_fast_path_rejects_trailing_comma_leaves_file_untouched_2276()
         .output()?;
     assert!(output.status.success());
     let file_contents = std::fs::read_to_string(dup_file.path())?;
-    assert_eq!(
-        file_contents.trim(),
-        r#"{"a":2}"#,
-        "the duplicate key collapsing proves the DOM fallback ran, not \
-         the M2 fast path -- matching this fix's documented, accepted cost"
-    );
+    // Both entries survive the DOM fallback since #1344, as in yq; see the `--slurp` sibling
+    // above for why the key no longer proves which route ran.
+    assert_eq!(file_contents.trim(), r#"{"a":1,"a":2}"#);
 
     Ok(())
 }
@@ -5873,16 +5856,17 @@ fn test_yaml_native_dom_raises_on_colliding_alias_to_decode_failure_key_1749() -
 }
 
 /// #1749 sibling: an *ordinary* repeated scalar key (neither side complex)
-/// must keep overwriting without complaint through the same DOM path --
-/// only a complex/undecodable key's fallback spelling is refused, matching
-/// #1738's own "ordinary repeat still overwrites" rule for JSON.
+/// must go through the same DOM path without complaint -- only a
+/// complex/undecodable key's fallback spelling is refused. It kept the last
+/// entry (#1738's "ordinary repeat still overwrites" rule for JSON) until the
+/// DOM could hold two entries for one key (#1344); now both are kept, as yq does.
 #[test]
-fn test_yaml_native_dom_ordinary_repeated_key_still_overwrites_1749() -> Result<()> {
+fn test_yaml_native_dom_ordinary_repeated_key_is_not_refused_1749() -> Result<()> {
     let yaml = "a: 1\na: 2\n";
 
     let (output, code) = run_yq_stdin(".[0]", yaml, &["--slurp", "-o=json", "-I0"])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#"{"a":2}"#);
+    assert_eq!(output.trim(), r#"{"a":1,"a":2}"#);
 
     Ok(())
 }
@@ -5961,7 +5945,8 @@ fn test_yq_streaming_routes_keep_both_colliding_complex_keys_2519() -> Result<()
         (TWO, "has(\"\")", &[], "true\n"),
         (TWO, "select(.)", &[], "\"\": v1\n\"\": v2\n"),
         ("? [1]\n: v1\nb: 3\n", ".x = 1", &[], "'': v1\nb: 3\nx: 1\n"),
-        ("a: 1\na: 2\n", ".x = 1", &[], "a: 2\nx: 1\n"),
+        // An ordinary repeated key is kept by a write, as yq does (#1344, ADR-0027).
+        ("a: 1\na: 2\n", ".x = 1", &[], "a: 1\na: 2\nx: 1\n"),
     ];
     for &(yaml, filter, args, expected) in rows {
         let (output, stderr, code) = run_yq_stdin_with_stderr(filter, yaml, args)?;
@@ -41547,9 +41532,9 @@ fn test_materializing_route_raises_on_colliding_decode_failure_keys_1642() -> Re
     // The key's own double quotes survive the write (#3601).
     assert_eq!(output.trim(), "\"\": 1\n\"c\": 2");
 
-    // An ordinary repeated key -- no decode failure on either side -- still
-    // collapses to the last value, matching yq's normal duplicate handling;
-    // the guard must not turn a genuine duplicate into a raise.
+    // An ordinary repeated key -- no decode failure on either side -- is kept
+    // (yq keeps both entries, #1344); the guard must not turn a genuine
+    // duplicate into a raise.
     let ordinary_dup = "a: 1\na: 2\n";
     let (output, stderr, exit_code) =
         run_yq_stdin_with_stderr(".", ordinary_dup, &["--arg", "z", "y"])?;
@@ -41557,7 +41542,7 @@ fn test_materializing_route_raises_on_colliding_decode_failure_keys_1642() -> Re
         exit_code, 0,
         "ordinary duplicate key should not raise, stderr: {stderr}"
     );
-    assert_eq!(output.trim(), "a: 2");
+    assert_eq!(output.trim(), "a: 1\na: 2");
 
     Ok(())
 }
@@ -43675,16 +43660,12 @@ fn test_fold_source_null_bool_reestablishment_stays_jq_mode_only_2732() -> Resul
     Ok(())
 }
 
-/// #1687 item 1's documented residual: `reduce`/`foreach` recover the
-/// *number* of elements, not each element's own shape.
-///
-/// The accumulator and every `$x` a pattern binds are `OwnedValue` in both
-/// evaluators -- `substitute_bound_var` takes `&OwnedValue`, and no
-/// duplicate-key-capable owned representation exists in this crate -- so an
-/// element that gets bound is collapsed at the bind. A known gap pinned
-/// deliberately, following `test_object_slice_duplicate_key_known_gap_1102`.
+/// #1687 item 1's documented residual, closed by #1344: `reduce`/`foreach` used to recover only the
+/// *number* of elements, because the accumulator and every `$x` a pattern binds are `OwnedValue` and
+/// no duplicate-key-capable owned representation existed. One does now (ADR-0027), so a bound
+/// element keeps every entry of a repeated key, as in yq.
 #[test]
-fn test_reduce_binding_still_collapses_duplicate_keys_known_gap_1687() -> Result<()> {
+fn test_reduce_binding_keeps_duplicate_keys_1687() -> Result<()> {
     let dup = "- b: 1\n  a: 2\n  b: 3\n";
     let args = ["--jq-extensions", "-o=json", "-I=0"];
 
@@ -43693,14 +43674,10 @@ fn test_reduce_binding_still_collapses_duplicate_keys_known_gap_1687() -> Result
     assert_eq!(code, 0);
     assert_eq!(out.trim(), r#"{"b":1,"a":2,"b":3}"#);
 
-    // Bound to `$x`, it does not.
+    // Bound to `$x`, it does too.
     let (out, code) = run_yq_stdin("reduce .[] as $x (null; $x)", dup, &args)?;
     assert_eq!(code, 0);
-    assert_eq!(
-        out.trim(),
-        r#"{"b":3,"a":2}"#,
-        "known gap: a bound element is an OwnedValue, which cannot hold a duplicate key"
-    );
+    assert_eq!(out.trim(), r#"{"b":1,"a":2,"b":3}"#);
 
     Ok(())
 }
@@ -43733,36 +43710,23 @@ fn test_limit_and_nth_generator_n_preserve_duplicate_keys_1687() -> Result<()> {
     Ok(())
 }
 
-/// #1687's carve-outs, pinned so they are visible rather than merely
-/// asserted in prose.
-///
-/// `group_by` returns an array *of arrays*: `LazySeq` has no nested-lazy form
-/// and `OwnedValue::Array(ArrayVec)` cannot hold a cursor, so there is
-/// no lossless representation for it today -- it keeps the bridge, and real
-/// yq (which does implement it) preserves where succinctly collapses.
-/// `while`/`until` compute their state from step 1 onward, so only the seed
-/// could ever stay a cursor.
+/// #1687's carve-outs, which #1344 (ADR-0027) closed: `group_by` returns an array *of arrays*, which
+/// `LazySeq` has no nested-lazy form for, and `while`/`until` compute their state from step 1 onward.
+/// Both used to collapse a repeated mapping key because their `OwnedValue` could not hold two entries
+/// for one key; they keep both now, as real yq's `group_by` does.
 #[test]
-fn test_group_by_and_while_until_remain_lossy_known_gap_1687() -> Result<()> {
+fn test_group_by_and_while_until_keep_a_repeated_key_1687() -> Result<()> {
     let dup = "- b: 1\n  a: 2\n  b: 3\n";
     let args = ["--jq-extensions", "-o=json", "-I=0"];
 
     let (out, code) = run_yq_stdin("group_by(.a) | .[0] | .[0]", dup, &args)?;
     assert_eq!(code, 0);
-    assert_eq!(
-        out.trim(),
-        r#"{"b":3,"a":2}"#,
-        "known gap: an array of arrays has no cursor-backed representation"
-    );
+    assert_eq!(out.trim(), r#"{"b":1,"a":2,"b":3}"#);
 
     let scalar_dup = "b: 1\na: 2\nb: 3\n";
     let (out, code) = run_yq_stdin("[limit(1; while(true; .))]", scalar_dup, &args)?;
     assert_eq!(code, 0);
-    assert_eq!(
-        out.trim(),
-        r#"[{"b":3,"a":2}]"#,
-        "known gap: while/until fold through an OwnedValue state"
-    );
+    assert_eq!(out.trim(), r#"[{"b":1,"a":2,"b":3}]"#);
 
     Ok(())
 }
@@ -61239,18 +61203,18 @@ mod recursive_descent_duplicate_keys_1344 {
         )
     }
 
-    /// The shapes where `..` still collapses a repeated key because the node is
-    /// materialized, pinned at today's answer (yq keeps both entries in every
-    /// one of them; see `docs/compliance/yq/limitations.md`, #1344).
+    /// The shapes where `..` has the node materialized (an array construction, a comma, a
+    /// binding): the node keeps every occurrence of a repeated key, as yq's does (#1344, ADR-0027).
+    /// They collapsed it while an `OwnedValue` could not hold two entries for one key.
     #[test]
-    fn descent_still_collapses_a_materialized_node_1344() -> Result<()> {
+    fn descent_keeps_a_materialized_node_1344() -> Result<()> {
         check_on(
             "a: 1\na: 2\nb: 3\n",
             &[],
             &[
-                ("[..]", r#"[{"a":2,"b":3},2,3]"#),
-                (".., 1", r#"{"a":2,"b":3} 2 3 1"#),
-                (".. as $x | $x", r#"{"a":2,"b":3} 2 3"#),
+                ("[..]", r#"[{"a":1,"a":2,"b":3},2,3]"#),
+                (".., 1", r#"{"a":1,"a":2,"b":3} 2 3 1"#),
+                (".. as $x | $x", r#"{"a":1,"a":2,"b":3} 2 3"#),
             ],
         )
     }
