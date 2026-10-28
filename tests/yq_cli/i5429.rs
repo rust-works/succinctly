@@ -74,6 +74,10 @@ fn test_tagged_sequence_keeps_presentation_5429() -> Result<()> {
             ("flatten(0)", "- !Ref A\n- !Ref B\n- !Ref C\n"),
             ("[(.[0], .[1])]", "- !Ref A\n- !Ref B\n"),
             ("[.[0]] + [.[1]]", "- !Ref A\n- !Ref B\n"),
+            (
+                "map(. + \"!\") | map(.)",
+                "- !Ref A!\n- !Ref B!\n- !Ref C!\n",
+            ),
             ("map_values(.)", "- !Ref A\n- !Ref B\n- !Ref C\n"),
         ],
     )
@@ -144,4 +148,10 @@ fn test_json_output_is_unchanged_5429() -> Result<()> {
         assert_eq!((stdout.as_str(), code), (want, 0), "`{filter}`");
     }
     Ok(())
+}
+
+/// `map_values` over a sequence is `map`; computing new numbers keeps the sequence's flow style.
+#[test]
+fn test_map_values_over_a_sequence_5429() -> Result<()> {
+    check("[1, 2]\n", &[("map_values(. + 1)", "[2, 3]\n")])
 }
