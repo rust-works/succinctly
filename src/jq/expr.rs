@@ -1898,7 +1898,7 @@ impl core::fmt::Debug for ArithSettleMemo {
 ///
 /// It also remembers three syntactic facts about the stages (#5404) and keeps
 /// the owned copy of each tail the owned evaluator hands on
-/// ([`Self::tail_plan`], #5404, #5421). A pipe a substitution rebuilt reads the
+/// (`tail_plan`, #5404, #5421). A pipe a substitution rebuilt reads the
 /// tails kept for the pipe it was rebuilt from (`share_tails_of`, #5424).
 ///
 /// Reads as the `Vec<Expr>` it wraps (`Deref`), so a pipe's stages are matched
@@ -4441,7 +4441,7 @@ mod tests {
         // Run 1..5, the stage at 5, run 6..9, the stage at 9, run 10..12.
         assert_eq!(first.len(), 5);
         assert_eq!(
-            [&first[0], &first[2], &first[4]].map(|stage| run_len_5421(stage)),
+            [&first[0], &first[2], &first[4]].map(run_len_5421),
             [Some(4), Some(3), Some(2)],
             "the runs between the stateful stages"
         );
