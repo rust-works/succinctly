@@ -4702,11 +4702,12 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     // handling was already correct, just newly *exercised* here for the
     // first time, since `sort_keys` could never reach this gate before
     // (the outer `can_use_lazy_path` excluded it outright). It has no
-    // `color`/`ascii` handling of its own, though: `color_output` and
-    // `ascii_output` route to the general lazy path below instead, which
-    // applies both by materializing the one output value and reusing
-    // `format_json`'s existing `ascii`/color options (see
-    // `write_output_jq_value`'s own comment on that branch).
+    // `ascii` handling of its own, though: `ascii_output` routes to the
+    // general lazy path below instead, which applies it by materializing the
+    // one output value and reusing `format_json`'s existing `ascii` option
+    // (see `write_output_jq_value`'s own comment on that branch). `-C` takes
+    // this path for a result that is one cursor, colored as it is written
+    // (#5415, see the call below).
     let can_json_fast_path = can_use_m2_streaming(&expr)
         && m2_json_fallback_safe(&expr)
         && !m2_has_stderr_effect(&expr)
@@ -5097,17 +5098,16 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 // cursors`'s `None` fallback) can still reach
                 // `to_owned_cursor_at_depth`'s panic guard.
                 // #5415: `-C` takes it too, colored as it is written, with
-                // three exceptions that keep `-C`'s bytes what the
-                // materializing route made them. `--preserve-input` echoes
-                // source text the colored route validated and re-rendered. A
-                // document `colored_stream_safe` does not vouch for. And a
-                // result that is not one cursor, which `evaluate_m2_fast_path`
-                // hands back (see there).
-                let color_streams = output_config.color_output && colored_stream_safe(json_bytes);
-                if can_json_fast_path
-                    && !(output_config.color_output
-                        && (output_config.convention.preserves_source_values() || !color_streams))
-                {
+                // two exceptions that keep `-C`'s bytes what the materializing
+                // route made them. `color_streams` is false under
+                // `--preserve-input`, which echoes source text the colored
+                // route re-renders, and for a document `colored_stream_safe`
+                // does not vouch for. And a result that is not one cursor,
+                // which `evaluate_m2_fast_path` hands back (see there).
+                let color_streams = output_config.color_output
+                    && !output_config.convention.preserves_source_values()
+                    && colored_stream_safe(json_bytes);
+                if can_json_fast_path && (!output_config.color_output || color_streams) {
                     let color = output_config
                         .color_output
                         .then_some(&output_config.color_scheme);
@@ -10278,29 +10278,18 @@ fn render_json_body<Wrd: Clone + AsRef<[u64]>>(
         // spelled as `NAN_COLOR_MARKER` for the colorizer, and the caller
         // colors it as it copies the record out. The old route built an
         // `OwnedValue` of the whole record and two whole-output `String`s.
-        if config.convention.preserves_source_values() {
-            print_json(
-                out,
-                value,
-                &NanMarkingFormatter(PreserveFormatter),
-                config,
-                0,
-                &mut Vec::new(),
-                &mut Vec::new(),
-                None,
-            )?;
-        } else {
-            print_json(
-                out,
-                value,
-                &NanMarkingFormatter(JqCompatFormatter),
-                config,
-                0,
-                &mut Vec::new(),
-                &mut Vec::new(),
-                None,
-            )?;
-        }
+        // Never under `--preserve-input` (`stream_color` is false there):
+        // that convention echoes number text the old route re-rendered.
+        print_json(
+            out,
+            value,
+            &NanMarkingFormatter(JqCompatFormatter),
+            config,
+            0,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            None,
+        )?;
     } else {
         // For complex output (pretty-print, sort_keys, colors, ascii),
         // materialize first -- and surface a decode failure rather than
@@ -10689,8 +10678,14 @@ impl<F: LiteralFormatter> LiteralFormatter for NanMarkingFormatter<F> {
     fn format_raw_number<'a>(&self, raw: &'a [u8]) -> Cow<'a, str> {
         // A NaN is never a valid number's spelling: jq's `nan`/`sNaN12` words,
         // or the bridge token a computed NaN is smuggled through text as
-        // (`NAN_SENTINEL`). So a valid number skips the parse.
-        if !validate::is_valid_number(raw)
+        // (`NAN_SENTINEL`, two exponent markers). So an ordinary number, with
+        // neither, skips the checks.
+        let word = raw
+            .iter()
+            .any(|b| b.is_ascii_alphabetic() && !matches!(b, b'e' | b'E'));
+        let two_exponents = raw.iter().filter(|b| matches!(b, b'e' | b'E')).count() > 1;
+        if (word || two_exponents)
+            && !validate::is_valid_number(raw)
             && OwnedValue::from_number_bytes::<JqSemantics>(raw)
                 .as_f64()
                 .is_some_and(f64::is_nan)
@@ -11512,12 +11507,7 @@ where
                                 .into());
                             }
                         }
-                        // `-C` collapses under either convention: it used to
-                        // render through `format_json`, which always did
-                        // (#5415).
-                        let collapsed = if !config.convention.preserves_source_values()
-                            || config.color_output
-                        {
+                        let collapsed = if !config.convention.preserves_source_values() {
                             collapse_duplicate_fields(&scratch[base..], &frame)
                         } else {
                             None
@@ -14666,7 +14656,8 @@ mod tests {
                     &rebuilt,
                     config,
                     &mut Vec::new(),
-                    true,
+                    // As the caller sets it: never under `--preserve-input`.
+                    !config.convention.preserves_source_values(),
                 )
                 .err()
                 .map(|e| e.to_string());

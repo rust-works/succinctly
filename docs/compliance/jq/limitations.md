@@ -11833,9 +11833,8 @@ Reading it behaves as an array's does, with these specifics. `.k`, a chain that 
 contents, and a member that is a node comes back as the node (`{a: .bad} | .a | length` counts its
 members, `| tojson` raises). Printing, `tojson`, `to_entries`, `has`, an index key or slice bound
 (`.u[{a: .bad}:]`) and every other consumer read the whole object and raise on a node that fails
-to decode, writing nothing; `-e`, `-S` and `-a` materialize it first, as they do an
-array, and so does `-C` for a document that has an undecodable string in it (`-C` streams any
-other, #5415). Any stage after the object that is not one of those reads takes the object as the owned
+to decode, writing nothing; `-e`, `-S`, `-a` and `-C` materialize it first, as they do an
+array. Any stage after the object that is not one of those reads takes the object as the owned
 value it stands for, through the arm that has always handled one, so a `?//` retry, a bounded
 consumer and a generator after it behave as they did. `try`/`?`, `isempty`, `skip` and `isvalid`
 do not read the object (they do not read an array's nodes either, but they force a `LazySeq`), so

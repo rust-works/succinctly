@@ -184,3 +184,15 @@ fn test_undecodable_and_over_deep_documents_are_still_refused_under_color_5415()
     assert!(err.contains("nesting depth exceeds limit of 256"), "{err}");
     Ok(())
 }
+
+/// `--preserve-input` echoes a number's source text (`1.`) on the default route, but `-C` has
+/// always rendered it, and still does.
+#[test]
+fn test_preserve_input_still_renders_numbers_under_color_5415() -> Result<()> {
+    for filter in [".", ".[0]", "[.[]]"] {
+        let (out, code) = run_jq_stdin(filter, "[1.]", &["-C", "-c", "--preserve-input"])?;
+        assert_eq!(code, 0, "{filter}");
+        assert!(out.contains("\u{1b}[0;39m1\u{1b}[0m"), "{filter}: {out:?}");
+    }
+    Ok(())
+}

@@ -1257,23 +1257,17 @@ impl<'a, W: Write> JsonColorWriter<'a, W> {
 
     /// Colors `raw` up to its last whole character (all of it when `all`) and
     /// writes the result. The renderers write `str`s, so the only partial
-    /// character is a write that split one; anything else invalid is
+    /// character is a write that split one; any other invalid byte is
     /// replaced, as `String::from_utf8_lossy` would.
     fn color_raw(&mut self, all: bool) -> std::io::Result<()> {
-        let whole = match std::str::from_utf8(&self.raw) {
-            Ok(text) => text.len(),
-            Err(e) if e.error_len().is_none() && !all => e.valid_up_to(),
-            Err(_) => {
-                let text = String::from_utf8_lossy(&self.raw).into_owned();
-                self.lexer.push_str(&text, self.scheme, &mut self.colored);
-                self.raw.clear();
-                return self.drain();
-            }
+        let whole = if all {
+            self.raw.len()
+        } else {
+            self.raw.len() - incomplete_tail(&self.raw)
         };
-        // `whole` ends on a character boundary, so this cannot fail.
-        if let Ok(text) = std::str::from_utf8(&self.raw[..whole]) {
-            self.lexer.push_str(text, self.scheme, &mut self.colored);
-        }
+        let text = String::from_utf8_lossy(&self.raw[..whole]);
+        self.lexer.push_str(&text, self.scheme, &mut self.colored);
+        drop(text);
         self.raw.drain(..whole);
         self.drain()
     }
@@ -1316,6 +1310,25 @@ impl<W: Write> core::fmt::Write for JsonColorWriter<'_, W> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         Write::write_all(self, s.as_bytes()).map_err(|_| core::fmt::Error)
     }
+}
+
+/// The length of the character `bytes` ends in the middle of, 0 when it ends on a boundary
+/// (or in bytes that no character completes).
+fn incomplete_tail(bytes: &[u8]) -> usize {
+    for back in 1..=bytes.len().min(3) {
+        let byte = bytes[bytes.len() - back];
+        if byte & 0xC0 == 0x80 {
+            continue;
+        }
+        let need = match byte {
+            0xF0.. => 4,
+            0xE0.. => 3,
+            0xC0.. => 2,
+            _ => 1,
+        };
+        return if need > back { back } else { 0 };
+    }
+    0
 }
 
 /// [`colorize_json`] for a render that is already bytes, written to `out` a
@@ -1744,6 +1757,23 @@ mod tests {
             let want = colorize_json(&String::from_utf8_lossy(bytes), &scheme);
             assert_eq!(String::from_utf8(out).unwrap(), want, "{bytes:?}");
         }
+    }
+
+    /// An invalid byte does not take a character split across two writes down with it.
+    #[test]
+    fn test_json_color_writer_keeps_a_split_character_after_an_invalid_byte_5415() {
+        let scheme = ColorScheme::default();
+        let mut out = Vec::new();
+        let mut writer = JsonColorWriter::new(&mut out, &scheme);
+        // Enough to fill a block, so the first `color_raw` runs between the halves.
+        let filler = "1,".repeat(COLOR_BLOCK_BYTES / 2);
+        writer.write_all(b"[\"\xff").unwrap();
+        writer.write_all(filler.as_bytes()).unwrap();
+        writer.write_all(b"\xe2\x98").unwrap();
+        writer.write_all(b"\x83\"]").unwrap();
+        writer.finish().unwrap();
+        let want = colorize_json(&format!("[\"\u{fffd}{filler}\u{2603}\"]"), &scheme);
+        assert_eq!(String::from_utf8(out).unwrap(), want);
     }
 
     /// A writer whose `write` fails is reported, at the write that fills a block or at `finish`.
