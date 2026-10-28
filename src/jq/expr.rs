@@ -4197,6 +4197,115 @@ mod tests {
         assert!(longest.kept_tail(1, |_| true).is_some());
     }
 
+    /// #5421: a tail holding a stage with evaluation state is split. Its
+    /// stateless runs are kept, one copy for all calls, and each stateful stage
+    /// is cloned afresh for the call; a tail after the last stateful stage is
+    /// kept whole, and a short one is copied as before.
+    #[test]
+    fn test_pipe_stages_split_a_tail_holding_state_into_kept_runs_5421() {
+        let stateful = |e: &Expr| matches!(e, Expr::Identity);
+        let mut stages = vec![Expr::Field("a".into()); 12];
+        stages[5] = Expr::Identity;
+        stages[9] = Expr::Identity;
+        let pipe = PipeStages::from(stages);
+        let plan = |from: usize| pipe.tail_plan(from, stateful, |_| true);
+        assert!(
+            matches!(plan(1), TailPlan::Copy),
+            "the first ask keeps nothing"
+        );
+        assert!(matches!(plan(1), TailPlan::Split), "stages 1.. hold state");
+        let first = pipe.split_tail(1, |_| true);
+        // Run 1..5, the stage at 5, run 6..9 (three stages), the stage at 9, run 10..12.
+        assert_eq!(first.len(), 5);
+        let run_len = |e: &Expr| match e {
+            Expr::Shared(run) => match run.expr() {
+                Expr::Pipe(stages) => stages.len(),
+                other => panic!("a pipe, not {other:?}"),
+            },
+            other => panic!("a kept run, not {other:?}"),
+        };
+        assert_eq!(
+            [&first[0], &first[2], &first[4]].map(run_len),
+            [4, 3, 2],
+            "the runs between the stateful stages"
+        );
+        assert!(matches!(first[1], Expr::Identity) && matches!(first[3], Expr::Identity));
+        let again = pipe.split_tail(1, |_| unreachable!("kept"));
+        for at in [0, 2, 4] {
+            let (Expr::Shared(a), Expr::Shared(b)) = (&first[at], &again[at]) else {
+                panic!("runs");
+            };
+            assert!(Rc::ptr_eq(a, b), "a run is kept once for every call");
+        }
+        // The runs of a split tail are the tails of the same table: a run's own
+        // tails are the runs after it.
+        let Expr::Shared(run) = &first[0] else {
+            panic!("a run");
+        };
+        let Expr::Pipe(run) = run.expr() else {
+            panic!("a pipe");
+        };
+        assert!(matches!(
+            run.tail_plan(1, stateful, |_| true),
+            TailPlan::Whole(inner) if matches!(inner.expr(), Expr::Pipe(t) if t.len() == 3)
+        ));
+        // A tail after the last stateful stage is a whole kept tail, a short tail
+        // holding state is copied, and the run behind it is not asked for.
+        assert!(
+            matches!(plan(10), TailPlan::Whole(tail) if matches!(tail.expr(), Expr::Pipe(t) if t.len() == 2)),
+            "the two stages after the last stateful one"
+        );
+        assert!(matches!(plan(11), TailPlan::Copy), "a lone stage");
+        assert!(matches!(plan(6), TailPlan::Copy), "six stages are copied");
+        let after = PipeStages::from(
+            [Expr::Identity]
+                .into_iter()
+                .chain(vec![Expr::Field("a".into()); 11])
+                .collect::<Vec<_>>(),
+        );
+        for _ in 0..2 {
+            let _ = after.tail_plan(1, stateful, |_| true);
+        }
+        assert!(matches!(
+            after.tail_plan(1, stateful, |_| true),
+            TailPlan::Whole(_)
+        ));
+    }
+
+    /// #5421: a run `may_keep` declines is cloned stage by stage into the split
+    /// and asked once; a run of one stage is the stage.
+    #[test]
+    fn test_split_tail_clones_a_declined_run_and_a_lone_stage_5421() {
+        let stateful = |e: &Expr| matches!(e, Expr::Identity);
+        let mut stages = vec![Expr::Field("a".into()); 12];
+        stages[3] = Expr::Identity;
+        stages[5] = Expr::Identity;
+        let pipe = PipeStages::from(stages);
+        assert!(matches!(
+            pipe.tail_plan(1, stateful, |_| unreachable!("first")),
+            TailPlan::Copy
+        ));
+        assert!(matches!(
+            pipe.tail_plan(1, stateful, |_| true),
+            TailPlan::Split
+        ));
+        let mut asked = 0;
+        for _ in 0..2 {
+            let split = pipe.split_tail(1, |run| {
+                asked += 1;
+                run.len() != 2
+            });
+            // Runs 1..3 (declined: two stages), stage 3, the lone stage 4, stage 5,
+            // run 6..12 (six stages).
+            assert_eq!(split.len(), 2 + 1 + 1 + 1 + 1);
+            assert!(matches!(split[0], Expr::Field(_)) && matches!(split[1], Expr::Field(_)));
+            assert!(matches!(split[2], Expr::Identity));
+            assert!(matches!(split[3], Expr::Field(_)) && matches!(split[4], Expr::Identity));
+            assert!(matches!(split[5], Expr::Shared(_)));
+        }
+        assert_eq!(asked, 2, "the declined run and the long one, once each");
+    }
+
     /// #5404: the three facts a pipe remembers are asked once, and forgotten
     /// when its stages change or when it is cloned.
     #[test]
