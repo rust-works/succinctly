@@ -546,7 +546,7 @@ pub struct JsonFormatOpts<'a> {
 /// emits any bare n-leading token except `null` and this marker, so the two
 /// are unambiguous by construction, not by coincidence. Stripped and
 /// recolored (as `null`) before the text ever reaches a user.
-const NAN_COLOR_MARKER: &str = "nan";
+pub(crate) const NAN_COLOR_MARKER: &str = "nan";
 
 /// Escape a JSON string body per the opts' control-escape style and ASCII mode.
 fn escape_json_body(s: &str, opts: &JsonFormatOpts) -> String {
@@ -1212,6 +1212,122 @@ impl JsonColorizer {
             }
         }
     }
+}
+
+/// How much text [`JsonColorWriter`] collects before coloring and writing it:
+/// the size of the `BufWriter` behind the real writer, and the block #808
+/// measured against coloring every small write as it arrived.
+const COLOR_BLOCK_BYTES: usize = 8 * 1024;
+
+/// A writer that colors the JSON text written to it on its way to `out`
+/// (#5415), through [`JsonColorizer`], which colors the same bytes however
+/// its input is cut. A renderer writing a token at a time can stream through
+/// it without the uncolored render ever being a second whole-output `String`
+/// next to the colored one: the working set is one block of each.
+///
+/// One writer per result: [`Self::finish`] closes the token the text ended
+/// inside, and a fresh writer starts outside any container. A write that is
+/// not a whole number of characters is carried over to the next one.
+pub struct JsonColorWriter<'a, W: Write> {
+    out: &'a mut W,
+    scheme: &'a ColorScheme,
+    lexer: JsonColorizer,
+    /// Uncolored text not yet colored; ends mid-character only between writes.
+    raw: Vec<u8>,
+    colored: String,
+}
+
+impl<'a, W: Write> JsonColorWriter<'a, W> {
+    pub fn new(out: &'a mut W, scheme: &'a ColorScheme) -> Self {
+        Self {
+            out,
+            scheme,
+            lexer: JsonColorizer::default(),
+            raw: Vec::with_capacity(COLOR_BLOCK_BYTES),
+            colored: String::new(),
+        }
+    }
+
+    /// Colors and writes what is left, closing the token the text ended in.
+    pub fn finish(mut self) -> std::io::Result<()> {
+        self.color_raw(true)?;
+        self.lexer.finish(self.scheme, &mut self.colored);
+        self.drain()
+    }
+
+    /// Colors `raw` up to its last whole character (all of it when `all`) and
+    /// writes the result. The renderers write `str`s, so the only partial
+    /// character is a write that split one; anything else invalid is
+    /// replaced, as `String::from_utf8_lossy` would.
+    fn color_raw(&mut self, all: bool) -> std::io::Result<()> {
+        let whole = match std::str::from_utf8(&self.raw) {
+            Ok(text) => text.len(),
+            Err(e) if e.error_len().is_none() && !all => e.valid_up_to(),
+            Err(_) => {
+                let text = String::from_utf8_lossy(&self.raw).into_owned();
+                self.lexer.push_str(&text, self.scheme, &mut self.colored);
+                self.raw.clear();
+                return self.drain();
+            }
+        };
+        // `whole` ends on a character boundary, so this cannot fail.
+        if let Ok(text) = std::str::from_utf8(&self.raw[..whole]) {
+            self.lexer.push_str(text, self.scheme, &mut self.colored);
+        }
+        self.raw.drain(..whole);
+        self.drain()
+    }
+
+    fn drain(&mut self) -> std::io::Result<()> {
+        if self.colored.is_empty() {
+            return Ok(());
+        }
+        let written = self.out.write_all(self.colored.as_bytes());
+        self.colored.clear();
+        written
+    }
+}
+
+impl<W: Write> Write for JsonColorWriter<'_, W> {
+    fn write(&mut self, mut buf: &[u8]) -> std::io::Result<usize> {
+        let total = buf.len();
+        // A write far larger than a block (a whole rendered record) is
+        // colored a block at a time rather than copied into `raw` whole.
+        while !buf.is_empty() {
+            let take = buf
+                .len()
+                .min(COLOR_BLOCK_BYTES.saturating_sub(self.raw.len()).max(1));
+            self.raw.extend_from_slice(&buf[..take]);
+            buf = &buf[take..];
+            if self.raw.len() >= COLOR_BLOCK_BYTES {
+                self.color_raw(false)?;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Does not flush `raw`: a partial token is only closed by [`Self::finish`].
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<W: Write> core::fmt::Write for JsonColorWriter<'_, W> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        Write::write_all(self, s.as_bytes()).map_err(|_| core::fmt::Error)
+    }
+}
+
+/// [`colorize_json`] for a render that is already bytes, written to `out` a
+/// block at a time instead of collected into a second whole `String` (#5415).
+pub fn write_colorized_json<W: Write>(
+    out: &mut W,
+    json: &[u8],
+    scheme: &ColorScheme,
+) -> std::io::Result<()> {
+    let mut writer = JsonColorWriter::new(out, scheme);
+    writer.write_all(json)?;
+    writer.finish()
 }
 
 /// The length of `text`'s leading run of bytes `stops` rejects.

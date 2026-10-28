@@ -4714,7 +4714,6 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
         && !output_config.join_output
         && !output_config.raw_output0
         && !output_config.unbuffered
-        && !output_config.color_output
         && !output_config.ascii_output
         && context.named.is_empty();
 
@@ -5097,7 +5096,22 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 // arms (`LazyKeys`'s sorted branch, `sequence_streamable_
                 // cursors`'s `None` fallback) can still reach
                 // `to_owned_cursor_at_depth`'s panic guard.
-                if can_json_fast_path {
+                // #5415: `-C` takes it too, colored as it is written, with
+                // three exceptions that keep `-C`'s bytes what the
+                // materializing route made them. `--preserve-input` echoes
+                // source text the colored route validated and re-rendered. A
+                // document with a NaN word in it: the streamer prints a NaN
+                // as `null`, and the colorizer needs the marker to color it
+                // as jq does. And a result that is not one cursor, which
+                // `evaluate_m2_fast_path` hands back (see there).
+                if can_json_fast_path
+                    && !(output_config.color_output
+                        && (output_config.convention.preserves_source_values()
+                            || may_contain_nan_word(json_bytes)))
+                {
+                    let color = output_config
+                        .color_output
+                        .then_some(&output_config.color_scheme);
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         evaluate_m2_fast_path(
                             json_bytes,
@@ -5108,6 +5122,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                             json_indent,
                             args.sort_keys,
                             json_numbers,
+                            color,
                             args.exit_status,
                             &mut had_output,
                             &mut last_output,
@@ -9217,6 +9232,13 @@ fn m2_has_stderr_effect(expr: &Expr) -> bool {
     })
 }
 
+/// Whether `json` has a NaN word in it, in any case: jq reads `nan`, `NaN` and
+/// `sNaN12` as numbers (#2877). Conservative: a string holding "nan" says yes.
+fn may_contain_nan_word(json: &[u8]) -> bool {
+    json.windows(3)
+        .any(|w| w[0] | 0x20 == b'n' && w[1] | 0x20 == b'a' && w[2] | 0x20 == b'n')
+}
+
 /// Evaluate one JSON document through the M2 fast path (#1576): stream
 /// straight from `GenericResult`'s cursors instead of the materializing
 /// `generic_result_to_jq_values`/`print_json` stack that feeds
@@ -9275,6 +9297,7 @@ fn evaluate_m2_fast_path<W: Write>(
     indent: IndentSpec,
     sort_keys: bool,
     numbers: JsonConvention,
+    color: Option<&ColorScheme>,
     exit_status: bool,
     had_output: &mut bool,
     last_output: &mut Option<OwnedValue>,
@@ -9293,6 +9316,16 @@ fn evaluate_m2_fast_path<W: Write>(
             *last_output = Some(OwnedValue::Bool(!stats.last_was_falsy));
         }
     };
+
+    // A colored render takes a result that is one cursor into the document
+    // and nothing else: every other result is owned, or a sequence of values,
+    // and is streamed by a writer that spells an overflowing literal (`1e999`
+    // in `map(.)?`) differently from the one `-C` used to render through. It
+    // is left to the general path, which renders as `print_json` does, and
+    // nothing has been written (#5415).
+    if color.is_some() && !matches!(result, GenericResult::OneCursor(_)) {
+        return Ok(false);
+    }
 
     if matches!(result, GenericResult::LazySeq(_)) {
         let mut buf = String::new();
@@ -9315,6 +9348,33 @@ fn evaluate_m2_fast_path<W: Write>(
         *had_output = *had_output || stats.count > 0;
         record_exit_status(last_output, &stats);
         out.write_all(buf.as_bytes())?;
+        Ok(true)
+    } else if let Some(scheme) = color {
+        // #5415: the same single result, colored a block at a time on its way
+        // to `out`. The streamer's own per-value buffer is still the only
+        // whole-result copy; an error means it has written nothing to
+        // `colored`, so dropping it unfinished discards nothing.
+        let mut colored = output::JsonColorWriter::new(out, scheme);
+        let stats = result
+            .stream_json::<_, JqSemantics>(
+                &mut colored,
+                indent,
+                sort_keys,
+                numbers,
+                write_result_newline,
+            )
+            .map_err(|_| anyhow::anyhow!("write error"))?;
+        if let Some(code) = stats.halt {
+            colored.finish()?;
+            sink.request_halt(code);
+            return Ok(true);
+        }
+        if stats.error.is_some() {
+            return Ok(false);
+        }
+        colored.finish()?;
+        *had_output = *had_output || stats.count > 0;
+        record_exit_status(last_output, &stats);
         Ok(true)
     } else {
         let mut writer = FmtWriter(out);
@@ -10009,7 +10069,7 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
         if write_output_raw_prologue(out, as_str, config)? {
             return Ok(());
         }
-        out.write_all(scratch)?;
+        write_json_body(out, scratch, config)?;
         write_terminator(out, config)
     })();
     // Don't pin one huge record's buffer for the rest of a long stream,
@@ -10027,6 +10087,14 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
 /// all take, so a flag added to it reaches all three (#3909).
 fn writes_lazily(config: &OutputConfig) -> bool {
     !config.sort_keys && !config.color_output && !config.ascii_output
+}
+
+/// Whether a `-C` record is still written by the streaming writers, with its
+/// text colored on the way out, rather than materialized for `format_json`
+/// (#5415). `-S` and `-a` still need the whole value, so they keep the
+/// materializing route, and color its text in blocks afterwards.
+fn streams_colored(config: &OutputConfig) -> bool {
+    config.color_output && !config.sort_keys && !config.ascii_output
 }
 
 /// The source text of a cursor-backed `value` when the compact jq-compat
@@ -10117,6 +10185,34 @@ fn render_json_body<Wrd: Clone + AsRef<[u64]>>(
                 None,
             )?;
         }
+    } else if streams_colored(config) {
+        // #5415: `-C` renders the uncolored text the same way, with a NaN
+        // spelled as `NAN_COLOR_MARKER` for the colorizer, and the caller
+        // colors it as it copies the record out. The old route built an
+        // `OwnedValue` of the whole record and two whole-output `String`s.
+        if config.convention.preserves_source_values() {
+            print_json(
+                out,
+                value,
+                &NanMarkingFormatter(PreserveFormatter),
+                config,
+                0,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                None,
+            )?;
+        } else {
+            print_json(
+                out,
+                value,
+                &NanMarkingFormatter(JqCompatFormatter),
+                config,
+                0,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                None,
+            )?;
+        }
     } else {
         // For complex output (pretty-print, sort_keys, colors, ascii),
         // materialize first -- and surface a decode failure rather than
@@ -10148,7 +10244,7 @@ fn render_json_body<Wrd: Clone + AsRef<[u64]>>(
             .map_err(|e| anyhow::Error::from(MalformedJsonError::new(e)))?;
         // Nothing can fail past `try_materialize`, so take the formatted
         // `String`'s allocation as the buffer rather than copying into it.
-        *out = format_json(&owned, config).into_bytes();
+        *out = format_json_text(&owned, config).into_bytes();
     }
     Ok(())
 }
@@ -10302,6 +10398,35 @@ fn write_output_owned_value<Out: Write>(
         } else {
             print_owned_json(out, value, &JqCompatFormatter, config, 0)?;
         }
+    } else if streams_colored(config) {
+        // #5415: streamed through the colorizer, no whole-record `String`.
+        // `print_owned_json` cannot fail past its depth check, which the
+        // caller made before this was handed the value (`to_jq_values`).
+        let mut colored = output::JsonColorWriter::new(out, &config.color_scheme);
+        if config.convention.preserves_source_values() {
+            print_owned_json(
+                &mut colored,
+                value,
+                &NanMarkingFormatter(PreserveFormatter),
+                config,
+                0,
+            )?;
+        } else {
+            print_owned_json(
+                &mut colored,
+                value,
+                &NanMarkingFormatter(JqCompatFormatter),
+                config,
+                0,
+            )?;
+        }
+        colored.finish()?;
+    } else if config.color_output {
+        output::write_colorized_json(
+            out,
+            format_json_text(value, config).as_bytes(),
+            &config.color_scheme,
+        )?;
     } else {
         out.write_all(format_json(value, config).as_bytes())?;
     }
@@ -10342,6 +10467,12 @@ trait LiteralFormatter {
 
     /// Format a computed integer.
     fn format_int(&self, i: i64) -> String;
+
+    /// Whether a NaN is spelled `NAN_COLOR_MARKER` (#5415). A constant per
+    /// formatter, so the uncolored printers compile it away.
+    fn marks_nan(&self) -> bool {
+        false
+    }
 }
 
 /// jq-compatible formatter: reformats numbers according to jq's rules.
@@ -10457,6 +10588,57 @@ impl LiteralFormatter for PreserveFormatter {
 
     fn format_int(&self, i: i64) -> String {
         format!("{i}")
+    }
+}
+
+/// Wraps a formatter so a NaN is spelled `NAN_COLOR_MARKER` rather than
+/// `null`, for text only the colorizer will read (#5415). `format_json` does
+/// the same through `JsonFormatOpts::mark_nan_for_color` (#3413): jq colors a
+/// NaN's `null` as a number wrapping a null, not as a plain null.
+struct NanMarkingFormatter<F>(F);
+
+impl<F: LiteralFormatter> LiteralFormatter for NanMarkingFormatter<F> {
+    fn format_raw_number<'a>(&self, raw: &'a [u8]) -> Cow<'a, str> {
+        // A NaN is never a valid number's spelling: jq's `nan`/`sNaN12` words,
+        // or the bridge token a computed NaN is smuggled through text as
+        // (`NAN_SENTINEL`). So a valid number skips the parse.
+        if !validate::is_valid_number(raw)
+            && OwnedValue::from_number_bytes::<JqSemantics>(raw)
+                .as_f64()
+                .is_some_and(f64::is_nan)
+        {
+            return Cow::Borrowed(output::NAN_COLOR_MARKER);
+        }
+        self.0.format_raw_number(raw)
+    }
+
+    fn format_float(&self, f: f64) -> String {
+        if f.is_nan() {
+            return output::NAN_COLOR_MARKER.to_string();
+        }
+        self.0.format_float(f)
+    }
+
+    fn format_int(&self, i: i64) -> String {
+        self.0.format_int(i)
+    }
+
+    fn marks_nan(&self) -> bool {
+        true
+    }
+}
+
+/// Writes a rendered JSON body to `out`, colored when `-C` asks for it, a
+/// block at a time (#5415).
+fn write_json_body<Out: Write>(
+    out: &mut Out,
+    body: &[u8],
+    config: &OutputConfig,
+) -> std::io::Result<()> {
+    if config.color_output {
+        output::write_colorized_json(out, body, &config.color_scheme)
+    } else {
+        out.write_all(body)
     }
 }
 
@@ -11242,7 +11424,12 @@ where
                                 .into());
                             }
                         }
-                        let collapsed = if !config.convention.preserves_source_values() {
+                        // `-C` collapses under either convention: it used to
+                        // render through `format_json`, which always did
+                        // (#5415).
+                        let collapsed = if !config.convention.preserves_source_values()
+                            || config.color_output
+                        {
                             collapse_duplicate_fields(&scratch[base..], &frame)
                         } else {
                             None
@@ -11631,6 +11818,14 @@ where
         OwnedValue::Int(n) => out.write_all(formatter.format_int(*n).as_bytes())?,
         OwnedValue::Float(f) => out.write_all(formatter.format_float(*f).as_bytes())?,
         // The `_` on the repr is load-bearing -- see this function's doc.
+        //
+        // A computed NaN is a literal whose text is `null` and whose repr says
+        // NaN, so a marking formatter reads it from there (#5415).
+        OwnedValue::NumberLiteral(succinctly::jq::NumberRepr::Float(f), _)
+            if formatter.marks_nan() && f.is_nan() =>
+        {
+            out.write_all(output::NAN_COLOR_MARKER.as_bytes())?;
+        }
         OwnedValue::NumberLiteral(_, literal) => {
             out.write_all(formatter.format_raw_number(literal.as_bytes()).as_bytes())?;
         }
@@ -11681,6 +11876,18 @@ where
 
 /// Format a value as JSON.
 fn format_json(value: &OwnedValue, config: &OutputConfig) -> String {
+    let json = format_json_text(value, config);
+    if config.color_output {
+        output::colorize_json(&json, &config.color_scheme)
+    } else {
+        json
+    }
+}
+
+/// [`format_json`]'s text before it is colored: with `-C`, a NaN is
+/// `NAN_COLOR_MARKER` rather than `null`, so it is only valid input to the
+/// colorizer (#3413). Split out so a caller can color it in blocks (#5415).
+fn format_json_text(value: &OwnedValue, config: &OutputConfig) -> String {
     let opts = JsonFormatOpts {
         indent: if config.compact {
             ""
@@ -11704,13 +11911,7 @@ fn format_json(value: &OwnedValue, config: &OutputConfig) -> String {
         // the non-colorized branch.
         mark_nan_for_color: config.color_output,
     };
-    let json = output::format_json(value, &opts);
-
-    if config.color_output {
-        output::colorize_json(&json, &config.color_scheme)
-    } else {
-        json
-    }
+    output::format_json(value, &opts)
 }
 
 #[cfg(test)]
