@@ -2660,6 +2660,16 @@ impl<'a> Parser<'a> {
         self.parse_expr()
     }
 
+    /// Whether a parsed bracket is a slice (`[a:b]`), optional marker included.
+    fn bracket_is_slice(bracket: &Bracket) -> bool {
+        match bracket {
+            Bracket::DynamicSlice { .. } => true,
+            Bracket::Static(Expr::Slice { .. }) => true,
+            Bracket::Static(Expr::Optional(inner)) => matches!(**inner, Expr::Slice { .. }),
+            _ => false,
+        }
+    }
+
     /// Parse an index bracket and check for optional marker.
     fn parse_index_bracket_with_optional(&mut self) -> Result<Bracket, ParseError> {
         let bracket = self.parse_index_bracket()?;
@@ -5360,6 +5370,10 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         let mut params = Vec::new();
 
+        // jq's grammar has no empty parameter list: `def f(): 1;` is a syntax error (#5454).
+        if self.mode == ParserMode::Jq && self.peek() == Some(')') {
+            return Err(ParseError::new("syntax error, unexpected ')'", self.pos));
+        }
         if self.peek() != Some(')') {
             loop {
                 // Parameters can be $var or just var
@@ -5462,6 +5476,10 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let mut args = Vec::new();
 
+            // jq's grammar has no empty argument list: `f()` is a syntax error (#5454).
+            if self.mode == ParserMode::Jq && self.peek() == Some(')') {
+                return Err(ParseError::new("syntax error, unexpected ')'", self.pos));
+            }
             if self.peek() != Some(')') {
                 loop {
                     // Each `;`-separated slot is a full expression — comma
@@ -8633,7 +8651,16 @@ impl<'a> Parser<'a> {
 
                     // Check for bracket after dot
                     if self.peek() == Some('[') {
+                        let bracket_start = self.pos;
                         let bracket = self.parse_index_bracket_with_optional()?;
+                        // jq's grammar has `Term '.' '[' Exp ']'` and `Term '.' '[' ']'` but no
+                        // slice after a dot (#5454): `[1,2,3].[1:]` is a syntax error there.
+                        if self.mode == ParserMode::Jq && Self::bracket_is_slice(&bracket) {
+                            return Err(ParseError::new(
+                                "syntax error, unexpected ':'",
+                                bracket_start,
+                            ));
+                        }
                         push_bracket(&mut chain, bracket);
                     } else {
                         let name = if self.peek() == Some('"') {
