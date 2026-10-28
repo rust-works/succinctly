@@ -82,7 +82,7 @@ fn test_container_identity_survives_a_run_split_around_a_reader_5441() -> Result
         ),
         (
             "a run of identity stages ending the body",
-            format!("[nan] as $a | [range(0;3) | . as $x | ($a | . | . | . | . | . | . | . | . | . | .)] | map(. == $a)"),
+            "[nan] as $a | [range(0;3) | . as $x | ($a | . | . | . | . | . | . | . | . | . | .)] | map(. == $a)".to_string(),
             "[true,true,true]\n",
         ),
         (

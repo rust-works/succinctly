@@ -2246,7 +2246,8 @@ impl PipeStages {
                     // starts after the last stage that reads a variable and no tail
                     // is long enough to split around one (#5441).
                     let after_the_last = table.volatile_through as usize + 2 <= len;
-                    if !after_the_last && !(table.keeps_a_run && len > MIN_SPLIT_TAIL_STAGES) {
+                    let splits = table.keeps_a_run && len > MIN_SPLIT_TAIL_STAGES;
+                    if !(after_the_last || splits) {
                         return;
                     }
                     Some((Rc::downgrade(table), 0))

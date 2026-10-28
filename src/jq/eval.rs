@@ -2532,8 +2532,10 @@ fn to_owned_lossy<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
     // stage that ends a bridged run (`. | . | .`) detaches a copy, and a
     // container compared by identity afterwards (`[nan] as $a | ... | . == $a`)
     // is a different one.
-    if let Some(shared) = bridge_shared_for_value::<S, W>(value) {
-        return shared;
+    if matches!(value, StandardJson::Array(_) | StandardJson::Object(_)) {
+        if let Some(shared) = bridge_shared_for_value::<S, W>(value) {
+            return shared;
+        }
     }
     to_owned_lossy_at_depth::<S, W>(value, 0)
 }
@@ -11975,8 +11977,10 @@ pub(crate) fn eval_each_owned<S: EvalSemantics>(
     if matches!(unwrap_paren(expr), Expr::Pipe(stages) if lone_plain_stage(stages).is_some()) {
         lone_pipe_entries::bump();
     }
-    if let Some(flow) = eval_each_owned_split_head::<S>(expr, input, optional, reentry, sink) {
-        return flow;
+    if starts_with_shared_run(expr) {
+        if let Some(flow) = eval_each_owned_split_head::<S>(expr, input, optional, reentry, sink) {
+            return flow;
+        }
     }
     if let Some(flow) = eval_each_owned_front_doors::<S>(expr, input, optional, sink) {
         return flow;
@@ -11994,6 +11998,17 @@ pub(crate) fn eval_each_owned<S: EvalSemantics>(
 /// only, where jq compares the two by identity (`[nan] as $a | ... | . == $a`).
 /// The run is the same stages as the flat pipe has in its place, so it is
 /// evaluated as a pipe, on the doors, and what follows it is the rest.
+/// Whether `expr` can be [`split_head`]'s, by its first node alone: the check
+/// every [`eval_each_owned`] call makes, which has to be a branch.
+#[inline(always)]
+fn starts_with_shared_run(expr: &Expr) -> bool {
+    match expr {
+        Expr::Shared(_) => true,
+        Expr::Pipe(stages) => matches!(stages.first(), Some(Expr::Shared(_))),
+        _ => false,
+    }
+}
+
 fn split_head(expr: &Expr) -> Option<(&Expr, &[Expr])> {
     match expr {
         Expr::Shared(arg) if matches!(arg.expr(), Expr::Pipe(_)) => Some((arg.expr(), &[])),
@@ -77812,7 +77827,7 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // #5441: a tail that starts with a kept run, as in the lazy twin. Out of line:
     // this function is inlined into recursive callers, and a stack frame of theirs
     // that grows is a depth limit that moves.
-    if split_head(expr).is_some() {
+    if starts_with_shared_run(expr) && split_head(expr).is_some() {
         return eval_owned_input_split_head::<W, S>(expr, input, optional, reentry);
     }
     // #3180: the relocating fold and the embed peel, as in the lazy twin
@@ -137905,7 +137920,13 @@ mod tests {
         // The long literal now survives either route. A NaN renders as
         // `null` in jq mode, so this fixture isolates the visible spelling.
         let rows: &[(OwnedValue, &str)] = &[(
-            OwnedValue::NumberLiteral(NumberRepr::Float(1e299), long.clone().into()),
+            // The payload is what the spelling parses to, as a parsed literal's is:
+            // the bridge hands a container back with the storage it went in as
+            // (#5441), which a payload the text does not give would tell apart.
+            OwnedValue::NumberLiteral(
+                NumberRepr::Float(long.parse::<f64>().unwrap()),
+                long.clone().into(),
+            ),
             &long,
         )];
         for (scalar, spelling) in rows {
