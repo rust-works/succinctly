@@ -1898,7 +1898,8 @@ impl core::fmt::Debug for ArithSettleMemo {
 ///
 /// It also remembers three syntactic facts about the stages (#5404) and keeps
 /// the owned copy of each tail the owned evaluator hands on (`kept_tail`,
-/// #5404).
+/// #5404). A pipe a substitution rebuilt reads the tails kept for the pipe it
+/// was rebuilt from (`share_tails_of`, #5424).
 ///
 /// Reads as the `Vec<Expr>` it wraps (`Deref`), so a pipe's stages are matched
 /// and indexed as before. The remembered answer is `eval::needs_path_context`
@@ -1918,6 +1919,7 @@ pub struct PipeStages {
     holds_tracked_var: core::cell::Cell<Option<bool>>,
     holds_resolver_node: core::cell::Cell<Option<bool>>,
     holds_bind: core::cell::Cell<Option<bool>>,
+    holds_var: core::cell::Cell<Option<bool>>,
     tails: TailState,
 }
 
@@ -1933,10 +1935,11 @@ pub(crate) const MAX_KEPT_TAIL_STAGES: usize = 128;
 /// What a pipe has settled about the tails it hands on (#5404).
 ///
 /// Exactly one of two kinds of pipe uses each field. A pipe of the program (or
-/// any pipe nothing else made) has `table` and `asked`; a copy it kept has
-/// `origin`, and reaches its own tails through the table of that pipe, so that
-/// the copies of one pipe are one table of at most `n - 2` and a copy never
-/// grows copies of its own.
+/// any pipe nothing else made) has `table`, `asked` and `rebuilt`; a copy it
+/// kept, and a pipe rebuilt from another by a substitution (#5424), have
+/// `origin`, and reach their tails through the table of that pipe, so that the
+/// copies of one pipe are one table of at most `n - 2` however many pipes are
+/// rebuilt from it, and a copy never grows copies of its own.
 #[derive(Default)]
 struct TailState {
     /// Whether a tail of this pipe was asked for before: the first ask answers
@@ -1944,10 +1947,15 @@ struct TailState {
     /// each value, one level of a recursion -- pays nothing for copies it
     /// would never reuse.
     asked: core::cell::Cell<bool>,
+    /// Whether a pipe was rebuilt from this one before (#5424): the first
+    /// rebuild is not linked to this pipe's tails, so a substitution that
+    /// happens once pays nothing for a table it would never use.
+    rebuilt: core::cell::Cell<bool>,
     /// The kept copies, built on the second ask.
     table: core::cell::OnceCell<Rc<TailTable>>,
-    /// For a kept copy: the table it belongs to and the offset of its first
-    /// stage in the pipe that owns it. A `Weak`, as the table holds the copy.
+    /// For a kept copy, or a pipe rebuilt from another (#5424): the table it
+    /// reaches its tails through and the offset of its first stage there. A
+    /// `Weak`, as the table holds the copy.
     origin: Option<(Weak<TailTable>, usize)>,
 }
 
@@ -2046,25 +2054,11 @@ impl PipeStages {
                 if len > MAX_KEPT_TAIL_STAGES || !self.tails.asked.replace(true) {
                     return TailPlan::Copy;
                 }
-                let table = self.tails.table.get_or_init(|| {
-                    let mut stops = vec![len as u32; len + 1];
-                    for (i, stage) in self.stages.iter().enumerate().rev() {
-                        stops[i] = if is_stateful(stage) {
-                            i as u32
-                        } else {
-                            stops[i + 1]
-                        };
-                    }
-                    Rc::new(TailTable {
-                        stops: stops.into(),
-                        slots: (0..len).map(|_| core::cell::OnceCell::new()).collect(),
-                    })
-                });
-                (Rc::clone(table), from, len)
+                (Rc::clone(self.tail_table(is_stateful)), from, len)
             }
         };
         if (table.stops[at] as usize) < end {
-            // A copy's tails hold no state, so this pipe is the program's own.
+            // A kept run holds no state, so this pipe is the program's own or linked.
             return if len - from < MIN_SPLIT_TAIL_STAGES {
                 TailPlan::Copy
             } else {
@@ -2087,27 +2081,85 @@ impl PipeStages {
         mut may_keep: impl FnMut(&[Expr]) -> bool,
     ) -> Vec<Expr> {
         let len = self.stages.len();
-        let table = self
-            .tails
-            .table
-            .get()
-            .expect("a split tail follows the pipe's second ask");
+        let (table, base) = self
+            .table_and_base()
+            .expect("a split tail follows the plan that found its table");
         let mut segments = Vec::new();
         let mut i = from;
         while i < len {
-            let stop = table.stops[i] as usize;
+            let stop = table.stops[base + i] as usize - base;
             if stop <= i + 1 {
                 segments.push(self.stages[i].clone());
                 i += 1;
                 continue;
             }
-            match self.kept_run(table, i, i, stop, &mut may_keep) {
+            match self.kept_run(&table, base + i, i, base + stop, &mut may_keep) {
                 Some(copy) => segments.push(Expr::Shared(copy)),
                 None => segments.extend(self.stages[i..stop].iter().cloned()),
             }
             i = stop;
         }
         segments
+    }
+
+    /// The table this pipe's tails are kept in and the offset of its first
+    /// stage there: its own, or the one it was linked or kept to (#5424).
+    fn table_and_base(&self) -> Option<(Rc<TailTable>, usize)> {
+        match &self.tails.origin {
+            Some((table, base)) => Some((table.upgrade()?, *base)),
+            None => Some((Rc::clone(self.tails.table.get()?), 0)),
+        }
+    }
+
+    /// This pipe's own table of kept tails, built on first use: for each
+    /// offset, where the next stage holding evaluation state is.
+    fn tail_table(&self, is_stateful: impl Fn(&Expr) -> bool) -> &Rc<TailTable> {
+        self.tails.table.get_or_init(|| {
+            let len = self.stages.len();
+            let mut stops = vec![len as u32; len + 1];
+            for (i, stage) in self.stages.iter().enumerate().rev() {
+                stops[i] = if is_stateful(stage) {
+                    i as u32
+                } else {
+                    stops[i + 1]
+                };
+            }
+            Rc::new(TailTable {
+                stops: stops.into(),
+                slots: (0..len).map(|_| core::cell::OnceCell::new()).collect(),
+            })
+        })
+    }
+
+    /// Makes this pipe hand on the tails `source` keeps instead of keeping
+    /// tails of its own (#5424), for a pipe rebuilt from `source` by a
+    /// substitution that changed none of its stages (`source` reads no
+    /// variable, which the caller has checked): a body rebuilt for each value
+    /// is a new pipe each time, so tails kept for it would be made once per
+    /// value and used once. Linked, the values after the first find them made.
+    ///
+    /// The stages being the same, the tails are the ones the source keeps, and
+    /// a stage holding evaluation state (`is_stateful`, #3148) is cloned afresh
+    /// from this pipe as [`Self::tail_plan`] has it for the source. Unlike a
+    /// pipe of the program, a linked pipe answers [`TailPlan::Split`] or
+    /// [`TailPlan::Whole`] from its first ask: the source has been asked.
+    ///
+    /// The first rebuild is not linked (see [`TailState::rebuilt`]); a pipe too
+    /// short to keep a tail, or too long to keep any, is never linked.
+    pub(crate) fn share_tails_of(&mut self, source: &Self, is_stateful: impl Fn(&Expr) -> bool) {
+        let len = self.stages.len();
+        if !(3..=MAX_KEPT_TAIL_STAGES).contains(&len) {
+            return;
+        }
+        debug_assert!(
+            self.stages == source.stages,
+            "a pipe shares the tails of a pipe with the same stages"
+        );
+        self.tails.origin = match &source.tails.origin {
+            Some(link) => Some(link.clone()),
+            None if !source.tails.rebuilt.replace(true) => return,
+            None => Some((Rc::downgrade(source.tail_table(is_stateful)), 0)),
+        };
     }
 
     /// The pipe over the run `end - at` stages long that starts at `at` in the
@@ -2177,6 +2229,13 @@ impl PipeStages {
         memo(&self.holds_bind, || classify(&self.stages))
     }
 
+    /// Whether an `Expr::Var` is somewhere in the stages, computing it with
+    /// `classify` on the first call (#5424). Without one a substitution of a
+    /// variable rebuilds the pipe stage for stage.
+    pub(crate) fn holds_var_or_init(&self, classify: impl FnOnce(&[Expr]) -> bool) -> bool {
+        memo(&self.holds_var, || classify(&self.stages))
+    }
+
     /// The stages, without the remembered answers.
     pub fn into_vec(self) -> Vec<Expr> {
         self.stages
@@ -2204,6 +2263,7 @@ impl From<Vec<Expr>> for PipeStages {
             holds_tracked_var: core::cell::Cell::new(None),
             holds_resolver_node: core::cell::Cell::new(None),
             holds_bind: core::cell::Cell::new(None),
+            holds_var: core::cell::Cell::new(None),
             tails: TailState::default(),
         }
     }
@@ -2230,6 +2290,7 @@ impl core::ops::DerefMut for PipeStages {
         self.holds_tracked_var.set(None);
         self.holds_resolver_node.set(None);
         self.holds_bind.set(None);
+        self.holds_var.set(None);
         self.tails = TailState::default();
         &mut self.stages
     }
@@ -4195,6 +4256,99 @@ mod tests {
         let longest = PipeStages::from(vec![Expr::Identity; MAX_KEPT_TAIL_STAGES]);
         assert!(longest.kept_tail(1, |_| true).is_none());
         assert!(longest.kept_tail(1, |_| true).is_some());
+    }
+
+    /// #5424: a pipe rebuilt stage for stage from another reads the tails that
+    /// pipe keeps, from its first ask, so the tails are made once however many
+    /// pipes are rebuilt from it. The first rebuild is not linked (a
+    /// substitution that happens once pays nothing); a rebuilt pipe keeps none
+    /// of its own, a rewrite of it forgets the link, and a pipe too short or
+    /// too long to keep tails is not linked.
+    #[test]
+    fn test_pipe_stages_rebuilt_from_a_pipe_read_its_kept_tails_5424() {
+        let source = PipeStages::from(vec![Expr::Field("a".into()); 6]);
+        let rebuild = |from: &PipeStages| {
+            let mut copy = PipeStages::from(from.to_vec());
+            copy.share_tails_of(from, |_| false);
+            copy
+        };
+        let first = rebuild(&source);
+        assert!(first.tails.origin.is_none(), "the first rebuild is alone");
+        assert!(first.kept_tail(2, |_| unreachable!("first ask")).is_none());
+        let mut made = 0;
+        let second = rebuild(&source);
+        let kept = second
+            .kept_tail(2, |_| {
+                made += 1;
+                true
+            })
+            .expect("kept from its first ask: the source's table exists");
+        let third = rebuild(&source);
+        let again = third
+            .kept_tail(2, |_| unreachable!("made for the second"))
+            .unwrap();
+        assert!(Rc::ptr_eq(&kept, &again));
+        assert_eq!(made, 1);
+        assert_eq!(
+            source.kept_tail_count(),
+            1,
+            "the tail is kept in the source's table, not the rebuilt pipe's"
+        );
+        assert_eq!(second.kept_tail_count(), 0);
+        // A pipe rebuilt from a rebuilt one reads the same table.
+        let fourth = rebuild(&second);
+        assert!(fourth
+            .kept_tail(2, |_| unreachable!("made for the second"))
+            .is_some_and(|tail| Rc::ptr_eq(&tail, &kept)));
+        // A rewrite makes it a different pipe.
+        let mut rewritten = rebuild(&source);
+        rewritten.push(Expr::Identity);
+        assert!(rewritten.kept_tail(2, |_| true).is_none(), "asks afresh");
+        // Too short to keep a tail, too long to keep any.
+        for len in [2, MAX_KEPT_TAIL_STAGES + 1] {
+            let source = PipeStages::from(vec![Expr::Identity; len]);
+            for _ in 0..2 {
+                assert!(rebuild(&source).tails.origin.is_none(), "{len} stages");
+            }
+        }
+    }
+
+    /// #5424: a pipe rebuilt from another that holds a stage with evaluation
+    /// state splits its tail as that pipe does, from its first ask, through the
+    /// source's table: the runs are the ones the source keeps and the stateful
+    /// stage is the rebuilt pipe's own clone.
+    #[test]
+    fn test_pipe_stages_rebuilt_from_a_pipe_split_around_their_stateful_stages_5424() {
+        let stateful = |e: &Expr| matches!(e, Expr::Identity);
+        let mut stages = vec![Expr::Field("a".into()); 12];
+        stages[5] = Expr::Identity;
+        let source = PipeStages::from(stages);
+        let rebuild = || {
+            let mut copy = PipeStages::from(source.to_vec());
+            copy.share_tails_of(&source, stateful);
+            copy
+        };
+        assert!(rebuild().tails.origin.is_none(), "the first is alone");
+        let (second, third) = (rebuild(), rebuild());
+        assert!(matches!(
+            second.tail_plan(1, stateful, |_| true),
+            TailPlan::Split
+        ));
+        let split = second.split_tail(1, |_| true);
+        // Run 1..5, the stage at 5, run 6..12.
+        assert_eq!(split.len(), 3);
+        assert!(matches!(&split[1], Expr::Identity));
+        let other = third.split_tail(1, |_| unreachable!("kept for the second"));
+        let same_run = |a: &Expr, b: &Expr| match (a, b) {
+            (Expr::Shared(a), Expr::Shared(b)) => Rc::ptr_eq(a, b),
+            _ => false,
+        };
+        assert!(same_run(&split[0], &other[0]) && same_run(&split[2], &other[2]));
+        // A tail after the stateful stage is kept whole.
+        assert!(matches!(
+            third.tail_plan(6, stateful, |_| true),
+            TailPlan::Whole(_)
+        ));
     }
 
     /// #5421: a tail holding a stage with evaluation state is split. Its
