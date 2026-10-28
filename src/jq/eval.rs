@@ -503,7 +503,7 @@ use super::value::{
     infinite_float_preview_text, int_to_f64, jq_identical, jq_literal_int_to_f64, jq_numeric_cmp,
     numeric_repr_cmp, owned_value_eq, owned_value_eq_at_depth_generic, subarray_indices,
     subarray_positions, window_matches, ArrayVec, NumberRepr, ObjectMap, ObjectMapEntry,
-    OwnedValue,
+    ObjectMapOf, OwnedValue,
 };
 
 /// Which binary operator an operand that produced *zero outputs* is being
@@ -12403,7 +12403,7 @@ pub(crate) fn eval_owned_reindex_free<S: EvalSemantics>(
                 }
                 _ => return None,
             };
-            Some(entries_to_object::<S, _>(entries).map(OwnedValue::object_from))
+            Some(entries_to_object::<S, _>(entries).map(OwnedValue::Object))
         }
         Expr::Assign { .. }
         | Expr::Update { .. }
@@ -12433,7 +12433,7 @@ fn owned_to_entries(input: &OwnedValue) -> Option<OwnedValue> {
     };
     let entries: Vec<OwnedValue> = match input {
         OwnedValue::Object(fields) => fields
-            .iter()
+            .occurrences()
             .map(|(key, value)| entry(OwnedValue::String(key.clone().into()), value))
             .collect(),
         OwnedValue::Array(items) => items
@@ -14824,7 +14824,18 @@ fn arith_add<S: EvalSemantics>(
         // `jv_object_merge` iterates the right operand, so `. + {}` hands
         // the left object back unchanged.
         (OwnedValue::Object(mut a), OwnedValue::Object(b)) => {
-            if !b.is_empty() {
+            if S::TAG == EvalTag::Yq && a.has_shadows() {
+                // yq overwrites the *first* entry of a repeated key (`{a: 1, a: 2} + {a: 9}` is
+                // `{a: 9, a: 2}`) and appends a key the left lacks (ADR-0027, #1344).
+                for (key, value) in b {
+                    match a.first_occurrence_mut(key.as_str()) {
+                        Some(slot) => *slot = value,
+                        None => {
+                            a.insert(key, value);
+                        }
+                    }
+                }
+            } else if !b.is_empty() {
                 a.extend(b);
             }
             Ok(OwnedValue::Object(a))
@@ -17980,38 +17991,46 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Ok(f) => f,
                 Err(e) => return QueryResult::Error(e),
             };
-            let mut result_map = IndexMap::with_capacity(checked.len());
-            let mut guard = DisplayKeyGuard::default();
-            for field in checked {
-                // `effective_fields_checked` already refused every key
-                // `key_display_string_kind` would answer `None` for
-                // (#1194), so that arm is unreachable here -- kept as a
-                // real branch (not `.unwrap()`) so a future change to
-                // either function's refusal condition fails loudly instead
-                // of panicking.
-                //
-                // `key_display_string_kind`, not `resolve_display_key`: the
-                // latter checks the `DisplayKeyGuard` collision (and
-                // registers the key in it) unconditionally, before `f` is
-                // evaluated below -- but `f` can produce no output at all
-                // (`QueryResult::None`), in which case this field's key is
-                // never actually inserted into `result_map`. Checking the
-                // guard that early raised a false-positive collision
-                // against a *later* field sharing the same #1642 fallback
-                // spelling even when the earlier field's own value never
-                // made it into the map (code review, #1829): every other
-                // `resolve_display_key` call site inserts unconditionally
-                // right after resolving, so this is the first one where
-                // that isn't true. The guard check is deferred below,
-                // immediately before the one line that actually inserts.
+            // The display key of every field, then which occurrence of each key is its live (last)
+            // one. yq's `map_values` rewrites that entry and leaves a repeated key's earlier entries
+            // as they were (ADR-0027, #1344); jq mode's `checked` is already collapsed, so every
+            // field is live there.
+            let mut keyed: Vec<(String, bool)> = vec_with_capacity(checked.len());
+            for field in &checked {
                 let Some((key, is_fallback)) = key_display_string_kind(&field.key) else {
                     return QueryResult::Error(fields.malformed_member_error());
                 };
-                let key = key.into_owned();
-
+                keyed.push((key.into_owned(), is_fallback));
+            }
+            let last_of: Option<alloc::collections::BTreeMap<&str, usize>> =
+                (!S::COLLAPSE_DUPLICATE_KEYS).then(|| {
+                    keyed
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (key, _))| (key.as_str(), i))
+                        .collect()
+                });
+            let is_live = |i: usize| match &last_of {
+                Some(last) => last[keyed[i].0.as_str()] == i,
+                None => true,
+            };
+            // What each field becomes: an earlier entry of a repeated key is kept as read.
+            enum Rewritten {
+                Earlier(OwnedValue),
+                Live(Option<OwnedValue>),
+            }
+            let mut rewritten: Vec<Rewritten> = vec_with_capacity(checked.len());
+            for (i, field) in checked.into_iter().enumerate() {
+                if !is_live(i) {
+                    match to_owned::<S, _>(&field.value) {
+                        Ok(owned) => rewritten.push(Rewritten::Earlier(owned)),
+                        Err(e) => return suppress_or_raise(e, optional),
+                    }
+                    continue;
+                }
                 // Apply f to the value
                 let field_val = field.value;
-                let value_to_insert =
+                let value_to_insert: Option<OwnedValue> =
                     match eval_single::<W, S>(f, field_val, optional).materialize_cursor() {
                         QueryResult::One(v) => match to_owned::<S, _>(&v) {
                             Ok(owned) => Some(owned),
@@ -18042,14 +18061,34 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                             return QueryResult::Halt(code);
                         }
                     };
-                if let Some(value) = value_to_insert {
-                    if !guard.check(&result_map, &key, is_fallback) {
-                        return QueryResult::Error(EvalError::colliding_display_key(&key));
+                rewritten.push(Rewritten::Live(value_to_insert));
+            }
+            let dropped: Vec<bool> = rewritten
+                .iter()
+                .map(|r| matches!(r, Rewritten::Live(None)))
+                .collect();
+            let mut result_map = super::eval_generic::ObjectBuilder::new();
+            let mut guard = DisplayKeyGuard::default();
+            for (i, outcome) in rewritten.into_iter().enumerate() {
+                let (key, is_fallback) = &keyed[i];
+                match outcome {
+                    Rewritten::Live(Some(value)) => {
+                        if !guard.check(result_map.map(), key, *is_fallback) {
+                            return QueryResult::Error(EvalError::colliding_display_key(key));
+                        }
+                        result_map.push::<S>(key.clone(), value);
                     }
-                    result_map.insert(key, value);
+                    Rewritten::Live(None) => {}
+                    // Kept only while its key's live entry is.
+                    Rewritten::Earlier(value) => {
+                        let live_at = last_of.as_ref().map_or(i, |last| last[key.as_str()]);
+                        if !dropped[live_at] {
+                            result_map.push::<S>(key.clone(), value);
+                        }
+                    }
                 }
             }
-            QueryResult::Owned(OwnedValue::Object(result_map.into()))
+            QueryResult::Owned(OwnedValue::Object(result_map.finish()))
         }
         StandardJson::Array(elements) => {
             // map_values on array applies to each element. #1829:
@@ -21123,8 +21162,9 @@ fn yq_entry_key_and_value(
 /// excluded.
 pub(crate) fn entries_to_object<S: EvalSemantics, I: IntoIterator<Item = OwnedValue>>(
     entries: I,
-) -> Result<IndexMap<String, OwnedValue>, EvalError> {
-    let mut result = IndexMap::new();
+) -> Result<ObjectMapOf<OwnedValue>, EvalError> {
+    // yq's `from_entries` keeps a repeated key's earlier entry (ADR-0027, #1344); jq's replaces it.
+    let mut result = super::eval_generic::ObjectBuilder::new();
     for (position, entry) in entries.into_iter().enumerate() {
         let (key, value) = if S::TAG == EvalTag::Yq {
             yq_entry_key_and_value(&entry, position)?
@@ -21138,9 +21178,9 @@ pub(crate) fn entries_to_object<S: EvalSemantics, I: IntoIterator<Item = OwnedVa
                 None => return Err(EvalError::cannot_use_as_object_key(&key)),
             },
         };
-        result.insert(k, value);
+        result.push::<S>(k, value);
     }
-    Ok(result)
+    Ok(result.finish())
 }
 
 /// Builtin: from_entries - [{key:k, value:v}] → {k:v}
@@ -21183,7 +21223,7 @@ fn builtin_from_entries<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(e) => return suppress_or_raise(e, optional),
     };
     match entries_to_object::<S, _>(entries) {
-        Ok(result) => QueryResult::Owned(OwnedValue::Object(result.into())),
+        Ok(result) => QueryResult::Owned(OwnedValue::Object(result)),
         // The `?` suffix swallows the refusal outright in jq, as the arm
         // above already does for a non-array/non-object input. See
         // `ObjectEscape`'s doc on why the flag is not yet reachable from
@@ -21283,7 +21323,7 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     // from_entries
     match entries_to_object::<S, _>(transformed) {
-        Ok(result) => QueryResult::Owned(OwnedValue::Object(result.into())),
+        Ok(result) => QueryResult::Owned(OwnedValue::Object(result)),
         Err(_) if optional => QueryResult::None,
         Err(e) => e.into(),
     }
@@ -95169,7 +95209,7 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Ok(f) => f,
                 Err(e) => return QueryResult::Error(e),
             };
-            let mut result = IndexMap::new();
+            let mut result = super::eval_generic::ObjectBuilder::new();
             // Two distinct undecodable keys whose #1642 fallback spellings
             // collide must raise rather than silently overwrite one
             // another in `result` -- same `DisplayKeyGuard` `map_values`
@@ -95184,7 +95224,7 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     return QueryResult::Error(fields.malformed_member_error());
                 };
                 if !omit_keys.contains(key.as_ref()) {
-                    if !guard.check(&result, &key, is_fallback) {
+                    if !guard.check(result.map(), &key, is_fallback) {
                         return QueryResult::Error(EvalError::colliding_display_key(&key));
                     }
                     // #1755: to_owned, not to_owned_lossy -- an
@@ -95192,10 +95232,10 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     // silently become "".
                     // #2001: ...or_suppress -- see `pick`'s identical fix.
                     let owned = to_owned_or_suppress!(&field.value, optional);
-                    result.insert(key.into_owned(), owned);
+                    result.push::<S>(key.into_owned(), owned);
                 }
             }
-            QueryResult::Owned(OwnedValue::Object(result.into()))
+            QueryResult::Owned(OwnedValue::Object(result.finish()))
         }
         StandardJson::Array(elements) => {
             // For arrays, keep all indices except those in the omit list

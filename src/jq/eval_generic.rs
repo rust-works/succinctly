@@ -1244,6 +1244,12 @@ pub struct ObjectBuilder<V> {
     shadowed: Option<ObjectMapOf<V>>,
 }
 
+impl<V: Clone> Default for ObjectBuilder<V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<V: Clone> ObjectBuilder<V> {
     #[inline]
     pub fn new() -> Self {
@@ -34284,7 +34290,7 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 return GenericResult::None; // patchcov: coverage tolerate-line reason="unreachable: `map(f)` over an array emits exactly one array; kept so a future `map` shape produces no output rather than a panic (#2785)"
             };
             match entries_to_object::<S, _>(mapped) {
-                Ok(fields) => GenericResult::Owned(OwnedValue::Object(fields.into())),
+                Ok(fields) => GenericResult::Owned(OwnedValue::Object(fields)),
                 Err(e) => GenericResult::Error(e),
             }
         }
@@ -38435,9 +38441,21 @@ fn map_family_members(
 ) -> Option<Vec<(OwnedValue, OwnedValue)>> {
     let members = match container {
         OwnedValue::Object(fields) => {
-            let typed_keys = typed_keys.filter(|keys| keys.len() == fields.len());
-            fields
-                .iter()
+            let listed = if matches!(family, MapFamily::WithEntries) {
+                fields.occurrence_len()
+            } else {
+                fields.len()
+            };
+            let typed_keys = typed_keys.filter(|keys| keys.len() == listed);
+            // `with_entries` runs over `to_entries`, which lists a repeated key once per entry
+            // (yq, ADR-0027); `map` and `map_values` run over `.[]`, the live entries.
+            let entries: alloc::boxed::Box<dyn Iterator<Item = (&String, &OwnedValue)>> =
+                if matches!(family, MapFamily::WithEntries) {
+                    alloc::boxed::Box::new(fields.occurrences())
+                } else {
+                    alloc::boxed::Box::new(fields.iter())
+                };
+            entries
                 .enumerate()
                 .map(|(i, (k, v))| match family {
                     MapFamily::WithEntries => {
@@ -38500,7 +38518,16 @@ fn eval_map_family_positioned<S: EvalSemantics, V: DocumentValue>(
     };
     let stages = owned_identity_body_stages(f);
     let mut array: Vec<OwnedValue> = Vec::new();
-    let mut object = IndexMap::with_capacity(members.len());
+    // `map_values` writes each live value and leaves a repeated key's earlier entries alone (yq,
+    // ADR-0027): start from the container, not from nothing.
+    let mut object = match container {
+        OwnedValue::Object(fields)
+            if matches!(family, MapFamily::MapValues) && fields.has_shadows() =>
+        {
+            fields.clone()
+        }
+        _ => ObjectMapOf::new(),
+    };
     for (component, member) in members {
         let member_id = id.child(&parent, component.clone());
         let mut outputs: Vec<OwnedValue> = Vec::new();
@@ -38521,6 +38548,10 @@ fn eval_map_family_positioned<S: EvalSemantics, V: DocumentValue>(
             MapFamily::Map | MapFamily::WithEntries => array.extend(outputs),
             MapFamily::MapValues => {
                 let Some(value) = outputs.into_iter().next() else {
+                    // No output removes the member (every entry of its key).
+                    if !matches!(component, OwnedValue::Int(_)) {
+                        object.shift_remove(owned_to_string::<S>(&component).as_str());
+                    }
                     continue;
                 };
                 match &component {
@@ -38536,10 +38567,10 @@ fn eval_map_family_positioned<S: EvalSemantics, V: DocumentValue>(
         MapFamily::Map => OwnedValue::array_from(array),
         MapFamily::MapValues => match container {
             OwnedValue::Array(_) => OwnedValue::array_from(array),
-            _ => OwnedValue::Object(object.into()),
+            _ => OwnedValue::Object(object),
         },
         MapFamily::WithEntries => match entries_to_object::<S, _>(array) {
-            Ok(fields) => OwnedValue::Object(fields.into()),
+            Ok(fields) => OwnedValue::Object(fields),
             Err(_) if optional => return Some(Flow::Exhausted),
             Err(e) => return Some(Flow::Escaped(Control::Error(e))),
         },
