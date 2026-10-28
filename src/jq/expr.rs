@@ -3,7 +3,7 @@
 #[cfg(not(test))]
 use alloc::boxed::Box;
 #[cfg(not(test))]
-use alloc::rc::Rc;
+use alloc::rc::{Rc, Weak};
 #[cfg(not(test))]
 use alloc::string::String;
 #[cfg(not(test))]
@@ -11,7 +11,7 @@ use alloc::vec;
 #[cfg(not(test))]
 use alloc::vec::Vec;
 #[cfg(test)]
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use super::value::{NumberRepr, OwnedValue};
 
@@ -1877,6 +1877,10 @@ impl core::fmt::Debug for ArithSettleMemo {
 /// An [`Expr::Pipe`]'s stages, whether any of them needs path context
 /// (#3886), and whether a stage before the last may have an effect (#4293).
 ///
+/// It also remembers three syntactic facts about the stages (#5404) and keeps
+/// the owned copy of each tail the owned evaluator hands on (`kept_tail`,
+/// #5404).
+///
 /// Reads as the `Vec<Expr>` it wraps (`Deref`), so a pipe's stages are matched
 /// and indexed as before. The remembered answer is `eval::needs_path_context`
 /// over every stage: a pipe asks it on each dispatch to choose its route, and
@@ -1885,15 +1889,110 @@ impl core::fmt::Debug for ArithSettleMemo {
 ///
 /// Derived state, like [`FuncDefData`]'s memo: it takes no part in equality or
 /// `Debug`, a clone starts empty, and `DerefMut` forgets it, because any
-/// rewrite of a stage goes through `&mut Vec<Expr>` and may change the answer.
+/// rewrite of a stage goes through `&mut Vec<Expr>` and may change the answer
+/// (or, for the tail copies, no longer be a copy of the stages).
 #[derive(Default)]
 pub struct PipeStages {
     stages: Vec<Expr>,
     needs_path_context: core::cell::Cell<Option<bool>>,
     effect_before_last: core::cell::Cell<Option<bool>>,
+    holds_tracked_var: core::cell::Cell<Option<bool>>,
+    holds_resolver_node: core::cell::Cell<Option<bool>>,
+    holds_bind: core::cell::Cell<Option<bool>>,
+    tails: TailState,
+}
+
+/// The longest pipe that keeps owned copies of its tails (#5404).
+///
+/// A pipe of `n` stages keeps up to `n - 2` copies, `n - 1` stages down to 2,
+/// so the stage copies are quadratic in `n`: 8,127 at the limit, held for as
+/// long as the program (and only for a pipe that went down twice, see
+/// [`PipeStages::kept_tail`]). A longer pipe copies its tail per call, as it did
+/// before the cache.
+pub(crate) const MAX_KEPT_TAIL_STAGES: usize = 128;
+
+/// What a pipe has settled about the tails it hands on (#5404).
+///
+/// Exactly one of two kinds of pipe uses each field. A pipe of the program (or
+/// any pipe nothing else made) has `table` and `asked`; a copy it kept has
+/// `origin`, and reaches its own tails through the table of that pipe, so that
+/// the copies of one pipe are one table of at most `n - 2` and a copy never
+/// grows copies of its own.
+#[derive(Default)]
+struct TailState {
+    /// Whether a tail of this pipe was asked for before: the first ask answers
+    /// `None`, so a pipe that only ever goes down once -- a body rebuilt for
+    /// each value, one level of a recursion -- pays nothing for copies it
+    /// would never reuse.
+    asked: core::cell::Cell<bool>,
+    /// The kept copies, built on the second ask.
+    table: core::cell::OnceCell<Rc<TailTable>>,
+    /// For a kept copy: the table it belongs to and the offset of its first
+    /// stage in the pipe that owns it. A `Weak`, as the table holds the copy.
+    origin: Option<(Weak<TailTable>, usize)>,
+}
+
+/// Slot `i` holds the `Expr::Pipe` over `stages[i..]` of the pipe that owns the
+/// table, once something asked for it; `None` marks a tail that is not kept.
+struct TailTable {
+    slots: Box<[core::cell::OnceCell<Option<Rc<Expr>>>]>,
 }
 
 impl PipeStages {
+    /// The owned `Expr::Pipe` over `stages[from..]`, kept once a second value
+    /// has gone down this pipe (#5404), or `None` when this pipe keeps no copy
+    /// of that tail: it is the pipe's first ask, `may_keep` declined the tail,
+    /// the tail is shorter than two stages (a lone stage is handed on as
+    /// itself), or the pipe is longer than [`MAX_KEPT_TAIL_STAGES`].
+    ///
+    /// Why a copy is wanted at all: the doors and the bridge of the owned
+    /// evaluator are keyed on a whole `&Expr`, so a rest of several stages
+    /// needs a pipe of its own to be handed on. Built per call it is `n - 1`,
+    /// `n - 2`, ... stages for each value that goes down a pipe of `n`, and the
+    /// copy starts with no memo, so the analyses a pipe asks of itself re-walk
+    /// it too. Kept, both are paid once per program.
+    ///
+    /// `may_keep` says whether the tail may be kept and is asked once per
+    /// tail: one holding a node that remembers what evaluation did to it
+    /// (#3148) would carry that from one call to the next, and one too large
+    /// would hold the program's memory for little.
+    pub(crate) fn kept_tail(
+        &self,
+        from: usize,
+        may_keep: impl FnOnce(&[Expr]) -> bool,
+    ) -> Option<Rc<Expr>> {
+        let len = self.stages.len();
+        if from == 0 || len < from + 2 {
+            return None;
+        }
+        let (table, at) = match &self.tails.origin {
+            Some((table, base)) => (table.upgrade()?, base + from),
+            None => {
+                if len > MAX_KEPT_TAIL_STAGES || !self.tails.asked.replace(true) {
+                    return None;
+                }
+                let table = self.tails.table.get_or_init(|| {
+                    Rc::new(TailTable {
+                        slots: (0..len).map(|_| core::cell::OnceCell::new()).collect(),
+                    })
+                });
+                (Rc::clone(table), from)
+            }
+        };
+        table
+            .slots
+            .get(at)?
+            .get_or_init(|| {
+                let tail = &self.stages[from..];
+                may_keep(tail).then(|| {
+                    let mut copy = Self::from(tail.to_vec());
+                    copy.tails.origin = Some((Rc::downgrade(&table), at));
+                    Rc::new(Expr::Pipe(copy))
+                })
+            })
+            .clone()
+    }
+
     /// Whether any stage needs path context, computing it with `classify` on
     /// the first call.
     pub(crate) fn needs_path_context_or_init(
@@ -1912,9 +2011,46 @@ impl PipeStages {
         memo(&self.effect_before_last, || classify(&self.stages))
     }
 
+    /// Whether an `Expr::TrackedVar` is somewhere in the stages, computing it
+    /// with `classify` on the first call (#5404). Without one a re-entry has no
+    /// marker to rewrite.
+    pub(crate) fn holds_tracked_var_or_init(&self, classify: impl FnOnce(&[Expr]) -> bool) -> bool {
+        memo(&self.holds_tracked_var, || classify(&self.stages))
+    }
+
+    /// Whether a node that can start a resolver invocation is somewhere in the
+    /// stages, computing it with `classify` on the first call (#5404). Without
+    /// one nothing reads a rewritten marker.
+    pub(crate) fn holds_resolver_node_or_init(
+        &self,
+        classify: impl FnOnce(&[Expr]) -> bool,
+    ) -> bool {
+        memo(&self.holds_resolver_node, || classify(&self.stages))
+    }
+
+    /// Whether an `Expr::As` is somewhere in the stages, computing it with
+    /// `classify` on the first call (#5404). Without one no `as` bind can reach
+    /// a resolver; a destructuring bind is an `Expr::AsPattern`, which this
+    /// does not cover.
+    pub(crate) fn holds_bind_or_init(&self, classify: impl FnOnce(&[Expr]) -> bool) -> bool {
+        memo(&self.holds_bind, || classify(&self.stages))
+    }
+
     /// The stages, without the remembered answers.
     pub fn into_vec(self) -> Vec<Expr> {
         self.stages
+    }
+
+    /// How many tails are kept, for tests.
+    #[cfg(test)]
+    pub(crate) fn kept_tail_count(&self) -> usize {
+        self.tails.table.get().map_or(0, |table| {
+            table
+                .slots
+                .iter()
+                .filter(|slot| slot.get().is_some_and(Option::is_some))
+                .count()
+        })
     }
 }
 
@@ -1924,6 +2060,10 @@ impl From<Vec<Expr>> for PipeStages {
             stages,
             needs_path_context: core::cell::Cell::new(None),
             effect_before_last: core::cell::Cell::new(None),
+            holds_tracked_var: core::cell::Cell::new(None),
+            holds_resolver_node: core::cell::Cell::new(None),
+            holds_bind: core::cell::Cell::new(None),
+            tails: TailState::default(),
         }
     }
 }
@@ -1946,6 +2086,10 @@ impl core::ops::DerefMut for PipeStages {
     fn deref_mut(&mut self) -> &mut Vec<Expr> {
         self.needs_path_context.set(None);
         self.effect_before_last.set(None);
+        self.holds_tracked_var.set(None);
+        self.holds_resolver_node.set(None);
+        self.holds_bind.set(None);
+        self.tails = TailState::default();
         &mut self.stages
     }
 }
@@ -3799,6 +3943,145 @@ mod tests {
             !iterated.needs_path_context_or_init(|_| false),
             "a rewrite by iteration forgets"
         );
+    }
+
+    /// #5404: a pipe keeps the owned copy of a tail from its second ask on,
+    /// builds it once, and forgets it when its stages change or when it is
+    /// cloned.
+    #[test]
+    fn test_pipe_stages_keep_a_tail_copy_from_the_second_ask_5404() {
+        let stages = |n: usize| PipeStages::from(vec![Expr::Identity; n]);
+        let mut pipe = stages(5);
+        assert!(
+            pipe.kept_tail(1, |_| unreachable!("not asked on the first ask"))
+                .is_none(),
+            "a pipe that goes down once keeps nothing"
+        );
+        let first = pipe.kept_tail(1, |_| true).expect("a tail of four stages");
+        assert!(matches!(&*first, Expr::Pipe(tail) if tail.len() == 4));
+        let again = pipe.kept_tail(1, |_| unreachable!("kept"));
+        assert!(again.is_some_and(|again| Rc::ptr_eq(&again, &first)));
+        assert!(
+            pipe.kept_tail(2, |_| true)
+                .is_some_and(|tail| matches!(&*tail, Expr::Pipe(t) if t.len() == 3)),
+            "each offset has its own"
+        );
+        assert!(
+            pipe.kept_tail(3, |_| true).is_some(),
+            "a tail of two stages"
+        );
+        assert_eq!(pipe.kept_tail_count(), 3);
+        assert!(pipe
+            .kept_tail(4, |_| unreachable!("a lone stage is not kept"))
+            .is_none());
+        assert!(pipe
+            .kept_tail(0, |_| unreachable!("the pipe itself is not a tail"))
+            .is_none());
+        let clone = pipe.clone();
+        assert!(
+            clone.kept_tail(1, |_| true).is_none(),
+            "a clone starts without the copies, and its first ask keeps nothing"
+        );
+        pipe.push(Expr::Identity);
+        assert_eq!(pipe.kept_tail_count(), 0, "a rewrite drops the copies");
+        assert!(pipe.kept_tail(1, |_| true).is_none(), "and asks afresh");
+        assert!(pipe
+            .kept_tail(1, |_| true)
+            .is_some_and(|tail| matches!(&*tail, Expr::Pipe(t) if t.len() == 5)));
+    }
+
+    /// #5404: a kept copy has no copies of its own. Asked for a tail, it
+    /// answers with the very copy its pipe keeps for that tail, so the copies
+    /// of one pipe are one table however the evaluation reaches them.
+    #[test]
+    fn test_kept_tail_copies_share_the_table_of_their_pipe_5404() {
+        let pipe = PipeStages::from(vec![Expr::Identity; 6]);
+        assert!(pipe.kept_tail(1, |_| true).is_none());
+        let first = pipe.kept_tail(1, |_| true).unwrap();
+        let Expr::Pipe(copy) = &*first else {
+            panic!("a pipe");
+        };
+        let through_copy = copy.kept_tail(1, |_| true).unwrap();
+        let through_root = pipe
+            .kept_tail(2, |_| unreachable!("kept by the copy"))
+            .unwrap();
+        assert!(Rc::ptr_eq(&through_copy, &through_root));
+        let Expr::Pipe(second) = &*through_copy else {
+            panic!("a pipe");
+        };
+        let deeper = second.kept_tail(2, |_| true).unwrap();
+        assert!(Rc::ptr_eq(
+            &deeper,
+            &pipe
+                .kept_tail(4, |_| unreachable!("kept by the copy"))
+                .unwrap()
+        ));
+        assert_eq!(pipe.kept_tail_count(), 3, "the tails at offsets 1, 2 and 4");
+        assert_eq!(
+            copy.kept_tail_count(),
+            0,
+            "a copy holds no table of its own"
+        );
+        drop(pipe);
+        assert!(
+            copy.kept_tail(2, |_| true).is_none(),
+            "a copy whose pipe is gone keeps nothing, and does not dangle"
+        );
+    }
+
+    /// #5404: a tail `may_keep` declines is asked once and stays declined, and
+    /// a pipe past the limit keeps nothing.
+    #[test]
+    fn test_pipe_stages_remember_a_declined_tail_and_keep_none_past_the_limit_5404() {
+        let pipe = PipeStages::from(vec![Expr::Identity; 4]);
+        assert!(pipe.kept_tail(1, |_| unreachable!("first ask")).is_none());
+        let mut asks = 0;
+        for _ in 0..3 {
+            assert!(pipe
+                .kept_tail(1, |_| {
+                    asks += 1;
+                    false
+                })
+                .is_none());
+        }
+        assert_eq!(asks, 1);
+        let long = PipeStages::from(vec![Expr::Identity; MAX_KEPT_TAIL_STAGES + 1]);
+        for _ in 0..2 {
+            assert!(long
+                .kept_tail(1, |_| unreachable!("too long to keep copies"))
+                .is_none());
+        }
+        let longest = PipeStages::from(vec![Expr::Identity; MAX_KEPT_TAIL_STAGES]);
+        assert!(longest.kept_tail(1, |_| true).is_none());
+        assert!(longest.kept_tail(1, |_| true).is_some());
+    }
+
+    /// #5404: the three facts a pipe remembers are asked once, and forgotten
+    /// when its stages change or when it is cloned.
+    #[test]
+    fn test_pipe_stages_remember_what_they_hold_5404() {
+        let mut pipe = PipeStages::from(vec![Expr::Identity; 2]);
+        assert!(pipe.holds_bind_or_init(|_| true));
+        assert!(pipe.holds_bind_or_init(|_| unreachable!("answered from the memo")));
+        assert!(pipe.holds_tracked_var_or_init(|_| true));
+        assert!(pipe.holds_resolver_node_or_init(|_| true));
+        assert!(
+            !pipe.clone().holds_bind_or_init(|_| false),
+            "a clone starts without them"
+        );
+        pipe.push(Expr::Identity);
+        assert!(
+            !pipe.holds_bind_or_init(|stages| {
+                assert_eq!(stages.len(), 3, "asked of the stages as they now are");
+                false
+            }),
+            "a rewrite of the stages forgets the facts"
+        );
+        assert!(
+            !pipe.holds_tracked_var_or_init(|_| false),
+            "and so do the others"
+        );
+        assert!(!pipe.holds_resolver_node_or_init(|_| false));
     }
 
     #[test]

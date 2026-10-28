@@ -71,7 +71,7 @@ use super::eval::{
     is_identity_passthrough, is_retryable_control, is_retryable_stop, key_arrays_eq, limit_raising,
     literal_to_owned, mark_nonretryable_escape, native_stack_exhausted, needs_path_context,
     numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned, owned_bound_to_i64_for,
-    owned_index_key_to_expr, owned_to_string, pattern_alternatives_var_names,
+    owned_index_key_to_expr, owned_to_string, pattern_alternatives_var_names, pipe_holds_bind,
     pipe_needs_path_context, prefer_pending_control, probe_def_call, range_from_literal_override,
     range_max_exceeded_error, range_num, reads_parent, recurse_walk_flow, reduce_forks,
     reroot_for_reentry, reroot_markers, resolve_computed_slice_bounds, resume_from_escape,
@@ -12663,6 +12663,12 @@ pub(crate) fn owned_identity_bind_door<S: EvalSemantics>(
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Option<Flow> {
     if S::TAG != EvalTag::Jq || reentry != Reentry::REBUILT {
+        return None;
+    }
+    // No `as` anywhere in a pipe means no bind to reach a resolver, so the walk
+    // below could only say no: a pipe remembers that (#5404), and is asked once
+    // per stage by every owned value that goes down it.
+    if matches!(strip_parens(expr), Expr::Pipe(stages) if !pipe_holds_bind(stages)) {
         return None;
     }
     let stages = owned_identity_body_stages(expr);
