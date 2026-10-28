@@ -1940,7 +1940,6 @@ impl<'a> Parser<'a> {
         // yq's lexer ends an interpolation slot at the first `"`, so a string literal inside
         // one is jq syntax (#5452).
         if self.interp_depth > 0 {
-            self.skip_ws();
             self.reject_unless_jq_extensions("string literal inside \\(...)")?;
         }
         self.expect('"')?;
@@ -2080,6 +2079,10 @@ impl<'a> Parser<'a> {
     fn parse_path_step_name(&mut self) -> Result<String, ParseError> {
         if self.mode != ParserMode::Yq {
             return self.parse_string_literal();
+        }
+        // A quoted step is a string literal to yq's lexer too (#5452).
+        if self.interp_depth > 0 {
+            self.reject_unless_jq_extensions("string literal inside \\(...)")?;
         }
         self.expect('"')?;
         let mut name = String::new();

@@ -17,6 +17,10 @@ fn test_jq_syntax_the_yq_lexer_rejects_needs_jq_extensions_5452() -> Result<()> 
         (r#""\("x")""#, "\"x\"\n"),
         (r#""\(.a // "d")""#, "\"[1]\"\n"),
         (r#""\(.a)\("y")""#, "\"[1]y\"\n"),
+        // A quoted path step is a string to yq's lexer as well.
+        (r#""\(."a")""#, "\"[1]\"\n"),
+        // The depth is restored after a slot: a string after one is fine, and nested slots count.
+        (r#""\(.a)" + "\(.a)\("z")""#, "\"[1][1]z\"\n"),
         ("5.", "5.0\n"),
         ("1. + 1", "2.0\n"),
         ("[1.]", "[1.0]\n"),
