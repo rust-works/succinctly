@@ -2865,12 +2865,7 @@ fn collect_write_targets(expr: &Expr) -> Option<Vec<WriteTarget>> {
         out.last().map_or(0, |t| t.stage + 1)
     }
 
-    fn push(
-        lhs: &Expr,
-        kind: WriteKind,
-        flags: (bool, bool),
-        out: &mut Vec<WriteTarget>,
-    ) -> bool {
+    fn push(lhs: &Expr, kind: WriteKind, flags: (bool, bool), out: &mut Vec<WriteTarget>) -> bool {
         let stage = next_stage(out);
         push_at(lhs, kind, flags, stage, out)
     }
@@ -3083,9 +3078,10 @@ fn shift_through_stage(path: &[PathStep], stage: &[StageRemovals], backward: boo
             return Shifted::Unknown;
         }
         let moved = if backward {
-            removed
-                .iter()
-                .fold(*slot, |slot, gone| if *gone <= slot { slot + 1 } else { slot })
+            removed.iter().fold(
+                *slot,
+                |slot, gone| if *gone <= slot { slot + 1 } else { slot },
+            )
         } else if removed.contains(slot) {
             return Shifted::Removed;
         } else {
