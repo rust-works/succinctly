@@ -106006,6 +106006,7 @@ fn test_try_wrapped_if_bind_source_yq_unchanged_3279() -> Result<()> {
     let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
         .args([
             "yq",
+            "--jq-extensions",
             "-o",
             "json",
             "-I",
@@ -106037,7 +106038,7 @@ fn test_try_wrapped_if_bind_source_yq_unchanged_3279() -> Result<()> {
         "del((. | .) as $v0 | $v0.b)",
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-            .args(["yq", "-o", "json", "-I", "0", filter])
+            .args(["yq", "--jq-extensions", "-o", "json", "-I", "0", filter])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

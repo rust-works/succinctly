@@ -4319,7 +4319,8 @@ fn test_yq_any_all_predicate_forms_gated_2005() -> Result<()> {
         ("def any(f): \"mine\"; any(.)", "\"mine\""),
         ("def all(f; g): \"mine\"; all(.; .)", "\"mine\""),
     ] {
-        let (out, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &["-o=json"])?;
+        let (out, stderr, code) =
+            run_yq_stdin_with_stderr(filter, "a: 1\n", &["--jq-extensions", "-o=json"])?;
         assert_eq!(code, 0, "{filter:?}: {stderr}");
         assert_eq!(out.trim(), want, "{filter:?}");
     }
@@ -4499,8 +4500,11 @@ fn test_yq_any_c_all_c_shadowing_and_jq_mode_3966() -> Result<()> {
             r#"["zero",true]"#,
         ),
     ] {
-        let (out, stderr, code) =
-            run_yq_stdin_with_stderr(filter, "[1,5]\n", &["-o", "json", "-I", "0"])?;
+        let (out, stderr, code) = run_yq_stdin_with_stderr(
+            filter,
+            "[1,5]\n",
+            &["--jq-extensions", "-o", "json", "-I", "0"],
+        )?;
         assert_eq!(code, 0, "{filter}: {stderr}");
         assert_eq!(out.trim(), want, "{filter}");
     }
@@ -10847,7 +10851,7 @@ fn test_yaml_is_builtins_resolve_tags_and_agree_with_type_903() -> Result<()> {
         ("isarray", "a: [1, 2]\n", "true"),
         ("isobject", "a: {x: 1}\n", "true"),
     ] {
-        let (out, code) = run_yq_stdin(&format!(".a | {query}"), input, &[])?;
+        let (out, code) = run_yq_stdin(&format!(".a | {query}"), input, &["--jq-extensions"])?;
         assert_eq!(code, 0, "{query} on {input:?}: expected clean success");
         assert_eq!(out.trim(), expected, "{query} on {input:?}");
     }
@@ -17924,7 +17928,8 @@ fn test_yq_halt_not_caught_by_try_catch_or_label() -> Result<()> {
         (r#"try ("x"|halt_error) catch "caught""#, 1),
         (r"label $out | (halt, break $out)", 0),
     ] {
-        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "x: 1\n", &[])?;
+        let (stdout, stderr, code) =
+            run_yq_stdin_with_stderr(filter, "x: 1\n", &["--jq-extensions"])?;
         assert_eq!(code, want_code, "{filter}: stderr: {stderr:?}");
         assert!(!stdout.contains("caught"), "{filter}: stdout: {stdout:?}");
     }
@@ -18013,6 +18018,7 @@ fn test_inplace_halt_before_any_output_does_not_truncate_file() -> Result<()> {
 
     let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
         .arg("yq")
+        .arg("--jq-extensions")
         .arg("-i")
         .arg("halt")
         .arg(input_file.path())
@@ -18039,6 +18045,7 @@ fn test_inplace_halt_before_any_output_in_multi_doc_file_does_not_truncate_file(
 
     let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
         .arg("yq")
+        .arg("--jq-extensions")
         .arg("-i")
         .arg("if .a == 1 then halt else . end")
         .arg(input_file.path())
@@ -18084,6 +18091,7 @@ fn test_inplace_multi_doc_no_dangling_separator_before_halting_or_empty_document
 
         let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
             .arg("yq")
+            .arg("--jq-extensions")
             .arg("-i")
             .arg(filter)
             .arg(input_file.path())
@@ -18111,6 +18119,7 @@ fn test_inplace_legitimately_empty_output_still_truncates_file() -> Result<()> {
 
         let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
             .arg("yq")
+            .arg("--jq-extensions")
             .arg("-i")
             .arg(filter)
             .arg(input_file.path())
@@ -18139,6 +18148,7 @@ fn test_inplace_multi_file_halt_leaves_untouched_files_alone() -> Result<()> {
 
     let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
         .arg("yq")
+        .arg("--jq-extensions")
         .arg("-i")
         .arg("if .a == 2 then halt else .a += 100 end")
         .arg(f1.path())
@@ -21715,14 +21725,17 @@ mod meta_assign_798 {
                 "# above b\nb: 1 # hi\nc: {x: 1} # yo\n",
             ),
         ] {
-            let (out, err, code) = run_yq_stdin_with_stderr(filter, input, &[])?;
+            let (out, err, code) = run_yq_stdin_with_stderr(filter, input, &["--jq-extensions"])?;
             assert_eq!((out.as_str(), code), (expected, 0), "{filter}: {err}");
         }
 
         // A navigation that is not a static path stays refused rather than dropped: `.[]` answers
         // several nodes, each its own document.
-        let (out, err, code) =
-            run_yq_stdin_with_stderr(".[] | .b line_comment = \"hi\"", "- b: 1\n- b: 2\n", &[])?;
+        let (out, err, code) = run_yq_stdin_with_stderr(
+            ".[] | .b line_comment = \"hi\"",
+            "- b: 1\n- b: 2\n",
+            &["--jq-extensions"],
+        )?;
         assert_eq!(code, 1, "{err}");
         assert_eq!(out, "");
         assert!(err.contains("#2679"), "{err}");
@@ -21740,14 +21753,19 @@ mod meta_assign_798 {
 
         // The same refusal through a `def` call that navigates.
         let filter = "def f: .a; f | .b line_comment = \"z\"";
-        let (out, err, code) = run_yq_stdin_with_stderr(filter, "a:\n  b: 1\n", &[])?;
+        let (out, err, code) =
+            run_yq_stdin_with_stderr(filter, "a:\n  b: 1\n", &["--jq-extensions"])?;
         assert_eq!(code, 1, "{filter}: {err}");
         assert_eq!(out, "", "{filter}");
         assert!(err.contains("#2679"), "{filter}: {err}");
 
         // Unchanged: the same write as the first stage, a `def` nothing calls, a
         // write a later stage replaces, and JSON output (no comments to lose).
-        let (out, code) = run_yq_stdin(".a.b line_comment = \"hi\"", "a:\n  b: 1\n", &[])?;
+        let (out, code) = run_yq_stdin(
+            ".a.b line_comment = \"hi\"",
+            "a:\n  b: 1\n",
+            &["--jq-extensions"],
+        )?;
         assert_eq!(code, 0);
         assert_eq!(out, "a:\n  b: 1 # hi\n");
         let (out, code) = run_yq_stdin(
@@ -21767,7 +21785,7 @@ mod meta_assign_798 {
         let (out, code) = run_yq_stdin(
             ".a | .b line_comment = \"hi\"",
             "a:\n  b: 1\n",
-            &["-o", "json", "-I0"],
+            &["--jq-extensions", "-o", "json", "-I0"],
         )?;
         assert_eq!(code, 0);
         assert_eq!(out.trim(), r#"{"b":1}"#);
@@ -24804,6 +24822,7 @@ fn test_front_matter_extract_allows_slurp_across_files() -> Result<()> {
 fn test_bare_break_outside_label_reports_error() -> Result<()> {
     let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
         .arg("yq")
+        .arg("--jq-extensions")
         .args(["-n", "break $foo"])
         .stdin(Stdio::null())
         .output()?;
@@ -24833,7 +24852,8 @@ fn test_yq_break_desugars_to_a_shadowable_error_call_2687() -> Result<()> {
         (r#"def error(m): "S1"; label $out | 1, break $out"#, "1"),
         (r"label $out | (1, break $out, 3)", "1"),
     ] {
-        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &["-o=json", "-I=0"])?;
+        let (stdout, stderr, code) =
+            run_yq_stdin_with_stderr(filter, doc, &["--jq-extensions", "-o=json", "-I=0"])?;
         assert_eq!(code, 0, "#2687: `{filter}` -- stderr: {stderr:?}");
         assert_eq!(
             stdout.trim(),
@@ -24868,7 +24888,8 @@ fn test_yq_label_error_reraise_is_a_shadowable_error_call_2840() -> Result<()> {
             "1\n10\n20",
         ),
     ] {
-        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &["-o=json", "-I=0"])?;
+        let (stdout, stderr, code) =
+            run_yq_stdin_with_stderr(filter, doc, &["--jq-extensions", "-o=json", "-I=0"])?;
         assert_eq!(code, 0, "#2840: `{filter}` -- stderr: {stderr:?}");
         assert_eq!(
             stdout.trim(),
@@ -25122,6 +25143,7 @@ fn test_split_exp_writes_prefix_produced_before_main_expression_halts() -> Resul
     );
     let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
         .arg("yq")
+        .arg("--jq-extensions")
         .args(["-n", "--split-exp", &pattern])
         .arg("1, halt")
         .stdin(Stdio::null())
@@ -25163,8 +25185,11 @@ fn test_split_exp_reports_each_error_exactly_once() -> Result<()> {
         "if . == 1 then error(\"boom1\") elif . == 2 then error(\"boom2\") else \"{}/f3.yml\" end",
         dir.path().display()
     );
-    let (_stdout, stderr, code) =
-        run_yq_split(".[]", "[1, 2, 3]", &["--split-exp", &pattern, "-p", "json"])?;
+    let (_stdout, stderr, code) = run_yq_split(
+        ".[]",
+        "[1, 2, 3]",
+        &["--jq-extensions", "--split-exp", &pattern, "-p", "json"],
+    )?;
     assert_ne!(code, 0);
     let error_lines: Vec<&str> = stderr.lines().filter(|l| l.starts_with("Error:")).collect();
     assert_eq!(
@@ -26813,7 +26838,7 @@ fn test_eval_all_file_index_agrees_across_both_routes_2416() -> Result<()> {
         let (stdout, stderr, code) = run_yq_files(
             filter,
             &[f1.path(), f2.path()],
-            &["--eval-all", "-o", "json", "-I", "0"],
+            &["--jq-extensions", "--eval-all", "-o", "json", "-I", "0"],
         )?;
         assert_eq!(code, 0, "`{filter}` exited {code}, stderr: {stderr}");
         assert_eq!(
@@ -27648,7 +27673,11 @@ fn test_split_exp_own_halt_returns_early_and_stops_further_results() -> Result<(
         "if $index == 1 then halt else \"{}/f\" + ($index|tostring) + \".yml\" end",
         dir.path().display()
     );
-    let (stdout, stderr, code) = run_yq_split(".[]", "[1, 2, 3]\n", &["--split-exp", &pattern])?;
+    let (stdout, stderr, code) = run_yq_split(
+        ".[]",
+        "[1, 2, 3]\n",
+        &["--jq-extensions", "--split-exp", &pattern],
+    )?;
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(stdout, "");
     assert_eq!(
@@ -27680,7 +27709,11 @@ fn test_split_exp_own_halt_with_produced_value_still_writes_file() -> Result<()>
         "\"{}/f\" + ($index|tostring) + \".yml\", halt",
         dir.path().display()
     );
-    let (stdout, stderr, code) = run_yq_split(".[]", "[1, 2, 3]\n", &["--split-exp", &pattern])?;
+    let (stdout, stderr, code) = run_yq_split(
+        ".[]",
+        "[1, 2, 3]\n",
+        &["--jq-extensions", "--split-exp", &pattern],
+    )?;
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(stdout, "");
     assert_eq!(
@@ -27883,8 +27916,11 @@ fn test_split_exp_own_halt_breaks_json_branch_immediately() -> Result<()> {
         "if $index == 1 then halt else \"{}/f\" + ($index|tostring) + \".yml\" end",
         dir.path().display()
     );
-    let (stdout, stderr, code) =
-        run_yq_split(".[]", "[1, 2, 3]", &["--split-exp", &pattern, "-p", "json"])?;
+    let (stdout, stderr, code) = run_yq_split(
+        ".[]",
+        "[1, 2, 3]",
+        &["--jq-extensions", "--split-exp", &pattern, "-p", "json"],
+    )?;
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(stdout, "");
     assert_eq!(
@@ -27941,6 +27977,7 @@ fn test_split_exp_own_halt_in_null_input_stops_further_results() -> Result<()> {
     );
     let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
         .arg("yq")
+        .arg("--jq-extensions")
         .args(["-n", "--split-exp", &pattern])
         .arg("1, 2, 3")
         .stdin(Stdio::null())
@@ -27980,6 +28017,7 @@ fn test_split_exp_writes_every_result_in_a_multi_value_halt_prefix_null_input() 
     );
     let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
         .arg("yq")
+        .arg("--jq-extensions")
         .args(["-n", "--split-exp", &pattern])
         .arg("1, 2, 3, halt")
         .stdin(Stdio::null())
@@ -28081,6 +28119,7 @@ fn test_inplace_m2_select_halt_stops_streaming_further_documents() -> Result<()>
 
     let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
         .arg("yq")
+        .arg("--jq-extensions")
         .arg("-i")
         .arg("select(if .a == 2 then halt else true end)")
         .arg(input_file.path())
@@ -30525,6 +30564,8 @@ fn test_object_slice_fractional_negative_end_is_refused_3415() -> Result<()> {
 #[test]
 fn test_yq_slice_bound_must_be_integer_shaped_3415() -> Result<()> {
     let args = ["-o=json", "-I=0"];
+    // `if` is jq-only surface, so the unreached-branch case needs the flag.
+    let unreached_args = ["--jq-extensions", "-o=json", "-I=0"];
     for filter in [
         ".[0:1.5]",
         ".[0.5:]",
@@ -30554,7 +30595,7 @@ fn test_yq_slice_bound_must_be_integer_shaped_3415() -> Result<()> {
         ("[.[-2:]]", "[[3,4]]\n"),
         ("if false then .[1.0:] else 1 end", "1\n"),
     ] {
-        let (stdout, code) = run_yq_stdin(filter, "[1,2,3,4]", &args)?;
+        let (stdout, code) = run_yq_stdin(filter, "[1,2,3,4]", &unreached_args)?;
         assert_eq!((stdout.as_str(), code), (want, 0), "`{filter}`");
     }
     Ok(())
@@ -30567,6 +30608,8 @@ fn test_yq_slice_bound_must_be_integer_shaped_3415() -> Result<()> {
 #[test]
 fn test_yq_computed_float_slice_bound_in_exponent_form_is_refused_3970() -> Result<()> {
     let args = ["-o=json", "-I=0"];
+    // `if` is jq-only surface, so the unreached-branch case needs the flag.
+    let unreached_args = ["--jq-extensions", "-o=json", "-I=0"];
     for filter in [
         ".[(1.0*1000000):]",
         ".[(1e10*1):]",
@@ -30597,7 +30640,7 @@ fn test_yq_computed_float_slice_bound_in_exponent_form_is_refused_3970() -> Resu
         ("[.[(1000000*1):]]", "[[]]\n"),
         ("if false then .[(1.0*1000000):] else 1 end", "1\n"),
     ] {
-        let (stdout, code) = run_yq_stdin(filter, "[1,2,3]", &args)?;
+        let (stdout, code) = run_yq_stdin(filter, "[1,2,3]", &unreached_args)?;
         assert_eq!((stdout.as_str(), code), (want, 0), "`{filter}`");
     }
     Ok(())
@@ -37274,20 +37317,32 @@ fn test_yq_input_line_number_not_supported_723() -> Result<()> {
 /// `docs/compliance/yq/limitations.md`.
 #[test]
 fn test_yq_unreached_input_builtin_now_rejected_1507() -> Result<()> {
-    for filter in [
-        "if false then input else . end",
-        "if false then inputs else . end",
-        "if false then input_line_number else . end",
+    // `if` is jq-only surface (#4808), so the flag-off run reaches the `input` family through
+    // `and`, which yq has; the flagged run keeps the original `if` shapes.
+    for (filter, extra_args) in [
+        ("false and input", [].as_slice()),
+        ("false and inputs", [].as_slice()),
+        ("false and input_line_number", [].as_slice()),
+        (
+            "if false then input else . end",
+            ["--jq-extensions"].as_slice(),
+        ),
+        (
+            "if false then inputs else . end",
+            ["--jq-extensions"].as_slice(),
+        ),
+        (
+            "if false then input_line_number else . end",
+            ["--jq-extensions"].as_slice(),
+        ),
     ] {
-        for extra_args in [[].as_slice(), ["--jq-extensions"].as_slice()] {
-            let (out, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", extra_args)?;
-            assert_eq!(code, 1, "{filter} ({extra_args:?}) stderr: {stderr}");
-            assert_eq!(out, "", "{filter} ({extra_args:?}) should write no stdout");
-            assert!(
-                stderr.contains("is not supported in yq mode"),
-                "{filter} ({extra_args:?}) stderr: {stderr}"
-            );
-        }
+        let (out, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", extra_args)?;
+        assert_eq!(code, 1, "{filter} ({extra_args:?}) stderr: {stderr}");
+        assert_eq!(out, "", "{filter} ({extra_args:?}) should write no stdout");
+        assert!(
+            stderr.contains("is not supported in yq mode"),
+            "{filter} ({extra_args:?}) stderr: {stderr}"
+        );
     }
     Ok(())
 }
@@ -41772,7 +41827,8 @@ fn test_decode_failure_not_suppressed_by_optional_1620() -> Result<()> {
 fn test_decode_failure_not_caught_by_try_catch_1620() -> Result<()> {
     let input = "a: \"x\\qy\"\n";
     let filter = "try (.a | length) catch \"caught\"";
-    let (output, stderr, exit_code) = run_yq_stdin_with_stderr(filter, input, &[])?;
+    let (output, stderr, exit_code) =
+        run_yq_stdin_with_stderr(filter, input, &["--jq-extensions"])?;
     assert_ne!(exit_code, 0, "should still fail\noutput: {output:?}");
     assert!(
         !output.contains("caught"),
@@ -43262,7 +43318,11 @@ fn test_yq_legal_defs_still_resolve_1473() -> Result<()> {
             "[2,5]",
         ),
     ] {
-        let (stdout, code) = run_yq_stdin(filter, "a: 1\n", &["-o", "json", "-I", "0"])?;
+        let (stdout, code) = run_yq_stdin(
+            filter,
+            "a: 1\n",
+            &["--jq-extensions", "-o", "json", "-I", "0"],
+        )?;
         assert_eq!(code, 0, "{filter}");
         assert_eq!(stdout.trim_end(), want, "{filter}");
     }
@@ -44082,7 +44142,7 @@ fn test_bound_call_stays_lazy_in_yq_mode_1371() -> Result<()> {
 #[test]
 fn test_runaway_recursion_errors_cleanly_in_yq_mode_1371() -> Result<()> {
     for (filter, args) in [
-        ("def f: [f]; f", &[][..]),
+        ("def f: [f]; f", &["--jq-extensions"][..]),
         ("isempty(def f: [f]; f)", &["--jq-extensions"][..]),
         // `first` reaches the generic evaluator's *demand-driven* `DefCall`
         // arm, a separate one from `isempty`'s route above.
@@ -44108,7 +44168,7 @@ fn test_runaway_recursion_errors_cleanly_in_yq_mode_1371() -> Result<()> {
 fn test_argument_chain_refuses_in_yq_mode_3262() -> Result<()> {
     let def = "def f(n): if n == 0 then .a else f(n - 1 | select(true)) end;";
     for (filter, args) in [
-        (format!("{def} f(3000)"), &[][..]),
+        (format!("{def} f(3000)"), &["--jq-extensions"][..]),
         (format!("first({def} f(3000))"), &["--jq-extensions"][..]),
         (
             format!("[limit(1; {def} f(3000))]"),
@@ -44138,7 +44198,7 @@ fn test_tree_recursion_stack_follows_depth_in_yq_mode_3296() -> Result<()> {
         "def fib(n): if n < 2 then n else fib(n - 1) + fib(n - 2) end; fib(24)",
         "def fib(n): if n < 2 then n else fib(n - 1) as $a | fib(n - 2) as $b | $a + $b end; fib(24)",
     ] {
-        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[])?;
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &["--jq-extensions"])?;
         assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
         assert_eq!(stdout.trim_end(), "46368", "{filter}");
     }
@@ -44155,7 +44215,7 @@ fn test_pure_chain_links_recurse_deep_in_yq_mode_3287() -> Result<()> {
         "def g(x): x - 1; def f(n): if n == 0 then 0 else f(g(n)) end;",
     ] {
         let (stdout, stderr, code) =
-            run_yq_stdin_with_stderr(&format!("{body} f(1000)"), "a: 1\n", &[])?;
+            run_yq_stdin_with_stderr(&format!("{body} f(1000)"), "a: 1\n", &["--jq-extensions"])?;
         assert_eq!(code, 0, "{body}: stderr: {stderr:?}");
         assert_eq!(stdout.trim_end(), "0", "{body}");
     }
@@ -55637,6 +55697,7 @@ mod issue_1349_inplace_presentation {
         write!(file, "{json}")?;
         let out = Command::new(env!("CARGO_BIN_EXE_succinctly"))
             .arg("yq")
+            .arg("--jq-extensions")
             .args(["-i", "-p", "json", "--doc", "0", ".a = 9"])
             .arg(file.path())
             .stdin(Stdio::null())
@@ -55651,6 +55712,7 @@ mod issue_1349_inplace_presentation {
         write!(file, "{json}")?;
         let out = Command::new(env!("CARGO_BIN_EXE_succinctly"))
             .arg("yq")
+            .arg("--jq-extensions")
             .args(["-i", "-p", "json", "--doc", "1", ".a = 9"])
             .arg(file.path())
             .stdin(Stdio::null())
@@ -55664,6 +55726,7 @@ mod issue_1349_inplace_presentation {
         write!(file, "{json}")?;
         let out = Command::new(env!("CARGO_BIN_EXE_succinctly"))
             .arg("yq")
+            .arg("--jq-extensions")
             .args(["-i", "-p", "json", "(.a = 9) | halt"])
             .arg(file.path())
             .stdin(Stdio::null())
@@ -56360,7 +56423,7 @@ fn test_map_family_bodies_see_their_members_position_2471() -> Result<()> {
 /// they were already `""` and stay `""`.
 #[test]
 fn test_owned_identity_pipe_carries_control_and_prefix_2495() -> Result<()> {
-    let args = &["-o", "json", "-I0"];
+    let args = &["--jq-extensions", "-o", "json", "-I0"];
 
     let (stdout, stderr, code) =
         run_yq_stdin_with_stderr("[.a | .[halt_error] | key]", "a:\n  b: 1\n", args)?;
@@ -57813,7 +57876,7 @@ fn test_wildcard_bridge_over_alias_fanout_completes_2173() -> Result<()> {
         // pinned on the jq side instead.
         (r#"{"k": 1}"#, "k: 1"),
     ] {
-        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, &doc, &[])?;
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, &doc, &["--jq-extensions"])?;
         assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
         assert_eq!(stdout.trim(), want, "`{filter}` -- stderr: {stderr:?}");
     }
@@ -58662,8 +58725,10 @@ fn test_alternative_forwards_its_operands_cursor_untouched_2476_2692() -> Result
     ];
 
     for (label, doc, alternative, bare) in cases {
-        let (alt_out, alt_err, alt_code) = run_yq_stdin_with_stderr(alternative, doc, &[])?;
-        let (bare_out, bare_err, bare_code) = run_yq_stdin_with_stderr(bare, doc, &[])?;
+        let (alt_out, alt_err, alt_code) =
+            run_yq_stdin_with_stderr(alternative, doc, &["--jq-extensions"])?;
+        let (bare_out, bare_err, bare_code) =
+            run_yq_stdin_with_stderr(bare, doc, &["--jq-extensions"])?;
         assert_ne!(
             alt_code, 0,
             "[{label}] `{alternative}` must still raise -- stdout {alt_out:?}"
@@ -58683,7 +58748,8 @@ fn test_alternative_forwards_its_operands_cursor_untouched_2476_2692() -> Result
     // The other half of "forwards untouched": where the bare navigation
     // answers, so does the `//`, and with the same value.
     let clean = "a:\n  q: [\"ok\", \"two\"]\n";
-    let (alt_out, _, alt_code) = run_yq_stdin_with_stderr(".a | (.q[] // 1)", clean, &[])?;
+    let (alt_out, _, alt_code) =
+        run_yq_stdin_with_stderr(".a | (.q[] // 1)", clean, &["--jq-extensions"])?;
     assert_eq!(alt_code, 0);
     assert_eq!(alt_out, "ok\ntwo\n");
 
@@ -59176,8 +59242,8 @@ mod issue_2091_def_and_binder_wrapped_writes {
             ("def f: .b = 5; f", ".b = 5"),
             ("def f: del(.b); f", "del(.b)"),
         ] {
-            let (wrapped_out, wrapped_code) = run_yq_stdin(wrapped, DOC, &[])?;
-            let (bare_out, bare_code) = run_yq_stdin(bare, DOC, &[])?;
+            let (wrapped_out, wrapped_code) = run_yq_stdin(wrapped, DOC, &["--jq-extensions"])?;
+            let (bare_out, bare_code) = run_yq_stdin(bare, DOC, &["--jq-extensions"])?;
             assert_eq!(wrapped_code, 0, "{wrapped}");
             assert_eq!(bare_code, 0, "{bare}");
             assert_eq!(wrapped_out, bare_out, "`{wrapped}` must equal `{bare}`");
@@ -59224,7 +59290,7 @@ mod issue_2091_def_and_binder_wrapped_writes {
             ("def f: map(.); f", "- 1\n- 1\n"),
             ("def f: [.]; f", "- a: 1\n  b: 1\n"),
         ] {
-            let (output, code) = run_yq_stdin(filter, DOC, &[])?;
+            let (output, code) = run_yq_stdin(filter, DOC, &["--jq-extensions"])?;
             assert_eq!(code, 0, "{filter}");
             assert_eq!(output, expected, "{filter}");
         }
@@ -59261,15 +59327,23 @@ mod issue_2091_def_and_binder_wrapped_writes {
     /// reaches them either way (#1887's triage flags `def` for gating).
     #[test]
     fn test_yaml_def_gate_is_independent_of_jq_extensions_2091() -> Result<()> {
-        for filter in [
-            "def f: .a = 99; f",
-            "99 as $v | .a = $v",
-            "def f: map(.); f",
-        ] {
-            let (plain, plain_code) = run_yq_stdin(filter, DOC, &[])?;
-            let (gated, gated_code) = run_yq_stdin(filter, DOC, &["--jq-extensions"])?;
-            assert_eq!(plain_code, gated_code, "{filter}");
-            assert_eq!(plain, gated, "{filter}");
+        // A binder-wrapped write behaves the same with and without the flag.
+        let filter = "99 as $v | .a = $v";
+        let (plain, plain_code) = run_yq_stdin(filter, DOC, &[])?;
+        let (gated, gated_code) = run_yq_stdin(filter, DOC, &["--jq-extensions"])?;
+        assert_eq!(plain_code, gated_code, "{filter}");
+        assert_eq!(plain, gated, "{filter}");
+        // `def` itself is jq-only surface (#4808): refused without the flag, and what it wraps is
+        // answered as above with it.
+        for filter in ["def f: .a = 99; f", "def f: map(.); f"] {
+            let (plain, plain_stderr, plain_code) = run_yq_stdin_with_stderr(filter, DOC, &[])?;
+            assert_eq!((plain.as_str(), plain_code), ("", 1), "{filter}");
+            assert!(
+                plain_stderr.contains("\"def\" is not part of yq's syntax"),
+                "{filter}: {plain_stderr}"
+            );
+            let (_, gated_code) = run_yq_stdin(filter, DOC, &["--jq-extensions"])?;
+            assert_eq!(gated_code, 0, "{filter}");
         }
         Ok(())
     }
@@ -59295,7 +59369,7 @@ mod issue_2091_def_and_binder_wrapped_writes {
             "def f: del(.arr[0]); f",
             "1 as $v | del(.arr[0])",
         ] {
-            let (output, code) = run_yq_stdin(filter, doc, &[])?;
+            let (output, code) = run_yq_stdin(filter, doc, &["--jq-extensions"])?;
             assert_eq!(code, 0, "{filter}");
             assert_eq!(output, expected, "{filter}");
         }
@@ -59310,7 +59384,7 @@ mod issue_2091_def_and_binder_wrapped_writes {
     fn test_yaml_wrapped_write_keeps_870_fresh_literal_rule_2091() -> Result<()> {
         let doc = "o:\n  a: \"1\" # ca\n";
         for filter in [".o = {\"a\": \"1\"}", "def f: .o = {\"a\": \"1\"}; f"] {
-            let (output, code) = run_yq_stdin(filter, doc, &[])?;
+            let (output, code) = run_yq_stdin(filter, doc, &["--jq-extensions"])?;
             assert_eq!(code, 0, "{filter}");
             assert_eq!(output, "o:\n  a: \"1\"\n", "{filter}");
         }
@@ -59330,7 +59404,7 @@ mod issue_2091_def_and_binder_wrapped_writes {
         let wrapped_filter = r#"def f: {"a": .c, "b": .a, "c": .b}; def g: f; def f: .a = 99; g"#;
         let direct_filter = r#"{"a": .c, "b": .a, "c": .b}"#;
         // The values are what this pins: `b` is 1, not clobbered by the aliased write.
-        let json = ["-o", "json", "-I", "0"];
+        let json = ["--jq-extensions", "-o", "json", "-I", "0"];
         let (wrapped, code) = run_yq_stdin(wrapped_filter, doc, &json)?;
         assert_eq!(code, 0);
         // `g` calls the `f` visible where `g` was written -- the reshaping
@@ -59342,7 +59416,7 @@ mod issue_2091_def_and_binder_wrapped_writes {
         // wrapped in a definition is not replayed and prints plain.
         let (direct, _) = run_yq_stdin(direct_filter, doc, &[])?;
         assert_eq!(direct, "a: 2\nb: &x 1\nc: *x\n");
-        let (wrapped, _) = run_yq_stdin(wrapped_filter, doc, &[])?;
+        let (wrapped, _) = run_yq_stdin(wrapped_filter, doc, &["--jq-extensions"])?;
         assert_eq!(wrapped, "a: 2\nb: 1\nc: 1\n");
         Ok(())
     }
@@ -59355,8 +59429,8 @@ mod issue_2091_def_and_binder_wrapped_writes {
             ("def f: .a = 99; def f: .b = 5; f", ".b = 5"),
             ("def g: .a = 99; def f: g; f", ".a = 99"),
         ] {
-            let (w, wc) = run_yq_stdin(wrapped, DOC, &[])?;
-            let (b, bc) = run_yq_stdin(bare, DOC, &[])?;
+            let (w, wc) = run_yq_stdin(wrapped, DOC, &["--jq-extensions"])?;
+            let (b, bc) = run_yq_stdin(bare, DOC, &["--jq-extensions"])?;
             assert_eq!(wc, 0, "{wrapped}");
             assert_eq!(bc, 0, "{bare}");
             assert_eq!(w, b, "`{wrapped}` must equal `{bare}`");
@@ -59583,8 +59657,17 @@ mod issue_1360_identity_not_jq_equality {
 #[test]
 fn test_wrong_arity_special_form_keeps_yq_parse_error_2686() -> Result<()> {
     for (filter, want_fragment, args) in [
-        ("until(1;2;3)", "expected ')', found ';'", &[][..]),
-        ("while(1;2;3)", "expected ')', found ';'", &[][..]),
+        // yq has no `until`/`while` either, so they parse only under the flag (#4808).
+        (
+            "until(1;2;3)",
+            "expected ')', found ';'",
+            &["--jq-extensions"][..],
+        ),
+        (
+            "while(1;2;3)",
+            "expected ')', found ';'",
+            &["--jq-extensions"][..],
+        ),
         ("first(1;2)", "expected ')', found ';'", &[][..]),
         // yq has no `last`, so it parses only under the flag (#3560).
         (
@@ -64252,15 +64335,15 @@ fn test_yq_fold_container_loop_variable_stays_structural_3896() -> Result<()> {
 fn test_def_spine_in_yq_mode_unchanged_3307() -> Result<()> {
     let input = "a:\n  b: 5\nb: 2\n";
     for (filter, extra, want) in [
-        ("def a: .a; def b: .b; def c: a | b; c", &[][..], "5\n"),
-        ("def a: .a; def b: .b; a | b | key", &[][..], "\"b\"\n"),
+        ("def a: .a; def b: .b; def c: a | b; c", &["--jq-extensions"][..], "5\n"),
+        ("def a: .a; def b: .b; a | b | key", &["--jq-extensions"][..], "\"b\"\n"),
         (
             "def a: .a; def b: .b; def c: a; def d: b; def e: c; def f: d; def g: e; def h: f; def i: g; def j: h; [j, i]",
-            &[][..],
+            &["--jq-extensions"][..],
             "[2,{\"b\":5}]\n",
         ),
-        ("def f(x): x + 1; def f(x; y): f(x) + y; f(2; 3)", &[][..], "6\n"),
-        ("def a: .a; def a: .b; a", &[][..], "2\n"),
+        ("def f(x): x + 1; def f(x; y): f(x) + y; f(2; 3)", &["--jq-extensions"][..], "6\n"),
+        ("def a: .a; def a: .b; a", &["--jq-extensions"][..], "2\n"),
         (
             "def a: .a; def b: .b; path(a | b)",
             &["--jq-extensions"][..],
@@ -64764,7 +64847,7 @@ fn test_yq_map_f_in_path_position_stays_by_value_3865() -> Result<()> {
         r#"(map({"k":1} | .k) | empty) = 5"#,
         r#"del(map({"k":1} | .k) | empty)"#,
     ] {
-        let (stdout, code) = run_yq_stdin(filter, doc, &["-o", "json"])?;
+        let (stdout, code) = run_yq_stdin(filter, doc, &["--jq-extensions", "-o", "json"])?;
         assert_eq!(code, 0, "`{filter}`: stdout {stdout:?}");
         assert_eq!(stdout, unchanged, "`{filter}`");
     }
@@ -67223,8 +67306,8 @@ fn test_yq_last_is_gated_behind_jq_extensions_3560() -> Result<()> {
         "last(.a[])",
         ".a | last",
         "[.a | last]",
-        // A branch that never runs is rejected too: the gate is a parse-time one.
-        "if false then last else . end",
+        // A stage that never runs is rejected too: the gate is a parse-time one.
+        ".a | select(false) | last",
     ] {
         let (_, stderr, code) = run_yq_stdin_with_stderr(filter, "a: [1, 2]\n", &[])?;
         assert_eq!(code, 1, "`{filter}`: {stderr:?}");

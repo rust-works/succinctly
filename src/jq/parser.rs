@@ -13025,11 +13025,13 @@ mod tests {
         // In jq mode (default), `keys` returns sorted order
         assert_eq!(parse("keys").unwrap(), Expr::Builtin(Builtin::Keys));
 
-        // keys_unsorted is available in both modes for explicit document order
+        // keys_unsorted is available in both modes for explicit document order (yq mode: with the flag)
         assert_eq!(
-            parse_with_mode("keys_unsorted", ParserMode::Yq).unwrap(),
+            parse_with_mode_and_extensions("keys_unsorted", ParserMode::Yq, true).unwrap(),
             Expr::Builtin(Builtin::KeysUnsorted)
         );
+        // yq has no `keys_unsorted` (#4808), so yq mode refuses it without the flag.
+        assert!(parse_with_mode("keys_unsorted", ParserMode::Yq).is_err());
         assert_eq!(
             parse("keys_unsorted").unwrap(),
             Expr::Builtin(Builtin::KeysUnsorted)
