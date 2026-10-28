@@ -18625,9 +18625,8 @@ fn test_mid_chain_identity_does_not_discard_rest_of_write_path_yq_2241() -> Resu
 /// Error: 1:6: lexer: invalid input text "def f: 5; f"        (exit 1)
 /// ```
 ///
-/// -- with or without the comma. `def` in yq mode is a pre-existing,
-/// separately-scoped succinctly extension (an ungated one, unlike #1512's
-/// family), and `Expr::FuncDef`'s `then` clause is a full `Exp` in both
+/// -- with or without the comma. `def` in yq mode is a succinctly
+/// extension (gated behind `--jq-extensions` since #4808), and `Expr::FuncDef`'s `then` clause is a full `Exp` in both
 /// modes, so the comma lands *inside* the pipe's right-hand side either way
 /// and #2420's precedence swap leaves the expectations below unchanged. The
 /// row is recorded here rather than silently left as an unverified

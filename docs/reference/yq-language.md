@@ -54,7 +54,7 @@ Most of the [jq Language Reference](jq-language.md) works with yq, but real yq's
 
 - Path expressions (`.foo`, `.[0]`, `.[]`, `..`)
 - Operators (arithmetic, comparison, boolean, pipe, comma)
-- Array/object operations (`keys`, `values`, `sort`, `group_by`, etc.)
+- Array/object operations (`keys`, `sort`, `group_by`, etc.)
 - String functions (`split`, `join`, `test`, `match`, etc.)
 - Control flow through yq's own forms (`select`, `//`, `with`); `if`/`then`/`else`, `try`/`catch`, `reduce`, `foreach` and `label` need `--jq-extensions`
 - User-defined functions (`def name: body;`) need `--jq-extensions`
@@ -602,10 +602,10 @@ succinctly yq 'at_position(5; 3)' config.yaml
 ### `if` with no `else`
 
 Real yq's lexer rejects `if` outright, so `succinctly yq`'s support for it is itself an
-extension (see the construct list just below). It matches jq 1.7's own definition rather
+extension, gated behind `--jq-extensions` (#4808; see the construct list just below). It matches jq 1.7's own definition rather
 than inventing a separate yq answer: `if A then B end` desugars to `if A then B else . end`,
 so a falsy condition passes the input through unchanged, not `null` (#3408) —
-`printf 'a: false\n' | succinctly yq '.a | if . then "x" end'` is `false`, not `null`.
+`printf 'a: false\n' | succinctly yq --jq-extensions '.a | if . then "x" end'` is `false`, not `null`.
 
 ### `any_c(f)` / `all_c(f)`
 

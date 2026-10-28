@@ -14596,6 +14596,20 @@ mod tests {
             }
         }
 
+        // `def` is gated at two sites: the program's leading definitions and a `def` inside an
+        // expression. The probes above only start with one, so pin the nested one on its own.
+        for program in [". | def f: .; f", "(def f: .; f)", "\"\\(def f: 1; f)\""] {
+            assert!(
+                parse_program_with_mode_and_extensions(program, ParserMode::Yq, false)
+                    .is_err_and(|e| e.to_string().contains(GATE_MESSAGE)),
+                "`{program}` is not refused without --jq-extensions"
+            );
+            assert!(
+                parse_program_with_mode_and_extensions(program, ParserMode::Yq, true).is_ok(),
+                "`{program}` does not parse with --jq-extensions"
+            );
+        }
+
         // A continuation word is reachable only through its opener, so the opener has to be gated
         // (and the full form has to parse once the flag is on, or the word is dead surface).
         for (word, opener, program) in GATED_WITH_OPENER {

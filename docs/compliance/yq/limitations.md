@@ -6034,14 +6034,14 @@ extension under ADR-0018 rule 5 -- a decision this entry doesn't make, only surf
 The caps `succinctly jq` documents -- `MAX_RANGE_TOTAL`, `MAX_LOOP_ROUNDS` (which a tail-recursive `def` shares with `while`/`until`, #5379), `WHILE_UNTIL_MAX_STEPS`,
 `REDUCE_FOREACH_MAX_STEPS`, `repeat`'s `MAX_ITERATIONS`, `MAX_EVAL_FRAMES` -- are shared
 evaluator limits, so they apply to `succinctly yq` as well; real yq v4.53.3 has none of them.
-The reachable ones without `--jq-extensions` are `while`/`until` and a recursive `def`
-(`range`/`repeat` are gated, #1512). Since #2132 the raise is `ErrorKind::ResourceLimit`,
+The reachable ones are `while`/`until` and a recursive `def`, both behind `--jq-extensions` since #4808
+(`range`/`repeat` are gated too, #1512). Since #2132 the raise is `ErrorKind::ResourceLimit`,
 which `?`/`try`/`catch` never swallow, in both modes alike:
 
 ```console
-$ printf 'a: 1\n' | succinctly yq '[.a | while(true; (1, 2))] | length'
+$ printf 'a: 1\n' | succinctly yq --jq-extensions '[.a | while(true; (1, 2))] | length'
 Error: while: maximum iterations exceeded
-$ printf 'a: 1\n' | succinctly yq 'def f: f; try f catch "caught"'
+$ printf 'a: 1\n' | succinctly yq --jq-extensions 'def f: f; try f catch "caught"'
 Error: f/0 exceeded maximum recursion depth
 ```
 
@@ -6129,7 +6129,7 @@ The rest: `in`, `keys_unsorted`, `ltrim`, `rtrim`, `utf8bytelength`, `toboolean`
 The owner chose to gate all of them in one change, before the next release, rather than group by group or keep them ungated: nothing released has the gate, so one release note covers it, and the old split (`reduce`, `limit` and `last` gated while `def`, `if` and `try` were not) had no principled line.
 Little capability is lost: yq's `keys` already keeps document order, `..` is its recursion, `select(tag == "!!str")` is its type selector, `trim` covers `ltrim`/`rtrim`, and `select`, `//` and `with` cover `if`.
 A script that uses one of these under `succinctly yq` adds `--jq-extensions`, and the error already names it.
-`every_parsed_keyword_is_classified_for_the_jq_extensions_gate_1887` (`src/jq/parser.rs`) enforces the classification: every keyword the parser matches is gated, gated with its opener (`then`, `elif`, `else`, `end`, `catch`), a yq-native name, or listed in `BY_DESIGN`.
+`every_parsed_keyword_is_classified_for_the_jq_extensions_gate_1887` (`src/jq/parser.rs`) enforces the classification: every keyword the parser matches is gated, gated by call form (`all`, `any`, `path`), gated with its opener (`then`, `elif`, `else`, `end`, `catch`), a yq-native name, or listed in `BY_DESIGN`.
 `succinctly jq` is unchanged.
 
 The same gate covers the jq-styled **object-construction sugar** real yq's lexer rejects:
