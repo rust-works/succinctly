@@ -6161,6 +6161,10 @@ The same gate covers bare `env` and the `@text` and `@html` formats ([#5444](htt
 Real yq's lexer rejects all three (`invalid input text`), while `env(NAME)`, `strenv(NAME)` and its other formats are accepted and stay available by default.
 `@dsv` is wholly new syntax and stays unconditional.
 
+Two more jq-syntax forms real yq's lexer rejects sit behind the flag ([#5452](https://github.com/rust-works/succinctly/issues/5452)): a string literal inside a `\(...)` interpolation slot (`"\(.a // "d")"`, yq ends the slot at the first `"`) and a number with a trailing dot (`5.`, `1. + 1`; yq answers `bad expression`).
+Whitespace between a `.` and a name, a quote or a bracket (`. a`, `. "a"`, `.a . b`) is refused outright in yq mode with or without the flag, as jq refuses it too (#5447).
+The root metadata write (`. style = "flow"`, #798) and the terminators after a gap (`. and`, `. as`, `. == 1`) are unchanged.
+
 `gsub`/`scan`/`splits` specifically: real yq's lexer rejects all three outright, at any
 arity ([#1436](https://github.com/rust-works/succinctly/issues/1436)) — this isn't "3-arg
 `gsub` diverges," it's that yq's grammar has no `gsub`/`scan`/`splits` token at all:
