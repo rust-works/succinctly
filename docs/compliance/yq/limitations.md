@@ -4261,7 +4261,8 @@ reads as a plain `!!str`, and an alias element (`*x`) as the value it names (`ma
 `[!!float 1, !!binary aGk=, &x !!str 5, *x]` is `["!!float","!!binary","!!str",""]` in yq,
 `["!!float","!!str","!!str","!!str"]` after a slice here; without the slice both agree). How a
 sliced value's tag is *rendered* in YAML output (`- !!str 2` vs `- "2"`) is the missing explicit-tag
-slot, [#1416](https://github.com/rust-works/succinctly/issues/1416), for a computed-bound slice.
+slot, [#1416](https://github.com/rust-works/succinctly/issues/1416).
+That holds for a computed-bound slice.
 A literal-bound slice (`.[1:]`, `.a[:2]`) keeps each element's tag, comment, anchor and quoting (#5429).
 
 ### `.[]` over a non-container is now a silent no-op — two residual gaps remain (#2346)

@@ -25,12 +25,7 @@ pub(super) fn supported(expr: &Expr) -> bool {
         Expr::Pipe(parts) => parts.iter().all(supported),
         Expr::Arithmetic {
             op, left, right, ..
-        } => {
-            !matches!(op, ArithOp::Mul(flags) if flags.append_arrays || flags.only_existing
-                || flags.only_new || flags.deep_merge_arrays || flags.clobber_tags)
-                && supported(left)
-                && supported(right)
-        }
+        } => plain_op(op) && supported(left) && supported(right),
         Expr::Builtin(
             Builtin::Keys | Builtin::KeysUnsorted | Builtin::ToEntries | Builtin::FromEntries,
         ) => true,
@@ -45,6 +40,13 @@ pub(super) fn supported(expr: &Expr) -> bool {
         Expr::Update { path, filter } => static_path(path) && supported(filter),
         _ => false,
     }
+}
+
+/// Whether `op` is one whose result tree is built by [`merge_tree`]: not a `*` with a merge flag
+/// (`*+`, `*?`, `*n`, `*d`, `*c`), whose merge rules it does not follow.
+fn plain_op(op: &ArithOp) -> bool {
+    !matches!(op, ArithOp::Mul(flags) if flags.append_arrays || flags.only_existing
+        || flags.only_new || flags.deep_merge_arrays || flags.clobber_tags)
 }
 
 /// Whether `expr` replays a `pick`. The replay reads the presentation of the whole document, where
@@ -307,7 +309,7 @@ fn entry_pair<C: DocumentCursor>(e: &Expr, root: &C, depth: usize) -> Option<Res
         Expr::Paren(inner) => entry_pair(inner, root, depth + 1),
         Expr::Arithmetic {
             op, left, right, ..
-        } => {
+        } if plain_op(op) => {
             let l = entry_pair(left, root, depth + 1)?;
             let r = entry_pair(right, root, depth + 1)?;
             let sum = Expr::arithmetic(
@@ -394,12 +396,13 @@ fn construct<C: DocumentCursor>(expr: &Expr, root: &C, depth: usize) -> Option<R
             ))
         }
         Expr::Slice { start, end, .. } => {
-            let elements = root.value().as_array()?;
-            let range = succinctly::jq::literal_slice_range(*start, *end, elements.len());
+            // One walk of the sequence: `get_cursor` per kept element walks it again each time.
+            let cursors = root.value().as_array()?.collect_cursors();
+            let range = succinctly::jq::literal_slice_range(*start, *end, cursors.len());
             let mut values = Vec::with_capacity(range.len());
             let mut trees = Vec::with_capacity(range.len());
-            for at in range {
-                let (v, t) = node_pair_as(&elements.get_cursor(at)?, true).ok()?;
+            for node in &cursors[range] {
+                let (v, t) = node_pair_as(node, true).ok()?;
                 values.push(v);
                 trees.push(t);
             }
@@ -634,8 +637,9 @@ fn trace_at_depth(
             }
             _ => next(&Expr::Builtin(Builtin::Map(f.clone())), input),
         },
-        // `flatten` keeps every leaf's own node (#5429); the result is checked against the
-        // authoritative one, so a depth this does not read the same way is the plain route's.
+        // `flatten` keeps every leaf's own node (#5429). The value is built here too, and the caller
+        // compares it with the authoritative one, so a depth this reads differently is the plain
+        // route's.
         Expr::Builtin(Builtin::Flatten | Builtin::FlattenDepth(_)) => {
             let depth = match expr {
                 Expr::Builtin(Builtin::FlattenDepth(depth)) => {
@@ -646,22 +650,20 @@ fn trace_at_depth(
                         _ => return None,
                     }
                 }
-                _ => 256,
+                _ => usize::MAX,
             };
-            let result = evaluated(expr, value)?;
+            let mut values = Vec::new();
             let mut trees = Vec::new();
-            flatten_trees(value, tree, depth, &mut trees)?;
-            // patchcov: coverage tolerate reason="unreachable: `flatten` of a value that is not a sequence raised in `evaluated` above (#5429)"
-            let OwnedValue::Array(flat) = &result else {
-                return None;
-            };
-            // patchcov: coverage end
+            flatten_pairs(value, tree, depth, &mut values, &mut trees)?;
             // A trailing comment of the sequence is not carried: yq drops it, as it does the
             // comment above a sequence that `flatten` dissolves.
             let meta = tree
                 .meta()
                 .with_head_foot(tree.meta().head_comment().to_vec(), Vec::new());
-            (flat.len() == trees.len()).then(|| (result.clone(), CommentTree::Array(meta, trees)))
+            Some((
+                OwnedValue::Array(values.into_iter().collect()),
+                CommentTree::Array(meta, trees),
+            ))
         }
         Expr::Builtin(Builtin::Map(f)) => {
             let OwnedValue::Array(items) = value else {
@@ -703,15 +705,16 @@ fn trace_at_depth(
     }
 }
 
-/// The trees of the elements `flatten` keeps, in order: those of the nested sequences' own
-/// elements down to `depth` levels, and of every other element as it stands (#5429).
-fn flatten_trees(
+/// The elements `flatten` keeps, with their trees, in order: those of the nested sequences' own
+/// elements down to `depth` levels, and every other element as it stands (#5429).
+fn flatten_pairs(
     value: &OwnedValue,
     tree: &CommentTree,
     depth: usize,
-    out: &mut Vec<CommentTree>,
+    values: &mut Vec<OwnedValue>,
+    trees: &mut Vec<CommentTree>,
 ) -> Option<()> {
-    // patchcov: coverage tolerate reason="unreachable: the first call holds a sequence (see the caller) and a recursive call is made on one (#5429)"
+    // patchcov: coverage tolerate reason="unreachable: the first call holds a sequence (`flatten` of anything else raised in the authoritative evaluation, which decides before this tree is used) and a recursive call is made on one (#5429)"
     let OwnedValue::Array(items) = value else {
         return None;
     };
@@ -719,9 +722,12 @@ fn flatten_trees(
     for (i, item) in items.iter().enumerate() {
         match item {
             OwnedValue::Array(_) if depth > 0 => {
-                flatten_trees(item, tree.at_index(i), depth - 1, out)?;
+                flatten_pairs(item, tree.at_index(i), depth - 1, values, trees)?;
             }
-            _ => out.push(tree.at_index(i).clone()),
+            _ => {
+                values.push(item.clone());
+                trees.push(tree.at_index(i).clone());
+            }
         }
     }
     Some(())
