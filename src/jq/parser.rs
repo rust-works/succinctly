@@ -14465,8 +14465,9 @@ mod tests {
             "walk",
             "while",
         ];
-        /// yq has the name, but not this call form (`all(f)`, `any(f)`, `path(f)`); the form is gated.
-        const GATED_BY_CALL_FORM: &[&str] = &["all", "any", "path"];
+        /// yq has the name, but not this call form (`all(f)`, `any(f)`, `path(f)`, a bare `env`); the
+        /// form is gated.
+        const GATED_BY_CALL_FORM: &[&str] = &["all", "any", "env", "path"];
         /// Words that only continue a gated opener (`if` ... `then` ... `end`, `try` ... `catch`): each is
         /// listed with the opener that has to refuse first, since the word cannot start a filter of its own.
         const GATED_WITH_OPENER: &[(&str, &str, &str)] = &[
@@ -14492,7 +14493,6 @@ mod tests {
             "di",
             "document_index",
             "downcase",
-            "env",
             "envsubst",
             "error",
             "explode",
