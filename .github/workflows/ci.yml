@@ -510,20 +510,24 @@ jobs:
   # (max 0.3) with 3-4 legs per run, and 22 of 24 six-leg runs had a leg wait 1-7 min, about
   # the runtime of the shortest sibling. GitHub does not start matrix legs in include order
   # (the last to start was any of the six), so putting the long legs first does not help.
-  # A run therefore keeps its macOS legs at five or fewer: `simd`, the one with a
-  # macOS-only signal (NEON-only dispatch, no SVE2), stays alone, and `portable-popcount`
-  # and `no-std` share a leg.
+  # A run therefore kept its macOS legs at five.
   #
-  # #3649's weekday measurement (Oct 21-28, 678 five-leg runs) then showed that was not
-  # enough. The suite had grown: a run spent 37 macOS-minutes (24 on Oct 4), `cli-gated` ran
-  # 11.8 min and `popcount-no-std` 8.8 (p90 15.5). macOS was the last job to finish in 207 of
-  # 216 merge-group runs, and a run's own five legs fill the five concurrent slots, so any
-  # second run queues: merge-group wall-clock p50 16.1 / p90 26.9 min (9.3 / 10.0 on Oct 3),
-  # worst macOS queue wait per run p50 4.5 / p90 14.2 min. The `popcount-no-std` leg is
-  # therefore gone from macOS, the step the paragraph above named: #3655 found no signal in
-  # `portable-popcount` or `no-default-features` that ARM64 Linux lacks, and both still run
-  # there. What macOS no longer builds is `no-default-features` under Apple's own toolchain
-  # (#2123's gap was `target_arch = "aarch64"` code, which the Linux ARM64 leg covers too).
+  # #3649's weekday measurement (Oct 21-28, 678 runs with macOS jobs, 604 with all five legs;
+  # full table on the #3649 thread) then showed five was still too many. The suite had grown:
+  # a run spent 37 macOS-minutes (24 on Oct 4), `cli-gated` ran 11.8 min and the
+  # `portable-popcount` + `no-std` leg 8.8 (p90 15.5). macOS was the last job to finish in
+  # 207 of 216 merge-group runs, and a run's own five legs fill the five concurrent slots, so
+  # any second run queues: merge-group wall-clock p50 16.1 / p90 26.9 min (9.3 / 10.0 on
+  # Oct 3), worst macOS queue wait per run p50 4.5 / p90 14.2 min.
+  #
+  # The matrix is now FOUR legs: `cli-gated`, `orchestrate-default`, `deep-recursion` and
+  # `simd`. The `portable-popcount` + `no-std` leg was dropped, the step this comment named
+  # before: #3655 found no signal in either that ARM64 Linux lacks, and both still run on the
+  # ARM64 Linux and x86_64 matrices. The coverage given up, accepted on #3649: `portable-
+  # popcount` and `no-default-features` are no longer built under Apple's toolchain, so a
+  # bug that only that toolchain or macOS-only std behaviour exposes there (the #2123 class:
+  # `target_arch = "aarch64"` test modules reached without `std`) is now caught only on
+  # Linux ARM64. Re-adding a leg costs a slot per run; re-measure the queue first.
   test-macos-arm:
     name: Test (macOS ARM64)
     needs: [gate, test-macos-arm-matrix]
