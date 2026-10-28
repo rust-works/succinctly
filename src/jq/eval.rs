@@ -496,7 +496,7 @@ use super::expr::{
     retention_scope, ArithOp, ArithSettleMemo, AssignOp, BindOrigin, BoundBody, Builtin, CompareOp,
     Expr, FormatType, FuncDefBound, FuncDefData, Libm1, Libm2, Libm3, Literal, MergeFlags,
     MetaSlot, NumberKey, ObjectEntry, ObjectKey, Origin, Param, Pattern, PatternEntry, PipeStages,
-    SharedArg, SliceBoundKey, StringPart, TailPlan, Tracked,
+    SharedArg, SliceBoundKey, StageClass, StringPart, TailPlan, Tracked,
 };
 use super::value::{
     assert_value_tree_depth, check_value_tree_depth, cmp_f64, document_number_f64,
@@ -11689,7 +11689,7 @@ impl<'a> RestPipe<'a> {
     }
 
     /// A rest that is the tail of a pipe, whose owner keeps the owned copy
-    /// ([`RestTail::kept_copy`], #5417).
+    /// ([`RestTail::plan`], #5417).
     pub(crate) fn of_tail(tail: RestTail<'a>) -> Self {
         Self {
             stages: tail.stages,
@@ -11778,17 +11778,14 @@ impl<'a> RestPipe<'a> {
         // A rest of several stages: the copy the owner keeps, once it keeps one
         // (#5417); this `RestPipe`'s own, built on the first call, otherwise.
         let kept;
-        let whole = match lone.is_none().then(|| self.tail().plan()) {
+        let whole = match lone.is_none().then(|| self.tail().plan::<S>()) {
             Some(TailPlan::Whole(copy)) => {
                 kept = copy;
                 kept.expr()
             }
             Some(TailPlan::Split) => {
                 let tail = self.tail();
-                self.copy.split_pipe(|| {
-                    let owner = tail.owner.expect("only a tail with an owner splits");
-                    split_tail_of(owner, owner.len() - tail.stages.len())
-                })
+                self.copy.split_pipe(|| tail.split())
             }
             Some(TailPlan::Copy) | None => self.copy.owned_pipe(self.stages),
         };
@@ -28424,7 +28421,7 @@ fn promote_and_extend<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ///
 /// What lets [`eval_owned_pipe`] hand a rest of several stages on without
 /// copying it per call: the owner keeps one copy of each tail
-/// ([`PipeStages::kept_tail`]). The owner and the offset are the one value the
+/// ([`PipeStages::tail_plan`]). The owner and the offset are the one value the
 /// pipe drivers take in place of the slice, which [`Self::stages`] derives from
 /// them, so the stages evaluated and the tail kept cannot disagree.
 ///
@@ -28465,8 +28462,8 @@ impl<'p> PipeTail<'p> {
     }
 
     /// What the owner hands on for these stages ([`tail_plan_of`]).
-    fn plan(self) -> TailPlan {
-        tail_plan_of(self.owner, self.from)
+    fn plan<S: EvalSemantics>(self) -> TailPlan {
+        tail_plan_of::<S>(self.owner, self.from)
     }
 }
 
@@ -28525,27 +28522,66 @@ impl<'p> RestTail<'p> {
 
     /// What the owner hands on for these stages ([`PipeTail::plan`]); a tail
     /// with no owner is copied.
-    pub(crate) fn plan(self) -> TailPlan {
+    pub(crate) fn plan<S: EvalSemantics>(self) -> TailPlan {
         match self.owner {
-            Some(owner) => tail_plan_of(owner, owner.len() - self.stages.len()),
+            Some(owner) => tail_plan_of::<S>(owner, owner.len() - self.stages.len()),
             None => TailPlan::Copy,
+        }
+    }
+
+    /// The stages that stand for these stages once [`Self::plan`] has split
+    /// them; the stages themselves for a tail with no owner.
+    pub(crate) fn split(self) -> Vec<Expr> {
+        match self.owner {
+            Some(owner) => split_tail_of(owner, owner.len() - self.stages.len()),
+            None => self.stages.to_vec(),
         }
     }
 }
 
 /// What `owner` hands on for its stages from `from` on ([`PipeStages::tail_plan`]).
 ///
-/// A tail, or a run of stateless stages in one that holds evaluation state
+/// A tail, or a run of stages in one that holds evaluation state
 /// ([`holds_evaluation_state`], #3148), is kept up to [`MAX_KEPT_TAIL_NODES`]
-/// nodes.
-fn tail_plan_of(owner: &PipeStages, from: usize) -> TailPlan {
-    owner.tail_plan(from, holds_evaluation_state, may_keep_run)
+/// nodes. Only jq mode splits a tail (#5421): yq's first-stage rule for a
+/// failing generator ([`eval_pipe`]) reads the first stage of a pipe, and a run
+/// is one.
+fn tail_plan_of<S: EvalSemantics>(owner: &PipeStages, from: usize) -> TailPlan {
+    owner.tail_plan(from, classify_stage, S::TAG == EvalTag::Jq, may_keep_run)
 }
 
 /// The stages that stand for the tail of `owner` from `from` on, once
 /// [`tail_plan_of`] has split it (#5421).
 fn split_tail_of(owner: &PipeStages, from: usize) -> Vec<Expr> {
+    #[cfg(test)]
+    owned_pipe_copies::bump();
     owner.split_tail(from, may_keep_run)
+}
+
+/// What a stage of a pipe is to [`PipeStages::tail_plan`] (#5421).
+///
+/// A run is inside an `Expr::Shared` the pipe's evaluation reads as one stage,
+/// so it holds only stages that make the same evaluation there as in the pipe:
+/// one output at most, no effect, no state of its own (a `?//` bind retries
+/// across the stages after it, `,` and `range` fan out, `debug` and `input`
+/// order effects). The doors of the owned evaluator look at the head of a pipe
+/// for navigation, `select`, `as` and nested pipes; none of those is a run.
+fn classify_stage(stage: &Expr) -> StageClass {
+    if holds_evaluation_state(stage) {
+        StageClass::Stateful
+    } else if run_safe(stage) {
+        StageClass::Run
+    } else {
+        StageClass::Barrier
+    }
+}
+
+/// Whether `stage` may be inside a run ([`classify_stage`]).
+fn run_safe(stage: &Expr) -> bool {
+    matches!(
+        unwrap_paren(stage),
+        Expr::Arithmetic { .. } | Expr::Compare { .. } | Expr::Literal(_) | Expr::Negate(_)
+    ) && single_valued_pure(stage, None, &mut PureWalk::new(false)) == Some(false)
 }
 
 /// Whether a tail or a run of stateless stages is small enough to keep: no
@@ -28907,36 +28943,37 @@ fn eval_owned_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // drive; here each element is its own call, so the pipe of the program that
     // owns the rest keeps one for it (#5404) -- built per call, a chain of `n`
     // stages over one value copied `n - 1`, `n - 2`, ... of them, and each copy
-    // re-ran the analyses a pipe asks of itself. A pipe's first value, a pipe too
-    // long to keep copies for, and a rest holding evaluation state are copied per
-    // call.
+    // re-ran the analyses a pipe asks of itself. A pipe's first value and a pipe too
+    // long to keep copies for are copied per call; a rest holding evaluation state
+    // is kept in pieces when it is long enough (#5421), copied per call otherwise.
     //
     // One call to `eval_owned_input` below, not one per branch: it is
     // `#[inline(always)]`, so a second call site would emit its large body twice
     // in this recursive function.
     let kept;
-    let split;
-    let copy;
+    let built;
     let rest: &Expr = match exprs {
         [stage] if !holds_evaluation_state(stage) => stage,
-        _ => match tail.plan() {
+        _ => match tail.plan::<S>() {
             TailPlan::Whole(whole) => {
                 kept = whole;
                 kept.expr()
             }
-            TailPlan::Split => {
-                split = Expr::Pipe(split_tail_of(tail.owner, tail.from).into());
-                &split
-            }
-            TailPlan::Copy => {
-                #[cfg(test)]
-                owned_pipe_copies::bump();
-                copy = if exprs.len() == 1 {
-                    exprs[0].clone()
+            // One local for both: two `Expr`s that are never live together
+            // each cost this recursive function a slot of its frame.
+            plan => {
+                built = if matches!(plan, TailPlan::Split) {
+                    Expr::Pipe(tail.sink().split().into())
                 } else {
-                    Expr::Pipe(exprs.to_vec().into())
+                    #[cfg(test)]
+                    owned_pipe_copies::bump();
+                    if exprs.len() == 1 {
+                        exprs[0].clone()
+                    } else {
+                        Expr::Pipe(exprs.to_vec().into())
+                    }
                 };
-                &copy
+                &built
             }
         },
     };
@@ -75794,7 +75831,7 @@ fn substitute_var_impl(
             if (3..=crate::jq::expr::MAX_KEPT_TAIL_STAGES).contains(&stages.len())
                 && !stages.holds_var_or_init(|stages| stages.iter().any(holds_var))
             {
-                rebuilt.share_tails_of(stages, holds_evaluation_state);
+                rebuilt.share_tails_of(stages, classify_stage);
             }
             Expr::Pipe(rebuilt)
         }
@@ -111931,75 +111968,73 @@ mod tests {
     }
 
     /// #5421: a `def` call in the tail of a pipe no longer makes every tail
-    /// that contains it copy per value. The stateless run before the call is
-    /// kept like any tail and only the call is copied afresh, so a pipe of the
-    /// program copies nothing more for forty values than for four, down the
-    /// array constructor's route and the streaming drivers' alike, with the
-    /// call at the end of the pipe, in the middle, and twice. A parenthesized
-    /// pipe holding the call is one stage, cloned for each value (a node
-    /// remembers what evaluation did to it, #3148), and its copies per value are
-    /// the stages' own, not those of every tail of them.
+    /// that contains it copy per value. The runs of stages before the call are
+    /// kept like any tail and only the call (and a stage that is not in a run)
+    /// is copied afresh, so forty values copy no more than four do plus a few
+    /// stages each, down the array constructor's route and the streaming
+    /// drivers' alike, with the call at the end of the pipe, in the middle, and
+    /// twice. `eval_full` runs a parenthesized pipe as one cloned stage; the
+    /// generic route the CLI takes is pinned in `eval_generic`.
     #[test]
     fn test_pipe_tail_holding_a_def_call_copies_only_the_call_per_value_5421() {
-        fn run<S: EvalSemantics>() {
-            const STAGES: usize = 10;
-            let t = [". + 1"; STAGES].join(" | ");
-            let shapes = [
-                ("end", format!("{t} | f"), STAGES + 1, 1),
-                ("middle", format!("{t} | f | {t}"), 2 * STAGES + 1, 1),
-                ("twice", format!("f | {t} | f | {t} | f"), 2 * STAGES + 3, 3),
+        const STAGES: usize = 10;
+        let t = [". + 1"; STAGES].join(" | ");
+        let shapes = [
+            ("end", format!("{t} | f"), STAGES + 1, 1),
+            ("middle", format!("{t} | f | {t}"), 2 * STAGES + 1, 1),
+            ("twice", format!("f | {t} | f | {t} | f"), 2 * STAGES + 3, 3),
+        ];
+        for (place, pipe, added, calls) in shapes {
+            let templates = [
+                ("collect", format!("[range(0;N) | {pipe}] | add")),
+                (
+                    "select",
+                    format!("[range(0;N) | {pipe} | select(. > 0)] | add"),
+                ),
+                ("last", format!("last(range(0;N) | {pipe})")),
+                ("limit", format!("[limit(100; range(0;N) | {pipe})] | add")),
             ];
-            for (place, pipe, added, calls) in shapes {
-                for parenthesized in [false, true] {
-                    let pipe = if parenthesized {
-                        format!("({pipe})")
+            for (consumer, template) in templates {
+                let template = format!("def f: . + 1; {template}");
+                for (tag, copies) in [
+                    ("jq", copies_5421::<JqSemantics>(&template, added)),
+                    ("yq", copies_5421::<YqSemantics>(&template, added)),
+                ] {
+                    let (settled, many, output, want) = copies;
+                    let more = many - settled;
+                    // The call, a stage that is not in a run (`select`), and the
+                    // clone of the split itself, for each value; yq does not split.
+                    let allowed = if tag == "jq" {
+                        36 * (calls + 3)
                     } else {
-                        pipe.clone()
+                        usize::MAX
                     };
-                    let templates = [
-                        ("collect", format!("[range(0;N) | {pipe}] | add")),
-                        (
-                            "select",
-                            format!("[range(0;N) | {pipe} | select(. > 0)] | add"),
-                        ),
-                        ("last", format!("last(range(0;N) | {pipe})")),
-                        ("limit", format!("[limit(100; range(0;N) | {pipe})] | add")),
-                    ];
-                    for (consumer, template) in templates {
-                        let template = format!("def f: . + 1; {template}");
-                        let run_for = |n: usize| {
-                            run_owned_pipe_program::<S>(
-                                &template.replace('N', &n.to_string()),
-                                b"null",
-                            )
-                        };
-                        let (settled, many) = (run_for(4), run_for(40));
-                        let want = match consumer {
-                            "last" => (39 + added).to_string(),
-                            _ => (0..40).map(|i| i + added).sum::<usize>().to_string(),
-                        };
-                        let what = format!(
-                            "{place}/{consumer}/{} ({:?})",
-                            if parenthesized { "paren" } else { "bare" },
-                            S::TAG
-                        );
-                        assert_eq!(many.output, want, "{what}");
-                        let more = many.copies - settled.copies;
-                        // A pipe of the program copies its last few stages whole and
-                        // the call itself, a constant per value; the clone of a
-                        // parenthesized one is a pipe of its own for each value, and
-                        // copies per stage, not per stage of every tail.
-                        let allowed = 36 * if parenthesized { 3 * STAGES } else { calls + 1 };
-                        assert!(
-                            more <= allowed,
-                            "{what}: forty values copy {more} more than four do, {allowed} allowed"
-                        );
-                    }
+                    assert_eq!(output, want, "{place}/{consumer} ({tag})");
+                    assert!(
+                        more <= allowed,
+                        "{place}/{consumer} ({tag}): forty values copy {more} more than four do, {allowed} allowed"
+                    );
                 }
             }
         }
-        run::<JqSemantics>();
-        run::<YqSemantics>();
+    }
+
+    /// What [`test_pipe_tail_holding_a_def_call_copies_only_the_call_per_value_5421`]
+    /// measures for one program: the copies for four and for forty values, the
+    /// output, and the output it must have.
+    fn copies_5421<S: EvalSemantics>(
+        template: &str,
+        added: usize,
+    ) -> (usize, usize, String, String) {
+        let run_for =
+            |n: usize| run_owned_pipe_program::<S>(&template.replace('N', &n.to_string()), b"null");
+        let (settled, many) = (run_for(4), run_for(40));
+        let want = if template.contains("last(") {
+            (39 + added).to_string()
+        } else {
+            (0..40).map(|i| i + added).sum::<usize>().to_string()
+        };
+        (settled.copies, many.copies, many.output, want)
     }
 
     /// #5424: a body rebuilt for each value that reads no variable hands on the
@@ -112170,14 +112205,14 @@ mod tests {
         assert!(core::ptr::eq(rest.stages(), &stages[1..]));
         assert_eq!(rest.rest().stages().len(), 2);
         assert!(
-            matches!(whole.rest().rest().plan(), TailPlan::Copy),
+            matches!(whole.rest().rest().plan::<JqSemantics>(), TailPlan::Copy),
             "the first ask keeps nothing"
         );
         assert!(
-            matches!(whole.rest().rest().plan(), TailPlan::Whole(kept) if matches!(kept.expr(), Expr::Pipe(tail) if tail.len() == 2))
+            matches!(whole.rest().rest().plan::<JqSemantics>(), TailPlan::Whole(kept) if matches!(kept.expr(), Expr::Pipe(tail) if tail.len() == 2))
         );
         assert!(
-            matches!(rest.rest().rest().plan(), TailPlan::Copy),
+            matches!(rest.rest().rest().plan::<JqSemantics>(), TailPlan::Copy),
             "a lone stage is handed on as itself, not kept"
         );
     }
