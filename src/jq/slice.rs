@@ -55,6 +55,19 @@ pub(crate) fn large_container_sliced() -> bool {
     }
 }
 
+/// The element range `.[start:end]` names against `len` elements, for the bounds the parser
+/// folded to integers (#5429): the evaluator's own rule, for a caller that reads the elements of a
+/// slice it has already evaluated. Like [`SliceBounds::resolve_walk`] it leaves the
+/// [`large_container_sliced`] gate (#5118) alone, which the evaluating slice has raised itself.
+#[doc(hidden)]
+pub fn literal_slice_range(
+    start: Option<i64>,
+    end: Option<i64>,
+    len: usize,
+) -> core::ops::Range<usize> {
+    SliceBounds::from_literals(start, end).resolve_walk(len)
+}
+
 /// A validated slice path component, before it is resolved against a length.
 ///
 /// `None` is jq's `null` bound, which means "the end of the container on this

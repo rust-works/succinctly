@@ -99,6 +99,8 @@ mod parser;
 pub mod path_mode;
 pub mod resolve;
 mod slice;
+#[doc(hidden)]
+pub use slice::literal_slice_range;
 pub mod stream;
 mod tail_call;
 pub mod utf8_document;

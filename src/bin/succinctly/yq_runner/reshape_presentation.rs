@@ -9,9 +9,9 @@ use super::{
     NodeMeta, NumberRepr, OwnedValue, ResultWithComments,
 };
 use succinctly::jq::document::{DocumentCursor, DocumentElements, DocumentFields, DocumentValue};
-use succinctly::jq::eval_generic::{to_owned_with_comments, AnchorMark, KeyMeta};
+use succinctly::jq::eval_generic::{to_owned_with_comments, AnchorMark, KeyMeta, LazyElem};
 use succinctly::jq::YqSemantics;
-use succinctly::jq::{ArithOp, Builtin, ObjectKey, MAX_VALUE_TREE_DEPTH};
+use succinctly::jq::{ArithOp, Builtin, EvalError, ObjectKey, MAX_VALUE_TREE_DEPTH};
 
 /// A deliberately small allowlist: no variables, environment reads, I/O,
 /// clock/random functions, path registers, user functions or control effects.
@@ -25,25 +25,28 @@ pub(super) fn supported(expr: &Expr) -> bool {
         Expr::Pipe(parts) => parts.iter().all(supported),
         Expr::Arithmetic {
             op, left, right, ..
-        } => {
-            !matches!(op, ArithOp::Mul(flags) if flags.append_arrays || flags.only_existing
-                || flags.only_new || flags.deep_merge_arrays || flags.clobber_tags)
-                && supported(left)
-                && supported(right)
-        }
+        } => plain_op(op) && supported(left) && supported(right),
         Expr::Builtin(
             Builtin::Keys | Builtin::KeysUnsorted | Builtin::ToEntries | Builtin::FromEntries,
         ) => true,
-        Expr::Builtin(Builtin::WithEntries(f) | Builtin::Map(f) | Builtin::SortBy(f)) => {
-            supported(f)
-        }
-        Expr::Builtin(Builtin::Sort) => true,
+        Expr::Builtin(
+            Builtin::WithEntries(f) | Builtin::Map(f) | Builtin::MapValues(f) | Builtin::SortBy(f),
+        ) => supported(f),
+        Expr::Builtin(Builtin::Sort | Builtin::Flatten) => true,
+        Expr::Builtin(Builtin::FlattenDepth(depth)) => is_closed_literal(depth),
         // Paths given as a literal; one built from the document is for the plain route.
         Expr::Builtin(Builtin::Pick(paths)) => is_closed_literal(paths),
         Expr::Assign { path, value } => static_path(path) && supported(value),
         Expr::Update { path, filter } => static_path(path) && supported(filter),
         _ => false,
     }
+}
+
+/// Whether `op` is one whose result tree is built by [`merge_tree`]: not a `*` with a merge flag
+/// (`*+`, `*?`, `*n`, `*d`, `*c`), whose merge rules it does not follow.
+fn plain_op(op: &ArithOp) -> bool {
+    !matches!(op, ArithOp::Mul(flags) if flags.append_arrays || flags.only_existing
+        || flags.only_new || flags.deep_merge_arrays || flags.clobber_tags)
 }
 
 /// Whether `expr` replays a `pick`. The replay reads the presentation of the whole document, where
@@ -90,6 +93,10 @@ fn drop_head_comment(tree: &mut CommentTree) {
 fn array_operands(inner: &Expr) -> Vec<&Expr> {
     match inner {
         Expr::Comma(parts) => parts.iter().collect(),
+        // `[(a, b)]` is `[a, b]` (#5429).
+        Expr::Paren(inner) if matches!(**inner, Expr::Comma(_) | Expr::Paren(_)) => {
+            array_operands(inner)
+        }
         other => vec![other],
     }
 }
@@ -128,6 +135,14 @@ pub(super) fn navigation_construction(expr: &Expr) -> bool {
             None => false,
         },
         Expr::Paren(inner) => navigation_construction(inner),
+        // `.a[1:]`: the elements of a sequence a slice keeps are its own nodes (#5429).
+        Expr::Slice { .. } => true,
+        // `[.a] + [.b]` (#5429): the sum of constructions, at least one of them a construction.
+        Expr::Arithmetic { left, right, .. } => {
+            (navigation_construction(left) || navigation_construction(right))
+                && entry(left)
+                && entry(right)
+        }
         Expr::Object(entries) => {
             !is_closed_literal(expr)
                 && entries
@@ -198,12 +213,29 @@ fn landed_pair<C: DocumentCursor>(at: &Landed<C>) -> Option<ResultWithComments> 
     let Some(node) = &at.node else {
         return Some((OwnedValue::Null, CommentTree::empty()));
     };
-    let (value, mut tree) =
-        to_owned_with_comments::<_, YqSemantics>(&node.value(), Some(node)).ok()?;
+    node_pair_as(node, at.element).ok()
+}
+
+/// A document node taken into a constructed sequence (#5429): its value and the presentation it
+/// carries there, as [`landed_pair`] reads a node a construction names. `element` is whether the
+/// node is an element of a sequence, whose standalone comments are its own, where a mapping
+/// member's are its key's.
+pub(super) fn node_pair<C: DocumentCursor>(node: &C) -> Result<ResultWithComments, EvalError> {
+    let element = node
+        .document_parent()
+        .is_some_and(|parent| parent.value().as_array().is_some());
+    node_pair_as(node, element)
+}
+
+fn node_pair_as<C: DocumentCursor>(
+    node: &C,
+    element: bool,
+) -> Result<ResultWithComments, EvalError> {
+    let (value, mut tree) = to_owned_with_comments::<_, YqSemantics>(&node.value(), Some(node))?;
     // A mapping member's standalone comments live on its key, which a construction does not carry:
     // `d:` / `  x: 2` / `# f` read as `[.d]` leaves `# f` (the key's foot) behind, while a comment
     // inside the container (`  # f`) is a foot of one of its own keys and rides in the tree (#865).
-    if !at.element {
+    if !element {
         drop_head_comment(&mut tree);
     } else if node.document_has_standalone_comments() {
         // A sequence element keeps the comment above it, which the walk of a lone scalar clears.
@@ -214,7 +246,28 @@ fn landed_pair<C: DocumentCursor>(at: &Landed<C>) -> Option<ResultWithComments> 
                 .with_head_foot(head, tree.meta().foot_comment().to_vec());
         }
     }
-    Some((value, tree))
+    Ok((value, tree))
+}
+
+/// The sequence a `LazySeq` stands for, each element with the presentation of the node it still
+/// is (#5429); a value an earlier stage computed has none.
+pub(super) fn sequence_of_nodes<C: DocumentCursor>(
+    items: Vec<LazyElem<impl DocumentValue<Cursor = C>>>,
+) -> Result<ResultWithComments, EvalError> {
+    let mut values = Vec::with_capacity(items.len());
+    let mut trees = Vec::with_capacity(items.len());
+    for item in items {
+        let (value, tree) = match item {
+            LazyElem::Cursor(node) => node_pair(&node)?,
+            LazyElem::Owned(value) => (value, CommentTree::empty()),
+        };
+        values.push(value);
+        trees.push(tree);
+    }
+    Ok((
+        OwnedValue::array_from(values),
+        CommentTree::Array(NodeMeta::empty(), trees),
+    ))
 }
 
 /// Replay a construction for which [`navigation_construction`] holds, from the nodes it reads
@@ -238,6 +291,7 @@ pub(super) fn trace_navigation_construction<C: DocumentCursor>(
             // An absent node is for the plain route to answer.
             construct(last, &at.node?, 0)
         }
+        Expr::Arithmetic { .. } => entry_pair(expr, root, 0),
         _ => construct(expr, root, 0),
     }
 }
@@ -255,7 +309,7 @@ fn entry_pair<C: DocumentCursor>(e: &Expr, root: &C, depth: usize) -> Option<Res
         Expr::Paren(inner) => entry_pair(inner, root, depth + 1),
         Expr::Arithmetic {
             op, left, right, ..
-        } => {
+        } if plain_op(op) => {
             let l = entry_pair(left, root, depth + 1)?;
             let r = entry_pair(right, root, depth + 1)?;
             let sum = Expr::arithmetic(
@@ -339,6 +393,22 @@ fn construct<C: DocumentCursor>(expr: &Expr, root: &C, depth: usize) -> Option<R
             Some((
                 OwnedValue::Object(values.into()),
                 CommentTree::Object(NodeMeta::empty(), trees, IndexMap::new()),
+            ))
+        }
+        Expr::Slice { start, end, .. } => {
+            // One walk of the sequence: `get_cursor` per kept element walks it again each time.
+            let cursors = root.value().as_array()?.collect_cursors();
+            let range = succinctly::jq::literal_slice_range(*start, *end, cursors.len());
+            let mut values = Vec::with_capacity(range.len());
+            let mut trees = Vec::with_capacity(range.len());
+            for node in &cursors[range] {
+                let (v, t) = node_pair_as(node, true).ok()?;
+                values.push(v);
+                trees.push(t);
+            }
+            Some((
+                OwnedValue::Array(values.into_iter().collect()),
+                CommentTree::Array(NodeMeta::empty(), trees),
             ))
         }
         Expr::Array(inner) => {
@@ -545,6 +615,56 @@ fn trace_at_depth(
             let mapped = next(&Expr::Builtin(Builtin::Map(f.clone())), &entries)?;
             next(&Expr::Builtin(Builtin::FromEntries), &mapped)
         }
+        // `map_values(f)` keeps each key, its comments and its position (#5429); on a sequence it
+        // is `map(f)`.
+        Expr::Builtin(Builtin::MapValues(f)) => match value {
+            OwnedValue::Object(members) => {
+                let mut values = IndexMap::new();
+                let mut fields = IndexMap::new();
+                let mut keys = IndexMap::new();
+                for (key, item) in members {
+                    let (v, t) = next(f, &(item.clone(), tree.field(key).clone()))?;
+                    values.insert(key.clone(), v);
+                    fields.insert(key.clone(), t);
+                    if let Some(meta) = tree.key_meta(key) {
+                        keys.insert(key.clone(), meta.clone());
+                    }
+                }
+                Some((
+                    OwnedValue::Object(values.into()),
+                    CommentTree::Object(tree.meta().clone(), fields, keys),
+                ))
+            }
+            _ => next(&Expr::Builtin(Builtin::Map(f.clone())), input),
+        },
+        // `flatten` keeps every leaf's own node (#5429). The value is built here too, and the caller
+        // compares it with the authoritative one, so a depth this reads differently is the plain
+        // route's.
+        Expr::Builtin(Builtin::Flatten | Builtin::FlattenDepth(_)) => {
+            let depth = match expr {
+                Expr::Builtin(Builtin::FlattenDepth(depth)) => {
+                    match evaluated(depth, &OwnedValue::Null)? {
+                        OwnedValue::NumberLiteral(NumberRepr::Int(n), _) => {
+                            usize::try_from(n).ok()?
+                        }
+                        _ => return None,
+                    }
+                }
+                _ => usize::MAX,
+            };
+            let mut values = Vec::new();
+            let mut trees = Vec::new();
+            flatten_pairs(value, tree, depth, &mut values, &mut trees)?;
+            // A trailing comment of the sequence is not carried: yq drops it, as it does the
+            // comment above a sequence that `flatten` dissolves.
+            let meta = tree
+                .meta()
+                .with_head_foot(tree.meta().head_comment().to_vec(), Vec::new());
+            Some((
+                OwnedValue::Array(values.into_iter().collect()),
+                CommentTree::Array(meta, trees),
+            ))
+        }
         Expr::Builtin(Builtin::Map(f)) => {
             let OwnedValue::Array(items) = value else {
                 return None;
@@ -583,6 +703,34 @@ fn trace_at_depth(
         _ if is_closed_literal(expr) => Some((evaluated(expr, value)?, CommentTree::empty())),
         _ => None,
     }
+}
+
+/// The elements `flatten` keeps, with their trees, in order: those of the nested sequences' own
+/// elements down to `depth` levels, and every other element as it stands (#5429).
+fn flatten_pairs(
+    value: &OwnedValue,
+    tree: &CommentTree,
+    depth: usize,
+    values: &mut Vec<OwnedValue>,
+    trees: &mut Vec<CommentTree>,
+) -> Option<()> {
+    // patchcov: coverage tolerate reason="unreachable: the first call holds a sequence (`flatten` of anything else raised in the authoritative evaluation, which decides before this tree is used) and a recursive call is made on one (#5429)"
+    let OwnedValue::Array(items) = value else {
+        return None;
+    };
+    // patchcov: coverage end
+    for (i, item) in items.iter().enumerate() {
+        match item {
+            OwnedValue::Array(_) if depth > 0 => {
+                flatten_pairs(item, tree.at_index(i), depth - 1, values, trees)?;
+            }
+            _ => {
+                values.push(item.clone());
+                trees.push(tree.at_index(i).clone());
+            }
+        }
+    }
+    Some(())
 }
 
 /// `pick(keys)` replayed from the document's own tree (#5003): the keys it lists that the mapping
