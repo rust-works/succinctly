@@ -6074,7 +6074,7 @@ follows each one in its own mode. The behavioural axis is `EvalSemantics`
 | Behaviour | `succinctly jq` (jq 1.7.1) | `succinctly yq` (yq v4.53.3) |
 |---|---|---|
 | Bare 2-arg `sub(re; s)` | first match only (`"aaa"` → `"Xaa"`) | **every** match (`"aaa"` → `"XXX"`) |
-| `@uri`/`@base64`/`@html` on a container | JSON-encodes first (`[1,2]` → `"%5B1%2C2%5D"`) | errors, as real yq does |
+| `@uri`/`@base64`/`@html` on a container | JSON-encodes first (`[1,2]` → `"%5B1%2C2%5D"`) | errors, as real yq does (`@html` is not a yq format; it parses only under `--jq-extensions`, #5444) |
 | `@base64d` on malformed/misplaced padding | truncates at the first `=`, decodes the rest (`"===="` → `""`) | validates padding placement in place, rejects anything else (`"===="` → error) |
 | `keys` | sorted | document order (yq's `keys` *is* `keys_unsorted`) |
 | Integer overflow | converts to float | wraps |
@@ -6156,6 +6156,10 @@ A pattern with a bare-identifier key (`{a: $v}`) fails at its lexer (`invalid in
 Every other pattern (`[$a]`, `{$a}`, `{"a": $v}`, `{(.k): $v}`) fails with `RHS of 'as' operator must be a variable name`.
 `succinctly yq` rejects every non-`$name` pattern by default, with the same error that names `--jq-extensions`.
 With the flag a pattern keeps its jq meaning, and `?//` stays refused either way.
+
+The same gate covers bare `env` and the `@text` and `@html` formats ([#5444](https://github.com/rust-works/succinctly/issues/5444)).
+Real yq's lexer rejects all three (`invalid input text`), while `env(NAME)`, `strenv(NAME)` and its other formats are accepted and stay available by default.
+`@dsv` is wholly new syntax and stays unconditional.
 
 `gsub`/`scan`/`splits` specifically: real yq's lexer rejects all three outright, at any
 arity ([#1436](https://github.com/rust-works/succinctly/issues/1436)) — this isn't "3-arg
