@@ -58316,6 +58316,35 @@ mod tests {
         assert_eq!(slot_memo::root_built() - before, 2);
     }
 
+    /// #5421: the generic route the CLI takes copies the rest of a pipe holding
+    /// a `def` call a constant number of stages per value, however many stages
+    /// the pipe has, parenthesized or not, where it copied every tail.
+    #[cfg(feature = "std")]
+    #[test]
+    fn pipe_with_a_def_call_copies_a_constant_per_value_5421() {
+        use crate::jq::eval::owned_pipe_copies;
+        for stages in [10usize, 20] {
+            let t = vec![". + 1"; stages].join(" | ");
+            for pipe in [format!("({t} | f)"), format!("{t} | f")] {
+                let copies = |n: usize| {
+                    let program = format!("def f: . + 1; [range(0;{n}) | {pipe}] | add");
+                    let before = owned_pipe_copies::get();
+                    let (out, control) = drive_each_sink::<JqSemantics>(b"null", &program);
+                    assert!(control.is_none(), "{control:?}");
+                    let want = (0..n).map(|i| i + stages + 1).sum::<usize>() as i64;
+                    assert_eq!(out, [OwnedValue::Int(want)], "{pipe}");
+                    owned_pipe_copies::get() - before
+                };
+                let (settled, many) = (copies(4), copies(40));
+                assert!(
+                    many - settled <= 36 * 3,
+                    "{pipe}: forty values copy {} more than four do",
+                    many - settled
+                );
+            }
+        }
+    }
+
     /// #4001: the owned copy `path(f)` makes of a node is kept from the second
     /// call for that node on, so one `path(f)` holds nothing past itself and a
     /// loop of them pays for one copy; another node starts over.

@@ -1897,9 +1897,9 @@ impl core::fmt::Debug for ArithSettleMemo {
 /// (#3886), and whether a stage before the last may have an effect (#4293).
 ///
 /// It also remembers three syntactic facts about the stages (#5404) and keeps
-/// the owned copy of each tail the owned evaluator hands on (`kept_tail`,
-/// #5404). A pipe a substitution rebuilt reads the tails kept for the pipe it
-/// was rebuilt from (`share_tails_of`, #5424).
+/// the owned copy of each tail the owned evaluator hands on
+/// (`tail_plan`, #5404, #5421). A pipe a substitution rebuilt reads the
+/// tails kept for the pipe it was rebuilt from (`share_tails_of`, #5424).
 ///
 /// Reads as the `Vec<Expr>` it wraps (`Deref`), so a pipe's stages are matched
 /// and indexed as before. The remembered answer is `eval::needs_path_context`
@@ -1928,7 +1928,7 @@ pub struct PipeStages {
 /// A pipe of `n` stages keeps up to `n - 2` copies, `n - 1` stages down to 2,
 /// so the stage copies are quadratic in `n`: 8,127 at the limit, held for as
 /// long as the program (and only for a pipe that went down twice, see
-/// [`PipeStages::kept_tail`]). A longer pipe copies its tail per call, as it did
+/// [`PipeStages::tail_plan`]). A longer pipe copies its tail per call, as it did
 /// before the cache.
 pub(crate) const MAX_KEPT_TAIL_STAGES: usize = 128;
 
@@ -1943,7 +1943,7 @@ pub(crate) const MAX_KEPT_TAIL_STAGES: usize = 128;
 #[derive(Default)]
 struct TailState {
     /// Whether a tail of this pipe was asked for before: the first ask answers
-    /// `None`, so a pipe that only ever goes down once -- a body rebuilt for
+    /// [`TailPlan::Copy`], so a pipe that only ever goes down once -- a body rebuilt for
     /// each value, one level of a recursion -- pays nothing for copies it
     /// would never reuse.
     asked: core::cell::Cell<bool>,
@@ -1959,14 +1959,47 @@ struct TailState {
     origin: Option<(Weak<TailTable>, usize)>,
 }
 
-/// Slot `i` holds the `Expr::Pipe` over `stages[i..stops[i]]` of the pipe that
-/// owns the table, once something asked for it; `None` marks a run that is not
-/// kept. `stops[i]` is the first stage at or after `i` that holds evaluation
-/// state ([`TailPlan`]), or the pipe's length when none does, so for a pipe
-/// that holds none a slot is the whole tail from `i`.
+/// Slot `i` of `slots` holds the `Expr::Pipe` over `stages[i..]` of the pipe
+/// that owns the table, once something asked for it; `None` marks a tail that
+/// is not kept. Slot `i` of `runs` holds the one over `stages[i..stops[i]]`
+/// (see [`StageClass`]).
 struct TailTable {
-    stops: Box<[u32]>,
     slots: Box<[core::cell::OnceCell<Option<Rc<SharedArg>>>]>,
+    /// For each offset, the first stage at or after it that is not a
+    /// [`StageClass::Run`] stage (the pipe's length if none is).
+    stops: Box<[u32]>,
+    /// For each offset, the first [`StageClass::Stateful`] stage at or after it
+    /// (the pipe's length if none is).
+    states: Box<[u32]>,
+    /// For each offset, whether a run of two or more stages starts at it or
+    /// after it: whether splitting a tail from there shares anything.
+    shares: Box<[bool]>,
+    /// Empty for a pipe with no stateful stage, which is never split.
+    runs: Box<[core::cell::OnceCell<Option<Rc<SharedArg>>>]>,
+}
+
+/// Which of a [`TailTable`]'s slots a copy is kept in (#5421).
+#[derive(Clone, Copy)]
+enum SlotKind {
+    /// A whole tail: shares the table, so the copies of one pipe are one table.
+    Tail,
+    /// A run of a split tail: a pipe of its own, with tails of its own.
+    Run,
+}
+
+/// What a stage of a pipe is to [`PipeStages::tail_plan`] (#5421).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StageClass {
+    /// A stage that may be inside a copy the pipe shares across calls and
+    /// handed on as one `Expr::Shared` node: single-valued, effect-free,
+    /// holding no evaluation state, and not one of the shapes the owned
+    /// evaluator's doors or the pipe routes look for at the head of a pipe.
+    Run,
+    /// A stage that must be a stage of the pipe handed on, in a copy of its own.
+    Barrier,
+    /// A [`Self::Barrier`] that remembers what evaluation did to it (#3148): a
+    /// tail holding one is not kept whole.
+    Stateful,
 }
 
 /// What a pipe hands on for the tail of its stages from some offset (#5421).
@@ -1975,9 +2008,9 @@ pub(crate) enum TailPlan {
     Whole(Rc<SharedArg>),
     /// The tail holds a stage with evaluation state, which must start empty
     /// each call (#3148): [`PipeStages::split_tail`] has the stages that stand
-    /// for it, the stateless runs between those stages as the copies the pipe
-    /// keeps and each stateful stage as a copy of its own. Evaluated as a
-    /// pipe, they are the tail.
+    /// for it, the runs of [`StageClass::Run`] stages between its other stages
+    /// as the copies the pipe keeps and each other stage as a copy of its own.
+    /// Evaluated as a pipe, they are the tail.
     Split,
     /// The pipe keeps no copy of this tail: the caller copies it per call.
     Copy,
@@ -1986,10 +2019,9 @@ pub(crate) enum TailPlan {
 /// The shortest tail holding evaluation state that is [split](TailPlan::Split)
 /// rather than copied whole (#5421).
 ///
-/// The split replaces a copy of every stage with a few nodes, but it changes
-/// the shape the evaluator's doors see: a run behind a `Shared` node is not
-/// peeled by a door keyed on the stages of the pipe. A short tail costs a copy
-/// of a few stages, which is less than that; the copy is only quadratic in
+/// A split replaces a copy of every stage with a few nodes, at the price of a
+/// pipe the evaluator reads one level deeper for each run. A short tail costs a
+/// copy of a few stages, which is less than that: the copy is only quadratic in
 /// the length of the pipe.
 pub(crate) const MIN_SPLIT_TAIL_STAGES: usize = 8;
 
@@ -2007,7 +2039,7 @@ impl PipeStages {
         from: usize,
         may_keep: impl FnMut(&[Expr]) -> bool,
     ) -> Option<Rc<SharedArg>> {
-        match self.tail_plan(from, |_| false, may_keep) {
+        match self.tail_plan(from, |_| StageClass::Run, true, may_keep) {
             TailPlan::Whole(copy) => Some(copy),
             TailPlan::Split | TailPlan::Copy => None,
         }
@@ -2022,14 +2054,16 @@ impl PipeStages {
     /// copy starts with no memo, so the analyses a pipe asks of itself re-walk
     /// it too. Kept, both are paid once per program.
     ///
-    /// `is_stateful` says whether a stage holds a node that remembers what
-    /// evaluation did to it (#3148): a copy of it carried from one call to the
-    /// next would carry that too, so it is copied afresh each call. The
-    /// stateless stages between two such stages are a run, and a run is kept
-    /// like a tail: the pipe's table has one for each offset, the pipe over the
-    /// stages from there to the next stateful one. `may_keep` says whether a
-    /// run may be kept and is asked once per run: one too large would hold the
-    /// program's memory for little.
+    /// `class` says what each stage is, and must say the same of a stage on
+    /// every call for one pipe: the table is built from the first caller's
+    /// answers. A [`StageClass::Stateful`] stage
+    /// remembers what evaluation did to it (#3148): a copy of it carried from
+    /// one call to the next would carry that too, so a tail holding one is not
+    /// kept whole but, when `splittable`, handed on in pieces: each maximal run
+    /// of [`StageClass::Run`] stages as a copy the pipe keeps, every other stage
+    /// cloned afresh for the call. `may_keep` says whether a copy may be kept
+    /// and is asked once per copy: one too large would hold the program's
+    /// memory for little.
     ///
     /// Only a pipe's second ask (and one of at most [`MAX_KEPT_TAIL_STAGES`]
     /// stages) is answered with anything but [`TailPlan::Copy`]: a pipe that
@@ -2038,7 +2072,8 @@ impl PipeStages {
     pub(crate) fn tail_plan(
         &self,
         from: usize,
-        is_stateful: impl Fn(&Expr) -> bool,
+        class: impl Fn(&Expr) -> StageClass,
+        splittable: bool,
         may_keep: impl FnMut(&[Expr]) -> bool,
     ) -> TailPlan {
         let len = self.stages.len();
@@ -2054,18 +2089,18 @@ impl PipeStages {
                 if len > MAX_KEPT_TAIL_STAGES || !self.tails.asked.replace(true) {
                     return TailPlan::Copy;
                 }
-                (Rc::clone(self.tail_table(is_stateful)), from, len)
+                (Rc::clone(self.tail_table(class)), from, len)
             }
         };
-        if (table.stops[at] as usize) < end {
+        if (table.states[at] as usize) < end {
             // A kept run holds no state, so this pipe is the program's own or linked.
-            return if len - from < MIN_SPLIT_TAIL_STAGES {
-                TailPlan::Copy
-            } else {
+            return if splittable && len - from >= MIN_SPLIT_TAIL_STAGES && table.shares[at] {
                 TailPlan::Split
+            } else {
+                TailPlan::Copy
             };
         }
-        match self.kept_run(&table, at, from, end, may_keep) {
+        match self.kept_run(&table, SlotKind::Tail, at, from, end, may_keep) {
             Some(copy) => TailPlan::Whole(copy),
             None => TailPlan::Copy,
         }
@@ -2073,8 +2108,8 @@ impl PipeStages {
 
     /// The stages that stand for `stages[from..]` of a pipe whose
     /// [`tail_plan`](Self::tail_plan) for `from` was [`TailPlan::Split`]
-    /// (#5421): each run of stateless stages as the copy the pipe keeps for
-    /// it, each stateful stage and each lone stateless one cloned.
+    /// (#5421): each run of [`StageClass::Run`] stages as the copy the pipe
+    /// keeps for it, every other stage cloned.
     pub(crate) fn split_tail(
         &self,
         from: usize,
@@ -2084,7 +2119,8 @@ impl PipeStages {
         let (table, base) = self
             .table_and_base()
             .expect("a split tail follows the plan that found its table");
-        let mut segments = Vec::new();
+        // The runs collapse into a few stages: not one slot per stage.
+        let mut segments = Vec::with_capacity((len - from).min(16));
         let mut i = from;
         while i < len {
             let stop = table.stops[base + i] as usize - base;
@@ -2093,7 +2129,14 @@ impl PipeStages {
                 i += 1;
                 continue;
             }
-            match self.kept_run(&table, base + i, i, base + stop, &mut may_keep) {
+            match self.kept_run(
+                &table,
+                SlotKind::Run,
+                base + i,
+                i,
+                base + stop,
+                &mut may_keep,
+            ) {
                 Some(copy) => segments.push(Expr::Shared(copy)),
                 None => segments.extend(self.stages[i..stop].iter().cloned()),
             }
@@ -2112,21 +2155,39 @@ impl PipeStages {
     }
 
     /// This pipe's own table of kept tails, built on first use: for each
-    /// offset, where the next stage holding evaluation state is.
-    fn tail_table(&self, is_stateful: impl Fn(&Expr) -> bool) -> &Rc<TailTable> {
+    /// offset, where the next stage that is not a run is, where the next stage
+    /// holding evaluation state is, and whether a run starts at or after it.
+    fn tail_table(&self, class: impl Fn(&Expr) -> StageClass) -> &Rc<TailTable> {
         self.tails.table.get_or_init(|| {
             let len = self.stages.len();
-            let mut stops = vec![len as u32; len + 1];
+            let (mut stops, mut states) = (vec![len as u32; len + 1], vec![len as u32; len + 1]);
+            let mut shares = vec![false; len + 1];
             for (i, stage) in self.stages.iter().enumerate().rev() {
-                stops[i] = if is_stateful(stage) {
+                let class = class(stage);
+                stops[i] = if class == StageClass::Run {
+                    stops[i + 1]
+                } else {
+                    i as u32
+                };
+                states[i] = if class == StageClass::Stateful {
                     i as u32
                 } else {
-                    stops[i + 1]
+                    states[i + 1]
                 };
+                shares[i] = shares[i + 1] || stops[i] as usize >= i + 2;
             }
+            let slots = || (0..len).map(|_| core::cell::OnceCell::new()).collect();
+            let runs = if states[0] < len as u32 {
+                slots()
+            } else {
+                Box::default()
+            };
             Rc::new(TailTable {
+                slots: slots(),
                 stops: stops.into(),
-                slots: (0..len).map(|_| core::cell::OnceCell::new()).collect(),
+                states: states.into(),
+                shares: shares.into(),
+                runs,
             })
         })
     }
@@ -2139,14 +2200,14 @@ impl PipeStages {
     /// value and used once. Linked, the values after the first find them made.
     ///
     /// The stages being the same, the tails are the ones the source keeps, and
-    /// a stage holding evaluation state (`is_stateful`, #3148) is cloned afresh
+    /// a stage that is not a run (`class`, #3148, #5421) is cloned afresh
     /// from this pipe as [`Self::tail_plan`] has it for the source. Unlike a
     /// pipe of the program, a linked pipe answers [`TailPlan::Split`] or
     /// [`TailPlan::Whole`] from its first ask: the source has been asked.
     ///
     /// The first rebuild is not linked (see [`TailState::rebuilt`]); a pipe too
     /// short to keep a tail, or too long to keep any, is never linked.
-    pub(crate) fn share_tails_of(&mut self, source: &Self, is_stateful: impl Fn(&Expr) -> bool) {
+    pub(crate) fn share_tails_of(&mut self, source: &Self, class: impl Fn(&Expr) -> StageClass) {
         let len = self.stages.len();
         if !(3..=MAX_KEPT_TAIL_STAGES).contains(&len) {
             return;
@@ -2154,28 +2215,34 @@ impl PipeStages {
         self.tails.origin = match &source.tails.origin {
             Some(link) => Some(link.clone()),
             None if !source.tails.rebuilt.replace(true) => return,
-            None => Some((Rc::downgrade(source.tail_table(is_stateful)), 0)),
+            None => Some((Rc::downgrade(source.tail_table(class)), 0)),
         };
     }
 
-    /// The pipe over the run `end - at` stages long that starts at `at` in the
-    /// table's offsets and at `from` in these stages, kept in the table.
+    /// The pipe over the `end - at` stages that start at `at` in the table's
+    /// offsets and at `from` in these stages, kept in the slot of `kind`.
     fn kept_run(
         &self,
         table: &Rc<TailTable>,
+        kind: SlotKind,
         at: usize,
         from: usize,
         end: usize,
         may_keep: impl FnOnce(&[Expr]) -> bool,
     ) -> Option<Rc<SharedArg>> {
-        table
-            .slots
+        let slots = match kind {
+            SlotKind::Tail => &table.slots,
+            SlotKind::Run => &table.runs,
+        };
+        slots
             .get(at)?
             .get_or_init(|| {
                 let tail = &self.stages[from..from + (end - at)];
                 may_keep(tail).then(|| {
                     let mut copy = Self::from(tail.to_vec());
-                    copy.tails.origin = Some((Rc::downgrade(table), at));
+                    if matches!(kind, SlotKind::Tail) {
+                        copy.tails.origin = Some((Rc::downgrade(table), at));
+                    }
                     Rc::new(SharedArg::new(Expr::Pipe(copy)))
                 })
             })
@@ -4265,7 +4332,7 @@ mod tests {
         let source = PipeStages::from(vec![Expr::Field("a".into()); 6]);
         let rebuild = |from: &PipeStages| {
             let mut copy = PipeStages::from(from.to_vec());
-            copy.share_tails_of(from, |_| false);
+            copy.share_tails_of(from, |_| StageClass::Run);
             copy
         };
         let first = rebuild(&source);
@@ -4315,19 +4382,16 @@ mod tests {
     /// stage is the rebuilt pipe's own clone.
     #[test]
     fn test_pipe_stages_rebuilt_from_a_pipe_split_around_their_stateful_stages_5424() {
-        let stateful = |e: &Expr| matches!(e, Expr::Identity);
-        let mut stages = vec![Expr::Field("a".into()); 12];
-        stages[5] = Expr::Identity;
-        let source = PipeStages::from(stages);
+        let source = stages_5421(12, &[5], Expr::Identity);
         let rebuild = || {
             let mut copy = PipeStages::from(source.to_vec());
-            copy.share_tails_of(&source, stateful);
+            copy.share_tails_of(&source, class_5421);
             copy
         };
         assert!(rebuild().tails.origin.is_none(), "the first is alone");
         let (second, third) = (rebuild(), rebuild());
         assert!(matches!(
-            second.tail_plan(1, stateful, |_| true),
+            second.tail_plan(1, class_5421, true, |_| true),
             TailPlan::Split
         ));
         let split = second.split_tail(1, |_| true);
@@ -4342,40 +4406,59 @@ mod tests {
         assert!(same_run(&split[0], &other[0]) && same_run(&split[2], &other[2]));
         // A tail after the stateful stage is kept whole.
         assert!(matches!(
-            third.tail_plan(6, stateful, |_| true),
+            third.tail_plan(6, class_5421, true, |_| true),
             TailPlan::Whole(_)
         ));
     }
 
-    /// #5421: a tail holding a stage with evaluation state is split. Its
-    /// stateless runs are kept, one copy for all calls, and each stateful stage
-    /// is cloned afresh for the call; a tail after the last stateful stage is
-    /// kept whole, and a short one is copied as before.
+    /// The classes the #5421 tests give: `.a` is a run, `.` holds state, `.b`
+    /// is a barrier that holds none.
+    fn class_5421(stage: &Expr) -> StageClass {
+        match stage {
+            Expr::Identity => StageClass::Stateful,
+            Expr::Field(name) if name == "b" => StageClass::Barrier,
+            _ => StageClass::Run,
+        }
+    }
+
+    /// `n` stages of `.a` with the stages at `at` replaced by `with`.
+    fn stages_5421(n: usize, at: &[usize], with: Expr) -> PipeStages {
+        let mut stages = vec![Expr::Field("a".into()); n];
+        for &i in at {
+            stages[i] = with.clone();
+        }
+        PipeStages::from(stages)
+    }
+
+    /// The length of the kept run a split stage stands for, if it is one.
+    fn run_len_5421(stage: &Expr) -> Option<usize> {
+        match stage {
+            Expr::Shared(run) => match run.expr() {
+                Expr::Pipe(stages) => Some(stages.len()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// #5421: a tail holding a stage with evaluation state is split. Its runs
+    /// are kept, one copy for all calls, and each other stage is cloned afresh
+    /// for the call; a tail after the last stateful stage is kept whole, and a
+    /// short one is copied.
     #[test]
     fn test_pipe_stages_split_a_tail_holding_state_into_kept_runs_5421() {
-        let stateful = |e: &Expr| matches!(e, Expr::Identity);
-        let mut stages = vec![Expr::Field("a".into()); 12];
-        stages[5] = Expr::Identity;
-        stages[9] = Expr::Identity;
-        let pipe = PipeStages::from(stages);
-        let plan = |from: usize| pipe.tail_plan(from, stateful, |_| true);
+        let pipe = stages_5421(12, &[5, 9], Expr::Identity);
+        let plan = |from: usize| pipe.tail_plan(from, class_5421, true, |_| true);
         assert!(
             matches!(plan(1), TailPlan::Copy),
             "the first ask keeps nothing"
         );
         assert!(matches!(plan(1), TailPlan::Split), "stages 1.. hold state");
         let first = pipe.split_tail(1, |_| true);
-        // Run 1..5, the stage at 5, run 6..9 (three stages), the stage at 9, run 10..12.
+        // Run 1..5, the stage at 5, run 6..9, the stage at 9, run 10..12.
         assert_eq!(first.len(), 5);
-        let run_len = |e: &Expr| match e {
-            Expr::Shared(run) => match run.expr() {
-                Expr::Pipe(stages) => Some(stages.len()),
-                _ => None,
-            },
-            _ => None,
-        };
         assert_eq!(
-            [&first[0], &first[2], &first[4]].map(run_len),
+            [&first[0], &first[2], &first[4]].map(run_len_5421),
             [Some(4), Some(3), Some(2)],
             "the runs between the stateful stages"
         );
@@ -4387,55 +4470,108 @@ mod tests {
                 "a run is kept once for every call"
             );
         }
-        // The runs of a split tail are the tails of the same table: a run's own
-        // tails are the runs after it.
+        // A run is a pipe of its own, which keeps tails of its own from its
+        // second ask.
+        let keeps_its_own_tails = |run: &PipeStages| {
+            let first = matches!(run.tail_plan(1, class_5421, true, |_| true), TailPlan::Copy);
+            let second = run.tail_plan(1, class_5421, true, |_| true);
+            first
+                && matches!(second, TailPlan::Whole(inner)
+                    if matches!(inner.expr(), Expr::Pipe(t) if t.len() == 3))
+        };
         assert!(matches!(
             &first[0],
-            Expr::Shared(run) if matches!(
-                run.expr(),
-                Expr::Pipe(run) if matches!(
-                    run.tail_plan(1, stateful, |_| true),
-                    TailPlan::Whole(inner) if matches!(inner.expr(), Expr::Pipe(t) if t.len() == 3)
-                )
-            )
+            Expr::Shared(run) if matches!(run.expr(), Expr::Pipe(run) if keeps_its_own_tails(run))
         ));
-        // A tail after the last stateful stage is a whole kept tail, a short tail
-        // holding state is copied, and the run behind it is not asked for.
+        // A tail after the last stateful stage is a whole kept tail, a short
+        // tail holding state is copied.
         assert!(
             matches!(plan(10), TailPlan::Whole(tail) if matches!(tail.expr(), Expr::Pipe(t) if t.len() == 2)),
             "the two stages after the last stateful one"
         );
         assert!(matches!(plan(11), TailPlan::Copy), "a lone stage");
         assert!(matches!(plan(6), TailPlan::Copy), "six stages are copied");
-        let after = PipeStages::from(
-            core::iter::once(Expr::Identity)
-                .chain(vec![Expr::Field("a".into()); 11])
-                .collect::<Vec<_>>(),
-        );
+        let state_first = stages_5421(12, &[0], Expr::Identity);
         for _ in 0..2 {
-            let _ = after.tail_plan(1, stateful, |_| true);
+            let _ = state_first.tail_plan(1, class_5421, true, |_| true);
         }
         assert!(matches!(
-            after.tail_plan(1, stateful, |_| true),
+            state_first.tail_plan(1, class_5421, true, |_| true),
             TailPlan::Whole(_)
         ));
+    }
+
+    /// #5421: a barrier that holds no state is a stage of the split, never in
+    /// a run, and does not stop a tail without state being kept whole. A split
+    /// is chosen only when asked for and when a run of two stages is there to
+    /// share.
+    #[test]
+    fn test_split_tail_cuts_runs_at_a_barrier_and_needs_a_run_to_share_5421() {
+        let barrier = Expr::Field("b".into());
+        let pipe = stages_5421(12, &[4], barrier.clone());
+        assert!(matches!(
+            pipe.tail_plan(1, class_5421, true, |_| true),
+            TailPlan::Copy
+        ));
+        assert!(
+            matches!(
+                pipe.tail_plan(1, class_5421, true, |_| true),
+                TailPlan::Whole(tail) if matches!(tail.expr(), Expr::Pipe(t) if t.len() == 11)
+            ),
+            "no stateful stage: kept whole, barrier or not"
+        );
+        let with_state = stages_5421(12, &[4], barrier);
+        let mut stages: Vec<Expr> = with_state.into_vec();
+        stages[8] = Expr::Identity;
+        let pipe = PipeStages::from(stages);
+        let _ = pipe.tail_plan(1, class_5421, true, |_| true);
+        assert!(matches!(
+            pipe.tail_plan(1, class_5421, false, |_| true),
+            TailPlan::Copy
+        ));
+        assert!(matches!(
+            pipe.tail_plan(1, class_5421, true, |_| true),
+            TailPlan::Split
+        ));
+        let split = pipe.split_tail(1, |_| true);
+        // Run 1..4, the barrier at 4, run 5..8, the stateful stage at 8, run 9..12.
+        assert_eq!(
+            split.iter().map(run_len_5421).collect::<Vec<_>>(),
+            [Some(3), None, Some(3), None, Some(3)]
+        );
+        // Nothing to share: runs of a single stage.
+        let alternating: Vec<Expr> = (0..12)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Expr::Identity
+                } else {
+                    Expr::Field("a".into())
+                }
+            })
+            .collect();
+        let pipe = PipeStages::from(alternating);
+        for _ in 0..3 {
+            assert!(matches!(
+                pipe.tail_plan(1, class_5421, true, |_| true),
+                TailPlan::Copy
+            ));
+        }
     }
 
     /// #5421: a run `may_keep` declines is cloned stage by stage into the split
     /// and asked once; a run of one stage is the stage.
     #[test]
     fn test_split_tail_clones_a_declined_run_and_a_lone_stage_5421() {
-        let stateful = |e: &Expr| matches!(e, Expr::Identity);
         let mut stages = vec![Expr::Field("a".into()); 12];
         stages[3] = Expr::Identity;
         stages[5] = Expr::Identity;
         let pipe = PipeStages::from(stages);
         assert!(matches!(
-            pipe.tail_plan(1, stateful, |_| unreachable!("first")),
+            pipe.tail_plan(1, class_5421, true, |_| unreachable!("first")),
             TailPlan::Copy
         ));
         assert!(matches!(
-            pipe.tail_plan(1, stateful, |_| true),
+            pipe.tail_plan(1, class_5421, true, |_| true),
             TailPlan::Split
         ));
         let mut asked = 0;
@@ -4444,13 +4580,13 @@ mod tests {
                 asked += 1;
                 run.len() != 2
             });
-            // Runs 1..3 (declined: two stages), stage 3, the lone stage 4, stage 5,
+            // Run 1..3 (declined: two stages), stage 3, the lone stage 4, stage 5,
             // run 6..12 (six stages).
             assert_eq!(split.len(), 2 + 1 + 1 + 1 + 1);
             assert!(matches!(split[0], Expr::Field(_)) && matches!(split[1], Expr::Field(_)));
             assert!(matches!(split[2], Expr::Identity));
             assert!(matches!(split[3], Expr::Field(_)) && matches!(split[4], Expr::Identity));
-            assert!(matches!(split[5], Expr::Shared(_)));
+            assert_eq!(run_len_5421(&split[5]), Some(6));
         }
         assert_eq!(asked, 2, "the declined run and the long one, once each");
     }

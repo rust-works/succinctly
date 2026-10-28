@@ -119,5 +119,6 @@ mod i5379;
 mod i5388;
 mod i5397;
 mod i5417;
+mod i5421;
 mod i5424;
 mod i865;
