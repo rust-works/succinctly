@@ -6083,7 +6083,7 @@ extension under ADR-0018 rule 5 -- a decision this entry doesn't make, only surf
 
 ## Evaluator resource caps apply in yq mode too, and are uncatchable (#2132)
 
-The caps `succinctly jq` documents -- `MAX_RANGE_TOTAL`, `MAX_LOOP_ROUNDS`, `WHILE_UNTIL_MAX_STEPS`,
+The caps `succinctly jq` documents -- `MAX_RANGE_TOTAL`, `MAX_LOOP_ROUNDS` (which a tail-recursive `def` shares with `while`/`until`, #5379), `WHILE_UNTIL_MAX_STEPS`,
 `REDUCE_FOREACH_MAX_STEPS`, `repeat`'s `MAX_ITERATIONS`, `MAX_EVAL_FRAMES` -- are shared
 evaluator limits, so they apply to `succinctly yq` as well; real yq v4.53.3 has none of them.
 The reachable ones without `--jq-extensions` are `while`/`until` and a recursive `def`
@@ -6102,6 +6102,7 @@ either tool, so there is no yq catch semantics to match, and letting `try` swall
 report a truncated result as a clean answer. See the jq page's "Every resource cap is
 uncatchable" section for the full account and oracle rows; pinned by
 `test_resource_limit_caps_are_uncatchable_in_yq_mode_2132` (`tests/yq_cli_tests.rs`).
+A tail call that never ends (`def f: f; ...`) stops at the round budget (`MAX_LOOP_ROUNDS`, #5379) with the same refusal, pinned by `test_a_call_that_never_ends_still_ends_in_yq_mode_5379`.
 
 ## Where the two modes deliberately differ from each other
 

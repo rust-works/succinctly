@@ -48,7 +48,8 @@ use super::eval::{
     apply_compare_op, arith_combine, arith_negate, compare_values, is_tree_descending_f,
     native_stack_exhausted, owned_to_string, range_max_exceeded_error, recurse_max_items,
     recurse_node_cost, recurse_value_size, EvalTag, JqSemantics, LoopCounters, QueryResult,
-    MAX_EMPTY_REPEAT_ROUNDS, MAX_EVAL_FRAMES, MAX_RANGE, MAX_RANGE_TOTAL, REPEAT_WIDTH_BUDGET,
+    MAX_EMPTY_REPEAT_ROUNDS, MAX_EVAL_FRAMES, MAX_LOOP_ROUNDS, MAX_RANGE, MAX_RANGE_TOTAL,
+    REPEAT_WIDTH_BUDGET,
 };
 use super::expr::{
     ArithOp, Builtin, CompareOp, Expr, Literal, MergeFlags, NumberKey, ObjectKey, Param, Pattern,
@@ -56,6 +57,9 @@ use super::expr::{
 };
 use super::parser::parse;
 use super::resolve::ModuleRun;
+use super::tail_call::{
+    declared_tail_call, stage_settles, MAX_LOOP_OUTPUTS, OUTPUT_BUDGET_AFTER_ROUNDS,
+};
 use super::value::{
     jv_identical, ArrayVec, NumberRepr, OwnedValue, SharableLiteral, SharableString,
 };
@@ -339,6 +343,9 @@ enum Frame<'e> {
         params: &'e [Param],
         body: &'e Expr,
         parent: Env<'e>,
+        /// Whether a call to this def with no parameters runs as a tail loop (#5379),
+        /// worked out on the first call.
+        tail: Cell<Option<bool>>,
     },
     /// A closure parameter: an argument expression and its caller's
     /// environment, and whether the argument is pure there
@@ -1252,6 +1259,7 @@ impl<'e> Interp<'e> {
                     params,
                     body,
                     parent: env.clone(),
+                    tail: Cell::new(None),
                 });
             }
         }
@@ -1550,6 +1558,7 @@ impl<'e> Interp<'e> {
                     params,
                     body,
                     parent: env.clone(),
+                    tail: Cell::new(None),
                 });
                 self.eval(then, &env, input, reg, sink)
             }
@@ -3123,6 +3132,15 @@ impl<'e> Interp<'e> {
         reg: Reg,
         sink: &mut Sink<'_>,
     ) -> R {
+        // #5379: a `def` with no parameters whose body ends in a call jq jumps to
+        // runs as a loop, not as nested frames.
+        let loops = matches!(
+            &callee,
+            Callee::Def { name, params: [], body, env } if Self::loops_in_place(env, name, body)
+        );
+        if loops {
+            return self.call_def_loop(callee, input, reg, sink);
+        }
         let _depth = self.enter_call(&callee)?;
         match callee {
             // A pure argument with at most one output is evaluated before the
@@ -3154,6 +3172,195 @@ impl<'e> Interp<'e> {
                 self.bind_dollars(params, body, body_env, input, reg, sink)
             }
         }
+    }
+
+    /// A call to a `def` with no parameters whose body ends in a call jq jumps
+    /// to (`TAIL_CALL_JQ`, #5379), run as a loop.
+    ///
+    /// Each round is one [`Self::enter_call`], left before the next, so the live
+    /// call count and the native stack do not grow with the number of rounds.
+    /// The walk of a round's body passes through exactly what has nothing left to
+    /// run after the call: the condition of an `if`, the stages of a pipe and the
+    /// branches of a comma in front of it, a `def` declared in the body. It
+    /// follows the input and the register from stage to stage as `eval_pipe`
+    /// does, and a condition runs from `reg.sub()` as `Expr::If`'s arm does. A
+    /// condition or a stage that does not [`Self::settles`] ends the walk there:
+    /// that node, and the call in it, nest as before.
+    #[inline(never)]
+    fn call_def_loop(
+        &self,
+        callee: Callee<'e>,
+        mut input: OwnedValue,
+        mut reg: Reg,
+        sink: &mut Sink<'_>,
+    ) -> R {
+        let mut callee = callee;
+        let mut rounds = MAX_LOOP_ROUNDS;
+        // Rounds taken and outputs emitted ahead of the calls, for the output bound.
+        let (mut taken, mut outputs) = (0usize, 0usize);
+        // The def the loop started at, which a refusal is named for.
+        let Callee::Def { name: entry, .. } = &callee else {
+            // patchcov: coverage tolerate reason="unreachable: call_with starts a loop for a Callee::Def only"
+            return Err(unsupported("a tail loop over a closure parameter"));
+            // patchcov: coverage end
+        };
+        let entry: &str = entry;
+        loop {
+            let _depth = self.enter_call(&callee)?;
+            let Callee::Def { body, env, .. } = &callee else {
+                // patchcov: coverage tolerate reason="unreachable: a round continues with a Callee::Def"
+                return Err(unsupported("a tail loop over a closure parameter"));
+                // patchcov: coverage end
+            };
+            let mut env = env.clone();
+            let mut expr: &'e Expr = body;
+            let next = loop {
+                match expr {
+                    Expr::Paren(inner) => expr = inner,
+                    Expr::FuncDef {
+                        name,
+                        params,
+                        body,
+                        then,
+                        ..
+                    } => {
+                        env = Env::push(Frame::Def {
+                            name,
+                            params,
+                            body,
+                            parent: env.clone(),
+                            tail: Cell::new(None),
+                        });
+                        expr = then;
+                    }
+                    Expr::FuncCall { name, args, .. } if args.is_empty() => {
+                        match env.lookup_func(name, 0) {
+                            Some(next @ Callee::Def { params: [], .. }) => break next,
+                            // patchcov: coverage tolerate reason="defensive: declared_tail_call named a call that is not to a def with no parameters (a def of that name taking some)"
+                            _ => return self.eval(expr, &env, input, reg, sink),
+                            // patchcov: coverage end
+                        }
+                    }
+                    Expr::If {
+                        cond,
+                        then_branch,
+                        else_branch,
+                    } if Self::settles(cond) => {
+                        let Some((c, _)) = self.one(cond, &env, input.clone(), reg.sub())? else {
+                            return Ok(());
+                        };
+                        expr = if truthy(&c) { then_branch } else { else_branch };
+                    }
+                    // `gen_destructure` with a plain `$var`, as `Expr::As`'s arm: the
+                    // source runs from `reg.sub()` and the body from the register at entry.
+                    Expr::As {
+                        expr: source,
+                        var,
+                        body: as_body,
+                    } if Self::settles(source) => {
+                        let Some((v, _)) = self.one(source, &env, input.clone(), reg.sub())? else {
+                            return Ok(());
+                        };
+                        env = env.var_ref(var, v);
+                        expr = as_body;
+                    }
+                    Expr::Pipe(stages)
+                        if stages.len() > 1
+                            && stages[..stages.len() - 1].iter().all(Self::settles) =>
+                    {
+                        let (last, before) = stages.split_last().expect("two or more stages");
+                        for stage in before {
+                            let Some((v, r)) = self.one(stage, &env, input, reg)? else {
+                                return Ok(());
+                            };
+                            (input, reg) = (v, r);
+                        }
+                        expr = last;
+                    }
+                    Expr::Comma(items) if !items.is_empty() => {
+                        let (last, before) = items.split_last().expect("one or more items");
+                        for item in before {
+                            let mut emitted = 0usize;
+                            self.eval(item, &env, input.clone(), reg.clone(), &mut |v, r| {
+                                emitted += 1;
+                                sink(v, r)
+                            })?;
+                            outputs = outputs.saturating_add(emitted);
+                            if outputs > MAX_LOOP_OUTPUTS && taken >= OUTPUT_BUDGET_AFTER_ROUNDS {
+                                return Err(Raise::Fatal(EvalError::resource_limit(format!(
+                                    "{}/0: maximum outputs exceeded",
+                                    ModuleRun::display_name(
+                                        entry.strip_prefix("_sp_").unwrap_or(entry)
+                                    )
+                                ))));
+                            }
+                        }
+                        expr = last;
+                    }
+                    _ => return self.eval(expr, &env, input, reg, sink),
+                }
+            };
+            rounds = rounds.checked_sub(1).ok_or_else(|| {
+                Raise::Fatal(EvalError::resource_limit(format!(
+                    "{}/0 exceeded maximum recursion depth",
+                    ModuleRun::display_name(entry.strip_prefix("_sp_").unwrap_or(entry))
+                )))
+            })?;
+            callee = next;
+            taken += 1;
+        }
+    }
+
+    /// Whether a call to the `def` `name` with no parameters, whose body is `body` and whose
+    /// frame is the innermost of `env`, runs as a loop (#5379): its spine ends in a call to
+    /// the def itself or to one declared in it. Asked on every call, so remembered on the frame.
+    fn loops_in_place(env: &Env<'e>, name: &str, body: &'e Expr) -> bool {
+        let Some(Frame::Def { tail, .. }) = env.0.as_deref() else {
+            return declared_tail_call(body, name); // patchcov: coverage tolerate-line reason="unreachable: a Callee::Def's env is its own Def frame"
+        };
+        if let Some(known) = tail.get() {
+            return known;
+        }
+        let known = declared_tail_call(body, name);
+        tail.set(Some(known));
+        known
+    }
+
+    /// Whether a tail loop may run `expr` to its one output before the call it leads to
+    /// (#5379): the question the shipped evaluators ask ([`stage_settles`]), of the program as
+    /// written. A call to a def is a call by name here and is not followed, so a stage that
+    /// calls one nests, where on the shipped routes it settles when the def's body does.
+    fn settles(expr: &Expr) -> bool {
+        stage_settles(expr, true)
+    }
+
+    /// `expr`'s one output, for an `expr` that [`Self::settles`] says yields at
+    /// most one: `None` if it yields nothing. A second output is raised, not dropped.
+    fn one(
+        &self,
+        expr: &'e Expr,
+        env: &Env<'e>,
+        input: OwnedValue,
+        reg: Reg,
+    ) -> Result<Option<(OwnedValue, Reg)>, Raise> {
+        let mut out = None;
+        let mut more = false;
+        self.eval(expr, env, input, reg, &mut |v, r| {
+            if out.is_some() {
+                more = true; // patchcov: coverage tolerate-line reason="unreachable while stage_settles admits only stages that answer at most once"
+            } else {
+                out = Some((v, r));
+            }
+            Ok(())
+        })?;
+        if more {
+            // patchcov: coverage tolerate reason="unreachable while stage_settles admits only stages that answer at most once; kept so a mis-admission is loud, not a lost output"
+            return Err(unsupported(
+                "a stage a tail loop ran ahead of its call answered more than once",
+            ));
+            // patchcov: coverage end
+        }
+        Ok(out)
     }
 
     /// The recursion guard every closure call passes through, as every

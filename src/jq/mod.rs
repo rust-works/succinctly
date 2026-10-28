@@ -100,6 +100,7 @@ pub mod path_mode;
 pub mod resolve;
 mod slice;
 pub mod stream;
+mod tail_call;
 pub mod utf8_document;
 // Copy-on-write instrumentation for the shared containers (#2999). Compiled
 // under `std`/`test` like `util::select_stats`; the wrappers' call sites are

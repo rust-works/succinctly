@@ -59492,11 +59492,11 @@ fn test_resource_limit_caps_are_uncatchable_in_yq_mode_2132() -> Result<()> {
             "until: maximum iterations exceeded",
         ),
         (
-            "def f: f; try f catch \"caught\"",
+            "def f: [f]; try f catch \"caught\"",
             "f/0 exceeded maximum recursion depth",
         ),
         (
-            "def f: f; [f?] | length",
+            "def f: [f]; [f?] | length",
             "f/0 exceeded maximum recursion depth",
         ),
     ] {
