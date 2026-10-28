@@ -6074,7 +6074,7 @@ follows each one in its own mode. The behavioural axis is `EvalSemantics`
 | Behaviour | `succinctly jq` (jq 1.7.1) | `succinctly yq` (yq v4.53.3) |
 |---|---|---|
 | Bare 2-arg `sub(re; s)` | first match only (`"aaa"` → `"Xaa"`) | **every** match (`"aaa"` → `"XXX"`) |
-| `@uri`/`@base64`/`@html` on a container | JSON-encodes first (`[1,2]` → `"%5B1%2C2%5D"`) | errors, as real yq does |
+| `@uri`/`@base64`/`@html` on a container | JSON-encodes first (`[1,2]` → `"%5B1%2C2%5D"`) | errors, as real yq does (`@html` is not a yq format; it parses only under `--jq-extensions`, #5444) |
 | `@base64d` on malformed/misplaced padding | truncates at the first `=`, decodes the rest (`"===="` → `""`) | validates padding placement in place, rejects anything else (`"===="` → error) |
 | `keys` | sorted | document order (yq's `keys` *is* `keys_unsorted`) |
 | Integer overflow | converts to float | wraps |

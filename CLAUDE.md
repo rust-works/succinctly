@@ -226,7 +226,8 @@ The jq implementation supports format functions for converting values to strings
 **@uri/@base64/@html on arrays/objects (jq mode only):** a container is JSON-encoded
 first, then formatted, matching real jq (`[1,2] | @uri` => `"%5B1%2C2%5D"`) — `succinctly
 yq` still rejects a container outright for all three, matching real yq's own
-`cannot encode !!seq as URI/base64...` error (#1096).
+`cannot encode !!seq as URI/base64...` error (#1096); `@html` itself needs `--jq-extensions` there, since yq's
+lexer has no such format (#5444).
 
 **Format-prefixed string interpolation (jq mode only):** `@fmt "lit\(E)lit"` runs each
 `\(E)` slot through the format before splicing it in — jq's own `gen_format` desugar,

@@ -7859,7 +7859,7 @@ impl<'a> Parser<'a> {
                 return Ok(Some(Builtin::EnvObject(var_name)));
             }
             // yq has `env(NAME)` but no bare `env`: its lexer rejects the call-free form (#5444).
-            self.reject_unless_jq_extensions_at("env (without a variable name)", keyword_start)?;
+            self.reject_unless_jq_extensions_at("bare env", keyword_start)?;
             return Ok(Some(Builtin::Env));
         }
 

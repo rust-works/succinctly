@@ -122077,7 +122077,8 @@ mod tests {
         );
     }
 
-    /// yq's lexer rejects `@html` syntax entirely, so there's no oracle to
+    /// yq's lexer rejects `@html` syntax entirely (so `yq_query!` parses it
+    /// with `--jq-extensions` on, #5444), and there's no oracle to
     /// compare against directly — this pins succinctly's own extension
     /// behavior to match `@uri`/`@base64`'s confirmed yq-mode container
     /// rejection, keeping all three formats consistent with each other.
