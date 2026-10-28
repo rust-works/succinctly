@@ -640,7 +640,7 @@ fn trace_at_depth(
             let depth = match expr {
                 Expr::Builtin(Builtin::FlattenDepth(depth)) => {
                     match evaluated(depth, &OwnedValue::Null)? {
-                        OwnedValue::Int(n) | OwnedValue::NumberLiteral(NumberRepr::Int(n), _) => {
+                        OwnedValue::NumberLiteral(NumberRepr::Int(n), _) => {
                             usize::try_from(n).ok()?
                         }
                         _ => return None,
@@ -651,9 +651,11 @@ fn trace_at_depth(
             let result = evaluated(expr, value)?;
             let mut trees = Vec::new();
             flatten_trees(value, tree, depth, &mut trees)?;
+            // patchcov: coverage tolerate reason="unreachable: `flatten` of a value that is not a sequence raised in `evaluated` above (#5429)"
             let OwnedValue::Array(flat) = &result else {
                 return None;
             };
+            // patchcov: coverage end
             // A trailing comment of the sequence is not carried: yq drops it, as it does the
             // comment above a sequence that `flatten` dissolves.
             let meta = tree
@@ -709,9 +711,11 @@ fn flatten_trees(
     depth: usize,
     out: &mut Vec<CommentTree>,
 ) -> Option<()> {
+    // patchcov: coverage tolerate reason="unreachable: the first call holds a sequence (see the caller) and a recursive call is made on one (#5429)"
     let OwnedValue::Array(items) = value else {
         return None;
     };
+    // patchcov: coverage end
     for (i, item) in items.iter().enumerate() {
         match item {
             OwnedValue::Array(_) if depth > 0 => {

@@ -155,3 +155,12 @@ fn test_json_output_is_unchanged_5429() -> Result<()> {
 fn test_map_values_over_a_sequence_5429() -> Result<()> {
     check("[1, 2]\n", &[("map_values(. + 1)", "[2, 3]\n")])
 }
+
+/// A key keeps its quoting and its comment through `map_values`.
+#[test]
+fn test_map_values_keeps_the_keys_5429() -> Result<()> {
+    check(
+        "'k j': !Foo v # c\nz: !Bar w\n",
+        &[("map_values(.)", "'k j': !Foo v # c\nz: !Bar w\n")],
+    )
+}
