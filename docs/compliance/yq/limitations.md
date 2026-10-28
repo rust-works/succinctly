@@ -5033,7 +5033,7 @@ ruled out), even though real yq supports every one of them:
   prints `# 2` in both documents).
 - **A metadata write anywhere else than a pipe stage** (inside a `reduce`/`foreach` body, the
   *source* of an `as` binding — `(.b as $x | .a line_comment = "x") as $y | ...` — a
-  destructuring `as` pattern, a `def`, ...) raises `metadata assignment (...) is only
+  destructuring `as` pattern (behind `--jq-extensions`, #5433), a `def`, ...) raises `metadata assignment (...) is only
   supported as a pipe stage, or under a plain `as $var` binding`. The write pass resolves
   stages against the document each one sees and can't see the input such a nested write
   would run against; real yq handles the source case (it has no `reduce`/`foreach`, a `def`
@@ -6140,7 +6140,9 @@ first character: an entry that starts like an identifier (`{length, "k": 1}`) is
 shorthand (`{length: .length, ...}`), not yq's bare entry.
 
 The same gate covers jq's **destructuring patterns** in `as` (`. as {a: $v}`, `. as [$a]`, `. as {$a}`) ([#5433](https://github.com/rust-works/succinctly/issues/5433)).
-Real yq's `as` takes a variable name and nothing else: it rejects `{...}` patterns at its lexer (`invalid input text`) and `[...]` patterns and `{"k": ...}` patterns with `RHS of 'as' operator must be a variable name`.
+Real yq's `as` takes a variable name and nothing else.
+A pattern with a bare-identifier key (`{a: $v}`) fails at its lexer (`invalid input text`).
+Every other pattern (`[$a]`, `{$a}`, `{"a": $v}`, `{(.k): $v}`) fails with `RHS of 'as' operator must be a variable name`.
 `succinctly yq` rejects every non-`$name` pattern by default, with the same error that names `--jq-extensions`.
 With the flag a pattern keeps its jq meaning, and `?//` stays refused either way.
 

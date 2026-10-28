@@ -1,7 +1,7 @@
 //! #5433: yq's `as` takes a variable name and nothing else, so a destructuring pattern is jq
 //! surface `succinctly yq` accepts only under `--jq-extensions`. Pinned yq v4.53.3 rejects every
-//! one of these: `{...}` patterns at its lexer (`invalid input text`), `[...]` and `{"k": ...}`
-//! patterns with `RHS of 'as' operator must be a variable name`.
+//! one of these: a pattern with a bare-identifier key at its lexer (`invalid input text`), any other
+//! pattern (`[$a]`, `{$a}`, `{"a": $v}`) with `RHS of 'as' operator must be a variable name`.
 
 use anyhow::Result;
 
@@ -50,6 +50,22 @@ fn test_plain_variable_binding_needs_no_flag_5433() -> Result<()> {
             ("[1]\n".into(), String::new(), 0),
             "{args:?}"
         );
+    }
+    Ok(())
+}
+
+/// `?//` alternatives are jq-mode only: yq's lexer has no token for them, and the flag does not
+/// unlock them.
+#[test]
+fn test_destructuring_alternatives_stay_refused_with_the_flag_5433() -> Result<()> {
+    for args in [
+        &["-o=json", "-I=0"][..],
+        &["--jq-extensions", "-o=json", "-I=0"],
+    ] {
+        let (stdout, _stderr, code) =
+            run_yq_stdin_with_stderr(". as [$a] ?// $a | $a", "a: [1]\n", args)?;
+        assert_eq!(stdout, "", "{args:?}");
+        assert_ne!(code, 0, "{args:?}");
     }
     Ok(())
 }
