@@ -1243,7 +1243,8 @@ impl<'a, W: Write> JsonColorWriter<'a, W> {
             out,
             scheme,
             lexer: JsonColorizer::default(),
-            raw: Vec::with_capacity(COLOR_BLOCK_BYTES),
+            // Grown as written: a result is often a few bytes, and this is made per result.
+            raw: Vec::new(),
             colored: String::new(),
         }
     }
