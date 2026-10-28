@@ -115,9 +115,18 @@ fn test_sorted_keys_and_tab_indent_color_5415() -> Result<()> {
 /// printer, and `-S`/`-a`, which materialize).
 #[test]
 fn test_colored_text_is_the_plain_text_across_block_boundaries_5415() -> Result<()> {
+    // The second tail holds a surrogate pair, which the streamed route hands back to the
+    // materializing one (`colored_stream_safe`); both must give the plain text.
+    for tail in ["\\n\\u00e9", "\\n\\u00e9\\ud83d\\ude00"] {
+        colored_matches_plain(tail)?;
+    }
+    Ok(())
+}
+
+fn colored_matches_plain(tail: &str) -> Result<()> {
     let mut items = Vec::new();
     for n in 0..400 {
-        let word = "é".repeat(n % 41) + &"☃".repeat(n % 7) + "\\n\\u00e9\\ud83d\\ude00";
+        let word = "é".repeat(n % 41) + &"☃".repeat(n % 7) + tail;
         items.push(format!(
             r#"{{"k{n}":"{word}","n":[{n},{n}.5,-{n}e3,true,false,null],"o":{{}}}}"#
         ));
@@ -148,7 +157,7 @@ fn test_colored_text_is_the_plain_text_across_block_boundaries_5415() -> Result<
 /// gives it rather than the materializer's.
 #[test]
 fn test_malformed_scalar_is_refused_with_the_default_routes_message_5415() -> Result<()> {
-    for doc in [r#"{"a":tru}"#, r#"[[1],[tru]]"#] {
+    for doc in [r#"{"a":tru}"#, "[[1],[tru]]"] {
         let (out, err, code) = run_jq_full(&["-C", "-c", "."], Some(doc))?;
         let (plain_out, plain_err, plain_code) = run_jq_full(&["-c", "."], Some(doc))?;
         assert_eq!((out.as_str(), code), ("", 5), "{doc}");
@@ -156,5 +165,22 @@ fn test_malformed_scalar_is_refused_with_the_default_routes_message_5415() -> Re
         assert_eq!(err, plain_err, "{doc}");
         assert!(err.contains("invalid keyword 'tru'"), "{err}");
     }
+    Ok(())
+}
+
+/// A document the streamed route cannot vouch for keeps the refusals of the materializing one:
+/// an unpaired surrogate (#1247) and nesting past the limit (#1818).
+#[test]
+fn test_undecodable_and_over_deep_documents_are_still_refused_under_color_5415() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-C", "-c", "."], Some(r#"{"a":"\ud800"}"#))?;
+    assert_eq!((out.as_str(), code), ("", 5), "{err}");
+    assert!(err.contains("invalid unicode escape sequence"), "{err}");
+    // The default route still echoes it.
+    let (out, _, code) = run_jq_full(&["-c", "."], Some(r#"{"a":"\ud800"}"#))?;
+    assert_eq!((out.as_str(), code), ("{\"a\":\"\\ud800\"}\n", 0));
+    let deep = format!("{}1{}", "[".repeat(500), "]".repeat(500));
+    let (out, err, code) = run_jq_full(&["-C", "-c", "."], Some(&deep))?;
+    assert_eq!((out.as_str(), code), ("", 5), "{err}");
+    assert!(err.contains("nesting depth exceeds limit of 256"), "{err}");
     Ok(())
 }

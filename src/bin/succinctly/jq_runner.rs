@@ -14657,7 +14657,73 @@ mod tests {
                     String::from_utf8_lossy(&via_rebuild),
                     "byte mismatch for {value:?} under `{flags}`"
                 );
+
+                // #5415: and `-C` through `print_json` and the block-wise
+                // colorizer, rather than the materializing route.
+                let mut streamed = Vec::new();
+                let streamed_err = write_output_jq_value_colored(
+                    &mut streamed,
+                    &rebuilt,
+                    config,
+                    &mut Vec::new(),
+                    true,
+                )
+                .err()
+                .map(|e| e.to_string());
+                assert_eq!(
+                    direct_err, streamed_err,
+                    "streamed error mismatch for {value:?} under `{flags}`"
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&direct),
+                    String::from_utf8_lossy(&streamed),
+                    "streamed byte mismatch for {value:?} under `{flags}`"
+                );
             }
+        }
+    }
+
+    /// #5415: what `colored_stream_safe` vouches for, and what it hands back to
+    /// the materializing route.
+    #[test]
+    fn colored_stream_safe_vouches_only_for_what_the_streamers_match_5415() {
+        let deep_ok = format!("{}1{}", "[".repeat(128), "]".repeat(128));
+        let deep_not = format!("{}1{}", "[".repeat(129), "]".repeat(129));
+        for (doc, want) in [
+            (
+                r#"{"a":[1,2.5e3,-0,true,false,null,"x\n\"\\\/\b\f\r\t\u00e9\u0000"]}"#,
+                true,
+            ),
+            ("", true),
+            ("[nul]", true),
+            (r#"["nan","NaN","Infinity"]"#, true),
+            (deep_ok.as_str(), true),
+            (deep_not.as_str(), false),
+            // An unpaired or paired surrogate escape, in a value or a key.
+            (r#"{"a":"\ud800"}"#, false),
+            (r#"["\uDC00"]"#, false),
+            (r#"["\ud83d\ude00"]"#, false),
+            (r#"{"\ud800":1}"#, false),
+            // An escape the materializer refuses, or one cut short.
+            (r#"["\q"]"#, false),
+            (r#"["\u12"]"#, false),
+            (r#"["\uZZZZ"]"#, false),
+            (r#"["\"#, false),
+            (r#"["abc"#, false),
+            // A word that is a number to jq.
+            ("nan", false),
+            ("[NaN]", false),
+            ("[-nan]", false),
+            ("[sNaN12]", false),
+            ("[nAn]", false),
+            ("[Infinity]", false),
+            ("[infinity]", false),
+            ("[-Infinity]", false),
+            // A string's own closing quote after an escaped backslash.
+            (r#"["\\", nan]"#, false),
+            (r#"["\\"]"#, true),
+        ] {
+            assert_eq!(colored_stream_safe(doc.as_bytes()), want, "{doc:.60}");
         }
     }
 
