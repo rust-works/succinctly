@@ -5723,6 +5723,11 @@ impl<'a> Parser<'a> {
         }
 
         let format_name = &self.input[format_start..self.pos];
+        // yq's lexer has no `@text` or `@html` token (#5444); every other format named below is
+        // yq's, `@dsv` is wholly new syntax, and an unknown name is rejected in yq mode already.
+        if matches!(format_name, "text" | "html") {
+            self.reject_unless_jq_extensions_at(&format!("@{format_name}"), format_start - 1)?;
+        }
         let format_type = match format_name {
             "text" => FormatType::Text,
             "json" => FormatType::Json,
@@ -7853,6 +7858,8 @@ impl<'a> Parser<'a> {
                 self.next();
                 return Ok(Some(Builtin::EnvObject(var_name)));
             }
+            // yq has `env(NAME)` but no bare `env`: its lexer rejects the call-free form (#5444).
+            self.reject_unless_jq_extensions_at("env (without a variable name)", keyword_start)?;
             return Ok(Some(Builtin::Env));
         }
 
@@ -13046,6 +13053,51 @@ mod tests {
             parse("keys_unsorted").unwrap(),
             Expr::Builtin(Builtin::KeysUnsorted)
         );
+    }
+
+    /// #5444: yq's lexer has no `@text` or `@html` token and no bare `env` (it has `env(NAME)`),
+    /// so yq mode refuses them unless `--jq-extensions` is set. A format *name* is not a keyword,
+    /// so `every_parsed_keyword_is_classified_for_the_jq_extensions_gate_1887` cannot see one:
+    /// this pins each name the format parser accepts. jq mode accepts all of them.
+    #[test]
+    fn test_yq_format_names_and_bare_env_are_classified_for_the_gate_5444() {
+        // yq's own formats, plus `@dsv`, which is wholly new syntax and stays unconditional.
+        for source in [
+            "@json",
+            "@uri",
+            "@csv",
+            "@tsv",
+            "@base64",
+            "@base64d",
+            "@sh",
+            "@urid",
+            "@yaml",
+            "@props",
+            r#"@dsv(",")"#,
+            "env(HOME)",
+            "strenv(HOME)",
+        ] {
+            assert!(
+                parse_with_mode(source, ParserMode::Yq).is_ok(),
+                "yq mode must accept `{source}` without the flag"
+            );
+        }
+        for source in ["@text", "@html", "env", "env.HOME", "[env]"] {
+            let err = parse_with_mode(source, ParserMode::Yq).unwrap_err();
+            assert!(
+                err.message.contains("is not part of yq's syntax"),
+                "`{source}`: {}",
+                err.message
+            );
+            assert!(
+                parse_with_mode_and_extensions(source, ParserMode::Yq, true).is_ok(),
+                "--jq-extensions must accept `{source}`"
+            );
+            assert!(
+                parse_with_mode(source, ParserMode::Jq).is_ok(),
+                "jq mode must accept `{source}`"
+            );
+        }
     }
 
     /// #1512: yq mode rejects jq-only builtins real yq's lexer lacks by

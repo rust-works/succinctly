@@ -6157,6 +6157,10 @@ Every other pattern (`[$a]`, `{$a}`, `{"a": $v}`, `{(.k): $v}`) fails with `RHS 
 `succinctly yq` rejects every non-`$name` pattern by default, with the same error that names `--jq-extensions`.
 With the flag a pattern keeps its jq meaning, and `?//` stays refused either way.
 
+The same gate covers bare `env` and the `@text` and `@html` formats ([#5444](https://github.com/rust-works/succinctly/issues/5444)).
+Real yq's lexer rejects all three (`invalid input text`), while `env(NAME)`, `strenv(NAME)` and its other formats are accepted and stay available by default.
+`@dsv` is wholly new syntax and stays unconditional.
+
 `gsub`/`scan`/`splits` specifically: real yq's lexer rejects all three outright, at any
 arity ([#1436](https://github.com/rust-works/succinctly/issues/1436)) — this isn't "3-arg
 `gsub` diverges," it's that yq's grammar has no `gsub`/`scan`/`splits` token at all:

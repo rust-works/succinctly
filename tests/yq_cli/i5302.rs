@@ -8,7 +8,8 @@ use crate::run_yq_stdin;
 #[test]
 fn test_yq_formats_keep_raw_nul_5302() -> Result<()> {
     for filter in [".a | @sh", "[.a] | @csv", "[.a] | @tsv", ".a | @html"] {
-        let (out, code) = run_yq_stdin(filter, "a: \"x\\0y\"\n", &[])?;
+        // `@html` is not a yq token, so it needs the flag (#5444); the rest are yq's own.
+        let (out, code) = run_yq_stdin(filter, "a: \"x\\0y\"\n", &["--jq-extensions"])?;
         assert_eq!(code, 0, "{filter}");
         assert!(out.contains('\0'), "{filter}: {out:?}");
         assert!(!out.contains("\\0"), "{filter}: {out:?}");
