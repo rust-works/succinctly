@@ -5955,7 +5955,7 @@ comments onto the next entry, `b: {c: 1}` / `d: 3 # floated` / `# own`; succinct
 floated one on `b`'s line and drops the other), and a key whose value is
 `null`.
 A node's tag and quoting style are lost only on the routes that rebuild a sequence or mapping from document nodes and keep none of its presentation, which
-[#5429](https://github.com/rust-works/succinctly/issues/5429) tracks (`[.[]]`, array slices, `map_values`, `$x`, array `+`, `flatten`).
+[#5429](https://github.com/rust-works/succinctly/issues/5429) still tracks (a variable, a further stage after a construction, an iterating operand inside one, a computed slice bound, `map_values(select(...))`).
 `-o=json` output is unaffected, since neither appears in JSON.
 An object slice is the one case that stays a recorded divergence: yq prints the source mapping's `!!map` and the key's quoting on the sequence it returns (`{"a":1,"b":2} | yq
 '.[0:2]'` is `!!map\n- "a"\n- 1` on real yq, plain `- a\n- 1` on succinctly; [#1102](https://github.com/rust-works/succinctly/issues/1102), [#1416](https://github.com/rust-works/succinctly/issues/1416)).
