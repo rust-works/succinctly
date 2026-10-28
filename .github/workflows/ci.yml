@@ -510,11 +510,24 @@ jobs:
   # (max 0.3) with 3-4 legs per run, and 22 of 24 six-leg runs had a leg wait 1-7 min, about
   # the runtime of the shortest sibling. GitHub does not start matrix legs in include order
   # (the last to start was any of the six), so putting the long legs first does not help.
-  # A run therefore keeps its macOS legs at five or fewer: `simd`, the one with a
-  # macOS-only signal (NEON-only dispatch, no SVE2), stays alone, and `portable-popcount`
-  # and `no-std` share a leg. If queue wait under load still needs relief, the next step is
-  # dropping those two here (#3655 found no signal in them that ARM64 Linux lacks, ~5
-  # macOS-minutes per run) -- a policy call recorded on #3649.
+  # A run therefore kept its macOS legs at five.
+  #
+  # #3649's weekday measurement (Oct 21-28, 678 runs with macOS jobs, 604 with all five legs;
+  # full table on the #3649 thread) then showed five was still too many. The suite had grown:
+  # a run spent 37 macOS-minutes (24 on Oct 4), `cli-gated` ran 11.8 min and the
+  # `portable-popcount` + `no-std` leg 8.8 (p90 15.5). macOS was the last job to finish in
+  # 207 of 216 merge-group runs, and a run's own five legs fill the five concurrent slots, so
+  # any second run queues: merge-group wall-clock p50 16.1 / p90 26.9 min (9.3 / 10.0 on
+  # Oct 3), worst macOS queue wait per run p50 4.5 / p90 14.2 min.
+  #
+  # The matrix is now FOUR legs: `cli-gated`, `orchestrate-default`, `deep-recursion` and
+  # `simd`. The `portable-popcount` + `no-std` leg was dropped, the step this comment named
+  # before: #3655 found no signal in either that ARM64 Linux lacks, and both still run on the
+  # ARM64 Linux and x86_64 matrices. The coverage given up, accepted on #3649: `portable-
+  # popcount` and `no-default-features` are no longer built under Apple's toolchain, so a
+  # bug that only that toolchain or macOS-only std behaviour exposes there (the #2123 class:
+  # `target_arch = "aarch64"` test modules reached without `std`) is now caught only on
+  # Linux ARM64. Re-adding a leg costs a slot per run; re-measure the queue first.
   test-macos-arm:
     name: Test (macOS ARM64)
     needs: [gate, test-macos-arm-matrix]
@@ -556,28 +569,13 @@ jobs:
             testCmd: |
               cargo test --features cli,bench-runner --test orchestrate_cli_tests
               cargo test --verbose
-          # The next two legs held three feature sets in one `simd-variants` leg until #3649
-          # (#3655 made it). They are independent of the CLI binary and of each other -- the
-          # ARM64 Linux matrix runs them as separate legs -- so neither needs a build step.
-          # There are two legs, not three, to keep a run at five macOS legs: see the comment
-          # above `test-macos-arm`.
+          # `simd` is independent of the CLI binary, so it needs no build step. It was one of
+          # three feature-set legs held in a `simd-variants` leg until #3649 (#3655). The other
+          # two, `portable-popcount` and `no-std`, have no macOS-only signal (#3655) and run on
+          # the Linux ARM64 and x86_64 matrices only: see the comment above `test-macos-arm`.
           - name: simd
             buildCli: false
             testCmd: cargo test --verbose --features simd
-          # `portable-popcount` and `no-std` are the two with no macOS-only signal (#3655), so
-          # they share a leg: dropping them from macOS later is deleting this one entry. The
-          # second reuses the third-party crates the first built.
-          #
-          # Same no_std cargo-test rationale as test-x86 (#2114) -- macOS ARM64 is
-          # the only leg that builds the target_arch="aarch64"-gated NEON test
-          # modules under Apple's own toolchain rather than Linux's; a
-          # #2083-class std-only-symbol bug reachable only there was invisible to
-          # every CI leg until this one (#2123).
-          - name: popcount-no-std
-            buildCli: false
-            testCmd: |
-              cargo test --verbose --features portable-popcount
-              cargo test --no-default-features --verbose
           # #3698: the two slowest jq_cli_tests, split out of `cli-gated`; same list and
           # guards as the x86_64 leg's (see the comment on its `cli-gated` entry).
           - name: deep-recursion
