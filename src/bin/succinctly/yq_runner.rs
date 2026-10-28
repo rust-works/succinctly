@@ -3112,7 +3112,8 @@ fn shift_through_stage(path: &[PathStep], stage: &[StageRemovals], backward: boo
 /// Pipes whose `del`s touch no array another write reaches are returned untouched. Declined
 /// (leaving the positional walk): a negative index into a renumbered array, and a stage whose
 /// `del`s nest (`del(.a[0], .a[1].b[0])`), where one removal renumbers the array another is
-/// written against.
+/// written against. A write past the end of the array is resolved but still prints the old way:
+/// the array it makes is longer than the survivors [`array_sources`] predicts.
 fn resolve_stage_order(out: Vec<WriteTarget>) -> Option<Vec<WriteTarget>> {
     // `d` renumbers `t` when `t` goes through the array `d` removes a slot of. Deletions of the
     // same array in one stage are exempt: `array_sources` removes them as one set, which is what
@@ -3123,22 +3124,24 @@ fn resolve_stage_order(out: Vec<WriteTarget>) -> Option<Vec<WriteTarget>> {
             && t.path[..array.len()] == *array
             && !(t.stage == d.stage && t.kind == WriteKind::Del && t.path.len() == array.len() + 1)
     };
-    let pairs = || {
-        out.iter()
-            .enumerate()
-            .filter(|(_, d)| renumbers_array(d))
-            .flat_map(|(di, d)| {
-                out.iter()
-                    .enumerate()
-                    .filter(move |(ti, _)| *ti != di)
-                    .map(move |(_, t)| (d, t))
-            })
-    };
-    if !pairs().any(|(d, t)| renumbered(d, t)) {
+    // One pass over the `del`/target pairs: whether any is renumbered at all, whether one stage's
+    // removals renumber each other's arrays (they act together, which that breaks), and whether
+    // the renumbering `del` has a negative index (which slot it removes depends on a length this
+    // walk does not know).
+    let (mut related, mut nested, mut negative) = (false, false, false);
+    for (di, d) in out.iter().enumerate().filter(|(_, d)| renumbers_array(d)) {
+        for (_, t) in out.iter().enumerate().filter(|(ti, _)| *ti != di) {
+            if renumbered(d, t) {
+                related = true;
+                nested |= d.stage == t.stage;
+                negative |= matches!(d.path.last(), Some(PathStep::Index(slot)) if *slot < 0);
+            }
+        }
+    }
+    if !related {
         return Some(out);
     }
-    // One stage's removals act together, which needs them not to renumber each other's arrays.
-    if pairs().any(|(d, t)| d.stage == t.stage && renumbered(d, t)) {
+    if nested || negative {
         return None;
     }
 
@@ -3147,8 +3150,9 @@ fn resolve_stage_order(out: Vec<WriteTarget>) -> Option<Vec<WriteTarget>> {
         let Some((PathStep::Index(slot), array)) = d.path.split_last() else {
             continue;
         };
+        // Nothing else goes through this array (checked above), so what it removes is moot.
         if *slot < 0 {
-            return None;
+            continue;
         }
         let removals = stages.entry(d.stage).or_default();
         match removals.iter_mut().find(|(a, _)| a == array) {
@@ -15096,6 +15100,11 @@ mod tests {
                 )
             ])
         );
+        // ...but a negative `del` of an array nothing else enters is moot, and the rest is resolved.
+        let other = |i: i64| {
+            Expr::Pipe(vec![Expr::Field("b".into()), Expr::Index { idx: i, key: None }].into())
+        };
+        assert!(targets_of(&pipe(vec![del(arr_idx(-1)), del(other(0)), set(other(1))])).is_some());
         // One `del` of a single stage writing into an array another removes a slot of.
         assert!(targets_of(&del(Expr::Comma(vec![arr_idx(0), arr_idx_key(1)]))).is_none());
     }

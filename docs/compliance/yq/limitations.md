@@ -6397,6 +6397,17 @@ container root rewritten to the other kind keeps the document's head comment and
 matched: the head comment of a *non-first* document (`x: 1` / `---` / `# c` / `5` written `. = [1]` loses `# c`, which
 yq keeps), and a root with an explicit tag (`# c` / `!!null` written `.a = 1` prints a blank line after the comment).
 
+### A `del` that renumbers an array, then another write into it: three shapes still keep the wrong comments ([#2512](https://github.com/rust-works/succinctly/issues/2512))
+
+A pipe that deletes an array slot and writes into the same array by a static index is resolved stage by stage.
+Each element keeps its own comment and style, as in yq: `del(.arr[0]) | del(.arr[0])`, `.arr[2] = "Z" | del(.arr[0])` and `del(.arr[0]) | .arr[1].x = 9` all match.
+Three shapes are not resolved, and print the comment of the slot an element moved into rather than its own.
+A negative index into the array (`del(.arr[0]) | del(.arr[-1])`), because which slot it names depends on a length the walk does not know.
+A write at the end of the array next to a `del` (`.arr[5] = "Z" | del(.arr[0])`, and a write further out that pads it with `null`), because the array that comes out is longer than the survivors the walk predicts.
+A single `del` whose comma branches renumber each other's array (`del(.arr[0], .arr[1].x)`), because its branches are read together against the array as it was.
+Values are right in all three; only the comments and styles of the elements differ.
+`tests/yq_cli/i2512.rs` pins each with yq's own answer.
+
 ### A block scalar header's comment ([#5001](https://github.com/rust-works/succinctly/issues/5001))
 
 A comment after a block scalar's `|`/`>` indicator stays on the header line in the places the value is
