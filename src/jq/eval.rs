@@ -112004,16 +112004,22 @@ mod tests {
                     let more = many - settled;
                     // The call, a stage that is not in a run (`select`), and the
                     // clone of the split itself, for each value; yq does not split.
-                    let allowed = if tag == "jq" {
-                        36 * (calls + 3)
-                    } else {
-                        usize::MAX
-                    };
                     assert_eq!(output, want, "{place}/{consumer} ({tag})");
-                    assert!(
-                        more <= allowed,
-                        "{place}/{consumer} ({tag}): forty values copy {more} more than four do, {allowed} allowed"
-                    );
+                    if tag == "jq" {
+                        // The call, a stage that is not in a run (`select`) and the
+                        // clone of the split itself, for each value.
+                        let allowed = 36 * (calls + 2);
+                        assert!(
+                            more <= allowed,
+                            "{place}/{consumer}: forty values copy {more} more than four do, {allowed} allowed"
+                        );
+                    } else {
+                        // yq hands the tail on whole: a copy of the rest per value.
+                        assert!(
+                            more > 36 * (calls + 3),
+                            "{place}/{consumer} (yq): {more} copies is not a copy per value"
+                        );
+                    }
                 }
             }
         }

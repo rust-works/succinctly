@@ -1974,7 +1974,17 @@ struct TailTable {
     /// For each offset, whether a run of two or more stages starts at it or
     /// after it: whether splitting a tail from there shares anything.
     shares: Box<[bool]>,
+    /// Empty for a pipe with no stateful stage, which is never split.
     runs: Box<[core::cell::OnceCell<Option<Rc<SharedArg>>>]>,
+}
+
+/// Which of a [`TailTable`]'s slots a copy is kept in (#5421).
+#[derive(Clone, Copy)]
+enum SlotKind {
+    /// A whole tail: shares the table, so the copies of one pipe are one table.
+    Tail,
+    /// A run of a split tail: a pipe of its own, with tails of its own.
+    Run,
 }
 
 /// What a stage of a pipe is to [`PipeStages::tail_plan`] (#5421).
@@ -2044,7 +2054,9 @@ impl PipeStages {
     /// copy starts with no memo, so the analyses a pipe asks of itself re-walk
     /// it too. Kept, both are paid once per program.
     ///
-    /// `class` says what each stage is. A [`StageClass::Stateful`] stage
+    /// `class` says what each stage is, and must say the same of a stage on
+    /// every call for one pipe: the table is built from the first caller's
+    /// answers. A [`StageClass::Stateful`] stage
     /// remembers what evaluation did to it (#3148): a copy of it carried from
     /// one call to the next would carry that too, so a tail holding one is not
     /// kept whole but, when `splittable`, handed on in pieces: each maximal run
@@ -2088,7 +2100,7 @@ impl PipeStages {
                 TailPlan::Copy
             };
         }
-        match self.kept_run(&table, &table.slots, at, from, end, true, may_keep) {
+        match self.kept_run(&table, SlotKind::Tail, at, from, end, may_keep) {
             Some(copy) => TailPlan::Whole(copy),
             None => TailPlan::Copy,
         }
@@ -2107,7 +2119,8 @@ impl PipeStages {
         let (table, base) = self
             .table_and_base()
             .expect("a split tail follows the plan that found its table");
-        let mut segments = Vec::with_capacity(len - from);
+        // The runs collapse into a few stages: not one slot per stage.
+        let mut segments = Vec::with_capacity((len - from).min(16));
         let mut i = from;
         while i < len {
             let stop = table.stops[base + i] as usize - base;
@@ -2118,11 +2131,10 @@ impl PipeStages {
             }
             match self.kept_run(
                 &table,
-                &table.runs,
+                SlotKind::Run,
                 base + i,
                 i,
                 base + stop,
-                false,
                 &mut may_keep,
             ) {
                 Some(copy) => segments.push(Expr::Shared(copy)),
@@ -2165,12 +2177,17 @@ impl PipeStages {
                 shares[i] = shares[i + 1] || stops[i] as usize >= i + 2;
             }
             let slots = || (0..len).map(|_| core::cell::OnceCell::new()).collect();
+            let runs = if states[0] < len as u32 {
+                slots()
+            } else {
+                Box::default()
+            };
             Rc::new(TailTable {
                 slots: slots(),
                 stops: stops.into(),
                 states: states.into(),
                 shares: shares.into(),
-                runs: slots(),
+                runs,
             })
         })
     }
@@ -2203,27 +2220,27 @@ impl PipeStages {
     }
 
     /// The pipe over the `end - at` stages that start at `at` in the table's
-    /// offsets and at `from` in these stages, kept in `slots`. A tail shares the
-    /// table, so the copies of one pipe are one table whatever reaches them
-    /// (`share`); a run is a pipe of its own that keeps tails of its own.
-    #[allow(clippy::too_many_arguments)]
+    /// offsets and at `from` in these stages, kept in the slot of `kind`.
     fn kept_run(
         &self,
         table: &Rc<TailTable>,
-        slots: &[core::cell::OnceCell<Option<Rc<SharedArg>>>],
+        kind: SlotKind,
         at: usize,
         from: usize,
         end: usize,
-        share: bool,
         may_keep: impl FnOnce(&[Expr]) -> bool,
     ) -> Option<Rc<SharedArg>> {
+        let slots = match kind {
+            SlotKind::Tail => &table.slots,
+            SlotKind::Run => &table.runs,
+        };
         slots
             .get(at)?
             .get_or_init(|| {
                 let tail = &self.stages[from..from + (end - at)];
                 may_keep(tail).then(|| {
                     let mut copy = Self::from(tail.to_vec());
-                    if share {
+                    if matches!(kind, SlotKind::Tail) {
                         copy.tails.origin = Some((Rc::downgrade(table), at));
                     }
                     Rc::new(SharedArg::new(Expr::Pipe(copy)))
