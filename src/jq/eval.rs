@@ -11663,11 +11663,14 @@ impl RestCopy {
     }
 
     /// The owned pipe over `stages`, built on the first call.
-    fn owned_pipe(&mut self, stages: &[Expr]) -> &Expr {
+    fn owned_pipe(&mut self, stages: &[Expr], owner: Option<&PipeStages>) -> &Expr {
         self.pipe_of(|| {
             #[cfg(test)]
             owned_pipe_copies::bump();
-            stages.to_vec().into()
+            match owner {
+                Some(owner) => owner.tail_copy(owner.len() - stages.len()),
+                None => stages.to_vec().into(),
+            }
         })
     }
 
@@ -11790,7 +11793,7 @@ impl<'a> RestPipe<'a> {
                     split_tail_of(owner, owner.len() - tail.stages.len())
                 })
             }
-            Some(TailPlan::Copy) | None => self.copy.owned_pipe(self.stages),
+            Some(TailPlan::Copy) | None => self.copy.owned_pipe(self.stages, self.owner),
         };
         if lone.is_some() {
             eval_each_owned_past_front_doors::<S>(whole, input, optional, reentry, sink)
@@ -28934,7 +28937,7 @@ fn eval_owned_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 copy = if exprs.len() == 1 {
                     exprs[0].clone()
                 } else {
-                    Expr::Pipe(exprs.to_vec().into())
+                    Expr::Pipe(tail.owner.tail_copy(tail.from))
                 };
                 &copy
             }
@@ -75791,10 +75794,15 @@ fn substitute_var_impl(
                 .iter()
                 .map(|sub| substitute_var_impl(sub, var_name, replacement, mark))
                 .collect();
-            if (3..=crate::jq::expr::MAX_KEPT_TAIL_STAGES).contains(&stages.len())
-                && !stages.holds_var_or_init(|stages| stages.iter().any(holds_var))
-            {
-                rebuilt.share_tails_of(stages, holds_evaluation_state);
+            if (3..=crate::jq::expr::MAX_KEPT_TAIL_STAGES).contains(&stages.len()) {
+                // #5436: a pipe that reads a variable somewhere keeps the tails
+                // that start after its last reading stage.
+                let reads_var = stages.holds_var_or_init(|stages| stages.iter().any(holds_var));
+                rebuilt.share_tails_of(
+                    stages,
+                    holds_evaluation_state,
+                    reads_var.then_some(&holds_var),
+                );
             }
             Expr::Pipe(rebuilt)
         }
@@ -112062,6 +112070,86 @@ mod tests {
                     "{name}: forty values copy {more} more than four do ({:?})",
                     S::TAG
                 );
+            }
+        }
+        run::<JqSemantics>();
+        run::<YqSemantics>();
+    }
+
+    /// #5436: a body that reads its variable shares the tails that start after
+    /// its last reading stage. A stage that reads the variable is a different
+    /// stage for each value, so a tail holding one is copied for it; the
+    /// tails after the last such stage are the same for every value, and are
+    /// kept once, as for a body that reads none (#5424). Forty values copy
+    /// nothing more per value for a variable read in the first stage than for
+    /// a body that reads none; a variable read in the last stage shares no
+    /// tail, and answers the same. A tail copied because it holds one hands its
+    /// own tails on the link, so the tails after the variable are kept however
+    /// the copy was reached: a variable in the middle copies one tail for each
+    /// stage before it, where it copied one for every stage.
+    #[test]
+    fn test_body_that_reads_its_variable_shares_the_tails_after_it_5436() {
+        fn run<S: EvalSemantics>() {
+            const STAGES: usize = 20;
+            let after = vec![". + 1"; STAGES - 1].join(" | ");
+            let sum_of_indices = 40 * 39 / 2;
+            // Each value `v` yields `2v + STAGES - 1`.
+            let doubled = 2 * sum_of_indices + 40 * (STAGES - 1);
+            let shapes = [
+                (
+                    "as, first stage",
+                    format!("[range(0;N) | . as $x | (. + $x | {after})] | add"),
+                    doubled,
+                    Some(4),
+                ),
+                (
+                    "as pattern, first stage",
+                    format!("[range(0;N) | [.] as [$x] | (. + $x | {after})] | add"),
+                    doubled,
+                    Some(4),
+                ),
+                (
+                    "reduce, first stage",
+                    format!("reduce range(0;N) as $i (0; . + $i | {after})"),
+                    sum_of_indices + 40 * (STAGES - 1),
+                    Some(4),
+                ),
+                (
+                    "as, middle",
+                    format!("[range(0;N) | . as $x | ({after} | . + $x | {after})] | add"),
+                    doubled + 40 * (STAGES - 1),
+                    Some(20),
+                ),
+                (
+                    "as, last stage",
+                    format!("[range(0;N) | . as $x | ({after} | . + $x)] | add"),
+                    doubled,
+                    None,
+                ),
+                (
+                    "as, every stage",
+                    format!(
+                        "[range(0;N) | . as $x | ({})] | add",
+                        vec![". + $x"; STAGES].join(" | ")
+                    ),
+                    (STAGES + 1) * sum_of_indices,
+                    None,
+                ),
+            ];
+            for (name, template, want, per_value) in shapes {
+                let run_for = |n: usize| {
+                    run_owned_pipe_program::<S>(&template.replace('N', &n.to_string()), b"null")
+                };
+                let (settled, many) = (run_for(4), run_for(40));
+                assert_eq!(many.output, want.to_string(), "{name} ({:?})", S::TAG);
+                if let Some(per_value) = per_value {
+                    let more = many.copies - settled.copies;
+                    assert!(
+                        more <= 36 * per_value,
+                        "{name}: forty values copy {more} more than four do ({:?})",
+                        S::TAG
+                    );
+                }
             }
         }
         run::<JqSemantics>();

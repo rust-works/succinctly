@@ -120,4 +120,5 @@ mod i5388;
 mod i5397;
 mod i5417;
 mod i5424;
+mod i5436;
 mod i865;

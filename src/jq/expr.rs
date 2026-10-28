@@ -1935,8 +1935,10 @@ pub(crate) const MAX_KEPT_TAIL_STAGES: usize = 128;
 /// What a pipe has settled about the tails it hands on (#5404).
 ///
 /// Exactly one of two kinds of pipe uses each field. A pipe of the program (or
-/// any pipe nothing else made) has `table`, `asked` and `rebuilt`; a copy it
-/// kept, and a pipe rebuilt from another by a substitution (#5424), have
+/// any pipe nothing else made) has `table`, `asked` and `rebuilt`, and, when it
+/// reads a variable, `linked_table` (#5436) for the pipes rebuilt from it; a copy
+/// it kept, a copy of a tail of a pipe that reaches a table, and a pipe rebuilt
+/// from another by a substitution (#5424), have
 /// `origin`, and reach their tails through the table of that pipe, so that the
 /// copies of one pipe are one table of at most `n - 2` however many pipes are
 /// rebuilt from it, and a copy never grows copies of its own.
@@ -1953,6 +1955,10 @@ struct TailState {
     rebuilt: core::cell::Cell<bool>,
     /// The kept copies, built on the second ask.
     table: core::cell::OnceCell<Rc<TailTable>>,
+    /// The table of a pipe that reads a variable, which pipes rebuilt from it
+    /// reach their tails through (#5436): its runs stop at a stage that reads
+    /// one, which a rebuilt pipe holds a different copy of for each value.
+    linked_table: core::cell::OnceCell<Rc<TailTable>>,
     /// For a kept copy, or a pipe rebuilt from another (#5424): the table it
     /// reaches its tails through and the offset of its first stage there. A
     /// `Weak`, as the table holds the copy.
@@ -1965,6 +1971,10 @@ struct TailState {
 /// state ([`TailPlan`]), or the pipe's length when none does, so for a pipe
 /// that holds none a slot is the whole tail from `i`.
 struct TailTable {
+    /// The offset after the last stage that reads a variable (#5436), `0` for a
+    /// table that has none: a tail starting before it holds a stage that a
+    /// rebuilt pipe has a copy of its own of, so it is not kept.
+    volatile_through: u32,
     stops: Box<[u32]>,
     slots: Box<[core::cell::OnceCell<Option<Rc<SharedArg>>>]>,
 }
@@ -2057,6 +2067,9 @@ impl PipeStages {
                 (Rc::clone(self.tail_table(is_stateful)), from, len)
             }
         };
+        if at < table.volatile_through as usize {
+            return TailPlan::Copy;
+        }
         if (table.stops[at] as usize) < end {
             // A kept run holds no state, so this pipe is the program's own or linked.
             return if len - from < MIN_SPLIT_TAIL_STAGES {
@@ -2102,6 +2115,23 @@ impl PipeStages {
         segments
     }
 
+    /// The stages from `from` on as a pipe of their own, for a caller that
+    /// copies a tail ([`TailPlan::Copy`]).
+    ///
+    /// A pipe linked to a table (#5424, #5436) hands its copy the same link, at
+    /// the offset where the copy starts: the copy's stages are the pipe's, so
+    /// the tails of the copy that the table keeps are the ones it keeps for the
+    /// pipe. Without it a tail copied because it holds a stage that reads a
+    /// variable is a pipe nothing is known about, and each tail of that copy is
+    /// copied in turn.
+    pub(crate) fn tail_copy(&self, from: usize) -> Self {
+        let mut copy = Self::from(self.stages[from..].to_vec());
+        if let Some((table, base)) = &self.tails.origin {
+            copy.tails.origin = Some((Weak::clone(table), base + from));
+        }
+        copy
+    }
+
     /// The table this pipe's tails are kept in and the offset of its first
     /// stage there: its own, or the one it was linked or kept to (#5424).
     fn table_and_base(&self) -> Option<(Rc<TailTable>, usize)> {
@@ -2114,29 +2144,67 @@ impl PipeStages {
     /// This pipe's own table of kept tails, built on first use: for each
     /// offset, where the next stage holding evaluation state is.
     fn tail_table(&self, is_stateful: impl Fn(&Expr) -> bool) -> &Rc<TailTable> {
-        self.tails.table.get_or_init(|| {
-            let len = self.stages.len();
-            let mut stops = vec![len as u32; len + 1];
-            for (i, stage) in self.stages.iter().enumerate().rev() {
-                stops[i] = if is_stateful(stage) {
-                    i as u32
-                } else {
-                    stops[i + 1]
-                };
+        self.tails
+            .table
+            .get_or_init(|| self.build_table(is_stateful, |_| false))
+    }
+
+    /// The table of a pipe that reads a variable (#5436): [`Self::tail_table`]'s,
+    /// but a stage `is_volatile` ends a run as a stateful one does, and no tail
+    /// that holds one is kept. Separate from the pipe's own table, which a pipe
+    /// that reads a variable no substitution rewrites (`$ENV`) keeps using.
+    fn linked_table(
+        &self,
+        is_stateful: impl Fn(&Expr) -> bool,
+        is_volatile: impl Fn(&Expr) -> bool,
+    ) -> &Rc<TailTable> {
+        self.tails
+            .linked_table
+            .get_or_init(|| self.build_table(is_stateful, is_volatile))
+    }
+
+    /// The table over these stages: a stage that is stateful or `is_volatile`
+    /// stops the run before it.
+    fn build_table(
+        &self,
+        is_stateful: impl Fn(&Expr) -> bool,
+        is_volatile: impl Fn(&Expr) -> bool,
+    ) -> Rc<TailTable> {
+        let len = self.stages.len();
+        let mut stops = vec![len as u32; len + 1];
+        let mut volatile_through = 0;
+        for (i, stage) in self.stages.iter().enumerate().rev() {
+            let volatile = is_volatile(stage);
+            if volatile && volatile_through == 0 {
+                volatile_through = i as u32 + 1;
             }
-            Rc::new(TailTable {
-                stops: stops.into(),
-                slots: (0..len).map(|_| core::cell::OnceCell::new()).collect(),
-            })
+            stops[i] = if volatile || is_stateful(stage) {
+                i as u32
+            } else {
+                stops[i + 1]
+            };
+        }
+        Rc::new(TailTable {
+            volatile_through,
+            stops: stops.into(),
+            slots: (0..len).map(|_| core::cell::OnceCell::new()).collect(),
         })
     }
 
     /// Makes this pipe hand on the tails `source` keeps instead of keeping
     /// tails of its own (#5424), for a pipe rebuilt from `source` by a
-    /// substitution that changed none of its stages (`source` reads no
-    /// variable, which the caller has checked): a body rebuilt for each value
-    /// is a new pipe each time, so tails kept for it would be made once per
-    /// value and used once. Linked, the values after the first find them made.
+    /// substitution that changed none of the stages the tails hold: a body
+    /// rebuilt for each value is a new pipe each time, so tails kept for it
+    /// would be made once per value and used once. Linked, the values after
+    /// the first find them made.
+    ///
+    /// A `source` that reads no variable is rebuilt stage for stage, which the
+    /// caller has checked (`is_volatile` is `None`). One that reads a variable
+    /// is rebuilt with a different copy of each stage that reads it for each
+    /// value (`is_volatile`, #5436): it links to a table of its own, whose
+    /// runs end at such a stage, and a tail that starts at or before the last
+    /// is copied for the value ([`TailTable::volatile_through`]). The tails
+    /// after it hold no variable, so they are the ones the source keeps.
     ///
     /// The stages being the same, the tails are the ones the source keeps, and
     /// a stage holding evaluation state (`is_stateful`, #3148) is cloned afresh
@@ -2146,15 +2214,35 @@ impl PipeStages {
     ///
     /// The first rebuild is not linked (see [`TailState::rebuilt`]); a pipe too
     /// short to keep a tail, or too long to keep any, is never linked.
-    pub(crate) fn share_tails_of(&mut self, source: &Self, is_stateful: impl Fn(&Expr) -> bool) {
+    pub(crate) fn share_tails_of(
+        &mut self,
+        source: &Self,
+        is_stateful: impl Fn(&Expr) -> bool,
+        is_volatile: Option<&dyn Fn(&Expr) -> bool>,
+    ) {
         let len = self.stages.len();
         if !(3..=MAX_KEPT_TAIL_STAGES).contains(&len) {
             return;
         }
         self.tails.origin = match &source.tails.origin {
+            // A source with a link is a pipe rebuilt from one, or a copy of a tail of
+            // one, so it holds a variable only where the table it reaches counts a
+            // stage as volatile: a table of a pipe that reads one is always built
+            // with `is_volatile` (#5436), and a pipe that reads none holds none.
             Some(link) => Some(link.clone()),
             None if !source.tails.rebuilt.replace(true) => return,
-            None => Some((Rc::downgrade(source.tail_table(is_stateful)), 0)),
+            None => match is_volatile {
+                None => Some((Rc::downgrade(source.tail_table(is_stateful)), 0)),
+                Some(is_volatile) => {
+                    let table = source.linked_table(is_stateful, is_volatile);
+                    // No tail of two stages or more starts after the last stage
+                    // that reads a variable: nothing would be kept.
+                    if table.volatile_through as usize + 2 > len {
+                        return;
+                    }
+                    Some((Rc::downgrade(table), 0))
+                }
+            },
         };
     }
 
@@ -4265,7 +4353,7 @@ mod tests {
         let source = PipeStages::from(vec![Expr::Field("a".into()); 6]);
         let rebuild = |from: &PipeStages| {
             let mut copy = PipeStages::from(from.to_vec());
-            copy.share_tails_of(from, |_| false);
+            copy.share_tails_of(from, |_| false, None);
             copy
         };
         let first = rebuild(&source);
@@ -4309,6 +4397,109 @@ mod tests {
         }
     }
 
+    /// #5436: a pipe that reads a variable is linked to a table that keeps the
+    /// tails after its last reading stage. A tail that starts at or before that
+    /// stage holds a stage a rebuilt pipe has a copy of its own of, so it is
+    /// not kept; the stages after it are the same in every rebuild, and are
+    /// kept once. A reading stage in the last two places leaves no tail to keep,
+    /// and the pipe is not linked.
+    #[test]
+    fn test_pipe_stages_rebuilt_from_a_pipe_that_reads_a_variable_keep_the_tails_after_it_5436() {
+        let reads = |e: &Expr| matches!(e, Expr::Var(_));
+        let source_with = |at: usize| {
+            let mut stages = vec![Expr::Field("a".into()); 8];
+            stages[at] = Expr::Var("x".into());
+            PipeStages::from(stages)
+        };
+        let rebuild = |from: &PipeStages| {
+            let mut copy = PipeStages::from(from.to_vec());
+            copy.share_tails_of(from, |_| false, Some(&reads));
+            copy
+        };
+        let source = source_with(2);
+        assert!(
+            rebuild(&source).tails.origin.is_none(),
+            "the first is alone"
+        );
+        let (second, third) = (rebuild(&source), rebuild(&source));
+        // Starting at or before the reading stage: copied.
+        for from in 1..=2 {
+            assert!(second.kept_tail(from, |_| true).is_none(), "from {from}");
+        }
+        // Starting after it: kept once, however many pipes are rebuilt.
+        let mut made = 0;
+        let kept = second
+            .kept_tail(3, |_| {
+                made += 1;
+                true
+            })
+            .expect("kept from its first ask");
+        let again = third.kept_tail(3, |_| unreachable!("made for the second"));
+        assert!(again.is_some_and(|tail| Rc::ptr_eq(&tail, &kept)));
+        assert_eq!(made, 1);
+        assert_eq!(second.kept_tail_count(), 0, "kept in the source's table");
+        assert_eq!(source.kept_tail_count(), 0, "not in the source's own table");
+        // The reading stage in the last two places: nothing after it to keep.
+        for at in [6, 7] {
+            let source = source_with(at);
+            for _ in 0..2 {
+                assert!(rebuild(&source).tails.origin.is_none(), "stage {at}");
+            }
+        }
+        // A pipe rebuilt from a rebuilt one reads the same table.
+        let fourth = rebuild(&second);
+        assert!(fourth
+            .kept_tail(3, |_| unreachable!("made for the second"))
+            .is_some_and(|tail| Rc::ptr_eq(&tail, &kept)));
+        assert!(fourth.kept_tail(2, |_| true).is_none());
+    }
+
+    /// #5436: a copy of a tail of a linked pipe reaches the same table, at the
+    /// offset where it starts, so a tail copied because it holds a stage that
+    /// reads a variable keeps the tails after it; a copy of a tail of a pipe that
+    /// is not linked is a plain pipe.
+    #[test]
+    fn test_tail_copy_of_a_linked_pipe_keeps_the_link_5436() {
+        let reads = |e: &Expr| matches!(e, Expr::Var(_));
+        let mut stages = vec![Expr::Field("a".into()); 10];
+        stages[2] = Expr::Var("x".into());
+        let source = PipeStages::from(stages);
+        let rebuild = || {
+            let mut copy = PipeStages::from(source.to_vec());
+            copy.share_tails_of(&source, |_| false, Some(&reads));
+            copy
+        };
+        let _first = rebuild();
+        let (second, third) = (rebuild(), rebuild());
+        let kept = second
+            .kept_tail(5, |_| true)
+            .expect("after the reading stage");
+        // The tail from 1 is copied, and the copy is linked.
+        assert!(second.kept_tail(1, |_| true).is_none());
+        let copy = second.tail_copy(1);
+        assert_eq!(copy.len(), 9);
+        assert!(
+            copy.kept_tail(1, |_| true).is_none(),
+            "the reading stage is in it"
+        );
+        let again = copy
+            .kept_tail(4, |_| unreachable!("made for the second"))
+            .expect("offset 5 of the pipe");
+        assert!(Rc::ptr_eq(&again, &kept));
+        // A copy of a copy keeps it too.
+        let inner = copy.tail_copy(2);
+        assert!(inner
+            .kept_tail(2, |_| unreachable!("made for the second"))
+            .is_some_and(|tail| Rc::ptr_eq(&tail, &kept)));
+        // Not linked: a plain copy, which keeps nothing on its first ask.
+        let alone = third.tail_copy(0);
+        assert_eq!(alone.len(), 10);
+        let unlinked = PipeStages::from(vec![Expr::Field("a".into()); 6]);
+        let plain = unlinked.tail_copy(2);
+        assert_eq!(plain.len(), 4);
+        assert!(plain.tails.origin.is_none());
+    }
+
     /// #5424: a pipe rebuilt from another that holds a stage with evaluation
     /// state splits its tail as that pipe does, from its first ask, through the
     /// source's table: the runs are the ones the source keeps and the stateful
@@ -4321,7 +4512,7 @@ mod tests {
         let source = PipeStages::from(stages);
         let rebuild = || {
             let mut copy = PipeStages::from(source.to_vec());
-            copy.share_tails_of(&source, stateful);
+            copy.share_tails_of(&source, stateful, None);
             copy
         };
         assert!(rebuild().tails.origin.is_none(), "the first is alone");
