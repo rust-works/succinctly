@@ -1655,6 +1655,124 @@ mod tests {
         }
     }
 
+    /// #5415: [`JsonColorWriter`] gives the bytes [`colorize_json`] does however its input is cut
+    /// into writes -- one byte at a time, across a block, or inside a multi-byte character -- and
+    /// whichever of its two `Write` impls feeds it.
+    #[test]
+    fn test_json_color_writer_matches_colorize_json_at_every_cut_5415() {
+        let scheme = ColorScheme::default();
+        let long = format!(
+            "[{}]",
+            (0..2500)
+                .map(|i| format!(r#"{{"k{i}":"é☃\u00e9{i}","n":[{i},nan,true,null]}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(long.len() > 4 * COLOR_BLOCK_BYTES);
+        for json in [
+            r#"{"a":[true,false,null,-1.5e+3,"s\"x"],"b":nan,"c":{}}"#,
+            "[\"é☃😀\"]",
+            "nan",
+            "n",
+            "tru",
+            "12",
+            "",
+            long.as_str(),
+        ] {
+            let whole = colorize_json(json, &scheme);
+            let bytes = json.as_bytes();
+            let write_in = |cuts: &[usize]| {
+                let mut out = Vec::new();
+                let mut writer = JsonColorWriter::new(&mut out, &scheme);
+                let mut at = 0;
+                for &cut in cuts.iter().chain(&[bytes.len()]) {
+                    writer.write_all(&bytes[at..cut]).unwrap();
+                    at = cut;
+                }
+                writer.finish().unwrap();
+                String::from_utf8(out).unwrap()
+            };
+            assert_eq!(write_in(&[]), whole, "one write: {json:.40}");
+            if bytes.len() < 200 {
+                for cut in 0..=bytes.len() {
+                    assert_eq!(write_in(&[cut]), whole, "cut at {cut}: {json}");
+                }
+                let every: Vec<usize> = (0..=bytes.len()).collect();
+                assert_eq!(write_in(&every), whole, "a byte at a time: {json}");
+            } else {
+                // Cuts inside a character and either side of a block boundary.
+                for cut in [
+                    1,
+                    2,
+                    3,
+                    COLOR_BLOCK_BYTES - 1,
+                    COLOR_BLOCK_BYTES,
+                    COLOR_BLOCK_BYTES + 1,
+                ] {
+                    assert_eq!(write_in(&[cut]), whole, "cut at {cut}");
+                }
+                let sevens: Vec<usize> = (1..bytes.len() / 7).map(|i| i * 7).collect();
+                assert_eq!(write_in(&sevens), whole, "in sevens");
+            }
+            let mut sink = Vec::new();
+            let mut writer = JsonColorWriter::new(&mut sink, &scheme);
+            core::fmt::Write::write_str(&mut writer, json).unwrap();
+            writer.finish().unwrap();
+            assert_eq!(
+                String::from_utf8(sink).unwrap(),
+                whole,
+                "fmt::Write: {json:.40}"
+            );
+            let mut blocks = Vec::new();
+            write_colorized_json(&mut blocks, bytes, &scheme).unwrap();
+            assert_eq!(
+                String::from_utf8(blocks).unwrap(),
+                whole,
+                "write_colorized_json"
+            );
+        }
+    }
+
+    /// #5415: a byte the renderers never write -- invalid UTF-8 -- is replaced, not dropped, and
+    /// a character cut short by the end of the text is closed by `finish`.
+    #[test]
+    fn test_json_color_writer_replaces_invalid_utf8_5415() {
+        let scheme = ColorScheme::default();
+        for bytes in [&b"[\"a\xffb\"]"[..], &b"\"\xc3"[..], &b"\"\xe2\x98"[..]] {
+            let mut out = Vec::new();
+            write_colorized_json(&mut out, bytes, &scheme).unwrap();
+            let want = colorize_json(&String::from_utf8_lossy(bytes), &scheme);
+            assert_eq!(String::from_utf8(out).unwrap(), want, "{bytes:?}");
+        }
+    }
+
+    /// A writer whose `write` fails is reported, at the write that fills a block or at `finish`.
+    #[test]
+    fn test_json_color_writer_reports_a_failed_write_5415() {
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let scheme = ColorScheme::default();
+        let mut broken = Broken;
+        let mut writer = JsonColorWriter::new(&mut broken, &scheme);
+        writer.write_all(b"[1]").unwrap();
+        writer.flush().unwrap();
+        assert!(writer.finish().is_err());
+        let mut broken = Broken;
+        let mut writer = JsonColorWriter::new(&mut broken, &scheme);
+        let block = "1".repeat(COLOR_BLOCK_BYTES);
+        assert!(writer.write_all(block.as_bytes()).is_err());
+        let mut broken = Broken;
+        let mut writer = JsonColorWriter::new(&mut broken, &scheme);
+        assert!(core::fmt::Write::write_str(&mut writer, &block).is_err());
+    }
+
     #[test]
     fn test_colorize_json_token_aware() {
         let out = colorize_json(r#"{"a":true}"#, &ColorScheme::default());

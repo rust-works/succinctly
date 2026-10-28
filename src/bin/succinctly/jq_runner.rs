@@ -5100,14 +5100,13 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 // three exceptions that keep `-C`'s bytes what the
                 // materializing route made them. `--preserve-input` echoes
                 // source text the colored route validated and re-rendered. A
-                // document with a NaN word in it: the streamer prints a NaN
-                // as `null`, and the colorizer needs the marker to color it
-                // as jq does. And a result that is not one cursor, which
-                // `evaluate_m2_fast_path` hands back (see there).
+                // document `colored_stream_safe` does not vouch for. And a
+                // result that is not one cursor, which `evaluate_m2_fast_path`
+                // hands back (see there).
+                let color_streams = output_config.color_output && colored_stream_safe(json_bytes);
                 if can_json_fast_path
                     && !(output_config.color_output
-                        && (output_config.convention.preserves_source_values()
-                            || may_contain_nan_word(json_bytes)))
+                        && (output_config.convention.preserves_source_values() || !color_streams))
                 {
                     let color = output_config
                         .color_output
@@ -5197,80 +5196,83 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 // when either unwinds, and the other three are plain data
                 // regardless.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let mut on_value = |sink: &mut ErrorSink,
-                                        result: OutputItem<'_>|
-                     -> Result<bool> {
-                        had_output = true;
-                        // For exit_status tracking, we need to check the last value
-                        if args.exit_status {
-                            match &result {
-                                // `-e` is the flag that forces materialization at
-                                // all, so it is where a decode failure first
-                                // becomes observable here (#1247). Report and skip
-                                // the value rather than letting an undecodable
-                                // string count as a truthiness answer; `sink`
-                                // drives the exit code. `try_materialize`, not
-                                // `materialize` (#2850): this call used to leak
-                                // Rust's raw panic backtrace to stderr past
-                                // `MAX_NESTING_DEPTH`/`MAX_VALUE_TREE_DEPTH`
-                                // levels of nesting, ahead of the clean,
-                                // correctly exit-5'd diagnostic this `match`
-                                // already produces below -- a CLI-output
-                                // boundary has no business panicking for input
-                                // depth alone.
-                                OutputItem::Lazy(v) => match v.try_materialize() {
-                                    Ok(owned) => last_output = Some(owned),
-                                    Err(e) => {
-                                        sink.report(DiagStyle::Jq, &e, at.get());
-                                        return Ok(true);
+                    let mut on_value =
+                        |sink: &mut ErrorSink, result: OutputItem<'_>| -> Result<bool> {
+                            had_output = true;
+                            // For exit_status tracking, we need to check the last value
+                            if args.exit_status {
+                                match &result {
+                                    // `-e` is the flag that forces materialization at
+                                    // all, so it is where a decode failure first
+                                    // becomes observable here (#1247). Report and skip
+                                    // the value rather than letting an undecodable
+                                    // string count as a truthiness answer; `sink`
+                                    // drives the exit code. `try_materialize`, not
+                                    // `materialize` (#2850): this call used to leak
+                                    // Rust's raw panic backtrace to stderr past
+                                    // `MAX_NESTING_DEPTH`/`MAX_VALUE_TREE_DEPTH`
+                                    // levels of nesting, ahead of the clean,
+                                    // correctly exit-5'd diagnostic this `match`
+                                    // already produces below -- a CLI-output
+                                    // boundary has no business panicking for input
+                                    // depth alone.
+                                    OutputItem::Lazy(v) => match v.try_materialize() {
+                                        Ok(owned) => last_output = Some(owned),
+                                        Err(e) => {
+                                            sink.report(DiagStyle::Jq, &e, at.get());
+                                            return Ok(true);
+                                        }
+                                    },
+                                    // An owned result records its *truthiness*, not
+                                    // itself (#3009). Both readers of `last_output`
+                                    // only ever ask `matches!(last, Null |
+                                    // Bool(false))`, which is why the M2 path
+                                    // already synthesizes a `Bool` here rather than
+                                    // materializing (`record_exit_status`). Cloning
+                                    // the value instead would be a refcount bump in
+                                    // the shipped build but a deep copy under the
+                                    // `unshared-containers` holdout, i.e. a cost
+                                    // that shows up only in the configuration used
+                                    // to measure this change. There is no `Err`
+                                    // counterpart: an owned value cannot fail to
+                                    // materialize, and its depth was settled by
+                                    // `to_jq_values` before it got here.
+                                    OutputItem::Owned(v) => {
+                                        last_output = Some(OwnedValue::Bool(!matches!(
+                                            v,
+                                            OwnedValue::Null | OwnedValue::Bool(false)
+                                        )));
                                     }
-                                },
-                                // An owned result records its *truthiness*, not
-                                // itself (#3009). Both readers of `last_output`
-                                // only ever ask `matches!(last, Null |
-                                // Bool(false))`, which is why the M2 path
-                                // already synthesizes a `Bool` here rather than
-                                // materializing (`record_exit_status`). Cloning
-                                // the value instead would be a refcount bump in
-                                // the shipped build but a deep copy under the
-                                // `unshared-containers` holdout, i.e. a cost
-                                // that shows up only in the configuration used
-                                // to measure this change. There is no `Err`
-                                // counterpart: an owned value cannot fail to
-                                // materialize, and its depth was settled by
-                                // `to_jq_values` before it got here.
-                                OutputItem::Owned(v) => {
-                                    last_output = Some(OwnedValue::Bool(!matches!(
-                                        v,
-                                        OwnedValue::Null | OwnedValue::Bool(false)
-                                    )));
                                 }
                             }
-                        }
-                        // A malformed document is a data error, not an I/O
-                        // one: it belongs in jq's diagnostic channel (exit 5)
-                        // rather than aborting the process through `anyhow`
-                        // (#1194). Stop emitting results for *this* document,
-                        // but fall through to the halt check below and carry
-                        // on with the rest of the stream (#355) -- real jq
-                        // stops at the first parse error instead, a
-                        // divergence recorded in
-                        // `docs/compliance/jq/limitations.md`.
-                        let stop = route_write_error(
-                            sink,
-                            &mut out,
-                            || at.get().clone(),
-                            |o| match &result {
-                                OutputItem::Lazy(v) => {
-                                    write_output_jq_value(o, v, &output_config, &mut record_scratch)
-                                }
-                                OutputItem::Owned(v) => {
-                                    write_output_owned_value(o, v, &output_config)
-                                }
-                            },
-                        )?;
-                        Ok(!stop)
-                    };
+                            // A malformed document is a data error, not an I/O
+                            // one: it belongs in jq's diagnostic channel (exit 5)
+                            // rather than aborting the process through `anyhow`
+                            // (#1194). Stop emitting results for *this* document,
+                            // but fall through to the halt check below and carry
+                            // on with the rest of the stream (#355) -- real jq
+                            // stops at the first parse error instead, a
+                            // divergence recorded in
+                            // `docs/compliance/jq/limitations.md`.
+                            let stop = route_write_error(
+                                sink,
+                                &mut out,
+                                || at.get().clone(),
+                                |o| match &result {
+                                    OutputItem::Lazy(v) => write_output_jq_value_colored(
+                                        o,
+                                        v,
+                                        &output_config,
+                                        &mut record_scratch,
+                                        color_streams,
+                                    ),
+                                    OutputItem::Owned(v) => {
+                                        write_output_owned_value(o, v, &output_config)
+                                    }
+                                },
+                            )?;
+                            Ok(!stop)
+                        };
                     evaluate_bytes_streaming(
                         json_bytes,
                         &expr,
@@ -9232,11 +9234,81 @@ fn m2_has_stderr_effect(expr: &Expr) -> bool {
     })
 }
 
-/// Whether `json` has a NaN word in it, in any case: jq reads `nan`, `NaN` and
-/// `sNaN12` as numbers (#2877). Conservative: a string holding "nan" says yes.
-fn may_contain_nan_word(json: &[u8]) -> bool {
-    json.windows(3)
-        .any(|w| w[0] | 0x20 == b'n' && w[1] | 0x20 == b'a' && w[2] | 0x20 == b'n')
+/// How deep a document may nest for [`colored_stream_safe`] to vouch for it:
+/// well inside the 256 levels past which the materializing writer refuses.
+const COLORED_STREAM_MAX_DEPTH: usize = 128;
+
+/// Whether `json` is a document whose `-C` render the streaming printers give
+/// the same bytes, and the same refusals, as the materializing writer `-C`
+/// used to render every record with (#5415). `false` is "not proven", never
+/// "malformed": such a document is rendered the old way, which is correct for
+/// any input. A sufficient test, made in one pass per document:
+///
+/// - every string is one the materializer decodes: each `\` escape is a
+///   valid one, and no `\u` names a surrogate. The streaming printers echo a
+///   string's source text, so an unpaired surrogate (`"\ud800"`, #1247) would
+///   print where the materializer refuses it;
+/// - nesting stays within [`COLORED_STREAM_MAX_DEPTH`], where the materializer
+///   refuses past 256 with a diagnostic of its own and the printers past 384
+///   with another (#1818, #2850);
+/// - no word other than `true`, `false` and `null` stands as a value: jq reads
+///   `nan`, `NaN`, `sNaN12` and `Infinity` as numbers (#2877). The streamers
+///   print a NaN as a plain `null` where the colorizer needs the marker to
+///   color it as jq does (#3413), and echo `Infinity` under `--preserve-input`.
+///   Outside a string the letters of those three words and an exponent's `E`
+///   are the only ones allowed, and an `n` is followed by a `u`, not an `a`.
+fn colored_stream_safe(json: &[u8]) -> bool {
+    let mut depth = 0usize;
+    let mut at = 0;
+    while let Some(&byte) = json.get(at) {
+        at += 1;
+        match byte {
+            b'"' => loop {
+                // An unterminated string is the old route's to report.
+                let Some(len) = json[at..].iter().position(|&b| b == b'"' || b == b'\\') else {
+                    return false;
+                };
+                at += len;
+                if json[at] == b'"' {
+                    at += 1;
+                    break;
+                }
+                match json.get(at + 1) {
+                    Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => at += 2,
+                    Some(b'u') => {
+                        let Some(hex) = json.get(at + 2..at + 6) else {
+                            return false;
+                        };
+                        let surrogate =
+                            hex[0] | 0x20 == b'd' && matches!(hex[1] | 0x20, b'8'..=b'f');
+                        if surrogate || !hex.iter().all(u8::is_ascii_hexdigit) {
+                            return false;
+                        }
+                        at += 6;
+                    }
+                    _ => return false,
+                }
+            },
+            b'[' | b'{' => {
+                depth += 1;
+                if depth > COLORED_STREAM_MAX_DEPTH {
+                    return false;
+                }
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            b'n' if json.get(at).is_some_and(|b| b | 0x20 == b'a') => return false,
+            b if b.is_ascii_alphabetic()
+                && !matches!(
+                    b,
+                    b't' | b'r' | b'u' | b'e' | b'f' | b'a' | b'l' | b's' | b'n' | b'E'
+                ) =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 /// Evaluate one JSON document through the M2 fast path (#1576): stream
@@ -9987,11 +10059,26 @@ fn reject_raw_output0_nul(s: &str, config: &OutputConfig) -> Result<()> {
 /// All or nothing per record: a value that fails to decode leaves none of
 /// the record on `out` (#3265). `scratch` is the caller's reusable buffer
 /// for that; its contents on entry and on return are unspecified.
+#[cfg(test)]
 fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
     out: &mut Out,
     value: &JqValue<'_, Wrd>,
     config: &OutputConfig,
     scratch: &mut Vec<u8>,
+) -> Result<()> {
+    write_output_jq_value_colored(out, value, config, scratch, false)
+}
+
+/// [`write_output_jq_value`], with `stream_color` set when `-C` may render
+/// this record through `print_json` rather than materializing it: the
+/// caller has proved the record's document is one the two give the same
+/// bytes for (`colored_stream_safe`, #5415).
+fn write_output_jq_value_colored<Out: Write, Wrd: Clone + AsRef<[u64]>>(
+    out: &mut Out,
+    value: &JqValue<'_, Wrd>,
+    config: &OutputConfig,
+    scratch: &mut Vec<u8>,
+    stream_color: bool,
 ) -> Result<()> {
     // Raw-output string, if any -- resolved and NUL-checked before
     // writing *any* byte of this record, including the `--seq` RS
@@ -10064,7 +10151,7 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
     scratch.clear();
     let written = (|| {
         if !is_raw_record(&as_str, config) {
-            render_json_body(scratch, value, config)?;
+            render_json_body(scratch, value, config, stream_color)?;
         }
         if write_output_raw_prologue(out, as_str, config)? {
             return Ok(());
@@ -10139,6 +10226,7 @@ fn render_json_body<Wrd: Clone + AsRef<[u64]>>(
     out: &mut Vec<u8>,
     value: &JqValue<'_, Wrd>,
     config: &OutputConfig,
+    stream_color: bool,
 ) -> Result<()> {
     // `JqCompat` uses the jq-compatible formatter (reformats numbers); a
     // source-preserving convention uses the preserve formatter (keeps the
@@ -10185,7 +10273,7 @@ fn render_json_body<Wrd: Clone + AsRef<[u64]>>(
                 None,
             )?;
         }
-    } else if streams_colored(config) {
+    } else if stream_color && streams_colored(config) {
         // #5415: `-C` renders the uncolored text the same way, with a NaN
         // spelled as `NAN_COLOR_MARKER` for the colorizer, and the caller
         // colors it as it copies the record out. The old route built an
