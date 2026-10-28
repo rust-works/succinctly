@@ -3884,6 +3884,14 @@ impl<'a> Parser<'a> {
                 self.parse_postfix(expr)
             }
 
+            // #5456: yq's `~` is the null literal.
+            // It takes no postfix: yq answers `bad expression` for `~[0]` and `~.a`.
+            Some('~') if self.mode == ParserMode::Yq => {
+                self.next();
+                self.last_primary_is_term = true; // #3038: leaf Term
+                Ok(Expr::Literal(Literal::Null))
+            }
+
             // Variable reference: $varname, $__loc__, or $ENV
             Some('$') => {
                 let sigil_offset = self.pos;
@@ -4037,7 +4045,10 @@ impl<'a> Parser<'a> {
                     && ((self.matches_keyword("to_json")
                         && !self.shadowable_defs.contains("to_json"))
                         || (self.matches_keyword("to_yaml")
-                            && !self.shadowable_defs.contains("to_yaml")))
+                            && !self.shadowable_defs.contains("to_yaml"))
+                        // #5456: yq also spells it `toyaml`.
+                        || (self.matches_keyword("toyaml")
+                            && !self.shadowable_defs.contains("toyaml")))
                 {
                     // #4206: yq's `to_json` / `to_yaml`, each with an optional literal indent.
                     self.parse_yq_to_text_operator()
@@ -4609,7 +4620,13 @@ impl<'a> Parser<'a> {
     /// `to_json(2+2)`, `to_json(-1)`) as `bad expression`.
     fn parse_yq_to_text_operator(&mut self) -> Result<Expr, ParseError> {
         let json = self.matches_keyword("to_json");
-        self.consume_keyword(if json { "to_json" } else { "to_yaml" });
+        self.consume_keyword(if json {
+            "to_json"
+        } else if self.matches_keyword("toyaml") {
+            "toyaml"
+        } else {
+            "to_yaml"
+        });
         // The `(` must follow the name directly: yq reads `to_json (2)` as `to_json` and a stray
         // parenthesised `2`, and rejects it.
         let indent = if self.peek() == Some('(') {
@@ -7255,6 +7272,11 @@ impl<'a> Parser<'a> {
                 self.consume_keyword("from_yaml");
                 return Ok(Some(Builtin::FromYaml));
             }
+            // #5456: yq also spells it `fromyaml`.
+            if self.matches_keyword("fromyaml") {
+                self.consume_keyword("fromyaml");
+                return Ok(Some(Builtin::FromYaml));
+            }
             // #4872: `envsubst`, with the `nu`/`ne`/`ff` flags as bare words.
             if self.matches_keyword("envsubst") {
                 self.consume_keyword("envsubst");
@@ -9639,6 +9661,26 @@ impl<'a> Parser<'a> {
     /// Called after "as" has been consumed.
     fn parse_as_pattern(&mut self, expr: Expr) -> Result<Expr, ParseError> {
         let mut patterns = self.parse_pattern_alternatives()?;
+        // #5456: yq's `SRC as $v ireduce (INIT; UPDATE)` is `reduce SRC as $v (INIT; UPDATE)`.
+        if self.mode == ParserMode::Yq && self.matches_keyword("ireduce") {
+            self.consume_keyword("ireduce");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let init = self.parse_expr()?;
+            self.skip_ws();
+            self.expect(';')?;
+            self.skip_ws();
+            let update = self.parse_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Expr::Reduce {
+                input: Box::new(expr),
+                patterns,
+                init: Box::new(init),
+                update: Box::new(update),
+            });
+        }
         self.expect('|')?;
         self.skip_ws();
         let body = match self.mode {
@@ -14634,10 +14676,12 @@ mod tests {
             "from_json",
             "from_unix",
             "from_yaml",
+            "fromyaml",
             "fromjson",
             "group_by",
             "has",
             "head_comment",
+            "ireduce",
             "join",
             "key",
             "keys",
@@ -14680,6 +14724,7 @@ mod tests {
             "to_string",
             "to_unix",
             "to_yaml",
+            "toyaml",
             "tojson",
             "tonumber",
             "tostring",
