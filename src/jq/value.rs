@@ -28,6 +28,12 @@ use super::escape::{escape_json_body, write_json_body_jq};
 use super::eval::{EvalSemantics, EvalTag, JqSemantics, YqSemantics};
 use super::expr::Literal;
 
+mod object_map;
+
+pub use object_map::{
+    ObjectMapEntry, ObjectMapIntoIter, ObjectMapOf, OccupiedMapEntry, Occurrences, VacantMapEntry,
+};
+
 /// Recursion-depth ceiling for tree-walkers over an already-materialized
 /// [`OwnedValue`] (#1005).
 ///
@@ -2344,190 +2350,8 @@ macro_rules! shared_container {
     };
 }
 
-/// The backing store for an object-valued enum arm: an
-/// `IndexMap<String, V>` held behind a single pointer (#3000), refcounted so
-/// that clones share it until one side writes (#2999).
-///
-/// The cost is one extra allocation (plus, in the shipped shape, a 16-byte
-/// refcount header) and one extra pointer chase per object -- charged per
-/// object regardless of size, so an *empty* `{}`, which used to cost nothing
-/// on the heap (`IndexMap::new()` does not allocate), now costs a
-/// `malloc`/`free` pair with no offsetting inline saving of its own.
-///
-/// The indirection is invisible to callers. [`Deref`]/[`DerefMut`] expose
-/// the whole `IndexMap` API, [`IntoIterator`] is implemented for the owned,
-/// shared and mutable forms, and [`From`]/[`FromIterator`] build one from
-/// anything an `IndexMap` can be built from -- so `Object(map)` patterns keep
-/// reading and writing the map exactly as before. Only *construction* from a
-/// bare `IndexMap` needs a `.into()`.
-///
-/// `DerefMut` and the by-value conversions (`into_index_map`, the owned
-/// `IntoIterator`) are where a shared map is copied; both are
-/// `#[track_caller]` in the builds that read it (`test`, `share-stats`) so
-/// [`share_stats`](super::share_stats) can name the line that forced it.
-///
-/// Note for downstream users: the shape of the `OwnedValue::Object` variant
-/// changed in #3000 (boxed) and again in #2999 (refcounted). Construct with
-/// [`OwnedValue::object_from`] (or `IndexMap::....into()`) and read through
-/// [`OwnedValue::as_object`]/[`OwnedValue::as_object_mut`], whose signatures
-/// are unchanged throughout.
-pub struct ObjectMapOf<V>(ObjectMapInnerOf<V>);
-
 /// [`OwnedValue::Object`]'s backing store: [`ObjectMapOf`] over `OwnedValue`.
 pub type ObjectMap = ObjectMapOf<OwnedValue>;
-
-/// [`ObjectMapOf`]'s inner representation: refcounted in the shipped build.
-#[cfg(not(feature = "unshared-containers"))]
-type ObjectMapInnerOf<V> = Rc<IndexMap<String, V>>;
-
-/// See [`ObjectMapInnerOf`]'s shared twin -- the `unshared-containers`
-/// measurement holdout, the #3000 layout: boxed, not shared.
-#[cfg(feature = "unshared-containers")]
-type ObjectMapInnerOf<V> = Box<IndexMap<String, V>>;
-
-shared_container! {
-    ObjectMapOf, ObjectMapInnerOf, target = IndexMap<String, V>,
-    into = into_index_map, on_write = ObjectMakeMut, on_unwrap = ObjectUnwrap,
-    unshared_from = |map| Box::new(map),
-    unshared_into = |inner| *inner,
-}
-
-impl<V> FromIterator<(String, V)> for ObjectMapOf<V> {
-    #[inline]
-    fn from_iter<I: IntoIterator<Item = (String, V)>>(iter: I) -> Self {
-        Self::from(IndexMap::from_iter(iter))
-    }
-}
-
-impl<V: Clone> Extend<(String, V)> for ObjectMapOf<V> {
-    #[inline]
-    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
-    fn extend<I: IntoIterator<Item = (String, V)>>(&mut self, iter: I) {
-        (**self).extend(iter);
-    }
-}
-
-/// By-value iteration over an [`ObjectMapOf`].
-///
-/// The map's own iterator when this handle was the last one, otherwise one
-/// pass over the shared map cloning each entry as it goes -- never a copy of
-/// the whole map first and a second pass to consume it (#2999 review).
-pub enum ObjectMapIntoIter<V> {
-    /// This handle owned the map outright.
-    Owned(indexmap::map::IntoIter<String, V>),
-    /// Another handle still shares the map; the entries in `next..end` are
-    /// cloned out, from either end (`DoubleEndedIterator`, like the owned
-    /// form).
-    #[cfg(not(feature = "unshared-containers"))]
-    Shared {
-        /// The map every remaining entry is cloned from.
-        map: Rc<IndexMap<String, V>>,
-        /// Index of the next entry from the front.
-        next: usize,
-        /// One past the next entry from the back.
-        end: usize,
-    },
-}
-
-impl<V: Clone> Iterator for ObjectMapIntoIter<V> {
-    type Item = (String, V);
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::Owned(iter) => iter.next(),
-            #[cfg(not(feature = "unshared-containers"))]
-            Self::Shared { map, next, end } => {
-                if next >= end {
-                    return None;
-                }
-                let (k, v) = map.get_index(*next)?;
-                *next += 1;
-                Some((k.clone(), v.clone()))
-            }
-        }
-    }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        match self {
-            Self::Owned(iter) => iter.size_hint(),
-            #[cfg(not(feature = "unshared-containers"))]
-            Self::Shared { next, end, .. } => {
-                let n = end - next;
-                (n, Some(n))
-            }
-        }
-    }
-}
-
-impl<V: Clone> DoubleEndedIterator for ObjectMapIntoIter<V> {
-    #[inline]
-    fn next_back(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::Owned(iter) => iter.next_back(),
-            #[cfg(not(feature = "unshared-containers"))]
-            Self::Shared { map, next, end } => {
-                if next >= end {
-                    return None;
-                }
-                *end -= 1;
-                let (k, v) = map.get_index(*end)?;
-                Some((k.clone(), v.clone()))
-            }
-        }
-    }
-}
-
-impl<V: Clone> IntoIterator for ObjectMapOf<V> {
-    type Item = (String, V);
-    type IntoIter = ObjectMapIntoIter<V>;
-
-    #[inline]
-    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
-    fn into_iter(self) -> Self::IntoIter {
-        #[cfg(not(feature = "unshared-containers"))]
-        {
-            match Rc::try_unwrap(self.0) {
-                Ok(map) => ObjectMapIntoIter::Owned(map.into_iter()),
-                Err(shared) => {
-                    note_forced_copy!(ObjectUnwrap);
-                    let end = shared.len();
-                    ObjectMapIntoIter::Shared {
-                        map: shared,
-                        next: 0,
-                        end,
-                    }
-                }
-            }
-        }
-        #[cfg(feature = "unshared-containers")]
-        {
-            ObjectMapIntoIter::Owned((*self.0).into_iter())
-        }
-    }
-}
-
-impl<'a, V> IntoIterator for &'a ObjectMapOf<V> {
-    type Item = (&'a String, &'a V);
-    type IntoIter = indexmap::map::Iter<'a, String, V>;
-
-    #[inline]
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.iter()
-    }
-}
-
-impl<'a, V: Clone> IntoIterator for &'a mut ObjectMapOf<V> {
-    type Item = (&'a String, &'a mut V);
-    type IntoIter = indexmap::map::IterMut<'a, String, V>;
-
-    #[inline]
-    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
-    fn into_iter(self) -> Self::IntoIter {
-        (**self).iter_mut()
-    }
-}
 
 /// The backing store for an array-valued enum arm: a `Vec<V>` held behind a
 /// single refcounted pointer (#2999), the array twin of [`ObjectMapOf`].
@@ -2675,7 +2499,6 @@ impl<V: Clone> DoubleEndedIterator for ArrayIntoIter<V> {
 }
 
 impl<V: Clone> ExactSizeIterator for ArrayIntoIter<V> {}
-impl<V: Clone> ExactSizeIterator for ObjectMapIntoIter<V> {}
 
 impl<V: Clone> IntoIterator for ArrayOf<V> {
     type Item = V;
@@ -3989,10 +3812,13 @@ impl OwnedValue {
 
     /// Convert to a mutable object reference, if possible.
     ///
-    /// A copy-on-write point (#2999): on a shared map this is where the
-    /// copy happens, attributed to this method's caller.
-    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
-    pub fn as_object_mut(&mut self) -> Option<&mut IndexMap<String, Self>> {
+    /// Hands out the [`ObjectMap`] itself, not its `IndexMap` (#1344), so the
+    /// copy-on-write point (#2999) is the first mutator called on it -- not
+    /// this method, which writes nothing -- and `share-stats` attributes the
+    /// copy to that call. The mutators that keep a repeated key's earlier
+    /// entries in step are inherent methods of [`ObjectMapOf`]; a raw
+    /// `&mut IndexMap` borrow (`DerefMut`) collapses them first.
+    pub fn as_object_mut(&mut self) -> Option<&mut ObjectMap> {
         match self {
             Self::Object(obj) => Some(obj),
             _ => None,
@@ -6363,7 +6189,8 @@ mod tests {
     /// spelling is a `Box<str>`'s size, #3191) -- with the
     /// discriminant packed into `NumberRepr`'s own niche; holding the object
     /// map behind a pointer is what demotes `Object` from widest arm to 8
-    /// bytes. #2999 put `Array` behind a pointer as well (24 -> 8), which
+    /// bytes (16 since #1344 added the side list for a repeated key's earlier
+    /// entries, still under `NumberLiteral`'s 32). #2999 put `Array` behind a pointer as well (24 -> 8), which
     /// changes nothing here -- `NumberLiteral` was already the widest arm --
     /// and is asserted so the shape stays documented. 32 holds in every build
     /// -- under the `unshared-containers` holdout the array's `Vec` is inline
@@ -6381,11 +6208,14 @@ mod tests {
             "size_of::<OwnedValue>() moved -- every array element, object entry and \
              scalar pays this. See #3000 before re-pinning."
         );
+        // The map pointer and the repeated-key side list's (#1344): the side
+        // list is in the handle, not the map's heap block, so an object that
+        // repeats no key allocates exactly what it did before.
         assert_eq!(
             core::mem::size_of::<ObjectMap>(),
-            core::mem::size_of::<usize>(),
-            "ObjectMap must stay one pointer wide -- that is what keeps Object from \
-             being OwnedValue's widest arm again"
+            2 * core::mem::size_of::<usize>(),
+            "ObjectMap must stay two pointers wide -- narrow enough that Object is not \
+             OwnedValue's widest arm again, and with the map as the only heap block"
         );
         #[cfg(not(feature = "unshared-containers"))]
         assert_eq!(
@@ -6453,9 +6283,12 @@ mod tests {
         assert!(sized.capacity() >= 8);
     }
 
-    /// `as_object`/`as_object_mut` keep returning a bare `&IndexMap`
-    /// (#3000's public-API promise): the boxing is not supposed to show up
-    /// in either signature, only in the variant's own payload.
+    /// `as_object` keeps returning a bare `&IndexMap` (#3000's public-API
+    /// promise): the boxing is not supposed to show up in the signature, only
+    /// in the variant's own payload. `as_object_mut` returns `&mut ObjectMap`
+    /// since #1344 so the shadow-aware mutators are reachable, and an
+    /// `&mut IndexMap` annotation still compiles by deref coercion -- which is
+    /// what the `let` below exercises.
     #[test]
     fn as_object_accessors_still_hand_out_a_bare_index_map_3000() {
         let mut value = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);

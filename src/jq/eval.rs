@@ -502,7 +502,8 @@ use super::value::{
     assert_value_tree_depth, check_value_tree_depth, cmp_f64, document_number_f64,
     infinite_float_preview_text, int_to_f64, jq_identical, jq_literal_int_to_f64, jq_numeric_cmp,
     numeric_repr_cmp, owned_value_eq, owned_value_eq_at_depth_generic, subarray_indices,
-    subarray_positions, window_matches, ArrayVec, NumberRepr, ObjectMap, OwnedValue,
+    subarray_positions, window_matches, ArrayVec, NumberRepr, ObjectMap, ObjectMapEntry,
+    OwnedValue,
 };
 
 /// Which binary operator an operand that produced *zero outputs* is being
@@ -15474,11 +15475,11 @@ fn merge_object_fields(
 ) -> ObjectMap {
     for (k, v) in right {
         match left.entry(k) {
-            indexmap::map::Entry::Occupied(mut e) => {
+            ObjectMapEntry::Occupied(mut e) => {
                 let existing = e.insert(OwnedValue::Null);
                 e.insert(merge_existing_at_depth(existing, v, flags, depth + 1));
             }
-            indexmap::map::Entry::Vacant(e) => {
+            ObjectMapEntry::Vacant(e) => {
                 if let Some(new_value) = merge_position(None, v, flags, true, depth + 1) {
                     e.insert(new_value);
                 }
