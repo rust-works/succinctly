@@ -4239,8 +4239,7 @@ mod tests {
         assert!(matches!(plan(11), TailPlan::Copy), "a lone stage");
         assert!(matches!(plan(6), TailPlan::Copy), "six stages are copied");
         let after = PipeStages::from(
-            [Expr::Identity]
-                .into_iter()
+            core::iter::once(Expr::Identity)
                 .chain(vec![Expr::Field("a".into()); 11])
                 .collect::<Vec<_>>(),
         );
