@@ -23,6 +23,10 @@ fn test_whitespace_after_a_dot_matches_jq_5447() -> Result<()> {
         (". | .a", "{\"b\":[1,2]}\n"),
         (". as $x | $x.a", "{\"b\":[1,2]}\n"),
         (". and true", "true\n"),
+        (". \"a\"", "{\"b\":[1,2]}\n"),
+        (". [\"a\"]", "{\"b\":[1,2]}\n"),
+        (".#c\n.a", "{\"b\":[1,2]}\n"),
+        ("try . catch .", "{\"a\":{\"b\":[1,2]}}\n"),
     ] {
         let (stdout, code) = run_jq_stdin(filter, DOC, &["-c"])?;
         assert_eq!((stdout.as_str(), code), (want, 0), "`{filter}`");
@@ -33,7 +37,19 @@ fn test_whitespace_after_a_dot_matches_jq_5447() -> Result<()> {
 #[test]
 fn test_name_after_a_gap_is_a_syntax_error_like_jq_5447() -> Result<()> {
     for filter in [
-        ". a", ". true", ". null", ". not", ".a. b", ".a . b", ".\na", ". ..",
+        ". a",
+        ". true",
+        ". null",
+        ". not",
+        ".a. b",
+        ".a . b",
+        ".\na",
+        ". ..",
+        ". .5",
+        "{a: . b}",
+        "[. a]",
+        ".#c\na",
+        "if . then . a else 1 end",
     ] {
         let (stdout, code) = run_jq_stdin(filter, DOC, &["-c"])?;
         assert_eq!(stdout, "", "`{filter}`");
