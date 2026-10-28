@@ -12,15 +12,24 @@
 //!
 //! # Representation
 //!
-//! [`ObjectMapOf`] stays one pointer. Its target is an [`ObjectStore`]:
+//! [`ObjectMapOf`] is two pointers:
 //!
-//! - `map` is the **collapsed view**: each key once, at its first entry's
-//!   position, holding its last entry's value (I1). Every reader that goes
-//!   through [`Deref`] sees exactly what it saw when the target was a bare
-//!   `IndexMap`.
+//! - `map` is the **collapsed view**: a refcounted `IndexMap` holding each key
+//!   once, at its first entry's position, with its last entry's value (I1).
+//!   Every reader that goes through [`Deref`] sees exactly what it saw when
+//!   the handle was a bare pointer to that map. The heap block is the
+//!   `IndexMap` and nothing else, so an object that repeats no key costs the
+//!   allocator what it always cost (#3000 sized `OwnedValue` and `JqValue`
+//!   against those very chunk sizes).
 //! - `shadows` is `None` unless some key repeats (I2). When it is `Some`, it
 //!   lists every entry in document order, so the full view
 //!   ([`ObjectMapOf::occurrences`]) is recoverable.
+//!
+//! The second pointer lives in the handle, not in the map's heap block, on
+//! purpose: it adds 8 bytes to a value that is already 32 wide (so no value
+//! grows), where a field in the block would step the allocator one bin on
+//! glibc for every object and showed as +1% to +3% peak RSS on object-heavy
+//! inputs (#1344).
 //!
 //! Invariants, kept by every method here:
 //!
@@ -55,7 +64,7 @@
 //! | `push_occurrence`                                          | appends; an existing live entry becomes a shadow |
 //! | `first_occurrence`, `first_occurrence_mut`                 | the earliest entry for the key                  |
 
-#[cfg(not(test))]
+#[cfg(all(not(test), feature = "unshared-containers"))]
 use alloc::boxed::Box;
 #[cfg(not(test))]
 use alloc::string::String;
@@ -80,18 +89,19 @@ macro_rules! note_forced_copy {
     };
 }
 
-/// The backing store for an object-valued enum arm, behind a single pointer.
+/// The backing store for an object-valued enum arm: an
+/// [`IndexMap<String, V>`](IndexMap) (the collapsed view) behind a single
+/// pointer, plus the shadows of any repeated key (#1344).
 ///
-/// It holds an [`IndexMap<String, V>`](IndexMap) (the collapsed view) behind
-/// that pointer (#3000), refcounted so that clones share it until one side
-/// writes (#2999), plus the shadows of any repeated key (#1344).
-///
-/// The cost is one extra allocation (plus, in the shipped shape, a 16-byte
-/// refcount header) and one extra pointer chase per object -- charged per
-/// object regardless of size, so an *empty* `{}`, which used to cost nothing
-/// on the heap (`IndexMap::new()` does not allocate), now costs a
-/// `malloc`/`free` pair with no offsetting inline saving of its own. The
-/// shadows add one more word to that block.
+/// The map is refcounted so that clones share it until one side writes
+/// (#2999), and held behind that one pointer (#3000). The cost is one extra
+/// allocation (plus, in the shipped shape, a 16-byte refcount header) and one
+/// extra pointer chase per object -- charged per object regardless of size,
+/// so an *empty* `{}`, which used to cost nothing on the heap
+/// (`IndexMap::new()` does not allocate), now costs a `malloc`/`free` pair
+/// with no offsetting inline saving of its own. The shadows are a second,
+/// separately refcounted pointer that is `None` for an object with no
+/// repeated key.
 ///
 /// The indirection is invisible to callers. [`Deref`]/[`DerefMut`] expose
 /// the whole `IndexMap` API, [`IntoIterator`] is implemented for the owned,
@@ -112,27 +122,30 @@ macro_rules! note_forced_copy {
 /// [`OwnedValue::object_from`](super::OwnedValue::object_from) (or
 /// `IndexMap::....into()`) and read through
 /// [`OwnedValue::as_object`](super::OwnedValue::as_object).
-pub struct ObjectMapOf<V>(ObjectMapInnerOf<V>);
+pub struct ObjectMapOf<V> {
+    /// The collapsed view (I1).
+    map: ObjectMapInnerOf<V>,
+    /// Every repeated key's earlier entries, or `None` when no key repeats
+    /// (I2).
+    shadows: Option<ShadowsInnerOf<V>>,
+}
 
-/// [`ObjectMapOf`]'s inner representation: refcounted in the shipped build.
+/// [`ObjectMapOf`]'s map: refcounted in the shipped build.
 #[cfg(not(feature = "unshared-containers"))]
-type ObjectMapInnerOf<V> = Rc<ObjectStore<V>>;
+type ObjectMapInnerOf<V> = Rc<IndexMap<String, V>>;
 
 /// See [`ObjectMapInnerOf`]'s shared twin -- the `unshared-containers`
 /// measurement holdout, the #3000 layout: boxed, not shared.
 #[cfg(feature = "unshared-containers")]
-type ObjectMapInnerOf<V> = Box<ObjectStore<V>>;
+type ObjectMapInnerOf<V> = Box<IndexMap<String, V>>;
 
-/// What [`ObjectMapOf`] points at. Public only because the by-value iterator
-/// names it; its fields are private.
-#[doc(hidden)]
-pub struct ObjectStore<V> {
-    /// The collapsed view (I1).
-    map: IndexMap<String, V>,
-    /// Every repeated key's earlier entries, or `None` when no key repeats
-    /// (I2).
-    shadows: Option<Box<Shadows<V>>>,
-}
+/// [`ObjectMapOf`]'s side list: refcounted in the shipped build.
+#[cfg(not(feature = "unshared-containers"))]
+type ShadowsInnerOf<V> = Rc<Shadows<V>>;
+
+/// See [`ShadowsInnerOf`]'s shared twin.
+#[cfg(feature = "unshared-containers")]
+type ShadowsInnerOf<V> = Box<Shadows<V>>;
 
 /// The document-order list of entries for a map in which some key repeats.
 ///
@@ -150,10 +163,8 @@ struct Shadows<V> {
     live_pos: Vec<usize>,
 }
 
-/// One entry of [`Shadows::order`]. Public only because [`Occurrences`] names
-/// it.
-#[doc(hidden)]
-pub enum Occurrence<V> {
+/// One entry of [`Shadows::order`].
+enum Occurrence<V> {
     /// The key's last entry; its value is the `map` slot's.
     Live(usize),
     /// An earlier entry for a key whose later entry is live.
@@ -178,52 +189,20 @@ impl<V: Clone> Clone for Shadows<V> {
     }
 }
 
-impl<V: Clone> Clone for ObjectStore<V> {
-    fn clone(&self) -> Self {
-        Self {
-            map: self.map.clone(),
-            shadows: self.shadows.clone(),
-        }
-    }
-}
-
-impl<V> ObjectStore<V> {
-    fn from_map(map: IndexMap<String, V>) -> Self {
-        Self { map, shadows: None }
-    }
-
-    /// Records a key that was just appended to `map` at `slot`.
-    #[inline]
-    fn note_vacant_insert(&mut self, slot: usize) {
-        if let Some(shadows) = self.shadows.as_deref_mut() {
-            shadows.push_live(slot);
-        }
-    }
-
-    /// Restores I2 after a removal: no shadow left means no side list.
-    fn drop_shadows_if_none_left(&mut self) {
-        if let Some(shadows) = self.shadows.as_deref() {
-            if shadows.order.len() == self.map.len() {
-                self.shadows = None;
-            }
-        }
-    }
-}
-
 impl<V> Shadows<V> {
-    /// Records a key that was just appended to the map at `slot`.
-    #[inline]
-    fn push_live(&mut self, slot: usize) {
-        self.live_pos.push(self.order.len());
-        self.order.push(Occurrence::Live(slot));
-    }
-
     /// A side list for a map with `len` slots and no shadow yet.
     fn with_live_slots(len: usize) -> Self {
         Self {
             order: (0..len).map(Occurrence::Live).collect(),
             live_pos: (0..len).collect(),
         }
+    }
+
+    /// Records a key that was just appended to the map at `slot`.
+    #[inline]
+    fn push_live(&mut self, slot: usize) {
+        self.live_pos.push(self.order.len());
+        self.order.push(Occurrence::Live(slot));
     }
 
     /// Recomputes `live_pos` from `order` for a map of `len` slots.
@@ -236,6 +215,50 @@ impl<V> Shadows<V> {
             }
         }
     }
+
+    /// Whether every entry is live, i.e. no key repeats (I2).
+    #[inline]
+    fn has_no_shadow(&self, map_len: usize) -> bool {
+        self.order.len() == map_len
+    }
+}
+
+/// The map, copied first if another handle shares it -- the copy-on-write
+/// point (#2999). `V: Clone` is what `Rc::make_mut` needs and is the only
+/// bound the sharing adds anywhere.
+#[inline]
+#[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+fn map_mut<V: Clone>(map: &mut ObjectMapInnerOf<V>) -> &mut IndexMap<String, V> {
+    #[cfg(not(feature = "unshared-containers"))]
+    {
+        if Rc::strong_count(map) > 1 {
+            note_forced_copy!(ObjectMakeMut);
+        }
+        Rc::make_mut(map)
+    }
+    #[cfg(feature = "unshared-containers")]
+    {
+        map
+    }
+}
+
+/// The side list, copied first if another handle shares it.
+#[inline]
+fn shadows_mut<V: Clone>(shadows: &mut ShadowsInnerOf<V>) -> &mut Shadows<V> {
+    #[cfg(not(feature = "unshared-containers"))]
+    {
+        Rc::make_mut(shadows)
+    }
+    #[cfg(feature = "unshared-containers")]
+    {
+        shadows
+    }
+}
+
+/// `shadows` as a mutable reference to its list, if there is one.
+#[inline]
+fn live_shadows_mut<V: Clone>(shadows: &mut Option<ShadowsInnerOf<V>>) -> Option<&mut Shadows<V>> {
+    shadows.as_mut().map(shadows_mut)
 }
 
 impl<V> ObjectMapOf<V> {
@@ -260,7 +283,9 @@ impl<V> ObjectMapOf<V> {
     /// Sound as an identity test precisely because a write through
     /// either handle copies first ([`DerefMut`], `Rc::make_mut`):
     /// while the answer is `true`, neither handle has been written
-    /// through since they were split.
+    /// through since they were split. Every method that changes the side
+    /// list also changes the map, so equal map pointers with different side
+    /// lists cannot happen.
     ///
     /// Always `false` under `unshared-containers`, where a clone
     /// already deep-copied and no two handles can share anything --
@@ -271,7 +296,12 @@ impl<V> ObjectMapOf<V> {
     pub fn ptr_eq(&self, other: &Self) -> bool {
         #[cfg(not(feature = "unshared-containers"))]
         {
-            Rc::ptr_eq(&self.0, &other.0)
+            Rc::ptr_eq(&self.map, &other.map)
+                && match (&self.shadows, &other.shadows) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+                    _ => false,
+                }
         }
         #[cfg(feature = "unshared-containers")]
         {
@@ -289,7 +319,7 @@ impl<V> ObjectMapOf<V> {
     pub fn is_shared(&self) -> bool {
         #[cfg(not(feature = "unshared-containers"))]
         {
-            Rc::strong_count(&self.0) > 1
+            Rc::strong_count(&self.map) > 1
         }
         #[cfg(feature = "unshared-containers")]
         {
@@ -301,16 +331,16 @@ impl<V> ObjectMapOf<V> {
     /// [`occurrences`](Self::occurrences) differs from the collapsed view.
     #[inline]
     pub fn has_shadows(&self) -> bool {
-        self.0.shadows.is_some()
+        self.shadows.is_some()
     }
 
     /// How many entries the full view has: the collapsed view's length plus
     /// one per shadow.
     #[inline]
     pub fn occurrence_len(&self) -> usize {
-        match self.0.shadows.as_deref() {
+        match self.shadows.as_deref() {
             Some(shadows) => shadows.order.len(),
-            None => self.0.map.len(),
+            None => self.map.len(),
         }
     }
 
@@ -318,13 +348,13 @@ impl<V> ObjectMapOf<V> {
     /// object with no shadow this is the collapsed view's own iteration.
     #[inline]
     pub fn occurrences(&self) -> Occurrences<'_, V> {
-        match self.0.shadows.as_deref() {
-            Some(shadows) => Occurrences::Ordered {
-                map: &self.0.map,
+        Occurrences(match self.shadows.as_deref() {
+            Some(shadows) => OccurrencesInner::Ordered {
+                map: &self.map,
                 entries: shadows.order.iter(),
             },
-            None => Occurrences::Plain(self.0.map.iter()),
-        }
+            None => OccurrencesInner::Plain(self.map.iter()),
+        })
     }
 
     /// The earliest entry for `key`: the collapsed view's value when the key
@@ -338,8 +368,8 @@ impl<V> ObjectMapOf<V> {
     where
         Q: ?Sized + Hash + Equivalent<String>,
     {
-        let Some(shadows) = self.0.shadows.as_deref() else {
-            return self.0.map.get(key);
+        let Some(shadows) = self.shadows.as_deref() else {
+            return self.map.get(key);
         };
         for entry in &shadows.order {
             match entry {
@@ -347,7 +377,7 @@ impl<V> ObjectMapOf<V> {
                     return Some(value);
                 }
                 Occurrence::Live(slot) => {
-                    let (live_key, value) = self.0.map.get_index(*slot)?;
+                    let (live_key, value) = self.map.get_index(*slot)?;
                     if key.equivalent(live_key) {
                         return Some(value);
                     }
@@ -377,25 +407,6 @@ impl<V> ObjectMapOf<V> {
 }
 
 impl<V: Clone> ObjectMapOf<V> {
-    /// The copy-on-write point: a shared store is cloned here, once, before
-    /// the caller's write reaches it. `V: Clone` is what `Rc::make_mut`
-    /// needs and is the only bound the sharing adds anywhere.
-    #[inline]
-    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
-    fn store_mut(&mut self) -> &mut ObjectStore<V> {
-        #[cfg(not(feature = "unshared-containers"))]
-        {
-            if Rc::strong_count(&self.0) > 1 {
-                note_forced_copy!(ObjectMakeMut);
-            }
-            Rc::make_mut(&mut self.0)
-        }
-        #[cfg(feature = "unshared-containers")]
-        {
-            &mut self.0
-        }
-    }
-
     /// Consume the wrapper, yielding the collapsed `IndexMap` -- by move when
     /// this handle was the last one, by copy otherwise. Shadows are dropped.
     #[inline]
@@ -403,17 +414,17 @@ impl<V: Clone> ObjectMapOf<V> {
     pub fn into_index_map(self) -> IndexMap<String, V> {
         #[cfg(not(feature = "unshared-containers"))]
         {
-            match Rc::try_unwrap(self.0) {
-                Ok(store) => store.map,
+            match Rc::try_unwrap(self.map) {
+                Ok(map) => map,
                 Err(shared) => {
                     note_forced_copy!(ObjectUnwrap);
-                    shared.map.clone()
+                    (*shared).clone()
                 }
             }
         }
         #[cfg(feature = "unshared-containers")]
         {
-            self.0.map
+            *self.map
         }
     }
 
@@ -421,17 +432,20 @@ impl<V: Clone> ObjectMapOf<V> {
     /// move when this handle was the last one, by copy otherwise.
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     pub fn into_occurrences(self) -> Vec<(String, V)> {
+        let Self { map, shadows } = self;
         #[cfg(not(feature = "unshared-containers"))]
-        let store = match Rc::try_unwrap(self.0) {
-            Ok(store) => store,
-            Err(shared) => {
+        let (map, shadows) = {
+            let shared = Rc::strong_count(&map) > 1;
+            if shared {
                 note_forced_copy!(ObjectUnwrap);
-                (*shared).clone()
             }
+            (
+                Rc::try_unwrap(map).unwrap_or_else(|shared| (*shared).clone()),
+                shadows.map(|s| Rc::try_unwrap(s).unwrap_or_else(|shared| (*shared).clone())),
+            )
         };
         #[cfg(feature = "unshared-containers")]
-        let store = *self.0;
-        let ObjectStore { map, shadows } = store;
+        let (map, shadows) = (*map, shadows.map(|s| *s));
         let Some(shadows) = shadows else {
             return map.into_iter().collect();
         };
@@ -450,11 +464,9 @@ impl<V: Clone> ObjectMapOf<V> {
 
     /// Drops every shadow, leaving the collapsed view -- the answer a reader
     /// of the bare `IndexMap` always gave.
-    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+    #[inline]
     pub fn collapse(&mut self) {
-        if self.0.shadows.is_some() {
-            self.store_mut().shadows = None;
-        }
+        self.shadows = None;
     }
 
     /// Appends an entry for `key`, keeping an earlier entry for the same key.
@@ -467,43 +479,45 @@ impl<V: Clone> ObjectMapOf<V> {
     /// order.
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     pub fn push_occurrence(&mut self, key: String, value: V) {
-        let store = self.store_mut();
-        let (slot, old) = store.map.insert_full(key, value);
-        match old {
-            None => store.note_vacant_insert(slot),
-            Some(old_value) => {
-                // `insert_full` dropped the incoming key for an existing one, so the
-                // shadow takes a copy of the map's. Only a repeat pays this; a
-                // key seen for the first time never reaches this arm.
-                let key = store
-                    .map
-                    .get_index(slot)
-                    .map(|(k, _)| k.clone())
-                    .expect("insert_full returned a live slot");
-                let len = store.map.len();
-                let shadows = store
-                    .shadows
-                    .get_or_insert_with(|| Box::new(Shadows::with_live_slots(len)));
-                let pos = shadows.live_pos[slot];
-                shadows.order[pos] = Occurrence::Shadow(key, old_value);
-                shadows.live_pos[slot] = shadows.order.len();
-                shadows.order.push(Occurrence::Live(slot));
+        let map = map_mut(&mut self.map);
+        let (slot, old) = map.insert_full(key, value);
+        let Some(old_value) = old else {
+            if let Some(shadows) = live_shadows_mut(&mut self.shadows) {
+                shadows.push_live(slot);
             }
-        }
+            return;
+        };
+        // `insert_full` dropped the incoming key for an existing one, so the
+        // shadow takes a copy of the map's. Only a repeat pays this; a key
+        // seen for the first time never reaches here.
+        let key = map
+            .get_index(slot)
+            .map(|(k, _)| k.clone())
+            .expect("insert_full returned a live slot");
+        let len = map.len();
+        let shadows = shadows_mut(
+            self.shadows
+                .get_or_insert_with(|| Shadows::with_live_slots(len).into()),
+        );
+        let pos = shadows.live_pos[slot];
+        shadows.order[pos] = Occurrence::Shadow(key, old_value);
+        shadows.live_pos[slot] = shadows.order.len();
+        shadows.order.push(Occurrence::Live(slot));
     }
 
     /// A mutable reference to the earliest entry for `key`.
     ///
     /// The one method that writes through to a shadow rather than the live
-    /// entry: yq's `+` overwrites the *first* entry of a repeated key.
+    /// entry: yq's `+` overwrites the *first* entry of a repeated key. The
+    /// map is copied first even when the entry is a shadow, so two handles
+    /// that differ only in a shadow never share a map pointer.
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     pub fn first_occurrence_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
     where
         Q: ?Sized + Hash + Equivalent<String>,
     {
-        let store = self.store_mut();
-        let ObjectStore { map, shadows } = store;
-        let Some(shadows) = shadows.as_deref_mut() else {
+        let map = map_mut(&mut self.map);
+        let Some(shadows) = live_shadows_mut(&mut self.shadows) else {
             return map.get_mut(key);
         };
         let mut found = None;
@@ -533,28 +547,28 @@ impl<V: Clone> ObjectMapOf<V> {
     where
         Q: ?Sized + Hash + Equivalent<String>,
     {
-        self.store_mut().map.get_mut(key)
+        map_mut(&mut self.map).get_mut(key)
     }
 
     /// A mutable reference to the entry at `index` of the collapsed view.
     #[inline]
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     pub fn get_index_mut(&mut self, index: usize) -> Option<(&String, &mut V)> {
-        self.store_mut().map.get_index_mut(index)
+        map_mut(&mut self.map).get_index_mut(index)
     }
 
     /// Mutable iteration over the collapsed view's values.
     #[inline]
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     pub fn iter_mut(&mut self) -> indexmap::map::IterMut<'_, String, V> {
-        self.store_mut().map.iter_mut()
+        map_mut(&mut self.map).iter_mut()
     }
 
     /// Mutable iteration over the collapsed view's values.
     #[inline]
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     pub fn values_mut(&mut self) -> indexmap::map::ValuesMut<'_, String, V> {
-        self.store_mut().map.values_mut()
+        map_mut(&mut self.map).values_mut()
     }
 
     /// Sets `key` to `value`, returning the value it replaced.
@@ -565,13 +579,13 @@ impl<V: Clone> ObjectMapOf<V> {
     #[inline]
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     pub fn insert(&mut self, key: String, value: V) -> Option<V> {
-        let store = self.store_mut();
-        if store.shadows.is_none() {
-            return store.map.insert(key, value);
-        }
-        let (slot, old) = store.map.insert_full(key, value);
+        let map = map_mut(&mut self.map);
+        let Some(shadows) = live_shadows_mut(&mut self.shadows) else {
+            return map.insert(key, value);
+        };
+        let (slot, old) = map.insert_full(key, value);
         if old.is_none() {
-            store.note_vacant_insert(slot);
+            shadows.push_live(slot);
         }
         old
     }
@@ -584,7 +598,8 @@ impl<V: Clone> ObjectMapOf<V> {
     /// [`collapse`](Self::collapse).
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     pub fn entry(&mut self, key: String) -> ObjectMapEntry<'_, V> {
-        let ObjectStore { map, shadows } = self.store_mut();
+        let map = map_mut(&mut self.map);
+        let shadows = live_shadows_mut(&mut self.shadows);
         match map.entry(key) {
             indexmap::map::Entry::Occupied(entry) => {
                 ObjectMapEntry::Occupied(OccupiedMapEntry(entry))
@@ -602,9 +617,9 @@ impl<V: Clone> ObjectMapOf<V> {
     where
         Q: ?Sized + Hash + Equivalent<String>,
     {
-        let store = self.store_mut();
-        let (slot, _, value) = store.map.shift_remove_full(key)?;
-        if let Some(shadows) = store.shadows.as_deref_mut() {
+        let map = map_mut(&mut self.map);
+        let (slot, _, value) = map.shift_remove_full(key)?;
+        if let Some(shadows) = live_shadows_mut(&mut self.shadows) {
             shadows.order.retain_mut(|entry| match entry {
                 Occurrence::Live(live) if *live == slot => false,
                 Occurrence::Live(live) => {
@@ -615,8 +630,10 @@ impl<V: Clone> ObjectMapOf<V> {
                 }
                 Occurrence::Shadow(shadow_key, _) => !key.equivalent(shadow_key),
             });
-            shadows.rebuild_live_pos(store.map.len());
-            store.drop_shadows_if_none_left();
+            shadows.rebuild_live_pos(map.len());
+            if shadows.has_no_shadow(map.len()) {
+                self.shadows = None;
+            }
         }
         Some(value)
     }
@@ -633,11 +650,11 @@ impl<V: Clone> ObjectMapOf<V> {
     where
         Q: ?Sized + Hash + Equivalent<String>,
     {
-        let store = self.store_mut();
-        let (slot, _, value) = store.map.swap_remove_full(key)?;
-        if let Some(shadows) = store.shadows.as_deref_mut() {
+        let map = map_mut(&mut self.map);
+        let (slot, _, value) = map.swap_remove_full(key)?;
+        if let Some(shadows) = live_shadows_mut(&mut self.shadows) {
             // The key that sat in the last slot now sits in `slot`.
-            let moved_from = store.map.len();
+            let moved_from = map.len();
             shadows.order.retain_mut(|entry| match entry {
                 Occurrence::Live(live) if *live == slot => false,
                 Occurrence::Live(live) => {
@@ -648,8 +665,10 @@ impl<V: Clone> ObjectMapOf<V> {
                 }
                 Occurrence::Shadow(shadow_key, _) => !key.equivalent(shadow_key),
             });
-            shadows.rebuild_live_pos(store.map.len());
-            store.drop_shadows_if_none_left();
+            shadows.rebuild_live_pos(map.len());
+            if shadows.has_no_shadow(map.len()) {
+                self.shadows = None;
+            }
         }
         Some(value)
     }
@@ -661,14 +680,14 @@ impl<V: Clone> ObjectMapOf<V> {
     where
         F: FnMut(&String, &mut V) -> bool,
     {
-        let store = self.store_mut();
-        let Some(shadows) = store.shadows.as_deref_mut() else {
-            store.map.retain(keep);
+        let map = map_mut(&mut self.map);
+        let Some(shadows) = live_shadows_mut(&mut self.shadows) else {
+            map.retain(keep);
             return;
         };
-        let mut new_slot: Vec<Option<usize>> = Vec::with_capacity(store.map.len());
+        let mut new_slot: Vec<Option<usize>> = Vec::with_capacity(map.len());
         let mut kept = 0;
-        store.map.retain(|key, value| {
+        map.retain(|key, value| {
             let k = keep(key, value);
             new_slot.push(if k {
                 kept += 1;
@@ -678,7 +697,7 @@ impl<V: Clone> ObjectMapOf<V> {
             });
             k
         });
-        let map = &store.map;
+        let map = &*map;
         shadows.order.retain_mut(|entry| match entry {
             Occurrence::Live(live) => match new_slot[*live] {
                 Some(slot) => {
@@ -690,15 +709,16 @@ impl<V: Clone> ObjectMapOf<V> {
             Occurrence::Shadow(shadow_key, _) => map.contains_key(shadow_key),
         });
         shadows.rebuild_live_pos(map.len());
-        store.drop_shadows_if_none_left();
+        if shadows.has_no_shadow(map.len()) {
+            self.shadows = None;
+        }
     }
 
     /// Removes every entry.
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     pub fn clear(&mut self) {
-        let store = self.store_mut();
-        store.map.clear();
-        store.shadows = None;
+        map_mut(&mut self.map).clear();
+        self.shadows = None;
     }
 }
 
@@ -717,7 +737,7 @@ pub struct OccupiedMapEntry<'a, V>(indexmap::map::OccupiedEntry<'a, String, V>);
 /// An [`ObjectMapEntry`] for a key the object lacks.
 pub struct VacantMapEntry<'a, V> {
     entry: indexmap::map::VacantEntry<'a, String, V>,
-    shadows: &'a mut Option<Box<Shadows<V>>>,
+    shadows: Option<&'a mut Shadows<V>>,
 }
 
 impl<'a, V> OccupiedMapEntry<'a, V> {
@@ -763,7 +783,7 @@ impl<'a, V> VacantMapEntry<'a, V> {
     #[inline]
     pub fn insert(self, value: V) -> &'a mut V {
         let slot = self.entry.index();
-        if let Some(shadows) = self.shadows.as_deref_mut() {
+        if let Some(shadows) = self.shadows {
             shadows.push_live(slot);
         }
         self.entry.insert(value)
@@ -818,14 +838,14 @@ impl<'a, V> ObjectMapEntry<'a, V> {
 
 /// Iteration over every entry of an [`ObjectMapOf`] in document order; see
 /// [`ObjectMapOf::occurrences`].
-pub enum Occurrences<'a, V> {
+pub struct Occurrences<'a, V>(OccurrencesInner<'a, V>);
+
+enum OccurrencesInner<'a, V> {
     /// No key repeats: the collapsed view's own iterator.
     Plain(indexmap::map::Iter<'a, String, V>),
     /// Some key repeats: the side list, with live entries read from `map`.
     Ordered {
-        /// The collapsed view the live entries are read from.
         map: &'a IndexMap<String, V>,
-        /// What is left of the document-order list.
         entries: core::slice::Iter<'a, Occurrence<V>>,
     },
 }
@@ -848,17 +868,17 @@ impl<'a, V> Iterator for Occurrences<'a, V> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::Plain(iter) => iter.next(),
-            Self::Ordered { map, entries } => Self::resolve(map, entries.next()?),
+        match &mut self.0 {
+            OccurrencesInner::Plain(iter) => iter.next(),
+            OccurrencesInner::Ordered { map, entries } => Self::resolve(map, entries.next()?),
         }
     }
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        match self {
-            Self::Plain(iter) => iter.size_hint(),
-            Self::Ordered { entries, .. } => entries.size_hint(),
+        match &self.0 {
+            OccurrencesInner::Plain(iter) => iter.size_hint(),
+            OccurrencesInner::Ordered { entries, .. } => entries.size_hint(),
         }
     }
 }
@@ -866,9 +886,9 @@ impl<'a, V> Iterator for Occurrences<'a, V> {
 impl<V> DoubleEndedIterator for Occurrences<'_, V> {
     #[inline]
     fn next_back(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::Plain(iter) => iter.next_back(),
-            Self::Ordered { map, entries } => Self::resolve(map, entries.next_back()?),
+        match &mut self.0 {
+            OccurrencesInner::Plain(iter) => iter.next_back(),
+            OccurrencesInner::Ordered { map, entries } => Self::resolve(map, entries.next_back()?),
         }
     }
 }
@@ -887,13 +907,16 @@ impl<V> Default for ObjectMapOf<V> {
     }
 }
 
-/// A refcount bump in the shipped shape (the copy is deferred to the
-/// first write through either handle); a deep copy under
+/// A refcount bump per pointer in the shipped shape (the copy is deferred to
+/// the first write through either handle); a deep copy under
 /// `unshared-containers`.
 impl<V: Clone> Clone for ObjectMapOf<V> {
     #[inline]
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self {
+            map: self.map.clone(),
+            shadows: self.shadows.clone(),
+        }
     }
 }
 
@@ -925,7 +948,7 @@ impl<V> Deref for ObjectMapOf<V> {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        &self.0.map
+        &self.map
     }
 }
 
@@ -936,11 +959,8 @@ impl<V: Clone> DerefMut for ObjectMapOf<V> {
     #[inline]
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     fn deref_mut(&mut self) -> &mut Self::Target {
-        let store = self.store_mut();
-        if store.shadows.is_some() {
-            store.shadows = None;
-        }
-        &mut store.map
+        self.shadows = None;
+        map_mut(&mut self.map)
     }
 }
 
@@ -949,11 +969,17 @@ impl<V> From<IndexMap<String, V>> for ObjectMapOf<V> {
     fn from(map: IndexMap<String, V>) -> Self {
         #[cfg(not(feature = "unshared-containers"))]
         {
-            Self(Rc::new(ObjectStore::from_map(map)))
+            Self {
+                map: Rc::new(map),
+                shadows: None,
+            }
         }
         #[cfg(feature = "unshared-containers")]
         {
-            Self(Box::new(ObjectStore::from_map(map)))
+            Self {
+                map: Box::new(map),
+                shadows: None,
+            }
         }
     }
 }
@@ -994,8 +1020,8 @@ pub enum ObjectMapIntoIter<V> {
     /// form).
     #[cfg(not(feature = "unshared-containers"))]
     Shared {
-        /// The store every remaining entry is cloned from.
-        store: Rc<ObjectStore<V>>,
+        /// The map every remaining entry is cloned from.
+        map: Rc<IndexMap<String, V>>,
         /// Index of the next entry from the front.
         next: usize,
         /// One past the next entry from the back.
@@ -1011,11 +1037,11 @@ impl<V: Clone> Iterator for ObjectMapIntoIter<V> {
         match self {
             Self::Owned(iter) => iter.next(),
             #[cfg(not(feature = "unshared-containers"))]
-            Self::Shared { store, next, end } => {
+            Self::Shared { map, next, end } => {
                 if next >= end {
                     return None;
                 }
-                let (k, v) = store.map.get_index(*next)?;
+                let (k, v) = map.get_index(*next)?;
                 *next += 1;
                 Some((k.clone(), v.clone()))
             }
@@ -1041,12 +1067,12 @@ impl<V: Clone> DoubleEndedIterator for ObjectMapIntoIter<V> {
         match self {
             Self::Owned(iter) => iter.next_back(),
             #[cfg(not(feature = "unshared-containers"))]
-            Self::Shared { store, next, end } => {
+            Self::Shared { map, next, end } => {
                 if next >= end {
                     return None;
                 }
                 *end -= 1;
-                let (k, v) = store.map.get_index(*end)?;
+                let (k, v) = map.get_index(*end)?;
                 Some((k.clone(), v.clone()))
             }
         }
@@ -1064,13 +1090,13 @@ impl<V: Clone> IntoIterator for ObjectMapOf<V> {
     fn into_iter(self) -> Self::IntoIter {
         #[cfg(not(feature = "unshared-containers"))]
         {
-            match Rc::try_unwrap(self.0) {
-                Ok(store) => ObjectMapIntoIter::Owned(store.map.into_iter()),
+            match Rc::try_unwrap(self.map) {
+                Ok(map) => ObjectMapIntoIter::Owned(map.into_iter()),
                 Err(shared) => {
                     note_forced_copy!(ObjectUnwrap);
-                    let end = shared.map.len();
+                    let end = shared.len();
                     ObjectMapIntoIter::Shared {
-                        store: shared,
+                        map: shared,
                         next: 0,
                         end,
                     }
@@ -1079,7 +1105,7 @@ impl<V: Clone> IntoIterator for ObjectMapOf<V> {
         }
         #[cfg(feature = "unshared-containers")]
         {
-            ObjectMapIntoIter::Owned(self.0.map.into_iter())
+            ObjectMapIntoIter::Owned((*self.map).into_iter())
         }
     }
 }
@@ -1090,7 +1116,7 @@ impl<'a, V> IntoIterator for &'a ObjectMapOf<V> {
 
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
-        self.0.map.iter()
+        self.map.iter()
     }
 }
 
@@ -1110,8 +1136,8 @@ impl<V> ObjectMapOf<V> {
     /// Checks every structural invariant of the side list (I2 and the
     /// bookkeeping the shadow-aware methods rely on).
     fn assert_invariants(&self) {
-        let store = &*self.0;
-        let Some(shadows) = store.shadows.as_deref() else {
+        let map = &self.map;
+        let Some(shadows) = self.shadows.as_deref() else {
             return;
         };
         let shadow_count = shadows
@@ -1120,9 +1146,9 @@ impl<V> ObjectMapOf<V> {
             .filter(|entry| matches!(entry, Occurrence::Shadow(..)))
             .count();
         assert!(shadow_count > 0, "I2: a side list with no shadow is kept");
-        assert_eq!(shadows.order.len(), store.map.len() + shadow_count);
-        assert_eq!(shadows.live_pos.len(), store.map.len());
-        let mut seen = vec![false; store.map.len()];
+        assert_eq!(shadows.order.len(), map.len() + shadow_count);
+        assert_eq!(shadows.live_pos.len(), map.len());
+        let mut seen = vec![false; map.len()];
         for (pos, entry) in shadows.order.iter().enumerate() {
             match entry {
                 Occurrence::Live(slot) => {
@@ -1131,7 +1157,7 @@ impl<V> ObjectMapOf<V> {
                     assert_eq!(shadows.live_pos[*slot], pos, "live_pos[{slot}]");
                 }
                 Occurrence::Shadow(key, _) => {
-                    assert!(store.map.contains_key(key), "shadow of a missing key {key}");
+                    assert!(map.contains_key(key), "shadow of a missing key {key}");
                 }
             }
         }
@@ -1327,6 +1353,26 @@ mod tests {
             owned(&map),
             pairs(&[("a", 1), ("a", 2), ("a", 3), ("b", 4)])
         );
+    }
+
+    #[test]
+    #[cfg(not(feature = "unshared-containers"))]
+    fn identity_follows_both_pointers_so_a_shadow_only_difference_is_not_the_same_node() {
+        let map = with_repeats(&[("a", 1), ("a", 2)]);
+        let mut copy = map.clone();
+        assert!(map.ptr_eq(&copy));
+        assert!(map.is_shared());
+        // Writing a shadow copies the map as well as the side list.
+        *copy.first_occurrence_mut("a").unwrap() = 9;
+        assert!(!map.ptr_eq(&copy));
+        assert_eq!(owned(&map), pairs(&[("a", 1), ("a", 2)]));
+        assert_eq!(owned(&copy), pairs(&[("a", 9), ("a", 2)]));
+        // Dropping the shadows leaves the map shared but is not the same node.
+        let mut collapsed = map.clone();
+        collapsed.collapse();
+        assert!(!map.ptr_eq(&collapsed));
+        assert!(!collapsed.has_shadows());
+        assert_eq!(owned(&map), pairs(&[("a", 1), ("a", 2)]));
     }
 
     #[test]

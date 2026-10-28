@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c37c6e0c23f8a7b28793aa34b3441cfe4f7e59c78f284f00c5acfe8632672275 # shrinks to ops = [Insert(6, 0), CloneThenWriteTheOriginal(6, 0), RawDerefMut(0, 0)]
+cc e04619f99e1bfae6eb9b302a828bb3f163b89108bd2fba38f8c3270abc05cafc # shrinks to ops = [EntryAndModify(2, 0), PushOccurrence(2, 0), GetMut(2, 1)]
+cc d9c765836c6045243add22438b20bf11effee4df584c425bb39f478cc2e7afdd # shrinks to ops = [Insert(2, 0), Insert(0, 0), PushOccurrence(5, 0), Insert(0, 0), SwapRemove(2)]
+cc 27784ab8cba3f2e08d64bc4bd27426631393e11c489342f2bcf6ef0442786f17 # shrinks to ops = [PushOccurrence(7, 0), PushOccurrence(2, 326), Retain(2)]

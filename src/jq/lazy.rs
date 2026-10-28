@@ -1016,7 +1016,8 @@ mod tests {
     /// So this size is not cosmetic -- it is half of a *pair* that has to
     /// stay as close as the two enums' own contents allow. The derivation:
     ///
-    /// - `Object(ObjectMapOf<Self>)` is now one pointer, 8 bytes.
+    /// - `Object(ObjectMapOf<Self>)` is two pointers, 16 bytes (the map's, and since #1344 the
+    ///   repeated-key side list's -- in the handle, so the map's heap block is unchanged).
     /// - `Cursor(JsonCursor<'a, W>)` is 32: `text: &[u8]` (16) +
     ///   `index: &JsonIndex<W>` (8) + `bp_pos: usize` (8).
     /// - `LazyKeysArray { fields: JsonFields<'a, W>, collapse: bool }` is

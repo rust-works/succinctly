@@ -6189,7 +6189,8 @@ mod tests {
     /// spelling is a `Box<str>`'s size, #3191) -- with the
     /// discriminant packed into `NumberRepr`'s own niche; holding the object
     /// map behind a pointer is what demotes `Object` from widest arm to 8
-    /// bytes. #2999 put `Array` behind a pointer as well (24 -> 8), which
+    /// bytes (16 since #1344 added the side list for a repeated key's earlier
+    /// entries, still under `NumberLiteral`'s 32). #2999 put `Array` behind a pointer as well (24 -> 8), which
     /// changes nothing here -- `NumberLiteral` was already the widest arm --
     /// and is asserted so the shape stays documented. 32 holds in every build
     /// -- under the `unshared-containers` holdout the array's `Vec` is inline
@@ -6207,11 +6208,14 @@ mod tests {
             "size_of::<OwnedValue>() moved -- every array element, object entry and \
              scalar pays this. See #3000 before re-pinning."
         );
+        // The map pointer and the repeated-key side list's (#1344): the side
+        // list is in the handle, not the map's heap block, so an object that
+        // repeats no key allocates exactly what it did before.
         assert_eq!(
             core::mem::size_of::<ObjectMap>(),
-            core::mem::size_of::<usize>(),
-            "ObjectMap must stay one pointer wide -- that is what keeps Object from \
-             being OwnedValue's widest arm again"
+            2 * core::mem::size_of::<usize>(),
+            "ObjectMap must stay two pointers wide -- narrow enough that Object is not \
+             OwnedValue's widest arm again, and with the map as the only heap block"
         );
         #[cfg(not(feature = "unshared-containers"))]
         assert_eq!(
