@@ -6165,6 +6165,9 @@ Two more jq-syntax forms real yq's lexer rejects sit behind the flag ([#5452](ht
 Whitespace between a `.` and a name, a quote or a bracket (`. a`, `. "a"`, `.a . b`) is refused outright in yq mode with or without the flag, as jq refuses it too (#5447).
 The root metadata write (`. style = "flow"`, #798) and the terminators after a gap (`. and`, `. as`, `. == 1`) are unchanged.
 
+yq's `~` null literal, its `toyaml`/`fromyaml` spellings and `SRC as $v ireduce (INIT; UPDATE)` (`reduce SRC as $v (INIT; UPDATE)`) are yq syntax and parse without the flag ([#5456](https://github.com/rust-works/succinctly/issues/5456)).
+A `~` written into a document prints as `null` in YAML output where yq keeps `~` (`.a = ~` is `a: ~` in yq), the null-spelling loss tracked on [#2802](https://github.com/rust-works/succinctly/issues/2802); `-o=json` agrees.
+
 `gsub`/`scan`/`splits` specifically: real yq's lexer rejects all three outright, at any
 arity ([#1436](https://github.com/rust-works/succinctly/issues/1436)) — this isn't "3-arg
 `gsub` diverges," it's that yq's grammar has no `gsub`/`scan`/`splits` token at all:
