@@ -969,6 +969,9 @@ struct Parser<'a> {
     /// Computed keys seen in the `Pattern` being parsed, reset as each
     /// top-level pattern begins; see [`MAX_PATTERN_COMPUTED_KEYS`].
     pattern_computed_keys: usize,
+    /// How many `\(...)` interpolation slots enclose the cursor; yq's lexer ends a slot at its
+    /// first `"` (#5452).
+    interp_depth: usize,
     /// Current `Expr` recursion depth; see [`MAX_EXPR_DEPTH`].
     expr_depth: usize,
     /// Whether a string bracket key (`.["k"]`) stays an [`Expr::IndexExpr`] rather than folding
@@ -1442,6 +1445,7 @@ impl<'a> Parser<'a> {
             jq_extensions,
             pattern_depth: 0,
             pattern_computed_keys: 0,
+            interp_depth: 0,
             expr_depth: 0,
             keep_bracket_keys: false,
             call_sites: Vec::new(),
@@ -1849,6 +1853,7 @@ impl<'a> Parser<'a> {
             // Look ahead to ensure it's not `..` (recursive descent)
             if self.peek_str(2) != ".." {
                 self.next(); // consume the dot
+                let fraction_start = self.pos;
 
                 // Consume fractional digits
                 while let Some(c) = self.peek() {
@@ -1857,6 +1862,10 @@ impl<'a> Parser<'a> {
                     } else {
                         break;
                     }
+                }
+                // yq's lexer has no number token for `5.` (#5452).
+                if self.pos == fraction_start {
+                    self.reject_unless_jq_extensions_at("number with a trailing '.'", start)?;
                 }
             }
         }
@@ -1928,6 +1937,12 @@ impl<'a> Parser<'a> {
     /// Parse a string literal or string interpolation.
     /// Returns either a simple string literal or a StringInterpolation expression.
     fn parse_string_or_interpolation(&mut self) -> Result<Expr, ParseError> {
+        // yq's lexer ends an interpolation slot at the first `"`, so a string literal inside
+        // one is jq syntax (#5452).
+        if self.interp_depth > 0 {
+            self.skip_ws();
+            self.reject_unless_jq_extensions("string literal inside \\(...)")?;
+        }
         self.expect('"')?;
         let mut parts: Vec<StringPart> = Vec::new();
         let mut current_literal = String::new();
@@ -1962,7 +1977,10 @@ impl<'a> Parser<'a> {
                                 )));
                             }
                             // Parse the expression inside \(...)
-                            let expr = self.parse_expr()?;
+                            self.interp_depth += 1;
+                            let expr = self.parse_expr();
+                            self.interp_depth -= 1;
+                            let expr = expr?;
                             self.skip_ws();
                             self.expect(')')?;
                             parts.push(StringPart::Expr(Box::new(expr)));
@@ -3700,6 +3718,10 @@ impl<'a> Parser<'a> {
                 // `. a` is a syntax error. yq's whitespace after a dot carries meaning of its
                 // own (#798, #4237), so only jq mode reads it this way.
                 let jq_gap = self.mode == ParserMode::Jq && self.pos > dot_end;
+                // #5452: yq's lexer ends the identity at the gap too: `. a`, `. "a"` and
+                // `. ["a"]` are errors there. Only the root metadata write (#798) and the
+                // terminators read past it.
+                let yq_gap = self.mode == ParserMode::Yq && self.pos > dot_end;
 
                 // `. .a`, `. ."a"`, `. .["a"]`: the second dot is a suffix, not half of `..`.
                 if jq_gap && self.peek() == Some('.') {
@@ -3737,7 +3759,7 @@ impl<'a> Parser<'a> {
 
                 // Check for `.[...]` (index/iterate). A leading bracket indexes
                 // the identity, so a dynamic key gets `.` as its target.
-                if self.peek() == Some('[') {
+                if self.peek() == Some('[') && !yq_gap {
                     let bracket = self.parse_index_bracket_with_optional()?;
                     let mut chain = vec![Expr::Identity];
                     push_bracket(&mut chain, bracket);
@@ -3800,11 +3822,19 @@ impl<'a> Parser<'a> {
                 // `.line_comment = "x"` silently discarded the write --
                 // caught in review). Only fires when the keyword really is
                 // followed by `=`/`|=` -- `. style` alone (no operator that
-                // follows) is still the ordinary GET-form field access
-                // `.style`, unchanged.
+                // follows) is not a field access: yq answers `bad expression`, and the gap
+                // gate below (#5452) refuses it.
                 if self.mode == ParserMode::Yq
                     && self.pos > dot_end
                     && self.peeks_meta_op_keyword_then_assign()
+                {
+                    self.last_primary_is_term = true; // #3038: leaf Term
+                    return Ok(Expr::Identity);
+                }
+
+                if yq_gap
+                    && (self.peek().is_some_and(is_ident_start_char)
+                        || matches!(self.peek(), Some('"' | '[')))
                 {
                     self.last_primary_is_term = true; // #3038: leaf Term
                     return Ok(Expr::Identity);
@@ -8570,10 +8600,16 @@ impl<'a> Parser<'a> {
                     self.skip_ws_after_dot();
 
                     // #5447: `.a. b` and `.a . b` are syntax errors in jq; a quote or a bracket
-                    // after the gap (`.a . "b"`, `.a .["b"]`) is still a suffix.
-                    if self.mode == ParserMode::Jq
-                        && self.pos > dot_end
-                        && self.peek().is_some_and(is_ident_start_char)
+                    // after the gap (`.a . "b"`, `.a .["b"]`) is still a suffix. In yq (#5452)
+                    // all three are.
+                    if self.pos > dot_end
+                        && match self.mode {
+                            ParserMode::Jq => self.peek().is_some_and(is_ident_start_char),
+                            ParserMode::Yq => {
+                                self.peek().is_some_and(is_ident_start_char)
+                                    || matches!(self.peek(), Some('"' | '['))
+                            }
+                        }
                     {
                         return Err(ParseError::new(
                             "syntax error, unexpected IDENT after '.'",
@@ -13108,8 +13144,10 @@ mod tests {
                 "jq mode must reject `{source}`"
             );
         }
-        // yq's rules are unchanged: a gap before a name is still a field access there.
-        assert!(parse_with_mode(". a", ParserMode::Yq).is_ok());
+        // yq's lexer ends the identity at the gap too (#5452), with or without the flag.
+        for extensions in [false, true] {
+            assert!(parse_with_mode_and_extensions(". a", ParserMode::Yq, extensions).is_err());
+        }
     }
 
     /// #5444: yq's lexer has no `@text` or `@html` token and no bare `env` (it has `env(NAME)`),

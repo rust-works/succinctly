@@ -39529,7 +39529,7 @@ fn test_yq_string_interpolation_path_context_error_is_atomic_1403() -> Result<()
     let (output, stderr, code) = run_yq_stdin_with_stderr(
         r#".a | "\(key)-\(error("boom"))""#,
         "a: 1\n",
-        &["-o", "json"],
+        &["-o", "json", "--jq-extensions"],
     )?;
     assert_ne!(code, 0);
     assert_eq!(output, "");
