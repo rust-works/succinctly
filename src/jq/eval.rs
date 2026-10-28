@@ -7200,7 +7200,7 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Flow::Exhausted
         }
         Expr::Pipe(exprs) => eval_each_pipe::<W, S>(
-            exprs,
+            RestTail::whole(exprs),
             Some(pipe_needs_path_context(exprs)),
             value,
             optional,
@@ -10062,12 +10062,13 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// `needs_path` is the pipe's own remembered answer (#3886) when the caller
 /// holds the `Expr::Pipe`, or `None` for a sub-slice, which is walked.
 fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    exprs: &[Expr],
+    tail: RestTail<'_>,
     needs_path: Option<bool>,
     value: StandardJson<'a, W>,
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
+    let exprs = tail.stages();
     // `eval_pipe` diverts to the deleted eager path-context evaluator whenever *any*
     // stage needs path context. `needs_path_context` recurses through
     // Pipe/Paren/Comma/Array/If/Try/Label, so this is a whole-pipe property
@@ -10075,7 +10076,7 @@ fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // re-deriving it: getting this wrong silently stubs `key`/`parent`/
     // `file_index` to their zero defaults (the #715/#1302 failure class),
     // which produces wrong output rather than an error.
-    let needs_path = needs_path.unwrap_or_else(|| exprs.iter().any(needs_path_context));
+    let needs_path = needs_path.unwrap_or_else(|| tail.needs_path_context());
     if needs_path {
         return drain_result(
             eval_pipe_with_path_context::<W, S>(exprs, value, optional),
@@ -10113,11 +10114,15 @@ fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `eval_generic`'s twin of this driver carries the same cache as a
     // `RestPipe`; here the `Owned` arm is the only reader, so a plain
     // `Option` is enough.
-    let mut rest_pipe = RestPipe::new(rest);
+    let mut rest_pipe = RestPipe::of_tail(tail.rest());
     let upstream = {
         let mut driver = |item: Item<'a, W>| -> Demand {
             let flow = match item {
-                Item::Borrowed(v) => eval_each_pipe::<W, S>(rest, None, v, optional, &mut *sink),
+                // The whole pipe needs no path context, so no suffix of it does
+                // (#5417): not walked again at each stage.
+                Item::Borrowed(v) => {
+                    eval_each_pipe::<W, S>(tail.rest(), Some(false), v, optional, &mut *sink)
+                }
                 // Re-enters `eval_each`'s own `Expr::Pipe` arm on the
                 // reindexed owned value (same serialize-and-reindex bridge as
                 // `eval_owned_pipe`/`eval_owned_input`, same cost), so
@@ -11569,9 +11574,9 @@ pub(crate) mod lone_pipe_entries {
     }
 }
 
-/// Test-only observable (#3715): how many times [`eval_owned_pipe`] copied the
-/// rest of its pipe on this thread, a copy kept on its pipe (#5404) counting
-/// once, when it is built. A stateless lone stage makes none; a lone stage
+/// Test-only observable (#3715): how many times [`eval_owned_pipe`] or a
+/// [`RestPipe`] (#5417) copied the rest of its pipe on this thread, a copy kept
+/// on its pipe (#5404) counting once, when it is built. A stateless lone stage makes none; a lone stage
 /// holding a `def`, and a rest of two or more stages that the pipe does not
 /// keep, make one per call.
 #[cfg(test)]
@@ -11620,6 +11625,10 @@ pub(crate) mod owned_pipe_copies {
 /// route has one definition.
 pub(crate) struct RestPipe<'a> {
     stages: &'a [Expr],
+    /// The pipe that owns `stages`, when the caller has it (#5417): what keeps
+    /// the owned copy of a rest of several stages from being rebuilt by each
+    /// `RestPipe` a pipe's drivers make, one per value of its first stage.
+    owner: Option<&'a PipeStages>,
     copy: RestCopy,
 }
 
@@ -11649,6 +11658,8 @@ impl RestCopy {
     /// The owned pipe over `stages`, built on the first call.
     fn owned_pipe(&mut self, stages: &[Expr]) -> &Expr {
         if !matches!(self, Self::Owned(_)) {
+            #[cfg(test)]
+            owned_pipe_copies::bump();
             *self = Self::Owned(Expr::Pipe(stages.to_vec().into()));
         }
         match self {
@@ -11660,9 +11671,24 @@ impl RestCopy {
 
 impl<'a> RestPipe<'a> {
     pub(crate) fn new(stages: &'a [Expr]) -> Self {
+        Self::of_tail(RestTail::unowned(stages))
+    }
+
+    /// A rest that is the tail of a pipe, whose owner keeps the owned copy
+    /// ([`RestTail::kept_copy`], #5417).
+    pub(crate) fn of_tail(tail: RestTail<'a>) -> Self {
         Self {
-            stages,
+            stages: tail.stages,
+            owner: tail.owner,
             copy: RestCopy::Unasked,
+        }
+    }
+
+    /// The rest as a tail, for a driver that goes on to run it as stages.
+    pub(crate) fn tail(&self) -> RestTail<'a> {
+        RestTail {
+            stages: self.stages,
+            owner: self.owner,
         }
     }
 
@@ -11735,7 +11761,16 @@ impl<'a> RestPipe<'a> {
                 return eval_each_owned_past_front_doors::<S>(only, input, optional, reentry, sink);
             }
         }
-        let whole = self.copy.owned_pipe(self.stages);
+        // A rest of several stages: the copy the owner keeps, once it keeps one
+        // (#5417); this `RestPipe`'s own, built on the first call, otherwise.
+        let kept;
+        let whole = match lone.is_none().then(|| self.tail().kept_copy()).flatten() {
+            Some(copy) => {
+                kept = copy;
+                &*kept
+            }
+            None => self.copy.owned_pipe(self.stages),
+        };
         if lone.is_some() {
             eval_each_owned_past_front_doors::<S>(whole, input, optional, reentry, sink)
         } else {
@@ -28291,6 +28326,10 @@ fn promote_and_extend<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// ([`PipeStages::kept_tail`]). The owner and the offset are the one value the
 /// pipe drivers take in place of the slice, which [`Self::stages`] derives from
 /// them, so the stages evaluated and the tail kept cannot disagree.
+///
+/// Two words, as the recursion of [`eval_pipe`] and [`eval_owned_pipe`] carries
+/// one per level; the sink drivers, whose callers may hold only a slice, take a
+/// [`RestTail`].
 #[derive(Clone, Copy)]
 struct PipeTail<'p> {
     owner: &'p PipeStages,
@@ -28316,27 +28355,101 @@ impl<'p> PipeTail<'p> {
         }
     }
 
+    /// The same tail for a sink driver.
+    fn sink(self) -> RestTail<'p> {
+        RestTail {
+            stages: self.stages(),
+            owner: Some(self.owner),
+        }
+    }
+
     /// The owned `Expr::Pipe` over these stages if the owner keeps one. It
     /// does not for a tail that holds evaluation state, whose copy has to start
     /// empty each call ([`holds_evaluation_state`], #3148), nor for one past
     /// [`MAX_KEPT_TAIL_NODES`] nodes.
     fn kept_copy(self) -> Option<Rc<Expr>> {
-        self.owner.kept_tail(self.from, |stages| {
-            let mut nodes = 0usize;
-            let small = !stages.iter().any(|stage| {
-                any_subexpr(stage, &mut |_| {
-                    nodes += 1;
-                    nodes > MAX_KEPT_TAIL_NODES
-                })
-            });
-            let keep = small && !stages.iter().any(holds_evaluation_state);
-            #[cfg(test)]
-            if keep {
-                owned_pipe_copies::bump();
-            }
-            keep
-        })
+        kept_copy_of(self.owner, self.from)
     }
+}
+
+/// The stages of a pipe from some stage on, with the pipe that owns them when
+/// there is one (#5417): what the sink drivers ([`eval_each_pipe`],
+/// [`RestPipe`]) take, whose callers may hold only a slice.
+///
+/// The stages are always a suffix of the owner's, so the offset is derived from
+/// their lengths rather than stored. A tail with no owner ([`Self::unowned`])
+/// is copied per drive, as before the cache.
+#[derive(Clone, Copy)]
+pub(crate) struct RestTail<'p> {
+    stages: &'p [Expr],
+    owner: Option<&'p PipeStages>,
+}
+
+impl<'p> RestTail<'p> {
+    /// All of `owner`'s stages.
+    pub(crate) fn whole(owner: &'p PipeStages) -> Self {
+        Self {
+            stages: owner,
+            owner: Some(owner),
+        }
+    }
+
+    /// A slice nothing keeps copies for.
+    pub(crate) fn unowned(stages: &'p [Expr]) -> Self {
+        Self {
+            stages,
+            owner: None,
+        }
+    }
+
+    /// The stages this tail covers.
+    pub(crate) fn stages(self) -> &'p [Expr] {
+        self.stages
+    }
+
+    /// Whether any of these stages needs path context. The owner remembers the
+    /// answer for all of its stages (#3886); none of a pipe's stages needing it
+    /// means no tail of it does, so only a pipe that has one walks a tail.
+    pub(crate) fn needs_path_context(self) -> bool {
+        match self.owner {
+            Some(owner) if !pipe_needs_path_context(owner) => false,
+            _ => self.stages.iter().any(needs_path_context),
+        }
+    }
+
+    /// The tail after its first stage.
+    pub(crate) fn rest(self) -> Self {
+        Self {
+            stages: &self.stages[1..],
+            owner: self.owner,
+        }
+    }
+
+    /// The owned `Expr::Pipe` over these stages if the owner keeps one
+    /// ([`PipeTail::kept_copy`]).
+    pub(crate) fn kept_copy(self) -> Option<Rc<Expr>> {
+        let owner = self.owner?;
+        kept_copy_of(owner, owner.len() - self.stages.len())
+    }
+}
+
+/// The copy `owner` keeps of its stages from `from` on, if it keeps one.
+fn kept_copy_of(owner: &PipeStages, from: usize) -> Option<Rc<Expr>> {
+    owner.kept_tail(from, |stages| {
+        let mut nodes = 0usize;
+        let small = !stages.iter().any(|stage| {
+            any_subexpr(stage, &mut |_| {
+                nodes += 1;
+                nodes > MAX_KEPT_TAIL_NODES
+            })
+        });
+        let keep = small && !stages.iter().any(holds_evaluation_state);
+        #[cfg(test)]
+        if keep {
+            owned_pipe_copies::bump();
+        }
+        keep
+    })
 }
 
 /// The most nodes a kept tail may hold (#5404). A pipe keeps up to `n - 2`
@@ -28400,15 +28513,20 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     {
         let mut outputs = Vec::new();
         let mut conversion_error = None;
-        let flow = eval_each_pipe::<W, S>(exprs, None, value, optional, &mut |item| match item
-            .into_owned::<S>()
-        {
-            Ok(item) => {
-                outputs.push(item);
-                Demand::Continue
-            }
-            Err(error) => stop_with_escape(&mut conversion_error, Control::Error(error)),
-        });
+        let flow =
+            eval_each_pipe::<W, S>(
+                tail.sink(),
+                Some(false),
+                value,
+                optional,
+                &mut |item| match item.into_owned::<S>() {
+                    Ok(item) => {
+                        outputs.push(item);
+                        Demand::Continue
+                    }
+                    Err(error) => stop_with_escape(&mut conversion_error, Control::Error(error)),
+                },
+            );
         return finish_fork_from_flow(
             outputs,
             resume_from_escape(conversion_error, flow),
@@ -111373,7 +111491,9 @@ mod tests {
         );
         assert_eq!(
             core::mem::size_of::<RestPipe<'static>>(),
-            core::mem::size_of::<&[Expr]>() + core::mem::size_of::<Option<Expr>>()
+            core::mem::size_of::<&[Expr]>()
+                + core::mem::size_of::<Option<&PipeStages>>()
+                + core::mem::size_of::<Option<Expr>>()
         );
     }
 
@@ -111591,6 +111711,57 @@ mod tests {
         assert!(one.copies > 0, "the rest of several stages is copied");
         assert_eq!(three.copies, 3 * one.copies, "each value makes its own");
         assert_eq!(three.kept, 0);
+    }
+
+    /// #5417: a pipe driven one output at a time (`select`, `last`, `limit`,
+    /// `first`, `reduce`/`foreach` over it) hands its rest on through a
+    /// [`RestPipe`] per value of its first stage, which built the owned copy of
+    /// the rest afresh each time. It asks the pipe that owns the rest instead,
+    /// so the copies are the ones the pipe keeps, however many values go down
+    /// it; and so is the effect arm of `eval_pipe`, which drove the pipe stage
+    /// by stage without its owner.
+    #[test]
+    fn test_sink_driven_pipe_rest_is_copied_once_per_program_not_per_value_5417() {
+        fn run<S: EvalSemantics>() {
+            const STAGES: usize = 30;
+            let t = parenthesized_increments(STAGES);
+            let effect = format!(
+                "(. + input_line_number | {})",
+                vec![". + 1"; STAGES].join(" | ")
+            );
+            let programs = [
+                (
+                    "select",
+                    format!("[range(0;N) | {t} | select(. > 0)] | length"),
+                ),
+                ("last", format!("last(range(0;N) | {t})")),
+                ("limit", format!("[limit(100; range(0;N) | {t})] | length")),
+                ("first", format!("first(range(0;N) | {t} | select(. > 7))")),
+                ("effect", format!("[range(0;N) | {effect}] | add")),
+            ];
+            for (name, template) in programs {
+                let run_for = |n: usize| {
+                    run_owned_pipe_program::<S>(&template.replace('N', &n.to_string()), b"null")
+                };
+                // A pipe keeps nothing for its first value and each tail it is
+                // asked for after that, so the copies settle after a few values.
+                let (settled, many) = (run_for(4), run_for(40));
+                assert_eq!(
+                    many.copies,
+                    settled.copies,
+                    "{name}: forty values copy no more than four do ({:?})",
+                    S::TAG
+                );
+                assert!(
+                    settled.copies <= 4 * (STAGES - 1),
+                    "{name}: {} copies is a copy of the rest per value ({:?})",
+                    settled.copies,
+                    S::TAG
+                );
+            }
+        }
+        run::<JqSemantics>();
+        run::<YqSemantics>();
     }
 
     /// #5404: a tail past [`MAX_KEPT_TAIL_NODES`] is not kept, however few its
