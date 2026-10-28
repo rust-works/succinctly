@@ -3880,6 +3880,7 @@ impl<'a> Parser<'a> {
                     self.consume_keyword("not");
                     self.zero_arity_or_wrong_arity_call(keyword_start, Some("not"), Expr::Not)
                 } else if self.matches_keyword("if") {
+                    self.reject_unless_jq_extensions("if")?;
                     // #3038: bare `if`/`reduce`/`foreach` are `Exp`-level
                     // alternatives in jq's real grammar, not `Term`s -- only
                     // `(if ... end)` is one. Early `return` here (and in the
@@ -3895,6 +3896,7 @@ impl<'a> Parser<'a> {
                     self.last_primary_is_term = false;
                     return Ok(e);
                 } else if self.matches_keyword("try") {
+                    self.reject_unless_jq_extensions("try")?;
                     // #3038: `try`'s own grammar production is unconditionally
                     // a Term in jq (`try . as $z | $z` is accepted), but its
                     // operand/catch-handler are each parsed via a nested
@@ -3935,18 +3937,21 @@ impl<'a> Parser<'a> {
                         Self::parse_limit_expr,
                     )
                 } else if self.matches_keyword("until") {
+                    self.reject_unless_jq_extensions("until")?;
                     self.parse_shadowable_special_form(
                         keyword_start,
                         "until",
                         Self::parse_until_expr,
                     )
                 } else if self.matches_keyword("while") {
+                    self.reject_unless_jq_extensions("while")?;
                     self.parse_shadowable_special_form(
                         keyword_start,
                         "while",
                         Self::parse_while_expr,
                     )
                 } else if self.matches_keyword("repeat") {
+                    self.reject_unless_jq_extensions("repeat")?;
                     self.parse_shadowable_special_form(
                         keyword_start,
                         "repeat",
@@ -3997,11 +4002,14 @@ impl<'a> Parser<'a> {
                     self.reject_unless_jq_extensions("last")?;
                     self.parse_shadowable_special_form(keyword_start, "last", Self::parse_last_expr)
                 } else if self.matches_keyword("def") {
+                    self.reject_unless_jq_extensions("def")?;
                     // Phase 9: Function definition
                     self.parse_def_expr()
                 } else if self.matches_keyword("label") {
+                    self.reject_unless_jq_extensions("label")?;
                     self.parse_label_expr()
                 } else if self.matches_keyword("break") {
+                    self.reject_unless_jq_extensions("break")?;
                     self.parse_break_expr()
                 } else {
                     // #2036: the shadow-check name is re-derived from
@@ -6246,74 +6254,91 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Type));
         }
         if self.matches_keyword("isnull") {
+            self.reject_unless_jq_extensions("isnull")?;
             self.consume_keyword("isnull");
             return Ok(Some(Builtin::IsNull));
         }
         if self.matches_keyword("isboolean") {
+            self.reject_unless_jq_extensions("isboolean")?;
             self.consume_keyword("isboolean");
             return Ok(Some(Builtin::IsBoolean));
         }
         if self.matches_keyword("isnumber") {
+            self.reject_unless_jq_extensions("isnumber")?;
             self.consume_keyword("isnumber");
             return Ok(Some(Builtin::IsNumber));
         }
         if self.matches_keyword("isstring") {
+            self.reject_unless_jq_extensions("isstring")?;
             self.consume_keyword("isstring");
             return Ok(Some(Builtin::IsString));
         }
         if self.matches_keyword("isarray") {
+            self.reject_unless_jq_extensions("isarray")?;
             self.consume_keyword("isarray");
             return Ok(Some(Builtin::IsArray));
         }
         if self.matches_keyword("isobject") {
+            self.reject_unless_jq_extensions("isobject")?;
             self.consume_keyword("isobject");
             return Ok(Some(Builtin::IsObject));
         }
 
         // Type filter functions (select by type)
         if self.matches_keyword("values") {
+            self.reject_unless_jq_extensions("values")?;
             self.consume_keyword("values");
             return Ok(Some(Builtin::Values));
         }
         if self.matches_keyword("nulls") {
+            self.reject_unless_jq_extensions("nulls")?;
             self.consume_keyword("nulls");
             return Ok(Some(Builtin::Nulls));
         }
         if self.matches_keyword("booleans") {
+            self.reject_unless_jq_extensions("booleans")?;
             self.consume_keyword("booleans");
             return Ok(Some(Builtin::Booleans));
         }
         if self.matches_keyword("numbers") {
+            self.reject_unless_jq_extensions("numbers")?;
             self.consume_keyword("numbers");
             return Ok(Some(Builtin::Numbers));
         }
         // Note: "strings" must be checked before "string" in any other context
         if self.matches_keyword("strings") {
+            self.reject_unless_jq_extensions("strings")?;
             self.consume_keyword("strings");
             return Ok(Some(Builtin::Strings));
         }
         if self.matches_keyword("arrays") {
+            self.reject_unless_jq_extensions("arrays")?;
             self.consume_keyword("arrays");
             return Ok(Some(Builtin::Arrays));
         }
         if self.matches_keyword("objects") {
+            self.reject_unless_jq_extensions("objects")?;
             self.consume_keyword("objects");
             return Ok(Some(Builtin::Objects));
         }
         if self.matches_keyword("iterables") {
+            self.reject_unless_jq_extensions("iterables")?;
             self.consume_keyword("iterables");
             return Ok(Some(Builtin::Iterables));
         }
         if self.matches_keyword("scalars") {
+            self.reject_unless_jq_extensions("scalars")?;
             self.consume_keyword("scalars");
             return Ok(Some(Builtin::Scalars));
         }
         // Additional numeric type filters
         if self.matches_keyword("normals") {
+            self.reject_unless_jq_extensions("normals")?;
             self.consume_keyword("normals");
             return Ok(Some(Builtin::Normals));
         }
         if self.matches_keyword("finites") {
+            self.reject_unless_jq_extensions("finites")?;
             self.consume_keyword("finites");
             return Ok(Some(Builtin::Finites));
         }
@@ -6324,10 +6349,12 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Length));
         }
         if self.matches_keyword("utf8bytelength") {
+            self.reject_unless_jq_extensions("utf8bytelength")?;
             self.consume_keyword("utf8bytelength");
             return Ok(Some(Builtin::Utf8ByteLength));
         }
         if self.matches_keyword("keys_unsorted") {
+            self.reject_unless_jq_extensions("keys_unsorted")?;
             // Check keys_unsorted before keys
             self.consume_keyword("keys_unsorted");
             return Ok(Some(Builtin::KeysUnsorted));
@@ -6361,12 +6388,14 @@ impl<'a> Parser<'a> {
                 .map(|cond| Builtin::Select(Box::new(cond))));
         }
         if self.matches_keyword("empty") {
+            self.reject_unless_jq_extensions("empty")?;
             self.consume_keyword("empty");
             return Ok(Some(Builtin::Empty));
         }
 
         // Process control (#791)
         if self.matches_keyword("halt_error") {
+            self.reject_unless_jq_extensions("halt_error")?;
             // Check halt_error before halt so "halt_error" isn't parsed as
             // "halt" followed by a stray "_error".
             let keyword_start = self.pos;
@@ -6386,10 +6415,12 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::HaltError));
         }
         if self.matches_keyword("halt") {
+            self.reject_unless_jq_extensions("halt")?;
             self.consume_keyword("halt");
             return Ok(Some(Builtin::Halt));
         }
         if self.matches_keyword("stderr") {
+            self.reject_unless_jq_extensions("stderr")?;
             self.consume_keyword("stderr");
             return Ok(Some(Builtin::Stderr));
         }
@@ -6564,6 +6595,7 @@ impl<'a> Parser<'a> {
         // in(obj) - takes an argument (note: "in" is also sometimes used differently in jq)
         // We parse it with required parentheses
         if self.matches_keyword("in") {
+            self.reject_unless_jq_extensions("in")?;
             let keyword_start = self.pos;
             self.consume_keyword("in");
             return Ok(self
@@ -7301,10 +7333,12 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::UpperIndex(Box::new(first))));
         }
         if self.matches_keyword("tojsonstream") {
+            self.reject_unless_jq_extensions("tojsonstream")?;
             self.consume_keyword("tojsonstream");
             return Ok(Some(Builtin::ToJsonStream));
         }
         if self.matches_keyword("fromjsonstream") {
+            self.reject_unless_jq_extensions("fromjsonstream")?;
             self.consume_keyword("fromjsonstream");
             return Ok(Some(Builtin::FromJsonStream));
         }
@@ -7341,6 +7375,7 @@ impl<'a> Parser<'a> {
         // Phase 8: Advanced Control Flow Builtins
         // recurse, recurse(f), recurse(f; cond)
         if self.matches_keyword("recurse") {
+            self.reject_unless_jq_extensions("recurse")?;
             let keyword_start = self.pos;
             self.consume_keyword("recurse");
             self.skip_ws();
@@ -7385,6 +7420,7 @@ impl<'a> Parser<'a> {
 
         // isvalid(expr)
         if self.matches_keyword("isvalid") {
+            self.reject_unless_jq_extensions("isvalid")?;
             let keyword_start = self.pos;
             self.consume_keyword("isvalid");
             return Ok(self
@@ -7872,10 +7908,12 @@ impl<'a> Parser<'a> {
         // Phase 10: String functions
         // Check ltrim and rtrim before trim
         if self.matches_keyword("ltrim") {
+            self.reject_unless_jq_extensions("ltrim")?;
             self.consume_keyword("ltrim");
             return Ok(Some(Builtin::Ltrim));
         }
         if self.matches_keyword("rtrim") {
+            self.reject_unless_jq_extensions("rtrim")?;
             self.consume_keyword("rtrim");
             return Ok(Some(Builtin::Rtrim));
         }
@@ -7904,6 +7942,7 @@ impl<'a> Parser<'a> {
         // via `.`, not a paren'd argument); succinctly previously required
         // `modulemeta(...)` here, inverted from jq's actual grammar (#2035).
         if self.matches_keyword("modulemeta") {
+            self.reject_unless_jq_extensions("modulemeta")?;
             self.consume_keyword("modulemeta");
             return Ok(Some(Builtin::ModuleMeta));
         }
@@ -8051,6 +8090,7 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Abs));
         }
         if self.matches_keyword("builtins") {
+            self.reject_unless_jq_extensions("builtins")?;
             self.consume_keyword("builtins");
             return Ok(Some(Builtin::Builtins));
         }
@@ -8193,6 +8233,7 @@ impl<'a> Parser<'a> {
         // Phase 14: Recursive traversal (extends Phase 8)
         // recurse_down is an alias for recurse
         if self.matches_keyword("recurse_down") {
+            self.reject_unless_jq_extensions("recurse_down")?;
             self.consume_keyword("recurse_down");
             return Ok(Some(Builtin::RecurseDown));
         }
@@ -8322,6 +8363,7 @@ impl<'a> Parser<'a> {
 
         // Phase 19: Type conversion
         if self.matches_keyword("toboolean") {
+            self.reject_unless_jq_extensions("toboolean")?;
             self.consume_keyword("toboolean");
             return Ok(Some(Builtin::ToBoolean));
         }
@@ -9641,6 +9683,7 @@ impl<'a> Parser<'a> {
 
         // Parse function definitions until we hit something that isn't one
         while self.matches_keyword("def") {
+            self.reject_unless_jq_extensions("def")?;
             let offset = self.pos;
             let (name, params, body) = self.parse_func_def_parts()?;
             self.def_sites.push(DefSite {
@@ -14236,6 +14279,7 @@ mod tests {
             "acos",
             "acosh",
             "add",
+            "arrays",
             "ascii_downcase",
             "ascii_upcase",
             "asin",
@@ -14243,38 +14287,59 @@ mod tests {
             "atan",
             "atan2",
             "atanh",
+            "booleans",
+            "break",
             "bsearch",
+            "builtins",
             "ceil",
             "combinations",
             "cos",
             "cosh",
             "debug",
+            "def",
+            "empty",
             "endswith",
             "exp",
             "exp10",
             "exp2",
             "fabs",
+            "finites",
             "floor",
             "foreach",
             "format",
             "fromdate",
             "fromdateiso8601",
+            "fromjsonstream",
             "fromstream",
             "getpath",
             "gmtime",
             "gsub",
+            "halt",
+            "halt_error",
+            "if",
             "implode",
             "import",
+            "in",
             "include",
             "index",
             "indices",
             "infinite",
             "inside",
+            "isarray",
+            "isboolean",
             "isempty",
             "isfinite",
             "isinfinite",
             "isnan",
             "isnormal",
+            "isnull",
+            "isnumber",
+            "isobject",
+            "isstring",
+            "isvalid",
+            "iterables",
+            "keys_unsorted",
+            "label",
             "last",
             "leaf_paths",
             "limit",
@@ -14282,20 +14347,31 @@ mod tests {
             "log",
             "log10",
             "log2",
+            "ltrim",
             "ltrimstr",
             "max_by",
             "min_by",
             "mktime",
             "module",
+            "modulemeta",
             "nan",
+            "normals",
             "nth",
+            "nulls",
+            "numbers",
+            "objects",
             "paths",
             "pow",
             "range",
+            "recurse",
+            "recurse_down",
             "reduce",
+            "repeat",
             "rindex",
             "round",
+            "rtrim",
             "rtrimstr",
+            "scalars",
             "scan",
             "sin",
             "sinh",
@@ -14303,21 +14379,39 @@ mod tests {
             "splits",
             "sqrt",
             "startswith",
+            "stderr",
             "strflocaltime",
             "strftime",
+            "strings",
             "strptime",
             "tan",
             "tanh",
+            "toboolean",
             "todate",
             "todateiso8601",
+            "tojsonstream",
             "tostream",
             "transpose",
             "trunc",
             "truncate_stream",
+            "try",
+            "until",
+            "utf8bytelength",
+            "values",
             "walk",
+            "while",
         ];
         /// yq has the name, but not this call form (`all(f)`, `any(f)`, `path(f)`); the form is gated.
         const GATED_BY_CALL_FORM: &[&str] = &["all", "any", "path"];
+        /// Words that only continue a gated opener (`if` ... `then` ... `end`, `try` ... `catch`): each is
+        /// listed with the opener that has to refuse first, since the word cannot start a filter of its own.
+        const GATED_WITH_OPENER: &[(&str, &str, &str)] = &[
+            ("catch", "try", "try . catch ."),
+            ("elif", "if", "if . then . elif . then . end"),
+            ("else", "if", "if . then . else . end"),
+            ("end", "if", "if . then . end"),
+            ("then", "if", "if . then . end"),
+        ];
         /// yq accepts the name (a yq builtin, an operator word or core syntax).
         const YQ_NATIVE: &[&str] = &[
             "all_c",
@@ -14418,56 +14512,6 @@ mod tests {
             "inputs",
             "input_line_number",
         ];
-        /// yq's lexer rejects the name and `succinctly yq` still accepts it without the flag -- a known gap, not a decision. Gating one means moving it to `GATED` and updating the tests that rely on it.
-        const UNGATED_GAP: &[&str] = &[
-            "arrays",
-            "booleans",
-            "break",
-            "builtins",
-            "catch",
-            "def",
-            "elif",
-            "else",
-            "empty",
-            "end",
-            "finites",
-            "fromjsonstream",
-            "halt",
-            "halt_error",
-            "if",
-            "in",
-            "isarray",
-            "isboolean",
-            "isnull",
-            "isnumber",
-            "isobject",
-            "isstring",
-            "isvalid",
-            "iterables",
-            "keys_unsorted",
-            "label",
-            "ltrim",
-            "modulemeta",
-            "normals",
-            "nulls",
-            "numbers",
-            "objects",
-            "recurse",
-            "recurse_down",
-            "repeat",
-            "rtrim",
-            "scalars",
-            "stderr",
-            "strings",
-            "then",
-            "toboolean",
-            "tojsonstream",
-            "try",
-            "until",
-            "utf8bytelength",
-            "values",
-            "while",
-        ];
 
         let source = include_str!("parser.rs");
         let production = &source[..source.rfind("#[cfg(test)]").unwrap()];
@@ -14480,12 +14524,13 @@ mod tests {
                 }
             }
         }
+        let with_opener: Vec<&str> = GATED_WITH_OPENER.iter().map(|(name, _, _)| *name).collect();
         let tables: [(&str, &[&str]); 5] = [
             ("GATED", GATED),
             ("GATED_BY_CALL_FORM", GATED_BY_CALL_FORM),
+            ("GATED_WITH_OPENER", &with_opener),
             ("YQ_NATIVE", YQ_NATIVE),
             ("BY_DESIGN", BY_DESIGN),
-            ("UNGATED_GAP", UNGATED_GAP),
         ];
         let mut classified = std::collections::BTreeMap::new();
         for (table, names) in tables {
@@ -14532,6 +14577,9 @@ mod tests {
         };
         for (table, names) in tables {
             let expect_gated = matches!(table, "GATED" | "GATED_BY_CALL_FORM");
+            if table == "GATED_WITH_OPENER" {
+                continue;
+            }
             for name in names {
                 assert_eq!(
                     is_gated(name),
@@ -14544,6 +14592,24 @@ mod tests {
                     }
                 );
             }
+        }
+
+        // A continuation word is reachable only through its opener, so the opener has to be gated
+        // (and the full form has to parse once the flag is on, or the word is dead surface).
+        for (word, opener, program) in GATED_WITH_OPENER {
+            assert!(
+                GATED.contains(opener),
+                "`{word}` continues `{opener}`, which is not in GATED"
+            );
+            assert!(
+                parse_program_with_mode_and_extensions(program, ParserMode::Yq, false)
+                    .is_err_and(|e| e.to_string().contains(GATE_MESSAGE)),
+                "`{program}` (the `{word}` form) is not refused without --jq-extensions"
+            );
+            assert!(
+                parse_program_with_mode_and_extensions(program, ParserMode::Yq, true).is_ok(),
+                "`{program}` (the `{word}` form) does not parse with --jq-extensions"
+            );
         }
     }
 }
