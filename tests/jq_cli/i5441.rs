@@ -46,6 +46,10 @@ fn test_body_that_reads_its_variable_late_matches_jq_5441() -> Result<()> {
         ("limit through a generator before the reader", format!("[limit(5; range(0;3) | . as $x | ((., 10 * .) | {T} | . + $x))]"), "[10,10,12,21,14]\n"),
         ("limit through a generator after the reader", format!("[limit(5; range(0;3) | . as $x | ({T} | . + $x | (., . + 100) | . + 1))]"), "[11,111,13,113,15]\n"),
         ("isempty", format!("[range(0;3) | . as $x | isempty({T} | . + $x | empty)]"), "[true,true,true]\n"),
+        ("a $ parameter, read last", format!("def f($a): {T} | . + $a; [range(0;6) | f(.)]"), "[10,12,14,16,18,20]\n"),
+        ("a $ parameter, read first", format!("def f($a): . + $a | {T}; [range(0;6) | f(.)]"), "[10,12,14,16,18,20]\n"),
+        ("a $ parameter, read in the middle", format!("def f($a): {T} | . + $a | {T}; [range(0;6) | f(.)]"), "[20,22,24,26,28,30]\n"),
+        ("two $ parameters, read last", format!("def f($a; $b): {T} | . + $a + $b; [range(0;6) | f(.; 2)]"), "[12,14,16,18,20,22]\n"),
         ("an update through the body", format!("[1,2,3] | .[] |= (. as $x | ({T} | . + $x))"), "[12,14,16]\n"),
         ("an assignment through the body", format!("{{\"a\": [1,2]}} | .a[] |= (. as $x | ({T} | . + $x))"), "{\"a\":[12,14]}\n"),
     ] {
