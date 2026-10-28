@@ -634,11 +634,11 @@ fn stream_owned_value_json_with_at_depth<W: core::fmt::Write>(
             // review before push -- exactly the drift risk a single shared
             // call site removes.
             let entries = if sort_keys {
-                let mut sorted: Vec<(&String, &OwnedValue)> = obj.iter().collect();
+                let mut sorted: Vec<(&String, &OwnedValue)> = obj.occurrences().collect();
                 sorted.sort_by(|a, b| a.0.cmp(b.0));
                 ObjectEntries::Sorted(sorted.into_iter())
             } else {
-                ObjectEntries::Unsorted(obj.iter())
+                ObjectEntries::Unsorted(obj.occurrences())
             };
             write_object_entries(
                 out,
@@ -669,7 +669,7 @@ fn stream_owned_value_json_with_at_depth<W: core::fmt::Write>(
 /// one type, rather than two call sites, matters.
 enum ObjectEntries<'a> {
     Sorted(alloc::vec::IntoIter<(&'a String, &'a OwnedValue)>),
-    Unsorted(indexmap::map::Iter<'a, String, OwnedValue>),
+    Unsorted(super::value::Occurrences<'a, OwnedValue>),
 }
 
 impl<'a> Iterator for ObjectEntries<'a> {
@@ -1088,7 +1088,7 @@ fn stream_owned_value_yaml_at_depth<W: core::fmt::Write>(
             if obj.is_empty() {
                 return out.write_str("{}");
             }
-            let mut entries: Vec<(&String, &OwnedValue)> = obj.iter().collect();
+            let mut entries: Vec<(&String, &OwnedValue)> = obj.occurrences().collect();
             if sort_keys {
                 entries.sort_by(|a, b| a.0.cmp(b.0));
             }

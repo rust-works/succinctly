@@ -163,9 +163,9 @@ pub use stream::{StreamError, StreamStats, StreamableValue};
 pub use value::{
     assert_value_tree_depth, format_number_jq_compat, jq_bare_float_display,
     jq_float_is_scientific, nesting_depth_exceeded_message, ArrayIntoIter, ArrayOf, ArrayVec,
-    NumberRepr, ObjectMap, ObjectMapEntry, ObjectMapIntoIter, ObjectMapOf, OccupiedMapEntry,
-    Occurrences, OwnedValue, ReindexedDoc, SharableLiteral, SharableString, VacantMapEntry,
-    MAX_VALUE_TREE_DEPTH,
+    FlaggedOccurrences, NumberRepr, ObjectMap, ObjectMapEntry, ObjectMapIntoIter, ObjectMapOf,
+    OccupiedMapEntry, Occurrences, OwnedValue, ReindexedDoc, SharableLiteral, SharableString,
+    VacantMapEntry, MAX_VALUE_TREE_DEPTH,
 };
 // `pub(crate)`, not `pub`: only `yaml::light`'s alias-chain resolvers (#1191
 // code review, #1193/PR #1314) need this from outside `jq::value` --

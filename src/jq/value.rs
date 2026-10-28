@@ -31,7 +31,8 @@ use super::expr::Literal;
 mod object_map;
 
 pub use object_map::{
-    ObjectMapEntry, ObjectMapIntoIter, ObjectMapOf, OccupiedMapEntry, Occurrences, VacantMapEntry,
+    FlaggedOccurrences, ObjectMapEntry, ObjectMapIntoIter, ObjectMapOf, OccupiedMapEntry,
+    Occurrences, VacantMapEntry,
 };
 
 /// Recursion-depth ceiling for tree-walkers over an already-materialized
@@ -3377,7 +3378,9 @@ impl OwnedValue {
             match value {
                 OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => f.is_nan(),
                 OwnedValue::Array(items) => items.iter().any(holds_nan_instance),
-                OwnedValue::Object(fields) => fields.values().any(holds_nan_instance),
+                OwnedValue::Object(fields) => {
+                    fields.occurrences().any(|(_, v)| holds_nan_instance(v))
+                }
                 _ => false,
             }
         }
@@ -4133,7 +4136,7 @@ impl OwnedValue {
             }
             Self::Object(obj) => {
                 let entries: Vec<String> = obj
-                    .iter()
+                    .occurrences()
                     .map(|(k, v)| {
                         format!(
                             "\"{}\":{}",
@@ -4242,7 +4245,7 @@ impl OwnedValue {
             }
             Self::Object(obj) => {
                 out.push('{');
-                for (i, (k, v)) in obj.iter().enumerate() {
+                for (i, (k, v)) in obj.occurrences().enumerate() {
                     if i > 0 {
                         out.push(',');
                     }
@@ -4307,7 +4310,7 @@ impl OwnedValue {
             }
             Self::Object(obj) => {
                 let entries: Vec<String> = obj
-                    .iter()
+                    .occurrences()
                     .map(|(k, v)| {
                         Ok(format!(
                             "\"{}\":{}",
@@ -4762,7 +4765,7 @@ pub(crate) mod bridge_provenance {
                     let slot = table.len();
                     table.push((position, None));
                     let mut all = true;
-                    for field in fields.values() {
+                    for (_, field) in fields.occurrences() {
                         *k += 1; // the key's own node
                         all &= walk(field, depth + 1, k, table);
                     }
@@ -4800,9 +4803,9 @@ pub(crate) fn bridge_round_trip_eq(shared: &OwnedValue, fresh: &OwnedValue) -> b
                     .all(|(x, y)| bridge_round_trip_eq(x, y))
         }
         (OwnedValue::Object(a), OwnedValue::Object(b)) => {
-            a.len() == b.len()
-                && a.iter()
-                    .zip(b.iter())
+            a.occurrence_len() == b.occurrence_len()
+                && a.occurrences()
+                    .zip(b.occurrences())
                     .all(|((ka, va), (kb, vb))| ka == kb && bridge_round_trip_eq(va, vb))
         }
         _ => alloc::format!("{shared:?}") == alloc::format!("{fresh:?}"),

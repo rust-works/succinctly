@@ -503,7 +503,7 @@ use super::value::{
     infinite_float_preview_text, int_to_f64, jq_identical, jq_literal_int_to_f64, jq_numeric_cmp,
     numeric_repr_cmp, owned_value_eq, owned_value_eq_at_depth_generic, subarray_indices,
     subarray_positions, window_matches, ArrayVec, NumberRepr, ObjectMap, ObjectMapEntry,
-    OwnedValue,
+    ObjectMapOf, OwnedValue,
 };
 
 /// Which binary operator an operand that produced *zero outputs* is being
@@ -2944,7 +2944,7 @@ fn to_owned_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
             OwnedValue::array_from(items)
         }
         StandardJson::Object(fields) => {
-            let mut map = IndexMap::new();
+            let mut map = ObjectMapOf::new();
             let mut guard = DisplayKeyGuard::default();
             // `uncons`/`rest`, not `for field in *fields`: a `for` loop
             // consumes the `Iterator` impl, whose `next()` reports `None`
@@ -2972,7 +2972,8 @@ fn to_owned_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
                 // one shared call -- see `DocumentField::checked_key`. This
                 // function had none of the delimiter half before #2262.
                 let key = field.checked_key(&f, &map, &mut guard, is_first)?;
-                map.insert(
+                super::eval_generic::push_field::<S, _>(
+                    &mut map,
                     key,
                     to_owned_at_depth::<S, W>(&field.value, Some(&field.value_cursor), depth + 1)?,
                 );
@@ -2985,7 +2986,7 @@ fn to_owned_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
             }
             // #2403: same reasoning as the array arm's own check above.
             tail_gap_ok(cursor, last_field.as_ref(), b'}')?;
-            OwnedValue::Object(map.into())
+            OwnedValue::Object(map)
         }
         // #2286 review: this arm used to silently substitute `Null` for a
         // bareword-garbage token (`StandardJson::Error`, e.g. `xyz123`),

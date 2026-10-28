@@ -28,7 +28,7 @@ use succinctly::jq::{
     self, alias_identity, assert_value_tree_depth, is_alias_sensitive_assign,
     nesting_depth_exceeded_message, nonfinite_display_string, nonfinite_literal_display,
     sync_aliased_paths, Builtin, DefScope, EvalError, Expr, Literal, MetaSlot, NumberRepr,
-    ObjectKey, OwnedValue, QueryResult, YqSemantics,
+    ObjectKey, ObjectMap, ObjectMapOf, OwnedValue, QueryResult, YqSemantics,
 };
 use succinctly::json::light::JsonCursor;
 use succinctly::json::validate;
@@ -1769,7 +1769,7 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
     // `[...]` nesting used to panic here.
     check_nesting_depth(depth)?;
     Ok(if let Some(fields) = value.as_object() {
-        let mut map = IndexMap::new();
+        let mut map = ObjectMapOf::new();
         let mut guard = DisplayKeyGuard::default();
         let mut f = fields;
         let mut is_first = true;
@@ -1791,7 +1791,8 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
             // silently accepted `{"a" 1, "b": 2}` when every other route
             // into the evaluator correctly raised.
             let key = field.checked_key(&f, &map, &mut guard, is_first)?;
-            map.insert(
+            // yq keeps a repeated mapping key's earlier entry (ADR-0027, #1344).
+            map.push_occurrence(
                 key,
                 to_owned_canonicalizing_numbers_at_depth(
                     &field.value,
@@ -1815,7 +1816,7 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
         // `container_tail_gap_ok` arm here, closing #2211's `{,}` gap the
         // same way `eval_generic::to_owned_at_depth` does since #2358.
         tail_gap_ok(Some(cursor), last_field.as_ref(), b'}')?;
-        OwnedValue::Object(map.into())
+        OwnedValue::Object(map)
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
         let mut elems = elements;
@@ -8205,6 +8206,29 @@ fn join_block_entries(entries: Vec<(String, bool)>) -> String {
     out
 }
 
+/// An object's entries in document order (a repeated key once per entry), each flagged live or
+/// shadow, optionally sorted by key. Out of line so the iterator's state stays out of
+/// `emit_yaml_value_at_depth`'s frame, which the nesting-depth guard is sized against (#1017).
+#[inline(never)]
+fn object_entries(obj: &ObjectMap, sort_keys: bool) -> Vec<(&String, &OwnedValue, bool)> {
+    let mut entries: Vec<_> = obj.occurrences().flagged().collect();
+    if sort_keys {
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+    }
+    entries
+}
+
+/// The presentation subtree for an object entry. The tree is keyed by key, so it describes the
+/// live (last) entry of a repeated key; an earlier entry of that key (a shadow, ADR-0027) has none
+/// of its own and is written plain rather than wearing its sibling's comments, anchor and style.
+fn field_comments_of<'a>(comments: &'a CommentTree, key: &str, live: bool) -> &'a CommentTree {
+    if live {
+        comments.field(key)
+    } else {
+        CommentTree::shared_empty()
+    }
+}
+
 /// Emit a YAML value as a string, appending each node's trailing same-line
 /// comment from the parallel `comments` tree (issue #710). Flow-style
 /// (`in_flow`) contexts never append one — flow items are comma-joined on
@@ -8508,9 +8532,9 @@ fn emit_yaml_value_at_depth(
                 // Flow style for nested in flow context
                 let ci = flow_continuation(indent, &config.indent_str);
                 let child_indent = flow_child_indent(&ci, &config.indent_str);
-                let entries: Vec<_> = obj
-                    .iter()
-                    .map(|(k, v)| {
+                let entries: Vec<_> = object_entries(obj, false)
+                    .into_iter()
+                    .map(|(k, v, live)| {
                         let key = with_key_anchor(
                             comments,
                             k,
@@ -8521,7 +8545,7 @@ fn emit_yaml_value_at_depth(
                                 config.json_sourced_floats,
                             ),
                         );
-                        let field_comments = comments.field(k);
+                        let field_comments = field_comments_of(comments, k, live);
                         let val = emit_yaml_value_at_depth(
                             v,
                             field_comments,
@@ -8540,17 +8564,11 @@ fn emit_yaml_value_at_depth(
                 with_container_tag(value, comments, rendered)
             } else {
                 // Block style mapping
-                let entries: Vec<_> = if config.sort_keys {
-                    let mut sorted: Vec<_> = obj.iter().collect();
-                    sorted.sort_by(|a, b| a.0.cmp(b.0));
-                    sorted
-                } else {
-                    obj.iter().collect()
-                };
+                let entries = object_entries(obj, config.sort_keys);
 
                 let items: Vec<(String, bool)> = entries
                     .iter()
-                    .map(|(k, v)| {
+                    .map(|(k, v, live)| {
                         // #1485/#1881: rounded up from the field's own
                         // column -- see `compact_child_indent`.
                         let val_indent = compact_child_indent(indent, &config.indent_str);
@@ -8598,7 +8616,7 @@ fn emit_yaml_value_at_depth(
                                 ),
                             )
                         });
-                        let field_comments = comments.field(k);
+                        let field_comments = field_comments_of(comments, k, *live);
                         let comment_suffix = trailing_comment_suffix(field_comments, indent);
                         let anchor = anchor_decl_prefix(field_comments);
                         // Check if value needs to be on next line - a

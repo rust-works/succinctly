@@ -898,6 +898,25 @@ enum OccurrencesInner<'a, V> {
 }
 
 impl<'a, V> Occurrences<'a, V> {
+    /// The same iteration, each entry flagged `true` when it is its key's live (last) entry and
+    /// `false` when it is a shadow -- for a writer that keys per-entry presentation by key and must
+    /// not hand a shadow its live entry's.
+    #[inline]
+    pub fn flagged(self) -> FlaggedOccurrences<'a, V> {
+        FlaggedOccurrences(self)
+    }
+
+    #[inline]
+    fn next_flagged(&mut self) -> Option<(&'a String, &'a V, bool)> {
+        match &mut self.0 {
+            OccurrencesInner::Plain(iter) => iter.next().map(|(k, v)| (k, v, true)),
+            OccurrencesInner::Ordered { map, entries } => {
+                let entry = entries.next()?;
+                Self::resolve(map, entry).map(|(k, v)| (k, v, matches!(entry, Occurrence::Live(_))))
+            }
+        }
+    }
+
     #[inline]
     fn resolve(
         map: &'a IndexMap<String, V>,
@@ -907,6 +926,23 @@ impl<'a, V> Occurrences<'a, V> {
             Occurrence::Shadow(key, value) => Some((key, value)),
             Occurrence::Live(slot) => map.get_index(*slot),
         }
+    }
+}
+
+/// [`Occurrences::flagged`]'s iterator.
+pub struct FlaggedOccurrences<'a, V>(Occurrences<'a, V>);
+
+impl<'a, V> Iterator for FlaggedOccurrences<'a, V> {
+    type Item = (&'a String, &'a V, bool);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next_flagged()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
     }
 }
 

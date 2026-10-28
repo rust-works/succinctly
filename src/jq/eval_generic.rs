@@ -102,7 +102,7 @@ use super::tail_call::{
     bind_next, body_is_reusable, pipe_settles_before_last, stage_settles, tail_def, tail_reachable,
     Tail, TailRounds,
 };
-use super::value::{owned_value_eq, subarray_indices, NumberRepr, OwnedValue};
+use super::value::{owned_value_eq, subarray_indices, NumberRepr, ObjectMapOf, OwnedValue};
 
 /// Recursion-depth ceiling for [`to_owned`]/[`to_owned_cursor`]/
 /// [`to_owned_with_comments`] (#998).
@@ -439,14 +439,15 @@ fn to_owned_checked_at_depth<S: EvalSemantics, V: DocumentValue>(
 ) -> Result<OwnedValue, EvalError> {
     check_nesting_depth(depth)?;
     if let Some(fields) = value.as_object_rendered() {
-        let mut map = IndexMap::new();
+        let mut map = ObjectMapOf::new();
         let mut guard = DisplayKeyGuard::default();
         let mut f = fields;
         let mut is_first = true;
         let mut last_field: Option<V::Cursor> = None;
         while let Some((field, rest)) = f.uncons() {
             let key = field.checked_key(&f, &map, &mut guard, is_first)?;
-            map.insert(
+            push_field::<S, _>(
+                &mut map,
                 key,
                 to_owned_checked_at_depth::<S, _>(&field.value, depth + 1)?,
             );
@@ -458,7 +459,7 @@ fn to_owned_checked_at_depth<S: EvalSemantics, V: DocumentValue>(
             return Err(f.malformed_member_error());
         }
         child_tail_gap_ok(last_field.as_ref(), b'}')?;
-        Ok(OwnedValue::Object(map.into()))
+        Ok(OwnedValue::Object(map))
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
         let mut elems = elements;
@@ -665,7 +666,7 @@ fn to_owned_at_depth<S: EvalSemantics, V: DocumentValue>(
     }
     // Check containers first (arrays and objects have no type ambiguity)
     if let Some(fields) = value.as_object_rendered() {
-        let mut map = IndexMap::new();
+        let mut map = ObjectMapOf::new();
         let mut guard = DisplayKeyGuard::default();
         let mut f = fields;
         let mut is_first = true;
@@ -679,7 +680,8 @@ fn to_owned_at_depth<S: EvalSemantics, V: DocumentValue>(
             // checks, as the one shared definition -- see
             // `DocumentField::checked_key` for which fault raises and why.
             let key = field.checked_key(&f, &map, &mut guard, is_first)?;
-            map.insert(
+            push_field::<S, _>(
+                &mut map,
                 key,
                 to_owned_at_depth::<S, _>(&field.value, Some(&field.value_cursor), depth + 1)?,
             );
@@ -700,7 +702,7 @@ fn to_owned_at_depth<S: EvalSemantics, V: DocumentValue>(
         // (only ever hit at the true top level) still can't, for the reason
         // this function's own doc comment above explains.
         tail_gap_ok(cursor, last_field.as_ref(), b'}')?;
-        Ok(OwnedValue::Object(map.into()))
+        Ok(OwnedValue::Object(map))
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
         let mut elems = elements;
@@ -1230,16 +1232,35 @@ pub fn validate_cursor<S: EvalSemantics, C: DocumentCursor>(cursor: &C) -> Resul
     result
 }
 
+/// Appends a member to an object being built by a cursor-to-owned walk.
+///
+/// A mode that keeps a repeated mapping key (`!S::COLLAPSE_DUPLICATE_KEYS`, yq) records the earlier
+/// entry beside the collapsed view ([`ObjectMapOf::push_occurrence`], ADR-0027); the others replace it,
+/// as an `IndexMap::insert` always did. The one definition every materializer shares, so the walks
+/// cannot disagree about which mode keeps what (#1344).
+#[inline]
+pub(super) fn push_field<S: EvalSemantics, V: Clone>(
+    map: &mut ObjectMapOf<V>,
+    key: String,
+    value: V,
+) {
+    if S::COLLAPSE_DUPLICATE_KEYS {
+        map.insert(key, value);
+    } else {
+        map.push_occurrence(key, value);
+    }
+}
+
 /// What [`to_owned_cursor_at_depth`] assembles from the checks it makes:
 /// the value itself ([`BuildOwned`]) or nothing ([`CheckOnly`], #3156). The
 /// walk -- every check, in the same order -- is the same for both.
 trait CursorWalkOutput {
-    type Out;
+    type Out: Clone;
     /// Whether the walk keeps the members it reads. `false` lets the object
     /// arm skip the per-key `String` and the per-object collision map, which
     /// are all a walk that builds nothing would spend them on (#3478).
     const KEEPS_MEMBERS: bool;
-    fn object(map: IndexMap<String, Self::Out>) -> Self::Out;
+    fn object(map: ObjectMapOf<Self::Out>) -> Self::Out;
     fn array(items: Vec<Self::Out>) -> Self::Out;
     fn scalar(value: OwnedValue) -> Self::Out;
     /// A bound node's own value, standing in for a subtree the walk would
@@ -1261,8 +1282,8 @@ struct BuildOwned;
 impl CursorWalkOutput for BuildOwned {
     type Out = OwnedValue;
     const KEEPS_MEMBERS: bool = true;
-    fn object(map: IndexMap<String, OwnedValue>) -> OwnedValue {
-        OwnedValue::Object(map.into())
+    fn object(map: ObjectMapOf<OwnedValue>) -> OwnedValue {
+        OwnedValue::Object(map)
     }
     fn array(items: Vec<OwnedValue>) -> OwnedValue {
         OwnedValue::array_from(items)
@@ -1288,7 +1309,7 @@ struct CheckOnly;
 impl CursorWalkOutput for CheckOnly {
     type Out = ();
     const KEEPS_MEMBERS: bool = false;
-    fn object(_: IndexMap<String, ()>) {}
+    fn object(_: ObjectMapOf<()>) {}
     fn array(_: Vec<()>) {}
     fn scalar(_: OwnedValue) {}
     /// Never: validating is walking, so no subtree may be skipped.
@@ -1344,7 +1365,7 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
     check_depth(depth)?;
     let value = known.unwrap_or_else(|| cursor.value());
     if let Some(fields) = value.as_object_rendered() {
-        let mut map = IndexMap::new();
+        let mut map = ObjectMapOf::new();
         let mut guard = DisplayKeyGuard::default();
         // #3478: the collision bookkeeping of a walk that keeps no members
         // (`CheckOnly`), lazy until an undecodable key appears; `map` and
@@ -1382,7 +1403,7 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
                     scalar_override,
                     nested,
                 )?;
-                map.insert(key, child);
+                push_field::<S, _>(&mut map, key, child);
                 Ok(())
             })?;
             return Ok(B::object(map));
@@ -1422,7 +1443,7 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
                 }
             }
             if B::KEEPS_MEMBERS {
-                map.insert(key, child);
+                push_field::<S, _>(&mut map, key, child);
             }
             last_field = Some(field.value_cursor);
             f = rest;
@@ -2721,6 +2742,11 @@ impl CommentTree {
             Self::Array(_, items) => items.get(i).unwrap_or(&EMPTY_COMMENT_TREE),
             _ => &EMPTY_COMMENT_TREE,
         }
+    }
+
+    /// A tree with nothing to say: what a node with no presentation of its own is written with.
+    pub fn shared_empty() -> &'static Self {
+        &EMPTY_COMMENT_TREE
     }
 
     /// The subtree for object key `key`, or the empty tree if this isn't an
