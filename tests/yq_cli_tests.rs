@@ -55096,16 +55096,12 @@ mod issue_870_position_shifting_writes {
         Ok(())
     }
 
-    /// **Known divergence** (gap 2): a `del` at an array index renumbers
-    /// every later slot, so a static index from another stage means one
-    /// node before it and another after — and the target list records no
-    /// order. `collect_write_targets` declines the expression instead of
-    /// guessing, which leaves it on the positional walk; both orderings
-    /// then give the same answer, where yq's differ from it.
-    ///
-    /// yq prints `- - new` / `  - b0 # b0` for both.
+    /// A `del` at an array index renumbers every later slot, so a static index
+    /// from another stage means one node before it and another after (gap 2,
+    /// closed by #2512). Both orders keep the one node they name, so both
+    /// print yq's `- - new` / `  - b0 # b0`; more shapes in `tests/yq_cli/i2512.rs`.
     #[test]
-    fn test_yaml_del_renumbering_another_stages_index_falls_back_870() -> Result<()> {
+    fn test_yaml_del_renumbering_another_stages_index_2512() -> Result<()> {
         let input = "arr:\n  - - a0 # a0\n  - - b0 # b0\n";
         for filter in [
             ".arr[1] = ([\"new\"] + .arr[1]) | del(.arr[0])",
@@ -55113,14 +55109,13 @@ mod issue_870_position_shifting_writes {
         ] {
             let (output, exit_code) = run_yq_stdin(filter, input, &[])?;
             assert_eq!(exit_code, 0, "{filter}");
-            assert_eq!(output, "arr:\n  - - new # a0\n    - b0\n", "{filter}");
+            assert_eq!(output, "arr:\n  - - new\n    - b0 # b0\n", "{filter}");
         }
         Ok(())
     }
 
-    /// The bail-out above must stay narrow: a `del` alongside a write that
-    /// never enters the same array is unambiguous, and both fixes still
-    /// apply.
+    /// A `del` alongside a write that never enters the same array needs no
+    /// ordering, and both fixes still apply.
     #[test]
     fn test_yaml_del_beside_an_unrelated_write_still_remaps_870() -> Result<()> {
         let input = "arr:\n  - \"x\" # cx\n  - y # cy\nn: 1\n";
