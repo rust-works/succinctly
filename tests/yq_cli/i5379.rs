@@ -35,8 +35,11 @@ fn test_a_tail_recursive_def_runs_past_the_frame_cap_in_yq_mode_5379() -> Result
 /// raised, and the refusal stays an error under `try` and `?` in yq mode too.
 #[test]
 fn test_a_call_that_never_ends_still_ends_in_yq_mode_5379() -> Result<()> {
-    let (stdout, stderr, code) =
-        run_yq_stdin_with_stderr("def f: f; try f catch \"caught\"", "a: 1\n", &[])?;
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(
+        "def f: f; try f catch \"caught\"",
+        "a: 1\n",
+        &["--jq-extensions"],
+    )?;
     assert_eq!((stdout.as_str(), code), ("", 1), "{stderr:?}");
     assert!(
         stderr.contains("f/0 exceeded maximum recursion depth"),
@@ -79,14 +82,15 @@ fn test_an_index_with_no_key_is_not_run_to_one_value_5379() -> Result<()> {
         "def g: .; def f: (.a[select(false)]) | g; f",
         "def g: .; def f: if (.a[select(false)] | length) > 0 then . else g end; f | .n",
     ] {
-        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &["-o", "json", "-I0"])?;
+        let (stdout, stderr, code) =
+            run_yq_stdin_with_stderr(filter, doc, &["--jq-extensions", "-o", "json", "-I0"])?;
         assert_eq!(code, 0, "`{filter}`: {stderr:?}");
         assert!(!stdout.is_empty(), "`{filter}`: {stdout:?}");
     }
     let (stdout, _, code) = run_yq_stdin_with_stderr(
         "def g: .; def f: (.a[select(false)]) | g; f",
         doc,
-        &["-o", "json", "-I0"],
+        &["--jq-extensions", "-o", "json", "-I0"],
     )?;
     assert_eq!((stdout.as_str(), code), ("1\n2\n3\n", 0));
     Ok(())

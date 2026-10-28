@@ -313,6 +313,9 @@ QUERY_FLAGS = {
     "users_yq_raw_slice": ["-R"],
     "users_yq_raw_concat": ["-R"],
     "users_yq_raw_test": ["-R"],
+    # yq's lexer has no `keys_unsorted`, so yq mode needs the flag for it (#4808); its cost
+    # is one boolean in the parser, nothing on the keys walk this row measures.
+    "users_yq_keys_unsorted": ["--jq-extensions"],
 }
 
 # Rows whose fixture is the base `users`/2mb document's records, one compact

@@ -156659,7 +156659,7 @@ mod touched_edge_cases_2999 {
         let json = br#"{"k":"a","v":[1,2]}"#;
         let index = JsonIndex::build(json);
         let run = |filter: &str, mode: ParserMode| {
-            let expr = parse_with_mode_and_extensions(filter, mode, false).expect("parses");
+            let expr = parse_with_mode_and_extensions(filter, mode, true).expect("parses");
             let result = match mode {
                 ParserMode::Yq => eval::<Vec<u64>, YqSemantics>(&expr, index.root(json))
                     .collect_owned::<YqSemantics>(),

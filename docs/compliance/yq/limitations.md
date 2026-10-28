@@ -1867,19 +1867,6 @@ in a yq filter is far more likely to be a jq habit (`limit(1; f)`, `reduce`, `fo
 empty result, and a loud error is the safer answer to it. The jq-style multi-argument forms that
 `--jq-extensions` enables (`limit`, `range`, `sub`, ...) are unaffected.
 
-### Jq-only names yq's lexer rejects that are still accepted without `--jq-extensions` (#1887)
-
-A test (`every_parsed_keyword_is_classified_for_the_jq_extensions_gate_1887`, `src/jq/parser.rs`)
-now classifies every keyword the parser matches against the pinned `yq` — gated, yq-native, a
-documented succinctly extension, or a known gap — so a new jq-only name can no longer ship ungated
-unnoticed. The sweep behind it found the gap list below: names yq's lexer rejects
-(`invalid input text`) that `succinctly yq` parses without the flag. Gating them is a behaviour
-change for existing yq scripts and tests, so they stay accepted until it is decided (`last` was
-gated by #3560); moving one to the test's `GATED` table is the whole change on the
-parser side.
-
-`arrays`, `booleans`, `break`, `builtins`, `catch`, `def`, `elif`, `else`, `empty`, `end`, `finites`, `fromjsonstream`, `halt`, `halt_error`, `if`, `in`, `isarray`, `isboolean`, `isnull`, `isnumber`, `isobject`, `isstring`, `isvalid`, `iterables`, `keys_unsorted`, `label`, `ltrim`, `modulemeta`, `normals`, `nulls`, `numbers`, `objects`, `recurse`, `recurse_down`, `repeat`, `rtrim`, `scalars`, `stderr`, `strings`, `then`, `toboolean`, `tojsonstream`, `try`, `until`, `utf8bytelength`, `values`, `while`.
-
 ### 3-argument `sub(re; s; flags)` — resolved, real yq ignores everything past the pattern
 
 [#1122](https://github.com/rust-works/succinctly/issues/1122) resolved what had looked like an
@@ -6047,14 +6034,14 @@ extension under ADR-0018 rule 5 -- a decision this entry doesn't make, only surf
 The caps `succinctly jq` documents -- `MAX_RANGE_TOTAL`, `MAX_LOOP_ROUNDS` (which a tail-recursive `def` shares with `while`/`until`, #5379), `WHILE_UNTIL_MAX_STEPS`,
 `REDUCE_FOREACH_MAX_STEPS`, `repeat`'s `MAX_ITERATIONS`, `MAX_EVAL_FRAMES` -- are shared
 evaluator limits, so they apply to `succinctly yq` as well; real yq v4.53.3 has none of them.
-The reachable ones without `--jq-extensions` are `while`/`until` and a recursive `def`
-(`range`/`repeat` are gated, #1512). Since #2132 the raise is `ErrorKind::ResourceLimit`,
+The reachable ones are `while`/`until` and a recursive `def`, both behind `--jq-extensions` since #4808
+(`range`/`repeat` are gated too, #1512). Since #2132 the raise is `ErrorKind::ResourceLimit`,
 which `?`/`try`/`catch` never swallow, in both modes alike:
 
 ```console
-$ printf 'a: 1\n' | succinctly yq '[.a | while(true; (1, 2))] | length'
+$ printf 'a: 1\n' | succinctly yq --jq-extensions '[.a | while(true; (1, 2))] | length'
 Error: while: maximum iterations exceeded
-$ printf 'a: 1\n' | succinctly yq 'def f: f; try f catch "caught"'
+$ printf 'a: 1\n' | succinctly yq --jq-extensions 'def f: f; try f catch "caught"'
 Error: f/0 exceeded maximum recursion depth
 ```
 
@@ -6130,6 +6117,20 @@ itself rejects it too (`leaf_paths/0 is not defined`; it's a succinctly-only inv
 modeled on a jq community recipe, see CLAUDE.md) — because, from `succinctly yq`'s
 syntax-surface point of view, it's the same kind of thing as the rest of this list: extra,
 off by default.
+
+**The rest of the jq-only names, gated by [#4808](https://github.com/rust-works/succinctly/issues/4808).**
+Real yq's lexer rejects every one of these with `invalid input text` (pinned yq v4.53.3), and `succinctly yq` now refuses them without the flag as well.
+Until #4808 they were the "known gap" table of the #1887 sweep, parsed without the flag.
+Control flow and definitions: `if`/`then`/`elif`/`else`/`end`, `try`/`catch`, `label`/`break`, `def`.
+Loops and recursion: `while`, `until`, `repeat`, `recurse`, `recurse_down`.
+Output and process control: `empty`, `halt`, `halt_error`, `stderr`.
+Type selectors and tests: `values`, `nulls`, `booleans`, `numbers`, `strings`, `arrays`, `objects`, `iterables`, `scalars`, `normals`, `finites`, `isnull`, `isboolean`, `isnumber`, `isstring`, `isarray`, `isobject`, `isvalid`.
+The rest: `in`, `keys_unsorted`, `ltrim`, `rtrim`, `utf8bytelength`, `toboolean`, `tojsonstream`, `fromjsonstream`, `builtins`, `modulemeta`.
+The owner chose to gate all of them in one change, before the next release, rather than group by group or keep them ungated: nothing released has the gate, so one release note covers it, and the old split (`reduce`, `limit` and `last` gated while `def`, `if` and `try` were not) had no principled line.
+Little capability is lost: yq's `keys` already keeps document order, `..` is its recursion, `select(tag == "!!str")` is its type selector, `trim` covers `ltrim`/`rtrim`, and `select`, `//` and `with` cover `if`.
+A script that uses one of these under `succinctly yq` adds `--jq-extensions`, and the error already names it.
+`every_parsed_keyword_is_classified_for_the_jq_extensions_gate_1887` (`src/jq/parser.rs`) enforces the classification: every keyword the parser matches is gated, gated by call form (`all`, `any`, `path`), gated with its opener (`then`, `elif`, `else`, `end`, `catch`), a yq-native name, or listed in `BY_DESIGN`.
+`succinctly jq` is unchanged.
 
 The same gate covers the jq-styled **object-construction sugar** real yq's lexer rejects:
 bare identifier keys (`{b: 2}`) and the field shorthand (`{x}`, meaning `{x: .x}`)

@@ -50,14 +50,14 @@ below.
 
 ## jq Compatibility
 
-All features from the [jq Language Reference](jq-language.md) work with yq, including:
+Most of the [jq Language Reference](jq-language.md) works with yq, but real yq's lexer rejects much of it, so the jq-only names need `--jq-extensions` (see [Gated jq Builtins](#gated-jq-builtins---jq-extensions)). These work by default:
 
 - Path expressions (`.foo`, `.[0]`, `.[]`, `..`)
 - Operators (arithmetic, comparison, boolean, pipe, comma)
-- Array/object operations (`keys`, `values`, `sort`, `group_by`, etc.)
+- Array/object operations (`keys`, `sort`, `group_by`, etc.)
 - String functions (`split`, `join`, `test`, `match`, etc.)
-- Control flow (`if-then-else`, `try-catch`; `reduce` and `foreach` need `--jq-extensions`)
-- User-defined functions (`def name: body;`)
+- Control flow through yq's own forms (`select`, `//`, `with`); `if`/`then`/`else`, `try`/`catch`, `reduce`, `foreach` and `label` need `--jq-extensions`
+- User-defined functions (`def name: body;`) need `--jq-extensions`
 - Variable binding (`as $var`)
 - Assignment operators (`=`, `|=`, `+=`, etc.)
 - Format strings (`@json`, `@csv`, `@base64`, etc.)
@@ -602,10 +602,10 @@ succinctly yq 'at_position(5; 3)' config.yaml
 ### `if` with no `else`
 
 Real yq's lexer rejects `if` outright, so `succinctly yq`'s support for it is itself an
-extension (see the construct list just below). It matches jq 1.7's own definition rather
+extension, gated behind `--jq-extensions` (#4808; see the construct list just below). It matches jq 1.7's own definition rather
 than inventing a separate yq answer: `if A then B end` desugars to `if A then B else . end`,
 so a falsy condition passes the input through unchanged, not `null` (#3408) —
-`printf 'a: false\n' | succinctly yq '.a | if . then "x" end'` is `false`, not `null`.
+`printf 'a: false\n' | succinctly yq --jq-extensions '.a | if . then "x" end'` is `false`, not `null`.
 
 ### `any_c(f)` / `all_c(f)`
 
@@ -702,6 +702,17 @@ surface (#1512):
 | `copysign`, `drem`, `fdim`, `fmax`, `fmin`, `fmod`, `hypot`, `jn`, `ldexp`, `nextafter`, `nexttoward`, `remainder`, `scalb`, `scalbln`, `yn` (2-arg), `fma` (3-arg) | jq's two- and three-argument libm builtins (#3042) |
 | `skip(n; f)`                                         | Drop the first `n` outputs of `f` (#1882)     |
 | `ascii_downcase`, `ascii_upcase`                     | jq's spellings of `downcase`/`upcase` (#2462) |
+| `if`/`then`/`elif`/`else`/`end`, `try`, `try`/`catch` | Conditionals and error handling (#4808)       |
+| `def name: body;`, `label $out`, `break $out`        | Function definitions, labelled break (#4808)  |
+| `while(c; f)`, `until(c; f)`, `repeat(f)`            | Loop generators (#4808)                       |
+| `recurse`, `recurse(f)`, `recurse(f; cond)`, `recurse_down` | Recursive descent; yq has `..` (#4808)        |
+| `empty`, `halt`, `halt_error`, `halt_error(n)`, `stderr` | No output / exit / stderr (#4808)             |
+| `values`, `nulls`, `booleans`, `numbers`, `strings`, `arrays`, `objects`, `iterables`, `scalars`, `normals`, `finites` | Type selectors; yq has `select(tag == ...)` (#4808) |
+| `isnull`, `isboolean`, `isnumber`, `isstring`, `isarray`, `isobject`, `isvalid(f)` | Type tests (#4808)                            |
+| `in(obj)`                                            | Key membership (#4808)                        |
+| `keys_unsorted`                                      | Document-order keys; yq's `keys` already is (#4808) |
+| `ltrim`, `rtrim`, `utf8bytelength`                   | Trim / byte length (#4808)                    |
+| `toboolean`, `tojsonstream`, `fromjsonstream`, `builtins`, `modulemeta` | Remaining jq-only names (#4808)               |
 
 The flag also enables jq's generic postfix `?` after an expression such as
 `length?` or `(.x)?` (#3378). Default yq accepts optional navigation on
