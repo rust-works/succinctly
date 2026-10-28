@@ -4219,35 +4219,35 @@ mod tests {
         assert_eq!(first.len(), 5);
         let run_len = |e: &Expr| match e {
             Expr::Shared(run) => match run.expr() {
-                Expr::Pipe(stages) => stages.len(),
-                other => panic!("a pipe, not {other:?}"),
+                Expr::Pipe(stages) => Some(stages.len()),
+                _ => None,
             },
-            other => panic!("a kept run, not {other:?}"),
+            _ => None,
         };
         assert_eq!(
             [&first[0], &first[2], &first[4]].map(run_len),
-            [4, 3, 2],
+            [Some(4), Some(3), Some(2)],
             "the runs between the stateful stages"
         );
         assert!(matches!(first[1], Expr::Identity) && matches!(first[3], Expr::Identity));
         let again = pipe.split_tail(1, |_| unreachable!("kept"));
         for at in [0, 2, 4] {
-            let (Expr::Shared(a), Expr::Shared(b)) = (&first[at], &again[at]) else {
-                panic!("runs");
-            };
-            assert!(Rc::ptr_eq(a, b), "a run is kept once for every call");
+            assert!(
+                matches!((&first[at], &again[at]), (Expr::Shared(a), Expr::Shared(b)) if Rc::ptr_eq(a, b)),
+                "a run is kept once for every call"
+            );
         }
         // The runs of a split tail are the tails of the same table: a run's own
         // tails are the runs after it.
-        let Expr::Shared(run) = &first[0] else {
-            panic!("a run");
-        };
-        let Expr::Pipe(run) = run.expr() else {
-            panic!("a pipe");
-        };
         assert!(matches!(
-            run.tail_plan(1, stateful, |_| true),
-            TailPlan::Whole(inner) if matches!(inner.expr(), Expr::Pipe(t) if t.len() == 3)
+            &first[0],
+            Expr::Shared(run) if matches!(
+                run.expr(),
+                Expr::Pipe(run) if matches!(
+                    run.tail_plan(1, stateful, |_| true),
+                    TailPlan::Whole(inner) if matches!(inner.expr(), Expr::Pipe(t) if t.len() == 3)
+                )
+            )
         ));
         // A tail after the last stateful stage is a whole kept tail, a short tail
         // holding state is copied, and the run behind it is not asked for.

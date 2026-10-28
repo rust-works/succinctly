@@ -11659,21 +11659,22 @@ impl RestCopy {
     /// (#5421), built on the first call that asks and kept until this is
     /// dropped, as [`Self::owned_pipe`] is.
     fn split_pipe(&mut self, stages: impl FnOnce() -> Vec<Expr>) -> &Expr {
-        if !matches!(self, Self::Owned(_)) {
-            *self = Self::Owned(Expr::Pipe(stages().into()));
-        }
-        match self {
-            Self::Owned(whole) => whole,
-            Self::Unasked | Self::Bare => unreachable!("the split pipe was just built"), // patchcov: coverage tolerate-line reason="unreachable: the `if` above replaces every other state with `Owned` before this match"
-        }
+        self.pipe_of(|| stages().into())
     }
 
     /// The owned pipe over `stages`, built on the first call.
     fn owned_pipe(&mut self, stages: &[Expr]) -> &Expr {
-        if !matches!(self, Self::Owned(_)) {
+        self.pipe_of(|| {
             #[cfg(test)]
             owned_pipe_copies::bump();
-            *self = Self::Owned(Expr::Pipe(stages.to_vec().into()));
+            stages.to_vec().into()
+        })
+    }
+
+    /// The owned pipe, from `build` on the first call and kept after.
+    fn pipe_of(&mut self, build: impl FnOnce() -> PipeStages) -> &Expr {
+        if !matches!(self, Self::Owned(_)) {
+            *self = Self::Owned(Expr::Pipe(build()));
         }
         match self {
             Self::Owned(whole) => whole,
