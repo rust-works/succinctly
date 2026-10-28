@@ -8218,6 +8218,17 @@ fn object_entries(obj: &ObjectMap, sort_keys: bool) -> Vec<(&String, &OwnedValue
     entries
 }
 
+/// The tree key-level presentation (quoting, an anchor, a tag, a comment on the key) is read from.
+/// It is keyed by key like [`field_comments_of`]'s, so an earlier entry of a repeated key gets none
+/// of its sibling's: an anchor declared on the live key is not declared twice.
+fn key_comments_of(comments: &CommentTree, live: bool) -> &CommentTree {
+    if live {
+        comments
+    } else {
+        CommentTree::shared_empty()
+    }
+}
+
 /// The presentation subtree for an object entry. The tree is keyed by key, so it describes the
 /// live (last) entry of a repeated key; an earlier entry of that key (a shadow, ADR-0027) has none
 /// of its own and is written plain rather than wearing its sibling's comments, anchor and style.
@@ -8535,15 +8546,11 @@ fn emit_yaml_value_at_depth(
                 let entries: Vec<_> = object_entries(obj, false)
                     .into_iter()
                     .map(|(k, v, live)| {
+                        let kc = key_comments_of(comments, live);
                         let key = with_key_anchor(
-                            comments,
+                            kc,
                             k,
-                            yaml_quote_key(
-                                k,
-                                comments.key_style(k),
-                                true,
-                                config.json_sourced_floats,
-                            ),
+                            yaml_quote_key(k, kc.key_style(k), true, config.json_sourced_floats),
                         );
                         let field_comments = field_comments_of(comments, k, live);
                         let val = emit_yaml_value_at_depth(
@@ -8569,6 +8576,7 @@ fn emit_yaml_value_at_depth(
                 let items: Vec<(String, bool)> = entries
                     .iter()
                     .map(|(k, v, live)| {
+                        let kc = key_comments_of(comments, *live);
                         // #1485/#1881: rounded up from the field's own
                         // column -- see `compact_child_indent`.
                         let val_indent = compact_child_indent(indent, &config.indent_str);
@@ -8577,9 +8585,9 @@ fn emit_yaml_value_at_depth(
                         // mapping's column. A key with no style, anchor or tag of its own (JSON
                         // or computed, or cleared by `-P`) takes go-yaml's choice of scalar; a
                         // YAML key keeps the spelling it was written in (#4950).
-                        let plain_key = comments.key_style(k).is_empty()
-                            && comments.key_anchor(k).is_none()
-                            && comments.key_tag(k).is_none();
+                        let plain_key = kc.key_style(k).is_empty()
+                            && kc.key_anchor(k).is_none()
+                            && kc.key_tag(k).is_none();
                         let explicit_key = if go_yaml_key_is_simple(k) {
                             None
                         } else if plain_key
@@ -8592,11 +8600,11 @@ fn emit_yaml_value_at_depth(
                             go_yaml_explicit_key_scalar(k, &val_indent, config.indent_str.len())
                         } else {
                             Some(with_key_anchor(
-                                comments,
+                                kc,
                                 k,
                                 yaml_quote_key(
                                     k,
-                                    comments.key_style(k),
+                                    kc.key_style(k),
                                     false,
                                     config.json_sourced_floats,
                                 ),
@@ -8606,11 +8614,11 @@ fn emit_yaml_value_at_depth(
                         let is_explicit_key = explicit_key.is_some();
                         let key = explicit_key.unwrap_or_else(|| {
                             with_key_anchor(
-                                comments,
+                                kc,
                                 k,
                                 yaml_quote_key(
                                     k,
-                                    comments.key_style(k),
+                                    kc.key_style(k),
                                     false,
                                     config.json_sourced_floats,
                                 ),
@@ -8666,7 +8674,7 @@ fn emit_yaml_value_at_depth(
                             } else {
                                 format!("{indent}{key}:{anchor}{tag}{key_comment_suffix}\n{val}")
                             }
-                        } else if let Some(kc) = comments.key_comment_if_value_absent(k) {
+                        } else if let Some(kc) = kc.key_comment_if_value_absent(k) {
                             // The deferred value materialized as nothing at
                             // all - the key's own comment stands alone with
                             // no value token, matching real yq (#765). An
@@ -8709,7 +8717,7 @@ fn emit_yaml_value_at_depth(
                                 // (#2806).
                                 let scalar =
                                     !matches!(v, OwnedValue::Object(_) | OwnedValue::Array(_));
-                                comments.key_comment(k).map_or_else(String::new, |c| {
+                                kc.key_comment(k).map_or_else(String::new, |c| {
                                     if scalar {
                                         comment_suffix_text(c, indent)
                                     } else {

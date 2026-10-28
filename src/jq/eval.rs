@@ -17991,6 +17991,67 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Ok(f) => f,
                 Err(e) => return QueryResult::Error(e),
             };
+            // `f` on one value: the first output, none, or the control to surface (object construction
+            // is atomic in jq -- see `eval_object_construction` -- so a `Partial` surfaces its control).
+            let rewrite =
+                |field_val: StandardJson<'a, W>| -> Result<Option<OwnedValue>, QueryResult<'a, W>> {
+                    Ok(
+                        match eval_single::<W, S>(f, field_val, optional).materialize_cursor() {
+                            QueryResult::One(v) => match to_owned::<S, _>(&v) {
+                                Ok(owned) => Some(owned),
+                                Err(e) => return Err(suppress_or_raise(e, optional)),
+                            },
+                            QueryResult::OneCursor(_) => unreachable!(),
+                            QueryResult::Owned(v) => Some(v),
+                            QueryResult::Many(vs) => match vs.first() {
+                                Some(v) => match to_owned::<S, _>(v) {
+                                    Ok(owned) => Some(owned),
+                                    Err(e) => return Err(suppress_or_raise(e, optional)),
+                                },
+                                None => None,
+                            },
+                            QueryResult::ManyOwned(vs) => vs.into_iter().next(),
+                            QueryResult::None => None,
+                            QueryResult::Error(e) => return Err(QueryResult::Error(e)),
+                            QueryResult::Break(label) => return Err(QueryResult::Break(label)),
+                            QueryResult::Halt(code) => return Err(QueryResult::Halt(code)),
+                            QueryResult::Partial(_, Control::Error(e)) => {
+                                return Err(QueryResult::Error(e))
+                            }
+                            QueryResult::Partial(_, Control::Break(label)) => {
+                                return Err(QueryResult::Break(label));
+                            }
+                            QueryResult::Partial(_, Control::Halt(code)) => {
+                                return Err(QueryResult::Halt(code));
+                            }
+                        },
+                    )
+                };
+            if S::COLLAPSE_DUPLICATE_KEYS {
+                // `checked` is already collapsed: one pass, each key checked as it is inserted.
+                let mut result_map = IndexMap::with_capacity(checked.len());
+                let mut guard = DisplayKeyGuard::default();
+                for field in checked {
+                    // `key_display_string_kind`, not `resolve_display_key`: see the guard note
+                    // above (a field `f` produces nothing for must not register its key).
+                    let Some((key, is_fallback)) = key_display_string_kind(&field.key) else {
+                        return QueryResult::Error(fields.malformed_member_error());
+                    };
+                    let key = key.into_owned();
+                    let value_to_insert = match rewrite(field.value) {
+                        Ok(v) => v,
+                        Err(result) => return result,
+                    };
+                    if let Some(value) = value_to_insert {
+                        if !guard.check(&result_map, &key, is_fallback) {
+                            return QueryResult::Error(EvalError::colliding_display_key(&key));
+                        }
+                        result_map.insert(key, value);
+                    }
+                }
+                return QueryResult::Owned(OwnedValue::Object(result_map.into()));
+            }
+
             // The display key of every field, then which occurrence of each key is its live (last)
             // one. yq's `map_values` rewrites that entry and leaves a repeated key's earlier entries
             // as they were (ADR-0027, #1344); jq mode's `checked` is already collapsed, so every
@@ -18028,39 +18089,10 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     }
                     continue;
                 }
-                // Apply f to the value
-                let field_val = field.value;
-                let value_to_insert: Option<OwnedValue> =
-                    match eval_single::<W, S>(f, field_val, optional).materialize_cursor() {
-                        QueryResult::One(v) => match to_owned::<S, _>(&v) {
-                            Ok(owned) => Some(owned),
-                            Err(e) => return suppress_or_raise(e, optional),
-                        },
-                        QueryResult::OneCursor(_) => unreachable!(),
-                        QueryResult::Owned(v) => Some(v),
-                        QueryResult::Many(vs) => match vs.first() {
-                            Some(v) => match to_owned::<S, _>(v) {
-                                Ok(owned) => Some(owned),
-                                Err(e) => return suppress_or_raise(e, optional),
-                            },
-                            None => None,
-                        },
-                        QueryResult::ManyOwned(vs) => vs.into_iter().next(),
-                        QueryResult::None => None,
-                        QueryResult::Error(e) => return QueryResult::Error(e),
-                        QueryResult::Break(label) => return QueryResult::Break(label),
-                        QueryResult::Halt(code) => return QueryResult::Halt(code),
-                        // Object construction is atomic in jq (see
-                        // `eval_object_construction`) — a `Partial` field value
-                        // just surfaces its control, same as a bare one.
-                        QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
-                        QueryResult::Partial(_, Control::Break(label)) => {
-                            return QueryResult::Break(label);
-                        }
-                        QueryResult::Partial(_, Control::Halt(code)) => {
-                            return QueryResult::Halt(code);
-                        }
-                    };
+                let value_to_insert = match rewrite(field.value) {
+                    Ok(v) => v,
+                    Err(result) => return result,
+                };
                 rewritten.push(Rewritten::Live(value_to_insert));
             }
             let dropped: Vec<bool> = rewritten

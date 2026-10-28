@@ -1482,7 +1482,9 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
             };
             if !nested.is_empty() {
                 // A later member with the same key replaces the value, so an
-                // earlier watched member is in no value this walk returns.
+                // earlier watched member is in no value this walk returns -- except as
+                // a shadow under a mode that keeps repeated keys (ADR-0027), which a
+                // path step cannot name, so an anchor under it is not filled either.
                 if map.map().contains_key(&key) {
                     watched.retain(|(_, k)| !matches!(k, OwnedValue::String(k) if *k == key));
                 }
@@ -38449,25 +38451,21 @@ fn map_family_members(
             let typed_keys = typed_keys.filter(|keys| keys.len() == listed);
             // `with_entries` runs over `to_entries`, which lists a repeated key once per entry
             // (yq, ADR-0027); `map` and `map_values` run over `.[]`, the live entries.
-            let entries: alloc::boxed::Box<dyn Iterator<Item = (&String, &OwnedValue)>> =
-                if matches!(family, MapFamily::WithEntries) {
-                    alloc::boxed::Box::new(fields.occurrences())
-                } else {
-                    alloc::boxed::Box::new(fields.iter())
-                };
-            entries
-                .enumerate()
-                .map(|(i, (k, v))| match family {
-                    MapFamily::WithEntries => {
-                        let key = typed_keys.map_or_else(
-                            || OwnedValue::String(k.clone().into()), // patchcov: coverage tolerate-line reason="pre-existing zero-hit line; #3191 changed only how its string payload is constructed"
-                            |keys| keys[i].clone(),
-                        );
-                        (OwnedValue::Int(i as i64), map_family_entry(key, v.clone()))
-                    }
-                    _ => (OwnedValue::String(k.clone().into()), v.clone()),
-                })
-                .collect()
+            let member = |(i, (k, v)): (usize, (&String, &OwnedValue))| match family {
+                MapFamily::WithEntries => {
+                    let key = typed_keys.map_or_else(
+                        || OwnedValue::String(k.clone().into()), // patchcov: coverage tolerate-line reason="pre-existing zero-hit line; #3191 changed only how its string payload is constructed"
+                        |keys| keys[i].clone(),
+                    );
+                    (OwnedValue::Int(i as i64), map_family_entry(key, v.clone()))
+                }
+                _ => (OwnedValue::String(k.clone().into()), v.clone()),
+            };
+            if matches!(family, MapFamily::WithEntries) {
+                fields.occurrences().enumerate().map(member).collect()
+            } else {
+                fields.iter().enumerate().map(member).collect()
+            }
         }
         OwnedValue::Array(elements) => elements
             .iter()
@@ -38526,7 +38524,7 @@ fn eval_map_family_positioned<S: EvalSemantics, V: DocumentValue>(
         {
             fields.clone()
         }
-        _ => ObjectMapOf::new(),
+        _ => ObjectMapOf::with_capacity(members.len()),
     };
     for (component, member) in members {
         let member_id = id.child(&parent, component.clone());

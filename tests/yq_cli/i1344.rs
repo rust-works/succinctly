@@ -348,3 +348,16 @@ fn the_gated_builtins_keep_a_repeated_key_1344() -> Result<()> {
     }
     Ok(())
 }
+
+/// An earlier entry carries none of its sibling's presentation, and an anchor is never declared
+/// twice. yq writes `&x` on the first entry here and `*x` on the second; the earlier entry is
+/// written plain, so the alias is resolved instead (a gap recorded in `limitations.md`).
+#[test]
+fn an_earlier_entry_does_not_repeat_its_siblings_anchor_1344() -> Result<()> {
+    let doc = "a: &x 1\na: *x\nb: 3\n";
+    let (out, code) = run_yq_stdin("[.] | .[0]", doc, &[])?;
+    assert_eq!(code, 0);
+    assert!(out.matches("&x").count() <= 1, "{out:?}");
+    assert_eq!(out, "a: 1\na: 1\nb: 3\n");
+    Ok(())
+}
