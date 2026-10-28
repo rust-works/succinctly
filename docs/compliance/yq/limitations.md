@@ -6139,6 +6139,11 @@ by default; with `--jq-extensions` they keep their jq meaning. The flag decides 
 first character: an entry that starts like an identifier (`{length, "k": 1}`) is jq's field
 shorthand (`{length: .length, ...}`), not yq's bare entry.
 
+The same gate covers jq's **destructuring patterns** in `as` (`. as {a: $v}`, `. as [$a]`, `. as {$a}`) ([#5433](https://github.com/rust-works/succinctly/issues/5433)).
+Real yq's `as` takes a variable name and nothing else: it rejects `{...}` patterns at its lexer (`invalid input text`) and `[...]` patterns and `{"k": ...}` patterns with `RHS of 'as' operator must be a variable name`.
+`succinctly yq` rejects every non-`$name` pattern by default, with the same error that names `--jq-extensions`.
+With the flag a pattern keeps its jq meaning, and `?//` stays refused either way.
+
 `gsub`/`scan`/`splits` specifically: real yq's lexer rejects all three outright, at any
 arity ([#1436](https://github.com/rust-works/succinctly/issues/1436)) — this isn't "3-arg
 `gsub` diverges," it's that yq's grammar has no `gsub`/`scan`/`splits` token at all:

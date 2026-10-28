@@ -21995,7 +21995,8 @@ mod meta_assign_798 {
             ". as [{((.a style = \"double\") | .a): $v}] | .",
             ". as {((.a anchor = \"z\") | .a): $v} | select(true)",
         ] {
-            let (out, err, code) = run_yq_stdin_with_stderr(filter, "a: 1\nb: hi\n", &[]).unwrap();
+            let (out, err, code) =
+                run_yq_stdin_with_stderr(filter, "a: 1\nb: hi\n", &["--jq-extensions"]).unwrap();
             assert_eq!(code, 1, "[{filter}] stderr: {err}");
             assert_eq!(out, "", "[{filter}]");
             assert!(
@@ -22013,7 +22014,8 @@ mod meta_assign_798 {
     #[test]
     fn value_write_in_a_pattern_key_does_not_open_the_metadata_pass_3203() {
         let filter = ". as {((.a = \"a\") | .a): $v} | .";
-        let (out, err, code) = run_yq_stdin_with_stderr(filter, "a: k\nk: 1\n", &[]).unwrap();
+        let (out, err, code) =
+            run_yq_stdin_with_stderr(filter, "a: k\nk: 1\n", &["--jq-extensions"]).unwrap();
         assert_eq!(code, 0, "[{filter}] stderr: {err}");
         assert_eq!(out, "a: k\nk: 1\n", "[{filter}]");
         assert!(
@@ -37209,7 +37211,11 @@ fn test_jq_urid_malformed_escape_errors_1138() -> Result<()> {
 /// pattern under an absent field resolves to `null` instead of erroring.
 #[test]
 fn test_destructuring_pattern_null_propagates_through_nested_object_1239() -> Result<()> {
-    let (out, code) = run_yq_stdin(". as {x: {y: $y}} | $y", "a: 1\n", &["-o", "json"])?;
+    let (out, code) = run_yq_stdin(
+        ". as {x: {y: $y}} | $y",
+        "a: 1\n",
+        &["--jq-extensions", "-o", "json"],
+    )?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "null");
     Ok(())
@@ -37227,7 +37233,7 @@ fn test_destructuring_computed_key_fans_out_on_the_owned_identity_route_2872() -
     let (out, code) = run_yq_stdin(
         ".a | . as {(\"x\",\"y\"):$q} | [key, $q]",
         doc,
-        &["-o", "json", "-I0"],
+        &["-o", "json", "-I0", "--jq-extensions"],
     )?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out, "[\"a\",1]\n[\"a\",2]\n");
@@ -37246,7 +37252,7 @@ fn test_destructuring_computed_key_fans_out_on_the_owned_identity_route_2872() -
     let (out, err, code) = run_yq_stdin_with_stderr(
         ".a | . as {(\"x\", error(\"E\")):$q} | key",
         doc,
-        &["-o", "json"],
+        &["-o", "json", "--jq-extensions"],
     )?;
     assert_eq!(code, 1, "out: {out:?} err: {err:?}");
     assert_eq!(out, "");
@@ -43296,7 +43302,7 @@ fn test_yq_forward_reference_is_rejected_1473() -> Result<()> {
 #[test]
 fn test_yq_computed_pattern_key_undefined_call_is_now_rejected_2734() -> Result<()> {
     let (stdout, stderr, code) =
-        run_yq_stdin_with_stderr(". as {(nosuchfn): $a} | $a", "a: 1\n", &[])?;
+        run_yq_stdin_with_stderr(". as {(nosuchfn): $a} | $a", "a: 1\n", &["--jq-extensions"])?;
     assert_eq!(code, 1, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "", "no document should be emitted");
     assert!(
@@ -64423,7 +64429,7 @@ fn test_tonumber_on_a_tagged_number_ignores_the_tag_3191() -> Result<()> {
 #[test]
 fn test_destructuring_bind_yq_mode_unchanged_3466() -> Result<()> {
     let input = "a: {b: 1, c: 0}\n";
-    let (stdout, code) = run_yq_stdin(". as {a:{b:$z}} | $z", input, &[])?;
+    let (stdout, code) = run_yq_stdin(". as {a:{b:$z}} | $z", input, &["--jq-extensions"])?;
     assert_eq!((stdout.as_str(), code), ("1\n", 0));
     let (stdout, code) = run_yq_stdin(
         ". as {a:{b:$z}} | [path(.a.b | $z)]",

@@ -4932,6 +4932,9 @@ impl<'a> Parser<'a> {
     /// - `$var` - simple variable binding
     /// - `{key: $var, ...}` - object destructuring
     /// - `[$first, $second, ...]` - array destructuring
+    ///
+    /// Only `$var` is yq's: its `as` takes a variable name and nothing else (#5433), so
+    /// the two destructuring forms are gated behind `--jq-extensions` in yq mode.
     fn parse_pattern(&mut self) -> Result<Pattern, ParseError> {
         if self.pattern_depth == 0 {
             self.pattern_computed_keys = 0;
@@ -4983,6 +4986,7 @@ impl<'a> Parser<'a> {
             }
             Some('{') => {
                 // Object pattern: {key: $var, ...}
+                self.reject_unless_jq_extensions("destructuring pattern")?;
                 self.next();
                 self.skip_ws();
 
@@ -5141,6 +5145,7 @@ impl<'a> Parser<'a> {
             }
             Some('[') => {
                 // Array pattern: [$first, $second, ...]
+                self.reject_unless_jq_extensions("destructuring pattern")?;
                 self.next();
                 self.skip_ws();
 
