@@ -4711,11 +4711,14 @@ already had this exact same-shaped custom-tag gap) — both builtins now agree w
 other and with real yq.
 
 **Custom tags are only correct when a cursor is available** (the overwhelming majority of
-call sites — any read through a real YAML document). Once a value has left cursor
-tracking (materialized into an `OwnedValue`, e.g. after `map`/a computed expression, or
-under `-n`/`--slurp`/JSON input), a custom tag is unrecoverable — `OwnedValue` has no
-field for one at all, the same structural gap #1416 already documents. This is not a
-regression from this fix: `tag`'s own prior, unconditional (non-cursor) implementation
+call sites — any read through a real YAML document).
+Most filters that build a value out of document nodes keep the node's tag, as yq does:
+`map(.)`, `[.a]`, `[.a, .b]`, `{"k": .a}`, `to_entries`, `with_entries(.)` over a mapping, `sort`, `reverse`, `unique` and `. + []` over a sequence.
+A custom tag is still lost when the value leaves cursor tracking on one of the routes
+[#5429](https://github.com/rust-works/succinctly/issues/5429) lists (`[.[]]`, array slices, `map_values`, `$x`, array `+`, `flatten`), on `with_entries(.)` over a sequence, on most filters under `--eval-all` ([#4380](https://github.com/rust-works/succinctly/issues/4380)), and in a `load()`ed document.
+The tag is lost there together with the node's comment, anchor and quoting, because those routes keep none of a node's presentation.
+Input that is not YAML carries no tag to lose.
+This is not a regression from this fix: `tag`'s own prior, unconditional (non-cursor) implementation
 already had the identical limitation; this fix only *adds* the cursor-aware case that
 real yq always has, it does not remove the old one.
 
@@ -5000,9 +5003,11 @@ ruled out), even though real yq supports every one of them:
   keeps a custom tag and loses a core tag its new value no longer has (`!!str 1` written `5` is
   `5`, written `"x"` stays `!!str x`; `!!int "5"` written `6` is `!!int "6"`); `-P` drops the
   core tags that only restate a type and keeps the rest. Checked against yq v4.53.3 on ~1,900
-  random tagged documents. Not matched: a node a write *copies* from elsewhere (`.b = .a`)
-  carries no tree entry, so it loses its tag where yq copies it (the existing copy gap); a
-  computed value has no tag (#1416); `!!set` members print `null` where yq prints `''`; and a tagged `null` that a path write walks through
+  random tagged documents.
+  A node a write copies from a plain path (`.b = .a`) keeps its tag, as in yq ([#5257](https://github.com/rust-works/succinctly/issues/5257)).
+  A node copied from a computed right-hand side (`.c = [.a]`, `.c = (.a // 1)`) loses it, with its comment and quoting
+  ([#5249](https://github.com/rust-works/succinctly/issues/5249)).
+  Not matched: `!!set` members print `null` where yq prints `''`; and a tagged `null` that a path write walks through
   (`a: !Foo null` + `.a.b = 5`) becomes a mapping where yq leaves the document alone. A tagged
   empty value (`a: !Foo` with nothing after it) is written `!Foo null`. A tag on a mapping *key*
   (`!Foo k: v`, `? !K key`, an implicit pair `[!Foo k: v]`) is kept too
@@ -5011,8 +5016,10 @@ ruled out), even though real yq supports every one of them:
   container it does not restate (`!!str []`, `!!seq {}`). Still not matched: a core `!!null`
   on a container (`a: !!null [1]`) is dropped by `-P` and kept by the default route, where yq
   turns the value into `null` on both ([#4111](https://github.com/rust-works/succinctly/issues/4111)). A key's tag
-  is also lost when a write copies the key from elsewhere (`.a = .b` over a tagged key in `.b`,
-  the same copy gap). A key deleted and written again in the same filter is a new node and keeps
+  is kept when a write copies its mapping from a plain path (`.a = .b` over a tagged key in `.b`),
+  and lost when the right-hand side is computed (`.a = (.b // 1)`, `. as $x | .a = $x.b`,
+  [#5249](https://github.com/rust-works/succinctly/issues/5249)).
+  A key deleted and written again in the same filter is a new node and keeps
   none of the old key's anchor, tag, quoting or key comment, and nothing beneath it either: a
   literal, a compound (`.k += "z"`) or a nested (`del(.m) | .m.x = 5`) write there starts from a
   new node ([#4113](https://github.com/rust-works/succinctly/issues/4113));
@@ -5944,13 +5951,14 @@ or empty `? b # own` shows it ahead of its own on every route, and a key that is
 collection (`? [1, 2]`) does not take it, as in yq, but still reads as `""`. Still different: a flow-valued or empty-valued key (yq moves both
 comments onto the next entry, `b: {c: 1}` / `d: 3 # floated` / `# own`; succinctly keeps the
 floated one on `b`'s line and drops the other), and a key whose value is
-`null` — and a missing
-explicit-tag slot: `OwnedValue` has no field for it, so any
-computed/constructed value — including an object-slice result (#1102) — loses the source
-node's `!!map`/`!!seq` tag and quoting style in YAML output (`{"a":1,"b":2} | yq
-'.[0:2]'` is `!!map\n- "a"\n- 1` on real yq, plain `- a\n- 1` on succinctly); `-o=json`
-output is unaffected, since neither appears in JSON
-([#1416](https://github.com/rust-works/succinctly/issues/1416)). Also see
+`null`.
+A node's tag and quoting style are lost only on the routes that rebuild a sequence or mapping from document nodes and keep none of its presentation, which
+[#5429](https://github.com/rust-works/succinctly/issues/5429) tracks (`[.[]]`, array slices, `map_values`, `$x`, array `+`, `flatten`).
+`-o=json` output is unaffected, since neither appears in JSON.
+An object slice is the one case that stays a recorded divergence: yq prints the source mapping's `!!map` and the key's quoting on the sequence it returns (`{"a":1,"b":2} | yq
+'.[0:2]'` is `!!map\n- "a"\n- 1` on real yq, plain `- a\n- 1` on succinctly; [#1102](https://github.com/rust-works/succinctly/issues/1102), [#1416](https://github.com/rust-works/succinctly/issues/1416)).
+`OwnedValue` has no tag slot and ADR-0017 rules out adding one for presentation data.
+Also see
 [yq Query Language Reference § Known Limitations](../../reference/yq-language.md#known-limitations)
 for the feature-level gaps (position builtins after DOM conversion; `file_index`/`key`/
 `document_index` inside object literals or `any`/`all`).
