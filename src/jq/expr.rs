@@ -1951,18 +1951,61 @@ struct TailState {
     origin: Option<(Weak<TailTable>, usize)>,
 }
 
-/// Slot `i` holds the `Expr::Pipe` over `stages[i..]` of the pipe that owns the
-/// table, once something asked for it; `None` marks a tail that is not kept.
+/// Slot `i` holds the `Expr::Pipe` over `stages[i..stops[i]]` of the pipe that
+/// owns the table, once something asked for it; `None` marks a run that is not
+/// kept. `stops[i]` is the first stage at or after `i` that holds evaluation
+/// state ([`TailPlan`]), or the pipe's length when none does, so for a pipe
+/// that holds none a slot is the whole tail from `i`.
 struct TailTable {
-    slots: Box<[core::cell::OnceCell<Option<Rc<Expr>>>]>,
+    stops: Box<[u32]>,
+    slots: Box<[core::cell::OnceCell<Option<Rc<SharedArg>>>]>,
 }
+
+/// What a pipe hands on for the tail of its stages from some offset (#5421).
+pub(crate) enum TailPlan {
+    /// The owned `Expr::Pipe` over the whole tail, kept.
+    Whole(Rc<SharedArg>),
+    /// The tail holds a stage with evaluation state, which must start empty
+    /// each call (#3148): [`PipeStages::split_tail`] has the stages that stand
+    /// for it, the stateless runs between those stages as the copies the pipe
+    /// keeps and each stateful stage as a copy of its own. Evaluated as a
+    /// pipe, they are the tail.
+    Split,
+    /// The pipe keeps no copy of this tail: the caller copies it per call.
+    Copy,
+}
+
+/// The shortest tail holding evaluation state that is [split](TailPlan::Split)
+/// rather than copied whole (#5421).
+///
+/// The split replaces a copy of every stage with a few nodes, but it changes
+/// the shape the evaluator's doors see: a run behind a `Shared` node is not
+/// peeled by a door keyed on the stages of the pipe. A short tail costs a copy
+/// of a few stages, which is less than that; the copy is only quadratic in
+/// the length of the pipe.
+pub(crate) const MIN_SPLIT_TAIL_STAGES: usize = 8;
 
 impl PipeStages {
     /// The owned `Expr::Pipe` over `stages[from..]`, kept once a second value
     /// has gone down this pipe (#5404), or `None` when this pipe keeps no copy
     /// of that tail: it is the pipe's first ask, `may_keep` declined the tail,
     /// the tail is shorter than two stages (a lone stage is handed on as
-    /// itself), or the pipe is longer than [`MAX_KEPT_TAIL_STAGES`].
+    /// itself), or the pipe is longer than [`MAX_KEPT_TAIL_STAGES`]. A tail
+    /// holding evaluation state is not kept whole either; see
+    /// [`Self::tail_plan`].
+    #[cfg(test)]
+    pub(crate) fn kept_tail(
+        &self,
+        from: usize,
+        may_keep: impl FnMut(&[Expr]) -> bool,
+    ) -> Option<Rc<SharedArg>> {
+        match self.tail_plan(from, |_| false, may_keep) {
+            TailPlan::Whole(copy) => Some(copy),
+            TailPlan::Split | TailPlan::Copy => None,
+        }
+    }
+
+    /// What this pipe hands on for `stages[from..]` (#5404, #5421).
     ///
     /// Why a copy is wanted at all: the doors and the bridge of the owned
     /// evaluator are keyed on a whole `&Expr`, so a rest of several stages
@@ -1971,42 +2014,121 @@ impl PipeStages {
     /// copy starts with no memo, so the analyses a pipe asks of itself re-walk
     /// it too. Kept, both are paid once per program.
     ///
-    /// `may_keep` says whether the tail may be kept and is asked once per
-    /// tail: one holding a node that remembers what evaluation did to it
-    /// (#3148) would carry that from one call to the next, and one too large
-    /// would hold the program's memory for little.
-    pub(crate) fn kept_tail(
+    /// `is_stateful` says whether a stage holds a node that remembers what
+    /// evaluation did to it (#3148): a copy of it carried from one call to the
+    /// next would carry that too, so it is copied afresh each call. The
+    /// stateless stages between two such stages are a run, and a run is kept
+    /// like a tail: the pipe's table has one for each offset, the pipe over the
+    /// stages from there to the next stateful one. `may_keep` says whether a
+    /// run may be kept and is asked once per run: one too large would hold the
+    /// program's memory for little.
+    ///
+    /// Only a pipe's second ask (and one of at most [`MAX_KEPT_TAIL_STAGES`]
+    /// stages) is answered with anything but [`TailPlan::Copy`]: a pipe that
+    /// goes down once -- a body rebuilt for each value, one level of a
+    /// recursion -- pays nothing for copies it would never reuse.
+    pub(crate) fn tail_plan(
         &self,
         from: usize,
-        may_keep: impl FnOnce(&[Expr]) -> bool,
-    ) -> Option<Rc<Expr>> {
+        is_stateful: impl Fn(&Expr) -> bool,
+        may_keep: impl FnMut(&[Expr]) -> bool,
+    ) -> TailPlan {
         let len = self.stages.len();
         if from == 0 || len < from + 2 {
-            return None;
+            return TailPlan::Copy;
         }
-        let (table, at) = match &self.tails.origin {
-            Some((table, base)) => (table.upgrade()?, base + from),
+        let (table, at, end) = match &self.tails.origin {
+            Some((table, base)) => match table.upgrade() {
+                Some(table) => (table, base + from, base + len),
+                None => return TailPlan::Copy,
+            },
             None => {
                 if len > MAX_KEPT_TAIL_STAGES || !self.tails.asked.replace(true) {
-                    return None;
+                    return TailPlan::Copy;
                 }
                 let table = self.tails.table.get_or_init(|| {
+                    let mut stops = vec![len as u32; len + 1];
+                    for (i, stage) in self.stages.iter().enumerate().rev() {
+                        stops[i] = if is_stateful(stage) {
+                            i as u32
+                        } else {
+                            stops[i + 1]
+                        };
+                    }
                     Rc::new(TailTable {
+                        stops: stops.into(),
                         slots: (0..len).map(|_| core::cell::OnceCell::new()).collect(),
                     })
                 });
-                (Rc::clone(table), from)
+                (Rc::clone(table), from, len)
             }
         };
+        if (table.stops[at] as usize) < end {
+            // A copy's tails hold no state, so this pipe is the program's own.
+            return if len - from < MIN_SPLIT_TAIL_STAGES {
+                TailPlan::Copy
+            } else {
+                TailPlan::Split
+            };
+        }
+        match self.kept_run(&table, at, from, end, may_keep) {
+            Some(copy) => TailPlan::Whole(copy),
+            None => TailPlan::Copy,
+        }
+    }
+
+    /// The stages that stand for `stages[from..]` of a pipe whose
+    /// [`tail_plan`](Self::tail_plan) for `from` was [`TailPlan::Split`]
+    /// (#5421): each run of stateless stages as the copy the pipe keeps for
+    /// it, each stateful stage and each lone stateless one cloned.
+    pub(crate) fn split_tail(
+        &self,
+        from: usize,
+        mut may_keep: impl FnMut(&[Expr]) -> bool,
+    ) -> Vec<Expr> {
+        let len = self.stages.len();
+        let table = self
+            .tails
+            .table
+            .get()
+            .expect("a split tail follows the pipe's second ask");
+        let mut segments = Vec::new();
+        let mut i = from;
+        while i < len {
+            let stop = table.stops[i] as usize;
+            if stop <= i + 1 {
+                segments.push(self.stages[i].clone());
+                i += 1;
+                continue;
+            }
+            match self.kept_run(table, i, i, stop, &mut may_keep) {
+                Some(copy) => segments.push(Expr::Shared(copy)),
+                None => segments.extend(self.stages[i..stop].iter().cloned()),
+            }
+            i = stop;
+        }
+        segments
+    }
+
+    /// The pipe over the run `end - at` stages long that starts at `at` in the
+    /// table's offsets and at `from` in these stages, kept in the table.
+    fn kept_run(
+        &self,
+        table: &Rc<TailTable>,
+        at: usize,
+        from: usize,
+        end: usize,
+        may_keep: impl FnOnce(&[Expr]) -> bool,
+    ) -> Option<Rc<SharedArg>> {
         table
             .slots
             .get(at)?
             .get_or_init(|| {
-                let tail = &self.stages[from..];
+                let tail = &self.stages[from..from + (end - at)];
                 may_keep(tail).then(|| {
                     let mut copy = Self::from(tail.to_vec());
-                    copy.tails.origin = Some((Rc::downgrade(&table), at));
-                    Rc::new(Expr::Pipe(copy))
+                    copy.tails.origin = Some((Rc::downgrade(table), at));
+                    Rc::new(SharedArg::new(Expr::Pipe(copy)))
                 })
             })
             .clone()
@@ -3977,12 +4099,12 @@ mod tests {
             "a pipe that goes down once keeps nothing"
         );
         let first = pipe.kept_tail(1, |_| true).expect("a tail of four stages");
-        assert!(matches!(&*first, Expr::Pipe(tail) if tail.len() == 4));
+        assert!(matches!(first.expr(), Expr::Pipe(tail) if tail.len() == 4));
         let again = pipe.kept_tail(1, |_| unreachable!("kept"));
         assert!(again.is_some_and(|again| Rc::ptr_eq(&again, &first)));
         assert!(
             pipe.kept_tail(2, |_| true)
-                .is_some_and(|tail| matches!(&*tail, Expr::Pipe(t) if t.len() == 3)),
+                .is_some_and(|tail| matches!(tail.expr(), Expr::Pipe(t) if t.len() == 3)),
             "each offset has its own"
         );
         assert!(
@@ -4006,7 +4128,7 @@ mod tests {
         assert!(pipe.kept_tail(1, |_| true).is_none(), "and asks afresh");
         assert!(pipe
             .kept_tail(1, |_| true)
-            .is_some_and(|tail| matches!(&*tail, Expr::Pipe(t) if t.len() == 5)));
+            .is_some_and(|tail| matches!(tail.expr(), Expr::Pipe(t) if t.len() == 5)));
     }
 
     /// #5404: a kept copy has no copies of its own. Asked for a tail, it
@@ -4017,7 +4139,7 @@ mod tests {
         let pipe = PipeStages::from(vec![Expr::Identity; 6]);
         assert!(pipe.kept_tail(1, |_| true).is_none());
         let first = pipe.kept_tail(1, |_| true).unwrap();
-        let Expr::Pipe(copy) = &*first else {
+        let Expr::Pipe(copy) = first.expr() else {
             panic!("a pipe");
         };
         let through_copy = copy.kept_tail(1, |_| true).unwrap();
@@ -4025,7 +4147,7 @@ mod tests {
             .kept_tail(2, |_| unreachable!("kept by the copy"))
             .unwrap();
         assert!(Rc::ptr_eq(&through_copy, &through_root));
-        let Expr::Pipe(second) = &*through_copy else {
+        let Expr::Pipe(second) = through_copy.expr() else {
             panic!("a pipe");
         };
         let deeper = second.kept_tail(2, |_| true).unwrap();
@@ -4073,6 +4195,114 @@ mod tests {
         let longest = PipeStages::from(vec![Expr::Identity; MAX_KEPT_TAIL_STAGES]);
         assert!(longest.kept_tail(1, |_| true).is_none());
         assert!(longest.kept_tail(1, |_| true).is_some());
+    }
+
+    /// #5421: a tail holding a stage with evaluation state is split. Its
+    /// stateless runs are kept, one copy for all calls, and each stateful stage
+    /// is cloned afresh for the call; a tail after the last stateful stage is
+    /// kept whole, and a short one is copied as before.
+    #[test]
+    fn test_pipe_stages_split_a_tail_holding_state_into_kept_runs_5421() {
+        let stateful = |e: &Expr| matches!(e, Expr::Identity);
+        let mut stages = vec![Expr::Field("a".into()); 12];
+        stages[5] = Expr::Identity;
+        stages[9] = Expr::Identity;
+        let pipe = PipeStages::from(stages);
+        let plan = |from: usize| pipe.tail_plan(from, stateful, |_| true);
+        assert!(
+            matches!(plan(1), TailPlan::Copy),
+            "the first ask keeps nothing"
+        );
+        assert!(matches!(plan(1), TailPlan::Split), "stages 1.. hold state");
+        let first = pipe.split_tail(1, |_| true);
+        // Run 1..5, the stage at 5, run 6..9 (three stages), the stage at 9, run 10..12.
+        assert_eq!(first.len(), 5);
+        let run_len = |e: &Expr| match e {
+            Expr::Shared(run) => match run.expr() {
+                Expr::Pipe(stages) => Some(stages.len()),
+                _ => None,
+            },
+            _ => None,
+        };
+        assert_eq!(
+            [&first[0], &first[2], &first[4]].map(run_len),
+            [Some(4), Some(3), Some(2)],
+            "the runs between the stateful stages"
+        );
+        assert!(matches!(first[1], Expr::Identity) && matches!(first[3], Expr::Identity));
+        let again = pipe.split_tail(1, |_| unreachable!("kept"));
+        for at in [0, 2, 4] {
+            assert!(
+                matches!((&first[at], &again[at]), (Expr::Shared(a), Expr::Shared(b)) if Rc::ptr_eq(a, b)),
+                "a run is kept once for every call"
+            );
+        }
+        // The runs of a split tail are the tails of the same table: a run's own
+        // tails are the runs after it.
+        assert!(matches!(
+            &first[0],
+            Expr::Shared(run) if matches!(
+                run.expr(),
+                Expr::Pipe(run) if matches!(
+                    run.tail_plan(1, stateful, |_| true),
+                    TailPlan::Whole(inner) if matches!(inner.expr(), Expr::Pipe(t) if t.len() == 3)
+                )
+            )
+        ));
+        // A tail after the last stateful stage is a whole kept tail, a short tail
+        // holding state is copied, and the run behind it is not asked for.
+        assert!(
+            matches!(plan(10), TailPlan::Whole(tail) if matches!(tail.expr(), Expr::Pipe(t) if t.len() == 2)),
+            "the two stages after the last stateful one"
+        );
+        assert!(matches!(plan(11), TailPlan::Copy), "a lone stage");
+        assert!(matches!(plan(6), TailPlan::Copy), "six stages are copied");
+        let after = PipeStages::from(
+            core::iter::once(Expr::Identity)
+                .chain(vec![Expr::Field("a".into()); 11])
+                .collect::<Vec<_>>(),
+        );
+        for _ in 0..2 {
+            let _ = after.tail_plan(1, stateful, |_| true);
+        }
+        assert!(matches!(
+            after.tail_plan(1, stateful, |_| true),
+            TailPlan::Whole(_)
+        ));
+    }
+
+    /// #5421: a run `may_keep` declines is cloned stage by stage into the split
+    /// and asked once; a run of one stage is the stage.
+    #[test]
+    fn test_split_tail_clones_a_declined_run_and_a_lone_stage_5421() {
+        let stateful = |e: &Expr| matches!(e, Expr::Identity);
+        let mut stages = vec![Expr::Field("a".into()); 12];
+        stages[3] = Expr::Identity;
+        stages[5] = Expr::Identity;
+        let pipe = PipeStages::from(stages);
+        assert!(matches!(
+            pipe.tail_plan(1, stateful, |_| unreachable!("first")),
+            TailPlan::Copy
+        ));
+        assert!(matches!(
+            pipe.tail_plan(1, stateful, |_| true),
+            TailPlan::Split
+        ));
+        let mut asked = 0;
+        for _ in 0..2 {
+            let split = pipe.split_tail(1, |run| {
+                asked += 1;
+                run.len() != 2
+            });
+            // Runs 1..3 (declined: two stages), stage 3, the lone stage 4, stage 5,
+            // run 6..12 (six stages).
+            assert_eq!(split.len(), 2 + 1 + 1 + 1 + 1);
+            assert!(matches!(split[0], Expr::Field(_)) && matches!(split[1], Expr::Field(_)));
+            assert!(matches!(split[2], Expr::Identity));
+            assert!(matches!(split[3], Expr::Field(_)) && matches!(split[4], Expr::Identity));
+            assert!(matches!(split[5], Expr::Shared(_)));
+        }
+        assert_eq!(asked, 2, "the declined run and the long one, once each");
     }
 
     /// #5404: the three facts a pipe remembers are asked once, and forgotten
