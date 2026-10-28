@@ -81,6 +81,11 @@ fn test_container_identity_survives_a_run_split_around_a_reader_5441() -> Result
             "[true,true,true]\n",
         ),
         (
+            "a run of identity stages ending the body",
+            format!("[nan] as $a | [range(0;3) | . as $x | ($a | . | . | . | . | . | . | . | . | . | .)] | map(. == $a)"),
+            "[true,true,true]\n",
+        ),
+        (
             "a reduce body that reads last",
             format!("[[nan]] as $a | reduce range(0;4) as $i ($a; {{k: .}} | .k | {long}[., $i] | .[0]) | . == $a"),
             "true\n",

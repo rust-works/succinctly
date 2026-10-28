@@ -2527,6 +2527,14 @@ pub(crate) fn key_arrays_eq<S: EvalSemantics>(a: &[OwnedValue], b: &[OwnedValue]
 fn to_owned_lossy<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
     value: &StandardJson<'_, W>,
 ) -> OwnedValue {
+    // #5441: a container a bridged evaluation hands back leaves with the
+    // storage it went in as, as it does through [`to_owned`]. Without it a
+    // stage that ends a bridged run (`. | . | .`) detaches a copy, and a
+    // container compared by identity afterwards (`[nan] as $a | ... | . == $a`)
+    // is a different one.
+    if let Some(shared) = bridge_shared_for_value::<S, W>(value) {
+        return shared;
+    }
     to_owned_lossy_at_depth::<S, W>(value, 0)
 }
 
