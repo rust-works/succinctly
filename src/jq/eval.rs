@@ -11862,6 +11862,26 @@ fn holds_evaluation_state(stage: &Expr) -> bool {
     })
 }
 
+/// Whether `stage` is one a pipe cannot keep a copy of that every call may
+/// share: it holds a node that remembers what evaluation did to it
+/// ([`holds_evaluation_state`], #3148), or reads a variable (#5424), which a
+/// body rebuilt for each value has substituted and so has a stage of its own
+/// for each. The walk reaches `Shared` arguments and bound definitions, as
+/// [`holds_evaluation_state`] does.
+fn is_volatile_stage(stage: &Expr) -> bool {
+    use crate::jq::walk::{search_subexpr, Visit};
+    search_subexpr(stage, &mut |e| {
+        if matches!(
+            e,
+            Expr::DefCall { .. } | Expr::FuncDef { .. } | Expr::Var(_)
+        ) {
+            Visit::Found
+        } else {
+            Visit::Descend
+        }
+    })
+}
+
 /// Owned-input twin of [`eval_each`], mirroring `eval_owned_input`.
 ///
 /// The sink takes `OwnedValue`, not `Item`: values produced against the
@@ -28454,11 +28474,11 @@ impl<'p> RestTail<'p> {
 
 /// What `owner` hands on for its stages from `from` on ([`PipeStages::tail_plan`]).
 ///
-/// A tail, or a run of stateless stages in one that holds evaluation state
-/// ([`holds_evaluation_state`], #3148), is kept up to [`MAX_KEPT_TAIL_NODES`]
-/// nodes.
+/// A tail, or a run of stages in one that holds a volatile stage
+/// ([`is_volatile_stage`]: evaluation state, #3148, or a variable, #5424), is
+/// kept up to [`MAX_KEPT_TAIL_NODES`] nodes.
 fn tail_plan_of(owner: &PipeStages, from: usize) -> TailPlan {
-    owner.tail_plan(from, holds_evaluation_state, may_keep_run)
+    owner.tail_plan(from, is_volatile_stage, may_keep_run)
 }
 
 /// The stages that stand for the tail of `owner` from `from` on, once
@@ -75702,6 +75722,18 @@ fn substitute_var_impl(
                 bound: FuncDefBound::default(),
             }
         }
+        // #5424: a pipe rebuilt for each value hands on the tails kept for the pipe it
+        // was rebuilt from -- only a stage that reads a variable differs from one
+        // value to the next -- instead of keeping tails of its own, made once per
+        // value and used once.
+        Expr::Pipe(stages) => {
+            let mut rebuilt: PipeStages = stages
+                .iter()
+                .map(|sub| substitute_var_impl(sub, var_name, replacement, mark))
+                .collect();
+            rebuilt.share_tails_of(stages, is_volatile_stage);
+            Expr::Pipe(rebuilt)
+        }
         // #2095: every remaining variant's recursive-structural-child
         // handling here is identical to `install_def_calls`'s and
         // `substitute_func_param`'s own -- apply this substitution to each
@@ -96624,10 +96656,14 @@ pub(crate) fn substitute_destructured_bindings<S: EvalSemantics>(
     all_var_names: &[String],
     mut register: impl FnMut(Option<&BindOrigin>, &mut OwnedValue),
 ) -> Expr {
-    let mut current = body.clone();
+    // The first substitution reads `body` itself, not a copy of it (#5424): a
+    // pipe rebuilt from a copy made for this binding set would link to the
+    // copy, which no later binding set sees.
+    let mut current: Option<Expr> = None;
     for (name, value, origin) in bindings {
-        current = match origin {
-            None => substitute_var(&current, name, value),
+        let source = current.as_ref().unwrap_or(body);
+        current = Some(match origin {
+            None => substitute_var(source, name, value),
             Some((node, document)) => {
                 let origin = BindOrigin::Node {
                     node: *node,
@@ -96637,7 +96673,7 @@ pub(crate) fn substitute_destructured_bindings<S: EvalSemantics>(
                 register(Some(&origin), &mut bound);
                 substitute_bound_var_at(
                     &Expr::Literal(Literal::Null),
-                    &current,
+                    source,
                     name,
                     &bound,
                     None,
@@ -96647,15 +96683,16 @@ pub(crate) fn substitute_destructured_bindings<S: EvalSemantics>(
                     S::EQUALITY_SHORT_CIRCUITS_ON_IDENTITY,
                 )
             }
-        };
+        });
     }
     let null_value = OwnedValue::Null;
     for name in all_var_names {
         if !bindings.iter().any(|(n, _, _)| n == name) {
-            current = substitute_var(&current, name, &null_value);
+            let source = current.as_ref().unwrap_or(body);
+            current = Some(substitute_var(source, name, &null_value));
         }
     }
-    current
+    current.unwrap_or_else(|| body.clone())
 }
 
 /// Drop every item after the first for each repeated `name`, keeping
@@ -111871,6 +111908,121 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+        run::<JqSemantics>();
+        run::<YqSemantics>();
+    }
+
+    /// #5424: a body rebuilt for each value hands on the tails of the pipe it
+    /// was rebuilt from, so a pipe of the program copies nothing more for forty
+    /// values than for four. `. as $x | (...)`, the update of a `reduce` and of
+    /// a `foreach`, and the destructuring forms rebuild their body per value;
+    /// each was a pipe of its own, so tails kept for it were made once per
+    /// value and used once. A stage that reads the variable is a different
+    /// stage for each value and is cloned afresh for it, the stages around it
+    /// are the pipe's kept runs.
+    #[test]
+    fn test_body_rebuilt_per_value_shares_the_tails_of_its_pipe_5424() {
+        fn run<S: EvalSemantics>() {
+            const STAGES: usize = 20;
+            let t = parenthesized_increments(STAGES);
+            let rest = vec![". + 1"; STAGES - 1].join(" | ");
+            // The sum of what each shape yields for 40 values, and the copies
+            // per value it may still make: a body holding a `def` call is a
+            // stage cloned for each value (#5421).
+            let sum_of_indices = 40 * 39 / 2;
+            let shapes = [
+                (
+                    "as",
+                    format!("[range(0;N) | . as $x | {t}] | add"),
+                    sum_of_indices + 40 * STAGES,
+                    4,
+                ),
+                (
+                    "as pattern",
+                    format!("[range(0;N) | [.] as [$x] | {t}] | add"),
+                    sum_of_indices + 40 * STAGES,
+                    4,
+                ),
+                (
+                    "as, def at the end",
+                    format!("def f: . + 1; [range(0;N) | . as $x | ({t} | f)] | add"),
+                    sum_of_indices + 40 * (STAGES + 1),
+                    3 * STAGES,
+                ),
+                (
+                    "nested as",
+                    format!("[range(0;N) | . as $x | (. + 1 | . as $y | {t})] | add"),
+                    sum_of_indices + 40 * (STAGES + 1),
+                    4,
+                ),
+                (
+                    "reduce",
+                    format!("reduce range(0;N) as $i (0; {t})"),
+                    40 * STAGES,
+                    4,
+                ),
+                (
+                    "foreach",
+                    format!("[foreach range(0;N) as $i (0; . + 1; {t})] | add"),
+                    sum_of_indices + 40 * (STAGES + 1),
+                    4,
+                ),
+                // The variable is read by one stage of the pipe: the stages
+                // around it are kept and it is cloned afresh for each value.
+                (
+                    "as, read first",
+                    format!("[range(0;N) | . as $x | (. + $x | {rest})] | add"),
+                    2 * sum_of_indices + 40 * (STAGES - 1),
+                    4,
+                ),
+                (
+                    "computed, read last",
+                    format!("[range(0;N) | (. + 0) as $x | ({rest} | . + $x)] | add"),
+                    2 * sum_of_indices + 40 * (STAGES - 1),
+                    4,
+                ),
+                (
+                    "computed, read in the middle",
+                    format!("[range(0;N) | (. + 0) as $x | ({rest} | . + $x | {rest})] | add"),
+                    2 * sum_of_indices + 40 * (2 * STAGES - 2),
+                    4,
+                ),
+                (
+                    "reduce, read first",
+                    format!("reduce range(0;N) as $i (0; . + $i | {rest})"),
+                    sum_of_indices + 40 * (STAGES - 1),
+                    4,
+                ),
+                (
+                    "foreach, read last",
+                    format!("[foreach range(0;N) as $i (0; . + 1; {rest} | . + $i)] | add"),
+                    2 * sum_of_indices + 40 * STAGES,
+                    4,
+                ),
+                // `. as $x` marks `$x`, and a marker read in a tail that holds a kept run
+                // makes the owned re-entry rebuild the run for each tail: the answer is the
+                // same, the copies are still those of a pipe of its own for each value.
+                (
+                    "marked, read last",
+                    format!("[range(0;N) | . as $x | ({rest} | . + $x)] | add"),
+                    2 * sum_of_indices + 40 * (STAGES - 1),
+                    usize::MAX / 64,
+                ),
+            ];
+            for (name, template, want, per_value) in shapes {
+                let run_for = |n: usize| {
+                    run_owned_pipe_program::<S>(&template.replace('N', &n.to_string()), b"null")
+                };
+                let (settled, many) = (run_for(4), run_for(40));
+                assert_eq!(many.output, want.to_string(), "{name} ({:?})", S::TAG);
+                let more = many.copies - settled.copies;
+                assert!(
+                    more <= 36 * per_value,
+                    "{name}: forty values copy {more} more than four do ({:?})",
+                    S::TAG
+                );
             }
         }
         run::<JqSemantics>();
