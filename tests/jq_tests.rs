@@ -650,7 +650,10 @@ fn test_parse_trailing_garbage_error() {
 
 #[test]
 fn test_whitespace_in_expression() {
-    query!(br#"{"a": 1}"#, " . a ",
+    // #5447: jq reads `. a` as a syntax error (`.` and `a` are separate tokens), so the gap
+    // goes around the whole path.
+    assert!(parse(". a").is_err());
+    query!(br#"{"a": 1}"#, " .a ",
         QueryResult::One(StandardJson::Number(n)) => {
             assert_eq!(n.as_i64().unwrap(), 1);
         }
