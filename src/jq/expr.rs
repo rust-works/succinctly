@@ -2151,10 +2151,6 @@ impl PipeStages {
         if !(3..=MAX_KEPT_TAIL_STAGES).contains(&len) {
             return;
         }
-        debug_assert!(
-            self.stages == source.stages,
-            "a pipe shares the tails of a pipe with the same stages"
-        );
         self.tails.origin = match &source.tails.origin {
             Some(link) => Some(link.clone()),
             None if !source.tails.rebuilt.replace(true) => return,

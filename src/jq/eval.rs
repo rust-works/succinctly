@@ -75791,7 +75791,9 @@ fn substitute_var_impl(
                 .iter()
                 .map(|sub| substitute_var_impl(sub, var_name, replacement, mark))
                 .collect();
-            if !stages.holds_var_or_init(|stages| stages.iter().any(holds_var)) {
+            if (3..=crate::jq::expr::MAX_KEPT_TAIL_STAGES).contains(&stages.len())
+                && !stages.holds_var_or_init(|stages| stages.iter().any(holds_var))
+            {
                 rebuilt.share_tails_of(stages, holds_evaluation_state);
             }
             Expr::Pipe(rebuilt)

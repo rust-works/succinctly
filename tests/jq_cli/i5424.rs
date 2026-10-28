@@ -109,6 +109,20 @@ fn test_container_identity_survives_a_long_tail_with_a_variable_5424() -> Result
     Ok(())
 }
 
+/// A NaN literal in a pipe that is rebuilt twice: the stages of the source and of the rebuild are
+/// equal in value only by identity, which a structural comparison of them would refuse.
+#[test]
+fn test_nan_in_a_rebuilt_pipe_matches_jq_5424() -> Result<()> {
+    let filter = format!("nan as $n | [1,2,3] | [.[] as $y | ($n | {T} | isnan)] | length");
+    let (stdout, stderr, status) = run_jq_full(&["-n", "-c", &filter], None)?;
+    assert_eq!(
+        (stdout.as_str(), status),
+        ("3\n", 0),
+        "`{filter}` -- {stderr:?}"
+    );
+    Ok(())
+}
+
 /// The same bodies over a document: the values of the first stage are cursors into the input.
 #[test]
 fn test_body_rebuilt_per_value_over_a_document_matches_jq_5424() -> Result<()> {
