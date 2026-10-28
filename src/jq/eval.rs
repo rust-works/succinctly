@@ -111907,7 +111907,7 @@ mod tests {
     fn test_pipe_tail_holding_a_def_call_copies_only_the_call_per_value_5421() {
         fn run<S: EvalSemantics>() {
             const STAGES: usize = 10;
-            let t = vec![". + 1"; STAGES].join(" | ");
+            let t = [". + 1"; STAGES].join(" | ");
             let shapes = [
                 ("end", format!("{t} | f"), STAGES + 1, 1),
                 ("middle", format!("{t} | f | {t}"), 2 * STAGES + 1, 1),
