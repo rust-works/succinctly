@@ -87,8 +87,9 @@ use super::eval::{
     yq_negative_index_error, yq_numeric_index_on_object_is_null, yq_object_key_stringify,
     yq_read_only_context, yq_scalar_text, yq_sort_by, BinaryFanoutRules, ComputedSliceBound,
     Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN,
-    PathTrail, QueryResult, RangeEnd, RangeNum, Reentry, RestPipe, RootWitness, SliceTargetKind,
-    StashedEscape, StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED, MAX_RANGE_TOTAL,
+    PathTrail, QueryResult, RangeEnd, RangeNum, Reentry, RestPipe, RestTail, RootWitness,
+    SliceTargetKind, StashedEscape, StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED,
+    MAX_RANGE_TOTAL,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -12771,12 +12772,19 @@ fn fold_pipe_stages_sink<S: EvalSemantics, V: DocumentValue>(
             // correct slice for every non-folding arm. Pinned by
             // `test_first_over_lazy_prefix_applies_every_stage_1565`.
             GenericResult::One(v) => {
-                return eval_each_pipe_generic::<S, V>(&stages[j..], None, v, optional, None, sink);
+                return eval_each_pipe_generic::<S, V>(
+                    RestTail::unowned(&stages[j..]),
+                    None,
+                    v,
+                    optional,
+                    None,
+                    sink,
+                );
                 // patchcov: coverage tolerate-line reason="unreachable: this loop is entered only with a LazyKeys/LazyIndexRange/LazySeq head, and every fold_lazy_*_stage answers OneCursor, Owned, ManyOwned or a lazy marker (eval_on_owned never returns One); kept so a stage that did return One hands off by value instead of falling to the eager fold (#1565, #3886)"
             }
             GenericResult::OneCursor(c) => {
                 return eval_each_pipe_generic::<S, V>(
-                    &stages[j..],
+                    RestTail::unowned(&stages[j..]),
                     None,
                     c.value(),
                     optional,
@@ -15115,7 +15123,7 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             Flow::Exhausted
         }
         Expr::Pipe(exprs) => eval_each_pipe_generic::<S, V>(
-            exprs,
+            RestTail::whole(exprs),
             Some(pipe_needs_path_context(exprs)),
             value,
             optional,
@@ -16211,10 +16219,10 @@ fn continue_pipe_element_generic<S: EvalSemantics, V: DocumentValue>(
 ) -> Flow {
     match item {
         GenericItem::One(v) => {
-            eval_each_pipe_generic::<S, V>(rest.stages(), None, v, optional, None, sink)
+            eval_each_pipe_generic::<S, V>(rest.tail(), None, v, optional, None, sink)
         }
         GenericItem::OneCursor(c) => {
-            eval_each_pipe_generic::<S, V>(rest.stages(), None, c.value(), optional, Some(c), sink)
+            eval_each_pipe_generic::<S, V>(rest.tail(), None, c.value(), optional, Some(c), sink)
         }
         // Same as the `OneCursor` arm above, minus the `c.value()` resolve
         // -- `v` was already decoded by whoever built this item (#1609), so
@@ -16245,7 +16253,7 @@ fn continue_pipe_element_generic<S: EvalSemantics, V: DocumentValue>(
                     }
                 }
             }
-            eval_each_pipe_generic::<S, V>(rest.stages(), None, v, optional, Some(c), sink)
+            eval_each_pipe_generic::<S, V>(rest.tail(), None, v, optional, Some(c), sink)
         }
         // #2543: this is the call site a plain top-level pipe
         // (`EXPR | tostring`/`EXPR | @json`/...) actually reaches --
@@ -19338,13 +19346,14 @@ fn each_object_value_generic<S: EvalSemantics, V: DocumentValue>(
 /// `fold_pipe_stages`'s own per-variant composability fast paths (#724/#725)
 /// rather than duplicating them -- see its own doc comment.
 fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
-    exprs: &[Expr],
+    tail: RestTail<'_>,
     needs_path: Option<bool>,
     value: V,
     optional: bool,
     cursor: Option<V::Cursor>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
+    let exprs = tail.stages();
     // #2451 rule 1: in yq mode a pipe with a union in it is evaluated over a
     // whole context list, branch-major, by `eval_yq_context_pipe` -- ahead of
     // the path-context routing below on purpose, since the sub-pipes it drives
@@ -19354,7 +19363,7 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
     }
     // The pipe's remembered answer when the caller holds the `Expr::Pipe`
     // (#3886); a sub-slice is walked.
-    let needs_path = needs_path.unwrap_or_else(|| exprs.iter().any(needs_path_context));
+    let needs_path = needs_path.unwrap_or_else(|| tail.needs_path_context());
     if needs_path {
         // #4286: the sink route's twin of the fusion in `eval_single_pipe`.
         if !optional && cursor.is_some() {
@@ -19477,7 +19486,7 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
         identity_from_first.is_some() && matches!(strip_parens(first), Expr::Builtin(Builtin::Key));
     // Same once-per-driver cache as `drive_pipe_elements_generic` (#1598):
     // this closure also runs once per item stage 1 produces.
-    let mut rest = RestPipe::new(rest);
+    let mut rest = RestPipe::of_tail(tail.rest());
     // #2666: the budget the consumer behind `sink` announced, read before
     // `driver` borrows `sink` mutably. `driver` is a forwarder -- it runs
     // `rest` on each item and pushes -- so it must carry that budget, or
@@ -33112,9 +33121,14 @@ fn try_path_context_absent_sink<S: EvalSemantics, V: DocumentValue>(
     let mut downstream_flow = None;
     let stepped = path_context_step_pipe_each::<S, V>(head, &root_pos, &mut |pos| {
         let flow = match &pos.node {
-            PathNode::At(c) if rest_is_cursor_native => {
-                eval_each_pipe_generic::<S, V>(rest, None, c.value(), false, Some(*c), sink)
-            }
+            PathNode::At(c) if rest_is_cursor_native => eval_each_pipe_generic::<S, V>(
+                RestTail::unowned(rest),
+                None,
+                c.value(),
+                false,
+                Some(*c),
+                sink,
+            ),
             PathNode::At(c) => match to_owned_cursor::<S, _>(c) {
                 Ok(value) => eval_owned_identity_pipe::<S, V>(
                     rest,
@@ -38066,9 +38080,14 @@ fn continue_owned_identity_ancestor<S: EvalSemantics, V: DocumentValue>(
             eval_owned_identity_stages::<S, V>(rest, Cow::Owned(v), vid, optional, tail)
         }
         OwnedAncestor::Node(c) => match tail {
-            OwnedIdentityTail::Sink(sink) => {
-                eval_each_pipe_generic::<S, V>(rest, None, c.value(), optional, Some(c), sink)
-            }
+            OwnedIdentityTail::Sink(sink) => eval_each_pipe_generic::<S, V>(
+                RestTail::unowned(rest),
+                None,
+                c.value(),
+                optional,
+                Some(c),
+                sink,
+            ),
             // An enclosing stage still needs the identity of every output
             // (spine 2416, identity pass): the node is materialized once and
             // the rest of the pipe continues here, from its position.
@@ -39323,7 +39342,7 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
             if let Some(kc) = key_node {
                 if let OwnedIdentityTail::Sink(sink) = tail.reborrow() {
                     return eval_each_pipe_generic::<S, V>(
-                        rest,
+                        RestTail::unowned(rest),
                         None,
                         kc.value(),
                         optional,
