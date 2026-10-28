@@ -1276,17 +1276,12 @@ impl<V: Clone> ObjectBuilder<V> {
         } else if S::COLLAPSE_DUPLICATE_KEYS {
             self.plain.insert(key, value);
         } else {
-            match self.plain.entry(key) {
-                indexmap::map::Entry::Vacant(slot) => {
-                    slot.insert(value);
-                }
-                indexmap::map::Entry::Occupied(slot) => {
-                    // The first repeat: the members so far become the collapsed view.
-                    let key = slot.key().clone();
-                    let mut shadowed = ObjectMapOf::from(core::mem::take(&mut self.plain));
-                    shadowed.push_occurrence(key, value);
-                    self.shadowed = Some(shadowed);
-                }
+            // The first repeat: the members so far become the collapsed view, the replaced value
+            // the key's earlier entry. One lookup per member until then, as `insert` always was.
+            if let (slot, Some(old)) = self.plain.insert_full(key, value) {
+                let mut shadowed = ObjectMapOf::from(core::mem::take(&mut self.plain));
+                shadowed.shadow_replaced(slot, old);
+                self.shadowed = Some(shadowed);
             }
         }
     }

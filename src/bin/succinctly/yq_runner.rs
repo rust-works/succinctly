@@ -8206,16 +8206,45 @@ fn join_block_entries(entries: Vec<(String, bool)>) -> String {
     out
 }
 
-/// An object's entries in document order (a repeated key once per entry), each flagged live or
-/// shadow, optionally sorted by key. Out of line so the iterator's state stays out of
-/// `emit_yaml_value_at_depth`'s frame, which the nesting-depth guard is sized against (#1017).
-#[inline(never)]
-fn object_entries(obj: &ObjectMap, sort_keys: bool) -> Vec<(&String, &OwnedValue, bool)> {
-    let mut entries: Vec<_> = obj.occurrences().flagged().collect();
-    if sort_keys {
-        entries.sort_by(|a, b| a.0.cmp(b.0));
+/// An object's entries for the YAML writer: in document order (a repeated key once per entry), each
+/// flagged live or shadow, optionally sorted by key.
+///
+/// An object with no repeated key and no sort is walked in place, one entry at a time, as the writer
+/// always did; only the other cases collect. Kept as one small enum so the iterator's state stays
+/// out of `emit_yaml_value_at_depth`'s frame, which the nesting-depth guard is sized against (#1017).
+enum ObjectEntries<'a> {
+    Plain(indexmap::map::Iter<'a, String, OwnedValue>),
+    Listed(std::vec::IntoIter<(&'a String, &'a OwnedValue, bool)>),
+}
+
+impl<'a> ObjectEntries<'a> {
+    fn of(obj: &'a ObjectMap, sort_keys: bool) -> Self {
+        if !sort_keys && !obj.has_shadows() {
+            return Self::Plain(obj.iter());
+        }
+        Self::Listed(Self::listed(obj, sort_keys).into_iter())
     }
-    entries
+
+    #[inline(never)]
+    fn listed(obj: &'a ObjectMap, sort_keys: bool) -> Vec<(&'a String, &'a OwnedValue, bool)> {
+        let mut entries: Vec<_> = obj.occurrences().flagged().collect();
+        if sort_keys {
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+        }
+        entries
+    }
+}
+
+impl<'a> Iterator for ObjectEntries<'a> {
+    type Item = (&'a String, &'a OwnedValue, bool);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Plain(iter) => iter.next().map(|(k, v)| (k, v, true)),
+            Self::Listed(iter) => iter.next(),
+        }
+    }
 }
 
 /// The tree key-level presentation (quoting, an anchor, a tag, a comment on the key) is read from.
@@ -8543,8 +8572,7 @@ fn emit_yaml_value_at_depth(
                 // Flow style for nested in flow context
                 let ci = flow_continuation(indent, &config.indent_str);
                 let child_indent = flow_child_indent(&ci, &config.indent_str);
-                let entries: Vec<_> = object_entries(obj, false)
-                    .into_iter()
+                let entries: Vec<_> = ObjectEntries::of(obj, false)
                     .map(|(k, v, live)| {
                         let kc = key_comments_of(comments, live);
                         let key = with_key_anchor(
@@ -8571,7 +8599,7 @@ fn emit_yaml_value_at_depth(
                 with_container_tag(value, comments, rendered)
             } else {
                 // Block style mapping
-                let entries = object_entries(obj, config.sort_keys);
+                let entries: Vec<_> = ObjectEntries::of(obj, config.sort_keys).collect();
 
                 let items: Vec<(String, bool)> = entries
                     .iter()
