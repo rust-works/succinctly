@@ -1636,6 +1636,15 @@ fn a_tail_recursive_def_runs_as_a_loop_5379() {
                 "def f: if . < 3 then . + 1 | f else . end; [path(f)]",
                 err(&[], "Invalid path expression with result 3"),
             ),
+            // A condition, a stage or an `as` source that yields nothing ends the round with
+            // nothing, as it ends the nested one.
+            (
+                "0",
+                "def f: if (. < 3 | select(false)) then 1 else f end; [f]",
+                ok(&["[]"]),
+            ),
+            ("0", "def f: select(false) | f; [f]", ok(&["[]"])),
+            ("0", "def f: (empty) as $x | f; [f]", ok(&["[]"])),
             // jq loops on this forever; the round budget stops it with the refusal the
             // nested form raised.
             (
@@ -1677,6 +1686,20 @@ fn the_tail_loops_settle_question_is_the_shared_one_5379() {
             ("0", &deep_arg, ok(&["[0,[]]"])),
             (r#"{"a":1}"#, &long_stage, ok(&[r#"[20000,["a"]]"#])),
         ]);
+    });
+}
+
+/// A generator that tail-calls itself under a collector holds every output until its end: the
+/// outputs emitted ahead of the calls are bounded, as on the shipped routes (2^20, once the
+/// loop has run a few rounds).
+#[test]
+fn a_tail_generator_under_a_collector_is_bounded_5379() {
+    on_big_stack(|| {
+        check(&[(
+            "0",
+            "[def f: ., (. + 1 | f); f] | length",
+            err(&[], "f/0: maximum outputs exceeded"),
+        )]);
     });
 }
 

@@ -3199,15 +3199,18 @@ impl<'e> Interp<'e> {
         // Rounds taken and outputs emitted ahead of the calls, for the output bound.
         let (mut taken, mut outputs) = (0usize, 0usize);
         // The def the loop started at, which a refusal is named for.
-        let entry = match &callee {
-            Callee::Def { name, .. } => *name,
-            Callee::Arg { .. } => "",
+        let Callee::Def { name: entry, .. } = &callee else {
+            // patchcov: coverage tolerate reason="unreachable: call_with starts a loop for a Callee::Def only"
+            return Err(unsupported("a tail loop over a closure parameter"));
+            // patchcov: coverage end
         };
+        let entry: &str = entry;
         loop {
             let _depth = self.enter_call(&callee)?;
             let Callee::Def { body, env, .. } = &callee else {
+                // patchcov: coverage tolerate reason="unreachable: a round continues with a Callee::Def"
                 return Err(unsupported("a tail loop over a closure parameter"));
-                // patchcov: coverage tolerate-line reason="unreachable: call_with starts a loop for a Callee::Def only, and a round continues with one"
+                // patchcov: coverage end
             };
             let mut env = env.clone();
             let mut expr: &'e Expr = body;
@@ -3233,7 +3236,9 @@ impl<'e> Interp<'e> {
                     Expr::FuncCall { name, args, .. } if args.is_empty() => {
                         match env.lookup_func(name, 0) {
                             Some(next @ Callee::Def { params: [], .. }) => break next,
+                            // patchcov: coverage tolerate reason="defensive: declared_tail_call named a call that is not to a def with no parameters (a def of that name taking some)"
                             _ => return self.eval(expr, &env, input, reg, sink),
+                            // patchcov: coverage end
                         }
                     }
                     Expr::If {
@@ -3342,16 +3347,18 @@ impl<'e> Interp<'e> {
         let mut more = false;
         self.eval(expr, env, input, reg, &mut |v, r| {
             if out.is_some() {
-                more = true;
+                more = true; // patchcov: coverage tolerate-line reason="unreachable while stage_settles admits only stages that answer at most once"
             } else {
                 out = Some((v, r));
             }
             Ok(())
         })?;
         if more {
+            // patchcov: coverage tolerate reason="unreachable while stage_settles admits only stages that answer at most once; kept so a mis-admission is loud, not a lost output"
             return Err(unsupported(
                 "a stage a tail loop ran ahead of its call answered more than once",
-            )); // patchcov: coverage tolerate-line reason="unreachable while stage_settles admits only stages that answer at most once; kept so a mis-admission is loud, not a lost output"
+            ));
+            // patchcov: coverage end
         }
         Ok(out)
     }
