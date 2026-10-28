@@ -244,10 +244,9 @@ fn a_tail_loop_over_a_document_node_holds_no_memory_per_round_5379() {
 /// a nested call's fresh nodes are freed as they return. `fib(18)` is about 8,000 calls, 14 MB
 /// kept and under a megabyte not.
 ///
-/// `std` only: the retention scope that frees a call's tree when it returns is backed by a
-/// thread-local, which `no_std` does not have (see `retention_scope`).
+/// Also under `--no-default-features`, where there is no thread-local scope stack to free a
+/// call's tree when it returns: a first reach is simply not kept (#5422, see `retention_scope`).
 #[test]
-#[cfg(feature = "std")]
 fn a_non_tail_call_in_a_loop_body_is_not_kept_5379() {
     let program = "def fib(n): if n < 2 then n else fib(n - 1) + fib(n - 2) end; \
                    def f: if . < 5 then . + (fib(18) * 0) + 1 | f else . end; 0 | f";
@@ -256,5 +255,51 @@ fn a_non_tail_call_in_a_loop_body_is_not_kept_5379() {
     assert!(
         peak < 1024 * 1024,
         "the loop held {peak} bytes: a call tree kept across rounds"
+    );
+}
+
+/// What `query` still holds when its first run returns, with the parsed expression alive (#5422).
+///
+/// The retention that matters is what the expression keeps for the next run, which a second-run
+/// peak cannot see: it finds the bound bodies already there and allocates nothing.
+fn retained_after_first_run(query: &str) -> (i64, i64) {
+    let json = b"null";
+    let index = JsonIndex::build(json);
+    let expr = parse(query).expect("parse");
+    let window = Window;
+    LIVE.with(|cell| cell.set(Some((0, 0))));
+    let mut answered = None;
+    let escaped =
+        eval_each_with_cursor_using::<JqSemantics, _>(&expr, index.root(json), &mut |result| {
+            match result {
+                GenericResult::Owned(OwnedValue::Int(n)) => answered = Some(n),
+                GenericResult::Error(e) => panic!("`{query}` failed: {e:?}"),
+                _ => panic!("`{query}` did not settle to one integer"),
+            }
+            true
+        });
+    let (live, _) = LIVE
+        .with(|cell| cell.replace(None))
+        .expect("the window was opened above");
+    drop(window);
+    assert!(escaped.is_none(), "`{query}` ended early: {escaped:?}");
+    (answered.expect("one output"), live)
+}
+
+/// A call tree evaluated once is freed as it returns, in every build: `fib(14)` is about 1,200
+/// calls and 2 MB kept. The `no_std` build has no scope stack to free it with, so it declines to
+/// keep a node's body on the first reach instead (#5422).
+///
+/// `fib(14)`, not `fib(21)` (59 MB kept): a debug test thread's 2 MiB stack overflows on the
+/// deeper call. Both builds hold about 2 KB; the bound leaves room for allocator size classes
+/// and nothing near a kept level of the tree.
+#[test]
+fn a_call_tree_evaluated_once_is_not_retained_5422() {
+    let program = "def fib(n): if n < 2 then n else fib(n - 1) + fib(n - 2) end; fib(14)";
+    let (answer, retained) = retained_after_first_run(program);
+    assert_eq!(answer, 377);
+    assert!(
+        retained < 16 * 1024,
+        "the expression kept {retained} bytes of the call tree after one evaluation"
     );
 }
