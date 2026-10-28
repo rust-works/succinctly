@@ -60520,13 +60520,13 @@ mod key_node_metadata_2763 {
 
     /// Bare key results and key writes retain #2763's behavior. The `keys`
     /// renderer now preserves source quoting (#3615), verified against yq
-    /// v4.53.3; `[.[] | key]` still has its separate presentation gap.
+    /// v4.53.3; `[.[] | key]` keeps the key nodes' quoting too (#5445).
     #[test]
     fn the_key_rendering_and_write_paths_2763() -> Result<()> {
         check(&[
             (".a | key", MIXED, "a\n"),
             (".[] | key", MIXED, "a\nx\nqk\nk2\n"),
-            ("[.[] | key]", MIXED, "- a\n- x\n- qk\n- k2\n"),
+            ("[.[] | key]", MIXED, "- a\n- x\n- \"qk\"\n- k2\n"),
             ("keys", MIXED, "- a\n- x\n- \"qk\"\n- k2\n"),
             (".a | key | tostring | key", KEYC, "a\n"),
             // A write *through* a key is still positional, unchanged.
@@ -62349,14 +62349,14 @@ mod typed_key_node_2785 {
                 JSON,
                 "[\"!!int\",\"!!bool\",\"!!null\",\"!!float\",\"!!str\",\"!!str\"]\n",
             ),
-            // YAML output: `[.[] | key]` shares the composed-pipe route
-            // above (bare `null`); `keys`'s own streaming writer takes the
-            // gated route (`~` stays quoted, like the pre-existing `"2"`).
+            // YAML output: `[.[] | key]` keeps the key node's `~` (#5445);
+            // `keys`'s own streaming writer takes the gated route (`~` stays
+            // quoted, like the pre-existing `"2"`).
             (
                 "[.[] | key]",
                 TYPED,
                 YAML,
-                "- 1\n- true\n- null\n- 1.5\n- \"2\"\n- null\n",
+                "- 1\n- true\n- null\n- 1.5\n- \"2\"\n- ~\n",
             ),
             (
                 "keys",
