@@ -11394,9 +11394,14 @@ mod tests {
         }
 
         // jq mode and yq mode share the pattern grammar (real yq has no
-        // pattern keys at all), so both modes reject the same constants.
-        let err = parse_program_with_mode(". as {(1): $x} | .", ParserMode::Yq).unwrap_err();
+        // pattern keys at all, so yq needs `--jq-extensions` to reach it, #5433),
+        // so both modes reject the same constants.
+        let err =
+            parse_program_with_mode_and_extensions(". as {(1): $x} | .", ParserMode::Yq, true)
+                .unwrap_err();
         assert_eq!(err.message, "Cannot use number (1) as object key");
+        let err = parse_program_with_mode(". as {(1): $x} | .", ParserMode::Yq).unwrap_err();
+        assert!(err.message.contains("--jq-extensions"), "{}", err.message);
 
         // Accept (parses for runtime evaluation): string constants and
         // genuinely computed keys -- a *string* const destructures by the
