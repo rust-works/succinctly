@@ -111805,6 +111805,78 @@ mod tests {
         run::<YqSemantics>();
     }
 
+    /// #5421: a `def` call in the tail of a pipe no longer makes every tail
+    /// that contains it copy per value. The stateless run before the call is
+    /// kept like any tail and only the call is copied afresh, so a pipe of the
+    /// program copies nothing more for forty values than for four, down the
+    /// array constructor's route and the streaming drivers' alike, with the
+    /// call at the end of the pipe, in the middle, and twice. A parenthesized
+    /// pipe holding the call is one stage, cloned for each value (a node
+    /// remembers what evaluation did to it, #3148), and its copies per value are
+    /// the stages' own, not those of every tail of them.
+    #[test]
+    fn test_pipe_tail_holding_a_def_call_copies_only_the_call_per_value_5421() {
+        fn run<S: EvalSemantics>() {
+            const STAGES: usize = 10;
+            let t = vec![". + 1"; STAGES].join(" | ");
+            let shapes = [
+                ("end", format!("{t} | f"), STAGES + 1, 1),
+                ("middle", format!("{t} | f | {t}"), 2 * STAGES + 1, 1),
+                ("twice", format!("f | {t} | f | {t} | f"), 2 * STAGES + 3, 3),
+            ];
+            for (place, pipe, added, calls) in shapes {
+                for parenthesized in [false, true] {
+                    let pipe = if parenthesized {
+                        format!("({pipe})")
+                    } else {
+                        pipe.clone()
+                    };
+                    let templates = [
+                        ("collect", format!("[range(0;N) | {pipe}] | add")),
+                        (
+                            "select",
+                            format!("[range(0;N) | {pipe} | select(. > 0)] | add"),
+                        ),
+                        ("last", format!("last(range(0;N) | {pipe})")),
+                        ("limit", format!("[limit(100; range(0;N) | {pipe})] | add")),
+                    ];
+                    for (consumer, template) in templates {
+                        let template = format!("def f: . + 1; {template}");
+                        let run_for = |n: usize| {
+                            run_owned_pipe_program::<S>(
+                                &template.replace('N', &n.to_string()),
+                                b"null",
+                            )
+                        };
+                        let (settled, many) = (run_for(4), run_for(40));
+                        let want = match consumer {
+                            "last" => (39 + added).to_string(),
+                            _ => (0..40).map(|i| i + added).sum::<usize>().to_string(),
+                        };
+                        let what = format!(
+                            "{place}/{consumer}/{} ({:?})",
+                            if parenthesized { "paren" } else { "bare" },
+                            S::TAG
+                        );
+                        assert_eq!(many.output, want, "{what}");
+                        let more = many.copies - settled.copies;
+                        // A pipe of the program copies its last few stages whole and
+                        // the call itself, a constant per value; the clone of a
+                        // parenthesized one is a pipe of its own for each value, and
+                        // copies per stage, not per stage of every tail.
+                        let allowed = 36 * if parenthesized { 3 * STAGES } else { calls + 1 };
+                        assert!(
+                            more <= allowed,
+                            "{what}: forty values copy {more} more than four do, {allowed} allowed"
+                        );
+                    }
+                }
+            }
+        }
+        run::<JqSemantics>();
+        run::<YqSemantics>();
+    }
+
     /// #5404: a tail past [`MAX_KEPT_TAIL_NODES`] is not kept, however few its
     /// stages: what a pipe holds is bounded by nodes, not stages. The tails
     /// near the end of the pipe are small enough and are kept; the longer ones
