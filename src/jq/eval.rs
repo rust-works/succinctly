@@ -18063,18 +18063,12 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 };
                 keyed.push((key.into_owned(), is_fallback));
             }
-            let last_of: Option<alloc::collections::BTreeMap<&str, usize>> =
-                (!S::COLLAPSE_DUPLICATE_KEYS).then(|| {
-                    keyed
-                        .iter()
-                        .enumerate()
-                        .map(|(i, (key, _))| (key.as_str(), i))
-                        .collect()
-                });
-            let is_live = |i: usize| match &last_of {
-                Some(last) => last[keyed[i].0.as_str()] == i,
-                None => true,
-            };
+            let last_of: alloc::collections::BTreeMap<&str, usize> = keyed
+                .iter()
+                .enumerate()
+                .map(|(i, (key, _))| (key.as_str(), i))
+                .collect();
+            let is_live = |i: usize| last_of[keyed[i].0.as_str()] == i;
             // What each field becomes: an earlier entry of a repeated key is kept as read.
             enum Rewritten {
                 Earlier(OwnedValue),
@@ -18113,7 +18107,7 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Rewritten::Live(None) => {}
                     // Kept only while its key's live entry is.
                     Rewritten::Earlier(value) => {
-                        let live_at = last_of.as_ref().map_or(i, |last| last[key.as_str()]);
+                        let live_at = last_of[key.as_str()];
                         if !dropped[live_at] {
                             result_map.push::<S>(key.clone(), value);
                         }

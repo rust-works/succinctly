@@ -38513,6 +38513,7 @@ fn eval_map_family_positioned<S: EvalSemantics, V: DocumentValue>(
     let mut array: Vec<OwnedValue> = Vec::new();
     // `map_values` writes each live value and leaves a repeated key's earlier entries alone (yq,
     // ADR-0027): start from the container, not from nothing.
+    let keeps_container = matches!(container, OwnedValue::Object(fields) if matches!(family, MapFamily::MapValues) && fields.has_shadows());
     let mut object = match container {
         OwnedValue::Object(fields)
             if matches!(family, MapFamily::MapValues) && fields.has_shadows() =>
@@ -38542,7 +38543,7 @@ fn eval_map_family_positioned<S: EvalSemantics, V: DocumentValue>(
             MapFamily::MapValues => {
                 let Some(value) = outputs.into_iter().next() else {
                     // No output removes the member (every entry of its key).
-                    if !matches!(component, OwnedValue::Int(_)) {
+                    if keeps_container && !matches!(component, OwnedValue::Int(_)) {
                         object.shift_remove(owned_to_string::<S>(&component).as_str());
                     }
                     continue;
