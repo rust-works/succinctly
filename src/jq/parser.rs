@@ -3885,9 +3885,11 @@ impl<'a> Parser<'a> {
             }
 
             // #5456: yq's `~` is the null literal.
+            // It takes no postfix: yq answers `bad expression` for `~[0]` and `~.a`.
             Some('~') if self.mode == ParserMode::Yq => {
                 self.next();
-                self.parse_postfix(Expr::Literal(Literal::Null))
+                self.last_primary_is_term = true; // #3038: leaf Term
+                Ok(Expr::Literal(Literal::Null))
             }
 
             // Variable reference: $varname, $__loc__, or $ENV

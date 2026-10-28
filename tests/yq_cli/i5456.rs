@@ -35,3 +35,14 @@ fn test_tilde_toyaml_fromyaml_and_ireduce_match_yq_5456() -> Result<()> {
     }
     Ok(())
 }
+
+/// `~` takes no postfix in yq, and none of the four spellings exists in jq mode.
+#[test]
+fn test_tilde_takes_no_postfix_and_jq_mode_is_unchanged_5456() -> Result<()> {
+    for filter in ["~[0]", "~.a", "path(~)"] {
+        let (stdout, code) = run_yq_stdin(filter, DOC, &["-o=json", "-I=0"])?;
+        assert_eq!(stdout, "", "`{filter}`");
+        assert_ne!(code, 0, "`{filter}` must be rejected");
+    }
+    Ok(())
+}
