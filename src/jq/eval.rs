@@ -11863,6 +11863,20 @@ fn holds_evaluation_state(stage: &Expr) -> bool {
     })
 }
 
+/// Whether `stage` reads a variable anywhere under it, `Shared` arguments and
+/// bound definitions included (#5424): the only node a substitution of a
+/// variable rewrites ([`substitute_var_impl`]).
+fn holds_var(stage: &Expr) -> bool {
+    use crate::jq::walk::{search_subexpr, Visit};
+    search_subexpr(stage, &mut |e| {
+        if matches!(e, Expr::Var(_)) {
+            Visit::Found
+        } else {
+            Visit::Descend
+        }
+    })
+}
+
 /// Owned-input twin of [`eval_each`], mirroring `eval_owned_input`.
 ///
 /// The sink takes `OwnedValue`, not `Item`: values produced against the
@@ -75769,6 +75783,21 @@ fn substitute_var_impl(
                 bound: FuncDefBound::default(),
             }
         }
+        // #5424: a pipe that reads no variable is rebuilt stage for stage, so the one
+        // rebuilt for this value hands on the tails kept for the pipe it was rebuilt
+        // from instead of keeping tails of its own, made once per value and used once.
+        Expr::Pipe(stages) => {
+            let mut rebuilt: PipeStages = stages
+                .iter()
+                .map(|sub| substitute_var_impl(sub, var_name, replacement, mark))
+                .collect();
+            if (3..=crate::jq::expr::MAX_KEPT_TAIL_STAGES).contains(&stages.len())
+                && !stages.holds_var_or_init(|stages| stages.iter().any(holds_var))
+            {
+                rebuilt.share_tails_of(stages, holds_evaluation_state);
+            }
+            Expr::Pipe(rebuilt)
+        }
         // #2095: every remaining variant's recursive-structural-child
         // handling here is identical to `install_def_calls`'s and
         // `substitute_func_param`'s own -- apply this substitution to each
@@ -96714,10 +96743,14 @@ pub(crate) fn substitute_destructured_bindings<S: EvalSemantics>(
     all_var_names: &[String],
     mut register: impl FnMut(Option<&BindOrigin>, &mut OwnedValue),
 ) -> Expr {
-    let mut current = body.clone();
+    // The first substitution reads `body` itself, not a copy of it (#5424): a
+    // pipe rebuilt from a copy made for this binding set would link to the
+    // copy, which no later binding set sees.
+    let mut current: Option<Expr> = None;
     for (name, value, origin) in bindings {
-        current = match origin {
-            None => substitute_var(&current, name, value),
+        let source = current.as_ref().unwrap_or(body);
+        current = Some(match origin {
+            None => substitute_var(source, name, value),
             Some((node, document)) => {
                 let origin = BindOrigin::Node {
                     node: *node,
@@ -96727,7 +96760,7 @@ pub(crate) fn substitute_destructured_bindings<S: EvalSemantics>(
                 register(Some(&origin), &mut bound);
                 substitute_bound_var_at(
                     &Expr::Literal(Literal::Null),
-                    &current,
+                    source,
                     name,
                     &bound,
                     None,
@@ -96737,15 +96770,16 @@ pub(crate) fn substitute_destructured_bindings<S: EvalSemantics>(
                     S::EQUALITY_SHORT_CIRCUITS_ON_IDENTITY,
                 )
             }
-        };
+        });
     }
     let null_value = OwnedValue::Null;
     for name in all_var_names {
         if !bindings.iter().any(|(n, _, _)| n == name) {
-            current = substitute_var(&current, name, &null_value);
+            let source = current.as_ref().unwrap_or(body);
+            current = Some(substitute_var(source, name, &null_value));
         }
     }
-    current
+    current.unwrap_or_else(|| body.clone())
 }
 
 /// Drop every item after the first for each repeated `name`, keeping
@@ -111850,7 +111884,8 @@ mod tests {
     /// so the copies are the ones the pipe keeps, however many values go down
     /// it; and so is the effect arm of `eval_pipe`, which drove the pipe stage
     /// by stage without its owner. A `reduce`/`foreach` body that
-    /// mentions its variable is rebuilt per value and still copies (#5421).
+    /// mentions its variable is rebuilt per value and still copies (#5424 links
+    /// the bodies that do not).
     #[test]
     fn test_sink_driven_pipe_rest_is_copied_once_per_program_not_per_value_5417() {
         fn run<S: EvalSemantics>() {
@@ -111961,6 +111996,72 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+        run::<JqSemantics>();
+        run::<YqSemantics>();
+    }
+
+    /// #5424: a body rebuilt for each value that reads no variable hands on the
+    /// tails of the pipe it was rebuilt from, so a pipe of the program copies
+    /// nothing more for forty values than for four. `. as $x | (...)`, the
+    /// update of a `reduce` and of a `foreach`, and the destructuring forms
+    /// rebuild their body per value; each was a pipe of its own, so tails kept
+    /// for it were made once per value and used once. A body that reads a
+    /// variable differs from one value to the next and is not linked; the CLI
+    /// rows pin its answers.
+    #[test]
+    fn test_body_rebuilt_per_value_shares_the_tails_of_its_pipe_5424() {
+        fn run<S: EvalSemantics>() {
+            const STAGES: usize = 20;
+            let t = parenthesized_increments(STAGES);
+            // The sum of what each shape yields for 40 values, and the copies
+            // per value it may still make.
+            let sum_of_indices = 40 * 39 / 2;
+            let shapes = [
+                (
+                    "as",
+                    format!("[range(0;N) | . as $x | {t}] | add"),
+                    sum_of_indices + 40 * STAGES,
+                    4,
+                ),
+                (
+                    "as pattern",
+                    format!("[range(0;N) | [.] as [$x] | {t}] | add"),
+                    sum_of_indices + 40 * STAGES,
+                    4,
+                ),
+                (
+                    "nested as",
+                    format!("[range(0;N) | . as $x | (. + 1 | . as $y | {t})] | add"),
+                    sum_of_indices + 40 * (STAGES + 1),
+                    4,
+                ),
+                (
+                    "reduce",
+                    format!("reduce range(0;N) as $i (0; {t})"),
+                    40 * STAGES,
+                    4,
+                ),
+                (
+                    "foreach",
+                    format!("[foreach range(0;N) as $i (0; . + 1; {t})] | add"),
+                    sum_of_indices + 40 * (STAGES + 1),
+                    4,
+                ),
+            ];
+            for (name, template, want, per_value) in shapes {
+                let run_for = |n: usize| {
+                    run_owned_pipe_program::<S>(&template.replace('N', &n.to_string()), b"null")
+                };
+                let (settled, many) = (run_for(4), run_for(40));
+                assert_eq!(many.output, want.to_string(), "{name} ({:?})", S::TAG);
+                let more = many.copies - settled.copies;
+                assert!(
+                    more <= 36 * per_value,
+                    "{name}: forty values copy {more} more than four do ({:?})",
+                    S::TAG
+                );
             }
         }
         run::<JqSemantics>();

@@ -100,7 +100,7 @@ fn test_long_parenthesized_pipe_matches_jq_5417() -> Result<()> {
             "[range(0;300) | (. + input_line_number | PIPE)] | add",
             "62850\n",
         ),
-        // A body that is rebuilt for each value still copies its rest per value (#5421); its
+        // A body that is rebuilt for each value that reads its variable still copies its rest per value (#5424); its
         // answer is the same.
         (
             "reduce range(0;300) as $i (0; ($i | (PIPE)) + .)",
