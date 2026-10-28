@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use indexmap::IndexMap;
 use std::cell::Cell;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::Path;
@@ -2706,6 +2706,10 @@ struct WriteTarget {
     /// The written value is another node of the document (`= .j`, `= $x`), not a closed literal:
     /// in yq it brings that node's own presentation along (#4113).
     copies: bool,
+    /// Which write of the pipe this is, in execution order (#2512). The paths of one
+    /// `del(.arr[0], .arr[2])` share a stage and name slots of the same array; a later stage's
+    /// static index is read after every earlier `del` has renumbered it.
+    stage: usize,
 }
 
 /// Collect the [`PathStep`]s of a *static* navigation chain, returning
@@ -2855,21 +2859,33 @@ fn is_closed_literal(expr: &Expr) -> bool {
 /// rejected by [`static_path_steps`] instead of being resolved against a
 /// document that may already be stale.
 fn collect_write_targets(expr: &Expr) -> Option<Vec<WriteTarget>> {
-    fn push(
+    /// The stage of the next write: one past the last target pushed (a comma `del` pushes
+    /// several targets under one stage).
+    fn next_stage(out: &[WriteTarget]) -> usize {
+        out.last().map_or(0, |t| t.stage + 1)
+    }
+
+    fn push(lhs: &Expr, kind: WriteKind, flags: (bool, bool), out: &mut Vec<WriteTarget>) -> bool {
+        let stage = next_stage(out);
+        push_at(lhs, kind, flags, stage, out)
+    }
+
+    fn push_at(
         lhs: &Expr,
         kind: WriteKind,
         (fresh, copies): (bool, bool),
+        stage: usize,
         out: &mut Vec<WriteTarget>,
     ) -> bool {
         match lhs {
-            Expr::Paren(inner) => push(inner, kind, (fresh, copies), out),
+            Expr::Paren(inner) => push_at(inner, kind, (fresh, copies), stage, out),
             // `del(.arr[0], .arr[2])` removes both, and each branch is a
             // path of its own — a generator is only valid on a `del`'s
             // left, never an assignment's, so this arm is gated on `Del`
             // rather than accepting `.a, .b = 1`.
-            Expr::Comma(branches) if kind == WriteKind::Del => {
-                branches.iter().all(|b| push(b, kind, (fresh, copies), out))
-            }
+            Expr::Comma(branches) if kind == WriteKind::Del => branches
+                .iter()
+                .all(|b| push_at(b, kind, (fresh, copies), stage, out)),
             _ => {
                 let mut path = Vec::new();
                 if !static_path_steps(lhs, &mut path) {
@@ -2880,6 +2896,7 @@ fn collect_write_targets(expr: &Expr) -> Option<Vec<WriteTarget>> {
                     kind,
                     fresh,
                     copies,
+                    stage,
                 });
                 true
             }
@@ -2936,6 +2953,7 @@ fn collect_write_targets(expr: &Expr) -> Option<Vec<WriteTarget>> {
                     kind: WriteKind::Set,
                     fresh: is_closed_literal(value),
                     copies: !is_closed_literal(value),
+                    stage: next_stage(out),
                 });
                 true
             }
@@ -2961,6 +2979,7 @@ fn collect_write_targets(expr: &Expr) -> Option<Vec<WriteTarget>> {
                     kind: WriteKind::Del,
                     fresh: false,
                     copies: false,
+                    stage: next_stage(out),
                 });
                 true
             }
@@ -3019,32 +3038,161 @@ fn collect_write_targets(expr: &Expr) -> Option<Vec<WriteTarget>> {
         return None;
     }
 
-    // Stage order is invisible here, and a `del` at an array index makes it
-    // matter: it renumbers every later slot, so a static index from another
-    // stage means one node before the `del` and a different one after.
-    // `.arr[1] = ... | del(.arr[0])` and `del(.arr[0]) | .arr[0] = ...` are
-    // the same two writes in this list and different documents on the page.
-    //
-    // Deletions from the *same* array are exempt — `array_sources` removes
-    // them as one set, which is what `del(.arr[0], .arr[2])` means anyway —
-    // and so is any path that never enters the array at all (`.z = 1 |
-    // del(.arr[0])`). Anything else gives up the whole expression rather
-    // than reconcile against an order it cannot see.
-    let ambiguous = out.iter().enumerate().any(|(di, d)| {
-        if d.kind != WriteKind::Del {
-            return false;
+    resolve_stage_order(out)
+}
+
+/// Whether `target` removes an array slot, renumbering the ones after it.
+fn renumbers_array(target: &WriteTarget) -> bool {
+    target.kind == WriteKind::Del && matches!(target.path.last(), Some(PathStep::Index(_)))
+}
+
+/// What one stage's `del`s did to a path, from [`shift_through_stage`].
+enum Shifted {
+    /// The path, in the other side's coordinates.
+    Path(Vec<PathStep>),
+    /// The node the path names was removed by the stage.
+    Removed,
+    /// A negative index follows a renumbered array, and what it names depends on a length this
+    /// walk does not know.
+    Unknown,
+}
+
+/// The slots one stage removed from one array: the array's path, and the removed indices
+/// ascending.
+type StageRemovals = (Vec<PathStep>, Vec<i64>);
+
+/// Carry `path` across one stage of `del`s. Forward, `path` is read before the stage and comes
+/// back as it reads after it (or [`Shifted::Removed`] if the stage removed the node); backward,
+/// the reverse. Each removal is matched against the path as given, so the stage's removals act
+/// together, as `del(.arr[0], .arr[2])` does.
+fn shift_through_stage(path: &[PathStep], stage: &[StageRemovals], backward: bool) -> Shifted {
+    let mut shifted = path.to_vec();
+    for (array, removed) in stage {
+        if path.len() <= array.len() || path[..array.len()] != **array {
+            continue;
         }
-        let Some((PathStep::Index(_), parent)) = d.path.split_last() else {
-            return false;
+        let PathStep::Index(slot) = &path[array.len()] else {
+            continue;
         };
-        out.iter().enumerate().any(|(ti, t)| {
-            ti != di
-                && t.path.len() > parent.len()
-                && t.path[..parent.len()] == *parent
-                && !(t.kind == WriteKind::Del && t.path.len() == parent.len() + 1)
-        })
-    });
-    (!ambiguous).then_some(out)
+        if *slot < 0 {
+            return Shifted::Unknown;
+        }
+        let moved = if backward {
+            removed.iter().fold(
+                *slot,
+                |slot, gone| if *gone <= slot { slot + 1 } else { slot },
+            )
+        } else if removed.contains(slot) {
+            return Shifted::Removed;
+        } else {
+            slot - removed.iter().filter(|gone| **gone < *slot).count() as i64
+        };
+        shifted[array.len()] = PathStep::Index(moved);
+    }
+    Shifted::Path(shifted)
+}
+
+/// Put the targets of a pipe's writes in one coordinate system each can be reconciled in (#870,
+/// #2512), or decline with `None`.
+///
+/// A `del` at an array index renumbers every later slot, so a static index written in one stage
+/// names one node before a `del` and another after it: `.arr[1] = ... | del(.arr[0])` and
+/// `del(.arr[0]) | .arr[0] = ...` touch the same node, and name it differently. The reconcile
+/// reads two kinds of index:
+///
+/// - the slot a `del` removed, in the *pristine* array ([`array_sources`] remaps against it);
+/// - every other step, which is descended into by the slot the node holds in the *result*
+///   ([`descend_index`]).
+///
+/// Each target is carried across the stages that disagree with it: a `del`'s own last index back
+/// across the `del`s before it, and every other step forward across the `del`s after it. A node
+/// a later stage removes needs no target (it is gone from the result), so its targets are
+/// dropped.
+///
+/// Pipes whose `del`s touch no array another write reaches are returned untouched. Declined
+/// (leaving the positional walk): a negative index into a renumbered array, and a stage whose
+/// `del`s nest (`del(.a[0], .a[1].b[0])`), where one removal renumbers the array another is
+/// written against. A write past the end of the array is resolved but still prints the old way:
+/// the array it makes is longer than the survivors [`array_sources`] predicts.
+fn resolve_stage_order(out: Vec<WriteTarget>) -> Option<Vec<WriteTarget>> {
+    // `d` renumbers `t` when `t` goes through the array `d` removes a slot of. Deletions of the
+    // same array in one stage are exempt: `array_sources` removes them as one set, which is what
+    // `del(.arr[0], .arr[2])` means.
+    let renumbered = |d: &WriteTarget, t: &WriteTarget| {
+        let array = &d.path[..d.path.len() - 1];
+        t.path.len() > array.len()
+            && t.path[..array.len()] == *array
+            && !(t.stage == d.stage && t.kind == WriteKind::Del && t.path.len() == array.len() + 1)
+    };
+    // One pass over the `del`/target pairs: whether any is renumbered at all, whether one stage's
+    // removals renumber each other's arrays (they act together, which that breaks), and whether
+    // the renumbering `del` has a negative index (which slot it removes depends on a length this
+    // walk does not know).
+    let (mut related, mut nested, mut negative) = (false, false, false);
+    for (di, d) in out.iter().enumerate().filter(|(_, d)| renumbers_array(d)) {
+        for (_, t) in out.iter().enumerate().filter(|(ti, _)| *ti != di) {
+            if renumbered(d, t) {
+                related = true;
+                nested |= d.stage == t.stage;
+                negative |= matches!(d.path.last(), Some(PathStep::Index(slot)) if *slot < 0);
+            }
+        }
+    }
+    if !related {
+        return Some(out);
+    }
+    if nested || negative {
+        return None;
+    }
+
+    let mut stages: BTreeMap<usize, Vec<StageRemovals>> = BTreeMap::new();
+    for d in out.iter().filter(|d| renumbers_array(d)) {
+        let Some((PathStep::Index(slot), array)) = d.path.split_last() else {
+            continue;
+        };
+        // Nothing else goes through this array (checked above), so what it removes is moot.
+        if *slot < 0 {
+            continue;
+        }
+        let removals = stages.entry(d.stage).or_default();
+        match removals.iter_mut().find(|(a, _)| a == array) {
+            Some((_, removed)) => removed.push(*slot),
+            None => removals.push((array.to_vec(), vec![*slot])),
+        }
+    }
+    for removed in stages.values_mut().flatten().map(|(_, removed)| removed) {
+        removed.sort_unstable();
+        removed.dedup();
+    }
+
+    let mut resolved = Vec::with_capacity(out.len());
+    'targets: for target in out {
+        let renumbers = renumbers_array(&target);
+        // Everything that is descended into reads as the result does: carried forward across the
+        // stages after this one. A `del`'s own last index is the exception, and keeps the slot of
+        // the array it was removed from.
+        let steps = target.path.len() - usize::from(renumbers);
+        let mut path = target.path[..steps].to_vec();
+        for (_, stage) in stages.range(target.stage + 1..) {
+            match shift_through_stage(&path, stage, false) {
+                Shifted::Path(shifted) => path = shifted,
+                Shifted::Removed => continue 'targets,
+                Shifted::Unknown => return None,
+            }
+        }
+        if renumbers {
+            let mut pristine = target.path.clone();
+            for (_, stage) in stages.range(..target.stage).rev() {
+                match shift_through_stage(&pristine, stage, true) {
+                    Shifted::Path(shifted) => pristine = shifted,
+                    Shifted::Removed | Shifted::Unknown => return None,
+                }
+            }
+            path.extend(pristine.pop());
+        }
+        resolved.push(WriteTarget { path, ..target });
+    }
+    Some(resolved)
 }
 
 /// A write path, relative to the node currently being reconciled, paired
@@ -3350,23 +3498,25 @@ fn owned_value_align_hash(value: &OwnedValue) -> u64 {
 /// An empty `targets` — a write whose path isn't static, e.g.
 /// `.arr[(.i)] = 1` — falls back to the pre-#870 lockstep walk unchanged.
 ///
-/// **Remaining gaps.** All three predate #870 and none is a wrong *value*:
+/// **Remaining gaps.** Both predate #870 and neither is a wrong *value*:
 ///
 /// 1. Real `yq` carries presentation on *node identity*, which values can
 ///    only approximate. Under a genuine permutation of **equal** elements
 ///    the pairing is arbitrary: reversing `[a # c0, a # c1]` pairs `c0`
 ///    with the first `a` where `yq`, which knows the nodes, pairs `c1`.
-/// 2. Stage order is invisible in `targets`, and a `del` at an array index
-///    renumbers slots, so `.arr[1] = ... | del(.arr[0])` and its reverse
-///    are the same target list and different documents.
-///    [`collect_write_targets`] detects that shape and declines the whole
-///    expression rather than guess, leaving it on the positional walk.
-/// 3. Object fields are matched by key, never aligned by value: a key names
+/// 2. Object fields are matched by key, never aligned by value: a key names
 ///    the same node however the map is reordered, and aligning object
 ///    children by value would let one key inherit a *different* key's
 ///    comment — the very misattribution #870 is about.
 ///
-/// Closing (1) and (2) properly needs a node-identity model for the values
+/// (A `del` at an array index renumbers slots, so a static index from
+/// another stage names one node before it and another after; the targets
+/// are put in the coordinates the walk reads them in by
+/// [`resolve_stage_order`], #2512. What stays on the positional walk is a
+/// negative index into such an array, and a single stage whose `del`s
+/// renumber each other.)
+///
+/// Closing (1) properly needs a node-identity model for the values
 /// themselves (#865; #1351's alias redirect gives anchors and aliases that
 /// identity, not arbitrary reshaped nodes).
 fn reconcile_presentation(
@@ -14830,38 +14980,133 @@ mod tests {
     }
 
     /// A `del` at an array index renumbers slots for every other write that
-    /// reaches into the same array, and the target list records no stage
-    /// order — so that combination is declined whole. Deletions from the
-    /// same array are exempt (they are removed as one set), and so is a
-    /// write that never enters the array.
+    /// reaches into the same array (#2512), so each target is put in the
+    /// coordinates the reconcile reads it in: a `del`'s own index in the
+    /// pristine array, every other step in the result.
     #[test]
-    fn collect_write_targets_declines_del_that_renumbers_another_write_870() {
+    fn collect_write_targets_orders_a_del_that_renumbers_another_write_2512() {
         let del = |e: Expr| Expr::Builtin(Builtin::Del(Box::new(e)));
         let arr_idx = |i: i64| {
             Expr::Pipe(vec![Expr::Field("arr".into()), Expr::Index { idx: i, key: None }].into())
+        };
+        let arr_idx_key = |i: i64| {
+            Expr::Pipe(
+                vec![
+                    Expr::Field("arr".into()),
+                    Expr::Index { idx: i, key: None },
+                    Expr::Field("k".into()),
+                ]
+                .into(),
+            )
         };
         let set = |p: Expr| Expr::Assign {
             path: Box::new(p),
             value: Box::new(Expr::Literal(succinctly::jq::Literal::Int(1))),
         };
+        let pipe = |stages: Vec<Expr>| Expr::Pipe(stages.into());
+        let arr = || PathStep::Key("arr".into());
+        let at = |i: i64| vec![arr(), PathStep::Index(i)];
+        let at_k = |i: i64| vec![arr(), PathStep::Index(i), PathStep::Key("k".into())];
 
-        // A write into the same array, after a del that renumbers it.
-        assert!(
-            collect_write_targets(&Expr::Pipe(vec![set(arr_idx(1)), del(arr_idx(0))].into()))
-                .is_none()
+        // A write before the del reads its index before the renumbering: the
+        // node `.arr[1]` named is `.arr[0]` in the result.
+        assert_eq!(
+            targets_of(&pipe(vec![set(arr_idx(1)), del(arr_idx(0))])),
+            Some(vec![(at(0), WriteKind::Set), (at(0), WriteKind::Del)])
         );
-        // Same two writes, other order — equally undecidable from this list.
-        assert!(
-            collect_write_targets(&Expr::Pipe(vec![del(arr_idx(0)), set(arr_idx(1))].into()))
-                .is_none()
+        // A write after the del already reads the renumbered array; the del's
+        // own index is the pristine one either way.
+        assert_eq!(
+            targets_of(&pipe(vec![del(arr_idx(0)), set(arr_idx(1))])),
+            Some(vec![(at(0), WriteKind::Del), (at(1), WriteKind::Set)])
         );
-        // Two deletions from one array are handled together, not declined.
-        assert!(collect_write_targets(&del(Expr::Comma(vec![arr_idx(0), arr_idx(2)]))).is_some());
+        // The same, one level further in.
+        assert_eq!(
+            targets_of(&pipe(vec![set(arr_idx_key(2)), del(arr_idx(0))])),
+            Some(vec![(at_k(1), WriteKind::Set), (at(0), WriteKind::Del)])
+        );
+        // Two `del`s in sequence: the second reads the array the first left.
+        assert_eq!(
+            targets_of(&pipe(vec![del(arr_idx(0)), del(arr_idx(0))])),
+            Some(vec![(at(0), WriteKind::Del), (at(1), WriteKind::Del)])
+        );
+        assert_eq!(
+            targets_of(&pipe(vec![del(arr_idx(2)), del(arr_idx(0))])),
+            Some(vec![(at(2), WriteKind::Del), (at(0), WriteKind::Del)])
+        );
+        // A write to a node a later `del` removes leaves nothing to reconcile.
+        assert_eq!(
+            targets_of(&pipe(vec![set(arr_idx(1)), del(arr_idx(1))])),
+            Some(vec![(at(1), WriteKind::Del)])
+        );
+        assert_eq!(
+            targets_of(&pipe(vec![del(arr_idx_key(0)), del(arr_idx(0))])),
+            Some(vec![(at(0), WriteKind::Del)])
+        );
+        // Two deletions of one array in one stage still act together.
+        assert_eq!(
+            targets_of(&del(Expr::Comma(vec![arr_idx(0), arr_idx(2)]))),
+            Some(vec![(at(0), WriteKind::Del), (at(2), WriteKind::Del)])
+        );
         // A write elsewhere is unaffected by the renumbering.
-        assert!(collect_write_targets(&Expr::Pipe(
-            vec![del(arr_idx(0)), set(Expr::Field("n".into()))].into()
-        ))
-        .is_some());
+        assert_eq!(
+            targets_of(&pipe(vec![del(arr_idx(0)), set(Expr::Field("n".into()))])),
+            Some(vec![
+                (at(0), WriteKind::Del),
+                (vec![PathStep::Key("n".into())], WriteKind::Set)
+            ])
+        );
+    }
+
+    /// What a negative index names depends on a length the walk does not
+    /// know, and a stage whose `del`s renumber each other's arrays is not one
+    /// the walk resolves either: both stay declined (#2512).
+    #[test]
+    fn collect_write_targets_declines_what_it_cannot_order_2512() {
+        let del = |e: Expr| Expr::Builtin(Builtin::Del(Box::new(e)));
+        let arr_idx = |i: i64| {
+            Expr::Pipe(vec![Expr::Field("arr".into()), Expr::Index { idx: i, key: None }].into())
+        };
+        let arr_idx_key = |i: i64| {
+            Expr::Pipe(
+                vec![
+                    Expr::Field("arr".into()),
+                    Expr::Index { idx: i, key: None },
+                    Expr::Field("k".into()),
+                ]
+                .into(),
+            )
+        };
+        let set = |p: Expr| Expr::Assign {
+            path: Box::new(p),
+            value: Box::new(Expr::Literal(succinctly::jq::Literal::Int(1))),
+        };
+        let pipe = |stages: Vec<Expr>| Expr::Pipe(stages.into());
+
+        // A negative `del` index, and a negative index a later `del` renumbers.
+        assert!(targets_of(&pipe(vec![set(arr_idx(1)), del(arr_idx(-1))])).is_none());
+        assert!(targets_of(&pipe(vec![set(arr_idx(-1)), del(arr_idx(0))])).is_none());
+        // A negative index after the last `del` is read against the result, as it is written.
+        assert_eq!(
+            targets_of(&pipe(vec![del(arr_idx(0)), set(arr_idx(-1))])),
+            Some(vec![
+                (
+                    vec![PathStep::Key("arr".into()), PathStep::Index(0)],
+                    WriteKind::Del
+                ),
+                (
+                    vec![PathStep::Key("arr".into()), PathStep::Index(-1)],
+                    WriteKind::Set
+                )
+            ])
+        );
+        // ...but a negative `del` of an array nothing else enters is moot, and the rest is resolved.
+        let other = |i: i64| {
+            Expr::Pipe(vec![Expr::Field("b".into()), Expr::Index { idx: i, key: None }].into())
+        };
+        assert!(targets_of(&pipe(vec![del(arr_idx(-1)), del(other(0)), set(other(1))])).is_some());
+        // One `del` of a single stage writing into an array another removes a slot of.
+        assert!(targets_of(&del(Expr::Comma(vec![arr_idx(0), arr_idx_key(1)]))).is_none());
     }
 
     /// `collect_write_targets` must follow exactly the wrappers
