@@ -8167,6 +8167,14 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Anchor));
         }
 
+        // alias - yq: the node's `Value`: an alias node's anchor name, a scalar's text (#5483).
+        // yq mode only, unlike `anchor` above (jq mode accepts that one as an older extension):
+        // jq has no `alias`, and `alias/0 is not defined` is the right answer there.
+        if self.mode == ParserMode::Yq && self.matches_keyword("alias") {
+            self.consume_keyword("alias");
+            return Ok(Some(Builtin::Alias));
+        }
+
         // style - yq: return scalar/collection style
         if self.matches_keyword("style") {
             self.consume_keyword("style");
@@ -14783,6 +14791,7 @@ mod tests {
         ];
         /// yq accepts the name (a yq builtin, an operator word or core syntax).
         const YQ_NATIVE: &[&str] = &[
+            "alias",
             "all_c",
             "anchor",
             "and",

@@ -166,6 +166,7 @@ pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
         | Builtin::ModuleMeta
         | Builtin::Tag
         | Builtin::Anchor
+        | Builtin::Alias
         | Builtin::Style
         | Builtin::Kind
         | Builtin::Key
@@ -481,6 +482,7 @@ pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr)
         | Builtin::ModuleMeta
         | Builtin::Tag
         | Builtin::Anchor
+        | Builtin::Alias
         | Builtin::Style
         | Builtin::Kind
         | Builtin::Key
@@ -1478,6 +1480,7 @@ pub(crate) fn is_cursor_metadata_builtin(builtin: &Builtin) -> bool {
             | Builtin::Column
             | Builtin::DocumentIndex
             | Builtin::Anchor
+            | Builtin::Alias
             | Builtin::Style
             | Builtin::LineComment
             | Builtin::HeadComment
@@ -1680,6 +1683,7 @@ fn stage_escapes_own_input(expr: &Expr) -> bool {
             | Builtin::LeafPaths
             | Builtin::Tag
             | Builtin::Anchor
+            | Builtin::Alias
             | Builtin::Style
             | Builtin::Kind
             | Builtin::Key
@@ -2209,6 +2213,7 @@ fn node_reads_ambient(node: &Expr) -> bool {
             | Builtin::Omit(_)
             | Builtin::Tag
             | Builtin::Anchor
+            | Builtin::Alias
             | Builtin::Style
             | Builtin::Kind
             | Builtin::Key

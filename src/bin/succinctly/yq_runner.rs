@@ -5230,6 +5230,7 @@ fn is_node_metadata_slot(builtin: &Builtin) -> bool {
             | Builtin::FileIndex
             | Builtin::Filename
             | Builtin::Anchor
+            | Builtin::Alias
             | Builtin::Style
             | Builtin::Line
             | Builtin::Column
@@ -6764,6 +6765,7 @@ fn reads_node_context(expr: &Expr) -> bool {
                 | Builtin::InputLineNumber
                 | Builtin::Tag
                 | Builtin::Anchor
+                | Builtin::Alias
                 | Builtin::Style
                 | Builtin::LineComment
                 | Builtin::HeadComment

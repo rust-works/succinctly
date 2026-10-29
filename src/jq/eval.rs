@@ -17265,6 +17265,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // YAML metadata functions (yq)
         Builtin::Tag => builtin_tag::<W>(value),
         Builtin::Anchor => builtin_anchor::<W>(),
+        Builtin::Alias => builtin_alias::<W>(value),
         Builtin::Style => builtin_style::<W>(),
         Builtin::Kind => builtin_kind::<W>(value),
         Builtin::Line => builtin_line::<W>(),
@@ -35083,6 +35084,7 @@ fn builtin_yields_at_most_one_value(builtin: &Builtin) -> bool {
         | Builtin::AllC(..)
         | Builtin::AllF(_)
         | Builtin::Anchor
+        | Builtin::Alias
         | Builtin::Any
         | Builtin::AnyC(..)
         | Builtin::AnyCond(_, _)
@@ -36050,6 +36052,7 @@ fn yq_metadata_builtin_as_assign_path_error(path_expr: &Expr) -> Option<EvalErro
                 | Builtin::FootComment
                 | Builtin::Style
                 | Builtin::Anchor
+                | Builtin::Alias
                 | Builtin::Tag,
         )
     )
@@ -95805,6 +95808,27 @@ fn builtin_anchor<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
 /// JSON input, which has no style concept.
 fn builtin_style<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
     QueryResult::Owned(OwnedValue::String(String::new().into()))
+}
+
+/// `alias` - yq answers the node's `Value`: a scalar's text, `""` for a collection (#5483).
+///
+/// This evaluator has no cursor, so no alias node to name and no source spelling to echo: a
+/// value is the canonical text of what it holds (`1.50` is `"1.5"` once typed). The cursor route
+/// in `src/jq/eval_generic.rs` answers the alias name and the text as written for a YAML
+/// document.
+fn builtin_alias<W: Clone + AsRef<[u64]>>(value: StandardJson<'_, W>) -> QueryResult<'_, W> {
+    let text = match &value {
+        StandardJson::String(_) => {
+            crate::jq::document::DocumentValue::as_str(&value).map(Cow::into_owned)
+        }
+        StandardJson::Bool(b) => Some(b.to_string()),
+        StandardJson::Null => Some(String::from("null")),
+        StandardJson::Number(_) => crate::jq::document::DocumentValue::number_text(&value)
+            .map(Cow::into_owned)
+            .or_else(|| crate::jq::document::DocumentValue::as_i64(&value).map(|n| n.to_string())),
+        _ => None,
+    };
+    QueryResult::Owned(OwnedValue::String(text.unwrap_or_default().into()))
 }
 
 /// `kind` - returns the node kind: "scalar", "seq", or "map"

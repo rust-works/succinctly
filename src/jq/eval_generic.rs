@@ -33605,6 +33605,30 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
             GenericResult::Owned(OwnedValue::String(anchor.into()))
         }
 
+        // yq's `alias` answers the node's `Value` (#5483): the anchor's name for an alias node
+        // (`*name`, whose own value the cursor has resolved away), and for any other scalar its
+        // text as written (`1.50`, `0x1F`, `~`, a quoted or block scalar decoded), which is what
+        // the operator returns whether or not the node is an alias. A mapping, a sequence and an
+        // empty value have no text.
+        Builtin::Alias => {
+            let text = match cursor.and_then(|c| c.alias().map(str::to_string)) {
+                Some(name) => name,
+                // A value with no cursor (an owned copy inside `|=`, a computed one) keeps no
+                // spelling or alias mark, so its text is the canonical one.
+                None => value
+                    .as_str()
+                    .map(Cow::into_owned)
+                    .or_else(|| value.number_text().map(Cow::into_owned))
+                    .or_else(|| value.as_i64().map(|n| n.to_string()))
+                    .or_else(|| value.as_bool().map(|b| b.to_string()))
+                    // An absent key (`.b | alias`) and a computed null are a `null` node, whose
+                    // `Value` is `null`; a cursor on an empty value (`a:`) is the empty string.
+                    .or_else(|| value.is_null().then(|| String::from("null")))
+                    .unwrap_or_default(),
+            };
+            GenericResult::Owned(OwnedValue::String(text.into()))
+        }
+
         // #4866: native, so a node is not converted whole just to name its kind, and an alias
         // answers `alias` as in yq. Without a cursor (an owned value, JSON input) the value says.
         Builtin::Kind => {
@@ -36109,6 +36133,7 @@ fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
             | Builtin::AnyC(..)
             | Builtin::AllC(..)
             | Builtin::Anchor
+            | Builtin::Alias
             | Builtin::DocumentIndex
             | Builtin::LineComment
             // #798: same class as `line_comment` -- a metadata read that
@@ -39224,6 +39249,7 @@ fn node_metadata_getter(stage: &Expr) -> Option<&Builtin> {
             | Builtin::Column
             | Builtin::Style
             | Builtin::Anchor
+            | Builtin::Alias
             | Builtin::LineComment
             | Builtin::HeadComment
             | Builtin::FootComment),
@@ -39237,7 +39263,7 @@ fn node_getter_meta_bit(builtin: &Builtin) -> u8 {
     match builtin {
         Builtin::Line | Builtin::Column => META_POS,
         Builtin::Style => META_STYLE,
-        Builtin::Anchor => META_ANCHOR,
+        Builtin::Anchor | Builtin::Alias => META_ANCHOR,
         Builtin::LineComment => META_LINE_COMMENT,
         Builtin::HeadComment | Builtin::FootComment => META_HEAD_FOOT,
         _ => 0,

@@ -3244,6 +3244,8 @@ pub enum Builtin {
     Tag,
     /// `anchor` - return anchor name if present, or empty string
     Anchor,
+    /// `alias` - return the name of the anchor an alias node (`*name`) refers to, or empty string
+    Alias,
     /// `style` - return scalar style (double, single, literal, folded) or collection style (flow)
     Style,
     /// `kind` - return node kind: "scalar", "seq", or "map"

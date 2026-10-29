@@ -1028,6 +1028,7 @@ fn cursor_metadata_name(builtin: &Builtin) -> Option<&'static str> {
         B::Column => "column",
         B::DocumentIndex => "document_index",
         B::Anchor => "anchor",
+        B::Alias => "alias",
         B::Style => "style",
         B::LineComment => "line_comment",
         B::HeadComment => "head_comment",
