@@ -80640,8 +80640,11 @@ pub(crate) fn fold_loop_variable_shares_identity<S: EvalSemantics>(
         return false;
     }
     let names = pattern_alternatives_var_names(patterns);
+    // Asked on every fold evaluation, so one that never reads a loop variable (`. + 1`) is
+    // answered by a single walk.
     let shares = |expr: &Expr| {
-        loop_var_can_be_compared(expr, &names) || loop_var_can_reach_output(expr, &names)
+        mentions_any_name(expr, &names)
+            && (loop_var_can_be_compared(expr, &names) || loop_var_can_reach_output(expr, &names))
     };
     !names.is_empty() && (shares(update) || extract.is_some_and(shares))
 }
