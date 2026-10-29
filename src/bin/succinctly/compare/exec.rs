@@ -28,7 +28,7 @@ impl Exec {
 
 /// Run `tool` with `args` and `stdin` in `cwd`. The environment is fixed
 /// (`TZ=UTC`, `LC_ALL=C`) so a locale or zone cannot read as a divergence.
-pub fn exec(tool: &Tool, args: &[String], stdin: &str, cwd: &Path) -> Result<Exec> {
+pub fn exec(tool: &Tool, args: &[String], stdin: impl AsRef<[u8]>, cwd: &Path) -> Result<Exec> {
     let mut child = Command::new(&tool.program)
         .args(&tool.prefix)
         .args(args)
@@ -43,7 +43,7 @@ pub fn exec(tool: &Tool, args: &[String], stdin: &str, cwd: &Path) -> Result<Exe
         .spawn()
         .with_context(|| format!("spawning {} ({})", tool.name, tool.program))?;
     let mut sin = child.stdin.take().expect("piped");
-    let input = stdin.as_bytes().to_vec();
+    let input = stdin.as_ref().to_vec();
     let writer = std::thread::spawn(move || {
         let _ = sin.write_all(&input);
     });

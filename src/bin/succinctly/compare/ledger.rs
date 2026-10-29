@@ -72,8 +72,16 @@ pub fn load(path: &Path) -> Result<Vec<Entry>> {
 
 /// Compare the listed ids with the observed ones, restricted to `suites`
 /// (a partial run must not call another suite's entries stale).
-pub fn check(entries: &[Entry], observed: &BTreeSet<String>, suites: &[&str]) -> Outcome {
-    let in_run = |id: &str| suites.iter().any(|s| id.starts_with(&format!("{s}:")));
+pub fn check<S: AsRef<str>>(
+    entries: &[Entry],
+    observed: &BTreeSet<String>,
+    suites: &[S],
+) -> Outcome {
+    let in_run = |id: &str| {
+        suites
+            .iter()
+            .any(|s| id.starts_with(&format!("{}:", s.as_ref())))
+    };
     let listed: BTreeSet<&str> = entries
         .iter()
         .map(|e| e.id.as_str())

@@ -78,7 +78,25 @@ pub fn render(results: &Results) -> String {
             .count();
         let _ = writeln!(s, "| CLI probes agreeing | {ok}/{} |", r.cli.len());
     }
-    if r.features.is_some() || !r.cli.is_empty() {
+    if !r.differential.is_empty() {
+        let (all, ok) = r
+            .differential
+            .iter()
+            .fold((0, 0), |(a, o), x| (a + x.total, o + x.matching));
+        let _ = writeln!(s, "| Upstream jq test cases agreeing | {ok}/{all} |");
+    }
+    if let Some(i) = &r.input {
+        let _ = writeln!(
+            s,
+            "| JSONTestSuite `y_` accepted / `n_` rejected (`--validate`) | {}/{} · {}/{} |",
+            i.y.validate,
+            i.y.total,
+            i.n.total - i.n.validate,
+            i.n.total
+        );
+    }
+    if r.features.is_some() || !r.cli.is_empty() || !r.differential.is_empty() || r.input.is_some()
+    {
         let _ = writeln!(
             s,
             "| Known divergences (ledger) | {} |",
@@ -155,6 +173,8 @@ pub fn render(results: &Results) -> String {
 
     features_sections(&mut s, r);
     cli_sections(&mut s, r);
+    differential_section(&mut s, r);
+    input_section(&mut s, r);
 
     let _ = writeln!(s, "\n## Reproduce\n");
     let _ = writeln!(s, "```bash\ncargo build --release --features bench-runner");
@@ -285,4 +305,67 @@ fn cli_sections(s: &mut String, r: &Results) {
             ex(x.subject_exit)
         );
     }
+}
+
+fn differential_section(s: &mut String, r: &Results) {
+    if r.differential.is_empty() {
+        return;
+    }
+    let _ = writeln!(s, "\n## B. Differential: upstream jq test files\n");
+    let _ = writeln!(
+        s,
+        "Each case runs through both tools; stdout and exit status must be identical. \
+         The files' own expected outputs are not consulted.\n"
+    );
+    let _ = writeln!(s, "| File | Cases | Agree |");
+    let _ = writeln!(s, "|------|-------|-------|");
+    for x in &r.differential {
+        let _ = writeln!(s, "| {} | {} | {} |", x.suite, x.total, x.matching);
+    }
+    let _ = writeln!(s, "\n| Case | Program | Ledger |");
+    let _ = writeln!(s, "|------|---------|--------|");
+    for x in r
+        .differential
+        .iter()
+        .flat_map(super::suites::SuiteSummary::differing)
+    {
+        let _ = writeln!(
+            s,
+            "| `{}` | `{}` | {} |",
+            x.id,
+            x.program,
+            note_for(r, &x.id)
+        );
+    }
+}
+
+fn input_section(s: &mut String, r: &Results) {
+    let Some(i) = &r.input else { return };
+    let _ = writeln!(s, "\n## C. Input conformance: JSONTestSuite\n");
+    let _ = writeln!(
+        s,
+        "Accepting is exit 0. `y_` must be accepted, `n_` rejected, `i_` is implementation-defined. \
+         `succinctly` as shipped semi-indexes and validates little; `--validate` is strict RFC 8259.\n"
+    );
+    let _ = writeln!(
+        s,
+        "| Class | Cases | jq accepts | succinctly accepts | succinctly --validate accepts |"
+    );
+    let _ = writeln!(
+        s,
+        "|-------|-------|------------|--------------------|-------------------------------|"
+    );
+    for (name, t) in [("y_", &i.y), ("n_", &i.n), ("i_", &i.i)] {
+        let _ = writeln!(
+            s,
+            "| {name} | {} | {} | {} | {} |",
+            t.total, t.reference, t.default, t.validate
+        );
+    }
+    let _ = writeln!(
+        s,
+        "\nThe ledger lists a case only when `--validate` breaks its `y_`/`n_` expectation or the \
+         two tools print different values for an input both accept; jq itself accepts {} `n_` cases.",
+        i.n.reference
+    );
 }

@@ -35,6 +35,14 @@ pub struct Probes {
     pub divergences: String,
 }
 
+/// A vendored upstream test file, pinned by content.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Suite {
+    pub id: String,
+    pub path: String,
+    pub sha256: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Manifest {
     pub schema_version: u32,
@@ -43,6 +51,9 @@ pub struct Manifest {
     pub succinctly: SuccinctlyBuild,
     pub queries: Queries,
     pub probes: Probes,
+    #[serde(rename = "suite", default)]
+    pub suites: Vec<Suite>,
+    pub json_suite: Suite,
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -71,6 +82,21 @@ impl Manifest {
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
         Self::parse(&text)
+    }
+
+    /// Read a pinned file, refusing one whose sha256 differs from the manifest's.
+    pub fn read_pinned(root: &Path, s: &Suite) -> Result<String> {
+        let bytes =
+            std::fs::read(root.join(&s.path)).with_context(|| format!("reading {}", s.path))?;
+        let got = sha256_hex(&bytes);
+        if got != s.sha256 {
+            bail!(
+                "{} has sha256 {got}, the manifest pins {}",
+                s.path,
+                s.sha256
+            );
+        }
+        Ok(String::from_utf8(bytes)?)
     }
 
     pub fn primary(&self) -> &Reference {
@@ -104,9 +130,37 @@ mod tests {
     fn two_primaries_are_rejected() {
         let text = "schema_version = 1\n\
             [succinctly]\nprofile='release'\nfeatures=''\n[queries]\nsmoke='x'\n\
-            [probes]\ncli='x'\nextensions='x'\nfixtures='x'\ndivergences='x'\n\
+            [probes]\ncli='x'\nextensions='x'\nfixtures='x'\ndivergences='x'\n[json_suite]\nid='j'\npath='p'\nsha256='s'\n\
             [[reference]]\nid='a'\nversion='1'\nrole='primary'\nsource_url=''\nsource_sha256=''\n\
             [[reference]]\nid='b'\nversion='2'\nrole='primary'\nsource_url=''\nsource_sha256=''\n";
         assert!(Manifest::parse(text).is_err());
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    /// Every pinned file in the checked-in manifest must match its hash:
+    /// editing a vendored file without re-pinning is a failure, not a drift.
+    #[test]
+    fn checked_in_pins_match_the_files() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (m, _) = Manifest::load(root).unwrap();
+        assert!(m.suites.len() >= 4);
+        for s in m.suites.iter().chain([&m.json_suite]) {
+            Manifest::read_pinned(root, s).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_changed_file_is_refused() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let s = Suite {
+            id: "x".into(),
+            path: "comparison/jq/manifest.toml".into(),
+            sha256: "0".repeat(64),
+        };
+        assert!(Manifest::read_pinned(root, &s).is_err());
     }
 }

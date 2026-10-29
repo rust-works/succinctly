@@ -121,3 +121,18 @@ id = "cli:files-missing-continues"
 category = "to-triage"
 reason = "jq reads the remaining files after one cannot be opened (and exits 2); succinctly stops at the first missing file."
 issue = "#5472"
+
+[[divergence]]
+id = "upstream-jq.test:113"
+category = "to-triage"
+reason = "`{(0):1}`: jq rejects a constant non-string object key at compile time (exit 3); succinctly fails when the program runs (exit 5)."
+
+[[divergence]]
+id = "upstream-jq.test:117"
+category = "to-triage"
+reason = "`{non_const:., (0):1}`: same compile-time rejection of a constant non-string key as upstream-jq.test:113."
+
+[[divergence]]
+id = "upstream-onig.test:102"
+category = "to-triage"
+reason = "`gsub(\"(?=u)\"; \"u\")`: regex lookahead is refused as an invalid regex (Rust `regex` has no lookaround); jq's oniguruma supports it."

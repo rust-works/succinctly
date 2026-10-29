@@ -20,8 +20,10 @@ reported as a correctness row and gets no timing; the command exits 1 on it.
 | `probes/cli.tsv`      | G: `id`, area, args (JSON array), stdin (JSON string)    |
 | `probes/extensions.tsv` | succinctly-only surface the reference must reject      |
 | `fixtures/`           | working directory of the CLI probes (`-f`, `-L`, ...)    |
+| `vendor/jq-1.7.1/`    | B: jq's own test files (MIT), sha256-pinned in the manifest |
 | `divergences.toml`    | ledger of known differences; the run fails on drift      |
 
 Dimension A probes every builtin in the reference's own `builtins` (plus those new in jq 1.8.1, against 1.8.1);
 `--write-summary` regenerates `docs/compare/jq-coverage.json` and the figures in `docs/reference/jq-language.md`.
-Dimensions B–F and H are listed in the report as not implemented, by phase.
+Dimension B runs the vendored upstream test files through both tools; C runs JSONTestSuite against the reference, `succinctly jq` and `--validate`.
+Dimensions D–F and H are listed in the report as not implemented, by phase.

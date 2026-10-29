@@ -41,3 +41,31 @@ cli = "comparison/jq/probes/cli.tsv"
 extensions = "comparison/jq/probes/extensions.tsv"
 fixtures = "comparison/jq/fixtures"
 divergences = "comparison/jq/divergences.toml"
+
+# Upstream test files, vendored from the jq 1.7.1 source tarball (MIT; see
+# vendor/jq-1.7.1/COPYING) and run as a differential (dimension B).
+[[suite]]
+id = "upstream-jq.test"
+path = "comparison/jq/vendor/jq-1.7.1/jq.test"
+sha256 = "35aade216e95e78e63e77011fb4588856a5d04d6ac7be572ad382a3430d8b4d5"
+
+[[suite]]
+id = "upstream-onig.test"
+path = "comparison/jq/vendor/jq-1.7.1/onig.test"
+sha256 = "af6f33f8903efae6d15d97ca94017cb439a7fdda51506618bd85100b17a72444"
+
+[[suite]]
+id = "upstream-man.test"
+path = "comparison/jq/vendor/jq-1.7.1/man.test"
+sha256 = "1d0c31386e6d431807ba1e0a2127c8e30705732355eafe8b794a70d1619d4f88"
+
+[[suite]]
+id = "upstream-optional.test"
+path = "comparison/jq/vendor/jq-1.7.1/optional.test"
+sha256 = "994c3be50823da63c7908a6e1c000a2f63a521bcb639a6423cfb1359e180e465"
+
+# Dimension C: JSONTestSuite (y_/n_/i_), the file the golden tests use.
+[json_suite]
+id = "json-test-suite"
+path = "tests/data/json-test-suite-1ef36fa.json"
+sha256 = "e938a45b6fe3fa7913207bc4de389f52f5641de1f6f50746b4260dbeb1291050"

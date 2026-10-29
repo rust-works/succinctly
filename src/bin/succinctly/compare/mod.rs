@@ -16,9 +16,11 @@ mod env;
 mod exec;
 mod features;
 mod harness;
+mod jsonconf;
 mod ledger;
 mod manifest;
 mod report;
+mod suites;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
@@ -38,6 +40,10 @@ pub enum Dimension {
     Features,
     /// G: CLI flags and the succinctly-only surface
     Cli,
+    /// B: the upstream jq test files, differentially
+    Differential,
+    /// C: JSON input conformance (JSONTestSuite)
+    Input,
 }
 
 #[derive(Debug, Parser)]
@@ -98,19 +104,15 @@ pub struct Results {
     pub cli: Vec<cli::CliRow>,
     /// Succinctly-only surface, not counted as coverage.
     pub extensions: Vec<cli::CliRow>,
+    /// B, one summary per vendored upstream file.
+    pub differential: Vec<suites::SuiteSummary>,
+    /// C.
+    pub input: Option<jsonconf::InputSummary>,
     pub known_divergences: Vec<ledger::Entry>,
     pub ledger: ledger::Outcome,
 }
 
 const PENDING: &[(&str, &str)] = &[
-    (
-        "B. Behavioural correctness (differential)",
-        "not implemented (phase 3)",
-    ),
-    (
-        "C. Input handling & validation",
-        "not implemented (phase 3)",
-    ),
     ("D. Performance", "not implemented (phase 4)"),
     ("E. Memory", "not implemented (phase 4)"),
     ("F. Robustness", "not implemented (phase 5)"),
@@ -251,10 +253,10 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
     let ledger_path = root.join(&manifest.probes.divergences);
     let known = ledger::load(&ledger_path)?;
     let mut observed = BTreeSet::new();
-    let mut suites: Vec<&str> = vec![];
+    let mut run_suites: Vec<String> = vec![];
     let (mut feats, mut since, mut secondary_note) = (None, None, None);
     if want(Dimension::Features) {
-        suites.push("features");
+        run_suites.push("features".into());
         let sum = features::run(&reference, &primary.id, &subject, None, &fixtures)?;
         for r in &sum.rows {
             if matches!(
@@ -274,7 +276,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
                     .filter(|b| !before.contains(b))
                     .collect();
                 let s = features::run(&sec, &sec.name, &subject, Some(&added), &fixtures)?;
-                suites.push("since-secondary");
+                run_suites.push("since-secondary".into());
                 for r in &s.rows {
                     if matches!(
                         r.status,
@@ -296,7 +298,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
     }
     let (mut cli_rows, mut ext_rows) = (vec![], vec![]);
     if want(Dimension::Cli) {
-        suites.extend(["cli", "extensions"]);
+        run_suites.extend(["cli".into(), "extensions".into()]);
         let read = |p: &str| std::fs::read_to_string(root.join(p)).with_context(|| p.to_string());
         cli_rows = cli::run(
             &reference,
@@ -341,7 +343,44 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
             features::patch_doc(&std::fs::read_to_string(&doc)?, &cov)?,
         )?;
     }
-    let ledger_outcome = ledger::check(&known, &observed, &suites);
+    let mut differential = vec![];
+    if want(Dimension::Differential) {
+        for suite in &manifest.suites {
+            run_suites.push(suite.id.clone());
+            let text = Manifest::read_pinned(&root, suite)?;
+            let sum = suites::run(&suite.id, &text, &reference, &subject, &fixtures)?;
+            for row in sum.differing() {
+                observed.insert(row.id.clone());
+            }
+            differential.push(sum);
+        }
+        dimensions.push(DimensionStatus {
+            name: "B. Behavioural correctness (differential)",
+            status: "implemented (upstream test files; grammar fuzzing and the sweep scripts are not yet folded in)",
+        });
+    }
+    let mut input = None;
+    if want(Dimension::Input) {
+        run_suites.push("json-validate".into());
+        run_suites.push("json-output".into());
+        let text = Manifest::read_pinned(&root, &manifest.json_suite)?;
+        let sum = jsonconf::run(&text, &reference, &subject, &fixtures)?;
+        for r in &sum.rows {
+            if (r.expect == 'y' && !r.validate_accepts) || (r.expect == 'n' && r.validate_accepts) {
+                observed.insert(format!("json-validate:{}", r.id));
+            }
+            if r.output_differs {
+                observed.insert(format!("json-output:{}", r.id));
+            }
+        }
+        input = Some(sum);
+        dimensions.push(DimensionStatus {
+            name: "C. Input handling & validation",
+            status:
+                "implemented (JSONTestSuite; BOM, NUL, depth and stream shapes are probed under G)",
+        });
+    }
+    let ledger_outcome = ledger::check(&known, &observed, &run_suites);
     for (name, status) in PENDING {
         dimensions.push(DimensionStatus { name, status });
     }
@@ -377,6 +416,8 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         secondary_note,
         cli: cli_rows,
         extensions: ext_rows,
+        differential,
+        input,
         known_divergences: known,
         ledger: ledger_outcome,
     };
