@@ -11666,7 +11666,7 @@ fn test_object_construction_fanout_and_key_2416() -> Result<()> {
         out.trim(),
         "{\"k\":\"b\",\"v\":[1,2]}\n{\"k\":\"c\",\"v\":\"x\"}"
     );
-    let (out, _, code) = run_jq_full(&["-c", ".a | {(1): key}"], Some(r#"{"a":1}"#))?;
+    let (out, _, code) = run_jq_full(&["-c", ".a | {(.): 0}"], Some(r#"{"a":1}"#))?;
     assert_eq!(code, 5, "a non-string key errors: {out:?}");
     Ok(())
 }
@@ -114541,7 +114541,7 @@ fn test_object_holding_unreadable_node_is_validated_where_read_4044() -> Result<
         ("{a: .n[0]}", "", 5),
         ("{a: .ok, b: .n.x}", "", 5),
         ("[{a: .n[0]}?]", "[]\n", 0),
-        ("[{(1): 2}?]", "[]\n", 0),
+        ("[{(.n): 2}?]", "[]\n", 0),
         ("select({a: .bad})", "", 5),
         ("{a: .bad} // 1", "", 5),
         ("[{a: .bad}]", "", 5),
