@@ -114896,6 +114896,13 @@ mod tests {
         whole("$u.score.x", &record);
         whole("$u.score", &OwnedValue::Int(3));
         whole("$u.score", &OwnedValue::Null);
+        // An object that repeats a key (yq, ADR-0027) is not read through its collapsed view.
+        let mut repeated = ObjectMap::new();
+        repeated.push_occurrence("score".to_string(), OwnedValue::Int(1));
+        repeated.push_occurrence("score".to_string(), OwnedValue::Int(2));
+        let repeated = OwnedValue::Object(repeated);
+        assert!(matches!(&repeated, OwnedValue::Object(o) if o.has_shadows()));
+        whole("$u.score", &repeated);
         // A different variable is not touched.
         assert_eq!(
             substitute_var(&parse("$v.score").unwrap(), "u", &record),

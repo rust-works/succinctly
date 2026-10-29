@@ -109,3 +109,26 @@ fn test_a_field_read_in_path_position_still_names_the_object_5499() -> Result<()
     );
     Ok(())
 }
+
+#[test]
+#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
+fn test_a_fold_reading_its_variable_in_path_position_still_names_the_object_5499() -> Result<()> {
+    // The splice is for a fold whose variable is read as a value. A path read keeps the object.
+    let want =
+        "\"Invalid path expression near attempt to access element \\\"a\\\" of {\\\"a\\\":1}\"\n";
+    assert_eq!(
+        jq(
+            "reduce .[] as $u (0; try ($u.a = 3) catch .)",
+            r#"[{"a":1}]"#
+        )?,
+        (want.to_string(), 0)
+    );
+    assert_eq!(
+        jq(
+            "[foreach .[] as $u (0; try ($u.a = 3) catch .)] | .[0]",
+            r#"[{"a":1}]"#
+        )?,
+        (want.to_string(), 0)
+    );
+    Ok(())
+}
