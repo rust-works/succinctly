@@ -20029,9 +20029,10 @@ fn eval_yq_context_pipe<S: EvalSemantics, V: DocumentValue>(
         // otherwise build for itself. A slice nothing owns also copies the rest
         // of the pipe per stage per entry (#5462: quadratic in the stages after
         // a union), so a list of several entries gets a pipe to own the stages,
-        // which keeps those copies once (#5404). One entry runs them once:
-        // nothing to share.
-        let owner = (inputs.len() > 1).then(|| PipeStages::from(stages.to_vec()));
+        // which keeps those copies once (#5404). One entry runs them once, and
+        // a rest of fewer than two stages has no tail to keep: nothing to share.
+        let owner =
+            (inputs.len() > 1 && stages.len() > 1).then(|| PipeStages::from(stages.to_vec()));
         let mut rest = RestPipe::of_tail(match &owner {
             Some(owner) => RestTail::whole(owner),
             None => RestTail::unowned(stages),
@@ -58390,6 +58391,43 @@ mod tests {
                 "{stages} stages: forty entries copy {} more than four do",
                 many - settled
             );
+        }
+    }
+
+    /// #5462: the branches of the shared-rest route that treat a list differently
+    /// -- one entry, a rest of one stage, a rest holding a `def` call or a
+    /// `reduce`, and a second union downstream -- answer branch-major, as they
+    /// did when every entry ran with a rest of its own. Each row is the pipe over
+    /// `[1, 2, 3]` read by `.[]` and was captured from the build before the change.
+    #[cfg(feature = "std")]
+    #[test]
+    fn stages_after_a_union_answer_the_same_for_every_rest_shape_5462() {
+        let rows: &[(&str, &[i64])] = &[
+            // One entry: the rest runs once with nothing to share.
+            ("[1] | .[] | (., 10) | . + 1 | . + 2", &[4, 13]),
+            // A rest of one stage over several entries.
+            (".[] | (., 10) | . + 1", &[2, 3, 4, 11, 11, 11]),
+            // A rest holding a `def` call, which keeps state between calls.
+            (
+                "def f: . + 1; .[] | (., 10) | f | f | . + 1",
+                &[4, 5, 6, 13, 13, 13],
+            ),
+            // A rest holding a `reduce`.
+            (
+                ".[] | (., 10) | reduce range(3) as $i (.; . + $i) | . + 1 | . + 1",
+                &[6, 7, 8, 15, 15, 15],
+            ),
+            // A second union downstream of the first.
+            (
+                ".[] | (., 10) | . + 1 | (., 100) | . + 1 | . + 1",
+                &[4, 5, 6, 13, 13, 13, 102, 102, 102, 102, 102, 102],
+            ),
+        ];
+        for (program, want) in rows {
+            let (out, control) = drive_each_sink::<YqSemantics>(b"[1,2,3]", program);
+            assert!(control.is_none(), "{program}: {control:?}");
+            let want: Vec<OwnedValue> = want.iter().copied().map(OwnedValue::Int).collect();
+            assert_eq!(out, want, "{program}");
         }
     }
 
