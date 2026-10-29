@@ -32,4 +32,16 @@ Dimensions D and E time every query on the pinned generated inputs (`[[input]]`,
 and checked against their sha256) against jq 1.7.1 and 1.8.1, interleaved, gated on output identity; `--control` times jq
 against itself to show the noise floor, and `--full` adds the 10 MB and 100 MB tiers.
 Dimension F runs 85 resource-limit probes under a 10 s deadline and classes each outcome (ok, error, crash, timeout).
-Dimension H is listed in the report as not implemented, by phase.
+
+Dimension H reports binary size, dynamic libraries, the Rust dependency count, whether either tool uses more than one
+core, and licence / `no_std` / CI-runner facts read from the repository; build time is not measured.
+
+```bash
+# Re-run the deterministic dimensions and spot-check 5 timing rows against a recorded run (exit 1 on any difference)
+./target/release/succinctly dev compare jq --verify docs/compare/jq-<platform>.json
+# Regenerate the committed report from a complete, valid run on a clean checkout (refused otherwise)
+./target/release/succinctly dev compare jq --quick --write-docs
+```
+
+`--write-docs` writes `docs/compare/jq-<platform>.{md,json}` and the index `docs/compare/jq.md`. CI is
+`.github/workflows/compare-jq.yml`, run by hand or on a release, not on pull requests.

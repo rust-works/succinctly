@@ -12,6 +12,7 @@
 //! checked against the `divergences.toml` ledger.
 
 mod cli;
+mod docs;
 mod env;
 mod exec;
 mod features;
@@ -19,10 +20,12 @@ mod harness;
 mod jsonconf;
 mod ledger;
 mod manifest;
+mod operational;
 mod perf;
 mod report;
 mod robust;
 mod suites;
+mod verify;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
@@ -50,6 +53,8 @@ pub enum Dimension {
     Performance,
     /// F: deep nesting, runaway generators, huge values, SIGPIPE
     Robustness,
+    /// H: binary size, libraries, dependencies, parallelism, licences
+    Operational,
 }
 
 #[derive(Debug, Parser)]
@@ -78,6 +83,20 @@ pub struct CompareJqArgs {
     /// Performance: run only the queries whose id contains this text
     #[arg(long)]
     query: Option<String>,
+
+    /// Re-run the deterministic dimensions and spot-check timing rows against a
+    /// recorded results.json; exit 1 on any difference
+    #[arg(long)]
+    verify: Option<PathBuf>,
+
+    /// Timing rows --verify re-measures
+    #[arg(long, default_value_t = 5)]
+    spot: usize,
+
+    /// Write docs/compare/jq-<platform>.{md,json} and the index docs/compare/jq.md
+    /// (refused unless the run is complete and valid)
+    #[arg(long)]
+    write_docs: bool,
 
     /// Time jq against itself instead of succinctly: the harness's own noise floor
     #[arg(long)]
@@ -127,11 +146,11 @@ pub struct Results {
     pub perf_note: Option<String>,
     /// F.
     pub robust: Vec<robust::Row>,
+    /// H.
+    pub operational: Option<operational::Operational>,
     pub known_divergences: Vec<ledger::Entry>,
     pub ledger: ledger::Outcome,
 }
-
-const PENDING: &[(&str, &str)] = &[("H. Platform & operational", "not implemented (phase 6)")];
 
 fn build_reference(root: &std::path::Path, version: &str) -> Result<()> {
     let status = Command::new(root.join("scripts/compare-jq-build.sh"))
@@ -250,7 +269,16 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         prefix: vec!["jq".into()],
     };
 
-    let want = |d: Dimension| args.dimension.is_empty() || args.dimension.contains(&d);
+    let verifying = args.verify.is_some() && args.dimension.is_empty();
+    let want = |d: Dimension| {
+        if verifying {
+            return !matches!(
+                d,
+                Dimension::Smoke | Dimension::Performance | Dimension::Operational
+            );
+        }
+        args.dimension.is_empty() || args.dimension.contains(&d)
+    };
     let mut dimensions = vec![];
     let mut smoke = vec![];
     if want(Dimension::Smoke) {
@@ -263,7 +291,10 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
             status: "implemented",
         });
     }
-    let secondary = if want(Dimension::Features) || want(Dimension::Performance) {
+    let secondary = if want(Dimension::Features)
+        || want(Dimension::Performance)
+        || want(Dimension::Operational)
+    {
         secondary_tool(&root, &manifest, args.build_jq)
     } else {
         Err("not needed".into())
@@ -473,10 +504,26 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
             status: "implemented (spawn timings and peak RSS on generated shapes; real-world corpus files, cachegrind and the memory-limit probes are not yet included)",
         });
     }
-    let ledger_outcome = ledger::check(&known, &observed, &run_suites);
-    for (name, status) in PENDING {
-        dimensions.push(DimensionStatus { name, status });
+    let mut operational_info = None;
+    if want(Dimension::Operational) {
+        let mut tools = vec![subject.clone(), reference.clone()];
+        if let Ok(sec) = &secondary {
+            tools.push(sec.clone());
+        }
+        operational_info = Some(operational::collect(
+            &root,
+            &tools,
+            &manifest.succinctly.features,
+            &std::env::current_exe()?,
+            &manifest.inputs,
+            &root.join("data/compare/inputs"),
+        )?);
+        dimensions.push(DimensionStatus {
+            name: "H. Platform & operational",
+            status: "implemented (sizes, libraries, dependencies, parallelism, licences; build time is not measured)",
+        });
     }
+    let ledger_outcome = ledger::check(&known, &observed, &run_suites);
 
     let run_id = {
         let t = chrono::Utc::now().format("%Y%m%d_%H%M%S");
@@ -513,6 +560,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         differential,
         input,
         robust: robust_rows,
+        operational: operational_info,
         perf: perf_rows,
         perf_note,
         known_divergences: known,
@@ -528,6 +576,30 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
     )?;
     std::fs::write(out_dir.join("report.md"), report::render(&results))?;
     println!("wrote {}", out_dir.display());
+    if args.write_docs {
+        write_docs(&root, &results, &args)?;
+    }
+    let mut verify_failures = vec![];
+    if let Some(path) = &args.verify {
+        verify_failures = run_verify(
+            path,
+            &results,
+            &VerifyCtx {
+                root: &root,
+                manifest: &manifest,
+                reference: &reference,
+                subject: &subject,
+                secondary: &secondary,
+            },
+            args.spot,
+        )?;
+        for f in &verify_failures {
+            eprintln!("verify: {f}");
+        }
+        if verify_failures.is_empty() {
+            println!("verify: recorded results reproduced");
+        }
+    }
 
     let differing: Vec<&str> = results
         .smoke
@@ -547,6 +619,120 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         }
     }
     Ok(i32::from(
-        !differing.is_empty() || !results.ledger.is_clean(),
+        !differing.is_empty() || !results.ledger.is_clean() || !verify_failures.is_empty(),
     ))
+}
+
+struct VerifyCtx<'a> {
+    root: &'a std::path::Path,
+    manifest: &'a Manifest,
+    reference: &'a Tool,
+    subject: &'a Tool,
+    secondary: &'a std::result::Result<Tool, String>,
+}
+
+/// Differences between a recorded run and this one: the deterministic sections
+/// must be identical, and `spot` timing rows must land within their tolerance.
+fn run_verify(
+    path: &std::path::Path,
+    fresh: &Results,
+    ctx: &VerifyCtx,
+    spot: usize,
+) -> Result<Vec<String>> {
+    let old: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?,
+    )?;
+    if old["schema_version"] != SCHEMA_VERSION {
+        bail!(
+            "{} has schema_version {}, this build writes {SCHEMA_VERSION}",
+            path.display(),
+            old["schema_version"]
+        );
+    }
+    let new = serde_json::to_value(fresh)?;
+    let mut failures = verify::diff(&verify::fingerprint(&old), &verify::fingerprint(&new));
+    let queries = perf::parse_queries(&std::fs::read_to_string(
+        ctx.root.join(&ctx.manifest.perf.queries),
+    )?)?;
+    let inputs_dir = ctx.root.join("data/compare/inputs");
+    let generator = std::env::current_exe()?;
+    let mut tools = vec![ctx.subject.clone(), ctx.reference.clone()];
+    if let Ok(sec) = ctx.secondary {
+        tools.push(sec.clone());
+    }
+    let recorded: Vec<&serde_json::Value> = old["perf"]
+        .as_array()
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    for (query, input) in verify::spot_rows(&old, spot) {
+        let Some(q) = queries.iter().find(|q| q.id == query) else {
+            failures.push(format!(
+                "perf:{query}@{input} names a query this checkout does not have"
+            ));
+            continue;
+        };
+        let spec = ctx.manifest.inputs.iter().find(|i| i.id == input);
+        if let Some(spec) = spec {
+            perf::ensure_input(&generator, &inputs_dir, spec)?;
+        }
+        let row = perf::run_row(&tools, q, spec, &inputs_dir, 5)?;
+        let now = serde_json::to_value(&row)?;
+        let was = recorded
+            .iter()
+            .find(|r| r["query"] == query && r["input"] == input);
+        let (Some(was), Some(n)) = (was, now["speedup_primary"].as_f64()) else {
+            failures.push(format!("perf:{query}@{input} produced no timing"));
+            continue;
+        };
+        let o = was["speedup_primary"].as_f64().unwrap_or(f64::NAN);
+        if !verify::timing_agrees(o, n, verify::max_cv(was), verify::max_cv(&now)) {
+            failures.push(format!(
+                "perf:{query}@{input} speedup was {o:.2}x, now {n:.2}x"
+            ));
+        }
+    }
+    Ok(failures)
+}
+
+fn write_docs(root: &std::path::Path, results: &Results, args: &CompareJqArgs) -> Result<()> {
+    if !results.env.invalid_reasons.is_empty() {
+        bail!(
+            "--write-docs refused: this run is invalid ({})",
+            results.env.invalid_reasons.join("; ")
+        );
+    }
+    if !args.dimension.is_empty() || args.control || args.query.is_some() || args.verify.is_some() {
+        bail!("--write-docs needs a complete run: no --dimension, --query, --control or --verify");
+    }
+    let dir = root.join("docs/compare");
+    std::fs::create_dir_all(&dir)?;
+    let p = docs::PLATFORM;
+    std::fs::write(
+        dir.join(format!("jq-{p}.md")),
+        format!("{}{}", docs::HEADER, report::render(results)),
+    )?;
+    std::fs::write(
+        dir.join(format!("jq-{p}.json")),
+        serde_json::to_string_pretty(results)? + "\n",
+    )?;
+    let mut rows = vec![];
+    for e in std::fs::read_dir(&dir)?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if let Some(plat) = name
+            .strip_prefix("jq-")
+            .and_then(|n| n.strip_suffix(".json"))
+        {
+            if plat == "coverage" {
+                continue;
+            }
+            rows.push((
+                plat.to_string(),
+                serde_json::from_str(&std::fs::read_to_string(e.path())?)?,
+            ));
+        }
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    std::fs::write(dir.join("jq.md"), docs::index(&rows))?;
+    println!("wrote docs/compare/jq-{p}.md, jq-{p}.json and jq.md");
+    Ok(())
 }

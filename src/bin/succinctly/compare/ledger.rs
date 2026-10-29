@@ -27,6 +27,9 @@ pub struct Entry {
     pub reason: String,
     /// Tracking issue, e.g. `#5409`, once one exists.
     pub issue: Option<String>,
+    /// `std::env::consts::OS` this entry was observed on (`macos`, `linux`); an
+    /// entry for another OS is neither expected nor called stale here.
+    pub platform: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -85,6 +88,11 @@ pub fn check<S: AsRef<str>>(
     };
     let listed: BTreeSet<&str> = entries
         .iter()
+        .filter(|e| {
+            e.platform
+                .as_deref()
+                .map_or(true, |p| p == std::env::consts::OS)
+        })
         .map(|e| e.id.as_str())
         .filter(|id| in_run(id))
         .collect();
@@ -112,6 +120,7 @@ mod tests {
             category: "to-triage".into(),
             reason: "r".into(),
             issue: None,
+            platform: None,
         }
     }
 
@@ -128,6 +137,17 @@ mod tests {
             (vec!["cli:c".into()], vec!["cli:a".into()])
         );
         assert!(check(&e, &set(&["cli:a", "cli:b"]), &["cli"]).is_clean());
+    }
+
+    #[test]
+    fn an_entry_for_another_os_is_not_stale_here() {
+        let mut other = entry("cli:a");
+        other.platform = Some("not-this-os".into());
+        let mut here = entry("cli:b");
+        here.platform = Some(std::env::consts::OS.into());
+        assert!(check(&[other.clone(), here.clone()], &set(&["cli:b"]), &["cli"]).is_clean());
+        let o = check(&[here], &set(&[]), &["cli"]);
+        assert_eq!(o.stale, ["cli:b"]);
     }
 
     #[test]

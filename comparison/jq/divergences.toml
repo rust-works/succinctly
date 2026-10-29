@@ -2,6 +2,7 @@
 # difference not listed here and on a listed one that no longer differs.
 #
 # id        <suite>:<probe>: features:name/arity, since-secondary:name/arity, cli:id, extensions:id
+# platform  optional std::env::consts::OS the entry was observed on; other OSes neither expect nor call it stale
 # category  by-design | host-dependent | newer-than-primary | reference-crash | reference-slow | to-triage
 #           (to-triage: a real difference nobody has yet classified against ADR-0018 or filed)
 
@@ -14,16 +15,19 @@ reason = "Prints the directory of the running binary, so the two tools differ by
 id = "features:strftime/1"
 category = "reference-crash"
 reason = "jq 1.7.1 aborts (`Assertion failed: JVP_HAS_KIND(j, JV_KIND_STRING)`, jv.c:1370) on a non-string format; succinctly reports a catchable error."
+platform = "macos"
 
 [[divergence]]
 id = "features:strflocaltime/1"
 category = "reference-crash"
 reason = "Same jq 1.7.1 assertion abort on a non-string format as strftime/1."
+platform = "macos"
 
 [[divergence]]
 id = "features:strptime/1"
 category = "host-dependent"
 reason = "On `\"a\" | strptime(.)` the weekday of 1900-00-00 is 6 in jq 1.7.1 (libc) and 0 in succinctly; the value is platform-libc dependent (#5340)."
+platform = "macos"
 
 [[divergence]]
 id = "since-secondary:add/1"

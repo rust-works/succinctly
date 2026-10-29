@@ -244,6 +244,7 @@ pub fn render(results: &Results) -> String {
     differential_section(&mut s, r);
     input_section(&mut s, r);
     robust_section(&mut s, r);
+    operational_section(&mut s, r);
     perf_sections(&mut s, r);
 
     let _ = writeln!(s, "\n## Reproduce\n");
@@ -605,5 +606,45 @@ fn robust_section(s: &mut String, r: &Results) {
             cls(x.subject, x.subject_exit, x.subject_ms),
             note_for(r, &format!("robust:{}", x.id))
         );
+    }
+}
+
+fn operational_section(s: &mut String, r: &Results) {
+    let Some(o) = &r.operational else { return };
+    let _ = writeln!(s, "\n## H. Platform and operational properties\n");
+    let _ = writeln!(
+        s,
+        "| Tool | Binary size | Dynamic libraries | CPU time ÷ wall time (`.` on 10 MB) |"
+    );
+    let _ = writeln!(
+        s,
+        "|------|-------------|-------------------|--------------------------------------|"
+    );
+    for b in &o.binaries {
+        let par = o
+            .parallelism
+            .iter()
+            .find(|p| p.tool == b.tool)
+            .and_then(|p| p.cpu_over_wall)
+            .map_or_else(|| "n/a".into(), |v| format!("{v:.2}"));
+        let _ = writeln!(
+            s,
+            "| {} | {:.1} MiB | {} | {par} |",
+            b.tool,
+            b.bytes as f64 / 1_048_576.0,
+            b.dynamic_libs.len()
+        );
+    }
+    let _ = writeln!(
+        s,
+        "\nA ratio near 1.00 means one thread. Rust dependencies of the shipped feature set \
+         (`cargo tree -e normal`): {}. Build time is not measured.\n",
+        o.rust_dependencies
+            .map_or_else(|| "n/a".into(), |n| n.to_string())
+    );
+    let _ = writeln!(s, "| Property | Value | Source |");
+    let _ = writeln!(s, "|----------|-------|--------|");
+    for f in &o.facts {
+        let _ = writeln!(s, "| {} | {} | `{}` |", f.item, f.value, f.source);
     }
 }

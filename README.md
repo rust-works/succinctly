@@ -234,6 +234,7 @@ Comparison of `succinctly jq .` vs `jq .` for formatting/printing JSON files.
 † Popcount speedup is measured against a *baseline* build, where `count_ones()` lowers to scalar broadword. Compiled with `-C target-cpu=native`, `count_ones()` auto-vectorizes to VPOPCNTDQ and the explicit path drops to ≈1× (parity); the ~5–9× win holds only for baseline/portable builds. Full measured data: [Popcount Strategies](docs/optimizations/simd.md#popcount-strategies-explicit-simd-vs-auto-vectorized-count_ones) (#45).
 
 See [docs/benchmarks/rust-parsers.md](docs/benchmarks/rust-parsers.md), [docs/benchmarks/jq.md](docs/benchmarks/jq.md), and [docs/optimizations/history.md](docs/optimizations/history.md) for detailed benchmarks.
+For a generated, reproducible comparison of `succinctly jq` with jq 1.7.1 and 1.8.1 (features, correctness, performance, memory, robustness), see [docs/compare/jq.md](docs/compare/jq.md).
 
 ## Feature Flags
 
