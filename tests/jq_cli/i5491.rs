@@ -51,3 +51,17 @@ fn test_stream_events_read_with_inputs_agree_with_the_lazy_route_5491() -> Resul
     );
     Ok(())
 }
+
+#[test]
+fn test_seq_slurp_with_an_overflowing_exponent_prints_lowercase_e_5491() -> Result<()> {
+    // `--seq` frames each value with an RS byte (0x1e), and so does its output.
+    assert_eq!(
+        run_jq_stdin(
+            ".",
+            "\x1e[1e9999999999,-1e9999999999]\n",
+            &["--seq", "-s", "-c"]
+        )?,
+        (format!("\x1e[[{MAX},-{MAX}]]\n"), 0)
+    );
+    Ok(())
+}
