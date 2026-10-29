@@ -64,3 +64,22 @@ fn test_flow_scalars_without_a_flow_indicator_are_echoed_5467() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn test_flow_scalar_quoting_with_compact_output_and_aliases_5467() -> Result<()> {
+    // `-I=0` writes every collection in flow; an alias to a plain `x:y` is written as the alias.
+    for (input, args, want) in [
+        ("a: [x:y, q]\n", vec!["-I=0"], "a: ['x:y', q]\n"),
+        ("[x:y]\n", vec!["-I=0"], "['x:y']\n"),
+        ("b: &a x:y\ne: [*a, p]\n", vec![], "b: &a x:y\ne: [*a, p]\n"),
+        (
+            "b: &a x:y\ne: [*a, p]\n",
+            vec!["-I=0"],
+            "b: &a x:y\ne: [*a, p]\n",
+        ),
+    ] {
+        let (out, code) = run_yq_stdin(".", input, &args)?;
+        assert_eq!((out.as_str(), code), (want, 0), "input {input:?} {args:?}");
+    }
+    Ok(())
+}
