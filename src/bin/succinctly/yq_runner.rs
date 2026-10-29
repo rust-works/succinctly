@@ -9535,6 +9535,13 @@ fn spelling_names_value(spelling: &str, value: &OwnedValue) -> bool {
         // A spelled integer is a literal (#2802); a bare `Int` is a computed one, which yq
         // prints canonically wherever it lands (`.a = (.f + 0)` over `a: 0x1f` is `a: 31`).
         (ResolvedScalar::Int(a), OwnedValue::NumberLiteral(NumberRepr::Int(b), _)) => a == *b,
+        // Likewise a spelled float (`+2.0`, `.5`, #1356): the bare `Float` at its position is a
+        // computed one (`map_values(. + 0)` over `a: +2.0` is `a: !!float 2`).
+        (ResolvedScalar::Float(_), OwnedValue::Float(_))
+            if succinctly::yaml::is_spelled_float(spelling) =>
+        {
+            false
+        }
         (
             ResolvedScalar::Float(a),
             OwnedValue::Float(b) | OwnedValue::NumberLiteral(NumberRepr::Float(b), _),

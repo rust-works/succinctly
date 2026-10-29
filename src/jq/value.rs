@@ -4297,6 +4297,19 @@ impl OwnedValue {
             {
                 out.push_str(&crate::json::validate::spelling_token(literal));
             }
+            // #1356: and a spelled float (`+2.0`, `2.`, `1.e5`, `+1e5`). In jq's number model the
+            // reader keeps a lenient `.5` or `007.5` itself, but peels a `+` and completes a
+            // trailing dot, so those two cross as the token.
+            Self::NumberLiteral(NumberRepr::Float(_), literal)
+                if crate::yaml::is_spelled_float(literal)
+                    && (S::TAG == EvalTag::Yq
+                        || literal.starts_with('+')
+                        || literal.ends_with('.')
+                        || literal.contains(".e")
+                        || literal.contains(".E")) =>
+            {
+                out.push_str(&crate::json::validate::spelling_token(literal));
+            }
             // The bridge must keep the source literal at every length.
             Self::NumberLiteral(_, literal) => out.push_str(literal),
             Self::Array(arr) => {

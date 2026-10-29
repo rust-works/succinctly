@@ -3209,8 +3209,14 @@ impl<'a> JsonNumber<'a> {
         let s = core::str::from_utf8(bytes).map_err(|_| JsonError::InvalidUtf8)?;
         s.parse().or_else(|_| {
             self.bridge_value()
-                // #2802: the number a spelled integer names.
+                // #2802: the number a spelled integer names; #1356: or a spelled float.
                 .or_else(|| self.bridge_spelled_int().map(|n| n as f64))
+                .or_else(|| {
+                    let spelling = self.bridge_spelling()?;
+                    crate::yaml::is_spelled_float(&spelling)
+                        .then(|| spelling.parse::<f64>().ok())
+                        .flatten()
+                })
                 .or_else(|| crate::json::validate::jq_special_number(bytes))
                 .ok_or(JsonError::InvalidNumber)
         })
@@ -10124,13 +10130,19 @@ mod tests {
             assert_eq!(n.bridge_nonfinite(), None, "{token}");
             assert_eq!(n.bridge_nonfinite_literal(), None, "{token}");
             assert_eq!(n.token_address(), None, "{token}");
-            // The number a spelled integer names, and nothing for a spelling that is no number.
+            // The number a spelled integer or float names, and nothing for a spelling that is no
+            // number (#2802, #1356).
             let named = match crate::yaml::resolve_plain(spelling) {
                 crate::yaml::ResolvedScalar::Int(i) => Some(i),
                 _ => None,
             };
+            let named_float = match spelling {
+                "+2.0" => Some(2.0),
+                ".5" => Some(0.5),
+                _ => named.map(|i| i as f64),
+            };
             assert_eq!(n.as_i64().ok(), named, "{token}");
-            assert_eq!(n.as_f64().ok(), named.map(|i| i as f64), "{token}");
+            assert_eq!(n.as_f64().ok(), named_float, "{token}");
             let number: StandardJson<'_, Vec<u64>> = StandardJson::Number(n);
             assert_eq!(
                 number.number_literal().as_deref(),

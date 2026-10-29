@@ -319,3 +319,138 @@ fn test_a_nested_tonumber_integer_is_tagged_when_yq_would_read_a_string_1356() -
     }
     Ok(())
 }
+
+/// #1356 (float spellings): a float written other than as JSON number syntax (`+2.0`, `2.`, `.5`,
+/// `1.e5`, `+1e5`, `007.5`) keeps its text through `tostring`, interpolation, `join`, YAML output
+/// and the node `sort`/`max`/`unique` return, while yq's JSON encoder writes `FormatFloat` of it
+/// (`2.0`, `0.5`, `100000.0`). Captured from yq v4.53.3 over one document.
+const FLOAT_DOC: &str = "a: +2.0\nb: 2.\nc: .5\nd: 1.e5\ne: -.5\nf: 007.5\ng: +1e5\nh: 2\n";
+
+const FLOAT_ROWS: &[(&str, &str, &str)] = &[
+    (".a | tostring", "+2.0\n", "\"+2.0\"\n"),
+    ("[.a] | .[0] | tostring", "+2.0\n", "\"+2.0\"\n"),
+    ("[.a, .b, .c, .d, .e, .f, .g] | map(tostring)", "- \"+2.0\"\n- \"2.\"\n- \".5\"\n- \"1.e5\"\n- \"-.5\"\n- \"007.5\"\n- \"+1e5\"\n", "[\"+2.0\",\"2.\",\".5\",\"1.e5\",\"-.5\",\"007.5\",\"+1e5\"]\n"),
+    ("[.a, .b, .c] | join(\",\")", "+2.0,2.,.5\n", "\"+2.0,2.,.5\"\n"),
+    ("(.a, .c) as $x | $x | tostring", "+2.0\n.5\n", "\"+2.0\"\n\".5\"\n"),
+    (".a as $x | [$x] | .[0] | tostring", "+2.0\n", "\"+2.0\"\n"),
+    ("\"\\(.a) \\(.c)\"", "+2.0 .5\n", "\"+2.0 .5\"\n"),
+    (".a + 1", "3\n", "3.0\n"),
+    (".a * .h", "4\n", "4.0\n"),
+    ("[.a, .h] | sort", "- +2.0\n- 2\n", "[2.0,2]\n"),
+    ("[.a, .h] | max", "+2.0\n", "2.0\n"),
+    ("[.a, 2.0] | unique", "- +2.0\n- 2.0\n", "[2.0,2.0]\n"),
+    (".a == 2", "false\n", "false\n"),
+    (".a == 2.0", "false\n", "false\n"),
+    (".a | @json", "2.0\n", "\"2.0\"\n"),
+    (".a | @yaml", "+2.0\n\n", "\"+2.0\\n\"\n"),
+    ("{\"x\": .c}", "x: .5\n", "{\"x\":0.5}\n"),
+    (".z = .c", "a: +2.0\nb: 2.\nc: .5\nd: 1.e5\ne: -.5\nf: 007.5\ng: +1e5\nh: 2\nz: .5\n", "{\"a\":2.0,\"b\":2.0,\"c\":0.5,\"d\":100000.0,\"e\":-0.5,\"f\":7.5,\"g\":100000.0,\"h\":2,\"z\":0.5}\n"),
+    (".z = (.c | tostring)", "a: +2.0\nb: 2.\nc: .5\nd: 1.e5\ne: -.5\nf: 007.5\ng: +1e5\nh: 2\nz: \".5\"\n", "{\"a\":2.0,\"b\":2.0,\"c\":0.5,\"d\":100000.0,\"e\":-0.5,\"f\":7.5,\"g\":100000.0,\"h\":2,\"z\":\".5\"}\n"),
+    ("[.c] | .[0] + 0", "0.5\n", "0.5\n"),
+    (".d | length", "4\n", "4\n"),
+    (".g | tag", "!!float\n", "\"!!float\"\n"),
+    (".a | type", "!!float\n", "\"!!float\"\n"),
+    ("to_entries | map(.value | tostring)", "- \"+2.0\"\n- \"2.\"\n- \".5\"\n- \"1.e5\"\n- \"-.5\"\n- \"007.5\"\n- \"+1e5\"\n- \"2\"\n", "[\"+2.0\",\"2.\",\".5\",\"1.e5\",\"-.5\",\"007.5\",\"+1e5\",\"2\"]\n"),
+    ("with_entries(.value |= tostring)", "a: \"+2.0\"\nb: \"2.\"\nc: \".5\"\nd: \"1.e5\"\ne: \"-.5\"\nf: \"007.5\"\ng: \"+1e5\"\nh: \"2\"\n", "{\"a\":\"+2.0\",\"b\":\"2.\",\"c\":\".5\",\"d\":\"1.e5\",\"e\":\"-.5\",\"f\":\"007.5\",\"g\":\"+1e5\",\"h\":\"2\"}\n"),
+    (".[] |= tostring", "a: \"+2.0\"\nb: \"2.\"\nc: \".5\"\nd: \"1.e5\"\ne: \"-.5\"\nf: \"007.5\"\ng: \"+1e5\"\nh: \"2\"\n", "{\"a\":\"+2.0\",\"b\":\"2.\",\"c\":\".5\",\"d\":\"1.e5\",\"e\":\"-.5\",\"f\":\"007.5\",\"g\":\"+1e5\",\"h\":\"2\"}\n"),
+    ("map_values(. + 0)", "a: !!float 2\nb: !!float 2\nc: 0.5\nd: !!float 100000\ne: -0.5\nf: 7.5\ng: !!float 100000\nh: 2\n", "{\"a\":2.0,\"b\":2.0,\"c\":0.5,\"d\":100000.0,\"e\":-0.5,\"f\":7.5,\"g\":100000.0,\"h\":2}\n"),
+    (".a tag = \"!!str\"", "a: \"+2.0\"\nb: 2.\nc: .5\nd: 1.e5\ne: -.5\nf: 007.5\ng: +1e5\nh: 2\n", "{\"a\":\"+2.0\",\"b\":2.0,\"c\":0.5,\"d\":100000.0,\"e\":-0.5,\"f\":7.5,\"g\":100000.0,\"h\":2}\n"),
+    (".c style = \"double\"", "a: +2.0\nb: 2.\nc: \".5\"\nd: 1.e5\ne: -.5\nf: 007.5\ng: +1e5\nh: 2\n", "{\"a\":2.0,\"b\":2.0,\"c\":0.5,\"d\":100000.0,\"e\":-0.5,\"f\":7.5,\"g\":100000.0,\"h\":2}\n"),
+    ("(.a | tonumber)", "+2.0\n", "2.0\n"),
+];
+
+/// The same spellings as strings `tonumber` reads. Captured from yq v4.53.3.
+const FLOAT_STRINGS: &str = "a: \"+2.0\"\nb: \"2.\"\nc: \".5\"\nd: \"1.e5\"\ne: \"-.5\"\nf: \"007.5\"\ng: \"+1e5\"\nh: \"+1.50\"\ni: \"1e3\"\nj: \"1.5\"\nk: \"-2.\"\nl: \".5e3\"\nm: \"1_0.5\"\nn: \"0x1p3\"\no: \"+.inf\"\np: \" .5\"\n";
+
+const TONUMBER_FLOAT_ROWS: &[(&str, &str, &str)] = &[
+    (".a | tonumber", "+2.0\n", "2.0\n"),
+    (".a | tonumber | tostring", "+2.0\n", "\"+2.0\"\n"),
+    (".a | tonumber | . + 1", "3\n", "3.0\n"),
+    ("[.a | tonumber]", "- +2.0\n", "[2.0]\n"),
+    ("{\"z\": (.a | tonumber)}", "z: +2.0\n", "{\"z\":2.0}\n"),
+    (".b | tonumber", "2.\n", "2.0\n"),
+    (".b | tonumber | tostring", "2.\n", "\"2.\"\n"),
+    (".b | tonumber | . + 1", "3\n", "3.0\n"),
+    ("[.b | tonumber]", "- 2.\n", "[2.0]\n"),
+    ("{\"z\": (.b | tonumber)}", "z: 2.\n", "{\"z\":2.0}\n"),
+    (".c | tonumber", ".5\n", "0.5\n"),
+    (".c | tonumber | tostring", ".5\n", "\".5\"\n"),
+    (".c | tonumber | . + 1", "1.5\n", "1.5\n"),
+    ("[.c | tonumber]", "- .5\n", "[0.5]\n"),
+    ("{\"z\": (.c | tonumber)}", "z: .5\n", "{\"z\":0.5}\n"),
+    (".d | tonumber", "1.e5\n", "100000.0\n"),
+    (".d | tonumber | tostring", "1.e5\n", "\"1.e5\"\n"),
+    (".d | tonumber | . + 1", "100001\n", "100001.0\n"),
+    ("[.d | tonumber]", "- 1.e5\n", "[100000.0]\n"),
+    (
+        "{\"z\": (.d | tonumber)}",
+        "z: 1.e5\n",
+        "{\"z\":100000.0}\n",
+    ),
+    (".e | tonumber", "-.5\n", "-0.5\n"),
+    (".e | tonumber | tostring", "-.5\n", "\"-.5\"\n"),
+    (".e | tonumber | . + 1", "0.5\n", "0.5\n"),
+    ("[.e | tonumber]", "- -.5\n", "[-0.5]\n"),
+    ("{\"z\": (.e | tonumber)}", "z: -.5\n", "{\"z\":-0.5}\n"),
+    (".f | tonumber", "007.5\n", "7.5\n"),
+    (".f | tonumber | tostring", "007.5\n", "\"007.5\"\n"),
+    (".f | tonumber | . + 1", "8.5\n", "8.5\n"),
+    ("[.f | tonumber]", "- 007.5\n", "[7.5]\n"),
+    ("{\"z\": (.f | tonumber)}", "z: 007.5\n", "{\"z\":7.5}\n"),
+    (".g | tonumber", "+1e5\n", "100000.0\n"),
+    (".g | tonumber | tostring", "+1e5\n", "\"+1e5\"\n"),
+    (".g | tonumber | . + 1", "100001\n", "100001.0\n"),
+    ("[.g | tonumber]", "- +1e5\n", "[100000.0]\n"),
+    (
+        "{\"z\": (.g | tonumber)}",
+        "z: +1e5\n",
+        "{\"z\":100000.0}\n",
+    ),
+    (".h | tonumber", "+1.50\n", "1.5\n"),
+    (".h | tonumber | tostring", "+1.50\n", "\"+1.50\"\n"),
+    (".h | tonumber | . + 1", "2.5\n", "2.5\n"),
+    ("[.h | tonumber]", "- +1.50\n", "[1.5]\n"),
+    ("{\"z\": (.h | tonumber)}", "z: +1.50\n", "{\"z\":1.5}\n"),
+    (".i | tonumber", "1e3\n", "1e3\n"),
+    (".i | tonumber | tostring", "1e3\n", "\"1e3\"\n"),
+    (".i | tonumber | . + 1", "1001\n", "1001.0\n"),
+    ("[.i | tonumber]", "- 1e3\n", "[1e3]\n"),
+    ("{\"z\": (.i | tonumber)}", "z: 1e3\n", "{\"z\":1e3}\n"),
+    (".j | tonumber", "1.5\n", "1.5\n"),
+    (".j | tonumber | tostring", "1.5\n", "\"1.5\"\n"),
+    (".j | tonumber | . + 1", "2.5\n", "2.5\n"),
+    ("[.j | tonumber]", "- 1.5\n", "[1.5]\n"),
+    ("{\"z\": (.j | tonumber)}", "z: 1.5\n", "{\"z\":1.5}\n"),
+    (".k | tonumber", "-2.\n", "-2.0\n"),
+    (".k | tonumber | tostring", "-2.\n", "\"-2.\"\n"),
+    (".k | tonumber | . + 1", "-1\n", "-1.0\n"),
+    ("[.k | tonumber]", "- -2.\n", "[-2.0]\n"),
+    ("{\"z\": (.k | tonumber)}", "z: -2.\n", "{\"z\":-2.0}\n"),
+    (".l | tonumber", ".5e3\n", "500.0\n"),
+    (".l | tonumber | tostring", ".5e3\n", "\".5e3\"\n"),
+    (".l | tonumber | . + 1", "501\n", "501.0\n"),
+    ("[.l | tonumber]", "- .5e3\n", "[500.0]\n"),
+    ("{\"z\": (.l | tonumber)}", "z: .5e3\n", "{\"z\":500.0}\n"),
+];
+
+#[test]
+fn test_a_document_float_keeps_its_spelling_1356() -> Result<()> {
+    for (filter, yaml, json) in FLOAT_ROWS {
+        let (out, code) = run_yq_stdin(filter, FLOAT_DOC, &[])?;
+        assert_eq!((out.as_str(), code), (*yaml, 0), "{filter}");
+        let (out, code) = run_yq_stdin(filter, FLOAT_DOC, &["-o=json", "-I0"])?;
+        assert_eq!((out.as_str(), code), (*json, 0), "{filter} -o=json");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_tonumber_keeps_the_spelling_of_a_float_string_1356() -> Result<()> {
+    for (filter, yaml, json) in TONUMBER_FLOAT_ROWS {
+        let (out, code) = run_yq_stdin(filter, FLOAT_STRINGS, &[])?;
+        assert_eq!((out.as_str(), code), (*yaml, 0), "{filter}");
+        let (out, code) = run_yq_stdin(filter, FLOAT_STRINGS, &["-o=json", "-I0"])?;
+        assert_eq!((out.as_str(), code), (*json, 0), "{filter} -o=json");
+    }
+    Ok(())
+}

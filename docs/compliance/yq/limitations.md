@@ -4421,8 +4421,9 @@ $ printf 'a: +99999999999999999999\n' | succinctly yq '.a | tostring'
 ```
 
 The digits ride in a `NumberLiteral` whose text the reindex bridge reads as number syntax, and
-neither `+9...` nor `0099...` is JSON number text (#954 records the same constraint for `+1.0` and
-`1.`). The bridge reads the leading zeros as it reads `007` (#1149) and keeps a `+` on this one shape
+neither `+9...` nor `0099...` is JSON number text.
+A `+1.0` or `1.` crosses the bridge the same way, as the spelling token since #1356.
+The bridge reads the leading zeros as it reads `007` (#1149) and keeps a `+` on this one shape
 when a bridge number is read (`JsonNumber::bridge_signed_overflowed_int`). jq mode follows jq, which
 stores `+X` as `X` (#2877): a `load()`ed YAML `+99999999999999999999` carries its `+` in the value
 but `succinctly jq` prints `99999999999999999999`, as for the plain spelling. A run past 309 digits, leading zeros
@@ -4435,7 +4436,9 @@ Two differences remain, none of them about the digits of an integer past `i64`:
   `0099999999999999999999` in yq, and `succinctly yq` answers `1e+20` (`+99999999999999999999`
   loses its `+`).
   An integer spelling that fits `i64` (`+5`, `007`, `0x10`, `0X10`, `0o7`, `1_000`) keeps its text since #1356's integer slice, so `tostring`, interpolation and YAML output echo it as yq does and arithmetic keeps its base.
-  A float spelling (`"+2.0"`, `"2."`, `".5"`) still normalizes to `2.0`, `2` and `0.5`, and an explicit `!!float 9223372036854775807` prints the rounded double.
+  A float spelling (`"+2.0"`, `"2."`, `".5"`, `"1.e5"`) keeps its text the same way since the float slice of #1356, as does a document float written so (`a: +2.0`, `a: .5`); the JSON writers print yq's `FormatFloat` of it (`2.0`, `0.5`, `100000.0`).
+  An underscored decimal or a hex float (`"1_0.5"`, `"0x1p3"`) still normalizes to its value (`10.5`, `8`).
+  An explicit `!!float 9223372036854775807` prints the rounded double.
   `"-0" | tonumber` is a float here (`-0` in JSON, `!!float`) and an `!!int` in yq, which prints `0` there.
   A signed or underscored integer past `i64` (`"+9223372036854775808"`, `"1_000_000_000_000_000_000_0"`) normalizes to its double.
   An underscored or upper-case-prefixed spelling (`1_000`, `0X10`) written to a file and read back by `succinctly yq` is a string, the recorded input-spec divergence; yq reads it as an integer.

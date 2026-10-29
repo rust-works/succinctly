@@ -23264,6 +23264,13 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
         if let Some(n) = crate::yaml::spelled_int_value(s) {
             return Ok(OwnedValue::NumberLiteral(NumberRepr::Int(n), s.into()));
         }
+        // A float spelled other than as JSON number syntax (`+2.0`, `2.`, `.5`, `1.e5`) keeps
+        // its text the same way; the JSON writers print yq's `FormatFloat` of it.
+        if let Some(f) =
+            yq_parse_float(s).filter(|f| f.is_finite() && crate::yaml::is_spelled_float(s))
+        {
+            return Ok(OwnedValue::NumberLiteral(NumberRepr::Float(f), s.into()));
+        }
     }
     let c_text = if yq_mode {
         s

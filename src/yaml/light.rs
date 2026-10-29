@@ -5199,6 +5199,9 @@ fn stream_resolved_scalar_as_json<Out: core::fmt::Write>(
         // whole float.
         ResolvedScalar::Float(_) if is_preservable_float_literal(str_val) => out.write_str(str_val),
         ResolvedScalar::Float(f) => match preservable_float_literal_text(str_val) {
+            // yq's encoder writes a float that is not JSON number syntax as `FormatFloat` (#1356):
+            // `+1e5` is `100000.0`, `1.e5` the same, `.5e3` is `500.0`.
+            Some(_) if f.is_finite() => out.write_str(&format_float_with_fraction(f)),
             Some(normalized) => out.write_str(&normalized),
             None if f.is_finite() => out.write_str(&format_float_with_fraction(f)),
             // JSON cannot represent the `.inf`/`.nan` family.
@@ -8609,8 +8612,10 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
                     {
                         Some(str_val)
                     }
+                    // #1356: the spelling is the literal (`+2.0`, `2.`); the JSON writers ask for
+                    // the number.
                     ResolvedScalar::Float(_) => {
-                        preservable_float_literal_text(&str_val).map(Cow::Owned)
+                        preservable_float_literal_text(&str_val).map(|_| str_val)
                     }
                     // #2802: a spelled integer (`0x1f`, `0o17`, `01`, `+5`) is the text the
                     // document wrote, as a float's `2.0` is; a canonical one is just its value.

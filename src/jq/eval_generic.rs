@@ -3438,6 +3438,12 @@ fn source_spelling<C: DocumentCursor>(
         {
             false
         }
+        // #1356: and so does a spelled float (`+2.0`, `.5`).
+        OwnedValue::NumberLiteral(NumberRepr::Float(_), literal)
+            if crate::yaml::is_spelled_float(literal) =>
+        {
+            false
+        }
         OwnedValue::NumberLiteral(_, literal) => source == **literal,
         // A document `.inf`/`.nan` is a `NumberLiteral` since #1071 (matched above), so a bare
         // non-finite here (a 400-digit integer) never spells as its source does: it falls to
