@@ -6590,3 +6590,16 @@ Captured live (v4.53.3):
 | `a: [1, 2]` then `.a \| @yaml` | `[1, 2]\n`        | `- 1\n- 2\n`  | same                                                                                                                    |
 | `"x\ny" \| @yaml`              | `\|-\n  x\n  y\n` | `"x\ny"\n`    | a line break is double-quoted, not a literal block (the computed-value streamer; #3587 closed the JSON route)           |
 | `2.0*1 \| @yaml`               | `!!float 2\n`     | `2\n`         | yq tags a computed float but not a document-sourced `!!float 2` (the #1090 test); an owned float cannot tell them apart |
+
+## A write that selects by node metadata, only where the document is the write's input ([#5479](https://github.com/rust-works/succinctly/issues/5479))
+
+A write resolves its left side against the owned document, which holds values and nothing else, so `(.. | select(style == "double")) = 1` selected nothing and was a silent no-op.
+The left side is now resolved on the document's cursor first, and the write runs on the literal paths it found.
+That covers `style`, `anchor`, `kind` (an alias), `line`, `column`, `line_comment`, `head_comment`, `foot_comment`, `document_index`, `file_index` and `filename` read in a `select(...)` condition in the left side of `=`, `|=`, `+=`-style updates, `//=`, a metadata write (`style =`, `anchor =`, ...) or a `del(...)`.
+A metadata builtin used as a path component of its own (`(.a | key | line_comment) = "x"`) is a different route and is unchanged.
+The write has to be the whole filter, or the first stage of a pipe: a later stage reads the document the stages before it left, which has no cursor.
+`.e = 1 | (.[] | select(style == "double")) = 5` therefore still selects nothing here where yq writes `5`, and so does a second metadata-selecting write in the same pipe or a metadata-selecting write inside a comma, `with(...)`, `reduce` or a function body.
+`--eval-all` and `--slurp` evaluate through the owned-value route and are unchanged.
+A write that clears an anchor leaves yq's dangling `*name` alias behind, where succinctly expands it (the anchor soundness rule above), exactly as `.a anchor = ""` already does.
+Pinned by `tests/yq_cli/i5479.rs`, whose rows were captured from yq v4.53.3.
+

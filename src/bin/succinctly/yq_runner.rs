@@ -5221,6 +5221,170 @@ fn is_value_identity_stage(stage: &Expr) -> bool {
     )
 }
 
+/// Whether `expr` selects nodes by their presentation or position: a `select(...)` whose
+/// condition reads a node's style, anchor, comments, line, column, document or file index, or
+/// whether it is an alias (#5479).
+///
+/// A metadata builtin used as a path component of its own (`(.a | key | line_comment) = "x"`)
+/// is not this: it yields the node's metadata slot and has its own write route.
+fn selects_by_node_metadata(expr: &Expr) -> bool {
+    jq::walk::any_subexpr(expr, &mut |e| {
+        let Expr::Builtin(Builtin::Select(condition)) = e else {
+            return false;
+        };
+        jq::walk::any_subexpr(condition, &mut |c| {
+            matches!(
+                c,
+                Expr::Builtin(
+                    Builtin::Anchor
+                        | Builtin::Style
+                        | Builtin::Kind
+                        | Builtin::Line
+                        | Builtin::Column
+                        | Builtin::LineComment
+                        | Builtin::HeadComment
+                        | Builtin::FootComment
+                        | Builtin::DocumentIndex
+                        | Builtin::FileIndex
+                        | Builtin::Filename
+                )
+            )
+        })
+    })
+}
+
+/// The left side of a write (or the argument of a `del`), when `expr` is one (#5479).
+fn write_target(expr: &Expr) -> Option<&Expr> {
+    match expr {
+        Expr::Paren(inner) => write_target(inner),
+        Expr::Assign { path, .. }
+        | Expr::Update { path, .. }
+        | Expr::CompoundAssign { path, .. }
+        | Expr::AlternativeAssign { path, .. } => Some(path),
+        Expr::MetaAssign { target, .. } => Some(target),
+        Expr::Builtin(Builtin::Del(paths)) => Some(paths),
+        _ => None,
+    }
+}
+
+/// `expr` with the left side of its write (see [`write_target`]) replaced by `target`.
+fn with_write_target(expr: &Expr, target: Expr) -> Option<Expr> {
+    let target = Box::new(target);
+    Some(match expr {
+        Expr::Paren(inner) => with_write_target(inner, *target)?,
+        Expr::Assign { value, .. } => Expr::Assign {
+            path: target,
+            value: value.clone(),
+        },
+        Expr::Update { filter, .. } => Expr::Update {
+            path: target,
+            filter: filter.clone(),
+        },
+        Expr::CompoundAssign { op, value, .. } => Expr::CompoundAssign {
+            op: *op,
+            path: target,
+            value: value.clone(),
+        },
+        Expr::AlternativeAssign { value, .. } => Expr::AlternativeAssign {
+            path: target,
+            value: value.clone(),
+        },
+        Expr::MetaAssign {
+            slot,
+            value,
+            is_update,
+            ..
+        } => Expr::MetaAssign {
+            target,
+            slot: *slot,
+            value: value.clone(),
+            is_update: *is_update,
+        },
+        Expr::Builtin(Builtin::Del(_)) => Expr::Builtin(Builtin::Del(target)),
+        _ => return None,
+    })
+}
+
+/// A write whose left side selects nodes by what only the document knows about them
+/// (`(.. | select(style == "double")) style = "single"`) resolved to the literal paths of the
+/// nodes it selects (#5479).
+///
+/// A write resolves its left side against the owned document, which holds values and nothing
+/// else, so every metadata builtin answers its empty default there and the selection matches
+/// nothing: the write was a silent no-op, where the read of the same expression selects
+/// correctly because it runs against the cursor. This asks the cursor for `<left side> | path`
+/// and rewrites the left side into `getpath(<path>)` per match (`empty` for none), which the
+/// write handles like any other literal target.
+///
+/// Only a write the document is the input of: the whole expression, or the first stage of a
+/// pipe. A later stage reads the document the stages before it left, which has no cursor.
+///
+/// `None` when that write's left side reads no metadata or its paths cannot be resolved (an
+/// error, or a key that is not a string or an integer), in which case the write runs as written.
+fn resolve_metadata_write_targets<W: AsRef<[u64]> + Clone>(
+    cursor: YamlCursor<'_, W>,
+    expr: &Expr,
+) -> Option<Expr> {
+    let mut stages = None;
+    let write = match expr {
+        Expr::Pipe(pipe) => {
+            let first = pipe.first()?;
+            stages = Some(pipe);
+            first
+        }
+        other => other,
+    };
+    let target = write_target(write)?;
+    if !selects_by_node_metadata(target) {
+        return None;
+    }
+    let query = Expr::Pipe(vec![target.clone(), Expr::Builtin(Builtin::PathNoArg)].into());
+    let mut scratch = ErrorSink::default();
+    let results =
+        evaluate_yaml_cursor_core(cursor, &query, &mut scratch, false, false, false, None).ok()?;
+    if scratch.hit() {
+        return None;
+    }
+    let mut matched = Vec::with_capacity(results.len());
+    for (path, _) in results {
+        let OwnedValue::Array(steps) = path else {
+            return None;
+        };
+        let mut items = Vec::with_capacity(steps.len());
+        for step in &steps {
+            items.push(match step {
+                OwnedValue::String(key) => Expr::Literal(Literal::String(key.to_string())),
+                OwnedValue::Int(idx) => Expr::Literal(Literal::Int(*idx)),
+                _ => return None,
+            });
+        }
+        matched.push(if items.is_empty() {
+            Expr::Identity
+        } else {
+            let literal = Expr::Array(Box::new(if items.len() == 1 {
+                items.remove(0)
+            } else {
+                Expr::Comma(items)
+            }));
+            Expr::Builtin(Builtin::GetPath(Box::new(literal)))
+        });
+    }
+    let target = match matched.len() {
+        0 => Expr::Builtin(Builtin::Empty),
+        1 => matched.remove(0),
+        _ => Expr::Paren(Box::new(Expr::Comma(matched))),
+    };
+    let rewritten = with_write_target(write, target)?;
+    Some(match stages {
+        None => rewritten,
+        Some(pipe) => {
+            let mut all: Vec<Expr> = pipe.iter().cloned().collect();
+            all[0] = rewritten;
+            Expr::Pipe(all.into())
+        }
+    })
+}
+
 /// Whether `expr` contains a `tag` metadata write anywhere (#2796): the one slot that changes
 /// a value a `-o json` output prints (`tag = "!!str"` makes `1` the string `"1"`), so it needs
 /// the metadata pass that output otherwise skips.
@@ -6663,6 +6827,16 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     strip_style: bool,
     sort_keys: bool,
 ) -> Result<Vec<ResultWithComments>> {
+    if let Some(resolved) = resolve_metadata_write_targets(cursor, expr) {
+        return evaluate_yaml_cursor(
+            cursor,
+            &resolved,
+            sink,
+            need_comments,
+            strip_style,
+            sort_keys,
+        );
+    }
     // A write behind a static navigation (#2679 for a metadata write, #5286 for any other) is the
     // write on the navigated node, run as the document it is: only when the node is there to be
     // navigated to. The presentation
