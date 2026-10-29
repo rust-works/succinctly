@@ -976,6 +976,16 @@ pub fn colorize_json(json: &str, scheme: &ColorScheme) -> String {
     result
 }
 
+/// [`colorize_json`] with the framing `succinctly yq` has always used for JSON
+/// ([`JsonColorizer::per_token`]).
+pub fn colorize_json_per_token(json: &str, scheme: &ColorScheme) -> String {
+    let mut result = String::with_capacity(json.len() * 2);
+    let mut colorizer = JsonColorizer::per_token();
+    colorizer.push_str(json, scheme, &mut result);
+    colorizer.finish(scheme, &mut result);
+    result
+}
+
 /// The token [`JsonColorizer`] has started but not finished: the one
 /// character of lookahead [`colorize_json`] needs, kept as state so a token
 /// split across two writes is colored the same as one written whole (#808).
@@ -998,16 +1008,39 @@ enum JsonToken {
 /// [`Self::push_str`] colors each chunk as it arrives, and [`Self::finish`]
 /// closes what the last one left open. Its state is the open token plus one
 /// entry per open container, so it holds none of the text it has seen.
+///
+/// The bytes are jq 1.7.1's (#5473), which writes a container's color before its
+/// opening bracket and again after every element and before the closing bracket, with a
+/// reset only after the closing one, before each object key and after each `:`; an empty
+/// container is its color, the two brackets and a reset.
 #[derive(Default)]
 pub struct JsonColorizer {
     in_string: bool,
     escape_next: bool,
-    depth_stack: Vec<char>, // Track context: '{' for object, '[' for array
-    expecting_key: bool,    // True when next string in object is a key
+    /// Open containers: `'{'` for an object, `'['` for an array, and whether it has had an element.
+    depth_stack: Vec<(char, bool)>,
+    expecting_key: bool, // True when next string in object is a key
+    /// Whether the string being read is an object key, which jq closes with a reset alone.
+    string_is_key: bool,
+    /// A `:` was written; the next token starts after a reset.
+    after_colon: bool,
+    /// The framing before #5473, in which each bracket, comma and colon is wrapped in its color
+    /// and a reset of its own. `succinctly yq -C -o json` keeps it: real yq's bytes are neither
+    /// this nor jq's, and that is a separate difference from the one #5473 closes.
+    per_token: bool,
     token: JsonToken,
 }
 
 impl JsonColorizer {
+    /// A colorizer with the framing `succinctly yq` has always used for JSON: a reset after
+    /// every bracket, comma and colon, and one color per container bracket (see `per_token`).
+    pub fn per_token() -> Self {
+        Self {
+            per_token: true,
+            ..Self::default()
+        }
+    }
+
     /// Colors `json` into `result`, carrying any token it ends inside over to
     /// the next call.
     pub fn push_str(&mut self, json: &str, scheme: &ColorScheme, result: &mut String) {
@@ -1041,13 +1074,36 @@ impl JsonColorizer {
     pub fn finish(&mut self, scheme: &ColorScheme, result: &mut String) {
         match core::mem::take(&mut self.token) {
             JsonToken::None => {}
-            JsonToken::Keyword | JsonToken::Number => result.push_str(&scheme.reset),
+            JsonToken::Keyword | JsonToken::Number => {
+                result.push_str(&scheme.reset);
+                self.value_done(scheme, result);
+            }
             JsonToken::N => {
                 result.push_str(&scheme.null);
                 result.push('n');
                 result.push_str(&scheme.reset);
+                self.value_done(scheme, result);
             }
-            JsonToken::Na => push_nan(scheme, result),
+            JsonToken::Na => {
+                push_nan(scheme, result);
+                self.value_done(scheme, result);
+            }
+        }
+    }
+
+    /// A value ended: jq writes the enclosing container's color again, whether a `,` or the
+    /// closing bracket follows.
+    fn value_done(&mut self, scheme: &ColorScheme, result: &mut String) {
+        if self.per_token {
+            return;
+        }
+        if let Some((kind, nonempty)) = self.depth_stack.last_mut() {
+            *nonempty = true;
+            result.push_str(if *kind == '{' {
+                &scheme.object
+            } else {
+                &scheme.array
+            });
         }
     }
 
@@ -1067,6 +1123,7 @@ impl JsonColorizer {
             JsonToken::Keyword | JsonToken::Number => {
                 result.push_str(&scheme.reset);
                 self.token = JsonToken::None;
+                self.value_done(scheme, result);
             }
             JsonToken::N if c == 'a' => {
                 self.token = JsonToken::Na;
@@ -1081,6 +1138,7 @@ impl JsonColorizer {
             JsonToken::Na => {
                 self.token = JsonToken::None;
                 push_nan(scheme, result);
+                self.value_done(scheme, result);
                 return;
             }
         }
@@ -1099,18 +1157,32 @@ impl JsonColorizer {
                 result.push(c);
                 result.push_str(&scheme.reset);
                 self.in_string = false;
+                if !self.string_is_key {
+                    self.value_done(scheme, result);
+                }
             } else {
                 result.push(c);
             }
         } else {
+            // The reset jq writes after a `:` comes after the space that follows it, so it is
+            // written where the value starts.
+            if self.after_colon && !c.is_whitespace() {
+                result.push_str(&scheme.reset);
+                self.after_colon = false;
+            }
             match c {
                 '"' => {
-                    // Use expecting_key to determine if this is a key
+                    // Use expecting_key to determine if this is a key; jq resets before each key.
                     if self.expecting_key {
+                        if !self.per_token {
+                            result.push_str(&scheme.reset);
+                        }
                         result.push_str(&scheme.key);
                         self.expecting_key = false; // After seeing key, next string is value
+                        self.string_is_key = true;
                     } else {
                         result.push_str(&scheme.string);
+                        self.string_is_key = false;
                     }
                     result.push(c);
                     self.in_string = true;
@@ -1118,30 +1190,37 @@ impl JsonColorizer {
                 '{' => {
                     result.push_str(&scheme.object);
                     result.push(c);
-                    result.push_str(&scheme.reset);
-                    self.depth_stack.push('{');
+                    if self.per_token {
+                        result.push_str(&scheme.reset);
+                    }
+                    self.depth_stack.push(('{', false));
                     self.expecting_key = true; // First thing in object is a key
                 }
                 '[' => {
                     result.push_str(&scheme.array);
                     result.push(c);
-                    result.push_str(&scheme.reset);
-                    self.depth_stack.push('[');
+                    if self.per_token {
+                        result.push_str(&scheme.reset);
+                    }
+                    self.depth_stack.push(('[', false));
                     // Arrays don't have keys
                 }
-                '}' => {
-                    result.push_str(&scheme.object);
+                '}' | ']' => {
+                    // A container with an element writes its color once more before the
+                    // bracket (`value_done` wrote the one after the last element).
+                    let color = if c == '}' {
+                        &scheme.object
+                    } else {
+                        &scheme.array
+                    };
+                    let nonempty = self.depth_stack.pop().is_some_and(|(_, nonempty)| nonempty);
+                    if nonempty || self.per_token {
+                        result.push_str(color);
+                    }
                     result.push(c);
                     result.push_str(&scheme.reset);
-                    self.depth_stack.pop();
                     self.expecting_key = false;
-                }
-                ']' => {
-                    result.push_str(&scheme.array);
-                    result.push(c);
-                    result.push_str(&scheme.reset);
-                    self.depth_stack.pop();
-                    self.expecting_key = false;
+                    self.value_done(scheme, result);
                 }
                 ':' => {
                     // #3110: real jq wraps the key/value `:` in the *object*
@@ -1152,26 +1231,30 @@ impl JsonColorizer {
                     // array-adjacent case to branch on.
                     result.push_str(&scheme.object);
                     result.push(c);
-                    result.push_str(&scheme.reset);
+                    if self.per_token {
+                        result.push_str(&scheme.reset);
+                    } else {
+                        self.after_colon = true;
+                    }
                     // After colon, we're expecting a value, not a key
                     self.expecting_key = false;
                 }
                 ',' => {
-                    // #3110: real jq colors the comma with its *enclosing
-                    // container* -- array color inside `[...]`, object color
-                    // inside `{...}` (confirmed live against jq 1.7.1 with a
-                    // custom `JQ_COLORS`, default colors share `1;39` so the
-                    // distinction only shows with a custom spec).
-                    let color = if self.depth_stack.last() == Some(&'{') {
-                        &scheme.object
-                    } else {
-                        &scheme.array
-                    };
-                    result.push_str(color);
+                    // #3110/#5473: jq writes the comma bare, after the enclosing container's
+                    // color that `value_done` wrote when the element before it ended.
+                    if self.per_token {
+                        result.push_str(if self.depth_stack.last().map(|f| f.0) == Some('{') {
+                            &scheme.object
+                        } else {
+                            &scheme.array
+                        });
+                    }
                     result.push(c);
-                    result.push_str(&scheme.reset);
+                    if self.per_token {
+                        result.push_str(&scheme.reset);
+                    }
                     // After comma in object context, next string is a key
-                    if self.depth_stack.last() == Some(&'{') {
+                    if self.depth_stack.last().map(|f| f.0) == Some('{') {
                         self.expecting_key = true;
                     }
                 }
@@ -2208,28 +2291,27 @@ mod tests {
     #[test]
     fn test_colorize_json_arrays_keywords_numbers_escapes() {
         let out = colorize_json(r#"[false,12.5e+1,"a\"b",null]"#, &ColorScheme::default());
-        // Array delimiters take the array color.
-        assert!(
-            out.starts_with("\x1b[1;39m[\x1b[0m"),
-            "open bracket: {out:?}"
-        );
-        assert!(
-            out.ends_with("\x1b[1;39m]\x1b[0m"),
-            "close bracket: {out:?}"
-        );
-        // false and full numbers (incl. exponent) are single colored tokens.
-        assert!(
-            out.contains("\x1b[0;39mfalse\x1b[0m"),
-            "false token: {out:?}"
-        );
-        assert!(
-            out.contains("\x1b[0;39m12.5e+1\x1b[0m"),
-            "number token: {out:?}"
-        );
-        // Escaped quotes inside strings do not terminate the string span.
-        assert!(
-            out.contains("\x1b[0;32m\"a\\\"b\"\x1b[0m"),
-            "escaped string: {out:?}"
+        // jq 1.7.1's bytes (#5473): the array color before `[` and, once more, before `]`, with
+        // a reset only after the closing bracket.
+        assert_eq!(
+            out,
+            concat!(
+                "\x1b[1;39m[",
+                "\x1b[0;39mfalse",
+                "\x1b[0m",
+                "\x1b[1;39m,",
+                "\x1b[0;39m12.5e+1",
+                "\x1b[0m",
+                "\x1b[1;39m,",
+                "\x1b[0;32m\"a\\\"b\"",
+                "\x1b[0m",
+                "\x1b[1;39m,",
+                "\x1b[0;90mnull",
+                "\x1b[0m",
+                "\x1b[1;39m",
+                "\x1b[1;39m]",
+                "\x1b[0m",
+            )
         );
     }
 
@@ -2252,15 +2334,23 @@ mod tests {
         assert_eq!(
             colorize_json(&format!("[null,{NAN_COLOR_MARKER},1,null]"), &scheme),
             concat!(
-                "\x1b[1;39m[\x1b[0m",
-                "\x1b[0;90mnull\x1b[0m",
-                "\x1b[1;39m,\x1b[0m",
-                "\x1b[0;39m\x1b[0;90mnull\x1b[0m\x1b[0m",
-                "\x1b[1;39m,\x1b[0m",
-                "\x1b[0;39m1\x1b[0m",
-                "\x1b[1;39m,\x1b[0m",
-                "\x1b[0;90mnull\x1b[0m",
-                "\x1b[1;39m]\x1b[0m",
+                "\x1b[1;39m[",
+                "\x1b[0;90mnull",
+                "\x1b[0m",
+                "\x1b[1;39m,",
+                "\x1b[0;39m",
+                "\x1b[0;90mnull",
+                "\x1b[0m",
+                "\x1b[0m",
+                "\x1b[1;39m,",
+                "\x1b[0;39m1",
+                "\x1b[0m",
+                "\x1b[1;39m,",
+                "\x1b[0;90mnull",
+                "\x1b[0m",
+                "\x1b[1;39m",
+                "\x1b[1;39m]",
+                "\x1b[0m",
             )
         );
     }
@@ -2305,19 +2395,31 @@ mod tests {
     fn test_colorize_json_wraps_separators_3110() {
         let scheme = ColorScheme::from_spec("1;31:1;32:1;33:1;34:1;35:1;36:1;37:1;30").unwrap();
 
-        // Object: `{`, `}`, `:` and the `,` all take the object color.
+        // Object: `{`, `}`, `:` and the `,` all take the object color. The bytes are
+        // jq 1.7.1's (#5473): no reset after `{` or `,`, one before each key and after each
+        // `:`, the color again after each value and before `}`.
         assert_eq!(
             colorize_json(r#"{"a":1,"b":2}"#, &scheme),
             concat!(
-                "\x1b[1;37m{\x1b[0m",
-                "\x1b[1;30m\"a\"\x1b[0m",
-                "\x1b[1;37m:\x1b[0m",
-                "\x1b[1;34m1\x1b[0m",
-                "\x1b[1;37m,\x1b[0m",
-                "\x1b[1;30m\"b\"\x1b[0m",
-                "\x1b[1;37m:\x1b[0m",
-                "\x1b[1;34m2\x1b[0m",
-                "\x1b[1;37m}\x1b[0m",
+                "\x1b[1;37m{",
+                "\x1b[0m",
+                "\x1b[1;30m\"a\"",
+                "\x1b[0m",
+                "\x1b[1;37m:",
+                "\x1b[0m",
+                "\x1b[1;34m1",
+                "\x1b[0m",
+                "\x1b[1;37m,",
+                "\x1b[0m",
+                "\x1b[1;30m\"b\"",
+                "\x1b[0m",
+                "\x1b[1;37m:",
+                "\x1b[0m",
+                "\x1b[1;34m2",
+                "\x1b[0m",
+                "\x1b[1;37m",
+                "\x1b[1;37m}",
+                "\x1b[0m",
             )
         );
 
@@ -2325,13 +2427,18 @@ mod tests {
         assert_eq!(
             colorize_json("[1,2,3]", &scheme),
             concat!(
-                "\x1b[1;36m[\x1b[0m",
-                "\x1b[1;34m1\x1b[0m",
-                "\x1b[1;36m,\x1b[0m",
-                "\x1b[1;34m2\x1b[0m",
-                "\x1b[1;36m,\x1b[0m",
-                "\x1b[1;34m3\x1b[0m",
-                "\x1b[1;36m]\x1b[0m",
+                "\x1b[1;36m[",
+                "\x1b[1;34m1",
+                "\x1b[0m",
+                "\x1b[1;36m,",
+                "\x1b[1;34m2",
+                "\x1b[0m",
+                "\x1b[1;36m,",
+                "\x1b[1;34m3",
+                "\x1b[0m",
+                "\x1b[1;36m",
+                "\x1b[1;36m]",
+                "\x1b[0m",
             )
         );
 
@@ -2340,15 +2447,24 @@ mod tests {
         assert_eq!(
             colorize_json(r#"[{"a":1},2]"#, &scheme),
             concat!(
-                "\x1b[1;36m[\x1b[0m",
-                "\x1b[1;37m{\x1b[0m",
-                "\x1b[1;30m\"a\"\x1b[0m",
-                "\x1b[1;37m:\x1b[0m",
-                "\x1b[1;34m1\x1b[0m",
-                "\x1b[1;37m}\x1b[0m",
-                "\x1b[1;36m,\x1b[0m",
-                "\x1b[1;34m2\x1b[0m",
-                "\x1b[1;36m]\x1b[0m",
+                "\x1b[1;36m[",
+                "\x1b[1;37m{",
+                "\x1b[0m",
+                "\x1b[1;30m\"a\"",
+                "\x1b[0m",
+                "\x1b[1;37m:",
+                "\x1b[0m",
+                "\x1b[1;34m1",
+                "\x1b[0m",
+                "\x1b[1;37m",
+                "\x1b[1;37m}",
+                "\x1b[0m",
+                "\x1b[1;36m,",
+                "\x1b[1;34m2",
+                "\x1b[0m",
+                "\x1b[1;36m",
+                "\x1b[1;36m]",
+                "\x1b[0m",
             )
         );
     }

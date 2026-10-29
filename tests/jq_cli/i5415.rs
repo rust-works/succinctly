@@ -1,8 +1,8 @@
 //! #5415: `-C` renders a result through the streaming printers and colors it a block at a time,
 //! instead of materializing the record and building two whole-output strings. The expected bytes
 //! of the pinned rows were captured from the `main` build that did the old, materializing
-//! render (`format_json` then `colorize_json`), because the change must not move a byte of `-C`'s
-//! stdout.
+//! render (`format_json` then `colorize_json`), because that change must not move a byte of `-C`'s
+//! stdout. #5473 then moved them to jq 1.7.1's own bytes, re-captured from `/usr/bin/jq`.
 
 use anyhow::Result;
 
@@ -32,26 +32,16 @@ fn strip_ansi(text: &str) -> String {
 #[test]
 fn test_nan_keeps_its_double_wrapped_color_5415() -> Result<()> {
     let nan = "\u{1b}[0;39m\u{1b}[0;90mnull\u{1b}[0m\u{1b}[0m";
-    let open = "\u{1b}[1;39m[\u{1b}[0m";
-    let close = "\u{1b}[1;39m]\u{1b}[0m";
-    let comma = "\u{1b}[1;39m,\u{1b}[0m";
+    // Every row's bytes were captured from jq 1.7.1 (#5473).
     for (doc, filter, want) in [
-        // A constructed array is an owned result.
-        ("[nan]", "map(.)?", format!("{open}{nan}{close}\n")),
-        ("nan", "[.,.]", format!("{open}{nan}{comma}{nan}{close}\n")),
-        // The identity result is a cursor onto a document that holds a NaN word, which the
-        // streamer would print as a plain `null`.
-        ("[nan]", ".", format!("{open}{nan}{close}\n")),
-        (
-            "[1,NaN]",
-            ".",
-            format!("{open}\u{1b}[0;39m1\u{1b}[0m{comma}{nan}{close}\n"),
-        ),
-        // A computed NaN literal, in an array and in an object's values.
-        ("null", "[nan]", format!("{open}{nan}{close}\n")),
+        ("[nan]", "map(.)?", "\u{1b}[1;39m[\u{1b}[0;39m\u{1b}[0;90mnull\u{1b}[0m\u{1b}[0m\u{1b}[1;39m\u{1b}[1;39m]\u{1b}[0m\n"),
+        ("nan", "[.,.]", "\u{1b}[1;39m[\u{1b}[0;39m\u{1b}[0;90mnull\u{1b}[0m\u{1b}[0m\u{1b}[1;39m,\u{1b}[0;39m\u{1b}[0;90mnull\u{1b}[0m\u{1b}[0m\u{1b}[1;39m\u{1b}[1;39m]\u{1b}[0m\n"),
+        ("[nan]", ".", "\u{1b}[1;39m[\u{1b}[0;39m\u{1b}[0;90mnull\u{1b}[0m\u{1b}[0m\u{1b}[1;39m\u{1b}[1;39m]\u{1b}[0m\n"),
+        ("[1,NaN]", ".", "\u{1b}[1;39m[\u{1b}[0;39m1\u{1b}[0m\u{1b}[1;39m,\u{1b}[0;39m\u{1b}[0;90mnull\u{1b}[0m\u{1b}[0m\u{1b}[1;39m\u{1b}[1;39m]\u{1b}[0m\n"),
+        ("null", "[nan]", "\u{1b}[1;39m[\u{1b}[0;39m\u{1b}[0;90mnull\u{1b}[0m\u{1b}[0m\u{1b}[1;39m\u{1b}[1;39m]\u{1b}[0m\n"),
     ] {
         let (out, code) = run_jq_stdin(filter, doc, &["-C", "-c"])?;
-        assert_eq!((out.as_str(), code), (want.as_str(), 0), "{doc} | {filter}");
+        assert_eq!((out.as_str(), code), (want, 0), "{doc} | {filter}");
     }
     let (out, code) = run_jq_stdin("to_entries?", r#"{"a":nan,"b":sNaN12}"#, &["-C", "-c"])?;
     assert_eq!(code, 0);
@@ -71,10 +61,7 @@ fn test_preserve_input_collapses_a_repeated_key_under_color_5415() -> Result<()>
     assert_eq!(code, 0);
     assert_eq!(
         out,
-        "\u{1b}[1;39m{\u{1b}[0m\u{1b}[1;34m\"a\"\u{1b}[0m\u{1b}[1;39m:\u{1b}[0m\u{1b}[0;39m2\u{1b}[0m\
-         \u{1b}[1;39m,\u{1b}[0m\u{1b}[1;34m\"b\"\u{1b}[0m\u{1b}[1;39m:\u{1b}[0m\u{1b}[1;39m{\u{1b}[0m\
-         \u{1b}[1;34m\"c\"\u{1b}[0m\u{1b}[1;39m:\u{1b}[0m\u{1b}[0;39m3\u{1b}[0m\u{1b}[1;39m}\u{1b}[0m\
-         \u{1b}[1;39m}\u{1b}[0m\n"
+        "\u{1b}[1;39m{\u{1b}[0m\u{1b}[1;34m\"a\"\u{1b}[0m\u{1b}[1;39m:\u{1b}[0m\u{1b}[0;39m2\u{1b}[0m\u{1b}[1;39m,\u{1b}[0m\u{1b}[1;34m\"b\"\u{1b}[0m\u{1b}[1;39m:\u{1b}[0m\u{1b}[1;39m{\u{1b}[0m\u{1b}[1;34m\"c\"\u{1b}[0m\u{1b}[1;39m:\u{1b}[0m\u{1b}[0;39m3\u{1b}[0m\u{1b}[1;39m\u{1b}[1;39m}\u{1b}[0m\u{1b}[1;39m\u{1b}[1;39m}\u{1b}[0m\n"
     );
     // The default route's rendering of the same input is unchanged.
     let (out, _) = run_jq_stdin(".", doc, &["-c", "--preserve-input"])?;
@@ -89,7 +76,7 @@ fn test_overflow_literal_spelling_is_unchanged_under_color_5415() -> Result<()> 
     assert_eq!(code, 0);
     assert_eq!(
         out,
-        "\u{1b}[1;39m[\u{1b}[0m\u{1b}[0;39m1E+999\u{1b}[0m\u{1b}[1;39m]\u{1b}[0m\n"
+        "\u{1b}[1;39m[\u{1b}[0;39m1E+999\u{1b}[0m\u{1b}[1;39m\u{1b}[1;39m]\u{1b}[0m\n"
     );
     Ok(())
 }
@@ -101,10 +88,7 @@ fn test_sorted_keys_and_tab_indent_color_5415() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(
         out,
-        "\u{1b}[1;39m[\u{1b}[0m\n\t\u{1b}[0;39m1\u{1b}[0m\u{1b}[1;39m,\u{1b}[0m\n\t\
-         \u{1b}[1;39m{\u{1b}[0m\n\t\t\u{1b}[1;34m\"a\"\u{1b}[0m\u{1b}[1;39m:\u{1b}[0m \
-         \u{1b}[1;39m[\u{1b}[0m\u{1b}[1;39m]\u{1b}[0m\n\t\u{1b}[1;39m}\u{1b}[0m\u{1b}[1;39m,\u{1b}[0m\n\t\
-         \u{1b}[0;32m\"x\"\u{1b}[0m\n\u{1b}[1;39m]\u{1b}[0m\n"
+        "\u{1b}[1;39m[\n\t\u{1b}[0;39m1\u{1b}[0m\u{1b}[1;39m,\n\t\u{1b}[1;39m{\n\t\t\u{1b}[0m\u{1b}[1;34m\"a\"\u{1b}[0m\u{1b}[1;39m: \u{1b}[0m\u{1b}[1;39m[]\u{1b}[0m\u{1b}[1;39m\n\t\u{1b}[1;39m}\u{1b}[0m\u{1b}[1;39m,\n\t\u{1b}[0;32m\"x\"\u{1b}[0m\u{1b}[1;39m\n\u{1b}[1;39m]\u{1b}[0m\n"
     );
     Ok(())
 }
