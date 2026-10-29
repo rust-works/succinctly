@@ -2530,6 +2530,21 @@ fn to_owned_lossy<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
     to_owned_lossy_at_depth::<S, W>(value, 0)
 }
 
+/// [`to_owned_lossy`] for a value read out of a reindex bridge document: a container the
+/// provenance table says round-trips comes back as the storage that went in, as it does for
+/// every read through [`to_owned`] (#3069).
+///
+/// The two places a bridge's results leave it without going through `to_owned` --
+/// [`detach_from_temp_document`] and [`eval_each_owned_past_front_doors`]'s sink -- rebuilt
+/// the container instead, so `[nan] as $a | ($a | . | .) == $a` was `false` where jq's pipe
+/// returns `$a` itself (#5487). A value from any other document is not registered and takes
+/// the ordinary conversion after one thread-local load.
+fn to_owned_lossy_shared<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
+    value: &StandardJson<'_, W>,
+) -> OwnedValue {
+    bridge_shared_for_value::<S, W>(value).unwrap_or_else(|| to_owned_lossy::<S, W>(value))
+}
+
 fn to_owned_lossy_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
     value: &StandardJson<'_, W>,
     depth: usize,
@@ -12060,7 +12075,14 @@ fn eval_each_owned_past_front_doors<S: EvalSemantics>(
     let cursor = doc.root();
 
     eval_each::<Vec<u64>, S>(expr, cursor.value(), optional, &mut |item| {
-        sink(item.into_owned_lossy::<S>())
+        // The document is `to_json_for_reindex` of an already-decoded value, so there is
+        // nothing to fail to decode (the same lossy read `Item::into_owned_lossy` made here
+        // before it learned to share, #5487).
+        sink(match item {
+            // STYLE-0012: a reindexed, already-decoded value cannot fail to decode.
+            Item::Borrowed(v) => to_owned_lossy_shared::<S, _>(&v),
+            Item::Owned(v) => v,
+        })
     })
 }
 
@@ -32508,6 +32530,19 @@ pub(crate) fn slice_owned_value_read<S: EvalSemantics>(
     }
     if let (EvalTag::Yq, OwnedValue::Object(map)) = (S::TAG, target) {
         return Ok(Some(slice_object_as_yq_children(map, start, end)));
+    }
+    // jq mode: a slice naming every element of a non-empty array is that array, not a copy
+    // (`jv_slice(a, 0, len)` hands `a` back), as the cursor-backed `Expr::Slice` arm already
+    // answers (#3306). The copy `slice_owned_value` makes loses the node's identity, so
+    // `[nan] as $a | ($a | .[0:] | .) == $a` was `false` where jq says `true` (#5487).
+    if S::TAG != EvalTag::Yq {
+        if let OwnedValue::Array(items) = target {
+            if !items.is_empty()
+                && SliceBounds::from_literals(start, end).is_full_range(items.len())
+            {
+                return Ok(Some(target.clone()));
+            }
+        }
     }
     slice_owned_value(target, start, end, optional)
 }
@@ -77994,7 +78029,27 @@ fn eval_owned_input_bridge<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
     let cursor = doc.root();
 
-    detach_from_temp_document::<_, S>(eval_single::<Vec<u64>, S>(expr, cursor.value(), optional))
+    detach_from_reindexed_input::<_, S>(eval_single::<Vec<u64>, S>(expr, cursor.value(), optional))
+}
+
+/// [`detach_from_temp_document`] for the bridge [`eval_owned_input_bridge`] builds over an
+/// input it holds the source of: a container the bridge hands back is that input's own storage
+/// where the provenance table says it round-trips (#3069), so `[nan] as $a | ($a | . | .) == $a`
+/// is `true` as it is in jq, whose pipe returns `$a` itself (#5487).
+///
+/// Not [`eval_path_context_pipe_owned`]'s detach: that one is handed fixtures a reindex does not
+/// reproduce (`test_owned_door_preserves_long_literal_3025`), which the provenance table's debug
+/// consistency check would reject.
+fn detach_from_reindexed_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    result: QueryResult<'_, Vec<u64>>,
+) -> QueryResult<'a, W> {
+    match result.materialize_cursor() {
+        QueryResult::One(v) => QueryResult::Owned(to_owned_lossy_shared::<S, _>(&v)),
+        QueryResult::Many(vs) => {
+            QueryResult::ManyOwned(vs.iter().map(to_owned_lossy_shared::<S, _>).collect())
+        }
+        other => detach_from_temp_document::<_, S>(other),
+    }
 }
 
 /// Own every value in `result` so it stops borrowing the throwaway document
