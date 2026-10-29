@@ -106582,7 +106582,8 @@ mod tests {
     fn test_lazy_object_construction_non_string_key_2180() {
         query!(
             br#"{"a":1}"#,
-            "first({(1): 2})",
+            // A computed key: jq refuses a constant `(1)` while compiling (#5501).
+            "first({(.a): 2})",
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "Cannot use number (1) as object key");
             }
@@ -109088,9 +109089,17 @@ mod tests {
         is(reemit("{\"q\": 1}"), "{\"q\": 1}");
         assert_eq!(reemit("{\"q\": .b}"), None);
         assert_eq!(reemit("{\"k\": 1, \"j\": .}"), None);
-        is(reemit("{(5): 1}"), "{\"5\": 1}");
         assert_eq!(reemit("{(.b): 1}"), None);
-        assert_eq!(reemit("{([1]): 1}"), None);
+        // A constant non-string key is a jq compile error (#5501), so these two
+        // rows are yq-mode source, the only mode `yq_empty_context_reemit` serves.
+        let yq_reemit = |src: &str| {
+            yq_empty_context_reemit(&crate::jq::parse_with_mode(src, ParserMode::Yq).unwrap())
+        };
+        assert_eq!(
+            yq_reemit("{(5): 1}"),
+            Some(crate::jq::parse_with_mode("{\"5\": 1}", ParserMode::Yq).unwrap())
+        );
+        assert_eq!(yq_reemit("{([1]): 1}"), None);
         // Anything that reads its input propagates the emptiness.
         for src in [".", ".b", "length", "select(true)", "tostring", "keys"] {
             assert_eq!(reemit(src), None, "`{src}`");

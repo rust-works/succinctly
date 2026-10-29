@@ -59394,7 +59394,7 @@ mod tests {
     /// error before the filter ever runs).
     #[test]
     fn each_object_entries_generic_computed_key_verdicts_2180() {
-        let (out, control) = drive_each_sink::<YqSemantics>(br#"{"x":1}"#, "{(1): 2}");
+        let (out, control) = drive_each_sink::<YqSemantics>(br#"{"x":1}"#, "{(.x): 2}");
         assert_eq!(
             out,
             vec![OwnedValue::Object(
