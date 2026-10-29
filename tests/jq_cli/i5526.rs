@@ -27,7 +27,7 @@ fn assert_refused(stdout: &str, stderr: &str, code: i32, what: &str) {
 fn test_built_value_past_the_tree_ceiling_is_a_refusal_not_a_panic_5526() -> Result<()> {
     for filter in [
         "last(f(400)) | length",
-        "{a:1} | .a += f(400) | length",
+        "{\"a\":1} | .a += f(400) | length",
         "null | .a //= f(400) | length",
         "try error(f(400)) catch 1",
         "last(foreach range(385) as $i (0;[.])) | length",
