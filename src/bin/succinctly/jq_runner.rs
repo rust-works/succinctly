@@ -31,7 +31,7 @@ use succinctly::json::validate::{self, ValidationError};
 use succinctly::json::JsonIndex;
 
 use super::m2_gate::can_use_m2_streaming;
-use super::JqCommand;
+use super::{JqCommand, OnError};
 use crate::output::{
     self, escape_json_string, escape_json_string_ascii, exit_codes, flush_then_err, ColorScheme,
     DiagStyle, ErrorSink, InputLocation, JsonFormatOpts, LoudFlushWriter, Terminator,
@@ -4434,6 +4434,89 @@ fn get_error_line(input: &[u8], line: usize, column: usize) -> Option<(String, u
     Some((display_content, caret_offset))
 }
 
+/// What the exit status remembers of the top-level inputs already finished (#5471).
+///
+/// jq's exit status is the *last* input's outcome: `main.c` reassigns its status from each
+/// `process()` call, so an error on an earlier input is forgotten. Under `-e`, an input that
+/// produced nothing falls back to `last_result`, which only an input that produced output and
+/// raised no error updates. This is that `last_result`; the runner's own `had_output` and
+/// `last_output` hold the current input's.
+#[derive(Default)]
+struct FinishedInputs {
+    had_output: bool,
+    last_output: Option<OwnedValue>,
+}
+
+impl FinishedInputs {
+    /// Close the input that just finished and start the next one. `false` once
+    /// `--on-error=stop` has seen an error: the caller then evaluates no further input.
+    fn next_input(
+        &mut self,
+        on_error: Option<OnError>,
+        sink: &mut ErrorSink,
+        had_output: &mut bool,
+        last_output: &mut Option<OwnedValue>,
+    ) -> bool {
+        if stopped(on_error, sink) {
+            return false;
+        }
+        self.close(sink, had_output, last_output);
+        sink.start_input();
+        true
+    }
+
+    fn close(
+        &mut self,
+        sink: &ErrorSink,
+        had_output: &mut bool,
+        last_output: &mut Option<OwnedValue>,
+    ) {
+        if *had_output && !sink.input_failed() {
+            self.had_output = true;
+            self.last_output = last_output.take();
+        }
+        *had_output = false;
+        *last_output = None;
+    }
+}
+
+/// Whether `--on-error=stop` has seen an error, so nothing more is read or evaluated (#5471).
+fn stopped(on_error: Option<OnError>, sink: &ErrorSink) -> bool {
+    on_error == Some(OnError::Stop) && sink.hit()
+}
+
+/// The exit code once every input has run (halt has already returned its own).
+///
+/// An uncaught error outranks -e: jq's 5 says the filter failed, -e's 1/4 describe an
+/// otherwise-successful result that happened to be falsy (#355 vs #178). Which errors count
+/// is `--on-error`'s: by default only the last input's, as in jq, plus a decode failure
+/// anywhere, since jq stops at a malformed document (#5471).
+fn jq_exit_code(
+    args: &JqCommand,
+    sink: &ErrorSink,
+    mut finished: FinishedInputs,
+    mut had_output: bool,
+    mut last_output: Option<OwnedValue>,
+) -> i32 {
+    let failed = match args.on_error {
+        None => sink.input_failed() || sink.decode_failed(),
+        Some(OnError::Continue | OnError::Stop) => sink.hit(),
+    };
+    if failed {
+        return DiagStyle::Jq.error_exit_code();
+    }
+    if args.exit_status {
+        finished.close(sink, &mut had_output, &mut last_output);
+        if !finished.had_output {
+            return exit_codes::NO_OUTPUT;
+        }
+        if let Some(OwnedValue::Null | OwnedValue::Bool(false)) = finished.last_output {
+            return exit_codes::FALSE_OR_NULL;
+        }
+    }
+    exit_codes::SUCCESS
+}
+
 /// Run the jq command with the given arguments.
 /// Returns the exit code (0 for success, non-zero for various errors).
 pub fn run_jq(mut args: JqCommand) -> Result<i32> {
@@ -4749,9 +4832,11 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     // One record's rendered body, reused across records (#3265).
     let mut record_scratch = Vec::new();
 
-    // Track last output for exit status
+    // Track last output for exit status: the current top-level input's, and
+    // what the inputs before it left behind (#5471).
     let mut last_output: Option<OwnedValue> = None;
     let mut had_output = false;
+    let mut finished = FinishedInputs::default();
     // Uncaught evaluation errors. Evaluation continues past one (as jq does),
     // so the failure is remembered here and turned into exit 5 below (#355).
     let mut sink = ErrorSink::default();
@@ -4783,7 +4868,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 }
             };
 
-            for (file_idx, raw) in raw_inputs.into_iter().enumerate() {
+            'files: for (file_idx, raw) in raw_inputs.into_iter().enumerate() {
                 jq::cli_context::set_current_source(u32::try_from(file_idx).ok());
                 let file = files.get(file_idx).map(|p| p.to_string_lossy().to_string());
 
@@ -4795,6 +4880,15 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 let rows = DsvRows::new(&raw, &index);
 
                 for (row_idx, row) in rows.enumerate() {
+                    // Each row is one top-level input.
+                    if !finished.next_input(
+                        args.on_error,
+                        &mut sink,
+                        &mut had_output,
+                        &mut last_output,
+                    ) {
+                        break 'files;
+                    }
                     // One row per line, so the row index is the line. Approximate
                     // for fields containing an embedded newline; jq has no DSV
                     // input mode, so there is no oracle to match here anyway.
@@ -4848,25 +4942,13 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
             }
 
             out.flush()?;
-
-            // Determine exit code. An uncaught error outranks -e: jq's 5 says
-            // the filter failed, -e's 1/4 describe an otherwise-successful
-            // result that happened to be falsy (#355 vs #178).
-            if sink.hit() {
-                return Ok(DiagStyle::Jq.error_exit_code());
-            }
-            if args.exit_status {
-                if !had_output {
-                    return Ok(exit_codes::NO_OUTPUT);
-                }
-                if let Some(last) = last_output {
-                    if matches!(last, OwnedValue::Null | OwnedValue::Bool(false)) {
-                        return Ok(exit_codes::FALSE_OR_NULL);
-                    }
-                }
-            }
-
-            return Ok(exit_codes::SUCCESS);
+            return Ok(jq_exit_code(
+                &args,
+                &sink,
+                finished,
+                had_output,
+                last_output,
+            ));
         }
         // Fall through to original path for slurp mode
     }
@@ -4996,7 +5078,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
         // file's lines as #4305 left them (#4316).
         let seams_align = seams.is_empty() || seams.len() == raw_inputs.len();
         debug_assert!(slurped.is_some() || seams_align);
-        for (idx, raw) in raw_inputs.iter().enumerate() {
+        'files: for (idx, raw) in raw_inputs.iter().enumerate() {
             // The slurped document answers for the last file (`input_filename`,
             // and the file a diagnostic names), as the materializing route's
             // `InputLocations::single` always did.
@@ -5068,6 +5150,10 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 seam,
             );
             for (start, end) in values {
+                if !finished.next_input(args.on_error, &mut sink, &mut had_output, &mut last_output)
+                {
+                    break 'files;
+                }
                 let json_bytes = &raw[start..end];
 
                 // Fast path for identity query: output raw bytes directly without materialization.
@@ -5338,6 +5424,9 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
             // has been processed. jq's parser stops at the first malformed
             // value and reads nothing after it, this file or any later one
             // (#4313), so the files that follow are not run either.
+            if stopped(args.on_error, &sink) {
+                break;
+            }
             if let Some(offset) = split_error {
                 let at =
                     InputLocation::at(filename.as_deref(), parse_error_line(raw, offset, seam));
@@ -5546,6 +5635,9 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 // loop reports it uncaught, at exit 5, and stops -- the prefix
                 // before it already ran, and nothing after it exists (#2961).
                 loop {
+                    if stopped(args.on_error, &sink) {
+                        break;
+                    }
                     let input = match jq::pop_input() {
                         jq::InputPop::Document(input) => input,
                         // jq's main loop prints a `--seq` parse error as
@@ -5567,6 +5659,15 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                         }
                         jq::InputPop::Exhausted => break,
                     };
+                    // Only this loop's pops start a top-level input: a
+                    // document the filter's own `input` reads belongs to the
+                    // input that read it, as in jq.
+                    finished.next_input(
+                        args.on_error,
+                        &mut sink,
+                        &mut had_output,
+                        &mut last_output,
+                    );
                     // Streaming, not collect-then-write (#1653) -- see
                     // `evaluate_input_streaming`.
                     evaluate_input_streaming(
@@ -5596,7 +5697,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
             }
         } else {
             let stream_events_lazily = stream_mode(&args, uses_input_builtins) == StreamMode::Lazy;
-            for (idx, document) in inputs.iter().enumerate() {
+            'documents: for (idx, document) in inputs.iter().enumerate() {
                 // `UNKNOWN_LINE`, not just any missing entry, must clear the
                 // source too (#3202): `input_filename` can't otherwise tell
                 // "this value's file is genuinely stdin" apart from "no
@@ -5629,6 +5730,16 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                     let Some(input) = input else {
                         break;
                     };
+                    // Each `--stream` event is a top-level input of its own,
+                    // as in jq, which runs the program once per event.
+                    if !finished.next_input(
+                        args.on_error,
+                        &mut sink,
+                        &mut had_output,
+                        &mut last_output,
+                    ) {
+                        break 'documents;
+                    }
                     evaluate_input_streaming(
                         &input,
                         &expr,
@@ -5657,7 +5768,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
             // The parse error the stream ended in, reported after the
             // documents before it (#2961) -- or, for `--seq -s`, the warning
             // jq defers past the filter (#3201).
-            if let Some(t) = trailing_error {
+            if let Some(t) = trailing_error.filter(|_| !stopped(args.on_error, &sink)) {
                 if t.seq_warning {
                     eprintln!(
                         "{}",
@@ -5675,25 +5786,13 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     }
 
     out.flush()?;
-
-    // Determine exit code. An uncaught error outranks -e: jq's 5 says the
-    // filter failed, -e's 1/4 describe an otherwise-successful result that
-    // happened to be falsy (#355 vs #178).
-    if sink.hit() {
-        return Ok(DiagStyle::Jq.error_exit_code());
-    }
-    if args.exit_status {
-        if !had_output {
-            return Ok(exit_codes::NO_OUTPUT);
-        }
-        if let Some(last) = last_output {
-            if matches!(last, OwnedValue::Null | OwnedValue::Bool(false)) {
-                return Ok(exit_codes::FALSE_OR_NULL);
-            }
-        }
-    }
-
-    Ok(exit_codes::SUCCESS)
+    Ok(jq_exit_code(
+        &args,
+        &sink,
+        finished,
+        had_output,
+        last_output,
+    ))
 }
 
 /// Build the evaluation context from command-line arguments.

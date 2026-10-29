@@ -189,13 +189,19 @@ pub struct ErrorSink {
     report_count: usize,
     /// How many of the reports the program itself raised (see [`Self::program_error_count`]).
     program_errors: usize,
+    /// `report_count` when the current top-level input started (see [`Self::input_failed`]).
+    input_start: usize,
+    /// Whether a value failed to decode (see [`Self::decode_failed`]).
+    decode_failed: bool,
     halt: Option<i32>,
 }
 
 impl ErrorSink {
     /// Report an uncaught evaluation error and mark the run as failed.
     pub fn report(&mut self, style: DiagStyle, err: &EvalError, at: &InputLocation) {
-        if !err.is_decode_failure() && !err.is_resource_limit() {
+        if err.is_decode_failure() {
+            self.decode_failed = true;
+        } else if !err.is_resource_limit() {
             self.program_errors += 1;
         }
         self.emit(style, &err.message, err.payload_is_not_a_string(), at);
@@ -293,6 +299,24 @@ impl ErrorSink {
     /// `write_split_result` needs to avoid double-reporting).
     pub fn report_count(&self) -> usize {
         self.report_count
+    }
+
+    /// Mark the start of a top-level input: [`Self::input_failed`] counts from here (#5471).
+    pub fn start_input(&mut self) {
+        self.input_start = self.report_count;
+    }
+
+    /// Whether anything was reported since the last [`Self::start_input`]. jq's exit status
+    /// is the last input's own outcome, so this, not [`Self::hit`], is what it reads (#5471).
+    pub fn input_failed(&self) -> bool {
+        self.report_count > self.input_start
+    }
+
+    /// Whether a value failed to decode at any point in the run. jq stops at a malformed
+    /// document and exits 5, where succinctly reads on past it (it validates only what it
+    /// reads), so this stays failed whatever the inputs after it do (#5471).
+    pub fn decode_failed(&self) -> bool {
+        self.decode_failed
     }
 }
 
@@ -1636,6 +1660,44 @@ mod tests {
             &InputLocation::at(None, 1),
         );
         assert!(sink.hit(), "an uncaught error must fail the run");
+    }
+
+    #[test]
+    fn test_error_sink_input_failed_counts_from_the_last_input_start() {
+        let at = InputLocation::at(None, 1);
+        let mut sink = ErrorSink::default();
+        assert!(!sink.input_failed());
+        sink.report(DiagStyle::Jq, &EvalError::new("boom"), &at);
+        assert!(
+            sink.input_failed(),
+            "an error fails the input it was raised in"
+        );
+        sink.start_input();
+        assert!(!sink.input_failed(), "the next input starts clean (#5471)");
+        assert!(sink.hit(), "the run still remembers it");
+        sink.report(DiagStyle::Jq, &EvalError::new("boom"), &at);
+        assert!(sink.input_failed());
+    }
+
+    #[test]
+    fn test_error_sink_decode_failure_stays_failed_across_inputs() {
+        let at = InputLocation::at(None, 1);
+        let mut sink = ErrorSink::default();
+        sink.report(DiagStyle::Jq, &EvalError::new("boom"), &at);
+        sink.report(DiagStyle::Jq, &EvalError::resource_limit("cap"), &at);
+        assert!(!sink.decode_failed(), "only a decode failure is sticky");
+        sink.report(DiagStyle::Jq, &EvalError::decode_failure("bad"), &at);
+        sink.start_input();
+        assert!(!sink.input_failed());
+        assert!(
+            sink.decode_failed(),
+            "jq stops at a malformed document (#5471)"
+        );
+        assert_eq!(
+            sink.program_error_count(),
+            1,
+            "a decode failure is not the program's"
+        );
     }
 
     #[test]

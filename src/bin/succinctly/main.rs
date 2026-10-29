@@ -1049,6 +1049,12 @@ struct JqCommand {
     #[arg(short = 'e', long, overrides_with = "exit_status")]
     exit_status: bool,
 
+    /// What an uncaught error does to the run (succinctly extension, not a jq flag). Without
+    /// it the exit status is the last input's outcome, as in jq: `continue` exits 5 if any
+    /// input failed, `stop` stops at the first failure and exits 5 (#5471)
+    #[arg(long, value_name = "MODE", overrides_with = "on_error")]
+    on_error: Option<OnError>,
+
     /// Flush output after each JSON value
     #[arg(long, overrides_with = "unbuffered")]
     unbuffered: bool,
@@ -1061,6 +1067,17 @@ struct JqCommand {
     /// Show build configuration
     #[arg(long, overrides_with = "build_configuration")]
     build_configuration: bool,
+}
+
+/// `succinctly jq --on-error`: how an uncaught error affects the run (#5471).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum OnError {
+    /// Process every input; exit 5 if any of them failed.
+    #[value(name = "continue")]
+    Continue,
+    /// Evaluate no input after the first one that failed; exit 5.
+    #[value(name = "stop")]
+    Stop,
 }
 
 /// Output format for yq command
