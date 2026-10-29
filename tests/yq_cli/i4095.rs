@@ -126,6 +126,49 @@ fn test_recurse_cond_positions_match_path_of_the_same_walk_4095() -> Result<()> 
     Ok(())
 }
 
+/// A computed node has no live cursor, so the walk runs over an owned value that carries its own
+/// position. Constructed values stand at the root of their own path, which makes
+/// `path(recurse(.[]?; cond))` over the same value the position reference; `cond` = `true` is also
+/// pinned to `..`, with `key` and `parent`.
+#[test]
+fn test_recurse_cond_keeps_the_positions_of_computed_nodes_4095() -> Result<()> {
+    for prefix in ["{a: [1, {b: 2}]} | ", "[[1, 2], {c: 3}] | "] {
+        for cond in ["true", "type != \"!!seq\"", ". != 1", "false"] {
+            let want = run(&format!("{prefix}[path(recurse(.[]?; {cond}))]"), "a: 5\n")?;
+            let got = run(&format!("{prefix}[recurse(.[]?; {cond}) | path]"), "a: 5\n")?;
+            assert_eq!(got, want, "`{prefix}` / `{cond}`");
+        }
+        for tail in ["| [key, path, parent] | tojson", "| key", "| path"] {
+            let want = run(&format!("{prefix}[.. {tail}]"), "a: 5\n")?;
+            let got = run(&format!("{prefix}[recurse(.[]?; true) {tail}]"), "a: 5\n")?;
+            assert_eq!(got, want, "`{prefix}` / `{tail}`");
+        }
+    }
+    Ok(())
+}
+
+/// A `cond` that raises while the walk asks it at a position raises out of the position stage
+/// too, for a live document and for a computed value.
+#[test]
+fn test_recurse_cond_that_raises_reaches_a_position_stage_4095() -> Result<()> {
+    for (doc, filter) in [
+        (TREE, r#"[recurse(.[]?; error("boom")) | path]"#),
+        (
+            "a: 5\n",
+            r#"{a: [1]} | [recurse(.[]?; error("boom")) | path]"#,
+        ),
+        (
+            "a: 5\n",
+            r#"{a: [1]} | [recurse(.[]?; error("boom")) | key]"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, ARGS)?;
+        assert_ne!(code, 0, "`{filter}` -- stdout: {stdout:?}");
+        assert!(stderr.contains("boom"), "`{filter}` -- stderr: {stderr:?}");
+    }
+    Ok(())
+}
+
 /// A value-only consumer of the walk is unchanged: the cursor walk and the owned walk it
 /// replaced list the same nodes in the same order, and a `cond` that raises does so after the
 /// earlier siblings' subtrees were delivered.
