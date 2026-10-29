@@ -29,6 +29,11 @@
 #
 #   deep-recursion-tests.sh skip-args   prints `--exact --skip <name> ...`, which
 #                                       ci.yml appends after `--` on `cli-gated`
+#   deep-recursion-tests.sh skip-args-stack
+#                                       the same for the two stack tests only: the
+#                                       x86_64 `holdout` leg is the one place the
+#                                       `unshared-containers` build is tested, so it
+#                                       keeps running the heavy tests and skips just these
 #   deep-recursion-tests.sh run         the whole `deep-recursion` leg
 #
 # Why `run` checks more than `cargo test -- --exact <names>` does: libtest runs
@@ -51,11 +56,14 @@ set -euo pipefail
 
 TEST_TARGET=jq_cli_tests
 
-DEEP_RECURSION_TESTS=(
-  # The native stack is the cost (#3698).
+# The two whose cost is the native stack (#3698). The `holdout` leg skips only these.
+STACK_TESTS=(
   test_recursion_refuses_before_the_native_stack_runs_out_3262
   test_composed_recursion_across_two_defs_errors_not_aborts_1371
-  # 10 s or more each, in the order of the #5494 measurement (seconds, M5 Max, in parallel).
+)
+
+# 10 s or more each, in the order of the #5494 measurement (seconds, M5 Max, in parallel).
+HEAVY_TESTS=(
   test_fused_slice_read_equals_the_unfused_spelling_4195 # 72
   test_recurse_cap_raises_instead_of_ending_silently_3716 # 68
   test_fused_literal_slice_read_equals_the_unfused_spelling_4323 # 61
@@ -76,13 +84,17 @@ DEEP_RECURSION_TESTS=(
   test_type_selectors_equal_their_definition_3690 # 11
 )
 
+# What the `deep-recursion` leg runs, and every other leg but `holdout` skips.
+DEEP_RECURSION_TESTS=("${STACK_TESTS[@]}" "${HEAVY_TESTS[@]}")
+
 usage() {
-  echo "usage: $0 skip-args|run" >&2
+  echo "usage: $0 skip-args|skip-args-stack|run" >&2
 }
 
-skip_args() {
+# `--exact --skip <name> ...` for the names given.
+skip_args_of() {
   local args="--exact" name
-  for name in "${DEEP_RECURSION_TESTS[@]}"; do
+  for name in "$@"; do
     args="$args --skip $name"
   done
   echo "$args"
@@ -124,7 +136,8 @@ run() {
 }
 
 case "${1:-}" in
-  skip-args) skip_args ;;
+  skip-args) skip_args_of "${DEEP_RECURSION_TESTS[@]}" ;;
+  skip-args-stack) skip_args_of "${STACK_TESTS[@]}" ;;
   run) run ;;
   *) usage; exit 2 ;;
 esac

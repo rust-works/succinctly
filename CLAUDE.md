@@ -90,10 +90,10 @@ cargo llvm-cov report --lcov --output-path target/coverage.lcov
 patchcov diff --report target/coverage.lcov
 ```
 
-The two stack-filling `jq_cli_tests` listed in `scripts/deep-recursion-tests.sh` (each fills a 2 GB native
-stack; the list also holds the 18 slowest tests, #5494) are `#[ignore]`d under `cfg(coverage)`, so `cargo llvm-cov` reports them as ignored:
-they cover no line the rest of the suite does not (#3750), and they still run in the
-`deep-recursion` CI leg and under a plain `cargo test`.
+The two stack-filling `jq_cli_tests` listed in `scripts/deep-recursion-tests.sh` (each fills a 2 GB
+native stack; the list also holds the 18 slowest tests, #5494) are `#[ignore]`d under `cfg(coverage)`,
+so `cargo llvm-cov` reports them as ignored: they cover no line the rest of the suite does not (#3750),
+and they still run in the `deep-recursion` CI leg and under a plain `cargo test`.
 
 ### CLI Tool
 

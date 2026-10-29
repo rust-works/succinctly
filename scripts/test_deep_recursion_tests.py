@@ -41,10 +41,9 @@ exit "${FAKE_EXIT:-0}"
 """
 
 
-
-def skip_arg_tokens():
+def skip_arg_tokens(subcommand="skip-args"):
     done = subprocess.run(
-        [str(SCRIPT), "skip-args"], capture_output=True, text=True, check=True
+        [str(SCRIPT), subcommand], capture_output=True, text=True, check=True
     )
     return done.stdout.split()
 
@@ -70,6 +69,17 @@ class SkipArgsTests(unittest.TestCase):
         self.assertGreater(len(names), 0)
         self.assertEqual(tokens, ["--exact"] + [t for n in names for t in ("--skip", n)])
         self.assertEqual(len(names), len(set(names)))
+
+    def test_the_two_stack_tests_are_listed_and_the_stack_subset_is_exactly_them(self):
+        # The count the run leg checks follows the list, so a name dropped from it would go
+        # unnoticed there; these two are the reason the leg exists (#3698).
+        stack = [
+            "test_recursion_refuses_before_the_native_stack_runs_out_3262",
+            "test_composed_recursion_across_two_defs_errors_not_aborts_1371",
+        ]
+        self.assertEqual(listed_names()[:2], stack)
+        tokens = skip_arg_tokens("skip-args-stack")
+        self.assertEqual(tokens, ["--exact"] + [t for n in stack for t in ("--skip", n)])
 
     def test_unknown_or_missing_subcommand_is_a_usage_error(self):
         for args in ([], ["bogus"]):
@@ -238,13 +248,15 @@ class CiWiringTests(unittest.TestCase):
 
     def test_no_other_leg_runs_jq_cli_tests_with_the_two_tests_twice(self):
         # A third place running `--test jq_cli_tests` unskipped would run them twice.
-        # The `holdout` leg (#5254) runs it under `--all-features`, and so skips them too.
+        # The `holdout` leg (#5254) runs it under `--all-features`, and skips the stack tests.
         for job in MATRIX_JOBS:
             with self.subTest(job=job):
                 for name, leg in matrix_legs(job).items():
                     if name == "holdout":
+                        # Only the stack tests: this is the one leg that builds
+                        # `unshared-containers`, so it keeps the heavy ones (#5494).
                         self.assertEqual(
-                            leg.count("skip=$(scripts/deep-recursion-tests.sh skip-args)"),
+                            leg.count("skip=$(scripts/deep-recursion-tests.sh skip-args-stack)"),
                             1,
                             name,
                         )

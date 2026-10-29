@@ -165,8 +165,9 @@ trimmed), and 18 more take 10-70 s each (#5494: the `recurse` cap tests walk mil
 documents since #5378, and the fused-slice equivalence tests build large arrays). CI runs
 all of them in their own `deep-recursion` leg rather than in `cli-gated`;
 `scripts/deep-recursion-tests.sh` holds the list for both sides (#3698), so to move another
-slow `jq_cli_tests` test there, add its name to that script (it handles that one test target
-only). `scripts/deep-recursion-tests.sh run` runs just those tests locally, and
+slow `jq_cli_tests` test there, add its name to that script's `HEAVY_TESTS` (it handles that one
+test target only). The x86_64 `holdout` leg skips only the two stack tests (`skip-args-stack`),
+since it is the one place the `unshared-containers` build is tested. `scripts/deep-recursion-tests.sh run` runs just those tests locally, and
 `scripts/test_deep_recursion_tests.py` is the script's own self-test, which the leg runs
 first. A plain `cargo test --features cli` still runs everything.
 
