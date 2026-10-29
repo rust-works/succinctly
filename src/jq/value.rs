@@ -3295,6 +3295,13 @@ impl OwnedValue {
         if let Some(literal) = n.bridge_nonfinite_literal() {
             return Self::from_number_literal::<S>(literal);
         }
+        // #2802: a scalar the bridge carried under its spelling token reads as that text, never
+        // as the token's digits. No value keeps a non-JSON spelling yet, so this is the literal
+        // parse of it (`0x1f` and `~` are `null` there, as for any text that is not a number)
+        // until the spelled variant lands; nothing writes the token before then.
+        if let Some(spelling) = n.bridge_spelling() {
+            return Self::from_number_literal::<S>(&spelling);
+        }
         if let Some(f) = n.bridge_value() {
             return Self::from_bridge_float(f);
         }
@@ -7795,6 +7802,23 @@ mod tests {
             OwnedValue::from_number_bytes::<JqSemantics>(b"1e0"),
             OwnedValue::NumberLiteral(_, _)
         ));
+    }
+
+    /// #2802: the bridge's spelling token reads back as the text it stands for, never as a
+    /// `NumberLiteral` carrying the token's digits -- and, until a spelled variant exists, as the
+    /// literal parse of that text. A document spelling the same bytes is no token (#3034).
+    #[test]
+    fn test_bridge_read_decodes_the_spelling_token_2802() {
+        for (spelling, shape) in [("007", "7"), (".5", "0.5"), ("1e3", "1e3"), ("~", "null")] {
+            let token = crate::json::validate::spelling_token(spelling);
+            let got = read_as_bridge_text::<YqSemantics>(&token);
+            assert_eq!(
+                got,
+                OwnedValue::from_number_literal::<YqSemantics>(spelling),
+                "{spelling} -> {token} -> {got:?} (expected {shape})"
+            );
+            assert!(!format!("{got:?}").contains(&token), "{token}: {got:?}");
+        }
     }
 
     /// jq compares a parsed NaN by instance (#3309): the same token is
