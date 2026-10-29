@@ -67,6 +67,21 @@ pub(crate) fn go_yaml_string_style(s: &str, flow: bool) -> Option<EncodedStringS
     go_yaml_string_style_typed(s, flow, true)
 }
 
+/// Whether go-yaml's emitter single-quotes `s` where it sits in flow context as a *plain*
+/// scalar read from the source, whatever type it resolves to.
+///
+/// The emitter decides on the characters alone (`flow_indicators`), so a plain `x:y`,
+/// `http://a`, `12:30:45`, `2001-12-14T21:59:43Z` or `a?b` inside `[...]` or `{...}` is
+/// written `'x:y'` and the type check [`go_yaml_string_style`] adds does not apply: a plain
+/// scalar of another type is still quoted when it holds a `:` or `?` (#5467).
+#[must_use]
+pub(crate) fn flow_plain_needs_single_quotes(s: &str) -> bool {
+    matches!(
+        go_yaml_string_style_typed(s, true, false),
+        Some(EncodedStringStyle::SingleQuoted)
+    )
+}
+
 /// [`go_yaml_string_style`], optionally without the type check: with an explicit `!!str`
 /// tag in front (yq's `style = "tagged"`, #4066) a string that would read back as
 /// another type is written plain, since the tag already says what it is (`!!str 1`).
@@ -1625,6 +1640,27 @@ mod tests {
             ("0x", "!!str"),
         ] {
             assert_eq!(go_yaml_resolved_tag(text), tag, "{text:?}");
+        }
+    }
+
+    /// #5467: a plain flow scalar is quoted by its characters alone, whatever type it reads as.
+    #[test]
+    fn flow_plain_scalar_quoting_follows_the_flow_indicators() {
+        for s in [
+            "x:y",
+            "http://a",
+            "12:30:45",
+            "2001-12-14T21:59:43Z",
+            "a?b",
+            "?x",
+            ":x",
+            "x:",
+            "a b:c d",
+        ] {
+            assert!(flow_plain_needs_single_quotes(s), "{s:?}");
+        }
+        for s in ["abc", "a b", "1", "true", "null", "1.5", "a#b", "-x", "a-b"] {
+            assert!(!flow_plain_needs_single_quotes(s), "{s:?}");
         }
     }
 }
