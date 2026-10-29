@@ -16120,57 +16120,89 @@ fn recurse_cond_keeps_cursor<S: EvalSemantics, V: DocumentValue>(
 /// of a document the machinery cost more than the comparison it ran.
 ///
 /// The grammar is `true`/`false`/`null`, `.` (truthiness, read in place), `not`, `and`/`or`, and a
-/// comparison between `.` and a literal. A container is decided by being one (it is not equal to a
-/// scalar literal); a scalar is copied and compared with the same `apply_compare_op` the general
-/// route applies, so the answer is the general route's, quirks included (yq compares a scalar with
-/// a literal by its text, so `e: "null"` is `== null`).
+/// comparison between a literal and `.` or `type`. A container compared with a scalar literal is
+/// decided by being one; a scalar is copied once per node and compared with the same
+/// `apply_compare_op` the general route applies, and `type` is the same `yq_type_tag` /
+/// `tagged_type_name` the general route answers, so the verdict is the general route's, quirks
+/// included (yq compares a scalar with a literal by its text, so `e: "null"` is `== null`).
 fn direct_cond_verdict<S: EvalSemantics, V: DocumentValue>(
     cond: &Expr,
     cursor: &V::Cursor,
 ) -> Option<bool> {
+    direct_cond_verdict_with::<S, V>(cond, cursor, &core::cell::OnceCell::new())
+}
+
+/// [`direct_cond_verdict`], with the node's owned copy shared by every comparison in `cond`
+/// (`. != null and . != false` copies a scalar once, not twice). `None` in the cell means the
+/// node cannot be copied, which the general route raises.
+fn direct_cond_verdict_with<S: EvalSemantics, V: DocumentValue>(
+    cond: &Expr,
+    cursor: &V::Cursor,
+    owned: &core::cell::OnceCell<Option<OwnedValue>>,
+) -> Option<bool> {
     match cond {
-        Expr::Paren(inner) => direct_cond_verdict::<S, V>(inner, cursor),
+        Expr::Paren(inner) => direct_cond_verdict_with::<S, V>(inner, cursor, owned),
         Expr::Literal(Literal::Bool(b)) => Some(*b),
         Expr::Literal(Literal::Null) => Some(false),
         Expr::Identity => Some(cursor_is_truthy(cursor)),
         Expr::Pipe(stages) => match &stages[..] {
-            [head, Expr::Not] => direct_cond_verdict::<S, V>(head, cursor).map(|b| !b),
+            [head, Expr::Not] => direct_cond_verdict_with::<S, V>(head, cursor, owned).map(|b| !b),
             _ => None,
         },
         // Both sides are pure, so asking the right one of a falsy `and` (or a truthy `or`) changes
         // nothing but the work, and `None` from either side sends the whole `cond` the general way.
         Expr::And(left, right) => {
             let (l, r) = (
-                direct_cond_verdict::<S, V>(left, cursor)?,
-                direct_cond_verdict::<S, V>(right, cursor)?,
+                direct_cond_verdict_with::<S, V>(left, cursor, owned)?,
+                direct_cond_verdict_with::<S, V>(right, cursor, owned)?,
             );
             Some(l && r)
         }
         Expr::Or(left, right) => {
             let (l, r) = (
-                direct_cond_verdict::<S, V>(left, cursor)?,
-                direct_cond_verdict::<S, V>(right, cursor)?,
+                direct_cond_verdict_with::<S, V>(left, cursor, owned)?,
+                direct_cond_verdict_with::<S, V>(right, cursor, owned)?,
             );
             Some(l || r)
         }
         Expr::Compare { op, left, right } => {
-            let (literal, node_is_left) = match (&**left, &**right) {
-                (Expr::Identity, Expr::Literal(literal)) => (literal, true),
-                (Expr::Literal(literal), Expr::Identity) => (literal, false),
+            let is_operand = |e: &Expr| matches!(e, Expr::Identity | Expr::Builtin(Builtin::Type));
+            let (operand, literal, operand_is_left) = match (&**left, &**right) {
+                (operand, Expr::Literal(literal)) if is_operand(operand) => {
+                    (operand, literal, true)
+                }
+                (Expr::Literal(literal), operand) if is_operand(operand) => {
+                    (operand, literal, false)
+                }
                 _ => return None,
             };
             let node = cursor.value();
-            if node.as_object().is_some() || node.as_array().is_some() {
-                return matches!(op, CompareOp::Eq | CompareOp::Ne)
-                    .then_some(matches!(op, CompareOp::Ne));
-            }
-            // A node that cannot be copied (a decode failure) raises on the general route.
-            let owned = to_owned_cursor::<S, _>(cursor).ok()?;
-            let literal = crate::jq::eval::literal_to_owned(literal);
-            let (l, r) = if node_is_left {
-                (&owned, &literal)
+            let type_name;
+            let operand_value: &OwnedValue = if matches!(operand, Expr::Identity) {
+                if node.as_object().is_some() || node.as_array().is_some() {
+                    return matches!(op, CompareOp::Eq | CompareOp::Ne)
+                        .then_some(matches!(op, CompareOp::Ne));
+                }
+                // A node that cannot be copied (a decode failure) raises on the general route.
+                owned
+                    .get_or_init(|| to_owned_cursor::<S, _>(cursor).ok())
+                    .as_ref()?
             } else {
-                (&literal, &owned)
+                type_name = if S::TAG == EvalTag::Yq {
+                    yq_type_tag(&node, Some(*cursor))
+                } else if node.is_error() {
+                    // A malformed keyword token raises on the general route (#3035).
+                    return None;
+                } else {
+                    tagged_type_name(&node, Some(*cursor)).to_string()
+                };
+                &OwnedValue::String(type_name.into())
+            };
+            let literal = crate::jq::eval::literal_to_owned(literal);
+            let (l, r) = if operand_is_left {
+                (operand_value, &literal)
+            } else {
+                (&literal, operand_value)
             };
             Some(crate::jq::eval::apply_compare_op::<S>(*op, l, r))
         }

@@ -200,14 +200,23 @@ fn test_recurse_cond_comparison_agrees_with_the_general_route_4095() -> Result<(
     Ok(())
 }
 
-/// The verdict for `. == null` and `. == true` is read off the node without decoding it, so it has
-/// to agree with the general route on every spelling YAML gives those: the nulls (`~`, `null`,
-/// `Null`, an empty value), their quoted and tagged look-alikes, the booleans (`true`, `True`, a
-/// quoted `"true"`, `yes`), and a container carrying a `!!null`/`!!bool` tag.
+/// The direct verdict for a comparison with `null`, a boolean or `type` has to agree with the
+/// general route on every spelling YAML gives those: the nulls (`~`, `null`, `Null`, an empty
+/// value), their quoted and tagged look-alikes (yq compares a scalar with a literal by its text,
+/// so `e: "null"` is `== null`), the booleans (`true`, `True`, a quoted `"true"`, `yes`), a
+/// container carrying a `!!null`/`!!bool` tag, and a node with a custom tag (`type` answers the
+/// tag).
 #[test]
 fn test_recurse_cond_null_and_bool_verdicts_agree_with_the_general_route_4095() -> Result<()> {
-    let doc = "a: ~\nb: null\nc: Null\nd:\ne: \"null\"\nf: 'null'\ng: !!str null\nh: true\ni: True\nj: \"true\"\nk: yes\nl: false\nm: !!bool true\nn: 0\no: \"\"\np: []\nq: {}\nr: !!null [1]\ns: !!bool [1]\nt: [~, true, false, [null]]\n";
+    let doc = "a: ~\nb: null\nc: Null\nd:\ne: \"null\"\nf: 'null'\ng: !!str null\nh: true\ni: True\nj: \"true\"\nk: yes\nl: false\nm: !!bool true\nn: 0\no: \"\"\np: []\nq: {}\nr: !!null [1]\ns: !!bool [1]\nt: [~, true, false, [null]]\nu: !custom {x: 5}\nv: !mytag 5\nw: !!map {x: 0x1F}\nx: 2.50\n";
     for cond in [
+        "type == \"!!map\"",
+        "type != \"!!str\"",
+        "\"!!int\" == type",
+        "type == \"!!map\" or type == \"!!seq\"",
+        "type == \"!!str\" and . != \"s\"",
+        "type == \"!custom\" or type == \"!mytag\"",
+        "type == \"!!float\" | not",
         ". == null",
         ". != null",
         "null == .",

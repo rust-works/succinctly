@@ -44,6 +44,11 @@ fn test_path_of_recurse_cond_reads_no_input_past_the_first_node_4095() -> Result
 fn test_recurse_cond_null_and_bool_verdicts_agree_with_the_general_route_4095() -> Result<()> {
     let doc = r#"{"a":null,"b":true,"c":false,"d":0,"e":"","f":"null","g":"true","h":[],"i":{},"j":[null,true,[false,{"k":null}]],"l":1.0,"m":-0}"#;
     for cond in [
+        r#"type == "object""#,
+        r#"type != "string""#,
+        r#""number" == type"#,
+        r#"type == "object" or type == "array""#,
+        r#"type == "number" and . != 0"#,
         ". == null",
         ". != null",
         "null == .",
