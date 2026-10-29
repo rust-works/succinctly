@@ -3,6 +3,7 @@
 use super::cli;
 use super::features::{FeatureSummary, Status};
 use super::harness::{Row, Verdict};
+use super::perf::{Gate, PerfRow};
 use super::Results;
 use std::fmt::Write;
 
@@ -25,6 +26,9 @@ pub fn render(results: &Results) -> String {
         e.git.commit_short,
         if e.git.dirty { " (dirty)" } else { "" },
     );
+    if r.command.contains("--control") {
+        let _ = writeln!(s, "> **CONTROL RUN:** the subject is jq itself, so every ratio shows the harness's noise floor, not a comparison.\n");
+    }
     if !e.invalid_reasons.is_empty() {
         let _ = writeln!(s, "> **INVALID RUN — do not quote the timings:**");
         for why in &e.invalid_reasons {
@@ -44,31 +48,33 @@ pub fn render(results: &Results) -> String {
     let _ = writeln!(s, "| Metric                      | Value |");
     let _ = writeln!(s, "|-----------------------------|-------|");
     let _ = writeln!(s, "| Reference                   | {} |", e.jq_version);
-    let _ = writeln!(s, "| Smoke differential pass     | {matched}/{total} |");
-    match geomean(&speedups) {
-        Some(g) => {
-            let lo = speedups.iter().copied().fold(f64::MAX, f64::min);
-            let hi = speedups.iter().copied().fold(f64::MIN, f64::max);
+    if total > 0 {
+        let _ = writeln!(s, "| Smoke differential pass     | {matched}/{total} |");
+        match geomean(&speedups) {
+            Some(g) => {
+                let lo = speedups.iter().copied().fold(f64::MAX, f64::min);
+                let hi = speedups.iter().copied().fold(f64::MIN, f64::max);
+                let _ = writeln!(
+                    s,
+                    "| Smoke geomean speedup       | {g:.2}x ({lo:.2}x–{hi:.2}x) |"
+                );
+            }
+            None => {
+                let _ = writeln!(s, "| Smoke geomean speedup       | n/a |");
+            }
+        }
+        if let Some(f) = &r.features {
             let _ = writeln!(
                 s,
-                "| Smoke geomean speedup       | {g:.2}x ({lo:.2}x–{hi:.2}x) |"
+                "| Builtins defined by succinctly | {:.1}% of {} probed ({} listed, {} not probed) |",
+                f.implemented_pct, f.probed, f.total, f.not_probed
+            );
+            let _ = writeln!(
+                s,
+                "| Builtins agreeing with the reference | {:.1}% ({}/{}) |",
+                f.matching_pct, f.matching, f.probed
             );
         }
-        None => {
-            let _ = writeln!(s, "| Smoke geomean speedup       | n/a |");
-        }
-    }
-    if let Some(f) = &r.features {
-        let _ = writeln!(
-            s,
-            "| Builtins defined by succinctly | {:.1}% of {} probed ({} listed, {} not probed) |",
-            f.implemented_pct, f.probed, f.total, f.not_probed
-        );
-        let _ = writeln!(
-            s,
-            "| Builtins agreeing with the reference | {:.1}% ({}/{}) |",
-            f.matching_pct, f.matching, f.probed
-        );
     }
     if !r.cli.is_empty() {
         let ok = r
@@ -95,6 +101,42 @@ pub fn render(results: &Results) -> String {
             i.n.total
         );
     }
+    let timed: Vec<&PerfRow> = r
+        .perf
+        .iter()
+        .filter(|x| x.speedup_primary.is_some())
+        .collect();
+    if !timed.is_empty() {
+        let sp: Vec<f64> = timed.iter().filter_map(|x| x.speedup_primary).collect();
+        let (lo, hi) = range(&sp);
+        let _ = writeln!(
+            s,
+            "| Geomean speedup vs {} | {:.2}x ({lo:.2}x–{hi:.2}x, n={}) |",
+            e.jq_version,
+            geomean(&sp).unwrap_or(f64::NAN),
+            sp.len()
+        );
+        let sec: Vec<f64> = timed.iter().filter_map(|x| x.speedup_secondary).collect();
+        if let Some(g) = geomean(&sec) {
+            let (lo, hi) = range(&sec);
+            let _ = writeln!(s, "| Geomean speedup vs the secondary reference | {g:.2}x ({lo:.2}x–{hi:.2}x, n={}) |", sec.len());
+        }
+        let rss: Vec<f64> = timed.iter().filter_map(|x| x.rss_ratio_primary).collect();
+        if let Some(g) = geomean(&rss) {
+            let (lo, hi) = range(&rss);
+            let _ = writeln!(
+                s,
+                "| Geomean peak RSS vs {} | {g:.2}x ({lo:.2}x–{hi:.2}x) |",
+                e.jq_version
+            );
+        }
+        let _ = writeln!(
+            s,
+            "| Timing rows jq wins / noisy (CV > 5%) | {} / {} |",
+            sp.iter().filter(|x| **x < 1.0).count(),
+            timed.iter().filter(|x| x.noisy).count()
+        );
+    }
     if r.features.is_some() || !r.cli.is_empty() || !r.differential.is_empty() || r.input.is_some()
     {
         let _ = writeln!(
@@ -118,63 +160,66 @@ pub fn render(results: &Results) -> String {
         let _ = writeln!(s, "| {} | {} |", d.name, d.status);
     }
 
-    // Deterministic section: no timings.
-    let _ = writeln!(s, "\n## Smoke: correctness\n");
-    let _ = writeln!(s, "| Query | Verdict | jq exit | succinctly exit |");
-    let _ = writeln!(s, "|-------|---------|---------|-----------------|");
-    for x in &r.smoke {
-        let ex = |c: Option<i32>| c.map_or_else(|| "signal".into(), |c| c.to_string());
-        let v = if x.verdict == Verdict::Match {
-            "match"
-        } else {
-            "**DIFFERS**"
-        };
-        let _ = writeln!(
-            s,
-            "| {} | {v} | {} | {} |",
-            x.id,
-            ex(x.reference_exit),
-            ex(x.subject_exit)
-        );
-    }
+    if total > 0 {
+        // Deterministic section: no timings.
+        let _ = writeln!(s, "\n## Smoke: correctness\n");
+        let _ = writeln!(s, "| Query | Verdict | jq exit | succinctly exit |");
+        let _ = writeln!(s, "|-------|---------|---------|-----------------|");
+        for x in &r.smoke {
+            let ex = |c: Option<i32>| c.map_or_else(|| "signal".into(), |c| c.to_string());
+            let v = if x.verdict == Verdict::Match {
+                "match"
+            } else {
+                "**DIFFERS**"
+            };
+            let _ = writeln!(
+                s,
+                "| {} | {v} | {} | {} |",
+                x.id,
+                ex(x.reference_exit),
+                ex(x.subject_exit)
+            );
+        }
 
-    let _ = writeln!(
-        s,
-        "\n## Smoke: timing (process spawn, ms; matching outputs only)\n"
-    );
-    let _ = writeln!(
-        s,
-        "| Query | jq median (MAD) | succinctly median (MAD) | speedup |"
-    );
-    let _ = writeln!(
-        s,
-        "|-------|-----------------|-------------------------|---------|"
-    );
-    let timed: Vec<&Row> = r.smoke.iter().filter(|x| x.speedup.is_some()).collect();
-    for x in timed {
-        let (a, b) = (x.reference.as_ref().unwrap(), x.subject.as_ref().unwrap());
         let _ = writeln!(
             s,
-            "| {} | {:.2} ({:.2}) | {:.2} ({:.2}) | {:.2}x |",
-            x.id,
-            a.median_ms,
-            a.mad_ms,
-            b.median_ms,
-            b.mad_ms,
-            x.speedup.unwrap()
+            "\n## Smoke: timing (process spawn, ms; matching outputs only)\n"
+        );
+        let _ = writeln!(
+            s,
+            "| Query | jq median (MAD) | succinctly median (MAD) | speedup |"
+        );
+        let _ = writeln!(
+            s,
+            "|-------|-----------------|-------------------------|---------|"
+        );
+        let timed: Vec<&Row> = r.smoke.iter().filter(|x| x.speedup.is_some()).collect();
+        for x in timed {
+            let (a, b) = (x.reference.as_ref().unwrap(), x.subject.as_ref().unwrap());
+            let _ = writeln!(
+                s,
+                "| {} | {:.2} ({:.2}) | {:.2} ({:.2}) | {:.2}x |",
+                x.id,
+                a.median_ms,
+                a.mad_ms,
+                b.median_ms,
+                b.mad_ms,
+                x.speedup.unwrap()
+            );
+        }
+        let _ = writeln!(
+            s,
+            "\nn = {} interleaved repetitions per row. Startup dominates at this input size; \
+             these rows measure process spawn, not throughput.",
+            r.reps
         );
     }
-    let _ = writeln!(
-        s,
-        "\nn = {} interleaved repetitions per row. Startup dominates at this input size; \
-         these rows measure process spawn, not throughput.",
-        r.reps
-    );
 
     features_sections(&mut s, r);
     cli_sections(&mut s, r);
     differential_section(&mut s, r);
     input_section(&mut s, r);
+    perf_sections(&mut s, r);
 
     let _ = writeln!(s, "\n## Reproduce\n");
     let _ = writeln!(s, "```bash\ncargo build --release --features bench-runner");
@@ -368,4 +413,131 @@ fn input_section(s: &mut String, r: &Results) {
          two tools print different values for an input both accept; jq itself accepts {} `n_` cases.",
         i.n.reference
     );
+}
+
+fn range(xs: &[f64]) -> (f64, f64) {
+    (
+        xs.iter().copied().fold(f64::MAX, f64::min),
+        xs.iter().copied().fold(f64::MIN, f64::max),
+    )
+}
+
+fn med(x: &PerfRow, i: usize) -> Option<String> {
+    let t = x.tools.get(i)?;
+    let (s, cv) = (t.stats.as_ref()?, t.cv_pct?);
+    Some(format!("{:.1} ({cv:.0}%)", s.median_ms))
+}
+
+fn ratio(v: Option<f64>) -> String {
+    v.map_or_else(|| "n/a".into(), |v| format!("{v:.2}x"))
+}
+
+fn perf_sections(s: &mut String, r: &Results) {
+    if r.perf.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        s,
+        "\n## D. Performance (process spawn, ms; matching outputs only)\n"
+    );
+    let _ = writeln!(
+        s,
+        "Median of {} interleaved repetitions (fewer at 100 MB), CV in parentheses; the tool order \
+         rotates each repetition. A speedup is reference ÷ succinctly, so below 1.00x jq is faster. \
+         `1.8.1 ÷ 1.7.1` is the secondary reference's own change in speed.{}\n",
+        r.reps,
+        r.perf_note.as_deref().map_or(String::new(), |n| format!(" ({n}.)"))
+    );
+    let wrong: Vec<&PerfRow> = r.perf.iter().filter(|x| x.gate == Gate::Differs).collect();
+    if !wrong.is_empty() {
+        let _ = writeln!(
+            s,
+            "**Correctness rows (output differs from the primary reference; untimed):**\n"
+        );
+        for x in &wrong {
+            let _ = writeln!(
+                s,
+                "- `{}` on `{}`: {}",
+                x.query,
+                x.input,
+                note_for(r, &format!("perf:{}@{}", x.query, x.input))
+            );
+        }
+        s.push('\n');
+    }
+    let timed: Vec<&PerfRow> = r
+        .perf
+        .iter()
+        .filter(|x| x.speedup_primary.is_some())
+        .collect();
+    let losses: Vec<&&PerfRow> = timed
+        .iter()
+        .filter(|x| x.speedup_primary < Some(1.0))
+        .collect();
+    let _ = writeln!(s, "### Where jq is faster\n");
+    if losses.is_empty() {
+        let _ = writeln!(s, "None in this run.\n");
+    } else {
+        let _ = writeln!(s, "| Query | Input | jq 1.7.1 | succinctly | speedup |");
+        let _ = writeln!(s, "|-------|-------|----------|------------|---------|");
+        for x in losses {
+            let _ = writeln!(
+                s,
+                "| {} | {} | {} | {} | {} |",
+                x.query,
+                x.input,
+                med(x, 1).unwrap_or_default(),
+                med(x, 0).unwrap_or_default(),
+                ratio(x.speedup_primary)
+            );
+        }
+        s.push('\n');
+    }
+    let _ = writeln!(s, "### All timed rows\n");
+    let _ = writeln!(s, "| Query | Input | jq 1.7.1 | succinctly | vs 1.7.1 | jq 1.8.1 | vs 1.8.1 | 1.8.1 ÷ 1.7.1 | CV>5% |");
+    let _ = writeln!(s, "|-------|-------|----------|------------|----------|----------|----------|---------------|-------|");
+    for x in &timed {
+        let _ = writeln!(
+            s,
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            x.query,
+            x.input,
+            med(x, 1).unwrap_or_default(),
+            med(x, 0).unwrap_or_default(),
+            ratio(x.speedup_primary),
+            med(x, 2).unwrap_or_else(|| "n/a".into()),
+            ratio(x.speedup_secondary),
+            ratio(x.secondary_over_primary),
+            if x.noisy { "yes" } else { "" }
+        );
+    }
+    let _ = writeln!(
+        s,
+        "\n## E. Memory (peak RSS, KiB; separate untimed runs, median of 3)\n"
+    );
+    let _ = writeln!(
+        s,
+        "| Query | Input | jq 1.7.1 | succinctly | ratio (succinctly ÷ jq) |"
+    );
+    let _ = writeln!(
+        s,
+        "|-------|-------|----------|------------|-------------------------|"
+    );
+    for x in &timed {
+        let kb = |i: usize| {
+            x.tools
+                .get(i)
+                .and_then(|t| t.peak_rss_kb)
+                .map_or_else(|| "n/a".into(), |v| v.to_string())
+        };
+        let _ = writeln!(
+            s,
+            "| {} | {} | {} | {} | {} |",
+            x.query,
+            x.input,
+            kb(1),
+            kb(0),
+            ratio(x.rss_ratio_primary)
+        );
+    }
 }

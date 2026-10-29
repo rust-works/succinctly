@@ -10,6 +10,9 @@ use std::time::{Duration, Instant};
 
 const DEADLINE: Duration = Duration::from_secs(10);
 
+/// The perf gate runs whole-corpus queries that legitimately take minutes in jq.
+pub const PERF_DEADLINE: Duration = Duration::from_secs(900);
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Exec {
     /// `None` when killed by a signal or by the deadline.
@@ -29,6 +32,16 @@ impl Exec {
 /// Run `tool` with `args` and `stdin` in `cwd`. The environment is fixed
 /// (`TZ=UTC`, `LC_ALL=C`) so a locale or zone cannot read as a divergence.
 pub fn exec(tool: &Tool, args: &[String], stdin: impl AsRef<[u8]>, cwd: &Path) -> Result<Exec> {
+    exec_within(tool, args, stdin, cwd, DEADLINE)
+}
+
+pub fn exec_within(
+    tool: &Tool,
+    args: &[String],
+    stdin: impl AsRef<[u8]>,
+    cwd: &Path,
+    deadline: Duration,
+) -> Result<Exec> {
     let mut child = Command::new(&tool.program)
         .args(&tool.prefix)
         .args(args)
@@ -63,7 +76,7 @@ pub fn exec(tool: &Tool, args: &[String], stdin: impl AsRef<[u8]>, cwd: &Path) -
         if let Some(s) = child.try_wait()? {
             break (s.code(), false);
         }
-        if start.elapsed() > DEADLINE {
+        if start.elapsed() > deadline {
             let _ = child.kill();
             let _ = child.wait();
             break (None, true);

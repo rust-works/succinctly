@@ -35,6 +35,11 @@ pub struct Probes {
     pub divergences: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct Perf {
+    pub queries: String,
+}
+
 /// A vendored upstream test file, pinned by content.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Suite {
@@ -54,6 +59,9 @@ pub struct Manifest {
     #[serde(rename = "suite", default)]
     pub suites: Vec<Suite>,
     pub json_suite: Suite,
+    pub perf: Perf,
+    #[serde(rename = "input", default)]
+    pub inputs: Vec<super::perf::InputSpec>,
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -130,7 +138,7 @@ mod tests {
     fn two_primaries_are_rejected() {
         let text = "schema_version = 1\n\
             [succinctly]\nprofile='release'\nfeatures=''\n[queries]\nsmoke='x'\n\
-            [probes]\ncli='x'\nextensions='x'\nfixtures='x'\ndivergences='x'\n[json_suite]\nid='j'\npath='p'\nsha256='s'\n\
+            [probes]\ncli='x'\nextensions='x'\nfixtures='x'\ndivergences='x'\n[json_suite]\nid='j'\npath='p'\nsha256='s'\n[perf]\nqueries='q'\n\
             [[reference]]\nid='a'\nversion='1'\nrole='primary'\nsource_url=''\nsource_sha256=''\n\
             [[reference]]\nid='b'\nversion='2'\nrole='primary'\nsource_url=''\nsource_sha256=''\n";
         assert!(Manifest::parse(text).is_err());
@@ -148,6 +156,7 @@ mod pin_tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let (m, _) = Manifest::load(root).unwrap();
         assert!(m.suites.len() >= 4);
+        assert!(m.inputs.len() >= 18 && m.inputs.iter().all(|i| i.sha256.len() == 64));
         for s in m.suites.iter().chain([&m.json_suite]) {
             Manifest::read_pinned(root, s).unwrap();
         }

@@ -1,0 +1,43 @@
+# id	flags (space-separated, - for none)	filter	shapes (comma-separated; none = no input file)	max tier (1mb|10mb|100mb)
+startup	-n	1	none	1mb
+identity	-	.	users,numbers,strings,wide,nested,comprehensive	100mb
+identity_compact	-c	.	users,numbers,strings,wide,nested,comprehensive	100mb
+users_field	-c	.users[0]	users	100mb
+users_length	-	[.users[]]|length	users	100mb
+users_names	-r	.users[].name	users	100mb
+users_map_select	-c	[.users[]|select(.score>500)]|length	users	100mb
+users_sort_by	-c	[.users|sort_by(.score)|.[0].id]	users	10mb
+users_group_by	-c	.users|group_by(.age)|length	users	10mb
+users_unique_by	-c	.users|unique_by(.age)|length	users	10mb
+users_reduce	-	reduce .users[] as $u (0; .+$u.score)	users	100mb
+users_to_entries	-c	[.users[0]|to_entries[]|.key]	users	100mb
+users_csv	-r	.users[]|[.id,.name,.email]|@csv	users	100mb
+users_regex	-	[.users[].email|select(test("user1"))]|length	users	10mb
+users_ascii_downcase	-	[.users[]|.name|ascii_downcase]|length	users	100mb
+users_first_early_exit	-	first(.users[])|.id	users	100mb
+users_limit_early_exit	-c	[limit(3;.users[])|.id]	users	100mb
+users_assign_update	-c	.users[0].name="x"|.users|length	users	10mb
+users_del	-c	del(.users[0])|.users|length	users	10mb
+users_paths	-	[paths]|length	users	10mb
+users_tojson_roundtrip	-	tojson|fromjson|.users|length	users	10mb
+users_walk	-	walk(.)|.users|length	users	10mb
+users_slurp	-s -c	map(.users|length)	users	10mb
+users_stream	--stream -n	reduce (inputs|select(length==2)) as $e (0;.+1)	users	10mb
+numbers_add	-	.numbers|add	numbers	100mb
+numbers_sort	-	.numbers|sort|.[0]	numbers	10mb
+numbers_max	-	.numbers|max	numbers	100mb
+numbers_map_floor	-	[.numbers[]|floor]|add	numbers	100mb
+strings_length	-	[.strings[]|length]|add	strings	100mb
+strings_upcase	-	[.strings[]|ascii_upcase]|length	strings	100mb
+strings_split	-	[.strings[]|split(" ")|length]|add	strings	10mb
+strings_test	-	[.strings[]|test("ipsum")]|length	strings	10mb
+wide_keys	-	keys|length	wide	100mb
+wide_to_entries	-	to_entries|length	wide	10mb
+wide_map_values	-c	map_values(.+1)|length	wide	10mb
+wide_add_values	-	[.[]]|add	wide	100mb
+wide_with_entries	-	with_entries(.value+=1)|length	wide	10mb
+nested_paths	-	[paths]|length	nested	10mb
+nested_recurse	-	[..]|length	nested	10mb
+comprehensive_paths	-	[paths]|length	comprehensive	10mb
+comprehensive_tostream	-	[tostream]|length	comprehensive	10mb
+comprehensive_numbers	-	[..|numbers]|length	comprehensive	10mb

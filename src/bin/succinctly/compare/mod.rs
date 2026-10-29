@@ -19,6 +19,7 @@ mod harness;
 mod jsonconf;
 mod ledger;
 mod manifest;
+mod perf;
 mod report;
 mod suites;
 
@@ -44,6 +45,8 @@ pub enum Dimension {
     Differential,
     /// C: JSON input conformance (JSONTestSuite)
     Input,
+    /// D and E: wall time and peak memory, interleaved, output-gated
+    Performance,
 }
 
 #[derive(Debug, Parser)]
@@ -68,6 +71,14 @@ pub struct CompareJqArgs {
     /// docs/reference/jq-language.md (commit them from a clean, idle machine)
     #[arg(long)]
     write_summary: bool,
+
+    /// Performance: run only the queries whose id contains this text
+    #[arg(long)]
+    query: Option<String>,
+
+    /// Time jq against itself instead of succinctly: the harness's own noise floor
+    #[arg(long)]
+    control: bool,
 
     /// Build the pinned reference jqs with scripts/compare-jq-build.sh if missing
     #[arg(long)]
@@ -108,13 +119,14 @@ pub struct Results {
     pub differential: Vec<suites::SuiteSummary>,
     /// C.
     pub input: Option<jsonconf::InputSummary>,
+    /// D and E, one row per query × input.
+    pub perf: Vec<perf::PerfRow>,
+    pub perf_note: Option<String>,
     pub known_divergences: Vec<ledger::Entry>,
     pub ledger: ledger::Outcome,
 }
 
 const PENDING: &[(&str, &str)] = &[
-    ("D. Performance", "not implemented (phase 4)"),
-    ("E. Memory", "not implemented (phase 4)"),
     ("F. Robustness", "not implemented (phase 5)"),
     ("H. Platform & operational", "not implemented (phase 6)"),
 ];
@@ -249,6 +261,11 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
             status: "implemented",
         });
     }
+    let secondary = if want(Dimension::Features) || want(Dimension::Performance) {
+        secondary_tool(&root, &manifest, args.build_jq)
+    } else {
+        Err("not needed".into())
+    };
     let fixtures = root.join(&manifest.probes.fixtures);
     let ledger_path = root.join(&manifest.probes.divergences);
     let known = ledger::load(&ledger_path)?;
@@ -266,16 +283,16 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
                 observed.insert(format!("features:{}", r.id));
             }
         }
-        match secondary_tool(&root, &manifest, args.build_jq) {
+        match &secondary {
             Ok(sec) => {
                 let before: BTreeSet<String> = features::inventory(&reference, &fixtures)?
                     .into_iter()
                     .collect();
-                let added: BTreeSet<String> = features::inventory(&sec, &fixtures)?
+                let added: BTreeSet<String> = features::inventory(sec, &fixtures)?
                     .into_iter()
                     .filter(|b| !before.contains(b))
                     .collect();
-                let s = features::run(&sec, &sec.name, &subject, Some(&added), &fixtures)?;
+                let s = features::run(sec, &sec.name, &subject, Some(&added), &fixtures)?;
                 run_suites.push("since-secondary".into());
                 for r in &s.rows {
                     if matches!(
@@ -287,7 +304,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
                 }
                 since = Some(s);
             }
-            Err(why) => secondary_note = Some(why),
+            Err(why) => secondary_note = Some(why.clone()),
         }
         feats = Some(sum);
         dimensions.push(DimensionStatus {
@@ -380,6 +397,59 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
                 "implemented (JSONTestSuite; BOM, NUL, depth and stream shapes are probed under G)",
         });
     }
+    let (mut perf_rows, mut perf_note) = (vec![], None);
+    if want(Dimension::Performance) {
+        run_suites.push("perf".into());
+        let inputs_dir = root.join("data/compare/inputs");
+        let top = if args.full { "100mb" } else { "1mb" };
+        let q = std::fs::read_to_string(root.join(&manifest.perf.queries))?;
+        let mut queries = perf::parse_queries(&q)?;
+        if let Some(f) = &args.query {
+            queries.retain(|x| x.id.contains(f.as_str()));
+            if queries.is_empty() {
+                bail!("no performance query contains `{f}`");
+            }
+        }
+        let planned = perf::plan(&queries, &manifest.inputs, top);
+        let generator = std::env::current_exe()?;
+        let mut tools = vec![
+            if args.control {
+                Tool {
+                    name: format!("{} (control)", reference.name),
+                    ..reference.clone()
+                }
+            } else {
+                subject.clone()
+            },
+            reference.clone(),
+        ];
+        match &secondary {
+            Ok(sec) => tools.push(sec.clone()),
+            Err(why) => perf_note = Some(format!("no secondary column: {why}")),
+        }
+        for (query, input) in &planned {
+            if let Some(spec) = input {
+                perf::ensure_input(&generator, &inputs_dir, spec)?;
+            }
+            let big = input.is_some_and(|i| i.tier == "100mb");
+            let mid = input.is_some_and(|i| i.tier == "10mb");
+            let n = match (args.full, big, mid) {
+                (false, ..) => 3,
+                (true, true, _) => 3,
+                (true, _, true) => 9,
+                _ => 21,
+            };
+            let row = perf::run_row(&tools, query, *input, &inputs_dir, n)?;
+            if row.gate == perf::Gate::Differs {
+                observed.insert(format!("perf:{}@{}", row.query, row.input));
+            }
+            perf_rows.push(row);
+        }
+        dimensions.push(DimensionStatus {
+            name: "D. Performance / E. Memory",
+            status: "implemented (spawn timings and peak RSS on generated shapes; real-world corpus files, cachegrind and the memory-limit probes are not yet included)",
+        });
+    }
     let ledger_outcome = ledger::check(&known, &observed, &run_suites);
     for (name, status) in PENDING {
         dimensions.push(DimensionStatus { name, status });
@@ -403,8 +473,9 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         schema_version: SCHEMA_VERSION,
         run_id,
         command: format!(
-            "./target/release/succinctly dev compare jq {}",
-            if args.full { "--full" } else { "--quick" }
+            "./target/release/succinctly dev compare jq {}{}",
+            if args.full { "--full" } else { "--quick" },
+            if args.control { " --control" } else { "" }
         ),
         reps,
         manifest_sha256,
@@ -418,6 +489,8 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         extensions: ext_rows,
         differential,
         input,
+        perf: perf_rows,
+        perf_note,
         known_divergences: known,
         ledger: ledger_outcome,
     };
