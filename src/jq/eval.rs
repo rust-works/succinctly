@@ -56023,6 +56023,9 @@ fn is_register_navigation(e: &Expr) -> bool {
         // #4790: `..` walks `.[]?` steps, and a comma runs each navigation from the same node, so each
         // output of either is a node the register is left on.
         Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => true,
+        // #4095: `recurse(.[]?; cond)` for a `cond` yielding at most one value is that walk pruned,
+        // so each output is a node the register is left on, as `..`'s is.
+        Expr::Builtin(Builtin::RecurseCond(f, cond)) => is_gated_structural_descent(f, Some(cond)),
         Expr::Comma(items) => items.iter().all(is_register_navigation),
         // #4795: `first(f)`, `limit(n; f)` and `nth(n; f)` hand on some of the navigation's outputs,
         // each a node the register is left on, and `select(c)` hands its input on or emits nothing

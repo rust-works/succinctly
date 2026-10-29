@@ -205,7 +205,7 @@ fn test_recurse_cond_comparison_agrees_with_the_general_route_4095() -> Result<(
 /// The direct verdict for a comparison with `null`, a boolean or `type` has to agree with the
 /// general route on every spelling YAML gives those: the nulls (`~`, `null`, `Null`, an empty
 /// value), their quoted and tagged look-alikes (yq compares a scalar with a literal by its text,
-/// so `e: "null"` is `== null`), the booleans (`true`, `True`, a quoted `"true"`, `yes`), a
+/// so `e: "null"` is `== null`), the booleans (`true`, `True`, a quoted `"true"`) and `yes`, which is a string, a
 /// container carrying a `!!null`/`!!bool` tag, and a node with a custom tag (`type` answers the
 /// tag).
 #[test]
@@ -231,7 +231,9 @@ fn test_recurse_cond_null_and_bool_verdicts_agree_with_the_general_route_4095() 
         ". == null or . == false",
         ". != null and . != false",
         ". == true | not",
-        // A spelled integer (#2802) compares as its value, in every spelling.
+        // A spelled integer (#2802): yq compares a scalar with a literal by its text, so `0x1F ==
+        // 31` is false in yq v4.53.3 and only ordering compares the value. Whatever the general route
+        // answers, the direct verdict has to answer too.
         ". == 31",
         ". != 15",
         ". == 7",
@@ -246,6 +248,27 @@ fn test_recurse_cond_null_and_bool_verdicts_agree_with_the_general_route_4095() 
             assert_eq!(got, want, "`{cond}` {tail}");
         }
     }
+    Ok(())
+}
+
+/// A comparison of a container with a literal is decided by the node being a container, so it does
+/// not decode the container: an undecodable string inside a subtree the walk stops short of is not
+/// raised (the general route copies the container to compare it, and raises). jq 1.7.1 rejects such
+/// a document at parse time, so there is no reference answer (ADR-0018: performance decides).
+#[test]
+fn test_recurse_cond_comparing_a_container_does_not_decode_it_4095() -> Result<()> {
+    let doc = "a:\n  b: \"bad\\q\"\nz: 5\n";
+    assert_eq!(
+        run("[limit(2; recurse(.[]?; . != null)) | path]", doc)?,
+        r#"[[],["a"]]"#
+    );
+    let (_, stderr, code) = run_yq_stdin_with_stderr(
+        "[limit(2; recurse(.[]?; . | (. != null))) | path]",
+        doc,
+        ARGS,
+    )?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("invalid escape"), "{stderr:?}");
     Ok(())
 }
 
@@ -296,15 +319,16 @@ fn test_recurse_cond_as_a_bracket_target_answers_what_recursive_descent_answers_
     Ok(())
 }
 
-/// `first`/`limit` stop the position walk where jq stops: a `cond` is not asked of a node the
-/// consumer never reached, so an effect in it (`debug`) does not run for those nodes.
+/// `limit` stops the position walk where jq stops: a `cond` is not asked of a node the consumer
+/// never reached, so an effect in it (`debug`) does not run for those nodes. (yq's own `first(exp)`
+/// is not jq's `first`: it returns the first child of the context for which `exp` is truthy, so it
+/// says nothing about where a walk stops.)
 #[test]
 fn test_recurse_cond_stops_asking_cond_when_the_consumer_stops_4095() -> Result<()> {
     // (filter, how many times `cond` is asked): the walk delivers the root without asking, then
     // asks once per child it reaches, in order, and stops where the consumer does.
     for (filter, asked) in [
         ("[limit(1; recurse(.[]?; debug | true) | path)]", 0),
-        ("[first(recurse(.[]?; debug | true) | key)]", 0),
         ("[limit(1; recurse(.[]?; debug | true))] | length", 0),
         ("[limit(3; recurse(.[]?; debug | true) | path)]", 2),
         // The root has no key, so the fourth key comes from the fourth kept node.
@@ -322,19 +346,24 @@ fn test_recurse_cond_stops_asking_cond_when_the_consumer_stops_4095() -> Result<
 }
 
 /// A `?` around the walk still suppresses an error `cond` raises, over a computed value as over a
-/// document: the nodes before the error are kept and the rest of the walk is dropped.
+/// document: the nodes before the error are kept and the rest of the walk is dropped. Over a
+/// document the position stage still answers for the nodes it reached (`[[],["a"]]`; the owned
+/// walk gave `[[],[]]`); a computed value takes the eager route and gives a position stage none.
 #[test]
 fn test_recurse_cond_optional_suppresses_a_raising_cond_4095() -> Result<()> {
     let cond = r#"if type == "!!int" then error("boom") else true end"#;
-    for filter in [
-        format!("[recurse(.[]?; {cond})? | tojson] | length"),
-        format!("{{a: [1, {{b: 2}}]}} | [recurse(.[]?; {cond})? | path] | length"),
-        format!("{{a: [1, {{b: 2}}]}} | [recurse(.[]?; {cond})? | key] | length"),
+    for (filter, want) in [
+        (format!("[recurse(.[]?; {cond})? | path]"), r#"[[],["a"]]"#),
+        (
+            format!("{{a: [1, {{b: 2}}]}} | [recurse(.[]?; {cond})? | path]"),
+            "[[],[]]",
+        ),
+        (
+            format!("{{a: [1, {{b: 2}}]}} | [recurse(.[]?; {cond})? | key]"),
+            "[]",
+        ),
     ] {
-        let (stdout, stderr, code) = run_yq_stdin_with_stderr(&filter, TREE, ARGS)?;
-        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
-        assert!(!stderr.contains("boom"), "`{filter}` -- {stderr:?}");
-        assert!(!stdout.trim().is_empty(), "`{filter}` produced nothing");
+        assert_eq!(run(&filter, TREE)?, want, "`{filter}`");
     }
     Ok(())
 }

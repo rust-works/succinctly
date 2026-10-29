@@ -330,7 +330,8 @@ pub(crate) fn guard_nesting_depth(depth: usize) -> Result<(), EvalError> {
 ///
 /// - `collect_paths_generic` (`paths`, `leaf_paths`): ~1.4 MiB on aarch64 and
 ///   ~1.3 MiB on x86_64, a ~1.4-1.5x margin;
-/// - `path_context_step_recurse` (`.. | path`): ~0.45 / ~0.43 MiB, ~4.6x;
+/// - `path_context_step_recurse` (`.. | path`): ~0.45 / ~0.43 MiB, ~4.6x (about 3.4x since #4095's
+///   streaming core made its frame ~400 bytes per level larger, measured in review);
 /// - a 383-component static chain (`path(.k.k...k)`): ~0.5 / ~0.47 MiB, ~4x.
 ///
 /// The first is the same margin 256 gives the materializer today (it overflows
@@ -16129,7 +16130,35 @@ fn direct_cond_verdict<S: EvalSemantics, V: DocumentValue>(
     cond: &Expr,
     cursor: &V::Cursor,
 ) -> Option<bool> {
+    // Decided before the node is touched: a `cond` with one part outside the grammar goes to the
+    // general route whole, and must not first decode the node for the part inside it.
+    if !is_direct_grammar(cond) {
+        return None;
+    }
     direct_cond_verdict_with::<S, V>(cond, cursor, &core::cell::OnceCell::new())
+}
+
+/// Whether every part of `cond` is in [`direct_cond_verdict`]'s grammar. The twin of its arms: a
+/// shape accepted here that the verdict cannot answer is only a missed shortcut, never a wrong
+/// answer, since the verdict returns `None` for it.
+fn is_direct_grammar(cond: &Expr) -> bool {
+    let is_operand = |e: &Expr| matches!(e, Expr::Identity | Expr::Builtin(Builtin::Type));
+    match cond {
+        Expr::Paren(inner) => is_direct_grammar(inner),
+        Expr::Literal(Literal::Bool(_) | Literal::Null) | Expr::Identity => true,
+        Expr::Pipe(stages) => match &stages[..] {
+            [head, Expr::Not] => is_direct_grammar(head),
+            _ => false,
+        },
+        Expr::And(left, right) | Expr::Or(left, right) => {
+            is_direct_grammar(left) && is_direct_grammar(right)
+        }
+        Expr::Compare { left, right, .. } => matches!(
+            (&**left, &**right),
+            (operand, Expr::Literal(_)) | (Expr::Literal(_), operand) if is_operand(operand)
+        ),
+        _ => false,
+    }
 }
 
 /// [`direct_cond_verdict`], with the node's owned copy shared by every comparison in `cond`
@@ -16177,7 +16206,7 @@ fn direct_cond_verdict_with<S: EvalSemantics, V: DocumentValue>(
                 _ => return None,
             };
             let node = cursor.value();
-            let type_name;
+            let type_value;
             let operand_value: &OwnedValue = if matches!(operand, Expr::Identity) {
                 if node.as_object().is_some() || node.as_array().is_some() {
                     return matches!(op, CompareOp::Eq | CompareOp::Ne)
@@ -16188,7 +16217,7 @@ fn direct_cond_verdict_with<S: EvalSemantics, V: DocumentValue>(
                     .get_or_init(|| to_owned_cursor::<S, _>(cursor).ok())
                     .as_ref()?
             } else {
-                type_name = if S::TAG == EvalTag::Yq {
+                let type_name = if S::TAG == EvalTag::Yq {
                     yq_type_tag(&node, Some(*cursor))
                 } else if node.is_error() {
                     // A malformed keyword token raises on the general route (#3035).
@@ -16196,7 +16225,10 @@ fn direct_cond_verdict_with<S: EvalSemantics, V: DocumentValue>(
                 } else {
                     tagged_type_name(&node, Some(*cursor)).to_string()
                 };
-                &OwnedValue::String(type_name.into())
+                // Bound before the borrow: a temporary in an `else` block's tail is not extended on
+                // the crate's declared minimum Rust version.
+                type_value = OwnedValue::String(type_name.into());
+                &type_value
             };
             let literal = crate::jq::eval::literal_to_owned(literal);
             let (l, r) = if operand_is_left {

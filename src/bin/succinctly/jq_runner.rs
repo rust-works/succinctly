@@ -4711,6 +4711,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     let can_json_fast_path = can_use_m2_streaming(&expr)
         && m2_json_fallback_safe(&expr)
         && !m2_has_stderr_effect(&expr)
+        && !m2_has_recurse_cond(&expr)
         && !output_config.raw_output
         && !output_config.join_output
         && !output_config.raw_output0
@@ -9231,6 +9232,20 @@ fn m2_has_stderr_effect(expr: &Expr) -> bool {
             node,
             Expr::Builtin(Builtin::Stderr | Builtin::Debug | Builtin::DebugMsg(_))
         )
+    })
+}
+
+/// Whether `expr` contains `recurse(f; cond)` (#4095).
+///
+/// The shared M2 gate admits a gated `recurse(.[]?; cond)` because yq mode's evaluator delivers each
+/// kept node as a live cursor. jq mode's collecting route keeps the owned walk (a `cond` is answered
+/// from the tree there), so a wrapper the fast path admits without looking inside (`map`, `last`,
+/// `nth`) gets owned items, whose writer prints a number beyond the `f64` range as `null`
+/// (`[[1e1000]] | map(recurse(.[]?; true))` printed `[[null],null]` where jq prints `1E+1000`).
+/// Such a program takes the general path, as it did before the gate knew the builtin.
+fn m2_has_recurse_cond(expr: &Expr) -> bool {
+    succinctly::jq::walk::any_subexpr(expr, &mut |node| {
+        matches!(node, Expr::Builtin(Builtin::RecurseCond(_, _)))
     })
 }
 

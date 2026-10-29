@@ -6412,7 +6412,7 @@ yq's recursive descent yields an alias node and does not descend into it, so on
 aliased mapping, as in yq. `recurse` and `recurse(.[]?)` are `..` (#3719) and stop with it; yq has
 no `recurse`, so under `--jq-extensions` they follow the `..` rule rather than a reference.
 So does `recurse(.[]?; cond)` for a `cond` that yields at most one value (#4095), and a `key`, `path` or `parent` stage after it reads each node's position.
-Its remaining divergences are recorded under `recurse(f; cond)` in [the jq limitations](../jq/limitations.md): `path(recurse(.[]?; cond))`, a write through it, and a `cond` that reads `key`, `path` or `tag` still expand aliases and give no position.
+Its remaining divergences are recorded under `recurse(f; cond)` in [the jq limitations](../jq/limitations.md): `path(recurse(.[]?; cond))`, a write through it, and a `cond` outside the admitted grammar (one that reads `key`, `path`, `tag` or `line`, is passed through a `def` parameter, or uses a builtin the allow-list does not know) still expand aliases and give no position.
 
 A write through `..` reaches an anchored node once too (#4223): `(.. | select(tag=="!!int")) |= . + 1`
 is `p: 2, q: 3` in yq and was `p: 3, q: 4` here, the shared node incremented twice. The paths a `..`
