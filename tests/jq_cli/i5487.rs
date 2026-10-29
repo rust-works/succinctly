@@ -30,6 +30,9 @@ fn test_variable_headed_pipe_is_identical_to_the_variable_5487() -> Result<()> {
         "[nan] as $a | ($a | .[0:] | .) == $a",
         "[nan,1] as $a | ($a | .[0:2] | .) == $a",
         "[nan] as $a | ($a | .[0:5] | .) == $a",
+        // An empty array has no whole to be identical to, and is `true` for the same reason a
+        // bare `[] == []` is.
+        "[] as $a | ($a | .[0:] | .) == $a",
     ] {
         assert_eq!(answer(filter)?, "true\n", "{filter}");
     }
