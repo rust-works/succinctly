@@ -2290,10 +2290,13 @@ impl PipeStages {
             return;
         }
         self.tails.origin = match &source.tails.origin {
-            // A source with a link is a pipe rebuilt from one, or a copy of a tail of
-            // one, so it holds a variable only where the table it reaches counts a
-            // stage as volatile: a table of a pipe that reads one is always built
-            // with `is_volatile` (#5436), and a pipe that reads none holds none.
+            // A source with a link is a pipe rebuilt from one by a substitution (or a
+            // copy of a tail of one), and a pipe is only ever linked to the table of
+            // its source: `linked_table` when the source reads a variable (#5436),
+            // `tail_table` when it reads none. The copies a pipe's own table keeps
+            // can hold a variable its table does not count as volatile, but they are
+            // only evaluated, never substituted into: `Expr::Shared` is opaque to
+            // `substitute_var_impl`, and cloning a pipe drops its link.
             Some(link) => Some(link.clone()),
             None if !source.tails.rebuilt.replace(true) => return,
             None => match is_volatile {
