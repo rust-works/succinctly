@@ -425,9 +425,19 @@ pub(crate) struct DataFileFailure {
 /// This is the main filter's report, a single error with no blank line before
 /// the trailer, as in jq. A *module's* syntax error is a [`ReportEntry::Syntax`]
 /// among the other entries and is printed by [`print_report_entry`].
-fn report_syntax_error(message: &str, source: &str, offset: usize, location: &str) {
-    print_syntax_error(message, source, offset, location);
-    eprintln!("jq: 1 compile error");
+///
+/// A parse error can carry others jq reports after it (#5510: every constant non-string object
+/// key, and whatever syntax error follows them): each is printed in jq's order and the trailer
+/// counts them all.
+fn report_syntax_error(errors: &[jq::ParseError], source: &str, location: &str) {
+    for each in errors {
+        print_syntax_error(&each.message, source, each.position, location);
+    }
+    let count = errors.len();
+    eprintln!(
+        "jq: {count} compile error{}",
+        if count == 1 { "" } else { "s" }
+    );
 }
 
 /// The position-and-echo part of [`report_syntax_error`], without the
@@ -4579,7 +4589,12 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     // in jq mode regardless), which is what this call site used before the
     // second parse existed.
     let parse_filter = |extra: &BTreeSet<String>| {
-        jq::parse_program_with_extra_shadowable_defs(&filter_str, jq::ParserMode::Jq, false, extra)
+        jq::parse_program_with_extra_shadowable_defs_all(
+            &filter_str,
+            jq::ParserMode::Jq,
+            false,
+            extra,
+        )
     };
 
     // Parse the filter as a full program (with module directives).
@@ -4593,7 +4608,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     let program = match parse_filter(&BTreeSet::new()) {
         Ok(program) => program,
         Err(e) => {
-            report_syntax_error(&e.message, &filter_str, e.position, "<top-level>");
+            report_syntax_error(&e, &filter_str, "<top-level>");
             return Ok(exit_codes::COMPILE_ERROR);
         }
     };

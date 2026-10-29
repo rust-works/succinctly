@@ -153,7 +153,8 @@ pub use expr::{
 pub use lazy::JqValue;
 pub use parser::{
     collect_break_sites, collect_call_sites, collect_def_sites, collect_var_sites, parse,
-    parse_program, parse_program_with_extra_shadowable_defs, parse_program_with_mode,
+    parse_program, parse_program_with_extra_shadowable_defs,
+    parse_program_with_extra_shadowable_defs_all, parse_program_with_mode,
     parse_program_with_mode_and_extensions, parse_with_mode, parse_with_mode_and_extensions,
     BreakSite, CallSite, DefSite, ParseError, ParserMode, VarSite,
 };

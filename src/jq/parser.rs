@@ -29,9 +29,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 #[cfg(not(test))]
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::eval::{
     apply_compare_op, arith_combine, compare_values, contains_retrying_pattern_bind,
@@ -999,6 +999,14 @@ struct Parser<'a> {
     /// never `Expr::Var`, so they can never be the subject of an unbound-
     /// variable diagnostic in the first place.
     var_sites: Vec<VarSite>,
+    /// jq's `check_object_key` errors (#5510), by position: jq's parser records one and keeps
+    /// going, so they are reported together at the end (see [`Self::finish`]). Keyed by the
+    /// byte offset so a stretch of text the parser reads twice (it backtracks) counts once.
+    ///
+    /// Nothing returns these on its own: a parse that reaches the end with this non-empty is
+    /// only an error through [`Self::finish_all`], so every entry point that builds a `Parser`
+    /// to compile a program calls it (the two public ones do).
+    deferred_key_errors: BTreeMap<usize, ParseError>,
     /// [`Self::var_sites`]'s sibling for `break $name` label-break sites
     /// (#2964): every `Expr::Break` the parse has built, with the byte
     /// offset of its `break` keyword. Same shape, same side-table
@@ -1450,6 +1458,7 @@ impl<'a> Parser<'a> {
             keep_bracket_keys: false,
             call_sites: Vec::new(),
             var_sites: Vec::new(),
+            deferred_key_errors: BTreeMap::new(),
             break_sites: Vec::new(),
             def_sites: Vec::new(),
             shadowable_defs,
@@ -2491,6 +2500,28 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The parse's result with the `check_object_key` errors it recorded (#5510): jq reports
+    /// them all, then whatever ended the parse, and counts each.
+    ///
+    /// A program that parsed with none is returned as it was. With some, it does not compile,
+    /// and its errors are the recorded ones in source order followed by the error that stopped
+    /// the parse, if one did. The error is a `Vec` here and not a field of [`ParseError`]
+    /// because that type is returned by value from every level of the recursive-descent parser:
+    /// growing it grew every frame and overflowed the stack in
+    /// `write_shape_gate_is_not_exponential_in_def_nesting_2091`.
+    fn finish_all<T>(&mut self, result: Result<T, ParseError>) -> Result<T, Vec<ParseError>> {
+        if self.deferred_key_errors.is_empty() {
+            return result.map_err(|error| vec![error]);
+        }
+        let mut errors: Vec<ParseError> = core::mem::take(&mut self.deferred_key_errors)
+            .into_values()
+            .collect();
+        if let Err(stopped) = result {
+            errors.push(stopped);
+        }
+        Err(errors)
+    }
+
     /// jq's `check_object_key` (#3018, #5501): the compile error for an object or pattern key
     /// that [`Self::const_fold_pattern_key`] reduces to something other than a string, or
     /// `None` for a string or a key left to run time.
@@ -2997,7 +3028,10 @@ impl<'a> Parser<'a> {
                         v
                     } else if self.peek() == Some(':') {
                         if let Some(error) = constant_key_error {
-                            return Err(error);
+                            // jq records it and parses on (#5510). Only set in jq mode, above.
+                            self.deferred_key_errors
+                                .entry(error.position)
+                                .or_insert(error);
                         }
                         self.next();
                         self.skip_ws();
@@ -5311,7 +5345,14 @@ impl<'a> Parser<'a> {
                                 }
                             };
                             if let Some(error) = refused {
-                                return Err(error);
+                                // jq records it and parses on (#5510); yq's own parser stops.
+                                if self.mode == ParserMode::Jq {
+                                    self.deferred_key_errors
+                                        .entry(error.position)
+                                        .or_insert(error);
+                                } else {
+                                    return Err(error);
+                                }
                             }
                             ObjectKey::Expr(Box::new(key_expr))
                         } else if self.peek() == Some('"') {
@@ -10391,18 +10432,19 @@ pub fn parse_with_mode_and_extensions(
     jq_extensions: bool,
 ) -> Result<Expr, ParseError> {
     let mut parser = Parser::with_mode_and_extensions(input, mode, jq_extensions);
-    let expr = parser.parse_expr()?;
-
-    // Ensure we consumed all input
-    parser.skip_ws();
-    if !parser.is_eof() {
-        return Err(ParseError::new(
-            format!("unexpected character '{}'", parser.peek().unwrap()),
-            parser.pos,
-        ));
-    }
-
-    Ok(expr)
+    let result = parser.parse_expr().and_then(|expr| {
+        // Ensure we consumed all input
+        parser.skip_ws();
+        if parser.is_eof() {
+            Ok(expr)
+        } else {
+            Err(ParseError::new(
+                format!("unexpected character '{}'", parser.peek().unwrap()),
+                parser.pos,
+            ))
+        }
+    });
+    parser.finish_all(result).map_err(first_error)
 }
 
 /// Parse a complete jq program including module directives.
@@ -10504,19 +10546,42 @@ pub fn parse_program_with_extra_shadowable_defs(
     jq_extensions: bool,
     extra: &BTreeSet<String>,
 ) -> Result<Program, ParseError> {
+    parse_program_with_extra_shadowable_defs_all(input, mode, jq_extensions, extra)
+        .map_err(first_error)
+}
+
+/// The error the single-error entry points return from [`Parser::finish_all`]'s list: the first,
+/// which is the one they reported before jq's later ones were collected (#5510).
+fn first_error(mut errors: Vec<ParseError>) -> ParseError {
+    errors.swap_remove(0)
+}
+
+/// [`parse_program_with_extra_shadowable_defs`], reporting every compile error (#5510).
+///
+/// jq records each constant non-string object key as its own error and parses on, so
+/// `{(0):1,(1):2}` is two and `{(0):1} )` is a key error and then the syntax error. The vector
+/// is never empty and is in the order jq prints them; its first element is the error the
+/// single-error entry points return.
+pub fn parse_program_with_extra_shadowable_defs_all(
+    input: &str,
+    mode: ParserMode,
+    jq_extensions: bool,
+    extra: &BTreeSet<String>,
+) -> Result<Program, Vec<ParseError>> {
     let mut parser = Parser::with_mode_extensions_and_extra_defs(input, mode, jq_extensions, extra);
-    let program = parser.parse_program()?;
-
-    // Ensure we consumed all input
-    parser.skip_ws();
-    if !parser.is_eof() {
-        return Err(ParseError::new(
-            format!("unexpected character '{}'", parser.peek().unwrap()),
-            parser.pos,
-        ));
-    }
-
-    Ok(program)
+    let result = parser.parse_program().and_then(|program| {
+        // Ensure we consumed all input
+        parser.skip_ws();
+        if parser.is_eof() {
+            Ok(program)
+        } else {
+            Err(ParseError::new(
+                format!("unexpected character '{}'", parser.peek().unwrap()),
+                parser.pos,
+            ))
+        }
+    });
+    parser.finish_all(result)
 }
 
 #[cfg(test)]
