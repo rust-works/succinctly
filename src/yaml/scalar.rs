@@ -132,7 +132,7 @@ impl ResolvedScalar {
             Self::Bool(b) => OwnedValue::Bool(b),
             // #2802: a spelled integer (`0x1f`, `0o17`, `01`, `+5`) keeps its text, as a float's
             // `.5` or `2.0` does; the JSON writers ask for the number ([`spelled_int_json_text`]).
-            Self::Int(n) if spelled_int_json_text(&text).is_some() => {
+            Self::Int(n) if is_spelled_int(&text) => {
                 OwnedValue::NumberLiteral(crate::jq::NumberRepr::Int(n), text.into_owned().into())
             }
             Self::Int(n) => OwnedValue::Int(n),
@@ -515,21 +515,47 @@ pub fn overflowed_int_json_text(raw: &str) -> Option<String> {
 /// and the reindex bridge keep the text.
 ///
 /// Mirrors [`overflowed_int_json_text`]: the text is the value's spelling, the
-/// JSON writers ask for the number. A canonical integer (`42`, `-7`, `0`) and
-/// any text with a `.` return before resolving anything, so a float literal and
-/// the ordinary integer pay a byte scan only.
+/// JSON writers ask for the number.
 #[must_use]
 pub fn spelled_int_json_text(raw: &str) -> Option<String> {
+    spelled_int_value(raw).map(|n| alloc::format!("{n}"))
+}
+
+/// Whether `raw` is an integer spelled other than the way it prints ([`spelled_int_json_text`]).
+///
+/// Allocation-free, for the callers that only ask.
+#[must_use]
+pub fn is_spelled_int(raw: &str) -> bool {
+    spelled_int_value(raw).is_some()
+}
+
+/// The integer a spelled-integer text names, `None` for any other text.
+///
+/// Only a `0x`/`0o` prefix or a decimal run of digits can be one, so a float literal, an
+/// exponent form and the canonical integer (`42`, `-7`, `0`) return after a byte scan, and the
+/// prefixed forms alone reach [`resolve_plain`].
+fn spelled_int_value(raw: &str) -> Option<i64> {
     let bytes = raw.as_bytes();
-    let digits = bytes.strip_prefix(b"-").unwrap_or(bytes);
-    let plain_digits = digits.iter().all(u8::is_ascii_digit);
-    if (plain_digits && digits.first() != Some(&b'0')) || digits == b"0" || bytes.contains(&b'.') {
+    let unsigned = bytes
+        .strip_prefix(b"-")
+        .or_else(|| bytes.strip_prefix(b"+"))
+        .unwrap_or(bytes);
+    if matches!(unsigned, [b'0', b'x' | b'o', ..]) {
+        return match resolve_plain(raw) {
+            ResolvedScalar::Int(n) => Some(n),
+            _ => None,
+        };
+    }
+    if unsigned.is_empty() || !unsigned.iter().all(u8::is_ascii_digit) {
         return None;
     }
-    match resolve_plain(raw) {
-        ResolvedScalar::Int(n) => Some(alloc::format!("{n}")),
-        _ => None,
+    // A leading `+` or zero is the spelling; `-0` is a float of a YAML document, not this.
+    let canonical =
+        bytes.first() != Some(&b'+') && (unsigned == b"0" || unsigned[0] != b'0') && raw != "-0";
+    if canonical || raw == "-0" {
+        return None;
     }
+    raw.parse::<i64>().ok()
 }
 
 /// The number yq's JSON encoder writes for a literal whose text is not what it writes.

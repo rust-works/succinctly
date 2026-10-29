@@ -5191,7 +5191,9 @@ its text (`numeric_display_string`, so `==` and `tostring` agree about a compute
   value prints, and is printed only while it still resolves to the node's value, so a node a
   write replaces takes the new value's text (`b: 0xff` written `5` is `5`). Checked against
   yq v4.53.3 on ~3,000 random documents plus a sweep of 2,178 real YAML files. It does not
-  touch #2802's *read* side (`==`, keys), listed below; an integer's `tostring` has kept its spelling since #2802's integer slice. A closed literal written
+  touch #2802's *read* side (`==`, keys), listed below.
+  An integer's `tostring` has kept its spelling since #2802's integer slice.
+  A closed literal written
   over a node (`.a = true` over `True`) brings its own text, as in yq; `style = "double"` and
   `"single"` quote the spelling (`"~"`, `"0x1F"`). Not matched:
   - arithmetic on a hex or octal integer keeps its base in yq (`0xff + 1` is `0x100`, #3027);

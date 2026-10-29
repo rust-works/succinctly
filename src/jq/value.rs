@@ -851,6 +851,15 @@ fn format_number_jq_compat_at(raw: &[u8], mantissa_digit_cap: Option<usize>) -> 
         Err(_) => return String::from_utf8_lossy(raw).into_owned(),
     };
 
+    // #2802: a YAML integer written `0x1f` or `0o17` is no JSON number, and the plain-integer
+    // path below would read its `0` as an insignificant leading zero (`x1f`). It prints as the
+    // number it is.
+    if matches!(raw, [b'0', b'x' | b'o', ..]) {
+        if let crate::yaml::ResolvedScalar::Int(n) = crate::yaml::resolve_plain(s) {
+            return n.to_string();
+        }
+    }
+
     // Check if it contains exponent notation
     let has_exp = s.contains('e') || s.contains('E');
     let has_dot = s.contains('.');
@@ -3244,8 +3253,7 @@ impl OwnedValue {
         match repr {
             // jq's own lenient literals (`007`, `+5`) stay literals in either mode.
             NumberRepr::Int(n)
-                if S::TAG == EvalTag::Yq
-                    && crate::yaml::spelled_int_json_text(&literal).is_some() =>
+                if S::TAG == EvalTag::Yq && crate::yaml::is_spelled_int(&literal) =>
             {
                 Self::spelled_int::<S>(n, literal)
             }
@@ -3625,7 +3633,7 @@ impl OwnedValue {
             Self::Float(f) => Some(Cow::Owned(jq_bare_float_display(*f))),
             // #2802: a spelled integer prints as the number it is in a message.
             Self::NumberLiteral(NumberRepr::Int(n), literal)
-                if crate::yaml::spelled_int_json_text(literal).is_some() =>
+                if crate::yaml::is_spelled_int(literal) =>
             {
                 Some(Cow::Owned(n.to_string()))
             }
@@ -4267,21 +4275,18 @@ impl OwnedValue {
                 out.push_str(&nan_instance_token(*f));
             }
             Self::Float(f) if f.is_infinite() => out.push_str(overflow_literal(*f)),
-            // #2802: yq's spelled integer (`0x1f`, `0o17`, `01`, `+5`) is no number text the
-            // bridge's reader keeps, so it crosses as the spelling token. jq mode never
-            // holds one, and its lenient `007` already reads back as itself.
+            // #2802: a spelled integer (`0x1f`, `0o17`, `01`, `+5`) is no number text the bridge's
+            // reader keeps, so it crosses as the spelling token. The yq runner writes its DOM
+            // routes in jq's number model but reads them as yq, so that model only keeps what its
+            // own reader already reads back as itself (the lenient `007`, but not a `+5`, whose
+            // sign the reader peels).
             Self::NumberLiteral(NumberRepr::Int(_), literal)
-                if S::TAG == EvalTag::Yq
-                    && crate::yaml::spelled_int_json_text(literal).is_some() =>
+                if crate::yaml::is_spelled_int(literal)
+                    && (S::TAG == EvalTag::Yq
+                        || literal.starts_with('+')
+                        || !crate::json::validate::number_span_decodes(literal.as_bytes())) =>
             {
                 out.push_str(&crate::json::validate::spelling_token(literal));
-            }
-            // A bridge read in jq's number model (a path computed over a yq document) has no use
-            // for the spelling, and `0x1f` is no number there.
-            Self::NumberLiteral(NumberRepr::Int(n), literal)
-                if !crate::json::validate::number_span_decodes(literal.as_bytes()) =>
-            {
-                let _ = write!(out, "{n}");
             }
             // The bridge must keep the source literal at every length.
             Self::NumberLiteral(_, literal) => out.push_str(literal),
@@ -7860,6 +7865,23 @@ mod tests {
             assert_eq!(got.to_json(), shape, "{spelling} -> {token} -> {got:?}");
             assert!(!format!("{got:?}").contains(&token), "{token}: {got:?}");
         }
+    }
+
+    /// #2802: a YAML integer written `0x1f` or `0o17` renders as the number in a message or a jq
+    /// -style echo, not as its text with the `0` read as an insignificant leading zero (`x1f`).
+    #[test]
+    fn test_jq_compat_format_reads_prefixed_integers_2802() {
+        for (text, rendered) in [("0x1f", "31"), ("0o17", "15"), ("0x1e", "30"), ("007", "7")] {
+            assert_eq!(format_number_jq_compat(text.as_bytes()), rendered, "{text}");
+            assert_eq!(
+                format_number_for_preview(text.as_bytes()),
+                rendered,
+                "{text}"
+            );
+        }
+        // Not a prefixed integer: an exponent form and a sign keep their ordinary reading.
+        assert_eq!(format_number_jq_compat(b"1e3"), "1E+3");
+        assert_eq!(format_number_jq_compat(b"+5"), "5");
     }
 
     /// jq compares a parsed NaN by instance (#3309): the same token is

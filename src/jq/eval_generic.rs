@@ -1642,7 +1642,7 @@ fn resolved_scalar_to_owned<S: EvalSemantics>(
         // reads the number.
         OwnedValue::NumberLiteral(NumberRepr::Int(n), literal)
             if S::TAG != EvalTag::Yq
-                && crate::yaml::spelled_int_json_text(&literal).is_some()
+                && crate::yaml::is_spelled_int(&literal)
                 && !crate::json::validate::number_span_decodes(literal.as_bytes()) =>
         {
             OwnedValue::Int(n)
@@ -3433,7 +3433,7 @@ fn source_spelling<C: DocumentCursor>(
         // #2802: a spelled integer carries its text, and the side-tree keeps it too, where the
         // YAML writer reads it back for a tag or a style written onto the node.
         OwnedValue::NumberLiteral(NumberRepr::Int(_), literal)
-            if crate::yaml::spelled_int_json_text(literal).is_some() =>
+            if crate::yaml::is_spelled_int(literal) =>
         {
             false
         }

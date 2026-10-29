@@ -109,3 +109,49 @@ fn test_spelled_integers_keep_their_text_where_yq_echoes_it_2802() -> Result<()>
     }
     Ok(())
 }
+
+/// `-r` writes the scalar's own text, so a spelled integer prints as written even under
+/// `-o=json`, where the encoder would print the number. Captured from yq v4.53.3:
+/// `yq -o=json -r '.a'` is `0x1f`, and `.[] | select(tag == "!!int")` is every integer's text.
+#[test]
+fn test_raw_json_output_prints_the_spelling_2802() -> Result<()> {
+    let (out, code) = run_yq_stdin(".a", DOC, &["-o=json", "-r"])?;
+    assert_eq!((out.as_str(), code), ("0x1f\n", 0));
+    let (out, code) = run_yq_stdin(r#".[] | select(tag == "!!int")"#, DOC, &["-o=json", "-r"])?;
+    assert_eq!((out.as_str(), code), ("0x1f\n0o17\n01\n+5\n007\n31\n", 0));
+    Ok(())
+}
+
+/// A message names the number a spelled integer is (`number (31)`), not a mangled text
+/// (`x1f`, from reading its `0` as a leading zero); yq words these errors differently, so only
+/// the value is pinned.
+#[test]
+fn test_error_previews_name_the_number_2802() -> Result<()> {
+    for (filter, number) in [
+        (r#".a - "x""#, "31"),
+        (".a | keys", "31"),
+        (".b | keys", "15"),
+    ] {
+        let (_, stderr, code) = crate::run_yq_stdin_with_stderr(filter, DOC, &[])?;
+        assert_eq!(code, 1, "{filter}");
+        assert!(
+            stderr.contains(&format!("number ({number})")),
+            "{filter}: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// The DOM routes that write the reindex bridge in jq's number model (`--slurp`,
+/// `--eval-all`) keep the spelling too: `+5` and `0x1f` both come back as written. Captured
+/// from yq v4.53.3 (`yq ea '[.] | .[0] | ...'`).
+#[test]
+fn test_slurp_and_eval_all_keep_the_spelling_2802() -> Result<()> {
+    let filter = "[.a,.b,.c,.d,.e] | map(tostring)";
+    let expected = ("[\"0x1f\",\"0o17\",\"01\",\"+5\",\"007\"]\n", 0);
+    let (out, code) = run_yq_stdin(&format!(".[0] | {filter}"), DOC, &["-s", "-o=json", "-I0"])?;
+    assert_eq!((out.as_str(), code), expected);
+    let (out, code) = run_yq_stdin(filter, DOC, &["--eval-all", "-o=json", "-I0"])?;
+    assert_eq!((out.as_str(), code), expected);
+    Ok(())
+}

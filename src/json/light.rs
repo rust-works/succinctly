@@ -3036,17 +3036,18 @@ impl<'a> JsonNumber<'a> {
     pub fn as_i64(&self) -> Result<i64, JsonError> {
         let bytes = self.raw_bytes();
         let s = core::str::from_utf8(bytes).map_err(|_| JsonError::InvalidUtf8)?;
-        s.parse().or_else(|_| {
-            // #2802: a spelled integer the bridge carried (`0x1f`) is the integer it spells.
-            match self
-                .bridge_spelling()
-                .as_deref()
-                .map(crate::yaml::resolve_plain)
-            {
-                Some(crate::yaml::ResolvedScalar::Int(n)) => Ok(n),
-                _ => Err(JsonError::InvalidNumber),
-            }
-        })
+        s.parse()
+            .or_else(|_| self.bridge_spelled_int().ok_or(JsonError::InvalidNumber))
+    }
+
+    /// The integer a bridge spelling token names (`0x1f` is 31), for an index built over bridge
+    /// text; `None` for any other span and for a spelling that is no integer (#2802).
+    #[inline]
+    pub(crate) fn bridge_spelled_int(&self) -> Option<i64> {
+        match crate::yaml::resolve_plain(&self.bridge_spelling()?) {
+            crate::yaml::ResolvedScalar::Int(n) => Some(n),
+            _ => None,
+        }
     }
 
     /// The value this span stands for if it is one of the reindex bridge's
@@ -3211,17 +3212,8 @@ impl<'a> JsonNumber<'a> {
         let s = core::str::from_utf8(bytes).map_err(|_| JsonError::InvalidUtf8)?;
         s.parse().or_else(|_| {
             self.bridge_value()
-                .or_else(|| {
-                    match self
-                        .bridge_spelling()
-                        .as_deref()
-                        .map(crate::yaml::resolve_plain)
-                    {
-                        // #2802: the number a spelled integer names.
-                        Some(crate::yaml::ResolvedScalar::Int(n)) => Some(n as f64),
-                        _ => None,
-                    }
-                })
+                // #2802: the number a spelled integer names.
+                .or_else(|| self.bridge_spelled_int().map(|n| n as f64))
                 .or_else(|| crate::json::validate::jq_special_number(bytes))
                 .ok_or(JsonError::InvalidNumber)
         })
