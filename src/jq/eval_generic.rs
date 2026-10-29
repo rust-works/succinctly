@@ -16087,7 +16087,7 @@ fn recurse_cond_keeps_cursor<S: EvalSemantics, V: DocumentValue>(
     cond: &Expr,
     cursor: V::Cursor,
 ) -> Result<bool, Control> {
-    if let Some(keep) = shallow_cond_verdict::<V>(cond, &cursor) {
+    if let Some(keep) = direct_cond_verdict::<S, V>(cond, &cursor) {
         return Ok(keep);
     }
     let mut keep = false;
@@ -16110,58 +16110,69 @@ fn recurse_cond_keeps_cursor<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
-/// A verdict for a `recurse(.[]?; cond)` `cond` read off the node's kind alone, or `None` when the
-/// node's value is needed (#4095).
+/// A verdict for a `recurse(.[]?; cond)` `cond` computed without the general evaluator, or `None`
+/// when only the general evaluator can answer it (#4095).
 ///
-/// Asked at a cursor, a comparison with `.` on one side materializes the node first, so
-/// `. != null` over a container copied the container's whole subtree at every node on the way
-/// down, a cost the owned walk's pure verdict ([`crate::jq::eval::owned_cond_verdict`]) never paid
-/// (1.9 times slower over a 10 MB `users` document, growing with depth). A container is not equal
-/// to a scalar literal, so that comparison is decided by the node being one; a scalar is cheap to
-/// compare and takes the general route.
+/// The general route builds a sink, a fan-out and an item per node, and for a comparison it then
+/// copies the node to an owned value to compare it. Two costs followed. A container was copied
+/// whole, so `. != null` over a container cost its subtree at every node on the way down (1.9 times
+/// the owned walk's time over a 10 MB `users` document, growing with depth). And on the many leaves
+/// of a document the machinery cost more than the comparison it ran.
 ///
-/// The grammar is the part of the pure verdict's that needs no value: `true`/`false`/`null`, `.`
-/// (truthiness, read in place), `not`, `and`/`or`, and `==`/`!=` between `.` and a literal.
-fn shallow_cond_verdict<V: DocumentValue>(cond: &Expr, cursor: &V::Cursor) -> Option<bool> {
+/// The grammar is `true`/`false`/`null`, `.` (truthiness, read in place), `not`, `and`/`or`, and a
+/// comparison between `.` and a literal. A container is decided by being one (it is not equal to a
+/// scalar literal); a scalar is copied and compared with the same `apply_compare_op` the general
+/// route applies, so the answer is the general route's, quirks included (yq compares a scalar with
+/// a literal by its text, so `e: "null"` is `== null`).
+fn direct_cond_verdict<S: EvalSemantics, V: DocumentValue>(
+    cond: &Expr,
+    cursor: &V::Cursor,
+) -> Option<bool> {
     match cond {
-        Expr::Paren(inner) => shallow_cond_verdict::<V>(inner, cursor),
+        Expr::Paren(inner) => direct_cond_verdict::<S, V>(inner, cursor),
         Expr::Literal(Literal::Bool(b)) => Some(*b),
         Expr::Literal(Literal::Null) => Some(false),
         Expr::Identity => Some(cursor_is_truthy(cursor)),
         Expr::Pipe(stages) => match &stages[..] {
-            [head, Expr::Not] => shallow_cond_verdict::<V>(head, cursor).map(|b| !b),
+            [head, Expr::Not] => direct_cond_verdict::<S, V>(head, cursor).map(|b| !b),
             _ => None,
         },
         // Both sides are pure, so asking the right one of a falsy `and` (or a truthy `or`) changes
         // nothing but the work, and `None` from either side sends the whole `cond` the general way.
         Expr::And(left, right) => {
             let (l, r) = (
-                shallow_cond_verdict::<V>(left, cursor)?,
-                shallow_cond_verdict::<V>(right, cursor)?,
+                direct_cond_verdict::<S, V>(left, cursor)?,
+                direct_cond_verdict::<S, V>(right, cursor)?,
             );
             Some(l && r)
         }
         Expr::Or(left, right) => {
             let (l, r) = (
-                shallow_cond_verdict::<V>(left, cursor)?,
-                shallow_cond_verdict::<V>(right, cursor)?,
+                direct_cond_verdict::<S, V>(left, cursor)?,
+                direct_cond_verdict::<S, V>(right, cursor)?,
             );
             Some(l || r)
         }
-        Expr::Compare {
-            op: op @ (CompareOp::Eq | CompareOp::Ne),
-            left,
-            right,
-        } => {
-            if !matches!(
-                (&**left, &**right),
-                (Expr::Identity, Expr::Literal(_)) | (Expr::Literal(_), Expr::Identity)
-            ) {
-                return None;
-            }
+        Expr::Compare { op, left, right } => {
+            let (literal, node_is_left) = match (&**left, &**right) {
+                (Expr::Identity, Expr::Literal(literal)) => (literal, true),
+                (Expr::Literal(literal), Expr::Identity) => (literal, false),
+                _ => return None,
+            };
             let node = cursor.value();
-            (node.as_object().is_some() || node.as_array().is_some())
-                .then_some(matches!(op, CompareOp::Ne))
+            if node.as_object().is_some() || node.as_array().is_some() {
+                return matches!(op, CompareOp::Eq | CompareOp::Ne)
+                    .then_some(matches!(op, CompareOp::Ne));
+            }
+            // A node that cannot be copied (a decode failure) raises on the general route.
+            let owned = to_owned_cursor::<S, _>(cursor).ok()?;
+            let literal = crate::jq::eval::literal_to_owned(literal);
+            let (l, r) = if node_is_left {
+                (&owned, &literal)
+            } else {
+                (&literal, &owned)
+            };
+            Some(crate::jq::eval::apply_compare_op::<S>(*op, l, r))
         }
         _ => None,
     }

@@ -169,10 +169,10 @@ fn test_recurse_cond_that_raises_reaches_a_position_stage_4095() -> Result<()> {
     Ok(())
 }
 
-/// A `cond` that compares `.` with a literal is decided from the node's kind for a container
-/// (`shallow_cond_verdict`), without copying the container to compare it. Each row is pinned to
-/// the same `cond` spelled so the general route takes it (`. | cond`), on documents holding every
-/// kind of node, an alias and a duplicate key.
+/// A `cond` that compares `.` with a literal is computed without the general evaluator
+/// (`direct_cond_verdict`): a container from its kind, a scalar with the general route's own
+/// comparison. Each row is pinned to the same `cond` spelled so the general route takes it
+/// (`. | cond`), on documents holding every kind of node, an alias and a duplicate key.
 #[test]
 fn test_recurse_cond_comparison_agrees_with_the_general_route_4095() -> Result<()> {
     for doc in [TREE, ALIAS_DOC] {
@@ -195,6 +195,36 @@ fn test_recurse_cond_comparison_agrees_with_the_general_route_4095() -> Result<(
                 let got = run(&format!("[recurse(.[]?; {cond}) {tail}]"), doc)?;
                 assert_eq!(got, want, "`{cond}` {tail}");
             }
+        }
+    }
+    Ok(())
+}
+
+/// The verdict for `. == null` and `. == true` is read off the node without decoding it, so it has
+/// to agree with the general route on every spelling YAML gives those: the nulls (`~`, `null`,
+/// `Null`, an empty value), their quoted and tagged look-alikes, the booleans (`true`, `True`, a
+/// quoted `"true"`, `yes`), and a container carrying a `!!null`/`!!bool` tag.
+#[test]
+fn test_recurse_cond_null_and_bool_verdicts_agree_with_the_general_route_4095() -> Result<()> {
+    let doc = "a: ~\nb: null\nc: Null\nd:\ne: \"null\"\nf: 'null'\ng: !!str null\nh: true\ni: True\nj: \"true\"\nk: yes\nl: false\nm: !!bool true\nn: 0\no: \"\"\np: []\nq: {}\nr: !!null [1]\ns: !!bool [1]\nt: [~, true, false, [null]]\n";
+    for cond in [
+        ". == null",
+        ". != null",
+        "null == .",
+        "null != .",
+        ". == true",
+        ". != true",
+        ". == false",
+        ". != false",
+        "true == .",
+        ". == null or . == false",
+        ". != null and . != false",
+        ". == true | not",
+    ] {
+        for tail in ["| tojson", "| path"] {
+            let want = run(&format!("[recurse(.[]?; . | ({cond})) {tail}]"), doc)?;
+            let got = run(&format!("[recurse(.[]?; {cond}) {tail}]"), doc)?;
+            assert_eq!(got, want, "`{cond}` {tail}");
         }
     }
     Ok(())

@@ -37,3 +37,30 @@ fn test_path_of_recurse_cond_reads_no_input_past_the_first_node_4095() -> Result
     assert_eq!(stdout, "[[]]\n[1,2,3,4,5]\n");
     Ok(())
 }
+
+/// jq mode shares the cursor walk's verdict for `. == null` and `. == true`, read off the node
+/// without decoding it; it has to agree with the general route on JSON's own spellings.
+#[test]
+fn test_recurse_cond_null_and_bool_verdicts_agree_with_the_general_route_4095() -> Result<()> {
+    let doc = r#"{"a":null,"b":true,"c":false,"d":0,"e":"","f":"null","g":"true","h":[],"i":{},"j":[null,true,[false,{"k":null}]],"l":1.0,"m":-0}"#;
+    for cond in [
+        ". == null",
+        ". != null",
+        "null == .",
+        ". == true",
+        ". != false",
+        ". == false",
+        ". == null or . == false",
+        ". != null and . != false",
+        ". == true | not",
+    ] {
+        let general = format!("[recurse(.[]?; . | ({cond}))]");
+        let shallow = format!("[recurse(.[]?; {cond})]");
+        let (want, _, c1) = run_jq_full(&["-c", &general], Some(doc))?;
+        let (got, stderr, c2) = run_jq_full(&["-c", &shallow], Some(doc))?;
+        assert_eq!((c1, c2), (0, 0), "`{cond}` -- {stderr:?}");
+        assert!(!want.trim().is_empty(), "`{cond}` produced nothing");
+        assert_eq!(got, want, "`{cond}`");
+    }
+    Ok(())
+}
