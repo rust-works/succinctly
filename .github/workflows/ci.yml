@@ -665,6 +665,11 @@ jobs:
       - name: jq-path-register-sweep.py self-tests
         run: python3 scripts/test_jq_path_register_sweep.py -v
 
+      # #3649: the same shape for the CI load report: jobs built in the test, no network.
+      # It pins the load-adjusted queue-wait count the macOS matrix decisions rest on.
+      - name: ci-load-report.py self-tests
+        run: python3 scripts/test_ci_load_report.py -v
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
