@@ -95,7 +95,8 @@ use super::eval::{
 use super::expr::FuncDefBound;
 use super::expr::{
     ArithOp, ArithSettleMemo, AssignOp, BindOrigin, BoundBody, Builtin, CompareOp, Expr,
-    FormatType, FuncDefData, Literal, NumberKey, ObjectEntry, ObjectKey, Pattern, StringPart,
+    FormatType, FuncDefData, Literal, NumberKey, ObjectEntry, ObjectKey, Pattern, PipeStages,
+    StringPart,
 };
 use super::path_mode::Route;
 use super::slice::{literal_component_from_values, slice_str, SliceBounds};
@@ -19816,34 +19817,29 @@ fn yq_stage_preserves_node(stage: &Expr) -> bool {
 /// `eval_each_pipe_generic`'s own empty-pipe short-circuit, which drops the
 /// cursor. Here the entry is the answer, cursor and all.
 fn run_yq_stages_over_item<S: EvalSemantics, V: DocumentValue>(
-    stages: &[Expr],
+    rest: &mut RestPipe<'_>,
     item: &YqContextItem<V>,
     optional: bool,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
     match item.tag.origin {
         Some(origin) => with_node_origin(origin, || {
-            run_yq_stages_bare::<S, V>(stages, item, optional, sink)
+            run_yq_stages_bare::<S, V>(rest, item, optional, sink)
         }),
-        None => run_yq_stages_bare::<S, V>(stages, item, optional, sink),
+        None => run_yq_stages_bare::<S, V>(rest, item, optional, sink),
     }
 }
 
 fn run_yq_stages_bare<S: EvalSemantics, V: DocumentValue>(
-    stages: &[Expr],
+    rest: &mut RestPipe<'_>,
     item: &YqContextItem<V>,
     optional: bool,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
-    if stages.is_empty() {
+    if rest.stages().is_empty() {
         return push_one_generic(item.to_generic_item(), sink);
     }
-    continue_pipe_element_generic::<S, V>(
-        item.to_generic_item(),
-        &mut RestPipe::new(stages),
-        optional,
-        sink,
-    )
+    continue_pipe_element_generic::<S, V>(item.to_generic_item(), rest, optional, sink)
 }
 
 /// Materialize the outputs of `stages` over a whole context list.
@@ -20028,12 +20024,25 @@ fn eval_yq_context_pipe<S: EvalSemantics, V: DocumentValue>(
         // own gate consults the same function, so a declined pipe takes the
         // path-context routes rather than looping back here.
         let preserves = stages.iter().all(yq_stage_preserves_node);
+        // The stages run once per entry, so one `RestPipe` drives them all: it
+        // keeps the owned copy of the whole rest, which each entry would
+        // otherwise build for itself. A slice nothing owns also copies the rest
+        // of the pipe per stage per entry (#5462: quadratic in the stages after
+        // a union), so a list of several entries gets a pipe to own the stages,
+        // which keeps those copies once (#5404). One entry runs them once, and
+        // a rest of fewer than two stages has no tail to keep: nothing to share.
+        let owner =
+            (inputs.len() > 1 && stages.len() > 1).then(|| PipeStages::from(stages.to_vec()));
+        let mut rest = RestPipe::of_tail(match &owner {
+            Some(owner) => RestTail::whole(owner),
+            None => RestTail::unowned(stages),
+        });
         for item in inputs {
             cur.set(YqContextTag {
                 together: item.tag.together && preserves,
                 origin: item.tag.origin,
             });
-            match run_yq_stages_over_item::<S, V>(stages, item, optional, sink) {
+            match run_yq_stages_over_item::<S, V>(&mut rest, item, optional, sink) {
                 Flow::Exhausted => {}
                 stopped_or_escaped => return stopped_or_escaped,
             }
@@ -20113,22 +20122,27 @@ fn collect_together<S: EvalSemantics, V: DocumentValue>(
     for item in context {
         cur.set(item.tag);
         let mut stray: Option<Control> = None;
-        let flow = run_yq_stages_over_item::<S, V>(single, item, optional, &mut |produced| {
-            match generic_item_into_owned::<_, S>(produced) {
-                // The per-node collect always yields exactly one array; the
-                // non-array arm is unreachable defensive splicing rather than
-                // a second rule.
-                Ok(OwnedValue::Array(elements)) => {
-                    merged.extend(elements);
-                    Demand::Continue
+        let flow = run_yq_stages_over_item::<S, V>(
+            &mut RestPipe::new(single),
+            item,
+            optional,
+            &mut |produced| {
+                match generic_item_into_owned::<_, S>(produced) {
+                    // The per-node collect always yields exactly one array; the
+                    // non-array arm is unreachable defensive splicing rather than
+                    // a second rule.
+                    Ok(OwnedValue::Array(elements)) => {
+                        merged.extend(elements);
+                        Demand::Continue
+                    }
+                    Ok(other) => {
+                        merged.push(other);
+                        Demand::Continue
+                    }
+                    Err(control) => stop_with_escape(&mut stray, control),
                 }
-                Ok(other) => {
-                    merged.push(other);
-                    Demand::Continue
-                }
-                Err(control) => stop_with_escape(&mut stray, control),
-            }
-        });
+            },
+        );
         if let Some(control) = stray {
             return Err(Flow::Escaped(control));
         }
@@ -58345,6 +58359,75 @@ mod tests {
                     many - settled
                 );
             }
+        }
+    }
+
+    /// #5462: the stages after a union in yq mode are driven once per entry of
+    /// the context list, and copy the rest of the pipe a constant number of
+    /// stages per entry, however many stages follow, where each entry and each
+    /// stage copied its own rest. The answer is branch-major (#2451).
+    #[cfg(feature = "std")]
+    #[test]
+    fn stages_after_a_union_copy_a_constant_per_entry_5462() {
+        use crate::jq::eval::owned_pipe_copies;
+        for stages in [10usize, 20] {
+            let t = vec![". + 1"; stages].join(" | ");
+            let copies = |n: usize| {
+                let program = format!("[range({n})] | .[] | (., 1) | {t}");
+                let before = owned_pipe_copies::get();
+                let (out, control) = drive_each_sink::<YqSemantics>(b"null", &program);
+                assert!(control.is_none(), "{control:?}");
+                let want: Vec<OwnedValue> = (0..n)
+                    .map(|i| (i + stages) as i64)
+                    .chain((0..n).map(|_| 1 + stages as i64))
+                    .map(OwnedValue::Int)
+                    .collect();
+                assert_eq!(out, want, "{stages} stages over {n} entries");
+                owned_pipe_copies::get() - before
+            };
+            let (settled, many) = (copies(4), copies(40));
+            assert!(
+                many - settled <= 2 * stages,
+                "{stages} stages: forty entries copy {} more than four do",
+                many - settled
+            );
+        }
+    }
+
+    /// #5462: the branches of the shared-rest route that treat a list differently
+    /// -- one entry, a rest of one stage, a rest holding a `def` call or a
+    /// `reduce`, and a second union downstream -- answer branch-major, as they
+    /// did when every entry ran with a rest of its own. Each row is the pipe over
+    /// `[1, 2, 3]` read by `.[]` and was captured from the build before the change.
+    #[cfg(feature = "std")]
+    #[test]
+    fn stages_after_a_union_answer_the_same_for_every_rest_shape_5462() {
+        let rows: &[(&str, &[i64])] = &[
+            // One entry: the rest runs once with nothing to share.
+            ("[1] | .[] | (., 10) | . + 1 | . + 2", &[4, 13]),
+            // A rest of one stage over several entries.
+            (".[] | (., 10) | . + 1", &[2, 3, 4, 11, 11, 11]),
+            // A rest holding a `def` call, which keeps state between calls.
+            (
+                "def f: . + 1; .[] | (., 10) | f | f | . + 1",
+                &[4, 5, 6, 13, 13, 13],
+            ),
+            // A rest holding a `reduce`.
+            (
+                ".[] | (., 10) | reduce range(3) as $i (.; . + $i) | . + 1 | . + 1",
+                &[6, 7, 8, 15, 15, 15],
+            ),
+            // A second union downstream of the first.
+            (
+                ".[] | (., 10) | . + 1 | (., 100) | . + 1 | . + 1",
+                &[4, 5, 6, 13, 13, 13, 102, 102, 102, 102, 102, 102],
+            ),
+        ];
+        for (program, want) in rows {
+            let (out, control) = drive_each_sink::<YqSemantics>(b"[1,2,3]", program);
+            assert!(control.is_none(), "{program}: {control:?}");
+            let want: Vec<OwnedValue> = want.iter().copied().map(OwnedValue::Int).collect();
+            assert_eq!(out, want, "{program}");
         }
     }
 
