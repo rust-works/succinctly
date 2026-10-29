@@ -6595,11 +6595,12 @@ Captured live (v4.53.3):
 
 A write resolves its left side against the owned document, which holds values and nothing else, so `(.. | select(style == "double")) = 1` selected nothing and was a silent no-op.
 The left side is now resolved on the document's cursor first, and the write runs on the literal paths it found.
-That covers `style`, `anchor`, `kind` (an alias), `line`, `column`, `line_comment`, `head_comment`, `foot_comment`, `document_index`, `file_index` and `filename` read in a `select(...)` condition in the left side of `=`, `|=`, `+=`-style updates, `//=`, a metadata write (`style =`, `anchor =`, ...) or a `del(...)`.
-A metadata builtin used as a path component of its own (`(.a | key | line_comment) = "x"`) is a different route and is unchanged.
+That covers `style`, `anchor`, `kind` (an alias), `line`, `column`, `line_comment`, `head_comment`, `foot_comment`, `document_index`, `file_index` and `filename` read anywhere in the left side of `=`, `|=`, `+=`-style updates, a metadata write (`style =`, `anchor =`, ...) or a `del(...)`, and of succinctly's own `//=` (yq has none).
+A metadata builtin that is the last stage of the left side (`(.a | key | line_comment) = "x"`) is the slot being written, a different route, and is unchanged.
 The write has to be the whole filter, or the first stage of a pipe: a later stage reads the document the stages before it left, which has no cursor.
-`.e = 1 | (.[] | select(style == "double")) = 5` therefore still selects nothing here where yq writes `5`, and so does a second metadata-selecting write in the same pipe or a metadata-selecting write inside a comma, `with(...)`, `reduce` or a function body.
+`.e = 1 | (.[] | select(style == "double")) = 5` therefore still selects nothing here where yq writes `5`, and so does a second metadata-selecting write in the same pipe, and one inside a comma, `with(...)`, `reduce` or a function body.
+So does metadata read in the right side of `|=` (`.[] |= (select(style == "double") | 5)`).
+When the paths cannot be resolved on the cursor (the left side errors, or a path step is neither a string key nor an integer index) the write runs as written, which is the same silent no-op.
 `--eval-all` and `--slurp` evaluate through the owned-value route and are unchanged.
 A write that clears an anchor leaves yq's dangling `*name` alias behind, where succinctly expands it (the anchor soundness rule above), exactly as `.a anchor = ""` already does.
 Pinned by `tests/yq_cli/i5479.rs`, whose rows were captured from yq v4.53.3.
-
