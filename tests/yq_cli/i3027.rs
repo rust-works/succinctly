@@ -326,7 +326,7 @@ fn test_computed_prefixed_integers_keep_their_tag_and_comment_3027() -> Result<(
 }
 
 /// A computed prefixed integer bound to a variable and used again, which rebuilds it from its
-/// text. Captured from yq v4.53.3.
+/// text, and one nested in a collection a string encoder writes. Captured from yq v4.53.3.
 const BOUND_ROWS: &[(&str, &str, &str)] = &[
     ("(.a - 100) as $v | [$v]", "- !!int 0x-54\n", "[-84]\n"),
     (
@@ -343,6 +343,21 @@ const BOUND_ROWS: &[(&str, &str, &str)] = &[
         ".a as $x | .b as $y | [$x + $y, $y + $x]",
         "- 0x10F\n- 0x10F\n",
         "[271,271]\n",
+    ),
+    (
+        "[.a - 100] | to_yaml",
+        "- !!int 0x-54\n\n",
+        "\"- !!int 0x-54\\n\"\n",
+    ),
+    (
+        "{\"k\": (.a - 100)} | to_yaml",
+        "k: !!int 0x-54\n\n",
+        "\"k: !!int 0x-54\\n\"\n",
+    ),
+    (
+        "[.a - 100] | @yaml",
+        "- !!int 0x-54\n\n",
+        "\"- !!int 0x-54\\n\"\n",
     ),
 ];
 

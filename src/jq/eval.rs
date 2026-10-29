@@ -14747,6 +14747,15 @@ pub(crate) fn arith_combine<S: EvalSemantics>(
             return result;
         }
     }
+    arith_combine_plain::<S>(op, left, right)
+}
+
+/// [`arith_combine`] for operands that carry no hex or octal spelling.
+fn arith_combine_plain<S: EvalSemantics>(
+    op: ArithOp,
+    left: OwnedValue,
+    right: OwnedValue,
+) -> Result<OwnedValue, EvalError> {
     match op {
         ArithOp::Add => arith_add::<S>(left, right),
         ArithOp::Sub => arith_sub::<S>(left, right),
@@ -14823,9 +14832,7 @@ fn yq_prefixed_int_arith(
     }
     if matches!(op, ArithOp::Div) || is_float(left) || is_float(right) {
         let named = if left_base.is_some() { left } else { right };
-        let OwnedValue::NumberLiteral(_, text) = named else {
-            return None; // patchcov: coverage tolerate-line reason="unreachable: `named` is the operand `yq_int_base` found a spelling on, which is a `NumberLiteral`"
-        };
+        let text = yq_scalar_text::<YqSemantics>(named).unwrap_or_default();
         return Some(Err(EvalError::new(format!(
             "strconv.ParseFloat: parsing \"{text}\": invalid syntax"
         ))));
@@ -14835,13 +14842,7 @@ fn yq_prefixed_int_arith(
         other => other.clone(),
     };
     let (l, r) = (plain(left), plain(right));
-    let result = match op {
-        ArithOp::Add => arith_add::<YqSemantics>(l, r),
-        ArithOp::Sub => arith_sub::<YqSemantics>(l, r),
-        ArithOp::Mul(flags) => arith_mul::<YqSemantics>(l, r, flags),
-        ArithOp::Mod => arith_mod::<YqSemantics>(l, r),
-        ArithOp::Div => return None, // patchcov: coverage tolerate-line reason="unreachable: a division returned the ParseFloat error above"
-    };
+    let result = arith_combine_plain::<YqSemantics>(op, l, r);
     Some(result.map(|value| match (value, left_base) {
         (OwnedValue::Int(n), Some(base)) => yq_spelled_in_base(base, n),
         (value, _) => value,
