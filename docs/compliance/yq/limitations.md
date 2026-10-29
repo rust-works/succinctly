@@ -6028,7 +6028,8 @@ Scalar `tostring` agrees in both (the #2902 fix). The `tojson` tests in
 ## `succinctly yq -o=json -C` colorizes with jq's own scheme, not real yq's (pre-existing, recorded while verifying #3413)
 
 `succinctly yq`'s JSON output colorizing (`-o=json -C`, and the JSON side of `-P -C`) reuses
-`colorize_json` -- the same tokenizer and `ColorScheme::default()` `succinctly jq` uses --
+`colorize_json_per_token` -- the same tokenizer and `ColorScheme::default()` `succinctly jq` uses,
+but with the per-token framing `succinctly jq` had before #5473 (jq's own bytes now differ from it) --
 rather than a yq-specific scheme, confirmed by `test_colorized_json_output_is_token_aware`'s
 own comment ("goes through the shared jq colorizer"). This predates #3413; #3413 only changed
 which color that shared default assigns to `null` (`1;30` to jq 1.7.1's own `0;90`), which

@@ -1208,11 +1208,12 @@ impl JsonColorizer {
                 '}' | ']' => {
                     // A container with an element writes its color once more before the
                     // bracket (`value_done` wrote the one after the last element).
-                    let (color, nonempty) = if c == '}' {
-                        (&scheme.object, self.depth_stack.pop().is_some_and(|f| f.1))
+                    let color = if c == '}' {
+                        &scheme.object
                     } else {
-                        (&scheme.array, self.depth_stack.pop().is_some_and(|f| f.1))
+                        &scheme.array
                     };
+                    let nonempty = self.depth_stack.pop().is_some_and(|(_, nonempty)| nonempty);
                     if nonempty || self.per_token {
                         result.push_str(color);
                     }

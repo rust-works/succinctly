@@ -8,6 +8,9 @@ use anyhow::Result;
 
 use crate::spawn_jq_with_env;
 
+/// jq 1.7.1's default `JQ_COLORS`: null, false, true, numbers, strings, arrays, objects, keys.
+const DEFAULT_SPEC: &str = "0;90:0;39:0;39:0;39:0;32:1;39:1;39:1;34";
+
 type Row = (
     &'static str,
     &'static [&'static str],
@@ -61,12 +64,11 @@ fn test_color_bytes_match_jq_5473() -> Result<()> {
     for &(input, args, colors, want) in rows {
         let mut argv = args.to_vec();
         argv.push(".");
-        let (output, _) = match colors {
-            Some(spec) => spawn_jq_with_env(&argv, "JQ_COLORS", spec, Some(input.as_bytes()))?,
-            // An unset `JQ_COLORS` is the default scheme, so pass the default spec's own
-            // fields through as an unrelated variable and leave `JQ_COLORS` alone.
-            None => spawn_jq_with_env(&argv, "UNRELATED_5473", "1", Some(input.as_bytes()))?,
-        };
+        // The rows with no spec expect the default scheme, so pass jq 1.7.1's own default spec
+        // rather than rely on `JQ_COLORS` being unset in the environment that runs the tests.
+        let spec = colors.unwrap_or(DEFAULT_SPEC);
+        let (output, code) = spawn_jq_with_env(&argv, "JQ_COLORS", spec, Some(input.as_bytes()))?;
+        assert_eq!(code, 0, "{args:?} {colors:?} over {input}");
         let got = String::from_utf8(output.stdout)?;
         assert_eq!(got, want, "{args:?} {colors:?} over {input}");
     }
