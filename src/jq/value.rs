@@ -7880,7 +7880,7 @@ mod tests {
             );
         }
         // A prefix with nothing to read after it is best-effort text, never a panic.
-        assert!(!format_number_jq_compat(b"0xzz").is_empty());
+        assert_ne!(format_number_jq_compat(b"0xzz"), "");
         // The message rendering of a spelled integer is the number.
         assert_eq!(
             OwnedValue::NumberLiteral(NumberRepr::Int(31), "0x1f".into())
