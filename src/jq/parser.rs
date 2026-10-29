@@ -4068,6 +4068,16 @@ impl<'a> Parser<'a> {
                         Some("array_to_map"),
                         desugared,
                     )
+                } else if self.mode == ParserMode::Yq
+                    && self.matches_keyword("explode")
+                    && self.keyword_is_called(keyword_start)
+                {
+                    // #5483: yq's `explode(f)`; jq's own `explode` is the nullary string builtin.
+                    self.parse_shadowable_special_form(
+                        keyword_start,
+                        "explode",
+                        Self::parse_explode_expr,
+                    )
                 } else if self.mode == ParserMode::Yq && self.matches_keyword("with") {
                     // #4206: yq's `with(path; update)`; not a jq form.
                     self.parse_shadowable_special_form(keyword_start, "with", Self::parse_with_expr)
@@ -4681,6 +4691,66 @@ impl<'a> Parser<'a> {
             (false, None) => FormatType::Yaml,
             (false, Some(n)) => FormatType::YqYaml(n),
         }))
+    }
+
+    /// Whether the keyword at `start` is followed, past any whitespace, by `(`: a call with
+    /// arguments, not the bare name.
+    fn keyword_is_called(&mut self, start: usize) -> bool {
+        let saved = self.pos;
+        self.pos = start;
+        while self
+            .peek()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            self.next();
+        }
+        self.skip_ws();
+        let called = self.peek() == Some('(');
+        self.pos = saved;
+        called
+    }
+
+    /// Parse yq's `explode(.)` (#5483): every alias in the document becomes a copy of its
+    /// anchor's node, the anchors go, and a `<<` merge is expanded.
+    ///
+    /// A write that clears every anchor already does exactly that: the aliases that named a
+    /// cleared anchor are written out as the nodes they stood for (`enforce_anchor_soundness`),
+    /// and a write materializes merges. So this is `(.. | select(kind != "alias")) anchor = ""`.
+    /// The alias nodes are skipped because they carry no anchor of their own.
+    ///
+    /// Only the argument `.` is supported. yq's `explode(.a)` leaves the aliases outside `.a` as
+    /// they are, and a copy made inside `.a` of a node anchored outside it is the part that has no
+    /// route here yet; a wrong answer would be worse than this refusal.
+    fn parse_explode_expr(&mut self) -> Result<Expr, ParseError> {
+        let start_pos = self.pos;
+        self.consume_keyword("explode");
+        self.skip_ws();
+        if let Err(early) = self.expect_or_wrong_arity('(', start_pos) {
+            return early;
+        }
+        self.next();
+        self.skip_ws();
+        let target = self.parse_expr()?;
+        self.skip_ws();
+        if self.peek() != Some(')') {
+            return self.wrong_arity_or_expect(start_pos, ')', vec![target]);
+        }
+        self.next();
+        let mut inner = &target;
+        while let Expr::Paren(expr) = inner {
+            inner = expr;
+        }
+        if !matches!(inner, Expr::Identity) {
+            return Err(ParseError::new(
+                "explode(f) is only supported as explode(.)",
+                start_pos,
+            ));
+        }
+        parse_with_mode_and_extensions(
+            "(.. | select(kind != \"alias\")) anchor = \"\"",
+            ParserMode::Yq,
+            true,
+        )
     }
 
     /// Parse yq's `with(path; update)` (#4206): `path` is the nodes to work on and `update` runs
