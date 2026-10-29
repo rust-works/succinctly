@@ -16176,7 +16176,7 @@ fn direct_cond_verdict_with<S: EvalSemantics, V: DocumentValue>(
         Expr::Identity => Some(cursor_is_truthy(cursor)),
         Expr::Pipe(stages) => match &stages[..] {
             [head, Expr::Not] => direct_cond_verdict_with::<S, V>(head, cursor, owned).map(|b| !b),
-            _ => None,
+            _ => None, // patchcov: coverage tolerate-line reason="unreachable: direct_cond_verdict checks is_direct_grammar before this runs, and that grammar admits only the shapes the arms above answer (#4095)"
         },
         // Both sides are pure, so asking the right one of a falsy `and` (or a truthy `or`) changes
         // nothing but the work, and `None` from either side sends the whole `cond` the general way.
@@ -16203,7 +16203,7 @@ fn direct_cond_verdict_with<S: EvalSemantics, V: DocumentValue>(
                 (Expr::Literal(literal), operand) if is_operand(operand) => {
                     (operand, literal, false)
                 }
-                _ => return None,
+                _ => return None, // patchcov: coverage tolerate-line reason="unreachable: direct_cond_verdict checks is_direct_grammar before this runs, and that grammar admits only the shapes the arms above answer (#4095)"
             };
             let node = cursor.value();
             let type_value;
@@ -16238,7 +16238,7 @@ fn direct_cond_verdict_with<S: EvalSemantics, V: DocumentValue>(
             };
             Some(crate::jq::eval::apply_compare_op::<S>(*op, l, r))
         }
-        _ => None,
+        _ => None, // patchcov: coverage tolerate-line reason="unreachable: direct_cond_verdict checks is_direct_grammar before this runs, and that grammar admits only the shapes the arms above answer (#4095)"
     }
 }
 
