@@ -4905,6 +4905,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
         && args.input_dsv.is_none()
         && !args.seq // seq input mode parses differently
         && !args.stream // the program reads tostream events, not documents (#4397)
+        && !args.stream_errors // ... read by jq's own streaming parser (#5474)
         && !uses_input_builtins;
 
     if can_use_lazy_path && !args.null_input {
@@ -6017,7 +6018,7 @@ fn get_inputs(
     // a file continues in the next one.
     // `--validate` is strict per file (an empty file is rejected too), so it reads the files as
     // written.
-    let mut seams = if json_input_mode && !args.validate {
+    let mut seams = if json_input_mode && !args.validate && !args.stream_errors {
         stitch_json_file_seams(raw_bytes.iter_mut().map(|(_, raw)| raw), track_eof)
     } else {
         Vec::new()
@@ -6140,6 +6141,55 @@ fn get_inputs(
     } else {
         Vec::new()
     };
+
+    // #5474: `--stream-errors` reads the bytes with jq's own streaming parser, which turns a fault
+    // into an input of its own, so neither the document parse nor the `--stream` expansion below
+    // can produce what the program reads.
+    if args.stream_errors && json_input_mode {
+        if args.validate {
+            for (file_idx, raw) in &raw_bytes {
+                let filename = file_idx.map(|idx| files[idx].to_string_lossy().to_string());
+                validate_json_input(raw, filename.as_deref())?;
+            }
+        }
+        let read = crate::jq_stream_errors::read(&raw_bytes);
+        let mut locations = InputLocations::new(
+            files
+                .iter()
+                .map(|p| Some(p.to_string_lossy().to_string()))
+                .collect(),
+        );
+        let mut values = read.values;
+        let mut value_locations = read.locations;
+        // `--slurp` closes its array at the call that empties jq's buffer, so what that call left
+        // behind comes out after the array as inputs of their own.
+        let after_array = args.slurp.then(|| {
+            let outside = values.split_off(read.inside);
+            let outside_locations = value_locations.split_off(read.inside);
+            let (source, line) = read.slurp_at;
+            values = vec![OwnedValue::array_from(std::mem::take(&mut values))];
+            value_locations = vec![(source, line)];
+            (outside, outside_locations)
+        });
+        if let Some((outside, outside_locations)) = after_array {
+            values.extend(outside);
+            value_locations.extend(outside_locations);
+        }
+        for &(source, line) in &value_locations {
+            if line == crate::jq_stream_errors::CLOSED {
+                locations.push(0, UNKNOWN_LINE as usize);
+            } else {
+                locations.push(raw_bytes[source].0.unwrap_or(0), line);
+            }
+        }
+        if track_eof && !args.slurp {
+            locations.eof_tail = Some(EofTail {
+                newlines: u32::try_from(read.open_at_end.unwrap_or(0)).unwrap_or(u32::MAX),
+                unknown: read.open_at_end.is_none(),
+            });
+        }
+        return Ok(Ok((values, locations, None, Vec::new())));
+    }
 
     // #4303: how the stream ends, read only by an `input`/`inputs` that runs
     // past it, so only a program using them pays the scan of the last source.
@@ -6601,7 +6651,8 @@ enum StreamMode {
 
 fn stream_mode(args: &JqCommand, uses_input_builtins: bool) -> StreamMode {
     let json_documents = args.input_dsv.is_none() && !args.raw_input && !args.seq;
-    if !args.stream || !json_documents {
+    // `--stream-errors` reads the events itself (#5474), so there is nothing left to expand.
+    if !args.stream || args.stream_errors || !json_documents {
         StreamMode::Off
     } else if args.slurp || uses_input_builtins {
         StreamMode::Eager

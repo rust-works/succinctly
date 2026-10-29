@@ -84,7 +84,7 @@ const MAX_PARSING_DEPTH: usize = 256;
 /// The most bytes one of jq's `fgets` refills can hold: `jq_util_input_read_more`
 /// (`src/util.c`) calls `fgets(state->buf, sizeof(state->buf), f)` on a
 /// `char buf[4096]`, and `fgets` reserves one byte for the terminating NUL.
-const JQ_FGETS_CHUNK: usize = 4095;
+pub(crate) const JQ_FGETS_CHUNK: usize = 4095;
 
 /// jq 1.7.1's `main` line for a `--seq` parse error it skips
 /// (`fprintf(stderr, "jq: ignoring parse error: %s\n", ...)`), for the
@@ -98,7 +98,7 @@ pub(crate) fn ignored_parse_error(body: &str) -> String {
 /// ends just after a newline or after [`JQ_FGETS_CHUNK`] bytes, whichever
 /// comes first. The one definition of that rule, shared by
 /// [`final_buffer_start`] and [`refill_boundaries`] (#3200).
-fn fgets_chunk_lens(raw: &[u8]) -> impl Iterator<Item = usize> + '_ {
+pub(crate) fn fgets_chunk_lens(raw: &[u8]) -> impl Iterator<Item = usize> + '_ {
     let mut pos = 0usize;
     std::iter::from_fn(move || {
         let rest = raw.get(pos..).filter(|rest| !rest.is_empty())?;
@@ -1342,7 +1342,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-fn unhex4(bytes: &[u8]) -> Option<u32> {
+pub(crate) fn unhex4(bytes: &[u8]) -> Option<u32> {
     let mut value = 0u32;
     for &b in bytes {
         value = (value << 4) | (b as char).to_digit(16)?;
@@ -1361,7 +1361,7 @@ fn unhex4(bytes: &[u8]) -> Option<u32> {
 /// numbers too. Getting this wrong shows up as "Invalid numeric literal"
 /// where jq says "Potentially truncated top-level numeric value", or vice
 /// versa.
-fn number_is_valid(token: &[u8]) -> bool {
+pub(crate) fn number_is_valid(token: &[u8]) -> bool {
     // The special-value words (`nan`, `sNaN12`, `-Infinity`, `+inf`) are
     // one shared definition since #2877 -- the document dispatchers and
     // the lenient validator read the same grammar from the same function.
