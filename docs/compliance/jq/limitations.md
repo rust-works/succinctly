@@ -307,6 +307,26 @@ substitution into the more sensible WHATWG-consistent shape. See
 substitution-mechanism history and
 [#1717](https://github.com/rust-works/succinctly/issues/1717) for the algorithm fix itself.
 
+## `-R` replaces a character that straddles jq's 4095-byte read; succinctly keeps it (#5476)
+
+jq 1.7.1 reads `--raw-input` with `fgets` into a 4096-byte buffer, so it sees a long line in pieces of at most 4095 bytes.
+A multi-byte character that starts before the end of one piece and ends in the next is read as invalid UTF-8 and printed as U+FFFD replacement characters (two or three for a 3-byte character, depending on where it splits).
+`succinctly jq` reads the line whole and keeps the character.
+This is jq corrupting valid text, so the divergence stands under [ADR-0018](../../adrs/adr-0018.md) rather than being matched.
+It reaches `-R`, `-Rs`, `-Rc` and `-nR` with `input`, and a differential sweep of 1,977 real JSON files found it in five of them (language packs with CJK text in a minified line).
+
+```bash
+$ python3 -c "import sys; sys.stdout.buffer.write(b'a'*4094 + '主'.encode() + b'b\n')" > t.txt
+$ jq -R length t.txt          # three U+FFFD for the one character
+4098
+$ sjq -R length t.txt
+4096
+```
+
+The offset is the character's first byte within its line: a 3- or 4-byte character at 4093 or 4094, and a 2-byte one at 4094, are replaced.
+One at 4092 or below, or at 4095 or above, is read intact, and `-Rn` with `inputs` agrees with jq on the same line.
+Pinned by `tests/jq_cli/i5476.rs`, which asserts succinctly's side; jq's side was captured from `/usr/bin/jq` 1.7.1.
+
 ## Conversion diagnostics
 
 jq implements `tonumber` and `fromjson` by handing the string to its JSON parser, so a failure surfaces as that parser's diagnostic.

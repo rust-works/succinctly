@@ -188,3 +188,4 @@ mod i5447;
 mod i5454;
 mod i5456;
 mod i5458;
+mod i5476;
