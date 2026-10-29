@@ -6618,7 +6618,7 @@ jq's own `explode` is the nullary string builtin and is unchanged; the call form
 Three things differ from yq.
 A path other than `.` (`explode(.a)`, `explode(..)`) is a parse error: yq leaves the aliases outside the selected nodes alone and expands those inside whose anchor is outside, which this route has no way to do, and a wrong answer would be worse than the refusal.
 `.a | explode(.)` is refused by the existing rule that a metadata write cannot sit behind a navigation.
-The flow style of an expanded alias copy is lost (`b: *x` over `a: &x {p: 1}` prints a block mapping where yq prints `b: {p: 1}`), the gap tracked on [#2651](https://github.com/rust-works/succinctly/issues/2651), and a comment after the alias moves with it.
+The presentation of an expanded alias copy is lost: its flow style (`b: *x` over `a: &x {p: 1}` prints a block mapping where yq prints `b: {p: 1}`), its quotes (`b: *s` over `a: &s "q"` prints `b: q`) and its explicit tag (`a: &x !!str 1` prints `b: "1"`), the family tracked on [#2651](https://github.com/rust-works/succinctly/issues/2651), and a comment after the alias moves with it.
+The value is the same each time; only how it is written differs.
 The `alias` getter and `alias =` setter, the rest of yq's anchor/alias operators, are still undefined.
 Pinned by `tests/yq_cli/i5483.rs`, whose rows were captured from yq v4.53.3.
-
