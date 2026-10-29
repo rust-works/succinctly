@@ -95772,12 +95772,12 @@ fn builtin_style<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
 fn builtin_alias<W: Clone + AsRef<[u64]>>(value: StandardJson<'_, W>) -> QueryResult<'_, W> {
     let text = match &value {
         StandardJson::String(_) => {
-            crate::jq::document::DocumentValue::as_str(&value).map(std::borrow::Cow::into_owned)
+            crate::jq::document::DocumentValue::as_str(&value).map(Cow::into_owned)
         }
         StandardJson::Bool(b) => Some(b.to_string()),
         StandardJson::Null => Some(String::from("null")),
         StandardJson::Number(_) => crate::jq::document::DocumentValue::number_text(&value)
-            .map(std::borrow::Cow::into_owned)
+            .map(Cow::into_owned)
             .or_else(|| crate::jq::document::DocumentValue::as_i64(&value).map(|n| n.to_string())),
         _ => None,
     };
