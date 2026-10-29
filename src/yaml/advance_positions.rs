@@ -271,8 +271,12 @@ impl AdvancePositions {
 
         let num_opens = positions.len();
 
-        // Build IB: set bit at each unique position
-        let ib_num_words = text_len.div_ceil(64);
+        // Build IB: set bit at each unique position.
+        // A null node's position is the sentinel `text_len` (see `YamlCursor::value`), so
+        // allocate one extra bit beyond `text_len`: at a multiple of 64 the sentinel's bit
+        // has no word otherwise, is dropped below, and every later open reads one entry off
+        // (#5463).
+        let ib_num_words = (text_len + 1).div_ceil(64);
         let mut ib_words = vec![0u64; ib_num_words];
 
         // Build advance bitmap: set bit when position changes
@@ -1225,6 +1229,21 @@ mod tests {
         assert_eq!(at(0), Some(positions[0]));
         for i in (1..40).chain(2900..2940) {
             assert_eq!(at(i), Some(positions[i]), "step {i}");
+        }
+    }
+
+    /// #5463: a null node sits at the sentinel position `text_len`. At a multiple of 64 that
+    /// bit used to have no IB word, was dropped, and every `get` after it read one entry off.
+    #[test]
+    fn test_sentinel_position_at_text_len_on_a_word_boundary() {
+        for text_len in [63usize, 64, 65, 127, 128, 129, 192] {
+            let positions = [0u32, 3, 3, text_len as u32, text_len as u32];
+            let ap = AdvancePositions::build_unchecked(&positions, text_len);
+            assert_eq!(ap.len(), positions.len(), "len at {text_len}");
+            for (i, &want) in positions.iter().enumerate() {
+                assert_eq!(ap.get(i), Some(want), "get({i}) at text_len {text_len}");
+            }
+            assert_eq!(ap.get(positions.len()), None, "past the end at {text_len}");
         }
     }
 }
