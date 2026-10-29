@@ -5835,6 +5835,9 @@ impl From<Literal> for OwnedValue {
                     Some(repr) == parse_i64_or_f64_in::<JqSemantics>(&text)
                         || Some(repr) == parse_i64_or_f64_in::<YqSemantics>(&text)
                         || matches!(repr, NumberRepr::Float(f) if is_nan_instance(f) && text == "null")
+                        // #2802: a YAML integer spelled `0x1f`, `0o17`, `01`, `+5` or `0x-54`.
+                        || matches!(repr, NumberRepr::Int(n)
+                            if crate::yaml::spelled_int_value(&text) == Some(n))
                         // #1071: a YAML document's `.inf`/`.NaN` is not JSON number text.
                         || matches!(repr, NumberRepr::Float(f)
                             if crate::yaml::nonfinite_literal_value(&text)

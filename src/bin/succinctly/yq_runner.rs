@@ -9402,10 +9402,7 @@ fn block_header(anchor: Option<&str>, tag: Option<&str>) -> String {
 /// recursive emitter's frame stays small.
 #[inline(never)]
 fn int_literal_reads_back_as_string(literal: &str) -> bool {
-    !matches!(
-        resolve_plain_sourced(literal, false),
-        ResolvedScalar::Int(_)
-    )
+    succinctly::yaml::is_signed_prefixed_int_text(literal)
 }
 
 /// `literal` behind the `!!int` tag that keeps it an integer.
@@ -9459,8 +9456,12 @@ fn emit_tagged_scalar(
             let bare = CommentTree::Leaf(comments.meta().with_tag(None).with_style(style));
             let text =
                 emit_yaml_value_at_depth(value, &bare, config, indent, in_flow, depth, indent);
-            // The explicit tag replaces the `!!float` a nested whole float adds itself.
-            match text.strip_prefix("!!float ") {
+            // The explicit tag replaces the `!!float` a nested whole float adds itself, and the
+            // `!!int` a negative hex or octal result does (#3027).
+            match text
+                .strip_prefix("!!float ")
+                .or_else(|| text.strip_prefix("!!int "))
+            {
                 Some(spelling) => spelling.to_string(),
                 None => text,
             }

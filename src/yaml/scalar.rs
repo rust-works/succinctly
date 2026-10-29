@@ -534,7 +534,7 @@ pub fn is_spelled_int(raw: &str) -> bool {
 /// Only a `0x`/`0o` prefix or a decimal run of digits can be one, so a float literal, an
 /// exponent form and the canonical integer (`42`, `-7`, `0`) return after a byte scan, and the
 /// prefixed forms alone reach [`resolve_plain`].
-pub fn spelled_int_value(raw: &str) -> Option<i64> {
+pub(crate) fn spelled_int_value(raw: &str) -> Option<i64> {
     let bytes = raw.as_bytes();
     let unsigned = bytes
         .strip_prefix(b"-")
@@ -544,7 +544,9 @@ pub fn spelled_int_value(raw: &str) -> Option<i64> {
         return match resolve_plain(raw) {
             ResolvedScalar::Int(n) => Some(n),
             // The `0x-10` yq's own arithmetic writes for a negative result (#3027).
-            _ if matches!(bytes, [b'0', b'x' | b'o', b'-', ..]) => crate::jq::yq_parse_int64(raw),
+            _ if is_signed_prefixed_int_text(raw) => {
+                i64::from_str_radix(&raw[2..], if bytes[1] == b'x' { 16 } else { 8 }).ok()
+            }
             _ => None,
         };
     }
@@ -558,6 +560,13 @@ pub fn spelled_int_value(raw: &str) -> Option<i64> {
         return None;
     }
     raw.parse::<i64>().ok()
+}
+
+/// Whether `raw` has the shape `0x-10` / `0o-17` that yq's arithmetic writes for a negative hex
+/// or octal result (#3027): the only integer text of a value that reads back as a string.
+#[must_use]
+pub fn is_signed_prefixed_int_text(raw: &str) -> bool {
+    matches!(raw.as_bytes(), [b'0', b'x' | b'o', b'-', ..])
 }
 
 /// The number yq's JSON encoder writes for a literal whose text is not what it writes.
@@ -1148,6 +1157,9 @@ mod tests {
             ("-007", "-7"),
             ("00", "0"),
             ("+0", "0"),
+            // What yq's arithmetic writes for a negative result (#3027).
+            ("0x-54", "-84"),
+            ("0o-125", "-85"),
         ] {
             if number.is_empty() {
                 assert!(!is_spelled_int(raw), "{raw}");

@@ -254,3 +254,105 @@ fn test_hex_and_octal_operands_meet_a_float_or_a_division_with_parsefloat_3027()
     }
     Ok(())
 }
+
+/// An explicit tag and a comment on the written node, and a hex right-hand side of a compound
+/// assignment. Captured from yq v4.53.3. (A `null` left operand or a collection built around a
+/// computed value also takes the node's tag and comment in yq, which is the general node-copy gap,
+/// not this issue.)
+const TAGGED_DOC: &str = "a: !!int 0x10 # note\nn: ~\nk: 0xFF\nm: 0o17\n";
+
+const TAGGED_ROWS: &[(&str, &str, &str)] = &[
+    (
+        ".a -= 100",
+        "a: !!int 0x-54 # note\nn: ~\nk: 0xFF\nm: 0o17\n",
+        "{\"a\":-84,\"n\":null,\"k\":255,\"m\":15}\n",
+    ),
+    (
+        ".a = .a - 100",
+        "a: !!int 0x-54 # note\nn: ~\nk: 0xFF\nm: 0o17\n",
+        "{\"a\":-84,\"n\":null,\"k\":255,\"m\":15}\n",
+    ),
+    (
+        ".a += .k",
+        "a: !!int 0x10F # note\nn: ~\nk: 0xFF\nm: 0o17\n",
+        "{\"a\":271,\"n\":null,\"k\":255,\"m\":15}\n",
+    ),
+    (
+        ".k += .a",
+        "a: !!int 0x10 # note\nn: ~\nk: 0x10F\nm: 0o17\n",
+        "{\"a\":16,\"n\":null,\"k\":271,\"m\":15}\n",
+    ),
+    (
+        ".m -= 100",
+        "a: !!int 0x10 # note\nn: ~\nk: 0xFF\nm: !!int 0o-125\n",
+        "{\"a\":16,\"n\":null,\"k\":255,\"m\":-85}\n",
+    ),
+    (
+        ".a *= -1",
+        "a: !!int 0x-10 # note\nn: ~\nk: 0xFF\nm: 0o17\n",
+        "{\"a\":-16,\"n\":null,\"k\":255,\"m\":15}\n",
+    ),
+    (
+        "[.a - 100, .m - 100]",
+        "- !!int 0x-54 # note\n- !!int 0o-125\n",
+        "[-84,-85]\n",
+    ),
+    ("{\"x\": (.m - 100)}", "x: !!int 0o-125\n", "{\"x\":-85}\n"),
+    (
+        "(.a, .m) -= 100",
+        "a: !!int 0x-54 # note\nn: ~\nk: 0xFF\nm: !!int 0o-125\n",
+        "{\"a\":-84,\"n\":null,\"k\":255,\"m\":-85}\n",
+    ),
+    (
+        "with(.a; . -= 100)",
+        "a: !!int 0x-54 # note\nn: ~\nk: 0xFF\nm: 0o17\n",
+        "{\"a\":-84,\"n\":null,\"k\":255,\"m\":15}\n",
+    ),
+    (".a - 100 | tag", "!!int\n", "\"!!int\"\n"),
+    (".a - 100 | type", "!!int\n", "\"!!int\"\n"),
+    (".a - 100 | length", "5\n", "5\n"),
+    (".a - 100 | . == \"0x-54\"", "true\n", "true\n"),
+];
+
+#[test]
+fn test_computed_prefixed_integers_keep_their_tag_and_comment_3027() -> Result<()> {
+    for (filter, yaml, json) in TAGGED_ROWS {
+        let (out, code) = run_yq_stdin(filter, TAGGED_DOC, &[])?;
+        assert_eq!((out.as_str(), code), (*yaml, 0), "{filter}");
+        let (out, code) = run_yq_stdin(filter, TAGGED_DOC, &["-o=json", "-I0"])?;
+        assert_eq!((out.as_str(), code), (*json, 0), "{filter} -o=json");
+    }
+    Ok(())
+}
+
+/// A computed prefixed integer bound to a variable and used again, which rebuilds it from its
+/// text. Captured from yq v4.53.3.
+const BOUND_ROWS: &[(&str, &str, &str)] = &[
+    ("(.a - 100) as $v | [$v]", "- !!int 0x-54\n", "[-84]\n"),
+    (
+        "(.a - 100) as $v | [$v, $v + 1]",
+        "- !!int 0x-54\n- !!int 0x-53\n",
+        "[-84,-83]\n",
+    ),
+    (
+        "(.c - 100) as $v | {\"k\": $v}",
+        "k: !!int 0o-125\n",
+        "{\"k\":-85}\n",
+    ),
+    (
+        ".a as $x | .b as $y | [$x + $y, $y + $x]",
+        "- 0x10F\n- 0x10F\n",
+        "[271,271]\n",
+    ),
+];
+
+#[test]
+fn test_a_computed_prefixed_integer_survives_a_binding_3027() -> Result<()> {
+    for (filter, yaml, json) in BOUND_ROWS {
+        let (out, code) = run_yq_stdin(filter, DOC, &[])?;
+        assert_eq!((out.as_str(), code), (*yaml, 0), "{filter}");
+        let (out, code) = run_yq_stdin(filter, DOC, &["-o=json", "-I0"])?;
+        assert_eq!((out.as_str(), code), (*json, 0), "{filter} -o=json");
+    }
+    Ok(())
+}
