@@ -596,7 +596,6 @@ fn go_parse_int_base0_accepts(raw: &str) -> bool {
     let (radix, body): (u32, &[u8]) = match unsigned {
         [b'0', b'x' | b'X', body @ ..] => (16, body),
         [b'0', b'o' | b'O', body @ ..] => (8, body),
-        [b'0', b'b' | b'B', body @ ..] => (2, body),
         [b'0', body @ ..] if !body.is_empty() => (8, body),
         body => (10, body),
     };

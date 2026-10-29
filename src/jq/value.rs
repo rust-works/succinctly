@@ -7866,6 +7866,39 @@ mod tests {
         ));
     }
 
+    /// #1356: jq's number model reads a spelled integer only where a YAML document can hold one as
+    /// an integer (`0x1f`, `0o17`, and the `0x-54` yq's arithmetic writes); the underscore and
+    /// upper-case-prefix forms `tonumber` accepts in yq stay no number there.
+    #[test]
+    fn test_jq_mode_reads_only_yaml_resolvable_spelled_integers_1356() {
+        for (text, number) in [("0x1f", 31), ("0o17", 15), ("0x-54", -84)] {
+            assert_eq!(
+                OwnedValue::from_number_literal::<JqSemantics>(text),
+                OwnedValue::Int(number),
+                "{text}"
+            );
+            assert_eq!(
+                OwnedValue::from_number_literal::<YqSemantics>(text).to_json_yq(),
+                number.to_string(),
+                "{text}"
+            );
+        }
+        for text in ["1_000", "0X10", "0x_1"] {
+            assert_eq!(
+                OwnedValue::from_number_literal::<JqSemantics>(text),
+                OwnedValue::Null,
+                "{text}"
+            );
+            assert!(
+                matches!(
+                    OwnedValue::from_number_literal::<YqSemantics>(text),
+                    OwnedValue::NumberLiteral(NumberRepr::Int(_), _)
+                ),
+                "{text}"
+            );
+        }
+    }
+
     /// #2802: the bridge's spelling token reads back as the text it stands for, never as a
     /// `NumberLiteral` carrying the token's digits -- and, until a spelled variant exists, as the
     /// literal parse of that text. A document spelling the same bytes is no token (#3034).
