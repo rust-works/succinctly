@@ -10091,6 +10091,52 @@ mod tests {
         }
     }
 
+    /// #2802: the spelling token is one `Number` span the bridge's index decodes to its text
+    /// (`bridge_spelling`, `number_literal`), which has no numeric value and no document
+    /// address; a document spelling the same bytes decodes nothing and is no number (#3034).
+    #[test]
+    fn json_number_decodes_the_spelling_token_2802() {
+        for spelling in ["~", "True", "0x1f", "+2.0", ".5", "007", "日本"] {
+            let token = crate::json::validate::spelling_token(spelling);
+            let json = format!("[{token}]");
+            let bytes = json.as_bytes();
+            assert_eq!(nested_number_span(bytes, 1), 1 + token.len());
+            let index = JsonIndex::build_reindex(bytes);
+            let root = index.root(bytes);
+            let StandardJson::Array(mut items) = root.value() else {
+                panic!("expected an array");
+            };
+            let StandardJson::Number(n) = items.next().expect("one element") else {
+                panic!("expected a number");
+            };
+            assert_eq!(n.bridge_spelling().as_deref(), Some(spelling), "{token}");
+            assert_eq!(n.bridge_value(), None, "{token}");
+            assert_eq!(n.bridge_nonfinite(), None, "{token}");
+            assert_eq!(n.bridge_nonfinite_literal(), None, "{token}");
+            assert_eq!(n.token_address(), None, "{token}");
+            assert_eq!(n.as_f64(), Err(JsonError::InvalidNumber), "{token}");
+            let number: StandardJson<'_, Vec<u64>> = StandardJson::Number(n);
+            assert_eq!(
+                number.number_literal().as_deref(),
+                Some(spelling),
+                "{token}"
+            );
+
+            let user_index = JsonIndex::build(bytes);
+            assert!(
+                matches!(
+                    user_index
+                        .root(bytes)
+                        .first_child()
+                        .expect("one child")
+                        .value(),
+                    StandardJson::Error(MALFORMED_NUMBER)
+                ),
+                "{token} as a document"
+            );
+        }
+    }
+
     /// #2877: every spelling jq 1.7.1 reads as a number, nested inside a
     /// container, is one `Number` node here -- `value()`, `text_range()`
     /// and `raw_bytes()` agree on its span, `as_f64` gives jq's value, and
