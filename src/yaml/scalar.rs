@@ -588,7 +588,7 @@ pub fn int_text_reads_back_as_string(raw: &str) -> bool {
 
 /// Whether Go's `strconv.ParseInt(s, 0, 64)` syntax accepts `raw` with its underscores removed.
 fn go_parse_int_base0_accepts(raw: &str) -> bool {
-    let stripped: Vec<u8> = raw.bytes().filter(|&b| b != b'_').collect();
+    let stripped: alloc::vec::Vec<u8> = raw.bytes().filter(|&b| b != b'_').collect();
     let unsigned = match stripped.as_slice() {
         [b'+' | b'-', rest @ ..] => rest,
         all => all,
