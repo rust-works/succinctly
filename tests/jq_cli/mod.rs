@@ -23,6 +23,7 @@
 mod i1076;
 mod i1344;
 mod i4095;
+mod i4749;
 mod i4800;
 mod i4800_first_bind_sibling;
 mod i4800_first_limit_if;
