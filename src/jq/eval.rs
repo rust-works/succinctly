@@ -85179,6 +85179,28 @@ fn cannot_grow_array(len: u64) -> EvalError {
     EvalError::new(format!("Cannot grow array to {len} elements"))
 }
 
+/// The longest array an index write grows one to: 2^29 elements, so index
+/// `INT_MAX >> 2` (536,870,911) is the last one written. That is the bound jq
+/// 1.8 puts on `jv_array_set` (`Array index too large`) and jq 1.7.1 lacks
+/// (#5500).
+///
+/// A bound is needed because succinctly, unlike jq, writes every element it
+/// pads: 1.7.1 answers `.[1073741823] = 1` by mapping pages it never touches,
+/// where this would write 17 GB of nulls. At the bound that is still 8.6 GB;
+/// the indexes between it and 1.7.1's own crash (`.[2147483647] = 1`) are the
+/// ones refused here that 1.7.1 answers.
+pub(crate) const MAX_PADDED_ARRAY_LEN: usize = 536_870_912;
+
+/// The refusal for a write that would grow an array to `len` elements, before
+/// anything is reserved.
+fn check_paddable_len(len: usize) -> Result<(), EvalError> {
+    if len > MAX_PADDED_ARRAY_LEN {
+        Err(cannot_grow_array(len as u64))
+    } else {
+        Ok(())
+    }
+}
+
 /// Pad `arr` with nulls until `index` is a valid element, reporting a failure
 /// the caller can catch.
 ///
@@ -85190,14 +85212,20 @@ fn cannot_grow_array(len: u64) -> EvalError {
 /// here because jq does not survive the same filter either (it dies on the
 /// allocation), so this is succinctly's own wording.
 ///
-/// Only the impossible is refused: every length that fits in memory still
-/// grows, which is what keeps `[1,2] | setpath([5]; 9)` agreeing with jq.
+/// Only the impossible and the absurd are refused: a length past
+/// [`MAX_PADDED_ARRAY_LEN`], or one that does not fit in memory. Every shorter
+/// one still grows, which is what keeps `[1,2] | setpath([5]; 9)` agreeing with
+/// jq.
 fn pad_with_nulls(arr: &mut Vec<OwnedValue>, index: usize) -> Result<(), EvalError> {
     // `index + 1` is only an overflow on a 32-bit target, where `usize::MAX`
     // is a reachable index; the refusal is the same either way.
     let len = index
         .checked_add(1)
         .ok_or_else(|| cannot_grow_array(index as u64 + 1))?;
+    // `try_reserve` alone does not stop `.[1e12] = 1`: the address space it
+    // asks for is reservable on a 64-bit target, and `resize` then spends its
+    // time (or the host's memory) writing 1e12 nulls (#5500).
+    check_paddable_len(len)?;
     arr.try_reserve(len - arr.len())
         .map_err(|_| cannot_grow_array(len as u64))?;
     // #1670: already guarded -- `try_reserve` above already proved the
@@ -129272,6 +129300,30 @@ mod tests {
             ),
             (b"[1,2]", "setpath([5]; 9)", Ok("[1,2,null,null,null,9]")),
         ]);
+    }
+
+    #[test]
+    fn test_pad_with_nulls_refuses_past_the_bound_without_allocating_5500() {
+        let mut arr = vec![OwnedValue::Null];
+        let err = pad_with_nulls(&mut arr, MAX_PADDED_ARRAY_LEN).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("Cannot grow array to {} elements", MAX_PADDED_ARRAY_LEN + 1)
+        );
+        assert_eq!(arr.len(), 1);
+        assert!(pad_with_nulls(&mut arr, 4).is_ok());
+        assert_eq!(arr.len(), 5);
+    }
+
+    /// The edge itself, without allocating: index `INT_MAX >> 2` (length
+    /// 2^29) is the last one written, the next index is the first refused.
+    #[test]
+    fn test_paddable_len_bound_is_exact_5500() {
+        assert_eq!(MAX_PADDED_ARRAY_LEN, 1 << 29);
+        assert_eq!(MAX_PADDED_ARRAY_LEN - 1, i32::MAX as usize >> 2);
+        assert!(check_paddable_len(MAX_PADDED_ARRAY_LEN).is_ok());
+        assert!(check_paddable_len(MAX_PADDED_ARRAY_LEN + 1).is_err());
+        assert!(check_paddable_len(0).is_ok());
     }
 
     /// The padding length comes from the document, so an absurd index asks for

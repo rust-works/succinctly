@@ -7050,8 +7050,17 @@ input: `null | setpath([1e30]; 9)` asks for 9.2e18 elements. jq dies on that fil
 killed on the allocation, with no message to reproduce), and succinctly used to panic with
 `capacity overflow`, which for a library means taking the embedder's process down. It now
 refuses with `Cannot grow array to <n> elements` — succinctly's own wording, since there is
-no jq sentence to copy. Only the impossible is refused; every length that fits in memory
-still pads, so `[1,2] | setpath([5]; 9)` still agrees with jq.
+no jq sentence to copy.
+Only the impossible and the absurd are refused; every length up to the bound below that fits in memory still pads, so `[1,2] | setpath([5]; 9)` still agrees with jq.
+
+A reservation that the address space can satisfy is not an allocation that can be made (#5500).
+`[] | .[1e12] = 1` wants 1e12 elements: a 64-bit target reserves that, and writing the nulls then takes over ten seconds and has ended in an abort.
+jq 1.7.1 dies there too (SIGSEGV, exit 139, with no message to copy) and has no bound of its own: it answers `.[536870912] = 1` and `.[1073741823] = 1`, and dies from `.[2147483647] = 1`.
+succinctly refuses an index write that would grow an array past 536,870,912 elements with the same `Cannot grow array to <n> elements`, before reserving anything.
+That bound is 2^29 elements (index `INT_MAX >> 2`), the one jq 1.8 puts on `jv_array_set` (`Array index too large`).
+The indexes between it and 1.7.1's crash (536,870,912 to 1,073,741,823 are the ones observed) are answered by 1.7.1 and refused here: 1.7.1 maps pages it never touches, where succinctly writes every null it pads, so `.[1073741823] = 1` would be a 17 GB write (ADR-0018 rule 4(c), the host process).
+Even at the bound a write is 8.6 GB, so a host with less memory than that can still be taken down by an index below it.
+Pinned by `tests/jq_cli/i5500.rs`; the same bound applies to `succinctly yq`.
 
 String repetition (`s * n`) has the identical shape (#1612): `n` comes from the document, so
 `"ab" * 1e30` asks for a byte length `String::repeat` cannot even represent, which used to
