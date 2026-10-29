@@ -69,3 +69,44 @@ fn test_recurse_cond_null_and_bool_verdicts_agree_with_the_general_route_4095() 
     }
     Ok(())
 }
+
+/// jq's own sink arm answers `type` and comparison conds through the direct verdict; `limit`
+/// drives it (the array constructor's collecting form keeps the owned walk), and it has to agree
+/// with the general route on every JSON kind.
+#[test]
+fn test_recurse_cond_sink_arm_agrees_with_the_general_route_4095() -> Result<()> {
+    let doc = r#"{"a":null,"b":true,"c":[1,"s",{"d":2.50}],"e":{},"f":[],"g":-0,"h":1e2}"#;
+    for cond in [
+        r#"type == "object" or type == "array""#,
+        r#"type != "number""#,
+        r#""string" == type"#,
+        ". != null",
+        ". == 1 | not",
+        "null",
+        "(. != 1)",
+        ". != null and . != false",
+    ] {
+        let general = format!("[limit(100000; recurse(.[]?; . | ({cond})))]");
+        let direct = format!("[limit(100000; recurse(.[]?; {cond}))]");
+        let (want, _, c1) = run_jq_full(&["-c", &general], Some(doc))?;
+        let (got, stderr, c2) = run_jq_full(&["-c", &direct], Some(doc))?;
+        assert_eq!((c1, c2), (0, 0), "`{cond}` -- {stderr:?}");
+        assert_eq!(got, want, "`{cond}`");
+    }
+    Ok(())
+}
+
+/// A malformed keyword token raises where the general route raises (#3035), not an answer from
+/// the direct verdict.
+#[test]
+fn test_recurse_cond_sink_arm_raises_on_a_malformed_token_like_the_general_route_4095() -> Result<()>
+{
+    let doc = "[1,nul]";
+    let general = r#"[limit(10; recurse(.[]?; . | (type == "number")))]"#;
+    let direct = r#"[limit(10; recurse(.[]?; type == "number"))]"#;
+    let (w_out, w_err, w_code) = run_jq_full(&["-c", general], Some(doc))?;
+    let (g_out, g_err, g_code) = run_jq_full(&["-c", direct], Some(doc))?;
+    assert_eq!((g_out, g_code), (w_out, w_code));
+    assert_eq!(g_err.trim().is_empty(), w_err.trim().is_empty());
+    Ok(())
+}

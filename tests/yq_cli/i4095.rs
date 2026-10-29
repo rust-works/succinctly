@@ -161,6 +161,8 @@ fn test_recurse_cond_that_raises_reaches_a_position_stage_4095() -> Result<()> {
             "a: 5\n",
             r#"{a: [1]} | [recurse(.[]?; error("boom")) | key]"#,
         ),
+        // A node with no cursor (a slice of the document) is asked through the owned evaluator.
+        (TREE, r#".l[1:5] | [recurse(.[]?; error("boom")) | path]"#),
     ] {
         let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, ARGS)?;
         assert_ne!(code, 0, "`{filter}` -- stdout: {stdout:?}");
@@ -239,20 +241,72 @@ fn test_recurse_cond_null_and_bool_verdicts_agree_with_the_general_route_4095() 
     Ok(())
 }
 
+/// Nodes that are not live (a slice of an array, a constructed value) have no cursor to ask, so
+/// the walk asks `cond` of their owned values. Each row is pinned to the `cond` spelled so the
+/// general route takes it (`. | cond`), for the values and for the positions.
+#[test]
+fn test_recurse_cond_over_sliced_and_computed_nodes_agrees_with_the_general_route_4095(
+) -> Result<()> {
+    for prefix in [
+        ".l[1:5] | ",
+        ".a.c[0:3] | ",
+        "{a: [1, {b: 2}], s: \"x\", n: null} | ",
+        "[[1, 2], {c: 3}, \"s\", null, 3.5, true] | ",
+    ] {
+        for cond in [
+            ". != null",
+            "null",
+            "(. != 1)",
+            "type == \"!!int\" | not",
+            "type != \"!!seq\"",
+            "length > 0",
+            ". == 1 | not",
+        ] {
+            for tail in ["| tojson", "| path"] {
+                let want = run(
+                    &format!("{prefix}[recurse(.[]?; . | ({cond})) {tail}]"),
+                    TREE,
+                )?;
+                let got = run(&format!("{prefix}[recurse(.[]?; {cond}) {tail}]"), TREE)?;
+                assert_eq!(got, want, "`{prefix}` / `{cond}` {tail}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A computed bracket on the walk steps it as a target (the collecting form of the position
+/// walk), and answers what the same bracket on `..` answers.
+#[test]
+fn test_recurse_cond_as_a_bracket_target_answers_what_recursive_descent_answers_4095() -> Result<()>
+{
+    for key in ["(0, 1)", "(1, 0)", "-1", "(2, -1)"] {
+        let want = run(&format!("[(..)[{key}] | path]"), TREE)?;
+        let got = run(&format!("[(recurse(.[]?; true))[{key}] | path]"), TREE)?;
+        assert_eq!(got, want, "{key}");
+    }
+    Ok(())
+}
+
 /// `first`/`limit` stop the position walk where jq stops: a `cond` is not asked of a node the
 /// consumer never reached, so an effect in it (`debug`) does not run for those nodes.
 #[test]
 fn test_recurse_cond_stops_asking_cond_when_the_consumer_stops_4095() -> Result<()> {
-    for filter in [
-        "[limit(1; recurse(.[]?; debug | true) | path)]",
-        "[first(recurse(.[]?; debug | true) | key)]",
-        "[limit(1; recurse(.[]?; debug | true))] | length",
+    // (filter, how many times `cond` is asked): the walk delivers the root without asking, then
+    // asks once per child it reaches, in order, and stops where the consumer does.
+    for (filter, asked) in [
+        ("[limit(1; recurse(.[]?; debug | true) | path)]", 0),
+        ("[first(recurse(.[]?; debug | true) | key)]", 0),
+        ("[limit(1; recurse(.[]?; debug | true))] | length", 0),
+        ("[limit(3; recurse(.[]?; debug | true) | path)]", 2),
+        // The root has no key, so the fourth key comes from the fourth kept node.
+        ("[limit(4; recurse(.[]?; debug | true) | key)]", 4),
     ] {
         let (_, stderr, code) = run_yq_stdin_with_stderr(filter, TREE, ARGS)?;
         assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
         assert_eq!(
             stderr.matches("DEBUG").count(),
-            0,
+            asked,
             "`{filter}` -- {stderr:?}"
         );
     }

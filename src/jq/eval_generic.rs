@@ -27793,6 +27793,17 @@ fn recurse_cond_is_walkable(f: &Expr, cond: &Expr) -> bool {
     crate::jq::eval::is_gated_structural_descent(f, Some(cond))
 }
 
+/// The `cond` of `expr` when it is a `recurse(f; cond)` the position walk takes
+/// ([`recurse_cond_is_walkable`]).
+fn walkable_recurse_cond(expr: &Expr) -> Option<&Expr> {
+    match expr {
+        Expr::Builtin(Builtin::RecurseCond(f, cond)) if recurse_cond_is_walkable(f, cond) => {
+            Some(cond)
+        }
+        _ => None,
+    }
+}
+
 /// Whether `cond` has no effect and cannot raise on any node: literals, `.`, `not`, `type`, and
 /// comparisons, `and`, `or` and pipes of them (#4095).
 ///
@@ -29301,8 +29312,7 @@ fn path_context_recurse_cond_keeps<S: EvalSemantics, V: DocumentValue>(
     }
     debug_assert!(
         verdicts.len() <= 1,
-        "an admitted `cond` yielded {} values",
-        verdicts.len()
+        "an admitted `cond` yielded several values"
     );
     Ok(verdicts.iter().any(OwnedValue::is_truthy))
 }
@@ -29993,10 +30003,8 @@ fn path_context_step_each<S: EvalSemantics, V: DocumentValue>(
     }
     // `recurse(.[]?; cond)` asks `cond` at every node it reaches, and `cond` can have an effect or
     // raise, so it is delivered as it goes too (#4095).
-    if let Expr::Builtin(Builtin::RecurseCond(f, cond)) = expr {
-        if recurse_cond_is_walkable(f, cond) {
-            return path_context_step_recurse_each::<S, V>(Some(cond), pos, sink);
-        }
+    if let Some(cond) = walkable_recurse_cond(expr) {
+        return path_context_step_recurse_each::<S, V>(Some(cond), pos, sink);
     }
     // Literal navigation -- `.k`, `.[3]`, `.[]`. Every component is fixed by
     // the query, so none of these can be the computed component yq rolls a
@@ -37392,28 +37400,36 @@ fn owned_identity_recurse_step<S: EvalSemantics, V: DocumentValue>(
             None => id.clone(),
         };
         if let Some(cond) = cond {
-            // An admitted `cond` is inert ([`recurse_cond_is_inert`]), so it reads no position to
-            // resolve and cannot raise; the pure verdict answers it from the tree, as the owned
-            // walk's `recurse_gate_verdict` does.
-            let keep = match crate::jq::eval::owned_cond_verdict::<S>(cond, &child, false) {
-                Some(Ok(keep)) => keep,
-                Some(Err(error)) => return Err(Control::Error(error)),
-                None => {
-                    let (verdicts, escape) =
-                        owned_identity_values::<S>(cond, &child, false, &RootWitness::Owned);
-                    if let Some(control) = escape {
-                        return Err(control);
-                    }
-                    verdicts.iter().any(OwnedValue::is_truthy)
-                }
-            };
-            if !keep {
+            if !owned_identity_cond_keeps::<S>(cond, &child)? {
                 continue;
             }
         }
         owned_identity_recurse_step::<S, V>(cond, &child, &child_id, out)?;
     }
     Ok(())
+}
+
+/// Whether `recurse(.[]?; cond)` keeps `child` on the owned identity route (#4095).
+///
+/// An admitted `cond` is inert ([`recurse_cond_is_inert`]), so it reads no position to resolve and
+/// cannot raise; the pure verdict answers it from the tree, as the owned walk's
+/// `recurse_gate_verdict` does. The evaluator is the fallback should the pure grammar ever stop
+/// covering a shape the inert grammar admits, which keeps the route correct and not merely fast.
+fn owned_identity_cond_keeps<S: EvalSemantics>(
+    cond: &Expr,
+    child: &OwnedValue,
+) -> Result<bool, Control> {
+    match crate::jq::eval::owned_cond_verdict::<S>(cond, child, false) {
+        Some(verdict) => verdict.map_err(Control::Error),
+        None => {
+            let (verdicts, escape) =
+                owned_identity_values::<S>(cond, child, false, &RootWitness::Owned);
+            match escape {
+                Some(control) => Err(control),
+                None => Ok(verdicts.iter().any(OwnedValue::is_truthy)),
+            }
+        }
+    }
 }
 
 /// This stage's own `key`/`path`/`file_index` reads, rewritten to the
@@ -60972,5 +60988,44 @@ mod deferred_bind_tests_3856 {
                 assert_eq!(took, u64::from(defers), "{filter} over {doc}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod recurse_cond_owned_route_4095 {
+    use super::*;
+    use crate::jq::parse;
+
+    fn keeps(cond: &str, child: OwnedValue) -> Result<bool, Control> {
+        let expr = parse(cond).expect("cond parses");
+        owned_identity_cond_keeps::<JqSemantics>(&expr, &child)
+    }
+
+    /// An inert `cond` is answered by the pure verdict.
+    #[test]
+    fn pure_verdict_answers_an_inert_cond() {
+        assert!(matches!(keeps(". != null", OwnedValue::Int(1)), Ok(true)));
+        assert!(matches!(keeps(". == null", OwnedValue::Int(1)), Ok(false)));
+    }
+
+    /// The pure verdict's own failure (a field read on a number) is the walk's failure.
+    #[test]
+    fn pure_verdict_failure_is_the_walks_failure() {
+        let outcome = keeps(".a", OwnedValue::Int(1));
+        assert!(matches!(outcome, Err(Control::Error(_))), "{outcome:?}");
+    }
+
+    /// A shape the pure verdict declines falls to the evaluator, which answers it (`length` of a
+    /// string) or raises where jq raises (`length` of a boolean).
+    #[test]
+    fn evaluator_answers_what_the_pure_verdict_declines() {
+        assert!(matches!(
+            keeps("length > 0", OwnedValue::String("abc".into())),
+            Ok(true)
+        ));
+        assert!(matches!(
+            keeps("length > 0", OwnedValue::Bool(true)),
+            Err(Control::Error(_))
+        ));
     }
 }
