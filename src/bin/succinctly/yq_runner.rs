@@ -8719,6 +8719,17 @@ fn emit_yaml_value_at_depth(
         OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if config.json_sourced_floats => {
             output::json_sourced_float_display(*f)
         }
+        // #3027: the `0x-10` yq's arithmetic writes for a negative hex or octal result reads back
+        // as a string, so anywhere nested it carries the `!!int` tag, as a whole float's `!!float`.
+        OwnedValue::NumberLiteral(NumberRepr::Int(_), literal)
+            if depth > 0
+                && !matches!(
+                    resolve_plain_sourced(literal, false),
+                    ResolvedScalar::Int(_)
+                ) =>
+        {
+            format!("!!int {literal}")
+        }
         OwnedValue::NumberLiteral(_, literal) => {
             // Echo the source spelling verbatim (#1008) rather than
             // routing through `number_str()`/`format_number_jq_compat`,

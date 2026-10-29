@@ -3244,8 +3244,9 @@ impl OwnedValue {
             };
         }
         let Some(repr) = parse_i64_or_f64_in::<S>(&literal) else {
-            // #2802: `0x1f`/`0o17` is no JSON number, but it is an integer of a YAML document.
-            if let crate::yaml::ResolvedScalar::Int(n) = crate::yaml::resolve_plain(&literal) {
+            // #2802: `0x1f`/`0o17` is no JSON number, but it is an integer of a YAML document
+            // (and `0x-10`, which yq's arithmetic writes, #3027).
+            if let Some(n) = crate::yaml::spelled_int_value(&literal) {
                 return Self::spelled_int::<S>(n, literal);
             }
             return Self::Null;

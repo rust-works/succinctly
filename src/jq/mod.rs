@@ -117,6 +117,8 @@ pub(crate) use eval::last_as_reduce;
 pub(crate) use eval::nonfinite_yaml_spelling;
 // #5306: `json::light` decodes a `group_by` group with the evaluator's own JSON materializer.
 pub(crate) use eval::to_owned as to_owned_standard_json;
+#[doc(hidden)]
+pub(crate) use eval::yq_parse_int64;
 pub use eval::{
     alias_identity, bound_def, enter_file_index_scope, enter_file_names_scope,
     enter_source_positions_scope, eval, eval_documents_together, eval_lenient,
@@ -125,7 +127,6 @@ pub use eval::{
     EvalSemantics, FileIndexScope, FileNamesScope, JqSemantics, QueryResult, SourcePositionsScope,
     VisibleDef, YqSemantics,
 };
-#[doc(hidden)]
 pub use eval::{eval_full, eval_owned_scalar_fast, eval_reindexed_document, with_stderr_muted};
 pub use eval::{tostream_events, tostream_events_iter, ToStreamEvents};
 // `input`/`inputs`/`input_line_number`'s CLI-facing seam (#723) -- only

@@ -529,12 +529,12 @@ pub fn is_spelled_int(raw: &str) -> bool {
     spelled_int_value(raw).is_some()
 }
 
-/// The integer a spelled-integer text names, `None` for any other text.
+/// The integer a spelled-integer text names, `None` for any other text (and for a canonical one).
 ///
 /// Only a `0x`/`0o` prefix or a decimal run of digits can be one, so a float literal, an
 /// exponent form and the canonical integer (`42`, `-7`, `0`) return after a byte scan, and the
 /// prefixed forms alone reach [`resolve_plain`].
-fn spelled_int_value(raw: &str) -> Option<i64> {
+pub fn spelled_int_value(raw: &str) -> Option<i64> {
     let bytes = raw.as_bytes();
     let unsigned = bytes
         .strip_prefix(b"-")
@@ -543,6 +543,8 @@ fn spelled_int_value(raw: &str) -> Option<i64> {
     if matches!(unsigned, [b'0', b'x' | b'o', ..]) {
         return match resolve_plain(raw) {
             ResolvedScalar::Int(n) => Some(n),
+            // The `0x-10` yq's own arithmetic writes for a negative result (#3027).
+            _ if matches!(bytes, [b'0', b'x' | b'o', b'-', ..]) => crate::jq::yq_parse_int64(raw),
             _ => None,
         };
     }

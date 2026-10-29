@@ -3044,10 +3044,7 @@ impl<'a> JsonNumber<'a> {
     /// text; `None` for any other span and for a spelling that is no integer (#2802).
     #[inline]
     pub(crate) fn bridge_spelled_int(&self) -> Option<i64> {
-        match crate::yaml::resolve_plain(&self.bridge_spelling()?) {
-            crate::yaml::ResolvedScalar::Int(n) => Some(n),
-            _ => None,
-        }
+        crate::yaml::spelled_int_value(&self.bridge_spelling()?)
     }
 
     /// The value this span stands for if it is one of the reindex bridge's
