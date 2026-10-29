@@ -13317,7 +13317,10 @@ jq emits events while it parses, so two things differ for the shapes below, both
 `--stream-errors` is accepted (#5474).
 It implies `--stream` and reports a parse error as an input of the form `[message, path]`, as jq does, and goes on reading with the next line.
 Unlike `--stream`, it does not build its events from a whole-document parse: the events a malformed document produced before the fault, and the path at the fault, are properties of jq's own incremental parser, so `jq_stream_errors.rs` is a port of the streaming half of jq 1.7.1's `jv_parse.c`.
-It reproduces jq's reads one `fgets` line at a time (the rest of a line is dropped after an error), a value lost to the byte that fails, the absence of a depth limit, and where `--slurp` closes its array.
+It follows jq in four details: it reads one `fgets` line at a time (the rest of a line is dropped after an error), a value completed by the byte that then fails is lost, there is no depth limit, and `--slurp` closes its array at the call that empties jq's buffer.
+Its events are materialized rather than streamed, like `--stream`'s, so memory grows with the input.
+`--validate` still runs first and rejects a malformed input outright, since strict validation is what it asks for.
+Under `-R` and `--input-dsv` the flag is ignored, as `--stream` is.
 It is pinned by `tests/jq_cli/i5474.rs` and was checked against `/usr/bin/jq` on random malformed inputs, with stdout, exit status and the `(at <file>:<line>)` marker compared.
 One shape differs: `--seq` combines with `--stream-errors` in jq (`printf '[1,2' | jq --seq --stream-errors -c .` prints `["Unfinished abandoned text at EOF at line 1, column 4",[]]`), and here `--seq` wins and the flag is ignored, as it is for `--stream`.
 `-b` is accepted and ignored, as jq does outside Windows; `--binary` is rejected there (`Unknown option --binary`, exit 2) and here.
