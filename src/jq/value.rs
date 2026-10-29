@@ -3244,8 +3244,9 @@ impl OwnedValue {
             };
         }
         let Some(repr) = parse_i64_or_f64_in::<S>(&literal) else {
-            // #2802: `0x1f`/`0o17` is no JSON number, but it is an integer of a YAML document.
-            if let crate::yaml::ResolvedScalar::Int(n) = crate::yaml::resolve_plain(&literal) {
+            // #2802: `0x1f`/`0o17` is no JSON number, but it is an integer of a YAML document
+            // (and `0x-10`, which yq's arithmetic writes, #3027).
+            if let Some(n) = crate::yaml::spelled_int_value(&literal) {
                 return Self::spelled_int::<S>(n, literal);
             }
             return Self::Null;
@@ -5834,6 +5835,9 @@ impl From<Literal> for OwnedValue {
                     Some(repr) == parse_i64_or_f64_in::<JqSemantics>(&text)
                         || Some(repr) == parse_i64_or_f64_in::<YqSemantics>(&text)
                         || matches!(repr, NumberRepr::Float(f) if is_nan_instance(f) && text == "null")
+                        // #2802: a YAML integer spelled `0x1f`, `0o17`, `01`, `+5` or `0x-54`.
+                        || matches!(repr, NumberRepr::Int(n)
+                            if crate::yaml::spelled_int_value(&text) == Some(n))
                         // #1071: a YAML document's `.inf`/`.NaN` is not JSON number text.
                         || matches!(repr, NumberRepr::Float(f)
                             if crate::yaml::nonfinite_literal_value(&text)

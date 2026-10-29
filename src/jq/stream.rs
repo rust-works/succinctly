@@ -1017,6 +1017,13 @@ fn stream_owned_value_yaml_at_depth<W: core::fmt::Write>(
         {
             out.write_str(super::nonfinite_literal_display(*f, literal))
         }
+        // #3027: see the DOM writer -- a negative hex or octal result reads back as a string.
+        OwnedValue::NumberLiteral(NumberRepr::Int(_), literal)
+            if depth > 0 && crate::yaml::is_signed_prefixed_int_text(literal) =>
+        {
+            out.write_str("!!int ")?;
+            out.write_str(literal)
+        }
         OwnedValue::NumberLiteral(_, literal) => {
             // Echo verbatim (#1008), matching this function's JSON sibling
             // (`stream_owned_value_json`'s `finite_literal` hook) -- this

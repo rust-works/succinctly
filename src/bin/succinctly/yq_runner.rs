@@ -8719,6 +8719,13 @@ fn emit_yaml_value_at_depth(
         OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if config.json_sourced_floats => {
             output::json_sourced_float_display(*f)
         }
+        // #3027: the `0x-10` yq's arithmetic writes for a negative hex or octal result reads back
+        // as a string, so anywhere nested it carries the `!!int` tag, as a whole float's `!!float`.
+        OwnedValue::NumberLiteral(NumberRepr::Int(_), literal)
+            if depth > 0 && int_literal_reads_back_as_string(literal) =>
+        {
+            tagged_int_literal(literal)
+        }
         OwnedValue::NumberLiteral(_, literal) => {
             // Echo the source spelling verbatim (#1008) rather than
             // routing through `number_str()`/`format_number_jq_compat`,
@@ -9390,6 +9397,20 @@ fn block_header(anchor: Option<&str>, tag: Option<&str>) -> String {
     }
 }
 
+/// Whether an integer literal's text reads back as something other than an integer, which only
+/// yq's own arithmetic writes (`0x-10`, #3027). Out of line, with [`tagged_int_literal`], so the
+/// recursive emitter's frame stays small.
+#[inline(never)]
+fn int_literal_reads_back_as_string(literal: &str) -> bool {
+    succinctly::yaml::is_signed_prefixed_int_text(literal)
+}
+
+/// `literal` behind the `!!int` tag that keeps it an integer.
+#[inline(never)]
+fn tagged_int_literal(literal: &str) -> String {
+    format!("!!int {literal}")
+}
+
 /// A scalar behind its tag (#4066, #4078): the explicit tag it was written with
 /// (`!Ref`, `!!str`), verbatim, or under `style = "tagged"` the tag of its current
 /// value type. `None` for a container (its tag goes on the header line, see
@@ -9435,8 +9456,12 @@ fn emit_tagged_scalar(
             let bare = CommentTree::Leaf(comments.meta().with_tag(None).with_style(style));
             let text =
                 emit_yaml_value_at_depth(value, &bare, config, indent, in_flow, depth, indent);
-            // The explicit tag replaces the `!!float` a nested whole float adds itself.
-            match text.strip_prefix("!!float ") {
+            // The explicit tag replaces the `!!float` a nested whole float adds itself, and the
+            // `!!int` a negative hex or octal result does (#3027).
+            match text
+                .strip_prefix("!!float ")
+                .or_else(|| text.strip_prefix("!!int "))
+            {
                 Some(spelling) => spelling.to_string(),
                 None => text,
             }

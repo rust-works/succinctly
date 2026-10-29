@@ -14742,6 +14742,20 @@ pub(crate) fn arith_combine<S: EvalSemantics>(
     left: OwnedValue,
     right: OwnedValue,
 ) -> Result<OwnedValue, EvalError> {
+    if S::TAG == EvalTag::Yq {
+        if let Some(result) = yq_prefixed_int_arith(op, &left, &right) {
+            return result;
+        }
+    }
+    arith_combine_plain::<S>(op, left, right)
+}
+
+/// [`arith_combine`] for operands that carry no hex or octal spelling.
+fn arith_combine_plain<S: EvalSemantics>(
+    op: ArithOp,
+    left: OwnedValue,
+    right: OwnedValue,
+) -> Result<OwnedValue, EvalError> {
     match op {
         ArithOp::Add => arith_add::<S>(left, right),
         ArithOp::Sub => arith_sub::<S>(left, right),
@@ -14749,6 +14763,90 @@ pub(crate) fn arith_combine<S: EvalSemantics>(
         ArithOp::Div => arith_div::<S>(left, right),
         ArithOp::Mod => arith_mod::<S>(left, right),
     }
+}
+
+/// The base a yq integer is written in when it is not decimal: `0x1f` or `0o17` (and the
+/// `0x-10` yq's own arithmetic writes for a negative result).
+#[derive(Clone, Copy)]
+enum YqIntBase {
+    Hex,
+    Octal,
+}
+
+/// The base of an integer operand that carries a `0x`/`0o` spelling, `None` for every other value.
+fn yq_int_base(value: &OwnedValue) -> Option<YqIntBase> {
+    match value {
+        OwnedValue::NumberLiteral(NumberRepr::Int(_), text) => match text.as_bytes() {
+            [b'0', b'x', ..] => Some(YqIntBase::Hex),
+            [b'0', b'o', ..] => Some(YqIntBase::Octal),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// An integer result in the base yq's `parseInt64` format string gives it: `0x%X` or `0o%o`,
+/// so the digits are upper-case hex and a negative sign lands after the prefix (`0x-10`).
+fn yq_spelled_in_base(base: YqIntBase, n: i64) -> OwnedValue {
+    let sign = if n < 0 { "-" } else { "" };
+    let magnitude = n.unsigned_abs();
+    let text = match base {
+        YqIntBase::Hex => format!("0x{sign}{magnitude:X}"),
+        YqIntBase::Octal => format!("0o{sign}{magnitude:o}"),
+    };
+    OwnedValue::NumberLiteral(NumberRepr::Int(n), text.into())
+}
+
+/// yq's arithmetic over a hex or octal integer (#3027), `None` when neither operand is one.
+///
+/// yq's `parseInt64` hands back a format string with the value (`0x%X`, `0o%o`, else `%v`), and
+/// `+`, `-`, `*` and `%` write an integer result with the **left** operand's: `0x10 + 1` is
+/// `0x11`, `0o17 + 1` is `0o20`, `1 + 0x10` is `17`. `/` and a float operand go through
+/// `strconv.ParseFloat` on the operand's text, which cannot read `0x10`, so they fail naming
+/// the first such operand. A decimal operand with leading zeros or a sign (`017`, `+5`) formats
+/// as `%v` and is the number, as ever.
+fn yq_prefixed_int_arith(
+    op: ArithOp,
+    left: &OwnedValue,
+    right: &OwnedValue,
+) -> Option<Result<OwnedValue, EvalError>> {
+    let (left_base, right_base) = (yq_int_base(left), yq_int_base(right));
+    if left_base.is_none() && right_base.is_none() {
+        return None;
+    }
+    let is_float = |v: &OwnedValue| {
+        matches!(
+            v,
+            OwnedValue::Float(_) | OwnedValue::NumberLiteral(NumberRepr::Float(..), _)
+        )
+    };
+    let is_number = |v: &OwnedValue| {
+        matches!(
+            v,
+            OwnedValue::Int(_) | OwnedValue::NumberLiteral(..) | OwnedValue::Float(_)
+        )
+    };
+    // A string, null or container operand keeps its own rule (`0x10 + "x"` is `0x10x`).
+    if !is_number(left) || !is_number(right) {
+        return None;
+    }
+    if matches!(op, ArithOp::Div) || is_float(left) || is_float(right) {
+        let named = if left_base.is_some() { left } else { right };
+        let text = yq_scalar_text::<YqSemantics>(named).unwrap_or_default();
+        return Some(Err(EvalError::new(format!(
+            "strconv.ParseFloat: parsing \"{text}\": invalid syntax"
+        ))));
+    }
+    let plain = |v: &OwnedValue| match v {
+        OwnedValue::NumberLiteral(NumberRepr::Int(n), _) => OwnedValue::Int(*n),
+        other => other.clone(),
+    };
+    let (l, r) = (plain(left), plain(right));
+    let result = arith_combine_plain::<YqSemantics>(op, l, r);
+    Some(result.map(|value| match (value, left_base) {
+        (OwnedValue::Int(n), Some(base)) => yq_spelled_in_base(base, n),
+        (value, _) => value,
+    }))
 }
 
 /// Evaluate arithmetic operations.

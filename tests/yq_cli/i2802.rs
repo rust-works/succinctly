@@ -5,7 +5,7 @@
 //! of the same filter), over one document.
 //!
 //! Not here, still different from yq: arithmetic on a hex or octal integer keeps its base
-//! (`.a + 1` is `0x20` there, #3027), and `tonumber` of a spelled string (#1356).
+//! (`.a + 1` is `0x20` there) lands with #3027 in `i3027.rs`; `tonumber` of a spelled string is #1356.
 
 use anyhow::Result;
 
