@@ -34,6 +34,9 @@ fn test_extreme_exponent_literal_prints_like_jq_5508() -> Result<()> {
         ("12.5e-1147483646", "1.3E-1147483645"),
         ("99.5e-1147483647", "1.0E-1147483645"),
         ("0.0e999999999", "0E+999999998"),
+        // The fraction's shift is applied before the clamp, not after.
+        ("0.0e1000000001", "0E+999999999"),
+        ("0.00e1000000002", "0E+999999999"),
         ("0.00e-1147483646", "0E-1147483646"),
     ] {
         let (output, code) = run_jq_stdin(".", literal, &["-c"])?;
