@@ -84685,8 +84685,8 @@ fn builtin_fromstream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 e = ended;
             }
             // The values completed before a malformed event are emitted first, then the error is
-            // raised, as jq's lazy `foreach` does (#5489); `try`/`?` keep them too.
-            Err(err) if outputs.is_empty() => return QueryResult::Error(err),
+            // raised, as jq's lazy `foreach` does (#5489); `try`/`?` keep them too. With none
+            // completed `partial` is the bare error.
             Err(err) => return partial(outputs, Control::Error(err)),
         }
         if e {
