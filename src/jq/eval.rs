@@ -75890,6 +75890,17 @@ fn substitute_bound_var_at(
     substitute_var_impl(body, var_name, bound, Some(&marker))
 }
 
+/// [`substitute_var_with`] that splices nothing: every caller but a fold's loop-variable
+/// substitution (`substitute_fold_step`).
+fn substitute_var_impl(
+    expr: &Expr,
+    var_name: &str,
+    replacement: &OwnedValue,
+    mark: Option<&LazyMarker<'_>>,
+) -> Expr {
+    substitute_var_with(expr, var_name, replacement, mark, false)
+}
+
 /// Substitute a variable in an expression with a value.
 /// Returns a new expression with the variable replaced. `mark`
 /// selects whether a substituted `$var_name` becomes an `Expr::TrackedVar`
@@ -75897,11 +75908,12 @@ fn substitute_bound_var_at(
 /// or a plain value-construction node --
 /// see `substitute_var`/`substitute_var_tracked` above, the only two
 /// callers that should pass a literal `false`/`true` here.
-fn substitute_var_impl(
+fn substitute_var_with(
     expr: &Expr,
     var_name: &str,
     replacement: &OwnedValue,
     mark: Option<&LazyMarker<'_>>,
+    splice: bool,
 ) -> Expr {
     match expr {
         // #1371: opaque, in both directions. A `Shared` holds an argument the
@@ -75923,13 +75935,23 @@ fn substitute_var_impl(
         // invariant like `Shared`'s). No longer special-cased: it now falls
         // through to the catch-all below, reaching `map_subexprs`'s own
         // `Expr::Error` arm, which already recurses into the message.
-        Expr::Builtin(b) => {
-            Expr::Builtin(substitute_var_in_builtin(b, var_name, replacement, mark))
-        }
+        Expr::Builtin(b) => Expr::Builtin(substitute_var_in_builtin(
+            b,
+            var_name,
+            replacement,
+            mark,
+            splice,
+        )),
         // Phase 8 expressions
         // Don't substitute if this `as` binds the same variable (shadowing)
         Expr::As { expr, var, body } if var == var_name => Expr::As {
-            expr: Box::new(substitute_var_impl(expr, var_name, replacement, mark)),
+            expr: Box::new(substitute_var_with(
+                expr,
+                var_name,
+                replacement,
+                mark,
+                splice,
+            )),
             var: var.clone(),
             body: body.clone(), // Don't substitute in body - shadowed
         },
@@ -75944,7 +75966,13 @@ fn substitute_var_impl(
             init,
             update,
         } if patterns.iter().any(|p| pattern_binds_var(p, var_name)) => Expr::Reduce {
-            input: Box::new(substitute_var_impl(input, var_name, replacement, mark)),
+            input: Box::new(substitute_var_with(
+                input,
+                var_name,
+                replacement,
+                mark,
+                splice,
+            )),
             // #2873 review: the pattern's *own* binding shadows `var_name`
             // for `update`, which stays unsubstituted below -- but a
             // computed key inside the pattern resolves against the
@@ -75958,11 +75986,17 @@ fn substitute_var_impl(
                 .iter()
                 .map(|p| {
                     map_pattern_subexprs(p, &mut |e| {
-                        substitute_var_impl(e, var_name, replacement, mark)
+                        substitute_var_with(e, var_name, replacement, mark, splice)
                     })
                 })
                 .collect(),
-            init: Box::new(substitute_var_impl(init, var_name, replacement, mark)),
+            init: Box::new(substitute_var_with(
+                init,
+                var_name,
+                replacement,
+                mark,
+                splice,
+            )),
             update: update.clone(), // shadowed
         },
         Expr::Foreach {
@@ -75972,18 +76006,30 @@ fn substitute_var_impl(
             update,
             extract,
         } if patterns.iter().any(|p| pattern_binds_var(p, var_name)) => Expr::Foreach {
-            input: Box::new(substitute_var_impl(input, var_name, replacement, mark)),
+            input: Box::new(substitute_var_with(
+                input,
+                var_name,
+                replacement,
+                mark,
+                splice,
+            )),
             // #2873 review: see the identical `Expr::Reduce` arm's comment
             // just above.
             patterns: patterns
                 .iter()
                 .map(|p| {
                     map_pattern_subexprs(p, &mut |e| {
-                        substitute_var_impl(e, var_name, replacement, mark)
+                        substitute_var_with(e, var_name, replacement, mark, splice)
                     })
                 })
                 .collect(),
-            init: Box::new(substitute_var_impl(init, var_name, replacement, mark)),
+            init: Box::new(substitute_var_with(
+                init,
+                var_name,
+                replacement,
+                mark,
+                splice,
+            )),
             update: update.clone(),
             extract: extract.clone(),
         },
@@ -75996,13 +76042,19 @@ fn substitute_var_impl(
             patterns,
             body,
         } if patterns.iter().any(|p| pattern_binds_var(p, var_name)) => Expr::AsPattern {
-            expr: Box::new(substitute_var_impl(expr, var_name, replacement, mark)),
+            expr: Box::new(substitute_var_with(
+                expr,
+                var_name,
+                replacement,
+                mark,
+                splice,
+            )),
             // #2873 review: see `Expr::Reduce`'s identical comment above.
             patterns: patterns
                 .iter()
                 .map(|p| {
                     map_pattern_subexprs(p, &mut |e| {
-                        substitute_var_impl(e, var_name, replacement, mark)
+                        substitute_var_with(e, var_name, replacement, mark, splice)
                     })
                 })
                 .collect(),
@@ -76050,13 +76102,53 @@ fn substitute_var_impl(
                 body: if shadowed {
                     body.clone()
                 } else {
-                    Box::new(substitute_var_impl(body, var_name, replacement, mark))
+                    Box::new(substitute_var_with(
+                        body,
+                        var_name,
+                        replacement,
+                        mark,
+                        splice,
+                    ))
                 },
-                then: Box::new(substitute_var_impl(then, var_name, replacement, mark)),
+                then: Box::new(substitute_var_with(
+                    then,
+                    var_name,
+                    replacement,
+                    mark,
+                    splice,
+                )),
                 // Rebuilt above (`body`/`then` may have changed), so any
                 // cache computed against the old node is stale (#2094).
                 bound: FuncDefBound::default(),
             }
+        }
+        // #5499: `$var.field` on an object that holds the field is that field's value, so
+        // the field is spliced in and the rest of the object is not. The general arm below
+        // rebuilds the whole object as a literal tree for each loop element, for the evaluator
+        // to read one field out of it. Only a field the object holds itself is taken: an
+        // absent one is `null` in jq and may be filled from a merge key in yq, and the arm
+        // below keeps both answers. `splice` is the caller's word that nothing reads the
+        // variable in path position, where a literal object and a spliced field raise
+        // different errors; a marked substitution hands the object on whole (#3177).
+        Expr::Pipe(stages)
+            if splice
+                && mark.is_none()
+                && stages.len() == 2
+                && matches!(&stages[0], Expr::Var(name) if name == var_name) =>
+        {
+            if let (Expr::Field(field), OwnedValue::Object(object)) = (&stages[1], replacement) {
+                if !object.has_shadows() {
+                    if let Some(value) = object.get(field.as_str()) {
+                        return owned_to_expr(value);
+                    }
+                }
+            }
+            Expr::Pipe(
+                stages
+                    .iter()
+                    .map(|sub| substitute_var_with(sub, var_name, replacement, mark, splice))
+                    .collect(),
+            )
         }
         // #5424: a pipe that reads no variable is rebuilt stage for stage, so the one
         // rebuilt for this value hands on the tails kept for the pipe it was rebuilt
@@ -76064,7 +76156,7 @@ fn substitute_var_impl(
         Expr::Pipe(stages) => {
             let mut rebuilt: PipeStages = stages
                 .iter()
-                .map(|sub| substitute_var_impl(sub, var_name, replacement, mark))
+                .map(|sub| substitute_var_with(sub, var_name, replacement, mark, splice))
                 .collect();
             if (3..=crate::jq::expr::MAX_KEPT_TAIL_STAGES).contains(&stages.len()) {
                 // #5436: a pipe that reads a variable somewhere keeps the tails
@@ -76098,7 +76190,7 @@ fn substitute_var_impl(
         // recurses into `body` unconditionally and leaves `name` (a plain
         // `String`, not an `Expr`) untouched, which is exactly right here.
         _ => map_subexprs(expr, &mut |sub| {
-            substitute_var_impl(sub, var_name, replacement, mark)
+            substitute_var_with(sub, var_name, replacement, mark, splice)
         }),
     }
 }
@@ -76120,9 +76212,10 @@ fn substitute_var_in_builtin(
     var_name: &str,
     replacement: &OwnedValue,
     mark: Option<&LazyMarker<'_>>,
+    splice: bool,
 ) -> Builtin {
     map_builtin_subexprs(builtin, &mut |e| {
-        substitute_var_impl(e, var_name, replacement, mark)
+        substitute_var_with(e, var_name, replacement, mark, splice)
     })
 }
 
@@ -76600,8 +76693,15 @@ fn try_reduce_step_alternatives<S: EvalSemantics>(
                 }
                 outcome = None;
                 let (update, reentry) = update.against::<S>(&state);
-                let substituted =
-                    substitute_fold_step(update, bindings, all_var_names, mark_loop_vars);
+                // #5499: jq mode only. An unmarked loop variable is never read in path position
+                // there; yq has no marker, so it cannot say.
+                let substituted = substitute_fold_step(
+                    update,
+                    bindings,
+                    all_var_names,
+                    mark_loop_vars,
+                    S::TAG == EvalTag::Jq,
+                );
 
                 if let Some(control) = budget.charge_step("reduce") {
                     outcome_at = pipe_retry_generation();
@@ -79887,14 +79987,25 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                 }
                 outcome = None;
                 let (update, update_reentry) = update.against::<S>(&state);
-                let substituted_update =
-                    substitute_fold_step(update, bindings, all_var_names, mark_loop_vars);
+                let substituted_update = substitute_fold_step(
+                    update,
+                    bindings,
+                    all_var_names,
+                    mark_loop_vars,
+                    S::TAG == EvalTag::Jq,
+                );
                 // EXTRACT runs against each UPDATE output, not against `state`,
                 // so which copy it takes (#3181) is decided per output below,
                 // and the as-written copy is substituted only for an output
                 // the embed table witnesses.
                 let substituted_extract = extract.map(|ext| {
-                    substitute_fold_step(ext.hoisted, bindings, all_var_names, mark_loop_vars)
+                    substitute_fold_step(
+                        ext.hoisted,
+                        bindings,
+                        all_var_names,
+                        mark_loop_vars,
+                        false,
+                    )
                 });
 
                 // #2180 WP3 review: one attempt, one clear -- see
@@ -80001,6 +80112,7 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                                             bindings,
                                             all_var_names,
                                             mark_loop_vars,
+                                            false,
                                         );
                                         (&witnessed, Reentry::REBUILT)
                                     }
@@ -80388,6 +80500,7 @@ pub(crate) fn substitute_fold_step(
     bindings: &[(String, OwnedValue)],
     all_var_names: &[String],
     marked: bool,
+    splice: bool,
 ) -> Expr {
     let null_value = OwnedValue::Null;
     let vars = as_var_refs(bindings).chain(
@@ -80397,7 +80510,17 @@ pub(crate) fn substitute_fold_step(
             .map(|name| (name.as_str(), &null_value)),
     );
     if !marked {
-        return substitute_vars(expr, vars);
+        if !splice {
+            return substitute_vars(expr, vars);
+        }
+        // #5499: a field the loop variable's object holds is spliced alone (see
+        // `substitute_var_with`).
+        let mut result: Option<Expr> = None;
+        for (name, value) in vars {
+            let current = result.as_ref().unwrap_or(expr);
+            result = Some(substitute_var_with(current, name, value, None, true));
+        }
+        return result.unwrap_or_else(|| expr.clone());
     }
     // #3329: a container loop variable is spliced in as a marker holding the
     // source element's own storage, not as a rebuilt literal, so the resolver
@@ -114724,6 +114847,80 @@ mod tests {
             // jq's own canonical spelling, not Rust's f64 Display -- #1035.
             ["1E+100"]
         );
+    }
+
+    /// #5499: `$var.field` on an object that holds the field is that field's value alone, not a
+    /// pipe out of the whole object rebuilt as a literal tree.
+    #[test]
+    fn test_substitute_var_splices_a_held_field_alone_5499() {
+        let record = OwnedValue::object_from([
+            ("score".to_string(), OwnedValue::Int(7)),
+            ("name".to_string(), OwnedValue::String("x".into())),
+        ]);
+        let spliced = |source: &str, value: &OwnedValue| {
+            substitute_var_with(&parse(source).unwrap(), "u", value, None, true)
+        };
+        let substituted = spliced("$u.score", &record);
+        assert_eq!(substituted, Expr::Literal(Literal::Int(7)));
+        // An array value is spliced as the array, and the stage that follows is kept.
+        let nested = OwnedValue::object_from([(
+            "l".to_string(),
+            OwnedValue::array_from(vec![OwnedValue::Int(1)]),
+        )]);
+        assert_eq!(
+            spliced("$u.l", &nested),
+            owned_to_expr(&OwnedValue::array_from(vec![OwnedValue::Int(1)]))
+        );
+        // Without the caller's word that nothing reads the variable in path position, it is the
+        // object that is spliced.
+        let Expr::Pipe(stages) = substitute_var(&parse("$u.score").unwrap(), "u", &record) else {
+            panic!("not spliced without the flag: a pipe out of the object");
+        };
+        assert_eq!(stages[0], owned_to_expr(&record));
+    }
+
+    /// #5499: what the field splice leaves alone. An absent field is `null` in jq and may come
+    /// from a merge key in yq; a non-object has an error of its own; a longer pipe and a marked
+    /// substitution (path position) keep the object whole.
+    #[test]
+    fn test_substitute_var_keeps_the_object_for_everything_else_5499() {
+        let record = OwnedValue::object_from([("score".to_string(), OwnedValue::Int(7))]);
+        let whole = |source: &str, value: &OwnedValue| {
+            let expr = parse(source).unwrap();
+            let Expr::Pipe(stages) = substitute_var_with(&expr, "u", value, None, true) else {
+                panic!("{source}: not a pipe");
+            };
+            assert_eq!(stages[0], owned_to_expr(value), "{source}");
+        };
+        whole("$u.absent", &record);
+        whole("$u.score.x", &record);
+        whole("$u.score", &OwnedValue::Int(3));
+        whole("$u.score", &OwnedValue::Null);
+        // An object that repeats a key (yq, ADR-0027) is not read through its collapsed view.
+        let mut repeated = ObjectMap::new();
+        repeated.push_occurrence("score".to_string(), OwnedValue::Int(1));
+        repeated.push_occurrence("score".to_string(), OwnedValue::Int(2));
+        let repeated = OwnedValue::Object(repeated);
+        assert!(matches!(&repeated, OwnedValue::Object(o) if o.has_shadows()));
+        whole("$u.score", &repeated);
+        // A different variable is not touched.
+        assert_eq!(
+            substitute_var(&parse("$v.score").unwrap(), "u", &record),
+            parse("$v.score").unwrap()
+        );
+        // A marked substitution splices the marker, as the path reading it needs.
+        let marker = LazyMarker::new(&record, Origin::Untracked, None);
+        let marked = substitute_var_with(
+            &parse("$u.score").unwrap(),
+            "u",
+            &record,
+            Some(&marker),
+            true,
+        );
+        let Expr::Pipe(stages) = marked else {
+            panic!("a marked substitution is a pipe");
+        };
+        assert!(matches!(stages[0], Expr::TrackedVar(_)));
     }
 
     /// #1368: `substitute_vars` on an empty binding list must return `expr`
