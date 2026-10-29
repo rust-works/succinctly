@@ -10066,60 +10066,30 @@ it is recorded here as a still-open policy question, matching
 [yq Limitations](../yq/limitations.md)'s "Merge-flag `+` and `d` combined" precedent for a
 divergence accepted on its merits without fitting the letter of rule 4.
 
-### Exit code is sticky (any-error) across multi-document input — accepted divergence, ADR-0018 rule 4 (#1855)
+### Exit code is the last input's, as in jq — fixed by #5471 (`--on-error=continue` keeps the sticky status)
 
-`succinctly jq`'s exit code is a **sticky any-error** flag: once any uncaught error is
-reported anywhere during the run, the final exit code is forced to 5
-(`ErrorSink::hit()`, checked once after the whole input loop finishes, `jq_runner.rs`).
-Real jq's exit code instead reflects only the **most recently processed top-level input
-document's own outcome** — an error on an earlier document does not affect the exit code
-if a later document processes cleanly:
+Since [#5471](https://github.com/rust-works/succinctly/issues/5471) `succinctly jq`'s exit code is the last top-level input's outcome, as jq's is: an error on an earlier input followed by a clean last one exits 0.
+jq gets this from `main.c` reassigning its status from each `process()` call, and its manual documents neither the 5 nor the last-input rule, so it reads as a side effect rather than a design; fidelity is still the default (ADR-0018).
+A top-level input is what jq runs the program on once: each document, each `-R` line, each `--stream` event; `input`/`inputs` reads belong to the input that made them.
+Under `-e` an input that printed and then raised leaves the last result where it was, as jq's `last_result` does: `printf '[false,1] []' | jq -e '.[] | if type=="number" then error("n") else . end'` exits 4 in both.
 
 ```console
-$ printf '{"a":1,"b":0}\n{"a":4,"b":2}\n' | jq '.a / .b'
-2
-$ echo $?
-0                              # first doc errored, second succeeded -- exit 0
 $ printf '{"a":1,"b":0}\n{"a":4,"b":2}\n' | succinctly jq '.a / .b'
 2
 $ echo $?
-5                              # sink.hit() stays sticky from the first document
+0                              # the first document errored, the last one did not
+$ printf '{"a":1,"b":0}\n{"a":4,"b":2}\n' | succinctly jq --on-error=continue '.a / .b'
+2
+$ echo $?
+5
 ```
 
-The stickiness *does* apply across multiple outputs produced by one document
-(`.[] | 1/.`), but real jq resets it at the next top-level document boundary; succinctly's
-`sink.hit()` never resets for the life of the run. [#1830](https://github.com/rust-works/succinctly/issues/1830)'s
-`--raw-output0` NUL-content check inherits the same stickiness through the same
-`ErrorSink`/`sink.hit()` convention every other jq error in this file already uses — it is
-not a separate divergence, just another error class that can trigger this one:
+One case stays sticky by default: a document that fails to decode (`{"a":tru} {"a":1}`) exits 5 wherever it is.
+jq stops at a malformed document and exits 5; succinctly reads on past it (it validates only what a filter reads), so without this a clean document after it would turn jq's 5 into 0.
 
-```console
-$ printf '"a"\n"b\u0000c"\n"d"\n' | jq -r --raw-output0 '.'
-a␀d␀                                      # stderr: the NUL error, for the middle document
-$ echo $?
-0                                         # the LAST document ("d") succeeded
-$ printf '"a"\n"b\u0000c"\n"d"\n' | succinctly jq -r --raw-output0 '.'
-a␀d␀                                      # identical stdout and stderr
-$ echo $?
-5                                         # sink.hit() stays sticky from the middle document
-```
-
-**This is a deliberate, considered divergence, not an oversight.** [#355](https://github.com/rust-works/succinctly/issues/355)
-originally found `succinctly jq` exiting 0 on *every* error — a strictly worse bug than the
-one described here — and its fix introduced today's sticky-any-error behavior on the
-reasoning that a shell script checking `$?` after a multi-document run generally wants "did
-*anything* fail," not just "did the *last* thing fail." [#1855](https://github.com/rust-works/succinctly/issues/1855)
-re-examined that decision, implemented and fully verified a jq-exact (last-document-wins)
-fix, and then closed as won't-fix rather than merge it: none of ADR-0018's four permitted
-divergence conditions literally cover this case (jq's own output is readable and nothing is
-corrupted), so per rule 4 it is recorded here as an intentional exception on its merits —
-the same footing as the `docs/plan/decode-failure-routing.md` Stage-4 precedent immediately
-above, and unlike that one, this one has a name: it is a user-facing CLI exit-code contract
-that real scripts may already depend on in its current form, and reversing it is a behavior
-change rather than a bug fix in the ordinary sense. `succinctly yq`'s own exit-code semantics
-are unaffected by any of this — real yq genuinely *is* sticky-any-error across documents,
-unlike jq, so `yq_runner.rs`'s own use of `sink.hit()` at its final exit-code check already
-matches and needs no exception recorded in [yq Limitations](../yq/limitations.md).
+`--on-error` is a succinctly extension (ADR-0018 rule 5): `continue` keeps every input running and exits 5 if any of them raised, which was the default from [#355](https://github.com/rust-works/succinctly/issues/355) until #5471, and `stop` evaluates nothing after the first failure.
+[#1855](https://github.com/rust-works/succinctly/issues/1855) had kept the sticky status as the default and [#1923](https://github.com/rust-works/succinctly/issues/1923) recorded it here as a divergence none of rule 4's conditions covered; making it opt-in removes the divergence without dropping the behaviour.
+`succinctly yq` is unaffected: real yq stops at the first error and exits 1, and so does `succinctly yq` (#2810); [#5507](https://github.com/rust-works/succinctly/issues/5507) tracks the same flag there.
 
 ### `ascii_downcase`/`ascii_upcase` inside `path()` name the outer value, not jq's inner exploded-array step — fixed by the path-mode interpreter (#5223)
 

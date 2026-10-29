@@ -602,6 +602,7 @@ while the evaluator still follows jq (`length` on `{"a":1,"a":2}` is `1` either 
 ### Exit Status
 
 - `-e, --exit-status`: Set exit status from the last output (see the table below)
+- `--on-error <continue|stop>`: What an uncaught error does to the run (succinctly extension, not a jq flag; see below)
 
 | Code | Meaning                                                              |
 |------|----------------------------------------------------------------------|
@@ -635,9 +636,29 @@ Codes 5 and `-e`'s 1/4 answer different questions and are not interchangeable:
 with a falsy or empty result. An error therefore outranks `-e`. A caught error
 (`try`/`catch`) is not a failure and exits 0.
 
-One divergence from jq is deliberate: jq's exit code reflects only the *last*
-input, so an error on any earlier input exits 0. `succinctly jq` exits 5 if any
-input raised, which is the point of having the code at all.
+As in jq, the exit code reflects only the *last* top-level input (each document,
+each `-R` line, each `--stream` event): an error on an earlier input followed by
+a clean last one exits 0. Under `-e`, an input that printed and then raised
+does not count as the last output. One exception: a document that fails to
+decode fails the run wherever it is, because jq stops at a malformed document
+and exits 5 where succinctly reads on past it.
+
+`--on-error` is a succinctly extension for scripts that need every failure
+reflected in the exit code:
+
+| Mode                  | Behaviour                                                               |
+|-----------------------|-------------------------------------------------------------------------|
+| *(not given)*         | jq's: the last input's outcome decides                                  |
+| `--on-error=continue` | Every input is still evaluated; exit 5 if any of them raised            |
+| `--on-error=stop`     | Nothing is evaluated after the first input that raised; exit 5         |
+
+```bash
+printf '1 {"a":2}' | succinctly jq '.a'                       # 2, exit 0 (as jq)
+printf '1 {"a":2}' | succinctly jq --on-error=continue '.a'   # 2, exit 5
+printf '1 {"a":2}' | succinctly jq --on-error=stop '.a'       # nothing, exit 5
+```
+
+`halt`/`halt_error` outranks every mode, and an error still outranks `-e`.
 
 ### Examples
 
