@@ -7,8 +7,6 @@
 //! requested.
 
 #[cfg(not(test))]
-use alloc::vec;
-#[cfg(not(test))]
 use alloc::{
     borrow::Cow, collections::BTreeMap, format, rc::Rc, string::String, string::ToString, vec::Vec,
 };
@@ -6004,10 +6002,9 @@ fn is_merge_key_value<W: AsRef<[u64]>>(key_value: &YamlValue<'_, W>) -> bool {
 /// element) yields no sources — merging from it is a silent no-op, matching
 /// yq rather than erroring.
 fn merge_sources<W: AsRef<[u64]>>(value_cursor: YamlCursor<'_, W>) -> Vec<YamlCursor<'_, W>> {
-    merge_sources_tagged(value_cursor)
-        .into_iter()
-        .map(|(source, _)| source)
-        .collect()
+    let mut sources = Vec::new();
+    for_each_merge_source(value_cursor, |source, _| sources.push(source));
+    sources
 }
 
 /// [`merge_sources`] with, for each source, whether it was spelled as an alias (`<<: *a`, or
@@ -6015,18 +6012,30 @@ fn merge_sources<W: AsRef<[u64]>>(value_cursor: YamlCursor<'_, W>) -> Vec<YamlCu
 fn merge_sources_tagged<W: AsRef<[u64]>>(
     value_cursor: YamlCursor<'_, W>,
 ) -> Vec<(YamlCursor<'_, W>, bool)> {
+    let mut sources = Vec::new();
+    for_each_merge_source(value_cursor, |source, via_alias| {
+        sources.push((source, via_alias));
+    });
+    sources
+}
+
+/// The one walk behind [`merge_sources`] and [`merge_sources_tagged`], so the two cannot disagree on
+/// which values name a source.
+fn for_each_merge_source<'a, W: AsRef<[u64]>>(
+    value_cursor: YamlCursor<'a, W>,
+    mut push: impl FnMut(YamlCursor<'a, W>, bool),
+) {
     fn as_mapping<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> bool {
         matches!(cursor.value(), YamlValue::Mapping(_))
     }
 
     match value_cursor.value() {
-        YamlValue::Mapping(_) => vec![(value_cursor, false)],
+        YamlValue::Mapping(_) => push(value_cursor, false),
         YamlValue::Alias {
             target: Some(target),
             ..
-        } if as_mapping(target) => vec![(target, true)],
+        } if as_mapping(target) => push(target, true),
         YamlValue::Sequence(elements) => {
-            let mut sources = Vec::new();
             let mut rest = elements;
             while let Some((cursor, tail)) = rest.uncons_cursor() {
                 match cursor.value() {
@@ -6037,20 +6046,17 @@ fn merge_sources_tagged<W: AsRef<[u64]>>(
                     // reads the wrapper's one child - the mapping node
                     // itself - instead of its first key, silently dropping
                     // every field of this merge source (#835).
-                    YamlValue::Mapping(_) => {
-                        sources.push((cursor.resolve_bare_seq_item(), false));
-                    }
+                    YamlValue::Mapping(_) => push(cursor.resolve_bare_seq_item(), false),
                     YamlValue::Alias {
                         target: Some(target),
                         ..
-                    } if as_mapping(target) => sources.push((target, true)),
+                    } if as_mapping(target) => push(target, true),
                     _ => {}
                 }
                 rest = tail;
             }
-            sources
         }
-        _ => Vec::new(),
+        _ => {}
     }
 }
 
