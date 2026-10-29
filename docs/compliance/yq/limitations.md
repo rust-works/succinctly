@@ -3039,10 +3039,13 @@ overridden by it. `succinctly yq` matches both since #4983 (`MergeView::Renderin
 the owned conversion, `MergeView::Iteration` for everything else that reads the fields), over the
 13 merge shapes in `tests/yq_cli/i4983.rs`. A mapping with one source reads the same either way. The
 layer is shared with `succinctly jq` over YAML, which therefore iterates a sequence merge the way yq
-does (and answers `.item.z` the way it already did). Still divergent: yq's JSON rendering leaves an
-*inline-mapping* source out (`<<: {q: 1}` renders `{"k":0}`; `.item.q` and `.[]` still see it,
-[#4987](https://github.com/rust-works/succinctly/issues/4987)), which would discard merged keys for
-`succinctly jq` over YAML with no reference to match, so it needs the mode; `path` of a merged member
+does (and answers `.item.z` the way it already did).
+yq's JSON rendering leaves an *inline-mapping* source out (`<<: {q: 1}` renders `{"k":0}`; so do an anchored inline mapping and `{q: *a}`, while an alias source renders; `.item.q` and `.[]` still see them).
+`succinctly yq` matches that since [#4987](https://github.com/rust-works/succinctly/issues/4987): the yq runner sets `YamlIndex::render_merges_through_aliases_only` on every index it builds.
+The library view `succinctly jq` over YAML reads keeps the inline source's keys in the rendering, because no reference tool drops them there.
+The rule applies to the direct JSON writers (`-o json` of a document node, `.`, `.item`, a nested value), not to a value the evaluator materializes first.
+`[.item]`, `{a: .item}`, `.item | tojson`, `. * {}` and a write such as `.item.k = 1` still list the inline source's keys in JSON, because a write expands the merge key and dropping the source there would drop its keys from the document.
+Still divergent: `path` of a merged member
 names its anchor's location in yq (`["a","x"]`) and the mapping's own here (`["item","x"]`); `..` does not descend into a merged mapping's members at all in yq, and walks them here (in the iteration's order since #4983, the rendering's before). `to_entries`, `with_entries`, `paths` and `tostream` keep the rendering's order.
 
 Still divergent, because the mapping is no longer a document node by the time the builtin runs

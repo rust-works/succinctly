@@ -7,8 +7,6 @@
 //! requested.
 
 #[cfg(not(test))]
-use alloc::vec;
-#[cfg(not(test))]
 use alloc::{
     borrow::Cow, collections::BTreeMap, format, rc::Rc, string::String, string::ToString, vec::Vec,
 };
@@ -2711,7 +2709,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             }
             YamlValue::Mapping(fields) => {
                 // #4983: a mapping renders through yq's rendering expansion, not the iteration one.
-                let fields = fields.rendered();
+                let fields = fields.rendered_for_json();
                 if fields.is_empty() {
                     return Ok(out.write_str("{}")?);
                 }
@@ -2874,7 +2872,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             }
             YamlValue::Mapping(fields) => {
                 // #4983: a mapping renders through yq's rendering expansion, not the iteration one.
-                let fields = fields.rendered();
+                let fields = fields.rendered_for_json();
                 output.push('{');
                 let mut first = true;
                 for field in fields {
@@ -3691,7 +3689,7 @@ fn write_yaml_value_as_json<W: AsRef<[u64]>>(output: &mut String, value: YamlVal
         }
         YamlValue::Mapping(fields) => {
             // #4983: a mapping renders through yq's rendering expansion, not the iteration one.
-            let fields = fields.rendered();
+            let fields = fields.rendered_for_json();
             output.push('{');
             let mut first = true;
             for field in fields {
@@ -5387,6 +5385,19 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
     /// list is the iteration (`MergeView::Iteration`: `.[]`, `.[] | key`); a mapping without a merge key reads
     /// the same either way.
     pub(crate) fn rendered(&self) -> Self {
+        self.rendered_as(MergeView::Rendering)
+    }
+
+    /// [`rendered`](Self::rendered) for a JSON writer (#4987): when the index says so
+    /// ([`YamlIndex::render_merges_through_aliases_only`]), a `<<` source written in place contributes
+    /// nothing, as in yq's JSON encoder. A value materialized for a write keeps [`rendered`](Self::rendered)'s
+    /// list instead: a write expands the merge, and dropping a source there would drop its keys from the
+    /// document.
+    pub(crate) fn rendered_for_json(&self) -> Self {
+        self.rendered_as(MergeView::JsonRendering)
+    }
+
+    fn rendered_as(&self, view: MergeView) -> Self {
         match &self.inner {
             FieldsInner::Direct(_) => self.clone(),
             // The same list when no `<<` has two sources to order differently.
@@ -5394,19 +5405,17 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
                 views_differ: false,
                 ..
             } => self.clone(),
-            FieldsInner::Merged { first_key, .. } => {
-                match resolve_merge_keys(**first_key, MergeView::Rendering) {
-                    Some((entries, views_differ)) => Self {
-                        inner: FieldsInner::Merged {
-                            entries: Rc::new(entries),
-                            views_differ,
-                            first_key: first_key.clone(),
-                            index: 0,
-                        },
+            FieldsInner::Merged { first_key, .. } => match resolve_merge_keys(**first_key, view) {
+                Some((entries, views_differ)) => Self {
+                    inner: FieldsInner::Merged {
+                        entries: Rc::new(entries),
+                        views_differ,
+                        first_key: first_key.clone(),
+                        index: 0,
                     },
-                    None => self.clone(),
-                }
-            }
+                },
+                None => self.clone(),
+            },
         }
     }
 
@@ -5680,15 +5689,14 @@ fn resolve_merge_keys<'a, W: AsRef<[u64]>>(
                 upsert_field(&mut entries, &mut positions, key, value, &key_value);
             }
             let mut views_differ =
-                merge_field_into(&mut entries, &mut positions, field.value_cursor, view) > 1;
+                merge_field_into(&mut entries, &mut positions, field.value_cursor, view);
 
             fields = rest;
             while let Some((field, rest)) = fields.uncons() {
                 let key_value = field.key_cursor.value();
                 if is_merge_key_value(&key_value) {
                     views_differ |=
-                        merge_field_into(&mut entries, &mut positions, field.value_cursor, view)
-                            > 1;
+                        merge_field_into(&mut entries, &mut positions, field.value_cursor, view);
                 } else {
                     upsert_field(
                         &mut entries,
@@ -5870,11 +5878,16 @@ type MergedEntries<'a, W> = Vec<(YamlCursor<'a, W>, YamlCursor<'a, W>)>;
 enum MergeView {
     /// A sequence folded in reverse (see [`merge_field_into`]).
     Rendering,
+    /// [`Rendering`](Self::Rendering) for a JSON writer: on an index that renders only alias sources
+    /// (#4987), a source written in place is left out.
+    JsonRendering,
     /// Every source, in listed order, each field upserting in place.
     Iteration,
 }
 
-/// Expand one `<<` field's merge sources into `entries`/`positions`, returning how many sources it had.
+/// Expand one `<<` field's merge sources into `entries`/`positions`, returning whether the two views
+/// of it can differ: it has two or more sources, or the index renders only alias sources (#4987) and
+/// one is an inline mapping.
 ///
 /// For [`MergeView::Rendering`], reverse the source list so an earlier-listed source (higher merge-spec
 /// priority) is applied last and wins value conflicts, while a later-listed
@@ -5885,13 +5898,20 @@ fn merge_field_into<'a, W: AsRef<[u64]>>(
     positions: &mut KeyPositions,
     value_cursor: YamlCursor<'a, W>,
     view: MergeView,
-) -> usize {
-    let mut sources = merge_sources(value_cursor);
-    let count = sources.len();
+) -> bool {
+    let tagged = merge_sources_tagged(value_cursor);
+    // #4987: yq's rendering expands only an alias source; an index that says so drops the rest from
+    // that view, which is then not the iteration's list even for a lone source.
+    let aliases_only = value_cursor.index.merge_rendering_aliases_only();
+    let views_differ = tagged.len() > 1 || (aliases_only && tagged.iter().any(|(_, alias)| !alias));
+    let drop_inline = aliases_only && view == MergeView::JsonRendering;
+    let mut sources: Vec<_> = tagged
+        .into_iter()
+        .filter(|(_, alias)| *alias || !drop_inline)
+        .map(|(source, _)| source)
+        .collect();
     match view {
-        // (yq's JSON rendering also leaves an inline-mapping source out, #4987; this layer serves
-        // `succinctly jq` over YAML too, where that would discard merged keys with no reference to match.)
-        MergeView::Rendering => sources.reverse(),
+        MergeView::Rendering | MergeView::JsonRendering => sources.reverse(),
         // #4983: in listed order, each field upserting, as yq's iteration walks them.
         MergeView::Iteration => {}
     }
@@ -5907,7 +5927,7 @@ fn merge_field_into<'a, W: AsRef<[u64]>>(
             );
         }
     }
-    count
+    views_differ
 }
 
 /// Insert a field by name, or overwrite an existing entry's value in place.
@@ -5982,18 +6002,40 @@ fn is_merge_key_value<W: AsRef<[u64]>>(key_value: &YamlValue<'_, W>) -> bool {
 /// element) yields no sources — merging from it is a silent no-op, matching
 /// yq rather than erroring.
 fn merge_sources<W: AsRef<[u64]>>(value_cursor: YamlCursor<'_, W>) -> Vec<YamlCursor<'_, W>> {
+    let mut sources = Vec::new();
+    for_each_merge_source(value_cursor, |source, _| sources.push(source));
+    sources
+}
+
+/// [`merge_sources`] with, for each source, whether it was spelled as an alias (`<<: *a`, or
+/// `*a` in a sequence) rather than as a mapping in place (#4987).
+fn merge_sources_tagged<W: AsRef<[u64]>>(
+    value_cursor: YamlCursor<'_, W>,
+) -> Vec<(YamlCursor<'_, W>, bool)> {
+    let mut sources = Vec::new();
+    for_each_merge_source(value_cursor, |source, via_alias| {
+        sources.push((source, via_alias));
+    });
+    sources
+}
+
+/// The one walk behind [`merge_sources`] and [`merge_sources_tagged`], so the two cannot disagree on
+/// which values name a source.
+fn for_each_merge_source<'a, W: AsRef<[u64]>>(
+    value_cursor: YamlCursor<'a, W>,
+    mut push: impl FnMut(YamlCursor<'a, W>, bool),
+) {
     fn as_mapping<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> bool {
         matches!(cursor.value(), YamlValue::Mapping(_))
     }
 
     match value_cursor.value() {
-        YamlValue::Mapping(_) => vec![value_cursor],
+        YamlValue::Mapping(_) => push(value_cursor, false),
         YamlValue::Alias {
             target: Some(target),
             ..
-        } if as_mapping(target) => vec![target],
+        } if as_mapping(target) => push(target, true),
         YamlValue::Sequence(elements) => {
-            let mut sources = Vec::new();
             let mut rest = elements;
             while let Some((cursor, tail)) = rest.uncons_cursor() {
                 match cursor.value() {
@@ -6004,18 +6046,17 @@ fn merge_sources<W: AsRef<[u64]>>(value_cursor: YamlCursor<'_, W>) -> Vec<YamlCu
                     // reads the wrapper's one child - the mapping node
                     // itself - instead of its first key, silently dropping
                     // every field of this merge source (#835).
-                    YamlValue::Mapping(_) => sources.push(cursor.resolve_bare_seq_item()),
+                    YamlValue::Mapping(_) => push(cursor.resolve_bare_seq_item(), false),
                     YamlValue::Alias {
                         target: Some(target),
                         ..
-                    } if as_mapping(target) => sources.push(target),
+                    } if as_mapping(target) => push(target, true),
                     _ => {}
                 }
                 rest = tail;
             }
-            sources
         }
-        _ => Vec::new(),
+        _ => {}
     }
 }
 
@@ -17071,6 +17112,38 @@ mod tests {
         let mut out = String::new();
         write_yaml_value_as_json(&mut out, value);
         out
+    }
+
+    /// #4987: the index decides whether a mapping's rendering lists a `<<` source spelled in place. By default it
+    /// does (the library view `succinctly jq` over YAML reads); after `render_merges_through_aliases_only` it
+    /// expands only an alias, as yq's `-o json` does, while a lookup and the iteration still see every source.
+    #[test]
+    fn test_render_merges_through_aliases_only_4987() {
+        let yaml: &[u8] = b"a: &a {x: 1}\nitem:\n  <<: [*a, {q: 2}]\n  k: 0\n";
+        let read = |aliases_only: bool| {
+            let mut index = YamlIndex::build(yaml).expect("builds");
+            if aliases_only {
+                index.render_merges_through_aliases_only();
+            }
+            let YamlValue::Mapping(root) = first_doc(index.root(yaml)) else {
+                panic!("root document must be a mapping");
+            };
+            let rendered = write_yaml_value_as_json_string(root.find("item").expect("item"));
+            let YamlValue::Mapping(item) = root.find("item").expect("item") else {
+                panic!("item must be a mapping");
+            };
+            let has_q = item.find("q").is_some();
+            let iterated: Vec<String> = item.map(|f| f.key().key_string().into_owned()).collect();
+            (rendered, iterated, has_q)
+        };
+        let (rendered, iterated, has_q) = read(false);
+        assert_eq!(rendered, r#"{"q":2,"x":1,"k":0}"#);
+        assert_eq!(iterated, ["x", "q", "k"]);
+        assert!(has_q);
+        let (rendered, iterated, has_q) = read(true);
+        assert_eq!(rendered, r#"{"x":1,"k":0}"#);
+        assert_eq!(iterated, ["x", "q", "k"]);
+        assert!(has_q);
     }
 
     // ========================================================================

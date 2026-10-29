@@ -2054,8 +2054,9 @@ fn parse_input(bytes: &[u8], format: InputFormat) -> Result<Vec<OwnedValue>> {
         }),
         InputFormat::Yaml | InputFormat::Auto => {
             // Parse as YAML (Auto defaults to YAML when no extension hint)
-            let index =
+            let mut index =
                 YamlIndex::build(bytes).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
+            index.render_merges_through_aliases_only(); // #4987, see the stdin site
             let root = index.root(bytes);
 
             match root.value() {
@@ -2136,7 +2137,7 @@ fn evaluate_yaml_direct_filtered(
     // #2839: several top-level values are several documents; the index then addresses the
     // rewritten stream, which is only built once the single-value parse has failed.
     let mut streamed: Option<Vec<u8>> = None;
-    let index = if mark_json_sourced {
+    let mut index = if mark_json_sourced {
         let (index, stream) = build_json_sourced_streaming(source)
             .map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
         streamed = stream;
@@ -2144,6 +2145,7 @@ fn evaluate_yaml_direct_filtered(
     } else {
         YamlIndex::build(source).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?
     };
+    index.render_merges_through_aliases_only(); // #4987, see the stdin site
     let bytes: &[u8] = streamed.as_deref().unwrap_or(source);
     let root = index.root(bytes);
 
@@ -11437,6 +11439,8 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
             if args.no_doc {
                 index.suppress_header_doc_markers();
             }
+            // #4987: yq's rendering of a mapping expands only an alias `<<` source.
+            index.render_merges_through_aliases_only();
 
             // #1350/#2486: `--sort-keys` has no soundness pass on the M2
             // fast path below -- fall back to the DOM evaluator (via
@@ -11662,6 +11666,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 if args.no_doc {
                     index.suppress_header_doc_markers(); // #2795, see the stdin site
                 }
+                index.render_merges_through_aliases_only(); // #4987, see the stdin site
 
                 // #1350/#2486: see the stdin branch's identical check above
                 // for the full rationale.
@@ -12212,8 +12217,9 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 // No `suppress_header_doc_markers` here (#2795): a slurped
                 // array streams its documents as elements, never as
                 // documents, so no header is ever printed on this path.
-                let index = YamlIndex::build(&bytes)
+                let mut index = YamlIndex::build(&bytes)
                     .map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
+                index.render_merges_through_aliases_only(); // #4987, see the stdin site
                 parsed_sources.push((bytes, index));
             }
 
@@ -12498,6 +12504,7 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
                 if args.no_doc {
                     index.suppress_header_doc_markers(); // #2795, see the stdin site
                 }
+                index.render_merges_through_aliases_only(); // #4987, see the stdin site
                 let root = index.root(&input_bytes);
 
                 {
