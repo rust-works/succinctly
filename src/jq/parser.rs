@@ -2903,6 +2903,7 @@ impl<'a> Parser<'a> {
                     self.parse_yq_object_entry()?
                 } else {
                     let mut string_key: Option<Expr> = None;
+                    let mut constant_key_error: Option<ParseError> = None;
                     let (mut key, dollar_shorthand_value) = if self.peek() == Some('(') {
                         // Dynamic key: (expr)
                         let key_start = self.pos;
@@ -2913,13 +2914,14 @@ impl<'a> Parser<'a> {
                         // while compiling (`jq: error: Cannot use number (0) as object key`,
                         // exit 3), before anything runs. yq has no such check -- it stringifies
                         // a number key -- so only jq mode takes it; a computed key still
-                        // reaches the evaluator's runtime verdict.
+                        // reaches the evaluator's runtime verdict. The verdict waits for
+                        // the `:`: a key with no pair is jq's syntax error first.
                         if self.mode == ParserMode::Jq {
                             if let Some(value) =
                                 Self::const_fold_pattern_key::<JqSemantics>(&key_expr)
                             {
                                 if !matches!(value, OwnedValue::String(_)) {
-                                    return Err(ParseError::new(
+                                    constant_key_error = Some(ParseError::new(
                                         EvalError::cannot_use_as_object_key(&value).message,
                                         key_start,
                                     ));
@@ -2985,6 +2987,9 @@ impl<'a> Parser<'a> {
                     let value = if let Some(v) = dollar_shorthand_value {
                         v
                     } else if self.peek() == Some(':') {
+                        if let Some(error) = constant_key_error {
+                            return Err(error);
+                        }
                         self.next();
                         self.skip_ws();
                         self.parse_object_value()?
