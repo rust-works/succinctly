@@ -4092,10 +4092,18 @@ doesn't mistake it for this fix's own doing: `{"x":null,"y":1} | del(.x[0:2], .y
 `succinctly yq` both before and after this fix, via the pre-existing #1116/#1219
 chained-slice-parent-drop rule elsewhere in this same trie walk.
 
-**Closed for distinct non-negative indices (#4749).**
-`delete_keys` pads the array once to the largest index of a `del(.[5], .[0])` batch of plain non-negative indices and then deletes the others, which is what yq's highest-first handling gives (`[10,20,30]` with `del(.[5], .[7])` is `[10,20,30,null,null,null]`, and `del(.[5], .[0])` is `[20,30,null,null]`, in either order).
-Pinned by `tests/yq_cli/i4749.rs`; a one-off differential sweep of 600 random distinct-index batches against yq v4.53.3 (not kept in the repo) found no difference.
-Still open: a batch with a negative index or a slice (`del(.[-1], .[5])` is `[10,20,null,null]` in yq, and the order matters), and a repeated index, which yq deletes again where the delete trie collapses the repeated path to one.
+**Closed for plain indices (#4749).**
+yq's `deleteChildOperator` evaluates every path of a `del()` batch left to right into nodes: an index past the end grows the array with `null`s as it is evaluated, and a negative index counts back from the length at that moment.
+It then deletes the nodes from the back, each by the key it holds at that time.
+A deletion renumbers the nodes that stay, but a node already deleted keeps its old key, so naming one twice deletes whatever has moved into its place, and a key past the end deletes nothing.
+`yq_delete_index_sequence` does the same: `del(.[5], .[0])` is `[20,30,null,null]` in either order, `del(.[-1], .[5])` is `[10,20,null,null]` while `del(.[5], .[-1])` is `[10,20,30,null,null]`, and `del(.[0], .[0])` is `[30]` (`[10,20,30]` in each case).
+A string spelling an index (`.["5"]`) names the same node as the number.
+Distinct nodes are one pass over the grown array; a repeated one is replayed, bounded to 2^27 element-times-index steps, past which the repeat is deleted once.
+`DeleteTrieNode::terminal_order` keeps the order and the repeats that the interned trie edges lose.
+Pinned by `tests/yq_cli/i4749.rs`; a one-off differential sweep of about 2,500 random batches (indices -8 to 12 on arrays of 0 to 5 elements, with string spellings, nested under a key or at the root) against yq v4.53.3 (not kept in the repo) found no difference in any batch both tools answer.
+Still open: a slice in the batch (`del(.[5], .[0:2])` is `[10,20,30,null,null,null]` in yq, where a slice has no parent and ends the deletion, so nothing before it in the batch is deleted).
+Still open: a negative index that is out of range of the array as it entered but in range once an earlier past-the-end index has grown it (`[10] | del(.[2], .[-2])` is `[10]` in yq).
+That one is the read side, not the delete: yq's `.[2], .[-2]` grows the array as it reads (#2435), and the read here does not, so the path resolves before `del()` sees it and raises `index [-2] out of range`.
 
 **Gated off when 2+ *terminal* indices share one node** (the `null`-vivify gate below; the array padding of a `del()` batch is the separate #4749 rule above). `delete_keys`'s own #2305/#2306
 gate only extends a single-key batch — real yq's own multi-key extension is

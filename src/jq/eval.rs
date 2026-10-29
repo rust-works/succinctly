@@ -86093,6 +86093,71 @@ fn highest_plain_index(keys: &[&OwnedValue]) -> Option<usize> {
     Some(highest)
 }
 
+/// Most deletions [`yq_delete_index_sequence`] replays one by one before it takes the set-deletion
+/// instead: elements times indices, a bound on the replay's memmoves.
+const YQ_DELETE_REPLAY_WORK_LIMIT: usize = 1 << 27;
+
+/// yq's `del()` of several plain indices of one array, as `deleteChildOperator` runs it (#4749).
+///
+/// yq first evaluates every path, left to right, into a list of *nodes*: a non-negative index past
+/// the end grows the array with `null`s up to it as it is evaluated, and a negative one counts
+/// back from the length at that moment (`del(.[-1], .[5])` names the last of three, where
+/// `del(.[5], .[-1])` names the sixth). It then deletes the list from the back, each node by the
+/// key it holds *then*: a deletion renumbers every node that stays, but a node already deleted
+/// keeps its old key, so naming one twice deletes whatever has since moved into its place
+/// (`del(.[0], .[0])` on three elements is `[30]`), and a key past the end deletes nothing.
+///
+/// Distinct nodes cannot disturb one another, so they are one pass over the grown array; only a
+/// repeated node is replayed.
+fn yq_delete_index_sequence(arr: &mut Vec<OwnedValue>, steps: &[i64]) -> Result<(), EvalError> {
+    let mut len = arr.len();
+    let mut nodes: Vec<usize> = vec_with_capacity(steps.len());
+    for &step in steps {
+        if step >= 0 {
+            let index = usize::try_from(step).map_err(|_| cannot_grow_array(step as u64))?;
+            len = len.max(index.saturating_add(1));
+            nodes.push(index);
+        } else {
+            if let Some(err) = yq_negative_index_error_for_len(true, &OwnedValue::Int(step), len) {
+                return Err(err);
+            }
+            nodes.push(len - step.unsigned_abs() as usize);
+        }
+    }
+    if len > arr.len() {
+        pad_with_nulls(arr, len - 1)?;
+    }
+    let mut keep = vec![true; len];
+    let mut repeated = false;
+    for &node in &nodes {
+        repeated |= !keep[node];
+        keep[node] = false;
+    }
+    if repeated && nodes.len().saturating_mul(len) <= YQ_DELETE_REPLAY_WORK_LIMIT {
+        // The ids of the elements still in the array, ascending, and the key each deleted one
+        // held when it went.
+        let mut alive: Vec<usize> = (0..len).collect();
+        let mut stale = vec![usize::MAX; len];
+        for &node in nodes.iter().rev() {
+            let key = alive.binary_search(&node).unwrap_or_else(|_| stale[node]);
+            if key < alive.len() {
+                let gone = alive.remove(key);
+                stale[gone] = key;
+            }
+        }
+        keep.fill(false);
+        for &id in &alive {
+            keep[id] = true;
+        }
+    }
+    let mut position = 0usize;
+    arr.retain(|_| {
+        position += 1;
+        keep[position - 1]
+    });
+    Ok(())
+}
+
 /// jq's `jv_dels`: remove every key in `keys` from one container in a single
 /// pass. Keys naming nothing are ignored, and every array index resolves
 /// against the length the array had on entry, so one deletion cannot shift the
@@ -86480,6 +86545,13 @@ struct DeleteTrieNode {
     field_groups: Vec<usize>,
     /// `field_groups` for `indices`.
     index_groups: Vec<usize>,
+    /// yq mode only (#4749): the child ids of the edges, `fields` and `indices` alike, that ended
+    /// a resolved path, one entry per path in the order the paths were inserted, so a repeated
+    /// index appears as many times as it was written. `indices` keeps one edge per distinct step
+    /// and so has lost both the repeat and the interleaving, and an integer spelled as a string
+    /// (`.["5"]`) is a `fields` edge; yq's batch `del()` of one array needs all three (see
+    /// [`yq_delete_index_sequence`]). Empty in jq mode.
+    terminal_order: Vec<u32>,
     /// Where this node hangs off its parent, so gaining a first child can
     /// append this node to the right one of the parent's two `*_groups`
     /// lists. `DELETE_TRIE_ROOT` has no parent and these are meaningless.
@@ -86502,6 +86574,7 @@ impl DeleteTrieNode {
             indices: IndexMap::new(),
             field_groups: Vec::new(),
             index_groups: Vec::new(),
+            terminal_order: Vec::new(),
             parent,
             slot,
             keyed_by_field,
@@ -86584,6 +86657,31 @@ impl DeleteTrie {
     /// at `start == 0`, which collapses the whole document to `null`.
     fn root_is_terminal(&self) -> bool {
         self.node(DELETE_TRIE_ROOT).terminal
+    }
+
+    /// yq mode (#4749): the integers the edges that ended a resolved path at `node` name, one per
+    /// path in insertion order, when there are at least two and every one is a plain index or a
+    /// string spelling one. `None` when a slice or any other name is among them, or fewer than two
+    /// paths end here, which keep [`delete_keys`]'s batch.
+    fn yq_terminal_index_sequence(&self, node: &DeleteTrieNode) -> Option<Vec<i64>> {
+        if node.terminal_order.len() < 2 {
+            return None;
+        }
+        node.terminal_order
+            .iter()
+            .map(|&child| {
+                let edge = self.node(child);
+                if edge.keyed_by_field {
+                    let (name, _) = node.fields.get_index(edge.slot)?;
+                    return yq_field_name_as_index::<YqSemantics>(name);
+                }
+                let (step, _) = node.indices.get_index(edge.slot)?;
+                match *step {
+                    ArrayStep::Index { idx, frac: None } => Some(idx),
+                    _ => None,
+                }
+            })
+            .collect()
     }
 
     /// jq mode only (#2929): whether `delete_trie_object`/`delete_trie_array`
@@ -86913,8 +87011,22 @@ impl DeleteTrieBuilder {
         let Some(id) = self.intern(path)? else {
             return Ok(());
         };
-        self.trie.nodes[id as usize].terminal = true;
+        self.mark_terminal(id);
         Ok(())
+    }
+
+    /// Record that a resolved path ends at node `id`.
+    ///
+    /// In yq mode an array edge also joins its parent's [`DeleteTrieNode::terminal_order`], which
+    /// is the one place a repeated index and the order of the `del()` batch survive the interning
+    /// (#4749).
+    fn mark_terminal(&mut self, id: u32) {
+        let node = &mut self.trie.nodes[id as usize];
+        node.terminal = true;
+        if self.yq_mode && id != DELETE_TRIE_ROOT {
+            let parent = node.parent;
+            self.trie.nodes[parent as usize].terminal_order.push(id);
+        }
     }
 
     /// Insert an already-flat path `Expr` — yq's slice rules produce one by
@@ -86946,7 +87058,7 @@ impl DeleteTrieBuilder {
         match failed {
             Some(e) => Err(e),
             None => {
-                self.trie.nodes[id as usize].terminal = true;
+                self.mark_terminal(id);
                 Ok(())
             }
         }
@@ -87538,6 +87650,14 @@ fn delete_trie_array(
         })
         .collect();
     doomed.extend_from_slice(named_terminals);
+    if yq_mode {
+        if let OwnedValue::Array(arr) = &mut value {
+            if let Some(steps) = trie.yq_terminal_index_sequence(node) {
+                yq_delete_index_sequence(arr, &steps)?;
+                return Ok(value);
+            }
+        }
+    }
     if !doomed.is_empty() {
         let key_refs: Vec<&OwnedValue> = doomed.iter().collect();
         value = delete_keys(value, &key_refs, yq_mode)?;
@@ -119309,13 +119429,13 @@ mod tests {
         // else-branch contributes no path steps, matching path(.).
         query!(br#"{"a": 1}"#, "path(if false then .a end)",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert!(arr.is_empty());
+                assert_eq!(arr, Vec::<OwnedValue>::new());
             }
         );
 
         query!(br#"{"a": 1}"#, "path(if false then .a elif false then .b end)",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert!(arr.is_empty());
+                assert_eq!(arr, Vec::<OwnedValue>::new());
             }
         );
 
@@ -120659,7 +120779,7 @@ mod tests {
         );
         query!(br"{}", "map(. + 1)",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert!(arr.is_empty());
+                assert_eq!(arr, Vec::<OwnedValue>::new());
             }
         );
     }
@@ -122030,7 +122150,7 @@ mod tests {
         );
         query!(br"{}", "flatten",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert!(arr.is_empty());
+                assert_eq!(arr, Vec::<OwnedValue>::new());
             }
         );
     }
@@ -130766,7 +130886,7 @@ mod tests {
         // Test identity path
         query!(br#"{"a": 1}"#, "path(.)",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert!(arr.is_empty()); // Identity has no path components
+                assert_eq!(arr, Vec::<OwnedValue>::new()); // Identity has no path components
             }
         );
     }
@@ -140117,7 +140237,7 @@ mod tests {
         // jq 1.7.1 yields no values for a zero step (it does not error)
         query!(b"null", "[range(0; 1; 0)]",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert!(arr.is_empty());
+                assert_eq!(arr, Vec::<OwnedValue>::new());
             }
         );
     }
@@ -140318,7 +140438,7 @@ mod tests {
         // No occurrences returns empty array
         query!(br#""abc""#, r#"indices("xyz")"#,
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert!(arr.is_empty());
+                assert_eq!(arr, Vec::<OwnedValue>::new());
             }
         );
     }
@@ -140604,7 +140724,7 @@ mod tests {
         // shuffle of empty array should return empty array
         query!(br"[]", "shuffle",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert!(arr.is_empty());
+                assert_eq!(arr, Vec::<OwnedValue>::new());
             }
         );
     }
@@ -140752,7 +140872,7 @@ mod tests {
         // Empty array returns empty array
         query!(br"[]", "pivot",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert!(arr.is_empty());
+                assert_eq!(arr, Vec::<OwnedValue>::new());
             }
         );
     }
@@ -140762,7 +140882,7 @@ mod tests {
         // Array of empty arrays returns empty array
         query!(br"[[], []]", "pivot",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert!(arr.is_empty());
+                assert_eq!(arr, Vec::<OwnedValue>::new());
             }
         );
     }
@@ -141919,6 +142039,51 @@ mod tests {
         let err = delete_trie_array(OwnedValue::Int(5), &slice_trie, DELETE_TRIE_ROOT, true, &[])
             .expect_err("slice step must still error even in yq mode");
         assert_eq!(err.message, "Cannot index number with object");
+    }
+
+    fn ints(range: core::ops::Range<i64>) -> Vec<OwnedValue> {
+        range.map(OwnedValue::Int).collect()
+    }
+
+    #[test]
+    fn test_yq_delete_index_sequence_replays_a_repeat_and_refuses_the_absurd_4749() {
+        let mut arr = ints(10..13);
+        yq_delete_index_sequence(&mut arr, &[0, 1, 0]).expect("replay");
+        assert_eq!(arr, Vec::<OwnedValue>::new());
+
+        let mut arr = ints(10..13);
+        yq_delete_index_sequence(&mut arr, &[-1, 5]).expect("negative before the growth");
+        assert_eq!(
+            arr,
+            [
+                OwnedValue::Int(10),
+                OwnedValue::Int(11),
+                OwnedValue::Null,
+                OwnedValue::Null
+            ]
+        );
+
+        // A negative index that is out of range when it is evaluated raises, as a single
+        // `del(.[-5])` does.
+        let mut arr = ints(10..13);
+        yq_delete_index_sequence(&mut arr, &[0, -5]).expect_err("out of range");
+
+        // An index no array can grow to is refused by the padding.
+        let mut arr = ints(10..13);
+        yq_delete_index_sequence(&mut arr, &[0, i64::MAX]).expect_err("absurd index");
+    }
+
+    #[test]
+    fn test_yq_delete_index_sequence_past_the_replay_bound_deletes_the_set_4749() {
+        // 7,000 steps over 20,000 elements is past `YQ_DELETE_REPLAY_WORK_LIMIT`, so the repeat
+        // is deleted once rather than replayed: bounded work instead of a quadratic memmove.
+        let mut steps: Vec<i64> = vec![0; 7_000];
+        steps.push(1);
+        assert!(steps.len() * 20_000 > YQ_DELETE_REPLAY_WORK_LIMIT);
+        let mut arr = ints(0..20_000);
+        yq_delete_index_sequence(&mut arr, &steps).expect("set deletion");
+        assert_eq!(arr.len(), 19_998);
+        assert_eq!(arr[0], OwnedValue::Int(2));
     }
 
     // #694: `collect_owned()`/`eval_owned_multi` silently dropped a
