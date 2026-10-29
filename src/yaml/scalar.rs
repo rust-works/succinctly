@@ -578,9 +578,10 @@ pub fn is_signed_prefixed_int_text(raw: &str) -> bool {
     matches!(raw.as_bytes(), [b'0', b'x' | b'o', b'-', ..])
 }
 
-/// Whether an integer literal's text reads back as a string when it is written nested in a
-/// document, so yq tags it `!!int` (#3027, #1356): the `0x-10` its arithmetic writes for a
-/// negative hex or octal result, and an underscore-led text (`_1`) `tonumber` accepts.
+/// Whether an integer literal's text reads back as a string when written nested (#3027, #1356).
+///
+/// yq then tags it `!!int`: the `0x-10` its arithmetic writes for a negative hex or octal result,
+/// and an underscore-led text (`_1`) `tonumber` accepts.
 #[must_use]
 pub fn int_text_reads_back_as_string(raw: &str) -> bool {
     is_signed_prefixed_int_text(raw) || raw.strip_prefix(['-', '+']).unwrap_or(raw).starts_with('_')
