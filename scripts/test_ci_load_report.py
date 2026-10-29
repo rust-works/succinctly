@@ -11,8 +11,12 @@ a hyphen, which is not a valid Python module identifier.
 
 import argparse
 import importlib.util
+import json
+import os
 import pathlib
+import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 
 _SCRIPT_PATH = pathlib.Path(__file__).parent / "ci-load-report.py"
@@ -31,18 +35,19 @@ def stamp(minute):
     return f"{at(minute):%Y-%m-%dT%H:%M:%SZ}"
 
 
-def job(name, created, started, completed, conclusion="success", runner="macos-latest"):
+def job(name, created, started, completed, conclusion="success", runner="macos-latest", attempt=1):
     return {
-        "name": name, "status": "completed", "conclusion": conclusion, "labels": [runner],
+        "name": name, "status": "completed" if completed is not None else "in_progress",
+        "conclusion": conclusion, "labels": [runner], "run_attempt": attempt,
         "created_at": stamp(created),
         "started_at": None if started is None else stamp(started),
-        "completed_at": stamp(completed),
+        "completed_at": None if completed is None else stamp(completed),
     }
 
 
-def run(run_id, created=0, event="merge_group", conclusion="success", attempt=1):
-    return {"id": run_id, "event": event, "conclusion": conclusion, "created_at": stamp(created),
-            "run_attempt": attempt, "workflow": "ci.yml"}
+def run(run_id, created=0, event="merge_group", conclusion="success", attempt=1, status="completed"):
+    return {"id": run_id, "status": status, "event": event, "conclusion": conclusion,
+            "created_at": stamp(created), "run_attempt": attempt, "workflow": "ci.yml"}
 
 
 class OtherRunInFlightTest(unittest.TestCase):
@@ -90,18 +95,29 @@ class HelpersTest(unittest.TestCase):
 
     def test_is_macos(self):
         self.assertTrue(ci_load_report.is_macos(job("x", 0, 0, 1, runner="macos-latest")))
+        self.assertTrue(ci_load_report.is_macos(job("x", 0, 0, 1, runner="macOS-arm64")))
         self.assertFalse(ci_load_report.is_macos(job("x", 0, 0, 1, runner="ubuntu-24.04-arm")))
 
     def test_skipped_jobs_hold_no_slot(self):
         self.assertFalse(ci_load_report.holds_slot(job("x", 0, 0, 0, conclusion="skipped")))
         self.assertTrue(ci_load_report.holds_slot(job("x", 0, None, 4, conclusion="cancelled")))
+        # Still queued: it holds its place in the load count until the report ends.
+        queued = job("x", 0, None, None, conclusion=None)
+        self.assertTrue(ci_load_report.holds_slot(queued))
+        self.assertEqual(ci_load_report.slot_end(queued), ci_load_report.NOT_YET)
         self.assertFalse(ci_load_report.ran(job("x", 0, None, 4, conclusion="cancelled")))
 
     def test_parse_window(self):
         name, since, until = ci_load_report.parse_window("after=2026-10-28T12:17:00Z..2026-10-29T12:17:00Z")
         self.assertEqual(name, "after")
         self.assertEqual(until - since, timedelta(days=1))
-        for bad in ("after", "after=2026-10-28T12:17:00Z", "=a..b"):
+        # A non-UTC offset is converted, so the runs query and the bucketing agree.
+        _, since, _ = ci_load_report.parse_window("w=2026-10-28T14:17:00+02:00..2026-10-29T12:17:00Z")
+        self.assertEqual(since, datetime(2026, 10, 28, 12, 17, tzinfo=timezone.utc))
+        self.assertEqual(since.utcoffset(), timedelta(0))
+        for bad in ("after", "after=2026-10-28T12:17:00Z", "=a..b", "w=2026-10-21..2026-10-28T00:00:00Z",
+                    "w=2026-10-29T00:00:00Z..2026-10-29T00:00:00Z", "w=2026-10-29T00:00:00Z..2026-10-28T00:00:00Z",
+                    "w=yesterday..today"):
             with self.assertRaises(argparse.ArgumentTypeError):
                 ci_load_report.parse_window(bad)
 
@@ -174,12 +190,59 @@ class ReportTest(unittest.TestCase):
         runs = [run(1, created=0), run(2, created=5, attempt=2)]
         jobs = {
             1: [job("Test (macOS ARM64) (simd)", 10, 12, 20)],
-            # A re-run whose `started_at` is from the earlier attempt: before `created_at`.
-            2: [job("Test (macOS ARM64) (cli-gated)", 5, -50, 30)],
+            # A re-run attempt's job whose `started_at` is from the earlier attempt.
+            2: [job("Test (macOS ARM64) (cli-gated)", 5, -50, 30, attempt=2)],
         }
         text = ci_load_report.report(windows, runs, jobs)
         self.assertIn("| 0-1 | n=1, mean 2.0, p90 2.0, 100% over 1 min |", text)
         self.assertNotIn("cli-gated", text)
+
+    def test_a_later_attempts_copy_of_a_job_is_not_counted_twice(self):
+        windows = [("w", at(0), at(60))]
+        original = job("Test (macOS ARM64) (simd)", 0, 1, 30)
+        copy = dict(original, run_attempt=2, created_at=stamp(20))
+        runs = [run(1, created=0, attempt=2), run(2, created=25)]
+        jobs = {1: [copy, original], 2: [job("Test (macOS ARM64) (simd)", 25, 26, 40)]}
+        self.assertIn("| 0-1 | n=2, mean 1.0, p90 1.0, 0% over 1 min |", ci_load_report.report(windows, runs, jobs))
+        self.assertEqual(ci_load_report.unique_jobs([copy, original]), [original])
+        # Two jobs that never started are not copies of each other.
+        queued = job("x", 0, None, None, conclusion=None)
+        self.assertEqual(len(ci_load_report.unique_jobs([queued, dict(queued, run_attempt=2)])), 2)
+
+    def test_a_queued_job_counts_as_load(self):
+        windows = [("w", at(0), at(60))]
+        runs = [run(1, created=0, status="in_progress"), run(2, created=10)]
+        jobs = {1: [job("Test (macOS ARM64) (simd)", 0, None, None, conclusion=None)] * 2,
+                2: [job("Test (macOS ARM64) (simd)", 10, 12, 20)]}
+        self.assertIn("| 2-3 | n=1, mean 2.0,", ci_load_report.report(windows, runs, jobs))
+
+
+class FetchTest(unittest.TestCase):
+    def test_runs_repeated_across_pages_are_kept_once(self):
+        page1 = {"workflow_runs": [dict(run(i), status="completed") for i in range(100)]}
+        page2 = {"workflow_runs": [dict(run(99), status="completed"), dict(run(100), status="completed")]}
+        with mock.patch.object(ci_load_report, "gh_json", side_effect=[page1, page2]):
+            runs = ci_load_report.list_runs("ci.yml", at(0), at(60))
+        self.assertEqual(sorted(r["id"] for r in runs), list(range(101)))
+
+    def test_jobs_are_cached_per_attempt_once_the_run_completed(self):
+        body = {"total_count": 1, "jobs": [dict(job("simd", 0, 1, 2), id=7, extra="x")]}
+        with tempfile.TemporaryDirectory() as cache:
+            os.makedirs(os.path.join(cache, "jobs"))
+            with mock.patch.object(ci_load_report, "gh_json", return_value=body) as gh:
+                # A run still in progress: its `needs:`-gated jobs may not exist yet.
+                ci_load_report.fetch_jobs(run(5, status="in_progress"), cache)
+                self.assertEqual(os.listdir(os.path.join(cache, "jobs")), [])
+                self.assertIn("filter=all", gh.call_args.args[0])
+                ci_load_report.fetch_jobs(run(5), cache)
+                ci_load_report.fetch_jobs(run(5), cache)
+                self.assertEqual(gh.call_count, 2)
+                # A re-run is another attempt, so another cache entry.
+                ci_load_report.fetch_jobs(run(5, attempt=2), cache)
+                self.assertEqual(gh.call_count, 3)
+            self.assertEqual(sorted(os.listdir(os.path.join(cache, "jobs"))), ["5-1.json", "5-2.json"])
+            with open(os.path.join(cache, "jobs", "5-1.json")) as f:
+                self.assertEqual(set(json.load(f)[0]), set(ci_load_report.JOB_FIELDS))
 
 
 if __name__ == "__main__":

@@ -25,8 +25,9 @@ Definitions:
 - a macOS job is one whose labels name a `macos` runner.
 
 Run-level rows count successful first-attempt runs with at least one macOS job, so a
-cancelled or re-run run does not stretch a percentile; queue-wait and leg rows count the
-jobs of first attempts, since a re-run's jobs can carry an earlier attempt's timestamps. Needs `gh` (authenticated).
+cancelled or re-run run does not stretch a percentile; queue-wait and leg rows count
+first-attempt jobs, since a re-run's jobs can carry an earlier attempt's timestamps. A job
+still queued or running holds its slot to the end of the report. Needs `gh` (authenticated).
 Jobs of a run whose jobs had all completed are cached in `--cache` and never refetched.
 Standard library only.
 """
@@ -50,7 +51,10 @@ WORKFLOWS = ("ci.yml", "scheduled.yml", "release.yml")
 REPORTED_WORKFLOW = "ci.yml"
 EVENTS = ("merge_group", "pull_request")
 BUCKETS = ("0-1", "2-3", "4-5", "6-8", "9+")
-JOB_FIELDS = ("name", "status", "conclusion", "created_at", "started_at", "completed_at", "labels")
+JOB_FIELDS = ("name", "status", "conclusion", "created_at", "started_at", "completed_at", "labels", "run_attempt")
+RUN_FIELDS = ("id", "status", "event", "conclusion", "created_at", "run_attempt")
+# A job still queued or running holds its place in the load count until the report ends.
+NOT_YET = datetime.max.replace(tzinfo=timezone.utc)
 
 
 def parse_ts(text):
@@ -62,13 +66,14 @@ def minutes(start, end):
 
 
 def percentile(values, fraction):
-    """Nearest-rank percentile, as every #3649 table used."""
+    """The value at index `round(fraction * (n - 1))` of the sorted values: the method
+    every #3649 table used, kept so this report's figures compare with theirs."""
     ordered = sorted(values)
     return ordered[min(len(ordered) - 1, int(round(fraction * (len(ordered) - 1))))]
 
 
 def is_macos(job):
-    return any("macos" in label for label in job["labels"])
+    return any("macos" in label.lower() for label in job["labels"])
 
 
 def ran(job):
@@ -76,7 +81,32 @@ def ran(job):
 
 
 def holds_slot(job):
-    return job["conclusion"] != "skipped" and job["completed_at"] is not None
+    return job["conclusion"] != "skipped"
+
+
+def slot_end(job):
+    return parse_ts(job["completed_at"]) or NOT_YET
+
+
+def first_attempt(job):
+    return job.get("run_attempt", 1) == 1
+
+
+def unique_jobs(jobs):
+    """A run's jobs with a later attempt's copies of an earlier attempt's jobs dropped.
+
+    With `filter=all`, a re-run attempt can list a job it did not run again: same name,
+    `started_at` and `completed_at` as the earlier attempt's, and a later `created_at`.
+    Counting both would hold the slot twice."""
+    seen = set()
+    out = []
+    for job in sorted(jobs, key=lambda job: job.get("run_attempt", 1)):
+        key = (job["name"], job["started_at"], job["completed_at"])
+        if job["started_at"] is not None and key in seen:
+            continue
+        seen.add(key)
+        out.append(job)
+    return out
 
 
 def load_bucket(count):
@@ -149,7 +179,16 @@ def parse_window(text):
     since, _, until = span.partition("..")
     if not (name and since and until):
         raise argparse.ArgumentTypeError(f"expected NAME=SINCE..UNTIL, got {text!r}")
-    return name, parse_ts(since), parse_ts(until)
+    try:
+        since, until = parse_ts(since), parse_ts(until)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"{text!r}: {error}") from None
+    if since.tzinfo is None or until.tzinfo is None:
+        raise argparse.ArgumentTypeError(f"{text!r}: give a timezone, e.g. 2026-10-28T12:17:00Z")
+    since, until = since.astimezone(timezone.utc), until.astimezone(timezone.utc)
+    if since >= until:
+        raise argparse.ArgumentTypeError(f"{text!r}: the window ends before it starts")
+    return name, since, until
 
 
 def gh_json(path, attempts=4):
@@ -179,28 +218,31 @@ def list_runs(workflow, since, until):
                 f"?created={span}&per_page=100&page={page}"
             )
             for run in body["workflow_runs"]:
-                runs.append({key: run[key] for key in ("id", "event", "conclusion", "created_at", "run_attempt")}
-                            | {"workflow": workflow})
+                runs.append({key: run[key] for key in RUN_FIELDS} | {"workflow": workflow})
             if len(body["workflow_runs"]) < 100:
                 break
             page += 1
         day = end
-    return runs
+    # A run created while a day is being paged shifts the pages, so one can repeat.
+    return list({run["id"]: run for run in runs}.values())
 
 
-def fetch_jobs(run_id, cache):
-    path = os.path.join(cache, "jobs", f"{run_id}.json")
+def fetch_jobs(run, cache):
+    """Every attempt's jobs (`filter=all`): a re-run's earlier attempts held slots too.
+    Cached per attempt, and only once the run itself has completed, since a run's
+    `needs:`-gated jobs do not exist until their dependencies finish."""
+    path = os.path.join(cache, "jobs", f"{run['id']}-{run['run_attempt']}.json")
     if os.path.exists(path):
         with open(path) as f:
             return json.load(f)
     jobs, page = [], 1
     while True:
-        body = gh_json(f"repos/{REPO}/actions/runs/{run_id}/jobs?filter=latest&per_page=100&page={page}")
+        body = gh_json(f"repos/{REPO}/actions/runs/{run['id']}/jobs?filter=all&per_page=100&page={page}")
         jobs += [{key: job[key] for key in JOB_FIELDS} for job in body["jobs"]]
         if len(jobs) >= body["total_count"] or not body["jobs"]:
             break
         page += 1
-    if all(job["status"] == "completed" for job in jobs):
+    if run["status"] == "completed":
         with open(path + ".tmp", "w") as f:
             json.dump(jobs, f)
         os.replace(path + ".tmp", path)
@@ -213,7 +255,7 @@ def fetch(windows, margin_hours, cache, workers):
     until = max(w[2] for w in windows)
     runs = [run for workflow in WORKFLOWS for run in list_runs(workflow, since, until)]
     with concurrent.futures.ThreadPoolExecutor(workers) as pool:
-        jobs = dict(zip((run["id"] for run in runs), pool.map(lambda r: fetch_jobs(r["id"], cache), runs)))
+        jobs = dict(zip((run["id"] for run in runs), pool.map(lambda r: fetch_jobs(r, cache), runs)))
     return runs, jobs
 
 
@@ -260,10 +302,10 @@ def report(windows, runs, jobs):
             group = summaries[(name, event)]
             if not group:
                 continue
-            legs = collections.Counter(s["legs"] for s in group)
+            leg_counts = collections.Counter(s["legs"] for s in group)
             rows.append([
                 event, name, len(group),
-                ", ".join(f"{k}: {v}" for k, v in sorted(legs.items())),
+                ", ".join(f"{k}: {v}" for k, v in sorted(leg_counts.items())),
                 f"{fmt(percentile([s['wall'] for s in group], .5))} / {fmt(percentile([s['wall'] for s in group], .9))}",
                 fmt(statistics.mean(s["macos_min"] for s in group)),
                 fmt(statistics.mean(s["runner_min"] for s in group)),
@@ -279,18 +321,18 @@ def report(windows, runs, jobs):
             for day, walls in sorted(by_day.items())]
     out.append("**`merge_group` wall-clock by day** (minutes)\n\n" + table(["day (UTC)", "n", "p50 / p90"], rows))
 
-    mac = [(run_id, job) for run_id, run_jobs in jobs.items() for job in run_jobs
+    mac = [(run_id, job) for run_id, run_jobs in jobs.items() for job in unique_jobs(run_jobs)
            if is_macos(job) and holds_slot(job)]
     in_flight = other_run_in_flight(
-        [(run_id, parse_ts(job["created_at"]), parse_ts(job["completed_at"])) for run_id, job in mac])
+        [(run_id, parse_ts(job["created_at"]), slot_end(job)) for run_id, job in mac])
     # A re-run attempt's jobs can carry an earlier attempt's `started_at` (up to an hour
-    # before their `created_at`), so only first attempts give queue-wait samples. Every
-    # attempt still counts towards load.
-    reported = {run["id"] for run in ci_runs if run.get("run_attempt", 1) == 1}
+    # before their `created_at`), so only first-attempt jobs give queue-wait samples.
+    # Every attempt still counts towards load.
+    reported = {run["id"] for run in ci_runs}
     waits = collections.defaultdict(list)
     legs = collections.defaultdict(list)
     for (run_id, job), count in zip(mac, in_flight):
-        if run_id not in reported or not ran(job):
+        if run_id not in reported or not first_attempt(job) or not ran(job):
             continue
         for name in run_windows[run_id]:
             waits[(name, load_bucket(count))].append(
