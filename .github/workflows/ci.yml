@@ -528,6 +528,15 @@ jobs:
   # bug that only that toolchain or macOS-only std behaviour exposes there (the #2123 class:
   # `target_arch = "aarch64"` test modules reached without `std`) is now caught only on
   # Linux ARM64. Re-adding a leg costs a slot per run; re-measure the queue first.
+  #
+  # The day after the drop against the day before it (#3649; 27 and 22 merge-group runs):
+  # macOS-minutes per run 45.6 -> 32.8, worst macOS queue wait per merge-group run p50
+  # 6.8 -> 0.1 / p90 13.8 -> 7.5 min, merge-group wall-clock p50 18.5 -> 17.2 / p90 28.0 ->
+  # 21.9. At equal load waits fell too (2-3 other macOS jobs in flight: mean 1.8 -> 0.6 min).
+  # Wall-clock p50 barely moved because the legs themselves grew: `cli-gated` ran 11.6 min
+  # (p50) over Oct 21-28 and 15.6 the day after, and macOS still finished last in 17 of 27
+  # merge-group runs. `scripts/ci-load-report.py` produces all of these figures; run it
+  # with a window before and after any change to this matrix.
   test-macos-arm:
     name: Test (macOS ARM64)
     needs: [gate, test-macos-arm-matrix]
