@@ -283,7 +283,13 @@ succinctly yq '.. | select(anchor != "")' file.yaml
 # Get style of scalars
 succinctly yq '.description | style' file.yaml
 # Output: "literal" (for block scalar |)
+
+# Expand every alias into a copy of its anchor's node, drop the anchors, expand `<<` merges
+succinctly yq 'explode(.)' file.yaml
 ```
+
+`explode(.)` is the only form of yq's `explode(f)` supported (#5483): a path other than `.` is a
+parse error, and `.a | explode(.)` is refused (a metadata write behind a navigation).
 
 ### Multi-Document Support
 

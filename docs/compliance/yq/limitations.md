@@ -6609,3 +6609,17 @@ When the paths cannot be resolved on the cursor (the left side errors, or a path
 `--eval-all` and `--slurp` evaluate through the owned-value route and are unchanged.
 A write that clears an anchor leaves yq's dangling `*name` alias behind, where succinctly expands it (the anchor soundness rule above), exactly as `.a anchor = ""` already does.
 Pinned by `tests/yq_cli/i5479.rs`, whose rows were captured from yq v4.53.3.
+
+## `explode(.)` is the only `explode(f)` ([#5483](https://github.com/rust-works/succinctly/issues/5483))
+
+yq's `explode(f)` expands every alias in the nodes `f` selects into a copy of its anchor's node, drops the anchors and expands `<<` merges.
+`explode(.)` parses here as `(.. | select(kind != "alias")) anchor = ""`: clearing every anchor makes the aliases that named one print as the nodes they stood for (`enforce_anchor_soundness`), and a write expands merges.
+Rows over a plain, a merge, a merge list, a nested, a sequence, a multi-document and an override document match yq v4.53.3.
+jq's own `explode` is the nullary string builtin and is unchanged; the call form only exists in yq mode.
+Three things differ from yq.
+A path other than `.` (`explode(.a)`, `explode(..)`) is a parse error: yq leaves the aliases outside the selected nodes alone and expands those inside whose anchor is outside, which this route has no way to do, and a wrong answer would be worse than the refusal.
+`.a | explode(.)` is refused by the existing rule that a metadata write cannot sit behind a navigation.
+The presentation of an expanded alias copy is lost: its flow style (`b: *x` over `a: &x {p: 1}` prints a block mapping where yq prints `b: {p: 1}`), its quotes (`b: *s` over `a: &s "q"` prints `b: q`) and its explicit tag (`a: &x !!str 1` prints `b: "1"`), the family tracked on [#2651](https://github.com/rust-works/succinctly/issues/2651), and a comment after the alias moves with it.
+The value is the same each time; only how it is written differs.
+The `alias` getter and `alias =` setter, the rest of yq's anchor/alias operators, are still undefined.
+Pinned by `tests/yq_cli/i5483.rs`, whose rows were captured from yq v4.53.3.
