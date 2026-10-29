@@ -166,7 +166,8 @@ mod tests {
         let mut b = sample();
         b["features"]["rows"][0]["note"] = json!("/other/path");
         b["robust"][0]["subject_ms"] = json!(999.0);
-        assert!(diff(&fingerprint(&a), &fingerprint(&b)).is_empty());
+        let none: Vec<String> = vec![];
+        assert_eq!(diff(&fingerprint(&a), &fingerprint(&b)), none);
     }
 
     /// The check must be able to fail: each kind of change is reported by id.
