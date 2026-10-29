@@ -110,6 +110,11 @@ pub struct YamlIndex<W = Vec<u64>> {
     /// other document separator, so the CLI clears this once after `build`.
     /// Carried here for the same reason as `canonicalize_numbers` above.
     header_doc_markers: bool,
+    /// Whether a mapping's rendering expands only an alias-valued `<<` source (#4987), as real
+    /// yq's does; set by [`Self::render_merges_through_aliases_only`]. Off by default: the
+    /// merged view then lists an inline-mapping source's keys too. Carried here for the same
+    /// reason as `canonicalize_numbers` above.
+    merge_rendering_aliases_only: bool,
     /// Whether any node carries a standalone head/foot comment (#2795).
     /// The streaming emitter consults this once per node before looking up
     /// either list, so a comment-free document -- the common case, and the
@@ -231,6 +236,7 @@ impl YamlIndex<Vec<u64>> {
             lines: OnceCell::new(),
             canonicalize_numbers: false,
             header_doc_markers: true,
+            merge_rendering_aliases_only: false,
             yq_header: OnceCell::new(),
             text_is_ascii: OnceCell::new(),
             may_have_merge_keys: OnceCell::new(),
@@ -305,6 +311,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             lines: OnceCell::new(),
             canonicalize_numbers: false,
             header_doc_markers: true,
+            merge_rendering_aliases_only: false,
             yq_header: OnceCell::new(),
             text_is_ascii: OnceCell::new(),
             may_have_merge_keys: OnceCell::new(),
@@ -385,6 +392,22 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     /// call once right after `build`, before streaming through any cursor.
     pub fn suppress_header_doc_markers(&mut self) {
         self.header_doc_markers = false;
+    }
+
+    /// Make a mapping's rendering (`-o json`, `tojson`, a value nested in another) expand only the
+    /// `<<` sources spelled as an alias, as real yq's does (#4987): an inline mapping, an anchored
+    /// inline mapping and `{q: *a}` contribute nothing to it, while a lookup (`.item.q`) and an
+    /// iteration (`.[]`) still see their keys. This is `succinctly yq`'s rule; `succinctly jq`
+    /// has no reference that drops them, so call this once right after `build`, from the yq
+    /// runner only, before streaming through any cursor.
+    pub fn render_merges_through_aliases_only(&mut self) {
+        self.merge_rendering_aliases_only = true;
+    }
+
+    /// Whether [`Self::render_merges_through_aliases_only`] was called.
+    #[inline]
+    pub(crate) fn merge_rendering_aliases_only(&self) -> bool {
+        self.merge_rendering_aliases_only
     }
 
     /// Whether [`Self::suppress_header_doc_markers`] was *not* called.

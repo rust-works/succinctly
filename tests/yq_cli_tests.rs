@@ -9584,12 +9584,18 @@ fn test_yaml_merge_key_override() -> Result<()> {
 /// `merge_field_into`'s `source.first_child()` read the wrapper's one
 /// child - the mapping node itself - in place of its first key, silently
 /// dropping every field the bare-dash source would have contributed.
+///
+/// The source is a mapping written in place, so yq's JSON rendering leaves it out (`{"c":3}`, #4987) while the
+/// iteration still lists its keys: the keys below are what show the source was found. Both captured from yq v4.53.3.
 #[test]
 fn test_yaml_merge_key_bare_dash_deferred_source_expands_712_835() -> Result<()> {
     let input = "item:\n  <<:\n    -\n      a: 1\n      b: 2\n  c: 3\n";
     let (output, exit_code) = run_yq_stdin(".item", input, &["-o", "json", "-I0"])?;
     assert_eq!(exit_code, 0);
-    assert_eq!(output.trim(), r#"{"a":1,"b":2,"c":3}"#);
+    assert_eq!(output.trim(), r#"{"c":3}"#);
+    let (output, exit_code) = run_yq_stdin("[.item|.[]|key]", input, &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"["a","b","c"]"#);
     Ok(())
 }
 
