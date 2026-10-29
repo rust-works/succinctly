@@ -12,7 +12,9 @@
 //! single shared definition, used by both runners, closes that off by
 //! construction rather than by convention.
 
-use succinctly::jq::eval_generic::path_context_pipe_streams_cursors;
+use succinctly::jq::eval_generic::{
+    path_context_pipe_streams_cursors, recurse_cond_streams_cursors,
+};
 use succinctly::jq::{Builtin, Expr};
 
 /// Check if an expression can use the M2 streaming path.
@@ -175,6 +177,13 @@ pub fn can_use_m2_streaming(expr: &Expr) -> bool {
         // duplicate mapping key inside a node that yq prints intact (#1344).
         // `recurse`/`recurse_down` are the same walk (#3719).
         Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => true,
+
+        // `recurse(.[]?; cond)` for a `cond` yielding at most one value is `..` pruned: each node
+        // it keeps is its own live cursor (#3867, #4095), so it streams the same way. Without this
+        // arm the DOM path copied every node's whole subtree again at output time -- 1.9 times
+        // `recurse(.[]?; true)`'s time and 2.2 times its memory over a 1 MB document -- and
+        // printed an alias or a flow collection expanded where `..` keeps its spelling.
+        Expr::Builtin(Builtin::RecurseCond(f, cond)) => recurse_cond_streams_cursors(f, cond),
 
         // Everything else requires OwnedValue
         _ => false,

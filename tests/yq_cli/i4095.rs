@@ -169,6 +169,92 @@ fn test_recurse_cond_that_raises_reaches_a_position_stage_4095() -> Result<()> {
     Ok(())
 }
 
+/// A `cond` that compares `.` with a literal is decided from the node's kind for a container
+/// (`shallow_cond_verdict`), without copying the container to compare it. Each row is pinned to
+/// the same `cond` spelled so the general route takes it (`. | cond`), on documents holding every
+/// kind of node, an alias and a duplicate key.
+#[test]
+fn test_recurse_cond_comparison_agrees_with_the_general_route_4095() -> Result<()> {
+    for doc in [TREE, ALIAS_DOC] {
+        for cond in [
+            ". != null",
+            ". == null",
+            ". != 1",
+            ". == \"s\"",
+            "null != .",
+            ". == 1 | not",
+            ". != null and . != 2",
+            ". == null or . == 3.5",
+            "(. != null)",
+            "true",
+            "false",
+            ".",
+        ] {
+            for tail in ["| tojson", "| path", "| key"] {
+                let want = run(&format!("[recurse(.[]?; . | ({cond})) {tail}]"), doc)?;
+                let got = run(&format!("[recurse(.[]?; {cond}) {tail}]"), doc)?;
+                assert_eq!(got, want, "`{cond}` {tail}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `first`/`limit` stop the position walk where jq stops: a `cond` is not asked of a node the
+/// consumer never reached, so an effect in it (`debug`) does not run for those nodes.
+#[test]
+fn test_recurse_cond_stops_asking_cond_when_the_consumer_stops_4095() -> Result<()> {
+    for filter in [
+        "[limit(1; recurse(.[]?; debug | true) | path)]",
+        "[first(recurse(.[]?; debug | true) | key)]",
+        "[limit(1; recurse(.[]?; debug | true))] | length",
+    ] {
+        let (_, stderr, code) = run_yq_stdin_with_stderr(filter, TREE, ARGS)?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(
+            stderr.matches("DEBUG").count(),
+            0,
+            "`{filter}` -- {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A `?` around the walk still suppresses an error `cond` raises, over a computed value as over a
+/// document: the nodes before the error are kept and the rest of the walk is dropped.
+#[test]
+fn test_recurse_cond_optional_suppresses_a_raising_cond_4095() -> Result<()> {
+    let cond = r#"if type == "!!int" then error("boom") else true end"#;
+    for filter in [
+        format!("[recurse(.[]?; {cond})? | tojson] | length"),
+        format!("{{a: [1, {{b: 2}}]}} | [recurse(.[]?; {cond})? | path] | length"),
+        format!("{{a: [1, {{b: 2}}]}} | [recurse(.[]?; {cond})? | key] | length"),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(&filter, TREE, ARGS)?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert!(!stderr.contains("boom"), "`{filter}` -- {stderr:?}");
+        assert!(!stdout.trim().is_empty(), "`{filter}` produced nothing");
+    }
+    Ok(())
+}
+
+/// The default (YAML) output of a bare walk is rendered from each kept node's own cursor, as
+/// `..`'s is: an alias, a flow collection and a comment keep their spelling, and the walk does not
+/// copy every node's subtree again at output time (twice `..`'s memory before the M2 gate took it).
+#[test]
+fn test_recurse_cond_yaml_output_is_rendered_like_recursive_descent_4095() -> Result<()> {
+    let doc = "base: &b {x: 1}\ne: [*b, 2] # tail\nf: {k: [1, 2]}\n";
+    let args = ["--jq-extensions"];
+    let (want, e1, c1) = run_yq_stdin_with_stderr("..", doc, &args)?;
+    assert_eq!(c1, 0, "stderr: {e1:?}");
+    for filter in ["recurse(.[]?; true)", "recurse(.[]?; . != null)"] {
+        let (got, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &args)?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(got, want, "`{filter}`");
+    }
+    Ok(())
+}
+
 /// A value-only consumer of the walk is unchanged: the cursor walk and the owned walk it
 /// replaced list the same nodes in the same order, and a `cond` that raises does so after the
 /// earlier siblings' subtrees were delivered.
