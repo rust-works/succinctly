@@ -23,9 +23,10 @@ use std::rc::Rc;
 use std::string::ToString;
 
 use super::encode_style::{
-    go_yaml_explicit_key_scalar, go_yaml_key_is_simple, go_yaml_multiline_scalar,
-    go_yaml_unicode_separator_scalar, has_unwritable_char, has_unwritable_char_in_block,
-    write_go_yaml_double_quoted, write_go_yaml_single_quoted, write_go_yaml_string,
+    flow_plain_needs_single_quotes, go_yaml_explicit_key_scalar, go_yaml_key_is_simple,
+    go_yaml_multiline_scalar, go_yaml_unicode_separator_scalar, has_unwritable_char,
+    has_unwritable_char_in_block, write_go_yaml_double_quoted, write_go_yaml_single_quoted,
+    write_go_yaml_string,
 };
 use super::index::YamlIndex;
 use super::line_break::{blank_line_between, is_line_break, line_break_len, line_break_len_before};
@@ -2066,6 +2067,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     self.index.canonicalize_numbers(),
                     Undecodable::Raise,
                     block,
+                    false,
                 )
             }
             YamlValue::Mapping(_) => {
@@ -2116,7 +2118,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         if i != 0 {
                             out.write_str(", ")?;
                         }
-                        write_yaml_field_key(out, field)?;
+                        write_yaml_field_key(out, field, true)?;
                         out.write_str(": ")?;
                         write_yaml_child_inline(
                             out,
@@ -9303,6 +9305,7 @@ fn compact_yaml_indent(indent: &str) -> String {
 fn write_yaml_field_key<W: AsRef<[u64]>, Out: core::fmt::Write>(
     out: &mut Out,
     field: YamlField<'_, W>,
+    flow: bool,
 ) -> StreamResult {
     if let Some(anchor) = field.key_cursor().anchor() {
         out.write_char('&')?;
@@ -9333,6 +9336,7 @@ fn write_yaml_field_key<W: AsRef<[u64]>, Out: core::fmt::Write>(
             field.key_cursor().index.canonicalize_numbers(),
             Undecodable::PreserveEmpty,
             None,
+            flow,
         )
     } else {
         Ok(stream_yaml_nonstring_key(out, &key)?)
@@ -9379,7 +9383,7 @@ fn write_yaml_block_field_key<W: AsRef<[u64]>, Out: core::fmt::Write>(
             }
         }
     }
-    write_yaml_field_key(out, field)?;
+    write_yaml_field_key(out, field, false)?;
     Ok(false)
 }
 
@@ -9414,7 +9418,7 @@ fn write_yaml_block_field_key_checked<W: AsRef<[u64]>, Out: core::fmt::Write>(
                     .is_ok_and(|decoded| !go_yaml_key_is_simple(&decoded))
             {
                 out.write_str("? ")?;
-                write_yaml_field_key(out, field)?;
+                write_yaml_field_key(out, field, false)?;
                 out.write_char('\n')?;
                 out.write_str(indent)?;
                 return Ok(true);
@@ -9538,6 +9542,25 @@ fn write_yaml_child_inline<W: AsRef<[u64]>, Out: core::fmt::Write>(
                     return Ok(out.write_str(&scalar)?);
                 }
             }
+        }
+    }
+    // #5467: a plain scalar holding a `:` or `?` is single-quoted here, as go-yaml's emitter
+    // does in flow context; the tag, which `stream_yaml_value_at`'s scalar arm would have
+    // written, goes first. Every other scalar goes through that arm unchanged.
+    if let Some(YamlValue::String(string @ YamlString::Unquoted { .. })) = &resolved {
+        if string.raw_bytes().iter().any(|&b| b == b':' || b == b'?') {
+            if let Some(tag) = value.explicit_tag_at(None) {
+                out.write_str(tag)?;
+                out.write_char(' ')?;
+            }
+            return stream_yaml_string_value(
+                out,
+                string,
+                value.index.canonicalize_numbers(),
+                Undecodable::Raise,
+                None,
+                true,
+            );
         }
     }
     value.stream_yaml_value_at(resolved, out, "", 0, unit, sort_keys, false)
@@ -10631,12 +10654,17 @@ fn widen_folded_breaks(decoded: &str, explicit_indent_used: bool) -> Cow<'_, str
 /// output -- this arm just didn't have any type-resolution logic to begin
 /// with (a genuine YAML plain scalar echoes verbatim by design, #918/#836),
 /// so the fix is to add it rather than bypass existing arms.
+///
+/// `flow` is whether the scalar sits inside `[...]` or `{...}` (an entry or a key of one):
+/// go-yaml's emitter writes a plain scalar holding a `:` or `?` there single-quoted, so the
+/// verbatim echo of the `Unquoted` arm does the same (#5467).
 fn stream_yaml_string_value<Out: core::fmt::Write>(
     out: &mut Out,
     s: &YamlString<'_>,
     canonicalize: bool,
     undecodable: Undecodable,
     block: Option<(&str, usize)>,
+    flow: bool,
 ) -> StreamResult {
     // Try to get the string value. Decoded exactly once, whichever policy
     // applies: the `Err` arm below is the *only* decode-failure check on this
@@ -10716,6 +10744,11 @@ fn stream_yaml_string_value<Out: core::fmt::Write>(
                 || starts_seq_entry(str_val.as_bytes(), 0)
             {
                 Ok(write_go_yaml_double_quoted(out, &str_val)?)
+            } else if flow
+                && str_val.bytes().any(|b| matches!(b, b':' | b'?'))
+                && flow_plain_needs_single_quotes(&str_val)
+            {
+                Ok(write_go_yaml_single_quoted(out, &str_val)?)
             } else {
                 Ok(out.write_str(&str_val)?)
             }
