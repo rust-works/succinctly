@@ -17325,9 +17325,12 @@ fn builtin_length<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // (#3597), so its text is the rendering that is measured there too.
                 // #1071: a document `.INF`/`.NaN` crossed the bridge as a token; its text is
                 // the spelling it carried, not the token.
-                let width = match n.bridge_nonfinite_literal() {
-                    Some(literal) => literal.chars().count(),
-                    None => String::from_utf8_lossy(n.raw_bytes()).chars().count(),
+                // #2802: likewise a scalar written in a non-JSON spelling (`0x1f`, `~`, `True`):
+                // yq measures the text, not the token that carried it.
+                let width = match (n.bridge_nonfinite_literal(), n.bridge_spelling()) {
+                    (Some(literal), _) => literal.chars().count(),
+                    (None, Some(spelling)) => spelling.chars().count(),
+                    (None, None) => String::from_utf8_lossy(n.raw_bytes()).chars().count(),
                 };
                 QueryResult::Owned(OwnedValue::Int(width as i64))
             } else if let Ok(i) = n.as_i64() {
@@ -128145,6 +128148,35 @@ mod tests {
             assert!(
                 matches!(result, QueryResult::Owned(OwnedValue::Bool(true))),
                 "{token} | {filter} as bridge text: {result:?}"
+            );
+        }
+    }
+
+    /// #2802: a scalar the reindex bridge carried under its spelling token is measured by the
+    /// spelling it stands for (`0x1f` is 4, `True` is 4, `~` is 1), as yq measures the text -- not
+    /// by the token's digits -- while the same bytes in a user document are a malformed number
+    /// that raises, like `9e999e999` beside it (#3034).
+    #[test]
+    fn test_length_of_a_bridge_spelling_token_measures_the_spelling_2802() {
+        for spelling in ["~", "True", "0x1f", "0o17", "+2.0", ".5", "007", "日本"] {
+            let token = crate::json::validate::spelling_token(spelling);
+            let bridge = format!("[{token}]");
+            let index = JsonIndex::build_reindex(bridge.as_bytes());
+            let expr = parse(".[0] | length").unwrap();
+            let result = eval_full::<Vec<u64>, YqSemantics>(&expr, index.root(bridge.as_bytes()));
+            assert!(
+                matches!(
+                    result,
+                    QueryResult::Owned(OwnedValue::Int(n)) if n == spelling.chars().count() as i64
+                ),
+                "{spelling} as bridge text: {result:?}"
+            );
+
+            let index = JsonIndex::build(bridge.as_bytes());
+            let result = eval_full::<Vec<u64>, YqSemantics>(&expr, index.root(bridge.as_bytes()));
+            assert!(
+                matches!(&result, QueryResult::Error(e) if e.is_decode_failure()),
+                "{token} as a document: {result:?}"
             );
         }
     }

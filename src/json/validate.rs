@@ -1447,6 +1447,74 @@ pub(crate) fn parse_nonfinite_literal_token(bytes: &[u8]) -> Option<&'static str
     crate::yaml::NONFINITE_LITERALS.get(index).copied()
 }
 
+/// The suffix [`spelling_token`] ends in: [`NONFINITE_LITERAL_TOKEN_SUFFIX`]'s doubled exponent
+/// marker, which `str::parse::<f64>()` and `::<i64>()` both reject. The same constant, not a copy:
+/// the leading digit alone keeps the two families apart.
+const SPELLING_TOKEN_SUFFIX: &str = NONFINITE_LITERAL_TOKEN_SUFFIX;
+
+/// The reindex bridge's spelling of a YAML scalar whose source text is **not JSON number
+/// syntax** (`0x1f`, `0o17`, `1_000`, `+5`, `.5`, `~`, `True`, #2802): `6`, the text's bytes as
+/// three decimal digits each, then [`SPELLING_TOKEN_SUFFIX`].
+///
+/// Bridge text is read back into an `OwnedValue`, so writing the canonical form (`16` for
+/// `0x1f`) loses the spelling yq echoes (`tostring`, `join`, `sort`, `to_entries |
+/// from_entries`), and writing the text as is breaks the span (`0x1f` ends at the `x`, so it
+/// crosses as `0`). This is the third token on the pattern of [`computed_float_token`] and
+/// [`nonfinite_literal_token`]:
+///
+/// - the doubled exponent marker makes `str::parse` reject it, so no document literal can spell
+///   the same bytes;
+/// - it starts with a digit and is drawn from `[0-9e]`, so the semi-index scanners capture it
+///   whole as a number span;
+/// - the leading `6` keeps it apart from the computed NaN (`9e999e999`, `9e999e999e<bits>`),
+///   infinity (`8e999e999`) and [`nonfinite_literal_token`] (`7<n>e999e999`) tokens, and it
+///   never ends in `e0`, [`computed_float_token`]'s suffix;
+/// - three digits per byte is a fixed width, so a text has exactly one token and the decode needs
+///   no length prefix. The text is not restricted to ASCII: a tag-forced scalar can be anything.
+///
+/// Only a number read through an index built over bridge text decodes one
+/// (`JsonNumber::bridge_spelling`, #3034); the same bytes in a user document stay an ordinary
+/// malformed number.
+#[must_use]
+#[cfg_attr(not(test), allow(dead_code))] // STYLE-0005: no spelled scalar exists to write yet (#2802); the reader below is live
+pub(crate) fn spelling_token(text: &str) -> String {
+    use core::fmt::Write;
+    let mut token = String::with_capacity(1 + text.len() * 3 + SPELLING_TOKEN_SUFFIX.len());
+    token.push('6');
+    for byte in text.bytes() {
+        // Infallible: writing to a `String`.
+        let _ = write!(token, "{byte:03}");
+    }
+    token.push_str(SPELLING_TOKEN_SUFFIX);
+    token
+}
+
+/// Decodes a [`spelling_token`], `None` for anything else -- the one definition of the shape,
+/// spelling only like [`parse_computed_float_token`].
+///
+/// Strict: only what [`spelling_token`] writes decodes (a leading `6`, the suffix, digits in
+/// whole triples each at most `255`, and bytes that are UTF-8), so the decode of a token and the
+/// token of a decode agree and a near-miss is never half-read.
+#[must_use]
+pub(crate) fn parse_spelling_token(bytes: &[u8]) -> Option<String> {
+    let digits = bytes
+        .strip_prefix(b"6")?
+        .strip_suffix(SPELLING_TOKEN_SUFFIX.as_bytes())?;
+    if digits.len() % 3 != 0 || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let text = digits
+        .chunks_exact(3)
+        .map(|triple| {
+            let value = u32::from(triple[0] - b'0') * 100
+                + u32::from(triple[1] - b'0') * 10
+                + u32::from(triple[2] - b'0');
+            u8::try_from(value).ok()
+        })
+        .collect::<Option<Vec<u8>>>()?;
+    String::from_utf8(text).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1487,6 +1555,105 @@ mod tests {
                 None,
                 "{bytes}"
             );
+        }
+    }
+
+    /// #2802: a scalar's spelling round-trips through its bridge token for every shape yq
+    /// resolves and then some -- and the token is never a number to `str::parse`, so no document
+    /// literal can spell it.
+    #[test]
+    fn spelling_token_round_trips_2802() {
+        for text in [
+            "~",
+            "Null",
+            "NULL",
+            "True",
+            "TRUE",
+            "False",
+            "yes",
+            "0x1f",
+            "0X1F",
+            "0o17",
+            "01",
+            "007",
+            "+5",
+            "+2.0",
+            "2.",
+            ".5",
+            "-.5",
+            "1_000",
+            "1e3",
+            "1E+3",
+            "-0x10",
+            "",
+            "a",
+            "é",
+            "日本",
+            "\u{1F600}",
+        ] {
+            let token = spelling_token(text);
+            assert!(
+                token.parse::<f64>().is_err() && token.parse::<i64>().is_err(),
+                "{token}"
+            );
+            assert!(!is_valid_number(token.as_bytes()), "{token}");
+            assert!(token.as_bytes()[0].is_ascii_digit(), "{token}");
+            assert!(
+                token.bytes().all(|b| b.is_ascii_digit() || b == b'e'),
+                "{token}"
+            );
+            assert_eq!(
+                parse_spelling_token(token.as_bytes()).as_deref(),
+                Some(text),
+                "{token}"
+            );
+        }
+        assert_eq!(spelling_token(""), "6e999e999");
+        assert_eq!(spelling_token("~"), "6126e999e999");
+        assert_eq!(spelling_token("0x1f"), "6048120049102e999e999");
+    }
+
+    /// #2802: nothing but a token decodes, and the token keeps clear of the other bridge tokens
+    /// in both directions -- each of theirs is rejected here, and this one is rejected by each of
+    /// theirs.
+    #[test]
+    fn parse_spelling_token_rejects_everything_else_2802() {
+        for text in [
+            // The other bridge tokens.
+            "9e999e999",
+            "8e999e999",
+            "-8e999e999",
+            "9e999e999e1",
+            "1e0e0",
+            "7e999e999",
+            "70e999e999",
+            // Near misses: no prefix, wrong prefix, no suffix, partial triple, non-digit,
+            // a triple past 255, a sign, bytes that are not UTF-8.
+            "126e999e999",
+            "7126e999e999",
+            "6126",
+            "6126e999e99",
+            "61e999e999",
+            "6126ee999e999",
+            "6256e999e999",
+            "6999e999e999",
+            "6-26e999e999",
+            "6+26e999e999",
+            "6 26e999e999",
+            "6126e999e999e999",
+            "6255e999e999",
+            "6195e999e999",
+            "",
+            "6",
+            "+6126e999e999",
+            "6126e999e9990",
+        ] {
+            assert_eq!(parse_spelling_token(text.as_bytes()), None, "{text}");
+        }
+        for text in ["", "~", "0x1f", "\u{1F600}"] {
+            let token = spelling_token(text);
+            assert_eq!(parse_nonfinite_literal_token(token.as_bytes()), None);
+            assert_eq!(parse_computed_float_token(token.as_bytes()), None);
         }
     }
 

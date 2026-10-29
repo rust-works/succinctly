@@ -938,8 +938,8 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
     /// a decNumber word, a bridge token, a malformed span -- takes the
     /// greedy span and asks
     /// [`number_span_decodes`](crate::json::validate::number_span_decodes),
-    /// after [`JsonNumber::bridge_value`], which alone may decode a bridge
-    /// token (#3034).
+    /// after [`JsonNumber::bridge_value`] and [`JsonNumber::bridge_spelling`],
+    /// which alone may decode a bridge token (#3034, #2802).
     #[inline]
     fn number_at(&self, text_pos: usize) -> StandardJson<'a, W> {
         let strict_end = strict_number_end(self.text, text_pos);
@@ -952,6 +952,7 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
         };
         if strict_end.is_some()
             || n.bridge_value().is_some()
+            || n.bridge_spelling().is_some()
             || crate::json::validate::number_span_decodes(&self.text[text_pos..end])
         {
             StandardJson::Number(n)
@@ -3073,6 +3074,22 @@ impl<'a> JsonNumber<'a> {
         crate::json::validate::parse_nonfinite_literal_token(self.raw_bytes())
     }
 
+    /// The source spelling of a YAML scalar this span stands for, if it is the reindex bridge's
+    /// token for one
+    /// ([`spelling_token`](crate::json::validate::spelling_token)) **and** it was read through
+    /// an index built over bridge text; `None` otherwise (#2802, #3034).
+    ///
+    /// An allocation, unlike [`bridge_nonfinite_literal`](Self::bridge_nonfinite_literal),
+    /// whose spellings are a fixed table: a spelling is whatever the scalar was written as.
+    /// It is the cold path, reached only for a bridge number that is not a plain one.
+    #[inline]
+    pub(crate) fn bridge_spelling(&self) -> Option<String> {
+        if !self.bridge {
+            return None;
+        }
+        crate::json::validate::parse_spelling_token(self.raw_bytes())
+    }
+
     /// The address of the token's first byte in the document text: the
     /// identity jq gives a NaN it parsed (#3309), since every read of one
     /// position answers the same address and no other live token does.
@@ -3083,7 +3100,7 @@ impl<'a> JsonNumber<'a> {
     /// so a document NaN gets the same instance whichever materializes it.
     #[must_use]
     pub fn token_address(&self) -> Option<usize> {
-        if self.bridge_value().is_some() {
+        if self.bridge_value().is_some() || self.bridge_spelling().is_some() {
             return None;
         }
         Some(self.raw_bytes().as_ptr() as usize)
@@ -4425,6 +4442,10 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
                 // the spelling the owned value carried.
                 if let Some(literal) = n.bridge_nonfinite_literal() {
                     return Some(Cow::Borrowed(literal));
+                }
+                // #2802: so does the token for a scalar written in a non-JSON spelling.
+                if let Some(spelling) = n.bridge_spelling() {
+                    return Some(Cow::Owned(spelling));
                 }
                 let bytes = n.raw_bytes();
                 if crate::json::validate::is_valid_number(bytes) {
@@ -10067,6 +10088,52 @@ mod tests {
             assert_eq!(n.as_i64(), Err(JsonError::InvalidNumber), "{token}");
             let number: StandardJson<'_, Vec<u64>> = StandardJson::Number(n);
             assert_eq!(number.number_literal(), None, "{token}");
+        }
+    }
+
+    /// #2802: the spelling token is one `Number` span the bridge's index decodes to its text
+    /// (`bridge_spelling`, `number_literal`), which has no numeric value and no document
+    /// address; a document spelling the same bytes decodes nothing and is no number (#3034).
+    #[test]
+    fn json_number_decodes_the_spelling_token_2802() {
+        for spelling in ["~", "True", "0x1f", "+2.0", ".5", "007", "日本"] {
+            let token = crate::json::validate::spelling_token(spelling);
+            let json = format!("[{token}]");
+            let bytes = json.as_bytes();
+            assert_eq!(nested_number_span(bytes, 1), 1 + token.len());
+            let index = JsonIndex::build_reindex(bytes);
+            let root = index.root(bytes);
+            let StandardJson::Array(mut items) = root.value() else {
+                panic!("expected an array");
+            };
+            let StandardJson::Number(n) = items.next().expect("one element") else {
+                panic!("expected a number");
+            };
+            assert_eq!(n.bridge_spelling().as_deref(), Some(spelling), "{token}");
+            assert_eq!(n.bridge_value(), None, "{token}");
+            assert_eq!(n.bridge_nonfinite(), None, "{token}");
+            assert_eq!(n.bridge_nonfinite_literal(), None, "{token}");
+            assert_eq!(n.token_address(), None, "{token}");
+            assert_eq!(n.as_f64(), Err(JsonError::InvalidNumber), "{token}");
+            let number: StandardJson<'_, Vec<u64>> = StandardJson::Number(n);
+            assert_eq!(
+                number.number_literal().as_deref(),
+                Some(spelling),
+                "{token}"
+            );
+
+            let user_index = JsonIndex::build(bytes);
+            assert!(
+                matches!(
+                    user_index
+                        .root(bytes)
+                        .first_child()
+                        .expect("one child")
+                        .value(),
+                    StandardJson::Error(MALFORMED_NUMBER)
+                ),
+                "{token} as a document"
+            );
         }
     }
 
