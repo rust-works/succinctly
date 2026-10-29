@@ -4053,12 +4053,13 @@ impl<'a> Parser<'a> {
                     // #4206: yq's `to_json` / `to_yaml`, each with an optional literal indent.
                     self.parse_yq_to_text_operator()
                 } else if self.mode == ParserMode::Yq && self.matches_keyword("array_to_map") {
-                    // #5458: yq's `array_to_map`: an array becomes a map keyed by index with its
-                    // null elements skipped, a map is itself, anything else is `{}`.
+                    // #5458: yq's `array_to_map`: an array becomes a map keyed by index and a map
+                    // keeps its entries, each with its null values skipped; a scalar is `{}`. An
+                    // alias has no tag of its own, so the test is on the node's kind.
                     self.consume_keyword("array_to_map");
                     let desugared = parse_with_mode_and_extensions(
-                        "if tag == \"!!seq\" then (to_entries | map(select(.value != null)) | from_entries) \
-                         elif tag == \"!!map\" then . else {} end",
+                        "if kind == \"scalar\" then {} \
+                         else try (to_entries | map(select(.value != null)) | from_entries) catch {} end",
                         ParserMode::Yq,
                         true,
                     )?;
