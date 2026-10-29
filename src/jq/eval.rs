@@ -95775,6 +95775,7 @@ fn builtin_alias<W: Clone + AsRef<[u64]>>(value: StandardJson<'_, W>) -> QueryRe
             crate::jq::document::DocumentValue::as_str(&value).map(std::borrow::Cow::into_owned)
         }
         StandardJson::Bool(b) => Some(b.to_string()),
+        StandardJson::Null => Some(String::from("null")),
         StandardJson::Number(_) => crate::jq::document::DocumentValue::number_text(&value)
             .map(std::borrow::Cow::into_owned)
             .or_else(|| crate::jq::document::DocumentValue::as_i64(&value).map(|n| n.to_string())),

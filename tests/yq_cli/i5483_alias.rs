@@ -118,6 +118,36 @@ fn test_alias_getter_matches_yq_5483() -> Result<()> {
             &[],
             "1\nx\n---\n2\ny\n",
         ),
+        (
+            "a: 5\n",
+            ".b | alias",
+            &[],
+            "null\n",
+        ),
+        (
+            "a: null\nb: 5\n",
+            ".a |= alias",
+            &[],
+            "a: \"null\"\nb: 5\n",
+        ),
+        (
+            "a: null\nb: 5\n",
+            "[.a, .b] | .[] | alias",
+            &[],
+            "null\n5\n",
+        ),
+        (
+            "a:\nb: 5\n",
+            ".a | alias",
+            &[],
+            "\n",
+        ),
+        (
+            "a: 5\n",
+            "null | alias",
+            &[],
+            "null\n",
+        ),
     ];
     for &(input, filter, args, want) in rows {
         let (out, code) = run_yq_stdin(filter, input, args)?;

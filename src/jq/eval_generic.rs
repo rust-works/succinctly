@@ -33621,6 +33621,9 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                     .or_else(|| value.number_text().map(Cow::into_owned))
                     .or_else(|| value.as_i64().map(|n| n.to_string()))
                     .or_else(|| value.as_bool().map(|b| b.to_string()))
+                    // An absent key (`.b | alias`) and a computed null are a `null` node, whose
+                    // `Value` is `null`; a cursor on an empty value (`a:`) is the empty string.
+                    .or_else(|| value.is_null().then(|| String::from("null")))
                     .unwrap_or_default(),
             };
             GenericResult::Owned(OwnedValue::String(text.into()))

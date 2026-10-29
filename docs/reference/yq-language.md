@@ -264,7 +264,7 @@ These functions access YAML-specific metadata not available in JSON:
 | `tag`      | YAML type tag                      | `!!str`, `!!int`, `!!map`               |
 | `type`     | Alias of `tag` in yq mode (#2516)  | `!!str`, `!!int`, `!!map`               |
 | `anchor`   | Anchor name for nodes with `&name` | `"myanchor"` or `""`                    |
-| `alias`    | Name an `*alias` refers to         | `"myanchor"` or `""`                    |
+| `alias`    | Node text; `*alias` anchor name    | `"myanchor"`, `"1.50"`, `""`            |
 | `style`    | Scalar/collection style            | `"double"`, `"literal"`, `"flow"`       |
 | `kind`     | Node kind                          | `"scalar"`, `"seq"`, `"map"`, `"alias"` |
 | `key`      | Current key when iterating         | `"name"` or `0`                         |
