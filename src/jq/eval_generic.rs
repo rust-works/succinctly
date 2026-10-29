@@ -1638,6 +1638,15 @@ fn resolved_scalar_to_owned<S: EvalSemantics>(
         {
             OwnedValue::Float(f)
         }
+        // #2802: likewise a spelled integer (`0x1f`, `01`, `+5`): yq echoes the spelling, jq
+        // reads the number.
+        OwnedValue::NumberLiteral(NumberRepr::Int(n), literal)
+            if S::TAG != EvalTag::Yq
+                && crate::yaml::spelled_int_json_text(&literal).is_some()
+                && !crate::json::validate::number_span_decodes(literal.as_bytes()) =>
+        {
+            OwnedValue::Int(n)
+        }
         other => other,
     }
 }
@@ -3420,6 +3429,13 @@ fn source_spelling<C: DocumentCursor>(
                 && (digits.len() == 1 || !digits.starts_with('0'))
                 && source != "-0"
                 && source.parse::<i64>() == Ok(*n)
+        }
+        // #2802: a spelled integer carries its text, and the side-tree keeps it too, where the
+        // YAML writer reads it back for a tag or a style written onto the node.
+        OwnedValue::NumberLiteral(NumberRepr::Int(_), literal)
+            if crate::yaml::spelled_int_json_text(literal).is_some() =>
+        {
+            false
         }
         OwnedValue::NumberLiteral(_, literal) => source == **literal,
         // A document `.inf`/`.nan` is a `NumberLiteral` since #1071 (matched above), so a bare

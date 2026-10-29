@@ -33,7 +33,7 @@ use super::line_break::{blank_line_between, is_line_break, line_break_len, line_
 use super::scalar::{
     could_be_null_or_bool, is_overflowed_int_literal, is_preservable_float_literal,
     preservable_float_literal_text, resolve_plain, resolve_plain_sourced, resolve_tagged,
-    whole_float_as_int, ResolvedScalar,
+    spelled_int_json_text, whole_float_as_int, ResolvedScalar,
 };
 use super::{starts_inline_seq_entry, starts_seq_entry};
 
@@ -8611,6 +8611,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
                     }
                     ResolvedScalar::Float(_) => {
                         preservable_float_literal_text(&str_val).map(Cow::Owned)
+                    }
+                    // #2802: a spelled integer (`0x1f`, `0o17`, `01`, `+5`) is the text the
+                    // document wrote, as a float's `2.0` is; a canonical one is just its value.
+                    ResolvedScalar::Int(_) if spelled_int_json_text(&str_val).is_some() => {
+                        Some(str_val)
                     }
                     _ => None,
                 }

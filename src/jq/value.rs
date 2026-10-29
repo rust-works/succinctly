@@ -3235,9 +3235,33 @@ impl OwnedValue {
             };
         }
         let Some(repr) = parse_i64_or_f64_in::<S>(&literal) else {
+            // #2802: `0x1f`/`0o17` is no JSON number, but it is an integer of a YAML document.
+            if let crate::yaml::ResolvedScalar::Int(n) = crate::yaml::resolve_plain(&literal) {
+                return Self::spelled_int::<S>(n, literal);
+            }
             return Self::Null;
         };
-        Self::NumberLiteral(repr, literal.into())
+        match repr {
+            // jq's own lenient literals (`007`, `+5`) stay literals in either mode.
+            NumberRepr::Int(n)
+                if S::TAG == EvalTag::Yq
+                    && crate::yaml::spelled_int_json_text(&literal).is_some() =>
+            {
+                Self::spelled_int::<S>(n, literal)
+            }
+            repr => Self::NumberLiteral(repr, literal.into()),
+        }
+    }
+
+    /// A YAML integer written other than the way it prints (`0x1f`, `0o17`, `01`, `+5`, #2802):
+    /// yq keeps the spelling it echoes. jq's number model has no `0x1f` literal and reads the
+    /// number, as it did before the spelling was kept.
+    pub(crate) fn spelled_int<S: EvalSemantics>(n: i64, spelling: Box<str>) -> Self {
+        if S::TAG == EvalTag::Yq {
+            Self::NumberLiteral(NumberRepr::Int(n), spelling.into())
+        } else {
+            Self::Int(n)
+        }
     }
 
     /// The reindex bridge's NaN/infinity tokens (#472/#1083), decoded to
@@ -3296,9 +3320,8 @@ impl OwnedValue {
             return Self::from_number_literal::<S>(literal);
         }
         // #2802: a scalar the bridge carried under its spelling token reads as that text, never
-        // as the token's digits. No value keeps a non-JSON spelling yet, so this is the literal
-        // parse of it (`0x1f` and `~` are `null` there, as for any text that is not a number)
-        // until the spelled variant lands; nothing writes the token before then.
+        // as the token's digits. Only a yq spelled integer is written under it so far, and
+        // `from_number_literal` keeps its spelling in yq mode.
         if let Some(spelling) = n.bridge_spelling() {
             return Self::from_number_literal::<S>(&spelling);
         }
@@ -3600,6 +3623,12 @@ impl OwnedValue {
             // `numeric_display_string`'s yq-mode arms always return before
             // reaching here for a `Float`).
             Self::Float(f) => Some(Cow::Owned(jq_bare_float_display(*f))),
+            // #2802: a spelled integer prints as the number it is in a message.
+            Self::NumberLiteral(NumberRepr::Int(n), literal)
+                if crate::yaml::spelled_int_json_text(literal).is_some() =>
+            {
+                Some(Cow::Owned(n.to_string()))
+            }
             Self::NumberLiteral(_, literal) => {
                 Some(Cow::Owned(format_number_jq_compat(literal.as_bytes())))
             }
@@ -4238,6 +4267,22 @@ impl OwnedValue {
                 out.push_str(&nan_instance_token(*f));
             }
             Self::Float(f) if f.is_infinite() => out.push_str(overflow_literal(*f)),
+            // #2802: yq's spelled integer (`0x1f`, `0o17`, `01`, `+5`) is no number text the
+            // bridge's reader keeps, so it crosses as the spelling token. jq mode never
+            // holds one, and its lenient `007` already reads back as itself.
+            Self::NumberLiteral(NumberRepr::Int(_), literal)
+                if S::TAG == EvalTag::Yq
+                    && crate::yaml::spelled_int_json_text(literal).is_some() =>
+            {
+                out.push_str(&crate::json::validate::spelling_token(literal));
+            }
+            // A bridge read in jq's number model (a path computed over a yq document) has no use
+            // for the spelling, and `0x1f` is no number there.
+            Self::NumberLiteral(NumberRepr::Int(n), literal)
+                if !crate::json::validate::number_span_decodes(literal.as_bytes()) =>
+            {
+                let _ = write!(out, "{n}");
+            }
             // The bridge must keep the source literal at every length.
             Self::NumberLiteral(_, literal) => out.push_str(literal),
             Self::Array(arr) => {

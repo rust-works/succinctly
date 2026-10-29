@@ -322,7 +322,7 @@ pub(crate) fn real_output_finite_literal(raw: &[u8]) -> String {
 pub(crate) fn yq_json_finite_literal(raw: &[u8]) -> String {
     core::str::from_utf8(raw)
         .ok()
-        .and_then(crate::yaml::overflowed_int_json_text)
+        .and_then(crate::yaml::yq_json_number_text)
         .unwrap_or_else(|| real_output_finite_literal(raw))
 }
 

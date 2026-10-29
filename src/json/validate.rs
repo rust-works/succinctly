@@ -1476,7 +1476,6 @@ const SPELLING_TOKEN_SUFFIX: &str = NONFINITE_LITERAL_TOKEN_SUFFIX;
 /// (`JsonNumber::bridge_spelling`, #3034); the same bytes in a user document stay an ordinary
 /// malformed number.
 #[must_use]
-#[cfg_attr(not(test), allow(dead_code))] // STYLE-0005: no spelled scalar exists to write yet (#2802); the reader below is live
 pub(crate) fn spelling_token(text: &str) -> String {
     use core::fmt::Write;
     let mut token = String::with_capacity(1 + text.len() * 3 + SPELLING_TOKEN_SUFFIX.len());

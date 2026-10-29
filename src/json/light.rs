@@ -3036,7 +3036,17 @@ impl<'a> JsonNumber<'a> {
     pub fn as_i64(&self) -> Result<i64, JsonError> {
         let bytes = self.raw_bytes();
         let s = core::str::from_utf8(bytes).map_err(|_| JsonError::InvalidUtf8)?;
-        s.parse().map_err(|_| JsonError::InvalidNumber)
+        s.parse().or_else(|_| {
+            // #2802: a spelled integer the bridge carried (`0x1f`) is the integer it spells.
+            match self
+                .bridge_spelling()
+                .as_deref()
+                .map(crate::yaml::resolve_plain)
+            {
+                Some(crate::yaml::ResolvedScalar::Int(n)) => Ok(n),
+                _ => Err(JsonError::InvalidNumber),
+            }
+        })
     }
 
     /// The value this span stands for if it is one of the reindex bridge's
@@ -3201,6 +3211,17 @@ impl<'a> JsonNumber<'a> {
         let s = core::str::from_utf8(bytes).map_err(|_| JsonError::InvalidUtf8)?;
         s.parse().or_else(|_| {
             self.bridge_value()
+                .or_else(|| {
+                    match self
+                        .bridge_spelling()
+                        .as_deref()
+                        .map(crate::yaml::resolve_plain)
+                    {
+                        // #2802: the number a spelled integer names.
+                        Some(crate::yaml::ResolvedScalar::Int(n)) => Some(n as f64),
+                        _ => None,
+                    }
+                })
                 .or_else(|| crate::json::validate::jq_special_number(bytes))
                 .ok_or(JsonError::InvalidNumber)
         })
@@ -10114,7 +10135,13 @@ mod tests {
             assert_eq!(n.bridge_nonfinite(), None, "{token}");
             assert_eq!(n.bridge_nonfinite_literal(), None, "{token}");
             assert_eq!(n.token_address(), None, "{token}");
-            assert_eq!(n.as_f64(), Err(JsonError::InvalidNumber), "{token}");
+            // The number a spelled integer names, and nothing for a spelling that is no number.
+            let named = match crate::yaml::resolve_plain(spelling) {
+                crate::yaml::ResolvedScalar::Int(i) => Some(i),
+                _ => None,
+            };
+            assert_eq!(n.as_i64().ok(), named, "{token}");
+            assert_eq!(n.as_f64().ok(), named.map(|i| i as f64), "{token}");
             let number: StandardJson<'_, Vec<u64>> = StandardJson::Number(n);
             assert_eq!(
                 number.number_literal().as_deref(),

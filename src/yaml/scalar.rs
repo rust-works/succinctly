@@ -130,6 +130,11 @@ impl ResolvedScalar {
         match self {
             Self::Null => OwnedValue::Null,
             Self::Bool(b) => OwnedValue::Bool(b),
+            // #2802: a spelled integer (`0x1f`, `0o17`, `01`, `+5`) keeps its text, as a float's
+            // `.5` or `2.0` does; the JSON writers ask for the number ([`spelled_int_json_text`]).
+            Self::Int(n) if spelled_int_json_text(&text).is_some() => {
+                OwnedValue::NumberLiteral(crate::jq::NumberRepr::Int(n), text.into_owned().into())
+            }
             Self::Int(n) => OwnedValue::Int(n),
             Self::Float(_) if is_preservable_float_literal(&text) => {
                 OwnedValue::from_number_literal::<YqSemantics>(&text)
@@ -501,6 +506,39 @@ pub fn overflowed_int_json_text(raw: &str) -> Option<String> {
     // Past `i64` is always past yq's scientific threshold, which is where its
     // JSON writer keeps the decimal point: `100000000000000000000.0`.
     Some(format_float_with_fraction(f))
+}
+
+/// What yq's JSON encoder writes for a spelled integer (#2802).
+///
+/// `None` when the text is already what it writes. `0x1f`, `0o17`, `01`, `007` and `+5` are
+/// the integers `31`, `15`, `1`, `7` and `5` there, but `tostring`, YAML output
+/// and the reindex bridge keep the text.
+///
+/// Mirrors [`overflowed_int_json_text`]: the text is the value's spelling, the
+/// JSON writers ask for the number. A canonical integer (`42`, `-7`, `0`) and
+/// any text with a `.` return before resolving anything, so a float literal and
+/// the ordinary integer pay a byte scan only.
+#[must_use]
+pub fn spelled_int_json_text(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let digits = bytes.strip_prefix(b"-").unwrap_or(bytes);
+    let plain_digits = digits.iter().all(u8::is_ascii_digit);
+    if (plain_digits && digits.first() != Some(&b'0')) || digits == b"0" || bytes.contains(&b'.') {
+        return None;
+    }
+    match resolve_plain(raw) {
+        ResolvedScalar::Int(n) => Some(alloc::format!("{n}")),
+        _ => None,
+    }
+}
+
+/// The number yq's JSON encoder writes for a literal whose text is not what it writes.
+///
+/// An integer past `i64` ([`overflowed_int_json_text`]) or a spelled one
+/// ([`spelled_int_json_text`]). `None` for every literal that is echoed.
+#[must_use]
+pub fn yq_json_number_text(raw: &str) -> Option<String> {
+    overflowed_int_json_text(raw).or_else(|| spelled_int_json_text(raw))
 }
 
 /// A normalized, JSON-safe equivalent spelling for `s`, for a `Float`
