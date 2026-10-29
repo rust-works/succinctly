@@ -80,39 +80,9 @@ category = "by-design"
 reason = "succinctly has no bytecode to trace; the flag is rejected (exit 2)."
 
 [[divergence]]
-id = "cli:long-binary"
-category = "to-triage"
-reason = "jq accepts `-b`/`--binary` (a no-op outside Windows); succinctly rejects it (exit 2)."
-issue = "#5474"
-
-[[divergence]]
-id = "cli:stream-errors"
-category = "to-triage"
-reason = "`--stream-errors` is not accepted (exit 2); jq 1.7.1 emits `[message, path]` for a truncated input."
-issue = "#5474"
-
-[[divergence]]
 id = "cli:stream-slurp"
 category = "to-triage"
 reason = "`--stream -s` : jq 1.7.1 prints the stream's closing event as a separate value (`[[1]]`); succinctly folds it into the one slurped array."
-
-[[divergence]]
-id = "cli:color"
-category = "to-triage"
-reason = "`-C` colour escapes differ: jq 1.7.1 emits no reset after an opening bracket or comma, succinctly resets after each token."
-issue = "#5473"
-
-[[divergence]]
-id = "cli:color-pretty"
-category = "to-triage"
-reason = "Same colour-escape difference as `cli:color`, in pretty-printed output."
-issue = "#5473"
-
-[[divergence]]
-id = "cli:jq-colors"
-category = "to-triage"
-reason = "Same colour-escape difference as `cli:color`, for an array holding null."
-issue = "#5473"
 
 [[divergence]]
 id = "cli:exit-error-continues"
