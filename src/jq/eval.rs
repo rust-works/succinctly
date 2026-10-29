@@ -80582,12 +80582,15 @@ pub(crate) fn fold_loop_variable_is_marked<S: EvalSemantics>(
 
 /// Whether a fold's container loop variables are substituted as storage-sharing
 /// markers so that jq's `jv_equal` identity check can see them (#3896): jq mode,
-/// and a fold whose UPDATE or EXTRACT both reads a loop variable and can compare
-/// it by value ([`loop_var_can_be_compared`]).
+/// and a fold whose UPDATE or EXTRACT reads a loop variable where it can be
+/// compared by value ([`loop_var_can_be_compared`]) or handed out of the step
+/// ([`loop_var_can_reach_output`], #5516).
 ///
 /// jq binds `$a` to one `jv` and reads it twice, so `reduce ([nan]) as $a (0;
 /// $a == $a)` is `true`; a rebuilt literal per `$a` is two allocations, and a
-/// NaN-bearing container is then unequal to itself. Independent of
+/// NaN-bearing container is then unequal to itself. The same holds for a step
+/// whose output is the variable and a comparison after the fold: `last($a) ==
+/// $a` is `reduce $a as $x (null; $x) == $a` (#5377). Independent of
 /// [`fold_loop_variable_is_marked`]: it needs no path read, no anchor scope, and
 /// holds on every INIT fork (a constant source is shared on each), and it never
 /// registers INIT's `Rc` -- the marker's storage is the element's own, which
@@ -80601,9 +80604,95 @@ pub(crate) fn fold_loop_variable_shares_identity<S: EvalSemantics>(
         return false;
     }
     let names = pattern_alternatives_var_names(patterns);
-    !names.is_empty()
-        && (loop_var_can_be_compared(update, &names)
-            || extract.is_some_and(|extract| loop_var_can_be_compared(extract, &names)))
+    let shares = |expr: &Expr| {
+        loop_var_can_be_compared(expr, &names) || loop_var_can_reach_output(expr, &names)
+    };
+    !names.is_empty() && (shares(update) || extract.is_some_and(shares))
+}
+
+/// Whether `expr` reads one of `names` where the read can become the step's
+/// output, or part of it (#5516): `$a`, `$a | .`, `$a[0]`, `[$a]`, `$a // 0`, an
+/// `if` branch. jq hands the element itself on, so `[nan] as $a | reduce $a as $x
+/// (null; $x) == $a` is `true`, and a rebuilt literal is a new container.
+///
+/// The positions read by value are left out, each for the reason
+/// [`loop_var_can_be_compared`] leaves an assignment out: an assignment and
+/// arithmetic, whose closed right-hand side is `owned_assign_step`'s and
+/// `owned_arith_accumulator_shape`'s in-place step, which a container marker
+/// makes decline (`. + [$a]`, `.x = $a` therefore still rebuild); an `if`'s
+/// condition, where one makes `owned_if_step` decline; and a comparison, `and`
+/// and `or`, whose answer is a boolean.
+///
+/// A binder's source reaches the output only through the names it binds: `$r as
+/// $s | .[$s.name] = $s.score` and `reduce $r.tags[] as $t (.; .[$t] += 1)` hand
+/// nothing on, so the names join the search of the body (and of a fold's UPDATE
+/// and EXTRACT) instead, and the in-place step they feed keeps its unmarked
+/// operands. Everything else over-approximates, at no cost beyond skipping the
+/// rebuild.
+fn loop_var_can_reach_output(expr: &Expr, names: &[String]) -> bool {
+    // `bodies`, searched for `names` plus `bound` when `source` reads one of `names`.
+    let through_binder = |source: &Expr, bound: &[Pattern], bodies: &[Option<&Expr>]| {
+        let reads = any_subexpr(
+            source,
+            &mut |n| matches!(n, Expr::Var(v) if names.iter().any(|name| name == v)),
+        );
+        let mut wider = names.to_vec();
+        if reads {
+            for pattern in bound {
+                collect_pattern_var_names(pattern, &mut wider);
+            }
+        }
+        bodies
+            .iter()
+            .flatten()
+            .any(|body| loop_var_can_reach_output(body, &wider))
+    };
+    let visit = |found: bool| if found { Visit::Found } else { Visit::Skip };
+    search_subexpr(expr, &mut |e| match e {
+        Expr::Var(v) if names.iter().any(|name| name == v) => Visit::Found,
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => visit(
+            loop_var_can_reach_output(then_branch, names)
+                || loop_var_can_reach_output(else_branch, names),
+        ),
+        Expr::As { expr, var, body } => visit(through_binder(
+            expr,
+            &[Pattern::Var(var.clone())],
+            &[Some(body)],
+        )),
+        Expr::AsPattern {
+            expr,
+            patterns,
+            body,
+        } => visit(through_binder(expr, patterns, &[Some(body)])),
+        Expr::Reduce {
+            input,
+            patterns,
+            init,
+            update,
+        } => visit(
+            loop_var_can_reach_output(init, names)
+                || through_binder(input, patterns, &[Some(update)]),
+        ),
+        Expr::Foreach {
+            input,
+            patterns,
+            init,
+            update,
+            extract,
+        } => visit(
+            loop_var_can_reach_output(init, names)
+                || through_binder(input, patterns, &[Some(update), extract.as_deref()]),
+        ),
+        Expr::Arithmetic { .. } | Expr::Compare { .. } | Expr::And(..) | Expr::Or(..) => {
+            Visit::Skip
+        }
+        _ if is_assignment_expr(e) => Visit::Skip,
+        _ => Visit::Descend,
+    })
 }
 
 /// Whether `expr` reads one of `names` *and* holds a node that can run jq's
@@ -102201,8 +102290,9 @@ mod tests {
     }
 
     /// #3896: a fold shares its container loop variables' storage only where its
-    /// UPDATE or EXTRACT both reads one and can compare it by value, and never in
-    /// yq mode. An assignment's path and right-hand side keep the in-place step
+    /// UPDATE or EXTRACT both reads one and can compare it by value, or (#5516) can
+    /// hand it out of the step, and never in yq mode. An assignment's path and
+    /// right-hand side, and arithmetic, keep the in-place step
     /// (`fold_assign_step_copies_nothing_3138`) unless they hold a `==`/`!=`.
     #[test]
     fn fold_loop_variable_identity_gate_3896() {
@@ -102234,10 +102324,32 @@ mod tests {
             "reduce . as $a (.; .x |= ($a == 1))",
             "foreach . as $a (0; 1; $a == $a)",
             "foreach . as $a (0; $a == $a; .)",
+            // #5516: the step hands the variable, or a node of it, on, and a comparison
+            // after the fold can see it (`last(f)` is `reduce f as $x (null; $x)`).
+            "reduce . as $a (null; $a)",
+            "reduce . as $a (null; $a | .)",
+            "reduce . as $a (null; $a[0])",
+            "reduce . as $a (null; [$a])",
+            "reduce . as $a (null; {x: $a})",
+            "reduce . as $a (null; $a // 0)",
+            "reduce . as $a (null; try $a catch 0)",
+            "reduce . as $a (null; if . then $a else 0 end)",
+            "reduce . as $a (null; if . then 0 elif . then 1 else $a end)",
+            "reduce . as [$a] (null; $a)",
+            "foreach . as $a (0; $a)",
+            "foreach . as $a (0; 0; $a)",
+            "foreach . as $a (0; .; $a.b)",
+            "foreach . as $a (0; . + 1; [$a, .])",
+            // ... through a binder, whose names then reach the output.
+            "reduce . as $a (null; $a as $s | $s)",
+            "reduce . as $a (null; $a as [$x] | $x)",
+            "reduce . as $a (null; reduce $a[] as $t (null; $t))",
+            "reduce . as $a (null; foreach $a[] as $t (0; 0; $t))",
+            "reduce . as $a (null; reduce 1 as $t ($a; .))",
         ] {
             assert!(
                 gate::<JqSemantics>(src),
-                "{src} can compare its loop variable"
+                "{src} can compare its loop variable or hand it on"
             );
             assert!(
                 !gate::<YqSemantics>(src),
@@ -102258,11 +102370,26 @@ mod tests {
             "reduce .[] as $r ({}; .x[$r.name] += $r.score)",
             "reduce .[] as $r ({}; .[$r.name] = my_fn($r))",
             "reduce .[] as $r ({}; .[$r.name] += ($r.score | floor))",
-            "foreach . as $a (0; .; $a.b)",
+            // #5516: an assignment and arithmetic keep the in-place step, and an `if`
+            // condition, `and` and `or` answer a boolean.
+            "reduce . as $a ({}; .x = $a)",
+            "reduce . as $a ({}; .x |= $a)",
+            "reduce . as $a ({}; . + {x: $a})",
+            "reduce . as $a (null; if $a then 1 else 0 end)",
+            "reduce . as $a (null; $a and true)",
+            "reduce . as $a (null; $a or false)",
+            "reduce . as $a (null; $b)",
+            // A binder's source hands nothing on but through its names, here read by
+            // value only (`fold_assign_step_copies_nothing_3138`).
+            "reduce .[] as $r ({}; $r as $s | .[$s.name] = $s.score)",
+            "reduce .[] as $r ({}; $r.name as $n | .[$n] = $r.score)",
+            "reduce .[] as $r ({}; $r as {name: $n} | .[$n] = 1)",
+            "reduce .[] as $r ({}; reduce $r.tags[] as $t (.; .[$t] += 1))",
+            "reduce .[] as $r ({}; foreach $r.tags[] as $t (.; .[$t] = 1; .))",
         ] {
             assert!(
                 !gate::<JqSemantics>(src),
-                "{src} cannot compare its loop variable"
+                "{src} neither compares its loop variable nor hands it on"
             );
         }
     }
@@ -155923,12 +156050,15 @@ mod share_audit_2999 {
             "[limit(300; range([]; {}; [1]) | length)] | length",
             &[(Kind::ArrayMakeMut, 1), (Kind::ArrayUnwrap, 299)],
         );
-        // `last(f)` no longer retains (#5377): it is jq's `reduce`, which lets go of each value
-        // as the next arrives, so it appends in place like the consumers above.
+        // `last(f)` no longer retains every value (#5377): it is jq's `reduce`, which holds only
+        // the latest. Since #5516 its state *is* that value, the generator's own array, as jq's
+        // `$x` is, so `range`'s next `. + [1]` copies it once a step, as jq's does. That copy
+        // replaced a rebuild of the whole value from a literal every step, which cost more
+        // (`last(limit(10000; range([]; {}; [1])))`: 19.0 s to 4.5 s, M4 Pro, release).
         assert_forced(
             b"null",
             "last(limit(300; range([]; {}; [1]))) | length",
-            &[(Kind::ArrayMakeMut, 1), (Kind::ArrayUnwrap, 299)],
+            &[(Kind::ArrayMakeMut, 299), (Kind::ArrayUnwrap, 299)],
         );
         assert_forced(
             b"null",
