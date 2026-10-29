@@ -4104,8 +4104,13 @@ Pinned by `tests/yq_cli/i4749.rs`; a one-off differential sweep of about 2,500 r
 Still open: a slice in the batch (`del(.[5], .[0:2])` is `[10,20,30,null,null,null]` in yq, where a slice has no parent and ends the deletion, so nothing before it in the batch is deleted).
 Still open: a negative index that is out of range of the array as it entered but in range once an earlier past-the-end index has grown it (`[10] | del(.[2], .[-2])` is `[10]` in yq).
 That one is the read side, not the delete: yq's `.[2], .[-2]` grows the array as it reads (#2435), and the read here does not, so the path resolves before `del()` sees it and raises `index [-2] out of range`.
+The same cause gives the size in the message of a negative index that is out of range in both (`[10,20,30] | del(.[5], .[-9])` says `array size is 6` in yq and `array size is 3` here).
+A repeated index on an array past 2^22 elements, or past 2^27 element-times-index steps, is deleted once where yq deletes again (the replay holds two words per element and memmoves per repeat).
+A `null` or absent target is vivified for the batch as for a single index (`null | del(.[2], .[3])` is `[null,null]`).
 
-**Gated off when 2+ *terminal* indices share one node** (the `null`-vivify gate below; the array padding of a `del()` batch is the separate #4749 rule above). `delete_keys`'s own #2305/#2306
+**Gated off when 2+ *terminal* indices share one node, unless they are plain indices (#4749).**
+A batch of plain indices is replayed by `yq_delete_index_sequence` (above) and vivifies a `null` target, so `null | del(.[2], .[3])` is `[null,null]` as in yq; what follows describes the gate as it still stands for a batch with a slice, and its numbers predate that.
+`delete_keys`'s own #2305/#2306
 gate only extends a single-key batch — real yq's own multi-key extension is
 order-*dependent* (confirmed live: `null | del(.[2],.[3])` and `null | del(.[3],.[2])`
 both give `[null,null]` here, but #2306's own filed example, a mixed in-range/out-of-range

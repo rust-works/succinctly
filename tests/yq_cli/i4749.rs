@@ -112,3 +112,51 @@ fn test_a_repeated_index_of_a_yaml_sequence_deletes_again_4749() -> Result<()> {
     assert_eq!(stdout, "a:\n  - z\n");
     Ok(())
 }
+
+#[test]
+fn test_multi_key_del_vivifies_a_null_target_for_the_batch_4749() -> Result<()> {
+    for (doc, filter, want) in [
+        ("null", "del(.[2], .[3])", "[null,null]\n"),
+        ("null", "del(.[0], .[1])", "[]\n"),
+        ("{\"a\":null}", "del(.a[0], .a[0], .a[1])", "{\"a\":[]}\n"),
+        ("{\"a\":null}", "del(.a[2], .a[0])", "{\"a\":[null]}\n"),
+        // An absent key is not written.
+        ("{\"b\":1}", "del(.a[2], .a[0])", "{\"b\":1}\n"),
+        // A terminal batch beside a continuation through the same node.
+        ("[[1,2],[3]]", "del(.[0][0], .[0], .[0])", "[]\n"),
+        ("null", "del(.[2], .[3].a)", "[null,null,null]\n"),
+    ] {
+        assert_eq!(del(doc, filter)?, want, "{filter} on {doc}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_multi_key_del_of_signed_string_spellings_4749() -> Result<()> {
+    for (filter, want) in [
+        ("del(.[\"-1\"], .[0])", "[20]\n"),
+        ("del(.[\"+1\"], .[0])", "[30]\n"),
+    ] {
+        assert_eq!(del("[10,20,30]", filter)?, want, "{filter}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_multi_key_del_negative_index_raises_on_the_entry_length_4749() -> Result<()> {
+    // yq counts the length after the earlier `.[5]` grew the array (6); the read side here still
+    // reports the length the array entered with. Both raise, with different sizes.
+    let (_, code) = run_yq_stdin(
+        "del(.[5], .[-9])",
+        "[10,20,30]",
+        &["-p=json", "-o=json", "-I=0"],
+    )?;
+    assert_ne!(code, 0);
+    let (_, code) = run_yq_stdin(
+        "del(.a[-1], .a[0])",
+        "{\"a\":null}",
+        &["-p=json", "-o=json", "-I=0"],
+    )?;
+    assert_ne!(code, 0);
+    Ok(())
+}

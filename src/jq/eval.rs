@@ -86094,8 +86094,13 @@ fn highest_plain_index(keys: &[&OwnedValue]) -> Option<usize> {
 }
 
 /// Most deletions [`yq_delete_index_sequence`] replays one by one before it takes the set-deletion
-/// instead: elements times indices, a bound on the replay's memmoves.
+/// instead: elements times indices, a bound on the replay's memmoves. Past it, or past
+/// [`YQ_DELETE_REPLAY_LEN_LIMIT`], a repeated index is deleted once, which differs from yq.
 const YQ_DELETE_REPLAY_WORK_LIMIT: usize = 1 << 27;
+
+/// The longest array [`yq_delete_index_sequence`] replays a repeat on: the replay holds two
+/// `usize` per element (16 bytes), so this is 64 MiB of index vectors at most.
+const YQ_DELETE_REPLAY_LEN_LIMIT: usize = 1 << 22;
 
 /// yq's `del()` of several plain indices of one array, as `deleteChildOperator` runs it (#4749).
 ///
@@ -86133,7 +86138,10 @@ fn yq_delete_index_sequence(arr: &mut Vec<OwnedValue>, steps: &[i64]) -> Result<
         repeated |= !keep[node];
         keep[node] = false;
     }
-    if repeated && nodes.len().saturating_mul(len) <= YQ_DELETE_REPLAY_WORK_LIMIT {
+    if repeated
+        && len <= YQ_DELETE_REPLAY_LEN_LIMIT
+        && nodes.len().saturating_mul(len) <= YQ_DELETE_REPLAY_WORK_LIMIT
+    {
         // The ids of the elements still in the array, ascending, and the key each deleted one
         // held when it went.
         let mut alive: Vec<usize> = (0..len).collect();
@@ -86259,18 +86267,18 @@ fn delete_keys(
             // here is now only ever jq mode (unaffected: real jq's own
             // `delpaths` genuinely is order-independent) or `del()`'s own
             // comma-separated multi-target form, which still reaches here
-            // batched. For a batch of plain non-negative indices that form
-            // is closed (#4749, below); a negative index or a slice in the
-            // batch is still the open part of #2306's "still open" note.
-            // #4749: yq deletes a batch of plain indices highest first, and pads the array to
-            // an index it reaches past the end of: `del(.[5], .[7])` on three elements is
-            // `[10,20,30,null,null,null]` (pad to 7, then drop index 5), whatever order the paths
-            // come in, and `del(.[5], .[0])` is `[20,30,null,null]`. Distinct indices never
-            // disturb one another when taken highest first, so padding once to the largest and
-            // then taking the single `retain` pass below deletes the same elements. A negative
-            // key or a slice in the batch resolves order-dependently in yq and keeps the old
-            // behaviour. (A repeated index deletes again in yq, where this deletes once: the
-            // delete trie collapses a repeated path before it gets here.)
+            // batched. A batch of plain indices (negative, repeated and
+            // string-spelled ones too) no longer reaches here from `del()` in
+            // yq mode: `delete_trie_array` replays it in yq's own order
+            // ([`yq_delete_index_sequence`], #4749), which needs the order and
+            // the repeats the trie edges lose. What does reach here with 2+
+            // keys is a batch with a slice, or a `delpaths` caller.
+            // #4749: yq pads the array to an index it reaches past the end of
+            // (`del(.[5], .[7])` on three elements is `[10,20,30,null,null,null]`).
+            // Padding once to the largest plain index and then taking the single
+            // `retain` pass below is that rule for distinct indices; a negative
+            // key or a slice in the batch resolves order-dependently in yq and
+            // keeps the old behaviour.
             if yq_mode && keys.len() > 1 {
                 if let Some(highest) = highest_plain_index(keys) {
                     extend_array_with_nulls_for_delete(&mut arr, highest)?;
@@ -87024,7 +87032,17 @@ impl DeleteTrieBuilder {
         let node = &mut self.trie.nodes[id as usize];
         node.terminal = true;
         if self.yq_mode && id != DELETE_TRIE_ROOT {
-            let parent = node.parent;
+            let (parent, slot, by_field) = (node.parent, node.slot, node.keyed_by_field);
+            // A field edge only matters to an array when its name spells an integer; every other
+            // name stays out of the list, which keeps an object's many keys out of it.
+            if by_field
+                && !self.trie.nodes[parent as usize]
+                    .fields
+                    .get_index(slot)
+                    .is_some_and(|(name, _)| yq_field_name_as_index::<YqSemantics>(name).is_some())
+            {
+                return;
+            }
             self.trie.nodes[parent as usize].terminal_order.push(id);
         }
     }
@@ -87376,7 +87394,9 @@ fn delete_trie_array(
     // `[null,null,null]`, order-independent, confirmed live both ways.
     //
     // **Not** safe, and deliberately excluded, when 2+ *terminal* indices
-    // share this node: `delete_keys`'s own `keys.len() == 1` gate (#2305/
+    // share this node and `delete_keys` would take them (a batch with a
+    // slice; a batch of plain indices is the #4749 exception below):
+    // `delete_keys`'s own `keys.len() == 1` gate (#2305/
     // #2306's own documented scope, unrelated to this fix) already refuses
     // to extend a multi-key batch, because real yq's own multi-key
     // extension is order-*dependent* in a way a single `retain` pass can't
@@ -87391,8 +87411,20 @@ fn delete_trie_array(
     // above. jq has no vivify rule at all, so this whole check is yq-mode
     // only -- jq mode always falls through to the pre-existing
     // `null`-tolerant walk-through-absent behavior below, unchanged.
+    //
+    // #4749: a batch of plain indices that [`yq_delete_index_sequence`] replays is the exception:
+    // it names every terminal index in yq's order, so a `null` target is vivified for it too
+    // (`null | del(.[2], .[3])` is `[null,null]`).
+    let sequence = if yq_mode {
+        trie.yq_terminal_index_sequence(node)
+    } else {
+        None
+    };
     let terminal_index_count = node.indices.len() - node.index_groups.len();
-    if yq_mode && terminal_index_count <= 1 && matches!(value, OwnedValue::Null) {
+    if yq_mode
+        && (terminal_index_count <= 1 || sequence.is_some())
+        && matches!(value, OwnedValue::Null)
+    {
         value = OwnedValue::array();
     } else if matches!(value, OwnedValue::Null) {
         // Same per-step `null` exemption as `delete_trie_object` — applies
@@ -87626,6 +87658,12 @@ fn delete_trie_array(
         }
     }
 
+    // #4749: yq deletes a batch of plain indices in its own order -- see
+    // [`yq_delete_index_sequence`] -- so it replaces the `delete_keys` batch below.
+    if let (Some(steps), OwnedValue::Array(arr)) = (&sequence, &mut value) {
+        yq_delete_index_sequence(arr, steps)?;
+        return Ok(value);
+    }
     // Terminal indices go through `delete_keys`, which silently drops an
     // index that names nothing in jq mode (or a positive-out-of-range one
     // in any mode), `?` or not (#415/#477) — but raises on a negative
@@ -87638,8 +87676,9 @@ fn delete_trie_array(
     // instead of dropping it — see that function's own doc comment for
     // why this is gated on a single-key batch specifically (a
     // `del(.[5], .[7])` comma-form reaching two or more terminal indices
-    // here shares that same gate, and stays at the pre-#2305 no-op
-    // behavior).
+    // here shares that same gate; for plain indices the sequence above
+    // handles it since #4749, a batch with a slice stays at the pre-#2305
+    // no-op behavior).
     let mut doomed: Vec<OwnedValue> = node
         .indices
         .iter()
@@ -87650,14 +87689,6 @@ fn delete_trie_array(
         })
         .collect();
     doomed.extend_from_slice(named_terminals);
-    if yq_mode {
-        if let OwnedValue::Array(arr) = &mut value {
-            if let Some(steps) = trie.yq_terminal_index_sequence(node) {
-                yq_delete_index_sequence(arr, &steps)?;
-                return Ok(value);
-            }
-        }
-    }
     if !doomed.is_empty() {
         let key_refs: Vec<&OwnedValue> = doomed.iter().collect();
         value = delete_keys(value, &key_refs, yq_mode)?;
@@ -119429,13 +119460,13 @@ mod tests {
         // else-branch contributes no path steps, matching path(.).
         query!(br#"{"a": 1}"#, "path(if false then .a end)",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert_eq!(arr, Vec::<OwnedValue>::new());
+                assert!(arr.is_empty());
             }
         );
 
         query!(br#"{"a": 1}"#, "path(if false then .a elif false then .b end)",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert_eq!(arr, Vec::<OwnedValue>::new());
+                assert!(arr.is_empty());
             }
         );
 
@@ -120779,7 +120810,7 @@ mod tests {
         );
         query!(br"{}", "map(. + 1)",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert_eq!(arr, Vec::<OwnedValue>::new());
+                assert!(arr.is_empty());
             }
         );
     }
@@ -122150,7 +122181,7 @@ mod tests {
         );
         query!(br"{}", "flatten",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert_eq!(arr, Vec::<OwnedValue>::new());
+                assert!(arr.is_empty());
             }
         );
     }
@@ -126509,7 +126540,7 @@ mod tests {
         // this arity really does answer differently for a NaN bound.
         query!(br"null", r"[limit(3; range(0; nan; 1))]",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert_eq!(arr, Vec::<OwnedValue>::new());
+                assert!(arr.is_empty());
             }
         );
     }
@@ -126544,7 +126575,7 @@ mod tests {
         );
         query!(br"null", r"[limit(3; range(nan; -3; -1))]",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert_eq!(arr, Vec::<OwnedValue>::new());
+                assert!(arr.is_empty());
             }
         );
     }
@@ -126565,7 +126596,7 @@ mod tests {
         );
         query!(br"null", r"[limit(3; range(0; 5; nan))]",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert_eq!(arr, Vec::<OwnedValue>::new());
+                assert!(arr.is_empty());
             }
         );
         query!(br"null", r"[limit(3; range(0; -5; nan))]",
@@ -126575,7 +126606,7 @@ mod tests {
         );
         query!(br"null", r"[limit(3; range(5; 5; nan))]",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert_eq!(arr, Vec::<OwnedValue>::new());
+                assert!(arr.is_empty());
             }
         );
         // A literal zero step, not NaN -- `cmp_f64(0.0, 0.0)` is `Equal`,
@@ -126589,7 +126620,7 @@ mod tests {
         // 1.7.1.
         query!(br"null", r"[range(1; 5; 0.0)]",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert_eq!(arr, Vec::<OwnedValue>::new());
+                assert!(arr.is_empty());
             }
         );
     }
@@ -126649,7 +126680,7 @@ mod tests {
         // consumer must still be able to stop.
         query!(br"null", r"[range(0;3;null)]",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert_eq!(arr, Vec::<OwnedValue>::new());
+                assert!(arr.is_empty());
             }
         );
         query!(br"null", r"[limit(3;range(5;0;null))]",
@@ -126662,7 +126693,7 @@ mod tests {
         // takes jq's `else empty` arm.
         query!(br"null", r"[limit(3;range(0;5;0))]",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert_eq!(arr, Vec::<OwnedValue>::new());
+                assert!(arr.is_empty());
             }
         );
         // range/1 and range/2 are native builtins (unlike range/3's
@@ -130886,7 +130917,7 @@ mod tests {
         // Test identity path
         query!(br#"{"a": 1}"#, "path(.)",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert_eq!(arr, Vec::<OwnedValue>::new()); // Identity has no path components
+                assert!(arr.is_empty()); // Identity has no path components
             }
         );
     }
@@ -137257,25 +137288,24 @@ mod tests {
     }
 
     #[test]
-    fn test_del_comma_grouped_multi_terminal_key_stays_no_op_yq_mode_2323() {
+    fn test_del_comma_grouped_multi_terminal_key_vivifies_a_null_source_yq_mode_2323() {
         // #2323 review: `delete_keys`'s own #2305/#2306 gate only extends a
-        // *single*-key batch (real yq's own multi-key extension is
-        // order-dependent, not replicable by this function's one-pass
-        // `retain` model -- #2306's own documented, deliberately deferred
-        // scope). Vivifying the comma-grouped trie's source unconditionally
-        // would trade the *pre-existing* "stays null" gap for a *new*,
-        // undocumented "vivifies to `[]` but the batch never actually
-        // extends" gap instead -- this pins that the fix stays at the
-        // pre-existing (not new) shape when 2+ terminal indices share one
-        // node. Confirmed live, order-independent: real yq answers
-        // `[null,null]` here (its own actual multi-key algorithm, #2306's
-        // scope, not replicated by this fix), and both `succinctly` orderings
-        // agree with each other even though neither matches real yq yet.
+        // *single*-key batch, so vivifying the comma-grouped trie's source
+        // for a batch it would take trades "stays null" for a wrong `[]`.
+        // That is why the vivify gate counts the terminal indices. #4749
+        // lifted it for a batch of plain indices, which
+        // `yq_delete_index_sequence` replays in yq's own order: real yq
+        // answers `[null,null]` here, order-independent (captured from
+        // v4.53.3), and so does this.
         yq_query!(br"null", r"del(.[2],.[3])",
-            QueryResult::Owned(OwnedValue::Null) => {}
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Null, OwnedValue::Null]);
+            }
         );
         yq_query!(br"null", r"del(.[3],.[2])",
-            QueryResult::Owned(OwnedValue::Null) => {}
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Null, OwnedValue::Null]);
+            }
         );
         // One terminal index alongside one *continuation* at the same node
         // is a different shape -- not 2+ terminal keys sharing a
@@ -140237,7 +140267,7 @@ mod tests {
         // jq 1.7.1 yields no values for a zero step (it does not error)
         query!(b"null", "[range(0; 1; 0)]",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert_eq!(arr, Vec::<OwnedValue>::new());
+                assert!(arr.is_empty());
             }
         );
     }
@@ -140438,7 +140468,7 @@ mod tests {
         // No occurrences returns empty array
         query!(br#""abc""#, r#"indices("xyz")"#,
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert_eq!(arr, Vec::<OwnedValue>::new());
+                assert!(arr.is_empty());
             }
         );
     }
@@ -140724,7 +140754,7 @@ mod tests {
         // shuffle of empty array should return empty array
         query!(br"[]", "shuffle",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert_eq!(arr, Vec::<OwnedValue>::new());
+                assert!(arr.is_empty());
             }
         );
     }
@@ -140872,7 +140902,7 @@ mod tests {
         // Empty array returns empty array
         query!(br"[]", "pivot",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert_eq!(arr, Vec::<OwnedValue>::new());
+                assert!(arr.is_empty());
             }
         );
     }
@@ -140882,7 +140912,7 @@ mod tests {
         // Array of empty arrays returns empty array
         query!(br"[[], []]", "pivot",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert_eq!(arr, Vec::<OwnedValue>::new());
+                assert!(arr.is_empty());
             }
         );
     }
