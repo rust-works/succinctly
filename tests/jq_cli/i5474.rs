@@ -154,3 +154,13 @@ fn test_binary_long_flag_is_still_rejected_5474() -> Result<()> {
     assert_eq!((stdout.as_str(), code), ("", 2));
     Ok(())
 }
+
+#[test]
+fn test_stream_errors_with_validate_rejects_a_malformed_input_outright_5474() -> Result<()> {
+    // `--validate` is strict validation before processing, so it answers first.
+    let (stdout, code) = stream_errors("[1,", &["--validate"])?;
+    assert_eq!((stdout.as_str(), code), ("", 3));
+    let (stdout, code) = stream_errors("[1]", &["--validate"])?;
+    assert_eq!((stdout.as_str(), code), ("[[0],1]\n[[0]]\n", 0));
+    Ok(())
+}

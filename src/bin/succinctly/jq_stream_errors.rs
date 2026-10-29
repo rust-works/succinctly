@@ -799,4 +799,77 @@ mod tests {
         let events: Vec<String> = read.values.iter().map(OwnedValue::to_json).collect();
         assert_eq!(events, ["[[0],12]", "[[0]]"]);
     }
+
+    /// Each row's output was captured from `jq --stream-errors -c .` (jq 1.7.1) and covers one of
+    /// the parser's error arms or an event shape.
+    #[test]
+    fn every_error_arm_and_event_shape_matches_jq_5474() {
+        let rows: &[(&str, &str)] = &[
+        ("[1 2]", "[\"Expected separator between values at line 1, column 5\",[0]]\n"),
+        ("{[\"a\"]}", "[\"Expected string key after '{', not '[' at line 1, column 2\",[null]]\n"),
+        ("{\"x\":\"y\",[\"foo\"]}", "[[\"x\"],\"y\"]\n[\"Expected string key after ',' in object, not '[' at line 1, column 10\",[null]]\n"),
+        ("{{\"a\":1}}", "[\"Expected string key after '{', not '{' at line 1, column 2\",[null]]\n"),
+        ("{\"x\":\"y\",{\"foo\":\"bar\"}}", "[[\"x\"],\"y\"]\n[\"Expected string key after ',' in object, not '{' at line 1, column 10\",[null]]\n"),
+        (":", "[\"':' not as part of an object at line 1, column 1\",[]]\n"),
+        ("[1:2]", "[\"':' not as part of an object at line 1, column 3\",[0]]\n"),
+        ("{\"a\":1:2}", "[\"Object keys must be strings at line 1, column 7\",[\"a\"]]\n"),
+        ("{1:2}", "[\"Object keys must be strings at line 1, column 3\",[null]]\n"),
+        ("{\"a\" \"b\"}", "[\"Expected separator between values at line 1, column 8\",[null]]\n"),
+        ("1:2", "[\"':' not as part of an object at line 1, column 2\",[]]\n"),
+        ("{,}", "[\"Expected value before ',' at line 1, column 2\",[null]]\n"),
+        ("{\"a\",1}", "[\"Objects must consist of key:value pairs at line 1, column 5\",[null]]\n"),
+        ("[,]", "[\"Expected value before ',' at line 1, column 2\",[0]]\n"),
+        (",", "[\"Expected value before ',' at line 1, column 1\",[]]\n"),
+        ("[1,,2]", "[[0],1]\n[\"Expected value before ',' at line 1, column 4\",[1]]\n"),
+        ("]", "[\"Unmatched ']' at the top-level at line 1, column 1\",[]]\n"),
+        ("[1,2,]", "[[0],1]\n[[1],2]\n[\"Expected another array element at line 1, column 6\",[2]]\n"),
+        ("{\"a\":[1]]}", "[[\"a\",0],1]\n[[\"a\",0]]\n[\"Unmatched ']' in the middle of an object at line 1, column 9\",[\"a\"]]\n"),
+        ("}", "[\"Unmatched '}' at the top-level at line 1, column 1\",[]]\n"),
+        ("{\"a\":1,}", "[[\"a\"],1]\n[\"Expected another key:value pair at line 1, column 8\",[null]]\n"),
+        ("{\"a\":}", "[\"Missing value in key:value pair at line 1, column 6\",[\"a\"]]\n"),
+        ("{\"a\":1]", "[\"Unmatched ']' in the middle of an object at line 1, column 7\",[\"a\"]]\n"),
+        ("[}", "[\"Unmatched '}' in the middle of an array at line 1, column 2\",[0]]\n"),
+        ("[1}", "[\"Unmatched '}' in the middle of an array at line 1, column 3\",[0]]\n"),
+        ("{1}", "[\"Objects must consist of key:value pairs at line 1, column 3\",[null]]\n"),
+        ("{\"a\"}", "[\"Objects must consist of key:value pairs at line 1, column 5\",[null]]\n"),
+        ("[1,2] }", "[[0],1]\n[[1],2]\n[[1]]\n[\"Unmatched '}' at the top-level at line 1, column 7\",[]]\n"),
+        ("\"\\x\"", "[\"Invalid escape at line 1, column 4\",[]]\n"),
+        ("\"\\u12\"", "[\"Invalid \\\\uXXXX escape at line 1, column 6\",[]]\n"),
+        ("\"\\u12zz\"", "[\"Invalid characters in \\\\uXXXX escape at line 1, column 8\",[]]\n"),
+        ("\"\\ud800x\"", "[\"Invalid \\\\uXXXX\\\\uXXXX surrogate pair escape at line 1, column 9\",[]]\n"),
+        ("\"\\ud800\\u0041\"", "[\"Invalid \\\\uXXXX\\\\uXXXX surrogate pair escape at line 1, column 14\",[]]\n"),
+        ("\"a\tb\"", "[\"Invalid string: control characters from U+0000 through U+001F must be escaped at line 1, column 5\",[]]\n"),
+        ("tru", "[\"Invalid literal at EOF at line 1, column 3\",[]]\n"),
+        ("nul", "[\"Invalid literal at EOF at line 1, column 3\",[]]\n"),
+        ("1e", "[\"Invalid numeric literal at EOF at line 1, column 2\",[]]\n"),
+        ("-", "[\"Invalid numeric literal at EOF at line 1, column 1\",[]]\n"),
+        ("\"abc", "[\"Unfinished string at EOF at line 1, column 4\",[]]\n"),
+        ("[1,2", "[[0],1]\n[\"Unfinished JSON term at EOF at line 1, column 4\",[1]]\n"),
+        ("[[]]", "[[0],[]]\n[[0]]\n"),
+        ("{\"a\":{}}", "[[\"a\"],{}]\n[[\"a\"]]\n"),
+        ("[[1],[2]]", "[[0,0],1]\n[[0,0]]\n[[1,0],2]\n[[1,0]]\n[[1]]\n"),
+        ("{\"a\":[]}", "[[\"a\"],[]]\n[[\"a\"]]\n"),
+        ("{\"a\":{\"b\":[]}}", "[[\"a\",\"b\"],[]]\n[[\"a\",\"b\"]]\n[[\"a\"]]\n"),
+        ("[{}]", "[[0],{}]\n[[0]]\n"),
+        ("{\"a\":1,\"b\":[2,3]}", "[[\"a\"],1]\n[[\"b\",0],2]\n[[\"b\",1],3]\n[[\"b\",1]]\n[[\"b\"]]\n"),
+        ("\"\\ud83d\\ude00\"", "[[],\"😀\"]\n"),
+        ];
+        for (input, want) in rows {
+            let got: String = run(input).iter().map(|line| format!("{line}\n")).collect();
+            assert_eq!(got, *want, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn an_empty_source_is_a_refill_that_hands_out_what_the_last_byte_left() {
+        // `[1]` leaves its close pending after the last byte; the empty source after it is the
+        // call that hands it out, at that source's own position.
+        let read = read(&[(Some(0), b"[1]".to_vec()), (Some(1), Vec::new())]);
+        let events: Vec<String> = read.values.iter().map(OwnedValue::to_json).collect();
+        assert_eq!(events, ["[[0],1]", "[[0]]"]);
+        assert_eq!(read.locations, [(0, 0), (1, 0)]);
+        assert_eq!(read.inside, 2);
+        // An empty input has no value, and nothing to slurp.
+        assert!(read_one(b"").values.is_empty());
+    }
 }
