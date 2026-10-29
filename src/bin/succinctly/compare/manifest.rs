@@ -26,6 +26,15 @@ pub struct Queries {
     pub smoke: String,
 }
 
+/// Probe data: CLI flags, succinctly-only surface, and the directory they run in.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Probes {
+    pub cli: String,
+    pub extensions: String,
+    pub fixtures: String,
+    pub divergences: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Manifest {
     pub schema_version: u32,
@@ -33,6 +42,7 @@ pub struct Manifest {
     pub references: Vec<Reference>,
     pub succinctly: SuccinctlyBuild,
     pub queries: Queries,
+    pub probes: Probes,
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -94,6 +104,7 @@ mod tests {
     fn two_primaries_are_rejected() {
         let text = "schema_version = 1\n\
             [succinctly]\nprofile='release'\nfeatures=''\n[queries]\nsmoke='x'\n\
+            [probes]\ncli='x'\nextensions='x'\nfixtures='x'\ndivergences='x'\n\
             [[reference]]\nid='a'\nversion='1'\nrole='primary'\nsource_url=''\nsource_sha256=''\n\
             [[reference]]\nid='b'\nversion='2'\nrole='primary'\nsource_url=''\nsource_sha256=''\n";
         assert!(Manifest::parse(text).is_err());

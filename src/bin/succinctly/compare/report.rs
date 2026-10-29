@@ -1,5 +1,7 @@
 //! `report.md`, generated from the results (#5409). Never hand-edited.
 
+use super::cli;
+use super::features::{FeatureSummary, Status};
 use super::harness::{Row, Verdict};
 use super::Results;
 use std::fmt::Write;
@@ -55,6 +57,39 @@ pub fn render(results: &Results) -> String {
         None => {
             let _ = writeln!(s, "| Smoke geomean speedup       | n/a |");
         }
+    }
+    if let Some(f) = &r.features {
+        let _ = writeln!(
+            s,
+            "| Builtins defined by succinctly | {:.1}% of {} probed ({} listed, {} not probed) |",
+            f.implemented_pct, f.probed, f.total, f.not_probed
+        );
+        let _ = writeln!(
+            s,
+            "| Builtins agreeing with the reference | {:.1}% ({}/{}) |",
+            f.matching_pct, f.matching, f.probed
+        );
+    }
+    if !r.cli.is_empty() {
+        let ok = r
+            .cli
+            .iter()
+            .filter(|x| x.verdict == cli::Verdict::Match)
+            .count();
+        let _ = writeln!(s, "| CLI probes agreeing | {ok}/{} |", r.cli.len());
+    }
+    if r.features.is_some() || !r.cli.is_empty() {
+        let _ = writeln!(
+            s,
+            "| Known divergences (ledger) | {} |",
+            r.known_divergences.len()
+        );
+        let _ = writeln!(
+            s,
+            "| Ledger drift | {} unlisted, {} stale |",
+            r.ledger.unlisted.len(),
+            r.ledger.stale.len()
+        );
     }
     s.push('\n');
 
@@ -118,6 +153,9 @@ pub fn render(results: &Results) -> String {
         r.reps
     );
 
+    features_sections(&mut s, r);
+    cli_sections(&mut s, r);
+
     let _ = writeln!(s, "\n## Reproduce\n");
     let _ = writeln!(s, "```bash\ncargo build --release --features bench-runner");
     let _ = writeln!(s, "{}\n```", r.command);
@@ -127,4 +165,124 @@ pub fn render(results: &Results) -> String {
         r.manifest_sha256, e.succinctly_sha256, e.jq_sha256
     );
     s
+}
+
+fn note_for(r: &Results, id: &str) -> String {
+    r.known_divergences.iter().find(|e| e.id == id).map_or_else(
+        || "**unlisted**".into(),
+        |e| format!("{}: {}", e.category, e.reason),
+    )
+}
+
+fn feature_table(s: &mut String, r: &Results, suite: &str, f: &FeatureSummary) {
+    let _ = writeln!(
+        s,
+        "{} builtins: {} match, {} differ, {} not implemented, {} not probed.\n",
+        f.reference, f.matching, f.differs, f.not_implemented, f.not_probed
+    );
+    let _ = writeln!(s, "| Builtin | Status | Ledger |");
+    let _ = writeln!(s, "|---------|--------|--------|");
+    for x in f
+        .rows
+        .iter()
+        .filter(|x| !matches!(x.status, Status::Match | Status::NotProbed))
+    {
+        let st = if x.status == Status::Differs {
+            "differs"
+        } else {
+            "not implemented"
+        };
+        let _ = writeln!(
+            s,
+            "| `{}` | {st} | {} |",
+            x.id,
+            note_for(r, &format!("{suite}:{}", x.id))
+        );
+    }
+    let skipped: Vec<String> = f
+        .rows
+        .iter()
+        .filter(|x| x.status == Status::NotProbed)
+        .map(|x| format!("`{}` ({})", x.id, x.note.as_deref().unwrap_or("")))
+        .collect();
+    if !skipped.is_empty() {
+        let _ = writeln!(s, "\nNot probed: {}.", skipped.join(", "));
+    }
+}
+
+fn features_sections(s: &mut String, r: &Results) {
+    let Some(f) = &r.features else { return };
+    let _ = writeln!(s, "\n## A. Builtin coverage\n");
+    let _ = writeln!(
+        s,
+        "Inventory: `builtins` of the reference. Each `name/arity` runs on eight inputs under \
+         `try ... catch \"E\"`; error wording is the error-probe suite's job.\n"
+    );
+    feature_table(s, r, "features", f);
+    let _ = writeln!(s, "\n### Added after the primary reference\n");
+    match (&r.since_secondary, &r.secondary_note) {
+        (Some(x), _) => feature_table(s, r, "since-secondary", x),
+        (None, Some(why)) => {
+            let _ = writeln!(s, "Not run: {why}.");
+        }
+        (None, None) => {}
+    }
+}
+
+fn cli_sections(s: &mut String, r: &Results) {
+    if r.cli.is_empty() {
+        return;
+    }
+    let _ = writeln!(s, "\n## G. CLI & I/O compatibility\n");
+    let _ = writeln!(
+        s,
+        "Stdout and exit status must be identical; stderr wording is not compared.\n"
+    );
+    let _ = writeln!(s, "| Area | Probes | Agree |");
+    let _ = writeln!(s, "|------|--------|-------|");
+    let mut areas: Vec<&str> = r.cli.iter().map(|x| x.area.as_str()).collect();
+    areas.sort_unstable();
+    areas.dedup();
+    for a in areas {
+        let all = r.cli.iter().filter(|x| x.area == a).count();
+        let ok = r
+            .cli
+            .iter()
+            .filter(|x| x.area == a && x.verdict == cli::Verdict::Match)
+            .count();
+        let _ = writeln!(s, "| {a} | {all} | {ok} |");
+    }
+    let _ = writeln!(s, "\n| Probe | jq exit | succinctly exit | Ledger |");
+    let _ = writeln!(s, "|-------|---------|-----------------|--------|");
+    let ex = |c: Option<i32>| c.map_or_else(|| "signal".into(), |c| c.to_string());
+    for x in r.cli.iter().filter(|x| x.verdict == cli::Verdict::Differs) {
+        let _ = writeln!(
+            s,
+            "| `{}` | {} | {} | {} |",
+            x.id,
+            ex(x.reference_exit),
+            ex(x.subject_exit),
+            note_for(r, &format!("cli:{}", x.id))
+        );
+    }
+    let _ = writeln!(
+        s,
+        "\n### Succinctly-only surface (not counted as coverage)\n"
+    );
+    let _ = writeln!(s, "| Probe | Reference | Succinctly |");
+    let _ = writeln!(s, "|-------|-----------|------------|");
+    for x in &r.extensions {
+        let who = if x.verdict == cli::Verdict::Extension {
+            "rejects, as intended"
+        } else {
+            "**unexpected**"
+        };
+        let _ = writeln!(
+            s,
+            "| `{}` | exit {} ({who}) | exit {} |",
+            x.id,
+            ex(x.reference_exit),
+            ex(x.subject_exit)
+        );
+    }
 }

@@ -13,9 +13,9 @@ role = "primary"
 source_url = "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-1.7.1.tar.gz"
 source_sha256 = "478c9ca129fd2e3443fe27314b455e211e0d8c60bc8ff7df703873deeee580c2"
 
-# jq 1.8.1 is secondary: only behaviour new in 1.8.x that succinctly implements
-# (the `since-1.8.1` suite), run against 1.8.1 alone, never counted as a
-# divergence in the 1.7.1 columns.
+# jq 1.8.1 is secondary: the builtins new in 1.8.x are probed against 1.8.1
+# alone (the `since-1.8.1` suite) and, in later phases, timed and measured
+# against it too. It is never counted as a divergence in the 1.7.1 columns.
 [[reference]]
 id = "jq-1.8.1"
 version = "1.8.1"
@@ -33,3 +33,11 @@ manifest = "tests/data/bench-corpus/manifest.json"
 
 [queries]
 smoke = "comparison/jq/queries/smoke.tsv"
+
+# Dimension A (builtins) derives its probes from the reference's own `builtins`;
+# these are the data for G (CLI) and the succinctly-only surface.
+[probes]
+cli = "comparison/jq/probes/cli.tsv"
+extensions = "comparison/jq/probes/extensions.tsv"
+fixtures = "comparison/jq/fixtures"
+divergences = "comparison/jq/divergences.toml"

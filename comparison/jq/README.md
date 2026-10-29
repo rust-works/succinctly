@@ -17,5 +17,11 @@ reported as a correctness row and gets no timing; the command exits 1 on it.
 |-----------------------|----------------------------------------------------------|
 | `manifest.toml`       | pinned references (version, source sha256), build, queries |
 | `queries/smoke.tsv`   | `id`, flags, filter, input — data, not code              |
+| `probes/cli.tsv`      | G: `id`, area, args (JSON array), stdin (JSON string)    |
+| `probes/extensions.tsv` | succinctly-only surface the reference must reject      |
+| `fixtures/`           | working directory of the CLI probes (`-f`, `-L`, ...)    |
+| `divergences.toml`    | ledger of known differences; the run fails on drift      |
 
-Only the `smoke` suite exists so far. The report lists dimensions A–H as not implemented, by phase.
+Dimension A probes every builtin in the reference's own `builtins` (plus those new in jq 1.8.1, against 1.8.1);
+`--write-summary` regenerates `docs/compare/jq-coverage.json` and the figures in `docs/reference/jq-language.md`.
+Dimensions B–F and H are listed in the report as not implemented, by phase.

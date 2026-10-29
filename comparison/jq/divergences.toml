@@ -1,0 +1,123 @@
+# Known differences from the reference jq (#5409). `succinctly dev compare jq` fails on a
+# difference not listed here and on a listed one that no longer differs.
+#
+# id        <suite>:<probe>: features:name/arity, since-secondary:name/arity, cli:id, extensions:id
+# category  by-design | host-dependent | newer-than-primary | reference-crash | to-triage
+#           (to-triage: a real difference nobody has yet classified against ADR-0018 or filed)
+
+[[divergence]]
+id = "features:get_jq_origin/0"
+category = "host-dependent"
+reason = "Prints the directory of the running binary, so the two tools differ by installation path alone."
+
+[[divergence]]
+id = "features:strftime/1"
+category = "reference-crash"
+reason = "jq 1.7.1 aborts (`Assertion failed: JVP_HAS_KIND(j, JV_KIND_STRING)`, jv.c:1370) on a non-string format; succinctly reports a catchable error."
+
+[[divergence]]
+id = "features:strflocaltime/1"
+category = "reference-crash"
+reason = "Same jq 1.7.1 assertion abort on a non-string format as strftime/1."
+
+[[divergence]]
+id = "features:strptime/1"
+category = "host-dependent"
+reason = "On `\"a\" | strptime(.)` the weekday of 1900-00-00 is 6 in jq 1.7.1 (libc) and 0 in succinctly; the value is platform-libc dependent (#5340)."
+
+[[divergence]]
+id = "since-secondary:add/1"
+category = "newer-than-primary"
+reason = "add(f) is new in jq 1.8; succinctly follows the 1.7.1 pin (ADR-0018)."
+
+[[divergence]]
+id = "since-secondary:trimstr/1"
+category = "newer-than-primary"
+reason = "trimstr(s) is new in jq 1.8; succinctly follows the 1.7.1 pin (ADR-0018)."
+
+[[divergence]]
+id = "since-secondary:have_decnum/0"
+category = "newer-than-primary"
+reason = "have_decnum is new in jq 1.8; succinctly follows the 1.7.1 pin (ADR-0018)."
+
+[[divergence]]
+id = "since-secondary:have_literal_numbers/0"
+category = "newer-than-primary"
+reason = "have_literal_numbers is new in jq 1.8; succinctly follows the 1.7.1 pin (ADR-0018)."
+
+[[divergence]]
+id = "cli:version"
+category = "by-design"
+reason = "`--version` names the tool (`succinctly jq ... 0.8.0`), not jq's version token."
+
+[[divergence]]
+id = "cli:help-exit"
+category = "by-design"
+reason = "`-h` prints succinctly's own usage text."
+
+[[divergence]]
+id = "cli:help-long-exit"
+category = "by-design"
+reason = "`--help` prints succinctly's own usage text."
+
+[[divergence]]
+id = "cli:build-configuration"
+category = "by-design"
+reason = "`--build-configuration` describes succinctly's build, not jq's configure line."
+
+[[divergence]]
+id = "cli:debug-dump-disasm"
+category = "by-design"
+reason = "succinctly has no bytecode to disassemble; the flag is rejected (exit 2)."
+
+[[divergence]]
+id = "cli:debug-trace"
+category = "by-design"
+reason = "succinctly has no bytecode to trace; the flag is rejected (exit 2)."
+
+[[divergence]]
+id = "cli:long-binary"
+category = "to-triage"
+reason = "jq accepts `-b`/`--binary` (a no-op outside Windows); succinctly rejects it (exit 2)."
+issue = "#5474"
+
+[[divergence]]
+id = "cli:stream-errors"
+category = "to-triage"
+reason = "`--stream-errors` is not accepted (exit 2); jq 1.7.1 emits `[message, path]` for a truncated input."
+issue = "#5474"
+
+[[divergence]]
+id = "cli:stream-slurp"
+category = "to-triage"
+reason = "`--stream -s` : jq 1.7.1 prints the stream's closing event as a separate value (`[[1]]`); succinctly folds it into the one slurped array."
+
+[[divergence]]
+id = "cli:color"
+category = "to-triage"
+reason = "`-C` colour escapes differ: jq 1.7.1 emits no reset after an opening bracket or comma, succinctly resets after each token."
+issue = "#5473"
+
+[[divergence]]
+id = "cli:color-pretty"
+category = "to-triage"
+reason = "Same colour-escape difference as `cli:color`, in pretty-printed output."
+issue = "#5473"
+
+[[divergence]]
+id = "cli:jq-colors"
+category = "to-triage"
+reason = "Same colour-escape difference as `cli:color`, for an array holding null."
+issue = "#5473"
+
+[[divergence]]
+id = "cli:exit-error-continues"
+category = "to-triage"
+reason = "jq's exit status reflects only the last input (`1 {\"a\":2}` with `.a` exits 0 after the error on `1`); succinctly exits 5 if any input errored."
+issue = "#5471"
+
+[[divergence]]
+id = "cli:files-missing-continues"
+category = "to-triage"
+reason = "jq reads the remaining files after one cannot be opened (and exits 2); succinctly stops at the first missing file."
+issue = "#5472"

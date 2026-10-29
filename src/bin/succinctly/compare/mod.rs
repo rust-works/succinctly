@@ -1,14 +1,22 @@
 //! `succinctly dev compare jq`: one reproducible comparison of `jq` and
 //! `succinctly jq` (#5409).
 //!
-//! Phase 1 (this module): manifest, hermetic reference jq, `env.json`,
+//! Phase 1: manifest, hermetic reference jq, `env.json`,
 //! schema-versioned `results.json`, generated `report.md`, and the
 //! interleaved timer with its output-identity gate. The `smoke` suite runs
 //! end to end; the dimensions of the issue that are not built yet are listed
 //! in the report as not implemented rather than silently absent.
+//!
+//! Phase 2: dimension A (every builtin the reference lists, plus those new in
+//! the secondary reference), G (CLI flags) and the succinctly-only surface,
+//! checked against the `divergences.toml` ledger.
 
+mod cli;
 mod env;
+mod exec;
+mod features;
 mod harness;
+mod ledger;
 mod manifest;
 mod report;
 
@@ -17,6 +25,7 @@ use clap::{Parser, ValueEnum};
 use harness::{Row, Tool, Verdict};
 use manifest::{sha256_hex, Manifest};
 use serde::Serialize;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -25,6 +34,10 @@ pub const SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Dimension {
     Smoke,
+    /// A: language and builtin coverage
+    Features,
+    /// G: CLI flags and the succinctly-only surface
+    Cli,
 }
 
 #[derive(Debug, Parser)]
@@ -45,7 +58,12 @@ pub struct CompareJqArgs {
     #[arg(long)]
     out: Option<PathBuf>,
 
-    /// Build the pinned reference jq with scripts/compare-jq-build.sh if missing
+    /// Write docs/compare/jq-coverage.json and refresh the figures quoted in
+    /// docs/reference/jq-language.md (commit them from a clean, idle machine)
+    #[arg(long)]
+    write_summary: bool,
+
+    /// Build the pinned reference jqs with scripts/compare-jq-build.sh if missing
     #[arg(long)]
     build_jq: bool,
 
@@ -71,13 +89,20 @@ pub struct Results {
     pub env: env::Env,
     pub dimensions: Vec<DimensionStatus>,
     pub smoke: Vec<Row>,
+    /// A, against the primary reference.
+    pub features: Option<features::FeatureSummary>,
+    /// A, the builtins new in the secondary reference, against it alone.
+    pub since_secondary: Option<features::FeatureSummary>,
+    pub secondary_note: Option<String>,
+    /// G.
+    pub cli: Vec<cli::CliRow>,
+    /// Succinctly-only surface, not counted as coverage.
+    pub extensions: Vec<cli::CliRow>,
+    pub known_divergences: Vec<ledger::Entry>,
+    pub ledger: ledger::Outcome,
 }
 
 const PENDING: &[(&str, &str)] = &[
-    (
-        "A. Language & builtin coverage",
-        "not implemented (phase 2)",
-    ),
     (
         "B. Behavioural correctness (differential)",
         "not implemented (phase 3)",
@@ -89,9 +114,58 @@ const PENDING: &[(&str, &str)] = &[
     ("D. Performance", "not implemented (phase 4)"),
     ("E. Memory", "not implemented (phase 4)"),
     ("F. Robustness", "not implemented (phase 5)"),
-    ("G. CLI & I/O compatibility", "not implemented (phase 2)"),
     ("H. Platform & operational", "not implemented (phase 6)"),
 ];
+
+fn build_reference(root: &std::path::Path, version: &str) -> Result<()> {
+    let status = Command::new(root.join("scripts/compare-jq-build.sh"))
+        .arg(version)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .context("running compare-jq-build.sh")?;
+    if !status.success() {
+        bail!("building jq-{version} failed");
+    }
+    Ok(())
+}
+
+/// The secondary reference's binary, or why it is not available.
+fn secondary_tool(
+    root: &std::path::Path,
+    manifest: &Manifest,
+    build: bool,
+) -> std::result::Result<Tool, String> {
+    let Some(r) = manifest.references.iter().find(|r| r.role == "secondary") else {
+        return Err("the manifest names no secondary reference".into());
+    };
+    let path = Manifest::jq_path(root, r);
+    if !path.exists() && build {
+        build_reference(root, &r.version).map_err(|e| e.to_string())?;
+    }
+    if !path.exists() {
+        return Err(format!(
+            "{} not built (scripts/compare-jq-build.sh {}, or --build-jq)",
+            r.id, r.version
+        ));
+    }
+    let v = Command::new(&path)
+        .arg("--version")
+        .output()
+        .map_err(|e| e.to_string())?;
+    let v = String::from_utf8_lossy(&v.stdout).trim().to_string();
+    if v != format!("jq-{}", r.version) {
+        return Err(format!(
+            "{} reports `{v}`, the manifest pins jq-{}",
+            path.display(),
+            r.version
+        ));
+    }
+    Ok(Tool {
+        name: r.id.clone(),
+        program: path.to_string_lossy().into(),
+        prefix: vec![],
+    })
+}
 
 fn repo_root() -> Result<PathBuf> {
     let out = Command::new("git")
@@ -119,13 +193,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
                 primary.id, jq.display(), primary.version
             );
         }
-        let status = Command::new(root.join("scripts/compare-jq-build.sh"))
-            .arg(&primary.version)
-            .status()
-            .context("running compare-jq-build.sh")?;
-        if !status.success() {
-            bail!("building {} failed", primary.id);
-        }
+        build_reference(&root, &primary.version)?;
     }
     let version = Command::new(&jq)
         .arg("--version")
@@ -179,6 +247,101 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
             status: "implemented",
         });
     }
+    let fixtures = root.join(&manifest.probes.fixtures);
+    let ledger_path = root.join(&manifest.probes.divergences);
+    let known = ledger::load(&ledger_path)?;
+    let mut observed = BTreeSet::new();
+    let mut suites: Vec<&str> = vec![];
+    let (mut feats, mut since, mut secondary_note) = (None, None, None);
+    if want(Dimension::Features) {
+        suites.push("features");
+        let sum = features::run(&reference, &primary.id, &subject, None, &fixtures)?;
+        for r in &sum.rows {
+            if matches!(
+                r.status,
+                features::Status::Differs | features::Status::NotImplemented
+            ) {
+                observed.insert(format!("features:{}", r.id));
+            }
+        }
+        match secondary_tool(&root, &manifest, args.build_jq) {
+            Ok(sec) => {
+                let before: BTreeSet<String> = features::inventory(&reference, &fixtures)?
+                    .into_iter()
+                    .collect();
+                let added: BTreeSet<String> = features::inventory(&sec, &fixtures)?
+                    .into_iter()
+                    .filter(|b| !before.contains(b))
+                    .collect();
+                let s = features::run(&sec, &sec.name, &subject, Some(&added), &fixtures)?;
+                suites.push("since-secondary");
+                for r in &s.rows {
+                    if matches!(
+                        r.status,
+                        features::Status::Differs | features::Status::NotImplemented
+                    ) {
+                        observed.insert(format!("since-secondary:{}", r.id));
+                    }
+                }
+                since = Some(s);
+            }
+            Err(why) => secondary_note = Some(why),
+        }
+        feats = Some(sum);
+        dimensions.push(DimensionStatus {
+            name: "A. Language & builtin coverage",
+            status:
+                "implemented (builtins; syntax forms and the manual's sections are not yet probed)",
+        });
+    }
+    let (mut cli_rows, mut ext_rows) = (vec![], vec![]);
+    if want(Dimension::Cli) {
+        suites.extend(["cli", "extensions"]);
+        let read = |p: &str| std::fs::read_to_string(root.join(p)).with_context(|| p.to_string());
+        cli_rows = cli::run(
+            &reference,
+            &subject,
+            &cli::parse_probes(&read(&manifest.probes.cli)?)?,
+            false,
+            &fixtures,
+        )?;
+        ext_rows = cli::run(
+            &reference,
+            &subject,
+            &cli::parse_probes(&read(&manifest.probes.extensions)?)?,
+            true,
+            &fixtures,
+        )?;
+        for r in &cli_rows {
+            if r.verdict == cli::Verdict::Differs {
+                observed.insert(format!("cli:{}", r.id));
+            }
+        }
+        for r in &ext_rows {
+            if r.verdict == cli::Verdict::Unexpected {
+                observed.insert(format!("extensions:{}", r.id));
+            }
+        }
+        dimensions.push(DimensionStatus {
+            name: "G. CLI & I/O compatibility",
+            status: "implemented (flags, I/O, exit codes, numbers; colour and locale partially)",
+        });
+    }
+    if args.write_summary {
+        let Some(f) = &feats else {
+            bail!("--write-summary needs the features dimension");
+        };
+        let cov = features::Coverage::from(f);
+        let json = root.join("docs/compare/jq-coverage.json");
+        std::fs::create_dir_all(json.parent().expect("has parent"))?;
+        std::fs::write(&json, serde_json::to_string_pretty(&cov)? + "\n")?;
+        let doc = root.join("docs/reference/jq-language.md");
+        std::fs::write(
+            &doc,
+            features::patch_doc(&std::fs::read_to_string(&doc)?, &cov)?,
+        )?;
+    }
+    let ledger_outcome = ledger::check(&known, &observed, &suites);
     for (name, status) in PENDING {
         dimensions.push(DimensionStatus { name, status });
     }
@@ -209,6 +372,13 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         env,
         dimensions,
         smoke,
+        features: feats,
+        since_secondary: since,
+        secondary_note,
+        cli: cli_rows,
+        extensions: ext_rows,
+        known_divergences: known,
+        ledger: ledger_outcome,
     };
     std::fs::write(
         out_dir.join("env.json"),
@@ -229,7 +399,16 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         .collect();
     if !differing.is_empty() {
         eprintln!("unlisted divergence(s): {}", differing.join(", "));
-        return Ok(1);
     }
-    Ok(0)
+    for (what, ids) in [
+        ("unlisted divergence(s)", &results.ledger.unlisted),
+        ("listed but no longer diverging", &results.ledger.stale),
+    ] {
+        if !ids.is_empty() {
+            eprintln!("{what}: {}", ids.join(", "));
+        }
+    }
+    Ok(i32::from(
+        !differing.is_empty() || !results.ledger.is_clean(),
+    ))
 }
