@@ -1019,7 +1019,7 @@ fn stream_owned_value_yaml_at_depth<W: core::fmt::Write>(
         }
         // #3027: see the DOM writer -- a negative hex or octal result reads back as a string.
         OwnedValue::NumberLiteral(NumberRepr::Int(_), literal)
-            if depth > 0 && crate::yaml::is_signed_prefixed_int_text(literal) =>
+            if depth > 0 && crate::yaml::int_text_reads_back_as_string(literal) =>
         {
             out.write_str("!!int ")?;
             out.write_str(literal)

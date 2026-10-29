@@ -3246,7 +3246,15 @@ impl OwnedValue {
         let Some(repr) = parse_i64_or_f64_in::<S>(&literal) else {
             // #2802: `0x1f`/`0o17` is no JSON number, but it is an integer of a YAML document
             // (and `0x-10`, which yq's arithmetic writes, #3027).
-            if let Some(n) = crate::yaml::spelled_int_value(&literal) {
+            // jq's number model reads only the forms a YAML document can hold as an integer.
+            if let Some(n) = crate::yaml::spelled_int_value(&literal).filter(|_| {
+                S::TAG == EvalTag::Yq
+                    || matches!(
+                        crate::yaml::resolve_plain(&literal),
+                        crate::yaml::ResolvedScalar::Int(_)
+                    )
+                    || crate::yaml::is_signed_prefixed_int_text(&literal)
+            }) {
                 return Self::spelled_int::<S>(n, literal);
             }
             return Self::Null;
@@ -7856,6 +7864,37 @@ mod tests {
             OwnedValue::from_number_bytes::<JqSemantics>(b"1e0"),
             OwnedValue::NumberLiteral(_, _)
         ));
+    }
+
+    /// #1356: jq's number model reads a spelled integer only where a YAML document can hold one as
+    /// an integer (`0x1f`, `0o17`, and the `0x-54` yq's arithmetic writes); the underscore and
+    /// upper-case-prefix forms `tonumber` accepts in yq stay no number there.
+    #[test]
+    fn test_jq_mode_reads_only_yaml_resolvable_spelled_integers_1356() {
+        for (text, number) in [("0x1f", 31), ("0o17", 15), ("0x-54", -84)] {
+            assert_eq!(
+                OwnedValue::from_number_literal::<JqSemantics>(text),
+                OwnedValue::Int(number),
+                "{text}"
+            );
+            assert_eq!(
+                OwnedValue::from_number_literal::<YqSemantics>(text).to_json_yq(),
+                number.to_string(),
+                "{text}"
+            );
+        }
+        for text in ["1_000", "0X10", "0x_1"] {
+            assert_eq!(
+                OwnedValue::from_number_literal::<JqSemantics>(text),
+                OwnedValue::Null,
+                "{text}"
+            );
+            let kept = matches!(
+                OwnedValue::from_number_literal::<YqSemantics>(text),
+                OwnedValue::NumberLiteral(NumberRepr::Int(_), _)
+            );
+            assert!(kept, "{text}");
+        }
     }
 
     /// #2802: the bridge's spelling token reads back as the text it stands for, never as a

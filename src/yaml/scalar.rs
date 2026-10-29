@@ -531,35 +531,40 @@ pub fn is_spelled_int(raw: &str) -> bool {
 
 /// The integer a spelled-integer text names, `None` for any other text (and for a canonical one).
 ///
-/// Only a `0x`/`0o` prefix or a decimal run of digits can be one, so a float literal, an
-/// exponent form and the canonical integer (`42`, `-7`, `0`) return after a byte scan, and the
-/// prefixed forms alone reach [`resolve_plain`].
+/// yq's `parseInt64` grammar (`pkg/yqlib/lib.go`): every `_` is dropped, then a `0x`/`0X` (hex)
+/// or `0o` (octal) prefix is read off the whole string -- so a sign *after* it is part of the
+/// digits (`0x-10`, which yq's arithmetic writes) and one *before* it defeats it (`-0x10` is
+/// no integer) -- else a plain decimal, which keeps its zeros and `+` as spelling (`007`, `+5`).
+///
+/// A float literal, an exponent form and the canonical integer (`42`, `-7`, `0`) return after
+/// a byte scan, without parsing.
 pub(crate) fn spelled_int_value(raw: &str) -> Option<i64> {
     let bytes = raw.as_bytes();
-    let unsigned = bytes
-        .strip_prefix(b"-")
-        .or_else(|| bytes.strip_prefix(b"+"))
-        .unwrap_or(bytes);
-    if matches!(unsigned, [b'0', b'x' | b'o', ..]) {
-        return match resolve_plain(raw) {
-            ResolvedScalar::Int(n) => Some(n),
-            // The `0x-10` yq's own arithmetic writes for a negative result (#3027).
-            _ if is_signed_prefixed_int_text(raw) => {
-                i64::from_str_radix(&raw[2..], if bytes[1] == b'x' { 16 } else { 8 }).ok()
-            }
-            _ => None,
-        };
-    }
-    if unsigned.is_empty() || !unsigned.iter().all(u8::is_ascii_digit) {
+    let unsigned = bytes.strip_prefix(b"-").unwrap_or(bytes);
+    // `-0` is a float of a YAML document, and a canonical decimal is just its value.
+    if unsigned.is_empty()
+        || raw == "-0"
+        || (unsigned.iter().all(u8::is_ascii_digit) && (unsigned == b"0" || unsigned[0] != b'0'))
+    {
         return None;
     }
-    // A leading `+` or zero is the spelling; `-0` is a float of a YAML document, not this.
-    let canonical =
-        bytes.first() != Some(&b'+') && (unsigned == b"0" || unsigned[0] != b'0') && raw != "-0";
-    if canonical || raw == "-0" {
-        return None;
+    let stripped;
+    let digits = if bytes.contains(&b'_') {
+        stripped = raw.replace('_', "");
+        stripped.as_str()
+    } else {
+        raw
+    };
+    if let Some(rest) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        i64::from_str_radix(rest, 16).ok()
+    } else if let Some(rest) = digits.strip_prefix("0o") {
+        i64::from_str_radix(rest, 8).ok()
+    } else {
+        digits.parse::<i64>().ok()
     }
-    raw.parse::<i64>().ok()
 }
 
 /// Whether `raw` has the shape `0x-10` / `0o-17` that yq's arithmetic writes for a negative hex
@@ -567,6 +572,34 @@ pub(crate) fn spelled_int_value(raw: &str) -> Option<i64> {
 #[must_use]
 pub fn is_signed_prefixed_int_text(raw: &str) -> bool {
     matches!(raw.as_bytes(), [b'0', b'x' | b'o', b'-', ..])
+}
+
+/// Whether an integer literal's text reads back as a string when written nested (#3027, #1356).
+///
+/// yq then tags it `!!int`. go-yaml resolves a plain scalar as an integer when
+/// `strconv.ParseInt(text without its underscores, 0, 64)` accepts it, so the text that does not
+/// is the `0x-10` its arithmetic writes for a negative hex or octal result and a decimal with
+/// zeros that is no octal number (`09`, `0_9`). So is `tonumber`'s unsigned underscore-led text
+/// (`_1`), which yq tags although the same text with its underscores removed would read.
+#[must_use]
+pub fn int_text_reads_back_as_string(raw: &str) -> bool {
+    raw.starts_with('_') || !go_parse_int_base0_accepts(raw)
+}
+
+/// Whether Go's `strconv.ParseInt(s, 0, 64)` syntax accepts `raw` with its underscores removed.
+fn go_parse_int_base0_accepts(raw: &str) -> bool {
+    let stripped: alloc::vec::Vec<u8> = raw.bytes().filter(|&b| b != b'_').collect();
+    let unsigned = match stripped.as_slice() {
+        [b'+' | b'-', rest @ ..] => rest,
+        all => all,
+    };
+    let (radix, body): (u32, &[u8]) = match unsigned {
+        [b'0', b'x' | b'X', body @ ..] => (16, body),
+        [b'0', b'o' | b'O', body @ ..] => (8, body),
+        [b'0', body @ ..] if !body.is_empty() => (8, body),
+        body => (10, body),
+    };
+    !body.is_empty() && body.iter().all(|&b| char::from(b).is_digit(radix))
 }
 
 /// The number yq's JSON encoder writes for a literal whose text is not what it writes.
@@ -1142,14 +1175,14 @@ mod tests {
         ));
     }
 
-    /// #2802: only a `0x`/`0o` integer or a digit run with a `+` or a leading zero is a spelled
-    /// integer; the canonical integer, a float, an exponent form, `-0` and a prefix with nothing
-    /// valid after it are not, and the number it names is what `resolve_plain` reads.
+    /// #2802, #1356: only text yq's `parseInt64` reads that is not the canonical decimal is a
+    /// spelled integer (`0x1f`, `0X1F`, `0o17`, `007`, `+5`, `1_000`, `0x-54`); the canonical
+    /// integer, a float, an exponent form, `-0` and a prefix with nothing valid after it are not.
     #[test]
     fn is_spelled_int_classifies_by_text_alone_2802() {
         for (raw, number) in [
             ("0x1f", "31"),
-            ("0X1F", ""),
+            ("0X1F", "31"),
             ("0o17", "15"),
             ("01", "1"),
             ("007", "7"),
@@ -1160,6 +1193,12 @@ mod tests {
             // What yq's arithmetic writes for a negative result (#3027).
             ("0x-54", "-84"),
             ("0o-125", "-85"),
+            // What `tonumber` reads with yq's `parseInt64` (#1356).
+            ("1_000", "1000"),
+            ("_1", "1"),
+            ("0X10", "16"),
+            ("-007", "-7"),
+            ("0x_1", "1"),
         ] {
             if number.is_empty() {
                 assert!(!is_spelled_int(raw), "{raw}");
@@ -1179,7 +1218,6 @@ mod tests {
             "1.5",
             "1e3",
             ".5",
-            "1_000",
             "0b11",
             "0xzz",
             "0o9",

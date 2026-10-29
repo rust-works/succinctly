@@ -297,11 +297,12 @@ pub use scalar::overflowed_int_json_text;
 pub(crate) use scalar::spelled_int_value;
 #[doc(hidden)]
 pub use scalar::NONFINITE_LITERALS;
+pub use scalar::{
+    int_text_reads_back_as_string, is_signed_prefixed_int_text, is_spelled_int,
+    spelled_int_json_text, yq_json_number_text,
+};
 pub(crate) use scalar::{
     is_overflowed_int_literal, nonfinite_literal_index, nonfinite_literal_value, whole_float_as_int,
-};
-pub use scalar::{
-    is_signed_prefixed_int_text, is_spelled_int, spelled_int_json_text, yq_json_number_text,
 };
 pub use scalar::{resolve_plain, resolve_plain_sourced, resolve_tagged, ResolvedScalar};
 
