@@ -8646,6 +8646,30 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// #4361: in yq mode `(A + B)["k"]` and `(A * B)["k"]` read an absent key as nothing, where
+    /// `(A + B).k` and `(A + B) | .["k"]` read it as `null`. The folded [`Expr::Field`] cannot
+    /// tell the bracket from the dot, so a string key straight after such a head stays the
+    /// computed key it is, as in a `del()` argument (#2126).
+    fn keep_string_key_after_sum_or_merge(&self, chain: &[Expr], bracket: Bracket) -> Bracket {
+        if self.mode != ParserMode::Yq || chain.len() != 1 || !chain[0].is_sum_or_merge() {
+            return bracket;
+        }
+        match bracket {
+            Bracket::Static(Expr::Field(name)) => Bracket::Dynamic {
+                key: Expr::Literal(Literal::String(name)),
+                optional: false,
+            },
+            Bracket::Static(Expr::Optional(inner)) => match *inner {
+                Expr::Field(name) => Bracket::Dynamic {
+                    key: Expr::Literal(Literal::String(name)),
+                    optional: true,
+                },
+                other => Bracket::Static(Expr::Optional(Box::new(other))),
+            },
+            other => other,
+        }
+    }
+
     fn parse_postfix(&mut self, mut expr: Expr) -> Result<Expr, ParseError> {
         let mut chain = vec![expr];
 
@@ -8732,6 +8756,7 @@ impl<'a> Parser<'a> {
                 }
                 Some('[') => {
                     let bracket = self.parse_index_bracket_with_optional()?;
+                    let bracket = self.keep_string_key_after_sum_or_merge(&chain, bracket);
                     push_bracket(&mut chain, bracket);
                 }
                 _ => break,
@@ -9201,6 +9226,32 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// [`Self::keep_string_key_after_sum_or_merge`] undone for an assignment's target: a write
+    /// through `(A + B)["k"]` is the no-op it always was (#4361), and the kept computed key would
+    /// read as a path expression that is not one. The key is the head of the target, bare or as
+    /// the first stage of a longer path (`(A + B)["k"].x`, `(A + B)["k"][0]`).
+    fn fold_sum_or_merge_key(left: Expr) -> Expr {
+        match left {
+            Expr::IndexExpr { target, key } if target.is_sum_or_merge() => match *key {
+                Expr::Literal(Literal::String(name)) => {
+                    Expr::pipe(vec![*target, Expr::Field(name)])
+                }
+                other => Expr::IndexExpr {
+                    target,
+                    key: Box::new(other),
+                },
+            },
+            Expr::Pipe(stages) => {
+                let mut folded = stages.to_vec();
+                let head = folded.remove(0);
+                folded.insert(0, Self::fold_sum_or_merge_key(head));
+                Expr::pipe(folded)
+            }
+            Expr::Paren(inner) => Expr::Paren(Box::new(Self::fold_sum_or_merge_key(*inner))),
+            other => other,
+        }
+    }
+
     /// Parse assignment expressions: `path = value`, `path |= filter`, `path += value`, etc.
     /// Assignment has higher precedence than pipe; against `//` see [`Self::parse_assignment`].
     fn parse_assignment_level(&mut self) -> Result<Expr, ParseError> {
@@ -9242,7 +9293,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let filter = self.parse_assignment_operand()?;
             return Ok(Expr::Update {
-                path: Box::new(left),
+                path: Box::new(Self::fold_sum_or_merge_key(left)),
                 filter: Box::new(filter),
             });
         }
@@ -9255,7 +9306,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let value = self.parse_assignment_operand()?;
             return Ok(Expr::AlternativeAssign {
-                path: Box::new(left),
+                path: Box::new(Self::fold_sum_or_merge_key(left)),
                 value: Box::new(value),
             });
         }
@@ -9276,7 +9327,7 @@ impl<'a> Parser<'a> {
             let value = self.parse_assignment_operand()?;
             return Ok(Expr::CompoundAssign {
                 op: AssignOp::Mul(flags),
-                path: Box::new(left),
+                path: Box::new(Self::fold_sum_or_merge_key(left)),
                 value: Box::new(value),
             });
         }
@@ -9299,7 +9350,7 @@ impl<'a> Parser<'a> {
                 let value = self.parse_assignment_operand()?;
                 return Ok(Expr::CompoundAssign {
                     op,
-                    path: Box::new(left),
+                    path: Box::new(Self::fold_sum_or_merge_key(left)),
                     value: Box::new(value),
                 });
             }
@@ -9312,7 +9363,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let value = self.parse_assignment_operand()?;
             return Ok(Expr::Assign {
-                path: Box::new(left),
+                path: Box::new(Self::fold_sum_or_merge_key(left)),
                 value: Box::new(value),
             });
         }
