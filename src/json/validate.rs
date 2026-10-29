@@ -1448,8 +1448,9 @@ pub(crate) fn parse_nonfinite_literal_token(bytes: &[u8]) -> Option<&'static str
 }
 
 /// The suffix [`spelling_token`] ends in: [`NONFINITE_LITERAL_TOKEN_SUFFIX`]'s doubled exponent
-/// marker, which `str::parse::<f64>()` and `::<i64>()` both reject.
-const SPELLING_TOKEN_SUFFIX: &str = "e999e999";
+/// marker, which `str::parse::<f64>()` and `::<i64>()` both reject. The same constant, not a copy:
+/// the leading digit alone keeps the two families apart.
+const SPELLING_TOKEN_SUFFIX: &str = NONFINITE_LITERAL_TOKEN_SUFFIX;
 
 /// The reindex bridge's spelling of a YAML scalar whose source text is **not JSON number
 /// syntax** (`0x1f`, `0o17`, `1_000`, `+5`, `.5`, `~`, `True`, #2802): `6`, the text's bytes as

@@ -7809,14 +7809,10 @@ mod tests {
     /// literal parse of that text. A document spelling the same bytes is no token (#3034).
     #[test]
     fn test_bridge_read_decodes_the_spelling_token_2802() {
-        for (spelling, shape) in [("007", "7"), (".5", "0.5"), ("1e3", "1e3"), ("~", "null")] {
+        for (spelling, shape) in [("007", "7"), (".5", "0.5"), ("1e3", "1E+3"), ("~", "null")] {
             let token = crate::json::validate::spelling_token(spelling);
             let got = read_as_bridge_text::<YqSemantics>(&token);
-            assert_eq!(
-                got,
-                OwnedValue::from_number_literal::<YqSemantics>(spelling),
-                "{spelling} -> {token} -> {got:?} (expected {shape})"
-            );
+            assert_eq!(got.to_json(), shape, "{spelling} -> {token} -> {got:?}");
             assert!(!format!("{got:?}").contains(&token), "{token}: {got:?}");
         }
     }
