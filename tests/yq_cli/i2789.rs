@@ -73,14 +73,14 @@ fn test_key_tostring_and_formats_over_string_keys_2789() -> Result<()> {
 
 /// A key spelled like a null, bool or number keeps the cursor route, because `as_str` is the
 /// scalar's text and not its type: `~` is a null and `01` an integer. This pins the *route
-/// guard* (`key_spelling_may_retype`), not real yq's answer for these keys, which differs
-/// (`~` and `01` come back verbatim there); that gap is not this issue's.
+/// guard* (`key_spelling_may_retype`), not real yq's answer for these keys, which differs for
+/// `~` (it comes back verbatim there; `01` has done since #2802 kept an integer's spelling).
 #[test]
 fn test_key_tostring_keeps_the_typed_key_route_2789() -> Result<()> {
     let input = "~: 1\n01: 2\ntrue: 3\nnull: 4\n";
     assert_eq!(
         lines(".[] | key | tostring", input)?,
-        ["null", "1", "true", "null"]
+        ["null", "01", "true", "null"]
     );
     Ok(())
 }

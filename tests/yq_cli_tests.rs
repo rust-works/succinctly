@@ -66255,8 +66255,8 @@ fn test_yq_bare_wildcard_field_and_text_keys_2800() -> Result<()> {
         );
     }
 
-    // What stays different from yq: a key whose spelling the owned value has lost (`0x10` is the
-    // number 16, `null:` is `null`) is not matched by a pattern (yq matches its text `0x10`,
+    // What stays different from yq: a key whose spelling the owned value has lost (`null:` is
+    // `null`; `0x10` keeps its text since #2802) is not matched by a pattern (yq matches its text
     // `null`), and is left out rather than answered with a `null`; a pattern on a sequence is
     // still the `cannot index` error, worded as for any string key.
     let (stdout, code) = run_yq_stdin(
@@ -66264,7 +66264,7 @@ fn test_yq_bare_wildcard_field_and_text_keys_2800() -> Result<()> {
         "1.0: a\n0x10: h\nnull: n\nb: 2\n",
         &["-o", "json", "-I", "0"],
     )?;
-    assert_eq!((stdout.as_str(), code), ("\"a\"\n2\n", 0));
+    assert_eq!((stdout.as_str(), code), ("\"a\"\n\"h\"\n2\n", 0));
     let (stdout, stderr, code) =
         run_yq_stdin_with_stderr(".*", "- a\n- b\n", &["-o", "json", "-I", "0"])?;
     assert_eq!((stdout.as_str(), code), ("", 1));
