@@ -140,6 +140,7 @@ mod i5467;
 mod i5479;
 mod i5483;
 mod i5483_alias;
+mod i5487;
 mod i5500;
 mod i5501;
 mod i865;

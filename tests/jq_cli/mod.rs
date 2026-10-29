@@ -194,6 +194,7 @@ mod i5471;
 mod i5473;
 mod i5474;
 mod i5476;
+mod i5487;
 mod i5489;
 mod i5491;
 mod i5500;
