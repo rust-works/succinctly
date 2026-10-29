@@ -76143,16 +76143,22 @@ fn substitute_var_with(
         // below keeps both answers. `splice` is the caller's word that nothing reads the
         // variable in path position, where a literal object and a spliced field raise
         // different errors; a marked substitution hands the object on whole (#3177).
+        // With `splice` a marker is a fold's identity-sharing one (#5516, the only caller
+        // passing both), and a scalar field is still spliced: a scalar carries no identity,
+        // and a container field stays a node of the marked object.
         Expr::Pipe(stages)
             if splice
-                && mark.is_none()
                 && stages.len() == 2
                 && matches!(&stages[0], Expr::Var(name) if name == var_name) =>
         {
             if let (Expr::Field(field), OwnedValue::Object(object)) = (&stages[1], replacement) {
                 if !object.has_shadows() {
                     if let Some(value) = object.get(field.as_str()) {
-                        return owned_to_expr(value);
+                        if mark.is_none()
+                            || !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_))
+                        {
+                            return owned_to_expr(value);
+                        }
                     }
                 }
             }
@@ -76670,7 +76676,7 @@ fn try_reduce_step_alternatives<S: EvalSemantics>(
     input_val: &OwnedValue,
     acc_input: OwnedValue,
     optional: bool,
-    mark_loop_vars: bool,
+    mark_loop_vars: LoopVarSplice,
     budget: &mut FoldBudget<'_>,
 ) -> (OwnedValue, Option<Control>) {
     let last_idx = patterns.len() - 1;
@@ -79954,7 +79960,7 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
     input_val: &OwnedValue,
     state_input: OwnedValue,
     optional: bool,
-    mark_loop_vars: bool,
+    mark_loop_vars: LoopVarSplice,
     budget: &mut FoldBudget<'_>,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> (OwnedValue, Flow) {
@@ -80512,7 +80518,7 @@ pub(crate) fn substitute_fold_step(
     expr: &Expr,
     bindings: &[(String, OwnedValue)],
     all_var_names: &[String],
-    marked: bool,
+    marked: LoopVarSplice,
     splice: bool,
 ) -> Expr {
     let null_value = OwnedValue::Null;
@@ -80522,7 +80528,7 @@ pub(crate) fn substitute_fold_step(
             .filter(|name| !bindings.iter().any(|(n, _)| n == *name))
             .map(|name| (name.as_str(), &null_value)),
     );
-    if !marked {
+    if marked == LoopVarSplice::Literal {
         if !splice {
             return substitute_vars(expr, vars);
         }
@@ -80540,19 +80546,49 @@ pub(crate) fn substitute_fold_step(
     // can recognize it by storage identity (#3177). Everything else -- a scalar,
     // and the `null` fill for a name only another `?//` alternative binds -- is
     // substituted as before.
+    let fields_alone = splice && marked == LoopVarSplice::Shared;
     let mut result: Option<Expr> = None;
     for (name, value) in vars {
         let current = result.as_ref().unwrap_or(expr);
         result = Some(
             if matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
                 let marker = LazyMarker::new(value, Origin::Untracked, None);
-                substitute_var_impl(current, name, value, Some(&marker))
+                substitute_var_with(current, name, value, Some(&marker), fields_alone)
             } else {
                 substitute_var(current, name, value)
             },
         );
     }
     result.unwrap_or_else(|| expr.clone())
+}
+
+/// How a fold step splices a container loop variable into UPDATE or EXTRACT.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LoopVarSplice {
+    /// A literal rebuilt from the value, or only the field a `$var.field` reads (#5499).
+    Literal,
+    /// A marker holding the element's storage, handed on whole so the resolver can
+    /// recognise it in path position (#3329, [`fold_loop_variable_is_marked`]).
+    Path,
+    /// A marker for jq's identity short-circuit alone (#3896, #5516,
+    /// [`fold_loop_variable_shares_identity`]): `$var.field` still splices a scalar field
+    /// alone, which carries no identity, so `reduce .[] as $r (0; $r.score)` keeps #5499's
+    /// literal step.
+    Shared,
+}
+
+impl LoopVarSplice {
+    /// The splice for one fork: the path marker where the fold reads a loop variable
+    /// as a path step on this fork, else the identity marker where it shares, else literals.
+    pub(crate) fn of(path: bool, shares: bool) -> Self {
+        if path {
+            Self::Path
+        } else if shares {
+            Self::Shared
+        } else {
+            Self::Literal
+        }
+    }
 }
 
 /// Whether a fold's container loop variables are substituted as markers, and
@@ -81155,7 +81191,7 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
         // never the accumulator's, so it certifies no write jq refuses
         // (`test_fold_container_loop_variable_identity_through_document_input_3896`'s
         // multi-fork rows).
-        let mark = (mark_loop_vars && first) || share_loop_vars;
+        let mark = LoopVarSplice::of(mark_loop_vars && first, share_loop_vars);
         // #3895: jq runs every later fork's SOURCE against `null`.
         let source_input = if first {
             SourceInput::Real
@@ -81295,7 +81331,7 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
         // never the accumulator's, so it certifies no write jq refuses
         // (`test_fold_container_loop_variable_identity_through_document_input_3896`'s
         // multi-fork rows).
-        let mark = (mark_loop_vars && first) || share_loop_vars;
+        let mark = LoopVarSplice::of(mark_loop_vars && first, share_loop_vars);
         // #3895: jq runs every later fork's SOURCE against `null`.
         let source_input = if first {
             SourceInput::Real
@@ -115252,19 +115288,62 @@ mod tests {
             substitute_var(&parse("$v.score").unwrap(), "u", &record),
             parse("$v.score").unwrap()
         );
-        // A marked substitution splices the marker, as the path reading it needs.
+        // A path marker (`LoopVarSplice::Path`, which passes no `splice`) splices the marker, as
+        // the path reading it needs.
         let marker = LazyMarker::new(&record, Origin::Untracked, None);
         let marked = substitute_var_with(
             &parse("$u.score").unwrap(),
             "u",
             &record,
             Some(&marker),
-            true,
+            false,
         );
         let Expr::Pipe(stages) = marked else {
             panic!("a marked substitution is a pipe");
         };
         assert!(matches!(stages[0], Expr::TrackedVar(_)));
+    }
+
+    /// #5516: under a fold's identity-sharing marker (`LoopVarSplice::Shared`), a scalar held
+    /// field is still spliced alone, as #5499 does unmarked, and a container field stays a read
+    /// of the marker, so it keeps the element's storage.
+    #[test]
+    fn test_shared_fold_marker_splices_a_scalar_field_alone_5516() {
+        let tags = OwnedValue::array_from(vec![OwnedValue::Float(f64::NAN)]);
+        let record = OwnedValue::object_from([
+            ("score".to_string(), OwnedValue::Int(7)),
+            ("tags".to_string(), tags),
+        ]);
+        let shared = |source: &str| {
+            substitute_fold_step(
+                &parse(source).unwrap(),
+                &[("u".to_string(), record.clone())],
+                &[],
+                LoopVarSplice::Shared,
+                true,
+            )
+        };
+        assert_eq!(shared("$u.score"), Expr::Literal(Literal::Int(7)));
+        let Expr::Pipe(stages) = shared("$u.tags") else {
+            panic!("a container field is read through the marker");
+        };
+        assert!(matches!(stages[0], Expr::TrackedVar(_)));
+        // Without the jq-mode `splice`, and under the path marker, the object stays whole.
+        for (mode, splice) in [(LoopVarSplice::Shared, false), (LoopVarSplice::Path, true)] {
+            let Expr::Pipe(stages) = substitute_fold_step(
+                &parse("$u.score").unwrap(),
+                &[("u".to_string(), record.clone())],
+                &[],
+                mode,
+                splice,
+            ) else {
+                panic!("{mode:?}/{splice}: not spliced");
+            };
+            assert!(
+                matches!(stages[0], Expr::TrackedVar(_)),
+                "{mode:?}/{splice}"
+            );
+        }
     }
 
     /// #1368: `substitute_vars` on an empty binding list must return `expr`

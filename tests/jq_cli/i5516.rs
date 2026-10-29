@@ -55,6 +55,7 @@ fn test_fold_step_hands_its_loop_variable_on_5516() -> Result<()> {
         "[nan] as $a | reduce $a as $v (null; [$v]) | .[0] == $a",
         "[nan] as $a | reduce $a as $v (null; {x: $v}) | .x == $a",
         "[[nan]] as $a | reduce $a as $v (null; $v[0]) == $a[0]",
+        "[{\"a\":[nan],\"s\":1}] as $a | reduce $a[] as $r (null; $r.a) == $a[0].a",
         "[[nan]] as $a | reduce $a as [$x] (null; $x) == $a[0]",
         "[nan] as $a | reduce $a as $v (null; if true then $v else 0 end) == $a",
         "[nan] as $a | reduce $a as $v (null; $v // 0) == $a",
