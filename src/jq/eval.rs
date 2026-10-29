@@ -26246,7 +26246,7 @@ fn build_regex<S: EvalSemantics>(pattern: &str, flags: Option<&str>) -> Result<J
         Err(e) => match build_fancy_regex::<S>(&pattern) {
             Some(re) => Ok(JqRegex {
                 engine: RegexEngine::Fancy(re),
-                // `build_fancy_regex` rewrote `$` itself: see [`rewrite_end_anchors`].
+                // `build_fancy_regex` rewrote `$` itself: see [`prepare_fancy_pattern`].
                 needs_trailing_nl_check: false,
                 suppress_empty,
             }),
@@ -26263,19 +26263,19 @@ const FANCY_BACKTRACK_LIMIT: usize = 10_000_000;
 
 /// The `fancy-regex` compilation of a jq pattern the `regex` crate refused (#5502), or `None`
 /// when the pattern uses anything whose meaning there was not checked against jq-1.7.1 to be
-/// Oniguruma's: an escape outside [`fancy_escape_is_oniguruma`]'s list (`\h` is a hex digit in
-/// `fancy-regex` and a literal `h` in jq), or a construct outside [`fancy_expr_is_oniguruma`]'s
+/// Oniguruma's: syntax [`prepare_fancy_pattern`] refuses (`\h` is a hex digit in `fancy-regex`
+/// and a literal `h` in jq), or a construct outside [`fancy_expr_is_oniguruma`]'s list
 /// (subroutine calls, absence operators, backtracking verbs). Those keep the `invalid regex`
 /// refusal rather than answering differently from jq. Never in yq mode, whose dialect is Go's.
 ///
-/// `oniguruma_mode` makes `\<`/`\>` the literal characters, as in jq, where `fancy-regex` reads
-/// them as word boundaries by default.
+/// `oniguruma_mode` makes `\<`/`\>` the literal characters and `*+`/`++`/`?+` possessive, as in
+/// jq, where `fancy-regex` reads them as word boundaries and nested repeats by default.
 #[cfg(feature = "regex")]
 fn build_fancy_regex<S: EvalSemantics>(pattern: &str) -> Option<fancy_regex::Regex> {
-    if S::TAG == EvalTag::Yq || !pattern_escapes_are_oniguruma(pattern) {
+    if S::TAG == EvalTag::Yq {
         return None;
     }
-    let pattern = rewrite_end_anchors(pattern);
+    let pattern = prepare_fancy_pattern(pattern)?;
     let tree = fancy_regex::Expr::parse_tree(&pattern).ok()?;
     if !fancy_expr_is_oniguruma(&tree.expr)
         || tree.expr.has_descendant(|e| !fancy_expr_is_oniguruma(e))
@@ -26319,113 +26319,241 @@ fn fancy_expr_is_oniguruma(expr: &fancy_regex::Expr) -> bool {
     )
 }
 
-/// Whether every escape in `pattern` is one `fancy-regex` reads as Oniguruma does (#5502). Its
-/// parse tree cannot tell: `\h` arrives as the same class node as a written `[0-9A-Fa-f]`, and
-/// `\g1` as the same backreference as `\1`, where jq reads `\h` as a literal `h` and `\g1` as no
-/// backreference at all. A punctuation escape is always the literal character.
+/// The escape letters [`prepare_fancy_pattern`] lets through: the ones the `regex` crate already
+/// reads as jq does (`\d`, `\s`, `\b`, `\p{..}`, `\x..`, `\n`, ... -- `\w` never reaches here,
+/// [`translate_posix_brackets`] rewrote it), and the Oniguruma ones `fancy-regex` adds and reads
+/// alike: `\1`-`\9`, `\k<name>`, `\K`, `\G`, `\R`, `\e` and `\Z` (which it replaces). A
+/// punctuation escape is always the literal character. `fancy-regex`'s parse tree cannot catch the
+/// others: `\h` arrives as the same class node as a written `[0-9A-Fa-f]`, and `\g1` as the same
+/// backreference as `\1`, where jq reads `\h` as a literal `h` and `\g1` as no backreference.
 #[cfg(feature = "regex")]
-fn pattern_escapes_are_oniguruma(pattern: &str) -> bool {
-    let mut chars = pattern.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some(e) if !e.is_ascii_alphanumeric() || fancy_escape_is_oniguruma(e) => {}
-                _ => return false,
+fn fancy_escape_is_oniguruma(e: char) -> bool {
+    !e.is_ascii_alphanumeric()
+        || matches!(
+            e,
+            '1'..='9'
+                | 'k'
+                | 'A'
+                | 'z'
+                | 'Z'
+                | 'b'
+                | 'B'
+                | 'd'
+                | 'D'
+                | 's'
+                | 'S'
+                | 'p'
+                | 'P'
+                | 'x'
+                | 'n'
+                | 't'
+                | 'r'
+                | 'f'
+                | 'v'
+                | 'a'
+                | 'e'
+                | 'K'
+                | 'G'
+                | 'R'
+        )
+}
+
+/// `pattern` ready for `fancy-regex` (#5502), or `None` for syntax it would read differently from
+/// jq-1.7.1's Oniguruma, which then keeps the `regex` crate's refusal:
+///
+/// - an escape outside [`fancy_escape_is_oniguruma`]'s list;
+/// - a `(?P...)` group, which Oniguruma's Perl syntax rejects and `fancy-regex` accepts;
+/// - a reversed interval (`a{3,2}`), an error in jq and a possessive `a{2,3}` in `oniguruma_mode`;
+/// - a `+` after an interval: possessive in jq for `{n,m}+` and `{n,}+` but a repeat of a repeat
+///   for `{n}+`, and a repeat of a repeat for all three in `fancy-regex`.
+///
+/// Each `\Z`, and each `$` where multi-line mode is off, becomes `(?=\n?\z)`: the end of the text,
+/// or just before one final `\n`, which is what both mean in jq (`"a\n" | test("a$")` is `true`,
+/// `"a\n\n" | test("a$")` is `false`). The `regex` route emulates that with a second search of the
+/// text without its `\n` ([`dv_captures_at`]), which is wrong once a lookaround can look at that
+/// `\n` (`"a\n" | test("a(?!\n)$")` is `false` in jq); `fancy-regex` has lookahead, so the anchor
+/// is spelled out instead. Its own `\Z` also matches before `\n\n`, which jq's does not.
+///
+/// The scan follows the lexical structure both engines share: escapes, classes (where none of the
+/// above applies), `(?#...)` comments and, where the `x` flag is on, `#` comments to the end of
+/// the line, all copied through untouched. The `m` and `x` flags are followed per group, as inline
+/// `(?flags)` and `(?flags:...)` set them.
+#[cfg(feature = "regex")]
+fn prepare_fancy_pattern(pattern: &str) -> Option<String> {
+    const END: &str = r"(?=\n?\z)";
+    #[derive(Clone, Copy, Default)]
+    struct Flags {
+        multi_line: bool,
+        extended: bool,
+    }
+    fn apply(flags: &mut Flags, letters: &[char]) {
+        let mut on = true;
+        for &c in letters {
+            match c {
+                '-' => on = false,
+                'm' => flags.multi_line = on,
+                'x' => flags.extended = on,
+                _ => {}
             }
         }
     }
-    true
-}
-
-/// The escape letters [`pattern_escapes_are_oniguruma`] lets through: the ones the `regex` crate
-/// already reads as jq does (`\d`, `\s`, `\b`, `\p{..}`, `\x..`, `\n`, ... -- `\w` never reaches
-/// here, [`translate_posix_brackets`] rewrote it), and the Oniguruma ones `fancy-regex` adds and
-/// reads alike: `\1`-`\9`, `\k<name>`, `\K`, `\G`, `\R`, `\e`, `\<`, `\>` and `\Z` (which
-/// [`rewrite_end_anchors`] replaces).
-#[cfg(feature = "regex")]
-fn fancy_escape_is_oniguruma(e: char) -> bool {
-    matches!(
-        e,
-        '1'..='9'
-            | 'k'
-            | 'A'
-            | 'z'
-            | 'Z'
-            | 'b'
-            | 'B'
-            | 'd'
-            | 'D'
-            | 's'
-            | 'S'
-            | 'p'
-            | 'P'
-            | 'x'
-            | 'n'
-            | 't'
-            | 'r'
-            | 'f'
-            | 'v'
-            | 'a'
-            | 'e'
-            | 'K'
-            | 'G'
-            | 'R'
-    )
-}
-
-/// `pattern` with each `\Z`, and each `$` unless the pattern may turn on multi-line mode, written
-/// as `(?=\n?\z)`: the end of the text, or just before one final `\n`, which is what both mean in
-/// jq (`"a\n" | test("a$")` is `true`, `"a\n\n" | test("a$")` is `false`). The `regex` route
-/// emulates that with a second search of the text without its `\n` ([`dv_captures_at`]), which is
-/// wrong once a lookaround can look at that `\n` (`"a\n" | test("a(?!\n)$")` is `false` in jq);
-/// `fancy-regex` has lookahead, so the anchor is spelled out instead. Its own `\Z` also matches
-/// before `\n\n`, which jq's does not. Escaped characters and class contents are left alone.
-#[cfg(feature = "regex")]
-fn rewrite_end_anchors(pattern: &str) -> std::borrow::Cow<'_, str> {
-    const END: &str = r"(?=\n?\z)";
-    let rewrite_dollar = !pattern_may_enable_multiline(pattern);
-    if !(pattern.contains("\\Z") || (rewrite_dollar && pattern.contains('$'))) {
-        return std::borrow::Cow::Borrowed(pattern);
-    }
+    let chars: Vec<char> = pattern.chars().collect();
     let mut out = string_with_capacity(pattern.len() + END.len());
+    // One entry per open group: the flags in force inside it.
+    let mut groups = vec![Flags::default()];
     // Open classes, and whether the next char is the first of the class (after an optional `^`),
     // where a `]` is a literal -- as in [`translate_posix_brackets`], whose output this reads.
     let mut depth = 0usize;
     let mut at_start = false;
-    let mut chars = pattern.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => {
-                let next = chars.next();
-                if depth == 0 && next == Some('Z') {
-                    out.push_str(END);
-                } else {
-                    out.push(c);
-                    out.extend(next);
-                }
-                at_start = false;
-                continue;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let flags = *groups.last().expect("the outermost group is never closed");
+        if c == '\\' {
+            let next = chars.get(i + 1).copied();
+            if !next.is_some_and(fancy_escape_is_oniguruma) {
+                return None;
             }
-            '$' if depth == 0 && rewrite_dollar => out.push_str(END),
+            let mut end = i + 2;
+            if depth == 0 && next == Some('Z') {
+                out.push_str(END);
+            } else {
+                // `\p{L}`, `\x{41}`: the braces are the escape's own, not an interval.
+                if matches!(next, Some('p' | 'P' | 'x')) && chars.get(end) == Some(&'{') {
+                    end = chars[end..]
+                        .iter()
+                        .position(|&c| c == '}')
+                        .map_or(chars.len(), |n| end + n + 1);
+                }
+                out.extend(&chars[i..end]);
+            }
+            at_start = false;
+            i = end;
+            continue;
+        }
+        if depth > 0 {
+            match c {
+                '[' => {
+                    depth += 1;
+                    at_start = true;
+                    out.push(c);
+                    i += 1;
+                    continue;
+                }
+                ']' if !at_start => depth -= 1,
+                '^' if at_start => {
+                    out.push(c);
+                    i += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            at_start = false;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        match c {
             '[' => {
-                depth += 1;
+                depth = 1;
                 at_start = true;
                 out.push(c);
+                i += 1;
                 continue;
             }
-            ']' if depth > 0 && !at_start => {
-                depth -= 1;
-                out.push(c);
-            }
-            '^' if at_start => {
-                out.push(c);
+            '#' if flags.extended => {
+                let end = chars[i..]
+                    .iter()
+                    .position(|&c| c == '\n')
+                    .map_or(chars.len(), |n| i + n);
+                out.extend(&chars[i..end]);
+                i = end;
                 continue;
             }
-            _ => out.push(c),
+            '$' if !flags.multi_line => {
+                out.push_str(END);
+                i += 1;
+                continue;
+            }
+            '{' => {
+                // An interval only when it is digits, an optional comma and digits; otherwise a
+                // literal `{`, as in both engines. Without a lower bound (`{,2}`) it is a literal
+                // in jq too, but an interval in `fancy-regex`, so it is escaped.
+                let digits = |from: usize| {
+                    chars[from..]
+                        .iter()
+                        .take_while(|c| c.is_ascii_digit())
+                        .count()
+                };
+                let lo = digits(i + 1);
+                if lo == 0 {
+                    out.push_str("\\{");
+                    i += 1;
+                    continue;
+                }
+                let mut j = i + 1 + lo;
+                let mut hi = None;
+                if chars.get(j) == Some(&',') {
+                    let n = digits(j + 1);
+                    hi = Some(&chars[j + 1..j + 1 + n]);
+                    j += 1 + n;
+                }
+                if chars.get(j) == Some(&'}') {
+                    let number = |d: &[char]| d.iter().collect::<String>().parse::<u64>().ok();
+                    let reversed = match (number(&chars[i + 1..i + 1 + lo]), hi.and_then(number)) {
+                        (Some(lo), Some(hi)) => hi < lo,
+                        _ => false,
+                    };
+                    if reversed || chars.get(j + 1) == Some(&'+') {
+                        return None;
+                    }
+                }
+            }
+            '(' if chars.get(i + 1) == Some(&'?') => {
+                let rest = &chars[i + 2..];
+                if rest.first() == Some(&'#') {
+                    let end = rest
+                        .iter()
+                        .position(|&c| c == ')')
+                        .map_or(chars.len(), |n| i + 2 + n + 1);
+                    out.extend(&chars[i..end]);
+                    i = end;
+                    continue;
+                }
+                if rest.first() == Some(&'P') {
+                    return None;
+                }
+                let letters = rest
+                    .iter()
+                    .take_while(|c| c.is_ascii_alphabetic() || **c == '-')
+                    .count();
+                let mut inner = flags;
+                match rest.get(letters) {
+                    // `(?flags)`: the rest of the enclosing group.
+                    Some(')') => {
+                        apply(groups.last_mut().expect("never empty"), &rest[..letters]);
+                        out.extend(&chars[i..=i + 2 + letters]);
+                        i += 2 + letters + 1;
+                        continue;
+                    }
+                    // `(?flags:...)`, `(?:...)`: this group only.
+                    Some(':') => apply(&mut inner, &rest[..letters]),
+                    // Lookaround, a named or atomic group, a conditional: the enclosing flags.
+                    _ => {}
+                }
+                groups.push(inner);
+            }
+            '(' => groups.push(flags),
+            ')' if groups.len() > 1 => {
+                groups.pop();
+            }
+            _ => {}
         }
         at_start = false;
+        out.push(c);
+        i += 1;
     }
-    std::borrow::Cow::Owned(out)
+    Some(out)
 }
 
 /// jq's regex builtins bottom out in `_match_impl`, a C function that reads its **input** before
@@ -27016,9 +27144,10 @@ fn utf8_char_count(s: &str) -> usize {
 /// Amortises codepoint-offset conversion across the many *forward-order*
 /// offset queries a single `match(re)`/`match(re;"g")` call makes.
 ///
-/// `global_captures` produces matches at strictly increasing byte offsets,
-/// and every capture group's own offset is always `>= ` the overall match's
-/// start (captures can't extend outside their match). A naive
+/// `global_captures` produces matches at strictly increasing byte offsets.
+/// A capture group's own offset is usually `>=` the overall match's start,
+/// but not always: a group in a lookbehind, or before a `\K`, starts earlier
+/// (#5502). A naive
 /// `input[..byte_offset].chars().count()` re-scan from byte 0 on every one
 /// of those calls made `match(".";"g")` quadratic on any document containing
 /// even a single non-ASCII byte (#806 follow-up) -- `M` matches each
@@ -27028,10 +27157,11 @@ fn utf8_char_count(s: &str) -> usize {
 /// Mirrors the one-entry forward-walk cache `LineIndex` uses in
 /// `src/text/lines.rs`: advancing the cursor forward only counts the bytes
 /// since the last query (amortised `O(1)` per call, `O(N)` total across a
-/// monotone walk), and a backward query -- only possible among a single
-/// match's own out-of-order capture offsets, never across matches -- falls
-/// back to a direct scan from byte 0 without disturbing the cursor, so later
-/// forward queries stay correct.
+/// monotone walk), and a backward query -- a group starting before its match,
+/// or before an earlier group -- counts back from the cursor without moving
+/// it, so it costs the distance back rather than a scan from byte 0 (which
+/// made `[match("(?<=(.)).";"g")]` quadratic, #5502), and later forward
+/// queries stay correct.
 #[cfg(feature = "regex")]
 #[derive(Default)]
 struct CodepointCursor {
@@ -27050,7 +27180,7 @@ impl CodepointCursor {
             self.byte = byte_offset;
             self.chars as i64
         } else {
-            utf8_char_count(&input[..byte_offset]) as i64
+            (self.chars - utf8_char_count(&input[byte_offset..self.byte])) as i64
         }
     }
 }
@@ -125249,10 +125379,11 @@ mod tests {
 
     #[cfg(feature = "regex")]
     #[test]
-    fn test_rewrite_end_anchors_spells_out_dollar_and_backslash_z_5502() {
+    fn test_prepare_fancy_pattern_end_anchors_5502() {
         const END: &str = r"(?=\n?\z)";
-        assert_eq!(rewrite_end_anchors("a(?!b)$"), format!("a(?!b){END}"));
-        assert_eq!(rewrite_end_anchors(r"(?<=a)\Z"), format!("(?<=a){END}"));
+        let prepared = |pattern: &str| prepare_fancy_pattern(pattern).expect(pattern);
+        assert_eq!(prepared("a(?!b)$"), format!("a(?!b){END}"));
+        assert_eq!(prepared(r"(?<=a)\Z"), format!("(?<=a){END}"));
         // An escaped `$`, one inside a class (a leading `]` included), and `\z` stay as written.
         for pattern in [
             r"(?=a)\$",
@@ -125262,24 +125393,65 @@ mod tests {
             r"(?=a)[\]$]",
             r"(?=a)\z",
         ] {
-            assert_eq!(rewrite_end_anchors(pattern), pattern);
+            assert_eq!(prepared(pattern), pattern);
         }
         // A `$` after a class closes it is the anchor again.
+        assert_eq!(prepared("(?=a)[[b]c]$"), format!("(?=a)[[b]c]{END}"));
+        // Multi-line mode leaves `$` alone, for its own scope only, and still rewrites `\Z`.
+        assert_eq!(prepared("(?m)(?=a)$"), "(?m)(?=a)$");
+        assert_eq!(prepared(r"(?m)(?=a)\Z"), format!("(?m)(?=a){END}"));
+        assert_eq!(prepared("(?m:(?=a)$)$"), format!("(?m:(?=a)$){END}"));
+        assert_eq!(prepared("((?m)(?=a)$)$"), format!("((?m)(?=a)$){END}"));
         assert_eq!(
-            rewrite_end_anchors("(?=a)[[b]c]$"),
-            format!("(?=a)[[b]c]{END}")
+            prepared("(?m)(?-m:(?=a)$)$"),
+            format!("(?m)(?-m:(?=a){END})$")
         );
-        // Multi-line mode leaves `$` alone and still rewrites `\Z`, which it does not affect.
-        assert_eq!(rewrite_end_anchors("(?m)(?=a)$"), "(?m)(?=a)$");
-        assert_eq!(
-            rewrite_end_anchors(r"(?m)(?=a)\Z"),
-            format!("(?m)(?=a){END}")
-        );
+        // An `m` in a lookahead, a named or an atomic group is not the flag (the review of #5502).
+        assert_eq!(prepared("a(?=m)m$"), format!("a(?=m)m{END}"));
+        assert_eq!(prepared("(?<m>a)(?=b)$"), format!("(?<m>a)(?=b){END}"));
+        assert_eq!(prepared("(?>name)$"), format!("(?>name){END}"));
     }
 
     #[cfg(feature = "regex")]
     #[test]
-    fn test_pattern_escapes_are_oniguruma_5502() {
+    fn test_prepare_fancy_pattern_comments_and_intervals_5502() {
+        const END: &str = r"(?=\n?\z)";
+        let prepared = |pattern: &str| prepare_fancy_pattern(pattern).expect(pattern);
+        // Comments are copied through: a `[` there opens no class, a `$` is no anchor, an escape
+        // is not checked.
+        assert_eq!(prepared("(?=a)(?#[)$"), format!("(?=a)(?#[){END}"));
+        assert_eq!(prepared("(?#cost $5)(?=a)"), "(?#cost $5)(?=a)");
+        assert_eq!(prepared("(?#\\h)(?=a)"), "(?#\\h)(?=a)");
+        assert_eq!(
+            prepared("(?x)(?=a)b # [$ \\h\n$"),
+            format!("(?x)(?=a)b # [$ \\h\n{END}")
+        );
+        // `#` is a comment only where `x` is on, and is literal in a class.
+        assert_eq!(prepared("(?=a)#$"), format!("(?=a)#{END}"));
+        assert_eq!(prepared("(?x:(?=a))#$"), format!("(?x:(?=a))#{END}"));
+        assert_eq!(prepared("(?x)(?=a)[#]$"), format!("(?x)(?=a)[#]{END}"));
+        // An interval without a lower bound is a literal in jq; any `{` without one is escaped,
+        // which keeps a `{x}` the literal it already was.
+        assert_eq!(prepared("(?=a)b{,2}"), "(?=a)b\\{,2}");
+        assert_eq!(prepared("(?=a)a{x}"), "(?=a)a\\{x}");
+        for pattern in ["(?=a)a{2}", "(?=a)a{2,}", "(?=a)a{2,3}", "(?=a)a{2"] {
+            assert_eq!(prepared(pattern), pattern);
+        }
+        // Refused: a reversed interval, a `+` after an interval, `(?P...)`.
+        for pattern in [
+            "(?=a)a{3,2}",
+            "(?=a)a{2,3}+",
+            "(?=a)a{2,}+",
+            "(?=a)a{2}+",
+            "(?P<n>a)(?P=n)",
+        ] {
+            assert!(prepare_fancy_pattern(pattern).is_none(), "{pattern}");
+        }
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_prepare_fancy_pattern_escapes_5502() {
         for pattern in [
             r"(?<=a)b",
             r"(ab)\1",
@@ -125290,13 +125462,20 @@ mod tests {
             r"\<a\>",
             r"\p{L}\x{41}\$\\",
         ] {
-            assert!(pattern_escapes_are_oniguruma(pattern), "{pattern}");
+            assert!(prepare_fancy_pattern(pattern).is_some(), "{pattern}");
         }
+        // An escape's own braces are copied, not read as an interval.
+        assert_eq!(
+            prepare_fancy_pattern(r"(?<=\p{L})\P{Lu}\x{41}[\p{N}]").as_deref(),
+            Some(r"(?<=\p{L})\P{Lu}\x{41}[\p{N}]")
+        );
         // `\h` is a hex digit in `fancy-regex` and a literal `h` in jq; `\g` is a subroutine call
-        // or relative backreference there, and the rest are not Oniguruma's Perl syntax.
+        // or relative backreference there, and the rest are not Oniguruma's Perl syntax. Inside a
+        // class too.
         for pattern in [
             r"(?=a)\h",
             r"(?=a)\H",
+            r"(?=a)[\h]",
             r"(a)\g1",
             r"(?<n>a)\g<n>",
             r"\X",
@@ -125304,8 +125483,22 @@ mod tests {
             r"\y",
             r"a\",
         ] {
-            assert!(!pattern_escapes_are_oniguruma(pattern), "{pattern}");
+            assert!(prepare_fancy_pattern(pattern).is_none(), "{pattern}");
         }
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_codepoint_cursor_counts_back_from_its_position_5502() {
+        // "éaéb": byte offsets 0, 2, 3, 5 are codepoints 0, 1, 2, 3.
+        let input = "\u{e9}a\u{e9}b";
+        let mut cursor = CodepointCursor::default();
+        assert_eq!(cursor.advance(input, 5), 3);
+        // A group before its match (a lookbehind, `\K`) asks backward; the cursor stays put.
+        assert_eq!(cursor.advance(input, 2), 1);
+        assert_eq!(cursor.advance(input, 0), 0);
+        assert_eq!((cursor.byte, cursor.chars), (5, 3));
+        assert_eq!(cursor.advance(input, 6), 4);
     }
 
     #[cfg(feature = "regex")]

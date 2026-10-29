@@ -107,6 +107,27 @@ fn test_end_anchors_with_lookaround_match_jq_5502() -> Result<()> {
     ])
 }
 
+/// The pattern's lexical structure decides what is rewritten: an `m` in a lookahead or an atomic
+/// group is not the multi-line flag, comments are skipped (a `[` there opens no class, a `$` is no
+/// anchor), `x` and `m` hold for their own group, and an interval without a lower bound is a
+/// literal (all found in review).
+#[test]
+fn test_fancy_route_follows_the_pattern_structure_5502() -> Result<()> {
+    assert_rows(&[
+        (r#""am\n" | test("a(?=m)m$")"#, "true"),
+        (r#""name\n" | test("(?>name)$")"#, "true"),
+        (r#""ab\n" | test("(?<=a)b(?#[)$")"#, "true"),
+        (r#""ab\n" | test("(?<=a)b # [x\n$"; "x")"#, "true"),
+        (r#""ab" | test("(?#cost $5)ab")"#, "true"),
+        (r#""ab" | test("(?<=a)b # \\h\n"; "x")"#, "true"),
+        (r#""ab\n" | test("(?<=a)(?x: b # c\n)$")"#, "true"),
+        (r#""a b\n" | test("(?<=a)(?x: b)#$")"#, "false"),
+        (r#""a\nb" | [match("(?<=a)(?m:$)"; "g").offset]"#, "[1]"),
+        (r#""ab{,2}" | test("(?<=a)b{,2}$")"#, "true"),
+        (r#""abb" | test("(?<=a)b{,2}$")"#, "false"),
+    ])
+}
+
 /// jq reports every group of an empty overall match as an empty match at its position, whatever
 /// it captured or whether it took part: `capture`, `scan` and `sub`'s `.` are built from `match`'s
 /// `captures`, so they show the same `""` (they showed `null` here before). A group inside a
@@ -136,7 +157,7 @@ fn test_empty_match_reports_every_group_empty_5502() -> Result<()> {
 
 /// Escapes and constructs `fancy-regex` reads differently from Oniguruma, or that were not checked
 /// against it, keep the `regex` crate's refusal rather than answering differently from jq
-/// (jq 1.7.1: `true`, `true`, `true`, `false`).
+/// (jq 1.7.1: `true`, `true`, `true`, `false`, an error, an error, `false`).
 #[test]
 fn test_constructs_read_differently_stay_refused_5502() -> Result<()> {
     for filter in [
@@ -144,6 +165,11 @@ fn test_constructs_read_differently_stay_refused_5502() -> Result<()> {
         r#""abab" | test("(?<n>ab)\\g<n>")"#,
         r#""abc" | test("(?~b)")"#,
         r#""abab" | test("(ab)\\g1")"#,
+        // jq errors on these three; `fancy-regex` would answer them.
+        r#""aaa" | test("a{3,2}")"#,
+        r#""aa" | test("(?P<n>a)(?P=n)")"#,
+        // Possessive in jq, a repeat of a repeat in `fancy-regex` (jq: `false`).
+        r#""aaa" | test("^(?=a)a{2,3}+a$")"#,
     ] {
         let (stdout, stderr, code) = run(filter)?;
         assert_eq!((stdout.as_str(), code), ("", 5), "{filter}");
