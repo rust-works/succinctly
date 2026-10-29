@@ -3755,6 +3755,25 @@ impl Expr {
 }
 
 impl Expr {
+    /// Whether this expression, parentheses peeled, is a `+` or `*` -- the operators whose result
+    /// yq reads a bracketed key of without a parent to vivify it under (#4361).
+    #[must_use]
+    pub fn is_sum_or_merge(&self) -> bool {
+        let mut node = self;
+        while let Self::Paren(inner) = node {
+            node = inner;
+        }
+        matches!(
+            node,
+            Self::Arithmetic {
+                op: ArithOp::Add | ArithOp::Mul(_),
+                ..
+            }
+        )
+    }
+}
+
+impl Expr {
     /// Spell an arbitrary value in place as a passthrough snapshot with no
     /// bound node -- the one node that can hold a value no literal syntax
     /// spells (a `NumberLiteral` with its own text, a value above the

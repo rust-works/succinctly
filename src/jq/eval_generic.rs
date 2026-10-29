@@ -67,7 +67,7 @@ use super::eval::{
     eval_each_owned, eval_full_unrouted as full_eval, finish_fork_flow, finish_fork_from_flow,
     finish_short_circuit, fold_escaped_generator_prefix, foreach_forks, format_owned,
     has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
-    index_one_owned_read as index_owned_by_key, is_assignment_expr, is_eager_arg,
+    index_one_owned_read_of as index_owned_by_key, is_assignment_expr, is_eager_arg,
     is_identity_passthrough, is_retryable_control, is_retryable_stop, key_arrays_eq, limit_raising,
     literal_to_owned, mark_nonretryable_escape, native_stack_exhausted, needs_path_context,
     numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned, owned_bound_to_i64_for,
@@ -19184,7 +19184,12 @@ fn process_index_key<S: EvalSemantics, V: DocumentValue>(
                     Ok(t) => t,
                     Err(control) => return drive.stop_with_escape(control),
                 };
-                match index_owned_checked::<S>(&t, k, optional) {
+                match index_owned_checked::<S>(
+                    crate::jq::eval::yq_sum_or_merge_read::<S>(target),
+                    &t,
+                    k,
+                    optional,
+                ) {
                     Ok(Some(v)) => {
                         if sink.push(GenericItem::Owned(v)) == Demand::Stop {
                             return drive.consumer_stop();
@@ -22883,6 +22888,7 @@ fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
 /// surfaced when the library entry moved onto this evaluator (#3457), and the
 /// CLI's cursor route, which had the same gap, is fixed with it.
 fn index_owned_checked<S: EvalSemantics>(
+    sum_or_merge: bool,
     target: &OwnedValue,
     key: &OwnedValue,
     optional: bool,
@@ -22890,7 +22896,7 @@ fn index_owned_checked<S: EvalSemantics>(
     if let Some(e) = yq_negative_index_error::<S>(target, key) {
         return Err(e);
     }
-    index_owned_by_key::<S>(target, key, optional)
+    index_owned_by_key::<S>(sum_or_merge, target, key, optional)
 }
 
 /// Evaluate `E[K]` — indexing by a computed key.
@@ -22905,6 +22911,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
+    let sum_or_merge = crate::jq::eval::yq_sum_or_merge_read::<S>(target);
     // Keys first: an empty key stream must not evaluate the target at all.
     //
     // `pending_control` carries the key stream's own escape when it arrived
@@ -23174,7 +23181,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                         }
                     },
                     accumulator: owned,
-                    fold: |t| index_owned_checked::<S>(t, k, optional),
+                    fold: |t| index_owned_checked::<S>(sum_or_merge, t, k, optional),
                 }
             }
             GenericResult::One(v) => KeyTargets::Native(vec![(v, None)]),
@@ -23333,7 +23340,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                     escape_generic!(Control::Error(cannot_reserve_cross_product(&[ts.len()])));
                 }
                 for t in &ts {
-                    match index_owned_checked::<S>(t, k, optional) {
+                    match index_owned_checked::<S>(sum_or_merge, t, k, optional) {
                         Ok(Some(v)) => owned.push(v),
                         Ok(None) => {}
                         // Same reasoning as the `Native` arm above: a later

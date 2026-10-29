@@ -29760,6 +29760,38 @@ pub(crate) fn index_one_owned_read<S: EvalSemantics>(
     index_one_owned::<S>(target, key, optional)
 }
 
+/// Whether a bracket read's target is the result of a `+` or `*` in yq mode (#4361).
+///
+/// yq reads such a node without a parent to vivify a missing key under, so an absent key on a
+/// mapping answers nothing where every other target answers `null`.
+pub(crate) fn yq_sum_or_merge_read<S: EvalSemantics>(target: &Expr) -> bool {
+    S::TAG == EvalTag::Yq && target.is_sum_or_merge()
+}
+
+/// [`index_one_owned_read`] for a target that [`yq_sum_or_merge_read`] flagged: a key the
+/// mapping does not hold answers nothing (#4361). A key it holds, and every other kind of
+/// target, read as before.
+pub(crate) fn index_one_owned_read_of<S: EvalSemantics>(
+    sum_or_merge: bool,
+    target: &OwnedValue,
+    key: &OwnedValue,
+    optional: bool,
+) -> Result<Option<OwnedValue>, EvalError> {
+    if sum_or_merge {
+        if let OwnedValue::Object(map) = target {
+            let absent = match key {
+                OwnedValue::String(s) => map.get(s.as_str()).is_none(),
+                _ => yq_mapping_index_text::<S>(key)
+                    .is_some_and(|text| map.get(text.as_str()).is_none()),
+            };
+            if absent {
+                return Ok(None);
+            }
+        }
+    }
+    index_one_owned_read::<S>(target, key, optional)
+}
+
 /// Reserve capacity for a `Vec<T>` sized as the product of `factors`,
 /// without risking the unconditional panic/abort `Vec::with_capacity`
 /// gives an unrepresentable or unallocatable length (#1634, same
@@ -29986,6 +30018,7 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    let sum_or_merge = yq_sum_or_merge_read::<S>(target);
     // (3) Keys first: an empty key stream must not evaluate the target.
     //
     // `pending_control` carries the key stream's own escape when it arrived
@@ -30226,7 +30259,7 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                                 }
                             },
                             accumulator: owned.as_mut().expect("promoted by the block above"),
-                            fold: |t| index_one_owned_read::<S>(t, k, optional),
+                            fold: |t| index_one_owned_read_of::<S>(sum_or_merge, t, k, optional),
                         }
                     }
                 };
@@ -30379,7 +30412,7 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                             if let Some(e) = yq_negative_index_error::<S>(t, k) {
                                 escape_with_prefix!(Control::Error(e));
                             }
-                            match index_one_owned_read::<S>(t, k, optional) {
+                            match index_one_owned_read_of::<S>(sum_or_merge, t, k, optional) {
                                 Ok(Some(v)) => owned.as_mut().expect("still Some").push(v),
                                 Ok(None) => {}
                                 // Same reasoning as the `Borrowed` arm above: a
