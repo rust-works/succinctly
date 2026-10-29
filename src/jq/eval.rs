@@ -3524,19 +3524,46 @@ pub(crate) fn pipe_needs_path_context(stages: &PipeStages) -> bool {
 /// the node pays no more than it did and one that does not pays once.
 pub(crate) fn pipe_holds_tracked_var(stages: &PipeStages) -> bool {
     stages.holds_tracked_var_or_init(|stages| {
-        stages
-            .iter()
-            .any(|stage| any_subexpr(stage, &mut |e| matches!(e, Expr::TrackedVar(_))))
+        stages.iter().any(|stage| match kept_run_of(stage) {
+            Some(run) => kept_run_answers(run, pipe_holds_tracked_var),
+            None => any_subexpr(stage, &mut |e| matches!(e, Expr::TrackedVar(_))),
+        })
     })
+}
+
+/// The stages a stage of a split tail stands for when it is one of the runs
+/// the pipe keeps ([`TailPlan::Split`]), which remember the facts these
+/// early-outs ask: a split tail is built for each call, and a walk of a run is
+/// paid again by every call, so a split pipe was as quadratic as the copy it
+/// replaces (#5441).
+#[inline]
+fn kept_run_of(stage: &Expr) -> Option<&PipeStages> {
+    match stage {
+        Expr::Shared(arg) => arg.run_stages(),
+        _ => None,
+    }
+}
+
+/// `fact` of a kept run ([`kept_run_of`]), out of line: a run is reached once
+/// per split tail, while the walk around it runs for every stage of every pipe,
+/// and a call back into the fact inline kept that walk from being inlined into
+/// its callers (+2.5% instructions on a 7950X for a pipe that reads its
+/// variable in every stage, which is never split, #5441).
+#[inline(never)]
+fn kept_run_answers(run: &PipeStages, fact: fn(&PipeStages) -> bool) -> bool {
+    fact(run)
 }
 
 /// Whether the stages of a pipe hold a node that can start a resolver
 /// invocation ([`may_enter_resolver_node`]), remembered on the pipe (#5404).
+/// A kept run is asked for its stages, not counted as the `Shared` around them
+/// (#5441): it is evaluated as those stages.
 pub(crate) fn pipe_holds_resolver_node(stages: &PipeStages) -> bool {
     stages.holds_resolver_node_or_init(|stages| {
-        stages
-            .iter()
-            .any(|stage| any_subexpr(stage, &mut may_enter_resolver_node))
+        stages.iter().any(|stage| match kept_run_of(stage) {
+            Some(run) => kept_run_answers(run, pipe_holds_resolver_node),
+            None => any_subexpr(stage, &mut may_enter_resolver_node),
+        })
     })
 }
 
@@ -3545,9 +3572,10 @@ pub(crate) fn pipe_holds_resolver_node(stages: &PipeStages) -> bool {
 /// destructuring bind is an `Expr::AsPattern`, which it does not).
 pub(crate) fn pipe_holds_bind(stages: &PipeStages) -> bool {
     stages.holds_bind_or_init(|stages| {
-        stages
-            .iter()
-            .any(|stage| any_subexpr(stage, &mut |e| matches!(e, Expr::As { .. })))
+        stages.iter().any(|stage| match kept_run_of(stage) {
+            Some(run) => kept_run_answers(run, pipe_holds_bind),
+            None => any_subexpr(stage, &mut |e| matches!(e, Expr::As { .. })),
+        })
     })
 }
 
@@ -3577,7 +3605,21 @@ pub(crate) fn pipe_effect_before_last(stages: &PipeStages) -> bool {
 /// twice where jq reads `0`, then `1`.
 pub(crate) fn stages_effect_before_last(stages: &[Expr]) -> bool {
     match stages.split_last() {
-        Some((_, before)) => before.iter().any(|stage| {
+        Some((_, before)) => before.iter().any(stage_may_have_effect),
+        None => false,
+    }
+}
+
+/// Whether one stage of a pipe may have an effect or read the input state, as
+/// [`stages_effect_before_last`] counts them. A kept run is asked its
+/// remembered answer and its last stage, which that answer leaves out (#5441):
+/// one stage walked per run, not the run.
+fn stage_may_have_effect(stage: &Expr) -> bool {
+    match kept_run_of(stage) {
+        Some(run) => kept_run_answers(run, |run| {
+            pipe_effect_before_last(run) || run.last().is_some_and(stage_may_have_effect)
+        }),
+        None => {
             walk_body_may_have_effects(stage)
                 || any_subexpr(stage, &mut |e| {
                     matches!(
@@ -3585,8 +3627,7 @@ pub(crate) fn stages_effect_before_last(stages: &[Expr]) -> bool {
                         Expr::Builtin(Builtin::InputLineNumber | Builtin::InputFilename)
                     )
                 })
-        }),
-        None => false,
+        }
     }
 }
 
@@ -42715,7 +42756,12 @@ pub(crate) fn may_enter_resolver(expr: &Expr) -> bool {
 /// Whether evaluating `node` itself can start a resolver invocation -- see
 /// [`reentry_can_observe`], which asks this of every node in the
 /// expression. Conservative: every builtin and every call counts (a `def`
-/// body, a resolved `DefCall` and a `Shared` argument are walked too).
+/// body, a resolved `DefCall` and a `Shared` argument are walked too, and a
+/// `Shared` argument counts itself). A run of a split tail
+/// ([`SharedArg::run_stages`], #5441) is not an argument but stages of the
+/// pipe, evaluated as they are: it counts only for what it holds, which the
+/// walk reaches, so it answers as the unsplit pipe does and as
+/// [`pipe_holds_resolver_node`] remembers.
 fn may_enter_resolver_node(node: &Expr) -> bool {
     is_assignment_expr(node)
         || matches!(
@@ -42725,8 +42771,8 @@ fn may_enter_resolver_node(node: &Expr) -> bool {
                 | Expr::NamespacedCall { .. }
                 | Expr::DefCall { .. }
                 | Expr::FuncDef { .. }
-                | Expr::Shared(_)
         )
+        || matches!(node, Expr::Shared(arg) if arg.run_stages().is_none())
 }
 
 /// Whether resolving `expr` can bind a variable from a navigated position
@@ -75967,7 +76013,8 @@ fn substitute_var_impl(
                 .collect();
             if (3..=crate::jq::expr::MAX_KEPT_TAIL_STAGES).contains(&stages.len()) {
                 // #5436: a pipe that reads a variable somewhere keeps the tails
-                // that start after its last reading stage.
+                // that start after its last reading stage, and (#5441) the runs
+                // between its reading stages, which a longer tail is split around.
                 let reads_var = stages.holds_var_or_init(|stages| stages.iter().any(holds_var));
                 rebuilt.share_tails_of(stages, classify_stage, reads_var.then_some(&holds_var));
             }
@@ -112253,14 +112300,19 @@ mod tests {
     /// tails after the last such stage are the same for every value, and are
     /// kept once, as for a body that reads none (#5424). Forty values copy
     /// nothing more per value for a variable read in the first stage than for
-    /// a body that reads none; a variable read in the last stage shares no
-    /// tail, and answers the same. A tail copied because it holds one hands its
-    /// own tails on the link, so the tails after the variable are kept however
-    /// the copy was reached: a variable in the middle copies one tail for each
-    /// stage before it, where it copied one for every stage.
+    /// a body that reads none. In yq mode a variable read in the last stage
+    /// shares no tail, and answers the same; a tail copied because it holds one
+    /// hands its own tails on the link, so the tails after the variable are
+    /// kept however the copy was reached: a variable in the middle copies one
+    /// tail for each stage before it, where it copied one for every stage. In
+    /// jq mode a tail holding the reading stage is split around it (#5441), its
+    /// runs the ones the pipe keeps, so a variable read in the middle or last
+    /// copies nothing more per value either; one read in every stage leaves no
+    /// run to share.
     #[test]
     fn test_body_that_reads_its_variable_shares_the_tails_after_it_5436() {
         fn run<S: EvalSemantics>() {
+            let splits = S::TAG == EvalTag::Jq;
             const STAGES: usize = 20;
             let after = vec![". + 1"; STAGES - 1].join(" | ");
             let sum_of_indices = 40 * 39 / 2;
@@ -112289,13 +112341,13 @@ mod tests {
                     "as, middle",
                     format!("[range(0;N) | . as $x | ({after} | . + $x | {after})] | add"),
                     doubled + 40 * (STAGES - 1),
-                    Some(20),
+                    Some(if splits { 4 } else { 20 }),
                 ),
                 (
                     "as, last stage",
                     format!("[range(0;N) | . as $x | ({after} | . + $x)] | add"),
                     doubled,
-                    None,
+                    splits.then_some(4),
                 ),
                 (
                     "as, every stage",
@@ -112439,6 +112491,70 @@ mod tests {
             matches!(rest.rest().rest().plan::<JqSemantics>(), TailPlan::Copy),
             "a lone stage is handed on as itself, not kept"
         );
+    }
+
+    /// #5441: a split tail is built for each call, so the facts its pipe is
+    /// asked are read off the runs it keeps, not walked: they are the answers
+    /// for the stages the split stands for (a run is evaluated as its stages,
+    /// so the `Shared` around it is no resolver node), and a run's remembered
+    /// answer is the one read. A `Shared` argument is walked as before.
+    #[test]
+    fn test_split_tail_reads_the_facts_its_runs_remember_5441() {
+        let stages_of = |src: &str| match parse(src).unwrap() {
+            Expr::Pipe(stages) => stages,
+            other => unreachable!("{other:?}"),
+        };
+        let body = format!("{} | . + $x", [". + 1"; 11].join(" | "));
+        let reader = parse(". + 1").unwrap();
+        // The split a rebuilt pipe's tail from 1 stands for, its reader replaced
+        // by one that reads no variable.
+        let split_of = |source: &PipeStages| {
+            let rebuild = || {
+                let mut rebuilt = PipeStages::from(source.iter().cloned().collect::<Vec<_>>());
+                rebuilt.share_tails_of(source, classify_stage, Some(&holds_var));
+                rebuilt
+            };
+            let _first = rebuild();
+            let second = rebuild();
+            assert!(matches!(
+                tail_plan_of::<JqSemantics>(&second, 1),
+                TailPlan::Split
+            ));
+            let mut split = split_tail_of(&second, 1);
+            assert!(split.len() == 2 && kept_run_of(&split[0]).is_some());
+            split[1] = reader.clone();
+            PipeStages::from(split)
+        };
+        let split = split_of(&stages_of(&body));
+        let flat = PipeStages::from(vec![reader.clone(); 11]);
+        assert_eq!(
+            pipe_holds_resolver_node(&split),
+            pipe_holds_resolver_node(&flat)
+        );
+        assert!(!pipe_holds_resolver_node(&split), "the run is its stages");
+        let walk = |pipe: &PipeStages| {
+            pipe.iter()
+                .any(|stage| any_subexpr(stage, &mut may_enter_resolver_node))
+        };
+        assert!(!walk(&split), "and the walk agrees");
+        assert!(!pipe_holds_tracked_var(&split) && !pipe_holds_bind(&split));
+        assert!(!pipe_effect_before_last(&split));
+
+        // The run's remembered answer is the one read: seeded with a wrong one
+        // before anything asked, the split answers it.
+        let split = split_of(&stages_of(&body));
+        let run = kept_run_of(&split[0]).unwrap();
+        assert!(run.holds_bind_or_init(|_| true));
+        assert!(run.holds_resolver_node_or_init(|_| true));
+        assert!(pipe_holds_bind(&split) && pipe_holds_resolver_node(&split));
+
+        // An argument is not a run: its `Shared` counts, as it did.
+        let argument = PipeStages::from(vec![
+            Expr::shared(Expr::Pipe(stages_of(". + 1 | . + 2"))),
+            reader,
+        ]);
+        assert!(kept_run_of(&argument[0]).is_none());
+        assert!(pipe_holds_resolver_node(&argument) && walk(&argument));
     }
 
     /// #5404: the three facts a pipe remembers are the walks they stand in

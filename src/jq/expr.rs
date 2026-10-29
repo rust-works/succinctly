@@ -1504,6 +1504,9 @@ pub struct SharedArg {
     eager: core::cell::Cell<Option<bool>>,
     needs_path_context: core::cell::Cell<Option<bool>>,
     retrying_bind: core::cell::Cell<Option<bool>>,
+    /// Whether this is a run of a split tail ([`TailPlan::Split`]), not an
+    /// argument: stages of a pipe, kept as an `Expr::Pipe` of their own (#5441).
+    run: bool,
 }
 
 impl SharedArg {
@@ -1514,12 +1517,28 @@ impl SharedArg {
             eager: core::cell::Cell::new(None),
             needs_path_context: core::cell::Cell::new(None),
             retrying_bind: core::cell::Cell::new(None),
+            run: false,
         }
     }
 
     /// The captured argument.
     pub fn expr(&self) -> &Expr {
         &self.expr
+    }
+
+    /// The stages of the pipe this stands for when it is a run of a split tail
+    /// ([`TailPlan::Split`], #5441); `None` for an argument.
+    ///
+    /// A split tail is built for each call, so a fact a pipe remembers about
+    /// its stages (`eval::pipe_holds_resolver_node`, ...) is asked of it once
+    /// per call: read off the run's own remembered answer, it is not walked
+    /// again. A run is evaluated as the stages it holds, so its answer is
+    /// theirs; an argument's is not, and is walked as before.
+    pub(crate) fn run_stages(&self) -> Option<&PipeStages> {
+        match &self.expr {
+            Expr::Pipe(stages) if self.run => Some(stages),
+            _ => None,
+        }
     }
 
     /// The captured argument, for a pass that rewrites it in place. Forgets
@@ -1972,7 +1991,8 @@ struct TailState {
 struct TailTable {
     /// The offset after the last stage that reads a variable (#5436), `0` for a
     /// table that has none: a tail starting before it holds a stage that a
-    /// rebuilt pipe has a copy of its own of, so it is not kept.
+    /// rebuilt pipe has a copy of its own of, so it is not kept whole, but split
+    /// around such stages as around one holding evaluation state (#5441).
     volatile_through: u32,
     slots: Box<[core::cell::OnceCell<Option<Rc<SharedArg>>>]>,
     /// For each offset, the first stage at or after it that is not a
@@ -1984,7 +2004,8 @@ struct TailTable {
     /// For each offset, whether a run of two or more stages starts at it or
     /// after it: whether splitting a tail from there shares anything.
     shares: Box<[bool]>,
-    /// Empty for a pipe with no stateful stage, which is never split.
+    /// Empty for a pipe with no stateful stage and no stage that reads a
+    /// variable, which is never split.
     runs: Box<[core::cell::OnceCell<Option<Rc<SharedArg>>>]>,
 }
 
@@ -2017,17 +2038,20 @@ pub(crate) enum TailPlan {
     /// The owned `Expr::Pipe` over the whole tail, kept.
     Whole(Rc<SharedArg>),
     /// The tail holds a stage with evaluation state, which must start empty
-    /// each call (#3148): [`PipeStages::split_tail`] has the stages that stand
-    /// for it, the runs of [`StageClass::Run`] stages between its other stages
-    /// as the copies the pipe keeps and each other stage as a copy of its own.
-    /// Evaluated as a pipe, they are the tail.
+    /// each call (#3148), or, in a pipe rebuilt for each value, a stage that
+    /// reads the variable and so differs per value (#5441):
+    /// [`PipeStages::split_tail`] has the stages that stand for it, the runs of
+    /// [`StageClass::Run`] stages between its other stages as the copies the
+    /// pipe keeps and each other stage as a copy of its own. Evaluated as a
+    /// pipe, they are the tail.
     Split,
     /// The pipe keeps no copy of this tail: the caller copies it per call.
     Copy,
 }
 
-/// The shortest tail holding evaluation state that is [split](TailPlan::Split)
-/// rather than copied whole (#5421).
+/// The shortest tail holding evaluation state (#5421), or a stage that reads
+/// the variable a linked pipe was rebuilt for (#5441), that is
+/// [split](TailPlan::Split) rather than copied whole.
 ///
 /// A split replaces a copy of every stage with a few nodes, at the price of a
 /// pipe the evaluator reads one level deeper for each run. A short tail costs a
@@ -2041,8 +2065,8 @@ impl PipeStages {
     /// of that tail: it is the pipe's first ask, `may_keep` declined the tail,
     /// the tail is shorter than two stages (a lone stage is handed on as
     /// itself), or the pipe is longer than [`MAX_KEPT_TAIL_STAGES`]. A tail
-    /// holding evaluation state is not kept whole either; see
-    /// [`Self::tail_plan`].
+    /// holding evaluation state, or a stage that reads the variable a linked
+    /// pipe was rebuilt for, is not kept whole either; see [`Self::tail_plan`].
     #[cfg(test)]
     pub(crate) fn kept_tail(
         &self,
@@ -2071,7 +2095,10 @@ impl PipeStages {
     /// one call to the next would carry that too, so a tail holding one is not
     /// kept whole but, when `splittable`, handed on in pieces: each maximal run
     /// of [`StageClass::Run`] stages as a copy the pipe keeps, every other stage
-    /// cloned afresh for the call. `may_keep` says whether a copy may be kept
+    /// cloned afresh for the call. A linked pipe's tail that holds a stage
+    /// reading the variable it was rebuilt for ([`Self::share_tails_of`]) is
+    /// handed on the same way (#5441): that stage differs per value, and is
+    /// cloned from this pipe like a stateful one. `may_keep` says whether a copy may be kept
     /// and is asked once per copy: one too large would hold the program's
     /// memory for little.
     ///
@@ -2102,11 +2129,10 @@ impl PipeStages {
                 (Rc::clone(self.tail_table(class)), from, len)
             }
         };
-        if at < table.volatile_through as usize {
-            return TailPlan::Copy;
-        }
-        if (table.states[at] as usize) < end {
-            // A kept run holds no state, so this pipe is the program's own or linked.
+        // A tail holding a stage with state, or one that reads the variable a
+        // linked pipe was rebuilt for (#5441): kept runs hold neither, so this
+        // pipe is the program's own or linked.
+        if at < table.volatile_through as usize || (table.states[at] as usize) < end {
             return if splittable && len - from >= MIN_SPLIT_TAIL_STAGES && table.shares[at] {
                 TailPlan::Split
             } else {
@@ -2241,7 +2267,10 @@ impl PipeStages {
             shares[i] = shares[i + 1] || stops[i] as usize >= i + 2;
         }
         let slots = || (0..len).map(|_| core::cell::OnceCell::new()).collect();
-        let runs = if states[0] < len as u32 {
+        // Only a tail of `MIN_SPLIT_TAIL_STAGES` stages or more is split, and a
+        // pipe that asks this table is no longer than it.
+        let splits = states[0] < len as u32 || volatile_through > 0;
+        let runs = if splits && len > MIN_SPLIT_TAIL_STAGES {
             slots()
         } else {
             Box::default()
@@ -2267,9 +2296,11 @@ impl PipeStages {
     /// caller has checked (`is_volatile` is `None`). One that reads a variable
     /// is rebuilt with a different copy of each stage that reads it for each
     /// value (`is_volatile`, #5436): it links to a table of its own, whose
-    /// runs end at such a stage, and a tail that starts at or before the last
-    /// is copied for the value ([`TailTable::volatile_through`]). The tails
-    /// after it hold no variable, so they are the ones the source keeps.
+    /// runs end at such a stage. The tails after the last one hold no variable,
+    /// so they are the ones the source keeps; a tail that starts at or before
+    /// it is split around the reading stages (#5441), its runs the ones the
+    /// source keeps and each reading stage cloned from this pipe, or copied for
+    /// the value when it is too short to split ([`TailTable::volatile_through`]).
     ///
     /// The stages being the same, the tails are the ones the source keeps, and
     /// a stage that is not a run (`class`, #3148, #5421) is cloned afresh
@@ -2303,9 +2334,12 @@ impl PipeStages {
                 None => Some((Rc::downgrade(source.tail_table(class)), 0)),
                 Some(is_volatile) => {
                     let table = source.linked_table(class, is_volatile);
-                    // No tail of two stages or more starts after the last stage
-                    // that reads a variable: nothing would be kept.
-                    if table.volatile_through as usize + 2 > len {
+                    // Nothing would be kept when no tail of two stages or more
+                    // starts after the last stage that reads a variable and no
+                    // tail is long enough to split around one (#5441).
+                    let after_the_last = table.volatile_through as usize + 2 <= len;
+                    let splits = len > MIN_SPLIT_TAIL_STAGES && table.shares[1];
+                    if !after_the_last && !splits {
                         return;
                     }
                     Some((Rc::downgrade(table), 0))
@@ -2338,7 +2372,9 @@ impl PipeStages {
                     if matches!(kind, SlotKind::Tail) {
                         copy.tails.origin = Some((Rc::downgrade(table), at));
                     }
-                    Rc::new(SharedArg::new(Expr::Pipe(copy)))
+                    let mut arg = SharedArg::new(Expr::Pipe(copy));
+                    arg.run = matches!(kind, SlotKind::Run);
+                    Rc::new(arg)
                 })
             })
             .clone()
@@ -4591,6 +4627,94 @@ mod tests {
         let plain = unlinked.tail_copy(2);
         assert_eq!(plain.len(), 4);
         assert!(plain.tails.origin.is_none());
+    }
+
+    /// #5441: a pipe rebuilt from one that reads a variable splits a tail that
+    /// holds a reading stage around it, wherever it is, once the tail is long
+    /// enough: the runs between the reading stages are the ones the source
+    /// keeps, one copy for every rebuilt pipe, and each reading stage is cloned
+    /// from the rebuilt pipe. Only when asked to split (jq mode); a tail too
+    /// short to split is copied, and a pipe with no run to share, or too short
+    /// to split and with nothing after its last reader to keep, is not linked.
+    #[test]
+    fn test_pipe_stages_rebuilt_from_a_pipe_that_reads_a_variable_split_around_it_5441() {
+        let reads = |e: &Expr| matches!(e, Expr::Var(_));
+        let source_with = |len: usize, at: &[usize]| stages_5421(len, at, Expr::Var("x".into()));
+        let rebuild = |from: &PipeStages| {
+            let mut copy = PipeStages::from(from.to_vec());
+            copy.share_tails_of(from, |_| StageClass::Run, Some(&reads));
+            copy
+        };
+        let plan = |pipe: &PipeStages, from: usize, splittable: bool| {
+            pipe.tail_plan(from, |_| StageClass::Run, splittable, |_| true)
+        };
+        let is_run = |stage: &Expr, len: usize| run_len_5421(stage) == Some(len);
+        let same_run = |a: &Expr, b: &Expr| match (a, b) {
+            (Expr::Shared(a), Expr::Shared(b)) => Rc::ptr_eq(a, b),
+            _ => false,
+        };
+
+        // The reader in the last stage: linked from the second rebuild.
+        let source = source_with(12, &[11]);
+        assert!(
+            rebuild(&source).tails.origin.is_none(),
+            "the first is alone"
+        );
+        let (second, third) = (rebuild(&source), rebuild(&source));
+        assert!(matches!(plan(&second, 1, true), TailPlan::Split));
+        assert!(
+            matches!(plan(&second, 1, false), TailPlan::Copy),
+            "not split where the caller does not split (yq mode)"
+        );
+        assert!(
+            matches!(plan(&second, 5, true), TailPlan::Copy),
+            "a tail shorter than {MIN_SPLIT_TAIL_STAGES} stages is copied"
+        );
+        let split = second.split_tail(1, |_| true);
+        assert_eq!(split.len(), 2);
+        assert!(is_run(&split[0], 10), "the ten stages before the reader");
+        assert!(matches!(split[1], Expr::Var(_)), "the reader, cloned");
+        let again = third.split_tail(1, |_| unreachable!("kept for the second"));
+        assert!(same_run(&split[0], &again[0]));
+        assert!(
+            matches!(&split[0], Expr::Shared(run) if run.run_stages().is_some()),
+            "marked as a run"
+        );
+        // From a later offset the run is shorter, and a run of its own.
+        let later = second.split_tail(3, |_| true);
+        assert!(later.len() == 2 && is_run(&later[0], 8));
+
+        // The reader in the middle: a run on each side of it, the one after it
+        // as kept for the tail that starts there.
+        let source = source_with(21, &[10]);
+        let _first = rebuild(&source);
+        let middle = rebuild(&source);
+        let split = middle.split_tail(1, |_| true);
+        assert_eq!(split.len(), 3);
+        assert!(is_run(&split[0], 9) && is_run(&split[2], 10));
+        assert!(matches!(split[1], Expr::Var(_)));
+        assert!(matches!(plan(&middle, 11, true), TailPlan::Whole(_)));
+
+        // Two readers: the run between them.
+        let source = source_with(12, &[0, 11]);
+        let _first = rebuild(&source);
+        let split = rebuild(&source).split_tail(1, |_| true);
+        assert!(split.len() == 2 && is_run(&split[0], 10));
+        // A reader in every stage, or every other: no run to share.
+        for at in [
+            (0..12).collect::<Vec<_>>(),
+            (0..12).step_by(2).collect::<Vec<_>>(),
+        ] {
+            let source = source_with(12, &at);
+            for _ in 0..2 {
+                assert!(rebuild(&source).tails.origin.is_none(), "{at:?}");
+            }
+        }
+        // Too short to split, with nothing kept after the reader either.
+        let source = source_with(MIN_SPLIT_TAIL_STAGES, &[MIN_SPLIT_TAIL_STAGES - 1]);
+        for _ in 0..2 {
+            assert!(rebuild(&source).tails.origin.is_none(), "eight stages");
+        }
     }
 
     /// #5424: a pipe rebuilt from another that holds a stage with evaluation
