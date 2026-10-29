@@ -6168,6 +6168,8 @@ The root metadata write (`. style = "flow"`, #798) and the terminators after a g
 yq's `~` null literal, its `toyaml`/`fromyaml` spellings and `SRC as $v ireduce (INIT; UPDATE)` (`reduce SRC as $v (INIT; UPDATE)`) are yq syntax and parse without the flag ([#5456](https://github.com/rust-works/succinctly/issues/5456)).
 A `~` written into a document prints as `null` in YAML output where yq keeps `~` (`.a = ~` is `a: ~` in yq), the null-spelling loss tracked on [#2802](https://github.com/rust-works/succinctly/issues/2802); `-o=json` agrees.
 
+`array_to_map` ([#5458](https://github.com/rust-works/succinctly/issues/5458)) is a parser-level desugar over `to_entries`/`from_entries`, so it keeps `from_entries`'s string keys where yq's are ints (`.b | array_to_map | keys` is `["0","1","2"]`, yq `[0,1,2]`) and prints a nested container in block style where yq prints flow style; values and `-o=json` output agree.
+
 `gsub`/`scan`/`splits` specifically: real yq's lexer rejects all three outright, at any
 arity ([#1436](https://github.com/rust-works/succinctly/issues/1436)) — this isn't "3-arg
 `gsub` diverges," it's that yq's grammar has no `gsub`/`scan`/`splits` token at all:

@@ -4052,6 +4052,21 @@ impl<'a> Parser<'a> {
                 {
                     // #4206: yq's `to_json` / `to_yaml`, each with an optional literal indent.
                     self.parse_yq_to_text_operator()
+                } else if self.mode == ParserMode::Yq && self.matches_keyword("array_to_map") {
+                    // #5458: yq's `array_to_map`: an array becomes a map keyed by index with its
+                    // null elements skipped, a map is itself, anything else is `{}`.
+                    self.consume_keyword("array_to_map");
+                    let desugared = parse_with_mode_and_extensions(
+                        "if tag == \"!!seq\" then (to_entries | map(select(.value != null)) | from_entries) \
+                         elif tag == \"!!map\" then . else {} end",
+                        ParserMode::Yq,
+                        true,
+                    )?;
+                    self.zero_arity_or_wrong_arity_call(
+                        keyword_start,
+                        Some("array_to_map"),
+                        desugared,
+                    )
                 } else if self.mode == ParserMode::Yq && self.matches_keyword("with") {
                     // #4206: yq's `with(path; update)`; not a jq form.
                     self.parse_shadowable_special_form(keyword_start, "with", Self::parse_with_expr)
@@ -14680,6 +14695,7 @@ mod tests {
             "fromjson",
             "group_by",
             "has",
+            "array_to_map",
             "head_comment",
             "ireduce",
             "join",
