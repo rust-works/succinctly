@@ -5196,7 +5196,6 @@ its text (`numeric_display_string`, so `==` and `tostring` agree about a compute
   A closed literal written
   over a node (`.a = true` over `True`) brings its own text, as in yq; `style = "double"` and
   `"single"` quote the spelling (`"~"`, `"0x1F"`). Not matched:
-  - arithmetic on a hex or octal integer keeps its base in yq (`0xff + 1` is `0x100`, #3027);
   - the spelling belongs to the *position*, not the node, so equal-valued scalars that a write
     moves (`[~, Null] | reverse`) swap spellings, where yq carries each node's own;
   - a node copied by a plain `=` from a static read of it (`.b = .a`, `.c.d = .a.x`) and a bare
