@@ -56,6 +56,48 @@ fn test_every_constant_non_string_key_is_reported_and_counted_5510() -> Result<(
             ][..],
             "jq: 2 compile errors",
         ),
+        // Wherever they sit in the program: a definition, a branch, an interpolation, a
+        // nested object, a `reduce` update.
+        (
+            "def f: {(0):1}; {(1):2}",
+            &[
+                "jq: error: Cannot use number (0) as object key at <top-level>, line 1:",
+                "jq: error: Cannot use number (1) as object key at <top-level>, line 1:",
+            ][..],
+            "jq: 2 compile errors",
+        ),
+        (
+            "if true then {(0):1} else {(1):2} end",
+            &[
+                "jq: error: Cannot use number (0) as object key at <top-level>, line 1:",
+                "jq: error: Cannot use number (1) as object key at <top-level>, line 1:",
+            ][..],
+            "jq: 2 compile errors",
+        ),
+        (
+            "\"\\({(0):1}) \\({(1):2})\"",
+            &[
+                "jq: error: Cannot use number (0) as object key at <top-level>, line 1:",
+                "jq: error: Cannot use number (1) as object key at <top-level>, line 1:",
+            ][..],
+            "jq: 2 compile errors",
+        ),
+        (
+            "{a:{(0):1},b:{(1):2}}",
+            &[
+                "jq: error: Cannot use number (0) as object key at <top-level>, line 1:",
+                "jq: error: Cannot use number (1) as object key at <top-level>, line 1:",
+            ][..],
+            "jq: 2 compile errors",
+        ),
+        (
+            "reduce range(3) as $i ({}; {(0):$i}) | {(1):2}",
+            &[
+                "jq: error: Cannot use number (0) as object key at <top-level>, line 1:",
+                "jq: error: Cannot use number (1) as object key at <top-level>, line 1:",
+            ][..],
+            "jq: 2 compile errors",
+        ),
         // One is still one.
         (
             "{(0):1}",

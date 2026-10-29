@@ -1002,6 +1002,10 @@ struct Parser<'a> {
     /// jq's `check_object_key` errors (#5510), by position: jq's parser records one and keeps
     /// going, so they are reported together at the end (see [`Self::finish`]). Keyed by the
     /// byte offset so a stretch of text the parser reads twice (it backtracks) counts once.
+    ///
+    /// Nothing returns these on its own: a parse that reaches the end with this non-empty is
+    /// only an error through [`Self::finish_all`], so every entry point that builds a `Parser`
+    /// to compile a program calls it (the two public ones do).
     deferred_key_errors: BTreeMap<usize, ParseError>,
     /// [`Self::var_sites`]'s sibling for `break $name` label-break sites
     /// (#2964): every `Expr::Break` the parse has built, with the byte
@@ -3024,7 +3028,7 @@ impl<'a> Parser<'a> {
                         v
                     } else if self.peek() == Some(':') {
                         if let Some(error) = constant_key_error {
-                            // jq records it and parses on (#5510).
+                            // jq records it and parses on (#5510). Only set in jq mode, above.
                             self.deferred_key_errors
                                 .entry(error.position)
                                 .or_insert(error);
@@ -10440,9 +10444,7 @@ pub fn parse_with_mode_and_extensions(
             ))
         }
     });
-    parser
-        .finish_all(result)
-        .map_err(|mut errors| errors.swap_remove(0))
+    parser.finish_all(result).map_err(first_error)
 }
 
 /// Parse a complete jq program including module directives.
@@ -10545,7 +10547,13 @@ pub fn parse_program_with_extra_shadowable_defs(
     extra: &BTreeSet<String>,
 ) -> Result<Program, ParseError> {
     parse_program_with_extra_shadowable_defs_all(input, mode, jq_extensions, extra)
-        .map_err(|mut errors| errors.remove(0))
+        .map_err(first_error)
+}
+
+/// The error the single-error entry points return from [`Parser::finish_all`]'s list: the first,
+/// which is the one they reported before jq's later ones were collected (#5510).
+fn first_error(mut errors: Vec<ParseError>) -> ParseError {
+    errors.swap_remove(0)
 }
 
 /// [`parse_program_with_extra_shadowable_defs`], reporting every compile error (#5510).
