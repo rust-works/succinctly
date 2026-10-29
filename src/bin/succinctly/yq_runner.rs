@@ -10352,7 +10352,7 @@ fn stream_branch_results<C: DocumentCursor + Copy>(
 /// diagnostic `run_jq` already gives it, exiting with yq's own error status;
 /// any other panic is re-raised unchanged.
 pub fn run_yq(args: YqCommand) -> Result<i32> {
-    silence_depth_guard_panic_line();
+    super::jq_runner::silence_depth_guard_panic_line();
     JSON_STREAM_TAIL_ERROR.with(|e| *e.borrow_mut() = None);
     // `-e` exits 1 for "no match" too, which says nothing about the stream's bad value.
     let exit_status = args.exit_status;
@@ -10377,28 +10377,6 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             Ok(exit_codes::YQ_FAILURE)
         }
     }
-}
-
-/// Install, once per process, a panic hook that stays silent for the depth
-/// guards' exact message so the raw `thread panicked` line does not precede
-/// [`run_yq`]'s diagnostic; every other panic goes to the hook that was
-/// there. Installed once rather than swapped per call: the hook is
-/// process-global, so a per-call take/restore would interleave across
-/// threads and nest one wrapper deeper per call.
-// `PanicInfo` is the hook's type on this crate's 1.73 MSRV; newer toolchains
-// renamed it `PanicHookInfo` and deprecate the old name.
-#[allow(deprecated)]
-fn silence_depth_guard_panic_line() {
-    static INSTALLED: std::sync::Once = std::sync::Once::new();
-    INSTALLED.call_once(|| {
-        let previous: Box<dyn Fn(&std::panic::PanicInfo<'_>) + Sync + Send> =
-            std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            if depth_guard_panic_message(info.payload()).is_none() {
-                previous(info);
-            }
-        }));
-    });
 }
 
 fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
