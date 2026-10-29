@@ -1408,31 +1408,32 @@ Still the owned route's, in yq mode:
 - Over a computed value nested 257 to 384 levels the owned identity route raises `nesting depth exceeds limit of 256`, as `..` does there, where the owned walk answered with empty positions.
 
 Measured in yq mode with `scripts/ab-cli.py` (interleaved, 7 repetitions, minimum, base `c31f900b8` against the change, both `codegen-units=1` and fat LTO, output identical on every row, `memcap.py` at 8 GB), on `users` documents of 1, 10 and 100 MB.
-The control (the base binary against itself, 10 MB) read -1.8% to +0.1% on the 7950X and -1.8% to +1.1% on the M4 Pro.
+The control (the base binary against itself, 10 MB) read -1.5% to +0.4% on the 7950X and -0.7% to +0.7% on the M4 Pro.
 
 | Query                                                           | Machine           |   1 MB |  10 MB | 100 MB |
 |-----------------------------------------------------------------|-------------------|--------|--------|--------|
-| `first(recurse(.[]?; true))`                                    | AMD Ryzen 9 7950X | -69.9% | -75.8% | -75.2% |
-| `first(recurse(.[]?; true))`                                    | Apple M4 Pro      | -59.1% | -71.9% | -73.7% |
-| `[recurse(.[]?; true)] \| length`                               | AMD Ryzen 9 7950X | -55.6% | -59.2% | -58.0% |
-| `[recurse(.[]?; true)] \| length`                               | Apple M4 Pro      | -42.7% | -49.4% | -50.8% |
-| `[recurse(.[]?; length > 0)] \| length`                         | AMD Ryzen 9 7950X | -33.3% | -36.6% | -34.4% |
-| `[recurse(.[]?; length > 0)] \| length`                         | Apple M4 Pro      | -23.5% | -26.1% | -27.6% |
-| `[recurse(.[]?; type == "!!map" or type == "!!seq")] \| length` | AMD Ryzen 9 7950X | -32.6% | -36.6% | -33.0% |
-| `[recurse(.[]?; type == "!!map" or type == "!!seq")] \| length` | Apple M4 Pro      | -10.5% | -11.6% | -13.6% |
-| `[recurse(.[]?; . != null)] \| length`                          | AMD Ryzen 9 7950X | -21.3% | -25.4% | -22.2% |
-| `[recurse(.[]?; . != null)] \| length`                          | Apple M4 Pro      |  -3.9% |  -4.0% |  -5.5% |
-| `[recurse(.[]?; . == 1 \| not)] \| length`                      | AMD Ryzen 9 7950X | -20.7% | -26.5% | -22.0% |
-| `[recurse(.[]?; . == 1 \| not)] \| length`                      | Apple M4 Pro      |  -3.6% |  -5.8% |  -5.8% |
-| `[recurse(.[]?; . != null and . != false)] \| length`           | AMD Ryzen 9 7950X | -12.5% | -17.5% | -13.5% |
-| `[recurse(.[]?; . != null and . != false)] \| length`           | Apple M4 Pro      |  +5.8% |  +4.7% |  +4.4% |
+| `first(recurse(.[]?; true))`                                    | AMD Ryzen 9 7950X | -69.6% | -75.7% | -75.5% |
+| `first(recurse(.[]?; true))`                                    | Apple M4 Pro      | -60.4% | -72.3% | -73.6% |
+| `[recurse(.[]?; true)] \| length`                               | AMD Ryzen 9 7950X | -54.3% | -59.3% | -58.0% |
+| `[recurse(.[]?; true)] \| length`                               | Apple M4 Pro      | -43.5% | -49.2% | -50.2% |
+| `[recurse(.[]?; length > 0)] \| length`                         | AMD Ryzen 9 7950X | -34.2% | -37.3% | -35.5% |
+| `[recurse(.[]?; length > 0)] \| length`                         | Apple M4 Pro      | -26.3% | -27.5% | -28.0% |
+| `[recurse(.[]?; type == "!!map" or type == "!!seq")] \| length` | AMD Ryzen 9 7950X | -30.9% | -36.2% | -33.0% |
+| `[recurse(.[]?; type == "!!map" or type == "!!seq")] \| length` | Apple M4 Pro      | -11.0% | -12.8% | -13.3% |
+| `[recurse(.[]?; . != null)] \| length`                          | AMD Ryzen 9 7950X | -21.0% | -24.8% | -21.1% |
+| `[recurse(.[]?; . != null)] \| length`                          | Apple M4 Pro      |  -3.4% |  -4.5% |  -5.6% |
+| `[recurse(.[]?; . == 1 \| not)] \| length`                      | AMD Ryzen 9 7950X | -19.4% | -25.8% | -21.1% |
+| `[recurse(.[]?; . == 1 \| not)] \| length`                      | Apple M4 Pro      |  -1.8% |  -4.8% |  -5.8% |
+| `[recurse(.[]?; . != null and . != false)] \| length`           | AMD Ryzen 9 7950X | -11.8% | -16.7% | -13.2% |
+| `[recurse(.[]?; . != null and . != false)] \| length`           | Apple M4 Pro      |  +3.9% |  +4.7% |  +4.0% |
 
 Every row is faster on the 7950X.
-On the M4 Pro the only slower rows are the last pair, two comparisons joined by `and`, at +4.4% to +5.8%; a `cond` made of `type` tests, which was 11% slower there before `type` joined the direct verdicts, is 10.5% to 13.6% faster.
+On the M4 Pro the only slower rows are the last pair, two comparisons joined by `and`, at +3.9% to +4.7%; a `cond` made of `type` tests, which was 11% slower there before `type` joined the direct verdicts, is 11.0% to 13.3% faster.
 The alias ladder is where the owned walk is unusable: `.root | first(recurse(.[]?; true))` over a 26-level ladder (586 B, 2^26 leaves once expanded) took 16.9 s on the M4 Pro and 37.8 s and over 8 GB on the 7950X, and takes 4.3 ms and 1.8 ms.
 At 16, 20 and 24 levels the base took 19 ms, 245 ms and 3.8 s on the M4 Pro and 35 ms, 552 ms and 8.9 s on the 7950X, and the change takes the same few milliseconds at each (3.6 to 3.8 ms and 1.6 to 1.7 ms).
-In jq mode over a 10 MB `users` JSON document, a bare `recurse(.[]?; . != null)` is 62.7% (7950X) and 55.0% (M4 Pro) faster, a bare `recurse(.[]?; type == "object" or type == "array")` 51.0% and 40.1% faster, and `recurse(.[]?; true)` 8.2% and 6.7% faster; the collecting form and `first(...)` are unchanged (-1.1%, -1.3%, -1.8%, -0.2%).
-The default YAML output of a bare `recurse(.[]?; true)` over a 10 MB `users` document is 27.1% and 17.4% faster, and `recurse(.[]?; . != null)` 11.6% and 0.4%.
+In jq mode over a 10 MB `users` JSON document, a bare `recurse(.[]?; . != null)` is 62.9% (7950X) and 54.9% (M4 Pro) faster, a bare `recurse(.[]?; type == "object" or type == "array")` 51.9% and 40.1% faster, and `recurse(.[]?; true)` 9.5% and 5.6% faster; the collecting form and `first(...)` are unchanged (-1.0%, +1.2%, -3.5%, +0.7%).
+That is the direct verdict: jq mode keeps the owned walk for a collecting form and stays off the M2 fast path for this builtin (`m2_has_recurse_cond`).
+The default YAML output of a bare `recurse(.[]?; true)` over a 10 MB `users` document is 27.4% and 19.4% faster, and `recurse(.[]?; . != null)` 12.9% and 0.8%.
 The path walker still
 runs `.[]?` at every node, so
 `path(recurse(.[]?))` takes about 1.8 times `path(..)`'s time (2.9 s against 1.6 s over 1.15 M nodes of
