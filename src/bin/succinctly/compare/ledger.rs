@@ -15,6 +15,7 @@ pub const CATEGORIES: &[&str] = &[
     "host-dependent",
     "newer-than-primary",
     "reference-crash",
+    "reference-slow",
     "to-triage",
 ];
 

@@ -41,6 +41,7 @@ cli = "comparison/jq/probes/cli.tsv"
 extensions = "comparison/jq/probes/extensions.tsv"
 fixtures = "comparison/jq/fixtures"
 divergences = "comparison/jq/divergences.toml"
+robust = "comparison/jq/probes/robust.tsv"
 
 # Upstream test files, vendored from the jq 1.7.1 source tarball (MIT; see
 # vendor/jq-1.7.1/COPYING) and run as a differential (dimension B).

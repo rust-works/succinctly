@@ -2,7 +2,7 @@
 # difference not listed here and on a listed one that no longer differs.
 #
 # id        <suite>:<probe>: features:name/arity, since-secondary:name/arity, cli:id, extensions:id
-# category  by-design | host-dependent | newer-than-primary | reference-crash | to-triage
+# category  by-design | host-dependent | newer-than-primary | reference-crash | reference-slow | to-triage
 #           (to-triage: a real difference nobody has yet classified against ADR-0018 or filed)
 
 [[divergence]]
@@ -136,3 +136,113 @@ reason = "`{non_const:., (0):1}`: same compile-time rejection of a constant non-
 id = "upstream-onig.test:102"
 category = "to-triage"
 reason = "`gsub(\"(?=u)\"; \"u\")`: regex lookahead is refused as an invalid regex (Rust `regex` has no lookaround); jq's oniguruma supports it."
+
+[[divergence]]
+id = "robust:deep-array-length"
+category = "to-triage"
+reason = "`[..]|length` on 5000 nested arrays: succinctly answers (5000); jq refuses at its parse depth limit (`Exceeds depth limit for parsing`, exit 5). The lazy route does not apply a depth limit."
+
+[[divergence]]
+id = "robust:deep-array-parse-257"
+category = "to-triage"
+reason = "257 nested arrays: jq rejects past its 256-level parse limit (exit 5); succinctly's lazy route answers."
+
+[[divergence]]
+id = "robust:deep-array-parse-384"
+category = "to-triage"
+reason = "384 nested arrays: same as deep-array-parse-257; succinctly's own limit of 384 is not reached on this route."
+
+[[divergence]]
+id = "robust:deep-array-parse-385"
+category = "to-triage"
+reason = "385 nested arrays: same as deep-array-parse-257; succinctly answers although its own limit is 384."
+
+[[divergence]]
+id = "robust:deep-object-parse-257"
+category = "to-triage"
+reason = "257 nested objects: jq rejects past its 256-level parse limit (exit 5); succinctly's lazy route answers."
+
+[[divergence]]
+id = "robust:deep-object-parse-385"
+category = "to-triage"
+reason = "385 nested objects: same as deep-object-parse-257."
+
+[[divergence]]
+id = "robust:deep-array-print-5000"
+category = "to-triage"
+reason = "`.` on 5000 nested arrays: both refuse, jq at parse (`Exceeds depth limit for parsing`, exit 5), succinctly at 384 (`Error: nesting depth exceeds limit of 384`, exit 1)."
+
+[[divergence]]
+id = "robust:deep-tojson-built-1000"
+category = "to-triage"
+reason = "`tojson` of a value built 1000 levels deep: jq answers; succinctly raises `nesting depth exceeds limit of 384` (exit 5) for a value it built itself."
+
+[[divergence]]
+id = "robust:deep-tojson-built-10000"
+category = "to-triage"
+reason = "Same as deep-tojson-built-1000, at 10000 levels."
+
+[[divergence]]
+id = "robust:deep-tojson-built-20000"
+category = "to-triage"
+reason = "Same as deep-tojson-built-1000, at 20000 levels."
+
+[[divergence]]
+id = "robust:deep-built-equal"
+category = "to-triage"
+reason = "`==` on a value built 5000 levels deep: jq answers; succinctly raises the 384-level depth error."
+
+[[divergence]]
+id = "robust:deep-built-sort"
+category = "to-triage"
+reason = "`sort` over a value built 3000 levels deep: jq answers; succinctly raises the 384-level depth error."
+
+[[divergence]]
+id = "robust:error-deep-message"
+category = "to-triage"
+reason = "`error(<value built 2000 levels deep>)` caught and measured: jq answers; succinctly raises the 384-level depth error."
+
+[[divergence]]
+id = "robust:recursion-depth-10000"
+category = "by-design"
+reason = "A user-defined function recursing 10000 deep: jq answers (about 3 s); succinctly's stack guard refuses with `exceeded maximum recursion depth` (ADR-0025)."
+
+[[divergence]]
+id = "robust:recursion-depth-100000"
+category = "by-design"
+reason = "Recursion 100000 deep: jq does not finish within 10 s; succinctly's stack guard refuses (ADR-0025)."
+
+[[divergence]]
+id = "robust:recursion-tail-100000"
+category = "by-design"
+reason = "Tail-position recursion 100000 deep: jq does not finish within 10 s; succinctly's stack guard refuses (ADR-0025), so it gets no tail-call elimination."
+
+[[divergence]]
+id = "robust:regex-many-matches"
+category = "reference-slow"
+reason = "`[match(\"a\";\"g\")]` over 100000 characters: jq 1.7.1 does not finish within 10 s; succinctly answers in tens of milliseconds."
+
+[[divergence]]
+id = "robust:regex-gsub-large"
+category = "reference-slow"
+reason = "`gsub(\"a\";\"b\")` over 100000 characters: jq 1.7.1 does not finish within 10 s; succinctly answers in tens of milliseconds."
+
+[[divergence]]
+id = "robust:sigpipe-range"
+category = "to-triage"
+reason = "`range(10000000)` piped into `head -n1`: jq dies of SIGPIPE (shell status 141); succinctly exits 1."
+
+[[divergence]]
+id = "robust:sigpipe-input"
+category = "to-triage"
+reason = "`.[]` over a million-element array piped into `head -n1`: jq exits 141 (SIGPIPE); succinctly exits 1."
+
+[[divergence]]
+id = "robust:sigpipe-repeat"
+category = "to-triage"
+reason = "`repeat(1)` piped into `head -n1`: jq exits 141 (SIGPIPE); succinctly exits 1."
+
+[[divergence]]
+id = "robust:array-set-too-huge-index"
+category = "to-triage"
+reason = "`[] | .[1e12] = 1`: jq aborts (SIGSEGV); succinctly neither errors nor finishes within 10 s (it appears to allocate the index), and earlier runs ended in an abort. A refused index would be the safe answer."

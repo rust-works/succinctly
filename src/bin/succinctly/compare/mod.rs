@@ -21,6 +21,7 @@ mod ledger;
 mod manifest;
 mod perf;
 mod report;
+mod robust;
 mod suites;
 
 use anyhow::{bail, Context, Result};
@@ -47,6 +48,8 @@ pub enum Dimension {
     Input,
     /// D and E: wall time and peak memory, interleaved, output-gated
     Performance,
+    /// F: deep nesting, runaway generators, huge values, SIGPIPE
+    Robustness,
 }
 
 #[derive(Debug, Parser)]
@@ -122,14 +125,13 @@ pub struct Results {
     /// D and E, one row per query × input.
     pub perf: Vec<perf::PerfRow>,
     pub perf_note: Option<String>,
+    /// F.
+    pub robust: Vec<robust::Row>,
     pub known_divergences: Vec<ledger::Entry>,
     pub ledger: ledger::Outcome,
 }
 
-const PENDING: &[(&str, &str)] = &[
-    ("F. Robustness", "not implemented (phase 5)"),
-    ("H. Platform & operational", "not implemented (phase 6)"),
-];
+const PENDING: &[(&str, &str)] = &[("H. Platform & operational", "not implemented (phase 6)")];
 
 fn build_reference(root: &std::path::Path, version: &str) -> Result<()> {
     let status = Command::new(root.join("scripts/compare-jq-build.sh"))
@@ -397,6 +399,27 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
                 "implemented (JSONTestSuite; BOM, NUL, depth and stream shapes are probed under G)",
         });
     }
+    let mut robust_rows = vec![];
+    if want(Dimension::Robustness) {
+        run_suites.push("robust".into());
+        let text = std::fs::read_to_string(root.join(&manifest.probes.robust))?;
+        robust_rows = robust::run(
+            &reference,
+            &subject,
+            &robust::parse_probes(&text)?,
+            &fixtures,
+        )?;
+        // A crash or hang of succinctly is listed even when jq does the same.
+        for r in robust_rows.iter().filter(|r| {
+            !r.matches || matches!(r.subject, robust::Class::Crash | robust::Class::Timeout)
+        }) {
+            observed.insert(format!("robust:{}", r.id));
+        }
+        dimensions.push(DimensionStatus {
+            name: "F. Robustness",
+            status: "implemented (nesting, recursion, generators, regex, large values, SIGPIPE; the memory-limit probes are not yet included)",
+        });
+    }
     let (mut perf_rows, mut perf_note) = (vec![], None);
     if want(Dimension::Performance) {
         run_suites.push("perf".into());
@@ -489,6 +512,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         extensions: ext_rows,
         differential,
         input,
+        robust: robust_rows,
         perf: perf_rows,
         perf_note,
         known_divergences: known,

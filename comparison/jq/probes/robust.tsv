@@ -1,0 +1,86 @@
+# id	area	args (JSON array)	stdin (- | JSON string | @gen:kind:n)	wrap (- | head)
+deep-array-parse-100	nesting	["-c", "."]	@gen:nested-array:100	-
+deep-array-length	nesting	["-c", "[..]|length"]	@gen:nested-array:5000	-
+deep-array-paths	nesting	["-c", "[paths]|length"]	@gen:nested-array:5000	-
+deep-array-flatten	nesting	["-c", "flatten|length"]	@gen:nested-array:5000	-
+deep-tojson-built-1000	nesting	["-n", "-c", "reduce range(1000) as $i (0;[.])|tojson|length"]	-	-
+deep-tojson-built-10000	nesting	["-n", "-c", "reduce range(10000) as $i (0;[.])|tojson|length"]	-	-
+deep-tojson-built-20000	nesting	["-n", "-c", "reduce range(20000) as $i (0;[.])|tojson|length"]	-	-
+deep-built-equal	nesting	["-n", "-c", "(reduce range(5000) as $i (0;[.])) as $a | $a == $a"]	-	-
+deep-built-sort	nesting	["-n", "-c", "[reduce range(3000) as $i (0;[.]), 1] | sort | length"]	-	-
+deep-fromjson-9000	nesting	["-n", "-c", "reduce range(9000) as $i (0;[.])|tojson|fromjson|[..]|length"]	-	-
+recursion-depth-10000	recursion	["-n", "def f(n): if n==0 then 0 else 1+f(n-1) end; f(10000)"]	-	-
+recursion-depth-100000	recursion	["-n", "def f(n): if n==0 then 0 else 1+f(n-1) end; f(100000)"]	-	-
+recurse-limit	recursion	["-n", "-c", "[limit(5; 0|recurse(.+1))]"]	-	-
+recurse-depth	recursion	["-n", "-c", "last(limit(100000; 0|recurse(.+1)))"]	-	-
+until-million	recursion	["-n", "0|until(.>=1000000; .+1)"]	-	-
+range-limit	generators	["-n", "-c", "[limit(3; range(1e9))]"]	-	-
+range-first	generators	["-n", "first(range(1e9))"]	-	-
+range-nth	generators	["-n", "nth(5; range(1e9))"]	-	-
+range-isempty	generators	["-n", "isempty(range(1e9))"]	-	-
+range-neg-step	generators	["-n", "-c", "[limit(2; range(1e9;0;-1))]"]	-	-
+repeat-limit	generators	["-n", "-c", "[limit(10; repeat(1))]"]	-	-
+repeat-first	generators	["-n", "first(repeat(1))"]	-	-
+repeat-million	generators	["-n", "[limit(1000000; repeat(1))]|length"]	-	-
+range-million-array	generators	["-n", "[range(1000000)]|length"]	-	-
+range-ten-million-add	generators	["-n", "reduce range(10000000) as $i (0; .+$i)"]	-	-
+input-first-of-many	generators	["-n", "first(inputs)"]	@gen:int-array:100	-
+limit-zero-infinite	generators	["-n", "-c", "[limit(0; repeat(1))]"]	-	-
+limit-negative	generators	["-n", "-c", "[limit(-1; 1,2)]"]	-	-
+regex-catastrophic	regex	["-c", "test(\"(a*)*b\")"]	@gen:long-string:28	-
+regex-nested-quantifier	regex	["-c", "test(\"(a+)+$\")"]	@gen:long-string:28	-
+regex-many-matches	regex	["-c", "[match(\"a\";\"g\")]|length"]	@gen:long-string:100000	-
+regex-gsub-large	regex	["-c", "gsub(\"a\";\"b\")|length"]	@gen:long-string:100000	-
+regex-huge-alternation	regex	["-c", "test(\"(\" + ([range(2000)|tostring]|join(\"|\")) + \")\")"]	"\"1999\""	-
+regex-bad-pattern	regex	["-c", "test(\"(\")"]	"\"a\""	-
+string-10mb-length	strings	["-c", "length"]	@gen:long-string:10000000	-
+string-10mb-downcase	strings	["-c", "ascii_downcase|length"]	@gen:long-string:10000000	-
+string-10mb-explode	strings	["-c", "explode|length"]	@gen:long-string:10000000	-
+string-10mb-split	strings	["-c", "split(\"a\")|length"]	@gen:long-string:1000000	-
+string-10mb-tojson	strings	["-c", "tojson|length"]	@gen:long-string:10000000	-
+string-repeat-1e8	strings	["-n", "\"ab\" * 50000000 | length"]	-	-
+string-repeat-neg	strings	["-n", "-c", "\"ab\" * -1"]	-	-
+string-implode-bad	strings	["-n", "-c", "[1114112]|implode"]	-	-
+wide-object-keys	wide	["-c", "keys|length"]	@gen:wide-object:1000000	-
+wide-object-entries	wide	["-c", "to_entries|length"]	@gen:wide-object:1000000	-
+wide-object-lookup	wide	["-c", ".k999999"]	@gen:wide-object:1000000	-
+wide-object-add	wide	["-c", "[.[]]|add"]	@gen:wide-object:1000000	-
+wide-object-del	wide	["-c", "del(.k0)|length"]	@gen:wide-object:1000000	-
+wide-object-with-entries	wide	["-c", "with_entries(.value+=1)|length"]	@gen:wide-object:200000	-
+big-array-sort	wide	["-c", "sort|length"]	@gen:int-array:1000000	-
+big-array-group	wide	["-c", "group_by(.%10)|length"]	@gen:int-array:1000000	-
+big-array-unique	wide	["-c", "unique|length"]	@gen:int-array:1000000	-
+big-array-tostream	wide	["-c", "[tostream]|length"]	@gen:int-array:200000	-
+big-array-slurp	wide	["-s", "-c", "length"]	@gen:int-array:1000000	-
+sigpipe-range	pipe	["-n", "range(10000000)"]	-	head
+sigpipe-input	pipe	["-c", ".[]"]	@gen:int-array:1000000	head
+sigpipe-repeat	pipe	["-n", "repeat(1)"]	-	head
+partial-output-on-error	errors	["-c", ".[] | if . == 3 then error(\"boom\") else . end"]	"[1,2,3,4]"	-
+partial-output-try	errors	["-c", ".[] | try (if . == 3 then error(\"boom\") else . end) catch \"caught\""]	"[1,2,3,4]"	-
+error-object	errors	["-n", "-c", "{a:1}|error"]	-	-
+error-null	errors	["-n", "-c", "try error(null) catch ."]	-	-
+error-deep-message	errors	["-n", "-c", "try error(reduce range(2000) as $i (0;[.])) catch (tojson|length)"]	-	-
+limit-error-after	errors	["-n", "-c", "[limit(2; 1, 2, error(\"x\"))]"]	-	-
+first-error-after	errors	["-n", "first(1, error(\"x\"))"]	-	-
+number-huge-exponent	numbers	["-n", "-c", "[1e1000, -1e1000, 1e-1000] | map(tojson)"]	-	-
+number-pow-overflow	numbers	["-n", "-c", "[pow(10; 1000), pow(2; -1100)]"]	-	-
+number-huge-literal-input	numbers	["-c", "."]	@gen:long-string:0	-
+array-index-huge	numbers	["-n", "-c", "[1,2] | .[1e300]"]	-	-
+array-index-neg-huge	numbers	["-n", "-c", "[1,2] | .[-1e300]"]	-	-
+array-slice-huge	numbers	["-n", "-c", "[1,2,3] | .[1e300:]"]	-	-
+array-set-huge-index	numbers	["-n", "-c", "[] | .[100000000] = 1 | length"]	-	-
+array-set-too-huge-index	numbers	["-n", "-c", "[] | .[1e12] = 1 | length"]	-	-
+splits-empty-regex	regex	["-n", "-c", "\"abc\" | [splits(\"\")]"]	-	-
+ltrimstr-huge	strings	["-n", "-c", "(\"a\" * 1000000) | ltrimstr(\"a\") | length"]	-	-
+tojson-nan-deep	numbers	["-n", "-c", "[nan, [nan]] | tojson"]	-	-
+env-huge	errors	["-n", "-c", "$ENV | type"]	-	-
+input-line-large	errors	["-c", "length"]	@gen:wide-object:10	-
+deep-array-parse-256	nesting	["-c", "length"]	@gen:nested-array:256	-
+deep-array-parse-257	nesting	["-c", "length"]	@gen:nested-array:257	-
+deep-array-parse-384	nesting	["-c", "length"]	@gen:nested-array:384	-
+deep-array-parse-385	nesting	["-c", "length"]	@gen:nested-array:385	-
+deep-array-print-5000	nesting	["-c", "."]	@gen:nested-array:5000	-
+deep-object-parse-257	nesting	["-c", "length"]	@gen:nested-object:257	-
+deep-object-parse-385	nesting	["-c", "length"]	@gen:nested-object:385	-
+recursion-depth-1000	recursion	["-n", "def f(n): if n==0 then 0 else 1+f(n-1) end; f(1000)"]	-	-
+recursion-tail-100000	recursion	["-n", "def f(n): if n==0 then 0 else f(n-1) end; f(100000)"]	-	-

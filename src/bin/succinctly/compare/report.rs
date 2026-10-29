@@ -4,6 +4,7 @@ use super::cli;
 use super::features::{FeatureSummary, Status};
 use super::harness::{Row, Verdict};
 use super::perf::{Gate, PerfRow};
+use super::robust;
 use super::Results;
 use std::fmt::Write;
 
@@ -99,6 +100,29 @@ pub fn render(results: &Results) -> String {
             i.y.total,
             i.n.total - i.n.validate,
             i.n.total
+        );
+    }
+    if !r.robust.is_empty() {
+        let ok = r.robust.iter().filter(|x| x.matches).count();
+        let n = |c: robust::Class, f: fn(&robust::Row) -> robust::Class| {
+            r.robust.iter().filter(|x| f(x) == c).count()
+        };
+        let _ = writeln!(
+            s,
+            "| Robustness probes agreeing | {ok}/{} |",
+            r.robust.len()
+        );
+        let _ = writeln!(
+            s,
+            "| Robustness: crashes / timeouts, succinctly | {} / {} |",
+            n(robust::Class::Crash, |x| x.subject),
+            n(robust::Class::Timeout, |x| x.subject)
+        );
+        let _ = writeln!(
+            s,
+            "| Robustness: crashes / timeouts, jq | {} / {} |",
+            n(robust::Class::Crash, |x| x.reference),
+            n(robust::Class::Timeout, |x| x.reference)
         );
     }
     let timed: Vec<&PerfRow> = r
@@ -219,6 +243,7 @@ pub fn render(results: &Results) -> String {
     cli_sections(&mut s, r);
     differential_section(&mut s, r);
     input_section(&mut s, r);
+    robust_section(&mut s, r);
     perf_sections(&mut s, r);
 
     let _ = writeln!(s, "\n## Reproduce\n");
@@ -538,6 +563,47 @@ fn perf_sections(s: &mut String, r: &Results) {
             kb(1),
             kb(0),
             ratio(x.rss_ratio_primary)
+        );
+    }
+}
+
+fn robust_section(s: &mut String, r: &Results) {
+    if r.robust.is_empty() {
+        return;
+    }
+    let _ = writeln!(s, "\n## F. Robustness and resource limits\n");
+    let _ = writeln!(
+        s,
+        "Each probe has a 10 s deadline. Class: `ok`, `error` (non-zero exit), `crash` (signal or panic), \
+         `timeout`. Stdout and exit status must match jq's; a crash or hang of succinctly is listed \
+         even when jq does the same.\n"
+    );
+    let mut areas: Vec<&str> = r.robust.iter().map(|x| x.area.as_str()).collect();
+    areas.sort_unstable();
+    areas.dedup();
+    let _ = writeln!(s, "| Area | Probes | Agree |");
+    let _ = writeln!(s, "|------|--------|-------|");
+    for a in areas {
+        let all = r.robust.iter().filter(|x| x.area == a).count();
+        let ok = r.robust.iter().filter(|x| x.area == a && x.matches).count();
+        let _ = writeln!(s, "| {a} | {all} | {ok} |");
+    }
+    let _ = writeln!(s, "\n| Probe | jq | succinctly | Ledger |");
+    let _ = writeln!(s, "|-------|----|-------------|--------|");
+    let cls = |c: robust::Class, exit: Option<i32>, ms: f64| {
+        let e = exit.map_or_else(|| "signal".into(), |e| e.to_string());
+        format!("{c:?} {e} ({ms:.0} ms)").to_lowercase()
+    };
+    for x in r.robust.iter().filter(|x| {
+        !x.matches || matches!(x.subject, robust::Class::Crash | robust::Class::Timeout)
+    }) {
+        let _ = writeln!(
+            s,
+            "| `{}` | {} | {} | {} |",
+            x.id,
+            cls(x.reference, x.reference_exit, x.reference_ms),
+            cls(x.subject, x.subject_exit, x.subject_ms),
+            note_for(r, &format!("robust:{}", x.id))
         );
     }
 }
