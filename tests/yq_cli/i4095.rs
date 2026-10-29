@@ -210,7 +210,7 @@ fn test_recurse_cond_comparison_agrees_with_the_general_route_4095() -> Result<(
 /// tag).
 #[test]
 fn test_recurse_cond_null_and_bool_verdicts_agree_with_the_general_route_4095() -> Result<()> {
-    let doc = "a: ~\nb: null\nc: Null\nd:\ne: \"null\"\nf: 'null'\ng: !!str null\nh: true\ni: True\nj: \"true\"\nk: yes\nl: false\nm: !!bool true\nn: 0\no: \"\"\np: []\nq: {}\nr: !!null [1]\ns: !!bool [1]\nt: [~, true, false, [null]]\nu: !custom {x: 5}\nv: !mytag 5\nw: !!map {x: 0x1F}\nx: 2.50\n";
+    let doc = "a: ~\nb: null\nc: Null\nd:\ne: \"null\"\nf: 'null'\ng: !!str null\nh: true\ni: True\nj: \"true\"\nk: yes\nl: false\nm: !!bool true\nn: 0\no: \"\"\np: []\nq: {}\nr: !!null [1]\ns: !!bool [1]\nt: [~, true, false, [null]]\nu: !custom {x: 5}\nv: !mytag 5\nw: !!map {x: 0x1F}\nx: 2.50\ny: 0x1F\nz: 0o17\naa: 007\nab: +5\nac: 1_000\nad: 1e3\n";
     for cond in [
         "type == \"!!map\"",
         "type != \"!!str\"",
@@ -231,6 +231,14 @@ fn test_recurse_cond_null_and_bool_verdicts_agree_with_the_general_route_4095() 
         ". == null or . == false",
         ". != null and . != false",
         ". == true | not",
+        // A spelled integer (#2802) compares as its value, in every spelling.
+        ". == 31",
+        ". != 15",
+        ". == 7",
+        ". == 5",
+        ". > 6",
+        ". == 1000",
+        ". == 1e3",
     ] {
         for tail in ["| tojson", "| path"] {
             let want = run(&format!("[recurse(.[]?; . | ({cond})) {tail}]"), doc)?;
