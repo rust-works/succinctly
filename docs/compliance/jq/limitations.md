@@ -13320,15 +13320,13 @@ constant-memory streaming of a large document: a program that reads `.` walks ea
 `input`/`inputs` keeps every event (a 10.8 MB array of 120,000 records peaked at 622 MB with the events kept and
 310 MB walked one at a time, against jq's 2.4 MB).
 
-## ANSI color bytes: succinctly emits one SGR per token, jq emits redundant repeats (#3110)
+## ANSI color bytes: `-C` writes jq 1.7.1's bytes, redundant repeats included ([#5473](https://github.com/rust-works/succinctly/issues/5473))
 
-`-C` output wraps the same tokens in the same colors as real jq -- including, since #3110,
-the `:` in the object color and the `,` in its enclosing container's color (verified live
-against jq 1.7.1 with a custom `JQ_COLORS` that distinguishes object/array colors). The one
-byte-level difference is that jq redundantly emits the SGR a second time immediately before
-a closing delimiter (`\x1b[1;39m\x1b[1;39m}` for `}`/`]`), a quirk of its
-color-of-every-token-with-conditional-reset writer; succinctly emits each SGR once. Renders
-are identical.
+`-C` output is byte-identical to jq 1.7.1's, for compact and pretty output, `--tab`, `--indent`, `-S`, `-a`, `-r`/`-j` and every `JQ_COLORS` field (880 invocations compared).
+jq writes a container's color before its opening bracket with no reset after it, writes it again after every element and once more before the closing bracket, and resets only after the closing bracket, before each object key and after each `:`; an empty container is its color, the two brackets and a reset.
+The `,` is bare and the `:` carries the object color (#3110).
+Until #5473 succinctly reset after every token and wrote each color once, which looked the same on a terminal and differed in every byte.
+`succinctly yq -C -o json` keeps that older per-token framing: real yq's JSON colors and framing are a third thing (`{` plain, keys `36`, numbers `95`), so neither framing matches it, and it is a separate difference from this one.
 
 **`null`'s default color, and NaN's own double wrap (#3413).** jq 1.7.1's default color for
 `null` is `0;90` (bright black), confirmed live on both the macOS system build and the Linux

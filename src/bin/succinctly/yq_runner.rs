@@ -129,7 +129,9 @@ impl Colorizer {
     fn new(syntax: ColorSyntax) -> Self {
         let lexer = match syntax {
             ColorSyntax::Yaml => ColorLexer::Yaml(YamlColorizer::default()),
-            ColorSyntax::Json => ColorLexer::Json(output::JsonColorizer::default(), Box::default()),
+            ColorSyntax::Json => {
+                ColorLexer::Json(output::JsonColorizer::per_token(), Box::default())
+            }
         };
         Self {
             lexer,
@@ -8344,7 +8346,7 @@ fn output_value<W: Write>(
         write!(
             writer,
             "{}",
-            output::colorize_json(&json_str, &ColorScheme::default())
+            output::colorize_json_per_token(&json_str, &ColorScheme::default())
         )?;
     } else {
         write!(writer, "{json_str}")?;
@@ -13345,7 +13347,7 @@ mod tests {
                 ColorSyntax::Json,
                 json.as_str(),
                 "2]",
-                output::colorize_json(&format!("{json}2]"), &ColorScheme::default()),
+                output::colorize_json_per_token(&format!("{json}2]"), &ColorScheme::default()),
             ),
         ] {
             let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -13409,7 +13411,7 @@ mod tests {
         colorizer.finish(&mut out).unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            output::colorize_json(&json, &ColorScheme::default())
+            output::colorize_json_per_token(&json, &ColorScheme::default())
         );
 
         // Under a block of text, over one once colored: the result's end writes it.
