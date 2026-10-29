@@ -44,7 +44,7 @@ cargo llvm-cov report --lcov --output-path target/coverage.lcov
 patchcov diff --report target/coverage.lcov
 ```
 
-The two `jq_cli_tests` named in `scripts/deep-recursion-tests.sh` are `#[ignore]`d under `cfg(coverage)`, so `cargo llvm-cov` reports them as ignored; they still run in the `deep-recursion` CI leg and under a plain `cargo test` (`docs/guides/developer.md` says how that was checked and how to repeat it).
+The two stack-filling `jq_cli_tests` named in `scripts/deep-recursion-tests.sh` (it also lists the 18 slowest tests, #5494) are `#[ignore]`d under `cfg(coverage)`, so `cargo llvm-cov` reports them as ignored; they still run in the `deep-recursion` CI leg and under a plain `cargo test` (`docs/guides/developer.md` says how that was checked and how to repeat it).
 
 Build the CLI with `cargo build --release --features cli`. The binary's `jq` and `yq` subcommands also have `sjq` and `syq` aliases. Use files under `.ai/scratch/` for manual CLI experiments; tracked examples are not scratch files.
 

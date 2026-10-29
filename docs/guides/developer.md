@@ -161,10 +161,13 @@ cargo test --test properties
 
 Two `jq_cli_tests` take 100-150 s each in a debug build, because the cost is the native
 stack being filled to the point where ADR-0025's guard refuses (not logic that can be
-trimmed). CI runs them in their own `deep-recursion` leg rather than in `cli-gated`;
+trimmed), and 18 more take 10-70 s each (#5494: the `recurse` cap tests walk million-node
+documents since #5378, and the fused-slice equivalence tests build large arrays). CI runs
+all of them in their own `deep-recursion` leg rather than in `cli-gated`;
 `scripts/deep-recursion-tests.sh` holds the list for both sides (#3698), so to move another
-slow `jq_cli_tests` test there, add its name to that script (it handles that one test target
-only). `scripts/deep-recursion-tests.sh run` runs just those tests locally, and
+slow `jq_cli_tests` test there, add its name to that script's `HEAVY_TESTS` (it handles that one
+test target only). The x86_64 `holdout` leg skips only the two stack tests (`skip-args-stack`),
+since it is the one place the `unshared-containers` build is tested. `scripts/deep-recursion-tests.sh run` runs just those tests locally, and
 `scripts/test_deep_recursion_tests.py` is the script's own self-test, which the leg runs
 first. A plain `cargo test --features cli` still runs everything.
 
@@ -202,7 +205,7 @@ cargo llvm-cov report --lcov --output-path target/coverage.lcov
 patchcov diff --report target/coverage.lcov
 ```
 
-The two `jq_cli_tests` listed in `scripts/deep-recursion-tests.sh` are `#[ignore]`d under
+The two stack-filling `jq_cli_tests` listed in `scripts/deep-recursion-tests.sh` are `#[ignore]`d under
 `cfg(coverage)` (an attribute on each; cargo-llvm-cov sets the cfg), so `cargo llvm-cov` and the CI
 `Coverage` job report them as ignored. They still run in the `deep-recursion` leg and under a plain
 `cargo test`. When measured (#3750) they covered no line the rest of the suite did not: 4,605 lines on

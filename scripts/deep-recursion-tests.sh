@@ -1,13 +1,24 @@
 #!/bin/bash
-# The jq_cli_tests whose cost is the native stack being filled, kept out of the
-# `cli-gated` CI legs and run in their own `deep-recursion` leg instead (#3698).
+# The slowest `jq_cli_tests`, kept out of the `cli-gated` CI legs and run in their own
+# `deep-recursion` leg instead (#3698, #5494).
 #
-# Each of the two takes ~100-150 s in a debug build and pins a core; together they
-# were a third of the test time of the ~4,500-test `cli-gated` leg on every
-# platform. They are intrinsic to the check (ADR-0025's guard refuses once the
-# registered 2 GB stack is half spent), so the cost is moved, not reduced.
+# Two kinds are listed. The first two cost the native stack being filled: each takes
+# ~100-150 s in a debug build and pins a core, and together they were a third of the test
+# time of the ~4,500-test `cli-gated` leg on every platform. They are intrinsic to the
+# check (ADR-0025's guard refuses once the registered 2 GB stack is half spent), so the
+# cost is moved, not reduced.
 #
-# The same two tests are also `#[ignore]`d under `cfg(coverage)` (the `cargo llvm-cov`
+# The rest are the tests that took 10 s or more each when #5494 measured them (a
+# `--report-time` run of the `cli-gated` command on an M5 Max, 8 tests in parallel): 18
+# tests, 554 s of the 1,263 s `jq_cli_tests` spends. The `macOS ARM64` `cli-gated` leg had
+# grown from 10.6 to 15.4 min in a week (#5494) and set the merge-group wall time; the growth
+# was these. Six `recurse` cap and argument-chain tests went from under 2 s to 35-70 s when #5378
+# raised the node cap to 2^20, so each now walks a million-node document through a dozen
+# filters. They are heavy by construction, not slow because of a fault, so the cost is moved
+# here too: this leg (about 270 s of test CPU) and `cli-gated` (about 970 s) now carry
+# similar amounts. A `yq_cli_tests` test cannot be listed: `run` lists and runs one target.
+#
+# The same two stack tests are also `#[ignore]`d under `cfg(coverage)` (the `cargo llvm-cov`
 # runs, CI's `Coverage` job included), by `#[cfg_attr(coverage, ignore = ...)]` on the
 # tests themselves, because they cover no line the rest of the suite does not
 # (#3750, B2). That is not driven by this list: a test moved here is NOT skipped from
@@ -18,6 +29,11 @@
 #
 #   deep-recursion-tests.sh skip-args   prints `--exact --skip <name> ...`, which
 #                                       ci.yml appends after `--` on `cli-gated`
+#   deep-recursion-tests.sh skip-args-stack
+#                                       the same for the two stack tests only: the
+#                                       x86_64 `holdout` leg is the one place the
+#                                       `unshared-containers` build is tested, so it
+#                                       keeps running the heavy tests and skips just these
 #   deep-recursion-tests.sh run         the whole `deep-recursion` leg
 #
 # Why `run` checks more than `cargo test -- --exact <names>` does: libtest runs
@@ -40,18 +56,45 @@ set -euo pipefail
 
 TEST_TARGET=jq_cli_tests
 
-DEEP_RECURSION_TESTS=(
+# The two whose cost is the native stack (#3698). The `holdout` leg skips only these.
+STACK_TESTS=(
   test_recursion_refuses_before_the_native_stack_runs_out_3262
   test_composed_recursion_across_two_defs_errors_not_aborts_1371
 )
 
+# 10 s or more each, in the order of the #5494 measurement (seconds, M5 Max, in parallel).
+HEAVY_TESTS=(
+  test_fused_slice_read_equals_the_unfused_spelling_4195 # 72
+  test_recurse_cap_raises_instead_of_ending_silently_3716 # 68
+  test_fused_literal_slice_read_equals_the_unfused_spelling_4323 # 61
+  test_argument_chain_refuses_on_the_path_routes_3262 # 61
+  test_recurse_cap_stopping_consumers_and_boundary_3716 # 44
+  test_fused_slice_key_equals_the_unfused_spelling_4286 # 43
+  test_owned_array_slice_read_equals_the_unfused_spelling_4286 # 25
+  test_fused_navigated_literal_slice_read_equals_the_unfused_spelling_4406 # 25
+  test_recurse_cap_retry_and_null_loop_3716 # 23
+  test_linked_dependency_keeps_jq_scoping_2955 # 21
+  per_issue::i5379::test_every_tail_position_loops_in_place_5379 # 18
+  test_recursion_reaches_depth_far_past_expansion_era_1371 # 17
+  per_issue::i5023::test_5023_foreach_update_pipe_of_no_ops_over_an_untracked_state # 16
+  test_pure_chain_links_recurse_deep_3287 # 15
+  test_duplicate_keys_collapse_past_the_probe_ceiling_1588 # 13
+  test_tree_recursion_stack_follows_depth_not_calls_3296 # 12
+  test_path_try_equals_the_question_mark_spelling_4412 # 11
+  test_type_selectors_equal_their_definition_3690 # 11
+)
+
+# What the `deep-recursion` leg runs, and every other leg but `holdout` skips.
+DEEP_RECURSION_TESTS=("${STACK_TESTS[@]}" "${HEAVY_TESTS[@]}")
+
 usage() {
-  echo "usage: $0 skip-args|run" >&2
+  echo "usage: $0 skip-args|skip-args-stack|run" >&2
 }
 
-skip_args() {
+# `--exact --skip <name> ...` for the names given.
+skip_args_of() {
   local args="--exact" name
-  for name in "${DEEP_RECURSION_TESTS[@]}"; do
+  for name in "$@"; do
     args="$args --skip $name"
   done
   echo "$args"
@@ -93,7 +136,8 @@ run() {
 }
 
 case "${1:-}" in
-  skip-args) skip_args ;;
+  skip-args) skip_args_of "${DEEP_RECURSION_TESTS[@]}" ;;
+  skip-args-stack) skip_args_of "${STACK_TESTS[@]}" ;;
   run) run ;;
   *) usage; exit 2 ;;
 esac

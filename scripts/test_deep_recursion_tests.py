@@ -40,12 +40,10 @@ printf '%s\\n' "$FAKE_RESULT"
 exit "${FAKE_EXIT:-0}"
 """
 
-PASSED_2 = "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 2321 filtered out; finished in 101.00s"
 
-
-def skip_arg_tokens():
+def skip_arg_tokens(subcommand="skip-args"):
     done = subprocess.run(
-        [str(SCRIPT), "skip-args"], capture_output=True, text=True, check=True
+        [str(SCRIPT), subcommand], capture_output=True, text=True, check=True
     )
     return done.stdout.split()
 
@@ -56,6 +54,14 @@ def listed_names():
     return tokens[2::2]
 
 
+def all_passed():
+    """What libtest prints when every listed test passed: the count follows the list."""
+    return (
+        f"test result: ok. {len(listed_names())} passed; 0 failed; 0 ignored; 0 measured; "
+        "2321 filtered out; finished in 101.00s"
+    )
+
+
 class SkipArgsTests(unittest.TestCase):
     def test_is_exact_and_skips_every_name_once(self):
         tokens = skip_arg_tokens()
@@ -63,6 +69,17 @@ class SkipArgsTests(unittest.TestCase):
         self.assertGreater(len(names), 0)
         self.assertEqual(tokens, ["--exact"] + [t for n in names for t in ("--skip", n)])
         self.assertEqual(len(names), len(set(names)))
+
+    def test_the_two_stack_tests_are_listed_and_the_stack_subset_is_exactly_them(self):
+        # The count the run leg checks follows the list, so a name dropped from it would go
+        # unnoticed there; these two are the reason the leg exists (#3698).
+        stack = [
+            "test_recursion_refuses_before_the_native_stack_runs_out_3262",
+            "test_composed_recursion_across_two_defs_errors_not_aborts_1371",
+        ]
+        self.assertEqual(listed_names()[:2], stack)
+        tokens = skip_arg_tokens("skip-args-stack")
+        self.assertEqual(tokens, ["--exact"] + [t for n in stack for t in ("--skip", n)])
 
     def test_unknown_or_missing_subcommand_is_a_usage_error(self):
         for args in ([], ["bogus"]):
@@ -84,10 +101,12 @@ class RunTests(unittest.TestCase):
         self.log = self.dir / "calls"
         self.names = listed_names()
 
-    def run_script(self, listing=None, result=PASSED_2, exit_code=0):
+    def run_script(self, listing=None, result=None, exit_code=0):
         """Returns (CompletedProcess, [one string per fake-cargo invocation])."""
         if listing is None:
             listing = [f"{n}: test" for n in ["unrelated_test", *self.names]]
+        if result is None:
+            result = all_passed()
         env = dict(
             os.environ,
             PATH=f"{self.dir}{os.pathsep}{os.environ['PATH']}",
@@ -142,7 +161,9 @@ class RunTests(unittest.TestCase):
         result = "test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 2321 filtered out; finished in 1.00s"
         done, _ = self.run_script(result=result)
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
-        self.assertIn("::error::expected 2 deep-recursion tests to pass", done.stdout)
+        self.assertIn(
+            f"::error::expected {len(self.names)} deep-recursion tests to pass", done.stdout
+        )
         self.assertIn("reported 1", done.stdout)
 
     def test_zero_tests_run_fails(self):
@@ -150,7 +171,9 @@ class RunTests(unittest.TestCase):
         result = "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2323 filtered out; finished in 0.00s"
         done, _ = self.run_script(result=result)
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
-        self.assertIn("::error::expected 2 deep-recursion tests to pass", done.stdout)
+        self.assertIn(
+            f"::error::expected {len(self.names)} deep-recursion tests to pass", done.stdout
+        )
         self.assertIn("reported 0", done.stdout)
 
     def test_no_result_line_fails(self):
@@ -166,7 +189,7 @@ class RunTests(unittest.TestCase):
         self.assertNotIn("::error::", done.stdout)
 
     def test_cargo_failing_on_a_clean_looking_result_still_fails_the_leg(self):
-        done, _ = self.run_script(result=PASSED_2, exit_code=101)
+        done, _ = self.run_script(result=all_passed(), exit_code=101)
         self.assertEqual(done.returncode, 101, done.stdout + done.stderr)
         self.assertNotIn("::error::", done.stdout)
 
@@ -225,13 +248,15 @@ class CiWiringTests(unittest.TestCase):
 
     def test_no_other_leg_runs_jq_cli_tests_with_the_two_tests_twice(self):
         # A third place running `--test jq_cli_tests` unskipped would run them twice.
-        # The `holdout` leg (#5254) runs it under `--all-features`, and so skips them too.
+        # The `holdout` leg (#5254) runs it under `--all-features`, and skips the stack tests.
         for job in MATRIX_JOBS:
             with self.subTest(job=job):
                 for name, leg in matrix_legs(job).items():
                     if name == "holdout":
+                        # Only the stack tests: this is the one leg that builds
+                        # `unshared-containers`, so it keeps the heavy ones (#5494).
                         self.assertEqual(
-                            leg.count("skip=$(scripts/deep-recursion-tests.sh skip-args)"),
+                            leg.count("skip=$(scripts/deep-recursion-tests.sh skip-args-stack)"),
                             1,
                             name,
                         )
