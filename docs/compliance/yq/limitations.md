@@ -6621,5 +6621,17 @@ A path other than `.` (`explode(.a)`, `explode(..)`) is a parse error: yq leaves
 `.a | explode(.)` is refused by the existing rule that a metadata write cannot sit behind a navigation.
 The presentation of an expanded alias copy is lost: its flow style (`b: *x` over `a: &x {p: 1}` prints a block mapping where yq prints `b: {p: 1}`), its quotes (`b: *s` over `a: &s "q"` prints `b: q`) and its explicit tag (`a: &x !!str 1` prints `b: "1"`), the family tracked on [#2651](https://github.com/rust-works/succinctly/issues/2651), and a comment after the alias moves with it.
 The value is the same each time; only how it is written differs.
-The `alias` getter and `alias =` setter, the rest of yq's anchor/alias operators, are still undefined.
+The `alias =` setter is still undefined (`.b alias = "z"` is a parse error); the `alias` getter is next.
 Pinned by `tests/yq_cli/i5483.rs`, whose rows were captured from yq v4.53.3.
+
+## The `alias` getter answers a node's `Value`, as yq does ([#5483](https://github.com/rust-works/succinctly/issues/5483))
+
+yq's `alias` returns the node's `Value`, not whether it is an alias: the anchor's name for an alias node (`*name`), the scalar's own text for any other scalar, and `""` for a mapping, a sequence and an empty value.
+So `[.. | alias]` over `a: &x {p: 1}` / `b: *x` / `c: &y 2` is `["", "", "1", "x", "2", "y"]`, not a column of empty strings with two names.
+`succinctly yq` follows that bug-for-bug (ADR-0018): the text is the scalar as written (`1.50`, `0x1F`, `~`, `.inf`, `2001-12-14`), a quoted or block scalar decoded (`"q\tx"`, `|` literals), and the alias name for an alias node.
+It is yq-mode only: jq has no `alias`, and `succinctly jq alias` is `alias/0 is not defined` as in jq 1.7.1.
+Rows over a plain document, a 25-spelling scalar table, `select(alias != "")` in a read, a write and a `del`, and a two-document stream match yq v4.53.3.
+Where the node is an owned copy rather than a node of the document (the value inside `|=`, `with_entries(.value |= alias)`, a computed value), the evaluator holds no alias mark and no source spelling, so `~` answers `""` where yq answers `~`, an alias node answers the text of its target where yq answers the anchor's name, and a number answers its canonical text (`1.50` is `1.5`).
+`.[] | select(alias != "")` prints the resolved target of an alias node where yq prints `*x`, the read-route alias echo tracked with the alias-mark family (#2505, #5249).
+Pinned by `tests/yq_cli/i5483_alias.rs`, whose rows were captured from yq v4.53.3.
+

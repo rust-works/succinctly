@@ -264,11 +264,15 @@ These functions access YAML-specific metadata not available in JSON:
 | `tag`      | YAML type tag                      | `!!str`, `!!int`, `!!map`               |
 | `type`     | Alias of `tag` in yq mode (#2516)  | `!!str`, `!!int`, `!!map`               |
 | `anchor`   | Anchor name for nodes with `&name` | `"myanchor"` or `""`                    |
+| `alias`    | Name an `*alias` refers to         | `"myanchor"` or `""`                    |
 | `style`    | Scalar/collection style            | `"double"`, `"literal"`, `"flow"`       |
 | `kind`     | Node kind                          | `"scalar"`, `"seq"`, `"map"`, `"alias"` |
 | `key`      | Current key when iterating         | `"name"` or `0`                         |
 | `line`     | 1-based line number (*)            | `5`                                     |
 | `column`   | 1-based column number (*)          | `3`                                     |
+
+`alias` is yq's node `Value` (#5483): the anchor's name for an alias node, a scalar's own text (`1.50`,
+`0x1F`) for any other scalar, `""` for a collection.
 
 (*) A node that carries a property reports the position of its first `&anchor`/`!tag`
 token, not of its value: `b: &anc [1,2]` is column 4 (the `&`), as in yq (#2712).

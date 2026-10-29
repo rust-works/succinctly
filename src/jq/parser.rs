@@ -8167,6 +8167,12 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Anchor));
         }
 
+        // alias - yq: return the name of the anchor an alias node refers to (#5483)
+        if self.mode == ParserMode::Yq && self.matches_keyword("alias") {
+            self.consume_keyword("alias");
+            return Ok(Some(Builtin::Alias));
+        }
+
         // style - yq: return scalar/collection style
         if self.matches_keyword("style") {
             self.consume_keyword("style");
@@ -14783,6 +14789,7 @@ mod tests {
         ];
         /// yq accepts the name (a yq builtin, an operator word or core syntax).
         const YQ_NATIVE: &[&str] = &[
+            "alias",
             "all_c",
             "anchor",
             "and",
