@@ -4421,7 +4421,9 @@ $ printf 'a: +99999999999999999999\n' | succinctly yq '.a | tostring'
 ```
 
 The digits ride in a `NumberLiteral` whose text the reindex bridge reads as number syntax, and
-neither `+9...` nor `0099...` is JSON number text (a `+1.0` or `1.` crosses the bridge the same way, as the spelling token since #1356). The bridge reads the leading zeros as it reads `007` (#1149) and keeps a `+` on this one shape
+neither `+9...` nor `0099...` is JSON number text.
+A `+1.0` or `1.` crosses the bridge the same way, as the spelling token since #1356.
+The bridge reads the leading zeros as it reads `007` (#1149) and keeps a `+` on this one shape
 when a bridge number is read (`JsonNumber::bridge_signed_overflowed_int`). jq mode follows jq, which
 stores `+X` as `X` (#2877): a `load()`ed YAML `+99999999999999999999` carries its `+` in the value
 but `succinctly jq` prints `99999999999999999999`, as for the plain spelling. A run past 309 digits, leading zeros

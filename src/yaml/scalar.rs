@@ -612,7 +612,7 @@ fn go_parse_int_base0_accepts(raw: &str) -> bool {
 /// already JSON number syntax or no float.
 #[must_use]
 pub fn spelled_float_json_text(raw: &str) -> Option<String> {
-    if !raw.contains(['.', 'e', 'E']) || preservable_float_literal_text(raw).is_none() {
+    if !is_spelled_float(raw) {
         return None;
     }
     let f: f64 = raw.parse().ok().filter(|f: &f64| f.is_finite())?;
@@ -622,7 +622,25 @@ pub fn spelled_float_json_text(raw: &str) -> Option<String> {
 /// Whether `raw` is a float spelled other than as JSON number syntax ([`spelled_float_json_text`]).
 #[must_use]
 pub fn is_spelled_float(raw: &str) -> bool {
-    raw.contains(['.', 'e', 'E']) && preservable_float_literal_text(raw).is_some()
+    has_non_json_float_marker(raw)
+        && raw.parse::<f64>().is_ok_and(f64::is_finite)
+        && preservable_float_literal_text(raw).is_some()
+}
+
+/// Whether `raw` carries a mark that keeps it from being JSON number syntax: a leading `+` or
+/// dot, a trailing dot, a dot before the exponent, or a zero with a digit after it.
+///
+/// A necessary condition only, a few byte tests that let the ordinary `3.14` and `-1.5e3`
+/// skip the full syntax scan on every JSON write.
+fn has_non_json_float_marker(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    let unsigned = bytes.strip_prefix(b"-").unwrap_or(bytes);
+    matches!(bytes.first(), Some(b'+'))
+        || matches!(unsigned.first(), Some(b'.'))
+        || matches!(bytes.last(), Some(b'.'))
+        || matches!(unsigned, [b'0', b'0'..=b'9', ..])
+        || raw.contains(".e")
+        || raw.contains(".E")
 }
 
 /// The number yq's JSON encoder writes for a literal whose text is not what it writes.
@@ -651,31 +669,14 @@ pub fn yq_json_number_text(raw: &str) -> Option<String> {
 /// [`crate::json::validate::strip_redundant_leading_zeros`], #1149's own
 /// JSON-side helper for the identical problem).
 ///
-/// Normalizing (rather than preserving verbatim, the way
-/// `is_preservable_float_literal` does) is required, not a style choice:
-/// `OwnedValue::NumberLiteral`'s downstream JSON-reindexing bridge parses
-/// its stored text as if it *were* JSON, so a genuinely non-JSON-safe
-/// spelling passed through unchanged corrupts that round trip. This was
-/// caught live during this fix's own development (code review self-check):
-/// an earlier draft widened `is_preservable_float_literal` itself to
-/// accept anything this crate's own lenient semi-index scanner
-/// (`number_literal_end`) could find the boundaries of, on the theory that
-/// scanner-safety implied output-safety -- it doesn't. The scanner finding
-/// a clean span only means it won't mis-parse *already-embedded* text; it
-/// says nothing about whether that same text is valid to *emit* as new
-/// JSON output. That draft made `-o json` on `a: 1.`/`a: 007e2` literally
-/// emit `1.`/`007e2` as JSON number text -- invalid per RFC 8259 (confirmed
-/// via a real JSON parser rejecting it) -- for the same query shapes that
-/// happened to route through this text before any other validation caught
-/// it. Every consumer needs the stored spelling to be actual valid JSON,
-/// which normalizing up front guarantees uniformly.
-///
-/// This is a real, permanent divergence from real yq's own verbatim-echo
-/// `tostring`/`join`/`-o yaml` output for these spellings (`+1.0`, `1.`,
-/// `007e2` all echo completely unchanged in real yq, oracle-confirmed) --
-/// accepted, not fixed by this function, matching #954's own root-cause
-/// framing (real yq's Go-based number model has no equivalent internal
-/// JSON-reindexing constraint forcing it to normalize).
+/// The normalized text is a JSON number, which the reindex bridge and the JSON writers could echo
+/// as is. Since #1356 nothing stores it: a document float and `tonumber` keep the spelling as the
+/// literal's text (as yq echoes `+1.0`, `1.` and `007e2` through `tostring`, `join` and YAML
+/// output), and this function is the test of which spellings those are
+/// ([`is_spelled_float`]), with the JSON writers printing yq's `FormatFloat` of the value
+/// ([`spelled_float_json_text`]). Before then the normalization was the stored text, because an
+/// emitted spelling that is not JSON (`1.`, `007e2`) corrupted the bridge's round trip -- which the
+/// spelling token now carries instead.
 ///
 /// `None` when nothing here helps (not `.`-or-exponent-shaped at all, or the
 /// normalized text is still invalid, e.g.
@@ -698,14 +699,14 @@ pub(super) fn preservable_float_literal_text(s: &str) -> Option<String> {
     }
     let stripped_plus = s.strip_prefix('+').unwrap_or(s);
     // A leading dot (`.5`, `-.5`, `+.5e3`) gets the `0` JSON number syntax needs (#1356).
-    let with_zero = match stripped_plus.strip_prefix("-.") {
-        Some(rest) => format!("-0.{rest}"),
+    let with_zero: Cow<'_, str> = match stripped_plus.strip_prefix("-.") {
+        Some(rest) => Cow::Owned(format!("-0.{rest}")),
         None => match stripped_plus.strip_prefix('.') {
-            Some(rest) => format!("0.{rest}"),
-            None => stripped_plus.to_string(),
+            Some(rest) => Cow::Owned(format!("0.{rest}")),
+            None => Cow::Borrowed(stripped_plus),
         },
     };
-    let stripped_plus = with_zero.as_str();
+    let stripped_plus: &str = &with_zero;
     let (mantissa, exponent) = match stripped_plus.find(['e', 'E']) {
         Some(exp_pos) => stripped_plus.split_at(exp_pos),
         None => (stripped_plus, ""),
@@ -1388,6 +1389,34 @@ mod tests {
     // ========================================================================
     // preservable_float_literal_text tests (#954)
     // ========================================================================
+
+    /// #1356: only text that parses as a float and is not JSON number syntax is a spelled float;
+    /// a lone dot, a doubled sign and a bare exponent are not, and the ordinary float is not.
+    #[test]
+    fn is_spelled_float_classifies_by_text_alone_1356() {
+        for (raw, json) in [
+            ("+2.0", "2.0"),
+            ("2.", "2.0"),
+            (".5", "0.5"),
+            ("-.5", "-0.5"),
+            ("007.5", "7.5"),
+            ("00.5", "0.5"),
+            ("1.e5", "100000.0"),
+            ("+1e5", "100000.0"),
+            (".5e3", "500.0"),
+            ("+.5", "0.5"),
+        ] {
+            assert!(is_spelled_float(raw), "{raw}");
+            assert_eq!(spelled_float_json_text(raw).as_deref(), Some(json), "{raw}");
+        }
+        for raw in [
+            "3.14", "-1.5e3", "1e5", "1E5", "0.5", "0.0", "1.0", "-0.5", "2", "+5", ".", "+.",
+            "-.", ".e5", "+-2.0", "1.2.3", "abc", "", "+", "1e999", "+1e999",
+        ] {
+            assert!(!is_spelled_float(raw), "{raw}");
+            assert_eq!(spelled_float_json_text(raw), None, "{raw}");
+        }
+    }
 
     #[test]
     fn preservable_float_literal_text_returns_none_when_already_preservable() {

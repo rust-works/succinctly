@@ -28518,14 +28518,8 @@ fn test_yaml_legal_json_unsafe_float_spellings_normalize_954() -> Result<()> {
         ("a: 007e2\n", "700.0"),
         ("a: -1.\n", "-1.0"),
         ("a: -007e2\n", "-700.0"),
-        // Passes via the pre-existing bare-`f64` fallback, not this fix's
-        // new normalization: `preservable_float_literal_text` doesn't
-        // widen a bare leading dot (`.5`, no digit before the point) at
-        // all, only a leading `+`/trailing `.`/redundant leading zero --
-        // but `0.5_f64.to_string()` already includes the leading zero
-        // naturally, so there's no #954-style symptom here to begin with.
-        // Kept in this sweep as a non-regression check, not new-path coverage
-        // (code review flagged the distinction).
+        // A leading dot is a spelled float too since #1356 (`+.5` rides as the
+        // literal and the JSON writers print yq's `FormatFloat`, `0.5`).
         ("a: +.5\n", "0.5"),
     ] {
         let (out, code) = run_yq_stdin(".a", yaml, &["-o=json", "-I=0"])?;

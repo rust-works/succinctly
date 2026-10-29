@@ -3211,7 +3211,12 @@ impl<'a> JsonNumber<'a> {
             self.bridge_value()
                 // #2802: the number a spelled integer names; #1356: or a spelled float.
                 .or_else(|| self.bridge_spelled_int().map(|n| n as f64))
-                .or_else(|| self.bridge_spelling()?.parse::<f64>().ok())
+                .or_else(|| {
+                    let spelling = self.bridge_spelling()?;
+                    crate::yaml::is_spelled_float(&spelling)
+                        .then(|| spelling.parse::<f64>().ok())
+                        .flatten()
+                })
                 .or_else(|| crate::json::validate::jq_special_number(bytes))
                 .ok_or(JsonError::InvalidNumber)
         })
