@@ -13861,6 +13861,13 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         {
             collect_each_generic::<S, V>(expr, value, optional, cursor)
         }
+        // #4095: and `recurse(.[]?; cond)` for a `cond` yielding at most one value, the
+        // non-sink twin of `eval_each_generic`'s cursor arm.
+        Expr::Builtin(Builtin::RecurseCond(f, cond))
+            if cursor.is_some() && crate::jq::eval::is_gated_structural_descent(f, Some(cond)) =>
+        {
+            collect_each_generic::<S, V>(expr, value, optional, cursor)
+        }
         Expr::Pipe(exprs) => {
             eval_single_pipe::<S, V>(exprs, &PipeWhole::given(expr), value, optional, cursor)
         }
@@ -15724,14 +15731,10 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // #3867: and `recurse(.[]?; cond)` for a `cond` that yields at most one value
         // -- the owned walk's `walk_descendants_gated`, without materializing the
         // document (`first(recurse(.[]?; true))` over a 7 MB document was 5x `..`'s
-        // memory).
-        // Jq mode only: in yq mode a mapping with a duplicate key read through a position
-        // (`recurse(.[]?; true) | path`) counts the repeated key's node once more than the owned
-        // walk, a divergence left to its own issue.
+        // memory). Both modes (#4095): the walk lists a node's children as `..` does, so a
+        // mapping with a duplicate key counts as many nodes here as in the owned walk (#1344).
         Expr::Builtin(Builtin::RecurseCond(f, cond))
-            if S::TAG == EvalTag::Jq
-                && cursor.is_some()
-                && crate::jq::eval::is_gated_structural_descent(f, Some(cond)) =>
+            if cursor.is_some() && crate::jq::eval::is_gated_structural_descent(f, Some(cond)) =>
         {
             each_recurse_cursor_generic::<S, V>(cursor.expect("guarded"), Some(cond), sink)
         }
@@ -27507,6 +27510,8 @@ fn path_context_is_navigational_at(expr: &Expr, unfolded: u8) -> bool {
         Expr::Builtin(Builtin::RecurseF(f)) if crate::jq::eval::is_structural_descent(f, None) => {
             true
         }
+        // #4095: and `recurse(.[]?; cond)` for a `cond` the walk can ask at a position.
+        Expr::Builtin(Builtin::RecurseCond(f, cond)) => recurse_cond_is_walkable(f, cond),
         Expr::SliceExpr { target, start, end } => {
             (nav(target) || path_context_component_walkable(target))
                 && start
@@ -27644,6 +27649,17 @@ fn path_context_is_navigational_at(expr: &Expr, unfolded: u8) -> bool {
 /// is carried out exactly as the eager route carried it (#2495).
 fn path_context_component_walkable(expr: &Expr) -> bool {
     owned_identity_component_supported(expr)
+}
+
+/// `recurse(f; cond)` as one navigation step (#4095): structural descent
+/// ([`crate::jq::eval::is_gated_structural_descent`]) pruned by a `cond` that yields at most one
+/// value and that the walk can ask at a position ([`path_context_component_walkable`], the
+/// predicate a computed component answers to). The one definition the position walk's gate, its
+/// step and the owned identity pipe's gate and step all consult, so the three cannot disagree on
+/// which spellings they take.
+fn recurse_cond_is_walkable(f: &Expr, cond: &Expr) -> bool {
+    crate::jq::eval::is_gated_structural_descent(f, Some(cond))
+        && path_context_component_walkable(cond)
 }
 
 /// A position reached during a path-context walk: the node the path reached
@@ -28114,10 +28130,14 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             path_context_step_getpath::<S, V>(path_expr, pos, out)
         }
         Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => {
-            path_context_step_recurse::<S, V>(pos, out)
+            path_context_step_recurse::<S, V>(None, pos, out)
         }
         Expr::Builtin(Builtin::RecurseF(f)) if crate::jq::eval::is_structural_descent(f, None) => {
-            path_context_step_recurse::<S, V>(pos, out)
+            path_context_step_recurse::<S, V>(None, pos, out)
+        }
+        // #4095: `recurse(.[]?; cond)`, the same walk with `cond` asked of each child.
+        Expr::Builtin(Builtin::RecurseCond(f, cond)) if recurse_cond_is_walkable(f, cond) => {
+            path_context_step_recurse::<S, V>(Some(cond), pos, out)
         }
         // spine 2416 (walk residue): the transparent wrappers, at the head
         // of a pipe or anywhere else in it. Each one's positions *are* the
@@ -29058,7 +29078,14 @@ fn path_context_step_getpath<S: EvalSemantics, V: DocumentValue>(
 /// (the root's `key` emits nothing, #2421), `[.. | path]` starts with `[]`,
 /// and `[.. | parent | key]` is `["a","a","c","c"]`; jq 1.7.1's
 /// `[path(..)]` lists the same positions in the same order.
+///
+/// With a `cond` (#4095), `recurse(.[]?; cond)`: a child is stepped into only once `cond` is
+/// truthy at its position, asked when the walk reaches it -- after the subtrees of the siblings
+/// before it, as jq's `def r: ., (f | select(cond) | r)` does -- and the starting node is
+/// delivered without it. The caller admitted only a `cond` yielding at most one value
+/// ([`recurse_cond_is_walkable`]), so one verdict keeps a child once.
 fn path_context_step_recurse<S: EvalSemantics, V: DocumentValue>(
+    cond: Option<&Expr>,
     pos: &PathContextPos<V>,
     out: &mut Vec<PathContextPos<V>>,
 ) -> Result<(), Control> {
@@ -29073,7 +29100,16 @@ fn path_context_step_recurse<S: EvalSemantics, V: DocumentValue>(
     let mut children = Vec::new();
     path_context_step_try::<S, V>(&Expr::Iterate, None, pos, &mut children)?;
     for child in &children {
-        path_context_step_recurse::<S, V>(child, out)?;
+        if let Some(cond) = cond {
+            let (verdicts, escape) = path_context_component_values::<S, V>(cond, child);
+            if let Some(control) = escape {
+                return Err(control);
+            }
+            if !verdicts.iter().any(OwnedValue::is_truthy) {
+                continue;
+            }
+        }
+        path_context_step_recurse::<S, V>(cond, child, out)?;
     }
     Ok(())
 }
@@ -36418,6 +36454,8 @@ fn owned_identity_nav_supported(expr: &Expr) -> bool {
         Expr::Builtin(Builtin::RecurseF(f)) if crate::jq::eval::is_structural_descent(f, None) => {
             true
         }
+        // #4095: and `recurse(.[]?; cond)`, the same descent with `cond` asked of each child.
+        Expr::Builtin(Builtin::RecurseCond(f, cond)) => recurse_cond_is_walkable(f, cond),
         Expr::Optional(inner) | Expr::Paren(inner) => owned_identity_nav_supported(inner),
         Expr::Pipe(exprs) => exprs.iter().all(owned_identity_nav_supported),
         _ => false,
@@ -37096,10 +37134,13 @@ fn owned_identity_step<S: EvalSemantics, V: DocumentValue>(
             out,
         ),
         Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => {
-            owned_identity_recurse_step::<S, V>(value, id, out).map_err(Control::Error)
+            owned_identity_recurse_step::<S, V>(None, value, id, out)
         }
         Expr::Builtin(Builtin::RecurseF(f)) if crate::jq::eval::is_structural_descent(f, None) => {
-            owned_identity_recurse_step::<S, V>(value, id, out).map_err(Control::Error)
+            owned_identity_recurse_step::<S, V>(None, value, id, out)
+        }
+        Expr::Builtin(Builtin::RecurseCond(f, cond)) if recurse_cond_is_walkable(f, cond) => {
+            owned_identity_recurse_step::<S, V>(Some(cond), value, id, out)
         }
         // #2771: a literal has no position of its own. Reached only from
         // `owned_identity_operand` (its top-level `strip_parens` short-circuit
@@ -37127,12 +37168,16 @@ fn owned_identity_step<S: EvalSemantics, V: DocumentValue>(
 /// value itself, then every descendant in document order, each at its own
 /// position -- `recurse(.[]?)`, so a scalar ends its branch silently. The
 /// same order [`path_context_step_recurse`] gives the walk's nodes.
+///
+/// With a `cond` (#4095), `recurse(.[]?; cond)`: a child is stepped into only once `cond` is
+/// truthy at its position, as [`path_context_step_recurse`] does for a live one.
 fn owned_identity_recurse_step<S: EvalSemantics, V: DocumentValue>(
+    cond: Option<&Expr>,
     value: &OwnedValue,
     id: &OwnedIdentity<V>,
     out: &mut Vec<(OwnedValue, OwnedIdentity<V>)>,
-) -> Result<(), EvalError> {
-    guard_nesting_depth(id.ancestors.len())?;
+) -> Result<(), Control> {
+    guard_nesting_depth(id.ancestors.len()).map_err(Control::Error)?;
     out.push((value.clone(), id.clone()));
     let (children, _suppressed) = owned_nav_children::<S>(&Expr::Iterate, value, true);
     let parent = Rc::new(value.clone());
@@ -37141,7 +37186,19 @@ fn owned_identity_recurse_step<S: EvalSemantics, V: DocumentValue>(
             Some(component) => id.child(&parent, component),
             None => id.clone(),
         };
-        owned_identity_recurse_step::<S, V>(&child, &child_id, out)?;
+        if let Some(cond) = cond {
+            let resolved = owned_identity_resolve_component::<S, V>(cond, &child_id)
+                .map_err(Control::Error)?;
+            let (verdicts, escape) =
+                owned_identity_values::<S>(&resolved, &child, false, &child_id.root_witness());
+            if let Some(control) = escape {
+                return Err(control);
+            }
+            if !verdicts.iter().any(OwnedValue::is_truthy) {
+                continue;
+            }
+        }
+        owned_identity_recurse_step::<S, V>(cond, &child, &child_id, out)?;
     }
     Ok(())
 }

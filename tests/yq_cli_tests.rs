@@ -57926,11 +57926,12 @@ fn test_recurse_structural_descent_over_alias_fanout_completes_3719() -> Result<
     Ok(())
 }
 
-/// #3867: `recurse(.[]?; cond)` keeps the owned walk in yq mode (the cursor arm is jq
-/// mode only): over a mapping with a duplicate key, a position read counts the
-/// repeated key once, as the owned walk does.
+/// #3867, #4095: `recurse(.[]?; cond)` over a mapping with a duplicate key counts the
+/// repeated key once in yq mode, a position read included. #3867 kept the owned walk there
+/// because the cursor walk counted it twice (#1344); the cursor walk serves yq mode now
+/// (`tests/yq_cli/i4095.rs`) and agrees.
 #[test]
-fn test_recurse_cond_in_yq_mode_keeps_the_owned_walk_3867() -> Result<()> {
+fn test_recurse_cond_in_yq_mode_counts_a_duplicate_key_once_3867() -> Result<()> {
     let doc = "dup: {a: 1, a: 2}\n";
     for (filter, want) in [
         ("[recurse(.[]?; true) | path] | length", "3"),
