@@ -158,7 +158,8 @@ jobs:
       matrix:
         include:
           # #3698: scripts/deep-recursion-tests.sh lists the two jq_cli_tests whose cost is
-          # the native stack being filled (~100-150 s each, a third of this leg's test CPU).
+          # the native stack being filled (~100-150 s each, a third of this leg's test CPU),
+          # and (#5494) the 18 that take 10 s or more each, 554 s of the leg's test CPU.
           # They run in the `deep-recursion` leg below instead. `skip-args` prints
           # `--exact --skip <name> ...` from the very list that leg runs, so the two cannot
           # drift apart; it is computed on its own line so a failure there fails the step

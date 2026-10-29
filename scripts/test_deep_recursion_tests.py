@@ -40,7 +40,6 @@ printf '%s\\n' "$FAKE_RESULT"
 exit "${FAKE_EXIT:-0}"
 """
 
-PASSED_2 = "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 2321 filtered out; finished in 101.00s"
 
 
 def skip_arg_tokens():
@@ -54,6 +53,14 @@ def listed_names():
     tokens = skip_arg_tokens()
     assert tokens[0] == "--exact", tokens
     return tokens[2::2]
+
+
+def all_passed():
+    """What libtest prints when every listed test passed: the count follows the list."""
+    return (
+        f"test result: ok. {len(listed_names())} passed; 0 failed; 0 ignored; 0 measured; "
+        "2321 filtered out; finished in 101.00s"
+    )
 
 
 class SkipArgsTests(unittest.TestCase):
@@ -84,10 +91,12 @@ class RunTests(unittest.TestCase):
         self.log = self.dir / "calls"
         self.names = listed_names()
 
-    def run_script(self, listing=None, result=PASSED_2, exit_code=0):
+    def run_script(self, listing=None, result=None, exit_code=0):
         """Returns (CompletedProcess, [one string per fake-cargo invocation])."""
         if listing is None:
             listing = [f"{n}: test" for n in ["unrelated_test", *self.names]]
+        if result is None:
+            result = all_passed()
         env = dict(
             os.environ,
             PATH=f"{self.dir}{os.pathsep}{os.environ['PATH']}",
@@ -142,7 +151,9 @@ class RunTests(unittest.TestCase):
         result = "test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 2321 filtered out; finished in 1.00s"
         done, _ = self.run_script(result=result)
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
-        self.assertIn("::error::expected 2 deep-recursion tests to pass", done.stdout)
+        self.assertIn(
+            f"::error::expected {len(self.names)} deep-recursion tests to pass", done.stdout
+        )
         self.assertIn("reported 1", done.stdout)
 
     def test_zero_tests_run_fails(self):
@@ -150,7 +161,9 @@ class RunTests(unittest.TestCase):
         result = "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2323 filtered out; finished in 0.00s"
         done, _ = self.run_script(result=result)
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
-        self.assertIn("::error::expected 2 deep-recursion tests to pass", done.stdout)
+        self.assertIn(
+            f"::error::expected {len(self.names)} deep-recursion tests to pass", done.stdout
+        )
         self.assertIn("reported 0", done.stdout)
 
     def test_no_result_line_fails(self):
@@ -166,7 +179,7 @@ class RunTests(unittest.TestCase):
         self.assertNotIn("::error::", done.stdout)
 
     def test_cargo_failing_on_a_clean_looking_result_still_fails_the_leg(self):
-        done, _ = self.run_script(result=PASSED_2, exit_code=101)
+        done, _ = self.run_script(result=all_passed(), exit_code=101)
         self.assertEqual(done.returncode, 101, done.stdout + done.stderr)
         self.assertNotIn("::error::", done.stdout)
 
