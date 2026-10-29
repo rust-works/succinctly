@@ -131,6 +131,17 @@ fn test_a_malformed_earlier_document_still_fails_the_run_5471() -> Result<()> {
     Ok(())
 }
 
+/// jq has no iteration cap, so it would have printed the first input's answer; exiting 0 after
+/// succinctly's cap dropped it would hide that the output is short.
+#[test]
+fn test_a_resource_limit_on_an_earlier_input_still_fails_the_run_5471() -> Result<()> {
+    let filter = "if . == 1 then [range(1e12)] | length else . end";
+    let (out, err, code) = run_jq_full(&["-c", filter], Some("1 2"))?;
+    assert!(err.contains("maximum iterations exceeded"), "{err}");
+    assert_eq!((out.as_str(), code), ("2\n", 5), "{err}");
+    Ok(())
+}
+
 /// The same rule across files: the last file's input decides.
 #[test]
 fn test_exit_status_follows_the_last_file_5471() -> Result<()> {

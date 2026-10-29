@@ -10084,8 +10084,9 @@ $ echo $?
 5
 ```
 
-One case stays sticky by default: a document that fails to decode (`{"a":tru} {"a":1}`) exits 5 wherever it is.
+Two errors stay sticky by default, because jq never raises them where succinctly does: a document that fails to decode (`{"a":tru} {"a":1}`) and a succinctly resource limit (`range: maximum iterations exceeded`, the recursion-depth cap) exit 5 wherever they occur.
 jq stops at a malformed document and exits 5; succinctly reads on past it (it validates only what a filter reads), so without this a clean document after it would turn jq's 5 into 0.
+jq has no such cap and would have produced the capped input's output, so exiting 0 would hide that the output is short.
 
 `--on-error` is a succinctly extension (ADR-0018 rule 5): `continue` keeps every input running and exits 5 if any of them raised, which was the default from [#355](https://github.com/rust-works/succinctly/issues/355) until #5471, and `stop` evaluates nothing after the first failure.
 [#1855](https://github.com/rust-works/succinctly/issues/1855) had kept the sticky status as the default and [#1923](https://github.com/rust-works/succinctly/issues/1923) recorded it here as a divergence none of rule 4's conditions covered; making it opt-in removes the divergence without dropping the behaviour.

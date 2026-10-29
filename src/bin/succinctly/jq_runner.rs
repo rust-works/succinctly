@@ -4450,6 +4450,7 @@ struct FinishedInputs {
 impl FinishedInputs {
     /// Close the input that just finished and start the next one. `false` once
     /// `--on-error=stop` has seen an error: the caller then evaluates no further input.
+    #[must_use]
     fn next_input(
         &mut self,
         on_error: Option<OnError>,
@@ -4489,8 +4490,8 @@ fn stopped(on_error: Option<OnError>, sink: &ErrorSink) -> bool {
 ///
 /// An uncaught error outranks -e: jq's 5 says the filter failed, -e's 1/4 describe an
 /// otherwise-successful result that happened to be falsy (#355 vs #178). Which errors count
-/// is `--on-error`'s: by default only the last input's, as in jq, plus a decode failure
-/// anywhere, since jq stops at a malformed document (#5471).
+/// is `--on-error`'s: by default only the last input's, as in jq, plus anywhere an error jq
+/// would not have raised there ([`ErrorSink::beyond_jq`], #5471).
 fn jq_exit_code(
     args: &JqCommand,
     sink: &ErrorSink,
@@ -4499,7 +4500,7 @@ fn jq_exit_code(
     mut last_output: Option<OwnedValue>,
 ) -> i32 {
     let failed = match args.on_error {
-        None => sink.input_failed() || sink.decode_failed(),
+        None => sink.input_failed() || sink.beyond_jq(),
         Some(OnError::Continue | OnError::Stop) => sink.hit(),
     };
     if failed {
@@ -4838,7 +4839,8 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     let mut had_output = false;
     let mut finished = FinishedInputs::default();
     // Uncaught evaluation errors. Evaluation continues past one (as jq does),
-    // so the failure is remembered here and turned into exit 5 below (#355).
+    // so the failure is remembered here, and `jq_exit_code` turns the ones its
+    // `--on-error` mode counts into exit 5 (#355, #5471).
     let mut sink = ErrorSink::default();
 
     // Validate DSV delimiter if provided
@@ -4869,6 +4871,9 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
             };
 
             'files: for (file_idx, raw) in raw_inputs.into_iter().enumerate() {
+                if stopped(args.on_error, &sink) {
+                    break;
+                }
                 jq::cli_context::set_current_source(u32::try_from(file_idx).ok());
                 let file = files.get(file_idx).map(|p| p.to_string_lossy().to_string());
 
@@ -5662,12 +5667,14 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                     // Only this loop's pops start a top-level input: a
                     // document the filter's own `input` reads belongs to the
                     // input that read it, as in jq.
-                    finished.next_input(
+                    if !finished.next_input(
                         args.on_error,
                         &mut sink,
                         &mut had_output,
                         &mut last_output,
-                    );
+                    ) {
+                        break;
+                    }
                     // Streaming, not collect-then-write (#1653) -- see
                     // `evaluate_input_streaming`.
                     evaluate_input_streaming(

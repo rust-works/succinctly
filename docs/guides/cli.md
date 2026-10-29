@@ -612,7 +612,8 @@ while the evaluator still follows jq (`length` on `{"a":1,"a":2}` is `1` either 
 | 4    | With `-e`, no output was produced                                    |
 | 5    | Uncaught evaluation error                                            |
 
-An uncaught evaluation error prints a diagnostic to stderr and exits 5, so a
+An uncaught evaluation error prints a diagnostic to stderr. On the last input
+(on any input, under `--on-error` below) it also makes the run exit 5, so a
 failed filter is distinguishable from a successful one under `set -e`, `&&`, or
 an explicit `$?` check:
 
@@ -639,18 +640,20 @@ with a falsy or empty result. An error therefore outranks `-e`. A caught error
 As in jq, the exit code reflects only the *last* top-level input (each document,
 each `-R` line, each `--stream` event): an error on an earlier input followed by
 a clean last one exits 0. Under `-e`, an input that printed and then raised
-does not count as the last output. One exception: a document that fails to
-decode fails the run wherever it is, because jq stops at a malformed document
-and exits 5 where succinctly reads on past it.
+does not count as the last output. Two errors jq never raises where succinctly
+does fail the run wherever they occur: a document that fails to decode (jq stops
+at a malformed document and exits 5, where succinctly reads on past it) and a
+succinctly resource limit such as `range: maximum iterations exceeded` (jq would
+have produced that input's output).
 
 `--on-error` is a succinctly extension for scripts that need every failure
 reflected in the exit code:
 
-| Mode                  | Behaviour                                                               |
-|-----------------------|-------------------------------------------------------------------------|
-| *(not given)*         | jq's: the last input's outcome decides                                  |
-| `--on-error=continue` | Every input is still evaluated; exit 5 if any of them raised            |
-| `--on-error=stop`     | Nothing is evaluated after the first input that raised; exit 5         |
+| Mode                  | Behaviour                                                |
+|-----------------------|----------------------------------------------------------|
+| *(not given)*         | jq's: the last input's outcome decides                   |
+| `--on-error=continue` | Every input is still evaluated; exit 5 if any raised     |
+| `--on-error=stop`     | Nothing is evaluated after the first that raised; exit 5 |
 
 ```bash
 printf '1 {"a":2}' | succinctly jq '.a'                       # 2, exit 0 (as jq)
