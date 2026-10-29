@@ -7,13 +7,15 @@ use anyhow::Result;
 
 use crate::{run_jq_full, run_jq_over_files};
 
-/// Fails a number, so `.a` raises on `1` and answers on an object.
+/// Prints each element of an array until it reaches a number, then raises.
 const RAISE_ON_NUMBER: &str = r#".[] | if type == "number" then error("n") else . end"#;
+
+/// (input, args, jq's stdout = continue's, jq's code, continue's code, stop's stdout)
+type Row<'a> = (&'a str, &'a [&'a str], &'a str, i32, i32, &'a str);
 
 #[test]
 fn test_exit_status_is_the_last_inputs_and_on_error_overrides_it_5471() -> Result<()> {
-    // (input, args, jq's stdout = continue's, jq's code, continue's code, stop's stdout)
-    let rows: &[(&str, &[&str], &str, i32, i32, &str)] = &[
+    let rows: &[Row] = &[
         // The issue's own repro: an error on an early input, a clean last one.
         ("1 {\"a\":2}", &[".a"], "2\n", 0, 5, ""),
         ("{\"a\":2} 1", &[".a"], "2\n", 5, 5, "2\n"),
