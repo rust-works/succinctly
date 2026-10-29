@@ -1326,10 +1326,11 @@ build that only lifts the cap and keeps the evaluator-driven walk (and against `
 
 The walk is 3.4 to 4.9 times faster than lifting only the cap, at 0.25 to 0.65 times its peak memory, and
 costs 1.6 to 1.9 times `..`'s time and 1.5 to 2.6 times its memory: one `cond` per node, and the owned tree
-a cursor walk avoids (in jq mode over a live document `recurse(.[]?; cond)` now takes that cursor walk, #3867, so
+a cursor walk avoids (over a live document `recurse(.[]?; cond)` now takes that cursor walk, in jq mode since #3867
+and in yq mode since #4095, so
 `first(recurse(.[]?; true))` costs what `first(..)` does: 0.01 s and 18 MB against 0.09 s and 81 MB over a 7 MB
-`users` document on an Apple M4 Pro; the figures above are the owned walk's, which yq mode and a `cond` outside
-this grammar still take). The Apple M5 Max is a laptop on mains power with other
+`users` document on an Apple M4 Pro; the figures above are the owned walk's, which a `cond` outside
+this grammar still takes). The Apple M5 Max is a laptop on mains power with other
 sessions running (load average about 25), so its seconds are indicative and the ratios are the claim. Below
 the cap it is faster too: over a 7,001-node document, 300 repetitions of `[recurse(.[]?; true)]` took 2.01 s
 before and 0.14 s now on the 7950X (2.39 s and 0.14 s on the M5 Max). A `cond` the pure verdict cannot answer
@@ -1370,13 +1371,36 @@ same document with a last element `[7]` is 12004 in jq and raises here.
 A finite walk past the cap is still refused rather than answered where it is not provably bounded by the
 tree: a `cond` that forks, and an `f` that is not tree-descending (`.[]? | .`, a computed `f`, an `if` that
 descends only through arrays). A hang is not a divergence ADR-0018 permits either, so the cap stays there.
-`recurse(.[]?; cond)` has a cursor arm in jq mode only ([#3867](https://github.com/rust-works/succinctly/issues/3867)):
-`succinctly yq` keeps the owned walk, so there `first(recurse(.[]?; true))` still pays for the whole document where
-`first(..)` does not, and it counts a repeated mapping key's node once fewer than the cursor walk does when a
-position is read (`recurse(.[]?; true) | path` over `dup: {a: 1, a: 2}` is 3 nodes, the cursor walk's 4). Like `..`,
-the cursor walk decodes a node only where something reads it, so an undecodable string inside a subtree `cond`
+`recurse(.[]?; cond)` has a cursor arm in both modes ([#3867](https://github.com/rust-works/succinctly/issues/3867) for jq, [#4095](https://github.com/rust-works/succinctly/issues/4095) for yq).
+Like `..`, the cursor walk decodes a node only where something reads it, so an undecodable string inside a subtree `cond`
 prunes is never raised (the owned walk raised it up front); jq 1.7.1 rejects such a document at parse time, so
-there is no reference answer (ADR-0018: performance decides). The path walker still
+there is no reference answer (ADR-0018: performance decides).
+In yq mode the arm also stops at an alias node as `..` and `recurse(.[]?)` do (#4214), where the owned walk expanded it.
+Over `a: &b {x: 1, y: [1, 2]}` with `c: *b` beside it, `[recurse(.[]?; true)] | length` counts the alias as one node, as `[..] | length` does.
+A `key`, `path`, `parent`, `line` or `column` stage after the walk reads each node's position, where the owned walk gave it none (`[recurse(.[]?; true) | path]` was `[[], [], ...]`).
+A `cond` that reads `key`, `path` or `tag` is not asked at a position by the walk, so a position stage after it still reads none.
+A write through the walk is still the owned one: `(recurse(.[]?; true) | select(tag == "!!int")) |= . + 1` over `anchors: {base: &b {p: 1}, copy: *b}` reaches the shared node once per alias (`p: 3`, where `..` gives `p: 2`), the write-side residual of [#4223](https://github.com/rust-works/succinctly/issues/4223).
+A `cond` outside this grammar keeps the owned walk in both modes, with its alias expansion in yq.
+
+Measured in yq mode with `scripts/ab-cli.py` (interleaved, 7 repetitions, minimum, base `c31f900b8` against the change, both `codegen-units=1` and fat LTO, output identical on every row, `memcap.py` at 8 GB), on `users` documents of 1, 10 and 100 MB.
+The control (the base binary against itself) read -1.8% to +1.7% on the 7950X and -1.3% to +1.6% on the M4 Pro.
+
+| Query                                                           | Machine           |   1 MB |  10 MB | 100 MB |
+|-----------------------------------------------------------------|-------------------|--------|--------|--------|
+| `first(recurse(.[]?; true))`                                    | AMD Ryzen 9 7950X | -70.9% | -76.0% | -75.6% |
+| `first(recurse(.[]?; true))`                                    | Apple M4 Pro      | -60.8% | -71.9% | -73.6% |
+| `[recurse(.[]?; true)] \| length`                               | AMD Ryzen 9 7950X | -41.1% | -44.7% | -42.5% |
+| `[recurse(.[]?; true)] \| length`                               | Apple M4 Pro      | -28.0% | -30.7% | -31.0% |
+| `[recurse(.[]?; length > 0)] \| length`                         | AMD Ryzen 9 7950X | -33.7% | -36.8% | -34.8% |
+| `[recurse(.[]?; length > 0)] \| length`                         | Apple M4 Pro      | -24.2% | -28.5% | -28.5% |
+| `[recurse(.[]?; type == "!!map" or type == "!!seq")] \| length` | AMD Ryzen 9 7950X |  -6.4% |  -9.5% |  -3.8% |
+| `[recurse(.[]?; type == "!!map" or type == "!!seq")] \| length` | Apple M4 Pro      | +11.2% | +11.9% | +10.6% |
+
+The last pair is the one slower row: a `cond` made only of `type` tests is the shape the owned walk's pure verdict (`owned_cond_verdict`) answers from the tree, and asked at a cursor it costs more on the M4 Pro, at every size, and less on the 7950X.
+The shape is a loss on one of the two chips measured and a win on the other, so it ships with the rest; it is the price of the walk reading a cursor instead of building the tree.
+The alias ladder is where the owned walk is unusable: `.root | first(recurse(.[]?; true))` over a 26-level ladder (586 B, 2^26 leaves once expanded) took 16.2 s on the M4 Pro and 38.4 s and over 8 GB on the 7950X, and takes 3.7 ms and 1.3 ms.
+At 16, 20 and 24 levels the base took 18 ms, 241 ms and 3.7 s on the M4 Pro and 35 ms, 552 ms and 9.0 s on the 7950X, and the change takes the same few milliseconds at each.
+The path walker still
 runs `.[]?` at every node, so
 `path(recurse(.[]?))` takes about 1.8 times `path(..)`'s time (2.9 s against 1.6 s over 1.15 M nodes of
 a `users` document, [#3717](https://github.com/rust-works/succinctly/issues/3717)).
