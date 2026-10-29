@@ -126,81 +126,97 @@ issue = "#5472"
 id = "upstream-jq.test:113"
 category = "to-triage"
 reason = "`{(0):1}`: jq rejects a constant non-string object key at compile time (exit 3); succinctly fails when the program runs (exit 5)."
+issue = "#5501"
 
 [[divergence]]
 id = "upstream-jq.test:117"
 category = "to-triage"
 reason = "`{non_const:., (0):1}`: same compile-time rejection of a constant non-string key as upstream-jq.test:113."
+issue = "#5501"
 
 [[divergence]]
 id = "upstream-onig.test:102"
 category = "to-triage"
 reason = "`gsub(\"(?=u)\"; \"u\")`: regex lookahead is refused as an invalid regex (Rust `regex` has no lookaround); jq's oniguruma supports it."
+issue = "#5502"
 
 [[divergence]]
 id = "robust:deep-array-length"
 category = "to-triage"
 reason = "`[..]|length` on 5000 nested arrays: succinctly answers (5000); jq refuses at its parse depth limit (`Exceeds depth limit for parsing`, exit 5). The lazy route does not apply a depth limit."
+issue = "#5497"
 
 [[divergence]]
 id = "robust:deep-array-parse-257"
 category = "to-triage"
 reason = "257 nested arrays: jq rejects past its 256-level parse limit (exit 5); succinctly's lazy route answers."
+issue = "#5497"
 
 [[divergence]]
 id = "robust:deep-array-parse-384"
 category = "to-triage"
 reason = "384 nested arrays: same as deep-array-parse-257; succinctly's own limit of 384 is not reached on this route."
+issue = "#5497"
 
 [[divergence]]
 id = "robust:deep-array-parse-385"
 category = "to-triage"
 reason = "385 nested arrays: same as deep-array-parse-257; succinctly answers although its own limit is 384."
+issue = "#5497"
 
 [[divergence]]
 id = "robust:deep-object-parse-257"
 category = "to-triage"
 reason = "257 nested objects: jq rejects past its 256-level parse limit (exit 5); succinctly's lazy route answers."
+issue = "#5497"
 
 [[divergence]]
 id = "robust:deep-object-parse-385"
 category = "to-triage"
 reason = "385 nested objects: same as deep-object-parse-257."
+issue = "#5497"
 
 [[divergence]]
 id = "robust:deep-array-print-5000"
 category = "to-triage"
 reason = "`.` on 5000 nested arrays: both refuse, jq at parse (`Exceeds depth limit for parsing`, exit 5), succinctly at 384 (`Error: nesting depth exceeds limit of 384`, exit 1)."
+issue = "#5497"
 
 [[divergence]]
 id = "robust:deep-tojson-built-1000"
 category = "to-triage"
 reason = "`tojson` of a value built 1000 levels deep: jq answers; succinctly raises `nesting depth exceeds limit of 384` (exit 5) for a value it built itself."
+issue = "#5497"
 
 [[divergence]]
 id = "robust:deep-tojson-built-10000"
 category = "to-triage"
 reason = "Same as deep-tojson-built-1000, at 10000 levels."
+issue = "#5497"
 
 [[divergence]]
 id = "robust:deep-tojson-built-20000"
 category = "to-triage"
 reason = "Same as deep-tojson-built-1000, at 20000 levels."
+issue = "#5497"
 
 [[divergence]]
 id = "robust:deep-built-equal"
 category = "to-triage"
 reason = "`==` on a value built 5000 levels deep: jq answers; succinctly raises the 384-level depth error."
+issue = "#5497"
 
 [[divergence]]
 id = "robust:deep-built-sort"
 category = "to-triage"
 reason = "`sort` over a value built 3000 levels deep: jq answers; succinctly raises the 384-level depth error."
+issue = "#5497"
 
 [[divergence]]
 id = "robust:error-deep-message"
 category = "to-triage"
 reason = "`error(<value built 2000 levels deep>)` caught and measured: jq answers; succinctly raises the 384-level depth error."
+issue = "#5497"
 
 [[divergence]]
 id = "robust:recursion-depth-10000"
@@ -246,3 +262,4 @@ reason = "`repeat(1)` piped into `head -n1`: jq exits 141 (SIGPIPE); succinctly 
 id = "robust:array-set-too-huge-index"
 category = "to-triage"
 reason = "`[] | .[1e12] = 1`: jq aborts (SIGSEGV); succinctly neither errors nor finishes within 10 s (it appears to allocate the index), and earlier runs ended in an abort. A refused index would be the safe answer."
+issue = "#5500"
