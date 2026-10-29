@@ -16,9 +16,8 @@ use succinctly::jq::document::{
     DocumentCursor, DocumentValue, IndentSpec, JsonConvention, PAIRWISE_SPAN_SCAN_LIMIT,
 };
 use succinctly::jq::eval_generic::{
-    check_nesting_depth, eval_with_cursor, nesting_depth_panic_message,
-    to_owned as generic_to_owned, to_owned_checked as generic_to_owned_checked, validate_cursor,
-    GenericResult, LazyElem,
+    check_nesting_depth, depth_guard_panic_message, eval_with_cursor, to_owned as generic_to_owned,
+    to_owned_checked as generic_to_owned_checked, validate_cursor, GenericResult, LazyElem,
 };
 use succinctly::jq::walk::{map_builtin_subexprs, map_pattern_subexprs, stamp_loc_file};
 use succinctly::jq::{
@@ -4528,9 +4527,33 @@ fn jq_exit_code(
     exit_codes::SUCCESS
 }
 
+/// Install, once per process, a panic hook that stays silent for the depth
+/// guards' exact messages so the raw `thread panicked` line does not precede
+/// the diagnostic `run_jq` and `run_yq` report from the panic they catch
+/// (#5526); every other panic goes to the hook that was there. Installed
+/// once rather than swapped per call: the hook is process-global, so a
+/// per-call take/restore would interleave across threads and nest one
+/// wrapper deeper per call.
+// `PanicInfo` is the hook's type on this crate's 1.73 MSRV; newer toolchains
+// renamed it `PanicHookInfo` and deprecate the old name.
+#[allow(deprecated)]
+pub(crate) fn silence_depth_guard_panic_line() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let previous: Box<dyn Fn(&std::panic::PanicInfo<'_>) + Sync + Send> =
+            std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if depth_guard_panic_message(info.payload()).is_none() {
+                previous(info);
+            }
+        }));
+    });
+}
+
 /// Run the jq command with the given arguments.
 /// Returns the exit code (0 for success, non-zero for various errors).
 pub fn run_jq(mut args: JqCommand) -> Result<i32> {
+    silence_depth_guard_panic_line();
     args.resolve_positional_args();
     // The order only matters between two or more named flags: a command line with fewer builds no clap definition for it.
     if (args.arg.len() + args.argjson.len() + args.slurpfile.len() + args.rawfile.len()) / 2 >= 2 {
@@ -5247,7 +5270,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                     let handled = match outcome {
                         Ok(handled) => handled?,
                         Err(payload) => {
-                            let Some(message) = nesting_depth_panic_message(&*payload) else {
+                            let Some(message) = depth_guard_panic_message(&*payload) else {
                                 std::panic::resume_unwind(payload);
                             };
                             sink.report(DiagStyle::Jq, &EvalError::new(message), &locator.at(end));
@@ -5392,7 +5415,6 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 }));
                 match outcome {
                     Ok(written) => written?,
-                    // patchcov: coverage tolerate reason="unreachable from any query this suite can build since #3457: the path walkers were the sites that panicked at MAX_NESTING_DEPTH here (sort/join/map, path()/paths/setpath/del()/assignment on a deep document), and they now return a decode-failure-tagged error, so a deep document is reported through the ordinary Err arm instead. The panic sites still in the evaluator (lazy.rs cursor_to_owned, owned_identity_recurse_step, owned_from_standard_json_at_depth, the YAML comment-preserving materialization) are not reached by a jq-mode CLI query at 250-500 levels, probed by hand; the catch is kept as the net for them and for a future guard that panics, and nesting_depth_panic_message itself is pinned by a unit test (#3457)"
                     Err(payload) => {
                         // `&*payload`, not `&payload` -- `payload` is a
                         // `Box<dyn Any + Send>`, and a bare `&payload`
@@ -5402,9 +5424,9 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                         // it holds -- so every `downcast_ref` inside the
                         // helper would silently miss regardless of the
                         // panic's real payload type. Confirmed live: `&payload`
-                        // here made `nesting_depth_panic_message` return
+                        // here made the panic-message helper return
                         // `None` even for this exact panic.
-                        let Some(message) = nesting_depth_panic_message(&*payload) else {
+                        let Some(message) = depth_guard_panic_message(&*payload) else {
                             // Not the specific guard this catch exists for --
                             // an unexpected panic must still crash loudly,
                             // not be silently absorbed as if it were #1793.
@@ -5428,7 +5450,6 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                         // reaches it on the same iteration; this one didn't).
                     }
                 }
-                // patchcov: coverage end
                 // halt/halt_error (#791) outranks everything else, including
                 // remaining values/files still to process. The panic arm above
                 // used to `continue` past this check and repeat it itself;
@@ -9111,34 +9132,51 @@ fn evaluate_input_streaming(
     let cursor = doc.root();
 
     let mut write_err: Option<anyhow::Error> = None;
-    let control = jq::eval_generic::eval_each_with_cursor(expr, cursor, &mut |result| {
-        match materialize_stream_item(result, sink, at) {
-            // Nothing to write: either genuinely no value, or a failure this
-            // call already reported to `sink` (same "report and keep going"
-            // contract the eager path's own arms followed, #355).
-            None => true,
-            // The eager route's copy of `to_jq_values`' depth gate (#3009
-            // review): every caller writes through `write_output_owned_value`,
-            // whose printer only refuses an over-deep value after 384 levels
-            // of `[` are already on stdout. Checked here, before `on_value`,
-            // so such a value prints nothing, is reported at exit 5 and the
-            // generator carries on -- the lazy route's behaviour, and not the
-            // `format_json` panic this route had before the writers merged.
-            Some(v) => match v.check_tree_depth() {
-                Err(e) => {
-                    sink.report(DiagStyle::Jq, &e, &at.resolve());
-                    true
-                }
-                Ok(()) => match on_value(sink, v) {
-                    Ok(keep_going) => keep_going,
+    // The evaluator asserts `MAX_VALUE_TREE_DEPTH` where it splices a built
+    // value back into the AST (`last(f)`, `+=`, `//=`) or renders one for
+    // `error(...)`, with no `Result` to thread that through (#5526). Caught
+    // here, like the lazy route's nets, as the ordinary error exit-5 report
+    // `reduce` already gets from `check_tree_depth`; any other panic still
+    // unwinds.
+    let evaluated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        jq::eval_generic::eval_each_with_cursor(expr, cursor, &mut |result| {
+            match materialize_stream_item(result, sink, at) {
+                // Nothing to write: either genuinely no value, or a failure this
+                // call already reported to `sink` (same "report and keep going"
+                // contract the eager path's own arms followed, #355).
+                None => true,
+                // The eager route's copy of `to_jq_values`' depth gate (#3009
+                // review): every caller writes through `write_output_owned_value`,
+                // whose printer only refuses an over-deep value after 384 levels
+                // of `[` are already on stdout. Checked here, before `on_value`,
+                // so such a value prints nothing, is reported at exit 5 and the
+                // generator carries on -- the lazy route's behaviour, and not the
+                // `format_json` panic this route had before the writers merged.
+                Some(v) => match v.check_tree_depth() {
                     Err(e) => {
-                        write_err = Some(e);
-                        false
+                        sink.report(DiagStyle::Jq, &e, &at.resolve());
+                        true
                     }
+                    Ok(()) => match on_value(sink, v) {
+                        Ok(keep_going) => keep_going,
+                        Err(e) => {
+                            write_err = Some(e);
+                            false
+                        }
+                    },
                 },
-            },
+            }
+        })
+    }));
+    let control = match evaluated {
+        Ok(control) => control,
+        Err(payload) => {
+            let Some(message) = depth_guard_panic_message(&*payload) else {
+                std::panic::resume_unwind(payload);
+            };
+            Some(jq::Control::Error(EvalError::resource_limit(message)))
         }
-    });
+    };
     // The control is reported *before* any write error is surfaced. The eager
     // path reported it during evaluation, i.e. always before the caller's
     // write loop could fail; returning `Err` first here would let an I/O
@@ -12568,7 +12606,7 @@ mod tests {
     /// whether any call site still panics with either message.
     #[test]
     fn nesting_depth_panic_message_distinguishes_the_two_guards_3261() {
-        use succinctly::jq::eval_generic::MAX_NESTING_DEPTH;
+        use succinctly::jq::eval_generic::{nesting_depth_panic_message, MAX_NESTING_DEPTH};
         let payload_256 = Box::new(format!(
             "nesting depth exceeds limit of {MAX_NESTING_DEPTH}"
         )) as Box<dyn core::any::Any + Send>;

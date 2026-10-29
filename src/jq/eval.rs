@@ -32833,9 +32833,13 @@ pub fn eval_owned_scalar_fast<S: EvalSemantics>(
 
 /// Run `f`, turning the generic evaluator's document-nesting panic
 /// ([`assert_nesting_depth`](super::eval_generic::assert_nesting_depth), 256)
-/// into a `decode_failure`-tagged [`QueryResult::Error`] (#3457).
+/// into a `decode_failure`-tagged [`QueryResult::Error`] (#3457), and the
+/// value-tree panic ([`assert_value_tree_depth`], 384: a value the filter
+/// itself built that deep, spliced back into the AST by `last(f)`, `+=`,
+/// `//=` or rendered by `error(<deep>)`) into a `resource_limit`-tagged one
+/// (#5526), the error `check_value_tree_depth` already returns.
 ///
-/// The CLI wraps every query in `catch_unwind` for this (#1793); a library
+/// The CLI has its own `catch_unwind` nets for this (#1793, #5526); a library
 /// caller of [`eval`] has no such net and must never see a raw unwind from
 /// an over-deep document (#2627). No guard the evaluator reaches panics any
 /// more (the path walkers, `to_owned_with_comments`,
@@ -32843,11 +32847,13 @@ pub fn eval_owned_scalar_fast<S: EvalSemantics>(
 /// return the same tagged error directly), so this is a backstop for a
 /// 256-level panic from outside it, such as `JqValue::materialize`.
 ///
-/// Only that one exact message is caught
-/// ([`nesting_depth_panic_message`](super::eval_generic::nesting_depth_panic_message));
-/// any other panic, including `assert_value_tree_depth`'s 384 guard, keeps
-/// unwinding. The tag makes the error un-swallowable by a `try`/`catch`,
-/// matching what the panic did. Every scope the evaluator installs
+/// Only those two exact messages are caught
+/// ([`nesting_depth_panic_message`](super::eval_generic::nesting_depth_panic_message),
+/// [`depth_guard_panic_message`](super::eval_generic::depth_guard_panic_message));
+/// any other panic keeps unwinding. Both tags make the error
+/// un-swallowable by a `try`/`catch`, matching what the panic did.
+///
+/// Every scope the evaluator installs
 /// (`file_origin`, node origin, the input queue, `with_stack_budget`) is an
 /// RAII guard, so an unwind restores it; the
 /// `eval_depth_panic_leaves_no_scope_behind_3457` test pins that.
@@ -32858,10 +32864,17 @@ pub fn eval_owned_scalar_fast<S: EvalSemantics>(
 fn contain_depth_panic<'a, W>(f: impl FnOnce() -> QueryResult<'a, W>) -> QueryResult<'a, W> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(result) => result,
-        Err(payload) => match super::eval_generic::nesting_depth_panic_message(&*payload) {
-            Some(message) => QueryResult::Error(EvalError::decode_failure(message)),
-            None => std::panic::resume_unwind(payload),
-        },
+        Err(payload) => {
+            if let Some(message) = super::eval_generic::nesting_depth_panic_message(&*payload) {
+                QueryResult::Error(EvalError::decode_failure(message))
+            } else if let Some(message) = super::eval_generic::depth_guard_panic_message(&*payload)
+            {
+                // Not the 256 guard, so the value-tree one (#5526).
+                QueryResult::Error(EvalError::resource_limit(message))
+            } else {
+                std::panic::resume_unwind(payload)
+            }
+        }
     }
 }
 
@@ -157190,9 +157203,10 @@ mod touched_edge_cases_2999 {
     }
 
     /// #3457: the `eval()` boundary turns the 256-level nesting panic into a
-    /// tagged error, and only that panic.
+    /// tagged error, and (#5526) the 384-level value-tree one into a resource
+    /// limit; no other panic.
     #[test]
-    fn contain_depth_panic_catches_only_the_nesting_guard_3457() {
+    fn contain_depth_panic_catches_only_the_depth_guards_3457() {
         let caught: QueryResult<'_, Vec<u64>> = contain_depth_panic(|| {
             crate::jq::eval_generic::assert_nesting_depth(
                 crate::jq::eval_generic::MAX_NESTING_DEPTH,
@@ -157208,20 +157222,55 @@ mod touched_edge_cases_2999 {
         );
         assert!(nesting_error, "expected the nesting error, got {caught:?}");
 
-        // The 384 guard shares the template but is a different failure class:
-        // it must keep unwinding.
-        let other = std::panic::catch_unwind(|| {
-            contain_depth_panic::<Vec<u64>>(|| {
-                crate::jq::assert_value_tree_depth(crate::jq::MAX_VALUE_TREE_DEPTH);
-                QueryResult::None
-            })
+        // The 384 guard shares the template but is a different failure class
+        // (#5526): a resource limit, not a decode failure.
+        let value_tree: QueryResult<'_, Vec<u64>> = contain_depth_panic(|| {
+            crate::jq::assert_value_tree_depth(crate::jq::MAX_VALUE_TREE_DEPTH);
+            QueryResult::None
         });
-        assert!(other.is_err(), "the 384 guard must not be contained");
+        let value_tree_error = matches!(
+            &value_tree,
+            QueryResult::Error(e)
+                if e.is_resource_limit()
+                    && !e.is_decode_failure()
+                    && e.to_string() == "nesting depth exceeds limit of 384"
+        );
+        assert!(
+            value_tree_error,
+            "expected the value-tree error, got {value_tree:?}"
+        );
 
         // An unrelated panic keeps unwinding too.
         let unrelated =
             std::panic::catch_unwind(|| contain_depth_panic::<Vec<u64>>(|| panic!("unrelated")));
         assert!(unrelated.is_err());
+    }
+
+    /// #5526: through the public entry, a real program that builds a value past
+    /// the tree ceiling gets the resource-limit error, not an unwind.
+    #[test]
+    fn eval_reports_a_built_value_past_the_tree_ceiling_5526() {
+        // The CLI evaluates on a large-stack thread; a test thread's default stack is
+        // too small for a 400-level recursion in a debug build.
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(|| {
+                let json = br"{}";
+                let index = JsonIndex::build(json);
+                let program = "def f(n): if n == 0 then 0 else [f(n-1)] end; last(f(400)) | length";
+                let expr = parse(program).expect("parse");
+                let result = eval::<Vec<u64>, JqSemantics>(&expr, index.root(json));
+                let refused = matches!(
+                    &result,
+                    QueryResult::Error(e)
+                        if e.is_resource_limit()
+                            && e.to_string() == "nesting depth exceeds limit of 384"
+                );
+                assert!(refused, "expected the value-tree refusal, got {result:?}");
+            })
+            .expect("spawn")
+            .join()
+            .expect("the evaluation must not unwind");
     }
 
     /// #3457: a contained depth panic leaves no evaluation scope installed --
