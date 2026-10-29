@@ -19169,6 +19169,7 @@ fn process_index_key<S: EvalSemantics, V: DocumentValue>(
     sink: &mut dyn Sink<V>,
     escape: &StashedEscape,
 ) -> bool {
+    let sum_or_merge = crate::jq::eval::yq_sum_or_merge_read::<S>(target);
     // #3520: a target that can fan out is pulled one output at a time, so a
     // consumer that stops after its first output never runs the target's
     // later ones (jq's `E as $t`). An error on one output comes after the
@@ -19184,12 +19185,7 @@ fn process_index_key<S: EvalSemantics, V: DocumentValue>(
                     Ok(t) => t,
                     Err(control) => return drive.stop_with_escape(control),
                 };
-                match index_owned_checked::<S>(
-                    crate::jq::eval::yq_sum_or_merge_read::<S>(target),
-                    &t,
-                    k,
-                    optional,
-                ) {
+                match index_owned_checked::<S>(sum_or_merge, &t, k, optional) {
                     Ok(Some(v)) => {
                         if sink.push(GenericItem::Owned(v)) == Demand::Stop {
                             return drive.consumer_stop();

@@ -9226,11 +9226,10 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse assignment expressions: `path = value`, `path |= filter`, `path += value`, etc.
-    /// Assignment has higher precedence than pipe; against `//` see [`Self::parse_assignment`].
     /// [`Self::keep_string_key_after_sum_or_merge`] undone for an assignment's target: a write
     /// through `(A + B)["k"]` is the no-op it always was (#4361), and the kept computed key would
-    /// read as a path expression that is not one.
+    /// read as a path expression that is not one. The key is the head of the target, bare or as
+    /// the first stage of a longer path (`(A + B)["k"].x`, `(A + B)["k"][0]`).
     fn fold_sum_or_merge_key(left: Expr) -> Expr {
         match left {
             Expr::IndexExpr { target, key } if target.is_sum_or_merge() => match *key {
@@ -9242,10 +9241,19 @@ impl<'a> Parser<'a> {
                     key: Box::new(other),
                 },
             },
+            Expr::Pipe(stages) => {
+                let mut folded = stages.to_vec();
+                let head = folded.remove(0);
+                folded.insert(0, Self::fold_sum_or_merge_key(head));
+                Expr::pipe(folded)
+            }
+            Expr::Paren(inner) => Expr::Paren(Box::new(Self::fold_sum_or_merge_key(*inner))),
             other => other,
         }
     }
 
+    /// Parse assignment expressions: `path = value`, `path |= filter`, `path += value`, etc.
+    /// Assignment has higher precedence than pipe; against `//` see [`Self::parse_assignment`].
     fn parse_assignment_level(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.parse_assignment_operand()?;
         self.skip_ws();

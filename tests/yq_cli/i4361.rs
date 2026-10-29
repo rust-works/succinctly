@@ -38,6 +38,14 @@ fn test_absent_bracket_key_on_a_sum_or_merge_is_empty_4361() -> Result<()> {
         ("(.a + {})[\"z\"] = 1", "a: {x: 1}\nb: {}\nn: [1, 2]\n"),
         ("(.a + {})[\"z\"] |= 1", "a: {x: 1}\nb: {}\nn: [1, 2]\n"),
         ("del((.a + {})[\"z\"])", "a: {x: 1}\nb: {}\nn: [1, 2]\n"),
+        ("0 as $k | (.a + {})[$k]", ""),
+        ("true as $k | (.a * {\"q\": 1})[$k]", ""),
+        ("((.a + {})[\"k\"]).x = 1", "a: {x: 1}\nb: {}\nn: [1, 2]\n"),
+        (
+            "(.a + {})[\"k\"][\"m\"] |= 1",
+            "a: {x: 1}\nb: {}\nn: [1, 2]\n",
+        ),
+        ("(.a * {})[\"x\"][0] += 1", "a: {x: 1}\nb: {}\nn: [1, 2]\n"),
     ] {
         let (stdout, code) = run_yq_stdin(filter, DOC, &[])?;
         assert_eq!((stdout.as_str(), code), (want, 0), "`{filter}`");
