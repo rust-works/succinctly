@@ -3286,6 +3286,15 @@ comment for the full call-site list and `tests/yq_cli_tests.rs`'s
 unaffected (it keeps its own separate, unconditional-null rule), and a real container
 target keeps its own structural error.
 
+#### A bracketed key read off a `+` or `*` result (#4361) — string keys resolved; two shapes remain
+
+The same flag explains `(A + B)["k"]` and `(A * B)["k"]`: the arithmetic operator leaves its result in a context that does not auto-create, so a key the mapping lacks answers nothing where `(A + B).k` and `(A + B) | .["k"]` answer `null`.
+It is a property of the bracket spelling directly after the operator, so the parser keeps a string key there as a computed key instead of folding it into a field (as for a `del()` argument, #2126), and both evaluators read it through `index_one_owned_read_of`.
+A write through the same spelling (`(A + B)["k"] = 1`) is unchanged: an assignment target is folded back to the field it always was.
+Two shapes still answer `null` or an error where yq answers nothing, both on a mapping that lacks the key.
+A number key (`(A + B)[0]`) reaches the evaluator as an array index rather than a computed key, and an object-valued key (`(A + B)[.a]`) raises `Cannot index object with object`.
+Neither was changed: the first shares its parse with array indexing, whose negative-index handling a bracket rewrite would have to reproduce.
+
 ### `//` maps per left output and keeps a falsy left value when the right side is empty — resolved ([#2817](https://github.com/rust-works/succinctly/issues/2817)); yq's auto-creating key lookup remains
 
 Real yq v4.53.3's `L // R` is not jq's collect-then-fallback. Captured live when
