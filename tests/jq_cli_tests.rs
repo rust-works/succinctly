@@ -8895,7 +8895,8 @@ fn test_seq_error_location_correct_with_many_preceding_records_1213() -> Result<
         &["--seq", r#"if .n==50 then error("boom") else . end"#],
         Some(&input),
     )?;
-    assert_eq!(code, 5, "stderr: {stderr}");
+    // Records after the failing one ran cleanly, so jq 1.7.1 exits 0 (#5471).
+    assert_eq!(code, 0, "stderr: {stderr}");
     // Record 50 (0-indexed) is the 51st RS-delimited record, ending on the
     // 51st line of the input.
     assert!(stderr.contains("(at <stdin>:51): boom"), "stderr: {stderr}");
@@ -10226,19 +10227,21 @@ fn test_uncaught_error_line_number_without_trailing_newline() -> Result<()> {
 }
 
 #[test]
-fn test_uncaught_error_on_any_input_fails_the_run() -> Result<()> {
-    // DELIBERATE DIVERGENCE FROM jq. jq's exit code reflects only the *last*
-    // input, so an error on any earlier one exits 0 -- the exact
-    // indistinguishability #355 exists to remove. We fail if any input raised.
+fn test_uncaught_error_on_an_earlier_input_exits_as_jq_does() -> Result<()> {
+    // jq's exit code reflects only the *last* input, so an error on an earlier
+    // one exits 0. `--on-error=continue` is the opt-in for failing the run if
+    // any input raised (#5471; it was the default from #355 until then).
     let (_keep, path) = temp_json("{\"n\":1}\n{\"n\":2}\n")?;
-    let (stdout, stderr, code) = run_jq_full(
-        &["-c", r#"if .n==1 then error("bad") else . end"#, &path],
-        None,
-    )?;
-    assert_eq!(code, 5, "real jq exits 0 here; we deliberately do not");
-    assert_eq!(stderr.trim_end(), format!("jq: error (at {path}:1): bad"));
-    // Evaluation still continues to the remaining inputs, as jq does.
-    assert_eq!(stdout.trim(), r#"{"n":2}"#);
+    let filter = r#"if .n==1 then error("bad") else . end"#;
+    for (flags, expected) in [(&[][..], 0), (&["--on-error=continue"][..], 5)] {
+        let mut args = vec!["-c", filter, &path];
+        args.extend_from_slice(flags);
+        let (stdout, stderr, code) = run_jq_full(&args, None)?;
+        assert_eq!(code, expected, "{flags:?}");
+        assert_eq!(stderr.trim_end(), format!("jq: error (at {path}:1): bad"));
+        // Evaluation still continues to the remaining inputs, as jq does.
+        assert_eq!(stdout.trim(), r#"{"n":2}"#);
+    }
     Ok(())
 }
 
@@ -42248,7 +42251,8 @@ fn test_jq_seq_malformed_record_does_not_misattribute_other_files_error_location
         &["--seq", "-c", "if . == 1 then error(\"boom\") else . end"],
         &["\x1e1\n\x1e{bad\n", "\x1e2\n"],
     )?;
-    assert_eq!(code, 5, "{stderr}");
+    // The last value, `2`, did not fail (#5471).
+    assert_eq!(code, 0, "{stderr}");
     assert!(
         stderr.contains(&format!("(at {}:1): boom", paths[0])),
         "the error on value `1` must report its own file (paths[0]), not paths[1]: {stderr}"
@@ -146772,7 +146776,8 @@ fn test_jq_general_path_error_lines_after_skipped_values_4178() -> Result<()> {
         stderr,
         "jq: error (at <stdin>:51): boom\njq: error (at <stdin>:71): boom\n"
     );
-    assert_eq!(code, 5);
+    // The last value did not fail, so jq exits 0 (#5471).
+    assert_eq!(code, 0);
     Ok(())
 }
 

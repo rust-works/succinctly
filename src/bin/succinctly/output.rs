@@ -177,7 +177,8 @@ impl core::fmt::Display for InputLocation {
 ///
 /// jq's evaluation *continues* after an uncaught error — it reports the diagnostic
 /// and moves to the next input — so the failure has to be remembered rather
-/// than returned. `hit()` then drives the process exit code (#355). yq's runner
+/// than returned. jq mode's exit code reads [`Self::input_failed`] and
+/// [`Self::beyond_jq`], or `hit()` under `--on-error` (#355, #5471). yq's runner
 /// stops at the first error the program raises ([`Self::program_error_count`], #2810).
 ///
 /// One definition shared by both runners: the jq and yq paths previously each
@@ -189,13 +190,19 @@ pub struct ErrorSink {
     report_count: usize,
     /// How many of the reports the program itself raised (see [`Self::program_error_count`]).
     program_errors: usize,
+    /// `report_count` when the current top-level input started (see [`Self::input_failed`]).
+    input_start: usize,
+    /// Whether an error with no jq counterpart was reported (see [`Self::beyond_jq`]).
+    beyond_jq: bool,
     halt: Option<i32>,
 }
 
 impl ErrorSink {
     /// Report an uncaught evaluation error and mark the run as failed.
     pub fn report(&mut self, style: DiagStyle, err: &EvalError, at: &InputLocation) {
-        if !err.is_decode_failure() && !err.is_resource_limit() {
+        if err.is_decode_failure() || err.is_resource_limit() {
+            self.beyond_jq = true;
+        } else {
             self.program_errors += 1;
         }
         self.emit(style, &err.message, err.payload_is_not_a_string(), at);
@@ -293,6 +300,26 @@ impl ErrorSink {
     /// `write_split_result` needs to avoid double-reporting).
     pub fn report_count(&self) -> usize {
         self.report_count
+    }
+
+    /// Mark the start of a top-level input: [`Self::input_failed`] counts from here (#5471).
+    pub fn start_input(&mut self) {
+        self.input_start = self.report_count;
+    }
+
+    /// Whether anything was reported since the last [`Self::start_input`]. jq's exit status
+    /// is the last input's own outcome, so this, not [`Self::hit`], is what it reads (#5471).
+    pub fn input_failed(&self) -> bool {
+        self.report_count > self.input_start
+    }
+
+    /// Whether a value failed to decode or a resource limit stopped an input, at any point in
+    /// the run. jq has neither error where succinctly raises it: it stops at a malformed
+    /// document and exits 5, where succinctly reads on past it (it validates only what it
+    /// reads), and it has no cap, so it would have produced the capped input's output. Either
+    /// way the later inputs cannot make the run a success (#5471).
+    pub fn beyond_jq(&self) -> bool {
+        self.beyond_jq
     }
 }
 
@@ -1636,6 +1663,47 @@ mod tests {
             &InputLocation::at(None, 1),
         );
         assert!(sink.hit(), "an uncaught error must fail the run");
+    }
+
+    #[test]
+    fn test_error_sink_input_failed_counts_from_the_last_input_start() {
+        let at = InputLocation::at(None, 1);
+        let mut sink = ErrorSink::default();
+        assert!(!sink.input_failed());
+        sink.report(DiagStyle::Jq, &EvalError::new("boom"), &at);
+        assert!(
+            sink.input_failed(),
+            "an error fails the input it was raised in"
+        );
+        sink.start_input();
+        assert!(!sink.input_failed(), "the next input starts clean (#5471)");
+        assert!(sink.hit(), "the run still remembers it");
+        sink.report(DiagStyle::Jq, &EvalError::new("boom"), &at);
+        assert!(sink.input_failed());
+    }
+
+    #[test]
+    fn test_error_sink_errors_jq_never_raises_stay_failed_across_inputs() {
+        let at = InputLocation::at(None, 1);
+        for err in [
+            EvalError::decode_failure("bad"),
+            EvalError::resource_limit("cap"),
+        ] {
+            let mut sink = ErrorSink::default();
+            sink.report(DiagStyle::Jq, &EvalError::new("boom"), &at);
+            sink.start_input();
+            assert!(!sink.beyond_jq(), "a program error is the input's own");
+            sink.report(DiagStyle::Jq, &err, &at);
+            sink.start_input();
+            assert!(!sink.input_failed());
+            assert!(sink.beyond_jq(), "{} stays failed (#5471)", err.message);
+            assert_eq!(
+                sink.program_error_count(),
+                1,
+                "{} is not the program's",
+                err.message
+            );
+        }
     }
 
     #[test]
