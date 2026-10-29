@@ -4089,6 +4089,11 @@ doesn't mistake it for this fix's own doing: `{"x":null,"y":1} | del(.x[0:2], .y
 `succinctly yq` both before and after this fix, via the pre-existing #1116/#1219
 chained-slice-parent-drop rule elsewhere in this same trie walk.
 
+**Closed for distinct non-negative indices (#4749).**
+`delete_keys` pads the array once to the largest index of a `del(.[5], .[0])` batch of plain non-negative indices and then deletes the others, which is what yq's highest-first handling gives (`[10,20,30]` with `del(.[5], .[7])` is `[10,20,30,null,null,null]`, and `del(.[5], .[0])` is `[20,30,null,null]`, in either order).
+Pinned by `tests/yq_cli/i4749.rs` and a differential sweep against yq v4.53.3 (600 distinct-index batches, none differing).
+Still open: a batch with a negative index or a slice (`del(.[-1], .[5])` is `[10,20,null,null]` in yq, and the order matters), and a repeated index, which yq deletes again where the delete trie collapses the repeated path to one.
+
 **Gated off when 2+ *terminal* indices share one node.** `delete_keys`'s own #2305/#2306
 gate only extends a single-key batch — real yq's own multi-key extension is
 order-*dependent* (confirmed live: `null | del(.[2],.[3])` and `null | del(.[3],.[2])`
