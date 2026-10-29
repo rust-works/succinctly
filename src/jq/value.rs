@@ -7889,13 +7889,11 @@ mod tests {
                 OwnedValue::Null,
                 "{text}"
             );
-            assert!(
-                matches!(
-                    OwnedValue::from_number_literal::<YqSemantics>(text),
-                    OwnedValue::NumberLiteral(NumberRepr::Int(_), _)
-                ),
-                "{text}"
+            let kept = matches!(
+                OwnedValue::from_number_literal::<YqSemantics>(text),
+                OwnedValue::NumberLiteral(NumberRepr::Int(_), _)
             );
+            assert!(kept, "{text}");
         }
     }
 
