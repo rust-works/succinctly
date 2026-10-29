@@ -13314,7 +13314,15 @@ jq emits events while it parses, so two things differ for the shapes below, both
   occurrence (`{"a":1,"a":2}` prints `[["a"],2]` and `[["a"]]`), where jq's `--stream` emits every occurrence
   (`docs/plan/jq-duplicate-key-collapse.md`).
 
-`--stream-errors` is not accepted. The document is still parsed whole, so `--stream` does not give jq's
+`--stream-errors` is accepted (#5474).
+It implies `--stream` and reports a parse error as an input of the form `[message, path]`, as jq does, and goes on reading with the next line.
+Unlike `--stream`, it does not build its events from a whole-document parse: the events a malformed document produced before the fault, and the path at the fault, are properties of jq's own incremental parser, so `jq_stream_errors.rs` is a port of the streaming half of jq 1.7.1's `jv_parse.c`.
+It reproduces jq's reads one `fgets` line at a time (the rest of a line is dropped after an error), a value lost to the byte that fails, the absence of a depth limit, and where `--slurp` closes its array.
+It is pinned by `tests/jq_cli/i5474.rs` and was checked against `/usr/bin/jq` on random malformed inputs, with stdout, exit status and the `(at <file>:<line>)` marker compared.
+One shape differs: `--seq` combines with `--stream-errors` in jq (`printf '[1,2' | jq --seq --stream-errors -c .` prints `["Unfinished abandoned text at EOF at line 1, column 4",[]]`), and here `--seq` wins and the flag is ignored, as it is for `--stream`.
+`-b` is accepted and ignored, as jq does outside Windows; `--binary` is rejected there (`Unknown option --binary`, exit 2) and here.
+
+`--stream` itself still parses the document whole, so it does not give jq's
 constant-memory streaming of a large document: a program that reads `.` walks each document's events one at a time
 (`tostream_events_iter`, memory proportional to the depth on top of the document), and one that uses `-s` or
 `input`/`inputs` keeps every event (a 10.8 MB array of 120,000 records peaked at 622 MB with the events kept and

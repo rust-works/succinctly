@@ -1036,6 +1036,14 @@ struct JqCommand {
     #[arg(long, overrides_with = "stream")]
     stream: bool,
 
+    /// Implies --stream, and reports a parse error as an input of the form [message, path] instead of stopping
+    #[arg(long, overrides_with = "stream_errors")]
+    stream_errors: bool,
+
+    /// Accepted and ignored, as jq does outside Windows (only the short form: `--binary` is rejected there)
+    #[arg(short = 'b', hide = true, overrides_with = "binary")]
+    binary: bool,
+
     // === Exit Status ===
     /// Set exit status based on output (0 if last output != false/null)
     #[arg(short = 'e', long, overrides_with = "exit_status")]
@@ -2834,6 +2842,7 @@ mod jq_locate;
 mod jq_path_mode;
 mod jq_runner;
 mod jq_seq_reader;
+mod jq_stream_errors;
 mod json_validate;
 mod m2_gate;
 mod output;
