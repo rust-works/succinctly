@@ -3549,7 +3549,6 @@ fn kept_run_of(stage: &Expr) -> Option<&PipeStages> {
 /// and a call back into the fact inline kept that walk from being inlined into
 /// its callers (+2.5% instructions on a 7950X for a pipe that reads its
 /// variable in every stage, which is never split, #5441).
-#[cold]
 #[inline(never)]
 fn kept_run_answers(run: &PipeStages, fact: fn(&PipeStages) -> bool) -> bool {
     fact(run)
@@ -3613,7 +3612,8 @@ pub(crate) fn stages_effect_before_last(stages: &[Expr]) -> bool {
 
 /// Whether one stage of a pipe may have an effect or read the input state, as
 /// [`stages_effect_before_last`] counts them. A kept run is asked its
-/// remembered answer and its last stage, which that answer leaves out (#5441).
+/// remembered answer and its last stage, which that answer leaves out (#5441):
+/// one stage walked per run, not the run.
 fn stage_may_have_effect(stage: &Expr) -> bool {
     match kept_run_of(stage) {
         Some(run) => kept_run_answers(run, |run| {
@@ -42658,7 +42658,12 @@ pub(crate) fn may_enter_resolver(expr: &Expr) -> bool {
 /// Whether evaluating `node` itself can start a resolver invocation -- see
 /// [`reentry_can_observe`], which asks this of every node in the
 /// expression. Conservative: every builtin and every call counts (a `def`
-/// body, a resolved `DefCall` and a `Shared` argument are walked too).
+/// body, a resolved `DefCall` and a `Shared` argument are walked too, and a
+/// `Shared` argument counts itself). A run of a split tail
+/// ([`SharedArg::run_stages`], #5441) is not an argument but stages of the
+/// pipe, evaluated as they are: it counts only for what it holds, which the
+/// walk reaches, so it answers as the unsplit pipe does and as
+/// [`pipe_holds_resolver_node`] remembers.
 fn may_enter_resolver_node(node: &Expr) -> bool {
     is_assignment_expr(node)
         || matches!(
@@ -42668,8 +42673,8 @@ fn may_enter_resolver_node(node: &Expr) -> bool {
                 | Expr::NamespacedCall { .. }
                 | Expr::DefCall { .. }
                 | Expr::FuncDef { .. }
-                | Expr::Shared(_)
         )
+        || matches!(node, Expr::Shared(arg) if arg.run_stages().is_none())
 }
 
 /// Whether resolving `expr` can bind a variable from a navigated position
@@ -112429,6 +112434,11 @@ mod tests {
             pipe_holds_resolver_node(&flat)
         );
         assert!(!pipe_holds_resolver_node(&split), "the run is its stages");
+        let walk = |pipe: &PipeStages| {
+            pipe.iter()
+                .any(|stage| any_subexpr(stage, &mut may_enter_resolver_node))
+        };
+        assert!(!walk(&split), "and the walk agrees");
         assert!(!pipe_holds_tracked_var(&split) && !pipe_holds_bind(&split));
         assert!(!pipe_effect_before_last(&split));
 
@@ -112446,7 +112456,7 @@ mod tests {
             reader,
         ]);
         assert!(kept_run_of(&argument[0]).is_none());
-        assert!(pipe_holds_resolver_node(&argument));
+        assert!(pipe_holds_resolver_node(&argument) && walk(&argument));
     }
 
     /// #5404: the three facts a pipe remembers are the walks they stand in

@@ -2049,8 +2049,9 @@ pub(crate) enum TailPlan {
     Copy,
 }
 
-/// The shortest tail holding evaluation state that is [split](TailPlan::Split)
-/// rather than copied whole (#5421).
+/// The shortest tail holding evaluation state (#5421), or a stage that reads
+/// the variable a linked pipe was rebuilt for (#5441), that is
+/// [split](TailPlan::Split) rather than copied whole.
 ///
 /// A split replaces a copy of every stage with a few nodes, at the price of a
 /// pipe the evaluator reads one level deeper for each run. A short tail costs a
@@ -2064,8 +2065,8 @@ impl PipeStages {
     /// of that tail: it is the pipe's first ask, `may_keep` declined the tail,
     /// the tail is shorter than two stages (a lone stage is handed on as
     /// itself), or the pipe is longer than [`MAX_KEPT_TAIL_STAGES`]. A tail
-    /// holding evaluation state is not kept whole either; see
-    /// [`Self::tail_plan`].
+    /// holding evaluation state, or a stage that reads the variable a linked
+    /// pipe was rebuilt for, is not kept whole either; see [`Self::tail_plan`].
     #[cfg(test)]
     pub(crate) fn kept_tail(
         &self,
@@ -2094,7 +2095,10 @@ impl PipeStages {
     /// one call to the next would carry that too, so a tail holding one is not
     /// kept whole but, when `splittable`, handed on in pieces: each maximal run
     /// of [`StageClass::Run`] stages as a copy the pipe keeps, every other stage
-    /// cloned afresh for the call. `may_keep` says whether a copy may be kept
+    /// cloned afresh for the call. A linked pipe's tail that holds a stage
+    /// reading the variable it was rebuilt for ([`Self::share_tails_of`]) is
+    /// handed on the same way (#5441): that stage differs per value, and is
+    /// cloned from this pipe like a stateful one. `may_keep` says whether a copy may be kept
     /// and is asked once per copy: one too large would hold the program's
     /// memory for little.
     ///
@@ -2263,7 +2267,10 @@ impl PipeStages {
             shares[i] = shares[i + 1] || stops[i] as usize >= i + 2;
         }
         let slots = || (0..len).map(|_| core::cell::OnceCell::new()).collect();
-        let runs = if states[0] < len as u32 || volatile_through > 0 {
+        // Only a tail of `MIN_SPLIT_TAIL_STAGES` stages or more is split, and a
+        // pipe that asks this table is no longer than it.
+        let splits = states[0] < len as u32 || volatile_through > 0;
+        let runs = if splits && len > MIN_SPLIT_TAIL_STAGES {
             slots()
         } else {
             Box::default()
