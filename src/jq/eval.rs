@@ -80621,41 +80621,54 @@ pub(crate) fn fold_loop_variable_shares_identity<S: EvalSemantics>(
 /// `owned_arith_accumulator_shape`'s in-place step, which a container marker
 /// makes decline (`. + [$a]`, `.x = $a` therefore still rebuild); an `if`'s
 /// condition, where one makes `owned_if_step` decline; and a comparison, `and`
-/// and `or`, whose answer is a boolean.
+/// and `or`, whose answer is a boolean. (These are recorded as still different
+/// in `docs/compliance/jq/limitations.md`.)
 ///
 /// A binder's source reaches the output only through the names it binds: `$r as
 /// $s | .[$s.name] = $s.score` and `reduce $r.tags[] as $t (.; .[$t] += 1)` hand
 /// nothing on, so the names join the search of the body (and of a fold's UPDATE
 /// and EXTRACT) instead, and the in-place step they feed keeps its unmarked
-/// operands. Everything else over-approximates, at no cost beyond skipping the
-/// rebuild.
+/// operands. A position left out, or a binder's source, still counts when it can
+/// raise while reading a name, since `try ... catch .` hands the error value on
+/// (`try (error($a) and true) catch .`).
+///
+/// Everything else over-approximates. That skips the per-read rebuild, and costs
+/// one thing: a fold whose state is the element shares it with whatever produced
+/// it, so a generator that grows its own value in place copies it once a step
+/// (`last(range([]; {}; [1]))`, as jq's `reduce` does), where the rebuild had
+/// copied it anyway.
 fn loop_var_can_reach_output(expr: &Expr, names: &[String]) -> bool {
+    let raises_a_name = |e: &Expr| {
+        any_subexpr(e, &mut |n| matches!(n, Expr::Error(_))) && mentions_any_name(e, names)
+    };
     // `bodies`, searched for `names` plus `bound` when `source` reads one of `names`.
     let through_binder = |source: &Expr, bound: &[Pattern], bodies: &[Option<&Expr>]| {
-        let reads = any_subexpr(
-            source,
-            &mut |n| matches!(n, Expr::Var(v) if names.iter().any(|name| name == v)),
-        );
-        let mut wider = names.to_vec();
-        if reads {
-            for pattern in bound {
-                collect_pattern_var_names(pattern, &mut wider);
-            }
+        if !mentions_any_name(source, names) {
+            return bodies
+                .iter()
+                .flatten()
+                .any(|body| loop_var_can_reach_output(body, names));
         }
-        bodies
-            .iter()
-            .flatten()
-            .any(|body| loop_var_can_reach_output(body, &wider))
+        let mut wider = names.to_vec();
+        for pattern in bound {
+            collect_pattern_var_names(pattern, &mut wider);
+        }
+        raises_a_name(source)
+            || bodies
+                .iter()
+                .flatten()
+                .any(|body| loop_var_can_reach_output(body, &wider))
     };
     let visit = |found: bool| if found { Visit::Found } else { Visit::Skip };
     search_subexpr(expr, &mut |e| match e {
         Expr::Var(v) if names.iter().any(|name| name == v) => Visit::Found,
         Expr::If {
+            cond,
             then_branch,
             else_branch,
-            ..
         } => visit(
-            loop_var_can_reach_output(then_branch, names)
+            raises_a_name(cond)
+                || loop_var_can_reach_output(then_branch, names)
                 || loop_var_can_reach_output(else_branch, names),
         ),
         Expr::As { expr, var, body } => visit(through_binder(
@@ -80688,11 +80701,19 @@ fn loop_var_can_reach_output(expr: &Expr, names: &[String]) -> bool {
                 || through_binder(input, patterns, &[Some(update), extract.as_deref()]),
         ),
         Expr::Arithmetic { .. } | Expr::Compare { .. } | Expr::And(..) | Expr::Or(..) => {
-            Visit::Skip
+            visit(raises_a_name(e))
         }
-        _ if is_assignment_expr(e) => Visit::Skip,
+        _ if is_assignment_expr(e) => visit(raises_a_name(e)),
         _ => Visit::Descend,
     })
+}
+
+/// Whether `expr` mentions one of `names` as a variable anywhere.
+fn mentions_any_name(expr: &Expr, names: &[String]) -> bool {
+    any_subexpr(
+        expr,
+        &mut |n| matches!(n, Expr::Var(v) if names.iter().any(|name| name == v)),
+    )
 }
 
 /// Whether `expr` reads one of `names` *and* holds a node that can run jq's
@@ -80724,11 +80745,7 @@ fn loop_var_can_be_compared(expr: &Expr, names: &[String]) -> bool {
             }
         )
     }
-    let reads_name = any_subexpr(
-        expr,
-        &mut |n| matches!(n, Expr::Var(v) if names.iter().any(|name| name == v)),
-    );
-    reads_name
+    mentions_any_name(expr, names)
         && search_subexpr(expr, &mut |e| {
             if is_equality(e) {
                 Visit::Found
@@ -80779,12 +80796,7 @@ fn loop_var_is_path_source(expr: &Expr, names: &[String]) -> bool {
 /// which runs by value (`.[$r.name] = f($r)` is the fold shape marking would
 /// slow), though a resolver nested there still does.
 fn scan_for_path_source(expr: &Expr, names: &[String], calls: bool) -> bool {
-    let mentions = |e: &Expr| {
-        any_subexpr(
-            e,
-            &mut |n| matches!(n, Expr::Var(v) if names.iter().any(|name| name == v)),
-        )
-    };
+    let mentions = |e: &Expr| mentions_any_name(e, names);
     search_subexpr(expr, &mut |e| match e {
         Expr::Assign { path, value: rhs }
         | Expr::CompoundAssign {
@@ -102346,6 +102358,11 @@ mod tests {
             "reduce . as $a (null; reduce $a[] as $t (null; $t))",
             "reduce . as $a (null; foreach $a[] as $t (0; 0; $t))",
             "reduce . as $a (null; reduce 1 as $t ($a; .))",
+            // ... or as an error a position read by value raises (`catch .` hands it on).
+            "reduce . as $a (null; try (error($a) and true) catch .)",
+            "reduce . as $a (null; try (if error($a) then 1 else 0 end) catch .)",
+            "reduce . as $a (null; try (error($a) as $x | 1) catch .)",
+            "reduce . as $a (null; try (($a | error) + 1) catch .)",
         ] {
             assert!(
                 gate::<JqSemantics>(src),

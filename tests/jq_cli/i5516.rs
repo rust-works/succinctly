@@ -63,6 +63,12 @@ fn test_fold_step_hands_its_loop_variable_on_5516() -> Result<()> {
         "[nan] as $a | foreach ($a | . | .) as $v (0; 0; $v) == $a",
         "[nan] as $a | foreach $a as $v (0; . + 1; [$v, .]) | .[0] == $a",
         "[nan] as $a | [foreach $a as $v (0; $v)] | .[0] == $a",
+        // Through a binder, and as an error a by-value position raises.
+        "[nan] as $a | reduce $a as $v (null; $v as $s | $s) == $a",
+        "[[nan]] as $a | reduce $a as $v (null; reduce $v[] as $t (null; $t)) == $a[0]",
+        "[nan] as $a | reduce $a as $v (null; try (error($v) and true) catch .) == $a",
+        "[nan] as $a | reduce $a as $v (null; try (if error($v) then 1 else 0 end) catch .) == $a",
+        "[nan] as $a | reduce $a as $v (null; try (error($v) as $x | 1) catch .) == $a",
     ] {
         assert_eq!(answer(filter)?, "true\n", "{filter}");
     }
