@@ -7112,15 +7112,10 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
             // narrower shape before reaching this materializing DOM boundary.
             //
             // A sequence whose elements are still document nodes keeps what each node
-            // carries (its tag, comment, anchor and quoting), as `map(.)` does (#5429). Not
-            // when the filter reads `key`: that hands over a mapping's key node, which yq
-            // prints bare however it was written.
+            // carries (its tag, comment, anchor and quoting), as `map(.)` does (#5429). A
+            // mapping's key node is one of them: yq prints it quoted as written (#5445).
             GenericResult::LazySeq(seq) => {
-                let keeps_nodes = need_comments
-                    && presentation_sync_ctx.is_none()
-                    && !jq::walk::any_subexpr(expr, &mut |e| {
-                        matches!(e, Expr::Builtin(Builtin::Key))
-                    });
+                let keeps_nodes = need_comments && presentation_sync_ctx.is_none();
                 let built = if keeps_nodes {
                     seq.drain_atomic()
                         .map(reshape_presentation::sequence_of_nodes)

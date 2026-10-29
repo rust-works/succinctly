@@ -124,6 +124,7 @@ mod i5424;
 mod i5429;
 mod i5433;
 mod i5444;
+mod i5445;
 mod i5452;
 mod i5456;
 mod i865;
