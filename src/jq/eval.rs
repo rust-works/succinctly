@@ -56023,6 +56023,9 @@ fn is_register_navigation(e: &Expr) -> bool {
         // #4790: `..` walks `.[]?` steps, and a comma runs each navigation from the same node, so each
         // output of either is a node the register is left on.
         Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => true,
+        // #4095: `recurse(.[]?; cond)` for a `cond` yielding at most one value is that walk pruned,
+        // so each output is a node the register is left on, as `..`'s is.
+        Expr::Builtin(Builtin::RecurseCond(f, cond)) => is_gated_structural_descent(f, Some(cond)),
         Expr::Comma(items) => items.iter().all(is_register_navigation),
         // #4795: `first(f)`, `limit(n; f)` and `nth(n; f)` hand on some of the navigation's outputs,
         // each a node the register is left on, and `select(c)` hands its input on or emits nothing
@@ -69428,8 +69431,8 @@ fn walk_descendants(
 /// alive while its children run (see [`each_recurse_walk`]'s memory note). That
 /// is what lets it go uncapped: the walk is bounded by the tree, at the price
 /// of one `cond` per node and of the owned tree that [`walk_descendants`]'s
-/// cursor twin avoids (jq mode over a live document takes `each_recurse_cursor_generic`'s
-/// gated cursor walk instead, #3867, which asks `cond` in this same order) (1.5 to 1.8 times `..`'s time and about twice its
+/// cursor twin avoids (over a live document, in both modes, `each_recurse_cursor_generic`'s
+/// gated cursor walk is taken instead -- #3867 for jq, #4095 for yq -- which asks `cond` in this same order) (1.5 to 1.8 times `..`'s time and about twice its
 /// memory, measured in `docs/compliance/jq/limitations.md`).
 ///
 /// A container's children are pushed only once the sink has accepted it, so a

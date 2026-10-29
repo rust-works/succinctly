@@ -1326,10 +1326,11 @@ build that only lifts the cap and keeps the evaluator-driven walk (and against `
 
 The walk is 3.4 to 4.9 times faster than lifting only the cap, at 0.25 to 0.65 times its peak memory, and
 costs 1.6 to 1.9 times `..`'s time and 1.5 to 2.6 times its memory: one `cond` per node, and the owned tree
-a cursor walk avoids (in jq mode over a live document `recurse(.[]?; cond)` now takes that cursor walk, #3867, so
+a cursor walk avoids (over a live document `recurse(.[]?; cond)` now takes that cursor walk, in jq mode since #3867
+and in yq mode since #4095, so
 `first(recurse(.[]?; true))` costs what `first(..)` does: 0.01 s and 18 MB against 0.09 s and 81 MB over a 7 MB
-`users` document on an Apple M4 Pro; the figures above are the owned walk's, which yq mode and a `cond` outside
-this grammar still take). The Apple M5 Max is a laptop on mains power with other
+`users` document on an Apple M4 Pro; the figures above are the owned walk's, which a `cond` outside
+this grammar still takes). The Apple M5 Max is a laptop on mains power with other
 sessions running (load average about 25), so its seconds are indicative and the ratios are the claim. Below
 the cap it is faster too: over a 7,001-node document, 300 repetitions of `[recurse(.[]?; true)]` took 2.01 s
 before and 0.14 s now on the 7950X (2.39 s and 0.14 s on the M5 Max). A `cond` the pure verdict cannot answer
@@ -1370,13 +1371,70 @@ same document with a last element `[7]` is 12004 in jq and raises here.
 A finite walk past the cap is still refused rather than answered where it is not provably bounded by the
 tree: a `cond` that forks, and an `f` that is not tree-descending (`.[]? | .`, a computed `f`, an `if` that
 descends only through arrays). A hang is not a divergence ADR-0018 permits either, so the cap stays there.
-`recurse(.[]?; cond)` has a cursor arm in jq mode only ([#3867](https://github.com/rust-works/succinctly/issues/3867)):
-`succinctly yq` keeps the owned walk, so there `first(recurse(.[]?; true))` still pays for the whole document where
-`first(..)` does not, and it counts a repeated mapping key's node once fewer than the cursor walk does when a
-position is read (`recurse(.[]?; true) | path` over `dup: {a: 1, a: 2}` is 3 nodes, the cursor walk's 4). Like `..`,
-the cursor walk decodes a node only where something reads it, so an undecodable string inside a subtree `cond`
+`recurse(.[]?; cond)` has a cursor arm in both modes ([#3867](https://github.com/rust-works/succinctly/issues/3867) for jq, [#4095](https://github.com/rust-works/succinctly/issues/4095) for yq).
+Like `..`, the cursor walk decodes a node only where something reads it, so an undecodable string inside a subtree `cond`
 prunes is never raised (the owned walk raised it up front); jq 1.7.1 rejects such a document at parse time, so
-there is no reference answer (ADR-0018: performance decides). The path walker still
+there is no reference answer (ADR-0018: performance decides).
+In yq mode the arm also stops at an alias node as `..` and `recurse(.[]?)` do (#4214), where the owned walk expanded it.
+Over `a: &b {x: 1, y: [1, 2]}` with `c: *b` beside it, `[recurse(.[]?; true)] | length` counts the alias as one node, as `[..] | length` does.
+A `key`, `path`, `parent`, `line` or `column` stage after the walk reads each node's position, where the owned walk gave it none (`[recurse(.[]?; true) | path]` was `[[], [], ...]`).
+That position walk asks `cond` as it reaches each node in the shapes it streams (a bare walk, a pipe, a comma, `try` and `?`), so `limit` stops it where jq stops: `[limit(3; recurse(.[]?; debug | true) | path)]` asks `cond` twice, once per child it reaches.
+A wrapper it does not stream (`if`, a `def` call, `label`, `skip`, a nested `limit`) collects the walk's positions first, asking `cond` of every node before the consumer can stop it; that shows for a `cond` with an effect (`debug`, `input`) or one that raises, and costs the whole walk for a one-result consumer.
+yq's own `first(exp)` is not jq's `first` (it returns the first child of the context for which `exp` is truthy), so it says nothing about where a walk stops.
+Over a computed value (a constructed object, `$var`, `input`) the position walk is the owned identity pipe, which collects a whole stage before a consumer can stop it, so it takes only a `cond` that has no effect and cannot raise: literals, `.`, `not`, `type`, and comparisons, `and` and `or` of them.
+Any other `cond` over a computed value keeps the eager route and gives a position stage none.
+The admitted `cond` is the hand-written allow-list `yields_at_most_one_value`; anything it does not list keeps the owned walk in both modes, with its alias expansion in yq mode and no position.
+That is a `cond` that reads `key`, `path`, `tag`, `kind`, `style`, `anchor` or `line`, or can yield more than one value, and also spellings the list does not know: a `cond` passed through a `def` parameter, `?` or `try`, an object construction, and builtins such as `test`, `tojson`, `any`, `all` and `isempty`.
+The alias ladder's reproducer is one such spelling away: over the 22-level ladder, `def f(c): .root | first(recurse(.[]?; c)) | length; f(. != 1)` takes 0.94 s and 820 MB where `.root | first(recurse(.[]?; . != 1)) | length` takes 0.08 s and 14 MB, and the cost doubles with each level.
+A comparison of `.` or `type` with a literal, and `and`, `or` and `not` of those, are decided without the general evaluator (`direct_cond_verdict`): a container is not equal to a scalar literal, and a scalar is compared with the same `apply_compare_op` the general route applies, so the answer is the general route's, quirks included (yq compares a scalar with a literal by its text, so `e: "null"` is `== null`).
+That route copied every container whole to compare it (1.9 times the owned walk's time over a 10 MB `users` document) before it was added.
+In jq mode the collecting form (`[recurse(.[]?; cond)]`) keeps the owned walk it has always had; only yq mode's takes the cursor walk there.
+The default (YAML) output of a bare walk is rendered from each kept node's own cursor, as `..`'s is (`m2_gate.rs`), so it prints what real yq's `..` prints, including a document's leading head comment, which the owned walk's output dropped.
+
+Still the owned route's, in yq mode:
+- A write through the walk: `(recurse(.[]?; true) | select(tag == "!!int")) |= . + 1` over `anchors: {base: &b {p: 1}, copy: *b}` reaches the shared node once per alias (`p: 3`, where `..` gives `p: 2`), the write-side residual of [#4223](https://github.com/rust-works/succinctly/issues/4223).
+- `path(recurse(.[]?; cond))` still materializes the document and expands every alias: `[path(recurse(.[]?; true))] | length` over `a: &x {p: 1}` with `b: *x` is 5, where `[recurse(.[]?; true) | path] | length` and `[path(..)] | length` are 4.
+- A `cond` that reads `type` of a node whose explicit tag the owned value cannot hold (a custom tag, `!!binary`, `!!set`, `!!omap`, an explicit `!!timestamp`, or `!!null` or `!!bool` on a container) is asked at the node by the read walk, as yq reads it, and over the owned value by `path(...)` and by writes, which keep or drop other nodes: over `ak: !!binary aGVsbG8=`, `[recurse(.[]?; type == "!!binary") | path | join(".")]` is `["","ak"]` (as yq's `.. | select(type == "!!binary")` is `ak`), while `[path(recurse(.[]?; type == "!!binary")) | join(".")]` is `[""]`.
+- A comparison of a container with a literal is decided by the node being a container, so the container is not decoded: `a: {b: "bad\\q"}` / `z: 5`, `[limit(2; recurse(.[]?; . != null)) | path]` is `[[],["a"]]`, where `. | (. != null)` (the general route) copies the container and raises `invalid escape sequence`.
+  jq 1.7.1 rejects such a document at parse time, so there is no reference answer (ADR-0018: performance decides).
+- Consumers that bind, compare or serialize each node copy its subtree out of the live document, which the owned walk's shared tree did not: `reduce recurse(.[]?; true) as $n (0; . + 1)` is 2.4 to 2.6 times slower over a 1 to 10 MB `users` document, `any(recurse(.[]?; true); . == x)` 2.8 to 3.2 times, `foreach` 2.3 to 2.6 times, and `[recurse(.[]?; true)] | sort` 1.3 to 1.4 times with 16% to 70% more peak memory.
+  The cost grows with depth (a 150-level document: 19 to 22 times).
+  `..` pays the same in yq mode, and jq mode has paid it since #3867; the pass-through consumers measured below do not.
+- Inside `map`, `try`, `if`, `label`, `limit`, `skip`, `nth(n; f)`, `as` bindings and `def` calls, and over a computed value, a position stage after a walk whose `cond` is not inert (`length > 0`, a field read) is stamped with the position of the stage's input, as before: `map(recurse(.[]?; length > 0) | path)` lists the entry node's path for every node.
+- A union after a position stage is evaluated element-major, as `recurse(.[]?)`'s is, where yq's `..` is branch-major: `[recurse(.[]?; true) | (path, key)]` differs from `[.. | (path, key)]` (which is real yq's answer).
+  A navigation stage before a position reader also runs over alias-dereferenced values, so `select(type == "!!map") | .x | select(. != null) | path` reaches both an anchor and its alias.
+  A single-output tail agrees with `..` node for node.
+- A `cond` that raises after many nodes costs the nodes already delivered, because the collecting route copies them for the partial output, and the cost grows with depth: over a 150-level document of 60,000 integers, an error raised at the last one took 1.93 s and 349 MB against 0.17 s and 54 MB (the error is the same).
+- Over a computed value nested 257 to 384 levels the owned identity route raises `nesting depth exceeds limit of 256`, as `..` does there, where the owned walk answered with empty positions.
+
+Measured in yq mode with `scripts/ab-cli.py` (interleaved, 7 repetitions, minimum, base `c31f900b8` against the change, both `codegen-units=1` and fat LTO, output identical on every row, `memcap.py` at 8 GB), on `users` documents of 1, 10 and 100 MB.
+The control (the base binary against itself, 10 MB) read -1.5% to +0.4% on the 7950X and -0.7% to +0.7% on the M4 Pro.
+
+| Query                                                           | Machine           |   1 MB |  10 MB | 100 MB |
+|-----------------------------------------------------------------|-------------------|--------|--------|--------|
+| `first(recurse(.[]?; true))`                                    | AMD Ryzen 9 7950X | -69.6% | -75.7% | -75.5% |
+| `first(recurse(.[]?; true))`                                    | Apple M4 Pro      | -60.4% | -72.3% | -73.6% |
+| `[recurse(.[]?; true)] \| length`                               | AMD Ryzen 9 7950X | -54.3% | -59.3% | -58.0% |
+| `[recurse(.[]?; true)] \| length`                               | Apple M4 Pro      | -43.5% | -49.2% | -50.2% |
+| `[recurse(.[]?; length > 0)] \| length`                         | AMD Ryzen 9 7950X | -34.2% | -37.3% | -35.5% |
+| `[recurse(.[]?; length > 0)] \| length`                         | Apple M4 Pro      | -26.3% | -27.5% | -28.0% |
+| `[recurse(.[]?; type == "!!map" or type == "!!seq")] \| length` | AMD Ryzen 9 7950X | -30.9% | -36.2% | -33.0% |
+| `[recurse(.[]?; type == "!!map" or type == "!!seq")] \| length` | Apple M4 Pro      | -11.0% | -12.8% | -13.3% |
+| `[recurse(.[]?; . != null)] \| length`                          | AMD Ryzen 9 7950X | -21.0% | -24.8% | -21.1% |
+| `[recurse(.[]?; . != null)] \| length`                          | Apple M4 Pro      |  -3.4% |  -4.5% |  -5.6% |
+| `[recurse(.[]?; . == 1 \| not)] \| length`                      | AMD Ryzen 9 7950X | -19.4% | -25.8% | -21.1% |
+| `[recurse(.[]?; . == 1 \| not)] \| length`                      | Apple M4 Pro      |  -1.8% |  -4.8% |  -5.8% |
+| `[recurse(.[]?; . != null and . != false)] \| length`           | AMD Ryzen 9 7950X | -11.8% | -16.7% | -13.2% |
+| `[recurse(.[]?; . != null and . != false)] \| length`           | Apple M4 Pro      |  +3.9% |  +4.7% |  +4.0% |
+
+Every row is faster on the 7950X.
+On the M4 Pro the only slower rows are the last pair, two comparisons joined by `and`, at +3.9% to +4.7%; a `cond` made of `type` tests, which was 11% slower there before `type` joined the direct verdicts, is 11.0% to 13.3% faster.
+The alias ladder is where the owned walk is unusable: `.root | first(recurse(.[]?; true))` over a 26-level ladder (586 B, 2^26 leaves once expanded) took 16.9 s on the M4 Pro and 37.8 s and over 8 GB on the 7950X, and takes 4.3 ms and 1.8 ms.
+At 16, 20 and 24 levels the base took 19 ms, 245 ms and 3.8 s on the M4 Pro and 35 ms, 552 ms and 8.9 s on the 7950X, and the change takes the same few milliseconds at each (3.6 to 3.8 ms and 1.6 to 1.7 ms).
+In jq mode over a 10 MB `users` JSON document, a bare `recurse(.[]?; . != null)` is 62.9% (7950X) and 54.9% (M4 Pro) faster, a bare `recurse(.[]?; type == "object" or type == "array")` 51.9% and 40.1% faster, and `recurse(.[]?; true)` 9.5% and 5.6% faster; the collecting form and `first(...)` are unchanged (-1.0%, +1.2%, -3.5%, +0.7%).
+That is the direct verdict: jq mode keeps the owned walk for a collecting form and stays off the M2 fast path for this builtin (`m2_has_recurse_cond`).
+The default YAML output of a bare `recurse(.[]?; true)` over a 10 MB `users` document is 27.4% and 19.4% faster, and `recurse(.[]?; . != null)` 12.9% and 0.8%.
+The path walker still
 runs `.[]?` at every node, so
 `path(recurse(.[]?))` takes about 1.8 times `path(..)`'s time (2.9 s against 1.6 s over 1.15 M nodes of
 a `users` document, [#3717](https://github.com/rust-works/succinctly/issues/3717)).

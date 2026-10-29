@@ -330,7 +330,8 @@ pub(crate) fn guard_nesting_depth(depth: usize) -> Result<(), EvalError> {
 ///
 /// - `collect_paths_generic` (`paths`, `leaf_paths`): ~1.4 MiB on aarch64 and
 ///   ~1.3 MiB on x86_64, a ~1.4-1.5x margin;
-/// - `path_context_step_recurse` (`.. | path`): ~0.45 / ~0.43 MiB, ~4.6x;
+/// - `path_context_step_recurse` (`.. | path`): ~0.45 / ~0.43 MiB, ~4.6x (about 3.4x since #4095's
+///   streaming core made its frame ~400 bytes per level larger, measured in review);
 /// - a 383-component static chain (`path(.k.k...k)`): ~0.5 / ~0.47 MiB, ~4x.
 ///
 /// The first is the same margin 256 gives the materializer today (it overflows
@@ -13861,6 +13862,17 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         {
             collect_each_generic::<S, V>(expr, value, optional, cursor)
         }
+        // #4095: and `recurse(.[]?; cond)` for a `cond` yielding at most one value, the
+        // non-sink twin of `eval_each_generic`'s cursor arm. yq mode only: jq mode's collecting
+        // route keeps the owned walk it has always had here, which answers a `cond` from the tree
+        // where the cursor walk asks the node.
+        Expr::Builtin(Builtin::RecurseCond(f, cond))
+            if S::TAG == EvalTag::Yq
+                && cursor.is_some()
+                && crate::jq::eval::is_gated_structural_descent(f, Some(cond)) =>
+        {
+            collect_each_generic::<S, V>(expr, value, optional, cursor)
+        }
         Expr::Pipe(exprs) => {
             eval_single_pipe::<S, V>(exprs, &PipeWhole::given(expr), value, optional, cursor)
         }
@@ -15724,14 +15736,10 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // #3867: and `recurse(.[]?; cond)` for a `cond` that yields at most one value
         // -- the owned walk's `walk_descendants_gated`, without materializing the
         // document (`first(recurse(.[]?; true))` over a 7 MB document was 5x `..`'s
-        // memory).
-        // Jq mode only: in yq mode a mapping with a duplicate key read through a position
-        // (`recurse(.[]?; true) | path`) counts the repeated key's node once more than the owned
-        // walk, a divergence left to its own issue.
+        // memory). Both modes (#4095): the walk lists a node's children as `..` does, so a
+        // mapping with a duplicate key counts as many nodes here as in the owned walk (#1344).
         Expr::Builtin(Builtin::RecurseCond(f, cond))
-            if S::TAG == EvalTag::Jq
-                && cursor.is_some()
-                && crate::jq::eval::is_gated_structural_descent(f, Some(cond)) =>
+            if cursor.is_some() && crate::jq::eval::is_gated_structural_descent(f, Some(cond)) =>
         {
             each_recurse_cursor_generic::<S, V>(cursor.expect("guarded"), Some(cond), sink)
         }
@@ -16070,6 +16078,170 @@ fn each_foreach_generic<S: EvalSemantics, V: DocumentValue>(
     )
 }
 
+/// Whether `recurse(.[]?; cond)` keeps the node `cursor` stands at: `cond`'s truthiness there, or the
+/// escape it raised. The one rule the cursor walk and the position walk share, so the two cannot
+/// disagree on which nodes a `cond` prunes (#4095).
+///
+/// The caller admitted only a `cond` yielding at most one value
+/// ([`crate::jq::eval::is_gated_structural_descent`]), so one truthy verdict keeps the child once.
+fn recurse_cond_keeps_cursor<S: EvalSemantics, V: DocumentValue>(
+    cond: &Expr,
+    cursor: V::Cursor,
+) -> Result<bool, Control> {
+    if let Some(keep) = direct_cond_verdict::<S, V>(cond, &cursor) {
+        return Ok(keep);
+    }
+    let mut keep = false;
+    let mut verdicts = 0u32;
+    let flow = eval_each_generic::<S, V>(cond, cursor.value(), false, Some(cursor), &mut |item| {
+        verdicts += 1;
+        keep |= generic_item_is_truthy(&item);
+        Demand::Continue
+    });
+    // The walk's bound rests on the admission rule: a second verdict would visit a child once per
+    // truthy output where this visits it once.
+    debug_assert!(
+        verdicts <= 1,
+        "an admitted `cond` yielded {verdicts} values"
+    );
+    match flow {
+        // `cond` is never stopped: the sink above always continues.
+        Flow::Exhausted | Flow::Stopped { .. } => Ok(keep),
+        Flow::Escaped(control) => Err(control),
+    }
+}
+
+/// A verdict for a `recurse(.[]?; cond)` `cond` computed without the general evaluator, or `None`
+/// when only the general evaluator can answer it (#4095).
+///
+/// The general route builds a sink, a fan-out and an item per node, and for a comparison it then
+/// copies the node to an owned value to compare it. Two costs followed. A container was copied
+/// whole, so `. != null` over a container cost its subtree at every node on the way down (1.9 times
+/// the owned walk's time over a 10 MB `users` document, growing with depth). And on the many leaves
+/// of a document the machinery cost more than the comparison it ran.
+///
+/// The grammar is `true`/`false`/`null`, `.` (truthiness, read in place), `not`, `and`/`or`, and a
+/// comparison between a literal and `.` or `type`. A container compared with a scalar literal is
+/// decided by being one; a scalar is copied once per node and compared with the same
+/// `apply_compare_op` the general route applies, and `type` is the same `yq_type_tag` /
+/// `tagged_type_name` the general route answers, so the verdict is the general route's, quirks
+/// included (yq compares a scalar with a literal by its text, so `e: "null"` is `== null`).
+fn direct_cond_verdict<S: EvalSemantics, V: DocumentValue>(
+    cond: &Expr,
+    cursor: &V::Cursor,
+) -> Option<bool> {
+    // Decided before the node is touched: a `cond` with one part outside the grammar goes to the
+    // general route whole, and must not first decode the node for the part inside it.
+    if !is_direct_grammar(cond) {
+        return None;
+    }
+    direct_cond_verdict_with::<S, V>(cond, cursor, &core::cell::OnceCell::new())
+}
+
+/// Whether every part of `cond` is in [`direct_cond_verdict`]'s grammar. The twin of its arms: a
+/// shape accepted here that the verdict cannot answer is only a missed shortcut, never a wrong
+/// answer, since the verdict returns `None` for it.
+fn is_direct_grammar(cond: &Expr) -> bool {
+    let is_operand = |e: &Expr| matches!(e, Expr::Identity | Expr::Builtin(Builtin::Type));
+    match cond {
+        Expr::Paren(inner) => is_direct_grammar(inner),
+        Expr::Literal(Literal::Bool(_) | Literal::Null) | Expr::Identity => true,
+        Expr::Pipe(stages) => match &stages[..] {
+            [head, Expr::Not] => is_direct_grammar(head),
+            _ => false,
+        },
+        Expr::And(left, right) | Expr::Or(left, right) => {
+            is_direct_grammar(left) && is_direct_grammar(right)
+        }
+        Expr::Compare { left, right, .. } => matches!(
+            (&**left, &**right),
+            (operand, Expr::Literal(_)) | (Expr::Literal(_), operand) if is_operand(operand)
+        ),
+        _ => false,
+    }
+}
+
+/// [`direct_cond_verdict`], with the node's owned copy shared by every comparison in `cond`
+/// (`. != null and . != false` copies a scalar once, not twice). `None` in the cell means the
+/// node cannot be copied, which the general route raises.
+fn direct_cond_verdict_with<S: EvalSemantics, V: DocumentValue>(
+    cond: &Expr,
+    cursor: &V::Cursor,
+    owned: &core::cell::OnceCell<Option<OwnedValue>>,
+) -> Option<bool> {
+    match cond {
+        Expr::Paren(inner) => direct_cond_verdict_with::<S, V>(inner, cursor, owned),
+        Expr::Literal(Literal::Bool(b)) => Some(*b),
+        Expr::Literal(Literal::Null) => Some(false),
+        Expr::Identity => Some(cursor_is_truthy(cursor)),
+        Expr::Pipe(stages) => match &stages[..] {
+            [head, Expr::Not] => direct_cond_verdict_with::<S, V>(head, cursor, owned).map(|b| !b),
+            _ => None, // patchcov: coverage tolerate-line reason="unreachable: direct_cond_verdict checks is_direct_grammar before this runs, and that grammar admits only the shapes the arms above answer (#4095)"
+        },
+        // Both sides are pure, so asking the right one of a falsy `and` (or a truthy `or`) changes
+        // nothing but the work, and `None` from either side sends the whole `cond` the general way.
+        Expr::And(left, right) => {
+            let (l, r) = (
+                direct_cond_verdict_with::<S, V>(left, cursor, owned)?,
+                direct_cond_verdict_with::<S, V>(right, cursor, owned)?,
+            );
+            Some(l && r)
+        }
+        Expr::Or(left, right) => {
+            let (l, r) = (
+                direct_cond_verdict_with::<S, V>(left, cursor, owned)?,
+                direct_cond_verdict_with::<S, V>(right, cursor, owned)?,
+            );
+            Some(l || r)
+        }
+        Expr::Compare { op, left, right } => {
+            let is_operand = |e: &Expr| matches!(e, Expr::Identity | Expr::Builtin(Builtin::Type));
+            let (operand, literal, operand_is_left) = match (&**left, &**right) {
+                (operand, Expr::Literal(literal)) if is_operand(operand) => {
+                    (operand, literal, true)
+                }
+                (Expr::Literal(literal), operand) if is_operand(operand) => {
+                    (operand, literal, false)
+                }
+                _ => return None, // patchcov: coverage tolerate-line reason="unreachable: direct_cond_verdict checks is_direct_grammar before this runs, and that grammar admits only the shapes the arms above answer (#4095)"
+            };
+            let node = cursor.value();
+            let type_value;
+            let operand_value: &OwnedValue = if matches!(operand, Expr::Identity) {
+                if node.as_object().is_some() || node.as_array().is_some() {
+                    return matches!(op, CompareOp::Eq | CompareOp::Ne)
+                        .then_some(matches!(op, CompareOp::Ne));
+                }
+                // A node that cannot be copied (a decode failure) raises on the general route.
+                owned
+                    .get_or_init(|| to_owned_cursor::<S, _>(cursor).ok())
+                    .as_ref()?
+            } else {
+                let type_name = if S::TAG == EvalTag::Yq {
+                    yq_type_tag(&node, Some(*cursor))
+                } else if node.is_error() {
+                    // A malformed keyword token raises on the general route (#3035).
+                    return None;
+                } else {
+                    tagged_type_name(&node, Some(*cursor)).to_string()
+                };
+                // Bound before the borrow: a temporary in an `else` block's tail is not extended on
+                // the crate's declared minimum Rust version.
+                type_value = OwnedValue::String(type_name.into());
+                &type_value
+            };
+            let literal = crate::jq::eval::literal_to_owned(literal);
+            let (l, r) = if operand_is_left {
+                (operand_value, &literal)
+            } else {
+                (&literal, operand_value)
+            };
+            Some(crate::jq::eval::apply_compare_op::<S>(*op, l, r))
+        }
+        _ => None, // patchcov: coverage tolerate-line reason="unreachable: direct_cond_verdict checks is_direct_grammar before this runs, and that grammar admits only the shapes the arms above answer (#4095)"
+    }
+}
+
 /// `..` from a cursor (and, with a `cond`, `recurse(.[]?; cond)` for a `cond` yielding at
 /// most one value, #3867): the node, then every descendant in document order,
 /// each delivered as a live cursor (spine 2416, walk residue). `..` is
@@ -16102,27 +16274,10 @@ fn each_recurse_cursor_generic<S: EvalSemantics, V: DocumentValue>(
         // truthy verdict keeps the child once.
         let is_root = core::mem::take(&mut at_root);
         if let Some(cond) = cond.filter(|_| !is_root) {
-            let mut keep = false;
-            let mut verdicts = 0u32;
-            let flow =
-                eval_each_generic::<S, V>(cond, cursor.value(), false, Some(cursor), &mut |item| {
-                    verdicts += 1;
-                    keep |= generic_item_is_truthy(&item);
-                    Demand::Continue
-                });
-            // The walk's bound rests on the admission rule: a second verdict would visit a
-            // child once per truthy output where this visits it once.
-            debug_assert!(
-                verdicts <= 1,
-                "an admitted `cond` yielded {verdicts} values"
-            );
-            match flow {
-                // `cond` is never stopped: the sink above always continues.
-                Flow::Exhausted | Flow::Stopped { .. } => {}
-                escaped @ Flow::Escaped(_) => return escaped,
-            }
-            if !keep {
-                continue;
+            match recurse_cond_keeps_cursor::<S, V>(cond, cursor) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(control) => return Flow::Escaped(control),
             }
         }
         if matches!(sink.push(GenericItem::OneCursor(cursor)), Demand::Stop) {
@@ -26062,7 +26217,7 @@ fn path_expr_observes_no_identity(expr: &Expr) -> bool {
 /// #4412: in jq mode `try E` and `try E catch empty` are `E?` and are admitted too; before, they
 /// fell to the materializing route, which copies the input and wraps the copy in an `Rc` on every
 /// `path(f)` call. Not in yq mode: the walk counts a repeated mapping key's node once more than
-/// the owned walk (`recurse(.[]?; true) | path` carries the same note), so moving `try` there
+/// the owned walk, so moving `try` there
 /// would change a `path(try .[])` over a document with a duplicate key, and a decode failure
 /// elsewhere in a YAML document would stop raising. jq mode collapses duplicate keys on both
 /// routes.
@@ -27507,6 +27662,8 @@ fn path_context_is_navigational_at(expr: &Expr, unfolded: u8) -> bool {
         Expr::Builtin(Builtin::RecurseF(f)) if crate::jq::eval::is_structural_descent(f, None) => {
             true
         }
+        // #4095: and `recurse(.[]?; cond)` for a `cond` the walk can ask at a position.
+        Expr::Builtin(Builtin::RecurseCond(f, cond)) => recurse_cond_is_walkable(f, cond),
         Expr::SliceExpr { target, start, end } => {
             (nav(target) || path_context_component_walkable(target))
                 && start
@@ -27644,6 +27801,59 @@ fn path_context_is_navigational_at(expr: &Expr, unfolded: u8) -> bool {
 /// is carried out exactly as the eager route carried it (#2495).
 fn path_context_component_walkable(expr: &Expr) -> bool {
     owned_identity_component_supported(expr)
+}
+
+/// Whether `recurse(f; cond)` answers each node it keeps as its own live cursor (#4095): the
+/// cursor walk's admission rule ([`crate::jq::eval::is_gated_structural_descent`]).
+///
+/// `#[doc(hidden)]`: the CLI's M2 streaming gate (`src/bin/succinctly/m2_gate.rs`) asks this, so a
+/// bare `recurse(.[]?; cond)` is rendered from each cursor's own text, as `..` is, instead of
+/// through the DOM path's per-node `to_owned()`, which copies every node's whole subtree again.
+#[doc(hidden)]
+pub fn recurse_cond_streams_cursors(f: &Expr, cond: &Expr) -> bool {
+    crate::jq::eval::is_gated_structural_descent(f, Some(cond))
+}
+
+/// `recurse(f; cond)` as one navigation step (#4095): structural descent
+/// ([`crate::jq::eval::is_gated_structural_descent`]) pruned by a `cond` that yields at most one
+/// value. That test is what keeps a `cond` that reads the node's position (`key`, `path`, `parent`,
+/// ...) out, since [`crate::jq::eval::yields_at_most_one_value`] refuses those leaves: the walk asks
+/// `cond` of the node and never of its position, which a `cond` outside the grammar would need.
+/// The one definition the position walk's gate, its step and the owned identity pipe's gate all
+/// consult, so they cannot disagree on which spellings they take.
+fn recurse_cond_is_walkable(f: &Expr, cond: &Expr) -> bool {
+    crate::jq::eval::is_gated_structural_descent(f, Some(cond))
+}
+
+/// The `cond` of `expr` when it is a `recurse(f; cond)` the position walk takes
+/// ([`recurse_cond_is_walkable`]).
+fn walkable_recurse_cond(expr: &Expr) -> Option<&Expr> {
+    match expr {
+        Expr::Builtin(Builtin::RecurseCond(f, cond)) if recurse_cond_is_walkable(f, cond) => {
+            Some(cond)
+        }
+        _ => None,
+    }
+}
+
+/// Whether `cond` has no effect and cannot raise on any node: literals, `.`, `not`, `type`, and
+/// comparisons, `and`, `or` and pipes of them (#4095).
+///
+/// The owned identity pipe collects a stage's positions before the next stage sees one, so a
+/// consumer's stop (`first`, `limit`) cannot reach a walk it drives. It over-asks `cond`, which is
+/// unobservable only for a `cond` that cannot raise and does nothing but answer: `input`, `debug`
+/// or a field read that raises on a number would show. The position walk over a live document
+/// streams ([`path_context_step_recurse_each`]) and needs no such bound.
+fn recurse_cond_is_inert(cond: &Expr) -> bool {
+    match cond {
+        Expr::Literal(_) | Expr::Identity | Expr::Not | Expr::Builtin(Builtin::Type) => true,
+        Expr::Paren(inner) => recurse_cond_is_inert(inner),
+        Expr::Pipe(stages) => stages.iter().all(recurse_cond_is_inert),
+        Expr::Compare { left, right, .. } | Expr::And(left, right) | Expr::Or(left, right) => {
+            recurse_cond_is_inert(left) && recurse_cond_is_inert(right)
+        }
+        _ => false,
+    }
 }
 
 /// A position reached during a path-context walk: the node the path reached
@@ -28114,10 +28324,14 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             path_context_step_getpath::<S, V>(path_expr, pos, out)
         }
         Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => {
-            path_context_step_recurse::<S, V>(pos, out)
+            path_context_step_recurse::<S, V>(None, pos, out)
         }
         Expr::Builtin(Builtin::RecurseF(f)) if crate::jq::eval::is_structural_descent(f, None) => {
-            path_context_step_recurse::<S, V>(pos, out)
+            path_context_step_recurse::<S, V>(None, pos, out)
+        }
+        // #4095: `recurse(.[]?; cond)`, the same walk with `cond` asked of each child.
+        Expr::Builtin(Builtin::RecurseCond(f, cond)) if recurse_cond_is_walkable(f, cond) => {
+            path_context_step_recurse::<S, V>(Some(cond), pos, out)
         }
         // spine 2416 (walk residue): the transparent wrappers, at the head
         // of a pipe or anywhere else in it. Each one's positions *are* the
@@ -29058,24 +29272,81 @@ fn path_context_step_getpath<S: EvalSemantics, V: DocumentValue>(
 /// (the root's `key` emits nothing, #2421), `[.. | path]` starts with `[]`,
 /// and `[.. | parent | key]` is `["a","a","c","c"]`; jq 1.7.1's
 /// `[path(..)]` lists the same positions in the same order.
+///
+/// With a `cond` (#4095), `recurse(.[]?; cond)`: a child is stepped into only once `cond` is
+/// truthy at its position, asked when the walk reaches it -- after the subtrees of the siblings
+/// before it, as jq's `def r: ., (f | select(cond) | r)` does -- and the starting node is
+/// delivered without it. The caller admitted only a `cond` yielding at most one value
+/// ([`recurse_cond_is_walkable`]), so one verdict keeps a child once.
 fn path_context_step_recurse<S: EvalSemantics, V: DocumentValue>(
+    cond: Option<&Expr>,
     pos: &PathContextPos<V>,
     out: &mut Vec<PathContextPos<V>>,
 ) -> Result<(), Control> {
+    path_context_step_recurse_each::<S, V>(cond, pos, &mut |found| {
+        out.push(found);
+        Demand::Continue
+    })
+    .map(|_| ())
+}
+
+/// [`path_context_step_recurse`], delivering each position as the walk reaches it, so a consumer's
+/// stop reaches the walk: `first(recurse(.[]?; C) | path)` must not ask `C` of a node past the one
+/// it returned, and `C` may have an effect (`input`, `debug`) or raise (#4095). `..` is delivered
+/// the same way, with no `cond` to ask.
+fn path_context_step_recurse_each<S: EvalSemantics, V: DocumentValue>(
+    cond: Option<&Expr>,
+    pos: &PathContextPos<V>,
+    sink: &mut dyn FnMut(PathContextPos<V>) -> Demand,
+) -> Result<Demand, Control> {
     guard_path_walk_depth(pos.trail.recursion_depth())?;
-    out.push(pos.clone());
+    if matches!(sink(pos.clone()), Demand::Stop) {
+        return Ok(Demand::Stop);
+    }
     // #4214: yq's `..` yields an alias node and stops there.
     if S::TAG == EvalTag::Yq
         && matches!(&pos.node, PathNode::At(c) if c.document_has_aliases() && c.is_alias())
     {
-        return Ok(());
+        return Ok(Demand::Continue);
     }
     let mut children = Vec::new();
     path_context_step_try::<S, V>(&Expr::Iterate, None, pos, &mut children)?;
     for child in &children {
-        path_context_step_recurse::<S, V>(child, out)?;
+        if let Some(cond) = cond {
+            if !path_context_recurse_cond_keeps::<S, V>(cond, child)? {
+                continue;
+            }
+        }
+        if matches!(
+            path_context_step_recurse_each::<S, V>(cond, child, sink)?,
+            Demand::Stop
+        ) {
+            return Ok(Demand::Stop);
+        }
     }
-    Ok(())
+    Ok(Demand::Continue)
+}
+
+/// Whether `recurse(.[]?; cond)` keeps the node at `pos` (#4095): a live node is asked at its own
+/// cursor, as the cursor walk asks it ([`recurse_cond_keeps_cursor`]), and a computed or absent one
+/// through the owned evaluator. Copying a live node into an owned value to test its truthiness
+/// would make a `cond` that returns the node (`.`, `objects`) cost its whole subtree.
+fn path_context_recurse_cond_keeps<S: EvalSemantics, V: DocumentValue>(
+    cond: &Expr,
+    pos: &PathContextPos<V>,
+) -> Result<bool, Control> {
+    if let PathNode::At(cursor) = &pos.node {
+        return recurse_cond_keeps_cursor::<S, V>(cond, *cursor);
+    }
+    let (verdicts, escape) = path_context_component_values::<S, V>(cond, pos);
+    if let Some(control) = escape {
+        return Err(control);
+    }
+    debug_assert!(
+        verdicts.len() <= 1,
+        "an admitted `cond` yielded several values"
+    );
+    Ok(verdicts.iter().any(OwnedValue::is_truthy))
 }
 
 /// `try body catch handler` / `body?` as one walk step (spine 2416, walk
@@ -29761,6 +30032,11 @@ fn path_context_step_each<S: EvalSemantics, V: DocumentValue>(
         if !matches!(&**inner, Expr::IndexExpr { .. } | Expr::SliceExpr { .. }) {
             return path_context_step_try_each::<S, V>(inner, None, pos, sink);
         }
+    }
+    // `recurse(.[]?; cond)` asks `cond` at every node it reaches, and `cond` can have an effect or
+    // raise, so it is delivered as it goes too (#4095).
+    if let Some(cond) = walkable_recurse_cond(expr) {
+        return path_context_step_recurse_each::<S, V>(Some(cond), pos, sink);
     }
     // Literal navigation -- `.k`, `.[3]`, `.[]`. Every component is fixed by
     // the query, so none of these can be the computed component yq rolls a
@@ -36418,6 +36694,11 @@ fn owned_identity_nav_supported(expr: &Expr) -> bool {
         Expr::Builtin(Builtin::RecurseF(f)) if crate::jq::eval::is_structural_descent(f, None) => {
             true
         }
+        // #4095: and `recurse(.[]?; cond)`, the same descent with `cond` asked of each child -- an
+        // inert `cond` only, since this pipe collects the whole walk before its consumer can stop it.
+        Expr::Builtin(Builtin::RecurseCond(f, cond)) => {
+            recurse_cond_is_walkable(f, cond) && recurse_cond_is_inert(cond)
+        }
         Expr::Optional(inner) | Expr::Paren(inner) => owned_identity_nav_supported(inner),
         Expr::Pipe(exprs) => exprs.iter().all(owned_identity_nav_supported),
         _ => false,
@@ -37096,10 +37377,15 @@ fn owned_identity_step<S: EvalSemantics, V: DocumentValue>(
             out,
         ),
         Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => {
-            owned_identity_recurse_step::<S, V>(value, id, out).map_err(Control::Error)
+            owned_identity_recurse_step::<S, V>(None, value, id, out)
         }
         Expr::Builtin(Builtin::RecurseF(f)) if crate::jq::eval::is_structural_descent(f, None) => {
-            owned_identity_recurse_step::<S, V>(value, id, out).map_err(Control::Error)
+            owned_identity_recurse_step::<S, V>(None, value, id, out)
+        }
+        Expr::Builtin(Builtin::RecurseCond(f, cond))
+            if recurse_cond_is_walkable(f, cond) && recurse_cond_is_inert(cond) =>
+        {
+            owned_identity_recurse_step::<S, V>(Some(cond), value, id, out)
         }
         // #2771: a literal has no position of its own. Reached only from
         // `owned_identity_operand` (its top-level `strip_parens` short-circuit
@@ -37127,12 +37413,16 @@ fn owned_identity_step<S: EvalSemantics, V: DocumentValue>(
 /// value itself, then every descendant in document order, each at its own
 /// position -- `recurse(.[]?)`, so a scalar ends its branch silently. The
 /// same order [`path_context_step_recurse`] gives the walk's nodes.
+///
+/// With a `cond` (#4095), `recurse(.[]?; cond)`: a child is stepped into only once `cond` is
+/// truthy at its position, as [`path_context_step_recurse`] does for a live one.
 fn owned_identity_recurse_step<S: EvalSemantics, V: DocumentValue>(
+    cond: Option<&Expr>,
     value: &OwnedValue,
     id: &OwnedIdentity<V>,
     out: &mut Vec<(OwnedValue, OwnedIdentity<V>)>,
-) -> Result<(), EvalError> {
-    guard_nesting_depth(id.ancestors.len())?;
+) -> Result<(), Control> {
+    guard_nesting_depth(id.ancestors.len()).map_err(Control::Error)?;
     out.push((value.clone(), id.clone()));
     let (children, _suppressed) = owned_nav_children::<S>(&Expr::Iterate, value, true);
     let parent = Rc::new(value.clone());
@@ -37141,9 +37431,37 @@ fn owned_identity_recurse_step<S: EvalSemantics, V: DocumentValue>(
             Some(component) => id.child(&parent, component),
             None => id.clone(),
         };
-        owned_identity_recurse_step::<S, V>(&child, &child_id, out)?;
+        if let Some(cond) = cond {
+            if !owned_identity_cond_keeps::<S>(cond, &child)? {
+                continue;
+            }
+        }
+        owned_identity_recurse_step::<S, V>(cond, &child, &child_id, out)?;
     }
     Ok(())
+}
+
+/// Whether `recurse(.[]?; cond)` keeps `child` on the owned identity route (#4095).
+///
+/// An admitted `cond` is inert ([`recurse_cond_is_inert`]), so it reads no position to resolve and
+/// cannot raise; the pure verdict answers it from the tree, as the owned walk's
+/// `recurse_gate_verdict` does. The evaluator is the fallback should the pure grammar ever stop
+/// covering a shape the inert grammar admits, which keeps the route correct and not merely fast.
+fn owned_identity_cond_keeps<S: EvalSemantics>(
+    cond: &Expr,
+    child: &OwnedValue,
+) -> Result<bool, Control> {
+    match crate::jq::eval::owned_cond_verdict::<S>(cond, child, false) {
+        Some(verdict) => verdict.map_err(Control::Error),
+        None => {
+            let (verdicts, escape) =
+                owned_identity_values::<S>(cond, child, false, &RootWitness::Owned);
+            match escape {
+                Some(control) => Err(control),
+                None => Ok(verdicts.iter().any(OwnedValue::is_truthy)),
+            }
+        }
+    }
 }
 
 /// This stage's own `key`/`path`/`file_index` reads, rewritten to the
@@ -60702,5 +61020,44 @@ mod deferred_bind_tests_3856 {
                 assert_eq!(took, u64::from(defers), "{filter} over {doc}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod recurse_cond_owned_route_4095 {
+    use super::*;
+    use crate::jq::parse;
+
+    fn keeps(cond: &str, child: OwnedValue) -> Result<bool, Control> {
+        let expr = parse(cond).expect("cond parses");
+        owned_identity_cond_keeps::<JqSemantics>(&expr, &child)
+    }
+
+    /// An inert `cond` is answered by the pure verdict.
+    #[test]
+    fn pure_verdict_answers_an_inert_cond() {
+        assert!(matches!(keeps(". != null", OwnedValue::Int(1)), Ok(true)));
+        assert!(matches!(keeps(". == null", OwnedValue::Int(1)), Ok(false)));
+    }
+
+    /// The pure verdict's own failure (a field read on a number) is the walk's failure.
+    #[test]
+    fn pure_verdict_failure_is_the_walks_failure() {
+        let outcome = keeps(".a", OwnedValue::Int(1));
+        assert!(matches!(outcome, Err(Control::Error(_))), "{outcome:?}");
+    }
+
+    /// A shape the pure verdict declines falls to the evaluator, which answers it (`length` of a
+    /// string) or raises where jq raises (`length` of a boolean).
+    #[test]
+    fn evaluator_answers_what_the_pure_verdict_declines() {
+        assert!(matches!(
+            keeps("length > 0", OwnedValue::String("abc".into())),
+            Ok(true)
+        ));
+        assert!(matches!(
+            keeps("length > 0", OwnedValue::Bool(true)),
+            Err(Control::Error(_))
+        ));
     }
 }
