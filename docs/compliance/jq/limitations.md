@@ -7887,6 +7887,12 @@ exactly as it visits the program's, last-declared first, so `include "twomiss"; 
 construction): `jq: error: … at <top-level>, line N:`, the echoed filter line, and the
 trailer. The flat `jq: compile error: parse error at position N: …` is gone.
 
+**Closed for several constant non-string object keys (#5510).**
+jq's `check_object_key` records each as its own compile error and parses on, so `{(0):1,(1):2}` prints two `Cannot use number (n) as object key` reports and ends `jq: 2 compile errors`, and a syntax error after them is a further one.
+`jq::parse_program_with_extra_shadowable_defs_all` returns every error (the single-error entry points still return the first), and the main filter's report prints each and counts them.
+A destructuring pattern's keys count the same way; `succinctly yq` is unchanged (it stringifies a constant key in construction and stops at the first in a pattern).
+Open: a module's own syntax report still prints one error and counts one, where jq prints each.
+
 **Closed for a syntax error inside an `include`d module.** Same reporter, with the module's
 *canonical absolute* resolved path in the `at …` label (`/private/tmp/…` — canonicalizing
 `-L /tmp` matches jq's own naming), the module's echoed source line, and the trailer, with no
