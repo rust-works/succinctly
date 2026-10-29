@@ -803,6 +803,7 @@ mod tests {
     /// Each row's output was captured from `jq --stream-errors -c .` (jq 1.7.1) and covers one of
     /// the parser's error arms or an event shape.
     #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
     fn every_error_arm_and_event_shape_matches_jq_5474() {
         let rows: &[(&str, &str)] = &[
         ("[1 2]", "[\"Expected separator between values at line 1, column 5\",[0]]\n"),
@@ -870,6 +871,6 @@ mod tests {
         assert_eq!(read.locations, [(0, 0), (1, 0)]);
         assert_eq!(read.inside, 2);
         // An empty input has no value, and nothing to slurp.
-        assert!(read_one(b"").values.is_empty());
+        assert_eq!(read_one(b"").values.len(), 0);
     }
 }
