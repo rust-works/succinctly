@@ -8722,13 +8722,9 @@ fn emit_yaml_value_at_depth(
         // #3027: the `0x-10` yq's arithmetic writes for a negative hex or octal result reads back
         // as a string, so anywhere nested it carries the `!!int` tag, as a whole float's `!!float`.
         OwnedValue::NumberLiteral(NumberRepr::Int(_), literal)
-            if depth > 0
-                && !matches!(
-                    resolve_plain_sourced(literal, false),
-                    ResolvedScalar::Int(_)
-                ) =>
+            if depth > 0 && int_literal_reads_back_as_string(literal) =>
         {
-            format!("!!int {literal}")
+            tagged_int_literal(literal)
         }
         OwnedValue::NumberLiteral(_, literal) => {
             // Echo the source spelling verbatim (#1008) rather than
@@ -9399,6 +9395,23 @@ fn block_header(anchor: Option<&str>, tag: Option<&str>) -> String {
         (None, Some(tag)) => tag.to_string(),
         (None, None) => String::new(),
     }
+}
+
+/// Whether an integer literal's text reads back as something other than an integer, which only
+/// yq's own arithmetic writes (`0x-10`, #3027). Out of line, with [`tagged_int_literal`], so the
+/// recursive emitter's frame stays small.
+#[inline(never)]
+fn int_literal_reads_back_as_string(literal: &str) -> bool {
+    !matches!(
+        resolve_plain_sourced(literal, false),
+        ResolvedScalar::Int(_)
+    )
+}
+
+/// `literal` behind the `!!int` tag that keeps it an integer.
+#[inline(never)]
+fn tagged_int_literal(literal: &str) -> String {
+    format!("!!int {literal}")
 }
 
 /// A scalar behind its tag (#4066, #4078): the explicit tag it was written with
