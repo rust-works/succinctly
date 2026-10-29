@@ -192,3 +192,4 @@ mod i5458;
 mod i5473;
 mod i5474;
 mod i5476;
+mod i5489;
