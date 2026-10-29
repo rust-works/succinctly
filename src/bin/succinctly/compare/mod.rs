@@ -709,11 +709,14 @@ fn write_docs(root: &std::path::Path, results: &Results, args: &CompareJqArgs) -
     let p = docs::PLATFORM;
     std::fs::write(
         dir.join(format!("jq-{p}.md")),
-        format!("{}{}", docs::HEADER, report::render(results)),
+        docs::sanitize(
+            &format!("{}{}", docs::HEADER, report::render(results)),
+            root,
+        ),
     )?;
     std::fs::write(
         dir.join(format!("jq-{p}.json")),
-        serde_json::to_string_pretty(results)? + "\n",
+        docs::sanitize(&(serde_json::to_string_pretty(results)? + "\n"), root),
     )?;
     let mut rows = vec![];
     for e in std::fs::read_dir(&dir)?.flatten() {
