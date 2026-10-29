@@ -8048,6 +8048,15 @@ Three differences remain, all in the direction of erroring rather than aborting:
   this is a `catch_unwind` net rather than an `EvalError`, so the failure ends the run
   instead of being an error a `try` could see; the emission recursion has no `Result` to
   thread it through.
+  `succinctly jq` has the same net for the evaluator's own splice sites
+  ([#5526](https://github.com/rust-works/succinctly/issues/5526)).
+  `last(f)`, `+=`, `//=`, a fold's `$x` and `try error(<deep>)` on a value built past 384 levels
+  assert the ceiling where they splice it back into the AST or render it, with no `Result` to thread it through.
+  They exited 101 with a raw panic; the three CLI routes and the library's `jq::eval` now catch exactly that panic.
+  The CLI reports `nesting depth exceeds limit of 384` at exit 5, the same refusal `reduce` gives.
+  `jq::eval` returns it as a `resource_limit` error.
+  As with the yq net, it is a `catch_unwind` net and so ends the evaluation, not an error a `try` could see.
+  jq prints all of these values (`1` for each of the five programs in `tests/jq_cli/i5526.rs`).
 - **A self-recursive comma generator streams for thousands of elements, not
   indefinitely.** `def naturals: 0, (naturals|.+1); [limit(100000; naturals)]` errors
   (`naturals/0 exceeded maximum recursion depth`) somewhere between 10,000 and 20,000

@@ -9174,7 +9174,7 @@ fn evaluate_input_streaming(
             let Some(message) = depth_guard_panic_message(&*payload) else {
                 std::panic::resume_unwind(payload);
             };
-            Some(jq::Control::Error(EvalError::new(message)))
+            Some(jq::Control::Error(EvalError::resource_limit(message)))
         }
     };
     // The control is reported *before* any write error is surfaced. The eager
