@@ -14818,7 +14818,7 @@ enum YqIntBase {
 fn yq_int_base(value: &OwnedValue) -> Option<YqIntBase> {
     match value {
         OwnedValue::NumberLiteral(NumberRepr::Int(_), text) => match text.as_bytes() {
-            [b'0', b'x', ..] => Some(YqIntBase::Hex),
+            [b'0', b'x' | b'X', ..] => Some(YqIntBase::Hex),
             [b'0', b'o', ..] => Some(YqIntBase::Octal),
             _ => None,
         },
@@ -23258,6 +23258,13 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
     //
     // `tonumber` passes jq's parser a C string, so a NUL ends the text it sees (`"1\u00002" |
     // tonumber` is 1); `fromjson`, which passes a length, does not (#5309).
+    // yq reads the text with `parseInt64` and keeps it as the node's value: `"0x10" | tonumber`
+    // prints `0x10` and `"007"` `007`, while the JSON writers print the number (#1356).
+    if yq_mode {
+        if let Some(n) = crate::yaml::spelled_int_value(s) {
+            return Ok(OwnedValue::NumberLiteral(NumberRepr::Int(n), s.into()));
+        }
+    }
     let c_text = if yq_mode {
         s
     } else {

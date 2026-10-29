@@ -9404,7 +9404,7 @@ fn block_header(anchor: Option<&str>, tag: Option<&str>) -> String {
 /// recursive emitter's frame stays small.
 #[inline(never)]
 fn int_literal_reads_back_as_string(literal: &str) -> bool {
-    succinctly::yaml::is_signed_prefixed_int_text(literal)
+    succinctly::yaml::int_text_reads_back_as_string(literal)
 }
 
 /// `literal` behind the `!!int` tag that keeps it an integer.

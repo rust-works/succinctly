@@ -4433,9 +4433,9 @@ Two differences remain, none of them about the digits of an integer past `i64`:
 
 - **`tonumber` re-reads the text with its own rules** (#1356): `.a | tostring | tonumber` is
   `0099999999999999999999` in yq, and `succinctly yq` answers `1e+20` (`+99999999999999999999`
-  loses its `+`). The same holds for every non-JSON spelling that fits `i64`, which yq also echoes
-  and which `succinctly yq` normalizes: `+5`, `007`, `0x10`, `0o7` print as `5`, `7`, `16`, `7`
-  through `tostring`, and an explicit `!!float 9223372036854775807` prints the rounded double.
+  loses its `+`).
+  An integer spelling that fits `i64` (`+5`, `007`, `0x10`, `0X10`, `0o7`, `1_000`) keeps its text since #1356's integer slice, so `tostring`, interpolation and YAML output echo it as yq does and arithmetic keeps its base.
+  A float spelling (`"+2.0"`, `"2."`, `".5"`) still normalizes to `2.0`, `2` and `0.5`, and an explicit `!!float 9223372036854775807` prints the rounded double.
 - **A tag is not printed on a nested value.** yq keeps an explicit tag on the node, so a `!!float`
   scalar prints it when it is nested or copied (`[.a]` is `- !!float 99999999999999999999`, `.b = .a`
   writes `b: !!float 99999999999999999999`); a bare `.a` and `tostring` do not. `succinctly yq` drops
