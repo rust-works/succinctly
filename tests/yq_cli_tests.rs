@@ -17752,17 +17752,16 @@ fn test_tonumber_preserves_source_spelling_1090() -> Result<()> {
 
 /// #3033: jq mode's `tonumber` gained new literal-preserving escapes for
 /// spellings like `007.500`/`1.e5`, but real yq's own `tonumber` has a
-/// different, already-tracked fidelity model (#1356, #2960) -- confirm the
-/// jq-mode fix left yq mode's own (pre-existing, lossy on these spellings)
-/// output on these same inputs byte-for-byte unchanged.
+/// different fidelity model (#1356, #2960): it echoes the spelling. These
+/// are yq's own answers, which the jq-mode fix must not have moved.
 #[test]
 fn test_tonumber_lenient_spellings_unaffected_in_yq_mode_3033() -> Result<()> {
     for (text, want) in [
-        ("007.500", "7.5"),
-        (".500", "0.5"),
-        ("1.e5", "100000"),
-        ("+007.500", "7.5"),
-        ("+.500", "0.5"),
+        ("007.500", "007.500"),
+        (".500", ".500"),
+        ("1.e5", "1.e5"),
+        ("+007.500", "+007.500"),
+        ("+.500", "+.500"),
     ] {
         let input = format!("a: \"{text}\"\n");
         let (out, code) = run_yq_stdin(".a | tonumber", &input, &[])?;
@@ -28516,9 +28515,9 @@ fn test_yaml_legal_json_unsafe_float_spellings_normalize_954() -> Result<()> {
     for (yaml, want) in [
         ("a: +2.0\n", "2.0"),
         ("a: 1.\n", "1.0"),
-        ("a: 007e2\n", "7e2"),
+        ("a: 007e2\n", "700.0"),
         ("a: -1.\n", "-1.0"),
-        ("a: -007e2\n", "-7e2"),
+        ("a: -007e2\n", "-700.0"),
         // Passes via the pre-existing bare-`f64` fallback, not this fix's
         // new normalization: `preservable_float_literal_text` doesn't
         // widen a bare leading dot (`.5`, no digit before the point) at
@@ -28567,22 +28566,21 @@ fn test_yaml_legal_json_unsafe_float_spellings_produce_valid_json_954() -> Resul
 /// neither matched real yq's own `+1.0`. #954's fix (materializing a
 /// preserved -- if normalized -- `NumberLiteral` instead of a bare `Float`)
 /// makes every consumer read the same stored text, so they can no longer
-/// diverge from each other, even though they still don't match real yq's
-/// own `+`-preserving spelling (a real, documented, permanent divergence --
-/// see `preservable_float_literal_text`'s own doc comment for why).
+/// diverge from each other. Since #1356 that text is the spelling itself, so
+/// they also match real yq's own `+`-preserving one.
 #[test]
 fn test_yaml_legal_json_unsafe_float_self_consistent_across_consumers_954() -> Result<()> {
     for (yaml, want) in [
-        ("a: +1.0\n", "1.0"),
-        ("a: 1.\n", "1.0"),
-        ("a: 007e2\n", "7e2"),
+        ("a: +1.0\n", "+1.0"),
+        ("a: 1.\n", "1."),
+        ("a: 007e2\n", "007e2"),
         // A bare trailing dot immediately before an exponent marker --
         // code review found the first draft's whole-string
         // `strip_suffix('.')` missed this shape entirely (the exponent
         // digits are the string's actual suffix, not the dot), silently
         // reproducing this test's exact symptom for just this one spelling.
-        ("a: 1.e5\n", "1.0e5"),
-        ("a: 007.e2\n", "7.0e2"),
+        ("a: 1.e5\n", "1.e5"),
+        ("a: 007.e2\n", "007.e2"),
     ] {
         let (out, code) = run_yq_stdin(".a | tostring", yaml, &["-r"])?;
         assert_eq!(code, 0, "for {yaml:?}");

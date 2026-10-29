@@ -152,7 +152,10 @@ impl ResolvedScalar {
                 OwnedValue::from_number_literal::<YqSemantics>(&text)
             }
             Self::Float(f) => match preservable_float_literal_text(&text) {
-                Some(normalized) => OwnedValue::from_number_literal::<YqSemantics>(&normalized),
+                // #1356: the spelling (`+2.0`, `2.`, `007.5`, `1.e5`) rides as the literal's text,
+                // as an integer's does; the JSON writers ask for the number
+                // ([`spelled_float_json_text`]).
+                Some(_) => OwnedValue::from_number_literal::<YqSemantics>(&text),
                 // #2438: same document boundary as `to_owned_at_depth`'s own
                 // bare-float arm (`src/jq/eval_generic.rs`) -- a tag-forced
                 // float with no literal to keep (`!!float 0x1p70`-shaped
@@ -602,13 +605,36 @@ fn go_parse_int_base0_accepts(raw: &str) -> bool {
     !body.is_empty() && body.iter().all(|&b| char::from(b).is_digit(radix))
 }
 
+/// What yq's JSON encoder writes for a float spelled other than as JSON number syntax (#1356).
+///
+/// `+2.0`, `2.`, `007.5`, `1.e5` and `+1e5` are the floats `2.0`, `2.0`, `7.5`, `100000.0` and
+/// `100000.0` there, but `tostring` and YAML output keep the text. `None` for text that is
+/// already JSON number syntax or no float.
+#[must_use]
+pub fn spelled_float_json_text(raw: &str) -> Option<String> {
+    if !raw.contains(['.', 'e', 'E']) || preservable_float_literal_text(raw).is_none() {
+        return None;
+    }
+    let f: f64 = raw.parse().ok().filter(|f: &f64| f.is_finite())?;
+    Some(format_float_with_fraction(f))
+}
+
+/// Whether `raw` is a float spelled other than as JSON number syntax ([`spelled_float_json_text`]).
+#[must_use]
+pub fn is_spelled_float(raw: &str) -> bool {
+    raw.contains(['.', 'e', 'E']) && preservable_float_literal_text(raw).is_some()
+}
+
 /// The number yq's JSON encoder writes for a literal whose text is not what it writes.
 ///
-/// An integer past `i64` ([`overflowed_int_json_text`]) or a spelled one
-/// ([`spelled_int_json_text`]). `None` for every literal that is echoed.
+/// An integer past `i64` ([`overflowed_int_json_text`]), a spelled one
+/// ([`spelled_int_json_text`]) or a spelled float ([`spelled_float_json_text`]). `None` for
+/// every literal that is echoed.
 #[must_use]
 pub fn yq_json_number_text(raw: &str) -> Option<String> {
-    overflowed_int_json_text(raw).or_else(|| spelled_int_json_text(raw))
+    overflowed_int_json_text(raw)
+        .or_else(|| spelled_int_json_text(raw))
+        .or_else(|| spelled_float_json_text(raw))
 }
 
 /// A normalized, JSON-safe equivalent spelling for `s`, for a `Float`
@@ -671,6 +697,15 @@ pub(super) fn preservable_float_literal_text(s: &str) -> Option<String> {
         return None;
     }
     let stripped_plus = s.strip_prefix('+').unwrap_or(s);
+    // A leading dot (`.5`, `-.5`, `+.5e3`) gets the `0` JSON number syntax needs (#1356).
+    let with_zero = match stripped_plus.strip_prefix("-.") {
+        Some(rest) => format!("-0.{rest}"),
+        None => match stripped_plus.strip_prefix('.') {
+            Some(rest) => format!("0.{rest}"),
+            None => stripped_plus.to_string(),
+        },
+    };
+    let stripped_plus = with_zero.as_str();
     let (mantissa, exponent) = match stripped_plus.find(['e', 'E']) {
         Some(exp_pos) => stripped_plus.split_at(exp_pos),
         None => (stripped_plus, ""),
