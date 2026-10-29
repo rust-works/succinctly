@@ -258,3 +258,64 @@ fn test_tonumber_refuses_what_parseint64_and_parsefloat_refuse_1356() -> Result<
     }
     Ok(())
 }
+
+/// (text, `[.a | tonumber]` as yq prints it) for `a: "<text>"`: a nested integer text go-yaml would
+/// not resolve as an integer (`09`, `0x-1`, an unsigned `_1`) carries `!!int`, any other is bare.
+const NESTED_ROWS: &[(&str, &str)] = &[
+    ("_1", "- !!int _1\n"),
+    ("__1", "- !!int __1\n"),
+    ("_1_0", "- !!int _1_0\n"),
+    ("1_000", "- 1_000\n"),
+    ("1__0", "- 1__0\n"),
+    ("1_", "- 1_\n"),
+    ("0x1_0", "- 0x1_0\n"),
+    ("0o_7", "- 0o_7\n"),
+    ("0x_1", "- 0x_1\n"),
+    ("0X10", "- 0X10\n"),
+    ("0x1F", "- 0x1F\n"),
+    ("0o17", "- 0o17\n"),
+    ("09", "- !!int 09\n"),
+    ("008", "- !!int 008\n"),
+    ("-09", "- !!int -09\n"),
+    ("+09", "- !!int +09\n"),
+    ("0_9", "- !!int 0_9\n"),
+    ("07", "- 07\n"),
+    ("0_7", "- 0_7\n"),
+    ("007", "- 007\n"),
+    ("-007", "- -007\n"),
+    ("+007", "- +007\n"),
+    ("00", "- 00\n"),
+    ("0x+1", "- !!int 0x+1\n"),
+    ("0x-1", "- !!int 0x-1\n"),
+    ("0o-7", "- !!int 0o-7\n"),
+    ("0o+7", "- !!int 0o+7\n"),
+    ("-_1", "- -_1\n"),
+    ("+_1", "- +_1\n"),
+    ("-__1", "- -__1\n"),
+    ("1_0", "- 1_0\n"),
+    ("+1_0", "- +1_0\n"),
+    ("-1_0", "- -1_0\n"),
+    ("12", "- 12\n"),
+    ("+12", "- +12\n"),
+    ("-12", "- -12\n"),
+    ("0", "- 0\n"),
+    ("+0", "- +0\n"),
+    ("0_0", "- 0_0\n"),
+    ("00_7", "- 00_7\n"),
+    ("0_07", "- 0_07\n"),
+    ("0xff", "- 0xff\n"),
+    ("0XFF", "- 0XFF\n"),
+    ("0x0", "- 0x0\n"),
+    ("0x00", "- 0x00\n"),
+    ("0o0", "- 0o0\n"),
+];
+
+#[test]
+fn test_a_nested_tonumber_integer_is_tagged_when_yq_would_read_a_string_1356() -> Result<()> {
+    for (text, yaml) in NESTED_ROWS {
+        let doc = format!("a: \"{text}\"\n");
+        let (out, code) = run_yq_stdin("[.a | tonumber]", &doc, &[])?;
+        assert_eq!((out.as_str(), code), (*yaml, 0), "{text}");
+    }
+    Ok(())
+}

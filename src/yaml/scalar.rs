@@ -548,10 +548,6 @@ pub(crate) fn spelled_int_value(raw: &str) -> Option<i64> {
     {
         return None;
     }
-    let prefixed = matches!(bytes, [b'0', b'x' | b'X' | b'o', ..]);
-    if !prefixed && bytes.iter().any(|b| matches!(b, b'.' | b'e' | b'E')) {
-        return None;
-    }
     let stripped;
     let digits = if bytes.contains(&b'_') {
         stripped = raw.replace('_', "");
@@ -580,11 +576,31 @@ pub fn is_signed_prefixed_int_text(raw: &str) -> bool {
 
 /// Whether an integer literal's text reads back as a string when written nested (#3027, #1356).
 ///
-/// yq then tags it `!!int`: the `0x-10` its arithmetic writes for a negative hex or octal result,
-/// and an underscore-led text (`_1`) `tonumber` accepts.
+/// yq then tags it `!!int`. go-yaml resolves a plain scalar as an integer when
+/// `strconv.ParseInt(text without its underscores, 0, 64)` accepts it, so the text that does not
+/// is the `0x-10` its arithmetic writes for a negative hex or octal result and a decimal with
+/// zeros that is no octal number (`09`, `0_9`). So is `tonumber`'s unsigned underscore-led text
+/// (`_1`), which yq tags although the same text with its underscores removed would read.
 #[must_use]
 pub fn int_text_reads_back_as_string(raw: &str) -> bool {
-    is_signed_prefixed_int_text(raw) || raw.strip_prefix(['-', '+']).unwrap_or(raw).starts_with('_')
+    raw.starts_with('_') || !go_parse_int_base0_accepts(raw)
+}
+
+/// Whether Go's `strconv.ParseInt(s, 0, 64)` syntax accepts `raw` with its underscores removed.
+fn go_parse_int_base0_accepts(raw: &str) -> bool {
+    let stripped: Vec<u8> = raw.bytes().filter(|&b| b != b'_').collect();
+    let unsigned = match stripped.as_slice() {
+        [b'+' | b'-', rest @ ..] => rest,
+        all => all,
+    };
+    let (radix, body): (u32, &[u8]) = match unsigned {
+        [b'0', b'x' | b'X', body @ ..] => (16, body),
+        [b'0', b'o' | b'O', body @ ..] => (8, body),
+        [b'0', b'b' | b'B', body @ ..] => (2, body),
+        [b'0', body @ ..] if !body.is_empty() => (8, body),
+        body => (10, body),
+    };
+    !body.is_empty() && body.iter().all(|&b| char::from(b).is_digit(radix))
 }
 
 /// The number yq's JSON encoder writes for a literal whose text is not what it writes.
