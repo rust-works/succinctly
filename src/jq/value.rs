@@ -819,6 +819,29 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
     format_number_jq_compat_at(raw, None)
 }
 
+/// `to_json_input_bridge`'s `finite_literal` (#5491): [`format_number_jq_compat`], except a
+/// literal that overflows `f64` past decNumber's exponent limit is written as the bridge's
+/// infinity token.
+///
+/// That formatter spells such a literal as `DBL_MAX`'s display text, which is no overflow: the
+/// reparse reads it back as an ordinary finite literal that prints `E+308`, where jq prints
+/// `e+308`. The token reads back as the bare infinity, which prints as `DBL_MAX` the way jq
+/// does for a literal that has no text to keep. The check parses the literal as well as reading
+/// the text, so a finite literal cannot be turned into an infinity.
+fn input_bridge_literal_text(raw: &[u8]) -> String {
+    let text = format_number_jq_compat(raw);
+    let negative = text.starts_with('-');
+    if text == infinite_float_preview_text(negative)
+        && core::str::from_utf8(raw)
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .is_some_and(f64::is_infinite)
+    {
+        return overflow_literal_text(negative).to_string();
+    }
+    text
+}
+
 /// [`format_number_jq_compat`]'s preview-bounded twin: caps the exponent-
 /// notation mantissa at [`PREVIEW_MANTISSA_DIGIT_CAP`] digits, for
 /// [`crate::jq::stream::stream_owned_value_json_jq`] alone -- every call
@@ -4016,7 +4039,7 @@ impl OwnedValue {
     pub fn to_json_input_bridge(&self) -> String {
         self.to_json_at_depth(
             0,
-            format_number_jq_compat,
+            input_bridge_literal_text,
             jq_bare_float_display,
             overflow_literal_text,
             nan_instance_token,
