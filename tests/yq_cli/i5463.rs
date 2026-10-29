@@ -46,3 +46,21 @@ fn test_comment_only_document_across_a_64_byte_boundary_5463() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn test_alias_and_bare_null_tails_across_a_64_byte_boundary_5463() -> Result<()> {
+    for size in [63, 64, 65, 128] {
+        // `c:` with no comment, then padding as a trailing comment line.
+        let alias = format!("a: &x\nb: *x\nc: #{}\n", "y".repeat(size - 17));
+        assert_eq!(alias.len(), size);
+        let (out, code) = run_yq_stdin(".zzkey = 1", &alias, &[])?;
+        assert_eq!(code, 0, "alias, size {size}");
+        assert!(out.ends_with("zzkey: 1\n"), "alias, size {size}: {out}");
+        let bare = format!("a: 1\nc:\n#{}\n", "y".repeat(size - 10));
+        assert_eq!(bare.len(), size);
+        let (out, code) = run_yq_stdin(".zzkey = 1", &bare, &[])?;
+        assert_eq!(code, 0, "bare, size {size}");
+        assert!(out.ends_with("zzkey: 1\n"), "bare, size {size}: {out}");
+    }
+    Ok(())
+}

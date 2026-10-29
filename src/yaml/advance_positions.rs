@@ -287,6 +287,10 @@ impl AdvancePositions {
         let mut ib_ones = 0usize;
 
         for (i, &pos) in positions.iter().enumerate() {
+            debug_assert!(
+                pos as usize <= text_len,
+                "open position {pos} is past text_len {text_len}: its IB bit would be dropped"
+            );
             let is_new_position = prev_pos != Some(pos);
 
             if is_new_position {
@@ -1244,6 +1248,31 @@ mod tests {
                 assert_eq!(ap.get(i), Some(want), "get({i}) at text_len {text_len}");
             }
             assert_eq!(ap.get(positions.len()), None, "past the end at {text_len}");
+            // Backwards and out of order, so the cursor's jump paths run, not only its scan.
+            for i in (0..positions.len()).rev() {
+                assert_eq!(
+                    ap.get(i),
+                    Some(positions[i]),
+                    "reverse get({i}) at {text_len}"
+                );
+            }
+            for i in [4, 0, 3, 1, 4, 2] {
+                assert_eq!(
+                    ap.get(i),
+                    Some(positions[i]),
+                    "shuffled get({i}) at {text_len}"
+                );
+            }
+            let open = OpenPositions::build(&positions, text_len);
+            assert!(
+                open.is_compact(),
+                "monotonic positions stay compact at {text_len}"
+            );
+            assert_eq!(
+                open.get(3),
+                Some(text_len as u32),
+                "OpenPositions at {text_len}"
+            );
         }
     }
 }
