@@ -2034,28 +2034,17 @@ mod tests {
         assert!(result.ends_with("..."), "must be truncated: {result}");
     }
 
-    /// #1304: unlike the mantissa above, `assemble_scientific_from_raw_
-    /// exponent` (reached via `format_near_zero_literal` for a saturated
-    /// exponent) deliberately does *not* cap the raw exponent digit string
-    /// it echoes -- see that function's own doc comment for the measured
-    /// reasoning. Pins that `dump_truncated`'s own output still stays
-    /// bounded regardless: the echo itself is uncapped, but
-    /// `dump_truncated`'s `PreviewSink` still clamps what actually gets
-    /// kept, the same as it already does for every other value shape.
+    /// #1304/#5508: a near-zero literal with a huge saturated exponent. It
+    /// used to echo the whole exponent digit string (bounded only by
+    /// `dump_truncated`'s `PreviewSink`); jq prints it clamped to decNumber's
+    /// floor, which is short whatever the input, so nothing is left to cut.
     #[test]
     fn dump_truncated_bounds_a_near_zero_literal_with_a_huge_saturated_exponent() {
         let exponent = "9".repeat(100_000);
         let literal: Box<str> = format!("0.005e-{exponent}").into();
         let value =
             OwnedValue::NumberLiteral(super::super::value::NumberRepr::Float(0.0), literal.into());
-        let result = dump_truncated(&value);
-        assert!(
-            result.len() < 100,
-            "must not render anywhere near the full 100,000-digit exponent: got {} bytes",
-            result.len()
-        );
-        assert!(result.starts_with("5E-99999999"), "got: {result}");
-        assert!(result.ends_with("..."), "must be truncated: {result}");
+        assert_eq!(dump_truncated(&value), "0E-1147483646");
     }
 
     /// #930 review: `from_value`'s non-string branch used `OwnedValue::to_json`,
