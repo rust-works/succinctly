@@ -1131,6 +1131,54 @@ mod tests {
         ));
     }
 
+    /// #2802: only a `0x`/`0o` integer or a digit run with a `+` or a leading zero is a spelled
+    /// integer; the canonical integer, a float, an exponent form, `-0` and a prefix with nothing
+    /// valid after it are not, and the number it names is what `resolve_plain` reads.
+    #[test]
+    fn is_spelled_int_classifies_by_text_alone_2802() {
+        for (raw, number) in [
+            ("0x1f", "31"),
+            ("0X1F", ""),
+            ("0o17", "15"),
+            ("01", "1"),
+            ("007", "7"),
+            ("+5", "5"),
+            ("-007", "-7"),
+            ("00", "0"),
+            ("+0", "0"),
+        ] {
+            if number.is_empty() {
+                assert!(!is_spelled_int(raw), "{raw}");
+                continue;
+            }
+            assert!(is_spelled_int(raw), "{raw}");
+            assert_eq!(spelled_int_json_text(raw).as_deref(), Some(number), "{raw}");
+        }
+        for raw in [
+            "0",
+            "42",
+            "-7",
+            "-0",
+            "",
+            "-",
+            "+",
+            "1.5",
+            "1e3",
+            ".5",
+            "1_000",
+            "0b11",
+            "0xzz",
+            "0o9",
+            "+0x10",
+            "-0x10",
+            "99999999999999999999",
+            "abc",
+        ] {
+            assert!(!is_spelled_int(raw), "{raw}");
+            assert_eq!(spelled_int_json_text(raw), None, "{raw}");
+        }
+    }
+
     /// #1129/#4921: a `[-+]?digits` run past `i64` keeps its digits, leading
     /// zeros and a `+` included.
     #[test]

@@ -7879,6 +7879,15 @@ mod tests {
                 "{text}"
             );
         }
+        // A prefix with nothing to read after it is best-effort text, never a panic.
+        assert!(!format_number_jq_compat(b"0xzz").is_empty());
+        // The message rendering of a spelled integer is the number.
+        assert_eq!(
+            OwnedValue::NumberLiteral(NumberRepr::Int(31), "0x1f".into())
+                .number_str()
+                .as_deref(),
+            Some("31")
+        );
         // Not a prefixed integer: an exponent form and a sign keep their ordinary reading.
         assert_eq!(format_number_jq_compat(b"1e3"), "1E+3");
         assert_eq!(format_number_jq_compat(b"+5"), "5");
