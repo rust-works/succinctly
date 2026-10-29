@@ -130,6 +130,11 @@ impl ResolvedScalar {
         match self {
             Self::Null => OwnedValue::Null,
             Self::Bool(b) => OwnedValue::Bool(b),
+            // #2802: a spelled integer (`0x1f`, `0o17`, `01`, `+5`) keeps its text, as a float's
+            // `.5` or `2.0` does; the JSON writers ask for the number ([`spelled_int_json_text`]).
+            Self::Int(n) if is_spelled_int(&text) => {
+                OwnedValue::NumberLiteral(crate::jq::NumberRepr::Int(n), text.into_owned().into())
+            }
             Self::Int(n) => OwnedValue::Int(n),
             Self::Float(_) if is_preservable_float_literal(&text) => {
                 OwnedValue::from_number_literal::<YqSemantics>(&text)
@@ -501,6 +506,65 @@ pub fn overflowed_int_json_text(raw: &str) -> Option<String> {
     // Past `i64` is always past yq's scientific threshold, which is where its
     // JSON writer keeps the decimal point: `100000000000000000000.0`.
     Some(format_float_with_fraction(f))
+}
+
+/// What yq's JSON encoder writes for a spelled integer (#2802).
+///
+/// `None` when the text is already what it writes. `0x1f`, `0o17`, `01`, `007` and `+5` are
+/// the integers `31`, `15`, `1`, `7` and `5` there, but `tostring`, YAML output
+/// and the reindex bridge keep the text.
+///
+/// Mirrors [`overflowed_int_json_text`]: the text is the value's spelling, the
+/// JSON writers ask for the number.
+#[must_use]
+pub fn spelled_int_json_text(raw: &str) -> Option<String> {
+    spelled_int_value(raw).map(|n| alloc::format!("{n}"))
+}
+
+/// Whether `raw` is an integer spelled other than the way it prints ([`spelled_int_json_text`]).
+///
+/// Allocation-free, for the callers that only ask.
+#[must_use]
+pub fn is_spelled_int(raw: &str) -> bool {
+    spelled_int_value(raw).is_some()
+}
+
+/// The integer a spelled-integer text names, `None` for any other text.
+///
+/// Only a `0x`/`0o` prefix or a decimal run of digits can be one, so a float literal, an
+/// exponent form and the canonical integer (`42`, `-7`, `0`) return after a byte scan, and the
+/// prefixed forms alone reach [`resolve_plain`].
+fn spelled_int_value(raw: &str) -> Option<i64> {
+    let bytes = raw.as_bytes();
+    let unsigned = bytes
+        .strip_prefix(b"-")
+        .or_else(|| bytes.strip_prefix(b"+"))
+        .unwrap_or(bytes);
+    if matches!(unsigned, [b'0', b'x' | b'o', ..]) {
+        return match resolve_plain(raw) {
+            ResolvedScalar::Int(n) => Some(n),
+            _ => None,
+        };
+    }
+    if unsigned.is_empty() || !unsigned.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    // A leading `+` or zero is the spelling; `-0` is a float of a YAML document, not this.
+    let canonical =
+        bytes.first() != Some(&b'+') && (unsigned == b"0" || unsigned[0] != b'0') && raw != "-0";
+    if canonical || raw == "-0" {
+        return None;
+    }
+    raw.parse::<i64>().ok()
+}
+
+/// The number yq's JSON encoder writes for a literal whose text is not what it writes.
+///
+/// An integer past `i64` ([`overflowed_int_json_text`]) or a spelled one
+/// ([`spelled_int_json_text`]). `None` for every literal that is echoed.
+#[must_use]
+pub fn yq_json_number_text(raw: &str) -> Option<String> {
+    overflowed_int_json_text(raw).or_else(|| spelled_int_json_text(raw))
 }
 
 /// A normalized, JSON-safe equivalent spelling for `s`, for a `Float`
@@ -1065,6 +1129,54 @@ mod tests {
         assert!(!is_preservable_float_literal(
             "123456789012345678901234567890"
         ));
+    }
+
+    /// #2802: only a `0x`/`0o` integer or a digit run with a `+` or a leading zero is a spelled
+    /// integer; the canonical integer, a float, an exponent form, `-0` and a prefix with nothing
+    /// valid after it are not, and the number it names is what `resolve_plain` reads.
+    #[test]
+    fn is_spelled_int_classifies_by_text_alone_2802() {
+        for (raw, number) in [
+            ("0x1f", "31"),
+            ("0X1F", ""),
+            ("0o17", "15"),
+            ("01", "1"),
+            ("007", "7"),
+            ("+5", "5"),
+            ("-007", "-7"),
+            ("00", "0"),
+            ("+0", "0"),
+        ] {
+            if number.is_empty() {
+                assert!(!is_spelled_int(raw), "{raw}");
+                continue;
+            }
+            assert!(is_spelled_int(raw), "{raw}");
+            assert_eq!(spelled_int_json_text(raw).as_deref(), Some(number), "{raw}");
+        }
+        for raw in [
+            "0",
+            "42",
+            "-7",
+            "-0",
+            "",
+            "-",
+            "+",
+            "1.5",
+            "1e3",
+            ".5",
+            "1_000",
+            "0b11",
+            "0xzz",
+            "0o9",
+            "+0x10",
+            "-0x10",
+            "99999999999999999999",
+            "abc",
+        ] {
+            assert!(!is_spelled_int(raw), "{raw}");
+            assert_eq!(spelled_int_json_text(raw), None, "{raw}");
+        }
     }
 
     /// #1129/#4921: a `[-+]?digits` run past `i64` keeps its digits, leading

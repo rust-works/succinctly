@@ -7972,10 +7972,13 @@ fn output_value<W: Write>(
         }
         // #1129: `-r` writes a scalar's own text, not its JSON encoding, so an
         // integer too big for `i64` prints its digits (`-r -o=json '.a'` is
-        // `99999999999999999999`) where the JSON writer would round it.
+        // `99999999999999999999`) where the JSON writer would round it. A spelled
+        // integer prints its text the same way (`0x1f`, #2802).
         if config.output_format == OutputFormat::Json {
             if let OwnedValue::NumberLiteral(_, literal) = value {
-                if succinctly::yaml::overflowed_int_json_text(literal).is_some() {
+                if succinctly::yaml::overflowed_int_json_text(literal).is_some()
+                    || succinctly::yaml::is_spelled_int(literal)
+                {
                     write_pending_separator(writer, separator, terminator_from_config(config))?;
                     write!(writer, "{literal}")?;
                     write_terminator(writer, config)?;
@@ -9324,10 +9327,9 @@ fn spelling_names_value(spelling: &str, value: &OwnedValue) -> bool {
     match (resolve_plain_sourced(spelling, false), value) {
         (ResolvedScalar::Null, OwnedValue::Null) => true,
         (ResolvedScalar::Bool(a), OwnedValue::Bool(b)) => a == *b,
-        (
-            ResolvedScalar::Int(a),
-            OwnedValue::Int(b) | OwnedValue::NumberLiteral(NumberRepr::Int(b), _),
-        ) => a == *b,
+        // A spelled integer is a literal (#2802); a bare `Int` is a computed one, which yq
+        // prints canonically wherever it lands (`.a = (.f + 0)` over `a: 0x1f` is `a: 31`).
+        (ResolvedScalar::Int(a), OwnedValue::NumberLiteral(NumberRepr::Int(b), _)) => a == *b,
         (
             ResolvedScalar::Float(a),
             OwnedValue::Float(b) | OwnedValue::NumberLiteral(NumberRepr::Float(b), _),

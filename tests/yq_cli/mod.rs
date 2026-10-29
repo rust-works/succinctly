@@ -34,6 +34,7 @@ mod i2513;
 mod i2650;
 mod i2679;
 mod i2789;
+mod i2802;
 mod i2810;
 mod i2835;
 mod i2839;

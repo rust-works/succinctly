@@ -759,7 +759,7 @@ fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> 
                         // #1129: but an integer past `i64` is encoded as the
                         // double yq parsed, where its text is what `tostring`
                         // and YAML output echo.
-                        _ => succinctly::yaml::overflowed_int_json_text(literal)
+                        _ => succinctly::yaml::yq_json_number_text(literal)
                             .unwrap_or_else(|| literal.to_string()),
                     },
                     // jq's default: `format_number_jq_compat`'s reformatting,

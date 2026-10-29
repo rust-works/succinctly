@@ -3036,7 +3036,18 @@ impl<'a> JsonNumber<'a> {
     pub fn as_i64(&self) -> Result<i64, JsonError> {
         let bytes = self.raw_bytes();
         let s = core::str::from_utf8(bytes).map_err(|_| JsonError::InvalidUtf8)?;
-        s.parse().map_err(|_| JsonError::InvalidNumber)
+        s.parse()
+            .or_else(|_| self.bridge_spelled_int().ok_or(JsonError::InvalidNumber))
+    }
+
+    /// The integer a bridge spelling token names (`0x1f` is 31), for an index built over bridge
+    /// text; `None` for any other span and for a spelling that is no integer (#2802).
+    #[inline]
+    pub(crate) fn bridge_spelled_int(&self) -> Option<i64> {
+        match crate::yaml::resolve_plain(&self.bridge_spelling()?) {
+            crate::yaml::ResolvedScalar::Int(n) => Some(n),
+            _ => None,
+        }
     }
 
     /// The value this span stands for if it is one of the reindex bridge's
@@ -3201,6 +3212,8 @@ impl<'a> JsonNumber<'a> {
         let s = core::str::from_utf8(bytes).map_err(|_| JsonError::InvalidUtf8)?;
         s.parse().or_else(|_| {
             self.bridge_value()
+                // #2802: the number a spelled integer names.
+                .or_else(|| self.bridge_spelled_int().map(|n| n as f64))
                 .or_else(|| crate::json::validate::jq_special_number(bytes))
                 .ok_or(JsonError::InvalidNumber)
         })
@@ -10114,7 +10127,13 @@ mod tests {
             assert_eq!(n.bridge_nonfinite(), None, "{token}");
             assert_eq!(n.bridge_nonfinite_literal(), None, "{token}");
             assert_eq!(n.token_address(), None, "{token}");
-            assert_eq!(n.as_f64(), Err(JsonError::InvalidNumber), "{token}");
+            // The number a spelled integer names, and nothing for a spelling that is no number.
+            let named = match crate::yaml::resolve_plain(spelling) {
+                crate::yaml::ResolvedScalar::Int(i) => Some(i),
+                _ => None,
+            };
+            assert_eq!(n.as_i64().ok(), named, "{token}");
+            assert_eq!(n.as_f64().ok(), named.map(|i| i as f64), "{token}");
             let number: StandardJson<'_, Vec<u64>> = StandardJson::Number(n);
             assert_eq!(
                 number.number_literal().as_deref(),

@@ -5191,7 +5191,9 @@ its text (`numeric_display_string`, so `==` and `tostring` agree about a compute
   value prints, and is printed only while it still resolves to the node's value, so a node a
   write replaces takes the new value's text (`b: 0xff` written `5` is `5`). Checked against
   yq v4.53.3 on ~3,000 random documents plus a sweep of 2,178 real YAML files. It does not
-  touch #2802's *read* side (`tostring`, `==`, keys), listed below. A closed literal written
+  touch #2802's *read* side (`==`, keys), listed below.
+  An integer's `tostring` has kept its spelling since #2802's integer slice.
+  A closed literal written
   over a node (`.a = true` over `True`) brings its own text, as in yq; `style = "double"` and
   `"single"` quote the spelling (`"~"`, `"0x1F"`). Not matched:
   - arithmetic on a hex or octal integer keeps its base in yq (`0xff + 1` is `0x100`, #3027);
@@ -5209,10 +5211,11 @@ its text (`numeric_display_string`, so `==` and `tostring` agree about a compute
   - an empty value inside a flow collection (`{x: , y: 1}`) prints `null` where yq prints `''`.
 - **Spellings `OwnedValue` cannot keep** ([#2802](https://github.com/rust-works/succinctly/issues/2802)):
   `True == "true"` and `!!bool "yes" == true` are `true` here (yq `false`, its text is
-  `True`/`yes`), `"~" == null` is `true` here (yq `false`), and a leading-zero, hex or
-  underscored integer compares by its resolved decimal text (`1 == 01` is `true` here,
-  `false` in yq). Every one of these already shows in `tostring`. So does `split` by such
-  a separator (#4263): `sep: 0x10` splits on `16`, yq on `0x10`.
+  `True`/`yes`), and `"~" == null` is `true` here (yq `false`).
+  Every one of these already shows in `tostring`.
+  An integer of a *document* written `0x1f`, `0o17`, `01`, `+5` or `007` keeps its spelling since the integer slice of #2802, so `==`, `tostring`, `join`, `sort`, `unique` and `split` by such a separator (#4263) read its text as yq does (`.a == 31` on `a: 0x1f` is `false`).
+  The same integer written as a filter literal still compares by value here (`1 == 01` is `true`, `false` in yq).
+  An underscored integer (`1_000`) is a string here, the recorded input-spec divergence.
 - **`split`'s separator literals** ([#4374](https://github.com/rust-works/succinctly/issues/4374)):
   the `{}` literal splits on the text `{}` as in yq (`"a{}b" | split({})` is `["a","b"]`), recognised
   syntactically, so a form that merely *evaluates* to it (`{} | .`, `{}?`, `first({})`, `{} // 1`)
@@ -5268,10 +5271,9 @@ untouched. The key is `tostring`'s text, so `==` and `unique` agree about a numb
   gives `.anch | unique | length` of `3` in yq and `1` here (`group_by(.) | length` is `2` there and
   `1` here). Aliases are resolved before the key is built, so the identity is gone.
 - **Spellings `OwnedValue` cannot keep** ([#2802](https://github.com/rust-works/succinctly/issues/2802)):
-  the text a `01`, `0x1f` or `True` keys on is its resolved text here, in a document and as a
-  filter literal alike (`[01, 1] | unique` is `[1]` here and `[1,1]` in yq; a document
-  `[01, 1, 0x1f, 31, True, true] | unique` has 3 elements here and 6 in yq), the same residual
-  `==` has.
+  the text a `True` keys on is its resolved text here, as is a `01` or `0x1f` written as a filter literal (`[01, 1] | unique` is `[1]` here and `[1,1]` in yq).
+  A document `[01, 1, 0x1f, 31, True, true] | unique` has 5 elements here and 6 in yq: its integers key on their text since the integer slice of #2802, the `True` does not.
+  The same residual `==` has.
 - **Cost.** yq mode builds one `String` key per element and probes a hashed `IndexSet`/`IndexMap`
   where it used to sort values in place. Interleaved A/B against `main`, release builds, minimum of
   9 runs, 1M-element arrays (`yq '.a | unique | length'` and friends on 5-10 MB documents; the
@@ -5350,7 +5352,8 @@ position and then by length, as `sort_by(.a, .b)` is in yq. jq mode is untouched
   mapping's `sort_by` read their keys the same way (`by_key_scope`; the cursor route enters it around
   `sort_family_array_generic`). The gated `min_by`/`max_by` extensions follow jq and read the absent key as `null`.
 - **Spellings `OwnedValue` cannot keep** ([#2802](https://github.com/rust-works/succinctly/issues/2802)):
-  a leading-zero, hex or underscored integer sorts by its resolved value here.
+  an underscored integer (`1_000`) is a string here and sorts after the numbers, where yq reads it as `1000` (the recorded input-spec divergence).
+  A leading-zero, hex or octal integer of a document sorts by its value as in yq, and the node it returns keeps its spelling.
 - **A mapping** (#2064, #4386). yq's `sort` and `sort_by(f)` reorder a mapping's entries by their
   values and answer a mapping, as `sort_by` does an array; so does this build, with the same
   comparator and the same stable sort. The result is an owned mapping, which carries no
