@@ -2491,6 +2491,23 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// jq's `check_object_key` (#3018, #5501): the compile error for an object or pattern key
+    /// that [`Self::const_fold_pattern_key`] reduces to something other than a string, or
+    /// `None` for a string or a key left to run time.
+    fn constant_key_error<S: EvalSemantics>(
+        key_expr: &Expr,
+        key_start: usize,
+    ) -> Option<ParseError> {
+        let value = Self::const_fold_pattern_key::<S>(key_expr)?;
+        if matches!(value, OwnedValue::String(_)) {
+            return None;
+        }
+        Some(ParseError::new(
+            EvalError::cannot_use_as_object_key(&value).message,
+            key_start,
+        ))
+    }
+
     /// Whether jq compiles `expr` to an empty block (`.`, however parenthesised).
     fn is_noop_block(expr: &Expr) -> bool {
         match expr {
@@ -2917,16 +2934,8 @@ impl<'a> Parser<'a> {
                         // reaches the evaluator's runtime verdict. The verdict waits for
                         // the `:`: a key with no pair is jq's syntax error first.
                         if self.mode == ParserMode::Jq {
-                            if let Some(value) =
-                                Self::const_fold_pattern_key::<JqSemantics>(&key_expr)
-                            {
-                                if !matches!(value, OwnedValue::String(_)) {
-                                    constant_key_error = Some(ParseError::new(
-                                        EvalError::cannot_use_as_object_key(&value).message,
-                                        key_start,
-                                    ));
-                                }
-                            }
+                            constant_key_error =
+                                Self::constant_key_error::<JqSemantics>(&key_expr, key_start);
                         }
                         (ObjectKey::Expr(Box::new(key_expr)), None)
                     } else if let Some(key_string) = self.try_parse_interpolated_key()? {
@@ -5293,21 +5302,16 @@ impl<'a> Parser<'a> {
                             // (#5501, `parse_object_construction`): yq
                             // stringifies a number key, so yq mode keeps its
                             // runtime verdict.
-                            let folded = match self.mode {
+                            let refused = match self.mode {
                                 ParserMode::Jq => {
-                                    Self::const_fold_pattern_key::<JqSemantics>(&key_expr)
+                                    Self::constant_key_error::<JqSemantics>(&key_expr, key_start)
                                 }
                                 ParserMode::Yq => {
-                                    Self::const_fold_pattern_key::<YqSemantics>(&key_expr)
+                                    Self::constant_key_error::<YqSemantics>(&key_expr, key_start)
                                 }
                             };
-                            if let Some(value) = folded {
-                                if !matches!(value, OwnedValue::String(_)) {
-                                    return Err(ParseError::new(
-                                        EvalError::cannot_use_as_object_key(&value).message,
-                                        key_start,
-                                    ));
-                                }
+                            if let Some(error) = refused {
+                                return Err(error);
                             }
                             ObjectKey::Expr(Box::new(key_expr))
                         } else if self.peek() == Some('"') {
@@ -11741,6 +11745,11 @@ mod tests {
         assert_eq!(err.message, "Cannot use number (1) as object key");
         let err = parse_program_with_mode(". as {(1): $x} | .", ParserMode::Yq).unwrap_err();
         assert!(err.message.contains("--jq-extensions"), "{}", err.message);
+        // #5501: the pipe-of-a-constant rule reaches the yq-mode fold too.
+        let err =
+            parse_program_with_mode_and_extensions(". as {(1|.): $x} | .", ParserMode::Yq, true)
+                .unwrap_err();
+        assert_eq!(err.message, "Cannot use number (1) as object key");
 
         // Accept (parses for runtime evaluation): string constants and
         // genuinely computed keys -- a *string* const destructures by the
