@@ -86074,6 +86074,25 @@ fn delete_paths_under<S: EvalSemantics>(
     }
 }
 
+/// The largest index of a `del()` batch made only of plain non-negative index keys, for
+/// [`delete_keys`]'s padding rule (#4749); `None` when any key is a slice, a string, a negative
+/// number or NaN, since such a batch resolves order-dependently in yq and keeps the old path.
+///
+/// A finite non-negative number truncates toward zero; one past `usize` saturates and is refused
+/// by the padding as any other absurd index is.
+fn highest_plain_index(keys: &[&OwnedValue]) -> Option<usize> {
+    let mut highest = 0usize;
+    for key in keys {
+        let plain = matches!(
+            key,
+            OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)
+        );
+        let number = key.as_f64().filter(|f| plain && *f >= 0.0)?;
+        highest = highest.max(number as usize);
+    }
+    Some(highest)
+}
+
 /// jq's `jv_dels`: remove every key in `keys` from one container in a single
 /// pass. Keys naming nothing are ignored, and every array index resolves
 /// against the length the array had on entry, so one deletion cannot shift the
@@ -86160,8 +86179,10 @@ fn delete_keys(
             // #2305: a *single*-key batch's own positive-out-of-range index
             // gets the same null-extension `delete_at_path`'s `Expr::Index`
             // arm does (`delpaths([[5]])` on `[1,2]` matches `del(.[5])`
-            // exactly, confirmed live) -- gated on `keys.len() == 1`
-            // deliberately, not extended to a multi-key batch: real yq's
+            // exactly, confirmed live) -- the `single_key_oob_target` below
+            // is gated on `keys.len() == 1` deliberately, and a multi-key
+            // batch of plain indices is padded up front instead (#4749,
+            // `highest_plain_index`). For any other multi-key batch: real yq's
             // own multi-key `delpaths()` batch is order-*dependent*
             // (`delpaths([[0],[5]])` vs `delpaths([[5],[0]])` on the same
             // `[1,2,3]` give *different* results, 5 vs 4 elements), which
@@ -86173,8 +86194,23 @@ fn delete_keys(
             // here is now only ever jq mode (unaffected: real jq's own
             // `delpaths` genuinely is order-independent) or `del()`'s own
             // comma-separated multi-target form, which still reaches here
-            // batched and still has this same gap (#2306's own "still
-            // open" note).
+            // batched. For a batch of plain non-negative indices that form
+            // is closed (#4749, below); a negative index or a slice in the
+            // batch is still the open part of #2306's "still open" note.
+            // #4749: yq deletes a batch of plain indices highest first, and pads the array to
+            // an index it reaches past the end of: `del(.[5], .[7])` on three elements is
+            // `[10,20,30,null,null,null]` (pad to 7, then drop index 5), whatever order the paths
+            // come in, and `del(.[5], .[0])` is `[20,30,null,null]`. Distinct indices never
+            // disturb one another when taken highest first, so padding once to the largest and
+            // then taking the single `retain` pass below deletes the same elements. A negative
+            // key or a slice in the batch resolves order-dependently in yq and keeps the old
+            // behaviour. (A repeated index deletes again in yq, where this deletes once: the
+            // delete trie collapses a repeated path before it gets here.)
+            if yq_mode && keys.len() > 1 {
+                if let Some(highest) = highest_plain_index(keys) {
+                    extend_array_with_nulls_for_delete(&mut arr, highest)?;
+                }
+            }
             let mut indices: Vec<usize> = vec_with_capacity(keys.len());
             let mut single_key_oob_target: Option<usize> = None;
             for key in keys {

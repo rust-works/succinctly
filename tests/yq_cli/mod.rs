@@ -57,6 +57,7 @@ mod i4386;
 mod i4461;
 mod i4476;
 mod i4646;
+mod i4749;
 mod i4851;
 mod i4856;
 mod i4865;
