@@ -85172,6 +85172,13 @@ fn cannot_grow_array(len: u64) -> EvalError {
     EvalError::new(format!("Cannot grow array to {len} elements"))
 }
 
+/// The longest array an index write grows one to: `INT_MAX >> 2` elements plus
+/// one, the bound jq 1.8 puts on `jv_array_set` (`Array index too large`) and
+/// that jq 1.7.1 lacks (#5500). 1.7.1 answers `.[536870912] = 1` and dies from
+/// `.[2147483647] = 1`, so every index it survives up to this bound still
+/// pads here.
+pub(crate) const MAX_PADDED_ARRAY_LEN: usize = 536_870_912;
+
 /// Pad `arr` with nulls until `index` is a valid element, reporting a failure
 /// the caller can catch.
 ///
@@ -85191,6 +85198,12 @@ fn pad_with_nulls(arr: &mut Vec<OwnedValue>, index: usize) -> Result<(), EvalErr
     let len = index
         .checked_add(1)
         .ok_or_else(|| cannot_grow_array(index as u64 + 1))?;
+    // `try_reserve` alone does not stop `.[1e12] = 1`: the address space it
+    // asks for is reservable on a 64-bit target, and `resize` then spends its
+    // time (or the host's memory) writing 1e12 nulls (#5500).
+    if len > MAX_PADDED_ARRAY_LEN {
+        return Err(cannot_grow_array(len as u64));
+    }
     arr.try_reserve(len - arr.len())
         .map_err(|_| cannot_grow_array(len as u64))?;
     // #1670: already guarded -- `try_reserve` above already proved the
@@ -129274,6 +129287,19 @@ mod tests {
     ///
     /// The message is matched by prefix because it names the requested length,
     /// which differs by word size.
+    #[test]
+    fn test_pad_with_nulls_refuses_past_the_bound_without_allocating_5500() {
+        let mut arr = vec![OwnedValue::Null];
+        let err = pad_with_nulls(&mut arr, MAX_PADDED_ARRAY_LEN).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("Cannot grow array to {} elements", MAX_PADDED_ARRAY_LEN + 1)
+        );
+        assert_eq!(arr.len(), 1);
+        assert!(pad_with_nulls(&mut arr, 4).is_ok());
+        assert_eq!(arr.len(), 5);
+    }
+
     #[test]
     fn test_setpath_refuses_a_length_it_cannot_allocate() {
         let err = outcome(b"null", "setpath([1e30]; 9)").unwrap_err();
