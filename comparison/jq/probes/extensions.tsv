@@ -1,0 +1,8 @@
+# succinctly-only surface: the reference must reject each and succinctly accept it
+# id	area	args (JSON array)	stdin (JSON string, - for none)
+at-offset	extension	["-c", "at_offset(10)"]	"{\"name\": \"Alice\", \"age\": 30}"
+at-position	extension	["-c", "at_position(1; 1)"]	"{\"name\": \"Alice\"}"
+leaf-paths	extension	["-c", "leaf_paths"]	"{\"a\": {\"b\": 1, \"c\": null}, \"d\": []}"
+dsv-format	extension	["-r", "@dsv(\"|\")"]	"[\"a\",\"b\"]"
+input-dsv	extension	["--input-dsv", ",", "-c", "."]	"a,b\n1,2\n"
+validate	extension	["--validate", "-c", "."]	"{\"a\":1}"

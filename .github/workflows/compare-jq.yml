@@ -1,0 +1,47 @@
+name: Compare jq
+
+# `succinctly dev compare jq --quick` on x86_64 and ARM64 Linux (#5409): builds the
+# pinned jq 1.7.1 and 1.8.1 from source (sha256-verified), runs every dimension, and
+# uploads the report and results.json. It is not a required check and does not run on
+# pull requests: shared runners are too noisy for the timing rows, and the divergence
+# ledger is recorded on macOS, so entries that only hold there are tagged `platform`
+# and a first Linux run may list further ones. Run it by hand, or on a release.
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compare-jq-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  compare:
+    name: Compare (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the pinned references
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+          scripts/compare-jq-build.sh 1.7.1
+          scripts/compare-jq-build.sh 1.8.1
+      - name: Build succinctly (the manifest's feature set)
+        run: cargo build --release --features cli,simd,regex,serde,bench-runner
+      - name: Compare
+        run: ./target/release/succinctly dev compare jq --quick --out data/compare/ci
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: compare-jq-${{ matrix.runner }}
+          path: data/compare/ci

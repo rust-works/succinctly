@@ -1,0 +1,137 @@
+# id	area	args (JSON array)	stdin (JSON string, - for none)
+compact	output	["-c", "."]	"{\"a\":[1,2]}"
+raw-output	output	["-r", ".a"]	"{\"a\":\"x y\"}"
+join-output	output	["-j", ".[]"]	"[\"a\",\"b\"]"
+raw-output0	output	["--raw-output0", ".[]"]	"[\"a\",\"b\"]"
+ascii-output	output	["-a", "."]	"\"é☃\""
+sort-keys	output	["-S", "-c", "."]	"{\"b\":1,\"a\":{\"d\":1,\"c\":2}}"
+indent-1	output	["--indent", "1", "."]	"{\"a\":[1]}"
+indent-0	output	["--indent", "0", "."]	"{\"a\":[1]}"
+indent-7	output	["--indent", "7", "."]	"{\"a\":[1]}"
+indent-8-error	output	["--indent", "8", "."]	"1"
+tab	output	["--tab", "."]	"{\"a\":[1]}"
+color	output	["-C", "-c", "."]	"{\"a\":[1,\"x\",null,true]}"
+color-pretty	output	["-C", "."]	"{\"a\":[1,\"x\",null,true]}"
+monochrome	output	["-M", "."]	"{\"a\":1}"
+jq-colors	output	["-C", "-c", "."]	"[null]"
+unbuffered	output	["--unbuffered", "-c", "."]	"1 2"
+seq-output	output	["--seq", "-c", "."]	"[1]"
+null-input	input	["-n", "1+1"]	-
+raw-input	input	["-R", "."]	"a\nb\n"
+raw-input-no-newline	input	["-R", "."]	"a\nb"
+raw-input-slurp	input	["-R", "-s", "."]	"a\nb\n"
+slurp	input	["-s", "-c", "."]	"1 2 3"
+slurp-empty	input	["-s", "-c", "."]	""
+slurp-null-input	input	["-n", "-s", "-c", "[inputs]"]	"1 2"
+null-input-inputs	input	["-n", "-c", "[inputs]"]	"1 2 3"
+null-input-input	input	["-n", "input"]	"7 8"
+input-empty-error	input	["-n", "input"]	""
+multiple-values	input	["-c", "."]	"1 [2] {\"a\":3} \"s\" null"
+ndjson	input	["-c", "."]	"{\"a\":1}\n{\"a\":2}\n"
+concatenated	input	["-c", "."]	"[1][2]{\"a\":3}"
+truncated	input	["-c", "."]	"{\"a\":"
+trailing-garbage	input	["-c", "."]	"1 x"
+empty-stdin	input	["."]	""
+bom	input	["-c", "."]	"﻿{\"a\":1}"
+seq-input	input	["--seq", "-c", "."]	"\u001e[1]\n\u001e[2]\n"
+stream	input	["--stream", "-c", "."]	"{\"a\":[1,{\"b\":2}]}"
+stream-scalar	input	["--stream", "-c", "."]	"3"
+stream-empty-containers	input	["--stream", "-c", "."]	"[[],{}]"
+stream-errors	input	["--stream-errors", "-c", "."]	"[1,"
+stream-slurp	input	["--stream", "-s", "-c", "."]	"[1,2]"
+stream-null-input	input	["--stream", "-n", "-c", "[inputs]"]	"[1,2]"
+exit-status-false	exit	["-e", "."]	"false"
+exit-status-null	exit	["-e", "."]	"null"
+exit-status-true	exit	["-e", "."]	"1"
+exit-status-empty	exit	["-e", "empty"]	"1"
+exit-status-last	exit	["-e", ".[]"]	"[1,null]"
+exit-error-5	exit	["error"]	"\"x\""
+exit-compile-3	exit	["{"]	"1"
+exit-halt	exit	["-n", "halt"]	-
+exit-halt-error	exit	["-n", "\"bye\\n\"|halt_error"]	-
+exit-halt-error-code	exit	["-n", "{} | halt_error(7)"]	-
+exit-halt-error-object	exit	["-n", "{a:1}|halt_error"]	-
+exit-input-invalid-2	exit	["."]	"{"
+exit-no-program-2	exit	[]	"1"
+exit-bad-flag-2	exit	["--no-such-flag", "."]	"1"
+exit-missing-file-2	exit	[".", "no-such-file.json"]	-
+exit-partial-then-error	exit	["-c", ".[] | if . == 2 then error(\"boom\") else . end"]	"[1,2,3]"
+exit-error-continues	exit	["-c", ".a"]	"1 {\"a\":2}"
+arg	vars	["-n", "-c", "--arg", "x", "1", "$x"]	-
+argjson	vars	["-n", "-c", "--argjson", "x", "{\"a\":1}", "$x"]	-
+argjson-invalid	vars	["-n", "--argjson", "x", "{", "$x"]	-
+arg-named	vars	["-n", "-c", "$ARGS.named", "--arg", "a", "1", "--argjson", "b", "2"]	-
+args	vars	["-n", "-c", "$ARGS", "--args", "a", "b"]	-
+jsonargs	vars	["-n", "-c", "$ARGS", "--jsonargs", "1", "{\"a\":2}"]	-
+jsonargs-invalid	vars	["-n", "-c", "$ARGS", "--jsonargs", "{"]	-
+args-then-jsonargs	vars	["-n", "-c", "$ARGS.positional", "--args", "a", "--jsonargs", "1"]	-
+positional-dollar	vars	["-n", "-c", "$__prog_args"]	-
+slurpfile	vars	["-n", "-c", "--slurpfile", "x", "data2.json", "$x"]	-
+rawfile	vars	["-n", "-c", "--rawfile", "x", "raw.txt", "$x"]	-
+slurpfile-missing	vars	["-n", "--slurpfile", "x", "nope.json", "$x"]	-
+env-var	vars	["-n", "-c", "$ENV|type"]	-
+env-tz	vars	["-n", "-r", "env.TZ"]	-
+env-path-type	vars	["-n", "-r", "$ENV.PATH|type"]	-
+undefined-var	vars	["-n", "$nope"]	-
+prog-file	program	["-f", "prog.jq", "data.json"]	-
+prog-file-from-file	program	["--from-file", "prog.jq"]	"{\"a\":9}"
+prog-file-positional-input	program	["-f", "prog.jq"]	"{\"a\":5}"
+prog-file-missing	program	["-f", "nope.jq"]	"1"
+library-path	program	["-n", "-L", "mod", "-c", "include \"lib\"; 1|inc"]	-
+library-path-import	program	["-n", "-L", "mod", "-c", "import \"lib\" as l; 1|l::inc"]	-
+library-path-data	program	["-n", "-L", "mod", "-c", "import \"meta\" as $m; $m"]	-
+library-path-missing	program	["-n", "-c", "include \"lib\"; 1"]	-
+modulemeta	program	["-n", "-L", "mod", "-c", "\"lib\"|modulemeta"]	-
+get-search-list	program	["-n", "-L", "mod", "-c", "get_search_list"]	-
+files-multiple	files	["-c", ".a", "data.json", "data2.json"]	-
+files-input-filename	files	["-c", "[.a,input_filename]", "data.json", "data2.json"]	-
+files-slurp	files	["-s", "-c", ".", "data.json", "data2.json"]	-
+files-missing-continues	files	["-c", ".a", "nope.json", "data.json"]	-
+files-raw	files	["-R", ".", "raw.txt"]	-
+files-line-number	files	["-c", "[input_line_number,.a]", "data2.json"]	-
+stdin-filename	files	["-c", "input_filename"]	"1"
+stdin-dash-file	files	["-c", "."]	"1"
+double-dash	flags	["-c", "--", "."]	"1"
+double-dash-file	flags	["-c", "--", ".a", "data.json"]	-
+combined-short	flags	["-nr", "\"a\""]	-
+combined-short-sc	flags	["-sc", "."]	"1 2"
+short-file-order	flags	[".a", "-c", "data.json"]	-
+long-compact	flags	["--compact-output", "."]	"[1]"
+long-raw	flags	["--raw-output", "."]	"\"a\""
+long-slurp	flags	["--slurp", "-c", "."]	"1 2"
+long-null	flags	["--null-input", "1"]	-
+long-sort	flags	["--sort-keys", "-c", "."]	"{\"b\":1,\"a\":2}"
+long-exit	flags	["--exit-status", "."]	"false"
+long-join	flags	["--join-output", "."]	"\"a\""
+long-ascii	flags	["--ascii-output", "."]	"\"é\""
+long-color	flags	["--color-output", "-c", "."]	"1"
+long-mono	flags	["--monochrome-output", "."]	"1"
+long-raw-input	flags	["--raw-input", "."]	"a\n"
+long-seq	flags	["--seq", "."]	"1"
+long-binary	flags	["-b", "."]	"1"
+long-tab	flags	["--tab", "."]	"[1]"
+long-nul-output	flags	["--nul-output", "."]	"\"a\""
+version	meta	["--version"]	-
+help-exit	meta	["-h"]	-
+help-long-exit	meta	["--help"]	-
+build-configuration	meta	["--build-configuration"]	-
+debug-dump-disasm	meta	["--debug-dump-disasm", "."]	"1"
+debug-trace	meta	["--debug-trace", "."]	"1"
+debug-stderr-passthrough	meta	["-c", "debug"]	"1"
+stderr-builtin	meta	["-c", "stderr"]	"1"
+input-line-number	meta	["-c", "[., input_line_number]"]	"1\n2\n"
+locale-sort	meta	["-c", "sort"]	"[\"b\",\"a\",\"B\",\"A\"]"
+locale-ascii-downcase	meta	["-c", "ascii_downcase"]	"\"ÀB\""
+sigpipe-head	pipe	["-n", "range(100000)"]	-
+stdin-large-number	numbers	["-c", "."]	"[100000000000000000000, 1.000000000000000000001, 1e1000, -1e1000, 0.1]"
+literal-preserved	numbers	["-c", "."]	"[1.0, 1.10, 100e-2, 1E2, 3.0e0]"
+literal-arith	numbers	["-c", ".[0]+0"]	"[100000000000000000000]"
+literal-tojson	numbers	["-c", "map(tojson)"]	"[1.0, 100000000000000000000, 1.5e300]"
+nan-input	numbers	["-c", "."]	"[nan, NaN, -nan]"
+infinity-input	numbers	["-c", "."]	"[Infinity, -Infinity]"
+nan-sort	numbers	["-c", "sort"]	"[1, 2]"
+big-int-arg	numbers	["-n", "-c", "--argjson", "x", "100000000000000000000", "$x"]	-
+tostring-float	numbers	["-c", "map(tostring)"]	"[1.0, 0.1, 1e100, 1e-5, 3.14159265358979323846]"
+seventeen-digits	numbers	["-c", "."]	"[0.1, 0.30000000000000004, 1.7976931348623157e308]"
+negative-zero	numbers	["-c", "."]	"[-0, -0.0, 0]"
+int-division	numbers	["-n", "-c", "[5/2, 1e1000, -1e1000, infinite, -infinite, nan]"]	-

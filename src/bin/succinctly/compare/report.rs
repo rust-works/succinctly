@@ -1,6 +1,10 @@
 //! `report.md`, generated from the results (#5409). Never hand-edited.
 
+use super::cli;
+use super::features::{FeatureSummary, Status};
 use super::harness::{Row, Verdict};
+use super::perf::{Gate, PerfRow};
+use super::robust;
 use super::Results;
 use std::fmt::Write;
 
@@ -23,6 +27,9 @@ pub fn render(results: &Results) -> String {
         e.git.commit_short,
         if e.git.dirty { " (dirty)" } else { "" },
     );
+    if r.command.contains("--control") {
+        let _ = writeln!(s, "> **CONTROL RUN:** the subject is jq itself, so every ratio shows the harness's noise floor, not a comparison.\n");
+    }
     if !e.invalid_reasons.is_empty() {
         let _ = writeln!(s, "> **INVALID RUN — do not quote the timings:**");
         for why in &e.invalid_reasons {
@@ -42,19 +49,131 @@ pub fn render(results: &Results) -> String {
     let _ = writeln!(s, "| Metric                      | Value |");
     let _ = writeln!(s, "|-----------------------------|-------|");
     let _ = writeln!(s, "| Reference                   | {} |", e.jq_version);
-    let _ = writeln!(s, "| Smoke differential pass     | {matched}/{total} |");
-    match geomean(&speedups) {
-        Some(g) => {
-            let lo = speedups.iter().copied().fold(f64::MAX, f64::min);
-            let hi = speedups.iter().copied().fold(f64::MIN, f64::max);
+    if total > 0 {
+        let _ = writeln!(s, "| Smoke differential pass     | {matched}/{total} |");
+        match geomean(&speedups) {
+            Some(g) => {
+                let lo = speedups.iter().copied().fold(f64::MAX, f64::min);
+                let hi = speedups.iter().copied().fold(f64::MIN, f64::max);
+                let _ = writeln!(
+                    s,
+                    "| Smoke geomean speedup       | {g:.2}x ({lo:.2}x–{hi:.2}x) |"
+                );
+            }
+            None => {
+                let _ = writeln!(s, "| Smoke geomean speedup       | n/a |");
+            }
+        }
+        if let Some(f) = &r.features {
             let _ = writeln!(
                 s,
-                "| Smoke geomean speedup       | {g:.2}x ({lo:.2}x–{hi:.2}x) |"
+                "| Builtins defined by succinctly | {:.1}% of {} probed ({} listed, {} not probed) |",
+                f.implemented_pct, f.probed, f.total, f.not_probed
+            );
+            let _ = writeln!(
+                s,
+                "| Builtins agreeing with the reference | {:.1}% ({}/{}) |",
+                f.matching_pct, f.matching, f.probed
             );
         }
-        None => {
-            let _ = writeln!(s, "| Smoke geomean speedup       | n/a |");
+    }
+    if !r.cli.is_empty() {
+        let ok = r
+            .cli
+            .iter()
+            .filter(|x| x.verdict == cli::Verdict::Match)
+            .count();
+        let _ = writeln!(s, "| CLI probes agreeing | {ok}/{} |", r.cli.len());
+    }
+    if !r.differential.is_empty() {
+        let (all, ok) = r
+            .differential
+            .iter()
+            .fold((0, 0), |(a, o), x| (a + x.total, o + x.matching));
+        let _ = writeln!(s, "| Upstream jq test cases agreeing | {ok}/{all} |");
+    }
+    if let Some(i) = &r.input {
+        let _ = writeln!(
+            s,
+            "| JSONTestSuite `y_` accepted / `n_` rejected (`--validate`) | {}/{} · {}/{} |",
+            i.y.validate,
+            i.y.total,
+            i.n.total - i.n.validate,
+            i.n.total
+        );
+    }
+    if !r.robust.is_empty() {
+        let ok = r.robust.iter().filter(|x| x.matches).count();
+        let n = |c: robust::Class, f: fn(&robust::Row) -> robust::Class| {
+            r.robust.iter().filter(|x| f(x) == c).count()
+        };
+        let _ = writeln!(
+            s,
+            "| Robustness probes agreeing | {ok}/{} |",
+            r.robust.len()
+        );
+        let _ = writeln!(
+            s,
+            "| Robustness: crashes / timeouts, succinctly | {} / {} |",
+            n(robust::Class::Crash, |x| x.subject),
+            n(robust::Class::Timeout, |x| x.subject)
+        );
+        let _ = writeln!(
+            s,
+            "| Robustness: crashes / timeouts, jq | {} / {} |",
+            n(robust::Class::Crash, |x| x.reference),
+            n(robust::Class::Timeout, |x| x.reference)
+        );
+    }
+    let timed: Vec<&PerfRow> = r
+        .perf
+        .iter()
+        .filter(|x| x.speedup_primary.is_some())
+        .collect();
+    if !timed.is_empty() {
+        let sp: Vec<f64> = timed.iter().filter_map(|x| x.speedup_primary).collect();
+        let (lo, hi) = range(&sp);
+        let _ = writeln!(
+            s,
+            "| Geomean speedup vs {} | {:.2}x ({lo:.2}x–{hi:.2}x, n={}) |",
+            e.jq_version,
+            geomean(&sp).unwrap_or(f64::NAN),
+            sp.len()
+        );
+        let sec: Vec<f64> = timed.iter().filter_map(|x| x.speedup_secondary).collect();
+        if let Some(g) = geomean(&sec) {
+            let (lo, hi) = range(&sec);
+            let _ = writeln!(s, "| Geomean speedup vs the secondary reference | {g:.2}x ({lo:.2}x–{hi:.2}x, n={}) |", sec.len());
         }
+        let rss: Vec<f64> = timed.iter().filter_map(|x| x.rss_ratio_primary).collect();
+        if let Some(g) = geomean(&rss) {
+            let (lo, hi) = range(&rss);
+            let _ = writeln!(
+                s,
+                "| Geomean peak RSS vs {} | {g:.2}x ({lo:.2}x–{hi:.2}x) |",
+                e.jq_version
+            );
+        }
+        let _ = writeln!(
+            s,
+            "| Timing rows jq wins / noisy (CV > 5%) | {} / {} |",
+            sp.iter().filter(|x| **x < 1.0).count(),
+            timed.iter().filter(|x| x.noisy).count()
+        );
+    }
+    if r.features.is_some() || !r.cli.is_empty() || !r.differential.is_empty() || r.input.is_some()
+    {
+        let _ = writeln!(
+            s,
+            "| Known divergences (ledger) | {} |",
+            r.known_divergences.len()
+        );
+        let _ = writeln!(
+            s,
+            "| Ledger drift | {} unlisted, {} stale |",
+            r.ledger.unlisted.len(),
+            r.ledger.stale.len()
+        );
     }
     s.push('\n');
 
@@ -65,58 +184,68 @@ pub fn render(results: &Results) -> String {
         let _ = writeln!(s, "| {} | {} |", d.name, d.status);
     }
 
-    // Deterministic section: no timings.
-    let _ = writeln!(s, "\n## Smoke: correctness\n");
-    let _ = writeln!(s, "| Query | Verdict | jq exit | succinctly exit |");
-    let _ = writeln!(s, "|-------|---------|---------|-----------------|");
-    for x in &r.smoke {
-        let ex = |c: Option<i32>| c.map_or_else(|| "signal".into(), |c| c.to_string());
-        let v = if x.verdict == Verdict::Match {
-            "match"
-        } else {
-            "**DIFFERS**"
-        };
+    if total > 0 {
+        // Deterministic section: no timings.
+        let _ = writeln!(s, "\n## Smoke: correctness\n");
+        let _ = writeln!(s, "| Query | Verdict | jq exit | succinctly exit |");
+        let _ = writeln!(s, "|-------|---------|---------|-----------------|");
+        for x in &r.smoke {
+            let ex = |c: Option<i32>| c.map_or_else(|| "signal".into(), |c| c.to_string());
+            let v = if x.verdict == Verdict::Match {
+                "match"
+            } else {
+                "**DIFFERS**"
+            };
+            let _ = writeln!(
+                s,
+                "| {} | {v} | {} | {} |",
+                x.id,
+                ex(x.reference_exit),
+                ex(x.subject_exit)
+            );
+        }
+
         let _ = writeln!(
             s,
-            "| {} | {v} | {} | {} |",
-            x.id,
-            ex(x.reference_exit),
-            ex(x.subject_exit)
+            "\n## Smoke: timing (process spawn, ms; matching outputs only)\n"
+        );
+        let _ = writeln!(
+            s,
+            "| Query | jq median (MAD) | succinctly median (MAD) | speedup |"
+        );
+        let _ = writeln!(
+            s,
+            "|-------|-----------------|-------------------------|---------|"
+        );
+        let timed: Vec<&Row> = r.smoke.iter().filter(|x| x.speedup.is_some()).collect();
+        for x in timed {
+            let (a, b) = (x.reference.as_ref().unwrap(), x.subject.as_ref().unwrap());
+            let _ = writeln!(
+                s,
+                "| {} | {:.2} ({:.2}) | {:.2} ({:.2}) | {:.2}x |",
+                x.id,
+                a.median_ms,
+                a.mad_ms,
+                b.median_ms,
+                b.mad_ms,
+                x.speedup.unwrap()
+            );
+        }
+        let _ = writeln!(
+            s,
+            "\nn = {} interleaved repetitions per row. Startup dominates at this input size; \
+             these rows measure process spawn, not throughput.",
+            r.reps
         );
     }
 
-    let _ = writeln!(
-        s,
-        "\n## Smoke: timing (process spawn, ms; matching outputs only)\n"
-    );
-    let _ = writeln!(
-        s,
-        "| Query | jq median (MAD) | succinctly median (MAD) | speedup |"
-    );
-    let _ = writeln!(
-        s,
-        "|-------|-----------------|-------------------------|---------|"
-    );
-    let timed: Vec<&Row> = r.smoke.iter().filter(|x| x.speedup.is_some()).collect();
-    for x in timed {
-        let (a, b) = (x.reference.as_ref().unwrap(), x.subject.as_ref().unwrap());
-        let _ = writeln!(
-            s,
-            "| {} | {:.2} ({:.2}) | {:.2} ({:.2}) | {:.2}x |",
-            x.id,
-            a.median_ms,
-            a.mad_ms,
-            b.median_ms,
-            b.mad_ms,
-            x.speedup.unwrap()
-        );
-    }
-    let _ = writeln!(
-        s,
-        "\nn = {} interleaved repetitions per row. Startup dominates at this input size; \
-         these rows measure process spawn, not throughput.",
-        r.reps
-    );
+    features_sections(&mut s, r);
+    cli_sections(&mut s, r);
+    differential_section(&mut s, r);
+    input_section(&mut s, r);
+    robust_section(&mut s, r);
+    operational_section(&mut s, r);
+    perf_sections(&mut s, r);
 
     let _ = writeln!(s, "\n## Reproduce\n");
     let _ = writeln!(s, "```bash\ncargo build --release --features bench-runner");
@@ -127,4 +256,395 @@ pub fn render(results: &Results) -> String {
         r.manifest_sha256, e.succinctly_sha256, e.jq_sha256
     );
     s
+}
+
+fn note_for(r: &Results, id: &str) -> String {
+    r.known_divergences.iter().find(|e| e.id == id).map_or_else(
+        || "**unlisted**".into(),
+        |e| format!("{}: {}", e.category, e.reason),
+    )
+}
+
+fn feature_table(s: &mut String, r: &Results, suite: &str, f: &FeatureSummary) {
+    let _ = writeln!(
+        s,
+        "{} builtins: {} match, {} differ, {} not implemented, {} not probed.\n",
+        f.reference, f.matching, f.differs, f.not_implemented, f.not_probed
+    );
+    let _ = writeln!(s, "| Builtin | Status | Ledger |");
+    let _ = writeln!(s, "|---------|--------|--------|");
+    for x in f
+        .rows
+        .iter()
+        .filter(|x| !matches!(x.status, Status::Match | Status::NotProbed))
+    {
+        let st = if x.status == Status::Differs {
+            "differs"
+        } else {
+            "not implemented"
+        };
+        let _ = writeln!(
+            s,
+            "| `{}` | {st} | {} |",
+            x.id,
+            note_for(r, &format!("{suite}:{}", x.id))
+        );
+    }
+    let skipped: Vec<String> = f
+        .rows
+        .iter()
+        .filter(|x| x.status == Status::NotProbed)
+        .map(|x| format!("`{}` ({})", x.id, x.note.as_deref().unwrap_or("")))
+        .collect();
+    if !skipped.is_empty() {
+        let _ = writeln!(s, "\nNot probed: {}.", skipped.join(", "));
+    }
+}
+
+fn features_sections(s: &mut String, r: &Results) {
+    let Some(f) = &r.features else { return };
+    let _ = writeln!(s, "\n## A. Builtin coverage\n");
+    let _ = writeln!(
+        s,
+        "Inventory: `builtins` of the reference. Each `name/arity` runs on eight inputs under \
+         `try ... catch \"E\"`; error wording is the error-probe suite's job.\n"
+    );
+    feature_table(s, r, "features", f);
+    let _ = writeln!(s, "\n### Added after the primary reference\n");
+    match (&r.since_secondary, &r.secondary_note) {
+        (Some(x), _) => feature_table(s, r, "since-secondary", x),
+        (None, Some(why)) => {
+            let _ = writeln!(s, "Not run: {why}.");
+        }
+        (None, None) => {}
+    }
+}
+
+fn cli_sections(s: &mut String, r: &Results) {
+    if r.cli.is_empty() {
+        return;
+    }
+    let _ = writeln!(s, "\n## G. CLI & I/O compatibility\n");
+    let _ = writeln!(
+        s,
+        "Stdout and exit status must be identical; stderr wording is not compared.\n"
+    );
+    let _ = writeln!(s, "| Area | Probes | Agree |");
+    let _ = writeln!(s, "|------|--------|-------|");
+    let mut areas: Vec<&str> = r.cli.iter().map(|x| x.area.as_str()).collect();
+    areas.sort_unstable();
+    areas.dedup();
+    for a in areas {
+        let all = r.cli.iter().filter(|x| x.area == a).count();
+        let ok = r
+            .cli
+            .iter()
+            .filter(|x| x.area == a && x.verdict == cli::Verdict::Match)
+            .count();
+        let _ = writeln!(s, "| {a} | {all} | {ok} |");
+    }
+    let _ = writeln!(s, "\n| Probe | jq exit | succinctly exit | Ledger |");
+    let _ = writeln!(s, "|-------|---------|-----------------|--------|");
+    let ex = |c: Option<i32>| c.map_or_else(|| "signal".into(), |c| c.to_string());
+    for x in r.cli.iter().filter(|x| x.verdict == cli::Verdict::Differs) {
+        let _ = writeln!(
+            s,
+            "| `{}` | {} | {} | {} |",
+            x.id,
+            ex(x.reference_exit),
+            ex(x.subject_exit),
+            note_for(r, &format!("cli:{}", x.id))
+        );
+    }
+    let _ = writeln!(
+        s,
+        "\n### Succinctly-only surface (not counted as coverage)\n"
+    );
+    let _ = writeln!(s, "| Probe | Reference | Succinctly |");
+    let _ = writeln!(s, "|-------|-----------|------------|");
+    for x in &r.extensions {
+        let who = if x.verdict == cli::Verdict::Extension {
+            "rejects, as intended"
+        } else {
+            "**unexpected**"
+        };
+        let _ = writeln!(
+            s,
+            "| `{}` | exit {} ({who}) | exit {} |",
+            x.id,
+            ex(x.reference_exit),
+            ex(x.subject_exit)
+        );
+    }
+}
+
+fn differential_section(s: &mut String, r: &Results) {
+    if r.differential.is_empty() {
+        return;
+    }
+    let _ = writeln!(s, "\n## B. Differential: upstream jq test files\n");
+    let _ = writeln!(
+        s,
+        "Each case runs through both tools; stdout and exit status must be identical. \
+         The files' own expected outputs are not consulted.\n"
+    );
+    let _ = writeln!(s, "| File | Cases | Agree |");
+    let _ = writeln!(s, "|------|-------|-------|");
+    for x in &r.differential {
+        let _ = writeln!(s, "| {} | {} | {} |", x.suite, x.total, x.matching);
+    }
+    let _ = writeln!(s, "\n| Case | Program | Ledger |");
+    let _ = writeln!(s, "|------|---------|--------|");
+    for x in r
+        .differential
+        .iter()
+        .flat_map(super::suites::SuiteSummary::differing)
+    {
+        let _ = writeln!(
+            s,
+            "| `{}` | `{}` | {} |",
+            x.id,
+            x.program,
+            note_for(r, &x.id)
+        );
+    }
+}
+
+fn input_section(s: &mut String, r: &Results) {
+    let Some(i) = &r.input else { return };
+    let _ = writeln!(s, "\n## C. Input conformance: JSONTestSuite\n");
+    let _ = writeln!(
+        s,
+        "Accepting is exit 0. `y_` must be accepted, `n_` rejected, `i_` is implementation-defined. \
+         `succinctly` as shipped semi-indexes and validates little; `--validate` is strict RFC 8259.\n"
+    );
+    let _ = writeln!(
+        s,
+        "| Class | Cases | jq accepts | succinctly accepts | succinctly --validate accepts |"
+    );
+    let _ = writeln!(
+        s,
+        "|-------|-------|------------|--------------------|-------------------------------|"
+    );
+    for (name, t) in [("y_", &i.y), ("n_", &i.n), ("i_", &i.i)] {
+        let _ = writeln!(
+            s,
+            "| {name} | {} | {} | {} | {} |",
+            t.total, t.reference, t.default, t.validate
+        );
+    }
+    let _ = writeln!(
+        s,
+        "\nThe ledger lists a case only when `--validate` breaks its `y_`/`n_` expectation or the \
+         two tools print different values for an input both accept; jq itself accepts {} `n_` cases.",
+        i.n.reference
+    );
+}
+
+fn range(xs: &[f64]) -> (f64, f64) {
+    (
+        xs.iter().copied().fold(f64::MAX, f64::min),
+        xs.iter().copied().fold(f64::MIN, f64::max),
+    )
+}
+
+fn med(x: &PerfRow, i: usize) -> Option<String> {
+    let t = x.tools.get(i)?;
+    let (s, cv) = (t.stats.as_ref()?, t.cv_pct?);
+    Some(format!("{:.1} ({cv:.0}%)", s.median_ms))
+}
+
+fn ratio(v: Option<f64>) -> String {
+    v.map_or_else(|| "n/a".into(), |v| format!("{v:.2}x"))
+}
+
+fn perf_sections(s: &mut String, r: &Results) {
+    if r.perf.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        s,
+        "\n## D. Performance (process spawn, ms; matching outputs only)\n"
+    );
+    let _ = writeln!(
+        s,
+        "Median of {} interleaved repetitions (fewer at 100 MB), CV in parentheses; the tool order \
+         rotates each repetition. A speedup is reference ÷ succinctly, so below 1.00x jq is faster. \
+         `1.8.1 ÷ 1.7.1` is the secondary reference's own change in speed.{}\n",
+        r.reps,
+        r.perf_note.as_deref().map_or(String::new(), |n| format!(" ({n}.)"))
+    );
+    let wrong: Vec<&PerfRow> = r.perf.iter().filter(|x| x.gate == Gate::Differs).collect();
+    if !wrong.is_empty() {
+        let _ = writeln!(
+            s,
+            "**Correctness rows (output differs from the primary reference; untimed):**\n"
+        );
+        for x in &wrong {
+            let _ = writeln!(
+                s,
+                "- `{}` on `{}`: {}",
+                x.query,
+                x.input,
+                note_for(r, &format!("perf:{}@{}", x.query, x.input))
+            );
+        }
+        s.push('\n');
+    }
+    let timed: Vec<&PerfRow> = r
+        .perf
+        .iter()
+        .filter(|x| x.speedup_primary.is_some())
+        .collect();
+    let losses: Vec<&&PerfRow> = timed
+        .iter()
+        .filter(|x| x.speedup_primary < Some(1.0))
+        .collect();
+    let _ = writeln!(s, "### Where jq is faster\n");
+    if losses.is_empty() {
+        let _ = writeln!(s, "None in this run.\n");
+    } else {
+        let _ = writeln!(s, "| Query | Input | jq 1.7.1 | succinctly | speedup |");
+        let _ = writeln!(s, "|-------|-------|----------|------------|---------|");
+        for x in losses {
+            let _ = writeln!(
+                s,
+                "| {} | {} | {} | {} | {} |",
+                x.query,
+                x.input,
+                med(x, 1).unwrap_or_default(),
+                med(x, 0).unwrap_or_default(),
+                ratio(x.speedup_primary)
+            );
+        }
+        s.push('\n');
+    }
+    let _ = writeln!(s, "### All timed rows\n");
+    let _ = writeln!(s, "| Query | Input | jq 1.7.1 | succinctly | vs 1.7.1 | jq 1.8.1 | vs 1.8.1 | 1.8.1 ÷ 1.7.1 | CV>5% |");
+    let _ = writeln!(s, "|-------|-------|----------|------------|----------|----------|----------|---------------|-------|");
+    for x in &timed {
+        let _ = writeln!(
+            s,
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            x.query,
+            x.input,
+            med(x, 1).unwrap_or_default(),
+            med(x, 0).unwrap_or_default(),
+            ratio(x.speedup_primary),
+            med(x, 2).unwrap_or_else(|| "n/a".into()),
+            ratio(x.speedup_secondary),
+            ratio(x.secondary_over_primary),
+            if x.noisy { "yes" } else { "" }
+        );
+    }
+    let _ = writeln!(
+        s,
+        "\n## E. Memory (peak RSS, KiB; separate untimed runs, median of 3)\n"
+    );
+    let _ = writeln!(
+        s,
+        "| Query | Input | jq 1.7.1 | succinctly | ratio (succinctly ÷ jq) |"
+    );
+    let _ = writeln!(
+        s,
+        "|-------|-------|----------|------------|-------------------------|"
+    );
+    for x in &timed {
+        let kb = |i: usize| {
+            x.tools
+                .get(i)
+                .and_then(|t| t.peak_rss_kb)
+                .map_or_else(|| "n/a".into(), |v| v.to_string())
+        };
+        let _ = writeln!(
+            s,
+            "| {} | {} | {} | {} | {} |",
+            x.query,
+            x.input,
+            kb(1),
+            kb(0),
+            ratio(x.rss_ratio_primary)
+        );
+    }
+}
+
+fn robust_section(s: &mut String, r: &Results) {
+    if r.robust.is_empty() {
+        return;
+    }
+    let _ = writeln!(s, "\n## F. Robustness and resource limits\n");
+    let _ = writeln!(
+        s,
+        "Each probe has a 10 s deadline. Class: `ok`, `error` (non-zero exit), `crash` (signal or panic), \
+         `timeout`. Stdout and exit status must match jq's; a crash or hang of succinctly is listed \
+         even when jq does the same.\n"
+    );
+    let mut areas: Vec<&str> = r.robust.iter().map(|x| x.area.as_str()).collect();
+    areas.sort_unstable();
+    areas.dedup();
+    let _ = writeln!(s, "| Area | Probes | Agree |");
+    let _ = writeln!(s, "|------|--------|-------|");
+    for a in areas {
+        let all = r.robust.iter().filter(|x| x.area == a).count();
+        let ok = r.robust.iter().filter(|x| x.area == a && x.matches).count();
+        let _ = writeln!(s, "| {a} | {all} | {ok} |");
+    }
+    let _ = writeln!(s, "\n| Probe | jq | succinctly | Ledger |");
+    let _ = writeln!(s, "|-------|----|-------------|--------|");
+    let cls = |c: robust::Class, exit: Option<i32>, ms: f64| {
+        let e = exit.map_or_else(|| "signal".into(), |e| e.to_string());
+        format!("{c:?} {e} ({ms:.0} ms)").to_lowercase()
+    };
+    for x in r.robust.iter().filter(|x| {
+        !x.matches || matches!(x.subject, robust::Class::Crash | robust::Class::Timeout)
+    }) {
+        let _ = writeln!(
+            s,
+            "| `{}` | {} | {} | {} |",
+            x.id,
+            cls(x.reference, x.reference_exit, x.reference_ms),
+            cls(x.subject, x.subject_exit, x.subject_ms),
+            note_for(r, &format!("robust:{}", x.id))
+        );
+    }
+}
+
+fn operational_section(s: &mut String, r: &Results) {
+    let Some(o) = &r.operational else { return };
+    let _ = writeln!(s, "\n## H. Platform and operational properties\n");
+    let _ = writeln!(
+        s,
+        "| Tool | Binary size | Dynamic libraries | CPU time ÷ wall time (`.` on 10 MB) |"
+    );
+    let _ = writeln!(
+        s,
+        "|------|-------------|-------------------|--------------------------------------|"
+    );
+    for b in &o.binaries {
+        let par = o
+            .parallelism
+            .iter()
+            .find(|p| p.tool == b.tool)
+            .and_then(|p| p.cpu_over_wall)
+            .map_or_else(|| "n/a".into(), |v| format!("{v:.2}"));
+        let _ = writeln!(
+            s,
+            "| {} | {:.1} MiB | {} | {par} |",
+            b.tool,
+            b.bytes as f64 / 1_048_576.0,
+            b.dynamic_libs.len()
+        );
+    }
+    let _ = writeln!(
+        s,
+        "\nA ratio near 1.00 means one thread. Rust dependencies of the shipped feature set \
+         (`cargo tree -e normal`): {}. Build time is not measured.\n",
+        o.rust_dependencies
+            .map_or_else(|| "n/a".into(), |n| n.to_string())
+    );
+    let _ = writeln!(s, "| Property | Value | Source |");
+    let _ = writeln!(s, "|----------|-------|--------|");
+    for f in &o.facts {
+        let _ = writeln!(s, "| {} | {} | `{}` |", f.item, f.value, f.source);
+    }
 }

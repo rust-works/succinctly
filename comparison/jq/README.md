@@ -17,5 +17,31 @@ reported as a correctness row and gets no timing; the command exits 1 on it.
 |-----------------------|----------------------------------------------------------|
 | `manifest.toml`       | pinned references (version, source sha256), build, queries |
 | `queries/smoke.tsv`   | `id`, flags, filter, input — data, not code              |
+| `probes/cli.tsv`      | G: `id`, area, args (JSON array), stdin (JSON string)    |
+| `probes/extensions.tsv` | succinctly-only surface the reference must reject      |
+| `fixtures/`           | working directory of the CLI probes (`-f`, `-L`, ...)    |
+| `vendor/jq-1.7.1/`    | B: jq's own test files (MIT), sha256-pinned in the manifest |
+| `queries/perf.tsv`    | D/E: id, flags, filter, shapes, max tier                 |
+| `probes/robust.tsv`   | F: nesting, recursion, generators, regex, big values, SIGPIPE; `@gen:` builds large stdin |
+| `divergences.toml`    | ledger of known differences; the run fails on drift      |
 
-Only the `smoke` suite exists so far. The report lists dimensions A–H as not implemented, by phase.
+Dimension A probes every builtin in the reference's own `builtins` (plus those new in jq 1.8.1, against 1.8.1);
+`--write-summary` regenerates `docs/compare/jq-coverage.json` and the figures in `docs/reference/jq-language.md`.
+Dimension B runs the vendored upstream test files through both tools; C runs JSONTestSuite against the reference, `succinctly jq` and `--validate`.
+Dimensions D and E time every query on the pinned generated inputs (`[[input]]`, regenerated into `data/compare/inputs/`
+and checked against their sha256) against jq 1.7.1 and 1.8.1, interleaved, gated on output identity; `--control` times jq
+against itself to show the noise floor, and `--full` adds the 10 MB and 100 MB tiers.
+Dimension F runs 85 resource-limit probes under a 10 s deadline and classes each outcome (ok, error, crash, timeout).
+
+Dimension H reports binary size, dynamic libraries, the Rust dependency count, whether either tool uses more than one
+core, and licence / `no_std` / CI-runner facts read from the repository; build time is not measured.
+
+```bash
+# Re-run the deterministic dimensions and spot-check 5 timing rows against a recorded run (exit 1 on any difference)
+./target/release/succinctly dev compare jq --verify docs/compare/jq-<platform>.json
+# Regenerate the committed report from a complete, valid run on a clean checkout (refused otherwise)
+./target/release/succinctly dev compare jq --quick --write-docs
+```
+
+`--write-docs` writes `docs/compare/jq-<platform>.{md,json}` and the index `docs/compare/jq.md`. CI is
+`.github/workflows/compare-jq.yml`, run by hand or on a release, not on pull requests.

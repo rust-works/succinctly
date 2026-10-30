@@ -1,0 +1,8 @@
+{
+  "reference": "jq-1.7.1",
+  "total": 218,
+  "probed": 207,
+  "matching": 203,
+  "implemented_pct": 100.0,
+  "matching_pct": 98.1
+}
