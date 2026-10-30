@@ -135,12 +135,7 @@ pub fn run_benchmark(
 
     // Set up Ctrl+C handler
     let interrupted = Arc::new(AtomicBool::new(false));
-    let interrupted_clone = Arc::clone(&interrupted);
-    ctrlc::set_handler(move || {
-        interrupted_clone.store(true, Ordering::SeqCst);
-        eprintln!("\nInterrupted! Writing partial results...");
-    })
-    .context("Failed to set Ctrl+C handler")?;
+    super::interrupt::install(&interrupted)?;
 
     eprintln!("Running UTF-8 validation benchmark suite (scalar)...");
     eprintln!("  Data directory: {}", config.data_dir.display());
