@@ -15161,7 +15161,7 @@ fn jq_checked_int_arith(
 }
 
 /// Add two values (numbers, strings, arrays, objects).
-fn arith_add<S: EvalSemantics>(
+pub(crate) fn arith_add<S: EvalSemantics>(
     left: OwnedValue,
     right: OwnedValue,
 ) -> Result<OwnedValue, EvalError> {

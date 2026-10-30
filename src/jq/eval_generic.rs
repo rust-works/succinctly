@@ -35417,6 +35417,58 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
             group_by_array_generic::<S, V>(f, cursors, optional)
         }
 
+        // #5595: `add` over an array, element by element from the document's own cursor. Without
+        // this arm the generic fallback below converted the whole array to an `OwnedValue`, wrote
+        // it out as JSON, indexed that, and then `builtin_add` converted every element again from
+        // the new cursor: 62% of `.numbers | add`. jq mode over an array only, and not while the
+        // #2889 embed table is live; an object, a scalar and every other mode take the bridge
+        // as before, with the evaluator's own diagnostics.
+        Builtin::Add if S::TAG == EvalTag::Jq && !embed_table_active() => {
+            let Some(elements) = value
+                .as_array()
+                .filter(|_| reordering_may_keep_cursors::<V>(cursor.as_ref()))
+            else {
+                return bridge_to_full_evaluator::<S, _>(
+                    &builtin_expr(whole, builtin),
+                    value,
+                    cursor,
+                    optional,
+                );
+            };
+            if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
+                return GenericResult::Error(err);
+            }
+            // The same gap checks the whole-array conversion made, before any element is read.
+            let cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
+            // `builtin_add` converts every element before it adds any, so an undecodable
+            // element is reported ahead of an addition that fails earlier in the array. Adding
+            // as we go and keeping the first addition error until every element has converted
+            // gives the same answer without holding the converted elements.
+            let mut total: Option<OwnedValue> = None;
+            let mut failed: Option<EvalError> = None;
+            for element in &cursors {
+                let item = owned_or_suppress!(to_owned_cursor::<S, _>(element), optional);
+                if failed.is_some() {
+                    continue;
+                }
+                total = match total.take() {
+                    None => Some(item),
+                    Some(acc) => match crate::jq::eval::arith_add::<S>(acc, item) {
+                        Ok(sum) => Some(sum),
+                        Err(error) => {
+                            failed = Some(error);
+                            None
+                        }
+                    },
+                };
+            }
+            match (failed, total) {
+                (Some(error), _) => GenericResult::Error(error),
+                (None, Some(sum)) => GenericResult::Owned(sum),
+                (None, None) => GenericResult::Owned(OwnedValue::Null),
+            }
+        }
+
         // The single-element half of the same family. `min`/`max` answer one
         // of the input's own elements, so the winner is returned as a bare
         // `OneCursor` -- the same shape `eval_first_or_last_generic` already
@@ -41122,6 +41174,145 @@ mod tests {
                 "{filter} bridged the input"
             );
         }
+    }
+
+    /// #5595: `add` over a document array is read element by element, not bridged: the bridge
+    /// converts the array, writes it out as JSON, indexes it again (`reindex_count` counts
+    /// exactly that) and converts every element a second time. Every answer, error and error
+    /// order is the bridge's, compared as printed over the shapes `add` folds, and an object, a
+    /// scalar and a live embed table still bridge. The pin must be able to fail: it does, with
+    /// the `Builtin::Add` arm removed.
+    #[cfg(feature = "std")]
+    #[test]
+    fn add_over_an_array_is_read_from_its_cursor_not_bridged_5595() {
+        use crate::jq::value::reindex_count;
+
+        type V<'a> = crate::json::light::StandardJson<'a, Vec<u64>>;
+        fn shown(result: GenericResult<V<'_>>) -> String {
+            match result {
+                GenericResult::Error(e) | GenericResult::Partial(_, Control::Error(e)) => {
+                    format!("error: {}", e.message)
+                }
+                other => other.collect_owned::<JqSemantics>().map_or_else(
+                    |e| format!("error: {}", e.message),
+                    |values| {
+                        values
+                            .iter()
+                            .map(OwnedValue::to_json)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    },
+                ),
+            }
+        }
+        let add = Expr::Builtin(Builtin::Add);
+        let run = |json: &[u8], via_bridge: bool| -> (String, usize) {
+            let index = JsonIndex::build(json);
+            let root = index.root(json);
+            let before = reindex_count::get();
+            let result = if via_bridge {
+                bridge_to_full_evaluator::<JqSemantics, V<'_>>(
+                    &add,
+                    root.value(),
+                    Some(root),
+                    false,
+                )
+            } else {
+                eval_using::<JqSemantics, _>(&add, root.value())
+            };
+            let text = shown(result);
+            (text, reindex_count::get() - before)
+        };
+        let arrays: &[&[u8]] = &[
+            b"[]",
+            b"[1]",
+            b"[1,2,3]",
+            b"[1.50,2.25]",
+            b"[1.000]",
+            b"[100000000000000000000,1]",
+            b"[0.1,0.2,0.3]",
+            b"[null,1,null]",
+            b"[null,null]",
+            b"[\"a\",\"b\"]",
+            b"[[1],[2,3],[]]",
+            b"[{\"a\":1},{\"b\":2},{\"a\":3}]",
+            b"[{\"a\":[1,2]}]",
+            b"[1,\"a\"]",
+            b"[1,2,\"x\",{}]",
+            b"[[1],{\"a\":1}]",
+            b"[true,false]",
+            b"[1,[2]]",
+            b"[[[1]],[[2]]]",
+            b"[1e1000,1]",
+        ];
+        let mut raised = 0;
+        for json in arrays {
+            let (native, native_reindexes) = run(json, false);
+            let (bridged, bridged_reindexes) = run(json, true);
+            let text = String::from_utf8_lossy(json);
+            assert_eq!(native, bridged, "{text}");
+            assert_eq!(native_reindexes, 0, "{text} was bridged");
+            assert!(
+                bridged_reindexes > 0 || json.len() == 2,
+                "{text}: the oracle must bridge"
+            );
+            raised += usize::from(native.starts_with("error:"));
+        }
+        assert!(
+            raised >= 3,
+            "the matrix must hold arrays `add` raises on: {raised}"
+        );
+        // What the arm does not take keeps the bridge: an object's values, a scalar, null.
+        for json in [&b"{\"a\":1,\"b\":2}"[..], b"5", b"null", b"\"s\""] {
+            let (native, native_reindexes) = run(json, false);
+            let (bridged, _) = run(json, true);
+            assert_eq!(native, bridged, "{}", String::from_utf8_lossy(json));
+            assert!(
+                native_reindexes > 0,
+                "{} should bridge",
+                String::from_utf8_lossy(json)
+            );
+        }
+        // An undecodable element is reported ahead of an addition that fails earlier in the
+        // array, as `builtin_add` converts every element before it adds any: the answer is the
+        // bridge's for each place the bad element can sit.
+        // The first two put a failed addition (`1 + "a"`, `"a" + 1`) ahead of the bad element.
+        for json in [&b"[1,\"a\",xyz]"[..], b"[\"a\",1,xyz]"] {
+            let (native, _) = run(json, false);
+            let text = String::from_utf8_lossy(json);
+            assert!(
+                native.starts_with("error:") && !native.contains("cannot be added"),
+                "{text}: the undecodable element must be reported, not the addition: {native}"
+            );
+            assert_eq!(native, run(json, true).0, "{text}");
+        }
+        for json in [
+            &b"[1,2,xyz]"[..],
+            b"[xyz,1,\"a\"]",
+            b"[xyz]",
+            b"[1,xyz,\"a\",2]",
+        ] {
+            let (native, _) = run(json, false);
+            let text = String::from_utf8_lossy(json);
+            assert_eq!(native, run(json, true).0, "{text}");
+            assert!(native.starts_with("error:"), "{text}: {native}");
+        }
+        // A live #2889 embed table keeps the bridge, whose result is detached from the nodes the
+        // bindings hold: with a binding in scope the arm steps aside and the answer is the same.
+        let origin = BindOrigin::Node {
+            node: 1,
+            document: 9,
+        };
+        let mut bound = OwnedValue::array_from(vec![OwnedValue::Int(1)]);
+        let guard =
+            embed_table_push::<JqSemantics>(Some(&origin), &mut bound).expect("a container bind");
+        assert!(embed_table_active());
+        let (with_table, with_table_reindexes) = run(b"[1,2,3]", false);
+        drop(guard);
+        let (without_table, without_table_reindexes) = run(b"[1,2,3]", false);
+        assert_eq!((with_table.as_str(), without_table.as_str()), ("6", "6"));
+        assert!(with_table_reindexes > 0, "a live embed table must bridge");
+        assert_eq!(without_table_reindexes, 0);
     }
 
     /// #5593: `floor`, `ceil`, `round`, `trunc`, `sqrt` and `fabs` of a document number are
