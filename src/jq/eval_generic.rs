@@ -4885,6 +4885,53 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
         }
     }
 
+    // #5602: `tojson` of a number the filter computed is its `tostring` -- a plain `Int` or `Float`
+    // has no source spelling, so jq dumps both through the same number printer.
+    if let Expr::Builtin(Builtin::ToJson) = strip_parens(expr) {
+        if is_computed_plain_number::<S>(&owned) {
+            return GenericResult::Owned(tostring_owned::<S>(owned));
+        }
+    }
+
+    // #5602: a `select` or an `if` over a number the filter computed settles its condition from the
+    // number, as `owned_select_door` does for the sink route. A verdict is a boolean that carries no
+    // node, so neither the re-entry nor the embed table matters to it (`owned_cond_verdict`); the
+    // input is a plain number with no storage identity (`is_computed_plain_number`), so `select`
+    // hands it back as it is. A condition outside the pure grammar, or `optional`, bridges as before.
+    if !optional && is_computed_plain_number::<S>(&owned) {
+        match strip_parens(expr) {
+            // The branch an `if` takes when it has nothing to say: no output, whatever the input.
+            Expr::Builtin(Builtin::Empty) => return GenericResult::None,
+            Expr::Builtin(Builtin::Select(cond)) => {
+                if let Some(verdict) = crate::jq::eval::owned_cond_verdict::<S>(cond, &owned, false)
+                {
+                    return match verdict {
+                        Ok(true) => GenericResult::Owned(owned),
+                        Ok(false) => GenericResult::None,
+                        Err(error) => GenericResult::Error(error),
+                    };
+                }
+            }
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                if let Some(verdict) = crate::jq::eval::owned_cond_verdict::<S>(cond, &owned, false)
+                {
+                    return match verdict {
+                        Ok(taken) => {
+                            let branch = if taken { then_branch } else { else_branch };
+                            eval_on_owned_over::<S, V>(branch, owned, optional, reentry, rooted)
+                        }
+                        Err(error) => GenericResult::Error(error),
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+
     // #3477: a count needs no index over the container it counts.
     if let Some(length) = crate::jq::eval::eval_owned_length(expr, &owned) {
         return GenericResult::Owned(length);
@@ -41191,6 +41238,42 @@ mod tests {
             assert_eq!(reindexes(filter), 0, "{filter} bridged");
         }
         assert!(reindexes("map(nan | . + 1)") > 0);
+    }
+
+    /// #5602: a `select`, an `if` and a `tojson` over a number the filter computed settle from the
+    /// number: `reindex_count` counts every serialize-and-index. The pin must be able to fail: it
+    /// does, with the `select`/`if` arm of `eval_on_owned_over` removed, and with the `tojson` arm
+    /// removed.
+    #[cfg(feature = "std")]
+    #[test]
+    fn select_if_and_tojson_of_a_computed_number_are_not_bridged_5602() {
+        use crate::jq::value::reindex_count;
+
+        let reindexes = |filter: &str| {
+            let json = b"[1.5,2.5,-0.0,16]";
+            let index = JsonIndex::build(json);
+            let expr = crate::jq::parse(filter).unwrap();
+            let before = reindex_count::get();
+            let result = eval_using::<JqSemantics, _>(&expr, index.root(json).value())
+                .collect_owned::<JqSemantics>()
+                .unwrap();
+            assert_eq!(result.len(), 1, "{filter}");
+            reindex_count::get() - before
+        };
+        for filter in [
+            "map(. + 1 | select(. > 2))",
+            "map(. + 1 | if . > 2 then 1 else 0 end)",
+            "map(. + 1 | if . > 2 then . else empty end)",
+            "map(. * 2 | select(. > 2 and . < 100) | . + 1)",
+            "map(. + 1 | tojson)",
+        ] {
+            assert_eq!(reindexes(filter), 0, "{filter} bridged");
+        }
+        // A condition outside the pure grammar (a generator), a NaN and a stage the arm does not
+        // take (`as`) keep the bridge.
+        assert!(reindexes("map(. + 1 | select(. > 1, . < 0))") > 0);
+        assert!(reindexes("map(nan | select(. == .))") > 0);
+        assert!(reindexes("map(. + 1 | . as $x | $x)") > 0);
     }
 
     /// #3639: a `label` met at a position with no prefetch hook (the absent-
