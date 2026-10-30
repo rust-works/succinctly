@@ -9525,6 +9525,10 @@ fn strip_quotes_and_decode(field: &[u8]) -> String {
 /// outputs that preceded it have been written, which is what makes
 /// `1, error("x"), 3` print `1` before its diagnostic like jq.
 ///
+/// The filter `.` is answered without a cursor at all (#5624): the input is handed on as it is,
+/// so there is no bridge document to materialize from. Everything below describes the other
+/// programs, which are evaluated against one.
+///
 /// A per-item materialization failure (`materialize_stream_item`'s
 /// `sink.materialize` calls) is defense-in-depth rather than reachable in
 /// practice: `cursor` is always rooted in `input.to_json_input_bridge()`/
@@ -15895,17 +15899,14 @@ mod tests {
             seq: false,
             convention: JsonConvention::JqCompat,
         };
-        let input = jq::parse("1").map(|_| ()).ok().map(|()| {
-            OwnedValue::array_from(vec![
-                OwnedValue::from_number_bytes::<jq::JqSemantics>(b"1.50"),
-                OwnedValue::String("a".into()),
-                OwnedValue::object_from([(
-                    "b".to_string(),
-                    OwnedValue::array_from(vec![OwnedValue::Float(f64::NAN), OwnedValue::Null]),
-                )]),
-            ])
-        });
-        let input = input.expect("parses");
+        let input = OwnedValue::array_from(vec![
+            OwnedValue::from_number_bytes::<jq::JqSemantics>(b"1.50"),
+            OwnedValue::String("a".into()),
+            OwnedValue::object_from([(
+                "b".to_string(),
+                OwnedValue::array_from(vec![OwnedValue::Float(f64::NAN), OwnedValue::Null]),
+            )]),
+        ]);
         let run = |filter: &str| -> (Vec<String>, usize) {
             let expr = jq::parse(filter).expect("parses");
             let before = bridge_docs::built();
