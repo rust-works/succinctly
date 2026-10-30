@@ -54,6 +54,32 @@ fn test_a_repeated_pattern_answers_the_same_for_every_input_5531() -> Result<()>
 }
 
 #[test]
+fn test_a_pattern_on_the_second_engine_is_kept_too_5531() -> Result<()> {
+    // Lookaround and a backreference go to `fancy-regex` (#5502); the cache holds those as well.
+    let input = r#"["ab","ac","a","xa","bab"]"#;
+    for (filter, expected) in [
+        (r#"[.[] | test("a(?!b)")]"#, "[false,true,true,true,false]"),
+        (
+            r#"[.[] | [match("(?<=a)b";"g").offset]]"#,
+            "[[1],[],[],[],[2]]",
+        ),
+        (
+            r#"[.[] | gsub("(?=a)";"_")]"#,
+            r#"["_ab","_ac","_a","x_a","b_ab"]"#,
+        ),
+        (
+            r#"[.[] | test("(a)\\1")]"#,
+            "[false,false,false,false,false]",
+        ),
+    ] {
+        let (stdout, stderr, code) = run(filter, input)?;
+        assert_eq!(stdout.trim_end(), expected, "{filter}: stderr={stderr:?}");
+        assert_eq!(code, 0, "{filter}");
+    }
+    Ok(())
+}
+
+#[test]
 fn test_a_pattern_that_changes_per_input_answers_past_the_cache_size_5531() -> Result<()> {
     // 40 distinct patterns, each used twice in a row and then again after all the others: more
     // than the cache holds, so entries are evicted and rebuilt.
