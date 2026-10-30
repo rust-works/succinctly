@@ -6381,7 +6381,7 @@ fn test_keyword_prefix_and_truncated_tokens_reject_3035() -> Result<()> {
             "top-level {doc:?} `.` must leak nothing, out: {out:?}"
         );
         assert!(
-            err.contains("Invalid JSON text"),
+            err.contains("Invalid literal at EOF at line 1, column"),
             "top-level {doc:?} `.`, stderr: {err}"
         );
 
@@ -40212,8 +40212,9 @@ fn test_sub_replacement_via_input_still_raises_on_decode_failure_2165() -> Resul
         .expect("sub replacement via input() repro runs");
     assert_eq!(code, 5, "stdout: {stdout}\nstderr: {stderr}");
     assert_eq!(stdout, "");
-    assert!(
-        stderr.contains("invalid escape sequence"),
+    // #5555: jq's own text for the bad escape, at the position its parser stands on.
+    assert_eq!(
+        stderr, "jq: error (at <stdin>:2): Invalid escape at line 2, column 4\n",
         "stderr: {stderr}"
     );
     Ok(())
@@ -95721,9 +95722,10 @@ fn test_input_queue_still_rejects_malformed_second_document_2400() -> Result<()>
         code, 0,
         "a trailing comma in the second document should raise (stdout: {stdout:?})"
     );
-    assert!(
-        stderr.contains("Invalid JSON"),
-        "expected a JSON validity error, stderr: {stderr:?}"
+    // #5555: in jq's own words and position (jq 1.7.1).
+    assert_eq!(
+        stderr, "jq: error (at <stdin>:2): Expected another key-value pair at line 2, column 8\n",
+        "expected jq's parse error, stdout: {stdout:?}"
     );
     Ok(())
 }
@@ -111826,8 +111828,8 @@ fn test_control_character_in_a_later_value_keeps_the_clean_prefix_2878_2961() ->
 /// exactly one parse error is delivered -- uncaught from the driver loop (exit
 /// 5), or as an ordinary catchable error to `input`/`inputs` -- and nothing
 /// after it is read, including later files; a read after a caught one is
-/// `break`. Error *wording* is not compared (succinctly says `Invalid JSON
-/// text`, a recorded divergence); its channel is: `jq: error`, never `Error:`.
+/// `break`. Its channel is `jq: error`/`jq: parse error`, never `Error:`; the
+/// wording is jq's own since #5555 (`tests/jq_cli/i5555.rs`).
 #[test]
 fn malformed_later_value_keeps_the_clean_prefix_2961() -> Result<()> {
     let fixture = |body: &str| -> Result<NamedTempFile> {
@@ -111900,7 +111902,24 @@ fn malformed_later_value_keeps_the_clean_prefix_2961() -> Result<()> {
             "{args:?}: a malformed document is reported in jq's channel: {stderr:?}"
         );
         if want_code == 5 {
-            assert!(stderr.starts_with("jq: error"), "{args:?}: {stderr:?}");
+            assert!(
+                stderr.starts_with("jq: error") || stderr.starts_with("jq: parse error"),
+                "{args:?}: {stderr:?}"
+            );
+            // A malformed member the semi-index accepts is found when the filter reads it, and
+            // keeps the evaluator's wording.
+            let found_when_read = args.contains(&"-s") && args.contains(&t3.as_str());
+            if found_when_read {
+                assert!(
+                    stderr.starts_with("jq: error (at ") && stderr.contains("Invalid JSON text:"),
+                    "{args:?}: {stderr:?}"
+                );
+            } else {
+                assert!(
+                    !stderr.contains("Invalid JSON text"),
+                    "{args:?}: {stderr:?}"
+                );
+            }
         }
     }
 
@@ -143503,26 +143522,38 @@ fn test_slurp_validates_only_what_the_filter_reads_2847() -> Result<()> {
 /// no longer shares.
 #[test]
 fn test_slurp_splitter_failures_stay_all_or_nothing_2847() -> Result<()> {
-    for doc in ["1 2 }", "[1,2", "1\n2\n{", "\"abc", "1 xyz", "\"a\tb\" 1"] {
+    // #5555: jq's parse error, in its words and at its position (jq 1.7.1).
+    for (doc, message) in [
+        ("1 2 }", "Unmatched '}' at line 1, column 5"),
+        ("[1,2", "Unfinished JSON term at EOF at line 1, column 4"),
+        ("1\n2\n{", "Unfinished JSON term at EOF at line 3, column 1"),
+        ("\"abc", "Unfinished string at EOF at line 1, column 4"),
+        ("1 xyz", "Invalid numeric literal at EOF at line 1, column 5"),
+        (
+            "\"a\tb\" 1",
+            "Invalid string: control characters from U+0000 through U+001F must be escaped at line 1, column 5",
+        ),
+    ] {
         for filter in [".", "1+1", "length"] {
             let (out, err, code) = run_jq_full(&["-sc", filter], Some(doc))?;
             assert_eq!(code, 5, "-sc {filter} on {doc:?}: out {out:?} stderr {err}");
             assert!(out.is_empty(), "-sc {filter} on {doc:?}: out {out:?}");
             assert_eq!(
-                err, "jq: error (at <stdin>:0): Invalid JSON text\n",
+                err,
+                format!("jq: parse error: {message}\n"),
                 "-sc {filter} on {doc:?}"
             );
         }
     }
 
-    // A later file's failure still discards the earlier files' values, and
-    // names the first file, as before.
-    let (out, err, code, paths) = run_jq_over_files(&["-sc", "."], &["1\n", "[1,2\n"])?;
+    // A later file's failure still discards the earlier files' values; jq counts lines across
+    // the files.
+    let (out, err, code, _) = run_jq_over_files(&["-sc", "."], &["1\n", "[1,2\n"])?;
     assert_eq!(code, 5, "out {out:?} stderr {err}");
     assert!(out.is_empty(), "out {out:?}");
     assert_eq!(
         err,
-        format!("jq: error (at {}:0): Invalid JSON text\n", paths[0])
+        "jq: parse error: Unfinished JSON term at EOF at line 3, column 0\n"
     );
     Ok(())
 }
@@ -143667,11 +143698,20 @@ fn test_slurp_with_an_input_builtin_still_reports_the_materializing_route_failur
     // A document the splitter or the delimiter walk rejects fails the whole
     // slurped stream, `input?` or not. Every row is exit 5 in jq 1.7.1 too.
     for (stdin, want) in [
-        ("1 [", "Invalid JSON text"),
-        ("[1 2]", "expected ',' or ']', found '2'"),
-        ("[1,]", "Invalid JSON text"),
-        ("{\"a\" 1}", "expected ':', found '1'"),
-        ("{\"a\":1 \"b\":2}", "Invalid JSON text"),
+        ("1 [", "Unfinished JSON term at EOF at line 1, column 3"),
+        (
+            "[1 2]",
+            "Expected separator between values at line 1, column 5",
+        ),
+        ("[1,]", "Expected another array element at line 1, column 4"),
+        (
+            "{\"a\" 1}",
+            "Expected separator between values at line 1, column 7",
+        ),
+        (
+            "{\"a\":1 \"b\":2}",
+            "Expected separator between values at line 1, column 10",
+        ),
     ] {
         let (out, err, code) = run_jq_full(&["-s", "-c", "input?"], Some(stdin))?;
         assert_eq!(code, 5, "{stdin:?}: out {out:?} stderr {err}");

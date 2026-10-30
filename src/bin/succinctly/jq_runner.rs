@@ -3628,6 +3628,9 @@ fn bail_if_keys_malformed<F: succinctly::jq::document::DocumentFields>(
 pub struct MalformedJsonError {
     message: String,
     kind: Option<ErrorKind>,
+    /// jq's own parse error for a slurped stream, and the source (an index into the command
+    /// line's files) and line jq's parser stood on when it met it (#5555).
+    stream_fault: Option<(usize, usize)>,
 }
 
 impl MalformedJsonError {
@@ -3639,7 +3642,17 @@ impl MalformedJsonError {
             EvalErrorPayload::Value(OwnedValue::String(text)) => (text.into_string(), None), // patchcov: coverage tolerate-line reason="unreachable by construction: every error this wrapper receives today is a decode or nesting-depth failure the evaluator raised itself, never error(v); kept so a future one is rendered rather than dropped (#2999)"
             EvalErrorPayload::Value(value) => (value.to_json(), None), // patchcov: coverage tolerate-line reason="see the arm above (#2999)"
         };
-        Self { message, kind }
+        Self {
+            message,
+            kind,
+            stream_fault: None,
+        }
+    }
+
+    /// This error worded by jq's parser, which met the fault in `source` at `line` (#5555).
+    fn at_stream_fault(mut self, source: usize, line: usize) -> Self {
+        self.stream_fault = Some((source, line));
+        self
     }
 
     /// The [`EvalError`] this was built from.
@@ -5119,7 +5132,12 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 // Line 0 of the first file, where `get_inputs` has always
                 // named a `--slurp` stream it could not finish splitting: the
                 // one combined value has no document position of its own.
-                Err(SlurpFailure::Unsplittable) => {
+                Err(SlurpFailure::Unsplittable(Some(message))) => {
+                    sink.report_parse_error(&message);
+                    return Ok(DiagStyle::Jq.error_exit_code());
+                }
+                // patchcov: coverage tolerate reason="defensive: the splitter stops only at a fault jq's parser also meets, so `slurp_fault` names one; kept so a disagreement between them prints the old line-0 message rather than none (#5555)"
+                Err(SlurpFailure::Unsplittable(None)) => {
                     let file = files.first().map(|p| p.to_string_lossy().to_string());
                     sink.report(
                         DiagStyle::Jq,
@@ -5127,7 +5145,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                         &InputLocation::at(file.as_deref(), 0),
                     );
                     return Ok(DiagStyle::Jq.error_exit_code());
-                }
+                } // patchcov: coverage end
             }
         } else {
             (raw_inputs, None)
@@ -5513,15 +5531,21 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
             if let Some(offset) = split_error {
                 // #5497: jq meets its depth limit first when the refused bracket comes before
                 // the fault the splitter stopped at.
-                let (line, column) = jq_stream_position(&raw_inputs, idx, offset);
-                if let Some(message) = jq::jq_depth_fault(&raw[offset..], line, column) {
+                // #5555: jq's parser names the first fault of its input, whether it is the depth
+                // limit or not, and a value the splitter delimits can hold one ahead of the
+                // splitter's.
+                if let Some(message) =
+                    jq::jq_stream_fault(raw_inputs.iter().map(Vec::as_slice), 1, 0)
+                {
                     sink.report_parse_error(&message);
                     break;
                 }
+                // patchcov: coverage tolerate reason="defensive: the splitter stops only at a fault jq's parser also meets, so `jq_stream_fault` names one; kept so a disagreement between them prints the old line placement rather than none (#5555)"
                 let at =
                     InputLocation::at(filename.as_deref(), parse_error_line(raw, offset, seam));
                 sink.report(DiagStyle::Jq, &EvalError::new("Invalid JSON text"), &at);
                 break;
+                // patchcov: coverage end
             }
         }
     } else {
@@ -5586,10 +5610,26 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                     if let Some(unopenable) = e.downcast_ref::<InputFileOpenError>() {
                         return Ok(report_unopenable_input(unopenable));
                     }
-                    let err = e.downcast::<MalformedJsonError>()?.to_eval_error();
+                    let malformed = e.downcast::<MalformedJsonError>()?;
+                    let err = malformed.to_eval_error();
                     let files = get_input_files(&args);
-                    let file = files.first().map(|p| p.to_string_lossy().to_string());
-                    sink.report(DiagStyle::Jq, &err, &InputLocation::at(file.as_deref(), 0));
+                    let name_of =
+                        |source: usize| files.get(source).map(|p| p.to_string_lossy().to_string());
+                    // #5555: jq's own parse error reads a slurped stream before the program
+                    // runs, so it is a parse error; under `-n` it is the error `inputs` raises,
+                    // at the position the parser stood on.
+                    match malformed.stream_fault {
+                        Some((source, line)) if args.null_input => {
+                            let at = InputLocation::at(name_of(source).as_deref(), line);
+                            sink.report(DiagStyle::Jq, &err, &at);
+                        }
+                        Some(_) => sink.report_parse_error(&err.message),
+                        // patchcov: coverage tolerate reason="defensive: the only malformed document `get_inputs` returns here is a slurped stream, which carries the read that met its fault unless `slurp_fault_at` finds none (unreachable, see there); kept as the line-0 placement every other malformed document gets (#5555)"
+                        None => {
+                            let at = InputLocation::at(name_of(0).as_deref(), 0);
+                            sink.report(DiagStyle::Jq, &err, &at);
+                        } // patchcov: coverage end
+                    }
                     return Ok(DiagStyle::Jq.error_exit_code());
                 }
                 Err(exit_code) => return Ok(exit_code), // Validation error
@@ -6757,7 +6797,13 @@ fn get_inputs(
                 // document, rather than through `anyhow` at exit 1.
                 if args.slurp {
                     if let Some(error) = parse_error {
-                        return Ok(Err(anyhow::Error::from(MalformedJsonError::new(error))));
+                        let malformed = MalformedJsonError::new(error);
+                        // #5555: the read that met the fault, as the resuming route places it.
+                        return Ok(Err(match slurp_fault_at(&raw, seam, parsed.len()) {
+                            Some(line) => malformed.at_stream_fault(src, line),
+                            None => malformed, // patchcov: coverage tolerate-line reason="unreachable: the prefix parse stopped at value `parsed`, which the splitter either delimits or stopped at, so a read is found; kept so a disagreement falls back to line 0 (#5555)"
+                        }
+                        .into()));
                     }
                 }
                 // Skipped under `--slurp` (#1541) -- see the DSV branch above.
@@ -8034,6 +8080,15 @@ fn meet_fault(counter: &mut LineCounter<'_>, bytes: &[u8], start: usize) -> (usi
     (detected, line, resume)
 }
 
+/// The line jq's parser stands on when it meets the fault that ends `raw`'s clean prefix of
+/// `parsed` values, or `None` when the splitter finds no fault there (#5555).
+fn slurp_fault_at(raw: &str, seam: Seam, parsed: usize) -> Option<usize> {
+    let (spans, split_error) = split_json_values(raw.as_bytes());
+    let start = spans.get(parsed).map(|&(start, _)| start).or(split_error)?;
+    let mut faults = LineCounter::at_seam(raw.as_bytes(), seam);
+    Some(meet_fault(&mut faults, raw.as_bytes(), start).1)
+}
+
 /// Whether jq never reads the value at `span` because the fault in the
 /// malformed value starting at `malformed` is detected on the very byte that
 /// completes it (#4311). A number or literal completes on the byte after it, so
@@ -8528,8 +8583,9 @@ enum SlurpFailure {
     /// code to leave with.
     Validation(i32),
     /// A file's splitter gave up (a truncated container, a byte that starts
-    /// no token): the stream cannot be slurped.
-    Unsplittable,
+    /// no token): the stream cannot be slurped. Carries jq's own parse error for it (#5555),
+    /// when its parser stops there too.
+    Unsplittable(Option<String>),
     /// jq's parse-depth limit refuses the document the splitter gave up on, before the fault it
     /// stopped at (#5497). Reported as jq's parse error, without the position, as every depth
     /// refusal under `--slurp` is.
@@ -8545,6 +8601,31 @@ struct SlurpedInput {
     /// The last source's own newline count at EOF, the line jq's `(at ...)`
     /// marker names for a value slurped out of the whole stream (#1520).
     eof_line: usize,
+}
+
+/// jq's parse error for a `--slurp` stream the splitter gave up on in `raw`, file `idx` of `files`
+/// (#5555), or `None` when jq's parser reads it all.
+///
+/// A value the splitter delimits can hold a fault ahead of the one it stopped at, in this file or
+/// an earlier one, so the stream is read again from its start. The earlier files' buffers are
+/// gone by now, so they are read from disk; stdin is one source, and `raw` is all of it. A file
+/// that cannot be read again leaves jq's parser to start at this file, where `origin` places it.
+fn slurp_fault(
+    files: &[PathBuf],
+    idx: usize,
+    raw: &[u8],
+    origin: (usize, usize),
+) -> Option<String> {
+    let earlier: Option<Vec<Vec<u8>>> = files
+        .get(..=idx)
+        .and_then(|files| files.iter().map(|path| std::fs::read(path).ok()).collect());
+    match earlier {
+        Some(mut all) if idx > 0 => {
+            strip_leading_json_bom(all.iter_mut());
+            jq::jq_stream_fault(all.iter().map(Vec::as_slice), 1, 0)
+        }
+        _ => jq::jq_stream_fault([raw], origin.0, origin.1),
+    }
 }
 
 /// Join every top-level value of every input, in order, into one JSON array
@@ -8577,6 +8658,8 @@ fn slurp_documents(
     let mut eof_line = 0;
     combined.push(b'[');
     let mut wrote_value = false;
+    // Where the current file starts in jq's input, which counts lines across files (#5555).
+    let mut origin = StreamOrigin::ALONE.file;
     for (idx, raw) in raw_inputs.into_iter().enumerate() {
         if validate {
             let filename = files.get(idx).map(|p| p.to_string_lossy().to_string());
@@ -8588,7 +8671,13 @@ fn slurp_documents(
             if jq::jq_depth_fault_offset(&raw[offset..]).is_some() {
                 return Err(SlurpFailure::DepthLimit);
             }
-            return Err(SlurpFailure::Unsplittable);
+            return Err(SlurpFailure::Unsplittable(slurp_fault(
+                files, idx, &raw, origin,
+            )));
+        }
+        if idx != last {
+            // The next file starts where jq's line and column counts leave off here.
+            origin = advance_position(origin, &raw);
         }
         for (start, end) in spans {
             if wrote_value {
@@ -8782,24 +8871,31 @@ fn parse_json_stream_prefix(
     if let Ok(values) = parse_json_stream_strict(s, origin, text, lead) {
         return (values, None);
     }
+    // #5555: jq's parser names the first fault of the text, which can sit inside a value the
+    // splitter delimits and the delimiter walk rejects, ahead of the one the splitter stopped at.
+    // It reads the text as written: the newline after a bare token is part of its fault.
+    let jq_fault = || {
+        origin.and_then(|origin| {
+            let (line, column) = origin.position(text, 0);
+            jq::jq_stream_fault([text], line, column)
+        })
+    };
     let bytes = s.as_bytes();
     let (spans, split_error) = split_json_values(bytes);
     let mut values = Vec::with_capacity(spans.len());
     for (start, end) in spans {
         match stream_document_checked(&bytes[start..end], origin, text, lead + start) {
             Ok(value) => values.push(value),
+            Err(error) if error.is_decode_failure() => {
+                return (values, Some(jq_fault().map_or(error, EvalError::new)));
+            }
             Err(error) => return (values, Some(error)),
         }
     }
     // #5497: jq meets its depth limit first when the refused bracket comes before the fault
     // the splitter stopped at.
-    let error = split_error.map(|offset| {
-        let depth = origin.and_then(|origin| {
-            let (line, column) = origin.position(text, lead + offset);
-            jq::jq_depth_fault(&bytes[offset..], line, column)
-        });
-        EvalError::new(depth.unwrap_or_else(|| String::from("Invalid JSON text")))
-    });
+    let error = split_error
+        .map(|_| EvalError::new(jq_fault().unwrap_or_else(|| String::from("Invalid JSON text"))));
     (values, error)
 }
 
@@ -14221,7 +14317,7 @@ mod tests {
                     s.eof_line,
                 )),
                 Err(f) => Err(match f {
-                    SlurpFailure::Unsplittable => "unsplittable",
+                    SlurpFailure::Unsplittable(_) => "unsplittable",
                     SlurpFailure::DepthLimit => "depth",
                     SlurpFailure::Validation(_) => "validation",
                 }),
@@ -14275,11 +14371,19 @@ mod tests {
             (vec![], None)
         );
         // A splitter failure: truncated, unterminated, unmatched.
-        for text in ["1 2 [3,", "1 2 \"abc", "1 2 }"] {
+        // #5555: worded as jq's parser words it.
+        for (text, message) in [
+            ("1 2 [3,", "Unfinished JSON term at EOF at line 1, column 7"),
+            ("1 2 \"abc", "Unfinished string at EOF at line 1, column 8"),
+            ("1 2 }", "Unmatched '}' at line 1, column 5"),
+        ] {
             let (values, error) = show(parse_json_stream_prefix(text, Some(StreamOrigin::ALONE)));
             assert_eq!(values, vec!["1", "2"], "{text}");
-            assert_eq!(error.as_deref(), Some("Invalid JSON text"), "{text}");
+            assert_eq!(error.as_deref(), Some(message), "{text}");
         }
+        // Without an origin (`--stream`) the splitter's wording stands.
+        let (_, error) = show(parse_json_stream_prefix("1 2 }", None));
+        assert_eq!(error.as_deref(), Some("Invalid JSON text"));
         // A span the splitter accepts but the materializer rejects: the
         // prefix ends there, and nothing after it is kept.
         let (values, error) = show(parse_json_stream_prefix(
@@ -14287,7 +14391,10 @@ mod tests {
             Some(StreamOrigin::ALONE),
         ));
         assert_eq!(values, vec!["1", "2"]);
-        assert!(error.is_some());
+        assert_eq!(
+            error.as_deref(),
+            Some("Invalid numeric literal at line 1, column 13")
+        );
     }
 
     #[test]

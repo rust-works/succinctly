@@ -70,6 +70,8 @@ struct Parser {
     /// The stack size at which a `[` or `{` is refused: [`JQ_MAX_PARSING_DEPTH`], or one more
     /// under a wrapper jq never parsed ([`InputSource::Slurped`]).
     limit: usize,
+    /// Whether a second top-level value is fine: jq's input stream, not `fromjson`'s one text.
+    multi: bool,
 }
 
 /// jq's decNumber reader: an optionally signed decimal with an optional exponent, or
@@ -208,6 +210,7 @@ impl Parser {
             stack: Vec::new(),
             next: None,
             emitted: 0,
+            multi: false,
         }
     }
 
@@ -238,7 +241,7 @@ impl Parser {
     /// Hand the completed value back to the caller; the second one ends the parse.
     fn emit(&mut self) -> Result<(), Stop> {
         self.emitted += 1;
-        if self.emitted == 2 {
+        if self.emitted == 2 && !self.multi {
             return Err(Stop::ExtraValues);
         }
         Ok(())
@@ -494,18 +497,41 @@ fn stack_reaches(text: &[u8], limit: usize) -> bool {
     false
 }
 
-/// jq's message when its parser, reading `text` from `line` and `column` of its input (as
-/// [`jq_input_depth_fault`] places it), refuses a bracket past [`JQ_MAX_PARSING_DEPTH`] before
-/// anything else stops it, or `None` (#5497).
+/// jq's message when its parser, reading `chunks` in order from `line` and `column` of its input
+/// as one stream of top-level values, stops on a fault, or `None` when it reads every value
+/// (#5555).
 ///
-/// For text the splitter could not delimit (a container left open, say): jq still meets its
-/// depth limit first when the refused bracket comes before the fault, and the message is jq's
-/// parse error rather than the splitter's.
+/// For a route that has already found its own reason to refuse a document and now has to word it
+/// the way jq's `main` prints it: `jq: parse error: <message>`. The fault is the first in the
+/// stream, so a caller passes the text from where its own check stopped, or all of it.
+///
+/// A byte-order mark is a fault like any other byte: jq skips the one at the front of its input,
+/// so the caller has stripped it (`strip_leading_json_bom`) before the first chunk.
 #[doc(hidden)]
-pub fn jq_depth_fault(text: &[u8], line: usize, column: usize) -> Option<String> {
-    jq_parse_fault(text, line, column, JQ_MAX_PARSING_DEPTH)
-        .filter(|fault| fault.depth)
-        .map(|fault| fault.message)
+pub fn jq_stream_fault<'a>(
+    chunks: impl IntoIterator<Item = &'a [u8]>,
+    line: usize,
+    column: usize,
+) -> Option<String> {
+    let mut parser = Parser::new(line, column, JQ_MAX_PARSING_DEPTH);
+    parser.multi = true;
+    for chunk in chunks {
+        for &byte in chunk {
+            if let Err(Stop::Fault(fault)) = parser.feed(byte) {
+                return Some(format!(
+                    "{fault} at line {}, column {}",
+                    parser.line, parser.column
+                ));
+            }
+        }
+    }
+    match parser.finish() {
+        Err(Stop::Fault(fault)) => Some(format!(
+            "{fault} at EOF at line {}, column {}",
+            parser.line, parser.column
+        )),
+        _ => None,
+    }
 }
 
 /// Whether `message` is jq's parse-depth refusal, which jq's `main` prints as a parse error.
@@ -589,6 +615,38 @@ mod tests {
 
     fn message(text: &str) -> Option<String> {
         jq_parse_message(text.as_bytes())
+    }
+
+    /// #5555: a stream of values is clean until a fault, which is worded and placed as jq's
+    /// `main` places it across files read as one stream. Rows captured from `/usr/bin/jq` 1.7.1.
+    #[test]
+    fn names_the_first_fault_of_a_stream_5555() {
+        let fault = |chunks: &[&str], line, column| {
+            jq_stream_fault(chunks.iter().map(|c| c.as_bytes()), line, column)
+        };
+        assert_eq!(fault(&[], 1, 0), None);
+        assert_eq!(fault(&[" \n"], 1, 0), None);
+        assert_eq!(fault(&["1 2 [3] {\"a\":4}\n"], 1, 0), None);
+        assert_eq!(
+            fault(&["1 [2,"], 1, 0).as_deref(),
+            Some("Unfinished JSON term at EOF at line 1, column 5")
+        );
+        // Files are one stream: lines run on, and a value can span the seam.
+        assert_eq!(
+            fault(&["1\n2\n", "3\n{\"a\":1,}\n"], 1, 0).as_deref(),
+            Some("Expected another key-value pair at line 4, column 8")
+        );
+        assert_eq!(fault(&["[1,", "2]"], 1, 0), None);
+        // A text that starts part-way in is placed by the position it is given.
+        assert_eq!(
+            fault(&["}"], 3, 4).as_deref(),
+            Some("Unmatched '}' at line 3, column 5")
+        );
+        // The newline after a bare token is read: the fault is on the next line.
+        assert_eq!(
+            fault(&["ul\n"], 1, 0).as_deref(),
+            Some("Invalid numeric literal at line 2, column 0")
+        );
     }
 
     /// Every row was captured live from `/usr/bin/jq` 1.7.1: `"<text>" | try fromjson catch .`,

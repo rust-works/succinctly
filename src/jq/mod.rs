@@ -156,7 +156,7 @@ pub use lazy::JqValue;
 // #5497: jq's parse-depth limit, applied by the CLI's document routes.
 #[doc(hidden)]
 pub use parse_message::{
-    is_jq_depth_fault, jq_depth_fault, jq_depth_fault_offset, jq_input_depth_fault, InputSource,
+    is_jq_depth_fault, jq_depth_fault_offset, jq_input_depth_fault, jq_stream_fault, InputSource,
     JQ_MAX_PARSING_DEPTH,
 };
 pub use parser::{
