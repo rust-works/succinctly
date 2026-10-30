@@ -54,6 +54,40 @@ fn test_qualified_name_is_a_destructuring_key_5600() -> Result<()> {
     Ok(())
 }
 
+/// A `label`/`break` name is a `BINDING`, so `$a::b` is one name there too.
+#[test]
+fn test_qualified_name_is_a_label_name_5600() -> Result<()> {
+    for (program, expected) in [
+        ("label $a::b | 1, break $a::b", "1\n"),
+        ("label $a::b | break $a::b", ""),
+        ("label $a::b | (1, break $a::b, 2)", "1\n"),
+    ] {
+        let (out, err, code) = run(program)?;
+        assert_eq!((out.as_str(), code), (expected, 0), "{program}: {err}");
+    }
+    Ok(())
+}
+
+/// A qualified key binds in every pattern context, and a parameter shadows a `def` of the same name.
+#[test]
+fn test_qualified_name_in_pattern_contexts_and_shadowing_5600() -> Result<()> {
+    for (program, expected) in [
+        ("[{\"a::b\":3}] | .[] as {a::b: $v} | $v", "3\n"),
+        (
+            "reduce ({\"a::b\":1},{\"a::b\":2}) as {a::b: $x} (0; .+$x)",
+            "3\n",
+        ),
+        (". as [$a] ?// {a::b: $x} | [$a,$x]", "[null,null]\n"),
+        ("def a::b: 7; def f(a::b): a::b; f(1)", "1\n"),
+        ("def f(a::b; a::b): a::b; f(1;2)", "2\n"),
+        ("def f(x::y): x::y; f(1,2)", "1\n2\n"),
+    ] {
+        let (out, err, code) = run(program)?;
+        assert_eq!((out.as_str(), code), (expected, 0), "{program}: {err}");
+    }
+    Ok(())
+}
+
 /// The `::` takes no whitespace and must be followed by an identifier; each of these is a compile
 /// error in jq 1.7.1 (exit 3) and stays one here.
 #[test]

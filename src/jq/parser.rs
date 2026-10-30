@@ -5532,7 +5532,7 @@ impl<'a> Parser<'a> {
             return Err(ParseError::new("expected '$' after 'label'", self.pos));
         }
         self.next();
-        let name = self.parse_ident()?;
+        let name = self.parse_variable_name()?;
         self.skip_ws();
 
         // Expect '|'
@@ -5596,7 +5596,7 @@ impl<'a> Parser<'a> {
             return Err(ParseError::new("expected '$' after 'break'", self.pos));
         }
         self.next();
-        let name = self.parse_ident()?;
+        let name = self.parse_variable_name()?;
 
         // #2964: record the site unconditionally -- before the
         // `wrap_shadowable_call` wrapper below decides whether this `break`
@@ -15319,6 +15319,7 @@ mod tests {
             ". as {a::b: $x} | $x",
             "def f(a::b): a::b; f(1)",
             "def f($a::b): $a::b; f(1)",
+            "label $a::b | break $a::b",
         ] {
             assert!(parse_program(program).is_ok(), "{program}");
         }
