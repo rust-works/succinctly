@@ -10694,9 +10694,10 @@ mod tests {
     use super::*;
 
     /// #5613: jq 1.7.1's lexer skips only space, tab and newline between tokens; CR, form feed,
-    /// vertical tab, NBSP and U+2028 are `INVALID_CHARACTER` wherever a token could follow,
-    /// including the lookahead after `add` and `def`-free keyword calls. A CR inside a comment
-    /// is part of the comment. yq mode keeps its wider set (#5616).
+    /// vertical tab, NBSP and U+2028 are `INVALID_CHARACTER` wherever a token could follow. A CR
+    /// inside a comment is part of the comment. yq mode keeps its wider set (#5616). (The two
+    /// keyword lookaheads share the predicate with `skip_ws`, but a refusal there is also reached
+    /// by `skip_ws`, so no row here isolates them.)
     #[test]
     fn jq_mode_whitespace_is_space_tab_newline_only_5613() {
         for c in [

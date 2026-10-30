@@ -564,3 +564,6 @@ syn-ws-nbsp	syntax	["-n", "-c", "1\u00a0+1"]	-
 syn-ws-line-separator	syntax	["-n", "-c", "1\u2028+1"]	-
 syn-ws-cr-after-keyword-call	syntax	["-n", "-c", "[1] | add\r"]	-
 syn-ws-tab-and-newline	syntax	["-n", "-c", "1\t+\n1"]	-
+syn-ws-cr-in-interpolation	syntax	["-n", "-c", "\"a\\(1\r+2)\""]	-
+syn-ws-cr-in-def-header	syntax	["-n", "-c", "def\rf: 1; f"]	-
+syn-ws-cr-in-comment	syntax	["-n", "-c", "1 # a\rb\n+ 1"]	-
