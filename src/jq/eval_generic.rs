@@ -41022,7 +41022,7 @@ mod tests {
     fn unary_math_of_a_document_number_is_not_bridged_5593() {
         use crate::jq::value::reindex_count;
 
-        let json = br#"[1.5,-2.5,100000000000000000000,1e-5,0,-0.0,16]"#;
+        let json = br"[1.5,-2.5,100000000000000000000,1e-5,0,-0.0,16]";
         let index = JsonIndex::build(json);
         let reindexes = |filter: &str, json: &[u8]| {
             let index = JsonIndex::build(json);
