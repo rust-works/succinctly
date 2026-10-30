@@ -22,7 +22,14 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 /// jq's `MAX_PARSING_DEPTH`: the stack of containers and pending keys.
-const MAX_PARSING_DEPTH: usize = 256;
+///
+/// An array holds one entry and an object two once its key is read, and a `[` or `{` is refused
+/// when the stack already holds this many, so 256 nested arrays parse and 129 nested objects do
+/// not. The one definition behind every route that applies jq's limit (#5497).
+pub const JQ_MAX_PARSING_DEPTH: usize = 256;
+
+/// The fault [`Parser::open`] stops on at [`JQ_MAX_PARSING_DEPTH`].
+const DEPTH_FAULT: &str = "Exceeds depth limit for parsing";
 
 /// The UTF-8 byte-order mark jq's parser skips at the front of its text.
 const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
@@ -60,6 +67,9 @@ struct Parser {
     next: Option<Pending>,
     /// Top-level values handed back so far; the second is `Unexpected extra JSON values`.
     emitted: usize,
+    /// The stack size at which a `[` or `{` is refused: [`JQ_MAX_PARSING_DEPTH`], or one more
+    /// under a wrapper jq never parsed ([`InputSource::Slurped`]).
+    limit: usize,
 }
 
 /// jq's decNumber reader: an optionally signed decimal with an optional exponent, or
@@ -186,10 +196,13 @@ fn check_string(token: &[u8]) -> Result<(), Stop> {
 }
 
 impl Parser {
-    fn new() -> Self {
+    /// A parser whose first byte is at `line` (1-based) and just after `column` bytes of it, as
+    /// jq's own counters stand there.
+    fn new(line: usize, column: usize, limit: usize) -> Self {
         Self {
-            line: 1,
-            column: 0,
+            limit,
+            line,
+            column,
             string_state: 0,
             token: Vec::new(),
             stack: Vec::new(),
@@ -232,8 +245,8 @@ impl Parser {
     }
 
     fn open(&mut self, frame: Frame) -> Result<(), Stop> {
-        if self.stack.len() >= MAX_PARSING_DEPTH {
-            return Err(Stop::Fault("Exceeds depth limit for parsing"));
+        if self.stack.len() >= self.limit {
+            return Err(Stop::Fault(DEPTH_FAULT));
         }
         if self.next.is_some() {
             return Err(Stop::Fault("Expected separator between values"));
@@ -386,26 +399,188 @@ impl Parser {
 ///
 /// `text` is parsed whole, NULs included: jq's parser takes a length, not a C string.
 pub(crate) fn jq_parse_message(text: &[u8]) -> Option<String> {
+    jq_parse_fault(text, 1, 0, JQ_MAX_PARSING_DEPTH).map(|fault| fault.message)
+}
+
+/// What stopped jq's parser on a text it refuses (#5497).
+struct ParseFault {
+    /// Whether it stopped on [`JQ_MAX_PARSING_DEPTH`].
+    depth: bool,
+    /// The byte of `text` it stopped on, or `text`'s length when the fault is at its end.
+    offset: usize,
+    /// jq's diagnostic, worded as [`jq_parse_message`] words it.
+    message: String,
+}
+
+/// [`jq_parse_message`] for a text that starts at `line` and `column` of a longer input, so the
+/// position in the message is the one jq names for that input, refusing a bracket once `limit`
+/// stack entries are open.
+fn jq_parse_fault(text: &[u8], line: usize, column: usize, limit: usize) -> Option<ParseFault> {
+    let full = text.len();
     let text = text.strip_prefix(UTF8_BOM).unwrap_or(text);
-    let mut parser = Parser::new();
+    let bom = full - text.len();
+    let mut parser = Parser::new(line, column, limit);
+    let mut offset = full;
     let outcome = text
         .iter()
-        .try_for_each(|&byte| parser.feed(byte))
+        .enumerate()
+        .try_for_each(|(at, &byte)| {
+            offset = bom + at;
+            parser.feed(byte)
+        })
         .map_err(|stop| (stop, false))
-        .and_then(|()| parser.finish().map_err(|stop| (stop, true)));
-    match outcome {
-        Err((Stop::ExtraValues, _)) => Some(String::from("Unexpected extra JSON values")),
-        Err((Stop::Fault(fault), at_eof)) => Some(if at_eof {
-            format!(
-                "{fault} at EOF at line {}, column {}",
-                parser.line, parser.column
-            )
-        } else {
-            format!("{fault} at line {}, column {}", parser.line, parser.column)
-        }),
-        Ok(()) if parser.emitted == 0 => Some(String::from("Expected JSON value")),
-        Ok(()) => None,
+        .and_then(|()| {
+            offset = full;
+            parser.finish().map_err(|stop| (stop, true))
+        });
+    let (depth, message) = match outcome {
+        Err((Stop::ExtraValues, _)) => (false, String::from("Unexpected extra JSON values")),
+        Err((Stop::Fault(fault), at_eof)) => (
+            fault == DEPTH_FAULT,
+            if at_eof {
+                format!(
+                    "{fault} at EOF at line {}, column {}",
+                    parser.line, parser.column
+                )
+            } else {
+                format!("{fault} at line {}, column {}", parser.line, parser.column)
+            },
+        ),
+        Ok(()) if parser.emitted == 0 => (false, String::from("Expected JSON value")),
+        Ok(()) => return None,
+    };
+    Some(ParseFault {
+        depth,
+        offset,
+        message,
+    })
+}
+
+/// Whether a `[` or `{` of `text` opens with `limit` entries already on jq's parse stack, an
+/// array holding one and an object two (#5497): the count [`Parser::open`] refuses at, kept
+/// for the brackets alone. A container can only open as a value, so every object above it has
+/// its key read, and jq never refuses the key itself.
+///
+/// It reads strings with [`string_literal_end`](crate::json::light::string_literal_end), the
+/// splitter's own scanner, and gives up (`false`) on one that scanner rejects: the document is
+/// malformed there, and its first fault in jq's order is for the route's own handling, not for
+/// this check.
+fn stack_reaches(text: &[u8], limit: usize) -> bool {
+    let mut weights: Vec<u8> = Vec::new();
+    let mut entries = 0usize;
+    let mut at = 0;
+    while let Some(&byte) = text.get(at) {
+        match byte {
+            b'"' => match crate::json::light::string_literal_end(text, at) {
+                Some(end) => {
+                    at = end;
+                    continue;
+                }
+                None => return false,
+            },
+            b'[' | b'{' => {
+                if entries >= limit {
+                    return true;
+                }
+                let weight = if byte == b'[' { 1 } else { 2 };
+                entries += usize::from(weight);
+                weights.push(weight);
+            }
+            b']' | b'}' => entries -= weights.pop().map_or(0, usize::from),
+            _ => {}
+        }
+        at += 1;
     }
+    false
+}
+
+/// jq's message when its parser, reading `text` from `line` and `column` of its input (as
+/// [`jq_input_depth_fault`] places it), refuses a bracket past [`JQ_MAX_PARSING_DEPTH`] before
+/// anything else stops it, or `None` (#5497).
+///
+/// For text the splitter could not delimit (a container left open, say): jq still meets its
+/// depth limit first when the refused bracket comes before the fault, and the message is jq's
+/// parse error rather than the splitter's.
+#[doc(hidden)]
+pub fn jq_depth_fault(text: &[u8], line: usize, column: usize) -> Option<String> {
+    jq_parse_fault(text, line, column, JQ_MAX_PARSING_DEPTH)
+        .filter(|fault| fault.depth)
+        .map(|fault| fault.message)
+}
+
+/// Whether `message` is jq's parse-depth refusal, which jq's `main` prints as a parse error.
+#[doc(hidden)]
+pub fn is_jq_depth_fault(message: &str) -> bool {
+    message.starts_with(DEPTH_FAULT)
+}
+
+/// The byte of `text` at which jq's parser, reading it from its start, refuses a bracket past
+/// [`JQ_MAX_PARSING_DEPTH`], or `None` when it stops on anything else first (#5497).
+///
+/// For a caller that must place jq's depth refusal in its input, where a validator with a
+/// limit of its own stops somewhere else.
+#[doc(hidden)]
+pub fn jq_depth_fault_offset(text: &[u8]) -> Option<usize> {
+    jq_parse_fault(text, 1, 0, JQ_MAX_PARSING_DEPTH)
+        .filter(|fault| fault.depth)
+        .map(|fault| fault.offset)
+}
+
+/// Where a document checked against jq's parse-depth limit came from (#5497).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputSource {
+    /// A document of the input stream, as jq's parser reads it.
+    Stream,
+    /// The `[...]` `--slurp` joins every document into. jq parses the documents, never the
+    /// array, so the limit applies to each member, and the files are gone by the time it is
+    /// indexed, so the message has no position.
+    Slurped,
+}
+
+/// jq's message when its parse-depth limit refuses the document `text`, whose index has the
+/// balanced parentheses `bp`, or `None` when jq's parser gets past every bracket in it (#5497).
+///
+/// `position` places a [`InputSource::Stream`] document in its input as jq counts: the 1-based
+/// line its first byte is on, and the bytes before it on that line. It is asked only when the
+/// parser runs, so a caller can count lines there without charging every document for it.
+///
+/// Only the depth limit is reported. A document whose first fault is anything else is left to
+/// the route's own handling, so this refuses nothing jq's limit does not.
+///
+/// Two cheaper reads come first, so the parser runs only on a document it will refuse. A `[` or
+/// `{` is refused once [`JQ_MAX_PARSING_DEPTH`] entries are open, and no container adds more
+/// than two, so the refused bracket is at least the 129th nested one. The BP has one open per
+/// container and one per leaf, so its excess is at most the container depth plus one, and a BP
+/// that never rises above 128 cannot hold a refused bracket. That costs one popcount per 64
+/// parentheses ([`BalancedParens::max_excess_exceeds`](crate::trees::BalancedParens::max_excess_exceeds)).
+/// A document that does rise above 128 is walked for jq's stack alone ([`stack_reaches`]), its
+/// strings skipped whole, which is several times faster than the parser's byte-at-a-time
+/// tokenizing, and only a document that walk refuses is parsed, for jq's message.
+#[doc(hidden)]
+pub fn jq_input_depth_fault<W: AsRef<[u64]>>(
+    text: &[u8],
+    bp: &crate::trees::BalancedParens<W>,
+    source: InputSource,
+    position: impl FnOnce() -> (usize, usize),
+) -> Option<String> {
+    // The slurp wrapper adds one level to every member, so the bound moves with the limit.
+    let wrapper = usize::from(source == InputSource::Slurped);
+    if !bp.max_excess_exceeds(JQ_MAX_PARSING_DEPTH / 2 + wrapper) {
+        return None;
+    }
+    if !stack_reaches(text, JQ_MAX_PARSING_DEPTH + wrapper) {
+        return None;
+    }
+    let (line, column) = match source {
+        InputSource::Stream => position(),
+        InputSource::Slurped => (1, 0),
+    };
+    let fault = jq_parse_fault(text, line, column, JQ_MAX_PARSING_DEPTH + wrapper)?;
+    fault.depth.then(|| match source {
+        InputSource::Stream => fault.message,
+        InputSource::Slurped => String::from(DEPTH_FAULT),
+    })
 }
 
 #[cfg(test)]
@@ -546,5 +721,158 @@ mod tests {
             message(&"[".repeat(256)).as_deref(),
             Some("Unfinished JSON term at EOF at line 1, column 256")
         );
+    }
+
+    fn depth_fault(text: &str, line: usize, column: usize) -> Option<String> {
+        let index = crate::json::JsonIndex::build(text.as_bytes());
+        jq_input_depth_fault(text.as_bytes(), index.bp(), InputSource::Stream, || {
+            (line, column)
+        })
+    }
+
+    fn nest(open: &str, inner: &str, close: &str, levels: usize) -> String {
+        format!("{}{inner}{}", open.repeat(levels), close.repeat(levels))
+    }
+
+    /// Every boundary captured live from `/usr/bin/jq` 1.7.1 (`jq -c length`): an object holds two
+    /// stack entries once its key is read, but the key itself is never refused (#5497).
+    #[test]
+    fn input_depth_fault_refuses_what_jq_refuses_5497() {
+        for (text, want) in [
+            (nest("[", "", "]", 256), None),
+            (nest("[", "1", "]", 256), None),
+            (
+                nest("[", "", "]", 257),
+                Some("Exceeds depth limit for parsing at line 1, column 257"),
+            ),
+            (nest("{\"a\":", "1", "}", 128), None),
+            (
+                nest("{\"a\":", "1", "}", 129),
+                Some("Exceeds depth limit for parsing at line 1, column 641"),
+            ),
+            // The BP's excess peaks at exactly 129 here (the 128th key and the empty object),
+            // so this is the shape that pins the pre-filter's bound.
+            (
+                nest("{\"a\":", "{}", "}", 128),
+                Some("Exceeds depth limit for parsing at line 1, column 641"),
+            ),
+            (nest("[{\"a\":", "1", "}]", 85), None),
+            (
+                nest("[{\"a\":", "1", "}]", 86),
+                Some("Exceeds depth limit for parsing at line 1, column 512"),
+            ),
+            (nest("[", "{\"a\":1}", "]", 255), None),
+            (nest("[", "{}", "]", 255), None),
+            (
+                nest("[", "{\"a\":[1]}", "]", 254),
+                Some("Exceeds depth limit for parsing at line 1, column 260"),
+            ),
+        ] {
+            assert_eq!(depth_fault(&text, 1, 0).as_deref(), want, "{text}");
+        }
+    }
+
+    /// The position continues from where the document sits in its input, as jq counts it: a
+    /// newline inside the document moves the line, and the column restarts there.
+    #[test]
+    fn input_depth_fault_names_the_position_in_the_input_5497() {
+        let deep = nest("[", "", "]", 300);
+        assert_eq!(
+            depth_fault(&deep, 4, 0).as_deref(),
+            Some("Exceeds depth limit for parsing at line 4, column 257")
+        );
+        assert_eq!(
+            depth_fault(&deep, 2, 10).as_deref(),
+            Some("Exceeds depth limit for parsing at line 2, column 267")
+        );
+        let broken = format!("[\n{}", &deep[1..]);
+        assert_eq!(
+            depth_fault(&broken, 3, 5).as_deref(),
+            Some("Exceeds depth limit for parsing at line 4, column 256")
+        );
+    }
+
+    /// A document jq refuses for something else first is not a depth refusal, and a bracket
+    /// inside a string is not a container.
+    #[test]
+    fn input_depth_fault_reports_only_the_depth_limit_5497() {
+        let syntax_first = format!("[1,,{}]", nest("[", "", "]", 300));
+        assert_eq!(depth_fault(&syntax_first, 1, 0), None);
+        let strings = nest("[", "\"[[[[{{{{\"", "]", 200);
+        assert_eq!(depth_fault(&strings, 1, 0), None);
+    }
+
+    /// Under `--slurp` the synthesized array is not one of jq's levels: its members get the
+    /// whole limit, and the message has no position to name.
+    #[test]
+    fn input_depth_fault_does_not_count_the_slurp_wrapper_5497() {
+        let slurped = |members: &[String]| {
+            let text = format!("[{}]", members.join(","));
+            let index = crate::json::JsonIndex::build(text.as_bytes());
+            // A position the message would show if it were used.
+            jq_input_depth_fault(text.as_bytes(), index.bp(), InputSource::Slurped, || (9, 9))
+        };
+        assert_eq!(slurped(&[nest("[", "1", "]", 256), "2".into()]), None);
+        assert_eq!(slurped(&[nest("{\"a\":", "1", "}", 128)]), None);
+        assert_eq!(
+            slurped(&["1".into(), nest("[", "", "]", 257)]).as_deref(),
+            Some("Exceeds depth limit for parsing")
+        );
+        assert_eq!(
+            slurped(&[nest("{\"a\":", "1", "}", 129)]).as_deref(),
+            Some("Exceeds depth limit for parsing")
+        );
+    }
+
+    #[test]
+    fn depth_fault_offset_is_the_refused_bracket_5497() {
+        let deep = nest("[", "", "]", 300);
+        assert_eq!(jq_depth_fault_offset(deep.as_bytes()), Some(256));
+        // jq reads on into the next value, and meets the limit there.
+        let after = format!("1 {deep} 2");
+        assert_eq!(jq_depth_fault_offset(after.as_bytes()), Some(2 + 256));
+        let syntax_first = format!("[1,,{deep}]");
+        assert_eq!(jq_depth_fault_offset(syntax_first.as_bytes()), None);
+        let objects = format!("\u{feff}{}", nest("{\"a\":", "1", "}", 129));
+        assert_eq!(jq_depth_fault_offset(objects.as_bytes()), Some(3 + 640));
+        assert_eq!(jq_depth_fault_offset(b"[1,,2]"), None);
+    }
+
+    /// The bracket walk refuses exactly where the parser does: on every boundary shape above and
+    /// on random mixed nestings, with brackets inside strings and escaped quotes (#5497).
+    #[test]
+    fn stack_reaches_agrees_with_the_parser_5497() {
+        let parser_refuses = |text: &str| {
+            jq_parse_fault(text.as_bytes(), 1, 0, JQ_MAX_PARSING_DEPTH).is_some_and(|f| f.depth)
+        };
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..400 {
+            let depth = 100 + (next() % 200) as usize;
+            let (mut open, mut close) = (String::new(), Vec::new());
+            for _ in 0..depth {
+                if next() % 2 == 0 {
+                    open.push_str(["[", "[1,\"]\",", "[\"[{\\\"\","][(next() % 3) as usize]);
+                    close.push("]");
+                } else {
+                    open.push_str(["{\"a\":", "{\"k\":{},\"a\":"][(next() % 2) as usize]);
+                    close.push("}");
+                }
+            }
+            close.reverse();
+            let text = format!("{open}1{}", close.concat());
+            let head = &text[..text.len().min(120)];
+            assert_eq!(
+                stack_reaches(text.as_bytes(), JQ_MAX_PARSING_DEPTH),
+                parser_refuses(&text),
+                "{head}"
+            );
+        }
+        assert!(!stack_reaches(b"[\"unterminated", JQ_MAX_PARSING_DEPTH));
     }
 }

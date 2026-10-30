@@ -77,10 +77,6 @@ use crate::front_matter::UTF8_BOM;
 
 const ASCII_RS: u8 = 0x1e;
 
-/// jq's `MAX_PARSING_DEPTH` (`jv_parse.c`), confirmed against the oracle:
-/// 256 nested `[` parse and the 257th reports `Exceeds depth limit`.
-const MAX_PARSING_DEPTH: usize = 256;
-
 /// The most bytes one of jq's `fgets` refills can hold: `jq_util_input_read_more`
 /// (`src/util.c`) calls `fgets(state->buf, sizeof(state->buf), f)` on a
 /// `char buf[4096]`, and `fgets` reserves one byte for the terminating NUL.
@@ -1084,7 +1080,7 @@ impl<'a> Reader<'a> {
     fn token_structure(&mut self, ch: u8) -> Result<(), &'static str> {
         match ch {
             b'[' | b'{' => {
-                if self.stack.len() >= MAX_PARSING_DEPTH {
+                if self.stack.len() >= succinctly::jq::JQ_MAX_PARSING_DEPTH {
                     return Err("Exceeds depth limit for parsing");
                 }
                 if self.next.is_some() {

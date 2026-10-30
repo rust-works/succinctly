@@ -151,6 +151,12 @@ pub use expr::{
     PipeStages, Program, SharedArg, SliceBoundKey, StringPart,
 };
 pub use lazy::JqValue;
+// #5497: jq's parse-depth limit, applied by the CLI's document routes.
+#[doc(hidden)]
+pub use parse_message::{
+    is_jq_depth_fault, jq_depth_fault, jq_depth_fault_offset, jq_input_depth_fault, InputSource,
+    JQ_MAX_PARSING_DEPTH,
+};
 pub use parser::{
     collect_break_sites, collect_call_sites, collect_def_sites, collect_var_sites, parse,
     parse_program, parse_program_with_extra_shadowable_defs,
@@ -168,7 +174,7 @@ pub use value::{
     jq_float_is_scientific, nesting_depth_exceeded_message, ArrayIntoIter, ArrayOf, ArrayVec,
     FlaggedOccurrences, NumberRepr, ObjectMap, ObjectMapEntry, ObjectMapIntoIter, ObjectMapOf,
     OccupiedMapEntry, Occurrences, OwnedValue, ReindexedDoc, SharableLiteral, SharableString,
-    VacantMapEntry, MAX_VALUE_TREE_DEPTH,
+    VacantMapEntry, JQ_MAX_PRINT_DEPTH, MAX_VALUE_TREE_DEPTH, SKIPPED_TOO_DEEP,
 };
 // `pub(crate)`, not `pub`: only `yaml::light`'s alias-chain resolvers (#1191
 // code review, #1193/PR #1314) need this from outside `jq::value` --

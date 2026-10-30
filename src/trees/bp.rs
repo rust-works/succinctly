@@ -2408,6 +2408,42 @@ impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
         self.len - self.total_ones
     }
 
+    /// Whether the excess (opens minus closes in `[0, p]`) rises above `bound` at any `p`: the
+    /// tree has a node deeper than `bound` levels, counting the root as 1 (#5497).
+    ///
+    /// A word whose opens could not lift the excess at its start above `bound` cannot cross it,
+    /// so it is skipped with one popcount; only a word that could is walked bit by bit. A tree
+    /// that stays well under `bound` costs one popcount per 64 parentheses.
+    pub fn max_excess_exceeds(&self, bound: usize) -> bool {
+        let bound = i64::try_from(bound).unwrap_or(i64::MAX);
+        let mut excess = 0i64;
+        let mut remaining = self.len;
+        for &word in self.words.as_ref() {
+            if remaining == 0 {
+                break;
+            }
+            let bits = remaining.min(64);
+            remaining -= bits;
+            let word = if bits == 64 {
+                word
+            } else {
+                word & ((1u64 << bits) - 1)
+            };
+            let opens = i64::from(word.count_ones());
+            if excess + opens > bound {
+                let mut at = excess;
+                for k in 0..bits {
+                    at += if (word >> k) & 1 == 1 { 1 } else { -1 };
+                    if at > bound {
+                        return true;
+                    }
+                }
+            }
+            excess += 2 * opens - bits as i64;
+        }
+        false
+    }
+
     /// Find the position of the k-th 1-bit (0-indexed).
     ///
     /// Returns `None` if k >= total_ones.
@@ -5341,6 +5377,95 @@ mod tests {
                 scalar_excess, sse41_excess,
                 "L1 block_excess mismatch for pattern {pattern_idx}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod max_excess_tests {
+    use super::*;
+
+    /// `parens` as BP words, `(` = 1, LSB first, with the unused high bits of the last word set,
+    /// so a test fails if the walk reads past `len`.
+    fn bp(parens: &str) -> BalancedParens {
+        let len = parens.len();
+        let mut words = vec![0u64; len.div_ceil(64).max(1)];
+        for (i, c) in parens.bytes().enumerate() {
+            if c == b'(' {
+                words[i / 64] |= 1 << (i % 64);
+            }
+        }
+        if len % 64 != 0 {
+            *words.last_mut().unwrap() |= u64::MAX << (len % 64);
+        }
+        BalancedParens::new(words, len)
+    }
+
+    fn max_excess(parens: &str) -> i64 {
+        let mut excess = 0i64;
+        let mut max = 0;
+        for c in parens.bytes() {
+            excess += if c == b'(' { 1 } else { -1 };
+            max = max.max(excess);
+        }
+        max
+    }
+
+    #[test]
+    fn max_excess_exceeds_is_strict_at_the_bound_5497() {
+        for depth in [1usize, 63, 64, 65, 128, 129, 200] {
+            let nest = format!("{}{}", "(".repeat(depth), ")".repeat(depth));
+            let tree = bp(&nest);
+            assert!(!tree.max_excess_exceeds(depth), "depth {depth}");
+            assert!(tree.max_excess_exceeds(depth - 1), "depth {depth}");
+        }
+        assert!(!bp("").max_excess_exceeds(0));
+    }
+
+    /// A word whose opens could cross the bound but whose running excess does not must not be
+    /// reported: `()` repeated has 32 opens per word and never rises above 1.
+    #[test]
+    fn max_excess_exceeds_walks_a_word_that_only_might_cross_5497() {
+        let flat = "()".repeat(100);
+        assert!(!bp(&flat).max_excess_exceeds(1));
+        assert!(bp(&flat).max_excess_exceeds(0));
+        let deep_then_flat = format!("{}{}{}", "(".repeat(40), "()".repeat(50), ")".repeat(40));
+        assert!(!bp(&deep_then_flat).max_excess_exceeds(41));
+        assert!(bp(&deep_then_flat).max_excess_exceeds(40));
+    }
+
+    #[test]
+    fn max_excess_exceeds_agrees_with_the_bit_walk_5497() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..500 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let len = (state % 700) as usize;
+            // Open with probability 1/2 to 7/8 so the excess climbs at different rates.
+            let bias = 4 + (state >> 20) % 4;
+            let mut seed = state;
+            let parens: String = (0..len)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    if seed % 8 < bias {
+                        '('
+                    } else {
+                        ')'
+                    }
+                })
+                .collect();
+            let tree = bp(&parens);
+            let max = max_excess(&parens);
+            for bound in [0, 1, 50, 63, 64, 65, 128, 300] {
+                assert_eq!(
+                    tree.max_excess_exceeds(bound),
+                    max > bound as i64,
+                    "len {len}, bound {bound}, max {max}"
+                );
+            }
         }
     }
 }

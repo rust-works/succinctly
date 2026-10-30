@@ -5,6 +5,8 @@
 //! panic line. jq itself answers every program below (`1`); whether 384 stays is #5497's call.
 //! `last(f)` no longer reaches the ceiling: since #5516 it shares the value instead of splicing
 //! it back, and answers as jq does; `reduce ... as $x ([]; . + [$x])` still splices `$x`.
+//! `try error(<deep>)` left the list with #5497: jq's writer stops at its print depth, so the
+//! message renders as jq's does and the program answers `1`.
 
 use anyhow::Result;
 
@@ -31,7 +33,6 @@ fn test_built_value_past_the_tree_ceiling_is_a_refusal_not_a_panic_5526() -> Res
         "reduce f(400) as $x ([]; . + [$x]) | length",
         "{\"a\":1} | .a += f(400) | length",
         "null | .a //= f(400) | length",
-        "try error(f(400)) catch 1",
         "last(foreach range(385) as $i (0;[.])) | length",
     ] {
         let program = format!("{DEF} {filter}");
@@ -48,11 +49,25 @@ fn test_built_value_past_the_tree_ceiling_on_document_input_5526() -> Result<()>
         "reduce f(400) as $x ([]; . + [$x]) | length",
         ".a += f(400) | length",
         ".a //= f(400) | length",
-        "try error(f(400)) catch 1",
     ] {
         let program = format!("{DEF} {filter}");
         let (stdout, stderr, code) = run_jq_full(&["-c", &program], Some("{}"))?;
         assert_refused(&stdout, &stderr, code, filter);
+    }
+    Ok(())
+}
+
+/// #5497: rendering the raised value stops at jq's print depth, so it never reaches the ceiling,
+/// on either route, and `try` sees the error as jq's does.
+#[test]
+fn test_error_of_a_built_value_past_the_tree_ceiling_answers_as_jq_5497() -> Result<()> {
+    let program = format!("{DEF} try error(f(400)) catch 1");
+    for (args, input) in [
+        (&["-nc", &program][..], None),
+        (&["-c", &program][..], Some("{}")),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(args, input)?;
+        assert_eq!((stdout.as_str(), stderr.as_str(), code), ("1\n", "", 0));
     }
     Ok(())
 }
