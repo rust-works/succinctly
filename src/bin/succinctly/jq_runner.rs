@@ -4514,13 +4514,20 @@ fn stopped(on_error: Option<OnError>, sink: &ErrorSink) -> bool {
 /// otherwise-successful result that happened to be falsy (#355 vs #178). Which errors count
 /// is `--on-error`'s: by default only the last input's, as in jq, plus anywhere an error jq
 /// would not have raised there ([`ErrorSink::beyond_jq`], #5471).
+///
+/// A file that would not open outranks both: jq sets its exit status to 2 once the run is
+/// over, whatever the filter left (`open_failed`, #5472).
 fn jq_exit_code(
     args: &JqCommand,
     sink: &ErrorSink,
     mut finished: FinishedInputs,
     mut had_output: bool,
     mut last_output: Option<OwnedValue>,
+    open_failed: bool,
 ) -> i32 {
+    if open_failed {
+        return exit_codes::USAGE_ERROR;
+    }
     let failed = match args.on_error {
         None => sink.input_failed() || sink.beyond_jq(),
         Some(OnError::Continue | OnError::Stop) => sink.hit(),
@@ -4916,6 +4923,9 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     // so the failure is remembered here, and `jq_exit_code` turns the ones its
     // `--on-error` mode counts into exit 5 (#355, #5471).
     let mut sink = ErrorSink::default();
+    // An input file jq could not open is reported and skipped, and the run then exits 2
+    // whatever else happened (#5472).
+    let mut open_failed = false;
 
     // Validate DSV delimiter if provided
     if let Some(delim) = args.input_dsv {
@@ -4929,20 +4939,15 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
         if !args.slurp && !args.null_input && !uses_input_builtins {
             // Streaming mode: process each row independently
             let files = get_input_files(&args);
-            // `input_filename` on this route too (#3046 review).
-            jq::cli_context::set_input_names(input_names(&files));
-            let raw_inputs: Vec<Vec<u8>> = if files.is_empty() {
-                vec![read_stdin_bytes()?]
+            let (files, raw_inputs, failures) = if files.is_empty() {
+                (files, vec![read_stdin_bytes()?], Vec::new())
             } else {
-                match files
-                    .iter()
-                    .map(|path| read_file_bytes(path))
-                    .collect::<std::result::Result<Vec<_>, InputFileOpenError>>()
-                {
-                    Ok(raw) => raw,
-                    Err(unopenable) => return Ok(report_unopenable_input(&unopenable)),
-                }
+                read_input_files(&files)
             };
+            report_open_failures(&failures, &mut open_failed);
+            // `input_filename` on this route too (#3046 review), named after the files that
+            // opened: `raw_inputs`' indexes are its source tags (#5472).
+            jq::cli_context::set_input_names(input_names(&files));
 
             'files: for (file_idx, raw) in raw_inputs.into_iter().enumerate() {
                 if stopped(args.on_error, &sink) {
@@ -5027,6 +5032,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 finished,
                 had_output,
                 last_output,
+                open_failed,
             ));
         }
         // Fall through to original path for slurp mode
@@ -5074,21 +5080,24 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
         // Lazy path: read files as raw bytes and process directly
         // This preserves original number formatting like "4e4"
         let files = get_input_files(&args);
-        // `input_filename`'s names for this route's source tags, which are the
-        // indexes into `raw_inputs` below (#3046).
-        jq::cli_context::set_input_names(input_names(&files));
-        let mut raw_inputs: Vec<Vec<u8>> = if files.is_empty() {
-            vec![read_stdin_bytes()?]
+        let (files, mut raw_inputs, failures) = if files.is_empty() {
+            (files, vec![read_stdin_bytes()?], Vec::new())
         } else {
-            match files
-                .iter()
-                .map(|path| read_file_bytes(path))
-                .collect::<std::result::Result<Vec<_>, InputFileOpenError>>()
-            {
-                Ok(raw) => raw,
-                Err(unopenable) => return Ok(report_unopenable_input(&unopenable)),
-            }
+            read_input_files(&files)
         };
+        // A slurp reads every file in the one fetch that meets the first failure, so it
+        // reports them all up front and cuts nothing. Otherwise jq reports a file when its
+        // reader gets there, which the loop below does too (#5472).
+        let stop_at = failures.first().map(|(at, _)| *at).filter(|_| !args.slurp);
+        if args.slurp {
+            report_open_failures(&failures, &mut open_failed);
+        }
+        let mut next_failure = if args.slurp { failures.len() } else { 0 };
+        let mut run_stopped = false;
+        // `input_filename`'s names for this route's source tags, which are the
+        // indexes into `raw_inputs` below (#3046). Only the files that opened have a tag, so
+        // the names are taken after the ones that did not are dropped (#5472).
+        jq::cli_context::set_input_names(input_names(&files));
         // #5291: jq skips a BOM at the start of its input, `--validate` included.
         strip_leading_json_bom(raw_inputs.iter_mut());
         // #4305: see [`stitch_json_file_seams`]. Not under `--validate`, which is strict per file.
@@ -5167,6 +5176,12 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
         let seams_align = seams.is_empty() || seams.len() == raw_inputs.len();
         debug_assert!(slurped.is_some() || seams_align);
         'files: for (idx, raw) in raw_inputs.iter().enumerate() {
+            // The files that would not open before this one, reported now: jq's reader meets
+            // them as it moves on to this file (#5472).
+            while let Some((_, e)) = failures.get(next_failure).filter(|(at, _)| *at <= idx) {
+                report_unopenable_input(e, &mut open_failed);
+                next_failure += 1;
+            }
             // The slurped document answers for the last file (`input_filename`,
             // and the file a diagnostic names), as the materializing route's
             // `InputLocations::single` always did.
@@ -5208,6 +5223,16 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
             } else {
                 split_json_values(raw)
             };
+            // jq's main loop ends the run once an open has failed, after the one value it was
+            // fetching when it met the failure: the first the files past it hold. It reads
+            // nothing beyond that value, so a fault further on is never reached (#5472).
+            let past_open_failure = stop_at.is_some_and(|at| idx >= at) && !values.is_empty();
+            let split_error = if past_open_failure {
+                values.truncate(1);
+                None
+            } else {
+                split_error
+            };
             // #4311: a number or literal the fault's own byte completes is
             // never read (`1\n2]` reads `1`, then the error).
             if let (Some(offset), Some(&last)) = (split_error, values.last()) {
@@ -5240,6 +5265,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
             for (start, end) in values {
                 if !finished.next_input(args.on_error, &mut sink, &mut had_output, &mut last_output)
                 {
+                    run_stopped = true;
                     break 'files;
                 }
                 let json_bytes = &raw[start..end];
@@ -5275,6 +5301,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                     })
                 {
                     sink.report_parse_error(&message);
+                    run_stopped = true;
                     break 'files;
                 }
                 // #1576: the M2 fast path, mirroring `yq_runner.rs`'s own
@@ -5521,11 +5548,16 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                     return Ok(code);
                 }
             }
+            if past_open_failure {
+                run_stopped = true;
+                break;
+            }
             // The malformed value, reported only once everything before it
             // has been processed. jq's parser stops at the first malformed
             // value and reads nothing after it, this file or any later one
             // (#4313), so the files that follow are not run either.
             if stopped(args.on_error, &sink) {
+                run_stopped = true;
                 break;
             }
             if let Some(offset) = split_error {
@@ -5538,15 +5570,22 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                     jq::jq_stream_fault(raw_inputs.iter().map(Vec::as_slice), 1, 0)
                 {
                     sink.report_parse_error(&message);
+                    run_stopped = true;
                     break;
                 }
                 // patchcov: coverage tolerate reason="defensive: the splitter stops only at a fault jq's parser also meets, so `jq_stream_fault` names one; kept so a disagreement between them prints the old line placement rather than none (#5555)"
                 let at =
                     InputLocation::at(filename.as_deref(), parse_error_line(raw, offset, seam));
                 sink.report(DiagStyle::Jq, &EvalError::new("Invalid JSON text"), &at);
+                run_stopped = true;
                 break;
                 // patchcov: coverage end
             }
+        }
+        // Past the last file that opened: the ones that would not open after it, which jq's
+        // reader meets when it asks for more and finds none -- unless the run had stopped.
+        if !run_stopped {
+            report_open_failures(&failures[next_failure..], &mut open_failed);
         }
     } else {
         // The materializing path: reads every document up front into a
@@ -5588,52 +5627,51 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
             get_input_files(&args).is_empty(),
             std::io::stdin().is_terminal(),
         );
-        let (inputs, locations, trailing_error, resumed_errors) =
-            match get_inputs(&args, force_read_under_null_input, uses_input_builtins) {
-                Ok(Ok(inputs)) => inputs,
-                // A malformed or undecodable document is a data error, so it goes
-                // out in jq's own diagnostic shape at exit 5 rather than through
-                // `anyhow` at exit 1 with an `Error:` prefix jq never prints
-                // (#1194). Everything else here really is I/O and keeps the
-                // `anyhow` path.
-                //
-                // Line 0, the same placeholder the lazy path prints when it has
-                // no better position. Only `--slurp` still fails here: it reads
-                // the whole stream into one value, so there is no document
-                // position to name. A non-slurped stream keeps its clean prefix
-                // and reports its parse error after it instead (#2961).
-                Ok(Err(e)) => {
-                    // A main input `get_inputs` couldn't open is jq's own
-                    // exit-2 usage error, not a data error (#3098) -- checked
-                    // before the `MalformedJsonError` branch below, which
-                    // drains the `anyhow` channel by consuming `e`.
-                    if let Some(unopenable) = e.downcast_ref::<InputFileOpenError>() {
-                        return Ok(report_unopenable_input(unopenable));
+        let mut opened = Vec::new();
+        let (inputs, locations, trailing_error, resumed_errors) = match get_inputs(
+            &args,
+            force_read_under_null_input,
+            uses_input_builtins,
+            &mut open_failed,
+            &mut opened,
+        ) {
+            Ok(Ok(inputs)) => inputs,
+            // A malformed or undecodable document is a data error, so it goes
+            // out in jq's own diagnostic shape at exit 5 rather than through
+            // `anyhow` at exit 1 with an `Error:` prefix jq never prints
+            // (#1194). Everything else here really is I/O and keeps the
+            // `anyhow` path.
+            //
+            // Line 0, the same placeholder the lazy path prints when it has
+            // no better position. Only `--slurp` still fails here: it reads
+            // the whole stream into one value, so there is no document
+            // position to name. A non-slurped stream keeps its clean prefix
+            // and reports its parse error after it instead (#2961).
+            Ok(Err(e)) => {
+                let malformed = e.downcast::<MalformedJsonError>()?;
+                let err = malformed.to_eval_error();
+                // The files that opened: `source` indexes them (#5472).
+                let name_of =
+                    |source: usize| opened.get(source).map(|p| p.to_string_lossy().to_string());
+                // #5555: jq's own parse error reads a slurped stream before the program
+                // runs, so it is a parse error; under `-n` it is the error `inputs` raises,
+                // at the position the parser stood on.
+                match malformed.stream_fault {
+                    Some((source, line)) if args.null_input => {
+                        let at = InputLocation::at(name_of(source).as_deref(), line);
+                        sink.report(DiagStyle::Jq, &err, &at);
                     }
-                    let malformed = e.downcast::<MalformedJsonError>()?;
-                    let err = malformed.to_eval_error();
-                    let files = get_input_files(&args);
-                    let name_of =
-                        |source: usize| files.get(source).map(|p| p.to_string_lossy().to_string());
-                    // #5555: jq's own parse error reads a slurped stream before the program
-                    // runs, so it is a parse error; under `-n` it is the error `inputs` raises,
-                    // at the position the parser stood on.
-                    match malformed.stream_fault {
-                        Some((source, line)) if args.null_input => {
-                            let at = InputLocation::at(name_of(source).as_deref(), line);
-                            sink.report(DiagStyle::Jq, &err, &at);
-                        }
-                        Some(_) => sink.report_parse_error(&err.message),
-                        // patchcov: coverage tolerate reason="defensive: the only malformed document `get_inputs` returns here is a slurped stream, which carries the read that met its fault unless `slurp_fault_at` finds none (unreachable, see there); kept as the line-0 placement every other malformed document gets (#5555)"
-                        None => {
-                            let at = InputLocation::at(name_of(0).as_deref(), 0);
-                            sink.report(DiagStyle::Jq, &err, &at);
-                        } // patchcov: coverage end
-                    }
-                    return Ok(DiagStyle::Jq.error_exit_code());
+                    Some(_) => sink.report_parse_error(&err.message),
+                    // patchcov: coverage tolerate reason="defensive: the only malformed document `get_inputs` returns here is a slurped stream, which carries the read that met its fault unless `slurp_fault_at` finds none (unreachable, see there); kept as the line-0 placement every other malformed document gets (#5555)"
+                    None => {
+                        let at = InputLocation::at(name_of(0).as_deref(), 0);
+                        sink.report(DiagStyle::Jq, &err, &at);
+                    } // patchcov: coverage end
                 }
-                Err(exit_code) => return Ok(exit_code), // Validation error
-            };
+                return Ok(DiagStyle::Jq.error_exit_code());
+            }
+            Err(exit_code) => return Ok(exit_code), // Validation error
+        };
         // `input_filename`'s names for this route's source tags (#3046). Stdin
         // is one unnamed source, which this table records as no sources at
         // all.
@@ -5932,6 +5970,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
         finished,
         had_output,
         last_output,
+        open_failed,
     ))
 }
 
@@ -6198,6 +6237,8 @@ fn get_inputs(
     args: &JqCommand,
     force_read_under_null_input: bool,
     track_eof: bool,
+    open_failed: &mut bool,
+    opened: &mut Vec<PathBuf>,
 ) -> std::result::Result<Result<Inputs>, i32> {
     // Null input mode: use null as the single input -- unless the filter
     // itself uses `input`/`inputs`/`input_line_number` (#723), in which case
@@ -6226,26 +6267,27 @@ fn get_inputs(
     // rather than through `read_to_string`, which refused the whole input on
     // a stray byte and reported it as a *read* failure when the read had in
     // fact succeeded (#1247).
-    let mut raw_bytes: Vec<(Option<usize>, Vec<u8>)> = if files.is_empty() {
+    //
+    // `files` is then the ones that opened (#5472): every source index below is a position in
+    // it, and the `InputLocations` built from it, so a file that did not open takes no index.
+    // A main input `read_file_bytes` couldn't open is jq's own exit-2 usage error (#3098),
+    // reported here and left out; `opened` hands the caller the names that remain.
+    let (files, mut raw_bytes): OpenedInputs = if files.is_empty() {
         match read_stdin_bytes() {
-            Ok(b) => vec![(None, b)],
+            Ok(b) => (files, vec![(None, b)]),
             Err(e) => return Ok(Err(e)),
         }
     } else {
-        let mut inputs = Vec::new();
-        for (idx, path) in files.iter().enumerate() {
-            match read_file_bytes(path) {
-                Ok(b) => inputs.push((Some(idx), b)),
-                // A main input `read_file_bytes` couldn't open is jq's own
-                // exit-2 usage error (#3098); the caller downcasts it back
-                // out of the `anyhow` channel here. `e.into()` converts the
-                // concrete [`InputFileOpenError`] into the `anyhow::Error`
-                // this `Result<Inputs, _>` carries.
-                Err(e) => return Ok(Err(anyhow::Error::from(e))),
-            }
-        }
-        inputs
+        let (files, raws, failures) = read_input_files(&files);
+        report_open_failures(&failures, open_failed);
+        let raws = raws
+            .into_iter()
+            .enumerate()
+            .map(|(idx, raw)| (Some(idx), raw))
+            .collect();
+        (files, raws)
     };
+    opened.clone_from(&files);
 
     // JSON input mode is the only mode that runs the strict validator at all
     // -- `-R`, `--seq` and DSV never do, and must not start now.
@@ -7561,7 +7603,7 @@ fn read_stdin_bytes() -> Result<Vec<u8>> {
 /// A file `std::fs::read` cannot open is an [`InputFileOpenError`], not a
 /// generic `anyhow` failure: jq reports a main input it cannot open with its
 /// own one-line diagnostic at exit 2, so the call sites convert it back
-/// (via [`report_unopenable_input`], or `get_inputs`' caller's downcast)
+/// (via [`report_unopenable_input`])
 /// rather than letting it escape as `Error: .../Caused by:` at exit 1
 /// (#3098).
 fn read_file_bytes(path: &Path) -> std::result::Result<Vec<u8>, InputFileOpenError> {
@@ -7632,9 +7674,52 @@ impl std::error::Error for InputFileOpenError {}
 /// Report an [`InputFileOpenError`] the way jq does and answer with the exit
 /// code jq takes for it: `jq: error: Could not open file <path>: <detail>`,
 /// exit 2 (`USAGE_ERROR`) (#3098).
-fn report_unopenable_input(e: &InputFileOpenError) -> i32 {
+///
+/// jq carries on with the other files and exits 2 at the end, so this only reports and notes
+/// the failure in `open_failed` (#5472).
+fn report_unopenable_input(e: &InputFileOpenError, open_failed: &mut bool) {
     report_usage_error(&e.to_string());
-    exit_codes::USAGE_ERROR
+    *open_failed = true;
+}
+
+/// The input files that opened, and the bytes of each tagged with its position among them
+/// (`None` for stdin) ([`get_inputs`]).
+type OpenedInputs = (Vec<PathBuf>, Vec<(Option<usize>, Vec<u8>)>);
+
+/// The input files that did not open, each with the number of files that opened before it
+/// ([`read_input_files`]).
+type OpenFailures = Vec<(usize, InputFileOpenError)>;
+
+/// Read every main input file, setting aside each one that will not open and carrying on with
+/// the rest (#5472). jq's `jq: error: Could not open file ...` is one line per file, the run
+/// still reads the others, and its exit status is 2 at the end.
+///
+/// The files returned are the ones that opened, paired index for index with the bytes, so a
+/// source tag and `input_filename` name the right file. A failure is `(index, error)`, where
+/// the index is how many files opened before it: the position it sits at among them. It is
+/// the caller that reports it ([`report_open_failures`]), because jq reports a file when its
+/// reader reaches it, and the run can end before that.
+fn read_input_files(files: &[PathBuf]) -> (Vec<PathBuf>, Vec<Vec<u8>>, OpenFailures) {
+    let mut opened = Vec::with_capacity(files.len());
+    let mut raws = Vec::with_capacity(files.len());
+    let mut failures = Vec::new();
+    for path in files {
+        match read_file_bytes(path) {
+            Ok(raw) => {
+                opened.push(path.clone());
+                raws.push(raw);
+            }
+            Err(e) => failures.push((opened.len(), e)),
+        }
+    }
+    (opened, raws, failures)
+}
+
+/// Report every failure in `failures`, and note that the run must now exit 2.
+fn report_open_failures(failures: &[(usize, InputFileOpenError)], open_failed: &mut bool) {
+    for (_, e) in failures {
+        report_unopenable_input(e, open_failed);
+    }
 }
 
 /// What [`stitch_json_file_seams`] did to one file's bytes (#4305), which jq's own per-file
