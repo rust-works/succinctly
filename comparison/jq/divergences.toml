@@ -15,19 +15,16 @@ reason = "Prints the directory of the running binary, so the two tools differ by
 id = "features:strftime/1"
 category = "reference-crash"
 reason = "jq 1.7.1 aborts (`Assertion failed: JVP_HAS_KIND(j, JV_KIND_STRING)`, jv.c:1370) on a non-string format; succinctly reports a catchable error."
-platform = "macos"
 
 [[divergence]]
 id = "features:strflocaltime/1"
 category = "reference-crash"
 reason = "Same jq 1.7.1 assertion abort on a non-string format as strftime/1."
-platform = "macos"
 
 [[divergence]]
 id = "features:strptime/1"
 category = "host-dependent"
-reason = "On `\"a\" | strptime(.)` the weekday of 1900-00-00 is 6 in jq 1.7.1 (libc) and 0 in succinctly; the value is platform-libc dependent (#5340)."
-platform = "macos"
+reason = "On `\"a\" | strptime(.)` the weekday of 1900-00-00 is 6 in jq 1.7.1 on macOS, `[…,8,367]` on glibc, and `[…,0,-1]` in succinctly; the value is platform-libc dependent (#5340)."
 
 [[divergence]]
 id = "since-secondary:add/1"
@@ -85,34 +82,10 @@ category = "to-triage"
 reason = "`--stream -s` : jq 1.7.1 prints the stream's closing event as a separate value (`[[1]]`); succinctly folds it into the one slurped array."
 
 [[divergence]]
-id = "cli:exit-error-continues"
-category = "to-triage"
-reason = "jq's exit status reflects only the last input (`1 {\"a\":2}` with `.a` exits 0 after the error on `1`); succinctly exits 5 if any input errored."
-issue = "#5471"
-
-[[divergence]]
 id = "cli:files-missing-continues"
 category = "to-triage"
 reason = "jq reads the remaining files after one cannot be opened (and exits 2); succinctly stops at the first missing file."
 issue = "#5472"
-
-[[divergence]]
-id = "upstream-jq.test:113"
-category = "to-triage"
-reason = "`{(0):1}`: jq rejects a constant non-string object key at compile time (exit 3); succinctly fails when the program runs (exit 5)."
-issue = "#5501"
-
-[[divergence]]
-id = "upstream-jq.test:117"
-category = "to-triage"
-reason = "`{non_const:., (0):1}`: same compile-time rejection of a constant non-string key as upstream-jq.test:113."
-issue = "#5501"
-
-[[divergence]]
-id = "upstream-onig.test:102"
-category = "to-triage"
-reason = "`gsub(\"(?=u)\"; \"u\")`: regex lookahead is refused as an invalid regex (Rust `regex` has no lookaround); jq's oniguruma supports it."
-issue = "#5502"
 
 [[divergence]]
 id = "robust:deep-tojson-built-1000"
@@ -162,7 +135,8 @@ reason = "Tail-position recursion 100000 deep: jq does not finish within 10 s; s
 [[divergence]]
 id = "robust:regex-many-matches"
 category = "reference-slow"
-reason = "`[match(\"a\";\"g\")]` over 100000 characters: jq 1.7.1 does not finish within 10 s; succinctly answers in tens of milliseconds."
+reason = "`[match(\"a\";\"g\")]` over 100000 characters: jq 1.7.1 does not finish within 10 s on an M4 Pro (5.7 s on a 7950X); succinctly answers in tens of milliseconds. Whether jq beats the deadline depends on the host."
+platform = "macos"
 
 [[divergence]]
 id = "robust:regex-gsub-large"
@@ -171,6 +145,5 @@ reason = "`gsub(\"a\";\"b\")` over 100000 characters: jq 1.7.1 does not finish w
 
 [[divergence]]
 id = "robust:array-set-too-huge-index"
-category = "to-triage"
-reason = "`[] | .[1e12] = 1`: jq aborts (SIGSEGV); succinctly neither errors nor finishes within 10 s (it appears to allocate the index), and earlier runs ended in an abort. A refused index would be the safe answer."
-issue = "#5500"
+category = "reference-crash"
+reason = "`[] | .[1e12] = 1`: jq aborts (SIGSEGV); succinctly refuses the index with an error (exit 5, #5500)."

@@ -481,6 +481,8 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
             Ok(sec) => tools.push(sec.clone()),
             Err(why) => perf_note = Some(format!("no secondary column: {why}")),
         }
+        // A query with no input (`startup`) runs here too, before any generator has.
+        std::fs::create_dir_all(&inputs_dir)?;
         for (query, input) in &planned {
             if let Some(spec) = input {
                 perf::ensure_input(&generator, &inputs_dir, spec)?;
@@ -655,6 +657,7 @@ fn run_verify(
         ctx.root.join(&ctx.manifest.perf.queries),
     )?)?;
     let inputs_dir = ctx.root.join("data/compare/inputs");
+    std::fs::create_dir_all(&inputs_dir)?;
     let generator = std::env::current_exe()?;
     let mut tools = vec![ctx.subject.clone(), ctx.reference.clone()];
     if let Ok(sec) = ctx.secondary {
