@@ -7303,6 +7303,34 @@ A repetition operator right after an assertion (`^*`, `$+`, `\b?`, `\A{2}`, `\z*
 Only a direct repetition is refused: a non-capturing group of an assertion (`(?:^)*`), which jq also refuses, is still accepted here.
 Under the `x` flag, or a pattern with an inline flag group naming `x`, the check stands down, because the scan cannot see the mode's comments and ignored blanks; `test(\"^ *\"; \"x\")` is an error in jq and `true` here.
 
+## Lookaround and backreferences: a second regex engine (#5502)
+
+A pattern the `regex` crate refuses for a construct only a backtracking engine has is compiled by `fancy-regex` instead: lookahead and lookbehind (`(?=…)`, `(?!…)`, `(?<=…)`, `(?<!…)`), backreferences (`\1`, `\k<name>`), atomic groups (`(?>…)`), group conditionals (`(?(1)…|…)`), `\K`, `\G`, `\R` and `\e` ([ADR-0019's #5502 amendment](../../adrs/adr-0019.md#amendment-5502-implemented-2026-10-30-lookaround-and-backreferences-go-to-fancy-regex)).
+They answer as in jq; before, they failed with `invalid regex`.
+A pattern the `regex` crate accepts never reaches the second engine, so nothing that worked before changed.
+yq mode keeps Go's `regexp`, which refuses all of these, as yq does.
+Three differences remain.
+
+- **The backtracking budget runs out on different patterns.**
+  Both engines give up after the same 10,000,000 steps, with jq's own `Regex failure: retry-limit-in-match over`, but they spend them differently.
+  Oniguruma's optimizer settles `"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!" | test("((?=a)a|aa)*b")` (`false`) where `fancy-regex` gives up, and `fancy-regex` answers `test("(a+)+(?<=b)")` on the same input (`false`) where Oniguruma gives up.
+  `fancy-regex` also gives up when its backtracking stack passes a million saved states, with `Regex failure: match-stack limit over` (Oniguruma's wording for its own stack limit, which jq leaves unlimited): `test("(?:a(?=a)|a)*b")` on a million `a`s, which jq answers `false`.
+  `?` and `try` catch the error like any other.
+  Pinned by `test_backtrack_limit_is_a_catchable_error_5502`.
+- **Some lookbehinds Oniguruma refuses are answered.**
+  Oniguruma refuses a lookbehind whose alternatives have different fixed lengths (`(?<=ab|c)`, `(?<!a|bb)`), one holding a lookahead (`(?<=(?=a)a)`) and some others (`(?<!a*b)`), with `invalid pattern in look-behind`.
+  `fancy-regex` matches them, correctly.
+  Oniguruma's rule is not a simple one (`(?<=a|b+)` and `(?<!a+)` are accepted), and reproducing it would mean reproducing its lookbehind compiler.
+  Pinned by `test_lookbehind_oniguruma_refuses_is_answered_5502`.
+- **Oniguruma syntax outside the checked list stays refused.**
+  The second engine takes only constructs and escapes whose meaning there was compared with jq's.
+  `\h` and `\H` (a hex digit there, the letters `h` and `H` in jq), `\g<name>`/`\g1`, the absence operator `(?~…)`, `\X`, `\Q…\E` and `\y` keep the `invalid regex` error.
+  So do two that jq reads differently from `fancy-regex`: a reversed interval (`a{3,2}`), an error in jq, and a `+` after an interval (`a{2,3}+`), possessive in jq for `{n,m}+` and `{n,}+` but not for `{n}+`.
+  A `(?P…)` group is refused before either engine, with jq's `undefined group option` (above).
+  Pinned by `test_constructs_read_differently_stay_refused_5502`.
+
+The `l` and `n` flags below are unchanged on the second engine: `n` uses the same skip-forward search, and `l` has no effect.
+
 ## Regex flags `l` and `n`
 
 [ADR-0019](../../adrs/adr-0019.md) accepted two regex-flag gaps as permanent — rule 4(d)

@@ -63,8 +63,9 @@ cli = ["std", "clap", "rand", "rand_chacha", "anyhow", "serde_json", "memmap2", 
 # evaluator reads only a POSIX `TZ` offset string.
 local-zone = ["std", "dep:jiff"]
 
-# Enable regex support in jq query language
-regex = ["dep:regex"]
+# Enable regex support in jq query language. `fancy-regex` compiles only the jq
+# patterns the `regex` crate refuses for lookaround or a backreference (#5502).
+regex = ["dep:regex", "dep:fancy-regex"]
 
 # Test features (not for production)
 large-tests = []    # 1G bitvector tests (~125MB RAM)
@@ -119,6 +120,7 @@ memmap2 = { version = "0.9", optional = true }
 tempfile = { version = "3.10", optional = true }
 serde = { version = "1.0", default-features = false, features = ["alloc", "derive"], optional = true }
 regex = { version = "1.10", optional = true }
+fancy-regex = { version = "0.20", optional = true }
 
 # CLI dependencies (optional, only for binary)
 clap = { version = "4.5", features = ["derive"], optional = true }

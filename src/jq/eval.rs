@@ -25698,35 +25698,183 @@ fn dv_captures_at<'h>(
 /// accepted as permanent, documented limitations — see ADR-0019.
 #[cfg(feature = "regex")]
 struct JqRegex {
-    re: regex::Regex,
+    engine: RegexEngine,
     needs_trailing_nl_check: bool,
     suppress_empty: bool,
 }
 
+/// Which crate compiled a [`JqRegex`]. Every pattern the `regex` crate accepts stays on it; a jq
+/// pattern it refuses for lookaround, a backreference or another construct only a backtracking
+/// engine has goes to `fancy-regex` instead (#5502), and only when every construct in it is one
+/// whose meaning was checked against jq's Oniguruma (see [`build_fancy_regex`]). yq never takes
+/// the second arm: Go's `regexp` has none of these constructs either, and refuses them.
 #[cfg(feature = "regex")]
-impl JqRegex {
-    fn is_match(&self, input: &str) -> bool {
-        if self.suppress_empty {
-            first_captures(self, input).is_some()
-        } else {
-            dv_is_match(&self.re, input, self.needs_trailing_nl_check)
+enum RegexEngine {
+    Std(regex::Regex),
+    Fancy(fancy_regex::Regex),
+}
+
+/// One match's capture groups, from either [`RegexEngine`].
+#[cfg(feature = "regex")]
+enum RegexCaptures<'h> {
+    Std(regex::Captures<'h>),
+    Fancy(fancy_regex::Captures<'h, str>),
+}
+
+/// One capture group's span: the subset of `regex::Match` the builtins read, for either engine.
+#[cfg(feature = "regex")]
+#[derive(Clone, Copy)]
+struct RegexMatch<'h> {
+    text: &'h str,
+    start: usize,
+}
+
+#[cfg(feature = "regex")]
+impl<'h> RegexMatch<'h> {
+    fn start(&self) -> usize {
+        self.start
+    }
+
+    fn end(&self) -> usize {
+        self.start + self.text.len()
+    }
+
+    fn as_str(&self) -> &'h str {
+        self.text
+    }
+
+    fn len(&self) -> usize {
+        self.text.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+}
+
+#[cfg(feature = "regex")]
+impl<'h> RegexCaptures<'h> {
+    fn get(&self, i: usize) -> Option<RegexMatch<'h>> {
+        match self {
+            RegexCaptures::Std(caps) => caps.get(i).map(|m| RegexMatch {
+                text: m.as_str(),
+                start: m.start(),
+            }),
+            RegexCaptures::Fancy(caps) => caps.get(i).map(|m| RegexMatch {
+                text: m.as_str(),
+                start: m.start(),
+            }),
         }
     }
 
-    fn captures<'h>(&self, input: &'h str) -> Option<regex::Captures<'h>> {
+    /// Group `i` as jq reports it (jq-1.7.1's `f_match`): when the overall match is empty, every
+    /// group is an empty match at its position, whatever it captured or whether it took part at
+    /// all. Without lookaround a group inside an empty match can only be empty there anyway, so
+    /// this differs from [`get`](Self::get) only for a group that took no part
+    /// (`"b" | capture("(?<x>a)?")` is `{"x": ""}`) and for one inside a lookahead
+    /// (`"abc" | match("(?=(b))").captures[0].string` is `""`, not `"b"`, #5502).
+    fn jq_group(&self, i: usize) -> Option<RegexMatch<'h>> {
+        let m0 = self
+            .get(0)
+            .expect("capture group 0 is always present on a match");
+        if m0.is_empty() {
+            Some(m0)
+        } else {
+            self.get(i)
+        }
+    }
+}
+
+/// [`JqRegex::capture_names`]'s iterator, for either engine.
+#[cfg(feature = "regex")]
+enum RegexCaptureNames<'r> {
+    Std(regex::CaptureNames<'r>),
+    Fancy(fancy_regex::CaptureNames<'r>),
+}
+
+#[cfg(feature = "regex")]
+impl<'r> Iterator for RegexCaptureNames<'r> {
+    type Item = Option<&'r str>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            RegexCaptureNames::Std(names) => names.next(),
+            RegexCaptureNames::Fancy(names) => names.next(),
+        }
+    }
+}
+
+#[cfg(feature = "regex")]
+impl JqRegex {
+    fn is_match(&self, input: &str) -> Result<bool, EvalError> {
+        if self.suppress_empty {
+            return Ok(first_captures(self, input)?.is_some());
+        }
+        match &self.engine {
+            RegexEngine::Std(re) => Ok(dv_is_match(re, input, self.needs_trailing_nl_check)),
+            RegexEngine::Fancy(re) => re.is_match(input).map_err(fancy_match_error),
+        }
+    }
+
+    fn captures<'h>(&self, input: &'h str) -> Result<Option<RegexCaptures<'h>>, EvalError> {
         if self.suppress_empty {
             first_captures(self, input)
         } else {
-            dv_captures_at(&self.re, input, 0, self.needs_trailing_nl_check)
+            self.captures_at(input, 0)
         }
     }
 
-    fn capture_names(&self) -> regex::CaptureNames<'_> {
-        self.re.capture_names()
+    /// Leftmost match at or after byte offset `start`. A lookbehind still sees the text before
+    /// `start`, as Oniguruma's does when jq's global loop resumes (`"aab" | [match("(?<=a)[ab]";
+    /// "g").offset]` is `[1, 2]`).
+    fn captures_at<'h>(
+        &self,
+        input: &'h str,
+        start: usize,
+    ) -> Result<Option<RegexCaptures<'h>>, EvalError> {
+        match &self.engine {
+            RegexEngine::Std(re) => {
+                Ok(
+                    dv_captures_at(re, input, start, self.needs_trailing_nl_check)
+                        .map(RegexCaptures::Std),
+                )
+            }
+            RegexEngine::Fancy(re) => re
+                .captures_from_pos(input, start)
+                .map(|caps| caps.map(RegexCaptures::Fancy))
+                .map_err(fancy_match_error),
+        }
+    }
+
+    fn capture_names(&self) -> RegexCaptureNames<'_> {
+        match &self.engine {
+            RegexEngine::Std(re) => RegexCaptureNames::Std(re.capture_names()),
+            RegexEngine::Fancy(re) => RegexCaptureNames::Fancy(re.capture_names()),
+        }
     }
 
     fn captures_len(&self) -> usize {
-        self.re.captures_len()
+        match &self.engine {
+            RegexEngine::Std(re) => re.captures_len(),
+            RegexEngine::Fancy(re) => re.captures_len(),
+        }
+    }
+}
+
+/// A `fancy-regex` search that gave up. Oniguruma gives up too, on its own retry limit, with
+/// `Regex failure: retry-limit-in-match over`, and that is the wording used here; a full
+/// backtracking stack takes Oniguruma's wording for its stack limit, which jq leaves unlimited.
+/// The two engines give up on different patterns, though: Oniguruma's optimizer answers some that
+/// exhaust `fancy-regex`'s budget, and `fancy-regex` answers some that exhaust Oniguruma's
+/// (recorded in `docs/compliance/jq/limitations.md`, #5502). A search raises only those two
+/// (`BacktrackLimitExceeded` is the other); compile errors were all met in `build_fancy_regex`.
+#[cfg(feature = "regex")]
+fn fancy_match_error(e: fancy_regex::Error) -> EvalError {
+    match e {
+        fancy_regex::Error::RuntimeError(fancy_regex::RuntimeError::StackOverflow) => {
+            EvalError::new("Regex failure: match-stack limit over")
+        }
+        _ => EvalError::new("Regex failure: retry-limit-in-match over"),
     }
 }
 
@@ -26159,13 +26307,322 @@ fn build_regex<S: EvalSemantics>(pattern: &str, flags: Option<&str>) -> Result<J
     let needs_trailing_nl_check =
         S::TAG != EvalTag::Yq && pattern_may_need_trailing_newline_check(&pattern);
 
-    let re =
-        regex::Regex::new(&pattern).map_err(|e| EvalError::new(format!("invalid regex: {e}")))?;
-    Ok(JqRegex {
-        re,
-        needs_trailing_nl_check,
-        suppress_empty,
-    })
+    match regex::Regex::new(&pattern) {
+        Ok(re) => Ok(JqRegex {
+            engine: RegexEngine::Std(re),
+            needs_trailing_nl_check,
+            suppress_empty,
+        }),
+        // #5502: lookaround, backreferences, atomic groups and the like are Oniguruma syntax the
+        // `regex` crate refuses. A pattern `fancy-regex` cannot take either keeps the crate's
+        // own refusal, so its message is what it always was.
+        Err(e) => match build_fancy_regex::<S>(&pattern) {
+            Some(re) => Ok(JqRegex {
+                engine: RegexEngine::Fancy(re),
+                // `build_fancy_regex` rewrote `$` itself: see [`prepare_fancy_pattern`].
+                needs_trailing_nl_check: false,
+                suppress_empty,
+            }),
+            None => Err(EvalError::new(format!("invalid regex: {e}"))),
+        },
+    }
+}
+
+/// Oniguruma's own retry limit (`ONIG_DEFAULT_RETRY_LIMIT_IN_MATCH`), used as `fancy-regex`'s
+/// backtracking budget so a jq pattern gets the same allowance of work before
+/// [`fancy_match_error`] gives up (`fancy-regex`'s own default is a tenth of it).
+#[cfg(feature = "regex")]
+const FANCY_BACKTRACK_LIMIT: usize = 10_000_000;
+
+/// The `fancy-regex` compilation of a jq pattern the `regex` crate refused (#5502), or `None`
+/// when the pattern uses anything whose meaning there was not checked against jq-1.7.1 to be
+/// Oniguruma's: syntax [`prepare_fancy_pattern`] refuses (`\h` is a hex digit in `fancy-regex`
+/// and a literal `h` in jq), or a construct outside [`fancy_expr_is_oniguruma`]'s list
+/// (subroutine calls, absence operators, backtracking verbs). Those keep the `invalid regex`
+/// refusal rather than answering differently from jq. Never in yq mode, whose dialect is Go's.
+///
+/// `oniguruma_mode` makes `\<`/`\>` the literal characters and `*+`/`++`/`?+` possessive, as in
+/// jq, where `fancy-regex` reads them as word boundaries and nested repeats by default.
+#[cfg(feature = "regex")]
+fn build_fancy_regex<S: EvalSemantics>(pattern: &str) -> Option<fancy_regex::Regex> {
+    if S::TAG == EvalTag::Yq {
+        return None;
+    }
+    let pattern = prepare_fancy_pattern(pattern)?;
+    let tree = fancy_regex::Expr::parse_tree(&pattern).ok()?;
+    if !fancy_expr_is_oniguruma(&tree.expr)
+        || tree.expr.has_descendant(|e| !fancy_expr_is_oniguruma(e))
+    {
+        return None;
+    }
+    fancy_regex::RegexBuilder::new(&pattern)
+        .oniguruma_mode(true)
+        .backtrack_limit(FANCY_BACKTRACK_LIMIT)
+        .build()
+        .ok()
+}
+
+/// Whether `expr` (one node, not its children) is a construct `fancy-regex` matches the way
+/// Oniguruma does, checked against jq-1.7.1 (#5502): lookaround, backreferences by number and
+/// name, atomic groups and possessive repeats, conditionals on a group, `\K`, `\G` and `\R`, plus
+/// everything the `regex` crate already has.
+#[cfg(feature = "regex")]
+fn fancy_expr_is_oniguruma(expr: &fancy_regex::Expr) -> bool {
+    use fancy_regex::Expr;
+    matches!(
+        expr,
+        Expr::Empty
+            | Expr::Any { .. }
+            | Expr::Assertion(_)
+            | Expr::GeneralNewline { .. }
+            | Expr::Literal { .. }
+            | Expr::LiteralBytes { .. }
+            | Expr::Concat(_)
+            | Expr::Alt(_)
+            | Expr::Group(_)
+            | Expr::LookAround(..)
+            | Expr::Repeat { .. }
+            | Expr::Delegate { .. }
+            | Expr::Backref { .. }
+            | Expr::AtomicGroup(_)
+            | Expr::KeepOut
+            | Expr::ContinueFromPreviousMatchEnd
+            | Expr::BackrefExistsCondition { .. }
+            | Expr::Conditional { .. }
+    )
+}
+
+/// The escape letters [`prepare_fancy_pattern`] lets through: the ones the `regex` crate already
+/// reads as jq does (`\d`, `\s`, `\b`, `\p{..}`, `\x..`, `\n`, ... -- `\w` never reaches here,
+/// [`translate_posix_brackets`] rewrote it), and the Oniguruma ones `fancy-regex` adds and reads
+/// alike: `\1`-`\9`, `\k<name>`, `\K`, `\G`, `\R`, `\e` and `\Z` (which it replaces). A
+/// punctuation escape is always the literal character. `fancy-regex`'s parse tree cannot catch the
+/// others: `\h` arrives as the same class node as a written `[0-9A-Fa-f]`, and `\g1` as the same
+/// backreference as `\1`, where jq reads `\h` as a literal `h` and `\g1` as no backreference.
+#[cfg(feature = "regex")]
+fn fancy_escape_is_oniguruma(e: char) -> bool {
+    !e.is_ascii_alphanumeric()
+        || matches!(
+            e,
+            '1'..='9'
+                | 'k'
+                | 'A'
+                | 'z'
+                | 'Z'
+                | 'b'
+                | 'B'
+                | 'd'
+                | 'D'
+                | 's'
+                | 'S'
+                | 'p'
+                | 'P'
+                | 'x'
+                | 'n'
+                | 't'
+                | 'r'
+                | 'f'
+                | 'v'
+                | 'a'
+                | 'e'
+                | 'K'
+                | 'G'
+                | 'R'
+        )
+}
+
+/// `pattern` ready for `fancy-regex` (#5502), or `None` for syntax it would read differently from
+/// jq-1.7.1's Oniguruma, which then keeps the `regex` crate's refusal:
+///
+/// - an escape outside [`fancy_escape_is_oniguruma`]'s list;
+/// - a reversed interval (`a{3,2}`), an error in jq and a possessive `a{2,3}` in `oniguruma_mode`;
+/// - a `+` after an interval: possessive in jq for `{n,m}+` and `{n,}+` but a repeat of a repeat
+///   for `{n}+`, and a repeat of a repeat for all three in `fancy-regex`.
+///
+/// Each `\Z`, and each `$` where multi-line mode is off, becomes `(?=\n?\z)`: the end of the text,
+/// or just before one final `\n`, which is what both mean in jq (`"a\n" | test("a$")` is `true`,
+/// `"a\n\n" | test("a$")` is `false`). The `regex` route emulates that with a second search of the
+/// text without its `\n` ([`dv_captures_at`]), which is wrong once a lookaround can look at that
+/// `\n` (`"a\n" | test("a(?!\n)$")` is `false` in jq); `fancy-regex` has lookahead, so the anchor
+/// is spelled out instead. Its own `\Z` also matches before `\n\n`, which jq's does not.
+///
+/// The scan follows the lexical structure both engines share: escapes, classes (where none of the
+/// above applies), `(?#...)` comments and, where the `x` flag is on, `#` comments to the end of
+/// the line, all copied through untouched. The `m` and `x` flags are followed per group, as inline
+/// `(?flags)` and `(?flags:...)` set them.
+#[cfg(feature = "regex")]
+fn prepare_fancy_pattern(pattern: &str) -> Option<String> {
+    const END: &str = r"(?=\n?\z)";
+    #[derive(Clone, Copy, Default)]
+    struct Flags {
+        multi_line: bool,
+        extended: bool,
+    }
+    fn apply(flags: &mut Flags, letters: &[char]) {
+        let mut on = true;
+        for &c in letters {
+            match c {
+                '-' => on = false,
+                'm' => flags.multi_line = on,
+                'x' => flags.extended = on,
+                _ => {}
+            }
+        }
+    }
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = string_with_capacity(pattern.len() + END.len());
+    // One entry per open group: the flags in force inside it.
+    let mut groups = vec![Flags::default()];
+    // Open classes, and whether the next char is the first of the class (after an optional `^`),
+    // where a `]` is a literal -- as in [`translate_posix_brackets`], whose output this reads.
+    let mut depth = 0usize;
+    let mut at_start = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let flags = *groups.last().expect("the outermost group is never closed");
+        if c == '\\' {
+            let next = chars.get(i + 1).copied();
+            if !next.is_some_and(fancy_escape_is_oniguruma) {
+                return None;
+            }
+            let mut end = i + 2;
+            if depth == 0 && next == Some('Z') {
+                out.push_str(END);
+            } else {
+                // `\p{L}`, `\x{41}`: the braces are the escape's own, not an interval.
+                if matches!(next, Some('p' | 'P' | 'x')) && chars.get(end) == Some(&'{') {
+                    end = chars[end..]
+                        .iter()
+                        .position(|&c| c == '}')
+                        .map_or(chars.len(), |n| end + n + 1);
+                }
+                out.extend(&chars[i..end]);
+            }
+            at_start = false;
+            i = end;
+            continue;
+        }
+        if depth > 0 {
+            match c {
+                '[' => {
+                    depth += 1;
+                    at_start = true;
+                    out.push(c);
+                    i += 1;
+                    continue;
+                }
+                ']' if !at_start => depth -= 1,
+                '^' if at_start => {
+                    out.push(c);
+                    i += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            at_start = false;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        match c {
+            '[' => {
+                depth = 1;
+                at_start = true;
+                out.push(c);
+                i += 1;
+                continue;
+            }
+            '#' if flags.extended => {
+                let end = chars[i..]
+                    .iter()
+                    .position(|&c| c == '\n')
+                    .map_or(chars.len(), |n| i + n);
+                out.extend(&chars[i..end]);
+                i = end;
+                continue;
+            }
+            '$' if !flags.multi_line => {
+                out.push_str(END);
+                i += 1;
+                continue;
+            }
+            '{' => {
+                // An interval only when it is digits, an optional comma and digits; otherwise a
+                // literal `{`, as in both engines. Without a lower bound (`{,2}`) it is a literal
+                // in jq too, but an interval in `fancy-regex`, so it is escaped.
+                let digits = |from: usize| {
+                    chars[from..]
+                        .iter()
+                        .take_while(|c| c.is_ascii_digit())
+                        .count()
+                };
+                let lo = digits(i + 1);
+                if lo == 0 {
+                    out.push_str("\\{");
+                    i += 1;
+                    continue;
+                }
+                let mut j = i + 1 + lo;
+                let mut hi = None;
+                if chars.get(j) == Some(&',') {
+                    let n = digits(j + 1);
+                    hi = Some(&chars[j + 1..j + 1 + n]);
+                    j += 1 + n;
+                }
+                if chars.get(j) == Some(&'}') {
+                    let number = |d: &[char]| d.iter().collect::<String>().parse::<u64>().ok();
+                    let reversed = match (number(&chars[i + 1..i + 1 + lo]), hi.and_then(number)) {
+                        (Some(lo), Some(hi)) => hi < lo,
+                        _ => false,
+                    };
+                    if reversed || chars.get(j + 1) == Some(&'+') {
+                        return None;
+                    }
+                }
+            }
+            '(' if chars.get(i + 1) == Some(&'?') => {
+                let rest = &chars[i + 2..];
+                if rest.first() == Some(&'#') {
+                    let end = rest
+                        .iter()
+                        .position(|&c| c == ')')
+                        .map_or(chars.len(), |n| i + 2 + n + 1);
+                    out.extend(&chars[i..end]);
+                    i = end;
+                    continue;
+                }
+                let letters = rest
+                    .iter()
+                    .take_while(|c| c.is_ascii_alphabetic() || **c == '-')
+                    .count();
+                let mut inner = flags;
+                match rest.get(letters) {
+                    // `(?flags)`: the rest of the enclosing group.
+                    Some(')') => {
+                        apply(groups.last_mut().expect("never empty"), &rest[..letters]);
+                        out.extend(&chars[i..=i + 2 + letters]);
+                        i += 2 + letters + 1;
+                        continue;
+                    }
+                    // `(?flags:...)`, `(?:...)`: this group only.
+                    Some(':') => apply(&mut inner, &rest[..letters]),
+                    // Lookaround, a named or atomic group, a conditional: the enclosing flags.
+                    _ => {}
+                }
+                groups.push(inner);
+            }
+            '(' => groups.push(flags),
+            ')' if groups.len() > 1 => {
+                groups.pop();
+            }
+            _ => {}
+        }
+        at_start = false;
+        out.push(c);
+        i += 1;
+    }
+    Some(out)
 }
 
 /// jq's regex builtins bottom out in `_match_impl`, a C function that reads its **input** before
@@ -26558,7 +27015,11 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
             if global {
                 // Stream one match object per match (jq's match(re;"g") is a generator)
-                let caps_vec = global_captures::<S>(&re, &input);
+                let caps_vec = match global_captures::<S>(&re, &input) {
+                    Ok(v) => v,
+                    Err(_e) if optional => return QueryResult::None,
+                    Err(e) => return e.into(),
+                };
                 if caps_vec.is_empty() {
                     return QueryResult::None;
                 }
@@ -26578,7 +27039,12 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 QueryResult::ManyOwned(matches)
             } else {
                 // Return first match, or no output (not `null`) when there's no match.
-                match re.captures(&input) {
+                let first = match re.captures(&input) {
+                    Ok(v) => v,
+                    Err(_e) if optional => return QueryResult::None,
+                    Err(e) => return e.into(),
+                };
+                match first {
                     Some(caps) => {
                         let input_is_ascii = input.is_ascii();
                         let mut cursor = CodepointCursor::default();
@@ -26597,6 +27063,11 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     )
 }
 
+/// [`next_match_step`]'s answer: the match, whether the `n` flag accepts it, where the next search
+/// starts, and the match's own start and end.
+#[cfg(feature = "regex")]
+type MatchStep<'h> = (RegexCaptures<'h>, bool, usize, usize, usize);
+
 /// One step of a forward regex search: the leftmost match of `re` at or
 /// after byte offset `start`, whether it satisfies the `n` flag's policy
 /// (`re.suppress_empty` implies non-empty), the offset to resume searching
@@ -26614,11 +27085,13 @@ fn next_match_step<'h>(
     re: &JqRegex,
     input: &'h str,
     start: usize,
-) -> Option<(regex::Captures<'h>, bool, usize, usize, usize)> {
+) -> Result<Option<MatchStep<'h>>, EvalError> {
     if start > input.len() {
-        return None;
+        return Ok(None);
     }
-    let caps = dv_captures_at(&re.re, input, start, re.needs_trailing_nl_check)?;
+    let Some(caps) = re.captures_at(input, start)? else {
+        return Ok(None);
+    };
     let m = caps
         .get(0)
         .expect("capture group 0 is always present on a match");
@@ -26632,7 +27105,7 @@ fn next_match_step<'h>(
             None => m_end + 1,
         }
     };
-    Some((caps, accepted, next_start, m_start, m_end))
+    Ok(Some((caps, accepted, next_start, m_start, m_end)))
 }
 
 /// Leftmost match of `re` in `input` satisfying the `n` flag
@@ -26646,12 +27119,19 @@ fn next_match_step<'h>(
 /// a different alternative at the *same* position — see the gap documented
 /// on `JqRegex` (#922).
 #[cfg(feature = "regex")]
-fn first_captures<'h>(re: &JqRegex, input: &'h str) -> Option<regex::Captures<'h>> {
+fn first_captures<'h>(
+    re: &JqRegex,
+    input: &'h str,
+) -> Result<Option<RegexCaptures<'h>>, EvalError> {
     let mut start = 0usize;
     loop {
-        let (caps, accepted, next_start, _m_start, _m_end) = next_match_step(re, input, start)?;
+        let Some((caps, accepted, next_start, _m_start, _m_end)) =
+            next_match_step(re, input, start)?
+        else {
+            return Ok(None);
+        };
         if accepted {
-            return Some(caps);
+            return Ok(Some(caps));
         }
         start = next_start;
     }
@@ -26694,11 +27174,15 @@ fn first_captures<'h>(re: &JqRegex, input: &'h str) -> Option<regex::Captures<'h
 /// to `global_captures::<S>(...)` just because `S` happens to already be in
 /// scope there — check that call site's own comment first.
 #[cfg(feature = "regex")]
-fn global_captures<'h, S: EvalSemantics>(re: &JqRegex, input: &'h str) -> Vec<regex::Captures<'h>> {
+fn global_captures<'h, S: EvalSemantics>(
+    re: &JqRegex,
+    input: &'h str,
+) -> Result<Vec<RegexCaptures<'h>>, EvalError> {
     let mut results = Vec::new();
     let mut start = 0usize;
     let mut last_match_end: Option<usize> = None;
-    while let Some((caps, accepted, next_start, m_start, m_end)) = next_match_step(re, input, start)
+    while let Some((caps, accepted, next_start, m_start, m_end)) =
+        next_match_step(re, input, start)?
     {
         if accepted {
             let is_empty_match = m_start == m_end;
@@ -26712,7 +27196,7 @@ fn global_captures<'h, S: EvalSemantics>(re: &JqRegex, input: &'h str) -> Vec<re
         }
         start = next_start;
     }
-    results
+    Ok(results)
 }
 
 /// Count of codepoints in a `str`, computed in one pass over its bytes by
@@ -26729,9 +27213,10 @@ fn utf8_char_count(s: &str) -> usize {
 /// Amortises codepoint-offset conversion across the many *forward-order*
 /// offset queries a single `match(re)`/`match(re;"g")` call makes.
 ///
-/// `global_captures` produces matches at strictly increasing byte offsets,
-/// and every capture group's own offset is always `>= ` the overall match's
-/// start (captures can't extend outside their match). A naive
+/// `global_captures` produces matches at strictly increasing byte offsets.
+/// A capture group's own offset is usually `>=` the overall match's start,
+/// but not always: a group in a lookbehind, or before a `\K`, starts earlier
+/// (#5502). A naive
 /// `input[..byte_offset].chars().count()` re-scan from byte 0 on every one
 /// of those calls made `match(".";"g")` quadratic on any document containing
 /// even a single non-ASCII byte (#806 follow-up) -- `M` matches each
@@ -26741,10 +27226,11 @@ fn utf8_char_count(s: &str) -> usize {
 /// Mirrors the one-entry forward-walk cache `LineIndex` uses in
 /// `src/text/lines.rs`: advancing the cursor forward only counts the bytes
 /// since the last query (amortised `O(1)` per call, `O(N)` total across a
-/// monotone walk), and a backward query -- only possible among a single
-/// match's own out-of-order capture offsets, never across matches -- falls
-/// back to a direct scan from byte 0 without disturbing the cursor, so later
-/// forward queries stay correct.
+/// monotone walk), and a backward query -- a group starting before its match,
+/// or before an earlier group -- counts back from the cursor without moving
+/// it, so it costs the distance back rather than a scan from byte 0 (which
+/// made `[match("(?<=(.)).";"g")]` quadratic, #5502), and later forward
+/// queries stay correct.
 #[cfg(feature = "regex")]
 #[derive(Default)]
 struct CodepointCursor {
@@ -26763,7 +27249,7 @@ impl CodepointCursor {
             self.byte = byte_offset;
             self.chars as i64
         } else {
-            utf8_char_count(&input[..byte_offset]) as i64
+            (self.chars - utf8_char_count(&input[byte_offset..self.byte])) as i64
         }
     }
 }
@@ -26811,7 +27297,7 @@ fn char_len(matched: &str) -> i64 {
 #[cfg(feature = "regex")]
 fn build_match_object<S: EvalSemantics>(
     re: &JqRegex,
-    caps: &regex::Captures,
+    caps: &RegexCaptures,
     input: &str,
     input_is_ascii: bool,
     cursor: &mut CodepointCursor,
@@ -26851,12 +27337,12 @@ fn build_match_object<S: EvalSemantics>(
         // matched empty or didn't participate at all. A group that never
         // participated (e.g. a `?`/`*`-quantified group that ran zero times)
         // reports offset -1, string null — *unless* the overall match itself
-        // is zero-length, in which case oniguruma reports every
-        // non-participating group as an empty match at the overall match's
-        // own position instead of unset. Verified with 6 independent probes,
-        // e.g. `(a)(b)*` on "a" (nonzero match) -> group 2 offset -1, but
-        // `(a)*` on "" (zero-length match) -> group 1 offset 0, string "".
-        match caps.get(i) {
+        // is zero-length, in which case jq reports every group as an empty
+        // match at the overall match's own position ([`RegexCaptures::jq_group`]).
+        // Verified with 6 independent probes, e.g. `(a)(b)*` on "a" (nonzero
+        // match) -> group 2 offset -1, but `(a)*` on "" (zero-length match) ->
+        // group 1 offset 0, string "".
+        match caps.jq_group(i) {
             Some(m) if !m.is_empty() => {
                 cap_obj.insert(
                     "offset".to_string(),
@@ -26889,22 +27375,6 @@ fn build_match_object<S: EvalSemantics>(
                 );
                 cap_obj.insert("length".to_string(), OwnedValue::Int(0));
             }
-            None if m0.is_empty() => {
-                cap_obj.insert(
-                    "offset".to_string(),
-                    OwnedValue::Int(byte_to_char_offset(
-                        input,
-                        input_is_ascii,
-                        cursor,
-                        m0.start(),
-                    )),
-                );
-                cap_obj.insert(
-                    "string".to_string(),
-                    OwnedValue::String(String::new().into()),
-                );
-                cap_obj.insert("length".to_string(), OwnedValue::Int(0));
-            }
             None => {
                 cap_obj.insert("offset".to_string(), OwnedValue::Int(-1));
                 cap_obj.insert("string".to_string(), OwnedValue::Null);
@@ -26930,7 +27400,7 @@ fn build_match_object<S: EvalSemantics>(
 /// 0}`, whatever the overall match is; a group that matched empty keeps its own offset.
 /// Confirmed against yq v4.53.3 (`"héllo" | match("l")` is offset 3).
 #[cfg(feature = "regex")]
-fn build_match_object_yq(re: &JqRegex, caps: &regex::Captures) -> OwnedValue {
+fn build_match_object_yq(re: &JqRegex, caps: &RegexCaptures) -> OwnedValue {
     let int = |n: usize| OwnedValue::Int(n as i64);
     let string = |s: &str| OwnedValue::String(s.to_string().into());
     let m0 = caps
@@ -26971,7 +27441,7 @@ fn build_match_object_yq(re: &JqRegex, caps: &regex::Captures) -> OwnedValue {
 /// (it also fixes the same trailing-zero-width-match gap for split/replace,
 /// not just match(;"g")).
 #[cfg(feature = "regex")]
-fn stitch_split(input: &str, matches: &[regex::Captures]) -> Vec<String> {
+fn stitch_split(input: &str, matches: &[RegexCaptures]) -> Vec<String> {
     let mut parts = vec_with_capacity(matches.len() + 1);
     let mut last_end = 0;
     for caps in matches {
@@ -27042,10 +27512,10 @@ fn stitch_split(input: &str, matches: &[regex::Captures]) -> Vec<String> {
 fn eval_sub_replacement<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     replacement_expr: &Expr,
     re: &JqRegex,
-    caps: &regex::Captures,
+    caps: &RegexCaptures,
     optional: bool,
 ) -> Result<Vec<OwnedValue>, QueryResult<'a, W>> {
-    let captures = capture_object(re, caps);
+    let captures = capture_object::<S>(re, caps);
     // Every output, not just the first (#1279): jq drains this match's
     // replacement generator completely before moving on, and the per-match
     // lists are then transposed -- see `stitch_replacement_rows`. An empty
@@ -27063,7 +27533,7 @@ fn eval_sub_replacement<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // #2165: plain `stream_outputs_lossy`, not `_checked`, is safe here -- confirmed
     // by investigation, not assumed. `replacement_expr` runs with `.` bound to
     // `captures` (see this function's own doc comment above), which is built
-    // by `capture_object` purely from `regex::Captures` substrings of the
+    // by `capture_object` purely from `RegexCaptures` substrings of the
     // already-matched subject string; the `regex` crate operates on `&str`,
     // so that subject was necessarily valid UTF-8 already, and every capture
     // group is a clean substring of it (or `null`, for one that took no part, #5363). `captures` itself can
@@ -27169,7 +27639,7 @@ fn stitch_replacement_rows<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     replacement_expr: &Expr,
     re: &JqRegex,
     input: &str,
-    matches: &[regex::Captures],
+    matches: &[RegexCaptures],
     optional: bool,
 ) -> Result<Vec<String>, QueryResult<'a, W>> {
     let mut cells: Vec<ReplacementCell> = vec_with_capacity(matches.len());
@@ -27362,7 +27832,7 @@ fn go_template_reference<'t>(
 
 /// Append `pieces` expanded for one match ([`parse_go_template`]).
 #[cfg(feature = "regex")]
-fn expand_go_template(pieces: &[TemplatePiece], caps: &regex::Captures, dst: &mut String) {
+fn expand_go_template(pieces: &[TemplatePiece], caps: &RegexCaptures, dst: &mut String) {
     for piece in pieces {
         match piece {
             TemplatePiece::Text(text) => dst.push_str(text),
@@ -27569,7 +28039,11 @@ fn builtin_test_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
 
             // Test if regex matches
-            QueryResult::Owned(OwnedValue::Bool(re.is_match(&input)))
+            match re.is_match(&input) {
+                Ok(matched) => QueryResult::Owned(OwnedValue::Bool(matched)),
+                Err(_e) if optional => QueryResult::None,
+                Err(e) => e.into(),
+            }
         },
     )
 }
@@ -27644,17 +28118,26 @@ fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
             if global {
                 // Stream one captures object per match (jq's capture(re;"g") is a generator)
-                let objects: Vec<OwnedValue> = global_captures::<S>(&re, &input)
+                let matches = match global_captures::<S>(&re, &input) {
+                    Ok(v) => v,
+                    Err(_e) if optional => return QueryResult::None,
+                    Err(e) => return e.into(),
+                };
+                let objects: Vec<OwnedValue> = matches
                     .iter()
-                    .map(|caps| capture_object(&re, caps))
+                    .map(|caps| capture_object::<S>(&re, caps))
                     .collect();
                 if objects.is_empty() {
                     QueryResult::None
                 } else {
                     QueryResult::ManyOwned(objects)
                 }
-            } else if let Some(caps) = re.captures(&input) {
-                QueryResult::Owned(capture_object(&re, &caps))
+            } else if let Some(caps) = match re.captures(&input) {
+                Ok(v) => v,
+                Err(_e) if optional => return QueryResult::None,
+                Err(e) => return e.into(),
+            } {
+                QueryResult::Owned(capture_object::<S>(&re, &caps))
             } else {
                 // jq produces no output (not `{}`, not `null`) when there's no match,
                 // whether or not `?` was used.
@@ -27668,13 +28151,23 @@ fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ///
 /// A named group that took no part in the match (`"b" | capture("(?<x>a)?(?<y>b)")`) is there
 /// with a `null` value, as in jq (#5363); unnamed groups are not part of the object.
+///
+/// jq's `capture` is `match`'s `captures` folded into an object, so in jq mode an empty overall
+/// match reports every group as `""` ([`RegexCaptures::jq_group`]): `"b" | capture("(?<x>a)?")`
+/// is `{"x": ""}` (#5502). yq's is Go's: such a group stays `null`.
 #[cfg(feature = "regex")]
-fn capture_object(re: &JqRegex, caps: &regex::Captures) -> OwnedValue {
+fn capture_object<S: EvalSemantics>(re: &JqRegex, caps: &RegexCaptures) -> OwnedValue {
     let mut entries = IndexMap::new();
-    for name in re.capture_names().flatten() {
+    for (i, name) in re.capture_names().enumerate() {
+        let Some(name) = name else { continue };
         // #5363: a group that took no part in the match is `null`, not absent -- jq builds this
         // object from every named capture, whether or not it matched.
-        let value = caps.name(name).map_or(OwnedValue::Null, |m| {
+        let group = if S::TAG == EvalTag::Yq {
+            caps.get(i)
+        } else {
+            caps.jq_group(i)
+        };
+        let value = group.map_or(OwnedValue::Null, |m| {
             OwnedValue::String(m.as_str().to_string().into())
         });
         entries.insert(name.to_string(), value);
@@ -27837,7 +28330,11 @@ fn yq_sub_arity3_empty_replace<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Err(e) => return e.into(),
             };
 
-            let matches = global_captures::<S>(&re, &input);
+            let matches = match global_captures::<S>(&re, &input) {
+                Ok(matches) => matches,
+                Err(_e) if optional => return QueryResult::None,
+                Err(e) => return e.into(),
+            };
             if matches.is_empty() {
                 return QueryResult::Owned(OwnedValue::String(input.into()));
             }
@@ -27943,14 +28440,19 @@ fn sub_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // only match, both reach `rows == 0` and yield the input unchanged. The
     // replacement is still never evaluated when nothing matched, since the
     // loop has no match to evaluate it for.
-    let matches: Vec<regex::Captures> = if global {
+    let matches: Result<Vec<RegexCaptures>, EvalError> = if global {
         if is_bare_sub {
             global_captures::<YqSemantics>(&re, &input)
         } else {
             global_captures::<JqSemantics>(&re, &input)
         }
     } else {
-        re.captures(&input).into_iter().collect()
+        re.captures(&input).map(|caps| caps.into_iter().collect())
+    };
+    let matches = match matches {
+        Ok(matches) => matches,
+        Err(_e) if optional => return QueryResult::None,
+        Err(e) => return e.into(),
     };
 
     if let Some(template) = yq_template {
@@ -28371,13 +28873,25 @@ fn scan_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut results = Vec::new();
     let capture_count = re.captures_len();
 
-    for caps in global_captures::<JqSemantics>(&re, &input) {
+    let matches = match global_captures::<JqSemantics>(&re, &input) {
+        Ok(matches) => matches,
+        Err(_e) if optional => return QueryResult::None,
+        Err(e) => return e.into(),
+    };
+    for caps in matches {
         if capture_count > 1 {
             // Has capture groups - return array of captured strings
             let mut captured = Vec::new();
             for i in 1..capture_count {
-                // #5363: a group that took no part in the match is `null` in its place.
-                captured.push(caps.get(i).map_or(OwnedValue::Null, |m| {
+                // #5363: a group that took no part in the match is `null` in its place. jq's
+                // `scan` reads `match`'s captures, so an empty match makes every group `""`
+                // (#5502); yq has no `scan`, and its extension keeps Go's `null`.
+                let group = if S::TAG == EvalTag::Yq {
+                    caps.get(i)
+                } else {
+                    caps.jq_group(i)
+                };
+                captured.push(group.map_or(OwnedValue::Null, |m| {
                     OwnedValue::String(m.as_str().to_string().into())
                 }));
             }
@@ -28518,7 +29032,11 @@ fn split_regex_resolved<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(_e) if optional => return QueryResult::None,
             Err(e) => return e.into(),
         };
-        matches.extend(global_captures::<JqSemantics>(&re, &input));
+        match global_captures::<JqSemantics>(&re, &input) {
+            Ok(found) => matches.extend(found),
+            Err(_e) if optional => return QueryResult::None,
+            Err(e) => return e.into(),
+        }
     }
 
     // Split by regex. `split(re;flags)` *is* a real yq builtin, unlike
@@ -28632,7 +29150,11 @@ fn splits_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(_e) if optional => return QueryResult::None,
             Err(e) => return e.into(),
         };
-        matches.extend(global_captures::<JqSemantics>(&re, &input));
+        match global_captures::<JqSemantics>(&re, &input) {
+            Ok(found) => matches.extend(found),
+            Err(_e) if optional => return QueryResult::None,
+            Err(e) => return e.into(),
+        }
     }
 
     // Split by regex and return as stream. `splits` isn't a real yq
@@ -125152,6 +125674,139 @@ mod tests {
 
     #[cfg(feature = "regex")]
     #[test]
+    fn test_prepare_fancy_pattern_end_anchors_5502() {
+        const END: &str = r"(?=\n?\z)";
+        let prepared = |pattern: &str| prepare_fancy_pattern(pattern).expect(pattern);
+        assert_eq!(prepared("a(?!b)$"), format!("a(?!b){END}"));
+        assert_eq!(prepared(r"(?<=a)\Z"), format!("(?<=a){END}"));
+        // An escaped `$`, one inside a class (a leading `]` included), and `\z` stay as written.
+        for pattern in [
+            r"(?=a)\$",
+            "(?=a)[$]",
+            "(?=a)[]$]",
+            "(?=a)[^]$]",
+            r"(?=a)[\]$]",
+            r"(?=a)\z",
+        ] {
+            assert_eq!(prepared(pattern), pattern);
+        }
+        // A `$` after a class closes it is the anchor again.
+        assert_eq!(prepared("(?=a)[[b]c]$"), format!("(?=a)[[b]c]{END}"));
+        // Multi-line mode leaves `$` alone, for its own scope only, and still rewrites `\Z`.
+        assert_eq!(prepared("(?m)(?=a)$"), "(?m)(?=a)$");
+        assert_eq!(prepared(r"(?m)(?=a)\Z"), format!("(?m)(?=a){END}"));
+        assert_eq!(prepared("(?m:(?=a)$)$"), format!("(?m:(?=a)$){END}"));
+        assert_eq!(prepared("((?m)(?=a)$)$"), format!("((?m)(?=a)$){END}"));
+        assert_eq!(
+            prepared("(?m)(?-m:(?=a)$)$"),
+            format!("(?m)(?-m:(?=a){END})$")
+        );
+        // An `m` in a lookahead, a named or an atomic group is not the flag (the review of #5502).
+        assert_eq!(prepared("a(?=m)m$"), format!("a(?=m)m{END}"));
+        assert_eq!(prepared("(?<m>a)(?=b)$"), format!("(?<m>a)(?=b){END}"));
+        assert_eq!(prepared("(?>name)$"), format!("(?>name){END}"));
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_prepare_fancy_pattern_comments_and_intervals_5502() {
+        const END: &str = r"(?=\n?\z)";
+        let prepared = |pattern: &str| prepare_fancy_pattern(pattern).expect(pattern);
+        // Comments are copied through: a `[` there opens no class, a `$` is no anchor, an escape
+        // is not checked.
+        assert_eq!(prepared("(?=a)(?#[)$"), format!("(?=a)(?#[){END}"));
+        assert_eq!(prepared("(?#cost $5)(?=a)"), "(?#cost $5)(?=a)");
+        assert_eq!(prepared("(?#\\h)(?=a)"), "(?#\\h)(?=a)");
+        assert_eq!(
+            prepared("(?x)(?=a)b # [$ \\h\n$"),
+            format!("(?x)(?=a)b # [$ \\h\n{END}")
+        );
+        // `#` is a comment only where `x` is on, and is literal in a class.
+        assert_eq!(prepared("(?=a)#$"), format!("(?=a)#{END}"));
+        assert_eq!(prepared("(?x:(?=a))#$"), format!("(?x:(?=a))#{END}"));
+        assert_eq!(prepared("(?x)(?=a)[#]$"), format!("(?x)(?=a)[#]{END}"));
+        // An interval without a lower bound is a literal in jq; any `{` without one is escaped,
+        // which keeps a `{x}` the literal it already was.
+        assert_eq!(prepared("(?=a)b{,2}"), "(?=a)b\\{,2}");
+        assert_eq!(prepared("(?=a)a{x}"), "(?=a)a\\{x}");
+        for pattern in ["(?=a)a{2}", "(?=a)a{2,}", "(?=a)a{2,3}", "(?=a)a{2"] {
+            assert_eq!(prepared(pattern), pattern);
+        }
+        // Refused: a reversed interval, a `+` after an interval.
+        for pattern in ["(?=a)a{3,2}", "(?=a)a{2,3}+", "(?=a)a{2,}+", "(?=a)a{2}+"] {
+            assert!(prepare_fancy_pattern(pattern).is_none(), "{pattern}");
+        }
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_prepare_fancy_pattern_escapes_5502() {
+        for pattern in [
+            r"(?<=a)b",
+            r"(ab)\1",
+            r"(?<x>a)\k<x>",
+            r"a\Kb",
+            r"\Ga",
+            r"\e\R",
+            r"\<a\>",
+            r"\p{L}\x{41}\$\\",
+        ] {
+            assert!(prepare_fancy_pattern(pattern).is_some(), "{pattern}");
+        }
+        // An escape's own braces are copied, not read as an interval.
+        assert_eq!(
+            prepare_fancy_pattern(r"(?<=\p{L})\P{Lu}\x{41}[\p{N}]").as_deref(),
+            Some(r"(?<=\p{L})\P{Lu}\x{41}[\p{N}]")
+        );
+        // `\h` is a hex digit in `fancy-regex` and a literal `h` in jq; `\g` is a subroutine call
+        // or relative backreference there, and the rest are not Oniguruma's Perl syntax. Inside a
+        // class too.
+        for pattern in [
+            r"(?=a)\h",
+            r"(?=a)\H",
+            r"(?=a)[\h]",
+            r"(a)\g1",
+            r"(?<n>a)\g<n>",
+            r"\X",
+            r"\Qa\E",
+            r"\y",
+            r"a\",
+        ] {
+            assert!(prepare_fancy_pattern(pattern).is_none(), "{pattern}");
+        }
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_codepoint_cursor_counts_back_from_its_position_5502() {
+        // "éaéb": byte offsets 0, 2, 3, 5 are codepoints 0, 1, 2, 3.
+        let input = "\u{e9}a\u{e9}b";
+        let mut cursor = CodepointCursor::default();
+        assert_eq!(cursor.advance(input, 5), 3);
+        // A group before its match (a lookbehind, `\K`) asks backward; the cursor stays put.
+        assert_eq!(cursor.advance(input, 2), 1);
+        assert_eq!(cursor.advance(input, 0), 0);
+        assert_eq!((cursor.byte, cursor.chars), (5, 3));
+        assert_eq!(cursor.advance(input, 6), 4);
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_build_fancy_regex_scope_5502() {
+        // Only what the `regex` crate refuses reaches it, but it decides on its own.
+        assert!(build_fancy_regex::<JqSemantics>("(?=u)").is_some());
+        assert!(build_fancy_regex::<JqSemantics>(r"(ab)\1").is_some());
+        // Never for yq, whose dialect is Go's.
+        assert!(build_fancy_regex::<YqSemantics>("(?=u)").is_none());
+        // Constructs outside the checked list: absence operator, subroutine call by number.
+        assert!(build_fancy_regex::<JqSemantics>("(?~b)").is_none());
+        assert!(build_fancy_regex::<JqSemantics>(r"(a)(?1)").is_none());
+        // A pattern neither engine parses.
+        assert!(build_fancy_regex::<JqSemantics>("(?<=x").is_none());
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
     fn test_regex_scan() {
         query!(br#""test abc test""#, r#"scan("test")"#,
             QueryResult::ManyOwned(matches) => {
@@ -126026,15 +126681,13 @@ mod tests {
 
     #[cfg(feature = "regex")]
     #[test]
-    fn test_regex_lookahead_unsupported() {
-        // #703: jq's oniguruma backend supports lookahead (`(?=...)`), but
-        // succinctly's `regex` crate does not implement lookaround at all —
-        // this is a permanent constraint of the crate choice, not a bug to
-        // fix here. Pinned so nobody "fixes" it later by attempting
-        // lookahead support inside `build_regex`.
+    fn test_regex_lookahead_supported_5502() {
+        // #703 pinned this as a refusal: the `regex` crate has no lookaround. Since #5502 a
+        // pattern it refuses for lookaround goes to `fancy-regex` (`build_fancy_regex`), and
+        // answers as jq-1.7.1 does.
         query!(br#""aubub""#, r#"gsub("(?=u)"; "u")"#,
-            QueryResult::Error(e) => {
-                assert!(e.to_string().contains("invalid regex"));
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s.as_str(), "auubuub");
             }
         );
     }
