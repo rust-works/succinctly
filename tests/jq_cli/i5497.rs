@@ -320,11 +320,12 @@ fn test_document_levels_past_print_depth_print_the_marker_5497() -> Result<()> {
     Ok(())
 }
 
-/// A write that fails mid-stream (here, stdout closed by its reader) is reported and ends the
-/// run, without a panic. Before #5497 the writer's own depth guard was the error a test could
-/// make it return; the guard is gone, so a real write error keeps that path covered.
+/// Stdout closed by its reader on the general path ends the run without a panic. It was a
+/// reported `Broken pipe` write error (exit 1) until #5547; `succinctly jq` now dies of
+/// SIGPIPE like jq, so the signal is the answer on Unix. Where there is no SIGPIPE (Windows) the
+/// write error is reported as before.
 #[test]
-fn test_closed_stdout_is_a_write_error_on_the_general_path_5497() -> Result<()> {
+fn test_closed_stdout_ends_the_general_path_without_a_panic_5497() -> Result<()> {
     use std::io::{Read, Write};
     use std::process::{Command, Stdio};
 
@@ -353,7 +354,14 @@ fn test_closed_stdout_is_a_write_error_on_the_general_path_5497() -> Result<()> 
     let status = child.wait()?;
     let _ = feeder.join();
     assert!(!status.success(), "stderr: {stderr:?}");
-    assert!(stderr.contains("Broken pipe"), "stderr: {stderr:?}");
     assert!(!stderr.contains("panicked"), "stderr: {stderr:?}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(13), "stderr: {stderr:?}");
+        assert_eq!(stderr, "");
+    }
+    #[cfg(not(unix))]
+    assert!(stderr.contains("Broken pipe"), "stderr: {stderr:?}");
     Ok(())
 }
