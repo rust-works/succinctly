@@ -4607,10 +4607,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
 
     /// [`key_raw_unescaped`](DocumentValue::key_raw_unescaped) and the span's
     /// end from the one `raw_and_escaped` scan (#3343). An unterminated span
-    /// (`raw` not ending in its closing quote) answers `None`: `find_end`
-    /// used to report one past the text there (#5541 clamps it to the text's
-    /// end), so that rare shape still takes the two-call path instead of an
-    /// answer that merely happens to agree.
+    /// (`raw` not ending in its closing quote) answers `None`, and that guard
+    /// is load-bearing: `find_end` stops at the end of the text there, so
+    /// `start + raw.len()` would now agree with it, but an unterminated key
+    /// must not be answered from this one scan. It takes the two-call path
+    /// (#5541).
     #[inline]
     fn key_raw_unescaped_with_end(&self) -> Option<(&[u8], usize)> {
         match self {
@@ -10804,9 +10805,9 @@ mod tests {
 
     /// `key_raw_unescaped_with_end` (#3343) answers the span and where it
     /// ends from one scan, and only where the two-call path would agree:
-    /// an unterminated span has no closing quote to end at (`find_end` used
-    /// to report one past the text; since #5541 it stops at the text's end) and
-    /// an escaped one is not its own decoded key, so both decline.
+    /// an unterminated span has no closing quote to end at (`find_end` stops at
+    /// the text's end, #5541, so the two paths would agree by accident) and an
+    /// escaped one is not its own decoded key, so both decline.
     #[test]
     fn key_raw_unescaped_with_end_declines_what_the_two_calls_would_split_3343() {
         use crate::jq::document::DocumentValue;
