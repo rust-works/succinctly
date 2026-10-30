@@ -608,6 +608,8 @@ succinctly dev bench jq  --data-dir data/bench/corpus/json
 succinctly dev bench dsv --data-dir data/bench/corpus/dsv
 ```
 
+The `dev bench` commands write their partial results on Ctrl+C only in a `--features bench-runner` build; in a plain `cli` build (which no longer links `ctrlc`, #5551) Ctrl+C ends the run at once.
+
 ### Shape-statistics lookup
 
 `corpus-stats` derives shape distributions directly from the crate's own

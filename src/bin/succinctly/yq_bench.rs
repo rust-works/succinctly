@@ -176,17 +176,9 @@ pub fn run_benchmark(
         );
     }
 
-    // Set up Ctrl+C handler. Only `bench-runner` builds carry `ctrlc`: on macOS it links Foundation, which
-    // costs every `cli` start ~0.75 ms and ~4 MB (#5551). Without it Ctrl+C takes the default action.
+    // Set up Ctrl+C handler
     let interrupted = Arc::new(AtomicBool::new(false));
-    #[cfg(feature = "bench-runner")]
-    let interrupted_clone = Arc::clone(&interrupted);
-    #[cfg(feature = "bench-runner")]
-    ctrlc::set_handler(move || {
-        interrupted_clone.store(true, Ordering::SeqCst);
-        eprintln!("\nInterrupted! Writing partial results...");
-    })
-    .context("Failed to set Ctrl+C handler")?;
+    crate::interrupt::on_interrupt(&interrupted, "Interrupted! Writing partial results...")?;
 
     eprintln!("Running yq benchmark suite...");
     eprintln!("  Data directory: {}", config.data_dir.display());
