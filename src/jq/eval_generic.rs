@@ -962,6 +962,7 @@ pub fn to_owned_cursor<S: EvalSemantics, C: DocumentCursor>(
         cursor,
         None,
         0,
+        0,
         &nesting_depth_check,
         &|_, _| None,
         &nested,
@@ -1189,6 +1190,7 @@ pub(super) fn to_owned_cursor_with<C: DocumentCursor, S: EvalSemantics>(
         cursor,
         None,
         0,
+        0,
         &check_depth,
         &scalar_override,
         &[],
@@ -1216,6 +1218,7 @@ pub fn to_owned_yaml_cursor<S: EvalSemantics, W: AsRef<[u64]> + Clone>(
     let result = to_owned_cursor_at_depth::<S, _, BuildOwned>(
         cursor,
         None,
+        0,
         0,
         &nesting_depth_check,
         &yaml_scalar_in_one_resolve::<S, _>,
@@ -1301,6 +1304,7 @@ pub fn validate_cursor<S: EvalSemantics, C: DocumentCursor>(cursor: &C) -> Resul
         cursor,
         None,
         0,
+        0,
         &nesting_depth_check,
         &|_, _| None,
         &[],
@@ -1333,8 +1337,14 @@ impl<V: Clone> Default for ObjectBuilder<V> {
 impl<V: Clone> ObjectBuilder<V> {
     #[inline]
     pub fn new() -> Self {
+        Self::with_capacity(0)
+    }
+
+    /// An empty object with room for `capacity` members before its map grows (#5594).
+    #[inline]
+    pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            plain: IndexMap::new(),
+            plain: IndexMap::with_capacity(capacity),
             shadowed: None,
         }
     }
@@ -1375,6 +1385,17 @@ impl<V: Clone> ObjectBuilder<V> {
     }
 }
 
+/// The most members an array element's object pre-sizes its map for from the
+/// element before it (#5594).
+///
+/// A record in an array usually has the members the one before it had, so its
+/// map is sized for that many up front instead of growing from empty, which
+/// reallocates the table and the entry list twice on the way to six members
+/// and showed as -7% to -8% of the instructions of a `del` or an assignment
+/// over the `users` pattern. The cap bounds what a wrong guess costs: an
+/// object after a wide sibling holds at most this many unused slots.
+const MAX_SIBLING_CAPACITY: usize = 16;
+
 /// What [`to_owned_cursor_at_depth`] assembles from the checks it makes:
 /// the value itself ([`BuildOwned`]) or nothing ([`CheckOnly`], #3156). The
 /// walk -- every check, in the same order -- is the same for both.
@@ -1390,6 +1411,12 @@ trait CursorWalkOutput {
     /// A bound node's own value, standing in for a subtree the walk would
     /// otherwise build (#3179), or `None` to walk it anyway.
     fn reuse(value: OwnedValue) -> Option<Self::Out>;
+    /// How many members `out` holds if it is an object, which sizes the next
+    /// sibling's map (#5594); `0` otherwise, and always for a walk that keeps
+    /// nothing, so that walk never allocates a map it will not fill.
+    fn object_len(_out: &Self::Out) -> usize {
+        0
+    }
     /// Hand `out`, just built for `parent`'s node, to the anchors waiting on
     /// the children `watched` names, each with its step (#3134).
     fn fill_anchors<C: DocumentCursor>(
@@ -1417,6 +1444,12 @@ impl CursorWalkOutput for BuildOwned {
     }
     fn reuse(value: OwnedValue) -> Option<OwnedValue> {
         Some(value)
+    }
+    fn object_len(out: &OwnedValue) -> usize {
+        match out {
+            OwnedValue::Object(map) => map.len(),
+            _ => 0,
+        }
     }
     fn fill_anchors<C: DocumentCursor>(
         parent: &C,
@@ -1448,11 +1481,13 @@ impl CursorWalkOutput for CheckOnly {
 /// shared YAML walk from the hand-written one it replaced (#2664). Only a
 /// format that reuses member values ([`DocumentCursor::REUSE_FIELD_VALUE`])
 /// holds the child's value here, so for every other format `known` is `None`
-/// and this is the call it always was.
+/// and this is the call it always was. `capacity` is passed through to the
+/// walk below.
 #[inline(always)]
 fn walk_child<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOutput>(
     cursor: &C,
     known: Option<C::Value>,
+    capacity: usize,
     depth: usize,
     check_depth: &impl Fn(usize) -> Result<(), EvalError>,
     scalar_override: &impl Fn(&C, &C::Value) -> Option<OwnedValue>,
@@ -1465,7 +1500,15 @@ fn walk_child<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOutput>(
             return Ok(B::scalar(owned));
         }
     }
-    to_owned_cursor_at_depth::<S, _, B>(cursor, known, depth, check_depth, scalar_override, nested)
+    to_owned_cursor_at_depth::<S, _, B>(
+        cursor,
+        known,
+        capacity,
+        depth,
+        check_depth,
+        scalar_override,
+        nested,
+    )
 }
 
 /// `nested` names the in-scope binding's nodes inside this walk's subtree:
@@ -1478,9 +1521,14 @@ fn walk_child<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOutput>(
 /// format asks for it to be reused ([`DocumentCursor::REUSE_FIELD_VALUE`]): a
 /// member's `DocumentField` is built with its value, and resolving it again
 /// from the same cursor on entry doubled the cost of every YAML member (#2664).
+///
+/// `capacity` is how many members to make room for if `cursor` is an object:
+/// its previous sibling's count when the caller is walking an array, `0`
+/// otherwise (#5594, see [`MAX_SIBLING_CAPACITY`]).
 fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOutput>(
     cursor: &C,
     known: Option<C::Value>,
+    capacity: usize,
     depth: usize,
     check_depth: &impl Fn(usize) -> Result<(), EvalError>,
     scalar_override: &impl Fn(&C, &C::Value) -> Option<OwnedValue>,
@@ -1489,7 +1537,7 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
     check_depth(depth)?;
     let value = known.unwrap_or_else(|| cursor.value());
     if let Some(fields) = value.as_object_rendered() {
-        let mut map = ObjectBuilder::new();
+        let mut map = ObjectBuilder::with_capacity(capacity);
         let mut guard = DisplayKeyGuard::default();
         // #3478: the collision bookkeeping of a walk that keeps no members
         // (`CheckOnly`), lazy until an undecodable key appears; `map` and
@@ -1522,6 +1570,7 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
                 let child = walk_child::<S, _, B>(
                     &value_cursor,
                     Some(member_value),
+                    0,
                     depth + 1,
                     check_depth,
                     scalar_override,
@@ -1549,6 +1598,7 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
                 None => walk_child::<S, _, B>(
                     &field.value_cursor,
                     C::REUSE_FIELD_VALUE.then_some(field.value),
+                    0,
                     depth + 1,
                     check_depth,
                     scalar_override,
@@ -1598,6 +1648,9 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
         let mut last_elem: Option<C> = None;
         // #3134: as the object arm's own `watched`, keyed by index.
         let mut watched: Vec<(usize, OwnedValue)> = Vec::new();
+        // #5594: the members of the object element before this one, which
+        // sizes this one's map.
+        let mut sibling_members = 0;
         while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
             // #1677: same gap check as `to_owned_at_depth`'s array loop --
             // #1803 made "same" literal, via the shared `element_gap_ok`.
@@ -1609,19 +1662,20 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
                 let index = i64::try_from(items.len()).unwrap_or(i64::MAX);
                 watched.push((elem_cursor.node_id(), OwnedValue::Int(index)));
             }
-            items.push(
-                match embed_shared_nested::<_, B>(&elem_cursor, depth + 1, nested) {
-                    Some(child) => child,
-                    None => walk_child::<S, _, B>(
-                        &elem_cursor,
-                        C::REUSE_FIELD_VALUE.then(|| elem_cursor.value()),
-                        depth + 1,
-                        check_depth,
-                        scalar_override,
-                        nested,
-                    )?,
-                },
-            );
+            let child = match embed_shared_nested::<_, B>(&elem_cursor, depth + 1, nested) {
+                Some(child) => child,
+                None => walk_child::<S, _, B>(
+                    &elem_cursor,
+                    C::REUSE_FIELD_VALUE.then(|| elem_cursor.value()),
+                    sibling_members,
+                    depth + 1,
+                    check_depth,
+                    scalar_override,
+                    nested,
+                )?,
+            };
+            sibling_members = B::object_len(&child).min(MAX_SIBLING_CAPACITY);
+            items.push(child);
             last_elem = Some(elem_cursor);
             elems = rest;
             is_first = false;
@@ -20905,6 +20959,7 @@ fn project_object_members<C: DocumentCursor, S: EvalSemantics>(
             let child = walk_child::<S, _, BuildOwned>(
                 &field.value_cursor,
                 None,
+                0,
                 1,
                 &nesting_depth_check,
                 &|_, _| None,
@@ -50937,6 +50992,45 @@ mod tests {
         assert!(
             err.is_decode_failure(),
             "expected decode failure, got: {err:?}"
+        );
+    }
+
+    /// #5594: an object element is sized from the one before it, so a record
+    /// shaped like its predecessor fills its map without growing it, and a wide
+    /// predecessor sizes the next one for at most `MAX_SIBLING_CAPACITY`.
+    #[test]
+    fn to_owned_cursor_sizes_an_element_from_its_sibling_5594() {
+        let wide: String = (0..MAX_SIBLING_CAPACITY + 4)
+            .map(|i| format!("\"k{i}\":{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(r#"[{{"a":1,"b":2,"c":3,"d":4,"e":5}},{{"x":1}},{{{wide}}},{{"y":1}}]"#);
+        let index = JsonIndex::build(json.as_bytes());
+        let root = index.root(json.as_bytes());
+        let owned = to_owned_cursor::<JqSemantics, _>(&root).unwrap();
+        let OwnedValue::Array(items) = &owned else {
+            panic!("expected an array, got {owned:?}");
+        };
+        let capacity = |i: usize| match &items[i] {
+            OwnedValue::Object(map) => map.capacity(),
+            other => panic!("expected an object, got {other:?}"),
+        };
+        // Grown from empty, a one-member map has room for 3.
+        assert!(
+            capacity(1) >= 5,
+            "sized from a 5-member sibling: {}",
+            capacity(1)
+        );
+        assert!(
+            capacity(3) < MAX_SIBLING_CAPACITY + 4,
+            "a wide sibling is capped: {}",
+            capacity(3)
+        );
+        // The values are what they were.
+        assert_eq!(
+            owned.to_json(),
+            json,
+            "the sizing changes no member, only the room"
         );
     }
 
