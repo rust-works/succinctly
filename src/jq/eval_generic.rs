@@ -1386,7 +1386,8 @@ impl<V: Clone> ObjectBuilder<V> {
 }
 
 /// The most members an array element's object pre-sizes its map for from the
-/// elements before it (#5594).
+/// elements before it, in jq mode (#5594; yq mode's maps are not sized, see
+/// the array arm of [`to_owned_cursor_at_depth`]).
 ///
 /// A record in an array usually has the members the ones before it had, so its
 /// map is sized for that many up front instead of growing from empty, which
@@ -1683,8 +1684,14 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
         // #3134: as the object arm's own `watched`, keyed by index.
         let mut watched: Vec<(usize, OwnedValue)> = Vec::new();
         // #5594: the member counts of the object elements before this one,
-        // which size this one's map.
+        // which size this one's map -- in jq mode only. In yq mode the same
+        // sizing measured +10% to +24% peak RSS on a write followed by a
+        // navigation (`del(.users[0]) | .users | length` over YAML or JSON,
+        // 7 MB), with a spare slot per map as well, though a bare write
+        // (`del(.users[0]) | length`) gained; that is not attributed yet, so
+        // yq's maps grow from empty as before.
         let mut siblings = SiblingShape::default();
+        let sized = S::TAG == EvalTag::Jq;
         while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
             // #1677: same gap check as `to_owned_at_depth`'s array loop --
             // #1803 made "same" literal, via the shared `element_gap_ok`.
@@ -1701,7 +1708,7 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
                 None => walk_child::<S, _, B>(
                     &elem_cursor,
                     C::REUSE_FIELD_VALUE.then(|| elem_cursor.value()),
-                    siblings.capacity(),
+                    if sized { siblings.capacity() } else { 0 },
                     depth + 1,
                     check_depth,
                     scalar_override,
@@ -51064,6 +51071,15 @@ mod tests {
             capacity(5)
         );
         assert!(capacity(7) < 5, "siblings that disagree: {}", capacity(7));
+        // yq mode sizes nothing (see the array arm's note).
+        let yq = to_owned_cursor::<YqSemantics, _>(&root).unwrap();
+        let OwnedValue::Array(yq_items) = &yq else {
+            panic!("expected an array, got {yq:?}");
+        };
+        match &yq_items[2] {
+            OwnedValue::Object(map) => assert!(map.capacity() < 5, "yq: {}", map.capacity()),
+            other => panic!("expected an object, got {other:?}"),
+        }
         // The values are what they were.
         assert_eq!(
             owned.to_json(),
