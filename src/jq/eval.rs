@@ -25815,12 +25815,19 @@ const JQ_WORD_CLASS_IN_CLASS: &str = r"\p{Alphabetic}\p{M}\p{Nd}\p{Pc}";
 /// Unicode-aware, so `"é" | test("[[:alpha:]]")` is `true` in jq; the `regex` crate's are ASCII, so
 /// it was `false`. `\w` and `\W` become jq's own word class ([`JQ_WORD_CLASS`], #5373). Outside a
 /// class a `[:alpha:]` is an ordinary class of those characters in both engines and is not touched,
-/// nor is an escaped bracket. A bracket-shaped `[:word:]` (lowercase letters, optionally led by `^`) whose name is not
+/// nor is an escaped bracket. `\<` and `\>` become the literal `<` and `>` (#5529), and a
+/// `(?P` group is an error. A bracket-shaped `[:word:]` (lowercase letters, optionally led by `^`) whose name is not
 /// a POSIX class is an error, as in jq (`invalid POSIX bracket type`); `ascii` and `xdigit` are
 /// ASCII in both engines and are left to the crate.
 #[cfg(feature = "regex")]
 fn translate_posix_brackets(pattern: &str) -> Result<std::borrow::Cow<'_, str>, EvalError> {
-    if !pattern.contains('[') && !pattern.contains("\\w") && !pattern.contains("\\W") {
+    if !pattern.contains('[')
+        && !pattern.contains("\\w")
+        && !pattern.contains("\\W")
+        && !pattern.contains("\\<")
+        && !pattern.contains("\\>")
+        && !pattern.contains("(?P")
+    {
         return Ok(std::borrow::Cow::Borrowed(pattern));
     }
     let chars: Vec<char> = pattern.chars().collect();
@@ -25854,6 +25861,16 @@ fn translate_posix_brackets(pattern: &str) -> Result<std::borrow::Cow<'_, str>, 
                 i += 2;
                 continue;
             }
+            // #5529: Oniguruma's Perl syntax has no word-boundary assertions here, so `\<` and
+            // `\>` are the literal characters. The `regex` crate (1.10+) reads them as
+            // start-of-word and end-of-word.
+            if let Some(&lit @ ('<' | '>')) = chars.get(i + 1) {
+                out.push(lit);
+                changed = true;
+                at_start = false;
+                i += 2;
+                continue;
+            }
             out.push(c);
             if let Some(&next) = chars.get(i + 1) {
                 out.push(next);
@@ -25863,6 +25880,11 @@ fn translate_posix_brackets(pattern: &str) -> Result<std::borrow::Cow<'_, str>, 
             continue;
         }
         if depth == 0 {
+            // #5529: jq refuses Python-style named groups (`(?P<n>...)`, `(?P=n)`, `(?P>n)`);
+            // the `regex` crate accepts the first and would answer where jq errors.
+            if c == '(' && chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'P') {
+                return Err(EvalError::new("invalid regex: undefined group option"));
+            }
             if c == '[' {
                 depth = 1;
                 at_start = true;

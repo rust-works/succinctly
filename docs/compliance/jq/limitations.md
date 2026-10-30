@@ -7294,6 +7294,9 @@ A range that starts or ends at a `\w` (`[\w-.]`, `[+-\w]`) is accepted here and 
 Three exotic shapes still differ: a range from a POSIX bracket (`[[:alpha:]-z]`) and a doubled hyphen (`[a--b]`) are accepted here and an error in jq, and a negated bracket under the `i` flag (`test("[[:^upper:]]";"i")`) is case-folded before the negation here and is not in jq.
 An unknown bracket name (`[[:foo:]]`, `[[:ALPHA:]]`) is an error in both, with this crate's wording.
 In jq mode a `[`, `&` or `~` inside a class is the literal character, as in Oniguruma's Perl syntax, where the `regex` crate would read a nested class, an intersection and a symmetric difference.
+In jq mode `\<` and `\>` are the literal characters `<` and `>`, as in Oniguruma's Perl syntax (#5529), where the `regex` crate reads them as start-of-word and end-of-word assertions.
+A Python-style group (`(?P<n>a)`, `(?P=n)`, `(?P>n)`) is an error in jq (`undefined group option`), and the `regex` crate would accept the first.
+It is an error here too, with this crate's `invalid regex:` prefix where jq says `Regex failure:`, the same wording difference every refused pattern has.
 
 ## Regex flags `l` and `n`
 
