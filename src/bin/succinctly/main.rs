@@ -2854,6 +2854,7 @@ mod env_config;
 mod exit_status;
 mod front_matter;
 mod generators;
+mod interrupt;
 mod jq_bench;
 mod jq_locate;
 mod jq_path_mode;
