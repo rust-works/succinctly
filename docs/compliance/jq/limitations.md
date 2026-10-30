@@ -9489,10 +9489,12 @@ A rejected later value no longer takes the values before it with it: on `{"ok":1
 by `["a<TAB>b"]` (or a truncated `[1,2,`), succinctly prints `{"ok":1}` and then exits 5, as jq
 does, on both input routes — closed by [#2961](https://github.com/rust-works/succinctly/issues/2961),
 which keeps the splitter's clean prefix instead of discarding it, and queues the parse error
-behind it for `input`/`inputs` (catchable there, delivered once, `break` after). One
-difference remains, pre-existing: the error reads `Invalid JSON text` where jq quotes its
-parser (`jq: parse error: Unfinished JSON term at EOF at line 2, column 5`, with no `(at …)`
-marker from the driver loop). A parse error stops the whole input stream on both routes, as it
+behind it for `input`/`inputs` (catchable there, delivered once, `break` after).
+The error is jq's parser's own text and position since [#5555](https://github.com/rust-works/succinctly/issues/5555) (`jq: parse error: Unfinished JSON term at EOF at line 2, column 5`, with no `(at …)` marker from the driver loop; under `input`/`inputs` it is `jq: error (at <file>:<line>): …`).
+It is the first fault in jq's input, counting lines across files, whether the splitter stopped there or on a later one.
+`--stream` reads with jq's streaming parser, and a splitter failure there still reads `Invalid JSON text`.
+A malformed *member* the semi-index accepts is a separate case below: it is found when the filter reads it, and keeps the evaluator's wording and position.
+A parse error stops the whole input stream on both routes, as it
 does in jq: the files after the malformed one are not read ([#4313](https://github.com/rust-works/succinctly/issues/4313);
 the lazy per-file route used to move on to the next file). Under `input`/`inputs`, jq instead
 discards the rest of the read the error is in and goes on parsing at the next one, into later
@@ -9578,9 +9580,9 @@ reads) plus two consequences of the route:
 - What the splitter cannot delimit is **unchanged** and still all-or-nothing under `-s` — a
   truncated container or string, a byte that starts no token, a raw control character in a
   string — and `--validate` still checks each file in order first. `1 2 }` and `[1,2` exit 5
-  with no output and `Invalid JSON text` at line 0 of the first file, exactly as before.
-  jq's own text for these (`jq: parse error: Unfinished JSON term at EOF at line 3, column 0`)
-  was never reproduced on this route and still is not.
+  with no output and jq's own parse error (`jq: parse error: Unfinished JSON term at EOF at line 3, column 0`, [#5555](https://github.com/rust-works/succinctly/issues/5555)).
+  `-n -s` with `inputs` raises it as jq does, `jq: error (at <file>:<line>): …` at the position jq's parser stood on.
+  A file earlier than the one the splitter stopped in is read again from disk to find a fault ahead of it, since its buffer is gone.
 - A value jq rejects as undecodable (`"\ud800"`, `"\x"`) is echoed raw, as on the default
   route ([`docs/plan/decode-failure-routing.md`](../../plan/decode-failure-routing.md)), where
   `-s` used to refuse the whole run. `{"\ud800":1}` under `-s` also stops printing the

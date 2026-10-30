@@ -628,6 +628,38 @@ mod tests {
         jq_parse_message(text.as_bytes())
     }
 
+    /// #5555: a stream of values is clean until a fault, which is worded and placed as jq's
+    /// `main` places it across files read as one stream. Rows captured from `/usr/bin/jq` 1.7.1.
+    #[test]
+    fn names_the_first_fault_of_a_stream_5555() {
+        let fault = |chunks: &[&str], line, column| {
+            jq_stream_fault(chunks.iter().map(|c| c.as_bytes()), line, column)
+        };
+        assert_eq!(fault(&[], 1, 0), None);
+        assert_eq!(fault(&[" \n"], 1, 0), None);
+        assert_eq!(fault(&["1 2 [3] {\"a\":4}\n"], 1, 0), None);
+        assert_eq!(
+            fault(&["1 [2,"], 1, 0).as_deref(),
+            Some("Unfinished JSON term at EOF at line 1, column 5")
+        );
+        // Files are one stream: lines run on, and a value can span the seam.
+        assert_eq!(
+            fault(&["1\n2\n", "3\n{\"a\":1,}\n"], 1, 0).as_deref(),
+            Some("Expected another key-value pair at line 4, column 8")
+        );
+        assert_eq!(fault(&["[1,", "2]"], 1, 0), None);
+        // A text that starts part-way in is placed by the position it is given.
+        assert_eq!(
+            fault(&["}"], 3, 4).as_deref(),
+            Some("Unmatched '}' at line 3, column 5")
+        );
+        // The newline after a bare token is read: the fault is on the next line.
+        assert_eq!(
+            fault(&["ul\n"], 1, 0).as_deref(),
+            Some("Invalid numeric literal at line 2, column 0")
+        );
+    }
+
     /// Every row was captured live from `/usr/bin/jq` 1.7.1: `"<text>" | try fromjson catch .`,
     /// less the `(while parsing '<text>')` it appends.
     #[test]

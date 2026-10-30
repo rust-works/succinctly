@@ -5530,9 +5530,12 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
             if let Some(offset) = split_error {
                 // #5497: jq meets its depth limit first when the refused bracket comes before
                 // the fault the splitter stopped at.
-                let (line, column) = jq_stream_position(&raw_inputs, idx, offset);
-                // #5555: jq's parser names the fault, whether it is the depth limit or not.
-                if let Some(message) = jq::jq_stream_fault([&raw[offset..]], line, column) {
+                // #5555: jq's parser names the first fault of its input, whether it is the depth
+                // limit or not, and a value the splitter delimits can hold one ahead of the
+                // splitter's.
+                if let Some(message) =
+                    jq::jq_stream_fault(raw_inputs.iter().map(Vec::as_slice), 1, 0)
+                {
                     sink.report_parse_error(&message);
                     break;
                 }
@@ -8596,6 +8599,31 @@ struct SlurpedInput {
     eof_line: usize,
 }
 
+/// jq's parse error for a `--slurp` stream the splitter gave up on in `raw`, file `idx` of `files`
+/// (#5555), or `None` when jq's parser reads it all.
+///
+/// A value the splitter delimits can hold a fault ahead of the one it stopped at, in this file or
+/// an earlier one, so the stream is read again from its start. The earlier files' buffers are
+/// gone by now, so they are read from disk; stdin is one source, and `raw` is all of it. A file
+/// that cannot be read again leaves jq's parser to start at this file, where `origin` places it.
+fn slurp_fault(
+    files: &[PathBuf],
+    idx: usize,
+    raw: &[u8],
+    origin: (usize, usize),
+) -> Option<String> {
+    let earlier: Option<Vec<Vec<u8>>> = files
+        .get(..=idx)
+        .and_then(|files| files.iter().map(|path| std::fs::read(path).ok()).collect());
+    match earlier {
+        Some(mut all) if idx > 0 => {
+            strip_leading_json_bom(all.iter_mut());
+            jq::jq_stream_fault(all.iter().map(Vec::as_slice), 1, 0)
+        }
+        _ => jq::jq_stream_fault([raw], origin.0, origin.1),
+    }
+}
+
 /// Join every top-level value of every input, in order, into one JSON array
 /// for `--slurp` to index, without materializing any of them (#2847).
 ///
@@ -8639,11 +8667,8 @@ fn slurp_documents(
             if jq::jq_depth_fault_offset(&raw[offset..]).is_some() {
                 return Err(SlurpFailure::DepthLimit);
             }
-            let (line, column) = advance_position(origin, &raw[..offset]);
-            return Err(SlurpFailure::Unsplittable(jq::jq_stream_fault(
-                [&raw[offset..]],
-                line,
-                column,
+            return Err(SlurpFailure::Unsplittable(slurp_fault(
+                files, idx, &raw, origin,
             )));
         }
         if idx != last {
@@ -8842,24 +8867,31 @@ fn parse_json_stream_prefix(
     if let Ok(values) = parse_json_stream_strict(s, origin, text, lead) {
         return (values, None);
     }
+    // #5555: jq's parser names the first fault of the text, which can sit inside a value the
+    // splitter delimits and the delimiter walk rejects, ahead of the one the splitter stopped at.
+    // It reads the text as written: the newline after a bare token is part of its fault.
+    let jq_fault = || {
+        origin.and_then(|origin| {
+            let (line, column) = origin.position(text, 0);
+            jq::jq_stream_fault([text], line, column)
+        })
+    };
     let bytes = s.as_bytes();
     let (spans, split_error) = split_json_values(bytes);
     let mut values = Vec::with_capacity(spans.len());
     for (start, end) in spans {
         match stream_document_checked(&bytes[start..end], origin, text, lead + start) {
             Ok(value) => values.push(value),
+            Err(error) if error.is_decode_failure() => {
+                return (values, Some(jq_fault().map_or(error, EvalError::new)));
+            }
             Err(error) => return (values, Some(error)),
         }
     }
     // #5497: jq meets its depth limit first when the refused bracket comes before the fault
     // the splitter stopped at.
-    let error = split_error.map(|offset| {
-        let fault = origin.and_then(|origin| {
-            let (line, column) = origin.position(text, lead + offset);
-            jq::jq_stream_fault([&bytes[offset..]], line, column)
-        });
-        EvalError::new(fault.unwrap_or_else(|| String::from("Invalid JSON text")))
-    });
+    let error = split_error
+        .map(|_| EvalError::new(jq_fault().unwrap_or_else(|| String::from("Invalid JSON text"))));
     (values, error)
 }
 
@@ -11449,14 +11481,7 @@ fn json_document_to_owned_value_checked(
         }
     }
     let cursor = index.root(bytes);
-    if let Err(error) = validate_json_delimiters(&cursor, 0) {
-        // #5555: a stream document words its fault the way jq's parser does.
-        let jq_fault = at.filter(|_| error.is_decode_failure()).and_then(|at| {
-            let (line, column) = at();
-            jq::jq_stream_fault([bytes], line, column)
-        });
-        return Err(jq_fault.map_or(error, EvalError::new));
-    }
+    validate_json_delimiters(&cursor, 0)?;
     // `bytes` is often a temporary (an `--argjson` string, a `--seq` record),
     // so each NaN gets an identity of its own rather than its address (#3309).
     generic_to_owned::<JqSemantics, _>(&cursor.value())
@@ -14342,11 +14367,19 @@ mod tests {
             (vec![], None)
         );
         // A splitter failure: truncated, unterminated, unmatched.
-        for text in ["1 2 [3,", "1 2 \"abc", "1 2 }"] {
+        // #5555: worded as jq's parser words it.
+        for (text, message) in [
+            ("1 2 [3,", "Unfinished JSON term at EOF at line 1, column 7"),
+            ("1 2 \"abc", "Unfinished string at EOF at line 1, column 8"),
+            ("1 2 }", "Unmatched '}' at line 1, column 5"),
+        ] {
             let (values, error) = show(parse_json_stream_prefix(text, Some(StreamOrigin::ALONE)));
             assert_eq!(values, vec!["1", "2"], "{text}");
-            assert_eq!(error.as_deref(), Some("Invalid JSON text"), "{text}");
+            assert_eq!(error.as_deref(), Some(message), "{text}");
         }
+        // Without an origin (`--stream`) the splitter's wording stands.
+        let (_, error) = show(parse_json_stream_prefix("1 2 }", None));
+        assert_eq!(error.as_deref(), Some("Invalid JSON text"));
         // A span the splitter accepts but the materializer rejects: the
         // prefix ends there, and nothing after it is kept.
         let (values, error) = show(parse_json_stream_prefix(
@@ -14354,7 +14387,10 @@ mod tests {
             Some(StreamOrigin::ALONE),
         ));
         assert_eq!(values, vec!["1", "2"]);
-        assert!(error.is_some());
+        assert_eq!(
+            error.as_deref(),
+            Some("Invalid numeric literal at line 1, column 13")
+        );
     }
 
     #[test]
