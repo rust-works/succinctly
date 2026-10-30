@@ -3,6 +3,7 @@
 use super::cli;
 use super::features::{FeatureSummary, Status};
 use super::harness::{Row, Verdict};
+use super::ledger;
 use super::perf::{Gate, PerfRow, ToolResult};
 use super::robust;
 use super::Results;
@@ -271,7 +272,7 @@ pub fn render(results: &Results) -> String {
     }
 
     features_sections(&mut s, r);
-    syntax_section(&mut s, r);
+    syntax_section(&mut s, &r.syntax, &r.known_divergences);
     cli_sections(&mut s, r);
     differential_section(&mut s, r);
     input_section(&mut s, r);
@@ -298,7 +299,11 @@ pub fn render(results: &Results) -> String {
 }
 
 fn note_for(r: &Results, id: &str) -> String {
-    r.known_divergences.iter().find(|e| e.id == id).map_or_else(
+    ledger_note(&r.known_divergences, id)
+}
+
+fn ledger_note(known: &[ledger::Entry], id: &str) -> String {
+    known.iter().find(|e| e.id == id).map_or_else(
         || "**unlisted**".into(),
         |e| format!("{}: {}", e.category, e.reason),
     )
@@ -360,8 +365,8 @@ fn features_sections(s: &mut String, r: &Results) {
 }
 
 /// A, the language's forms: the same stdout-and-exit comparison as G, grouped by area.
-fn syntax_section(s: &mut String, r: &Results) {
-    if r.syntax.is_empty() {
+fn syntax_section(s: &mut String, rows: &[cli::CliRow], known: &[ledger::Entry]) {
+    if rows.is_empty() {
         return;
     }
     let _ = writeln!(s, "\n### A. Syntax forms\n");
@@ -373,20 +378,18 @@ fn syntax_section(s: &mut String, r: &Results) {
     );
     let _ = writeln!(s, "| Area | Probes | Agree |");
     let _ = writeln!(s, "|------|--------|-------|");
-    let mut areas: Vec<&str> = r.syntax.iter().map(|x| x.area.as_str()).collect();
+    let mut areas: Vec<&str> = rows.iter().map(|x| x.area.as_str()).collect();
     areas.sort_unstable();
     areas.dedup();
     for a in areas {
-        let all = r.syntax.iter().filter(|x| x.area == a).count();
-        let ok = r
-            .syntax
+        let all = rows.iter().filter(|x| x.area == a).count();
+        let ok = rows
             .iter()
             .filter(|x| x.area == a && x.verdict == cli::Verdict::Match)
             .count();
         let _ = writeln!(s, "| {a} | {all} | {ok} |");
     }
-    let mut differing = r
-        .syntax
+    let mut differing = rows
         .iter()
         .filter(|x| x.verdict == cli::Verdict::Differs)
         .peekable();
@@ -403,7 +406,7 @@ fn syntax_section(s: &mut String, r: &Results) {
             x.id,
             ex(x.reference_exit),
             ex(x.subject_exit),
-            note_for(r, &format!("syntax:{}", x.id))
+            ledger_note(known, &format!("syntax:{}", x.id))
         );
     }
 }
@@ -820,5 +823,80 @@ mod tests {
         let mut s = String::new();
         memory_section(&mut s, &[&r]);
         assert!(s.contains("| 5 | 10 | 2.00x | n/a | n/a |"), "{s}");
+    }
+}
+
+#[cfg(test)]
+mod syntax_tests {
+    use super::*;
+
+    fn row(id: &str, area: &str, verdict: cli::Verdict) -> cli::CliRow {
+        cli::CliRow {
+            id: id.into(),
+            area: area.into(),
+            verdict,
+            reference_exit: Some(0),
+            subject_exit: if verdict == cli::Verdict::Match {
+                Some(0)
+            } else {
+                Some(3)
+            },
+        }
+    }
+
+    fn entry(id: &str) -> ledger::Entry {
+        ledger::Entry {
+            id: id.into(),
+            category: "to-triage".into(),
+            reason: "the parser rejects it (#5590)".into(),
+            issue: None,
+            platform: None,
+            volatile: false,
+        }
+    }
+
+    fn render(rows: &[cli::CliRow], known: &[ledger::Entry]) -> String {
+        let mut s = String::new();
+        syntax_section(&mut s, rows, known);
+        s
+    }
+
+    #[test]
+    fn no_syntax_rows_renders_nothing() {
+        assert_eq!(render(&[], &[]), "");
+    }
+
+    /// The per-area counts come from the rows, and a difference shows its exit codes and its
+    /// ledger entry; one that is not listed says so rather than printing a blank.
+    #[test]
+    fn the_syntax_section_counts_per_area_and_names_each_difference_with_its_ledger_note() {
+        let rows = [
+            row("op-add", "operators", cli::Verdict::Match),
+            row("op-sub", "operators", cli::Verdict::Match),
+            row("def-ns", "functions", cli::Verdict::Differs),
+            row("def-new", "functions", cli::Verdict::Differs),
+        ];
+        let out = render(&rows, &[entry("syntax:def-ns")]);
+        assert!(out.contains("| operators | 2 | 2 |"), "{out}");
+        assert!(out.contains("| functions | 2 | 0 |"), "{out}");
+        assert!(
+            out.contains("| `def-ns` | 0 | 3 | to-triage: the parser rejects it (#5590) |"),
+            "{out}"
+        );
+        assert!(
+            out.contains("| `def-new` | 0 | 3 | **unlisted** |"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("`op-add`"),
+            "a matching probe is not listed: {out}"
+        );
+    }
+
+    #[test]
+    fn an_all_agreeing_syntax_section_has_no_difference_table() {
+        let out = render(&[row("op-add", "operators", cli::Verdict::Match)], &[]);
+        assert!(out.contains("| operators | 1 | 1 |"), "{out}");
+        assert!(!out.contains("| Probe |"), "{out}");
     }
 }
