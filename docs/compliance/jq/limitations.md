@@ -11835,11 +11835,10 @@ The shortcut fires only where `==` is handed two handles on one storage, so the 
   kind of marker when UPDATE or EXTRACT can compare it (#3896) or hand it out of the step
   ([#5516](https://github.com/rust-works/succinctly/issues/5516)).
   So `[nan] as $a | last($a) == $a` and `reduce $a as $v (null; [$v]) | .[0] == $a` are `true`, as in jq (`last(f)` is `reduce f as $x (null; $x)`).
-- **An `as` destructuring.** A container a pattern binds from a value that names no node of the
-  document is spliced as the same kind of marker when the body can compare it or hand it on
-  ([#5539](https://github.com/rust-works/succinctly/issues/5539)), so `[[nan]] as $a | $a as [$x] | $x == $a[0]` is `true`, as in jq,
-  and `$a as [$x] | $x == [nan]`, a fresh container, stays `false`.
-  A body that only reads the name by value (an index key, an assignment's right-hand side) keeps the literal, for the reason the fold row below gives.
+- **An `as` destructuring** ([#5539](https://github.com/rust-works/succinctly/issues/5539)).
+  A container a pattern binds from a value that names no node of the document is spliced as the same kind of marker, wherever the body reads the name other than in an assignment's or arithmetic's operands.
+  So `[[nan]] as $a | $a as [$x] | $x == $a[0]` is `true`, as in jq, and `$a as [$x] | $x == [nan]`, a fresh container, stays `false`.
+  A name stored or added in place (`.a = $x`, `. + $x`) keeps the literal, for the reason the fold row below gives.
 
 Still different:
 
