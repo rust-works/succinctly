@@ -9584,6 +9584,22 @@ mod bridge_docs {
     }
 }
 
+/// `generic_to_owned_checked`'s nesting ceiling ([`check_nesting_depth`]) applied to a value that is
+/// handed on without being converted (#5624): every container level is held to it, and the walk stops at
+/// the first level that is not, so a deeper value costs no more than the ceiling.
+fn check_output_nesting(value: &OwnedValue, depth: usize) -> core::result::Result<(), EvalError> {
+    check_nesting_depth(depth)?;
+    match value {
+        OwnedValue::Array(items) => items
+            .iter()
+            .try_for_each(|item| check_output_nesting(item, depth + 1)),
+        OwnedValue::Object(fields) => fields
+            .values()
+            .try_for_each(|item| check_output_nesting(item, depth + 1)),
+        _ => Ok(()),
+    }
+}
+
 /// Whether `expr` is the filter `.` -- on its own, in parentheses, or as every stage of a pipe --
 /// whose answer is its input unchanged (#5624).
 fn is_identity_filter(expr: &jq::Expr) -> bool {
@@ -9642,8 +9658,11 @@ fn evaluate_input_streaming(
     // a 35-byte `--stream` event) only to hand the same value on. `--preserve-input` writes its own
     // text and keeps the route.
     if !preserve && is_identity_filter(expr) {
-        // The gate every output here goes through (see below), applied to the value itself.
-        if let Err(e) = input.check_tree_depth() {
+        // The two gates every output here goes through (see below), applied to the value itself:
+        // the nesting ceiling `materialize_stream_item`'s checked conversion holds an answer to,
+        // which a value that is never converted would otherwise skip (a `--seq -s` record of 256
+        // empty arrays is 257 levels with the slurp wrapper, and is refused), then the tree depth.
+        if let Err(e) = check_output_nesting(input, 0).and_then(|()| input.check_tree_depth()) {
             sink.report(DiagStyle::Jq, &e, &at.resolve());
             return Ok(());
         }
@@ -15943,6 +15962,30 @@ mod tests {
             let (outputs, built) = run(filter);
             assert_eq!(built, 1, "{filter}");
             assert!(!outputs.is_empty(), "{filter}");
+        }
+        // The nesting ceiling of a converted output (256 levels) holds for the shortcut too: 255
+        // levels print, 256 do not.
+        for (depth, prints) in [(255usize, 1usize), (256, 0), (300, 0)] {
+            let mut nest = OwnedValue::Int(1);
+            for _ in 0..depth {
+                nest = OwnedValue::array_from(vec![nest]);
+            }
+            let mut sink = ErrorSink::default();
+            let mut outputs = 0;
+            evaluate_input_streaming(
+                &nest,
+                &jq::parse(".").expect("parses"),
+                &EvalContext::default(),
+                &ErrorAt::Fixed(InputLocation::unknown()),
+                &mut sink,
+                &config,
+                &mut |_, _| {
+                    outputs += 1;
+                    Ok(true)
+                },
+            )
+            .expect("evaluates");
+            assert_eq!(outputs, prints, "{depth} levels");
         }
         // A value past the print depth is refused with no output, as the route does for any output.
         let mut deep = OwnedValue::Int(1);

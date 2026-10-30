@@ -1053,3 +1053,45 @@ fn test_identity_agrees_with_the_route_it_skips_5624() -> Result<()> {
     }
     Ok(())
 }
+
+/// The nesting ceiling a converted output is held to (256 levels) still applies to the value the
+/// shortcut hands on. `--seq --slurp` wraps a record in one more level, so a record of 255 arrays
+/// prints and one of 256 is refused at exit 5 without a panic; `.` agrees with `[.][0]` there and
+/// under plain `--slurp`, which takes a route of its own.
+#[test]
+fn test_identity_keeps_the_output_nesting_ceiling_5624() -> Result<()> {
+    for depth in [254usize, 255, 256] {
+        let doc = format!("{}{}\n", "[".repeat(depth), "]".repeat(depth));
+        for seq in [false, true] {
+            let mut mode = vec!["--slurp", "-c"];
+            let stdin = if seq {
+                mode.push("--seq");
+                format!("\x1e{doc}")
+            } else {
+                doc.clone()
+            };
+            let run = |filter: &str| -> Result<(String, i32)> {
+                let mut args = mode.clone();
+                args.push(filter);
+                let (stdout, stderr, status) = run_jq_full(&args, Some(&stdin))?;
+                assert!(!stderr.contains("panicked"), "stderr: {stderr}");
+                Ok((stdout, status))
+            };
+            let (stdout, status) = run(".")?;
+            assert_eq!(
+                run("[.][0]")?,
+                (stdout.clone(), status),
+                "seq {seq} {depth}"
+            );
+            if seq {
+                let refused = depth == 256;
+                assert_eq!(
+                    (stdout.is_empty(), status),
+                    (refused, if refused { 5 } else { 0 }),
+                    "{depth} levels under --seq --slurp"
+                );
+            }
+        }
+    }
+    Ok(())
+}
