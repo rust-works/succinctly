@@ -26211,6 +26211,150 @@ fn posix_bracket_at(chars: &[char], at: usize) -> Option<(usize, bool, String)> 
     Some((j + 2, negated, chars[name_start..j].iter().collect()))
 }
 
+/// Whether `chars[at..]` opens an interval quantifier in Oniguruma's Perl syntax, and if so the
+/// index just past its `}` and whether it has a comma (`{n,}`, `{n,m}`, `{,m}`, `{,}`; `{n}` has
+/// none). Anything else after a `{` is a literal brace.
+#[cfg(feature = "regex")]
+fn interval_quantifier_at(chars: &[char], at: usize) -> Option<(usize, bool)> {
+    let mut j = at + 1;
+    let digits = |j: &mut usize| {
+        let start = *j;
+        while chars.get(*j).is_some_and(char::is_ascii_digit) {
+            *j += 1;
+        }
+        *j - start
+    };
+    let low = digits(&mut j);
+    let comma = chars.get(j) == Some(&',');
+    if comma {
+        j += 1;
+        digits(&mut j);
+    } else if low == 0 {
+        return None;
+    }
+    (chars.get(j) == Some(&'}')).then_some((j + 1, comma))
+}
+
+/// Refuse a possessive quantifier (#5524): a greedy `*`, `+`, `?` or an interval with a comma
+/// (`{n,}`, `{n,m}`) directly followed by `+`.
+///
+/// Oniguruma reads it as possessive (the repetition never gives characters back), where the
+/// `regex` crate reads a quantifier applied to a quantifier, so `"aaa" | test("a*+a")` is `false`
+/// in jq and was `true` here: the pattern compiles in both and answered differently without a
+/// word.
+/// The crate has no atomic group to rewrite it to, so it is refused like the other
+/// Oniguruma-only syntax.
+/// The exception is a quantifier that ends the pattern, or ends it but for closing parentheses
+/// (`(?:a++)`): nothing after it can fail, so the plain quantifier matches the same text
+/// (`sub("a*+";"X")`) and the `+` is dropped.
+/// A lazy quantifier followed by `+` (`a*?+`) and `{n}+` are a repeat of a repeat in jq as well
+/// and are left alone, as is a `+` that whitespace separates from its quantifier under the `x`
+/// flag (`a* +`).
+/// Escapes, character classes, `\Q..\E`, `(?#..)` and, under `x`, `#` comments are stepped over;
+/// an inline `(?x)` is not modelled, so a `#` comment under it is read as pattern.
+#[cfg(feature = "regex")]
+fn refuse_possessive_quantifier(
+    pattern: &str,
+    extended: bool,
+) -> Result<std::borrow::Cow<'_, str>, EvalError> {
+    // Cheap exit for the common pattern: a possessive `+` follows a quantifier character.
+    if !pattern
+        .as_bytes()
+        .windows(2)
+        .any(|pair| pair[1] == b'+' && matches!(pair[0], b'*' | b'+' | b'?' | b'}'))
+    {
+        return Ok(std::borrow::Cow::Borrowed(pattern));
+    }
+    let chars: Vec<char> = pattern.chars().collect();
+    let refusal = || {
+        EvalError::new("invalid regex: regex parse error: possessive quantifier is not supported")
+    };
+    // What the token just read is: a greedy quantifier, which a `+` would make possessive and a
+    // `?` would make lazy; a fixed `{n}`, which a `?` makes lazy and a `+` repeats; or neither.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Last {
+        Other,
+        Greedy,
+        Fixed,
+    }
+    let mut last = Last::Other;
+    let mut i = 0;
+    while i < chars.len() {
+        let before = std::mem::replace(&mut last, Last::Other);
+        match chars[i] {
+            '\\' if chars.get(i + 1) == Some(&'Q') => {
+                // A quoted run is literal up to `\E`, or to the end.
+                i += 2;
+                while i < chars.len() && !(chars[i] == '\\' && chars.get(i + 1) == Some(&'E')) {
+                    i += 1;
+                }
+                i += 2;
+            }
+            '\\' => i += 2,
+            '(' if chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'#') => {
+                while i < chars.len() && chars[i] != ')' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            '#' if extended => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '[' => {
+                // A class runs to its first `]` that is not the leading one; a POSIX bracket
+                // (`[:alpha:]`) and an escape inside it are stepped over whole.
+                i += 1;
+                if chars.get(i) == Some(&'^') {
+                    i += 1;
+                }
+                if chars.get(i) == Some(&']') {
+                    i += 1;
+                }
+                while i < chars.len() && chars[i] != ']' {
+                    if chars[i] == '\\' {
+                        i += 2;
+                    } else if let Some((end, ..)) = (chars[i] == '[')
+                        .then(|| posix_bracket_at(&chars, i))
+                        .flatten()
+                    {
+                        i = end;
+                    } else {
+                        i += 1;
+                    }
+                }
+                i += 1;
+            }
+            '+' if before == Last::Greedy => {
+                // Nothing after it can fail, so it never has to give anything back: the plain
+                // quantifier matches the same text.
+                if chars[i + 1..].iter().all(|&c| c == ')') {
+                    let mut plain: String = chars[..i].iter().collect();
+                    plain.extend(&chars[i + 1..]);
+                    return Ok(std::borrow::Cow::Owned(plain));
+                }
+                return Err(refusal());
+            }
+            // The lazy marker of the quantifier before it; what follows is a new quantifier.
+            '?' if before != Last::Other => i += 1,
+            '*' | '+' | '?' => {
+                last = Last::Greedy;
+                i += 1;
+            }
+            '{' => match interval_quantifier_at(&chars, i) {
+                Some((end, comma)) => {
+                    last = if comma { Last::Greedy } else { Last::Fixed };
+                    i = end;
+                }
+                None => i += 1,
+            },
+            _ => i += 1,
+        }
+    }
+    Ok(std::borrow::Cow::Borrowed(pattern))
+}
+
 /// Build regex flags from jq flag string
 #[cfg(feature = "regex")]
 fn build_regex<S: EvalSemantics>(pattern: &str, flags: Option<&str>) -> Result<JqRegex, EvalError> {
@@ -26218,17 +26362,22 @@ fn build_regex<S: EvalSemantics>(pattern: &str, flags: Option<&str>) -> Result<J
     // `regexp`, a different syntax from the crate's throughout (#5374, #5388), so its pattern is
     // read and re-written whole.
     //
-    // A refusal from the jq pre-pass waits until the flags string has been read (#5529): jq checks
-    // the modifiers before it compiles the pattern, so `test("(?P<n>a)"; "z")` is the modifier
-    // error.
+    // A refusal from the jq pre-pass waits until the flags string has been read (#5529, #5524):
+    // jq checks the modifiers before it compiles the pattern, so `test("(?P<n>a)"; "z")` is the
+    // modifier error.
     let mut deferred_refusal = None;
     let mut pattern = if S::TAG == EvalTag::Yq {
         super::go_regex::translate(pattern).map_err(EvalError::new)?
     } else {
-        match translate_posix_brackets(pattern, flags.is_some_and(|f| f.contains('x'))) {
+        let extended = flags.is_some_and(|flags| flags.contains('x'));
+        let scanned = refuse_possessive_quantifier(pattern, extended).unwrap_or_else(|refusal| {
+            deferred_refusal = Some(refusal);
+            std::borrow::Cow::Borrowed(pattern)
+        });
+        match translate_posix_brackets(&scanned, extended) {
             Ok(translated) => translated.into_owned(),
             Err(refusal) => {
-                deferred_refusal = Some(refusal);
+                deferred_refusal.get_or_insert(refusal);
                 String::new()
             }
         }
