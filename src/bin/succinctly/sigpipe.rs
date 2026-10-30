@@ -15,8 +15,10 @@
 pub fn restore_default() {
     #[cfg(unix)]
     {
-        // SAFETY: `signal` with `SIG_DFL` installs no handler and reads no Rust data; it is
-        // called once, at the top of a subcommand, before any thread of ours is started.
+        // SAFETY: `signal` with `SIG_DFL` installs no handler and reads or writes no Rust data.
+        // It is async-signal-safe and process-wide, so it does not matter that `main` has
+        // already started the evaluation thread this runs on; nothing in this program observes
+        // the disposition except the kernel, when a write finds a pipe closed.
         unsafe {
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
         }
