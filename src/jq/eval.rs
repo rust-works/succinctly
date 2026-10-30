@@ -26988,8 +26988,8 @@ fn build_fancy_regex_with<S: EvalSemantics>(
     if S::TAG == EvalTag::Yq {
         return None;
     }
-    let variable_length = modes.longest && pattern_is_variable_length(pattern);
-    let pattern = prepare_fancy_pattern(pattern)?;
+    let source = pattern;
+    let pattern = prepare_fancy_pattern(source)?;
     let tree = fancy_regex::Expr::parse_tree(&pattern).ok()?;
     if !fancy_expr_is_oniguruma(&tree.expr)
         || tree.expr.has_descendant(|e| !fancy_expr_is_oniguruma(e))
@@ -26999,7 +26999,7 @@ fn build_fancy_regex_with<S: EvalSemantics>(
     if modes.longest && fancy_has_lazy_repeat(&tree.expr) {
         return None;
     }
-    let pattern = if variable_length {
+    let pattern = if modes.longest && pattern_is_variable_length(source) {
         format!("{FANCY_UNBOUNDED_DEAD_BRANCH}|{pattern}")
     } else {
         pattern

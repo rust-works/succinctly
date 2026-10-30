@@ -82,3 +82,35 @@ fn test_l_flag_multibyte_dot_captures_and_flags_5580() -> Result<()> {
         ),
     ])
 }
+
+/// A pattern that starts with an inline flag, an anchor or a comment sits in the second branch of
+/// the search's top-level alternation; its flags and anchors still apply to it.
+#[test]
+fn test_l_flag_multibyte_alternation_with_leading_flags_and_anchors_5580() -> Result<()> {
+    assert_rows(&[
+        (
+            r#""éé" | [match("(?x) é | éé "; "l") | [.offset, .length]]"#,
+            "[[0,2]]",
+        ),
+        (
+            r#""éé" | [match("(?x) é # c\n | éé # d"; "l") | [.offset, .length]]"#,
+            "[[0,2]]",
+        ),
+        (
+            r#""éé" | [match("(?i)É|éé"; "l") | [.offset, .length]]"#,
+            "[[0,2]]",
+        ),
+        (
+            r#""éé" | [match("^é|^éé"; "l") | [.offset, .length]]"#,
+            "[[0,2]]",
+        ),
+        (
+            r#""éé" | [match("\\Aé|\\Aéé"; "l") | [.offset, .length]]"#,
+            "[[0,2]]",
+        ),
+        (
+            r#""éé" | [match("(é)\\1|é"; "l") | [.offset, .length]]"#,
+            "[[0,2]]",
+        ),
+    ])
+}
