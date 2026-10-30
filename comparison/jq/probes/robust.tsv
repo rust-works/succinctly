@@ -94,5 +94,5 @@ mem-limit-string-bomb	memory	["-n", "-c", "\"a\" * 1e9 | length"]	-	ulimit-v:524
 mem-limit-first	memory	["-c", "first(.[])"]	@gen:int-array:2000000	ulimit-v:524288
 mem-limit-limit	memory	["-c", "[limit(3; .[])]"]	@gen:int-array:2000000	ulimit-v:524288
 mem-limit-isempty	memory	["-c", "isempty(.[])"]	@gen:int-array:2000000	ulimit-v:524288
-mem-first-big-array	memory	["-c", "first(.[])"]	@gen:int-array:5000000	-
-mem-limit-big-array	memory	["-c", "[limit(3; .[])]"]	@gen:int-array:5000000	-
+mem-early-exit-first-uncapped	memory	["-c", "first(.[])"]	@gen:int-array:5000000	-
+mem-early-exit-limit-uncapped	memory	["-c", "[limit(3; .[])]"]	@gen:int-array:5000000	-

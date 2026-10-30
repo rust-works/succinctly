@@ -137,10 +137,10 @@ fn wrapped(tool: &Tool, wrap: Option<&str>) -> Tool {
         Some(w) if w.starts_with("ulimit-v:") => Tool {
             name: tool.name.clone(),
             program: "bash".into(),
-            // macOS refuses `ulimit -v`; skip rather than run uncapped and report a false pass.
+            // macOS refuses `ulimit -v`: skip there; elsewhere a refused limit exits 99, not a silent pass.
             prefix: [
                 "-c",
-                "ulimit -v \"$0\" 2>/dev/null || exit 0; exec \"$@\"",
+                "ulimit -v \"$0\" 2>/dev/null || { [ \"$(uname)\" = Darwin ] && exit 0; exit 99; }; exec \"$@\"",
                 &w["ulimit-v:".len()..],
                 tool.program.as_str(),
             ]
