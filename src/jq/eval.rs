@@ -26355,9 +26355,187 @@ fn refuse_possessive_quantifier(
     Ok(std::borrow::Cow::Borrowed(pattern))
 }
 
-/// Build regex flags from jq flag string
+/// How many compiled patterns [`build_regex`] keeps (#5531).
 #[cfg(feature = "regex")]
-fn build_regex<S: EvalSemantics>(pattern: &str, flags: Option<&str>) -> Result<JqRegex, EvalError> {
+const REGEX_CACHE_SLOTS: usize = 16;
+
+/// How many recently seen keys [`build_regex`] remembers without their compiled value, to tell a
+/// pattern that comes back from one that never does (#5531).
+#[cfg(feature = "regex")]
+const REGEX_SEEN_SLOTS: usize = 32;
+
+/// The longest pattern [`build_regex`] caches, in bytes. A pattern a program computes per input
+/// can be any size, and a compiled one is far larger than its text, so a long one is built each
+/// time rather than kept (#5531).
+#[cfg(feature = "regex")]
+const REGEX_CACHE_MAX_PATTERN: usize = 1024;
+
+#[cfg(feature = "regex")]
+struct CachedRegex {
+    hash: u64,
+    yq: bool,
+    pattern: String,
+    flags: FlagsKey,
+    /// Set by a hit; the eviction scan clears it once before it overwrites the slot.
+    referenced: core::cell::Cell<bool>,
+    compiled: Result<Rc<JqRegex>, EvalError>,
+}
+
+/// A flags string as the cache keys it. The flags that change what a pattern compiles to are
+/// `i`, `x`, `m`/`p` and `n`; `g`, `l` and `s` do nothing here and the order and repeats do not
+/// matter, so `"gi"`, `"ig"` and `"i"` are one key, and so are no flags and `"g"`. A string with
+/// any other character is an error whichever way it is spelled, keyed as written.
+#[cfg(feature = "regex")]
+#[derive(Clone, PartialEq, Eq)]
+enum FlagsKey {
+    Effective(u8),
+    Invalid(String),
+}
+
+#[cfg(feature = "regex")]
+impl FlagsKey {
+    fn of(flags: Option<&str>) -> Self {
+        let mut bits = 0u8;
+        for c in flags.unwrap_or("").chars() {
+            match c {
+                'i' => bits |= 1,
+                'x' => bits |= 2,
+                'm' | 'p' => bits |= 4,
+                'n' => bits |= 8,
+                'g' | 'l' | 's' => {}
+                _ => return Self::Invalid(flags.unwrap_or("").to_string()),
+            }
+        }
+        Self::Effective(bits)
+    }
+}
+
+#[cfg(feature = "regex")]
+struct RegexCache {
+    slots: Vec<CachedRegex>,
+    /// Where the next eviction scan starts once `slots` is full.
+    hand: usize,
+    /// Hashes of keys built once and not yet admitted, a ring.
+    seen: [u64; REGEX_SEEN_SLOTS],
+    seen_next: usize,
+}
+
+#[cfg(feature = "regex")]
+thread_local! {
+    static REGEX_CACHE: core::cell::RefCell<RegexCache> = const {
+        core::cell::RefCell::new(RegexCache {
+            slots: Vec::new(),
+            hand: 0,
+            seen: [0; REGEX_SEEN_SLOTS],
+            seen_next: 0,
+        })
+    };
+}
+
+/// FNV-1a over the key's parts, with separators so `("ab", "c")` and `("a", "bc")` differ.
+#[cfg(feature = "regex")]
+fn regex_key_hash(yq: bool, pattern: &str, flags: &FlagsKey) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |byte: u8| {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    };
+    feed(u8::from(yq));
+    match flags {
+        FlagsKey::Effective(bits) => {
+            feed(1);
+            feed(*bits);
+        }
+        FlagsKey::Invalid(raw) => {
+            feed(2);
+            raw.bytes().for_each(&mut feed);
+            feed(3);
+        }
+    }
+    pattern.bytes().for_each(&mut feed);
+    hash
+}
+
+/// Build regex flags from jq flag string, once per distinct `(mode, pattern, flags)` (#5531).
+///
+/// Every regex builtin compiled its pattern again for every input value, and
+/// `regex::Regex::new` dominates a short-string match (a Unicode class pattern over 20,000
+/// strings was 20x a literal one). A program's pattern is usually the same for every input, so a
+/// key seen a second time has its result kept, per thread, up to [`REGEX_CACHE_SLOTS`] of them
+/// (errors too, so a refused pattern is not translated and compiled again for each input).
+/// Eviction is a clock: a hit marks its slot, and the scan that makes room passes over a marked
+/// slot once, so a pattern in constant use outlives one-off admissions.
+///
+/// A key is only kept on its second sighting. A pattern a program computes per input never comes
+/// back, and keeping each one cost 6% on x86_64 (sixteen live compiled values instead of one
+/// freed at once); it now pays a hash and a ring write on top of the compile it always paid. The
+/// compiled value is shared (`Rc`), not cloned: a `regex::Regex` clone starts with an empty
+/// scratch-space pool. A pattern over [`REGEX_CACHE_MAX_PATTERN`] bytes skips the cache. The
+/// bound on what is kept is a count, not a size: a short pattern can compile to megabytes
+/// (`\w{100}`), so up to sixteen of those stay alive until the thread ends.
+#[cfg(feature = "regex")]
+fn build_regex<S: EvalSemantics>(
+    pattern: &str,
+    flags: Option<&str>,
+) -> Result<Rc<JqRegex>, EvalError> {
+    let yq = S::TAG == EvalTag::Yq;
+    if pattern.len() > REGEX_CACHE_MAX_PATTERN {
+        return build_regex_uncached::<S>(pattern, flags).map(Rc::new);
+    }
+    let key = FlagsKey::of(flags);
+    let hash = regex_key_hash(yq, pattern, &key);
+    let hit = REGEX_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .slots
+            .iter()
+            .find(|slot| {
+                slot.hash == hash && slot.yq == yq && slot.flags == key && slot.pattern == pattern
+            })
+            .map(|slot| {
+                slot.referenced.set(true);
+                slot.compiled.clone()
+            })
+    });
+    if let Some(compiled) = hit {
+        return compiled;
+    }
+    let compiled = build_regex_uncached::<S>(pattern, flags).map(Rc::new);
+    REGEX_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if !cache.seen.contains(&hash) {
+            let at = cache.seen_next;
+            cache.seen[at] = hash;
+            cache.seen_next = (at + 1) % REGEX_SEEN_SLOTS;
+            return;
+        }
+        let entry = CachedRegex {
+            hash,
+            yq,
+            pattern: pattern.to_string(),
+            flags: key,
+            referenced: core::cell::Cell::new(false),
+            compiled: compiled.clone(),
+        };
+        if cache.slots.len() < REGEX_CACHE_SLOTS {
+            cache.slots.push(entry);
+            return;
+        }
+        let mut at = cache.hand;
+        while cache.slots[at].referenced.replace(false) {
+            at = (at + 1) % REGEX_CACHE_SLOTS;
+        }
+        cache.slots[at] = entry;
+        cache.hand = (at + 1) % REGEX_CACHE_SLOTS;
+    });
+    compiled
+}
+
+#[cfg(feature = "regex")]
+fn build_regex_uncached<S: EvalSemantics>(
+    pattern: &str,
+    flags: Option<&str>,
+) -> Result<JqRegex, EvalError> {
     // #5367: jq's classes are Oniguruma's, Unicode-aware, and rewritten here. yq's are Go's
     // `regexp`, a different syntax from the crate's throughout (#5374, #5388), so its pattern is
     // read and re-written whole.
@@ -126503,6 +126681,110 @@ mod tests {
         );
         query!(br#""abc""#, r#"match("[0-9]+"; "")?"#,
             QueryResult::None => {}
+        );
+    }
+
+    /// #5531: `build_regex` keeps the result for a `(mode, pattern, flags)` it has built twice and
+    /// hands the same value back, errors included; a different flag string, mode or pattern is its
+    /// own entry, a pattern seen once is not kept, a long pattern never is, and the oldest entry
+    /// makes room once the cache is full.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn build_regex_keeps_the_last_patterns_5531() {
+        use std::rc::Rc;
+        let jq = |pattern: &str, flags: Option<&str>| build_regex::<JqSemantics>(pattern, flags);
+        // The first call records the key, the second keeps its result, the third is the hit.
+        let settled = |pattern: &str, flags: Option<&str>| {
+            jq(pattern, flags).ok();
+            jq(pattern, flags).ok();
+            jq(pattern, flags)
+        };
+
+        let first = settled("a[0-9]+", None).expect("compiles");
+        assert!(Rc::ptr_eq(&first, &jq("a[0-9]+", None).expect("cached")));
+        assert!(!Rc::ptr_eq(
+            &first,
+            &settled("a[0-9]+", Some("i")).expect("other flags")
+        ));
+        assert!(!Rc::ptr_eq(
+            &first,
+            &settled("a[0-9]*", None).expect("other pattern")
+        ));
+        // Spellings that compile to the same regex share an entry: `g`, `l` and `s` do nothing,
+        // and order and repeats do not matter.
+        assert!(Rc::ptr_eq(
+            &first,
+            &jq("a[0-9]+", Some("g")).expect("g is a no-op")
+        ));
+        assert!(Rc::ptr_eq(
+            &first,
+            &jq("a[0-9]+", Some("")).expect("empty flags")
+        ));
+        let ci = settled("a[0-9]+", Some("i")).expect("i");
+        for same in ["ig", "gi", "ii", "sgi"] {
+            assert!(
+                Rc::ptr_eq(&ci, &jq("a[0-9]+", Some(same)).expect("same flags")),
+                "{same}"
+            );
+        }
+        assert!(!Rc::ptr_eq(
+            &ci,
+            &jq("a[0-9]+", Some("ix")).expect("x differs")
+        ));
+        assert!(!Rc::ptr_eq(
+            &ci,
+            &jq("a[0-9]+", Some("im")).expect("m differs")
+        ));
+        assert!(!Rc::ptr_eq(
+            &ci,
+            &jq("a[0-9]+", Some("in")).expect("n differs")
+        ));
+        let m = settled("a[0-9]+", Some("m")).expect("m");
+        assert!(Rc::ptr_eq(&m, &jq("a[0-9]+", Some("p")).expect("p is m")));
+        let yq = build_regex::<YqSemantics>("a[0-9]+", None).expect("yq compiles");
+        assert!(!Rc::ptr_eq(&first, &yq), "the mode is part of the key");
+        assert!(first.is_match("a12").expect("match") && !first.is_match("a").expect("match"));
+
+        // A key built once is not kept: the second call builds again (and then keeps that one).
+        let once = jq("once[0-9]", None).expect("compiles");
+        let again = jq("once[0-9]", None).expect("compiles again");
+        assert!(!Rc::ptr_eq(&once, &again));
+        assert!(Rc::ptr_eq(&again, &jq("once[0-9]", None).expect("hit")));
+
+        // A refusal is kept too, and is the same error each time.
+        let refused = settled("(?P<n>a)", None).err().expect("refused");
+        assert_eq!(Some(refused), jq("(?P<n>a)", None).err());
+        let bad_flags = settled("a", Some("z")).err().expect("bad modifier");
+        assert_eq!(Some(bad_flags), jq("a", Some("z")).err());
+
+        // A pattern past the size limit is built each time.
+        let long = format!("{}b", "a".repeat(REGEX_CACHE_MAX_PATTERN));
+        let (a, b, c) = (
+            jq(&long, None).expect("long"),
+            jq(&long, None).expect("long"),
+            jq(&long, None).expect("long"),
+        );
+        assert!(!Rc::ptr_eq(&a, &b) && !Rc::ptr_eq(&b, &c));
+
+        // A pattern in constant use outlives one-off admissions: a hit marks its slot and the
+        // eviction scan passes a marked slot once.
+        let hot = settled("hot[0-9]", None).expect("hot");
+        for n in 0..REGEX_CACHE_SLOTS * 3 {
+            settled(&format!("cold{n}"), None).expect("cold");
+            assert!(
+                Rc::ptr_eq(&hot, &jq("hot[0-9]", None).expect("hot hit")),
+                "round {n}"
+            );
+        }
+
+        // Full: an entry nothing hits is overwritten in its turn.
+        let kept = settled("kept", None).expect("kept");
+        for n in 0..REGEX_CACHE_SLOTS {
+            settled(&format!("evict{n}"), None).expect("evict");
+        }
+        assert!(
+            !Rc::ptr_eq(&kept, &jq("kept", None).expect("rebuilt")),
+            "a full cache drops its oldest entries"
         );
     }
 
