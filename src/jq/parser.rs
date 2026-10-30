@@ -6369,12 +6369,26 @@ impl<'a> Parser<'a> {
         name: &str,
         parse_original: impl FnOnce(&mut Self) -> Result<Expr, ParseError>,
     ) -> Result<Expr, ParseError> {
-        if !self.shadowable_defs.contains(name) {
-            return parse_original(self);
-        }
-        match parse_original(self) {
-            Ok(original) => Ok(Self::wrap_shadowable_call(name, original)),
-            Err(e) => self.retry_shadow_candidate_as_generic_call(start_pos, e),
+        let call = if !self.shadowable_defs.contains(name) {
+            parse_original(self)?
+        } else {
+            match parse_original(self) {
+                Ok(original) => Self::wrap_shadowable_call(name, original),
+                Err(e) => self.retry_shadow_candidate_as_generic_call(start_pos, e)?,
+            }
+        };
+        // #5612: `limit`, `until`, `while`, `repeat`, `range`, `first`, `last`, `error` and `JOIN`
+        // are ordinary `Term`s in jq's grammar, so a trailing `.x`/`[0]`/`[]` binds to the call
+        // (`first(.a[]).id`, `range(3).x`, `error.y`). yq takes one after `first` and `error` too,
+        // and its lexer refuses the other seven before they reach here. A call that already took
+        // its postfix (a wrong-arity rewind) has none left to take.
+        if matches!(
+            name,
+            "limit" | "until" | "while" | "repeat" | "range" | "first" | "last" | "error" | "JOIN"
+        ) {
+            self.parse_postfix(call)
+        } else {
+            Ok(call)
         }
     }
 
