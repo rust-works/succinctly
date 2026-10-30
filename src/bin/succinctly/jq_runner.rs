@@ -9554,6 +9554,45 @@ impl InputDoc {
     }
 }
 
+/// The bridge document of an owned input (see [`InputDoc::Bridge`]); the one place it is built, so
+/// a test can count the inputs that needed one (#5624).
+fn bridge_doc_of(input: &OwnedValue) -> succinctly::jq::ReindexedDoc {
+    #[cfg(test)]
+    bridge_docs::bump();
+    input.input_bridge_doc()
+}
+
+/// Test-only count of [`bridge_doc_of`] calls on this thread.
+#[cfg(test)]
+mod bridge_docs {
+    use std::cell::Cell;
+
+    thread_local! {
+        static BUILT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn bump() {
+        BUILT.with(|n| n.set(n.get() + 1));
+    }
+
+    pub(super) fn built() -> usize {
+        BUILT.with(Cell::get)
+    }
+}
+
+/// Whether `expr` is the filter `.` -- on its own, in parentheses, or as every stage of a pipe --
+/// whose answer is its input unchanged (#5624).
+fn is_identity_filter(expr: &jq::Expr) -> bool {
+    match expr {
+        jq::Expr::Identity => true,
+        jq::Expr::Paren(inner) => is_identity_filter(inner),
+        jq::Expr::Pipe(stages) => {
+            !stages.as_slice().is_empty() && stages.as_slice().iter().all(is_identity_filter)
+        }
+        _ => false,
+    }
+}
+
 fn evaluate_input_streaming(
     input: &OwnedValue,
     expr: &jq::Expr,
@@ -9594,12 +9633,25 @@ fn evaluate_input_streaming(
     // can't forget the flag the way a hand-rolled `to_json_input_bridge` +
     // `JsonIndex::build_reindex` pair could.
     let preserve = output_config.convention.preserves_source_values();
+    // #5624: the filter `.` answers its input, so there is nothing to evaluate -- writing the value
+    // out, indexing the text and converting the cursor's answer back (about 9,000 instructions for
+    // a 35-byte `--stream` event) only to hand the same value on. `--preserve-input` writes its own
+    // text and keeps the route.
+    if !preserve && is_identity_filter(expr) {
+        // The gate every output here goes through (see below), applied to the value itself.
+        if let Err(e) = input.check_tree_depth() {
+            sink.report(DiagStyle::Jq, &e, &at.resolve());
+            return Ok(());
+        }
+        on_value(sink, input.clone())?;
+        return Ok(());
+    }
     let doc = if preserve {
         let text = input.to_json_jq_preserve();
         let index = JsonIndex::build(text.as_bytes());
         InputDoc::Preserve(text, index)
     } else {
-        InputDoc::Bridge(input.input_bridge_doc())
+        InputDoc::Bridge(bridge_doc_of(input))
     };
     let cursor = doc.root();
 
@@ -15821,6 +15873,97 @@ mod tests {
             .expect("spawns")
             .join()
             .expect("passes");
+    }
+
+    /// #5624: the filter `.` over an owned input -- a `--stream` event, a `--seq` record, a DSV
+    /// row -- hands the input on without writing it out and indexing the text for a cursor, and
+    /// the shapes that read the input still build that document. The pin must be able to fail: it
+    /// does, with the shortcut removed from `evaluate_input_streaming`.
+    #[test]
+    fn identity_over_an_owned_input_builds_no_bridge_document_5624() {
+        let config = OutputConfig {
+            compact: true,
+            raw_output: false,
+            join_output: false,
+            raw_output0: false,
+            ascii_output: false,
+            color_output: false,
+            color_scheme: ColorScheme::default(),
+            sort_keys: false,
+            indent_string: String::new(),
+            unbuffered: false,
+            seq: false,
+            convention: JsonConvention::JqCompat,
+        };
+        let input = jq::parse("1").map(|_| ()).ok().map(|()| {
+            OwnedValue::array_from(vec![
+                OwnedValue::from_number_bytes::<jq::JqSemantics>(b"1.50"),
+                OwnedValue::String("a".into()),
+                OwnedValue::object_from([(
+                    "b".to_string(),
+                    OwnedValue::array_from(vec![OwnedValue::Float(f64::NAN), OwnedValue::Null]),
+                )]),
+            ])
+        });
+        let input = input.expect("parses");
+        let run = |filter: &str| -> (Vec<String>, usize) {
+            let expr = jq::parse(filter).expect("parses");
+            let before = bridge_docs::built();
+            let mut outputs = Vec::new();
+            let mut sink = ErrorSink::default();
+            evaluate_input_streaming(
+                &input,
+                &expr,
+                &EvalContext::default(),
+                &ErrorAt::Fixed(InputLocation::unknown()),
+                &mut sink,
+                &config,
+                &mut |_, value| {
+                    outputs.push(value.to_json());
+                    Ok(true)
+                },
+            )
+            .expect("evaluates");
+            (outputs, bridge_docs::built() - before)
+        };
+        let expected = vec![input.to_json()];
+        for filter in [".", "(.)", ". | .", "((.))", "(. | .) | ."] {
+            assert_eq!(run(filter), (expected.clone(), 0), "{filter}");
+        }
+        // Whatever reads the input, or is not just `.`, still needs the document.
+        for filter in [
+            ".[0]",
+            ". , .",
+            ".[1] | .",
+            "def f: .; f",
+            "length",
+            ". as $x | $x",
+        ] {
+            let (outputs, built) = run(filter);
+            assert_eq!(built, 1, "{filter}");
+            assert!(!outputs.is_empty(), "{filter}");
+        }
+        // A value past the print depth is refused with no output, as the route does for any output.
+        let mut deep = OwnedValue::Int(1);
+        for _ in 0..succinctly::jq::MAX_VALUE_TREE_DEPTH {
+            deep = OwnedValue::array_from(vec![deep]);
+        }
+        let mut sink = ErrorSink::default();
+        let mut outputs = 0;
+        evaluate_input_streaming(
+            &deep,
+            &jq::parse(".").expect("parses"),
+            &EvalContext::default(),
+            &ErrorAt::Fixed(InputLocation::unknown()),
+            &mut sink,
+            &config,
+            &mut |_, _| {
+                outputs += 1;
+                Ok(true)
+            },
+        )
+        .expect("evaluates");
+        assert_eq!(outputs, 0, "an over-deep value prints nothing");
     }
 
     #[test]
