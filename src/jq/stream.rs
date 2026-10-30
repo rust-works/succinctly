@@ -314,9 +314,9 @@ pub(crate) fn real_output_finite_literal(raw: &[u8]) -> String {
 }
 
 /// [`real_output_finite_literal`], appended to `out` with no `String` of its own: the form
-/// `OwnedValue`'s printer takes (#5594).
-pub(crate) fn push_real_output_finite_literal(out: &mut String, raw: &[u8]) {
-    out.push_str(&String::from_utf8_lossy(raw));
+/// `OwnedValue`'s printer takes, from the `str` a `NumberLiteral` holds (#5594).
+pub(crate) fn push_real_output_finite_literal(out: &mut String, literal: &str) {
+    out.push_str(literal);
 }
 
 /// [`real_output_finite_literal`] for a place yq writes *JSON* (#1129).
@@ -327,21 +327,22 @@ pub(crate) fn push_real_output_finite_literal(out: &mut String, raw: &[u8]) {
 /// (`100000000000000000000.0`) by its JSON encoder, which is the spelling the
 /// bare `Float` printed before the digits were kept.
 pub(crate) fn yq_json_finite_literal(raw: &[u8]) -> String {
-    core::str::from_utf8(raw)
-        .ok()
-        .and_then(crate::yaml::yq_json_number_text)
-        .unwrap_or_else(|| real_output_finite_literal(raw))
+    match core::str::from_utf8(raw) {
+        Ok(literal) => {
+            let mut out = String::new();
+            push_yq_json_finite_literal(&mut out, literal);
+            out
+        }
+        Err(_) => real_output_finite_literal(raw),
+    }
 }
 
-/// [`yq_json_finite_literal`], appended to `out` (#5594): only the respelled wide integer
-/// allocates.
-pub(crate) fn push_yq_json_finite_literal(out: &mut String, raw: &[u8]) {
-    match core::str::from_utf8(raw)
-        .ok()
-        .and_then(crate::yaml::yq_json_number_text)
-    {
+/// [`yq_json_finite_literal`], appended to `out`, and the one definition of its rule (#5594):
+/// only the respelled wide integer allocates.
+pub(crate) fn push_yq_json_finite_literal(out: &mut String, literal: &str) {
+    match crate::yaml::yq_json_number_text(literal) {
         Some(text) => out.push_str(&text),
-        None => push_real_output_finite_literal(out, raw),
+        None => push_real_output_finite_literal(out, literal),
     }
 }
 

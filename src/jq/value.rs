@@ -857,21 +857,24 @@ fn input_bridge_literal_text(raw: &[u8]) -> String {
 
 /// [`format_number_jq_compat`], appended to `out` (#5594): a literal the formatter would hand
 /// back unchanged ([`is_jq_canonical_number`]) is copied as it is, so the printer allocates no
-/// `String` per number.
-fn push_number_jq_compat(out: &mut String, raw: &[u8]) {
-    match core::str::from_utf8(raw) {
-        Ok(text) if is_jq_canonical_number(raw) => out.push_str(text),
-        _ => out.push_str(&format_number_jq_compat(raw)),
+/// `String` per number. It takes the literal as the `str` a `NumberLiteral` already holds, so
+/// nothing re-validates its UTF-8.
+fn push_number_jq_compat(out: &mut String, literal: &str) {
+    if is_jq_canonical_number(literal.as_bytes()) {
+        out.push_str(literal);
+    } else {
+        out.push_str(&format_number_jq_compat(literal.as_bytes()));
     }
 }
 
 /// [`input_bridge_literal_text`], appended to `out` (#5594). A canonical literal has no exponent,
 /// so it is never the overflow the bridge respells, and is copied as [`push_number_jq_compat`]
 /// copies it.
-fn push_input_bridge_literal_text(out: &mut String, raw: &[u8]) {
-    match core::str::from_utf8(raw) {
-        Ok(text) if is_jq_canonical_number(raw) => out.push_str(text),
-        _ => out.push_str(&input_bridge_literal_text(raw)),
+fn push_input_bridge_literal_text(out: &mut String, literal: &str) {
+    if is_jq_canonical_number(literal.as_bytes()) {
+        out.push_str(literal);
+    } else {
+        out.push_str(&input_bridge_literal_text(literal.as_bytes()));
     }
 }
 
@@ -4140,7 +4143,7 @@ impl OwnedValue {
         &self,
         depth: usize,
         jq_printer: bool,
-        finite_literal: fn(&mut String, &[u8]),
+        finite_literal: fn(&mut String, &str),
         float_fmt: fn(f64) -> String,
         infinite_fmt: fn(bool) -> &'static str,
         nan_fmt: fn(&mut String, f64),
@@ -4172,7 +4175,7 @@ impl OwnedValue {
         out: &mut String,
         depth: usize,
         jq_printer: bool,
-        finite_literal: fn(&mut String, &[u8]),
+        finite_literal: fn(&mut String, &str),
         float_fmt: fn(f64) -> String,
         infinite_fmt: fn(bool) -> &'static str,
         nan_fmt: fn(&mut String, f64),
@@ -4208,7 +4211,7 @@ impl OwnedValue {
             {
                 out.push_str(infinite_fmt(f.is_sign_negative()));
             }
-            Self::NumberLiteral(_, literal) => finite_literal(out, literal.as_bytes()),
+            Self::NumberLiteral(_, literal) => finite_literal(out, literal),
             Self::String(s) => {
                 out.push('"');
                 let _ = write_json_body_jq(out, s);
@@ -4430,7 +4433,7 @@ impl OwnedValue {
             }
             // A parsed NaN keeps its instance through the bridge (#3309).
             Self::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => {
-                out.push_str(&nan_instance_token(*f));
+                push_nan_instance_token(out, *f);
             }
             Self::Float(f) if f.is_infinite() => out.push_str(overflow_literal(*f)),
             // #2802: a spelled integer (`0x1f`, `0o17`, `01`, `+5`) is no number text the bridge's
@@ -10835,7 +10838,7 @@ mod tests {
         type Convention = (
             bool,
             fn(&[u8]) -> String,
-            fn(&mut String, &[u8]),
+            fn(&mut String, &str),
             fn(f64) -> String,
             fn(bool) -> &'static str,
             fn(f64) -> String,
