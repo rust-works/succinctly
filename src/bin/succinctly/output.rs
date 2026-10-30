@@ -1880,6 +1880,10 @@ mod tests {
 
         let mut sink = ErrorSink::default();
         sink.set_stream_fault(StreamFault::new(|| Some(String::from("jq's message"))));
+        assert!(
+            format!("{sink:?}").contains("StreamFault"),
+            "a held hook prints by name"
+        );
         sink.report(DiagStyle::Jq, &EvalError::new("a type error"), &at);
         assert!(
             !sink.parse_stopped(),
