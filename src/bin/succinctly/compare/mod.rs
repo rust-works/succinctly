@@ -260,14 +260,18 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         ),
         None => None,
     };
-    let subject_build = subject_exe.as_deref().zip(args.subject_features.as_deref()).map(
-        |(exe, feats)| {
+    let subject_build = subject_exe
+        .as_deref()
+        .zip(args.subject_features.as_deref())
+        .map(|(exe, feats)| {
             (
                 exe,
-                feats.split(',').map(|f| f.trim().to_string()).collect::<Vec<_>>(),
+                feats
+                    .split(',')
+                    .map(|f| f.trim().to_string())
+                    .collect::<Vec<_>>(),
             )
-        },
-    );
+        });
     let mut env = env::Env::collect(&jq, sha256_hex(&std::fs::read(&jq)?), subject_build)?;
     let mut declared: Vec<String> = manifest
         .succinctly
