@@ -11,11 +11,28 @@
       "Bash(./scripts/build.sh)",
       "Bash(./scripts/build.sh *)",
       "Bash(./scripts/test.sh)",
+      "Bash(./scripts/pre-push.sh)",
+      "Bash(./scripts/pre-push.sh *)",
+      "Bash(scripts/pre-push.sh)",
+      "Bash(scripts/pre-push.sh *)",
       "Bash(.claude/hooks/format-rust.sh)",
       "Bash(.claude/hooks/check-skill-casing.sh)"
     ]
   },
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/pre-push.sh hook",
+            "timeout": 1800,
+            "statusMessage": "pre-push gate"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write|MultiEdit",

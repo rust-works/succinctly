@@ -7,6 +7,9 @@
 #           finishes inside the 10 s deadline on a fast machine only); expected where it shows, not stale where it does not
 # category  by-design | host-dependent | newer-than-primary | reference-crash | reference-slow | to-triage
 #           (to-triage: a real difference nobody has yet classified against ADR-0018 or filed)
+# issue     optional tracking issue. A branch that references a `to-triage` entry's issue deletes the entry in
+#           the same change (scripts/ledger_refs.py, #5585); one that only mentions it says `[ledger keeps #N]`
+#           on its own line in a commit message
 
 [[divergence]]
 id = "features:get_jq_origin/0"

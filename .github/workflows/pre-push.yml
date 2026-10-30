@@ -1,0 +1,32 @@
+name: Pre-push gate
+
+# scripts/pre-push.sh runs the CI gates a diff can fail before an agent pushes it (#5585), and
+# .claude/settings.json blocks `git push` while it fails. This keeps its gate list from drifting
+# from the workflows: the test fails when a command in .github/workflows/*.yml is neither
+# mirrored by a gate in scripts/pre_push.py nor listed there as deliberately not.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/**'
+      - '.claude/settings.json'
+      - 'scripts/pre_push.py'
+      - 'scripts/pre-push.sh'
+      - 'scripts/test_pre_push.py'
+      - 'scripts/lib/clippy-variants.sh'
+      - 'scripts/ledger_refs.py'
+      - 'scripts/changelog.py'
+      - 'scripts/doc_lines.py'
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    name: Pre-push gate list
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Unit-test the gate list against the workflows
+        run: python3 scripts/test_pre_push.py -v

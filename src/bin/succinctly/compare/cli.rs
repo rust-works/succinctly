@@ -9,6 +9,7 @@ use super::exec::exec;
 use super::harness::Tool;
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 #[derive(Debug, Clone)]
@@ -69,16 +70,20 @@ pub fn parse_probes(text: &str) -> Result<Vec<Probe>> {
     Ok(out)
 }
 
-/// `extension`: true for the succinctly-only file.
+/// `extension`: true for the succinctly-only file. `only`: run just these probe ids.
 pub fn run(
     reference: &Tool,
     subject: &Tool,
     probes: &[Probe],
     extension: bool,
+    only: Option<&BTreeSet<String>>,
     cwd: &Path,
 ) -> Result<Vec<CliRow>> {
     let mut rows = vec![];
     for p in probes {
+        if only.is_some_and(|s| !s.contains(&p.id)) {
+            continue;
+        }
         let r = exec(reference, &p.args, &p.stdin, cwd)?;
         let s = exec(subject, &p.args, &p.stdin, cwd)?;
         let verdict = if extension {
@@ -138,15 +143,15 @@ mod tests {
         let bad_exit = sh("cat >/dev/null; echo 1; exit 2");
         let cwd = Path::new(".");
         assert_eq!(
-            run(&ok, &ok, &probe(), false, cwd).unwrap()[0].verdict,
+            run(&ok, &ok, &probe(), false, None, cwd).unwrap()[0].verdict,
             Verdict::Match
         );
         assert_eq!(
-            run(&ok, &other, &probe(), false, cwd).unwrap()[0].verdict,
+            run(&ok, &other, &probe(), false, None, cwd).unwrap()[0].verdict,
             Verdict::Differs
         );
         assert_eq!(
-            run(&ok, &bad_exit, &probe(), false, cwd).unwrap()[0].verdict,
+            run(&ok, &bad_exit, &probe(), false, None, cwd).unwrap()[0].verdict,
             Verdict::Differs
         );
     }
@@ -156,9 +161,26 @@ mod tests {
         let accepts = sh("cat >/dev/null; echo 1");
         let rejects = sh("cat >/dev/null; exit 2");
         let cwd = Path::new(".");
-        let v = |r: &Tool, s: &Tool| run(r, s, &probe(), true, cwd).unwrap()[0].verdict;
+        let v = |r: &Tool, s: &Tool| run(r, s, &probe(), true, None, cwd).unwrap()[0].verdict;
         assert_eq!(v(&rejects, &accepts), Verdict::Extension);
         assert_eq!(v(&accepts, &accepts), Verdict::Unexpected);
         assert_eq!(v(&rejects, &rejects), Verdict::Unexpected);
+    }
+
+    #[test]
+    fn only_runs_the_listed_probe_ids() {
+        let ok = sh("cat >/dev/null; echo 1");
+        let cwd = Path::new(".");
+        let listed: BTreeSet<String> = ["p".to_string()].into();
+        let other: BTreeSet<String> = ["not-p".to_string()].into();
+        assert_eq!(
+            run(&ok, &ok, &probe(), false, Some(&listed), cwd)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(run(&ok, &ok, &probe(), false, Some(&other), cwd)
+            .unwrap()
+            .is_empty());
     }
 }

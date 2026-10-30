@@ -36,6 +36,24 @@ scripts/doc_lines.py check` caps prose lines at 1000 characters; `fix` splits ov
 that conflicts in one of these pages because `fix` split a paragraph upstream is resolved by
 `python3 scripts/doc_lines.py resolve <file>` (it splits all three sides, then merges them).
 
+## Before You Push
+
+`scripts/pre-push.sh` maps the files your branch changed to the CI gates they can fail and runs
+those (`--full` adds the lints CI runs: three clippy invocations, rustdoc, `--no-default-features`;
+`list` shows the gates). `.claude/settings.json` runs it as a `PreToolUse` hook, so an agent's
+`git push` is blocked while it fails -- `--no-verify` does not skip it. `PRE_PUSH_SKIP="gate ..."`
+skips named gates (as a prefix of the push, `PRE_PUSH_SKIP=ledger-only git push`, for an agent), and a
+skip is always printed. The gates are checked against
+`.github/workflows/*.yml` by `python3 scripts/test_pre_push.py`: a new CI gate has to be mirrored in
+`scripts/pre_push.py` or listed there as deliberately not (#5585).
+
+A fix for a `to-triage` entry in `comparison/jq/divergences.toml` deletes that entry in the same
+change, or CI's `Ledger drift` job fails on "listed but no longer diverging" (#5583 needed a third
+commit for it). `python3 scripts/ledger_refs.py check` names the entry in milliseconds; a branch
+that only mentions the issue says `[ledger keeps #N]` on its own line in a commit message.
+`succinctly dev compare jq --ledger-only` is the stale-entry half of that CI job in about a minute,
+against `/usr/bin/jq` when the pinned 1.7.1 is not built.
+
 ## AI Scratch Directory
 
 Use `.ai/scratch/` for temporary files (git-ignored):

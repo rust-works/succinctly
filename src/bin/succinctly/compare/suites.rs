@@ -10,6 +10,7 @@ use super::exec::exec;
 use super::harness::Tool;
 use anyhow::Result;
 use serde::Serialize;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,15 +83,20 @@ impl SuiteSummary {
     }
 }
 
+/// `only`: run just the cases at these line numbers.
 pub fn run(
     suite: &str,
     text: &str,
     reference: &Tool,
     subject: &Tool,
+    only: Option<&BTreeSet<String>>,
     cwd: &Path,
 ) -> Result<SuiteSummary> {
     let mut rows = vec![];
     for c in parse(text) {
+        if only.is_some_and(|s| !s.contains(&c.line.to_string())) {
+            continue;
+        }
         let (args, stdin): (Vec<String>, String) = match &c.input {
             Some(input) => (vec!["-c".into(), c.program.clone()], format!("{input}\n")),
             None => (
@@ -168,6 +174,7 @@ mod tests {
             text,
             &sh("cat; echo ok"),
             &sh("cat; echo ok"),
+            None,
             Path::new("."),
         )
         .unwrap();
@@ -177,9 +184,29 @@ mod tests {
             text,
             &sh("cat; echo a"),
             &sh("cat; echo b"),
+            None,
             Path::new("."),
         )
         .unwrap();
         assert_eq!(diff.differing().next().map(|r| r.id.as_str()), Some("t:1"));
+    }
+
+    #[test]
+    fn only_runs_the_cases_at_the_listed_lines() {
+        let text = ".\n1\n1\n\n.\n2\n2\n";
+        let at = |lines: &[&str]| -> BTreeSet<String> {
+            lines.iter().map(|s| (*s).to_string()).collect()
+        };
+        let tool = sh("cat; echo ok");
+        let run_only = |only: &BTreeSet<String>| {
+            run("t", text, &tool, &tool, Some(only), Path::new("."))
+                .unwrap()
+                .rows
+                .into_iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(run_only(&at(&["5"])), ["t:5"]);
+        assert_eq!(run_only(&at(&["2"])), Vec::<String>::new());
     }
 }
