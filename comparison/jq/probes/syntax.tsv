@@ -583,3 +583,10 @@ num-lit-trailing-dot-wide-pow	operators	["-n", "-c", "100000000000000000000."]	-
 num-lit-trailing-dot-2p53	operators	["-n", "-c", "9007199254740993."]	-
 num-lit-trailing-dot-2p53-tojson	operators	["-n", "-c", "9007199254740993.|tojson"]	-
 num-lit-trailing-dot-index	operators	["-n", "-c", "[range(3)]|.[1.e0]"]	-
+num-lit-leading-zero-exp	operators	["-n", "-c", "00e1"]	-
+num-lit-leading-zero-exp-int	operators	["-n", "-c", "007e1"]	-
+num-lit-leading-zero-fraction	operators	["-n", "-c", "007.50"]	-
+num-lit-leading-zero-neg-exp	operators	["-n", "-c", "0007e-1"]	-
+num-lit-leading-zero-tojson	operators	["-n", "-c", "00e1|tojson"]	-
+num-lit-double-dot-index	operators	["-n", "-c", "1..e1"]	-
+num-lit-double-dot-try	operators	["-n", "-c", "try (1..e1) catch ."]	-
