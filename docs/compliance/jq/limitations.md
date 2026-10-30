@@ -8050,8 +8050,9 @@ Three differences remain, all in the direction of erroring rather than aborting:
   thread it through.
   `succinctly jq` has the same net for the evaluator's own splice sites
   ([#5526](https://github.com/rust-works/succinctly/issues/5526)).
-  `last(f)`, `+=`, `//=`, a fold's `$x` and `try error(<deep>)` on a value built past 384 levels
+  `+=`, `//=`, a fold's `$x` read by an assignment or arithmetic (`reduce f as $x ([]; . + [$x])`) and `try error(<deep>)` on a value built past 384 levels
   assert the ceiling where they splice it back into the AST or render it, with no `Result` to thread it through.
+  `last(f)` was one of them until [#5516](https://github.com/rust-works/succinctly/issues/5516), which hands the value on instead of splicing it, so `last(f(400)) | length` answers `1` as jq does.
   They exited 101 with a raw panic; the three CLI routes and the library's `jq::eval` now catch exactly that panic.
   The CLI reports `nesting depth exceeds limit of 384` at exit 5, the same refusal `reduce` gives.
   `jq::eval` returns it as a `resource_limit` error.

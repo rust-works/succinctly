@@ -157486,7 +157486,10 @@ mod touched_edge_cases_2999 {
             .spawn(|| {
                 let json = br"{}";
                 let index = JsonIndex::build(json);
-                let program = "def f(n): if n == 0 then 0 else [f(n-1)] end; last(f(400)) | length";
+                // A fold's `$x` read by arithmetic is still spliced back (`last(f)` shares the
+                // value since #5516, and answers as jq does).
+                let program = "def f(n): if n == 0 then 0 else [f(n-1)] end; \
+                               reduce f(400) as $x ([]; . + [$x]) | length";
                 let expr = parse(program).expect("parse");
                 let result = eval::<Vec<u64>, JqSemantics>(&expr, index.root(json));
                 let refused = matches!(
