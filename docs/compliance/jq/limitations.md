@@ -7435,6 +7435,20 @@ exists for the two-sided check to pin, the same caveat
 [ADR-0018](../../adrs/adr-0018.md)'s Consequences already record for
 [yq Limitations](../yq/limitations.md).
 
+## `$` before a final newline (#5572)
+
+jq's `$` matches at the end of the text or just before a final `\n`, and the `regex` crate's does not, so a pattern with `$` is searched in the text and again in the text without its last `\n` (`dv_captures_at`).
+When the two searches match at the same start and differ, which one jq finds depends on the order a backtracking engine tries the pattern's alternatives in: a greedy `\s+$` takes the `\n` (`"abc \n" | sub("\\s+$";"")` is `"abc"`), and a lazy `\s+?$` does not.
+That tie is decided by the `fancy-regex` route, built the first time it is needed, which reads `$` as `(?=\n?\z)` as Oniguruma does.
+A text that ends in two newlines is searched the same way, because `$` is just before the last one of them (`"a\n\n" | [match("$";"g").offset]` is `[2,3]`).
+
+- **A pattern `fancy-regex` cannot compile keeps the shorter match on a tie.**
+  `fancy-regex`'s parser refuses a repeat of an empty group, so `"abc \n" | match("(?:)+\\s+$")` is `[3,1]` here and `[3,2]` in jq.
+  Pinned by `test_dollar_tie_keeps_the_trimmed_match_when_fancy_regex_refuses_5572`.
+- **Text that follows a `$` is not searched.**
+  Neither search can match `a$\n` (the `$`, then the newline it stands before) in `"a\n"`, which jq does, and `$[^a]?` on `"\n\n"` finds an empty match at 1 where jq's `[^a]?` takes the newline.
+  A pattern with `\z` as well (`a$|b\z`) does not have this problem with `\z`, because it is read by the `fancy-regex` route alone, which has jq's meaning for both.
+
 ## A slice is a path component
 
 jq models `.[1:2]` as indexing with `{"start":1,"end":2}`, and treats that object as a
