@@ -3080,7 +3080,7 @@ impl<'a> Parser<'a> {
                         }
                     } else {
                         // Identifier key
-                        let name = self.parse_ident()?;
+                        let name = self.parse_qualified_ident()?;
                         (ObjectKey::Literal(name), None)
                     };
 
@@ -5434,7 +5434,7 @@ impl<'a> Parser<'a> {
                                 }
                             }
                         } else {
-                            ObjectKey::Literal(self.parse_ident()?)
+                            ObjectKey::Literal(self.parse_qualified_ident()?)
                         };
 
                         self.skip_ws();
@@ -5532,7 +5532,7 @@ impl<'a> Parser<'a> {
             return Err(ParseError::new("expected '$' after 'label'", self.pos));
         }
         self.next();
-        let name = self.parse_ident()?;
+        let name = self.parse_variable_name()?;
         self.skip_ws();
 
         // Expect '|'
@@ -5596,7 +5596,7 @@ impl<'a> Parser<'a> {
             return Err(ParseError::new("expected '$' after 'break'", self.pos));
         }
         self.next();
-        let name = self.parse_ident()?;
+        let name = self.parse_variable_name()?;
 
         // #2964: record the site unconditionally -- before the
         // `wrap_shadowable_call` wrapper below decides whether this `break`
@@ -5651,7 +5651,7 @@ impl<'a> Parser<'a> {
                 let name = if is_dollar {
                     self.parse_variable_name()?
                 } else {
-                    self.parse_ident()?
+                    self.parse_qualified_ident()?
                 };
                 if is_dollar {
                     self.reject_loc_as_binding_name(&name, Some("IDENT or BINDING"), sigil_offset)?;
@@ -15305,6 +15305,37 @@ mod tests {
         }
         for program in ["def a::: 1; 1", "def a:: 1; 1", "a::b::"] {
             assert!(parse_program(program).is_err(), "{program}");
+        }
+    }
+
+    /// #5600: an unquoted object key, a destructuring key and a closure parameter read `a::b` as
+    /// one name in jq mode (the `::` takes no whitespace and needs a name after it).
+    #[test]
+    fn a_qualified_name_is_an_object_key_and_a_parameter_in_jq_mode_5600() {
+        for program in [
+            "{a::b: 1}",
+            "{a::b}",
+            "{a::b::c: 1}",
+            ". as {a::b: $x} | $x",
+            "def f(a::b): a::b; f(1)",
+            "def f($a::b): $a::b; f(1)",
+            "label $a::b | break $a::b",
+        ] {
+            assert!(parse_program(program).is_ok(), "{program}");
+        }
+        for program in [
+            "{a::: 1}",
+            "{a::1: 1}",
+            "{a ::b: 1}",
+            "def f(a:: b): 1; f(1)",
+        ] {
+            assert!(parse_program(program).is_err(), "{program}");
+        }
+        match parse_program("{a::b: 1}").map(|p| p.expr) {
+            Ok(Expr::Object(entries)) => {
+                assert!(matches!(&entries[..], [e] if e.key == ObjectKey::Literal("a::b".into())));
+            }
+            other => panic!("parsed to {other:?}"),
         }
     }
 
