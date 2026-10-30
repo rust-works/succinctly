@@ -12070,7 +12070,19 @@ fn eval_each_owned_past_front_doors<S: EvalSemantics>(
     // `eval_owned_input`.
     let doc = match input.reindexed::<S>() {
         Ok(doc) => doc,
-        Err(error) => return Flow::Escaped(Control::Error(error)),
+        Err(error) => {
+            // #5554: a value too deep to re-index still renders as text.
+            return match text_peel_after_refusal::<S>(expr, input, &error) {
+                Some((text, None)) => match sink(text) {
+                    Demand::Continue => Flow::Exhausted,
+                    Demand::Stop => Flow::Stopped { pending: None },
+                },
+                Some((text, Some(rest))) => {
+                    eval_each_owned::<S>(&rest, &text, optional, Reentry::REBUILT, sink)
+                }
+                None => Flow::Escaped(Control::Error(error)),
+            };
+        }
     };
     let cursor = doc.root();
 
@@ -12510,6 +12522,64 @@ fn unreachable_owned_pipe_stage() -> EvalError {
     );
     EvalError::new("internal error: pipe stage yielded other than one value") // patchcov: coverage tolerate-line reason="unreachable: same invariant as the `false` above (#5285)"
 } // patchcov: coverage tolerate-line reason="unreachable: the whole function body above is dead by the same invariant (#5285)"
+
+/// The first stage of `expr`, answered without the re-index bridge, when the bridge refused
+/// `input` for its depth and that stage only renders `input` as text (#5554): `tojson`,
+/// `tostring`, `@json`, `@text` and `"\(.)"`. Returns the text and what is left of `expr`.
+///
+/// The bridge writes `input` out and indexes it again, and refuses a value past
+/// [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH) levels, which jq has no
+/// counterpart for: a value a program built can be deeper, and jq's writer prints it as far as
+/// [`JQ_MAX_PRINT_DEPTH`](super::value::JQ_MAX_PRINT_DEPTH) and then
+/// [`SKIPPED_TOO_DEEP`](super::value::SKIPPED_TOO_DEEP). The text is rendered from the tree by the
+/// writer the lone-stage fast path already uses, which stops at that depth whatever the tree's.
+/// Only a refusal asks, so nothing a value the bridge accepts answers changes.
+///
+/// jq mode only: yq's writers print the whole value.
+fn text_peel_after_refusal<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    refused: &EvalError,
+) -> Option<(OwnedValue, Option<Expr>)> {
+    if S::TAG != EvalTag::Jq || !refused.is_resource_limit() {
+        return None;
+    }
+    let (stage, rest) = match unwrap_paren(expr) {
+        Expr::Pipe(stages) => {
+            let (first, tail) = stages.split_first()?;
+            let rest = match tail {
+                [] => None,
+                [only] => Some(only.clone()),
+                _ => Some(Expr::Pipe(tail.to_vec().into())),
+            };
+            (first, rest)
+        }
+        other => (other, None),
+    };
+    let text = match unwrap_paren(stage) {
+        Expr::Builtin(Builtin::ToJson) | Expr::Format(FormatType::Json) => {
+            owned_value_to_json::<S>(input)
+        }
+        Expr::Builtin(Builtin::ToString) | Expr::Format(FormatType::Text) => {
+            tostring_text::<S>(input, false)
+        }
+        Expr::StringInterpolation(parts) => {
+            let mut text = String::new();
+            for part in parts {
+                match part {
+                    StringPart::Literal(literal) => text.push_str(literal),
+                    StringPart::Expr(inner) if matches!(unwrap_paren(inner), Expr::Identity) => {
+                        text.push_str(&owned_to_string::<S>(input));
+                    }
+                    StringPart::Expr(_) => return None,
+                }
+            }
+            text
+        }
+        _ => return None,
+    };
+    Some((OwnedValue::String(text.into()), rest))
+}
 
 pub(crate) fn eval_owned_reindex_free<S: EvalSemantics>(
     expr: &Expr,
@@ -79540,7 +79610,14 @@ fn eval_owned_input_bridge<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // ±Infinity rather than being silently substituted with "null" (#561).
     let doc = match input.reindexed::<S>() {
         Ok(doc) => doc,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => {
+            // #5554: a value too deep to re-index still renders as text.
+            return match text_peel_after_refusal::<S>(expr, input, &e) {
+                Some((text, None)) => QueryResult::Owned(text),
+                Some((text, Some(rest))) => eval_owned_input_bridge::<W, S>(&rest, &text, optional),
+                None => QueryResult::Error(e),
+            };
+        }
     };
     let cursor = doc.root();
 
