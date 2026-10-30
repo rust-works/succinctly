@@ -14155,6 +14155,7 @@ mod tests {
                 )),
                 Err(f) => Err(match f {
                     SlurpFailure::Unsplittable => "unsplittable",
+                    SlurpFailure::DepthLimit => "depth",
                     SlurpFailure::Validation(_) => "validation",
                 }),
             }
@@ -14172,6 +14173,10 @@ mod tests {
         // after clean ones.
         assert_eq!(join(&["1", "[1,"]), Err("unsplittable"));
         assert_eq!(join(&["1 }"]), Err("unsplittable"));
+        // A document jq refuses for depth before the fault the splitter stops at (#5497).
+        let open = "[".repeat(300);
+        assert_eq!(join(&["1", &open]), Err("depth"));
+        assert_eq!(join(&["[".repeat(100).as_str()]), Err("unsplittable"));
 
         // `--validate` rejects a file before it is split, even one the
         // splitter would have accepted, and a clean stream joins as before.

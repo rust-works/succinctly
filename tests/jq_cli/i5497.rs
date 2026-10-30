@@ -112,7 +112,10 @@ fn test_depth_refusal_comes_before_a_later_fault_5497() -> Result<()> {
 fn test_top_level_read_under_input_builtins_is_a_parse_error_5497() -> Result<()> {
     let input = format!("1\n2\n{}\n", nest("[", "", "]", 300));
     let (out, err, exit) = run_jq_full(&["-c", "[., input_line_number]"], Some(&input))?;
-    assert_eq!((out.as_str(), err, exit), ("[1,1]\n[2,2]\n", refused(3, 257), 5));
+    assert_eq!(
+        (out.as_str(), err, exit),
+        ("[1,1]\n[2,2]\n", refused(3, 257), 5)
+    );
     Ok(())
 }
 
