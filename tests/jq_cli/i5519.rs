@@ -163,6 +163,18 @@ fn test_a_fold_reading_fields_of_its_variable_matches_jq_5519() -> Result<()> {
             "1\n",
             0,
         ),
+        (
+            ".[0] as $x | reduce .[] as $u (0; if $u.b == $x.b then .+1 else . end)",
+            r#"[{"b":[nan]},{"b":[nan]}]"#,
+            "1\n",
+            0,
+        ),
+        (
+            ". as $r | reduce .[] as $u (0; if $u.b == $r[1].b then .+1 else . end)",
+            r#"[{"b":[nan]},{"b":[nan]}]"#,
+            "1\n",
+            0,
+        ),
     ] {
         assert_eq!(
             jq(filter, input)?,
@@ -199,6 +211,20 @@ fn test_a_malformed_object_still_fails_a_fold_that_reads_it_5519() -> Result<()>
         assert_eq!(
             jq("[foreach .[] as $u (0; . + 1; $u.a)]", input)?,
             (String::new(), 5),
+            "{input}"
+        );
+    }
+    // A loop variable nothing reads materializes nothing of its element, so it checks nothing, as
+    // `.[] as $x | 1` does (jq refuses the document at parse time).
+    for input in ["[{,}]", r#"[{"a"}]"#, r#"[{"a":1,}]"#] {
+        assert_eq!(
+            jq("reduce .[] as $u (0; . + 1)", input)?,
+            ("1\n".to_string(), 0),
+            "{input}"
+        );
+        assert_eq!(
+            jq(".[] as $x | 1", input)?,
+            ("1\n".to_string(), 0),
             "{input}"
         );
     }

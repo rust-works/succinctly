@@ -40710,34 +40710,143 @@ mod tests {
         assert_eq!(depth_guard_panic_message(&*not_text), None);
     }
 
+    fn elements<V: DocumentValue>(
+        root: V,
+        project: Option<&[String]>,
+    ) -> Vec<Result<String, String>> {
+        let mut out = Vec::new();
+        let mut rest = root.as_array().expect("an array root");
+        while let Some((cursor, next)) = rest.uncons_cursor() {
+            let item = GenericItem::OneCursor(cursor);
+            out.push(
+                match project {
+                    Some(fields) => fold_element_into_owned::<V, JqSemantics>(item, fields),
+                    None => generic_item_into_owned::<V, JqSemantics>(item),
+                }
+                .map(|v| v.to_json())
+                .map_err(|control| match control {
+                    Control::Error(error) => error.to_string(),
+                    _ => "not an error".to_string(),
+                }),
+            );
+            rest = next;
+        }
+        out
+    }
+
+    /// #5519: the projected walk is a copy of the whole conversion's object arm, so a rule added to
+    /// one must reach the other. Every one-byte mutation of three small objects (a byte deleted,
+    /// replaced or inserted, from the structural characters and a backslash) is read through both
+    /// with every member named: they must agree on which documents fail, and on every member of
+    /// those that do not.
+    #[test]
+    fn a_projected_element_and_the_whole_one_agree_on_validity_5519() {
+        fn owned<V: DocumentValue>(
+            root: V,
+            project: Option<&[String]>,
+        ) -> Option<Result<OwnedValue, String>> {
+            let mut rest = root.as_array()?;
+            let (cursor, _) = rest.uncons_cursor()?;
+            let item = GenericItem::OneCursor(cursor);
+            let owned = match project {
+                Some(fields) => fold_element_into_owned::<V, JqSemantics>(item, fields),
+                None => generic_item_into_owned::<V, JqSemantics>(item),
+            };
+            rest = rest;
+            let _ = rest;
+            Some(owned.map_err(|control| match control {
+                Control::Error(error) => error.to_string(),
+                _ => "not an error".to_string(),
+            }))
+        }
+        let names = ["a", "b", "c"].map(String::from);
+        let mut checked = 0usize;
+        for base in [
+            &br#"{"a":1,"b":"x","c":[1,{"d":2}]}"#[..],
+            br#"{"a":1}"#,
+            br#"{"c":null,"a":"y"}"#,
+        ] {
+            let mut docs: Vec<Vec<u8>> = Vec::new();
+            for at in 0..=base.len() {
+                for byte in b",:{}[]\" \\1" {
+                    let mut inserted = base.to_vec();
+                    inserted.insert(at, *byte);
+                    docs.push(inserted);
+                    if at < base.len() {
+                        let mut replaced = base.to_vec();
+                        replaced[at] = *byte;
+                        docs.push(replaced);
+                    }
+                }
+                if at < base.len() {
+                    let mut deleted = base.to_vec();
+                    deleted.remove(at);
+                    docs.push(deleted);
+                }
+            }
+            for element in docs {
+                let mut json = b"[".to_vec();
+                json.extend_from_slice(&element);
+                json.push(b']');
+                // The CLI's document splitter refuses an unterminated string before any walk; the
+                // library-level walks (the whole conversion's included) are not meant to see one.
+                let (mut in_string, mut escaped) = (false, false);
+                for &byte in &json {
+                    match (in_string, escaped, byte) {
+                        (true, true, _) => escaped = false,
+                        (true, false, b'\\') => escaped = true,
+                        (true, false, b'"') => in_string = false,
+                        (false, _, b'"') => in_string = true,
+                        _ => {}
+                    }
+                }
+                if in_string {
+                    continue;
+                }
+                let index = JsonIndex::build(&json);
+                let (Some(projected), Some(whole)) = (
+                    owned(index.root(&json).value(), Some(&names)),
+                    owned(index.root(&json).value(), None),
+                ) else {
+                    continue;
+                };
+                let text = String::from_utf8_lossy(&json);
+                checked += 1;
+                match (projected, whole) {
+                    (Err(_), Err(_)) => {}
+                    (Ok(projected), Ok(whole)) => match (&projected, &whole) {
+                        (OwnedValue::Object(kept), OwnedValue::Object(all)) => {
+                            let expected: Vec<_> = names
+                                .iter()
+                                .filter_map(|name| {
+                                    all.get(name.as_str()).map(|v| (name, v.to_json()))
+                                })
+                                .collect();
+                            let got: Vec<_> = names
+                                .iter()
+                                .filter_map(|name| {
+                                    kept.get(name.as_str()).map(|v| (name, v.to_json()))
+                                })
+                                .collect();
+                            assert_eq!(got, expected, "{text}");
+                            assert_eq!(kept.len(), got.len(), "{text}");
+                        }
+                        _ => assert_eq!(projected.to_json(), whole.to_json(), "{text}"),
+                    },
+                    (projected, whole) => panic!(
+                        "validity disagrees on {text}: projected {projected:?}, whole {whole:?}"
+                    ),
+                }
+            }
+        }
+        assert!(checked > 500, "the sweep reached {checked} documents");
+    }
+
     /// #5519: a fold's loop element is converted to the members the fold reads and nothing else.
     /// The pin must be able to fail: it does, with `fold_element_into_owned` made to ignore
     /// `project`, which gives back the whole object.
     #[test]
     fn a_fold_element_is_projected_to_the_members_it_reads_5519() {
-        fn elements<V: DocumentValue>(
-            root: V,
-            project: Option<&[String]>,
-        ) -> Vec<Result<String, String>> {
-            let mut out = Vec::new();
-            let mut rest = root.as_array().expect("an array root");
-            while let Some((cursor, next)) = rest.uncons_cursor() {
-                let item = GenericItem::OneCursor(cursor);
-                out.push(
-                    match project {
-                        Some(fields) => fold_element_into_owned::<V, JqSemantics>(item, fields),
-                        None => generic_item_into_owned::<V, JqSemantics>(item),
-                    }
-                    .map(|v| v.to_json())
-                    .map_err(|control| match control {
-                        Control::Error(error) => error.to_string(),
-                        _ => "not an error".to_string(),
-                    }),
-                );
-                rest = next;
-            }
-            out
-        }
         let json = br#"[{"a":1,"b":"x","c":[1,{"d":2}],"a":7},5,[1],{"b":2}]"#;
         let index = JsonIndex::build(json);
         let fields = ["a".to_string(), "zz".to_string()];
