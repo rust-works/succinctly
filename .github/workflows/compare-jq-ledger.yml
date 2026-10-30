@@ -12,16 +12,33 @@ name: Compare jq ledger
 # release.
 #
 # x86_64 Linux only: the ledger's `platform` field is per OS, so an ARM leg would add cost
-# and no different expectation. Not a required check. The weekly run catches drift that no
-# path below would trigger, for example a bumped dependency.
+# and no different expectation. Not a required check (a branch-protection change, not a
+# workflow one). The weekly run catches drift that no path below would trigger.
+#
+# `src/**` and not just src/jq: the JSON index, the bit and tree layers and the CLI all
+# decide what a probe prints. The `push` trigger on `main` runs the same paths after a merge
+# and is what seeds the jq cache below.
+#
+# The --dimension list in the Compare step names the dimensions whose probes feed the ledger
+# (see `run_suites` in src/bin/succinctly/compare/mod.rs); a new ledger-fed dimension has to
+# be added there too.
 on:
   pull_request:
     branches: [main]
     paths:
       - 'comparison/jq/**'
-      - 'src/jq/**'
-      - 'src/bin/succinctly/compare/**'
-      - 'src/bin/succinctly/jq*.rs'
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/compare-jq-build.sh'
+      - '.github/workflows/compare-jq-ledger.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'comparison/jq/**'
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - 'scripts/compare-jq-build.sh'
       - '.github/workflows/compare-jq-ledger.yml'
   schedule:
@@ -45,8 +62,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       # Restore-only except on `main` (#3649): a PR-scoped cache can only be read by that
-      # one ref. The weekly run on `main` writes it; a PR that misses just builds the two
-      # jqs, which the script skips when they are already in place.
+      # one ref. A push, the weekly run or a manual run on `main` writes it, so the first PR
+      # after the manifest or the build script changes builds the two jqs itself.
       - name: Restore the pinned jq builds
         id: jq-cache
         uses: actions/cache/restore@v6
@@ -78,17 +95,21 @@ jobs:
 
       - name: Compare
         run: |
+          set -o pipefail
+          mkdir -p data/compare/ledger
           ./target/release/succinctly dev compare jq --quick \
             --dimension smoke --dimension features --dimension cli \
             --dimension differential --dimension input --dimension robustness \
-            --out data/compare/ledger
+            --out data/compare/ledger 2>&1 | tee data/compare/ledger/compare.log
 
       - name: Summarize the drift
         if: always()
         run: |
           {
             echo '### Divergence ledger'
-            grep -h 'Ledger drift' data/compare/ledger/report.md || echo 'no report was written'
+            echo '```'
+            grep -hE 'divergence\(s\)|no longer diverging' data/compare/ledger/compare.log || echo 'no drift reported'
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the report
