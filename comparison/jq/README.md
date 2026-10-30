@@ -43,6 +43,14 @@ core, and licence / `no_std` / CI-runner facts read from the repository; build t
 ./target/release/succinctly dev compare jq --quick --write-docs
 ```
 
+The harness needs `bench-runner`, which the shipped CLI does not carry (`bench-runner` pulls in `ctrlc`, which links Foundation on macOS, #5551).
+To time the shipped build instead, build it separately and pass it in; the report records that the timed binary is not the harness:
+
+```bash
+cargo build --release --features cli,simd,regex,serde --target-dir target/subject
+./target/release/succinctly dev compare jq --quick --subject target/subject/release/succinctly --subject-features cli,simd,regex,serde
+```
+
 `--write-docs` writes `docs/compare/jq-<platform>.{md,json}` and the index `docs/compare/jq.md`. CI is
 `.github/workflows/compare-jq.yml`, run by hand or on a release, not on pull requests.
 `.github/workflows/compare-jq-ledger.yml` runs the correctness dimensions (no timing rows) on pull requests that touch

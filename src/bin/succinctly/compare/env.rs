@@ -17,7 +17,9 @@ pub struct Env {
     pub load_average_1m: Option<f64>,
     pub succinctly_sha256: String,
     pub succinctly_profile: &'static str,
-    pub succinctly_features: Vec<&'static str>,
+    pub succinctly_features: Vec<String>,
+    /// The timed binary is a separate `--subject` build, not the harness itself (#5570).
+    pub subject_is_harness: bool,
     pub jq_sha256: String,
     pub jq_version: String,
     pub jq_build_configuration: String,
@@ -60,8 +62,8 @@ fn load_average() -> Option<f64> {
         .ok()
 }
 
-fn features() -> Vec<&'static str> {
-    let mut f = vec![];
+fn features() -> Vec<String> {
+    let mut f: Vec<&'static str> = vec![];
     if cfg!(feature = "cli") {
         f.push("cli");
     }
@@ -85,11 +87,16 @@ fn features() -> Vec<&'static str> {
             f.push(name);
         }
     }
-    f
+    f.into_iter().map(String::from).collect()
 }
 
 impl Env {
-    pub fn collect(jq: &std::path::Path, jq_sha256: String) -> Result<Self> {
+    /// `subject` is the binary under test and its features; `None` times the harness itself.
+    pub fn collect(
+        jq: &std::path::Path,
+        jq_sha256: String,
+        subject: Option<(&std::path::Path, Vec<String>)>,
+    ) -> Result<Self> {
         let git = collect_git_info()?;
         let on_battery = on_battery();
         let profile = if cfg!(debug_assertions) {
@@ -97,7 +104,11 @@ impl Env {
         } else {
             "release"
         };
-        let feats = features();
+        let (subject_exe, feats) = match subject {
+            Some((exe, feats)) => (exe.to_path_buf(), feats),
+            None => (std::env::current_exe()?, features()),
+        };
+        let subject_is_harness = std::env::current_exe()? == subject_exe;
         let mut invalid = vec![];
         if git.dirty {
             invalid.push("dirty working tree".to_string());
@@ -115,7 +126,7 @@ impl Env {
             "select-stats",
             "share-stats",
         ] {
-            if feats.contains(&bad) {
+            if feats.iter().any(|f| f == bad) {
                 invalid.push(format!("measurement-distorting feature `{bad}` is enabled"));
             }
         }
@@ -126,11 +137,10 @@ impl Env {
             toolchain: collect_toolchain_info()?,
             on_battery,
             load_average_1m: load_average(),
-            succinctly_sha256: super::manifest::sha256_hex(&std::fs::read(
-                std::env::current_exe()?
-            )?),
+            succinctly_sha256: super::manifest::sha256_hex(&std::fs::read(&subject_exe)?),
             succinctly_profile: profile,
             succinctly_features: feats,
+            subject_is_harness,
             jq_sha256,
             jq_version: cmd_stdout(&jq_str, &["--version"]).unwrap_or_default(),
             jq_build_configuration: cmd_stdout(&jq_str, &["--build-configuration"])
