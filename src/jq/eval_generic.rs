@@ -41621,6 +41621,37 @@ mod tests {
         assert!(matches!(result, GenericResult::Error(_)), "{result:?}");
     }
 
+    /// #5549: a `del` of a static path is answered without the reindex bridge in jq mode, the
+    /// same observable proof as the fixed-path `del` above: a value at the nesting limit, which
+    /// the bridge refuses to write out, still deletes. `optional` swallows a delete that raises,
+    /// and yq mode and a computed key keep the bridge (and so its depth error).
+    #[test]
+    fn eval_on_owned_answers_a_static_del_without_the_bridge_5549() {
+        type V<'a> = crate::json::light::StandardJson<'a, Vec<u64>>;
+        let mut deep = OwnedValue::Null;
+        for _ in 0..crate::jq::value::MAX_VALUE_TREE_DEPTH {
+            deep = OwnedValue::array_from(vec![deep]);
+        }
+        let expr = crate::jq::parse("del(.[7])").unwrap();
+        let result =
+            eval_on_owned::<JqSemantics, V<'_>>(&expr, deep.clone(), false, Reentry::REBUILT);
+        assert!(matches!(result, GenericResult::Owned(_)), "{result:?}");
+        let result =
+            eval_on_owned::<YqSemantics, V<'_>>(&expr, deep.clone(), false, Reentry::REBUILT);
+        assert!(matches!(result, GenericResult::Error(_)), "{result:?}");
+        let computed = crate::jq::parse("del(.[7 + 0])").unwrap();
+        let result = eval_on_owned::<JqSemantics, V<'_>>(&computed, deep, false, Reentry::REBUILT);
+        assert!(matches!(result, GenericResult::Error(_)), "{result:?}");
+
+        let raising = crate::jq::parse("del(.a)").unwrap();
+        let array = OwnedValue::array_from(vec![OwnedValue::Int(1)]);
+        let result =
+            eval_on_owned::<JqSemantics, V<'_>>(&raising, array.clone(), false, Reentry::REBUILT);
+        assert!(matches!(result, GenericResult::Error(_)), "{result:?}");
+        let result = eval_on_owned::<JqSemantics, V<'_>>(&raising, array, true, Reentry::REBUILT);
+        assert!(matches!(result, GenericResult::None), "{result:?}");
+    }
+
     fn round_trips_unchanged<S: EvalSemantics>(value: &OwnedValue) -> bool {
         let doc = value.reindexed::<S>().unwrap();
         let cursor = doc.root();

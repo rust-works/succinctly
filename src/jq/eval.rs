@@ -12424,7 +12424,9 @@ fn owned_del_run<S: EvalSemantics>(
     match del_on_owned::<Vec<u64>, S>(path, state, false) {
         QueryResult::Owned(value) => Ok(value),
         QueryResult::Error(error) => Err(error),
-        _ => Err(unreachable_owned_del_outcome()), // patchcov: coverage tolerate-line reason="unreachable: a static jq-mode path resolves to paths or an error, never to no output, a break or a halt (#5549)"
+        _ => Err(EvalError::new(
+            "internal error: del yielded other than one value",
+        )), // patchcov: coverage tolerate-line reason="unreachable: a static jq-mode path resolves to paths or an error, never to no output, a break or a halt (#5549)"
     }
 }
 
@@ -12441,17 +12443,6 @@ pub(crate) fn owned_del_target<S: EvalSemantics>(expr: &Expr) -> Option<&Expr> {
     (owned_assign_path_shape(path, &|_| false) && !super::eval_generic::embed_table_active())
         .then_some(path.as_ref())
 }
-
-/// The error [`owned_del_step`] reports if a `del` of a static path ever yields other than a
-/// value or an error.
-#[cold]
-fn unreachable_owned_del_outcome() -> EvalError {
-    debug_assert!(
-        false, // patchcov: coverage tolerate-line reason="unreachable: same invariant as the `_` arm of owned_del_step (#5549)"
-        "a del of a static path yielded neither a value nor an error" // patchcov: coverage tolerate-line reason="unreachable: same invariant as the `false` above (#5549)"
-    );
-    EvalError::new("internal error: del yielded other than one value") // patchcov: coverage tolerate-line reason="unreachable: same invariant as the `false` above (#5549)"
-} // patchcov: coverage tolerate-line reason="unreachable: the whole function body above is dead by the same invariant (#5549)"
 
 /// The assignment half of [`try_eval_owned_step`]: [`owned_assign_step`] over
 /// a consumed state, declining (the untouched state handed back) for anything
