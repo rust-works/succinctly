@@ -7303,6 +7303,20 @@ A repetition operator right after an assertion (`^*`, `$+`, `\b?`, `\A{2}`, `\z*
 Only a direct repetition is refused: a non-capturing group of an assertion (`(?:^)*`), which jq also refuses, is still accepted here.
 Under the `x` flag, or a pattern with an inline flag group naming `x`, the check stands down, because the scan cannot see the mode's comments and ignored blanks; `test(\"^ *\"; \"x\")` is an error in jq and `true` here.
 
+## Possessive quantifiers are refused (#5524)
+
+A possessive quantifier (`*+`, `++`, `?+`, `{n,}+`, `{n,m}+`) never gives characters back in jq's Oniguruma, so `"aaa" | test("a*+a")` is `false`.
+The `regex` crate reads the same text as a quantifier on a quantifier, `(a*)+`, and it has no atomic group to rewrite it to, so it answered `true` without a word.
+`build_regex` refuses the pattern with `invalid regex: regex parse error: possessive quantifier is not supported` (exit 5), the way it refuses other Oniguruma-only syntax: no portable dependency closes it yet (ADR-0018 rule 4(d), pending #5502), and a refusal is better than the silent wrong answer.
+As the last character of the pattern, or followed only by closing parentheses (`(?:a++)`), nothing after it can fail, so it is rewritten to the plain quantifier instead (`sub("a*+";"X")`, `gsub("a++";"X")`).
+The flags are checked first, as in jq, so a bad flag string is the error whatever the pattern.
+The scan steps over escapes, classes, `\Q..\E`, `(?#..)` and, under the `x` flag, `#` comments; an inline `(?x)` is not modelled, and a `*+` in its comments is refused.
+What jq itself reads as a repeat of a repeat stays as it was: `{n}+`, and a lazy quantifier followed by `+` (`a*?+`).
+The interval forms follow jq 1.7.1: `{n,}+`, `{n,m}+` and `{,m}+` are possessive, `{n}+` is not.
+A possessive quantifier that used to agree because nothing after it needed a character back (`"aaab" | test("a++b")`) is refused too, since the scan does not look at what follows.
+The second engine added by #5502 (`fancy-regex`, below) does not help: a pattern the `regex` crate accepts never reaches it, and it makes `*+`, `++` and `?+` atomic as jq does but reads `{n,m}+` as a repeat of a repeat, so an interval would stay refused.
+yq mode is unchanged: Go's `regexp` rejects the form (`invalid nested repetition operator: `*+``), as yq does.
+
 ## Lookaround and backreferences: a second regex engine (#5502)
 
 A pattern the `regex` crate refuses for a construct only a backtracking engine has is compiled by `fancy-regex` instead: lookahead and lookbehind (`(?=…)`, `(?!…)`, `(?<=…)`, `(?<!…)`), backreferences (`\1`, `\k<name>`), atomic groups (`(?>…)`), group conditionals (`(?(1)…|…)`), `\K`, `\G`, `\R` and `\e` ([ADR-0019's #5502 amendment](../../adrs/adr-0019.md#amendment-5502-implemented-2026-10-30-lookaround-and-backreferences-go-to-fancy-regex)).
