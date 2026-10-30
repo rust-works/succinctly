@@ -7382,43 +7382,47 @@ Three differences remain.
   A `(?P…)` group is refused before either engine, with jq's `undefined group option` (above).
   Pinned by `test_constructs_read_differently_stay_refused_5502`.
 
-The `l` and `n` flags below are unchanged on the second engine: `n` uses the same skip-forward search, and `l` has no effect.
+The `l` and `n` flags use the second engine too, and are described in the next section.
 
 ## Regex flags `l` and `n`
 
-[ADR-0019](../../adrs/adr-0019.md) accepted two regex-flag gaps as permanent — rule 4(d)
-of [ADR-0018](../../adrs/adr-0018.md): no dependency in the `regex`/`regex-automata` stack
-expresses oniguruma's search policies, and of the alternatives evaluated, the ones that do
-(`onig`, `pcre2`) cost more than closing #920/#922 is worth (both are C FFI, breaking pure-
-`cargo build` portability), while the one that doesn't cost that (`fancy-regex`) closes
-neither gap at all. `l` (POSIX leftmost-longest) is accepted as valid flag syntax but has
-no effect; `n` (suppress empty matches) still misses a non-empty match reachable only by
-backtracking to a different alternative — lazy quantifiers (`a*?`) and alternations with an
-empty-matching branch listed first (`(?:|a)`).
+[ADR-0019](../../adrs/adr-0019.md) accepted two regex-flag gaps as permanent, under rule 4(d) of [ADR-0018](../../adrs/adr-0018.md): no dependency in the `regex` stack expresses Oniguruma's search policies, and the alternatives that do were C FFI.
+[#5530](https://github.com/rust-works/succinctly/issues/5530) closed most of both gaps once `fancy-regex` 0.20 (pure Rust, already the second engine for lookaround) gained a longest-match mode and a not-empty mode.
+A pattern whose flags include `l`, or whose flags include `n` and which can match the empty string, is compiled by `fancy-regex` with the matching mode.
+Every other pattern keeps the `regex` crate, its speed and its output, and yq mode never takes the route.
 
-Both gaps route through `first_captures`/`global_captures`/`next_match_step`
-(`src/jq/eval.rs`), the one choke point every regex builtin shares, so the divergence is
-not confined to `match`/`test` — it reaches the string-transformation builtins too, and
-there it is not a wrong-answer-with-a-clear-error case, but a silent no-op or wrong-span
-replacement:
+- **`l` is the longest match anywhere, not POSIX leftmost-longest.**
+  Oniguruma's `ONIG_OPTION_FIND_LONGEST` keeps scanning start positions after the first one that matches and replaces its best only with a strictly longer match, so the winner can start after the leftmost match.
+  `fancy-regex`'s own `leftmost_longest` is the POSIX rule (the longest match at the leftmost start), so succinctly applies it at each start and walks the starts itself (`fancy_longest_captures`).
+  The two differ whenever a later start has a longer match: `"abaa" | match("a|aa|aaa";"l")` is `"aa"` at offset 2 in jq, and the same here.
+  Among equally long matches the earliest wins, and `g` resumes after the chosen match, as in jq.
+  Like Oniguruma's, one search reads the rest of the text, so `l` with `g` is quadratic in the number of matches unless the pattern has a bounded length (`a|ab`), where the search stops at the first match of that length.
+  An unbounded pattern (`a+`) over a long text with many matches is slow in both tools, and slower here.
+- **`l` stays a no-op on a pattern with a lazy quantifier.**
+  `fancy-regex`'s longest mode returns the lazy match where Oniguruma returns the longest of all the ways to match: `"aa" | match("a*?";"l")` is `"aa"` in jq and `""` here.
+  Such a pattern keeps its old route whole, `n` included, because the two flags are not independent (`ln` is the longest non-empty match anywhere).
+  Pinned by `test_regex_l_and_n_keep_their_old_search_where_fancy_regex_disagrees_5530` and `test_l_flag_on_a_lazy_quantifier_is_still_a_no_op_5530`.
+- **`n` backtracks to a non-empty match at the same position.**
+  `ONIG_OPTION_FIND_NOT_EMPTY` refuses an empty match and tries another way to match where it stands, which the skip-forward search could not: `"xaab" | gsub("a*?";"X";"gn")` is `"xXXb"` in jq and now here, where it was a no-op.
+- **A repeat of the empty group keeps the old search under either flag.**
+  `fancy-regex` mishandles `(?:)+?` and `(?:){1,2}` in both of its modes: `"a" | match("(?:)+?|a";"n")` is no match where jq has `"a"`, and `"ba" | match("(?:){1,2}a?||";"l")` stops at the empty match where jq has `"a"` at offset 1.
+  A pattern containing one is not routed to it, so it behaves as before #5530.
+  Nobody writes this (the group matches nothing and the repeat repeats nothing), and `()` is not affected.
+  Pinned by `test_a_repeated_empty_group_keeps_its_old_search_5530`.
+- **A group that iterates over the empty string is read differently, with or without a flag.**
+  Oniguruma stops a loop after an iteration that matched nothing and keeps that iteration: `"a" | match("(a*)*")` has `[1,0,""]` for group 1, and `"bcba" | match("b(c|(|.))*")` is `"bc"`.
+  The `regex` crate keeps the last non-empty iteration (`[0,1,"a"]`) and `"bcba"`.
+  `fancy-regex` reports the empty iteration as jq does for the captures, so `"a" | match("(a*)*";"n")` now agrees, but it backtracks out of an empty iteration to a longer match, so `"bcba" | match("b(c|(|.))*";"n")` is still `"bcba"`.
+  A repeated group with an empty alternative and `n` is another shape: `"ab" | match("(((b)|(|a))){2}";"n")` is `"ab"` in jq, `"a"` here and `"b"` before.
+  This predates `l` and `n`, which only move a pattern to the other route.
+- **A search can run out of budget where jq's optimizer does not.**
+  `l` and `n` run the backtracking engine on patterns the `regex` crate used to answer in one pass, so a pathological pattern that Oniguruma settles at once can raise `Regex failure: retry-limit-in-match over` here, the budget of the lookaround route (above).
+  As in Oniguruma, each start position an `l` search tries has a budget of its own.
+- **Multibyte text and an empty match are a separate jq quirk.**
+  jq 1.7.1 advances one byte after an empty match, so `"éaé" | [match("";"g").offset]` has a duplicate `1` and `3` in jq; this is the same with and without `l` and is not changed here.
 
-```console
-$ echo '"aaa"'  | jq            -c 'match("a|aa|aaa";"l").string'   =>  "aaa"
-$ echo '"aaa"'  | succinctly jq -c 'match("a|aa|aaa";"l").string'   =>  "a"
-$ echo '"aaa"'  | jq            -c 'sub("a|aa|aaa";"X";"l")'        =>  "X"
-$ echo '"aaa"'  | succinctly jq -c 'sub("a|aa|aaa";"X";"l")'        =>  "Xaa"   # wrong span
-$ echo '"xaab"' | jq            -c 'gsub("a*?";"X";"gn")'           =>  "xXXb"
-$ echo '"xaab"' | succinctly jq -c 'gsub("a*?";"X";"gn")'           =>  "xaab"  # no-op
-$ echo '"xaab"' | jq            -c 'sub("a*?";"X";"n")'             =>  "xXab"
-$ echo '"xaab"' | succinctly jq -c 'sub("a*?";"X";"n")'             =>  "xaab"  # no-op
-```
-
-`split`/`splits` inherit the same two gaps, since both are built on the same match
-discovery as `sub`/`gsub`. Every probe above exits 0 with empty stderr — silently wrong
-output, not a wrong-error-wording case. The flag combinations that trigger it are narrow:
-greedy quantifiers and non-empty-first alternation are unaffected and agree with jq —
-`[scan("a*";"gn")]` on `"xaab"` is `["aa"]` in both, and `[match("(?:a|)";"gn").string]` on
-`"xa"` is `["a"]` in both.
+Both flags go through `first_captures`/`global_captures`/`next_match_step` (`src/jq/eval.rs`), the one choke point every regex builtin shares, so `test`, `match`, `capture`, `scan`, `split`, `splits`, `sub` and `gsub` agree with each other.
+The differential behind this change compared `/usr/bin/jq` 1.7.1, the previous binary and the new one over generated patterns (nested and quantified groups, alternations inside repeats, lazy quantifiers, empty-first alternation, and each with lookbehind) on every string over `{a,b,c}` up to length 5, for `l`, `n`, `ln` and each with `g`.
 
 Like [Where succinctly errors and jq does not](#where-succinctly-errors-and-jq-does-not)
 above, this divergence is **not** tracked by
