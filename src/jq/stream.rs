@@ -313,6 +313,12 @@ pub(crate) fn real_output_finite_literal(raw: &[u8]) -> String {
     String::from_utf8_lossy(raw).into_owned()
 }
 
+/// [`real_output_finite_literal`], appended to `out` with no `String` of its own: the form
+/// `OwnedValue`'s printer takes (#5594).
+pub(crate) fn push_real_output_finite_literal(out: &mut String, raw: &[u8]) {
+    out.push_str(&String::from_utf8_lossy(raw));
+}
+
 /// [`real_output_finite_literal`] for a place yq writes *JSON* (#1129).
 ///
 /// Identical except for one literal: an integer too big for `i64`
@@ -325,6 +331,18 @@ pub(crate) fn yq_json_finite_literal(raw: &[u8]) -> String {
         .ok()
         .and_then(crate::yaml::yq_json_number_text)
         .unwrap_or_else(|| real_output_finite_literal(raw))
+}
+
+/// [`yq_json_finite_literal`], appended to `out` (#5594): only the respelled wide integer
+/// allocates.
+pub(crate) fn push_yq_json_finite_literal(out: &mut String, raw: &[u8]) {
+    match core::str::from_utf8(raw)
+        .ok()
+        .and_then(crate::yaml::yq_json_number_text)
+    {
+        Some(text) => out.push_str(&text),
+        None => push_real_output_finite_literal(out, raw),
+    }
 }
 
 /// The `yq`/real-output convention for an infinite `Float` (NaN is handled
