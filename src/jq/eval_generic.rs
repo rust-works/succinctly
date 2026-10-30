@@ -35398,19 +35398,28 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
             // element is reported ahead of an addition that fails earlier in the array. Adding
             // as we go and keeping the first addition error until every element has converted
             // gives the same answer without holding the converted elements.
-            let mut sum: Option<Result<OwnedValue, EvalError>> = None;
+            let mut total: Option<OwnedValue> = None;
+            let mut failed: Option<EvalError> = None;
             for element in &cursors {
                 let item = owned_or_suppress!(to_owned_cursor::<S, _>(element), optional);
-                sum = Some(match sum {
-                    None => Ok(item),
-                    Some(Ok(acc)) => crate::jq::eval::arith_add::<S>(acc, item),
-                    Some(failed) => failed,
-                });
+                if failed.is_some() {
+                    continue;
+                }
+                total = match total.take() {
+                    None => Some(item),
+                    Some(acc) => match crate::jq::eval::arith_add::<S>(acc, item) {
+                        Ok(sum) => Some(sum),
+                        Err(error) => {
+                            failed = Some(error);
+                            None
+                        }
+                    },
+                };
             }
-            match sum {
-                None => GenericResult::Owned(OwnedValue::Null),
-                Some(Ok(total)) => GenericResult::Owned(total),
-                Some(Err(error)) => GenericResult::Error(error),
+            match (failed, total) {
+                (Some(error), _) => GenericResult::Error(error),
+                (None, Some(sum)) => GenericResult::Owned(sum),
+                (None, None) => GenericResult::Owned(OwnedValue::Null),
             }
         }
 
@@ -41218,6 +41227,46 @@ mod tests {
                 String::from_utf8_lossy(json)
             );
         }
+        // An undecodable element is reported ahead of an addition that fails earlier in the
+        // array, as `builtin_add` converts every element before it adds any: the answer is the
+        // bridge's for each place the bad element can sit.
+        // The first two put a failed addition (`1 + "a"`, `"a" + 1`) ahead of the bad element.
+        for json in [&b"[1,\"a\",xyz]"[..], b"[\"a\",1,xyz]"] {
+            let (native, _) = run(json, false);
+            let text = String::from_utf8_lossy(json);
+            assert!(
+                native.starts_with("error:") && !native.contains("cannot be added"),
+                "{text}: the undecodable element must be reported, not the addition: {native}"
+            );
+            assert_eq!(native, run(json, true).0, "{text}");
+        }
+        for json in [
+            &b"[1,2,xyz]"[..],
+            b"[xyz,1,\"a\"]",
+            b"[xyz]",
+            b"[1,xyz,\"a\",2]",
+        ] {
+            let (native, _) = run(json, false);
+            let text = String::from_utf8_lossy(json);
+            assert_eq!(native, run(json, true).0, "{text}");
+            assert!(native.starts_with("error:"), "{text}: {native}");
+        }
+        // A live #2889 embed table keeps the bridge, whose result is detached from the nodes the
+        // bindings hold: with a binding in scope the arm steps aside and the answer is the same.
+        let origin = BindOrigin::Node {
+            node: 1,
+            document: 9,
+        };
+        let mut bound = OwnedValue::array_from(vec![OwnedValue::Int(1)]);
+        let guard =
+            embed_table_push::<JqSemantics>(Some(&origin), &mut bound).expect("a container bind");
+        assert!(embed_table_active());
+        let (with_table, with_table_reindexes) = run(b"[1,2,3]", false);
+        drop(guard);
+        let (without_table, without_table_reindexes) = run(b"[1,2,3]", false);
+        assert_eq!((with_table.as_str(), without_table.as_str()), ("6", "6"));
+        assert!(with_table_reindexes > 0, "a live embed table must bridge");
+        assert_eq!(without_table_reindexes, 0);
     }
 
     /// #5593: `floor`, `ceil`, `round`, `trunc`, `sqrt` and `fabs` of a document number are

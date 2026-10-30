@@ -114,6 +114,25 @@ const ROWS: &[(&str, &str, &str)] = &[
         r"try add catch .",
         r#""number (1) and array ([2]) cannot be added""#,
     ),
+    (r"[1,2,3]", r". as $x | add", r"6"),
+    (
+        r"[[1],[2]]",
+        r". as $a | $a | add == ($a[0] + $a[1])",
+        r"true",
+    ),
+    (r"[[1],[2]]", r".[0] as $x | add | length", r"2"),
+    (r"[[1],[2]]", r". as $x | add | path($x)?", r""),
+    (r#"[{"a":1},{"b":2}]"#, r".[0] as $x | add | .a", r"1"),
+    (
+        r#"[1,"a"]"#,
+        r". as $x | try add catch .",
+        r#""number (1) and string (\"a\") cannot be added""#,
+    ),
+    (
+        r"[[1,2],[3]]",
+        r". as $a | [add, $a[0]]",
+        r"[[1,2,3],[1,2]]",
+    ),
 ];
 
 #[test]
