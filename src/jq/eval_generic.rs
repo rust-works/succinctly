@@ -1399,33 +1399,38 @@ impl<V: Clone> ObjectBuilder<V> {
 /// this many unused slots.
 const MAX_SIBLING_CAPACITY: usize = 16;
 
-/// The member counts of the last two object elements of an array, which size
-/// the next one's map when they agree (#5594).
+/// The member counts of the last two elements of an array, which size the
+/// next one's map when they agree, until a guess overshoots (#5594).
 ///
 /// One sibling is not enough evidence: an array alternating a wide record with
 /// a one-member one would size every narrow map for the wide record, which
 /// measured +31% peak RSS on such a document. Two that agree are what a
-/// uniform array of records looks like, and an alternating one never offers
-/// them, so it grows its maps from empty as before.
+/// uniform array of records looks like. Agreement alone still admits a longer
+/// period (`wide, wide, narrow, ...`) or an empty object after two records, so
+/// the first object that turns out smaller than the room it was given ends the
+/// guessing for the rest of the array: at most one map per array is oversized.
 #[derive(Default)]
 struct SiblingShape {
     last: usize,
     before_last: usize,
+    overshot: bool,
 }
 
 impl SiblingShape {
     /// How many members to make room for in the next element's map.
     fn capacity(&self) -> usize {
-        if self.last == self.before_last {
+        if !self.overshot && self.last == self.before_last {
             self.last
         } else {
             0
         }
     }
 
-    /// Record an element with `members` members (`0` for anything but an
-    /// object).
-    fn push(&mut self, members: usize) {
+    /// Record an element that was given room for `given` members and holds
+    /// `members` if it is an object (`None` for anything else).
+    fn push(&mut self, members: Option<usize>, given: usize) {
+        let members = members.unwrap_or(0);
+        self.overshot |= members < given;
         self.before_last = self.last;
         self.last = members.min(MAX_SIBLING_CAPACITY);
     }
@@ -1447,10 +1452,10 @@ trait CursorWalkOutput {
     /// otherwise build (#3179), or `None` to walk it anyway.
     fn reuse(value: OwnedValue) -> Option<Self::Out>;
     /// How many members `out` holds if it is an object, which sizes the next
-    /// sibling's map (#5594); `0` otherwise, and always for a walk that keeps
-    /// nothing, so that walk never allocates a map it will not fill.
-    fn object_len(_out: &Self::Out) -> usize {
-        0
+    /// sibling's map (#5594); `None` otherwise, and always for a walk that
+    /// keeps nothing, so that walk never allocates a map it will not fill.
+    fn object_len(_out: &Self::Out) -> Option<usize> {
+        None
     }
     /// Hand `out`, just built for `parent`'s node, to the anchors waiting on
     /// the children `watched` names, each with its step (#3134).
@@ -1480,10 +1485,10 @@ impl CursorWalkOutput for BuildOwned {
     fn reuse(value: OwnedValue) -> Option<OwnedValue> {
         Some(value)
     }
-    fn object_len(out: &OwnedValue) -> usize {
+    fn object_len(out: &OwnedValue) -> Option<usize> {
         match out {
-            OwnedValue::Object(map) => map.len(),
-            _ => 0,
+            OwnedValue::Object(map) => Some(map.len()),
+            _ => None,
         }
     }
     fn fill_anchors<C: DocumentCursor>(
@@ -1703,19 +1708,22 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
                 let index = i64::try_from(items.len()).unwrap_or(i64::MAX);
                 watched.push((elem_cursor.node_id(), OwnedValue::Int(index)));
             }
+            let capacity = if sized { siblings.capacity() } else { 0 };
             let child = match embed_shared_nested::<_, B>(&elem_cursor, depth + 1, nested) {
                 Some(child) => child,
                 None => walk_child::<S, _, B>(
                     &elem_cursor,
                     C::REUSE_FIELD_VALUE.then(|| elem_cursor.value()),
-                    if sized { siblings.capacity() } else { 0 },
+                    capacity,
                     depth + 1,
                     check_depth,
                     scalar_override,
                     nested,
                 )?,
             };
-            siblings.push(B::object_len(&child));
+            if sized {
+                siblings.push(B::object_len(&child), capacity);
+            }
             items.push(child);
             last_elem = Some(elem_cursor);
             elems = rest;
@@ -51039,9 +51047,28 @@ mod tests {
     /// #5594: an object element is sized from the two before it when they
     /// agree, so a record shaped like its predecessors fills its map without
     /// growing it; wide predecessors size it for at most
-    /// `MAX_SIBLING_CAPACITY`, and predecessors that disagree size nothing.
+    /// `MAX_SIBLING_CAPACITY`, predecessors that disagree size nothing, and
+    /// once a guess overshoots the rest of the array is not sized. yq mode
+    /// sizes nothing.
     #[test]
     fn to_owned_cursor_sizes_an_element_from_its_siblings_5594() {
+        fn capacities<S: EvalSemantics>(json: &str) -> Vec<usize> {
+            let index = JsonIndex::build(json.as_bytes());
+            let root = index.root(json.as_bytes());
+            let owned = to_owned_cursor::<S, _>(&root).unwrap();
+            // The sizing changes no member, only the room.
+            assert_eq!(owned.to_json(), json);
+            let OwnedValue::Array(items) = &owned else {
+                panic!("expected an array, got {owned:?}");
+            };
+            items
+                .iter()
+                .map(|item| match item {
+                    OwnedValue::Object(map) => map.capacity(),
+                    other => panic!("expected an object, got {other:?}"),
+                })
+                .collect()
+        }
         let wide = format!(
             "{{{}}}",
             (0..MAX_SIBLING_CAPACITY + 4)
@@ -51051,41 +51078,25 @@ mod tests {
         );
         let five = r#"{"a":1,"b":2,"c":3,"d":4,"e":5}"#;
         let one = r#"{"x":1}"#;
-        // 0..=1 agree on 5; 3..=4 agree on the cap; 5 and 6 disagree.
-        let json = format!("[{five},{five},{one},{wide},{wide},{one},{wide},{one}]");
-        let index = JsonIndex::build(json.as_bytes());
-        let root = index.root(json.as_bytes());
-        let owned = to_owned_cursor::<JqSemantics, _>(&root).unwrap();
-        let OwnedValue::Array(items) = &owned else {
-            panic!("expected an array, got {owned:?}");
-        };
-        let capacity = |i: usize| match &items[i] {
-            OwnedValue::Object(map) => map.capacity(),
-            other => panic!("expected an object, got {other:?}"),
-        };
-        // Grown from empty, a one-member map has room for 3.
-        assert!(capacity(2) >= 5, "two 5-member siblings: {}", capacity(2));
+        // Grown from empty, a one-member map has room for 3 and `{}` for none.
+        let agreed = capacities::<JqSemantics>(&format!("[{five},{five},{one}]"));
+        assert!(agreed[2] >= 5, "two 5-member siblings: {agreed:?}");
+        let capped = capacities::<JqSemantics>(&format!("[{wide},{wide},{one}]"));
         assert!(
-            (MAX_SIBLING_CAPACITY..MAX_SIBLING_CAPACITY + 4).contains(&capacity(5)),
-            "two wide siblings, capped: {}",
-            capacity(5)
+            (MAX_SIBLING_CAPACITY..MAX_SIBLING_CAPACITY + 4).contains(&capped[2]),
+            "two wide siblings, capped: {capped:?}"
         );
-        assert!(capacity(7) < 5, "siblings that disagree: {}", capacity(7));
-        // yq mode sizes nothing (see the array arm's note).
-        let yq = to_owned_cursor::<YqSemantics, _>(&root).unwrap();
-        let OwnedValue::Array(yq_items) = &yq else {
-            panic!("expected an array, got {yq:?}");
-        };
-        match &yq_items[2] {
-            OwnedValue::Object(map) => assert!(map.capacity() < 5, "yq: {}", map.capacity()),
-            other => panic!("expected an object, got {other:?}"),
-        }
-        // The values are what they were.
-        assert_eq!(
-            owned.to_json(),
-            json,
-            "the sizing changes no member, only the room"
+        let disagreed = capacities::<JqSemantics>(&format!("[{one},{wide},{one}]"));
+        assert!(disagreed[2] < 5, "siblings that disagree: {disagreed:?}");
+        let period = capacities::<JqSemantics>(&format!(
+            "[{five},{five},{one},{five},{five},{one},{five},{five},{{}}]"
+        ));
+        assert!(
+            period[5] < 5 && period[8] == 0,
+            "after the first overshoot nothing is sized: {period:?}"
         );
+        let yq = capacities::<YqSemantics>(&format!("[{five},{five},{one}]"));
+        assert!(yq[2] < 5, "yq: {yq:?}");
     }
 
     /// #5541: every prefix of a document is a malformed one that
