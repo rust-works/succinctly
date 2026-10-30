@@ -7337,10 +7337,11 @@ In jq mode `\<` and `\>` are the literal characters `<` and `>`, as in Oniguruma
 A Python-style group (`(?P<n>a)`, `(?P=n)`, `(?P>n)`) is an error in jq (`undefined group option`), and the `regex` crate would accept the first.
 It is an error here too, with this crate's `invalid regex:` prefix where jq says `Regex failure:`, the same wording difference every refused pattern has.
 The crate's `\b{start}`, `\b{end}`, `\b{start-half}` and `\b{end-half}` are `\b` followed by the literal text in jq, and are rewritten to that.
-These rewrites read the raw pattern text, so under the `x` flag a `(?P` inside a `#` comment is refused here and ignored by jq.
+These rewrites skip comments, as jq does (#5550): `(?#...)`, and `#` to the end of the line where the extended mode is on, from the `x` flag or an inline `(?x)`, `(?x:...)` or `(?-x)` followed group by group.
+So a `(?P` or a `[` in a comment is text (`test("ab # (?P\n"; "x")` is `true` in both), while without `x` the `#` is a literal and the `(?P` is refused in both.
 A repetition operator right after an assertion (`^*`, `$+`, `\b?`, `\A{2}`, `\z*`) is an error in jq (`target of repeat operator is invalid`) and is refused here too (#5535), where the `regex` crate repeats the empty match and answered `true`.
 Only a direct repetition is refused: a non-capturing group of an assertion (`(?:^)*`), which jq also refuses, is still accepted here.
-Under the `x` flag, or a pattern with an inline flag group naming `x`, the check stands down, because the scan cannot see the mode's comments and ignored blanks; `test(\"^ *\"; \"x\")` is an error in jq and `true` here.
+Under the `x` flag, or a pattern with an inline flag group naming `x`, the check stands down, because the scan cannot see the mode's ignored blanks (it does skip its comments); `test(\"^ *\"; \"x\")` is an error in jq and `true` here.
 
 ## Possessive quantifiers are refused (#5524)
 
