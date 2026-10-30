@@ -399,21 +399,57 @@ fn unary_math_of_document_number<S: EvalSemantics, V: DocumentValue>(
         return None;
     }
     // Checked before reading the number, so a builtin this does not answer costs one match.
-    let apply: fn(f64) -> OwnedValue = match builtin {
-        Builtin::Floor => |n| crate::jq::eval::integral_f64_result::<S>(super::math::floor(n)),
-        Builtin::Ceil => |n| crate::jq::eval::integral_f64_result::<S>(super::math::ceil(n)),
-        Builtin::Round => |n| crate::jq::eval::integral_f64_result::<S>(super::math::round(n)),
-        Builtin::Trunc => |n| crate::jq::eval::integral_f64_result::<S>(super::math::trunc(n)),
-        Builtin::Sqrt => |n| OwnedValue::Float(super::math::sqrt(n)),
-        Builtin::Fabs => |n| OwnedValue::Float(super::math::fabs(n)),
-        _ => return None,
-    };
+    if !matches!(
+        builtin,
+        Builtin::Floor
+            | Builtin::Ceil
+            | Builtin::Round
+            | Builtin::Trunc
+            | Builtin::Sqrt
+            | Builtin::Fabs
+    ) {
+        return None;
+    }
     let text = value.number_text()?;
     if !crate::json::validate::is_valid_number(text.as_bytes()) {
         return None;
     }
     let n = document_number_f64_generic::<S, V>(value).filter(|n| n.is_finite())?;
-    Some(apply(n))
+    crate::jq::eval::unary_math_apply::<S>(builtin, n)
+}
+
+/// Whether `expr` starts with a shape [`crate::jq::eval::eval_owned_fast_path`] can answer: the
+/// arithmetic accumulator, a comparison, `and`/`or`/`not`, a literal, navigation, `type` and
+/// `tostring`, or a pipe that starts with one (#5601). A necessary condition only, so the fast
+/// path still decides; it keeps a stage outside the grammar from paying a failed walk per value.
+fn owned_fast_path_may_answer(expr: &Expr) -> bool {
+    match strip_parens(expr) {
+        Expr::Pipe(stages) => stages.first().is_some_and(owned_fast_path_may_answer),
+        Expr::Arithmetic { .. }
+        | Expr::Compare { .. }
+        | Expr::And(..)
+        | Expr::Or(..)
+        | Expr::Not
+        | Expr::Literal(_)
+        | Expr::TrackedVar(_)
+        | Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Builtin(Builtin::Type | Builtin::ToString) => true,
+        _ => false,
+    }
+}
+
+/// A number the filter computed (`Int` or `Float`, not a document's `NumberLiteral`) that is not a
+/// NaN, in jq mode (#5601): a value with no storage identity to keep and no spelling to preserve,
+/// which the owned fast paths can answer without the reindex bridge.
+fn is_computed_plain_number<S: EvalSemantics>(value: &OwnedValue) -> bool {
+    S::TAG == EvalTag::Jq
+        && match value {
+            OwnedValue::Int(_) => true,
+            OwnedValue::Float(f) => !f.is_nan(),
+            _ => false,
+        }
 }
 
 /// Whether `value` is a number scalar of a JSON-sourced document (#3597), whose
@@ -4841,6 +4877,14 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
         return GenericResult::Owned(tostring_owned::<S>(owned));
     }
 
+    // #5601: `floor`, `ceil`, `round`, `trunc`, `sqrt` and `fabs` of an owned number are one libm
+    // call; the round trip below would write the number out and index it to make it.
+    if let Expr::Builtin(builtin) = strip_parens(expr) {
+        if let Some(answer) = crate::jq::eval::owned_unary_math::<S>(builtin, &owned) {
+            return GenericResult::Owned(answer);
+        }
+    }
+
     // #3477: a count needs no index over the container it counts.
     if let Some(length) = crate::jq::eval::eval_owned_length(expr, &owned) {
         return GenericResult::Owned(length);
@@ -4937,7 +4981,20 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
     // node identity, and to evaluations that registered a DOM document, so
     // nothing else changes route; the fast path is the same evaluation the
     // streaming owned entries already run (`eval_each_owned`).
-    if !S::REINDEX_BRIDGE_KEEPS_IDENTITY && dom_roots::active() && !embed_table_active() {
+    //
+    // #5601: jq mode takes it too for a number the filter computed. What
+    // `REINDEX_BRIDGE_KEEPS_IDENTITY` keeps is a container's storage, and a plain `Int` or
+    // `Float` has none; a `NumberLiteral` is left out because the shapes answered here may
+    // return it in a representation the bridge would not (`eval_owned_pure`'s `Fresh` rule), and
+    // a NaN because jq tells two of them apart.
+    //
+    // The expression is checked for a shape the fast path answers first: a stage outside its
+    // grammar (`select`, `if`, a constructor, `as`) would pay a failed walk per value and then
+    // bridge anyway, 1-6% slower than not trying (measured).
+    if !embed_table_active()
+        && ((!S::REINDEX_BRIDGE_KEEPS_IDENTITY && dom_roots::active())
+            || (is_computed_plain_number::<S>(&owned) && owned_fast_path_may_answer(expr)))
+    {
         if let Some(result) = crate::jq::eval::eval_owned_fast_path::<S>(expr, &owned, optional) {
             // No `Err(_) if optional` arm, unlike the route above: the fast
             // path applies `optional` itself, so an `Err` it still returns is
@@ -41093,10 +41150,47 @@ mod tests {
                 "{token}"
             );
         }
-        // Not a number, a computed double and a non-finite literal keep the bridge.
+        // Not a number, a computed NaN and a non-finite literal keep the bridge.
         assert!(reindexes("map(try floor catch 0)", br#"["x",true]"#) > 0);
-        assert!(reindexes("map(. * 1.5 | floor)", b"[1,2]") > 0);
+        // A computed finite double is answered from the number since #5601; a NaN is not.
+        assert_eq!(reindexes("map(. * 1.5 | floor)", b"[1,2]"), 0);
+        assert!(reindexes("map(nan | floor)", b"[1,2]") > 0);
         assert!(reindexes("map(floor)", b"[1e1000]") > 0);
+    }
+
+    /// #5601: a number the filter computed meets the next stage without the reindex bridge, and
+    /// `floor` and its siblings of an owned number are answered from it. `reindex_count` counts
+    /// every serialize-and-index. A NaN, which jq tells two of apart, still bridges. The pin must be
+    /// able to fail: it does, with `is_computed_plain_number` made `false` and
+    /// `owned_unary_math` made to return `None`.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_computed_number_meets_the_next_stage_without_the_bridge_5601() {
+        use crate::jq::value::reindex_count;
+
+        let reindexes = |filter: &str| {
+            let json = b"[1.5,2.5,-0.0,16]";
+            let index = JsonIndex::build(json);
+            let expr = crate::jq::parse(filter).unwrap();
+            let before = reindex_count::get();
+            let result = eval_using::<JqSemantics, _>(&expr, index.root(json).value())
+                .collect_owned::<JqSemantics>()
+                .unwrap();
+            assert_eq!(result.len(), 1, "{filter}");
+            reindex_count::get() - before
+        };
+        for filter in [
+            "map(. + 1 | . * 2)",
+            "map(. * 2 | floor)",
+            "map(floor | . + 1)",
+            "map(. + 1 | type)",
+            "map(. + 1 | . > 2)",
+            "map(sqrt | fabs | ceil)",
+            "reduce .[] as $x (0; . + ($x | floor))",
+        ] {
+            assert_eq!(reindexes(filter), 0, "{filter} bridged");
+        }
+        assert!(reindexes("map(nan | . + 1)") > 0);
     }
 
     /// #3639: a `label` met at a position with no prefetch hook (the absent-
