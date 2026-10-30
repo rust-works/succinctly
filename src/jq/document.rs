@@ -193,8 +193,10 @@ impl JsonConvention {
 
     /// Whether the writer prints a value more than jq's print depth down as
     /// `<skipped: too deep>` (#5497): jq's two conventions do, yq's `Preserve` prints it whole.
+    /// They are the conventions [`Self::uses_jq_escape_table`] names, jq's writer's, so it is
+    /// one predicate under two names.
     pub fn skips_past_print_depth(self) -> bool {
-        matches!(self, Self::JqCompat | Self::JqPreserveInput)
+        self.uses_jq_escape_table()
     }
 
     /// Whether a raw DEL byte (`0x7f`) found in `bytes` needs escaping on

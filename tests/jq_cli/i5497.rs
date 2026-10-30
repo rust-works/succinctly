@@ -79,6 +79,43 @@ fn test_depth_refusal_counts_lines_across_files_5497() -> Result<()> {
     Ok(())
 }
 
+/// jq meets its depth limit before a fault later in the same document: a container left open,
+/// one closing bracket short, or a raw control character in the innermost string are all
+/// reported as the depth refusal, on every route, as in jq.
+#[test]
+fn test_depth_refusal_comes_before_a_later_fault_5497() -> Result<()> {
+    for input in [
+        "[".repeat(300),
+        format!("{}{}", "[".repeat(300), "]".repeat(299)),
+        nest("[", "\"a\tb\"", "]", 300),
+    ] {
+        let (out, err, exit) = run_jq_full(&["-c", "length"], Some(&input))?;
+        assert_eq!((out.as_str(), err, exit), ("", refused(1, 257), 5));
+        let (out, err, exit) = run_jq_full(&["-s", "-c", "length"], Some(&input))?;
+        assert_eq!(
+            (out.as_str(), err.as_str(), exit),
+            ("", "jq: parse error: Exceeds depth limit for parsing\n", 5)
+        );
+        let (out, err, exit) = run_jq_full(&["-n", "-c", "[inputs]"], Some(&input))?;
+        assert_eq!((out.as_str(), exit), ("", 5));
+        assert_eq!(
+            err,
+            "jq: error (at <stdin>:0): Exceeds depth limit for parsing at line 1, column 257\n"
+        );
+    }
+    Ok(())
+}
+
+/// A program that uses `input` reads its own top-level documents through the same queue, and a
+/// refused one is still jq's parse error there, not an error raised by the program.
+#[test]
+fn test_top_level_read_under_input_builtins_is_a_parse_error_5497() -> Result<()> {
+    let input = format!("1\n2\n{}\n", nest("[", "", "]", 300));
+    let (out, err, exit) = run_jq_full(&["-c", "[., input_line_number]"], Some(&input))?;
+    assert_eq!((out.as_str(), err, exit), ("[1,1]\n[2,2]\n", refused(3, 257), 5));
+    Ok(())
+}
+
 /// `input` raises jq's own message, position included, so a program that catches it sees what
 /// jq's would.
 #[test]

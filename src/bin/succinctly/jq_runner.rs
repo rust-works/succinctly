@@ -5089,6 +5089,10 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 Ok(mut slurped) => (vec![std::mem::take(&mut slurped.combined)], Some(slurped)),
                 // `--validate` already printed its own report.
                 Err(SlurpFailure::Validation(exit_code)) => return Ok(exit_code),
+                Err(SlurpFailure::DepthLimit) => {
+                    sink.report_parse_error("Exceeds depth limit for parsing");
+                    return Ok(DiagStyle::Jq.error_exit_code());
+                }
                 // Line 0 of the first file, where `get_inputs` has always
                 // named a `--slurp` stream it could not finish splitting: the
                 // one combined value has no document position of its own.
@@ -5484,6 +5488,13 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 break;
             }
             if let Some(offset) = split_error {
+                // #5497: jq meets its depth limit first when the refused bracket comes before
+                // the fault the splitter stopped at.
+                let (line, column) = jq_stream_position(&raw_inputs, idx, offset);
+                if let Some(message) = jq::jq_depth_fault(&raw[offset..], line, column) {
+                    sink.report_parse_error(&message);
+                    break;
+                }
                 let at =
                     InputLocation::at(filename.as_deref(), parse_error_line(raw, offset, seam));
                 sink.report(DiagStyle::Jq, &EvalError::new("Invalid JSON text"), &at);
@@ -5703,6 +5714,14 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                                 "{}",
                                 crate::jq_seq_reader::ignored_parse_error(&error.message)
                             );
+                            break;
+                        }
+                        // jq's `main` prints its parser's depth refusal of the next input as a
+                        // parse error, with no input location (#5497).
+                        jq::InputPop::ParseError(error)
+                            if jq::is_jq_depth_fault(&error.message) =>
+                        {
+                            sink.report_parse_error(&error.message);
                             break;
                         }
                         jq::InputPop::ParseError(error) => {
@@ -6566,13 +6585,17 @@ fn get_inputs(
         debug_assert_eq!(locations.len(), values.len(), "one location per value");
     } else {
         // Where the next file starts in jq's input, which reads every file as one stream; only
-        // the depth limit's message reads it (#5497).
+        // the depth limit's message reads it (#5497). The files are consumed as they are read,
+        // so this is the one count made ahead of a refusal: a newline count of each file but
+        // the last, on a route that already decodes every byte of each, and none at all where
+        // no message can read it (`--stream`, DSV).
         let last = raw_inputs.len().saturating_sub(1);
+        let counts_files = !args.stream && args.input_dsv.is_none();
         let mut next_file = StreamOrigin::ALONE.file;
         for (pos, (file_idx, raw)) in raw_inputs.into_iter().enumerate() {
             let src = file_idx.unwrap_or(0);
             let file_start = next_file;
-            if pos < last {
+            if counts_files && pos < last {
                 next_file = advance_position(next_file, raw.as_bytes());
             }
             // `--stream` reads with jq's streaming parser, which has no depth limit.
@@ -7770,7 +7793,8 @@ fn advance_position((line, column): (usize, usize), bytes: &[u8]) -> (usize, usi
 
 /// Where a text handed to one of the stream parsers starts in jq's input, for the position
 /// jq's depth-limit message names (#5497): `file` is where its file starts, and `before` the
-/// part of that file ahead of the text. Resolved only for a refused document.
+/// part of that file ahead of the text. The position within the file is resolved only for a
+/// refused document.
 #[derive(Clone, Copy)]
 struct StreamOrigin<'a> {
     file: (usize, usize),
@@ -8439,6 +8463,10 @@ enum SlurpFailure {
     /// A file's splitter gave up (a truncated container, a byte that starts
     /// no token): the stream cannot be slurped.
     Unsplittable,
+    /// jq's parse-depth limit refuses the document the splitter gave up on, before the fault it
+    /// stopped at (#5497). Reported as jq's parse error, without the position, as every depth
+    /// refusal under `--slurp` is.
+    DepthLimit,
 }
 
 /// What [`slurp_documents`] hands the lazy per-document loop (#2847).
@@ -8488,7 +8516,11 @@ fn slurp_documents(
             validate_json_input(&raw, filename.as_deref()).map_err(SlurpFailure::Validation)?;
         }
         let (spans, split_error) = split_json_values(&raw);
-        if split_error.is_some() {
+        if let Some(offset) = split_error {
+            // #5497: jq meets its depth limit first when the refused bracket comes first.
+            if jq::jq_depth_fault_offset(&raw[offset..]).is_some() {
+                return Err(SlurpFailure::DepthLimit);
+            }
             return Err(SlurpFailure::Unsplittable);
         }
         for (start, end) in spans {
@@ -8692,7 +8724,15 @@ fn parse_json_stream_prefix(
             Err(error) => return (values, Some(error)),
         }
     }
-    let error = split_error.map(|_| EvalError::new("Invalid JSON text"));
+    // #5497: jq meets its depth limit first when the refused bracket comes before the fault
+    // the splitter stopped at.
+    let error = split_error.map(|offset| {
+        let depth = origin.and_then(|origin| {
+            let (line, column) = origin.position(text, lead + offset);
+            jq::jq_depth_fault(&bytes[offset..], line, column)
+        });
+        EvalError::new(depth.unwrap_or_else(|| String::from("Invalid JSON text")))
+    });
     (values, error)
 }
 
@@ -11486,7 +11526,7 @@ where
     // formatter that marks a NaN writes text that is about to be colored, which takes the
     // marker's colored placeholder.
     if level > succinctly::jq::JQ_MAX_PRINT_DEPTH {
-        let marker = skipped_kind_of(value).marker(formatter.marks_nan());
+        let marker = output::SkippedKind::of_jq_value(value).marker(formatter.marks_nan());
         return Ok(out.write_all(marker.as_bytes())?);
     }
     // `|| indent_string.is_empty()`: `--indent 0` sets an empty indent with
@@ -12305,34 +12345,6 @@ where
         }
     }
     Ok(())
-}
-
-/// The kind of `value` [`print_json`] colors its depth marker with (#5497).
-fn skipped_kind_of<Wrd: Clone + AsRef<[u64]>>(value: &JqValue<'_, Wrd>) -> output::SkippedKind {
-    use output::SkippedKind;
-    use succinctly::json::light::StandardJson;
-    match value {
-        JqValue::Null => SkippedKind::Null,
-        JqValue::Bool(false) => SkippedKind::False,
-        JqValue::Bool(true) => SkippedKind::True,
-        JqValue::Int(_) | JqValue::Float(_) | JqValue::RawNumber(_) | JqValue::NumberLiteral(_) => {
-            SkippedKind::Number
-        }
-        JqValue::String(_) => SkippedKind::String,
-        JqValue::Array(_) | JqValue::LazyKeysArray { .. } | JqValue::LazyIndexRange(_) => {
-            SkippedKind::Array
-        }
-        JqValue::Object(_) => SkippedKind::Object,
-        JqValue::Cursor(c) => match c.value() {
-            StandardJson::Bool(false) => SkippedKind::False,
-            StandardJson::Bool(true) => SkippedKind::True,
-            StandardJson::Number(_) => SkippedKind::Number,
-            StandardJson::String(_) => SkippedKind::String,
-            StandardJson::Array(_) => SkippedKind::Array,
-            StandardJson::Object(_) => SkippedKind::Object,
-            _ => SkippedKind::Null,
-        },
-    }
 }
 
 /// Format a value as JSON.

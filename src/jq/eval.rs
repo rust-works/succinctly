@@ -95738,10 +95738,19 @@ fn builtin_isfinite<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// `owned_value_to_json` now leaves stderr untouched rather than a
 /// truncated `["DEBUG:",` fragment with no closing bracket.
 fn write_debug_line<S: EvalSemantics>(value: &OwnedValue) {
-    // The line is one value to jq, so `value` is a level down in it and meets jq's print depth a
-    // level sooner (#5497).
-    let line = OwnedValue::Array(vec![OwnedValue::String("DEBUG:".into()), value.clone()].into());
-    write_stderr(&format!("{}\n", owned_value_to_json::<S>(&line)));
+    // jq writes the line as one value, so `value` is a level down in it and meets jq's print
+    // depth a level sooner (#5497). yq's writer has no print depth, and the wrapper would only
+    // bring its value-tree ceiling a level closer.
+    if S::TAG == EvalTag::Jq {
+        let line =
+            OwnedValue::Array(vec![OwnedValue::String("DEBUG:".into()), value.clone()].into());
+        write_stderr(&format!("{}\n", owned_value_to_json::<S>(&line)));
+    } else {
+        write_stderr(&format!(
+            "[\"DEBUG:\",{}]\n",
+            owned_value_to_json::<S>(value)
+        ));
+    }
 }
 
 /// Builtin: debug - print `["DEBUG:", .]` to stderr, pass `.` through

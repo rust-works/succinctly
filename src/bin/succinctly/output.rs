@@ -15,7 +15,7 @@ use succinctly::jq::escape::{
 };
 use succinctly::jq::{
     assert_value_tree_depth, format_number_jq_compat, jq_bare_float_display,
-    nonfinite_display_string, EvalError, JqSemantics, NumberRepr, OwnedValue, StreamError,
+    nonfinite_display_string, EvalError, JqSemantics, JqValue, NumberRepr, OwnedValue, StreamError,
     JQ_MAX_PRINT_DEPTH, SKIPPED_TOO_DEEP,
 };
 pub use succinctly::yaml::format_float_yq;
@@ -610,6 +610,35 @@ impl SkippedKind {
             OwnedValue::String(_) => Self::String,
             OwnedValue::Array(_) => Self::Array,
             OwnedValue::Object(_) => Self::Object,
+        }
+    }
+
+    /// [`Self::of`] for a value of the CLI's lazy writer, a cursor read for its kind.
+    pub(crate) fn of_jq_value<W: Clone + AsRef<[u64]>>(value: &JqValue<'_, W>) -> Self {
+        use succinctly::json::light::StandardJson;
+        match value {
+            JqValue::Null => Self::Null,
+            JqValue::Bool(false) => Self::False,
+            JqValue::Bool(true) => Self::True,
+            JqValue::Int(_)
+            | JqValue::Float(_)
+            | JqValue::RawNumber(_)
+            | JqValue::NumberLiteral(_) => Self::Number,
+            JqValue::String(_) => Self::String,
+            JqValue::Array(_) | JqValue::LazyKeysArray { .. } | JqValue::LazyIndexRange(_) => {
+                Self::Array
+            }
+            JqValue::Object(_) => Self::Object,
+            JqValue::Cursor(c) => match c.value() {
+                StandardJson::Bool(false) => Self::False,
+                StandardJson::Bool(true) => Self::True,
+                StandardJson::Number(_) => Self::Number,
+                StandardJson::String(_) => Self::String,
+                StandardJson::Array(_) => Self::Array,
+                StandardJson::Object(_) => Self::Object,
+                // A cursor the writer cannot read is written as an error before this is reached.
+                StandardJson::Null | StandardJson::Error(_) => Self::Null,
+            },
         }
     }
 
