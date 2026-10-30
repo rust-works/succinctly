@@ -9,6 +9,7 @@ use super::exec::exec;
 use super::harness::Tool;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 #[derive(Debug, Deserialize)]
@@ -87,7 +88,14 @@ pub struct InputSummary {
     pub rows: Vec<CaseRow>,
 }
 
-pub fn run(text: &str, reference: &Tool, subject: &Tool, cwd: &Path) -> Result<InputSummary> {
+/// `only`: run just these case ids.
+pub fn run(
+    text: &str,
+    reference: &Tool,
+    subject: &Tool,
+    only: Option<&BTreeSet<String>>,
+    cwd: &Path,
+) -> Result<InputSummary> {
     let mut rows = vec![];
     let validate = Tool {
         name: "succinctly jq --validate".into(),
@@ -101,6 +109,9 @@ pub fn run(text: &str, reference: &Tool, subject: &Tool, cwd: &Path) -> Result<I
     };
     let args = vec!["-c".to_string(), ".".to_string()];
     for c in parse(text)? {
+        if only.is_some_and(|s| !s.contains(&c.id)) {
+            continue;
+        }
         let r = exec(reference, &args, &c.bytes, cwd)?;
         let d = exec(subject, &args, &c.bytes, cwd)?;
         let v = exec(&validate, &args, &c.bytes, cwd)?;
@@ -169,10 +180,30 @@ mod tests {
     #[test]
     fn accept_and_reject_are_told_apart() {
         let text = r#"[{"bytes_b64":"MQ==","expect":"y","id":"y_one"},{"bytes_b64":"ew==","expect":"n","id":"n_brace"}]"#;
-        let s = run(text, &sh("cat; exit 0"), &sh("cat; exit 1"), Path::new(".")).unwrap();
+        let s = run(
+            text,
+            &sh("cat; exit 0"),
+            &sh("cat; exit 1"),
+            None,
+            Path::new("."),
+        )
+        .unwrap();
         assert_eq!(
             (s.y.reference, s.y.default, s.n.reference, s.n.default),
             (1, 0, 1, 0)
+        );
+        let only: BTreeSet<String> = ["n_brace".to_string()].into();
+        let s = run(
+            text,
+            &sh("cat; exit 0"),
+            &sh("cat; exit 1"),
+            Some(&only),
+            Path::new("."),
+        )
+        .unwrap();
+        assert_eq!(
+            s.rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["n_brace"]
         );
     }
 }

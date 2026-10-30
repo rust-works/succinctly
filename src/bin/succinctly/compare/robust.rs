@@ -11,6 +11,7 @@ use super::exec::{exec_within, Exec};
 use super::harness::Tool;
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -143,9 +144,19 @@ fn timed(tool: &Tool, p: &Probe, cwd: &Path) -> Result<(Exec, f64)> {
     Ok((e, start.elapsed().as_secs_f64() * 1e3))
 }
 
-pub fn run(reference: &Tool, subject: &Tool, probes: &[Probe], cwd: &Path) -> Result<Vec<Row>> {
+/// `only`: run just these probe ids.
+pub fn run(
+    reference: &Tool,
+    subject: &Tool,
+    probes: &[Probe],
+    only: Option<&BTreeSet<String>>,
+    cwd: &Path,
+) -> Result<Vec<Row>> {
     let mut rows = vec![];
     for p in probes {
+        if only.is_some_and(|s| !s.contains(&p.id)) {
+            continue;
+        }
         let (r, rms) = timed(reference, p, cwd)?;
         let (s, sms) = timed(subject, p, cwd)?;
         rows.push(Row {
@@ -225,20 +236,31 @@ mod tests {
         let probes = parse_probes("p\tx\t[]\t-\t-\n").unwrap();
         let ok = sh("echo 1");
         let crash = sh("kill -SEGV $$");
-        let rows = run(&ok, &crash, &probes, Path::new(".")).unwrap();
+        let rows = run(&ok, &crash, &probes, None, Path::new(".")).unwrap();
         assert!(!rows[0].matches);
         assert_eq!(
             (rows[0].reference, rows[0].subject),
             (Class::Ok, Class::Crash)
         );
-        assert!(run(&ok, &ok, &probes, Path::new(".")).unwrap()[0].matches);
+        assert!(run(&ok, &ok, &probes, None, Path::new(".")).unwrap()[0].matches);
+    }
+
+    #[test]
+    fn only_runs_the_listed_probe_ids() {
+        let probes = parse_probes("p\tx\t[]\t-\t-\n").unwrap();
+        let ok = sh("echo 1");
+        let none: BTreeSet<String> = ["other".to_string()].into();
+        let one: BTreeSet<String> = ["p".to_string()].into();
+        let cwd = Path::new(".");
+        assert!(run(&ok, &ok, &probes, Some(&none), cwd).unwrap().is_empty());
+        assert_eq!(run(&ok, &ok, &probes, Some(&one), cwd).unwrap().len(), 1);
     }
 
     #[test]
     fn head_wrap_turns_a_pipe_close_into_the_shell_status() {
         let probes = parse_probes("p\tpipe\t[]\t-\thead\n").unwrap();
         let writer = sh("yes");
-        let rows = run(&writer, &writer, &probes, Path::new(".")).unwrap();
+        let rows = run(&writer, &writer, &probes, None, Path::new(".")).unwrap();
         assert!(rows[0].matches);
         assert_eq!(rows[0].subject_exit, Some(141));
     }

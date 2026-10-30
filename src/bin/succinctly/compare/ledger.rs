@@ -80,6 +80,48 @@ pub fn load(path: &Path) -> Result<Vec<Entry>> {
     parse(&std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?)
 }
 
+/// An entry observed on another OS is neither expected nor called stale here.
+fn applies_here(e: &Entry) -> bool {
+    e.platform
+        .as_deref()
+        .map_or(true, |p| p == std::env::consts::OS)
+}
+
+fn suite_of(id: &str) -> &str {
+    id.split_once(':').map_or(id, |(suite, _)| suite)
+}
+
+/// `--ledger-only` (#5585): the probe ids of `suite` that the ledger lists for this host,
+/// without the `suite:` prefix. The harness runs only these probes.
+pub fn ids_in(entries: &[Entry], suite: &str) -> BTreeSet<String> {
+    entries
+        .iter()
+        .filter(|e| applies_here(e))
+        .filter_map(|e| e.id.strip_prefix(suite)?.strip_prefix(':'))
+        .map(String::from)
+        .collect()
+}
+
+/// The entries a run of `run_suites` cannot check on this host, each with the reason: a
+/// `--ledger-only` run says so rather than reading them as clean.
+pub fn unchecked<'a, S: AsRef<str>>(
+    entries: &'a [Entry],
+    run_suites: &[S],
+) -> Vec<(&'a str, &'static str)> {
+    entries
+        .iter()
+        .filter_map(|e| {
+            if !applies_here(e) {
+                Some((e.id.as_str(), "listed for another OS"))
+            } else if !run_suites.iter().any(|s| s.as_ref() == suite_of(&e.id)) {
+                Some((e.id.as_str(), "its suite was not run"))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Compare the listed ids with the observed ones, restricted to `suites`
 /// (a partial run must not call another suite's entries stale).
 pub fn check<S: AsRef<str>>(
@@ -94,11 +136,7 @@ pub fn check<S: AsRef<str>>(
     };
     let listed: BTreeSet<&str> = entries
         .iter()
-        .filter(|e| {
-            e.platform
-                .as_deref()
-                .map_or(true, |p| p == std::env::consts::OS)
-        })
+        .filter(|e| applies_here(e))
         .map(|e| e.id.as_str())
         .filter(|id| in_run(id))
         .collect();
@@ -184,6 +222,43 @@ mod tests {
         assert!(parse(one).is_ok());
         assert!(parse(&format!("{one}{one}")).is_err());
         assert!(parse(&one.replace("to-triage", "whatever")).is_err());
+    }
+
+    #[test]
+    fn ids_in_lists_this_hosts_probes_of_one_suite_without_the_prefix() {
+        let mut other = entry("cli:elsewhere");
+        other.platform = Some("not-this-os".into());
+        let e = [
+            entry("cli:a"),
+            entry("cli:b:with-colon"),
+            entry("robust:c"),
+            other,
+        ];
+        assert_eq!(ids_in(&e, "cli"), set(&["a", "b:with-colon"]));
+        assert_eq!(ids_in(&e, "robust"), set(&["c"]));
+        assert!(ids_in(&e, "features").is_empty());
+        // `cli` must not match a suite that merely starts with it.
+        assert!(ids_in(&[entry("cli-extra:x")], "cli").is_empty());
+    }
+
+    #[test]
+    fn unchecked_names_other_os_entries_and_suites_that_did_not_run() {
+        let mut other = entry("cli:elsewhere");
+        other.platform = Some("not-this-os".into());
+        let e = [
+            entry("cli:a"),
+            other,
+            entry("since-secondary:add/1"),
+            entry("perf:q@1mb"),
+        ];
+        assert_eq!(
+            unchecked(&e, &["cli"]),
+            [
+                ("cli:elsewhere", "listed for another OS"),
+                ("since-secondary:add/1", "its suite was not run"),
+                ("perf:q@1mb", "its suite was not run"),
+            ]
+        );
     }
 
     #[test]

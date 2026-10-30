@@ -8,6 +8,13 @@ cargo build --release --features cli,simd,regex,serde,bench-runner
 ./target/release/succinctly dev compare jq --quick    # or --full; --build-jq builds the reference if missing
 ```
 
+`--ledger-only` runs just the probes `divergences.toml` lists for this OS and exits 1 on an entry that no longer
+diverges: the stale half of the `Ledger drift` CI job in about a minute, without the 1.8.1 build (#5585). With no pinned
+1.7.1 build it uses `/usr/bin/jq` when that reports `jq-1.7.1` or `jq-1.7.1-<vendor>` (macOS: `jq-1.7.1-apple`) and says
+so, because a vendor build can disagree with the pinned one on libm-dependent entries. It skips `since-secondary` entries,
+entries for another OS and the perf and operational dimensions, names each skip, and cannot find an unlisted divergence:
+that half stays in CI.
+
 Writes `env.json`, `results.json` (schema-versioned) and `report.md` to `data/compare/<run_id>/`.
 A dirty tree, battery power, a non-release build or a feature set that differs from `manifest.toml`
 marks the run **INVALID** in the report. A query whose output or exit status differs from jq's is

@@ -38,6 +38,16 @@ use std::process::Command;
 
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Where `--ledger-only` looks for a reference jq when the pinned build is absent.
+const SYSTEM_JQ: &str = "/usr/bin/jq";
+
+/// Whether a reference reporting `reported` stands in for the pinned `jq-<pinned>`. Only
+/// `--ledger-only` (`loose`) accepts a vendor build of it: macOS ships `jq-1.7.1-apple`.
+fn reference_version_ok(reported: &str, pinned: &str, loose: bool) -> bool {
+    let want = format!("jq-{pinned}");
+    reported == want || (loose && reported.starts_with(&format!("{want}-")))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Dimension {
     Smoke,
@@ -105,6 +115,17 @@ pub struct CompareJqArgs {
     /// Build the pinned reference jqs with scripts/compare-jq-build.sh if missing
     #[arg(long)]
     build_jq: bool,
+
+    /// Run only the probes `divergences.toml` lists for this OS, and report entries that no
+    /// longer diverge (the stale half of the `Ledger drift` CI job, #5585). Needs no jq 1.8.1
+    /// build and falls back to `/usr/bin/jq` when the pinned 1.7.1 is not built; skips
+    /// `since-secondary` entries, entries for another OS and the perf/operational dimensions.
+    /// An unlisted divergence is not found this way: that half stays in CI
+    #[arg(
+        long,
+        conflicts_with_all = ["full", "verify", "write_docs", "write_summary", "control", "query"]
+    )]
+    ledger_only: bool,
 
     /// Compare against this jq binary instead of the manifest's build
     /// (its --version must still equal the primary reference)
@@ -227,10 +248,18 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
     let (manifest, manifest_sha256) = Manifest::load(&root)?;
     let primary = manifest.primary().clone();
 
-    let jq = args
+    let mut jq = args
         .jq
         .clone()
         .unwrap_or_else(|| Manifest::jq_path(&root, &primary));
+    let pinned_jq = jq.clone();
+    if args.ledger_only
+        && args.jq.is_none()
+        && !jq.exists()
+        && std::path::Path::new(SYSTEM_JQ).exists()
+    {
+        jq = PathBuf::from(SYSTEM_JQ);
+    }
     if !jq.exists() && args.jq.is_none() {
         if !args.build_jq {
             bail!(
@@ -245,11 +274,19 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         .output()
         .with_context(|| format!("running {}", jq.display()))?;
     let version = String::from_utf8_lossy(&version.stdout).trim().to_string();
-    if version != format!("jq-{}", primary.version) {
+    if !reference_version_ok(&version, &primary.version, args.ledger_only) {
         bail!(
             "{} reports `{version}`, the manifest pins jq-{}",
             jq.display(),
             primary.version
+        );
+    }
+    if args.ledger_only && jq != pinned_jq {
+        eprintln!(
+            "ledger-only: reference is {version} at {}, not the pinned build ({}); an entry that \
+             depends on the libm or on a 1.7.1 patch level can disagree with CI",
+            jq.display(),
+            pinned_jq.display()
         );
     }
 
@@ -308,6 +345,16 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
 
     let verifying = args.verify.is_some() && args.dimension.is_empty();
     let want = |d: Dimension| {
+        if args.ledger_only {
+            return matches!(
+                d,
+                Dimension::Features
+                    | Dimension::Cli
+                    | Dimension::Differential
+                    | Dimension::Input
+                    | Dimension::Robustness
+            ) && (args.dimension.is_empty() || args.dimension.contains(&d));
+        }
         if verifying {
             return !matches!(
                 d,
@@ -328,7 +375,9 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
             status: "implemented",
         });
     }
-    let secondary = if want(Dimension::Features)
+    let secondary = if args.ledger_only {
+        Err("--ledger-only checks against the primary reference alone".into())
+    } else if want(Dimension::Features)
         || want(Dimension::Performance)
         || want(Dimension::Operational)
     {
@@ -339,12 +388,20 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
     let fixtures = root.join(&manifest.probes.fixtures);
     let ledger_path = root.join(&manifest.probes.divergences);
     let known = ledger::load(&ledger_path)?;
+    // `--ledger-only` runs just the probes the ledger lists for this host.
+    let only = |suite: &str| args.ledger_only.then(|| ledger::ids_in(&known, suite));
     let mut observed = BTreeSet::new();
     let mut run_suites: Vec<String> = vec![];
     let (mut feats, mut since, mut secondary_note) = (None, None, None);
     if want(Dimension::Features) {
         run_suites.push("features".into());
-        let sum = features::run(&reference, &primary.id, &subject, None, &fixtures)?;
+        let sum = features::run(
+            &reference,
+            &primary.id,
+            &subject,
+            only("features").as_ref(),
+            &fixtures,
+        )?;
         for r in &sum.rows {
             if matches!(
                 r.status,
@@ -392,6 +449,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
             &subject,
             &cli::parse_probes(&read(&manifest.probes.cli)?)?,
             false,
+            only("cli").as_ref(),
             &fixtures,
         )?;
         ext_rows = cli::run(
@@ -399,6 +457,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
             &subject,
             &cli::parse_probes(&read(&manifest.probes.extensions)?)?,
             true,
+            only("extensions").as_ref(),
             &fixtures,
         )?;
         for r in &cli_rows {
@@ -435,7 +494,14 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         for suite in &manifest.suites {
             run_suites.push(suite.id.clone());
             let text = Manifest::read_pinned(&root, suite)?;
-            let sum = suites::run(&suite.id, &text, &reference, &subject, &fixtures)?;
+            let sum = suites::run(
+                &suite.id,
+                &text,
+                &reference,
+                &subject,
+                only(&suite.id).as_ref(),
+                &fixtures,
+            )?;
             for row in sum.differing() {
                 observed.insert(row.id.clone());
             }
@@ -451,7 +517,12 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         run_suites.push("json-validate".into());
         run_suites.push("json-output".into());
         let text = Manifest::read_pinned(&root, &manifest.json_suite)?;
-        let sum = jsonconf::run(&text, &reference, &subject, &fixtures)?;
+        let listed = args.ledger_only.then(|| {
+            let mut ids = ledger::ids_in(&known, "json-validate");
+            ids.extend(ledger::ids_in(&known, "json-output"));
+            ids
+        });
+        let sum = jsonconf::run(&text, &reference, &subject, listed.as_ref(), &fixtures)?;
         for r in &sum.rows {
             if (r.expect == 'y' && !r.validate_accepts) || (r.expect == 'n' && r.validate_accepts) {
                 observed.insert(format!("json-validate:{}", r.id));
@@ -475,6 +546,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
             &reference,
             &subject,
             &robust::parse_probes(&text)?,
+            only("robust").as_ref(),
             &fixtures,
         )?;
         // A crash or hang of succinctly is listed even when jq does the same.
@@ -563,6 +635,17 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         });
     }
     let ledger_outcome = ledger::check(&known, &observed, &run_suites);
+    if args.ledger_only {
+        let skipped = ledger::unchecked(&known, &run_suites);
+        println!(
+            "ledger-only: checked {} of {} ledger entries against {version}",
+            known.len() - skipped.len(),
+            known.len()
+        );
+        for (id, why) in skipped {
+            println!("  not checked {id}: {why}");
+        }
+    }
 
     let run_id = {
         let t = chrono::Utc::now().format("%Y%m%d_%H%M%S");
@@ -785,4 +868,21 @@ fn write_docs(root: &std::path::Path, results: &Results, args: &CompareJqArgs) -
     std::fs::write(dir.join("jq.md"), docs::index(&rows))?;
     println!("wrote docs/compare/jq-{p}.md, jq-{p}.json and jq.md");
     Ok(())
+}
+
+#[cfg(test)]
+mod ledger_only_tests {
+    use super::reference_version_ok;
+
+    #[test]
+    fn a_vendor_build_of_the_pinned_version_stands_in_only_for_ledger_only() {
+        assert!(reference_version_ok("jq-1.7.1", "1.7.1", false));
+        assert!(reference_version_ok("jq-1.7.1", "1.7.1", true));
+        assert!(reference_version_ok("jq-1.7.1-apple", "1.7.1", true));
+        assert!(!reference_version_ok("jq-1.7.1-apple", "1.7.1", false));
+        // A different version, or a longer number, is never the pinned one.
+        assert!(!reference_version_ok("jq-1.8.1", "1.7.1", true));
+        assert!(!reference_version_ok("jq-1.7.10", "1.7.1", true));
+        assert!(!reference_version_ok("jq-1.7", "1.7.1", true));
+    }
 }
