@@ -76201,16 +76201,22 @@ fn substitute_var_with(
         // below keeps both answers. `splice` is the caller's word that nothing reads the
         // variable in path position, where a literal object and a spliced field raise
         // different errors; a marked substitution hands the object on whole (#3177).
+        // With `splice` a marker is a fold's identity-sharing one (#5516, the only caller
+        // passing both), and a scalar field is still spliced: a scalar carries no identity,
+        // and a container field stays a node of the marked object.
         Expr::Pipe(stages)
             if splice
-                && mark.is_none()
                 && stages.len() == 2
                 && matches!(&stages[0], Expr::Var(name) if name == var_name) =>
         {
             if let (Expr::Field(field), OwnedValue::Object(object)) = (&stages[1], replacement) {
                 if !object.has_shadows() {
                     if let Some(value) = object.get(field.as_str()) {
-                        return owned_to_expr(value);
+                        if mark.is_none()
+                            || !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_))
+                        {
+                            return owned_to_expr(value);
+                        }
                     }
                 }
             }
@@ -76728,7 +76734,7 @@ fn try_reduce_step_alternatives<S: EvalSemantics>(
     input_val: &OwnedValue,
     acc_input: OwnedValue,
     optional: bool,
-    mark_loop_vars: bool,
+    mark_loop_vars: LoopVarSplice,
     budget: &mut FoldBudget<'_>,
 ) -> (OwnedValue, Option<Control>) {
     let last_idx = patterns.len() - 1;
@@ -80012,7 +80018,7 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
     input_val: &OwnedValue,
     state_input: OwnedValue,
     optional: bool,
-    mark_loop_vars: bool,
+    mark_loop_vars: LoopVarSplice,
     budget: &mut FoldBudget<'_>,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> (OwnedValue, Flow) {
@@ -80570,7 +80576,7 @@ pub(crate) fn substitute_fold_step(
     expr: &Expr,
     bindings: &[(String, OwnedValue)],
     all_var_names: &[String],
-    marked: bool,
+    marked: LoopVarSplice,
     splice: bool,
 ) -> Expr {
     let null_value = OwnedValue::Null;
@@ -80580,7 +80586,7 @@ pub(crate) fn substitute_fold_step(
             .filter(|name| !bindings.iter().any(|(n, _)| n == *name))
             .map(|name| (name.as_str(), &null_value)),
     );
-    if !marked {
+    if marked == LoopVarSplice::Literal {
         if !splice {
             return substitute_vars(expr, vars);
         }
@@ -80598,19 +80604,49 @@ pub(crate) fn substitute_fold_step(
     // can recognize it by storage identity (#3177). Everything else -- a scalar,
     // and the `null` fill for a name only another `?//` alternative binds -- is
     // substituted as before.
+    let fields_alone = splice && marked == LoopVarSplice::Shared;
     let mut result: Option<Expr> = None;
     for (name, value) in vars {
         let current = result.as_ref().unwrap_or(expr);
         result = Some(
             if matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
                 let marker = LazyMarker::new(value, Origin::Untracked, None);
-                substitute_var_impl(current, name, value, Some(&marker))
+                substitute_var_with(current, name, value, Some(&marker), fields_alone)
             } else {
                 substitute_var(current, name, value)
             },
         );
     }
     result.unwrap_or_else(|| expr.clone())
+}
+
+/// How a fold step splices a container loop variable into UPDATE or EXTRACT.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LoopVarSplice {
+    /// A literal rebuilt from the value, or only the field a `$var.field` reads (#5499).
+    Literal,
+    /// A marker holding the element's storage, handed on whole so the resolver can
+    /// recognise it in path position (#3329, [`fold_loop_variable_is_marked`]).
+    Path,
+    /// A marker for jq's identity short-circuit alone (#3896, #5516,
+    /// [`fold_loop_variable_shares_identity`]): `$var.field` still splices a scalar field
+    /// alone, which carries no identity, so `reduce .[] as $r (0; $r.score)` keeps #5499's
+    /// literal step.
+    Shared,
+}
+
+impl LoopVarSplice {
+    /// The splice for one fork: the path marker where the fold reads a loop variable
+    /// as a path step on this fork, else the identity marker where it shares, else literals.
+    pub(crate) fn of(path: bool, shares: bool) -> Self {
+        if path {
+            Self::Path
+        } else if shares {
+            Self::Shared
+        } else {
+            Self::Literal
+        }
+    }
 }
 
 /// Whether a fold's container loop variables are substituted as markers, and
@@ -80640,12 +80676,15 @@ pub(crate) fn fold_loop_variable_is_marked<S: EvalSemantics>(
 
 /// Whether a fold's container loop variables are substituted as storage-sharing
 /// markers so that jq's `jv_equal` identity check can see them (#3896): jq mode,
-/// and a fold whose UPDATE or EXTRACT both reads a loop variable and can compare
-/// it by value ([`loop_var_can_be_compared`]).
+/// and a fold whose UPDATE or EXTRACT reads a loop variable where it can be
+/// compared by value ([`loop_var_can_be_compared`]) or handed out of the step
+/// ([`loop_var_can_reach_output`], #5516).
 ///
 /// jq binds `$a` to one `jv` and reads it twice, so `reduce ([nan]) as $a (0;
 /// $a == $a)` is `true`; a rebuilt literal per `$a` is two allocations, and a
-/// NaN-bearing container is then unequal to itself. Independent of
+/// NaN-bearing container is then unequal to itself. The same holds for a step
+/// whose output is the variable and a comparison after the fold: `last($a) ==
+/// $a` is `reduce $a as $x (null; $x) == $a` (#5377). Independent of
 /// [`fold_loop_variable_is_marked`]: it needs no path read, no anchor scope, and
 /// holds on every INIT fork (a constant source is shared on each), and it never
 /// registers INIT's `Rc` -- the marker's storage is the element's own, which
@@ -80659,9 +80698,119 @@ pub(crate) fn fold_loop_variable_shares_identity<S: EvalSemantics>(
         return false;
     }
     let names = pattern_alternatives_var_names(patterns);
-    !names.is_empty()
-        && (loop_var_can_be_compared(update, &names)
-            || extract.is_some_and(|extract| loop_var_can_be_compared(extract, &names)))
+    // Asked on every fold evaluation, so one that never reads a loop variable (`. + 1`) is
+    // answered by a single walk.
+    let shares = |expr: &Expr| {
+        mentions_any_name(expr, &names)
+            && (loop_var_can_be_compared(expr, &names) || loop_var_can_reach_output(expr, &names))
+    };
+    !names.is_empty() && (shares(update) || extract.is_some_and(shares))
+}
+
+/// Whether `expr` reads one of `names` where the read can become the step's
+/// output, or part of it (#5516): `$a`, `$a | .`, `$a[0]`, `[$a]`, `$a // 0`, an
+/// `if` branch. jq hands the element itself on, so `[nan] as $a | reduce $a as $x
+/// (null; $x) == $a` is `true`, and a rebuilt literal is a new container.
+///
+/// The positions read by value are left out, each for the reason
+/// [`loop_var_can_be_compared`] leaves an assignment out: an assignment and
+/// arithmetic, whose closed right-hand side is `owned_assign_step`'s and
+/// `owned_arith_accumulator_shape`'s in-place step, which a container marker
+/// makes decline (`. + [$a]`, `.x = $a` therefore still rebuild); an `if`'s
+/// condition, where one makes `owned_if_step` decline; and a comparison, `and`
+/// and `or`, whose answer is a boolean. (These are recorded as still different
+/// in `docs/compliance/jq/limitations.md`.)
+///
+/// A binder's source reaches the output only through the names it binds: `$r as
+/// $s | .[$s.name] = $s.score` and `reduce $r.tags[] as $t (.; .[$t] += 1)` hand
+/// nothing on, so the names join the search of the body (and of a fold's UPDATE
+/// and EXTRACT) instead, and the in-place step they feed keeps its unmarked
+/// operands. A position left out, or a binder's source, still counts when it can
+/// raise while reading a name, since `try ... catch .` hands the error value on
+/// (`try (error($a) and true) catch .`).
+///
+/// Everything else over-approximates. That skips the per-read rebuild, and costs
+/// one thing: a fold whose state is the element shares it with whatever produced
+/// it, so a generator that grows its own value in place copies it once a step
+/// (`last(range([]; {}; [1]))`, as jq's `reduce` does), where the rebuild had
+/// copied it anyway.
+fn loop_var_can_reach_output(expr: &Expr, names: &[String]) -> bool {
+    let raises_a_name = |e: &Expr| {
+        any_subexpr(e, &mut |n| matches!(n, Expr::Error(_))) && mentions_any_name(e, names)
+    };
+    // `bodies`, searched for `names` plus `bound` when `source` reads one of `names`.
+    let through_binder = |source: &Expr, bound: &[Pattern], bodies: &[Option<&Expr>]| {
+        if !mentions_any_name(source, names) {
+            return bodies
+                .iter()
+                .flatten()
+                .any(|body| loop_var_can_reach_output(body, names));
+        }
+        let mut wider = names.to_vec();
+        for pattern in bound {
+            collect_pattern_var_names(pattern, &mut wider);
+        }
+        raises_a_name(source)
+            || bodies
+                .iter()
+                .flatten()
+                .any(|body| loop_var_can_reach_output(body, &wider))
+    };
+    let visit = |found: bool| if found { Visit::Found } else { Visit::Skip };
+    search_subexpr(expr, &mut |e| match e {
+        Expr::Var(v) if names.iter().any(|name| name == v) => Visit::Found,
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => visit(
+            raises_a_name(cond)
+                || loop_var_can_reach_output(then_branch, names)
+                || loop_var_can_reach_output(else_branch, names),
+        ),
+        Expr::As { expr, var, body } => visit(through_binder(
+            expr,
+            &[Pattern::Var(var.clone())],
+            &[Some(body)],
+        )),
+        Expr::AsPattern {
+            expr,
+            patterns,
+            body,
+        } => visit(through_binder(expr, patterns, &[Some(body)])),
+        Expr::Reduce {
+            input,
+            patterns,
+            init,
+            update,
+        } => visit(
+            loop_var_can_reach_output(init, names)
+                || through_binder(input, patterns, &[Some(update)]),
+        ),
+        Expr::Foreach {
+            input,
+            patterns,
+            init,
+            update,
+            extract,
+        } => visit(
+            loop_var_can_reach_output(init, names)
+                || through_binder(input, patterns, &[Some(update), extract.as_deref()]),
+        ),
+        Expr::Arithmetic { .. } | Expr::Compare { .. } | Expr::And(..) | Expr::Or(..) => {
+            visit(raises_a_name(e))
+        }
+        _ if is_assignment_expr(e) => visit(raises_a_name(e)),
+        _ => Visit::Descend,
+    })
+}
+
+/// Whether `expr` mentions one of `names` as a variable anywhere.
+fn mentions_any_name(expr: &Expr, names: &[String]) -> bool {
+    any_subexpr(
+        expr,
+        &mut |n| matches!(n, Expr::Var(v) if names.iter().any(|name| name == v)),
+    )
 }
 
 /// Whether `expr` reads one of `names` *and* holds a node that can run jq's
@@ -80693,11 +80842,7 @@ fn loop_var_can_be_compared(expr: &Expr, names: &[String]) -> bool {
             }
         )
     }
-    let reads_name = any_subexpr(
-        expr,
-        &mut |n| matches!(n, Expr::Var(v) if names.iter().any(|name| name == v)),
-    );
-    reads_name
+    mentions_any_name(expr, names)
         && search_subexpr(expr, &mut |e| {
             if is_equality(e) {
                 Visit::Found
@@ -80748,12 +80893,7 @@ fn loop_var_is_path_source(expr: &Expr, names: &[String]) -> bool {
 /// which runs by value (`.[$r.name] = f($r)` is the fold shape marking would
 /// slow), though a resolver nested there still does.
 fn scan_for_path_source(expr: &Expr, names: &[String], calls: bool) -> bool {
-    let mentions = |e: &Expr| {
-        any_subexpr(
-            e,
-            &mut |n| matches!(n, Expr::Var(v) if names.iter().any(|name| name == v)),
-        )
-    };
+    let mentions = |e: &Expr| mentions_any_name(e, names);
     search_subexpr(expr, &mut |e| match e {
         Expr::Assign { path, value: rhs }
         | Expr::CompoundAssign {
@@ -81112,7 +81252,7 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
         // never the accumulator's, so it certifies no write jq refuses
         // (`test_fold_container_loop_variable_identity_through_document_input_3896`'s
         // multi-fork rows).
-        let mark = (mark_loop_vars && first) || share_loop_vars;
+        let mark = LoopVarSplice::of(mark_loop_vars && first, share_loop_vars);
         // #3895: jq runs every later fork's SOURCE against `null`.
         let source_input = if first {
             SourceInput::Real
@@ -81252,7 +81392,7 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
         // never the accumulator's, so it certifies no write jq refuses
         // (`test_fold_container_loop_variable_identity_through_document_input_3896`'s
         // multi-fork rows).
-        let mark = (mark_loop_vars && first) || share_loop_vars;
+        let mark = LoopVarSplice::of(mark_loop_vars && first, share_loop_vars);
         // #3895: jq runs every later fork's SOURCE against `null`.
         let source_input = if first {
             SourceInput::Real
@@ -102259,8 +102399,9 @@ mod tests {
     }
 
     /// #3896: a fold shares its container loop variables' storage only where its
-    /// UPDATE or EXTRACT both reads one and can compare it by value, and never in
-    /// yq mode. An assignment's path and right-hand side keep the in-place step
+    /// UPDATE or EXTRACT both reads one and can compare it by value, or (#5516) can
+    /// hand it out of the step, and never in yq mode. An assignment's path and
+    /// right-hand side, and arithmetic, keep the in-place step
     /// (`fold_assign_step_copies_nothing_3138`) unless they hold a `==`/`!=`.
     #[test]
     fn fold_loop_variable_identity_gate_3896() {
@@ -102292,10 +102433,37 @@ mod tests {
             "reduce . as $a (.; .x |= ($a == 1))",
             "foreach . as $a (0; 1; $a == $a)",
             "foreach . as $a (0; $a == $a; .)",
+            // #5516: the step hands the variable, or a node of it, on, and a comparison
+            // after the fold can see it (`last(f)` is `reduce f as $x (null; $x)`).
+            "reduce . as $a (null; $a)",
+            "reduce . as $a (null; $a | .)",
+            "reduce . as $a (null; $a[0])",
+            "reduce . as $a (null; [$a])",
+            "reduce . as $a (null; {x: $a})",
+            "reduce . as $a (null; $a // 0)",
+            "reduce . as $a (null; try $a catch 0)",
+            "reduce . as $a (null; if . then $a else 0 end)",
+            "reduce . as $a (null; if . then 0 elif . then 1 else $a end)",
+            "reduce . as [$a] (null; $a)",
+            "foreach . as $a (0; $a)",
+            "foreach . as $a (0; 0; $a)",
+            "foreach . as $a (0; .; $a.b)",
+            "foreach . as $a (0; . + 1; [$a, .])",
+            // ... through a binder, whose names then reach the output.
+            "reduce . as $a (null; $a as $s | $s)",
+            "reduce . as $a (null; $a as [$x] | $x)",
+            "reduce . as $a (null; reduce $a[] as $t (null; $t))",
+            "reduce . as $a (null; foreach $a[] as $t (0; 0; $t))",
+            "reduce . as $a (null; reduce 1 as $t ($a; .))",
+            // ... or as an error a position read by value raises (`catch .` hands it on).
+            "reduce . as $a (null; try (error($a) and true) catch .)",
+            "reduce . as $a (null; try (if error($a) then 1 else 0 end) catch .)",
+            "reduce . as $a (null; try (error($a) as $x | 1) catch .)",
+            "reduce . as $a (null; try (($a | error) + 1) catch .)",
         ] {
             assert!(
                 gate::<JqSemantics>(src),
-                "{src} can compare its loop variable"
+                "{src} can compare its loop variable or hand it on"
             );
             assert!(
                 !gate::<YqSemantics>(src),
@@ -102316,11 +102484,26 @@ mod tests {
             "reduce .[] as $r ({}; .x[$r.name] += $r.score)",
             "reduce .[] as $r ({}; .[$r.name] = my_fn($r))",
             "reduce .[] as $r ({}; .[$r.name] += ($r.score | floor))",
-            "foreach . as $a (0; .; $a.b)",
+            // #5516: an assignment and arithmetic keep the in-place step, and an `if`
+            // condition, `and` and `or` answer a boolean.
+            "reduce . as $a ({}; .x = $a)",
+            "reduce . as $a ({}; .x |= $a)",
+            "reduce . as $a ({}; . + {x: $a})",
+            "reduce . as $a (null; if $a then 1 else 0 end)",
+            "reduce . as $a (null; $a and true)",
+            "reduce . as $a (null; $a or false)",
+            "reduce . as $a (null; $b)",
+            // A binder's source hands nothing on but through its names, here read by
+            // value only (`fold_assign_step_copies_nothing_3138`).
+            "reduce .[] as $r ({}; $r as $s | .[$s.name] = $s.score)",
+            "reduce .[] as $r ({}; $r.name as $n | .[$n] = $r.score)",
+            "reduce .[] as $r ({}; $r as {name: $n} | .[$n] = 1)",
+            "reduce .[] as $r ({}; reduce $r.tags[] as $t (.; .[$t] += 1))",
+            "reduce .[] as $r ({}; foreach $r.tags[] as $t (.; .[$t] = 1; .))",
         ] {
             assert!(
                 !gate::<JqSemantics>(src),
-                "{src} cannot compare its loop variable"
+                "{src} neither compares its loop variable nor hands it on"
             );
         }
     }
@@ -115166,19 +115349,62 @@ mod tests {
             substitute_var(&parse("$v.score").unwrap(), "u", &record),
             parse("$v.score").unwrap()
         );
-        // A marked substitution splices the marker, as the path reading it needs.
+        // A path marker (`LoopVarSplice::Path`, which passes no `splice`) splices the marker, as
+        // the path reading it needs.
         let marker = LazyMarker::new(&record, Origin::Untracked, None);
         let marked = substitute_var_with(
             &parse("$u.score").unwrap(),
             "u",
             &record,
             Some(&marker),
-            true,
+            false,
         );
         let Expr::Pipe(stages) = marked else {
             panic!("a marked substitution is a pipe");
         };
         assert!(matches!(stages[0], Expr::TrackedVar(_)));
+    }
+
+    /// #5516: under a fold's identity-sharing marker (`LoopVarSplice::Shared`), a scalar held
+    /// field is still spliced alone, as #5499 does unmarked, and a container field stays a read
+    /// of the marker, so it keeps the element's storage.
+    #[test]
+    fn test_shared_fold_marker_splices_a_scalar_field_alone_5516() {
+        let tags = OwnedValue::array_from(vec![OwnedValue::Float(f64::NAN)]);
+        let record = OwnedValue::object_from([
+            ("score".to_string(), OwnedValue::Int(7)),
+            ("tags".to_string(), tags),
+        ]);
+        let shared = |source: &str| {
+            substitute_fold_step(
+                &parse(source).unwrap(),
+                &[("u".to_string(), record.clone())],
+                &[],
+                LoopVarSplice::Shared,
+                true,
+            )
+        };
+        assert_eq!(shared("$u.score"), Expr::Literal(Literal::Int(7)));
+        let Expr::Pipe(stages) = shared("$u.tags") else {
+            panic!("a container field is read through the marker");
+        };
+        assert!(matches!(stages[0], Expr::TrackedVar(_)));
+        // Without the jq-mode `splice`, and under the path marker, the object stays whole.
+        for (mode, splice) in [(LoopVarSplice::Shared, false), (LoopVarSplice::Path, true)] {
+            let Expr::Pipe(stages) = substitute_fold_step(
+                &parse("$u.score").unwrap(),
+                &[("u".to_string(), record.clone())],
+                &[],
+                mode,
+                splice,
+            ) else {
+                panic!("{mode:?}/{splice}: not spliced");
+            };
+            assert!(
+                matches!(stages[0], Expr::TrackedVar(_)),
+                "{mode:?}/{splice}"
+            );
+        }
     }
 
     /// #1368: `substitute_vars` on an empty binding list must return `expr`
@@ -155981,12 +156207,15 @@ mod share_audit_2999 {
             "[limit(300; range([]; {}; [1]) | length)] | length",
             &[(Kind::ArrayMakeMut, 1), (Kind::ArrayUnwrap, 299)],
         );
-        // `last(f)` no longer retains (#5377): it is jq's `reduce`, which lets go of each value
-        // as the next arrives, so it appends in place like the consumers above.
+        // `last(f)` no longer retains every value (#5377): it is jq's `reduce`, which holds only
+        // the latest. Since #5516 its state *is* that value, the generator's own array, as jq's
+        // `$x` is, so `range`'s next `. + [1]` copies it once a step, as jq's does. That copy
+        // replaced a rebuild of the whole value from a literal every step, which cost more
+        // (`last(limit(10000; range([]; {}; [1])))`: 19.0 s to 4.5 s, M4 Pro, release).
         assert_forced(
             b"null",
             "last(limit(300; range([]; {}; [1]))) | length",
-            &[(Kind::ArrayMakeMut, 1), (Kind::ArrayUnwrap, 299)],
+            &[(Kind::ArrayMakeMut, 299), (Kind::ArrayUnwrap, 299)],
         );
         assert_forced(
             b"null",
@@ -157315,7 +157544,10 @@ mod touched_edge_cases_2999 {
             .spawn(|| {
                 let json = br"{}";
                 let index = JsonIndex::build(json);
-                let program = "def f(n): if n == 0 then 0 else [f(n-1)] end; last(f(400)) | length";
+                // A fold's `$x` read by arithmetic is still spliced back (`last(f)` shares the
+                // value since #5516, and answers as jq does).
+                let program = "def f(n): if n == 0 then 0 else [f(n-1)] end; \
+                               reduce f(400) as $x ([]; . + [$x]) | length";
                 let expr = parse(program).expect("parse");
                 let result = eval::<Vec<u64>, JqSemantics>(&expr, index.root(json));
                 let refused = matches!(

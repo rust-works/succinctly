@@ -8055,8 +8055,9 @@ Three differences remain, all in the direction of erroring rather than aborting:
   thread it through.
   `succinctly jq` has the same net for the evaluator's own splice sites
   ([#5526](https://github.com/rust-works/succinctly/issues/5526)).
-  `last(f)`, `+=`, `//=`, a fold's `$x` and `try error(<deep>)` on a value built past 384 levels
+  `+=`, `//=`, a fold's `$x` read by an assignment or arithmetic (`reduce f as $x ([]; . + [$x])`) and `try error(<deep>)` on a value built past 384 levels
   assert the ceiling where they splice it back into the AST or render it, with no `Result` to thread it through.
+  `last(f)` was one of them until [#5516](https://github.com/rust-works/succinctly/issues/5516), which hands the value on instead of splicing it, so `last(f(400)) | length` answers `1` as jq does.
   They exited 101 with a raw panic; the three CLI routes and the library's `jq::eval` now catch exactly that panic.
   The CLI reports `nesting depth exceeds limit of 384` at exit 5, the same refusal `reduce` gives.
   `jq::eval` returns it as a `resource_limit` error.
@@ -11725,8 +11726,18 @@ The shortcut fires only where `==` is handed two handles on one storage, so the 
   body as literal syntax, so each `$a` *rebuilt* it. A container is now spliced as an
   untracked marker holding the bound value, so every `$a` reads one allocation; `path($a)`
   refuses exactly as before, because a constructed value is no node of `.`.
+- **A fold's loop variable.** `reduce`/`foreach` splice a container loop variable as the same
+  kind of marker when UPDATE or EXTRACT can compare it (#3896) or hand it out of the step
+  ([#5516](https://github.com/rust-works/succinctly/issues/5516)).
+  So `[nan] as $a | last($a) == $a` and `reduce $a as $v (null; [$v]) | .[0] == $a` are `true`, as in jq (`last(f)` is `reduce f as $x (null; $x)`).
 
 Still different:
+
+- **A fold's loop variable stored by an assignment or by arithmetic.** `reduce $a as $v ({};
+  .x = $v) | .x == $a`, `reduce $a as $v ([]; . + [$v]) | .[0] == $a` and jq's own spelling of
+  `add`, `reduce $a[] as $v (null; . + $v)`, are `false` here and `true` in jq.
+  Those steps run in place on the owned accumulator (#3138, #3944), and a marker there makes them decline and copy the accumulator on every step (#4005), so they keep the rebuilt operand; the `add` builtin itself answers `true`.
+- **`as` destructuring.** `[[nan]] as $a | $a as [$x] | $x == $a[0]` is `false` here and `true` in jq: a destructured name is spliced as a rebuilt literal, in or out of a fold.
 
 - **Slices.** `.[0:]` and any other full-range slice hand back the array itself, as jq's view
   does. An equal-bounds *partial* slice is a view onto the same storage in jq (pointer, offset
