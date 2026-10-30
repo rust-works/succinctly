@@ -12396,6 +12396,54 @@ pub(crate) fn try_eval_owned_step<S: EvalSemantics>(expr: &Expr, state: OwnedVal
     }
 }
 
+/// `del(f)` for a static `f` against an owned state (#5549): the delete
+/// [`builtin_del`] makes, on the state moved in, where the bridge wrote the whole state out as
+/// JSON and indexed it again to hand the builtin a cursor, only for it to be materialized once
+/// more. That round trip was 18% of `del(.users[0]) | .users | length` over a 0.7 MB document.
+///
+/// `f` is [`owned_assign_path_shape`]'s grammar with no computed key: field names and literal
+/// indices in any pipe nesting, so it holds no marker and no effect, and every path it can name
+/// is one the evaluator's own resolution finds in the same tree. jq mode only, and not while the
+/// #2889 embed table is live, whose bindings a bridge result would have been detached from.
+/// A decline hands the state back untouched; an error is the one `del` raises, with its text,
+/// since the state it consumed cannot be handed back.
+pub(crate) fn owned_del_step<S: EvalSemantics>(expr: &Expr, state: OwnedValue) -> OwnedStep {
+    match owned_del_target::<S>(expr) {
+        Some(path) => OwnedStep::Handled(owned_del_run::<S>(path, state)),
+        None => OwnedStep::Declined(state),
+    }
+}
+
+/// The delete [`owned_del_step`] makes, for a `path` [`owned_del_target`] has already accepted:
+/// a caller that asked for the target first (to copy a borrowed state only when it will be
+/// used) runs it here and does not ask again.
+fn owned_del_run<S: EvalSemantics>(
+    path: &Expr,
+    state: OwnedValue,
+) -> Result<OwnedValue, EvalError> {
+    match del_on_owned::<Vec<u64>, S>(path, state, false) {
+        QueryResult::Owned(value) => Ok(value),
+        QueryResult::Error(error) => Err(error),
+        _ => Err(EvalError::new(
+            "internal error: del yielded other than one value",
+        )), // patchcov: coverage tolerate-line reason="unreachable: a static jq-mode path resolves to paths or an error, never to no output, a break or a halt (#5549)"
+    }
+}
+
+/// The path of the `del(f)` [`owned_del_step`] may answer, and nothing evaluated: `expr` is a
+/// `del` in jq mode, `f` is static, and the #2889 embed table is off. Cheap enough for a caller
+/// holding a borrowed state to ask before it copies one.
+pub(crate) fn owned_del_target<S: EvalSemantics>(expr: &Expr) -> Option<&Expr> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    let Expr::Builtin(Builtin::Del(path)) = unwrap_paren(expr) else {
+        return None;
+    };
+    (owned_assign_path_shape(path, &|_| false) && !super::eval_generic::embed_table_active())
+        .then_some(path.as_ref())
+}
+
 /// The assignment half of [`try_eval_owned_step`]: [`owned_assign_step`] over
 /// a consumed state, declining (the untouched state handed back) for anything
 /// that is not one of [`is_owned_assign`]'s shapes -- or a `setpath(P; V)`
@@ -79515,6 +79563,15 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             FixedPathDel::Input => input.clone(),
         });
     }
+    // #5549: see `eval_generic::eval_on_owned_over`. The state is copied only for a `del` the
+    // step can answer, and the copy shares `input`'s storage until the delete writes.
+    if let Some(path) = owned_del_target::<S>(expr) {
+        return match owned_del_run::<S>(path, input.clone()) {
+            Ok(value) => QueryResult::Owned(value),
+            Err(_) if optional => QueryResult::None,
+            Err(error) => QueryResult::Error(error),
+        };
+    }
     // After the fast path on purpose: it never reaches a resolver, and
     // demoting rebuilds `expr` whenever it holds a marker at all.
     eval_owned_input_bridge::<W, S>(&reentry.reroot::<S>(expr), input, optional)
@@ -90377,7 +90434,18 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // path (`del(.a?)`) is unaffected — it's already a distinct
     // `Expr::Optional` node baked into `path_expr`, which the walkers still
     // honor on their own.
-    let mut result = to_owned_or_suppress!(&value, optional);
+    let result = to_owned_or_suppress!(&value, optional);
+    del_on_owned::<W, S>(path_expr, result, optional)
+}
+
+/// [`builtin_del`] over a value that is already owned (#5549): everything the builtin does
+/// after it has materialized its input. Split out so [`owned_del_step`] can answer a `del`
+/// against an owned tree without writing it out and indexing it again.
+fn del_on_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    path_expr: &Expr,
+    mut result: OwnedValue,
+    optional: bool,
+) -> QueryResult<'a, W> {
     // #1351: pre-write snapshot for the alias mirror, only while a table is
     // installed (never in jq mode).
     let del_pre = alias_identity::active().then(|| result.clone());
@@ -113350,6 +113418,147 @@ mod tests {
             assert!(eval_owned_closed::<JqSemantics>(&expr).is_none(), "{src}");
             assert!(eval_owned_closed::<YqSemantics>(&expr).is_none(), "{src}");
         }
+    }
+
+    /// #5549: `owned_del_step` is the delete the reindex bridge makes of a `del` whose path is
+    /// static, on every value, including the ones `del` raises on, and it declines every other
+    /// target and yq mode with the state untouched. Compared as printed, since the bridge reparses
+    /// a computed `Int` as a literal of the same spelling, which this route keeps computed, as jq
+    /// does.
+    #[test]
+    fn owned_del_step_agrees_with_the_reindex_bridge_5549() {
+        let record = |id: i64| {
+            OwnedValue::object_from([
+                ("id".to_string(), OwnedValue::Int(id)),
+                (
+                    "name".to_string(),
+                    OwnedValue::String(alloc::format!("user{id}").into()),
+                ),
+                (
+                    "score".to_string(),
+                    OwnedValue::from_number_literal::<JqSemantics>("1.50"),
+                ),
+                ("ratio".to_string(), OwnedValue::Float(0.1 + 0.2)),
+            ])
+        };
+        let mut values = pure_value_matrix();
+        values.push(OwnedValue::object_from([(
+            "users".to_string(),
+            OwnedValue::array_from(vec![record(1), record(2), record(3)]),
+        )]));
+        values.push(OwnedValue::array_from(vec![
+            record(4),
+            OwnedValue::Null,
+            OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
+        ]));
+        let accepted = [
+            "del(.)",
+            "del(.a)",
+            "(del(.a))",
+            "del(.a.b)",
+            "del(.a | .b)",
+            "del(.[0])",
+            "del(.[-1])",
+            "del(.[7])",
+            "del(.a[0])",
+            "del(.a[0].b)",
+            "del(.users)",
+            "del(.users[0])",
+            "del(.users[-1])",
+            "del(.users[1].id)",
+            "del(.users[9])",
+            "del(.users[0].name)",
+            "del(.[2][0])",
+            "del(.[0].ratio)",
+        ];
+        let declined = [
+            "del(.a, .b)",
+            "del(.a?)",
+            "del(.[])",
+            "del(.[1:])",
+            "del(.[0.5])",
+            "del(.a | select(. == 1))",
+            "del(.a[.b])",
+            "del(..)",
+            ". as $x | del($x)",
+            "delpaths([[\"a\"]])",
+            "del(.a) | .b",
+            "map(del(.a))",
+            ".a = 1",
+        ];
+        let mut handled = 0usize;
+        let mut raised = 0usize;
+        for value in &values {
+            for src in accepted {
+                let expr = parse(src).unwrap();
+                let (bridge, ended) = normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                    &expr, value, false,
+                ));
+                let bridge: Vec<String> = bridge.iter().map(OwnedValue::to_json).collect();
+                let OwnedStep::Handled(answer) =
+                    owned_del_step::<JqSemantics>(&expr, value.clone())
+                else {
+                    panic!("{src:?} on {value:?} was declined"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message of the assertion this test exists to make (#5549)"
+                };
+                let step = match answer {
+                    Ok(v) => (vec![v.to_json()], "ok".to_string()),
+                    Err(e) => {
+                        raised += 1;
+                        (vec![], alloc::format!("error:{}", e.message))
+                    }
+                };
+                handled += 1;
+                assert_eq!(
+                    (bridge.clone(), ended.clone()),
+                    step,
+                    "{src:?} on {value:?}"
+                );
+                // `eval_owned_input`, which asks for the target and copies its borrowed state,
+                // answers the same, and an `optional` stage swallows the error.
+                for optional in [false, true] {
+                    let (via_input, input_ended) =
+                        normalize(eval_owned_input::<Vec<u64>, JqSemantics>(
+                            &expr,
+                            value,
+                            optional,
+                            Reentry::Proven,
+                        ));
+                    let via_input: Vec<String> =
+                        via_input.iter().map(OwnedValue::to_json).collect();
+                    let expected = if optional && ended.starts_with("error:") {
+                        (vec![], "ok".to_string())
+                    } else {
+                        (bridge.clone(), ended.clone())
+                    };
+                    assert_eq!(
+                        (via_input, input_ended),
+                        expected,
+                        "optional {optional}: {src:?} on {value:?}"
+                    );
+                }
+            }
+            for src in declined {
+                let expr = parse(src).unwrap();
+                assert!(
+                    owned_del_target::<JqSemantics>(&expr).is_none(),
+                    "{src:?} is not a static del"
+                );
+                let before = value.to_json();
+                let OwnedStep::Declined(back) = owned_del_step::<JqSemantics>(&expr, value.clone())
+                else {
+                    panic!("{src:?} on {value:?} was answered"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message of the assertion this test exists to make (#5549)"
+                };
+                assert_eq!(back.to_json(), before, "{src:?} hands the state back");
+            }
+            // yq's `del` has its own rules (a slot-keeping target, `del(.)` printing nothing).
+            let expr = parse("del(.a)").unwrap();
+            assert!(owned_del_target::<YqSemantics>(&expr).is_none());
+        }
+        assert_eq!(handled, accepted.len() * values.len());
+        assert!(
+            raised > 10 && raised < handled,
+            "the matrix must hold values `del` raises on and values it deletes from: {raised} of {handled}"
+        );
     }
 
     /// #4283: `fixed_path_del` answers `del(.)`, and `del(.[]?)` over a scalar

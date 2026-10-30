@@ -24,7 +24,9 @@ use core::ops::{Deref, DerefMut};
 use indexmap::IndexMap;
 
 use super::error::EvalError;
-use super::escape::{escape_json_body, write_json_body_jq};
+#[cfg(test)]
+use super::escape::escape_json_body;
+use super::escape::write_json_body_jq;
 use super::eval::{EvalSemantics, EvalTag, JqSemantics, YqSemantics};
 use super::expr::Literal;
 
@@ -4109,7 +4111,135 @@ impl OwnedValue {
     /// `jq_printer` is jq's writer, which prints anything more than
     /// [`JQ_MAX_PRINT_DEPTH`] levels down as [`SKIPPED_TOO_DEEP`] (#5497); the yq writer
     /// and the reindex bridge, which must keep the whole value, do not.
+    ///
+    /// The text is appended to one buffer by [`write_json_at_depth`](Self::write_json_at_depth)
+    /// (#5549); `tojson`, `tostring` and every printer fork above go through here.
     fn to_json_at_depth(
+        &self,
+        depth: usize,
+        jq_printer: bool,
+        finite_literal: fn(&[u8]) -> String,
+        float_fmt: fn(f64) -> String,
+        infinite_fmt: fn(bool) -> &'static str,
+        nan_fmt: fn(f64) -> String,
+    ) -> String {
+        let mut out = String::new();
+        self.write_json_at_depth(
+            &mut out,
+            depth,
+            jq_printer,
+            finite_literal,
+            float_fmt,
+            infinite_fmt,
+            nan_fmt,
+        );
+        out
+    }
+
+    /// [`to_json_at_depth`](Self::to_json_at_depth)'s text, appended to `out` in one pass (#5549).
+    ///
+    /// The previous form built a `String` per node and joined them, so every level of nesting
+    /// copied everything below it again, and every object member paid a `format!`. The bytes are
+    /// the same as that form wrote; `printer_text_matches_the_nested_form_5549` compares the two
+    /// on every value shape, under every convention a caller passes.
+    #[allow(clippy::too_many_arguments)] // STYLE-0004: the nested form it replaced takes the same
+                                         // convention parameters and threads them through the
+                                         // recursion unchanged; the two stay comparable line by line.
+    fn write_json_at_depth(
+        &self,
+        out: &mut String,
+        depth: usize,
+        jq_printer: bool,
+        finite_literal: fn(&[u8]) -> String,
+        float_fmt: fn(f64) -> String,
+        infinite_fmt: fn(bool) -> &'static str,
+        nan_fmt: fn(f64) -> String,
+    ) {
+        use core::fmt::Write;
+        if jq_printer && depth > JQ_MAX_PRINT_DEPTH {
+            out.push_str(SKIPPED_TOO_DEEP);
+            return;
+        }
+        assert_value_tree_depth(depth);
+        match self {
+            Self::Null => out.push_str("null"),
+            Self::Bool(true) => out.push_str("true"),
+            Self::Bool(false) => out.push_str("false"),
+            Self::Int(n) => {
+                // Writing into a `String` is infallible.
+                let _ = write!(out, "{n}");
+            }
+            Self::Float(f) => {
+                if f.is_nan() {
+                    // See the nested form's comment: `null` for output, the bridge token for
+                    // `to_json_input_bridge` (#2877); a computed NaN goes in canonical (#3309).
+                    out.push_str(&nan_fmt(f64::NAN));
+                } else if f.is_infinite() {
+                    out.push_str(infinite_fmt(f.is_sign_negative()));
+                } else {
+                    out.push_str(&float_fmt(*f));
+                }
+            }
+            Self::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => {
+                out.push_str(&nan_fmt(*f));
+            }
+            Self::NumberLiteral(NumberRepr::Float(f), literal)
+                if f.is_infinite() && crate::yaml::nonfinite_literal_index(literal).is_some() =>
+            {
+                out.push_str(infinite_fmt(f.is_sign_negative()));
+            }
+            Self::NumberLiteral(_, literal) => out.push_str(&finite_literal(literal.as_bytes())),
+            Self::String(s) => {
+                out.push('"');
+                let _ = write_json_body_jq(out, s);
+                out.push('"');
+            }
+            Self::Array(arr) => {
+                out.push('[');
+                for (i, v) in arr.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    v.write_json_at_depth(
+                        out,
+                        depth + 1,
+                        jq_printer,
+                        finite_literal,
+                        float_fmt,
+                        infinite_fmt,
+                        nan_fmt,
+                    );
+                }
+                out.push(']');
+            }
+            Self::Object(obj) => {
+                out.push('{');
+                for (i, (k, v)) in obj.occurrences().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push('"');
+                    let _ = write_json_body_jq(out, k);
+                    out.push_str("\":");
+                    v.write_json_at_depth(
+                        out,
+                        depth + 1,
+                        jq_printer,
+                        finite_literal,
+                        float_fmt,
+                        infinite_fmt,
+                        nan_fmt,
+                    );
+                }
+                out.push('}');
+            }
+        }
+    }
+
+    /// The per-node `String` form [`write_json_at_depth`](Self::write_json_at_depth) replaced
+    /// (#5549), kept as the oracle `printer_text_matches_the_nested_form_5549` checks it against.
+    #[cfg(test)]
+    fn to_json_nested_at_depth(
         &self,
         depth: usize,
         jq_printer: bool,
@@ -4173,7 +4303,7 @@ impl OwnedValue {
                 let elements: Vec<String> = arr
                     .iter()
                     .map(|v| {
-                        v.to_json_at_depth(
+                        v.to_json_nested_at_depth(
                             depth + 1,
                             jq_printer,
                             finite_literal,
@@ -4192,7 +4322,7 @@ impl OwnedValue {
                         format!(
                             "\"{}\":{}",
                             escape_json_body(write_json_body_jq, k),
-                            v.to_json_at_depth(
+                            v.to_json_nested_at_depth(
                                 depth + 1,
                                 jq_printer,
                                 finite_literal,
@@ -4338,14 +4468,15 @@ impl OwnedValue {
             // the bridge-only token `computed_float_token` decodes (#2902);
             // see `to_json_for_reindex_at_depth`, the nested form this
             // replaced, for why. Every other variant is handled above.
-            other => out.push_str(&other.to_json_at_depth(
+            other => other.write_json_at_depth(
+                out,
                 depth,
                 false,
                 format_number_jq_compat,
                 crate::json::validate::computed_float_token,
                 infinite_float_preview_text,
                 printed_nan,
-            )),
+            ),
         }
         Ok(())
     }
@@ -10652,6 +10783,153 @@ mod tests {
                 (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string()),
                 (a, b) => panic!("depth {depth}: {a:?} vs {b:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make: the two serializers disagreeing on whether a nest is too deep (#3479)"
             }
+        }
+    }
+
+    /// #5549: the printer's text is written in one pass now; it must be the bytes the nested
+    /// per-node form wrote, under each of the four conventions its callers pass (jq's printer,
+    /// the input bridge, `--preserve-input`, yq), for every kind of leaf, for the depth marker
+    /// jq's writer prints past [`JQ_MAX_PRINT_DEPTH`], and for the panic at the tree limit.
+    #[test]
+    fn printer_text_matches_the_nested_form_5549() {
+        type Convention = (
+            bool,
+            fn(&[u8]) -> String,
+            fn(f64) -> String,
+            fn(bool) -> &'static str,
+            fn(f64) -> String,
+        );
+        let conventions: [Convention; 4] = [
+            (
+                true,
+                format_number_jq_compat,
+                jq_bare_float_display,
+                infinite_float_preview_text,
+                printed_nan,
+            ),
+            (
+                false,
+                input_bridge_literal_text,
+                jq_bare_float_display,
+                overflow_literal_text,
+                nan_instance_token,
+            ),
+            (
+                true,
+                crate::jq::stream::real_output_finite_literal,
+                jq_bare_float_display,
+                infinite_float_preview_text,
+                printed_nan,
+            ),
+            (
+                false,
+                crate::jq::stream::yq_json_finite_literal,
+                crate::yaml::format_float_yq,
+                yq_infinite_float_json_text,
+                printed_nan,
+            ),
+        ];
+        let literal = |text: &str| OwnedValue::from_number_bytes::<JqSemantics>(text.as_bytes());
+        let leaves = vec![
+            OwnedValue::Null,
+            OwnedValue::Bool(true),
+            OwnedValue::Bool(false),
+            OwnedValue::Int(0),
+            OwnedValue::Int(i64::MIN),
+            OwnedValue::Int(i64::MAX),
+            OwnedValue::Float(1.5),
+            OwnedValue::Float(-0.0),
+            OwnedValue::Float(1e300 * 1e300),
+            OwnedValue::Float(-1e300 * 1e300),
+            OwnedValue::Float(f64::NAN),
+            literal("1"),
+            literal("1.0"),
+            literal("1e100"),
+            literal("-0.0"),
+            literal("1e400"),
+            literal("0.0000001"),
+            literal("100000000000000000000"),
+            OwnedValue::NumberLiteral(NumberRepr::Float(f64::NAN), ".NaN".into()),
+            OwnedValue::NumberLiteral(NumberRepr::Float(f64::INFINITY), ".inf".into()),
+            OwnedValue::NumberLiteral(NumberRepr::Float(f64::NEG_INFINITY), "-.INF".into()),
+            OwnedValue::String("".into()),
+            OwnedValue::String("plain".into()),
+            OwnedValue::String("q\"b\\s\n\r\t\u{8}\u{c}\u{1}\u{7f}é😀".into()),
+        ];
+        let mut values = leaves.clone();
+        values.push(OwnedValue::array_from(leaves.clone()));
+        values.push(OwnedValue::array_from(vec![]));
+        values.push(OwnedValue::object_from(vec![]));
+        values.push(OwnedValue::object_from(
+            leaves
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (format!("k\"{i}\n"), v.clone()))
+                .collect::<Vec<_>>(),
+        ));
+        values.push(OwnedValue::object_from([
+            (
+                "a".to_string(),
+                OwnedValue::array_from(vec![
+                    OwnedValue::object_from([("b".to_string(), OwnedValue::array_from(leaves))]),
+                    OwnedValue::array_from(vec![OwnedValue::array_from(vec![])]),
+                ]),
+            ),
+            (String::new(), OwnedValue::object_from(vec![])),
+        ]));
+        // Past jq's print depth the jq printers write the marker for the subtree and the
+        // others keep writing; both must agree with the nested form on where that is.
+        for depth in [
+            JQ_MAX_PRINT_DEPTH - 1,
+            JQ_MAX_PRINT_DEPTH,
+            JQ_MAX_PRINT_DEPTH + 3,
+        ] {
+            values.push(linear_array_nest(depth));
+        }
+        for value in &values {
+            for (jq_printer, finite, float, infinite, nan) in conventions {
+                assert_eq!(
+                    value.to_json_at_depth(0, jq_printer, finite, float, infinite, nan),
+                    value.to_json_nested_at_depth(0, jq_printer, finite, float, infinite, nan),
+                    "{value:?}"
+                );
+            }
+        }
+        // And from a nonzero depth, which is how the reindex bridge's fallback arrives.
+        for (jq_printer, finite, float, infinite, nan) in conventions {
+            let leaf = OwnedValue::Float(2.5);
+            assert_eq!(
+                leaf.to_json_at_depth(7, jq_printer, finite, float, infinite, nan),
+                leaf.to_json_nested_at_depth(7, jq_printer, finite, float, infinite, nan)
+            );
+        }
+        let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        for form in [false, true] {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if form {
+                    over.to_json_nested_at_depth(
+                        0,
+                        false,
+                        format_number_jq_compat,
+                        jq_bare_float_display,
+                        infinite_float_preview_text,
+                        printed_nan,
+                    )
+                } else {
+                    over.to_json_at_depth(
+                        0,
+                        false,
+                        format_number_jq_compat,
+                        jq_bare_float_display,
+                        infinite_float_preview_text,
+                        printed_nan,
+                    )
+                }
+            }));
+            assert!(
+                result.is_err(),
+                "nested form: {form}; both forms panic at MAX_VALUE_TREE_DEPTH (#1005)"
+            );
         }
     }
 
