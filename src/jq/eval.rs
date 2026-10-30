@@ -98581,6 +98581,49 @@ pub(crate) fn each_pattern_binding_set_at<S: EvalSemantics, C: DocumentCursor>(
     )
 }
 
+/// Whether `body` reads the destructured variable `name` where jq's identity
+/// short-circuit can see it (#5539): anywhere but in the operands of an assignment or
+/// of arithmetic, which `owned_assign_step` and `owned_arith_accumulator_shape` run in
+/// place on the accumulator and which a container marker makes decline, copying the
+/// accumulator on every step (#3138, #3944, #4005). A read there stays a literal unless
+/// the node holds an equality that mentions `name` (`.x = ($t == $t)`), so `.[$k] = $t`
+/// and `. + $t` keep their in-place steps whatever else the body calls.
+///
+/// This asks about `name` itself, unlike [`loop_var_can_be_compared`], which fires on any
+/// builtin or call in the body: a body such as `.x = $t | has("zz")` then marked `$t` and
+/// declined the in-place step for a read it makes by value.
+///
+/// Asked only of a container, per binding, so a destructuring of scalars (the common
+/// `. as [$k, $v]`) never walks `body`.
+fn destructured_variable_shares_identity(body: &Expr, name: &str) -> bool {
+    let names = [name.to_string()];
+    search_subexpr(body, &mut |e| match e {
+        Expr::Var(v) if v == name => Visit::Found,
+        Expr::Arithmetic { .. } => in_place_operand(e, &names),
+        _ if is_assignment_expr(e) => in_place_operand(e, &names),
+        _ => Visit::Descend,
+    })
+}
+
+/// An assignment or arithmetic node of [`destructured_variable_shares_identity`]'s walk:
+/// found only through an equality that mentions one of `names`, otherwise skipped whole.
+fn in_place_operand(node: &Expr, names: &[String]) -> Visit {
+    let compares_name = any_subexpr(node, &mut |n| {
+        matches!(
+            n,
+            Expr::Compare {
+                op: CompareOp::Eq | CompareOp::Ne,
+                ..
+            }
+        ) && mentions_any_name(n, names)
+    });
+    if compares_name {
+        Visit::Found
+    } else {
+        Visit::Skip
+    }
+}
+
 /// `body` with every variable of one binding set substituted (#3466): a
 /// binding that names a document node goes through the marker route -- first
 /// telling `register` (the caller's embed-table and anchor push, whose guards
@@ -98604,6 +98647,26 @@ pub(crate) fn substitute_destructured_bindings<S: EvalSemantics>(
     for (name, value, origin) in bindings {
         let source = current.as_ref().unwrap_or(body);
         current = Some(match origin {
+            // #5539: a container bound from a value that names no node of the
+            // document (`[[nan]] as $a | $a as [$x]`) is a child of the source's own
+            // storage, as jq's `$x` is, so it is spliced as that storage when the
+            // body can compare it or hand it on, not as a rebuilt literal.
+            None if S::EQUALITY_SHORT_CIRCUITS_ON_IDENTITY
+                && matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_))
+                && destructured_variable_shares_identity(source, name) =>
+            {
+                substitute_bound_var_at(
+                    &Expr::Literal(Literal::Null),
+                    source,
+                    name,
+                    value,
+                    None,
+                    None,
+                    None,
+                    S::TAG == EvalTag::Jq,
+                    true,
+                )
+            }
             None => substitute_var(source, name, value),
             Some((node, document)) => {
                 let origin = BindOrigin::Node {
@@ -103380,6 +103443,50 @@ mod tests {
             "reduce . as $x (.; $x as $y | path($y))",
             AnchorScope::On
         ));
+    }
+
+    /// #5539: a destructured container is spliced as a sharing marker only where the body reads
+    /// the name outside an assignment's or arithmetic's operands, or compares it there. A read
+    /// there keeps the in-place step (`fold_assign_step_copies_nothing_3138`) whatever else the
+    /// body calls, and a body that never reads the name has nothing to share.
+    #[test]
+    fn destructured_variable_identity_gate_5539() {
+        fn gate(body: &str) -> bool {
+            destructured_variable_shares_identity(&parse(body).unwrap(), "x")
+        }
+        for body in [
+            "$x == $x",
+            "$x != 1",
+            "$x",
+            "[$x]",
+            "{k: $x}",
+            "$x | length",
+            "$x | .[0]",
+            "f($x)",
+            "$x // 0",
+            "if $x then 1 else 2 end",
+            ".a = ($x == $x)",
+            ". + ($x == $x | if . then 1 else 0 end)",
+            "$x as $y | $y",
+        ] {
+            assert!(gate(body), "{body} reads $x where identity can be seen");
+        }
+        for body in [
+            ".a = $x",
+            ".[$k] = $x",
+            ".a |= $x",
+            ".a += $x",
+            ". + $x",
+            ". + [$x]",
+            ".a = $x | has(\"zz\")",
+            ".a = $x | length",
+            ".a = $x | keys",
+            "$y == $y",
+            "1",
+            ".a = ($y == $y)",
+        ] {
+            assert!(!gate(body), "{body} reads $x only by value, or not at all");
+        }
     }
 
     /// #3896: a fold shares its container loop variables' storage only where its

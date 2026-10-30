@@ -212,3 +212,4 @@ mod i5526;
 mod i5529;
 mod i5531;
 mod i5535;
+mod i5539;
