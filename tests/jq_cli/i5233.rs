@@ -12,7 +12,7 @@
 
 use anyhow::Result;
 
-use crate::run_jq_full;
+use crate::{names_fault, run_jq_full};
 
 /// A dynamic path target beside an extension builtin, anywhere in the program, is refused
 /// with the builtin's name, once, at jq's compile-error status (3), before any input is read:
@@ -120,7 +120,7 @@ fn a_dynamic_path_program_over_an_undecodable_document_raises_5233() -> Result<(
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!((stdout.as_str(), code), ("", 5), "`{filter}`: {stderr}");
-        assert!(stderr.contains(message), "`{filter}`: {stderr}");
+        assert!(names_fault(&stderr, message), "`{filter}`: {stderr}");
     }
     let (stdout, stderr, code) = run_jq_full(&["-c", "[.d | path(.)]"], Some(lone))?;
     assert_eq!((stdout.as_str(), code), ("[[]]\n", 0), "{stderr}");

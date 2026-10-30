@@ -121,13 +121,13 @@ fn test_exit_status_is_the_last_inputs_and_on_error_overrides_it_5471() -> Resul
     Ok(())
 }
 
-/// jq stops at a malformed document and exits 5; succinctly reads on past it (it validates
-/// only what a filter reads), so a decode failure still fails the run when a clean document
-/// follows. jq 1.7.1 prints nothing here; the `1` is that recorded divergence.
+/// jq stops at a malformed document and exits 5, and so does succinctly when a filter reads the
+/// malformed member (#5576), so a clean document that follows is not answered. Before that it
+/// read on past it, and a decode failure still failed the run when a clean document followed.
 #[test]
 fn test_a_malformed_earlier_document_still_fails_the_run_5471() -> Result<()> {
     let (out, err, code) = run_jq_full(&["-c", ".a"], Some("{\"a\":tru} {\"a\":1}"))?;
-    assert_eq!((out.as_str(), code), ("1\n", 5), "{err}");
+    assert_eq!((out.as_str(), code), ("", 5), "{err}");
     Ok(())
 }
 

@@ -8,7 +8,7 @@
 
 use anyhow::Result;
 
-use crate::run_jq_full;
+use crate::{names_fault, run_jq_full};
 
 #[test]
 fn test_forwarding_filter_echoes_a_string_with_an_undecodable_escape_5308() -> Result<()> {
@@ -44,7 +44,7 @@ fn test_reading_filter_raises_on_a_string_with_an_undecodable_escape_5308() -> R
             let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
             assert_eq!(code, 5, "`{filter}` over {input}: {stdout:?} {stderr}");
             assert!(
-                stderr.contains(want),
+                names_fault(&stderr, want),
                 "`{filter}` over {input} should say {want:?}, got {stderr:?}"
             );
         }

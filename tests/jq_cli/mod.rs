@@ -223,4 +223,5 @@ mod i5555;
 mod i5558;
 mod i5563;
 mod i5572;
+mod i5576;
 mod i5580;

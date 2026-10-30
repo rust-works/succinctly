@@ -33,7 +33,7 @@ use super::m2_gate::can_use_m2_streaming;
 use super::{JqCommand, OnError};
 use crate::output::{
     self, escape_json_string, escape_json_string_ascii, exit_codes, flush_then_err, ColorScheme,
-    DiagStyle, ErrorSink, InputLocation, JsonFormatOpts, LoudFlushWriter, Terminator,
+    DiagStyle, ErrorSink, InputLocation, JsonFormatOpts, LoudFlushWriter, StreamFault, Terminator,
 };
 
 /// One word taken by `--args` (a string) or `--jsonargs` (JSON text), kept
@@ -4505,7 +4505,8 @@ impl FinishedInputs {
 
 /// Whether `--on-error=stop` has seen an error, so nothing more is read or evaluated (#5471).
 fn stopped(on_error: Option<OnError>, sink: &ErrorSink) -> bool {
-    on_error == Some(OnError::Stop) && sink.hit()
+    // #5576: jq's parser reads nothing after the fault it has reported.
+    sink.parse_stopped() || (on_error == Some(OnError::Stop) && sink.hit())
 }
 
 /// The exit code of a run `halt`/`halt_error` ended: its own, unless an input file did not
@@ -5176,6 +5177,22 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
         } else {
             (raw_inputs, None)
         };
+        // #5576: a malformed member this route meets when the filter reads it is worded as jq's
+        // parser words it, from the stream's first fault. The buffers are shared with the loop
+        // below, not copied; a slurped stream's are gone, so it is read again from its files.
+        let raw_inputs = std::rc::Rc::new(raw_inputs);
+        sink.set_stream_fault(match slurped {
+            None => {
+                let raw_inputs = std::rc::Rc::clone(&raw_inputs);
+                StreamFault::new(move || {
+                    jq::jq_stream_fault(raw_inputs.iter().map(Vec::as_slice), 1, 0)
+                })
+            }
+            Some(_) => {
+                let files = files.clone();
+                StreamFault::new(move || reread_stream_fault(&files))
+            }
+        });
 
         // Check if we can use the identity fast path (raw bytes output, no materialization)
         let use_identity_fast_path = expr.is_identity() && output_config.can_use_raw_identity();
@@ -5486,8 +5503,9 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                             // (#1194). Stop emitting results for *this* document,
                             // but fall through to the halt check below and carry
                             // on with the rest of the stream (#355) -- real jq
-                            // stops at the first parse error instead, a
-                            // divergence recorded in
+                            // stops at the first parse error instead, which the
+                            // sink does too when jq's parser also stops on the
+                            // stream (#5576); the rest is a divergence recorded in
                             // `docs/compliance/jq/limitations.md`.
                             let stop = route_write_error(
                                 sink,
@@ -8728,6 +8746,33 @@ fn slurp_fault(
         }
         _ => jq::jq_stream_fault([raw], origin.0, origin.1),
     }
+}
+
+/// jq's parse error for the stream `files` hold, read again from disk one file at a time, or
+/// `None` when jq's parser reads it all or a file cannot be read again (#5576). Stdin has no file
+/// to read again, so a stream slurped from it keeps the evaluator's own wording.
+///
+/// Each file is read as the default route reads it, a BOM skipped at the front of the stream and an
+/// invalid byte substituted, so the position is the one a stream that was not slurped names.
+fn reread_stream_fault(files: &[PathBuf]) -> Option<String> {
+    let mut unreadable = false;
+    let mut at_front = true;
+    let chunks = files.iter().map_while(|path| match std::fs::read(path) {
+        Ok(raw) => {
+            let mut raw = utf8_lossy_document(raw, None);
+            if at_front && !raw.is_empty() {
+                at_front = false;
+                raw.drain(..crate::front_matter::leading_bom_len(&raw));
+            }
+            Some(raw)
+        }
+        Err(_) => {
+            unreadable = true;
+            None
+        }
+    });
+    let fault = jq::jq_stream_fault(chunks, 1, 0);
+    (!unreadable).then_some(fault).flatten()
 }
 
 /// Join every top-level value of every input, in order, into one JSON array
@@ -14087,6 +14132,42 @@ mod tests {
 
     /// #5291: only the front of the whole stream loses a BOM -- the first file with any bytes,
     /// not every file -- and a partial or doubled one is left for the parser to refuse.
+    /// #5576: a slurped stream's fault is read again from its files, a file at a time, as the
+    /// default route reads them; a file that cannot be read again leaves the evaluator's wording.
+    #[test]
+    fn reread_stream_fault_reads_the_files_as_one_stream_5576() {
+        use std::io::Write;
+        let file = |body: &[u8]| {
+            let mut f = tempfile::NamedTempFile::new().expect("temp file");
+            f.write_all(body).expect("write");
+            f
+        };
+        let paths = |files: &[&tempfile::NamedTempFile]| -> Vec<PathBuf> {
+            files.iter().map(|f| f.path().to_path_buf()).collect()
+        };
+        let (a, b, c) = (file(b"1\n2\n"), file(b"3\n{\"a\":1,}\n"), file(b"4\n"));
+        assert_eq!(
+            reread_stream_fault(&paths(&[&a, &b, &c])).as_deref(),
+            Some("Expected another key-value pair at line 4, column 8")
+        );
+        assert_eq!(reread_stream_fault(&paths(&[&a, &c])), None);
+        // The BOM at the front of the stream is skipped; a later file's is a byte of the stream.
+        let bom = file(b"\xef\xbb\xbf1\n");
+        assert_eq!(reread_stream_fault(&paths(&[&bom])), None);
+        assert!(reread_stream_fault(&paths(&[&a, &bom])).is_some());
+        // An invalid byte is substituted before it is counted, as the default route does.
+        let bad = file(b"1\n[1,\xff,,2]\n");
+        assert_eq!(
+            reread_stream_fault(&paths(&[&bad])).as_deref(),
+            Some("Invalid numeric literal at line 2, column 7")
+        );
+        // A file that is gone leaves no fault to name, even when an earlier file has one.
+        let gone = PathBuf::from("/nonexistent-5576/gone.json");
+        assert_eq!(reread_stream_fault(std::slice::from_ref(&gone)), None);
+        assert_eq!(reread_stream_fault(&[gone, b.path().to_path_buf()]), None);
+        assert_eq!(reread_stream_fault(&[]), None);
+    }
+
     #[test]
     fn strip_leading_json_bom_skips_it_once_at_the_stream_front_5291() {
         let stripped = |files: &[&[u8]]| -> Vec<Vec<u8>> {

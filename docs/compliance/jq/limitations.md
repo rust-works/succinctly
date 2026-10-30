@@ -5756,6 +5756,14 @@ $ echo '{invalid}' | jq  empty               # parse error, exit 5
 $ echo '{invalid}' | sjq empty               # no output, exit 0
 ```
 
+Since [#5576](https://github.com/rust-works/succinctly/issues/5576) the error a read member raises is jq's parser's own text and position (`jq: parse error: Expected another key-value pair at line 4, column 8`), not `Invalid JSON text: <reason>`, wherever jq's parser also stops on the stream.
+The stream is read again from its start to find jq's first fault, on that error path alone, so a filter that reads no malformed member pays nothing.
+That fault is the first in the stream, as jq's is, so when the member the filter reads is in a later document it can name an earlier document's fault that the filter never read, after answering the values before the one the filter did read.
+jq stops there, so the run does too: the values before the fault are answered and no later value or file is read.
+Only the first read of a malformed member asks, and a stream jq's parser reads clean (a decode failure jq has no counterpart for) keeps the evaluator's `Invalid JSON text: ...` line and reads on.
+A `--slurp` stream is read again from its files, so one slurped from stdin keeps the evaluator's wording and its `(at <stdin>:N)` marker: the original bytes are gone once the values are joined, and keeping them would hold a second copy of the whole input for the run.
+`input`/`inputs` and `-n` are not on this route, and word their faults as [#5555](https://github.com/rust-works/succinctly/issues/5555) does.
+
 jq builds a DOM before the program runs, so it rejects the document whatever the filter is.
 Reproducing that means validating every document up front, which costs roughly a second
 index-building pass over the input — the whole advantage this crate is built for. `--validate`
@@ -9512,7 +9520,7 @@ behind it for `input`/`inputs` (catchable there, delivered once, `break` after).
 The error is jq's parser's own text and position since [#5555](https://github.com/rust-works/succinctly/issues/5555) (`jq: parse error: Unfinished JSON term at EOF at line 2, column 5`, with no `(at …)` marker from the driver loop; under `input`/`inputs` it is `jq: error (at <file>:<line>): …`).
 It is the first fault in jq's input, counting lines across files, whether the splitter stopped there or on a later one.
 `--stream` reads with jq's streaming parser, and a splitter failure there still reads `Invalid JSON text`.
-A malformed *member* the semi-index accepts is a separate case below: it is found when the filter reads it, and keeps the evaluator's wording and position.
+A malformed *member* the semi-index accepts is a separate case below: it is found when the filter reads it, and is worded as jq's parser words it since [#5576](https://github.com/rust-works/succinctly/issues/5576).
 A parse error stops the whole input stream on both routes, as it
 does in jq: the files after the malformed one are not read ([#4313](https://github.com/rust-works/succinctly/issues/4313);
 the lazy per-file route used to move on to the next file). Under `input`/`inputs`, jq instead
@@ -10245,6 +10253,8 @@ $ echo $?
 
 Two errors stay sticky by default, because jq never raises them where succinctly does: a document that fails to decode (`{"a":tru} {"a":1}`) and a succinctly resource limit (`range: maximum iterations exceeded`, the recursion-depth cap) exit 5 wherever they occur.
 jq stops at a malformed document and exits 5; succinctly reads on past it (it validates only what a filter reads), so without this a clean document after it would turn jq's 5 into 0.
+Since [#5576](https://github.com/rust-works/succinctly/issues/5576) it stops there too, as jq does, when the filter reads the malformed member and jq's parser also stops on the stream; the run reads past it only for a `--slurp` stream from stdin and for a decode failure jq's parser does not share.
+`--on-error=continue` does not change that: jq's parser has no way to read on past a fault, and the splitter's own faults stop the run the same way.
 jq has no such cap and would have produced the capped input's output, so exiting 0 would hide that the output is short.
 
 `--on-error` is a succinctly extension (ADR-0018 rule 5): `continue` keeps every input running and exits 5 if any of them raised, which was the default from [#355](https://github.com/rust-works/succinctly/issues/355) until #5471, and `stop` evaluates nothing after the first failure.
