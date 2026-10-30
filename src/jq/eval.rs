@@ -127850,7 +127850,7 @@ mod tests {
 
     #[cfg(feature = "regex")]
     #[test]
-    fn test_regex_l_flag_stays_a_no_op_on_a_lazy_quantifier_5530() {
+    fn test_regex_l_and_n_keep_their_old_search_where_fancy_regex_disagrees_5530() {
         // `fancy-regex`'s longest-match mode returns the lazy match, where Oniguruma's
         // `ONIG_OPTION_FIND_LONGEST` returns the longest of all the ways to match
         // (`"aa" | match("a*?"; "l")` is `"aa"` in jq 1.7.1). A pattern with a lazy quantifier
@@ -127859,6 +127859,20 @@ mod tests {
         assert_eq!(
             outputs(br#""aa""#, r#"match("a*?"; "l") | [.offset, .string]"#),
             [r#"[0,""]"#]
+        );
+        // A repeat of an empty group keeps its old search under either flag: `fancy-regex` 0.20
+        // mishandles it (`"a" | match("(?:)+?|a"; "n")` is `"a"` in jq, `"ba" |
+        // match("(?:){1,2}a?||"; "l")` is `"a"` at offset 1).
+        assert_eq!(
+            outputs(br#""a""#, r#"[match("(?:)+?|a"; "n") | .string]"#),
+            ["[]"]
+        );
+        assert_eq!(
+            outputs(
+                br#""ba""#,
+                r#"[match("(?:){1,2}a?||"; "l") | [.offset, .string]]"#
+            ),
+            [r#"[[0,""]]"#]
         );
         // `ln` keeps its old route whole too, `n`'s skip-forward search included: fixing `n` alone
         // would change which wrong answer the pair gives (`"aa" | match("a*?"; "ln")` is `"aa"`
