@@ -805,6 +805,8 @@ mod tests {
             gate: Gate::Match,
             gate_secondary: None,
             tools,
+            reps: 3,
+            ratio_from_min: false,
             speedup_primary: Some(1.0),
             speedup_secondary: None,
             secondary_over_primary: None,
