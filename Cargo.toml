@@ -54,7 +54,7 @@ portable-popcount = []
 serde = ["dep:serde"]
 
 # CLI tool features
-cli = ["std", "clap", "rand", "rand_chacha", "anyhow", "serde_json", "memmap2", "md5", "serde", "ctrlc", "regex", "local-zone", "dep:libc"]
+cli = ["std", "clap", "rand", "rand_chacha", "anyhow", "serde_json", "memmap2", "md5", "serde", "regex", "local-zone", "dep:libc"]
 
 # Resolve the system's local time zone for jq's `localtime`/`strflocaltime`
 # (#3054) through jiff: an IANA `TZ` name or the system zone, with the offset
@@ -110,7 +110,7 @@ scalar-yaml = []
 select-stats = ["std"]
 
 # Unified benchmark runner (succinctly bench list/run/orchestrate/nodes/sync/report)
-bench-runner = ["cli", "dep:chrono", "dep:serde_yaml", "dep:toml", "dep:sha2"]
+bench-runner = ["cli", "ctrlc", "dep:chrono", "dep:serde_yaml", "dep:toml", "dep:sha2"]
 
 [dependencies]
 bytemuck = { version = "1.14", features = ["derive"] }
