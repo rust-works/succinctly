@@ -111909,10 +111909,17 @@ fn malformed_later_value_keeps_the_clean_prefix_2961() -> Result<()> {
             // A malformed member the semi-index accepts is found when the filter reads it, and
             // keeps the evaluator's wording.
             let found_when_read = args.contains(&"-s") && args.contains(&t3.as_str());
-            assert!(
-                found_when_read || !stderr.contains("Invalid JSON text"),
-                "{args:?}: {stderr:?}"
-            );
+            if found_when_read {
+                assert!(
+                    stderr.starts_with("jq: error (at ") && stderr.contains("Invalid JSON text:"),
+                    "{args:?}: {stderr:?}"
+                );
+            } else {
+                assert!(
+                    !stderr.contains("Invalid JSON text"),
+                    "{args:?}: {stderr:?}"
+                );
+            }
         }
     }
 

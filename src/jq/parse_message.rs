@@ -518,6 +518,9 @@ pub fn jq_depth_fault(text: &[u8], line: usize, column: usize) -> Option<String>
 /// For a route that has already found its own reason to refuse a document and now has to word it
 /// the way jq's `main` prints it: `jq: parse error: <message>`. The fault is the first in the
 /// stream, so a caller passes the text from where its own check stopped, or all of it.
+///
+/// A byte-order mark is a fault like any other byte: jq skips the one at the front of its input,
+/// so the caller has stripped it (`strip_leading_json_bom`) before the first chunk.
 #[doc(hidden)]
 pub fn jq_stream_fault<'a>(
     chunks: impl IntoIterator<Item = &'a [u8]>,
