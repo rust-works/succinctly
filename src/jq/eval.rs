@@ -25687,20 +25687,25 @@ fn dv_captures_at<'h>(
 /// `suppress_empty`'s skip-forward algorithm only correctly implements the
 /// `n` flag for patterns where an empty match proves no non-empty match is
 /// achievable at that position — true for greedy quantifiers and
-/// alternations whose non-empty branch is preferred first, which covers
-/// every documented jq use of `n`. Lazy quantifiers (`*?`) and alternations
-/// with an empty-matching branch listed first can have a non-empty match at
-/// the *same* position that the skip-forward search never finds, since
-/// finding it needs backtracking semantics (oniguruma's
-/// `ONIG_OPTION_FIND_NOT_EMPTY`) that Rust's non-backtracking `regex` crate
-/// has no equivalent for — the same category of gap as `l`'s missing
-/// `MatchKind::LeftmostLongest` (#920). Tracked as #922. Both gaps are
-/// accepted as permanent, documented limitations — see ADR-0019.
+/// alternations whose non-empty branch is preferred first. Lazy quantifiers
+/// (`*?`) and alternations with an empty-matching branch listed first can
+/// have a non-empty match at the *same* position that the skip-forward
+/// search never finds, since finding it needs backtracking (Oniguruma's
+/// `ONIG_OPTION_FIND_NOT_EMPTY`, #922). The `regex` crate has no such mode,
+/// so `build_regex` compiles a pattern that can match empty with `n` on
+/// `fancy-regex` instead, and likewise one with `l` (Oniguruma's
+/// `ONIG_OPTION_FIND_LONGEST`, #920): both were permanent gaps in ADR-0019
+/// until #5530. What is left of them is recorded in the ADR's amendment and in
+/// `docs/compliance/jq/limitations.md`.
 #[cfg(feature = "regex")]
 struct JqRegex {
     engine: RegexEngine,
     needs_trailing_nl_check: bool,
     suppress_empty: bool,
+    /// `l` on the `fancy-regex` engine: a search returns the longest match anywhere at or after
+    /// its start, not the leftmost one (see [`fancy_longest_captures`]). The payload is the
+    /// longest match the pattern can make, in bytes, when it has a bound.
+    longest: Option<Option<usize>>,
 }
 
 /// Which crate compiled a [`JqRegex`]. Every pattern the `regex` crate accepts stays on it; a jq
@@ -25839,6 +25844,10 @@ impl JqRegex {
                         .map(RegexCaptures::Std),
                 )
             }
+            RegexEngine::Fancy(re) if self.longest.is_some() => {
+                fancy_longest_captures(re, input, start, self.longest.flatten())
+                    .map(|caps| caps.map(RegexCaptures::Fancy))
+            }
             RegexEngine::Fancy(re) => re
                 .captures_from_pos(input, start)
                 .map(|caps| caps.map(RegexCaptures::Fancy))
@@ -25859,6 +25868,45 @@ impl JqRegex {
             RegexEngine::Fancy(re) => re.captures_len(),
         }
     }
+}
+
+/// The match `l` selects: the longest one starting anywhere at or after `start`, the earliest of
+/// equals (#5530). That is Oniguruma's `ONIG_OPTION_FIND_LONGEST`, which keeps scanning start
+/// positions after the first one that matches and replaces its best only with a strictly longer
+/// match, so `"abaa" | match("a|aa|aaa"; "l")` is `"aa"` at offset 2, not `"a"` at offset 0. It is
+/// not POSIX's leftmost-longest, which `fancy-regex`'s own `leftmost_longest` implements: that
+/// supplies the longest match *at* one start, and this walks the starts. Like Oniguruma's, one
+/// search reads the rest of the text, unless `max_len` (the longest match the pattern can make)
+/// is reached first: nothing is longer than that, so the search stops.
+#[cfg(feature = "regex")]
+fn fancy_longest_captures<'h>(
+    re: &fancy_regex::Regex,
+    input: &'h str,
+    start: usize,
+    max_len: Option<usize>,
+) -> Result<Option<fancy_regex::Captures<'h, str>>, EvalError> {
+    let mut best: Option<(usize, fancy_regex::Captures<'h, str>)> = None;
+    let mut from = start;
+    while let Some(caps) = re
+        .captures_from_pos(input, from)
+        .map_err(fancy_match_error)?
+    {
+        let m = caps
+            .get(0)
+            .expect("capture group 0 is always present on a match");
+        let (m_start, len) = (m.start(), m.end() - m.start());
+        if best.as_ref().map_or(true, |(best_len, _)| len > *best_len) {
+            best = Some((len, caps));
+        }
+        if max_len.is_some_and(|max| len >= max) {
+            break;
+        }
+        match input[m_start..].chars().next() {
+            Some(c) => from = m_start + c.len_utf8(),
+            None => break,
+        }
+    }
+    Ok(best.map(|(_, caps)| caps))
 }
 
 /// A `fancy-regex` search that gave up. Oniguruma gives up too, on its own retry limit, with
@@ -26563,6 +26611,7 @@ fn build_regex_uncached<S: EvalSemantics>(
 
     // Apply flags
     let mut suppress_empty = false;
+    let mut longest = false;
     if let Some(flags) = flags {
         let mut case_insensitive = false;
         let mut extended = false;
@@ -26585,12 +26634,11 @@ fn build_regex_uncached<S: EvalSemantics>(
                 'p' => dot_matches_newline = true,
                 'g' => {}                     // global - handled at call site
                 'n' => suppress_empty = true, // suppress empty matches (#730)
-                // Recognized by real jq but not implemented here (#730):
-                // `l` (POSIX leftmost-longest) is accepted as a valid flag
-                // character, silently without effect, rather than raising
-                // the error below — see #920 and ADR-0019 for why this one
-                // stays open permanently.
-                'l' => {}
+                // `l` is Oniguruma's `ONIG_OPTION_FIND_LONGEST`: the longest match anywhere,
+                // where the `regex` crate stops at the first one its alternation order finds.
+                // Only the `fancy-regex` engine has a longest mode (#5530), so a pattern it
+                // cannot take keeps the flag as a no-op (#920, ADR-0019).
+                'l' => longest = true,
                 _ => {
                     // Real jq's own wording, and its own choice: the message
                     // names the whole flags string, not just the offending
@@ -26634,11 +26682,38 @@ fn build_regex_uncached<S: EvalSemantics>(
     let needs_trailing_nl_check =
         S::TAG != EvalTag::Yq && pattern_may_need_trailing_newline_check(&pattern);
 
+    // #5530: `l`, and `n` on a pattern that can match empty, are search policies of the
+    // backtracking engine. The `regex` crate cannot express either, so a pattern that asks for one
+    // goes to `fancy-regex` when it may (see [`build_fancy_regex`]); every other pattern keeps its
+    // engine, its speed and its output.
+    if S::TAG != EvalTag::Yq {
+        let modes = FancyModes {
+            longest,
+            not_empty: suppress_empty && pattern_can_match_empty(&pattern),
+        };
+        if modes.longest || modes.not_empty {
+            // A pattern that asks for `l` and cannot have it keeps its old route whole: the
+            // flags are not independent (`ln` is the longest *non-empty* match anywhere), so
+            // fixing `n` alone would change which wrong answer it gives.
+            if let Some((re, built)) = build_fancy_regex_with::<S>(&pattern, modes)
+                .filter(|(_, built)| built.longest == modes.longest)
+            {
+                return Ok(JqRegex {
+                    engine: RegexEngine::Fancy(re),
+                    needs_trailing_nl_check: false,
+                    suppress_empty,
+                    longest: built.longest.then(|| pattern_max_len(&pattern)),
+                });
+            }
+        }
+    }
+
     match regex::Regex::new(&pattern) {
         Ok(re) => Ok(JqRegex {
             engine: RegexEngine::Std(re),
             needs_trailing_nl_check,
             suppress_empty,
+            longest: None,
         }),
         // #5502: lookaround, backreferences, atomic groups and the like are Oniguruma syntax the
         // `regex` crate refuses. A pattern `fancy-regex` cannot take either keeps the crate's
@@ -26649,6 +26724,7 @@ fn build_regex_uncached<S: EvalSemantics>(
                 // `build_fancy_regex` rewrote `$` itself: see [`prepare_fancy_pattern`].
                 needs_trailing_nl_check: false,
                 suppress_empty,
+                longest: None,
             }),
             None => Err(EvalError::new(format!("invalid regex: {e}"))),
         },
@@ -26672,6 +26748,49 @@ const FANCY_BACKTRACK_LIMIT: usize = 10_000_000;
 /// jq, where `fancy-regex` reads them as word boundaries and nested repeats by default.
 #[cfg(feature = "regex")]
 fn build_fancy_regex<S: EvalSemantics>(pattern: &str) -> Option<fancy_regex::Regex> {
+    build_fancy_regex_with::<S>(pattern, FancyModes::default()).map(|(re, _)| re)
+}
+
+/// The search policies jq's `l` and `n` flags select, which only `fancy-regex` can apply (#5530).
+#[cfg(feature = "regex")]
+#[derive(Clone, Copy, Default)]
+struct FancyModes {
+    /// `l`: `ONIG_OPTION_FIND_LONGEST`, the longest match at the leftmost position.
+    longest: bool,
+    /// `n`: `ONIG_OPTION_FIND_NOT_EMPTY`, an empty match is refused and the search backtracks to
+    /// another way to match at the same position.
+    not_empty: bool,
+}
+
+/// Whether some input may make `pattern` match the empty string, so that `n` could refuse a match
+/// there. A pattern the `regex` crate cannot parse (lookaround) is answered `true`.
+#[cfg(feature = "regex")]
+fn pattern_can_match_empty(pattern: &str) -> bool {
+    regex_syntax::Parser::new()
+        .parse(pattern)
+        .map_or(true, |hir| hir.properties().minimum_len() == Some(0))
+}
+
+/// The most bytes one match of `pattern` can span, when it has a bound. A pattern the `regex`
+/// crate cannot parse (lookaround, a backreference) has none.
+#[cfg(feature = "regex")]
+fn pattern_max_len(pattern: &str) -> Option<usize> {
+    regex_syntax::Parser::new()
+        .parse(pattern)
+        .ok()?
+        .properties()
+        .maximum_len()
+}
+
+/// [`build_fancy_regex`] with the search policies of jq's `l` and `n` flags set, and the modes the
+/// regex was built with: `l` is dropped from a pattern with a lazy quantifier, where
+/// `fancy-regex`'s longest-match mode returns the lazy match (`"a" | match("a*?"; "l")` is `""`
+/// there and `"a"` in jq).
+#[cfg(feature = "regex")]
+fn build_fancy_regex_with<S: EvalSemantics>(
+    pattern: &str,
+    mut modes: FancyModes,
+) -> Option<(fancy_regex::Regex, FancyModes)> {
     if S::TAG == EvalTag::Yq {
         return None;
     }
@@ -26682,11 +26801,38 @@ fn build_fancy_regex<S: EvalSemantics>(pattern: &str) -> Option<fancy_regex::Reg
     {
         return None;
     }
-    fancy_regex::RegexBuilder::new(&pattern)
+    // `fancy-regex` 0.20 mishandles a repeat of an empty non-capturing group under either mode:
+    // `"a" | match("(?:)+?|a"; "n")` is no match where jq has `"a"`, and `"ba" |
+    // match("(?:){1,2}a?||"; "l")` stops at the empty match where jq has the `"a"` at offset 1.
+    // Such a pattern keeps the search it had, a gap only for the shapes #920 and #922 describe.
+    if fancy_repeats_empty_group(&tree.expr) && (modes.not_empty || modes.longest) {
+        return None;
+    }
+    if modes.longest && fancy_has_lazy_repeat(&tree.expr) {
+        modes.longest = false;
+    }
+    let re = fancy_regex::RegexBuilder::new(&pattern)
         .oniguruma_mode(true)
+        .leftmost_longest(modes.longest)
+        .find_not_empty(modes.not_empty)
         .backtrack_limit(FANCY_BACKTRACK_LIMIT)
         .build()
-        .ok()
+        .ok()?;
+    Some((re, modes))
+}
+
+/// Whether `expr` has a lazy quantifier (`*?`, `+?`, `??`, `{n,m}?`).
+#[cfg(feature = "regex")]
+fn fancy_has_lazy_repeat(expr: &fancy_regex::Expr) -> bool {
+    let lazy = |e: &fancy_regex::Expr| matches!(e, fancy_regex::Expr::Repeat { greedy: false, .. });
+    lazy(expr) || expr.has_descendant(lazy)
+}
+
+/// Whether `expr` has a repeat of the empty expression, which `(?:)+?` and `(?:){1,}` parse to.
+#[cfg(feature = "regex")]
+fn fancy_repeats_empty_group(expr: &fancy_regex::Expr) -> bool {
+    let repeats_empty = |e: &fancy_regex::Expr| matches!(e, fancy_regex::Expr::Repeat { child, .. } if matches!(**child, fancy_regex::Expr::Empty));
+    repeats_empty(expr) || expr.has_descendant(repeats_empty)
 }
 
 /// Whether `expr` (one node, not its children) is a construct `fancy-regex` matches the way
@@ -27444,7 +27590,8 @@ fn next_match_step<'h>(
 /// `n`'s skip-forward search only finds a non-empty match reachable by
 /// moving to a *later* position, not one reachable only by backtracking to
 /// a different alternative at the *same* position — see the gap documented
-/// on `JqRegex` (#922).
+/// on `JqRegex` (#922). A pattern `build_regex` sent to `fancy-regex` for `n`
+/// has no such gap: its matches are never empty.
 #[cfg(feature = "regex")]
 fn first_captures<'h>(
     re: &JqRegex,
@@ -27474,8 +27621,8 @@ fn first_captures<'h>(
 /// (`re.suppress_empty`), which excludes zero-length matches from the
 /// result while still using them to advance the search position, matching
 /// jq's own behavior (verified live: `[scan(" *";"n")]` on `"a  b   c"`
-/// keeps only the two non-empty runs of spaces). Same known gap as
-/// `first_captures` (#922).
+/// keeps only the two non-empty runs of spaces). Same gap as
+/// `first_captures` (#922) on the `regex` route.
 ///
 /// In yq mode, additionally reproduces Go `regexp`'s own global-replace
 /// semantics rather than Oniguruma's (#1255): Go skips an empty match that
@@ -127484,10 +127631,9 @@ mod tests {
         }
 
         // `n` (suppress empty matches, implemented below in
-        // test_regex_n_flag_suppresses_empty_matches_730), `l` (POSIX
-        // leftmost-longest, permanently unimplemented — #920, ADR-0019)
-        // and `p` are all real jq flag characters — they must not be
-        // rejected as unknown.
+        // test_regex_n_flag_suppresses_empty_matches_730), `l` (longest
+        // match, #920/#5530, ADR-0019) and `p` are all real jq flag
+        // characters — they must not be rejected as unknown.
         for flags in ["n", "l", "p"] {
             query!(br#""abc""#, &format!(r#"test("abc"; "{flags}")"#),
                 QueryResult::Owned(OwnedValue::Bool(b)) => {
@@ -127592,200 +127738,124 @@ mod tests {
 
     #[cfg(feature = "regex")]
     #[test]
-    fn test_regex_n_flag_known_gap_lazy_quantifier_922() {
-        // #922: `n`'s skip-forward search only finds a non-empty match
-        // reachable by moving to a *later* position, not one reachable only
-        // by backtracking to a different alternative at the *same*
-        // position — which a lazy quantifier or an empty-preferring
-        // alternation can require. Rust's non-backtracking `regex` crate
-        // has no equivalent to oniguruma's `ONIG_OPTION_FIND_NOT_EMPTY`
-        // (same root cause as #920's missing `MatchKind::LeftmostLongest`).
-        // Accepted as a permanent, documented limitation — see ADR-0019.
-        //
-        // This pins the *current, known-divergent* behavior rather than
-        // jq's — verified live against jq 1.7.1, which returns `true`/a
-        // real match/`["x","a","b","b"]` for each case below.
-        query!(br#""x\nabb""#, r#"test("a*?"; "n")"#,
-            QueryResult::Owned(OwnedValue::Bool(b)) => {
-                assert!(!b, "jq says true here (offset 2, \"a\") — known gap, #922");
-            }
-        );
-        query!(br#""x\nabb""#, r#"[match("a*?"; "n")]"#,
-            QueryResult::Owned(OwnedValue::Array(vs)) => {
-                assert!(vs.is_empty(), "jq finds a match at offset 2 — known gap, #922");
-            }
-        );
-        query!(br#""x\nabb""#, r#"[scan(".*?"; "gn")]"#,
-            QueryResult::Owned(OwnedValue::Array(vs)) => {
-                assert!(vs.is_empty(), "jq returns [\"x\",\"a\",\"b\",\"b\"] — known gap, #922");
-            }
-        );
-
-        // The equivalent alternation with branches reordered (non-empty
-        // first) is unaffected — isolates the gap to which alternative the
-        // engine's leftmost-first preference reaches, not to `n` broadly.
-        query!(br#""xa""#, r#"[match("(?:a|)"; "gn")] | length"#,
-            QueryResult::Owned(OwnedValue::Int(n)) => {
-                assert_eq!(n, 1);
-            }
-        );
-        query!(br#""xa""#, r#"[match("(?:|a)"; "gn")]"#,
-            QueryResult::Owned(OwnedValue::Array(vs)) => {
-                assert!(vs.is_empty(), "jq finds a match at offset 1 — known gap, #922");
-            }
-        );
-
-        // #1502: the gap is not specific to test/match/scan — sub/gsub/
-        // split/splits all route through the same first_captures/
-        // global_captures choke point, so they miss the same lazy-
-        // quantifier match and silently no-op instead of replacing/
-        // splitting. Verified live against jq 1.7.1, which returns
-        // "xXXb"/"xXab"/["x","","b"]/[["x","","b"]] for the four cases
-        // below.
-        query!(br#""xaab""#, r#"gsub("a*?"; "X"; "gn")"#,
-            QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "xaab", "jq returns \"xXXb\" — known gap, #922");
-            }
-        );
-        query!(br#""xaab""#, r#"sub("a*?"; "X"; "n")"#,
-            QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "xaab", "jq returns \"xXab\" — known gap, #922");
-            }
-        );
-        query!(br#""xaab""#, r#"[splits("a*?"; "gn")]"#,
-            QueryResult::Owned(OwnedValue::Array(vs)) => {
-                assert_eq!(
-                    vs,
-                    vec![OwnedValue::String("xaab".to_string().into())],
-                    "jq returns [\"x\",\"\",\"b\"] — known gap, #922"
-                );
-            }
-        );
-        query!(br#""xaab""#, r#"[split("a*?"; "gn")]"#,
-            QueryResult::Owned(OwnedValue::Array(vs)) => {
-                assert_eq!(
-                    vs,
-                    vec![OwnedValue::array_from(vec![OwnedValue::String("xaab".to_string().into())])],
-                    "jq returns [[\"x\",\"\",\"b\"]] — known gap, #922"
-                );
-            }
-        );
-
-        // Boundary, greedy half: a greedy quantifier (no backtracking
-        // needed to find the non-empty match) and a `[0-9]*` character
-        // class are both unaffected and agree with jq — the gap is in
-        // *reaching* a non-empty match via backtracking, not in `n`
-        // itself. Complements the reordered-alternation boundary pinned
-        // above.
-        query!(br#""xaab""#, r#"[scan("a*"; "gn")]"#,
-            QueryResult::Owned(OwnedValue::Array(vs)) => {
-                assert_eq!(vs, vec![OwnedValue::String("aa".to_string().into())]);
-            }
-        );
-        query!(br#""a12b""#, r#"[match("[0-9]*"; "gn").string]"#,
-            QueryResult::Owned(OwnedValue::Array(vs)) => {
-                assert_eq!(vs, vec![OwnedValue::String("12".to_string().into())]);
-            }
-        );
-
-        // #1502 review: `capture` is one of ADR-0019's eight regex builtin
-        // families sharing this choke point, and was otherwise untested
-        // under `n` anywhere in this file. It shares the exact no-match
-        // outcome as match/test above: no non-empty match is reachable
-        // without backtracking, so the generator produces no output at
-        // all (not `null`, not an empty object) rather than jq's
-        // `{"x":"a"}`.
-        query!(br#""xaab""#, r#"[capture("(?<x>a*?)"; "n")]"#,
-            QueryResult::Owned(OwnedValue::Array(vs)) => {
-                assert!(vs.is_empty(), "jq returns [{{\"x\":\"a\"}}] — known gap, #922");
-            }
-        );
+    fn test_regex_n_flag_backtracks_to_a_non_empty_match_5530() {
+        // #922, closed by #5530: `n` is Oniguruma's `ONIG_OPTION_FIND_NOT_EMPTY`, which refuses
+        // an empty match and backtracks to another way to match at the *same* position. The
+        // skip-forward search only ever moved to a later position, so a lazy quantifier or an
+        // alternation that lists the empty branch first answered no match. A pattern that can
+        // match empty now goes to `fancy-regex`, whose `find_not_empty` is the same policy.
+        // Every expected value below was captured from jq 1.7.1.
+        let cases: &[(&[u8], &str, &str)] = &[
+            (br#""x\nabb""#, r#"test("a*?"; "n")"#, "true"),
+            (
+                br#""x\nabb""#,
+                r#"[match("a*?"; "n") | [.offset, .string]]"#,
+                r#"[[2,"a"]]"#,
+            ),
+            (
+                br#""x\nabb""#,
+                r#"[scan(".*?"; "gn")]"#,
+                r#"["x","a","b","b"]"#,
+            ),
+            (br#""xa""#, r#"[match("(?:a|)"; "gn")] | length"#, "1"),
+            (
+                br#""xa""#,
+                r#"[match("(?:|a)"; "gn") | [.offset, .string]]"#,
+                r#"[[1,"a"]]"#,
+            ),
+            // sub/gsub/split/splits share the match discovery (#1502).
+            (br#""xaab""#, r#"gsub("a*?"; "X"; "gn")"#, r#""xXXb""#),
+            (br#""xaab""#, r#"sub("a*?"; "X"; "n")"#, r#""xXab""#),
+            (br#""xaab""#, r#"[splits("a*?"; "gn")]"#, r#"["x","","b"]"#),
+            (br#""xaab""#, r#"[split("a*?"; "gn")]"#, r#"[["x","","b"]]"#),
+            (
+                br#""xaab""#,
+                r#"[capture("(?<x>a*?)"; "n")]"#,
+                r#"[{"x":"a"}]"#,
+            ),
+            // A greedy pattern never needed the backtracking and keeps its engine.
+            (br#""xaab""#, r#"[scan("a*"; "gn")]"#, r#"["aa"]"#),
+            (
+                br#""a12b""#,
+                r#"[match("[0-9]*"; "gn").string]"#,
+                r#"["12"]"#,
+            ),
+        ];
+        for (json, filter, expected) in cases {
+            assert_eq!(outputs(json, filter), [*expected], "{filter}");
+        }
     }
 
     #[cfg(feature = "regex")]
     #[test]
-    fn test_regex_l_flag_known_gap_920() {
-        // #920: jq's `l` flag switches from Perl-style leftmost-first to
-        // POSIX leftmost-longest matching (real oniguruma), applied
-        // recursively to every subexpression. Rust's `regex`/
-        // `regex-automata` stack has no `MatchKind::LeftmostLongest`
-        // implementation to switch to (the crate's own maintainers left
-        // the door open but never built it), so succinctly accepts `l` as
-        // valid flag syntax — see test_regex_unknown_flags_rejected_730 —
-        // but it has no effect on match semantics. Accepted as a
-        // permanent, documented limitation — see ADR-0019.
-        //
-        // This pins the *current, known-divergent* behavior rather than
-        // jq's — verified live against jq 1.7.1, which returns "aaa"/"X"/
-        // ["aaa"]/["aaa","a"] for the four cases below (`l` reorders a
-        // top-level alternation to prefer the longest branch at each
-        // position; succinctly keeps its own leftmost-first order and
-        // stops at the first alternative that matches, "a").
-        query!(br#""aaa""#, r#"match("a|aa|aaa"; "l").string"#,
-            QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "a", "jq returns \"aaa\" — known gap, #920");
-            }
-        );
-        query!(br#""aaa""#, r#"sub("a|aa|aaa"; "X"; "l")"#,
-            QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "Xaa", "jq returns \"X\" — known gap, #920");
-            }
-        );
-        query!(br#""aaa""#, r#"[scan("a|aa|aaa"; "gl")]"#,
-            QueryResult::Owned(OwnedValue::Array(vs)) => {
-                assert_eq!(
-                    vs,
-                    vec![
-                        OwnedValue::String("a".to_string().into()),
-                        OwnedValue::String("a".to_string().into()),
-                        OwnedValue::String("a".to_string().into()),
-                    ],
-                    "jq returns [\"aaa\"] — known gap, #920"
-                );
-            }
-        );
-        query!(br#""aaaa""#, r#"[match("a|aa|aaa"; "gl").string]"#,
-            QueryResult::Owned(OwnedValue::Array(vs)) => {
-                assert_eq!(
-                    vs,
-                    vec![
-                        OwnedValue::String("a".to_string().into()),
-                        OwnedValue::String("a".to_string().into()),
-                        OwnedValue::String("a".to_string().into()),
-                        OwnedValue::String("a".to_string().into()),
-                    ],
-                    "jq returns [\"aaa\",\"a\"] — known gap, #920"
-                );
-            }
-        );
-
-        // #1502 review: `capture` shares the same no-op `l` arm as
-        // match/sub above and was otherwise untested under `l` anywhere
-        // in this file.
-        query!(br#""aaa""#, r#"capture("(?<x>a|aa|aaa)"; "l")"#,
-            QueryResult::Owned(OwnedValue::Object(o)) => {
-                assert_eq!(
-                    o.get("x"),
-                    Some(&OwnedValue::String("a".to_string().into())),
-                    "jq binds .x to \"aaa\" — known gap, #920"
-                );
-            }
-        );
-
-        // #1502 review: `l` and `n` are independent no-ops/approximations
-        // (`build_regex`'s `'l' => {}` arm and `global_captures`'s
-        // suppress-empty search are unrelated code paths), so combining
-        // them composes into a third, still-silent divergence rather than
-        // either flag masking the other. Verified live against jq 1.7.1,
-        // which returns "aaa" for both flag orderings (order is
-        // insignificant to jq's flag parsing).
-        for flags in ["ln", "nl"] {
-            query!(br#""aaa""#, &format!(r#"match("a|aa|aaa"; "{flags}").string"#),
-                QueryResult::Owned(OwnedValue::String(s)) => {
-                    assert_eq!(s, "a", "jq returns \"aaa\" — known gap, #920, flags: {flags:?}");
-                }
-            );
+    fn test_regex_l_flag_finds_the_longest_match_anywhere_5530() {
+        // #920, closed by #5530: `l` is Oniguruma's `ONIG_OPTION_FIND_LONGEST`. A search keeps
+        // scanning start positions after the first match and replaces its best only with a
+        // strictly longer one, so the winner can start after the leftmost match: `"abaa"` is
+        // matched by `"aa"` at offset 2, not by `"a"` at offset 0. Every expected value below
+        // was captured from jq 1.7.1.
+        let cases: &[(&[u8], &str, &str)] = &[
+            (br#""aaa""#, r#"match("a|aa|aaa"; "l").string"#, r#""aaa""#),
+            (br#""aaa""#, r#"sub("a|aa|aaa"; "X"; "l")"#, r#""X""#),
+            (br#""aaa""#, r#"[scan("a|aa|aaa"; "gl")]"#, r#"["aaa"]"#),
+            (
+                br#""aaaa""#,
+                r#"[match("a|aa|aaa"; "gl").string]"#,
+                r#"["aaa","a"]"#,
+            ),
+            (
+                br#""aaa""#,
+                r#"capture("(?<x>a|aa|aaa)"; "l")"#,
+                r#"{"x":"aaa"}"#,
+            ),
+            (
+                br#""abaa""#,
+                r#"[match("a|aa|aaa"; "l") | [.offset, .string]]"#,
+                r#"[[2,"aa"]]"#,
+            ),
+            (
+                br#""abaa""#,
+                r#"[match("a|aa|aaa"; "gl") | [.offset, .string]]"#,
+                r#"[[2,"aa"]]"#,
+            ),
+            // The longest of several parses of one start, with that parse's captures.
+            (
+                br#""abcd""#,
+                r#"match("(a|ab)(c|bcd)"; "l") | [.string, (.captures | map(.string))]"#,
+                r#"["abcd",["a","bcd"]]"#,
+            ),
+            // Empty matches: nothing is longer than the first, so it stays.
+            (
+                br#""xyz""#,
+                r#"[match("x*"; "gl") | [.offset, .length]]"#,
+                "[[0,1],[1,0],[2,0],[3,0]]",
+            ),
+            // `l` and `n` together, in either order.
+            (br#""aaa""#, r#"match("a|aa|aaa"; "ln").string"#, r#""aaa""#),
+            (br#""aaa""#, r#"match("a|aa|aaa"; "nl").string"#, r#""aaa""#),
+        ];
+        for (json, filter, expected) in cases {
+            assert_eq!(outputs(json, filter), [*expected], "{filter}");
         }
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_regex_l_flag_stays_a_no_op_on_a_lazy_quantifier_5530() {
+        // `fancy-regex`'s longest-match mode returns the lazy match, where Oniguruma's
+        // `ONIG_OPTION_FIND_LONGEST` returns the longest of all the ways to match
+        // (`"aa" | match("a*?"; "l")` is `"aa"` in jq 1.7.1). A pattern with a lazy quantifier
+        // therefore keeps the `regex` crate and `l` has no effect on it (#920, ADR-0019). This
+        // pins that boundary, not jq's value: when it is closed this test is the one to flip.
+        assert_eq!(
+            outputs(br#""aa""#, r#"match("a*?"; "l") | [.offset, .string]"#),
+            [r#"[0,""]"#]
+        );
+        // With `n` the empty match is still refused, by the `fancy-regex` route.
+        assert_eq!(
+            outputs(br#""aa""#, r#"match("a*?"; "ln") | [.offset, .string]"#),
+            [r#"[0,"a"]"#]
+        );
     }
 
     #[cfg(feature = "regex")]

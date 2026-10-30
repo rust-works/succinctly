@@ -65,7 +65,7 @@ local-zone = ["std", "dep:jiff"]
 
 # Enable regex support in jq query language. `fancy-regex` compiles only the jq
 # patterns the `regex` crate refuses for lookaround or a backreference (#5502).
-regex = ["dep:regex", "dep:fancy-regex"]
+regex = ["dep:regex", "dep:regex-syntax", "dep:fancy-regex"]
 
 # Test features (not for production)
 large-tests = []    # 1G bitvector tests (~125MB RAM)
@@ -120,7 +120,8 @@ memmap2 = { version = "0.9", optional = true }
 tempfile = { version = "3.10", optional = true }
 serde = { version = "1.0", default-features = false, features = ["alloc", "derive"], optional = true }
 regex = { version = "1.10", optional = true }
-fancy-regex = { version = "0.20", optional = true }
+regex-syntax = { version = "0.8", optional = true }
+fancy-regex = { version = "0.20", optional = true, features = ["leftmost_longest"] }
 
 # CLI dependencies (optional, only for binary)
 clap = { version = "4.5", features = ["derive"], optional = true }
