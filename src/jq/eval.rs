@@ -13066,6 +13066,11 @@ fn closed_unary_builtin<S: EvalSemantics>(stage: &Expr, input: &OwnedValue) -> O
     if S::TAG != EvalTag::Jq || !is_closed_unary_builtin(stage) {
         return None;
     }
+    if let Expr::Builtin(builtin) = unwrap_paren(stage) {
+        if let Some(answer) = owned_unary_math::<S>(builtin, input) {
+            return Some(answer);
+        }
+    }
     match eval_owned_expr_full::<S>(unwrap_paren(stage), input, false) {
         Ok(Some((value, None))) => Some(value),
         _ => None,
@@ -95992,6 +95997,47 @@ pub(crate) fn integral_f64_result<S: EvalSemantics>(f: f64) -> OwnedValue {
     } else {
         OwnedValue::Float(f)
     }
+}
+
+/// The answer of `floor`, `ceil`, `round`, `trunc`, `sqrt` or `fabs` for the finite double `n`, as
+/// `builtin_floor` and its siblings build it (#5593): the one mapping from builtin to libm call, shared
+/// by those, by the cursor arm of the generic evaluator and by [`owned_unary_math`]. `None` for any
+/// other builtin.
+pub(crate) fn unary_math_apply<S: EvalSemantics>(builtin: &Builtin, n: f64) -> Option<OwnedValue> {
+    Some(match builtin {
+        Builtin::Floor => integral_f64_result::<S>(math::floor(n)),
+        Builtin::Ceil => integral_f64_result::<S>(math::ceil(n)),
+        Builtin::Round => integral_f64_result::<S>(math::round(n)),
+        Builtin::Trunc => integral_f64_result::<S>(math::trunc(n)),
+        Builtin::Sqrt => OwnedValue::Float(math::sqrt(n)),
+        Builtin::Fabs => OwnedValue::Float(math::fabs(n)),
+        _ => return None,
+    })
+}
+
+/// [`unary_math_apply`] of an owned number (#5601), so a computed or bound number does not take the
+/// reindex bridge to meet one libm call. The double is `Int`'s or `Float`'s own, or a literal's read
+/// from its text. `None` (the caller's route, unchanged)
+/// for yq mode, a value that is not a number, which keeps the evaluator's error, and a non-finite
+/// double.
+pub(crate) fn owned_unary_math<S: EvalSemantics>(
+    builtin: &Builtin,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    let n = match input {
+        OwnedValue::Int(_) | OwnedValue::Float(_) => input.as_f64(),
+        // A literal's double is read from its text, as `json_number_f64` reads a document's:
+        // `-0` is `Int(0)` in the parsed form and has lost its sign there.
+        OwnedValue::NumberLiteral(_, text) => {
+            super::value::document_number_f64::<S>(text.as_bytes(), || input.as_f64())
+        }
+        _ => None,
+    }
+    .filter(|n| n.is_finite())?;
+    unary_math_apply::<S>(builtin, n)
 }
 
 /// Builtin: floor
