@@ -497,20 +497,6 @@ fn stack_reaches(text: &[u8], limit: usize) -> bool {
     false
 }
 
-/// jq's message when its parser, reading `text` from `line` and `column` of its input (as
-/// [`jq_input_depth_fault`] places it), refuses a bracket past [`JQ_MAX_PARSING_DEPTH`] before
-/// anything else stops it, or `None` (#5497).
-///
-/// For text the splitter could not delimit (a container left open, say): jq still meets its
-/// depth limit first when the refused bracket comes before the fault, and the message is jq's
-/// parse error rather than the splitter's.
-#[doc(hidden)]
-pub fn jq_depth_fault(text: &[u8], line: usize, column: usize) -> Option<String> {
-    jq_parse_fault(text, line, column, JQ_MAX_PARSING_DEPTH)
-        .filter(|fault| fault.depth)
-        .map(|fault| fault.message)
-}
-
 /// jq's message when its parser, reading `chunks` in order from `line` and `column` of its input
 /// as one stream of top-level values, stops on a fault, or `None` when it reads every value
 /// (#5555).

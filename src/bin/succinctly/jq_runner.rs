@@ -5136,6 +5136,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                     sink.report_parse_error(&message);
                     return Ok(DiagStyle::Jq.error_exit_code());
                 }
+                // patchcov: coverage tolerate reason="defensive: the splitter stops only at a fault jq's parser also meets, so `slurp_fault` names one; kept so a disagreement between them prints the old line-0 message rather than none (#5555)"
                 Err(SlurpFailure::Unsplittable(None)) => {
                     let file = files.first().map(|p| p.to_string_lossy().to_string());
                     sink.report(
@@ -5144,7 +5145,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                         &InputLocation::at(file.as_deref(), 0),
                     );
                     return Ok(DiagStyle::Jq.error_exit_code());
-                }
+                } // patchcov: coverage end
             }
         } else {
             (raw_inputs, None)
@@ -5539,10 +5540,12 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                     sink.report_parse_error(&message);
                     break;
                 }
+                // patchcov: coverage tolerate reason="defensive: the splitter stops only at a fault jq's parser also meets, so `jq_stream_fault` names one; kept so a disagreement between them prints the old line placement rather than none (#5555)"
                 let at =
                     InputLocation::at(filename.as_deref(), parse_error_line(raw, offset, seam));
                 sink.report(DiagStyle::Jq, &EvalError::new("Invalid JSON text"), &at);
                 break;
+                // patchcov: coverage end
             }
         }
     } else {
@@ -5621,10 +5624,11 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                             sink.report(DiagStyle::Jq, &err, &at);
                         }
                         Some(_) => sink.report_parse_error(&err.message),
+                        // patchcov: coverage tolerate reason="defensive: the only malformed document `get_inputs` returns here is a slurped stream, which carries the read that met its fault unless `slurp_fault_at` finds none (unreachable, see there); kept as the line-0 placement every other malformed document gets (#5555)"
                         None => {
                             let at = InputLocation::at(name_of(0).as_deref(), 0);
                             sink.report(DiagStyle::Jq, &err, &at);
-                        }
+                        } // patchcov: coverage end
                     }
                     return Ok(DiagStyle::Jq.error_exit_code());
                 }
@@ -6797,7 +6801,7 @@ fn get_inputs(
                         // #5555: the read that met the fault, as the resuming route places it.
                         return Ok(Err(match slurp_fault_at(&raw, seam, parsed.len()) {
                             Some(line) => malformed.at_stream_fault(src, line),
-                            None => malformed,
+                            None => malformed, // patchcov: coverage tolerate-line reason="unreachable: the prefix parse stopped at value `parsed`, which the splitter either delimits or stopped at, so a read is found; kept so a disagreement falls back to line 0 (#5555)"
                         }
                         .into()));
                     }
