@@ -4817,9 +4817,11 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     // Configure output
     let output_config = OutputConfig::from_args(&args);
 
-    // #5553: under `-C` jq colors the line `debug` writes to stderr too, compact (it drops the
-    // indent flags and keeps color, sorting and ASCII).
-    if output_config.color_output {
+    // #5553, #5558: jq writes the line `debug`/`debug(msg)` send to stderr with its dump options
+    // minus the indent flags, so `-C` colors it and `-S`/`-a` sort and escape it. Without any of
+    // the three the library's own compact rendering is already that line.
+    if output_config.color_output || output_config.sort_keys || output_config.ascii_output {
+        let colored = output_config.color_output;
         let scheme = output_config.color_scheme.clone();
         let (sort_keys, ascii, convention) = (
             output_config.sort_keys,
@@ -4833,9 +4835,14 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 ascii,
                 convention,
                 json_sourced: false,
-                mark_nan_for_color: true,
+                mark_nan_for_color: colored,
             };
-            output::colorize_json(&output::format_json(line, &opts), &scheme)
+            let text = output::format_json(line, &opts);
+            if colored {
+                output::colorize_json(&text, &scheme)
+            } else {
+                text
+            }
         });
     }
 
