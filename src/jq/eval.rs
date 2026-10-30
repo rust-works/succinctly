@@ -25818,9 +25818,22 @@ const JQ_WORD_CLASS_IN_CLASS: &str = r"\p{Alphabetic}\p{M}\p{Nd}\p{Pc}";
 /// nor is an escaped bracket. A bracket-shaped `[:word:]` (lowercase letters, optionally led by `^`) whose name is not
 /// a POSIX class is an error, as in jq (`invalid POSIX bracket type`); `ascii` and `xdigit` are
 /// ASCII in both engines and are left to the crate.
+///
+/// The same pass takes the other spellings the `regex` crate reads differently from Oniguruma
+/// (#5529): `\<` and `\>` are the literal characters (the crate's word-boundary assertions),
+/// `\b{start}` and its three siblings are `\b` and a literal `{...}`, and a Python-style
+/// `(?P...)` group is an error. A scan of the raw text, so it does not know the `x` flag's
+/// comments: a `(?P` inside one is refused here and ignored by jq.
 #[cfg(feature = "regex")]
 fn translate_posix_brackets(pattern: &str) -> Result<std::borrow::Cow<'_, str>, EvalError> {
-    if !pattern.contains('[') && !pattern.contains("\\w") && !pattern.contains("\\W") {
+    if !pattern.contains('[')
+        && !pattern.contains("\\w")
+        && !pattern.contains("\\W")
+        && !pattern.contains("\\<")
+        && !pattern.contains("\\>")
+        && !pattern.contains("\\b{")
+        && !pattern.contains("(?P")
+    {
         return Ok(std::borrow::Cow::Borrowed(pattern));
     }
     let chars: Vec<char> = pattern.chars().collect();
@@ -25854,6 +25867,31 @@ fn translate_posix_brackets(pattern: &str) -> Result<std::borrow::Cow<'_, str>, 
                 i += 2;
                 continue;
             }
+            // #5529: the `regex` crate's `\b{start}`, `\b{end}`, `\b{start-half}` and
+            // `\b{end-half}` assertions are `\b` and a literal `{...}` run in Oniguruma.
+            if chars.get(i + 1) == Some(&'b') && chars.get(i + 2) == Some(&'{') {
+                let rest: String = chars[i + 3..].iter().take(11).collect();
+                if ["start}", "end}", "start-half}", "end-half}"]
+                    .iter()
+                    .any(|name| rest.starts_with(name))
+                {
+                    out.push_str("\\b\\{");
+                    changed = true;
+                    at_start = false;
+                    i += 3;
+                    continue;
+                }
+            }
+            // #5529: Oniguruma's Perl syntax has no word-boundary assertions here, so `\<` and
+            // `\>` are the literal characters. The `regex` crate (1.10+) reads them as
+            // start-of-word and end-of-word.
+            if let Some(&lit @ ('<' | '>')) = chars.get(i + 1) {
+                out.push(lit);
+                changed = true;
+                at_start = false;
+                i += 2;
+                continue;
+            }
             out.push(c);
             if let Some(&next) = chars.get(i + 1) {
                 out.push(next);
@@ -25863,6 +25901,11 @@ fn translate_posix_brackets(pattern: &str) -> Result<std::borrow::Cow<'_, str>, 
             continue;
         }
         if depth == 0 {
+            // #5529: jq refuses Python-style named groups (`(?P<n>...)`, `(?P=n)`, `(?P>n)`);
+            // the `regex` crate accepts the first and would answer where jq errors.
+            if c == '(' && chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'P') {
+                return Err(EvalError::new("invalid regex: undefined group option"));
+            }
             if c == '[' {
                 depth = 1;
                 at_start = true;
@@ -25953,10 +25996,21 @@ fn build_regex<S: EvalSemantics>(pattern: &str, flags: Option<&str>) -> Result<J
     // #5367: jq's classes are Oniguruma's, Unicode-aware, and rewritten here. yq's are Go's
     // `regexp`, a different syntax from the crate's throughout (#5374, #5388), so its pattern is
     // read and re-written whole.
+    //
+    // A refusal from the jq pre-pass waits until the flags string has been read (#5529): jq checks
+    // the modifiers before it compiles the pattern, so `test("(?P<n>a)"; "z")` is the modifier
+    // error.
+    let mut deferred_refusal = None;
     let mut pattern = if S::TAG == EvalTag::Yq {
         super::go_regex::translate(pattern).map_err(EvalError::new)?
     } else {
-        translate_posix_brackets(pattern)?.into_owned()
+        match translate_posix_brackets(pattern) {
+            Ok(translated) => translated.into_owned(),
+            Err(refusal) => {
+                deferred_refusal = Some(refusal);
+                String::new()
+            }
+        }
     };
 
     // Apply flags
@@ -26016,6 +26070,10 @@ fn build_regex<S: EvalSemantics>(pattern: &str, flags: Option<&str>) -> Result<J
             prefix.push(')');
             pattern = format!("{prefix}{pattern}");
         }
+    }
+
+    if let Some(refusal) = deferred_refusal {
+        return Err(refusal);
     }
 
     // jq's un-flagged `$` matches at the absolute end of the string, or
@@ -125178,7 +125236,7 @@ mod tests {
     #[cfg(feature = "regex")]
     #[test]
     fn test_regex_capture() {
-        query!(br#""foo bar""#, r#"capture("(?P<first>\\w+) (?P<second>\\w+)")"#,
+        query!(br#""foo bar""#, r#"capture("(?<first>\\w+) (?<second>\\w+)")"#,
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 assert_eq!(obj.get("first"), Some(&OwnedValue::String("foo".to_string().into())));
                 assert_eq!(obj.get("second"), Some(&OwnedValue::String("bar".to_string().into())));
@@ -125699,7 +125757,7 @@ mod tests {
             }
         );
 
-        query!(br#""foo bar""#, r#"capture("(?P<first>\\w+) (?P<second>\\w+)"; null)"#,
+        query!(br#""foo bar""#, r#"capture("(?<first>\\w+) (?<second>\\w+)"; null)"#,
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 assert_eq!(obj.get("first"), Some(&OwnedValue::String("foo".to_string().into())));
             }
