@@ -30,6 +30,14 @@ fn test_text_stages_render_a_value_past_384_levels_5554() -> Result<()> {
         ("f(500) | @text | length", "533\n"),
         ("f(500) | @json | length", "533\n"),
         (r#"f(500) | "a\(.)b\(.)c" | length"#, "1069\n"),
+        // A leading group is the same stages, and the rest of the pipe still runs.
+        ("f(400) | (tojson | length)", "533\n"),
+        ("f(400) | (tojson | ascii_downcase) | length", "533\n"),
+        // A consumer that stops early stops the peeled rest too.
+        ("first(f(400) | tojson | length)", "533\n"),
+        ("[limit(1; f(500) | tojson | length, 7)]", "[533]\n"),
+        ("isempty(f(400) | tojson)", "false\n"),
+        (r#"f(500) | "\(.)\(.)\(.)" | length"#, "1599\n"),
         // The marker is where jq puts it, 256 levels down.
         (
             "f(500) | tojson | .[250:300]",

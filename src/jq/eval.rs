@@ -12544,19 +12544,27 @@ fn text_peel_after_refusal<S: EvalSemantics>(
     if S::TAG != EvalTag::Jq || !refused.is_resource_limit() {
         return None;
     }
-    let (stage, rest) = match unwrap_paren(expr) {
-        Expr::Pipe(stages) => {
-            let (first, tail) = stages.split_first()?;
-            let rest = match tail {
-                [] => None,
-                [only] => Some(only.clone()),
-                _ => Some(Expr::Pipe(tail.to_vec().into())),
-            };
-            (first, rest)
-        }
-        other => (other, None),
+    // The first stage and the stages after it, a leading `(a | b)` read as `a | b`: jq's pipe
+    // is associative, so the stages are the same.
+    let mut stage = unwrap_paren(expr);
+    let mut after: Vec<&Expr> = Vec::new();
+    while let Expr::Pipe(stages) = stage {
+        let (first, tail) = stages.split_first()?;
+        after.splice(0..0, tail);
+        stage = unwrap_paren(first);
+    }
+    let rest = match after.as_slice() {
+        [] => None,
+        [only] => Some((*only).clone()),
+        _ => Some(Expr::Pipe(
+            after
+                .iter()
+                .map(|stage| (*stage).clone())
+                .collect::<Vec<_>>()
+                .into(),
+        )),
     };
-    let text = match unwrap_paren(stage) {
+    let text = match stage {
         Expr::Builtin(Builtin::ToJson) | Expr::Format(FormatType::Json) => {
             owned_value_to_json::<S>(input)
         }
@@ -12565,11 +12573,15 @@ fn text_peel_after_refusal<S: EvalSemantics>(
         }
         Expr::StringInterpolation(parts) => {
             let mut text = String::new();
+            // Each `\(.)` slot is the same text: walk the value once, not once per slot.
+            let mut value_text: Option<String> = None;
             for part in parts {
                 match part {
                     StringPart::Literal(literal) => text.push_str(literal),
                     StringPart::Expr(inner) if matches!(unwrap_paren(inner), Expr::Identity) => {
-                        text.push_str(&owned_to_string::<S>(input));
+                        text.push_str(
+                            value_text.get_or_insert_with(|| owned_to_string::<S>(input)),
+                        );
                     }
                     StringPart::Expr(_) => return None,
                 }
@@ -114803,6 +114815,57 @@ mod tests {
             matches!(rest.rest().rest().plan::<JqSemantics>(), TailPlan::Copy),
             "a lone stage is handed on as itself, not kept"
         );
+    }
+
+    /// #5554: the text peel asks only after a depth refusal, in jq mode, and only for a first
+    /// stage that renders its input, reading a leading `(a | b)` as `a | b`.
+    #[test]
+    fn test_text_peel_asks_only_after_a_depth_refusal_in_jq_mode_5554() {
+        let refused = EvalError::resource_limit("nesting depth exceeds limit of 384");
+        let input = OwnedValue::Null;
+        let peel = |source: &str, error: &EvalError| {
+            text_peel_after_refusal::<JqSemantics>(
+                &crate::jq::parse(source).unwrap(),
+                &input,
+                error,
+            )
+        };
+        let text = |peeled: &(OwnedValue, Option<Expr>)| match &peeled.0 {
+            OwnedValue::String(text) => text.to_string(),
+            other => unreachable!("{other:?}"),
+        };
+        // A refusal in jq mode: the stage's text, with nothing left of a lone stage.
+        let lone = peel("tojson", &refused).unwrap();
+        assert_eq!((text(&lone).as_str(), lone.1.is_none()), ("null", true));
+        // Any other error is not a refusal: the bridge's own answer stands.
+        assert!(peel("tojson", &EvalError::new("another error")).is_none());
+        // yq's writers print the whole value, so nothing is peeled there.
+        let yq = crate::jq::parse("tojson").unwrap();
+        assert!(text_peel_after_refusal::<YqSemantics>(&yq, &input, &refused).is_none());
+        // A first stage that does not only render its input, or an interpolation slot that reads
+        // more than `.`, is not peeled.
+        for source in [
+            "length",
+            ". + 1",
+            r#""\(.a)""#,
+            "tojson | tojson | 1 | tostring",
+        ] {
+            assert_eq!(
+                peel(source, &refused).is_some(),
+                source.starts_with("tojson"),
+                "{source}"
+            );
+        }
+        // The rest of the pipe is what follows the stage, a leading group read as its stages.
+        let grouped = peel("(tojson | length) | . + 1 | . + 2", &refused).unwrap();
+        let rest = grouped.1.unwrap();
+        assert!(
+            matches!(&rest, Expr::Pipe(stages) if stages.len() == 3),
+            "{rest:?}"
+        );
+        // Each `\(.)` slot is the same text.
+        let slots = peel(r#""a\(.)b\(.)c""#, &refused).unwrap();
+        assert_eq!(text(&slots), "anullbnullc");
     }
 
     /// #5441: a split tail is built for each call, so the facts its pipe is
