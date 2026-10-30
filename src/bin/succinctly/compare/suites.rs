@@ -194,8 +194,9 @@ mod tests {
     #[test]
     fn only_runs_the_cases_at_the_listed_lines() {
         let text = ".\n1\n1\n\n.\n2\n2\n";
-        let at =
-            |lines: &[&str]| -> BTreeSet<String> { lines.iter().map(|s| s.to_string()).collect() };
+        let at = |lines: &[&str]| -> BTreeSet<String> {
+            lines.iter().map(|s| (*s).to_string()).collect()
+        };
         let tool = sh("cat; echo ok");
         let run_only = |only: &BTreeSet<String>| {
             run("t", text, &tool, &tool, Some(only), Path::new("."))
@@ -206,6 +207,6 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(run_only(&at(&["5"])), ["t:5"]);
-        assert!(run_only(&at(&["2"])).is_empty());
+        assert_eq!(run_only(&at(&["2"])), Vec::<String>::new());
     }
 }
