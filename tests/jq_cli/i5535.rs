@@ -63,3 +63,19 @@ fn test_what_is_not_a_repetition_of_an_assertion_is_unchanged_5535() -> Result<(
     }
     Ok(())
 }
+
+#[test]
+fn test_extended_mode_comments_are_not_scanned_5535() -> Result<()> {
+    // The scan cannot see the `x` flag's comments, so under it (the flag or an inline `(?x)`) the
+    // check stands down rather than refuse a commented-out fragment; jq returns `true` for both.
+    for filter in [
+        "\"a\" | test(\"a # ^*\\n\"; \"x\")",
+        "\"a\" | test(\"(?x) a # $+\\n\")",
+        "\"a\" | test(\"(?ix: a # \\\\b?\\n)\")",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(stdout.trim_end(), "true", "{filter}: stderr={stderr:?}");
+        assert_eq!(code, 0, "{filter}");
+    }
+    Ok(())
+}

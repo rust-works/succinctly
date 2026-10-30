@@ -7301,6 +7301,7 @@ The crate's `\b{start}`, `\b{end}`, `\b{start-half}` and `\b{end-half}` are `\b`
 These rewrites read the raw pattern text, so under the `x` flag a `(?P` inside a `#` comment is refused here and ignored by jq.
 A repetition operator right after an assertion (`^*`, `$+`, `\b?`, `\A{2}`, `\z*`) is an error in jq (`target of repeat operator is invalid`) and is refused here too (#5535), where the `regex` crate repeats the empty match and answered `true`.
 Only a direct repetition is refused: a non-capturing group of an assertion (`(?:^)*`), which jq also refuses, is still accepted here.
+Under the `x` flag, or a pattern with an inline flag group naming `x`, the check stands down, because the scan cannot see the mode's comments and ignored blanks; `test(\"^ *\"; \"x\")` is an error in jq and `true` here.
 
 ## Regex flags `l` and `n`
 
