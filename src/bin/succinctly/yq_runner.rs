@@ -14237,6 +14237,19 @@ mod tests {
     /// involved.
     #[test]
     fn emit_yaml_value_panics_past_nesting_depth_limit_1017() {
+        // 8 MiB, four times a test thread's default: about 21 KiB for each of the 383 levels,
+        // still a pin on a runaway frame. The default 2 MiB left about 5 KiB a level, a margin that
+        // coverage instrumentation and the code around it moved enough to overflow on Linux ARM64
+        // in a change that touched no emitter code (#5531).
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(emit_yaml_value_panics_past_nesting_depth_limit_1017_body)
+            .expect("spawn")
+            .join()
+            .expect("the body asserts the panic itself");
+    }
+
+    fn emit_yaml_value_panics_past_nesting_depth_limit_1017_body() {
         use succinctly::jq::MAX_VALUE_TREE_DEPTH;
 
         let config = OutputConfig {
