@@ -7404,10 +7404,9 @@ Every other pattern keeps the `regex` crate, its speed and its output, and yq mo
   Pinned by `test_regex_l_and_n_keep_their_old_search_where_fancy_regex_disagrees_5530` and `test_l_flag_on_a_lazy_quantifier_is_still_a_no_op_5530`.
 - **`n` backtracks to a non-empty match at the same position.**
   `ONIG_OPTION_FIND_NOT_EMPTY` refuses an empty match and tries another way to match where it stands, which the skip-forward search could not: `"xaab" | gsub("a*?";"X";"gn")` is `"xXXb"` in jq and now here, where it was a no-op.
-- **A repeat of the empty group keeps the old search under either flag.**
-  `fancy-regex` mishandles `(?:)+?` and `(?:){1,2}` in both of its modes: `"a" | match("(?:)+?|a";"n")` is no match where jq has `"a"`, and `"ba" | match("(?:){1,2}a?||";"l")` stops at the empty match where jq has `"a"` at offset 1.
-  A pattern containing one is not routed to it, so it behaves as before #5530.
-  Nobody writes this (the group matches nothing and the repeat repeats nothing), and `()` is not affected.
+- **A repeat of an empty non-capturing group keeps the old search under either flag.**
+  `fancy-regex`'s parser refuses `(?:)+?` and `(?:){1,2}` (`TargetNotRepeatable`), where the `regex` crate and Oniguruma accept them, so a pattern with one is not routed and behaves as before #5530: `"a" | match("(?:)+?|a";"n")` is no match where jq has `"a"`, and `"ba" | match("(?:){1,2}a?||";"l")` stops at the empty match where jq has `"a"` at offset 1.
+  Nobody writes this (the group matches nothing and the repeat repeats nothing), and `()+?` is a group and is routed.
   Pinned by `test_a_repeated_empty_group_keeps_its_old_search_5530`.
 - **A group that iterates over the empty string is read differently, with or without a flag.**
   Oniguruma stops a loop after an iteration that matched nothing and keeps that iteration: `"a" | match("(a*)*")` has `[1,0,""]` for group 1, and `"bcba" | match("b(c|(|.))*")` is `"bc"`.

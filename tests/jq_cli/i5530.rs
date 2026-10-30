@@ -158,8 +158,9 @@ fn test_the_regex_cache_keeps_l_and_n_apart_5530() -> Result<()> {
     ])
 }
 
-/// A repeat of an empty non-capturing group keeps the search the pattern had: `fancy-regex` 0.20
-/// mishandles it under both modes (`"a" | match("(?:)+?|a"; "n")` is `"a"` in jq 1.7.1, and
+/// A repeat of an empty non-capturing group keeps the search the pattern had: `fancy-regex`'s
+/// parser refuses it (`TargetNotRepeatable`), so neither mode can be applied
+/// (`"a" | match("(?:)+?|a"; "n")` is `"a"` in jq 1.7.1, and
 /// `"ba" | match("(?:){1,2}a?||"; "l")` is `"a"` at offset 1). Pinned as the divergence it is
 /// (docs/compliance/jq/limitations.md), so closing it is a visible change. `()` is not affected.
 #[test]

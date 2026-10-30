@@ -26811,13 +26811,6 @@ fn build_fancy_regex_with<S: EvalSemantics>(
     {
         return None;
     }
-    // `fancy-regex` 0.20 mishandles a repeat of an empty non-capturing group under either mode:
-    // `"a" | match("(?:)+?|a"; "n")` is no match where jq has `"a"`, and `"ba" |
-    // match("(?:){1,2}a?||"; "l")` stops at the empty match where jq has the `"a"` at offset 1.
-    // Such a pattern keeps the search it had, a gap only for the shapes #920 and #922 describe.
-    if fancy_repeats_empty_group(&tree.expr) && (modes.not_empty || modes.longest) {
-        return None;
-    }
     if modes.longest && fancy_has_lazy_repeat(&tree.expr) {
         return None;
     }
@@ -26835,13 +26828,6 @@ fn build_fancy_regex_with<S: EvalSemantics>(
 fn fancy_has_lazy_repeat(expr: &fancy_regex::Expr) -> bool {
     let lazy = |e: &fancy_regex::Expr| matches!(e, fancy_regex::Expr::Repeat { greedy: false, .. });
     lazy(expr) || expr.has_descendant(lazy)
-}
-
-/// Whether `expr` has a repeat of the empty expression, which `(?:)+?` and `(?:){1,}` parse to.
-#[cfg(feature = "regex")]
-fn fancy_repeats_empty_group(expr: &fancy_regex::Expr) -> bool {
-    let repeats_empty = |e: &fancy_regex::Expr| matches!(e, fancy_regex::Expr::Repeat { child, .. } if matches!(**child, fancy_regex::Expr::Empty));
-    repeats_empty(expr) || expr.has_descendant(repeats_empty)
 }
 
 /// Whether `expr` (one node, not its children) is a construct `fancy-regex` matches the way
@@ -127888,9 +127874,10 @@ mod tests {
             outputs(br#""aa""#, r#"match("a*?"; "l") | [.offset, .string]"#),
             [r#"[0,""]"#]
         );
-        // A repeat of an empty group keeps its old search under either flag: `fancy-regex` 0.20
-        // mishandles it (`"a" | match("(?:)+?|a"; "n")` is `"a"` in jq, `"ba" |
-        // match("(?:){1,2}a?||"; "l")` is `"a"` at offset 1).
+        // `fancy-regex`'s parser refuses a repeat of an empty non-capturing group
+        // (`TargetNotRepeatable`), so a pattern with one keeps its old search under either flag
+        // (`"a" | match("(?:)+?|a"; "n")` is `"a"` in jq, `"ba" | match("(?:){1,2}a?||"; "l")`
+        // is `"a"` at offset 1). `()` is a group, not an empty expression, and is routed.
         assert_eq!(
             outputs(br#""a""#, r#"[match("(?:)+?|a"; "n") | .string]"#),
             ["[]"]
