@@ -25785,6 +25785,10 @@ struct JqRegex {
 struct LongestSearch {
     /// The most bytes one match of the pattern can span, when it has a bound.
     max_len: Option<usize>,
+    /// Whether a match at one start is the same whichever search finds it, so the starts one pass
+    /// finds serve every later search of the same text (#5563). A `\G` anchors at where a search
+    /// begins, which breaks that.
+    start_independent: bool,
 }
 
 /// Which crate compiled a [`JqRegex`]. Every pattern the `regex` crate accepts stays on it; a jq
@@ -25916,6 +25920,17 @@ impl JqRegex {
         input: &'h str,
         start: usize,
     ) -> Result<Option<RegexCaptures<'h>>, EvalError> {
+        self.captures_at_indexed(input, start, None)
+    }
+
+    /// [`captures_at`](Self::captures_at), reading an `l` search's answer from `starts` when
+    /// the caller built one for this `input` (#5563).
+    fn captures_at_indexed<'h>(
+        &self,
+        input: &'h str,
+        start: usize,
+        starts: Option<&LongestStarts>,
+    ) -> Result<Option<RegexCaptures<'h>>, EvalError> {
         match &self.engine {
             RegexEngine::Std(re) => Ok(dv_captures_at(
                 re,
@@ -25925,6 +25940,15 @@ impl JqRegex {
                 self.exact_end.as_ref(),
             )),
             RegexEngine::Fancy(re) if self.longest.is_some() => {
+                if let Some(starts) = starts {
+                    return match starts.winner_from(start) {
+                        Some(best_start) => re
+                            .captures_from_pos(input, best_start)
+                            .map(|caps| caps.map(RegexCaptures::Fancy))
+                            .map_err(fancy_match_error),
+                        None => Ok(None),
+                    };
+                }
                 let max_len = self.longest.and_then(|search| search.max_len);
                 fancy_longest_captures(re, input, start, max_len)
                     .map(|caps| caps.map(RegexCaptures::Fancy))
@@ -25948,6 +25972,54 @@ impl JqRegex {
             RegexEngine::Std(re) => re.captures_len(),
             RegexEngine::Fancy(re) => re.captures_len(),
         }
+    }
+}
+
+/// Every start at which an `l` regex matches in one text, with the match each makes there, and
+/// for each start the winner among it and every later one (#5563).
+///
+/// A search for the longest match at or after some `start` reads the rest of the text, so a global
+/// loop that runs one per match is quadratic in the matches. The match `fancy-regex` finds at a
+/// start does not depend on where the search began (a `\G` is the exception, and keeps the search
+/// per match), so one forward pass finds them all and each search is a lookup: the longest match
+/// among the starts from `start` on, the earliest of equals, as [`fancy_longest_captures`] picks.
+#[cfg(feature = "regex")]
+struct LongestStarts {
+    /// `(start, len)` of the match at each start that has one, by start.
+    spans: Vec<(usize, usize)>,
+    /// For each position in `spans`, the position of the winner among it and every later one.
+    winner: Vec<usize>,
+}
+
+#[cfg(feature = "regex")]
+impl LongestStarts {
+    /// The matches of `re` at every start in `input` from byte `from`.
+    fn build(re: &fancy_regex::Regex, input: &str, from: usize) -> Result<Self, EvalError> {
+        let mut spans = Vec::new();
+        let mut at = from;
+        while let Some(m) = re.find_from_pos(input, at).map_err(fancy_match_error)? {
+            spans.push((m.start(), m.end() - m.start()));
+            match input[m.start()..].chars().next() {
+                Some(c) => at = m.start() + c.len_utf8(),
+                None => break,
+            }
+        }
+        // From the last start back, a start wins when it is at least as long as the winner after
+        // it: an earlier start keeps a tie.
+        let mut winner = vec![0; spans.len()];
+        for index in (0..spans.len()).rev() {
+            winner[index] = match winner.get(index + 1) {
+                Some(&later) if spans[later].1 > spans[index].1 => later,
+                _ => index,
+            };
+        }
+        Ok(Self { spans, winner })
+    }
+
+    /// The start of the longest match at or after byte `start`, the earliest of equals.
+    fn winner_from(&self, start: usize) -> Option<usize> {
+        let first = self.spans.partition_point(|&(at, _)| at < start);
+        self.winner.get(first).map(|&index| self.spans[index].0)
     }
 }
 
@@ -26858,7 +26930,10 @@ fn build_regex_uncached<S: EvalSemantics>(
                     needs_trailing_nl_check: false,
                     exact_end: None,
                     suppress_empty,
-                    longest: modes.longest.then_some(LongestSearch { max_len }),
+                    longest: modes.longest.then_some(LongestSearch {
+                        max_len,
+                        start_independent: !pattern.contains("\\G"),
+                    }),
                 });
             }
         }
@@ -27743,11 +27818,12 @@ fn next_match_step<'h>(
     re: &JqRegex,
     input: &'h str,
     start: usize,
+    starts: Option<&LongestStarts>,
 ) -> Result<Option<MatchStep<'h>>, EvalError> {
     if start > input.len() {
         return Ok(None);
     }
-    let Some(caps) = re.captures_at(input, start)? else {
+    let Some(caps) = re.captures_at_indexed(input, start, starts)? else {
         return Ok(None);
     };
     let m = caps
@@ -27785,7 +27861,7 @@ fn first_captures<'h>(
     let mut start = 0usize;
     loop {
         let Some((caps, accepted, next_start, _m_start, _m_end)) =
-            next_match_step(re, input, start)?
+            next_match_step(re, input, start, None)?
         else {
             return Ok(None);
         };
@@ -27840,8 +27916,16 @@ fn global_captures<'h, S: EvalSemantics>(
     let mut results = Vec::new();
     let mut start = 0usize;
     let mut last_match_end: Option<usize> = None;
+    // #5563: an `l` search reads the rest of the text, so one per match is quadratic. One pass
+    // over the starts answers them all, unless a `\G` ties a match to where its search began.
+    let starts = match (&re.engine, re.longest) {
+        (RegexEngine::Fancy(fancy), Some(search)) if search.start_independent => {
+            Some(LongestStarts::build(fancy, input, 0)?)
+        }
+        _ => None,
+    };
     while let Some((caps, accepted, next_start, m_start, m_end)) =
-        next_match_step(re, input, start)?
+        next_match_step(re, input, start, starts.as_ref())?
     {
         if accepted {
             let is_empty_match = m_start == m_end;
