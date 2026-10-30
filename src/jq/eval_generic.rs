@@ -375,6 +375,46 @@ fn document_number_f64_generic<S: EvalSemantics, V: DocumentValue>(value: &V) ->
     }
 }
 
+/// `floor`, `ceil`, `round`, `trunc`, `sqrt` and `fabs` of a document number, answered from the
+/// number itself (#5593). Without this they fell to [`eval_builtin_in`]'s wildcard, which writes
+/// the number out as JSON text, indexes it and evaluates the builtin over that one-number
+/// document: a round trip and an index build per number to make one libm call (`[.numbers[]|floor]`
+/// was 0.87x of jq, and `floor|.+1` 0.57x).
+///
+/// The double is [`document_number_f64_generic`]'s, which is `eval.rs`'s `json_number_f64` for a
+/// cursor, and the result is the one `builtin_floor` and its siblings build
+/// ([`integral_f64_result`](crate::jq::eval::integral_f64_result), `OwnedValue::Float` for
+/// `sqrt`/`fabs`), so the answer is the same value the bridge produced.
+///
+/// Declines (`None`, the wildcard route unchanged) for everything but a finite number token the
+/// document keeps as a literal: a string, a bridge token (a computed float or a non-finite
+/// spelling), a literal whose double is not finite, and yq mode, whose number model differs. A
+/// value that is not a number is the evaluator's error to word.
+fn unary_math_of_document_number<S: EvalSemantics, V: DocumentValue>(
+    builtin: &Builtin,
+    value: &V,
+) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    // Checked before reading the number, so a builtin this does not answer costs one match.
+    let apply: fn(f64) -> OwnedValue = match builtin {
+        Builtin::Floor => |n| crate::jq::eval::integral_f64_result::<S>(super::math::floor(n)),
+        Builtin::Ceil => |n| crate::jq::eval::integral_f64_result::<S>(super::math::ceil(n)),
+        Builtin::Round => |n| crate::jq::eval::integral_f64_result::<S>(super::math::round(n)),
+        Builtin::Trunc => |n| crate::jq::eval::integral_f64_result::<S>(super::math::trunc(n)),
+        Builtin::Sqrt => |n| OwnedValue::Float(super::math::sqrt(n)),
+        Builtin::Fabs => |n| OwnedValue::Float(super::math::fabs(n)),
+        _ => return None,
+    };
+    if value.bridge_computed_float().is_some() {
+        return None;
+    }
+    value.number_literal()?;
+    let n = document_number_f64_generic::<S, V>(value).filter(|n| n.is_finite())?;
+    Some(apply(n))
+}
+
 /// Whether `value` is a number scalar of a JSON-sourced document (#3597), whose
 /// `length` is the width of the number yq's JSON decoder produced rather than of
 /// the source spelling `as_str` hands back.
@@ -35948,6 +35988,9 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
             // a builtin argument here can embed a `Snapshot`-origin marker
             // (e.g. `path(...)`/`del(...)` nested inside this builtin's own
             // argument), so it must be checked against this call's own root.
+            if let Some(answer) = unary_math_of_document_number::<S, V>(builtin, &value) {
+                return GenericResult::Owned(answer);
+            }
             let root = RootWitness::of(cursor.as_ref());
             let expr = builtin_expr(whole, builtin);
             let rooted = reindexed_root_for::<S, _>(&expr, cursor.as_ref());
@@ -40967,6 +41010,46 @@ mod tests {
                 "{filter} bridged the input"
             );
         }
+    }
+
+    /// #5593: `floor`, `ceil`, `round`, `trunc`, `sqrt` and `fabs` of a document number are
+    /// answered from the number, not bridged: the bridge serialises the value and indexes it again
+    /// (`reindex_count` counts exactly that), once per number. A value that is not a finite number
+    /// token still bridges, which is how its error keeps the evaluator's wording. The pin must be
+    /// able to fail: it does, with `unary_math_of_document_number` made to return `None`.
+    #[cfg(feature = "std")]
+    #[test]
+    fn unary_math_of_a_document_number_is_not_bridged_5593() {
+        use crate::jq::value::reindex_count;
+
+        let json = br#"[1.5,-2.5,100000000000000000000,1e-5,0,-0.0,16]"#;
+        let index = JsonIndex::build(json);
+        let reindexes = |filter: &str, json: &[u8]| {
+            let index = JsonIndex::build(json);
+            let expr = crate::jq::parse(filter).unwrap();
+            let before = reindex_count::get();
+            let _ = eval_using::<JqSemantics, _>(&expr, index.root(json).value())
+                .collect_owned::<JqSemantics>();
+            reindex_count::get() - before
+        };
+        for builtin in ["floor", "ceil", "round", "trunc", "sqrt", "fabs"] {
+            let filter = format!("map({builtin})");
+            let expr = crate::jq::parse(&filter).unwrap();
+            let before = reindex_count::get();
+            let result = eval_using::<JqSemantics, _>(&expr, index.root(json).value())
+                .collect_owned::<JqSemantics>()
+                .unwrap();
+            assert_eq!(result.len(), 1, "{filter}");
+            assert_eq!(
+                reindex_count::get() - before,
+                0,
+                "{filter} bridged a document number"
+            );
+        }
+        // Not a number, a computed double and a non-finite literal keep the bridge.
+        assert!(reindexes("map(try floor catch 0)", br#"["x",true]"#) > 0);
+        assert!(reindexes("map(. * 1.5 | floor)", b"[1,2]") > 0);
+        assert!(reindexes("map(floor)", b"[1e1000]") > 0);
     }
 
     /// #3639: a `label` met at a position with no prefetch hook (the absent-
