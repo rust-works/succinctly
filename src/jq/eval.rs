@@ -25893,28 +25893,29 @@ fn fancy_longest_captures<'h>(
     start: usize,
     max_len: Option<usize>,
 ) -> Result<Option<fancy_regex::Captures<'h, str>>, EvalError> {
-    let mut best: Option<(usize, fancy_regex::Captures<'h, str>)> = None;
+    // Only the span of each candidate is needed to pick the winner; the captures are built once,
+    // for the start it chose (the match `fancy-regex` finds there is the one it found here).
+    let mut best: Option<(usize, usize)> = None;
     let mut from = start;
-    while let Some(caps) = re
-        .captures_from_pos(input, from)
-        .map_err(fancy_match_error)?
-    {
-        let m = caps
-            .get(0)
-            .expect("capture group 0 is always present on a match");
-        let (m_start, len) = (m.start(), m.end() - m.start());
-        if best.as_ref().map_or(true, |(best_len, _)| len > *best_len) {
-            best = Some((len, caps));
+    while let Some(m) = re.find_from_pos(input, from).map_err(fancy_match_error)? {
+        let len = m.end() - m.start();
+        if best.map_or(true, |(_, best_len)| len > best_len) {
+            best = Some((m.start(), len));
         }
         if max_len.is_some_and(|max| len >= max) {
             break;
         }
-        match input[m_start..].chars().next() {
-            Some(c) => from = m_start + c.len_utf8(),
+        match input[m.start()..].chars().next() {
+            Some(c) => from = m.start() + c.len_utf8(),
             None => break,
         }
     }
-    Ok(best.map(|(_, caps)| caps))
+    match best {
+        Some((best_start, _)) => re
+            .captures_from_pos(input, best_start)
+            .map_err(fancy_match_error),
+        None => Ok(None),
+    }
 }
 
 /// A `fancy-regex` search that gave up. Oniguruma gives up too, on its own retry limit, with
@@ -26438,7 +26439,8 @@ struct CachedRegex {
 }
 
 /// A flags string as the cache keys it. The flags that change what a pattern compiles to are
-/// `i`, `x`, `m`/`p`, `n` and `l` (which picks the engine and its search, #5530); `g` and `s` do
+/// `i`, `x`, `m`/`p`, `n` and `l` (which picks the engine and its search, #5530, outside yq mode, where it
+/// does nothing); `g` and `s` do
 /// nothing here and the order and repeats do not matter, so `"gi"`, `"ig"` and `"i"` are one key,
 /// and so are no flags and `"g"`. A string with
 /// any other character is an error whichever way it is spelled, keyed as written.
@@ -26451,7 +26453,7 @@ enum FlagsKey {
 
 #[cfg(feature = "regex")]
 impl FlagsKey {
-    fn of(flags: Option<&str>) -> Self {
+    fn of(flags: Option<&str>, yq: bool) -> Self {
         let mut bits = 0u8;
         for c in flags.unwrap_or("").chars() {
             match c {
@@ -26459,8 +26461,9 @@ impl FlagsKey {
                 'x' => bits |= 2,
                 'm' | 'p' => bits |= 4,
                 'n' => bits |= 8,
-                'l' => bits |= 16,
-                'g' | 's' => {}
+                // yq mode never takes the route `l` selects.
+                'l' if !yq => bits |= 16,
+                'g' | 'l' | 's' => {}
                 _ => return Self::Invalid(flags.unwrap_or("").to_string()),
             }
         }
@@ -26540,7 +26543,7 @@ fn build_regex<S: EvalSemantics>(
     if pattern.len() > REGEX_CACHE_MAX_PATTERN {
         return build_regex_uncached::<S>(pattern, flags).map(Rc::new);
     }
-    let key = FlagsKey::of(flags);
+    let key = FlagsKey::of(flags, yq);
     let hash = regex_key_hash(yq, pattern, &key);
     let hit = REGEX_CACHE.with(|cache| {
         cache
@@ -26696,25 +26699,22 @@ fn build_regex_uncached<S: EvalSemantics>(
     // backtracking engine. The `regex` crate cannot express either, so a pattern that asks for one
     // goes to `fancy-regex` when it may (see [`build_fancy_regex`]); every other pattern keeps its
     // engine, its speed and its output.
-    if S::TAG != EvalTag::Yq {
+    if S::TAG != EvalTag::Yq && (longest || suppress_empty) {
+        let (can_be_empty, max_len) = pattern_match_lengths(&pattern);
         let modes = FancyModes {
             longest,
-            not_empty: suppress_empty && pattern_can_match_empty(&pattern),
+            not_empty: suppress_empty && can_be_empty,
         };
+        // A pattern that asks for `l` and cannot have it is refused by the builder and keeps its
+        // old route whole: the flags are not independent (`ln` is the longest *non-empty* match
+        // anywhere), so fixing `n` alone would change which wrong answer it gives.
         if modes.longest || modes.not_empty {
-            // A pattern that asks for `l` and cannot have it keeps its old route whole: the
-            // flags are not independent (`ln` is the longest *non-empty* match anywhere), so
-            // fixing `n` alone would change which wrong answer it gives.
-            if let Some((re, built)) = build_fancy_regex_with::<S>(&pattern, modes)
-                .filter(|(_, built)| built.longest == modes.longest)
-            {
+            if let Some(re) = build_fancy_regex_with::<S>(&pattern, modes) {
                 return Ok(JqRegex {
                     engine: RegexEngine::Fancy(re),
                     needs_trailing_nl_check: false,
                     suppress_empty,
-                    longest: built.longest.then(|| LongestSearch {
-                        max_len: pattern_max_len(&pattern),
-                    }),
+                    longest: modes.longest.then_some(LongestSearch { max_len }),
                 });
             }
         }
@@ -26760,7 +26760,7 @@ const FANCY_BACKTRACK_LIMIT: usize = 10_000_000;
 /// jq, where `fancy-regex` reads them as word boundaries and nested repeats by default.
 #[cfg(feature = "regex")]
 fn build_fancy_regex<S: EvalSemantics>(pattern: &str) -> Option<fancy_regex::Regex> {
-    build_fancy_regex_with::<S>(pattern, FancyModes::default()).map(|(re, _)| re)
+    build_fancy_regex_with::<S>(pattern, FancyModes::default())
 }
 
 /// The search policies jq's `l` and `n` flags select, which only `fancy-regex` can apply (#5530).
@@ -26774,35 +26774,32 @@ struct FancyModes {
     not_empty: bool,
 }
 
-/// Whether some input may make `pattern` match the empty string, so that `n` could refuse a match
-/// there. A pattern the `regex` crate cannot parse (lookaround) is answered `true`.
+/// What bounds the length of a match of `pattern`: whether some input may make it empty (so `n`
+/// could refuse a match there), and the most bytes one match can span, when it has a bound. A
+/// pattern the `regex` crate cannot parse (lookaround, a backreference) may be empty and has no
+/// bound.
 #[cfg(feature = "regex")]
-fn pattern_can_match_empty(pattern: &str) -> bool {
-    regex_syntax::Parser::new()
-        .parse(pattern)
-        .map_or(true, |hir| hir.properties().minimum_len() == Some(0))
+fn pattern_match_lengths(pattern: &str) -> (bool, Option<usize>) {
+    match regex_syntax::Parser::new().parse(pattern) {
+        Ok(hir) => {
+            let properties = hir.properties();
+            (
+                properties.minimum_len() == Some(0),
+                properties.maximum_len(),
+            )
+        }
+        Err(_) => (true, None),
+    }
 }
 
-/// The most bytes one match of `pattern` can span, when it has a bound. A pattern the `regex`
-/// crate cannot parse (lookaround, a backreference) has none.
-#[cfg(feature = "regex")]
-fn pattern_max_len(pattern: &str) -> Option<usize> {
-    regex_syntax::Parser::new()
-        .parse(pattern)
-        .ok()?
-        .properties()
-        .maximum_len()
-}
-
-/// [`build_fancy_regex`] with the search policies of jq's `l` and `n` flags set, and the modes the
-/// regex was built with: `l` is dropped from a pattern with a lazy quantifier, where
-/// `fancy-regex`'s longest-match mode returns the lazy match (`"a" | match("a*?"; "l")` is `""`
-/// there and `"a"` in jq).
+/// [`build_fancy_regex`] with the search policies of jq's `l` and `n` flags set. `None` also when
+/// `l` is asked of a pattern with a lazy quantifier: `fancy-regex`'s longest-match mode returns
+/// the lazy match there (`"a" | match("a*?"; "l")` is `""` and jq has `"a"`).
 #[cfg(feature = "regex")]
 fn build_fancy_regex_with<S: EvalSemantics>(
     pattern: &str,
-    mut modes: FancyModes,
-) -> Option<(fancy_regex::Regex, FancyModes)> {
+    modes: FancyModes,
+) -> Option<fancy_regex::Regex> {
     if S::TAG == EvalTag::Yq {
         return None;
     }
@@ -26821,16 +26818,15 @@ fn build_fancy_regex_with<S: EvalSemantics>(
         return None;
     }
     if modes.longest && fancy_has_lazy_repeat(&tree.expr) {
-        modes.longest = false;
+        return None;
     }
-    let re = fancy_regex::RegexBuilder::new(&pattern)
+    fancy_regex::RegexBuilder::new(&pattern)
         .oniguruma_mode(true)
         .leftmost_longest(modes.longest)
         .find_not_empty(modes.not_empty)
         .backtrack_limit(FANCY_BACKTRACK_LIMIT)
         .build()
-        .ok()?;
-    Some((re, modes))
+        .ok()
 }
 
 /// Whether `expr` has a lazy quantifier (`*?`, `+?`, `??`, `{n,m}?`).

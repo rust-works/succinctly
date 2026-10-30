@@ -7416,6 +7416,7 @@ Every other pattern keeps the `regex` crate, its speed and its output, and yq mo
   This predates `l` and `n`, which only move a pattern to the other route.
 - **A search can run out of budget where jq's optimizer does not.**
   `l` and `n` run the backtracking engine on patterns the `regex` crate used to answer in one pass, so a pathological pattern that Oniguruma settles at once can raise `Regex failure: retry-limit-in-match over` here, the budget of the lookaround route (above).
+  As in Oniguruma, each start position an `l` search tries has a budget of its own.
 - **Multibyte text and an empty match are a separate jq quirk.**
   jq 1.7.1 advances one byte after an empty match, so `"éaé" | [match("";"g").offset]` has a duplicate `1` and `3` in jq; this is the same with and without `l` and is not changed here.
 
