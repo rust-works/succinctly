@@ -567,3 +567,14 @@ syn-ws-tab-and-newline	syntax	["-n", "-c", "1\t+\n1"]	-
 syn-ws-cr-in-interpolation	syntax	["-n", "-c", "\"a\\(1\r+2)\""]	-
 syn-ws-cr-in-def-header	syntax	["-n", "-c", "def\rf: 1; f"]	-
 syn-ws-cr-in-comment	syntax	["-n", "-c", "1 # a\rb\n+ 1"]	-
+num-lit-trailing-dot-exp	operators	["-n", "-c", "1.e1"]	-
+num-lit-trailing-dot-exp-upper	operators	["-n", "-c", "1.E1"]	-
+num-lit-trailing-dot-exp-plus	operators	["-n", "-c", "1.e+1"]	-
+num-lit-trailing-dot-exp-neg	operators	["-n", "-c", "1.e-1"]	-
+num-lit-trailing-dot-exp-zero	operators	["-n", "-c", "1.e0"]	-
+num-lit-trailing-dot-exp-multi	operators	["-n", "-c", "10.e1"]	-
+num-lit-trailing-dot-exp-zero-int	operators	["-n", "-c", "0.e5"]	-
+num-lit-trailing-dot-exp-huge	operators	["-n", "-c", "1.e1000"]	-
+num-lit-trailing-dot-array	operators	["-n", "-c", "[1.e1,2.E2]"]	-
+num-lit-trailing-dot-tojson	operators	["-n", "-c", "1.e1|tojson"]	-
+num-lit-trailing-dot-plain	operators	["-n", "-c", "1."]	-
