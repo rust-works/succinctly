@@ -3394,7 +3394,7 @@ impl OwnedValue {
 
     /// A double the reindex bridge decoded: the [`nan_instance`](Self::nan_instance)
     /// it was written from when it carries one's payload
-    /// ([`nan_instance_token`]), a bare computed `Float` otherwise (#2902).
+    /// ([`push_nan_instance_token`]), a bare computed `Float` otherwise (#2902).
     pub(crate) fn from_bridge_float(f: f64) -> Self {
         if is_nan_instance(f) {
             Self::NumberLiteral(NumberRepr::Float(f), "null".into())
@@ -5439,7 +5439,7 @@ fn printed_nan(f: f64) -> String {
     out
 }
 
-/// [`printed_nan`], appended to `out`: the form the printer takes (#5594).
+/// `to_json`'s NaN text, `null`, appended to `out`: the form the printer takes (#5594).
 fn push_printed_nan(out: &mut String, _: f64) {
     out.push_str("null");
 }
@@ -5449,20 +5449,23 @@ fn is_nan_instance(f: f64) -> bool {
     f.is_nan() && f.to_bits() & NAN_INSTANCE_TAG != 0
 }
 
-/// The reindex bridge's spelling of a parsed NaN
-/// ([`OwnedValue::nan_instance`]): [`NAN_SENTINEL`], then `e` and the
-/// double's bits in decimal, so the instance survives the round trip
-/// (#3309). Still digit-led, drawn from `[0-9e]` and carrying several
-/// exponent markers, so it is a number span to the scanner and unparseable
-/// as a real number, like the sentinel itself. A NaN without a parse
-/// identity is written as the plain sentinel.
+/// [`push_nan_instance_token`]'s text as a `String`: the form the nested printer the tests keep
+/// takes (#5594).
+#[cfg(test)]
 fn nan_instance_token(f: f64) -> String {
     let mut out = String::new();
     push_nan_instance_token(&mut out, f);
     out
 }
 
-/// [`nan_instance_token`], appended to `out`: the form the printer takes (#5594).
+/// The reindex bridge's spelling of a parsed NaN
+/// ([`OwnedValue::nan_instance`]), appended to `out`: [`NAN_SENTINEL`], then
+/// `e` and the double's bits in decimal, so the instance survives the round
+/// trip (#3309). Still digit-led, drawn from `[0-9e]` and carrying several
+/// exponent markers, so it is a number span to the scanner and unparseable
+/// as a real number, like the sentinel itself. A NaN without a parse
+/// identity is written as the plain sentinel. Appended rather than returned
+/// since #5594, so the printers allocate nothing for it.
 fn push_nan_instance_token(out: &mut String, f: f64) {
     use core::fmt::Write;
     out.push_str(NAN_SENTINEL);
@@ -5472,7 +5475,7 @@ fn push_nan_instance_token(out: &mut String, f: f64) {
     }
 }
 
-/// Decodes a [`nan_instance_token`] back to the tagged double it was
+/// Decodes a [`push_nan_instance_token`] token back to the tagged double it was
 /// written from; `None` for anything else, the plain sentinel included.
 fn parse_nan_instance_token(bytes: &[u8]) -> Option<f64> {
     let digits = bytes
