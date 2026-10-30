@@ -205,3 +205,4 @@ mod i5508;
 mod i5510;
 mod i5526;
 mod i5529;
+mod i5535;

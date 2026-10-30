@@ -25833,6 +25833,7 @@ fn translate_posix_brackets(pattern: &str) -> Result<std::borrow::Cow<'_, str>, 
         && !pattern.contains("\\>")
         && !pattern.contains("\\b{")
         && !pattern.contains("(?P")
+        && !pattern.contains(['^', '$', '\\'])
     {
         return Ok(std::borrow::Cow::Borrowed(pattern));
     }
@@ -25843,9 +25844,13 @@ fn translate_posix_brackets(pattern: &str) -> Result<std::borrow::Cow<'_, str>, 
     // where a `]` is a literal.
     let mut depth = 0usize;
     let mut at_start = false;
+    // Whether the token just before this one is an assertion (`^`, `$`, `\b`, ...), which
+    // Oniguruma refuses to repeat (#5535).
+    let mut prev_assertion = false;
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
+        let was_assertion = std::mem::take(&mut prev_assertion);
         if c == '\\' {
             // #5373: jq's `\w` is its POSIX `word` plus six Latin-1 characters and without the
             // two joiners the `regex` crate's `\w` adds. Always a bracketed class, so that a
@@ -25895,12 +25900,21 @@ fn translate_posix_brackets(pattern: &str) -> Result<std::borrow::Cow<'_, str>, 
             out.push(c);
             if let Some(&next) = chars.get(i + 1) {
                 out.push(next);
+                prev_assertion = depth == 0 && matches!(next, 'b' | 'B' | 'A' | 'z' | 'Z' | 'G');
             }
             at_start = false;
             i += 2;
             continue;
         }
         if depth == 0 {
+            // #5535: a repetition operator right after an assertion is an error in jq
+            // (`^*`, `$+`, `\b?`, `\A{2}`); the `regex` crate repeats the empty match.
+            if was_assertion && starts_repetition(&chars[i..]) {
+                return Err(EvalError::new(
+                    "invalid regex: target of repeat operator is invalid",
+                ));
+            }
+            prev_assertion = c == '^' || c == '$';
             // #5529: jq refuses Python-style named groups (`(?P<n>...)`, `(?P=n)`, `(?P>n)`);
             // the `regex` crate accepts the first and would answer where jq errors.
             if c == '(' && chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'P') {
@@ -25964,6 +25978,37 @@ fn translate_posix_brackets(pattern: &str) -> Result<std::borrow::Cow<'_, str>, 
     } else {
         std::borrow::Cow::Borrowed(pattern)
     })
+}
+
+/// Whether `chars` begins with a repetition operator as Oniguruma's Perl syntax reads one: `*`,
+/// `+`, `?`, or an interval `{n}`, `{n,}` or `{n,m}`. `{,m}` and `{x}` are literal text there, so
+/// they do not count (#5535).
+#[cfg(feature = "regex")]
+fn starts_repetition(chars: &[char]) -> bool {
+    match chars.first() {
+        Some('*' | '+' | '?') => true,
+        Some('{') => {
+            let digits = |from: usize| {
+                chars[from..]
+                    .iter()
+                    .take_while(|c| c.is_ascii_digit())
+                    .count()
+            };
+            let first = digits(1);
+            if first == 0 {
+                return false;
+            }
+            match chars.get(1 + first) {
+                Some('}') => true,
+                Some(',') => {
+                    let second = digits(2 + first);
+                    matches!(chars.get(2 + first + second), Some('}'))
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 /// The POSIX bracket starting at `chars[at]` (a `[`): the index just past its closing `:]`,

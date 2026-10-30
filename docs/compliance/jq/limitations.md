@@ -7299,6 +7299,8 @@ A Python-style group (`(?P<n>a)`, `(?P=n)`, `(?P>n)`) is an error in jq (`undefi
 It is an error here too, with this crate's `invalid regex:` prefix where jq says `Regex failure:`, the same wording difference every refused pattern has.
 The crate's `\b{start}`, `\b{end}`, `\b{start-half}` and `\b{end-half}` are `\b` followed by the literal text in jq, and are rewritten to that.
 These rewrites read the raw pattern text, so under the `x` flag a `(?P` inside a `#` comment is refused here and ignored by jq.
+A repetition operator right after an assertion (`^*`, `$+`, `\b?`, `\A{2}`, `\z*`) is an error in jq (`target of repeat operator is invalid`) and is refused here too (#5535), where the `regex` crate repeats the empty match and answered `true`.
+Only a direct repetition is refused: a non-capturing group of an assertion (`(?:^)*`), which jq also refuses, is still accepted here.
 
 ## Regex flags `l` and `n`
 
