@@ -26362,7 +26362,6 @@ fn fancy_escape_is_oniguruma(e: char) -> bool {
 /// jq-1.7.1's Oniguruma, which then keeps the `regex` crate's refusal:
 ///
 /// - an escape outside [`fancy_escape_is_oniguruma`]'s list;
-/// - a `(?P...)` group, which Oniguruma's Perl syntax rejects and `fancy-regex` accepts;
 /// - a reversed interval (`a{3,2}`), an error in jq and a possessive `a{2,3}` in `oniguruma_mode`;
 /// - a `+` after an interval: possessive in jq for `{n,m}+` and `{n,}+` but a repeat of a repeat
 ///   for `{n}+`, and a repeat of a repeat for all three in `fancy-regex`.
@@ -26519,9 +26518,6 @@ fn prepare_fancy_pattern(pattern: &str) -> Option<String> {
                     out.extend(&chars[i..end]);
                     i = end;
                     continue;
-                }
-                if rest.first() == Some(&'P') {
-                    return None;
                 }
                 let letters = rest
                     .iter()
@@ -125437,14 +125433,8 @@ mod tests {
         for pattern in ["(?=a)a{2}", "(?=a)a{2,}", "(?=a)a{2,3}", "(?=a)a{2"] {
             assert_eq!(prepared(pattern), pattern);
         }
-        // Refused: a reversed interval, a `+` after an interval, `(?P...)`.
-        for pattern in [
-            "(?=a)a{3,2}",
-            "(?=a)a{2,3}+",
-            "(?=a)a{2,}+",
-            "(?=a)a{2}+",
-            "(?P<n>a)(?P=n)",
-        ] {
+        // Refused: a reversed interval, a `+` after an interval.
+        for pattern in ["(?=a)a{3,2}", "(?=a)a{2,3}+", "(?=a)a{2,}+", "(?=a)a{2}+"] {
             assert!(prepare_fancy_pattern(pattern).is_none(), "{pattern}");
         }
     }
