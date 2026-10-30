@@ -1413,6 +1413,17 @@ fn bind_retrying_value_arg(builtin: Builtin) -> Expr {
 /// keeps the plain word boundary after these (#1890).
 const NON_NAME_KEYWORDS: [&str; 8] = ["and", "or", "then", "elif", "else", "end", "catch", "as"];
 
+/// jq 1.7.1's reserved words: the keywords its lexer turns into tokens of their own, which
+/// its grammar then refuses where it wants an `IDENT`, so `def if: 1; 2` is a syntax error
+/// (#5591). `not` and `__loc__` are not among them (`def not: 1; 2` and `def __loc__: 1; 2`
+/// are programs), and none of these is reserved after a `$` (`1 as $if | $if` is `1`) or after a
+/// `.` or in an object key, which is a different production. Captured by running each
+/// word through `def W: 1; 2` on jq 1.7.1.
+const JQ_RESERVED_WORDS: [&str; 17] = [
+    "def", "module", "import", "include", "if", "then", "else", "elif", "reduce", "foreach", "end",
+    "and", "or", "as", "label", "try", "catch",
+];
+
 impl<'a> Parser<'a> {
     #[allow(dead_code)] // STYLE-0005: kept for tests and future use
     fn new(input: &'a str) -> Self {
@@ -2832,6 +2843,9 @@ impl<'a> Parser<'a> {
     /// (`None` for the shorthand forms); `sigil_offset` is the byte position
     /// of the `$` that started the name, so the error points at the sigil the
     /// way jq's column does rather than at a byte already past it.
+    ///
+    /// The `IDENT` sites share [`Self::reject_reserved_word_as_name`], the same one definition
+    /// for a name that is not a binder.
     fn reject_loc_as_binding_name(
         &self,
         name: &str,
@@ -2846,6 +2860,36 @@ impl<'a> Parser<'a> {
                 None => "syntax error, unexpected $__loc__".to_string(),
             };
             return Err(ParseError::new(message, sigil_offset));
+        }
+        Ok(())
+    }
+
+    /// The name after `def`, for both of the parsers that read a definition (`parse_def_expr` in an
+    /// expression, `parse_func_def_parts` in a module body): one definition, so a word one
+    /// refuses is a word the other refuses (#5591).
+    fn parse_def_name(&mut self) -> Result<String, ParseError> {
+        let offset = self.pos;
+        let name = self.parse_ident()?;
+        self.reject_reserved_word_as_name(&name, "IDENT", offset)?;
+        Ok(name)
+    }
+
+    /// A `def` name, a bare `def` parameter or an `import … as` namespace that is one of jq's
+    /// reserved words (#5591): jq's grammar wants an `IDENT` there and its lexer has already
+    /// turned the word into a keyword token. jq mode only; a `$name` is a different token and
+    /// takes any word. `expecting` is jq's lookahead list for that production, and `offset`
+    /// the start of the word.
+    fn reject_reserved_word_as_name(
+        &self,
+        name: &str,
+        expecting: &str,
+        offset: usize,
+    ) -> Result<(), ParseError> {
+        if self.mode == ParserMode::Jq && JQ_RESERVED_WORDS.contains(&name) {
+            return Err(ParseError::new(
+                format!("syntax error, unexpected {name}, expecting {expecting}"),
+                offset,
+            ));
         }
         Ok(())
     }
@@ -5585,6 +5629,8 @@ impl<'a> Parser<'a> {
                 };
                 if is_dollar {
                     self.reject_loc_as_binding_name(&name, Some("IDENT or BINDING"), sigil_offset)?;
+                } else {
+                    self.reject_reserved_word_as_name(&name, "IDENT or BINDING", sigil_offset)?;
                 }
                 params.push(if is_dollar {
                     Param::Dollar(name)
@@ -5619,7 +5665,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
 
         // Parse function name
-        let name = self.parse_ident()?;
+        let name = self.parse_def_name()?;
         self.skip_ws();
 
         // Parse optional parameters
@@ -10113,7 +10159,7 @@ impl<'a> Parser<'a> {
         self.consume_keyword("def");
         self.skip_ws();
 
-        let name = self.parse_ident()?;
+        let name = self.parse_def_name()?;
         self.skip_ws();
 
         // Parse optional parameters
@@ -10176,10 +10222,14 @@ impl<'a> Parser<'a> {
         // distinguishes a *data* import from a module import, so record it
         // rather than just consuming it (#2865) -- `Import::data`.
         let data = self.peek() == Some('$');
+        let alias_offset = self.pos;
         if data {
             self.next();
         }
         let alias = self.parse_ident()?;
+        if !data {
+            self.reject_reserved_word_as_name(&alias, "IDENT or BINDING", alias_offset)?;
+        }
 
         self.skip_ws();
 
@@ -10596,6 +10646,49 @@ mod tests {
         }
     }
     use super::*;
+
+    /// #5591: a reserved word is no `def` name, bare parameter or `import ... as` namespace, in
+    /// jq mode, with jq's own lookahead list and the error at the word; a `$name`, `not` and
+    /// `__loc__` are not reserved there; and yq mode, whose lexer is its own, keeps its answers.
+    #[test]
+    fn a_reserved_word_is_not_a_name_in_jq_mode_5591() {
+        for word in JQ_RESERVED_WORDS {
+            for (text, expecting, at) in [
+                (format!("def {word}: 1; 2"), "IDENT", 4),
+                (format!("def f({word}): 1; 2"), "IDENT or BINDING", 6),
+                (format!("def f(a; {word}): 1; 2"), "IDENT or BINDING", 9),
+                (format!("import \"m\" as {word}; 1"), "IDENT or BINDING", 14),
+            ] {
+                let error = parse_program(&text).unwrap_err();
+                assert_eq!(
+                    (error.message.as_str(), error.position),
+                    (
+                        format!("syntax error, unexpected {word}, expecting {expecting}").as_str(),
+                        at
+                    ),
+                    "{text:?}"
+                );
+            }
+        }
+        for text in [
+            "def not: 1; 2",
+            "def __loc__: 1; 2",
+            "def f($if): $if; f(1)",
+            "2 as $then | $then",
+            "import \"m\" as $if; 1",
+            "def f(not; __loc__): 1; 2",
+        ] {
+            parse_program(text).unwrap_or_else(|e| panic!("{text:?}: {}", e.message));
+        }
+        // yq's lexer has its own words (`def` is behind `--jq-extensions` there at all), and mode
+        // decides: nothing here changes what it accepts.
+        for text in ["def if: 1; 2", "def f(then): 1; 2"] {
+            assert!(
+                parse_program_with_mode_and_extensions(text, ParserMode::Yq, true).is_ok(),
+                "{text:?}"
+            );
+        }
+    }
 
     /// #5351: a text of definitions alone and one with a main expression after them build the
     /// same tree, so `has_main_expr` is what tells a library that may be loaded from one that

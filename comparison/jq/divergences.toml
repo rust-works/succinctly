@@ -193,36 +193,6 @@ category = "to-triage"
 reason = "`def a::b: 1; a::b` is a compile error (exit 3); jq 1.7.1 accepts a namespaced function name (#5590)."
 
 [[divergence]]
-id = "syntax:syn-empty-program"
-category = "to-triage"
-reason = "succinctly runs an empty program as the identity; jq 1.7.1 and 1.8.1 refuse it with `Top-level program not given`, exit 3 (#5591)."
-
-[[divergence]]
-id = "syntax:syn-comment-only"
-category = "to-triage"
-reason = "succinctly runs a comment-only program as the identity; jq 1.7.1 and 1.8.1 refuse it with `Top-level program not given`, exit 3 (#5591)."
-
-[[divergence]]
-id = "syntax:syn-whitespace-only"
-category = "to-triage"
-reason = "succinctly runs a whitespace-only program as the identity; jq 1.7.1 and 1.8.1 refuse it with `Top-level program not given`, exit 3 (#5591)."
-
-[[divergence]]
-id = "syntax:def-def-at-end"
-category = "to-triage"
-reason = "succinctly runs `def f: 1;` with no body as the identity; jq 1.7.1 and 1.8.1 refuse it with `Top-level program not given`, exit 3 (#5591)."
-
-[[divergence]]
-id = "syntax:def-fn-keyword"
-category = "to-triage"
-reason = "`def if: 1; 2` runs; jq 1.7.1 rejects a keyword as a function name (#5591)."
-
-[[divergence]]
-id = "syntax:mod-import-keyword-ns"
-category = "to-triage"
-reason = "`import \"lib\" as if; 1` runs; jq 1.7.1 rejects a keyword as an import namespace (#5591)."
-
-[[divergence]]
 id = "syntax:str-format-urid"
 category = "newer-than-primary"
 reason = "`@urid` is new in jq 1.8, which decodes it; jq 1.7.1 answers `urid is not a valid format` (exit 5). succinctly follows the 1.8 behaviour for this format, documented in CLAUDE.md's format table."

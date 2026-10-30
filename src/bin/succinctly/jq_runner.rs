@@ -4661,6 +4661,16 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     // which exits 3 with no such line. Nothing else distinguished this arm
     // from a resolution failure below, so the two now answer identically.
     let program = match parse_filter(&BTreeSet::new()) {
+        // A program with no expression of its own -- empty, only a comment, or only
+        // definitions and directives -- is a compile error in jq, not the identity (#5591). It
+        // is raised right after the parse, so a `include "missing";` with no body reports only
+        // this, never the module (jq 1.7.1: `Top-level program not given (try ".")`, one
+        // error, exit 3).
+        Ok(program) if !program.has_main_expr => {
+            eprintln!("jq: error: Top-level program not given (try \".\")");
+            eprintln!("jq: 1 compile error");
+            return Ok(exit_codes::COMPILE_ERROR);
+        }
         Ok(program) => program,
         Err(e) => {
             report_syntax_error(&e, &filter_str, "<top-level>");
