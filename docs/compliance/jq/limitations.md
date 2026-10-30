@@ -529,8 +529,9 @@ Since [#5233](https://github.com/rust-works/succinctly/issues/5233) no jq-mode p
 One that also uses a succinctly extension the interpreter does not run (`key`, `file_index`, `parent`, `parent(n)`, bare `path`, or a cursor-metadata builtin: `line`, `column`, `document_index`, `anchor`, `style`, the comment builtins, `at_offset`, `at_position`) is refused with `<name> is not supported in a program whose path expression does more than navigate`, wherever in the program the extension sits.
 The CLI reports it once, as a compile error (exit 3) before any input is read; the library entries return it as an evaluation error.
 jq 1.7.1 rejects each such program at compile time (`key/0 is not defined`), so no jq answer is lost; the same extension beside navigation-only targets still answers (`(.a[] | select(. > 1)) |= (parent | length)`).
-A dynamic-target program over a document the interpreter cannot materialize whole (a lone surrogate, nesting past 256 levels) raises the decode error (`invalid unicode escape sequence`, `nesting depth exceeds limit of 256`, exit 5).
-jq rejects such a document when it parses it, with its own parse error (`Invalid \uXXXX\uXXXX surrogate pair escape`, `Exceeds depth limit for parsing`), so the wording and the reported location differ from jq's while both refuse; a program with no dynamic target still decodes only what it reads (#4412).
+A dynamic-target program over a document the interpreter cannot materialize whole (a lone surrogate, a scalar at the 257th level) raises the decode error (`invalid unicode escape sequence`, `nesting depth exceeds limit of 256`, exit 5).
+jq rejects the lone surrogate when it parses the document, with its own parse error (`Invalid \uXXXX\uXXXX surrogate pair escape`), so the wording and the reported location differ from jq's while both refuse; a program with no dynamic target still decodes only what it reads (#4412).
+A document past jq's own parse-depth limit never reaches the interpreter: every document route refuses it first, as jq does (see "Nesting depth" below, #5497); the scalar at the 257th level is one jq accepts, the materializer's band recorded there.
 The `unshared-containers` A/B holdout, a measurement build that never ships, refuses a dynamic-target program outright: its by-value `jv_identical` makes the interpreter refuse rows jq answers, and the shipped resolver no longer answers such a target.
 yq mode is unchanged.
 
@@ -7182,7 +7183,43 @@ against the pinned jq 1.7.1 binary), so refusing with a catchable error is the s
 "would take the host process down" exception as the rest of this entry, not a new kind of
 divergence.
 
-## A too-deeply-nested document is caught at a different stage, with different wording
+## Nesting depth (#5497)
+
+[#5497](https://github.com/rust-works/succinctly/issues/5497) decided each row under ADR-0018.
+jq has two limits, and succinctly now follows both where the input is a document and where the value is printed.
+
+**Parsing.** jq's parser refuses a `[` or `{` once its stack holds 256 entries, where an array holds one and an object two once its key is read.
+So 256 nested arrays parse and 257 do not, 128 nested objects parse and 129 do not, and 255 arrays around `{"a":1}` parse (the key itself is never refused) while 254 around `{"a":[1]}` do not.
+Every jq-mode document route refuses exactly those documents: the default route (M2 and general path), `--slurp`, `input`/`inputs` and `--slurpfile`.
+The documents before the refused one are printed, nothing after it is read, and the run exits 5, as jq's does.
+The default route writes jq's own line, `jq: parse error: Exceeds depth limit for parsing at line L, column C`, with the line counted across files as jq reads them; `input`/`inputs` raise the same message, catchable as in jq, and name the line jq has read to.
+`--seq` and `fromjson` already applied jq's limit through their own ports of jq's parser, and `--argjson`/`--jsonargs` refuse such text too.
+The check reads the balanced parentheses of the index each document already builds: no bracket can be refused below 129 nested containers, so a document whose parentheses never rise above 128 costs one popcount per 64 of them, and only a deeper one is read by a port of jq's parser (`jq_input_depth_fault`, `src/jq/parse_message.rs`).
+Measured with the A/B in the PR that landed it.
+
+What still differs:
+
+- Under `--slurp` the message has no `at line L, column C`: the files are joined into one array before it is indexed, so the position is gone by then.
+- jq's `--stream` uses its streaming parser, which has no depth limit, and succinctly's `--stream` does not apply jq's parse limit either.
+  It still materializes each document before it streams the events, though, so it stops at the materializer's ceiling below (a document of 257 nested arrays), where jq streams on.
+- The routes that materialize a document (`input`/`inputs`, `--slurpfile`, and the filters that build an owned copy, such as `tojson`, `del` and `sort`) check every node, leaves included, against `MAX_NESTING_DEPTH` (256).
+  A document jq accepts with a scalar at its 257th level, which only 256 nested containers can hold (`[[…[1]…]]` with 256 arrays, or 255 arrays around `{"a":1}`), is refused there with `nesting depth exceeds limit of 256`.
+  The guard is shared with `succinctly yq` across the evaluator, and a one-level band is not worth moving it for.
+- `--preserve-input`'s raw echo (a succinctly extension that echoes a document without validating it) does not apply the limit.
+- A document deeper than 128 levels whose first fault in jq's order is something else keeps the default route's lazy handling of that fault: the depth check refuses only what jq's depth limit refuses.
+
+**Printing.** jq's writer prints anything more than 256 levels below the value it is handed as `<skipped: too deep>`, scalars included.
+A document cannot be that deep any more, so only a value the program builds reaches it, and succinctly now prints the marker in the same place in the CLI's output (compact, pretty, `--tab`/`--indent`, `-S`, `-a`) and in everything jq renders through the same writer: `tojson`, `tostring`, string interpolation, `@json`/`@text`, `debug` (whose `["DEBUG:", v]` puts `v` a level down, so it meets the marker a level sooner) and an uncaught non-string `error`.
+Under `-C` the marker takes the color of the value it replaces, followed by a reset, as in jq.
+Before #5497 a value 257 to 383 levels deep printed in full.
+
+**Building.** succinctly still refuses a value more than 384 levels deep (`MAX_VALUE_TREE_DEPTH`), where jq's only limit is its C stack (`[.,.] | sort` segfaults at 100,000 levels, and `length` at 1,000,000).
+`reduce`/`foreach` re-index their accumulator on every step and refuse one past 384 levels whatever the program does next, and `tojson`/`tostring`/interpolation materialize a value past 384 levels before writing it, so the marker does not help them there.
+ADR-0025's stack floor relies on that bound for the walks over a built value between its checks, so lifting it is a design of its own; see "Recursive `def`s" below for the shapes that reach it.
+
+### Before #5497
+
+The rest of this section is the history of the guards that a too-deep document reached before the parse limit above refused it; they still guard the routes listed above.
 
 Real jq refuses a document nested past 256 levels at *parse* time: `jq -c sort` on a
 260-level-deep array gives `jq: parse error: Exceeds depth limit for parsing at line 1,
@@ -9504,13 +9541,11 @@ reads) plus two consequences of the route:
   route ([`docs/plan/decode-failure-routing.md`](../../plan/decode-failure-routing.md)), where
   `-s` used to refuse the whole run. `{"\ud800":1}` under `-s` also stops printing the
   garbled `"\\ud800"` key the old route produced.
-- Nesting depth now follows the default route. A document of 257 or more levels (jq rejects
-  it at parse time, exit 5) is accepted under `-s` and read by any filter that does not
-  materialize it. *Printing* it is bounded by the printer's own ceiling of 384 levels, and the
-  slurp array is one of them: a 383-level document prints bare but not under `-s`, where `.`
-  fails with `nesting depth exceeds limit of 384` at exit 1, the answer the default route
-  gives a 384-level document (#1819). A document at jq's own limit of 256 now reads and prints
-  under `-s`, where the old route's extra array level pushed it over its own ceiling.
+- Nesting depth now follows the default route. Since #5497 a document past jq's parse-depth
+  limit is refused under `-s` as jq refuses it (the slurp array is not one of jq's levels),
+  without the position jq's message names (see "Nesting depth" above). A document at jq's own
+  limit of 256 reads and prints under `-s`, where the old route's extra array level pushed it
+  over its own ceiling.
   **The routes that still materialize keep that ceiling, and it is a divergence from jq:** a
   256-level document under `--seq -s`, or under `-s` with `input`/`inputs`, exits 5 with
   `nesting depth exceeds limit of 256` (the slurp array is the 257th level), where jq 1.7.1
