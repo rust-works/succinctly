@@ -26438,8 +26438,9 @@ struct CachedRegex {
 }
 
 /// A flags string as the cache keys it. The flags that change what a pattern compiles to are
-/// `i`, `x`, `m`/`p` and `n`; `g`, `l` and `s` do nothing here and the order and repeats do not
-/// matter, so `"gi"`, `"ig"` and `"i"` are one key, and so are no flags and `"g"`. A string with
+/// `i`, `x`, `m`/`p`, `n` and `l` (which picks the engine and its search, #5530); `g` and `s` do
+/// nothing here and the order and repeats do not matter, so `"gi"`, `"ig"` and `"i"` are one key,
+/// and so are no flags and `"g"`. A string with
 /// any other character is an error whichever way it is spelled, keyed as written.
 #[cfg(feature = "regex")]
 #[derive(Clone, PartialEq, Eq)]
@@ -26458,7 +26459,8 @@ impl FlagsKey {
                 'x' => bits |= 2,
                 'm' | 'p' => bits |= 4,
                 'n' => bits |= 8,
-                'g' | 'l' | 's' => {}
+                'l' => bits |= 16,
+                'g' | 's' => {}
                 _ => return Self::Invalid(flags.unwrap_or("").to_string()),
             }
         }

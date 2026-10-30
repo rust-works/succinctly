@@ -139,3 +139,21 @@ fn test_l_flag_on_a_lazy_quantifier_is_still_a_no_op_5530() -> Result<()> {
     assert_eq!((stdout.trim_end(), code), ("[]", 0));
     Ok(())
 }
+
+/// The compiled-regex cache (#5531) is keyed by pattern and flags. `l` and `n` change the engine
+/// and the search, so a pattern used with `l` and without it, or with `n` and without it, in one
+/// program must not be answered from the other's entry. The pairs alternate past a key's second
+/// sighting, which is when the cache starts to keep it.
+#[test]
+fn test_the_regex_cache_keeps_l_and_n_apart_5530() -> Result<()> {
+    assert_rows(&[
+        (
+            r#"[range(6) as $i | "abaa" | match("a|aa|aaa"; if $i % 2 == 0 then "l" else "" end) | [.offset, .string]]"#,
+            r#"[[2,"aa"],[0,"a"],[2,"aa"],[0,"a"],[2,"aa"],[0,"a"]]"#,
+        ),
+        (
+            r#"[range(8) as $i | "xaab" | match("a*?"; ["gn","g","n","","gn","g","n",""][$i]) | [.offset, .length]]"#,
+            "[[1,1],[2,1],[0,0],[1,0],[2,0],[3,0],[4,0],[1,1],[0,0],[1,1],[2,1],[0,0],[1,0],[2,0],[3,0],[4,0],[1,1],[0,0]]",
+        ),
+    ])
+}
