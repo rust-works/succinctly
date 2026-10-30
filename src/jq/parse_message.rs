@@ -70,6 +70,8 @@ struct Parser {
     /// The stack size at which a `[` or `{` is refused: [`JQ_MAX_PARSING_DEPTH`], or one more
     /// under a wrapper jq never parsed ([`InputSource::Slurped`]).
     limit: usize,
+    /// Whether a second top-level value is fine: jq's input stream, not `fromjson`'s one text.
+    multi: bool,
 }
 
 /// jq's decNumber reader: an optionally signed decimal with an optional exponent, or
@@ -208,6 +210,7 @@ impl Parser {
             stack: Vec::new(),
             next: None,
             emitted: 0,
+            multi: false,
         }
     }
 
@@ -238,7 +241,7 @@ impl Parser {
     /// Hand the completed value back to the caller; the second one ends the parse.
     fn emit(&mut self) -> Result<(), Stop> {
         self.emitted += 1;
-        if self.emitted == 2 {
+        if self.emitted == 2 && !self.multi {
             return Err(Stop::ExtraValues);
         }
         Ok(())
@@ -506,6 +509,40 @@ pub fn jq_depth_fault(text: &[u8], line: usize, column: usize) -> Option<String>
     jq_parse_fault(text, line, column, JQ_MAX_PARSING_DEPTH)
         .filter(|fault| fault.depth)
         .map(|fault| fault.message)
+}
+
+/// jq's message when its parser, reading `chunks` in order from `line` and `column` of its input
+/// as one stream of top-level values, stops on a fault, or `None` when it reads every value
+/// (#5555).
+///
+/// For a route that has already found its own reason to refuse a document and now has to word it
+/// the way jq's `main` prints it: `jq: parse error: <message>`. The fault is the first in the
+/// stream, so a caller passes the text from where its own check stopped, or all of it.
+#[doc(hidden)]
+pub fn jq_stream_fault<'a>(
+    chunks: impl IntoIterator<Item = &'a [u8]>,
+    line: usize,
+    column: usize,
+) -> Option<String> {
+    let mut parser = Parser::new(line, column, JQ_MAX_PARSING_DEPTH);
+    parser.multi = true;
+    for chunk in chunks {
+        for &byte in chunk {
+            if let Err(Stop::Fault(fault)) = parser.feed(byte) {
+                return Some(format!(
+                    "{fault} at line {}, column {}",
+                    parser.line, parser.column
+                ));
+            }
+        }
+    }
+    match parser.finish() {
+        Err(Stop::Fault(fault)) => Some(format!(
+            "{fault} at EOF at line {}, column {}",
+            parser.line, parser.column
+        )),
+        _ => None,
+    }
 }
 
 /// Whether `message` is jq's parse-depth refusal, which jq's `main` prints as a parse error.

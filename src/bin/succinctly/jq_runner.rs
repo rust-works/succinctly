@@ -3628,6 +3628,9 @@ fn bail_if_keys_malformed<F: succinctly::jq::document::DocumentFields>(
 pub struct MalformedJsonError {
     message: String,
     kind: Option<ErrorKind>,
+    /// jq's own parse error for a slurped stream, and the source (an index into the command
+    /// line's files) and line jq's parser stood on when it met it (#5555).
+    stream_fault: Option<(usize, usize)>,
 }
 
 impl MalformedJsonError {
@@ -3639,7 +3642,17 @@ impl MalformedJsonError {
             EvalErrorPayload::Value(OwnedValue::String(text)) => (text.into_string(), None), // patchcov: coverage tolerate-line reason="unreachable by construction: every error this wrapper receives today is a decode or nesting-depth failure the evaluator raised itself, never error(v); kept so a future one is rendered rather than dropped (#2999)"
             EvalErrorPayload::Value(value) => (value.to_json(), None), // patchcov: coverage tolerate-line reason="see the arm above (#2999)"
         };
-        Self { message, kind }
+        Self {
+            message,
+            kind,
+            stream_fault: None,
+        }
+    }
+
+    /// This error worded by jq's parser, which met the fault in `source` at `line` (#5555).
+    fn at_stream_fault(mut self, source: usize, line: usize) -> Self {
+        self.stream_fault = Some((source, line));
+        self
     }
 
     /// The [`EvalError`] this was built from.
@@ -5119,7 +5132,11 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 // Line 0 of the first file, where `get_inputs` has always
                 // named a `--slurp` stream it could not finish splitting: the
                 // one combined value has no document position of its own.
-                Err(SlurpFailure::Unsplittable) => {
+                Err(SlurpFailure::Unsplittable(Some(message))) => {
+                    sink.report_parse_error(&message);
+                    return Ok(DiagStyle::Jq.error_exit_code());
+                }
+                Err(SlurpFailure::Unsplittable(None)) => {
                     let file = files.first().map(|p| p.to_string_lossy().to_string());
                     sink.report(
                         DiagStyle::Jq,
@@ -5514,7 +5531,8 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 // #5497: jq meets its depth limit first when the refused bracket comes before
                 // the fault the splitter stopped at.
                 let (line, column) = jq_stream_position(&raw_inputs, idx, offset);
-                if let Some(message) = jq::jq_depth_fault(&raw[offset..], line, column) {
+                // #5555: jq's parser names the fault, whether it is the depth limit or not.
+                if let Some(message) = jq::jq_stream_fault([&raw[offset..]], line, column) {
                     sink.report_parse_error(&message);
                     break;
                 }
@@ -5586,10 +5604,25 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                     if let Some(unopenable) = e.downcast_ref::<InputFileOpenError>() {
                         return Ok(report_unopenable_input(unopenable));
                     }
-                    let err = e.downcast::<MalformedJsonError>()?.to_eval_error();
+                    let malformed = e.downcast::<MalformedJsonError>()?;
+                    let err = malformed.to_eval_error();
                     let files = get_input_files(&args);
-                    let file = files.first().map(|p| p.to_string_lossy().to_string());
-                    sink.report(DiagStyle::Jq, &err, &InputLocation::at(file.as_deref(), 0));
+                    let name_of =
+                        |source: usize| files.get(source).map(|p| p.to_string_lossy().to_string());
+                    // #5555: jq's own parse error reads a slurped stream before the program
+                    // runs, so it is a parse error; under `-n` it is the error `inputs` raises,
+                    // at the position the parser stood on.
+                    match malformed.stream_fault {
+                        Some((source, line)) if args.null_input => {
+                            let at = InputLocation::at(name_of(source).as_deref(), line);
+                            sink.report(DiagStyle::Jq, &err, &at);
+                        }
+                        Some(_) => sink.report_parse_error(&err.message),
+                        None => {
+                            let at = InputLocation::at(name_of(0).as_deref(), 0);
+                            sink.report(DiagStyle::Jq, &err, &at);
+                        }
+                    }
                     return Ok(DiagStyle::Jq.error_exit_code());
                 }
                 Err(exit_code) => return Ok(exit_code), // Validation error
@@ -6757,7 +6790,13 @@ fn get_inputs(
                 // document, rather than through `anyhow` at exit 1.
                 if args.slurp {
                     if let Some(error) = parse_error {
-                        return Ok(Err(anyhow::Error::from(MalformedJsonError::new(error))));
+                        let malformed = MalformedJsonError::new(error);
+                        // #5555: the read that met the fault, as the resuming route places it.
+                        return Ok(Err(match slurp_fault_at(&raw, seam, parsed.len()) {
+                            Some(line) => malformed.at_stream_fault(src, line),
+                            None => malformed,
+                        }
+                        .into()));
                     }
                 }
                 // Skipped under `--slurp` (#1541) -- see the DSV branch above.
@@ -8034,6 +8073,15 @@ fn meet_fault(counter: &mut LineCounter<'_>, bytes: &[u8], start: usize) -> (usi
     (detected, line, resume)
 }
 
+/// The line jq's parser stands on when it meets the fault that ends `raw`'s clean prefix of
+/// `parsed` values, or `None` when the splitter finds no fault there (#5555).
+fn slurp_fault_at(raw: &str, seam: Seam, parsed: usize) -> Option<usize> {
+    let (spans, split_error) = split_json_values(raw.as_bytes());
+    let start = spans.get(parsed).map(|&(start, _)| start).or(split_error)?;
+    let mut faults = LineCounter::at_seam(raw.as_bytes(), seam);
+    Some(meet_fault(&mut faults, raw.as_bytes(), start).1)
+}
+
 /// Whether jq never reads the value at `span` because the fault in the
 /// malformed value starting at `malformed` is detected on the very byte that
 /// completes it (#4311). A number or literal completes on the byte after it, so
@@ -8528,8 +8576,9 @@ enum SlurpFailure {
     /// code to leave with.
     Validation(i32),
     /// A file's splitter gave up (a truncated container, a byte that starts
-    /// no token): the stream cannot be slurped.
-    Unsplittable,
+    /// no token): the stream cannot be slurped. Carries jq's own parse error for it (#5555),
+    /// when its parser stops there too.
+    Unsplittable(Option<String>),
     /// jq's parse-depth limit refuses the document the splitter gave up on, before the fault it
     /// stopped at (#5497). Reported as jq's parse error, without the position, as every depth
     /// refusal under `--slurp` is.
@@ -8577,6 +8626,8 @@ fn slurp_documents(
     let mut eof_line = 0;
     combined.push(b'[');
     let mut wrote_value = false;
+    // Where the current file starts in jq's input, which counts lines across files (#5555).
+    let mut origin = StreamOrigin::ALONE.file;
     for (idx, raw) in raw_inputs.into_iter().enumerate() {
         if validate {
             let filename = files.get(idx).map(|p| p.to_string_lossy().to_string());
@@ -8588,7 +8639,16 @@ fn slurp_documents(
             if jq::jq_depth_fault_offset(&raw[offset..]).is_some() {
                 return Err(SlurpFailure::DepthLimit);
             }
-            return Err(SlurpFailure::Unsplittable);
+            let (line, column) = advance_position(origin, &raw[..offset]);
+            return Err(SlurpFailure::Unsplittable(jq::jq_stream_fault(
+                [&raw[offset..]],
+                line,
+                column,
+            )));
+        }
+        if idx != last {
+            // The next file starts where jq's line and column counts leave off here.
+            origin = advance_position(origin, &raw);
         }
         for (start, end) in spans {
             if wrote_value {
@@ -8794,11 +8854,11 @@ fn parse_json_stream_prefix(
     // #5497: jq meets its depth limit first when the refused bracket comes before the fault
     // the splitter stopped at.
     let error = split_error.map(|offset| {
-        let depth = origin.and_then(|origin| {
+        let fault = origin.and_then(|origin| {
             let (line, column) = origin.position(text, lead + offset);
-            jq::jq_depth_fault(&bytes[offset..], line, column)
+            jq::jq_stream_fault([&bytes[offset..]], line, column)
         });
-        EvalError::new(depth.unwrap_or_else(|| String::from("Invalid JSON text")))
+        EvalError::new(fault.unwrap_or_else(|| String::from("Invalid JSON text")))
     });
     (values, error)
 }
@@ -11389,7 +11449,14 @@ fn json_document_to_owned_value_checked(
         }
     }
     let cursor = index.root(bytes);
-    validate_json_delimiters(&cursor, 0)?;
+    if let Err(error) = validate_json_delimiters(&cursor, 0) {
+        // #5555: a stream document words its fault the way jq's parser does.
+        let jq_fault = at.filter(|_| error.is_decode_failure()).and_then(|at| {
+            let (line, column) = at();
+            jq::jq_stream_fault([bytes], line, column)
+        });
+        return Err(jq_fault.map_or(error, EvalError::new));
+    }
     // `bytes` is often a temporary (an `--argjson` string, a `--seq` record),
     // so each NaN gets an identity of its own rather than its address (#3309).
     generic_to_owned::<JqSemantics, _>(&cursor.value())
@@ -14221,7 +14288,7 @@ mod tests {
                     s.eof_line,
                 )),
                 Err(f) => Err(match f {
-                    SlurpFailure::Unsplittable => "unsplittable",
+                    SlurpFailure::Unsplittable(_) => "unsplittable",
                     SlurpFailure::DepthLimit => "depth",
                     SlurpFailure::Validation(_) => "validation",
                 }),
