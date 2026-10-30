@@ -7,7 +7,7 @@ use std::fs;
 
 use anyhow::Result;
 
-use crate::run_jq_full;
+use crate::{run_jq_full, succinctly_bin};
 
 const SKIPPED: &str = "<skipped: too deep>";
 
@@ -281,5 +281,79 @@ fn test_colored_marker_takes_the_skipped_values_color_5497() -> Result<()> {
         "{}",
         &out[out.len().saturating_sub(200)..]
     );
+    Ok(())
+}
+
+/// The levels past the print depth can come from a document: a document 157 levels deep inside
+/// 100 levels the program builds puts the innermost array's elements, one of each kind, at
+/// level 257. The construction materializes the document, and the owned writer prints a marker
+/// for each element, under `-C` in that element's kind's color.
+#[test]
+fn test_document_levels_past_print_depth_print_the_marker_5497() -> Result<()> {
+    let document = nest("[", r#"[null,false,true,1,"s",[1],{"a":1}]"#, "]", 156);
+    let program = nest("[", ".", "]", 100);
+    let (out, err, exit) = run_jq_full(&["-c", &program], Some(&document))?;
+    assert_eq!((err.as_str(), exit), ("", 0));
+    assert_eq!(
+        out,
+        format!("{}\n", nest("[", &[SKIPPED; 7].join(","), "]", 257))
+    );
+
+    let (out, err, exit) = run_jq_full(&["-c", "-C", &program], Some(&document))?;
+    assert_eq!((err.as_str(), exit), ("", 0));
+    let marked = |color: &str| format!("\x1b[{color}m{SKIPPED}\x1b[0m");
+    let comma = "\x1b[1;39m,";
+    let want = [
+        marked("0;90"),
+        marked("0;39"),
+        marked("0;39"),
+        marked("0;39"),
+        marked("0;32"),
+        marked("1;39"),
+        marked("1;39"),
+    ]
+    .join(comma);
+    assert!(
+        out.contains(&format!("\x1b[1;39m[{want}\x1b[1;39m\x1b[1;39m]")),
+        "{out:?}"
+    );
+    Ok(())
+}
+
+/// A write that fails mid-stream (here, stdout closed by its reader) is reported and ends the
+/// run, without a panic. Before #5497 the writer's own depth guard was the error a test could
+/// make it return; the guard is gone, so a real write error keeps that path covered.
+#[test]
+fn test_closed_stdout_is_a_write_error_on_the_general_path_5497() -> Result<()> {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+
+    let records: Vec<String> = (0..40_000)
+        .map(|i| format!(r#"{{"id":{i},"name":"user{i}"}}"#))
+        .collect();
+    let input = format!("[{}]", records.join(","));
+    let mut child = Command::new(succinctly_bin())
+        .args(["jq", "-c", "map(.) | .[]"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().expect("piped");
+    let feeder = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+    let mut stdout = child.stdout.take().expect("piped");
+    let mut first = [0u8; 16];
+    stdout.read_exact(&mut first)?;
+    drop(stdout);
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("piped")
+        .read_to_string(&mut stderr)?;
+    let status = child.wait()?;
+    let _ = feeder.join();
+    assert!(!status.success(), "stderr: {stderr:?}");
+    assert!(stderr.contains("Broken pipe"), "stderr: {stderr:?}");
+    assert!(!stderr.contains("panicked"), "stderr: {stderr:?}");
     Ok(())
 }

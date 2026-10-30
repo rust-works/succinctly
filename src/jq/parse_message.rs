@@ -866,11 +866,11 @@ mod tests {
             }
             close.reverse();
             let text = format!("{open}1{}", close.concat());
+            let head = &text[..text.len().min(120)];
             assert_eq!(
                 stack_reaches(text.as_bytes(), JQ_MAX_PARSING_DEPTH),
                 parser_refuses(&text),
-                "{}",
-                &text[..text.len().min(120)]
+                "{head}"
             );
         }
         assert!(!stack_reaches(b"[\"unterminated", JQ_MAX_PARSING_DEPTH));

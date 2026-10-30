@@ -15227,6 +15227,74 @@ mod tests {
     /// writer merge first shipped without). It stays as a backstop against a future caller that skips that
     /// gate, so it is covered here directly rather than left as an
     /// unexercised line.
+    /// `print_json` writes jq's marker past the print depth too, plain or, for a formatter that
+    /// marks text about to be colored, as the kind's placeholder (#5497). A lazy value is never
+    /// that deep from the CLI: a construction above a document materializes it, so the owned
+    /// writer prints it, and this pins the branch directly.
+    #[test]
+    fn print_json_stops_at_print_depth_5497() {
+        // 257 debug-build `print_json` frames outgrow a 2 MiB test thread; the CLI prints on its
+        // evaluation thread, `EVAL_STACK_SIZE`.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let config = owned_print_configs_3009()
+                    .into_iter()
+                    .find(|c| c.compact && !c.color_output && !c.sort_keys && !c.ascii_output)
+                    .expect("a plain compact config");
+                let mut value: JqValue<'_, Vec<u64>> = JqValue::String("s".into());
+                for _ in 0..=succinctly::jq::JQ_MAX_PRINT_DEPTH {
+                    value = JqValue::Array(vec![value]);
+                }
+                let print = |formatter: &dyn Fn(&mut Vec<u8>) -> Result<()>| {
+                    let mut out = Vec::new();
+                    formatter(&mut out).unwrap();
+                    String::from_utf8(out).unwrap()
+                };
+                let levels = succinctly::jq::JQ_MAX_PRINT_DEPTH + 1;
+                let plain = print(&|out| {
+                    print_json(
+                        out,
+                        &value,
+                        &JqCompatFormatter,
+                        &config,
+                        0,
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                        None,
+                    )
+                });
+                assert_eq!(
+                    plain,
+                    format!(
+                        "{}{}{}",
+                        "[".repeat(levels),
+                        succinctly::jq::SKIPPED_TOO_DEEP,
+                        "]".repeat(levels)
+                    )
+                );
+                let marked = print(&|out| {
+                    print_json(
+                        out,
+                        &value,
+                        &NanMarkingFormatter(JqCompatFormatter),
+                        &config,
+                        0,
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                        None,
+                    )
+                });
+                assert_eq!(
+                    marked,
+                    format!("{}<s>{}", "[".repeat(levels), "]".repeat(levels))
+                );
+            })
+            .expect("spawns")
+            .join()
+            .expect("passes");
+    }
+
     #[test]
     fn print_owned_json_stops_at_print_depth_3009() {
         let config = OutputConfig {

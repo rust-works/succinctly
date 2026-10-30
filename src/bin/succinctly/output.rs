@@ -2723,6 +2723,85 @@ mod tests {
         );
     }
 
+    /// Every kind of value, owned or read through a cursor, maps to the kind jq colors its
+    /// marker with, and its placeholder comes back from the colorizer as the marker in that
+    /// color (#5497).
+    #[test]
+    fn skipped_kind_maps_marks_and_colors_every_kind_5497() {
+        use succinctly::jq::JqValue;
+        use succinctly::json::light::StandardJson;
+        use succinctly::json::JsonIndex;
+        use SkippedKind::*;
+
+        let owned = [
+            (OwnedValue::Null, Null),
+            (OwnedValue::Bool(false), False),
+            (OwnedValue::Bool(true), True),
+            (OwnedValue::Int(1), Number),
+            (OwnedValue::Float(1.5), Number),
+            (OwnedValue::String("s".into()), String),
+            (OwnedValue::array_from(vec![]), Array),
+            (OwnedValue::Object(IndexMap::new().into()), Object),
+        ];
+        for (value, kind) in &owned {
+            assert_eq!(SkippedKind::of(value), *kind, "{value:?}");
+        }
+
+        let lazy: Vec<(JqValue<'_, Vec<u64>>, SkippedKind)> = vec![
+            (JqValue::Null, Null),
+            (JqValue::Bool(false), False),
+            (JqValue::Bool(true), True),
+            (JqValue::Int(1), Number),
+            (JqValue::Float(1.5), Number),
+            (JqValue::RawNumber(b"1"), Number),
+            (JqValue::NumberLiteral("1".into()), Number),
+            (JqValue::String("s".into()), String),
+            (JqValue::Array(vec![]), Array),
+            (JqValue::LazyIndexRange(0), Array),
+            (JqValue::Object(Default::default()), Object),
+        ];
+        for (value, kind) in &lazy {
+            assert_eq!(SkippedKind::of_jq_value(value), *kind);
+        }
+        for (text, kind) in [
+            ("null", Null),
+            ("false", False),
+            ("true", True),
+            ("1", Number),
+            ("\"s\"", String),
+            ("[1]", Array),
+            ("{}", Object),
+        ] {
+            let index = JsonIndex::build(text.as_bytes());
+            let cursor = index.root(text.as_bytes());
+            assert_eq!(
+                SkippedKind::of_jq_value(&JqValue::Cursor(cursor)),
+                kind,
+                "{text}"
+            );
+            if let StandardJson::Object(fields) = cursor.value() {
+                let keys = JqValue::LazyKeysArray {
+                    fields,
+                    collapse: false,
+                };
+                assert_eq!(SkippedKind::of_jq_value(&keys), Array);
+            }
+        }
+
+        let scheme = ColorScheme::default();
+        for kind in [Null, False, True, Number, String, Array, Object] {
+            assert_eq!(kind.marker(false), SKIPPED_TOO_DEEP);
+            let placeholder = kind.marker(true);
+            let middle = placeholder.chars().nth(1).unwrap();
+            assert_eq!(SkippedKind::from_placeholder(middle), Some(kind));
+            assert_eq!(
+                colorize_json(placeholder, &scheme),
+                format!("{}{SKIPPED_TOO_DEEP}{}", kind.color(&scheme), scheme.reset)
+            );
+        }
+        assert_eq!(SkippedKind::from_placeholder('?'), None);
+    }
+
     /// jq's conventions print anything more than jq's print depth down as the marker, or, in
     /// text about to be colored, as the placeholder the colorizer turns into the marker in the
     /// skipped value's color (#5497).
