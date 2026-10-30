@@ -7195,7 +7195,9 @@ The documents before the refused one are printed, nothing after it is read, and 
 The default route writes jq's own line, `jq: parse error: Exceeds depth limit for parsing at line L, column C`, with the line counted across files as jq reads them; `input`/`inputs` raise the same message, catchable as in jq, and name the line jq has read to.
 `--seq` and `fromjson` already applied jq's limit through their own ports of jq's parser, and `--argjson`/`--jsonargs` refuse such text too.
 The check reads the balanced parentheses of the index each document already builds: no bracket can be refused below 129 nested containers, so a document whose parentheses never rise above 128 costs one popcount per 64 of them, and only a deeper one is read by a port of jq's parser (`jq_input_depth_fault`, `src/jq/parse_message.rs`).
-Measured with the A/B in the PR that landed it.
+Measured on an M4 Pro (`scripts/ab-cli.py`, interleaved, 11 repetitions, `-c` with `.` and `length`, against the commit before): documents of 1 to 100 MB (records, NDJSON lines, and the structurally densest generator pattern) read within the control run's noise, medians −2.2% to +1.3% against a control of −3.4% to +0.5%.
+A 6.9 MB document 200 levels deep, the one shape that takes the walk, reads +17% to +26%; the walk costs about 0.4 ms per MB, paid only by a document deeper than 128 levels.
+A 7950X read the ordinary rows neutral too (−4.2% to +2.4%, control −8.4% to +4.7%), measured before the walk replaced the parser on deep documents.
 
 What still differs:
 
@@ -9541,11 +9543,9 @@ reads) plus two consequences of the route:
   route ([`docs/plan/decode-failure-routing.md`](../../plan/decode-failure-routing.md)), where
   `-s` used to refuse the whole run. `{"\ud800":1}` under `-s` also stops printing the
   garbled `"\\ud800"` key the old route produced.
-- Nesting depth now follows the default route. Since #5497 a document past jq's parse-depth
-  limit is refused under `-s` as jq refuses it (the slurp array is not one of jq's levels),
-  without the position jq's message names (see "Nesting depth" above). A document at jq's own
-  limit of 256 reads and prints under `-s`, where the old route's extra array level pushed it
-  over its own ceiling.
+- Nesting depth now follows the default route.
+  Since #5497 a document past jq's parse-depth limit is refused under `-s` as jq refuses it (the slurp array is not one of jq's levels), without the position jq's message names (see "Nesting depth" above).
+  A document at jq's own limit of 256 reads and prints under `-s`, where the old route's extra array level pushed it over its own ceiling.
   **The routes that still materialize keep that ceiling, and it is a divergence from jq:** a
   256-level document under `--seq -s`, or under `-s` with `input`/`inputs`, exits 5 with
   `nesting depth exceeds limit of 256` (the slurp array is the 257th level), where jq 1.7.1
