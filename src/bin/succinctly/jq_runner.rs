@@ -6829,8 +6829,9 @@ fn get_inputs(
         let mut slurped_locations = InputLocations::single(at);
         if let Some(close) = unflushed_close {
             slurped.push(close);
-            // Read after the input is exhausted, so `input_line_number` is 0.
-            slurped_locations.push(0, 0);
+            // Read after the input is exhausted: no file, no line (`input_line_number` 0,
+            // `input_filename` null, `(at <unknown>)`).
+            slurped_locations.push(NO_SOURCE as usize, UNKNOWN_LINE as usize);
         }
         Ok(Ok((
             slurped,

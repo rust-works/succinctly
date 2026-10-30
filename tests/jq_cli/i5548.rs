@@ -111,6 +111,22 @@ fn test_the_held_back_closer_is_an_input_to_the_program_5548() -> Result<()> {
         (stdout.as_str(), code),
         ("[[[[0],1],[[1],2]],1]\n[[[1]],0]\n", 0)
     );
+    // ... and `input_filename` is null, not the last file's name.
+    let (stdout, _, code, paths) = run_jq_over_files(
+        &["-c", "--stream", "-s", "[input_filename, length]"],
+        &["[1,2]", "[3]"],
+    )?;
+    assert_eq!(stdout, format!("[{:?},4]\n[null,1]\n", paths[1]), "{code}");
+    // ... and an error on it names no position, where the slurped array's names the file.
+    let (_, stderr, _, paths) =
+        run_jq_over_files(&["-c", "--stream", "-s", r#"error("boom")"#], &["[1,2]"])?;
+    assert_eq!(
+        stderr,
+        format!(
+            "jq: error (at {}:0): boom\njq: error (at <unknown>): boom\n",
+            paths[0]
+        ),
+    );
     // Without `-s` the events are the same stream either way.
     let (stdout, _, code) = run_jq_full(&["-c", "--stream", "."], Some("[1,2]"))?;
     assert_eq!((stdout.as_str(), code), ("[[0],1]\n[[1],2]\n[[1]]\n", 0));
