@@ -40745,15 +40745,12 @@ mod tests {
             root: V,
             project: Option<&[String]>,
         ) -> Option<Result<OwnedValue, String>> {
-            let mut rest = root.as_array()?;
-            let (cursor, _) = rest.uncons_cursor()?;
+            let (cursor, _) = root.as_array()?.uncons_cursor()?;
             let item = GenericItem::OneCursor(cursor);
             let owned = match project {
                 Some(fields) => fold_element_into_owned::<V, JqSemantics>(item, fields),
                 None => generic_item_into_owned::<V, JqSemantics>(item),
             };
-            rest = rest;
-            let _ = rest;
             Some(owned.map_err(|control| match control {
                 Control::Error(error) => error.to_string(),
                 _ => "not an error".to_string(),
