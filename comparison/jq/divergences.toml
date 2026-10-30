@@ -143,56 +143,6 @@ category = "reference-crash"
 reason = "`[] | .[1e12] = 1`: jq aborts (SIGSEGV); succinctly refuses the index with an error (exit 5, #5500)."
 
 [[divergence]]
-id = "syntax:str-esc-surrogate"
-category = "to-triage"
-reason = "A surrogate pair escape in a program string literal (`\"\\ud83d\\ude00\"`) is `invalid unicode code point` (exit 3); jq 1.7.1 reads it as one character (#5590)."
-
-[[divergence]]
-id = "syntax:syn-keyword-field-then"
-category = "to-triage"
-reason = "`.then` is a compile error (exit 3); jq 1.7.1 reads a keyword after the dot as a field name and answers `null` (#5590)."
-
-[[divergence]]
-id = "syntax:syn-keyword-field-elif"
-category = "to-triage"
-reason = "`.elif` is a compile error (exit 3); jq 1.7.1 reads a keyword after the dot as a field name and answers `null` (#5590)."
-
-[[divergence]]
-id = "syntax:syn-keyword-field-else"
-category = "to-triage"
-reason = "`.else` is a compile error (exit 3); jq 1.7.1 reads a keyword after the dot as a field name and answers `null` (#5590)."
-
-[[divergence]]
-id = "syntax:syn-keyword-field-end"
-category = "to-triage"
-reason = "`.end` is a compile error (exit 3); jq 1.7.1 reads a keyword after the dot as a field name and answers `null` (#5590)."
-
-[[divergence]]
-id = "syntax:syn-keyword-field-as"
-category = "to-triage"
-reason = "`.as` is a compile error (exit 3); jq 1.7.1 reads a keyword after the dot as a field name and answers `null` (#5590)."
-
-[[divergence]]
-id = "syntax:syn-keyword-field-catch"
-category = "to-triage"
-reason = "`.catch` is a compile error (exit 3); jq 1.7.1 reads a keyword after the dot as a field name and answers `null` (#5590)."
-
-[[divergence]]
-id = "syntax:syn-keyword-field-and"
-category = "to-triage"
-reason = "`.and` is a compile error (exit 3); jq 1.7.1 reads a keyword after the dot as a field name and answers `null` (#5590)."
-
-[[divergence]]
-id = "syntax:syn-keyword-field-or"
-category = "to-triage"
-reason = "`.or` is a compile error (exit 3); jq 1.7.1 reads a keyword after the dot as a field name and answers `null` (#5590)."
-
-[[divergence]]
-id = "syntax:def-fn-ns"
-category = "to-triage"
-reason = "`def a::b: 1; a::b` is a compile error (exit 3); jq 1.7.1 accepts a namespaced function name (#5590)."
-
-[[divergence]]
 id = "syntax:str-format-urid"
 category = "newer-than-primary"
 reason = "`@urid` is new in jq 1.8, which decodes it; jq 1.7.1 answers `urid is not a valid format` (exit 5). succinctly follows the 1.8 behaviour for this format, documented in CLAUDE.md's format table."
