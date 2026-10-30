@@ -5,6 +5,7 @@
 //! and build-configuration diagnostics.
 
 use std::io::{BufWriter, Write};
+use std::rc::Rc;
 
 // Aliased: this module already has an `escape_json_body` of its own, which
 // picks *which* convention to use; the library's runs a chosen writer.
@@ -187,6 +188,8 @@ impl core::fmt::Display for InputLocation {
 /// independently.
 #[derive(Debug, Default)]
 pub struct ErrorSink {
+    stream_fault: Option<StreamFault>,
+    parse_stopped: bool,
     hit: bool,
     report_count: usize,
     /// How many of the reports the program itself raised (see [`Self::program_error_count`]).
@@ -198,9 +201,52 @@ pub struct ErrorSink {
     halt: Option<i32>,
 }
 
+/// jq's own parse error for the input stream, asked for only when a document turns out to be
+/// malformed (#5576). `None` from it means jq's parser reads the whole stream.
+#[derive(Clone)]
+pub struct StreamFault(Rc<dyn Fn() -> Option<String>>);
+
+impl StreamFault {
+    pub fn new(fault: impl Fn() -> Option<String> + 'static) -> Self {
+        Self(Rc::new(fault))
+    }
+}
+
+impl core::fmt::Debug for StreamFault {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("StreamFault")
+    }
+}
+
 impl ErrorSink {
+    /// Word a document the lazy route finds malformed as jq's parser does, by asking `fault` for
+    /// the stream's first parse error when one is reported (#5576). The lazy route reads a
+    /// member only when the filter does, so it knows its own slice and nothing of the stream;
+    /// `fault` re-reads the stream, on that error path alone.
+    pub fn set_stream_fault(&mut self, fault: StreamFault) {
+        self.stream_fault = Some(fault);
+    }
+
+    /// Whether a malformed document was reported as jq's parse error. jq reads no further after
+    /// one, so the caller reads no further input either (#5576).
+    pub fn parse_stopped(&self) -> bool {
+        self.parse_stopped
+    }
+
     /// Report an uncaught evaluation error and mark the run as failed.
     pub fn report(&mut self, style: DiagStyle, err: &EvalError, at: &InputLocation) {
+        if err.is_decode_failure() {
+            // Asked once: when jq's parser reads the stream clean, a later decode failure has
+            // no parse error to be worded as, and re-reading the stream for each would make a
+            // run of malformed documents quadratic.
+            if let Some(fault) = self.stream_fault.take() {
+                if let Some(message) = (fault.0)() {
+                    self.report_parse_error(&message);
+                    self.parse_stopped = true;
+                    return;
+                }
+            }
+        }
         if err.is_decode_failure() || err.is_resource_limit() {
             self.beyond_jq = true;
         } else {
@@ -1805,6 +1851,44 @@ mod tests {
             &InputLocation::at(None, 1),
         );
         assert!(sink.hit(), "an uncaught error must fail the run");
+    }
+
+    /// #5576: a decode failure is worded as jq's parse error when jq's parser has one for the
+    /// stream, and stops the run; when it has none, the evaluator's own report stands and the
+    /// stream is not read again for the next one.
+    #[test]
+    fn test_error_sink_words_a_decode_failure_as_jqs_parse_error_5576() {
+        use std::cell::Cell;
+        let asked = Rc::new(Cell::new(0));
+        let mut sink = ErrorSink::default();
+        let counter = Rc::clone(&asked);
+        sink.set_stream_fault(StreamFault::new(move || {
+            counter.set(counter.get() + 1);
+            None
+        }));
+        let at = InputLocation::at(Some("a.json"), 1);
+        let decode = EvalError::decode_failure("bad");
+        sink.report(DiagStyle::Jq, &decode, &at);
+        sink.report(DiagStyle::Jq, &decode, &at);
+        assert_eq!(
+            asked.get(),
+            1,
+            "jq's parser is asked once, then its answer stands"
+        );
+        assert!(!sink.parse_stopped(), "no parse error, so the run reads on");
+        assert!(sink.hit() && sink.beyond_jq());
+
+        let mut sink = ErrorSink::default();
+        sink.set_stream_fault(StreamFault::new(|| Some(String::from("jq's message"))));
+        sink.report(DiagStyle::Jq, &EvalError::new("a type error"), &at);
+        assert!(
+            !sink.parse_stopped(),
+            "only a decode failure is worded by jq's parser"
+        );
+        sink.report(DiagStyle::Jq, &decode, &at);
+        assert!(sink.parse_stopped());
+        assert!(!sink.beyond_jq(), "jq's own error, not one beyond it");
+        assert_eq!(sink.report_count(), 2);
     }
 
     #[test]

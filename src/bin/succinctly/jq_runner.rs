@@ -33,7 +33,7 @@ use super::m2_gate::can_use_m2_streaming;
 use super::{JqCommand, OnError};
 use crate::output::{
     self, escape_json_string, escape_json_string_ascii, exit_codes, flush_then_err, ColorScheme,
-    DiagStyle, ErrorSink, InputLocation, JsonFormatOpts, LoudFlushWriter, Terminator,
+    DiagStyle, ErrorSink, InputLocation, JsonFormatOpts, LoudFlushWriter, StreamFault, Terminator,
 };
 
 /// One word taken by `--args` (a string) or `--jsonargs` (JSON text), kept
@@ -4505,7 +4505,8 @@ impl FinishedInputs {
 
 /// Whether `--on-error=stop` has seen an error, so nothing more is read or evaluated (#5471).
 fn stopped(on_error: Option<OnError>, sink: &ErrorSink) -> bool {
-    on_error == Some(OnError::Stop) && sink.hit()
+    // #5576: jq's parser reads nothing after the fault it has reported.
+    sink.parse_stopped() || (on_error == Some(OnError::Stop) && sink.hit())
 }
 
 /// The exit code of a run `halt`/`halt_error` ended: its own, unless an input file did not
@@ -5169,6 +5170,22 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
         } else {
             (raw_inputs, None)
         };
+        // #5576: a malformed member this route meets when the filter reads it is worded as jq's
+        // parser words it, from the stream's first fault. The buffers are shared with the loop
+        // below, not copied; a slurped stream's are gone, so it is read again from its files.
+        let raw_inputs = std::rc::Rc::new(raw_inputs);
+        sink.set_stream_fault(match slurped {
+            None => {
+                let raw_inputs = std::rc::Rc::clone(&raw_inputs);
+                StreamFault::new(move || {
+                    jq::jq_stream_fault(raw_inputs.iter().map(Vec::as_slice), 1, 0)
+                })
+            }
+            Some(_) => {
+                let files = files.clone();
+                StreamFault::new(move || reread_stream_fault(&files))
+            }
+        });
 
         // Check if we can use the identity fast path (raw bytes output, no materialization)
         let use_identity_fast_path = expr.is_identity() && output_config.can_use_raw_identity();
@@ -5479,8 +5496,9 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                             // (#1194). Stop emitting results for *this* document,
                             // but fall through to the halt check below and carry
                             // on with the rest of the stream (#355) -- real jq
-                            // stops at the first parse error instead, a
-                            // divergence recorded in
+                            // stops at the first parse error instead, which the
+                            // sink does too when jq's parser also stops on the
+                            // stream (#5576); the rest is a divergence recorded in
                             // `docs/compliance/jq/limitations.md`.
                             let stop = route_write_error(
                                 sink,
@@ -8721,6 +8739,18 @@ fn slurp_fault(
         }
         _ => jq::jq_stream_fault([raw], origin.0, origin.1),
     }
+}
+
+/// jq's parse error for the stream `files` hold, read again from disk, or `None` when jq's
+/// parser reads it all or a file cannot be read again (#5576). Stdin has no file to read again,
+/// so a stream slurped from it keeps the evaluator's own wording.
+fn reread_stream_fault(files: &[PathBuf]) -> Option<String> {
+    let mut all: Vec<Vec<u8>> = files
+        .iter()
+        .map(|path| std::fs::read(path).ok())
+        .collect::<Option<_>>()?;
+    strip_leading_json_bom(all.iter_mut());
+    jq::jq_stream_fault(all.iter().map(Vec::as_slice), 1, 0)
 }
 
 /// Join every top-level value of every input, in order, into one JSON array
