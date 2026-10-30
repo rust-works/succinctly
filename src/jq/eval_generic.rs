@@ -14314,6 +14314,8 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             let mut outputs: Vec<OwnedValue> = Vec::new();
             let retry =
                 crate::jq::eval::FoldDirectRetry::of::<S>(init, input, patterns, update, None);
+            let projection =
+                crate::jq::eval::fold_loop_var_projection::<S>(patterns, update, None, retry);
             let flow = reduce_forks::<S>(
                 patterns,
                 update,
@@ -14324,6 +14326,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                         optional,
                         cursor,
                         retry.marks_loop_vars(),
+                        None,
                         per_init,
                     )
                 },
@@ -14335,6 +14338,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                         &value,
                         optional,
                         cursor,
+                        projection.as_deref(),
                         per_element,
                     )
                 },
@@ -14392,6 +14396,12 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 update,
                 extract.as_deref(),
             );
+            let projection = crate::jq::eval::fold_loop_var_projection::<S>(
+                patterns,
+                update,
+                extract.as_deref(),
+                retry,
+            );
             let flow = foreach_forks::<S>(
                 patterns,
                 update,
@@ -14403,6 +14413,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                         optional,
                         cursor,
                         retry.marks_loop_vars(),
+                        None,
                         per_init,
                     )
                 },
@@ -14414,6 +14425,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                         &value,
                         optional,
                         cursor,
+                        projection.as_deref(),
                         per_element,
                     )
                 },
@@ -15919,6 +15931,7 @@ fn drive_foreach_expr_generic<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
     register_first: bool,
+    project: Option<&[String]>,
     per_item: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Flow {
     // Out-of-band, same as `stream_owned_outputs_generic`'s own
@@ -15930,7 +15943,13 @@ fn drive_foreach_expr_generic<S: EvalSemantics, V: DocumentValue>(
     let mut first = register_first;
     let flow = eval_each_generic::<S, V>(expr, value.clone(), optional, cursor, &mut |item| {
         if !core::mem::take(&mut first) {
-            return match generic_item_into_owned::<_, S>(item) {
+            // Branched here rather than inside a helper that takes `Option`: the unprojected fold
+            // (every fold but a `$u.field` one) does not move the item through a second call.
+            let owned = match project {
+                Some(fields) => fold_element_into_owned::<_, S>(item, fields),
+                None => generic_item_into_owned::<_, S>(item),
+            };
+            return match owned {
                 Ok(v) => per_item(v),
                 Err(control) => stop_with_escape(&mut escape, control),
             };
@@ -15963,12 +15982,13 @@ fn drive_fold_source_generic<S: EvalSemantics, V: DocumentValue>(
     value: &V,
     optional: bool,
     cursor: Option<V::Cursor>,
+    project: Option<&[String]>,
     per_item: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Flow {
     match source_input {
-        crate::jq::eval::SourceInput::Real => {
-            drive_foreach_expr_generic::<S, V>(source, value, optional, cursor, false, per_item)
-        }
+        crate::jq::eval::SourceInput::Real => drive_foreach_expr_generic::<S, V>(
+            source, value, optional, cursor, false, project, per_item,
+        ),
         crate::jq::eval::SourceInput::Null => {
             crate::jq::eval::drive_source_against_null::<S>(source, optional, per_item)
         }
@@ -15992,6 +16012,7 @@ fn each_reduce_generic<S: EvalSemantics, V: DocumentValue>(
     // reruns against the fold's own accumulator, never the ambient cursor,
     // and `reduce_forks` demotes it against `Owned` itself.
     let retry = crate::jq::eval::FoldDirectRetry::of::<S>(init, input, patterns, update, None);
+    let projection = crate::jq::eval::fold_loop_var_projection::<S>(patterns, update, None, retry);
     reduce_forks::<S>(
         patterns,
         update,
@@ -16002,6 +16023,7 @@ fn each_reduce_generic<S: EvalSemantics, V: DocumentValue>(
                 optional,
                 cursor,
                 retry.marks_loop_vars(),
+                None,
                 per_init,
             )
         },
@@ -16013,6 +16035,7 @@ fn each_reduce_generic<S: EvalSemantics, V: DocumentValue>(
                 &value,
                 optional,
                 cursor,
+                projection.as_deref(),
                 per_element,
             )
         },
@@ -16054,6 +16077,8 @@ fn each_foreach_generic<S: EvalSemantics, V: DocumentValue>(
     // `update`/`extract` rerun against the fold's own accumulator, never the
     // ambient cursor, and `foreach_forks` demotes them against `Owned` itself.
     let retry = crate::jq::eval::FoldDirectRetry::of::<S>(init, input, patterns, update, extract);
+    let projection =
+        crate::jq::eval::fold_loop_var_projection::<S>(patterns, update, extract, retry);
     foreach_forks::<S>(
         patterns,
         update,
@@ -16065,6 +16090,7 @@ fn each_foreach_generic<S: EvalSemantics, V: DocumentValue>(
                 optional,
                 cursor,
                 retry.marks_loop_vars(),
+                None,
                 per_init,
             )
         },
@@ -16076,6 +16102,7 @@ fn each_foreach_generic<S: EvalSemantics, V: DocumentValue>(
                 &value,
                 optional,
                 cursor,
+                projection.as_deref(),
                 per_element,
             )
         },
@@ -20655,6 +20682,101 @@ fn generic_item_into_owned<V: DocumentValue, S: EvalSemantics>(
             unreachable!("a single GenericItem never materializes to a multi-output or lazy shape")
         }
     }
+}
+
+/// [`generic_item_into_owned`] for the loop element of a `reduce`/`foreach` (#5519). With `fields`
+/// (the members the fold's UPDATE and EXTRACT read, and nothing else of the loop variable:
+/// [`crate::jq::eval::fold_loop_var_projection`]) an object element of a JSON document is converted
+/// to an object holding only those members, instead of to a value of its whole subtree. The
+/// conversion was ~40% of a `reduce .users[] as $u (0; .+$u.score)` over a 51 MB document (IndexMap
+/// inserts, hashing, malloc) for a body that reads one member.
+///
+/// One pass over the object's members, checked as `to_owned_cursor_at_depth`'s object arm checks
+/// them: every key resolves (the #1642 collision rules included), the delimiters around each
+/// member and the object's tail hold, and an unpaired trailing member raises. Only a wanted
+/// member's *value* is walked, by the same child walk and at the same depth the whole conversion
+/// uses; a repeated wanted key is walked at each occurrence and the last wins, as in jq. What an
+/// unread member's value holds is never decoded, so it can no longer fail the fold: the rule
+/// `.[] as $x | $x.k` already follows through a deferred bind (#3856) and `any`/`all`/`isvalid`/
+/// `until` through #2658 -- a filter validates only what it materializes
+/// (`docs/compliance/jq/limitations.md`, ADR-0018's #2103 amendment). Validating the rest first
+/// (`validate_cursor`) would keep jq's answer but costs most of what the projection saves
+/// (measured, #5519). An element that is not an object of a [`DocumentCursor::PROJECTS_MEMBERS`]
+/// format takes the whole conversion.
+///
+/// Fallible like [`generic_item_into_owned`], and adjudicated by the same caller: the error goes
+/// out raw as a [`Control`], and [`drive_foreach_expr_generic`] hands it to `stop_with_escape` for
+/// `eval::reduce_forks`/`foreach_forks`, which own the `suppresses` decision (STYLE-0012).
+fn fold_element_into_owned<V: DocumentValue, S: EvalSemantics>(
+    item: GenericItem<V>,
+    fields: &[String],
+) -> Result<OwnedValue, Control> {
+    if let GenericItem::OneCursor(cursor) | GenericItem::OneCursorValue(cursor, _) = &item {
+        if V::Cursor::PROJECTS_MEMBERS {
+            let value = cursor.value();
+            if let Some(members) = value.as_object_rendered() {
+                // A loop variable nothing reads materializes nothing of its element: the same
+                // rule that leaves `.[] as $x | 1` unvalidated.
+                if fields.is_empty() {
+                    return Ok(OwnedValue::object_from([]));
+                }
+                return project_object_members::<V::Cursor, S>(cursor, &value, members, fields)
+                    .map_err(Control::Error);
+            }
+        }
+    }
+    generic_item_into_owned::<_, S>(item)
+}
+
+/// [`fold_element_into_owned`]'s object walk: `to_owned_cursor_at_depth`'s object arm with the
+/// value of every member not in `fields` left unwalked.
+fn project_object_members<C: DocumentCursor, S: EvalSemantics>(
+    cursor: &C,
+    value: &C::Value,
+    members: <C::Value as DocumentValue>::Fields,
+    fields: &[String],
+) -> Result<OwnedValue, EvalError> {
+    // The walk's first check, at the element's own depth.
+    nesting_depth_check(0)?;
+    let mut ledger = LazyKeyLedger::default();
+    let mut found: Vec<(usize, OwnedValue)> = vec_with_capacity(fields.len());
+    let mut f = members;
+    let mut consumed = 0usize;
+    let mut last_field: Option<C> = None;
+    while let Some((field, rest)) = f.uncons() {
+        field.checked_key_lazy(&f, || value.as_object_rendered(), consumed, &mut ledger)?;
+        let wanted = field
+            .key
+            .display_key_kind()
+            .and_then(|(key, _)| fields.iter().position(|name| *name == *key));
+        if let Some(slot) = wanted {
+            let child = walk_child::<S, _, BuildOwned>(
+                &field.value_cursor,
+                None,
+                1,
+                &nesting_depth_check,
+                &|_, _| None,
+                &[],
+            )?;
+            // A later occurrence of the key replaces the earlier one.
+            match found.iter_mut().find(|(at, _)| *at == slot) {
+                Some(entry) => entry.1 = child,
+                None => found.push((slot, child)),
+            }
+        }
+        last_field = Some(field.value_cursor);
+        f = rest;
+        consumed += 1;
+    }
+    if f.ends_unpaired() {
+        return Err(f.malformed_member_error());
+    }
+    container_tail_gap_ok(cursor, last_field.as_ref(), b'}')?;
+    Ok(OwnedValue::object_from(
+        found
+            .into_iter()
+            .map(|(slot, child)| (fields[slot].clone(), child)),
+    ))
 }
 
 /// `item` with whatever decode it still owes forced, so its failure is raised
@@ -40586,6 +40708,87 @@ mod tests {
         assert_eq!(depth_guard_panic_message(&other), None);
         let not_text: Box<dyn core::any::Any + Send> = Box::new(7_u32);
         assert_eq!(depth_guard_panic_message(&*not_text), None);
+    }
+
+    /// #5519: a fold's loop element is converted to the members the fold reads and nothing else.
+    /// The pin must be able to fail: it does, with `fold_element_into_owned` made to ignore
+    /// `project`, which gives back the whole object.
+    #[test]
+    fn a_fold_element_is_projected_to_the_members_it_reads_5519() {
+        fn elements<V: DocumentValue>(
+            root: V,
+            project: Option<&[String]>,
+        ) -> Vec<Result<String, String>> {
+            let mut out = Vec::new();
+            let mut rest = root.as_array().expect("an array root");
+            while let Some((cursor, next)) = rest.uncons_cursor() {
+                let item = GenericItem::OneCursor(cursor);
+                out.push(
+                    match project {
+                        Some(fields) => fold_element_into_owned::<V, JqSemantics>(item, fields),
+                        None => generic_item_into_owned::<V, JqSemantics>(item),
+                    }
+                    .map(|v| v.to_json())
+                    .map_err(|control| match control {
+                        Control::Error(error) => error.to_string(),
+                        _ => "not an error".to_string(),
+                    }),
+                );
+                rest = next;
+            }
+            out
+        }
+        let json = br#"[{"a":1,"b":"x","c":[1,{"d":2}],"a":7},5,[1],{"b":2}]"#;
+        let index = JsonIndex::build(json);
+        let fields = ["a".to_string(), "zz".to_string()];
+        let projected = elements(index.root(json).value(), Some(&fields));
+        let projected: Vec<_> = projected.into_iter().map(|r| r.expect("decodes")).collect();
+        // The object keeps `a` (the last of the repeated key) and drops the rest; an absent
+        // field is simply not there; a non-object element is converted whole.
+        assert_eq!(projected, [r#"{"a":7}"#, "5", "[1]", "{}"]);
+        let none: [String; 0] = [];
+        let unread = elements(index.root(json).value(), Some(&none));
+        assert_eq!(unread[0].as_deref(), Ok("{}"));
+        let whole = elements(index.root(json).value(), None);
+        assert_eq!(
+            whole[0].as_deref(),
+            Ok(r#"{"a":7,"b":"x","c":[1,{"d":2}]}"#)
+        );
+        // The object's own frame is checked whatever is read: a stray `,`, a missing value or a
+        // missing `:` fails the element, as the whole conversion fails it.
+        for malformed in [
+            &br"[{,}]"[..],
+            br#"[{"a"}]"#,
+            br#"[{"a":}]"#,
+            br"[{:1}]",
+            br#"[{"a":1,}]"#,
+            br#"[{"a":1 "b":2}]"#,
+            br#"[{"a":1,,"b":2}]"#,
+        ] {
+            let index = JsonIndex::build(malformed);
+            let only_a = ["a".to_string()];
+            assert!(
+                elements(index.root(malformed).value(), Some(&only_a))[0].is_err(),
+                "{}",
+                String::from_utf8_lossy(malformed)
+            );
+            assert!(
+                elements(index.root(malformed).value(), None)[0].is_err(),
+                "{}",
+                String::from_utf8_lossy(malformed)
+            );
+        }
+        // A member nothing reads is not decoded, so it cannot fail the element; one that is read is.
+        let bad = br#"[{"a":"\ud800","b":5}]"#;
+        let index = JsonIndex::build(bad);
+        let only_b = ["b".to_string()];
+        assert_eq!(
+            elements(index.root(bad).value(), Some(&only_b))[0].as_deref(),
+            Ok(r#"{"b":5}"#)
+        );
+        let only_a = ["a".to_string()];
+        assert!(elements(index.root(bad).value(), Some(&only_a))[0].is_err());
+        assert!(elements(index.root(bad).value(), None)[0].is_err());
     }
 
     /// #2783: the generic evaluator collects a `{...}` holding a bare entry the way

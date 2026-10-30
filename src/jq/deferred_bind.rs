@@ -80,6 +80,8 @@
 //! (#2889, #3134, #3177).
 
 use alloc::rc::Rc;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 use super::document::DocumentCursor;
 use super::expr::{BindOrigin, Builtin, Expr, ObjectKey};
@@ -208,27 +210,54 @@ pub(crate) fn deferred_bind_reads(body: &Expr, var: &str) -> Option<DeferredRead
     (LAZY_SHARES && walk(body, var, sharing, false).is_some()).then_some(DeferredReads::Sharing)
 }
 
-/// Whether `body` reads `$var` anywhere but as the head of a field chain
-/// (`$x.a`), which is the only read that never materializes the node.
-/// Over-approximate, like [`mentions_var`]: a read it cannot place counts.
-fn reads_whole_node(body: &Expr, var: &str) -> bool {
+/// How `body` reads `$var`: which fields it reads as the head of a field chain (`$x.a`,
+/// `$x.a?`), and whether it reads the variable any other way.
+///
+/// The one definition of a field-head read (#5519 review): the deferred bind asks whether the
+/// node must be materialized, a fold asks which members of its loop element must be.
+pub(crate) struct VarReads {
+    /// The distinct fields read as `$var.k` / `$var.k?`, in first-read order.
+    pub(crate) fields: Vec<String>,
+    /// Whether `$var` is read anywhere but as the head of a field chain, which is the only read
+    /// that never materializes the node. Over-approximate, like [`mentions_var`]: a read it
+    /// cannot place counts.
+    pub(crate) whole: bool,
+}
+
+/// [`VarReads`] of `body` for `$var`.
+pub(crate) fn var_reads(body: &Expr, var: &str) -> VarReads {
     let (mut reads, mut heads) = (0usize, 0usize);
+    let mut fields: Vec<String> = Vec::new();
     any_subexpr(body, &mut |e| {
         match e {
             Expr::Var(name) if name == var => reads += 1,
             Expr::Pipe(stages) => {
-                heads += stages
-                    .windows(2)
-                    .filter(|w| {
-                        matches!(&w[0], Expr::Var(name) if name == var) && is_field_read(&w[1])
-                    })
-                    .count();
+                for pair in stages.windows(2) {
+                    if !matches!(&pair[0], Expr::Var(name) if name == var) {
+                        continue;
+                    }
+                    if let Some(field) = field_read(&pair[1]) {
+                        heads += 1;
+                        if !fields.contains(field) {
+                            fields.push(field.clone());
+                        }
+                    }
+                }
             }
             _ => {}
         }
         false
     });
-    reads > heads
+    VarReads {
+        fields,
+        whole: reads > heads,
+    }
+}
+
+/// Whether `body` reads `$var` anywhere but as the head of a field chain
+/// (`$x.a`), which is the only read that never materializes the node.
+fn reads_whole_node(body: &Expr, var: &str) -> bool {
+    var_reads(body, var).whole
 }
 
 /// Whether `expr` reads `$var` anywhere. Over-approximate: a nested binder
@@ -274,13 +303,21 @@ fn may_yield_many(expr: &Expr) -> bool {
     }
 }
 
+/// The field a stage reads from an object: `.k`, `.k?`.
+fn field_read(stage: &Expr) -> Option<&String> {
+    match stage {
+        Expr::Field(field) => Some(field),
+        Expr::Optional(inner) => match inner.as_ref() {
+            Expr::Field(field) => Some(field),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// A stage that reads one member of an object: `.k`, `.k?`.
 fn is_field_read(stage: &Expr) -> bool {
-    match stage {
-        Expr::Field(_) => true,
-        Expr::Optional(inner) => matches!(inner.as_ref(), Expr::Field(_)),
-        _ => false,
-    }
+    field_read(stage).is_some()
 }
 
 /// A stage that navigates into what it is handed: `.k`, `.[3]`, `.[]`,

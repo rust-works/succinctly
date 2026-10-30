@@ -80886,6 +80886,59 @@ fn mentions_any_name(expr: &Expr, names: &[String]) -> bool {
     )
 }
 
+/// The most fields a fold's projection will name (#5519). The projection walks an element's members
+/// once and keeps the ones named, matching each key against the names, so it costs a little more
+/// per named field and saves the conversion of every member left out. Measured on 20-member
+/// records (interleaved A/B, 10 MB): reading 1, 5 and 10 of the 20 fields is 45%, 34% and 15%
+/// faster on a 7950X and 47%, 28% and 15% faster on an M4 Pro, and reading all 20 is 21% slower
+/// on the 7950X and 5% slower on the M4 Pro. A fold naming more fields than this converts the
+/// element whole.
+pub(crate) const MAX_PROJECTED_FIELDS: usize = 8;
+
+/// The fields of a fold's loop variable that its UPDATE and EXTRACT read, when those are the *only*
+/// reads (#5519): the element handed to the fold then needs only those members, and the rest of it
+/// is never converted to a value.
+///
+/// `Some(fields)` (possibly empty, for a loop variable nothing reads) when the fold is jq mode, has
+/// one plain `as $name` pattern, marks no loop variable as a path-position read
+/// ([`FoldDirectRetry`]), and reads `$name` in UPDATE and EXTRACT only as the head of a field read
+/// (`$name.k`, `$name.k?`; [`var_reads`](super::deferred_bind::var_reads)). Any other read -- bare
+/// `$name`, `$name[..]`, a dynamic key -- sees the whole element, so the answer is `None`.
+///
+/// Identity sharing (`retry.shares`, a body that compares or calls) does not decline it: the shared
+/// storage is then the projected object's, whose fields are the element's own values, so the answer
+/// does not depend on how the update spells its read.
+///
+/// Over-approximate in the safe direction, like [`mentions_var`]: a nested binder of the same name
+/// counts as a read of this one, which can only decline a projection or keep a field that was not
+/// needed. A fold naming more than [`MAX_PROJECTED_FIELDS`] fields declines too.
+pub(crate) fn fold_loop_var_projection<S: EvalSemantics>(
+    patterns: &[Pattern],
+    update: &Expr,
+    extract: Option<&Expr>,
+    retry: FoldDirectRetry,
+) -> Option<Vec<String>> {
+    if S::TAG != EvalTag::Jq || retry.marks {
+        return None;
+    }
+    let [Pattern::Var(name)] = patterns else {
+        return None;
+    };
+    let mut fields: Vec<String> = Vec::new();
+    for body in core::iter::once(update).chain(extract) {
+        let reads = super::deferred_bind::var_reads(body, name);
+        if reads.whole {
+            return None;
+        }
+        for field in reads.fields {
+            if !fields.contains(&field) {
+                fields.push(field);
+            }
+        }
+    }
+    (fields.len() <= MAX_PROJECTED_FIELDS).then_some(fields)
+}
+
 /// Whether `expr` reads one of `names` *and* holds a node that can run jq's
 /// value equality: a `==`/`!=` anywhere, or an array subtraction, a builtin or
 /// a call (whose body may compare: `unique`, `index`, `IN`, a `def f: $a == $a`)
@@ -115360,6 +115413,114 @@ mod tests {
                 .collect::<Vec<_>>(),
             // jq's own canonical spelling, not Rust's f64 Display -- #1035.
             ["1E+100"]
+        );
+    }
+
+    /// #5519: a fold projects its loop element to the fields it reads only when `$u.field` is the
+    /// sole way it reads `$u`; any other read, a destructuring pattern, a marked path read or
+    /// yq mode sees the whole element.
+    #[test]
+    fn test_fold_loop_var_projection_5519() {
+        fn projection<S: EvalSemantics>(program: &str) -> Option<Vec<String>> {
+            let (input, patterns, init, update, extract) = match parse(program).unwrap() {
+                Expr::Reduce {
+                    input,
+                    patterns,
+                    init,
+                    update,
+                } => (input, patterns, init, update, None),
+                Expr::Foreach {
+                    input,
+                    patterns,
+                    init,
+                    update,
+                    extract,
+                } => (input, patterns, init, update, extract),
+                other => panic!("{program}: not a fold: {other:?}"),
+            };
+            let retry =
+                FoldDirectRetry::of::<S>(&init, &input, &patterns, &update, extract.as_deref());
+            fold_loop_var_projection::<S>(&patterns, &update, extract.as_deref(), retry)
+        }
+        let jq = |program: &str| projection::<JqSemantics>(program);
+        let names =
+            |fields: &[&str]| Some(fields.iter().copied().map(String::from).collect::<Vec<_>>());
+        assert_eq!(jq("reduce .[] as $u (0; . + $u.score)"), names(&["score"]));
+        assert_eq!(
+            jq("reduce .[] as $u (0; . + $u.a + $u.b + $u.a)"),
+            names(&["a", "b"])
+        );
+        assert_eq!(
+            jq("reduce .[] as $u (0; . + ($u | .a) + ($u.b? // 0))"),
+            names(&["a", "b"])
+        );
+        assert_eq!(jq("reduce .[] as $u (0; . + $u.a.b)"), names(&["a"]));
+        // A string-literal index parses to the same field read.
+        assert_eq!(jq("reduce .[] as $u (0; . + $u[\"a\"])"), names(&["a"]));
+        assert_eq!(
+            jq("reduce .[] as $u (0; [$u.a, $u.b][0])"),
+            names(&["a", "b"])
+        );
+        // Reading through a builtin, a comparison or a call does not decline: the answer must not
+        // depend on how the update spells its read.
+        assert_eq!(
+            jq("reduce .[] as $u (0; . + ($u.a | floor))"),
+            names(&["a"])
+        );
+        assert_eq!(
+            jq("reduce .[] as $u (0; if $u.a == $u.b then . + 1 else . end)"),
+            names(&["a", "b"])
+        );
+        assert_eq!(jq("reduce .[] as $u (0; . - $u.a)"), names(&["a"]));
+        assert_eq!(
+            jq("reduce .[] as $u (0; . + ([limit($u.n; 1, 2)] | length))"),
+            names(&["n"])
+        );
+        // More fields than the projection pays for converts the element whole.
+        let many = |count: usize| {
+            let sum = (0..count)
+                .map(|i| format!("$u.f{i}"))
+                .collect::<Vec<_>>()
+                .join(" + ");
+            format!("reduce .[] as $u (0; . + {sum})")
+        };
+        assert_eq!(
+            jq(&many(MAX_PROJECTED_FIELDS)).map(|fields| fields.len()),
+            Some(MAX_PROJECTED_FIELDS)
+        );
+        assert_eq!(jq(&many(MAX_PROJECTED_FIELDS + 1)), None);
+        // A loop variable nothing reads needs no member at all.
+        assert_eq!(jq("reduce .[] as $u (0; . + 1)"), names(&[]));
+        // EXTRACT is read too.
+        assert_eq!(
+            jq("foreach .[] as $u (0; . + 1; $u.name)"),
+            names(&["name"])
+        );
+        assert_eq!(
+            jq("foreach .[] as $u (0; . + $u.s; [., $u.t])"),
+            names(&["s", "t"])
+        );
+        // Any read that is not a field head sees the whole element.
+        for program in [
+            "reduce .[] as $u (0; . + ($u | length))",
+            "reduce .[] as $u ([]; . + [$u])",
+            "reduce .[] as $u (0; . + $u.a + ($u | length))",
+            "reduce .[] as $u (0; . + $u[$u.k])",
+            "reduce .[] as $u (0; . + ($u | .a, .b))",
+            "foreach .[] as $u (0; . + 1; $u)",
+            // A path-position read keeps the element whole (the marker's error text names it).
+            "reduce .[] as $u (0; try ($u.a = 3) catch .)",
+            // A destructuring pattern and a `?//` alternation bind more than one name.
+            "reduce .[] as {a: $x} (0; . + $x)",
+            "reduce .[] as [$x] (0; . + $x)",
+            "reduce .[] as [$x] ?// $x (0; . + $x)",
+        ] {
+            assert_eq!(jq(program), None, "{program}");
+        }
+        // yq has no marker to say a loop variable is never read in path position.
+        assert_eq!(
+            projection::<YqSemantics>("reduce .[] as $u (0; . + $u.score)"),
+            None
         );
     }
 

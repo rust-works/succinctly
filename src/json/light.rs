@@ -4014,6 +4014,8 @@ fn scan_canonical_array(
 }
 
 impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
+    const PROJECTS_MEMBERS: bool = true;
+
     /// `JsonElements::uncons_cursor` yields the first child, then each
     /// `next_sibling`: the chain is exactly the siblings.
     const RESUMABLE_ELEMENT_SCAN: bool = true;
