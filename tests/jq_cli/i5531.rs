@@ -81,8 +81,8 @@ fn test_a_pattern_on_the_second_engine_is_kept_too_5531() -> Result<()> {
 
 #[test]
 fn test_a_pattern_that_changes_per_input_answers_past_the_cache_size_5531() -> Result<()> {
-    // 40 distinct patterns, each used twice in a row and then again after all the others: more
-    // than the cache holds, so entries are evicted and rebuilt.
+    // 40 distinct patterns, each used twice in a row: more than the cache holds, so entries are
+    // evicted and rebuilt as the program goes on.
     let (stdout, stderr, code) = run_jq_full(
         &[
             "-nc",
@@ -96,11 +96,12 @@ fn test_a_pattern_that_changes_per_input_answers_past_the_cache_size_5531() -> R
     let (stdout, stderr, code) = run_jq_full(
         &[
             "-nc",
-            r#"[range(40) as $i | range(40) as $j | ("v\($j)" | test("^v\($i)$"))] | map(select(.)) | length"#,
+            r#"[range(3) as $r | range(40) as $i | ("v\($i)" | test("^v\($i)$"))] | map(select(.)) | length"#,
         ],
         None,
     )?;
-    assert_eq!(stdout.trim_end(), "40", "stderr={stderr:?}");
+    // Each of the 40 patterns comes back every 40 inputs, after the 16 slots have turned over.
+    assert_eq!(stdout.trim_end(), "120", "stderr={stderr:?}");
     assert_eq!(code, 0);
     Ok(())
 }
