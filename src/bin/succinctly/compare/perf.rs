@@ -26,8 +26,8 @@ use std::time::Instant;
 pub const SLOW_ROW_MS: f64 = 15.0;
 /// How many repetitions a slow row is topped up to, at least.
 pub const SLOW_ROW_REPS: usize = 21;
-/// The most extra wall time, summed over every tool, a row may spend on top-up
-/// repetitions, so a 100 MB row of several seconds is not tripled.
+/// The most extra wall time, summed over every tool, a row may spend on timed top-up
+/// repetitions (the untimed peak-RSS runs are not counted), so a 100 MB row of several seconds is not tripled.
 pub const SLOW_ROW_EXTRA_BUDGET_MS: f64 = 30_000.0;
 
 /// Tiers in ascending size; a query's `max_tier` caps how far up it runs.
@@ -187,8 +187,10 @@ pub struct PerfRow {
     pub reps: usize,
     /// Median ratios (reference ÷ subject); `None` unless that pair's output matched.
     pub speedup_primary: Option<f64>,
-    /// The speedups above are ratios of each tool's minimum rather than its median:
-    /// set for a slow row ([`SLOW_ROW_MS`]), whose median the run-to-run noise moves.
+    /// The speedups above are ratios of each tool's minimum rather than its median: set for a
+    /// slow row ([`SLOW_ROW_MS`]) that reached [`SLOW_ROW_REPS`] repetitions, whose median the
+    /// run-to-run noise moves. A slow row the time budget cut short keeps the median, since the
+    /// minimum of a handful of runs is no steadier. `secondary_over_primary` is always a median.
     pub ratio_from_min: bool,
     pub speedup_secondary: Option<f64>,
     /// Secondary ÷ primary median, so a change in the reference's own speed is visible.
@@ -470,21 +472,23 @@ pub fn run_row(
     }
     row.noisy = row.tools.iter().any(|t| t.cv_pct.is_some_and(|c| c > 5.0));
     // A slow row's median moves with the run (a control read 0.75x-1.40x, #5581) while its
-    // minimum does not, so its ratios use the minimum, for every pair alike.
-    row.ratio_from_min = is_slow(&samples);
+    // minimum does not, so a row that got the full top-up rates each pair by the minimum.
+    row.ratio_from_min = is_slow(&samples) && total >= SLOW_ROW_REPS;
     let from_min = row.ratio_from_min;
-    let med = |i: usize| {
+    let stat = |i: usize, min: bool| {
         row.tools[i]
             .stats
             .as_ref()
-            .map(|s| if from_min { s.min_ms } else { s.median_ms })
+            .map(|s| if min { s.min_ms } else { s.median_ms })
+            .unwrap()
     };
-    row.speedup_primary = Some(med(1).unwrap() / med(0).unwrap());
+    row.speedup_primary = Some(stat(1, from_min) / stat(0, from_min));
     if gate_secondary == Some(Gate::Match) {
-        row.speedup_secondary = Some(med(2).unwrap() / med(0).unwrap());
+        row.speedup_secondary = Some(stat(2, from_min) / stat(0, from_min));
     }
     if tools.len() > 2 && digest[1] == digest[2] {
-        row.secondary_over_primary = Some(med(2).unwrap() / med(1).unwrap());
+        // The reference's own change in speed: its run-to-run spread is the point, so a median.
+        row.secondary_over_primary = Some(stat(2, false) / stat(1, false));
     }
     let ratio = |a: Option<u64>, b: Option<u64>| match (a, b) {
         (Some(s), Some(r)) if r > 0 => Some(s as f64 / r as f64),

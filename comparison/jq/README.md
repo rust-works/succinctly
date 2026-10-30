@@ -39,7 +39,7 @@ Dimension B runs the vendored upstream test files through both tools; C runs JSO
 Dimensions D and E time every query on the pinned generated inputs (`[[input]]`, regenerated into `data/compare/inputs/`
 and checked against their sha256) against jq 1.7.1 and 1.8.1, interleaved, gated on output identity; `--control` times jq
 against itself to show the noise floor, and `--full` adds the 10 MB and 100 MB tiers.
-A row whose slowest tool runs over 15 ms is topped up to 21 repetitions (within 30 s of extra wall time per row) and its
+A row whose slowest tool runs over 15 ms is topped up to 21 repetitions (within 30 s of extra timed runs per row) and, once it has them, its
 ratios are of each tool's fastest run, marked † in the report, because run-to-run noise moves the median of a figure that
 long (#5581). A row with a CV above 5% is marked, and its ratio is not a finding on its own.
 Dimension F runs 85 resource-limit probes under a 10 s deadline and classes each outcome (ok, error, crash, timeout).

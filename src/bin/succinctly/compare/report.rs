@@ -569,14 +569,16 @@ fn perf_sections(s: &mut String, r: &Results) {
     );
     let _ = writeln!(
         s,
-        "Median of {} interleaved repetitions (fewer at 100 MB; a row over {} ms is topped up to {} \
-         where the time allows), CV in parentheses; the tool order rotates each repetition. A speedup is \
-         reference ÷ succinctly, so below 1.00x jq is faster. A ratio marked † is of each tool's fastest \
-         run, not its median: a row that long is moved by run-to-run noise, which the minimum \
-         resists. A row marked `CV>5%` is noise-dominated, and its ratio is not a finding on its \
-         own. `1.8.1 ÷ 1.7.1` is the secondary reference's own change in speed.{}\n",
+        "Median of interleaved repetitions ({} requested, fewer at 100 MB; a row over {} ms is topped up \
+         to {} where the time allows), CV in parentheses; the tool order rotates each repetition. A \
+         speedup is reference ÷ succinctly, so below 1.00x jq is faster, and is a ratio of medians \
+         except where marked †: a row that long is moved by run-to-run noise, so its ratio is of \
+         each tool's fastest of the {} runs, which the noise moves least (the times beside it stay \
+         medians). A row marked `CV>5%` is noise-dominated, and its ratio is not a finding on its \
+         own. `1.8.1 ÷ 1.7.1` is the secondary reference's own change in speed, always of medians.{}\n",
         r.reps,
         perf::SLOW_ROW_MS,
+        perf::SLOW_ROW_REPS,
         perf::SLOW_ROW_REPS,
         r.perf_note.as_deref().map_or(String::new(), |n| format!(" ({n}.)"))
     );
@@ -646,7 +648,7 @@ fn perf_sections(s: &mut String, r: &Results) {
             row_ratio(x, x.speedup_primary),
             med(x, 2).unwrap_or_else(|| "n/a".into()),
             row_ratio(x, x.speedup_secondary),
-            row_ratio(x, x.secondary_over_primary),
+            ratio(x.secondary_over_primary),
             if x.noisy { "yes" } else { "" }
         );
     }
