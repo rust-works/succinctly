@@ -456,6 +456,44 @@ fn jq_parse_fault(text: &[u8], line: usize, column: usize, limit: usize) -> Opti
     })
 }
 
+/// Whether a `[` or `{` of `text` opens with `limit` entries already on jq's parse stack, an
+/// array holding one and an object two (#5497): the count [`Parser::open`] refuses at, kept
+/// for the brackets alone. A container can only open as a value, so every object above it has
+/// its key read, and jq never refuses the key itself.
+///
+/// It reads strings with [`string_literal_end`](crate::json::light::string_literal_end), the
+/// splitter's own scanner, and gives up (`false`) on one that scanner rejects: the document is
+/// malformed there, and its first fault in jq's order is for the route's own handling, not for
+/// this check.
+fn stack_reaches(text: &[u8], limit: usize) -> bool {
+    let mut weights: Vec<u8> = Vec::new();
+    let mut entries = 0usize;
+    let mut at = 0;
+    while let Some(&byte) = text.get(at) {
+        match byte {
+            b'"' => match crate::json::light::string_literal_end(text, at) {
+                Some(end) => {
+                    at = end;
+                    continue;
+                }
+                None => return false,
+            },
+            b'[' | b'{' => {
+                if entries >= limit {
+                    return true;
+                }
+                let weight = if byte == b'[' { 1 } else { 2 };
+                entries += usize::from(weight);
+                weights.push(weight);
+            }
+            b']' | b'}' => entries -= weights.pop().map_or(0, usize::from),
+            _ => {}
+        }
+        at += 1;
+    }
+    false
+}
+
 /// The byte of `text` at which jq's parser, reading it from its start, refuses a bracket past
 /// [`JQ_MAX_PARSING_DEPTH`], or `None` when it stops on anything else first (#5497).
 ///
@@ -490,13 +528,15 @@ pub enum InputSource {
 /// Only the depth limit is reported. A document whose first fault is anything else is left to
 /// the route's own handling, so this refuses nothing jq's limit does not.
 ///
-/// The parser runs only on a document that could reach the limit. A `[` or `{` is refused once
-/// [`JQ_MAX_PARSING_DEPTH`] entries are open, and no container adds more than two, so the
-/// refused bracket is at least the 129th nested one. The BP has one open per container and
-/// one per leaf, so its excess is at most the container depth plus one, and a BP that never
-/// rises above 128 cannot hold a refused bracket. That costs one popcount per 64 parentheses
-/// ([`BalancedParens::max_excess_exceeds`](crate::trees::BalancedParens::max_excess_exceeds)),
-/// where the parser reads every byte.
+/// Two cheaper reads come first, so the parser runs only on a document it will refuse. A `[` or
+/// `{` is refused once [`JQ_MAX_PARSING_DEPTH`] entries are open, and no container adds more
+/// than two, so the refused bracket is at least the 129th nested one. The BP has one open per
+/// container and one per leaf, so its excess is at most the container depth plus one, and a BP
+/// that never rises above 128 cannot hold a refused bracket. That costs one popcount per 64
+/// parentheses ([`BalancedParens::max_excess_exceeds`](crate::trees::BalancedParens::max_excess_exceeds)).
+/// A document that does rise above 128 is walked for jq's stack alone ([`stack_reaches`]), its
+/// strings skipped whole, which is several times faster than the parser's byte-at-a-time
+/// tokenizing, and only a document that walk refuses is parsed, for jq's message.
 #[doc(hidden)]
 pub fn jq_input_depth_fault<W: AsRef<[u64]>>(
     text: &[u8],
@@ -507,6 +547,9 @@ pub fn jq_input_depth_fault<W: AsRef<[u64]>>(
     // The slurp wrapper adds one level to every member, so the bound moves with the limit.
     let wrapper = usize::from(source == InputSource::Slurped);
     if !bp.max_excess_exceeds(JQ_MAX_PARSING_DEPTH / 2 + wrapper) {
+        return None;
+    }
+    if !stack_reaches(text, JQ_MAX_PARSING_DEPTH + wrapper) {
         return None;
     }
     let (line, column) = match source {
@@ -773,5 +816,43 @@ mod tests {
         let objects = format!("\u{feff}{}", nest("{\"a\":", "1", "}", 129));
         assert_eq!(jq_depth_fault_offset(objects.as_bytes()), Some(3 + 640));
         assert_eq!(jq_depth_fault_offset(b"[1,,2]"), None);
+    }
+
+    /// The bracket walk refuses exactly where the parser does: on every boundary shape above and
+    /// on random mixed nestings, with brackets inside strings and escaped quotes (#5497).
+    #[test]
+    fn stack_reaches_agrees_with_the_parser_5497() {
+        let parser_refuses = |text: &str| {
+            jq_parse_fault(text.as_bytes(), 1, 0, JQ_MAX_PARSING_DEPTH).is_some_and(|f| f.depth)
+        };
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..400 {
+            let depth = 100 + (next() % 200) as usize;
+            let (mut open, mut close) = (String::new(), Vec::new());
+            for _ in 0..depth {
+                if next() % 2 == 0 {
+                    open.push_str(["[", "[1,\"]\",", "[\"[{\\\"\","][(next() % 3) as usize]);
+                    close.push("]");
+                } else {
+                    open.push_str(["{\"a\":", "{\"k\":{},\"a\":"][(next() % 2) as usize]);
+                    close.push("}");
+                }
+            }
+            close.reverse();
+            let text = format!("{open}1{}", close.concat());
+            assert_eq!(
+                stack_reaches(text.as_bytes(), JQ_MAX_PARSING_DEPTH),
+                parser_refuses(&text),
+                "{}",
+                &text[..text.len().min(120)]
+            );
+        }
+        assert!(!stack_reaches(b"[\"unterminated", JQ_MAX_PARSING_DEPTH));
     }
 }
