@@ -3,7 +3,7 @@
 use super::cli;
 use super::features::{FeatureSummary, Status};
 use super::harness::{Row, Verdict};
-use super::perf::{Gate, PerfRow};
+use super::perf::{Gate, PerfRow, ToolResult};
 use super::robust;
 use super::Results;
 use std::fmt::Write;
@@ -158,6 +158,18 @@ pub fn render(results: &Results) -> String {
             let _ = writeln!(
                 s,
                 "| Geomean peak RSS vs {} | {g:.2}x ({lo:.2}x–{hi:.2}x) |",
+                e.jq_version
+            );
+        }
+        let private: Vec<f64> = timed
+            .iter()
+            .filter_map(|x| x.private_ratio_primary)
+            .collect();
+        if let Some(g) = geomean(&private) {
+            let (lo, hi) = range(&private);
+            let _ = writeln!(
+                s,
+                "| Geomean private memory vs {} | {g:.2}x ({lo:.2}x–{hi:.2}x) |",
                 e.jq_version
             );
         }
@@ -551,33 +563,52 @@ fn perf_sections(s: &mut String, r: &Results) {
             if x.noisy { "yes" } else { "" }
         );
     }
+    memory_section(s, &timed);
+}
+
+/// Dimension E: peak RSS beside private memory, with the note that says why both are shown.
+fn memory_section(s: &mut String, timed: &[&PerfRow]) {
     let _ = writeln!(
         s,
-        "\n## E. Memory (peak RSS, KiB; separate untimed runs, median of 3)\n"
+        "\n## E. Memory (peak RSS and private memory, KiB; separate untimed runs, median of 3)\n"
     );
     let _ = writeln!(
         s,
-        "| Query | Input | jq 1.7.1 | succinctly | ratio (succinctly ÷ jq) |"
+        "Peak RSS charges a process for the file-backed pages of its mapped executable and libraries, \
+         which are shared and reclaimable, so a larger binary reads higher on every row with the same \
+         heap (#5578). Private memory leaves them out: on Linux the largest `RssAnon` sampled while \
+         the process ran (a lower bound, and coarser for a run of a few milliseconds, so its ratios and the \
+         geomean carry the same caveat), on macOS the peak memory footprint. `n/a` where the platform \
+         offers neither.\n"
     );
     let _ = writeln!(
         s,
-        "|-------|-------|----------|------------|-------------------------|"
+        "| Query | Input | jq 1.7.1 RSS | succinctly RSS | RSS ratio (succinctly ÷ jq) | jq 1.7.1 private | succinctly private | private ratio |"
     );
-    for x in &timed {
-        let kb = |i: usize| {
+    let _ = writeln!(
+        s,
+        "|-------|-------|--------------|----------------|-----------------------------|------------------|--------------------|---------------|"
+    );
+    for x in timed {
+        let kb = |i: usize, f: fn(&ToolResult) -> Option<u64>| {
             x.tools
                 .get(i)
-                .and_then(|t| t.peak_rss_kb)
+                .and_then(f)
                 .map_or_else(|| "n/a".into(), |v| v.to_string())
         };
+        let rss = |t: &ToolResult| t.peak_rss_kb;
+        let private = |t: &ToolResult| t.private_kb;
         let _ = writeln!(
             s,
-            "| {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} |",
             x.query,
             x.input,
-            kb(1),
-            kb(0),
-            ratio(x.rss_ratio_primary)
+            kb(1, rss),
+            kb(0, rss),
+            ratio(x.rss_ratio_primary),
+            kb(1, private),
+            kb(0, private),
+            ratio(x.private_ratio_primary)
         );
     }
 }
@@ -660,5 +691,72 @@ fn operational_section(s: &mut String, r: &Results) {
     let _ = writeln!(s, "|----------|-------|--------|");
     for f in &o.facts {
         let _ = writeln!(s, "| {} | {} | `{}` |", f.item, f.value, f.source);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool(name: &str, rss: Option<u64>, private: Option<u64>) -> ToolResult {
+        ToolResult {
+            tool: name.into(),
+            stats: None,
+            cv_pct: None,
+            peak_rss_kb: rss,
+            private_kb: private,
+        }
+    }
+
+    fn row(tools: Vec<ToolResult>, rss: Option<f64>, private: Option<f64>) -> PerfRow {
+        PerfRow {
+            query: "startup".into(),
+            input: "none".into(),
+            tier: "startup".into(),
+            gate: Gate::Match,
+            gate_secondary: None,
+            tools,
+            speedup_primary: Some(1.0),
+            speedup_secondary: None,
+            secondary_over_primary: None,
+            rss_ratio_primary: rss,
+            private_ratio_primary: private,
+            noisy: false,
+        }
+    }
+
+    #[test]
+    fn memory_table_shows_private_memory_beside_peak_rss() {
+        // The #5578 measurement: a 3.4x RSS ratio over a 1.07x private one.
+        let r = row(
+            vec![
+                tool("succinctly", Some(10128), Some(896)),
+                tool("jq", Some(3008), Some(840)),
+            ],
+            Some(3.37),
+            Some(1.07),
+        );
+        let mut s = String::new();
+        memory_section(&mut s, &[&r]);
+        assert!(s.contains("file-backed pages"), "{s}");
+        assert!(
+            s.contains("| startup | none | 3008 | 10128 | 3.37x | 840 | 896 | 1.07x |"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn memory_table_marks_a_platform_without_private_memory() {
+        let r = row(
+            vec![
+                tool("succinctly", Some(10), None),
+                tool("jq", Some(5), None),
+            ],
+            Some(2.0),
+            None,
+        );
+        let mut s = String::new();
+        memory_section(&mut s, &[&r]);
+        assert!(s.contains("| 5 | 10 | 2.00x | n/a | n/a |"), "{s}");
     }
 }

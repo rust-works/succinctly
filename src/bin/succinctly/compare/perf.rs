@@ -5,8 +5,10 @@
 //! starts warm (or loaded), min/median/MAD, and an output-identity gate before
 //! any number is believed. A row whose output differs from the primary
 //! reference is reported as a correctness row and gets no timing. Memory is read
-//! from a separate, untimed run through `/usr/bin/time`, so the wrapper's own
-//! spawn never lands in a wall-clock sample.
+//! from separate, untimed runs, so a wrapper's own spawn never lands in a
+//! wall-clock sample. Peak RSS comes from `/usr/bin/time`; it counts the pages of
+//! the mapped executable, so a 24 MiB binary reads several MiB above a 2.5 MiB one
+//! with the same heap (#5578). Private memory (anonymous pages only) is read beside it.
 
 use super::exec::{exec_within, PERF_DEADLINE};
 use super::harness::{stats, Stats, Tool};
@@ -153,6 +155,11 @@ pub struct ToolResult {
     /// Standard deviation over mean, in percent.
     pub cv_pct: Option<f64>,
     pub peak_rss_kb: Option<u64>,
+    /// Private (anonymous) memory in KiB, without the file-backed pages of the mapped
+    /// executable and libraries that peak RSS charges (#5578). Linux: the largest
+    /// `RssAnon` seen while the process ran (sampled, so a lower bound for a run too
+    /// short to sample twice). macOS: `peak memory footprint`. `None` elsewhere.
+    pub private_kb: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -171,6 +178,8 @@ pub struct PerfRow {
     /// Secondary ÷ primary median, so a change in the reference's own speed is visible.
     pub secondary_over_primary: Option<f64>,
     pub rss_ratio_primary: Option<f64>,
+    /// The same ratio over private memory (`ToolResult::private_kb`).
+    pub private_ratio_primary: Option<f64>,
     /// Any tool's CV exceeds 5%.
     pub noisy: bool,
 }
@@ -182,15 +191,25 @@ fn args_for(q: &PerfQuery, file: Option<&str>) -> Vec<String> {
     a
 }
 
-fn time_once(tool: &Tool, args: &[String], cwd: &Path) -> Result<f64> {
-    let start = Instant::now();
-    let status = Command::new(&tool.program)
-        .args(&tool.prefix)
+/// What every run of a tool shares: its prefix and flags, the working directory and a
+/// fixed environment, so the timed, peak-RSS and private-memory runs are one configuration.
+fn configure<'a>(
+    cmd: &'a mut Command,
+    tool: &Tool,
+    args: &[String],
+    cwd: &Path,
+) -> &'a mut Command {
+    cmd.args(&tool.prefix)
         .args(args)
         .current_dir(cwd)
         .env("TZ", "UTC")
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
+}
+
+fn time_once(tool: &Tool, args: &[String], cwd: &Path) -> Result<f64> {
+    let start = Instant::now();
+    let status = configure(&mut Command::new(&tool.program), tool, args, cwd)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -214,25 +233,99 @@ pub fn parse_rss_kb(report: &str) -> Option<u64> {
     None
 }
 
-fn rss_once(tool: &Tool, args: &[String], cwd: &Path) -> Option<u64> {
+/// macOS `/usr/bin/time -l` prints the peak memory footprint (dirty and compressed pages,
+/// no file-backed ones) in bytes; returned in KiB.
+#[cfg(any(target_os = "macos", test))]
+pub fn parse_footprint_kb(report: &str) -> Option<u64> {
+    report.lines().find_map(|line| {
+        let v = line.trim().strip_suffix("peak memory footprint")?;
+        v.trim().parse::<u64>().ok().map(|b| b / 1024)
+    })
+}
+
+/// The `RssAnon` line of a `/proc/<pid>/status`, in KiB.
+#[cfg(any(target_os = "linux", test))]
+pub fn parse_rss_anon_kb(status: &str) -> Option<u64> {
+    status.lines().find_map(|line| {
+        let v = line.strip_prefix("RssAnon:")?;
+        v.trim().strip_suffix("kB")?.trim().parse().ok()
+    })
+}
+
+/// One untimed run's memory: peak RSS and private memory, each `None` where this
+/// platform cannot read it.
+struct MemSample {
+    rss_kb: Option<u64>,
+    private_kb: Option<u64>,
+}
+
+fn mem_once(tool: &Tool, args: &[String], cwd: &Path) -> MemSample {
+    let report = time_report(tool, args, cwd);
+    MemSample {
+        rss_kb: report.as_deref().and_then(parse_rss_kb),
+        private_kb: private_once(tool, args, cwd, report.as_deref()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn private_once(_: &Tool, _: &[String], _: &Path, report: Option<&str>) -> Option<u64> {
+    report.and_then(parse_footprint_kb)
+}
+
+/// Spawn the tool and read `RssAnon` from `/proc/<pid>/status` for as long as it runs.
+/// The kernel drops the counters when the process exits, so the figure is the largest
+/// sample, not an exact peak, and it is a second run of the tool beside `time_report`'s.
+/// `spawn` returns only once the child has called `exec`, so the first sample is the
+/// tool's own address space and never a copy of this process's.
+#[cfg(target_os = "linux")]
+fn private_once(tool: &Tool, args: &[String], cwd: &Path, _: Option<&str>) -> Option<u64> {
+    let mut child = configure(&mut Command::new(&tool.program), tool, args, cwd)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let path = format!("/proc/{}/status", child.id());
+    let start = Instant::now();
+    let mut best = None;
+    while matches!(child.try_wait(), Ok(None)) {
+        if start.elapsed() > PERF_DEADLINE {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        if let Some(kb) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| parse_rss_anon_kb(&t))
+        {
+            best = best.max(Some(kb));
+        }
+        std::thread::sleep(std::time::Duration::from_micros(100));
+    }
+    best
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn private_once(_: &Tool, _: &[String], _: &Path, _: Option<&str>) -> Option<u64> {
+    None
+}
+
+/// `/usr/bin/time`'s report (`-l` on macOS, `-v` on Linux) for one untimed run.
+fn time_report(tool: &Tool, args: &[String], cwd: &Path) -> Option<String> {
     let flag = if cfg!(target_os = "macos") {
         "-l"
     } else {
         "-v"
     };
-    let out = Command::new("/usr/bin/time")
-        .arg(flag)
-        .arg(&tool.program)
-        .args(&tool.prefix)
-        .args(args)
-        .current_dir(cwd)
-        .env("TZ", "UTC")
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .output()
-        .ok()?;
-    parse_rss_kb(&String::from_utf8_lossy(&out.stderr))
+    let out = configure(
+        Command::new("/usr/bin/time").arg(flag).arg(&tool.program),
+        tool,
+        args,
+        cwd,
+    )
+    .stdout(Stdio::null())
+    .output()
+    .ok()?;
+    Some(String::from_utf8_lossy(&out.stderr).into_owned())
 }
 
 fn cv_pct(samples: &[f64]) -> f64 {
@@ -296,6 +389,7 @@ pub fn run_row(
         speedup_secondary: None,
         secondary_over_primary: None,
         rss_ratio_primary: None,
+        private_ratio_primary: None,
         noisy: false,
     };
     if gate == Gate::Differs || reps == 0 {
@@ -313,16 +407,15 @@ pub fn run_row(
         }
     }
     for (i, t) in tools.iter().enumerate() {
-        let rss = median_u64(
-            (0..3)
-                .filter_map(|_| rss_once(t, &args, inputs_dir))
-                .collect(),
-        );
+        let mem: Vec<MemSample> = (0..3).map(|_| mem_once(t, &args, inputs_dir)).collect();
+        let rss = median_u64(mem.iter().filter_map(|m| m.rss_kb).collect());
+        let private = median_u64(mem.iter().filter_map(|m| m.private_kb).collect());
         row.tools.push(ToolResult {
             tool: t.name.clone(),
             stats: Some(stats(&samples[i])),
             cv_pct: Some(cv_pct(&samples[i])),
             peak_rss_kb: rss,
+            private_kb: private,
         });
     }
     row.noisy = row.tools.iter().any(|t| t.cv_pct.is_some_and(|c| c > 5.0));
@@ -334,10 +427,12 @@ pub fn run_row(
     if tools.len() > 2 && digest[1] == digest[2] {
         row.secondary_over_primary = Some(med(2).unwrap() / med(1).unwrap());
     }
-    row.rss_ratio_primary = match (row.tools[0].peak_rss_kb, row.tools[1].peak_rss_kb) {
+    let ratio = |a: Option<u64>, b: Option<u64>| match (a, b) {
         (Some(s), Some(r)) if r > 0 => Some(s as f64 / r as f64),
         _ => None,
     };
+    row.rss_ratio_primary = ratio(row.tools[0].peak_rss_kb, row.tools[1].peak_rss_kb);
+    row.private_ratio_primary = ratio(row.tools[0].private_kb, row.tools[1].private_kb);
     Ok(row)
 }
 
@@ -427,6 +522,48 @@ mod tests {
             Some(4321)
         );
         assert_eq!(parse_rss_kb("nothing"), None);
+    }
+
+    #[test]
+    fn private_memory_is_read_from_both_platforms() {
+        assert_eq!(
+            parse_footprint_kb(
+                "  1294336  maximum resident set size\n   999640  peak memory footprint\n"
+            ),
+            Some(976)
+        );
+        assert_eq!(
+            parse_footprint_kb("  1294336  maximum resident set size\n"),
+            None
+        );
+        let status =
+            "Name:\tjq\nVmRSS:\t   3616 kB\nRssAnon:\t     840 kB\nRssFile:\t    2776 kB\n";
+        assert_eq!(parse_rss_anon_kb(status), Some(840));
+        // A zombie's status has no Rss lines once its address space is gone.
+        assert_eq!(parse_rss_anon_kb("Name:\tjq\nState:\tZ (zombie)\n"), None);
+    }
+
+    /// A process that holds a known amount of anonymous memory must read at least that
+    /// much, and far less than its mapped file pages would add up to.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_memory_of_a_running_process_is_sampled() {
+        let tool = Tool {
+            name: "python3".into(),
+            program: "python3".into(),
+            prefix: vec![],
+        };
+        if Command::new("python3").arg("--version").output().is_err() {
+            eprintln!("python3 not found; skipping");
+            return;
+        }
+        let args = vec![
+            "-c".to_string(),
+            "import time; b = bytearray(64 * 1024 * 1024); b[::4096] = b'x' * len(b[::4096]); time.sleep(0.5)"
+                .to_string(),
+        ];
+        let kb = private_once(&tool, &args, Path::new("."), None).expect("sampled");
+        assert!(kb >= 60 * 1024, "{kb} KiB");
     }
 
     #[test]
