@@ -24,6 +24,7 @@ reported as a correctness row and gets no timing; the command exits 1 on it.
 |-----------------------|----------------------------------------------------------|
 | `manifest.toml`       | pinned references (version, source sha256), build, queries |
 | `queries/smoke.tsv`   | `id`, flags, filter, input — data, not code              |
+| `probes/syntax.tsv`   | A: syntax forms, same columns as `cli.tsv`; run beside the builtins |
 | `probes/cli.tsv`      | G: `id`, area, args (JSON array), stdin (JSON string)    |
 | `probes/extensions.tsv` | succinctly-only surface the reference must reject      |
 | `fixtures/`           | working directory of the CLI probes (`-f`, `-L`, ...)    |
@@ -32,7 +33,7 @@ reported as a correctness row and gets no timing; the command exits 1 on it.
 | `probes/robust.tsv`   | F: nesting, recursion, generators, regex, big values, SIGPIPE; `@gen:` builds large stdin |
 | `divergences.toml`    | ledger of known differences; the run fails on drift      |
 
-Dimension A probes every builtin in the reference's own `builtins` (plus those new in jq 1.8.1, against 1.8.1);
+Dimension A probes every builtin in the reference's own `builtins` (plus those new in jq 1.8.1, against 1.8.1) and, from `probes/syntax.tsv`, the language's forms: operators, paths and slices, construction, `if`/`reduce`/`foreach`/`label`, destructuring with `?//`, `def`, string and format forms, assignment and `import`/`include`;
 `--write-summary` regenerates `docs/compare/jq-coverage.json` and the figures in `docs/reference/jq-language.md`.
 Dimension B runs the vendored upstream test files through both tools; C runs JSONTestSuite against the reference, `succinctly jq` and `--validate`.
 Dimensions D and E time every query on the pinned generated inputs (`[[input]]`, regenerated into `data/compare/inputs/`

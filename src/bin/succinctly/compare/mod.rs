@@ -164,6 +164,8 @@ pub struct Results {
     /// A, the builtins new in the secondary reference, against it alone.
     pub since_secondary: Option<features::FeatureSummary>,
     pub secondary_note: Option<String>,
+    /// A, syntax forms and the manual's sections.
+    pub syntax: Vec<cli::CliRow>,
     /// G.
     pub cli: Vec<cli::CliRow>,
     /// Succinctly-only surface, not counted as coverage.
@@ -393,8 +395,9 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
     let mut observed = BTreeSet::new();
     let mut run_suites: Vec<String> = vec![];
     let (mut feats, mut since, mut secondary_note) = (None, None, None);
+    let mut syntax_rows = vec![];
     if want(Dimension::Features) {
-        run_suites.push("features".into());
+        run_suites.extend(["features".into(), "syntax".into()]);
         let sum = features::run(
             &reference,
             &primary.id,
@@ -434,10 +437,24 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
             Err(why) => secondary_note = Some(why.clone()),
         }
         feats = Some(sum);
+        let text = std::fs::read_to_string(root.join(&manifest.probes.syntax))
+            .with_context(|| manifest.probes.syntax.clone())?;
+        syntax_rows = cli::run(
+            &reference,
+            &subject,
+            &cli::parse_probes(&text)?,
+            false,
+            only("syntax").as_ref(),
+            &fixtures,
+        )?;
+        for r in &syntax_rows {
+            if r.verdict == cli::Verdict::Differs {
+                observed.insert(format!("syntax:{}", r.id));
+            }
+        }
         dimensions.push(DimensionStatus {
             name: "A. Language & builtin coverage",
-            status:
-                "implemented (builtins; syntax forms and the manual's sections are not yet probed)",
+            status: "implemented (builtins and syntax forms; `import`/`include` beyond the library-path fixtures and the manual's prose are not probed)",
         });
     }
     let (mut cli_rows, mut ext_rows) = (vec![], vec![]);
@@ -691,6 +708,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         features: feats,
         since_secondary: since,
         secondary_note,
+        syntax: syntax_rows,
         cli: cli_rows,
         extensions: ext_rows,
         differential,

@@ -156,6 +156,47 @@ mod tests {
         );
     }
 
+    /// The syntax-form file is data in the CLI probe format; a duplicate id would merge two
+    /// ledger entries, and a missing area would drop a row from the report's table.
+    #[test]
+    fn the_checked_in_syntax_probes_parse_with_unique_ids_and_cover_every_form() {
+        let probes =
+            parse_probes(include_str!("../../../../comparison/jq/probes/syntax.tsv")).unwrap();
+        assert!(probes.len() > 400, "{}", probes.len());
+        let ids: std::collections::BTreeSet<&str> = probes.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids.len(), probes.len(), "duplicate probe id");
+        let areas: std::collections::BTreeSet<&str> =
+            probes.iter().map(|p| p.area.as_str()).collect();
+        for a in [
+            "operators",
+            "alternative",
+            "paths-slices",
+            "construction",
+            "control",
+            "variables",
+            "functions",
+            "strings-formats",
+            "syntax",
+            "assignment",
+            "modules",
+        ] {
+            assert!(areas.contains(a), "no probe in area {a}");
+        }
+        // the forms the issue names: `?//`, reduce, foreach, label, import, include, a format string
+        let programs: String = probes.iter().flat_map(|p| p.args.iter()).cloned().collect();
+        for form in [
+            "?//",
+            "reduce ",
+            "foreach ",
+            "label $",
+            "import \"",
+            "include \"",
+            "@base64 \"",
+        ] {
+            assert!(programs.contains(form), "no probe uses `{form}`");
+        }
+    }
+
     #[test]
     fn an_extension_must_be_rejected_by_the_reference_and_accepted_by_succinctly() {
         let accepts = sh("cat >/dev/null; echo 1");
