@@ -14631,6 +14631,67 @@ mod tests {
         );
     }
 
+    /// #5608: the strict route validates with `serde_json` and then materializes each span
+    /// without walking its delimiters again, so it must never be the route that accepts a
+    /// stream whose delimiters are wrong, and for every stream it does accept the values are
+    /// the ones the checked route (the splitter's spans, delimiter walk included) builds.
+    #[test]
+    fn strict_stream_route_agrees_with_the_checked_route_5608() {
+        let strict = |text: &str| parse_json_stream_strict(text, None, text.as_bytes(), 0);
+        let checked = |text: &str| -> Vec<String> {
+            let bytes = text.as_bytes();
+            let (spans, error) = split_json_values(bytes);
+            assert!(error.is_none(), "{text:?}");
+            spans
+                .into_iter()
+                .map(|(start, end)| {
+                    stream_document_checked(&bytes[start..end], None, bytes, start)
+                        .expect("the checked route accepts it")
+                        .to_json()
+                })
+                .collect()
+        };
+        for text in [
+            "1",
+            "1 2 3",
+            "[1,2,3]",
+            "{\"a\":1} {\"b\":[2,{\"c\":null}]}",
+            "[] {} [[]] [{}] \"x\" true null",
+            "[1.50,2e2,-0.0,100000000000000000000,0.1e1]",
+            "{\"a\":{\"b\":{\"c\":[1,[2,[3]]]}}}",
+            "\"\\u00e9\\ud83d\\ude00\" \"\\n\"",
+            "[1][2]{\"a\":1}",
+            "  [ 1 , 2 ]  \n\n { \"k\" : \"v\" }  ",
+        ] {
+            let values = strict(text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
+            let strict_text: Vec<String> = values.iter().map(OwnedValue::to_json).collect();
+            assert_eq!(strict_text, checked(text), "{text:?}");
+        }
+        // Every way a delimiter can be wrong is `serde_json`'s to refuse, so none of them reaches
+        // the materializer that no longer looks.
+        for text in [
+            "[1 2]",
+            "[1,]",
+            "[,1]",
+            "[1,,2]",
+            "{\"a\" 1}",
+            "{\"a\":1,}",
+            "{\"a\":1 \"b\":2}",
+            "{\"a\"::1}",
+            "{,}",
+            "[1}",
+            "{\"a\":1]",
+            "1 [1 2]",
+            "[1] {\"a\" 1}",
+            "[[1,2],[3 4]]",
+        ] {
+            assert!(
+                strict(text).is_err(),
+                "{text:?} must not take the strict route"
+            );
+        }
+    }
+
     #[test]
     fn test_parse_json_stream() {
         let stream = r#"{"a":1} {"b":2} {"c":3}"#;
