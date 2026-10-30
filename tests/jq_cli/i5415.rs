@@ -6,7 +6,7 @@
 
 use anyhow::Result;
 
-use crate::{run_jq_full, run_jq_stdin};
+use crate::{names_fault, run_jq_full, run_jq_stdin};
 
 /// `text` without its ANSI escape sequences (`ESC [ ... m`).
 fn strip_ansi(text: &str) -> String {
@@ -147,7 +147,7 @@ fn test_malformed_scalar_is_refused_with_the_default_routes_message_5415() -> Re
         assert_eq!((out.as_str(), code), ("", 5), "{doc}");
         assert_eq!((plain_out.as_str(), plain_code), ("", 5), "{doc}");
         assert_eq!(err, plain_err, "{doc}");
-        assert!(err.contains("invalid keyword 'tru'"), "{err}");
+        assert!(names_fault(&err, "invalid keyword 'tru'"), "{err}");
     }
     Ok(())
 }
@@ -159,7 +159,10 @@ fn test_malformed_scalar_is_refused_with_the_default_routes_message_5415() -> Re
 fn test_undecodable_and_over_deep_documents_are_still_refused_under_color_5415() -> Result<()> {
     let (out, err, code) = run_jq_full(&["-C", "-c", "."], Some(r#"{"a":"\ud800"}"#))?;
     assert_eq!((out.as_str(), code), ("", 5), "{err}");
-    assert!(err.contains("invalid unicode escape sequence"), "{err}");
+    assert!(
+        names_fault(&err, "invalid unicode escape sequence"),
+        "{err}"
+    );
     // The default route still echoes it.
     let (out, _, code) = run_jq_full(&["-c", "."], Some(r#"{"a":"\ud800"}"#))?;
     assert_eq!((out.as_str(), code), ("{\"a\":\"\\ud800\"}\n", 0));

@@ -2,9 +2,8 @@
 //! names, which counts lines across the files as one stream. Every expected message was captured
 //! from jq 1.7.1 (`/usr/bin/jq`).
 //!
-//! A malformed *member* that the semi-index accepts is found when the filter reads it and keeps
-//! the evaluator's wording; this file pins the faults the splitter or a `input`/`inputs` read
-//! meets, which are jq's.
+//! A malformed *member* that the semi-index accepts is found when the filter reads it, and is
+//! worded by `i5576`; this file pins the faults the splitter or a `input`/`inputs` read meets.
 
 use anyhow::Result;
 

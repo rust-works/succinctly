@@ -594,6 +594,30 @@ fn run_jq_stdin_streams(
     run_jq_full(&args, Some(input))
 }
 
+/// #5576: whether `stderr` names a malformed member by the reason the evaluator gave it
+/// (`evaluator`) or by jq's parser's own words for the same fault, which the lazy route prints
+/// instead since the stream's first fault is reported as `jq: parse error: ...`. The map is by
+/// kind, so a test still tells an escape fault from a number one.
+fn names_fault(stderr: &str, evaluator: &str) -> bool {
+    const UNICODE: &str = "surrogate pair escape";
+    const HEX: &str = "Invalid characters in \\uXXXX escape";
+    const SHORT: &str = "Invalid \\uXXXX escape";
+    let parser: &[&str] = match evaluator {
+        "Invalid JSON text" | "Invalid JSON text:" | "Invalid JSON" => &["jq: parse error: "],
+        "invalid unicode escape sequence" | "invalid unicode escape" => &[UNICODE, HEX, SHORT],
+        "invalid escape sequence" | "invalid escape" | "invalid escape sequence in string" => {
+            &["Invalid escape"]
+        }
+        "escape sequence" => &["Invalid escape", UNICODE, HEX, SHORT],
+        "invalid numeric literal" | "unexpected character" => &["Invalid numeric literal"],
+        "invalid keyword" | "invalid keyword 'tru'" | "invalid boolean" => &["Invalid literal"],
+        // Lone-surrogate keys, the one way a document the lazy route reads names two keys alike.
+        "ambiguous" | "is ambiguous" => &[UNICODE],
+        _ => return stderr.contains(evaluator),
+    };
+    stderr.contains(evaluator) || parser.iter().any(|words| stderr.contains(words))
+}
+
 /// Run jq with an arbitrary argument list, returning stdout, stderr and the
 /// exit code.
 ///
@@ -1973,7 +1997,7 @@ fn test_jq_number_spellings_reject_set_2877() -> Result<()> {
             assert_eq!(code, 5, "{filter} on {input}: {stdout:?}");
             assert_eq!(stdout, "", "{filter} on {input} must not decode");
             assert!(
-                stderr.contains("invalid numeric literal"),
+                names_fault(&stderr, "invalid numeric literal"),
                 "{input}: {stderr}"
             );
         }
@@ -4211,7 +4235,7 @@ fn test_select_passes_through_corruption_it_only_tests_1645_2692() -> Result<()>
              \nstdout: {stdout:?}\nstderr: {stderr:?}"
         );
         assert!(
-            stderr.contains(want_stderr),
+            names_fault(&stderr, want_stderr),
             "[{label}] `{materializes}`: stderr {stderr:?} lacks {want_stderr:?}"
         );
 
@@ -4259,7 +4283,7 @@ fn assert_jq_raises(
         "[{label}] {op_label} must raise\nstdout: {out:?}\nstderr: {err:?}"
     );
     assert!(
-        err.contains(expect_stderr),
+        names_fault(&err, expect_stderr),
         "[{label}] {op_label} stderr must contain {expect_stderr:?}\nstderr: {err:?}"
     );
 }
@@ -6126,7 +6150,7 @@ fn test_materializing_route_raises_on_colliding_decode_failure_keys_1642() -> Re
         code, 0,
         "`-Sc .` should raise rather than silently drop a value, out: {out:?}"
     );
-    assert!(err.contains("ambiguous"), "`-Sc .` stderr: {err}");
+    assert!(names_fault(&err, "ambiguous"), "`-Sc .` stderr: {err}");
 
     // #2847: `-s .` echoes the slurped document's own bytes, with nothing
     // dropped and nothing raised, the same way the default route echoes `.`.
@@ -6321,7 +6345,7 @@ fn test_root_forwarding_filters_stream_without_validating_2103() -> Result<()> {
         let (out, err, code) = run_jq_full(&["-c", filter], Some(malformed))?;
         assert_eq!(code, 5, "filter {filter:?} must still raise, out: {out:?}");
         assert!(
-            err.contains("Invalid JSON text"),
+            names_fault(&err, "Invalid JSON text"),
             "filter {filter:?}, stderr: {err}"
         );
     }
@@ -6330,7 +6354,7 @@ fn test_root_forwarding_filters_stream_without_validating_2103() -> Result<()> {
     // collision -- the #1642 guard is untouched.
     let (out, err, code) = run_jq_full(&["-Sc", "."], Some(dup_doc))?;
     assert_eq!(code, 5, "`-S .` must still raise, out: {out:?}");
-    assert!(err.contains("ambiguous"), "stderr: {err}");
+    assert!(names_fault(&err, "ambiguous"), "stderr: {err}");
 
     // --- Spelling: raw where nothing materializes, doubled where it does. ---
 
@@ -6714,7 +6738,7 @@ fn test_malformed_document_error_channel_under_lazy_sort_ascii_color_2662() -> R
         let (out, stderr, code) = run_jq_full(&args, Some("{invalid}"))?;
         assert_eq!(code, 5, "{flags:?}: out {out:?} stderr {stderr:?}");
         assert!(
-            stderr.starts_with("jq: error"),
+            stderr.starts_with("jq: error") || stderr.starts_with("jq: parse error"),
             "{flags:?} must report in jq's channel, not anyhow's: {stderr:?}"
         );
     }
@@ -6799,14 +6823,14 @@ fn test_colliding_display_key_error_is_uncatchable_1813() -> Result<()> {
         code, 0,
         "`?` must not silently suppress a colliding-key error, out: {out:?}"
     );
-    assert!(err.contains("ambiguous"), "stderr: {err}");
+    assert!(names_fault(&err, "ambiguous"), "stderr: {err}");
 
     let (out, err, code) = run_jq_full(&["try sort catch ."], Some(dup_doc))?;
     assert_ne!(
         code, 0,
         "try/catch must not catch a colliding-key error, out: {out:?}"
     );
-    assert!(err.contains("ambiguous"), "stderr: {err}");
+    assert!(names_fault(&err, "ambiguous"), "stderr: {err}");
 
     // `delpaths(...)?` specifically, called out by the issue: #1746 review
     // added an `is_uncatchable()`-gated suppression bypass there.
@@ -6816,7 +6840,7 @@ fn test_colliding_display_key_error_is_uncatchable_1813() -> Result<()> {
         code, 0,
         "delpaths(...)? must not silently suppress a colliding-key error, out: {out:?}"
     );
-    assert!(err.contains("ambiguous"), "stderr: {err}");
+    assert!(names_fault(&err, "ambiguous"), "stderr: {err}");
 
     Ok(())
 }
@@ -6863,7 +6887,7 @@ fn test_exit_status_materialize_route_raises_on_colliding_decode_failure_keys_16
         code, 0,
         "-e should raise rather than silently drop a value, out: {out:?}"
     );
-    assert!(err.contains("ambiguous"), "stderr: {err}");
+    assert!(names_fault(&err, "ambiguous"), "stderr: {err}");
 
     Ok(())
 }
@@ -24880,7 +24904,7 @@ fn test_malformed_two_dot_number_raises_when_read_3222() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", "[.a]"], Some(r#"{"a": 1.2.3}"#))?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
-    assert!(stderr.contains("invalid numeric literal"), "{stderr}");
+    assert!(names_fault(&stderr, "invalid numeric literal"), "{stderr}");
     Ok(())
 }
 
@@ -24929,7 +24953,7 @@ fn test_array_iteration_raises_at_the_malformed_number_3222() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", ".[]"], Some("[007, 1.2.3, 42]"))?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "7\n");
-    assert!(stderr.contains("Invalid JSON text"), "{stderr}");
+    assert!(names_fault(&stderr, "Invalid JSON text"), "{stderr}");
     Ok(())
 }
 
@@ -24972,7 +24996,7 @@ fn test_exit_status_for_malformed_number_is_the_decode_failure_3222() -> Result<
     let (stdout, stderr, code) = run_jq_full(&["-e", "-c", ".a"], Some(r#"{"a": 1.2.3}"#))?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
-    assert!(stderr.contains("invalid numeric literal"), "{stderr}");
+    assert!(names_fault(&stderr, "invalid numeric literal"), "{stderr}");
     Ok(())
 }
 
@@ -24990,7 +25014,7 @@ fn test_arithmetic_on_malformed_number_errors_not_silent_zero_966() -> Result<()
     assert_eq!(stdout, "");
     // Since #3222 the read itself raises, before `-` sees an operand.
     assert!(
-        stderr.contains("invalid numeric literal"),
+        names_fault(&stderr, "invalid numeric literal"),
         "unexpected stderr: {stderr}"
     );
     Ok(())
@@ -33602,7 +33626,7 @@ fn test_lazyseq_builtins_stay_atomic_on_malformed_content_2066() -> Result<()> {
         assert_eq!(code, 5, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
         assert_eq!(stdout, "", "{filter}: stdout: {stdout:?}");
         assert!(
-            stderr.contains("unexpected character"),
+            names_fault(&stderr, "unexpected character"),
             "{filter}: stderr: {stderr:?}"
         );
     }
@@ -34733,7 +34757,7 @@ fn test_jq_malformed_object_member_errors_not_silently_dropped_1194() -> Result<
             "{input} should print nothing (it used to print {previously}), got: {out:?}"
         );
         assert!(
-            stderr.contains("Invalid JSON text"),
+            names_fault(&stderr, "Invalid JSON text"),
             "{input} should name the cause on stderr, got: {stderr:?}"
         );
     }
@@ -34746,15 +34770,23 @@ fn test_jq_malformed_object_member_errors_not_silently_dropped_1194() -> Result<
 /// path) should agree about *why* a document is malformed.
 #[test]
 fn test_jq_malformed_object_reports_the_validators_reason_1194() -> Result<()> {
+    // The cause of each fault, in jq's parser's words since #5576 (captured from jq 1.7.1).
     for (input, reason) in [
-        ("{invalid}", "expected string key"),
-        ("{1}", "expected string key"),
-        (r#"{"a"}"#, "expected ':'"),
+        ("{invalid}", "Invalid numeric literal at line 1, column 9"),
+        (
+            "{1}",
+            "Objects must consist of key:value pairs at line 1, column 3",
+        ),
+        (
+            r#"{"a"}"#,
+            "Objects must consist of key:value pairs at line 1, column 5",
+        ),
     ] {
         let (_out, stderr, _code) = run_jq_full(&["-c", "."], Some(input))?;
-        assert!(
-            stderr.contains(reason),
-            "{input} should report {reason:?}, got: {stderr:?}"
+        assert_eq!(
+            stderr,
+            format!("jq: parse error: {reason}\n"),
+            "{input} should report {reason:?}"
         );
     }
 
@@ -35013,7 +35045,10 @@ fn test_jq_malformed_object_raises_off_the_lazy_path_1194() -> Result<()> {
     // On the lazy path.
     let (_out, stderr, code) = run_jq_full(&["-c", "."], Some("{invalid}"))?;
     assert_eq!(code, 5);
-    assert!(stderr.contains("jq: error"), "stderr: {stderr:?}");
+    assert!(
+        stderr.starts_with("jq: parse error: Invalid numeric literal"),
+        "stderr: {stderr:?}"
+    );
 
     // And off it.
     for args in [
@@ -35024,7 +35059,7 @@ fn test_jq_malformed_object_raises_off_the_lazy_path_1194() -> Result<()> {
         let (out, stderr, code) = run_jq_full(args, Some("{invalid}"))?;
         assert_eq!(code, 5, "{args:?}: out: {out:?}, stderr: {stderr:?}");
         assert!(
-            stderr.contains("jq: error"),
+            stderr.contains("jq: error") || stderr.starts_with("jq: parse error"),
             "{args:?} must report in jq's channel, not anyhow's: {stderr:?}"
         );
         assert!(!out.contains("{}"), "{args:?}: out: {out:?}");
@@ -35105,7 +35140,7 @@ fn test_malformed_json_error_never_suppressed_2286() -> Result<()> {
         let (stdout, stderr, code) = run_jq_full(&["-c", expr], Some(malformed_pairing))?;
         assert_eq!(code, 5, "{expr}: stdout: {stdout:?} stderr: {stderr:?}");
         assert!(
-            stderr.contains("Invalid JSON text"),
+            names_fault(&stderr, "Invalid JSON text"),
             "{expr}: stderr: {stderr:?}"
         );
     }
@@ -35147,7 +35182,7 @@ fn test_malformed_json_error_never_suppressed_on_generic_bridge_2286() -> Result
         assert_eq!(code, 5, "{expr}: stdout: {stdout:?} stderr: {stderr:?}");
         assert!(stdout.is_empty(), "{expr}: stdout: {stdout:?}");
         assert!(
-            stderr.contains("Invalid JSON text"),
+            names_fault(&stderr, "Invalid JSON text"),
             "{expr}: stderr: {stderr:?}"
         );
     }
@@ -35186,8 +35221,9 @@ fn test_jq_malformed_object_leaves_no_partial_output_1194() -> Result<()> {
 fn test_jq_malformed_object_in_stream_keeps_good_documents_1194() -> Result<()> {
     let (out, _stderr, code) = run_jq_full(&["-c", "."], Some("{\"a\":1}\n{invalid}\n{\"z\":9}"))?;
     assert_eq!(code, 5, "out: {out:?}");
+    // jq stops at the malformed document and reads nothing after it (#5576).
     let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
-    assert_eq!(lines, vec![r#"{"a":1}"#, r#"{"z":9}"#], "out: {out:?}");
+    assert_eq!(lines, vec![r#"{"a":1}"#], "out: {out:?}");
 
     Ok(())
 }
@@ -35260,13 +35296,15 @@ fn test_jq_malformed_object_non_string_key_raises_everywhere_1194() -> Result<()
         let (out, stderr, code) = run_jq_full(args, Some(input))?;
         assert_eq!(code, 5, "{args:?}: out: {out:?}, stderr: {stderr:?}");
         assert!(
-            stderr.contains("jq: error"),
+            stderr.contains("jq: error") || stderr.starts_with("jq: parse error"),
             "{args:?} must report in jq's channel: {stderr:?}"
         );
-        // The strict validator's own diagnosis of *this* fault, not the
-        // orphan wording -- getting the cause right is half the fix.
+        // The cause of *this* fault, not the orphan wording -- getting it right is half the
+        // fix. jq's parser words it since #5576, except a `--slurp` stream from stdin, which
+        // keeps the strict validator's reason.
         assert!(
-            stderr.contains("expected string key"),
+            stderr.contains("expected string key")
+                || stderr.contains("Object keys must be strings"),
             "{args:?}: stderr: {stderr:?}"
         );
     }
@@ -35295,7 +35333,7 @@ fn test_optional_wrongly_suppresses_malformed_json_error_known_gap_1995() -> Res
         assert_eq!(code, 5, "input {input:?}: out: {out:?}, stderr: {stderr:?}");
         assert!(out.trim().is_empty(), "input {input:?}: out: {out:?}");
         assert!(
-            stderr.contains("Invalid JSON text"),
+            names_fault(&stderr, "Invalid JSON text"),
             "input {input:?}: stderr: {stderr:?}"
         );
     }
@@ -35325,7 +35363,7 @@ fn test_jq_malformed_object_keys_raises_on_both_faults_1194() -> Result<()> {
                 "{input} | {filter}: out: {out:?}, stderr: {stderr:?}"
             );
             assert!(
-                stderr.contains("Invalid JSON text"),
+                names_fault(&stderr, "Invalid JSON text"),
                 "{input} | {filter}: stderr: {stderr:?}"
             );
         }
@@ -35386,7 +35424,7 @@ fn test_jq_malformed_nested_number_raises_like_1194_3222() -> Result<()> {
     let (out, stderr, code) = run_jq_full(&["-c", "."], Some(input))?;
     assert_eq!(code, 5, "{input}: out: {out:?}");
     assert_eq!(out, "", "{input}");
-    assert!(stderr.contains("Invalid JSON text"), "{stderr}");
+    assert!(names_fault(&stderr, "Invalid JSON text"), "{stderr}");
 
     Ok(())
 }
@@ -35414,7 +35452,7 @@ fn test_jq_bare_iterate_over_malformed_object_errors_1641() -> Result<()> {
             "{input} should print nothing at all, got: {out:?}"
         );
         assert!(
-            stderr.contains("Invalid JSON text"),
+            names_fault(&stderr, "Invalid JSON text"),
             "{input} should name the cause on stderr, got: {stderr:?}"
         );
     }
@@ -35485,7 +35523,7 @@ fn test_jq_missing_or_doubled_delimiter_raises_1643() -> Result<()> {
         assert_eq!(code, 5, "{input}: out: {out:?}, stderr: {stderr:?}");
         assert!(out.trim().is_empty(), "{input}: unexpected output {out:?}");
         assert!(
-            stderr.contains("Invalid JSON text"),
+            names_fault(&stderr, "Invalid JSON text"),
             "{input}: stderr: {stderr:?}"
         );
     }
@@ -35501,7 +35539,10 @@ fn test_jq_missing_delimiter_raises_through_field_lookup_1643() -> Result<()> {
     let (out, stderr, code) = run_jq_full(&["-c", ".a"], Some(r#"{"a":{"b" 1}}"#))?;
     assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
     assert!(out.trim().is_empty(), "unexpected output {out:?}");
-    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+    assert!(
+        names_fault(&stderr, "Invalid JSON text"),
+        "stderr: {stderr:?}"
+    );
 
     Ok(())
 }
@@ -35683,7 +35724,7 @@ fn test_jq_trailing_leading_comma_now_rejected_1676() -> Result<()> {
         assert_eq!(code, 5, "{input}: out: {out:?}, stderr: {stderr:?}");
         assert!(out.trim().is_empty(), "{input}: unexpected output {out:?}");
         assert!(
-            stderr.contains("Invalid JSON text"),
+            names_fault(&stderr, "Invalid JSON text"),
             "{input}: stderr: {stderr:?}"
         );
     }
@@ -35703,7 +35744,7 @@ fn test_jq_trailing_leading_comma_now_rejected_1676() -> Result<()> {
         let (out, stderr, code) = run_jq_full(&["-c", "."], Some(input))?;
         assert_eq!(code, 5, "{input}: out: {out:?}, stderr: {stderr:?}");
         assert!(
-            stderr.contains("Invalid JSON text"),
+            names_fault(&stderr, "Invalid JSON text"),
             "{input}: stderr: {stderr:?}"
         );
     }
@@ -35788,7 +35829,7 @@ fn test_jq_lazy_path_rejects_stray_comma_in_empty_container_2211() -> Result<()>
         let (out, stderr, code) = run_jq_full(&["-c", "if true then . else . end"], Some(input))?;
         assert_eq!(code, 5, "{input}: out: {out:?}, stderr: {stderr:?}");
         assert!(
-            stderr.contains("Invalid JSON text"),
+            names_fault(&stderr, "Invalid JSON text"),
             "{input}: stderr: {stderr:?}"
         );
     }
@@ -35808,7 +35849,7 @@ fn test_jq_lazy_path_already_rejected_nonempty_stray_comma_2211() -> Result<()> 
         let (out, stderr, code) = run_jq_full(&["-c", "if true then . else . end"], Some(input))?;
         assert_eq!(code, 5, "{input}: out: {out:?}, stderr: {stderr:?}");
         assert!(
-            stderr.contains("Invalid JSON text"),
+            names_fault(&stderr, "Invalid JSON text"),
             "{input}: stderr: {stderr:?}"
         );
     }
@@ -35858,7 +35899,7 @@ fn test_jq_lazy_path_trailing_comma_after_scalar_last_child_2243() -> Result<()>
         let (out, stderr, code) = run_jq_full(&["-c", "if true then . else . end"], Some(input))?;
         assert_eq!(code, 5, "{input}: out: {out:?}, stderr: {stderr:?}");
         assert!(
-            stderr.contains("Invalid JSON text"),
+            names_fault(&stderr, "Invalid JSON text"),
             "{input}: stderr: {stderr:?}"
         );
     }
@@ -35939,7 +35980,7 @@ fn test_jq_cursor_transparent_fast_paths_reject_trailing_comma_2261() -> Result<
             "input={input} query={query}: unexpected output {out:?}"
         );
         assert!(
-            stderr.contains("Invalid JSON text"),
+            names_fault(&stderr, "Invalid JSON text"),
             "input={input} query={query}: stderr: {stderr:?}"
         );
     }
@@ -35950,7 +35991,10 @@ fn test_jq_cursor_transparent_fast_paths_reject_trailing_comma_2261() -> Result<
     let (out, stderr, code) = run_jq_full(&["-c", "keys_unsorted[]"], Some(r#"{"a":1,}"#))?;
     assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
     assert_eq!(out, "\"a\"\n", "the one real key should still stream");
-    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+    assert!(
+        names_fault(&stderr, "Invalid JSON text"),
+        "stderr: {stderr:?}"
+    );
 
     Ok(())
 }
@@ -35971,7 +36015,10 @@ fn test_jq_lazy_array_iterate_trailing_comma_streams_confirmed_prefix_first_2261
     let (out, stderr, code) = run_jq_full(&["-c", ".[]"], Some(r"[1,]"))?;
     assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
     assert_eq!(out.trim(), "1", "the one real element should still stream");
-    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+    assert!(
+        names_fault(&stderr, "Invalid JSON text"),
+        "stderr: {stderr:?}"
+    );
     Ok(())
 }
 
@@ -35986,7 +36033,10 @@ fn test_jq_lazy_keys_array_trailing_comma_writes_no_partial_record_2261() -> Res
     let (out, stderr, code) = run_jq_full(&["-c", "keys_unsorted"], Some(r#"{"a":1,}"#))?;
     assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
     assert_eq!(out, "", "no partial record (#3265)");
-    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+    assert!(
+        names_fault(&stderr, "Invalid JSON text"),
+        "stderr: {stderr:?}"
+    );
     Ok(())
 }
 
@@ -36007,7 +36057,10 @@ fn test_jq_array_positive_index_trailing_comma_fixed_2261() -> Result<()> {
     let (out, stderr, code) = run_jq_full(&["-c", ".[0]"], Some(r"[1,]"))?;
     assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
     assert!(out.trim().is_empty(), "unexpected output {out:?}");
-    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+    assert!(
+        names_fault(&stderr, "Invalid JSON text"),
+        "stderr: {stderr:?}"
+    );
     Ok(())
 }
 
@@ -36111,7 +36164,7 @@ fn test_jq_cursor_transparent_fast_paths_empty_container_stray_comma_now_raises_
             "input={input} query={query}: expected the #2211 raise, got out={out:?}"
         );
         assert!(
-            stderr.contains("Invalid JSON text"),
+            names_fault(&stderr, "Invalid JSON text"),
             "input={input} query={query}: stderr {stderr:?} is not the strict-validator message"
         );
         assert!(
@@ -36269,7 +36322,7 @@ fn test_jq_nested_value_domain_walks_empty_container_now_raises_2731() -> Result
             "input={input} query={query}: expected the #2211 raise, got out={out:?}"
         );
         assert!(
-            stderr.contains("Invalid JSON text"),
+            names_fault(&stderr, "Invalid JSON text"),
             "input={input} query={query}: stderr {stderr:?} is not the strict-validator message"
         );
         assert!(
@@ -36308,7 +36361,7 @@ fn test_jq_nested_paths_array_stray_comma_with_real_elements_now_raises_2731() -
             "input={input} query={query}: expected the #2211 raise, got out={out:?}"
         );
         assert!(
-            stderr.contains("Invalid JSON text"),
+            names_fault(&stderr, "Invalid JSON text"),
             "input={input} query={query}: stderr {stderr:?} is not the strict-validator message"
         );
         assert!(
@@ -36435,7 +36488,7 @@ fn test_jq_len_checked_sibling_paths_reject_trailing_comma_2261() -> Result<()> 
             "input={input} query={query}: unexpected output {out:?}"
         );
         assert!(
-            stderr.contains("Invalid JSON text"),
+            names_fault(&stderr, "Invalid JSON text"),
             "input={input} query={query}: stderr: {stderr:?}"
         );
     }
@@ -36465,7 +36518,7 @@ fn test_jq_length_object_rejects_trailing_comma_2307() -> Result<()> {
             "input={input} query={query}: unexpected output {out:?}"
         );
         assert!(
-            stderr.contains("Invalid JSON text"),
+            names_fault(&stderr, "Invalid JSON text"),
             "input={input} query={query}: stderr: {stderr:?}"
         );
     }
@@ -36550,7 +36603,7 @@ fn test_jq_collect_cursors_checked_sibling_paths_reject_trailing_comma_2261() ->
             "query={query}: unexpected output {out:?}"
         );
         assert!(
-            stderr.contains("Invalid JSON text"),
+            names_fault(&stderr, "Invalid JSON text"),
             "query={query}: stderr: {stderr:?}"
         );
     }
@@ -36570,11 +36623,17 @@ fn test_jq_collect_cursors_checked_sibling_paths_reject_trailing_comma_2261() ->
     // and demonstrates the identical `collect_cursors`-to-`_checked` fix.
     let (out, stderr, code) = run_jq_full(&["-c", "pivot"], Some(r#"[{"a":1},,{"a":2}]"#))?;
     assert_eq!(code, 5, "pivot: out: {out:?}, stderr: {stderr:?}");
-    assert!(stderr.contains("Invalid JSON text"), "pivot: {stderr:?}");
+    assert!(
+        names_fault(&stderr, "Invalid JSON text"),
+        "pivot: {stderr:?}"
+    );
 
     let (out, stderr, code) = run_jq_full(&["-c", "shuffle"], Some(r"[1,2,3,]"))?;
     assert_eq!(code, 5, "shuffle: out: {out:?}, stderr: {stderr:?}");
-    assert!(stderr.contains("Invalid JSON text"), "shuffle: {stderr:?}");
+    assert!(
+        names_fault(&stderr, "Invalid JSON text"),
+        "shuffle: {stderr:?}"
+    );
 
     Ok(())
 }
@@ -36596,7 +36655,10 @@ fn test_jq_has_object_early_exit_still_skips_a_later_trailing_comma_2261() -> Re
     let (out, stderr, code) = run_jq_full(&["-c", "has(\"a\")"], Some(r#"{"a":1,}"#))?;
     assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
     assert!(out.trim().is_empty(), "unexpected output {out:?}");
-    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+    assert!(
+        names_fault(&stderr, "Invalid JSON text"),
+        "stderr: {stderr:?}"
+    );
 
     // The match is *not* the last field -- a later trailing comma exists
     // but this early-exit consumer never reaches it, a documented,
@@ -36611,7 +36673,10 @@ fn test_jq_has_object_early_exit_still_skips_a_later_trailing_comma_2261() -> Re
     // match-not-last case above misses.
     let (out, stderr, code) = run_jq_full(&["-c", "has(\"z\")"], Some(r#"{"a":1,"b":2,}"#))?;
     assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
-    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+    assert!(
+        names_fault(&stderr, "Invalid JSON text"),
+        "stderr: {stderr:?}"
+    );
 
     Ok(())
 }
@@ -36662,7 +36727,10 @@ fn test_jq_has_object_rejects_nonstring_key_before_match_2288() -> Result<()> {
     let (out, stderr, code) = run_jq_full(&["-c", "has(\"a\")"], Some(r#"{123:1,"a":2}"#))?;
     assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
     assert!(out.trim().is_empty(), "unexpected output {out:?}");
-    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+    assert!(
+        names_fault(&stderr, "Invalid JSON text"),
+        "stderr: {stderr:?}"
+    );
 
     // Malformed key visited *after* the match -- documented, accepted gap:
     // real jq raises here too (it can't parse the document at all), but
@@ -36675,7 +36743,10 @@ fn test_jq_has_object_rejects_nonstring_key_before_match_2288() -> Result<()> {
     // regardless of where it sits, so this always raises.
     let (out, stderr, code) = run_jq_full(&["-c", "has(\"z\")"], Some(r#"{"a":1,123:2}"#))?;
     assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
-    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+    assert!(
+        names_fault(&stderr, "Invalid JSON text"),
+        "stderr: {stderr:?}"
+    );
 
     Ok(())
 }
@@ -36696,7 +36767,7 @@ fn test_jq_length_and_index_leading_comma_gap_still_raises_2261() -> Result<()> 
             "query={query}: unexpected output {out:?}"
         );
         assert!(
-            stderr.contains("Invalid JSON text"),
+            names_fault(&stderr, "Invalid JSON text"),
             "query={query}: stderr: {stderr:?}"
         );
     }
@@ -36730,7 +36801,10 @@ fn test_jq_descended_pipe_prefix_reaches_demand_aware_keys_sink_2261() -> Result
         run_jq_full(&["-c", ".x | keys_unsorted[]"], Some(r#"{"x":{"a":1,}}"#))?;
     assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
     assert_eq!(out.trim(), "\"a\"", "the one real key should still stream");
-    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+    assert!(
+        names_fault(&stderr, "Invalid JSON text"),
+        "stderr: {stderr:?}"
+    );
     Ok(())
 }
 
@@ -36763,7 +36837,7 @@ fn test_jq_missing_delimiter_raises_under_sort_keys_color_and_slurp_1643() -> Re
                 "{args:?} {input}: unexpected output {out:?}"
             );
             assert!(
-                stderr.contains("Invalid JSON text"),
+                names_fault(&stderr, "Invalid JSON text"),
                 "{args:?} {input}: stderr: {stderr:?}"
             );
         }
@@ -36801,7 +36875,7 @@ fn test_jq_trailing_comma_raises_under_sort_keys_color_and_slurp_1676() -> Resul
                 "{args:?} {input}: unexpected output {out:?}"
             );
             assert!(
-                stderr.contains("Invalid JSON text"),
+                names_fault(&stderr, "Invalid JSON text"),
                 "{args:?} {input}: stderr: {stderr:?}"
             );
         }
@@ -36820,7 +36894,7 @@ fn test_jq_doubled_trailing_comma_rejected_1676() -> Result<()> {
         assert_eq!(code, 5, "{input}: out: {out:?}, stderr: {stderr:?}");
         assert!(out.trim().is_empty(), "{input}: unexpected output {out:?}");
         assert!(
-            stderr.contains("Invalid JSON text"),
+            names_fault(&stderr, "Invalid JSON text"),
             "{input}: stderr: {stderr:?}"
         );
     }
@@ -36872,7 +36946,10 @@ fn test_jq_missing_delimiter_raises_under_sort_keys_mid_stream_1643() -> Result<
         "{\n  \"x\": 1\n}",
         "the first, well-formed value must still print: {out:?}"
     );
-    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+    assert!(
+        names_fault(&stderr, "Invalid JSON text"),
+        "stderr: {stderr:?}"
+    );
 
     Ok(())
 }
@@ -36906,7 +36983,7 @@ fn test_jq_missing_delimiter_raises_through_nonreserializing_filters_1677() -> R
         let (out, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a" 1, "b": 2}"#))?;
         assert_eq!(code, 5, "{filter}: out: {out:?}, stderr: {stderr:?}");
         assert!(
-            stderr.contains("Invalid JSON text"),
+            names_fault(&stderr, "Invalid JSON text"),
             "{filter}: stderr: {stderr:?}"
         );
     }
@@ -36918,11 +36995,17 @@ fn test_jq_missing_delimiter_raises_through_nonreserializing_filters_1677() -> R
     let (out, stderr, code) = run_jq_full(&["-c", ".[]"], Some("[1 2, 3]"))?;
     assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
     assert_eq!(out, "1\n", "unexpected output {out:?}");
-    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+    assert!(
+        names_fault(&stderr, "Invalid JSON text"),
+        "stderr: {stderr:?}"
+    );
 
     let (out, stderr, code) = run_jq_full(&["-c", "add"], Some("[1 2, 3]"))?;
     assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
-    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+    assert!(
+        names_fault(&stderr, "Invalid JSON text"),
+        "stderr: {stderr:?}"
+    );
 
     Ok(())
 }
@@ -36941,7 +37024,10 @@ fn test_jq_general_streaming_path_writes_no_prefix_before_nested_comma_fault_221
     let (out, stderr, code) = run_jq_full(&["-c", "."], Some(r#"{"a": [,]}"#))?;
     assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
     assert_eq!(out, "", "unexpected output {out:?}");
-    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+    assert!(
+        names_fault(&stderr, "Invalid JSON text"),
+        "stderr: {stderr:?}"
+    );
 
     // `-S` forces the fully materializing path, which validates before
     // printing anything. The two paths now agree on stdout as well as on
@@ -36949,7 +37035,10 @@ fn test_jq_general_streaming_path_writes_no_prefix_before_nested_comma_fault_221
     let (out, stderr, code) = run_jq_full(&["-c", "-S", "."], Some(r#"{"a": [,]}"#))?;
     assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
     assert!(out.is_empty(), "unexpected output {out:?}");
-    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+    assert!(
+        names_fault(&stderr, "Invalid JSON text"),
+        "stderr: {stderr:?}"
+    );
 
     Ok(())
 }
@@ -37020,7 +37109,10 @@ fn test_jq_missing_delimiter_raises_through_top_level_field_lookup_1677() -> Res
     let (out, stderr, code) = run_jq_full(&["-c", ".a"], Some(r#"{"a" 1}"#))?;
     assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
     assert!(out.trim().is_empty(), "unexpected output {out:?}");
-    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+    assert!(
+        names_fault(&stderr, "Invalid JSON text"),
+        "stderr: {stderr:?}"
+    );
 
     Ok(())
 }
@@ -37066,7 +37158,10 @@ fn test_jq_keys_unsorted_last_raises_on_missing_delimiter_1956() -> Result<()> {
     let (out, stderr, code) = run_jq_full(&["-c", "keys_unsorted | last"], Some(doc))?;
     assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
     assert!(out.trim().is_empty(), "unexpected output {out:?}");
-    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+    assert!(
+        names_fault(&stderr, "Invalid JSON text"),
+        "stderr: {stderr:?}"
+    );
 
     // #2286: this #1194/#1677 error is now `is_decode_failure()`-tagged,
     // so `try...catch` no longer reaches its handler either -- matching
@@ -37078,7 +37173,10 @@ fn test_jq_keys_unsorted_last_raises_on_missing_delimiter_1956() -> Result<()> {
     )?;
     assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
     assert!(out.trim().is_empty(), "unexpected output {out:?}");
-    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+    assert!(
+        names_fault(&stderr, "Invalid JSON text"),
+        "stderr: {stderr:?}"
+    );
 
     // Well-formed data is unaffected.
     let (out, stderr, code) =
@@ -37102,7 +37200,10 @@ fn test_jq_keys_unsorted_map_raises_on_missing_delimiter_1956() -> Result<()> {
     let (out, stderr, code) = run_jq_full(&["-c", "keys_unsorted | map(.)"], Some(doc))?;
     assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
     assert!(out.trim().is_empty(), "unexpected output {out:?}");
-    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+    assert!(
+        names_fault(&stderr, "Invalid JSON text"),
+        "stderr: {stderr:?}"
+    );
 
     // #2286: same revision as the sibling `last` test above -- this error
     // is now `is_decode_failure()`-tagged, so `try...catch` no longer
@@ -37113,7 +37214,10 @@ fn test_jq_keys_unsorted_map_raises_on_missing_delimiter_1956() -> Result<()> {
     )?;
     assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
     assert!(out.trim().is_empty(), "unexpected output {out:?}");
-    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+    assert!(
+        names_fault(&stderr, "Invalid JSON text"),
+        "stderr: {stderr:?}"
+    );
 
     // Well-formed data is unaffected.
     let (out, stderr, code) =
@@ -40165,7 +40269,7 @@ fn test_jq_nth_generic_still_surfaces_a_skipped_decode_failure_through_a_retry_2
     assert_eq!(code, 5, "stdout: {stdout}\nstderr: {stderr}");
     assert_eq!(stdout, "");
     assert!(
-        stderr.contains("invalid escape sequence"),
+        names_fault(&stderr, "invalid escape sequence"),
         "stderr: {stderr}"
     );
     Ok(())
@@ -40195,7 +40299,7 @@ fn test_sub_replacement_via_bound_var_still_raises_on_decode_failure_2165() -> R
     assert_eq!(code, 5, "stdout: {stdout}\nstderr: {stderr}");
     assert_eq!(stdout, "");
     assert!(
-        stderr.contains("invalid escape sequence"),
+        names_fault(&stderr, "invalid escape sequence"),
         "stderr: {stderr}"
     );
     Ok(())
@@ -45085,7 +45189,7 @@ fn test_as_pattern_alternatives_retry_under_a_wrapping_consumer_1519() -> Result
             ],
             Some(r#"{"bad": "\x"}"#),
             "\"ok\"\n",
-            "jq: error (at <stdin>:0): invalid escape sequence in string",
+            "jq: parse error: Invalid escape at line 1, column 12",
             5,
         ),
     ];
@@ -46918,7 +47022,7 @@ fn test_getpath_touches_only_the_nodes_it_navigates_2168() -> Result<()> {
         let (_, stderr, code) =
             run_jq_stdin_streams(r#"getpath(["a"]) | length"#, &input, &["-c"])?;
         assert_eq!(code, 5, "{bad}: stderr {stderr:?}");
-        assert!(stderr.contains("escape sequence"), "{bad}: {stderr:?}");
+        assert!(names_fault(&stderr, "escape sequence"), "{bad}: {stderr:?}");
     }
 
     Ok(())
@@ -47122,7 +47226,7 @@ fn test_getpath_optional_matches_jq_on_the_cursor_walk_2168() -> Result<()> {
         &["-c"],
     )?;
     assert_eq!(code, 5, "stdout {stdout:?} stderr {stderr:?}");
-    assert!(stderr.contains("escape sequence"), "{stderr:?}");
+    assert!(names_fault(&stderr, "escape sequence"), "{stderr:?}");
 
     Ok(())
 }
@@ -47449,7 +47553,7 @@ fn test_optional_ignored_sites_2327() -> Result<()> {
             );
             assert_eq!(stdout, "", "{full_filter}: stderr {stderr:?}");
             assert!(
-                stderr.contains("Invalid JSON text"),
+                names_fault(&stderr, "Invalid JSON text"),
                 "{full_filter}: stderr {stderr:?}"
             );
         }
@@ -48026,7 +48130,7 @@ fn test_decode_failure_surfaces_as_error_1247() {
             .unwrap_or_else(|e| panic!("`{filter}` failed to run: {e}"));
         assert_ne!(code, 0, "`{filter}` should fail\nstdout: {stdout}");
         assert!(
-            stderr.contains("invalid unicode escape sequence"),
+            names_fault(&stderr, "invalid unicode escape sequence"),
             "`{filter}` should name the decode failure, not a downstream type error\nstderr: {stderr}"
         );
     }
@@ -48067,7 +48171,7 @@ fn test_low_surrogate_substitutes_replacement_character_2008() {
         code, 0,
         "lone high surrogate should still be rejected (#1247)"
     );
-    assert!(stderr.contains("invalid unicode escape sequence"));
+    assert!(names_fault(&stderr, "invalid unicode escape sequence"));
 }
 
 /// #2008 (code review): a lone low surrogate in an object *key* decodes the
@@ -48318,7 +48422,7 @@ fn test_sort_keys_and_color_force_materialize_and_surface_decode_failure_1247() 
             .unwrap_or_else(|e| panic!("`{flag}` failed to run: {e}"));
         assert_ne!(code, 0, "`{flag}` should fail\nstdout: {stdout}");
         assert!(
-            stderr.contains("invalid unicode escape sequence"),
+            names_fault(&stderr, "invalid unicode escape sequence"),
             "`{flag}` stderr: {stderr}"
         );
     }
@@ -48352,7 +48456,7 @@ fn test_decode_failure_not_suppressed_by_optional_1620() {
             "`{filter}` should fail, not be suppressed by `?`\nstdout: {stdout}"
         );
         assert!(
-            stderr.contains("invalid unicode escape sequence"),
+            names_fault(&stderr, "invalid unicode escape sequence"),
             "`{filter}` should name the decode failure\nstderr: {stderr}"
         );
     }
@@ -48377,7 +48481,7 @@ fn test_decode_failure_not_caught_by_try_catch_1620() {
             "`{filter}` should not have run the catch handler\nstdout: {stdout}"
         );
         assert!(
-            stderr.contains("invalid unicode escape sequence"),
+            names_fault(&stderr, "invalid unicode escape sequence"),
             "`{filter}` should name the decode failure\nstderr: {stderr}"
         );
     }
@@ -48404,7 +48508,7 @@ fn test_in_upper_in_contains_all_raise_decode_failure_from_cli_2202() {
             .unwrap_or_else(|e| panic!("`{filter}` failed to run: {e}"));
         assert_ne!(code, 0, "`{filter}` should fail\nstdout: {stdout}");
         assert!(
-            stderr.contains("invalid unicode escape sequence"),
+            names_fault(&stderr, "invalid unicode escape sequence"),
             "`{filter}` should name the decode failure, not `boom`\nstderr: {stderr}"
         );
     }
@@ -48480,7 +48584,10 @@ fn test_try_catch_contains_a_genuinely_catchable_malformed_key_error_1812() -> R
     let (stdout, stderr, code) = run_jq_full(&["-c", "sort?"], Some(doc))?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr}");
     assert!(stdout.trim().is_empty(), "stdout: {stdout:?}");
-    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr}");
+    assert!(
+        names_fault(&stderr, "Invalid JSON text"),
+        "stderr: {stderr}"
+    );
 
     // `1+1` reads nothing, so since #2103 it validates nothing. jq exits 5.
     let (stdout, stderr, code) = run_jq_full(&["-c", r#"try (1+1) catch "x""#], Some(doc))?;
@@ -48594,7 +48701,7 @@ fn test_optional_and_try_catch_force_and_catch_a_lazykeys_malformed_key_1936() -
         assert_eq!(code, 5, "`{filter}` -- stdout: {stdout:?} stderr: {stderr}");
         assert!(stdout.trim().is_empty(), "`{filter}` -- stdout: {stdout:?}");
         assert!(
-            stderr.contains("Invalid JSON text"),
+            names_fault(&stderr, "Invalid JSON text"),
             "`{filter}` -- stderr: {stderr}"
         );
     }
@@ -48608,7 +48715,7 @@ fn test_optional_and_try_catch_force_and_catch_a_lazykeys_malformed_key_1936() -
         assert_eq!(code, 5, "`{filter}` -- stdout: {stdout:?} stderr: {stderr}");
         assert!(stdout.trim().is_empty(), "`{filter}` -- stdout: {stdout:?}");
         assert!(
-            stderr.contains("Invalid JSON text"),
+            names_fault(&stderr, "Invalid JSON text"),
             "`{filter}` -- stderr: {stderr}"
         );
     }
@@ -48677,7 +48784,7 @@ fn test_first_limit_wrapped_optional_try_catch_suppresses_and_catches_1948() -> 
         assert_eq!(code, 5, "`{filter}` -- stdout: {stdout:?} stderr: {stderr}");
         assert!(stdout.trim().is_empty(), "`{filter}` -- stdout: {stdout}");
         assert!(
-            stderr.contains("Invalid JSON text"),
+            names_fault(&stderr, "Invalid JSON text"),
             "`{filter}` -- stderr: {stderr}"
         );
     }
@@ -48693,7 +48800,7 @@ fn test_first_limit_wrapped_optional_try_catch_suppresses_and_catches_1948() -> 
         assert_eq!(code, 5, "`{filter}` -- stdout: {stdout:?} stderr: {stderr}");
         assert!(stdout.trim().is_empty(), "`{filter}` -- stdout: {stdout}");
         assert!(
-            stderr.contains("Invalid JSON text"),
+            names_fault(&stderr, "Invalid JSON text"),
             "`{filter}` -- stderr: {stderr}"
         );
     }
@@ -48772,9 +48879,8 @@ fn test_malformed_value_surfaces_as_error_1194() {
         );
     }
 
-    // Evaluation continues past the bad value, per the `ErrorSink`
-    // convention (#355): the two good documents either side of it still
-    // produce output, and the exit code still reports the failure.
+    // jq's parser stops at the bad value (#5576): the good document before it is
+    // answered, the one after it is not read, and the exit code reports the failure.
     let (stdout, _, code) = run_jq_full(
         &["-c", "to_entries"],
         Some("{\"a\":1}\n[xyz123]\n{\"b\":2}\n"),
@@ -48783,7 +48889,7 @@ fn test_malformed_value_surfaces_as_error_1194() {
     assert_ne!(code, 0);
     assert_eq!(
         stdout.lines().collect::<Vec<_>>(),
-        [r#"[{"key":"a","value":1}]"#, r#"[{"key":"b","value":2}]"#]
+        [r#"[{"key":"a","value":1}]"#]
     );
 }
 
@@ -55320,7 +55426,7 @@ fn test_path_answers_past_a_colliding_key_2168() -> Result<()> {
     let (stdout, stderr, code) =
         run_jq_stdin_streams(".", r#"{"\ud800":1,"\ud800":2}"#, &["-S", "-c"])?;
     assert_eq!(code, 5, "stdout {stdout:?}");
-    assert!(stderr.contains("is ambiguous"), "{stderr}");
+    assert!(names_fault(&stderr, "is ambiguous"), "{stderr}");
 
     Ok(())
 }
@@ -55373,7 +55479,7 @@ fn test_validation_gate_seeds_the_collision_map_prefix_2168() -> Result<()> {
         let (stdout, stderr, code) =
             run_jq_stdin_streams("sort_by(.a) | length", &array_doc, &["-c"])?;
         assert_eq!(code, 5, "sort_by on {array_doc}: stdout {stdout:?}");
-        assert!(stderr.contains("is ambiguous"), "sort_by: {stderr}");
+        assert!(names_fault(&stderr, "is ambiguous"), "sort_by: {stderr}");
 
         // The control, and the point of the whole #2168 split: the same
         // document, the same colliding pair, on a query that only names
@@ -55461,7 +55567,8 @@ fn test_path_answers_past_an_undecodable_sibling_2168() -> Result<()> {
         let (stdout, stderr, code) = run_jq_stdin_streams("path(.a[])", &input, &["-c"])?;
         assert_eq!(code, 5, "{bad}: stdout {stdout:?} stderr {stderr:?}");
         assert!(
-            stderr.contains("invalid unicode escape sequence") || stderr.contains("invalid escape"),
+            names_fault(&stderr, "invalid unicode escape sequence")
+                || names_fault(&stderr, "invalid escape"),
             "{bad}: {stderr}"
         );
         let (stdout, stderr, code) = run_jq_stdin_streams("[path(.[])]", &input, &["-c"])?;
@@ -55504,7 +55611,8 @@ fn test_path_optional_still_raises_a_decode_failure_2168() -> Result<()> {
              (plain nav {plain_nav} raised {nav_err:?})"
         );
         assert!(
-            stderr.contains("invalid unicode escape sequence") || stderr.contains("invalid escape"),
+            names_fault(&stderr, "invalid unicode escape sequence")
+                || stderr.contains("invalid escape"),
             "{filter}: {stderr:?}"
         );
     }
@@ -55615,7 +55723,7 @@ fn test_lazy_validation_boundary_2168() -> Result<()> {
         let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
         assert_eq!(code, 5, "{filter}: stdout {stdout:?} stderr {stderr:?}");
         assert!(
-            stderr.contains("invalid unicode escape sequence"),
+            names_fault(&stderr, "invalid unicode escape sequence"),
             "{filter}: {stderr:?}"
         );
     }
@@ -55633,7 +55741,7 @@ fn test_lazy_validation_boundary_2168() -> Result<()> {
         let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
         assert_eq!(code, 5, "{filter}: stdout {stdout:?} stderr {stderr:?}");
         assert!(
-            stderr.contains("invalid unicode escape sequence"),
+            names_fault(&stderr, "invalid unicode escape sequence"),
             "{filter}: {stderr:?}"
         );
     }
@@ -55691,7 +55799,7 @@ fn test_type_selectors_validate_only_what_they_read_3690() -> Result<()> {
         let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
         assert_eq!(code, 5, "{filter}: stdout {stdout:?} stderr {stderr:?}");
         assert!(
-            stderr.contains("invalid unicode escape sequence"),
+            names_fault(&stderr, "invalid unicode escape sequence"),
             "{filter}: {stderr:?}"
         );
     }
@@ -55703,7 +55811,7 @@ fn test_type_selectors_validate_only_what_they_read_3690() -> Result<()> {
         let (stdout, stderr, code) = run_jq_stdin_streams(filter, "[1.2.3, 4]", &["-c"])?;
         assert_eq!(code, 5, "{filter}: stdout {stdout:?} stderr {stderr:?}");
         assert!(
-            stderr.contains("invalid numeric literal"),
+            names_fault(&stderr, "invalid numeric literal"),
             "{filter}: {stderr:?}"
         );
     }
@@ -59808,7 +59916,7 @@ fn test_slice_bound_decode_failure_is_the_generator_escape_2546() -> Result<()> 
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "[1,2,3]\n");
     assert!(
-        stderr.contains("invalid unicode escape sequence"),
+        names_fault(&stderr, "invalid unicode escape sequence"),
         "stderr: {stderr:?}"
     );
 
@@ -59816,7 +59924,7 @@ fn test_slice_bound_decode_failure_is_the_generator_escape_2546() -> Result<()> 
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
     assert!(
-        stderr.contains("invalid unicode escape sequence"),
+        names_fault(&stderr, "invalid unicode escape sequence"),
         "stderr: {stderr:?}"
     );
     Ok(())
@@ -69075,7 +69183,7 @@ fn test_validate_only_gate_delimiter_checks_2349() -> Result<()> {
              (got exit 0, stdout: {stdout:?})"
         );
         assert!(
-            stderr.contains("Invalid JSON"),
+            names_fault(&stderr, "Invalid JSON"),
             "{desc}: expected a JSON validity error, stderr: {stderr:?}"
         );
     }
@@ -69134,7 +69242,7 @@ fn test_path_answers_past_a_structural_fault_it_never_reads_2168() -> Result<()>
     for filter in [".c", ".c.a", "sort_by(.c) | length"] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
         assert_ne!(code, 0, "{filter}: stdout {stdout:?}");
-        assert!(stderr.contains("Invalid JSON"), "{filter}: {stderr:?}");
+        assert!(names_fault(&stderr, "Invalid JSON"), "{filter}: {stderr:?}");
     }
 
     Ok(())
@@ -82885,7 +82993,7 @@ fn assert_path_rows_via_3749(
             );
         } else {
             assert!(
-                err.contains(message),
+                names_fault(&err, message),
                 "`{filter}` on {input}: stderr {err:?} lacks {message:?}"
             );
         }
@@ -95698,7 +95806,7 @@ fn test_validate_only_gate_array_element_delimiter_2349() -> Result<()> {
         "duplicate comma between array elements should raise (stdout: {stdout:?})"
     );
     assert!(
-        stderr.contains("Invalid JSON"),
+        names_fault(&stderr, "Invalid JSON"),
         "expected a JSON validity error, stderr: {stderr:?}"
     );
     Ok(())
@@ -97796,7 +97904,7 @@ fn test_parent_then_length_stays_on_cursor_2574() -> anyhow::Result<()> {
     let (out, err, code) = run_jq_full(&["-c", ".users[0] | parent | map(.id)"], Some(doc))?;
     assert_ne!(code, 0, "control must fail to decode: {out:?}");
     assert!(
-        err.contains("invalid unicode escape sequence"),
+        names_fault(&err, "invalid unicode escape sequence"),
         "control stderr: {err}"
     );
     Ok(())
@@ -98878,7 +98986,7 @@ fn test_closed_terms_do_not_validate_2173() -> Result<()> {
     // the collision, which is what keeps the pair above meaningful.
     let (_out, err, code) = run_jq_full(&["-Sc", "."], Some(collision))?;
     assert_eq!(code, 5, "`-Sc .` on the collision doc must still raise");
-    assert!(err.contains("ambiguous"), "`-Sc .` stderr: {err}");
+    assert!(names_fault(&err, "ambiguous"), "`-Sc .` stderr: {err}");
     // `-s` left that list with #2847: the slurped array is indexed, and `.`
     // forwards the cursor to the printer, so it echoes the document's own
     // bytes inside the array exactly as the default route echoes them bare.
@@ -98950,7 +99058,10 @@ fn test_and_or_raise_only_when_an_operand_materializes_2173_2692() -> Result<()>
     // that actually materializes it.
     let (stdout, stderr, code) = run_jq_stdin_streams(".", "{123: 1}", &[])?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr}");
+    assert!(
+        names_fault(&stderr, "Invalid JSON text"),
+        "stderr: {stderr}"
+    );
 
     Ok(())
 }
@@ -99148,7 +99259,7 @@ fn test_any_all_no_longer_reject_a_malformed_array_2692() -> Result<()> {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("{123: 1}"))?;
         assert_eq!(code, 5, "`{filter}` -- stdout: {stdout:?} stderr: {stderr}");
         assert!(
-            stderr.contains("Invalid JSON text"),
+            names_fault(&stderr, "Invalid JSON text"),
             "`{filter}` -- stderr: {stderr}"
         );
     }
@@ -99208,7 +99319,7 @@ fn test_any_all_validate_only_the_keys_they_resolve_2476_2692() -> Result<()> {
             );
             if *want_code == 5 {
                 assert!(
-                    first.contains("expected string key"),
+                    first.starts_with("jq: parse error: "),
                     "[{label}] `{probe}`: stderr {first:?}"
                 );
             }
@@ -99420,7 +99531,7 @@ fn test_alternative_raises_only_when_it_reads_the_document_2173() -> Result<()> 
         "`.a // 1` -- stdout: {stdout:?} stderr: {stderr:?}"
     );
     assert!(
-        stderr.contains("Invalid JSON text"),
+        names_fault(&stderr, "Invalid JSON text"),
         "`.a // 1` -- stderr: {stderr}"
     );
 
@@ -99438,7 +99549,10 @@ fn test_alternative_raises_only_when_it_reads_the_document_2173() -> Result<()> 
     // does.
     let (stdout, stderr, code) = run_jq_stdin_streams(".a // 1", "{123: 1}", &["-c"])?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr}");
+    assert!(
+        names_fault(&stderr, "Invalid JSON text"),
+        "stderr: {stderr}"
+    );
 
     // Navigates to an undecodable *element* and forwards it: the cursor is
     // passed through untouched, so this echoes the raw source bytes, exactly
@@ -99452,7 +99566,7 @@ fn test_alternative_raises_only_when_it_reads_the_document_2173() -> Result<()> 
         run_jq_stdin_streams("(.[0] // 1) | tostring", "[\"\\x\"]", &["-c"])?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(
-        stderr.contains("invalid escape sequence"),
+        names_fault(&stderr, "invalid escape sequence"),
         "stderr: {stderr}"
     );
 
@@ -100976,7 +101090,10 @@ fn test_pull_model_arms_reachable_only_through_a_nested_forcing_context_2103() -
     )?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr}");
     assert!(stdout.trim().is_empty(), "stdout: {stdout:?}");
-    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr}");
+    assert!(
+        names_fault(&stderr, "Invalid JSON text"),
+        "stderr: {stderr}"
+    );
 
     // #2180 WP2b review: `{...}` gained its own native push arm
     // (`each_object_entries_generic`/`each_object_value_generic`), so
@@ -101001,7 +101118,10 @@ fn test_pull_model_arms_reachable_only_through_a_nested_forcing_context_2103() -
     )?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr}");
     assert_eq!(stdout, "{\"v\":\"a\"}\n{\"v\":\"b\"}\n");
-    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr}");
+    assert!(
+        names_fault(&stderr, "Invalid JSON text"),
+        "stderr: {stderr}"
+    );
 
     // `eval_limit_generic`'s `items_to_generic_result` error arm: `5` pulls
     // clean (an owned literal), `.arr[0]` pulls clean too (an
@@ -101018,7 +101138,10 @@ fn test_pull_model_arms_reachable_only_through_a_nested_forcing_context_2103() -
     )?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr}");
     assert_eq!(stdout, "{\"v\":5}\n");
-    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr}");
+    assert!(
+        names_fault(&stderr, "Invalid JSON text"),
+        "stderr: {stderr}"
+    );
 
     Ok(())
 }
@@ -101948,7 +102071,7 @@ fn test_boolean_routes_agree_on_a_malformed_document_2669() -> Result<()> {
             "`{filter}` on {doc}: reading a member must still raise"
         );
         assert!(
-            stderr.contains("Invalid JSON text"),
+            names_fault(&stderr, "Invalid JSON text"),
             "`{filter}` on {doc}: stderr {stderr:?}"
         );
     }
@@ -102587,7 +102710,7 @@ fn range_bounds_validate_only_what_they_read_2698() -> Result<()> {
             "#2698: `{filter}` must still raise -- stderr: {err:?}"
         );
         assert!(
-            err.contains("invalid escape"),
+            names_fault(&err, "invalid escape"),
             "#2698: `{filter}` -- stderr: {err:?}"
         );
     }
@@ -103031,7 +103154,7 @@ fn test_reverse_follows_jqs_own_definition_2730() -> Result<()> {
             ("", 5),
             "#2730: `{filter}` on an undecodable string -- stderr: {err:?}"
         );
-        assert!(err.contains("invalid escape"), "stderr: {err:?}");
+        assert!(names_fault(&err, "invalid escape"), "stderr: {err:?}");
     }
     Ok(())
 }
@@ -111906,12 +112029,13 @@ fn malformed_later_value_keeps_the_clean_prefix_2961() -> Result<()> {
                 stderr.starts_with("jq: error") || stderr.starts_with("jq: parse error"),
                 "{args:?}: {stderr:?}"
             );
-            // A malformed member the semi-index accepts is found when the filter reads it, and
-            // keeps the evaluator's wording.
+            // A malformed member the semi-index accepts is found when the filter reads it, and is
+            // worded as jq's parser words it (#5576).
             let found_when_read = args.contains(&"-s") && args.contains(&t3.as_str());
             if found_when_read {
                 assert!(
-                    stderr.starts_with("jq: error (at ") && stderr.contains("Invalid JSON text:"),
+                    stderr
+                        .starts_with("jq: parse error: Invalid numeric literal at line 1, column "),
                     "{args:?}: {stderr:?}"
                 );
             } else {
@@ -112315,7 +112439,7 @@ fn test_plain_as_bind_does_not_retry_a_decode_failure_3295() -> Result<()> {
         assert_eq!(code, 5, "`{filter}`: stdout={out:?} stderr={err:?}");
         assert_eq!(out, "", "`{filter}`: stdout={out:?}");
         assert!(
-            err.contains("invalid escape sequence"),
+            names_fault(&err, "invalid escape sequence"),
             "`{filter}`: stderr={err:?}"
         );
     }
@@ -113301,9 +113425,21 @@ fn test_isvalid_native_arm_matches_eager_rules_2658() -> Result<()> {
     // #2594's stray-comma and #1194's malformed-member checks ride the
     // element walk, as `.[]`'s own arm has them.
     for (input, filter, want) in [
-        ("[,]", "any(true)", "expected JSON value, found ','"),
-        ("{,}", "all(false)", "expected string key, found ','"),
-        ("{\"a\" 1}", "any(true)", "expected ':', found '1'"),
+        (
+            "[,]",
+            "any(true)",
+            "Expected value before ',' at line 1, column 2",
+        ),
+        (
+            "{,}",
+            "all(false)",
+            "Expected value before ',' at line 1, column 2",
+        ),
+        (
+            "{\"a\" 1}",
+            "any(true)",
+            "Expected separator between values at line 1, column 7",
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_stdin_streams(filter, input, &["-c"])?;
         assert_eq!(
@@ -113311,7 +113447,11 @@ fn test_isvalid_native_arm_matches_eager_rules_2658() -> Result<()> {
             ("", 5),
             "`{filter}` on {input}: {stderr}"
         );
-        assert!(stderr.contains(want), "`{filter}` on {input}: {stderr:?}");
+        assert_eq!(
+            stderr,
+            format!("jq: parse error: {want}\n"),
+            "`{filter}` on {input}"
+        );
     }
 
     // #791: `halt` inside `isvalid` exits the process, it is never `true`.
@@ -113403,7 +113543,7 @@ fn test_any_all_cond_isvalid_loops_validate_only_what_they_read_2658() -> Result
             "`{filter}` on {input}: stdout {stdout:?} stderr {stderr:?}"
         );
         assert!(
-            stderr.contains("invalid unicode escape sequence"),
+            names_fault(&stderr, "invalid unicode escape sequence"),
             "`{filter}` on {input}: {stderr:?}"
         );
     }
@@ -124457,7 +124597,7 @@ fn test_retried_bounded_output_keeps_its_identity_on_both_routes_3621() -> Resul
         let (stdout, stderr, code) = run_jq_full(&["-c", &collected], Some(bad))?;
         assert_ne!(code, 0, "`{collected}`: stdout {stdout:?}");
         assert!(
-            stderr.contains("invalid unicode escape"),
+            names_fault(&stderr, "invalid unicode escape"),
             "`{collected}`: stderr {stderr:?}"
         );
     }
@@ -127155,7 +127295,7 @@ fn test_comma_array_malformed_writes_nothing_3317() -> Result<()> {
                 "#3317 `{filter}` on {doc}: stdout={stdout:?}"
             );
             assert!(
-                stderr.contains("jq: error"),
+                stderr.contains("jq: error") || stderr.starts_with("jq: parse error"),
                 "#3317 `{filter}` on {doc}: stderr={stderr:?}"
             );
             // A node the array holds fails with its own decode message when
@@ -127171,7 +127311,7 @@ fn test_comma_array_malformed_writes_nothing_3317() -> Result<()> {
             };
             if let Some(want) = want {
                 assert!(
-                    stderr.contains(want),
+                    names_fault(&stderr, want),
                     "#3317 `{filter}` on {doc}: stderr={stderr:?}"
                 );
             }
@@ -127269,7 +127409,7 @@ fn test_comma_array_first_failure_in_branch_order_3317() -> Result<()> {
             "#3317 `{filter}` on {doc}: stdout={stdout:?}"
         );
         assert!(
-            stderr.contains(message),
+            names_fault(&stderr, message),
             "#3317 `{filter}` on {doc}: stderr={stderr:?}"
         );
     }
@@ -127323,7 +127463,7 @@ fn test_comma_array_deferred_walk_settles_before_anything_observable_3478() -> R
             assert_eq!(code, 5, "#3478 `{filter}`: stderr={stderr:?}");
             assert!(stdout.is_empty(), "#3478 `{filter}`: stdout={stdout:?}");
             assert!(
-                stderr.contains("invalid boolean") || stderr.contains("invalid keyword"),
+                names_fault(&stderr, "invalid boolean") || names_fault(&stderr, "invalid keyword"),
                 "#3478 `{filter}`: stderr={stderr:?}"
             );
             assert!(
@@ -127331,7 +127471,7 @@ fn test_comma_array_deferred_walk_settles_before_anything_observable_3478() -> R
                 "#3478 `{filter}` ran a side effect before the array failed: stderr={stderr:?}"
             );
             assert_eq!(
-                stderr.matches("jq: error").count(),
+                stderr.matches("jq: error").count() + stderr.matches("jq: parse error").count(),
                 1,
                 "#3478 `{filter}`: stderr={stderr:?}"
             );
@@ -127577,7 +127717,7 @@ fn test_comma_head_pipe_array_malformed_writes_nothing_3476() -> Result<()> {
             "#3476 `{filter}` on {doc}: stdout={stdout:?}"
         );
         assert!(
-            stderr.contains(message),
+            names_fault(&stderr, message),
             "#3476 `{filter}` on {doc}: stderr={stderr:?}"
         );
     }
@@ -127689,7 +127829,7 @@ fn test_comma_head_pipe_array_multi_stage_tail_3476() -> Result<()> {
         assert_eq!(code, 5, "#3476 on {doc}: stderr={stderr:?}");
         assert!(stdout.is_empty(), "#3476 on {doc}: stdout={stdout:?}");
         assert!(
-            stderr.contains(message),
+            names_fault(&stderr, message),
             "#3476 on {doc}: stderr={stderr:?}"
         );
     }
@@ -129711,7 +129851,7 @@ fn test_count_argument_decode_failure_raises_limit_nth_skip_3466() -> Result<()>
         assert_eq!(code, 5, "{filter}: stdout {stdout:?} stderr {stderr:?}");
         assert!(stdout.is_empty(), "{filter}: {stdout:?}");
         assert!(
-            stderr.contains("invalid escape sequence"),
+            names_fault(&stderr, "invalid escape sequence"),
             "{filter}: {stderr:?}"
         );
     }
@@ -132842,7 +132982,7 @@ fn test_slice_bound_decode_failure_stops_stderr_retry_3809() -> Result<()> {
             assert!(stdout.is_empty(), "{filter}: {stdout:?}");
             assert_eq!(stderr.matches('A').count(), 1, "{filter}: {stderr:?}");
             assert!(
-                stderr.contains("invalid escape sequence in string"),
+                names_fault(&stderr, "invalid escape sequence in string"),
                 "{filter}: {stderr:?}"
             );
         }
@@ -136039,7 +136179,7 @@ fn test_undecodable_target_output_in_computed_index_and_slice_3807() -> Result<(
         let (out, err, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!((out.as_str(), code), ("", 5), "`{filter}`: {err:?}");
         assert!(
-            err.contains("invalid unicode escape sequence"),
+            names_fault(&err, "invalid unicode escape sequence"),
             "`{filter}`: {err:?}"
         );
     }
@@ -143587,15 +143727,13 @@ fn test_slurp_multiple_files_keep_order_and_last_file_location_2847() -> Result<
     assert_eq!(code, 5);
     assert_eq!(err, format!("jq: error (at {}:0): x\n", paths[1]));
 
-    // A malformed member read lazily is reported at the slurped value's
-    // location, which is the *last* file even when the member is in an
-    // earlier one (jq fails at parse time instead, with no file at all).
-    let (out, err, code, paths) =
+    // A malformed member read lazily is jq's parse error, which names no file at all (#5576).
+    let (out, err, code, _) =
         run_jq_over_files(&["-sc", ".[0]"], &[concat!("{", "123:1}\n"), "2\n"])?;
     assert_eq!(code, 5, "out {out:?}");
     assert!(out.is_empty(), "out {out:?}");
-    assert!(
-        err.starts_with(&format!("jq: error (at {}:1): ", paths[1])),
+    assert_eq!(
+        err, "jq: parse error: Object keys must be strings at line 1, column 5\n",
         "stderr: {err}"
     );
 

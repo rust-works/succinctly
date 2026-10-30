@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 
-use crate::{assert_path_rows_both_routes_3749, run_jq_full};
+use crate::{assert_path_rows_both_routes_3749, names_fault, run_jq_full};
 
 const INPUT: &str = r#"[{"a":1,"b":"x"},{"a":2,"b":"y"},{"a":1,"b":"z"},{"a":null},{"b":3},{"a":1.0},{"a":"1"},{"a":[1]},{"a":true},{"a":false},{"a":{"x":1}},{"a":2}]"#;
 
@@ -92,7 +92,7 @@ fn test_group_by_undecodable_element_wins_over_a_key_error_5306() -> Result<()> 
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!((stdout.as_str(), code), ("", 5), "`{filter}`: {stderr}");
         assert!(
-            stderr.contains("invalid unicode escape sequence"),
+            names_fault(&stderr, "invalid unicode escape sequence"),
             "`{filter}`: {stderr}"
         );
     }
@@ -198,7 +198,7 @@ fn test_group_by_checks_every_element_before_reading_a_key_5306() -> Result<()> 
     )?;
     assert_eq!((stdout.as_str(), code), ("", 5), "{stderr}");
     assert!(
-        stderr.contains("invalid unicode escape sequence"),
+        names_fault(&stderr, "invalid unicode escape sequence"),
         "{stderr}"
     );
     Ok(())
@@ -230,7 +230,10 @@ fn test_group_by_empty_array_with_a_stray_comma_raises_5306() -> Result<()> {
     for filter in ["group_by(.a)", "group_by(.a)?", "try group_by(.a) catch ."] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("[,]"))?;
         assert_eq!((stdout.as_str(), code), ("", 5), "`{filter}`: {stderr}");
-        assert!(stderr.contains("Invalid JSON text"), "`{filter}`: {stderr}");
+        assert!(
+            names_fault(&stderr, "Invalid JSON text"),
+            "`{filter}`: {stderr}"
+        );
     }
     Ok(())
 }
