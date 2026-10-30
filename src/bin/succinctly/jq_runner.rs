@@ -4787,6 +4787,28 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     // Configure output
     let output_config = OutputConfig::from_args(&args);
 
+    // #5553: under `-C` jq colors the line `debug` writes to stderr too, compact (it drops the
+    // indent flags and keeps color, sorting and ASCII).
+    if output_config.color_output {
+        let scheme = output_config.color_scheme.clone();
+        let (sort_keys, ascii, convention) = (
+            output_config.sort_keys,
+            output_config.ascii_output,
+            output_config.convention,
+        );
+        succinctly::jq::set_debug_line_renderer(move |line| {
+            let opts = JsonFormatOpts {
+                indent: "",
+                sort_keys,
+                ascii,
+                convention,
+                json_sourced: false,
+                mark_nan_for_color: true,
+            };
+            output::colorize_json(&output::format_json(line, &opts), &scheme)
+        });
+    }
+
     // #1576: the jq-side M2 fast path -- `can_use_m2_streaming` (shared
     // with `yq_runner.rs`, `m2_gate.rs`) is the AST-shape half of the gate;
     // the flag exclusions below are its own, scoped narrower than yq's for
