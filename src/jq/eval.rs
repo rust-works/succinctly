@@ -86340,6 +86340,9 @@ pub fn tostream_events(value: &OwnedValue) -> Vec<OwnedValue> {
 /// and its own key are moved into their event, and a container's key is promoted to shared
 /// storage once, so the events beneath it clone a reference count. `jq --stream` hands each input
 /// document to this and drops it straight after.
+///
+/// A container still shared with another handle (the same value reachable twice) is copied element
+/// by element, as the borrowed walk copied it; only an unshared one is taken apart.
 #[must_use]
 pub fn tostream_events_owned(value: OwnedValue) -> Vec<OwnedValue> {
     let mut events = Vec::new();
@@ -86347,12 +86350,11 @@ pub fn tostream_events_owned(value: OwnedValue) -> Vec<OwnedValue> {
     events
 }
 
-/// A path component for `key`, shared when the events under it will each clone the path.
-fn stream_key(key: String, shared: bool) -> OwnedValue {
+/// The path component for a container's `key`, shared: every event beneath it clones the path, so
+/// each clones a reference count and not the string.
+fn shared_stream_key(key: String) -> OwnedValue {
     let mut key = SharableString::from(key);
-    if shared {
-        key.promote();
-    }
+    key.promote();
     OwnedValue::String(key)
 }
 
@@ -86373,6 +86375,9 @@ fn push_leaf_event(
     last: OwnedValue,
     leaf: OwnedValue,
 ) {
+    // The borrowed walk asserts the depth on every child, a leaf included, and a leaf sits one
+    // component below its container's path.
+    assert_value_tree_depth(path.len() + 1);
     let mut whole = vec_with_capacity(path.len() + 1);
     whole.extend_from_slice(path);
     whole.push(last);
@@ -86403,7 +86408,7 @@ fn collect_tostream_events_owned(
             for (position, (key, val)) in entries.into_iter().enumerate() {
                 let last = position + 1 == count;
                 if is_stream_container(&val) {
-                    path.push(stream_key(key, true));
+                    path.push(shared_stream_key(key));
                     collect_tostream_events_owned(val, path, events);
                     let key = path.pop().expect("the key pushed above");
                     if last {
@@ -135078,6 +135083,40 @@ mod tests {
         assert!(
             with_events > 10,
             "the matrix must hold containers: {with_events}"
+        );
+
+        // The depth guard fires at the same level in both walks (#1021): the nest the borrowed
+        // walk accepts is accepted, the one it refuses is refused, and a nest of objects ending
+        // in a scalar is held to the same ceiling as one of arrays.
+        let outcome = |walk: &dyn Fn() -> Vec<OwnedValue>| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(walk))
+                .map(|events| alloc::format!("{events:?}"))
+                .ok()
+        };
+        let object_nest = |depth: usize| {
+            let mut value = OwnedValue::Int(1);
+            for _ in 0..depth {
+                value = OwnedValue::object_from([("k".to_string(), value)]);
+            }
+            value
+        };
+        for depth in [
+            crate::jq::value::MAX_VALUE_TREE_DEPTH - 2,
+            crate::jq::value::MAX_VALUE_TREE_DEPTH - 1,
+            crate::jq::value::MAX_VALUE_TREE_DEPTH,
+        ] {
+            for nest in [linear_array_nest(depth), object_nest(depth)] {
+                let borrowed = outcome(&|| tostream_events(&nest));
+                let owned = outcome(&|| tostream_events_owned(nest.clone()));
+                assert_eq!(owned, borrowed, "depth {depth}");
+            }
+        }
+        assert!(
+            outcome(&|| tostream_events_owned(linear_array_nest(
+                crate::jq::value::MAX_VALUE_TREE_DEPTH
+            )))
+            .is_none(),
+            "the ceiling must refuse something"
         );
     }
 

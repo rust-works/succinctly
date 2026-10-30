@@ -7074,7 +7074,8 @@ fn expand_into_stream_events(
     let mut starts = Vec::with_capacity(document_count + 1);
     for (index, document) in documents.into_iter().enumerate() {
         starts.push(values.len());
-        // The document is dropped as soon as its events exist, so they take its leaves (#5611).
+        // `into_iter` hands over one document at a time and it is dropped once its events exist, so
+        // the events take its leaves instead of copying them (#5611).
         let events = succinctly::jq::tostream_events_owned(document);
         if located {
             let target = locations.per_value.len() + events.len();
