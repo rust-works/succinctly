@@ -19,6 +19,12 @@ fn test_escaped_angle_brackets_are_literals_5529() -> Result<()> {
         (r#""a<b>" | sub("\\<";"X")"#, r#""aXb>""#),
         (r#""a<b>" | gsub("\\>";"Y")"#, r#""a<bY""#),
         (r#""a<b>" | [scan("\\<.")]"#, r#"["<b"]"#),
+        // The `regex` crate's `\b{start}` family is `\b` and a literal `{...}` run in jq.
+        (r#""a" | test("\\b{start}a")"#, "false"),
+        (r#""b{start}a" | test("\\b{start}a")"#, "true"),
+        (r#""a" | test("\\b{end}")"#, "false"),
+        (r#""a" | test("\\b{start-half}")"#, "false"),
+        (r#""a" | test("\\b{end-half}")"#, "false"),
         // An escaped backslash before `<` is a backslash, then a literal `<`.
         (r#""a\\<" | [match("\\\\<").offset]"#, "[1]"),
     ] {
@@ -61,5 +67,17 @@ fn test_neighbouring_syntax_is_unchanged_5529() -> Result<()> {
         assert_eq!(stdout.trim_end(), expected, "{filter}: stderr={stderr:?}");
         assert_eq!(code, 0, "{filter}");
     }
+    Ok(())
+}
+
+#[test]
+fn test_flags_are_checked_before_the_pattern_is_refused_5529() -> Result<()> {
+    // jq reads the modifier string before it compiles the pattern.
+    let (stdout, stderr, code) = run_jq_full(&["-nc", r#""a" | test("(?P<n>a)";"z")"#], None)?;
+    assert_eq!(code, 5, "stdout={stdout:?} stderr={stderr:?}");
+    assert!(
+        stderr.contains("z is not a valid modifier string"),
+        "{stderr:?}"
+    );
     Ok(())
 }

@@ -25815,10 +25815,15 @@ const JQ_WORD_CLASS_IN_CLASS: &str = r"\p{Alphabetic}\p{M}\p{Nd}\p{Pc}";
 /// Unicode-aware, so `"é" | test("[[:alpha:]]")` is `true` in jq; the `regex` crate's are ASCII, so
 /// it was `false`. `\w` and `\W` become jq's own word class ([`JQ_WORD_CLASS`], #5373). Outside a
 /// class a `[:alpha:]` is an ordinary class of those characters in both engines and is not touched,
-/// nor is an escaped bracket. `\<` and `\>` become the literal `<` and `>` (#5529), and a
-/// `(?P` group is an error. A bracket-shaped `[:word:]` (lowercase letters, optionally led by `^`) whose name is not
+/// nor is an escaped bracket. A bracket-shaped `[:word:]` (lowercase letters, optionally led by `^`) whose name is not
 /// a POSIX class is an error, as in jq (`invalid POSIX bracket type`); `ascii` and `xdigit` are
 /// ASCII in both engines and are left to the crate.
+///
+/// The same pass takes the other spellings the `regex` crate reads differently from Oniguruma
+/// (#5529): `\<` and `\>` are the literal characters (the crate's word-boundary assertions),
+/// `\b{start}` and its three siblings are `\b` and a literal `{...}`, and a Python-style
+/// `(?P...)` group is an error. A scan of the raw text, so it does not know the `x` flag's
+/// comments: a `(?P` inside one is refused here and ignored by jq.
 #[cfg(feature = "regex")]
 fn translate_posix_brackets(pattern: &str) -> Result<std::borrow::Cow<'_, str>, EvalError> {
     if !pattern.contains('[')
@@ -25826,6 +25831,7 @@ fn translate_posix_brackets(pattern: &str) -> Result<std::borrow::Cow<'_, str>, 
         && !pattern.contains("\\W")
         && !pattern.contains("\\<")
         && !pattern.contains("\\>")
+        && !pattern.contains("\\b{")
         && !pattern.contains("(?P")
     {
         return Ok(std::borrow::Cow::Borrowed(pattern));
@@ -25860,6 +25866,21 @@ fn translate_posix_brackets(pattern: &str) -> Result<std::borrow::Cow<'_, str>, 
                 at_start = false;
                 i += 2;
                 continue;
+            }
+            // #5529: the `regex` crate's `\b{start}`, `\b{end}`, `\b{start-half}` and
+            // `\b{end-half}` assertions are `\b` and a literal `{...}` run in Oniguruma.
+            if chars.get(i + 1) == Some(&'b') && chars.get(i + 2) == Some(&'{') {
+                let rest: String = chars[i + 3..].iter().take(11).collect();
+                if ["start}", "end}", "start-half}", "end-half}"]
+                    .iter()
+                    .any(|name| rest.starts_with(name))
+                {
+                    out.push_str("\\b\\{");
+                    changed = true;
+                    at_start = false;
+                    i += 3;
+                    continue;
+                }
             }
             // #5529: Oniguruma's Perl syntax has no word-boundary assertions here, so `\<` and
             // `\>` are the literal characters. The `regex` crate (1.10+) reads them as
@@ -25975,10 +25996,21 @@ fn build_regex<S: EvalSemantics>(pattern: &str, flags: Option<&str>) -> Result<J
     // #5367: jq's classes are Oniguruma's, Unicode-aware, and rewritten here. yq's are Go's
     // `regexp`, a different syntax from the crate's throughout (#5374, #5388), so its pattern is
     // read and re-written whole.
+    //
+    // A refusal from the jq pre-pass waits until the flags string has been read (#5529): jq checks
+    // the modifiers before it compiles the pattern, so `test("(?P<n>a)"; "z")` is the modifier
+    // error.
+    let mut deferred_refusal = None;
     let mut pattern = if S::TAG == EvalTag::Yq {
         super::go_regex::translate(pattern).map_err(EvalError::new)?
     } else {
-        translate_posix_brackets(pattern)?.into_owned()
+        match translate_posix_brackets(pattern) {
+            Ok(translated) => translated.into_owned(),
+            Err(refusal) => {
+                deferred_refusal = Some(refusal);
+                String::new()
+            }
+        }
     };
 
     // Apply flags
@@ -26038,6 +26070,10 @@ fn build_regex<S: EvalSemantics>(pattern: &str, flags: Option<&str>) -> Result<J
             prefix.push(')');
             pattern = format!("{prefix}{pattern}");
         }
+    }
+
+    if let Some(refusal) = deferred_refusal {
+        return Err(refusal);
     }
 
     // jq's un-flagged `$` matches at the absolute end of the string, or

@@ -7297,6 +7297,8 @@ In jq mode a `[`, `&` or `~` inside a class is the literal character, as in Onig
 In jq mode `\<` and `\>` are the literal characters `<` and `>`, as in Oniguruma's Perl syntax (#5529), where the `regex` crate reads them as start-of-word and end-of-word assertions.
 A Python-style group (`(?P<n>a)`, `(?P=n)`, `(?P>n)`) is an error in jq (`undefined group option`), and the `regex` crate would accept the first.
 It is an error here too, with this crate's `invalid regex:` prefix where jq says `Regex failure:`, the same wording difference every refused pattern has.
+The crate's `\b{start}`, `\b{end}`, `\b{start-half}` and `\b{end-half}` are `\b` followed by the literal text in jq, and are rewritten to that.
+These rewrites read the raw pattern text, so under the `x` flag a `(?P` inside a `#` comment is refused here and ignored by jq.
 
 ## Regex flags `l` and `n`
 
