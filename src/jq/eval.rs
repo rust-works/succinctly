@@ -96280,6 +96280,13 @@ fn write_debug_line<S: EvalSemantics>(value: &OwnedValue) {
     if S::TAG == EvalTag::Jq {
         let line =
             OwnedValue::Array(vec![OwnedValue::String("DEBUG:".into()), value.clone()].into());
+        // #5553: under `-C` jq colors the line like any other value it prints; the CLI owns the
+        // colorizer, so it installs the renderer ([`set_debug_line_renderer`]).
+        #[cfg(feature = "std")]
+        if let Some(render) = DEBUG_LINE_RENDERER.get() {
+            write_stderr(&format!("{}\n", render(&line)));
+            return;
+        }
         write_stderr(&format!("{}\n", owned_value_to_json::<S>(&line)));
     } else {
         write_stderr(&format!(
@@ -96287,6 +96294,27 @@ fn write_debug_line<S: EvalSemantics>(value: &OwnedValue) {
             owned_value_to_json::<S>(value)
         ));
     }
+}
+
+/// How `succinctly jq` renders the `["DEBUG:", v]` line `debug`/`debug(msg)` write to stderr when
+/// the default compact JSON is not what jq prints (#5553).
+#[cfg(feature = "std")]
+type DebugLineRenderer = Box<dyn Fn(&OwnedValue) -> String + Send + Sync>;
+
+#[cfg(feature = "std")]
+static DEBUG_LINE_RENDERER: std::sync::OnceLock<DebugLineRenderer> = std::sync::OnceLock::new();
+
+/// Install the renderer for the line `debug`/`debug(msg)` write to stderr in jq mode (#5553).
+///
+/// Under `-C` jq colors that line as it colors an output value, and the colorizer lives in the
+/// CLI, so the CLI hands it over here for the rest of the process. Without one the line is the
+/// compact JSON it has always been, and `succinctly yq` never consults it. The first call wins;
+/// a later one is ignored and answers `false`.
+#[cfg(feature = "std")]
+pub fn set_debug_line_renderer(
+    render: impl Fn(&OwnedValue) -> String + Send + Sync + 'static,
+) -> bool {
+    DEBUG_LINE_RENDERER.set(Box::new(render)).is_ok()
 }
 
 /// Builtin: debug - print `["DEBUG:", .]` to stderr, pass `.` through

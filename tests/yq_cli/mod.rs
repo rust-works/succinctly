@@ -149,4 +149,5 @@ mod i5501;
 mod i5502;
 mod i5539;
 mod i5547;
+mod i5553;
 mod i865;
