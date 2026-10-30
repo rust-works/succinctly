@@ -74,6 +74,41 @@ fn test_debug_line_with_flags_keeps_number_spelling_5558() -> Result<()> {
     Ok(())
 }
 
+/// A character past the BMP is a surrogate pair under `-a`, a literal past a double keeps its
+/// exponent spelling, and the flags that change only stdout (`-r`, `-j`, `--seq`) leave the
+/// line alone.
+#[test]
+fn test_debug_line_with_flags_matches_jq_on_wide_input_5558() -> Result<()> {
+    let program = r#"["😀",1e1000,-0,1E2,0.10] | debug | empty"#;
+    for args in [&["-a"][..], &["-a", "-r"], &["-a", "-j"], &["-a", "--seq"]] {
+        assert_eq!(
+            debug_stderr(args, program)?,
+            "[\"DEBUG:\",[\"\\ud83d\\ude00\",1E+1000,-0,1E+2,0.10]]\n",
+            "{args:?}"
+        );
+    }
+    // With `-C` the same text is colored, so removing the escapes gives back the plain line.
+    let colored = debug_stderr(&["-C", "-a", "-S"], program)?;
+    let mut plain = String::new();
+    let mut chars = colored.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for e in chars.by_ref() {
+                if e == 'm' {
+                    break;
+                }
+            }
+        } else {
+            plain.push(c);
+        }
+    }
+    assert_eq!(
+        plain,
+        "[\"DEBUG:\",[\"\\ud83d\\ude00\",1E+1000,-0,1E+2,0.10]]\n"
+    );
+    Ok(())
+}
+
 /// With neither flag the line is as it was, `-C` still colors it, and `-M` still turns that off.
 #[test]
 fn test_debug_line_without_flags_is_unchanged_5558() -> Result<()> {
