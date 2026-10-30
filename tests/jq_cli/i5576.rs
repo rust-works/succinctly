@@ -101,3 +101,17 @@ fn test_slurp_from_stdin_keeps_the_evaluators_wording_5576() -> Result<()> {
     assert!(stderr.contains("Invalid JSON text:"), "{stderr}");
     Ok(())
 }
+
+#[test]
+fn test_on_error_continue_still_stops_at_jqs_parse_error_5576() -> Result<()> {
+    // jq's parser cannot read on past a fault, so the flag cannot keep the stream running: the
+    // splitter's own faults already stop it the same way.
+    let (stdout, stderr, code, _) =
+        run_jq_over_files(&["-c", "--on-error=continue", "."], &[A, B, C])?;
+    assert_eq!((stdout.as_str(), code), ("1\n2\n3\n", 5));
+    assert_eq!(
+        stderr,
+        "jq: parse error: Expected another key-value pair at line 4, column 8\n"
+    );
+    Ok(())
+}

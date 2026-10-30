@@ -508,15 +508,15 @@ fn stack_reaches(text: &[u8], limit: usize) -> bool {
 /// A byte-order mark is a fault like any other byte: jq skips the one at the front of its input,
 /// so the caller has stripped it (`strip_leading_json_bom`) before the first chunk.
 #[doc(hidden)]
-pub fn jq_stream_fault<'a>(
-    chunks: impl IntoIterator<Item = &'a [u8]>,
+pub fn jq_stream_fault<B: AsRef<[u8]>>(
+    chunks: impl IntoIterator<Item = B>,
     line: usize,
     column: usize,
 ) -> Option<String> {
     let mut parser = Parser::new(line, column, JQ_MAX_PARSING_DEPTH);
     parser.multi = true;
     for chunk in chunks {
-        for &byte in chunk {
+        for &byte in chunk.as_ref() {
             if let Err(Stop::Fault(fault)) = parser.feed(byte) {
                 return Some(format!(
                     "{fault} at line {}, column {}",

@@ -5758,6 +5758,7 @@ $ echo '{invalid}' | sjq empty               # no output, exit 0
 
 Since [#5576](https://github.com/rust-works/succinctly/issues/5576) the error a read member raises is jq's parser's own text and position (`jq: parse error: Expected another key-value pair at line 4, column 8`), not `Invalid JSON text: <reason>`, wherever jq's parser also stops on the stream.
 The stream is read again from its start to find jq's first fault, on that error path alone, so a filter that reads no malformed member pays nothing.
+That fault is the first in the stream, as jq's is, so when the member the filter reads is in a later document it can name an earlier document's fault that the filter never read, after answering the values before the one the filter did read.
 jq stops there, so the run does too: the values before the fault are answered and no later value or file is read.
 Only the first read of a malformed member asks, and a stream jq's parser reads clean (a decode failure jq has no counterpart for) keeps the evaluator's `Invalid JSON text: ...` line and reads on.
 A `--slurp` stream is read again from its files, so one slurped from stdin keeps the evaluator's wording and its `(at <stdin>:N)` marker: the original bytes are gone once the values are joined, and keeping them would hold a second copy of the whole input for the run.
@@ -10253,6 +10254,7 @@ $ echo $?
 Two errors stay sticky by default, because jq never raises them where succinctly does: a document that fails to decode (`{"a":tru} {"a":1}`) and a succinctly resource limit (`range: maximum iterations exceeded`, the recursion-depth cap) exit 5 wherever they occur.
 jq stops at a malformed document and exits 5; succinctly reads on past it (it validates only what a filter reads), so without this a clean document after it would turn jq's 5 into 0.
 Since [#5576](https://github.com/rust-works/succinctly/issues/5576) it stops there too, as jq does, when the filter reads the malformed member and jq's parser also stops on the stream; the run reads past it only for a `--slurp` stream from stdin and for a decode failure jq's parser does not share.
+`--on-error=continue` does not change that: jq's parser has no way to read on past a fault, and the splitter's own faults stop the run the same way.
 jq has no such cap and would have produced the capped input's output, so exiting 0 would hide that the output is short.
 
 `--on-error` is a succinctly extension (ADR-0018 rule 5): `continue` keeps every input running and exits 5 if any of them raised, which was the default from [#355](https://github.com/rust-works/succinctly/issues/355) until #5471, and `stop` evaluates nothing after the first failure.
