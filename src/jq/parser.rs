@@ -2864,6 +2864,16 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// The name after `def`, for both of the parsers that read a definition (`parse_def_expr` in an
+    /// expression, `parse_func_def_parts` in a module body): one definition, so a word one
+    /// refuses is a word the other refuses (#5591).
+    fn parse_def_name(&mut self) -> Result<String, ParseError> {
+        let offset = self.pos;
+        let name = self.parse_ident()?;
+        self.reject_reserved_word_as_name(&name, "IDENT", offset)?;
+        Ok(name)
+    }
+
     /// A `def` name, a bare `def` parameter or an `import … as` namespace that is one of jq's
     /// reserved words (#5591): jq's grammar wants an `IDENT` there and its lexer has already
     /// turned the word into a keyword token. jq mode only; a `$name` is a different token and
@@ -5655,9 +5665,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
 
         // Parse function name
-        let name_offset = self.pos;
-        let name = self.parse_ident()?;
-        self.reject_reserved_word_as_name(&name, "IDENT", name_offset)?;
+        let name = self.parse_def_name()?;
         self.skip_ws();
 
         // Parse optional parameters
@@ -10151,9 +10159,7 @@ impl<'a> Parser<'a> {
         self.consume_keyword("def");
         self.skip_ws();
 
-        let name_offset = self.pos;
-        let name = self.parse_ident()?;
-        self.reject_reserved_word_as_name(&name, "IDENT", name_offset)?;
+        let name = self.parse_def_name()?;
         self.skip_ws();
 
         // Parse optional parameters
