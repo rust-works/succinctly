@@ -95820,7 +95820,7 @@ const I64_RANGE_UPPER_BOUND_AS_F64: f64 = 9_223_372_036_854_775_808.0; // 2^63, 
 /// `i64::MAX`/`i64::MIN` past that range -- a succinctly extension either
 /// way (real yq's lexer rejects `floor` et al outright, so there is no
 /// oracle here), just no longer one that silently corrupts a huge value.
-fn integral_f64_result<S: EvalSemantics>(f: f64) -> OwnedValue {
+pub(crate) fn integral_f64_result<S: EvalSemantics>(f: f64) -> OwnedValue {
     if f.is_nan() {
         return OwnedValue::Float(f64::NAN);
     }
