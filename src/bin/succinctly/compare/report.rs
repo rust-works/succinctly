@@ -577,8 +577,9 @@ fn memory_section(s: &mut String, timed: &[&PerfRow]) {
         "Peak RSS charges a process for the file-backed pages of its mapped executable and libraries, \
          which are shared and reclaimable, so a larger binary reads higher on every row with the same \
          heap (#5578). Private memory leaves them out: on Linux the largest `RssAnon` sampled while \
-         the process ran (a lower bound for a run too short to sample twice), on macOS the peak memory \
-         footprint. `n/a` where the platform offers neither.\n"
+         the process ran (a lower bound, and coarser for a run of a few milliseconds, so its ratios and the \
+         geomean carry the same caveat), on macOS the peak memory footprint. `n/a` where the platform \
+         offers neither.\n"
     );
     let _ = writeln!(
         s,

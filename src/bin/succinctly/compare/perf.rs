@@ -191,15 +191,25 @@ fn args_for(q: &PerfQuery, file: Option<&str>) -> Vec<String> {
     a
 }
 
-fn time_once(tool: &Tool, args: &[String], cwd: &Path) -> Result<f64> {
-    let start = Instant::now();
-    let status = Command::new(&tool.program)
-        .args(&tool.prefix)
+/// What every run of a tool shares: its prefix and flags, the working directory and a
+/// fixed environment, so the timed, peak-RSS and private-memory runs are one configuration.
+fn configure<'a>(
+    cmd: &'a mut Command,
+    tool: &Tool,
+    args: &[String],
+    cwd: &Path,
+) -> &'a mut Command {
+    cmd.args(&tool.prefix)
         .args(args)
         .current_dir(cwd)
         .env("TZ", "UTC")
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
+}
+
+fn time_once(tool: &Tool, args: &[String], cwd: &Path) -> Result<f64> {
+    let start = Instant::now();
+    let status = configure(&mut Command::new(&tool.program), tool, args, cwd)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -264,29 +274,32 @@ fn private_once(_: &Tool, _: &[String], _: &Path, report: Option<&str>) -> Optio
 
 /// Spawn the tool and read `RssAnon` from `/proc/<pid>/status` for as long as it runs.
 /// The kernel drops the counters when the process exits, so the figure is the largest
-/// sample, not an exact peak.
+/// sample, not an exact peak, and it is a second run of the tool beside `time_report`'s.
+/// `spawn` returns only once the child has called `exec`, so the first sample is the
+/// tool's own address space and never a copy of this process's.
 #[cfg(target_os = "linux")]
 fn private_once(tool: &Tool, args: &[String], cwd: &Path, _: Option<&str>) -> Option<u64> {
-    let mut child = Command::new(&tool.program)
-        .args(&tool.prefix)
-        .args(args)
-        .current_dir(cwd)
-        .env("TZ", "UTC")
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
+    let mut child = configure(&mut Command::new(&tool.program), tool, args, cwd)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
     let path = format!("/proc/{}/status", child.id());
+    let start = Instant::now();
     let mut best = None;
     while matches!(child.try_wait(), Ok(None)) {
+        if start.elapsed() > PERF_DEADLINE {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
         if let Some(kb) = std::fs::read_to_string(&path)
             .ok()
             .and_then(|t| parse_rss_anon_kb(&t))
         {
             best = best.max(Some(kb));
         }
+        std::thread::sleep(std::time::Duration::from_micros(100));
     }
     best
 }
@@ -303,18 +316,15 @@ fn time_report(tool: &Tool, args: &[String], cwd: &Path) -> Option<String> {
     } else {
         "-v"
     };
-    let out = Command::new("/usr/bin/time")
-        .arg(flag)
-        .arg(&tool.program)
-        .args(&tool.prefix)
-        .args(args)
-        .current_dir(cwd)
-        .env("TZ", "UTC")
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .output()
-        .ok()?;
+    let out = configure(
+        Command::new("/usr/bin/time").arg(flag).arg(&tool.program),
+        tool,
+        args,
+        cwd,
+    )
+    .stdout(Stdio::null())
+    .output()
+    .ok()?;
     Some(String::from_utf8_lossy(&out.stderr).into_owned())
 }
 
@@ -543,6 +553,10 @@ mod tests {
             program: "python3".into(),
             prefix: vec![],
         };
+        if Command::new("python3").arg("--version").output().is_err() {
+            eprintln!("python3 not found; skipping");
+            return;
+        }
         let args = vec![
             "-c".to_string(),
             "import time; b = bytearray(64 * 1024 * 1024); b[::4096] = b'x' * len(b[::4096]); time.sleep(0.5)"
