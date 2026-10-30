@@ -114817,6 +114817,33 @@ mod tests {
         );
     }
 
+    /// #5554: the owned bridge answers a text stage over a value too deep to re-index, alone and
+    /// with the rest of its pipe, as `path(...)` does for a stage it evaluates on an owned value.
+    #[test]
+    fn test_owned_bridge_renders_a_value_past_the_reindex_limit_5554() {
+        let mut deep = OwnedValue::Int(0);
+        for _ in 0..crate::jq::MAX_VALUE_TREE_DEPTH + 16 {
+            deep = OwnedValue::array_from(vec![deep]);
+        }
+        let run = |source: &str| {
+            let expr = crate::jq::parse(source).unwrap();
+            match eval_owned_input_bridge::<Vec<u64>, JqSemantics>(&expr, &deep, false) {
+                QueryResult::Owned(value) => value,
+                _ => panic!("`{source}` did not answer one owned value"),
+            }
+        };
+        // jq's writer prints 256 levels, then the marker: 533 characters whatever the depth.
+        assert_eq!(run("tojson | length").to_json(), "533");
+        assert_eq!(run("tojson").to_json().len(), 533 + 2);
+        assert_eq!(run("tostring | length | . + 1").to_json(), "534");
+        // A first stage that is not text keeps the refusal.
+        let expr = crate::jq::parse("length").unwrap();
+        assert!(matches!(
+            eval_owned_input_bridge::<Vec<u64>, JqSemantics>(&expr, &deep, false),
+            QueryResult::Error(_)
+        ));
+    }
+
     /// #5554: the text peel asks only after a depth refusal, in jq mode, and only for a first
     /// stage that renders its input, reading a leading `(a | b)` as `a | b`.
     #[test]
@@ -114830,13 +114857,11 @@ mod tests {
                 error,
             )
         };
-        let text = |peeled: &(OwnedValue, Option<Expr>)| match &peeled.0 {
-            OwnedValue::String(text) => text.to_string(),
-            other => unreachable!("{other:?}"),
-        };
+        // The peeled text as the JSON string it is.
+        let text = |peeled: &(OwnedValue, Option<Expr>)| peeled.0.to_json();
         // A refusal in jq mode: the stage's text, with nothing left of a lone stage.
         let lone = peel("tojson", &refused).unwrap();
-        assert_eq!((text(&lone).as_str(), lone.1.is_none()), ("null", true));
+        assert_eq!((text(&lone).as_str(), lone.1.is_none()), ("\"null\"", true));
         // Any other error is not a refusal: the bridge's own answer stands.
         assert!(peel("tojson", &EvalError::new("another error")).is_none());
         // yq's writers print the whole value, so nothing is peeled there.
@@ -114865,7 +114890,7 @@ mod tests {
         );
         // Each `\(.)` slot is the same text.
         let slots = peel(r#""a\(.)b\(.)c""#, &refused).unwrap();
-        assert_eq!(text(&slots), "anullbnullc");
+        assert_eq!(text(&slots), "\"anullbnullc\"");
     }
 
     /// #5441: a split tail is built for each call, so the facts its pipe is
