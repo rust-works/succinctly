@@ -404,6 +404,10 @@ pub fn flush_then_err<W: std::io::Write, T>(
 /// succeeded. An occasional cosmetic second diagnostic line for the same
 /// underlying I/O condition is a much smaller cost than that, so `Drop`
 /// always attempts its own flush and always reports a failure, full stop.
+///
+/// A closed stdout pipe is no longer one of those failures on Unix: `jq` and `yq` die of SIGPIPE
+/// before the write returns (#5547), as the tools they follow do. This still reports every
+/// other failure (a full disk, `EIO`), and a closed pipe where there is no SIGPIPE (Windows).
 pub struct LoudFlushWriter<W: Write>(BufWriter<W>);
 
 impl<W: Write> LoudFlushWriter<W> {

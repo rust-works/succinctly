@@ -170,21 +170,6 @@ category = "reference-slow"
 reason = "`gsub(\"a\";\"b\")` over 100000 characters: jq 1.7.1 does not finish within 10 s; succinctly answers in tens of milliseconds."
 
 [[divergence]]
-id = "robust:sigpipe-range"
-category = "to-triage"
-reason = "`range(10000000)` piped into `head -n1`: jq dies of SIGPIPE (shell status 141); succinctly exits 1."
-
-[[divergence]]
-id = "robust:sigpipe-input"
-category = "to-triage"
-reason = "`.[]` over a million-element array piped into `head -n1`: jq exits 141 (SIGPIPE); succinctly exits 1."
-
-[[divergence]]
-id = "robust:sigpipe-repeat"
-category = "to-triage"
-reason = "`repeat(1)` piped into `head -n1`: jq exits 141 (SIGPIPE); succinctly exits 1."
-
-[[divergence]]
 id = "robust:array-set-too-huge-index"
 category = "to-triage"
 reason = "`[] | .[1e12] = 1`: jq aborts (SIGSEGV); succinctly neither errors nor finishes within 10 s (it appears to allocate the index), and earlier runs ended in an abort. A refused index would be the safe answer."
