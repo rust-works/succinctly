@@ -826,9 +826,19 @@ fn collect_def_names(input: &str) -> BTreeSet<String> {
         if !is_ident_start_char(first) {
             return None;
         }
-        let end = chars
+        let mut end = chars
             .find(|&(_, c)| !is_ident_continue(c))
             .map_or(s.len(), |(i, _)| i);
+        // #5590: jq lexes `a::b` as one name, so `def a::b` defines `a::b` and shadows no `a`.
+        while let Some(part) = s[end..].strip_prefix("::") {
+            let Some(c) = part.chars().next().filter(|&c| is_ident_start_char(c)) else {
+                break;
+            };
+            end += 2 + c.len_utf8();
+            end += s[end..]
+                .find(|c: char| !is_ident_continue(c))
+                .unwrap_or(s.len() - end);
+        }
         Some((&s[..end], &s[end..]))
     }
 
@@ -2872,7 +2882,7 @@ impl<'a> Parser<'a> {
     /// `def a::b: 1; a::b` is `1` (#5590); a reserved word followed by `::` is not a reserved word.
     fn parse_def_name(&mut self) -> Result<String, ParseError> {
         let offset = self.pos;
-        let name = self.parse_variable_name()?;
+        let name = self.parse_qualified_ident()?;
         self.reject_reserved_word_as_name(&name, "IDENT", offset)?;
         Ok(name)
     }
@@ -2897,11 +2907,11 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// The name after a `$`: an identifier, and in jq mode also `ns::name` (any number of
-    /// `::` parts), which jq's lexer reads as one `BINDING` token (#5295). That is how a data
-    /// import `import "d" as $a;` is also reachable as `$a::a`. The `::` takes no whitespace,
-    /// and one not followed by an identifier is left for the caller to reject.
-    fn parse_variable_name(&mut self) -> Result<String, ParseError> {
+    /// An identifier, and in jq mode also `ns::name` (any number of `::` parts), which jq's lexer
+    /// reads as one token: `IDENT` for a function name, `BINDING` after a `$` (#5295, #5590).
+    /// The `::` takes no whitespace, and one not followed by an identifier is left for the caller
+    /// to reject.
+    fn parse_qualified_ident(&mut self) -> Result<String, ParseError> {
         let mut name = self.parse_ident()?;
         if self.mode == ParserMode::Jq {
             while self.peek_str(2) == "::"
@@ -2916,6 +2926,12 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(name)
+    }
+
+    /// The name after a `$`; in jq mode `$a::b` is one `BINDING`, which is how a data import
+    /// `import "d" as $a;` is also reachable as `$a::a` (#5295).
+    fn parse_variable_name(&mut self) -> Result<String, ParseError> {
+        self.parse_qualified_ident()
     }
 
     fn parse_dollar_name(&mut self) -> Result<(String, usize, bool), ParseError> {
@@ -10347,21 +10363,13 @@ impl<'a> Parser<'a> {
         // Parse function name. Both oracles require it to immediately follow
         // the `::` (`mymod::func`); `mymod:: func` is a syntax error, hence no
         // `skip_ws()` between the token and the identifier here (#3116).
-        let mut namespace = namespace;
-        let mut name = self.parse_ident()?;
         // jq's lexer reads `a::b::c` as one `IDENT` (#5590): the namespace is everything
         // before the last `::`, as for a `def a::b::c: ...` it names.
-        while self.mode == ParserMode::Jq
-            && self.peek_str(2) == "::"
-            && self.input[self.pos + 2..]
-                .chars()
-                .next()
-                .is_some_and(is_ident_start_char)
-        {
-            self.pos += 2;
-            namespace = format!("{namespace}::{name}");
-            name = self.parse_ident()?;
-        }
+        let qualified = self.parse_qualified_ident()?;
+        let (namespace, name) = match qualified.rsplit_once("::") {
+            Some((rest, last)) => (format!("{namespace}::{rest}"), last.to_string()),
+            None => (namespace, qualified),
+        };
         self.skip_ws();
 
         // Parse optional arguments
@@ -15279,5 +15287,61 @@ mod tests {
                 "`{program}` (the `{word}` form) does not parse with --jq-extensions"
             );
         }
+    }
+
+    /// #5590: a def name, a call and a prescan agree that `a::b` is one name, in jq mode only.
+    #[test]
+    fn a_qualified_name_is_one_identifier_in_jq_mode_5590() {
+        let names = collect_def_names("def length::x: 5; def a::b::c(p::q): 1; def d: 2;");
+        assert!(names.contains("length::x") && names.contains("a::b::c") && names.contains("d"));
+        assert!(
+            !names.contains("length") && !names.contains("a") && !names.contains("a::b"),
+            "{names:?}"
+        );
+        // A trailing `::` that is not followed by a name ends the identifier before it.
+        assert!(collect_def_names("def a:: 1;").contains("a"));
+        for program in ["def a::b: 1; a::b", "def a::b::c(x): x; a::b::c(1)"] {
+            assert!(parse_program(program).is_ok(), "{program}");
+        }
+        for program in ["def a::: 1; 1", "def a:: 1; 1", "a::b::"] {
+            assert!(parse_program(program).is_err(), "{program}");
+        }
+    }
+
+    /// #5590: a surrogate pair is one character, a lone low surrogate is U+FFFD and a high
+    /// surrogate with no low half is an error, whichever of the two literal paths reads it.
+    #[test]
+    fn a_surrogate_pair_escape_in_a_literal_is_one_character_5590() {
+        let lit = |escapes: &str| {
+            let program = format!("\"{escapes}\"");
+            match parse_program(&program).map(|p| p.expr) {
+                Ok(Expr::Literal(Literal::String(s))) => Some(s),
+                other => panic!("`{program}` parsed to {other:?}"),
+            }
+        };
+        assert_eq!(lit("\\ud83d\\ude00").as_deref(), Some("😀"));
+        assert_eq!(lit("a\\ude00b").as_deref(), Some("a\u{fffd}b"));
+        for bad in [
+            "\\ud83d",
+            "\\ud83dx",
+            "\\ud83d\\u0041",
+            "\\ud83d\\ud83d\\ude00",
+        ] {
+            assert!(parse_program(&format!("\"{bad}\"")).is_err(), "{bad}");
+        }
+    }
+
+    /// #5590: a keyword right after the dot is a field name; after a gap the dot is the identity.
+    #[test]
+    fn a_keyword_after_the_dot_is_a_field_in_jq_mode_5590() {
+        for kw in ["then", "elif", "else", "end", "as", "catch", "and", "or"] {
+            assert_eq!(
+                parse_program(&format!(".{kw}")).map(|p| p.expr).unwrap(),
+                Expr::Field(kw.into()),
+                ".{kw}"
+            );
+        }
+        assert!(parse_program("if . then 1 end").is_ok());
+        assert!(parse_program(". and true").is_ok());
     }
 }

@@ -143,7 +143,6 @@ category = "reference-crash"
 reason = "`[] | .[1e12] = 1`: jq aborts (SIGSEGV); succinctly refuses the index with an error (exit 5, #5500)."
 
 [[divergence]]
-[[divergence]]
 id = "syntax:str-format-urid"
 category = "newer-than-primary"
 reason = "`@urid` is new in jq 1.8, which decodes it; jq 1.7.1 answers `urid is not a valid format` (exit 5). succinctly follows the 1.8 behaviour for this format, documented in CLAUDE.md's format table."
