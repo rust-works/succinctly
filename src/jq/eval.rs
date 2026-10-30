@@ -26027,8 +26027,10 @@ const JQ_WORD_CLASS_IN_CLASS: &str = r"\p{Alphabetic}\p{M}\p{Nd}\p{Pc}";
 /// The same pass takes the other spellings the `regex` crate reads differently from Oniguruma
 /// (#5529): `\<` and `\>` are the literal characters (the crate's word-boundary assertions),
 /// `\b{start}` and its three siblings are `\b` and a literal `{...}`, and a Python-style
-/// `(?P...)` group is an error. A scan of the raw text, so it does not know the `x` flag's
-/// comments: a `(?P` inside one is refused here and ignored by jq.
+/// `(?P...)` group is an error. None of that applies inside a comment, which is copied through
+/// whole: `(?#...)`, and `#` to the end of the line where the extended mode is on, from the `x`
+/// flag or an inline `(?x)`, `(?x:...)` or `(?-x)` followed group by group (#5550). The mode's
+/// ignored blanks are the part this scan still does not see (see `check_repetition` below).
 #[cfg(feature = "regex")]
 fn translate_posix_brackets(
     pattern: &str,
@@ -26055,8 +26057,8 @@ fn translate_posix_brackets(
     // Whether the token just before this one is an assertion (`^`, `$`, `\b`, ...), which
     // Oniguruma refuses to repeat (#5535).
     let mut prev_assertion = false;
-    // The extended mode's comments and ignored blanks are invisible to this scan, so it leaves
-    // the repetition check to the crate there rather than refuse a commented-out fragment.
+    // The extended mode's ignored blanks are invisible to this scan (`^ *` is a repeated
+    // assertion there), so it leaves the repetition check to the crate rather than judge it.
     let check_repetition = !extended && !inline_extended(pattern);
     // One entry per open group: whether the extended mode is on inside it, from the `x` flag and
     // from inline `(?x)`, `(?x:...)` and `(?-x)` (#5550).
@@ -26079,10 +26081,12 @@ fn translate_posix_brackets(
                 continue;
             }
             if c == '(' && chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'#') {
-                let end = chars[i..]
-                    .iter()
-                    .position(|&c| c == ')')
-                    .map_or(chars.len(), |n| i + n + 1);
+                // A backslash escapes the next character, `)` included: `(?#\))` is one comment.
+                let mut end = i + 3;
+                while end < chars.len() && chars[end] != ')' {
+                    end += if chars[end] == '\\' { 2 } else { 1 };
+                }
+                let end = (end + 1).min(chars.len());
                 out.extend(&chars[i..end]);
                 i = end;
                 continue;

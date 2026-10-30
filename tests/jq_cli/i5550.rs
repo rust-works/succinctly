@@ -24,6 +24,10 @@ const ROWS: &[(&str, Option<&str>, &str)] = &[
     ("ab # \\<\n", Some("x"), "true"),
     ("a(?#[)b", None, "true"),
     ("a(?#\\<)b", None, "true"),
+    ("(?x:a(?#\\)) # (?P\n)b", None, "true"),
+    ("a(?#\\w [ \\<)b", None, "true"),
+    ("ab # \\w [ \\< (?P\n", Some("x"), "true"),
+    ("(?#(?P", None, "REFUSED-OTHER"),
     // A `#` is a literal without the extended mode, and then the `(?P` is a real group.
     ("ab # (?P\n", None, "REFUSED"),
     ("(?x:a) # (?P\n", None, "REFUSED"),
@@ -48,7 +52,10 @@ fn test_a_p_group_in_a_comment_is_text_5550() -> Result<()> {
         let flag_arg = flags.map_or(String::new(), |f| format!(";\"{f}\""));
         let filter = format!(r#""ab" | test("{escaped}"{flag_arg})"#);
         let (stdout, stderr, code) = run_jq_full(&["-nc", &filter], None)?;
-        if *expected == "REFUSED" {
+        if *expected == "REFUSED-OTHER" {
+            // An unterminated comment is an error in jq too, with another message.
+            assert_eq!(code, 5, "{pattern:?} {flags:?}: stdout={stdout:?}");
+        } else if *expected == "REFUSED" {
             assert_eq!(
                 code, 5,
                 "{pattern:?} {flags:?}: stdout={stdout:?} stderr={stderr:?}"
