@@ -7068,12 +7068,15 @@ fn expand_into_stream_events(
     resumed_errors: &mut [(usize, TrailingParseError)],
 ) {
     let documents = std::mem::take(values);
-    let located = locations.per_value.len() == documents.len();
+    let document_count = documents.len();
+    let located = locations.per_value.len() == document_count;
     let old_locations = std::mem::take(&mut locations.per_value);
-    let mut starts = Vec::with_capacity(documents.len() + 1);
-    for (index, document) in documents.iter().enumerate() {
+    let mut starts = Vec::with_capacity(document_count + 1);
+    for (index, document) in documents.into_iter().enumerate() {
         starts.push(values.len());
-        let events = succinctly::jq::tostream_events(document);
+        // `into_iter` hands over one document at a time and it is dropped once its events exist, so
+        // the events take its leaves instead of copying them (#5611).
+        let events = succinctly::jq::tostream_events_owned(document);
         if located {
             let target = locations.per_value.len() + events.len();
             locations.per_value.resize(target, old_locations[index]);
@@ -7082,7 +7085,7 @@ fn expand_into_stream_events(
     }
     starts.push(values.len());
     for (position, _) in resumed_errors.iter_mut() {
-        *position = starts[(*position).min(documents.len())];
+        *position = starts[(*position).min(document_count)];
     }
 }
 

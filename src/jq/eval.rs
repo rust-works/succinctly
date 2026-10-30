@@ -503,7 +503,7 @@ use super::value::{
     infinite_float_preview_text, int_to_f64, jq_identical, jq_literal_int_to_f64, jq_numeric_cmp,
     numeric_repr_cmp, owned_value_eq, owned_value_eq_at_depth_generic, subarray_indices,
     subarray_positions, window_matches, ArrayVec, NumberRepr, ObjectMap, ObjectMapEntry,
-    ObjectMapOf, OwnedValue,
+    ObjectMapOf, OwnedValue, SharableString,
 };
 
 /// Which binary operator an operand that produced *zero outputs* is being
@@ -86332,6 +86332,119 @@ pub fn tostream_events(value: &OwnedValue) -> Vec<OwnedValue> {
     events
 }
 
+/// [`tostream_events`] for a value the caller is finished with (#5611): the same events in the same
+/// order, with the document's own leaves and keys moved into them instead of copied.
+///
+/// A leaf event is the path array and the leaf, and the borrowed walk copies both: the leaf, and
+/// every key in the path (each a `String` that is cloned for every event beneath it). Here a leaf
+/// and its own key are moved into their event, and a container's key is promoted to shared
+/// storage once, so the events beneath it clone a reference count. `jq --stream` hands each input
+/// document to this and drops it straight after.
+///
+/// A container still shared with another handle (the same value reachable twice) is copied element
+/// by element, as the borrowed walk copied it; only an unshared one is taken apart.
+#[must_use]
+pub fn tostream_events_owned(value: OwnedValue) -> Vec<OwnedValue> {
+    let mut events = Vec::new();
+    collect_tostream_events_owned(value, &mut Vec::new(), &mut events);
+    events
+}
+
+/// The path component for a container's `key`, shared: every event beneath it clones the path, so
+/// each clones a reference count and not the string.
+fn shared_stream_key(key: String) -> OwnedValue {
+    let mut key = SharableString::from(key);
+    key.promote();
+    OwnedValue::String(key)
+}
+
+/// Whether `value` is walked into (a non-empty container) rather than emitted as a leaf event.
+fn is_stream_container(value: &OwnedValue) -> bool {
+    match value {
+        OwnedValue::Object(entries) => !entries.is_empty(),
+        OwnedValue::Array(items) => !items.is_empty(),
+        _ => false,
+    }
+}
+
+/// One `[[path..., last], leaf]` event: `path` copied (its components are container keys, shared,
+/// and indices) with the leaf's own `last` component moved in behind it.
+fn push_leaf_event(
+    events: &mut Vec<OwnedValue>,
+    path: &[OwnedValue],
+    last: OwnedValue,
+    leaf: OwnedValue,
+) {
+    // The borrowed walk asserts the depth on every child, a leaf included, and a leaf sits one
+    // component below its container's path.
+    assert_value_tree_depth(path.len() + 1);
+    let mut whole = vec_with_capacity(path.len() + 1);
+    whole.extend_from_slice(path);
+    whole.push(last);
+    events.push(OwnedValue::Array(
+        vec![OwnedValue::Array(whole.into()), leaf].into(),
+    ));
+}
+
+/// The closing `[[path..., last]]` event of a non-empty container.
+fn push_closing_event(events: &mut Vec<OwnedValue>, path: &[OwnedValue], last: OwnedValue) {
+    let mut whole = vec_with_capacity(path.len() + 1);
+    whole.extend_from_slice(path);
+    whole.push(last);
+    events.push(OwnedValue::Array(
+        vec![OwnedValue::Array(whole.into())].into(),
+    ));
+}
+
+fn collect_tostream_events_owned(
+    value: OwnedValue,
+    path: &mut Vec<OwnedValue>,
+    events: &mut Vec<OwnedValue>,
+) {
+    assert_value_tree_depth(path.len());
+    match value {
+        OwnedValue::Object(entries) if !entries.is_empty() => {
+            let count = entries.len();
+            for (position, (key, val)) in entries.into_iter().enumerate() {
+                let last = position + 1 == count;
+                if is_stream_container(&val) {
+                    path.push(shared_stream_key(key));
+                    collect_tostream_events_owned(val, path, events);
+                    let key = path.pop().expect("the key pushed above");
+                    if last {
+                        push_closing_event(events, path, key);
+                    }
+                } else if last {
+                    // The key is both the leaf's last component and the closing event's.
+                    let closing = OwnedValue::String(key.clone().into());
+                    push_leaf_event(events, path, OwnedValue::String(key.into()), val);
+                    push_closing_event(events, path, closing);
+                } else {
+                    push_leaf_event(events, path, OwnedValue::String(key.into()), val);
+                }
+            }
+        }
+        OwnedValue::Array(items) if !items.is_empty() => {
+            let count = items.len();
+            for (index, val) in items.into_vec().into_iter().enumerate() {
+                if is_stream_container(&val) {
+                    path.push(OwnedValue::Int(index as i64));
+                    collect_tostream_events_owned(val, path, events);
+                    path.pop();
+                } else {
+                    push_leaf_event(events, path, OwnedValue::Int(index as i64), val);
+                }
+            }
+            push_closing_event(events, path, OwnedValue::Int((count - 1) as i64));
+        }
+        leaf => {
+            events.push(OwnedValue::Array(
+                vec![OwnedValue::Array(path.clone().into()), leaf].into(),
+            ));
+        }
+    }
+}
+
 /// [`tostream_events`], one event at a time (#4397).
 ///
 /// The same events in the same order, holding the walk's stack and the current path instead of
@@ -134885,6 +134998,127 @@ mod tests {
     // The following tostream/fromstream/truncate_stream expectations are all
     // verified against jq-1.7.1 (#396) — not derived from this codebase's own
     // output.
+
+    /// #5611: the walk that takes its document apart emits the events the borrowed walk does, in
+    /// the same order, for every shape (empty containers, a container as the last child, a leaf
+    /// as the last child, objects in arrays and the reverse, a shared subtree, a scalar root),
+    /// and the path arrays it builds hold the same components.
+    #[test]
+    fn tostream_events_owned_matches_the_borrowed_walk_5611() {
+        let record = |id: i64| {
+            OwnedValue::object_from([
+                ("id".to_string(), OwnedValue::Int(id)),
+                (
+                    "name".to_string(),
+                    OwnedValue::String(alloc::format!("user{id}").into()),
+                ),
+                (
+                    "tags".to_string(),
+                    OwnedValue::array_from(vec![
+                        OwnedValue::String("a".into()),
+                        OwnedValue::array(),
+                        OwnedValue::object_from(Vec::<(String, OwnedValue)>::new()),
+                    ]),
+                ),
+                (
+                    "score".to_string(),
+                    OwnedValue::from_number_literal::<JqSemantics>("1.50"),
+                ),
+            ])
+        };
+        let shared = OwnedValue::array_from(vec![OwnedValue::Int(1), record(9)]);
+        let mut values = pure_value_matrix();
+        values.extend([
+            record(1),
+            OwnedValue::array_from(vec![record(1), record(2), OwnedValue::Null]),
+            OwnedValue::object_from([
+                (
+                    "users".to_string(),
+                    OwnedValue::array_from(vec![record(1), record(2)]),
+                ),
+                ("n".to_string(), OwnedValue::Int(2)),
+            ]),
+            // Last child a container, last child a leaf, last child an empty container.
+            OwnedValue::object_from([
+                ("a".to_string(), OwnedValue::Int(1)),
+                (
+                    "b".to_string(),
+                    OwnedValue::array_from(vec![OwnedValue::Int(1)]),
+                ),
+            ]),
+            OwnedValue::object_from([
+                (
+                    "b".to_string(),
+                    OwnedValue::array_from(vec![OwnedValue::Int(1)]),
+                ),
+                ("a".to_string(), OwnedValue::Int(1)),
+            ]),
+            OwnedValue::object_from([
+                ("a".to_string(), OwnedValue::Int(1)),
+                ("e".to_string(), OwnedValue::array()),
+            ]),
+            OwnedValue::array_from(vec![OwnedValue::array_from(vec![OwnedValue::array_from(
+                vec![OwnedValue::Int(1)],
+            )])]),
+            // The same container twice, so taking it apart has to copy from a shared handle.
+            OwnedValue::array_from(vec![shared.clone(), shared.clone()]),
+            OwnedValue::object_from([("x".to_string(), shared.clone()), ("y".to_string(), shared)]),
+        ]);
+        let mut with_events = 0;
+        for value in &values {
+            let borrowed = tostream_events(value);
+            let owned = tostream_events_owned(value.clone());
+            // Debug, not `==`: a NaN is not equal to itself, and the spelling of every leaf matters.
+            assert_eq!(
+                alloc::format!("{owned:?}"),
+                alloc::format!("{borrowed:?}"),
+                "{value:?}"
+            );
+            let shown = |events: &[OwnedValue]| -> Vec<String> {
+                events.iter().map(OwnedValue::to_json).collect()
+            };
+            assert_eq!(shown(&owned), shown(&borrowed), "{value:?}");
+            with_events += usize::from(borrowed.len() > 1);
+        }
+        assert!(
+            with_events > 10,
+            "the matrix must hold containers: {with_events}"
+        );
+
+        // The depth guard fires at the same level in both walks (#1021): the nest the borrowed
+        // walk accepts is accepted, the one it refuses is refused, and a nest of objects ending
+        // in a scalar is held to the same ceiling as one of arrays.
+        let outcome = |walk: &dyn Fn() -> Vec<OwnedValue>| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(walk))
+                .map(|events| alloc::format!("{events:?}"))
+                .ok()
+        };
+        let object_nest = |depth: usize| {
+            let mut value = OwnedValue::Int(1);
+            for _ in 0..depth {
+                value = OwnedValue::object_from([("k".to_string(), value)]);
+            }
+            value
+        };
+        for depth in [
+            crate::jq::value::MAX_VALUE_TREE_DEPTH - 2,
+            crate::jq::value::MAX_VALUE_TREE_DEPTH - 1,
+            crate::jq::value::MAX_VALUE_TREE_DEPTH,
+        ] {
+            for nest in [linear_array_nest(depth), object_nest(depth)] {
+                let borrowed = outcome(&|| tostream_events(&nest));
+                let owned = outcome(&|| tostream_events_owned(nest.clone()));
+                assert_eq!(owned, borrowed, "depth {depth}");
+            }
+        }
+        assert!(
+            outcome(&|| tostream_events_owned(linear_array_nest(
+                crate::jq::value::MAX_VALUE_TREE_DEPTH
+            )))
+            .is_none(),
+            "the ceiling must refuse something"
+        );
+    }
 
     #[test]
     fn test_tostream_object() {
