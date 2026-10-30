@@ -126660,7 +126660,7 @@ mod tests {
         ));
         let yq = build_regex::<YqSemantics>("a[0-9]+", None).expect("yq compiles");
         assert!(!Rc::ptr_eq(&first, &yq), "the mode is part of the key");
-        assert!(first.is_match("a12") && !first.is_match("a"));
+        assert!(first.is_match("a12").expect("match") && !first.is_match("a").expect("match"));
 
         // A key built once is not kept: the second call builds again (and then keeps that one).
         let once = jq("once[0-9]", None).expect("compiles");
