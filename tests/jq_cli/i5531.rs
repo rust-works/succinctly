@@ -29,11 +29,11 @@ fn test_a_repeated_pattern_answers_the_same_for_every_input_5531() -> Result<()>
         ),
         (
             r##"[.[] | sub("[0-9]";"#")]"##,
-            r##"["item#","item#2","x","item#33","item#a"]"##,
+            r#"["item#","item#2","x","item#33","item#a"]"#,
         ),
         (
             r##"[.[] | gsub("[0-9]";"#")]"##,
-            r##"["item#","item##","x","item###","item#a"]"##,
+            r#"["item#","item##","x","item###","item#a"]"#,
         ),
         (r#"[.[] | [scan("[0-9]")] | length]"#, "[1,2,0,3,1]"),
         (
