@@ -25611,6 +25611,24 @@ fn pattern_may_enable_multiline(pattern: &str) -> bool {
     false
 }
 
+/// Whether `pattern` has the escape `\z` (a backslash that is not itself escaped, then `z`).
+#[cfg(feature = "regex")]
+fn pattern_has_escape_z(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            if bytes.get(i + 1) == Some(&b'z') {
+                return true;
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
 /// Whether `pattern` needs the dual-haystack-view trailing-newline check at
 /// all (see `dv_captures_at`). Deliberately naive about escaping/character
 /// classes — a false positive (an escaped `\$` or a `$` inside `[...]`)
@@ -25662,14 +25680,14 @@ fn dv_captures_at<'h>(
     start: usize,
     needs_check: bool,
     exact: Option<&ExactEnd>,
-) -> Result<Option<RegexCaptures<'h>>, EvalError> {
+) -> Option<RegexCaptures<'h>> {
     let full = re.captures_at(input, start);
     if !needs_check || !ends_with_trailing_newline(input) {
-        return Ok(full.map(RegexCaptures::Std));
+        return full.map(RegexCaptures::Std);
     }
     let trimmed = &input[..input.len() - 1];
     if start > trimmed.len() {
-        return Ok(full.map(RegexCaptures::Std));
+        return full.map(RegexCaptures::Std);
     }
     match (re.captures_at(trimmed, start), full) {
         (Some(t), Some(f)) => {
@@ -25678,30 +25696,30 @@ fn dv_captures_at<'h>(
                 f.get(0).expect("group 0 always present"),
             );
             if t0.start() < f0.start() {
-                return Ok(Some(RegexCaptures::Std(t)));
+                return Some(RegexCaptures::Std(t));
             }
             if f0.start() < t0.start() {
-                return Ok(Some(RegexCaptures::Std(f)));
+                return Some(RegexCaptures::Std(f));
             }
             let same = (0..t.len()).all(|i| {
                 t.get(i).map(|m| (m.start(), m.end())) == f.get(i).map(|m| (m.start(), m.end()))
             });
             if !same {
                 if let Some(engine) = exact.and_then(ExactEnd::engine) {
-                    let found = engine
-                        .captures_from_pos(input, t0.start())
-                        .map_err(fancy_match_error)?;
-                    if let Some(caps) = found {
+                    // A search that gives up (the backtracking budget) keeps the trimmed match:
+                    // the `regex` crate answered this pattern in linear time before, and a tie
+                    // is no reason to fail the filter.
+                    if let Ok(Some(caps)) = engine.captures_from_pos(input, t0.start()) {
                         if caps.get(0).is_some_and(|m| m.start() == t0.start()) {
-                            return Ok(Some(RegexCaptures::Fancy(caps)));
+                            return Some(RegexCaptures::Fancy(caps));
                         }
                     }
                 }
             }
-            Ok(Some(RegexCaptures::Std(t)))
+            Some(RegexCaptures::Std(t))
         }
-        (Some(t), None) => Ok(Some(RegexCaptures::Std(t))),
-        (None, full) => Ok(full.map(RegexCaptures::Std)),
+        (Some(t), None) => Some(RegexCaptures::Std(t)),
+        (None, full) => full.map(RegexCaptures::Std),
     }
 }
 
@@ -25899,13 +25917,13 @@ impl JqRegex {
         start: usize,
     ) -> Result<Option<RegexCaptures<'h>>, EvalError> {
         match &self.engine {
-            RegexEngine::Std(re) => dv_captures_at(
+            RegexEngine::Std(re) => Ok(dv_captures_at(
                 re,
                 input,
                 start,
                 self.needs_trailing_nl_check,
                 self.exact_end.as_ref(),
-            ),
+            )),
             RegexEngine::Fancy(re) if self.longest.is_some() => {
                 let max_len = self.longest.and_then(|search| search.max_len);
                 fancy_longest_captures(re, input, start, max_len)
@@ -26741,7 +26759,7 @@ fn build_regex_uncached<S: EvalSemantics>(
     }
 
     // jq's un-flagged `$` matches at the absolute end of the string, or
-    // immediately before a single trailing `\n` (Perl's `\Z` semantics) —
+    // immediately before a final `\n` (Perl's `\Z` semantics) —
     // unlike Rust regex's un-flagged `$`, which only matches the absolute
     // end. See `dv_captures_at`/`dv_is_match` for how builtins compensate,
     // and `pattern_may_enable_multiline` for why a user-written `(?m)`
@@ -26749,21 +26767,6 @@ fn build_regex_uncached<S: EvalSemantics>(
     // (Go's `$` is the end of the text and nothing else: `"a\n" | test("a$")` is false in yq.)
     let needs_trailing_nl_check =
         S::TAG != EvalTag::Yq && pattern_may_need_trailing_newline_check(&pattern);
-
-    // #5572: `\z` is the end of the text and nothing else, which the trimmed view of the text (see
-    // `dv_captures_at`) cannot say: it would end `b\z` before a final `\n` that is really there. A
-    // pattern with both `$` and `\z` is therefore read by the exact engine alone.
-    if S::TAG != EvalTag::Yq && needs_trailing_nl_check && pattern.contains("\\z") {
-        if let Some(re) = build_fancy_regex::<S>(&pattern) {
-            return Ok(JqRegex {
-                engine: RegexEngine::Fancy(re),
-                needs_trailing_nl_check: false,
-                exact_end: None,
-                suppress_empty,
-                longest: None,
-            });
-        }
-    }
 
     // #5530: `l`, and `n` on a pattern that can match empty, are search policies of the
     // backtracking engine. The `regex` crate cannot express either, so a pattern that asks for one
@@ -26789,6 +26792,22 @@ fn build_regex_uncached<S: EvalSemantics>(
                     longest: modes.longest.then_some(LongestSearch { max_len }),
                 });
             }
+        }
+    }
+
+    // #5572: `\z` is the end of the text and nothing else, which the trimmed view of the text (see
+    // `dv_captures_at`) cannot say: it would end `b\z` before a final `\n` that is really there. A
+    // pattern with both `$` and `\z` is therefore read by the exact engine alone (after the `l`/`n` route above,
+    // which reads `$` the same way).
+    if S::TAG != EvalTag::Yq && needs_trailing_nl_check && pattern_has_escape_z(&pattern) {
+        if let Some(re) = build_fancy_regex::<S>(&pattern) {
+            return Ok(JqRegex {
+                engine: RegexEngine::Fancy(re),
+                needs_trailing_nl_check: false,
+                exact_end: None,
+                suppress_empty,
+                longest: None,
+            });
         }
     }
 
@@ -126518,7 +126537,7 @@ mod tests {
         // Real jq: sub("a$";"X") on "a\n" -> "X\n" (matches "a" itself,
         // zero-width $ after it — the \n is never part of the match).
         let re = regex::Regex::new("a$").unwrap();
-        let caps = dv_captures_at(&re, "a\n", 0, true, None).unwrap().unwrap();
+        let caps = dv_captures_at(&re, "a\n", 0, true, None).unwrap();
         let m = caps.get(0).unwrap();
         assert_eq!(m.as_str(), "a");
         assert_eq!((m.start(), m.end()), (0, 1));
@@ -126563,6 +126582,18 @@ mod tests {
 
     #[cfg(feature = "regex")]
     #[test]
+    fn test_pattern_has_escape_z_5572() {
+        assert!(pattern_has_escape_z(r"a$|b\z"));
+        assert!(pattern_has_escape_z(r"\z"));
+        // An escaped backslash, then a plain `z`.
+        assert!(!pattern_has_escape_z(r"a\\z$"));
+        assert!(pattern_has_escape_z(r"a\\\z"));
+        assert!(!pattern_has_escape_z("a$"));
+        assert!(!pattern_has_escape_z(r"z\"));
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
     fn test_dollar_after_a_doubled_newline_5572() {
         // `$` is just before the *final* newline whether or not another one precedes it.
         for (json, filter, expected) in [
@@ -126595,6 +126626,24 @@ mod tests {
                 r#"[match("(?<n2>$|[[:digit:]]*)+$\\z"; "g") | .offset]"#,
                 "[3]",
             ),
+            // The `l` and `n` flags still reach the exact engine alongside `\z` (#5530).
+            (
+                br#""ab""#,
+                r#"[match("a|ab$\\z"; "gl").string]"#,
+                r#"["ab"]"#,
+            ),
+            (
+                br#""ab\n""#,
+                r#"[match("a|ab$\\z"; "l").string]"#,
+                r#"["a"]"#,
+            ),
+            (
+                br#""xaab""#,
+                r#"[match("(?:a*?|b$\\z)"; "gn") | [.offset, .string]]"#,
+                r#"[[1,"a"],[2,"a"],[3,"b"]]"#,
+            ),
+            // An escaped backslash followed by `z` is not the escape `\z`.
+            (br#""a\\z""#, r#"[match("a\\\\z$").string]"#, r#"["a\\z"]"#),
         ] {
             assert_eq!(outputs(json, filter), [expected], "{filter}");
         }

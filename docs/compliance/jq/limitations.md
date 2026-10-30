@@ -7445,9 +7445,12 @@ A text that ends in two newlines is searched the same way, because `$` is just b
 - **A pattern `fancy-regex` cannot compile keeps the shorter match on a tie.**
   `fancy-regex`'s parser refuses a repeat of an empty group, so `"abc \n" | match("(?:)+\\s+$")` is `[3,1]` here and `[3,2]` in jq.
   Pinned by `test_dollar_tie_keeps_the_trimmed_match_when_fancy_regex_refuses_5572`.
+- **A tie whose exact search runs out of budget keeps the trimmed match.**
+  The exact engine backtracks, and a pathological pattern (`(a+)+\s*$` on a long run of `a`) can exhaust its budget where the `regex` crate answers in linear time.
+  The filter does not fail for it: the trimmed text's match stands, as it did before #5572.
 - **Text that follows a `$` is not searched.**
   Neither search can match `a$\n` (the `$`, then the newline it stands before) in `"a\n"`, which jq does, and `$[^a]?` on `"\n\n"` finds an empty match at 1 where jq's `[^a]?` takes the newline.
-  A pattern with `\z` as well (`a$|b\z`) does not have this problem with `\z`, because it is read by the `fancy-regex` route alone, which has jq's meaning for both.
+  A pattern with `\z` as well (`a$|b\z`) is not affected by `\z` in the trimmed text, because it is read by the `fancy-regex` route alone, which has jq's meaning for both.
 
 ## A slice is a path component
 
