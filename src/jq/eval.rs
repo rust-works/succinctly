@@ -25558,15 +25558,14 @@ pub(crate) fn getpath_walk_owned_segments<'a, W: Clone + AsRef<[u64]>, S: EvalSe
 // Phase 7: Regex Functions (requires "regex" feature)
 // =============================================================================
 
-/// True iff `input` ends with exactly one trailing `\n` — jq's (and
-/// Perl's) end-of-string exception for `$` applies to at most one trailing
-/// newline; a second one disqualifies it (verified against jq-1.7.1:
-/// `"a\n\n"` does not satisfy `a$`, only `"a\n"` does).
+/// True iff `input` ends with a `\n`. jq's (and Perl's) `$` matches just before the *final* `\n`,
+/// whether or not another one precedes it: `"a\n\n" | [match("$";"g").offset]` is `[2,3]` (#5572).
+/// What a second newline rules out is a match that has to *end* before the first of them
+/// (`a$` does not match `"a\n\n"`), and the trimmed view of the text (see `dv_captures_at`) already
+/// has that right: its own `$` is at 2, not 1.
 #[cfg(feature = "regex")]
-fn ends_with_single_trailing_newline(input: &str) -> bool {
-    let bytes = input.as_bytes();
-    matches!(bytes.last(), Some(b'\n'))
-        && !matches!(bytes.get(bytes.len().wrapping_sub(2)), Some(b'\n'))
+fn ends_with_trailing_newline(input: &str) -> bool {
+    input.ends_with('\n')
 }
 
 /// Conservative (over-detecting, never under-detecting) check for whether
@@ -25612,6 +25611,24 @@ fn pattern_may_enable_multiline(pattern: &str) -> bool {
     false
 }
 
+/// Whether `pattern` has the escape `\z` (a backslash that is not itself escaped, then `z`).
+#[cfg(feature = "regex")]
+fn pattern_has_escape_z(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            if bytes.get(i + 1) == Some(&b'z') {
+                return true;
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
 /// Whether `pattern` needs the dual-haystack-view trailing-newline check at
 /// all (see `dv_captures_at`). Deliberately naive about escaping/character
 /// classes — a false positive (an escaped `\$` or a `$` inside `[...]`)
@@ -25628,53 +25645,106 @@ fn pattern_may_need_trailing_newline_check(pattern: &str) -> bool {
 fn dv_is_match(re: &regex::Regex, input: &str, needs_check: bool) -> bool {
     re.is_match(input)
         || (needs_check
-            && ends_with_single_trailing_newline(input)
+            && ends_with_trailing_newline(input)
             && re.is_match(&input[..input.len() - 1]))
 }
 
 /// Leftmost `Captures` in `input` at or after byte offset `start` — like
 /// `Regex::captures_at`, but also honors jq's Perl-style trailing-newline
 /// exception for `$`: real jq's `$` matches at the absolute end of the
-/// string, or immediately before a single trailing `\n`, as a genuine
+/// string, or immediately before a final `\n`, as a genuine
 /// zero-width assertion (it never consumes that `\n` — verified against
 /// jq-1.7.1: `sub("a$";"X")` on `"a\n"` is `"aX\n"`, not `"aX"` or `"X"`).
 /// Rust's `regex` crate has no lookahead, so no pattern rewrite can express
-/// this directly. Instead, when `needs_check` and `input` ends in exactly
-/// one `\n`, the *unmodified* pattern is searched against a second
-/// haystack view with that one `\n` trimmed off; Rust's own (already
-/// correct, lookahead-free) `$`/`\z` handles each view correctly on its own
-/// terms, and whichever view produces the leftmost match wins. Byte offsets
-/// from the trimmed view are already valid offsets into `input` (only the
-/// tail was trimmed), so no translation is needed — this also gets
-/// match/capture content exactly right for free, since the trimmed view
-/// never contains the `\n` to begin with.
+/// this directly. Instead, when `needs_check` and `input` ends in a `\n`, the
+/// *unmodified* pattern is searched against a second haystack view with
+/// that one `\n` trimmed off; Rust's own (already correct, lookahead-free)
+/// `$`/`\z` handles each view correctly on its own terms, and whichever view
+/// produces the leftmost match wins. Byte offsets from the trimmed view are
+/// already valid offsets into `input` (only the tail was trimmed), so no
+/// translation is needed — this also gets match/capture content exactly
+/// right for free, since the trimmed view never contains the `\n` to begin
+/// with.
+///
+/// When both views match at the *same* start and differ, which one jq finds is
+/// the first in the backtracking order of the pattern, and that is not a
+/// property of either view: `\s+$` on `"abc \n"` is `" \n"` (greedy, the full
+/// view) and `\s+?$` is `" "` (lazy, the trimmed view, #5572). Then the
+/// exact engine — the `fancy-regex` route, which rewrites `$` to `(?=\n?\z)`
+/// (`prepare_fancy_pattern`) — answers for that start. A pattern it refuses
+/// keeps the trimmed view's match, as before.
 #[cfg(feature = "regex")]
 fn dv_captures_at<'h>(
     re: &regex::Regex,
     input: &'h str,
     start: usize,
     needs_check: bool,
-) -> Option<regex::Captures<'h>> {
+    exact: Option<&ExactEnd>,
+) -> Option<RegexCaptures<'h>> {
     let full = re.captures_at(input, start);
-    if !needs_check || !ends_with_single_trailing_newline(input) {
-        return full;
+    if !needs_check || !ends_with_trailing_newline(input) {
+        return full.map(RegexCaptures::Std);
     }
     let trimmed = &input[..input.len() - 1];
     if start > trimmed.len() {
-        return full;
+        return full.map(RegexCaptures::Std);
     }
     match (re.captures_at(trimmed, start), full) {
         (Some(t), Some(f)) => {
-            if t.get(0).expect("group 0 always present").start()
-                <= f.get(0).expect("group 0 always present").start()
-            {
-                Some(t)
-            } else {
-                Some(f)
+            let (t0, f0) = (
+                t.get(0).expect("group 0 always present"),
+                f.get(0).expect("group 0 always present"),
+            );
+            if t0.start() < f0.start() {
+                return Some(RegexCaptures::Std(t));
             }
+            if f0.start() < t0.start() {
+                return Some(RegexCaptures::Std(f));
+            }
+            let same = (0..t.len()).all(|i| {
+                t.get(i).map(|m| (m.start(), m.end())) == f.get(i).map(|m| (m.start(), m.end()))
+            });
+            if !same {
+                if let Some(engine) = exact.and_then(ExactEnd::engine) {
+                    // A search that gives up (the backtracking budget) keeps the trimmed match:
+                    // the `regex` crate answered this pattern in linear time before, and a tie
+                    // is no reason to fail the filter.
+                    if let Ok(Some(caps)) = engine.captures_from_pos(input, t0.start()) {
+                        if caps.get(0).is_some_and(|m| m.start() == t0.start()) {
+                            return Some(RegexCaptures::Fancy(caps));
+                        }
+                    }
+                }
+            }
+            Some(RegexCaptures::Std(t))
         }
-        (Some(t), None) => Some(t),
-        (None, full) => full,
+        (Some(t), None) => Some(RegexCaptures::Std(t)),
+        (None, full) => full.map(RegexCaptures::Std),
+    }
+}
+
+/// The exact reading of a pattern's `$` for [`dv_captures_at`]: the `fancy-regex` compilation of
+/// it, built the first time two views of a text disagree and kept after (a pattern that does not
+/// reach that point never pays for it).
+#[cfg(feature = "regex")]
+struct ExactEnd {
+    pattern: String,
+    engine: core::cell::OnceCell<Option<fancy_regex::Regex>>,
+}
+
+#[cfg(feature = "regex")]
+impl ExactEnd {
+    fn new(pattern: &str) -> Self {
+        Self {
+            pattern: pattern.to_string(),
+            engine: core::cell::OnceCell::new(),
+        }
+    }
+
+    fn engine(&self) -> Option<&fancy_regex::Regex> {
+        self.engine
+            .get_or_init(|| build_fancy_regex::<JqSemantics>(&self.pattern))
+            .as_ref()
     }
 }
 
@@ -25701,6 +25771,8 @@ fn dv_captures_at<'h>(
 struct JqRegex {
     engine: RegexEngine,
     needs_trailing_nl_check: bool,
+    /// The exact reading of `$` for a pattern with `needs_trailing_nl_check` (#5572).
+    exact_end: Option<ExactEnd>,
     suppress_empty: bool,
     /// `l` on the `fancy-regex` engine: a search returns the longest match anywhere at or after
     /// its start, not the leftmost one (see [`fancy_longest_captures`]).
@@ -25845,12 +25917,13 @@ impl JqRegex {
         start: usize,
     ) -> Result<Option<RegexCaptures<'h>>, EvalError> {
         match &self.engine {
-            RegexEngine::Std(re) => {
-                Ok(
-                    dv_captures_at(re, input, start, self.needs_trailing_nl_check)
-                        .map(RegexCaptures::Std),
-                )
-            }
+            RegexEngine::Std(re) => Ok(dv_captures_at(
+                re,
+                input,
+                start,
+                self.needs_trailing_nl_check,
+                self.exact_end.as_ref(),
+            )),
             RegexEngine::Fancy(re) if self.longest.is_some() => {
                 let max_len = self.longest.and_then(|search| search.max_len);
                 fancy_longest_captures(re, input, start, max_len)
@@ -26755,7 +26828,7 @@ fn build_regex_uncached<S: EvalSemantics>(
     }
 
     // jq's un-flagged `$` matches at the absolute end of the string, or
-    // immediately before a single trailing `\n` (Perl's `\Z` semantics) —
+    // immediately before a final `\n` (Perl's `\Z` semantics) —
     // unlike Rust regex's un-flagged `$`, which only matches the absolute
     // end. See `dv_captures_at`/`dv_is_match` for how builtins compensate,
     // and `pattern_may_enable_multiline` for why a user-written `(?m)`
@@ -26783,6 +26856,7 @@ fn build_regex_uncached<S: EvalSemantics>(
                 return Ok(JqRegex {
                     engine: RegexEngine::Fancy(re),
                     needs_trailing_nl_check: false,
+                    exact_end: None,
                     suppress_empty,
                     longest: modes.longest.then_some(LongestSearch { max_len }),
                 });
@@ -26790,10 +26864,27 @@ fn build_regex_uncached<S: EvalSemantics>(
         }
     }
 
+    // #5572: `\z` is the end of the text and nothing else, which the trimmed view of the text (see
+    // `dv_captures_at`) cannot say: it would end `b\z` before a final `\n` that is really there. A
+    // pattern with both `$` and `\z` is therefore read by the exact engine alone (after the `l`/`n` route above,
+    // which reads `$` the same way).
+    if S::TAG != EvalTag::Yq && needs_trailing_nl_check && pattern_has_escape_z(&pattern) {
+        if let Some(re) = build_fancy_regex::<S>(&pattern) {
+            return Ok(JqRegex {
+                engine: RegexEngine::Fancy(re),
+                needs_trailing_nl_check: false,
+                exact_end: None,
+                suppress_empty,
+                longest: None,
+            });
+        }
+    }
+
     match regex::Regex::new(&pattern) {
         Ok(re) => Ok(JqRegex {
             engine: RegexEngine::Std(re),
             needs_trailing_nl_check,
+            exact_end: needs_trailing_nl_check.then(|| ExactEnd::new(&pattern)),
             suppress_empty,
             longest: None,
         }),
@@ -26805,6 +26896,7 @@ fn build_regex_uncached<S: EvalSemantics>(
                 engine: RegexEngine::Fancy(re),
                 // `build_fancy_regex` rewrote `$` itself: see [`prepare_fancy_pattern`].
                 needs_trailing_nl_check: false,
+                exact_end: None,
                 suppress_empty,
                 longest: None,
             }),
@@ -126440,13 +126532,14 @@ mod tests {
 
     #[cfg(feature = "regex")]
     #[test]
-    fn test_ends_with_single_trailing_newline() {
-        assert!(ends_with_single_trailing_newline("a\n"));
-        assert!(!ends_with_single_trailing_newline("a\n\n"));
-        assert!(!ends_with_single_trailing_newline("a"));
-        assert!(!ends_with_single_trailing_newline(""));
-        assert!(ends_with_single_trailing_newline("\n"));
-        assert!(!ends_with_single_trailing_newline("\n\n"));
+    fn test_ends_with_trailing_newline() {
+        assert!(ends_with_trailing_newline("a\n"));
+        // A second newline does not disqualify the text (#5572): `$` is just before the last one.
+        assert!(ends_with_trailing_newline("a\n\n"));
+        assert!(!ends_with_trailing_newline("a"));
+        assert!(!ends_with_trailing_newline(""));
+        assert!(ends_with_trailing_newline("\n"));
+        assert!(ends_with_trailing_newline("\n\n"));
     }
 
     #[cfg(feature = "regex")]
@@ -126497,6 +126590,10 @@ mod tests {
         // Real jq: test("a$") on "a\n" -> true, on "a\n\n" -> false.
         assert!(dv_is_match(&re, "a\n", true));
         assert!(!dv_is_match(&re, "a\n\n", true));
+        // `$` is just before the final newline of a doubled one too (#5572).
+        let re = regex::Regex::new(r"a\s$").unwrap();
+        assert!(dv_is_match(&re, "a\n\n", true));
+        let re = regex::Regex::new("a$").unwrap();
         assert!(dv_is_match(&re, "a", true));
         // Without the check flag, falls back to plain Rust `$` semantics.
         assert!(!dv_is_match(&re, "a\n", false));
@@ -126509,10 +126606,155 @@ mod tests {
         // Real jq: sub("a$";"X") on "a\n" -> "X\n" (matches "a" itself,
         // zero-width $ after it — the \n is never part of the match).
         let re = regex::Regex::new("a$").unwrap();
-        let caps = dv_captures_at(&re, "a\n", 0, true).unwrap();
+        let caps = dv_captures_at(&re, "a\n", 0, true, None).unwrap();
         let m = caps.get(0).unwrap();
         assert_eq!(m.as_str(), "a");
         assert_eq!((m.start(), m.end()), (0, 1));
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_dollar_tie_is_broken_by_the_exact_engine_5572() {
+        // `$` is the end of the text or just before a final `\n`. Both views of the text match
+        // `\s+$` at offset 3 of `"abc \n"`: a greedy `\s+` takes the `\n` (jq's `[3,2]`) and a lazy
+        // one does not (`[3,1]`). Captured from jq 1.7.1.
+        for (json, filter, expected) in [
+            (
+                &br#""abc \n""#[..],
+                r#"[match("\\s+$") | [.offset, .length]]"#,
+                "[[3,2]]",
+            ),
+            (
+                br#""abc \n""#,
+                r#"[match("\\s+?$") | [.offset, .length]]"#,
+                "[[3,1]]",
+            ),
+            (br#""abc \n""#, r#"sub("\\s+$"; "")"#, r#""abc""#),
+            (br#""abc \n""#, r#"[scan("\\s+$")]"#, r#"[" \n"]"#),
+            // Identical in both views: no tie to break, and the answer is not affected.
+            (
+                br#""a \n""#,
+                r#"[match(" $") | [.offset, .length]]"#,
+                "[[1,1]]",
+            ),
+            // The full text's match starts first (it needs the final `\n`): no tie.
+            (
+                br#""ab\n""#,
+                r#"[match("a.\\n|b$") | [.offset, .length]]"#,
+                "[[0,3]]",
+            ),
+            // A group that differs between the views is a tie too, and its captures come from
+            // the exact engine.
+            (
+                br#""k=v \n""#,
+                r#"capture("(?<k>\\w+)=(?<v>\\w+)\\s*$")"#,
+                r#"{"k":"k","v":"v"}"#,
+            ),
+        ] {
+            assert_eq!(outputs(json, filter), [expected], "{filter}");
+        }
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_pattern_has_escape_z_5572() {
+        assert!(pattern_has_escape_z(r"a$|b\z"));
+        assert!(pattern_has_escape_z(r"\z"));
+        // An escaped backslash, then a plain `z`.
+        assert!(!pattern_has_escape_z(r"a\\z$"));
+        assert!(pattern_has_escape_z(r"a\\\z"));
+        assert!(!pattern_has_escape_z("a$"));
+        assert!(!pattern_has_escape_z(r"z\"));
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_dollar_after_a_doubled_newline_5572() {
+        // `$` is just before the *final* newline whether or not another one precedes it.
+        for (json, filter, expected) in [
+            (
+                &br#""a\n\n""#[..],
+                r#"[match("$"; "g") | .offset]"#,
+                "[2,3]",
+            ),
+            (br#""a\n\n""#, r#"[match("\\s$"; "g") | .offset]"#, "[1,2]"),
+            (br#""a\n\n""#, r#"test("a\\s$")"#, "true"),
+            // What a second newline does rule out: a match that has to end before the first one.
+            (br#""a\n\n""#, r#"test("a$")"#, "false"),
+            (br#""line\n\n""#, r#"gsub("\\n$"; "")"#, r#""line""#),
+        ] {
+            assert_eq!(outputs(json, filter), [expected], "{filter}");
+        }
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_dollar_with_z_is_read_by_the_exact_engine_5572() {
+        // `\z` is the end of the text and nothing else; the trimmed view of `"b\n"` would end
+        // `b\z` before the newline that is there. Captured from jq 1.7.1.
+        for (json, filter, expected) in [
+            (&br#""b\n""#[..], r#"[match("a$|b\\z") | .length]"#, "[]"),
+            (br#""b""#, r#"[match("a$|b\\z") | .length]"#, "[1]"),
+            (br#""a\n""#, r#"[match("a$|b\\z") | .length]"#, "[1]"),
+            (
+                br#""a\n\n""#,
+                r#"[match("(?<n2>$|[[:digit:]]*)+$\\z"; "g") | .offset]"#,
+                "[3]",
+            ),
+            // The `l` and `n` flags still reach the exact engine alongside `\z` (#5530).
+            (
+                br#""ab""#,
+                r#"[match("a|ab$\\z"; "gl").string]"#,
+                r#"["ab"]"#,
+            ),
+            (
+                br#""ab\n""#,
+                r#"[match("a|ab$\\z"; "l").string]"#,
+                r#"["a"]"#,
+            ),
+            (
+                br#""xaab""#,
+                r#"[match("(?:a*?|b$\\z)"; "gn") | [.offset, .string]]"#,
+                r#"[[1,"a"],[2,"a"],[3,"b"]]"#,
+            ),
+            // `\z` with a group `fancy-regex` cannot parse: the `regex` route's two views answer.
+            (br#""a\n""#, r#"[match("(?:)+a$|b\\z") | .length]"#, "[1]"),
+            // An escaped backslash followed by `z` is not the escape `\z`.
+            (br#""a\\z""#, r#"[match("a\\\\z$").string]"#, r#"["a\\z"]"#),
+        ] {
+            assert_eq!(outputs(json, filter), [expected], "{filter}");
+        }
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_dollar_tie_keeps_the_trimmed_match_when_the_exact_engine_does_not_answer_5572() {
+        // The exact engine is asked for the match at the tie's start. If it has none there (or
+        // gives up on its budget), the trimmed text's match stands.
+        let re = regex::Regex::new(r"\s+$").unwrap();
+        let exact = ExactEnd::new(r"\s+$");
+        exact
+            .engine
+            .set(Some(fancy_regex::Regex::new("zzz").unwrap()))
+            .unwrap();
+        let caps = dv_captures_at(&re, "abc \n", 0, true, Some(&exact)).unwrap();
+        let m = caps.get(0).unwrap();
+        assert_eq!((m.start(), m.len()), (3, 1));
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_dollar_tie_keeps_the_trimmed_match_when_fancy_regex_refuses_5572() {
+        // `fancy-regex`'s parser refuses a repeat of an empty group, so the exact engine is not
+        // available for this pattern and the tie keeps the trimmed text's (shorter) match. jq 1.7.1
+        // has `[3,2]`. Pinned as the divergence it is: when it is closed this test is the one to flip.
+        assert_eq!(
+            outputs(
+                br#""abc \n""#,
+                r#"[match("(?:)+\\s+$") | [.offset, .length]]"#
+            ),
+            ["[[3,1]]"]
+        );
     }
 
     #[cfg(feature = "regex")]
