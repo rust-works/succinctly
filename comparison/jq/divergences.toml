@@ -199,3 +199,9 @@ id = "robust:mem-limit-64m-string"
 platform = "linux"
 category = "to-triage"
 reason = "Under `ulimit -v` 64 MiB a 20 MB string is read by jq but refused by succinctly with an error (exit 1). Same run and open question as mem-limit-256m-identity."
+
+[[divergence]]
+id = "robust:mem-limit-alloc-bomb"
+platform = "linux"
+category = "to-triage"
+reason = "`[range(1e8)] | length` under `ulimit -v` 512 MiB: jq 1.7.1 and succinctly both abort (killed by a signal, no exit status), so the output matches but the subject crashes where a graceful out-of-memory error would be expected. Seen on GitHub-hosted x86_64 Linux in #5623; stderr not yet captured."
