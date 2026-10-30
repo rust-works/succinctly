@@ -6493,6 +6493,7 @@ fn get_inputs(
     } else {
         raw_inputs.last().map(|(_, raw)| raw.as_bytes())
     };
+    let last_ends_on_close = raw_inputs.last().is_some_and(|(_, raw)| ends_on_close(raw));
     let slurp_eof_line: Option<usize> = if args.slurp {
         last_source.and_then(|raw| {
             // #1550: the drop check reads across every file as one stream,
@@ -6808,8 +6809,14 @@ fn get_inputs(
     // slurping the events and `input`/`inputs` reading them. Each event keeps its document's
     // location. Only those two need the events kept; a program that reads `.` walks each
     // document's events one at a time in `run_jq`'s loop instead.
+    let mut unflushed_close = None;
     if stream_mode(args, track_eof) == StreamMode::Eager {
         expand_into_stream_events(&mut values, &mut locations, &mut resumed_errors);
+        // #5548: only the slurped array is wrapped up front; the event jq's parser still holds at
+        // EOF is a value of its own after it.
+        if args.slurp && last_ends_on_close {
+            unflushed_close = take_unflushed_close(&mut values);
+        }
     }
 
     // Slurp mode: wrap all inputs in an array
@@ -6818,9 +6825,16 @@ fn get_inputs(
             Some((src, line)) => locations.resolve(src, line),
             None => InputLocation::unknown(),
         };
+        let mut slurped = vec![OwnedValue::array_from(values)];
+        let mut slurped_locations = InputLocations::single(at);
+        if let Some(close) = unflushed_close {
+            slurped.push(close);
+            // Read after the input is exhausted, so `input_line_number` is 0.
+            slurped_locations.push(0, 0);
+        }
         Ok(Ok((
-            vec![OwnedValue::array_from(values)],
-            InputLocations::single(at),
+            slurped,
+            slurped_locations,
             // A plain-JSON parse error fails `--slurp` outright instead
             // (above); only `--seq`'s deferred warning follows the array
             // (#3201).
@@ -6832,6 +6846,35 @@ fn get_inputs(
         )))
     } else {
         Ok(Ok((values, locations, trailing_error, resumed_errors)))
+    }
+}
+
+/// Whether the last byte of a file is the `]` or `}` that closes its document, with no whitespace
+/// after it (#5548).
+fn ends_on_close(raw: &str) -> bool {
+    matches!(raw.as_bytes().last(), Some(b']' | b'}'))
+}
+
+/// jq's streaming parser emits a scalar element's value event when the `,` or closer after it
+/// arrives, and the closing event of a top-level array or object that scalar ends only at the next
+/// byte -- or, when there is none, once its input is exhausted (#5548). `jq -s --stream` has
+/// finished the array by then, so that one event is a value after it: `[1,2]` with no trailing
+/// newline slurps to `[[[0],1],[[1],2]]` and then `[[1]]`, where `[1,2]\n` and `[1,[2]]` slurp
+/// whole. Removes and returns that event from the `--stream` events of the last document.
+fn take_unflushed_close(events: &mut Vec<OwnedValue>) -> Option<OwnedValue> {
+    let [.., before, close] = events.as_slice() else {
+        return None;
+    };
+    let is_close = matches!(close, OwnedValue::Array(parts) if parts.len() == 1);
+    let is_scalar_leaf = matches!(
+        before,
+        OwnedValue::Array(parts) if parts.len() == 2
+            && !matches!(parts[1], OwnedValue::Array(_) | OwnedValue::Object(_))
+    );
+    if is_close && is_scalar_leaf {
+        events.pop()
+    } else {
+        None
     }
 }
 
