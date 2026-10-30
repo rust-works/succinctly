@@ -7224,7 +7224,12 @@ Under `-C` the marker takes the color of the value it replaces, followed by a re
 Before #5497 a value 257 to 383 levels deep printed in full.
 
 **Building.** succinctly still refuses a value more than 384 levels deep (`MAX_VALUE_TREE_DEPTH`), where jq's only limit is its C stack (`[.,.] | sort` segfaults at 100,000 levels, and `length` at 1,000,000).
-`reduce`/`foreach` re-index their accumulator on every step and refuse one past 384 levels whatever the program does next, and `tojson`/`tostring`/interpolation materialize a value past 384 levels before writing it, so the marker does not help them there.
+`reduce`/`foreach` re-index their accumulator on every step and refuse one past 384 levels whatever the program does next.
+`tojson`/`tostring`/interpolation (and `@json`/`@text`) used to materialize a value past 384 levels before writing it, so the marker did not help them there.
+Since [#5554](https://github.com/rust-works/succinctly/issues/5554) a pipe whose first stage only renders its input as text answers a value the re-index bridge refused from the tree, with the marker where jq puts it: `def f(n): if n == 0 then 0 else [f(n-1)] end; f(1000) | tojson | length` is `533`, as in jq.
+Only a refusal asks for that, so a value under the limit reads as before, and it is jq mode only.
+A leading `( … | … )` group is read as its stages, and a consumer that stops early (`first`, `limit`, `isempty`) stops the rest too.
+The same stage inside `try`, a comma, an `as` source or `map` still reads the refusal, because those reach the bridge through the other evaluator's own re-index sites.
 ADR-0025's stack floor relies on that bound for the walks over a built value between its checks, so lifting it is a design of its own; see "Recursive `def`s" below for the shapes that reach it.
 
 ### Before #5497

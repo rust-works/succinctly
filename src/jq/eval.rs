@@ -12070,7 +12070,19 @@ fn eval_each_owned_past_front_doors<S: EvalSemantics>(
     // `eval_owned_input`.
     let doc = match input.reindexed::<S>() {
         Ok(doc) => doc,
-        Err(error) => return Flow::Escaped(Control::Error(error)),
+        Err(error) => {
+            // #5554: a value too deep to re-index still renders as text.
+            return match text_peel_after_refusal::<S>(expr, input, &error) {
+                Some((text, None)) => match sink(text) {
+                    Demand::Continue => Flow::Exhausted,
+                    Demand::Stop => Flow::Stopped { pending: None },
+                },
+                Some((text, Some(rest))) => {
+                    eval_each_owned::<S>(&rest, &text, optional, Reentry::REBUILT, sink)
+                }
+                None => Flow::Escaped(Control::Error(error)),
+            };
+        }
     };
     let cursor = doc.root();
 
@@ -12558,6 +12570,76 @@ fn unreachable_owned_pipe_stage() -> EvalError {
     );
     EvalError::new("internal error: pipe stage yielded other than one value") // patchcov: coverage tolerate-line reason="unreachable: same invariant as the `false` above (#5285)"
 } // patchcov: coverage tolerate-line reason="unreachable: the whole function body above is dead by the same invariant (#5285)"
+
+/// The first stage of `expr`, answered without the re-index bridge, when the bridge refused
+/// `input` for its depth and that stage only renders `input` as text (#5554): `tojson`,
+/// `tostring`, `@json`, `@text` and `"\(.)"`. Returns the text and what is left of `expr`.
+///
+/// The bridge writes `input` out and indexes it again, and refuses a value past
+/// [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH) levels, which jq has no
+/// counterpart for: a value a program built can be deeper, and jq's writer prints it as far as
+/// [`JQ_MAX_PRINT_DEPTH`](super::value::JQ_MAX_PRINT_DEPTH) and then
+/// [`SKIPPED_TOO_DEEP`](super::value::SKIPPED_TOO_DEEP). The text is rendered from the tree by the
+/// writer the lone-stage fast path already uses, which stops at that depth whatever the tree's.
+/// Only a refusal asks, so nothing a value the bridge accepts answers changes.
+///
+/// jq mode only: yq's writers print the whole value.
+fn text_peel_after_refusal<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    refused: &EvalError,
+) -> Option<(OwnedValue, Option<Expr>)> {
+    if S::TAG != EvalTag::Jq || !refused.is_resource_limit() {
+        return None;
+    }
+    // The first stage and the stages after it, a leading `(a | b)` read as `a | b`: jq's pipe
+    // is associative, so the stages are the same.
+    let mut stage = unwrap_paren(expr);
+    let mut after: Vec<&Expr> = Vec::new();
+    while let Expr::Pipe(stages) = stage {
+        let (first, tail) = stages.split_first()?;
+        after.splice(0..0, tail);
+        stage = unwrap_paren(first);
+    }
+    let rest = match after.as_slice() {
+        [] => None,
+        [only] => Some((*only).clone()),
+        _ => Some(Expr::Pipe(
+            after
+                .iter()
+                .map(|stage| (*stage).clone())
+                .collect::<Vec<_>>()
+                .into(),
+        )),
+    };
+    let text = match stage {
+        Expr::Builtin(Builtin::ToJson) | Expr::Format(FormatType::Json) => {
+            owned_value_to_json::<S>(input)
+        }
+        Expr::Builtin(Builtin::ToString) | Expr::Format(FormatType::Text) => {
+            tostring_text::<S>(input, false)
+        }
+        Expr::StringInterpolation(parts) => {
+            let mut text = String::new();
+            // Each `\(.)` slot is the same text: walk the value once, not once per slot.
+            let mut value_text: Option<String> = None;
+            for part in parts {
+                match part {
+                    StringPart::Literal(literal) => text.push_str(literal),
+                    StringPart::Expr(inner) if matches!(unwrap_paren(inner), Expr::Identity) => {
+                        text.push_str(
+                            value_text.get_or_insert_with(|| owned_to_string::<S>(input)),
+                        );
+                    }
+                    StringPart::Expr(_) => return None,
+                }
+            }
+            text
+        }
+        _ => return None,
+    };
+    Some((OwnedValue::String(text.into()), rest))
+}
 
 pub(crate) fn eval_owned_reindex_free<S: EvalSemantics>(
     expr: &Expr,
@@ -79597,7 +79679,14 @@ fn eval_owned_input_bridge<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // ±Infinity rather than being silently substituted with "null" (#561).
     let doc = match input.reindexed::<S>() {
         Ok(doc) => doc,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => {
+            // #5554: a value too deep to re-index still renders as text.
+            return match text_peel_after_refusal::<S>(expr, input, &e) {
+                Some((text, None)) => QueryResult::Owned(text),
+                Some((text, Some(rest))) => eval_owned_input_bridge::<W, S>(&rest, &text, optional),
+                None => QueryResult::Error(e),
+            };
+        }
     };
     let cursor = doc.root();
 
@@ -114935,6 +115024,82 @@ mod tests {
             matches!(rest.rest().rest().plan::<JqSemantics>(), TailPlan::Copy),
             "a lone stage is handed on as itself, not kept"
         );
+    }
+
+    /// #5554: the owned bridge answers a text stage over a value too deep to re-index, alone and
+    /// with the rest of its pipe, as `path(...)` does for a stage it evaluates on an owned value.
+    #[test]
+    fn test_owned_bridge_renders_a_value_past_the_reindex_limit_5554() {
+        let mut deep = OwnedValue::Int(0);
+        for _ in 0..crate::jq::MAX_VALUE_TREE_DEPTH + 16 {
+            deep = OwnedValue::array_from(vec![deep]);
+        }
+        let run = |source: &str| {
+            let expr = crate::jq::parse(source).unwrap();
+            match eval_owned_input_bridge::<Vec<u64>, JqSemantics>(&expr, &deep, false) {
+                QueryResult::Owned(value) => value,
+                _ => panic!("`{source}` did not answer one owned value"),
+            }
+        };
+        // jq's writer prints 256 levels, then the marker: 533 characters whatever the depth.
+        assert_eq!(run("tojson | length").to_json(), "533");
+        assert_eq!(run("tojson").to_json().len(), 533 + 2);
+        assert_eq!(run("tostring | length | . + 1").to_json(), "534");
+        // A first stage that is not text keeps the refusal.
+        let expr = crate::jq::parse("length").unwrap();
+        assert!(matches!(
+            eval_owned_input_bridge::<Vec<u64>, JqSemantics>(&expr, &deep, false),
+            QueryResult::Error(_)
+        ));
+    }
+
+    /// #5554: the text peel asks only after a depth refusal, in jq mode, and only for a first
+    /// stage that renders its input, reading a leading `(a | b)` as `a | b`.
+    #[test]
+    fn test_text_peel_asks_only_after_a_depth_refusal_in_jq_mode_5554() {
+        let refused = EvalError::resource_limit("nesting depth exceeds limit of 384");
+        let input = OwnedValue::Null;
+        let peel = |source: &str, error: &EvalError| {
+            text_peel_after_refusal::<JqSemantics>(
+                &crate::jq::parse(source).unwrap(),
+                &input,
+                error,
+            )
+        };
+        // The peeled text as the JSON string it is.
+        let text = |peeled: &(OwnedValue, Option<Expr>)| peeled.0.to_json();
+        // A refusal in jq mode: the stage's text, with nothing left of a lone stage.
+        let lone = peel("tojson", &refused).unwrap();
+        assert_eq!((text(&lone).as_str(), lone.1.is_none()), ("\"null\"", true));
+        // Any other error is not a refusal: the bridge's own answer stands.
+        assert!(peel("tojson", &EvalError::new("another error")).is_none());
+        // yq's writers print the whole value, so nothing is peeled there.
+        let yq = crate::jq::parse("tojson").unwrap();
+        assert!(text_peel_after_refusal::<YqSemantics>(&yq, &input, &refused).is_none());
+        // A first stage that does not only render its input, or an interpolation slot that reads
+        // more than `.`, is not peeled.
+        for source in [
+            "length",
+            ". + 1",
+            r#""\(.a)""#,
+            "tojson | tojson | 1 | tostring",
+        ] {
+            assert_eq!(
+                peel(source, &refused).is_some(),
+                source.starts_with("tojson"),
+                "{source}"
+            );
+        }
+        // The rest of the pipe is what follows the stage, a leading group read as its stages.
+        let grouped = peel("(tojson | length) | . + 1 | . + 2", &refused).unwrap();
+        let rest = grouped.1.unwrap();
+        assert!(
+            matches!(&rest, Expr::Pipe(stages) if stages.len() == 3),
+            "{rest:?}"
+        );
+        // Each `\(.)` slot is the same text.
+        let slots = peel(r#""a\(.)b\(.)c""#, &refused).unwrap();
+        assert_eq!(text(&slots), "\"anullbnullc\"");
     }
 
     /// #5441: a split tail is built for each call, so the facts its pipe is
