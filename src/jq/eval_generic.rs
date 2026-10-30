@@ -1386,15 +1386,49 @@ impl<V: Clone> ObjectBuilder<V> {
 }
 
 /// The most members an array element's object pre-sizes its map for from the
-/// element before it (#5594).
+/// elements before it (#5594).
 ///
-/// A record in an array usually has the members the one before it had, so its
+/// A record in an array usually has the members the ones before it had, so its
 /// map is sized for that many up front instead of growing from empty, which
 /// reallocates the table and the entry list twice on the way to six members
-/// and showed as -7% to -8% of the instructions of a `del` or an assignment
-/// over the `users` pattern. The cap bounds what a wrong guess costs: an
-/// object after a wide sibling holds at most this many unused slots.
+/// and showed as -8% to -9% of the instructions of a `del` or an assignment
+/// over the `users` pattern, and -4% to -6% of its peak RSS. The guess is taken
+/// only when the two elements before agreed ([`SiblingShape`]), and the cap
+/// bounds what a wrong one costs: an object after wide siblings holds at most
+/// this many unused slots.
 const MAX_SIBLING_CAPACITY: usize = 16;
+
+/// The member counts of the last two object elements of an array, which size
+/// the next one's map when they agree (#5594).
+///
+/// One sibling is not enough evidence: an array alternating a wide record with
+/// a one-member one would size every narrow map for the wide record, which
+/// measured +31% peak RSS on such a document. Two that agree are what a
+/// uniform array of records looks like, and an alternating one never offers
+/// them, so it grows its maps from empty as before.
+#[derive(Default)]
+struct SiblingShape {
+    last: usize,
+    before_last: usize,
+}
+
+impl SiblingShape {
+    /// How many members to make room for in the next element's map.
+    fn capacity(&self) -> usize {
+        if self.last == self.before_last {
+            self.last
+        } else {
+            0
+        }
+    }
+
+    /// Record an element with `members` members (`0` for anything but an
+    /// object).
+    fn push(&mut self, members: usize) {
+        self.before_last = self.last;
+        self.last = members.min(MAX_SIBLING_CAPACITY);
+    }
+}
 
 /// What [`to_owned_cursor_at_depth`] assembles from the checks it makes:
 /// the value itself ([`BuildOwned`]) or nothing ([`CheckOnly`], #3156). The
@@ -1523,8 +1557,8 @@ fn walk_child<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOutput>(
 /// from the same cursor on entry doubled the cost of every YAML member (#2664).
 ///
 /// `capacity` is how many members to make room for if `cursor` is an object:
-/// its previous sibling's count when the caller is walking an array, `0`
-/// otherwise (#5594, see [`MAX_SIBLING_CAPACITY`]).
+/// its previous siblings' count when the caller is walking an array and they
+/// agree, `0` otherwise (#5594, see [`SiblingShape`]).
 fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOutput>(
     cursor: &C,
     known: Option<C::Value>,
@@ -1648,9 +1682,9 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
         let mut last_elem: Option<C> = None;
         // #3134: as the object arm's own `watched`, keyed by index.
         let mut watched: Vec<(usize, OwnedValue)> = Vec::new();
-        // #5594: the members of the object element before this one, which
-        // sizes this one's map.
-        let mut sibling_members = 0;
+        // #5594: the member counts of the object elements before this one,
+        // which size this one's map.
+        let mut siblings = SiblingShape::default();
         while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
             // #1677: same gap check as `to_owned_at_depth`'s array loop --
             // #1803 made "same" literal, via the shared `element_gap_ok`.
@@ -1667,14 +1701,14 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
                 None => walk_child::<S, _, B>(
                     &elem_cursor,
                     C::REUSE_FIELD_VALUE.then(|| elem_cursor.value()),
-                    sibling_members,
+                    siblings.capacity(),
                     depth + 1,
                     check_depth,
                     scalar_override,
                     nested,
                 )?,
             };
-            sibling_members = B::object_len(&child).min(MAX_SIBLING_CAPACITY);
+            siblings.push(B::object_len(&child));
             items.push(child);
             last_elem = Some(elem_cursor);
             elems = rest;
@@ -50995,16 +51029,23 @@ mod tests {
         );
     }
 
-    /// #5594: an object element is sized from the one before it, so a record
-    /// shaped like its predecessor fills its map without growing it, and a wide
-    /// predecessor sizes the next one for at most `MAX_SIBLING_CAPACITY`.
+    /// #5594: an object element is sized from the two before it when they
+    /// agree, so a record shaped like its predecessors fills its map without
+    /// growing it; wide predecessors size it for at most
+    /// `MAX_SIBLING_CAPACITY`, and predecessors that disagree size nothing.
     #[test]
-    fn to_owned_cursor_sizes_an_element_from_its_sibling_5594() {
-        let wide: String = (0..MAX_SIBLING_CAPACITY + 4)
-            .map(|i| format!("\"k{i}\":{i}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        let json = format!(r#"[{{"a":1,"b":2,"c":3,"d":4,"e":5}},{{"x":1}},{{{wide}}},{{"y":1}}]"#);
+    fn to_owned_cursor_sizes_an_element_from_its_siblings_5594() {
+        let wide = format!(
+            "{{{}}}",
+            (0..MAX_SIBLING_CAPACITY + 4)
+                .map(|i| format!("\"k{i}\":{i}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let five = r#"{"a":1,"b":2,"c":3,"d":4,"e":5}"#;
+        let one = r#"{"x":1}"#;
+        // 0..=1 agree on 5; 3..=4 agree on the cap; 5 and 6 disagree.
+        let json = format!("[{five},{five},{one},{wide},{wide},{one},{wide},{one}]");
         let index = JsonIndex::build(json.as_bytes());
         let root = index.root(json.as_bytes());
         let owned = to_owned_cursor::<JqSemantics, _>(&root).unwrap();
@@ -51016,16 +51057,13 @@ mod tests {
             other => panic!("expected an object, got {other:?}"),
         };
         // Grown from empty, a one-member map has room for 3.
+        assert!(capacity(2) >= 5, "two 5-member siblings: {}", capacity(2));
         assert!(
-            capacity(1) >= 5,
-            "sized from a 5-member sibling: {}",
-            capacity(1)
+            (MAX_SIBLING_CAPACITY..MAX_SIBLING_CAPACITY + 4).contains(&capacity(5)),
+            "two wide siblings, capped: {}",
+            capacity(5)
         );
-        assert!(
-            capacity(3) < MAX_SIBLING_CAPACITY + 4,
-            "a wide sibling is capped: {}",
-            capacity(3)
-        );
+        assert!(capacity(7) < 5, "siblings that disagree: {}", capacity(7));
         // The values are what they were.
         assert_eq!(
             owned.to_json(),
