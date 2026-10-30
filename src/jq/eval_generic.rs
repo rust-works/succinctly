@@ -41124,9 +41124,11 @@ mod tests {
                 "{token}"
             );
         }
-        // Not a number, a computed double and a non-finite literal keep the bridge.
+        // Not a number, a computed NaN and a non-finite literal keep the bridge.
         assert!(reindexes("map(try floor catch 0)", br#"["x",true]"#) > 0);
-        assert!(reindexes("map(. * 1.5 | floor)", b"[1,2]") > 0);
+        // A computed finite double is answered from the number since #5601; a NaN is not.
+        assert_eq!(reindexes("map(. * 1.5 | floor)", b"[1,2]"), 0);
+        assert!(reindexes("map(nan | floor)", b"[1,2]") > 0);
         assert!(reindexes("map(floor)", b"[1e1000]") > 0);
     }
 
