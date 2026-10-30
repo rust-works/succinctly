@@ -10,6 +10,10 @@ use crate::run_jq_full;
 
 const NUMBERS: &str = r"[0,-0,-0.0,1,-1,1.5,-1.5,2.5,-2.5,0.5,0.49999999999999994,4.5,1E5,1e-5,1e19,-1e20,100000000000000000000,123456789012345678901234567890,1.7976931348623157e308,1e1000,-1e1000,1e-400,9007199254740991,9007199254740992,9007199254740993,-9007199254740993,9223372036854775808,3.14159265358979323846,0.30000000000000004,16,2]";
 
+const FINITE: &str = r"[0,-0.0,1.5,-1.5,2.5,0.5,4.5,1e19,-1e20,100000000000000000000,9007199254740993,3.14159265358979323846,16,2,123456.789e3]";
+
+const SMALL: &str = r"[1,-1,2.5,0.1,100]";
+
 #[test]
 fn test_stages_after_a_computed_number_match_jq_5601() -> Result<()> {
     for (program, expected) in [
@@ -57,18 +61,85 @@ fn test_stages_after_a_computed_number_match_jq_5601() -> Result<()> {
             r"map(. * 1 | tojson)",
             r#"["0","-0","-0","1","-1","1.5","-1.5","2.5","-2.5","0.5","0.49999999999999994","4.5","100000","1e-05","1e+19","-1e+20","1e+20","123456789012345680000000000000","1.7976931348623157e+308","1.7976931348623157e+308","-1.7976931348623157e+308","0","9007199254740991","9007199254740992","9007199254740992","-9007199254740992","9223372036854776000","3.141592653589793","0.30000000000000004","16","2"]"#,
         ),
-        (r"reduce .[] as $x (0; . + ($x | floor))", r"null"),
-        (
-            r"[foreach .[] as $x (0; . + ($x | trunc); .)] | last",
-            r"null",
-        ),
-        (r"reduce .[] as $x ([]; . + [$x | round]) | length", r"31"),
         (
             r"map(. + 1 | floor | . + 1 | floor)",
             r"[2,2,2,3,1,3,0,4,-1,2,2,6,100002,2,1e+19,-1e+20,1e+20,123456789012345680000000000000,1.7976931348623157e+308,1.7976931348623157e+308,-1.7976931348623157e+308,2,9007199254740992,9007199254740992,9007199254740992,-9007199254740990,9223372036854776000,5,2,18,4]",
         ),
+        (r"reduce .[] as $x ([]; . + [$x | round]) | length", r"31"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(NUMBERS))?;
+        assert_eq!(code, 0, "{program}: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "{program}");
+    }
+    Ok(())
+}
+
+/// The folds bind a document number to `$x`; over finite numbers the sums have a value to get wrong.
+#[test]
+fn test_folds_over_document_numbers_match_jq_5601() -> Result<()> {
+    for (program, expected) in [
+        (
+            r"reduce .[] as $x (0; . + ($x | floor))",
+            r"10009007199378199000",
+        ),
+        (
+            r"[foreach .[] as $x (0; . + ($x | trunc); .)] | last",
+            r"10009007199378199000",
+        ),
+        (
+            r"reduce .[] as $x (0; . + ($x | fabs | sqrt | floor))",
+            r"23257195047",
+        ),
+        (
+            r"[foreach .[] as $x (0; . + ($x | ceil); .)]",
+            r"[0,0,2,1,4,5,10,1e+19,-9e+19,1e+19,10009007199254740000,10009007199254740000,10009007199254740000,10009007199254740000,10009007199378199000]",
+        ),
+        (
+            r"reduce .[] as $x (0; . + ($x | fabs | . * 2))",
+            r"420018014398756400000",
+        ),
+        (
+            r"reduce .[] as $x (0; . + ($x | round))",
+            r"10009007199378199000",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(FINITE))?;
+        assert_eq!(code, 0, "{program}: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "{program}");
+    }
+    Ok(())
+}
+
+/// A computed infinity is a plain `Float` on the owned fast path, compared as the infinity it is.
+#[test]
+fn test_computed_infinities_meet_the_next_stage_as_jq_does_5601() -> Result<()> {
+    for (program, expected) in [
+        (
+            r"map(. * 1e308 * 10 | . == 1.7976931348623157e308)",
+            r"[false,false,false,false,false]",
+        ),
+        (
+            r"map(. * 1e308 * 10 | . > 1.7976931348623157e308)",
+            r"[true,false,true,false,true]",
+        ),
+        (
+            r"map(. * 1e308 * 10 | floor | . == infinite)",
+            r"[true,false,true,false,true]",
+        ),
+        (
+            r"map(. * 1e308 * 10 | . + 1 | tostring)",
+            r#"["1.7976931348623157e+308","-1.7976931348623157e+308","1.7976931348623157e+308","1e+308","1.7976931348623157e+308"]"#,
+        ),
+        (
+            r"map(. * 1e308 * 10 | sqrt | . + 1)",
+            r"[1.7976931348623157e+308,null,1.7976931348623157e+308,1e+154,1.7976931348623157e+308]",
+        ),
+        (
+            r"map(. * -1e308 * 10 | fabs | . - 1 | tojson)",
+            r#"["1.7976931348623157e+308","1.7976931348623157e+308","1.7976931348623157e+308","1.7976931348623157e+308","1.7976931348623157e+308"]"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(SMALL))?;
         assert_eq!(code, 0, "{program}: {stderr:?}");
         assert_eq!(stdout.trim_end(), expected, "{program}");
     }

@@ -418,6 +418,28 @@ fn unary_math_of_document_number<S: EvalSemantics, V: DocumentValue>(
     crate::jq::eval::unary_math_apply::<S>(builtin, n)
 }
 
+/// Whether `expr` starts with a shape [`crate::jq::eval::eval_owned_fast_path`] can answer: the
+/// arithmetic accumulator, a comparison, `and`/`or`/`not`, a literal, navigation, `type` and
+/// `tostring`, or a pipe that starts with one (#5601). A necessary condition only, so the fast
+/// path still decides; it keeps a stage outside the grammar from paying a failed walk per value.
+fn owned_fast_path_may_answer(expr: &Expr) -> bool {
+    match strip_parens(expr) {
+        Expr::Pipe(stages) => stages.first().is_some_and(owned_fast_path_may_answer),
+        Expr::Arithmetic { .. }
+        | Expr::Compare { .. }
+        | Expr::And(..)
+        | Expr::Or(..)
+        | Expr::Not
+        | Expr::Literal(_)
+        | Expr::TrackedVar(_)
+        | Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Builtin(Builtin::Type | Builtin::ToString) => true,
+        _ => false,
+    }
+}
+
 /// A number the filter computed (`Int` or `Float`, not a document's `NumberLiteral`) that is not a
 /// NaN, in jq mode (#5601): a value with no storage identity to keep and no spelling to preserve,
 /// which the owned fast paths can answer without the reindex bridge.
@@ -4965,9 +4987,13 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
     // `Float` has none; a `NumberLiteral` is left out because the shapes answered here may
     // return it in a representation the bridge would not (`eval_owned_pure`'s `Fresh` rule), and
     // a NaN because jq tells two of them apart.
+    //
+    // The expression is checked for a shape the fast path answers first: a stage outside its
+    // grammar (`select`, `if`, a constructor, `as`) would pay a failed walk per value and then
+    // bridge anyway, 1-6% slower than not trying (measured).
     if !embed_table_active()
         && ((!S::REINDEX_BRIDGE_KEEPS_IDENTITY && dom_roots::active())
-            || is_computed_plain_number::<S>(&owned))
+            || (is_computed_plain_number::<S>(&owned) && owned_fast_path_may_answer(expr)))
     {
         if let Some(result) = crate::jq::eval::eval_owned_fast_path::<S>(expr, &owned, optional) {
             // No `Err(_) if optional` arm, unlike the route above: the fast

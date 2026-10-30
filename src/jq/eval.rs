@@ -13059,8 +13059,10 @@ fn is_closed_unary_builtin(stage: &Expr) -> bool {
 /// answer (#3944): `$r.score | floor`. The input is the closed head's value,
 /// never the accumulator, so the evaluator runs on a value the size of one
 /// record field. The stage is a whitelisted builtin with no argument, so it
-/// cannot fan out or run an effect; one that raises or yields nothing is
-/// `None`, and the caller declines to the evaluator's own route and text.
+/// cannot fan out or run an effect. The six math builtins of a number are
+/// [`owned_unary_math`]'s, with no evaluation at all (#5601); every other case,
+/// or one that raises or yields nothing, is the evaluator's, and `None` leaves the
+/// caller on its own route and text.
 /// jq mode only, like the operators in [`closed_expr_to_owned_at_depth`].
 fn closed_unary_builtin<S: EvalSemantics>(stage: &Expr, input: &OwnedValue) -> Option<OwnedValue> {
     if S::TAG != EvalTag::Jq || !is_closed_unary_builtin(stage) {
@@ -96016,22 +96018,36 @@ pub(crate) fn unary_math_apply<S: EvalSemantics>(builtin: &Builtin, n: f64) -> O
 }
 
 /// [`unary_math_apply`] of an owned number (#5601), so a computed or bound number does not take the
-/// reindex bridge to meet one libm call. The double is `Int`'s or `Float`'s own, or a literal's read
-/// from its text. `None` (the caller's route, unchanged)
-/// for yq mode, a value that is not a number, which keeps the evaluator's error, and a non-finite
-/// double.
+/// reindex bridge to meet one libm call. The double is an `Int`'s or a `Float`'s own, or a literal's
+/// read from its text. `None`, leaving the caller's route unchanged, for yq mode, a value that is
+/// not a number (which keeps the evaluator's error), a literal whose text is not a valid number,
+/// and a non-finite double.
 pub(crate) fn owned_unary_math<S: EvalSemantics>(
     builtin: &Builtin,
     input: &OwnedValue,
 ) -> Option<OwnedValue> {
-    if S::TAG != EvalTag::Jq {
+    if S::TAG != EvalTag::Jq
+        || !matches!(
+            builtin,
+            Builtin::Floor
+                | Builtin::Ceil
+                | Builtin::Round
+                | Builtin::Trunc
+                | Builtin::Sqrt
+                | Builtin::Fabs
+        )
+    {
         return None;
     }
     let n = match input {
         OwnedValue::Int(_) | OwnedValue::Float(_) => input.as_f64(),
         // A literal's double is read from its text, as `json_number_f64` reads a document's:
         // `-0` is `Int(0)` in the parsed form and has lost its sign there.
-        OwnedValue::NumberLiteral(_, text) => {
+        // Only a text that is a valid RFC 8259 number, as the cursor arm requires of a document's
+        // span; any other spelling keeps the bridge.
+        OwnedValue::NumberLiteral(_, text)
+            if crate::json::validate::is_valid_number(text.as_bytes()) =>
+        {
             super::value::document_number_f64::<S>(text.as_bytes(), || input.as_f64())
         }
         _ => None,
