@@ -9082,7 +9082,10 @@ fn parse_json_stream_strict(
     // `serde_json`'s own separator-skipping recognizes between stream
     // values.
     let mut values = Vec::new();
-    let mut deserializer = serde_json::Deserializer::from_str(s).into_iter::<serde_json::Value>();
+    // `IgnoredAny`, not `Value` (#5608): the value is thrown away, so nothing should build it.
+    // The parser, the recursion limit and the error text are the same.
+    let mut deserializer =
+        serde_json::Deserializer::from_str(s).into_iter::<serde::de::IgnoredAny>();
     let mut prev_end = 0;
     let bytes = s.as_bytes();
 
@@ -9107,7 +9110,7 @@ fn parse_json_stream_strict(
             // protection #2295 found fragile elsewhere in this file --
             // this is the primary `--slurp`/`--slurpfile` document-input
             // path, worth the same defense-in-depth swap.
-            stream_document_checked(&bytes[start..end], origin, text, lead + start)
+            stream_document_validated(&bytes[start..end], origin, text, lead + start)
                 .map_err(|e| anyhow::Error::from(MalformedJsonError::new(e)))?,
         );
         prev_end = end;
@@ -11633,6 +11636,18 @@ fn json_document_to_owned_value_checked(
     bytes: &[u8],
     at: Option<&dyn Fn() -> (usize, usize)>,
 ) -> core::result::Result<OwnedValue, EvalError> {
+    json_document_to_owned_value(bytes, at, true)
+}
+
+/// [`json_document_to_owned_value_checked`], with the delimiter walk optional: `bytes` that
+/// `serde_json` has already accepted (#5608) have every comma and colon in place, so the walk can
+/// only repeat that answer, at the cost of a second traversal of the whole document through its
+/// cursor.
+fn json_document_to_owned_value(
+    bytes: &[u8],
+    at: Option<&dyn Fn() -> (usize, usize)>,
+    check_delimiters: bool,
+) -> core::result::Result<OwnedValue, EvalError> {
     let index = JsonIndex::build(bytes);
     if let Some(at) = at {
         if let Some(message) =
@@ -11642,7 +11657,9 @@ fn json_document_to_owned_value_checked(
         }
     }
     let cursor = index.root(bytes);
-    validate_json_delimiters(&cursor, 0)?;
+    if check_delimiters {
+        validate_json_delimiters(&cursor, 0)?;
+    }
     // `bytes` is often a temporary (an `--argjson` string, a `--seq` record),
     // so each NaN gets an identity of its own rather than its address (#3309).
     generic_to_owned::<JqSemantics, _>(&cursor.value())
@@ -11657,11 +11674,35 @@ fn stream_document_checked(
     text: &[u8],
     offset: usize,
 ) -> core::result::Result<OwnedValue, EvalError> {
+    stream_document(bytes, origin, text, offset, true)
+}
+
+/// [`stream_document_checked`] for a span `serde_json` has just accepted as a whole value
+/// ([`parse_json_stream_strict`]): the delimiter walk is skipped, as it can only agree (#5608).
+/// The splitter's fallback spans have not been through `serde_json` and keep it.
+fn stream_document_validated(
+    bytes: &[u8],
+    origin: Option<StreamOrigin<'_>>,
+    text: &[u8],
+    offset: usize,
+) -> core::result::Result<OwnedValue, EvalError> {
+    stream_document(bytes, origin, text, offset, false)
+}
+
+fn stream_document(
+    bytes: &[u8],
+    origin: Option<StreamOrigin<'_>>,
+    text: &[u8],
+    offset: usize,
+    check_delimiters: bool,
+) -> core::result::Result<OwnedValue, EvalError> {
     match origin {
-        Some(origin) => {
-            json_document_to_owned_value_checked(bytes, Some(&|| origin.position(text, offset)))
-        }
-        None => json_document_to_owned_value_checked(bytes, None),
+        Some(origin) => json_document_to_owned_value(
+            bytes,
+            Some(&|| origin.position(text, offset)),
+            check_delimiters,
+        ),
+        None => json_document_to_owned_value(bytes, None, check_delimiters),
     }
 }
 
