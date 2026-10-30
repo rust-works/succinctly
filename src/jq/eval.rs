@@ -25825,7 +25825,10 @@ const JQ_WORD_CLASS_IN_CLASS: &str = r"\p{Alphabetic}\p{M}\p{Nd}\p{Pc}";
 /// `(?P...)` group is an error. A scan of the raw text, so it does not know the `x` flag's
 /// comments: a `(?P` inside one is refused here and ignored by jq.
 #[cfg(feature = "regex")]
-fn translate_posix_brackets(pattern: &str) -> Result<std::borrow::Cow<'_, str>, EvalError> {
+fn translate_posix_brackets(
+    pattern: &str,
+    extended: bool,
+) -> Result<std::borrow::Cow<'_, str>, EvalError> {
     if !pattern.contains('[')
         && !pattern.contains("\\w")
         && !pattern.contains("\\W")
@@ -25833,6 +25836,7 @@ fn translate_posix_brackets(pattern: &str) -> Result<std::borrow::Cow<'_, str>, 
         && !pattern.contains("\\>")
         && !pattern.contains("\\b{")
         && !pattern.contains("(?P")
+        && !may_hold_assertion(pattern)
     {
         return Ok(std::borrow::Cow::Borrowed(pattern));
     }
@@ -25843,9 +25847,16 @@ fn translate_posix_brackets(pattern: &str) -> Result<std::borrow::Cow<'_, str>, 
     // where a `]` is a literal.
     let mut depth = 0usize;
     let mut at_start = false;
+    // Whether the token just before this one is an assertion (`^`, `$`, `\b`, ...), which
+    // Oniguruma refuses to repeat (#5535).
+    let mut prev_assertion = false;
+    // The extended mode's comments and ignored blanks are invisible to this scan, so it leaves
+    // the repetition check to the crate there rather than refuse a commented-out fragment.
+    let check_repetition = !extended && !inline_extended(pattern);
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
+        let was_assertion = std::mem::take(&mut prev_assertion);
         if c == '\\' {
             // #5373: jq's `\w` is its POSIX `word` plus six Latin-1 characters and without the
             // two joiners the `regex` crate's `\w` adds. Always a bracketed class, so that a
@@ -25895,12 +25906,21 @@ fn translate_posix_brackets(pattern: &str) -> Result<std::borrow::Cow<'_, str>, 
             out.push(c);
             if let Some(&next) = chars.get(i + 1) {
                 out.push(next);
+                prev_assertion = depth == 0 && matches!(next, 'b' | 'B' | 'A' | 'z' | 'Z' | 'G');
             }
             at_start = false;
             i += 2;
             continue;
         }
         if depth == 0 {
+            // #5535: a repetition operator right after an assertion is an error in jq
+            // (`^*`, `$+`, `\b?`, `\A{2}`); the `regex` crate repeats the empty match.
+            if check_repetition && was_assertion && starts_repetition(&chars[i..]) {
+                return Err(EvalError::new(
+                    "invalid regex: target of repeat operator is invalid",
+                ));
+            }
+            prev_assertion = c == '^' || c == '$';
             // #5529: jq refuses Python-style named groups (`(?P<n>...)`, `(?P=n)`, `(?P>n)`);
             // the `regex` crate accepts the first and would answer where jq errors.
             if c == '(' && chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'P') {
@@ -25966,6 +25986,59 @@ fn translate_posix_brackets(pattern: &str) -> Result<std::borrow::Cow<'_, str>, 
     })
 }
 
+/// Whether `pattern` could hold an assertion `starts_repetition` has to look after: `^`, `$` or
+/// one of the escaped ones. A pattern with none keeps the borrowed fast path (#5535).
+#[cfg(feature = "regex")]
+fn may_hold_assertion(pattern: &str) -> bool {
+    pattern.contains(['^', '$'])
+        || ["\\b", "\\B", "\\A", "\\z", "\\Z", "\\G"]
+            .iter()
+            .any(|assertion| pattern.contains(assertion))
+}
+
+/// Whether an inline flag group (`(?x)`, `(?ix:...)`, `(?-x)`) names the extended flag, so the
+/// pattern may hold comments and blanks Oniguruma ignores (#5535).
+#[cfg(feature = "regex")]
+fn inline_extended(pattern: &str) -> bool {
+    pattern.match_indices("(?").any(|(at, _)| {
+        pattern[at + 2..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic() || *c == '-')
+            .any(|c| c == 'x')
+    })
+}
+
+/// Whether `chars` begins with a repetition operator as Oniguruma's Perl syntax reads one: `*`,
+/// `+`, `?`, or an interval `{n}`, `{n,}` or `{n,m}`. `{,m}` and `{x}` are literal text there, so
+/// they do not count (#5535).
+#[cfg(feature = "regex")]
+fn starts_repetition(chars: &[char]) -> bool {
+    match chars.first() {
+        Some('*' | '+' | '?') => true,
+        Some('{') => {
+            let digits = |from: usize| {
+                chars[from..]
+                    .iter()
+                    .take_while(|c| c.is_ascii_digit())
+                    .count()
+            };
+            let first = digits(1);
+            if first == 0 {
+                return false;
+            }
+            match chars.get(1 + first) {
+                Some('}') => true,
+                Some(',') => {
+                    let second = digits(2 + first);
+                    matches!(chars.get(2 + first + second), Some('}'))
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 /// The POSIX bracket starting at `chars[at]` (a `[`): the index just past its closing `:]`,
 /// whether it is negated (`[:^name:]`), and its name. `None` unless it is `[:` + an optional `^` +
 /// ASCII letters + `:]`, so a `[:` that is not a bracket costs a few characters, not a
@@ -26004,7 +26077,7 @@ fn build_regex<S: EvalSemantics>(pattern: &str, flags: Option<&str>) -> Result<J
     let mut pattern = if S::TAG == EvalTag::Yq {
         super::go_regex::translate(pattern).map_err(EvalError::new)?
     } else {
-        match translate_posix_brackets(pattern) {
+        match translate_posix_brackets(pattern, flags.is_some_and(|f| f.contains('x'))) {
             Ok(translated) => translated.into_owned(),
             Err(refusal) => {
                 deferred_refusal = Some(refusal);
