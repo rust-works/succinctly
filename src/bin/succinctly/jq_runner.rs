@@ -9067,22 +9067,35 @@ fn parse_json_stream_strict(
     text: &[u8],
     lead: usize,
 ) -> Result<Vec<OwnedValue>> {
-    // Validate the whole stream via `serde_json::Deserializer` as before
-    // (for its own error message and its rejection of anything that isn't
-    // valid, whitespace-or-self-delineated-separated JSON) -- but discard
-    // each parsed `Value` rather than converting it, and materialize the
-    // real result from the same byte span instead, via this crate's own
-    // fidelity-preserving semi-indexer (#1058's fix for `--argjson`,
-    // extended here to `--slurpfile`, #1093). `byte_offset()` gives each
-    // value's own end position after a successful `.next()`; its start is
-    // the first non-whitespace byte after the previous value's end -- JSON
-    // ASCII whitespace specifically (`is_ascii_whitespace`, matching
-    // `find_json_values`'s own convention below, not Rust's broader
-    // Unicode `char::is_whitespace`), since that's the same set
-    // `serde_json`'s own separator-skipping recognizes between stream
-    // values.
+    // Validate the whole stream via `serde_json::Deserializer` (for its own error message and its
+    // rejection of anything that isn't valid, whitespace-or-self-delineated-separated JSON) --
+    // but build nothing from it: the value is discarded, and the real result is materialized from
+    // the same byte span instead, via this crate's own fidelity-preserving semi-indexer (#1058's
+    // fix for `--argjson`, extended here to `--slurpfile`, #1093). `byte_offset()` gives each
+    // value's own end position after a successful `.next()`; its start is the first
+    // non-whitespace byte after the previous value's end -- JSON ASCII whitespace specifically
+    // (`is_ascii_whitespace`, matching `find_json_values`'s own convention below, not Rust's
+    // broader Unicode `char::is_whitespace`), since that's the same set `serde_json`'s own
+    // separator-skipping recognizes between stream values.
+    //
+    // #5608: the validation target is `IgnoredAny`, not `Value`. That is the same trade
+    // `parse_json_value` records for #1095 (`Value` was chosen there to reject a
+    // magnitude-overflowing literal, a rejection the materializer made unnecessary and jq never
+    // made), and it changes two things on this route, neither of them visible in the output
+    // (`strict_stream_route_agrees_with_the_checked_route_5608` pins both):
+    //
+    // - what the pass accepts: a number outside `f64` (`1e999`) and a lone trailing surrogate
+    //   escape, which `Value` refused and sent to the fallback below, are taken here, and
+    //   materialize to the same values the fallback built;
+    // - how deep it goes: `IgnoredAny` skips a value iteratively and has no recursion limit, so
+    //   the nesting ceiling is the materializer's own, not `serde_json`'s 128 levels.
+    //
+    // The delimiters of a span it accepts are in place by construction, so the materializer does
+    // not walk them again ([`Delimiters::SerdeValidated`]); the fallback's spans, which it has
+    // not seen, do.
     let mut values = Vec::new();
-    let mut deserializer = serde_json::Deserializer::from_str(s).into_iter::<serde_json::Value>();
+    let mut deserializer =
+        serde_json::Deserializer::from_str(s).into_iter::<serde::de::IgnoredAny>();
     let mut prev_end = 0;
     let bytes = s.as_bytes();
 
@@ -9100,14 +9113,11 @@ fn parse_json_stream_strict(
             // at exit 5. Flattening lost that, and the run exited 1 with an
             // `Error:` prefix jq never prints (#1194).
             //
-            // #2295: checked, not the bare materializer -- `serde_json`'s
-            // own `Deserializer` above already rejected anything past its
-            // default 128-deep recursion limit before this line runs, but
-            // that's the same incidental (not designed-for-this-purpose)
-            // protection #2295 found fragile elsewhere in this file --
-            // this is the primary `--slurp`/`--slurpfile` document-input
-            // path, worth the same defense-in-depth swap.
-            stream_document_checked(&bytes[start..end], origin, text, lead + start)
+            // #2295: the checked materializer, whose own nesting check is
+            // this call's guard rather than an incidental by-product of
+            // whatever validated the text -- and since #5608 it is the only
+            // one: `IgnoredAny` has no recursion limit to lean on.
+            stream_document_validated(&bytes[start..end], origin, text, lead + start)
                 .map_err(|e| anyhow::Error::from(MalformedJsonError::new(e)))?,
         );
         prev_end = end;
@@ -11609,7 +11619,9 @@ fn validate_json_delimiters<W: Clone + AsRef<[u64]>>(
 /// since #2052 validates through `validate::validate_jq_lenient` and calls
 /// this once, with no retry),
 /// `parse_json_stream_strict` (the primary `--slurp`/`--slurpfile`
-/// document-input path), and the `--seq` per-record materializer. Before
+/// document-input path; since #5608 through the materializer's own nesting
+/// check alone, with no delimiter walk -- see [`Delimiters::SerdeValidated`]),
+/// and the `--seq` per-record materializer. Before
 /// #2295 only `parse_json_stream`'s `find_json_values` fallback used this;
 /// every other caller reached a since-removed bare, panicking version
 /// directly (`crate::output::json_bytes_to_owned_value`, now dead code with
@@ -11633,6 +11645,30 @@ fn json_document_to_owned_value_checked(
     bytes: &[u8],
     at: Option<&dyn Fn() -> (usize, usize)>,
 ) -> core::result::Result<OwnedValue, EvalError> {
+    json_document_to_owned_value(bytes, at, Delimiters::Walk)
+}
+
+/// How [`json_document_to_owned_value`] establishes that the delimiters of `bytes` are in place
+/// before it builds a value.
+#[derive(Clone, Copy)]
+enum Delimiters {
+    /// Walk them through the index's cursor (and hold the walk to the nesting ceiling): the text
+    /// has not been through a parser that checked its grammar.
+    Walk,
+    /// `serde_json` has already accepted exactly this span as a whole value (#5608), so every
+    /// comma and colon is in place and a second traversal of the document could only repeat that
+    /// answer. The nesting ceiling the walk enforced is kept by the materializer's own check
+    /// ([`generic_to_owned_checked`], #2299) rather than left to `serde_json`'s recursion limit.
+    SerdeValidated,
+}
+
+/// [`json_document_to_owned_value_checked`], with how the delimiters are established chosen by
+/// the caller.
+fn json_document_to_owned_value(
+    bytes: &[u8],
+    at: Option<&dyn Fn() -> (usize, usize)>,
+    delimiters: Delimiters,
+) -> core::result::Result<OwnedValue, EvalError> {
     let index = JsonIndex::build(bytes);
     if let Some(at) = at {
         if let Some(message) =
@@ -11642,11 +11678,16 @@ fn json_document_to_owned_value_checked(
         }
     }
     let cursor = index.root(bytes);
-    validate_json_delimiters(&cursor, 0)?;
     // `bytes` is often a temporary (an `--argjson` string, a `--seq` record),
     // so each NaN gets an identity of its own rather than its address (#3309).
-    generic_to_owned::<JqSemantics, _>(&cursor.value())
-        .map(|value| value.with_fresh_nan_instances(bytes))
+    match delimiters {
+        Delimiters::Walk => {
+            validate_json_delimiters(&cursor, 0)?;
+            generic_to_owned::<JqSemantics, _>(&cursor.value())
+        }
+        Delimiters::SerdeValidated => generic_to_owned_checked::<JqSemantics, _>(&cursor.value()),
+    }
+    .map(|value| value.with_fresh_nan_instances(bytes))
 }
 
 /// [`json_document_to_owned_value_checked`] for the document `bytes` found at `text[offset]`,
@@ -11657,11 +11698,33 @@ fn stream_document_checked(
     text: &[u8],
     offset: usize,
 ) -> core::result::Result<OwnedValue, EvalError> {
+    stream_document(bytes, origin, text, offset, Delimiters::Walk)
+}
+
+/// [`stream_document_checked`] for a span `serde_json` has just accepted as a whole value
+/// ([`parse_json_stream_strict`]): see [`Delimiters::SerdeValidated`] (#5608). The splitter's
+/// fallback spans have not been through `serde_json` and keep the walk.
+fn stream_document_validated(
+    bytes: &[u8],
+    origin: Option<StreamOrigin<'_>>,
+    text: &[u8],
+    offset: usize,
+) -> core::result::Result<OwnedValue, EvalError> {
+    stream_document(bytes, origin, text, offset, Delimiters::SerdeValidated)
+}
+
+fn stream_document(
+    bytes: &[u8],
+    origin: Option<StreamOrigin<'_>>,
+    text: &[u8],
+    offset: usize,
+    delimiters: Delimiters,
+) -> core::result::Result<OwnedValue, EvalError> {
     match origin {
         Some(origin) => {
-            json_document_to_owned_value_checked(bytes, Some(&|| origin.position(text, offset)))
+            json_document_to_owned_value(bytes, Some(&|| origin.position(text, offset)), delimiters)
         }
-        None => json_document_to_owned_value_checked(bytes, None),
+        None => json_document_to_owned_value(bytes, None, delimiters),
     }
 }
 
@@ -14588,6 +14651,101 @@ mod tests {
             error.as_deref(),
             Some("Invalid numeric literal at line 1, column 13")
         );
+    }
+
+    /// #5608: the strict route validates with `serde_json` (into `IgnoredAny`, which builds
+    /// nothing) and then materializes each span without walking its delimiters again, so it
+    /// must never be the route that accepts a stream whose delimiters are wrong, and for every
+    /// stream it does accept the values are the ones the checked route (the splitter's spans,
+    /// delimiter walk included) builds -- with and without an origin for the depth message.
+    #[test]
+    fn strict_stream_route_agrees_with_the_checked_route_5608() {
+        let strict = |text: &str, origin: Option<StreamOrigin<'_>>| {
+            parse_json_stream_strict(text, origin, text.as_bytes(), 0)
+        };
+        let checked = |text: &str, origin: Option<StreamOrigin<'_>>| -> Vec<String> {
+            let bytes = text.as_bytes();
+            let (spans, error) = split_json_values(bytes);
+            assert!(error.is_none(), "{text:?}");
+            spans
+                .into_iter()
+                .map(|(start, end)| {
+                    stream_document_checked(&bytes[start..end], origin, bytes, start)
+                        .expect("the checked route accepts it")
+                        .to_json()
+                })
+                .collect()
+        };
+        let valid = [
+            "1",
+            "1 2 3",
+            "[1,2,3]",
+            "{\"a\":1} {\"b\":[2,{\"c\":null}]}",
+            "[] {} [[]] [{}] \"x\" true null",
+            "[1.50,2e2,-0.0,100000000000000000000,0.1e1]",
+            "{\"a\":{\"b\":{\"c\":[1,[2,[3]]]}}}",
+            "\"\\u00e9\\ud83d\\ude00\" \"\\n\"",
+            "[1][2]{\"a\":1}",
+            "  [ 1 , 2 ]  \n\n { \"k\" : \"v\" }  ",
+            // What `Value` turned down and `IgnoredAny` takes: a number outside `f64` and a lone
+            // trailing surrogate escape. They used to reach the splitter's fallback and now stay
+            // on the strict route; the values they build are the same either way. (A lone
+            // *leading* surrogate, `\ud800`, is still refused here and still takes the fallback.)
+            "1e999",
+            "[1e999,-1e400,1e-999]",
+            "\"\\udc00x\"",
+            "{\"a\":\"\\udc00\"} 1e999",
+            // Deep, but inside `serde_json`'s recursion limit.
+            &format!("{}{}", "[".repeat(100), "]".repeat(100)),
+        ];
+        for origin in [None, Some(StreamOrigin::ALONE)] {
+            for text in &valid {
+                let values = strict(text, origin).unwrap_or_else(|e| panic!("{text:?}: {e}"));
+                let strict_text: Vec<String> = values.iter().map(OwnedValue::to_json).collect();
+                assert_eq!(strict_text, checked(text, origin), "{text:?}");
+            }
+        }
+        // Every way a delimiter can be wrong is `serde_json`'s to refuse, so none of them reaches
+        // the materializer that no longer looks.
+        for text in [
+            "[1 2]",
+            "[1,]",
+            "[,1]",
+            "[1,,2]",
+            "{\"a\" 1}",
+            "{\"a\":1,}",
+            "{\"a\":1 \"b\":2}",
+            "{\"a\"::1}",
+            "{,}",
+            "[1}",
+            "{\"a\":1]",
+            "1 [1 2]",
+            "[1] {\"a\" 1}",
+            "[[1,2],[3 4]]",
+        ] {
+            assert!(
+                strict(text, None).is_err(),
+                "{text:?} must not take the strict route"
+            );
+        }
+        // `IgnoredAny` skips a value iteratively, so unlike `Value` it has no recursion limit and
+        // the strict route takes a document of any depth. The nesting ceiling is therefore the
+        // materializer's own check ([`Delimiters::SerdeValidated`]): a document inside the ceiling
+        // streams the same values as the checked route, and one past it is a clean error, not a
+        // panic or a stack overflow.
+        for depth in [129, 200, 255] {
+            let text = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+            let values = strict(&text, None).unwrap_or_else(|e| panic!("{depth} levels: {e}"));
+            let strict_text: Vec<String> = values.iter().map(OwnedValue::to_json).collect();
+            assert_eq!(strict_text, checked(&text, None), "{depth} levels");
+        }
+        for depth in [257, 300, 20_000] {
+            let text = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+            assert!(
+                strict(&text, None).is_err(),
+                "{depth} levels must be refused, not panic"
+            );
+        }
     }
 
     #[test]
