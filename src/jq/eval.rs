@@ -125200,7 +125200,7 @@ mod tests {
     #[cfg(feature = "regex")]
     #[test]
     fn test_regex_capture() {
-        query!(br#""foo bar""#, r#"capture("(?P<first>\\w+) (?P<second>\\w+)")"#,
+        query!(br#""foo bar""#, r#"capture("(?<first>\\w+) (?<second>\\w+)")"#,
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 assert_eq!(obj.get("first"), Some(&OwnedValue::String("foo".to_string().into())));
                 assert_eq!(obj.get("second"), Some(&OwnedValue::String("bar".to_string().into())));
@@ -125721,7 +125721,7 @@ mod tests {
             }
         );
 
-        query!(br#""foo bar""#, r#"capture("(?P<first>\\w+) (?P<second>\\w+)"; null)"#,
+        query!(br#""foo bar""#, r#"capture("(?<first>\\w+) (?<second>\\w+)"; null)"#,
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 assert_eq!(obj.get("first"), Some(&OwnedValue::String("foo".to_string().into())));
             }
