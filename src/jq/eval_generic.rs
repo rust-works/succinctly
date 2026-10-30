@@ -40785,21 +40785,6 @@ mod tests {
                 let mut json = b"[".to_vec();
                 json.extend_from_slice(&element);
                 json.push(b']');
-                // The CLI's document splitter refuses an unterminated string before any walk; the
-                // library-level walks (the whole conversion's included) are not meant to see one.
-                let (mut in_string, mut escaped) = (false, false);
-                for &byte in &json {
-                    match (in_string, escaped, byte) {
-                        (true, true, _) => escaped = false,
-                        (true, false, b'\\') => escaped = true,
-                        (true, false, b'"') => in_string = false,
-                        (false, _, b'"') => in_string = true,
-                        _ => {}
-                    }
-                }
-                if in_string {
-                    continue;
-                }
                 let index = JsonIndex::build(&json);
                 let (Some(projected), Some(whole)) = (
                     owned(index.root(&json).value(), Some(&names)),
@@ -40837,6 +40822,17 @@ mod tests {
             }
         }
         assert!(checked > 500, "the sweep reached {checked} documents");
+    }
+
+    /// #5541: converting an element of a document with an unterminated string no longer panics
+    /// (the CLI's splitter refuses such a document; the library API does not).
+    #[test]
+    fn an_unterminated_string_is_not_a_panic_in_to_owned_cursor_5541() {
+        let json = br#"[{"a":1,"b":"x","c":[1,{"d":"2}]}]"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json).value();
+        let (element, _) = root.as_array().unwrap().uncons_cursor().unwrap();
+        let _ = to_owned_cursor::<JqSemantics, _>(&element);
     }
 
     /// #5519: a fold's loop element is converted to the members the fold reads and nothing else.

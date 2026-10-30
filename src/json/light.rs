@@ -2144,7 +2144,10 @@ impl<'a> JsonString<'a> {
     }
 
     fn find_end(&self) -> usize {
-        self.find_string_end() + 1 // Include closing quote
+        // Include the closing quote. A string that never closes (a document the CLI's splitter
+        // refuses, but `JsonIndex::build` accepts) runs to the end of the text: the span stops
+        // there instead of one past it (#5541).
+        (self.find_string_end() + 1).min(self.text.len())
     }
 
     fn find_string_end(&self) -> usize {
@@ -10874,5 +10877,40 @@ mod tests {
             rank_ptr,
             "the rank buffer is reused"
         );
+    }
+
+    /// #5541: a string that never closes spans to the end of the text, not one byte past it. The
+    /// CLI's splitter refuses such a document, but `JsonIndex::build` accepts it, and
+    /// `raw_bytes`/`end` slice with this span (`scalar_end_pos` reached it from
+    /// `to_owned_cursor` and panicked: `range end index 35 out of range for slice of length 34`).
+    #[test]
+    fn an_unterminated_string_spans_to_the_end_of_the_text_5541() {
+        for json in [
+            &br#"[{"d":"2}]"#[..],
+            br#"["abc"#,
+            // A trailing backslash skips past the end.
+            br#"["abc\"#,
+            br"[",
+        ] {
+            let index = JsonIndex::build(json);
+            let root = index.root(json);
+            let mut reached_the_end = false;
+            let mut stack = vec![root];
+            while let Some(cursor) = stack.pop() {
+                if let StandardJson::String(s) = cursor.value() {
+                    assert!(s.end() <= json.len(), "{}", String::from_utf8_lossy(json));
+                    assert_eq!(s.raw_bytes(), &json[s.start()..s.end()]);
+                    let _ = s.raw_and_escaped();
+                    reached_the_end |= s.end() == json.len();
+                }
+                stack.extend(cursor.first_child());
+                stack.extend(cursor.next_sibling());
+            }
+            assert!(
+                reached_the_end || json == b"[",
+                "{}",
+                String::from_utf8_lossy(json)
+            );
+        }
     }
 }
