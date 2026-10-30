@@ -7398,7 +7398,7 @@ Every other pattern keeps the `regex` crate, its speed and its output, and yq mo
   The two differ whenever a later start has a longer match: `"abaa" | match("a|aa|aaa";"l")` is `"aa"` at offset 2 in jq, and the same here.
   Among equally long matches the earliest wins, and `g` resumes after the chosen match, as in jq.
   Like Oniguruma's, one search reads the rest of the text, unless the pattern has a bounded length (`a|ab`), where the search stops at the first match of that length.
-With `g`, one pass over the starts serves every search of the text, so the loop is linear in the matches ([#5563](https://github.com/rust-works/succinctly/issues/5563)); a pattern with `\G` keeps one search per match, and is quadratic in them.
+  With `g`, one pass over the starts serves every search of the text, so the loop is linear in the matches ([#5563](https://github.com/rust-works/succinctly/issues/5563)); a pattern with `\G` keeps one search per match, and is quadratic in them.
   An unbounded pattern (`a+`) over a long text with many matches is slow in both tools, and slower here.
 - **`l` stays a no-op on a pattern with a lazy quantifier.**
   `fancy-regex`'s longest mode returns the lazy match where Oniguruma returns the longest of all the ways to match: `"aa" | match("a*?";"l")` is `"aa"` in jq and `""` here.
