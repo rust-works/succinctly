@@ -45,7 +45,11 @@ pub fn fingerprint(r: &Value) -> Fingerprint {
             put(section, s(x, "id").into(), s(x, "status").into());
         }
     }
-    for (section, key) in [("cli", "cli"), ("extensions", "extensions")] {
+    for (section, key) in [
+        ("syntax", "syntax"),
+        ("cli", "cli"),
+        ("extensions", "extensions"),
+    ] {
         for x in rows(r, &[key]) {
             put(section, s(x, "id").into(), s(x, "verdict").into());
         }
@@ -147,6 +151,7 @@ mod tests {
         json!({
             "features": {"rows": [{"id": "length/0", "status": "match", "note": "/Users/x/path"}]},
             "cli": [{"id": "compact", "verdict": "match"}],
+            "syntax": [{"id": "op-add", "area": "operators", "verdict": "match"}],
             "differential": [{"rows": [{"id": "jq.test:3", "matches": true}]}],
             "robust": [{"id": "r", "matches": true, "reference": "ok", "subject": "ok",
                         "reference_exit": 0, "subject_exit": 0, "reference_ms": 1.0, "subject_ms": 2.0}],
@@ -178,6 +183,12 @@ mod tests {
         changed["cli"][0]["verdict"] = json!("differs");
         let d = diff(&a, &fingerprint(&changed));
         assert_eq!(d, ["cli:compact was `match`, now `differs`"]);
+        let mut syntax = sample();
+        syntax["syntax"][0]["verdict"] = json!("differs");
+        assert_eq!(
+            diff(&a, &fingerprint(&syntax)),
+            ["syntax:op-add was `match`, now `differs`"]
+        );
         let mut dropped = sample();
         dropped["differential"][0]["rows"] = json!([]);
         assert_eq!(

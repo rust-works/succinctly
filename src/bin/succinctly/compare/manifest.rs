@@ -31,6 +31,8 @@ pub struct Queries {
 pub struct Probes {
     pub cli: String,
     pub extensions: String,
+    /// A: syntax forms and the manual's sections, in the CLI probe format.
+    pub syntax: String,
     pub fixtures: String,
     pub divergences: String,
     pub robust: String,
@@ -139,7 +141,7 @@ mod tests {
     fn two_primaries_are_rejected() {
         let text = "schema_version = 1\n\
             [succinctly]\nprofile='release'\nfeatures=''\n[queries]\nsmoke='x'\n\
-            [probes]\ncli='x'\nextensions='x'\nfixtures='x'\ndivergences='x'\nrobust='x'\n[json_suite]\nid='j'\npath='p'\nsha256='s'\n[perf]\nqueries='q'\n\
+            [probes]\ncli='x'\nextensions='x'\nsyntax='x'\nfixtures='x'\ndivergences='x'\nrobust='x'\n[json_suite]\nid='j'\npath='p'\nsha256='s'\n[perf]\nqueries='q'\n\
             [[reference]]\nid='a'\nversion='1'\nrole='primary'\nsource_url=''\nsource_sha256=''\n\
             [[reference]]\nid='b'\nversion='2'\nrole='primary'\nsource_url=''\nsource_sha256=''\n";
         assert!(Manifest::parse(text).is_err());

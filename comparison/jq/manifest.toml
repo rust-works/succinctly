@@ -34,11 +34,13 @@ manifest = "tests/data/bench-corpus/manifest.json"
 [queries]
 smoke = "comparison/jq/queries/smoke.tsv"
 
-# Dimension A (builtins) derives its probes from the reference's own `builtins`;
-# these are the data for G (CLI) and the succinctly-only surface.
+# Dimension A (builtins) derives its probes from the reference's own `builtins`; `syntax` adds
+# the language's forms (operators, destructuring, reduce/foreach/label, modules, formats).
+# The rest are the data for G (CLI) and the succinctly-only surface.
 [probes]
 cli = "comparison/jq/probes/cli.tsv"
 extensions = "comparison/jq/probes/extensions.tsv"
+syntax = "comparison/jq/probes/syntax.tsv"
 fixtures = "comparison/jq/fixtures"
 divergences = "comparison/jq/divergences.toml"
 robust = "comparison/jq/probes/robust.tsv"

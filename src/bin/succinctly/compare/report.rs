@@ -84,6 +84,18 @@ pub fn render(results: &Results) -> String {
             );
         }
     }
+    if !r.syntax.is_empty() {
+        let ok = r
+            .syntax
+            .iter()
+            .filter(|x| x.verdict == cli::Verdict::Match)
+            .count();
+        let _ = writeln!(
+            s,
+            "| Syntax-form probes agreeing | {ok}/{} |",
+            r.syntax.len()
+        );
+    }
     if !r.cli.is_empty() {
         let ok = r
             .cli
@@ -259,6 +271,7 @@ pub fn render(results: &Results) -> String {
     }
 
     features_sections(&mut s, r);
+    syntax_section(&mut s, r);
     cli_sections(&mut s, r);
     differential_section(&mut s, r);
     input_section(&mut s, r);
@@ -343,6 +356,55 @@ fn features_sections(s: &mut String, r: &Results) {
             let _ = writeln!(s, "Not run: {why}.");
         }
         (None, None) => {}
+    }
+}
+
+/// A, the language's forms: the same stdout-and-exit comparison as G, grouped by area.
+fn syntax_section(s: &mut String, r: &Results) {
+    if r.syntax.is_empty() {
+        return;
+    }
+    let _ = writeln!(s, "\n### A. Syntax forms\n");
+    let _ = writeln!(
+        s,
+        "Operators, paths and slices, construction, control flow, destructuring (`?//` included), functions, \
+         string and format forms, assignment and modules, each run on a fixed document. Stdout and exit \
+         status must be identical; error wording is not compared.\n"
+    );
+    let _ = writeln!(s, "| Area | Probes | Agree |");
+    let _ = writeln!(s, "|------|--------|-------|");
+    let mut areas: Vec<&str> = r.syntax.iter().map(|x| x.area.as_str()).collect();
+    areas.sort_unstable();
+    areas.dedup();
+    for a in areas {
+        let all = r.syntax.iter().filter(|x| x.area == a).count();
+        let ok = r
+            .syntax
+            .iter()
+            .filter(|x| x.area == a && x.verdict == cli::Verdict::Match)
+            .count();
+        let _ = writeln!(s, "| {a} | {all} | {ok} |");
+    }
+    let mut differing = r
+        .syntax
+        .iter()
+        .filter(|x| x.verdict == cli::Verdict::Differs)
+        .peekable();
+    if differing.peek().is_none() {
+        return;
+    }
+    let _ = writeln!(s, "\n| Probe | jq exit | succinctly exit | Ledger |");
+    let _ = writeln!(s, "|-------|---------|-----------------|--------|");
+    let ex = |c: Option<i32>| c.map_or_else(|| "signal".into(), |c| c.to_string());
+    for x in differing {
+        let _ = writeln!(
+            s,
+            "| `{}` | {} | {} | {} |",
+            x.id,
+            ex(x.reference_exit),
+            ex(x.subject_exit),
+            note_for(r, &format!("syntax:{}", x.id))
+        );
     }
 }
 
