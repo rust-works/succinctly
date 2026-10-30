@@ -92,6 +92,30 @@ const ROWS: &[(Option<&str>, &str, &str)] = &[
         r#""Cannot index string with number""#,
     ),
     (Some(r#"{"a":1}"#), r"del(.a.b)?", r""),
+    (None, r"[nan] | del(.[1]) | .[0] == .[0]", r"false"),
+    (None, r#"{"a":[nan],"b":1} | del(.b) | .a == .a"#, r"true"),
+    (
+        None,
+        r#"{"a":[nan],"b":1} | del(.b) | .a[0] == .a[0]"#,
+        r"false",
+    ),
+    (None, r"[[nan],1] | del(.[1]) | .[0] == .[0]", r"true"),
+    (
+        None,
+        r"[[nan],1] | del(.[1]) | (.[0] | .[0]) == (.[0] | .[0])",
+        r"false",
+    ),
+    (
+        None,
+        r#"{"a":{"b":[nan]},"c":1} | del(.c) | [.a.b] == [.a.b]"#,
+        r"true",
+    ),
+    (None, r"[nan] | [., .] | del(.[2]) | .[0] == .[1]", r"true"),
+    (
+        None,
+        r"[nan] as $a | {y:$a,z:1} | del(.z) | .y == $a",
+        r"true",
+    ),
     (
         None,
         r#"[nan, infinite, -infinite, 1.0, 1e1000, -0, "é\u0001\u007f😀", [], {}, null, true] | tojson"#,

@@ -12408,13 +12408,23 @@ pub(crate) fn try_eval_owned_step<S: EvalSemantics>(expr: &Expr, state: OwnedVal
 /// A decline hands the state back untouched; an error is the one `del` raises, with its text,
 /// since the state it consumed cannot be handed back.
 pub(crate) fn owned_del_step<S: EvalSemantics>(expr: &Expr, state: OwnedValue) -> OwnedStep {
-    let Some(path) = owned_del_target::<S>(expr) else {
-        return OwnedStep::Declined(state);
-    };
+    match owned_del_target::<S>(expr) {
+        Some(path) => OwnedStep::Handled(owned_del_run::<S>(path, state)),
+        None => OwnedStep::Declined(state),
+    }
+}
+
+/// The delete [`owned_del_step`] makes, for a `path` [`owned_del_target`] has already accepted:
+/// a caller that asked for the target first (to copy a borrowed state only when it will be
+/// used) runs it here and does not ask again.
+fn owned_del_run<S: EvalSemantics>(
+    path: &Expr,
+    state: OwnedValue,
+) -> Result<OwnedValue, EvalError> {
     match del_on_owned::<Vec<u64>, S>(path, state, false) {
-        QueryResult::Owned(value) => OwnedStep::Handled(Ok(value)),
-        QueryResult::Error(error) => OwnedStep::Handled(Err(error)),
-        _ => OwnedStep::Handled(Err(unreachable_owned_del_outcome())), // patchcov: coverage tolerate-line reason="unreachable: a static jq-mode path resolves to paths or an error, never to no output, a break or a halt (#5549)"
+        QueryResult::Owned(value) => Ok(value),
+        QueryResult::Error(error) => Err(error),
+        _ => Err(unreachable_owned_del_outcome()), // patchcov: coverage tolerate-line reason="unreachable: a static jq-mode path resolves to paths or an error, never to no output, a break or a halt (#5549)"
     }
 }
 
@@ -79564,14 +79574,12 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
     // #5549: see `eval_generic::eval_on_owned_over`. The state is copied only for a `del` the
     // step can answer, and the copy shares `input`'s storage until the delete writes.
-    if owned_del_target::<S>(expr).is_some() {
-        if let OwnedStep::Handled(answer) = owned_del_step::<S>(expr, input.clone()) {
-            return match answer {
-                Ok(value) => QueryResult::Owned(value),
-                Err(_) if optional => QueryResult::None,
-                Err(error) => QueryResult::Error(error),
-            };
-        }
+    if let Some(path) = owned_del_target::<S>(expr) {
+        return match owned_del_run::<S>(path, input.clone()) {
+            Ok(value) => QueryResult::Owned(value),
+            Err(_) if optional => QueryResult::None,
+            Err(error) => QueryResult::Error(error),
+        };
     }
     // After the fast path on purpose: it never reaches a resolver, and
     // demoting rebuilds `expr` whenever it holds a marker at all.
@@ -113509,7 +113517,34 @@ mod tests {
                     }
                 };
                 handled += 1;
-                assert_eq!((bridge, ended), step, "{src:?} on {value:?}");
+                assert_eq!(
+                    (bridge.clone(), ended.clone()),
+                    step,
+                    "{src:?} on {value:?}"
+                );
+                // `eval_owned_input`, which asks for the target and copies its borrowed state,
+                // answers the same, and an `optional` stage swallows the error.
+                for optional in [false, true] {
+                    let (via_input, input_ended) =
+                        normalize(eval_owned_input::<Vec<u64>, JqSemantics>(
+                            &expr,
+                            value,
+                            optional,
+                            Reentry::Proven,
+                        ));
+                    let via_input: Vec<String> =
+                        via_input.iter().map(OwnedValue::to_json).collect();
+                    let expected = if optional && ended.starts_with("error:") {
+                        (vec![], "ok".to_string())
+                    } else {
+                        (bridge.clone(), ended.clone())
+                    };
+                    assert_eq!(
+                        (via_input, input_ended),
+                        expected,
+                        "optional {optional}: {src:?} on {value:?}"
+                    );
+                }
             }
             for src in declined {
                 let expr = parse(src).unwrap();
