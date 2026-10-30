@@ -45,3 +45,5 @@ core, and licence / `no_std` / CI-runner facts read from the repository; build t
 
 `--write-docs` writes `docs/compare/jq-<platform>.{md,json}` and the index `docs/compare/jq.md`. CI is
 `.github/workflows/compare-jq.yml`, run by hand or on a release, not on pull requests.
+`.github/workflows/compare-jq-ledger.yml` runs the correctness dimensions (no timing rows) on pull requests that touch
+`comparison/jq/`, `src/jq/` or the harness, and weekly, and fails on an unlisted or stale ledger entry (#5565).

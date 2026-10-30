@@ -1,0 +1,120 @@
+name: Compare jq ledger
+
+# Fails on a stale or unlisted entry in comparison/jq/divergences.toml (#5565).
+#
+# `succinctly dev compare jq` already exits 1 when a probe differs from the pinned jq and
+# the ledger does not list it, or when a listed entry no longer differs. Nothing ran it on a
+# pull request, so five entries went stale after #5471/#5500-#5502/#5547 unnoticed until a
+# manual run (#5552). This runs the dimensions that feed the ledger, `--quick`, and none of
+# the ones that do not: performance is timing on shared runners (noisy, and it has no ledger
+# ids beyond an output mismatch the smoke suite already catches) and the operational
+# dimension reads facts, not behaviour. compare-jq.yml stays the full report, by hand or on a
+# release.
+#
+# x86_64 Linux only: the ledger's `platform` field is per OS, so an ARM leg would add cost
+# and no different expectation. Not a required check (a branch-protection change, not a
+# workflow one). The weekly run catches drift that no path below would trigger.
+#
+# `src/**` and not just src/jq: the JSON index, the bit and tree layers and the CLI all
+# decide what a probe prints. The `push` trigger on `main` runs the same paths after a merge
+# and is what seeds the jq cache below.
+#
+# The --dimension list in the Compare step names the dimensions whose probes feed the ledger
+# (see `run_suites` in src/bin/succinctly/compare/mod.rs); a new ledger-fed dimension has to
+# be added there too.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'comparison/jq/**'
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/compare-jq-build.sh'
+      - '.github/workflows/compare-jq-ledger.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'comparison/jq/**'
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/compare-jq-build.sh'
+      - '.github/workflows/compare-jq-ledger.yml'
+  schedule:
+    - cron: '41 5 * * 1'      # weekly, Monday 05:41 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compare-jq-ledger-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ledger:
+    name: Ledger drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Restore-only except on `main` (#3649): a PR-scoped cache can only be read by that
+      # one ref. A push, the weekly run or a manual run on `main` writes it, so the first PR
+      # after the manifest or the build script changes builds the two jqs itself.
+      - name: Restore the pinned jq builds
+        id: jq-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            target/compare/jq-1.7.1
+            target/compare/jq-1.8.1
+          key: compare-jq-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('comparison/jq/manifest.toml', 'scripts/compare-jq-build.sh') }}
+
+      - name: Build the pinned references
+        if: steps.jq-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+          scripts/compare-jq-build.sh 1.7.1
+          scripts/compare-jq-build.sh 1.8.1
+
+      - name: Save the pinned jq builds
+        if: steps.jq-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            target/compare/jq-1.7.1
+            target/compare/jq-1.8.1
+          key: ${{ steps.jq-cache.outputs.cache-primary-key }}
+
+      - name: Build succinctly (the manifest's feature set)
+        run: cargo build --release --features cli,simd,regex,serde,bench-runner
+
+      - name: Compare
+        run: |
+          set -o pipefail
+          mkdir -p data/compare/ledger
+          ./target/release/succinctly dev compare jq --quick \
+            --dimension smoke --dimension features --dimension cli \
+            --dimension differential --dimension input --dimension robustness \
+            --out data/compare/ledger 2>&1 | tee data/compare/ledger/compare.log
+
+      - name: Summarize the drift
+        if: always()
+        run: |
+          {
+            echo '### Divergence ledger'
+            echo '```'
+            grep -hE 'divergence\(s\)|no longer diverging' data/compare/ledger/compare.log || echo 'no drift reported'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the report
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: compare-jq-ledger
+          path: data/compare/ledger

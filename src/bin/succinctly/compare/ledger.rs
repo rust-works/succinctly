@@ -30,6 +30,12 @@ pub struct Entry {
     /// `std::env::consts::OS` this entry was observed on (`macos`, `linux`); an
     /// entry for another OS is neither expected nor called stale here.
     pub platform: Option<String>,
+    /// Whether the difference shows depends on the host's speed (a reference that
+    /// finishes a probe inside the deadline on a fast machine and not on a slow one):
+    /// the entry is expected wherever the difference shows, but is not called stale
+    /// where it does not.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub volatile: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -96,6 +102,11 @@ pub fn check<S: AsRef<str>>(
         .map(|e| e.id.as_str())
         .filter(|id| in_run(id))
         .collect();
+    let volatile: BTreeSet<&str> = entries
+        .iter()
+        .filter(|e| e.volatile)
+        .map(|e| e.id.as_str())
+        .collect();
     Outcome {
         unlisted: observed
             .iter()
@@ -104,7 +115,7 @@ pub fn check<S: AsRef<str>>(
             .collect(),
         stale: listed
             .iter()
-            .filter(|id| !observed.contains(**id))
+            .filter(|id| !observed.contains(**id) && !volatile.contains(**id))
             .map(|s| (*s).to_string())
             .collect(),
     }
@@ -121,6 +132,7 @@ mod tests {
             reason: "r".into(),
             issue: None,
             platform: None,
+            volatile: false,
         }
     }
 
@@ -148,6 +160,16 @@ mod tests {
         assert!(check(&[other.clone(), here.clone()], &set(&["cli:b"]), &["cli"]).is_clean());
         let o = check(&[here], &set(&[]), &["cli"]);
         assert_eq!(o.stale, ["cli:b"]);
+    }
+
+    #[test]
+    fn a_volatile_entry_is_expected_but_not_stale_when_absent() {
+        let mut v = entry("robust:slow");
+        v.volatile = true;
+        assert!(check(&[v.clone()], &set(&[]), &["robust"]).is_clean());
+        assert!(check(&[v.clone()], &set(&["robust:slow"]), &["robust"]).is_clean());
+        let o = check(&[v], &set(&["robust:other"]), &["robust"]);
+        assert_eq!((o.unlisted, o.stale), (vec!["robust:other".into()], vec![]));
     }
 
     #[test]

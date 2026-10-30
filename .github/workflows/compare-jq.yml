@@ -6,6 +6,7 @@ name: Compare jq
 # pull requests: shared runners are too noisy for the timing rows, and the divergence
 # ledger is recorded on macOS, so entries that only hold there are tagged `platform`
 # and a first Linux run may list further ones. Run it by hand, or on a release.
+# compare-jq-ledger.yml is the pull-request check for ledger drift alone (#5565).
 on:
   workflow_dispatch:
   release:
