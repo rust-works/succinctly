@@ -26355,9 +26355,92 @@ fn refuse_possessive_quantifier(
     Ok(std::borrow::Cow::Borrowed(pattern))
 }
 
-/// Build regex flags from jq flag string
+/// How many compiled patterns [`build_regex`] keeps (#5531).
 #[cfg(feature = "regex")]
-fn build_regex<S: EvalSemantics>(pattern: &str, flags: Option<&str>) -> Result<JqRegex, EvalError> {
+const REGEX_CACHE_SLOTS: usize = 16;
+
+/// The longest pattern [`build_regex`] caches, in bytes. A pattern a program computes per input
+/// can be any size, and a compiled one is far larger than its text, so a long one is built each
+/// time rather than kept (#5531).
+#[cfg(feature = "regex")]
+const REGEX_CACHE_MAX_PATTERN: usize = 1024;
+
+#[cfg(feature = "regex")]
+struct CachedRegex {
+    yq: bool,
+    pattern: String,
+    flags: Option<String>,
+    compiled: Result<std::rc::Rc<JqRegex>, EvalError>,
+}
+
+#[cfg(feature = "regex")]
+#[derive(Default)]
+struct RegexCache {
+    slots: Vec<CachedRegex>,
+    /// The slot the next miss overwrites once `slots` is full (oldest first).
+    next: usize,
+}
+
+#[cfg(feature = "regex")]
+thread_local! {
+    static REGEX_CACHE: core::cell::RefCell<RegexCache> = core::cell::RefCell::new(RegexCache::default());
+}
+
+/// Build regex flags from jq flag string, once per distinct `(mode, pattern, flags)` (#5531).
+///
+/// Every regex builtin compiled its pattern again for every input value, and
+/// `regex::Regex::new` dominates a short-string match (a Unicode class pattern over 20,000
+/// strings was 20x a literal one). A program's pattern is usually the same for every input, so the
+/// last [`REGEX_CACHE_SLOTS`] results are kept per thread, errors included so a refused pattern is
+/// not translated and compiled again for each input. The compiled value is shared (`Rc`), not
+/// cloned: a `regex::Regex` clone starts with an empty scratch-space pool. A pattern a program
+/// computes per input misses every time and pays one key copy and a short scan on top of the
+/// compile it always paid; a pattern over [`REGEX_CACHE_MAX_PATTERN`] bytes skips the cache.
+#[cfg(feature = "regex")]
+fn build_regex<S: EvalSemantics>(
+    pattern: &str,
+    flags: Option<&str>,
+) -> Result<std::rc::Rc<JqRegex>, EvalError> {
+    let yq = S::TAG == EvalTag::Yq;
+    if pattern.len() > REGEX_CACHE_MAX_PATTERN {
+        return build_regex_uncached::<S>(pattern, flags).map(std::rc::Rc::new);
+    }
+    let hit = REGEX_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .slots
+            .iter()
+            .find(|slot| slot.yq == yq && slot.flags.as_deref() == flags && slot.pattern == pattern)
+            .map(|slot| slot.compiled.clone())
+    });
+    if let Some(compiled) = hit {
+        return compiled;
+    }
+    let compiled = build_regex_uncached::<S>(pattern, flags).map(std::rc::Rc::new);
+    REGEX_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let entry = CachedRegex {
+            yq,
+            pattern: pattern.to_string(),
+            flags: flags.map(str::to_string),
+            compiled: compiled.clone(),
+        };
+        if cache.slots.len() < REGEX_CACHE_SLOTS {
+            cache.slots.push(entry);
+        } else {
+            let at = cache.next;
+            cache.slots[at] = entry;
+            cache.next = (at + 1) % REGEX_CACHE_SLOTS;
+        }
+    });
+    compiled
+}
+
+#[cfg(feature = "regex")]
+fn build_regex_uncached<S: EvalSemantics>(
+    pattern: &str,
+    flags: Option<&str>,
+) -> Result<JqRegex, EvalError> {
     // #5367: jq's classes are Oniguruma's, Unicode-aware, and rewritten here. yq's are Go's
     // `regexp`, a different syntax from the crate's throughout (#5374, #5388), so its pattern is
     // read and re-written whole.
