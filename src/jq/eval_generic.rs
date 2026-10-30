@@ -50081,6 +50081,52 @@ mod tests {
         );
     }
 
+    /// #5541: `JsonIndex::build` accepts a document whose last string never
+    /// closes, and `to_owned_cursor` on an element used to slice the text past
+    /// its end (`scalar_end_pos` added the string's raw length to a start
+    /// position that already ran to end-of-text). The CLI never reaches it --
+    /// its document splitter rejects the file first -- so this is a
+    /// library-API-only panic. It must come back as a decode failure instead.
+    #[test]
+    fn to_owned_cursor_unterminated_string_is_error_not_panic_5541() {
+        let json = br#"[{"a":1,"b":"x","c":[1,{"d":"2}]}]"#; // the string "2}]}] never closes
+        let index = JsonIndex::build(json);
+        let root = index.root(json).value();
+        let (element, _) = root.as_array().unwrap().uncons_cursor().unwrap();
+        let err = to_owned_cursor::<JqSemantics, _>(&element)
+            .expect_err("an unterminated string is a malformed document");
+        assert!(
+            err.is_decode_failure(),
+            "expected decode failure, got: {err:?}"
+        );
+    }
+
+    /// #5541: every prefix of a document is a malformed one that
+    /// `JsonIndex::build` still accepts, so `to_owned_cursor` on the root and
+    /// on each element must answer `Ok` or `Err` for all of them -- the
+    /// unterminated-string panic was one cut point of this family, and the
+    /// sweep covers the sibling position helpers (numbers, literals, nested
+    /// containers) the same way.
+    #[test]
+    fn to_owned_cursor_never_panics_on_a_truncated_document_5541() {
+        let full: &[u8] =
+            br#"[{"a":1,"b":"x\"y","c":[1.5e3,{"d":"2"}],"e":null,"f":true},"tail",-0]"#;
+        for len in 0..=full.len() {
+            let json = &full[..len];
+            let index = JsonIndex::build(json);
+            let root = index.root(json);
+            let _ = to_owned_cursor::<JqSemantics, _>(&root);
+            let mut elements = match root.value().as_array() {
+                Some(elements) => elements,
+                None => continue,
+            };
+            while let Some((element, rest)) = elements.uncons_cursor() {
+                let _ = to_owned_cursor::<JqSemantics, _>(&element);
+                elements = rest;
+            }
+        }
+    }
+
     /// #1017: `owned_from_standard_json` is a third, independent copy of the
     /// cursor-to-`OwnedValue` conversion `to_owned`/`to_owned_cursor` are
     /// already guarded above (#998) -- same limit, same construction, its
