@@ -126568,6 +126568,12 @@ mod tests {
                 r#"[match(" $") | [.offset, .length]]"#,
                 "[[1,1]]",
             ),
+            // The full text's match starts first (it needs the final `\n`): no tie.
+            (
+                br#""ab\n""#,
+                r#"[match("a.\\n|b$") | [.offset, .length]]"#,
+                "[[0,3]]",
+            ),
             // A group that differs between the views is a tie too, and its captures come from
             // the exact engine.
             (
@@ -126642,11 +126648,29 @@ mod tests {
                 r#"[match("(?:a*?|b$\\z)"; "gn") | [.offset, .string]]"#,
                 r#"[[1,"a"],[2,"a"],[3,"b"]]"#,
             ),
+            // `\z` with a group `fancy-regex` cannot parse: the `regex` route's two views answer.
+            (br#""a\n""#, r#"[match("(?:)+a$|b\\z") | .length]"#, "[1]"),
             // An escaped backslash followed by `z` is not the escape `\z`.
             (br#""a\\z""#, r#"[match("a\\\\z$").string]"#, r#"["a\\z"]"#),
         ] {
             assert_eq!(outputs(json, filter), [expected], "{filter}");
         }
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_dollar_tie_keeps_the_trimmed_match_when_the_exact_engine_does_not_answer_5572() {
+        // The exact engine is asked for the match at the tie's start. If it has none there (or
+        // gives up on its budget), the trimmed text's match stands.
+        let re = regex::Regex::new(r"\s+$").unwrap();
+        let exact = ExactEnd::new(r"\s+$");
+        exact
+            .engine
+            .set(Some(fancy_regex::Regex::new("zzz").unwrap()))
+            .unwrap();
+        let caps = dv_captures_at(&re, "abc \n", 0, true, Some(&exact)).unwrap();
+        let m = caps.get(0).unwrap();
+        assert_eq!((m.start(), m.len()), (3, 1));
     }
 
     #[cfg(feature = "regex")]
