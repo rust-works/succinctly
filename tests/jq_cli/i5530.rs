@@ -46,7 +46,7 @@ fn test_l_flag_takes_the_longest_match_anywhere_5530() -> Result<()> {
         ),
         (
             r#""xyz" | [match("x*"; "gl") | [.offset, .length]]"#,
-            r#"[[0,1],[1,0],[2,0],[3,0]]"#,
+            "[[0,1],[1,0],[2,0],[3,0]]",
         ),
         (
             r#""abcabcab" | [match("abc|ab|c"; "gl") | .string]"#,
@@ -65,7 +65,7 @@ fn test_l_flag_takes_the_longest_match_anywhere_5530() -> Result<()> {
             r#""1a22b333" | [splits("[0-9]|[0-9]{2}"; "gl")]"#,
             r#"["1a","b","",""]"#,
         ),
-        (r#""abc" | test("a|ab"; "l")"#, r#"true"#),
+        (r#""abc" | test("a|ab"; "l")"#, "true"),
         (r#""aaa" | [scan("(a|aa)(a|aa)?"; "l")]"#, r#"[["a","aa"]]"#),
         (
             r#""abab" | [match("(ab|a)(ba|b)*"; "l") | [.string, (.captures | map(.string))]]"#,
@@ -93,7 +93,7 @@ fn test_n_flag_backtracks_to_a_non_empty_match_5530() -> Result<()> {
     assert_rows(&[
         (
             r#""xaab" | [match("a*?"; "gn") | [.offset, .length]]"#,
-            r#"[[1,1],[2,1]]"#,
+            "[[1,1],[2,1]]",
         ),
         (
             r#""abcabc" | [match("(?:|abc)"; "gn") | [.offset, .string]]"#,
@@ -105,14 +105,14 @@ fn test_n_flag_backtracks_to_a_non_empty_match_5530() -> Result<()> {
             r#"["a","a","a"]"#,
         ),
         (r#""xaab" | gsub("(?:|a)"; "-"; "gn")"#, r#""x--b""#),
-        (r#""abc" | [match("^"; "n")]"#, r#"[]"#),
-        (r#""abc" | [match("\\b"; "gn")]"#, r#"[]"#),
+        (r#""abc" | [match("^"; "n")]"#, "[]"),
+        (r#""abc" | [match("\\b"; "gn")]"#, "[]"),
         (
             r#""aa" | [match("(a)\\1??"; "gn") | .string]"#,
             r#"["a","a"]"#,
         ),
         (r#""ab" | [match("(a|)(b|)"; "n") | .string]"#, r#"["ab"]"#),
-        (r#""xaab" | test("a*?"; "n")"#, r#"true"#),
+        (r#""xaab" | test("a*?"; "n")"#, "true"),
         (
             r#""aaa" | [match("a??"; "gn") | .string]"#,
             r#"["a","a","a"]"#,

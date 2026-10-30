@@ -7408,9 +7408,12 @@ Every other pattern keeps the `regex` crate, its speed and its output, and yq mo
   `fancy-regex` mishandles `(?:)+?` and `(?:){1,2}` in both of its modes: `"a" | match("(?:)+?|a";"n")` is no match where jq has `"a"`, and `"ba" | match("(?:){1,2}a?||";"l")` stops at the empty match where jq has `"a"` at offset 1.
   A pattern containing one is not routed to it, so it behaves as before #5530.
   Nobody writes this (the group matches nothing and the repeat repeats nothing), and `()` is not affected.
-- **The captures of a group that iterates over the empty string differ on the `regex` route.**
-  Oniguruma ends `(a*)*` on an extra empty iteration and reports it (`"a" | match("(a*)*")` has `[1,0,""]` for group 1), where the `regex` crate reports the last non-empty one (`[0,1,"a"]`).
-  This is not specific to `l` and `n`, which only move a pattern to the other route: `fancy-regex` reports the empty iteration as jq does, so `"a" | match("(a*)*";"n")` now agrees.
+- **A group that iterates over the empty string is read differently, with or without a flag.**
+  Oniguruma stops a loop after an iteration that matched nothing and keeps that iteration: `"a" | match("(a*)*")` has `[1,0,""]` for group 1, and `"bcba" | match("b(c|(|.))*")` is `"bc"`.
+  The `regex` crate keeps the last non-empty iteration (`[0,1,"a"]`) and `"bcba"`.
+  `fancy-regex` reports the empty iteration as jq does for the captures, so `"a" | match("(a*)*";"n")` now agrees, but it backtracks out of an empty iteration to a longer match, so `"bcba" | match("b(c|(|.))*";"n")` is still `"bcba"`.
+  A repeated group with an empty alternative and `n` is another shape: `"ab" | match("(((b)|(|a))){2}";"n")` is `"ab"` in jq, `"a"` here and `"b"` before.
+  This predates `l` and `n`, which only move a pattern to the other route.
 - **A search can run out of budget where jq's optimizer does not.**
   `l` and `n` run the backtracking engine on patterns the `regex` crate used to answer in one pass, so a pathological pattern that Oniguruma settles at once can raise `Regex failure: retry-limit-in-match over` here, the budget of the lookaround route (above).
 - **Multibyte text and an empty match are a separate jq quirk.**

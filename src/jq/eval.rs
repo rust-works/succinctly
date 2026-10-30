@@ -25703,9 +25703,16 @@ struct JqRegex {
     needs_trailing_nl_check: bool,
     suppress_empty: bool,
     /// `l` on the `fancy-regex` engine: a search returns the longest match anywhere at or after
-    /// its start, not the leftmost one (see [`fancy_longest_captures`]). The payload is the
-    /// longest match the pattern can make, in bytes, when it has a bound.
-    longest: Option<Option<usize>>,
+    /// its start, not the leftmost one (see [`fancy_longest_captures`]).
+    longest: Option<LongestSearch>,
+}
+
+/// How an `l` search ends early.
+#[cfg(feature = "regex")]
+#[derive(Clone, Copy)]
+struct LongestSearch {
+    /// The most bytes one match of the pattern can span, when it has a bound.
+    max_len: Option<usize>,
 }
 
 /// Which crate compiled a [`JqRegex`]. Every pattern the `regex` crate accepts stays on it; a jq
@@ -25845,7 +25852,8 @@ impl JqRegex {
                 )
             }
             RegexEngine::Fancy(re) if self.longest.is_some() => {
-                fancy_longest_captures(re, input, start, self.longest.flatten())
+                let max_len = self.longest.and_then(|search| search.max_len);
+                fancy_longest_captures(re, input, start, max_len)
                     .map(|caps| caps.map(RegexCaptures::Fancy))
             }
             RegexEngine::Fancy(re) => re
@@ -26702,7 +26710,9 @@ fn build_regex_uncached<S: EvalSemantics>(
                     engine: RegexEngine::Fancy(re),
                     needs_trailing_nl_check: false,
                     suppress_empty,
-                    longest: built.longest.then(|| pattern_max_len(&pattern)),
+                    longest: built.longest.then(|| LongestSearch {
+                        max_len: pattern_max_len(&pattern),
+                    }),
                 });
             }
         }
@@ -127851,10 +127861,12 @@ mod tests {
             outputs(br#""aa""#, r#"match("a*?"; "l") | [.offset, .string]"#),
             [r#"[0,""]"#]
         );
-        // With `n` the empty match is still refused, by the `fancy-regex` route.
+        // `ln` keeps its old route whole too, `n`'s skip-forward search included: fixing `n` alone
+        // would change which wrong answer the pair gives (`"aa" | match("a*?"; "ln")` is `"aa"`
+        // in jq).
         assert_eq!(
-            outputs(br#""aa""#, r#"match("a*?"; "ln") | [.offset, .string]"#),
-            [r#"[0,"a"]"#]
+            outputs(br#""aa""#, r#"[match("a*?"; "ln") | .string]"#),
+            ["[]"]
         );
     }
 
