@@ -63,6 +63,17 @@
 //! | `occurrences`, `occurrence_len`, `into_occurrences`        | the full view                                   |
 //! | `push_occurrence`                                          | appends; an existing live entry becomes a shadow |
 //! | `first_occurrence`, `first_occurrence_mut`                 | the earliest entry for the key                  |
+//!
+//! # Why the map keeps the default hasher
+//!
+//! The map hashes with `IndexMap`'s default, SipHash 1-3 seeded per process, which a document's
+//! keys cannot be crafted against. A fixed hasher would give that up for very little, measured
+//! (#5594) by building the same commit with `indexmap`'s default replaced by an unseeded Fx hash,
+//! the cheapest a swap could get. On the `users` pattern (Apple M5 Max, instructions retired),
+//! `del(.users[0]) | .users | length` went from 1,625M to 1,584M (-2.5%) at 7 MB and -0.8% at
+//! 0.7 MB, an assignment -2.6% and -1.3%, and `tojson` -0.7%. The rest of the insert's cost is the
+//! table itself (probing, growth and its allocations), which no hasher changes. Revisit this
+//! with new numbers, not on the strength of a profile that attributes `insert_full` to hashing.
 
 #[cfg(all(not(test), feature = "unshared-containers"))]
 use alloc::boxed::Box;
