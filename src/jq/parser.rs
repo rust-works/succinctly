@@ -4384,7 +4384,9 @@ impl<'a> Parser<'a> {
                         // text`. Real jq has no such restriction (`.a *=n .b`
                         // parses as `.a *= (n.b)` there, confirmed live, and
                         // only fails later at name resolution), so jq mode
-                        // keeps the postfix fix.
+                        // keeps the postfix fix. (The special forms of
+                        // `parse_shadowable_special_form` take it in both modes, #5612: yq's
+                        // lexer accepts a postfix after each of those it accepts at all.)
                         Ok(None) => {
                             // #2807: an arm that had already parsed its
                             // arguments when it found the boundary wrong
@@ -6377,19 +6379,12 @@ impl<'a> Parser<'a> {
                 Err(e) => self.retry_shadow_candidate_as_generic_call(start_pos, e)?,
             }
         };
-        // #5612: `limit`, `until`, `while`, `repeat`, `range`, `first`, `last`, `error` and `JOIN`
-        // are ordinary `Term`s in jq's grammar, so a trailing `.x`/`[0]`/`[]` binds to the call
-        // (`first(.a[]).id`, `range(3).x`, `error.y`). yq takes one after `first` and `error` too,
-        // and its lexer refuses the other seven before they reach here. A call that already took
-        // its postfix (a wrong-arity rewind) has none left to take.
-        if matches!(
-            name,
-            "limit" | "until" | "while" | "repeat" | "range" | "first" | "last" | "error" | "JOIN"
-        ) {
-            self.parse_postfix(call)
-        } else {
-            Ok(call)
-        }
+        // #5612: every special form here is a `Term` in the grammar it follows, so a trailing
+        // `.x`/`[0]`/`[]` binds to the call (`first(.a[]).id`, `range(3).x`, `error.y`,
+        // `filter(f)[0]`). yq mode reaches only the names yq's own lexer accepts, the rest being
+        // refused by `reject_unless_jq_extensions` first. A call that already took its postfix
+        // (a wrong-arity rewind) has none left to take.
+        self.parse_postfix(call)
     }
 
     /// #2036: shared by every arity-mismatch recovery path (the special

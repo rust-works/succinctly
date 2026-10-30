@@ -1,9 +1,9 @@
-//! #5612 lets a postfix follow `first`, `last`, `limit`, `range`, `repeat`, `until`, `while` and
-//! `error` in jq mode. yq's grammar takes one after `first` and `error` only; the other six are
-//! gated outside `--jq-extensions` and stay refused there, as they are in real yq (4.53.3).
-//! Expected values were captured from yq 4.53.3.
+//! #5612 lets a postfix follow `first`, `last`, `limit`, `range`, `repeat`, `until`, `while`,
+//! `error` and `JOIN` in jq mode. yq's grammar takes one after `first`, `error`, `filter`,
+//! `collect`, `with` and `explode`; the others are gated outside `--jq-extensions` and stay
+//! refused there, as they are in real yq (4.53.3). Expected values were captured from yq 4.53.3.
 
-use crate::run_yq_stdin;
+use crate::{run_yq_stdin, run_yq_stdin_with_stderr};
 
 const SEQ: &str = "- id: 1\n- id: 2\n";
 
@@ -15,6 +15,8 @@ fn test_yq_postfix_after_first_and_error_parses_and_the_gated_names_stay_refused
         ("first(.id).x", "null\n"),
         ("first(.id)[0]", "null\n"),
         ("first(.id == 1).id", "1\n"),
+        ("filter(.id == 1)[0].id", "1\n"),
+        ("explode(.)[0]", "{\"id\":1}\n"),
     ] {
         let (out, code) = run_yq_stdin(program, SEQ, &["-o=json", "-I0"]).unwrap();
         assert_eq!((out.as_str(), code), (expected, 0), "{program}");
@@ -22,8 +24,10 @@ fn test_yq_postfix_after_first_and_error_parses_and_the_gated_names_stay_refused
     let (out, code) = run_yq_stdin(r#"error("x").y"#, SEQ, &["-o=json", "-I0"]).unwrap();
     assert_eq!((out.as_str(), code), ("", 1));
     for program in ["last(.id).x", "range(3).x", "limit(1;.).x", "until(.;.).x"] {
-        let (_, code) = run_yq_stdin(program, SEQ, &["-o=json", "-I0"]).unwrap();
+        let (_, stderr, code) =
+            run_yq_stdin_with_stderr(program, SEQ, &["-o=json", "-I0"]).unwrap();
         assert_ne!(code, 0, "{program}");
+        assert!(stderr.contains("--jq-extensions"), "{program}: {stderr}");
     }
 }
 
