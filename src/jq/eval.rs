@@ -86373,7 +86373,7 @@ fn push_leaf_event(
     last: OwnedValue,
     leaf: OwnedValue,
 ) {
-    let mut whole = Vec::with_capacity(path.len() + 1);
+    let mut whole = vec_with_capacity(path.len() + 1);
     whole.extend_from_slice(path);
     whole.push(last);
     events.push(OwnedValue::Array(
@@ -86383,7 +86383,7 @@ fn push_leaf_event(
 
 /// The closing `[[path..., last]]` event of a non-empty container.
 fn push_closing_event(events: &mut Vec<OwnedValue>, path: &[OwnedValue], last: OwnedValue) {
-    let mut whole = Vec::with_capacity(path.len() + 1);
+    let mut whole = vec_with_capacity(path.len() + 1);
     whole.extend_from_slice(path);
     whole.push(last);
     events.push(OwnedValue::Array(
