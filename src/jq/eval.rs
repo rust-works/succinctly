@@ -26058,10 +26058,36 @@ fn translate_posix_brackets(
     // The extended mode's comments and ignored blanks are invisible to this scan, so it leaves
     // the repetition check to the crate there rather than refuse a commented-out fragment.
     let check_repetition = !extended && !inline_extended(pattern);
+    // One entry per open group: whether the extended mode is on inside it, from the `x` flag and
+    // from inline `(?x)`, `(?x:...)` and `(?-x)` (#5550).
+    let mut extended_in = vec![extended];
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
         let was_assertion = std::mem::take(&mut prev_assertion);
+        // #5550: a comment is text jq ignores, so nothing in it is a group, a class or an escape:
+        // `(?#...)` always, and `#` to the end of the line where the extended mode is on. Copied
+        // through whole, as the `fancy-regex` scan does.
+        if depth == 0 {
+            if c == '#' && extended_in.last().copied().unwrap_or(false) {
+                let end = chars[i..]
+                    .iter()
+                    .position(|&c| c == '\n')
+                    .map_or(chars.len(), |n| i + n);
+                out.extend(&chars[i..end]);
+                i = end;
+                continue;
+            }
+            if c == '(' && chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'#') {
+                let end = chars[i..]
+                    .iter()
+                    .position(|&c| c == ')')
+                    .map_or(chars.len(), |n| i + n + 1);
+                out.extend(&chars[i..end]);
+                i = end;
+                continue;
+            }
+        }
         if c == '\\' {
             // #5373: jq's `\w` is its POSIX `word` plus six Latin-1 characters and without the
             // two joiners the `regex` crate's `\w` adds. Always a bracketed class, so that a
@@ -26130,6 +26156,45 @@ fn translate_posix_brackets(
             // the `regex` crate accepts the first and would answer where jq errors.
             if c == '(' && chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'P') {
                 return Err(EvalError::new("invalid regex: undefined group option"));
+            }
+            // Follow the extended mode through the groups, to know where `#` starts a comment.
+            if c == '(' {
+                let outer = extended_in.last().copied().unwrap_or(false);
+                let flags = &chars[(i + 2).min(chars.len())..];
+                if chars.get(i + 1) == Some(&'?') {
+                    let letters = flags
+                        .iter()
+                        .take_while(|c| c.is_ascii_alphabetic() || **c == '-')
+                        .count();
+                    let mut on = true;
+                    let mut inner = outer;
+                    for &f in &flags[..letters] {
+                        match f {
+                            '-' => on = false,
+                            'x' => inner = on,
+                            _ => {}
+                        }
+                    }
+                    match flags.get(letters) {
+                        // `(?flags)`: the rest of the enclosing group.
+                        Some(')') => {
+                            if let Some(group) = extended_in.last_mut() {
+                                *group = inner;
+                            }
+                            out.extend(&chars[i..i + 2 + letters + 1]);
+                            i += 2 + letters + 1;
+                            continue;
+                        }
+                        // `(?flags:...)`: this group only.
+                        Some(':') => extended_in.push(inner),
+                        // A lookaround, a named or atomic group: the enclosing mode.
+                        _ => extended_in.push(outer),
+                    }
+                } else {
+                    extended_in.push(outer);
+                }
+            } else if c == ')' && extended_in.len() > 1 {
+                extended_in.pop();
             }
             if c == '[' {
                 depth = 1;
