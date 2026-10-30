@@ -220,6 +220,7 @@ fn test_debug_and_error_render_the_marker_5497() -> Result<()> {
 
 /// Under `-C` the marker takes the color of the value it stands for, then a reset.
 #[test]
+#[allow(clippy::literal_string_with_formatting_args)] // jq's `{a:.}`, not a format argument
 fn test_colored_marker_takes_the_skipped_values_color_5497() -> Result<()> {
     let (out, _, exit) = run_jq_full(
         &["-n", "-c", "-C", "reduce range(257) as $i (\"s\"; [.])"],
