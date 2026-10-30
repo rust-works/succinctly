@@ -79,12 +79,6 @@ category = "by-design"
 reason = "succinctly has no bytecode to trace; the flag is rejected (exit 2)."
 
 [[divergence]]
-id = "cli:files-missing-continues"
-category = "to-triage"
-reason = "jq reads the remaining files after one cannot be opened (and exits 2); succinctly stops at the first missing file."
-issue = "#5472"
-
-[[divergence]]
 id = "robust:deep-tojson-built-1000"
 category = "by-design"
 reason = "`tojson` of a value built 1000 levels deep: jq answers; succinctly raises `nesting depth exceeds limit of 384` (exit 5) for a value it built itself. The ceiling stays since #5497, which aligned parsing and printing with jq: lifting it is a design of its own (ADR-0025), recorded in the Nesting depth section of docs/compliance/jq/limitations.md."
