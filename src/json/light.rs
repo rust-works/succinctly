@@ -2144,7 +2144,12 @@ impl<'a> JsonString<'a> {
     }
 
     fn find_end(&self) -> usize {
-        self.find_string_end() + 1 // Include closing quote
+        // Include the closing quote, but never run past the text: a string
+        // that never closes makes `find_string_end` return `text.len()`, and
+        // `+ 1` would then slice one byte past the buffer (#5541). The span
+        // ends at end-of-text instead, so the caller's delimiter check sees
+        // no closing byte after it and reports the malformed document.
+        (self.find_string_end() + 1).min(self.text.len())
     }
 
     fn find_string_end(&self) -> usize {
@@ -4604,10 +4609,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
 
     /// [`key_raw_unescaped`](DocumentValue::key_raw_unescaped) and the span's
     /// end from the one `raw_and_escaped` scan (#3343). An unterminated span
-    /// (`raw` not ending in its closing quote) answers `None`: `find_end`
-    /// reports one past the text there, which `start + raw.len()` would not,
-    /// so that rare shape takes the two-call path instead of an answer that
-    /// merely happens to agree.
+    /// (`raw` not ending in its closing quote) answers `None`, and that guard
+    /// is load-bearing: `find_end` stops at the end of the text there, so
+    /// `start + raw.len()` would now agree with it, but an unterminated key
+    /// must not be answered from this one scan. It takes the two-call path
+    /// (#5541).
     #[inline]
     fn key_raw_unescaped_with_end(&self) -> Option<(&[u8], usize)> {
         match self {
@@ -10801,8 +10807,8 @@ mod tests {
 
     /// `key_raw_unescaped_with_end` (#3343) answers the span and where it
     /// ends from one scan, and only where the two-call path would agree:
-    /// an unterminated span has no closing quote to end at (`find_end`
-    /// reports one past the text, which `start + raw.len()` would not) and an
+    /// an unterminated span has no closing quote to end at (`find_end` stops at
+    /// the text's end, #5541, so the two paths would agree by accident) and an
     /// escaped one is not its own decoded key, so both decline.
     #[test]
     fn key_raw_unescaped_with_end_declines_what_the_two_calls_would_split_3343() {
@@ -10831,6 +10837,30 @@ mod tests {
             key(br#"{"":1}"#).key_raw_unescaped_with_end(),
             Some((&b""[..], 3))
         );
+    }
+
+    /// #5541: a string that never closes ends at the end of the text, not one
+    /// byte past it -- `raw_bytes` sliced `text[start..len + 1]` and panicked.
+    /// Both ways of leaving the string unclosed are covered: running out of
+    /// bytes, and a trailing backslash whose escaped byte is the one missing.
+    #[test]
+    fn unterminated_string_span_stops_at_end_of_text_5541() {
+        for text in [
+            &br#"["abc"#[..],
+            &br#"["abc\"#[..],
+            &br#"["abc\\"#[..],
+            &b"["[..],
+        ] {
+            let s = JsonString { text, start: 1 };
+            assert_eq!(s.end(), text.len(), "{:?}", core::str::from_utf8(text));
+            assert_eq!(s.raw_bytes(), &text[1..]);
+        }
+        let closed = JsonString {
+            text: br#"["abc"]"#,
+            start: 1,
+        };
+        assert_eq!(closed.end(), 6);
+        assert_eq!(closed.raw_bytes(), br#""abc""#);
     }
 
     /// #4217: `build_reindex_scalar_from` overwrites the buffers it is given.
