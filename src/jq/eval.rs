@@ -26699,7 +26699,8 @@ fn build_regex_uncached<S: EvalSemantics>(
     // backtracking engine. The `regex` crate cannot express either, so a pattern that asks for one
     // goes to `fancy-regex` when it may (see [`build_fancy_regex`]); every other pattern keeps its
     // engine, its speed and its output.
-    if S::TAG != EvalTag::Yq && (longest || suppress_empty) {
+    let wants_search_mode = longest || suppress_empty;
+    if S::TAG != EvalTag::Yq && wants_search_mode {
         let (can_be_empty, max_len) = pattern_match_lengths(&pattern);
         let modes = FancyModes {
             longest,
