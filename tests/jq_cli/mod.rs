@@ -205,6 +205,7 @@ mod i5502;
 mod i5508;
 mod i5510;
 mod i5516;
+mod i5519;
 mod i5526;
 mod i5529;
 mod i5535;

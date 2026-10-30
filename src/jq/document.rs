@@ -456,6 +456,18 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// for YAML.
     const HAS_DELIMITER_CHECKS: bool = true;
 
+    /// Whether an object of this format can be converted member by member, picking the members a
+    /// caller reads and leaving the others undecoded (#5519): the object's own frame (each key, the
+    /// delimiters between members, the tail) is checked as the whole conversion checks it, and
+    /// only a wanted member's value is walked.
+    ///
+    /// `false` by default, so a new format keeps the whole conversion until it opts in. JSON does:
+    /// its members are what the semi-index delimits. YAML does not: a mapping's members are not
+    /// what `as_object_rendered` lists (merge keys, aliases, tags), so a projection could answer a
+    /// different set of members than the whole conversion. Pinned by
+    /// `json_projects_object_members_5519`.
+    const PROJECTS_MEMBERS: bool = false;
+
     /// Whether a cursor walk that already holds a member's value (a
     /// [`DocumentField`] is built with one) hands it to the member's own walk
     /// instead of resolving it again from the member's cursor (#2664).
@@ -5031,6 +5043,28 @@ mod object_keys_repeat_tests {
             );
             assert_eq!(census(&fields).repeated, repeated, "census on {document}");
         }
+    }
+
+    /// #5519: JSON converts an object member by member; YAML does not, so a fold over a YAML
+    /// document (reached through `succinctly jq`) keeps the whole conversion.
+    #[test]
+    fn json_projects_object_members_5519() {
+        use crate::yaml::YamlIndex;
+        fn projects<C: DocumentCursor>(_: &C) -> bool {
+            C::PROJECTS_MEMBERS
+        }
+        let json = br"[1]";
+        let index = JsonIndex::build(json);
+        assert!(
+            projects(&index.root(json)),
+            "JSON converts member by member"
+        );
+        let yaml = b"- 1\n";
+        let index = YamlIndex::build(yaml).expect("builds");
+        assert!(
+            !projects(&index.root(yaml)),
+            "YAML keeps the whole conversion"
+        );
     }
 
     /// #2640: JSON is the format the delimiter checks exist for, so it must
