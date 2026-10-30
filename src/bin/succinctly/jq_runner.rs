@@ -6194,7 +6194,7 @@ fn get_filter(args: &JqCommand) -> Result<String, BuildContextError> {
                 strerror_only(&e)
             ))
         })?;
-        Ok(contents.trim().to_string())
+        Ok(contents)
     } else if let Some(ref filter) = args.filter {
         Ok(filter.clone())
     } else {
