@@ -1516,6 +1516,47 @@ impl<'a> Parser<'a> {
         &self.input[self.pos..end]
     }
 
+    /// The four hex digits of a `\uXXXX` escape, the `\u` already consumed.
+    fn parse_hex4(&mut self) -> Result<u32, ParseError> {
+        let mut code = 0;
+        for _ in 0..4 {
+            let Some(d) = self.peek().and_then(|c| c.to_digit(16)) else {
+                return Err(ParseError::new("invalid unicode escape", self.pos));
+            };
+            self.next();
+            code = code * 16 + d;
+        }
+        Ok(code)
+    }
+
+    /// A `\uXXXX` escape in a string literal, the `\u` already consumed, as jq 1.7.1
+    /// reads it: a high surrogate must be followed by `\u` and a low one and the pair is one
+    /// character (#5590), a high surrogate on its own is a compile error, and a lone low
+    /// surrogate is U+FFFD.
+    fn parse_unicode_escape(&mut self) -> Result<char, ParseError> {
+        let code = self.parse_hex4()?;
+        if !(0xD800..0xE000).contains(&code) {
+            return Ok(char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER));
+        }
+        if code >= 0xDC00 {
+            return Ok(char::REPLACEMENT_CHARACTER);
+        }
+        const LONE: &str = "invalid surrogate pair escape";
+        if self.peek_str(2) != "\\u" {
+            return Err(ParseError::new(LONE, self.pos));
+        }
+        self.next();
+        self.next();
+        let low = self.parse_hex4()?;
+        if !(0xDC00..0xE000).contains(&low) {
+            return Err(ParseError::new(LONE, self.pos));
+        }
+        Ok(
+            char::from_u32(0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00))
+                .unwrap_or(char::REPLACEMENT_CHARACTER),
+        )
+    }
+
     /// Consume and return the current character.
     fn next(&mut self) -> Option<char> {
         let c = self.peek()?;
@@ -2038,27 +2079,7 @@ impl<'a> Parser<'a> {
                         }
                         Some('u') => {
                             self.next();
-                            // Parse 4 hex digits
-                            let mut hex = String::new();
-                            for _ in 0..4 {
-                                match self.peek() {
-                                    Some(c) if c.is_ascii_hexdigit() => {
-                                        hex.push(c);
-                                        self.next();
-                                    }
-                                    _ => {
-                                        return Err(ParseError::new(
-                                            "invalid unicode escape",
-                                            self.pos,
-                                        ));
-                                    }
-                                }
-                            }
-                            let code = u32::from_str_radix(&hex, 16)
-                                .map_err(|_| ParseError::new("invalid unicode escape", self.pos))?;
-                            let c = char::from_u32(code).ok_or_else(|| {
-                                ParseError::new("invalid unicode code point", self.pos)
-                            })?;
+                            let c = self.parse_unicode_escape()?;
                             current_literal.push(c);
                         }
                         Some(c) => {
@@ -2174,27 +2195,7 @@ impl<'a> Parser<'a> {
                         }
                         Some('u') => {
                             self.next();
-                            // Parse 4 hex digits
-                            let mut hex = String::new();
-                            for _ in 0..4 {
-                                match self.peek() {
-                                    Some(c) if c.is_ascii_hexdigit() => {
-                                        hex.push(c);
-                                        self.next();
-                                    }
-                                    _ => {
-                                        return Err(ParseError::new(
-                                            "invalid unicode escape",
-                                            self.pos,
-                                        ));
-                                    }
-                                }
-                            }
-                            let code = u32::from_str_radix(&hex, 16)
-                                .map_err(|_| ParseError::new("invalid unicode escape", self.pos))?;
-                            let c = char::from_u32(code).ok_or_else(|| {
-                                ParseError::new("invalid unicode code point", self.pos)
-                            })?;
+                            let c = self.parse_unicode_escape()?;
                             result.push(c);
                         }
                         Some(c) => {
@@ -2866,10 +2867,12 @@ impl<'a> Parser<'a> {
 
     /// The name after `def`, for both of the parsers that read a definition (`parse_def_expr` in an
     /// expression, `parse_func_def_parts` in a module body): one definition, so a word one
-    /// refuses is a word the other refuses (#5591).
+    /// refuses is a word the other refuses (#5591). The name is an identifier, and in jq mode also
+    /// `ns::name` (any number of `::` parts), which jq's lexer reads as one `IDENT` token, so
+    /// `def a::b: 1; a::b` is `1` (#5590); a reserved word followed by `::` is not a reserved word.
     fn parse_def_name(&mut self) -> Result<String, ParseError> {
         let offset = self.pos;
-        let name = self.parse_ident()?;
+        let name = self.parse_variable_name()?;
         self.reject_reserved_word_as_name(&name, "IDENT", offset)?;
         Ok(name)
     }
@@ -3933,10 +3936,17 @@ impl<'a> Parser<'a> {
                 // #4237: more generally, yq's `.` followed at once by any character that is
                 // not in `is_yq_path_element_char`'s exclusions starts a name, operator
                 // characters included (`.>1` is the key `>1`, not a comparison).
+                //
+                // #5590: in jq a word at once after the dot is a field name even when it spells a
+                // keyword that ends an expression (`.then`, `.and`, `.end`); only a gap before
+                // it (`. and true`, `if . then 1 end`) leaves the dot as the identity.
                 if (self.is_eof() || self.is_expr_terminator())
                     && !(self.mode == ParserMode::Yq
                         && self.pos == dot_end
                         && self.peek().is_some_and(is_yq_path_element_char))
+                    && !(self.mode == ParserMode::Jq
+                        && self.pos == dot_end
+                        && self.peek().is_some_and(is_ident_start_char))
                 {
                     self.last_primary_is_term = true; // #3038: leaf Term
                     return Ok(Expr::Identity);
@@ -10337,7 +10347,21 @@ impl<'a> Parser<'a> {
         // Parse function name. Both oracles require it to immediately follow
         // the `::` (`mymod::func`); `mymod:: func` is a syntax error, hence no
         // `skip_ws()` between the token and the identifier here (#3116).
-        let name = self.parse_ident()?;
+        let mut namespace = namespace;
+        let mut name = self.parse_ident()?;
+        // jq's lexer reads `a::b::c` as one `IDENT` (#5590): the namespace is everything
+        // before the last `::`, as for a `def a::b::c: ...` it names.
+        while self.mode == ParserMode::Jq
+            && self.peek_str(2) == "::"
+            && self.input[self.pos + 2..]
+                .chars()
+                .next()
+                .is_some_and(is_ident_start_char)
+        {
+            self.pos += 2;
+            namespace = format!("{namespace}::{name}");
+            name = self.parse_ident()?;
+        }
         self.skip_ws();
 
         // Parse optional arguments
