@@ -126580,6 +126580,60 @@ mod tests {
         );
     }
 
+    /// #5531: `build_regex` compiles a `(mode, pattern, flags)` once and hands the same value
+    /// back, errors included; a different flag string, mode or pattern is its own entry, a long
+    /// pattern is never kept, and the oldest entry makes room once the cache is full.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn build_regex_keeps_the_last_patterns_5531() {
+        use std::rc::Rc;
+        let jq = |pattern: &str, flags: Option<&str>| build_regex::<JqSemantics>(pattern, flags);
+
+        let first = jq("a[0-9]+", None).expect("compiles");
+        assert!(Rc::ptr_eq(&first, &jq("a[0-9]+", None).expect("cached")));
+        assert!(!Rc::ptr_eq(
+            &first,
+            &jq("a[0-9]+", Some("i")).expect("other flags")
+        ));
+        assert!(!Rc::ptr_eq(
+            &first,
+            &jq("a[0-9]*", None).expect("other pattern")
+        ));
+        let yq = build_regex::<YqSemantics>("a[0-9]+", None).expect("yq compiles");
+        assert!(!Rc::ptr_eq(&first, &yq), "the mode is part of the key");
+        assert!(first.is_match("a12") && !first.is_match("a"));
+
+        // A refusal is cached too, and is the same error each time.
+        let refused = jq("(?P<n>a)", None).err().expect("refused");
+        assert_eq!(Some(refused), jq("(?P<n>a)", None).err());
+        let bad_flags = jq("a", Some("z")).err().expect("bad modifier");
+        assert_eq!(Some(bad_flags), jq("a", Some("z")).err());
+
+        // A pattern past the size limit is built each time.
+        let long = format!("{}b", "a".repeat(REGEX_CACHE_MAX_PATTERN));
+        assert!(!Rc::ptr_eq(
+            &jq(&long, None).expect("long"),
+            &jq(&long, None).expect("long again")
+        ));
+
+        // Full: the oldest entry is the one overwritten, the newest stay.
+        let kept = jq("kept", None).expect("kept");
+        for n in 0..REGEX_CACHE_SLOTS - 1 {
+            jq(&format!("fill{n}"), None).expect("fill");
+        }
+        assert!(
+            Rc::ptr_eq(&kept, &jq("kept", None).expect("still there")),
+            "{REGEX_CACHE_SLOTS} entries fit"
+        );
+        for n in 0..REGEX_CACHE_SLOTS {
+            jq(&format!("evict{n}"), None).expect("evict");
+        }
+        assert!(
+            !Rc::ptr_eq(&kept, &jq("kept", None).expect("rebuilt")),
+            "a full cache drops its oldest entries"
+        );
+    }
+
     #[cfg(feature = "regex")]
     #[test]
     fn test_regex_capture() {
