@@ -9,7 +9,9 @@ use anyhow::Result;
 use crate::run_jq_full;
 
 /// `(stdin, filter, expected stdout)`.
-const ROWS: &[(&str, &str, &str)] = &[
+type Row = (&'static str, &'static str, &'static str);
+
+const ROWS: &[Row] = &[
     (r"[1,2,3]", r"add", r"6"),
     (r"[]", r"add", r"null"),
     (r"[1]", r"add", r"1"),
@@ -121,7 +123,6 @@ const ROWS: &[(&str, &str, &str)] = &[
         r"true",
     ),
     (r"[[1],[2]]", r".[0] as $x | add | length", r"2"),
-    (r"[[1],[2]]", r". as $x | add | path($x)?", r""),
     (r#"[{"a":1},{"b":2}]"#, r".[0] as $x | add | .a", r"1"),
     (
         r#"[1,"a"]"#,
@@ -135,9 +136,10 @@ const ROWS: &[(&str, &str, &str)] = &[
     ),
 ];
 
-#[test]
-fn test_add_over_an_array_matches_jq_5595() -> Result<()> {
-    for (input, filter, expected) in ROWS {
+const PATH_ROWS: &[Row] = &[(r"[[1],[2]]", r". as $x | add | path($x)?", r"")];
+
+fn check(rows: &[Row]) -> Result<()> {
+    for (input, filter, expected) in rows {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(
             (stdout.trim_end(), code),
@@ -146,4 +148,17 @@ fn test_add_over_an_array_matches_jq_5595() -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[test]
+fn test_add_over_an_array_matches_jq_5595() -> Result<()> {
+    check(ROWS)
+}
+
+/// `path($x)` after an `add` over a bound document is a path expression that does more than
+/// navigate, which the unshared-containers holdout refuses by design.
+#[test]
+#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
+fn test_add_keeps_a_bound_node_out_of_the_path_like_jq_5595() -> Result<()> {
+    check(PATH_ROWS)
 }
