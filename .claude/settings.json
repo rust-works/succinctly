@@ -27,7 +27,7 @@
           {
             "type": "command",
             "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/pre-push.sh hook",
-            "timeout": 1200,
+            "timeout": 1800,
             "statusMessage": "pre-push gate"
           }
         ]

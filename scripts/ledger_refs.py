@@ -26,7 +26,6 @@ import os
 import re
 import subprocess
 import sys
-import tomllib
 
 LEDGER = "comparison/jq/divergences.toml"
 DEFAULT_BASE = "origin/main"
@@ -49,15 +48,23 @@ def git(*args, cwd=None):
     return out.stdout
 
 
+_STRING_FIELD = re.compile(r'^(\w+)\s*=\s*"((?:[^"\\]|\\.)*)"\s*(?:#.*)?$', re.MULTILINE)
+_ENTRY_HEADER = re.compile(r"^\[\[divergence\]\]\s*$", re.MULTILINE)
+
+
 def to_triage(text):
-    """`{issue number: [entry ids]}` for the `to-triage` entries that name an issue."""
+    """`{issue number: [entry ids]}` for the `to-triage` entries that name an issue.
+
+    Reads the ledger's own shape (`[[divergence]]` blocks of `key = "string"` lines) rather than
+    importing `tomllib`, which the Python that macOS ships (3.9) lacks; the Rust loader is the
+    strict parser, and CI's `Ledger drift` job runs it.
+    """
     found = {}
-    for entry in tomllib.loads(text).get("divergence", []):
-        if entry.get("category") != "to-triage":
-            continue
-        m = re.fullmatch(r"#(\d+)", (entry.get("issue") or "").strip())
-        if m:
-            found.setdefault(int(m.group(1)), []).append(entry["id"])
+    for block in _ENTRY_HEADER.split(text)[1:]:
+        fields = dict(_STRING_FIELD.findall(block))
+        m = re.fullmatch(r"#(\d+)", fields.get("issue", "").strip())
+        if fields.get("category") == "to-triage" and m and "id" in fields:
+            found.setdefault(int(m.group(1)), []).append(fields["id"])
     return found
 
 

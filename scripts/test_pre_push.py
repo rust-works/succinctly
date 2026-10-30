@@ -158,6 +158,11 @@ class PlanTests(unittest.TestCase):
         self.assertIsNone(p["ledger-only"])
         self.assertNotIn("clippy", p)
 
+    def test_the_static_ledger_check_runs_even_when_the_ledger_file_did_not_change(self):
+        # A branch that fixes a to-triage issue and forgets the entry touches only source.
+        self.assertIsNone(self.plan(["src/jq/eval.rs"])["ledger-refs"])
+        self.assertIsNone(self.plan(["docs/x.md"])["ledger-refs"])
+
     def test_the_ledger_file_alone_runs_the_static_check_and_the_ledger_gate(self):
         p = self.plan(["comparison/jq/divergences.toml"])
         self.assertIsNone(p["ledger-refs"])
@@ -182,7 +187,7 @@ class PlanTests(unittest.TestCase):
 
 class PushDetectionTests(unittest.TestCase):
     def pushes(self, command, cwd="/work"):
-        return pre_push.pushes(command, cwd)
+        return [d for d, _ in pre_push.pushes(command, cwd)]
 
     def test_plain_and_compound_pushes(self):
         self.assertEqual(self.pushes("git push"), ["/work"])
@@ -216,6 +221,37 @@ class PushDetectionTests(unittest.TestCase):
             "gh pr create",
         ):
             self.assertEqual(self.pushes(command), [], command)
+
+    def test_text_that_mentions_a_push_is_not_one(self):
+        for command in (
+            'echo "done; git push origin y"',
+            "git commit -m \"$(cat <<'EOF'\nfix it\ngit push origin x\nEOF\n)\"",
+            "cat <<EOF\ngit push\nEOF",
+            "cat <<-'EOF'\n\tgit push\n\tEOF\necho ok",
+            "gh pr create --body 'run: git push -u origin b'",
+            "echo a\\\n b",
+        ):
+            self.assertEqual(self.pushes(command), [], command)
+
+    def test_a_push_after_a_heredoc_is_still_found(self):
+        self.assertEqual(self.pushes("cat <<EOF\nnot a push\nEOF\ngit push"), ["/work"])
+
+    def test_a_mixed_delete_and_publish_is_a_push_but_a_pure_delete_is_not(self):
+        self.assertEqual(self.pushes("git push origin :old main"), ["/work"])
+        self.assertEqual(self.pushes("git push origin :old :older"), [])
+
+    def test_wrappers_do_not_hide_the_push(self):
+        self.assertEqual(self.pushes("(cd /x && git push)"), ["/x"])
+        self.assertEqual(self.pushes('bash -c "git push origin b"'), ["/work"])
+        self.assertEqual(self.pushes("sh -c 'cd /y; git push'"), ["/y"])
+        self.assertEqual(self.pushes("git push & wait"), ["/work"])
+
+    def test_a_skip_prefix_travels_with_the_push(self):
+        self.assertEqual(pre_push.pushes("PRE_PUSH_SKIP=ledger-only git push", "/w"), [("/w", "ledger-only")])
+        self.assertEqual(
+            pre_push.pushes('PRE_PUSH_SKIP="fmt ledger-only" git push', "/w"), [("/w", "fmt ledger-only")]
+        )
+        self.assertEqual(pre_push.pushes("git push", "/w"), [("/w", "")])
 
     def test_an_unbalanced_quote_still_finds_the_push(self):
         self.assertEqual(self.pushes("echo 'unterminated; git push"), ["/work"])
@@ -273,6 +309,12 @@ class HookTests(unittest.TestCase):
         self.addCleanup(other.cleanup)
         subprocess.run(["git", "init", "-q", other.name], check=True)
         self.assertEqual(self.call("git push", cwd=other.name)[0], 0)
+
+    def test_the_skip_prefix_reaches_the_gate_through_the_environment(self):
+        with open(os.path.join(self.root, "scripts", "pre_push.py"), "w", encoding="utf-8") as f:
+            f.write("import os, sys\nsys.exit(0 if 'fmt' in os.environ.get('PRE_PUSH_SKIP', '').split() else 1)\n")
+        self.assertEqual(self.call("git push")[0], 2)
+        self.assertEqual(self.call("PRE_PUSH_SKIP=fmt git push")[0], 0)
 
     def test_unreadable_input_is_allowed(self):
         self.assertEqual(pre_push.hook(io.StringIO("not json")), 0)

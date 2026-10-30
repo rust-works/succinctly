@@ -42,7 +42,8 @@ that conflicts in one of these pages because `fix` split a paragraph upstream is
 those (`--full` adds the lints CI runs: three clippy invocations, rustdoc, `--no-default-features`;
 `list` shows the gates). `.claude/settings.json` runs it as a `PreToolUse` hook, so an agent's
 `git push` is blocked while it fails -- `--no-verify` does not skip it. `PRE_PUSH_SKIP="gate ..."`
-skips named gates, and a skip is always printed. The gates are checked against
+skips named gates (as a prefix of the push, `PRE_PUSH_SKIP=ledger-only git push`, for an agent), and a
+skip is always printed. The gates are checked against
 `.github/workflows/*.yml` by `python3 scripts/test_pre_push.py`: a new CI gate has to be mirrored in
 `scripts/pre_push.py` or listed there as deliberately not (#5585).
 

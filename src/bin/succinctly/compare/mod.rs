@@ -634,6 +634,13 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
             status: "implemented (sizes, libraries, dependencies, parallelism, licences; build time is not measured)",
         });
     }
+    if args.ledger_only && run_suites.is_empty() {
+        bail!(
+            "--ledger-only ran no suite: --dimension names only dimensions it skips (smoke, \
+             performance, operational); the ledger is fed by features, cli, differential, input \
+             and robustness"
+        );
+    }
     let ledger_outcome = ledger::check(&known, &observed, &run_suites);
     if args.ledger_only {
         let skipped = ledger::unchecked(&known, &run_suites);
