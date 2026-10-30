@@ -554,3 +554,13 @@ def-param-ns-gen	functions	["-c", "def f(x::y): x::y; f(1,2)"]	"{\"a\":[1,2,3],\
 pattern-key-ns-alt	variables	["-c", ". as [$a] ?// {a::b: $x} | [$a,$x]"]	"{\"a\":[1,2,3],\"b\":{\"c\":\"x\",\"d\":null},\"s\":\"hi\",\"n\":2.5}\n"
 pattern-key-ns-reduce	variables	["-c", "reduce ({\"a::b\":1},{\"a::b\":2}) as {a::b: $x} (0; .+$x)"]	"{\"a\":[1,2,3],\"b\":{\"c\":\"x\",\"d\":null},\"s\":\"hi\",\"n\":2.5}\n"
 construct-obj-key-ns-trailing	construction	["-c", "{a::b::}"]	"{\"a\":[1,2,3],\"b\":{\"c\":\"x\",\"d\":null},\"s\":\"hi\",\"n\":2.5}\n"
+syn-ws-cr-between-tokens	syntax	["-n", "-c", "1\r+ 1"]	-
+syn-ws-crlf-between-tokens	syntax	["-n", "-c", "1\r\n+ 1"]	-
+syn-ws-cr-leading	syntax	["-n", "-c", "\r1"]	-
+syn-ws-cr-trailing	syntax	["-n", "-c", "1\r"]	-
+syn-ws-form-feed	syntax	["-n", "-c", "1\f+1"]	-
+syn-ws-vertical-tab	syntax	["-n", "-c", "1\u000b+1"]	-
+syn-ws-nbsp	syntax	["-n", "-c", "1\u00a0+1"]	-
+syn-ws-line-separator	syntax	["-n", "-c", "1\u2028+1"]	-
+syn-ws-cr-after-keyword-call	syntax	["-n", "-c", "[1] | add\r"]	-
+syn-ws-tab-and-newline	syntax	["-n", "-c", "1\t+\n1"]	-

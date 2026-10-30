@@ -57,6 +57,19 @@ pub enum ParserMode {
     Yq,
 }
 
+impl ParserMode {
+    /// Whether `c` is whitespace between two tokens of a program (#5613). jq 1.7.1's lexer skips
+    /// only `[ \n\t]+`: CR, form feed, vertical tab, NBSP and U+2028 are `INVALID_CHARACTER`
+    /// (exit 3), so a CRLF program file is refused at its first `\r`. yq mode keeps the wider
+    /// Unicode set for now; yq v4.53.3 is narrower too (#5616).
+    fn is_whitespace(self, c: char) -> bool {
+        match self {
+            Self::Jq => matches!(c, ' ' | '\t' | '\n'),
+            Self::Yq => c.is_whitespace(),
+        }
+    }
+}
+
 /// Error that occurs during parsing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseError {
@@ -1579,7 +1592,7 @@ impl<'a> Parser<'a> {
     fn skip_ws(&mut self) {
         loop {
             match self.peek() {
-                Some(c) if c.is_whitespace() => {
+                Some(c) if self.mode.is_whitespace(c) => {
                     self.next();
                 }
                 Some('#') => {
@@ -1783,7 +1796,7 @@ impl<'a> Parser<'a> {
         // Skip whitespace after keyword
         let rest = &self.input[after..];
         for c in rest.chars() {
-            if c.is_whitespace() {
+            if self.mode.is_whitespace(c) {
                 continue;
             }
             return c == '(';
@@ -6411,11 +6424,12 @@ impl<'a> Parser<'a> {
     /// expression. `pos` must be the position *before* the identifier.
     fn peek_after_keyword_at_is_empty_parens(&self, pos: usize) -> bool {
         let after_ident = pos + self.ident_text_at(pos).len();
-        let rest = self.input[after_ident..].trim_start();
+        let rest = self.input[after_ident..].trim_start_matches(|c| self.mode.is_whitespace(c));
         let Some(rest) = rest.strip_prefix('(') else {
             return false;
         };
-        rest.trim_start().starts_with(')')
+        rest.trim_start_matches(|c| self.mode.is_whitespace(c))
+            .starts_with(')')
     }
 
     /// #2036 Direction 3: wrap a *successfully*-parsed `original` -- the
@@ -10678,6 +10692,55 @@ mod tests {
         }
     }
     use super::*;
+
+    /// #5613: jq 1.7.1's lexer skips only space, tab and newline between tokens; CR, form feed,
+    /// vertical tab, NBSP and U+2028 are `INVALID_CHARACTER` wherever a token could follow,
+    /// including the lookahead after `add` and `def`-free keyword calls. A CR inside a comment
+    /// is part of the comment. yq mode keeps its wider set (#5616).
+    #[test]
+    fn jq_mode_whitespace_is_space_tab_newline_only_5613() {
+        for c in [
+            '\r', '\x0c', '\x0b', '\u{a0}', '\u{2028}', '\u{85}', '\u{3000}',
+        ] {
+            for text in [
+                format!("1{c}+ 1"),
+                format!("{c}1"),
+                format!("1{c}"),
+                format!("[1,{c}2]"),
+                format!("[1] | add{c}"),
+                format!("[1] | add{c}(.)"),
+                format!("def f: 1;{c}f"),
+                format!("def f: 1; f{c}"),
+            ] {
+                let spaced = text.replace(c, " ");
+                assert!(
+                    parse_with_mode(&spaced, ParserMode::Jq).is_ok(),
+                    "control {spaced:?}"
+                );
+                assert!(
+                    parse_with_mode(&text, ParserMode::Jq).is_err(),
+                    "jq mode accepted {text:?}"
+                );
+                assert_eq!(
+                    parse_with_mode(&text, ParserMode::Yq).is_ok(),
+                    parse_with_mode(&spaced, ParserMode::Yq).is_ok(),
+                    "yq mode moved on {text:?}"
+                );
+            }
+        }
+        for text in [
+            "1 +\t1",
+            "1 +\n1",
+            "1 # c\r\n+ 1",
+            "[1] | add \n",
+            "# c\r\n1",
+        ] {
+            assert!(
+                parse_with_mode(text, ParserMode::Jq).is_ok(),
+                "jq mode rejected {text:?}"
+            );
+        }
+    }
 
     /// #5591: a reserved word is no `def` name, bare parameter or `import ... as` namespace, in
     /// jq mode, with jq's own lookahead list and the error at the word; a `$name`, `not` and
