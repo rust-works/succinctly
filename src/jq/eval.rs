@@ -26181,7 +26181,7 @@ fn translate_posix_brackets(
                             if let Some(group) = extended_in.last_mut() {
                                 *group = inner;
                             }
-                            out.extend(&chars[i..i + 2 + letters + 1]);
+                            out.extend(&chars[i..=i + 2 + letters]);
                             i += 2 + letters + 1;
                             continue;
                         }
