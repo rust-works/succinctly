@@ -26954,6 +26954,29 @@ fn pattern_match_lengths(pattern: &str) -> (bool, Option<usize>) {
     }
 }
 
+/// Whether matches of `pattern` may differ in length. A pattern the `regex` crate cannot parse
+/// (lookaround, a backreference) is taken to.
+#[cfg(feature = "regex")]
+fn pattern_is_variable_length(pattern: &str) -> bool {
+    match regex_syntax::Parser::new().parse(pattern) {
+        Ok(hir) => {
+            let properties = hir.properties();
+            properties.minimum_len() != properties.maximum_len()
+        }
+        Err(_) => true,
+    }
+}
+
+/// A branch that never matches (`(?!)` fails at once) but is unbounded, put in front of a pattern
+/// that `l` searches with `fancy-regex`'s `leftmost_longest` (#5580). That mode stops looking for a
+/// longer match as soon as one is as long as the pattern's `max_size`, which the crate counts in
+/// characters and compares with a match's length in bytes: `"éé" | match("é|éé"; "l")` stopped at
+/// the two-byte `é` because the pattern is at most two characters long. An unbounded `max_size`
+/// never equals a length, so the longest match is found. Not needed when every match is the same
+/// length, which also keeps such a pattern on the crate's faster, non-backtracking path.
+#[cfg(feature = "regex")]
+const FANCY_UNBOUNDED_DEAD_BRANCH: &str = "(?!)x*";
+
 /// [`build_fancy_regex`] with the search policies of jq's `l` and `n` flags set. `None` also when
 /// `l` is asked of a pattern with a lazy quantifier: `fancy-regex`'s longest-match mode returns
 /// the lazy match there (`"a" | match("a*?"; "l")` is `""` and jq has `"a"`).
@@ -26965,7 +26988,8 @@ fn build_fancy_regex_with<S: EvalSemantics>(
     if S::TAG == EvalTag::Yq {
         return None;
     }
-    let pattern = prepare_fancy_pattern(pattern)?;
+    let source = pattern;
+    let pattern = prepare_fancy_pattern(source)?;
     let tree = fancy_regex::Expr::parse_tree(&pattern).ok()?;
     if !fancy_expr_is_oniguruma(&tree.expr)
         || tree.expr.has_descendant(|e| !fancy_expr_is_oniguruma(e))
@@ -26975,6 +26999,11 @@ fn build_fancy_regex_with<S: EvalSemantics>(
     if modes.longest && fancy_has_lazy_repeat(&tree.expr) {
         return None;
     }
+    let pattern = if modes.longest && pattern_is_variable_length(source) {
+        format!("{FANCY_UNBOUNDED_DEAD_BRANCH}|{pattern}")
+    } else {
+        pattern
+    };
     fancy_regex::RegexBuilder::new(&pattern)
         .oniguruma_mode(true)
         .leftmost_longest(modes.longest)
