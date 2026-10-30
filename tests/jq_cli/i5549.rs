@@ -8,7 +8,9 @@ use anyhow::Result;
 use crate::run_jq_full;
 
 /// `(stdin, filter, expected stdout)`; a `None` stdin runs the filter with `-n`.
-const ROWS: &[(Option<&str>, &str, &str)] = &[
+type Row = (Option<&'static str>, &'static str, &'static str);
+
+const ROWS: &[Row] = &[
     (
         Some(r#"{"users":[{"id":1},{"id":2}]}"#),
         r"del(.users[0]) | .users | length",
@@ -92,30 +94,6 @@ const ROWS: &[(Option<&str>, &str, &str)] = &[
         r#""Cannot index string with number""#,
     ),
     (Some(r#"{"a":1}"#), r"del(.a.b)?", r""),
-    (None, r"[nan] | del(.[1]) | .[0] == .[0]", r"false"),
-    (None, r#"{"a":[nan],"b":1} | del(.b) | .a == .a"#, r"true"),
-    (
-        None,
-        r#"{"a":[nan],"b":1} | del(.b) | .a[0] == .a[0]"#,
-        r"false",
-    ),
-    (None, r"[[nan],1] | del(.[1]) | .[0] == .[0]", r"true"),
-    (
-        None,
-        r"[[nan],1] | del(.[1]) | (.[0] | .[0]) == (.[0] | .[0])",
-        r"false",
-    ),
-    (
-        None,
-        r#"{"a":{"b":[nan]},"c":1} | del(.c) | [.a.b] == [.a.b]"#,
-        r"true",
-    ),
-    (None, r"[nan] | [., .] | del(.[2]) | .[0] == .[1]", r"true"),
-    (
-        None,
-        r"[nan] as $a | {y:$a,z:1} | del(.z) | .y == $a",
-        r"true",
-    ),
     (
         None,
         r#"[nan, infinite, -infinite, 1.0, 1e1000, -0, "é\u0001\u007f😀", [], {}, null, true] | tojson"#,
@@ -194,9 +172,35 @@ const ROWS: &[(Option<&str>, &str, &str)] = &[
     ),
 ];
 
-#[test]
-fn test_tojson_and_static_del_match_jq_5549() -> Result<()> {
-    for (stdin, filter, expected) in ROWS {
+const IDENTITY_ROWS: &[Row] = &[
+    (None, r"[nan] | del(.[1]) | .[0] == .[0]", r"false"),
+    (None, r#"{"a":[nan],"b":1} | del(.b) | .a == .a"#, r"true"),
+    (
+        None,
+        r#"{"a":[nan],"b":1} | del(.b) | .a[0] == .a[0]"#,
+        r"false",
+    ),
+    (None, r"[[nan],1] | del(.[1]) | .[0] == .[0]", r"true"),
+    (
+        None,
+        r"[[nan],1] | del(.[1]) | (.[0] | .[0]) == (.[0] | .[0])",
+        r"false",
+    ),
+    (
+        None,
+        r#"{"a":{"b":[nan]},"c":1} | del(.c) | [.a.b] == [.a.b]"#,
+        r"true",
+    ),
+    (None, r"[nan] | [., .] | del(.[2]) | .[0] == .[1]", r"true"),
+    (
+        None,
+        r"[nan] as $a | {y:$a,z:1} | del(.z) | .y == $a",
+        r"true",
+    ),
+];
+
+fn check(rows: &[Row]) -> Result<()> {
+    for (stdin, filter, expected) in rows {
         let (stdout, stderr, code) = match stdin {
             Some(input) => run_jq_full(&["-c", filter], Some(input))?,
             None => run_jq_full(&["-nc", filter], None)?,
@@ -208,4 +212,21 @@ fn test_tojson_and_static_del_match_jq_5549() -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[test]
+fn test_tojson_and_static_del_match_jq_5549() -> Result<()> {
+    check(ROWS)
+}
+
+/// A NaN is equal to itself only as the very node it is, so these read a value back through a
+/// `del` and compare it with itself: the answer is jq's `jv_identical` short-circuit, which the
+/// unshared-containers holdout has no node to give.
+#[test]
+#[cfg_attr(
+    feature = "unshared-containers",
+    ignore = "holdout has no node identity or sharing (#5254)"
+)]
+fn test_del_keeps_node_identity_like_jq_5549() -> Result<()> {
+    check(IDENTITY_ROWS)
 }
