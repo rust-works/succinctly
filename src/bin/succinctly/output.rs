@@ -2758,7 +2758,10 @@ mod tests {
             (JqValue::String("s".into()), String),
             (JqValue::Array(vec![]), Array),
             (JqValue::LazyIndexRange(0), Array),
-            (JqValue::Object(Default::default()), Object),
+            (
+                JqValue::Object(succinctly::jq::ObjectMapOf::default()),
+                Object,
+            ),
         ];
         for (value, kind) in &lazy {
             assert_eq!(SkippedKind::of_jq_value(value), *kind);
