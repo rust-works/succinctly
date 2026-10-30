@@ -33,8 +33,19 @@ fn test_empty_fraction_literal_keeps_its_decnumber_spelling_5614() -> Result<()>
         ("3.e2|floor", "300\n"),
         ("-1.e1", "-10\n"),
         ("1.e1|-.", "-10\n"),
-        // A trailing dot with no exponent was already the integer.
+        // A trailing dot with no exponent keeps the literal's digits too: the dot is dropped
+        // before the validity check, where it used to collapse a wide one to the double.
         ("1.", "1\n"),
+        (
+            "123456789012345678901234567890.",
+            "123456789012345678901234567890\n",
+        ),
+        ("100000000000000000000.", "100000000000000000000\n"),
+        ("9007199254740993.", "9007199254740993\n"),
+        ("9007199254740993.|tojson", "\"9007199254740993\"\n"),
+        ("9007199254740993.|.+0", "9007199254740992\n"),
+        // As an index.
+        ("[range(3)]|.[1.e0]", "1\n"),
     ] {
         let (out, err, code) = run_jq_full(&["-nc", program], None)?;
         assert_eq!((out.as_str(), code), (expected, 0), "{program}: {err}");

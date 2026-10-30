@@ -578,3 +578,8 @@ num-lit-trailing-dot-exp-huge	operators	["-n", "-c", "1.e1000"]	-
 num-lit-trailing-dot-array	operators	["-n", "-c", "[1.e1,2.E2]"]	-
 num-lit-trailing-dot-tojson	operators	["-n", "-c", "1.e1|tojson"]	-
 num-lit-trailing-dot-plain	operators	["-n", "-c", "1."]	-
+num-lit-trailing-dot-wide	operators	["-n", "-c", "123456789012345678901234567890."]	-
+num-lit-trailing-dot-wide-pow	operators	["-n", "-c", "100000000000000000000."]	-
+num-lit-trailing-dot-2p53	operators	["-n", "-c", "9007199254740993."]	-
+num-lit-trailing-dot-2p53-tojson	operators	["-n", "-c", "9007199254740993.|tojson"]	-
+num-lit-trailing-dot-index	operators	["-n", "-c", "[range(3)]|.[1.e0]"]	-
