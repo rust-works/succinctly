@@ -77,11 +77,6 @@ category = "by-design"
 reason = "succinctly has no bytecode to trace; the flag is rejected (exit 2)."
 
 [[divergence]]
-id = "cli:stream-slurp"
-category = "to-triage"
-reason = "`--stream -s` : jq 1.7.1 prints the stream's closing event as a separate value (`[[1]]`); succinctly folds it into the one slurped array."
-
-[[divergence]]
 id = "cli:files-missing-continues"
 category = "to-triage"
 reason = "jq reads the remaining files after one cannot be opened (and exits 2); succinctly stops at the first missing file."
