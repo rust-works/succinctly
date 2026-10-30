@@ -19,6 +19,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
+/// A row whose slowest tool has a median above this many milliseconds is long
+/// enough that run-to-run noise (scheduler, frequency, cache state) dominates
+/// the figure, so it is given more repetitions (#5581). The shorter rows are
+/// stable and stay as they are.
+pub const SLOW_ROW_MS: f64 = 15.0;
+/// How many repetitions a slow row is topped up to, at least.
+pub const SLOW_ROW_REPS: usize = 21;
+/// The most extra wall time, summed over every tool, a row may spend on timed top-up
+/// repetitions (the untimed peak-RSS runs are not counted), so a 100 MB row of several seconds is not tripled.
+pub const SLOW_ROW_EXTRA_BUDGET_MS: f64 = 30_000.0;
+
 /// Tiers in ascending size; a query's `max_tier` caps how far up it runs.
 pub const TIERS: &[&str] = &["1mb", "10mb", "100mb"];
 
@@ -172,8 +183,15 @@ pub struct PerfRow {
     /// Subject vs the secondary reference, when there is one.
     pub gate_secondary: Option<Gate>,
     pub tools: Vec<ToolResult>,
+    /// Timed repetitions each tool ran (a slow row is topped up past the requested count).
+    pub reps: usize,
     /// Median ratios (reference ÷ subject); `None` unless that pair's output matched.
     pub speedup_primary: Option<f64>,
+    /// The speedups above are ratios of each tool's minimum rather than its median: set for a
+    /// slow row ([`SLOW_ROW_MS`]) that reached [`SLOW_ROW_REPS`] repetitions, whose median the
+    /// run-to-run noise moves. A slow row the time budget cut short keeps the median, since the
+    /// minimum of a handful of runs is no steadier. `secondary_over_primary` is always a median.
+    pub ratio_from_min: bool,
     pub speedup_secondary: Option<f64>,
     /// Secondary ÷ primary median, so a change in the reference's own speed is visible.
     pub secondary_over_primary: Option<f64>,
@@ -338,6 +356,31 @@ fn cv_pct(samples: &[f64]) -> f64 {
     100.0 * var.sqrt() / mean
 }
 
+/// Is any tool's median over [`SLOW_ROW_MS`]?
+fn is_slow(samples: &[Vec<f64>]) -> bool {
+    samples
+        .iter()
+        .filter(|s| !s.is_empty())
+        .any(|s| stats(s).median_ms > SLOW_ROW_MS)
+}
+
+/// How many repetitions to add to `done` already taken: none for a row whose
+/// slowest median is at most [`SLOW_ROW_MS`]; otherwise up to
+/// [`SLOW_ROW_REPS`] in total, held to [`SLOW_ROW_EXTRA_BUDGET_MS`] of extra
+/// wall time across every tool.
+fn extra_reps(samples: &[Vec<f64>], done: usize) -> usize {
+    if !is_slow(samples) {
+        return 0;
+    }
+    let per_rep: f64 = samples
+        .iter()
+        .filter(|s| !s.is_empty())
+        .map(|s| stats(s).median_ms)
+        .sum();
+    let affordable = (SLOW_ROW_EXTRA_BUDGET_MS / per_rep) as usize;
+    SLOW_ROW_REPS.saturating_sub(done).min(affordable)
+}
+
 fn median_u64(mut v: Vec<u64>) -> Option<u64> {
     v.sort_unstable();
     v.get(v.len() / 2).copied()
@@ -385,7 +428,9 @@ pub fn run_row(
         gate,
         gate_secondary,
         tools: vec![],
+        reps: 0,
         speedup_primary: None,
+        ratio_from_min: false,
         speedup_secondary: None,
         secondary_over_primary: None,
         rss_ratio_primary: None,
@@ -400,12 +445,19 @@ pub fn run_row(
     for t in tools {
         time_once(t, &args, inputs_dir)?;
     }
-    for rep in 0..reps {
+    let mut rep = 0;
+    let mut total = reps;
+    while rep < total {
         for k in 0..tools.len() {
             let i = (rep + k) % tools.len();
             samples[i].push(time_once(&tools[i], &args, inputs_dir)?);
         }
+        rep += 1;
+        if rep == reps {
+            total += extra_reps(&samples, reps);
+        }
     }
+    row.reps = total;
     for (i, t) in tools.iter().enumerate() {
         let mem: Vec<MemSample> = (0..3).map(|_| mem_once(t, &args, inputs_dir)).collect();
         let rss = median_u64(mem.iter().filter_map(|m| m.rss_kb).collect());
@@ -419,13 +471,24 @@ pub fn run_row(
         });
     }
     row.noisy = row.tools.iter().any(|t| t.cv_pct.is_some_and(|c| c > 5.0));
-    let med = |i: usize| row.tools[i].stats.as_ref().map(|s| s.median_ms);
-    row.speedup_primary = Some(med(1).unwrap() / med(0).unwrap());
+    // A slow row's median moves with the run (a control read 0.75x-1.40x, #5581) while its
+    // minimum does not, so a row that got the full top-up rates each pair by the minimum.
+    row.ratio_from_min = is_slow(&samples) && total >= SLOW_ROW_REPS;
+    let from_min = row.ratio_from_min;
+    let stat = |i: usize, min: bool| {
+        row.tools[i]
+            .stats
+            .as_ref()
+            .map(|s| if min { s.min_ms } else { s.median_ms })
+            .unwrap()
+    };
+    row.speedup_primary = Some(stat(1, from_min) / stat(0, from_min));
     if gate_secondary == Some(Gate::Match) {
-        row.speedup_secondary = Some(med(2).unwrap() / med(0).unwrap());
+        row.speedup_secondary = Some(stat(2, from_min) / stat(0, from_min));
     }
     if tools.len() > 2 && digest[1] == digest[2] {
-        row.secondary_over_primary = Some(med(2).unwrap() / med(1).unwrap());
+        // The reference's own change in speed: its run-to-run spread is the point, so a median.
+        row.secondary_over_primary = Some(stat(2, false) / stat(1, false));
     }
     let ratio = |a: Option<u64>, b: Option<u64>| match (a, b) {
         (Some(s), Some(r)) if r > 0 => Some(s as f64 / r as f64),
@@ -564,6 +627,59 @@ mod tests {
         ];
         let kb = private_once(&tool, &args, Path::new("."), None).expect("sampled");
         assert!(kb >= 60 * 1024, "{kb} KiB");
+    }
+
+    #[test]
+    fn only_a_slow_row_is_topped_up_and_the_extra_time_is_capped() {
+        let quick = vec![vec![2.0; 3], vec![3.0; 3]];
+        assert_eq!(
+            extra_reps(&quick, 3),
+            0,
+            "a row under the threshold is left alone"
+        );
+        let slow = vec![vec![40.0; 3], vec![50.0; 3]];
+        assert_eq!(extra_reps(&slow, 3), SLOW_ROW_REPS - 3);
+        assert_eq!(extra_reps(&slow, SLOW_ROW_REPS), 0, "already at the target");
+        let huge = vec![vec![4_000.0; 3], vec![5_000.0; 3]];
+        assert_eq!(
+            extra_reps(&huge, 3),
+            3,
+            "the budget bounds a multi-second row"
+        );
+        let slower = vec![vec![40_000.0; 3], vec![50_000.0; 3]];
+        assert_eq!(extra_reps(&slower, 3), 0);
+    }
+
+    /// One slow tool is enough: the row's figure is dominated by that tool's noise.
+    #[test]
+    fn a_single_slow_tool_tops_the_row_up() {
+        let mixed = vec![vec![1.0; 3], vec![30.0; 3]];
+        assert!(extra_reps(&mixed, 3) > 0);
+    }
+
+    #[test]
+    fn a_slow_row_runs_the_topped_up_repetitions() {
+        let q = parse_queries("q\t-\tx\tnone\t1mb\n").unwrap().remove(0);
+        let slow = sh("slow", "sleep 0.02");
+        let row = run_row(&[slow.clone(), slow], &q, None, Path::new("."), 3).unwrap();
+        assert_eq!(row.reps, SLOW_ROW_REPS);
+        assert!(row
+            .tools
+            .iter()
+            .all(|t| t.stats.as_ref().unwrap().n == SLOW_ROW_REPS));
+        assert!(
+            row.ratio_from_min,
+            "a slow row's ratios come from the minimum"
+        );
+    }
+
+    #[test]
+    fn a_fast_row_keeps_the_requested_repetitions() {
+        let q = parse_queries("q\t-\tx\tnone\t1mb\n").unwrap().remove(0);
+        let t = sh("t", ":");
+        let row = run_row(&[t.clone(), t], &q, None, Path::new("."), 3).unwrap();
+        assert_eq!(row.reps, 3);
+        assert!(!row.ratio_from_min, "a fast row keeps the median ratio");
     }
 
     #[test]

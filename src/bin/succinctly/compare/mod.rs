@@ -841,8 +841,19 @@ fn run_verify(
         };
         let o = was["speedup_primary"].as_f64().unwrap_or(f64::NAN);
         if !verify::timing_agrees(o, n, verify::max_cv(was), verify::max_cv(&now)) {
+            let basis = |min: bool| if min { "minimum" } else { "median" };
+            let was_min = was["ratio_from_min"].as_bool().unwrap_or(false);
+            let note = if was_min == row.ratio_from_min {
+                String::new()
+            } else {
+                format!(
+                    " (the recorded ratio is of the {}, this one of the {}: regenerate the report)",
+                    basis(was_min),
+                    basis(row.ratio_from_min)
+                )
+            };
             failures.push(format!(
-                "perf:{query}@{input} speedup was {o:.2}x, now {n:.2}x"
+                "perf:{query}@{input} speedup was {o:.2}x, now {n:.2}x{note}"
             ));
         }
     }
