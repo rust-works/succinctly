@@ -54,7 +54,7 @@ portable-popcount = []
 serde = ["dep:serde"]
 
 # CLI tool features
-cli = ["std", "clap", "rand", "rand_chacha", "anyhow", "serde_json", "memmap2", "md5", "serde", "ctrlc", "regex", "local-zone"]
+cli = ["std", "clap", "rand", "rand_chacha", "anyhow", "serde_json", "memmap2", "md5", "serde", "ctrlc", "regex", "local-zone", "dep:libc"]
 
 # Resolve the system's local time zone for jq's `localtime`/`strflocaltime`
 # (#3054) through jiff: an IANA `TZ` name or the system zone, with the offset
@@ -138,6 +138,12 @@ sha2 = { version = "0.10.9", optional = true }
 # The system time zone for the `local-zone` feature. Not on Windows, which has no
 # zoneinfo directory for `tzdb-zoneinfo` to read: the released Windows binary keeps
 # the POSIX-offset-string model exactly (#3054).
+# `libc` for the CLI's one `signal(SIGPIPE, SIG_DFL)` call (#5547): Rust starts a process with
+# SIGPIPE ignored, where jq and yq die of it, so `tool | head -n1` is quiet and exits 141.
+# Already in the tree through `ctrlc` and `jiff`, so no new crate.
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
 [target.'cfg(not(windows))'.dependencies]
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"], optional = true }
 

@@ -2864,6 +2864,7 @@ mod json_validate;
 mod m2_gate;
 mod output;
 mod select_stats_report;
+mod sigpipe;
 mod text_generators;
 mod text_validate;
 mod utf8_bench;

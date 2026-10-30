@@ -4553,6 +4553,7 @@ pub(crate) fn silence_depth_guard_panic_line() {
 /// Run the jq command with the given arguments.
 /// Returns the exit code (0 for success, non-zero for various errors).
 pub fn run_jq(mut args: JqCommand) -> Result<i32> {
+    super::sigpipe::restore_default();
     silence_depth_guard_panic_line();
     args.resolve_positional_args();
     // The order only matters between two or more named flags: a command line with fewer builds no clap definition for it.

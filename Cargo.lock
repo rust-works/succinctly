@@ -1207,6 +1207,7 @@ dependencies = [
  "indexmap",
  "insta",
  "jiff",
+ "libc",
  "libm",
  "md5",
  "memchr",
