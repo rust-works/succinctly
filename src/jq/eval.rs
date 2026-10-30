@@ -98403,6 +98403,19 @@ pub(crate) fn each_pattern_binding_set_at<S: EvalSemantics, C: DocumentCursor>(
     )
 }
 
+/// Whether `body` reads the destructured variable `name` where jq's identity
+/// short-circuit can see it: compared by value, or handed out of the body
+/// ([`loop_var_can_be_compared`], [`loop_var_can_reach_output`], the fold gate's
+/// own questions, #5516). Asked only of a container, per binding, so a
+/// destructuring of scalars (the common `. as [$k, $v]`) never walks `body`.
+/// Anything else is read by value and keeps the literal, which leaves the in-place
+/// assignment and arithmetic steps their unmarked operands (#3138, #3944, #4005).
+fn destructured_variable_shares_identity(body: &Expr, name: &str) -> bool {
+    let names = [name.to_string()];
+    mentions_any_name(body, &names)
+        && (loop_var_can_be_compared(body, &names) || loop_var_can_reach_output(body, &names))
+}
+
 /// `body` with every variable of one binding set substituted (#3466): a
 /// binding that names a document node goes through the marker route -- first
 /// telling `register` (the caller's embed-table and anchor push, whose guards
@@ -98426,6 +98439,26 @@ pub(crate) fn substitute_destructured_bindings<S: EvalSemantics>(
     for (name, value, origin) in bindings {
         let source = current.as_ref().unwrap_or(body);
         current = Some(match origin {
+            // #5539: a container bound from a value that names no node of the
+            // document (`[[nan]] as $a | $a as [$x]`) is a child of the source's own
+            // storage, as jq's `$x` is, so it is spliced as that storage when the
+            // body can compare it or hand it on, not as a rebuilt literal.
+            None if S::EQUALITY_SHORT_CIRCUITS_ON_IDENTITY
+                && matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_))
+                && destructured_variable_shares_identity(source, name) =>
+            {
+                substitute_bound_var_at(
+                    &Expr::Literal(Literal::Null),
+                    source,
+                    name,
+                    value,
+                    None,
+                    None,
+                    None,
+                    S::TAG == EvalTag::Jq,
+                    true,
+                )
+            }
             None => substitute_var(source, name, value),
             Some((node, document)) => {
                 let origin = BindOrigin::Node {

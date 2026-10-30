@@ -11835,6 +11835,11 @@ The shortcut fires only where `==` is handed two handles on one storage, so the 
   kind of marker when UPDATE or EXTRACT can compare it (#3896) or hand it out of the step
   ([#5516](https://github.com/rust-works/succinctly/issues/5516)).
   So `[nan] as $a | last($a) == $a` and `reduce $a as $v (null; [$v]) | .[0] == $a` are `true`, as in jq (`last(f)` is `reduce f as $x (null; $x)`).
+- **An `as` destructuring.** A container a pattern binds from a value that names no node of the
+  document is spliced as the same kind of marker when the body can compare it or hand it on
+  ([#5539](https://github.com/rust-works/succinctly/issues/5539)), so `[[nan]] as $a | $a as [$x] | $x == $a[0]` is `true`, as in jq,
+  and `$a as [$x] | $x == [nan]`, a fresh container, stays `false`.
+  A body that only reads the name by value (an index key, an assignment's right-hand side) keeps the literal, for the reason the fold row below gives.
 
 Still different:
 
@@ -11842,8 +11847,6 @@ Still different:
   .x = $v) | .x == $a`, `reduce $a as $v ([]; . + [$v]) | .[0] == $a` and jq's own spelling of
   `add`, `reduce $a[] as $v (null; . + $v)`, are `false` here and `true` in jq.
   Those steps run in place on the owned accumulator (#3138, #3944), and a marker there makes them decline and copy the accumulator on every step (#4005), so they keep the rebuilt operand; the `add` builtin itself answers `true`.
-- **`as` destructuring.** `[[nan]] as $a | $a as [$x] | $x == $a[0]` is `false` here and `true` in jq: a destructured name is spliced as a rebuilt literal, in or out of a fold.
-
 - **Slices.** `.[0:]` and any other full-range slice hand back the array itself, as jq's view
   does. An equal-bounds *partial* slice is a view onto the same storage in jq (pointer, offset
   and size all equal), so `.[0:1] == .[0:1]` is identical there; here each slice is a new
