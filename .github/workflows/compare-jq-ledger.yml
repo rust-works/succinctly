@@ -31,6 +31,8 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/compare-jq-build.sh'
+      - 'scripts/ledger_refs.py'
+      - 'scripts/test_ledger_refs.py'
       - '.github/workflows/compare-jq-ledger.yml'
   push:
     branches: [main]
@@ -40,6 +42,8 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/compare-jq-build.sh'
+      - 'scripts/ledger_refs.py'
+      - 'scripts/test_ledger_refs.py'
       - '.github/workflows/compare-jq-ledger.yml'
   schedule:
     - cron: '41 5 * * 1'      # weekly, Monday 05:41 UTC
@@ -53,6 +57,33 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # A branch that fixes a `to-triage` divergence has to delete its ledger entry in the same
+  # change (#5585). The `ledger` job below catches a stale entry too, but only after two jq
+  # builds and ~2 minutes of probes; this one needs neither, so it reports in seconds. Pull
+  # requests only: it compares the branch with its merge base. See scripts/ledger_refs.py for
+  # the `[ledger keeps #N]` waiver.
+  refs:
+    name: Ledger entries left behind
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0                                  # the merge base and the branch's commits
+          ref: ${{ github.event.pull_request.head.sha }}  # not the merge commit, whose subject names no issue
+
+      - name: Unit-test the check
+        run: python3 scripts/test_ledger_refs.py -v
+
+      # Branch and base go through env, never interpolated into the script.
+      - name: No to-triage entry left for an issue this branch references
+        env:
+          BRANCH: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          python3 scripts/ledger_refs.py check \
+            --base "$(git merge-base HEAD "origin/$BASE_REF")" --branch "$BRANCH"
+
   ledger:
     name: Ledger drift
     runs-on: ubuntu-latest
