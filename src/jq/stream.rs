@@ -298,6 +298,7 @@ pub(crate) fn stream_owned_value_json<W: core::fmt::Write>(
         real_output_infinite_float,
         real_output_infinite_literal,
         yq_json_finite_literal,
+        false,
     )
 }
 
@@ -381,6 +382,7 @@ pub fn stream_owned_value_json_jq<W: core::fmt::Write>(
         |negative| infinite_float_preview_text(negative).to_string(),
         preview_infinite_literal,
         format_number_for_preview,
+        true,
     )
 }
 
@@ -421,6 +423,7 @@ pub(crate) fn stream_owned_value_json_jq_preserve_input<W: core::fmt::Write>(
         real_output_infinite_float,
         real_output_infinite_literal,
         real_output_finite_literal,
+        true,
     )
 }
 
@@ -458,6 +461,7 @@ pub(crate) fn stream_owned_value_json_jq_output<W: core::fmt::Write>(
         real_output_infinite_float,
         real_output_infinite_literal,
         format_number_jq_compat,
+        true,
     )
 }
 
@@ -518,6 +522,7 @@ fn stream_owned_value_json_with<W: core::fmt::Write>(
     infinite_float: fn(bool) -> String,
     infinite_literal: fn(&[u8]) -> String,
     finite_literal: fn(&[u8]) -> String,
+    jq_printer: bool,
 ) -> core::fmt::Result {
     stream_owned_value_json_with_at_depth(
         value,
@@ -531,12 +536,17 @@ fn stream_owned_value_json_with<W: core::fmt::Write>(
         infinite_float,
         infinite_literal,
         finite_literal,
+        jq_printer,
         0,
     )
 }
 
 /// Panics past [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH)
 /// levels of nesting (#1021, following #1005's precedent).
+///
+/// `jq_printer` is one of jq's writers, which prints anything more than
+/// [`JQ_MAX_PRINT_DEPTH`](super::value::JQ_MAX_PRINT_DEPTH) levels down as
+/// [`SKIPPED_TOO_DEEP`](super::value::SKIPPED_TOO_DEEP) (#5497); yq's prints the whole value.
 #[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors stream_owned_value_json_with's own suppression above.
 fn stream_owned_value_json_with_at_depth<W: core::fmt::Write>(
     value: &OwnedValue,
@@ -550,8 +560,12 @@ fn stream_owned_value_json_with_at_depth<W: core::fmt::Write>(
     infinite_float: fn(bool) -> String,
     infinite_literal: fn(&[u8]) -> String,
     finite_literal: fn(&[u8]) -> String,
+    jq_printer: bool,
     depth: usize,
 ) -> core::fmt::Result {
+    if jq_printer && depth > super::value::JQ_MAX_PRINT_DEPTH {
+        return out.write_str(super::value::SKIPPED_TOO_DEEP);
+    }
     assert_value_tree_depth(depth);
     match value {
         OwnedValue::Null => out.write_str("null"),
@@ -602,6 +616,7 @@ fn stream_owned_value_json_with_at_depth<W: core::fmt::Write>(
                     infinite_float,
                     infinite_literal,
                     finite_literal,
+                    jq_printer,
                     depth + 1,
                 )?;
             }
@@ -652,6 +667,7 @@ fn stream_owned_value_json_with_at_depth<W: core::fmt::Write>(
                 infinite_float,
                 infinite_literal,
                 finite_literal,
+                jq_printer,
                 depth + 1,
             )?;
             if indent_spaces > 0 {
@@ -700,6 +716,7 @@ fn write_object_entries<'a, W: core::fmt::Write>(
     infinite_float: fn(bool) -> String,
     infinite_literal: fn(&[u8]) -> String,
     finite_literal: fn(&[u8]) -> String,
+    jq_printer: bool,
     depth: usize,
 ) -> core::fmt::Result {
     for (i, (key, value)) in entries.enumerate() {
@@ -724,6 +741,7 @@ fn write_object_entries<'a, W: core::fmt::Write>(
             infinite_float,
             infinite_literal,
             finite_literal,
+            jq_printer,
             depth,
         )?;
     }
@@ -938,6 +956,7 @@ pub(crate) fn owned_value_to_yq_json_string(value: &OwnedValue, indent: usize) -
         real_output_infinite_float,
         real_output_infinite_literal,
         yq_json_finite_literal,
+        false,
     )
     .expect("writing to a String cannot fail");
     if indent > 0 {

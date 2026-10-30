@@ -16,6 +16,7 @@ use succinctly::jq::escape::{
 use succinctly::jq::{
     assert_value_tree_depth, format_number_jq_compat, jq_bare_float_display,
     nonfinite_display_string, EvalError, JqSemantics, NumberRepr, OwnedValue, StreamError,
+    JQ_MAX_PRINT_DEPTH, SKIPPED_TOO_DEEP,
 };
 pub use succinctly::yaml::format_float_yq;
 
@@ -256,6 +257,15 @@ impl ErrorSink {
             self.program_errors += 1;
         }
         self.emit(style, &err.message, err.not_a_string, at);
+    }
+
+    /// Report jq's parser refusing an input document, as jq's `main` prints it:
+    /// `jq: parse error: <message>`, with no input location (#5497). jq reads no further after
+    /// one, so the caller stops the run, and this fails it like any other report.
+    pub fn report_parse_error(&mut self, message: &str) {
+        eprintln!("jq: parse error: {message}");
+        self.hit = true;
+        self.report_count += 1;
     }
 
     /// Report a `break` that escaped its label — an uncaught error like any other.
@@ -575,6 +585,80 @@ pub struct JsonFormatOpts<'a> {
 /// recolored (as `null`) before the text ever reaches a user.
 pub(crate) const NAN_COLOR_MARKER: &str = "nan";
 
+/// The kind of a value jq's writer prints as [`SKIPPED_TOO_DEEP`], which colors the marker as
+/// it would have colored the value (#5497).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SkippedKind {
+    Null,
+    False,
+    True,
+    Number,
+    String,
+    Array,
+    Object,
+}
+
+impl SkippedKind {
+    pub(crate) fn of(value: &OwnedValue) -> Self {
+        match value {
+            OwnedValue::Null => Self::Null,
+            OwnedValue::Bool(false) => Self::False,
+            OwnedValue::Bool(true) => Self::True,
+            OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
+                Self::Number
+            }
+            OwnedValue::String(_) => Self::String,
+            OwnedValue::Array(_) => Self::Array,
+            OwnedValue::Object(_) => Self::Object,
+        }
+    }
+
+    /// What a writer puts where jq prints [`SKIPPED_TOO_DEEP`]: the marker itself, or, in text
+    /// about to be colored (`for_color`), a `<k>` placeholder [`JsonColorizer`] replaces with
+    /// the marker in the kind's color. The same smuggling as [`NAN_COLOR_MARKER`], and no
+    /// other token a writer emits starts with `<`.
+    pub(crate) fn marker(self, for_color: bool) -> &'static str {
+        if !for_color {
+            return SKIPPED_TOO_DEEP;
+        }
+        match self {
+            Self::Null => "<n>",
+            Self::False => "<f>",
+            Self::True => "<t>",
+            Self::Number => "<0>",
+            Self::String => "<s>",
+            Self::Array => "<a>",
+            Self::Object => "<o>",
+        }
+    }
+
+    /// The kind a [`Self::marker`] placeholder names, by its middle character.
+    fn from_placeholder(kind: char) -> Option<Self> {
+        Some(match kind {
+            'n' => Self::Null,
+            'f' => Self::False,
+            't' => Self::True,
+            '0' => Self::Number,
+            's' => Self::String,
+            'a' => Self::Array,
+            'o' => Self::Object,
+            _ => return None,
+        })
+    }
+
+    fn color(self, scheme: &ColorScheme) -> &str {
+        match self {
+            Self::Null => &scheme.null,
+            Self::False => &scheme.false_,
+            Self::True => &scheme.true_,
+            Self::Number => &scheme.number,
+            Self::String => &scheme.string,
+            Self::Array => &scheme.array,
+            Self::Object => &scheme.object,
+        }
+    }
+}
+
 /// Escape a JSON string body per the opts' control-escape style and ASCII mode.
 fn escape_json_body(s: &str, opts: &JsonFormatOpts) -> String {
     // The escape table is a *mode* rule, independent of the
@@ -621,6 +705,11 @@ pub fn format_json(value: &OwnedValue, opts: &JsonFormatOpts) -> String {
 /// with no adversarial document involved; `serde_json`'s own input-depth
 /// limit (used elsewhere on this eager-output path) never sees it.
 fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> String {
+    if level > JQ_MAX_PRINT_DEPTH && opts.convention.skips_past_print_depth() {
+        return SkippedKind::of(value)
+            .marker(opts.mark_nan_for_color)
+            .to_string();
+    }
     assert_value_tree_depth(level);
     let indent = opts.indent;
     let compact = indent.is_empty();
@@ -1029,6 +1118,8 @@ enum JsonToken {
     N,
     /// `na` of the NaN marker: the next character, whatever it is, ends it.
     Na,
+    /// A [`SkippedKind::marker`] placeholder, and its kind once read: `>` ends it.
+    Skipped(Option<char>),
 }
 
 /// [`colorize_json`] one chunk at a time, for a streamed render (#808):
@@ -1115,6 +1206,8 @@ impl JsonColorizer {
                 push_nan(scheme, result);
                 self.value_done(scheme, result);
             }
+            // Only a writer's own placeholder starts one, and it is always whole.
+            JsonToken::Skipped(_) => {} // patchcov: coverage tolerate-line reason="unreachable: a writer emits a placeholder whole, so the text never ends inside one (#5497)"
         }
     }
 
@@ -1168,6 +1261,21 @@ impl JsonColorizer {
                 self.value_done(scheme, result);
                 return;
             }
+            JsonToken::Skipped(None) => {
+                self.token = JsonToken::Skipped(Some(c));
+                return;
+            }
+            JsonToken::Skipped(Some(kind)) => {
+                // `c` is the closing `>`. jq writes the color of the value it skipped, the
+                // marker and a reset (#5497).
+                self.token = JsonToken::None;
+                let kind = SkippedKind::from_placeholder(kind).unwrap_or(SkippedKind::Null);
+                result.push_str(kind.color(scheme));
+                result.push_str(SKIPPED_TOO_DEEP);
+                result.push_str(&scheme.reset);
+                self.value_done(scheme, result);
+                return;
+            }
         }
 
         if self.escape_next {
@@ -1214,6 +1322,7 @@ impl JsonColorizer {
                     result.push(c);
                     self.in_string = true;
                 }
+                '<' => self.token = JsonToken::Skipped(None),
                 '{' => {
                     result.push_str(&scheme.object);
                     result.push(c);
@@ -2557,7 +2666,9 @@ mod tests {
     /// accumulator growing one level per iteration), which has no
     /// adversarial *document* behind it — `format_json_impl` must
     /// independently refuse to recurse past the same limit rather than
-    /// overflow the stack.
+    /// overflow the stack. Under jq's conventions it stops at jq's print depth
+    /// first (#5497, `format_json_writes_the_marker_past_print_depth_5497`), so
+    /// the limit is yq's.
     #[test]
     fn format_json_panics_past_nesting_depth_limit_1005() {
         use succinctly::jq::MAX_VALUE_TREE_DEPTH;
@@ -2567,7 +2678,7 @@ mod tests {
             indent: "",
             sort_keys: false,
             ascii: false,
-            convention: JsonConvention::JqCompat,
+            convention: JsonConvention::Preserve,
             json_sourced: false,
         };
 
@@ -2581,6 +2692,40 @@ mod tests {
             result.is_err(),
             "format_json should panic at MAX_VALUE_TREE_DEPTH"
         );
+    }
+
+    /// jq's conventions print anything more than jq's print depth down as the marker, or, in
+    /// text about to be colored, as the placeholder the colorizer turns into the marker in the
+    /// skipped value's color (#5497).
+    #[test]
+    fn format_json_writes_the_marker_past_print_depth_5497() {
+        use succinctly::jq::JQ_MAX_PRINT_DEPTH;
+
+        let mut opts = JsonFormatOpts {
+            mark_nan_for_color: false,
+            indent: "",
+            sort_keys: false,
+            ascii: false,
+            convention: JsonConvention::JqCompat,
+            json_sourced: false,
+        };
+        let open = "[".repeat(JQ_MAX_PRINT_DEPTH + 1);
+        let close = "]".repeat(JQ_MAX_PRINT_DEPTH + 1);
+        let past = linear_array_nest(JQ_MAX_PRINT_DEPTH + 1);
+        assert_eq!(
+            format_json(&past, &opts),
+            format!("{open}{SKIPPED_TOO_DEEP}{close}")
+        );
+        opts.mark_nan_for_color = true;
+        let text = format_json(&past, &opts);
+        assert_eq!(text, format!("{open}<n>{close}"));
+        let colored = colorize_json(&text, &ColorScheme::default());
+        let marker = format!(
+            "{}{SKIPPED_TOO_DEEP}{}",
+            default_colors::NULL,
+            default_colors::RESET
+        );
+        assert!(colored.contains(&marker), "{colored}");
     }
 
     /// Pins `Terminator::from_flags`'s precedence table by name (#1711),

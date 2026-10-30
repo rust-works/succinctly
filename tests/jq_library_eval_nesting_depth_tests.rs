@@ -300,3 +300,75 @@ fn test_public_eval_path_of_recursive_descent_fits_a_default_test_thread_3850() 
         );
     }
 }
+
+/// `{"a":{"a":...{"b":1}...}}`, `depth` levels of object nesting.
+fn nested_objects_with_b(depth: usize) -> String {
+    format!(
+        "{}{{\"b\":1}}{}",
+        "{\"a\":".repeat(depth),
+        "}".repeat(depth)
+    )
+}
+
+/// #3429/#3020: `[.. | key]` walks a document natively up to `MAX_PATH_WALK_DEPTH` (384) and
+/// refuses past it. Pinned here since #5497, when the CLI began refusing a document past jq's
+/// parse-depth limit before any filter runs, which no longer lets a CLI document reach it.
+#[test]
+fn test_public_eval_recurse_only_walk_3429_3020() {
+    assert_eq!(
+        run_on_big_stack(nested_arrays(300), "[.. | key] | length".to_string()),
+        Ok(vec!["300".to_string()])
+    );
+    let (decode_failure, message) =
+        run_on_big_stack(nested_arrays(400), "[.. | key]".to_string()).expect_err("refuses");
+    assert!(decode_failure, "{message}");
+    assert_eq!(message, "nesting depth exceeds limit of 384");
+}
+
+/// #3020: `.b`'s field step past a deeply seeded `..` candidate does not count the seeded
+/// ancestry as native recursion. Pinned here since #5497 (see the test above).
+#[test]
+fn test_public_eval_key_past_a_seeded_deep_position_3020() {
+    assert_eq!(
+        run_on_big_stack(
+            nested_objects_with_b(300),
+            r#"[.. | select(type=="object" and has("b")) | [.b | key]]"#.to_string()
+        ),
+        Ok(vec![r#"[["b"]]"#.to_string()])
+    );
+}
+
+/// #3179: nested reuse skips the walk of a shared subtree, so it must never skip the
+/// nesting-depth check that walk would have failed: `.a` is `n` arrays deep and sits at depth 1
+/// of the root `{k:.}` materializes, so the walk passes at 255 and raises at 256. A duplicate
+/// key the walk descends into but the value drops still fails it. Pinned here since #5497 (see
+/// `test_public_eval_recurse_only_walk_3429_3020`).
+#[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
+#[test]
+fn test_public_eval_embed_nested_reuse_keeps_the_depth_limit_3179() {
+    let nested = |n: usize| format!(r#"{{"a":{}{}}}"#, "[".repeat(n), "]".repeat(n));
+    for filter in [
+        r".a as $y | {k:.} | .k.a | path($y)",
+        r".a as $y | {k:., j:1} | .k.a | path($y)",
+    ] {
+        assert_eq!(
+            run_on_big_stack(nested(255), filter.to_string()),
+            Ok(vec!["[]".to_string()]),
+            "{filter}"
+        );
+        let (_, message) = run_on_big_stack(nested(256), filter.to_string()).expect_err("refuses");
+        assert!(message.contains("nesting depth"), "{filter}: {message}");
+    }
+    let dup = format!(
+        r#"{{"a":{{"x":{}1{},"x":1}}}}"#,
+        "[".repeat(254),
+        "]".repeat(254)
+    );
+    for filter in [r"{k:., j:1} | .k.a", r".a as $y | {k:., j:1} | .k.a"] {
+        let (_, message) = run_on_big_stack(dup.clone(), filter.to_string()).expect_err("refuses");
+        assert!(
+            message.contains("nesting depth"),
+            "dup `{filter}`: {message}"
+        );
+    }
+}

@@ -204,12 +204,14 @@ fn test_group_by_checks_every_element_before_reading_a_key_5306() -> Result<()> 
     Ok(())
 }
 
-/// The elements sit one level inside the array: 256 levels of nesting in an element is one level
-/// too many, as it is for every other builtin that reads the array whole.
+/// The elements sit one level inside the array: a scalar 256 levels down in an element is one
+/// level too many, as it is for every other builtin that reads the array whole. (#5497: that is
+/// as deep as a document reads, jq's parser refusing one more array.)
 #[test]
 fn test_group_by_counts_nesting_from_the_array_5306() -> Result<()> {
     let deep = |levels: usize| format!("[{}{}]", "[".repeat(levels), "]".repeat(levels));
-    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by(.a?) | length"], Some(&deep(256)))?;
+    let band = format!("[{}1{}]", "[".repeat(255), "]".repeat(255));
+    let (stdout, stderr, code) = run_jq_full(&["-c", "group_by(.a?) | length"], Some(&band))?;
     assert_eq!((stdout.as_str(), code), ("", 5), "{stderr}");
     assert!(
         stderr.contains("nesting depth exceeds limit of 256"),

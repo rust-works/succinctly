@@ -26002,62 +26002,76 @@ fn nested_objects_with_b(depth: usize) -> String {
     )
 }
 
-/// #3020, jq-mode twin of `yq_cli_tests.rs`'s
-/// `test_key_past_a_seeded_deep_position_does_not_panic_3020`: `..`'s own
-/// descent into a >256-deep document is an iterative worklist walk here
-/// (`select` after it forces the per-candidate sink route, `try_path_
-/// context_walk_sink`/`continue_pipe_element_generic`), not native
-/// recursion -- confirmed separately not to panic even at 2000 levels. Only
-/// `.b`'s single field step past that (deeply seeded) candidate used to
-/// panic, because `path_context_root` seeds the candidate's own trail with
-/// its full document ancestry and the guard counted that seeded depth as
-/// native recursion. Real jq answers `[["b"]]` regardless of depth.
-#[test]
-fn test_key_past_a_seeded_deep_position_does_not_panic_3020() -> Result<()> {
-    let doc = nested_objects_with_b(300);
-    let (stdout, stderr, code) = run_jq_full(
-        &[
-            "-c",
-            r#"[.. | select(type=="object" and has("b")) | [.b | key]]"#,
-        ],
-        Some(&doc),
-    )?;
-    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout.trim_end(), r#"[["b"]]"#);
-    Ok(())
+/// jq 1.7.1's line for a document past its parse-depth limit (#5497), which every document route
+/// now refuses before any filter runs: `nested_arrays(n)` for any `n` past 256 is refused at
+/// `line 1, column 257`.
+fn jq_parse_depth_refusal(line: usize, column: usize) -> String {
+    format!("jq: parse error: Exceeds depth limit for parsing at line {line}, column {column}\n")
 }
 
-/// #3020 companion: a `..` walk with *no* rest-pipe stage after it (`key`
-/// evaluated inside the same walked portion, not through a re-seeded
-/// downstream candidate) genuinely does recurse natively once per document
-/// level via `path_context_step_recurse` -- confirmed by the panic site
-/// itself (that function's own entry guard, not `path_field_step_generic`'s).
-/// This must keep failing past its recursion ceiling; #3020's fix only
-/// stopped a *seeded* trail from being miscounted as native recursion, it did
-/// not raise or remove the recursion guard itself. That ceiling is
-/// `MAX_PATH_WALK_DEPTH` (384) since #3429, not the materializers' 256.
+/// The document jq accepts and the materializers refuse (#5497): 256 nested arrays around a
+/// scalar, which sits at the 257th level, where `MAX_NESTING_DEPTH` (256) stops. It is the one
+/// document left that reaches their guards.
+fn materializer_band() -> String {
+    nested_arrays(256)
+}
+
+/// #3020, jq-mode twin of `yq_cli_tests.rs`'s
+/// `test_key_past_a_seeded_deep_position_does_not_panic_3020`: `.b`'s single field step past a
+/// deeply seeded `..` candidate used to panic, because `path_context_root` seeds the
+/// candidate's trail with its full document ancestry and the guard counted that seeded depth as
+/// native recursion. Real jq answers `[["b"]]` regardless of depth.
+///
+/// #5497: 300 nested objects are past jq's parse-depth limit, so that document is now refused
+/// before any filter runs, as jq refuses it; 120 levels answer. The 300-level shape is pinned
+/// through the library, which applies no parse limit
+/// (`test_public_eval_key_past_a_seeded_deep_position_3020`).
 #[test]
-fn test_recurse_only_walk_past_the_limit_still_fails_cleanly_3020() -> Result<()> {
-    let (stdout, stderr, code) = run_jq_full(&["-c", "[.. | key]"], Some(&nested_arrays(400)))?;
-    assert_eq!(stdout.trim_end(), "");
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert!(
-        stderr.contains("nesting depth exceeds limit of 384"),
-        "stderr: {stderr:?}"
+fn test_key_past_a_seeded_deep_position_does_not_panic_3020() -> Result<()> {
+    let filter = r#"[.. | select(type=="object" and has("b")) | [.b | key]]"#;
+    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&nested_objects_with_b(120)))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), r#"[["b"]]"#);
+    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&nested_objects_with_b(300)))?;
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("", jq_parse_depth_refusal(1, 641).as_str(), 5)
     );
     Ok(())
 }
 
-/// #3429: `paths`/`leaf_paths` walk a document natively, so they answer up to
-/// `MAX_PATH_WALK_DEPTH` (384) -- where `[..]` already did -- instead of
-/// stopping at the materializers' 256. 383 is the deepest document they
-/// accept: a path as long as the document is deep must stay under the ceiling.
+/// #3020 companion: a `..` walk with *no* rest-pipe stage after it recurses natively once per
+/// document level via `path_context_step_recurse`, and must keep failing past its recursion
+/// ceiling, `MAX_PATH_WALK_DEPTH` (384) since #3429.
+///
+/// #5497: a 400-level document is now refused before any filter runs, as jq refuses it; the
+/// walk's own refusal is pinned through the library (`test_public_eval_recurse_only_walk_3429_3020`).
+#[test]
+fn test_recurse_only_walk_past_the_limit_still_fails_cleanly_3020() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "[.. | key]"], Some(&nested_arrays(400)))?;
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("", jq_parse_depth_refusal(1, 257).as_str(), 5)
+    );
+    Ok(())
+}
+
+/// #3429: `paths`/`leaf_paths` walk natively, so they answer up to `MAX_PATH_WALK_DEPTH` (384)
+/// instead of stopping at the materializers' 256.
+///
+/// #5497: no document past 256 levels reads any more, so the depths past it are values the
+/// program builds; the document walk is pinned through the library
+/// (`test_public_eval_path_family_under_depth_answers_3457`).
 #[test]
 fn test_paths_and_leaf_paths_answer_between_256_and_384_3429() -> Result<()> {
     for depth in [255, 256, 300, 383] {
-        let doc = nested_arrays(depth);
         for (filter, expected) in [("[paths] | length", depth), ("[leaf_paths] | length", 1)] {
-            let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&doc))?;
+            let built = format!("reduce range({depth}) as $i (1; [.]) | {filter}");
+            let (stdout, stderr, code) = if depth <= 256 {
+                run_jq_full(&["-c", filter], Some(&nested_arrays(depth)))?
+            } else {
+                run_jq_full(&["-n", "-c", &built], None)?
+            };
             assert_eq!(
                 code, 0,
                 "{filter} @ {depth}: stdout: {stdout:?} stderr: {stderr:?}"
@@ -26072,8 +26086,10 @@ fn test_paths_and_leaf_paths_answer_between_256_and_384_3429() -> Result<()> {
     Ok(())
 }
 
-/// #3429: past 384 the same builtins refuse cleanly, and with the ceiling
-/// they actually enforce (384), not the materializers' 256.
+/// #3429: past 384 the same builtins refuse cleanly, with the ceiling they enforce (384).
+///
+/// #5497: such a document is now refused before any filter runs, as jq refuses it; the walks'
+/// own refusal is pinned through the library (`test_public_eval_path_family_over_depth_is_a_clean_error_3457`).
 #[test]
 fn test_paths_and_leaf_paths_past_384_refuse_cleanly_3429() -> Result<()> {
     for depth in [384, 500] {
@@ -26084,14 +26100,10 @@ fn test_paths_and_leaf_paths_past_384_refuse_cleanly_3429() -> Result<()> {
             "[.. | path] | length",
         ] {
             let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&doc))?;
-            assert_eq!(stdout.trim_end(), "", "{filter} @ {depth}");
             assert_eq!(
-                code, 5,
-                "{filter} @ {depth}: stdout: {stdout:?} stderr: {stderr:?}"
-            );
-            assert!(
-                stderr.contains("nesting depth exceeds limit of 384"),
-                "{filter} @ {depth}: stderr: {stderr:?}"
+                (stdout.as_str(), stderr.as_str(), code),
+                ("", jq_parse_depth_refusal(1, 257).as_str(), 5),
+                "{filter} @ {depth}"
             );
         }
     }
@@ -26102,11 +26114,13 @@ fn test_paths_and_leaf_paths_past_384_refuse_cleanly_3429() -> Result<()> {
 /// native recursion that overflows a 2 MiB debug thread at ~360 levels on aarch64, ~385 on
 /// x86_64), so it keeps the materializers' 256 ceiling even though `paths` and `.. | path` over
 /// the same document answer. Pinned so that lifting it is a deliberate change that also
-/// re-measures the materializer's stack (see `MAX_PATH_WALK_DEPTH`). `path(..)` and
-/// `path(recurse)` left this list with #3850.
+/// re-measures the materializer's stack (see `MAX_PATH_WALK_DEPTH`).
+///
+/// #5497: the document is [`materializer_band`], the deepest one jq's parser accepts that still
+/// reaches the materializers' ceiling.
 #[test]
 fn test_materializing_path_forms_still_stop_at_the_materializer_ceiling_3429() -> Result<()> {
-    let doc = nested_arrays(300);
+    let doc = materializer_band();
     let filter = "[paths(type == \"number\")] | length";
     let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&doc))?;
     assert_eq!(stdout.trim_end(), "", "{filter}");
@@ -26117,18 +26131,21 @@ fn test_materializing_path_forms_still_stop_at_the_materializer_ceiling_3429() -
     );
     let (stdout, stderr, code) = run_jq_full(&["-c", "[.. | path] | length"], Some(&doc))?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout.trim_end(), "301");
+    assert_eq!(stdout.trim_end(), "257");
     Ok(())
 }
 
-/// #3850: `path(..)`, `path(recurse)` and `path(recurse(.[]?))` walk the document with cursors
-/// instead of materializing it, so they answer up to `MAX_PATH_WALK_DEPTH` (384) -- where
-/// `.. | path` does -- instead of stopping at the materializers' 256. 383 is the deepest
-/// document: a path as long as the document is deep must stay under the ceiling.
+/// #3850: `path(..)`, `path(recurse)` and `path(recurse(.[]?))` walk with cursors instead of
+/// materializing, so they answer up to `MAX_PATH_WALK_DEPTH` (384) -- where `.. | path` does --
+/// instead of stopping at the materializers' 256.
+///
+/// #5497: no document past 256 levels reads any more, so the depths past it are values the
+/// program builds (`reduce`, whose result the walk reaches through the re-index bridge), and the
+/// document walk itself is pinned through the library
+/// (`test_public_eval_path_family_under_depth_answers_3457`).
 #[test]
 fn test_path_of_recursive_descent_answers_between_256_and_384_3850() -> Result<()> {
     for depth in [255, 256, 300, 383] {
-        let doc = nested_arrays(depth);
         for filter in [
             "[path(..)] | length",
             "[path(recurse)] | length",
@@ -26137,7 +26154,12 @@ fn test_path_of_recursive_descent_answers_between_256_and_384_3850() -> Result<(
             "first(path(..) | select(length == 5)) | length",
             "[limit(3; path(..))] | length",
         ] {
-            let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&doc))?;
+            let built = format!("reduce range({depth}) as $i (1; [.]) | {filter}");
+            let (stdout, stderr, code) = if depth <= 256 {
+                run_jq_full(&["-c", filter], Some(&nested_arrays(depth)))?
+            } else {
+                run_jq_full(&["-n", "-c", &built], None)?
+            };
             assert_eq!(
                 code, 0,
                 "{filter} @ {depth}: stdout: {stdout:?} stderr: {stderr:?}"
@@ -26192,38 +26214,45 @@ fn test_path_of_recursive_descent_edges_match_jq_3850() -> Result<()> {
     ])
 }
 
-/// #3850: a document nested between 256 and 384 levels reached through a *computed* value (no
-/// cursor to walk) still materializes and keeps the materializers' 256 ceiling, as before.
+/// #3850: a document between 256 and 384 levels reached through a *computed* value (no cursor
+/// to walk) used to materialize and keep the materializers' 256 ceiling.
+///
+/// #5497: such a document no longer reads, and the computed values that can reach the walk
+/// answer as jq does: a `map(.)` copy of the deepest document that reads, and a value the
+/// program builds past 256 levels.
 #[test]
-fn test_path_of_recursive_descent_over_a_computed_value_keeps_256_3850() -> Result<()> {
+fn test_path_of_recursive_descent_over_a_computed_value_answers_3850() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
         &["-c", "map(.) | [path(..)] | length"],
-        Some(&nested_arrays(300)),
+        Some(&materializer_band()),
     )?;
-    assert_eq!(stdout.trim_end(), "");
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert!(
-        stderr.contains("nesting depth exceeds limit of 256"),
-        "stderr: {stderr:?}"
-    );
+    assert_eq!((stdout.as_str(), code), ("257\n", 0), "stderr: {stderr:?}");
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-n",
+            "-c",
+            "reduce range(300) as $i (1; [.]) | map(.) | [path(..)] | length",
+        ],
+        None,
+    )?;
+    assert_eq!((stdout.as_str(), code), ("301\n", 0), "stderr: {stderr:?}");
     Ok(())
 }
 
 /// #3850: past 384 the same forms refuse cleanly, with the ceiling they enforce (384).
+///
+/// #5497: such a document is now refused before any filter runs, as jq refuses it; the walk's
+/// own refusal is pinned through the library (`test_public_eval_path_family_over_depth_is_a_clean_error_3457`).
 #[test]
 fn test_path_of_recursive_descent_past_384_refuses_cleanly_3850() -> Result<()> {
     for depth in [384, 500] {
         let doc = nested_arrays(depth);
         for filter in ["[path(..)] | length", "[path(recurse)] | length"] {
             let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&doc))?;
-            assert_eq!(stdout.trim_end(), "", "{filter} @ {depth}");
             assert_eq!(
-                code, 5,
-                "{filter} @ {depth}: stdout: {stdout:?} stderr: {stderr:?}"
-            );
-            assert!(
-                stderr.contains("nesting depth exceeds limit of 384"),
-                "{filter} @ {depth}: stderr: {stderr:?}"
+                (stdout.as_str(), stderr.as_str(), code),
+                ("", jq_parse_depth_refusal(1, 257).as_str(), 5),
+                "{filter} @ {depth}"
             );
         }
     }
@@ -26232,12 +26261,15 @@ fn test_path_of_recursive_descent_past_384_refuses_cleanly_3850() -> Result<()> 
 
 /// #3429: the same walk answers on a document between the materializers'
 /// 256 and the path walkers' 384, where `[..]` already did.
+///
+/// #5497: [`materializer_band`] is the deepest document that reads now; the 300-level walk is
+/// pinned through the library (`test_public_eval_recurse_only_walk_3429_3020`).
 #[test]
 fn test_recurse_only_walk_between_256_and_384_answers_3429() -> Result<()> {
     let (stdout, stderr, code) =
-        run_jq_full(&["-c", "[.. | key] | length"], Some(&nested_arrays(300)))?;
+        run_jq_full(&["-c", "[.. | key] | length"], Some(&materializer_band()))?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout.trim_end(), "300");
+    assert_eq!(stdout.trim_end(), "256");
     Ok(())
 }
 
@@ -26599,27 +26631,17 @@ fn test_eager_over_depth_value_reports_cleanly_3155() -> Result<()> {
     Ok(())
 }
 
-/// #2850: `-e`'s own exit-status materialize call (`jq_runner.rs`, separate
-/// from `write_output_jq_value`'s) used to leak Rust's raw panic backtrace
-/// to stderr ahead of the clean, correctly exit-5'd diagnostic the
-/// surrounding `catch_unwind` already produced -- confirmed live before this
-/// fix that `succinctly jq -e '.'` on 500 levels of `[...]`-nested JSON
-/// printed `thread '<unnamed>' panicked at src/jq/lazy.rs:...` before the
-/// `jq: error (at ...): nesting depth exceeds limit of 256` line. The exit
-/// code and final diagnostic were always correct; only the extra noise
-/// ahead of them was the bug (`JqValue::materialize`, not the checked
-/// `try_materialize`, #2850).
+/// #2850: `-e`'s own exit-status materialize call used to leak Rust's raw panic backtrace to
+/// stderr ahead of the clean, exit-5 diagnostic the surrounding `catch_unwind` produced
+/// (`JqValue::materialize`, not the checked `try_materialize`).
+///
+/// #5497: the document is now refused before any filter runs, with jq's own parse error.
 #[test]
 fn test_exit_status_over_depth_document_reports_cleanly_not_panic_2850() -> Result<()> {
-    let deep_json = format!("{}{}{}", "[".repeat(500), "1", "]".repeat(500));
-
-    let (stdout, stderr, code) = run_jq_full(&["-c", "-e", "."], Some(&deep_json))?;
-    assert_eq!(stdout.trim_end(), "");
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert!(!stderr.contains("panicked"), "stderr: {stderr:?}");
-    assert!(
-        stderr.contains("nesting depth exceeds limit of 256"),
-        "stderr: {stderr:?}"
+    let (stdout, stderr, code) = run_jq_full(&["-c", "-e", "."], Some(&nested_arrays(500)))?;
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("", jq_parse_depth_refusal(1, 257).as_str(), 5)
     );
 
     // Well-formed usage is unaffected: `-e` on a truthy last value exits 0.
@@ -26630,51 +26652,49 @@ fn test_exit_status_over_depth_document_reports_cleanly_not_panic_2850() -> Resu
     Ok(())
 }
 
-/// #2850 review: pins a real, observable behavior change beyond just
-/// removing panic noise, specific to `-e`'s exit-status call site. Before
-/// this fix, a nesting-depth violation panicked and unwound through the
-/// whole per-document `catch_unwind`, silently dropping every remaining
-/// sibling result for a multi-result filter (`.[]`) -- the checked
-/// `try_materialize` instead reports and continues, the same
-/// report-then-continue path a decode failure (#1247) already took at this
-/// exact call site. This makes the two failure classes consistent with each
-/// other rather than introducing new behavior: `["\ud800", 1] | .[]` under
-/// `-e` already reported the decode failure and printed the well-formed
-/// sibling `1` before this fix; a deeply-nested sibling now does the same
-/// instead of dropping it.
+/// #2850 review: before #2850 a nesting-depth violation under `-e` panicked and unwound through
+/// the whole per-document `catch_unwind`, dropping every remaining sibling result of a
+/// multi-result filter (`.[]`); the checked `try_materialize` reports and continues instead.
+///
+/// #5497: a document holding an element past jq's parse-depth limit is refused before any
+/// filter runs, as jq refuses it; at [`materializer_band`]'s depth `-e` reads the element without
+/// materializing it, so both siblings print, as in jq.
 #[test]
 fn test_exit_status_multi_result_over_depth_element_still_emits_siblings_2850() -> Result<()> {
-    let deep_json = format!("{}{}{}", "[".repeat(500), "1", "]".repeat(500));
-    let input = format!("[{deep_json}, 1]");
-
+    let input = format!("[{}, 1]", nested_arrays(500));
     let (stdout, stderr, code) = run_jq_full(&["-c", "-e", ".[]"], Some(&input))?;
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert!(!stderr.contains("panicked"), "stderr: {stderr:?}");
-    assert!(
-        stderr.contains("nesting depth exceeds limit of 256"),
-        "stderr: {stderr:?}"
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("", jq_parse_depth_refusal(1, 257).as_str(), 5)
     );
-    // The well-formed sibling still reaches stdout -- consistent with the
-    // pre-existing decode-failure granularity at this same call site.
-    assert_eq!(stdout.trim_end(), "1", "stderr: {stderr:?}");
-
+    let element = nested_arrays(255);
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "-e", ".[]"], Some(&format!("[{element}, 1]")))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, format!("{element}\n1\n"));
     Ok(())
 }
 
-/// #2850: `write_output_jq_value`'s own materialize call shares the
-/// identical checked-vs-panicking split as `-e`'s above. #2662 (landed in
-/// this same tree) is what makes this a genuinely live, confirmed leak
-/// rather than a defensive-only fix: before it, `-S`/`-a`/`-C` were excluded
-/// from the lazy/`JqValue::Cursor` path entirely (`can_use_lazy_path`), so
-/// this call site was unreachable for them; #2662 moved them onto that same
-/// path, so they now hit the identical panicking `materialize()` `-e`
-/// always did. All three flags pinned here, not just `-S`.
+/// #2850: `write_output_jq_value`'s own materialize call shares the identical
+/// checked-vs-panicking split as `-e`'s. #2662 moved `-S`/`-a`/`-C` onto the lazy
+/// `JqValue::Cursor` path, so they reached the panicking `materialize()` `-e` always did.
+///
+/// #5497: a document past jq's parse-depth limit is refused before any filter runs, under each
+/// flag; [`materializer_band`] still reaches the materializer under `-a` and `-C` (`-S` answers it,
+/// as jq does).
 #[test]
 fn test_complex_output_flags_over_depth_document_report_cleanly_not_panic_2850() -> Result<()> {
-    let deep_json = format!("{}{}{}", "[".repeat(500), "1", "]".repeat(500));
-
+    let deep_json = nested_arrays(500);
     for flag in ["-S", "-a", "-C"] {
         let (stdout, stderr, code) = run_jq_full(&["-c", flag, "."], Some(&deep_json))?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            ("", jq_parse_depth_refusal(1, 257).as_str(), 5),
+            "flag {flag}"
+        );
+    }
+    for flag in ["-a", "-C"] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", flag, "."], Some(&materializer_band()))?;
         assert_eq!(stdout.trim_end(), "", "flag {flag}");
         assert_eq!(
             code, 5,
@@ -26685,7 +26705,7 @@ fn test_complex_output_flags_over_depth_document_report_cleanly_not_panic_2850()
             "flag {flag} -- stderr: {stderr:?}"
         );
         assert!(
-            stderr.contains("nesting depth exceeds limit"),
+            stderr.contains("nesting depth exceeds limit of 256"),
             "flag {flag} -- stderr: {stderr:?}"
         );
     }
@@ -26699,42 +26719,22 @@ fn test_complex_output_flags_over_depth_document_report_cleanly_not_panic_2850()
 }
 
 /// #2627: the wildcard/ambient bridge used to reach `eval_generic.rs`'s
-/// `assert_nesting_depth` `panic!` on a >256-deep *document* (not a
-/// constructed value, unlike #1371's `test_partial_result_
-/// over_depth_value_reports_cleanly_not_panic_1371` above). It now reports a
-/// clean error instead, and that is what these two pin.
+/// `assert_nesting_depth` `panic!` on a too-deep *document* (not a constructed value, unlike
+/// #1371's `test_partial_result_over_depth_value_reports_cleanly_not_panic_1371`). It now
+/// reports a clean error instead, and that is what this pins. The probe has moved as the set of
+/// spellings that reach the bridge shrank: `true and true` (closed by #2173), `. and true`
+/// (#2692), `. as $x | $x` (#3856, which echoes now), and `. as $x | $x | tojson`, which reads
+/// the node and so still reaches the guard.
 ///
-/// The probe has moved twice, always for the same reason -- the set of
-/// spellings that still reach the bridge keeps shrinking, and this test has
-/// to follow it rather than pin a spelling that no longer gets there:
-///
-/// - `true and true` was the original. #2173's `walk::reads_ambient_value`
-///   gate substitutes `null` for a fully closed term instead of the real
-///   document, so it stopped reaching the bridge.
-/// - `. and true` replaced it, on the reasoning that `.` on the left keeps
-///   `needs_path_context` false while still making the expression read the
-///   ambient value. #2692 ended that too: `and`/`or` have a native,
-///   ungated streaming arm now, and reading `.`'s *truthiness* is
-///   `is_falsy` -- O(1), no recursion -- so `. and true` answers `true` at
-///   exit 0 on this same 300-deep input. That is pinned as its own claim by
-///   `test_truthiness_probes_do_not_trip_the_depth_guard_2692`.
-/// - `. as $x | $x` was the probe after that: a binding materialized the
-///   ambient value through the bridge, so it reached the guard. #3856 ended
-///   that too: a bind that only hands its node on (`$x` is read where the
-///   ambient is a cursor) decodes nothing, so it echoes the document like `.`
-///   does. `. as $x | $x | tojson` is the current probe: `tojson` reads the
-///   node, so it still reaches the guard.
-///
-/// Already shielded at the CLI boundary by `catch_unwind` (#1793) before the
-/// fix -- confirmed via `!stderr.contains("panicked")` below, so this pins
-/// the *absence* of a regression there, while the real fix
-/// (`eval_generic.rs`'s depth guard no longer panicking at all) is what
-/// protects a library embedder calling `succinctly::jq::eval` directly,
-/// which had no such net.
+/// #5497: a document past jq's parse-depth limit is refused before any filter runs, so the
+/// document is [`materializer_band`], the one jq accepts and the materializers refuse.
+/// `!stderr.contains("panicked")` pins the absence of a regression at the CLI's
+/// `catch_unwind` (#1793); `eval_generic.rs`'s guard no longer panicking at all is what protects
+/// a library embedder calling `succinctly::jq::eval` directly.
 #[test]
 fn test_boolean_wildcard_bridge_over_depth_document_reports_cleanly_not_panic_2627() -> Result<()> {
-    let (stdout, stderr, code) =
-        run_jq_full(&["-c", ". as $x | $x | tojson"], Some(&nested_arrays(300)))?;
+    let band = materializer_band();
+    let (stdout, stderr, code) = run_jq_full(&["-c", ". as $x | $x | tojson"], Some(&band))?;
     assert_eq!(stdout.trim_end(), "");
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(!stderr.contains("panicked"), "stderr: {stderr:?}");
@@ -26744,10 +26744,9 @@ fn test_boolean_wildcard_bridge_over_depth_document_reports_cleanly_not_panic_26
     );
     // #3856: and a bind that only hands the node on reads nothing, so the guard
     // has nothing to trip on -- it echoes the document, as `.` does.
-    let deep = nested_arrays(300);
-    let (stdout, stderr, code) = run_jq_full(&["-c", ". as $x | $x"], Some(&deep))?;
+    let (stdout, stderr, code) = run_jq_full(&["-c", ". as $x | $x"], Some(&band))?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout.trim_end(), deep.trim_end());
+    assert_eq!(stdout.trim_end(), band);
     Ok(())
 }
 
@@ -33258,29 +33257,29 @@ fn test_func_def_arity_overload_through_path_context_evaluator_1376() -> Result<
     Ok(())
 }
 
-/// #998: the bare identity `.` never materializes an `OwnedValue` tree (it
-/// stays lazy, streaming straight from the cursor via `print_json`), so
-/// `eval_generic::to_owned`'s own depth guard never gets a chance to fire
-/// for it -- confirmed live before this fix, `succinctly jq '.'` on a
-/// 200,000-level-deep document aborted with a raw stack overflow (SIGABRT,
-/// exit 134), not a clean error. `print_json` needs its own guard.
+/// #998 and #1819: the bare identity `.` never materializes an `OwnedValue` tree, so
+/// `print_json` needed a guard of its own (a raw stack overflow at 200,000 levels before #998),
+/// whose ceiling #1819 moved to `MAX_VALUE_TREE_DEPTH` (384) so a document between 256 and 384
+/// levels printed.
 ///
-/// #1819 moved that guard's own ceiling from `MAX_NESTING_DEPTH` (256) to
-/// `MAX_VALUE_TREE_DEPTH` (384) -- this test's 500-deep input still clears
-/// either ceiling, so it keeps demonstrating the same rejection, just with
-/// the new number. The guard fires 384 levels into the render; since #3265
-/// that render is buffered, so none of those `[` reach stdout (jq 1.7.1,
-/// whose parser refuses past 256 levels, prints nothing either).
+/// #5497: every document past jq's parse-depth limit is now refused before any filter runs, as
+/// jq refuses it, and the deepest document that reads (256 arrays) prints whole. A value the
+/// program builds is printed past 256 levels with jq's `<skipped: too deep>`
+/// (`test_reduce_built_value_in_former_depth_gap_prints_cleanly_1819`).
 #[test]
 fn test_identity_query_rejects_adversarial_nesting_998() -> Result<()> {
-    let input = nested_arrays(500);
+    for depth in [257, 300, 383, 384, 500] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", "."], Some(&nested_arrays(depth)))?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            ("", jq_parse_depth_refusal(1, 257).as_str(), 5),
+            "depth {depth}"
+        );
+    }
+    let input = nested_arrays(256);
     let (stdout, stderr, code) = run_jq_full(&["-c", "."], Some(&input))?;
-    assert_eq!(code, 1, "stderr: {stderr:?}");
-    assert_eq!(stdout, "", "no partial record (#3265)");
-    assert!(
-        stderr.contains("nesting depth exceeds limit of 384"),
-        "stderr: {stderr:?}"
-    );
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), input);
     Ok(())
 }
 
@@ -33295,99 +33294,38 @@ fn test_identity_query_accepts_nesting_under_limit_998() -> Result<()> {
     Ok(())
 }
 
-/// #1819: `MAX_NESTING_DEPTH` (256, `print_json`'s old ceiling) and
-/// `MAX_VALUE_TREE_DEPTH` (384, every other value-tree consumer's ceiling,
-/// including the construction-time guards a `reduce`-built value passes
-/// through) used to disagree, so a value strictly between them passed
-/// construction and then failed **mid-print** -- after `print_json` had
-/// already flushed a large amount of syntactically-incomplete JSON to
-/// stdout. Confirmed live before this fix: this exact query corrupted
-/// output and exited 1 with a raw `anyhow` message instead of printing a
-/// complete, valid document. 300 is the issue's own repro depth, squarely
-/// inside the former 257-384 gap.
+/// #1819: `MAX_NESTING_DEPTH` (256, `print_json`'s old ceiling) and `MAX_VALUE_TREE_DEPTH`
+/// (384) used to disagree, so a value strictly between them passed construction and then failed
+/// **mid-print**, after a large amount of syntactically-incomplete JSON reached stdout. 300 is the
+/// issue's own repro depth.
+///
+/// #5497: it prints as jq prints it, with everything past 256 levels as `<skipped: too deep>`.
 #[test]
 fn test_reduce_built_value_in_former_depth_gap_prints_cleanly_1819() -> Result<()> {
     let (stdout, stderr, code) =
         run_jq_full(&["-c", "reduce range(300) as $i (null; [.])"], Some("1"))?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
-    let want = format!("{}null{}", "[".repeat(300), "]".repeat(300));
+    let want = format!("{}<skipped: too deep>{}", "[".repeat(257), "]".repeat(257));
     assert_eq!(stdout.trim_end(), want);
     Ok(())
 }
 
-/// #1819 companion: the identity path (pure cursor navigation, no
-/// `OwnedValue` construction at all) must round-trip the same former-gap
-/// depths cleanly, not just the `reduce`-constructed case above --
-/// `print_json` is the only guard either shape ever reaches.
-#[test]
-fn test_identity_query_in_former_depth_gap_prints_cleanly_1819() -> Result<()> {
-    let input = nested_arrays(300);
-    let (stdout, stderr, code) = run_jq_full(&["-c", "."], Some(&input))?;
-    assert_eq!(code, 0, "stderr: {stderr:?}");
-    assert_eq!(stdout.trim_end(), input);
-    Ok(())
-}
-
-/// #1819 boundary: exactly `MAX_VALUE_TREE_DEPTH - 1` (383) levels deep must
-/// still succeed -- the last depth the new ceiling accepts.
-#[test]
-fn test_identity_query_accepts_exactly_384_boundary_minus_one_1819() -> Result<()> {
-    let input = nested_arrays(383);
-    let (stdout, stderr, code) = run_jq_full(&["-c", "."], Some(&input))?;
-    assert_eq!(code, 0, "stderr: {stderr:?}");
-    assert_eq!(stdout.trim_end(), input);
-    Ok(())
-}
-
-/// #1819 boundary: exactly `MAX_VALUE_TREE_DEPTH` (384) levels deep must
-/// still raise cleanly -- the new ceiling has a real edge, it didn't just
-/// move the corruption threshold out without limit. This is the
-/// crate's own documented depth-support ceiling (`MAX_VALUE_TREE_DEPTH`,
-/// #1005), so failing here -- rather than silently accepting arbitrarily
-/// deep input -- is deliberate, matching every other value-tree consumer's
-/// own boundary tests.
-#[test]
-fn test_identity_query_rejects_exactly_384_boundary_1819() -> Result<()> {
-    let input = nested_arrays(384);
-    let (_stdout, stderr, code) = run_jq_full(&["-c", "."], Some(&input))?;
-    assert_eq!(code, 1, "stderr: {stderr:?}");
-    assert!(
-        stderr.contains("nesting depth exceeds limit of 384"),
-        "stderr: {stderr:?}"
-    );
-    Ok(())
-}
-
 /// #998 review: `--exit-status`/`-e` forces `JqValue::materialize()` on
-/// every result before `print_json`'s own guarded output path ever runs,
-/// reaching `lazy.rs`'s independent `cursor_to_owned` materializer
-/// directly -- a second, unguarded recursive tree-walker with the exact
-/// same shape as `eval_generic::to_owned_cursor`, missed by this PR's own
-/// first pass. Confirmed live before this follow-up fix: `succinctly jq -e
-/// '.[0]'` on a 200,000-level-deep document raw-stack-overflowed (SIGABRT,
-/// exit 134) even with `print_json`'s guard already in place.
+/// every result, which reached `lazy.rs`'s own materializer, unguarded until
+/// #998 (a raw stack overflow at 200,000 levels).
 ///
-/// **Exit 5, not the 101 this pinned until #1653.** `-e`'s `materialize()`
-/// call used to sit in the CLI's per-result write loop, *outside* the
-/// `catch_unwind` that #1793 wraps evaluation in, so `lazy.rs`'s guard
-/// panicked all the way out of the process. Streaming the M2 path folds that
-/// write loop inside the guard, so the panic is now caught and reported
-/// through the same channel as every other #1793 nesting diagnostic.
-///
-/// That is the outcome #1793's own rationale argues for -- it exists to turn
-/// this ceiling "into an ordinary, recoverable diagnostic" rather than a
-/// hard, uncontrolled process exit -- and the guard is still doing its job:
-/// the depth limit is enforced, the message is unchanged, and the run still
-/// fails. Only the manner of failing moved, from abort to diagnostic.
+/// #5497: a document past jq's parse-depth limit is refused before any filter runs, as jq
+/// refuses it, so the guard this pinned is no longer reached from a document;
+/// [`materializer_band`] answers here, as it does in jq.
 #[test]
 fn test_exit_status_query_rejects_adversarial_nesting_998() -> Result<()> {
-    let input = nested_arrays(500);
-    let (_stdout, stderr, code) = run_jq_full(&["-e", "-c", ".[0]"], Some(&input))?;
-    assert_eq!(code, 5, "stderr: {stderr:?}");
-    assert!(
-        stderr.contains("nesting depth exceeds limit of 256"),
-        "stderr: {stderr:?}"
+    let (stdout, stderr, code) = run_jq_full(&["-e", "-c", ".[0]"], Some(&nested_arrays(500)))?;
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("", jq_parse_depth_refusal(1, 257).as_str(), 5)
     );
+    let (_, stderr, code) = run_jq_full(&["-e", "-c", ".[0]"], Some(&materializer_band()))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
     Ok(())
 }
 
@@ -33402,45 +33340,40 @@ fn test_exit_status_query_materializes_object_998() -> Result<()> {
     Ok(())
 }
 
-/// #1793: `sort`/`join`/`map(.)` have no native lazy fast path for a
-/// container-shaped condition (`sort`, `join`) or still have to materialize
-/// their `LazySeq` result before printing (`map(.)`), so each falls back to
-/// `to_owned_cursor_at_depth` -- the *same* `MAX_NESTING_DEPTH` guard
-/// `test_identity_query_rejects_adversarial_nesting_998` already covers for
-/// the identity path, but reached with no equivalent guard at this call
-/// site: an uncaught panic (exit 101) rather than a clean diagnostic. Fixed
-/// by isolating the panic with `catch_unwind` at the CLI's per-document
-/// dispatch, matching the exit code (5) and cross-file-tracer-confirmed
-/// clean-diagnostic behavior of every other uncaught-error path in this
-/// same loop (`#1194`, `#355`) -- not `-e`'s separate, still-101
-/// `cursor_to_owned` panic path (`lazy.rs`, untouched by this fix, see
-/// `test_exit_status_query_rejects_adversarial_nesting_998` above).
+/// #1793: `sort`/`join`/`map(.)` fell back to `to_owned_cursor_at_depth` with no
+/// guard at the call site, an uncaught panic (exit 101) until #1793 caught it
+/// at the CLI's per-document dispatch.
+///
+/// #5497: a document past jq's parse-depth limit is refused before any filter runs, as jq
+/// refuses it, so the guard this pinned is no longer reached from a document;
+/// [`materializer_band`] answers here, as it does in jq.
 #[test]
 fn test_sort_reports_clean_error_on_adversarial_nesting_1793() -> Result<()> {
-    let input = nested_arrays(500);
-    let (stdout, stderr, code) = run_jq_full(&["-c", "sort"], Some(&input))?;
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert!(
-        stderr.contains("nesting depth exceeds limit of 256"),
-        "stderr: {stderr:?}"
+    let (stdout, stderr, code) = run_jq_full(&["-c", "sort"], Some(&nested_arrays(500)))?;
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("", jq_parse_depth_refusal(1, 257).as_str(), 5)
     );
+    let (_, stderr, code) = run_jq_full(&["-c", "sort"], Some(&materializer_band()))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
     Ok(())
 }
 
-/// #1793 sibling case: `map(.)`'s panic originates from a different call
-/// site than `sort`'s (its own lazy fast path stays lazy through
-/// evaluation; the panic instead comes from materializing its `LazySeq`
-/// result just before printing) but funnels into the same guard and must
-/// be caught the same way.
+/// #1793 sibling case: `map(.)`'s panic originated from materializing its
+/// `LazySeq` result just before printing, a different call site from `sort`'s.
+///
+/// #5497: a document past jq's parse-depth limit is refused before any filter runs, as jq
+/// refuses it, so the guard this pinned is no longer reached from a document;
+/// [`materializer_band`] answers here, as it does in jq.
 #[test]
 fn test_map_identity_reports_clean_error_on_adversarial_nesting_1793() -> Result<()> {
-    let input = nested_arrays(500);
-    let (stdout, stderr, code) = run_jq_full(&["-c", "map(.)"], Some(&input))?;
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert!(
-        stderr.contains("nesting depth exceeds limit of 256"),
-        "stderr: {stderr:?}"
+    let (stdout, stderr, code) = run_jq_full(&["-c", "map(.)"], Some(&nested_arrays(500)))?;
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("", jq_parse_depth_refusal(1, 257).as_str(), 5)
     );
+    let (_, stderr, code) = run_jq_full(&["-c", "map(.)"], Some(&materializer_band()))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
     Ok(())
 }
 
@@ -33678,9 +33611,13 @@ fn test_lazyseq_builtins_stay_atomic_on_malformed_content_2066() -> Result<()> {
 
 /// #1793 sibling case: `join`, like `sort`, has no native lazy fast path in
 /// `eval_builtin` and falls to the same generic materializing bridge.
+///
+/// #5497: a document past jq's parse-depth limit is refused before any filter runs, so this
+/// guard is reached by [`materializer_band`], the one document jq accepts and the materializers
+/// refuse.
 #[test]
 fn test_join_reports_clean_error_on_adversarial_nesting_1793() -> Result<()> {
-    let input = nested_arrays(500);
+    let input = materializer_band();
     let (stdout, stderr, code) = run_jq_full(&["-c", "join(\",\")"], Some(&input))?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(
@@ -33704,21 +33641,25 @@ fn test_sort_accepts_nesting_under_limit_1793() -> Result<()> {
     Ok(())
 }
 
-/// #1793's real-world-relevant failure mode: before this fix, one
-/// adversarially-deep document *anywhere* in a multi-document stream
-/// silently discarded every document after it too, since the uncaught
-/// panic aborted the whole process rather than just that one document --
-/// unlike `#1194`'s established "isolate this document, continue the
-/// stream" convention a few lines above this fix's own call site. Uses
-/// `map(.)` (identity via the lazy fast path) so the first and third
-/// records need no builtin-specific behavior to prove they still get
-/// processed.
+/// #1793's real-world-relevant failure mode was one adversarially-deep document aborting the
+/// whole run through an uncaught panic. Since #5497 a document past jq's parse-depth limit is
+/// refused before any filter runs, and the stream stops there as jq stops it: the documents
+/// before it are printed, none after. [`materializer_band`] still reaches #1793's per-document
+/// guard, and that one document is reported while the stream goes on, as #1194 isolates any
+/// other malformed document.
 #[test]
-fn test_adversarial_nesting_does_not_abort_rest_of_stream_1793() -> Result<()> {
+fn test_adversarial_nesting_stops_the_stream_as_jq_does_1793() -> Result<()> {
     let deep = format!("[{}]", nested_arrays(500));
     let input = format!("[1]\n{deep}\n[2]\n");
     let (stdout, stderr, code) = run_jq_full(&["-c", "map(.)"], Some(&input))?;
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("[1]\n", jq_parse_depth_refusal(2, 257).as_str(), 5)
+    );
+    let input = format!("[1]\n{}\n[2]\n", materializer_band());
+    let (stdout, stderr, code) = run_jq_full(&["-c", "-a", "."], Some(&input))?;
+    // The exit status is the last input's own, as jq's is (#5471).
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(
         stderr.contains("nesting depth exceeds limit of 256"),
         "stderr: {stderr:?}"
@@ -33726,7 +33667,7 @@ fn test_adversarial_nesting_does_not_abort_rest_of_stream_1793() -> Result<()> {
     assert_eq!(
         stdout.lines().collect::<Vec<_>>(),
         vec!["[1]", "[2]"],
-        "the documents on either side of the adversarial one must still be processed\nstdout: {stdout:?}"
+        "the documents on either side of the band one must still be processed\nstdout: {stdout:?}"
     );
     Ok(())
 }
@@ -33825,64 +33766,56 @@ fn test_with_entries_entry_value_past_depth_limit_reports_cleanly_3261() -> Resu
     Ok(())
 }
 
-/// #1818: `run_jq`'s *other* top-level branch -- taken whenever
-/// `can_use_lazy_path` is `false` (`--slurp`/`-s`, `-S`/`--sort-keys`,
-/// `-C`/`--color-output`, `--ascii-output`, `--slurpfile`, or a filter using
-/// `input`/`inputs`/`input_line_number`) -- reaches
-/// `validate_json_delimiters` (`parse_json_stream`'s fallback) with no
-/// equivalent guard against #1793's own `MAX_NESTING_DEPTH` panic, unlike
-/// the lazy path that fix already covers. Confirmed live before this fix:
-/// each flag below panicked uncaught (exit 101, a bare `thread 'main'
-/// panicked at ...` message) rather than reporting a clean jq-channel
-/// error.
+/// #1818: `--slurp` and the other whole-batch flags reached `validate_json_delimiters` with no
+/// guard against #1793's `MAX_NESTING_DEPTH` panic (exit 101) until #1818.
 ///
-/// This branch materializes the whole batch up front, so (unlike
-/// `test_adversarial_nesting_does_not_abort_rest_of_stream_1793`'s lazy-path
-/// isolation) there's no expectation of processing documents on either side
-/// of the adversarial one -- only that the failure is a clean, catchable
-/// error instead of a panic.
+/// #5497: an over-deep document is refused before any filter runs, under `--slurp` as on the
+/// default route, as jq refuses it; `--slurp`'s message has no position, the slurped array no
+/// longer knowing it.
 #[test]
 fn test_slurp_reports_clean_error_on_adversarial_nesting_1818() -> Result<()> {
-    // #2847: `--slurp` no longer reaches `validate_json_delimiters`' guard --
-    // it indexes the input like the default route. What this test exists to
-    // pin still holds: an over-deep document ends in a clean error, never a
-    // panic. The error is now the default route's own identity ceiling
-    // (#1819: `nesting depth exceeds limit of 384`, exit 1), the same answer
-    // `-c .` gives for the same document.
     let input = nested_arrays(500);
     let (stdout, stderr, code) = run_jq_full(&["-c", "--slurp", "."], Some(&input))?;
-    assert_eq!(code, 1, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert!(stdout.is_empty(), "stdout: {stdout:?}");
-    assert!(
-        stderr.contains("nesting depth exceeds limit of 384"),
-        "stderr: {stderr:?}"
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("", "jq: parse error: Exceeds depth limit for parsing\n", 5)
     );
-    assert!(!stderr.contains("panicked"), "stderr: {stderr:?}");
-    let (_, default_err, default_code) = run_jq_full(&["-c", "."], Some(&input))?;
-    assert_eq!(default_code, code, "the default route's own answer");
-    assert!(default_err.contains("nesting depth exceeds limit of 384"));
+    let (stdout, stderr, code) = run_jq_full(&["-c", "."], Some(&input))?;
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("", jq_parse_depth_refusal(1, 257).as_str(), 5)
+    );
     Ok(())
 }
 
-/// #1818 sibling case: `-S`/`--sort-keys` reaches the identical fallback
-/// path as `--slurp` above.
+/// #1818 sibling case: `-S`/`--sort-keys` reached the identical fallback
+/// path as `--slurp`.
+///
+/// #5497: a document past jq's parse-depth limit is refused before any filter runs, as jq
+/// refuses it, so the guard this pinned is no longer reached from a document;
+/// [`materializer_band`] answers here, as it does in jq.
 #[test]
 fn test_sort_keys_reports_clean_error_on_adversarial_nesting_1818() -> Result<()> {
-    let input = nested_arrays(500);
-    let (stdout, stderr, code) = run_jq_full(&["-c", "--sort-keys", "."], Some(&input))?;
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert!(
-        stderr.contains("nesting depth exceeds limit of 256"),
-        "stderr: {stderr:?}"
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "--sort-keys", "."], Some(&nested_arrays(500)))?;
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("", jq_parse_depth_refusal(1, 257).as_str(), 5)
     );
+    let (_, stderr, code) = run_jq_full(&["-c", "--sort-keys", "."], Some(&materializer_band()))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
     Ok(())
 }
 
 /// #1818 sibling case: `-C`/`--color-output` forces the same
 /// whole-batch-materializing branch.
+///
+/// #5497: a document past jq's parse-depth limit is refused before any filter runs, so this
+/// guard is reached by [`materializer_band`], the one document jq accepts and the materializers
+/// refuse.
 #[test]
 fn test_color_output_reports_clean_error_on_adversarial_nesting_1818() -> Result<()> {
-    let input = nested_arrays(500);
+    let input = materializer_band();
     let (stdout, stderr, code) = run_jq_full(&["-c", "-C", "."], Some(&input))?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(
@@ -33894,9 +33827,13 @@ fn test_color_output_reports_clean_error_on_adversarial_nesting_1818() -> Result
 
 /// #1818 sibling case: `--ascii-output`, the fourth flag named in the
 /// issue's own repro.
+///
+/// #5497: a document past jq's parse-depth limit is refused before any filter runs, so this
+/// guard is reached by [`materializer_band`], the one document jq accepts and the materializers
+/// refuse.
 #[test]
 fn test_ascii_output_reports_clean_error_on_adversarial_nesting_1818() -> Result<()> {
-    let input = nested_arrays(500);
+    let input = materializer_band();
     let (stdout, stderr, code) = run_jq_full(&["-c", "--ascii-output", "."], Some(&input))?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(
@@ -33909,9 +33846,13 @@ fn test_ascii_output_reports_clean_error_on_adversarial_nesting_1818() -> Result
 /// #1818 sibling case: a filter using `inputs` also forces the
 /// whole-batch-materializing branch (`can_use_lazy_path` excludes it), even
 /// with no special CLI flag at all.
+///
+/// #5497: a document past jq's parse-depth limit is refused before any filter runs, so this
+/// guard is reached by [`materializer_band`], the one document jq accepts and the materializers
+/// refuse.
 #[test]
 fn test_inputs_filter_reports_clean_error_on_adversarial_nesting_1818() -> Result<()> {
-    let input = nested_arrays(500);
+    let input = materializer_band();
     let (stdout, stderr, code) = run_jq_full(&["-c", "[inputs]"], Some(&input))?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(
@@ -33933,45 +33874,28 @@ fn test_slurp_accepts_nesting_under_limit_1818() -> Result<()> {
     Ok(())
 }
 
-/// #2299: `#1818`'s own guard above covers `validate_json_delimiters`
-/// (`parse_json_stream`'s fallback), the *input*-parsing side of `--slurp`.
-/// It does not cover the separate *output*-materialization boundary
-/// (`materialize_stream_item`'s `GenericResult::One`/`OneCursor` arms,
-/// `jq_runner.rs`), which called `eval_generic::to_owned` directly with no
-/// guard of any kind. `--slurp` wraps its whole input in one more array
-/// level (confirmed by `test_slurp_accepts_nesting_under_limit_1818` above:
-/// `[{input}]`, not bare `{input}`), so a 255-deep input -- one level
-/// *under* #1818's own 256 input-parsing ceiling, and so accepted by it --
-/// became 256-deep once wrapped, landing exactly on `to_owned`'s panicking
-/// ceiling with no guard left to catch it. Confirmed live before this fix:
-/// `succinctly jq --slurp '.'` on `nested_arrays(255)` panicked (exit 101,
-/// `thread '<unnamed>' panicked at ...: nesting depth exceeds limit of
-/// 256`) instead of reporting the clean, catchable error every sibling
-/// case in this file already gets.
+/// #2299: `--slurp` wraps its whole input in one more array level, so a 255-deep input became
+/// 256-deep once wrapped and landed on `to_owned`'s panicking ceiling (exit 101) before #2299.
+/// #2847 indexes the slurped array instead of materializing it, so the wrap level is one more
+/// level for the printer only.
+///
+/// #5497: the wrap level is not one of jq's: a document at jq's limit slurps and prints, and one
+/// past it is refused before any filter runs, as jq refuses it (without the position, which the
+/// slurped array no longer knows).
 #[test]
 fn test_slurp_output_materialization_reports_clean_error_past_the_wrap_boundary_2299() -> Result<()>
 {
-    // #2847: the slurped array is indexed, not materialized, so the wrap
-    // level that used to land on `to_owned`'s ceiling is just one more level
-    // for the printer, whose own ceiling is 384 (#1819). 255 + 1 prints --
-    // jq itself accepts 256 -- and what this test exists to pin (no panic
-    // past the wrap boundary) holds trivially.
-    let input = nested_arrays(255);
-    let (stdout, stderr, code) = run_jq_full(&["-c", "--slurp", "."], Some(&input))?;
-    assert_eq!(code, 0, "stderr: {stderr:?}");
-    assert_eq!(stdout.trim_end(), format!("[{input}]"));
-    // The wrap level still counts against the printer's ceiling: a document
-    // at 383 prints bare but raises once the array wraps it to 384.
-    let input = nested_arrays(383);
-    let (_, bare_err, bare_code) = run_jq_full(&["-c", "."], Some(&input))?;
-    assert_eq!(bare_code, 0, "stderr: {bare_err:?}");
-    let (stdout, stderr, code) = run_jq_full(&["-c", "--slurp", "."], Some(&input))?;
-    assert_eq!(code, 1, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert!(
-        stderr.contains("nesting depth exceeds limit of 384"),
-        "stderr: {stderr:?}"
+    for depth in [255, 256] {
+        let input = nested_arrays(depth);
+        let (stdout, stderr, code) = run_jq_full(&["-c", "--slurp", "."], Some(&input))?;
+        assert_eq!(code, 0, "depth {depth}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), format!("[{input}]"), "depth {depth}");
+    }
+    let (stdout, stderr, code) = run_jq_full(&["-c", "--slurp", "."], Some(&nested_arrays(383)))?;
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("", "jq: parse error: Exceeds depth limit for parsing\n", 5)
     );
-    assert!(!stderr.contains("panicked"), "stderr: {stderr:?}");
     Ok(())
 }
 
@@ -98541,31 +98465,18 @@ fn test_truthiness_probes_validate_nothing_2692() -> Result<()> {
     Ok(())
 }
 
-/// #2692's consequence for the `#998`/`#2627` `MAX_NESTING_DEPTH` guard,
-/// which `test_truthiness_probes_validate_nothing_2692`'s own corpus
-/// deliberately leaves out: a document nested past 256 levels used to trip
-/// that guard from every one of these arms, because each one opened with
-/// `push_generic_document_validation_error`'s `assert_nesting_depth` before
-/// #2692 removed the call. None of them do anymore -- `is_falsy` never
-/// recurses into a container's children, and the reading probe below
-/// resolves one level without following what's underneath it -- so a
-/// document this deep is no longer a reason for any of these to fail.
+/// #2692's consequence for the `#998`/`#2627` `MAX_NESTING_DEPTH` guard: a document too deep for
+/// it used to trip that guard from every one of these arms, because each one opened with
+/// `push_generic_document_validation_error`'s `assert_nesting_depth` before #2692 removed the
+/// call. None of them do anymore -- `is_falsy` never recurses into a container's children -- so
+/// the document is no reason for any of these to fail.
 ///
-/// This is not a new decision, just an unrecorded corollary of the one
-/// #2692 already made: the guard was never about these arms' own work (none
-/// of them do enough of it to risk a stack overflow), it was a side effect
-/// of the whole-subtree walk that validated on their behalf. Removing that
-/// walk and keeping its depth check would have meant charging a filter for
-/// a limit on work it no longer does.
-///
-/// `sort_by(.)` is the control: `key_elements_generic` is the one caller
-/// `push_generic_document_validation_error` has left (it materializes a
-/// comparison key), so the same document still trips the same guard there,
-/// proving this is about which arms reach it, not about the guard itself
-/// having stopped working.
+/// #5497: the document is [`materializer_band`], the deepest one jq's parser accepts that still
+/// reaches the guard. `join(",")` is the control: it materializes the array, so the same
+/// document still trips the same guard there.
 #[test]
 fn test_truthiness_probes_do_not_trip_the_depth_guard_2692() -> Result<()> {
-    let deep = nested_arrays(300);
+    let deep = materializer_band();
 
     for probe in [
         "not",
@@ -98578,16 +98489,16 @@ fn test_truthiness_probes_do_not_trip_the_depth_guard_2692() -> Result<()> {
         let (stdout, stderr, code) = run_jq_full(&["-c", probe], Some(&deep))?;
         assert_eq!(
             code, 0,
-            "[depth guard] `{probe}` on a 300-deep document must not trip \
+            "[depth guard] `{probe}` on the band document must not trip \
              `MAX_NESTING_DEPTH` -- stdout: {stdout:?} stderr: {stderr:?}"
         );
     }
 
-    let (_stdout, stderr, code) = run_jq_full(&["-c", "sort_by(.)"], Some(&deep))?;
-    assert_eq!(code, 5, "control `sort_by(.)` -- stderr: {stderr:?}");
+    let (_stdout, stderr, code) = run_jq_full(&["-c", "join(\",\")"], Some(&deep))?;
+    assert_eq!(code, 5, "control `join` -- stderr: {stderr:?}");
     assert!(
         stderr.contains("nesting depth exceeds limit of 256"),
-        "control `sort_by(.)` -- stderr: {stderr:?}"
+        "control `join` -- stderr: {stderr:?}"
     );
 
     Ok(())
@@ -104363,23 +104274,32 @@ fn test_object_index_key_is_a_slice_descriptor_3300() -> Result<()> {
 /// overflowed the stack or tripped the literal splice's depth panic. A
 /// container bound only ever fails classification, so the key stays two
 /// levels deep and the error stays catchable.
+///
+/// #5497: a `start` 2000 objects deep is past jq's parse-depth limit, so the document is refused
+/// before any filter runs, as jq refuses it; 120 levels (inside jq's limit) answer as jq does.
 #[test]
 fn test_deep_document_descriptor_key_is_a_catchable_error_3300() -> Result<()> {
-    let depth = 2000;
-    let input = format!(
-        "[{}1{},[1,2,3]]",
-        r#"{"start":"#.repeat(depth),
-        "}".repeat(depth)
-    );
-    for filter in ["try .[1][.[0]] catch .", "[.[1][.[0]]?]"] {
-        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&input))?;
-        assert_eq!(
-            code, 0,
-            "#3300: `{filter}` must not crash: stdout={stdout:?} stderr={stderr:?}"
-        );
+    let input = |depth: usize| {
+        format!(
+            "[{}1{},[1,2,3]]",
+            r#"{"start":"#.repeat(depth),
+            "}".repeat(depth)
+        )
+    };
+    for (filter, want) in [
+        (
+            "try .[1][.[0]] catch .",
+            "\"Array/string slice indices must be integers\"\n",
+        ),
+        ("[.[1][.[0]]?]", "[]\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&input(120)))?;
+        assert_eq!((stdout.as_str(), code), (want, 0), "`{filter}`: {stderr}");
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&input(2000)))?;
+        assert_eq!((stdout.as_str(), code), ("", 5), "`{filter}`");
         assert!(
-            stdout == "\"Array/string slice indices must be integers\"\n" || stdout == "[]\n",
-            "#3300: `{filter}`: stdout={stdout:?}"
+            stderr.starts_with("jq: parse error: Exceeds depth limit for parsing"),
+            "`{filter}`: {stderr}"
         );
     }
     Ok(())
@@ -108472,55 +108392,33 @@ fn test_embed_reused_below_depth_zero_3179() -> Result<()> {
 }
 
 /// #3179: nested reuse skips the walk of a shared subtree, so it must never
-/// skip the nesting-depth check that walk would have failed. `.a` below is
-/// `n` arrays deep (height `n - 1`) and sits at depth 1 of the root `{k:.}`
-/// materializes: the fresh walk passes exactly when `n < 256`
-/// (`MAX_NESTING_DEPTH`), so at `n = 255` the reuse answers and at `n = 256`
-/// the walk raises the same depth error it raised before #3179.
+/// skip the nesting-depth check that walk would have failed.
+///
+/// #5497: `{"a": [[…]]}` reaches jq's parse-depth limit at 255 arrays (the object holds two stack
+/// entries), so a document can no longer reach the walk's own limit at 256: 254 arrays answer, as
+/// in jq, and 255 are refused before any filter runs. The reuse's depth check is pinned through
+/// the library, which applies no parse limit
+/// (`jq_library_eval_nesting_depth_tests.rs`'s `test_public_eval_embed_nested_reuse_keeps_the_depth_limit_3179`).
 #[cfg_attr(feature = "unshared-containers", ignore = "holdout refusal (#5246)")]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_embed_nested_reuse_keeps_the_depth_limit_3179() -> Result<()> {
     let nested = |n: usize| format!(r#"{{"a":{}{}}}"#, "[".repeat(n), "]".repeat(n));
-    let filter = r".a as $y | {k:.} | .k.a | path($y)";
-    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&nested(255)))?;
-    assert_eq!(
-        (stdout.trim_end(), code),
-        ("[]", 0),
-        "n=255: stderr={stderr:?}"
-    );
-    // #5233: the path-mode interpreter materializes the whole document, which
-    // stops at 256 levels, so this one raises the depth error even where `{k:.}`
-    // would hold the root as a node (#4044). jq 1.7.1 rejects the document when
-    // it parses it ("Exceeds depth limit for parsing"). A literal member makes
-    // the object ineligible on any route: it is built owned and the walk
-    // raises the depth error.
-    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&nested(256)))?;
-    assert_eq!((stdout.as_str(), code), ("", 5), "n=256 (held node)");
-    assert!(stderr.contains("nesting depth"), "n=256: stderr={stderr:?}");
-    let owned_filter = r".a as $y | {k:., j:1} | .k.a | path($y)";
-    let (stdout, stderr, code) = run_jq_full(&["-c", owned_filter], Some(&nested(256)))?;
-    assert_eq!((stdout.as_str(), code), ("", 5), "n=256: stdout={stdout:?}");
-    assert!(stderr.contains("nesting depth"), "n=256: stderr={stderr:?}");
-    // The height is the document's, not the bound value's: a duplicate key
-    // the walk descends into but the value drops (`"x"` twice, the first one
-    // 254 levels deep) still fails the fresh walk, so binding `.a` must not
-    // make the error go away (review of #3179).
-    let dup = format!(
-        r#"{{"a":{{"x":{}1{},"x":1}}}}"#,
-        "[".repeat(254),
-        "]".repeat(254)
-    );
-    for filter in [r"{k:., j:1} | .k.a", r".a as $y | {k:., j:1} | .k.a"] {
-        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&dup))?;
+    for filter in [
+        r".a as $y | {k:.} | .k.a | path($y)",
+        r".a as $y | {k:., j:1} | .k.a | path($y)",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&nested(254)))?;
         assert_eq!(
-            (stdout.as_str(), code),
-            ("", 5),
-            "dup `{filter}`: stdout={stdout:?}"
+            (stdout.trim_end(), code),
+            ("[]", 0),
+            "`{filter}` n=254: stderr={stderr:?}"
         );
-        assert!(
-            stderr.contains("nesting depth"),
-            "dup `{filter}`: stderr={stderr:?}"
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&nested(255)))?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            ("", jq_parse_depth_refusal(1, 260).as_str(), 5),
+            "`{filter}` n=255"
         );
     }
     Ok(())
@@ -143735,21 +143633,20 @@ fn test_slurp_preserve_input_echoes_source_spelling_like_the_default_route_2847(
     Ok(())
 }
 
-/// The synthesized `[` adds one level around every document, so a document
-/// at jq's own parse limit (256) must still read, and one past it is accepted
-/// by the index the way the default route accepts it (jq rejects it at parse
-/// time; the lazy route's own, recorded depth guard only fires when a value
-/// is materialized, #1793).
+/// The synthesized `[` adds one level around every document, so a document at jq's own parse
+/// limit (256) must still read. Since #5497 one past it is refused, as jq refuses it: the
+/// wrapper is not one of jq's levels.
 #[test]
 fn test_slurp_wrapper_level_does_not_reject_a_document_at_jq_depth_limit_2847() -> Result<()> {
     for depth in [255usize, 256, 257, 300] {
         let doc = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
         let (out, err, code) = run_jq_full(&["-sc", "length"], Some(&doc))?;
-        assert_eq!(
-            (out.as_str(), code),
-            ("1\n", 0),
-            "depth {depth}: stderr {err}"
-        );
+        let want = if depth <= 256 {
+            ("1\n", "", 0)
+        } else {
+            ("", "jq: parse error: Exceeds depth limit for parsing\n", 5)
+        };
+        assert_eq!((out.as_str(), err.as_str(), code), want, "depth {depth}");
     }
     // Printing the whole 256-deep document works: it is within jq's own limit.
     let doc = format!("{}{}", "[".repeat(256), "]".repeat(256));

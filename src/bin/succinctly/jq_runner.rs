@@ -5217,6 +5217,21 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
 
                 // Slow path: build index and evaluate expression
                 let index = JsonIndex::build(json_bytes);
+                // #5497: jq's parser refuses a document past its depth limit before any filter
+                // runs, and reads nothing after it, this file or any later one.
+                let source = if slurped.is_some() {
+                    jq::InputSource::Slurped
+                } else {
+                    jq::InputSource::Stream
+                };
+                if let Some(message) =
+                    jq::jq_input_depth_fault(json_bytes, index.bp(), source, || {
+                        jq_stream_position(&raw_inputs, idx, start)
+                    })
+                {
+                    sink.report_parse_error(&message);
+                    break 'files;
+                }
                 // #1576: the M2 fast path, mirroring `yq_runner.rs`'s own
                 // (`can_use_m2_streaming`/`GenericResult::stream_json`) but
                 // scoped to jq's own atomicity contract for array
@@ -6550,8 +6565,23 @@ fn get_inputs(
         values = build_raw_input_values(&raw_inputs, &mut locations);
         debug_assert_eq!(locations.len(), values.len(), "one location per value");
     } else {
+        // Where the next file starts in jq's input, which reads every file as one stream; only
+        // the depth limit's message reads it (#5497).
+        let last = raw_inputs.len().saturating_sub(1);
+        let mut next_file = StreamOrigin::ALONE.file;
         for (pos, (file_idx, raw)) in raw_inputs.into_iter().enumerate() {
             let src = file_idx.unwrap_or(0);
+            let file_start = next_file;
+            if pos < last {
+                next_file = advance_position(next_file, raw.as_bytes());
+            }
+            // `--stream` reads with jq's streaming parser, which has no depth limit.
+            let origin = |before| {
+                (!args.stream).then_some(StreamOrigin {
+                    file: file_start,
+                    before,
+                })
+            };
             // #4316: the bytes a stitched file starts with came from the previous file, so
             // its lines start after them.
             let seam = seams.get(pos).copied().unwrap_or_default();
@@ -6586,7 +6616,8 @@ fn get_inputs(
                     let mut faults = LineCounter::at_seam(raw.as_bytes(), seam);
                     loop {
                         let segment = &raw[offset..];
-                        let (parsed, parse_error) = parse_json_stream_prefix(segment);
+                        let (parsed, parse_error) =
+                            parse_json_stream_prefix(segment, origin(&raw.as_bytes()[..offset]));
                         let (spans, split_error) = split_json_values(segment.as_bytes());
                         if spans.len() < parsed.len() {
                             // patchcov: coverage tolerate reason="unreachable: the splitter is the more lenient of the two and the prefix parse materializes from its spans, so it cannot find fewer values -- the same internal-error guard as the non-resuming branch below (#1064), kept per segment (#4311)"
@@ -6672,7 +6703,7 @@ fn get_inputs(
                 }
                 // Parse as JSON stream: the clean prefix, and the parse error
                 // that ended it if the stream turned malformed (#2961).
-                let (parsed, parse_error) = parse_json_stream_prefix(&raw);
+                let (parsed, parse_error) = parse_json_stream_prefix(&raw, origin(&[]));
                 // `--slurp` stays all-or-nothing: jq prints nothing for a
                 // slurped stream it could not finish parsing. The error goes
                 // out in jq's channel at exit 5, like every other malformed
@@ -7716,6 +7747,49 @@ fn count_newlines(bytes: &[u8]) -> usize {
     total + chunks.remainder().iter().filter(|&&b| b == b'\n').count()
 }
 
+/// Where byte `offset` of `raws[file]` sits in jq's input, which reads every file as one
+/// stream: the 1-based line it is on and the bytes before it on that line (#5497).
+///
+/// Only a refused document asks, and the run stops there, so the walk over everything before it
+/// is paid at most once.
+fn jq_stream_position(raws: &[Vec<u8>], file: usize, offset: usize) -> (usize, usize) {
+    let before = raws[..file]
+        .iter()
+        .map(Vec::as_slice)
+        .chain([&raws[file][..offset]]);
+    before.fold(StreamOrigin::ALONE.file, advance_position)
+}
+
+/// `at` (jq's 1-based line and the bytes before the position on that line) moved past `bytes`.
+fn advance_position((line, column): (usize, usize), bytes: &[u8]) -> (usize, usize) {
+    match bytes.iter().rposition(|&b| b == b'\n') {
+        Some(last) => (line + count_newlines(bytes), bytes.len() - last - 1),
+        None => (line, column + bytes.len()),
+    }
+}
+
+/// Where a text handed to one of the stream parsers starts in jq's input, for the position
+/// jq's depth-limit message names (#5497): `file` is where its file starts, and `before` the
+/// part of that file ahead of the text. Resolved only for a refused document.
+#[derive(Clone, Copy)]
+struct StreamOrigin<'a> {
+    file: (usize, usize),
+    before: &'a [u8],
+}
+
+impl StreamOrigin<'_> {
+    /// A text that is a whole input of its own (a `--slurpfile` file, the first file read).
+    const ALONE: StreamOrigin<'static> = StreamOrigin {
+        file: (1, 0),
+        before: &[],
+    };
+
+    /// The position of `text[offset]`, `text` being the text this origin places.
+    fn position(self, text: &[u8], offset: usize) -> (usize, usize) {
+        advance_position(advance_position(self.file, self.before), &text[..offset])
+    }
+}
+
 /// Per-value input location for the default document loop, resolved on
 /// demand (#4160, #4178).
 ///
@@ -7904,6 +7978,11 @@ fn parse_error_detection(bytes: &[u8], start: usize) -> usize {
         Err(error) => {
             let at = start + error.position.offset;
             match error.kind {
+                // The validator's own depth limit is not jq's: jq meets its limit at the bracket
+                // its parser refuses (#5497).
+                Kind::NestingTooDeep { .. } => {
+                    jq::jq_depth_fault_offset(&bytes[start..]).map_or(at, |offset| start + offset)
+                }
                 Kind::UnclosedString | Kind::UnexpectedEof { .. } => bytes.len(),
                 Kind::ControlCharacter { .. }
                 | Kind::InvalidEscape { .. }
@@ -8549,19 +8628,25 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
 fn parse_json_stream(s: &str) -> Result<Vec<OwnedValue>> {
     // #5291: jq's parser skips a leading BOM before anything else, so whitespace ahead of one
     // leaves it standing, to be refused.
-    let s = s.strip_prefix('\u{feff}').unwrap_or(s).trim();
+    let s = s.strip_prefix('\u{feff}').unwrap_or(s);
+    // Each `--slurpfile` file is an input of its own to jq, its lines counted from 1 (#5497).
+    let (text, lead) = (s.as_bytes(), s.len() - s.trim_start().len());
+    let s = s.trim();
     if s.is_empty() {
         return Ok(vec![]);
     }
 
-    match parse_json_stream_strict(s) {
+    let origin = Some(StreamOrigin::ALONE);
+    match parse_json_stream_strict(s, origin, text, lead) {
         Ok(values) => Ok(values),
         Err(e) => {
             let bytes = s.as_bytes();
             match find_json_values(bytes) {
                 Ok(spans) => spans
                     .into_iter()
-                    .map(|(start, end)| json_bytes_to_owned_value_checked(&bytes[start..end]))
+                    .map(|(start, end)| {
+                        stream_document_checked(&bytes[start..end], origin, text, lead + start)
+                    })
                     // Wrapped rather than flattened, for the same reason as
                     // the sibling site in `parse_json_stream_strict`: the
                     // caller reports a document error in jq's channel at
@@ -8583,19 +8668,26 @@ fn parse_json_stream(s: &str) -> Result<Vec<OwnedValue>> {
 /// materializer fallback. The only difference is what a failure keeps.
 /// A splitter failure reads `Invalid JSON text`, the wording the lazy path
 /// already reports for the same failure.
-fn parse_json_stream_prefix(s: &str) -> (Vec<OwnedValue>, Option<EvalError>) {
+///
+/// `origin` places `s` in jq's input for the depth limit's message, or is `None` for a stream
+/// jq reads with no depth limit (`--stream`, #5497).
+fn parse_json_stream_prefix(
+    s: &str,
+    origin: Option<StreamOrigin<'_>>,
+) -> (Vec<OwnedValue>, Option<EvalError>) {
+    let (text, lead) = (s.as_bytes(), s.len() - s.trim_start().len());
     let s = s.trim();
     if s.is_empty() {
         return (vec![], None);
     }
-    if let Ok(values) = parse_json_stream_strict(s) {
+    if let Ok(values) = parse_json_stream_strict(s, origin, text, lead) {
         return (values, None);
     }
     let bytes = s.as_bytes();
     let (spans, split_error) = split_json_values(bytes);
     let mut values = Vec::with_capacity(spans.len());
     for (start, end) in spans {
-        match json_bytes_to_owned_value_checked(&bytes[start..end]) {
+        match stream_document_checked(&bytes[start..end], origin, text, lead + start) {
             Ok(value) => values.push(value),
             Err(error) => return (values, Some(error)),
         }
@@ -8607,7 +8699,14 @@ fn parse_json_stream_prefix(s: &str) -> (Vec<OwnedValue>, Option<EvalError>) {
 /// The `serde_json`-validated core of [`parse_json_stream`], split out so
 /// its own doc comment can describe the fallback wrapping it without also
 /// re-explaining this half's mechanics inline.
-fn parse_json_stream_strict(s: &str) -> Result<Vec<OwnedValue>> {
+///
+/// `s` starts `lead` bytes into `text`, which `origin` places in jq's input (#5497).
+fn parse_json_stream_strict(
+    s: &str,
+    origin: Option<StreamOrigin<'_>>,
+    text: &[u8],
+    lead: usize,
+) -> Result<Vec<OwnedValue>> {
     // Validate the whole stream via `serde_json::Deserializer` as before
     // (for its own error message and its rejection of anything that isn't
     // valid, whitespace-or-self-delineated-separated JSON) -- but discard
@@ -8648,7 +8747,7 @@ fn parse_json_stream_strict(s: &str) -> Result<Vec<OwnedValue>> {
             // protection #2295 found fragile elsewhere in this file --
             // this is the primary `--slurp`/`--slurpfile` document-input
             // path, worth the same defense-in-depth swap.
-            json_bytes_to_owned_value_checked(&bytes[start..end])
+            stream_document_checked(&bytes[start..end], origin, text, lead + start)
                 .map_err(|e| anyhow::Error::from(MalformedJsonError::new(e)))?,
         );
         prev_end = end;
@@ -11163,13 +11262,47 @@ fn validate_json_delimiters<W: Clone + AsRef<[u64]>>(
 pub(crate) fn json_bytes_to_owned_value_checked(
     bytes: &[u8],
 ) -> core::result::Result<OwnedValue, EvalError> {
+    json_document_to_owned_value_checked(bytes, None)
+}
+
+/// [`json_bytes_to_owned_value_checked`] for a document of an input stream, which jq's parser
+/// first holds to its depth limit (#5497): `at` is the position jq's message names for the
+/// document's first byte, asked only when the limit refuses it. `None` applies no such limit,
+/// as jq's streaming parser applies none (`--stream`).
+fn json_document_to_owned_value_checked(
+    bytes: &[u8],
+    at: Option<&dyn Fn() -> (usize, usize)>,
+) -> core::result::Result<OwnedValue, EvalError> {
     let index = JsonIndex::build(bytes);
+    if let Some(at) = at {
+        if let Some(message) =
+            jq::jq_input_depth_fault(bytes, index.bp(), jq::InputSource::Stream, at)
+        {
+            return Err(EvalError::new(message));
+        }
+    }
     let cursor = index.root(bytes);
     validate_json_delimiters(&cursor, 0)?;
     // `bytes` is often a temporary (an `--argjson` string, a `--seq` record),
     // so each NaN gets an identity of its own rather than its address (#3309).
     generic_to_owned::<JqSemantics, _>(&cursor.value())
         .map(|value| value.with_fresh_nan_instances(bytes))
+}
+
+/// [`json_document_to_owned_value_checked`] for the document `bytes` found at `text[offset]`,
+/// `text` being the text `origin` places (#5497).
+fn stream_document_checked(
+    bytes: &[u8],
+    origin: Option<StreamOrigin<'_>>,
+    text: &[u8],
+    offset: usize,
+) -> core::result::Result<OwnedValue, EvalError> {
+    match origin {
+        Some(origin) => {
+            json_document_to_owned_value_checked(bytes, Some(&|| origin.position(text, offset)))
+        }
+        None => json_document_to_owned_value_checked(bytes, None),
+    }
 }
 
 /// The bracket/brace-delimited, comma-and-indent-joined skeleton shared by
@@ -11249,6 +11382,13 @@ where
 ///
 /// This is the unified printer that handles JSON structure (arrays, objects,
 /// indentation) while delegating literal formatting to the formatter.
+///
+/// **Since #5497 the recursion stops at jq's print depth**: anything more than
+/// [`succinctly::jq::JQ_MAX_PRINT_DEPTH`] (256) levels down is written as jq's
+/// `<skipped: too deep>` marker, so this writer never recurses past 257 levels
+/// and the `MAX_VALUE_TREE_DEPTH` guard the rest of this comment describes was
+/// removed from it as unreachable. The history stays for the ceiling's other
+/// consumers.
 ///
 /// Guarded against adversarially deep JSON input (thousands of nested
 /// arrays/objects, which would otherwise recurse this writer once per
@@ -11342,11 +11482,13 @@ where
     // Routing through the library-side wrappers only accepts an
     // already-resolved `DocumentValue`/cursor pair, which is exactly what
     // this walk is resolving for the first time as it goes.
-    anyhow::ensure!(
-        level < MAX_VALUE_TREE_DEPTH,
-        "{}",
-        succinctly::jq::nesting_depth_exceeded_message(MAX_VALUE_TREE_DEPTH)
-    );
+    // #5497: past jq's print depth, jq's writer prints a marker where the value would be. A
+    // formatter that marks a NaN writes text that is about to be colored, which takes the
+    // marker's colored placeholder.
+    if level > succinctly::jq::JQ_MAX_PRINT_DEPTH {
+        let marker = skipped_kind_of(value).marker(formatter.marks_nan());
+        return Ok(out.write_all(marker.as_bytes())?);
+    }
     // `|| indent_string.is_empty()`: `--indent 0` sets an empty indent with
     // `compact` false, and jq 1.7.1 prints that compactly -- confirmed live,
     // `jq --indent 0 '{a:[1,2]}'` is `{"a":[1,2]}`. `format_json`
@@ -12043,13 +12185,14 @@ where
 /// `print_json`'s `Cursor` arm, and `Cursor`/`RawNumber`/`LazyKeysArray`/
 /// `LazyIndexRange` are all unreachable from an owned tree.
 ///
-/// The depth `ensure!` mirrors `print_json`'s but is unreachable from the
-/// CLI: `to_jq_values` rejects an over-deep owned value through
-/// `OwnedValue::check_tree_depth` before any byte is written, which is what
-/// keeps `test_partial_result_over_depth_value_reports_cleanly_not_panic_1371`
-/// true (an in-writer check fires 384 levels of `[` too late). It stays as a
-/// backstop for a future caller that skips that gate, and is covered
-/// directly by `print_owned_json_depth_guard_3009`.
+/// Past [`succinctly::jq::JQ_MAX_PRINT_DEPTH`] levels it writes jq's
+/// `<skipped: too deep>` marker, as `print_json` does (#5497), so it never
+/// recurses past 257 levels. The depth `ensure!` it used to mirror from
+/// `print_json` went with that; it had been unreachable from the CLI anyway,
+/// since `to_jq_values` rejects an over-deep owned value through
+/// `OwnedValue::check_tree_depth` before any byte is written (which keeps
+/// `test_partial_result_over_depth_value_reports_cleanly_not_panic_1371`
+/// true). `print_owned_json_stops_at_print_depth_3009` pins the marker.
 fn print_owned_json<F, Out>(
     out: &mut Out,
     value: &OwnedValue,
@@ -12061,11 +12204,11 @@ where
     F: LiteralFormatter,
     Out: Write,
 {
-    anyhow::ensure!(
-        level < MAX_VALUE_TREE_DEPTH,
-        "{}",
-        succinctly::jq::nesting_depth_exceeded_message(MAX_VALUE_TREE_DEPTH)
-    );
+    // #5497: as in `print_json`.
+    if level > succinctly::jq::JQ_MAX_PRINT_DEPTH {
+        let marker = output::SkippedKind::of(value).marker(formatter.marks_nan());
+        return Ok(out.write_all(marker.as_bytes())?);
+    }
     // `|| indent_string.is_empty()`: `--indent 0` sets an empty indent with
     // `compact` false, and jq 1.7.1 prints that compactly -- confirmed live,
     // `jq --indent 0 '{a:[1,2]}'` is `{"a":[1,2]}`. `format_json`
@@ -12162,6 +12305,34 @@ where
         }
     }
     Ok(())
+}
+
+/// The kind of `value` [`print_json`] colors its depth marker with (#5497).
+fn skipped_kind_of<Wrd: Clone + AsRef<[u64]>>(value: &JqValue<'_, Wrd>) -> output::SkippedKind {
+    use output::SkippedKind;
+    use succinctly::json::light::StandardJson;
+    match value {
+        JqValue::Null => SkippedKind::Null,
+        JqValue::Bool(false) => SkippedKind::False,
+        JqValue::Bool(true) => SkippedKind::True,
+        JqValue::Int(_) | JqValue::Float(_) | JqValue::RawNumber(_) | JqValue::NumberLiteral(_) => {
+            SkippedKind::Number
+        }
+        JqValue::String(_) => SkippedKind::String,
+        JqValue::Array(_) | JqValue::LazyKeysArray { .. } | JqValue::LazyIndexRange(_) => {
+            SkippedKind::Array
+        }
+        JqValue::Object(_) => SkippedKind::Object,
+        JqValue::Cursor(c) => match c.value() {
+            StandardJson::Bool(false) => SkippedKind::False,
+            StandardJson::Bool(true) => SkippedKind::True,
+            StandardJson::Number(_) => SkippedKind::Number,
+            StandardJson::String(_) => SkippedKind::String,
+            StandardJson::Array(_) => SkippedKind::Array,
+            StandardJson::Object(_) => SkippedKind::Object,
+            _ => SkippedKind::Null,
+        },
+    }
 }
 
 /// Format a value as JSON.
@@ -14009,19 +14180,28 @@ mod tests {
         };
         // A clean stream, including a leniency only the fallback accepts.
         assert_eq!(
-            show(parse_json_stream_prefix("1 007 \"x\"")),
+            show(parse_json_stream_prefix(
+                "1 007 \"x\"",
+                Some(StreamOrigin::ALONE)
+            )),
             (vec!["1".into(), "7".into(), "\"x\"".into()], None)
         );
-        assert_eq!(show(parse_json_stream_prefix("  ")), (vec![], None));
+        assert_eq!(
+            show(parse_json_stream_prefix("  ", Some(StreamOrigin::ALONE))),
+            (vec![], None)
+        );
         // A splitter failure: truncated, unterminated, unmatched.
         for text in ["1 2 [3,", "1 2 \"abc", "1 2 }"] {
-            let (values, error) = show(parse_json_stream_prefix(text));
+            let (values, error) = show(parse_json_stream_prefix(text, Some(StreamOrigin::ALONE)));
             assert_eq!(values, vec!["1", "2"], "{text}");
             assert_eq!(error.as_deref(), Some("Invalid JSON text"), "{text}");
         }
         // A span the splitter accepts but the materializer rejects: the
         // prefix ends there, and nothing after it is kept.
-        let (values, error) = show(parse_json_stream_prefix("1 2 {invalid} 3"));
+        let (values, error) = show(parse_json_stream_prefix(
+            "1 2 {invalid} 3",
+            Some(StreamOrigin::ALONE),
+        ));
         assert_eq!(values, vec!["1", "2"]);
         assert!(error.is_some());
     }
@@ -15031,7 +15211,7 @@ mod tests {
     /// gate, so it is covered here directly rather than left as an
     /// unexercised line.
     #[test]
-    fn print_owned_json_depth_guard_3009() {
+    fn print_owned_json_stops_at_print_depth_3009() {
         let config = OutputConfig {
             compact: true,
             raw_output: false,
@@ -15046,20 +15226,27 @@ mod tests {
             seq: false,
             convention: JsonConvention::JqCompat,
         };
-        let mut out = Vec::new();
-        let err = print_owned_json(
-            &mut out,
-            &OwnedValue::Int(1),
-            &JqCompatFormatter,
-            &config,
-            MAX_VALUE_TREE_DEPTH,
-        )
-        .expect_err("at the ceiling the writer must refuse");
-        assert!(
-            err.to_string().contains("nesting depth exceeds limit of"),
-            "message: {err}"
+        let print = |level| {
+            let mut out = Vec::new();
+            print_owned_json(
+                &mut out,
+                &OwnedValue::Int(1),
+                &JqCompatFormatter,
+                &config,
+                level,
+            )
+            .unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        assert_eq!(print(succinctly::jq::JQ_MAX_PRINT_DEPTH), "1");
+        assert_eq!(
+            print(succinctly::jq::JQ_MAX_PRINT_DEPTH + 1),
+            succinctly::jq::SKIPPED_TOO_DEEP
         );
-        assert!(out.is_empty(), "nothing may be written before refusing");
+        assert_eq!(
+            print(MAX_VALUE_TREE_DEPTH),
+            succinctly::jq::SKIPPED_TOO_DEEP
+        );
     }
 
     /// #3034: `print_json`'s `JqValue::Cursor` arm decodes a reindex bridge

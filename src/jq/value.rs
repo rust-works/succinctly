@@ -79,6 +79,17 @@ pub use object_map::{
 /// smaller default stack than the dev machine this was measured on.
 pub const MAX_VALUE_TREE_DEPTH: usize = 384;
 
+/// jq's `MAX_PRINT_DEPTH` (`jv_print.c`): its writer prints anything more than this many levels
+/// below the value it was handed as [`SKIPPED_TOO_DEEP`], scalars included (#5497).
+///
+/// Every route that renders a value as jq would -- the CLI's output, `tojson`, `tostring`, string
+/// interpolation, a non-string `error` -- goes through that one writer in jq, and a document can
+/// hold at most 256 nested containers, so only a value the program built reaches this.
+pub const JQ_MAX_PRINT_DEPTH: usize = 256;
+
+/// What jq's writer prints in place of a value more than [`JQ_MAX_PRINT_DEPTH`] levels down.
+pub const SKIPPED_TOO_DEEP: &str = "<skipped: too deep>";
+
 /// Panics past `max` levels of nesting.
 ///
 /// The one place every depth-guarded recursive function in the binary
@@ -3949,6 +3960,7 @@ impl OwnedValue {
     pub fn to_json(&self) -> String {
         self.to_json_at_depth(
             0,
+            true,
             format_number_jq_compat,
             jq_bare_float_display,
             infinite_float_preview_text,
@@ -3990,6 +4002,7 @@ impl OwnedValue {
     pub fn to_json_input_bridge(&self) -> String {
         self.to_json_at_depth(
             0,
+            false,
             input_bridge_literal_text,
             jq_bare_float_display,
             overflow_literal_text,
@@ -4014,6 +4027,7 @@ impl OwnedValue {
     pub fn to_json_jq_preserve(&self) -> String {
         self.to_json_at_depth(
             0,
+            true,
             crate::jq::stream::real_output_finite_literal,
             jq_bare_float_display,
             infinite_float_preview_text,
@@ -4064,6 +4078,7 @@ impl OwnedValue {
     pub(crate) fn to_json_yq(&self) -> String {
         self.to_json_at_depth(
             0,
+            false,
             crate::jq::stream::yq_json_finite_literal,
             crate::yaml::format_float_yq,
             yq_infinite_float_json_text,
@@ -4090,14 +4105,22 @@ impl OwnedValue {
     /// yq's Go `encoding/json` refuses to marshal Infinity at all and
     /// errors) -- `to_json_yq` keeps the pre-existing `null` substitution
     /// rather than guessing at that answer here.
+    ///
+    /// `jq_printer` is jq's writer, which prints anything more than
+    /// [`JQ_MAX_PRINT_DEPTH`] levels down as [`SKIPPED_TOO_DEEP`] (#5497); the yq writer
+    /// and the reindex bridge, which must keep the whole value, do not.
     fn to_json_at_depth(
         &self,
         depth: usize,
+        jq_printer: bool,
         finite_literal: fn(&[u8]) -> String,
         float_fmt: fn(f64) -> String,
         infinite_fmt: fn(bool) -> &'static str,
         nan_fmt: fn(f64) -> String,
     ) -> String {
+        if jq_printer && depth > JQ_MAX_PRINT_DEPTH {
+            return SKIPPED_TOO_DEEP.into();
+        }
         assert_value_tree_depth(depth);
         match self {
             Self::Null => "null".into(),
@@ -4152,6 +4175,7 @@ impl OwnedValue {
                     .map(|v| {
                         v.to_json_at_depth(
                             depth + 1,
+                            jq_printer,
                             finite_literal,
                             float_fmt,
                             infinite_fmt,
@@ -4170,6 +4194,7 @@ impl OwnedValue {
                             escape_json_body(write_json_body_jq, k),
                             v.to_json_at_depth(
                                 depth + 1,
+                                jq_printer,
                                 finite_literal,
                                 float_fmt,
                                 infinite_fmt,
@@ -4315,6 +4340,7 @@ impl OwnedValue {
             // replaced, for why. Every other variant is handled above.
             other => out.push_str(&other.to_json_at_depth(
                 depth,
+                false,
                 format_number_jq_compat,
                 crate::json::validate::computed_float_token,
                 infinite_float_preview_text,
@@ -4390,6 +4416,7 @@ impl OwnedValue {
             // `assert_value_tree_depth` at this same depth cannot fire.
             other => other.to_json_at_depth(
                 depth,
+                false,
                 format_number_jq_compat,
                 crate::json::validate::computed_float_token,
                 infinite_float_preview_text,
@@ -10157,18 +10184,49 @@ mod tests {
     /// *document* behind it, so #998's input-side guards never see it -
     /// `to_json`/`==` must each independently refuse to recurse past the
     /// same limit rather than overflow the stack.
+    ///
+    /// Since #5497 jq's writer stops at jq's own print depth, writing the marker there, so
+    /// `to_json` never recurses as far as the limit; yq's writer prints the whole value and
+    /// keeps the guard.
     #[test]
-    fn to_json_panics_past_nesting_depth_limit_1005() {
+    fn to_json_yq_panics_past_nesting_depth_limit_1005() {
         let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
         // Under the limit: succeeds (doesn't panic).
-        let _ = under.to_json();
+        let _ = under.to_json_yq();
 
         let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| over.to_json()));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| over.to_json_yq()));
         assert!(
             result.is_err(),
-            "to_json should panic at MAX_VALUE_TREE_DEPTH"
+            "to_json_yq should panic at MAX_VALUE_TREE_DEPTH"
         );
+        assert_eq!(
+            over.to_json(),
+            format!(
+                "{}{SKIPPED_TOO_DEEP}{}",
+                "[".repeat(JQ_MAX_PRINT_DEPTH + 1),
+                "]".repeat(JQ_MAX_PRINT_DEPTH + 1)
+            )
+        );
+    }
+
+    /// jq's writer prints a value exactly [`JQ_MAX_PRINT_DEPTH`] levels down, scalars
+    /// included, and nothing below it (#5497).
+    #[test]
+    fn to_json_prints_the_marker_past_print_depth_5497() {
+        let at = linear_array_nest(JQ_MAX_PRINT_DEPTH);
+        assert_eq!(
+            at.to_json(),
+            format!(
+                "{}null{}",
+                "[".repeat(JQ_MAX_PRINT_DEPTH),
+                "]".repeat(JQ_MAX_PRINT_DEPTH)
+            )
+        );
+        let past = linear_array_nest(JQ_MAX_PRINT_DEPTH + 1);
+        assert!(past.to_json().contains("[<skipped: too deep>]"));
+        assert!(!past.to_json_yq().contains("skipped"));
+        assert!(!past.to_json_input_bridge().contains("skipped"));
     }
 
     /// #3261: unlike `to_json` above, `to_json_for_reindex` is reached from
