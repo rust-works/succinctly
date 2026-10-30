@@ -52,6 +52,15 @@ fn test_double_dot_after_a_number_indexes_it_5615() -> Result<()> {
             "\"Cannot index number with string \\\"e1\\\"\"\n",
         ),
         ("[1..e1?]", "[]\n"),
+        // A negated literal: the postfix binds tighter than the `-`.
+        ("-1..e1?", ""),
+        (
+            "try (-1..e1) catch .",
+            "\"Cannot index number with string \\\"e1\\\"\"\n",
+        ),
+        ("[-1 .e1?]", "[]\n"),
+        ("[-1..e1?]", "[]\n"),
+        ("-1 .[0]?", ""),
     ] {
         let (out, err, code) = run_jq_full(&["-nc", program], None)?;
         assert_eq!((out.as_str(), code), (expected, 0), "{program}: {err}");

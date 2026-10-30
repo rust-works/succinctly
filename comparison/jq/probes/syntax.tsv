@@ -590,3 +590,5 @@ num-lit-leading-zero-neg-exp	operators	["-n", "-c", "0007e-1"]	-
 num-lit-leading-zero-tojson	operators	["-n", "-c", "00e1|tojson"]	-
 num-lit-double-dot-index	operators	["-n", "-c", "1..e1"]	-
 num-lit-double-dot-try	operators	["-n", "-c", "try (1..e1) catch ."]	-
+num-lit-double-dot-neg	operators	["-n", "-c", "-1..e1"]	-
+num-lit-double-dot-neg-space	operators	["-n", "-c", "-1 .e1"]	-

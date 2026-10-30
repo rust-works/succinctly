@@ -9176,7 +9176,8 @@ impl<'a> Parser<'a> {
     /// B` as `-(1 as $i | B)` and `-2 * "ab"` as `-(2 * "ab")`, so the sign
     /// must not fold into the token. The unary-minus arm then binds the
     /// positive literal and absorbs the chain. A postfix `?` scopes too:
-    /// `-2? * 3` is `-(2? * 3)`. Consumes nothing.
+    /// `-2? * 3` is `-(2? * 3)`; so does a postfix `.name` or `.[...]` (`-1..e1`
+    /// and `-1 .e1` index the number 1, #5615). Consumes nothing.
     fn negation_scopes_over_what_follows(&mut self) -> bool {
         // The byte right after the literal settles nearly every case.
         if matches!(self.peek(), None | Some(',' | ']' | ')' | '}' | ';' | '|')) {
@@ -9188,6 +9189,7 @@ impl<'a> Parser<'a> {
         let scopes = self.matches_keyword("as")
             || self.at_postfix_question()
             || match self.peek() {
+                Some('.') => true,
                 Some('*') => peek2 != "*=",
                 Some('%') => peek2 != "%=",
                 Some('/') => peek2 != "//" && peek2 != "/=",
