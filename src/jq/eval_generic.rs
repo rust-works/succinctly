@@ -4885,24 +4885,23 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
         }
     }
 
-    // #5602: `tojson` of a number the filter computed is its `tostring` -- a plain `Int` or `Float`
-    // has no source spelling, so jq dumps both through the same number printer.
-    if let Expr::Builtin(Builtin::ToJson) = strip_parens(expr) {
-        if is_computed_plain_number::<S>(&owned) {
-            return GenericResult::Owned(tostring_owned::<S>(owned));
-        }
-    }
-
-    // #5602: a `select` or an `if` over a number the filter computed settles its condition from the
-    // number, as `owned_select_door` does for the sink route. A verdict is a boolean that carries no
-    // node, so neither the re-entry nor the embed table matters to it (`owned_cond_verdict`); the
-    // input is a plain number with no storage identity (`is_computed_plain_number`), so `select`
-    // hands it back as it is. A condition outside the pure grammar, or `optional`, bridges as before.
-    if !optional && is_computed_plain_number::<S>(&owned) {
+    // #5602: stages over a number the filter computed that need nothing from the document. A plain
+    // `Int` or `Float` has no storage identity and no source spelling, so:
+    // - `tojson` is its `tostring` (jq dumps both through the same number printer);
+    // - `empty` yields nothing, whatever its input (it is the usual `else` of an `if`);
+    // - `select` and `if` settle their condition from the number, as `owned_select_door` does for
+    //   the sink route. A verdict is a boolean that carries no node, so neither the re-entry nor the
+    //   embed table matters to it (`owned_cond_verdict`); `select` hands the number back as it is.
+    //   A condition outside the pure grammar, or `optional`, bridges as before, which is also where
+    //   an error keeps the evaluator's wording.
+    let plain = is_computed_plain_number::<S>(&owned);
+    if plain {
         match strip_parens(expr) {
-            // The branch an `if` takes when it has nothing to say: no output, whatever the input.
+            Expr::Builtin(Builtin::ToJson) => {
+                return GenericResult::Owned(tostring_owned::<S>(owned));
+            }
             Expr::Builtin(Builtin::Empty) => return GenericResult::None,
-            Expr::Builtin(Builtin::Select(cond)) => {
+            Expr::Builtin(Builtin::Select(cond)) if !optional => {
                 if let Some(verdict) = crate::jq::eval::owned_cond_verdict::<S>(cond, &owned, false)
                 {
                     return match verdict {
@@ -4916,7 +4915,7 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
                 cond,
                 then_branch,
                 else_branch,
-            } => {
+            } if !optional => {
                 if let Some(verdict) = crate::jq::eval::owned_cond_verdict::<S>(cond, &owned, false)
                 {
                     return match verdict {
@@ -5036,11 +5035,11 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
     // a NaN because jq tells two of them apart.
     //
     // The expression is checked for a shape the fast path answers first: a stage outside its
-    // grammar (`select`, `if`, a constructor, `as`) would pay a failed walk per value and then
-    // bridge anyway, 1-6% slower than not trying (measured).
+    // grammar (a constructor, `as`, a `select` or `if` the arm above declined) would pay a failed
+    // walk per value and then bridge anyway, 1-6% slower than not trying (measured).
     if !embed_table_active()
         && ((!S::REINDEX_BRIDGE_KEEPS_IDENTITY && dom_roots::active())
-            || (is_computed_plain_number::<S>(&owned) && owned_fast_path_may_answer(expr)))
+            || (plain && owned_fast_path_may_answer(expr)))
     {
         if let Some(result) = crate::jq::eval::eval_owned_fast_path::<S>(expr, &owned, optional) {
             // No `Err(_) if optional` arm, unlike the route above: the fast
@@ -41274,6 +41273,8 @@ mod tests {
         assert!(reindexes("map(. + 1 | select(. > 1, . < 0))") > 0);
         assert!(reindexes("map(nan | select(. == .))") > 0);
         assert!(reindexes("map(. + 1 | . as $x | $x)") > 0);
+        // `optional` is the verdict path's one gate: `?` suppression stays the bridge's.
+        assert!(reindexes("map(. + 1 | select(. > 2)?)") > 0);
     }
 
     /// #3639: a `label` met at a position with no prefetch hook (the absent-

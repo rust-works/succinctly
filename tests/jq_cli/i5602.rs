@@ -90,3 +90,76 @@ fn test_select_if_and_tojson_after_a_computed_number_match_jq_5602() -> Result<(
     }
     Ok(())
 }
+
+const SMALL: &str = r"[1,-1,2.5,0.1,100]";
+
+/// The same stages with a `?`, a `limit`/`first`/`path` around them and an `elif` chain.
+#[test]
+fn test_select_and_if_after_a_computed_number_in_context_match_jq_5602() -> Result<()> {
+    for (program, expected) in [
+        (
+            r"map(. + 1 | try select(.a) catch .)",
+            r#"["Cannot index number with string \"a\"","Cannot index number with string \"a\"","Cannot index number with string \"a\"","Cannot index number with string \"a\"","Cannot index number with string \"a\""]"#,
+        ),
+        (
+            r"map(. + 1 | try (if .[0] then 1 else 2 end) catch .)",
+            r#"["Cannot index number with number","Cannot index number with number","Cannot index number with number","Cannot index number with number","Cannot index number with number"]"#,
+        ),
+        (r"map(. + 1 | select(.a)?)", r"[]"),
+        (
+            r#"map(. + 1 | (try select(.a) catch "d"))"#,
+            r#"["d","d","d","d","d"]"#,
+        ),
+        (r"map(. + 1 | select(. > 2)?)", r"[3.5,101]"),
+        (
+            r"map(. + 1 | (if . > 2 then 1 else 0 end)?)",
+            r"[0,0,1,0,1]",
+        ),
+        (r"[limit(2; .[] | . + 1 | select(. > 0))]", r"[2,3.5]"),
+        (r"first(.[] | . + 1 | select(. > 2))", r"3.5"),
+        (
+            r#"[.[] | . + 1 | if . > 100 then "big" elif . > 2 then "mid" elif . > 0 then "small" else "neg" end]"#,
+            r#"["small","neg","mid","small","big"]"#,
+        ),
+        (
+            r"try ([.[] | . + 1 | path(select(. > 0))]) catch .",
+            r"[[],[],[],[]]",
+        ),
+        (r"[.[] | . + 1 | select(. > 2)] | length", r"2"),
+        (r"map(. + 1 | select(. > 2) | tojson)", r#"["3.5","101"]"#),
+        (
+            r"[.[] | . + 1 | if . > 2 then empty else . end]",
+            r"[2,0,1.1]",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(SMALL))?;
+        assert_eq!(code, 0, "{program}: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "{program}");
+    }
+    Ok(())
+}
+
+/// A condition that raises reports jq's message and exit status, not the verdict path's own.
+#[test]
+fn test_a_raising_condition_after_a_computed_number_reports_jq_s_error_5602() -> Result<()> {
+    for (program, message) in [
+        (
+            r"map(. + 1 | select(.a))",
+            r#"jq: error (at <stdin>:0): Cannot index number with string "a""#,
+        ),
+        (
+            r"map(. + 1 | if .[0] then 1 else 2 end)",
+            r"jq: error (at <stdin>:0): Cannot index number with number",
+        ),
+        (
+            r#"map(. + 1 | (select(.a) // "d"))"#,
+            r#"jq: error (at <stdin>:0): Cannot index number with string "a""#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(SMALL))?;
+        assert_eq!(code, 5, "{program}");
+        assert_eq!(stdout.trim_end(), "", "{program}");
+        assert_eq!(stderr.trim_end(), message, "{program}");
+    }
+    Ok(())
+}
