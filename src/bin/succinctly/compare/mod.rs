@@ -110,6 +110,16 @@ pub struct CompareJqArgs {
     /// (its --version must still equal the primary reference)
     #[arg(long)]
     jq: Option<PathBuf>,
+
+    /// Time and measure this succinctly binary instead of the harness itself. The harness needs
+    /// `bench-runner`, which the shipped CLI does not carry (#5551), so build a plain `cli` binary
+    /// and pass it here with `--subject-features`
+    #[arg(long, requires = "subject_features")]
+    subject: Option<PathBuf>,
+
+    /// The cargo features `--subject` was built with, comma-separated (not detectable from a binary)
+    #[arg(long, requires = "subject")]
+    subject_features: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -243,8 +253,28 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         );
     }
 
-    let mut env = env::Env::collect(&jq, sha256_hex(&std::fs::read(&jq)?))?;
-    let mut declared: Vec<&str> = manifest.succinctly.features.split(',').collect();
+    let subject_exe = match &args.subject {
+        Some(p) => Some(
+            p.canonicalize()
+                .with_context(|| format!("--subject {}", p.display()))?,
+        ),
+        None => None,
+    };
+    let subject_build = subject_exe.as_deref().zip(args.subject_features.as_deref()).map(
+        |(exe, feats)| {
+            (
+                exe,
+                feats.split(',').map(|f| f.trim().to_string()).collect::<Vec<_>>(),
+            )
+        },
+    );
+    let mut env = env::Env::collect(&jq, sha256_hex(&std::fs::read(&jq)?), subject_build)?;
+    let mut declared: Vec<String> = manifest
+        .succinctly
+        .features
+        .split(',')
+        .map(String::from)
+        .collect();
     let mut built = env.succinctly_features.clone();
     declared.sort_unstable();
     built.sort_unstable();
@@ -265,7 +295,10 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
     };
     let subject = Tool {
         name: "succinctly jq".into(),
-        program: std::env::current_exe()?.to_string_lossy().into(),
+        program: match &subject_exe {
+            Some(p) => p.to_string_lossy().into(),
+            None => std::env::current_exe()?.to_string_lossy().into(),
+        },
         prefix: vec!["jq".into()],
     };
 
@@ -545,9 +578,16 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         schema_version: SCHEMA_VERSION,
         run_id,
         command: format!(
-            "./target/release/succinctly dev compare jq {}{}",
+            "./target/release/succinctly dev compare jq {}{}{}",
             if args.full { "--full" } else { "--quick" },
-            if args.control { " --control" } else { "" }
+            if args.control { " --control" } else { "" },
+            match (&args.subject, &args.subject_features) {
+                (Some(p), Some(f)) => format!(
+                    " --subject {} --subject-features {f}",
+                    p.strip_prefix(&root).unwrap_or(p).display()
+                ),
+                _ => String::new(),
+            }
         ),
         reps,
         manifest_sha256,

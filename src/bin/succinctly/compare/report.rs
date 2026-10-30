@@ -30,6 +30,13 @@ pub fn render(results: &Results) -> String {
     if r.command.contains("--control") {
         let _ = writeln!(s, "> **CONTROL RUN:** the subject is jq itself, so every ratio shows the harness's noise floor, not a comparison.\n");
     }
+    if !e.subject_is_harness {
+        let _ = writeln!(
+            s,
+            "> Timed binary: a separate build (`{}`), not the harness (#5570).\n",
+            e.succinctly_features.join(",")
+        );
+    }
     if !e.invalid_reasons.is_empty() {
         let _ = writeln!(s, "> **INVALID RUN — do not quote the timings:**");
         for why in &e.invalid_reasons {
@@ -249,6 +256,13 @@ pub fn render(results: &Results) -> String {
 
     let _ = writeln!(s, "\n## Reproduce\n");
     let _ = writeln!(s, "```bash\ncargo build --release --features bench-runner");
+    if !e.subject_is_harness {
+        let _ = writeln!(
+            s,
+            "cargo build --release --features {} --target-dir target/subject",
+            e.succinctly_features.join(",")
+        );
+    }
     let _ = writeln!(s, "{}\n```", r.command);
     let _ = writeln!(
         s,
