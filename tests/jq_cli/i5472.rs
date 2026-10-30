@@ -143,6 +143,23 @@ fn exit_status_2_outranks_the_filter_and_dash_e_5472() -> Result<()> {
 }
 
 #[test]
+fn halt_after_a_missing_file_exits_2_5472() -> Result<()> {
+    let f = Files::new()?;
+    // jq's exit status is 2 once an open has failed, over `halt`'s and `halt_error`'s own.
+    for filter in ["halt", "halt_error(7)", ".|halt_error"] {
+        let (out, err, code) = run_jq_full(&["-c", filter, &f.gone, &f.data], None)?;
+        assert_eq!((out.as_str(), code), ("", 2), "{filter}: {err:?}");
+        assert!(err.starts_with(&open_error(&f.gone)), "{filter}: {err:?}");
+    }
+    // A halt before the reader reaches the missing file never reports it: the file is not
+    // opened as far as the run goes, and the halt's own code stands.
+    let (out, err, code) = run_jq_full(&["-c", "halt_error(7)", &f.data, &f.gone], None)?;
+    assert_eq!((out.as_str(), code), ("", 7), "stderr: {err:?}");
+    assert!(!err.contains("Could not open"), "stderr: {err:?}");
+    Ok(())
+}
+
+#[test]
 fn input_filename_names_the_file_that_opened_5472() -> Result<()> {
     let f = Files::new()?;
     let (out, _, code) = run_jq_full(&["-c", "input_filename", &f.gone, &f.data], None)?;

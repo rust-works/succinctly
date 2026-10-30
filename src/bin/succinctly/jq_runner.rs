@@ -4508,6 +4508,16 @@ fn stopped(on_error: Option<OnError>, sink: &ErrorSink) -> bool {
     on_error == Some(OnError::Stop) && sink.hit()
 }
 
+/// The exit code of a run `halt`/`halt_error` ended: its own, unless an input file did not
+/// open, which makes it 2 as it does every other end of the run (`open_failed`, #5472).
+fn halt_exit_code(code: i32, open_failed: bool) -> i32 {
+    if open_failed {
+        exit_codes::USAGE_ERROR
+    } else {
+        code
+    }
+}
+
 /// The exit code once every input has run (halt has already returned its own).
 ///
 /// An uncaught error outranks -e: jq's 5 says the filter failed, -e's 1/4 describe an
@@ -5019,7 +5029,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                     // including remaining rows/files still to process.
                     if let Some(code) = sink.halted() {
                         out.flush()?;
-                        return Ok(code);
+                        return Ok(halt_exit_code(code, open_failed));
                     }
                     // row_value is dropped here, freeing memory for this row
                 }
@@ -5366,7 +5376,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                     };
                     if let Some(code) = sink.halted() {
                         out.flush()?;
-                        return Ok(code);
+                        return Ok(halt_exit_code(code, open_failed));
                     }
                     if handled {
                         continue;
@@ -5545,7 +5555,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 // both paths.
                 if let Some(code) = sink.halted() {
                     out.flush()?;
-                    return Ok(code);
+                    return Ok(halt_exit_code(code, open_failed));
                 }
             }
             if past_open_failure {
@@ -5783,7 +5793,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 )?;
                 if let Some(code) = sink.halted() {
                     out.flush()?;
-                    return Ok(code);
+                    return Ok(halt_exit_code(code, open_failed));
                 }
             } else {
                 // The outer loop and `input`/`inputs` draw from the exact
@@ -5869,7 +5879,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                     )?;
                     if let Some(code) = sink.halted() {
                         out.flush()?;
-                        return Ok(code);
+                        return Ok(halt_exit_code(code, open_failed));
                     }
                 }
             }
@@ -5939,7 +5949,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                     )?;
                     if let Some(code) = sink.halted() {
                         out.flush()?;
-                        return Ok(code);
+                        return Ok(halt_exit_code(code, open_failed));
                     }
                 }
             }

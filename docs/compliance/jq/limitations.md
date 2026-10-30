@@ -13274,7 +13274,7 @@ their message shapes was reusable for it.
 An input file that will not open no longer stops the run (#5472).
 jq reports every file it cannot open, one `jq: error: Could not open file ...` line each, and reads on with the files that did open.
 `sjq -c .a missing valid` prints the error, then `valid`'s output, and exits 2.
-The exit status is 2 whatever else the run did: an error in the filter, `-e`'s 1 and 4 and a clean run all become 2.
+The exit status is 2 whatever else the run did: an error in the filter, `-e`'s 1 and 4, `halt`'s and `halt_error`'s own code and a clean run all become 2.
 Under `-s` jq slurps the readable files (`[]` when none opened) and still exits 2, and `-n` reads no file unless the filter asks for one with `input`/`inputs`.
 
 jq's main loop ends the run once an open has failed, after the one value it was fetching when it hit the failure.
@@ -13283,7 +13283,7 @@ Past a missing file jq therefore prints the first value of the next file that ha
 It reports a missing file when it reaches it, after the values before it, so the stderr lines of a run keep jq's order.
 Two residuals remain, both with a missing file *and* a feature that routes input differently:
 
-* `-R`, `--seq`, `--stream`, `-s` and a filter that uses `input`/`inputs` read every file that opens and report every missing one up front.
+* `-R`, `--seq`, `--stream`, `-s`, `--input-dsv` and a filter that uses `input`/`inputs` read every file that opens and report every missing one up front.
   jq stops after one more line, record or event past a missing file, and reaches a missing file only when the reader gets to it (`jq -n -c input data.json missing` never opens `missing`).
   The output of `-R` and `-s` over files that all exist is unchanged; only the run that has a missing file differs.
 * jq keeps the name of the last file it tried even when it did not open, so a diagnostic or `input_filename` after a missing last file names that file (`jq -s -c input_filename data.json missing` prints `"missing"`).
