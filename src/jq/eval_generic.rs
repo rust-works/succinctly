@@ -386,10 +386,11 @@ fn document_number_f64_generic<S: EvalSemantics, V: DocumentValue>(value: &V) ->
 /// ([`integral_f64_result`](crate::jq::eval::integral_f64_result), `OwnedValue::Float` for
 /// `sqrt`/`fabs`), so the answer is the same value the bridge produced.
 ///
-/// Declines (`None`, the wildcard route unchanged) for everything but a finite number token the
-/// document keeps as a literal: a string, a bridge token (a computed float or a non-finite
-/// spelling), a literal whose double is not finite, and yq mode, whose number model differs. A
-/// value that is not a number is the evaluator's error to word.
+/// Declines (`None`, the wildcard route unchanged) for everything but a finite number whose raw
+/// span is a valid RFC 8259 number: a string, a bridge token (a computed float, a non-finite
+/// sentinel or a spelling token, none of which is a valid number), a lenient span, a literal whose
+/// double is not finite, and yq mode, whose number model differs. A value that is not a number is
+/// the evaluator's error to word.
 fn unary_math_of_document_number<S: EvalSemantics, V: DocumentValue>(
     builtin: &Builtin,
     value: &V,
@@ -407,10 +408,10 @@ fn unary_math_of_document_number<S: EvalSemantics, V: DocumentValue>(
         Builtin::Fabs => |n| OwnedValue::Float(super::math::fabs(n)),
         _ => return None,
     };
-    if value.bridge_computed_float().is_some() {
+    let text = value.number_text()?;
+    if !crate::json::validate::is_valid_number(text.as_bytes()) {
         return None;
     }
-    value.number_literal()?;
     let n = document_number_f64_generic::<S, V>(value).filter(|n| n.is_finite())?;
     Some(apply(n))
 }
@@ -41044,6 +41045,44 @@ mod tests {
                 reindex_count::get() - before,
                 0,
                 "{filter} bridged a document number"
+            );
+        }
+        // The answers are the evaluator's: a signed zero, a double past 2^53 and a NaN.
+        let answers = |filter: &str, json: &[u8]| {
+            let index = JsonIndex::build(json);
+            let expr = crate::jq::parse(filter).unwrap();
+            let result = eval_using::<JqSemantics, _>(&expr, index.root(json).value())
+                .collect_owned::<JqSemantics>()
+                .unwrap();
+            result.iter().map(OwnedValue::to_json).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            answers("map(floor)", b"[-0.0,-0.5,1e19,2.5]"),
+            ["[-0,-1,1e+19,2]"]
+        );
+        assert_eq!(answers("map(ceil)", b"[-0.5,0.2]"), ["[-0,1]"]);
+        assert_eq!(
+            answers("map(round)", b"[2.5,-2.5,0.49999999999999994]"),
+            ["[3,-3,0]"]
+        );
+        assert_eq!(
+            answers("map(sqrt)", b"[16,-1,2]"),
+            ["[4,null,1.4142135623730951]"]
+        );
+        assert_eq!(answers("map(fabs)", b"[-1.5,-0.0]"), ["[1.5,0]"]);
+        // A bridge token is no valid number, so it is never read as one here: the three kinds the
+        // reindex bridge writes in a number's place all fail the gate.
+        for token in [
+            crate::json::validate::computed_float_token(1.5),
+            crate::json::validate::nonfinite_literal_token(0),
+            crate::json::validate::spelling_token("0x1F"),
+            crate::jq::value::NAN_SENTINEL.to_string(),
+            crate::jq::value::INFINITY_SENTINEL.to_string(),
+            crate::jq::value::NEG_INFINITY_SENTINEL.to_string(),
+        ] {
+            assert!(
+                !crate::json::validate::is_valid_number(token.as_bytes()),
+                "{token}"
             );
         }
         // Not a number, a computed double and a non-finite literal keep the bridge.
