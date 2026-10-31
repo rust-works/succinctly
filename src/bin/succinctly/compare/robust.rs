@@ -23,7 +23,8 @@ pub struct Probe {
     pub area: String,
     pub args: Vec<String>,
     pub stdin: String,
-    /// `head` pipes the tool into `head -n1` to exercise SIGPIPE handling.
+    /// `head` pipes the tool into `head -n1` to exercise SIGPIPE handling;
+    /// `ulimit-v:<KiB>` caps its address space (Linux; elsewhere the probe is a no-op).
     pub wrap: Option<String>,
 }
 
@@ -126,6 +127,21 @@ fn wrapped(tool: &Tool, wrap: Option<&str>) -> Tool {
                 "-c",
                 "set -o pipefail; \"$@\" | head -n1",
                 "bash",
+                tool.program.as_str(),
+            ]
+            .iter()
+            .map(ToString::to_string)
+            .chain(tool.prefix.iter().cloned())
+            .collect(),
+        },
+        Some(w) if w.starts_with("ulimit-v:") => Tool {
+            name: tool.name.clone(),
+            program: "bash".into(),
+            // macOS refuses `ulimit -v`: skip there; elsewhere a refused limit exits 99, not a silent pass.
+            prefix: [
+                "-c",
+                "ulimit -v \"$0\" 2>/dev/null || { [ \"$(uname)\" = Darwin ] && exit 0; exit 99; }; exec \"$@\"",
+                &w["ulimit-v:".len()..],
                 tool.program.as_str(),
             ]
             .iter()
@@ -254,6 +270,16 @@ mod tests {
         let cwd = Path::new(".");
         assert!(run(&ok, &ok, &probes, Some(&none), cwd).unwrap().is_empty());
         assert_eq!(run(&ok, &ok, &probes, Some(&one), cwd).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ulimit_wrap_caps_address_space_or_is_a_no_op() {
+        let probes = parse_probes("p\tmem\t[]\t-\tulimit-v:4000000\n").unwrap();
+        let t = sh("echo hi");
+        let rows = run(&t, &t, &probes, None, Path::new(".")).unwrap();
+        assert!(rows[0].matches);
+        // Where the limit applies the tool still runs; where it does not the probe exits 0.
+        assert_eq!(rows[0].subject_exit, Some(0));
     }
 
     #[test]

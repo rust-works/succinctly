@@ -84,3 +84,15 @@ deep-object-parse-257	nesting	["-c", "length"]	@gen:nested-object:257	-
 deep-object-parse-385	nesting	["-c", "length"]	@gen:nested-object:385	-
 recursion-depth-1000	recursion	["-n", "def f(n): if n==0 then 0 else 1+f(n-1) end; f(1000)"]	-	-
 recursion-tail-100000	recursion	["-n", "def f(n): if n==0 then 0 else f(n-1) end; f(100000)"]	-	-
+mem-limit-1g-identity	memory	["-c", "length"]	@gen:int-array:1000000	ulimit-v:1048576
+mem-limit-256m-identity	memory	["-c", "length"]	@gen:int-array:1000000	ulimit-v:262144
+mem-limit-64m-identity	memory	["-c", "length"]	@gen:int-array:1000000	ulimit-v:65536
+mem-limit-64m-wide	memory	["-c", "length"]	@gen:wide-object:300000	ulimit-v:65536
+mem-limit-64m-string	memory	["-c", "length"]	@gen:long-string:20000000	ulimit-v:65536
+mem-limit-alloc-bomb	memory	["-n", "-c", "[range(1e8)] | length"]	-	ulimit-v:524288
+mem-limit-string-bomb	memory	["-n", "-c", "\"a\" * 1e9 | length"]	-	ulimit-v:524288
+mem-limit-first	memory	["-c", "first(.[])"]	@gen:int-array:2000000	ulimit-v:524288
+mem-limit-limit	memory	["-c", "[limit(3; .[])]"]	@gen:int-array:2000000	ulimit-v:524288
+mem-limit-isempty	memory	["-c", "isempty(.[])"]	@gen:int-array:2000000	ulimit-v:524288
+mem-early-exit-first-uncapped	memory	["-c", "first(.[])"]	@gen:int-array:5000000	-
+mem-early-exit-limit-uncapped	memory	["-c", "[limit(3; .[])]"]	@gen:int-array:5000000	-

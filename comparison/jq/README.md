@@ -30,7 +30,7 @@ reported as a correctness row and gets no timing; the command exits 1 on it.
 | `fixtures/`           | working directory of the CLI probes (`-f`, `-L`, ...)    |
 | `vendor/jq-1.7.1/`    | B: jq's own test files (MIT), sha256-pinned in the manifest |
 | `queries/perf.tsv`    | D/E: id, flags, filter, shapes, max tier                 |
-| `probes/robust.tsv`   | F: nesting, recursion, generators, regex, big values, SIGPIPE; `@gen:` builds large stdin |
+| `probes/robust.tsv`   | F: nesting, recursion, generators, regex, big values, SIGPIPE, `ulimit -v` (`ulimit-v:<KiB>` wrap); `@gen:` builds large stdin |
 | `divergences.toml`    | ledger of known differences; the run fails on drift      |
 
 Dimension A probes every builtin in the reference's own `builtins` (plus those new in jq 1.8.1, against 1.8.1) and, from `probes/syntax.tsv`, the language's forms: operators, paths and slices, construction, `if`/`reduce`/`foreach`/`label`, destructuring with `?//`, `def`, string and format forms, assignment and `import`/`include`;
@@ -42,7 +42,8 @@ against itself to show the noise floor, and `--full` adds the 10 MB and 100 MB t
 A row whose slowest tool runs over 15 ms is topped up to 21 repetitions (within 30 s of extra timed runs per row) and, once it has them, its
 ratios are of each tool's fastest run, marked † in the report, because run-to-run noise moves the median of a figure that
 long (#5581). A row with a CV above 5% is marked, and its ratio is not a finding on its own.
-Dimension F runs 85 resource-limit probes under a 10 s deadline and classes each outcome (ok, error, crash, timeout).
+Dimension F runs the resource-limit probes under a 10 s deadline and classes each outcome (ok, error, crash, timeout).
+Its `memory` probes cap the address space with `ulimit -v` (graceful error versus abort; early-exit `first`/`limit`/`isempty` on a generated array); macOS refuses `ulimit -v`, so there they run uncapped as a no-op and only Linux CI exercises the limit.
 
 Dimension H reports binary size, dynamic libraries, the Rust dependency count, whether either tool uses more than one
 core, and licence / `no_std` / CI-runner facts read from the repository; build time is not measured.
