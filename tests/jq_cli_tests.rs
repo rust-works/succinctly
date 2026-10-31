@@ -225,7 +225,7 @@ use cargo_run_exit::{
 };
 
 // New tests go in `tests/jq_cli/` (one `iNNNN.rs` per issue), not at the end of this file:
-// see the header of `tests/jq_cli/mod.rs`. #4329.
+// see the header of `tests/jq_cli/mod.rs`. #4329, #5697.
 #[path = "jq_cli/mod.rs"]
 mod per_issue;
 

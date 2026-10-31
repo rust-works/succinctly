@@ -11,12 +11,15 @@ Guidelines for writing effective tests that actually verify correctness.
 
 Do not append to the end of `tests/yq_cli_tests.rs` or `tests/jq_cli_tests.rs`: they are 70k and
 160k lines, and an append at EOF conflicts with every other PR that does the same (about nine
-a day). Put the test for issue `N` in `tests/yq_cli/iN.rs` (or `tests/jq_cli/iN.rs`), add one
-`mod iN;` line to that directory's `mod.rs` in numeric order, and reach the shared helpers with
+a day). Put the test for issue `N` in `tests/yq_cli/iN.rs` (or `tests/jq_cli/iN.rs`) and edit nothing
+else: the directory's `mod.rs` declares every file in it with `automod::dir!` (#5697), so there is
+no `mod iN;` list for two PRs to conflict on. Reach the shared helpers with
 `use crate::{run_yq_stdin, ...};`. The directory is compiled into the existing test binary (no new
-target, no extra link time), and `.gitattributes` marks the two `mod.rs` files `merge=union` so
-two lines added into the same gap both survive a rebase. A test for a behaviour an existing test
-already pins is better extended in place; do not move existing tests.
+target, no extra link time). `cargo fmt` cannot follow a macro-generated `mod`: format a new file
+with `scripts/fmt-per-issue.sh --fix` (CI and `scripts/pre-push.sh` check with it). An incremental
+`cargo test` does not see a *new* file until `mod.rs` is touched (`touch tests/jq_cli/mod.rs`).
+A test for a behaviour an existing test already pins is better extended in place; do not move
+existing tests.
 
 ## Critical Anti-Pattern: Success-Only Tests
 

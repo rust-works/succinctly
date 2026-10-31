@@ -64,13 +64,14 @@ lint conventions are captured with stable rule IDs in
 ```bash
 # Format code
 cargo fmt
+scripts/fmt-per-issue.sh --fix   # per-issue CLI tests under tests/{jq,yq}_cli/ (cargo fmt skips them)
 
 # Run clippy
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 All code must:
-- Pass `cargo fmt --check`
+- Pass `cargo fmt --check` and `scripts/fmt-per-issue.sh`
 - Pass `cargo clippy` with no warnings
 - Include tests for new functionality
 - Include documentation for public APIs

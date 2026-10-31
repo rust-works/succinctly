@@ -104,6 +104,14 @@ GATES = (
         cost=1,
     ),
     Gate(
+        "fmt-per-issue",
+        "fast",
+        ("./scripts/fmt-per-issue.sh",),
+        (r"^\./scripts/fmt-per-issue\.sh$",),
+        paths=("tests/*", "Cargo.toml", "scripts/fmt-per-issue.sh"),
+        cost=1,
+    ),
+    Gate(
         "ledger-only",
         "fast",
         (

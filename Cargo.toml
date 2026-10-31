@@ -171,6 +171,11 @@ memchr = "2.7"
 # dependency graph that actually runs the derive macros.
 syn = { version = "3.0", features = ["full", "visit"] }
 proc-macro2 = { version = "1.0", features = ["span-locations"] }
+# Test-only (#5697): `tests/{jq,yq}_cli/mod.rs` declare every per-issue file in their
+# directory with `automod::dir!`, so a new test is one new file and no shared `mod` list
+# is edited (a list conflicts in GitHub's merge-queue merge, which ignores `merge=union`).
+# A proc macro over proc-macro2/quote/syn, which are already in Cargo.lock.
+automod = "1.0"
 
 [[bench]]
 name = "rank_select"

@@ -441,6 +441,7 @@ Use rustfmt with default settings:
 
 ```bash
 cargo fmt
+scripts/fmt-per-issue.sh --fix   # tests/{jq,yq}_cli/*.rs: `cargo fmt` cannot reach them (#5697)
 ```
 
 ### Linting

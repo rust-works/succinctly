@@ -1,4 +1,0 @@
-# The per-issue test module lists (#4329) are sets of independent `mod iNNNN;` lines, so two
-# PRs that add a line into the same gap should keep both rather than conflict.
-tests/yq_cli/mod.rs merge=union
-tests/jq_cli/mod.rs merge=union
