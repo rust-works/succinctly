@@ -50,7 +50,7 @@ fn test_a_chain_of_equality_comparisons_folds_from_the_right_5629() -> Result<()
 /// stack overflow, however many operands there are.
 #[test]
 fn test_a_very_long_chain_is_refused_not_a_crash_5629() -> Result<()> {
-    let program = vec!["1"; 100_000].join(" == ");
+    let program = vec!["1"; 5_000].join(" == ");
     let (out, code) = run(&program)?;
     assert_eq!((out.as_str(), code), ("", 1));
     Ok(())

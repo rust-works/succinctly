@@ -3597,9 +3597,10 @@ impl<'a> Parser<'a> {
     /// the same hazard class as the prefix constructs, just reached by
     /// iteration, and trivially constructible either way.
     ///
-    /// `parse_comparison` deliberately has no counter: jq's comparison
-    /// operators are non-associative, so it parses at most one of them and
-    /// cannot build a chain at all.
+    /// `parse_comparison` is charged in yq mode only: jq's comparison
+    /// operators are non-associative, so in jq mode it parses at most one of
+    /// them and cannot build a chain, while yq's fold from the right and a
+    /// chain's links are nested nodes just like a run of `+` (#5629).
     ///
     /// `extra` is added to the current nesting depth rather than replacing
     /// it, so a chain written inside parentheses is charged for both.
@@ -9306,59 +9307,72 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
-    /// Parse comparison expressions: `==`, `!=`, `<`, `<=`, `>`, `>=`
-    ///
-    /// jq's grammar gives them no associativity, so a second operator is a syntax error left to
-    /// the caller. yq's shunting-yard pops only an operator of *strictly higher* precedence
-    /// (`expression_postfix.go`, v4.53.3) and gives all six the same one (40, also the
-    /// assignments'), so a chain folds from the right: `1 == 1 == true` is `1 == (1 == true)`
-    /// (#5629). The chain is gathered in a loop and folded afterwards, so its length costs
-    /// [`Self::check_expr_nesting`] and not stack.
-    fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
-        let mut operands = vec![self.parse_additive()?];
-        let mut ops: Vec<CompareOp> = Vec::new();
-        loop {
-            self.skip_ws();
-            let before_space = self.pos;
-            self.skip_yq_space();
-            if !self.at_comparison_op() {
-                self.pos = before_space;
-            }
-
-            let op = match self.peek_str(2) {
-                "==" => CompareOp::Eq,
-                "!=" => CompareOp::Ne,
-                "<=" => CompareOp::Le,
-                ">=" => CompareOp::Ge,
-                s if s.starts_with('<') => CompareOp::Lt,
-                s if s.starts_with('>') => CompareOp::Gt,
-                _ => break,
-            };
-
-            // Consume the operator
-            match op {
-                CompareOp::Eq | CompareOp::Ne | CompareOp::Le | CompareOp::Ge => {
-                    self.next();
-                    self.next();
-                }
-                CompareOp::Lt | CompareOp::Gt => {
-                    self.next();
-                }
-            }
-
-            self.skip_yq_space();
-            self.skip_ws();
-            ops.push(op);
-            operands.push(self.parse_additive()?);
-            if self.mode != ParserMode::Yq {
-                break;
-            }
-            self.check_expr_nesting(ops.len())?;
+    /// Consume a comparison operator and the space after it, if one follows: `==`, `!=`, `<`,
+    /// `<=`, `>`, `>=`. In yq mode the space before it may hold a CR or form feed (Go's `\s*`,
+    /// see [`Self::skip_yq_space`]); the position is left after the ordinary space when no
+    /// operator follows.
+    fn take_comparison_op(&mut self) -> Option<CompareOp> {
+        self.skip_ws();
+        let before_space = self.pos;
+        self.skip_yq_space();
+        if !self.at_comparison_op() {
+            self.pos = before_space;
         }
 
-        let Some(mut folded) = operands.pop() else {
-            return Err(ParseError::new("expected expression", self.pos));
+        let op = match self.peek_str(2) {
+            "==" => CompareOp::Eq,
+            "!=" => CompareOp::Ne,
+            "<=" => CompareOp::Le,
+            ">=" => CompareOp::Ge,
+            s if s.starts_with('<') => CompareOp::Lt,
+            s if s.starts_with('>') => CompareOp::Gt,
+            _ => return None,
         };
+
+        match op {
+            CompareOp::Eq | CompareOp::Ne | CompareOp::Le | CompareOp::Ge => {
+                self.next();
+                self.next();
+            }
+            CompareOp::Lt | CompareOp::Gt => {
+                self.next();
+            }
+        }
+        self.skip_yq_space();
+        self.skip_ws();
+        Some(op)
+    }
+
+    /// Parse comparison expressions: `==`, `!=`, `<`, `<=`, `>`, `>=`
+    ///
+    /// jq's grammar gives them no associativity, so in jq mode one operator is parsed and a
+    /// second is left to the caller, which refuses it. yq's shunting-yard pops only an operator
+    /// of *strictly higher* precedence (`expression_postfix.go`, v4.53.3) and gives all six the
+    /// same one (40, also the assignments'), so a chain folds from the right: `1 == 1 == true` is
+    /// `1 == (1 == true)` (#5629). The chain is gathered in a loop and folded afterwards, so its
+    /// length costs [`Self::check_expr_nesting`] and not stack.
+    fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
+        let left = self.parse_additive()?;
+        let Some(op) = self.take_comparison_op() else {
+            return Ok(left);
+        };
+        let right = self.parse_additive()?;
+        if self.mode != ParserMode::Yq {
+            return Ok(Expr::Compare {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            });
+        }
+
+        let mut operands = vec![left, right];
+        let mut ops = vec![op];
+        while let Some(op) = self.take_comparison_op() {
+            ops.push(op);
+            self.check_expr_nesting(ops.len())?;
+            operands.push(self.parse_additive()?);
+        }
+        let mut folded = operands.pop().unwrap_or(Expr::Identity);
         while let (Some(op), Some(left)) = (ops.pop(), operands.pop()) {
             folded = Expr::Compare {
                 op,
