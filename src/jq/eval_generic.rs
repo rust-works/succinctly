@@ -41747,6 +41747,7 @@ mod tests {
             ". as $x | . as $y | $x + $y",
             ". as $x | {a: $x, b: [$x]}",
             ". as $x | $x == . and true",
+            ". as $x | $x > 5 or $x == 3",
             ". as $x | $x // 1",
             "([.])",
             "{a: 1}",
