@@ -2126,14 +2126,16 @@ impl<'a> JsonString<'a> {
     /// Returns an error if the string contains invalid escape sequences
     /// or invalid UTF-8.
     pub fn as_str(&self) -> Result<Cow<'a, str>, JsonError> {
-        // Skip opening quote
+        // Skip opening quote. The scan for the closing quote already meets every backslash, so
+        // it reports whether there was one rather than a second pass searching the same bytes
+        // for it (#5594).
         let start = self.start + 1;
-        let end = self.find_string_end();
+        let (end, escaped) = self.find_string_end_and_escape();
 
         let bytes = &self.text[start..end];
 
         // Check if we need to decode escapes
-        if !bytes.contains(&b'\\') {
+        if !escaped {
             // No escapes - can return directly (zero-copy)
             let s = core::str::from_utf8(bytes).map_err(|_| JsonError::InvalidUtf8)?;
             Ok(Cow::Borrowed(s))
@@ -2153,15 +2155,24 @@ impl<'a> JsonString<'a> {
     }
 
     fn find_string_end(&self) -> usize {
+        self.find_string_end_and_escape().0
+    }
+
+    /// [`find_string_end`](Self::find_string_end), and whether the string holds a backslash.
+    fn find_string_end_and_escape(&self) -> (usize, bool) {
         let mut i = self.start + 1; // Skip opening quote
+        let mut escaped = false;
         while i < self.text.len() {
             match self.text[i] {
-                b'"' => return i,
-                b'\\' => i += 2, // Skip escape sequence
+                b'"' => return (i, escaped),
+                b'\\' => {
+                    escaped = true;
+                    i += 2; // Skip escape sequence
+                }
                 _ => i += 1,
             }
         }
-        self.text.len()
+        (self.text.len(), escaped)
     }
 }
 

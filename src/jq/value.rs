@@ -855,6 +855,29 @@ fn input_bridge_literal_text(raw: &[u8]) -> String {
     text
 }
 
+/// [`format_number_jq_compat`], appended to `out` (#5594): a literal the formatter would hand
+/// back unchanged ([`is_jq_canonical_number`]) is copied as it is, so the printer allocates no
+/// `String` per number. It takes the literal as the `str` a `NumberLiteral` already holds, so
+/// nothing re-validates its UTF-8.
+fn push_number_jq_compat(out: &mut String, literal: &str) {
+    if is_jq_canonical_number(literal.as_bytes()) {
+        out.push_str(literal);
+    } else {
+        out.push_str(&format_number_jq_compat(literal.as_bytes()));
+    }
+}
+
+/// [`input_bridge_literal_text`], appended to `out` (#5594). A canonical literal has no exponent,
+/// so it is never the overflow the bridge respells, and is copied as [`push_number_jq_compat`]
+/// copies it.
+fn push_input_bridge_literal_text(out: &mut String, literal: &str) {
+    if is_jq_canonical_number(literal.as_bytes()) {
+        out.push_str(literal);
+    } else {
+        out.push_str(&input_bridge_literal_text(literal.as_bytes()));
+    }
+}
+
 /// [`format_number_jq_compat`]'s preview-bounded twin: caps the exponent-
 /// notation mantissa at [`PREVIEW_MANTISSA_DIGIT_CAP`] digits, for
 /// [`crate::jq::stream::stream_owned_value_json_jq`] alone -- every call
@@ -3371,7 +3394,7 @@ impl OwnedValue {
 
     /// A double the reindex bridge decoded: the [`nan_instance`](Self::nan_instance)
     /// it was written from when it carries one's payload
-    /// ([`nan_instance_token`]), a bare computed `Float` otherwise (#2902).
+    /// ([`push_nan_instance_token`]), a bare computed `Float` otherwise (#2902).
     pub(crate) fn from_bridge_float(f: f64) -> Self {
         if is_nan_instance(f) {
             Self::NumberLiteral(NumberRepr::Float(f), "null".into())
@@ -3963,10 +3986,10 @@ impl OwnedValue {
         self.to_json_at_depth(
             0,
             true,
-            format_number_jq_compat,
+            push_number_jq_compat,
             jq_bare_float_display,
             infinite_float_preview_text,
-            printed_nan,
+            push_printed_nan,
         )
     }
 
@@ -4005,10 +4028,10 @@ impl OwnedValue {
         self.to_json_at_depth(
             0,
             false,
-            input_bridge_literal_text,
+            push_input_bridge_literal_text,
             jq_bare_float_display,
             overflow_literal_text,
-            nan_instance_token,
+            push_nan_instance_token,
         )
     }
 
@@ -4030,10 +4053,10 @@ impl OwnedValue {
         self.to_json_at_depth(
             0,
             true,
-            crate::jq::stream::real_output_finite_literal,
+            crate::jq::stream::push_real_output_finite_literal,
             jq_bare_float_display,
             infinite_float_preview_text,
-            printed_nan,
+            push_printed_nan,
         )
     }
 
@@ -4081,10 +4104,10 @@ impl OwnedValue {
         self.to_json_at_depth(
             0,
             false,
-            crate::jq::stream::yq_json_finite_literal,
+            crate::jq::stream::push_yq_json_finite_literal,
             crate::yaml::format_float_yq,
             yq_infinite_float_json_text,
-            printed_nan,
+            push_printed_nan,
         )
     }
 
@@ -4114,14 +4137,16 @@ impl OwnedValue {
     ///
     /// The text is appended to one buffer by [`write_json_at_depth`](Self::write_json_at_depth)
     /// (#5549); `tojson`, `tostring` and every printer fork above go through here.
+    /// `finite_literal` and `nan_fmt` append their text to that buffer too, so a number costs no
+    /// `String` of its own (#5594).
     fn to_json_at_depth(
         &self,
         depth: usize,
         jq_printer: bool,
-        finite_literal: fn(&[u8]) -> String,
+        finite_literal: fn(&mut String, &str),
         float_fmt: fn(f64) -> String,
         infinite_fmt: fn(bool) -> &'static str,
-        nan_fmt: fn(f64) -> String,
+        nan_fmt: fn(&mut String, f64),
     ) -> String {
         let mut out = String::new();
         self.write_json_at_depth(
@@ -4150,10 +4175,10 @@ impl OwnedValue {
         out: &mut String,
         depth: usize,
         jq_printer: bool,
-        finite_literal: fn(&[u8]) -> String,
+        finite_literal: fn(&mut String, &str),
         float_fmt: fn(f64) -> String,
         infinite_fmt: fn(bool) -> &'static str,
-        nan_fmt: fn(f64) -> String,
+        nan_fmt: fn(&mut String, f64),
     ) {
         use core::fmt::Write;
         if jq_printer && depth > JQ_MAX_PRINT_DEPTH {
@@ -4173,22 +4198,20 @@ impl OwnedValue {
                 if f.is_nan() {
                     // See the nested form's comment: `null` for output, the bridge token for
                     // `to_json_input_bridge` (#2877); a computed NaN goes in canonical (#3309).
-                    out.push_str(&nan_fmt(f64::NAN));
+                    nan_fmt(out, f64::NAN);
                 } else if f.is_infinite() {
                     out.push_str(infinite_fmt(f.is_sign_negative()));
                 } else {
                     out.push_str(&float_fmt(*f));
                 }
             }
-            Self::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => {
-                out.push_str(&nan_fmt(*f));
-            }
+            Self::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => nan_fmt(out, *f),
             Self::NumberLiteral(NumberRepr::Float(f), literal)
                 if f.is_infinite() && crate::yaml::nonfinite_literal_index(literal).is_some() =>
             {
                 out.push_str(infinite_fmt(f.is_sign_negative()));
             }
-            Self::NumberLiteral(_, literal) => out.push_str(&finite_literal(literal.as_bytes())),
+            Self::NumberLiteral(_, literal) => finite_literal(out, literal),
             Self::String(s) => {
                 out.push('"');
                 let _ = write_json_body_jq(out, s);
@@ -4410,7 +4433,7 @@ impl OwnedValue {
             }
             // A parsed NaN keeps its instance through the bridge (#3309).
             Self::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => {
-                out.push_str(&nan_instance_token(*f));
+                push_nan_instance_token(out, *f);
             }
             Self::Float(f) if f.is_infinite() => out.push_str(overflow_literal(*f)),
             // #2802: a spelled integer (`0x1f`, `0o17`, `01`, `+5`) is no number text the bridge's
@@ -4472,10 +4495,10 @@ impl OwnedValue {
                 out,
                 depth,
                 false,
-                format_number_jq_compat,
+                push_number_jq_compat,
                 crate::json::validate::computed_float_token,
                 infinite_float_preview_text,
-                printed_nan,
+                push_printed_nan,
             ),
         }
         Ok(())
@@ -4548,10 +4571,10 @@ impl OwnedValue {
             other => other.to_json_at_depth(
                 depth,
                 false,
-                format_number_jq_compat,
+                push_number_jq_compat,
                 crate::json::validate::computed_float_token,
                 infinite_float_preview_text,
-                printed_nan,
+                push_printed_nan,
             ),
         })
     }
@@ -5407,9 +5430,18 @@ fn address_nan_token(address: usize) -> u64 {
     (address ^ (address >> 49)) & NAN_INSTANCE_TOKEN_MASK
 }
 
-/// `to_json`'s NaN text: `null`, what jq prints for every NaN.
-fn printed_nan(_: f64) -> String {
-    "null".into()
+/// `to_json`'s NaN text: `null`, what jq prints for every NaN. The `String` form the nested
+/// printer the tests keep takes; the printer itself takes [`push_printed_nan`] (#5594).
+#[cfg(test)]
+fn printed_nan(f: f64) -> String {
+    let mut out = String::new();
+    push_printed_nan(&mut out, f);
+    out
+}
+
+/// `to_json`'s NaN text, `null`, appended to `out`: the form the printer takes (#5594).
+fn push_printed_nan(out: &mut String, _: f64) {
+    out.push_str("null");
 }
 
 /// Whether `f` is a NaN carrying a parse identity in its payload.
@@ -5417,22 +5449,33 @@ fn is_nan_instance(f: f64) -> bool {
     f.is_nan() && f.to_bits() & NAN_INSTANCE_TAG != 0
 }
 
+/// [`push_nan_instance_token`]'s text as a `String`: the form the nested printer the tests keep
+/// takes (#5594).
+#[cfg(test)]
+fn nan_instance_token(f: f64) -> String {
+    let mut out = String::new();
+    push_nan_instance_token(&mut out, f);
+    out
+}
+
 /// The reindex bridge's spelling of a parsed NaN
-/// ([`OwnedValue::nan_instance`]): [`NAN_SENTINEL`], then `e` and the
-/// double's bits in decimal, so the instance survives the round trip
-/// (#3309). Still digit-led, drawn from `[0-9e]` and carrying several
+/// ([`OwnedValue::nan_instance`]), appended to `out`: [`NAN_SENTINEL`], then
+/// `e` and the double's bits in decimal, so the instance survives the round
+/// trip (#3309). Still digit-led, drawn from `[0-9e]` and carrying several
 /// exponent markers, so it is a number span to the scanner and unparseable
 /// as a real number, like the sentinel itself. A NaN without a parse
-/// identity is written as the plain sentinel.
-fn nan_instance_token(f: f64) -> String {
+/// identity is written as the plain sentinel. Appended rather than returned
+/// since #5594, so the printers allocate nothing for it.
+fn push_nan_instance_token(out: &mut String, f: f64) {
+    use core::fmt::Write;
+    out.push_str(NAN_SENTINEL);
     if is_nan_instance(f) {
-        format!("{NAN_SENTINEL}e{}", f.to_bits())
-    } else {
-        NAN_SENTINEL.to_string()
+        // Writing into a `String` is infallible.
+        let _ = write!(out, "e{}", f.to_bits());
     }
 }
 
-/// Decodes a [`nan_instance_token`] back to the tagged double it was
+/// Decodes a [`push_nan_instance_token`] token back to the tagged double it was
 /// written from; `None` for anything else, the plain sentinel included.
 fn parse_nan_instance_token(bytes: &[u8]) -> Option<f64> {
     let digits = bytes
@@ -10790,43 +10833,56 @@ mod tests {
     /// per-node form wrote, under each of the four conventions its callers pass (jq's printer,
     /// the input bridge, `--preserve-input`, yq), for every kind of leaf, for the depth marker
     /// jq's writer prints past [`JQ_MAX_PRINT_DEPTH`], and for the panic at the tree limit.
+    ///
+    /// #5594: the printer takes each number convention in its appending form, and the nested
+    /// form keeps the `String` one, so the two forms of every convention are compared here too.
     #[test]
     fn printer_text_matches_the_nested_form_5549() {
         type Convention = (
             bool,
             fn(&[u8]) -> String,
+            fn(&mut String, &str),
             fn(f64) -> String,
             fn(bool) -> &'static str,
             fn(f64) -> String,
+            fn(&mut String, f64),
         );
         let conventions: [Convention; 4] = [
             (
                 true,
                 format_number_jq_compat,
+                push_number_jq_compat,
                 jq_bare_float_display,
                 infinite_float_preview_text,
                 printed_nan,
+                push_printed_nan,
             ),
             (
                 false,
                 input_bridge_literal_text,
+                push_input_bridge_literal_text,
                 jq_bare_float_display,
                 overflow_literal_text,
                 nan_instance_token,
+                push_nan_instance_token,
             ),
             (
                 true,
                 crate::jq::stream::real_output_finite_literal,
+                crate::jq::stream::push_real_output_finite_literal,
                 jq_bare_float_display,
                 infinite_float_preview_text,
                 printed_nan,
+                push_printed_nan,
             ),
             (
                 false,
                 crate::jq::stream::yq_json_finite_literal,
+                crate::jq::stream::push_yq_json_finite_literal,
                 crate::yaml::format_float_yq,
                 yq_infinite_float_json_text,
                 printed_nan,
+                push_printed_nan,
             ),
         ];
         let literal = |text: &str| OwnedValue::from_number_bytes::<JqSemantics>(text.as_bytes());
@@ -10849,6 +10905,15 @@ mod tests {
             literal("1e400"),
             literal("0.0000001"),
             literal("100000000000000000000"),
+            // #5594: spellings the appending jq formatter copies (canonical) and ones it has to
+            // hand to the formatter (a leading zero or `+`, no integer part, an exponent).
+            literal("-12"),
+            literal("0.50"),
+            OwnedValue::NumberLiteral(NumberRepr::Int(7), "007".into()),
+            OwnedValue::NumberLiteral(NumberRepr::Int(5), "+5".into()),
+            OwnedValue::NumberLiteral(NumberRepr::Float(0.5), ".5".into()),
+            OwnedValue::NumberLiteral(NumberRepr::Float(-7.5), "-007.5".into()),
+            OwnedValue::NumberLiteral(NumberRepr::Float(1e2), "1E2".into()),
             OwnedValue::NumberLiteral(NumberRepr::Float(f64::NAN), ".NaN".into()),
             OwnedValue::NumberLiteral(NumberRepr::Float(f64::INFINITY), ".inf".into()),
             OwnedValue::NumberLiteral(NumberRepr::Float(f64::NEG_INFINITY), "-.INF".into()),
@@ -10887,19 +10952,19 @@ mod tests {
             values.push(linear_array_nest(depth));
         }
         for value in &values {
-            for (jq_printer, finite, float, infinite, nan) in conventions {
+            for (jq_printer, finite, push_finite, float, infinite, nan, push_nan) in conventions {
                 assert_eq!(
-                    value.to_json_at_depth(0, jq_printer, finite, float, infinite, nan),
+                    value.to_json_at_depth(0, jq_printer, push_finite, float, infinite, push_nan),
                     value.to_json_nested_at_depth(0, jq_printer, finite, float, infinite, nan),
                     "{value:?}"
                 );
             }
         }
         // And from a nonzero depth, which is how the reindex bridge's fallback arrives.
-        for (jq_printer, finite, float, infinite, nan) in conventions {
+        for (jq_printer, finite, push_finite, float, infinite, nan, push_nan) in conventions {
             let leaf = OwnedValue::Float(2.5);
             assert_eq!(
-                leaf.to_json_at_depth(7, jq_printer, finite, float, infinite, nan),
+                leaf.to_json_at_depth(7, jq_printer, push_finite, float, infinite, push_nan),
                 leaf.to_json_nested_at_depth(7, jq_printer, finite, float, infinite, nan)
             );
         }
@@ -10919,10 +10984,10 @@ mod tests {
                     over.to_json_at_depth(
                         0,
                         false,
-                        format_number_jq_compat,
+                        push_number_jq_compat,
                         jq_bare_float_display,
                         infinite_float_preview_text,
-                        printed_nan,
+                        push_printed_nan,
                     )
                 }
             }));
