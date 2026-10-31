@@ -41664,7 +41664,8 @@ mod tests {
                 .unwrap();
             result.iter().map(OwnedValue::to_json).collect::<Vec<_>>()
         };
-        let table: [(&str, fn(f64) -> f64); 18] = [
+        type Libm = fn(f64) -> f64;
+        let table: [(&str, Libm); 18] = [
             ("log", math::log),
             ("log10", math::log10),
             ("log2", math::log2),
