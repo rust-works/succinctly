@@ -14379,16 +14379,10 @@ mod tests {
             "  \n",
             "",
         ] {
-            let strict = parse_json_stream(text).map(|values| values.len());
+            let strict = parse_json_stream(text).ok().map(|values| values.len());
             let (prefix, error) = parse_json_stream_prefix(text, Some(StreamOrigin::ALONE));
-            assert_eq!(
-                (strict.as_ref().ok().copied(), strict.is_err()),
-                (
-                    Some(prefix.len()).filter(|_| error.is_none()),
-                    error.is_some()
-                ),
-                "{text:?}"
-            );
+            let by_prefix = error.is_none().then_some(prefix.len());
+            assert_eq!(strict, by_prefix, "{text:?}");
         }
     }
 
