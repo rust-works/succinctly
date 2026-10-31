@@ -12427,9 +12427,10 @@ pub(crate) fn try_eval_owned_step<S: EvalSemantics>(expr: &Expr, state: OwnedVal
 /// JSON and indexed it again to hand the builtin a cursor, only for it to be materialized once
 /// more. That round trip was 18% of `del(.users[0]) | .users | length` over a 0.7 MB document.
 ///
-/// `f` is [`owned_assign_path_shape`]'s grammar with no computed key: field names and literal
-/// indices in any pipe nesting, so it holds no marker and no effect, and every path it can name
-/// is one the evaluator's own resolution finds in the same tree. jq mode only, and not while the
+/// `f` is [`owned_del_path_shape`]'s grammar: [`owned_assign_path_shape`]'s with no computed key
+/// (field names and literal indices in any pipe nesting), or a comma of such paths (#5670), so it
+/// holds no marker and no effect, and every path it can name is one the evaluator's own
+/// resolution finds in the same tree. jq mode only, and not while the
 /// #2889 embed table is live, whose bindings a bridge result would have been detached from.
 /// A decline hands the state back untouched; an error is the one `del` raises, with its text,
 /// since the state it consumed cannot be handed back.
@@ -12443,29 +12444,28 @@ pub(crate) fn owned_del_step<S: EvalSemantics>(expr: &Expr, state: OwnedValue) -
 /// The delete [`owned_del_step`] makes, for a `path` [`owned_del_target`] has already accepted:
 /// a caller that asked for the target first (to copy a borrowed state only when it will be
 /// used) runs it here and does not ask again.
+///
+/// A comma of distinct plain field names (#5670) deletes independent keys, so deleting them one
+/// after another is the delete of all of them at once, and each is the single-path delete rather
+/// than a path set merged into a trie. The first branch to raise is the error the combined
+/// resolution raises, and an object raises none. Any other path takes the builtin's own merged
+/// delete.
 fn owned_del_run<S: EvalSemantics>(
     path: &Expr,
     state: OwnedValue,
 ) -> Result<OwnedValue, EvalError> {
-    // #5670: a comma of distinct plain field names deletes independent keys, so deleting them one
-    // after another is the delete of all of them at once, and each is the single-path delete
-    // rather than a path set merged into a trie. The first branch to raise is the error the
-    // combined resolution raises, and an object has none.
     if let Some(fields) = distinct_field_branches(path) {
         let mut state = state;
         for field in fields {
-            state = match del_on_owned::<Vec<u64>, S>(field, state, false) {
-                QueryResult::Owned(value) => value,
-                QueryResult::Error(error) => return Err(error),
-                _ => {
-                    return Err(EvalError::new(
-                        "internal error: del yielded other than one value",
-                    )); // patchcov: coverage tolerate-line reason="unreachable: a static jq-mode path resolves to paths or an error, never to no output, a break or a halt (#5549)"
-                }
-            };
+            state = del_once::<S>(field, state)?;
         }
         return Ok(state);
     }
+    del_once::<S>(path, state)
+}
+
+/// [`del_on_owned`] of one `path`, as the one value or the one error a static jq-mode `del` makes.
+fn del_once<S: EvalSemantics>(path: &Expr, state: OwnedValue) -> Result<OwnedValue, EvalError> {
     match del_on_owned::<Vec<u64>, S>(path, state, false) {
         QueryResult::Owned(value) => Ok(value),
         QueryResult::Error(error) => Err(error),
@@ -12489,9 +12489,14 @@ pub(crate) fn owned_del_target<S: EvalSemantics>(expr: &Expr) -> Option<&Expr> {
         .then_some(path.as_ref())
 }
 
-/// The branches of a `del` path that is a comma of at least two plain field names, all different
-/// (#5670): `.a, .b, .c`, through any parentheses. `None` for anything else, including a name that
-/// repeats and a branch that is a deeper path or an index, which keep the merged delete.
+/// The most names [`distinct_field_branches`] takes: each is a pass of its own, so a long list
+/// keeps the merged delete, which is one pass however many names it holds.
+const MAX_SEQUENTIAL_DEL_FIELDS: usize = 8;
+
+/// The branches of a `del` path that is a comma of two to [`MAX_SEQUENTIAL_DEL_FIELDS`] plain field
+/// names, all different (#5670): `.a, .b, .c`, through any parentheses. `None` for anything else,
+/// including a name that repeats and a branch that is a deeper path or an index, which keep the
+/// merged delete. (`.["a"]` parses as the plain name `.a`.)
 fn distinct_field_branches(path: &Expr) -> Option<Vec<&Expr>> {
     fn collect<'p>(expr: &'p Expr, out: &mut Vec<&'p Expr>) -> bool {
         match expr {
@@ -12513,7 +12518,7 @@ fn distinct_field_branches(path: &Expr) -> Option<Vec<&Expr>> {
             .iter()
             .all(|b| !matches!((a, b), (Expr::Field(x), Expr::Field(y)) if x == y))
     });
-    (branches.len() >= 2 && distinct).then_some(branches)
+    ((2..=MAX_SEQUENTIAL_DEL_FIELDS).contains(&branches.len()) && distinct).then_some(branches)
 }
 
 /// The path grammar of [`owned_del_target`]: one static path, or a comma of them (#5670). jq
@@ -113980,6 +113985,41 @@ mod tests {
             let expr = parse(src).unwrap();
             assert!(eval_owned_closed::<JqSemantics>(&expr).is_none(), "{src}");
             assert!(eval_owned_closed::<YqSemantics>(&expr).is_none(), "{src}");
+        }
+    }
+
+    /// #5670: which `del` paths are applied name by name: two to eight different plain field
+    /// names, in any comma nesting. A repeated name, an index, a deeper path and a longer list keep
+    /// the merged delete, which handles overlap, shifting indices and error
+    /// order in one pass.
+    #[test]
+    fn distinct_field_branches_takes_only_independent_field_names_5670() {
+        let branches = |src: &str| {
+            let Expr::Builtin(Builtin::Del(path)) = parse(src).unwrap() else {
+                panic!("{src} is not a del"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message of the assertion this test exists to make (#5670)"
+            };
+            distinct_field_branches(&path).map(|fields| fields.len())
+        };
+        assert_eq!(branches("del(.a, .b)"), Some(2));
+        assert_eq!(branches("del(.a, .b, .c)"), Some(3));
+        assert_eq!(branches("del((.a, .b), .c)"), Some(3));
+        assert_eq!(branches("del((.a, .b))"), Some(2));
+        // A bracketed literal key parses as the same plain name.
+        assert_eq!(branches("del(.[\"a\"], .[\"b\"])"), Some(2));
+        assert_eq!(branches("del(.a, .[\"b\"])"), Some(2));
+        assert_eq!(branches("del(.a, .b, .c, .d, .e, .f, .g, .h)"), Some(8));
+        for merged in [
+            "del(.a)",
+            "del(.a, .a)",
+            "del(.a, .b, .a)",
+            "del(.a, .a.b)",
+            "del(.a.b, .c)",
+            "del(.[0], .[1])",
+            "del(.a, .[0])",
+            "del(.a, .b?)",
+            "del(.a, .b, .c, .d, .e, .f, .g, .h, .i)",
+        ] {
+            assert_eq!(branches(merged), None, "{merged}");
         }
     }
 

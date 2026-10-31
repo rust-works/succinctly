@@ -41640,7 +41640,8 @@ mod tests {
         ] {
             assert_eq!(reindexes(filter), 0, "{filter} bridged");
         }
-        // A computed key, an iteration, a condition and a `?` keep the bridge.
+        // A bracketed literal key is a static path too. A computed key, an iteration, a condition
+        // and a `?` keep the bridge.
         assert_eq!(reindexes("map(del(.a, .[\"b\"]))"), 0);
         assert!(reindexes("map(del(.a, .[(\"B\" | ascii_downcase)]))") > 0);
         assert!(reindexes("map(del(.a, .[]))") > 0);
