@@ -92157,7 +92157,7 @@ mod remaining_inputs {
     /// document at an index when it is first read. No parse error is queued: the CLI takes this
     /// route only for a stream with none.
     pub fn seed_lazy(
-        lines: Vec<(u32, u32)>,
+        lines: impl IntoIterator<Item = (u32, u32)>,
         materialize: Materialize,
         exhausted: Option<(u32, u32)>,
     ) {
@@ -92249,10 +92249,17 @@ mod remaining_inputs {
                 Slot::Lazy(index) => {
                     let converted = MATERIALIZE
                         .with(|m| m.borrow().as_ref().map(|materialize| materialize(index)));
+                    // The converter holds the stream's text: drop it with the last slot.
+                    if QUEUE.with(|q| q.borrow().is_empty()) {
+                        MATERIALIZE.with(|m| *m.borrow_mut() = None);
+                    }
+                    debug_assert!(
+                        converted.is_some(),
+                        "a lazy slot is queued with its converter"
+                    );
                     match converted {
                         Some(Ok(doc)) => Pop::Document(doc),
                         Some(Err(error)) => Pop::ParseError(error),
-                        // A lazy slot is only queued with a converter beside it.
                         None => Pop::Exhausted,
                     }
                 }
@@ -92594,7 +92601,7 @@ pub fn seed_remaining_inputs_with_errors(
 /// parses nor holds the documents it never reads.
 #[cfg(feature = "std")]
 pub fn seed_remaining_inputs_lazily(
-    lines: Vec<(u32, u32)>,
+    lines: impl IntoIterator<Item = (u32, u32)>,
     materialize: Box<dyn Fn(usize) -> Result<OwnedValue, EvalError>>,
     exhausted: Option<(u32, u32)>,
 ) {
@@ -113209,6 +113216,8 @@ mod tests {
         assert_eq!(current_input_location(), Some((0, 3)));
         assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(30)));
         assert_eq!(converted.get(), 4);
+        // The converter owns the stream's text, so it goes with the last slot.
+        assert_eq!(Rc::strong_count(&converted), 1, "the converter is released");
         assert_eq!(pop_remaining_input(), None);
         assert_eq!(current_input_location(), Some((0, 4)));
         // A later eager seed replaces the converter with nothing to convert.

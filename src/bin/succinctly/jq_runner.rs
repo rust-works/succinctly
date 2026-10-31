@@ -5755,16 +5755,19 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 // program reads them. `inputs` is empty; `locations` holds every document's
                 // line, and no parse error is queued (the route is taken only without one).
                 debug_assert_eq!(lazy.spans.len(), locations.per_value().len());
-                let lines: Vec<(u32, u32)> = locations.per_value().to_vec();
                 let materialize = move |index: usize| {
                     let (start, end) = lazy.spans[index];
+                    debug_assert!(
+                        json_depth_at_most(&lazy.text.as_bytes()[start..end], LAZY_JSON_MAX_DEPTH),
+                        "a lazily converted document is within the depth the route admits"
+                    );
                     // Serde accepted the span as a whole value and its depth is bounded
                     // (`lazy_json_spans`), so it is the conversion the eager route made, minus
                     // a position only a depth error would have read.
                     stream_document_validated(&lazy.text.as_bytes()[start..end], None, &[], 0)
                 };
                 jq::seed_remaining_inputs_lazily(
-                    lines,
+                    locations.per_value().iter().copied(),
                     Box::new(materialize),
                     locations.exhausted(args.slurp),
                 );
