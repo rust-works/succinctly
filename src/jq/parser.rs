@@ -9307,45 +9307,66 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse comparison expressions: `==`, `!=`, `<`, `<=`, `>`, `>=`
+    ///
+    /// jq's grammar gives them no associativity, so a second operator is a syntax error left to
+    /// the caller. yq's shunting-yard pops only an operator of *strictly higher* precedence
+    /// (`expression_postfix.go`, v4.53.3) and gives all six the same one (40, also the
+    /// assignments'), so a chain folds from the right: `1 == 1 == true` is `1 == (1 == true)`
+    /// (#5629). The chain is gathered in a loop and folded afterwards, so its length costs
+    /// [`Self::check_expr_nesting`] and not stack.
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
-        let left = self.parse_additive()?;
-        self.skip_ws();
-        let before_space = self.pos;
-        self.skip_yq_space();
-        if !self.at_comparison_op() {
-            self.pos = before_space;
+        let mut operands = vec![self.parse_additive()?];
+        let mut ops: Vec<CompareOp> = Vec::new();
+        loop {
+            self.skip_ws();
+            let before_space = self.pos;
+            self.skip_yq_space();
+            if !self.at_comparison_op() {
+                self.pos = before_space;
+            }
+
+            let op = match self.peek_str(2) {
+                "==" => CompareOp::Eq,
+                "!=" => CompareOp::Ne,
+                "<=" => CompareOp::Le,
+                ">=" => CompareOp::Ge,
+                s if s.starts_with('<') => CompareOp::Lt,
+                s if s.starts_with('>') => CompareOp::Gt,
+                _ => break,
+            };
+
+            // Consume the operator
+            match op {
+                CompareOp::Eq | CompareOp::Ne | CompareOp::Le | CompareOp::Ge => {
+                    self.next();
+                    self.next();
+                }
+                CompareOp::Lt | CompareOp::Gt => {
+                    self.next();
+                }
+            }
+
+            self.skip_yq_space();
+            self.skip_ws();
+            ops.push(op);
+            operands.push(self.parse_additive()?);
+            if self.mode != ParserMode::Yq {
+                break;
+            }
+            self.check_expr_nesting(ops.len())?;
         }
 
-        let op = match self.peek_str(2) {
-            "==" => CompareOp::Eq,
-            "!=" => CompareOp::Ne,
-            "<=" => CompareOp::Le,
-            ">=" => CompareOp::Ge,
-            s if s.starts_with('<') => CompareOp::Lt,
-            s if s.starts_with('>') => CompareOp::Gt,
-            _ => return Ok(left),
+        let Some(mut folded) = operands.pop() else {
+            return Err(ParseError::new("expected expression", self.pos));
         };
-
-        // Consume the operator
-        match op {
-            CompareOp::Eq | CompareOp::Ne | CompareOp::Le | CompareOp::Ge => {
-                self.next();
-                self.next();
-            }
-            CompareOp::Lt | CompareOp::Gt => {
-                self.next();
-            }
+        while let (Some(op), Some(left)) = (ops.pop(), operands.pop()) {
+            folded = Expr::Compare {
+                op,
+                left: Box::new(left),
+                right: Box::new(folded),
+            };
         }
-
-        self.skip_yq_space();
-        self.skip_ws();
-        let right = self.parse_additive()?;
-
-        Ok(Expr::Compare {
-            op,
-            left: Box::new(left),
-            right: Box::new(right),
-        })
+        Ok(folded)
     }
 
     /// Parse `and` expressions: `expr and expr`
@@ -10841,6 +10862,36 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #5629: in yq mode a chain of comparisons folds from the right (`a == b == c` is
+    /// `a == (b == c)`), because yq's shunting-yard pops only a strictly higher precedence and all
+    /// six operators share one. jq mode refuses a second operator.
+    #[test]
+    fn a_comparison_chain_folds_from_the_right_in_yq_mode_only_5629() {
+        let Expr::Compare { op, left, right } =
+            parse_with_mode("1 == 2 != 3", ParserMode::Yq).unwrap()
+        else {
+            panic!("not a comparison");
+        };
+        assert_eq!(op, CompareOp::Eq);
+        assert!(matches!(*left, Expr::Literal(_)));
+        let Expr::Compare { op, left, right } = *right else {
+            panic!("the right side is not the rest of the chain");
+        };
+        assert_eq!(op, CompareOp::Ne);
+        assert!(matches!(
+            (*left, *right),
+            (Expr::Literal(_), Expr::Literal(_))
+        ));
+        for text in ["1 == 2 != 3", "1 < 2 < 3", "1 + 1 == 2 == true"] {
+            assert!(
+                parse_with_mode(text, ParserMode::Jq).is_err(),
+                "jq mode accepted {text:?}"
+            );
+        }
+        let long = vec!["1"; 5_000].join(" == ");
+        assert!(parse_with_mode(&long, ParserMode::Yq).is_err());
     }
 
     /// #5591: a reserved word is no `def` name, bare parameter or `import ... as` namespace, in
