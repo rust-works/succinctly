@@ -6569,7 +6569,7 @@ fn get_inputs(
     let eof_tail = (track_eof && !args.slurp && !seq_stream_shape && args.input_dsv.is_none())
         .then(|| {
             let sources: Vec<&[u8]> = raw_bytes.iter().map(|(_, raw)| raw.as_slice()).collect();
-            EofTail::of(&sources, args.raw_input, &seams)
+            EofTail::of(&sources, args.raw_input, &seams, args.stream)
         });
 
     // All reads happen first, then decoding: a later file's read error still
@@ -7425,7 +7425,7 @@ impl EofTail {
     /// `seams` is what [`stitch_json_file_seams`] did to each source (#4316): the last
     /// source's own lines and reads start after the bytes moved onto it, which belong to an
     /// earlier file's reads. Nothing is moved off the last source.
-    fn of(sources: &[&[u8]], raw: bool, seams: &[Seam]) -> Self {
+    fn of(sources: &[&[u8]], raw: bool, seams: &[Seam], stream: bool) -> Self {
         let base = sources.len().checked_sub(1).map_or(0, |last| {
             seams
                 .get(last)
@@ -7441,6 +7441,7 @@ impl EofTail {
             Self::json_value_completes_in_final_read(
                 sources,
                 seams.last().copied().unwrap_or_default(),
+                stream,
             )
         };
         Self {
@@ -7465,7 +7466,7 @@ impl EofTail {
     /// JSON: whether the stream's last value completes in the read that
     /// reaches the end of input. The last source's first `base` bytes were moved there from
     /// an earlier file (#4316) and are not part of its reads.
-    fn json_value_completes_in_final_read(sources: &[&[u8]], seam: Seam) -> bool {
+    fn json_value_completes_in_final_read(sources: &[&[u8]], seam: Seam, stream: bool) -> bool {
         let Some((&last, earlier)) = sources.split_last() else {
             return false;
         };
@@ -7498,7 +7499,7 @@ impl EofTail {
             let Some(start) = malformed else {
                 break;
             };
-            let (detected, _, resume) = meet_fault(&mut faults, last, offset + start, false);
+            let (detected, _, resume) = meet_fault(&mut faults, last, offset + start, stream);
             last_event = Some(detected);
             if resume >= last.len() {
                 break;
@@ -15037,7 +15038,7 @@ mod tests {
             let mut raws: Vec<Vec<u8>> = files.iter().map(|f| f.to_vec()).collect();
             let seams = stitch_json_file_seams(raws.iter_mut(), false, false);
             let sources: Vec<&[u8]> = raws.iter().map(Vec::as_slice).collect();
-            let tail = EofTail::of(&sources, false, &seams);
+            let tail = EofTail::of(&sources, false, &seams, false);
             (!tail.unknown).then_some(tail.newlines)
         };
         // The moved `[1,\n` is the earlier file's newline, not the last file's.
@@ -15445,7 +15446,7 @@ mod tests {
     #[test]
     fn test_eof_tail_models_jqs_final_read_4303() {
         let at = |sources: &[&[u8]], raw: bool| {
-            let tail = EofTail::of(sources, raw, &[]);
+            let tail = EofTail::of(sources, raw, &[], false);
             (!tail.unknown).then_some(tail.newlines)
         };
         let spaces = |n: usize| " ".repeat(n);
