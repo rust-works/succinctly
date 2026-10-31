@@ -3695,13 +3695,13 @@ succinctly yq raises the same two errors; see the next section.
 yq's `<`, `<=`, `>` and `>=` are not jq's total order.
 `compareOperator` (`pkg/yqlib/operator_compare.go`, v4.53.3) tries these rules in order:
 
-| operands                                         | yq 4.53.3                                                  |
-|---------------------------------------------------|-------------------------------------------------------------|
-| a container on the left (any right operand)       | `arrays not yet supported for comparison` / `maps not yet supported for comparison` |
-| a scalar on the left, a container on the right    | `!!seq () cannot be subtracted from !!int` (right tag, then left tag) |
-| a `null` on either side                           | `false` (`<=`/`>=` of two `null`s is `true`)                |
-| two numbers (int or float), or two strings        | compared                                                   |
-| anything else (a bool, or unlike kinds)           | `<left tag> not yet supported for comparison`              |
+| operands                                       | yq 4.53.3                                                                           |
+|------------------------------------------------|-------------------------------------------------------------------------------------|
+| a container on the left (any right operand)    | `arrays not yet supported for comparison` / `maps not yet supported for comparison` |
+| a scalar on the left, a container on the right | `!!seq () cannot be subtracted from !!int` (right tag, then left tag)               |
+| a `null` on either side                        | `false` (`<=`/`>=` of two `null`s is `true`)                                        |
+| two numbers (int or float), or two strings     | compared                                                                            |
+| anything else (a bool, or unlike kinds)        | `<left tag> not yet supported for comparison`                                       |
 
 So `2 > true` is `!!int not yet supported for comparison`, `"a" < 1` is `!!str not yet supported for comparison`, and `true > false` is `!!bool not yet supported for comparison`; succinctly yq used to answer `true`/`false` from jq's order.
 `==` and `!=` never raise, in either tool.

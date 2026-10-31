@@ -730,14 +730,10 @@ pub(crate) fn yq_scalar_string_concat_is_ok<S: EvalSemantics>() -> bool {
 /// | `null <op> "a"`, `null <op> false`         | same as vs a number |
 /// | `.zzz < 1` (a genuine `null` *node*, not an empty operand -- comparison operands are not read-only) | `false` |
 ///
-/// **Not reproduced here:** `null` against an array/object in real yq
-/// raises a Go-internal error instead of answering `false` at all -- and the
-/// wording depends on operand *order* (`null < []` is `!!seq () cannot be
-/// subtracted from !!null`; `[] < null` is `arrays not yet supported for
-/// comparison`). That is a separate, much deeper quirk (yq's ordering
-/// comparator is implemented as a subtraction internally) than "ordering
-/// against null is false" and is not part of this rule -- see
-/// `docs/compliance/yq/limitations.md`.
+/// `null` against an array/object is not decided here: real yq raises there, and the wording
+/// depends on operand *order* (`null < []` is `!!seq () cannot be subtracted from !!null`; `[] <
+/// null` is `arrays not yet supported for comparison`). That is [`yq_ordering_refusal`]'s rule
+/// (#5631), which `try_compare_op` applies before this function is consulted.
 pub(crate) fn yq_null_ordering_is_false<S: EvalSemantics>(
     op: CompareOp,
     left: &OwnedValue,
@@ -14231,7 +14227,7 @@ fn binary_fanout_each_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     // combined-with-`rest` fallback (`.a | (.[])? | (key,
                     // (1 + "x"))` -- needs an arithmetic op to reach this
                     // `combine`-failure arm at all; `==`'s own `combine`
-                    // (`apply_compare_op`) is infallible, so an error from a
+                    // (`try_compare_op`) cannot fail, so an error from a
                     // `==`-wrapped operand like `error("x")` never lands
                     // here, it propagates through a different path entirely)
                     // -- the plain (non-path-context) evaluator's own
@@ -16107,6 +16103,10 @@ fn eval_compare<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Apply a comparison operator to two already-evaluated values.
+///
+/// Infallible: it answers jq's ordering even in yq mode, where an ordering comparison yq refuses
+/// must go through [`try_compare_op`] instead (#5631). Call this one only where the pair cannot
+/// be one yq refuses (`==`/`!=`, jq mode, or an operand known to be a number).
 ///
 /// Factored out of [`eval_compare`] so the path-context evaluator's own
 /// `Expr::Compare` arm (the deleted eager path-context evaluator, #715) and
