@@ -4331,6 +4331,37 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
         trailing_gap_ok(self.text, gap_start, close_char)
     }
 
+    /// #5683: see [`DocumentCursor::plain_int_at`].
+    #[inline]
+    fn plain_int_at(&self, text_pos: usize) -> Option<i64> {
+        let text = self.text;
+        let mut i = text_pos;
+        let negative = *text.get(i)? == b'-';
+        i += usize::from(negative);
+        let digits = i;
+        while text.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+        let len = i - digits;
+        // `0` alone, or 1-18 digits with no leading zero: the run `i64` holds exactly, and the
+        // spelling the general decode reads as the same integer. `-0` is left to it.
+        if len == 0 || len > 18 || (text[digits] == b'0' && (len > 1 || negative)) {
+            return None;
+        }
+        // The token ends here: anything else glued on (`1.5`, `1e3`, `12x`) is not this integer.
+        if !matches!(
+            text.get(i),
+            None | Some(b' ' | b'\t' | b'\n' | b'\r' | b',' | b']' | b'}')
+        ) {
+            return None;
+        }
+        let mut value = 0i64;
+        for &b in &text[digits..i] {
+            value = value * 10 + i64::from(b - b'0');
+        }
+        Some(if negative { -value } else { value })
+    }
+
     /// #5654: where this container ends, one past its closing bracket, for the trailing-gap
     /// check after a container that is its parent's last child.
     #[inline]
@@ -6040,6 +6071,58 @@ mod tests {
                 Some(text.len() - 1),
             ]
         );
+    }
+
+    /// #5683: `plain_int_at` reads the integers the general decode reads as the same number, and
+    /// declines every spelling that is not one.
+    #[test]
+    fn test_plain_int_at_reads_only_plain_integers_5683() {
+        use crate::jq::document::DocumentCursor;
+        use crate::json::JsonIndex;
+        let read = |text: &str| -> Option<i64> {
+            let doc = alloc::format!("[{text}]");
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            let first = root.first_child()?;
+            let at = first.text_position()?;
+            DocumentCursor::plain_int_at(&first, at)
+        };
+        for (text, want) in [
+            ("0", Some(0)),
+            ("7", Some(7)),
+            ("-7", Some(-7)),
+            ("123456789012345678", Some(123_456_789_012_345_678)),
+            ("-123456789012345678", Some(-123_456_789_012_345_678)),
+            (" 42 ", Some(42)),
+            // declined: left to the general decode
+            ("-0", None),
+            ("00", None),
+            ("007", None),
+            ("-07", None),
+            ("1234567890123456789", None),
+            ("1.0", None),
+            ("1.5", None),
+            ("1e3", None),
+            ("1E3", None),
+            ("12x", None),
+            ("+1", None),
+            ("-", None),
+            ("\"1\"", None),
+            ("true", None),
+        ] {
+            assert_eq!(read(text), want, "{text:?}");
+        }
+        // The last element ends at `]`, a comma-less token end.
+        let doc = b"[1,22]";
+        let index = JsonIndex::build(doc);
+        let last = index
+            .root(doc)
+            .first_child()
+            .unwrap()
+            .next_sibling()
+            .unwrap();
+        let at = last.text_position().unwrap();
+        assert_eq!(DocumentCursor::plain_int_at(&last, at), Some(22));
     }
 
     /// #5654: `last_open_before` finds the last 1 bit below `end`, across word boundaries, at a

@@ -730,6 +730,18 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         true
     }
 
+    /// The integer this element is, when its text at `text_pos` (its own `text_position()`) is a
+    /// plain one: an optional `-`, then `0` or a digit run of at most 18 digits starting with a
+    /// non-zero digit, and the end of the token (#5683). `None` for everything else (a fraction,
+    /// an exponent, `-0`, a longer run, a token that goes on), so a caller that takes the integer
+    /// reads the same number the general decode would, without building its owned value.
+    ///
+    /// The default is `None`: only a format whose numbers are bare text answers.
+    fn plain_int_at(&self, text_pos: usize) -> Option<i64> {
+        let _ = text_pos;
+        None
+    }
+
     /// Where this container ends, one past its closing bracket (#5654): the gap start for the
     /// trailing check after a container that is its parent's last child, which
     /// [`DocumentValue::scalar_text_end`] cannot answer.
